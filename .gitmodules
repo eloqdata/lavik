@@ -1,5 +1,5 @@
-[submodule "celer"]
-	path = celer
+[submodule "bycorf"]
+	path = bycorf
 	url = https://github.com/thweetkomputer/celer.git
 [submodule "third_party/mimalloc"]
 	path = third_party/mimalloc

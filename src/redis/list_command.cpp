@@ -16,8 +16,8 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/worker.h"
 #include "cluster_gate.h"
 #include "keylane/command_table.h"
 #include "keylane/redis_parse.h"
@@ -27,7 +27,7 @@
 #include "keylane/tx/tx_shard.h"
 
 namespace keylane {
-using namespace celer;
+using namespace bycorf;
 
 namespace {
 
@@ -610,8 +610,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       (request.spec_->flags_ & kCmdMayBlock) != 0 &&
       g_storage->ReplicationLogActive()) {
     while (!TryBeginReplicationTransactionOrder()) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
         co_return BuiltReply(
             reply_builder.AppendError("ERR ", waited.message()));
@@ -619,8 +619,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     }
     snapshot_attempt.order_active_ = true;
     while (!TryBeginSnapshotTransaction()) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
         co_return BuiltReply(
             reply_builder.AppendError("ERR ", waited.message()));
@@ -635,7 +635,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       co_return BuiltReply(
           AppendStorageError(reply_builder, replication.status()));
     }
-    SingleShardListOutcome outcome = co_await celer::SubmitTaskTo(
+    SingleShardListOutcome outcome = co_await bycorf::SubmitTaskTo(
         first_owner,
         [&request, db_id = request.db_id_, keys = std::move(keys), move,
          source_left, destination_left, pop_left, pop_count,
@@ -729,11 +729,11 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       op.count_ = pop_count;
       op.count_provided_ = true;
       const storage::Digest digest = storage::ComputeDigest(args[arg]);
-      auto popped = co_await celer::SubmitTaskTo(
+      auto popped = co_await bycorf::SubmitTaskTo(
           ShardForKey(args[arg]),
           [db = request.db_id_, key = std::string(args[arg]), digest, op,
            mutation_precondition]() mutable
-          -> Task<absl::StatusOr<storage::ListResult>> {
+              -> Task<absl::StatusOr<storage::ListResult>> {
             co_return co_await g_storage->ExecuteListLocked(
                 db, key, digest, op, nullptr, nullptr, &mutation_precondition);
           });
@@ -773,11 +773,11 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     op.first_ = source_left ? 1 : 0;
     op.second_ = destination_left ? 1 : 0;
     const storage::Digest digest = storage::ComputeDigest(source_key);
-    auto moved = co_await celer::SubmitTaskTo(
+    auto moved = co_await bycorf::SubmitTaskTo(
         ShardForKey(source_key),
         [db = request.db_id_, key = std::string(source_key), digest, op,
          mutation_precondition]() mutable
-        -> Task<absl::StatusOr<storage::ListResult>> {
+            -> Task<absl::StatusOr<storage::ListResult>> {
           co_return co_await g_storage->ExecuteListLocked(
               db, key, digest, op, nullptr, nullptr, &mutation_precondition);
         });
@@ -805,7 +805,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   pop.count_ = 1;
   const storage::Digest source_digest = storage::ComputeDigest(source_key);
   const unsigned source_owner = ShardForKey(source_key);
-  auto popped = co_await celer::SubmitTaskTo(
+  auto popped = co_await bycorf::SubmitTaskTo(
       source_owner, [db = request.db_id_, key = std::string(source_key),
                      source_digest, pop, write = &writes[source_owner]] {
         return g_storage->ExecuteListLocked(db, key, source_digest, pop, write);
@@ -826,7 +826,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   const storage::Digest destination_digest =
       storage::ComputeDigest(destination_key);
   const unsigned destination_owner = ShardForKey(destination_key);
-  auto pushed = co_await celer::SubmitTaskTo(
+  auto pushed = co_await bycorf::SubmitTaskTo(
       destination_owner,
       [db = request.db_id_, key = std::string(destination_key),
        destination_digest, push, write = &writes[destination_owner]] {
@@ -835,7 +835,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       });
   if (!pushed.ok()) {
     for (const unsigned owner : {source_owner, destination_owner}) {
-      (void)co_await celer::SubmitTaskTo(
+      (void)co_await bycorf::SubmitTaskTo(
           owner, [txid] { return g_storage->RollbackTxLocal(txid); });
     }
     (void)co_await release();
@@ -851,12 +851,12 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   status = co_await g_storage->CommitTxWrites(txid, std::move(write_ptrs));
   if (!status.ok()) {
     for (const unsigned owner : {source_owner, destination_owner}) {
-      (void)co_await celer::SubmitTaskTo(
+      (void)co_await bycorf::SubmitTaskTo(
           owner, [txid] { return g_storage->RollbackTxLocal(txid); });
     }
   } else {
     for (const unsigned owner : {source_owner, destination_owner}) {
-      (void)co_await celer::SubmitTaskTo(
+      (void)co_await bycorf::SubmitTaskTo(
           owner, [txid] { return g_storage->DiscardTxUndoLocal(txid); });
     }
   }

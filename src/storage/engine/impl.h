@@ -36,12 +36,12 @@
 #include "../ring_buffer.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
-#include "celer/io/spdk_storage.h"
-#include "celer/io/storage.h"
-#include "celer/runtime/concurrentqueue.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/sync.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/spdk_storage.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/runtime/concurrentqueue.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/sync.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/fault_injection.h"
 #include "keylane/memory.h"
 #include "keylane/storage/detail/compact_write.h"
@@ -58,13 +58,13 @@
 
 namespace keylane::storage {
 
-using celer::AsyncMutex;
-using celer::AsyncNotification;
-using celer::CoroutineBarrier;
-using celer::FixedBuffer;
-using celer::FixedFile;
-using celer::Task;
-using celer::Worker;
+using bycorf::AsyncMutex;
+using bycorf::AsyncNotification;
+using bycorf::CoroutineBarrier;
+using bycorf::FixedBuffer;
+using bycorf::FixedFile;
+using bycorf::Task;
+using bycorf::Worker;
 
 // Storage operations occasionally pin immutable physical state, release the
 // worker-local metadata mutex across IO, then reacquire it for publication.
@@ -832,8 +832,8 @@ inline absl::Status WriteExactlyAt(int fd, std::span<const std::byte> input,
 inline absl::Status ReadExactlyAt(const std::string& path,
                                   std::span<std::byte> output,
                                   std::uint64_t offset) {
-  if (celer::IsSpdkStoragePath(path)) {
-    return celer::ReadSpdkStorage(path, output, offset);
+  if (bycorf::IsSpdkStoragePath(path)) {
+    return bycorf::ReadSpdkStorage(path, output, offset);
   }
   const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (fd < 0) {
@@ -853,8 +853,8 @@ inline absl::Status ReadExactlyAt(const std::string& path,
 inline absl::Status WriteExactlyAt(const std::string& path,
                                    std::span<const std::byte> input,
                                    std::uint64_t offset, bool flush) {
-  if (celer::IsSpdkStoragePath(path)) {
-    return celer::WriteSpdkStorage(path, input, offset, flush);
+  if (bycorf::IsSpdkStoragePath(path)) {
+    return bycorf::WriteSpdkStorage(path, input, offset, flush);
   }
   const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (fd < 0) {
@@ -1052,7 +1052,7 @@ struct alignas(kCacheLineBytes) RecoveryDeviceCursor {
 static_assert(sizeof(RecoveryDeviceCursor) % kCacheLineBytes == 0);
 
 struct DeviceAllocator {
-  celer::WorkerId owner_ = 0;
+  bycorf::WorkerId owner_ = 0;
   AsyncMutex mutex_;
   std::uint32_t data_block_begin_ = 1;
   std::uint64_t next_pristine_ = 1;
@@ -1129,8 +1129,8 @@ inline absl::StatusOr<BlockDeviceInfo> ProbeBlockDevice(
 
 inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
     const std::string& path) {
-  if (celer::IsSpdkStoragePath(path)) {
-    auto device = celer::ProbeSpdkStorage(path);
+  if (bycorf::IsSpdkStoragePath(path)) {
+    auto device = bycorf::ProbeSpdkStorage(path);
     if (!device.ok()) {
       return device.status();
     }
@@ -1177,22 +1177,22 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
   };
 }
 
-inline celer::SizeIoAwaitable ReadStorageBuffer(Worker& worker, FixedFile file,
-                                                FixedBuffer buffer,
-                                                bool registered,
-                                                std::uint64_t offset) {
+inline bycorf::SizeIoAwaitable ReadStorageBuffer(Worker& worker, FixedFile file,
+                                                 FixedBuffer buffer,
+                                                 bool registered,
+                                                 std::uint64_t offset) {
   if (registered) {
-    return celer::ReadFixed(worker, file, buffer, offset);
+    return bycorf::ReadFixed(worker, file, buffer, offset);
   }
-  return celer::Read(worker, file,
-                     std::span<std::byte>(buffer.data_, buffer.size_), offset);
+  return bycorf::Read(worker, file,
+                      std::span<std::byte>(buffer.data_, buffer.size_), offset);
 }
 
 inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
     Worker& worker, FixedFile file, std::span<const std::byte> buffer,
     bool registered, FixedBuffer registered_buffer, std::uint64_t offset) {
   if (registered) {
-    celer::FixedBuffer target = {
+    bycorf::FixedBuffer target = {
         .data_ = const_cast<std::byte*>(buffer.data()),
         .size_ = buffer.size(),
         .index_ = registered_buffer.index_,
@@ -1202,9 +1202,9 @@ inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
       co_return absl::Status(absl::StatusCode::kInternal,
                              "invalid registered write buffer");
     }
-    co_return co_await celer::WriteFixed(worker, file, target, offset);
+    co_return co_await bycorf::WriteFixed(worker, file, target, offset);
   }
-  co_return co_await celer::Write(worker, file, buffer, offset);
+  co_return co_await bycorf::Write(worker, file, buffer, offset);
 }
 
 #if KEYLANE_FAULTS_ENABLED
@@ -1225,8 +1225,8 @@ inline Task<absl::Status> PauseCompactWriteForTest(Worker& worker,
     co_return absl::OkStatus();
   spdlog::info("compact collection write pause armed key={} milliseconds={}",
                key, milliseconds);
-  auto status =
-      co_await celer::SleepFor(worker, std::chrono::milliseconds(milliseconds));
+  auto status = co_await bycorf::SleepFor(
+      worker, std::chrono::milliseconds(milliseconds));
   if (!status.ok()) co_return status;
   spdlog::info("compact collection write pause complete key={}", key);
   co_return absl::OkStatus();
@@ -1243,7 +1243,8 @@ inline Task<absl::Status> PauseGroupedWriteForTest(Worker& worker,
   const char* selected = std::getenv("KEYLANE_GROUPED_WRITE_PAUSE_PHASE");
   if (selected == nullptr || phase != selected) co_return absl::OkStatus();
   spdlog::info("grouped write pause armed key={} phase={}", key, phase);
-  const auto status = co_await celer::SleepFor(worker, std::chrono::seconds(3));
+  const auto status =
+      co_await bycorf::SleepFor(worker, std::chrono::seconds(3));
   if (!status.ok()) co_return status;
   spdlog::info("grouped write pause complete key={} phase={}", key, phase);
   co_return absl::OkStatus();
@@ -2831,10 +2832,10 @@ class StorageEngine::Impl {
                              const RecordIndex::Entry& entry,
                              std::string_view known_key = {});
 
-  WorkerStore& CurrentStore() { return *stores_[celer::ThisWorker().id_]; }
+  WorkerStore& CurrentStore() { return *stores_[bycorf::ThisWorker().id_]; }
 
   const WorkerStore& CurrentStore() const {
-    return *stores_[celer::ThisWorker().id_];
+    return *stores_[bycorf::ThisWorker().id_];
   }
 
   absl::StatusOr<std::uint64_t> AllocateLsn(WorkerStore& store) {

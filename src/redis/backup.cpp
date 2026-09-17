@@ -19,9 +19,9 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/sync.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/sync.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/rdb.h"
@@ -197,15 +197,15 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
       }
     } cut_guard{this};
     while (!output_.ready()) {
-      absl::Status yielded = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status yielded = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!yielded.ok()) co_return yielded;
     }
     if (output_.failed()) co_return output_.result();
 
     while (!CloseAllCommandDbGates()) {
-      absl::Status yielded = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status yielded = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!yielded.ok()) co_return yielded;
     }
     struct GateGuard {
@@ -215,8 +215,8 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
       }
     } gates;
     while (CommandDbOperationsActive()) {
-      absl::Status yielded = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status yielded = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!yielded.ok()) co_return yielded;
     }
 
@@ -245,14 +245,14 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
     saved_change_cuts_.reserve(storage_->worker_count());
     unsigned begun = 0;
     for (; begun < storage_->worker_count(); ++begun) {
-      auto cut = co_await celer::SubmitTo(begun, [this, snapshot_time_ms] {
+      auto cut = co_await bycorf::SubmitTo(begun, [this, snapshot_time_ms] {
         absl::Status status =
             storage_->BeginRdbSnapshot(session_id_, snapshot_time_ms);
         return std::pair{std::move(status), LocalDatasetChangesTotal()};
       });
       if (!cut.first.ok()) {
         for (unsigned worker = 0; worker < begun; ++worker) {
-          (void)co_await celer::SubmitTaskTo(
+          (void)co_await bycorf::SubmitTaskTo(
               worker, [this] { return storage_->EndRdbSnapshot(session_id_); });
         }
         co_return cut.first;
@@ -264,17 +264,17 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
       while (!output_.TryPush(&fragment)) {
         if (output_.failed()) {
           for (unsigned worker = 0; worker < begun; ++worker) {
-            (void)co_await celer::SubmitTaskTo(worker, [this] {
+            (void)co_await bycorf::SubmitTaskTo(worker, [this] {
               return storage_->EndRdbSnapshot(session_id_);
             });
           }
           co_return absl::InternalError("RDB output writer failed");
         }
-        absl::Status yielded = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status yielded = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!yielded.ok()) {
           for (unsigned worker = 0; worker < begun; ++worker) {
-            (void)co_await celer::SubmitTaskTo(worker, [this] {
+            (void)co_await bycorf::SubmitTaskTo(worker, [this] {
               return storage_->EndRdbSnapshot(session_id_);
             });
           }
@@ -291,9 +291,9 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       auto context =
           std::make_unique<std::shared_ptr<BackupJob>>(shared_from_this());
-      celer::PostNotification(
-          celer::ThisWorker().cross_core_, worker,
-          celer::RemoteNotification{
+      bycorf::PostNotification(
+          bycorf::ThisWorker().cross_core_, worker,
+          bycorf::RemoteNotification{
               .context_ = context.release(),
               .value_ = worker,
               .run_fn_ =
@@ -305,8 +305,8 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
           });
     }
     while (remaining_.load(std::memory_order_acquire) != 0) {
-      absl::Status yielded = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status yielded = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!yielded.ok()) co_return yielded;
     }
     absl::Status scan_status = status();
@@ -318,8 +318,8 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
       output_.RequestAbort(scan_status);
     }
     while (!output_.done()) {
-      absl::Status yielded = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status yielded = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!yielded.ok()) co_return yielded;
     }
     absl::Status output_status = output_.result();
@@ -345,7 +345,7 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
   }
 
   void SpawnWorker(unsigned worker_id) {
-    celer::ThisWorker().self_->SpawnBackground(
+    bycorf::ThisWorker().self_->SpawnBackground(
         RunOwnedWorker(shared_from_this(), worker_id));
   }
 
@@ -357,8 +357,8 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
       while (!output_.TryPush(&fragment, worker_id)) {
         if (output_.failed())
           co_return absl::InternalError("RDB output writer failed");
-        auto status = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                               std::chrono::milliseconds(1));
+        auto status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                                std::chrono::milliseconds(1));
         if (!status.ok()) co_return status;
       }
       bytes.remove_prefix(piece.size());
@@ -422,8 +422,8 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
               status = absl::InternalError("RDB output writer failed");
               break;
             }
-            status = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                              std::chrono::milliseconds(1));
+            status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                               std::chrono::milliseconds(1));
             if (!status.ok()) break;
           }
           if (!status.ok()) break;
@@ -454,7 +454,7 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
         if (!status.ok() || batch->done_) break;
         if (++reads_since_yield == 64) {
           reads_since_yield = 0;
-          co_await celer::Yield(*celer::ThisWorker().self_);
+          co_await bycorf::Yield(*bycorf::ThisWorker().self_);
         }
       }
     } catch (const std::bad_alloc&) {
@@ -510,7 +510,7 @@ Task<absl::Status> FinishBackup(std::shared_ptr<BackupJob> job) {
   if (status.ok()) {
     const auto& cuts = job->saved_change_cuts();
     for (unsigned worker = 0; worker < cuts.size(); ++worker) {
-      co_await celer::SubmitTo(worker, [saved = cuts[worker]] {
+      co_await bycorf::SubmitTo(worker, [saved = cuts[worker]] {
         MarkLocalDatasetChangesSaved(saved);
         return true;
       });
@@ -575,10 +575,10 @@ Task<CommandReply> ExecuteRdbBackupCommand(const CommandRequest& request,
   }
   if (request.kind_ == CommandKind::kBgSave) {
     std::shared_ptr<BackupJob> cut = job;
-    celer::ThisWorker().self_->Spawn(FinishBackup(std::move(job)));
+    bycorf::ThisWorker().self_->Spawn(FinishBackup(std::move(job)));
     while (!cut->cut_ready()) {
-      absl::Status yielded = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status yielded = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!yielded.ok()) {
         co_return Reply(reply_builder.AppendError(
             absl::StrCat("ERR RDB cut failed: ", yielded.message())));

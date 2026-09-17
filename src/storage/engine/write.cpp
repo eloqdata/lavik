@@ -498,10 +498,10 @@ Task<absl::Status> StorageEngine::Impl::MarkRecordDead(
     const RetiredRecord& record) {
   assert(record.block_owner_ < worker_count_);
   const unsigned owner = record.block_owner_;
-  if (owner == celer::ThisWorker().id_) {
+  if (owner == bycorf::ThisWorker().id_) {
     co_return MarkRecordDeadLocal(owner, record);
   }
-  co_return co_await celer::SubmitTo(owner, [this, owner, record] {
+  co_return co_await bycorf::SubmitTo(owner, [this, owner, record] {
     return MarkRecordDeadLocal(owner, record);
   });
 }
@@ -773,11 +773,11 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
         // Keep the two suspension paths as statements: GCC 13 can alias their
         // coroutine-frame slots when both are operands of one conditional.
         absl::Status requested;
-        if (fence.block_owner_ == celer::ThisWorker().id_) {
+        if (fence.block_owner_ == bycorf::ThisWorker().id_) {
           requested = co_await request();
         } else {
-          requested = co_await celer::SubmitTaskTo(fence.block_owner_,
-                                                   std::move(request));
+          requested = co_await bycorf::SubmitTaskTo(fence.block_owner_,
+                                                    std::move(request));
         }
         if (!requested.ok()) {
           batch_status = std::move(requested);
@@ -1069,7 +1069,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
                                  group.allocation_epoch_);
         } else {
           unlock.Unlock();
-          (void)co_await celer::SubmitTo(group.block_owner_, [this, group] {
+          (void)co_await bycorf::SubmitTo(group.block_owner_, [this, group] {
             UnpinTxDependencyLocal(*stores_[group.block_owner_],
                                    group.block_id_, group.allocation_epoch_);
             return true;
@@ -1089,7 +1089,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
         // publication. Abort must release that same receipt, not inspect the
         // logical key owner's unrelated transaction-block table.
         unlock.Unlock();
-        (void)co_await celer::SubmitTo(
+        (void)co_await bycorf::SubmitTo(
             previous.block_owner(), [this, previous] {
               UnpinTxDependencyLocal(*stores_[previous.block_owner()],
                                      previous.block_id(),
@@ -1169,7 +1169,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
         if (pin.block_owner_ == store.worker_->id())
           dead = co_await release();
         else
-          dead = co_await celer::SubmitTaskTo(pin.block_owner_, release);
+          dead = co_await bycorf::SubmitTaskTo(pin.block_owner_, release);
         if (!dead.ok()) break;
       }
     }
@@ -1213,10 +1213,10 @@ Task<absl::Status> StorageEngine::Impl::MarkRetiredRecordsDead(
     assert(record.block_owner_ < worker_count_);
     const unsigned owner = record.block_owner_;
     absl::Status dead;
-    if (owner == celer::ThisWorker().id_) {
+    if (owner == bycorf::ThisWorker().id_) {
       dead = MarkRecordDeadLocal(owner, record);
     } else {
-      dead = co_await celer::SubmitTo(owner, [this, owner, record] {
+      dead = co_await bycorf::SubmitTo(owner, [this, owner, record] {
         return MarkRecordDeadLocal(owner, record);
       });
     }
@@ -1265,7 +1265,7 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
               "KEYLANE_TX_ACTIVE_BLOCK_PAUSE_MS pausing foreground allocation "
               "for {} ms",
               pause_ms);
-          absl::Status paused = co_await celer::SleepFor(
+          absl::Status paused = co_await bycorf::SleepFor(
               *store.worker_, std::chrono::milliseconds(pause_ms));
           if (!paused.ok()) {
             co_await store.store_state_mutex_.Lock();
@@ -1309,7 +1309,7 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
 Task<absl::Status> StorageEngine::Impl::ReturnReservedBlock(
     ReservedBlock block) {
   const std::size_t device_index = DeviceIndexForBlock(block.block_id_);
-  co_return co_await celer::SubmitTaskTo(
+  co_return co_await bycorf::SubmitTaskTo(
       device_allocators_[device_index]->owner_,
       [this, device_index, block]() -> Task<absl::Status> {
         DeviceAllocator& allocator = *device_allocators_[device_index];
@@ -1379,7 +1379,7 @@ Task<absl::Status> StorageEngine::Impl::PrefetchStandbyBlock(
                 "KEYLANE_STANDBY_PREFETCH_PAUSE_MS pausing standby prefetch "
                 "for {} ms",
                 pause_ms);
-            pause_status = co_await celer::SleepFor(
+            pause_status = co_await bycorf::SleepFor(
                 *store->worker_, std::chrono::milliseconds(pause_ms));
           }
         });
@@ -1607,7 +1607,7 @@ StorageEngine::Impl::WriteExtentValueLocked(
       }
       if (write_ok) {
         write_status =
-            co_await celer::Fdatasync(*store.worker_, store.files_[file_id]);
+            co_await bycorf::Fdatasync(*store.worker_, store.files_[file_id]);
       }
       if (write_status.ok()) {
         auto written = co_await WriteStorageBuffer(
@@ -1624,7 +1624,7 @@ StorageEngine::Impl::WriteExtentValueLocked(
       }
       if (write_status.ok()) {
         write_status =
-            co_await celer::Fdatasync(*store.worker_, store.files_[file_id]);
+            co_await bycorf::Fdatasync(*store.worker_, store.files_[file_id]);
       }
       co_return write_status;
     };
@@ -1769,8 +1769,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         replica_write_root.has_value() ? &*replica_write_root : nullptr,
         replacement_undo, &partition,
         grouped != nullptr ? grouped->root_ : nullptr,
-        /*mark_watched=*/true,
-        mutation_precondition);
+        /*mark_watched=*/true, mutation_precondition);
     if (!status.ok()) {
       store.worker_->Spawn(ReclaimExtents(&store, *extents));
     }
@@ -1783,8 +1782,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         replica_write_root.has_value() ? &*replica_write_root : nullptr,
         replacement_undo, &partition,
         grouped != nullptr ? grouped->root_ : nullptr,
-        /*mark_watched=*/true,
-        mutation_precondition);
+        /*mark_watched=*/true, mutation_precondition);
   }
   if (status.ok() && committed_sequence != nullptr) {
     *committed_sequence = mutation_sequence;
@@ -2363,7 +2361,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   // Logical partitions route keys, but physical append streams are per
   // worker. This keeps foreground writes local and bounds active 8 MiB
   // buffers by worker count rather than logical partition count.
-  const celer::WorkerId writer_id = store.worker_->id();
+  const bycorf::WorkerId writer_id = store.worker_->id();
   // Commit records are keyless and belong to no partition: they append
   // wherever their coordinator runs, and recovery reads them independently
   // of any partition's epochs.
@@ -2395,8 +2393,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         // value while this foreground append has not acquired its final stream.
         spdlog::info("record write publication pause armed");
         store.store_state_mutex_.Unlock(*store.worker_);
-        auto paused = co_await celer::SleepFor(*store.worker_,
-                                               std::chrono::milliseconds(1000));
+        auto paused = co_await bycorf::SleepFor(
+            *store.worker_, std::chrono::milliseconds(1000));
         co_await store.store_state_mutex_.Lock();
         if (!paused.ok()) co_return paused;
       });
@@ -2686,8 +2684,8 @@ acquire_active_stream:
             "group root dependency pause owner={} key-owner={} pinned=1",
             root.block_owner(), store.worker_->id());
         store.store_state_mutex_.Unlock(*store.worker_);
-        auto paused = co_await celer::SleepFor(*store.worker_,
-                                               std::chrono::milliseconds(1000));
+        auto paused = co_await bycorf::SleepFor(
+            *store.worker_, std::chrono::milliseconds(1000));
         co_await store.store_state_mutex_.Lock();
         if (!paused.ok()) co_return paused;
       }

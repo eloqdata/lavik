@@ -19,8 +19,8 @@
 #include <vector>
 
 #include "absl/status/status.h"
-#include "celer/io/storage.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/fault_injection.h"
 #include "keylane/meta/candidate_plan.h"
@@ -779,7 +779,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanFailoverStep(
 }
 
 struct MetaFailoverReconciler::Core {
-  celer::ForeignExecutor executor_;
+  bycorf::ForeignExecutor executor_;
   MetaFailoverReconcilerOptions options_;
   // Start/stop state is owned by the executor worker. Atomics are limited to
   // the cross-thread fast paths used when Notify can no longer be accepted.
@@ -809,7 +809,7 @@ struct MetaFailoverReconciler::Core {
 };
 
 MetaFailoverReconciler::MetaFailoverReconciler(
-    celer::ForeignExecutor executor, MetaFailoverReconcilerOptions options)
+    bycorf::ForeignExecutor executor, MetaFailoverReconcilerOptions options)
     : core_(std::make_shared<Core>()) {
   if (options.observation_grace_ms_ < 0 ||
       options.poll_interval_.count() <= 0) {
@@ -840,7 +840,7 @@ void MetaFailoverReconciler::Start(MetaLeaderContext& context) {
             if (core->running_) std::terminate();
             core->cancelled_ = false;
             core->running_ = true;
-            celer::ThisWorker().self_->Spawn(
+            bycorf::ThisWorker().self_->Spawn(
                 Run(core, context, leadership_started));
           })) {
     std::terminate();
@@ -877,7 +877,7 @@ bool MetaFailoverReconciler::accepting() const {
   return !core_->stopping_.load(std::memory_order_acquire);
 }
 
-celer::Task<absl::Status> MetaFailoverReconciler::Run(
+bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
     std::shared_ptr<Core> core, MetaLeaderContext* context,
     std::int64_t leadership_started_unix_ms) {
   auto changed = std::make_shared<std::atomic<bool>>(false);
@@ -919,7 +919,7 @@ celer::Task<absl::Status> MetaFailoverReconciler::Run(
         while (!core->cancelled_ && remaining > std::chrono::milliseconds(0)) {
           const auto slice = std::min(remaining, kSlice);
           const auto slept =
-              co_await celer::SleepFor(*celer::ThisWorker().self_, slice);
+              co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, slice);
           if (!slept.ok()) {
             core->cancelled_ = true;
             break;
@@ -956,7 +956,7 @@ celer::Task<absl::Status> MetaFailoverReconciler::Run(
         while (!core->cancelled_ && remaining > std::chrono::milliseconds(0)) {
           const auto slice = std::min(remaining, kSlice);
           const auto slept =
-              co_await celer::SleepFor(*celer::ThisWorker().self_, slice);
+              co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, slice);
           if (!slept.ok()) {
             core->cancelled_ = true;
             break;
@@ -995,7 +995,7 @@ celer::Task<absl::Status> MetaFailoverReconciler::Run(
         while (!core->cancelled_ && remaining > std::chrono::milliseconds(0)) {
           const auto slice = std::min(remaining, kSlice);
           const auto slept =
-              co_await celer::SleepFor(*celer::ThisWorker().self_, slice);
+              co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, slice);
           if (!slept.ok()) {
             core->cancelled_ = true;
             break;
@@ -1041,7 +1041,7 @@ celer::Task<absl::Status> MetaFailoverReconciler::Run(
         while (!core->cancelled_ && remaining > std::chrono::milliseconds(0)) {
           const auto slice = std::min(remaining, kSlice);
           const auto slept =
-              co_await celer::SleepFor(*celer::ThisWorker().self_, slice);
+              co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, slice);
           if (!slept.ok()) {
             core->cancelled_ = true;
             break;
@@ -1090,8 +1090,8 @@ celer::Task<absl::Status> MetaFailoverReconciler::Run(
       last_error.clear();
     }
 
-    const auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                                core->options_.poll_interval_);
+    const auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                                 core->options_.poll_interval_);
     if (!slept.ok()) break;
   }
 

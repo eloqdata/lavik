@@ -2,7 +2,7 @@
 
 // Streaming transport adapter for the Meta <-> Data control protocol. It is
 // deliberately separate from control_protocol: framing/codecs stay usable in
-// pure tests, while this module owns Celer socket reads and writes.
+// pure tests, while this module owns Bycorf socket reads and writes.
 
 #include <array>
 #include <chrono>
@@ -18,8 +18,8 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/net/tcp_stream.h"
-#include "celer/runtime/task.h"
+#include "bycorf/net/tcp_stream.h"
+#include "bycorf/runtime/task.h"
 #include "keylane/cluster/control_protocol.h"
 
 namespace keylane::cluster::control {
@@ -32,7 +32,7 @@ class ControlDeadlineWatchdog {
  public:
   using ExpireCallback = std::function<void()>;
 
-  ControlDeadlineWatchdog(celer::Worker& worker,
+  ControlDeadlineWatchdog(bycorf::Worker& worker,
                           ExpireCallback expire_callback);
   ~ControlDeadlineWatchdog();
 
@@ -46,7 +46,7 @@ class ControlDeadlineWatchdog {
   friend class ControlDeadlineWatchdogTestPeer;
   struct State;
 
-  static celer::Task<absl::Status> Watch(std::shared_ptr<State> state);
+  static bycorf::Task<absl::Status> Watch(std::shared_ptr<State> state);
   std::uint64_t TaskStartsForTest() const noexcept;
 
   std::shared_ptr<State> state_;
@@ -99,7 +99,7 @@ class ControlWriteQueue {
 // declared payload, so frame boundaries never depend on TCP packetization.
 class ControlFrameStream {
  public:
-  explicit ControlFrameStream(celer::TcpStream& stream,
+  explicit ControlFrameStream(bycorf::TcpStream& stream,
                               std::chrono::nanoseconds write_progress_timeout =
                                   std::chrono::seconds(10));
   ~ControlFrameStream();
@@ -107,31 +107,31 @@ class ControlFrameStream {
   ControlFrameStream(const ControlFrameStream&) = delete;
   ControlFrameStream& operator=(const ControlFrameStream&) = delete;
 
-  // Must run before TLS/application reads. It disables Celer's multishot
+  // Must run before TLS/application reads. It disables Bycorf's multishot
   // prefetch so the bounded protocol state is also the socket ingress bound.
   absl::Status Prepare() noexcept;
 
-  celer::Task<absl::StatusOr<Frame>> ReadFrame();
-  celer::Task<absl::StatusOr<WireMessage>> ReadMessage();
+  bycorf::Task<absl::StatusOr<Frame>> ReadFrame();
+  bycorf::Task<absl::StatusOr<WireMessage>> ReadMessage();
 
   // before_write runs after framing and immediately before the first
   // WriteAll. Lease challenges use it to capture the only valid sent_at.
-  celer::Task<absl::Status> WriteMessage(
+  bycorf::Task<absl::Status> WriteMessage(
       const WireMessage& message,
       std::function<void()> before_write = std::function<void()>{});
 
  private:
   struct WriteDeadlineState;
-  static celer::Task<absl::Status> WatchWriteDeadline(
+  static bycorf::Task<absl::Status> WatchWriteDeadline(
       std::shared_ptr<WriteDeadlineState> state);
   absl::Status ArmWriteDeadline();
   bool DisarmWriteDeadline() noexcept;
 
-  celer::Task<absl::Status> ReadExactly(std::span<std::byte> destination);
-  celer::Task<absl::Status> WriteEncoded(std::string encoded,
-                                         std::function<void()> before_write);
+  bycorf::Task<absl::Status> ReadExactly(std::span<std::byte> destination);
+  bycorf::Task<absl::Status> WriteEncoded(std::string encoded,
+                                          std::function<void()> before_write);
 
-  celer::TcpStream& stream_;
+  bycorf::TcpStream& stream_;
   const std::chrono::nanoseconds write_progress_timeout_;
   std::shared_ptr<WriteDeadlineState> write_deadline_;
   FrameEncoder encoder_;
@@ -150,7 +150,7 @@ class ControlFrameStream {
 // drain loop until every item admitted in that drain epoch has completed.
 class ControlSessionWriter {
  public:
-  using WriteFunction = std::function<celer::Task<absl::Status>(
+  using WriteFunction = std::function<bycorf::Task<absl::Status>(
       WireMessage, std::function<void()>)>;
 
   ControlSessionWriter(ControlFrameStream& frames, std::size_t max_queue_bytes);
@@ -163,7 +163,7 @@ class ControlSessionWriter {
   ControlSessionWriter(const ControlSessionWriter&) = delete;
   ControlSessionWriter& operator=(const ControlSessionWriter&) = delete;
 
-  celer::Task<absl::Status> Write(
+  bycorf::Task<absl::Status> Write(
       MessagePriority priority, WireMessage message,
       std::function<void()> before_write = std::function<void()>{});
 
@@ -172,7 +172,7 @@ class ControlSessionWriter {
   // Start/Chunk/End transfer path, where bulk chunks remain preemptible by
   // authority and reliable frames. FDS schema validation precedes installation;
   // streamed objects also require contiguous offsets and exact total length.
-  celer::Task<absl::Status> WriteFullDesiredState(
+  bycorf::Task<absl::Status> WriteFullDesiredState(
       std::shared_ptr<const std::string> encoded);
 
   // The immutable owner is retained by the scheduled request. This keeps a
@@ -181,7 +181,7 @@ class ControlSessionWriter {
   // potentially 512 MiB object. Transfers are serialized as complete
   // Start/Chunk/End sequences; ordinary authority/reliable messages may still
   // pass between chunks.
-  celer::Task<absl::Status> WriteTransfer(
+  bycorf::Task<absl::Status> WriteTransfer(
       TransferKind kind, WireId128 object_id,
       std::shared_ptr<const std::string> bytes);
 
@@ -193,7 +193,7 @@ class ControlSessionWriter {
   struct Request;
   struct Impl;
 
-  celer::Task<absl::Status> Drive();
+  bycorf::Task<absl::Status> Drive();
   std::unique_ptr<Impl> impl_;
 };
 

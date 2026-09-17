@@ -13,14 +13,14 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/net/tcp_stream.h"
-#include "celer/runtime/task.h"
+#include "bycorf/net/tcp_stream.h"
+#include "bycorf/runtime/task.h"
 #include "keylane/replication_group.h"
 
-namespace celer {
+namespace bycorf {
 class TlsContext;
 class Worker;
-}  // namespace celer
+}  // namespace bycorf
 
 namespace keylane::storage {
 class StorageEngine;
@@ -92,7 +92,7 @@ struct ReplicationOptions {
   // and CLUSTER NODES can identify the replica's Redis endpoint.
   std::uint16_t listen_port_ = 6379;
   bool use_tls_ = false;
-  std::shared_ptr<celer::TlsContext> tls_context_;
+  std::shared_ptr<bycorf::TlsContext> tls_context_;
   std::string masteruser_ = "default";
   std::string masterauth_;
   // Global in-memory history quota. Chunks are allocated lazily and distributed
@@ -418,7 +418,7 @@ class ClusterRebuildCompletion {
  public:
   ClusterRebuildCompletion() = default;
 
-  celer::Task<absl::Status> Await() const;
+  bycorf::Task<absl::Status> Await() const;
   // Lock-safe nonblocking observation used by a control session whose wire
   // lifetime may end before the underlying rebuild attempt does.
   std::optional<absl::Status> result() const;
@@ -442,7 +442,7 @@ class ClusterPromotionPrepareCompletion {
 
   ClusterPromotionPrepareCompletion() = default;
 
-  celer::Task<Result> Await() const;
+  bycorf::Task<Result> Await() const;
   std::optional<Result> result() const;
   bool valid() const noexcept { return state_ != nullptr; }
 
@@ -498,18 +498,18 @@ class ReplicationManager {
   ReplicationManager& operator=(const ReplicationManager&) = delete;
   ~ReplicationManager();
 
-  void StorageReady(celer::Worker& worker);
+  void StorageReady(bycorf::Worker& worker);
 
   // The deep group interface: administrative changes enter as directives,
   // peer sockets enter through the handlers below, and Observe returns one
   // coherent control-plane snapshot without blocking the caller's runtime
   // worker while another worker updates the native session registry.
-  celer::Task<absl::Status> ApplyDirective(ReplicationDirective directive);
-  celer::Task<ReplicationStatus> Observe() const;
+  bycorf::Task<absl::Status> ApplyDirective(ReplicationDirective directive);
+  bycorf::Task<ReplicationStatus> Observe() const;
 
   // Copies the current node, boot, and local history identities without
   // collecting replication progress or downstream session status.
-  celer::Task<ReplicationIdentity> ObserveIdentity() const;
+  bycorf::Task<ReplicationIdentity> ObserveIdentity() const;
 
   // Copies the immutable desired-upstream snapshot. Runtime workers cache it
   // locally; unchanged reads require no cross-worker hop or shared refcount
@@ -521,7 +521,7 @@ class ReplicationManager {
   // callers that acknowledge a directive must Await() the returned handle.
   // Exact replay shares the original completion, while supersession resolves
   // the older handle only after cancellation/join/abort has finished.
-  celer::Task<absl::StatusOr<ClusterRebuildCompletion>>
+  bycorf::Task<absl::StatusOr<ClusterRebuildCompletion>>
   StartClusterRebuildDirective(ReplicaOfConfig upstream,
                                RebuildDirective directive,
                                PopulationManifest manifest);
@@ -532,7 +532,7 @@ class ReplicationManager {
   // attempt shares its original completion without resetting storage again;
   // an invalidated proof requires a fresh attempt identity. Success resolves
   // only after durable root promotion and ReadyToken publication.
-  celer::Task<absl::StatusOr<ClusterRebuildCompletion>>
+  bycorf::Task<absl::StatusOr<ClusterRebuildCompletion>>
   StartEmptyPopulationInitialization(RebuildIdentity identity,
                                      PopulationManifest manifest);
 
@@ -550,7 +550,7 @@ class ReplicationManager {
   // authority workflow may activate only after a later FDS plus current-session
   // lease. Exact replay returns the original completion and evidence without
   // repeating local side effects.
-  celer::Task<absl::StatusOr<ClusterPromotionPrepareCompletion>>
+  bycorf::Task<absl::StatusOr<ClusterPromotionPrepareCompletion>>
   StartClusterPromotionPrepareDirective(
       ClusterPromotionPrepareDirective directive);
 
@@ -558,12 +558,12 @@ class ReplicationManager {
   // NodeControl has published paused mutation admission and drained earlier
   // work. Replacement retains the existing expiration pause while recapturing
   // exact evidence; null releases exactly the pause owned by this context.
-  celer::Task<absl::Status> ReconcileClusterSourcePause(
+  bycorf::Task<absl::Status> ReconcileClusterSourcePause(
       std::optional<DesiredClusterSourcePause> desired);
 
   // Returns SourcePaused input only after the native history and all flow
   // frontiers match the current desired source incarnation.
-  celer::Task<ClusterSourcePauseStatus> cluster_source_pause_status() const;
+  bycorf::Task<ClusterSourcePauseStatus> cluster_source_pause_status() const;
 
   // Reconciles the current committed candidate action. Authorization is a
   // one-way gate; exact replay is a no-op. Replacement/removal withdraws old
@@ -573,7 +573,7 @@ class ReplicationManager {
   // activation; that context and its child log are retained but no longer
   // reported as transition progress. Catch-up remains owned by the ordinary
   // population coordinator and does not delay this desired-state boundary.
-  celer::Task<absl::Status> ReconcileClusterFailoverAction(
+  bycorf::Task<absl::Status> ReconcileClusterFailoverAction(
       std::optional<DesiredClusterFailoverAction> desired,
       std::optional<ClusterFailoverActionId> pending_activation_action_id =
           std::nullopt);
@@ -581,31 +581,31 @@ class ReplicationManager {
   // Returns a coherent boot-local action observation. Meta may publish only a
   // matching Prepared or Failed terminal state; waiting/retrying states are
   // local diagnostics and are never durable workflow progress.
-  celer::Task<ClusterFailoverActionStatus> cluster_failover_action_status()
+  bycorf::Task<ClusterFailoverActionStatus> cluster_failover_action_status()
       const;
 
   // Returns the private boot-local context retained across a successful
   // Cutover FDS. This is an activation precondition lookup, not a heartbeat
   // observation: transition progress disappears as soon as the transition is
   // removed, while only the grant's exact action id may retrieve the context.
-  celer::Task<std::optional<ClusterFailoverPreparedContext>>
+  bycorf::Task<std::optional<ClusterFailoverPreparedContext>>
   FindClusterFailoverPreparedContext(
       const ClusterFailoverActionId& action_id) const;
 
   // Activates only a retained prepared context whose action, population, boot,
   // target term, and live child history all still match. Exact replay is a
   // no-op. This never resumes expiration or installs lease authority.
-  celer::Task<absl::Status> ActivateClusterPreparedPromotion(
+  bycorf::Task<absl::Status> ActivateClusterPreparedPromotion(
       ClusterFailoverActivation activation);
 
   // Installs finite active-expiration authority after NodeControl's final
   // lease/FDS recheck. The absolute deadline uses CLOCK_BOOTTIME semantics.
-  celer::Task<absl::Status> EnableClusterExpirationAuthorityUntil(
+  bycorf::Task<absl::Status> EnableClusterExpirationAuthorityUntil(
       std::chrono::nanoseconds deadline_since_boot);
 
   // Revokes future active-expiration work and drains any already-entered
   // cycle without disturbing an outer controlled-source pause.
-  celer::Task<absl::Status> RevokeClusterExpirationAuthority();
+  bycorf::Task<absl::Status> RevokeClusterExpirationAuthority();
 
   // Reconciles the ordinary post-Cutover relationship without a Meta rebuild
   // operation. Exact replay leaves a healthy coordinator/export untouched;
@@ -613,22 +613,22 @@ class ReplicationManager {
   // preserves its usable population until the new Owner has authenticated and
   // published an export-ready native incarnation, then the existing
   // CONTINUE/FULL machinery decides whether replacement is necessary.
-  celer::Task<absl::Status> ReconcileClusterFollowOwner(
+  bycorf::Task<absl::Status> ReconcileClusterFollowOwner(
       std::optional<DesiredClusterUpstream> desired);
 
   // Convenience wrapper that starts and awaits one full rebuild. Production
   // NodeControl uses StartClusterRebuildDirective so wire admission and later
   // terminal observation remain distinct; this wrapper returns success only
   // after the exact attempt publishes its ReadyToken following promotion.
-  celer::Task<absl::Status> ApplyClusterRebuildDirective(
+  bycorf::Task<absl::Status> ApplyClusterRebuildDirective(
       ReplicaOfConfig upstream, RebuildDirective directive,
       PopulationManifest manifest);
 
   // Process-shutdown barrier for Meta-managed target rebuilds. It closes the
   // native session immediately on worker zero, then returns only after the
   // coordinator has joined its flows and retired any partial candidate root.
-  // This must run while the Celer runtime and StorageEngine are still alive.
-  celer::Task<absl::Status> CancelClusterRebuildForShutdown();
+  // This must run while the Bycorf runtime and StorageEngine are still alive.
+  bycorf::Task<absl::Status> CancelClusterRebuildForShutdown();
 
   // Thread-safe first half of process shutdown. It closes outbound target
   // handshakes/sessions and inbound native/Redis source sockets immediately.
@@ -641,26 +641,26 @@ class ReplicationManager {
   // incomplete replacement root, and retires source egress/history before
   // storage freezes its index. RequestShutdown must be called first by a
   // non-runtime waiter; calling this coroutine also performs it idempotently.
-  celer::Task<absl::Status> QuiesceForShutdown();
+  bycorf::Task<absl::Status> QuiesceForShutdown();
 
   // Reconciles the runtime-only target population with an installed FDS.
   // A mismatch (or null desired identity) closes serving immediately, joins
   // native flows, aborts a partial root, retires the ReadyToken/attempt, and
   // resolves its completion. Unlike shutdown cancellation, later directives
   // remain admissible.
-  celer::Task<absl::Status> ReconcileClusterPopulation(
+  bycorf::Task<absl::Status> ReconcileClusterPopulation(
       std::optional<DesiredClusterPopulation> desired);
 
   // Transport loss cannot leave an unobserved destructive directive running.
   // A completed Ready population is retained. The caller may additionally
   // preserve the exact live level-triggered FollowOwner attempt whose history
   // rotation caused a Meta-session replacement; strong fences pass false.
-  celer::Task<absl::Status> CancelInProgressClusterPopulation(
+  bycorf::Task<absl::Status> CancelInProgressClusterPopulation(
       bool preserve_current_follow_attempt);
 
   // Returns one coherent boot-scoped population snapshot for heartbeat
   // candidate reporting and directive validation.
-  celer::Task<ClusterPopulationStatus> cluster_population_status() const;
+  bycorf::Task<ClusterPopulationStatus> cluster_population_status() const;
 
   // Installs one safe-source authorization delivered through the node
   // controller. A cluster node exports a population only when it is itself
@@ -670,7 +670,7 @@ class ReplicationManager {
   // active, and a revoked version cannot be replayed. Until a committed
   // primary-activation transition supplies its authority fence, export stays
   // fail-closed.
-  celer::Task<absl::Status> AuthorizeClusterRebuildSource(
+  bycorf::Task<absl::Status> AuthorizeClusterRebuildSource(
       RebuildDirective directive);
 
   // Revokes every downstream destructive-reset capability and reconnect lease
@@ -679,12 +679,12 @@ class ReplicationManager {
   // revocation; revoking an empty ledger is an idempotent no-op. Standalone
   // managers reject this cluster-only transition without disturbing ordinary
   // downstream replication sessions.
-  celer::Task<absl::Status> RevokeClusterRebuildSourceAuthorizations();
+  bycorf::Task<absl::Status> RevokeClusterRebuildSourceAuthorizations();
 
   // Opens the O(1) lease gate for new POPULATION handshakes. This never
   // creates a capability; the exact current FDS must already authorize one or
   // replay it after a live projection refresh.
-  celer::Task<absl::Status> EnableClusterRebuildSourceAdmissionUntil(
+  bycorf::Task<absl::Status> EnableClusterRebuildSourceAdmissionUntil(
       std::chrono::nanoseconds deadline_since_boot);
 
   // Clears capabilities inherited from an older desired-state projection
@@ -693,7 +693,7 @@ class ReplicationManager {
   // still cleared, and NodeControl invalidates the write lease until a
   // replacement FDS validates their group. Live FDS replacement has a
   // separate, stronger retention rule below.
-  celer::Task<absl::Status>
+  bycorf::Task<absl::Status>
   ClearClusterRebuildSourceAuthorizationsForSessionReplacement(
       bool preserve_established_exports = false);
 
@@ -703,7 +703,7 @@ class ReplicationManager {
   // all current capabilities arrive. When the replacement proves the exact
   // export scope unchanged, every already-published POPULATION session is
   // retained, including sessions between control admission and ONLINE.
-  celer::Task<absl::Status>
+  bycorf::Task<absl::Status>
   RefreshClusterRebuildSourceAuthorizationsForFdsReplacement(
       bool preserve_current_population_exports = false,
       std::size_t expected_authorization_replays = 0);
@@ -719,28 +719,26 @@ class ReplicationManager {
 
   // KLPSYNC and KLFLOW arrive as RESP commands on the ordinary Redis port.
   static bool IsNativeHandshake(std::span<const std::string> args) noexcept;
-  celer::Task<absl::Status> ServeNativeConnection(celer::TcpStream& stream,
-                                                  std::vector<std::string> args,
-                                                  std::uint64_t client_id,
-                                                  std::string client_address,
-                                                  bool tls);
-  celer::Task<absl::Status> ServeRedisExportConnection(
-      celer::TcpStream& stream, std::vector<std::string> args,
+  bycorf::Task<absl::Status> ServeNativeConnection(
+      bycorf::TcpStream& stream, std::vector<std::string> args,
+      std::uint64_t client_id, std::string client_address, bool tls);
+  bycorf::Task<absl::Status> ServeRedisExportConnection(
+      bycorf::TcpStream& stream, std::vector<std::string> args,
       std::uint64_t client_id, std::string client_address, bool tls,
       bool eof_capable);
 
   // Captures all source commands already queued on every worker. A missing
   // value means no native replication history is currently active; callers
   // may retry if they are waiting for a replica to connect.
-  celer::Task<absl::StatusOr<std::optional<NativeReplicationWatermark>>>
+  bycorf::Task<absl::StatusOr<std::optional<NativeReplicationWatermark>>>
   CaptureNativeReplicationWatermark();
   // Returns nullopt when the watermark belongs to an obsolete source history.
   // A replica counts only after every native flow acknowledges the cut.
-  celer::Task<std::optional<std::uint64_t>> CountAcknowledgedNativeReplicas(
+  bycorf::Task<std::optional<std::uint64_t>> CountAcknowledgedNativeReplicas(
       const NativeReplicationWatermark& watermark) const;
   // The initial per-connection replication offset precedes every source
   // event, so every online native replica satisfies it without a log fence.
-  celer::Task<std::uint64_t> CountOnlineNativeReplicas() const;
+  bycorf::Task<std::uint64_t> CountOnlineNativeReplicas() const;
   bool is_replica() const noexcept;
   bool is_loading() const noexcept;
   bool reject_writes() const noexcept;

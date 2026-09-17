@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "absl/strings/str_cat.h"
-#include "celer/runtime/cross_core.h"
+#include "bycorf/runtime/cross_core.h"
 #include "cluster_gate.h"
 #include "keylane/expiration.h"
 #include "keylane/memory.h"
@@ -52,7 +52,7 @@ absl::Status WrongType() {
       "WRONGTYPE Operation against a key holding the wrong kind of value");
 }
 
-celer::Task<absl::StatusOr<std::optional<storage::RawValue>>>
+bycorf::Task<absl::StatusOr<std::optional<storage::RawValue>>>
 ReadOptionalStringLocked(std::uint8_t db_id, std::string_view key,
                          const storage::Digest& digest) {
   auto value = co_await g_storage->ReadRawValueLocked(db_id, key, digest);
@@ -468,7 +468,7 @@ absl::StatusOr<bool> ParseBitmapUnit(std::string_view unit) {
   return absl::InvalidArgumentError("syntax error");
 }
 
-celer::Task<std::string> RunBitmapLocked(
+bycorf::Task<std::string> RunBitmapLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx,
     const storage::MutationPrecondition* mutation_precondition) {
@@ -662,7 +662,7 @@ celer::Task<std::string> RunBitmapLocked(
   co_return status.ok() ? reply : StorageError(status);
 }
 
-celer::Task<std::string> RunStringLocked(
+bycorf::Task<std::string> RunStringLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx,
     const storage::MutationPrecondition* mutation_precondition) {
@@ -1154,8 +1154,8 @@ struct LcsReadContext {
   std::string values_[2];
 };
 
-celer::Task<absl::Status> LcsReadCallback(void* opaque,
-                                          const tx::ShardSlice& slice) {
+bycorf::Task<absl::Status> LcsReadCallback(void* opaque,
+                                           const tx::ShardSlice& slice) {
   auto* context = static_cast<LcsReadContext*>(opaque);
   for (const tx::TxKey& key : slice.keys_) {
     auto value = co_await ReadOptionalStringLocked(
@@ -1265,8 +1265,8 @@ absl::Status PrepareBitOpReplication(BitOpContext* context) noexcept {
   }
 }
 
-celer::Task<absl::Status> ReadBitOpSources(BitOpContext* context,
-                                           const tx::ShardSlice& slice) {
+bycorf::Task<absl::Status> ReadBitOpSources(BitOpContext* context,
+                                            const tx::ShardSlice& slice) {
   for (const tx::TxKey& key : slice.keys_) {
     if (key.arg_index_ < 3) continue;
     auto value = co_await ReadOptionalStringLocked(
@@ -1279,14 +1279,14 @@ celer::Task<absl::Status> ReadBitOpSources(BitOpContext* context,
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> BitOpReadCallback(void* opaque,
-                                            const tx::ShardSlice& slice) {
+bycorf::Task<absl::Status> BitOpReadCallback(void* opaque,
+                                             const tx::ShardSlice& slice) {
   return ReadBitOpSources(static_cast<BitOpContext*>(opaque), slice);
 }
 
-celer::Task<absl::Status> WriteBitOpDestination(BitOpContext* context,
-                                                const storage::Digest& digest,
-                                                storage::TxShardWrites* tx) {
+bycorf::Task<absl::Status> WriteBitOpDestination(BitOpContext* context,
+                                                 const storage::Digest& digest,
+                                                 storage::TxShardWrites* tx) {
   const auto& request = *context->request_;
   const storage::MutationPrecondition* mutation_precondition =
       tx == nullptr ? &context->mutation_precondition_ : nullptr;
@@ -1302,8 +1302,8 @@ celer::Task<absl::Status> WriteBitOpDestination(BitOpContext* context,
   co_return written.ok() ? absl::OkStatus() : written.status();
 }
 
-celer::Task<absl::Status> BitOpWriteCallback(void* opaque,
-                                             const tx::ShardSlice& slice) {
+bycorf::Task<absl::Status> BitOpWriteCallback(void* opaque,
+                                              const tx::ShardSlice& slice) {
   auto* context = static_cast<BitOpContext*>(opaque);
   for (const tx::TxKey& key : slice.keys_) {
     if (key.arg_index_ == 2) {
@@ -1313,7 +1313,7 @@ celer::Task<absl::Status> BitOpWriteCallback(void* opaque,
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> BitOpSingleShardCallback(
+bycorf::Task<absl::Status> BitOpSingleShardCallback(
     void* opaque, const tx::ShardSlice& slice) {
   auto* context = static_cast<BitOpContext*>(opaque);
   absl::Status read = co_await ReadBitOpSources(context, slice);
@@ -1335,8 +1335,8 @@ void InitStringCommandStorage(storage::StorageEngine* engine) {
   g_storage = engine;
 }
 
-celer::Task<CommandReply> ExecuteStringCommand(const CommandRequest& request,
-                                               ReplyBuilder& reply_builder) {
+bycorf::Task<CommandReply> ExecuteStringCommand(const CommandRequest& request,
+                                                ReplyBuilder& reply_builder) {
   const storage::Digest digest = storage::ComputeDigest(request.args_[1]);
   const bool read_only = request.kind_ == CommandKind::kGetRange ||
                          request.kind_ == CommandKind::kSubstr;
@@ -1349,7 +1349,7 @@ celer::Task<CommandReply> ExecuteStringCommand(const CommandRequest& request,
       request, digest, nullptr, reply_builder, &mutation_precondition);
 }
 
-celer::Task<CommandReply> ExecuteStringCommandLocked(
+bycorf::Task<CommandReply> ExecuteStringCommandLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
     const storage::MutationPrecondition* mutation_precondition) {
@@ -1376,8 +1376,8 @@ celer::Task<CommandReply> ExecuteStringCommandLocked(
   co_return Built(reply_builder.AppendRaw(encoded));
 }
 
-celer::Task<CommandReply> ExecuteBitmapCommand(const CommandRequest& request,
-                                               ReplyBuilder& reply_builder) {
+bycorf::Task<CommandReply> ExecuteBitmapCommand(const CommandRequest& request,
+                                                ReplyBuilder& reply_builder) {
   const storage::Digest digest = storage::ComputeDigest(request.args_[1]);
   const bool read_only = request.kind_ != CommandKind::kSetBit &&
                          request.kind_ != CommandKind::kBitField;
@@ -1390,7 +1390,7 @@ celer::Task<CommandReply> ExecuteBitmapCommand(const CommandRequest& request,
       request, digest, nullptr, reply_builder, &mutation_precondition);
 }
 
-celer::Task<CommandReply> ExecuteBitmapCommandLocked(
+bycorf::Task<CommandReply> ExecuteBitmapCommandLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
     const storage::MutationPrecondition* mutation_precondition) {
@@ -1399,8 +1399,8 @@ celer::Task<CommandReply> ExecuteBitmapCommandLocked(
   co_return Built(reply_builder.AppendRaw(encoded));
 }
 
-celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
-                                              ReplyBuilder& reply_builder) {
+bycorf::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
+                                               ReplyBuilder& reply_builder) {
   auto operation = ParseBitOp(request);
   if (!operation.ok()) {
     co_return Built(reply_builder.AppendError(
@@ -1478,7 +1478,7 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
   co_return Built(reply_builder.AppendInteger(context.output_.size()));
 }
 
-celer::Task<std::string> ExecuteBitOpLocked(
+bycorf::Task<std::string> ExecuteBitOpLocked(
     const CommandRequest& request, std::span<const StringExecKey> locked_keys,
     std::vector<storage::TxShardWrites>& tx_writes) {
   MarkReplicationCommandHandled(request);
@@ -1511,10 +1511,10 @@ celer::Task<std::string> ExecuteBitOpLocked(
     };
     absl::StatusOr<std::optional<storage::RawValue>> value{
         absl::UnknownError("BITOP source read was not dispatched")};
-    if (key->owner_ == celer::ThisWorker().id_) {
+    if (key->owner_ == bycorf::ThisWorker().id_) {
       value = co_await read();
     } else {
-      value = co_await celer::SubmitTaskTo(key->owner_, read);
+      value = co_await bycorf::SubmitTaskTo(key->owner_, read);
     }
     if (!value.ok()) co_return StorageError(value.status());
     context.inputs_[argument] =
@@ -1529,10 +1529,10 @@ celer::Task<std::string> ExecuteBitOpLocked(
                                  &tx_writes[destination->owner_]);
   };
   absl::Status status;
-  if (destination->owner_ == celer::ThisWorker().id_) {
+  if (destination->owner_ == bycorf::ThisWorker().id_) {
     status = co_await write();
   } else {
-    status = co_await celer::SubmitTaskTo(destination->owner_, write);
+    status = co_await bycorf::SubmitTaskTo(destination->owner_, write);
   }
   if (!status.ok()) co_return StorageError(status);
   CaptureReplicationCommand(
@@ -1543,8 +1543,8 @@ celer::Task<std::string> ExecuteBitOpLocked(
   co_return EncodeInteger(context.output_.size());
 }
 
-celer::Task<CommandReply> ExecuteLcsCommand(const CommandRequest& request,
-                                            ReplyBuilder& reply_builder) {
+bycorf::Task<CommandReply> ExecuteLcsCommand(const CommandRequest& request,
+                                             ReplyBuilder& reply_builder) {
   tx::Transaction transaction;
   for (std::size_t argument = 1; argument <= 2; ++argument) {
     transaction.AddKey(
@@ -1576,7 +1576,7 @@ celer::Task<CommandReply> ExecuteLcsCommand(const CommandRequest& request,
                               absl::StrCat("ERR ", result.status().message())));
 }
 
-celer::Task<std::string> ExecuteLcsLocked(
+bycorf::Task<std::string> ExecuteLcsLocked(
     const CommandRequest& request, std::span<const StringExecKey> locked_keys) {
   std::string values[2];
   // Preserve the GCC 13 coroutine-frame invariant from BITOP: each possible
@@ -1596,10 +1596,10 @@ celer::Task<std::string> ExecuteLcsLocked(
     };
     absl::StatusOr<std::optional<storage::RawValue>> value{
         absl::UnknownError("LCS source read was not dispatched")};
-    if (key->owner_ == celer::ThisWorker().id_) {
+    if (key->owner_ == bycorf::ThisWorker().id_) {
       value = co_await read();
     } else {
-      value = co_await celer::SubmitTaskTo(key->owner_, read);
+      value = co_await bycorf::SubmitTaskTo(key->owner_, read);
     }
     if (!value.ok()) {
       if (value.status().message().starts_with("WRONGTYPE ")) {

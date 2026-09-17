@@ -12,10 +12,10 @@
 #include <utility>
 
 #include "absl/strings/str_cat.h"
-#include "celer/net/http_service.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/cycle_clock.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/net/http_service.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/cycle_clock.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/command_table.h"
 #include "keylane/memory.h"
 #include "keylane/storage/engine.h"
@@ -60,7 +60,7 @@ static_assert(sizeof(WorkerMetricsShard) % 64 == 0);
 static_assert(alignof(WorkerMetricsData) <= alignof(std::max_align_t));
 static_assert(alignof(WorkerMetricsTransfer) <= alignof(std::max_align_t));
 static_assert(alignof(WorkerMetricsSnapshot) <= alignof(std::max_align_t));
-static_assert(alignof(celer::Worker::StorageIoStats) <=
+static_assert(alignof(bycorf::Worker::StorageIoStats) <=
               alignof(std::max_align_t));
 
 std::unique_ptr<WorkerMetricsShard[]> g_worker_metrics;
@@ -162,7 +162,7 @@ std::uint64_t WorkerMetricsSnapshot::TotalCalls() const noexcept {
 void InitWorkerMetrics(unsigned worker_count) {
   g_worker_metrics = std::make_unique<WorkerMetricsShard[]>(worker_count);
   g_worker_metrics_count = worker_count;
-  g_counter_frequency = std::max(1.0, celer::CycleCounterFrequency());
+  g_counter_frequency = std::max(1.0, bycorf::CycleCounterFrequency());
   for (std::size_t i = 0; i < kCommandLatencyBucketUpperUs.size(); ++i) {
     const long double ticks =
         static_cast<long double>(g_counter_frequency) *
@@ -174,33 +174,33 @@ void InitWorkerMetrics(unsigned worker_count) {
 }
 
 void RecordConnectionOpened() noexcept {
-  ++g_worker_metrics[celer::ThisWorker().id_].connected_clients_;
+  ++g_worker_metrics[bycorf::ThisWorker().id_].connected_clients_;
 }
 
 void RecordConnectionClosed() noexcept {
-  --g_worker_metrics[celer::ThisWorker().id_].connected_clients_;
+  --g_worker_metrics[bycorf::ThisWorker().id_].connected_clients_;
 }
 
 void RecordClientBlocked() noexcept {
-  ++g_worker_metrics[celer::ThisWorker().id_].blocked_clients_;
+  ++g_worker_metrics[bycorf::ThisWorker().id_].blocked_clients_;
 }
 
 void RecordClientUnblocked() noexcept {
-  WorkerMetricsShard& shard = g_worker_metrics[celer::ThisWorker().id_];
+  WorkerMetricsShard& shard = g_worker_metrics[bycorf::ThisWorker().id_];
   assert(shard.blocked_clients_ != 0);
   --shard.blocked_clients_;
 }
 
 void RecordDatasetChanges(std::uint64_t count) noexcept {
-  g_worker_metrics[celer::ThisWorker().id_].dataset_changes_total_ += count;
+  g_worker_metrics[bycorf::ThisWorker().id_].dataset_changes_total_ += count;
 }
 
 std::uint64_t LocalDatasetChangesTotal() noexcept {
-  return g_worker_metrics[celer::ThisWorker().id_].dataset_changes_total_;
+  return g_worker_metrics[bycorf::ThisWorker().id_].dataset_changes_total_;
 }
 
 void MarkLocalDatasetChangesSaved(std::uint64_t total) noexcept {
-  WorkerMetricsShard& shard = g_worker_metrics[celer::ThisWorker().id_];
+  WorkerMetricsShard& shard = g_worker_metrics[bycorf::ThisWorker().id_];
   // Only one RDB job is active today, but max keeps this correct if completed
   // jobs are ever allowed to retire out of order.
   shard.dataset_changes_saved_ =
@@ -210,7 +210,7 @@ void MarkLocalDatasetChangesSaved(std::uint64_t total) noexcept {
 
 void RecordReplicationConnectionOpened(
     ReplicationConnectionKind kind) noexcept {
-  WorkerMetricsShard& shard = g_worker_metrics[celer::ThisWorker().id_];
+  WorkerMetricsShard& shard = g_worker_metrics[bycorf::ThisWorker().id_];
   if (kind == ReplicationConnectionKind::kControl) {
     ++shard.replication_control_connections_;
   } else {
@@ -220,7 +220,7 @@ void RecordReplicationConnectionOpened(
 
 void RecordReplicationConnectionClosed(
     ReplicationConnectionKind kind) noexcept {
-  WorkerMetricsShard& shard = g_worker_metrics[celer::ThisWorker().id_];
+  WorkerMetricsShard& shard = g_worker_metrics[bycorf::ThisWorker().id_];
   if (kind == ReplicationConnectionKind::kControl) {
     --shard.replication_control_connections_;
   } else {
@@ -229,7 +229,7 @@ void RecordReplicationConnectionClosed(
 }
 
 void RecordDefragMetric(DefragMetricResult result) noexcept {
-  WorkerMetricsShard& shard = g_worker_metrics[celer::ThisWorker().id_];
+  WorkerMetricsShard& shard = g_worker_metrics[bycorf::ThisWorker().id_];
   switch (result) {
     case DefragMetricResult::kSuccess:
       ++shard.defrag_successes_;
@@ -244,16 +244,16 @@ void RecordDefragMetric(DefragMetricResult result) noexcept {
 }
 
 void SetDefragActive(bool active) noexcept {
-  g_worker_metrics[celer::ThisWorker().id_].active_defrags_ = active;
+  g_worker_metrics[bycorf::ThisWorker().id_].active_defrags_ = active;
 }
 
 void SetDefragPending(bool pending) noexcept {
-  g_worker_metrics[celer::ThisWorker().id_].pending_defrags_ = pending;
+  g_worker_metrics[bycorf::ThisWorker().id_].pending_defrags_ = pending;
 }
 
 void RecordCommandMetric(CommandKind kind,
                          std::uint64_t elapsed_ticks) noexcept {
-  const unsigned worker = celer::ThisWorker().id_;
+  const unsigned worker = bycorf::ThisWorker().id_;
   std::size_t command_index = ToIndex(kind);
   if (worker >= g_worker_metrics_count) [[unlikely]] {
     return;
@@ -283,7 +283,7 @@ void RecordCommandMetric(CommandKind kind,
   ++metric.latency_bins_[bucket];
 }
 
-celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
+bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
   WorkerMetricsSnapshot result;
   result.counter_frequency_ = g_counter_frequency;
   for (unsigned worker = 0; worker < g_worker_metrics_count; ++worker) {
@@ -291,13 +291,13 @@ celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
     // Explicitly slice off the live shard's alignment before returning: pair
     // deduction from WorkerMetricsShard would over-align the coroutine frame.
     const auto [shard, connections] =
-        co_await celer::SubmitTo(worker, [worker]() -> WorkerMetricsTransfer {
+        co_await bycorf::SubmitTo(worker, [worker]() -> WorkerMetricsTransfer {
           return {
               static_cast<const WorkerMetricsData&>(g_worker_metrics[worker]),
-              celer::ThisWorker().self_->ActiveConnectionCount()};
+              bycorf::ThisWorker().self_->ActiveConnectionCount()};
         });
-    const celer::Worker::StorageIoStats storage_io = co_await celer::SubmitTo(
-        worker, [] { return celer::ThisWorker().self_->storage_io_stats(); });
+    const bycorf::Worker::StorageIoStats storage_io = co_await bycorf::SubmitTo(
+        worker, [] { return bycorf::ThisWorker().self_->storage_io_stats(); });
     result.connections_ += connections;
     result.connected_clients_ += shard.connected_clients_;
     result.blocked_clients_ += shard.blocked_clients_;
@@ -331,9 +331,9 @@ celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
   co_return result;
 }
 
-celer::Task<absl::Status> ResetCommandMetrics() {
+bycorf::Task<absl::Status> ResetCommandMetrics() {
   for (unsigned worker = 0; worker < g_worker_metrics_count; ++worker) {
-    co_await celer::SubmitTo(worker, [worker] {
+    co_await bycorf::SubmitTo(worker, [worker] {
       g_worker_metrics[worker].commands_ = {};
       return true;
     });
@@ -381,7 +381,7 @@ std::string SecondsFromMicroseconds(std::uint64_t microseconds) {
 
 }  // namespace
 
-celer::Task<absl::Status> RenderPrometheusMetrics(
+bycorf::Task<absl::Status> RenderPrometheusMetrics(
     const storage::StorageEngine& storage, bool server_ready,
     std::string* output_ptr) {
   std::string& output = *output_ptr;
@@ -775,15 +775,15 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
   co_return absl::OkStatus();
 }
 
-std::unique_ptr<celer::Service> CreateMetricsService(
+std::unique_ptr<bycorf::Service> CreateMetricsService(
     std::uint16_t port, const storage::StorageEngine* storage,
     std::function<bool()> server_ready) {
-  auto service = std::make_unique<celer::HttpService>(port);
+  auto service = std::make_unique<bycorf::HttpService>(port);
   service->RegisterGet(
       "/metrics",
       [storage, server_ready = std::move(server_ready)](
-          const celer::HttpRequest&,
-          celer::HttpResponse* response) -> celer::Task<absl::Status> {
+          const bycorf::HttpRequest&,
+          bycorf::HttpResponse* response) -> bycorf::Task<absl::Status> {
         response->content_type_ = "text/plain; version=0.0.4; charset=utf-8";
         co_return co_await RenderPrometheusMetrics(*storage, server_ready(),
                                                    &response->body_);

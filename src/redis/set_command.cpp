@@ -17,8 +17,8 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/worker.h"
 #include "cluster_gate.h"
 #include "keylane/command_table.h"
 #include "keylane/memory.h"
@@ -27,7 +27,7 @@
 #include "keylane/tx/transaction.h"
 
 namespace keylane {
-using namespace celer;
+using namespace bycorf;
 
 namespace {
 
@@ -306,7 +306,7 @@ void ReleaseSetWorkingSet(SetMultiContext* context) noexcept {
 storage::TxShardWrites* LocalWrites(SetMultiContext& context) {
   return context.tx_writes_.empty()
              ? nullptr
-             : &context.tx_writes_[celer::ThisWorker().id_];
+             : &context.tx_writes_[bycorf::ThisWorker().id_];
 }
 
 absl::flat_hash_set<std::string> AggregateMembers(

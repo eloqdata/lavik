@@ -24,12 +24,12 @@
 #include <vector>
 
 #include "absl/strings/str_cat.h"
-#include "celer/io/storage.h"
-#include "celer/net/connection.h"
-#include "celer/net/tcp_listener.h"
-#include "celer/net/tcp_stream.h"
-#include "celer/net/tls.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/net/connection.h"
+#include "bycorf/net/tcp_listener.h"
+#include "bycorf/net/tcp_stream.h"
+#include "bycorf/net/tls.h"
+#include "bycorf/runtime/worker.h"
 #include "spdlog/spdlog.h"
 // NuRaft's headers are not -Wpedantic-clean.
 #pragma GCC diagnostic push
@@ -68,7 +68,7 @@ namespace keylane::meta {
 // All Core members below the bind status are worker-thread only; the Core
 // outlives individual sessions via shared_ptr.
 struct MetaCtlServer::Core {
-  celer::ForeignExecutor foreign_executor_;
+  bycorf::ForeignExecutor foreign_executor_;
   nuraft::ptr<nuraft::raft_server> server_;
   nuraft::ptr<MetaStateMachine> state_machine_;
   std::shared_ptr<MetaCoordinator> coordinator_;
@@ -76,24 +76,24 @@ struct MetaCtlServer::Core {
   // ctl ingestion and commit-driven revalidation run on different threads.
   std::shared_ptr<MetaObservationStore> obs_store_;
   // Non-owning. Process assembly keeps the executor alive until after the
-  // Celer worker and all session coroutines have stopped.
+  // Bycorf worker and all session coroutines have stopped.
   MetaProposalExecutor* proposal_executor_ = nullptr;
   std::shared_ptr<MetaMembershipGate> membership_gate_;
   MetaCtlServerOptions options_;
-  std::shared_ptr<celer::TlsContext> tls_context_;
+  std::shared_ptr<bycorf::TlsContext> tls_context_;
 
   mutable std::mutex status_mu_;
   absl::Status status_ = absl::Status(absl::StatusCode::kUnavailable,
                                       "bind has not run on the worker yet");
 
   // Worker-thread only below.
-  celer::Worker* worker_ = nullptr;
-  celer::TcpListener listener_;
+  bycorf::Worker* worker_ = nullptr;
+  bycorf::TcpListener listener_;
   bool listening_ = false;
   bool shutdown_ = false;
   bool accept_loop_running_ = false;
   int shutdown_accept_wake_fd_ = -1;
-  std::vector<celer::Connection*> sessions_;
+  std::vector<bycorf::Connection*> sessions_;
   std::vector<std::shared_ptr<std::promise<void>>> shutdown_drain_waiters_;
   std::atomic<bool> shutdown_complete_{false};
 };
@@ -913,7 +913,7 @@ class AsyncReplyAwaiter {
 };
 
 void CompleteAsyncReply(
-    celer::ForeignExecutor foreign_executor, std::shared_ptr<AsyncReply> state,
+    bycorf::ForeignExecutor foreign_executor, std::shared_ptr<AsyncReply> state,
     std::string reply,
     std::shared_ptr<MetaClusterStatusService> retained_status_service = nullptr,
     std::size_t retained_status_bytes = 0) {
@@ -1130,7 +1130,7 @@ using CmdResult = nuraft::cmd_result<nuraft::ptr<nuraft::buffer>>;
 // the entry commits and this leader's state machine reports an accepted apply
 // verdict. Some callers additionally verify a stable post-state when their
 // effect cannot be removed by a later valid command.
-celer::Task<std::string> ProposeCommand(
+bycorf::Task<std::string> ProposeCommand(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     AuthenticatedPrincipal principal, MetaCommand command) {
   auto result =
@@ -1158,7 +1158,7 @@ celer::Task<std::string> ProposeCommand(
   co_return "OK " + std::to_string(result->log_index_);
 }
 
-celer::Task<std::string> HandleSubmitOp(
+bycorf::Task<std::string> HandleSubmitOp(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
@@ -1193,7 +1193,7 @@ celer::Task<std::string> HandleSubmitOp(
   co_return reply;
 }
 
-celer::Task<std::string> HandleCompleteOp(
+bycorf::Task<std::string> HandleCompleteOp(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
@@ -1243,7 +1243,7 @@ celer::Task<std::string> HandleCompleteOp(
   co_return reply;
 }
 
-celer::Task<std::string> HandleAbortOp(
+bycorf::Task<std::string> HandleAbortOp(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
@@ -1334,7 +1334,7 @@ std::string FailoverError(std::string_view stage, std::string_view code) {
   return absl::StrCat("ERR failover 1 ", stage, " ", code);
 }
 
-celer::Task<std::string> HandleFailover(
+bycorf::Task<std::string> HandleFailover(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const FailoverAdminRequestV1& request) {
@@ -1380,7 +1380,7 @@ celer::Task<std::string> HandleFailover(
           request.operation_id_.size())));
 }
 
-celer::Task<std::string> HandleRegisterNode(
+bycorf::Task<std::string> HandleRegisterNode(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal authenticated, const std::string& node_id,
@@ -1423,7 +1423,7 @@ std::string HandleGetNode(nuraft::ptr<MetaStateMachine> state_machine,
 
 // creategroup <group_id>: the topology epoch is absolute (current + 1), read
 // from a committed snapshot. Effect-verified like submitop.
-celer::Task<std::string> HandleCreateGroup(
+bycorf::Task<std::string> HandleCreateGroup(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id) {
@@ -1446,7 +1446,7 @@ celer::Task<std::string> HandleCreateGroup(
 // assignnode <group_id> <node_id> <primary|replica>. The operator names the
 // desired membership, but never its incarnation: the trusted proposer creates
 // a fresh nonzero 128-bit CSPRNG identity immediately before submission.
-celer::Task<std::string> HandleAssignNode(
+bycorf::Task<std::string> HandleAssignNode(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
@@ -1492,7 +1492,7 @@ celer::Task<std::string> HandleAssignNode(
 // begingroupterm <group_id> <expected> <new>: promotes the committed
 // group_term (and fences the group), which is what term-bound observations
 // anchor to.
-celer::Task<std::string> HandleBeginGroupTerm(
+bycorf::Task<std::string> HandleBeginGroupTerm(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
@@ -1520,7 +1520,7 @@ celer::Task<std::string> HandleBeginGroupTerm(
 // CAS values remain operator input; only the cluster-wide topology epoch is
 // derived from one committed snapshot because no external caller can safely
 // guess commits in unrelated groups.
-celer::Task<std::string> HandlePutPolicy(
+bycorf::Task<std::string> HandlePutPolicy(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     AuthenticatedPrincipal principal, const std::string& policy_id,
     std::uint64_t version, const std::string& content) {
@@ -1549,7 +1549,7 @@ std::string HandleGetPolicy(nuraft::ptr<MetaStateMachine> state_machine,
                       " content=", current->content_);
 }
 
-celer::Task<std::string> HandleSetSlotMap(
+bycorf::Task<std::string> HandleSetSlotMap(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, std::uint16_t first_slot,
@@ -1580,7 +1580,7 @@ celer::Task<std::string> HandleSetSlotMap(
   co_return reply;
 }
 
-celer::Task<std::string> HandleActivateAuthority(
+bycorf::Task<std::string> HandleActivateAuthority(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
@@ -1610,7 +1610,7 @@ celer::Task<std::string> HandleActivateAuthority(
   co_return reply;
 }
 
-celer::Task<std::string> HandleFenceGroup(
+bycorf::Task<std::string> HandleFenceGroup(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
@@ -1638,7 +1638,7 @@ celer::Task<std::string> HandleFenceGroup(
 // transitionop <id32hex> <phase> <history>: moves the operation to Running.
 // The history argument must match the anchor committed by submitop; it is a
 // ctl-side consistency check and is not fabricated into evidence.
-celer::Task<std::string> HandleTransitionOp(
+bycorf::Task<std::string> HandleTransitionOp(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
@@ -1695,7 +1695,7 @@ std::string ClusterAlreadyCreatedError(
 
 // Admission persists the whole plan BEFORE topology mutation. The leader
 // reconciler, not this connection or its timeout, owns all subsequent work.
-celer::Task<std::string> HandleClusterCreate(
+bycorf::Task<std::string> HandleClusterCreate(
     const nuraft::ptr<nuraft::raft_server>& server,
     const nuraft::ptr<MetaStateMachine>& state_machine,
     const std::shared_ptr<MetaCoordinator>& coordinator,
@@ -1808,7 +1808,7 @@ celer::Task<std::string> HandleClusterCreate(
   co_return absl::StrCat("OK clustercreate 1 ", applied->log_index_, " ", id);
 }
 
-celer::Task<std::string> HandlePruneAudit(
+bycorf::Task<std::string> HandlePruneAudit(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     AuthenticatedPrincipal principal, std::uint64_t through) {
   PruneAudit command;
@@ -1817,7 +1817,7 @@ celer::Task<std::string> HandlePruneAudit(
   co_return co_await ProposeCommand(coordinator, std::move(principal), command);
 }
 
-celer::Task<std::string> HandleSetAuditPolicy(
+bycorf::Task<std::string> HandleSetAuditPolicy(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     AuthenticatedPrincipal principal, MetaAuditPolicy policy,
     const std::string& attestation) {
@@ -1828,7 +1828,7 @@ celer::Task<std::string> HandleSetAuditPolicy(
   co_return co_await ProposeCommand(coordinator, std::move(principal), command);
 }
 
-celer::Task<std::string> HandlePruneOperationArchive(
+bycorf::Task<std::string> HandlePruneOperationArchive(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     AuthenticatedPrincipal principal, std::vector<std::uint64_t> seqs) {
   PruneOperationArchive command;
@@ -1837,7 +1837,7 @@ celer::Task<std::string> HandlePruneOperationArchive(
   co_return co_await ProposeCommand(coordinator, std::move(principal), command);
 }
 
-celer::Task<std::string> HandleArchiveOperations(
+bycorf::Task<std::string> HandleArchiveOperations(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, std::vector<std::uint64_t> seqs) {
@@ -1956,7 +1956,7 @@ std::string HandleObsAudit(
   return reply;
 }
 
-celer::Task<std::string> HandleConfigChange(
+bycorf::Task<std::string> HandleConfigChange(
     nuraft::ptr<nuraft::raft_server> server,
     nuraft::ptr<MetaStateMachine> state_machine,
     const std::shared_ptr<MetaCoordinator>& coordinator,
@@ -2098,8 +2098,8 @@ celer::Task<std::string> HandleConfigChange(
     if (op->lifecycle_ == MetaOperationLifecycle::kAborted ||
         op->kind_phase_blob_.starts_with("recovery-required:"))
       co_return absl::StrCat("ERR recovery-required operation=", id);
-    auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                          std::chrono::milliseconds(10));
+    auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                           std::chrono::milliseconds(10));
     if (!slept.ok()) break;
   }
   co_return absl::StrCat("ERR uncertain-outcome operation=", id);
@@ -2140,7 +2140,7 @@ bool ParseServerId(const std::string& text, int& out) {
 // Committed-mutation verbs: everything that proposes onto the raft log.
 // Split from DispatchCommand so the caller can run the observation
 // revalidation pass once per successful commit (see DispatchCommand).
-celer::Task<std::string> DispatchMutationVerb(
+bycorf::Task<std::string> DispatchMutationVerb(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& command,
@@ -2359,7 +2359,7 @@ celer::Task<std::string> DispatchMutationVerb(
   co_return "ERR unknown-command";
 }
 
-// Runs on the celer worker thread and suspends only on foreign-executor round
+// Runs on the bycorf worker thread and suspends only on foreign-executor round
 // trips. Shared references keep command dependencies alive if teardown
 // releases the core's references mid-command. The proposal executor is a
 // process-owned non-owning reference whose documented lifetime covers every
@@ -2367,12 +2367,12 @@ celer::Task<std::string> DispatchMutationVerb(
 // fields never come from command text. Observation access is internally
 // serialized because commit-driven revalidation can run concurrently with
 // this worker.
-celer::Task<std::string> DispatchCommand(
+bycorf::Task<std::string> DispatchCommand(
     nuraft::ptr<nuraft::raft_server> server,
     nuraft::ptr<MetaStateMachine> state_machine,
     const std::shared_ptr<MetaCoordinator>& coordinator,
     std::shared_ptr<MetaObservationStore> obs_store,
-    celer::ForeignExecutor foreign_executor,
+    bycorf::ForeignExecutor foreign_executor,
     MetaProposalExecutor& proposal_executor,
     std::shared_ptr<MetaMembershipGate> membership_gate,
     const MetaPrincipalIdentity& identity, AuthenticatedPrincipal principal,
@@ -2444,7 +2444,7 @@ celer::Task<std::string> DispatchCommand(
           }
           // The immutable, bracketed response no longer owns capture
           // admission. Sending is independently bounded by the retained-byte
-          // budget and deadline on the Celer worker.
+          // budget and deadline on the Bycorf worker.
           cluster_status_service->EndCapture();
           CompleteAsyncReply(foreign_executor, std::move(reply),
                              std::move(result), cluster_status_service,
@@ -2679,10 +2679,10 @@ celer::Task<std::string> DispatchCommand(
 
 class MetaCtlServer::SessionConnectionBorrow {
  public:
-  SessionConnectionBorrow(CorePtr core, celer::Connection* connection)
+  SessionConnectionBorrow(CorePtr core, bycorf::Connection* connection)
       : core_(std::move(core)), connection_(connection) {
     core_->sessions_.push_back(connection_);
-    celer::BorrowConnectionStorage(connection_);
+    bycorf::BorrowConnectionStorage(connection_);
   }
 
   SessionConnectionBorrow(SessionConnectionBorrow&& other) noexcept
@@ -2701,13 +2701,13 @@ class MetaCtlServer::SessionConnectionBorrow {
       *session = core_->sessions_.back();
       core_->sessions_.pop_back();
     }
-    celer::ReleaseConnectionStorage(connection_);
+    bycorf::ReleaseConnectionStorage(connection_);
     NotifyCtlShutdownDrained(*core_);
   }
 
  private:
   CorePtr core_;
-  celer::Connection* connection_;
+  bycorf::Connection* connection_;
 };
 
 // static
@@ -2785,7 +2785,7 @@ absl::Status MetaCtlServer::ValidateOptions(
 
 // static
 absl::StatusOr<std::shared_ptr<MetaCtlServer>> MetaCtlServer::Create(
-    celer::ForeignExecutor foreign_executor,
+    bycorf::ForeignExecutor foreign_executor,
     nuraft::ptr<nuraft::raft_server> server,
     nuraft::ptr<MetaStateMachine> state_machine,
     std::shared_ptr<MetaCoordinator> coordinator,
@@ -2833,12 +2833,12 @@ absl::StatusOr<std::shared_ptr<MetaCtlServer>> MetaCtlServer::Create(
         std::make_shared<MetaAutomaticFailoverDiagnosticsRegistry>();
   }
   if (core->options_.transport_ == MetaCtlServerOptions::Transport::kTcpMtls) {
-    celer::TlsServerOptions tls;
+    bycorf::TlsServerOptions tls;
     tls.cert_file_ = core->options_.tls_cert_file_;
     tls.key_file_ = core->options_.tls_key_file_;
     tls.ca_cert_file_ = core->options_.tls_ca_cert_file_;
-    tls.client_auth_ = celer::TlsClientAuth::kRequired;
-    auto context = celer::TlsContext::CreateServer(tls);
+    tls.client_auth_ = bycorf::TlsClientAuth::kRequired;
+    auto context = bycorf::TlsContext::CreateServer(tls);
     if (!context.ok()) return context.status();
     core->tls_context_ = std::move(*context);
   }
@@ -2850,7 +2850,7 @@ MetaCtlServer::~MetaCtlServer() { Shutdown(); }
 void MetaCtlServer::Start() {
   CorePtr core = core_;
   const bool accepted = core->foreign_executor_.Notify([core]() noexcept {
-    celer::Worker& worker = *celer::ThisWorker().self_;
+    bycorf::Worker& worker = *bycorf::ThisWorker().self_;
     if (core->listening_ || core->shutdown_) {
       return;
     }
@@ -2878,7 +2878,7 @@ void MetaCtlServer::Start() {
   });
   if (!accepted) {
     std::lock_guard<std::mutex> lock(core->status_mu_);
-    core->status_ = absl::UnavailableError("Celer worker is stopping");
+    core->status_ = absl::UnavailableError("Bycorf worker is stopping");
   }
 }
 
@@ -2913,14 +2913,14 @@ void MetaCtlServer::Shutdown() {
             (void)core->listener_.Close();
           }
           if (core->worker_ != nullptr) {
-            const std::vector<celer::Connection*> sessions = core->sessions_;
-            for (celer::Connection* connection : sessions) {
+            const std::vector<bycorf::Connection*> sessions = core->sessions_;
+            for (bycorf::Connection* connection : sessions) {
               if (connection != nullptr && connection->file_.fd_ >= 0) {
                 (void)::shutdown(connection->file_.fd_, SHUT_RDWR);
               }
               core->worker_->BeginClose(
                   connection, absl::CancelledError("ctl server shutdown"),
-                  celer::CloseMode::kLocalClose);
+                  bycorf::CloseMode::kLocalClose);
             }
           }
         }
@@ -2938,8 +2938,8 @@ absl::Status MetaCtlServer::status() const {
   return core_->status_;
 }
 
-celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
-  celer::Worker& worker = *core->worker_;
+bycorf::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
+  bycorf::Worker& worker = *core->worker_;
   while (core->listening_) {
     auto accepted = co_await core->listener_.Accept();
     if (!accepted.ok()) {
@@ -2949,21 +2949,21 @@ celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
         break;
       }
       const absl::Status slept =
-          co_await celer::SleepFor(worker, std::chrono::milliseconds(10));
+          co_await bycorf::SleepFor(worker, std::chrono::milliseconds(10));
       if (!slept.ok()) {
         if (!core->listening_) break;
         co_return slept;
       }
       continue;
     }
-    celer::Connection* connection = *accepted;
+    bycorf::Connection* connection = *accepted;
     if (!core->listening_) {
       if (connection != nullptr && connection->file_.fd_ >= 0) {
         (void)::shutdown(connection->file_.fd_, SHUT_RDWR);
       }
       worker.BeginClose(connection,
                         absl::CancelledError("ctl listener is shutting down"),
-                        celer::CloseMode::kLocalClose);
+                        bycorf::CloseMode::kLocalClose);
       if (core->shutdown_accept_wake_fd_ >= 0) {
         (void)::shutdown(core->shutdown_accept_wake_fd_, SHUT_RDWR);
         (void)::close(core->shutdown_accept_wake_fd_);
@@ -2975,7 +2975,7 @@ celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
     // Frame ownership closes the accept/shutdown race: even if Spawn rejects
     // the task before its body runs, destruction unregisters the session and
     // releases its storage borrow.
-    worker.Spawn(SessionLoop(core, celer::TcpStream(connection), connection,
+    worker.Spawn(SessionLoop(core, bycorf::TcpStream(connection), connection,
                              SessionConnectionBorrow(core, connection)));
   }
   if (core->shutdown_accept_wake_fd_ >= 0) {
@@ -2989,8 +2989,8 @@ celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> MetaCtlServer::SessionLoop(
-    CorePtr core, celer::TcpStream stream, celer::Connection* connection,
+bycorf::Task<absl::Status> MetaCtlServer::SessionLoop(
+    CorePtr core, bycorf::TcpStream stream, bycorf::Connection* connection,
     SessionConnectionBorrow borrow) {
   // This frame-owned parameter unregisters the task and releases the
   // Connection during frame destruction, after body-local users have unwound.

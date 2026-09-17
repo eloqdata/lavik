@@ -5,7 +5,7 @@ namespace keylane::storage {
 Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
   const auto interval = std::chrono::milliseconds(options_.flush_max_ms_);
   while (!store->worker_->stop_requested()) {
-    absl::Status status = co_await celer::SleepFor(*store->worker_, interval);
+    absl::Status status = co_await bycorf::SleepFor(*store->worker_, interval);
     if (!status.ok()) {
       CompleteShutdownFlush(status);
       co_return status;
@@ -50,8 +50,7 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
           {
             UnlockGuard guard(&store->store_state_mutex_, store->worker_);
             frozen = !store->expiry_cycle_running_ && !store->flush_running_ &&
-                     store->flush_queue_.empty() &&
-                     !RuntimeFailureLatched();
+                     store->flush_queue_.empty() && !RuntimeFailureLatched();
           }
           if (!frozen) {
             shard.status_ = absl::FailedPreconditionError(
@@ -310,7 +309,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           char* end = nullptr;
           const unsigned long pause_ms = std::strtoul(pause_text, &end, 10);
           if (end != pause_text && *end == '\0' && pause_ms != 0) {
-            absl::Status paused = co_await celer::SleepFor(
+            absl::Status paused = co_await bycorf::SleepFor(
                 *store->worker_, std::chrono::milliseconds(pause_ms));
             if (!paused.ok()) co_return paused;
           }
@@ -382,7 +381,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     };
 
     auto synced =
-        co_await celer::Fdatasync(*store->worker_, store->files_[file_id]);
+        co_await bycorf::Fdatasync(*store->worker_, store->files_[file_id]);
     if (!synced.ok()) {
       co_return co_await fail_flush(synced);
     }
@@ -403,7 +402,8 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
                               : header_written.status();
       co_return co_await fail_flush(std::move(header_status));
     }
-    synced = co_await celer::Fdatasync(*store->worker_, store->files_[file_id]);
+    synced =
+        co_await bycorf::Fdatasync(*store->worker_, store->files_[file_id]);
     if (!synced.ok()) {
       co_return co_await fail_flush(synced);
     }

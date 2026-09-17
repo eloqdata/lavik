@@ -18,8 +18,8 @@
 
 #include "absl/strings/str_cat.h"
 #include "blocking_wait.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/worker.h"
 #include "cluster_gate.h"
 #include "keylane/command_table.h"
 #include "keylane/glob.h"
@@ -657,14 +657,14 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
       (request.spec_->flags_ & kCmdMayBlock) != 0 &&
       g_storage->ReplicationLogActive()) {
     while (!TryBeginReplicationTransactionOrder()) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return Built(StorageError(builder, waited));
     }
     snapshot_attempt.order_active_ = true;
     while (!TryBeginSnapshotTransaction()) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return Built(StorageError(builder, waited));
     }
     snapshot_attempt.snapshot_active_ = true;
@@ -735,7 +735,7 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
   for (std::size_t argument : shape.key_args_) {
     const std::string& key = request.args_[argument];
     const storage::Digest digest = storage::ComputeDigest(key);
-    auto popped = co_await celer::SubmitTaskTo(
+    auto popped = co_await bycorf::SubmitTaskTo(
         g_storage->OwnerForKey(key),
         [db = request.db_id_, key = std::string(key), digest,
          maximum = shape.maximum_, count = shape.count_,
@@ -2571,7 +2571,7 @@ std::vector<CapturedReplicationCommand> BuildZSetReplacement(
 
 storage::TxShardWrites* LocalWrites(MultiContext& context) {
   return context.writes_.empty() ? nullptr
-                                 : &context.writes_[celer::ThisWorker().id_];
+                                 : &context.writes_[bycorf::ThisWorker().id_];
 }
 
 absl::Status ComputeMultiUnchecked(MultiContext* context) {
@@ -3049,9 +3049,9 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
        request.kind_ == CommandKind::kGeoRadiusByMember) &&
       !parsed_store->has_value()) {
     const unsigned owner = g_storage->OwnerForKey(args[1]);
-    if (owner == celer::ThisWorker().id_)
+    if (owner == bycorf::ThisWorker().id_)
       co_return co_await ExecuteZSetCommand(request, builder);
-    co_return co_await celer::SubmitTaskTo(
+    co_return co_await bycorf::SubmitTaskTo(
         owner, [&request, &builder]() -> Task<CommandReply> {
           co_return co_await ExecuteZSetCommand(request, builder);
         });
@@ -3238,7 +3238,7 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     replication.SetFinalExpirations(context.writes_);
     replication.Commit();
     g_storage->NoteTxCommitStarted();
-    celer::SpawnOnCurrentWorker(CommitMulti(txid, std::move(context.writes_)));
+    bycorf::SpawnOnCurrentWorker(CommitMulti(txid, std::move(context.writes_)));
     if (!context.output_.empty()) {
       NotifyZSetBlockingKey(
           request,
@@ -3423,19 +3423,19 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
                                             key->digest_,
                                             &context.input_charges_[argument]);
       } else {
-        input = co_await ReadAggregateInputLocked(request.db_id_,
-                                                  args[argument], key->digest_,
-                                                  &context.input_charges_[argument]);
+        input = co_await ReadAggregateInputLocked(
+            request.db_id_, args[argument], key->digest_,
+            &context.input_charges_[argument]);
       }
       if (!input.ok()) co_return input.status();
       context.inputs_[argument] = std::move(*input);
       co_return absl::OkStatus();
     };
     absl::Status status;
-    if (key->owner_ == celer::ThisWorker().id_) {
+    if (key->owner_ == bycorf::ThisWorker().id_) {
       status = co_await read();
     } else {
-      status = co_await celer::SubmitTaskTo(key->owner_, read);
+      status = co_await bycorf::SubmitTaskTo(key->owner_, read);
     }
     if (!status.ok()) {
       co_return std::string(StorageError(builder, status));
@@ -3455,7 +3455,7 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
           builder.AppendError("ERR Sorted Set destination key is missing"));
     }
     storage::TxShardWrites& destination_writes = tx_writes[destination->owner_];
-    absl::Status undo_ready = co_await celer::SubmitTaskTo(
+    absl::Status undo_ready = co_await bycorf::SubmitTaskTo(
         destination->owner_, [txid = destination_writes.txid_] {
           return g_storage->DiscardTxUndoLocal(txid);
         });
@@ -3467,14 +3467,14 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
           &context, destination->digest_, &tx_writes[destination->owner_]);
     };
     absl::Status status;
-    if (destination->owner_ == celer::ThisWorker().id_) {
+    if (destination->owner_ == bycorf::ThisWorker().id_) {
       status = co_await write();
     } else {
-      status = co_await celer::SubmitTaskTo(destination->owner_, write);
+      status = co_await bycorf::SubmitTaskTo(destination->owner_, write);
     }
     destination_writes.collect_undo_ = false;
     if (!status.ok()) ClearMultiPayloads(&context);
-    absl::Status undo_finished = co_await celer::SubmitTaskTo(
+    absl::Status undo_finished = co_await bycorf::SubmitTaskTo(
         destination->owner_,
         [txid = destination_writes.txid_, rollback = !status.ok(),
          writes = &destination_writes] {
@@ -3554,10 +3554,10 @@ Task<std::string> ExecuteZSetMultiPopLocked(
     // resume the local pop on the caller after selecting the remote branch,
     // violating PartitionFor's worker-affinity invariant.
     absl::StatusOr<storage::SortedSetResult> popped;
-    if (key->owner_ == celer::ThisWorker().id_) {
+    if (key->owner_ == bycorf::ThisWorker().id_) {
       popped = co_await pop();
     } else {
-      popped = co_await celer::SubmitTaskTo(key->owner_, pop);
+      popped = co_await bycorf::SubmitTaskTo(key->owner_, pop);
     }
     if (!popped.ok()) {
       co_return std::string(StorageError(builder, popped.status()));

@@ -2,7 +2,7 @@
 """Check runtime routing, one ring per worker, and recovery on disposable files.
 
 Kernel mode needs ordinary io_uring permissions. --dpdk also requires root and
-an unused celerdp0 TAP; it never binds physical devices. The binary must include
+an unused bycorfdp0 TAP; it never binds physical devices. The binary must include
 both capabilities to verify that compiled SPDK/DPDK remain inactive; the
 kernel checks also run on the default io_uring-only build.
 """
@@ -33,13 +33,13 @@ def rpc(sock, *args):
 def run(binary, network, data, directory, iteration, populate):
     host = '198.18.0.2' if network == 'dpdk' else '127.0.0.1'
     port = 16401
-    env = {k: v for k, v in os.environ.items() if not k.startswith('CELER_')}
+    env = {k: v for k, v in os.environ.items() if not k.startswith('BYCORF_')}
     if network == 'dpdk':
-        assert not Path('/sys/class/net/celerdp0').exists()
-        env.update(CELER_DPDK_QUEUES='1', CELER_DPDK_RX_STEERING='hash', CELER_DPDK_MODE='adaptive')
+        assert not Path('/sys/class/net/bycorfdp0').exists()
+        env.update(BYCORF_DPDK_QUEUES='1', BYCORF_DPDK_RX_STEERING='hash', BYCORF_DPDK_MODE='adaptive')
     else:
         # An inactive backend must not even parse these invalid settings.
-        env.update(CELER_EAL_ARGS='--invalid-disabled-eal-option', CELER_DPDK_MODE='invalid')
+        env.update(BYCORF_EAL_ARGS='--invalid-disabled-eal-option', BYCORF_DPDK_MODE='invalid')
     path = directory / f'{iteration}-{network}.log'
     args = [str(binary), '--network', network, '--storage', 'uring', '--bind', host,
             '--port', str(port), '--metrics-port', '0', '--threads', '2',
@@ -54,10 +54,10 @@ def run(binary, network, data, directory, iteration, populate):
             while time.monotonic() < ready:
                 assert p.poll() is None, path.read_text()[-5000:]
                 if network == 'dpdk' and not tap_ready:
-                    if path.read_text().count('celer0: Ethernet address:') < 2:
+                    if path.read_text().count('bycorf0: Ethernet address:') < 2:
                         time.sleep(.05); continue
-                    sp.run(['ip', 'link', 'set', 'celerdp0', 'address', '02:00:00:00:00:01'], check=True)
-                    sp.run(['ip', 'address', 'add', '198.18.0.1/24', 'dev', 'celerdp0'], check=True)
+                    sp.run(['ip', 'link', 'set', 'bycorfdp0', 'address', '02:00:00:00:00:01'], check=True)
+                    sp.run(['ip', 'address', 'add', '198.18.0.1/24', 'dev', 'bycorfdp0'], check=True)
                     tap_ready = True
                 try:
                     sock = socket.create_connection((host, port), .5); sock.settimeout(15)
@@ -93,7 +93,7 @@ def run(binary, network, data, directory, iteration, populate):
                 p.terminate()
                 try: p.wait(timeout=30)
                 except sp.TimeoutExpired: p.kill(); p.wait()
-    if network == 'dpdk': assert not Path('/sys/class/net/celerdp0').exists()
+    if network == 'dpdk': assert not Path('/sys/class/net/bycorfdp0').exists()
 
 
 def main():

@@ -25,7 +25,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
-#include "celer/net/server.h"
+#include "bycorf/net/server.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/storage/engine.h"
@@ -386,10 +386,9 @@ void VerifyExpirationConfig(RespClient& client, std::uint16_t port) {
       "+OK", "case-insensitive expiration SET");
 }
 
-class ExpirationAuthorityService final : public celer::Service {
+class ExpirationAuthorityService final : public bycorf::Service {
  public:
-  explicit ExpirationAuthorityService(
-      keylane::storage::StorageEngine* storage)
+  explicit ExpirationAuthorityService(keylane::storage::StorageEngine* storage)
       : storage_(storage) {}
 
   void Prepare(unsigned thread_count) override {
@@ -398,8 +397,8 @@ class ExpirationAuthorityService final : public celer::Service {
     }
   }
 
-  celer::Task<absl::Status> Run(celer::Worker& worker,
-                                celer::ServiceContext) override {
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker,
+                                 bycorf::ServiceContext) override {
     keylane::BindMemoryAccountingShard(worker.id());
     keylane::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
     result_ = co_await storage_->InitializeWorker(worker);
@@ -420,7 +419,7 @@ class ExpirationAuthorityService final : public celer::Service {
       }
     }
     if (result_.ok()) {
-      result_ = co_await celer::SleepFor(worker, 100ms);
+      result_ = co_await bycorf::SleepFor(worker, 100ms);
     }
     if (result_.ok() && storage_->LocalSize(0) != 1) {
       result_ = absl::FailedPreconditionError(
@@ -451,7 +450,7 @@ class ExpirationAuthorityService final : public celer::Service {
     for (unsigned attempt = 0;
          result_.ok() && storage_->LocalSize(0) != 0 && attempt < 5'000;
          ++attempt) {
-      result_ = co_await celer::SleepFor(worker, 1ms);
+      result_ = co_await bycorf::SleepFor(worker, 1ms);
     }
     if (result_.ok() && storage_->LocalSize(0) != 0) {
       result_ = absl::DeadlineExceededError(
@@ -463,7 +462,7 @@ class ExpirationAuthorityService final : public celer::Service {
 
   void Stop() noexcept override {}
 
-  void FinalizeWorker(celer::Worker& worker) noexcept override {
+  void FinalizeWorker(bycorf::Worker& worker) noexcept override {
     storage_->FinalizeWorker(worker);
   }
 
@@ -513,9 +512,9 @@ void VerifyDeferredExpirationAuthority(const std::string& data_path) {
   keylane::tx::TxRuntime::Create(1);
 
   ExpirationAuthorityService service(&storage);
-  celer::Server server;
+  bycorf::Server server;
   server.AddService(&service);
-  celer::ServerOptions runtime;
+  bycorf::ServerOptions runtime;
   runtime.thread_count_ = 1;
   runtime.pin_workers_ = false;
   runtime.recv_buffer_count_ = 0;
@@ -856,9 +855,9 @@ int main(int argc, char** argv) {
       ServerProcess server(argv[1], no_authority_port, no_authority_data_path,
                            no_authority_log_path);
       RespClient client = Connect(no_authority_port);
-      Expect(client.Command({"SET", "authority-deferred", "value", "PX",
-                             "3000"}),
-             "+OK", "no-authority recovery seed");
+      Expect(
+          client.Command({"SET", "authority-deferred", "value", "PX", "3000"}),
+          "+OK", "no-authority recovery seed");
       server.Stop();
     }
     std::this_thread::sleep_for(3100ms);

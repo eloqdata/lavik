@@ -12,10 +12,10 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/runtime/task.h"
+#include "bycorf/runtime/task.h"
 #include "keylane/resp.h"
 
-namespace celer {
+namespace bycorf {
 class TcpStream;
 }
 
@@ -51,27 +51,27 @@ std::string PUnsubscribePatterns(const std::shared_ptr<PubSubSession>& session,
 void ResetPubSubSubscriptions(const std::shared_ptr<PubSubSession>& session);
 
 // PUBSUB introspection reports this node's aggregate worker-local state.
-celer::Task<std::vector<std::string>> PubSubChannels(
+bycorf::Task<std::vector<std::string>> PubSubChannels(
     std::optional<std::string> pattern);
-celer::Task<std::vector<std::uint64_t>> PubSubNumSub(
+bycorf::Task<std::vector<std::uint64_t>> PubSubNumSub(
     std::span<const std::string> channels);
-celer::Task<std::uint64_t> PubSubNumPat();
+bycorf::Task<std::uint64_t> PubSubNumPat();
 
 // Delivers to every worker-local registry and returns the number of matching
 // live subscriptions on this node. The encoded message body is shared across
 // all recipients.
-celer::Task<std::uint64_t> PublishChannel(std::string_view channel,
-                                          std::string_view payload);
+bycorf::Task<std::uint64_t> PublishChannel(std::string_view channel,
+                                           std::string_view payload);
 
 // Captures the live subscription matches and their reply protocol at the
 // command's logical execution point without making the message visible. The
 // frozen receiver count is independent of later SUBSCRIBE/UNSUBSCRIBE changes;
 // delivery still uses each session's owner worker and bounded output queue.
-celer::Task<absl::StatusOr<std::shared_ptr<CapturedPubSubPublication>>>
+bycorf::Task<absl::StatusOr<std::shared_ptr<CapturedPubSubPublication>>>
 CapturePubSubPublication(std::string_view channel, std::string_view payload);
 std::uint64_t CapturedPubSubReceiverCount(
     const std::shared_ptr<CapturedPubSubPublication>& publication) noexcept;
-celer::Task<absl::Status> DeliverCapturedPubSubPublication(
+bycorf::Task<absl::Status> DeliverCapturedPubSubPublication(
     std::shared_ptr<CapturedPubSubPublication> publication);
 
 void EnqueuePubSubReply(const std::shared_ptr<PubSubSession>& session,
@@ -80,10 +80,10 @@ void ExitPubSubMode(const std::shared_ptr<PubSubSession>& session);
 void ClosePubSubSession(const std::shared_ptr<PubSubSession>& session);
 void MarkPubSubReaderStarted(const std::shared_ptr<PubSubSession>& session);
 void MarkPubSubReaderDone(const std::shared_ptr<PubSubSession>& session);
-celer::Task<absl::Status> WaitPubSubReaderDone(
+bycorf::Task<absl::Status> WaitPubSubReaderDone(
     const std::shared_ptr<PubSubSession>& session);
 
-celer::Task<absl::Status> StreamPubSubMessages(
-    celer::TcpStream& stream, const std::shared_ptr<PubSubSession>& session);
+bycorf::Task<absl::Status> StreamPubSubMessages(
+    bycorf::TcpStream& stream, const std::shared_ptr<PubSubSession>& session);
 
 }  // namespace keylane

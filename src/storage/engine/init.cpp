@@ -116,11 +116,11 @@ absl::Status ResetStorageMetadata(const std::string& path,
       kStorageBlockBytes;
   std::vector<std::byte> zero(kResetChunkBytes, std::byte{0});
 
-  if (celer::IsSpdkStoragePath(path)) {
+  if (bycorf::IsSpdkStoragePath(path)) {
     for (std::uint64_t offset = 0; offset < bytes; offset += kResetChunkBytes) {
       const std::size_t chunk = static_cast<std::size_t>(
           std::min<std::uint64_t>(kResetChunkBytes, bytes - offset));
-      absl::Status status = celer::WriteSpdkStorage(
+      absl::Status status = bycorf::WriteSpdkStorage(
           path, std::span<const std::byte>(zero.data(), chunk), offset,
           offset + chunk == bytes);
       if (!status.ok()) return status;
@@ -703,7 +703,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         ScanBitmapPageCount(device.capacity_blocks_);
     auto allocator = std::make_unique<DeviceAllocator>();
     allocator->owner_ =
-        static_cast<celer::WorkerId>(device_index % worker_count_);
+        static_cast<bycorf::WorkerId>(device_index % worker_count_);
     allocator->data_block_begin_ = device.data_block_begin_;
     allocator->next_pristine_ = device.data_block_begin_;
     allocator->scan_bitmap_.resize(bitmap_bytes, std::byte{0});
@@ -922,7 +922,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   }
   // Metadata probing is complete. Return its temporary controller qpairs so
   // a controller advertising exactly worker_count queues can still start.
-  celer::ReleaseSpdkStorageMetadataQpairs();
+  bycorf::ReleaseSpdkStorageMetadataQpairs();
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
     db_epochs_[db_id].store(epoch_values_[db_id], std::memory_order_relaxed);
   }
@@ -1032,7 +1032,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryLiveReferenceBatches(
     if (owner == store.worker_->id()) {
       applied = apply_live();
     } else {
-      applied = co_await celer::SubmitTo(owner, std::move(apply_live));
+      applied = co_await bycorf::SubmitTo(owner, std::move(apply_live));
     }
     if (!applied.ok()) {
       co_return applied;
@@ -1051,7 +1051,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         static_cast<unsigned>(options_.data_files_.size()));
   }
   if (status.ok()) {
-    if (celer::SpdkStorageEnabled()) {
+    if (bycorf::SpdkStorageEnabled()) {
       store.files_.resize(options_.data_files_.size());
       for (std::size_t i = 0; i < store.files_.size(); ++i) {
         store.files_[i] = FixedFile{.index_ = static_cast<std::uint32_t>(i)};
@@ -1065,8 +1065,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
           continue;
         }
         FixedFile file{.index_ = device.file_index_};
-        status = co_await celer::OpenFixedFile(worker, device.path_,
-                                               O_RDWR | O_DIRECT, 0, file);
+        status = co_await bycorf::OpenFixedFile(worker, device.path_,
+                                                O_RDWR | O_DIRECT, 0, file);
         if (!status.ok()) {
           break;
         }
@@ -1076,8 +1076,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       store.files_.reserve(options_.data_files_.size());
       for (std::size_t i = 0; i < options_.data_files_.size(); ++i) {
         FixedFile file{.index_ = static_cast<std::uint32_t>(i)};
-        status = co_await celer::OpenFixedFile(worker, options_.data_files_[i],
-                                               O_RDWR | O_DIRECT, 0, file);
+        status = co_await bycorf::OpenFixedFile(worker, options_.data_files_[i],
+                                                O_RDWR | O_DIRECT, 0, file);
         if (!status.ok()) {
           break;
         }
@@ -1691,7 +1691,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
-    const celer::WorkerId allocator_owner =
+    const bycorf::WorkerId allocator_owner =
         device_allocators_[device_index]->owner_;
     auto apply_recovery_free = [this, device_index,
                                 blocks = std::move(
@@ -1715,8 +1715,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     if (allocator_owner == worker.id()) {
       status = apply_recovery_free();
     } else {
-      status = co_await celer::SubmitTo(allocator_owner,
-                                        std::move(apply_recovery_free));
+      status = co_await bycorf::SubmitTo(allocator_owner,
+                                         std::move(apply_recovery_free));
     }
     if (!status.ok()) {
       Fail(status);
@@ -1935,7 +1935,7 @@ void StorageEngine::Impl::Fail(const absl::Status& status) {
 }
 
 absl::Status StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
-  if (celer::SpdkStorageEnabled()) {
+  if (bycorf::SpdkStorageEnabled()) {
     struct ControllerPlan {
       std::string id_;
       unsigned io_queue_count_ = 0;
@@ -2140,14 +2140,14 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
   // global QuiesceExpiration helper would make workers submit to and wait on
   // themselves while every periodic flush owns the same shutdown barrier.
   while (store->expiry_cycle_running_) {
-    absl::Status status =
-        co_await celer::SleepFor(*store->worker_, std::chrono::milliseconds(1));
+    absl::Status status = co_await bycorf::SleepFor(
+        *store->worker_, std::chrono::milliseconds(1));
     if (!status.ok()) co_return status;
   }
 
   while (active_defrags_.load(std::memory_order_acquire) != 0) {
-    absl::Status status =
-        co_await celer::SleepFor(*store->worker_, std::chrono::milliseconds(1));
+    absl::Status status = co_await bycorf::SleepFor(
+        *store->worker_, std::chrono::milliseconds(1));
     if (!status.ok()) {
       co_return status;
     }
@@ -2161,8 +2161,8 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
     const bool pending = store->replication_log_.standby_refill_pending_;
     store->replication_log_.mutex_.Unlock(*store->worker_);
     if (!pending) break;
-    absl::Status status =
-        co_await celer::SleepFor(*store->worker_, std::chrono::milliseconds(1));
+    absl::Status status = co_await bycorf::SleepFor(
+        *store->worker_, std::chrono::milliseconds(1));
     if (!status.ok()) co_return status;
   }
   co_await store->replication_log_.mutex_.Lock();
@@ -2177,8 +2177,8 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
     const bool prefetch_pending = store->standby_prefetch_pending_;
     store->store_state_mutex_.Unlock(*store->worker_);
     if (!prefetch_pending) break;
-    absl::Status status =
-        co_await celer::SleepFor(*store->worker_, std::chrono::milliseconds(1));
+    absl::Status status = co_await bycorf::SleepFor(
+        *store->worker_, std::chrono::milliseconds(1));
     if (!status.ok()) co_return status;
   }
 
@@ -2221,8 +2221,8 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
     if (done) {
       co_return absl::OkStatus();
     }
-    absl::Status status =
-        co_await celer::SleepFor(*store->worker_, std::chrono::milliseconds(1));
+    absl::Status status = co_await bycorf::SleepFor(
+        *store->worker_, std::chrono::milliseconds(1));
     if (!status.ok()) {
       co_return status;
     }

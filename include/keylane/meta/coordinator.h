@@ -30,22 +30,22 @@
 //
 // THREAD MODEL
 //
-//   - Propose is a celer::Task coroutine. Everything before the first
+//   - Propose is a bycorf::Task coroutine. Everything before the first
 //     suspension — leader check, fail-safe gates, ValidateProposal hooks,
 //     actor injection, encoding — runs SYNCHRONOUSLY on the
 //     caller's thread. Hooks that read the observation store therefore
-//     require the caller to run on the coordinator's owner thread (the celer
+//     require the caller to run on the coordinator's owner thread (the bycorf
 //     worker in production). The observation store is internally serialized
 //     because commit-driven revalidation runs on the dispatch thread.
 //   - The commit round trip suspends. Submission goes through the injected
 //     proposal executor before entering NuRaft's mutation path, so WAL work
-//     never blocks the production Celer worker. Short read-only role/config
+//     never blocks the production Bycorf worker. Short read-only role/config
 //     checks remain on the caller. Completion then goes through the injected
-//     options.foreign_executor_ — production resumes through Celer's target
+//     options.foreign_executor_ — production resumes through Bycorf's target
 //     worker mailbox so the continuation (and the awaiting reconciler) lands
 //     back on its owner. There is deliberately no implicit inline fallback:
 //     a coordinator attached to Raft requires this executor, preventing a
-//     NuRaft or timeout thread from accidentally running Celer-owned code.
+//     NuRaft or timeout thread from accidentally running Bycorf-owned code.
 //     Plain-thread tests opt into an explicit inline policy. A Propose task
 //     destroyed while suspended is SAFE: the awaiter detaches, and the late
 //     NuRaft completion fills a shared waiter and resumes nothing.
@@ -104,8 +104,8 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/runtime/foreign_executor.h"
-#include "celer/runtime/task.h"
+#include "bycorf/runtime/foreign_executor.h"
+#include "bycorf/runtime/task.h"
 #include "keylane/meta/commands.h"
 #include "keylane/meta/observation_store.h"
 #include "keylane/meta/proposal_executor.h"
@@ -331,7 +331,7 @@ class MetaReconciler;
 // lost fails with NOT_LEADER at the raft layer like any other proposal.
 class MetaLeaderContext {
  public:
-  celer::Task<absl::StatusOr<MetaApplyResult>> Propose(MetaCommand command);
+  bycorf::Task<absl::StatusOr<MetaApplyResult>> Propose(MetaCommand command);
   MetaCommittedView CommittedView();
   MetaSubscriptionStart SubscribeCommitted(MetaCommitCallback callback,
                                            std::size_t queue_capacity = 0);
@@ -399,8 +399,8 @@ struct MetaCoordinatorOptions {
   // Required whenever the coordinator is attached to a raft_server. Every
   // in-flight proposal retains a copy because a late completion can outlive
   // the caller-side timeout and coordinator.
-  celer::ForeignExecutor foreign_executor_{};
-  // Component tests without a Celer runtime must opt in explicitly. Production
+  bycorf::ForeignExecutor foreign_executor_{};
+  // Component tests without a Bycorf runtime must opt in explicitly. Production
   // assembly must never enable this or NuRaft/timer threads could run
   // worker-owned continuations inline.
   bool inline_resume_for_testing_ = false;
@@ -437,7 +437,7 @@ class MetaCoordinator {
   //     The message says so; the caller reconciles against CommittedView()
   //     using the command's idempotency key instead of assuming failure —
   //     safe because every command is replay/idempotency-safe by design.
-  celer::Task<absl::StatusOr<MetaApplyResult>> Propose(
+  bycorf::Task<absl::StatusOr<MetaApplyResult>> Propose(
       MetaCommand command, AuthenticatedPrincipal principal);
 
   // Registers a ValidateProposal plugin (see the MetaValidateHook contract).
@@ -560,9 +560,9 @@ class MetaCoordinator {
 };
 
 // Process-wiring bridge between NuRaft role callbacks and MetaCoordinator.
-// The callback records its exact edge synchronously, then asks the Celer worker
-// to Drain; this preserves callback order even if worker notifications are
-// delayed or coalesced. NuRaft can emit edges before the coordinator is
+// The callback records its exact edge synchronously, then asks the Bycorf
+// worker to Drain; this preserves callback order even if worker notifications
+// are delayed or coalesced. NuRaft can emit edges before the coordinator is
 // assembled, so Attach drains the retained prefix too. DetachAndStop is a
 // lifetime/order barrier: after it returns no callback can enqueue into the old
 // coordinator. Its target is non-owning and must remain alive from Attach

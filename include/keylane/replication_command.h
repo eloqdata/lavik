@@ -66,8 +66,8 @@ class ReplicationCommandPayloadSource final
       ReplicationCommandPayloadSource&&) noexcept = default;
 
   std::uint64_t size() const noexcept override { return size_; }
-  celer::Task<absl::Status> Read(std::uint64_t offset,
-                                 std::span<std::byte> output) override;
+  bycorf::Task<absl::Status> Read(std::uint64_t offset,
+                                  std::span<std::byte> output) override;
 
  private:
   ReplicationCommandPayloadSource() = default;

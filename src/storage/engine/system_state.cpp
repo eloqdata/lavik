@@ -456,7 +456,7 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
     co_return absl::InvalidArgumentError("invalid system-state root target");
   }
   DeviceAllocator& allocator = *device_allocators_[device_index];
-  if (celer::ThisWorker().id_ != allocator.owner_) {
+  if (bycorf::ThisWorker().id_ != allocator.owner_) {
     co_return absl::FailedPreconditionError(
         "system-state root write ran on the wrong worker");
   }
@@ -514,8 +514,8 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
         ? absl::InternalError("short system-state root write")
         : written.status();
   }
-  co_return co_await celer::Fdatasync(*store.worker_,
-                                      store.files_[device.file_index_]);
+  co_return co_await bycorf::Fdatasync(*store.worker_,
+                                       store.files_[device.file_index_]);
 }
 
 Task<absl::Status> StorageEngine::Impl::CommitSystemState(
@@ -577,13 +577,13 @@ Task<absl::Status> StorageEngine::Impl::CommitSystemState(
       static_cast<std::uint8_t>((next.generation_ - 1) & 1);
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
-    const celer::WorkerId owner = device_allocators_[device_index]->owner_;
+    const bycorf::WorkerId owner = device_allocators_[device_index]->owner_;
     absl::Status committed;
     if (owner == 0) {
       committed =
           co_await WriteSystemStateRootOnDeviceLocal(device_index, root, slot);
     } else {
-      committed = co_await celer::SubmitTaskTo(
+      committed = co_await bycorf::SubmitTaskTo(
           owner, [this, device_index, root, slot]() {
             return WriteSystemStateRootOnDeviceLocal(device_index, root, slot);
           });
@@ -620,15 +620,15 @@ StorageEngine::Impl::CommitFunctionCatalog(std::string_view dump) {
     co_return absl::OutOfRangeError(
         "Function catalog dump must be between 1 byte and 1 GiB");
   }
-  if (celer::ThisWorker().id_ != 0) {
+  if (bycorf::ThisWorker().id_ != 0) {
     std::string owned(dump);
-    co_return co_await celer::SubmitTaskTo(
+    co_return co_await bycorf::SubmitTaskTo(
         0, [this, owned = std::move(owned)]() {
           return CommitFunctionCatalog(owned);
         });
   }
   co_await system_state_mutex_.Lock();
-  UnlockGuard unlock(&system_state_mutex_, celer::ThisWorker().self_);
+  UnlockGuard unlock(&system_state_mutex_, bycorf::ThisWorker().self_);
   if (system_state_.catalog_token_.catalog_generation_ ==
       std::numeric_limits<std::uint64_t>::max()) {
     co_return absl::ResourceExhaustedError(
@@ -668,18 +668,18 @@ Task<absl::Status> StorageEngine::Impl::MakeDurable(
     co_return absl::InvalidArgumentError(
         "promotion durability frontier is incomplete");
   }
-  if (celer::ThisWorker().id_ != 0) {
+  if (bycorf::ThisWorker().id_ != 0) {
     DurabilityFrontier copied = frontier;
     std::string accumulator(opaque_accumulator);
-    co_return co_await celer::SubmitTaskTo(
+    co_return co_await bycorf::SubmitTaskTo(
         0, [this, copied = std::move(copied),
             accumulator = std::move(accumulator)]() {
           return MakeDurable(copied, accumulator);
         });
   }
   while (active_tx_commits_.load(std::memory_order_acquire) != 0) {
-    absl::Status slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                                  std::chrono::milliseconds(1));
+    absl::Status slept = co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
     if (!slept.ok()) co_return slept;
   }
   // Keep each suspension in its own statement. GCC 13 can reuse the wrong
@@ -692,7 +692,7 @@ Task<absl::Status> StorageEngine::Impl::MakeDurable(
     if (worker == 0) {
       durable = co_await drain();
     } else {
-      durable = co_await celer::SubmitTaskTo(worker, drain);
+      durable = co_await bycorf::SubmitTaskTo(worker, drain);
     }
     if (!durable.ok()) co_return durable;
   }
@@ -701,14 +701,14 @@ Task<absl::Status> StorageEngine::Impl::MakeDurable(
 
 Task<absl::Status> StorageEngine::Impl::CommitPromotionBase(
     PromotionBase base) {
-  if (celer::ThisWorker().id_ != 0) {
-    co_return co_await celer::SubmitTaskTo(
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
         0, [this, base = std::move(base)]() mutable {
           return CommitPromotionBase(std::move(base));
         });
   }
   co_await system_state_mutex_.Lock();
-  UnlockGuard unlock(&system_state_mutex_, celer::ThisWorker().self_);
+  UnlockGuard unlock(&system_state_mutex_, bycorf::ThisWorker().self_);
   if (system_state_.full_sync_session_id_ != 0 ||
       base.catalog_token_ != system_state_.catalog_token_ ||
       base.population_token_ != system_state_.population_token_) {
@@ -741,12 +741,12 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaFullSync(
   if (session_id == 0) {
     co_return absl::InvalidArgumentError("invalid full-sync session");
   }
-  if (celer::ThisWorker().id_ != 0) {
-    co_return co_await celer::SubmitTaskTo(
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
         0, [this, session_id]() { return BeginReplicaFullSync(session_id); });
   }
   co_await system_state_mutex_.Lock();
-  UnlockGuard unlock(&system_state_mutex_, celer::ThisWorker().self_);
+  UnlockGuard unlock(&system_state_mutex_, bycorf::ThisWorker().self_);
   if (system_state_.full_sync_session_id_ == session_id) {
     replica_recovery_fenced_.store(true, std::memory_order_release);
     co_return absl::OkStatus();
@@ -776,13 +776,14 @@ Task<absl::Status> StorageEngine::Impl::CompleteReplicaFullSync(
   if (session_id == 0 || population.generation_ == 0) {
     co_return absl::InvalidArgumentError("invalid full-sync completion");
   }
-  if (celer::ThisWorker().id_ != 0) {
-    co_return co_await celer::SubmitTaskTo(0, [this, session_id, population]() {
-      return CompleteReplicaFullSync(session_id, population);
-    });
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
+        0, [this, session_id, population]() {
+          return CompleteReplicaFullSync(session_id, population);
+        });
   }
   co_await system_state_mutex_.Lock();
-  UnlockGuard unlock(&system_state_mutex_, celer::ThisWorker().self_);
+  UnlockGuard unlock(&system_state_mutex_, bycorf::ThisWorker().self_);
   if (system_state_.full_sync_session_id_ != session_id ||
       !system_state_.catalog_ready_ ||
       system_state_.catalog_token_.catalog_generation_ == 0) {

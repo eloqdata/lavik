@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
-#include "celer/runtime/task.h"
+#include "bycorf/runtime/task.h"
 
 namespace keylane {
 
@@ -37,12 +37,12 @@ void MaybeRecordSlowCommand(std::span<const std::string> args,
                             std::string_view client_name,
                             std::uint64_t elapsed_ticks, bool may_block);
 
-celer::Task<std::vector<SlowLogEntry>> CollectSlowLog(std::size_t count);
-celer::Task<std::size_t> SlowLogLength();
-celer::Task<absl::Status> ResetSlowLog();
-celer::Task<absl::Status> ConfigureSlowLogThreshold(
+bycorf::Task<std::vector<SlowLogEntry>> CollectSlowLog(std::size_t count);
+bycorf::Task<std::size_t> SlowLogLength();
+bycorf::Task<absl::Status> ResetSlowLog();
+bycorf::Task<absl::Status> ConfigureSlowLogThreshold(
     std::int64_t threshold_micros);
-celer::Task<absl::Status> ConfigureSlowLogMaxLen(std::size_t max_len);
+bycorf::Task<absl::Status> ConfigureSlowLogMaxLen(std::size_t max_len);
 
 std::int64_t SlowLogThresholdMicros() noexcept;
 std::size_t SlowLogMaxLen() noexcept;

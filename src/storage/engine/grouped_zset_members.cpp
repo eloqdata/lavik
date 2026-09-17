@@ -13,7 +13,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedHashObject::Handle previous,
     const OrderedCollectionMutationPlan& ordered, bool unlocked) {
-  // Celer terminates on an exception escaping a coroutine body; a caller's
+  // Bycorf terminates on an exception escaping a coroutine body; a caller's
   // catch only covers frame creation. This phase owns private, admitted pages
   // and has staged nothing, so release them here and preserve the old graph.
   try {
@@ -78,7 +78,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     std::deque<RemovedMember> removed;
     absl::flat_hash_map<std::string_view, Change> changes;
     for (const auto& page : ordered.writes_) {
-      if (unlocked) co_await celer::Yield(*store.worker_);
+      if (unlocked) co_await bycorf::Yield(*store.worker_);
       for (const auto& entry : page.entries_) {
         auto& change = changes[entry.value_];
         if (change.after_)
@@ -88,7 +88,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     }
     for (const auto& page : ordered.writes_) {
       if (!previous || !previous->ordered_directory().Find(page.id_)) continue;
-      if (unlocked) co_await celer::Yield(*store.worker_);
+      if (unlocked) co_await bycorf::Yield(*store.worker_);
       GroupedScratchBudget read_budget;
       status = add_group(read_budget, {page.id_, 0});
       if (!status.ok()) co_return status;
@@ -144,7 +144,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
       for (const auto& [member, change] : changes) {
         if (unlocked && !value.entries_.empty() &&
             value.entries_.size() % 256 == 0)
-          co_await celer::Yield(*store.worker_);
+          co_await bycorf::Yield(*store.worker_);
         value.entries_.push_back(
             {.digest_ = ComputeDigest(member),
              .field_ = std::string(member),
@@ -181,7 +181,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     if (!admission.ok()) co_return admission.status();
     result.leaves_ = std::move(*admission);
     for (auto& [id, leaf] : leaves) {
-      if (unlocked) co_await celer::Yield(*store.worker_);
+      if (unlocked) co_await bycorf::Yield(*store.worker_);
       auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
                                                    digest, previous, id);
       if (!loaded.ok()) co_return loaded.status();

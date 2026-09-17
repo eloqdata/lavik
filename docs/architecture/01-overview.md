@@ -5,14 +5,14 @@
 Keylane is a Linux C++23 server that accepts Redis/Valkey-compatible commands.
 Connections start with RESP2 reply semantics and can negotiate RESP2 or RESP3
 with `HELLO`. Keylane persists the resulting logical data to local files, block
-devices, or SPDK NVMe namespaces. The process uses the Celer submodule for its
+devices, or SPDK NVMe namespaces. The process uses the Bycorf submodule for its
 thread-per-worker coroutine runtime, TCP/TLS transport, cross-core messaging,
 HTTP service, and storage I/O backends.
 
 The executable is one process with worker-affine state rather than a collection
 of networked services. Redis serving, metrics, replication, transaction
 coordination, the cluster data plane, and storage are composed in `RunServer`;
-Celer owns the worker and socket lifecycle underneath those Keylane modules.
+Bycorf owns the worker and socket lifecycle underneath those Keylane modules.
 
 Network and storage backends are independently selected at startup and remain
 fixed for the process lifetime, including storage preparation before workers
@@ -22,14 +22,14 @@ activate them. Startup defaults remain Linux TCP and io_uring, including for
 the Meta control plane. Each worker owns one io_uring shared by kernel
 network/storage I/O, timers and wakeups; the DPDK adapter borrows that ring.
 The optional DPDK network backend serves
-plaintext IPv4 TCP through Celer's private FreeBSD stack while preserving the
+plaintext IPv4 TCP through Bycorf's private FreeBSD stack while preserving the
 same RESP stream interface and worker ownership. Software packet forwarding
 allows connection owners to outnumber hardware queue pairs. File I/O and
 cross-worker wakeups retain io_uring, and networking shares one EAL with SPDK.
 This integration is an experimental standalone serving profile; its TLS,
 replication handoff, and cluster paths are outside the validation scope. See
 the [build guide](../operations/building-and-packaging.md#experimental-dpdk-networking)
-and Celer's [network architecture](../../celer/docs/architecture/networking.md).
+and Bycorf's [network architecture](../../bycorf/docs/architecture/networking.md).
 
 A separate `keylane-meta` executable runs the [Raft-backed meta control
 plane](08-meta-control-plane.md). It owns committed cluster metadata,
@@ -41,7 +41,7 @@ routing, local control and task updates. Initial creation, Meta-member
 addition/removal, and per-Group failover are recovered by the current leader,
 independent of an Admin client's connection or wait deadline. It links the
 pinned NuRaft submodule, whose native Asio service owns Raft peer communication;
-Celer owns the separate administrative and Data-node sessions. The Raft-free
+Bycorf owns the separate administrative and Data-node sessions. The Raft-free
 `keylane-ctl` operator client sends direct administrative commands; its
 `cluster-status` command discovers the current Meta leader and reads one stable
 cluster-readiness cut through that surface; `failover` submits a durable
@@ -53,7 +53,7 @@ enforces that boundary at configure time.
 ```text
 Redis/Valkey clients, Sentinels, and replicas
                 |
-        Celer TCP/TLS services
+        Bycorf TCP/TLS services
                 |
     RESP2/RESP3 session and command layer
           /                         \
@@ -66,7 +66,7 @@ Redis/Valkey clients, Sentinels, and replicas
           |
  file, block-device, or SPDK I/O
 
-Prometheus scrapes a separate Celer HTTP service backed by worker and storage
+Prometheus scrapes a separate Bycorf HTTP service backed by worker and storage
 snapshots.
 
 keylane-meta Raft leader <-- framed control session --> Data NodeControl
@@ -84,7 +84,7 @@ operator --> keylane-ctl cluster-status / failover / getop
 | Component | Responsibility | Main interface |
 |---|---|---|
 | Process shell | Parse configuration, initialize logging and memory limits, compose modules, start services, and coordinate graceful shutdown | `app/keylane.cpp`, `keylane::RunServer` |
-| Celer runtime | Own worker threads, coroutines, cross-core submissions, TCP/TLS sessions, HTTP serving, and I/O backends | `celer::Server`, `celer::TcpService`, `celer::Worker`, `celer::SubmitTaskTo` |
+| Bycorf runtime | Own worker threads, coroutines, cross-core submissions, TCP/TLS sessions, HTTP serving, and I/O backends | `bycorf::Server`, `bycorf::TcpService`, `bycorf::Worker`, `bycorf::SubmitTaskTo` |
 | Request and Redis serving | Parse commands, negotiate RESP reply semantics, retain connection state, run Lua and Pub/Sub, classify and dispatch commands, and encode or stream replies | `RedisService`, `DispatchCommand`, `ExecuteCommand` |
 | Transaction coordination | Serialize conflicting key access across workers and execute single- or multi-shard command hops | `tx::TxRuntime`, `tx::Transaction`, `tx::TxShard` |
 | Storage and recovery | Own logical indexes and physical blocks, execute reads and appends, recover durable state, and reclaim obsolete data | `storage::StorageEngine` |
@@ -100,7 +100,7 @@ operator --> keylane-ctl cluster-status / failover / getop
    validates the combined options, and initializes logging.
 2. `RunServer` initializes the memory budget, signal handling, storage engine,
    replication manager, cluster topology/authority/node-controller runtime,
-   command/storage bindings, metrics shards, transaction runtime, and Celer
+   command/storage bindings, metrics shards, transaction runtime, and Bycorf
    service graph. Cluster mode always starts the outbound Meta control client
    fenced; no topology or positive authority is restored locally.
 3. On every worker, `RedisService::Run` binds the memory and transaction shards
@@ -116,7 +116,7 @@ operator --> keylane-ctl cluster-status / failover / getop
    before storage is durably flushed. When configured, shutdown transaction
    cleaning relocates committed tagged winners into durable ordinary records;
    a second seal/drain then freezes the resulting indexes before a shutdown
-   checkpoint publishes them. Celer then stops
+   checkpoint publishes them. Bycorf then stops
    each worker; after that worker's I/O and coroutine frames are gone but
    before its native thread exits and is joined,
    `RedisService::FinalizeWorker` calls `StorageEngine::FinalizeWorker` to
@@ -203,8 +203,8 @@ cleanup as another durable phase.
 ## Cross-cutting invariants
 
 - Worker-affine mutable state is accessed on its owner worker; cross-worker
-  work uses Celer submission primitives. Coroutine coordinators resume on their
-  origin worker. Celer may batch cross-worker delivery, but accepted work
+  work uses Bycorf submission primitives. Coroutine coordinators resume on their
+  origin worker. Bycorf may batch cross-worker delivery, but accepted work
   remains discoverable across concurrent posts, drains, and worker wakeups and
   cannot be stranded.
 - Logical database identity is carried in each command and durable record; it
@@ -272,7 +272,7 @@ cleanup as another durable phase.
 
 | Integration | Boundary |
 |---|---|
-| Celer | Pinned git submodule compiled into Keylane for runtime, network, TLS, cross-core, HTTP, io_uring, and optional SPDK support |
+| Bycorf | Pinned git submodule compiled into Keylane for runtime, network, TLS, cross-core, HTTP, io_uring, and optional SPDK support |
 | mimalloc | Pinned allocator submodule; the official global new/delete override serves ordinary C++ allocations, while retained storage calls mimalloc through explicitly accounted domains |
 | NuRaft | Pinned Raft consensus submodule linked only by `keylane-meta`; its native Asio service owns Raft peer sockets, timers, and TLS and uses the Asio headers shipped in the NuRaft source tree |
 | OpenSSL | TLS server/client contexts; release builds can link it statically |
@@ -295,7 +295,7 @@ those deployment boundaries remain unknown here.
 | Meta control-plane composition, failover reconciler, and NuRaft layering boundary | `CMakeLists.txt`, `app/keylane_meta.cpp`, `include/keylane/meta/`, `src/meta/`, `.gitmodules` |
 | CLI/config parsing and top-level process entry | `app/keylane.cpp`, `include/keylane/config.h`, `src/config.cpp` |
 | Module construction, worker startup barriers, readiness, and shutdown ordering | `include/keylane/server.h`, `src/redis/server.cpp` |
-| Celer runtime and service dependency | `.gitmodules`, `celer/include/celer/runtime/`, `celer/include/celer/net/`, `celer/src/` |
+| Bycorf runtime and service dependency | `.gitmodules`, `bycorf/include/bycorf/runtime/`, `bycorf/include/bycorf/net/`, `bycorf/src/` |
 | Request/session/command flow and negotiated RESP semantics | `include/keylane/resp.h`, `include/keylane/resp_version.h`, `include/keylane/session.h`, `include/keylane/command.h`, `src/redis/server.cpp`, `src/redis/resp.cpp` |
 | Lua scripts, Function catalog lifecycle, and their transaction boundary | `src/redis/lua_eval.h`, `src/redis/lua_eval.cpp`, `src/redis/function_catalog.h`, `src/redis/function_catalog.cpp`, `src/redis/command.cpp` |
 | Pub/Sub sessions, worker-local registries, fan-out, and bounded output | `include/keylane/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |

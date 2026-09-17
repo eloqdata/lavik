@@ -16,7 +16,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
-#include "celer/runtime/task.h"
+#include "bycorf/runtime/task.h"
 #include "keylane/cluster/topology.h"
 #include "keylane/read_trace.h"
 #include "keylane/resp_version.h"
@@ -41,7 +41,7 @@ struct ReplicatedCommand;
 class ReplyBuilder;
 class ReplicationManager;
 
-using celer::Task;
+using bycorf::Task;
 
 struct CapturedReplicationCommand {
   CapturedReplicationCommand() = default;
@@ -343,7 +343,7 @@ enum class CommandKind {
 
 struct CommandSpec;
 
-// CommandRequest is stored directly in Celer coroutine frames. Their allocator
+// CommandRequest is stored directly in Bycorf coroutine frames. Their allocator
 // guarantees max_align_t, so stronger type alignment would let GCC emit aligned
 // SIMD stores that the frame cannot honor. The compact extent still keeps
 // vectors densely strided; do not over-align the type without extending the

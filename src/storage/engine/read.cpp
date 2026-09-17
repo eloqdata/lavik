@@ -8,7 +8,7 @@ class BatchReadAwaiter;
 
 // One address-stable io_uring/SPDK tag. A whole MGET shard owns a vector of
 // these ordinary objects and has only one awaiting coroutine.
-struct BatchReadOperation final : celer::IoCompletion {
+struct BatchReadOperation final : bycorf::IoCompletion {
   void Complete(Worker& worker, int result, unsigned flags) override;
 
   BatchReadAwaiter* batch_ = nullptr;
@@ -911,7 +911,7 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store,
     } else {
       const unsigned owner = location.block_owner();
       std::string owned_key(key);
-      loaded = co_await celer::SubmitTaskTo(
+      loaded = co_await bycorf::SubmitTaskTo(
           owner,
           [this, owner, db_id, key = std::move(owned_key), location,
            replication_epoch, db_epoch,
@@ -1111,7 +1111,7 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadExternalKey(
       read = co_await ReadExtentInto(
           store, ref, static_cast<std::uint32_t>(index), destination);
     } else {
-      read = co_await celer::SubmitTaskTo(
+      read = co_await bycorf::SubmitTaskTo(
           owner,
           [this, owner, ref, index, destination]() -> Task<absl::Status> {
             co_return co_await ReadExtentInto(*stores_[owner], ref,
@@ -1150,7 +1150,7 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadOutOfIndexKey(
     co_return absl::Status(absl::StatusCode::kInternal,
                            "inline key block has no owner");
   }
-  co_return co_await celer::SubmitTaskTo(
+  co_return co_await bycorf::SubmitTaskTo(
       owner,
       [this, owner, location,
        key_bytes]() -> Task<absl::StatusOr<std::string>> {
@@ -1280,7 +1280,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::VerifyExternalKeyExtents(
       read = co_await ReadExtentInto(
           store, ref, static_cast<std::uint32_t>(index), buffer.data());
     } else {
-      read = co_await celer::SubmitTaskTo(
+      read = co_await bycorf::SubmitTaskTo(
           owner,
           [this, owner, ref, index,
            destination = buffer.data()]() -> Task<absl::Status> {
@@ -1313,7 +1313,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::VerifyInlineRecordKey(
                            "inline key block has no owner");
   }
   std::string owned_key(key);
-  co_return co_await celer::SubmitTaskTo(
+  co_return co_await bycorf::SubmitTaskTo(
       owner,
       [this, owner, location,
        key = std::move(owned_key)]() -> Task<absl::StatusOr<bool>> {
@@ -1557,7 +1557,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
       read = co_await ReadExtentInto(store, ref,
                                      static_cast<std::uint32_t>(index), target);
     } else {
-      read = co_await celer::SubmitTaskTo(
+      read = co_await bycorf::SubmitTaskTo(
           owner, [this, owner, ref, index, target]() -> Task<absl::Status> {
             co_return co_await ReadExtentInto(*stores_[owner], ref,
                                               static_cast<std::uint32_t>(index),
@@ -1593,8 +1593,9 @@ StorageEngine::Impl::LoadValueLocal(
     RecordLocation location, std::uint64_t replication_epoch,
     ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch) {
   KEYLANE_FAULT_INJECT(
-      if (KEYLANE_FAULT_MATCHES("KEYLANE_FAIL_VALUE_READ_KEY", key))
-        co_return absl::InternalError("injected value payload read failure"););
+      if (KEYLANE_FAULT_MATCHES("KEYLANE_FAIL_VALUE_READ_KEY",
+                                key)) co_return absl::
+          InternalError("injected value payload read failure"););
   if (location.external()) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external value was dispatched as inline");

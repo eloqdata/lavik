@@ -64,8 +64,9 @@ bool NeedsGroupedHash(const HashValue& value) {
   return false;
 }
 
-absl::StatusOr<HashResult> ReadCompactHashResult(
-    std::string_view payload, HashOperationKind kind, std::uint64_t count) {
+absl::StatusOr<HashResult> ReadCompactHashResult(std::string_view payload,
+                                                 HashOperationKind kind,
+                                                 std::uint64_t count) {
   auto reader = HashValueReader::Open(payload);
   if (!reader.ok()) return reader.status();
   if (reader->size() != count) {
@@ -93,10 +94,10 @@ absl::StatusOr<HashResult> ReadCompactHashResult(
     auto entry = inspect.Next();
     if (!entry.ok()) return entry.status();
     if (!add_bytes(width * sizeof(std::optional<std::string>)) ||
-        (fields && !add_bytes(std::max(entry->field_.size(), inline_capacity) +
-                              1)) ||
-        (values && !add_bytes(std::max(entry->value_.size(), inline_capacity) +
-                              1))) {
+        (fields &&
+         !add_bytes(std::max(entry->field_.size(), inline_capacity) + 1)) ||
+        (values &&
+         !add_bytes(std::max(entry->value_.size(), inline_capacity) + 1))) {
       RecordMemoryRejection();
       return absl::ResourceExhaustedError("OOM Hash output is too large");
     }
@@ -143,7 +144,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     const HashOperation& operation, ValueType value_type, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
-  // Private preparation allocations must unwind here: Celer terminates on
+  // Private preparation allocations must unwind here: Bycorf terminates on
   // exceptions escaping a coroutine body, even when its caller has a catch.
   try {
     assert(db_id < kLogicalDatabaseCount);
@@ -294,7 +295,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         if (parsed.ec == std::errc{} && parsed.ptr == end && milliseconds > 0) {
           spdlog::info("compact hash write pause armed key={} milliseconds={}",
                        key, milliseconds);
-          auto paused = co_await celer::SleepFor(
+          auto paused = co_await bycorf::SleepFor(
               *store.worker_, std::chrono::milliseconds(milliseconds));
           if (!paused.ok()) co_return paused;
           spdlog::info("compact hash write pause complete key={}", key);
@@ -314,7 +315,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         const auto parsed = std::from_chars(configured, end, milliseconds);
         if (parsed.ec == std::errc{} && parsed.ptr == end &&
             milliseconds != 0) {
-          absl::Status paused = co_await celer::SleepFor(
+          absl::Status paused = co_await bycorf::SleepFor(
               *store.worker_, std::chrono::milliseconds(milliseconds));
           if (!paused.ok()) co_return paused;
         }
@@ -464,7 +465,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         // never enter this command's scratch unless they share the affected
         // group.
         for (const auto id : selected) {
-          if (unlocked_grouped_write) co_await celer::Yield(*store.worker_);
+          if (unlocked_grouped_write) co_await bycorf::Yield(*store.worker_);
           auto loaded = co_await LoadHashGroupSnapshot(
               store, partition, db_id, key, digest, grouped, id);
           if (!loaded.ok()) {
@@ -667,7 +668,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
           co_return absl::InvalidArgumentError("Hash field/value mismatch");
         for (std::size_t i = 0; i < operation.fields_.size(); ++i) {
           if (unlocked_create && i != 0 && i % 256 == 0)
-            co_await celer::Yield(*store.worker_);
+            co_await bycorf::Yield(*store.worker_);
           if (operation.fields_[i].size() > kMaxStringBytes ||
               operation.values_[i].size() > kMaxStringBytes) {
             co_return absl::OutOfRangeError(

@@ -85,7 +85,7 @@
 // synchronous pwrite/fdatasync on the calling NuRaft thread. NuRaft drives
 // log writes from its append/commit background threads and request handlers,
 // which are allowed to block on storage (the asio path behaves the same);
-// the meta plane deliberately keeps durability IO out of celer coroutines.
+// the meta plane deliberately keeps durability IO out of bycorf coroutines.
 //
 // Failure behavior: Open() reports errors via absl::Status. pwrite failures
 // inside append/write_at/apply_pack cannot be propagated through NuRaft's

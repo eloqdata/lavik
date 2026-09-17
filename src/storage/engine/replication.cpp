@@ -14,7 +14,7 @@ struct StorageEngine::Impl::SnapshotReadJoin {
     assert(pending_ != 0);
     if (--pending_ == 0 && waiter_) {
       const auto waiter = std::exchange(waiter_, {});
-      celer::ThisWorker().self_->Enqueue(waiter);
+      bycorf::ThisWorker().self_->Enqueue(waiter);
     }
   }
 
@@ -58,10 +58,10 @@ Task<absl::Status> StorageEngine::Impl::PinFullSyncExtents(
       co_return absl::OkStatus();
     };
     absl::Status status;
-    if (owner == celer::ThisWorker().id_) {
+    if (owner == bycorf::ThisWorker().id_) {
       status = co_await pin();
     } else {
-      status = co_await celer::SubmitTaskTo(owner, pin);
+      status = co_await bycorf::SubmitTaskTo(owner, pin);
     }
     if (!status.ok()) break;
     ++pinned;
@@ -94,10 +94,10 @@ Task<absl::Status> StorageEngine::Impl::ReleaseFullSyncExtents(
       co_return absl::OkStatus();
     };
     absl::Status status;
-    if (owner == celer::ThisWorker().id_) {
+    if (owner == bycorf::ThisWorker().id_) {
       status = co_await release();
     } else {
-      status = co_await celer::SubmitTaskTo(owner, release);
+      status = co_await bycorf::SubmitTaskTo(owner, release);
     }
     if (!status.ok()) co_return status;
   }
@@ -1077,7 +1077,7 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::ReadFullSyncValueChunk(
     if (owner == store.worker_->id()) {
       status = co_await read();
     } else {
-      status = co_await celer::SubmitTaskTo(owner, read);
+      status = co_await bycorf::SubmitTaskTo(owner, read);
     }
     if (!status.ok()) co_return status;
     written += slice;
@@ -1493,7 +1493,7 @@ StorageEngine::Impl::ResetReplicaPartitions(
   epoch_updates.reserve(resets.size());
   for (const ReplicaPartitionReset& reset : resets) {
     if (reset.partition_id_ >= kLogicalStorageShards ||
-        reset.partition_id_ % worker_count_ != celer::ThisWorker().id_ ||
+        reset.partition_id_ % worker_count_ != bycorf::ThisWorker().id_ ||
         seen[reset.partition_id_]) {
       co_return absl::Status(absl::StatusCode::kInvalidArgument,
                              "invalid replica reset batch partition");
@@ -1578,10 +1578,10 @@ StorageEngine::Impl::ResetReplicaPartitions(
 Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetach(
     std::span<const std::uint16_t> partition_ids) {
   if (partition_ids.empty()) co_return absl::OkStatus();
-  if (celer::ThisWorker().id_ != 0) {
+  if (bycorf::ThisWorker().id_ != 0) {
     std::vector<std::uint16_t> copied(partition_ids.begin(),
                                       partition_ids.end());
-    co_return co_await celer::SubmitTaskTo(
+    co_return co_await bycorf::SubmitTaskTo(
         0, [this, copied = std::move(copied)]() {
           return ResetPartitionsDetach(copied);
         });
@@ -1603,7 +1603,7 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetach(
     if (worker == 0) {
       reset = co_await ResetPartitionsDetachLocal(by_worker[worker]);
     } else {
-      reset = co_await celer::SubmitTaskTo(
+      reset = co_await bycorf::SubmitTaskTo(
           worker, [this, ids = std::move(by_worker[worker])]() {
             return ResetPartitionsDetachLocal(ids);
           });
@@ -1624,7 +1624,7 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
   epoch_updates.reserve(partition_ids.size());
   for (const std::uint16_t partition_id : partition_ids) {
     if (partition_id >= kLogicalStorageShards ||
-        partition_id % worker_count_ != celer::ThisWorker().id_) {
+        partition_id % worker_count_ != bycorf::ThisWorker().id_) {
       co_return absl::InvalidArgumentError(
           "targeted reset partition belongs to another worker");
     }
@@ -1700,7 +1700,7 @@ Task<absl::Status> StorageEngine::Impl::HandoffReplicaPartition(
     std::uint64_t replication_epoch) {
   WorkerStore& store = CurrentStore();
   if (partition_id >= kLogicalStorageShards ||
-      partition_id % worker_count_ != celer::ThisWorker().id_) {
+      partition_id % worker_count_ != bycorf::ThisWorker().id_) {
     co_return absl::InvalidArgumentError(
         "replica handoff partition belongs to another worker");
   }
@@ -1726,7 +1726,7 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaTailCommand(
     std::uint64_t session_id, std::uint16_t partition_id,
     std::uint64_t partition_sequence) {
   if (partition_sequence == 0 || partition_id >= kLogicalStorageShards ||
-      partition_id % worker_count_ != celer::ThisWorker().id_) {
+      partition_id % worker_count_ != bycorf::ThisWorker().id_) {
     co_return absl::InvalidArgumentError(
         "invalid replica tail command identity");
   }
@@ -2088,7 +2088,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicaRootWritesLocal(
     }
     if (done) co_return absl::OkStatus();
     absl::Status waited =
-        co_await celer::SleepFor(*store.worker_, std::chrono::milliseconds(1));
+        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
     if (!waited.ok()) co_return waited;
   }
 }
@@ -2098,8 +2098,8 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
   if (session_id == 0) {
     co_return absl::InvalidArgumentError("invalid replica root session");
   }
-  if (celer::ThisWorker().id_ != 0) {
-    co_return co_await celer::SubmitTaskTo(
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
         0, [this, session_id]() { return PromoteReplicaRoot(session_id); });
   }
 
@@ -2134,7 +2134,7 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
       return absl::OkStatus();
     };
     absl::Status valid =
-        target == 0 ? validate() : co_await celer::SubmitTo(target, validate);
+        target == 0 ? validate() : co_await bycorf::SubmitTo(target, validate);
     if (!valid.ok()) co_return valid;
   }
   for (unsigned target = 0; target < worker_count_; ++target) {
@@ -2149,7 +2149,7 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
     if (target == 0) {
       drained = co_await drain();
     } else {
-      drained = co_await celer::SubmitTaskTo(target, drain);
+      drained = co_await bycorf::SubmitTaskTo(target, drain);
     }
     if (!drained.ok()) co_return drained;
   }
@@ -2162,7 +2162,7 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
     if (target == 0) {
       settled = co_await settle();
     } else {
-      settled = co_await celer::SubmitTaskTo(target, settle);
+      settled = co_await bycorf::SubmitTaskTo(target, settle);
     }
     if (!settled.ok()) co_return settled;
   }
@@ -2210,7 +2210,7 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
     if (target == 0) {
       published = co_await publish();
     } else {
-      published = co_await celer::SubmitTaskTo(target, publish);
+      published = co_await bycorf::SubmitTaskTo(target, publish);
     }
     if (!published.ok()) co_return published;
   }
@@ -2235,8 +2235,8 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
 Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
     std::uint64_t session_id) {
   if (session_id == 0) co_return absl::OkStatus();
-  if (celer::ThisWorker().id_ != 0) {
-    co_return co_await celer::SubmitTaskTo(
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
         0, [this, session_id]() { return AbortReplicaRoot(session_id); });
   }
   // A stream can own an uncommitted grouped root and a cross-frame key hold.
@@ -2261,7 +2261,7 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
     if (target == 0) {
       cancelled = co_await cancel();
     } else {
-      cancelled = co_await celer::SubmitTaskTo(target, cancel);
+      cancelled = co_await bycorf::SubmitTaskTo(target, cancel);
     }
     if (!cancelled.ok()) co_return cancelled;
   }
@@ -2274,7 +2274,7 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
     if (target == 0) {
       drained = co_await drain();
     } else {
-      drained = co_await celer::SubmitTaskTo(target, drain);
+      drained = co_await bycorf::SubmitTaskTo(target, drain);
     }
     if (!drained.ok()) co_return drained;
   }
@@ -2326,7 +2326,7 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
     if (target == 0) {
       discarded = co_await discard();
     } else {
-      discarded = co_await celer::SubmitTaskTo(target, discard);
+      discarded = co_await bycorf::SubmitTaskTo(target, discard);
     }
     if (!discarded.ok()) co_return discarded;
   }

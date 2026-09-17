@@ -301,8 +301,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
       if (KEYLANE_FAULT_MATCHES("KEYLANE_PAUSE_FULLSYNC_COLLECTION_SCAN_KEY",
                                 key)) {
         spdlog::info("paused full-sync collection pre-scan key={}", key);
-        auto waited = co_await celer::SleepFor(*store.worker_,
-                                               std::chrono::milliseconds(5000));
+        auto waited = co_await bycorf::SleepFor(
+            *store.worker_, std::chrono::milliseconds(5000));
         if (!waited.ok()) co_return waited;
       });
   stream->ResetCursor();
@@ -369,8 +369,8 @@ StorageEngine::Impl::ReadFullSyncCollectionChunk(
                                 stream->key_)) {
         spdlog::info("paused full-sync collection chunk key={} page_bytes={}",
                      stream->key_, stream->page_->RetainedBytes());
-        auto waited = co_await celer::SleepFor(*stream->store_->worker_,
-                                               std::chrono::milliseconds(5000));
+        auto waited = co_await bycorf::SleepFor(
+            *stream->store_->worker_, std::chrono::milliseconds(5000));
         if (!waited.ok()) co_return waited;
       });
   const auto count = static_cast<std::size_t>(
@@ -472,9 +472,9 @@ Task<absl::Status> StorageEngine::Impl::ReleaseFullSyncCollection(
   if (stream == nullptr) co_return absl::OkStatus();
   stream->cancelled_ = true;
   while (stream->reading_ || (stream->releasing_ && !stream->released_)) {
-    const auto waited = co_await celer::SleepFor(*stream->store_->worker_,
-                                                 std::chrono::milliseconds(1));
-    if (!waited.ok()) co_await celer::Yield(*stream->store_->worker_);
+    const auto waited = co_await bycorf::SleepFor(*stream->store_->worker_,
+                                                  std::chrono::milliseconds(1));
+    if (!waited.ok()) co_await bycorf::Yield(*stream->store_->worker_);
   }
   if (stream->released_) co_return absl::OkStatus();
   stream->releasing_ = true;

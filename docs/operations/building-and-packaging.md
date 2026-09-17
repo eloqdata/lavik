@@ -11,10 +11,10 @@ Optimized local builds use the current machine's instruction set by default:
 `KEYLANE_KERNEL_BYPASS` defaults to `OFF`: Keylane and `keylane-meta` build
 with kernel networking and io_uring and do not configure or link DPDK, SPDK or
 the private FreeBSD stack. Set `-DKEYLANE_KERNEL_BYPASS=ON` to include both
-bypass capabilities. Keylane drives Celer's internal capability flags from
-this single option, including when reconfiguring an existing build directory.
+bypass capabilities. Keylane sets `BYCORF_KERNEL_BYPASS` from this single
+option, including when reconfiguring an existing build directory.
 
-This configures `KEYLANE_MARCH=native`, including Celer, mimalloc, and the
+This configures `KEYLANE_MARCH=native`, including Bycorf, mimalloc, and the
 Abseil CRC translation units used by the durable storage format. The latter is
 important because Abseil compiles its hardware CRC engine only when the target
 exposes the required instruction macros; leaving those translation units at
@@ -27,14 +27,14 @@ and `libcrypto.a`).
 For a different local CPU target, configure CMake directly with
 `-DKEYLANE_MARCH=<target>`. An empty value disables the explicit `-march` flag.
 
-Use `-DKEYLANE_CELER_SOURCE_DIR=/absolute/path/to/celer-worktree` to build and
-test a separate Celer checkout without replacing the repository's submodule.
-The default remains the pinned `celer/` checkout. Record both revisions when
+Use `-DKEYLANE_BYCORF_SOURCE_DIR=/absolute/path/to/bycorf-worktree` to build and
+test a separate Bycorf checkout without replacing the repository's submodule.
+The default remains the pinned `bycorf/` checkout. Record both revisions when
 comparing performance with an alternate runtime.
 
 When aggressive optimization is enabled, CMake's IPO support configures both
 compilation and linking for the non-Debug server and every bundled runtime
-library that feeds it, including Celer and the C libraries. Test-only
+library that feeds it, including Bycorf and the C libraries. Test-only
 executables omit IPO because their deliberately oversized coroutine stress
 cases can trigger GCC compiler failures; they still link against the optimized
 production libraries. Clang test links enable its LLVM bitcode reader without
@@ -54,27 +54,31 @@ build the Meta and operator binaries from source for this release.
 
 ### Experimental DPDK networking
 
-The pinned Celer includes an optional FreeBSD/DPDK IPv4 TCP backend for
+The pinned Bycorf includes an optional FreeBSD/DPDK IPv4 TCP backend for
 AArch64 and x86-64. The default network backend remains Linux TCP/io_uring.
-Initialize the required dependencies explicitly; SPDK uses Celer's direct DPDK
+Initialize the required dependencies explicitly; SPDK uses Bycorf's direct DPDK
 submodule, so its nested DPDK checkout is not needed:
 
 ```bash
-git submodule update --init celer third_party/mimalloc third_party/nuraft
+git submodule update --init bycorf third_party/mimalloc third_party/nuraft
 git -C third_party/nuraft submodule update --init asio
-git -C celer submodule update --init third_party/liburing third_party/abseil \
+git -C bycorf submodule update --init third_party/liburing third_party/abseil \
   third_party/spdk third_party/dpdk
-git -C celer/third_party/spdk submodule update --init isa-l isa-l-crypto
+git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
 cmake -S . -B build-dpdk-net -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo -DKEYLANE_ENABLE_OPT=OFF \
-  -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+  -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
   -DKEYLANE_KERNEL_BYPASS=ON -DBUILD_TESTING=OFF
 cmake --build build-dpdk-net --target keylane -j4
 ```
 
-CMake invokes the BSD build helper automatically; Python 3 remains a build
-dependency. See Celer's [prototype runbook](../../celer/docs/dpdk-prototype.md)
-for prerequisites, TAP setup, physical-device selection, poll/adaptive mode,
+On AArch64, use GCC for the bypass build because the pinned SPDK ISA-L Crypto
+dependency requires GCC. The private FreeBSD stack is built separately with
+Clang by the BSD build helper; both compilers are therefore required. Ordinary
+kernel/io_uring builds support Clang. CMake invokes the BSD build helper
+automatically; Python 3 remains a build dependency. See Bycorf's
+[prototype runbook](../../bycorf/docs/dpdk-prototype.md) for prerequisites, TAP
+setup, physical-device selection, poll/adaptive mode,
 and queue configuration. The default device is a virtual TAP. Ordinary data
 files use `--storage=uring`; the bypass build also supports
 `--storage=spdk` and `spdk://` NVMe paths. Select `--network=dpdk` explicitly;
@@ -84,13 +88,13 @@ disposable file and disable the metrics listener with
 and cluster use are outside this prototype's validation scope.
 
 The default DPDK build supports up to 128 network workers. Set
-`-DCELER_DPDK_MAX_WORKERS=N` to change this capacity (1–1023); Celer builds a
+`-DBYCORF_DPDK_MAX_WORKERS=N` to change this capacity (1–1023); Bycorf builds a
 matching FreeBSD stack and DPDK with `N+1` lcore registration slots, and links
-SPDK against that same DPDK. An external `CELER_DPDK_PREFIX` must have enough
+SPDK against that same DPDK. An external `BYCORF_DPDK_PREFIX` must have enough
 slots or configuration fails. This is a build capacity, not the active thread
 count; `--threads` chooses that at startup. RSS still requires a queue pair per
-worker; hash steering can use fewer queues. See Celer's
-[worker capacity guide](../../celer/docs/dpdk-prototype.md#worker-capacity).
+worker; hash steering can use fewer queues. See Bycorf's
+[worker capacity guide](../../bycorf/docs/dpdk-prototype.md#worker-capacity).
 
 ### Runtime backend selection
 
@@ -112,7 +116,7 @@ before device initialization. Existing SPDK launch commands must now include
 `--network=dpdk`. Backend selection is not a live `CONFIG SET` option.
 
 Device binding remains an operator step. Supply the complete selected NIC and
-NVMe allowlist in `CELER_EAL_ARGS` before launch; either accelerator can be the
+NVMe allowlist in `BYCORF_EAL_ARGS` before launch; either accelerator can be the
 first EAL user. With neither selected, EAL and its device discovery are inactive.
 Changing modes requires a clean process stop and appropriate device binding.
 The private TCP stack still has the prototype compatibility limits above.
@@ -232,7 +236,7 @@ KEYLANE_MAYBE_CRASH_AT("group-batch-before-root");
 KEYLANE_FAULT_INJECT(
     if (KEYLANE_FAULT_MATCHES("KEYLANE_TEST_PAUSE_KEY", key)) {
       // Keep the existing coroutine, lock ownership and error handling.
-      auto status = co_await celer::SleepFor(worker, delay);
+      auto status = co_await bycorf::SleepFor(worker, delay);
       if (!status.ok()) co_return status;
     });
 ```
@@ -310,9 +314,9 @@ allowlist rules. The CTest labels are `cluster-model`,
 
 ## Source formatting
 
-Keylane and its Celer submodule use the Google style, parse source as C++23,
-and pin clang-format 23.1.0. Install `pre-commit` once and enable the repository
-hook:
+Keylane uses the Google style, parses source as C++23, and pins clang-format
+23.1.0. Its Bycorf submodule maintains its own formatter pin. Install
+`pre-commit` once and enable the repository hook:
 
 ```bash
 sudo apt-get install pre-commit

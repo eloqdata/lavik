@@ -16,7 +16,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
-#include "celer/runtime/task.h"
+#include "bycorf/runtime/task.h"
 #include "keylane/memory.h"
 #include "keylane/read_trace.h"
 #include "keylane/set_trace.h"
@@ -25,9 +25,9 @@
 #include "keylane/storage/format.h"
 #include "keylane/storage/sorted_set.h"
 
-namespace celer {
+namespace bycorf {
 class Worker;
-}  // namespace celer
+}  // namespace bycorf
 
 namespace keylane::storage {
 
@@ -272,7 +272,7 @@ struct ScanBatch {
 class ScanPartitionAwaitable {
  public:
   using Result = absl::StatusOr<ScanBatch>;
-  using PendingTask = celer::Task<Result>;
+  using PendingTask = bycorf::Task<Result>;
 
   explicit ScanPartitionAwaitable(Result ready) : ready_(std::move(ready)) {}
   explicit ScanPartitionAwaitable(PendingTask pending)
@@ -385,8 +385,8 @@ class ReplicationLogPayloadSource {
   virtual std::uint64_t size() const noexcept = 0;
   // Must fill output exactly or return an error. The source and any storage it
   // references remain alive until AppendReplicationLog completes.
-  virtual celer::Task<absl::Status> Read(std::uint64_t offset,
-                                         std::span<std::byte> output) = 0;
+  virtual bycorf::Task<absl::Status> Read(std::uint64_t offset,
+                                          std::span<std::byte> output) = 0;
 };
 
 struct ReplicationLogAppend {
@@ -836,7 +836,7 @@ struct RestoreRawResult {
 // EOF (including an empty final page); the callback and its captured input
 // must remain alive until the awaited restore returns.
 using CollectionPageReader =
-    std::function<celer::Task<absl::StatusOr<CollectionPage>>()>;
+    std::function<bycorf::Task<absl::StatusOr<CollectionPage>>()>;
 
 // A transfer borrows no mutable index state. A nonempty reader owns a pinned,
 // single-pass grouped source; metadata_ then carries only type/count/TTL.
@@ -988,12 +988,12 @@ class StorageEngine {
   // Runs once on each worker before its listener is opened. Registers the
   // complete fixed-file table, opens every file with O_DIRECT into its fixed
   // slot, and performs parallel recovery.
-  celer::Task<absl::Status> InitializeWorker(celer::Worker& worker);
+  bycorf::Task<absl::Status> InitializeWorker(bycorf::Worker& worker);
   // Runs on the worker's native thread after its IO and coroutine frames have
   // been torn down. Releases all state owned by that worker, including every
   // worker-local ScanHashMap, unless AbandonWorkerStateForProcessExit armed
   // the clean-process-exit path.
-  void FinalizeWorker(celer::Worker& worker) noexcept;
+  void FinalizeWorker(bycorf::Worker& worker) noexcept;
   absl::Status FlushForShutdown();
 
   // Whether the next clean shutdown should build an index checkpoint. The
@@ -1014,7 +1014,7 @@ class StorageEngine {
 
   // Atomically replaces the node-global Function catalog dump. The body is
   // committed before a mirrored system-state root publishes the generation.
-  celer::Task<absl::StatusOr<CatalogDurabilityToken>> CommitFunctionCatalog(
+  bycorf::Task<absl::StatusOr<CatalogDurabilityToken>> CommitFunctionCatalog(
       std::string_view dump);
   // Returns the catalog selected during startup recovery. Absence means a new
   // storage set that has not committed its first (empty) catalog yet.
@@ -1024,11 +1024,11 @@ class StorageEngine {
   // Flushes all accepted storage work before a promotion base is committed.
   // The frontier and accumulator are validated but otherwise opaque to
   // storage; callers must already have quiesced replication and DB admission.
-  celer::Task<absl::Status> MakeDurable(const DurabilityFrontier& frontier,
-                                        std::string_view opaque_accumulator);
+  bycorf::Task<absl::Status> MakeDurable(const DurabilityFrontier& frontier,
+                                         std::string_view opaque_accumulator);
   // Atomically publishes a promotion base while retaining the current catalog
   // root. A population/catalog mismatch fails without changing durable state.
-  celer::Task<absl::Status> CommitPromotionBase(PromotionBase base);
+  bycorf::Task<absl::Status> CommitPromotionBase(PromotionBase base);
   // Recovery returns absence when this storage lineage has never committed a
   // promotion base or when full-sync invalidation cleared it.
   absl::StatusOr<std::optional<PromotionBase>> RecoverPromotionBase() const;
@@ -1042,9 +1042,9 @@ class StorageEngine {
   // idempotent for the same nonzero session. Complete accepts only that active
   // session, atomically makes it readable, and never rolls back the
   // replacement on failure.
-  celer::Task<absl::Status> BeginReplicaFullSync(std::uint64_t session_id);
-  celer::Task<absl::Status> CompleteReplicaFullSync(std::uint64_t session_id,
-                                                    PopulationToken population);
+  bycorf::Task<absl::Status> BeginReplicaFullSync(std::uint64_t session_id);
+  bycorf::Task<absl::Status> CompleteReplicaFullSync(
+      std::uint64_t session_id, PopulationToken population);
   bool ReplicaRecoveryFenced() const noexcept;
   // Irreversibly fences request serving in this process after a durable
   // mutation can no longer be reconciled with its replication history.
@@ -1066,7 +1066,7 @@ class StorageEngine {
   // pins its old physical record in a partition-local ScanHashMap.
   absl::Status BeginRdbSnapshot(std::uint64_t session_id,
                                 std::uint64_t snapshot_time_ms);
-  celer::Task<absl::StatusOr<RdbSnapshotBatch>> ReadRdbSnapshotBatch(
+  bycorf::Task<absl::StatusOr<RdbSnapshotBatch>> ReadRdbSnapshotBatch(
       std::uint64_t session_id, RdbSnapshotCursor cursor, std::size_t count,
       std::size_t max_bytes);
   // Run on the snapshot's owning worker. Only one collection stream may be
@@ -1074,16 +1074,16 @@ class StorageEngine {
   // starts at zero and must equal the preceding page's next_cursor_. A page
   // can be empty, but always advances. Graph pins retain the exact old view
   // through EOF until Finish, including while output backpressure suspends.
-  celer::Task<absl::StatusOr<CollectionPage>> ReadRdbCollectionPage(
+  bycorf::Task<absl::StatusOr<CollectionPage>> ReadRdbCollectionPage(
       std::uint64_t session_id, std::uint64_t token, std::uint64_t cursor);
-  celer::Task<absl::Status> FinishRdbCollection(std::uint64_t session_id,
-                                                std::uint64_t token);
+  bycorf::Task<absl::Status> FinishRdbCollection(std::uint64_t session_id,
+                                                 std::uint64_t token);
   // Cancels any unfinished stream, waits for admitted page reads, then
   // releases their physical pins. Repeated cancellation is harmless.
-  celer::Task<absl::Status> EndRdbSnapshot(std::uint64_t session_id);
+  bycorf::Task<absl::Status> EndRdbSnapshot(std::uint64_t session_id);
   // Runs on one worker and returns a random live key owned by that worker.
   // Nullopt means this worker currently has no live key in the database.
-  celer::Task<absl::StatusOr<std::optional<std::string>>> RandomKeyLocal(
+  bycorf::Task<absl::StatusOr<std::optional<std::string>>> RandomKeyLocal(
       std::uint8_t db_id);
   // Must run on the worker owning partition_id. The cursor is stateless and
   // may return duplicate keys while the partition index is changing.
@@ -1104,32 +1104,32 @@ class StorageEngine {
   // concurrent operations in that DB while this coroutine runs, and may allow
   // them again as soon as it returns: the DB is observably empty from here on.
   // Cost is bounded by the partition count, not by the number of keys.
-  celer::Task<absl::Status> FlushDbDetach(std::uint8_t db_id);
+  bycorf::Task<absl::Status> FlushDbDetach(std::uint8_t db_id);
   // Advances all 16 DB epochs in one metadata-page update and detaches every
   // database under one per-worker store critical section. The caller holds
   // all command DB gates.
-  celer::Task<absl::Status> FlushAllDetach();
+  bycorf::Task<absl::Status> FlushAllDetach();
 
   // Retires what FlushDbDetach took out of service, subtracting it from the
   // block accounting and freeing it. Safe to run with the DB open and serving.
   // `wait` distinguishes FLUSHDB SYNC from FLUSHDB ASYNC: a reclaimer runs
   // either way, and only the caller's completion differs.
-  celer::Task<absl::Status> FlushDbReclaim(bool wait);
+  bycorf::Task<absl::Status> FlushDbReclaim(bool wait);
   std::uint64_t DbEpoch(std::uint8_t db_id) const noexcept;
   // Broadcasts one DB-epoch control barrier to every active source-worker
   // flow. The caller keeps the DB gate closed until this completes.
-  celer::Task<absl::Status> PublishFlushDbReplication(std::uint8_t db_id,
-                                                      std::uint64_t db_epoch);
+  bycorf::Task<absl::Status> PublishFlushDbReplication(std::uint8_t db_id,
+                                                       std::uint64_t db_epoch);
   // Broadcasts one control barrier carrying the complete database-epoch
   // vector. It is one logical event on every source flow, not sixteen
   // independent FLUSHDB barriers.
-  celer::Task<absl::Status> PublishFlushAllReplication(
+  bycorf::Task<absl::Status> PublishFlushAllReplication(
       const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs);
   // Replica-side application after the receiver has collected this barrier
   // from every source flow.
-  celer::Task<absl::Status> ApplyReplicatedFlushDb(std::uint8_t db_id,
-                                                   std::uint64_t db_epoch);
-  celer::Task<absl::Status> ApplyReplicatedFlushAll(
+  bycorf::Task<absl::Status> ApplyReplicatedFlushDb(std::uint8_t db_id,
+                                                    std::uint64_t db_epoch);
+  bycorf::Task<absl::Status> ApplyReplicatedFlushAll(
       const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs);
 
   // Source-side full-sync lifetime. Begin fixes this worker's initial database
@@ -1154,18 +1154,18 @@ class StorageEngine {
   // worker and is idempotent.
   void EndPartitionReplication(std::uint64_t session_id,
                                std::uint16_t partition_id);
-  celer::Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
+  bycorf::Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
       std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id,
       std::uint64_t cursor, std::size_t count, std::size_t read_concurrency = 1,
       std::size_t max_bytes = kReplicationTransferBytes);
-  celer::Task<absl::StatusOr<PartitionFullSyncBatch>>
+  bycorf::Task<absl::StatusOr<PartitionFullSyncBatch>>
   ReadPartitionFullSyncOverrides(
       std::uint64_t session_id, std::uint16_t partition_id, std::size_t count,
       std::size_t max_bytes = kReplicationTransferBytes);
-  celer::Task<absl::StatusOr<SnapshotRecord>> MaterializeFullSyncPublishRecord(
+  bycorf::Task<absl::StatusOr<SnapshotRecord>> MaterializeFullSyncPublishRecord(
       std::uint64_t session_id, std::uint16_t partition_id,
       const SnapshotRecord& requested);
-  celer::Task<absl::StatusOr<std::string>> ReadFullSyncValueChunk(
+  bycorf::Task<absl::StatusOr<std::string>> ReadFullSyncValueChunk(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::uint64_t source_id, std::uint64_t offset, std::size_t max_bytes);
   void ReleaseFullSyncValue(std::uint64_t session_id,
@@ -1191,30 +1191,30 @@ class StorageEngine {
   // Runtime-only source replication backlog for the current storage worker.
   // These calls must execute on that worker. The log is shared by every
   // downstream replica; each replica owns only a ReplicationLogCursor.
-  celer::Task<absl::Status> EnableReplicationLog(std::uint64_t log_epoch,
-                                                 std::size_t capacity_bytes);
+  bycorf::Task<absl::Status> EnableReplicationLog(std::uint64_t log_epoch,
+                                                  std::size_t capacity_bytes);
   // Updates this worker flow's lazy block quota. Shrinkage drops complete
   // oldest events until the retained block count fits, except that live
   // consumer cursors stay pinned and make the smaller value a target quota;
   // growth allocates nothing until a later append needs another block.
-  celer::Task<absl::Status> SetReplicationLogCapacity(
+  bycorf::Task<absl::Status> SetReplicationLogCapacity(
       std::size_t capacity_bytes);
   // Selects whether a live retention cursor blocks publication at capacity.
   // Disabling the policy wakes blocked publishers, which revoke lagging
   // coverage and continue; enabling it affects the next capacity conflict.
-  celer::Task<absl::Status> SetReplicationBacklogBackpressure(bool enabled);
+  bycorf::Task<absl::Status> SetReplicationBacklogBackpressure(bool enabled);
   // Changes the worker-local in-memory publisher admission waterline. A
   // shrink never drops queued commands; new admissions wait for occupancy to
   // fall below the new limit. A growth wakes waiters immediately.
-  celer::Task<absl::Status> SetReplicationPublishQueueCapacity(
+  bycorf::Task<absl::Status> SetReplicationPublishQueueCapacity(
       std::size_t capacity_bytes);
-  celer::Task<absl::StatusOr<std::uint64_t>> AppendReplicationLog(
+  bycorf::Task<absl::StatusOr<std::uint64_t>> AppendReplicationLog(
       ReplicationLogAppend event);
   // Inserts an ordered publisher fence and returns the first LSN assigned
   // after it. All commands enqueued before the fence have reached the log;
   // commands enqueued afterwards receive an LSN at or above the result.
-  celer::Task<absl::StatusOr<std::uint64_t>> FenceReplicationLog();
-  celer::Task<absl::StatusOr<ReplicationLogBatch>> ReadReplicationLog(
+  bycorf::Task<absl::StatusOr<std::uint64_t>> FenceReplicationLog();
+  bycorf::Task<absl::StatusOr<ReplicationLogBatch>> ReadReplicationLog(
       ReplicationLogCursor next, std::size_t max_bytes, std::size_t max_frames);
   // Pins history needed by one ONLINE/downstream session. The cursor is the
   // first LSN not yet acknowledged by that session. At capacity, the runtime
@@ -1223,8 +1223,8 @@ class StorageEngine {
   absl::Status RetainReplicationLog(std::uint64_t session_id,
                                     std::uint64_t keep_from_lsn);
   void ReleaseReplicationLogRetention(std::uint64_t session_id);
-  celer::Task<absl::Status> TrimReplicationLog(std::uint64_t keep_from_lsn);
-  celer::Task<absl::Status> DisableReplicationLog();
+  bycorf::Task<absl::Status> TrimReplicationLog(std::uint64_t keep_from_lsn);
+  bycorf::Task<absl::Status> DisableReplicationLog();
   ReplicationLogInfo LocalReplicationLogInfo() const;
   bool ReplicationLogActive() const noexcept;
   // Worker-local high-water admission acquired before a source write enters
@@ -1232,7 +1232,7 @@ class StorageEngine {
   // hold fixed retained-memory budgets; this token reserves byte waterline and
   // ring-slot credit in their FIFOs. A request larger than the normal limit is
   // admitted only when it can be the sole staged item.
-  celer::Task<absl::StatusOr<ReplicationPublisherAdmission>>
+  bycorf::Task<absl::StatusOr<ReplicationPublisherAdmission>>
   AcquireReplicationPublisherAdmission(
       std::size_t logical_bytes,
       std::optional<ReplicationPublisherTarget> target = std::nullopt);
@@ -1246,7 +1246,7 @@ class StorageEngine {
   // precondition is checked after publisher admission, immediately before the
   // synchronous publication cut; pass an empty precondition when no external
   // mutation authority applies.
-  celer::Task<absl::Status> PublishEphemeralReplicationCommand(
+  bycorf::Task<absl::Status> PublishEphemeralReplicationCommand(
       std::uint16_t partition_id, std::vector<std::string> args,
       MutationPrecondition mutation_precondition);
   // Preallocates the online-backlog command and its active-full-sync copy.
@@ -1276,51 +1276,51 @@ class StorageEngine {
 
   // Replica-side primitives. Reset returns a new local replication epoch that
   // fences every record from an earlier copy of this partition.
-  celer::Task<absl::StatusOr<std::uint64_t>> ResetReplicaPartition(
+  bycorf::Task<absl::StatusOr<std::uint64_t>> ResetReplicaPartition(
       std::uint16_t partition_id,
       std::span<const std::uint64_t, 16> source_db_epochs);
   // Resets partitions owned by the current worker. Epoch metadata pages are
   // coalesced and persisted once for the whole batch before any new-epoch
   // replica records can be applied.
-  celer::Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
+  bycorf::Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
   ResetReplicaPartitions(std::uint64_t session_id,
                          std::span<const ReplicaPartitionReset> resets);
   // Logically empties only the selected Redis hash slots. Each partition gets
   // a new durable replication epoch and its indexes are detached in O(slots)
   // time; records sharing physical blocks with other slots remain untouched.
   // The caller must exclude command execution while this runs.
-  celer::Task<absl::Status> ResetPartitionsDetach(
+  bycorf::Task<absl::Status> ResetPartitionsDetach(
       std::span<const std::uint16_t> partition_ids);
-  celer::Task<absl::Status> HandoffReplicaPartition(
+  bycorf::Task<absl::Status> HandoffReplicaPartition(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::uint64_t replication_epoch);
-  celer::Task<absl::Status> BeginReplicaTailCommand(
+  bycorf::Task<absl::Status> BeginReplicaTailCommand(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::uint64_t partition_sequence);
-  celer::Task<absl::Status> EndReplicaTailCommand(
+  bycorf::Task<absl::Status> EndReplicaTailCommand(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::uint64_t partition_sequence);
-  celer::Task<absl::Status> ApplyReplicaRecords(
+  bycorf::Task<absl::Status> ApplyReplicaRecords(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::uint64_t replication_epoch, std::span<const SnapshotRecord> records);
   // Publishes a completed in-place rebuild at the final cut after draining
   // worker-local detached-index reclamation. Abort drains staged writes before
   // detaching the partial population through the same reclaim path.
-  celer::Task<absl::Status> PromoteReplicaRoot(std::uint64_t session_id);
-  celer::Task<absl::Status> AbortReplicaRoot(std::uint64_t session_id);
+  bycorf::Task<absl::Status> PromoteReplicaRoot(std::uint64_t session_id);
+  bycorf::Task<absl::Status> AbortReplicaRoot(std::uint64_t session_id);
   void SetReplicaLoading(bool loading) noexcept;
 
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
   // routed_partition_id reuses a route computed for this exact key before its
   // owner hop; when present it must equal RedisSlot(key).
-  celer::Task<absl::StatusOr<DiskValue>> Get(
+  bycorf::Task<absl::StatusOr<DiskValue>> Get(
       std::uint8_t db_id, std::string_view key,
       ReadLatencyTrace* trace = nullptr,
       std::optional<std::uint16_t> routed_partition_id = std::nullopt);
-  celer::Task<absl::StatusOr<std::uint64_t>> StringLength(std::uint8_t db_id,
-                                                          std::string_view key);
-  celer::Task<absl::StatusOr<SetResult>> Set(
+  bycorf::Task<absl::StatusOr<std::uint64_t>> StringLength(
+      std::uint8_t db_id, std::string_view key);
+  bycorf::Task<absl::StatusOr<SetResult>> Set(
       std::uint8_t db_id, std::string_view key, std::string_view value,
       SetOptions options = {}, ReplicationCommandAppend* replication = nullptr,
       SetLatencyTrace* trace = nullptr,
@@ -1328,50 +1328,50 @@ class StorageEngine {
       // When present it must equal RedisSlot(key) and belong to this worker.
       std::optional<std::uint16_t> routed_partition_id = std::nullopt,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<std::uint64_t>> ListPush(
+  bycorf::Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
       std::span<const std::string_view> values,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<ListResult>> ExecuteList(
+  bycorf::Task<absl::StatusOr<ListResult>> ExecuteList(
       std::uint8_t db_id, std::string_view key, const ListOperation& operation,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSet(
+  bycorf::Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSet(
       std::uint8_t db_id, std::string_view key,
       const SortedSetOperation& operation,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSetLocked(
+  bycorf::Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const SortedSetOperation& operation, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<HashResult>> ExecuteHash(
+  bycorf::Task<absl::StatusOr<HashResult>> ExecuteHash(
       std::uint8_t db_id, std::string_view key, const HashOperation& operation,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<HashResult>> ExecuteSet(
+  bycorf::Task<absl::StatusOr<HashResult>> ExecuteSet(
       std::uint8_t db_id, std::string_view key, const HashOperation& operation,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::Status> ExecuteCompact(
+  bycorf::Task<absl::Status> ExecuteCompact(
       std::uint8_t db_id, std::string_view key, ValueType value_type,
       bool read_only, const CompactValueCallback& callback,
       std::uint64_t now_ms = 0, ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
-                                            std::string_view key);
-  celer::Task<absl::StatusOr<bool>> UpdateExpiration(
+  bycorf::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
+                                             std::string_view key);
+  bycorf::Task<absl::StatusOr<bool>> UpdateExpiration(
       std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
       ExpirationCondition condition,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<bool>> Delete(
+  bycorf::Task<absl::StatusOr<bool>> Delete(
       std::uint8_t db_id, std::string_view key,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<bool> Exists(std::uint8_t db_id, std::string_view key);
+  bycorf::Task<bool> Exists(std::uint8_t db_id, std::string_view key);
 
   // Pre-locked variants for the transaction layer. The caller must already
   // hold this worker's key lock for `digest` in the required mode (shared for
@@ -1387,69 +1387,69 @@ class StorageEngine {
   // record that makes the transaction survive recovery, and only then lets
   // the superseded records leave their blocks' accounting. Without a commit,
   // recovery drops every tagged record — all-or-nothing.
-  celer::Task<absl::StatusOr<DiskValue>> GetLocked(
+  bycorf::Task<absl::StatusOr<DiskValue>> GetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ReadLatencyTrace* trace = nullptr);
-  celer::Task<std::vector<BatchGetValue>> BatchGetLocked(
+  bycorf::Task<std::vector<BatchGetValue>> BatchGetLocked(
       std::uint8_t db_id, std::span<const BatchGetRequest> requests);
-  celer::Task<absl::StatusOr<std::uint64_t>> StringLengthLocked(
+  bycorf::Task<absl::StatusOr<std::uint64_t>> StringLengthLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
-  celer::Task<absl::StatusOr<SetResult>> SetLocked(
+  bycorf::Task<absl::StatusOr<SetResult>> SetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::string_view value, SetOptions options = {},
       TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       SetLatencyTrace* trace = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<std::uint64_t>> ListPushLocked(
+  bycorf::Task<absl::StatusOr<std::uint64_t>> ListPushLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::span<const std::string_view> values, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<ListResult>> ExecuteListLocked(
+  bycorf::Task<absl::StatusOr<ListResult>> ExecuteListLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const ListOperation& operation, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<HashResult>> ExecuteHashLocked(
+  bycorf::Task<absl::StatusOr<HashResult>> ExecuteHashLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<HashResult>> ExecuteSetLocked(
+  bycorf::Task<absl::StatusOr<HashResult>> ExecuteSetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::Status> ExecuteCompactLocked(
+  bycorf::Task<absl::Status> ExecuteCompactLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ValueType value_type, bool read_only,
       const CompactValueCallback& callback, TxShardWrites* tx = nullptr,
       std::uint64_t now_ms = 0, ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
-                                                  std::string_view key,
-                                                  const Digest& digest);
+  bycorf::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
+                                                   std::string_view key,
+                                                   const Digest& digest);
   // Checked metadata for externally observable TYPE/TTL/EXISTS replies.
   // Missing/expired is an OK exists_=false result; an indeterminate grouped
   // transaction is an error, never an invented absence or partial metadata.
   // The locked form requires the caller's shared/exclusive key intent.
-  celer::Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadata(
+  bycorf::Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadata(
       std::uint8_t db_id, std::string_view key);
-  celer::Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadataLocked(
+  bycorf::Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadataLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
-  celer::Task<absl::StatusOr<RawValue>> ReadRawValueLocked(
+  bycorf::Task<absl::StatusOr<RawValue>> ReadRawValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
-  celer::Task<absl::StatusOr<RawValue>> ReadRawValue(std::uint8_t db_id,
-                                                     std::string_view key);
-  celer::Task<absl::StatusOr<TransferValue>> ReadValueForTransferLocked(
+  bycorf::Task<absl::StatusOr<RawValue>> ReadRawValue(std::uint8_t db_id,
+                                                      std::string_view key);
+  bycorf::Task<absl::StatusOr<TransferValue>> ReadValueForTransferLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
-  celer::Task<absl::Status> WriteValueForTransferLocked(
+  bycorf::Task<absl::Status> WriteValueForTransferLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const TransferValue& value, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<RestoreRawResult>> RestoreRawValue(
+  bycorf::Task<absl::StatusOr<RestoreRawResult>> RestoreRawValue(
       std::uint8_t db_id, std::string_view key, const RawValue& value,
       bool replace, ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
@@ -1458,7 +1458,7 @@ class StorageEngine {
   // aggregate compact value is built. A busy result does not consume reader.
   // Failure aborts the uncommitted graph; successful EOF/count validation is
   // required before any enclosing transaction can commit its auxiliaries.
-  celer::Task<absl::StatusOr<RestoreRawResult>> RestoreCollectionValue(
+  bycorf::Task<absl::StatusOr<RestoreRawResult>> RestoreCollectionValue(
       std::uint8_t db_id, std::string_view key, ValueType type,
       std::uint64_t expire_at_ms, bool replace,
       std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
@@ -1466,44 +1466,44 @@ class StorageEngine {
       const MutationPrecondition* mutation_precondition = nullptr);
   // Borrows the caller's exclusive key lock and optional outer transaction.
   // Its independent command decision is committed only at complete EOF.
-  celer::Task<absl::StatusOr<RestoreRawResult>> RestoreCollectionValueLocked(
+  bycorf::Task<absl::StatusOr<RestoreRawResult>> RestoreCollectionValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ValueType type, std::uint64_t expire_at_ms, bool replace,
       std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
       TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<RestoreRawResult>> RestoreRawValueLocked(
+  bycorf::Task<absl::StatusOr<RestoreRawResult>> RestoreRawValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const RawValue& value, bool replace, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::Status> WriteRawValueLocked(
+  bycorf::Task<absl::Status> WriteRawValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const RawValue& value, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<bool>> UpdateExpirationLocked(
+  bycorf::Task<absl::StatusOr<bool>> UpdateExpirationLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::uint64_t expire_at_ms, ExpirationCondition condition,
       TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<absl::StatusOr<bool>> DeleteLocked(
+  bycorf::Task<absl::StatusOr<bool>> DeleteLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
-  celer::Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
-                                 const Digest& digest);
+  bycorf::Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
+                                  const Digest& digest);
 
   // Appends the commit record for a transaction whose shard writes all
   // succeeded. Runs on any worker; fences and retirements come from the
   // per-shard TxShardWrites. May run in the background for asynchronous client
   // acknowledgement. A grouped decision that another mutation inherits is
   // not inheritable until its own durability fence completes.
-  celer::Task<absl::Status> CommitTxWrites(std::uint64_t txid,
-                                           std::vector<TxShardWrites*> shards);
+  bycorf::Task<absl::Status> CommitTxWrites(std::uint64_t txid,
+                                            std::vector<TxShardWrites*> shards);
   // Rejects an already-known failed grouped transaction before its coordinator
   // publishes effects, queues a commit, or acknowledges success. All command
   // callbacks must have settled before this check. This does not wait for IO
@@ -1518,7 +1518,7 @@ class StorageEngine {
   // not create or await another coroutine.
   [[nodiscard]] bool EnqueueTxCommit(std::uint64_t txid,
                                      std::vector<TxShardWrites> writes);
-  celer::Task<absl::Status> WaitForTxCommitCapacity();
+  bycorf::Task<absl::Status> WaitForTxCommitCapacity();
   // Must run on the owning worker before participant locks are released.
   void PublishCommittedFullSyncEffects(TxShardWrites* shard);
 
@@ -1547,14 +1547,14 @@ class StorageEngine {
   // carrying the same transaction id. This is required for command-local
   // rollback inside EXEC: its outer commit must make the restored state, not
   // an earlier failed half-write, win again during recovery.
-  celer::Task<absl::Status> RollbackTxLocal(
+  bycorf::Task<absl::Status> RollbackTxLocal(
       std::uint64_t txid, TxShardWrites* compensation = nullptr);
   // Drop the journal without acting on it (the transaction succeeded).
-  celer::Task<absl::Status> DiscardTxUndoLocal(std::uint64_t txid);
+  bycorf::Task<absl::Status> DiscardTxUndoLocal(std::uint64_t txid);
 
   // Freeze/unfreeze expiration writes for stable-count scans (KEYS). The
   // caller must already exclude client writes (closed database gate).
-  celer::Task<absl::Status> QuiesceExpiration();
+  bycorf::Task<absl::Status> QuiesceExpiration();
   void ResumeExpiration() noexcept;
   // Enables or disables admission of active-expiration mutations. This is a
   // non-blocking switch: disabling prevents later cycles from entering but
@@ -1596,26 +1596,26 @@ class StorageEngine {
   TombRaiderTotals TombRaiderStats() const noexcept;
   // Reconfigures the worker-0 scheduler. An in-flight round always finishes;
   // the new schedule starts counting from that completion.
-  celer::Task<absl::Status> ConfigureTombRaider(TombRaiderConfigUpdate update);
+  bycorf::Task<absl::Status> ConfigureTombRaider(TombRaiderConfigUpdate update);
   // Replica reset coordination: disables future rounds, asks an in-flight
   // round to forfeit at its next safe checkpoint, and waits until it exits.
   // This is deliberately stronger than the user-facing OFF configuration.
-  celer::Task<absl::Status> QuiesceTombRaiderForReplica();
+  bycorf::Task<absl::Status> QuiesceTombRaiderForReplica();
   // Runtime relocation pacing. Reducing concurrency does not cancel active
   // passes; it prevents replacements until the active count reaches the new
   // limit. Sleep changes take effect at the next checkpoint.
   DefragTotals DefragStats() const noexcept;
-  celer::Task<absl::Status> ConfigureDefrag(DefragConfigUpdate update);
+  bycorf::Task<absl::Status> ConfigureDefrag(DefragConfigUpdate update);
   TxCleanerTotals TxCleanerStats() const noexcept;
   std::uint32_t TxCleanerCooldownMs() const noexcept;
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
-  celer::Task<StorageDurabilityStats> DurabilityStats() const;
-  celer::Task<StorageMetricsSnapshot> CollectMetrics() const;
+  bycorf::Task<StorageDurabilityStats> DurabilityStats() const;
+  bycorf::Task<StorageMetricsSnapshot> CollectMetrics() const;
 
   // Non-suspending index probe for WATCH: whether the key currently holds a
   // live (non-tombstone, unexpired) value. Must run on OwnerForKey(key).
-  celer::Task<bool> KeyLive(std::uint8_t db_id, std::string_view key,
-                            const Digest& digest);
+  bycorf::Task<bool> KeyLive(std::uint8_t db_id, std::string_view key,
+                             const Digest& digest);
 
  private:
   friend class ExpirationAuthorityTestPeer;

@@ -19,7 +19,7 @@ references rather than current architecture.
 | Cluster data plane | Slot routing, finite authority admission, controlled-failover write pause, selected local control, independent route/task updates, failover activation and replica following, Meta discovery/session handling, and Redis Cluster compatibility | [Cluster data plane](06-cluster-data-plane.md) |
 | Meta control plane | NuRaft-backed metadata, manifest-bootstrapped multi-member genesis, six durable stores with Topology-owned lifecycle, per-Group term/owner/authority and failover transitions, atomic creation admission, Data-session publishing, cluster status, leader-owned workflow recovery, membership identity, and WAL/snapshots | [Meta control plane](08-meta-control-plane.md) |
 
-Metrics, memory accounting, logging, configuration, and the Celer runtime cross
+Metrics, memory accounting, logging, configuration, and the Bycorf runtime cross
 several subsystems and are summarized in the system overview rather than
 treated as independent durable modules.
 
@@ -70,7 +70,7 @@ architecture update.
 
 | Claim | Repository source |
 |---|---|
-| The process composes the `keylane` data-plane executable and one main Keylane library around Celer, plus the separate `keylane-meta` service and Raft-free `keylane-ctl` operator client | `CMakeLists.txt`, `app/keylane.cpp`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `src/redis/server.cpp`, `include/keylane/meta/`, `src/meta/` |
+| The process composes the `keylane` data-plane executable and one main Keylane library around Bycorf, plus the separate `keylane-meta` service and Raft-free `keylane-ctl` operator client | `CMakeLists.txt`, `app/keylane.cpp`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `src/redis/server.cpp`, `include/keylane/meta/`, `src/meta/` |
 | Request serving has distinct RESP-version, session, command, scripting, Function-catalog, Pub/Sub, and observability boundaries | `include/keylane/resp.h`, `include/keylane/resp_version.h`, `include/keylane/session.h`, `include/keylane/command.h`, `include/keylane/pubsub.h`, `include/keylane/slowlog.h`, `src/redis/` |
 | The Function catalog is a durable module with one complete-catalog commit boundary | `src/redis/function_catalog.h`, `src/redis/function_catalog.cpp`, `src/storage/engine/system_state.cpp` |
 | Transaction coordination has its own interfaces and implementation lifecycle | `include/keylane/tx/`, `src/tx/` |
@@ -79,4 +79,4 @@ architecture update.
 | Replication has manager, boot-scoped single-group coordination, callable cluster rebuild/failover/follow-owner adapters behind fail-closed admission, Sentinel-compatible configuration, and storage-log integration boundaries | `include/keylane/replication.h`, `include/keylane/replication_group.h`, `src/config.cpp`, `src/replication/`, `src/storage/engine/replication_log.cpp`, `tests/replication_group_test.cpp`, `tests/cluster/population_integration_test.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/cluster/rebuild_protocol_integration_test.cpp` |
 | Cluster data plane has topology, finite authority, node-controller, Meta-client/session, failover observation, and Redis gate boundaries | `include/keylane/cluster/`, `src/cluster/`, `src/redis/cluster_command.cpp`, `src/redis/command.cpp`, `src/redis/server.cpp` |
 | Meta control plane separates deterministic committed state with a topology-owned single-Data-cluster lifecycle and per-Group failover transitions, pure node projection, volatile observations, leader-scoped publishing/reconciliation, authenticated administration, atomic initial creation, stable cluster status, manifest-bootstrapped initial membership, and NuRaft integration | `include/keylane/meta/`, `src/meta/`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp` |
-| Celer is a pinned runtime submodule | `.gitmodules`, `CMakeLists.txt`, `celer/include/celer/`, `celer/src/` |
+| Bycorf is a pinned runtime submodule | `.gitmodules`, `CMakeLists.txt`, `bycorf/include/bycorf/`, `bycorf/src/` |

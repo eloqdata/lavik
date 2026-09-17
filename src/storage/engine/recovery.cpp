@@ -21,14 +21,14 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
     auto destination = std::span<std::byte>(
         reinterpret_cast<std::byte*>(key.data() + offset), key.size() - offset);
     absl::Status read;
-    if (celer::SpdkStorageEnabled()) {
+    if (bycorf::SpdkStorageEnabled()) {
       const auto& owners = device_owners_[DeviceIndexForBlock(ref.block_id_)];
       const unsigned owner = owners[ref.block_id_ % owners.size()];
       if (owner == store.worker_->id()) {
         read = co_await ReadRecoveryExtentInto(
             store, ref, static_cast<std::uint32_t>(index), destination);
       } else {
-        read = co_await celer::SubmitTaskTo(
+        read = co_await bycorf::SubmitTaskTo(
             owner,
             [this, owner, ref, index, destination]() -> Task<absl::Status> {
               co_return co_await ReadRecoveryExtentInto(
@@ -133,13 +133,13 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadRecoveryPayloadSlice(
     const auto destination = std::span<std::byte>(
         reinterpret_cast<std::byte*>(result.data() + copied), count);
     absl::Status read;
-    if (celer::SpdkStorageEnabled()) {
+    if (bycorf::SpdkStorageEnabled()) {
       // Scan-time extent owners may not be published yet. Use an eligible
       // device reader, exactly as external-key recovery does.
       const auto& owners = device_owners_[DeviceIndexForBlock(ref.block_id_)];
       const unsigned owner = owners[ref.block_id_ % owners.size()];
       if (owner != store.worker_->id()) {
-        read = co_await celer::SubmitTaskTo(
+        read = co_await bycorf::SubmitTaskTo(
             owner,
             [this, owner, ref, index, destination, slice_offset,
              ordered]() -> Task<absl::Status> {
@@ -173,7 +173,7 @@ std::uint16_t StorageEngine::Impl::RecoveredBlockOwner(
   mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
   mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
   mixed ^= mixed >> 31;
-  if (celer::SpdkStorageEnabled()) {
+  if (bycorf::SpdkStorageEnabled()) {
     const auto& owners = device_owners_[DeviceIndexForBlock(block_id)];
     if (block.layout_worker_count_ == worker_count_ &&
         std::binary_search(owners.begin(), owners.end(), block.writer_id_))
@@ -258,7 +258,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryBatches(
       if (!applied.ok()) co_return applied;
       continue;
     }
-    absl::Status applied = co_await celer::SubmitTo(
+    absl::Status applied = co_await bycorf::SubmitTo(
         target, [this, target, batch = std::move(batch)]() mutable {
           return ApplyRecovery(target, std::move(batch));
         });
@@ -334,7 +334,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
     const StorageDevice& device = devices_[device_index];
-    if (celer::SpdkStorageEnabled()) {
+    if (bycorf::SpdkStorageEnabled()) {
       const auto& owners = device_owners_[device_index];
       const auto owner =
           std::lower_bound(owners.begin(), owners.end(), store.worker_->id());
@@ -360,7 +360,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         continue;
       }
       const std::uint64_t device_offset = next_device_offset;
-      if (celer::SpdkStorageEnabled()) {
+      if (bycorf::SpdkStorageEnabled()) {
         next_device_offset += device_owners_[device_index].size();
       } else {
         next_device_offset += worker_count_;

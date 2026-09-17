@@ -60,7 +60,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanClusterCreateStep(
 class MetaClusterCreateReconciler final : public MetaReconciler {
  public:
   MetaClusterCreateReconciler(
-      celer::ForeignExecutor executor,
+      bycorf::ForeignExecutor executor,
       std::shared_ptr<MetaMembershipGate> membership_gate,
       std::shared_ptr<MetaDataControlRuntimeStatus> runtime_status,
       nuraft::ptr<nuraft::raft_server> server,
@@ -76,8 +76,8 @@ class MetaClusterCreateReconciler final : public MetaReconciler {
 
  private:
   struct Core;
-  static celer::Task<absl::Status> Run(std::shared_ptr<Core> core,
-                                       MetaLeaderContext* context);
+  static bycorf::Task<absl::Status> Run(std::shared_ptr<Core> core,
+                                        MetaLeaderContext* context);
   void Stop(bool permanent);
   std::shared_ptr<Core> core_;
 };

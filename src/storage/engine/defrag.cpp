@@ -47,7 +47,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::ReclaimExtentLocal(
     state->live_bytes_ = 0;
     if (state->pins_ != 0 || state->freeing_) {
       store.store_state_mutex_.Unlock(*store.worker_);
-      absl::Status waited = co_await celer::SleepFor(
+      absl::Status waited = co_await bycorf::SleepFor(
           *store.worker_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
         co_return waited;
@@ -93,7 +93,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimExtents(
     if (owner == store->worker_->id()) {
       freed = co_await ReclaimExtentLocal(*store, ref);
     } else {
-      freed = co_await celer::SubmitTaskTo(
+      freed = co_await bycorf::SubmitTaskTo(
           owner, [this, owner, ref]() -> Task<absl::StatusOr<bool>> {
             co_return co_await ReclaimExtentLocal(*stores_[owner], ref);
           });
@@ -144,7 +144,7 @@ void StorageEngine::Impl::MaybeQueueDefrag(WorkerStore& store,
 
 Task<absl::Status> StorageEngine::Impl::ConfigureDefrag(
     DefragConfigUpdate update) {
-  co_return co_await celer::SubmitTo(0, [this, update] {
+  co_return co_await bycorf::SubmitTo(0, [this, update] {
     switch (update.action_) {
       case DefragConfigAction::kPause:
         defrag_config_.paused_.store(true, std::memory_order_release);
@@ -261,10 +261,10 @@ Task<absl::Status> StorageEngine::Impl::WakeQueuedDefrags(
     }
     pending_defrags_.fetch_sub(1, std::memory_order_acq_rel);
     absl::Status started;
-    if (worker_id == celer::ThisWorker().id_) {
+    if (worker_id == bycorf::ThisWorker().id_) {
       started = co_await StartQueuedDefrag(worker_id, device_index);
     } else {
-      started = co_await celer::SubmitTaskTo(
+      started = co_await bycorf::SubmitTaskTo(
           worker_id, [this, worker_id, device_index]() -> Task<absl::Status> {
             co_return co_await StartQueuedDefrag(worker_id, device_index);
           });
@@ -349,8 +349,8 @@ Task<absl::Status> StorageEngine::Impl::DefragOne(WorkerStore* store) {
     // device rather than merely delaying this worker while another worker
     // immediately takes its place. SleepFor suspends only this background
     // coroutine; it never blocks the worker thread.
-    (void)co_await celer::SleepFor(*store->worker_,
-                                   std::chrono::milliseconds(block_sleep_ms));
+    (void)co_await bycorf::SleepFor(*store->worker_,
+                                    std::chrono::milliseconds(block_sleep_ms));
   }
   FinishDefragPass(*store);
   co_return status;
@@ -361,10 +361,10 @@ Task<absl::Status> StorageEngine::Impl::DefragRecordCheckpoint(
   const std::uint32_t sleep_us =
       defrag_config_.record_sleep_us_.load(std::memory_order_acquire);
   if (sleep_us != 0) {
-    co_return co_await celer::SleepFor(*store.worker_,
-                                       std::chrono::microseconds(sleep_us));
+    co_return co_await bycorf::SleepFor(*store.worker_,
+                                        std::chrono::microseconds(sleep_us));
   }
-  co_await celer::Yield(*store.worker_);
+  co_await bycorf::Yield(*store.worker_);
   co_return absl::OkStatus();
 }
 
@@ -501,8 +501,8 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   // first matching record instead of allocating/materializing all candidates.
   RecordIndex::Entry* current = index.FindCandidateIf(
       digest, key, [&](const RecordIndex::Entry& candidate) {
-        return MaterializeIndexLocation(candidate)
-            .SamePhysicalRecord(source_location);
+        return MaterializeIndexLocation(candidate).SamePhysicalRecord(
+            source_location);
       });
   if (current == nullptr) {
     co_return std::optional<RelocationDurabilityFence>{};
@@ -622,7 +622,7 @@ Task<absl::Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
       co_return absl::OkStatus();
     }
     absl::Status waited =
-        co_await celer::SleepFor(*store.worker_, std::chrono::milliseconds(1));
+        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
     if (!waited.ok()) {
       co_return waited;
     }
@@ -636,10 +636,10 @@ Task<absl::Status> StorageEngine::Impl::AwaitRelocationDurable(
                            "defrag relocation has an invalid block owner");
   }
   WorkerStore& owner = *stores_[fence.block_owner_];
-  if (fence.block_owner_ == celer::ThisWorker().id_) {
+  if (fence.block_owner_ == bycorf::ThisWorker().id_) {
     co_return co_await AwaitRelocationDurableLocal(owner, fence);
   }
-  co_return co_await celer::SubmitTaskTo(
+  co_return co_await bycorf::SubmitTaskTo(
       fence.block_owner_, [this, fence]() -> Task<absl::Status> {
         co_return co_await AwaitRelocationDurableLocal(
             *stores_[fence.block_owner_], fence);
@@ -952,11 +952,12 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
                                              source_location,
                                              committed_txids != nullptr);
     } else {
-      relocated = co_await celer::SubmitTaskTo(
+      relocated = co_await bycorf::SubmitTaskTo(
           key_owner,
           [this, key_owner, key, value, record, source_location,
            promote = committed_txids != nullptr]() mutable
-          -> Task<absl::StatusOr<std::optional<RelocationDurabilityFence>>> {
+              -> Task<
+                  absl::StatusOr<std::optional<RelocationDurabilityFence>>> {
             co_return co_await RelocateIfCurrent(key_owner, key, value, record,
                                                  source_location, promote);
           });
@@ -998,7 +999,7 @@ Task<absl::Status> StorageEngine::Impl::ReleaseEmptyBlock(
     WorkerStore& store, std::uint64_t block_id, BlockState& source) {
   while (source.pins_ != 0) {
     absl::Status waited =
-        co_await celer::SleepFor(*store.worker_, std::chrono::milliseconds(1));
+        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
     if (!waited.ok()) {
       source.freeing_ = false;
       source.defragging_ = false;

@@ -18,8 +18,8 @@
 
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/cycle_clock.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/cycle_clock.h"
 
 namespace keylane {
 namespace {
@@ -110,7 +110,7 @@ class SlowLogShard {
   std::size_t capacity_ = 0;
   std::int64_t threshold_micros_ = -1;
   std::uint64_t threshold_ticks_ = std::numeric_limits<std::uint64_t>::max();
-  double counter_frequency_ = std::max(1.0, celer::CycleCounterFrequency());
+  double counter_frequency_ = std::max(1.0, bycorf::CycleCounterFrequency());
 };
 
 std::unique_ptr<SlowLogShard[]> g_slowlog_shards;
@@ -119,7 +119,7 @@ std::atomic<std::uint64_t> g_next_slowlog_id{0};
 
 SlowLogShard* LocalShard() noexcept {
   if (g_slowlog_shards == nullptr) return nullptr;
-  const unsigned worker = celer::ThisWorker().id_;
+  const unsigned worker = bycorf::ThisWorker().id_;
   if (worker >= g_slowlog_worker_count) return nullptr;
   return &g_slowlog_shards[worker];
 }
@@ -213,10 +213,10 @@ void MaybeRecordSlowCommand(std::span<const std::string> args,
   });
 }
 
-celer::Task<std::vector<SlowLogEntry>> CollectSlowLog(std::size_t count) {
+bycorf::Task<std::vector<SlowLogEntry>> CollectSlowLog(std::size_t count) {
   std::vector<SlowLogEntry> merged;
   for (unsigned worker = 0; worker < g_slowlog_worker_count; ++worker) {
-    std::vector<SlowLogEntry> entries = co_await celer::SubmitTo(
+    std::vector<SlowLogEntry> entries = co_await bycorf::SubmitTo(
         worker, [worker] { return g_slowlog_shards[worker].Snapshot(); });
     std::move(entries.begin(), entries.end(), std::back_inserter(merged));
   }
@@ -230,11 +230,11 @@ celer::Task<std::vector<SlowLogEntry>> CollectSlowLog(std::size_t count) {
   co_return merged;
 }
 
-celer::Task<std::size_t> SlowLogLength() {
+bycorf::Task<std::size_t> SlowLogLength() {
   std::size_t length = 0;
   const std::size_t max_len = SlowLogMaxLen();
   for (unsigned worker = 0; worker < g_slowlog_worker_count; ++worker) {
-    const std::size_t local = co_await celer::SubmitTo(
+    const std::size_t local = co_await bycorf::SubmitTo(
         worker, [worker] { return g_slowlog_shards[worker].size(); });
     if (local >= max_len - length) co_return max_len;
     length += local;
@@ -242,9 +242,9 @@ celer::Task<std::size_t> SlowLogLength() {
   co_return length;
 }
 
-celer::Task<absl::Status> ResetSlowLog() {
+bycorf::Task<absl::Status> ResetSlowLog() {
   for (unsigned worker = 0; worker < g_slowlog_worker_count; ++worker) {
-    (void)co_await celer::SubmitTo(worker, [worker] {
+    (void)co_await bycorf::SubmitTo(worker, [worker] {
       g_slowlog_shards[worker].Reset();
       return true;
     });
@@ -252,10 +252,10 @@ celer::Task<absl::Status> ResetSlowLog() {
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> ConfigureSlowLogThreshold(
+bycorf::Task<absl::Status> ConfigureSlowLogThreshold(
     std::int64_t threshold_micros) {
   for (unsigned worker = 0; worker < g_slowlog_worker_count; ++worker) {
-    (void)co_await celer::SubmitTo(worker, [worker, threshold_micros] {
+    (void)co_await bycorf::SubmitTo(worker, [worker, threshold_micros] {
       g_slowlog_shards[worker].SetThreshold(threshold_micros);
       return true;
     });
@@ -263,9 +263,9 @@ celer::Task<absl::Status> ConfigureSlowLogThreshold(
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> ConfigureSlowLogMaxLen(std::size_t max_len) {
+bycorf::Task<absl::Status> ConfigureSlowLogMaxLen(std::size_t max_len) {
   for (unsigned worker = 0; worker < g_slowlog_worker_count; ++worker) {
-    (void)co_await celer::SubmitTo(worker, [worker, max_len] {
+    (void)co_await bycorf::SubmitTo(worker, [worker, max_len] {
       g_slowlog_shards[worker].SetCapacity(max_len);
       return true;
     });

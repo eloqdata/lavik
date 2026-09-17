@@ -36,7 +36,7 @@ void StorageEngine::Impl::ClearBitmapBit(DeviceAllocator& allocator,
 Task<absl::Status> StorageEngine::Impl::PersistBitmapPages(
     std::size_t device_index, DeviceAllocator& allocator,
     std::vector<std::size_t> page_indexes) {
-  assert(celer::ThisWorker().id_ == allocator.owner_);
+  assert(bycorf::ThisWorker().id_ == allocator.owner_);
   if (page_indexes.empty()) {
     co_return absl::OkStatus();
   }
@@ -88,7 +88,7 @@ Task<absl::Status> StorageEngine::Impl::PersistBitmapPages(
         .active_slot_ = next_slot,
     });
   }
-  absl::Status synced = co_await celer::Fdatasync(
+  absl::Status synced = co_await bycorf::Fdatasync(
       *store.worker_, store.files_[device.file_index_]);
   if (!synced.ok()) {
     co_return synced;
@@ -105,10 +105,10 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
     co_return absl::OkStatus();
   }
   DeviceAllocator& allocator = *device_allocators_[device_index];
-  assert(celer::ThisWorker().id_ == allocator.owner_);
+  assert(bycorf::ThisWorker().id_ == allocator.owner_);
   WorkerStore& store = *stores_[allocator.owner_];
   const StorageDevice& device = devices_[device_index];
-  auto* zero_header = static_cast<std::byte*>(celer::AllocateStorageBuffer(
+  auto* zero_header = static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
       kBlockHeaderBytes, options_.buffers_.alignment_));
   if (zero_header == nullptr) {
     co_return absl::Status(absl::StatusCode::kResourceExhausted,
@@ -131,16 +131,16 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
     }
   }
   if (status.ok()) {
-    status = co_await celer::Fdatasync(*store.worker_,
-                                       store.files_[device.file_index_]);
+    status = co_await bycorf::Fdatasync(*store.worker_,
+                                        store.files_[device.file_index_]);
   }
-  celer::FreeStorageBuffer(zero_header, options_.buffers_.alignment_);
+  bycorf::FreeStorageBuffer(zero_header, options_.buffers_.alignment_);
   co_return status;
 }
 
 Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
     std::size_t device_index, DeviceAllocator& allocator) {
-  assert(celer::ThisWorker().id_ == allocator.owner_);
+  assert(bycorf::ThisWorker().id_ == allocator.owner_);
   constexpr std::size_t kActivationBatchBlocks = 256;
   const StorageDevice& device = devices_[device_index];
   std::vector<std::uint64_t> activated;
@@ -208,7 +208,7 @@ Task<absl::StatusOr<ReservedBlock>>
 StorageEngine::Impl::AllocateFromDeviceLocal(std::size_t device_index,
                                              AllocationPurpose purpose) {
   DeviceAllocator& allocator = *device_allocators_[device_index];
-  assert(celer::ThisWorker().id_ == allocator.owner_);
+  assert(bycorf::ThisWorker().id_ == allocator.owner_);
   co_await allocator.mutex_.Lock();
   UnlockGuard unlock(&allocator.mutex_, stores_[allocator.owner_]->worker_);
   if (allocator.failed_.has_value()) {
@@ -290,11 +290,11 @@ Task<absl::Status> StorageEngine::Impl::RefillDeviceInBackground(
 
 Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateFromDevice(
     std::size_t device_index, AllocationPurpose purpose) {
-  const celer::WorkerId owner = device_allocators_[device_index]->owner_;
-  if (celer::ThisWorker().id_ == owner) {
+  const bycorf::WorkerId owner = device_allocators_[device_index]->owner_;
+  if (bycorf::ThisWorker().id_ == owner) {
     co_return co_await AllocateFromDeviceLocal(device_index, purpose);
   }
-  co_return co_await celer::SubmitTaskTo(
+  co_return co_await bycorf::SubmitTaskTo(
       owner,
       [this, device_index, purpose]() -> Task<absl::StatusOr<ReservedBlock>> {
         co_return co_await AllocateFromDeviceLocal(device_index, purpose);
@@ -304,7 +304,7 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateFromDevice(
 Task<absl::Status> StorageEngine::Impl::ReturnColdBlocksLocal(
     std::size_t device_index, std::vector<std::uint64_t> block_ids) {
   DeviceAllocator& allocator = *device_allocators_[device_index];
-  assert(celer::ThisWorker().id_ == allocator.owner_);
+  assert(bycorf::ThisWorker().id_ == allocator.owner_);
   co_await allocator.mutex_.Lock();
   UnlockGuard unlock(&allocator.mutex_, stores_[allocator.owner_]->worker_);
   if (allocator.failed_.has_value()) {
@@ -343,17 +343,17 @@ Task<absl::Status> StorageEngine::Impl::ReturnColdBlocks(
     if (by_device[device_index].empty()) {
       continue;
     }
-    const celer::WorkerId owner = device_allocators_[device_index]->owner_;
+    const bycorf::WorkerId owner = device_allocators_[device_index]->owner_;
     // Deliberately if/else, not a conditional expression: two co_awaits in
     // one full expression miscompile under GCC coroutines (branch awaiter
     // temporaries alias frame slots; destroying the suspended frame then
     // runs destructors on garbage).
     absl::Status returned;
-    if (owner == celer::ThisWorker().id_) {
+    if (owner == bycorf::ThisWorker().id_) {
       returned = co_await ReturnColdBlocksLocal(
           device_index, std::move(by_device[device_index]));
     } else {
-      returned = co_await celer::SubmitTaskTo(
+      returned = co_await bycorf::SubmitTaskTo(
           owner,
           [this, device_index,
            blocks = std::move(
@@ -372,7 +372,7 @@ Task<absl::Status> StorageEngine::Impl::ReturnColdBlocks(
 Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
     std::size_t device_index, std::size_t value_index, std::uint64_t epoch) {
   DeviceAllocator& allocator = *device_allocators_[device_index];
-  assert(celer::ThisWorker().id_ == allocator.owner_);
+  assert(bycorf::ThisWorker().id_ == allocator.owner_);
   if (epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(
         absl::StatusCode::kFailedPrecondition,
@@ -438,7 +438,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
                        "short write of device epoch metadata")
         : written.status();
   }
-  absl::Status synced = co_await celer::Fdatasync(
+  absl::Status synced = co_await bycorf::Fdatasync(
       *store.worker_, store.files_[device.file_index_]);
   if (!synced.ok()) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
@@ -462,7 +462,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
     std::size_t device_index,
     std::span<const std::pair<std::size_t, std::uint64_t>> values) {
   DeviceAllocator& allocator = *device_allocators_[device_index];
-  assert(celer::ThisWorker().id_ == allocator.owner_);
+  assert(bycorf::ThisWorker().id_ == allocator.owner_);
   if (values.empty()) co_return absl::OkStatus();
   if (epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(
@@ -545,7 +545,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
     };
   }
 
-  absl::Status synced = co_await celer::Fdatasync(
+  absl::Status synced = co_await bycorf::Fdatasync(
       *store.worker_, store.files_[device.file_index_]);
   if (!synced.ok()) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
@@ -577,13 +577,13 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValue(
   }
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
-    const celer::WorkerId owner = device_allocators_[device_index]->owner_;
+    const bycorf::WorkerId owner = device_allocators_[device_index]->owner_;
     absl::Status persisted;
-    if (owner == celer::ThisWorker().id_) {
+    if (owner == bycorf::ThisWorker().id_) {
       persisted = co_await PersistEpochValueOnDeviceLocal(device_index,
                                                           value_index, epoch);
     } else {
-      persisted = co_await celer::SubmitTaskTo(
+      persisted = co_await bycorf::SubmitTaskTo(
           owner,
           [this, device_index, value_index, epoch]() -> Task<absl::Status> {
             co_return co_await PersistEpochValueOnDeviceLocal(
@@ -607,15 +607,15 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValues(
   }
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
-    const celer::WorkerId owner = device_allocators_[device_index]->owner_;
+    const bycorf::WorkerId owner = device_allocators_[device_index]->owner_;
     absl::Status persisted;
-    if (owner == celer::ThisWorker().id_) {
+    if (owner == bycorf::ThisWorker().id_) {
       persisted =
           co_await PersistEpochValuesOnDeviceLocal(device_index, values);
     } else {
       std::vector<std::pair<std::size_t, std::uint64_t>> copied(values.begin(),
                                                                 values.end());
-      persisted = co_await celer::SubmitTaskTo(
+      persisted = co_await bycorf::SubmitTaskTo(
           owner,
           [this, device_index,
            copied = std::move(copied)]() -> Task<absl::Status> {
@@ -651,7 +651,7 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
   std::vector<std::size_t> attempt_order;
   const std::size_t device_count = devices_.size();
   std::vector<bool> included;
-  if (celer::SpdkStorageEnabled()) {
+  if (bycorf::SpdkStorageEnabled()) {
     attempt_order.reserve(home_order.size());
   } else {
     attempt_order.reserve(device_count);
@@ -660,11 +660,11 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
   for (const std::size_t home_index : home_order) {
     const std::size_t device_index = store.home_devices_[home_index];
     attempt_order.push_back(device_index);
-    if (!celer::SpdkStorageEnabled()) {
+    if (!bycorf::SpdkStorageEnabled()) {
       included[device_index] = true;
     }
   }
-  if (!celer::SpdkStorageEnabled()) {
+  if (!bycorf::SpdkStorageEnabled()) {
     for (std::size_t device_index = 0; device_index < device_count;
          ++device_index) {
       if (!included[device_index]) {
@@ -723,7 +723,7 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
     if (defrag_can_reclaim ||
         active_flushes_.load(std::memory_order_acquire) != 0 ||
         active_extent_reclaims_.load(std::memory_order_acquire) != 0) {
-      absl::Status waited = co_await celer::SleepFor(
+      absl::Status waited = co_await bycorf::SleepFor(
           *store.worker_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
         co_return waited;

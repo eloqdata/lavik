@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-#include "celer/runtime/worker.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/tx/transaction.h"
 
 namespace keylane::tx {
@@ -144,7 +144,7 @@ void TxRuntime::Create(unsigned worker_count) {
 TxRuntime* TxRuntime::Get() noexcept { return g_runtime; }
 
 TxShard& CurrentTxShard() {
-  return TxRuntime::Get()->shard(celer::ThisWorker().id_);
+  return TxRuntime::Get()->shard(bycorf::ThisWorker().id_);
 }
 
 }  // namespace keylane::tx

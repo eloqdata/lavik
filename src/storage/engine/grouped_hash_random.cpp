@@ -112,7 +112,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
          ++page_index) {
       if (shutdown_flush_requested_)
         co_return absl::CancelledError("random sample interrupted by shutdown");
-      if (!pop && page_index != 0) co_await celer::Yield(*store.worker_);
+      if (!pop && page_index != 0) co_await bycorf::Yield(*store.worker_);
       const auto& selection = selected[page_index];
       std::optional<MemoryReservation> page_scratch;
       if (!pop) {
@@ -211,11 +211,10 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
           object->version().root_.expire_at_ms_, tx, replication,
           mutation_precondition);
     } else {
-      status = co_await AppendLocked(store, partition, db_id, key, digest, {},
-                                     RecordKind::kTombstone, ValueType::kNone,
-                                     0, tx, 0, nullptr, nullptr, replication,
-                                     nullptr, true, nullptr,
-                                     mutation_precondition);
+      status = co_await AppendLocked(
+          store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
+          ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, nullptr,
+          true, nullptr, mutation_precondition);
     }
     if (!status.ok()) co_return status;
     co_return result;

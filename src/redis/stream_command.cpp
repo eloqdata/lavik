@@ -11,9 +11,9 @@
 
 #include "absl/strings/str_cat.h"
 #include "blocking_wait.h"
-#include "celer/io/storage.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/worker.h"
 #include "cluster_gate.h"
 #include "keylane/resp.h"
 
@@ -993,8 +993,8 @@ Task<CommandReply> ExecuteRead(
               std::chrono::milliseconds(block_ms)) {
         co_return Built(builder.AppendNullArray());
       }
-      absl::Status slept = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status slept = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!slept.ok()) co_return Built(StorageError(builder, slept));
     }
     AttemptDbGuard db_guard(request.db_id_, owns_attempt_gate);
@@ -1050,14 +1050,14 @@ Task<CommandReply> ExecuteRead(
       storage::TxShardWrites* local_tx =
           locked_key == nullptr || tx_writes == nullptr ? nullptr
                                                         : &(*tx_writes)[owner];
-      if (owner == celer::ThisWorker().id_) {
+      if (owner == bycorf::ThisWorker().id_) {
         one = co_await ReadOneLocal(request.db_id_, key, cursors[k], initialize,
                                     group_read, group_name, consumer_name,
                                     new_messages[k], noack, count,
                                     locked_digest ? &*locked_digest : nullptr,
                                     local_tx, &attempt_request);
       } else {
-        one = co_await celer::SubmitTaskTo(
+        one = co_await bycorf::SubmitTaskTo(
             owner,
             [db = request.db_id_, key = std::move(key), cursor = cursors[k],
              initialize, group_read, group_name, consumer_name,

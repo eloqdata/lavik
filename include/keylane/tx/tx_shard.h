@@ -16,9 +16,9 @@
 #include "keylane/tx/intent_lock.h"
 #include "keylane/tx/tx_queue.h"
 
-namespace celer {
+namespace bycorf {
 class Worker;
-}  // namespace celer
+}  // namespace bycorf
 
 namespace keylane::tx {
 
@@ -115,7 +115,7 @@ class TxShard {
 
   // Bind to the owning worker; queued resumptions go through
   // worker.Enqueue. Unbound (tests only) resumes inline from Poll.
-  void Bind(celer::Worker& worker) noexcept { worker_ = &worker; }
+  void Bind(bycorf::Worker& worker) noexcept { worker_ = &worker; }
   void BindTxidCounter(std::atomic<std::uint64_t>* counter) noexcept {
     next_txid_ = counter;
   }
@@ -258,7 +258,7 @@ class TxShard {
 
   LockTable& locks(std::uint8_t db_id) { return locks_[db_id]; }
   TxQueue& queue() noexcept { return queue_; }
-  celer::Worker* worker() const noexcept { return worker_; }
+  bycorf::Worker* worker() const noexcept { return worker_; }
   std::uint64_t committed_txid() const noexcept { return committed_txid_; }
   void PublishCommitted(std::uint64_t txid) noexcept {
     committed_txid_ = std::max(committed_txid_, txid);
@@ -326,7 +326,7 @@ class TxShard {
   TxQueue queue_;
   std::uint64_t committed_txid_ = 0;
   bool polling_ = false;
-  celer::Worker* worker_ = nullptr;
+  bycorf::Worker* worker_ = nullptr;
   std::atomic<std::uint64_t>* next_txid_ = nullptr;
   std::uint64_t fastpath_runs_ = 0;
   std::uint64_t queued_runs_ = 0;

@@ -2,8 +2,9 @@
 
 // NuRaft's public mutation APIs may synchronously enter storage or internal
 // locks before returning their asynchronous result handle. Meta ingress runs
-// on a single celer worker, so those calls must cross this bounded executor:
-// the worker only queues work and later resumes through celer::ForeignExecutor.
+// on a single bycorf worker, so those calls must cross this bounded executor:
+// the worker only queues work and later resumes through
+// bycorf::ForeignExecutor.
 
 #include <condition_variable>
 #include <cstddef>
@@ -31,7 +32,7 @@ class MetaProposalExecutor {
   MetaProposalExecutor& operator=(const MetaProposalExecutor&) = delete;
 
   // Enqueues without waiting. Accepted work is drained during Shutdown;
-  // overload is reported to ingress instead of blocking the celer worker.
+  // overload is reported to ingress instead of blocking the bycorf worker.
   absl::Status Submit(Work work);
   void Shutdown() noexcept;
 

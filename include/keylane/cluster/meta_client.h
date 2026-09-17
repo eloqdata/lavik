@@ -16,11 +16,11 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/net/service.h"
+#include "bycorf/net/service.h"
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/replication.h"
 
-namespace celer {
+namespace bycorf {
 class TlsContext;
 }
 
@@ -60,7 +60,7 @@ absl::StatusOr<MetaControlEndpoint> ParseNumericControlEndpoint(
 
 // The peer certificate must carry one and only one URI SAN, and it must equal
 // the identity committed/configured for that connection. IP SAN verification
-// is performed by Celer/OpenSSL during StartTls using the dialed numeric host.
+// is performed by Bycorf/OpenSSL during StartTls using the dialed numeric host.
 absl::Status ValidateUniqueControlPrincipal(
     std::span<const std::string> uri_sans, std::string_view expected);
 
@@ -328,10 +328,10 @@ struct MetaControlClientOptions {
   unsigned request_worker_count_ = 0;
   // Null means plaintext. When present, the same CA/client identity used for
   // Data-to-Data replication is reused for Meta control mTLS.
-  std::shared_ptr<celer::TlsContext> tls_context_;
+  std::shared_ptr<bycorf::TlsContext> tls_context_;
 };
 
-class MetaControlClientService final : public celer::Service {
+class MetaControlClientService final : public bycorf::Service {
  public:
   // The installer, topology cache, and replication manager are retained by
   // reference and must outlive Run, Stop, and the final WaitUntilQuiesced.
@@ -344,8 +344,8 @@ class MetaControlClientService final : public celer::Service {
   MetaControlClientService& operator=(const MetaControlClientService&) = delete;
 
   void Prepare(unsigned thread_count) override;
-  celer::Task<absl::Status> Run(celer::Worker& worker,
-                                celer::ServiceContext context) override;
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker,
+                                 bycorf::ServiceContext context) override;
   void Stop() noexcept override;
 
   // Joins the worker-0 session, including any directive execution and the

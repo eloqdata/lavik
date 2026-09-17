@@ -262,7 +262,7 @@ Task<absl::Status> StorageEngine::Impl::PrepinGroupedRetirementsLocked(
     if (owner == store.worker_->id()) {
       status = co_await pin();
     } else {
-      status = co_await celer::SubmitTaskTo(owner, pin);
+      status = co_await bycorf::SubmitTaskTo(owner, pin);
     }
     co_await store.store_state_mutex_.Lock();
     if (!status.ok()) {
@@ -296,7 +296,7 @@ Task<absl::Status> StorageEngine::Impl::ReleaseGroupedRetirementPins(
     if (owner == store->worker_->id())
       (void)co_await release();
     else
-      (void)co_await celer::SubmitTaskTo(owner, release);
+      (void)co_await bycorf::SubmitTaskTo(owner, release);
   }
   co_return absl::OkStatus();
 }

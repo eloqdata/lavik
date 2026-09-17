@@ -19,16 +19,16 @@
 
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
-#include "celer/net/tcp_stream.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/sync.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/net/tcp_stream.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/sync.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/command.h"
 #include "keylane/command_table.h"
 #include "keylane/session.h"
 
 namespace keylane {
-using namespace celer;
+using namespace bycorf;
 
 namespace {
 

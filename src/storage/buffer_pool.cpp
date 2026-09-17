@@ -10,9 +10,9 @@
 #include <optional>
 #include <vector>
 
-#include "celer/io/spdk_storage.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/spdk_storage.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/worker.h"
 #include "spdlog/spdlog.h"
 
 namespace keylane::storage {
@@ -29,7 +29,7 @@ bool IsAligned(std::size_t value, std::size_t alignment) noexcept {
 }  // namespace
 
 ReadBufferLease::ReadBufferLease(RegisteredBufferPool* pool,
-                                 celer::FixedBuffer buffer,
+                                 bycorf::FixedBuffer buffer,
                                  std::size_t headroom_bytes,
                                  std::size_t tailroom_bytes) noexcept
     : pool_(pool),
@@ -45,7 +45,7 @@ ReadBufferLease::ReadBufferLease(RegisteredBufferPool* pool,
 }
 
 ReadBufferLease::ReadBufferLease(RegisteredBufferPool* pool,
-                                 celer::FixedBuffer buffer,
+                                 bycorf::FixedBuffer buffer,
                                  std::size_t headroom_bytes,
                                  std::size_t tailroom_bytes,
                                  std::size_t overflow_id) noexcept
@@ -86,11 +86,11 @@ ReadBufferLease& ReadBufferLease::operator=(ReadBufferLease&& other) noexcept {
 
 ReadBufferLease::~ReadBufferLease() { Reset(); }
 
-celer::FixedBuffer ReadBufferLease::io_buffer() const noexcept {
+bycorf::FixedBuffer ReadBufferLease::io_buffer() const noexcept {
   if (!valid() || size_ < headroom_bytes_ + tailroom_bytes_) {
     return {};
   }
-  return celer::FixedBuffer{
+  return bycorf::FixedBuffer{
       .data_ = data_ + headroom_bytes_,
       .size_ = size_ - headroom_bytes_ - tailroom_bytes_,
       .index_ = buffer_id(),
@@ -113,41 +113,41 @@ void ReadBufferLease::Reset() noexcept {
 
 RegisteredBufferPool::~RegisteredBufferPool() {
   if (sentinel_buffer_ != nullptr) {
-    celer::FreeStorageBuffer(sentinel_buffer_, options_.alignment_);
+    bycorf::FreeStorageBuffer(sentinel_buffer_, options_.alignment_);
     sentinel_buffer_ = nullptr;
     sentinel_buffer_bytes_ = 0;
   }
-  for (const celer::FixedBuffer& buffer : write_buffers_) {
+  for (const bycorf::FixedBuffer& buffer : write_buffers_) {
     if (buffer.data_ != nullptr &&
         IsAligned(reinterpret_cast<std::uintptr_t>(buffer.data_),
                   options_.alignment_)) {
-      celer::FreeStorageBuffer(buffer.data_, options_.alignment_);
+      bycorf::FreeStorageBuffer(buffer.data_, options_.alignment_);
     }
   }
-  for (const celer::FixedBuffer& buffer : read_buffers_) {
+  for (const bycorf::FixedBuffer& buffer : read_buffers_) {
     if (buffer.data_ != nullptr &&
         IsAligned(reinterpret_cast<std::uintptr_t>(buffer.data_),
                   options_.alignment_)) {
-      celer::FreeStorageBuffer(buffer.data_, options_.alignment_);
+      bycorf::FreeStorageBuffer(buffer.data_, options_.alignment_);
     }
   }
   for (std::byte* buffer : heap_write_buffers_) {
     if (buffer != nullptr && IsAligned(reinterpret_cast<std::uintptr_t>(buffer),
                                        options_.alignment_)) {
-      celer::FreeStorageBuffer(buffer, options_.alignment_);
+      bycorf::FreeStorageBuffer(buffer, options_.alignment_);
     }
   }
-  for (const celer::FixedBuffer& buffer : overflow_read_buffers_) {
+  for (const bycorf::FixedBuffer& buffer : overflow_read_buffers_) {
     if (buffer.data_ != nullptr &&
         IsAligned(reinterpret_cast<std::uintptr_t>(buffer.data_),
                   options_.alignment_)) {
-      celer::FreeStorageBuffer(buffer.data_, options_.alignment_);
+      bycorf::FreeStorageBuffer(buffer.data_, options_.alignment_);
     }
   }
 }
 
 absl::Status RegisteredBufferPool::Init(
-    celer::Worker& worker, const RegisteredBufferPoolOptions& options) {
+    bycorf::Worker& worker, const RegisteredBufferPoolOptions& options) {
   if (initialized()) {
     return absl::Status(absl::StatusCode::kFailedPrecondition,
                         "registered buffer pool is already initialized");
@@ -239,22 +239,22 @@ absl::Status RegisteredBufferPool::Init(
 
   const std::size_t sentinel_bytes = options.alignment_;
   auto* sentinel = static_cast<std::byte*>(
-      celer::AllocateStorageBuffer(sentinel_bytes, options.alignment_));
+      bycorf::AllocateStorageBuffer(sentinel_bytes, options.alignment_));
   if (sentinel == nullptr) {
     return absl::Status(absl::StatusCode::kResourceExhausted,
                         "aligned sentinel buffer allocation failed");
   }
   std::fill_n(sentinel, sentinel_bytes, std::byte{0});
   iovecs.push_back(iovec{.iov_base = sentinel, .iov_len = sentinel_bytes});
-  std::vector<celer::FixedBuffer> write_buffers;
+  std::vector<bycorf::FixedBuffer> write_buffers;
   write_buffers.reserve(registered_write_count);
   for (std::size_t i = 0; i < registered_write_count; ++i) {
-    auto* data = static_cast<std::byte*>(celer::AllocateStorageBuffer(
+    auto* data = static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
         options.write_buffer_bytes_, options.alignment_));
     if (data == nullptr) {
-      celer::FreeStorageBuffer(sentinel, options.alignment_);
-      for (const celer::FixedBuffer& buffer : write_buffers) {
-        celer::FreeStorageBuffer(buffer.data_, options.alignment_);
+      bycorf::FreeStorageBuffer(sentinel, options.alignment_);
+      for (const bycorf::FixedBuffer& buffer : write_buffers) {
+        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
       }
       return absl::Status(absl::StatusCode::kResourceExhausted,
                           "aligned registered-write-buffer allocation failed");
@@ -262,32 +262,32 @@ absl::Status RegisteredBufferPool::Init(
     const std::size_t id = i + 1;
     iovecs.push_back(
         iovec{.iov_base = data, .iov_len = options.write_buffer_bytes_});
-    write_buffers.push_back(celer::FixedBuffer{
+    write_buffers.push_back(bycorf::FixedBuffer{
         .data_ = data,
         .size_ = options.write_buffer_bytes_,
         .index_ = static_cast<std::uint16_t>(id),
     });
   }
 
-  std::vector<celer::FixedBuffer> read_buffers;
+  std::vector<bycorf::FixedBuffer> read_buffers;
   read_buffers.reserve(read_count);
   for (std::size_t i = 0; i < read_count; ++i) {
     auto* data = static_cast<std::byte*>(
-        celer::AllocateStorageBuffer(read_slot_bytes, options.alignment_));
+        bycorf::AllocateStorageBuffer(read_slot_bytes, options.alignment_));
     if (data == nullptr) {
-      celer::FreeStorageBuffer(sentinel, options.alignment_);
-      for (const celer::FixedBuffer& buffer : write_buffers) {
-        celer::FreeStorageBuffer(buffer.data_, options.alignment_);
+      bycorf::FreeStorageBuffer(sentinel, options.alignment_);
+      for (const bycorf::FixedBuffer& buffer : write_buffers) {
+        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
       }
-      for (const celer::FixedBuffer& buffer : read_buffers) {
-        celer::FreeStorageBuffer(buffer.data_, options.alignment_);
+      for (const bycorf::FixedBuffer& buffer : read_buffers) {
+        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
       }
       return absl::Status(absl::StatusCode::kResourceExhausted,
                           "aligned registered-read-buffer allocation failed");
     }
     const std::size_t id = read_base + i;
     iovecs.push_back(iovec{.iov_base = data, .iov_len = read_slot_bytes});
-    read_buffers.push_back(celer::FixedBuffer{
+    read_buffers.push_back(bycorf::FixedBuffer{
         .data_ = data,
         .size_ = read_slot_bytes,
         .index_ = static_cast<std::uint16_t>(id),
@@ -297,16 +297,16 @@ absl::Status RegisteredBufferPool::Init(
   absl::Status status = worker.RegisterBuffers(iovecs);
   bool buffers_registered = status.ok();
   if (!status.ok()) {
-    if (celer::SpdkStorageEnabled()) {
+    if (bycorf::SpdkStorageEnabled()) {
       // SPDK registration is a DMA-addressability check; memory that fails it
       // cannot be handed to the device at all, so plain IO would fail the same
       // way. Fail fast instead of degrading.
-      celer::FreeStorageBuffer(sentinel, options.alignment_);
-      for (const celer::FixedBuffer& buffer : write_buffers) {
-        celer::FreeStorageBuffer(buffer.data_, options.alignment_);
+      bycorf::FreeStorageBuffer(sentinel, options.alignment_);
+      for (const bycorf::FixedBuffer& buffer : write_buffers) {
+        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
       }
-      for (const celer::FixedBuffer& buffer : read_buffers) {
-        celer::FreeStorageBuffer(buffer.data_, options.alignment_);
+      for (const bycorf::FixedBuffer& buffer : read_buffers) {
+        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
       }
       return status;
     } else {
@@ -336,7 +336,7 @@ absl::Status RegisteredBufferPool::Init(
   }
 
   worker_ = &worker;
-  cross_core_ = celer::ThisWorker().cross_core_;
+  cross_core_ = bycorf::ThisWorker().cross_core_;
   owner_worker_ = worker.id();
   buffers_registered_ = buffers_registered;
   options_ = options;
@@ -481,18 +481,18 @@ absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
                            options_.read_tailroom_bytes_, overflow_id);
   }
   auto* data = static_cast<std::byte*>(
-      celer::AllocateStorageBuffer(bytes, options_.alignment_));
+      bycorf::AllocateStorageBuffer(bytes, options_.alignment_));
   if (data == nullptr) {
     return absl::Status(absl::StatusCode::kResourceExhausted,
                         "aligned heap read buffer allocation failed");
   }
   if (overflow_read_buffers_.size() >= ReadBufferLease::kReleaseTokenMask) {
-    celer::FreeStorageBuffer(data, options_.alignment_);
+    bycorf::FreeStorageBuffer(data, options_.alignment_);
     return absl::Status(absl::StatusCode::kResourceExhausted,
                         "overflow read buffer id space exhausted");
   }
   overflow_read_buffers_.push_back(
-      celer::FixedBuffer{.data_ = data, .size_ = bytes, .index_ = 0});
+      bycorf::FixedBuffer{.data_ = data, .size_ = bytes, .index_ = 0});
   overflow_read_buffer_in_use_.push_back(true);
   const std::size_t overflow_id = overflow_read_buffers_.size();
   return ReadBufferLease(this, overflow_read_buffers_.back(),
@@ -539,7 +539,7 @@ bool RegisteredBufferPool::TryAcquireHeapWriteBuffer(
     free_heap_write_buffers_.pop_back();
     return true;
   }
-  auto* data = static_cast<std::byte*>(celer::AllocateStorageBuffer(
+  auto* data = static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
       options_.write_buffer_bytes_, options_.alignment_));
   if (data == nullptr) {
     return false;
@@ -571,7 +571,7 @@ void RegisteredBufferPool::ReleaseWriteBufferLocal(
 }
 
 void RegisteredBufferPool::Release(std::uint16_t buffer_id) noexcept {
-  const celer::CurrentWorker& current = celer::ThisWorker();
+  const bycorf::CurrentWorker& current = bycorf::ThisWorker();
   if (current.cross_core_ == cross_core_ && current.id_ == owner_worker_) {
     ReleaseLocal(buffer_id);
     return;
@@ -579,9 +579,9 @@ void RegisteredBufferPool::Release(std::uint16_t buffer_id) noexcept {
   if (current.cross_core_ == nullptr || current.cross_core_ != cross_core_) {
     return;
   }
-  celer::PostNotification(
+  bycorf::PostNotification(
       cross_core_, owner_worker_,
-      celer::RemoteNotification{
+      bycorf::RemoteNotification{
           .context_ = this,
           .value_ = buffer_id,
           .run_fn_ = &RegisteredBufferPool::HandleRemoteRelease,
@@ -589,7 +589,7 @@ void RegisteredBufferPool::Release(std::uint16_t buffer_id) noexcept {
 }
 
 void RegisteredBufferPool::ReleaseOverflow(std::size_t overflow_id) noexcept {
-  const celer::CurrentWorker& current = celer::ThisWorker();
+  const bycorf::CurrentWorker& current = bycorf::ThisWorker();
   if (current.cross_core_ == cross_core_ && current.id_ == owner_worker_) {
     ReleaseOverflowLocal(overflow_id);
     return;
@@ -597,9 +597,9 @@ void RegisteredBufferPool::ReleaseOverflow(std::size_t overflow_id) noexcept {
   if (current.cross_core_ == nullptr || current.cross_core_ != cross_core_) {
     return;
   }
-  celer::PostNotification(
+  bycorf::PostNotification(
       cross_core_, owner_worker_,
-      celer::RemoteNotification{
+      bycorf::RemoteNotification{
           .context_ = this,
           .value_ = overflow_id,
           .run_fn_ = &RegisteredBufferPool::HandleRemoteOverflowRelease,

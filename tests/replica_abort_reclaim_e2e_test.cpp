@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include "celer/net/server.h"
+#include "bycorf/net/server.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/storage/detail/collection_compact_stream.h"
@@ -72,7 +72,7 @@ class ScopedDataFile {
   bool owned_ = false;
 };
 
-class ReplicaAbortReclaimService final : public celer::Service {
+class ReplicaAbortReclaimService final : public bycorf::Service {
  public:
   explicit ReplicaAbortReclaimService(StorageEngine* storage,
                                       keylane::storage::ValueType large_type =
@@ -86,8 +86,8 @@ class ReplicaAbortReclaimService final : public celer::Service {
     Check(thread_count == 1, "replica-reclaim test requires one worker");
   }
 
-  celer::Task<absl::Status> Run(celer::Worker& worker,
-                                celer::ServiceContext) override {
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker,
+                                 bycorf::ServiceContext) override {
     worker_ = &worker;
     keylane::BindMemoryAccountingShard(worker.id());
     keylane::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
@@ -112,14 +112,14 @@ class ReplicaAbortReclaimService final : public celer::Service {
   // its owning worker. Without this, final cleanup destroys owner-thread
   // state (e.g. LocalSharedPtr<GroupIndexNode>) on the main thread and trips
   // the owner-thread assertion.
-  void FinalizeWorker(celer::Worker& worker) noexcept override {
+  void FinalizeWorker(bycorf::Worker& worker) noexcept override {
     storage_->FinalizeWorker(worker);
   }
 
   const absl::Status& result() const noexcept { return result_; }
 
  private:
-  celer::Task<absl::Status> VerifyOrdinaryCollectionIngest() {
+  bycorf::Task<absl::Status> VerifyOrdinaryCollectionIngest() {
     using namespace keylane::storage;
     for (auto type : {ValueType::kHash, ValueType::kSet, ValueType::kList,
                       ValueType::kSortedSet}) {
@@ -144,7 +144,7 @@ class ReplicaAbortReclaimService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExerciseOrdinaryCollectionIngest() {
+  bycorf::Task<absl::Status> ExerciseOrdinaryCollectionIngest() {
     using namespace keylane::storage;
     for (auto type : {ValueType::kHash, ValueType::kSet, ValueType::kList,
                       ValueType::kSortedSet}) {
@@ -153,7 +153,7 @@ class ReplicaAbortReclaimService final : public celer::Service {
       // Reverse scores deliberately exercise unordered RDB-style ZSet input.
       auto reader = [type](char fill, bool fail) -> CollectionPageReader {
         return [type, fill, fail, index = 0U]() mutable
-                   -> celer::Task<absl::StatusOr<CollectionPage>> {
+                   -> bycorf::Task<absl::StatusOr<CollectionPage>> {
           if (index == 1 && fail)
             co_return absl::DataLossError("injected late collection page");
           CollectionPage page{.value_type_ = type, .done_ = index == 1};
@@ -308,7 +308,7 @@ class ReplicaAbortReclaimService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExerciseLargeCollection() {
+  bycorf::Task<absl::Status> ExerciseLargeCollection() {
     using namespace keylane::storage;
     constexpr std::uint64_t count = 140000;
     constexpr std::size_t item_bytes = 8192;
@@ -350,7 +350,7 @@ class ReplicaAbortReclaimService final : public celer::Service {
     frame.kind_ = SnapshotRecord::Kind::kValueChunk;
     frame.value_.clear();
     frame.value_.reserve(kTransferBytes);
-    auto flush = [&]() -> celer::Task<absl::Status> {
+    auto flush = [&]() -> bycorf::Task<absl::Status> {
       if (frame.value_.empty()) co_return absl::OkStatus();
       const auto written = co_await apply();
       if (!written.ok()) {
@@ -517,12 +517,12 @@ class ReplicaAbortReclaimService final : public celer::Service {
     return result;
   }
 
-  celer::Task<absl::Status> SendCollection(std::uint64_t session,
-                                           std::uint64_t epoch,
-                                           std::string_view key,
-                                           keylane::storage::ValueType type,
-                                           std::uint64_t sequence,
-                                           unsigned mode, char fill = 'v') {
+  bycorf::Task<absl::Status> SendCollection(std::uint64_t session,
+                                            std::uint64_t epoch,
+                                            std::string_view key,
+                                            keylane::storage::ValueType type,
+                                            std::uint64_t sequence,
+                                            unsigned mode, char fill = 'v') {
     const auto encoded = CollectionBytes(type, fill);
     SnapshotRecord frame{.kind_ = SnapshotRecord::Kind::kValueBegin,
                          .db_id_ = 0,
@@ -561,7 +561,7 @@ class ReplicaAbortReclaimService final : public celer::Service {
     co_return co_await apply();
   }
 
-  celer::Task<absl::Status> ExerciseCollectionStreams() {
+  bycorf::Task<absl::Status> ExerciseCollectionStreams() {
     using namespace keylane::storage;
     std::uint64_t session = 1200;
     for (const auto type : {ValueType::kHash, ValueType::kSet, ValueType::kList,
@@ -650,7 +650,7 @@ class ReplicaAbortReclaimService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::StatusOr<PartitionSnapshotBatch>> PinActiveExternalValue(
+  bycorf::Task<absl::StatusOr<PartitionSnapshotBatch>> PinActiveExternalValue(
       std::uint64_t session_id, std::uint8_t db_id, std::string_view key,
       char fill) {
     auto written = co_await storage_->Set(
@@ -686,8 +686,8 @@ class ReplicaAbortReclaimService final : public celer::Service {
     storage_->EndFullSyncSession(session_id);
   }
 
-  celer::Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>> ResetFullRoot(
-      std::uint64_t session_id) {
+  bycorf::Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
+  ResetFullRoot(std::uint64_t session_id) {
     std::array<std::uint64_t, keylane::storage::kLogicalDatabaseCount>
         source_db_epochs{};
     for (std::uint8_t db_id = 0;
@@ -706,7 +706,7 @@ class ReplicaAbortReclaimService final : public celer::Service {
     co_return co_await storage_->ResetReplicaPartitions(session_id, resets);
   }
 
-  celer::Task<absl::Status> ApplyCandidate(
+  bycorf::Task<absl::Status> ApplyCandidate(
       std::uint64_t session_id,
       std::span<const ReplicaPartitionEpoch> partition_epochs,
       std::uint8_t db_id, std::string_view key, char fill) {
@@ -730,7 +730,7 @@ class ReplicaAbortReclaimService final : public celer::Service {
         std::span(&candidate, 1));
   }
 
-  celer::Task<absl::Status> HandoffAll(
+  bycorf::Task<absl::Status> HandoffAll(
       std::uint64_t session_id,
       std::span<const ReplicaPartitionEpoch> partition_epochs) {
     for (const auto& epoch : partition_epochs) {
@@ -741,11 +741,11 @@ class ReplicaAbortReclaimService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> WaitForCapacityIncrease(std::uint64_t previous,
-                                                    std::string_view failure) {
+  bycorf::Task<absl::Status> WaitForCapacityIncrease(std::uint64_t previous,
+                                                     std::string_view failure) {
     for (unsigned attempt = 0; attempt < 500; ++attempt) {
       absl::Status slept =
-          co_await celer::SleepFor(*worker_, std::chrono::milliseconds(1));
+          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(1));
       if (!slept.ok()) co_return slept;
       const auto metrics = co_await storage_->CollectMetrics();
       if (metrics.devices_.front().available_bytes_ > previous) {
@@ -766,7 +766,7 @@ class ReplicaAbortReclaimService final : public celer::Service {
     }
   }
 
-  celer::Task<absl::Status> ExerciseRepeatedAbort() {
+  bycorf::Task<absl::Status> ExerciseRepeatedAbort() {
     constexpr std::uint8_t kDb = 7;
     const std::string key = "replica-abort-candidate";
     std::optional<std::uint64_t> first_retained;
@@ -808,7 +808,7 @@ class ReplicaAbortReclaimService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExerciseRepeatedPromotion() {
+  bycorf::Task<absl::Status> ExerciseRepeatedPromotion() {
     constexpr std::uint8_t kDb = 9;
     const std::string key = "replica-promote-candidate";
     std::optional<std::uint64_t> first_retained;
@@ -858,7 +858,7 @@ class ReplicaAbortReclaimService final : public celer::Service {
   StorageEngine* storage_ = nullptr;
   keylane::storage::ValueType large_type_;
   bool verify_ingest_ = false;
-  celer::Worker* worker_ = nullptr;
+  bycorf::Worker* worker_ = nullptr;
   absl::Status result_ = absl::UnknownError("test service did not run");
 };
 
@@ -885,9 +885,9 @@ int Run(const std::string& path, keylane::storage::ValueType large_type,
   }
   keylane::tx::TxRuntime::Create(1);
   ReplicaAbortReclaimService service(&storage, large_type, verify_ingest);
-  celer::Server server;
+  bycorf::Server server;
   server.AddService(&service);
-  celer::ServerOptions runtime;
+  bycorf::ServerOptions runtime;
   runtime.thread_count_ = 1;
   runtime.pin_workers_ = false;
   runtime.recv_buffer_count_ = 0;

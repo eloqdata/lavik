@@ -53,7 +53,7 @@
 // Threading and IO model: identical to NuraftLogStore — synchronous,
 // mutex-serialized file IO on whatever NuRaft thread made the call. NuRaft
 // invokes save_state/save_config from its request/background threads, which
-// may block on storage; durability IO stays out of celer coroutines.
+// may block on storage; durability IO stays out of bycorf coroutines.
 //
 // Failure behavior: Open() reports via absl::Status. Inside the NuRaft
 // overrides there is no error channel and proceeding after a failed

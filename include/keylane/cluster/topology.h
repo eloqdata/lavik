@@ -165,7 +165,7 @@ class GroupInFlight {
   // forms a Dekker handshake — a drain that starts after a revoking publish
   // either observes this registration, or the registrant observes the
   // publication and rolls back (see TopologyCache::Publish). `stripe` is the
-  // configured Celer worker id and must be less than StripeCount().
+  // configured Bycorf worker id and must be less than StripeCount().
   void Enter(std::size_t stripe) noexcept {
     assert(stripe < stripe_count_);
     stripes_[stripe].value_.fetch_add(1);

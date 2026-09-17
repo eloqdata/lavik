@@ -56,7 +56,7 @@ if (KEYLANE_ENABLE_OPT)
   )
   if (KEYLANE_IPO_SUPPORTED)
     # IPO properties are initialized when a target is created. Keep these
-    # defaults ahead of every bundled target so Celer, Abseil, mimalloc, and
+    # defaults ahead of every bundled target so Bycorf, Abseil, mimalloc, and
     # Lua participate in the same link-time optimization as the server.
     # Debug deliberately stays non-IPO so local builds do not pay an
     # optimization cost that is unrelated to correctness.
@@ -133,12 +133,11 @@ else()
     "format targets are disabled")
 endif()
 
-set(CELER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-# Keylane exposes one opt-in dependency boundary. Force both Celer capabilities
-# from it so turning bypass off in an existing build also removes those deps.
-set(CELER_WITH_DPDK ${KEYLANE_KERNEL_BYPASS} CACHE BOOL "" FORCE)
-set(CELER_WITH_SPDK_STORAGE ${KEYLANE_KERNEL_BYPASS} CACHE BOOL "" FORCE)
-# This must be set before Celer's first find_package(OpenSSL). Static release
+set(BYCORF_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+# Keep the runtime dependency boundary aligned with Keylane, including when
+# bypass is turned off again in an existing build directory.
+set(BYCORF_KERNEL_BYPASS ${KEYLANE_KERNEL_BYPASS} CACHE BOOL "" FORCE)
+# This must be set before Bycorf's first find_package(OpenSSL). Static release
 # artifacts can then run without libssl.so or libcrypto.so on the target.
 set(OPENSSL_USE_STATIC_LIBS ${KEYLANE_STATIC_OPENSSL} CACHE BOOL
   "Use static OpenSSL libraries" FORCE)
@@ -153,15 +152,15 @@ foreach(open_ssl_cache_var IN ITEMS OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
 endforeach()
 find_package(OpenSSL REQUIRED)
 
-set(KEYLANE_CELER_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/celer" CACHE PATH
-    "Celer checkout to build (allows an isolated runtime worktree)")
-if (EXISTS "${KEYLANE_CELER_SOURCE_DIR}/CMakeLists.txt")
-  add_subdirectory("${KEYLANE_CELER_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/celer")
+set(KEYLANE_BYCORF_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bycorf" CACHE PATH
+    "Bycorf checkout to build (allows an isolated runtime worktree)")
+if (EXISTS "${KEYLANE_BYCORF_SOURCE_DIR}/CMakeLists.txt")
+  add_subdirectory("${KEYLANE_BYCORF_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/bycorf")
 else()
-  message(FATAL_ERROR "celer submodule not found; run git submodule update --init --recursive")
+  message(FATAL_ERROR "bycorf submodule not found; run git submodule update --init --recursive")
 endif()
-target_compile_definitions(celer PUBLIC
-  CELER_ENABLE_SUBMIT_TASK_COUNT=$<BOOL:${KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT}>
+target_compile_definitions(bycorf PUBLIC
+  BYCORF_ENABLE_SUBMIT_TASK_COUNT=$<BOOL:${KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT}>
 )
 
 if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mimalloc/CMakeLists.txt)
@@ -319,9 +318,9 @@ target_compile_definitions(keylane_lua PRIVATE
 )
 target_link_libraries(keylane_lua PUBLIC m)
 
-if (TARGET format AND TARGET celer-format)
-  add_dependencies(format celer-format)
-  add_dependencies(format-check celer-format-check)
+if (TARGET format AND TARGET bycorf-format)
+  add_dependencies(format bycorf-format)
+  add_dependencies(format-check bycorf-format-check)
 endif()
 
 # The generic Abseil CRC loop calls small load helpers for every input word.
@@ -376,7 +375,7 @@ target_include_directories(keylane_control_transport PUBLIC
 target_compile_features(keylane_control_transport PUBLIC cxx_std_23)
 target_link_libraries(keylane_control_transport PUBLIC
   keylane::control_protocol
-  celer::core
+  bycorf::core
   absl::status
   absl::statusor
 )
@@ -500,8 +499,8 @@ target_link_libraries(keylane_module PUBLIC
   keylane::lease_clock
   keylane::control_transport
   keylane::control_protocol
-  celer::core
-  celer::rpc
+  bycorf::core
+  bycorf::rpc
   absl::crc32c
   absl::flat_hash_map
   absl::inlined_vector
@@ -545,7 +544,7 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     if (NOT KEYLANE_MARCH STREQUAL "")
       list(APPEND KEYLANE_OPT_COMPILE_OPTIONS "-march=${KEYLANE_MARCH}")
     endif()
-    # Celer is compiled as part of Keylane, so local native builds should tune
+    # Bycorf is compiled as part of Keylane, so local native builds should tune
     # the transport and runtime too, not only the Redis/storage layer. Abseil's
     # accelerated CRC engines are compile-gated by architecture feature
     # macros; apply the explicit target to those translation units as well or
@@ -553,8 +552,8 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     set(KEYLANE_OPT_TARGETS
         absl_crc_internal
         absl_crc32c
-        celer
-        celer_rpc
+        bycorf
+        bycorf_rpc
         keylane_control_protocol
         keylane_control_transport
         keylane_lease_clock
@@ -595,7 +594,7 @@ if (KEYLANE_BUILD_META)
   # only into keylane-meta; keylane, keylane_module, and the test binaries
   # must stay Raft-free so the data plane never sees consensus code.
   #
-  # keylane_meta_core carries durability and control logic; Celer owns
+  # keylane_meta_core carries durability and control logic; Bycorf owns
   # foreign-thread completion ingress while NuRaft's native Asio service owns
   # peer transport and timers.
   set(KEYLANE_META_CORE_SOURCES
@@ -641,7 +640,7 @@ if (KEYLANE_BUILD_META)
     keylane::control_transport
     keylane::control_protocol
     NuRaft::static_lib
-    celer::core
+    bycorf::core
   )
   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(keylane_meta_core PRIVATE -Wall -Wextra -Wpedantic)
@@ -1070,25 +1069,25 @@ if (BUILD_TESTING)
     endif()
   endif()
 
-  # celer's connect/timer verification harness, run under ctest. Keylane
-  # forces CELER_BUILD_EXAMPLES=OFF, so the celer-side example target never
+  # bycorf's connect/timer verification harness, run under ctest. Keylane
+  # forces BYCORF_BUILD_EXAMPLES=OFF, so the bycorf-side example target never
   # materializes in this build; compile the source directly here instead (it
-  # only uses celer public headers). The suite deliberately sleeps past armed
+  # only uses bycorf public headers). The suite deliberately sleeps past armed
   # deadlines to catch stale-timeout dispatches, hence the 90s budget.
-  add_executable(celer_connect_timer_check
-    "${KEYLANE_CELER_SOURCE_DIR}/example/connect_timer_check.cpp"
+  add_executable(bycorf_connect_timer_check
+    "${KEYLANE_BYCORF_SOURCE_DIR}/example/connect_timer_check.cpp"
   )
-  target_link_libraries(celer_connect_timer_check PRIVATE celer::core)
+  target_link_libraries(bycorf_connect_timer_check PRIVATE bycorf::core)
   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(celer_connect_timer_check PRIVATE
+    target_compile_options(bycorf_connect_timer_check PRIVATE
       -Wall -Wextra -Wpedantic)
   endif()
   add_test(
-    NAME celer_connect_timer_check
-    COMMAND celer_connect_timer_check
+    NAME bycorf_connect_timer_check
+    COMMAND bycorf_connect_timer_check
   )
-  set_tests_properties(celer_connect_timer_check PROPERTIES
-    LABELS celer
+  set_tests_properties(bycorf_connect_timer_check PROPERTIES
+    LABELS bycorf
     TIMEOUT 90
   )
 

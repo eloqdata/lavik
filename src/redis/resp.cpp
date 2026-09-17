@@ -12,7 +12,7 @@
 #include "keylane/memory.h"
 
 namespace keylane {
-using namespace celer;
+using namespace bycorf;
 
 namespace {
 

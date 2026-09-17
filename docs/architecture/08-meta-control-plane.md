@@ -4,12 +4,12 @@
 
 `keylane-meta` is a separate C++ process for durable cluster metadata. It
 embeds NuRaft and uses its native Asio service for Raft peer sockets, timers,
-and TLS. One Celer worker owns the configured Unix and/or TCP administrative
+and TLS. One Bycorf worker owns the configured Unix and/or TCP administrative
 listeners and the process-lifetime Data-control listener; a bounded proposal
 executor keeps
 synchronous NuRaft API entry and WAL I/O off that worker. NuRaft and
 proposal-executor threads return typed notifications or coroutine handles
-through Celer's foreign MPSC mailbox, which reuses the worker's normal wake
+through Bycorf's foreign MPSC mailbox, which reuses the worker's normal wake
 sequence and eventfd. The main Keylane data-plane executable remains
 Raft-free. Followers keep accepting Data connections long enough to return the
 committed member directory and leader hint. Only a caught-up leader installs
@@ -23,7 +23,7 @@ reconcilers without waiting for remote results, then
 cancels administrative result waits and drains every listener, then quiesces Data
 sessions and
 all NuRaft/proposal-executor producers, waits for the foreign executor's
-accepted prefix to reach the Meta worker, and only then stops the generic Celer
+accepted prefix to reach the Meta worker, and only then stops the generic Bycorf
 runtime. An active demotion or first shutdown drain is fail-stop if the worker
 mailbox cannot accept its notification: reporting success would permit a later
 leader epoch to reuse authority that was never revoked. Once shutdown has
@@ -278,7 +278,7 @@ cursor, and a bounded ordered subscription. Replay can redeliver an index, so
 consumers deduplicate by index. Queue overflow cancels the subscription and
 requires resynchronization from a new full view. Each NuRaft role callback
 synchronously records its exact edge in `MetaLeadershipRelay` before scheduling
-a Celer drain, so a stalled worker or coordinator cannot collapse a rapid
+a Bycorf drain, so a stalled worker or coordinator cannot collapse a rapid
 Leader/Follower/Leader sequence into its final role. The relay also preserves
 edges racing startup attachment and makes shutdown detachment a lifetime
 barrier. `MetaCoordinator` consumes one ordered event queue for reconciler
@@ -497,11 +497,11 @@ Consequently anonymous/redirect work is capped at 4096, and projection/FDS
 holders are capped at one per committed node-record slot (validated active at
 claim time) even when a peer stalls or that record retires before session
 cleanup.
-An accepted Data-control or Admin session borrows its Celer `Connection`
+An accepted Data-control or Admin session borrows its Bycorf `Connection`
 storage before spawning the session coroutine. During frame destruction, its
 owner unregisters the task and releases the borrow after body-local Connection
 users have unwound. Shutdown, demotion, or a watchdog may retire the transport
-immediately, but Celer cannot reclaim the borrowed storage while suspended
+immediately, but Bycorf cannot reclaim the borrowed storage while suspended
 session code can still resume and dereference it.
 The full projection batches share one weighted 2 GiB budget derived
 as two overlapping generations times encoded-plus-decoded 512 MiB size
@@ -987,7 +987,7 @@ must name the same leadership generation and eligibility-continuity revision;
 the detector cut must also name the compact view's exact applied index. This
 top-level identity covers even an empty detector batch, so a false-to-true
 eligibility ABA cannot splice pre-interruption diagnostics into a later cut.
-Evaluation and encoding run on the bounded proposal executor, not the Celer
+Evaluation and encoding run on the bounded proposal executor, not the Bycorf
 worker that drives Data heartbeats.
 Runtime entries exist only
 after Hello, FDS application, and a current-view validation; replacement,
@@ -1242,8 +1242,8 @@ audit history rather than replacing it.
 | Durable post-genesis Meta membership intent, exact-config recovery, leadership handoff, and identity retirement | `include/keylane/meta/membership_reconciler.h`, `src/meta/membership_reconciler.cpp`, `src/meta/ctl_server.cpp`, `src/meta/state_apply.cpp`, `tests/meta_integration/gate_membership_recovery.py` |
 | Shared Meta/Data frame, object-transfer, failover observation, transition, and activation formats | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/keylane/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |
-| Meta session transport retirement and Connection-storage lifetime | `src/meta/ctl_server.cpp`, `src/meta/data_control_server.cpp`, `celer/include/celer/net/connection.h`, `celer/src/runtime/worker.cpp` |
-| Foreign-thread typed completion ingress and worker wakeup | `celer/include/celer/runtime/foreign_executor.h`, `celer/src/runtime/foreign_executor.cpp`, `celer/include/celer/runtime/cross_core.h`, `celer/src/runtime/worker.cpp` |
-| TLS identity, RBAC, Unix peer credentials, Admin transport, cluster status, controlled failover, and initial cluster creation | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `include/keylane/meta/cluster_create.h`, `include/keylane/meta/failover_admin.h`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `celer/src/net/` |
+| Meta session transport retirement and Connection-storage lifetime | `src/meta/ctl_server.cpp`, `src/meta/data_control_server.cpp`, `bycorf/include/bycorf/net/connection.h`, `bycorf/src/runtime/worker.cpp` |
+| Foreign-thread typed completion ingress and worker wakeup | `bycorf/include/bycorf/runtime/foreign_executor.h`, `bycorf/src/runtime/foreign_executor.cpp`, `bycorf/include/bycorf/runtime/cross_core.h`, `bycorf/src/runtime/worker.cpp` |
+| TLS identity, RBAC, Unix peer credentials, Admin transport, cluster status, controlled failover, and initial cluster creation | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `include/keylane/meta/cluster_create.h`, `include/keylane/meta/failover_admin.h`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `bycorf/src/net/` |
 | Automatic-failover status wire/model plus JSON and text rendering | `include/keylane/meta/cluster_status.h`, `src/meta/cluster_status.cpp`, `tests/meta_cluster_status_test.cpp` |
 | Recovery, partition, membership, failover, and security gates | `tests/meta_*`, `tests/meta_integration/` |

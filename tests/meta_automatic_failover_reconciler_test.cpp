@@ -17,8 +17,8 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
-#include "celer/runtime/runtime.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/runtime/runtime.h"
+#include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
 #include "keylane/meta/automatic_failover_reconciler.h"
 #include "keylane/meta/cluster_create.h"
@@ -87,7 +87,7 @@ bool WaitUntil(const std::function<bool()>& predicate,
 }
 
 template <typename T>
-T RunTaskSync(celer::Task<T> task) {
+T RunTaskSync(bycorf::Task<T> task) {
   std::promise<void> done;
   auto signal = done.get_future();
   task.SetCompletionCallback(
@@ -177,12 +177,12 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     std::error_code ignored;
     std::filesystem::remove_all(dir_, ignored);
 
-    runtime_ = std::make_unique<celer::Runtime>();
+    runtime_ = std::make_unique<bycorf::Runtime>();
     std::promise<absl::Status> initialized;
     auto initialized_result = initialized.get_future();
     runtime_->Start(
         1,
-        [&initialized](unsigned, celer::Worker& worker) {
+        [&initialized](unsigned, bycorf::Worker& worker) {
           const absl::Status status = worker.Init();
           initialized.set_value(status);
           if (!status.ok()) return 1;
@@ -695,8 +695,8 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
   }
 
   std::filesystem::path dir_;
-  std::unique_ptr<celer::Runtime> runtime_;
-  celer::ForeignExecutor executor_;
+  std::unique_ptr<bycorf::Runtime> runtime_;
+  bycorf::ForeignExecutor executor_;
   nuraft::ptr<NuraftStateMgr> manager_;
   nuraft::ptr<MetaStateMachine> machine_;
   NuraftLogStore* wal_ = nullptr;
