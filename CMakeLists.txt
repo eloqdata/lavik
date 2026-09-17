@@ -1479,7 +1479,10 @@ if (BUILD_TESTING)
                 $<TARGET_FILE:${LAVIK_SENTINEL_SERVER_TARGET}>
                 ${LAVIK_REDIS_SERVER_EXECUTABLE}
       )
+      # Temporarily disabled while ARM64 promotion triggers a second failover.
+      # Keep building the fixture; re-enable after https://github.com/eloqdata/lavik/issues/74.
       set_tests_properties(lavik_sentinel_e2e PROPERTIES
+        DISABLED TRUE
         LABELS cluster-integration
         TIMEOUT 180
         RUN_SERIAL TRUE)

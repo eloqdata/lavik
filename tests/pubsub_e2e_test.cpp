@@ -394,7 +394,7 @@ int main(int argc, char** argv) {
     RespClient resp3_client = Connect(source_port);
     const std::string hello3 =
         resp3_client.Command({"HELLO", "3", "SETNAME", "resp3-client"});
-    ExpectContains(hello3, "%7\r\n$6\r\nserver\r\n$7\r\nlavik", "HELLO 3 map");
+    ExpectContains(hello3, "%7\r\n$6\r\nserver\r\n$5\r\nlavik", "HELLO 3 map");
     ExpectContains(hello3, "$5\r\nproto\r\n:3", "HELLO 3 protocol");
     ExpectContains(resp3_client.Command({"CLIENT", "LIST"}),
                    "name=resp3-client", "RESP3 client name");
