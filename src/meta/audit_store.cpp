@@ -166,8 +166,7 @@ absl::Status MetaAuditStore::PruneThrough(std::uint64_t through) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::string> MetaAuditStore::Serialize() const {
-  MetaWriter w;
+void MetaAuditStore::WriteSnapshot(MetaWriter& w) const {
   w.WriteU16(kMetaFormatVersion);
   w.WriteU64(pruned_floor_);
   w.WriteU8(static_cast<std::uint8_t>(policy_));
@@ -177,7 +176,18 @@ absl::StatusOr<std::string> MetaAuditStore::Serialize() const {
   for (const auto& [index, entry] : window_) {
     WriteRecord(w, entry);
   }
-  return w.TakeBuffer();
+}
+
+absl::StatusOr<std::string> MetaAuditStore::Serialize() const {
+  MetaWriter writer;
+  WriteSnapshot(writer);
+  return writer.TakeBuffer();
+}
+
+std::uint64_t MetaAuditStore::SerializedSize() const {
+  MetaWriter counter(false);
+  WriteSnapshot(counter);
+  return counter.size();
 }
 
 absl::StatusOr<MetaAuditStore> MetaAuditStore::Deserialize(

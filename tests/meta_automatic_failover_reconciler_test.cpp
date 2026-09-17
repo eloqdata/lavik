@@ -473,7 +473,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
       return absl::FailedPreconditionError(
           "test projection lacks the current Owner authority");
     }
-    // Exercise the same final projection/hash transformation as production so
+    // Exercise the same effective lease transformation as production so
     // detector tests can distinguish the effective lease from global Policy.
     if (absl::Status limited = detail::ApplyLeadershipValidityLimit(
             *projected, effective_lease_duration_ms);
@@ -502,7 +502,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
         .owner_node_id_ = *group->owner_node_id,
         .owner_assignment_id_ = *group->owner_assignment_id,
         .group_term_ = group->group_term,
-        .projection_hash_ = projected->full_state.projection_hash,
+        .control_revision_ = projected->full_state.control_revision,
         .authority_lease_duration_ms_ =
             projected->full_state.authority_lease_duration_ms,
     };
@@ -563,7 +563,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
         .owner_node_id_ = *group->owner_node_id,
         .owner_assignment_id_ = *group->owner_assignment_id,
         .group_term_ = group->group_term,
-        .projection_hash_ = projected->full_state.projection_hash,
+        .control_revision_ = projected->full_state.control_revision,
         .authority_lease_duration_ms_ =
             projected->full_state.authority_lease_duration_ms,
     };
@@ -618,7 +618,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
         observed->identity_, heartbeat_sequence,
         cluster::control::LeaseGranted{
             .data_boot_id = HexBytes(observed->identity_.boot_incarnation_),
-            .projection_hash = projection.projection_hash_,
+            .control_revision = projection.control_revision_,
             .group_id = projection.group_id_,
             .assignment_id = projection.owner_assignment_id_,
             .group_term = projection.group_term_,
@@ -1387,7 +1387,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
       cluster::control::LeaseGranted{
           .leadership_generation = replacement_owner.leadership_generation_,
           .data_boot_id = replacement_owner.boot_id_,
-          .projection_hash = replacement_owner.projection_hash_,
+          .control_revision = replacement_owner.control_revision_,
           .group_id = replacement_group.group_id_,
           .assignment_id = replacement_group.assignment_id_,
           .group_term = replacement_group.group_term_,
@@ -1536,7 +1536,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
       cluster::control::LeaseGranted{
           .leadership_generation = owner.leadership_generation_,
           .data_boot_id = owner.boot_id_,
-          .projection_hash = owner.projection_hash_,
+          .control_revision = owner.control_revision_,
           .group_id = group.group_id_,
           .assignment_id = group.assignment_id_,
           .group_term = group.group_term_,

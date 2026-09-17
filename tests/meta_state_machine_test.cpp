@@ -164,7 +164,7 @@ RegisterNode MakeRegister(std::uint8_t seed) {
   cmd.node_id_ = MakeNodeId(seed);
   cmd.principal_ = MakePrincipal(seed);
   cmd.endpoints_ = {"10.0.0.1:7000", "10.0.0.1:17000"};
-  cmd.capability_mask_ = 0x5;
+
   cmd.role_ = keylane::meta::MetaNodeRole::kReplica;
   return cmd;
 }
@@ -625,7 +625,7 @@ TEST_F(MetaStateMachineTest,
   EXPECT_EQ(committed_transition.target_term_, 2u);
   EXPECT_FALSE(committed_transition.candidate_action_.has_value());
 
-  const auto committed_grant = committed.grant_.GroupState(group_id);
+  const auto committed_grant = committed.topology_.AuthorityFor(group_id);
   ASSERT_TRUE(committed_grant.has_value());
   EXPECT_EQ(committed_grant->group_term_, 2u);
   EXPECT_FALSE(committed_grant->grant_.has_value());
@@ -644,7 +644,7 @@ TEST_F(MetaStateMachineTest,
   ASSERT_TRUE(restored_group->failover_transition_.has_value());
   EXPECT_EQ(*restored_group->failover_transition_, committed_transition);
   EXPECT_EQ(restored_group->record_.group_term_, 2u);
-  const auto restored_grant = restored.grant_.GroupState(group_id);
+  const auto restored_grant = restored.topology_.AuthorityFor(group_id);
   ASSERT_TRUE(restored_grant.has_value());
   EXPECT_EQ(restored_grant->group_term_, 2u);
   EXPECT_FALSE(restored_grant->grant_.has_value());

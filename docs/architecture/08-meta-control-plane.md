@@ -40,15 +40,14 @@ membership descriptor own the advertised routes, which may name explicit
 proxies rather than these local binds. Wildcard Admin binds and port zero are
 invalid.
 
-The state machine owns one `MetaStores` value containing seven committed
+The state machine owns one `MetaStores` value containing six committed
 stores:
 
 | Store | Durable responsibility |
 |---|---|
 | Identity | Data-node certificate principal bindings and retired identities; Meta-member principal bindings |
-| Topology | Single-Data-cluster lifecycle, Groups, membership, owners, epochs, manifest references, slot ranges, and one optional failover transition per Group |
+| Topology | Cluster lifecycle and Groups: membership, one term/owner, active authority and activation action, population references, slots, and failover transition |
 | Policy | Registered cluster-wide Policy families and their immutable consecutive raw JSON versions, exposed through typed current-value accessors |
-| Grant | One optional authority Grant per Group Term, activation actions, and fencing |
 | Operation | Idempotent operation lifecycle, current directives, durable terminal receipts, and exported/prunable terminal summaries |
 | Population manifest | Immutable, content-addressed partition/epoch documents and explicit pruning |
 | Audit | Log-index-ordered command verdicts in a bounded audit window |
@@ -57,12 +56,21 @@ stores:
 revision-checked commands and enforces cross-store invariants such as unique
 principals, one data group per node, monotonic terms and epochs, required
 current Policy families for a Created cluster, and valid authority/operation
-anchors. Each Group Term may install at most one Grant. Fencing advances to a
+anchors. Apply mutates the command's affected records under the state-machine
+write lock. Compound authority, failover, and operation/lifecycle transitions
+retain only those records for rollback until post-state validation succeeds;
+rejection restores them before the audit verdict or any read can observe the
+result. Neither individual stores nor the complete `MetaStores` aggregate are
+copied for apply. Apply checks domain capacities and task bounds without constructing or
+encoding a node projection. Snapshot-size admission uses count-only writers;
+network encoding belongs to the publisher. Topology owns authority directly
+inside each Group, with no separate Grant table or snapshot section. Read-only
+authority views derive their term and owner from that same Group. Each Group Term may install at most one Grant. Fencing advances to a
 fresh grantless term, so replacing or reauthorizing an Owner cannot reuse an
 authority identity. Group membership, owner, slot, population-
 manifest, partition-replication, and `UpdateNode` endpoint changes advance the
-cluster topology epoch. `SetSlotMap` validates a complete candidate before
-publication and rejects any slot ownership change involving an
+cluster topology epoch. `SetSlotMap` validates the command's slot map before
+mutation and rejects any slot ownership change involving an
 active grant. Every affected source and destination group must first be
 fenced, preventing a lease for the old projection from spanning the cut.
 An active Group failover transition locks its owner, membership, term,
@@ -76,12 +84,7 @@ incarnation from the OS CSPRNG; the topology store's bounded last-value index
 only catches direct replay. Non-terminal operations persist an optional
 replication-history binding but no Policy dependency; current cluster-wide
 Policy takes effect at its own family boundary rather than being copied into a
-Grant, Operation, or Failover Transition. Phase evidence is accepted only when
-its exact `(group, node, assignment)` membership incarnation, reporter boot,
-operation, group term, manifest, partition replication epoch, and history
-match committed facts. Those identity anchors remain in the durable evidence
-summary rather than being reconstructed from the node's membership at apply.
-Directive validity is a continuously maintained committed invariant, not only
+Grant, Operation, or Failover Transition. Directive validity is a continuously maintained committed invariant, not only
 an admission check. After every accepted command, apply deterministically
 rechecks each bounded live directive against the exact active source and
 target assignments, Group Term, and population
@@ -123,26 +126,23 @@ codec transports the bounded raw bytes and version, while `MetaPolicyStore`
 remains the one family-aware validation and typed-decoding Seam. Reads return
 the retained raw current version.
 
-The topology store also owns an independently revisioned cluster lifecycle:
+The topology store also owns the cluster lifecycle:
 `Uninitialized`, `Creating`, `Created`, or `ProvisioningFailed`. A Meta Raft
 cluster owns at most one logical Data cluster. The root Cluster Create
-`SubmitOperation` and `Uninitialized -> Creating` transition occur on
-candidate copies in one apply; root completion or abort similarly updates the
+`SubmitOperation` and `Uninitialized -> Creating` transition occur in
+one atomic apply delta; root completion or abort similarly updates the
 operation and terminal lifecycle together. These transitions do not advance
 the topology epoch. The topology record permanently retains the root operation
-id, Genesis commit index, terminal outcome, and a bounded non-sensitive failure
-summary, while the manifest remains only in the root operation during
+id, Genesis commit index, lifecycle state, and a bounded non-sensitive failure
+summary. The public lifecycle revision is derived as 0 for Uninitialized, 1 for
+Creating, and 2 for either terminal state; terminal outcome is also derived
+from that state, while the manifest remains only in the root operation during
 creation. Operation archive or pruning therefore cannot reopen creation.
 Snapshot decode requires `Creating` to name exactly one matching non-terminal
 root whose operation sequence equals the Genesis index; a missing or mismatched
 half is fail-stop corruption. Terminal lifecycle permits that root to be live,
 archived, or pruned. An `Uninitialized` snapshot containing Data-cluster
-artifacts remains decodable and is reported as `non-pristine`. The lifecycle is
-part of the topology-store durable format. Keylane is pre-release, so this
-format change has no migration path; older development data directories must be
-rebuilt. The Raft command/WAL envelope version also advances without adding a
-command tag, so a WAL-only directory containing the older opaque creation
-intent fails stop at decode rather than replaying a partial lifecycle.
+artifacts remains decodable and is reported as `non-pristine`.
 
 Each Group may own one independently revisioned optional
 `MetaFailoverTransition`. It durably records a transition id, controlled or
@@ -336,18 +336,18 @@ uncontrolled transition for an exactly unserviceable Owner.
 
 Owner Serviceability is one pure classification over a self-contained cut: the
 committed Owner, assignment, and Group Term; the current
-authenticated session generation and boot; the FDS installed on that session;
+authenticated session generation and boot; the local control installed on that session;
 TTL freshness, draining, storage and population health; and causal lease
 confirmation. The exact Unserviceable reason precedence is `session_missing`,
 `heartbeat_expired`, `draining`, `storage_unready`, then
 `population_unready`. A mismatched session/boot identity or an unjoinable
 runtime/observation cut is Indeterminate until a coherent cut arrives; the
 detector does not manufacture failure from elapsed time when the possible
-lease deadline is unknown. For an exact session, an old FDS anchor or a valid
+lease deadline is unknown. For an exact session, an old local control anchor or a valid
 grant Ack not yet causally confirmed is Indeterminate only while its known
 possible Authority Lease remains inside that installed projection's effective
 duration. Known expiry becomes `heartbeat_expired` even if the committed and
-runtime FDS have already advanced. The observation store retains that old
+runtime local control have already advanced. The observation store retains that old
 effective duration with the same atomic heartbeat cut, starts its finite
 causal-progress interval at the first heartbeat for an exact session and Owner
 projection, and refreshes it only when a strictly higher granted Ack is
@@ -362,14 +362,14 @@ maximum unconfirmed deadline for the same Owner authority across projection
 or duration replacement. Confirmation of
 the latest ordered Grant collapses older possibilities into that exact
 installed window; the installed window itself survives later same-authority
-FDS replacement. A session/boot, Owner, assignment, or Group Term change
-clears both. Thus a Policy/FDS replacement cannot erase a lease
+local control update. A session/boot, Owner, assignment, or Group Term change
+clears both. Thus a Policy/local control update cannot erase a lease
 Data may still retain, while confirmation of a shorter replacement Grant does
 not unnecessarily preserve an older longer deadline.
 
 The handoff-pending denial is likewise recorded before its first send and bound
 to the exact session, authority, and heartbeat sequence. It survives a
-same-authority FDS replacement that clears projection-local runtime status. A
+same-authority local control update that clears projection-local runtime status. A
 Grant attempt proves the suspend-aware handoff deadline elapsed and clears the
 marker. An unhealthy exact challenge is passed through the same guard before
 Meta publishes `NodeNotReady`, so a same/newer successfully written health
@@ -413,52 +413,51 @@ for a manual uncontrolled Begin. Demotion cancels and joins detector timers,
 pending proposals, and validation admissions; a replacement leader never
 inherits SUSPECT time.
 
-`MetaControlProjector` is a pure function over one atomic committed view. It
-produces a canonical node-specific `FullDesiredState`: the global Meta/Data
-directories and topology, each group's partition replication epoch, the
-resolved Authority Lease duration, referenced population manifests, the
-optional Group failover transition and grant activation action, the complete
-steady owner/membership relationship, and live directives whose explicit
-recipient is that node. Each Group's
-`steady_replication_enabled` bit
-is true only when the committed cluster lifecycle is `Created`; Genesis leaves
-explicit population directives as the sole ingress owner. Data defers the
-projected follow-owner relationship while an active transition or a current
-local initialize/rebuild directive owns ingress and consumes a later complete
-projection after that owner disappears. Controlled operation id/deadline
-remains Meta-only. Policy ids, versions, and raw documents never cross this
-wire seam. The source applied index is an
-ordering/diagnostic watermark; SHA-256 of the canonical semantic projection is
-the dependency used by leases and directives. The projector takes the current
-typed Authority Lease Policy, the leader publisher may only reduce its
-duration to the local leadership-validity bound, and that effective duration
-is covered by the projection hash and validated by Data. Data derives the
-heartbeat interval deterministically as `max(1 ms, duration / 3)`; cadence is
-not an independently encoded FDS scalar. The publisher sends a full projection
-on session acceptance and whenever that hash changes. Control
-protocol v1 has no delta format, so an index advance with identical content
-does not create network
-churn and a reconnect never depends on retained incremental history.
-Superseding an incomplete node projection is an object-local FDS abort and
-retry on the same authenticated session. If a direct FDS or streamed
-`TransferEnd` is already visible, the publisher first consumes that
-projection's exact `FullStateApplied` and adopts it as the session's real
-baseline before retrying the newest projection. Only the named abort for the
-matching active FDS object is non-terminal; an unknown reason, wrong object
-kind, or mismatched object fails closed. This keeps ordinary projection churn
-out of candidate-disconnect semantics without weakening real session-loss
-handling.
+`MetaControlProjector` reads one atomic committed view. Initial connection and
+reconnection receive a complete `FullDesiredState` containing cluster discovery,
+Group state, referenced manifests, resolved lease duration, and the recipient's
+current tasks. Data selects its own control state and releases that input.
+It retains global routes and endpoints, only its local Group's assignments,
+population manifest and failover control, the Meta directory, and its tasks.
+Remote Group execution details have no Data-side owner.
 
-Control v1 is unreleased and its schema is replaced in place. Data and Meta
-must use matching layouts; a Policy-bearing FDS, missing resolved lease,
-missing Hello flow counts, and untyped rebuild payloads fail validation rather
-than being inferred or defaulted locally.
+Established sessions receive `NodeControlUpdate`. Routing, local Group control,
+and the Meta directory are complete objects with independent session revisions;
+tasks use a base/revision delta of upserts and removals. Only changed objects
+are sent. A remote rebuild or candidate preparation that leaves routes unchanged
+produces no update for this node. Revisions advance only for the affected object;
+the bootstrap seed does not require Data to follow Meta's Raft applied index.
+A task body is delivered once in bootstrap or an upsert and enters execution
+directly, without another full Directive message. Group Term, assignment,
+manifest/partition epochs, action and attempt identities retain their own
+business scopes. The local control revision binds lease challenges and fencing;
+request IDs correlate update acknowledgements, not state versions.
+
+Complete objects ignore older revisions and reject conflicting equal revisions.
+A task delta requires its base revision or an identical replay; a gap closes
+the session and bootstrap restores current state. Data validates the selected
+state before installation. Routing-only updates preserve local execution,
+source exports, population readiness and finite leases. Local control or task
+changes quiesce heartbeat/control work and reconcile before acknowledgement.
+Data derives heartbeat cadence as `max(1 ms, resolved lease duration / 3)`.
+Policy documents and versions remain Meta-owned. `steady_replication_enabled`
+is true only for a Created cluster; explicit population or failover work
+otherwise owns local replication ingress.
+
+Fencing and large-object publication share the serialized priority writer.
+An incomplete superseded update is aborted by object ID and retried within the
+session. Once Data can apply a direct update or completed transfer, Meta consumes
+its exact acknowledgement and adopts that intermediate baseline before retrying.
+A partial transfer never changes Data control state. Reconnection starts from
+fresh bootstrap and does not depend on retained delta history. Protocol v1
+layouts evolve in place for fresh clusters, without migration or mixed-version
+negotiation.
 
 The Data-control wire protocol has a fixed versioned header, per-direction
 sequence, payload length, and CRC32C. Frames are bounded to 16 KiB. Larger
-objects use Start/Chunk/End with a declared total length and SHA-256; desired
-state is capped at 512 MiB and individual opaque directive, result, or
-operation-evidence fields at 256 KiB. These are defensive ceilings rather than
+objects use Start/Chunk/End with object identity, ordered offsets, and a
+declared total length; desired state is capped at 512 MiB and individual
+opaque directive or result fields at 256 KiB. These are defensive ceilings rather than
 expected object sizes:
 16 KiB keeps small authority messages atomic and bounds per-frame latency;
 256 KiB equals the durable Meta payload-field cap; and the 512 MiB hard ceiling
@@ -471,9 +470,11 @@ and disabled socket read-ahead keep each session's memory ownership explicit.
 Only one complete-object transfer is active in a direction at a time; queued
 transfers retain shared ownership of their encoded bytes, so Start/Chunk/End
 sequences cannot interleave or outlive their payload storage.
-Projection and directive-set validation stream their canonical encodings into
-SHA-256 and retain only a bounded vector of directive references; they never
-materialize a normalized FDS or one encoded buffer per directive. Receive-side
+FDS and object transfers carry no whole-object content hash. Frame CRC32C
+checks accidental transport corruption; mutual TLS authenticates the channel
+and protects transmitted records. Session identity, local control revision, Group Term,
+and assignment enforce message freshness and authority. Structural validation
+does not allocate another projection-sized encoded buffer. Receive-side
 parsing necessarily overlaps the accumulated wire bytes with the owning
 decoded fields, so the 512 MiB value is a protocol abuse ceiling rather than a
 512 MiB process-memory promise. The consuming decoder releases the wire buffer
@@ -502,13 +503,16 @@ owner unregisters the task and releases the borrow after body-local Connection
 users have unwound. Shutdown, demotion, or a watchdog may retire the transport
 immediately, but Celer cannot reclaim the borrowed storage while suspended
 session code can still resume and dereference it.
-Those per-node objects also share one weighted 2 GiB projection budget derived
+The full projection batches share one weighted 2 GiB budget derived
 as two overlapping generations times encoded-plus-decoded 512 MiB size
 classes. Each build reserves the encoded/decoded pair before projection and
 then adjusts to the batch's actual retained string/vector capacities. The
 permit follows shared ownership through transfer and live installation, so
 4096 small sessions remain possible while a few abuse-sized projections cannot
 multiply common topology and manifest data into a TiB-scale allocation.
+The selected per-session state and temporary update objects are additional
+allocations bounded by the protocol's object limits; the batch budget is not
+a limit on total process memory.
 
 Heartbeat is the periodic Data-to-Meta observation message. Protocol v1 carries
 common health followed by exactly one tagged steady-state role payload: no role
@@ -522,7 +526,7 @@ of heartbeat `N+1` is causal confirmation of Ack `N`. Meta retains that proof
 only when `N` granted a nonzero lease for the same authenticated session/boot
 and exact installed Owner projection, assignment, and Group Term.
 Ack write completion alone is not confirmation. Data
-quiesces heartbeat projection reads during an FDS replacement. Any outstanding
+quiesces heartbeat projection reads during a local control update. Any outstanding
 ack for the old object is consumed without applying its lease decision, and
 production resumes only after the new object is acknowledged, so a prior
 projection cannot causally confirm the replacement authority.
@@ -554,20 +558,20 @@ node and assignment, and the current authenticated session's boot and history.
 Meta admits this exception only while the uncontrolled transition and fenced
 grantless state are both committed; active-grant owners and any mismatched
 term, assignment, boot, or history remain ineligible.
-Meta derives role from committed FDS facts rather than trusting the tag, and
+Meta derives role from committed local control facts rather than trusting the tag, and
 replaces common health plus candidate state under one observation-store lock.
 An authority/no-role heartbeat, or rejected candidate, clears any older
 candidate for that node. Session teardown also withdraws the exact
 generation's candidate immediately; a stale teardown cannot clear evidence
 from a replacement generation.
 The same atomic replacement stores the exact candidate-action basis from the
-FDS installed on that authenticated session: group term, transition revision,
+local control installed on that authenticated session: group term, transition revision,
 action, assignment, and boot. The failover planner treats a role omission or
 different candidate as terminal only when that basis matches the current
 unauthorized action. A heartbeat from an older or unknown projection remains
 warmup evidence, so `BeginUncontrolledFailover` cannot invalidate its
 preselected candidate merely by advancing the committed term before the new
-FDS arrives. Authorization may temporarily suppress the ordinary role during
+local control update arrives. Authorization may temporarily suppress the ordinary role during
 Data history rotation; thereafter only Prepared, typed ActionFailed, the
 action watchdog, or disconnect resolves the attempt.
 Challenges name the exact projection and complete group authority anchor.
@@ -598,7 +602,7 @@ session is active; accumulated suspend divergence of at least
 requests immediate NuRaft resignation. In a multi-member cluster the old
 generation cannot become eligible again. NuRaft intentionally keeps a sole
 member leader, so that case must instead run for another full `D` of active
-time; a further suspend restarts the wait. Live FDS boundaries, directives,
+time; a further suspend restarts the wait. Live control boundaries, directives,
 result proposals, and grants all pass this barrier. It covers the same-identity
 case whose ordinary `2D` handoff entry matured before suspension.
 
@@ -609,27 +613,27 @@ The common assignment field always names the target membership incarnation;
 the durable directive carries a separate source assignment and the committed
 partition replication epoch. Both must exactly match committed topology and
 the installed group view.
-The durable and wire codecs keep bounded `payload`, `preconditions`, and
-`force` fields. V1 uses `payload` for `initialize-empty-population`, where it
+The durable and wire codecs retain only the kind-specific bounded `payload`.
+Mutation classification follows directive kind, so it cannot disagree with a
+sender-supplied flag. V1 uses `payload` for `initialize-empty-population`, where it
 carries the target Data session's authenticated replication-history id.
 `rebuild` and `authorize-source` share a versioned payload containing the source
 flow count advertised with its boot/history in `ClientHello`. Meta commits that
 layout in both directives; projection and replay never infer it from the
 recipient's workers or a newer source session. Source authorization and the
 native target handshake both check it against the actual source layout.
-`revoke-sources` requires both fields empty, and all kinds require
-`force=false`.
+`revoke-sources` requires an empty payload.
 Meta transition apply and Data admission reject malformed or misplaced bodies,
 so the replication adapter cannot silently ignore a predicate or override.
 Operation, durable directive, execution attempt, and assignment-incarnation
 identities remain distinct. Assignment ids are proposer-generated
 128-bit values that are never reused across incarnations; the topology store
 retains the most recent value per node to reject direct remove/re-add replay
-without growing an unbounded historical set. Accepted, Started, and Completed
-receipts are session observations. A pre-start controller rejection omits
-Started and moves directly from Accepted to Completed; Meta requires its result
-status to be rejected. Once Started was observed, a non-success result is an
-execution failure rather than a rejection. The terminal result is authoritative
+without growing an unbounded historical set. `DirectiveResponse` reports whether the exact idempotent request started.
+A pre-admission failure produces a rejected result; failure after admission is
+an execution failure. There is no retained receipt-stage state machine, and
+Meta does not require a progress response before accepting a final result.
+The terminal result is authoritative
 only after Meta commits an exact `MetaTerminalReceipt` through Raft and responds
 `ResultCommitted`. That first commit advances the live operation revision, so
 an already-issued phase mutation cannot pass its old CAS after the terminal
@@ -645,23 +649,14 @@ immutable history and an exact retry still resolves to its original commit
 index after the authority later advances. Terminal receipts are pruned only
 through an explicit replicated command after the retry-retention window.
 
-Data sends typed `OperationEvidence` when directive execution starts and
-completes. The envelope carries the session and boot, exact reporter
-assignment, operation, population and history anchors, phase, and the bounded
-evidence body. A report that fits one frame uses the soft lane; a larger
-report uses the `ObservationEvidence` Start/Chunk/End transfer with a bounded
-256 KiB body plus envelope. Meta validates the schema before admission;
-streamed transfers additionally validate their whole-object digest. A report
-that is structurally valid but stale against the latest committed view is
-audited and discarded without disrupting an
-otherwise current authority session; malformed session, boot, or framing
-closes it.
+Generic operation evidence has no wire type, observation cache, phase-command
+field, or durable summary. Optional progress has explicit business semantics.
 
-Failover does not use operation evidence or terminal receipts. Its three typed
+Failover uses its Group transition rather than directive terminal receipts. Its three typed
 heartbeat observations are volatile inputs to a typed transition command. The
 Raft cutover command, not observation receipt, is the boundary between
 Data-local preparation and action-bound activation. A control stream may remain
-connected across it, but Data must consume the later committed FDS and a valid
+connected across it, but Data must consume the later committed local control and a valid
 finite lease; no single RPC crosses the commit point on Meta's behalf.
 
 `MetaObservationStore` is deliberately outside `MetaStores`: it is volatile,
@@ -680,16 +675,10 @@ The compatibility `history` field remains reporter-local; the internal
 selector uses the separately stored source assignment, boot, and history.
 Failover source/action observations additionally match the exact live
 transition identity, candidate action where applicable, reporter incarnation,
-and population anchors. Operation evidence for directive-based workflows also
-matches the committed operation and its replication-history binding. The
-typed candidate/evidence query results include the authenticated reporter boot
-alongside node and assignment, so a reconciler never joins a payload to a
-second session lookup that could cross a reconnect. The canonical evidence-
-summary conversion copies that complete reporter incarnation. Operation
-evidence's committed anchors are rechecked deterministically when embedded in
-an operation-phase command, closing the race between leader-local validation
-and Raft apply. A committed epoch-only change therefore invalidates old
-candidate and operation evidence even when term and manifest do not move.
+and population anchors. Typed candidate and failover query results retain the authenticated reporter
+boot alongside assignment, so reconciliation does not race a second session
+lookup. A committed population-epoch change invalidates older observations
+even when term and manifest do not move.
 Committed changes proactively purge stale evidence,
 and queries filter again against one current committed snapshot. Startup and
 each entered leader epoch clear soft state; every observed follower edge clears
@@ -698,16 +687,16 @@ leader edge is already waiting behind it.
 
 Soft-state memory is bounded independently of its field validators. The store
 admits at most the committed node-domain cap of 4096 session keys and candidate
-reporters per group, at most 1024 evidence phases per reporter and per operation
-(the durable operation-evidence cap), and at most 65,536 total observations.
+reporters per group and at most 65,536 total observations.
 Using the full node-domain bound for candidates avoids making report arrival
 order an implicit member-selection policy. Exact logical byte accounting covers
 retained variable fields and their lookup-key copies: the global 68 MiB budget
 is one direct frame plus identifier allowance per maximum node, while a node's
-289 KiB share holds one maximum streamed evidence object, one heartbeat frame,
-and its index allowance. Replacement, generation purge, revalidation, TTL
+17 KiB share holds one maximum heartbeat frame and its index allowance. Replacement, generation purge, revalidation, TTL
 expiry, and leader reset update the same counters. Ordinary diagnostic
 ingestion keeps its previous latest-wins value on capacity rejection.
+Rejecting diagnostic health text does not discard the heartbeat's fixed-size
+typed owner health used for serviceability.
 Heartbeat candidate replacement is stricter: it clears old role evidence
 before admitting the replacement. Soft state cannot grant or restore
 authority.
@@ -826,48 +815,36 @@ the operation's stable idempotency key.
 
 ## Format compatibility
 
-The Meta/Data control wire uses protocol v1 with the current pre-release
-layout. FDS carries the resolved Authority Lease duration; Data derives its
-heartbeat interval as `max(1 ms, duration / 3)`. Stop-and-wait heartbeat
-sequencing supplies the causal Ack confirmation used by Owner Serviceability.
-Both peers must use the same layout; earlier Policy-bearing layouts have no
-compatibility or negotiation path. This wire version is independent of the
-durable schemas below.
+The Meta/Data control wire, commands, stores, records, operation intents,
+exports, snapshots, physical segmented WAL, Admin binary payloads, and
+cluster-status JSON schema use their current v1 layouts. Before Keylane's
+first stable release, development layouts are replaced in place for fresh
+clusters without a legacy decoder, migration, or mixed-layout negotiation.
+Equal markers do not make earlier development state interchangeable.
 
-Commands, stores, records, operation intents, exports, snapshots, and the
-physical segmented WAL carry exact v1 format markers. Admin binary payloads
-and the cluster-status JSON schema also use v1. Before Keylane's first stable
-release, these development schemas are replaced in place without a legacy
-decoder or mixed-layout negotiation. Equal markers do not make earlier
-development state interchangeable.
-Policy snapshots retain only registered-family raw histories and
-typed-decodable current values.
+The aggregate snapshot contains six stores. Each Topology Group stores its
+single term/owner, authority-active bit, and optional activation action.
+Operation records and phase commands contain no evidence summaries. Policy
+snapshots retain registered-family raw histories and typed-decodable current
+values.
 
-Every configured Meta identity has one canonical concrete numeric
-Data-control endpoint and one canonical concrete numeric Admin endpoint. The
-NuRaft `srv_config::aux` `KMI1` descriptor carries the server id, derived
-principal, and both endpoints; Raft keeps its endpoint in the native field.
-The descriptor and committed identity binding must agree exactly. Advertised
-Data-control and Admin addresses may route through an explicit proxy instead
-of equaling their local process binds; restart can likewise rebind a Raft
-listener behind a transport proxy without changing its durable advertised
-endpoint. Endpoints are immutable, unique within their
-respective directories, and change only through retirement and replacement
-with a fresh server id. Partial member descriptors are rejected rather than
-migrated. Durable operation evidence includes its exact group id, reporter
-assignment and boot, population identity, history, and operation id. These
-summaries retain identity
-anchors, not a fingerprint of the discarded observation body. Snapshot decoding
-rejects malformed identity anchors and evidence that names a missing group or an
-impossible future group/population epoch; older committed evidence remains
-valid history after a group legitimately advances or the reporter moves.
+Every configured Meta identity has one canonical concrete numeric Data-control
+endpoint and one canonical concrete numeric Admin endpoint. NuRaft's
+`srv_config::aux` `KMI1` descriptor carries the server id, derived principal,
+and both endpoints; Raft keeps its endpoint in the native field. The descriptor
+and committed identity binding must agree exactly. Advertised Data-control and
+Admin addresses may route through an explicit proxy instead of equaling local
+binds; restart may likewise rebind a Raft listener behind a transport proxy
+without changing its durable advertised endpoint. Endpoints are immutable and
+unique within their respective directories, and change only through retirement
+and replacement with a fresh server id. Recovery validates descriptors and the
+committed directory together; partial descriptors are rejected.
 
-Incompatible development data directories are recreated rather than migrated.
-Keylane Meta does not negotiate durable formats between mixed binary versions
-and has no in-band schema-switch command. Incompatible changes require
-coordinated replacement of the Meta cluster. Readers reject unknown markers,
-malformed fields, and trailing bytes, including in the segmented WAL; these
-checks do not guarantee detection of every incompatible same-marker layout.
+Incompatible development data directories are recreated. Meta has no in-band
+schema-switch command; incompatible changes require coordinated replacement
+of communicating binaries. Readers reject unknown markers, malformed fields,
+and trailing bytes, including in the segmented WAL; these checks cannot detect
+every incompatible same-marker layout.
 
 ## Authentication, membership, and audit
 
@@ -1174,7 +1151,7 @@ byte-for-byte, including their original revisions, and add the matching
 checks the retained authorization's exact receipt before sending a rebuild.
 Source authority therefore remains logically current throughout target
 initialization, including Meta replay between the two phases. Data clears the
-runtime capabilities at each FDS boundary, but the FDS-projected replay count
+runtime capabilities at each local execution update, but the selected task replay count
 temporarily reserves their source history and makes an early target handshake
 retryable until the exact level-triggered capabilities are restored. Rebuild
 completion means the existing replication manager has activated the population

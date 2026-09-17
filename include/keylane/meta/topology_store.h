@@ -24,26 +24,23 @@
 //     carries new_topology_epoch (group lifecycle/membership, endpoint,
 //     replication state, slot map, authority activation, and failover cutover
 //     through the granular primitives) must carry exactly current + 1.
-//   - Cluster lifecycle has an independent revision. Only Uninitialized may
-//     enter Creating; Created and ProvisioningFailed are terminal. These
-//     transitions do not advance topology_epoch. The root operation id and
+//   - Cluster lifecycle's public revision is derived from its state. Only
+//     Uninitialized may enter Creating; Created and ProvisioningFailed are
+//     terminal. These transitions do not advance topology_epoch. The root
+//     operation id and
 //     Genesis commit index remain after operation archive/prune, so duplicate
 //     creation rejection never depends on operation retention.
 //   - Slot map is absolute: SetSlotMap replaces the whole map; ranges must be
 //     in bounds [0, kMetaSlotCount) and pairwise non-overlapping, and every
 //     referenced group must exist. Partial coverage is legal (unassigned
 //     slots have no owner); an empty range list clears the map. Whether a
-//     changed slot owner is covered by an active grant is a cross-store fact:
-//     MetaStateApply rejects that transition until every affected group is
-//     fenced.
-//   - MetaGroupRecord fields (owner, group_term,
-//     population manifest revision/digest, partition_replication_epoch)
-//     change ONLY through the granular primitives below.
-//     The term/grant semantics and the atomicity of owner switches (failover /
-//     ActivateAuthority) span the grant store and are orchestrated by the
-//     apply dispatcher. The primitives therefore validate group existence and
-//     absolute-value/idempotency only; ordering rules (term raised once via
-//     BeginGroupTerm and authority installation) live in the grant layer.
+//     changed slot owner is covered by active Group authority is checked by
+//     MetaStateApply, which rejects the transition until every affected group
+//     is fenced.
+//   - Each Group owns one term and owner plus its authority-active state.
+//     BeginGroupTerm fences and advances the term; ActivateAuthority changes
+//     owner and installs authority together. Aggregate epoch, membership and
+//     identity checks remain in ApplyCommitted.
 //   - Membership does not cascade: removing the node named by record.owner_
 //     from the member table leaves owner_ untouched. The apply dispatcher
 //     reads the fact and decides.
@@ -83,6 +80,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "keylane/meta/commands.h"
+#include "keylane/meta/encoding.h"
 
 namespace keylane::meta {
 
@@ -98,20 +96,18 @@ enum class MetaClusterLifecycle : std::uint8_t {
   kProvisioningFailed = 3,
 };
 
-enum class MetaClusterTerminalOutcome : std::uint8_t {
-  kNone = 0,
-  kCreated = 1,
-  kProvisioningFailed = 2,
-};
-
 struct MetaClusterLifecycleState {
   MetaClusterLifecycle state_ = MetaClusterLifecycle::kUninitialized;
-  std::uint64_t revision_ = 0;
   MetaOperationId root_operation_id_{};
   std::uint64_t genesis_commit_index_ = 0;
-  MetaClusterTerminalOutcome terminal_outcome_ =
-      MetaClusterTerminalOutcome::kNone;
   std::string failure_summary_;
+  // The one-shot lifecycle has no independent revision: initial, creating,
+  // and either terminal state are generations 0, 1, and 2 respectively.
+  std::uint64_t Revision() const {
+    return state_ == MetaClusterLifecycle::kUninitialized ? 0
+           : state_ == MetaClusterLifecycle::kCreating    ? 1
+                                                          : 2;
+  }
   bool operator==(const MetaClusterLifecycleState&) const = default;
 };
 
@@ -135,9 +131,26 @@ struct MetaTopologyGroupView {
   bool operator==(const MetaTopologyGroupView&) const = default;
 };
 
+// Derived authority query views; neither is separately persisted.
+struct MetaActiveAuthorityView {
+  std::string owner_;  // node_id
+  // Set only by failover cutover. Data activation must match this committed
+  // action to the boot-local prepared context; ordinary authority activation
+  // clears it.
+  std::optional<MetaFailoverActionId> activation_action_id_;
+  bool operator==(const MetaActiveAuthorityView&) const = default;
+};
+
+// Read-only view of one group's term/grant state (fact query result).
+struct MetaGroupAuthorityView {
+  std::uint64_t group_term_ = 0;
+  std::optional<MetaActiveAuthorityView> grant_;  // absent == fenced
+  bool operator==(const MetaGroupAuthorityView&) const = default;
+};
+
 class MetaTopologyStore {
  public:
-  // Cluster creation has its own revision and never advances topology_epoch.
+  // Cluster creation never advances topology_epoch.
   // Exact calls replay as no-ops; Created and ProvisioningFailed are terminal.
   absl::Status BeginClusterCreate(const MetaOperationId& root_operation_id,
                                   std::uint64_t genesis_commit_index);
@@ -157,15 +170,8 @@ class MetaTopologyStore {
   absl::Status Apply(const SetSlotMap& cmd);
   absl::Status Apply(const SetGroupReplicationState& cmd);
 
-  // Granular primitives for the apply dispatcher (e.g. orchestrating
-  // ActivateAuthority atomically with the grant store). Each validates that
-  // the group exists; setting the value the field already holds is an
-  // idempotent no-op accept. SetTopologyEpoch requires exactly current+1 (or
-  // current, idempotently). Any cross-store rule (grant consistency, term
-  // semantics, epoch coupling) is enforced by the caller, not here.
-  absl::Status SetOwner(const std::string& group_id,
-                        const std::string& new_owner);
-  absl::Status SetGroupTerm(const std::string& group_id, std::uint64_t term);
+  // Granular population/epoch updates participate in ApplyCommitted's
+  // cross-record validation. SetTopologyEpoch accepts current or current + 1.
   absl::Status SetPopulationManifest(const std::string& group_id,
                                      std::uint64_t manifest_revision,
                                      const MetaHash256& manifest_digest);
@@ -199,6 +205,22 @@ class MetaTopologyStore {
   // Accepts current (replay) or current+1 (fresh apply).
   absl::Status ValidateTopologyEpoch(std::uint64_t new_topology_epoch) const;
 
+  // Group authority shares record_.group_term_/owner_. Advancing term fences
+  // while retaining the last owner for replication; each term activates once.
+  absl::Status BeginGroupTerm(const keylane::meta::BeginGroupTerm& command);
+  absl::Status ValidateActivate(const keylane::meta::ActivateAuthority& command,
+                                std::optional<MetaFailoverActionId>
+                                    activation_action_id = std::nullopt) const;
+  // Validates and atomically installs owner and active authority in this Group.
+  // Aggregate membership/identity/epoch checks remain with ApplyCommitted.
+  absl::Status ActivateAuthority(
+      const keylane::meta::ActivateAuthority& command,
+      std::optional<MetaFailoverActionId> activation_action_id = std::nullopt);
+  std::optional<MetaGroupAuthorityView> AuthorityFor(
+      std::string_view group_id) const;
+  std::optional<std::uint64_t> CurrentGroupTerm(
+      std::string_view group_id) const;
+
   // Fact queries.
   std::uint64_t TopologyEpoch() const { return topology_epoch_; }
   std::optional<MetaTopologyGroupView> FindGroup(
@@ -217,11 +239,19 @@ class MetaTopologyStore {
   // including invariant violations inside the bytes (node in two groups,
   // slot run out of bounds/overlapping/referencing an unknown group).
   std::string Serialize() const;
+  // Exact durable size without allocating or copying snapshot bytes.
+  std::uint64_t SerializedSize() const;
   static absl::StatusOr<MetaTopologyStore> Deserialize(std::string_view bytes);
 
  private:
+  friend class MetaTopologyTestAccess;
+  void WriteSnapshot(MetaWriter& writer) const;
+  friend class MetaApplyRollback;
+
   struct GroupState {
     MetaGroupRecord record_;
+    bool authority_active_ = false;
+    std::optional<MetaFailoverActionId> activation_action_id_;
     std::optional<MetaFailoverTransition> failover_transition_;
     std::uint64_t revision_ = 0;
     struct MemberState {

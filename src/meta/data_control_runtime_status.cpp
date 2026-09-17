@@ -36,10 +36,9 @@ std::vector<MetaDataControlRuntimeGroup> ProjectedGroups(
 void ApplyProjection(MetaDataControlRuntimeNode& node,
                      std::uint64_t validated_committed_high_water,
                      const cluster::control::FullDesiredState& projection) {
-  node.source_meta_applied_index_ = projection.source_meta_applied_index;
   node.validated_committed_high_water_ = validated_committed_high_water;
   node.topology_epoch_ = projection.topology_epoch;
-  node.projection_hash_ = projection.projection_hash;
+  node.control_revision_ = projection.control_revision;
   node.groups_ = ProjectedGroups(node.node_id_, projection);
   // A replacement invalidates observations and a previous lease until a
   // heartbeat under the new projection is successfully acknowledged.

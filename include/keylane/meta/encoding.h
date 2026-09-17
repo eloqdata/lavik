@@ -118,7 +118,8 @@ MetaFailureClass MetaFailureClassOf(const absl::Status& status);
 
 class MetaWriter {
  public:
-  MetaWriter() = default;
+  explicit MetaWriter(bool retain_bytes = true) : retain_bytes_(retain_bytes) {}
+  std::uint64_t size() const { return size_; }
 
   void WriteU8(std::uint8_t v);
   void WriteU16(std::uint16_t v);
@@ -157,6 +158,8 @@ class MetaWriter {
 
  private:
   std::string buffer_;
+  bool retain_bytes_;
+  std::uint64_t size_ = 0;
 };
 
 // ---------------------------------------------------------------------------

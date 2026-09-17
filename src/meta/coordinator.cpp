@@ -158,7 +158,7 @@ bool MetaStoresFacts::IsActiveNode(std::string_view node_id) const {
 
 uint64_t MetaStoresFacts::CurrentGroupTerm(std::string_view group_id) const {
   // Conservative "unknown" per the MetaCommittedFacts contract: 0.
-  return stores_.grant_.CurrentGroupTerm(group_id).value_or(0);
+  return stores_.topology_.CurrentGroupTerm(group_id).value_or(0);
 }
 
 uint64_t MetaStoresFacts::CurrentPopulationManifestRevision(
@@ -208,7 +208,7 @@ bool MetaStoresFacts::MayReportFencedOwnerCandidate(
     const MetaCandidateProgressObs& candidate) const {
   const auto group =
       stores_.topology_.FindGroup(std::string(candidate.group_id_));
-  const auto grant = stores_.grant_.GroupState(candidate.group_id_);
+  const auto grant = stores_.topology_.AuthorityFor(candidate.group_id_);
   if (!group.has_value() || !grant.has_value() ||
       !group->failover_transition_.has_value() ||
       group->failover_transition_->mode_ != MetaFailoverMode::kUncontrolled ||
@@ -229,25 +229,7 @@ bool MetaStoresFacts::MayReportFencedOwnerCandidate(
       });
 }
 
-bool MetaStoresFacts::OperationNonTerminal(const MetaOperationId& id) const {
-  // Archived tombstones resolve to terminal summaries, so only a live
-  // non-terminal record answers true.
-  const auto record = stores_.operation_.FindOperation(id);
-  if (!record.has_value()) return false;
-  return record->lifecycle_ == MetaOperationLifecycle::kSubmitted ||
-         record->lifecycle_ == MetaOperationLifecycle::kRunning;
-}
 
-bool MetaStoresFacts::HistoryBoundToOperation(
-    const MetaOperationId& id,
-    const MetaReplicationHistoryId& history_id) const {
-  const auto record = stores_.operation_.FindOperation(id);
-  return record.has_value() &&
-         std::any_of(record->replication_history_id_.begin(),
-                     record->replication_history_id_.end(),
-                     [](std::uint8_t byte) { return byte != 0; }) &&
-         record->replication_history_id_ == history_id;
-}
 
 bool MetaStoresFacts::IsCurrentFailoverCandidate(
     std::string_view node_id, const MetaBootIncarnation& boot_id) const {
@@ -561,29 +543,18 @@ absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
       }
     }
 
-    const auto before_grant = stores.grant_.Serialize();
-    if (!before_grant.ok()) {
-      return absl::InternalError(
-          "meta: cannot evaluate fail-safe failover authority state");
-    }
     MetaStores candidate = stores;
     const MetaApplyResult applied = ApplyCommitted(
         candidate, applied_index + 1, command, actor_principal, readable_time);
     const auto after_operation =
         candidate.operation_.FindOperation(abort->operation_id_);
-    const auto after_grant = candidate.grant_.Serialize();
-    if (!after_grant.ok()) {
-      return absl::InternalError(
-          "meta: cannot evaluate fail-safe failover authority state");
-    }
     if (applied.verdict_ != MetaAuditVerdict::kAccepted ||
         !after_operation.has_value() ||
         after_operation->lifecycle_ != MetaOperationLifecycle::kAborted ||
         after_operation->revision_ != before_operation->revision_ + 1 ||
         after_operation->terminal_result_ != abort->reason_ ||
         after_operation->data_loss_possible_ ||
-        candidate.topology_.Serialize() != expected_topology.Serialize() ||
-        *after_grant != *before_grant) {
+        candidate.topology_.Serialize() != expected_topology.Serialize()) {
       return IneffectiveFailSafeRecovery(
           "AbortControlledFailover does not exclusively terminalize its "
           "operation and optional transition");

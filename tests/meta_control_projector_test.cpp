@@ -17,6 +17,7 @@
 #include "keylane/meta/policy_store.h"
 #include "keylane/meta/population_manifest_store.h"
 #include "keylane/meta/state_apply.h"
+#include "meta_topology_test_access.h"
 
 namespace {
 
@@ -251,7 +252,6 @@ Fixture CompleteFixture(std::string operation_kind = "population-rebuild") {
   directive.partition_replication_epoch_ = 1;
   directive.kind_ = "rebuild";
   directive.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
-  directive.storage_mutating_ = true;
 
   keylane::meta::TransitionOperationPhase transition;
   transition.request_id_ = Bytes<16>(0x1d);
@@ -261,13 +261,6 @@ Fixture CompleteFixture(std::string operation_kind = "population-rebuild") {
   fixture.directive_revision = index;
   Commit(fixture.stores, index++, transition);
   return fixture;
-}
-
-bool NonZero(const control::WireHash256& hash) {
-  for (const std::uint8_t byte : hash) {
-    if (byte != 0) return true;
-  }
-  return false;
 }
 
 TEST(MetaControlProjector, ProjectsRegisteredNodeBeforeAnyGroupExists) {
@@ -313,7 +306,7 @@ TEST(MetaControlProjector, ProjectsCompleteCanonicalStateForOneNode) {
   ASSERT_TRUE(projected.ok()) << projected.status();
   const control::FullDesiredState& state = projected->full_state;
 
-  EXPECT_EQ(state.source_meta_applied_index, 99u);
+  EXPECT_EQ(state.control_revision, 99u);
   EXPECT_EQ(state.topology_epoch, 7u);
   EXPECT_EQ(state.authority_lease_duration_ms, 5000u);
   EXPECT_EQ(control::DataHeartbeatIntervalMs(state.authority_lease_duration_ms),
@@ -366,8 +359,7 @@ TEST(MetaControlProjector, ProjectsCompleteCanonicalStateForOneNode) {
   ASSERT_EQ(state.current_directives.size(), 1u);
   const control::WireProjectedDirective& directive =
       state.current_directives[0];
-  EXPECT_EQ(directive.basis.source_meta_applied_index, 99u);
-  EXPECT_EQ(directive.basis.projection_hash, state.projection_hash);
+
   EXPECT_EQ(directive.authority.group_id, "group-a");
   EXPECT_EQ(directive.authority.assignment_id, fixture.target_assignment);
   EXPECT_EQ(directive.authority.group_term, 1u);
@@ -391,11 +383,8 @@ TEST(MetaControlProjector, ProjectsCompleteCanonicalStateForOneNode) {
   EXPECT_EQ(directive.partition_replication_epoch, 1u);
   EXPECT_EQ(directive.kind, control::WireDirectiveKind::kRebuild);
   EXPECT_EQ(directive.payload, *control::EncodeRebuildRequest({3}));
-  EXPECT_TRUE(directive.preconditions.empty());
-  EXPECT_TRUE(directive.storage_mutating);
-  EXPECT_FALSE(directive.force);
 
-  EXPECT_TRUE(NonZero(state.projection_hash));
+  EXPECT_GT(state.control_revision, 0u);
   const auto decoded =
       control::DecodeFullDesiredState(projected->encoded_full_state);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
@@ -474,8 +463,10 @@ TEST(MetaControlProjector, ProjectsCurrentGrantActivationActionIdentity) {
   begin.group_id_ = "group-a";
   begin.expected_term_ = 1;
   begin.new_term_ = 2;
-  ASSERT_TRUE(fixture.stores.grant_.BeginGroupTerm(begin).ok());
-  ASSERT_TRUE(fixture.stores.topology_.SetGroupTerm("group-a", 2).ok());
+  ASSERT_TRUE(fixture.stores.topology_.BeginGroupTerm(begin).ok());
+  ASSERT_TRUE(keylane::meta::MetaTopologyTestAccess::SetGroupTerm(
+                  fixture.stores.topology_, "group-a", 2)
+                  .ok());
 
   keylane::meta::ActivateAuthority activate;
   activate.group_id_ = "group-a";
@@ -483,9 +474,11 @@ TEST(MetaControlProjector, ProjectsCurrentGrantActivationActionIdentity) {
   activate.new_owner_ = fixture.target;
   activate.new_topology_epoch_ = 8;
   const keylane::meta::MetaFailoverActionId action_id = Bytes<16>(0xb1);
-  ASSERT_TRUE(fixture.stores.grant_.ValidateActivate(activate, action_id).ok());
+  ASSERT_TRUE(
+      fixture.stores.topology_.ValidateActivate(activate, action_id).ok());
   ASSERT_TRUE(fixture.stores.topology_.SetTopologyEpoch(8).ok());
-  ASSERT_TRUE(fixture.stores.grant_.ApplyGrantPart(activate, action_id).ok());
+  ASSERT_TRUE(
+      fixture.stores.topology_.ActivateAuthority(activate, action_id).ok());
 
   // Project the other member so the fixture's deliberately old target-only
   // directive is outside this node-specific batch.
@@ -506,13 +499,15 @@ TEST(MetaControlProjector, ProjectedManifestPassesDataPlaneValidation) {
       MetaCommittedView(fixture.stores, 99), fixture.target);
   ASSERT_TRUE(projected.ok()) << projected.status();
 
-  const auto prepared = keylane::cluster::PrepareMetaFullState(
-      projected->full_state, fixture.target, 4);
+  const auto prepared = keylane::cluster::PrepareNodeControlState(
+      control::SelectNodeControlState(projected->full_state, fixture.target),
+      fixture.target, 4);
   ASSERT_TRUE(prepared.ok()) << prepared.status();
   ASSERT_NE(prepared->serving_state_, nullptr);
-  ASSERT_EQ(prepared->control_groups_.size(), 2u);
-  EXPECT_EQ(prepared->control_groups_.front().manifest_digest_,
-            fixture.manifest_digest);
+  ASSERT_EQ(prepared->desired_cluster_controls_.size(), 1u);
+  EXPECT_EQ(
+      prepared->desired_cluster_controls_.front().identity_.manifest_digest_,
+      fixture.manifest_digest);
 }
 
 TEST(MetaControlProjector,
@@ -535,7 +530,7 @@ TEST(MetaControlProjector,
 }
 
 TEST(MetaControlProjector,
-     ProjectionHashIgnoresDiagnosticIndexAndTracksCurrentLeasePolicy) {
+     DesiredContentIgnoresSourceIndexAndTracksCurrentLeasePolicy) {
   const Fixture fixture = CompleteFixture();
   const auto first = MetaControlProjector::ProjectNode(
       MetaCommittedView(fixture.stores, 99), fixture.target);
@@ -544,15 +539,10 @@ TEST(MetaControlProjector,
   ASSERT_TRUE(first.ok()) << first.status();
   ASSERT_TRUE(later.ok()) << later.status();
 
-  EXPECT_EQ(first->full_state.projection_hash,
-            later->full_state.projection_hash);
+  EXPECT_TRUE(control::SameDesiredState(first->full_state, later->full_state));
   EXPECT_NE(first->encoded_full_state, later->encoded_full_state);
   ASSERT_EQ(later->full_state.current_directives.size(), 1u);
-  EXPECT_EQ(
-      later->full_state.current_directives[0].basis.source_meta_applied_index,
-      1000u);
-  EXPECT_EQ(later->full_state.current_directives[0].basis.projection_hash,
-            later->full_state.projection_hash);
+  EXPECT_EQ(later->full_state.control_revision, 1000u);
 
   MetaStores with_policy_change = fixture.stores;
   ASSERT_TRUE(with_policy_change.policy_
@@ -563,8 +553,8 @@ TEST(MetaControlProjector,
   const auto changed = MetaControlProjector::ProjectNode(
       MetaCommittedView(std::move(with_policy_change), 1001), fixture.target);
   ASSERT_TRUE(changed.ok()) << changed.status();
-  EXPECT_NE(changed->full_state.projection_hash,
-            first->full_state.projection_hash);
+  EXPECT_FALSE(
+      control::SameDesiredState(changed->full_state, first->full_state));
   EXPECT_EQ(changed->full_state.authority_lease_duration_ms, 6000u);
   EXPECT_EQ(control::DataHeartbeatIntervalMs(
                 changed->full_state.authority_lease_duration_ms),
@@ -657,7 +647,7 @@ TEST(MetaControlProjector,
   authorize.recipient_node_id_ = fixture.source;
   authorize.kind_ = "authorize-source";
   authorize.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
-  authorize.storage_mutating_ = false;
+
   keylane::meta::MetaDirectiveSpec revoke = authorize;
   revoke.directive_id_ = Bytes<16>(0x53);
   revoke.attempt_id_ = Bytes<16>(0x63);
@@ -730,7 +720,7 @@ TEST(MetaControlProjector,
     authorize.attempt_id_ = Bytes<16>(0x62);
     authorize.recipient_node_id_ = fixture.source;
     authorize.kind_ = keylane::meta::kMetaDirectiveAuthorizeSource;
-    authorize.storage_mutating_ = false;
+
     keylane::meta::TransitionOperationPhase authorize_transition;
     authorize_transition.request_id_ = Bytes<16>(0x77);
     authorize_transition.operation_id_ = fixture.operation_id;
@@ -826,24 +816,20 @@ TEST(MetaControlProjector,
 }
 
 TEST(MetaControlProjector,
-     TransitionGuardAndProjectorAllowOnlyExplicitDirectiveStorageClasses) {
+     TransitionGuardAndProjectorDeriveStorageClassFromKind) {
   const Fixture fixture = CompleteFixture();
   struct DirectiveCase {
     std::string_view kind;
-    bool storage_mutating;
     std::optional<control::WireDirectiveKind> expected;
   };
   const std::vector<DirectiveCase> cases = {
-      {"rebuild", true, control::WireDirectiveKind::kRebuild},
-      {"initialize-empty-population", true,
+      {"rebuild", control::WireDirectiveKind::kRebuild},
+      {"initialize-empty-population",
        control::WireDirectiveKind::kInitializeEmptyPopulation},
-      {"authorize-source", false, control::WireDirectiveKind::kAuthorizeSource},
-      {"revoke-sources", false, control::WireDirectiveKind::kRevokeSources},
-      {"unknown", false, std::nullopt},
-      {"rebuild", false, std::nullopt},
-      {"initialize-empty-population", false, std::nullopt},
-      {"authorize-source", true, std::nullopt},
-      {"revoke-sources", true, std::nullopt},
+      {"authorize-source", control::WireDirectiveKind::kAuthorizeSource},
+      {"revoke-sources", control::WireDirectiveKind::kRevokeSources},
+      {"unknown", std::nullopt},
+
   };
 
   for (const DirectiveCase& test : cases) {
@@ -856,7 +842,8 @@ TEST(MetaControlProjector,
     keylane::meta::MetaDirectiveSpec directive =
         operation->current_directives_[0].spec_;
     directive.kind_ = test.kind;
-    directive.storage_mutating_ = test.storage_mutating;
+    if (test.kind == "unknown") directive.payload_.clear();
+
     if (test.kind == "initialize-empty-population") {
       directive.source_node_id_ = std::string(40, '0');
       directive.source_assignment_id_ = {};

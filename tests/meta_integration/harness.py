@@ -452,21 +452,10 @@ class Node:
                         f"{health}", timeout=timeout)
 
     def obs_candidate(self, node_id, boot_hex, generation, group, term,
-                      manifest, history, partition_epoch=0, flow="-",
-                      backlog="-", readiness="ready", timeout=5.0):
+                      manifest, history, partition_epoch=0, timeout=5.0):
         return self.ctl(
             f"obs candidate {node_id} {boot_hex} {generation} {group} "
-            f"{term} {manifest} {partition_epoch} {self._history_id(history)} "
-            f"{flow} {backlog} {readiness}",
-            timeout=timeout)
-
-    def obs_evidence(self, node_id, boot_hex, generation, op_id, phase,
-                     evidence, group, term, manifest, history,
-                     partition_epoch=0, timeout=5.0):
-        return self.ctl(
-            f"obs evidence {node_id} {boot_hex} {generation} {op_id} "
-            f"{phase} {evidence} {group} {term} {manifest} {partition_epoch} "
-            f"{self._history_id(history)}",
+            f"{term} {manifest} {partition_epoch} {self._history_id(history)}",
             timeout=timeout)
 
     def observations(self, group=None, timeout=5.0):

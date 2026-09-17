@@ -531,17 +531,13 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
 
   auto runtime = std::make_unique<cluster::ClusterRuntime>();
   ASSERT_TRUE(runtime->node_control_installer_.SetStorageReady(true).ok());
-  cluster::Sha256Digest projection_hash{};
-  projection_hash.fill(0x11);
   const cluster::ProjectionBasis projection{
-      .source_meta_applied_index_ = 7,
-      .projection_hash_ = projection_hash,
+      .control_revision_ = 7,
   };
   ASSERT_TRUE(runtime->node_control_installer_
                   .InstallFullState(
                       cluster::PreparedFullState{
                           .serving_state_ = state,
-                          .control_groups_ = {},
                       },
                       projection)
                   .ok());

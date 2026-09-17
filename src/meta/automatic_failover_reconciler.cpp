@@ -86,7 +86,7 @@ std::optional<MetaAssignmentId> AssignmentFor(
 }
 
 bool ActiveGrantMatches(const MetaTopologyGroupView& group,
-                        const MetaGroupGrantState& grant) {
+                        const MetaGroupAuthorityView& grant) {
   return grant.grant_.has_value() &&
          grant.group_term_ == group.record_.group_term_ &&
          grant.grant_->owner_ == group.record_.owner_;
@@ -144,7 +144,7 @@ MetaOwnerAuthorityAnchor OwnerAnchor(
       .group_term_ = group.record_.group_term_,
   };
   if (runtime_node != nullptr && projection_current) {
-    result.projection_hash_ = runtime_node->projection_hash_;
+    result.control_revision_ = runtime_node->control_revision_;
   }
   return result;
 }
@@ -156,7 +156,7 @@ MetaOwnerAuthorityAnchor ObservedAnchor(
       .owner_node_id_ = observed.owner_node_id_,
       .owner_assignment_id_ = observed.owner_assignment_id_,
       .group_term_ = observed.group_term_,
-      .projection_hash_ = observed.projection_hash_,
+      .control_revision_ = observed.control_revision_,
   };
 }
 
@@ -280,7 +280,7 @@ absl::StatusOr<MetaAutomaticFailoverStateMachine::Input> BuildInput(
     const MetaDataControlRuntimeSnapshot& runtime,
     const MetaObservationStore& observations, std::uint64_t now_steady_ms,
     std::uint32_t observation_ttl_ms, bool warmup_complete) {
-  const auto grant = view.grant().GroupState(group.group_id_);
+  const auto grant = view.topology().AuthorityFor(group.group_id_);
   if (!grant.has_value()) {
     return absl::FailedPreconditionError(
         "automatic failover group has no grant state");
@@ -450,7 +450,7 @@ std::optional<MetaOperationRecord> PreemptableControlledRequest(
         operation.lifecycle_ != MetaOperationLifecycle::kSubmitted ||
         operation.revision_ != 0 || !operation.kind_phase_blob_.empty() ||
         !operation.current_directives_.empty() ||
-        !operation.terminal_receipts_.empty() || !operation.evidence_.empty() ||
+        !operation.terminal_receipts_.empty() ||
         !std::ranges::all_of(operation.replication_history_id_,
                              [](std::uint8_t byte) { return byte == 0; }) ||
         operation.intent_hash_ != MetaSha256(operation.intent_)) {
@@ -949,7 +949,8 @@ celer::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
                       update->status_);
         if (!update->trigger_now_) continue;
 
-        const auto grant = subscribed.view_.grant().GroupState(group.group_id_);
+        const auto grant =
+            subscribed.view_.topology().AuthorityFor(group.group_id_);
         const auto assignment = AssignmentFor(group, group.record_.owner_);
         if (!grant.has_value() || !assignment.has_value() ||
             group.record_.group_term_ ==

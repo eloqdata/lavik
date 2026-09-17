@@ -613,7 +613,6 @@ if (KEYLANE_BUILD_META)
     src/meta/encoding.cpp
     src/meta/failover.cpp
     src/meta/failover_reconciler.cpp
-    src/meta/grant_store.cpp
     src/meta/identity_verifier.cpp
     src/meta/identity_store.cpp
     src/meta/membership_reconciler.cpp
@@ -636,6 +635,7 @@ if (KEYLANE_BUILD_META)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_link_libraries(keylane_meta_core PUBLIC
+    OpenSSL::Crypto
     keylane_meta_admin
     keylane::lease_clock
     keylane::control_transport
@@ -899,12 +899,12 @@ if (BUILD_TESTING)
       # Metadata process gates: leader-change safety, WAL/snapshot
       # recovery matrix, membership-change semantics, transport
       # connect/cancel/timeout, mTLS, the observation
-      # stale-evidence/observation-lifecycle gate, and Meta partition safety.
+      # observation-lifecycle gate, and Meta partition safety.
       # The backpressure gate enforces a production RSS budget, so sanitizer
       # allocator quarantine would turn it into a measurement of ASan retention
       # instead of the bounded live Raft queues it is intended to cover.
       set(KEYLANE_META_INTEGRATION_GATES
-        initial_meta initial_recovery snapshot_vote leader_change recovery membership membership_recovery transport mtls stale_evidence
+        initial_meta initial_recovery snapshot_vote leader_change recovery membership membership_recovery transport mtls observation_lifecycle
         partition
       )
       if (NOT KEYLANE_ASAN_BUILD)

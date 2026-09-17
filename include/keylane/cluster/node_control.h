@@ -156,17 +156,18 @@ struct DesiredClusterControl {
   bool grant_active_ = false;
   std::optional<FailoverActionId> activation_action_id_;
   std::optional<PreparedFailoverTransition> failover_transition_;
-  // These are derived from the same complete FDS as identity_. They make the
-  // post-Cutover Follow Owner relationship self-contained at the one
+  // These are derived from the same complete local control as identity_. They
+  // make the post-Cutover Follow Owner relationship self-contained at the one
   // NodeControlActions seam; no adapter may consult a second topology view.
   std::optional<PreparedReplicationEndpoint> owner_endpoint_;
   std::vector<PopulationManifestEntry> manifest_entries_;
-  // Committed lifecycle gate projected in the FDS. False keeps Genesis on
-  // its explicit population workflow instead of starting a second ingress.
+  // Committed lifecycle gate projected in the local control. False keeps
+  // Genesis on its explicit population workflow instead of starting a second
+  // ingress.
   bool steady_replication_enabled_ = false;
-  // Derived from current_directives in the same FDS. While true, the exact
-  // population directive owns target ingress; ordinary Follow Owner is held
-  // until a later complete FDS removes the directive.
+  // Derived from current_directives in the same local control. While true, the
+  // exact population directive owns target ingress; ordinary Follow Owner is
+  // held until a later complete local control removes the directive.
   bool population_transition_expected_ = false;
 
   friend bool operator==(const DesiredClusterControl&,
@@ -177,7 +178,7 @@ struct DesiredClusterControl {
 // failover-installed current Grant and the control session that delivered it.
 // Replication owns the boot-local prepared context; NodeControl owns the
 // ordering that keeps this action provisional until finite expiration and
-// request authority are installed against the same FDS.
+// request authority are installed against the same local control.
 struct PreparedFailoverActivation {
   FailoverActionId action_id_;
   std::string group_id_;
@@ -193,10 +194,11 @@ struct PreparedFailoverActivation {
                          const PreparedFailoverActivation&) = default;
 };
 
-// Stable, FDS-derived portion of an already authenticated source export.
-// Source boot/history remain owned by the native live session: they are
-// Observation, so committed FDS must neither invent nor replace them. Within
-// one Data boot this scope decides whether that live session may be retained.
+// Stable, local control-derived portion of an already authenticated source
+// export. Source boot/history remain owned by the native live session: they are
+// Observation, so committed local control must neither invent nor replace them.
+// Within one Data boot this scope decides whether that live session may be
+// retained.
 struct EstablishedExportScope {
   std::string group_id_;
   PreparedMemberAssignment source_;
@@ -218,12 +220,12 @@ bool SameEstablishedExportScope(const DesiredClusterControl& left,
 struct PreparedFullState {
   std::shared_ptr<const ServingState> serving_state_;
   // Exact effective duration for every Authority Lease issued against this
-  // FDS. Policy identity and Meta-local leadership limits stay outside Data.
+  // local control. Policy identity and Meta-local leadership limits stay
+  // outside Data.
   std::uint32_t authority_lease_duration_ms_ = 0;
-  // Exact member incarnations and manifest binding from the same decoded FDS.
-  // Test-only projections may leave this empty when they exercise routing and
-  // authority without directives or boot-local population proof.
-  std::vector<PreparedGroupControlIdentity> control_groups_;
+  // Exact member incarnations and manifest binding from the same decoded local
+  // control. Test-only projections may leave this empty when they exercise
+  // routing and authority without directives or boot-local population proof.
   // Full level-triggered execution intent is deliberately separate from the
   // stable population identity above. Dynamic Meta projections populate this;
   // static topology leaves it empty.
@@ -301,22 +303,17 @@ struct NodeDirective {
   std::vector<NodeManifestEntry> manifest_entries_;
   // Rebuild/authorize-source payloads are decoded into flow_count_ above.
   // Empty-population initialization retains its authenticated target history
-  // in payload_; other V1 kinds require both strings empty.
+  // in payload_; other V1 kinds require it to be empty.
   std::string payload_;
-  std::string preconditions_;
-  // Population directives set this to drive non-serving-target admission and
-  // cross-operation mutation exclusion.
-  bool storage_mutating_ = false;
-  // Reserved in V1 and rejected when true before entering NodeControlActions.
-  bool force_ = false;
 
   friend bool operator==(const NodeDirective&, const NodeDirective&) = default;
 };
 
 // Pollable terminal outcome for one exact directive attempt. Starting and
-// observing are deliberately separate: a later FDS directive must be able to
-// enter ReplicationManager and supersede an in-progress population mutation,
-// while the original wire identity continues to own its terminal result.
+// observing are deliberately separate: a later local control directive must be
+// able to enter ReplicationManager and supersede an in-progress population
+// mutation, while the original wire identity continues to own its terminal
+// result.
 class NodeDirectiveCompletion {
  public:
   using Poll = std::function<std::optional<absl::Status>()>;
@@ -373,12 +370,13 @@ class NodeControlActions {
   virtual celer::Task<absl::Status>
   ClearSourceAuthorizationsForSessionReplacementAndWait(
       bool preserve_established_exports = false);
-  // A live FDS replacement replays source capabilities while an unchanged
-  // finite lease may remain active. Unlike session replacement, this clears
-  // capabilities without closing that lease-admission gate and may retain all
-  // already-published POPULATION sessions when the exact export scope survives
-  // the replacement; those sessions need not have reached ONLINE yet. The
-  // expected replay count keeps the intervening admission gap retryable.
+  // A live local control replacement replays source capabilities while an
+  // unchanged finite lease may remain active. Unlike session replacement, this
+  // clears capabilities without closing that lease-admission gate and may
+  // retain all already-published POPULATION sessions when the exact export
+  // scope survives the replacement; those sessions need not have reached ONLINE
+  // yet. The expected replay count keeps the intervening admission gap
+  // retryable.
   virtual celer::Task<absl::Status>
   RefreshSourceAuthorizationsForFdsReplacementAndWait(
       bool preserve_current_population_exports = false,
@@ -392,7 +390,7 @@ class NodeControlActions {
       std::optional<DesiredClusterControl> desired);
   // Opens the exact boot-local promotion prepared by `action_id`. This grants
   // neither a write lease nor active expiration authority; NodeControl does
-  // both only after a post-await FDS/session/deadline recheck.
+  // both only after a post-await local control/session/deadline recheck.
   virtual celer::Task<absl::Status> ActivatePreparedPromotion(
       PreparedFailoverActivation activation);
   // Installs the same absolute CLOCK_BOOTTIME deadline used by the request
@@ -470,12 +468,16 @@ class NodeControlInstaller {
   NodeControlInstaller(const NodeControlInstaller&) = delete;
   NodeControlInstaller& operator=(const NodeControlInstaller&) = delete;
 
+  // Publishes routing on worker 0 while preserving exact local control,
+  // task admission, exports, and leases. Rejects any local control change.
+  absl::Status InstallRouting(PreparedFullState prepared_state);
+
   // Installs one completely decoded and validated snapshot through a test
   // adapter that never receives directives. Directive-capable adapters must
   // use InstallFullStateTransition(), even when a particular snapshot appears
   // to require no cleanup: concurrent admission is what makes the synchronous
   // path unsafe. Meta transitions run on worker 0. Lower source indices and
-  // same-assignment counter regressions fail closed; same index/hash replay is
+  // same-assignment counter regressions fail closed; equal-index replay is
   // idempotent.
   absl::Status InstallFullState(PreparedFullState prepared_state,
                                 ProjectionBasis projection_basis);
@@ -499,13 +501,13 @@ class NodeControlInstaller {
   celer::Task<absl::Status> ApplyLeaseGrantTransition(
       const AuthorityMessage& authority_message);
 
-  // Meta-only FDS boundary. In addition to installing the immutable state,
-  // this invalidates and joins older directive admissions, then refreshes the
-  // source-capability ledger. An exact population scope preserves published
-  // exports and reserves its expected authorization replays; a changed scope
-  // joins the exports it invalidates. Authority-changing snapshots also wait
-  // for mutations admitted through the replaced ServingState before returning
-  // to the wire client.
+  // Meta-only local control boundary. In addition to installing the immutable
+  // state, this invalidates and joins older directive admissions, then
+  // refreshes the source-capability ledger. An exact population scope preserves
+  // published exports and reserves its expected authorization replays; a
+  // changed scope joins the exports it invalidates. Authority-changing
+  // snapshots also wait for mutations admitted through the replaced
+  // ServingState before returning to the wire client.
   celer::Task<absl::Status> InstallFullStateTransition(
       PreparedFullState prepared_state, ProjectionBasis projection_basis,
       bool local_population_transition_expected = false,
@@ -548,9 +550,9 @@ class NodeControlInstaller {
   // Records every current local assignment as draining before awaiting
   // session-scoped cleanup. Session loss closes write authority and new source
   // admission, but exact already-online exports retain their immutable
-  // population snapshots; a replacement FDS must replay authorization before
-  // new exports can start. Lease, rebuild, and new source authorization remain
-  // blocked by the drains meanwhile.
+  // population snapshots; a replacement local control must replay authorization
+  // before new exports can start. Lease, rebuild, and new source authorization
+  // remain blocked by the drains meanwhile.
   celer::Task<absl::Status> LoseSessionTransition(
       const SessionIdentity& session_identity, std::string_view reason);
 
@@ -617,8 +619,8 @@ class NodeControlInstaller {
 
   struct FullStateEffects {
     bool revoke_sources_ = false;
-    // Same-scope FDS refresh preserves every already-published population
-    // export, including a session that has not reached ONLINE yet.
+    // Same-scope local control refresh preserves every already-published
+    // population export, including a session that has not reached ONLINE yet.
     bool preserve_current_population_exports_ = false;
     std::vector<AuthorityAnchor> retired_;
     // A Controlled Pause retires only the old mutation admission snapshot,
@@ -711,7 +713,8 @@ class NodeControlInstaller {
   bool storage_ready_ = false;
   // Unlike the normal startup-not-ready state, a runtime storage failure is
   // irreversible for this boot. Keeping the two facts separate prevents a
-  // later FDS or directive from treating failure as rebuildable readiness.
+  // later local control or directive from treating failure as rebuildable
+  // readiness.
   bool storage_failed_ = false;
   // Empty while the first storage-loss coroutine is still joining cleanup;
   // afterwards it preserves success or the exact uncertain failure so a
@@ -719,7 +722,6 @@ class NodeControlInstaller {
   std::optional<absl::Status> storage_loss_result_;
   std::optional<ProjectionBasis> projection_basis_;
   std::uint32_t authority_lease_duration_ms_ = 0;
-  std::vector<PreparedGroupControlIdentity> control_groups_;
   std::vector<DesiredClusterControl> desired_cluster_controls_;
   std::optional<DesiredClusterControl> reconciled_cluster_control_;
   bool cluster_control_reconciled_ = false;

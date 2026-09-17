@@ -72,13 +72,6 @@ class PlanFacts final : public MetaCommittedFacts {
                          const MetaAssignmentId&) const override {
     return false;
   }
-  bool OperationNonTerminal(const MetaOperationId&) const override {
-    return false;
-  }
-  bool HistoryBoundToOperation(const MetaOperationId&,
-                               const MetaReplicationHistoryId&) const override {
-    return false;
-  }
 
   std::set<std::string> active_;
   std::map<std::string, MetaAssignmentId> assignments_;

@@ -38,10 +38,10 @@ struct MetaDataControlRuntimeNode {
   std::uint32_t replication_flow_count_ = 0;
   std::uint64_t session_generation_ = 0;
   std::uint64_t leadership_generation_ = 0;
-  std::uint64_t source_meta_applied_index_ = 0;
+  std::uint64_t control_revision_ = 0;
   std::uint64_t validated_committed_high_water_ = 0;
   std::uint64_t topology_epoch_ = 0;
-  cluster::control::WireHash256 projection_hash_{};
+
   // Lexicographically sorted by group_id_ in every published snapshot.
   std::vector<MetaDataControlRuntimeGroup> groups_;
   std::optional<cluster::control::HeartbeatHealth> health_;

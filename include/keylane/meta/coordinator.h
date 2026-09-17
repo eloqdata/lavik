@@ -183,7 +183,6 @@ class MetaCommittedView {
   const MetaIdentityStore& identity() const { return stores_.identity_; }
   const MetaTopologyStore& topology() const { return stores_.topology_; }
   const MetaPolicyStore& policy() const { return stores_.policy_; }
-  const MetaGrantStore& grant() const { return stores_.grant_; }
   const MetaOperationStore& operation() const { return stores_.operation_; }
   const MetaPopulationManifestStore& population_manifest() const {
     return stores_.population_manifest_;
@@ -217,10 +216,6 @@ class MetaStoresFacts : public MetaCommittedFacts {
                          const MetaAssignmentId& assignment_id) const override;
   bool MayReportFencedOwnerCandidate(
       const MetaCandidateProgressObs& candidate) const override;
-  bool OperationNonTerminal(const MetaOperationId& id) const override;
-  bool HistoryBoundToOperation(
-      const MetaOperationId& id,
-      const MetaReplicationHistoryId& history_id) const override;
   bool IsCurrentFailoverCandidate(
       std::string_view node_id,
       const MetaBootIncarnation& boot_id) const override;

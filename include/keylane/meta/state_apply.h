@@ -32,17 +32,14 @@
 //     the command cannot move, or are skipped once the effect is in place).
 //
 // Cross-store invariants enforced HERE (the stores expose fact queries; this
-// layer is the only place that sees all seven stores):
+// layer is the only place that sees all six stores):
 //   1. principal vs grant: the target node of AssignNodeToGroup and
 //      ActivateAuthority must be a registered, non-retired node (identity
 //      store).
-//   2. ActivateAuthority atomicity: grant-store ValidateActivate plus every
-//      topology-side check (topology_epoch exactly current+1, new owner is a
-//      group member and registered active) all run BEFORE any write; only then
-//      the grant half (ApplyGrantPart) and
-//      the topology half (owner, topology_epoch) are written in
-//      order. Any rejection leaves both halves
-//      untouched.
+//   2. ActivateAuthority validates the Group term/authority, topology epoch,
+//      active identity and membership before atomically changing its owner
+//      and authority. Compound transitions retain affected records for
+//      rollback.
 //   3. one-node-one-group cross-store half: an AssignNodeToGroup that would
 //      move a node into a group it is not currently a member of requires the
 //      node to hold no current membership and no active grant. "Grant owner
@@ -55,12 +52,9 @@
 //      in the stores; RetireNode is additionally rejected while the node
 //      still holds group membership (which, by the invariant in (3), also
 //      covers an active grant).
-//   6. TransitionOperationPhase is applied to a candidate operation store and
-//      the exact FullDesiredState for every old/new directive recipient is
-//      projected and encoded before commit. This aggregate check prevents
-//      individually valid operations from making a node's projection exceed
-//      protocol count, field, or total-object limits; rejection leaves the
-//      operation store unchanged.
+//   6. TransitionOperationPhase retains only affected records for rollback
+//      and enforces the supported task kinds, count and bounded payload budget.
+//      Apply never constructs a node projection or network byte buffer.
 //   7. Live directives remain valid after later committed mutations. After
 //      every accepted command, apply rechecks their exact source/target
 //      assignments, active Group Term, and population
@@ -68,7 +62,7 @@
 //      CAS revision once. CommitDirectiveResult repeats the same check before
 //      first commit; snapshot recovery and projection reject any stale entry
 //      that bypassed this invariant.
-//   8. SetSlotMap first constructs the complete candidate topology and rejects
+//   8. SetSlotMap first inspects the command's absolute slot map and rejects
 //      any slot-ownership change that affects a group with an
 //      active grant. Source and destination groups must be fenced before the
 //      cut, so no lease issued for the old projection can span a slot move.
@@ -85,16 +79,18 @@
 //      remain admissible.
 //  11. Failover Begin requires no active transition and validates its frozen
 //      committed anchors; every post-Begin mutation validates the exact
-//      transition revision. Mutations spanning topology, grant, and/or
-//      operation state stage their complete result in a candidate aggregate,
-//      validate affected FullDesiredState projections, and publish atomically.
+//      transition revision. Mutations spanning topology and/or
+//      operation state apply deltas under the state-machine write lock,
+//      retaining only affected records until domain validation succeeds.
+//      Rejection restores those records before releasing the lock; no full
+//      store or MetaStores copy is part of apply.
 //      Restore revalidates transition-id uniqueness, coherence with the
 //      Group's current authority and membership, and the Controlled
 //      transition's exact pristine operation link.
 //
 // MetaStores is the committed aggregate that snapshots serialize as one
 // versioned envelope: per-store length-prefixed versioned blobs in a fixed
-// order. Deserialize is strict and revalidates the cross-store group set,
+// order. Deserialize is strict and revalidates
 // authority anchors, active identities/policies, and retained manifest
 // documents before exposing any decoded store; every failure is
 // MetaFailureClass::kFailStop — the same bytes fail
@@ -107,7 +103,6 @@
 #include "absl/status/statusor.h"
 #include "keylane/meta/audit_store.h"
 #include "keylane/meta/commands.h"
-#include "keylane/meta/grant_store.h"
 #include "keylane/meta/identity_store.h"
 #include "keylane/meta/operation_store.h"
 #include "keylane/meta/policy_store.h"
@@ -116,14 +111,13 @@
 
 namespace keylane::meta {
 
-// The seven committed stores. Store constructor knobs (audit window capacity,
+// The six committed stores. Store constructor knobs (audit window capacity,
 // group/operation caps) are deployment constants: snapshots do not carry
 // them and Deserialize restores defaults.
 struct MetaStores {
   MetaIdentityStore identity_;
   MetaTopologyStore topology_;
   MetaPolicyStore policy_;
-  MetaGrantStore grant_;
   MetaOperationStore operation_;
   MetaPopulationManifestStore population_manifest_;
   MetaAuditStore audit_;

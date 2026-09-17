@@ -12,6 +12,7 @@
 #include "keylane/meta/failover.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/state_apply.h"
+#include "meta_topology_test_access.h"
 
 namespace {
 
@@ -60,7 +61,6 @@ std::array<std::string, 6> DomainBytes(const meta::MetaStores& stores) {
   return {stores.identity_.Serialize(),
           stores.topology_.Serialize(),
           stores.policy_.Serialize(),
-          stores.grant_.Serialize().value_or("invalid-grant"),
           stores.operation_.Serialize().value_or("invalid-operation"),
           stores.population_manifest_.Serialize()};
 }
@@ -400,7 +400,7 @@ void ExpectAuthorityUnchanged(const Fixture& fixture) {
   EXPECT_EQ(group->record_.group_term_, 1u);
   EXPECT_EQ(fixture.stores.topology_.TopologyEpoch(), 4u);
 
-  const auto state = fixture.stores.grant_.GroupState("g1");
+  const auto state = fixture.stores.topology_.AuthorityFor("g1");
   ASSERT_TRUE(state.has_value());
   ASSERT_TRUE(state->grant_.has_value());
   EXPECT_EQ(state->group_term_, 1u);
@@ -417,7 +417,7 @@ void ExpectCutover(const Fixture& fixture,
   EXPECT_FALSE(group->failover_transition_.has_value());
   EXPECT_EQ(fixture.stores.topology_.TopologyEpoch(), 5u);
 
-  const auto state = fixture.stores.grant_.GroupState("g1");
+  const auto state = fixture.stores.topology_.AuthorityFor("g1");
   ASSERT_TRUE(state.has_value());
   EXPECT_EQ(state->group_term_, 2u);
   ASSERT_TRUE(state->grant_.has_value());
@@ -513,7 +513,7 @@ TEST(MetaFailoverTransitionW2,
   EXPECT_FALSE(transition->candidate_action_.has_value());
   EXPECT_EQ(transition->mode_, meta::MetaFailoverMode::kUncontrolled);
   EXPECT_EQ(transition->target_term_, 2u);
-  EXPECT_FALSE(fixture.stores.grant_.GroupState("g1")->grant_.has_value());
+  EXPECT_FALSE(fixture.stores.topology_.AuthorityFor("g1")->grant_.has_value());
 }
 
 TEST(MetaFailoverTransitionW2,
@@ -713,7 +713,7 @@ TEST(MetaFailoverTransitionW2,
   EXPECT_EQ(group->record_.owner_, fixture.owner);
   EXPECT_EQ(group->record_.group_term_, 2u);
   EXPECT_EQ(fixture.stores.topology_.TopologyEpoch(), 4u);
-  const auto grant = fixture.stores.grant_.GroupState("g1");
+  const auto grant = fixture.stores.topology_.AuthorityFor("g1");
   EXPECT_FALSE(grant->grant_.has_value());
 
   const auto operation =
@@ -814,8 +814,10 @@ TEST(MetaFailoverTransitionW2,
   term_only.group_id_ = "g1";
   term_only.expected_term_ = 1;
   term_only.new_term_ = 2;
-  ASSERT_TRUE(fixture.stores.grant_.BeginGroupTerm(term_only).ok());
-  ASSERT_TRUE(fixture.stores.topology_.SetGroupTerm("g1", 2).ok());
+  ASSERT_TRUE(fixture.stores.topology_.BeginGroupTerm(term_only).ok());
+  ASSERT_TRUE(keylane::meta::MetaTopologyTestAccess::SetGroupTerm(
+                  fixture.stores.topology_, "g1", 2)
+                  .ok());
   RejectFresh(fixture, meta::MetaCommand{commit});
 
   const auto group = fixture.stores.topology_.FindGroup("g1");

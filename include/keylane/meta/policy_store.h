@@ -23,6 +23,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "keylane/meta/commands.h"
+#include "keylane/meta/encoding.h"
 
 namespace keylane::meta {
 
@@ -101,9 +102,12 @@ class MetaPolicyStore {
   // ascending (version, raw) history. No content hash or retired tombstone is
   // encoded. Old layouts are intentionally unsupported.
   std::string Serialize() const;
+  // Exact durable size without allocating or copying snapshot bytes.
+  std::uint64_t SerializedSize() const;
   static absl::StatusOr<MetaPolicyStore> Deserialize(std::string_view bytes);
 
  private:
+  void WriteSnapshot(MetaWriter& writer) const;
   std::map<std::string, std::map<std::uint64_t, std::string>> policies_;
   std::uint64_t total_content_bytes_ = 0;
 };

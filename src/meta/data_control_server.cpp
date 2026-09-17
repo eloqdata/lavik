@@ -304,19 +304,6 @@ class SessionIo {
     co_return co_await writer_.Write(priority, std::move(message));
   }
 
-  celer::Task<absl::Status> SendTransfer(
-      control::TransferKind kind, std::shared_ptr<const std::string> bytes) {
-    auto object_id = control::GenerateId128();
-    if (!object_id.ok()) co_return object_id.status();
-    co_return co_await writer_.WriteTransfer(kind, *object_id,
-                                             std::move(bytes));
-  }
-
-  celer::Task<absl::Status> SendFullDesiredState(
-      std::shared_ptr<const std::string> encoded) {
-    co_return co_await writer_.WriteFullDesiredState(std::move(encoded));
-  }
-
   void FailDeadline(std::string_view operation) {
     worker_.BeginClose(
         connection_,
@@ -336,20 +323,16 @@ class SessionIo {
 };
 
 // Data-to-Meta large messages remain bounded by their typed protocol caps.
-// The reassembler verifies sequence, declared length, and whole-object SHA
-// before Commit exposes bytes to the ordinary typed message decoder.
+// The reassembler verifies sequence and declared length before Commit
+// exposes bytes to the ordinary typed message decoder.
 class ClientTransferSink final : public control::LargeObjectSink {
  public:
   absl::Status Begin(const control::TransferStart& start) override {
-    if (start.kind != control::TransferKind::kDirectiveResult &&
-        start.kind != control::TransferKind::kObservationEvidence) {
+    if (start.kind != control::TransferKind::kDirectiveResult) {
       return absl::InvalidArgumentError(
-          "Meta accepts only result or evidence client transfers");
+          "Meta accepts only directive result transfers");
     }
-    const std::uint64_t limit =
-        start.kind == control::TransferKind::kDirectiveResult
-            ? control::kMaxDirectiveResultTransferBytes
-            : control::kMaxOperationEvidenceTransferBytes;
+    const std::uint64_t limit = control::kMaxDirectiveResultTransferBytes;
     if (start.total_length > limit) {
       return absl::ResourceExhaustedError(
           "client transfer exceeds its typed cap");
@@ -402,42 +385,7 @@ class ClientTransferSink final : public control::LargeObjectSink {
 
 bool SameApplied(const control::FullStateApplied& applied,
                  const NodeControlBatch& batch) {
-  return applied.source_meta_applied_index ==
-             batch.full_state.source_meta_applied_index &&
-         applied.projection_hash == batch.full_state.projection_hash;
-}
-
-control::FullStateApplied AppliedReceipt(const NodeControlBatch& batch) {
-  return control::FullStateApplied{
-      .source_meta_applied_index = batch.full_state.source_meta_applied_index,
-      .projection_hash = batch.full_state.projection_hash,
-  };
-}
-
-control::Directive LiveDirective(const control::WireProjectedDirective& source,
-                                 const control::WireId128& session_id) {
-  return control::Directive{
-      .session_id = session_id,
-      .basis = source.basis,
-      .authority = source.authority,
-      .identity = source.identity,
-      .recipient_node_id = source.recipient_node_id,
-      .recipient_boot_id = source.recipient_boot_id,
-      .target_node_id = source.target_node_id,
-      .target_boot_id = source.target_boot_id,
-      .source_node_id = source.source_node_id,
-      .source_assignment_id = source.source_assignment_id,
-      .source_boot_id = source.source_boot_id,
-      .source_replication_history_id = source.source_replication_history_id,
-      .manifest_revision = source.manifest_revision,
-      .manifest_digest = source.manifest_digest,
-      .partition_replication_epoch = source.partition_replication_epoch,
-      .kind = source.kind,
-      .payload = source.payload,
-      .preconditions = source.preconditions,
-      .storage_mutating = source.storage_mutating,
-      .force = source.force,
-  };
+  return applied.control_revision == batch.full_state.control_revision;
 }
 
 control::WireAuthorityAnchor GroupAnchor(
@@ -480,9 +428,7 @@ celer::Task<absl::Status> FenceSupersededAuthority(
         .target_boot_id = std::string(boot_id),
         .basis =
             control::WireProjectionBasis{
-                .source_meta_applied_index =
-                    installed.full_state.source_meta_applied_index,
-                .projection_hash = installed.full_state.projection_hash,
+                .control_revision = installed.full_state.control_revision,
             },
         .reject_through = anchor,
     };
@@ -535,56 +481,6 @@ celer::Task<absl::Status> FenceSupersededAuthority(
     // needed; if it succeeds, every later chunk boundary can skip this exact
     // authority anchor.
     fenced->push_back(anchor);
-  }
-  co_return absl::OkStatus();
-}
-
-celer::Task<absl::Status> SendDirectives(
-    SessionIo& io, const NodeControlBatch& batch,
-    const control::WireId128& session_id, std::string_view node_id,
-    std::string_view boot_id, MetaDirectiveReceiptTracker& receipt_tracker,
-    std::function<bool()> should_continue = std::function<bool()>{},
-    std::function<void(bool)> transfer_state = std::function<void(bool)>{}) {
-  for (const control::WireProjectedDirective& directive :
-       batch.full_state.current_directives) {
-    if (directive.recipient_node_id != node_id) {
-      co_return absl::FailedPreconditionError(
-          "node projection contains a directive for another recipient");
-    }
-    // A durable directive is incarnation-scoped. A different boot must not
-    // execute it merely because the stable node id reconnected.
-    if (directive.recipient_boot_id != boot_id) continue;
-    auto needs_dispatch = receipt_tracker.NeedsDispatch(directive.identity);
-    if (!needs_dispatch.ok()) co_return needs_dispatch.status();
-    if (!*needs_dispatch) continue;
-    if (should_continue && !should_continue()) {
-      co_return absl::CancelledError(
-          "directive projection was superseded before dispatch completed");
-    }
-    auto delivery = ClassifyDirectiveDelivery(directive, session_id);
-    if (!delivery.ok()) co_return delivery.status();
-    const control::Directive live = LiveDirective(directive, session_id);
-    absl::Status sent;
-    if (*delivery == MetaDirectiveDelivery::kFrame) {
-      sent = co_await io.Send(control::MessagePriority::kReliable,
-                              control::WireMessage(live));
-    } else {
-      auto encoded = control::EncodeMessage(control::WireMessage(live));
-      if (!encoded.ok()) co_return encoded.status();
-      auto owned = std::make_shared<const std::string>(std::move(*encoded));
-      if (transfer_state) transfer_state(true);
-      sent = co_await io.SendTransfer(control::TransferKind::kDirectivePayload,
-                                      std::move(owned));
-      if (transfer_state) transfer_state(false);
-    }
-    if (!sent.ok()) {
-      co_return sent;
-    }
-    if (absl::Status recorded =
-            receipt_tracker.MarkDispatched(directive.identity);
-        !recorded.ok()) {
-      co_return recorded;
-    }
   }
   co_return absl::OkStatus();
 }
@@ -738,7 +634,7 @@ detail::OwnerProjectionForHeartbeat(const control::FullDesiredState& installed,
         .owner_node_id_ = *group.owner_node_id,
         .owner_assignment_id_ = *group.owner_assignment_id,
         .group_term_ = group.group_term,
-        .projection_hash_ = installed.projection_hash,
+        .control_revision_ = installed.control_revision,
         .authority_lease_duration_ms_ = installed.authority_lease_duration_ms,
     };
   }
@@ -757,7 +653,7 @@ std::optional<std::uint64_t> detail::ConfirmedLeaseForHeartbeat(
       std::get_if<control::LeaseGranted>(&previous_ack->lease_decision);
   if (granted == nullptr || granted->granted_duration_ms == 0 ||
       granted->data_boot_id != authenticated_boot_id ||
-      granted->projection_hash != owner_projection->projection_hash_ ||
+      granted->control_revision != owner_projection->control_revision_ ||
       granted->group_id != owner_projection->group_id_ ||
       granted->assignment_id != owner_projection->owner_assignment_id_ ||
       granted->group_term != owner_projection->group_term_) {
@@ -781,13 +677,6 @@ absl::Status detail::ApplyLeadershipValidityLimit(
   state.authority_lease_duration_ms =
       std::min(state.authority_lease_duration_ms, leadership_validity_ms);
 
-  auto projection_hash = control::ComputeProjectionHash(state);
-  if (!projection_hash.ok()) return projection_hash.status();
-  state.projection_hash = *projection_hash;
-  for (control::WireProjectedDirective& directive : state.current_directives) {
-    directive.basis.source_meta_applied_index = state.source_meta_applied_index;
-    directive.basis.projection_hash = state.projection_hash;
-  }
   auto encoded = control::EncodeFullDesiredState(state);
   if (!encoded.ok()) return encoded.status();
   batch.encoded_full_state = std::move(*encoded);
@@ -888,12 +777,6 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
     } else if (!source_history.ok()) {
       record_rejection("candidate", source_history.status());
     } else {
-      std::string vector_text =
-          absl::StrCat(candidate.applied_next_lsns.size(), ":");
-      for (std::size_t i = 0; i < candidate.applied_next_lsns.size(); ++i) {
-        absl::StrAppend(&vector_text, i == 0 ? "" : ",",
-                        candidate.applied_next_lsns[i]);
-      }
       MetaCandidateProgressObs progress{
           .node_id_ = std::string(node_id),
           .boot_incarnation_ = boot,
@@ -911,9 +794,7 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
           .source_boot_incarnation_ = *source_boot,
           .source_replication_history_id_ = *source_history,
           .applied_next_lsns_ = candidate.applied_next_lsns,
-          .applied_flow_vector_ = std::move(vector_text),
-          .backlog_coverage_ = "complete",
-          .readiness_ = "ready",
+
           .storage_ready_ = health.storage_ready,
           .population_ready_ = health.population_ready,
           .draining_ = health.draining,
@@ -1021,63 +902,6 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
   return result;
 }
 
-absl::Status IngestOperationEvidenceObservation(
-    MetaObservationStore& observations, const MetaCommittedFacts& facts,
-    std::string_view node_id, const MetaBootIncarnation& boot,
-    std::uint64_t generation, const control::WireId128& session_id,
-    const control::OperationEvidence& evidence, std::int64_t now_unix_ms) {
-  if (evidence.session_id != session_id) {
-    return absl::InvalidArgumentError("operation evidence session id mismatch");
-  }
-  auto reporter_boot =
-      ParseIdentity<20>(evidence.reporter_boot_id, "evidence reporter boot id");
-  if (!reporter_boot.ok()) return reporter_boot.status();
-  if (*reporter_boot != boot) {
-    return absl::InvalidArgumentError(
-        "operation evidence reporter boot mismatch");
-  }
-  auto history = ParseIdentity<20>(evidence.replication_history_id,
-                                   "evidence replication history id");
-  if (!history.ok()) return history.status();
-
-  (void)observations.MaybeSweepExpired(now_unix_ms);
-  MetaOperationEvidenceObs payload{
-      .node_id_ = std::string(node_id),
-      .boot_incarnation_ = boot,
-      .assignment_id_ = evidence.assignment_id,
-      .operation_id_ = evidence.operation_id,
-      .kind_phase_ = evidence.kind_phase,
-      .evidence_ = evidence.evidence,
-      .group_id_ = evidence.group_id,
-      .group_term_ = evidence.group_term,
-      .population_manifest_revision_ = evidence.manifest_revision,
-      .partition_replication_epoch_ = evidence.partition_replication_epoch,
-      .replication_history_id_ = *history,
-  };
-  return observations.Ingest(
-      MetaObservation{
-          .identity_ =
-              MetaObservationIdentity{std::string(node_id), boot, generation},
-          .payload_ = std::move(payload),
-          .received_unix_ms_ = now_unix_ms,
-      },
-      facts, now_unix_ms);
-}
-
-absl::StatusOr<MetaDirectiveDelivery> ClassifyDirectiveDelivery(
-    const control::WireProjectedDirective& directive,
-    const control::WireId128& session_id) {
-  auto encoded = control::EncodeMessage(
-      control::WireMessage(LiveDirective(directive, session_id)));
-  if (!encoded.ok()) return encoded.status();
-  if (encoded->size() > control::kMaxDirectiveTransferBytes) {
-    return absl::ResourceExhaustedError(
-        "encoded directive exceeds its transfer cap");
-  }
-  return encoded->size() <= control::kMaxFramePayloadBytes
-             ? MetaDirectiveDelivery::kFrame
-             : MetaDirectiveDelivery::kTransfer;
-}
 
 std::vector<control::WireAuthorityAnchor> UnfencedSupersededAuthorities(
     const control::FullDesiredState& installed,
@@ -1103,118 +927,23 @@ std::vector<control::WireAuthorityAnchor> UnfencedSupersededAuthorities(
 MetaReplacementDisposition EvaluateReplacementDisposition(
     const control::FullDesiredState& replacement,
     const control::FullDesiredState& latest) {
-  return replacement.projection_hash == latest.projection_hash
+  return control::SameDesiredState(replacement, latest)
              ? MetaReplacementDisposition::kContinue
              : MetaReplacementDisposition::kAbortSuperseded;
 }
 
-absl::Status MetaDirectiveReceiptTracker::Rebuild(
-    std::span<const control::WireProjectedDirective> directives,
-    std::string_view node_id, std::string_view boot_id) {
-  std::vector<Entry> replacement;
-  replacement.reserve(directives.size());
-  for (const control::WireProjectedDirective& directive : directives) {
-    if (directive.recipient_node_id != node_id) {
-      return absl::FailedPreconditionError(
-          "node projection contains a receipt identity for another node");
-    }
-    if (directive.recipient_boot_id != boot_id) continue;
-    if (std::any_of(replacement.begin(), replacement.end(),
-                    [&](const Entry& entry) {
-                      return entry.identity_ == directive.identity;
-                    })) {
-      return absl::FailedPreconditionError(
-          "node projection contains duplicate directive receipt identity");
-    }
-    replacement.push_back(Entry{.identity_ = directive.identity});
-  }
-  entries_ = std::move(replacement);
-  return absl::OkStatus();
+namespace {
+MetaReplacementDisposition EvaluateNodeReplacement(
+    const control::FullDesiredState& installed,
+    const control::FullDesiredState& latest, std::string_view node_id) {
+  const auto before = control::SelectNodeControlState(installed, node_id);
+  auto after = control::SelectNodeControlState(latest, node_id);
+  const auto changes = control::DiffNodeControlState(before, after);
+  return changes.routing || changes.local || changes.directory || changes.tasks
+             ? MetaReplacementDisposition::kAbortSuperseded
+             : MetaReplacementDisposition::kContinue;
 }
-
-absl::StatusOr<bool> MetaDirectiveReceiptTracker::NeedsDispatch(
-    const control::WireDirectiveIdentity& identity) const {
-  const auto entry = std::find_if(
-      entries_.begin(), entries_.end(),
-      [&](const Entry& value) { return value.identity_ == identity; });
-  if (entry == entries_.end()) {
-    return absl::FailedPreconditionError(
-        "directive dispatch identity is not in the installed projection");
-  }
-  return !entry->dispatched_;
-}
-
-absl::Status MetaDirectiveReceiptTracker::MarkDispatched(
-    const control::WireDirectiveIdentity& identity) {
-  const auto entry = std::find_if(
-      entries_.begin(), entries_.end(),
-      [&](const Entry& value) { return value.identity_ == identity; });
-  if (entry == entries_.end()) {
-    return absl::FailedPreconditionError(
-        "directive dispatch identity is not in the installed projection");
-  }
-  entry->dispatched_ = true;
-  return absl::OkStatus();
-}
-
-bool MetaDirectiveReceiptTracker::HasUndispatched() const noexcept {
-  return std::any_of(entries_.begin(), entries_.end(),
-                     [](const Entry& entry) { return !entry.dispatched_; });
-}
-
-absl::Status MetaDirectiveReceiptTracker::Observe(
-    const control::WireDirectiveIdentity& identity,
-    control::DirectiveReceiptStage stage) {
-  const std::uint8_t next = static_cast<std::uint8_t>(stage);
-  if (next < static_cast<std::uint8_t>(
-                 control::DirectiveReceiptStage::kAccepted) ||
-      next > static_cast<std::uint8_t>(
-                 control::DirectiveReceiptStage::kCompleted)) {
-    return absl::InvalidArgumentError("directive receipt stage is unknown");
-  }
-  const auto entry = std::find_if(
-      entries_.begin(), entries_.end(),
-      [&](const Entry& value) { return value.identity_ == identity; });
-  if (entry == entries_.end()) {
-    return absl::FailedPreconditionError(
-        "directive receipt identity is not in the installed projection");
-  }
-  if (entry->stage_ == next) return absl::OkStatus();
-  const bool rejected_before_start =
-      entry->stage_ == static_cast<std::uint8_t>(
-                           control::DirectiveReceiptStage::kAccepted) &&
-      stage == control::DirectiveReceiptStage::kCompleted;
-  if (!rejected_before_start && next != entry->stage_ + 1) {
-    return absl::FailedPreconditionError(
-        "directive receipt stage skipped or moved backwards");
-  }
-  if (stage == control::DirectiveReceiptStage::kStarted) {
-    entry->started_ = true;
-  }
-  entry->stage_ = next;
-  return absl::OkStatus();
-}
-
-absl::Status MetaDirectiveReceiptTracker::ValidateResult(
-    const control::WireDirectiveIdentity& identity,
-    control::DirectiveResultStatus status) const {
-  const auto entry = std::find_if(
-      entries_.begin(), entries_.end(),
-      [&](const Entry& value) { return value.identity_ == identity; });
-  if (entry == entries_.end() ||
-      entry->stage_ != static_cast<std::uint8_t>(
-                           control::DirectiveReceiptStage::kCompleted)) {
-    return absl::FailedPreconditionError(
-        "directive result arrived before its Completed receipt");
-  }
-  const bool result_started =
-      status != control::DirectiveResultStatus::kRejected;
-  if (entry->started_ != result_started) {
-    return absl::FailedPreconditionError(
-        "directive result status conflicts with its receipt path");
-  }
-  return absl::OkStatus();
-}
+}  // namespace
 
 absl::StatusOr<std::vector<control::WireMetaEndpoint>>
 BuildCommittedMetaDirectory(const MetaCommittedView& view) {
@@ -1274,17 +1003,18 @@ control::LeaseDecision EvaluateLeaseChallenge(
     const control::HeartbeatHealth& health,
     const MetaLeaseEvaluation& evaluation) {
   if (!challenge.has_value()) return control::NoChallenge{};
-  const control::WireHash256 current_hash =
-      evaluation.desired_ == nullptr ? control::WireHash256{}
-                                     : evaluation.desired_->projection_hash;
+  const std::uint64_t current_index =
+      evaluation.desired_ == nullptr ? 0
+                                     : evaluation.desired_->control_revision;
   if (evaluation.desired_ == nullptr ||
-      challenge->projection_hash != evaluation.applied_projection_hash_ ||
-      challenge->projection_hash != current_hash) {
-    return control::LeaseStateOutOfDate{challenge->nonce, current_hash};
+      challenge->control_revision != evaluation.applied_projection_index_ ||
+      challenge->control_revision != current_index) {
+    return control::LeaseStateOutOfDate{challenge->nonce, current_index};
   }
   if (!evaluation.leader_valid_) {
-    return control::LeaseDenied{
-        challenge->nonce, control::LeaseDenialReason::kNotLeader, current_hash};
+    return control::LeaseDenied{challenge->nonce,
+                                control::LeaseDenialReason::kNotLeader,
+                                current_index};
   }
 
   const auto group = std::find_if(
@@ -1300,25 +1030,26 @@ control::LeaseDecision EvaluateLeaseChallenge(
       group->group_term != challenge->group_term) {
     return control::LeaseDenied{challenge->nonce,
                                 control::LeaseDenialReason::kAuthorityMismatch,
-                                current_hash};
+                                current_index};
   }
   if (!group->grant_active ||
       evaluation.desired_->authority_lease_duration_ms == 0) {
     return control::LeaseDenied{challenge->nonce,
                                 control::LeaseDenialReason::kGrantInactive,
-                                current_hash};
+                                current_index};
   }
   if (!health.storage_ready || !health.population_ready || health.draining) {
     return control::LeaseDenied{challenge->nonce,
                                 control::LeaseDenialReason::kNodeNotReady,
-                                current_hash};
+                                current_index};
   }
   const std::uint32_t duration =
       std::min(evaluation.desired_->authority_lease_duration_ms,
                evaluation.leadership_validity_ms_);
   if (duration == 0) {
-    return control::LeaseDenied{
-        challenge->nonce, control::LeaseDenialReason::kNotLeader, current_hash};
+    return control::LeaseDenied{challenge->nonce,
+                                control::LeaseDenialReason::kNotLeader,
+                                current_index};
   }
   return control::LeaseGranted{
       .nonce = challenge->nonce,
@@ -1326,7 +1057,7 @@ control::LeaseDecision EvaluateLeaseChallenge(
       .raft_term = evaluation.raft_term_,
       .leadership_generation = evaluation.leadership_generation_,
       .data_boot_id = evaluation.boot_id_,
-      .projection_hash = current_hash,
+      .control_revision = current_index,
       .group_id = challenge->group_id,
       .assignment_id = challenge->assignment_id,
       .group_term = challenge->group_term,
@@ -1381,7 +1112,7 @@ control::LeaseDecision MetaLeaseHandoffGuard::Enforce(
     return control::LeaseDenied{
         .nonce = grant->nonce,
         .reason = control::LeaseDenialReason::kAuthorityHandoffPending,
-        .current_projection_hash = grant->projection_hash,
+        .current_control_revision = grant->control_revision,
     };
   }
   return decision;
@@ -1552,9 +1283,9 @@ MetaDataControlServer::LifecycleHarnessForTest(
       new MetaDataControlServer(std::move(core)));
 }
 
-// Worker-local coordination shared by the established session's sole reader,
-// commit publisher, and directive sender. The auxiliary tasks may produce
-// writes concurrently, but SessionIo funnels every frame through one
+// Worker-local coordination shared by the established session's sole reader
+// and commit publisher. These tasks may produce writes concurrently, but
+// SessionIo funnels every frame through one
 // ControlSessionWriter. Only SessionLoop reads and resolves the single pending
 // publisher acknowledgement.
 struct LiveSessionState {
@@ -1574,11 +1305,11 @@ struct LiveSessionState {
 
   std::shared_ptr<const NodeControlBatch> installed_;
   // Highest synchronously published command commit whose semantic node
-  // projection has been compared with installed_. Heartbeats and directive
+  // projection has been compared with installed_. Heartbeats and update
   // boundaries deny authority if the coordinator high-water advances first,
   // even while the subscription callback is still queued cross-thread.
   std::uint64_t validated_committed_high_water_ = 0;
-  MetaDirectiveReceiptTracker receipt_tracker_;
+  control::NodeControlState selected_;
   std::vector<control::WireAuthorityAnchor> fenced_authorities_;
 
   std::optional<control::WireAuthorityAnchor> expected_fence_;
@@ -1594,8 +1325,6 @@ struct LiveSessionState {
   std::optional<absl::Status> terminal_error_;
   std::size_t active_tasks_ = 0;
   bool publisher_running_ = false;
-  bool directive_sender_running_ = false;
-  bool directive_transfer_active_ = false;
   bool projection_superseded_ = false;
   bool closing_ = false;
   celer::AsyncNotification tasks_changed_;
@@ -2054,17 +1783,63 @@ celer::Task<absl::Status> AwaitApplied(
 }
 
 celer::Task<absl::Status> SendFullState(
-    SessionIo& io, std::shared_ptr<const NodeControlBatch> batch) {
-  if (batch == nullptr) {
-    co_return absl::InvalidArgumentError("FullDesiredState batch is empty");
+    const std::shared_ptr<MetaDataControlServer::Core>& core, SessionIo& io,
+    std::shared_ptr<const NodeControlBatch> batch, std::string_view node_id,
+    std::uint64_t generation) {
+  if (batch == nullptr)
+    co_return absl::InvalidArgumentError("bootstrap batch is empty");
+  std::uint64_t validated_index = batch->full_state.control_revision;
+  const auto validate = [&]() -> absl::Status {
+    if (!AuthoritySessionsAllowed(*core, generation))
+      return absl::CancelledError("Meta leadership ended during bootstrap");
+    const auto high_water = core->coordinator_->CommittedHighWater();
+    if (high_water <= validated_index) return absl::OkStatus();
+    auto view = CommittedViewAtLeast(*core, high_water);
+    if (!view.ok()) return view.status();
+    auto latest = ProjectNodeBounded(*core, **view, node_id);
+    if (!latest.ok()) return latest.status();
+    if (EvaluateNodeReplacement(batch->full_state, latest->full_state,
+                                node_id) !=
+        MetaReplacementDisposition::kContinue)
+      return absl::AbortedError(
+          "bootstrap control was superseded before delivery");
+    validated_index = (*view)->applied_index();
+    return absl::OkStatus();
+  };
+  const std::string_view bytes = batch->encoded_full_state;
+  if (auto status = validate(); !status.ok()) co_return status;
+  if (bytes.size() <= control::kMaxFramePayloadBytes)
+    co_return co_await io.Send(control::MessagePriority::kReliable,
+                               control::WireMessage(batch->full_state));
+  auto object_id = control::GenerateId128();
+  if (!object_id.ok()) co_return object_id.status();
+  if (auto status =
+          co_await io.Send(control::MessagePriority::kReliable,
+                           control::WireMessage(control::TransferStart{
+                               .kind = control::TransferKind::kFullDesiredState,
+                               .object_id = *object_id,
+                               .total_length = bytes.size()}));
+      !status.ok())
+    co_return status;
+  for (std::size_t offset = 0; offset < bytes.size();
+       offset += control::kControlTransferChunkBytes) {
+    if (auto status = validate(); !status.ok()) co_return status;
+    if (auto status = co_await io.Send(
+            control::MessagePriority::kBulk,
+            control::WireMessage(control::TransferChunk{
+                .object_id = *object_id,
+                .offset = offset,
+                .bytes = std::string(bytes.substr(
+                    offset, control::kControlTransferChunkBytes))}));
+        !status.ok())
+      co_return status;
   }
-  // Aliasing retains the entire immutable projection batch while exposing its
-  // encoded member directly; a cancelled producer therefore cannot strand a
-  // borrowed 512 MiB view in the shared writer queue.
-  const std::string* encoded_member = &batch->encoded_full_state;
-  auto encoded =
-      std::shared_ptr<const std::string>(std::move(batch), encoded_member);
-  co_return co_await io.SendFullDesiredState(std::move(encoded));
+  // Data executes tasks as soon as End permits installation. A superseded
+  // bootstrap closes without End; no obsolete task becomes admissible.
+  if (auto status = validate(); !status.ok()) co_return status;
+  co_return co_await io.Send(
+      control::MessagePriority::kReliable,
+      control::WireMessage(control::TransferEnd{*object_id}));
 }
 
 celer::Task<absl::Status> AbortSupersededReplacement(
@@ -2084,7 +1859,7 @@ celer::Task<absl::Status> AbortSupersededReplacement(
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> EnsureCurrentBeforeDirectiveDispatch(
+celer::Task<absl::Status> ValidateBootstrapApplied(
     const std::shared_ptr<MetaDataControlServer::Core>& core, SessionIo& io,
     const NodeControlBatch& installed, std::string_view node_id,
     std::string_view boot_id, const control::WireId128& session_id,
@@ -2096,18 +1871,18 @@ celer::Task<absl::Status> EnsureCurrentBeforeDirectiveDispatch(
     std::vector<control::WireAuthorityAnchor>* fenced) {
   if (!AuthoritySessionsAllowed(*core, leadership_generation)) {
     co_return absl::CancelledError(
-        "Meta authority is unavailable before directive dispatch");
+        "Meta authority is unavailable during bootstrap validation");
   }
   if (commit_signal.delivery_failed_.load(std::memory_order_acquire) ||
       commit_subscription.needs_resync()) {
     co_return absl::ResourceExhaustedError(
-        "Meta commit subscription overflowed before directive dispatch");
+        "Meta commit subscription overflowed during bootstrap validation");
   }
 
   // Always take one fresh atomic view here instead of relying solely on a
-  // mailbox dirty bit. This is the final fail-closed barrier after the Data
-  // node has applied an object and before any storage-mutating directive from
-  // that object can be emitted.
+  // mailbox dirty bit. Tasks were current at the final delivery boundary;
+  // changes concurrent with delivery now fence or close the installed session
+  // before it can receive new authority.
   const std::uint64_t high_water = core->coordinator_->CommittedHighWater();
   auto cached_view = CommittedViewAtLeast(*core, high_water);
   if (!cached_view.ok()) co_return cached_view.status();
@@ -2126,12 +1901,11 @@ celer::Task<absl::Status> EnsureCurrentBeforeDirectiveDispatch(
     co_return status;
   }
   if (!latest.ok()) co_return latest.status();
-  if (EvaluateReplacementDisposition(installed.full_state,
-                                     latest->full_state) ==
+  if (EvaluateNodeReplacement(installed.full_state, latest->full_state,
+                              node_id) ==
       MetaReplacementDisposition::kAbortSuperseded) {
     co_return absl::AbortedError(
-        "installed FullDesiredState was superseded before directive "
-        "dispatch");
+        "bootstrap state changed concurrently with installation");
   }
   *validated_committed_high_water = view.applied_index();
   co_return absl::OkStatus();
@@ -2246,9 +2020,7 @@ celer::Task<absl::Status> FenceSupersededAuthorityLive(
         .target_boot_id = state->boot_id_,
         .basis =
             control::WireProjectionBasis{
-                .source_meta_applied_index =
-                    installed.full_state.source_meta_applied_index,
-                .projection_hash = installed.full_state.projection_hash,
+                .control_revision = installed.full_state.control_revision,
             },
         .reject_through = anchor,
     };
@@ -2309,8 +2081,8 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
     co_return fenced;
   }
   if (!latest.ok()) co_return latest.status();
-  const MetaReplacementDisposition disposition = EvaluateReplacementDisposition(
-      replacement.full_state, latest->full_state);
+  const MetaReplacementDisposition disposition = EvaluateNodeReplacement(
+      replacement.full_state, latest->full_state, state->node_id_);
   if (disposition == MetaReplacementDisposition::kContinue) {
     // Keep projection_superseded_ set until the complete object is Applied
     // and the final stable-view check succeeds. This cursor only avoids
@@ -2322,10 +2094,13 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
 }
 
 celer::Task<absl::StatusOr<detail::MetaPublisherTransferDisposition>>
-SendReplacementFullStateLive(const std::shared_ptr<LiveSessionState>& state,
-                             const NodeControlBatch& installed,
-                             const NodeControlBatch& replacement) {
-  const std::string_view bytes = replacement.encoded_full_state;
+SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
+                      const NodeControlBatch& installed,
+                      const NodeControlBatch& replacement,
+                      const control::NodeControlUpdate& update) {
+  auto encoded = control::EncodeNodeControlUpdate(update);
+  if (!encoded.ok()) co_return encoded.status();
+  const std::string_view bytes = *encoded;
   if (bytes.size() > control::kMaxFullDesiredStateBytes) {
     co_return absl::ResourceExhaustedError(
         "FullDesiredState transfer exceeds its object-size limit");
@@ -2347,7 +2122,8 @@ SendReplacementFullStateLive(const std::shared_ptr<LiveSessionState>& state,
     // Arm before the single frame for the same reason the streamed path arms
     // before TransferEnd: the reader may observe an immediate Applied while
     // this producer is still returning from the socket write.
-    state->expected_applied_ = AppliedReceipt(replacement);
+    state->expected_applied_ = control::FullStateApplied{
+        update.request_id, replacement.full_state.control_revision};
     state->applied_received_ = false;
     if (absl::Status armed =
             state->applied_ack_deadline_->Arm(std::chrono::milliseconds(
@@ -2357,8 +2133,7 @@ SendReplacementFullStateLive(const std::shared_ptr<LiveSessionState>& state,
       co_return armed;
     }
     if (absl::Status sent = co_await state->io_->Send(
-            control::MessagePriority::kReliable,
-            control::WireMessage(replacement.full_state));
+            control::MessagePriority::kReliable, control::WireMessage(update));
         !sent.ok()) {
       ClearPublisherApplied(state);
       co_return sent;
@@ -2387,10 +2162,9 @@ SendReplacementFullStateLive(const std::shared_ptr<LiveSessionState>& state,
   auto object_id = control::GenerateId128();
   if (!object_id.ok()) co_return object_id.status();
   const control::TransferStart start{
-      .kind = control::TransferKind::kFullDesiredState,
+      .kind = control::TransferKind::kNodeControlUpdate,
       .object_id = *object_id,
       .total_length = bytes.size(),
-      .sha256 = control::ComputeSha256(bytes),
   };
   if (absl::Status sent = co_await state->io_->Send(
           control::MessagePriority::kReliable, control::WireMessage(start));
@@ -2446,7 +2220,8 @@ SendReplacementFullStateLive(const std::shared_ptr<LiveSessionState>& state,
   // Arm before TransferEnd so the sole reader can accept an immediate Applied
   // response. FenceAck is tracked independently, allowing a commit discovered
   // after End to revoke old authority while Applied is also in flight.
-  state->expected_applied_ = AppliedReceipt(replacement);
+  state->expected_applied_ = control::FullStateApplied{
+      update.request_id, replacement.full_state.control_revision};
   state->applied_received_ = false;
   if (absl::Status armed =
           state->applied_ack_deadline_->Arm(std::chrono::milliseconds(
@@ -2482,46 +2257,6 @@ SendReplacementFullStateLive(const std::shared_ptr<LiveSessionState>& state,
   co_return detail::MetaPublisherTransferDisposition::kApplied;
 }
 
-celer::Task<absl::Status> RunDirectiveSender(
-    std::shared_ptr<LiveSessionState> state) {
-  const std::shared_ptr<const NodeControlBatch> batch = state->installed_;
-  absl::Status status = co_await SendDirectives(
-      *state->io_, *batch, state->session_id_, state->node_id_, state->boot_id_,
-      state->receipt_tracker_,
-      [state, batch] {
-        return !state->closing_ &&
-               AuthoritySessionsAllowed(*state->core_,
-                                        state->leadership_generation_) &&
-               ProjectionCurrent(*state) && state->installed_ == batch;
-      },
-      [state](bool active) { state->directive_transfer_active_ = active; });
-  state->directive_transfer_active_ = false;
-  const bool superseded =
-      status.code() == absl::StatusCode::kCancelled &&
-      (state->projection_superseded_ ||
-       CommitPending(*state->commit_signal_,
-                     state->validated_committed_high_water_) ||
-       state->installed_ != batch);
-  FinishLiveSessionTask(state, &state->directive_sender_running_);
-  if (!status.ok() && !superseded && !state->closing_) {
-    FailLiveSession(state, status);
-  }
-  co_return status;
-}
-
-void StartDirectiveSender(const std::shared_ptr<LiveSessionState>& state) {
-  if (state->closing_ || state->directive_sender_running_ ||
-      !AuthoritySessionsAllowed(*state->core_, state->leadership_generation_) ||
-      !ProjectionCurrent(*state) ||
-      state->installed_->full_state.current_directives.empty() ||
-      !state->receipt_tracker_.HasUndispatched()) {
-    return;
-  }
-  state->directive_sender_running_ = true;
-  ++state->active_tasks_;
-  state->worker_->Spawn(RunDirectiveSender(state));
-}
-
 celer::Task<absl::Status> SessionPublisherBody(
     const std::shared_ptr<LiveSessionState>& state) {
   while (
@@ -2549,9 +2284,10 @@ celer::Task<absl::Status> SessionPublisherBody(
     std::shared_ptr<const NodeControlBatch> installed = state->installed_;
     const control::FullDesiredState* latest_state =
         latest.ok() ? &latest->full_state : nullptr;
-    if (!latest.ok() || EvaluateReplacementDisposition(installed->full_state,
-                                                       latest->full_state) ==
-                            MetaReplacementDisposition::kAbortSuperseded) {
+    if (!latest.ok() ||
+        EvaluateNodeReplacement(installed->full_state, latest->full_state,
+                                state->node_id_) ==
+            MetaReplacementDisposition::kAbortSuperseded) {
       state->projection_superseded_ = true;
     }
     if (absl::Status fenced = co_await FenceSupersededAuthorityLive(
@@ -2560,45 +2296,30 @@ celer::Task<absl::Status> SessionPublisherBody(
       co_return fenced;
     }
     if (!latest.ok()) co_return latest.status();
-    if (EvaluateReplacementDisposition(installed->full_state,
-                                       latest->full_state) ==
+    if (EvaluateNodeReplacement(installed->full_state, latest->full_state,
+                                state->node_id_) ==
         MetaReplacementDisposition::kContinue) {
-      // An unrelated commit can interrupt the sender at its next directive
-      // boundary without changing this node's semantic projection. Preserve
-      // per-session dispatch progress: StartDirectiveSender is a no-op when all
-      // identities were already written and otherwise resumes only the unsent
-      // suffix retained by receipt_tracker_.
+      // No selected object changed. Advance only Meta's validation cursor.
       state->validated_committed_high_water_ = std::max(
           state->validated_committed_high_water_, view.applied_index());
       state->core_->options_.runtime_status_->MarkValidated(
           state->node_id_, state->session_id_,
           state->validated_committed_high_water_);
       state->projection_superseded_ = false;
-      StartDirectiveSender(state);
-      continue;
-    }
-
-    if (state->directive_sender_running_) {
-      // The Fence above is an independent authority producer: it enters the
-      // shared writer's authority lane and overtakes a long Directive object
-      // between chunks. Do not overlap the new FDS transfer with that object;
-      // after a transfer was in flight, close and let reconnect start from the
-      // newest atomic projection.
-      if (state->directive_transfer_active_) {
-        co_return absl::AbortedError(
-            "projection superseded an in-flight Directive transfer");
-      }
-      while (!state->closing_ && state->directive_sender_running_) {
-        co_await state->tasks_changed_.Wait();
-      }
-      if (state->closing_) break;
       continue;
     }
 
     state->core_->options_.runtime_status_->Remove(state->node_id_,
                                                    &state->session_id_);
+    auto next =
+        control::SelectNodeControlState(latest->full_state, state->node_id_);
+    auto update = control::DiffNodeControlState(state->selected_, next);
+    auto request_id = control::GenerateId128();
+    if (!request_id.ok()) co_return request_id.status();
+    update.request_id = *request_id;
+    latest->full_state.control_revision = next.local.revision;
     auto published =
-        co_await SendReplacementFullStateLive(state, *installed, *latest);
+        co_await SendControlUpdateLive(state, *installed, *latest, update);
     if (!published.ok()) {
       co_return published.status();
     }
@@ -2611,6 +2332,7 @@ celer::Task<absl::Status> SessionPublisherBody(
       continue;
     }
     state->core_->full_states_sent_.fetch_add(1, std::memory_order_relaxed);
+    state->selected_ = std::move(next);
     state->installed_ = RetainProjection(std::move(*latest));
     state->publisher_adoption_gate_.MarkProjectionAdopted();
     state->response_changed_.NotifyAll(*state->worker_);
@@ -2624,13 +2346,13 @@ celer::Task<absl::Status> SessionPublisherBody(
                           kAwaitExactAppliedAndRetryInSession) {
       // Data installed this exact intermediate object and its Applied was
       // consumed above. Retain it as the real session baseline, but skip
-      // directive/lease publication until the newest FDS is also installed.
+      // lease publication until the latest control state is installed.
       continue;
     }
 
     // Data has applied this object, but a commit may have landed behind its
-    // End/Ack exchange. Re-enter the publisher before rebuilding receipt
-    // state or dispatching any directive from an intermediate projection.
+    // End/Ack exchange. Re-enter the publisher before granting new authority
+    // against an intermediate control state.
     const std::uint64_t stable_high_water =
         state->core_->coordinator_->CommittedHighWater();
     auto cached_stable_view =
@@ -2640,26 +2362,19 @@ celer::Task<absl::Status> SessionPublisherBody(
     auto stable =
         ProjectNodeBounded(*state->core_, stable_view, state->node_id_);
     if (!stable.ok() ||
-        EvaluateReplacementDisposition(state->installed_->full_state,
-                                       stable->full_state) ==
+        EvaluateNodeReplacement(state->installed_->full_state,
+                                stable->full_state, state->node_id_) ==
             MetaReplacementDisposition::kAbortSuperseded) {
       continue;
     }
     state->validated_committed_high_water_ = std::max(
         state->validated_committed_high_water_, stable_view.applied_index());
-    if (absl::Status rebuilt = state->receipt_tracker_.Rebuild(
-            state->installed_->full_state.current_directives, state->node_id_,
-            state->boot_id_);
-        !rebuilt.ok()) {
-      co_return rebuilt;
-    }
     state->projection_superseded_ = false;
     state->core_->options_.runtime_status_->PublishCurrent(
         state->node_id_, state->boot_id_, state->session_id_,
         state->replication_history_id_, state->replication_flow_count_,
         state->session_generation_, state->leadership_generation_,
         state->validated_committed_high_water_, state->installed_->full_state);
-    StartDirectiveSender(state);
   }
   co_return absl::CancelledError(
       "data-control publisher stopped with its leadership generation");
@@ -2679,8 +2394,7 @@ celer::Task<absl::Status> HandleDirectiveResult(
     const std::shared_ptr<MetaDataControlServer::Core>& core, SessionIo& io,
     const control::DirectiveResult& result, std::string_view node_id,
     const MetaBootIncarnation& boot_id, std::uint64_t leadership_generation,
-    const control::WireId128& session_id,
-    const MetaDirectiveReceiptTracker& receipt_tracker) {
+    const control::WireId128& session_id) {
   auto parsed_boot = ParseIdentity<20>(result.recipient_boot_id,
                                        "directive result recipient boot id");
   if (!parsed_boot.ok() || *parsed_boot != boot_id ||
@@ -2726,14 +2440,8 @@ celer::Task<absl::Status> HandleDirectiveResult(
     co_return co_await io.Send(control::MessagePriority::kReliable,
                                control::WireMessage(NoLongerTracked(result)));
   }
-  // Matching committed results above and no-longer-tracked attempts are
-  // idempotent across receipt tracker replacement. A first live result must be
-  // consistent with the exact execution path observed in this session.
-  if (absl::Status receipt_path =
-          receipt_tracker.ValidateResult(result.identity, result.status);
-      !receipt_path.ok()) {
-    co_return receipt_path;
-  }
+  // Final outcomes are validated against committed task identity, independent
+  // of optional admission or progress responses on this connection.
   const MetaDirectiveSpec& spec = tracked->spec_;
   if (!IsKnownMetaDirective(spec.kind_)) {
     co_return absl::FailedPreconditionError(
@@ -2895,23 +2603,9 @@ celer::Task<absl::Status> RunEstablishedSession(
         co_return absl::InternalError(
             "committed client transfer has no typed kind");
       }
-      const control::TransferKind kind = *client_transfer_sink.kind();
-      const control::MessageType message_type =
-          kind == control::TransferKind::kDirectiveResult
-              ? control::MessageType::kDirectiveResult
-              : control::MessageType::kOperationEvidence;
-      auto decoded =
-          control::DecodeMessage(message_type, client_transfer_sink.Take());
+      auto decoded = control::DecodeMessage(
+          control::MessageType::kDirectiveResult, client_transfer_sink.Take());
       if (!decoded.ok()) co_return decoded.status();
-      const bool right_type =
-          (kind == control::TransferKind::kDirectiveResult &&
-           std::holds_alternative<control::DirectiveResult>(*decoded)) ||
-          (kind == control::TransferKind::kObservationEvidence &&
-           std::holds_alternative<control::OperationEvidence>(*decoded));
-      if (!right_type) {
-        co_return absl::InvalidArgumentError(
-            "client transfer decoded to the wrong message type");
-      }
       incoming = std::move(*decoded);
     }
 
@@ -3001,7 +2695,7 @@ celer::Task<absl::Status> RunEstablishedSession(
               state->core_->options_.leadership_validity_ms_,
           .node_id_ = state->node_id_,
           .boot_id_ = state->boot_id_,
-          .applied_projection_hash_ = installed->full_state.projection_hash,
+          .applied_projection_index_ = installed->full_state.control_revision,
           .desired_ = &installed->full_state,
       };
       control::LeaseDecision lease =
@@ -3052,58 +2746,26 @@ celer::Task<absl::Status> RunEstablishedSession(
       continue;
     }
 
-    if (const auto* evidence =
-            std::get_if<control::OperationEvidence>(&*incoming)) {
-      const std::uint64_t committed_high_water =
-          state->core_->coordinator_->CommittedHighWater();
-      auto cached_view =
-          CommittedViewAtLeast(*state->core_, committed_high_water);
-      if (!cached_view.ok()) co_return cached_view.status();
-      const MetaCommittedView& latest_view = **cached_view;
-      const MetaStoresFacts facts(latest_view.stores());
-      const absl::Status ingested = IngestOperationEvidenceObservation(
-          *state->core_->observations_, facts, state->node_id_, boot_id,
-          session_generation, state->session_id_, *evidence, NowUnixMillis());
-      if (ingested.ok()) {
-        state->core_->observations_accepted_.fetch_add(
-            1, std::memory_order_relaxed);
-      } else {
-        if (ingested.code() != absl::StatusCode::kFailedPrecondition) {
-          co_return ingested;
-        }
-        // Operation evidence is soft/latest-wins state. A stale report is
-        // audited and discarded without taking down the otherwise current
-        // authority session; malformed framing/schema was already rejected
-        // before this domain admission point.
-        state->core_->observations_rejected_.fetch_add(
-            1, std::memory_order_relaxed);
-      }
-      continue;
-    }
 
     if (const auto* result =
             std::get_if<control::DirectiveResult>(&*incoming)) {
       if (absl::Status handled = co_await HandleDirectiveResult(
               state->core_, *state->io_, *result, state->node_id_, boot_id,
-              state->leadership_generation_, state->session_id_,
-              state->receipt_tracker_);
+              state->leadership_generation_, state->session_id_);
           !handled.ok()) {
         co_return handled;
       }
       continue;
     }
     if (const auto* receipt =
-            std::get_if<control::DirectiveReceipt>(&*incoming)) {
+            std::get_if<control::DirectiveResponse>(&*incoming)) {
       if (receipt->session_id != state->session_id_ ||
           receipt->recipient_boot_id != state->boot_id_) {
         co_return absl::InvalidArgumentError(
             "directive receipt does not name the current session/boot");
       }
-      if (absl::Status observed = state->receipt_tracker_.Observe(
-              receipt->identity, receipt->stage);
-          !observed.ok()) {
-        co_return observed;
-      }
+      // Admission is advisory. A superseded task may reply after replacement;
+      // only its final outcome attempts a committed-state transition.
       continue;
     }
     co_return absl::InvalidArgumentError("unexpected data-control message");
@@ -3878,7 +3540,9 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
       !sent.ok()) {
     co_return finish(sent);
   }
-  if (absl::Status sent = co_await SendFullState(io, batch); !sent.ok()) {
+  if (absl::Status sent = co_await SendFullState(core, io, batch, node_id,
+                                                 leadership_generation);
+      !sent.ok()) {
     co_return finish(sent);
   }
   core->full_states_sent_.fetch_add(1, std::memory_order_relaxed);
@@ -3886,7 +3550,7 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
     co_return finish(applied, true);
   }
   std::uint64_t validated_committed_high_water = 0;
-  if (absl::Status current = co_await EnsureCurrentBeforeDirectiveDispatch(
+  if (absl::Status current = co_await ValidateBootstrapApplied(
           core, io, *batch, node_id, hello->boot_id, *session_id,
           leadership_generation, *commit_signal, *commit_subscription,
           &validated_committed_high_water, &deferred, max_deferred_messages,
@@ -3912,6 +3576,8 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   // SessionLoop coroutine frame outlives the publisher, so copying here would
   // pin the initial generation after every later replacement.
   live->installed_ = std::move(batch);
+  live->selected_ =
+      control::SelectNodeControlState(live->installed_->full_state, node_id);
   live->validated_committed_high_water_ = validated_committed_high_water;
   live->fenced_authorities_ = std::move(fenced_authorities);
   const std::weak_ptr<LiveSessionState> weak_live = live;
@@ -3945,12 +3611,6 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
                       "deadline"));
             }
           });
-  if (absl::Status rebuilt = live->receipt_tracker_.Rebuild(
-          live->installed_->full_state.current_directives, node_id,
-          hello->boot_id);
-      !rebuilt.ok()) {
-    co_return finish(rebuilt, true);
-  }
   core->options_.runtime_status_->PublishCurrent(
       node_id, hello->boot_id, *session_id, *replication_history_id,
       hello->replication_flow_count, session_generation, leadership_generation,
@@ -3965,7 +3625,6 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   live->publisher_running_ = true;
   ++live->active_tasks_;
   live->worker_->Spawn(RunSessionPublisher(live));
-  StartDirectiveSender(live);
   absl::Status session_status =
       co_await RunEstablishedSession(live, *boot_id, *replication_history_id,
                                      session_generation, std::move(deferred));

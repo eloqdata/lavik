@@ -208,7 +208,7 @@ RegisterNode MakeRegister(std::uint8_t seed) {
   cmd.node_id_ = MakeNodeId(seed);
   cmd.principal_ = MakeNodePrincipal(seed);
   cmd.endpoints_ = {"10.0.0.1:7000"};
-  cmd.capability_mask_ = 0x5;
+
   cmd.role_ = keylane::meta::MetaNodeRole::kReplica;
   return cmd;
 }
@@ -653,12 +653,8 @@ TEST_F(MetaCoordinatorComponentTest, CommittedViewFactsAnswerFromStores) {
   EXPECT_EQ(facts.CurrentGroupTerm("g1"), 1u);
   EXPECT_EQ(facts.CurrentGroupTerm("no-such-group"), 0u);
   EXPECT_EQ(facts.CurrentPopulationManifestRevision("g1"), 0u);
-  EXPECT_TRUE(facts.OperationNonTerminal(MakeOperationId(0x64)));
-  EXPECT_FALSE(facts.OperationNonTerminal(MakeOperationId(0x65)));
   keylane::meta::MetaReplicationHistoryId unbound_history{};
   unbound_history.back() = 1;
-  EXPECT_FALSE(
-      facts.HistoryBoundToOperation(MakeOperationId(0x64), unbound_history));
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,9 +1208,9 @@ TEST_F(MetaCoordinatorServerTest,
   SeedControlledFailover(failover, /*begin_transition=*/false);
   const auto before = machine_->StoresSnapshot();
   const auto before_group = before.topology_.FindGroup("g1");
-  const auto before_grant = before.grant_.Serialize();
+  const auto before_grant = before.topology_.AuthorityFor("g1");
   ASSERT_TRUE(before_group.has_value());
-  ASSERT_TRUE(before_grant.ok()) << before_grant.status();
+  ASSERT_TRUE(before_grant.has_value());
 
   {
     std::lock_guard<std::mutex> lock(role_mu_);
@@ -1244,8 +1240,8 @@ TEST_F(MetaCoordinatorServerTest,
   EXPECT_EQ(operation->terminal_result_, abort.reason_);
   EXPECT_FALSE(operation->data_loss_possible_);
   EXPECT_EQ(after.topology_.FindGroup("g1"), before_group);
-  const auto after_grant = after.grant_.Serialize();
-  ASSERT_TRUE(after_grant.ok()) << after_grant.status();
+  const auto after_grant = after.topology_.AuthorityFor("g1");
+  ASSERT_TRUE(after_grant.has_value());
   EXPECT_EQ(*after_grant, *before_grant);
 
   // A fresh request id cannot turn the idempotent post-state into another WAL
@@ -1268,10 +1264,10 @@ TEST_F(MetaCoordinatorServerTest,
   SeedControlledFailover(failover, /*begin_transition=*/true);
   const auto before = machine_->StoresSnapshot();
   const auto before_group = before.topology_.FindGroup("g1");
-  const auto before_grant = before.grant_.Serialize();
+  const auto before_grant = before.topology_.AuthorityFor("g1");
   ASSERT_TRUE(before_group.has_value());
   ASSERT_TRUE(before_group->failover_transition_.has_value());
-  ASSERT_TRUE(before_grant.ok()) << before_grant.status();
+  ASSERT_TRUE(before_grant.has_value());
 
   {
     std::lock_guard<std::mutex> lock(role_mu_);
@@ -1363,8 +1359,8 @@ TEST_F(MetaCoordinatorServerTest,
   auto expected_group = *before_group;
   expected_group.failover_transition_.reset();
   EXPECT_EQ(after.topology_.FindGroup("g1"), expected_group);
-  const auto after_grant = after.grant_.Serialize();
-  ASSERT_TRUE(after_grant.ok()) << after_grant.status();
+  const auto after_grant = after.topology_.AuthorityFor("g1");
+  ASSERT_TRUE(after_grant.has_value());
   EXPECT_EQ(*after_grant, *before_grant);
 
   const auto abort_audit = after.audit_.Find(aborted->log_index_);

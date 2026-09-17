@@ -50,34 +50,25 @@ absl::Status ValidateClusterLifecycle(
   const bool root_is_zero = IsZero(lifecycle.root_operation_id_);
   switch (lifecycle.state_) {
     case MetaClusterLifecycle::kUninitialized:
-      if (lifecycle.revision_ == 0 && root_is_zero &&
-          lifecycle.genesis_commit_index_ == 0 &&
-          lifecycle.terminal_outcome_ == MetaClusterTerminalOutcome::kNone &&
+      if (root_is_zero && lifecycle.genesis_commit_index_ == 0 &&
           lifecycle.failure_summary_.empty()) {
         return absl::OkStatus();
       }
       break;
     case MetaClusterLifecycle::kCreating:
-      if (lifecycle.revision_ == 1 && !root_is_zero &&
-          lifecycle.genesis_commit_index_ != 0 &&
-          lifecycle.terminal_outcome_ == MetaClusterTerminalOutcome::kNone &&
+      if (!root_is_zero && lifecycle.genesis_commit_index_ != 0 &&
           lifecycle.failure_summary_.empty()) {
         return absl::OkStatus();
       }
       break;
     case MetaClusterLifecycle::kCreated:
-      if (lifecycle.revision_ == 2 && !root_is_zero &&
-          lifecycle.genesis_commit_index_ != 0 &&
-          lifecycle.terminal_outcome_ == MetaClusterTerminalOutcome::kCreated &&
+      if (!root_is_zero && lifecycle.genesis_commit_index_ != 0 &&
           lifecycle.failure_summary_.empty()) {
         return absl::OkStatus();
       }
       break;
     case MetaClusterLifecycle::kProvisioningFailed:
-      if (lifecycle.revision_ == 2 && !root_is_zero &&
-          lifecycle.genesis_commit_index_ != 0 &&
-          lifecycle.terminal_outcome_ ==
-              MetaClusterTerminalOutcome::kProvisioningFailed &&
+      if (!root_is_zero && lifecycle.genesis_commit_index_ != 0 &&
           !lifecycle.failure_summary_.empty() &&
           lifecycle.failure_summary_.size() <=
               kMaxMetaClusterFailureSummaryBytes &&
@@ -124,7 +115,7 @@ absl::Status MetaTopologyStore::BeginClusterCreate(
     return MetaDomainRejectError("cluster has already accepted creation");
   }
   cluster_lifecycle_.state_ = MetaClusterLifecycle::kCreating;
-  cluster_lifecycle_.revision_ = 1;
+
   cluster_lifecycle_.root_operation_id_ = root_operation_id;
   cluster_lifecycle_.genesis_commit_index_ = genesis_commit_index;
   return absl::OkStatus();
@@ -133,10 +124,7 @@ absl::Status MetaTopologyStore::BeginClusterCreate(
 absl::Status MetaTopologyStore::CompleteClusterCreate(
     const MetaOperationId& root_operation_id) {
   if (cluster_lifecycle_.state_ == MetaClusterLifecycle::kCreated &&
-      cluster_lifecycle_.revision_ == 2 &&
       cluster_lifecycle_.root_operation_id_ == root_operation_id &&
-      cluster_lifecycle_.terminal_outcome_ ==
-          MetaClusterTerminalOutcome::kCreated &&
       cluster_lifecycle_.failure_summary_.empty()) {
     return absl::OkStatus();
   }
@@ -145,12 +133,8 @@ absl::Status MetaTopologyStore::CompleteClusterCreate(
     return MetaDomainRejectError(
         "cluster create completion does not match the active root");
   }
-  if (cluster_lifecycle_.revision_ == UINT64_MAX) {
-    return MetaDomainRejectError("cluster lifecycle revision exhausted");
-  }
   cluster_lifecycle_.state_ = MetaClusterLifecycle::kCreated;
-  ++cluster_lifecycle_.revision_;
-  cluster_lifecycle_.terminal_outcome_ = MetaClusterTerminalOutcome::kCreated;
+
   cluster_lifecycle_.failure_summary_.clear();
   return absl::OkStatus();
 }
@@ -167,10 +151,7 @@ absl::Status MetaTopologyStore::FailClusterCreate(
         "cluster failure summary is empty, unsafe, or over cap");
   }
   if (cluster_lifecycle_.state_ == MetaClusterLifecycle::kProvisioningFailed &&
-      cluster_lifecycle_.revision_ == 2 &&
       cluster_lifecycle_.root_operation_id_ == root_operation_id &&
-      cluster_lifecycle_.terminal_outcome_ ==
-          MetaClusterTerminalOutcome::kProvisioningFailed &&
       cluster_lifecycle_.failure_summary_ == failure_summary) {
     return absl::OkStatus();
   }
@@ -179,13 +160,8 @@ absl::Status MetaTopologyStore::FailClusterCreate(
     return MetaDomainRejectError(
         "cluster create failure does not match the active root");
   }
-  if (cluster_lifecycle_.revision_ == UINT64_MAX) {
-    return MetaDomainRejectError("cluster lifecycle revision exhausted");
-  }
   cluster_lifecycle_.state_ = MetaClusterLifecycle::kProvisioningFailed;
-  ++cluster_lifecycle_.revision_;
-  cluster_lifecycle_.terminal_outcome_ =
-      MetaClusterTerminalOutcome::kProvisioningFailed;
+
   cluster_lifecycle_.failure_summary_ = std::move(failure_summary);
   return absl::OkStatus();
 }
@@ -450,29 +426,6 @@ absl::Status MetaTopologyStore::Apply(const SetGroupReplicationState& cmd) {
   return absl::OkStatus();
 }
 
-absl::Status MetaTopologyStore::SetOwner(const std::string& group_id,
-                                         const std::string& new_owner) {
-  if (new_owner.size() > kMetaNodeIdBytes) {
-    return MetaDomainRejectError("owner node_id over cap");
-  }
-  const auto it = groups_.find(group_id);
-  if (it == groups_.end()) {
-    return MetaDomainRejectError(absl::StrCat("unknown group ", group_id));
-  }
-  it->second.record_.owner_ = new_owner;  // absolute; same value = no-op
-  return absl::OkStatus();
-}
-
-absl::Status MetaTopologyStore::SetGroupTerm(const std::string& group_id,
-                                             std::uint64_t term) {
-  const auto it = groups_.find(group_id);
-  if (it == groups_.end()) {
-    return MetaDomainRejectError(absl::StrCat("unknown group ", group_id));
-  }
-  it->second.record_.group_term_ = term;
-  return absl::OkStatus();
-}
-
 absl::Status MetaTopologyStore::SetPopulationManifest(
     const std::string& group_id, std::uint64_t manifest_revision,
     const MetaHash256& manifest_digest) {
@@ -616,6 +569,78 @@ absl::Status MetaTopologyStore::SetTopologyEpoch(
   return absl::OkStatus();
 }
 
+absl::Status MetaTopologyStore::BeginGroupTerm(
+    const keylane::meta::BeginGroupTerm& command) {
+  const auto it = groups_.find(command.group_id_);
+  if (it == groups_.end()) return MetaDomainRejectError("unknown group");
+  GroupState& group = it->second;
+  if (command.expected_term_ == std::numeric_limits<std::uint64_t>::max() ||
+      command.new_term_ != command.expected_term_ + 1) {
+    return MetaDomainRejectError("new term must be exactly expected term + 1");
+  }
+  if (group.record_.group_term_ != command.expected_term_) {
+    if (group.record_.group_term_ == command.new_term_ &&
+        !group.authority_active_)
+      return absl::OkStatus();
+    return MetaDomainRejectError("expected term does not match current term");
+  }
+  group.record_.group_term_ = command.new_term_;
+  group.authority_active_ = false;
+  group.activation_action_id_.reset();
+  return absl::OkStatus();
+}
+
+absl::Status MetaTopologyStore::ValidateActivate(
+    const keylane::meta::ActivateAuthority& command,
+    std::optional<MetaFailoverActionId> action) const {
+  if (action.has_value() && IsZero(*action))
+    return MetaDomainRejectError("failover activation action id is zero");
+  const auto it = groups_.find(command.group_id_);
+  if (it == groups_.end()) return MetaDomainRejectError("unknown group");
+  const GroupState& group = it->second;
+  if (command.expected_term_ == 0 ||
+      group.record_.group_term_ != command.expected_term_)
+    return MetaDomainRejectError("authority requires the current nonzero term");
+  if (command.new_owner_.empty() ||
+      command.new_owner_.size() > kMetaNodeIdBytes)
+    return MetaDomainRejectError("invalid authority owner");
+  if (group.authority_active_ && (group.record_.owner_ != command.new_owner_ ||
+                                  group.activation_action_id_ != action))
+    return MetaDomainRejectError("group term already has an active grant");
+  return absl::OkStatus();
+}
+
+absl::Status MetaTopologyStore::ActivateAuthority(
+    const keylane::meta::ActivateAuthority& command,
+    std::optional<MetaFailoverActionId> action) {
+  if (auto status = ValidateActivate(command, action); !status.ok())
+    return status;
+  GroupState& group = groups_.at(command.group_id_);
+  group.record_.owner_ = command.new_owner_;
+  group.authority_active_ = true;
+  group.activation_action_id_ = std::move(action);
+  return absl::OkStatus();
+}
+
+std::optional<MetaGroupAuthorityView> MetaTopologyStore::AuthorityFor(
+    std::string_view group_id) const {
+  const auto it = groups_.find(std::string(group_id));
+  if (it == groups_.end()) return std::nullopt;
+  const GroupState& group = it->second;
+  MetaGroupAuthorityView view{.group_term_ = group.record_.group_term_};
+  if (group.authority_active_)
+    view.grant_ = MetaActiveAuthorityView{group.record_.owner_,
+                                          group.activation_action_id_};
+  return view;
+}
+
+std::optional<std::uint64_t> MetaTopologyStore::CurrentGroupTerm(
+    std::string_view group_id) const {
+  const auto it = groups_.find(std::string(group_id));
+  if (it == groups_.end()) return std::nullopt;
+  return it->second.record_.group_term_;
+}
+
 absl::Status MetaTopologyStore::ValidateTopologyEpoch(
     std::uint64_t new_topology_epoch) const {
   if (new_topology_epoch == topology_epoch_) return absl::OkStatus();
@@ -673,14 +698,13 @@ std::vector<MetaTopologyGroupView> MetaTopologyStore::Groups() const {
 // sorted (node_id, assignment_id) entries | slot run count u32 | sorted runs.
 // The lifecycle is intentionally in this store but independent of
 // topology_epoch: accepting Genesis is not itself a topology mutation.
-std::string MetaTopologyStore::Serialize() const {
-  MetaWriter w;
+void MetaTopologyStore::WriteSnapshot(MetaWriter& w) const {
   w.WriteU16(kMetaTopologyStoreFormatVersion);
   w.WriteU8(static_cast<std::uint8_t>(cluster_lifecycle_.state_));
-  w.WriteU64(cluster_lifecycle_.revision_);
+
   WriteFixedArray(w, cluster_lifecycle_.root_operation_id_);
   w.WriteU64(cluster_lifecycle_.genesis_commit_index_);
-  w.WriteU8(static_cast<std::uint8_t>(cluster_lifecycle_.terminal_outcome_));
+
   w.WriteString(cluster_lifecycle_.failure_summary_);
   w.WriteU64(topology_epoch_);
   w.WriteCount(static_cast<std::uint32_t>(groups_.size()));
@@ -688,6 +712,11 @@ std::string MetaTopologyStore::Serialize() const {
     w.WriteString(group_id);
     w.WriteString(group.record_.owner_);
     w.WriteU64(group.record_.group_term_);
+    w.WriteBool(group.authority_active_);
+    w.WriteOptional(group.activation_action_id_,
+                    [](MetaWriter& nested, const MetaFailoverActionId& id) {
+                      WriteFixedArray(nested, id);
+                    });
     w.WriteU64(group.record_.population_manifest_revision_);
     WriteFixedArray(w, group.record_.population_manifest_digest_);
     w.WriteU64(group.record_.partition_replication_epoch_);
@@ -733,7 +762,18 @@ std::string MetaTopologyStore::Serialize() const {
     w.WriteU16(static_cast<std::uint16_t>(last));
     w.WriteString(slots_[slot]);
   }
-  return w.TakeBuffer();
+}
+
+std::string MetaTopologyStore::Serialize() const {
+  MetaWriter writer;
+  WriteSnapshot(writer);
+  return writer.TakeBuffer();
+}
+
+std::uint64_t MetaTopologyStore::SerializedSize() const {
+  MetaWriter counter(false);
+  WriteSnapshot(counter);
+  return counter.size();
 }
 
 absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
@@ -746,21 +786,14 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   }
   auto lifecycle_state = r.ReadU8();
   if (!lifecycle_state.ok()) return lifecycle_state.status();
-  auto lifecycle_revision = r.ReadU64();
-  if (!lifecycle_revision.ok()) return lifecycle_revision.status();
   auto root_operation_id = ReadFixedArray<16>(r);
   if (!root_operation_id.ok()) return root_operation_id.status();
   auto genesis_commit_index = r.ReadU64();
   if (!genesis_commit_index.ok()) return genesis_commit_index.status();
-  auto terminal_outcome = r.ReadU8();
-  if (!terminal_outcome.ok()) return terminal_outcome.status();
   auto failure_summary = r.ReadString(kMaxMetaClusterFailureSummaryBytes);
   if (!failure_summary.ok()) return failure_summary.status();
-  if (*lifecycle_state > static_cast<std::uint8_t>(
-                             MetaClusterLifecycle::kProvisioningFailed) ||
-      *terminal_outcome >
-          static_cast<std::uint8_t>(
-              MetaClusterTerminalOutcome::kProvisioningFailed)) {
+  if (*lifecycle_state >
+      static_cast<std::uint8_t>(MetaClusterLifecycle::kProvisioningFailed)) {
     return MetaFailStopError("unknown cluster lifecycle tag");
   }
   auto topology_epoch = r.ReadU64();
@@ -771,11 +804,9 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   MetaTopologyStore store;
   store.cluster_lifecycle_.state_ =
       static_cast<MetaClusterLifecycle>(*lifecycle_state);
-  store.cluster_lifecycle_.revision_ = *lifecycle_revision;
+
   store.cluster_lifecycle_.root_operation_id_ = *root_operation_id;
   store.cluster_lifecycle_.genesis_commit_index_ = *genesis_commit_index;
-  store.cluster_lifecycle_.terminal_outcome_ =
-      static_cast<MetaClusterTerminalOutcome>(*terminal_outcome);
   store.cluster_lifecycle_.failure_summary_ = std::move(*failure_summary);
   if (absl::Status status = ValidateClusterLifecycle(store.cluster_lifecycle_);
       !status.ok()) {
@@ -789,6 +820,15 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     if (!owner.ok()) return owner.status();
     auto group_term = r.ReadU64();
     if (!group_term.ok()) return group_term.status();
+    auto active = r.ReadBool("invalid authority state");
+    if (!active.ok()) return active.status();
+    auto action = r.ReadOptional<MetaFailoverActionId>(
+        [](MetaReader& nested) { return ReadFixedArray<16>(nested); });
+    if (!action.ok()) return action.status();
+    if ((*active && (*group_term == 0 || owner->empty())) ||
+        (action->has_value() && (!*active || IsZero(**action)))) {
+      return MetaFailStopError("invalid group authority");
+    }
     auto manifest_revision = r.ReadU64();
     if (!manifest_revision.ok()) return manifest_revision.status();
     auto manifest_digest = ReadFixedArray<32>(r);
@@ -829,6 +869,8 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
       return MetaFailStopError("duplicate group_id in snapshot");
     }
     GroupState group;
+    group.authority_active_ = *active;
+    group.activation_action_id_ = std::move(*action);
     group.record_.owner_ = std::string(*owner);
     group.record_.group_term_ = *group_term;
     group.record_.population_manifest_revision_ = *manifest_revision;

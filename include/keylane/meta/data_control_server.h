@@ -145,7 +145,7 @@ class RetainedProjectionLimiter {
 };
 
 // Worker-local immutable view cache shared by all Data sessions. A Meta
-// commit may wake thousands of sessions, but the seven committed stores are
+// commit may wake thousands of sessions, but the six committed stores are
 // copied only once for each new applied high-water. Not thread-safe: the
 // data-control server owns and accesses it exclusively on its Celer worker.
 class MetaCommittedViewCache {
@@ -228,7 +228,7 @@ std::optional<std::uint64_t> ConfirmedLeaseForHeartbeat(
     const std::optional<MetaObservedOwnerProjection>& owner_projection);
 
 // Applies this Meta process's leadership-validity ceiling to a deterministic
-// Policy projection, then rebuilds every hash/basis/encoded byte that the
+// Policy projection, then rebuilds the encoded bytes that the
 // scalar influences. Local Raft timing must never enter committed apply.
 absl::Status ApplyLeadershipValidityLimit(NodeControlBatch& batch,
                                           std::uint32_t leadership_validity_ms);
@@ -300,17 +300,6 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
     std::uint64_t heartbeat_sequence,
     std::optional<std::uint64_t> confirmed_grant_sequence,
     std::int64_t now_unix_ms, std::uint64_t now_steady_ms);
-
-// Validates a typed operation-evidence envelope against the authenticated
-// session, then ingests it as volatile leader-local evidence. The reporter
-// node is derived from the connection; self-reported boot, assignment,
-// operation, population, and history are all exact identity anchors.
-absl::Status IngestOperationEvidenceObservation(
-    MetaObservationStore& observations, const MetaCommittedFacts& facts,
-    std::string_view node_id, const MetaBootIncarnation& boot,
-    std::uint64_t generation, const cluster::control::WireId128& session_id,
-    const cluster::control::OperationEvidence& evidence,
-    std::int64_t now_unix_ms);
 
 struct MetaDataControlServerOptions {
   std::uint32_t server_id_ = 0;
@@ -403,7 +392,7 @@ struct MetaLeaseEvaluation {
   std::uint32_t leadership_validity_ms_ = 0;
   std::string node_id_;
   std::string boot_id_;
-  cluster::control::WireHash256 applied_projection_hash_{};
+  std::uint64_t applied_projection_index_ = 0;
   const cluster::control::FullDesiredState* desired_ = nullptr;
 };
 
@@ -504,19 +493,6 @@ class MetaLeaderRuntimeGuard {
 absl::StatusOr<std::vector<cluster::control::WireMetaEndpoint>>
 BuildCommittedMetaDirectory(const MetaCommittedView& view);
 
-enum class MetaDirectiveDelivery : std::uint8_t {
-  kFrame,
-  kTransfer,
-};
-
-// Classifies the encoded live envelope, not just its opaque payload. This
-// keeps a directive just over the frame boundary from being rejected by the
-// normal writer while preserving the same canonical Directive codec inside a
-// streamed object.
-absl::StatusOr<MetaDirectiveDelivery> ClassifyDirectiveDelivery(
-    const cluster::control::WireProjectedDirective& directive,
-    const cluster::control::WireId128& session_id);
-
 // Returns installed local-primary authority anchors that no longer exist
 // unchanged in `latest`, excluding anchors already fenced in this session.
 // A null latest projection means the node was removed or cannot be projected,
@@ -539,45 +515,6 @@ enum class MetaReplacementDisposition : std::uint8_t {
 MetaReplacementDisposition EvaluateReplacementDisposition(
     const cluster::control::FullDesiredState& replacement,
     const cluster::control::FullDesiredState& latest);
-
-// Volatile per-session dispatch and receipt state. Rebuild resets the accepted
-// identities to the newly installed projection. A semantic no-op commit keeps
-// this state so a sender interrupted at the commit boundary resumes only work
-// that was never completely written. Observe accepts exact stage replay and
-// either Accepted -> Started -> Completed for admitted work or
-// Accepted -> Completed for a pre-start rejection. ValidateResult binds the
-// terminal status to the path actually observed on this session.
-class MetaDirectiveReceiptTracker {
- public:
-  absl::Status Rebuild(
-      std::span<const cluster::control::WireProjectedDirective> directives,
-      std::string_view node_id, std::string_view boot_id);
-
-  // Dispatch is recorded only after the complete frame or object transfer has
-  // been written. Unknown identities fail closed because they cannot belong to
-  // the installed projection for this node incarnation.
-  absl::StatusOr<bool> NeedsDispatch(
-      const cluster::control::WireDirectiveIdentity& identity) const;
-  absl::Status MarkDispatched(
-      const cluster::control::WireDirectiveIdentity& identity);
-  bool HasUndispatched() const noexcept;
-
-  absl::Status Observe(const cluster::control::WireDirectiveIdentity& identity,
-                       cluster::control::DirectiveReceiptStage stage);
-  absl::Status ValidateResult(
-      const cluster::control::WireDirectiveIdentity& identity,
-      cluster::control::DirectiveResultStatus status) const;
-  std::size_t size() const noexcept { return entries_.size(); }
-
- private:
-  struct Entry {
-    cluster::control::WireDirectiveIdentity identity_;
-    std::uint8_t stage_ = 0;
-    bool dispatched_ = false;
-    bool started_ = false;
-  };
-  std::vector<Entry> entries_;
-};
 
 class MetaDataControlServer final : public MetaReconciler {
  public:

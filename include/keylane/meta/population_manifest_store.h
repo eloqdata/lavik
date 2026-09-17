@@ -63,10 +63,13 @@ class MetaPopulationManifestStore {
   // Deserialize strictly enforces aggregate bytes, entry caps, sorting,
   // uniqueness, and digest agreement; violations fail stop.
   std::string Serialize() const;
+  // Exact durable size without allocating or copying snapshot bytes.
+  std::uint64_t SerializedSize() const;
   static absl::StatusOr<MetaPopulationManifestStore> Deserialize(
       std::string_view bytes);
 
  private:
+  void WriteSnapshot(MetaWriter& writer) const;
   std::map<MetaHash256, MetaPopulationManifestDocument> documents_;
 };
 

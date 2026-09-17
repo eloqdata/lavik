@@ -8,6 +8,7 @@
 #include "keylane/meta/failover.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/state_apply.h"
+#include "meta_topology_test_access.h"
 
 namespace {
 
@@ -101,7 +102,6 @@ void PopulateActivatedFixture(Fixture& fixture,
   group.group_id_ = "g1";
   group.new_topology_epoch_ = 1;
   ASSERT_TRUE(fixture.stores.topology_.Apply(group).ok());
-  ASSERT_TRUE(fixture.stores.grant_.AddGroup(group.group_id_).ok());
 
   meta::AssignNodeToGroup assign_owner;
   assign_owner.request_id_ = Filled<16>(0x07);
@@ -147,8 +147,10 @@ void PopulateActivatedFixture(Fixture& fixture,
   begin_term.group_id_ = "g1";
   begin_term.expected_term_ = 0;
   begin_term.new_term_ = 1;
-  ASSERT_TRUE(fixture.stores.grant_.BeginGroupTerm(begin_term).ok());
-  ASSERT_TRUE(fixture.stores.topology_.SetGroupTerm("g1", 1).ok());
+  ASSERT_TRUE(fixture.stores.topology_.BeginGroupTerm(begin_term).ok());
+  ASSERT_TRUE(keylane::meta::MetaTopologyTestAccess::SetGroupTerm(
+                  fixture.stores.topology_, "g1", 1)
+                  .ok());
 
   meta::ActivateAuthority activate;
   activate.request_id_ = Filled<16>(0x0b);
@@ -156,10 +158,12 @@ void PopulateActivatedFixture(Fixture& fixture,
   activate.expected_term_ = 1;
   activate.new_owner_ = fixture.owner;
   activate.new_topology_epoch_ = 4;
-  ASSERT_TRUE(fixture.stores.grant_.ValidateActivate(activate).ok());
-  ASSERT_TRUE(fixture.stores.topology_.SetOwner("g1", fixture.owner).ok());
+  ASSERT_TRUE(fixture.stores.topology_.ValidateActivate(activate).ok());
+  ASSERT_TRUE(keylane::meta::MetaTopologyTestAccess::SetOwner(
+                  fixture.stores.topology_, "g1", fixture.owner)
+                  .ok());
   ASSERT_TRUE(fixture.stores.topology_.SetTopologyEpoch(4).ok());
-  ASSERT_TRUE(fixture.stores.grant_.ApplyGrantPart(activate).ok());
+  ASSERT_TRUE(fixture.stores.topology_.ActivateAuthority(activate).ok());
 }
 
 void InstallControlledTransition(Fixture& fixture, std::uint64_t operation_seq,

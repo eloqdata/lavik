@@ -61,7 +61,7 @@ control::WireMessage OversizedDirective() {
 
 absl::StatusOr<std::string> FullStatePayload(std::size_t padding_bytes) {
   control::FullDesiredState state;
-  state.source_meta_applied_index = 1;
+  state.control_revision = 1;
   state.authority_lease_duration_ms = 3000;
   if (padding_bytes != 0) {
     control::WireManifestDocument manifest;
@@ -75,9 +75,6 @@ absl::StatusOr<std::string> FullStatePayload(std::size_t padding_bytes) {
     }
     state.manifests.push_back(std::move(manifest));
   }
-  auto projection = control::ComputeProjectionHash(state);
-  if (!projection.ok()) return projection.status();
-  state.projection_hash = *projection;
   return control::EncodeFullDesiredState(state);
 }
 
@@ -255,7 +252,7 @@ struct PriorityWriterScenario {
     writer_ = &writer;
     auto bytes = std::make_shared<const std::string>(24u * 1024u, 'x');
     transfer_status_ = co_await writer.WriteTransfer(
-        control::TransferKind::kObservationEvidence, control::WireId128{0x42},
+        control::TransferKind::kDirectiveResult, control::WireId128{0x42},
         std::move(bytes));
     for (unsigned attempt = 0; !authority_done_ && attempt < 100; ++attempt) {
       co_await celer::Yield(worker);
@@ -348,7 +345,7 @@ struct SerializedTransfersScenario {
   celer::Task<absl::Status> SendSecond(
       std::shared_ptr<const std::string> payload) {
     second_status_ = co_await writer_->WriteTransfer(
-        control::TransferKind::kObservationEvidence, control::WireId128{0x22},
+        control::TransferKind::kDirectiveResult, control::WireId128{0x22},
         std::move(payload));
     second_done_ = true;
     co_return absl::OkStatus();
@@ -392,7 +389,7 @@ struct SerializedTransfersScenario {
     writer_ = &writer;
     auto first = std::make_shared<const std::string>(24u * 1024u, 'x');
     first_status_ = co_await writer.WriteTransfer(
-        control::TransferKind::kObservationEvidence, control::WireId128{0x11},
+        control::TransferKind::kDirectiveResult, control::WireId128{0x11},
         std::move(first));
     for (unsigned attempt = 0; !second_done_ && attempt < 100; ++attempt) {
       co_await celer::Yield(worker);
@@ -655,7 +652,6 @@ TEST(ControlSessionWriterTest,
   ASSERT_NE(start, nullptr);
   EXPECT_EQ(start->kind, control::TransferKind::kFullDesiredState);
   EXPECT_EQ(start->total_length, scenario->large_bytes_.size());
-  EXPECT_EQ(start->sha256, control::ComputeSha256(scenario->large_bytes_));
   EXPECT_TRUE(
       std::holds_alternative<control::TransferEnd>(scenario->frames_.back()));
   EXPECT_TRUE(std::all_of(

@@ -76,7 +76,7 @@ absl::Status ValidateDialedMetaIdentity(
 // exact field-for-field match with the installed FDS directive set. The live
 // session id is intentionally excluded because FDS is session independent.
 absl::Status ValidateLiveDirective(const control::Directive& directive,
-                                   const control::FullDesiredState& desired,
+                                   const control::NodeControlState& desired,
                                    std::string_view local_node_id,
                                    std::string_view local_boot_id);
 

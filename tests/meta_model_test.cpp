@@ -1,3 +1,5 @@
+#include "meta_topology_test_access.h"
+
 // Model-layer tests for encoding
 // primitives (src/meta/encoding.cpp) and the committed command schema
 // (src/meta/commands.cpp).
@@ -339,7 +341,7 @@ keylane::meta::RegisterNode MakeRegisterNode() {
   cmd.node_id_ = "0123456789abcdef0123456789abcdef01234567";  // 40 hex
   cmd.principal_ = "keylane://node/0123456789abcdef0123456789abcdef01234567";
   cmd.endpoints_ = {"10.0.0.1:7000", "10.0.0.1:17000"};
-  cmd.capability_mask_ = 0x5;
+
   cmd.role_ = keylane::meta::MetaNodeRole::kReplica;
   return cmd;
 }
@@ -482,7 +484,7 @@ TEST(MetaModelCommands, UpdateNodeRoundTrip) {
   cmd.node_id_ = "0123456789abcdef0123456789abcdef01234567";
   cmd.expected_revision_ = 41;
   cmd.endpoints_ = {"10.0.0.9:7000"};
-  cmd.capability_mask_ = 0x3;
+
   ExpectRoundTrip(cmd);
 }
 
@@ -919,22 +921,6 @@ keylane::meta::MetaOperationId MakeOperationId(std::uint8_t seed) {
   return id;
 }
 
-keylane::meta::MetaEvidenceSummary MakeEvidence(std::uint8_t seed) {
-  keylane::meta::MetaEvidenceSummary ev;
-  ev.node_id_ = "0123456789abcdef0123456789abcdef01234567";
-  ev.group_id_ = "group-a";
-  ev.assignment_id_.fill(static_cast<std::uint8_t>(seed + 1));
-  for (std::size_t i = 0; i < ev.boot_incarnation_.size(); ++i) {
-    ev.boot_incarnation_[i] = static_cast<std::uint8_t>(seed + 7 * i);
-  }
-  ev.group_term_ = 42;
-  ev.population_manifest_revision_ = 777;
-  ev.population_manifest_digest_ = MakeHash(seed + 1);
-  ev.partition_replication_epoch_ = 778;
-  ev.replication_history_id_.fill(seed);
-  ev.operation_id_ = MakeOperationId(seed);
-  return ev;
-}
 
 TEST(MetaModelCommands, SubmitOperationRoundTrip) {
   keylane::meta::SubmitOperation cmd;
@@ -971,10 +957,8 @@ TEST(MetaModelCommands, TransitionOperationPhaseRoundTrip) {
   directive.partition_replication_epoch_ = 778;
   directive.kind_ = "rebuild";
   directive.payload_ = "{\"partition\":5}";
-  directive.preconditions_ = "{\"source_caught_up\":true}";
-  directive.storage_mutating_ = true;
+
   cmd.current_directives_ = {directive};
-  cmd.evidence_ = {MakeEvidence(0x01), MakeEvidence(0x02)};
   ExpectRoundTrip(cmd);
 }
 
@@ -1211,7 +1195,7 @@ keylane::meta::RegisterNode MakeRegisterFor(std::uint32_t n) {
   cmd.node_id_ = MakeNodeId(n);
   cmd.principal_ = "keylane://node/" + MakeNodeId(n);
   cmd.endpoints_ = {"10.0.0.1:7000"};
-  cmd.capability_mask_ = 0x5;
+
   cmd.role_ = keylane::meta::MetaNodeRole::kPrimary;
   return cmd;
 }
@@ -1260,7 +1244,6 @@ std::string DomainStateBytes(const MetaStores& stores) {
   std::string out = stores.identity_.Serialize();
   out += stores.topology_.Serialize();
   out += stores.policy_.Serialize();
-  out += stores.grant_.Serialize().value_or("!");
   out += stores.operation_.Serialize().value_or("!");
   out += stores.population_manifest_.Serialize();
   return out;
@@ -1337,7 +1320,7 @@ TEST(MetaStateApply, UpdateAndRetireNodeThroughDispatcher) {
   update.node_id_ = node_id;
   update.expected_revision_ = 1;
   update.endpoints_ = {"10.0.0.9:7000"};
-  update.capability_mask_ = 0x3;
+
   update.new_topology_epoch_ = 1;
   ApplyOk(stores, 2, update);
   EXPECT_EQ(stores.identity_.FindNode(node_id)->revision_, 2u);
@@ -1365,7 +1348,7 @@ TEST(MetaStateApply, UpdateAndRetireNodeThroughDispatcher) {
   ASSERT_EQ(stores.audit_.size(), 5u);
 }
 
-TEST(MetaStateApply, CreateGroupMirrorsIntoGrantStore) {
+TEST(MetaStateApply, CreateGroupOwnsInitiallyFencedAuthority) {
   MetaStores stores;
   keylane::meta::CreateGroup cmd;
   cmd.request_id_ = MakeRequestId(0x30);
@@ -1377,7 +1360,7 @@ TEST(MetaStateApply, CreateGroupMirrorsIntoGrantStore) {
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 1u);
   // The grant half of the group exists too (fenced, grantless): grant
   // commands operate on groups known to both stores.
-  const auto grant_state = stores.grant_.GroupState("g1");
+  const auto grant_state = stores.topology_.AuthorityFor("g1");
   ASSERT_TRUE(grant_state.has_value());
   EXPECT_FALSE(grant_state->grant_.has_value());
   EXPECT_EQ(grant_state->group_term_, 0u);
@@ -1396,7 +1379,7 @@ TEST(MetaStateApply, CreateGroupEpochMustBeExactlyNext) {
   cmd.new_topology_epoch_ = 7;  // not current(0)+1
   ApplyRejected(stores, 1, cmd);
   EXPECT_FALSE(stores.topology_.GroupExists("g1"));
-  EXPECT_FALSE(stores.grant_.GroupState("g1").has_value());
+  EXPECT_FALSE(stores.topology_.AuthorityFor("g1").has_value());
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 0u);
 }
 
@@ -1416,7 +1399,7 @@ TEST(MetaStateApply, MetaStoresSnapshotRoundTrip) {
   EXPECT_EQ(MustSerialize(*restored), bytes);
   EXPECT_TRUE(restored->identity_.IsActiveNode(MakeNodeId(1)));
   EXPECT_TRUE(restored->topology_.GroupExists("g1"));
-  EXPECT_TRUE(restored->grant_.GroupState("g1").has_value());
+  EXPECT_TRUE(restored->topology_.AuthorityFor("g1").has_value());
   EXPECT_EQ(restored->audit_.size(), 2u);
   const auto* envelope = reinterpret_cast<const unsigned char*>(bytes.data());
   EXPECT_EQ(static_cast<std::uint16_t>(envelope[0] | (envelope[1] << 8)), 1);
@@ -1668,7 +1651,7 @@ TEST(MetaStateApply, BeginGroupTermRaisesTermInBothStores) {
 
   // Grant half: term 2 and grantless. Topology half: the committed
   // GroupRecord carries the same term.
-  const auto grant_state = stores.grant_.GroupState("g1");
+  const auto grant_state = stores.topology_.AuthorityFor("g1");
   ASSERT_TRUE(grant_state.has_value());
   EXPECT_EQ(grant_state->group_term_, 2u);
   EXPECT_FALSE(grant_state->grant_.has_value());
@@ -1685,174 +1668,7 @@ TEST(MetaStateApply, BeginGroupTermRaisesTermInBothStores) {
   ApplyRejected(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 4)});
 }
 
-TEST(MetaStateApply, TransitionEvidenceMustMatchCommittedAnchors) {
-  MetaStores stores;
-  SetupActivatedGroupPrerequisites(stores, 1, "g1");
-  keylane::meta::SubmitOperation submit;
-  submit.request_id_ = MakeRequestId(0x74);
-  submit.operation_id_.fill(0x42);
-  submit.kind_ = "migration";
-  submit.intent_ = "history-bound";
-  submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
-  submit.replication_history_id_.fill(55);
-  ApplyOk(stores, 6, submit);
 
-  keylane::meta::TransitionOperationPhase transition;
-  transition.request_id_ = MakeRequestId(0x75);
-  transition.operation_id_ = submit.operation_id_;
-  transition.kind_phase_blob_ = "prepare";
-  keylane::meta::MetaEvidenceSummary evidence;
-  evidence.node_id_ = MakeNodeId(1);
-  evidence.group_id_ = "g1";
-  evidence.assignment_id_.fill(1);
-  evidence.boot_incarnation_.fill(1);
-  evidence.group_term_ = 1;
-  evidence.population_manifest_revision_ = 0;
-  evidence.replication_history_id_.fill(55);
-  evidence.operation_id_ = submit.operation_id_;
-  transition.evidence_ = {evidence};
-  ApplyOk(stores, 7, transition);
-
-  keylane::meta::TransitionOperationPhase stale = transition;
-  stale.request_id_ = MakeRequestId(0x76);
-  stale.expected_revision_ = 1;
-  stale.kind_phase_blob_ = "commit";
-  stale.evidence_[0].group_term_ = 2;
-  ApplyRejected(stores, 8, stale);
-  EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
-            1u);
-
-  keylane::meta::PutPopulationManifest put_manifest;
-  put_manifest.request_id_ = MakeRequestId(0x77);
-  put_manifest.entries_ = {{1, 11}};
-  put_manifest.manifest_digest_ =
-      keylane::meta::MetaPopulationManifestStore::CanonicalDigest(
-          put_manifest.entries_);
-  ApplyOk(stores, 9, put_manifest);
-  keylane::meta::SetGroupReplicationState manifest;
-  manifest.request_id_ = MakeRequestId(0x77);
-  manifest.group_id_ = "g1";
-  manifest.new_population_manifest_revision_ = 1;
-  manifest.new_population_manifest_digest_ = put_manifest.manifest_digest_;
-  manifest.new_partition_replication_epoch_ = 1;
-  manifest.new_topology_epoch_ = 3;
-  ApplyOk(stores, 10, manifest);
-
-  keylane::meta::TransitionOperationPhase wrong_partition_epoch = transition;
-  wrong_partition_epoch.request_id_ = MakeRequestId(0x7a);
-  wrong_partition_epoch.expected_revision_ = 1;
-  wrong_partition_epoch.kind_phase_blob_ = "commit";
-  wrong_partition_epoch.evidence_[0].population_manifest_revision_ = 1;
-  wrong_partition_epoch.evidence_[0].population_manifest_digest_ =
-      put_manifest.manifest_digest_;
-  ApplyRejected(stores, 11, wrong_partition_epoch);
-  EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
-            1u);
-
-  keylane::meta::TransitionOperationPhase wrong_manifest = transition;
-  wrong_manifest.request_id_ = MakeRequestId(0x79);
-  wrong_manifest.expected_revision_ = 1;
-  wrong_manifest.kind_phase_blob_ = "commit";
-  wrong_manifest.evidence_[0].population_manifest_revision_ = 1;
-  wrong_manifest.evidence_[0].population_manifest_digest_.fill(0x7f);
-  ApplyRejected(stores, 12, wrong_manifest);
-  EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
-            1u);
-
-  keylane::meta::BeginGroupTerm next_term;
-  next_term.request_id_ = MakeRequestId(0x78);
-  next_term.group_id_ = "g1";
-  next_term.expected_term_ = 1;
-  next_term.new_term_ = 2;
-  ApplyOk(stores, 13, next_term);
-
-  // Evidence is checked against committed anchors on first application, but
-  // an exact replay stays accepted after those anchors legitimately advance.
-  ApplyOk(stores, 7, transition);
-  EXPECT_EQ(stores.audit_.size(), 13u);
-}
-
-TEST(MetaStateApply,
-     TransitionEvidenceRejectsProposalToApplyMembershipIncarnationRaces) {
-  const auto make_submit = [] {
-    keylane::meta::SubmitOperation submit;
-    submit.operation_id_.fill(0x43);
-    submit.kind_ = "migration";
-    submit.intent_ = "membership-bound";
-    submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
-    submit.replication_history_id_.fill(55);
-    return submit;
-  };
-  const auto make_transition =
-      [](const keylane::meta::MetaOperationId& operation_id) {
-        keylane::meta::TransitionOperationPhase transition;
-        transition.operation_id_ = operation_id;
-        transition.kind_phase_blob_ = "prepare";
-        keylane::meta::MetaEvidenceSummary evidence;
-        evidence.node_id_ = MakeNodeId(1);
-        evidence.group_id_ = "g1";
-        evidence.assignment_id_.fill(1);
-        evidence.boot_incarnation_.fill(2);
-        evidence.group_term_ = 1;
-        evidence.replication_history_id_.fill(55);
-        evidence.operation_id_ = operation_id;
-        transition.evidence_ = {evidence};
-        return transition;
-      };
-
-  {
-    MetaStores stores;
-    SetupActivatedGroupPrerequisites(stores, 1, "g1");
-    const keylane::meta::SubmitOperation submit = make_submit();
-    ApplyOk(stores, 6, submit);
-    // Model a leader that validated and baked evidence before the membership
-    // commands below committed, but whose transition reaches apply afterward.
-    const keylane::meta::TransitionOperationPhase proposed =
-        make_transition(submit.operation_id_);
-
-    keylane::meta::RemoveNodeFromGroup remove;
-    remove.group_id_ = "g1";
-    remove.node_id_ = MakeNodeId(1);
-    remove.expected_revision_ = 2;
-    remove.new_topology_epoch_ = 3;
-    ApplyOk(stores, 7, remove);
-    keylane::meta::AssignNodeToGroup readd = MakeAssign("g1", 1, 3, 4);
-    readd.assignment_id_.fill(0x21);
-    ApplyOk(stores, 8, readd);
-
-    ApplyRejected(stores, 9, proposed);
-    EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
-              0u);
-  }
-
-  {
-    MetaStores stores;
-    SetupActivatedGroupPrerequisites(stores, 1, "g1");
-    ApplyOk(stores, 6, MakeCreateGroup("g2", 3));
-    keylane::meta::BeginGroupTerm begin_g2;
-    begin_g2.group_id_ = "g2";
-    begin_g2.new_term_ = 1;
-    ApplyOk(stores, 7, begin_g2);
-    const keylane::meta::SubmitOperation submit = make_submit();
-    ApplyOk(stores, 8, submit);
-    const keylane::meta::TransitionOperationPhase proposed =
-        make_transition(submit.operation_id_);
-
-    keylane::meta::RemoveNodeFromGroup remove;
-    remove.group_id_ = "g1";
-    remove.node_id_ = MakeNodeId(1);
-    remove.expected_revision_ = 2;
-    remove.new_topology_epoch_ = 4;
-    ApplyOk(stores, 9, remove);
-    keylane::meta::AssignNodeToGroup move = MakeAssign("g2", 1, 1, 5);
-    move.assignment_id_.fill(0x31);
-    ApplyOk(stores, 10, move);
-
-    ApplyRejected(stores, 11, proposed);
-    EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
-              0u);
-  }
-}
 
 TEST(MetaStateApply, GroupReplicationStateAdvancesWithTopologyEpoch) {
   MetaStores stores;
@@ -2043,7 +1859,7 @@ TEST(MetaStateApply, SetSlotMapRequiresEveryAffectedGrantToBeFenced) {
 // grantless at term 1 and the topology record is untouched.
 void ExpectPreActivationState(const MetaStores& stores,
                               const std::string& group_id) {
-  const auto grant_state = stores.grant_.GroupState(group_id);
+  const auto grant_state = stores.topology_.AuthorityFor(group_id);
   ASSERT_TRUE(grant_state.has_value());
   EXPECT_EQ(grant_state->group_term_, 1u);
   EXPECT_FALSE(grant_state->grant_.has_value());
@@ -2091,7 +1907,7 @@ TEST(MetaStateApply, ActivateAuthorityRequiresABegunNonzeroTerm) {
                     "{\"kind\":\"authority-lease-v1\",\"duration_ms\":5000}"));
 
   ApplyRejected(stores, 5, MetaCommand{MakeActivate("g1", 0, 1, 3)});
-  const auto grant = stores.grant_.GroupState("g1");
+  const auto grant = stores.topology_.AuthorityFor("g1");
   ASSERT_TRUE(grant.has_value());
   EXPECT_EQ(grant->group_term_, 0u);
   EXPECT_FALSE(grant->grant_.has_value());
@@ -2112,7 +1928,7 @@ TEST(MetaStateApply, ActivateAuthorityAcceptedWritesBothHalvesAtomically) {
 
   // Grant half: the one Grant for the CURRENT term is installed; activation
   // never moves the term.
-  const auto grant_state = stores.grant_.GroupState("g1");
+  const auto grant_state = stores.topology_.AuthorityFor("g1");
   ASSERT_TRUE(grant_state.has_value());
   ASSERT_TRUE(grant_state->grant_.has_value());
   EXPECT_EQ(grant_state->group_term_, 1u);
@@ -2144,7 +1960,7 @@ TEST(MetaStateApply, ActivateAuthorityReplaySameIndexIsIdempotent) {
   // post-effect is already present), not a fresh activation.
   ApplyOk(stores, 7, MetaCommand{cmd});
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 3u);
-  EXPECT_EQ(stores.grant_.GroupState("g1")->grant_->owner_, MakeNodeId(1));
+  EXPECT_EQ(stores.topology_.AuthorityFor("g1")->grant_->owner_, MakeNodeId(1));
 
   // A genuinely different activation is rejected: the term already has its
   // one Grant and a changed topology epoch is not its exact post-effect.
@@ -2178,8 +1994,8 @@ TEST(MetaStateApply, FenceRequiresNewTermBeforeSameOwnerReauthorization) {
   fence.new_term_ = 2;
   ApplyOk(stores, 12, MetaCommand{fence});
   EXPECT_EQ(stores.topology_.FindGroup("g1")->record_.group_term_, 2u);
-  EXPECT_EQ(stores.grant_.GroupState("g1")->group_term_, 2u);
-  EXPECT_FALSE(stores.grant_.GroupState("g1")->grant_.has_value());
+  EXPECT_EQ(stores.topology_.AuthorityFor("g1")->group_term_, 2u);
+  EXPECT_FALSE(stores.topology_.AuthorityFor("g1")->grant_.has_value());
 
   // A replacement Meta leader restores the same unused term. Old activation
   // cannot regain authority; the same Owner can receive only term two's Grant.
@@ -2188,8 +2004,9 @@ TEST(MetaStateApply, FenceRequiresNewTermBeforeSameOwnerReauthorization) {
   ApplyRejected(*restored, 13, MetaCommand{MakeActivate("g1", 1, 1, 5)});
   const auto activate = MakeActivate("g1", 2, 1, 5);
   ApplyOk(*restored, 14, MetaCommand{activate});
-  ASSERT_TRUE(restored->grant_.GroupState("g1")->grant_.has_value());
-  EXPECT_EQ(restored->grant_.GroupState("g1")->grant_->owner_, MakeNodeId(1));
+  ASSERT_TRUE(restored->topology_.AuthorityFor("g1")->grant_.has_value());
+  EXPECT_EQ(restored->topology_.AuthorityFor("g1")->grant_->owner_,
+            MakeNodeId(1));
   const std::string reauthorized = DomainStateBytes(*restored);
   ApplyRejected(*restored, 15, MetaCommand{fence});
   ApplyOk(*restored, 16, MetaCommand{activate});
@@ -2272,7 +2089,7 @@ TEST(MetaStateApply, ClusterCreateRootAtomicallyOwnsLifecycle) {
   EXPECT_EQ(creating.state_, keylane::meta::MetaClusterLifecycle::kCreating);
   EXPECT_EQ(creating.root_operation_id_, root.operation_id_);
   EXPECT_EQ(creating.genesis_commit_index_, 11u);
-  EXPECT_EQ(creating.revision_, 1u);
+  EXPECT_EQ(creating.Revision(), 1u);
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 0u);
   ASSERT_TRUE(stores.operation_.FindOperation(root.operation_id_).has_value());
 
@@ -2298,7 +2115,7 @@ TEST(MetaStateApply, ClusterCreateRootAtomicallyOwnsLifecycle) {
   ApplyOk(stores, 14, MetaCommand{complete});
   EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
             keylane::meta::MetaClusterLifecycle::kCreated);
-  EXPECT_EQ(stores.topology_.ClusterLifecycle().revision_, 2u);
+  EXPECT_EQ(stores.topology_.ClusterLifecycle().Revision(), 2u);
 
   // Exact Genesis replay validates both already-applied halves and remains a
   // no-op after the root reaches its terminal state.
@@ -2463,24 +2280,11 @@ TEST(MetaStateApply, ClusterCreateAbortAtomicallyRecordsSafeFailure) {
   const auto& failed = stores.topology_.ClusterLifecycle();
   EXPECT_EQ(failed.state_,
             keylane::meta::MetaClusterLifecycle::kProvisioningFailed);
-  EXPECT_EQ(failed.terminal_outcome_,
-            keylane::meta::MetaClusterTerminalOutcome::kProvisioningFailed);
+
   EXPECT_EQ(failed.failure_summary_.find("hunter2"), std::string::npos);
   EXPECT_NE(failed.failure_summary_.find("root-operation="), std::string::npos);
 }
 
-TEST(MetaStateApply, MetaStoresDeserializeRejectsGroupStoreDrift) {
-  {
-    MetaStores stores;
-    ASSERT_TRUE(stores.topology_.Apply(MakeCreateGroup("g1", 1)).ok());
-    ExpectAggregateSnapshotFailStop(stores);
-  }
-  {
-    MetaStores stores;
-    ASSERT_TRUE(stores.grant_.AddGroup("g1").ok());
-    ExpectAggregateSnapshotFailStop(stores);
-  }
-}
 
 TEST(MetaStateApply, SnapshotValidatesClusterLifecycleAggregate) {
   {
@@ -2794,8 +2598,10 @@ TEST(MetaStateApply,
   {
     MetaStores stores;
     ApplyOk(stores, 1, MakeCreateGroup("g1", 1));
-    ASSERT_TRUE(stores.topology_.SetGroupTerm("g1", 1).ok());
-    ExpectAggregateSnapshotFailStop(stores);
+    ASSERT_TRUE(keylane::meta::MetaTopologyTestAccess::SetGroupTerm(
+                    stores.topology_, "g1", 1)
+                    .ok());
+    EXPECT_TRUE(MetaStores::Deserialize(MustSerialize(stores)).ok());
   }
 }
 
@@ -2812,7 +2618,9 @@ TEST(MetaStateApply,
   MetaStores stores;
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
   ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3)});
-  ASSERT_TRUE(stores.topology_.SetGroupTerm("g1", 0).ok());
+  ASSERT_TRUE(keylane::meta::MetaTopologyTestAccess::SetGroupTerm(
+                  stores.topology_, "g1", 0)
+                  .ok());
   ExpectAggregateSnapshotFailStop(stores);
 }
 
@@ -2921,7 +2729,7 @@ TEST(MetaStateApply, DirectiveResultCommitUsesFirstRaftIndexOnReplay) {
   directive.group_term_ = 1;
   directive.kind_ = "rebuild";
   directive.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
-  directive.storage_mutating_ = true;
+
   keylane::meta::TransitionOperationPhase transition;
   transition.operation_id_ = submit.operation_id_;
   transition.current_directives_ = {directive};
@@ -2983,7 +2791,6 @@ TEST(MetaStateApply, DirectiveIntentMustMatchCommittedAuthorityAndAssignment) {
   directive.partition_replication_epoch_ = 0;
   directive.kind_ = "rebuild";
   directive.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
-  directive.storage_mutating_ = true;
 
   keylane::meta::TransitionOperationPhase transition;
   transition.operation_id_ = submit.operation_id_;
@@ -3042,7 +2849,6 @@ InstalledDirectiveFixture MakeInstalledDirectiveFixture() {
   fixture.directive.kind_ = "rebuild";
   fixture.directive.payload_ =
       *keylane::cluster::control::EncodeRebuildRequest({3});
-  fixture.directive.storage_mutating_ = true;
 
   keylane::meta::TransitionOperationPhase transition;
   transition.operation_id_ = fixture.submit.operation_id_;

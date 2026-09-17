@@ -14,6 +14,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -47,9 +48,8 @@ enum class FailoverObservationKind : std::uint8_t {
 absl::StatusOr<std::uint64_t> TransferCap(TransferKind kind) {
   switch (kind) {
     case TransferKind::kFullDesiredState:
+    case TransferKind::kNodeControlUpdate:
       return kMaxFullDesiredStateBytes;
-    case TransferKind::kObservationEvidence:
-      return kMaxOperationEvidenceTransferBytes;
     case TransferKind::kDirectivePayload:
       return kMaxDirectiveTransferBytes;
     case TransferKind::kDirectiveResult:
@@ -68,14 +68,7 @@ absl::Status ResourceLimit(std::string_view message) {
 
 class Writer {
  public:
-  class Sink {
-   public:
-    virtual ~Sink() = default;
-    virtual void Append(std::string_view bytes) noexcept = 0;
-  };
-
-  Writer() = default;
-  explicit Writer(Sink& sink) : sink_(&sink) {}
+  explicit Writer(bool retain_bytes = true) : retain_bytes_(retain_bytes) {}
 
   void U8(std::uint8_t value) {
     const char byte = static_cast<char>(value);
@@ -134,15 +127,11 @@ class Writer {
  private:
   void Append(std::string_view value) {
     size_ += value.size();
-    if (sink_ != nullptr) {
-      sink_->Append(value);
-    } else {
-      bytes_.append(value);
-    }
+    if (retain_bytes_) bytes_.append(value);
   }
 
+  const bool retain_bytes_;
   std::string bytes_;
-  Sink* sink_ = nullptr;
   std::size_t size_ = 0;
 };
 
@@ -278,7 +267,7 @@ std::uint32_t Crc32c(std::string_view bytes) noexcept {
 
 bool IsKnownMessageType(std::uint16_t raw) noexcept {
   return raw >= static_cast<std::uint16_t>(MessageType::kClientHello) &&
-         raw <= static_cast<std::uint16_t>(MessageType::kFullDesiredState);
+         raw <= static_cast<std::uint16_t>(MessageType::kNodeControlUpdate);
 }
 
 bool IsZeroHash(const WireHash256& hash) noexcept {
@@ -328,145 +317,6 @@ absl::Status FillRandom(void* output, std::size_t bytes) {
   return absl::OkStatus();
 }
 
-// Incremental SHA-256, used so transfer validation retains O(1) bytes.
-class Sha256 {
- public:
-  void Update(std::string_view input) noexcept {
-    total_bytes_ += input.size();
-    const auto* data = reinterpret_cast<const std::uint8_t*>(input.data());
-    std::size_t length = input.size();
-    if (buffered_ != 0) {
-      const std::size_t copy = std::min(length, block_.size() - buffered_);
-      std::memcpy(block_.data() + buffered_, data, copy);
-      buffered_ += copy;
-      data += copy;
-      length -= copy;
-      if (buffered_ == block_.size()) {
-        Compress(block_.data());
-        buffered_ = 0;
-      }
-    }
-    while (length >= block_.size()) {
-      Compress(data);
-      data += block_.size();
-      length -= block_.size();
-    }
-    if (length != 0) {
-      std::memcpy(block_.data(), data, length);
-      buffered_ = length;
-    }
-  }
-
-  WireHash256 Final() noexcept {
-    const std::uint64_t bit_length = total_bytes_ * 8;
-    block_[buffered_++] = 0x80;
-    if (buffered_ > 56) {
-      std::fill(block_.begin() + buffered_, block_.end(), 0);
-      Compress(block_.data());
-      buffered_ = 0;
-    }
-    std::fill(block_.begin() + buffered_, block_.begin() + 56, 0);
-    for (unsigned i = 0; i < 8; ++i) {
-      block_[63 - i] = static_cast<std::uint8_t>(bit_length >> (8 * i));
-    }
-    Compress(block_.data());
-    WireHash256 digest{};
-    for (unsigned i = 0; i < state_.size(); ++i) {
-      for (unsigned j = 0; j < 4; ++j) {
-        digest[i * 4 + j] =
-            static_cast<std::uint8_t>(state_[i] >> (24 - 8 * j));
-      }
-    }
-    return digest;
-  }
-
- private:
-  static constexpr std::array<std::uint32_t, 64> kRound = {
-      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-      0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-      0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-      0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-      0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-      0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-      0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-      0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-      0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
-
-  static std::uint32_t Rotate(std::uint32_t value,
-                              std::uint32_t bits) noexcept {
-    return (value >> bits) | (value << (32 - bits));
-  }
-
-  void Compress(const std::uint8_t* block) noexcept {
-    std::array<std::uint32_t, 64> words{};
-    for (unsigned i = 0; i < 16; ++i) {
-      words[i] = (static_cast<std::uint32_t>(block[4 * i]) << 24) |
-                 (static_cast<std::uint32_t>(block[4 * i + 1]) << 16) |
-                 (static_cast<std::uint32_t>(block[4 * i + 2]) << 8) |
-                 block[4 * i + 3];
-    }
-    for (unsigned i = 16; i < words.size(); ++i) {
-      const std::uint32_t s0 = Rotate(words[i - 15], 7) ^
-                               Rotate(words[i - 15], 18) ^ (words[i - 15] >> 3);
-      const std::uint32_t s1 = Rotate(words[i - 2], 17) ^
-                               Rotate(words[i - 2], 19) ^ (words[i - 2] >> 10);
-      words[i] = words[i - 16] + s0 + words[i - 7] + s1;
-    }
-    std::uint32_t a = state_[0];
-    std::uint32_t b = state_[1];
-    std::uint32_t c = state_[2];
-    std::uint32_t d = state_[3];
-    std::uint32_t e = state_[4];
-    std::uint32_t f = state_[5];
-    std::uint32_t g = state_[6];
-    std::uint32_t h = state_[7];
-    for (unsigned i = 0; i < words.size(); ++i) {
-      const std::uint32_t upper_e =
-          Rotate(e, 6) ^ Rotate(e, 11) ^ Rotate(e, 25);
-      const std::uint32_t choose = (e & f) ^ (~e & g);
-      const std::uint32_t temp1 = h + upper_e + choose + kRound[i] + words[i];
-      const std::uint32_t upper_a =
-          Rotate(a, 2) ^ Rotate(a, 13) ^ Rotate(a, 22);
-      const std::uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
-      const std::uint32_t temp2 = upper_a + majority;
-      h = g;
-      g = f;
-      f = e;
-      e = d + temp1;
-      d = c;
-      c = b;
-      b = a;
-      a = temp1 + temp2;
-    }
-    state_[0] += a;
-    state_[1] += b;
-    state_[2] += c;
-    state_[3] += d;
-    state_[4] += e;
-    state_[5] += f;
-    state_[6] += g;
-    state_[7] += h;
-  }
-
-  std::array<std::uint32_t, 8> state_ = {0x6a09e667, 0xbb67ae85, 0x3c6ef372,
-                                         0xa54ff53a, 0x510e527f, 0x9b05688c,
-                                         0x1f83d9ab, 0x5be0cd19};
-  std::array<std::uint8_t, 64> block_{};
-  std::size_t buffered_ = 0;
-  std::uint64_t total_bytes_ = 0;
-};
-
-class Sha256WriterSink final : public Writer::Sink {
- public:
-  void Append(std::string_view bytes) noexcept override { sha_.Update(bytes); }
-  WireHash256 Final() noexcept { return sha_.Final(); }
-
- private:
-  Sha256 sha_;
-};
-
 absl::Status ValidateIdentity(std::string_view value, std::string_view field) {
   if (!IsCanonicalIdentity160(value)) {
     return ProtocolError(std::string(field) +
@@ -495,18 +345,14 @@ absl::StatusOr<std::string> ReadIdentity(Reader& reader,
 }
 
 void WriteProjectionBasis(Writer& writer, const WireProjectionBasis& basis) {
-  writer.U64(basis.source_meta_applied_index);
-  writer.Fixed(basis.projection_hash);
+  writer.U64(basis.control_revision);
 }
 
 absl::StatusOr<WireProjectionBasis> ReadProjectionBasis(Reader& reader) {
   WireProjectionBasis basis;
   auto index = reader.U64();
   if (!index.ok()) return index.status();
-  basis.source_meta_applied_index = *index;
-  auto hash = reader.Fixed<32>();
-  if (!hash.ok()) return hash.status();
-  basis.projection_hash = *hash;
+  basis.control_revision = *index;
   return basis;
 }
 
@@ -596,12 +442,6 @@ absl::StatusOr<WireId128> GenerateId128() {
   } while (std::all_of(id.begin(), id.end(),
                        [](std::uint8_t byte) { return byte == 0; }));
   return id;
-}
-
-WireHash256 ComputeSha256(std::string_view bytes) noexcept {
-  Sha256 sha;
-  sha.Update(bytes);
-  return sha.Final();
 }
 
 absl::StatusOr<std::string> EncodeRebuildRequest(
@@ -750,7 +590,6 @@ struct LargeObjectReassembler::Impl {
   struct Active {
     TransferStart start;
     std::uint64_t received = 0;
-    Sha256 sha;
   };
 
   explicit Impl(LargeObjectSink& output) : sink(output) {}
@@ -771,7 +610,7 @@ absl::Status LargeObjectReassembler::Accept(const TransferStart& start) {
         "only one object may be reassembled per direction");
   }
   const auto raw_kind = static_cast<std::uint16_t>(start.kind);
-  if (raw_kind < 1 || raw_kind > 4) {
+  if (raw_kind < 1 || raw_kind > 5) {
     return ProtocolError("unknown transfer kind");
   }
   auto cap = TransferCap(start.kind);
@@ -782,7 +621,7 @@ absl::Status LargeObjectReassembler::Accept(const TransferStart& start) {
   if (absl::Status status = impl_->sink.Begin(start); !status.ok()) {
     return status;
   }
-  impl_->active.emplace(Impl::Active{.start = start, .received = 0, .sha = {}});
+  impl_->active.emplace(Impl::Active{.start = start, .received = 0});
   return absl::OkStatus();
 }
 
@@ -810,7 +649,6 @@ absl::Status LargeObjectReassembler::Accept(const TransferChunk& chunk) {
     impl_->active.reset();
     return status;
   }
-  active.sha.Update(chunk.bytes);
   active.received += chunk.bytes.size();
   return absl::OkStatus();
 }
@@ -825,11 +663,6 @@ absl::Status LargeObjectReassembler::Accept(const TransferEnd& end) {
   }
   if (active.received != active.start.total_length) {
     return absl::FailedPreconditionError("transfer ended before all bytes");
-  }
-  if (active.sha.Final() != active.start.sha256) {
-    impl_->sink.Abort();
-    impl_->active.reset();
-    return absl::DataLossError("large-object SHA-256 mismatch");
   }
   if (absl::Status status = impl_->sink.Commit(); !status.ok()) {
     impl_->sink.Abort();
@@ -916,7 +749,7 @@ absl::StatusOr<std::int64_t> LeaseChallengeTracker::AcceptGrant(
   const LeaseChallenge& challenge = pending.challenge;
   if (session_id != pending.session_id || grant.nonce != challenge.nonce ||
       grant.data_boot_id != pending.data_boot_id ||
-      grant.projection_hash != challenge.projection_hash ||
+      grant.control_revision != challenge.control_revision ||
       grant.group_id != challenge.group_id ||
       grant.assignment_id != challenge.assignment_id ||
       grant.group_term != challenge.group_term) {
@@ -989,7 +822,7 @@ absl::StatusOr<WireMetaEndpoint> ReadEndpoint(Reader& reader) {
 absl::Status WriteLeaseChallenge(Writer& writer,
                                  const LeaseChallenge& challenge) {
   writer.Fixed(challenge.nonce);
-  writer.Fixed(challenge.projection_hash);
+  writer.U64(challenge.control_revision);
   if (absl::Status status = writer.String(
           challenge.group_id, kMaxIdentifierBytes, "challenge group id");
       !status.ok()) {
@@ -1005,9 +838,9 @@ absl::StatusOr<LeaseChallenge> ReadLeaseChallenge(Reader& reader) {
   auto nonce = reader.Fixed<16>();
   if (!nonce.ok()) return nonce.status();
   challenge.nonce = *nonce;
-  auto projection_hash = reader.Fixed<32>();
-  if (!projection_hash.ok()) return projection_hash.status();
-  challenge.projection_hash = *projection_hash;
+  auto control_revision = reader.U64();
+  if (!control_revision.ok()) return control_revision.status();
+  challenge.control_revision = *control_revision;
   auto group_id = reader.String(kMaxIdentifierBytes);
   if (!group_id.ok()) return group_id.status();
   challenge.group_id = std::move(*group_id);
@@ -1273,7 +1106,7 @@ absl::Status WriteLeaseGranted(Writer& writer, const LeaseGranted& grant) {
       !status.ok()) {
     return status;
   }
-  writer.Fixed(grant.projection_hash);
+  writer.U64(grant.control_revision);
   if (absl::Status status =
           writer.String(grant.group_id, kMaxIdentifierBytes, "grant group id");
       !status.ok()) {
@@ -1302,9 +1135,9 @@ absl::StatusOr<LeaseGranted> ReadLeaseGranted(Reader& reader) {
   auto boot_id = ReadIdentity(reader, "data boot id");
   if (!boot_id.ok()) return boot_id.status();
   grant.data_boot_id = std::move(*boot_id);
-  auto projection_hash = reader.Fixed<32>();
-  if (!projection_hash.ok()) return projection_hash.status();
-  grant.projection_hash = *projection_hash;
+  auto control_revision = reader.U64();
+  if (!control_revision.ok()) return control_revision.status();
+  grant.control_revision = *control_revision;
   auto group_id = reader.String(kMaxIdentifierBytes);
   if (!group_id.ok()) return group_id.status();
   grant.group_id = std::move(*group_id);
@@ -1463,7 +1296,7 @@ absl::StatusOr<WireMessage> DecodeServerHello(std::string_view bytes) {
 
 absl::StatusOr<std::string> Encode(const TransferStart& start) {
   const auto kind = static_cast<std::uint16_t>(start.kind);
-  if (kind < 1 || kind > 4) return ProtocolError("unknown transfer kind");
+  if (kind < 1 || kind > 5) return ProtocolError("unknown transfer kind");
   auto cap = TransferCap(start.kind);
   if (!cap.ok()) return cap.status();
   if (start.total_length > *cap) {
@@ -1473,7 +1306,6 @@ absl::StatusOr<std::string> Encode(const TransferStart& start) {
   writer.U16(kind);
   writer.Fixed(start.object_id);
   writer.U64(start.total_length);
-  writer.Fixed(start.sha256);
   return std::move(writer).Take();
 }
 
@@ -1482,7 +1314,7 @@ absl::StatusOr<WireMessage> DecodeTransferStart(std::string_view bytes) {
   TransferStart start;
   auto kind = reader.U16();
   if (!kind.ok()) return kind.status();
-  if (*kind < 1 || *kind > 4) return ProtocolError("unknown transfer kind");
+  if (*kind < 1 || *kind > 5) return ProtocolError("unknown transfer kind");
   start.kind = static_cast<TransferKind>(*kind);
   auto object_id = reader.Fixed<16>();
   if (!object_id.ok()) return object_id.status();
@@ -1495,9 +1327,6 @@ absl::StatusOr<WireMessage> DecodeTransferStart(std::string_view bytes) {
   if (start.total_length > *cap) {
     return ResourceLimit("large object exceeds its type-specific cap");
   }
-  auto hash = reader.Fixed<32>();
-  if (!hash.ok()) return hash.status();
-  start.sha256 = *hash;
   if (absl::Status status = Finish(reader); !status.ok()) return status;
   return WireMessage{start};
 }
@@ -1574,20 +1403,20 @@ absl::StatusOr<WireMessage> DecodeTransferAbort(std::string_view bytes) {
 
 absl::StatusOr<std::string> Encode(const FullStateApplied& applied) {
   Writer writer;
-  writer.U64(applied.source_meta_applied_index);
-  writer.Fixed(applied.projection_hash);
+  writer.Fixed(applied.request_id);
+  writer.U64(applied.control_revision);
   return std::move(writer).Take();
 }
 
 absl::StatusOr<WireMessage> DecodeFullStateApplied(std::string_view bytes) {
   Reader reader(bytes);
   FullStateApplied applied;
+  auto request = reader.Fixed<16>();
+  if (!request.ok()) return request.status();
+  applied.request_id = *request;
   auto index = reader.U64();
   if (!index.ok()) return index.status();
-  applied.source_meta_applied_index = *index;
-  auto projection_hash = reader.Fixed<32>();
-  if (!projection_hash.ok()) return projection_hash.status();
-  applied.projection_hash = *projection_hash;
+  applied.control_revision = *index;
   if (absl::Status status = Finish(reader); !status.ok()) return status;
   return WireMessage{applied};
 }
@@ -1781,85 +1610,6 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
   return WireMessage{std::move(heartbeat)};
 }
 
-absl::StatusOr<std::string> Encode(const OperationEvidence& evidence) {
-  Writer writer;
-  writer.Fixed(evidence.session_id);
-  if (absl::Status status = WriteIdentity(writer, evidence.reporter_boot_id,
-                                          "evidence reporter boot id");
-      !status.ok()) {
-    return status;
-  }
-  writer.Fixed(evidence.assignment_id);
-  writer.Fixed(evidence.operation_id);
-  if (absl::Status status = writer.String(
-          evidence.kind_phase, kMaxIdentifierBytes, "evidence kind/phase");
-      !status.ok()) {
-    return status;
-  }
-  if (absl::Status status = writer.String(
-          evidence.evidence, kMaxOpaqueFieldBytes, "operation evidence");
-      !status.ok()) {
-    return status;
-  }
-  if (absl::Status status = writer.String(
-          evidence.group_id, kMaxIdentifierBytes, "evidence group id");
-      !status.ok()) {
-    return status;
-  }
-  writer.U64(evidence.group_term);
-  writer.U64(evidence.manifest_revision);
-  writer.U64(evidence.partition_replication_epoch);
-  if (absl::Status status =
-          WriteIdentity(writer, evidence.replication_history_id,
-                        "evidence replication history id");
-      !status.ok()) {
-    return status;
-  }
-  return std::move(writer).Take();
-}
-
-absl::StatusOr<WireMessage> DecodeOperationEvidence(std::string_view bytes) {
-  Reader reader(bytes);
-  OperationEvidence evidence;
-  auto session_id = reader.Fixed<16>();
-  if (!session_id.ok()) return session_id.status();
-  evidence.session_id = *session_id;
-  auto boot_id = ReadIdentity(reader, "evidence reporter boot id");
-  if (!boot_id.ok()) return boot_id.status();
-  evidence.reporter_boot_id = std::move(*boot_id);
-  auto assignment_id = reader.Fixed<16>();
-  if (!assignment_id.ok()) return assignment_id.status();
-  evidence.assignment_id = *assignment_id;
-  auto operation_id = reader.Fixed<16>();
-  if (!operation_id.ok()) return operation_id.status();
-  evidence.operation_id = *operation_id;
-  auto kind_phase = reader.String(kMaxIdentifierBytes);
-  if (!kind_phase.ok()) return kind_phase.status();
-  evidence.kind_phase = std::move(*kind_phase);
-  auto body = reader.String(kMaxOpaqueFieldBytes);
-  if (!body.ok()) return body.status();
-  evidence.evidence = std::move(*body);
-  auto group_id = reader.String(kMaxIdentifierBytes);
-  if (!group_id.ok()) return group_id.status();
-  evidence.group_id = std::move(*group_id);
-  auto group_term = reader.U64();
-  if (!group_term.ok()) return group_term.status();
-  evidence.group_term = *group_term;
-  auto manifest_revision = reader.U64();
-  if (!manifest_revision.ok()) return manifest_revision.status();
-  evidence.manifest_revision = *manifest_revision;
-  auto partition_replication_epoch = reader.U64();
-  if (!partition_replication_epoch.ok()) {
-    return partition_replication_epoch.status();
-  }
-  evidence.partition_replication_epoch = *partition_replication_epoch;
-  auto history_id = ReadIdentity(reader, "evidence replication history id");
-  if (!history_id.ok()) return history_id.status();
-  evidence.replication_history_id = std::move(*history_id);
-  if (absl::Status status = Finish(reader); !status.ok()) return status;
-  return WireMessage{std::move(evidence)};
-}
-
 absl::StatusOr<std::string> Encode(const HeartbeatAck& ack) {
   const auto observation = static_cast<std::uint8_t>(ack.observation_status);
   if (observation > 3) return ProtocolError("unknown observation status");
@@ -1886,11 +1636,11 @@ absl::StatusOr<std::string> Encode(const HeartbeatAck& ack) {
     }
     writer.Fixed(denied->nonce);
     writer.U16(reason);
-    writer.Fixed(denied->current_projection_hash);
+    writer.U64(denied->current_control_revision);
   } else if (const auto* stale =
                  std::get_if<LeaseStateOutOfDate>(&ack.lease_decision)) {
     writer.Fixed(stale->nonce);
-    writer.Fixed(stale->current_projection_hash);
+    writer.U64(stale->current_control_revision);
   }
   return std::move(writer).Take();
 }
@@ -1934,9 +1684,9 @@ absl::StatusOr<WireMessage> DecodeHeartbeatAck(std::string_view bytes) {
         return ProtocolError("unknown lease denial reason");
       }
       denied.reason = static_cast<LeaseDenialReason>(*reason);
-      auto projection_hash = reader.Fixed<32>();
-      if (!projection_hash.ok()) return projection_hash.status();
-      denied.current_projection_hash = *projection_hash;
+      auto control_revision = reader.U64();
+      if (!control_revision.ok()) return control_revision.status();
+      denied.current_control_revision = *control_revision;
       ack.lease_decision = denied;
       break;
     }
@@ -1945,9 +1695,9 @@ absl::StatusOr<WireMessage> DecodeHeartbeatAck(std::string_view bytes) {
       auto nonce = reader.Fixed<16>();
       if (!nonce.ok()) return nonce.status();
       stale.nonce = *nonce;
-      auto projection_hash = reader.Fixed<32>();
-      if (!projection_hash.ok()) return projection_hash.status();
-      stale.current_projection_hash = *projection_hash;
+      auto control_revision = reader.U64();
+      if (!control_revision.ok()) return control_revision.status();
+      stale.current_control_revision = *control_revision;
       ack.lease_decision = stale;
       break;
     }
@@ -2084,14 +1834,7 @@ absl::StatusOr<std::string> Encode(const Directive& directive) {
       !status.ok()) {
     return status;
   }
-  if (absl::Status status =
-          writer.String(directive.preconditions, kMaxOpaqueFieldBytes,
-                        "directive preconditions");
-      !status.ok()) {
-    return status;
-  }
-  writer.Bool(directive.storage_mutating);
-  writer.Bool(directive.force);
+
   return std::move(writer).Take();
 }
 
@@ -2156,24 +1899,12 @@ absl::StatusOr<WireMessage> DecodeDirective(std::string_view bytes) {
   auto payload = reader.String(kMaxOpaqueFieldBytes);
   if (!payload.ok()) return payload.status();
   directive.payload = std::move(*payload);
-  auto preconditions = reader.String(kMaxOpaqueFieldBytes);
-  if (!preconditions.ok()) return preconditions.status();
-  directive.preconditions = std::move(*preconditions);
-  auto storage_mutating = reader.Bool();
-  if (!storage_mutating.ok()) return storage_mutating.status();
-  directive.storage_mutating = *storage_mutating;
-  auto force = reader.Bool();
-  if (!force.ok()) return force.status();
-  directive.force = *force;
+
   if (absl::Status status = Finish(reader); !status.ok()) return status;
   return WireMessage{std::move(directive)};
 }
 
-absl::StatusOr<std::string> Encode(const DirectiveReceipt& receipt) {
-  const auto stage = static_cast<std::uint8_t>(receipt.stage);
-  if (stage < 1 || stage > 3) {
-    return ProtocolError("unknown directive receipt stage");
-  }
+absl::StatusOr<std::string> Encode(const DirectiveResponse& receipt) {
   Writer writer;
   writer.Fixed(receipt.session_id);
   if (absl::Status status =
@@ -2182,13 +1913,13 @@ absl::StatusOr<std::string> Encode(const DirectiveReceipt& receipt) {
     return status;
   }
   WriteDirectiveIdentity(writer, receipt.identity);
-  writer.U8(stage);
+  writer.Bool(receipt.started);
   return std::move(writer).Take();
 }
 
-absl::StatusOr<WireMessage> DecodeDirectiveReceipt(std::string_view bytes) {
+absl::StatusOr<WireMessage> DecodeDirectiveResponse(std::string_view bytes) {
   Reader reader(bytes);
-  DirectiveReceipt receipt;
+  DirectiveResponse receipt;
   auto session_id = reader.Fixed<16>();
   if (!session_id.ok()) return session_id.status();
   receipt.session_id = *session_id;
@@ -2198,12 +1929,9 @@ absl::StatusOr<WireMessage> DecodeDirectiveReceipt(std::string_view bytes) {
   auto identity = ReadDirectiveIdentity(reader);
   if (!identity.ok()) return identity.status();
   receipt.identity = *identity;
-  auto stage = reader.U8();
-  if (!stage.ok()) return stage.status();
-  if (*stage < 1 || *stage > 3) {
-    return ProtocolError("unknown directive receipt stage");
-  }
-  receipt.stage = static_cast<DirectiveReceiptStage>(*stage);
+  auto started = reader.Bool();
+  if (!started.ok()) return started.status();
+  receipt.started = *started;
   if (absl::Status status = Finish(reader); !status.ok()) return status;
   return WireMessage{std::move(receipt)};
 }
@@ -2328,6 +2056,8 @@ MessageType MessageTypeOf(const WireMessage& message) noexcept {
         using T = std::decay_t<decltype(value)>;
         if constexpr (std::is_same_v<T, ClientHello>) {
           return MessageType::kClientHello;
+        } else if constexpr (std::is_same_v<T, NodeControlUpdate>) {
+          return MessageType::kNodeControlUpdate;
         } else if constexpr (std::is_same_v<T, ServerHello>) {
           return MessageType::kServerHello;
         } else if constexpr (std::is_same_v<T, TransferStart>) {
@@ -2344,16 +2074,15 @@ MessageType MessageTypeOf(const WireMessage& message) noexcept {
           return MessageType::kHeartbeat;
         } else if constexpr (std::is_same_v<T, HeartbeatAck>) {
           return MessageType::kHeartbeatAck;
-        } else if constexpr (std::is_same_v<T, OperationEvidence>) {
-          return MessageType::kOperationEvidence;
+
         } else if constexpr (std::is_same_v<T, Fence>) {
           return MessageType::kFence;
         } else if constexpr (std::is_same_v<T, FenceAck>) {
           return MessageType::kFenceAck;
         } else if constexpr (std::is_same_v<T, Directive>) {
           return MessageType::kDirective;
-        } else if constexpr (std::is_same_v<T, DirectiveReceipt>) {
-          return MessageType::kDirectiveReceipt;
+        } else if constexpr (std::is_same_v<T, DirectiveResponse>) {
+          return MessageType::kDirectiveResponse;
         } else if constexpr (std::is_same_v<T, DirectiveResult>) {
           return MessageType::kDirectiveResult;
         } else if constexpr (std::is_same_v<T, ResultCommitted>) {
@@ -2375,7 +2104,10 @@ absl::StatusOr<std::string> EncodeMessage(const WireMessage& message) {
         if constexpr (std::is_same_v<T, FullDesiredState>) {
           return EncodeFullDesiredState(value);
         } else {
-          return Encode(value);
+          if constexpr (std::is_same_v<T, NodeControlUpdate>)
+            return EncodeNodeControlUpdate(value);
+          else
+            return Encode(value);
         }
       },
       message);
@@ -2393,6 +2125,11 @@ absl::StatusOr<WireMessage> DecodeMessage(MessageType type,
     return ResourceLimit("non-fragmentable control message exceeds one frame");
   }
   switch (type) {
+    case MessageType::kNodeControlUpdate: {
+      auto update = DecodeNodeControlUpdate(payload);
+      if (!update.ok()) return update.status();
+      return WireMessage{std::move(*update)};
+    }
     case MessageType::kClientHello:
       return DecodeClientHello(payload);
     case MessageType::kServerHello:
@@ -2417,16 +2154,14 @@ absl::StatusOr<WireMessage> DecodeMessage(MessageType type,
       return DecodeFenceAck(payload);
     case MessageType::kDirective:
       return DecodeDirective(payload);
-    case MessageType::kDirectiveReceipt:
-      return DecodeDirectiveReceipt(payload);
+    case MessageType::kDirectiveResponse:
+      return DecodeDirectiveResponse(payload);
     case MessageType::kDirectiveResult:
       return DecodeDirectiveResult(payload);
     case MessageType::kResultCommitted:
       return DecodeResultCommitted(payload);
     case MessageType::kResultNoLongerTracked:
       return DecodeResultNoLongerTracked(payload);
-    case MessageType::kOperationEvidence:
-      return DecodeOperationEvidence(payload);
     case MessageType::kFullDesiredState: {
       auto desired = DecodeFullDesiredState(payload);
       if (!desired.ok()) return desired.status();
@@ -2941,14 +2676,7 @@ absl::StatusOr<WireManifestDocument> ReadManifest(Reader& reader) {
 }
 
 absl::Status WriteProjectedDirective(Writer& writer,
-                                     const WireProjectedDirective& directive,
-                                     bool normalize_basis = false) {
-  if (normalize_basis) {
-    writer.U64(0);
-    writer.Fixed(WireHash256{});
-  } else {
-    WriteProjectionBasis(writer, directive.basis);
-  }
+                                     const WireProjectedDirective& directive) {
   if (absl::Status status = WriteAuthorityAnchor(writer, directive.authority);
       !status.ok()) {
     return status;
@@ -3005,22 +2733,12 @@ absl::Status WriteProjectedDirective(Writer& writer,
       !status.ok()) {
     return status;
   }
-  if (absl::Status status =
-          writer.String(directive.preconditions, kMaxOpaqueFieldBytes,
-                        "directive preconditions");
-      !status.ok()) {
-    return status;
-  }
-  writer.Bool(directive.storage_mutating);
-  writer.Bool(directive.force);
+
   return absl::OkStatus();
 }
 
 absl::StatusOr<WireProjectedDirective> ReadProjectedDirective(Reader& reader) {
   WireProjectedDirective directive;
-  auto basis = ReadProjectionBasis(reader);
-  if (!basis.ok()) return basis.status();
-  directive.basis = *basis;
   auto authority = ReadAuthorityAnchor(reader);
   if (!authority.ok()) return authority.status();
   directive.authority = std::move(*authority);
@@ -3072,31 +2790,224 @@ absl::StatusOr<WireProjectedDirective> ReadProjectedDirective(Reader& reader) {
   auto payload = reader.String(kMaxOpaqueFieldBytes);
   if (!payload.ok()) return payload.status();
   directive.payload = std::move(*payload);
-  auto preconditions = reader.String(kMaxOpaqueFieldBytes);
-  if (!preconditions.ok()) return preconditions.status();
-  directive.preconditions = std::move(*preconditions);
-  auto storage_mutating = reader.Bool();
-  if (!storage_mutating.ok()) return storage_mutating.status();
-  directive.storage_mutating = *storage_mutating;
-  auto force = reader.Bool();
-  if (!force.ok()) return force.status();
-  directive.force = *force;
+
   return directive;
 }
 
+template <class T, class Write>
+absl::Status WriteStateList(Writer& w, const std::vector<T>& values,
+                            std::size_t cap, Write write) {
+  if (auto status = WriteCount(w, values.size(), cap, "state entries");
+      !status.ok())
+    return status;
+  for (const auto& value : values) {
+    if (auto status = write(w, value); !status.ok()) return status;
+  }
+  return absl::OkStatus();
+}
+
+template <class T, class Read>
+absl::StatusOr<std::vector<T>> ReadStateList(Reader& r, std::size_t cap,
+                                             Read read) {
+  auto count = ReadCount(r, cap, "state entries");
+  if (!count.ok()) return count.status();
+  std::vector<T> values;
+  values.reserve(*count);
+  for (std::uint32_t i = 0; i < *count; ++i) {
+    auto value = read(r);
+    if (!value.ok()) return value.status();
+    values.push_back(std::move(*value));
+  }
+  return values;
+}
+
+absl::Status WriteRoute(Writer& w, const WireRoutingGroup& g) {
+  if (auto st = w.String(g.group_id, kMaxIdentifierBytes, "group"); !st.ok())
+    return st;
+  w.U64(g.term);
+  w.Bool(g.owner.has_value());
+  if (g.owner) {
+    if (auto st = WriteIdentity(w, *g.owner, "owner"); !st.ok()) return st;
+    w.Fixed(g.owner_assignment);
+  }
+  w.Bool(g.available);
+  if (auto st = WriteStateList(w, g.members, kMaxProjectedNodes,
+                               [](Writer& out, const std::string& id) {
+                                 return WriteIdentity(out, id, "member");
+                               });
+      !st.ok())
+    return st;
+  return WriteStateList(w, g.slots, kMaxManifestEntries,
+                        [](Writer& out, const WireSlotRange& range) {
+                          if (range.first > range.last || range.last >= 16384)
+                            return ProtocolError("invalid route slots");
+                          out.U16(range.first);
+                          out.U16(range.last);
+                          return absl::OkStatus();
+                        });
+}
+
+absl::StatusOr<WireRoutingGroup> ReadRoute(Reader& r) {
+  WireRoutingGroup g;
+  auto id = r.String(kMaxIdentifierBytes);
+  if (!id.ok()) return id.status();
+  g.group_id = std::move(*id);
+  auto term = r.U64();
+  if (!term.ok()) return term.status();
+  g.term = *term;
+  auto owner = r.Bool();
+  if (!owner.ok()) return owner.status();
+  if (*owner) {
+    auto id = ReadIdentity(r, "owner");
+    if (!id.ok()) return id.status();
+    g.owner = std::move(*id);
+    auto assignment = r.Fixed<16>();
+    if (!assignment.ok()) return assignment.status();
+    g.owner_assignment = *assignment;
+  }
+  auto available = r.Bool();
+  if (!available.ok()) return available.status();
+  g.available = *available;
+  auto members = ReadStateList<std::string>(
+      r, kMaxProjectedNodes,
+      [](Reader& in) { return ReadIdentity(in, "member"); });
+  if (!members.ok()) return members.status();
+  g.members = std::move(*members);
+  auto slots = ReadStateList<WireSlotRange>(
+      r, kMaxManifestEntries, [](Reader& in) -> absl::StatusOr<WireSlotRange> {
+        auto first = in.U16();
+        if (!first.ok()) return first.status();
+        auto last = in.U16();
+        if (!last.ok()) return last.status();
+        if (*first > *last || *last >= 16384)
+          return ProtocolError("invalid route slots");
+        return WireSlotRange{*first, *last};
+      });
+  if (!slots.ok()) return slots.status();
+  g.slots = std::move(*slots);
+  if (g.available && (!g.owner || g.term == 0 || IsZeroId(g.owner_assignment)))
+    return ProtocolError("invalid available route");
+  return g;
+}
+
+absl::Status WriteState(Writer& w, const RoutingState& v) {
+  w.U64(v.revision);
+  if (auto st =
+          WriteStateList(w, v.nodes, kMaxProjectedNodes, WriteDataEndpoint);
+      !st.ok())
+    return st;
+  if (auto st = WriteStateList(w, v.groups, kMaxProjectedGroups, WriteRoute);
+      !st.ok())
+    return st;
+  return absl::OkStatus();
+}
+absl::StatusOr<RoutingState> ReadRoutingState(Reader& r) {
+  RoutingState v;
+  auto revision = r.U64();
+  if (!revision.ok()) return revision.status();
+  v.revision = std::move(*revision);
+  auto nodes =
+      ReadStateList<WireDataEndpoint>(r, kMaxProjectedNodes, ReadDataEndpoint);
+  if (!nodes.ok()) return nodes.status();
+  v.nodes = std::move(*nodes);
+  auto groups =
+      ReadStateList<WireRoutingGroup>(r, kMaxProjectedGroups, ReadRoute);
+  if (!groups.ok()) return groups.status();
+  v.groups = std::move(*groups);
+  return v;
+}
+
+absl::Status WriteState(Writer& w, const LocalGroupState& v) {
+  w.U64(v.revision);
+  w.U32(v.lease_duration_ms);
+  if (auto st = WriteStateList(w, v.groups, 1, WriteDesiredGroup); !st.ok())
+    return st;
+  if (auto st = WriteStateList(w, v.manifests, 1, WriteManifest); !st.ok())
+    return st;
+  return absl::OkStatus();
+}
+absl::StatusOr<LocalGroupState> ReadLocalGroupState(Reader& r) {
+  LocalGroupState v;
+  auto revision = r.U64();
+  if (!revision.ok()) return revision.status();
+  v.revision = std::move(*revision);
+  auto lease_duration_ms = r.U32();
+  if (!lease_duration_ms.ok()) return lease_duration_ms.status();
+  v.lease_duration_ms = std::move(*lease_duration_ms);
+  auto groups = ReadStateList<WireDesiredGroup>(r, 1, ReadDesiredGroup);
+  if (!groups.ok()) return groups.status();
+  v.groups = std::move(*groups);
+  auto manifests = ReadStateList<WireManifestDocument>(r, 1, ReadManifest);
+  if (!manifests.ok()) return manifests.status();
+  v.manifests = std::move(*manifests);
+  return v;
+}
+
+absl::Status WriteState(Writer& w, const MetaDirectoryState& v) {
+  w.U64(v.revision);
+  if (auto st =
+          WriteStateList(w, v.endpoints, kMaxDirectoryEntries, WriteEndpoint);
+      !st.ok())
+    return st;
+  return absl::OkStatus();
+}
+absl::StatusOr<MetaDirectoryState> ReadMetaDirectoryState(Reader& r) {
+  MetaDirectoryState v;
+  auto revision = r.U64();
+  if (!revision.ok()) return revision.status();
+  v.revision = std::move(*revision);
+  auto endpoints =
+      ReadStateList<WireMetaEndpoint>(r, kMaxDirectoryEntries, ReadEndpoint);
+  if (!endpoints.ok()) return endpoints.status();
+  v.endpoints = std::move(*endpoints);
+  return v;
+}
+
+absl::Status WriteState(Writer& w, const TaskChanges& v) {
+  w.U64(v.base_revision);
+  w.U64(v.revision);
+  if (auto st = WriteStateList(w, v.upserts, kMaxProjectedDirectives,
+                               WriteProjectedDirective);
+      !st.ok())
+    return st;
+  if (auto st =
+          WriteStateList(w, v.removed, kMaxProjectedDirectives,
+                         [](Writer& out, const WireDirectiveIdentity& id) {
+                           WriteDirectiveIdentity(out, id);
+                           return absl::OkStatus();
+                         });
+      !st.ok())
+    return st;
+  return absl::OkStatus();
+}
+absl::StatusOr<TaskChanges> ReadTaskChanges(Reader& r) {
+  TaskChanges v;
+  auto base_revision = r.U64();
+  if (!base_revision.ok()) return base_revision.status();
+  v.base_revision = std::move(*base_revision);
+  auto revision = r.U64();
+  if (!revision.ok()) return revision.status();
+  v.revision = std::move(*revision);
+  auto upserts = ReadStateList<WireProjectedDirective>(
+      r, kMaxProjectedDirectives, ReadProjectedDirective);
+  if (!upserts.ok()) return upserts.status();
+  v.upserts = std::move(*upserts);
+  auto removed = ReadStateList<WireDirectiveIdentity>(
+      r, kMaxProjectedDirectives, ReadDirectiveIdentity);
+  if (!removed.ok()) return removed.status();
+  v.removed = std::move(*removed);
+  return v;
+}
+
 absl::Status WriteFullDesiredStateBody(Writer& writer,
-                                       const FullDesiredState& state,
-                                       std::uint64_t source_meta_applied_index,
-                                       const WireHash256& projection_hash,
-                                       bool normalize_directive_basis) {
+                                       const FullDesiredState& state) {
   if (state.authority_lease_duration_ms == 0) {
     return ProtocolError("FullDesiredState lease duration is invalid");
   }
   writer.U16(kProtocolVersion);
-  writer.U64(source_meta_applied_index);
+  writer.U64(state.control_revision);
   writer.U64(state.topology_epoch);
   writer.U32(state.authority_lease_duration_ms);
-  writer.Fixed(projection_hash);
 
   if (absl::Status status = WriteCount(writer, state.meta_directory.size(),
                                        kMaxDirectoryEntries, "Meta directory");
@@ -3150,8 +3061,7 @@ absl::Status WriteFullDesiredStateBody(Writer& writer,
     return status;
   }
   for (const WireProjectedDirective& directive : state.current_directives) {
-    if (absl::Status status = WriteProjectedDirective(
-            writer, directive, normalize_directive_basis);
+    if (absl::Status status = WriteProjectedDirective(writer, directive);
         !status.ok()) {
       return status;
     }
@@ -3164,37 +3074,25 @@ absl::Status WriteFullDesiredStateBody(Writer& writer,
 
 absl::Status ValidateFullDesiredStateProjectionBasis(
     const FullDesiredState& state) {
-  if (IsZeroHash(state.projection_hash)) {
-    return ProtocolError("FullDesiredState projection hash is empty");
+  if (state.authority_lease_duration_ms == 0) {
+    return ProtocolError("FullDesiredState lease duration is invalid");
   }
-  for (const WireProjectedDirective& directive : state.current_directives) {
-    if (directive.basis.source_meta_applied_index !=
-            state.source_meta_applied_index ||
-        directive.basis.projection_hash != state.projection_hash) {
-      return ProtocolError(
-          "projected directive does not carry the enclosing projection "
-          "basis");
-    }
+  if (state.control_revision == 0) {
+    return ProtocolError("bootstrap control revision is zero");
   }
   return absl::OkStatus();
 }
 
-absl::StatusOr<WireHash256> ComputeProjectionHashImpl(
-    const FullDesiredState& state) {
-  // Projection hashing streams the canonical body into SHA-256. At the
-  // protocol maximum, materializing this normalized encoding would otherwise
-  // temporarily duplicate the complete decoded projection.
-  Sha256WriterSink sink;
-  Writer writer(sink);
-  if (absl::Status status =
-          WriteFullDesiredStateBody(writer, state, 0, WireHash256{}, true);
+}  // namespace
+
+absl::Status ValidateFullDesiredState(const FullDesiredState& state) {
+  if (auto status = ValidateFullDesiredStateProjectionBasis(state);
       !status.ok()) {
     return status;
   }
-  return sink.Final();
+  Writer counter(/*retain_bytes=*/false);
+  return WriteFullDesiredStateBody(counter, state);
 }
-
-}  // namespace
 
 absl::StatusOr<std::string> EncodeFullDesiredState(
     const FullDesiredState& state) {
@@ -3202,16 +3100,9 @@ absl::StatusOr<std::string> EncodeFullDesiredState(
       !status.ok()) {
     return status;
   }
-  auto expected_projection = ComputeProjectionHashImpl(state);
-  if (!expected_projection.ok()) return expected_projection.status();
-  if (*expected_projection != state.projection_hash) {
-    return ProtocolError("FullDesiredState projection hash is inconsistent");
-  }
 
   Writer writer;
-  if (absl::Status status = WriteFullDesiredStateBody(
-          writer, state, state.source_meta_applied_index, state.projection_hash,
-          false);
+  if (absl::Status status = WriteFullDesiredStateBody(writer, state);
       !status.ok()) {
     return status;
   }
@@ -3233,7 +3124,7 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
   }
   auto index = reader.U64();
   if (!index.ok()) return index.status();
-  state.source_meta_applied_index = *index;
+  state.control_revision = *index;
   auto topology_epoch = reader.U64();
   if (!topology_epoch.ok()) return topology_epoch.status();
   state.topology_epoch = *topology_epoch;
@@ -3242,9 +3133,6 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
     return authority_lease_duration_ms.status();
   }
   state.authority_lease_duration_ms = *authority_lease_duration_ms;
-  auto projection_hash = reader.Fixed<32>();
-  if (!projection_hash.ok()) return projection_hash.status();
-  state.projection_hash = *projection_hash;
 
   auto directory_count =
       ReadCount(reader, kMaxDirectoryEntries, "Meta directory");
@@ -3297,11 +3185,6 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
       !status.ok()) {
     return status;
   }
-  auto expected_projection = ComputeProjectionHashImpl(state);
-  if (!expected_projection.ok()) return expected_projection.status();
-  if (*expected_projection != state.projection_hash) {
-    return ProtocolError("FullDesiredState projection hash is inconsistent");
-  }
   return state;
 }
 
@@ -3315,9 +3198,259 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(std::string&& encoded) {
   return decoded;
 }
 
-absl::StatusOr<WireHash256> ComputeProjectionHash(
-    const FullDesiredState& state) {
-  return ComputeProjectionHashImpl(state);
+bool SameDesiredState(const FullDesiredState& left,
+                      const FullDesiredState& right) {
+  if (left.topology_epoch != right.topology_epoch ||
+      left.authority_lease_duration_ms != right.authority_lease_duration_ms ||
+      left.meta_directory != right.meta_directory ||
+      left.nodes != right.nodes || left.groups != right.groups ||
+      left.manifests != right.manifests ||
+      left.current_directives.size() != right.current_directives.size()) {
+    return false;
+  }
+  return left.current_directives == right.current_directives;
+}
+
+absl::StatusOr<std::string> EncodeNodeControlUpdate(
+    const NodeControlUpdate& update) {
+  Writer writer;
+  writer.Fixed(update.request_id);
+  writer.Bool(update.tasks.has_value());
+  if (update.tasks) {
+    if (auto st = WriteState(writer, *update.tasks); !st.ok()) return st;
+  }
+
+  writer.Bool(update.routing.has_value());
+  if (update.routing) {
+    if (auto st = WriteState(writer, *update.routing); !st.ok()) return st;
+  }
+  writer.Bool(update.local.has_value());
+  if (update.local) {
+    if (auto st = WriteState(writer, *update.local); !st.ok()) return st;
+  }
+  writer.Bool(update.directory.has_value());
+  if (update.directory) {
+    if (auto st = WriteState(writer, *update.directory); !st.ok()) return st;
+  }
+  if (writer.size() > kMaxFullDesiredStateBytes)
+    return ResourceLimit("node update exceeds its cap");
+  return std::move(writer).Take();
+}
+
+absl::StatusOr<NodeControlUpdate> DecodeNodeControlUpdate(
+    std::string_view bytes) {
+  if (bytes.size() > kMaxFullDesiredStateBytes)
+    return ResourceLimit("node update exceeds its cap");
+  Reader reader(bytes);
+  NodeControlUpdate update;
+  auto id = reader.Fixed<16>();
+  if (!id.ok()) return id.status();
+  update.request_id = *id;
+  auto has_tasks = reader.Bool();
+  if (!has_tasks.ok()) return has_tasks.status();
+  if (*has_tasks) {
+    auto value = ReadTaskChanges(reader);
+    if (!value.ok()) return value.status();
+    update.tasks = std::move(*value);
+  }
+  auto has_routing = reader.Bool();
+  if (!has_routing.ok()) return has_routing.status();
+  if (*has_routing) {
+    auto value = ReadRoutingState(reader);
+    if (!value.ok()) return value.status();
+    update.routing = std::move(*value);
+  }
+  auto has_local = reader.Bool();
+  if (!has_local.ok()) return has_local.status();
+  if (*has_local) {
+    auto value = ReadLocalGroupState(reader);
+    if (!value.ok()) return value.status();
+    update.local = std::move(*value);
+  }
+  auto has_directory = reader.Bool();
+  if (!has_directory.ok()) return has_directory.status();
+  if (*has_directory) {
+    auto value = ReadMetaDirectoryState(reader);
+    if (!value.ok()) return value.status();
+    update.directory = std::move(*value);
+  }
+  if (auto st = reader.Finish(); !st.ok()) return st;
+  return update;
+}
+
+NodeControlState SelectNodeControlState(const FullDesiredState& source,
+                                        std::string_view node_id) {
+  NodeControlState state;
+  state.routing.revision = source.control_revision;
+  state.routing.nodes = source.nodes;
+  state.local.revision = source.control_revision;
+  state.local.lease_duration_ms = source.authority_lease_duration_ms;
+  state.directory = {1, source.meta_directory};
+  state.tasks_revision = 1;
+  for (const auto& group : source.groups) {
+    WireRoutingGroup route{
+        .group_id = group.group_id,
+        .term = group.group_term,
+        .owner = group.owner_node_id,
+        .owner_assignment = group.owner_assignment_id.value_or(WireId128{}),
+        .available = group.grant_active,
+        .members = {},
+        .slots = group.slot_ranges};
+    bool local = false;
+    for (const auto& member : group.members) {
+      route.members.push_back(member.node_id);
+      local |= member.node_id == node_id;
+    }
+    state.routing.groups.push_back(std::move(route));
+    if (!local) continue;
+    state.local.groups.push_back(group);
+    for (const auto& manifest : source.manifests) {
+      if (manifest.revision == group.manifest_revision &&
+          manifest.digest == group.manifest_digest) {
+        state.local.manifests.push_back(manifest);
+      }
+    }
+  }
+  for (const auto& task : source.current_directives) {
+    if (task.recipient_node_id == node_id) state.tasks.push_back(task);
+  }
+  return state;
+}
+
+NodeControlUpdate DiffNodeControlState(const NodeControlState& previous,
+                                       NodeControlState& next) {
+  NodeControlUpdate update;
+  const auto diff = [](const auto& old_value, auto& new_value, auto& change) {
+    new_value.revision = old_value.revision;
+    if (old_value != new_value) {
+      ++new_value.revision;
+      change = new_value;
+    }
+  };
+  diff(previous.routing, next.routing, update.routing);
+  diff(previous.local, next.local, update.local);
+  // A local member's endpoint is execution input as well as discovery data.
+  // Reconcile it under the local revision even when membership is unchanged.
+  if (!update.local && previous.routing.nodes != next.routing.nodes) {
+    bool endpoint_changed = false;
+    for (const auto& group : next.local.groups) {
+      for (const auto& member : group.members) {
+        const auto endpoint = [&](const RoutingState& routes) {
+          return std::find_if(
+              routes.nodes.begin(), routes.nodes.end(),
+              [&](const auto& node) { return node.node_id == member.node_id; });
+        };
+        const auto before = endpoint(previous.routing);
+        const auto after = endpoint(next.routing);
+        endpoint_changed |= before == previous.routing.nodes.end() ||
+                            after == next.routing.nodes.end() ||
+                            *before != *after;
+      }
+    }
+    if (endpoint_changed) {
+      ++next.local.revision;
+      update.local = next.local;
+    }
+  }
+  diff(previous.directory, next.directory, update.directory);
+  next.tasks_revision = previous.tasks_revision;
+  TaskChanges tasks{.base_revision = previous.tasks_revision,
+                    .revision = previous.tasks_revision + 1,
+                    .upserts = {},
+                    .removed = {}};
+  for (const auto& task : next.tasks) {
+    if (std::find(previous.tasks.begin(), previous.tasks.end(), task) ==
+        previous.tasks.end()) {
+      tasks.upserts.push_back(task);
+    }
+  }
+  for (const auto& task : previous.tasks) {
+    if (std::none_of(next.tasks.begin(), next.tasks.end(),
+                     [&](const auto& current) {
+                       return current.identity == task.identity;
+                     }))
+      tasks.removed.push_back(task.identity);
+  }
+  if (!tasks.upserts.empty() || !tasks.removed.empty()) {
+    next.tasks_revision = tasks.revision;
+    update.tasks = std::move(tasks);
+  }
+  return update;
+}
+
+absl::Status ApplyNodeControlUpdate(NodeControlState& state,
+                                    const NodeControlUpdate& update) {
+  // Validate the entire request before publishing any module. A gap in the
+  // task delta requires reconnect/bootstrap; complete objects can skip
+  // revisions.
+  const auto validate = [](const auto& current, const auto& change) {
+    if (change &&
+        (change->revision == 0 ||
+         (change->revision == current.revision && *change != current))) {
+      return absl::FailedPreconditionError(
+          "conflicting control object revision");
+    }
+    return absl::OkStatus();
+  };
+  for (const auto& status : {validate(state.routing, update.routing),
+                             validate(state.local, update.local),
+                             validate(state.directory, update.directory)}) {
+    if (!status.ok()) return status;
+  }
+  std::optional<std::vector<WireProjectedDirective>> tasks;
+  if (update.tasks && update.tasks->revision >= state.tasks_revision) {
+    const auto& delta = *update.tasks;
+    if (delta.revision == 0 || delta.revision <= delta.base_revision) {
+      return absl::FailedPreconditionError("invalid task revision");
+    }
+    if (delta.revision == state.tasks_revision) {
+      for (const auto& task : delta.upserts) {
+        if (std::find(state.tasks.begin(), state.tasks.end(), task) ==
+            state.tasks.end())
+          return absl::FailedPreconditionError("conflicting task replay");
+      }
+      for (const auto& id : delta.removed) {
+        if (std::any_of(state.tasks.begin(), state.tasks.end(),
+                        [&](const auto& task) { return task.identity == id; }))
+          return absl::FailedPreconditionError(
+              "conflicting task removal replay");
+      }
+    } else {
+      if (delta.base_revision != state.tasks_revision)
+        return absl::FailedPreconditionError("task delta has a revision gap");
+      tasks = state.tasks;
+      for (const auto& id : delta.removed) {
+        std::erase_if(*tasks,
+                      [&](const auto& task) { return task.identity == id; });
+      }
+      for (const auto& task : delta.upserts) {
+        auto existing = std::find_if(
+            tasks->begin(), tasks->end(), [&](const auto& candidate) {
+              return task.identity == candidate.identity;
+            });
+        if (existing != tasks->end()) {
+          if (*existing != task)
+            return absl::FailedPreconditionError(
+                "task identity reused for different work");
+        } else {
+          tasks->push_back(task);
+        }
+      }
+      if (tasks->size() > kMaxProjectedDirectives)
+        return absl::ResourceExhaustedError("too many active tasks");
+    }
+  }
+  const auto apply = [](auto& current, const auto& change) {
+    if (change && change->revision > current.revision) current = *change;
+  };
+  apply(state.routing, update.routing);
+  apply(state.local, update.local);
+  apply(state.directory, update.directory);
+  if (tasks) {
+    state.tasks = std::move(*tasks);
+    state.tasks_revision = update.tasks->revision;
+  }
+  return absl::OkStatus();
 }
 
 }  // namespace keylane::cluster::control

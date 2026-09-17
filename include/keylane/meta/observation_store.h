@@ -27,8 +27,8 @@
 //     landing between ingest and query cannot leak stale data.
 //   - Group-bound observations require the authenticated node's exact current
 //     membership assignment and group_term == committed current term (older is
-//     stale, newer is forged: both rejected). Manifest ids and operation
-//     evidence histories must match committed values/bindings. Candidate
+//     stale, newer is forged: both rejected). Manifest ids match committed
+//     values. Candidate
 //     reporter history comes from ClientHello, while its independent source
 //     history is a compatibility-domain anchor for the internal selector.
 //
@@ -37,8 +37,8 @@
 // durable audit trail (that lives in MetaAuditStore).
 //
 // Resource bounds are layered: sessions and observation entries bound fixed
-// container overhead, candidate/evidence domain caps stop one group,
-// operation, or reporter from monopolizing keys, and exact charged-byte
+// container overhead, candidate/failover domain caps stop one group
+// or reporter from monopolizing keys, and exact charged-byte
 // budgets cover every large payload and its primary index copies. Capacity
 // rejection preserves the previous latest-wins value for diagnostic ingest;
 // heartbeat replace-or-clear still removes stale role evidence. Observations
@@ -71,6 +71,7 @@ struct MetaObservationIdentity {
   std::string node_id_;
   MetaBootIncarnation boot_incarnation_;
   uint64_t session_generation_ = 0;
+  bool operator==(const MetaObservationIdentity&) const = default;
 };
 
 // Exact candidate action contained in the FDS that underlay one authenticated
@@ -100,7 +101,7 @@ struct MetaObservedOwnerProjection {
   std::string owner_node_id_;
   MetaAssignmentId owner_assignment_id_{};
   std::uint64_t group_term_ = 0;
-  MetaHash256 projection_hash_{};
+  std::uint64_t control_revision_ = 0;
   // Effective duration from this installed FDS after the Meta Leader's local
   // validity cap. Retaining it with the projection lets a later snapshot tear
   // distinguish a known-expired old lease from unknown runtime evidence.
@@ -220,9 +221,6 @@ struct MetaCandidateProgressObs {
   MetaBootIncarnation source_boot_incarnation_{};
   MetaReplicationHistoryId source_replication_history_id_{};
   std::vector<std::uint64_t> applied_next_lsns_;
-  std::string applied_flow_vector_;  // compatibility diagnostic rendering
-  std::string backlog_coverage_;     // opaque, bounded
-  std::string readiness_;            // opaque, bounded
   bool storage_ready_ = false;
   bool population_ready_ = false;
   bool draining_ = false;
@@ -231,23 +229,6 @@ struct MetaCandidateProgressObs {
   bool operator==(const MetaCandidateProgressObs&) const = default;
 };
 
-struct MetaOperationEvidenceObs {
-  // Bound to the authenticated reporter and its exact current membership
-  // incarnation; neither field is accepted as an independent identity claim.
-  std::string node_id_;
-  MetaBootIncarnation boot_incarnation_{};
-  MetaAssignmentId assignment_id_{};
-  MetaOperationId operation_id_;
-  std::string kind_phase_;  // bounded; the phase this evidence supports
-  std::string evidence_;    // bounded normalized evidence payload
-  // Committed population and operation-history anchors for this evidence:
-  std::string group_id_;
-  uint64_t group_term_ = 0;
-  uint64_t population_manifest_revision_ = 0;
-  uint64_t partition_replication_epoch_ = 0;
-  MetaReplicationHistoryId replication_history_id_{};
-  bool operator==(const MetaOperationEvidenceObs&) const = default;
-};
 
 // Transition-scoped heartbeat facts are soft evidence. They are intentionally
 // separate from role_information because a source still requests ordinary
@@ -311,17 +292,9 @@ struct MetaFailoverObservationObs {
   bool operator==(const MetaFailoverObservationObs&) const = default;
 };
 
-// Canonical conversion used after EvidenceForOperation returns a validated,
-// TTL-fresh, self-contained observation. The manifest digest comes from the
-// same committed view used for that query; every observation/session anchor
-// is copied without a second lookup that could race session supersession.
-MetaEvidenceSummary SummarizeOperationEvidence(
-    const MetaOperationEvidenceObs& evidence,
-    const MetaHash256& population_manifest_digest);
-
 using MetaObservationPayload =
     std::variant<MetaNodeBootObs, MetaNodeHealthObs, MetaCandidateProgressObs,
-                 MetaOperationEvidenceObs, MetaFailoverObservationObs>;
+                 MetaFailoverObservationObs>;
 
 struct MetaObservation {
   MetaObservationIdentity identity_;
@@ -355,7 +328,7 @@ class MetaCommittedFacts {
       std::string_view group_id) const = 0;
   // True only for the exact current membership incarnation. An active node
   // outside the group, or a removed-and-readded node using an old assignment,
-  // must not contribute candidate or operation evidence.
+  // must not contribute candidate or failover observations.
   virtual bool AssignmentMatches(
       std::string_view group_id, std::string_view node_id,
       const MetaAssignmentId& assignment_id) const = 0;
@@ -371,14 +344,6 @@ class MetaCommittedFacts {
       const MetaCandidateProgressObs&) const {
     return false;
   }
-  // True when the operation exists (including archived summaries) and is not
-  // in a terminal lifecycle state.
-  virtual bool OperationNonTerminal(const MetaOperationId& id) const = 0;
-  // True when `history_id` is bound to the operation by a committed journal
-  // record (the history anchor for evidence freshness).
-  virtual bool HistoryBoundToOperation(
-      const MetaOperationId& id,
-      const MetaReplicationHistoryId& history_id) const = 0;
   // True when any committed active transition binds this exact node boot as
   // its current Candidate Action. The conservative default preserves a
   // disconnect latch for adapters that cannot inspect failover state.
@@ -436,24 +401,18 @@ class MetaObservationStore {
     // admission therefore uses that same bound instead of selecting the first
     // reporters by arrival order.
     size_t max_candidates_per_group_ = kMaxMetaNodes;
-    // Operation evidence is latest-wins by (operation, node, kind/phase).
-    // One reporter and one operation domain may each retain no more distinct
-    // phase keys than a durable operation record can ever consume.
-    size_t max_evidence_phases_per_node_ = kMaxMetaOperationEvidencePerRecord;
-    size_t max_evidence_per_operation_ = kMaxMetaOperationEvidencePerRecord;
     size_t max_observations_total_ = 65536;
     // Charged bytes include every variable-length observation field and its
     // lookup-key copies; fixed container overhead remains count-bounded by
     // max_observations_total_. The pooled default can retain one maximum
     // direct observation frame plus one identifier-sized index allowance per
-    // maximum registered node. A single node may retain one maximum streamed
-    // evidence object together with one direct heartbeat and its index.
+    // maximum registered node. Each node retains the latest heartbeat fields
+    // and their bounded lookup keys.
     std::uint64_t max_retained_bytes_total_ =
         static_cast<std::uint64_t>(kMaxMetaNodes) *
         (cluster::control::kMaxFrameBytes +
          cluster::control::kMaxIdentifierBytes);
     std::uint64_t max_retained_bytes_per_node_ =
-        cluster::control::kMaxOperationEvidenceTransferBytes +
         cluster::control::kMaxFrameBytes +
         cluster::control::kMaxIdentifierBytes;
     size_t audit_ring_capacity_ = 4096;
@@ -559,8 +518,7 @@ class MetaObservationStore {
 
   // Commit-driven invalidation: drop observations whose node, assignment,
   // term, manifest, or partition-epoch bindings no longer match committed
-  // state; operation evidence additionally checks its committed history and
-  // operation anchors. Candidate reporter-local history is session-bound;
+  // state. Candidate reporter-local history is session-bound;
   // its independent source history is a compatibility-domain anchor rather
   // than a committed Meta fact. Events are audited, and callers run this
   // after each committed batch.
@@ -573,9 +531,8 @@ class MetaObservationStore {
   // explicit query paths retain SweepExpired's exact boundary semantics.
   bool MaybeSweepExpired(int64_t now_unix_ms);
 
-  // Read paths re-filter against current committed facts. Operation evidence
-  // additionally takes the caller's current wall time so an authority
-  // decision cannot depend on a delayed periodic TTL sweep.
+  // Read paths re-filter against current committed facts. Planning queries
+  // also apply TTL at the caller's fixed observation cut.
   std::optional<MetaCandidateProgressObs> LatestCandidateProgress(
       std::string_view group_id, const MetaCommittedFacts& facts) const;
   std::vector<MetaCandidateProgressObs> CandidateProgressFor(
@@ -593,9 +550,6 @@ class MetaObservationStore {
   std::optional<MetaObservation> LatestForNode(
       std::string_view node_id, const MetaCommittedFacts& facts,
       std::optional<int64_t> now_unix_ms = std::nullopt) const;
-  std::vector<MetaOperationEvidenceObs> EvidenceForOperation(
-      const MetaOperationId& id, const MetaCommittedFacts& facts,
-      int64_t now_unix_ms) const;
   // Returns only TTL-fresh transition evidence that still matches committed
   // transition, action, membership, boot, and current-session anchors.
   // SourcePaused is keyed by transition; candidate outcomes additionally bind

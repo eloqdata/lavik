@@ -14,10 +14,6 @@ namespace keylane::meta {
 void WriteActorContext(MetaWriter& writer, const ActorContext& actor);
 absl::StatusOr<ActorContext> ReadActorContext(MetaReader& reader);
 
-void WriteMetaEvidenceSummary(MetaWriter& writer,
-                              const MetaEvidenceSummary& evidence);
-absl::StatusOr<MetaEvidenceSummary> ReadMetaEvidenceSummary(MetaReader& reader);
-
 void WriteMetaDirectiveSpec(MetaWriter& writer,
                             const MetaDirectiveSpec& directive);
 absl::StatusOr<MetaDirectiveSpec> ReadMetaDirectiveSpec(MetaReader& reader);

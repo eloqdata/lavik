@@ -99,13 +99,11 @@ bool AuthorityUnchanged(const ServingState& admitted,
 using MonotonicTime = LeaseTime;
 using MonotonicDuration = LeaseDuration;
 
-// Node-specific semantic basis of a projected Meta state. The Raft applied
-// index orders observations and detects rollback; the SHA-256 projection hash
-// is the actual dependency of lease grants and directives, so unrelated Meta
-// commits do not revoke valid work.
+// Committed source of the installed node projection. Leases and directives
+// must name this exact index; lower snapshot indexes cannot roll state back.
+// Meta retains this basis when unrelated commits leave desired content equal.
 struct ProjectionBasis {
-  std::uint64_t source_meta_applied_index_ = 0;
-  Sha256Digest projection_hash_{};
+  std::uint64_t control_revision_ = 0;
 
   friend bool operator==(const ProjectionBasis&,
                          const ProjectionBasis&) = default;

@@ -490,7 +490,7 @@ MetaCommittedStatusView MetaStateMachine::StatusSnapshot() const {
     view.automatic_failover_threshold_ms_ = automatic_policy->suspect_after_ms_;
   }
   for (MetaTopologyGroupView topology : stores_.topology_.Groups()) {
-    auto grant = stores_.grant_.GroupState(topology.group_id_);
+    auto grant = stores_.topology_.AuthorityFor(topology.group_id_);
     // Cross-store validation guarantees the grant half exists for every
     // topology group; retain a defensive fenced value if corrupted in memory
     // so status reports NOT READY instead of inventing authority.

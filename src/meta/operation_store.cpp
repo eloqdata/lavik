@@ -31,15 +31,6 @@ bool IsTerminal(MetaOperationLifecycle lifecycle) {
          lifecycle == MetaOperationLifecycle::kAborted;
 }
 
-// The replay check of TransitionOperationPhase: the command's evidence chunk
-// is already the tail of the record's accumulated evidence.
-bool EvidenceTailMatches(const MetaOperationRecord& record,
-                         const std::vector<MetaEvidenceSummary>& evidence) {
-  if (record.evidence_.size() < evidence.size()) return false;
-  return std::equal(evidence.begin(), evidence.end(),
-                    record.evidence_.end() - evidence.size());
-}
-
 template <std::size_t N>
 bool IsZero(const std::array<std::uint8_t, N>& value) {
   return std::all_of(value.begin(), value.end(),
@@ -62,11 +53,7 @@ bool RecipientMatchesKind(const MetaDirectiveSpec& directive) {
   if (IsMetaSourceDirective(directive.kind_)) {
     return directive.recipient_node_id_ == directive.source_node_id_;
   }
-  // Operation kinds are extensible at the durable layer. Unknown kinds still
-  // have to bind execution to one of the two persisted incarnations; the
-  // control projector decides whether it knows how to send them.
-  return directive.recipient_node_id_ == directive.target_node_id_ ||
-         directive.recipient_node_id_ == directive.source_node_id_;
+  return false;
 }
 
 const MetaBootIncarnation* RecipientBoot(const MetaDirectiveSpec& directive) {
@@ -77,24 +64,6 @@ const MetaBootIncarnation* RecipientBoot(const MetaDirectiveSpec& directive) {
   if (IsMetaSourceDirective(directive.kind_) &&
       directive.recipient_node_id_ == directive.source_node_id_) {
     return &directive.source_boot_id_;
-  }
-  if (IsKnownMetaDirective(directive.kind_)) {
-    return nullptr;
-  }
-  if (directive.recipient_node_id_ == directive.target_node_id_ &&
-      directive.recipient_node_id_ != directive.source_node_id_) {
-    return &directive.target_boot_id_;
-  }
-  if (directive.recipient_node_id_ == directive.source_node_id_ &&
-      directive.recipient_node_id_ != directive.target_node_id_) {
-    return &directive.source_boot_id_;
-  }
-  // An extensible kind cannot choose an incarnation when both roles name the
-  // same stable node but carry different boots. Refuse the ambiguous result
-  // anchor instead of silently preferring one role.
-  if (directive.recipient_node_id_ == directive.target_node_id_ &&
-      directive.target_boot_id_ == directive.source_boot_id_) {
-    return &directive.target_boot_id_;
   }
   return nullptr;
 }
@@ -111,12 +80,12 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
       IsZero(directive.source_boot_id_) &&
       IsZero(directive.source_replication_history_id_);
   const bool source_valid =
-      initializes_empty
-          ? absent_source
-          : directive.source_node_id_.size() == kMetaNodeIdBytes &&
-                !IsZero(directive.source_assignment_id_) &&
-                !IsZero(directive.source_boot_id_) &&
-                !IsZero(directive.source_replication_history_id_);
+      initializes_empty ? absent_source
+                        : cluster::control::IsCanonicalIdentity160(
+                              directive.source_node_id_) &&
+                              !IsZero(directive.source_assignment_id_) &&
+                              !IsZero(directive.source_boot_id_) &&
+                              !IsZero(directive.source_replication_history_id_);
   const bool payload_valid =
       initializes_empty
           ? directive.payload_.size() == 2 * kMetaReplicationHistoryIdBytes &&
@@ -125,15 +94,15 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
                             [](unsigned char value) {
                               return (value >= '0' && value <= '9') ||
                                      (value >= 'a' && value <= 'f');
-                            }) &&
-                directive.preconditions_.empty()
+                            })
       : rebuild
-          ? cluster::control::DecodeRebuildRequest(directive.payload_).ok() &&
-                directive.preconditions_.empty()
-          : directive.payload_.empty() && directive.preconditions_.empty();
-  return !IsZero(directive.directive_id_) && !IsZero(directive.attempt_id_) &&
-         directive.recipient_node_id_.size() == kMetaNodeIdBytes &&
-         directive.target_node_id_.size() == kMetaNodeIdBytes &&
+          ? cluster::control::DecodeRebuildRequest(directive.payload_).ok()
+          : directive.payload_.empty();
+  return IsKnownMetaDirective(directive.kind_) &&
+         !IsZero(directive.directive_id_) && !IsZero(directive.attempt_id_) &&
+         cluster::control::IsCanonicalIdentity160(
+             directive.recipient_node_id_) &&
+         cluster::control::IsCanonicalIdentity160(directive.target_node_id_) &&
          !IsZero(directive.target_boot_id_) &&
          !IsZero(directive.assignment_id_) && source_valid &&
          !directive.group_id_.empty() &&
@@ -142,23 +111,10 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
          ((directive.population_manifest_revision_ == 0) == zero_manifest) &&
          !directive.kind_.empty() &&
          directive.kind_.size() <= kMaxMetaDirectiveKindBytes &&
-         directive.payload_.size() <= kMaxMetaPayloadBytes &&
-         directive.preconditions_.size() <=
-             kMaxMetaDirectivePreconditionsBytes &&
-         payload_valid && !directive.force_ && RecipientMatchesKind(directive);
+         directive.payload_.size() <= kMaxMetaPayloadBytes && payload_valid &&
+         RecipientMatchesKind(directive);
 }
 
-bool EvidenceSummaryWellFormed(const MetaEvidenceSummary& evidence) {
-  const bool zero_manifest = IsZero(evidence.population_manifest_digest_);
-  return evidence.node_id_.size() == kMetaNodeIdBytes &&
-         !evidence.group_id_.empty() &&
-         evidence.group_id_.size() <= kMaxMetaGroupIdBytes &&
-         !IsZero(evidence.assignment_id_) &&
-         !IsZero(evidence.boot_incarnation_) && evidence.group_term_ != 0 &&
-         ((evidence.population_manifest_revision_ == 0) == zero_manifest) &&
-         !IsZero(evidence.replication_history_id_) &&
-         !IsZero(evidence.operation_id_);
-}
 
 bool ValidResultStatus(MetaDirectiveResultStatus status) {
   const auto tag = static_cast<std::uint8_t>(status);
@@ -336,8 +292,7 @@ bool MetaOperationStore::TransitionAlreadyApplied(
          record.revision_ == command.expected_revision_ + 1 &&
          record.kind_phase_blob_ == command.kind_phase_blob_ &&
          DirectiveSpecsMatch(record.current_directives_,
-                             command.current_directives_) &&
-         EvidenceTailMatches(record, command.evidence_);
+                             command.current_directives_);
 }
 
 bool MetaOperationStore::PopulationManifestInUse(
@@ -345,13 +300,6 @@ bool MetaOperationStore::PopulationManifestInUse(
   for (const auto& [id, record] : live_) {
     (void)id;
     if (IsTerminal(record.lifecycle_)) continue;
-    if (std::any_of(record.evidence_.begin(), record.evidence_.end(),
-                    [&digest](const MetaEvidenceSummary& evidence) {
-                      return evidence.population_manifest_revision_ != 0 &&
-                             evidence.population_manifest_digest_ == digest;
-                    })) {
-      return true;
-    }
     if (std::any_of(
             record.current_directives_.begin(),
             record.current_directives_.end(),
@@ -384,8 +332,7 @@ absl::Status MetaOperationStore::TransitionOperationPhase(
       record.revision_ == command.expected_revision_ + 1 &&
       record.kind_phase_blob_ == command.kind_phase_blob_ &&
       DirectiveSpecsMatch(record.current_directives_,
-                          command.current_directives_) &&
-      EvidenceTailMatches(record, command.evidence_)) {
+                          command.current_directives_)) {
     return absl::OkStatus();
   }
   if (IsTerminal(record.lifecycle_)) {
@@ -410,7 +357,7 @@ absl::Status MetaOperationStore::TransitionOperationPhase(
         !attempt_ids.insert(directive.attempt_id_).second) {
       return MetaDomainRejectError("invalid or duplicate current directive");
     }
-    if (directive.storage_mutating_ &&
+    if (IsMetaPopulationDirective(directive.kind_) &&
         !mutating_targets
              .emplace(directive.target_node_id_, directive.assignment_id_)
              .second) {
@@ -424,29 +371,12 @@ absl::Status MetaOperationStore::TransitionOperationPhase(
     }
     for (const MetaCurrentDirective& installed : other.current_directives_) {
       const MetaDirectiveSpec& directive = installed.spec_;
-      if (directive.storage_mutating_ &&
+      if (IsMetaPopulationDirective(directive.kind_) &&
           mutating_targets.contains(
               {directive.target_node_id_, directive.assignment_id_})) {
         return MetaDomainRejectError(
             "storage-mutating directive conflicts with another operation");
       }
-    }
-  }
-  if (record.evidence_.size() + command.evidence_.size() >
-      kMaxMetaOperationEvidencePerRecord) {
-    return MetaDomainRejectError("per-record evidence cap reached");
-  }
-  for (const MetaEvidenceSummary& evidence : command.evidence_) {
-    if (!EvidenceSummaryWellFormed(evidence)) {
-      return MetaDomainRejectError("invalid evidence summary anchors");
-    }
-    if (evidence.operation_id_ != command.operation_id_) {
-      return MetaDomainRejectError("evidence references a different operation");
-    }
-    if (IsZero(record.replication_history_id_) ||
-        evidence.replication_history_id_ != record.replication_history_id_) {
-      return MetaDomainRejectError(
-          "evidence replication history does not match the operation");
     }
   }
   record.lifecycle_ = MetaOperationLifecycle::kRunning;
@@ -466,8 +396,6 @@ absl::Status MetaOperationStore::TransitionOperationPhase(
     next_directives.push_back(MetaCurrentDirective{desired, revision});
   }
   record.current_directives_ = std::move(next_directives);
-  record.evidence_.insert(record.evidence_.end(), command.evidence_.begin(),
-                          command.evidence_.end());
   record.revision_ = command.expected_revision_ + 1;
   return absl::OkStatus();
 }
@@ -762,10 +690,10 @@ namespace {
 // Wire codecs for the snapshot and archive-export blobs (versioned strict
 // encoding; every decode failure is MetaFailureClass::kFailStop).
 
-absl::Status ReadStoreSchemaVersion(MetaReader& r) {
+absl::Status ReadStoreSchemaVersion(MetaReader& r, std::uint16_t expected) {
   auto version = r.ReadU16();
   if (!version.ok()) return version.status();
-  if (*version != kMetaFormatVersion) {
+  if (*version != expected) {
     return MetaFailStopError("unsupported operation store schema version");
   }
   return absl::OkStatus();
@@ -849,7 +777,6 @@ void WriteRecord(MetaWriter& w, const MetaOperationRecord& record) {
               });
   w.WriteList(record.terminal_receipts_, WriteTerminalReceipt);
   w.WriteU64(record.revision_);
-  w.WriteList(record.evidence_, WriteMetaEvidenceSummary);
   w.WriteString(record.terminal_result_);
   w.WriteBool(record.data_loss_possible_);
   WriteActorContext(w, record.actor_);
@@ -900,11 +827,6 @@ absl::StatusOr<MetaOperationRecord> ReadRecord(MetaReader& r) {
   auto revision = r.ReadU64();
   if (!revision.ok()) return revision.status();
   record.revision_ = *revision;
-  auto evidence = r.ReadList<MetaEvidenceSummary>(
-      kMaxMetaOperationEvidencePerRecord,
-      [](MetaReader& rr) { return ReadMetaEvidenceSummary(rr); });
-  if (!evidence.ok()) return evidence.status();
-  record.evidence_ = std::move(*evidence);
   auto result = r.ReadString(kMaxMetaPayloadBytes);
   if (!result.ok()) return result.status();
   record.terminal_result_ = std::string(*result);
@@ -988,9 +910,8 @@ absl::StatusOr<std::string> MetaOperationStore::ExportArchive() const {
   return w.TakeBuffer();
 }
 
-absl::StatusOr<std::string> MetaOperationStore::Serialize() const {
-  MetaWriter w;
-  w.WriteU16(kMetaFormatVersion);
+void MetaOperationStore::WriteSnapshot(MetaWriter& w) const {
+  w.WriteU16(kMetaOperationStoreFormatVersion);
   w.WriteCount(static_cast<std::uint32_t>(live_.size()));
   for (const auto& [id, record] : live_) {
     WriteRecord(w, record);
@@ -999,7 +920,18 @@ absl::StatusOr<std::string> MetaOperationStore::Serialize() const {
   for (const auto& [id, summary] : archived_) {
     WriteSummary(w, summary);
   }
-  return w.TakeBuffer();
+}
+
+absl::StatusOr<std::string> MetaOperationStore::Serialize() const {
+  MetaWriter writer;
+  WriteSnapshot(writer);
+  return writer.TakeBuffer();
+}
+
+std::uint64_t MetaOperationStore::SerializedSize() const {
+  MetaWriter counter(false);
+  WriteSnapshot(counter);
+  return counter.size();
 }
 
 absl::StatusOr<MetaOperationStore> MetaOperationStore::Deserialize(
@@ -1007,7 +939,9 @@ absl::StatusOr<MetaOperationStore> MetaOperationStore::Deserialize(
     std::uint32_t max_archived,
     std::uint32_t max_terminal_receipts_per_operation) {
   MetaReader r(bytes);
-  if (absl::Status status = ReadStoreSchemaVersion(r); !status.ok()) {
+  if (absl::Status status =
+          ReadStoreSchemaVersion(r, kMetaOperationStoreFormatVersion);
+      !status.ok()) {
     return status;
   }
   // The live set (terminal records included) never exceeds the joint bound
@@ -1033,15 +967,6 @@ absl::StatusOr<MetaOperationStore> MetaOperationStore::Deserialize(
         store.archived_by_seq_.contains(record.operation_seq_)) {
       return MetaFailStopError("duplicate operation_seq in snapshot");
     }
-    for (const MetaEvidenceSummary& evidence : record.evidence_) {
-      if (!EvidenceSummaryWellFormed(evidence) ||
-          evidence.operation_id_ != record.operation_id_ ||
-          IsZero(record.replication_history_id_) ||
-          evidence.replication_history_id_ != record.replication_history_id_) {
-        return MetaFailStopError(
-            "operation evidence does not match committed anchors");
-      }
-    }
     std::set<MetaDirectiveId> directive_ids;
     std::set<MetaAttemptId> attempt_ids;
     for (const MetaCurrentDirective& installed : record.current_directives_) {
@@ -1050,7 +975,7 @@ absl::StatusOr<MetaOperationStore> MetaOperationStore::Deserialize(
           !DirectiveWellFormed(directive) ||
           !directive_ids.insert(directive.directive_id_).second ||
           !attempt_ids.insert(directive.attempt_id_).second ||
-          (directive.storage_mutating_ &&
+          (IsMetaPopulationDirective(directive.kind_) &&
            !mutating_targets
                 .emplace(directive.target_node_id_, directive.assignment_id_)
                 .second)) {
@@ -1122,7 +1047,8 @@ absl::StatusOr<MetaOperationStore> MetaOperationStore::Deserialize(
 absl::StatusOr<MetaOperationArchiveExport> DecodeMetaOperationArchiveExport(
     std::string_view bytes) {
   MetaReader r(bytes);
-  if (absl::Status status = ReadStoreSchemaVersion(r); !status.ok()) {
+  if (absl::Status status = ReadStoreSchemaVersion(r, kMetaFormatVersion);
+      !status.ok()) {
     return status;
   }
   auto summaries = r.ReadList<MetaOperationArchiveSummary>(

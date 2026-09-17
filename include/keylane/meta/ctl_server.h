@@ -53,7 +53,7 @@
 //                             answer from an older commit index.
 //   registernode <node_id40hex> <principal> <primary|replica>
 //                <data-endpoint> [<data-endpoint>]
-//                          -> propose RegisterNode with zero capability mask;
+//                          -> propose RegisterNode;
 //                             reply shape of submitop. Data endpoints are
 //                             numeric host:port values optionally tagged with
 //                             tcp:// or tls://; an active node needs one or
@@ -144,9 +144,7 @@
 //
 // creategroup, assignnode, begingroupterm, and transitionop are also typed,
 // committed-state drivers used by operators and gates to build the anchors
-// against which observation freshness is checked. transitionop appends an
-// evidence summary whose replication_history_id is what later anchors
-// `obs evidence` (HistoryBoundToOperation).
+// against which observation freshness is checked.
 //
 // Observation surface: MetaObservationStore is volatile and leader-local, so
 // this whole verb family manipulates process-local state — nothing here is
@@ -158,21 +156,11 @@
 //   obs boot <node_id> <boot_hex40> <gen>
 //   obs health <node_id> <boot_hex40> <gen> <health>
 //   obs candidate <node_id> <boot_hex40> <gen> <group> <term> <manifest>
-//                 <partition_epoch> <history40hex> <flow> <backlog> <readiness>
-//   obs evidence <node_id> <boot_hex40> <gen> <op32hex> <phase> <evidence>
-//                <group> <term> <manifest> <partition_epoch> <history40hex>
-//                          -> one Ingest each (fields map 1:1 onto the
-//                             envelope payloads of observation_store.h;
-//                             candidate reporter/assignment identity is
-//                             derived from the trusted session identity and
-//                             the same committed snapshot used for admission;
-//                             by the ctl, not taken from the wire). "OK" on
-//                             admission, "ERR <detail>" on rejection — every
-//                             rejection also lands in the audit ring.
+//                 <partition_epoch> <history40hex>
 //   observations           -> "OK total=<n>"; observations <group_id> ->
 //                             "OK candidates=<n>" plus one
 //                             node=<n>,assignment=<a>,term=<t>,manifest=<m>,
-//                             partition_epoch=<p>,history=<h>,readiness=<r>
+//                             partition_epoch=<p>,history=<h>,storage_ready=<s>,population_ready=<r>
 //                             token per fresh candidate (read paths re-filter
 //                             against the current committed snapshot).
 //   obsaudit               -> "OK events=<n>" plus one

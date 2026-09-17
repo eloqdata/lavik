@@ -1,7 +1,7 @@
 #pragma once
 
 // MetaStateMachine is the metadata control plane's NuRaft `state_machine`.
-// It owns the committed aggregate `MetaStores` (seven stores) and applies every
+// It owns the committed aggregate `MetaStores` (six stores) and applies every
 // committed entry through
 // the deterministic pure function ApplyCommitted (see state_apply.h).
 //
@@ -188,7 +188,7 @@ class MetaStateMachine : public nuraft::state_machine {
       const MetaCommand& command);
 
   // Atomic copy of the whole committed aggregate (the CommittedView building
-  // block). All seven stores move together, so readers never observe a
+  // block). All six stores move together, so readers never observe a
   // cross-store tear. The copy is bounded by snapshot-format caps but can be
   // large; hot callers must cache/reuse a view or use targeted queries.
   MetaStores StoresSnapshot() const;

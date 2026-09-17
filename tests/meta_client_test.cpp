@@ -365,7 +365,7 @@ TEST(MetaCandidateProjectionTest,
     value[0] = 1;
     return value;
   }();
-  const control::WireHash256 manifest = control::ComputeSha256("manifest");
+  const control::WireHash256 manifest = control::WireHash256{1};
   control::WireDesiredGroup group{
       .group_id = "group-a",
       .members = {{.node_id = kLocal, .assignment_id = assignment}},
@@ -486,14 +486,12 @@ TEST(MetaInboundTransferAbortTest,
 }
 
 TEST(MetaDirectiveValidationTest,
-     RequiresExactInstalledDirectiveAndKindSpecificRecipient) {
+     RequiresCurrentLocalAnchorsAndKindSpecificRecipient) {
   constexpr char kLocal[] = "1111111111111111111111111111111111111111";
   constexpr char kLocalBoot[] = "2222222222222222222222222222222222222222";
   constexpr char kRemote[] = "3333333333333333333333333333333333333333";
   constexpr char kRemoteBoot[] = "4444444444444444444444444444444444444444";
   control::WireProjectedDirective projected{
-      .basis = {.source_meta_applied_index = 9,
-                .projection_hash = control::ComputeSha256("projection")},
       .authority = {.group_id = "group-a",
                     .assignment_id = {},
                     .group_term = 3},
@@ -510,13 +508,11 @@ TEST(MetaDirectiveValidationTest,
       .source_boot_id = kRemoteBoot,
       .source_replication_history_id = kRemote,
       .manifest_revision = 7,
-      .manifest_digest = control::ComputeSha256("manifest"),
+      .manifest_digest = control::WireHash256{1},
       .partition_replication_epoch = 10,
       .kind = control::WireDirectiveKind::kRebuild,
       .payload = "payload",
-      .preconditions = "preconditions",
-      .storage_mutating = true,
-      .force = false,
+
   };
   projected.authority.assignment_id[0] = 1;
   projected.identity.operation_id[0] = 2;
@@ -526,7 +522,7 @@ TEST(MetaDirectiveValidationTest,
   const auto live = [&] {
     return control::Directive{
         .session_id = {},
-        .basis = projected.basis,
+        .basis = {.control_revision = 9},
         .authority = projected.authority,
         .identity = projected.identity,
         .recipient_node_id = projected.recipient_node_id,
@@ -543,12 +539,11 @@ TEST(MetaDirectiveValidationTest,
         .partition_replication_epoch = projected.partition_replication_epoch,
         .kind = projected.kind,
         .payload = projected.payload,
-        .preconditions = projected.preconditions,
-        .storage_mutating = projected.storage_mutating,
-        .force = projected.force,
+
     };
   }();
   control::FullDesiredState desired;
+  desired.control_revision = 9;
   control::WireId128 remote_assignment{};
   remote_assignment[0] = 9;
   desired.groups.push_back({
@@ -562,27 +557,47 @@ TEST(MetaDirectiveValidationTest,
       .partition_replication_epoch = projected.partition_replication_epoch,
   });
   desired.current_directives.push_back(projected);
-  EXPECT_TRUE(ValidateLiveDirective(live, desired, kLocal, kLocalBoot).ok());
+  EXPECT_TRUE(ValidateLiveDirective(
+                  live, control::SelectNodeControlState(desired, kLocal),
+                  kLocal, kLocalBoot)
+                  .ok());
+
+  auto stale_basis = live;
+  --stale_basis.basis.control_revision;
+  EXPECT_EQ(ValidateLiveDirective(
+                stale_basis, control::SelectNodeControlState(desired, kLocal),
+                kLocal, kLocalBoot)
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
 
   control::Directive stale_population = live;
   --stale_population.partition_replication_epoch;
-  EXPECT_EQ(ValidateLiveDirective(stale_population, desired, kLocal, kLocalBoot)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(
+      ValidateLiveDirective(stale_population,
+                            control::SelectNodeControlState(desired, kLocal),
+                            kLocal, kLocalBoot)
+          .code(),
+      absl::StatusCode::kFailedPrecondition);
 
   // Even if a stale envelope exactly matches a projected directive, the
   // installed group's current population epoch remains authoritative.
   desired.current_directives.front().partition_replication_epoch =
       stale_population.partition_replication_epoch;
-  EXPECT_EQ(ValidateLiveDirective(stale_population, desired, kLocal, kLocalBoot)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(
+      ValidateLiveDirective(stale_population,
+                            control::SelectNodeControlState(desired, kLocal),
+                            kLocal, kLocalBoot)
+          .code(),
+      absl::StatusCode::kFailedPrecondition);
   desired.current_directives.front().partition_replication_epoch =
       projected.partition_replication_epoch;
 
   control::Directive changed = live;
-  changed.force = true;
-  EXPECT_EQ(ValidateLiveDirective(changed, desired, kLocal, kLocalBoot).code(),
+  changed.kind = control::WireDirectiveKind::kRevokeSources;
+  EXPECT_EQ(ValidateLiveDirective(
+                changed, control::SelectNodeControlState(desired, kLocal),
+                kLocal, kLocalBoot)
+                .code(),
             absl::StatusCode::kFailedPrecondition);
 
   control::Directive authorize = live;
@@ -598,9 +613,11 @@ TEST(MetaDirectiveValidationTest,
       authorize.recipient_boot_id;
   desired.current_directives.front().source_node_id = authorize.source_node_id;
   desired.current_directives.front().source_boot_id = authorize.source_boot_id;
-  EXPECT_EQ(
-      ValidateLiveDirective(authorize, desired, kLocal, kLocalBoot).code(),
-      absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(ValidateLiveDirective(
+                authorize, control::SelectNodeControlState(desired, kLocal),
+                kLocal, kLocalBoot)
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
 
   authorize.source_node_id = kLocal;
   authorize.source_assignment_id = projected.authority.assignment_id;
@@ -615,31 +632,40 @@ TEST(MetaDirectiveValidationTest,
   desired.current_directives.front().target_node_id = authorize.target_node_id;
   desired.current_directives.front().target_boot_id = authorize.target_boot_id;
   desired.current_directives.front().authority = authorize.authority;
-  EXPECT_TRUE(
-      ValidateLiveDirective(authorize, desired, kLocal, kLocalBoot).ok());
+  EXPECT_TRUE(ValidateLiveDirective(
+                  authorize, control::SelectNodeControlState(desired, kLocal),
+                  kLocal, kLocalBoot)
+                  .ok());
 
   control::Directive stale_source = authorize;
   stale_source.source_assignment_id = remote_assignment;
   desired.current_directives.front().source_assignment_id =
       stale_source.source_assignment_id;
-  EXPECT_EQ(
-      ValidateLiveDirective(stale_source, desired, kLocal, kLocalBoot).code(),
-      absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(ValidateLiveDirective(
+                stale_source, control::SelectNodeControlState(desired, kLocal),
+                kLocal, kLocalBoot)
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
   desired.current_directives.front().source_assignment_id =
       authorize.source_assignment_id;
 
   control::Directive stale_target = authorize;
   stale_target.authority.assignment_id = projected.authority.assignment_id;
   desired.current_directives.front().authority = stale_target.authority;
-  EXPECT_EQ(
-      ValidateLiveDirective(stale_target, desired, kLocal, kLocalBoot).code(),
-      absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(ValidateLiveDirective(
+                stale_target, control::SelectNodeControlState(desired, kLocal),
+                kLocal, kLocalBoot)
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
   desired.current_directives.front().authority = authorize.authority;
 
   control::Directive revoke = authorize;
   revoke.kind = control::WireDirectiveKind::kRevokeSources;
   desired.current_directives.front().kind = revoke.kind;
-  EXPECT_TRUE(ValidateLiveDirective(revoke, desired, kLocal, kLocalBoot).ok());
+  EXPECT_TRUE(ValidateLiveDirective(
+                  revoke, control::SelectNodeControlState(desired, kLocal),
+                  kLocal, kLocalBoot)
+                  .ok());
 
   control::Directive initialize = live;
   initialize.kind = control::WireDirectiveKind::kInitializeEmptyPopulation;
@@ -648,7 +674,7 @@ TEST(MetaDirectiveValidationTest,
   initialize.source_boot_id = std::string(40, '0');
   initialize.source_replication_history_id = std::string(40, '0');
   initialize.payload = kRemote;
-  initialize.preconditions.clear();
+
   initialize.authority.assignment_id = projected.authority.assignment_id;
   desired.current_directives.front() = projected;
   desired.current_directives.front().kind = initialize.kind;
@@ -658,10 +684,12 @@ TEST(MetaDirectiveValidationTest,
   desired.current_directives.front().source_replication_history_id =
       initialize.source_replication_history_id;
   desired.current_directives.front().payload = initialize.payload;
-  desired.current_directives.front().preconditions.clear();
+
   desired.current_directives.front().authority = initialize.authority;
-  EXPECT_TRUE(
-      ValidateLiveDirective(initialize, desired, kLocal, kLocalBoot).ok());
+  EXPECT_TRUE(ValidateLiveDirective(
+                  initialize, control::SelectNodeControlState(desired, kLocal),
+                  kLocal, kLocalBoot)
+                  .ok());
 
   control::Directive stale_initialize_boot = initialize;
   stale_initialize_boot.recipient_boot_id = kRemoteBoot;
@@ -669,7 +697,9 @@ TEST(MetaDirectiveValidationTest,
   desired.current_directives.front().recipient_boot_id = kRemoteBoot;
   desired.current_directives.front().target_boot_id = kRemoteBoot;
   EXPECT_EQ(
-      ValidateLiveDirective(stale_initialize_boot, desired, kLocal, kLocalBoot)
+      ValidateLiveDirective(stale_initialize_boot,
+                            control::SelectNodeControlState(desired, kLocal),
+                            kLocal, kLocalBoot)
           .code(),
       absl::StatusCode::kFailedPrecondition);
   desired.current_directives.front().recipient_boot_id = kLocalBoot;
@@ -680,15 +710,19 @@ TEST(MetaDirectiveValidationTest,
   desired.current_directives.front().authority =
       stale_initialize_term.authority;
   EXPECT_EQ(
-      ValidateLiveDirective(stale_initialize_term, desired, kLocal, kLocalBoot)
+      ValidateLiveDirective(stale_initialize_term,
+                            control::SelectNodeControlState(desired, kLocal),
+                            kLocal, kLocalBoot)
           .code(),
       absl::StatusCode::kFailedPrecondition);
   desired.current_directives.front().authority = initialize.authority;
 
   initialize.source_node_id = kRemote;
-  EXPECT_EQ(
-      ValidateLiveDirective(initialize, desired, kLocal, kLocalBoot).code(),
-      absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(ValidateLiveDirective(
+                initialize, control::SelectNodeControlState(desired, kLocal),
+                kLocal, kLocalBoot)
+                .code(),
+            absl::StatusCode::kInvalidArgument);
 }
 
 TEST(MetaDirectiveResultTest, SeparatesRejectionsFromExecutionFailures) {
@@ -733,7 +767,7 @@ TEST(MetaFailoverControlAdapterTest,
   source_assignment[0] = 0x33;
   control::WireId128 candidate_assignment{};
   candidate_assignment[0] = 0x44;
-  const control::WireHash256 manifest = control::ComputeSha256("manifest-a");
+  const control::WireHash256 manifest = control::WireHash256{2};
   DesiredClusterControl desired{
       .identity_ =
           {

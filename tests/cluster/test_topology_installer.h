@@ -44,17 +44,12 @@ class TestTopologyInstaller {
     if (absl::Status ready = installer_.SetStorageReady(true); !ready.ok()) {
       return ready;
     }
-    Sha256Digest projection_hash{};
-    projection_hash.fill(
-        static_cast<std::uint8_t>((next_source_index_ % 251) + 1));
     const ProjectionBasis projection{
-        .source_meta_applied_index_ = next_source_index_,
-        .projection_hash_ = projection_hash,
+        .control_revision_ = next_source_index_,
     };
     if (absl::Status installed = installer_.InstallFullState(
             PreparedFullState{
                 .serving_state_ = std::move(state),
-                .control_groups_ = {},
             },
             projection);
         !installed.ok()) {

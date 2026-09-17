@@ -60,8 +60,11 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "keylane/meta/commands.h"
+#include "keylane/meta/encoding.h"
 
 namespace keylane::meta {
+
+inline constexpr std::uint16_t kMetaIdentityStoreFormatVersion = 1;
 
 // One registered node. node_id_ is the map key, duplicated here so query
 // results are self-contained. revision_ and retired_ are defined by the
@@ -70,7 +73,7 @@ struct MetaNodeRecord {
   std::string node_id_;
   std::string principal_;  // canonical SAN principal, globally 1:1
   std::vector<std::string> endpoints_;
-  std::uint64_t capability_mask_ = 0;
+
   MetaNodeRole role_ = MetaNodeRole::kPrimary;
   std::uint64_t revision_ = 0;  // 1 at registration, +1 per applied mutation
   bool retired_ = false;
@@ -130,9 +133,12 @@ class MetaIdentityStore {
   // principal, Data-node revision 0) — a corrupt snapshot fails identically
   // on every node.
   std::string Serialize() const;
+  // Exact durable size without allocating or copying snapshot bytes.
+  std::uint64_t SerializedSize() const;
   static absl::StatusOr<MetaIdentityStore> Deserialize(std::string_view bytes);
 
  private:
+  void WriteSnapshot(MetaWriter& writer) const;
   std::map<std::string, MetaNodeRecord> nodes_;  // by node_id, sorted
   // Registry-specific reverse indexes jointly enforce the global 1:1 binding.
   std::map<std::string, std::string> node_id_by_principal_;

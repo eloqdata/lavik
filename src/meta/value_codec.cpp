@@ -17,64 +17,6 @@ absl::StatusOr<ActorContext> ReadActorContext(MetaReader& reader) {
   return ActorContext{std::string(*principal), std::string(*readable_time)};
 }
 
-void WriteMetaEvidenceSummary(MetaWriter& writer,
-                              const MetaEvidenceSummary& evidence) {
-  writer.WriteString(evidence.node_id_);
-  writer.WriteString(evidence.group_id_);
-  WriteFixedArray(writer, evidence.assignment_id_);
-  WriteFixedArray(writer, evidence.boot_incarnation_);
-  writer.WriteU64(evidence.group_term_);
-  writer.WriteU64(evidence.population_manifest_revision_);
-  WriteFixedArray(writer, evidence.population_manifest_digest_);
-  writer.WriteU64(evidence.partition_replication_epoch_);
-  WriteFixedArray(writer, evidence.replication_history_id_);
-  WriteFixedArray(writer, evidence.operation_id_);
-}
-
-absl::StatusOr<MetaEvidenceSummary> ReadMetaEvidenceSummary(
-    MetaReader& reader) {
-  auto node_id = reader.ReadString(kMetaNodeIdBytes);
-  if (!node_id.ok()) return node_id.status();
-  auto group_id = reader.ReadString(kMaxMetaGroupIdBytes);
-  if (!group_id.ok()) return group_id.status();
-  auto assignment_id = ReadFixedArray<16>(reader);
-  if (!assignment_id.ok()) return assignment_id.status();
-  auto boot_incarnation = ReadFixedArray<kMetaBootIncarnationBytes>(reader);
-  if (!boot_incarnation.ok()) return boot_incarnation.status();
-  auto group_term = reader.ReadU64();
-  if (!group_term.ok()) return group_term.status();
-  auto population_manifest_revision = reader.ReadU64();
-  if (!population_manifest_revision.ok()) {
-    return population_manifest_revision.status();
-  }
-  auto population_manifest_digest = ReadFixedArray<32>(reader);
-  if (!population_manifest_digest.ok()) {
-    return population_manifest_digest.status();
-  }
-  auto partition_replication_epoch = reader.ReadU64();
-  if (!partition_replication_epoch.ok()) {
-    return partition_replication_epoch.status();
-  }
-  auto replication_history_id =
-      ReadFixedArray<kMetaReplicationHistoryIdBytes>(reader);
-  if (!replication_history_id.ok()) return replication_history_id.status();
-  auto operation_id = ReadFixedArray<16>(reader);
-  if (!operation_id.ok()) return operation_id.status();
-
-  MetaEvidenceSummary evidence;
-  evidence.node_id_ = std::string(*node_id);
-  evidence.group_id_ = std::string(*group_id);
-  evidence.assignment_id_ = *assignment_id;
-  evidence.boot_incarnation_ = *boot_incarnation;
-  evidence.group_term_ = *group_term;
-  evidence.population_manifest_revision_ = *population_manifest_revision;
-  evidence.population_manifest_digest_ = *population_manifest_digest;
-  evidence.partition_replication_epoch_ = *partition_replication_epoch;
-  evidence.replication_history_id_ = *replication_history_id;
-  evidence.operation_id_ = *operation_id;
-  return evidence;
-}
-
 void WriteMetaDirectiveSpec(MetaWriter& writer,
                             const MetaDirectiveSpec& directive) {
   WriteFixedArray(writer, directive.directive_id_);
@@ -94,9 +36,6 @@ void WriteMetaDirectiveSpec(MetaWriter& writer,
   writer.WriteU64(directive.partition_replication_epoch_);
   writer.WriteString(directive.kind_);
   writer.WriteString(directive.payload_);
-  writer.WriteString(directive.preconditions_);
-  writer.WriteBool(directive.storage_mutating_);
-  writer.WriteBool(directive.force_);
 }
 
 absl::StatusOr<MetaDirectiveSpec> ReadMetaDirectiveSpec(MetaReader& reader) {
@@ -154,16 +93,7 @@ absl::StatusOr<MetaDirectiveSpec> ReadMetaDirectiveSpec(MetaReader& reader) {
   auto payload = reader.ReadString(kMaxMetaPayloadBytes);
   if (!payload.ok()) return payload.status();
   directive.payload_ = std::string(*payload);
-  auto preconditions = reader.ReadString(kMaxMetaDirectivePreconditionsBytes);
-  if (!preconditions.ok()) return preconditions.status();
-  directive.preconditions_ = std::string(*preconditions);
-  auto storage_mutating =
-      reader.ReadBool("storage_mutating tag must be 0 or 1");
-  if (!storage_mutating.ok()) return storage_mutating.status();
-  directive.storage_mutating_ = *storage_mutating;
-  auto force = reader.ReadBool("force tag must be 0 or 1");
-  if (!force.ok()) return force.status();
-  directive.force_ = *force;
+
   return directive;
 }
 
