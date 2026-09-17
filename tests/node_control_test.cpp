@@ -1626,8 +1626,12 @@ class LeaseExpiryService final : public bycorf::Service {
       server_->RequestStop();
       co_return result_;
     }
+    // Keep distinct original/renewed deadline windows with enough scheduling
+    // slack for a shared runner. A delayed wakeup before renewal must not turn
+    // this stale-timer check into the separate expired-lease renewal case.
+    constexpr auto lease_duration = 1s;
     if (absl::Status installed = control_.installer.InstallFullState(
-            WithLease(FullState(MakeState()), 100ms), Basis(10));
+            WithLease(FullState(MakeState()), lease_duration), Basis(10));
         !installed.ok()) {
       result_ = installed;
       server_->RequestStop();
@@ -1640,7 +1644,7 @@ class LeaseExpiryService final : public bycorf::Service {
         .projection_ = Basis(10),
         .anchor_ = Anchor(*state),
         .sent_at_ = LeaseClockNow(),
-        .granted_duration_ = 100ms,
+        .granted_duration_ = lease_duration,
     };
     expirations_before_ = GetClusterControlMetrics().lease_expirations_;
     result_ = co_await control_.installer.ApplyLeaseGrantTransition(grant);
@@ -1648,14 +1652,14 @@ class LeaseExpiryService final : public bycorf::Service {
       server_->RequestStop();
       co_return result_;
     }
-    absl::Status slept = co_await bycorf::SleepFor(worker, 60ms);
+    absl::Status slept = co_await bycorf::SleepFor(worker, 600ms);
     if (!slept.ok()) {
       result_ = slept;
       server_->RequestStop();
       co_return result_;
     }
     grant.sent_at_ = LeaseClockNow();
-    grant.granted_duration_ = 100ms;
+    grant.granted_duration_ = lease_duration;
     result_ = co_await control_.installer.ApplyLeaseGrantTransition(grant);
     if (!result_.ok()) {
       server_->RequestStop();
@@ -1664,7 +1668,7 @@ class LeaseExpiryService final : public bycorf::Service {
 
     // Cross the original deadline. Its timer must see the renewed deadline
     // and leave the replacement lease and its source capabilities intact.
-    slept = co_await bycorf::SleepFor(worker, 60ms);
+    slept = co_await bycorf::SleepFor(worker, 600ms);
     if (!slept.ok()) {
       result_ = slept;
       server_->RequestStop();
@@ -1677,7 +1681,7 @@ class LeaseExpiryService final : public bycorf::Service {
                 .kind_ == Decision::Kind::kServe &&
         control_.actions.session_clears_ == 0;
 
-    slept = co_await bycorf::SleepFor(worker, 70ms);
+    slept = co_await bycorf::SleepFor(worker, 700ms);
     if (!slept.ok()) {
       result_ = slept;
       server_->RequestStop();
@@ -1690,7 +1694,7 @@ class LeaseExpiryService final : public bycorf::Service {
     expiry_preserved_source_capabilities_ =
         control_.actions.session_clears_ == 0;
     grant.sent_at_ = LeaseClockNow();
-    grant.granted_duration_ = 100ms;
+    grant.granted_duration_ = lease_duration;
     renewal_succeeded_after_expiry_ =
         (co_await control_.installer.ApplyLeaseGrantTransition(grant)).ok();
     revocations_ = control_.actions.expiration_authority_revocations_;

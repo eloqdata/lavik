@@ -1308,11 +1308,24 @@ TEST(ListE2eTest, StreamBlockingRegistryBroadcastsAndKeepsGroupFifo) {
   auto xread = [port] {
     RespClient waiting(port);
     return waiting.Command(
-        {"XREAD", "BLOCK", "1000", "STREAMS", "broadcast-stream", "0-0"});
+        {"XREAD", "BLOCK", "5000", "STREAMS", "broadcast-stream", "0-0"});
+  };
+  // Thread launch order is not waiter registration order. Observe each
+  // registration before publishing data or adding the next FIFO consumer.
+  auto wait_for_blocked_clients = [&](unsigned expected) {
+    const std::string field =
+        "blocked_clients:" + std::to_string(expected) + "\r\n";
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (client.Command({"INFO", "CLIENTS"}).find(field) != std::string::npos)
+        return true;
+      std::this_thread::sleep_for(1ms);
+    }
+    return false;
   };
   auto first_reader = std::async(std::launch::async, xread);
   auto second_reader = std::async(std::launch::async, xread);
-  std::this_thread::sleep_for(50ms);
+  ASSERT_TRUE(wait_for_blocked_clients(2));
   EXPECT_EQ(
       client.Command({"XADD", "broadcast-stream", "1-0", "field", "value"}),
       Bulk("1-0"));
@@ -1330,15 +1343,15 @@ TEST(ListE2eTest, StreamBlockingRegistryBroadcastsAndKeepsGroupFifo) {
   auto first_group = std::async(std::launch::async, [port] {
     RespClient waiting(port);
     return waiting.Command({"XREADGROUP", "GROUP", "g", "first", "COUNT", "1",
-                            "BLOCK", "1000", "STREAMS", "fifo-stream", ">"});
+                            "BLOCK", "5000", "STREAMS", "fifo-stream", ">"});
   });
-  std::this_thread::sleep_for(30ms);
+  ASSERT_TRUE(wait_for_blocked_clients(1));
   auto second_group = std::async(std::launch::async, [port] {
     RespClient waiting(port);
     return waiting.Command({"XREADGROUP", "GROUP", "g", "second", "COUNT", "1",
-                            "BLOCK", "1000", "STREAMS", "fifo-stream", ">"});
+                            "BLOCK", "5000", "STREAMS", "fifo-stream", ">"});
   });
-  std::this_thread::sleep_for(50ms);
+  ASSERT_TRUE(wait_for_blocked_clients(2));
   EXPECT_EQ(client.Command({"XADD", "fifo-stream", "1-0", "f", "one"}),
             Bulk("1-0"));
   ASSERT_EQ(first_group.wait_for(1s), std::future_status::ready);
@@ -1357,9 +1370,9 @@ TEST(ListE2eTest, StreamBlockingRegistryBroadcastsAndKeepsGroupFifo) {
   auto rewound_group = std::async(std::launch::async, [port] {
     RespClient waiting(port);
     return waiting.Command({"XREADGROUP", "GROUP", "rewind-group", "reader",
-                            "BLOCK", "1000", "STREAMS", "rewind-wake", ">"});
+                            "BLOCK", "5000", "STREAMS", "rewind-wake", ">"});
   });
-  std::this_thread::sleep_for(50ms);
+  ASSERT_TRUE(wait_for_blocked_clients(1));
   EXPECT_EQ(
       client.Command({"XGROUP", "SETID", "rewind-wake", "rewind-group", "0"}),
       "+OK");
