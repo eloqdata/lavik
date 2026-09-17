@@ -1,0 +1,225 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1210" viewBox="0 0 1600 1210">
+<rect width="100%" height="100%" fill="#FFFFFF"/>
+<text x="70" y="65" font-family="Arial, sans-serif" font-size="35" font-weight="700" text-anchor="start" fill="#17202A">Redis and Valkey I/O-thread scaling</text>
+<text x="70" y="105" font-family="Arial, sans-serif" font-size="21" font-weight="400" text-anchor="start" fill="#566573">10M keys × 1 KiB · 30 s/run · 16 memtier threads · pipeline 1</text>
+<line x1="470" y1="157" x2="518" y2="157" stroke="#566573" stroke-width="5" stroke-dasharray="2 8"/>
+<circle cx="494" cy="157" r="6" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<text x="532" y="164" font-family="Arial, sans-serif" font-size="18" font-weight="400" text-anchor="start" fill="#17202A">1 threads</text>
+<line x1="675" y1="157" x2="723" y2="157" stroke="#168F8C" stroke-width="5" stroke-dasharray="10 6"/>
+<circle cx="699" cy="157" r="6" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<text x="737" y="164" font-family="Arial, sans-serif" font-size="18" font-weight="400" text-anchor="start" fill="#17202A">2 threads</text>
+<line x1="880" y1="157" x2="928" y2="157" stroke="#E97827" stroke-width="5" stroke-dasharray="16 5 3 5"/>
+<circle cx="904" cy="157" r="6" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<text x="942" y="164" font-family="Arial, sans-serif" font-size="18" font-weight="400" text-anchor="start" fill="#17202A">4 threads</text>
+<line x1="1085" y1="157" x2="1133" y2="157" stroke="#7D5CC6" stroke-width="5" stroke-dasharray="6 4"/>
+<circle cx="1109" cy="157" r="6" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<text x="1147" y="164" font-family="Arial, sans-serif" font-size="18" font-weight="400" text-anchor="start" fill="#17202A">8 threads</text>
+<line x1="1290" y1="157" x2="1338" y2="157" stroke="#1473E6" stroke-width="5" stroke-dasharray="none"/>
+<circle cx="1314" cy="157" r="6" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<text x="1352" y="164" font-family="Arial, sans-serif" font-size="18" font-weight="400" text-anchor="start" fill="#17202A">16 threads</text>
+<text x="120" y="210" font-family="Arial, sans-serif" font-size="25" font-weight="700" text-anchor="start" fill="#17202A">Redis 8.8.0 · GET</text>
+<line x1="120" y1="565.00" x2="735" y2="565.00" stroke="#DDE3E8"/>
+<text x="105" y="571.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">0k</text>
+<line x1="120" y1="499.00" x2="735" y2="499.00" stroke="#DDE3E8"/>
+<text x="105" y="505.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">200k</text>
+<line x1="120" y1="433.00" x2="735" y2="433.00" stroke="#DDE3E8"/>
+<text x="105" y="439.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">400k</text>
+<line x1="120" y1="367.00" x2="735" y2="367.00" stroke="#DDE3E8"/>
+<text x="105" y="373.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">600k</text>
+<line x1="120" y1="301.00" x2="735" y2="301.00" stroke="#DDE3E8"/>
+<text x="105" y="307.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">800k</text>
+<line x1="120" y1="235.00" x2="735" y2="235.00" stroke="#DDE3E8"/>
+<text x="105" y="241.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">1000k</text>
+<line x1="120" y1="235" x2="120" y2="565" stroke="#7B8794" stroke-width="1.5"/>
+<line x1="120" y1="565" x2="735" y2="565" stroke="#7B8794" stroke-width="1.5"/>
+<text x="120.0" y="596" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">80</text>
+<text x="273.75" y="596" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">160</text>
+<text x="427.5" y="596" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">320</text>
+<text x="581.25" y="596" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">640</text>
+<text x="735.0" y="596" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">1,280</text>
+<polyline points="120.00,517.21 273.75,514.83 427.50,513.36 581.25,514.78 735.00,520.08" fill="none" stroke="#566573" stroke-width="4" stroke-linejoin="round" stroke-dasharray="2 8"/>
+<circle cx="120.00" cy="517.21" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="273.75" cy="514.83" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="427.50" cy="513.36" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="581.25" cy="514.78" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="735.00" cy="520.08" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="120.00,514.23 273.75,513.82 427.50,513.04 581.25,513.24 735.00,521.36" fill="none" stroke="#168F8C" stroke-width="4" stroke-linejoin="round" stroke-dasharray="10 6"/>
+<circle cx="120.00" cy="514.23" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="273.75" cy="513.82" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="427.50" cy="513.04" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="581.25" cy="513.24" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="735.00" cy="521.36" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="120.00,469.88 273.75,435.91 427.50,425.72 581.25,422.98 735.00,422.27" fill="none" stroke="#E97827" stroke-width="4" stroke-linejoin="round" stroke-dasharray="16 5 3 5"/>
+<circle cx="120.00" cy="469.88" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="273.75" cy="435.91" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="427.50" cy="425.72" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="581.25" cy="422.98" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="735.00" cy="422.27" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="120.00,460.72 273.75,398.15 427.50,347.74 581.25,306.02 735.00,287.16" fill="none" stroke="#7D5CC6" stroke-width="4" stroke-linejoin="round" stroke-dasharray="6 4"/>
+<circle cx="120.00" cy="460.72" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="273.75" cy="398.15" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="427.50" cy="347.74" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="581.25" cy="306.02" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="735.00" cy="287.16" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="120.00,465.89 273.75,401.32 427.50,338.61 581.25,278.03 735.00,246.79" fill="none" stroke="#1473E6" stroke-width="4" stroke-linejoin="round" stroke-dasharray="none"/>
+<circle cx="120.00" cy="465.89" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="273.75" cy="401.32" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="427.50" cy="338.61" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="581.25" cy="278.03" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="735.00" cy="246.79" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<text x="427.5" y="634" font-family="Arial, sans-serif" font-size="18" font-weight="700" text-anchor="middle" fill="#17202A">Concurrent connections</text>
+<text x="865" y="210" font-family="Arial, sans-serif" font-size="25" font-weight="700" text-anchor="start" fill="#17202A">Redis 8.8.0 · SET</text>
+<line x1="865" y1="565.00" x2="1480" y2="565.00" stroke="#DDE3E8"/>
+<text x="850" y="571.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">0k</text>
+<line x1="865" y1="499.00" x2="1480" y2="499.00" stroke="#DDE3E8"/>
+<text x="850" y="505.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">200k</text>
+<line x1="865" y1="433.00" x2="1480" y2="433.00" stroke="#DDE3E8"/>
+<text x="850" y="439.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">400k</text>
+<line x1="865" y1="367.00" x2="1480" y2="367.00" stroke="#DDE3E8"/>
+<text x="850" y="373.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">600k</text>
+<line x1="865" y1="301.00" x2="1480" y2="301.00" stroke="#DDE3E8"/>
+<text x="850" y="307.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">800k</text>
+<line x1="865" y1="235.00" x2="1480" y2="235.00" stroke="#DDE3E8"/>
+<text x="850" y="241.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">1000k</text>
+<line x1="865" y1="235" x2="865" y2="565" stroke="#7B8794" stroke-width="1.5"/>
+<line x1="865" y1="565" x2="1480" y2="565" stroke="#7B8794" stroke-width="1.5"/>
+<text x="865.0" y="596" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">80</text>
+<text x="1018.75" y="596" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">160</text>
+<text x="1172.5" y="596" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">320</text>
+<text x="1326.25" y="596" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">640</text>
+<text x="1480.0" y="596" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">1,280</text>
+<polyline points="865.00,518.33 1018.75,518.25 1172.50,516.73 1326.25,518.11 1480.00,521.90" fill="none" stroke="#566573" stroke-width="4" stroke-linejoin="round" stroke-dasharray="2 8"/>
+<circle cx="865.00" cy="518.33" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1018.75" cy="518.25" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1172.50" cy="516.73" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1326.25" cy="518.11" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1480.00" cy="521.90" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="865.00,518.23 1018.75,517.86 1172.50,516.42 1326.25,517.30 1480.00,525.30" fill="none" stroke="#168F8C" stroke-width="4" stroke-linejoin="round" stroke-dasharray="10 6"/>
+<circle cx="865.00" cy="518.23" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1018.75" cy="517.86" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1172.50" cy="516.42" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1326.25" cy="517.30" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1480.00" cy="525.30" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="865.00,471.38 1018.75,441.41 1172.50,434.40 1326.25,433.59 1480.00,434.68" fill="none" stroke="#E97827" stroke-width="4" stroke-linejoin="round" stroke-dasharray="16 5 3 5"/>
+<circle cx="865.00" cy="471.38" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1018.75" cy="441.41" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1172.50" cy="434.40" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1326.25" cy="433.59" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1480.00" cy="434.68" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="865.00,461.03 1018.75,399.77 1172.50,351.32 1326.25,312.02 1480.00,295.22" fill="none" stroke="#7D5CC6" stroke-width="4" stroke-linejoin="round" stroke-dasharray="6 4"/>
+<circle cx="865.00" cy="461.03" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1018.75" cy="399.77" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1172.50" cy="351.32" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1326.25" cy="312.02" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1480.00" cy="295.22" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="865.00,466.59 1018.75,407.65 1172.50,347.97 1326.25,301.37 1480.00,276.29" fill="none" stroke="#1473E6" stroke-width="4" stroke-linejoin="round" stroke-dasharray="none"/>
+<circle cx="865.00" cy="466.59" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1018.75" cy="407.65" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1172.50" cy="347.97" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1326.25" cy="301.37" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1480.00" cy="276.29" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<text x="1172.5" y="634" font-family="Arial, sans-serif" font-size="18" font-weight="700" text-anchor="middle" fill="#17202A">Concurrent connections</text>
+<text x="120" y="695" font-family="Arial, sans-serif" font-size="25" font-weight="700" text-anchor="start" fill="#17202A">Valkey 9.1.0 · GET</text>
+<line x1="120" y1="1050.00" x2="735" y2="1050.00" stroke="#DDE3E8"/>
+<text x="105" y="1056.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">0k</text>
+<line x1="120" y1="984.00" x2="735" y2="984.00" stroke="#DDE3E8"/>
+<text x="105" y="990.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">200k</text>
+<line x1="120" y1="918.00" x2="735" y2="918.00" stroke="#DDE3E8"/>
+<text x="105" y="924.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">400k</text>
+<line x1="120" y1="852.00" x2="735" y2="852.00" stroke="#DDE3E8"/>
+<text x="105" y="858.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">600k</text>
+<line x1="120" y1="786.00" x2="735" y2="786.00" stroke="#DDE3E8"/>
+<text x="105" y="792.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">800k</text>
+<line x1="120" y1="720.00" x2="735" y2="720.00" stroke="#DDE3E8"/>
+<text x="105" y="726.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">1000k</text>
+<line x1="120" y1="720" x2="120" y2="1050" stroke="#7B8794" stroke-width="1.5"/>
+<line x1="120" y1="1050" x2="735" y2="1050" stroke="#7B8794" stroke-width="1.5"/>
+<text x="120.0" y="1081" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">80</text>
+<text x="273.75" y="1081" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">160</text>
+<text x="427.5" y="1081" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">320</text>
+<text x="581.25" y="1081" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">640</text>
+<text x="735.0" y="1081" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">1,280</text>
+<polyline points="120.00,1000.08 273.75,1000.50 427.50,999.05 581.25,1000.73 735.00,1004.07" fill="none" stroke="#566573" stroke-width="4" stroke-linejoin="round" stroke-dasharray="2 8"/>
+<circle cx="120.00" cy="1000.08" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="273.75" cy="1000.50" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="427.50" cy="999.05" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="581.25" cy="1000.73" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="735.00" cy="1004.07" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="120.00,999.61 273.75,998.50 427.50,998.29 581.25,997.41 735.00,1000.61" fill="none" stroke="#168F8C" stroke-width="4" stroke-linejoin="round" stroke-dasharray="10 6"/>
+<circle cx="120.00" cy="999.61" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="273.75" cy="998.50" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="427.50" cy="998.29" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="581.25" cy="997.41" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="735.00" cy="1000.61" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="120.00,932.95 273.75,911.82 427.50,907.71 581.25,904.77 735.00,905.80" fill="none" stroke="#E97827" stroke-width="4" stroke-linejoin="round" stroke-dasharray="16 5 3 5"/>
+<circle cx="120.00" cy="932.95" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="273.75" cy="911.82" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="427.50" cy="907.71" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="581.25" cy="904.77" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="735.00" cy="905.80" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="120.00,928.00 273.75,856.54 427.50,814.51 581.25,779.03 735.00,769.88" fill="none" stroke="#7D5CC6" stroke-width="4" stroke-linejoin="round" stroke-dasharray="6 4"/>
+<circle cx="120.00" cy="928.00" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="273.75" cy="856.54" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="427.50" cy="814.51" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="581.25" cy="779.03" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="735.00" cy="769.88" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="120.00,926.48 273.75,859.85 427.50,816.03 581.25,758.65 735.00,737.06" fill="none" stroke="#1473E6" stroke-width="4" stroke-linejoin="round" stroke-dasharray="none"/>
+<circle cx="120.00" cy="926.48" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="273.75" cy="859.85" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="427.50" cy="816.03" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="581.25" cy="758.65" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="735.00" cy="737.06" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<text x="427.5" y="1119" font-family="Arial, sans-serif" font-size="18" font-weight="700" text-anchor="middle" fill="#17202A">Concurrent connections</text>
+<text x="865" y="695" font-family="Arial, sans-serif" font-size="25" font-weight="700" text-anchor="start" fill="#17202A">Valkey 9.1.0 · SET</text>
+<line x1="865" y1="1050.00" x2="1480" y2="1050.00" stroke="#DDE3E8"/>
+<text x="850" y="1056.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">0k</text>
+<line x1="865" y1="984.00" x2="1480" y2="984.00" stroke="#DDE3E8"/>
+<text x="850" y="990.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">200k</text>
+<line x1="865" y1="918.00" x2="1480" y2="918.00" stroke="#DDE3E8"/>
+<text x="850" y="924.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">400k</text>
+<line x1="865" y1="852.00" x2="1480" y2="852.00" stroke="#DDE3E8"/>
+<text x="850" y="858.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">600k</text>
+<line x1="865" y1="786.00" x2="1480" y2="786.00" stroke="#DDE3E8"/>
+<text x="850" y="792.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">800k</text>
+<line x1="865" y1="720.00" x2="1480" y2="720.00" stroke="#DDE3E8"/>
+<text x="850" y="726.0" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="end" fill="#566573">1000k</text>
+<line x1="865" y1="720" x2="865" y2="1050" stroke="#7B8794" stroke-width="1.5"/>
+<line x1="865" y1="1050" x2="1480" y2="1050" stroke="#7B8794" stroke-width="1.5"/>
+<text x="865.0" y="1081" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">80</text>
+<text x="1018.75" y="1081" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">160</text>
+<text x="1172.5" y="1081" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">320</text>
+<text x="1326.25" y="1081" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">640</text>
+<text x="1480.0" y="1081" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#34495E">1,280</text>
+<polyline points="865.00,1004.06 1018.75,1003.77 1172.50,1002.53 1326.25,1003.76 1480.00,1006.63" fill="none" stroke="#566573" stroke-width="4" stroke-linejoin="round" stroke-dasharray="2 8"/>
+<circle cx="865.00" cy="1004.06" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1018.75" cy="1003.77" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1172.50" cy="1002.53" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1326.25" cy="1003.76" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1480.00" cy="1006.63" r="5" fill="#566573" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="865.00,1004.25 1018.75,1002.48 1172.50,1001.16 1326.25,1001.45 1480.00,1005.99" fill="none" stroke="#168F8C" stroke-width="4" stroke-linejoin="round" stroke-dasharray="10 6"/>
+<circle cx="865.00" cy="1004.25" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1018.75" cy="1002.48" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1172.50" cy="1001.16" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1326.25" cy="1001.45" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1480.00" cy="1005.99" r="5" fill="#168F8C" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="865.00,938.35 1018.75,923.86 1172.50,920.14 1326.25,915.52 1480.00,915.03" fill="none" stroke="#E97827" stroke-width="4" stroke-linejoin="round" stroke-dasharray="16 5 3 5"/>
+<circle cx="865.00" cy="938.35" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1018.75" cy="923.86" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1172.50" cy="920.14" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1326.25" cy="915.52" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1480.00" cy="915.03" r="5" fill="#E97827" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="865.00,930.34 1018.75,858.65 1172.50,824.91 1326.25,794.17 1480.00,787.27" fill="none" stroke="#7D5CC6" stroke-width="4" stroke-linejoin="round" stroke-dasharray="6 4"/>
+<circle cx="865.00" cy="930.34" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1018.75" cy="858.65" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1172.50" cy="824.91" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1326.25" cy="794.17" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1480.00" cy="787.27" r="5" fill="#7D5CC6" stroke="#FFFFFF" stroke-width="2"/>
+<polyline points="865.00,931.27 1018.75,866.80 1172.50,834.84 1326.25,816.28 1480.00,799.66" fill="none" stroke="#1473E6" stroke-width="4" stroke-linejoin="round" stroke-dasharray="none"/>
+<circle cx="865.00" cy="931.27" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1018.75" cy="866.80" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1172.50" cy="834.84" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1326.25" cy="816.28" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="1480.00" cy="799.66" r="5" fill="#1473E6" stroke="#FFFFFF" stroke-width="2"/>
+<text x="1172.5" y="1119" font-family="Arial, sans-serif" font-size="18" font-weight="700" text-anchor="middle" fill="#17202A">Concurrent connections</text>
+<text x="70" y="1180" font-family="Arial, sans-serif" font-size="17" font-weight="400" text-anchor="start" fill="#566573">QPS uses a zero baseline. Lines connect ordered connection-count categories; they do not imply interpolation.</text>
+</svg>

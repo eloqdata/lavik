@@ -240,6 +240,11 @@ Redis-style configuration file as its first argument.
 
 ## Benchmark
 
+Browse the [performance report index](perf_reports/README.md) for the SPDK
+stability and value-size tests, SPDK/io_uring comparison, Redis/Valkey and
+storage-tier comparisons, and YCSB results. Reports open in English and link
+to their Simplified Chinese versions.
+
 The [Keylane–Aerospike YCSB report (before the Lavik rename)](perf_reports/ycsb-rerun-2026-09-13/README.md)
 records a fresh 100-million-record dataset for each database, ten 128-byte
 fields per record, and 256 YCSB threads. It includes the server/client hardware,
@@ -282,7 +287,7 @@ Useful references:
 - [Operations](docs/operations/README.md)
 - [Prometheus metrics](docs/operations/metrics.md)
 - [Network IRQ affinity tuning](docs/operations/irq-affinity-tuning.md)
-- [Performance report](perf_reports/ycsb-rerun-2026-09-13/README.md)
+- [Performance reports](perf_reports/README.md)
 
 ---
 

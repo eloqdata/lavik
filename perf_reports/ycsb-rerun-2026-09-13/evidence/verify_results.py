@@ -34,6 +34,37 @@ PERCENTILES = {'p99_ms': '99thPercentileLatency(us)',
                'p9999_ms': '99.99PercentileLatency(us)'}
 
 
+# Publication added this exact license notice after the experiment recorded
+# script hashes. Keep those original digests authoritative: only this prefix
+# may be removed, and the resulting bytes must still match the recorded hash.
+_ARCHIVE_LICENSE_HEADER = b"""# Copyright (C) 2026 EloqData Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+
+
+def check_script_digest(name, expected):
+    """Verify the measured script, allowing only the later publication notice."""
+    body = (ROOT / name).read_bytes()
+    if hashlib.sha256(body).hexdigest() == expected:
+        return
+    shebang = b'#!/usr/bin/env python3\n'
+    assert body.startswith(shebang + _ARCHIVE_LICENSE_HEADER), name
+    measured_body = shebang + body[len(shebang + _ARCHIVE_LICENSE_HEADER):]
+    assert hashlib.sha256(measured_body).hexdigest() == expected, name
+
+
 def data(name):
     return json.loads((ROOT / name).read_text())
 
@@ -131,7 +162,7 @@ def verify(allow_partial=False):
         assert data('complete.json')['complete'] == 16
         check_host('aerospike', data('host-restored.json')['after'], original)
         inherited = data('inherited-affinity-restored.json')
-        assert hashlib.sha256((ROOT / 'restore_inherited_affinity.py').read_bytes()).hexdigest() == inherited['script_sha256']
+        check_script_digest('restore_inherited_affinity.py', inherited['script_sha256'])
         check_host('aerospike', inherited['after'], original)
         assert all(row['reason'] == 'exited' for row in inherited['skipped'])
         for row in inherited['restored']:
@@ -145,12 +176,12 @@ def verify(allow_partial=False):
     jars = data('inventory.json')['client']['jars']
     assert all(jars[name] == digest for name, digest in data('client-builds.json')['sha256'].items())
     for name, digest in experiment['script_sha256'].items():
-        assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest, name
+        check_script_digest(name, digest)
     if (ROOT / 'resume.json').exists():
         continuation = data('resume.json')
         assert continuation['retained_formal_windows'] == 8 and continuation['retained_phases'] == 16
         for name, digest in continuation['script_sha256'].items():
-            assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest, name
+            check_script_digest(name, digest)
         failure = data(continuation['failed_transition'] + '/failure.json')
         assert failure['completed'] == 8 and failure['mode'] is None
     allowed_aero = {'cluster-name', 'address', 'port', 'mode', 'replication-factor', 'device'}
