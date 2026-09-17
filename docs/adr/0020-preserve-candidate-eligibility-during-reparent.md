@@ -20,13 +20,17 @@ limitations under the License.
 
 Accepted for [#45](https://github.com/eloqdata/lavik/issues/45) and
 [#46](https://github.com/eloqdata/lavik/issues/46). Partial replay, HistorySwitch,
-and the preserving FULL replacement intent are implemented. Isolated staged
-storage replacement and joint availability acceptance remain in #45.
-The completed design replaces the first-release availability concession in
+and preservation before FULL admission are implemented. The current phase uses
+destructive FULL after authenticated source admission, withdrawing old Ready
+and Candidate evidence until the replacement completes. This lets #46 complete
+replica attachment independently of #45. Isolated staged storage replacement
+and joint availability acceptance remain in #45; the first-release availability
+concession remains in effect until then.
+The completed design will replace the first-release availability concession in
 [ADR 0013](0013-rebuild-followers-after-promotion.md), under which concurrent
 destructive FULLs could leave no eligible Candidate.
 
-Entering reparent must not itself revoke a trustworthy complete population's
+The completed design requires that entering reparent not itself revoke a trustworthy complete population's
 Candidate eligibility. Partial replay retains a provable complete applied
 frontier in its actual history domain; FULL retains the old Active Population
 while building an isolated Staging Population, and a partial-to-FULL fallback

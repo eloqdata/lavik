@@ -2737,6 +2737,7 @@ class RecoveryBoundaryDonor {
   unsigned requests() const { return requests_.load(); }
   bool continued() const { return continued_.load(); }
   bool proved_origin() const { return proved_origin_.load(); }
+  bool requested_full() const { return requested_full_.load(); }
 
  private:
   bool Write(int fd, std::string_view value) {
@@ -2800,6 +2801,14 @@ class RecoveryBoundaryDonor {
     }
     if (parent_mode_ != 0) {
       if (args[0] == "LVPSYNC") {
+        requested_full_.store(args.size() == 17 && args[4] == "?" &&
+                              args[7] == "?");
+        if (parent_mode_ >= 4 && parent_mode_ <= 6) {
+          // Partial has selected FULL, but an unavailable source has not yet
+          // admitted destructive replacement. Old Ready must still survive.
+          Stall(fd, stop);
+          return;
+        }
         proved_origin_.store(args.size() == 19 &&
                              args[4] == std::string(40, 'f') &&
                              args[7] == "1" && args[17] == "ORIGIN" &&
@@ -2923,6 +2932,7 @@ class RecoveryBoundaryDonor {
   std::uint16_t port_ = 0;
   unsigned parent_mode_ = 0;
   std::atomic<bool> continued_{false}, proved_origin_{false};
+  std::atomic<bool> requested_full_{false};
   std::mutex connections_mutex_;
   std::vector<int> connections_;
   std::vector<std::jthread> handlers_;
@@ -3502,7 +3512,10 @@ class CandidateRecoveryService final : public bycorf::Service {
     do {
       population = co_await replication_->cluster_population_status();
       if (switched ? parent_->continued()
-                   : population.replacement_intent_.has_value())
+          : parent_mode_ == 7
+              ? (storage_->ReplicaRecoveryFenced() &&
+                 population.state_ == lavik::ReplicationGroupState::kRebuilding)
+              : parent_->requested_full())
         break;
       status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, 1ms);
       if (!status.ok()) co_return status;
@@ -3510,12 +3523,24 @@ class CandidateRecoveryService final : public bycorf::Service {
     if (switched && (!parent_->continued() || !parent_->proved_origin()))
       co_return TestFailure(
           "HistorySwitch did not continue at its proved initial child cursor");
-    if (!switched && !population.replacement_intent_.has_value())
+    if (!switched && !parent_->requested_full())
       co_return TestFailure(
-          "incomplete partial attempt did not select staged FULL");
+          "FULL fallback advertised an old resume or origin proof");
+    if (parent_mode_ == 7 &&
+        (!storage_->ReplicaRecoveryFenced() ||
+         population.state_ != lavik::ReplicationGroupState::kRebuilding ||
+         population.ready_token_.has_value()))
+      co_return TestFailure("recovered Active did not admit destructive FULL");
     status = co_await replication_->ReconcileClusterFollowOwner(std::nullopt);
     if (!status.ok()) co_return status;
     population = co_await replication_->cluster_population_status();
+    if (parent_mode_ == 7) {
+      if (population.ready_token_.has_value() ||
+          population.applied_next_lsns_.has_value() ||
+          !storage_->ReplicaRecoveryFenced())
+        co_return TestFailure("cancelled FULL revived recovered Active proof");
+      co_return absl::OkStatus();
+    }
     const auto expected = switched ? std::vector<std::uint64_t>{1}
                           : parent_mode_ == 4
                               ? std::vector<std::uint64_t>{2, 2}
@@ -3684,7 +3709,7 @@ TEST(ReplicationManagerIntegrationTest,
   RunCandidateRecoveryCase(5, 1, true);
 }
 TEST(ReplicationManagerIntegrationTest,
-     RecoveredCandidateFullIntentPreservesReady) {
+     RecoveredCandidateFullAdmissionWithdrawsReady) {
   RunCandidateRecoveryCase(5, 7, true);
 }
 
@@ -3750,7 +3775,7 @@ TEST(ReplicationManagerIntegrationTest,
   RunCandidateRecoveryCase(5, 5);
 }
 TEST(ReplicationManagerIntegrationTest,
-     PartialReparentParentGapSelectsFullWithoutReset) {
+     PartialReparentParentGapPreservesReadyUntilFullAdmission) {
   RunCandidateRecoveryCase(5, 6);
 }
 
@@ -4338,32 +4363,34 @@ class FollowOwnerReconcileService final : public bycorf::Service {
         "replacement source did not receive steady FOLLOW scope");
     if (!waited.ok()) co_return waited;
 
-    // Authenticated source rejection selects staged FULL without withdrawing
-    // the former Owner's complete Active population or its frozen parent cut.
-    const auto intent_deadline = std::chrono::steady_clock::now() + 5s;
+    // Once the source admits FULL, the old Active proof must be withdrawn
+    // before the destructive replacement can expose any incomplete data.
+    const auto admission_deadline = std::chrono::steady_clock::now() + 5s;
     lavik::ClusterPopulationStatus after_export_ready;
     do {
       after_export_ready = co_await replication_->cluster_population_status();
-      if (after_export_ready.replacement_intent_.has_value()) break;
+      if (after_export_ready.state_ ==
+              lavik::ReplicationGroupState::kRebuilding &&
+          storage_->ReplicaRecoveryFenced())
+        break;
       waited = co_await bycorf::SleepFor(worker, 1ms);
       if (!waited.ok()) co_return waited;
-    } while (std::chrono::steady_clock::now() < intent_deadline);
-    if (!after_export_ready.replacement_intent_.has_value() ||
-        after_export_ready.state_ != lavik::ReplicationGroupState::kReady ||
-        !after_export_ready.ready_token_.has_value() ||
-        !after_export_ready.applied_next_lsns_.has_value() ||
-        !after_export_ready.failover_candidate_eligible_ ||
-        storage_->ReplicaRecoveryFenced()) {
+    } while (std::chrono::steady_clock::now() < admission_deadline);
+    if (after_export_ready.state_ !=
+            lavik::ReplicationGroupState::kRebuilding ||
+        after_export_ready.ready_token_.has_value() ||
+        after_export_ready.applied_next_lsns_.has_value() ||
+        !storage_->ReplicaRecoveryFenced()) {
       co_return TestFailure(
-          "FULL fallback did not preserve the complete Active candidate");
+          "FULL admission did not withdraw the old Active candidate");
     }
-    const auto parent_identity = after_export_ready.ready_token_->identity();
-    const auto parent_cursor = after_export_ready.applied_next_lsns_;
+    const auto parent_identity = before_export_ready.ready_token_->identity();
+    const auto parent_cursor = before_export_ready.applied_next_lsns_;
     if (parent_identity.source_node_id_ != local.local_node_id_ ||
         parent_identity.source_boot_id_ != local.boot_id_ ||
         parent_identity.term_ != 1 ||
         parent_identity.source_history_id_.empty() ||
-        parent_cursor->size() != 1) {
+        !parent_cursor.has_value() || parent_cursor->size() != 1) {
       co_return TestFailure(
           "former Owner did not freeze its own source domain before retiring "
           "history");
@@ -4383,30 +4410,20 @@ class FollowOwnerReconcileService final : public bycorf::Service {
     reconciled =
         co_await replication_->ReconcileClusterPopulation(desired_population);
     if (!reconciled.ok()) co_return reconciled;
-    // The new Owner fails before any transfer replaces Active. Cancellation
-    // must finish independently and leave exact parent-domain evidence usable.
+    // Losing the new Owner during destructive FULL cannot resurrect the old
+    // population's Ready or candidate evidence.
     reconciled =
         co_await replication_->ReconcileClusterFollowOwner(std::nullopt);
     if (!reconciled.ok()) co_return reconciled;
-    const auto preserved = co_await replication_->cluster_population_status();
-    if (preserved.state_ != lavik::ReplicationGroupState::kReady ||
-        !preserved.ready_token_.has_value() ||
-        preserved.ready_token_->identity() != parent_identity ||
-        preserved.applied_next_lsns_ != parent_cursor ||
-        !preserved.failover_candidate_eligible_ ||
+    const auto interrupted = co_await replication_->cluster_population_status();
+    if (interrupted.ready_token_.has_value() ||
+        interrupted.applied_next_lsns_.has_value() ||
+        !storage_->ReplicaRecoveryFenced() ||
         replication_->upstream().has_value()) {
       co_return TestFailure(
-          "second Owner failure discarded the complete parent population");
+          "Owner loss during FULL resurrected an incomplete candidate");
     }
 
-    // An immutable population replacement still retires Active. Exercise the
-    // existing initial/unready FULL lifecycle after deliberately changing its
-    // assignment, so this destructive path never masquerades as staging.
-    auto changed_assignment = desired_population;
-    changed_assignment.assignment_id_ = "retire-active-assignment";
-    reconciled =
-        co_await replication_->ReconcileClusterPopulation(changed_assignment);
-    if (!reconciled.ok()) co_return reconciled;
     reconciled = co_await RestartSteadyFollowFull(worker, replacement);
     if (!reconciled.ok()) co_return reconciled;
 
@@ -5860,7 +5877,7 @@ TEST(ReplicationManagerIntegrationTest,
 }
 
 TEST(ReplicationManagerIntegrationTest,
-     FollowOwnerFullIntentPreservesFormerOwnerAcrossSecondFailure) {
+     FollowOwnerFullAdmissionWithdrawsFormerOwnerAcrossSecondFailure) {
   const std::string local_node_id(40, '9');
   constexpr std::uint16_t kReplicationPort = 6381;
   FollowOwnerSource unavailable(std::string(40, 'a'), std::string(40, 'c'),

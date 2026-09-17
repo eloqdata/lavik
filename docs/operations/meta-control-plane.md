@@ -435,22 +435,30 @@ the stable source frontier. The chosen candidate must catch up through that
 frontier and prepare before the atomic cutover, so a completed controlled
 failover records `loss=none`. After cutover, full desired state makes every
 non-owner follow the new Owner through native CONTINUE, direct-parent replay
-and HistorySwitch, or a FULL replacement intent. The former Owner fences and
+and HistorySwitch, or destructive FULL. The former Owner fences and
 drains accepted writes and expiration, then freezes its own source-domain
 cursor before retiring that backlog; no separate cleanup command is required.
 
 A trustworthy complete Active population remains Ready and candidate-eligible
-while reparent is incomplete. Its reported cursor stays in the actual parent
-domain until HistorySwitch atomically installs the child domain and complete
-origin vector. A disconnect or retention gap selects FULL without first
-resetting Active. The adapter exposes a preserving replacement intent;
-isolated staged storage transfer and replacement remain the separate staged-
-population integration. Until that integration is available, such a target
-waits with Active preserved. Initial or already-unready FULL still uses the
-destructive rebuild path. Inspect actual population readiness and candidate
+during partial reparent and while a selected FULL awaits source admission. Its
+reported cursor stays in the actual parent domain until HistorySwitch atomically
+installs the child domain and complete origin vector. On authenticated FULL
+admission, the target withdraws old Ready and candidate evidence, durably fences
+storage, and performs destructive rebuild. It becomes eligible again only after
+FULL completes. If every surviving replica is rebuilding when the new Owner
+fails, the group can have no eligible Candidate; retaining Active throughout
+FULL remains dependent on isolated staged population replacement. Inspect
+actual population readiness and candidate
 progress when diagnosing recovery; neither node count nor partial transfer
 progress proves a complete population. There is no all-replica completion
 barrier or Meta queue serializing these independent relationships.
+
+The admin `observations <group>` command separates each reporter's own
+`history` from its population's `source_term`, `source_node`, and
+`source_history`. A candidate may remain Ready in an older source domain during
+reparent. Before requesting another controlled cutover, verify that Meta has
+observed a candidate in the current Owner's source domain; successful local
+reads alone do not prove that its updated progress has reached Meta.
 
 If the candidate is confirmed unavailable while the old owner is still usable,
 Meta aborts the controlled operation immediately and service remains on the old

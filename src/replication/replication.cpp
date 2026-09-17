@@ -7017,25 +7017,10 @@ class ReplicationManager::ReplicationGroup {
           "follow-owner source incarnation is incomplete");
     }
 
-    if (ClusterFollowReadyPopulationMatches(desired) &&
-        (native_dataset_valid_.load(std::memory_order_acquire) ||
-         recovered_population_fenced_) &&
-        !storage_->ReplicaRecoveryFenced()) {
-      // This is the staged-replacement integration boundary. A FULL decision
-      // alone never withdraws the old Ready token or issues destructive reset.
-      // A clean-recovered Ready proves complete Active even though it cannot
-      // revive a previous boot's native continuation capability.
-      // Until #45 admits a separate staging root, keep exposing the exact
-      // replacement intent and the old complete population independently.
-      replacement_intent_ = ClusterPopulationReplacementIntent{
-          desired,
-          session->cluster_follow_->force_full_.load(std::memory_order_acquire)
-              ? "continuation-unavailable"
-              : "history-domain-changed"};
-      return absl::FailedPreconditionError(
-          "trusted Active population requires staged FULL replacement");
-    }
-
+    // This is destructive FULL admission: the authenticated source and
+    // current relationship have been validated. Withdraw the old Ready proof
+    // before storage fences and replaces the root. Partial failure alone must
+    // not reach this boundary while the source is still unavailable.
     // ReplicationGroup owns the accepted-version watermark even after a
     // failed CONTINUE invalidates and releases cluster_rebuild_. Deriving the
     // next revision from that owner prevents every FULL retry from being
@@ -7243,7 +7228,6 @@ class ReplicationManager::ReplicationGroup {
       }
     }
 
-    replacement_intent_.reset();
     const std::shared_ptr<ClusterFollowOwnerContext> previous =
         std::move(cluster_follow_owner_);
     const bool previous_was_owner =
@@ -7908,7 +7892,6 @@ class ReplicationManager::ReplicationGroup {
       result.operator_recovery_identity_ = recovered_population_->identity_;
       result.operator_recovery_identity_->target_boot_id_ = boot_id_;
     }
-    result.replacement_intent_ = replacement_intent_;
     std::shared_ptr<detail::ReplicaAppliedFrontier> frontier;
     {
       AssertStateOwner();
@@ -11447,7 +11430,6 @@ class ReplicationManager::ReplicationGroup {
     group_id_ = std::move(group);
     source_worker_count_ = child.flow_count_;
     upstream_continuation_proof_ = std::move(proof);
-    replacement_intent_.reset();
     storage_->SetReplicaLoading(false);
     recovered_population_fenced_ = false;
     native_dataset_valid_.store(true, std::memory_order_release);
@@ -11468,9 +11450,6 @@ class ReplicationManager::ReplicationGroup {
       co_return absl::OkStatus();
     const auto& desired = session->cluster_follow_->desired_;
     if (session->cluster_follow_->force_full_.load(std::memory_order_acquire)) {
-      if (replacement_intent_.has_value())
-        co_return absl::FailedPreconditionError(
-            "trusted Active population is awaiting staged FULL replacement");
       co_return absl::OkStatus();
     }
     const auto& parent = cluster_rebuild_->ready_token_->identity();
@@ -11510,10 +11489,6 @@ class ReplicationManager::ReplicationGroup {
     if (!*result && active_replica_session_ == session &&
         cluster_follow_owner_ == relationship && !session->cancelled()) {
       relationship->force_full_.store(true, std::memory_order_release);
-      replacement_intent_ = ClusterPopulationReplacementIntent{
-          relationship->desired_, "partial-reparent-unavailable"};
-      co_return absl::FailedPreconditionError(
-          "trusted Active population requires staged FULL replacement");
     }
     co_return absl::OkStatus();
   }
@@ -11557,7 +11532,10 @@ class ReplicationManager::ReplicationGroup {
       // transient ONLINE state over an incomplete replacement.
       const bool replacement_required =
           storage_->ReplicaRecoveryFenced() ||
-          !native_dataset_valid_.load(std::memory_order_acquire);
+          !native_dataset_valid_.load(std::memory_order_acquire) ||
+          (session->cluster_follow_ != nullptr &&
+           session->cluster_follow_->force_full_.load(
+               std::memory_order_acquire));
       requested_history =
           replacement_required ? "?" : upstream_history_id_.value_or("?");
       if (!replacement_required && applied_frontier_ != nullptr) {
@@ -12021,8 +11999,8 @@ class ReplicationManager::ReplicationGroup {
       // The authenticated source matched our history but no longer retains
       // every requested cursor. Do not invalidate the usable population in a
       // flow worker. Fail this session before BeginReplicaFullSync and let the
-      // fixed-delay coordinator publish a staged replacement intent on worker
-      // zero while the complete Active proof remains intact.
+      // fixed-delay coordinator admit a fresh destructive FULL on worker zero.
+      // Keep Active intact until that new control handshake succeeds.
       session->cluster_follow_->force_full_.store(true,
                                                   std::memory_order_release);
       const absl::Status retry = absl::UnavailableError(
@@ -16085,7 +16063,6 @@ class ReplicationManager::ReplicationGroup {
   absl::flat_hash_map<std::string, NativeContinuationProof>
       continuation_proofs_;
   std::optional<NativeContinuationProof> upstream_continuation_proof_;
-  std::optional<ClusterPopulationReplacementIntent> replacement_intent_;
   // Cutover removes the transition before its finite lease arrives. Only the
   // exact action copied into the committed grant may keep the private prepared
   // context across that desired-state replacement.

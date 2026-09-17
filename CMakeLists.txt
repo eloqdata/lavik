@@ -1050,6 +1050,7 @@ if (BUILD_TESTING)
           # Let the harness read the caller's environment at test runtime.
           set(LAVIK_FAILOVER_INTEGRATION_CASES
             controlled
+            full-fallback
             leader-resume
             prepared-leader-resume
             live-leader-demotion

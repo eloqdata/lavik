@@ -697,9 +697,11 @@ native protocol chooses current-history CONTINUE, direct-parent replay and
 HistorySwitch, or FULL. A former owner fences its role, revokes export, drains
 accepted writes and expiration, and freezes its own source-domain cursor before
 retiring its old backlog. Complete Ready remains candidate evidence during
-reparent; HistorySwitch atomically changes its whole domain and cursor. A FULL
-replacement intent preserves trustworthy Active while awaiting isolated staged
-replacement; an incomplete target uses the existing initial FULL path.
+partial reparent; HistorySwitch atomically changes its whole domain and cursor.
+Selecting FULL preserves Active until an authenticated source admits destructive
+replacement, which withdraws Ready and candidate evidence until FULL completes.
+Concurrent FULLs can leave no eligible Candidate after another Owner failure;
+isolated staged replacement is a separate population primitive.
 This relation is resent after reconnect or Meta leadership change, so cleanup
 and replica attachment do not depend on an ephemeral post-commit message.
 

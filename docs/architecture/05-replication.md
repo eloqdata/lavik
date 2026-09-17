@@ -420,13 +420,15 @@ restart invalidates the bridge and continuation proof.
 
 Until local switch, a complete target remains eligible in its actual parent
 domain; afterward it reports the child domain. Partial cancellation joins
-accepted apply without withdrawing trustworthy Ready. When FULL is necessary
-and Active remains trustworthy, the adapter exposes a population replacement
-intent and preserves Active. Isolated staged transfer and atomic storage
-replacement are the separate staged-population primitive; this adapter does
-not destructively reset Active while awaiting it. Initial or already-unready
-FULL continues to use the existing destructive rebuild path. Uncertain apply
-or proof outcomes still fail closed.
+accepted apply without withdrawing trustworthy Ready. Selecting FULL preserves
+Active until a current, authenticated source handshake admits the replacement.
+Admission withdraws the old Ready proof before storage durably fences and
+rebuilds the single physical population. Only complete FULL publishes a new
+Ready proof; cancellation or Owner loss during destructive FULL cannot revive
+the old one. Concurrent FULLs can therefore leave the group without an eligible
+Candidate if the Owner fails. Preserving Active throughout FULL requires the
+separate isolated staged-population primitive. Uncertain apply or proof
+outcomes still fail closed.
 
 ## Single-group population coordination contract
 
@@ -1172,7 +1174,7 @@ connection metrics.
   upstream effects as new events.
 - Meta-managed post-cutover topology asks every non-owner to follow the new
   Owner directly. It uses native CONTINUE, direct-parent HistorySwitch, or a
-  FULL replacement intent, without a separate Meta rebuild operation. A former
+  destructive FULL, without a separate Meta rebuild operation. A former
   Owner freezes its source-domain cursor before retiring its old history.
 - Storage record application during replica synchronization bypasses the
   command layer's database gates. The code records that this breaks the

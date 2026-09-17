@@ -2031,6 +2031,8 @@ std::string HandleObservations(
   const std::vector<MetaCandidateProgressObs> candidates =
       obs_store->CandidateProgressFor(*group_id, facts);
   std::string reply = "OK candidates=" + std::to_string(candidates.size());
+  // Reporter history identifies its own session, not the population's source.
+  // A Ready candidate can retain an older source domain during reparent.
   for (const MetaCandidateProgressObs& candidate : candidates) {
     reply +=
         " node=" + candidate.node_id_ +
@@ -2041,7 +2043,11 @@ std::string HandleObservations(
         std::to_string(candidate.partition_replication_epoch_) + ",history=" +
         ReplicationHistoryIdText(candidate.replication_history_id_) +
         ",storage_ready=" + (candidate.storage_ready_ ? "true" : "false") +
-        ",population_ready=" + (candidate.population_ready_ ? "true" : "false");
+        ",population_ready=" +
+        (candidate.population_ready_ ? "true" : "false") +
+        ",source_term=" + std::to_string(candidate.source_group_term_) +
+        ",source_node=" + candidate.source_node_id_ + ",source_history=" +
+        ReplicationHistoryIdText(candidate.source_replication_history_id_);
   }
   return reply;
 }

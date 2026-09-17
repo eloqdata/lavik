@@ -40,12 +40,14 @@ separate accounting.
 Partial reparent is opportunistic: retaining or replaying the parent suffix
 and retaining the required child prefix must not block the serving Owner's
 writes. Missing coverage in either history sends only the affected target to
-whole-group FULL while preserving its trustworthy Active Population as
-specified in ADR 0020. This trades guaranteed partial completion under retention
-pressure for Owner write availability during partial reparent. Source-side
-FULL queues and cut processing retain their existing backpressure policy;
-staged population replacement preserves Candidate eligibility but does not
-extend the partial-reparent write-availability guarantee to FULL.
+whole-group FULL. Its trustworthy Active Population survives until FULL
+admission; the current destructive fallback then withdraws Ready until rebuild
+completes. ADR 0020 defers preservation throughout FULL to isolated staging.
+This trades guaranteed partial completion under retention pressure for Owner
+write availability during partial reparent. Source-side FULL queues and cut
+processing retain their existing backpressure policy; future staged population
+replacement preserves Candidate eligibility but does not extend the partial-
+reparent write-availability guarantee to FULL.
 
 HistorySwitch binds each history to its own flow layout and installs the
 complete child starting cursor only after the target proves that it has

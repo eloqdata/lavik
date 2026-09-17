@@ -90,15 +90,6 @@ struct DesiredClusterUpstream {
   bool operator==(const DesiredClusterUpstream&) const = default;
 };
 
-// FULL selects a replacement operation, not permission to erase a trustworthy
-// Active population. The staged storage owner (#45) consumes this exact
-// current relationship; half-built replacement data never supplies Ready.
-struct ClusterPopulationReplacementIntent {
-  DesiredClusterUpstream desired_;
-  std::string reason_;
-  bool operator==(const ClusterPopulationReplacementIntent&) const = default;
-};
-
 struct ReplicationOptions {
   // Cluster mode is always Meta-managed. It disables standalone upstream
   // control and Redis PSYNC export; native export requires an exact population
@@ -236,7 +227,6 @@ struct ClusterPopulationStatus {
   // Readable persisted scope without a certified frontier is exposed only to
   // an explicit operator-recovery action, never automatic candidate ranking.
   std::optional<RebuildIdentity> operator_recovery_identity_;
-  std::optional<ClusterPopulationReplacementIntent> replacement_intent_;
   // Nonempty exactly while state_ is kFailedStopped.
   std::string failure_reason_;
 };

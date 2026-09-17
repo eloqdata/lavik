@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -1308,6 +1309,111 @@ def run_controlled(meta_binary, data_binary, ctl, redis_cli, workdir,
         fixture.force_kill()
 
 
+def run_full_fallback(meta_binary, data_binary, ctl, redis_cli, workdir,
+                      require_fault_hook):
+    """A complete replica missing the direct parent completes destructive FULL."""
+    del redis_cli
+    fixture = FailoverFixture(
+        meta_binary, data_binary, ctl, os.path.join(workdir, "full-fallback"),
+        require_fault_hook, pause_after_begin_ms=1)
+    laggard = fixture.by_id[FOLLOWER]
+    paused = False
+    try:
+        fixture.start_created()
+        key = "{failover-gate}full-fallback"
+        fixture.seed_and_wait_for_replicas(key, "initial", (CANDIDATE, FOLLOWER))
+        with open(laggard.log_path, encoding="utf-8") as log:
+            initial_fulls = log.read().count("durably invalidated system state")
+        laggard.proc.send_signal(signal.SIGSTOP)
+        paused = True
+
+        def laggard_session_expired():
+            status = fixture.cluster_status(time.monotonic() + 5)
+            return any(node.get("node_id") == FOLLOWER and
+                       not node.get("current_session")
+                       for node in status.get("data_nodes", []))
+
+        H.wait_until("paused replica loses its Meta session", 30,
+                     laggard_session_expired)
+        owner = OWNER
+        for term in (2, 3):
+            operation = fixture.submit_failover()
+            wait_operation(
+                fixture, operation, "OK completed failover-completed",
+                f"controlled cutover reaches term {term}", timeout=30)
+            owner = CANDIDATE if owner == OWNER else OWNER
+
+            def owner_serving():
+                status = fixture.cluster_status(time.monotonic() + 5)
+                return any(group.get("group_id") == GROUP and
+                           group.get("term") == str(term) and
+                           group.get("owner_node_id") == owner and
+                           group.get("serving_ready")
+                           for group in status.get("groups", []))
+
+            H.wait_until(f"term {term} Owner serves", 30, owner_serving)
+            value = f"term-{term}"
+            if redis_call(fixture.by_id[owner], ["SET", key, value]) != "OK":
+                raise H.Failure("new Owner rejected a post-cutover write")
+            peer = CANDIDATE if owner == OWNER else OWNER
+            H.wait_until(
+                "live peer completes reparent before the next cutover", 30,
+                lambda: readonly_get(fixture.by_id[peer], key) == value)
+
+            # Local replay can finish before its next Meta heartbeat. The
+            # next controlled transition needs a candidate in the new source
+            # domain, not merely a preserved parent-domain Ready population.
+            source_history = replication_info_fields(
+                fixture.by_id[owner])["master_replid"]
+            expected_candidate = {
+                "node": peer, "source_term": str(term), "source_node": owner,
+                "source_history": source_history,
+                "storage_ready": "true", "population_ready": "true",
+            }
+
+            def peer_advertised_current_source():
+                fixture.rediscover_leader(time.monotonic() + 5)
+                reply = fixture.leader.observations(GROUP)
+                if not reply.startswith("OK candidates="):
+                    raise H.Failure(f"candidate observation query failed: {reply}")
+                for entry in reply.split()[2:]:
+                    fields = dict(field.split("=", 1)
+                                  for field in entry.split(","))
+                    if all(fields.get(key) == value
+                           for key, value in expected_candidate.items()):
+                        return True
+                return False
+
+            H.wait_until("Meta observes the peer in the current source domain",
+                         30, peer_advertised_current_source)
+
+        # Only the immediate parent bridge survives. The paused replica still
+        # owns term-1 Active and must now rebuild from the term-3 Owner.
+        laggard.proc.send_signal(signal.SIGCONT)
+        paused = False
+        H.wait_until("old complete replica finishes FULL fallback", 45,
+                     lambda: readonly_get(laggard, key) == "term-3")
+        with open(laggard.log_path, encoding="utf-8") as log:
+            final_fulls = log.read().count("durably invalidated system state")
+        if final_fulls <= initial_fulls:
+            raise H.Failure("missing-parent replica did not admit destructive FULL")
+        if redis_call(fixture.by_id[owner], ["SET", key, "after-full"]) != "OK":
+            raise H.Failure("Owner rejected the post-FULL write")
+        H.wait_until("rebuilt replica follows subsequent writes", 20,
+                     lambda: readonly_get(laggard, key) == "after-full")
+        wait_ready(fixture, "FULL fallback restores cluster readiness")
+        fixture.require_expected_processes_alive()
+        H.log("trusted Active with missing parent completed FULL and resumed FOLLOW")
+        fixture.clean_shutdown()
+    except Exception:
+        fixture.dump_logs()
+        raise
+    finally:
+        if paused and laggard.alive():
+            laggard.proc.send_signal(signal.SIGCONT)
+        fixture.force_kill()
+
+
 def run_leader_resume(meta_binary, data_binary, ctl, redis_cli, workdir,
                       require_fault_hook):
     """Resume one committed transition after its Meta leader is killed."""
@@ -2026,7 +2132,7 @@ def parse_args():
     parser.add_argument("workdir", nargs="?")
     parser.add_argument(
         "--case",
-        choices=("controlled", "leader-resume", "prepared-leader-resume",
+        choices=("controlled", "full-fallback", "leader-resume", "prepared-leader-resume",
                  "live-leader-demotion", "candidate-abort", "lease-fence",
                  "source-degrade-reselect"),
         required=True)
@@ -2048,6 +2154,10 @@ def main():
     try:
         if args.case == "controlled":
             run_controlled(
+                binaries["meta"], binaries["data"], binaries["ctl"],
+                binaries["redis_cli"], workdir, args.require_fault_hook)
+        elif args.case == "full-fallback":
+            run_full_fallback(
                 binaries["meta"], binaries["data"], binaries["ctl"],
                 binaries["redis_cli"], workdir, args.require_fault_hook)
         elif args.case == "leader-resume":
