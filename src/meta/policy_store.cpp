@@ -178,8 +178,7 @@ absl::StatusOr<MetaAutomaticUncontrolledFailoverPolicy>
 DecodeAutomaticUncontrolledFailoverPolicy(std::string_view raw) {
   auto object = CompactJsonObjectParser(raw).Parse();
   if (!object.ok()) return object.status();
-  if (auto status =
-          RequireExactFields(*object, {"kind", "enabled", "suspect_after_ms"});
+  if (auto status = RequireExactFields(*object, {"kind", "suspect_after_ms"});
       !status.ok()) {
     return status;
   }
@@ -187,11 +186,9 @@ DecodeAutomaticUncontrolledFailoverPolicy(std::string_view raw) {
       !status.ok()) {
     return status;
   }
-  const JsonValue& enabled = object->at("enabled");
   const JsonValue& suspect_after = object->at("suspect_after_ms");
-  const auto* enabled_value = std::get_if<bool>(&enabled);
   const auto* suspect_after_value = std::get_if<std::uint64_t>(&suspect_after);
-  if (enabled_value == nullptr || suspect_after_value == nullptr) {
+  if (suspect_after_value == nullptr) {
     return MetaDomainRejectError(
         "automatic failover policy field type mismatch");
   }
@@ -200,7 +197,6 @@ DecodeAutomaticUncontrolledFailoverPolicy(std::string_view raw) {
     return MetaDomainRejectError("suspect_after_ms outside supported range");
   }
   return MetaAutomaticUncontrolledFailoverPolicy{
-      .enabled_ = *enabled_value,
       .suspect_after_ms_ = *suspect_after_value,
   };
 }

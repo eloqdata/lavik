@@ -51,11 +51,11 @@ def run_cluster(args, expected, timeout=10, input_text=None, env=None):
     return proc
 
 
-def disabled_automatic_failover_status():
-    """Encode the clusterstatus v1 Group diagnostics for a disabled detector."""
+def healthy_automatic_failover_status():
+    """Encode the clusterstatus v1 Group diagnostics for a healthy detector."""
     # state, current_reason presence, suspect/threshold ms,
     # blocked_reason presence.
-    return struct.pack(">BBQQB", 0, 0, 0, 1000, 0)
+    return struct.pack(">BBQQB", 1, 0, 0, 1000, 0)
 
 
 def make_leaf(directory, ca_crt, ca_key, name, san):
@@ -225,7 +225,7 @@ def scripted_cluster_gate(workdir):
     group = (
         wire_string("group-1") + struct.pack(">Q", 4) + bytes([1]) +
         wire_string("data-1") + struct.pack(">BB", 1, 1) +
-        disabled_automatic_failover_status())
+        healthy_automatic_failover_status())
     slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
     status_payload = (
         struct.pack(">HIQQQQ", 1, 1, 1, 1, 1, 1) +
@@ -420,7 +420,7 @@ def scripted_cluster_create_gate(workdir):
     group = (
         wire_string("group-1") + struct.pack(">Q", 1) + bytes([1]) +
         wire_string(node_id) + struct.pack(">BB", 1, 1) +
-        disabled_automatic_failover_status())
+        healthy_automatic_failover_status())
     slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
     ready_status = (
         struct.pack(">HIQQQQ", 1, 1, 1, 1, 22, 5) +
@@ -571,7 +571,7 @@ def scripted_failover_gate(workdir):
     group = (
         wire_string("group-1") + struct.pack(">Q", 4) + bytes([1]) +
         wire_string(node_id) + struct.pack(">BB", 1, 1) +
-        disabled_automatic_failover_status())
+        healthy_automatic_failover_status())
     slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
     status_payload = (
         struct.pack(">HIQQQQ", 1, 1, 1, 1, 50, 3) +

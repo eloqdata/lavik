@@ -68,8 +68,6 @@ struct ClusterCreateManifestV1 {
   };
 
   std::uint32_t schema_version_ = 0;
-  bool automatic_uncontrolled_failover_enabled_ =
-      kDefaultAutomaticFailoverEnabled;
   std::uint64_t automatic_uncontrolled_failover_suspect_after_ms_ =
       kDefaultAutomaticFailoverSuspectAfterMs;
   std::uint64_t authority_lease_duration_ms_ = kDefaultAuthorityLeaseDurationMs;

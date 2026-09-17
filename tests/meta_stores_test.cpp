@@ -1553,11 +1553,10 @@ PutPolicy MakePut(const std::string& policy_id, std::uint64_t version,
   return cmd;
 }
 
-std::string AutomaticPolicy(bool enabled, std::uint64_t suspect_after_ms) {
+std::string AutomaticPolicy(std::uint64_t suspect_after_ms) {
   return absl::StrCat(
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":)",
-      enabled ? "true" : "false", R"(,"suspect_after_ms":)", suspect_after_ms,
-      "}");
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":)",
+      suspect_after_ms, "}");
 }
 
 std::string LeasePolicy(std::uint64_t duration_ms) {
@@ -1565,10 +1564,23 @@ std::string LeasePolicy(std::uint64_t duration_ms) {
                       duration_ms, "}");
 }
 
+TEST(MetaPolicyStore, AutomaticFailoverNeedsOnlySuspectThreshold) {
+  MetaPolicyStore store;
+  ASSERT_TRUE(
+      store
+          .Apply(MakePut(
+              std::string(kAutomaticUncontrolledFailoverPolicyId), 1,
+              R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})"))
+          .ok());
+  ASSERT_TRUE(store.CurrentAutomaticUncontrolledFailover().has_value());
+  EXPECT_EQ(store.CurrentAutomaticUncontrolledFailover()->suspect_after_ms_,
+            5000u);
+}
+
 TEST(MetaPolicyStore, StoresTypedPoliciesAndReturnsOriginalRawBytes) {
   MetaPolicyStore store;
   const std::string reordered =
-      R"({"suspect_after_ms":7000,"enabled":false,"kind":"automatic-uncontrolled-failover-v1"})";
+      R"({"suspect_after_ms":7000,"kind":"automatic-uncontrolled-failover-v1"})";
   ASSERT_TRUE(
       store
           .Apply(MakePut(std::string(kAutomaticUncontrolledFailoverPolicyId), 1,
@@ -1600,7 +1612,6 @@ TEST(MetaPolicyStore, StoresTypedPoliciesAndReturnsOriginalRawBytes) {
   const auto automatic = store.CurrentAutomaticUncontrolledFailover();
   ASSERT_TRUE(automatic.has_value());
   EXPECT_EQ(automatic->version_, 1u);
-  EXPECT_FALSE(automatic->enabled_);
   EXPECT_EQ(automatic->suspect_after_ms_, 7000u);
 
   const auto lease = store.CurrentAuthorityLease();
@@ -1612,17 +1623,17 @@ TEST(MetaPolicyStore, StoresTypedPoliciesAndReturnsOriginalRawBytes) {
 TEST(MetaPolicyStore, RejectsUnregisteredPolicyAndInvalidCommandFields) {
   MetaPolicyStore store;
   {
-    PutPolicy cmd = MakePut("", 1, AutomaticPolicy(true, 5000));
+    PutPolicy cmd = MakePut("", 1, AutomaticPolicy(5000));
     ExpectDomainReject(store.Apply(cmd));
   }
   {
-    PutPolicy cmd = MakePut("unknown-policy", 1, AutomaticPolicy(true, 5000));
+    PutPolicy cmd = MakePut("unknown-policy", 1, AutomaticPolicy(5000));
     ExpectDomainReject(store.Apply(cmd));
   }
   {
     PutPolicy cmd =
         MakePut(std::string(lavik::meta::kMaxMetaPolicyIdBytes + 1, 'p'), 1,
-                AutomaticPolicy(true, 5000));
+                AutomaticPolicy(5000));
     ExpectDomainReject(store.Apply(cmd));
   }
   {
@@ -1640,18 +1651,18 @@ TEST(MetaPolicyStore, AutomaticFailoverSchemaIsStrict) {
   const std::vector<std::string> invalid = {
       "",
       R"({})",
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true})",
-      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})",
-      R"({"kind":"wrong","enabled":true,"suspect_after_ms":5000})",
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":1,"suspect_after_ms":5000})",
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":"5000"})",
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":999})",
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":86400001})",
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":18446744073709551616})",
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"enabled":false,"suspect_after_ms":5000})",
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000,"extra":1})",
-      R"({ "kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})",
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000} trailing)",
+      R"({"kind":"automatic-uncontrolled-failover-v1"})",
+      R"({"kind":"wrong","suspect_after_ms":5000})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":false,"suspect_after_ms":5000})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":"5000"})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":999})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":86400001})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":18446744073709551616})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000,"suspect_after_ms":6000})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000,"extra":1})",
+      R"({ "kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000} trailing)",
   };
   for (const std::string& content : invalid) {
     SCOPED_TRACE(content);
@@ -1686,7 +1697,7 @@ TEST(MetaPolicyStore, PutPolicyReplayIsIdempotentAccept) {
   MetaPolicyStore store;
   const PutPolicy cmd =
       MakePut(std::string(kAutomaticUncontrolledFailoverPolicyId), 1,
-              AutomaticPolicy(true, 5000));
+              AutomaticPolicy(5000));
   ASSERT_TRUE(store.Apply(cmd).ok());
   ASSERT_TRUE(store.Apply(cmd).ok());
   EXPECT_EQ(store.PolicyCount(), 1u);
@@ -1696,27 +1707,19 @@ TEST(MetaPolicyStore, PutPolicyReplayIsIdempotentAccept) {
 TEST(MetaPolicyStore, PutPolicySameVersionDifferentContentRejected) {
   MetaPolicyStore store;
   const std::string policy_id(kAutomaticUncontrolledFailoverPolicyId);
-  ASSERT_TRUE(
-      store.Apply(MakePut(policy_id, 1, AutomaticPolicy(true, 5000))).ok());
-  ExpectDomainReject(
-      store.Apply(MakePut(policy_id, 1, AutomaticPolicy(false, 5000))));
-  EXPECT_EQ(store.FindVersion(policy_id, 1)->content_,
-            AutomaticPolicy(true, 5000));
+  ASSERT_TRUE(store.Apply(MakePut(policy_id, 1, AutomaticPolicy(5000))).ok());
+  ExpectDomainReject(store.Apply(MakePut(policy_id, 1, AutomaticPolicy(6000))));
+  EXPECT_EQ(store.FindVersion(policy_id, 1)->content_, AutomaticPolicy(5000));
 }
 
 TEST(MetaPolicyStore, PutPolicyRequiresFirstAndConsecutiveVersions) {
   MetaPolicyStore store;
   const std::string policy_id(kAutomaticUncontrolledFailoverPolicyId);
-  ExpectDomainReject(
-      store.Apply(MakePut(policy_id, 2, AutomaticPolicy(true, 5000))));
-  ASSERT_TRUE(
-      store.Apply(MakePut(policy_id, 1, AutomaticPolicy(true, 5000))).ok());
-  ExpectDomainReject(
-      store.Apply(MakePut(policy_id, 3, AutomaticPolicy(true, 7000))));
-  ASSERT_TRUE(
-      store.Apply(MakePut(policy_id, 2, AutomaticPolicy(true, 6000))).ok());
-  ExpectDomainReject(
-      store.Apply(MakePut(policy_id, 1, AutomaticPolicy(true, 4000))));
+  ExpectDomainReject(store.Apply(MakePut(policy_id, 2, AutomaticPolicy(5000))));
+  ASSERT_TRUE(store.Apply(MakePut(policy_id, 1, AutomaticPolicy(5000))).ok());
+  ExpectDomainReject(store.Apply(MakePut(policy_id, 3, AutomaticPolicy(7000))));
+  ASSERT_TRUE(store.Apply(MakePut(policy_id, 2, AutomaticPolicy(6000))).ok());
+  ExpectDomainReject(store.Apply(MakePut(policy_id, 1, AutomaticPolicy(4000))));
   EXPECT_EQ(store.LatestVersion(policy_id), std::optional<std::uint64_t>(2));
 }
 
@@ -1726,14 +1729,12 @@ TEST(MetaPolicyStore, PutPolicyEvictsOldestVersionAfterHistoryCap) {
   for (std::uint32_t v = 1; v <= lavik::meta::kMaxMetaPolicyVersionsPerPolicy;
        ++v) {
     ASSERT_TRUE(
-        store.Apply(MakePut(policy_id, v, AutomaticPolicy(true, 1000 + v)))
-            .ok())
+        store.Apply(MakePut(policy_id, v, AutomaticPolicy(1000 + v))).ok())
         << v;
   }
   const std::uint64_t next = lavik::meta::kMaxMetaPolicyVersionsPerPolicy + 1;
   ASSERT_TRUE(
-      store.Apply(MakePut(policy_id, next, AutomaticPolicy(true, 1000 + next)))
-          .ok());
+      store.Apply(MakePut(policy_id, next, AutomaticPolicy(1000 + next))).ok());
   EXPECT_FALSE(store.FindVersion(policy_id, 1).has_value());
   EXPECT_TRUE(store.FindVersion(policy_id, 2).has_value());
   EXPECT_TRUE(store.FindVersion(policy_id, next).has_value());
@@ -1751,7 +1752,7 @@ MetaPolicyStore MakePopulatedPolicies() {
   EXPECT_TRUE(
       store
           .Apply(MakePut(std::string(kAutomaticUncontrolledFailoverPolicyId), 1,
-                         AutomaticPolicy(true, 5000)))
+                         AutomaticPolicy(5000)))
           .ok());
   EXPECT_TRUE(store
                   .Apply(MakePut(std::string(kAuthorityLeasePolicyId), 1,
@@ -1793,7 +1794,7 @@ TEST(MetaPolicyStore, SerializationIsDeterministic) {
   MetaPolicyStore b;
   const PutPolicy automatic =
       MakePut(std::string(kAutomaticUncontrolledFailoverPolicyId), 1,
-              AutomaticPolicy(true, 5000));
+              AutomaticPolicy(5000));
   const PutPolicy lease =
       MakePut(std::string(kAuthorityLeasePolicyId), 1, LeasePolicy(5000));
   ASSERT_TRUE(a.Apply(automatic).ok());
@@ -1848,7 +1849,7 @@ TEST(MetaPolicyStore, DeserializeRejectsInvariantViolations) {
     std::vector<PolicyBlobVersion> versions;
     for (std::uint32_t v = 1;
          v <= lavik::meta::kMaxMetaPolicyVersionsPerPolicy + 1; ++v) {
-      versions.push_back(PolicyBlobVersion{v, AutomaticPolicy(true, 1000 + v)});
+      versions.push_back(PolicyBlobVersion{v, AutomaticPolicy(1000 + v)});
     }
     ExpectStoreFailStop(
         MetaPolicyStore::Deserialize(

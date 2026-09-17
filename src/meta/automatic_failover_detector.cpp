@@ -64,7 +64,6 @@ MetaAutomaticFailoverBlocker BlockerFor(
 
 bool IsValidState(MetaAutomaticFailoverState state) noexcept {
   switch (state) {
-    case MetaAutomaticFailoverState::kDisabled:
     case MetaAutomaticFailoverState::kHealthy:
     case MetaAutomaticFailoverState::kSuspect:
     case MetaAutomaticFailoverState::kBlocked:
@@ -217,12 +216,9 @@ MetaAutomaticFailoverStateMachine::Advance(const Input& input,
   const bool input_changed =
       runtime.status_.anchor_ != input.anchor_ ||
       runtime.leader_authority_eligible_ != input.leader_authority_eligible_ ||
-      runtime.automatic_failover_enabled_ !=
-          input.automatic_failover_enabled_ ||
       runtime.suspect_after_ms_ != input.suspect_after_ms_;
   if (input_changed) {
     runtime.leader_authority_eligible_ = input.leader_authority_eligible_;
-    runtime.automatic_failover_enabled_ = input.automatic_failover_enabled_;
     runtime.suspect_after_ms_ = input.suspect_after_ms_;
     runtime.status_ = {};
     clear_suspect_clock();
@@ -241,11 +237,6 @@ MetaAutomaticFailoverStateMachine::Advance(const Input& input,
       .effective_threshold_ms_ = input.suspect_after_ms_,
   };
   runtime.last_now_ms_ = now_steady_ms;
-  if (!input.automatic_failover_enabled_) {
-    runtime.status_.state_ = MetaAutomaticFailoverState::kDisabled;
-    clear_suspect_clock();
-    return AdvanceResult{.status_ = runtime.status_};
-  }
   if (!input.leader_authority_eligible_) {
     runtime.status_.blocker_ = MetaAutomaticFailoverBlocker::kLeaderIneligible;
     clear_suspect_clock();
@@ -305,8 +296,6 @@ MetaAutomaticFailoverStateMachine::Snapshot() const {
 std::string_view MetaAutomaticFailoverStateName(
     MetaAutomaticFailoverState state) noexcept {
   switch (state) {
-    case MetaAutomaticFailoverState::kDisabled:
-      return "disabled";
     case MetaAutomaticFailoverState::kHealthy:
       return "healthy";
     case MetaAutomaticFailoverState::kSuspect:

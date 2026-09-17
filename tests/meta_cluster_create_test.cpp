@@ -126,7 +126,6 @@ TEST(ClusterCreateManifestTest, NormalizesMultipleGroupsAndAllocatesSlots) {
             (ClusterCreateManifestV1::SlotRange{0, 8191, "group-1"}));
   EXPECT_EQ(manifest->slot_ranges_[1],
             (ClusterCreateManifestV1::SlotRange{8192, 16383, "group-2"}));
-  EXPECT_TRUE(manifest->automatic_uncontrolled_failover_enabled_);
   EXPECT_EQ(manifest->automatic_uncontrolled_failover_suspect_after_ms_, 5000u);
   EXPECT_EQ(manifest->authority_lease_duration_ms_, 5000u);
 }
@@ -135,7 +134,6 @@ TEST(ClusterCreateManifestTest, ParsesStrictBootstrapPolicyOverrides) {
   const std::string configured = std::string(kValidManifest) +
                                  R"toml(
 [bootstrap_policy]
-automatic_uncontrolled_failover_enabled = false
 automatic_uncontrolled_failover_suspect_after_ms = 9000
 authority_lease_duration_ms = 3000
 )toml";
@@ -143,13 +141,13 @@ authority_lease_duration_ms = 3000
   auto manifest = ParseClusterCreateManifest(configured);
 
   ASSERT_TRUE(manifest.ok()) << manifest.status();
-  EXPECT_FALSE(manifest->automatic_uncontrolled_failover_enabled_);
   EXPECT_EQ(manifest->automatic_uncontrolled_failover_suspect_after_ms_, 9000u);
   EXPECT_EQ(manifest->authority_lease_duration_ms_, 3000u);
 
   for (const std::string& invalid : {
            configured + "unknown = 1\n",
-           ReplaceOnce(configured, "false", "1"),
+           configured + "automatic_uncontrolled_failover_enabled = false\n",
+           configured + "automatic_uncontrolled_failover_enabled = true\n",
            ReplaceOnce(configured, "9000", "999"),
            ReplaceOnce(configured, "3000", "99"),
            configured +

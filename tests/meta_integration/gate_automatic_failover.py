@@ -39,12 +39,6 @@ PAUSE_BEFORE_PROPOSE = "LAVIK_TEST_PAUSE_AUTOMATIC_BEFORE_PROPOSE_MS"
 PAUSE_AFTER_COMMIT = "LAVIK_TEST_PAUSE_FAILOVER_AFTER_AUTOMATIC_BEGIN_MS"
 
 
-def start_with_automatic_failover_disabled(fixture):
-    """Build the topology before arming its deliberately short detector."""
-    fixture.start_created(
-        automatic_uncontrolled_failover_enabled=False)
-
-
 def group_status(fixture, deadline):
     status = fixture.cluster_status(deadline)
     group = next(
@@ -74,16 +68,6 @@ def wait_group(fixture, description, predicate, timeout=90):
 def configure_fast_policies(fixture, suspect_after_ms=1000,
                             lease_duration_ms=1000):
     fixture.rediscover_leader(time.monotonic() + 5)
-    disabled_reply = fixture.leader.put_automatic_uncontrolled_failover_policy(
-        2, enabled=False, suspect_after_ms=suspect_after_ms)
-    if re.fullmatch(r"OK [1-9][0-9]*", disabled_reply) is None:
-        raise H.Failure(
-            "automatic-failover Policy disable failed: " + disabled_reply)
-    wait_group(
-        fixture, "automatic detector disables before Policy projection",
-        lambda group:
-        group.get("automatic_failover_state") == "disabled", timeout=10)
-
     # The lease Policy is projected asynchronously into every Data FDS. A
     # transient READY result from the pre-update projection is not sufficient:
     # cutting the Owner at that point can strand both replicas midway through
@@ -107,11 +91,11 @@ def configure_fast_policies(fixture, suspect_after_ms=1000,
             timeout=30)
     F.wait_ready(fixture, "fast Policy projection reaches READY")
 
-    enabled_reply = fixture.leader.put_automatic_uncontrolled_failover_policy(
-        3, suspect_after_ms=suspect_after_ms)
-    if re.fullmatch(r"OK [1-9][0-9]*", enabled_reply) is None:
+    threshold_reply = fixture.leader.put_automatic_uncontrolled_failover_policy(
+        2, suspect_after_ms=suspect_after_ms)
+    if re.fullmatch(r"OK [1-9][0-9]*", threshold_reply) is None:
         raise H.Failure(
-            "automatic-failover Policy enable failed: " + enabled_reply)
+            "automatic-failover Policy threshold update failed: " + threshold_reply)
 
     def healthy(group):
         elapsed = int(group.get("suspect_elapsed_ms", "0"))
@@ -172,7 +156,7 @@ def run_owner_loss(meta, data, ctl, workdir, mode, require_fault_hook):
     fixture = F.FailoverFixture(
         meta, data, ctl, os.path.join(workdir, mode), False)
     try:
-        start_with_automatic_failover_disabled(fixture)
+        fixture.start_created()
         configure_fast_policies(fixture)
         key = f"{{automatic-{mode}}}key"
         fixture.seed_and_wait_for_replicas(
@@ -257,7 +241,7 @@ def run_partition(meta, data, ctl, workdir, direction, require_fault_hook):
     old_probe = None
     replica_probes = {}
     try:
-        start_with_automatic_failover_disabled(fixture)
+        fixture.start_created()
         configure_fast_policies(fixture)
         key = f"{{automatic-{name}}}key"
         fixture.seed_and_wait_for_replicas(
@@ -343,7 +327,7 @@ def run_leader_threshold(meta, data, ctl, workdir, require_fault_hook):
     fixture = F.FailoverFixture(
         meta, data, ctl, os.path.join(workdir, "leader-threshold"), False)
     try:
-        start_with_automatic_failover_disabled(fixture)
+        fixture.start_created()
         configure_fast_policies(fixture, suspect_after_ms=3000)
         fixture.by_id[F.OWNER].force_kill()
         old_suspect = wait_group(
@@ -404,7 +388,7 @@ def run_leader_cut(meta, data, ctl, workdir, phase, require_fault_hook):
         meta, data, ctl, os.path.join(workdir, f"leader-{phase}"),
         require_fault_hook)
     try:
-        start_with_automatic_failover_disabled(fixture)
+        fixture.start_created()
         # This gate requires exactly one Begin across Meta recovery. Promotion
         # rotates replication history and reconnects the new Owner's session;
         # a 1s debounce can legitimately declare that reconnect a second Owner

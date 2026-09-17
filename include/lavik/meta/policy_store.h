@@ -52,7 +52,6 @@ inline constexpr std::uint64_t kMinimumAutomaticFailoverSuspectAfterMs = 1'000;
 inline constexpr std::uint64_t kMaximumAutomaticFailoverSuspectAfterMs =
     86'400'000;
 inline constexpr std::uint64_t kDefaultAutomaticFailoverSuspectAfterMs = 5'000;
-inline constexpr bool kDefaultAutomaticFailoverEnabled = true;
 
 inline constexpr std::uint64_t kMinimumAuthorityLeaseDurationMs = 100;
 inline constexpr std::uint64_t kMaximumAuthorityLeaseDurationMs = 86'400'000;
@@ -60,7 +59,6 @@ inline constexpr std::uint64_t kDefaultAuthorityLeaseDurationMs = 5'000;
 
 struct MetaAutomaticUncontrolledFailoverPolicy {
   std::uint64_t version_ = 0;
-  bool enabled_ = false;
   std::uint64_t suspect_after_ms_ = 0;
   bool operator==(const MetaAutomaticUncontrolledFailoverPolicy&) const =
       default;

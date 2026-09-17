@@ -146,7 +146,7 @@ void PopulateActivatedFixture(Fixture& fixture,
         std::string(meta::kAutomaticUncontrolledFailoverPolicyId);
     automatic.version_ = 1;
     automatic.content_ =
-        R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+        R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})";
     ASSERT_TRUE(fixture.stores.policy_.Apply(automatic).ok());
   }
   if (install_authority_lease_policy) {

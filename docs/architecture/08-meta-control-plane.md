@@ -120,8 +120,8 @@ correctness does not depend on apply running only once.
 
 Policy families are compiled into `MetaPolicyStore`; an arbitrary id cannot
 introduce a schema at runtime. The current families are
-`lavik.automatic-uncontrolled-failover-v1` (fixed matching `kind`, `enabled`,
-and `suspect_after_ms`) and `lavik.authority-lease-v1` (fixed matching `kind`
+`lavik.automatic-uncontrolled-failover-v1` (fixed matching `kind` and
+`suspect_after_ms`) and `lavik.authority-lease-v1` (fixed matching `kind`
 and `duration_ms`).
 Each accepts only its exact compact JSON object and typed ranges, rejecting
 whitespace, missing, duplicate or unknown fields, alternate escaped spellings,
@@ -413,15 +413,17 @@ an existing Failover Transition are explicit control-plane blockers.
 
 The Automatic Failover Detector is a bounded leader-local state machine, not
 Committed State and not the Uncontrolled Executor. For every Created Group it
-reports `DISABLED`, `HEALTHY`, `SUSPECT`, `BLOCKED`, or `TRIGGERING` and uses
+runs continuously and reports `HEALTHY`, `SUSPECT`, `BLOCKED`, or `TRIGGERING`.
+There is no enable/disable Policy; `suspect_after_ms` controls only the finite
+debounce interval. The detector uses
 an injected monotonic-millisecond cut (production `steady_clock`) to accumulate
 only exact Unserviceable time. A reason change does not clear elapsed time.
 Indeterminate evidence for the same complete anchor freezes and later resumes
 it; Serviceable evidence clears it. A change
 to leadership generation or any revisioned eligibility interruption (including
 false-to-true entirely between detector polls), Owner/assignment, Group term,
-either current Policy version, enabled value, or
-threshold discards it. A new or newly eligible leader first completes the
+either current Policy version, or threshold discards it. A new or newly
+eligible leader first completes the
 normal observation warmup and then gives absence or failure a complete fresh
 debounce interval. Silent loss therefore needs the observation TTL plus that
 full debounce and proposal latency before a fence can commit. Detector state
@@ -591,9 +593,12 @@ grantless state are both committed; active-grant owners and any mismatched
 term, assignment, boot, or history remain ineligible.
 Meta derives role from committed local control facts rather than trusting the tag, and
 replaces common health plus candidate state under one observation-store lock.
-An authority/no-role heartbeat, or rejected candidate, clears any older
-candidate for that node. Session teardown also withdraws the exact
-generation's candidate immediately; a stale teardown cannot clear evidence
+An authority heartbeat clears ordinary candidate progress, but may retain an
+unready, storage-healthy node's operator-recovery availability with its original
+receive time and TTL. Availability still requires the current boot/session and
+committed population scope at selection. No-role heartbeats, rejected reports,
+changed readiness or unhealthy storage withdraw it. Session teardown also
+withdraws the exact generation's candidate immediately; a stale teardown cannot clear evidence
 from a replacement generation.
 The same atomic replacement stores the exact candidate-action basis from the
 local control installed on that authenticated session: group term, transition revision,
@@ -1048,7 +1053,8 @@ includes `automatic_failover_state`, optional
 the threshold is a derived scalar rather than Policy identity or content.
 These are a bounded leader-local diagnostic cut and do not alter readiness. A Created Group
 missing the first complete detector publication is conservatively `blocked`
-with `indeterminate_evidence` rather than being reported as disabled.
+with `indeterminate_evidence`. A pre-Genesis Group without its Policy is also
+`BLOCKED`; only that pre-Policy state may have a zero threshold.
 `data_unobserved` means the current leader has no handshake evidence;
 `data_session_missing` means a previously accepted or actively retrying node
 has no current accepted session. A rejected,
@@ -1097,10 +1103,9 @@ Slots are either generated with `contiguous-even` after sorting Group ids or sup
 complete, non-overlapping `0..16383` range table. All
 declared Data belongs to exactly one Group and every Group owns at least one
 slot. An optional strict `[bootstrap_policy]` table supplies Bootstrap Policy
-Defaults for `automatic_uncontrolled_failover_enabled`,
-`automatic_uncontrolled_failover_suspect_after_ms`, and
-`authority_lease_duration_ms`; omitted values default to `true`, 5000 ms, and
-5000 ms respectively and must satisfy the registered family ranges. The parser
+Defaults for `automatic_uncontrolled_failover_suspect_after_ms` and
+`authority_lease_duration_ms`; both omitted values default to 5000 ms and must
+satisfy the registered family ranges. The parser
 rejects unknown TOML structure and files over 64 KiB, then
 sorts nodes, Groups, replicas and ranges and merges adjacent ranges belonging
 to the same Group. The CLI renders that canonical plan and requires exact

@@ -911,7 +911,9 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
           std::move(candidate_observation),
           std::move(failover_observation_value), std::move(failover_projection),
           std::move(owner_projection), heartbeat_sequence,
-          confirmed_grant_sequence, facts, now_unix_ms, now_steady_ms);
+          confirmed_grant_sequence, facts, now_unix_ms, now_steady_ms,
+          std::holds_alternative<control::AuthorityLeaseRequest>(
+              role_information));
   if (!replaced.boot_status_.ok()) {
     record_rejection("boot", replaced.boot_status_);
   }

@@ -482,8 +482,11 @@ class MetaObservationStore {
   // marker, and causal lease confirmation as one session cut; diagnostic text
   // capacity cannot splice that cut across frames. Candidate and transition
   // evidence remain replace-or-clear: absence or component rejection clears
-  // the corresponding older fact. Rejecting the heartbeat identity leaves the
-  // replacement session untouched. The shorter overloads deliberately supply
+  // the corresponding older fact. A lease-only heartbeat may retain operator
+  // recovery availability for an unready, storage-healthy node, without
+  // refreshing its TTL; it never retains automatic candidate progress.
+  // Rejecting the heartbeat identity leaves the replacement session untouched.
+  // The shorter overloads deliberately supply
   // nullopt for fields they cannot carry and therefore clear them. Component
   // statuses report diagnostic and role-evidence admission independently.
   // The full overload takes both clock cuts: Unix time retains the existing
@@ -513,7 +516,7 @@ class MetaObservationStore {
       std::uint64_t heartbeat_sequence,
       std::optional<std::uint64_t> confirmed_grant_sequence,
       const MetaCommittedFacts& facts, int64_t now_unix_ms,
-      std::uint64_t now_steady_ms);
+      std::uint64_t now_steady_ms, bool lease_only = false);
 
   // Records the handoff or Grant consequence immediately before the Ack's
   // first send attempt. A failed network write can be ambiguous, so a Grant
@@ -610,7 +613,8 @@ class MetaObservationStore {
                             int64_t now_unix_ms);
   void ClearCandidatesForNodeLocked(std::string_view node_id,
                                     int64_t now_unix_ms,
-                                    std::string_view detail);
+                                    std::string_view detail,
+                                    bool retain_operator_recovery = false);
   void ClearCandidateFailoverForNodeLocked(std::string_view node_id,
                                            int64_t now_unix_ms,
                                            std::string_view detail);

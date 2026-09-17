@@ -109,7 +109,7 @@ struct Fixture {
         std::string(meta::kAutomaticUncontrolledFailoverPolicyId);
     automatic.version_ = 1;
     automatic.content_ =
-        R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+        R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})";
     EXPECT_TRUE(stores.policy_.Apply(automatic).ok());
     EXPECT_TRUE(stores.topology_.CompleteClusterCreate(root).ok());
 
@@ -1900,7 +1900,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
       std::string(meta::kAutomaticUncontrolledFailoverPolicyId);
   automatic.version_ = 1;
   automatic.content_ =
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})";
   commit(meta::MetaCommand{automatic});
   meta::PutPolicy authority;
   authority.request_id_ = Bytes<16>(0x07);
@@ -2089,7 +2089,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
       std::string(meta::kAutomaticUncontrolledFailoverPolicyId);
   automatic.version_ = 1;
   automatic.content_ =
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})";
   commit(meta::MetaCommand{automatic});
   meta::PutPolicy authority;
   authority.request_id_ = Bytes<16>(0x07);

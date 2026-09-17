@@ -128,7 +128,7 @@ def create_request(meta, node_id, endpoint, group_id, meta_id=None,
     # Direct admission/recovery cases construct the same current v1 durable
     # intent as the CLI. Older persisted layouts are deliberately unsupported.
     payload = struct.pack(">H", 1) + operation_id
-    payload += struct.pack(">HII", 1, 5000, 5000)
+    payload += struct.pack(">II", 5000, 5000)
     payload += struct.pack(">I", len(metas))
     for member in sorted(metas, key=lambda item: item.id):
         member_id = member.id if meta_id is None else meta_id

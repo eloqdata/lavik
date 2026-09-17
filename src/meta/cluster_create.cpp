@@ -85,13 +85,6 @@ absl::StatusOr<std::string> ParseString(const CLI::ConfigItem& item) {
   return item.inputs.front();
 }
 
-absl::StatusOr<bool> ParseBool(const CLI::ConfigItem& item) {
-  if (item.inputs.size() != 1) return Invalid("duplicate manifest field");
-  if (item.inputs.front() == "true") return true;
-  if (item.inputs.front() == "false") return false;
-  return Invalid("manifest boolean must be true or false");
-}
-
 absl::StatusOr<std::vector<std::string>> ParseStringList(
     const CLI::ConfigItem& item) {
   std::vector<std::string> values;
@@ -592,12 +585,7 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
 
     switch (section) {
       case Section::kBootstrapPolicy:
-        if (item.name == "automatic_uncontrolled_failover_enabled") {
-          auto value = ParseBool(item);
-          if (!value.ok()) return value.status();
-          result.automatic_uncontrolled_failover_enabled_ = *value;
-        } else if (item.name ==
-                   "automatic_uncontrolled_failover_suspect_after_ms") {
+        if (item.name == "automatic_uncontrolled_failover_suspect_after_ms") {
           auto value = ParseUnsigned<std::uint64_t>(item);
           if (!value.ok()) return value.status();
           result.automatic_uncontrolled_failover_suspect_after_ms_ = *value;
@@ -720,7 +708,6 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
   writer.Raw(
       std::string_view(reinterpret_cast<const char*>(root_operation_id.data()),
                        root_operation_id.size()));
-  writer.U16(manifest.automatic_uncontrolled_failover_enabled_ ? 1 : 0);
   writer.U32(static_cast<std::uint32_t>(
       manifest.automatic_uncontrolled_failover_suspect_after_ms_));
   writer.U32(static_cast<std::uint32_t>(manifest.authority_lease_duration_ms_));
@@ -801,14 +788,11 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
 
   ClusterCreateManifestV1 manifest;
   manifest.schema_version_ = 1;
-  auto automatic_enabled = reader.U16();
   auto suspect_after_ms = reader.U32();
   auto authority_lease_duration_ms = reader.U32();
-  if (!automatic_enabled.ok() || *automatic_enabled > 1 ||
-      !suspect_after_ms.ok() || !authority_lease_duration_ms.ok()) {
+  if (!suspect_after_ms.ok() || !authority_lease_duration_ms.ok()) {
     return Invalid("invalid bootstrap Policy defaults");
   }
-  manifest.automatic_uncontrolled_failover_enabled_ = *automatic_enabled == 1;
   manifest.automatic_uncontrolled_failover_suspect_after_ms_ =
       *suspect_after_ms;
   manifest.authority_lease_duration_ms_ = *authority_lease_duration_ms;

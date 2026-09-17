@@ -916,7 +916,7 @@ class MetaCoordinatorServerTest : public ::testing::Test {
         std::string(lavik::meta::kAutomaticUncontrolledFailoverPolicyId);
     automatic.version_ = 1;
     automatic.content_ =
-        R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+        R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})";
     ProposeAccepted(automatic);
 
     lavik::meta::PutPolicy policy;

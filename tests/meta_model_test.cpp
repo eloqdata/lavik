@@ -2063,7 +2063,7 @@ lavik::meta::SubmitOperation MakeClusterCreateSubmit(
 lavik::meta::PutPolicy MakeAutomaticFailoverPolicy(std::uint64_t version = 1) {
   return MakePutPolicy(
       std::string(lavik::meta::kAutomaticUncontrolledFailoverPolicyId), version,
-      "{\"kind\":\"automatic-uncontrolled-failover-v1\",\"enabled\":true,"
+      "{\"kind\":\"automatic-uncontrolled-failover-v1\","
       "\"suspect_after_ms\":5000}");
 }
 
@@ -2183,7 +2183,7 @@ TEST(MetaStateApply,
 TEST(MetaStateApply,
      PreseededCurrentPoliciesRemainPristineAndSurviveGenesisAdmission) {
   const std::string automatic_raw =
-      R"({"suspect_after_ms":9000,"enabled":false,"kind":"automatic-uncontrolled-failover-v1"})";
+      R"({"suspect_after_ms":9000,"kind":"automatic-uncontrolled-failover-v1"})";
   const std::string lease_raw =
       R"({"duration_ms":7000,"kind":"authority-lease-v1"})";
 
@@ -2223,10 +2223,9 @@ TEST(MetaStateApply,
                       1)
                   ->content_,
               automatic_raw);
-    EXPECT_EQ(
-        stores.policy_.CurrentAutomaticUncontrolledFailover(),
-        (lavik::meta::MetaAutomaticUncontrolledFailoverPolicy{
-            .version_ = 1, .enabled_ = false, .suspect_after_ms_ = 9000}));
+    EXPECT_EQ(stores.policy_.CurrentAutomaticUncontrolledFailover(),
+              (lavik::meta::MetaAutomaticUncontrolledFailoverPolicy{
+                  .version_ = 1, .suspect_after_ms_ = 9000}));
     if (seed_both_families) {
       ASSERT_TRUE(
           stores.policy_

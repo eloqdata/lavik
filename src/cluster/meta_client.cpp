@@ -2485,7 +2485,9 @@ struct MetaControlClientService::Impl {
               continue;
             // Availability never doubles as a lease challenge. Alternating
             // these reports lets Meta observe an unready former Owner and
-            // lets an operator start a fence when automatic failover is off.
+            // lets an operator start a fence before the detector threshold.
+            // Meta retains availability across the intervening lease request
+            // without extending the availability report's original TTL.
             if (heartbeat_challenge.has_value()) continue;
             heartbeat.role_information = control::ReplicaCandidate{
                 .progress = {.group_id = group.group_id,

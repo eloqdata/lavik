@@ -145,7 +145,7 @@ Fixture CompleteFixture(std::string operation_kind = "population-rebuild") {
       PutPolicy(
           0x16,
           std::string(lavik::meta::kAutomaticUncontrolledFailoverPolicyId), 1,
-          R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})"));
+          R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})"));
 
   lavik::meta::BindMetaMember meta2;
   meta2.request_id_ = Bytes<16>(0x02);

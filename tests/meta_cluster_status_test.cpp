@@ -80,7 +80,8 @@ ClusterStatusWireV1 ReadyStatus(std::vector<ClusterMetaMemberWireV1> members,
        .serving_ready_ = true,
        .topology_converged_ = true,
        .automatic_failover_state_ = ClusterAutomaticFailoverState::kHealthy,
-       .effective_threshold_ms_ = 1'000});
+       .effective_threshold_ms_ = 1'000,
+       .blocked_reason_ = std::nullopt});
   status.slot_ranges_.push_back(
       {.first_ = 0, .last_ = 16'383, .group_id_ = "group-1"});
   return status;
@@ -172,7 +173,8 @@ TEST(MetaClusterStatusWireTest,
     EXPECT_FALSE(EncodeClusterStatusReply(status).ok());
   };
   rejected([](auto& group) {
-    group.automatic_failover_state_ = ClusterAutomaticFailoverState::kDisabled;
+    group.automatic_failover_state_ =
+        static_cast<ClusterAutomaticFailoverState>(0);
     group.effective_threshold_ms_ = 0;
   });
   rejected([](auto& group) { group.effective_threshold_ms_ = 0; });
@@ -202,7 +204,7 @@ TEST(MetaClusterStatusWireTest,
 }
 
 TEST(MetaClusterStatusWireTest,
-     AllowsDisabledPrePolicyDiagnosticsForNonPristineGroup) {
+     AllowsBlockedPrePolicyDiagnosticsForNonPristineGroup) {
   ClusterStatusWireV1 status;
   status.capture_ = {.responder_id_ = 1, .term_ = 2, .committed_index_ = 3};
   status.cluster_state_ = ClusterStateWireV1::kNonPristine;

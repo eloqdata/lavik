@@ -72,18 +72,13 @@ AUTOMATIC_UNCONTROLLED_FAILOVER_POLICY_ID = (
 AUTHORITY_LEASE_POLICY_ID = "lavik.authority-lease-v1"
 
 
-def automatic_uncontrolled_failover_policy(enabled=True,
-                                           suspect_after_ms=5000):
+def automatic_uncontrolled_failover_policy(suspect_after_ms=5000):
     """Return the strict compact JSON accepted by the registered family."""
-    if not isinstance(enabled, bool):
-        raise ValueError("automatic failover enabled must be bool")
     if (not isinstance(suspect_after_ms, int) or
             isinstance(suspect_after_ms, bool) or
             not 1000 <= suspect_after_ms <= 86_400_000):
         raise ValueError("automatic failover suspect_after_ms is out of range")
-    enabled_json = "true" if enabled else "false"
     return ("{\"kind\":\"automatic-uncontrolled-failover-v1\","
-            f"\"enabled\":{enabled_json},"
             f"\"suspect_after_ms\":{suspect_after_ms}}}")
 
 
@@ -415,12 +410,12 @@ class Node:
                         timeout=timeout)
 
     def put_automatic_uncontrolled_failover_policy(
-            self, version, enabled=True, suspect_after_ms=5000,
+            self, version, suspect_after_ms=5000,
             timeout=5.0):
         return self.putpolicy(
             AUTOMATIC_UNCONTROLLED_FAILOVER_POLICY_ID, version,
             automatic_uncontrolled_failover_policy(
-                enabled=enabled, suspect_after_ms=suspect_after_ms),
+                suspect_after_ms=suspect_after_ms),
             timeout=timeout)
 
     def put_authority_lease_policy(self, version, duration_ms=5000,

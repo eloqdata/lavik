@@ -1426,6 +1426,101 @@ TEST(MetaHeartbeatObservationTest,
 }
 
 TEST(MetaHeartbeatObservationTest,
+     LeaseOnlyHeartbeatRetainsOperatorRecoveryWithoutRefreshingExpiry) {
+  MetaObservationStore observations({.ttl_ms_ = 100});
+  HeartbeatFacts facts;
+  const auto boot = Bytes<20>(0x22);
+  ASSERT_TRUE(observations.AdoptSession({Identity('1'), boot, 1}, 1000).ok());
+  const control::HeartbeatHealth health{.storage_ready = true};
+  const control::ReplicaCandidate available{
+      .progress = {.group_id = "group-a",
+                   .assignment_id = Bytes<16>(0x22),
+                   .group_term = 7,
+                   .manifest_revision = 9,
+                   .partition_replication_epoch = 4,
+                   .operator_recovery = true}};
+  ASSERT_EQ(
+      IngestHeartbeatObservations(observations, facts, Identity('1'), boot,
+                                  Bytes<20>(0x55), 1, health, available, 1001)
+          .status,
+      control::ObservationStatus::kAccepted);
+  ASSERT_EQ(
+      IngestHeartbeatObservations(
+          observations, facts, Identity('1'), boot, Bytes<20>(0x55), 1, health,
+          control::AuthorityLeaseRequest{.challenge = Challenge()}, 1050)
+          .status,
+      control::ObservationStatus::kAccepted);
+  const auto retained = observations.LiveCandidateProgressFor(
+      "group-a", facts, 1050, /*include_operator_recovery=*/true);
+  ASSERT_EQ(retained.size(), 1u);
+  EXPECT_EQ(retained.front().received_unix_ms_, 1001);
+  EXPECT_EQ(retained.front().expires_unix_ms_, 1101);
+  EXPECT_TRUE(
+      observations.LiveCandidateProgressFor("group-a", facts, 1050).empty());
+  EXPECT_TRUE(observations
+                  .LiveCandidateProgressFor("group-a", facts, 1102,
+                                            /*include_operator_recovery=*/true)
+                  .empty());
+}
+
+TEST(MetaHeartbeatObservationTest,
+     OperatorRecoveryIsWithdrawnOnRoleHealthOrIdentityChange) {
+  for (const auto* change :
+       {"no-role", "storage-unready", "draining", "population-ready",
+        "bad-assignment", "new-session", "new-boot", "disconnect"}) {
+    SCOPED_TRACE(change);
+    MetaObservationStore observations;
+    HeartbeatFacts facts;
+    const auto boot = Bytes<20>(0x22);
+    ASSERT_TRUE(observations.AdoptSession({Identity('1'), boot, 1}, 1000).ok());
+    control::HeartbeatHealth health{.storage_ready = true};
+    control::ReplicaCandidate available{
+        .progress = {.group_id = "group-a",
+                     .assignment_id = Bytes<16>(0x22),
+                     .group_term = 7,
+                     .manifest_revision = 9,
+                     .partition_replication_epoch = 4,
+                     .operator_recovery = true}};
+    ASSERT_EQ(
+        IngestHeartbeatObservations(observations, facts, Identity('1'), boot,
+                                    Bytes<20>(0x55), 1, health, available, 1001)
+            .status,
+        control::ObservationStatus::kAccepted);
+    const auto live = [&] {
+      return observations.LiveCandidateProgressFor(
+          "group-a", facts, 1003, /*include_operator_recovery=*/true);
+    };
+    ASSERT_EQ(live().size(), 1u);
+    control::HeartbeatRoleInformation role =
+        control::AuthorityLeaseRequest{.challenge = Challenge()};
+    const std::string_view kind(change);
+    if (kind == "no-role") role = control::NoRoleInformation{};
+    if (kind == "storage-unready") health.storage_ready = false;
+    if (kind == "draining") health.draining = true;
+    if (kind == "population-ready") health.population_ready = true;
+    if (kind == "bad-assignment") {
+      available.progress.assignment_id = Bytes<16>(0x23);
+      role = available;
+    }
+    if (kind == "new-session" || kind == "new-boot") {
+      ASSERT_TRUE(
+          observations
+              .AdoptSession({Identity('1'),
+                             kind == "new-boot" ? Bytes<20>(0x33) : boot, 2},
+                            1002)
+              .ok());
+    }
+    if (kind == "disconnect") {
+      observations.InvalidateCandidateOnDisconnect({Identity('1'), boot, 1},
+                                                   1002);
+    }
+    (void)IngestHeartbeatObservations(observations, facts, Identity('1'), boot,
+                                      Bytes<20>(0x55), 1, health, role, 1003);
+    EXPECT_TRUE(live().empty());
+  }
+}
+
+TEST(MetaHeartbeatObservationTest,
      BridgesActionObservationWithoutRequiringCandidateRolePayload) {
   MetaObservationStore observations;
   FailoverHeartbeatFacts facts;

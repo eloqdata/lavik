@@ -53,7 +53,6 @@ struct MetaAutomaticFailoverAnchor {
 };
 
 enum class MetaAutomaticFailoverState : std::uint8_t {
-  kDisabled = 1,
   kHealthy = 2,
   kSuspect = 3,
   kBlocked = 4,
@@ -76,7 +75,7 @@ enum class MetaAutomaticFailoverBlocker : std::uint8_t {
 
 struct MetaAutomaticFailoverStatus {
   MetaAutomaticFailoverAnchor anchor_;
-  MetaAutomaticFailoverState state_ = MetaAutomaticFailoverState::kDisabled;
+  MetaAutomaticFailoverState state_ = MetaAutomaticFailoverState::kBlocked;
   // Populated only while the current classification is exact Unserviceable or
   // after the corresponding trigger has latched.
   MetaOwnerServiceabilityReason current_reason_ =
@@ -154,7 +153,6 @@ class MetaAutomaticFailoverStateMachine {
     // Eligibility is repeated explicitly because losing it discards SUSPECT
     // time even before a formal leadership-generation change.
     bool leader_authority_eligible_ = false;
-    bool automatic_failover_enabled_ = false;
     std::uint64_t suspect_after_ms_ = 0;
     MetaOwnerServiceabilityDecision owner_serviceability_;
   };
@@ -191,7 +189,6 @@ class MetaAutomaticFailoverStateMachine {
  private:
   struct GroupRuntime {
     bool leader_authority_eligible_ = false;
-    bool automatic_failover_enabled_ = false;
     std::uint64_t suspect_after_ms_ = 0;
     MetaAutomaticFailoverStatus status_;
     std::optional<std::uint64_t> active_since_ms_;

@@ -873,12 +873,21 @@ absl::Status MetaObservationStore::IngestLocked(MetaObservation observation,
 }
 
 void MetaObservationStore::ClearCandidatesForNodeLocked(
-    std::string_view node_id, int64_t now_unix_ms, std::string_view detail) {
+    std::string_view node_id, int64_t now_unix_ms, std::string_view detail,
+    bool retain_operator_recovery) {
   Impl& impl = *impl_;
   for (auto group_it = impl.candidates_by_group_.begin();
        group_it != impl.candidates_by_group_.end();) {
     auto node_it = group_it->second.find(std::string(node_id));
     if (node_it != group_it->second.end()) {
+      if (retain_operator_recovery &&
+          std::get<MetaCandidateProgressObs>(node_it->second.payload_)
+              .operator_recovery_) {
+        // Keep the original observation identity and receive time. Selection
+        // still revalidates boot/session, committed population scope and TTL.
+        ++group_it;
+        continue;
+      }
       impl.AccountErase(node_it->second);
       group_it->second.erase(node_it);
       if (!detail.empty()) {
@@ -959,7 +968,7 @@ MetaObservationStore::ReplaceHeartbeat(
     std::uint64_t heartbeat_sequence,
     std::optional<std::uint64_t> confirmed_grant_sequence,
     const MetaCommittedFacts& facts, int64_t now_unix_ms,
-    std::uint64_t now_steady_ms) {
+    std::uint64_t now_steady_ms, bool lease_only) {
   std::lock_guard<std::mutex> lock(mutex_);
   const absl::Status identity_status = impl_->CheckIdentity(identity, facts);
   if (!identity_status.ok()) {
@@ -1076,6 +1085,9 @@ MetaObservationStore::ReplaceHeartbeat(
   session.heartbeat_sequence_ = heartbeat_sequence;
 
   HeartbeatReplaceResult result;
+  const bool retain_operator_recovery =
+      lease_only && !candidate.has_value() && health.storage_ready_ &&
+      !health.population_ready_ && !health.draining_;
   result.boot_status_ = IngestLocked(
       MetaObservation{.identity_ = identity, .payload_ = MetaNodeBootObs{}},
       facts, now_unix_ms);
@@ -1083,13 +1095,16 @@ MetaObservationStore::ReplaceHeartbeat(
       MetaObservation{.identity_ = identity, .payload_ = std::move(health)},
       facts, now_unix_ms);
 
-  // Candidate is replace-or-clear, never patch-in-place. This also removes a
-  // candidate for another group left behind by an FDS role or membership
-  // transition before attempting to admit the new report.
-  ClearCandidatesForNodeLocked(identity.node_id_, now_unix_ms,
-                               candidate.has_value()
-                                   ? std::string_view{}
-                                   : "heartbeat-role-has-no-candidate");
+  // Ordinary candidates are replace-or-clear. A restarted former Owner
+  // alternates availability with lease requests: the intervening request
+  // must not withdraw its operator-only population. An explicit role omission,
+  // unhealthy heartbeat or new candidate report still clears the old fact.
+  ClearCandidatesForNodeLocked(
+      identity.node_id_, now_unix_ms,
+      candidate.has_value() ? std::string_view{}
+                            : "heartbeat-role-has-no-candidate",
+      retain_operator_recovery && result.boot_status_.ok() &&
+          result.health_status_.ok());
   if (candidate.has_value() && result.boot_status_.ok() &&
       result.health_status_.ok()) {
     result.candidate_status_ =

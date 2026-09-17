@@ -129,6 +129,12 @@ def wait_durable(data):
 
 
 def require_fenced(fixture, data, term):
+    # Metrics start before disk recovery completes; a fresh Meta observation
+    # of the fence does not imply that Redis has opened its listener yet.
+    def listener_ready():
+        with socket.create_connection(F.endpoint(data), timeout=1):
+            return True
+    H.wait_until("restarted Redis listener is available", 20, listener_ready)
     A.wait_group(fixture, "restarted node has no serving authority",
                  lambda g: g.get("term") == str(term) and
                  not g.get("serving_ready"), timeout=40)
@@ -187,9 +193,9 @@ def run(args, workdir):
             # Shutdown the replica before cutting its source; the restarted
             # candidate must retain the source's two-flow layout, not its own.
             replica.terminate()
-        automatic = case not in ("manual-fence", "eligible-candidate")
+        short_threshold = case not in ("manual-fence", "eligible-candidate")
         reply = fixture.leader.put_automatic_uncontrolled_failover_policy(
-            2, enabled=automatic, suspect_after_ms=1000)
+            2, suspect_after_ms=1000 if short_threshold else 600_000)
         if not reply.startswith("OK "):
             raise H.Failure(f"could not configure recovery detector: {reply}")
         if publish_fault:
@@ -207,7 +213,7 @@ def run(args, workdir):
             require_exit_at_fault(target)
         restart(fixture, target)
         if case in ("incomplete-full", "eligible-candidate"):
-            require_fenced(fixture, target, 2 if automatic else 1)
+            require_fenced(fixture, target, 2 if short_threshold else 1)
             reply = fixture.leader.ctl(
                 f"promote {F.GROUP} --node {target.node_id} --accept-data-loss")
             expected = ("no-readable-recovered-population" if case == "incomplete-full"
@@ -219,7 +225,19 @@ def run(args, workdir):
         eligible = case in ("clean-owner", "clean-replica", "after-publish",
                             "before-consume")
         if not eligible:
-            require_fenced(fixture, target, 2 if automatic else 1)
+            require_fenced(fixture, target, 2 if short_threshold else 1)
+            if case == "manual-fence":
+                # Promote after a lease-only heartbeat has replaced the role
+                # report. Recovery availability must survive this interval;
+                # sampling an arbitrary heartbeat hid this regression.
+                H.wait_until("Meta observes the recovered population", 20,
+                             lambda: fixture.leader.observations(F.GROUP)
+                             .startswith("OK candidates=1 "))
+                metric = "lavik_cluster_control_lease_decisions_total"
+                labels = '{decision="denied"}'
+                before = target.metric(metric, labels)
+                target.wait_metric(metric, lambda value: value > before,
+                                   "next lease heartbeat is denied", labels=labels)
             promote(fixture, target)
         wait_serving(fixture, target, 2)
         require_data(target)

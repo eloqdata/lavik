@@ -17,7 +17,7 @@ limitations under the License.
 # Meta control plane operations
 
 Lavik clusters require Lavik binaries and certificates with `lavik://` URI
-SANs on every member. Recreate data and Meta directories from earlier Lavik
+SANs on every member. Recreate data and Meta directories from earlier Keylane
 development builds; mixed identifiers and rolling upgrades from those builds
 are unsupported.
 
@@ -202,7 +202,6 @@ schema_version = 1
 slot_strategy = "contiguous-even"
 
 [bootstrap_policy]
-automatic_uncontrolled_failover_enabled = true
 automatic_uncontrolled_failover_suspect_after_ms = 5000
 authority_lease_duration_ms = 5000
 
@@ -796,11 +795,17 @@ raw document. The only accepted families and update forms are:
 ```sh
 lavik-ctl --socket /var/lib/lavik/meta-1/meta-admin.sock \
   putpolicy lavik.automatic-uncontrolled-failover-v1 2 \
-  '{"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000}'
+  '{"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000}'
 lavik-ctl --socket /var/lib/lavik/meta-1/meta-admin.sock \
   putpolicy lavik.authority-lease-v1 2 \
   '{"kind":"authority-lease-v1","duration_ms":5000}'
 ```
+
+Automatic failover is always active. Its Policy configures only the finite
+suspicion threshold; neither the Policy JSON nor the bootstrap manifest accepts
+an enable/disable field. Without an eligible candidate the Group remains fenced
+until a candidate becomes eligible or an operator explicitly accepts data loss
+and selects a recovered population with `promote`.
 
 The same 1,000–86,400,000 ms automatic threshold and 100–86,400,000 ms lease
 range apply to runtime updates. Field reordering is accepted, but whitespace,

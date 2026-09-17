@@ -38,7 +38,7 @@ struct RecoveredPopulation {
 inline std::string EncodeRecoveredPopulation(
     const RebuildIdentity& identity,
     std::span<const std::uint64_t> frontier = {}) {
-  std::string out("KLRP1");
+  std::string out("LVRP1");
   auto number = [&](std::uint64_t value) {
     for (unsigned i = 0; i < 8; ++i)
       out.push_back(static_cast<char>(value >> (i * 8)));
@@ -67,7 +67,7 @@ inline absl::StatusOr<RecoveredPopulation> DecodeRecoveredPopulation(
     return absl::DataLossError(
         "invalid durable cluster population recovery payload");
   };
-  if (!in.starts_with("KLRP1") || in.size() > 1024 * 1024) return invalid();
+  if (!in.starts_with("LVRP1") || in.size() > 1024 * 1024) return invalid();
   in.remove_prefix(5);
   auto number = [&](std::uint64_t& value) {
     if (in.size() < 8) return false;

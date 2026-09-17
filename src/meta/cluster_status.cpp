@@ -234,16 +234,6 @@ absl::Status ValidateAutomaticFailoverDiagnostics(
         "invalid clusterstatus automatic failover blocker");
   }
   switch (group.automatic_failover_state_) {
-    case ClusterAutomaticFailoverState::kDisabled:
-      // Before Genesis, a legally non-pristine topology may contain Groups
-      // without either required Policy. DISABLED with a zero threshold is the
-      // only honest diagnostic for that pre-Policy state.
-      if (!has_reason && !has_blocker && group.suspect_elapsed_ms_ == 0 &&
-          (group.effective_threshold_ms_ != 0 ||
-           allow_pre_policy_diagnostics)) {
-        return absl::OkStatus();
-      }
-      break;
     case ClusterAutomaticFailoverState::kHealthy:
       if (!has_reason && !has_blocker && group.suspect_elapsed_ms_ == 0 &&
           group.effective_threshold_ms_ != 0) {
@@ -257,7 +247,11 @@ absl::Status ValidateAutomaticFailoverDiagnostics(
       }
       break;
     case ClusterAutomaticFailoverState::kBlocked:
-      if (!has_reason && has_blocker && group.effective_threshold_ms_ != 0) {
+      // A pre-Genesis Group may not have its threshold Policy yet.
+      if (!has_reason && has_blocker &&
+          (group.effective_threshold_ms_ != 0 ||
+           (allow_pre_policy_diagnostics && group.suspect_elapsed_ms_ == 0 &&
+            group.blocked_reason_ == "indeterminate_evidence"))) {
         return absl::OkStatus();
       }
       break;
@@ -810,8 +804,6 @@ std::string_view DataNodeRoleName(ClusterDataNodeRole role) {
 std::string_view AutomaticFailoverStateName(
     ClusterAutomaticFailoverState state) {
   switch (state) {
-    case ClusterAutomaticFailoverState::kDisabled:
-      return "disabled";
     case ClusterAutomaticFailoverState::kHealthy:
       return "healthy";
     case ClusterAutomaticFailoverState::kSuspect:

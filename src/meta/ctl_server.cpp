@@ -685,11 +685,8 @@ std::string BuildClusterStatusReply(
                        return item.anchor_.group_id_ == group.group_id_;
                      });
     if (detector_status != detector.statuses_.end()) {
+      group.blocked_reason_.reset();
       switch (detector_status->state_) {
-        case MetaAutomaticFailoverState::kDisabled:
-          group.automatic_failover_state_ =
-              ClusterAutomaticFailoverState::kDisabled;
-          break;
         case MetaAutomaticFailoverState::kHealthy:
           group.automatic_failover_state_ =
               ClusterAutomaticFailoverState::kHealthy;
@@ -718,11 +715,10 @@ std::string BuildClusterStatusReply(
         group.blocked_reason_ = std::string(
             MetaAutomaticFailoverBlockerName(detector_status->blocker_));
       }
-    } else if (view.cluster_lifecycle_.state_ ==
-               MetaClusterLifecycle::kCreated) {
+    } else {
       // A newly opened diagnostics bracket may precede its first complete
-      // detector publication. Report a conservative transient state instead
-      // of claiming that automatic failover is disabled.
+      // detector publication. Missing policies before Genesis also block
+      // evaluation; automatic failover has no administrative off state.
       group.automatic_failover_state_ = ClusterAutomaticFailoverState::kBlocked;
       group.blocked_reason_ = "indeterminate_evidence";
     }

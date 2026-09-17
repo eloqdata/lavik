@@ -350,7 +350,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     automatic.policy_id_ = std::string(kAutomaticUncontrolledFailoverPolicyId);
     automatic.version_ = 1;
     automatic.content_ =
-        R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":1000})";
+        R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":1000})";
     ProposeAccepted(automatic);
 
     PutPolicy lease;
@@ -1061,13 +1061,14 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   std::this_thread::sleep_for(100ms);
   ASSERT_EQ(automatic_attempts.load(std::memory_order_acquire), 1);
 
-  PutPolicy disabled;
-  disabled.request_id_ = Bytes<16>(0x0c);
-  disabled.policy_id_ = std::string(kAutomaticUncontrolledFailoverPolicyId);
-  disabled.version_ = 2;
-  disabled.content_ =
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":false,"suspect_after_ms":1000})";
-  ProposeAccepted(disabled);
+  PutPolicy longer_threshold;
+  longer_threshold.request_id_ = Bytes<16>(0x0c);
+  longer_threshold.policy_id_ =
+      std::string(kAutomaticUncontrolledFailoverPolicyId);
+  longer_threshold.version_ = 2;
+  longer_threshold.content_ =
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":10000})";
+  ProposeAccepted(longer_threshold);
   ASSERT_TRUE(
       PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
                             MetaNodeHealthObs{.storage_ready_ = true,
@@ -1093,7 +1094,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   const auto automatic = stores.policy_.CurrentAutomaticUncontrolledFailover();
   ASSERT_TRUE(automatic.has_value());
   EXPECT_EQ(automatic->version_, 2u);
-  EXPECT_FALSE(automatic->enabled_);
+  EXPECT_EQ(automatic->suspect_after_ms_, 10000u);
   EXPECT_EQ(automatic_attempts.load(std::memory_order_acquire), 2);
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 2);
 }

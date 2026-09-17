@@ -354,7 +354,6 @@ TEST_F(ClusterCreateV1RecoveryTest,
   EXPECT_EQ(stores_.policy_.CurrentAutomaticUncontrolledFailover(),
             (MetaAutomaticUncontrolledFailoverPolicy{
                 .version_ = 1,
-                .enabled_ = kDefaultAutomaticFailoverEnabled,
                 .suspect_after_ms_ = kDefaultAutomaticFailoverSuspectAfterMs}));
   EXPECT_EQ(
       stores_.policy_.CurrentAuthorityLease(),
@@ -381,7 +380,7 @@ TEST_F(ClusterCreateV1RecoveryTest,
   automatic.policy_id_ = kAutomaticUncontrolledFailoverPolicyId;
   automatic.version_ = 1;
   automatic.content_ =
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":false,"suspect_after_ms":9000})";
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":9000})";
   Apply(automatic);
   PutPolicy lease;
   lease.policy_id_ = kAuthorityLeasePolicyId;
@@ -392,7 +391,7 @@ TEST_F(ClusterCreateV1RecoveryTest,
   AdvanceToProjectionWait();
   EXPECT_EQ(stores_.policy_.CurrentAutomaticUncontrolledFailover(),
             (MetaAutomaticUncontrolledFailoverPolicy{
-                .version_ = 1, .enabled_ = false, .suspect_after_ms_ = 9000}));
+                .version_ = 1, .suspect_after_ms_ = 9000}));
   EXPECT_EQ(stores_.policy_.CurrentAuthorityLease(),
             (MetaAuthorityLeasePolicy{.version_ = 1, .duration_ms_ = 7000}));
 }

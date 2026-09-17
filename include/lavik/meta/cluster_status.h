@@ -86,7 +86,6 @@ struct ClusterDataNodeWireV1 {
 // Raft-free Admin model so status clients do not depend on the leader-local
 // detector Module or its timer state.
 enum class ClusterAutomaticFailoverState : std::uint8_t {
-  kDisabled = 0,
   kHealthy = 1,
   kSuspect = 2,
   kBlocked = 3,
@@ -104,14 +103,14 @@ struct ClusterGroupWireV1 {
   // SUSPECT/TRIGGERING classifications; `blocked_reason_` is present only for
   // BLOCKED. Durations are milliseconds: elapsed suspicion may freeze while
   // BLOCKED, while `effective_threshold_ms_` is the threshold resolved from the
-  // current global Policy for this cut. It is zero only for DISABLED Groups
+  // current global Policy for this cut. It may be zero for BLOCKED Groups
   // that legally predate Genesis Policy installation in a non-pristine cluster.
   ClusterAutomaticFailoverState automatic_failover_state_ =
-      ClusterAutomaticFailoverState::kDisabled;
+      ClusterAutomaticFailoverState::kBlocked;
   std::optional<std::string> current_reason_;
   std::uint64_t suspect_elapsed_ms_ = 0;
   std::uint64_t effective_threshold_ms_ = 0;
-  std::optional<std::string> blocked_reason_;
+  std::optional<std::string> blocked_reason_ = "indeterminate_evidence";
   bool operator==(const ClusterGroupWireV1&) const = default;
 };
 

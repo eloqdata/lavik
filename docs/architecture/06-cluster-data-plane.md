@@ -398,7 +398,10 @@ participate in either Owner freshness decision. Invalid
 challenge content changes only the lease decision and cannot suppress common
 health observation. Meta derives role from the installed committed projection,
 not from the payload tag; an authority/no-role heartbeat atomically clears any
-candidate left from the same node's prior replica role. The authenticated
+ordinary candidate left from the same node's prior replica role. An unready,
+storage-healthy former Owner's lease-only heartbeat retains operator-recovery
+availability without refreshing its original TTL; no-role or unhealthy reports
+withdraw it. The authenticated
 session completion path immediately withdraws the exact generation's
 candidate. Generation replacement, boot replacement, committed freshness
 changes, and Meta leadership changes independently invalidate it, so the

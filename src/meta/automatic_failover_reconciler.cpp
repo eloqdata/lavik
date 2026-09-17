@@ -403,7 +403,6 @@ absl::StatusOr<MetaAutomaticFailoverStateMachine::Input> BuildInput(
               .authority_lease_policy_version_ = lease.version_,
           },
       .leader_authority_eligible_ = runtime.leader_authority_eligible_,
-      .automatic_failover_enabled_ = automatic.enabled_,
       .suspect_after_ms_ = automatic.suspect_after_ms_,
       .owner_serviceability_ = EvaluateOwnerServiceability(cut),
   };
@@ -646,7 +645,6 @@ absl::Status ValidateAutomaticProposal(
   // Requiring equality here would discard a completed debounce interval just
   // because, for example, a disconnected Owner reconnects storage-unready.
   if (input->anchor_ != admission.anchor_ ||
-      !input->automatic_failover_enabled_ ||
       !input->leader_authority_eligible_ ||
       input->owner_serviceability_.state_ !=
           MetaOwnerServiceabilityState::kUnserviceable ||

@@ -49,7 +49,6 @@ MetaAutomaticFailoverStateMachine::Input UnserviceableInput() {
               .authority_lease_policy_version_ = 17,
           },
       .leader_authority_eligible_ = true,
-      .automatic_failover_enabled_ = true,
       .suspect_after_ms_ = 1'000,
       .owner_serviceability_ =
           {
@@ -204,7 +203,7 @@ TEST(MetaAutomaticFailoverDiagnosticsRegistryTest,
   std::thread writer([&] {
     for (int i = 0; i < 2'000; ++i) {
       const auto state = (i & 1) == 0 ? MetaAutomaticFailoverState::kHealthy
-                                      : MetaAutomaticFailoverState::kDisabled;
+                                      : MetaAutomaticFailoverState::kBlocked;
       const std::uint64_t evaluated_index = 401 + static_cast<std::uint64_t>(i);
       registry.Publish(
           30, 1, evaluated_index,
@@ -286,20 +285,12 @@ TEST(MetaAutomaticFailoverStateMachineTest,
 }
 
 TEST(MetaAutomaticFailoverStateMachineTest,
-     DisabledAndServiceableInputsDiscardSuspectTime) {
+     ServiceableInputDiscardsSuspectTime) {
   MetaAutomaticFailoverStateMachine machine;
-  auto disabled = UnserviceableInput();
-  disabled.automatic_failover_enabled_ = false;
-  auto disabled_update = machine.Advance(disabled, 10'000);
-  ASSERT_TRUE(disabled_update.ok()) << disabled_update.status();
-  EXPECT_EQ(disabled_update->status_.state_,
-            MetaAutomaticFailoverState::kDisabled);
-  EXPECT_EQ(disabled_update->status_.accumulated_suspect_ms_, 0u);
-
-  auto enabled = machine.Advance(UnserviceableInput(), 20'000);
-  ASSERT_TRUE(enabled.ok()) << enabled.status();
-  EXPECT_EQ(enabled->status_.state_, MetaAutomaticFailoverState::kSuspect);
-  EXPECT_EQ(enabled->status_.accumulated_suspect_ms_, 0u);
+  auto initial = machine.Advance(UnserviceableInput(), 20'000);
+  ASSERT_TRUE(initial.ok()) << initial.status();
+  EXPECT_EQ(initial->status_.state_, MetaAutomaticFailoverState::kSuspect);
+  EXPECT_EQ(initial->status_.accumulated_suspect_ms_, 0u);
 
   auto partial = machine.Advance(UnserviceableInput(), 20'900);
   ASSERT_TRUE(partial.ok()) << partial.status();
@@ -513,9 +504,6 @@ TEST(MetaAutomaticFailoverStateMachineTest,
 }
 
 TEST(MetaAutomaticFailoverStateMachineTest, DiagnosticCodesAreStable) {
-  EXPECT_EQ(
-      MetaAutomaticFailoverStateName(MetaAutomaticFailoverState::kDisabled),
-      "disabled");
   EXPECT_EQ(
       MetaAutomaticFailoverStateName(MetaAutomaticFailoverState::kHealthy),
       "healthy");

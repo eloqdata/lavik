@@ -343,7 +343,7 @@ def meta_manifest_lines(metas):
 
 
 def write_manifest(path, metas, data_nodes, *,
-                   automatic_uncontrolled_failover_enabled=None):
+                   automatic_uncontrolled_failover_suspect_after_ms=None):
     by_id = {node.node_id: node for node in data_nodes}
     replicas = sorted(node_id for node_id in by_id if node_id != OWNER)
     replica_list = ", ".join(f'"{node_id}"' for node_id in replicas)
@@ -367,12 +367,11 @@ def write_manifest(path, metas, data_nodes, *,
         f'group = "{GROUP}"',
         "",
     ])
-    if automatic_uncontrolled_failover_enabled is not None:
-        enabled = ("true" if automatic_uncontrolled_failover_enabled
-                   else "false")
+    if automatic_uncontrolled_failover_suspect_after_ms is not None:
         lines.extend([
             "[bootstrap_policy]",
-            f"automatic_uncontrolled_failover_enabled = {enabled}",
+            "automatic_uncontrolled_failover_suspect_after_ms = "
+            f"{automatic_uncontrolled_failover_suspect_after_ms}",
             "",
         ])
     with open(path, "w", encoding="utf-8") as output:
@@ -956,19 +955,18 @@ class FailoverFixture:
         raise H.Failure("getop exhausted its global deadline")
 
     def start_created(self, add_follower=True, *,
-                      automatic_uncontrolled_failover_enabled=False):
+                      automatic_uncontrolled_failover_suspect_after_ms=600_000):
         # Keep this failover gate independent of #40's explicit Genesis
         # replica-initialization operation. Once the Owner-only topology is
         # Created, both replicas enter through the production steady
         # FollowOwner path that failover also relies on after cutover.
-        # Disable automatic failover during that deliberately serial topology
-        # construction. The controlled #41 gates must not be preempted by an
-        # unrelated detector decision, while the automatic gate explicitly
-        # enables its short test Policy only after all replicas are current.
+        # Allow the deliberately serial topology setup and controlled-failover
+        # fault cuts to finish within a finite, long suspicion interval. Gates
+        # for automatic detection install their short threshold once READY.
         write_manifest(
             self.manifest, self.metas, self.data_nodes[:1],
-            automatic_uncontrolled_failover_enabled=
-            automatic_uncontrolled_failover_enabled)
+            automatic_uncontrolled_failover_suspect_after_ms=
+            automatic_uncontrolled_failover_suspect_after_ms)
         for proxy in self.control_proxies:
             proxy.start()
         for meta in self.metas:

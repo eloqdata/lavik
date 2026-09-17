@@ -114,9 +114,7 @@ Plan Abort(const MetaOperationRecord& operation, std::string reason) {
 std::string AutomaticFailoverPolicyContent(
     const ClusterCreateManifestV1& manifest) {
   return absl::StrCat(
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":)",
-      manifest.automatic_uncontrolled_failover_enabled_ ? "true" : "false",
-      R"(,"suspect_after_ms":)",
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":)",
       manifest.automatic_uncontrolled_failover_suspect_after_ms_, "}");
 }
 

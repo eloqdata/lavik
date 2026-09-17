@@ -439,7 +439,7 @@ TEST_F(MetaStateMachineTest,
       std::string(lavik::meta::kAutomaticUncontrolledFailoverPolicyId);
   automatic.version_ = 1;
   automatic.content_ =
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})";
 
   lavik::meta::CompleteOperation complete;
   complete.request_id_ = MakeRequestId(0x04);
@@ -558,7 +558,7 @@ TEST_F(MetaStateMachineTest,
       std::string(lavik::meta::kAutomaticUncontrolledFailoverPolicyId);
   automatic.version_ = 1;
   automatic.content_ =
-      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})";
   Commit(*machine, 2, automatic);
 
   lavik::meta::PutPolicy policy;
