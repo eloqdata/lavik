@@ -100,6 +100,15 @@ The downloadable release archive below includes all three executables.
 
 ### Experimental DPDK networking
 
+On Ubuntu, SPDK's RPC header generator requires `python3-jinja2` and
+`python3-tabulate` in addition to the native build dependencies. Install them
+explicitly; a preconfigured developer machine or CI image may already have
+them, but a clean machine need not:
+
+```bash
+sudo apt-get install -y python3-jinja2 python3-tabulate
+```
+
 The pinned Bycorf includes an optional FreeBSD/DPDK IPv4 TCP backend for
 AArch64 and x86-64. The default network backend remains Linux TCP/io_uring.
 Initialize the required dependencies explicitly; SPDK uses Bycorf's direct DPDK
