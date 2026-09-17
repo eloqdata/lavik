@@ -4072,6 +4072,20 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
     waited = co_await WaitDone(worker, second_control,
                                "second steady export cleanup");
     if (!waited.ok()) co_return waited;
+    // Both probes have ended without an online downstream. Let the standalone
+    // idle-history monitor's 10 ms tick run: Meta still owns this population
+    // and its advertised history even while no replica is connected.
+    waited = co_await bycorf::SleepFor(worker, 50ms);
+    if (!waited.ok()) co_return waited;
+    const auto retained_history =
+        co_await replication_->CaptureNativeReplicationWatermark();
+    const auto retained_identity = co_await replication_->ObserveIdentity();
+    if (!retained_history.ok() || !retained_history->has_value() ||
+        (*retained_history)->history_id_ != (*watermark)->history_id_ ||
+        retained_identity.local_history_id_ != (*watermark)->history_id_) {
+      co_return TestFailure(
+          "idle source cleanup retired Meta's owned replication history");
+    }
     const lavik::ClusterPopulationStatus population =
         co_await replication_->cluster_population_status();
     if (population.state_ != lavik::ReplicationGroupState::kReady ||

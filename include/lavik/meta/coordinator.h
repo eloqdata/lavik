@@ -349,6 +349,9 @@ class MetaLeaderContext {
  public:
   bycorf::Task<absl::StatusOr<MetaApplyResult>> Propose(MetaCommand command);
   MetaCommittedView CommittedView();
+  // O(1) applied cursor, including Raft configurations without commit events.
+  // A changed cursor requires a fresh CommittedView before publishing a cut.
+  std::uint64_t AppliedIndex() const;
   MetaSubscriptionStart SubscribeCommitted(MetaCommitCallback callback,
                                            std::size_t queue_capacity = 0);
   const MetaObservationStore& Observations() const;
@@ -463,6 +466,11 @@ class MetaCoordinator {
 
   // One atomic read of the committed aggregate (see MetaCommittedView).
   MetaCommittedView CommittedView();
+
+  // O(1) full applied cursor, including configuration commits that do not
+  // change MetaStores or notify subscribers. This is a freshness hint, not
+  // an atomic pairing with a separately captured store snapshot.
+  std::uint64_t AppliedIndex() const;
 
   // O(1) MetaStores-change watermark published synchronously by command apply
   // and snapshot install. Unlike last_commit_index this excludes Raft

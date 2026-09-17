@@ -125,6 +125,7 @@ class DataProcess:
             "--port", str(self.redis_port),
             "--metrics-port", str(self.metrics_port),
             "--threads", str(self.workers),
+            "--no-pin-workers",
             "--recv-buffers-per-worker", "0",
             "--registered-buffer-mb-per-worker", "64",
             "--repl-backlog-size", f"{8 * self.workers}mb",

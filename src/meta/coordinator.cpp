@@ -969,6 +969,10 @@ MetaCommittedView MetaCoordinator::CommittedView() {
   return MetaCommittedView(std::move(stores), applied_index);
 }
 
+std::uint64_t MetaCoordinator::AppliedIndex() const {
+  return state_machine_.last_commit_index();
+}
+
 std::uint64_t MetaCoordinator::CommittedHighWater() const {
   return state_machine_.state_change_index();
 }
@@ -1441,6 +1445,10 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaLeaderContext::Propose(
 
 MetaCommittedView MetaLeaderContext::CommittedView() {
   return coordinator_->CommittedView();
+}
+
+std::uint64_t MetaLeaderContext::AppliedIndex() const {
+  return coordinator_->AppliedIndex();
 }
 
 MetaSubscriptionStart MetaLeaderContext::SubscribeCommitted(

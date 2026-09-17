@@ -22,7 +22,11 @@ streams, plus the generic `SORT` suite. The upstream snapshot is Valkey commit
 `d2c8a4b91e8c0e6aefd1f5bc0bf582cddbe046b7`, which reports Redis compatibility
 version 7.2.4; its BSD license is in `COPYING`.
 
-The test cases are copied unchanged. The harness has Lavik-specific changes:
+The test cases retain the upstream assertions, with two portability adaptations:
+the Hash ziplist fixtures compare named field/value pairs without depending on
+`HGETALL` order, and the blocked-move WATCH fixture reads the EXEC result before
+unblocking the move from another connection. The latter makes command ordering
+explicit across Lavik's workers. The harness has Lavik-specific changes:
 it limits the default suite list to the vendored data-structure files,
 external-server cleanup tolerates unavailable housekeeping commands,
 Valkey-only object-encoding configuration is emulated inside the harness, and

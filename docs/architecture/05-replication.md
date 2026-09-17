@@ -53,6 +53,12 @@ Without that proof, automatic eligibility requires whole-group full sync.
 Every boot creates a new boot ID, history ID, and replica incarnation; neither
 native continuation nor Redis replid/offset state resumes across restart.
 
+In Meta-managed mode the source history belongs to the population lifecycle,
+including intervals before the first replica connects or after all replicas
+disconnect. Protocol probes and idle-consumer cleanup cannot change that
+identity; explicit role or population transitions drain and retire it. Its
+in-memory backlog remains bounded by the configured retention budget.
+
 ## Population recovery
 
 Completed Bootstrap and replica FULL populations commit their Group/member

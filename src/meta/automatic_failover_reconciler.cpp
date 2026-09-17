@@ -821,7 +821,12 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
 
   while (!core->cancelled_) {
     if (subscribed.subscription_->needs_resync()) subscribed = subscribe();
-    if (changed->exchange(false, std::memory_order_acq_rel)) {
+    // Raft configuration commits advance the status cut without notifying
+    // Meta command subscribers. In particular, a new leader's configuration
+    // must not leave diagnostics permanently behind until another command.
+    // Check the cheap cursor each poll; copy stores only when it advances.
+    if (changed->exchange(false, std::memory_order_acq_rel) ||
+        subscribed.view_.applied_index() != context->AppliedIndex()) {
       subscribed.view_ = context->CommittedView();
     }
     const std::uint64_t now_steady = core->options_.now_steady_ms_();

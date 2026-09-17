@@ -364,6 +364,11 @@ at a time. Packed-node decoding first validates and measures its entries
 without allocating their vectors, then admits the decoded node and validation
 scratch. Individual strings, including packed nodes, retain their size bound.
 
+File import owns an open descriptor and bounded read scratch for checksum
+validation and object decoding. Saved input positions can be reread without
+retaining prior file buffers. The source file remains immutable until import
+finishes; RESTORE borrows its retained request payload instead.
+
 The complete validation pass precedes destructive file replacement or changing
 a RESTORE destination. Duplicate Hash fields and Set/Sorted Set members are
 checked across pages using admitted digest-to-input-position metadata; digest

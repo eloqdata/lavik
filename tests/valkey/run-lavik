@@ -59,7 +59,7 @@ truncate -s "${LAVIK_TEST_DATA_SIZE:-8G}" "$DATA_FILE"
     --threads "${LAVIK_TEST_THREADS:-2}" \
     --no-pin-workers \
     --recv-buffers-per-worker "${LAVIK_TEST_RECV_BUFFERS:-0}" \
-    --registered-buffer-mb-per-worker "${LAVIK_TEST_BUFFER_MB:-256}" \
+    --registered-buffer-mb-per-worker "${LAVIK_TEST_BUFFER_MB:-64}" \
     --replication-publish-queue-mb-per-worker "${LAVIK_TEST_REPLICATION_QUEUE_MB:-8}" \
     --max-memory "${LAVIK_TEST_MAX_MEMORY:-2147483648}" \
     --data-file "$DATA_FILE" >"$LOG_FILE" 2>&1 &

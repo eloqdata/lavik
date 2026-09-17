@@ -719,6 +719,7 @@ class ServerProcess {
           std::to_string(port),
           "--threads",
           std::to_string(threads),
+          "--no-pin-workers",
           "--recv-buffers-per-worker",
           std::move(recv_buffers),
           "--max-memory",

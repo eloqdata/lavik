@@ -114,8 +114,10 @@ operator --> lavik-ctl cluster-status / failover / getop
 
 1. `main` loads an optional Redis-style config file, applies CLI overrides,
    validates the combined options, and initializes logging.
-2. `RunServer` initializes the memory budget, signal handling, storage engine,
-   replication manager, cluster topology/authority/node-controller runtime,
+2. `RunServer` selects Bycorf's process-wide I/O backends before storage probing,
+   buffer allocation, or worker startup freezes the selection. It then
+   initializes the memory budget, signal handling, storage engine, replication
+   manager, cluster topology/authority/node-controller runtime,
    command/storage bindings, metrics shards, transaction runtime, and Bycorf
    service graph. Cluster mode always starts the outbound Meta control client
    fenced; no topology or positive authority is restored locally.

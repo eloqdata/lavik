@@ -1,0 +1,121 @@
+# Copyright (C) 2026 EloqData Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: clang-format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install pre-commit
+        run: python -m pip install pre-commit
+      # The hook owns the exact clang-format version for both local and CI use.
+      - name: Check all maintained sources
+        run: pre-commit run clang-format --all-files --show-diff-on-failure
+
+  test:
+    name: Tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Initialize runtime dependencies
+        # Public submodules use the exact gitlinks from the tested commit.
+        # SPDK and its transitive dependencies are only needed by hardware builds.
+        run: |
+          git submodule update --init --depth 1 bycorf third_party/mimalloc third_party/nuraft
+          git -C bycorf submodule update --init --depth 1 third_party/abseil third_party/liburing
+          git -C third_party/nuraft submodule update --init --depth 1 asio
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang-18 cmake ninja-build libssl-dev openssl python3 \
+            redis-server redis-tools tcl
+      - name: Prepare test host
+        run: |
+          sudo sysctl -w kernel.io_uring_disabled=0
+          # Large-collection fixtures create private regular files here.
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/dev
+      - name: Configure
+        # Debug enables the Meta fault hooks as well as the Data crash tests.
+        run: |
+          cmake -S . -B build_ci -G Ninja \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DLAVIK_ENABLE_OPT=OFF \
+            -DLAVIK_STATIC_OPENSSL=ON \
+            -DLAVIK_BUILD_META=ON \
+            -DLAVIK_BUILD_FAULT_SERVER=ON \
+            -DBUILD_TESTING=ON
+      - name: Build all targets
+        run: cmake --build build_ci --parallel "$(nproc)"
+      - name: Run all software tests
+        run: |
+          # Registered io_uring buffers must not depend on the runner's memlock limit.
+          sudo prlimit --pid "$$" --memlock=unlimited
+          ./scripts/run_ci_tests.sh build_ci
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ matrix.arch }}
+          path: |
+            build_ci/test-results/
+            build_ci/Testing/Temporary/
+            build_ci/meta-integration/**/*.log
+            build_ci/meta-integration/**/*.json
+            /mnt/dev/lavik-*.log
+            /tmp/lavik-*/**/*.log
+            /tmp/cluster_create_*/**/*.log
+            /tmp/meta_*/**/*.log
+            /tmp/lavik-*.log
+          if-no-files-found: ignore
+          retention-days: 7

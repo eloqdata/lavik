@@ -37,6 +37,7 @@
 #include "absl/strings/str_cat.h"
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/worker.h"
+#include "spdlog/spdlog.h"
 
 namespace lavik::cluster {
 namespace {
@@ -1615,6 +1616,11 @@ bycorf::Task<absl::Status> NodeControlInstaller::FinishExpiredLeaseTransition(
   InvalidateDirectiveAdmissions();
   const bool expired = authority_.ExpireLease(
       schedule->session_, schedule->anchor_, schedule->deadline_, now);
+  if (expired) {
+    spdlog::warn(
+        "cluster lease expired for group {}; suspending new source admission",
+        schedule->anchor_.group_id_);
+  }
   schedule->active_ = false;
   const auto installed =
       lease_expiry_schedules_.find(schedule->anchor_.group_id_);

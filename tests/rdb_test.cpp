@@ -18,10 +18,12 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -76,9 +78,20 @@ std::string Dump(std::string object, std::uint16_t version = 11) {
   return object;
 }
 
+std::string RdbLength(std::uint32_t length) {
+  if (length < 64) return std::string(1, static_cast<char>(length));
+  if (length < 16384) {
+    return {static_cast<char>(0x40 | (length >> 8)), static_cast<char>(length)};
+  }
+  std::string result(1, static_cast<char>(0x80));
+  for (unsigned byte = 0; byte < 4; ++byte)
+    result.push_back(static_cast<char>(length >> (24 - byte * 8)));
+  return result;
+}
+
 std::string RdbString(std::string_view value) {
-  EXPECT_LT(value.size(), 64);
-  std::string result(1, static_cast<char>(value.size()));
+  EXPECT_LE(value.size(), UINT32_MAX);
+  std::string result = RdbLength(static_cast<std::uint32_t>(value.size()));
   result.append(value);
   return result;
 }
@@ -236,6 +249,137 @@ TEST(RdbTest, ReadsCompleteFilesVersionsOneThroughEleven) {
     auto eof = reader->Next();
     ASSERT_TRUE(eof.ok()) << eof.status();
     EXPECT_FALSE(eof->has_value());
+  }
+}
+
+TEST(RdbTest, ReadsAcrossFileBuffersAndRewindsAfterMoveAndUnlink) {
+  // Place the expiration across the 1 MiB read boundary, followed by a value
+  // spanning several buffers. Values contain binary data, not just padding.
+  std::string value(2 * 1024 * 1024 + 37, '\0');
+  for (std::size_t i = 0; i < value.size(); ++i)
+    value[i] = static_cast<char>(i % 251);
+  const std::string padding(1024 * 1024 - 21, 'p');
+  std::string body = Hex("00") + RdbString("pad") + RdbString(padding);
+  ASSERT_EQ(body.size() + 9, 1024 * 1024 - 2);
+  body.push_back(static_cast<char>(0xfc));
+  PutLe64(&body, 4'102'444'800'123ULL);
+  body += Hex("00") + RdbString("large") + RdbString(value);
+  body += Hex("00") + RdbString("integer") + Hex("c2ffffff7f");
+  for (unsigned version : {4, 11}) {
+    TempFile file(RdbFile(body, version));
+    auto opened = FileReader::Open(file.path());
+    ASSERT_TRUE(opened.ok()) << opened.status();
+    FileReader reader(std::move(*opened));
+    ASSERT_EQ(::unlink(file.path().c_str()), 0);
+    for (unsigned pass = 0; pass < 2; ++pass) {
+      auto first = reader.Next();
+      ASSERT_TRUE(first.ok()) << first.status();
+      ASSERT_TRUE(first->has_value());
+      EXPECT_EQ((**first).value_.encoded_, padding);
+      auto large = reader.Next();
+      ASSERT_TRUE(large.ok()) << large.status();
+      ASSERT_TRUE(large->has_value());
+      EXPECT_EQ((**large).key_, "large");
+      EXPECT_EQ((**large).value_.encoded_, value);
+      EXPECT_EQ((**large).value_.expire_at_ms_, 4'102'444'800'123ULL);
+      auto integer = reader.Next();
+      ASSERT_TRUE(integer.ok()) << integer.status();
+      ASSERT_TRUE(integer->has_value());
+      EXPECT_EQ((**integer).value_.encoded_, "2147483647");
+      auto end = reader.Next();
+      ASSERT_TRUE(end.ok()) << end.status();
+      EXPECT_FALSE(end->has_value());
+      reader.Rewind();
+    }
+  }
+}
+
+TEST(RdbTest, ChecksEveryFileBufferAndAcceptsDisabledChecksum) {
+  // The checksum itself straddles a buffer boundary.
+  constexpr std::size_t value_bytes = 2 * 1024 * 1024 - 26;
+  std::string contents = RdbFile(
+      Hex("00") + RdbString("large") + RdbString(std::string(value_bytes, 'x')),
+      11);
+  ASSERT_EQ(contents.size() - 8, 2 * 1024 * 1024 - 4);
+  for (std::size_t at : {std::size_t{1024 * 1024 - 1}, std::size_t{1024 * 1024},
+                         contents.size() - 10}) {
+    contents[at] ^= 1;
+    {
+      TempFile file(contents);
+      auto reader = FileReader::Open(file.path());
+      ASSERT_FALSE(reader.ok());
+      EXPECT_EQ(reader.status().message(), "RDB file checksum is invalid");
+    }
+    contents[at] ^= 1;
+  }
+  std::fill(contents.end() - 8, contents.end(), '\0');
+  TempFile file(contents);
+  auto reader = FileReader::Open(file.path());
+  ASSERT_TRUE(reader.ok()) << reader.status();
+  auto entry = reader->Next();
+  ASSERT_TRUE(entry.ok()) << entry.status();
+  ASSERT_TRUE(entry->has_value());
+  EXPECT_EQ((**entry).value_.encoded_.size(), value_bytes);
+}
+
+TEST(RdbTest, ReportsFileTruncationDuringDecodeUntilRewind) {
+  TempFile file(RdbFile(Hex("00") + RdbString("large") +
+                            RdbString(std::string(2 * 1024 * 1024, 'x')),
+                        11));
+  auto reader = FileReader::Open(file.path());
+  ASSERT_TRUE(reader.ok()) << reader.status();
+  ASSERT_EQ(::truncate(file.path().c_str(), 1024 * 1024 + 5), 0);
+  auto entry = reader->Next();
+  ASSERT_FALSE(entry.ok());
+  EXPECT_NE(entry.status().message().find("truncated while reading"),
+            std::string_view::npos);
+  EXPECT_EQ(reader->NextStreaming().status(), entry.status());
+  reader->Rewind();
+  EXPECT_EQ(reader->Next().status(), entry.status());
+}
+
+TEST(RdbTest, DecodesLzfAcrossFileBuffersWithoutBorrowedInput) {
+  std::string expected(2 * 1024 * 1024 + 37, '\0');
+  for (std::size_t i = 0; i < expected.size(); ++i)
+    expected[i] = static_cast<char>(i % 251);
+  std::string compressed;
+  for (std::size_t at = 0; at < expected.size();) {
+    const auto size = std::min(std::size_t{32}, expected.size() - at);
+    compressed.push_back(static_cast<char>(size - 1));
+    compressed.append(expected, at, size);
+    at += size;
+  }
+  // Exercise both short and extended overlapping back-references as well as
+  // literal spans that cross a refill boundary.
+  compressed += Hex("2000e0ff00");
+  expected.append(3 + 264, expected.back());
+  const auto encoded = Hex("c3") + RdbLength(compressed.size()) +
+                       RdbLength(expected.size()) + compressed;
+  auto memory = DecodeDump(Dump(Hex("00") + encoded));
+  ASSERT_TRUE(memory.ok()) << memory.status();
+  EXPECT_EQ(memory->encoded_, expected);
+  TempFile file(RdbFile(Hex("00") + RdbString("large") + encoded, 11));
+  auto reader = FileReader::Open(file.path());
+  ASSERT_TRUE(reader.ok()) << reader.status();
+  auto entry = reader->Next();
+  ASSERT_TRUE(entry.ok()) << entry.status();
+  ASSERT_TRUE(entry->has_value());
+  EXPECT_EQ((**entry).value_.encoded_, expected);
+}
+
+TEST(RdbTest, LzfCannotReadPastItsDeclaredCompressedLength) {
+  for (const auto compressed :
+       {Hex("0061e0"), Hex("0061e0ff"), Hex("2000"), Hex("026162")}) {
+    const auto encoded =
+        Hex("c3") + RdbLength(compressed.size()) + RdbLength(10) + compressed;
+    EXPECT_FALSE(DecodeDump(Dump(Hex("00") + encoded)).ok());
+    // Bytes belonging to the next key must not complete a truncated token.
+    TempFile file(RdbFile(Hex("00") + RdbString("bad") + encoded + Hex("00") +
+                              RdbString("next") + RdbString("v"),
+                          11));
+    auto reader = FileReader::Open(file.path());
+    ASSERT_TRUE(reader.ok()) << reader.status();
+    EXPECT_FALSE(reader->Next().ok());
   }
 }
 

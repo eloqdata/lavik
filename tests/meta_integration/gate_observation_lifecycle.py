@@ -153,9 +153,21 @@ def main():
             leader.obs_candidate(DATA_NODE, BOOT_A, 2, GROUP,
                                  term=1, manifest=0, history=7),
             "candidate from previous term", "term-mismatch")
-        audit = leader.obsaudit()
-        if "detail=commit-stale:term-mismatch" not in audit:
-            raise H.Failure(f"term advancement did not audit purge: {audit}")
+        # Queries and admission reject the old term against committed facts
+        # immediately. The dispatch thread separately purges the retained
+        # candidate, so the commit reply need not include its audit record yet.
+        audit = ""
+
+        def stale_candidate_purged():
+            nonlocal audit
+            audit = leader.obsaudit()
+            return "detail=commit-stale:term-mismatch" in audit
+
+        try:
+            H.wait_until("stale candidate purged and audited", 10,
+                         stale_candidate_purged)
+        except H.Failure as error:
+            raise H.Failure(f"{error}; obsaudit={audit}") from error
         expect_ok(
             leader.obs_candidate(DATA_NODE, BOOT_A, 2, GROUP,
                                  term=2, manifest=0, history=7),

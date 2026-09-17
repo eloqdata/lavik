@@ -46,6 +46,17 @@ GROUPS = {
 TRANSIENT_SELF_FENCE = "CLUSTERDOWN Hash slot not served"
 
 
+def creation_raft_args():
+    """Keep the initial authority handoff inside the source retry budget."""
+    # The election lower bound D also requires a 2D first-grant quarantine.
+    # At D=2s that quarantine outlasts the target's three one-second retries.
+    # D=500ms leaves room for heartbeat delivery and hosted-runner scheduling.
+    # Later lease expiry only suspends new admission: already-published
+    # POPULATION sessions survive slow Debug snapshot/TLS work.
+    return H.raft_args(snapshot_distance=100_000,
+                       election_ms_low=500, election_ms_high=1000)
+
+
 def meta_manifest_lines(*metas):
     lines = []
     for meta in sorted(metas, key=lambda node: node.id):
@@ -91,9 +102,13 @@ def command(environment, arguments, input_text=None, timeout=90, expected=0):
 
 
 def cluster_status(meta, admin=None):
+    # These fixtures publish loopback TCP endpoints. A UDS seed can become a
+    # follower during creation, so authorize the CLI to follow its leader.
+    # Explicit transport/TLS cases keep their own admin arguments.
     result = subprocess.run(
         [CTL, "cluster-status", "--json"] +
-        (admin if admin is not None else ["--socket", meta.ctl_path]),
+        (admin if admin is not None else
+         ["--socket", meta.ctl_path, "--allow-plaintext-admin"]),
         capture_output=True, text=True, timeout=5)
     if result.returncode not in (0, 2):
         raise H.Failure(f"cluster-status failed: {result}")
@@ -671,6 +686,12 @@ def run_manifest_bootstrapped_multi_meta_case(workdir, count, late_voter):
                 len(status["meta_members"]) != count):
             raise H.Failure(
                 f"{count}-Meta Cluster Create is not READY: {status}")
+        # Exercise leader discovery even when this run had no incidental
+        # election: a follower's UDS must reach the same ready cluster.
+        current_leader = H.find_leader(metas)
+        follower = next(meta for meta in metas if meta is not current_leader)
+        wait_cluster_ready(
+            follower, f"{count}-Meta follower seed discovers READY", 20)
         if count == 3:
             post_create_joiner = H.Node(
                 META, meta_workdir, count + 1,
@@ -1147,7 +1168,7 @@ def run_multi_group_case(workdir, automatic, interactive,
     meta_workdir = os.path.join(scenario, "meta")
     os.makedirs(meta_workdir, mode=0o700)
     meta = H.Node(META, meta_workdir, 1,
-                  args=H.raft_args(snapshot_distance=100_000))
+                  args=creation_raft_args())
     # Hold target rebuilds after source initialization so snapshots contain
     # real data. The advertised proxy also captures reconnects and redirects.
     proxy = (DirectiveBarrier(meta.data_control_port,
@@ -1386,7 +1407,7 @@ def run_tls_create_case(workdir, tls_only):
     operator_cert, operator_key = make_leaf(
         certdir, ca, ca_key, "operator", "lavik://operator/create-test")
     meta = H.Node(META, scenario, 1, args=(
-        H.raft_args(snapshot_distance=100_000) +
+        creation_raft_args() +
         H.tls_args(ca, meta_cert, meta_key) +
         ["--ctl-tls-ca", ca, "--ctl-tls-cert", meta_cert,
          "--ctl-tls-key", meta_key]))
@@ -1428,13 +1449,21 @@ def run_tls_create_case(workdir, tls_only):
         # population/replication outcome so missing TLS ports cannot pass.
         wait_cluster_ready(meta, f"{name} reaches READY", 30, admin=admin)
         primary, replica = nodes
+        # Created installs the steady FollowOwner task after the initial
+        # population directive. Replacing that ingress may require another
+        # full sync (an empty history's 1:0 cursor cannot CONTINUE), including
+        # all 16,384 partition boundaries. Debug TLS on hosted runners can
+        # take more than 10 seconds. Bound the entire post-create convergence
+        # phase while still requiring every write to reach the replica.
+        replication_deadline = time.monotonic() + 60
         for ordinal in range(3):
             key, value = f"tls-create-{ordinal}", f"replicated-{ordinal}"
             if redis_call(primary, ["SET", key, value]) != "OK":
                 raise H.Failure(f"{name} primary write failed")
             if redis_call(primary, ["GET", key]) != value:
                 raise H.Failure(f"{name} primary read failed")
-            H.wait_until(f"{name} replica receives {key}", 10,
+            H.wait_until(f"{name} replica receives {key}",
+                         max(0, replication_deadline - time.monotonic()),
                          lambda: readonly_get(replica, key) == value)
         H.log(f"{name}: mTLS Admin, Data control and replication reached READY")
         for node in nodes:

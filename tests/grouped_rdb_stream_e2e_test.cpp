@@ -683,6 +683,11 @@ TEST(GroupedRdbStreamE2e,
   constexpr std::uint64_t count = 140000;
   constexpr std::size_t member_bytes = 8192;
   static_assert(count * member_bytes > 1024ULL * 1024 * 1024);
+  // One worker owns this entire key. Its admission share must cover old and
+  // new undo receipts while they are merged during atomic import. Leave room
+  // for that transient peak while keeping the process budget below the value
+  // size; fixed I/O buffers have a separate budget.
+  constexpr std::string_view max_memory = "640M";
   PrivateDisk disk(4ULL * 1024 * 1024 * 1024, "/mnt/dev");
   // A failed multi-minute run must retain its only recovery/timeout evidence.
   // Successful runs still remove all private artifacts.
@@ -726,11 +731,11 @@ TEST(GroupedRdbStreamE2e,
     ASSERT_TRUE(writer->Finish().ok());
   }
   {
-    Server imported(disk, 2, {}, {}, false, 2, "512M", input);
+    Server imported(disk, 2, {}, {}, false, 2, max_memory, input);
     imported.PreserveOnFailure();
     const auto deadline = std::chrono::steady_clock::now() + 10min;
     while (imported.Log().find("loaded RDB file") == std::string::npos &&
-           std::chrono::steady_clock::now() < deadline)
+           imported.Running() && std::chrono::steady_clock::now() < deadline)
       std::this_thread::sleep_for(250ms);
     ASSERT_NE(imported.Log().find("loaded RDB file"), std::string::npos)
         << imported.Log();
@@ -743,7 +748,7 @@ TEST(GroupedRdbStreamE2e,
     ASSERT_EQ(client.Command({"BGSAVE"}).kind_, '+');
     const auto saved = std::chrono::steady_clock::now() + 10min;
     while (imported.Log().find("RDB backup completed:") == std::string::npos &&
-           std::chrono::steady_clock::now() < saved)
+           imported.Running() && std::chrono::steady_clock::now() < saved)
       std::this_thread::sleep_for(250ms);
     ASSERT_NE(imported.Log().find("RDB backup completed:"), std::string::npos)
         << imported.Log();
@@ -777,7 +782,7 @@ TEST(GroupedRdbStreamE2e,
     } import_log{imported, disk.path()};
     ASSERT_EQ(imported.Wait(true, 120s), 0) << imported.Log();
   }
-  Server recovered(disk, 3, {}, {}, false, 2, "512M");
+  Server recovered(disk, 3, {}, {}, false, 2, max_memory);
   recovered.PreserveOnFailure();
   // Rebuilding hundreds of thousands of physical records can outlast the
   // generic client's 20-second connection deadline. Observe actual recovery
@@ -785,6 +790,7 @@ TEST(GroupedRdbStreamE2e,
   const auto recovered_deadline = std::chrono::steady_clock::now() + 120s;
   while (recovered.Log().find("direct-IO storage initialized") ==
              std::string::npos &&
+         recovered.Running() &&
          std::chrono::steady_clock::now() < recovered_deadline)
     std::this_thread::sleep_for(250ms);
   ASSERT_NE(recovered.Log().find("direct-IO storage initialized"),

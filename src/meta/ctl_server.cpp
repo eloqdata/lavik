@@ -2242,8 +2242,8 @@ bool ParseServerId(const std::string& text, int& out) {
 }
 
 // Committed-mutation verbs: everything that proposes onto the raft log.
-// Split from DispatchCommand so the caller can run the observation
-// revalidation pass once per successful commit (see DispatchCommand).
+// Observation revalidation is scheduled by the coordinator's commit callback
+// on its dispatch thread, independently of this command's response.
 bycorf::Task<std::string> DispatchMutationVerb(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,

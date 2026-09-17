@@ -267,6 +267,7 @@ class ServerProcess {
           std::to_string(metrics_port),
           "--threads",
           std::to_string(workers),
+          "--no-pin-workers",
           "--recv-buffers-per-worker",
           "0",
           "--max-memory",

@@ -27,8 +27,9 @@
 //   2. Core-driven integration: a single-node raft_server running on the
 //      real adapters (NuraftStateMgr + WAL v1 NuraftLogStore +
 //      MetaStateMachine) proves the persistence ordering the Raft core
-//      relies on and replay-based recovery after restart. These two tests
-//      use the production state machine with real commands.
+//      relies on, replay-based recovery after restart, and clean shutdown
+//      across changes to peer commit tracking. These integration tests use
+//      the production state machine with real commands.
 //
 // ACTOR ON THE WIRE: the command codec encodes the trusted-entry-injected
 // ActorContext (actor_principal, readable_time) as ordinary bounded fields of
@@ -46,6 +47,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1057,7 +1059,8 @@ class MetaServerIntegrationTest : public ::testing::Test {
     machine_ = nuraft::ptr<MetaStateMachine>(std::move(*machine));
   }
 
-  void LaunchServer(int snapshot_distance, bool elect_leader = true) {
+  void LaunchServer(int snapshot_distance, bool elect_leader = true,
+                    bool disable_peer_tracking_on_leadership = false) {
     scheduler_ = nuraft::cs_new<ThreadScheduler>();
 
     nuraft::raft_params params;
@@ -1067,12 +1070,32 @@ class MetaServerIntegrationTest : public ::testing::Test {
     params.with_snapshot_enabled(snapshot_distance);
     params.with_reserved_log_items(0);
     params.with_client_req_timeout(5000);
+    params.track_peers_sm_commit_idx_ = disable_peer_tracking_on_leadership;
+    params.wait_for_sm_catchup_on_becoming_leader_ =
+        disable_peer_tracking_on_leadership;
 
     nuraft::context* ctx = new nuraft::context(
         mgr_, machine_, /*listener=*/nullptr, /*logger=*/nullptr,
         nuraft::cs_new<NullRpcClientFactory>(), scheduler_, params);
     nuraft::raft_server::init_options options;
     options.skip_initial_election_timeout_ = !elect_leader;
+    if (disable_peer_tracking_on_leadership) {
+      // Production's creation reconciler switches a caught-up leader from
+      // all-peer confirmation to majority completion. Do it synchronously at
+      // the role callback to leave a pending notifier target deterministically,
+      // before the commit thread has scanned it. Context replacement is the
+      // thread-safe parameter publication used by raft_server::update_params.
+      options.raft_callback_ = [ctx](nuraft::cb_func::Type type,
+                                     nuraft::cb_func::Param*) {
+        if (type == nuraft::cb_func::BecomeLeader) {
+          auto updated =
+              nuraft::cs_new<nuraft::raft_params>(*ctx->get_params());
+          updated->track_peers_sm_commit_idx_ = false;
+          ctx->set_params(updated);
+        }
+        return nuraft::cb_func::Ok;
+      };
+    }
     server_ = nuraft::cs_new<nuraft::raft_server>(ctx, options);
     if (elect_leader) {
       ASSERT_TRUE(WaitFor([this] { return server_->is_leader(); },
@@ -1131,6 +1154,38 @@ class MetaServerIntegrationTest : public ::testing::Test {
   nuraft::ptr<ThreadScheduler> scheduler_;
   nuraft::ptr<nuraft::raft_server> server_;
 };
+
+TEST_F(MetaServerIntegrationTest,
+       DisablingPeerCommitTrackingDoesNotStrandShutdown) {
+  StartServer(/*snapshot_distance=*/0);
+  AppendAndWait(MakeRegister(0x10));
+  StopServer();
+  OpenStorage();
+  ASSERT_NO_FATAL_FAILURE(LaunchServer(
+      /*snapshot_distance=*/0, /*elect_leader=*/true,
+      /*disable_peer_tracking_on_leadership=*/true));
+  ASSERT_TRUE(WaitFor(
+      [this] {
+        return !server_->get_current_params().track_peers_sm_commit_idx_;
+      },
+      std::chrono::seconds(5)));
+  AppendAndWait(MakeRegister(0x11));
+
+  auto shutdown =
+      std::async(std::launch::async, [this] { server_->shutdown(); });
+  const auto stopped = shutdown.wait_for(std::chrono::seconds(2));
+  if (stopped != std::future_status::ready) {
+    // Unstick the old implementation so failure is an assertion, not a hung
+    // test process: re-enabling tracking lets it retire its stale target and
+    // reach the stop check. The production fix must not need this transition.
+    auto params = server_->get_current_params();
+    params.track_peers_sm_commit_idx_ = true;
+    server_->update_params(params);
+  }
+  shutdown.get();
+  server_.reset();
+  EXPECT_EQ(stopped, std::future_status::ready);
+}
 
 TEST_F(MetaServerIntegrationTest, CommitThenRestartReplaysLog) {
   StartServer(/*snapshot_distance=*/0);

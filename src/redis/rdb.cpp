@@ -1,13 +1,13 @@
 #include "lavik/rdb.h"
 
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cassert>
 #include <cerrno>
 #include <charconv>
 #include <cmath>
@@ -125,12 +125,113 @@ void PutBe64(std::string* out, std::uint64_t value) {
     out->push_back(static_cast<char>(value >> (56 - 8 * i)));
 }
 
+// All file cursors borrow this one cache. Measurement and duplicate checks
+// retain offsets, never cache views, so revisiting old input cannot pin a
+// growing set of buffers. pread also leaves each copied cursor independent.
+// The file must remain immutable throughout validation and application.
+class FileInput {
+ public:
+  FileInput() = default;
+  FileInput(const FileInput&) = delete;
+  FileInput& operator=(const FileInput&) = delete;
+  ~FileInput() {
+    if (fd_ >= 0) ::close(fd_);
+  }
+
+  absl::Status Open(const std::string& path) {
+    fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd_ < 0) {
+      const int error = errno;
+      const std::string message = absl::StrCat("cannot open RDB file '", path,
+                                               "': ", std::strerror(error));
+      return error == ENOENT ? absl::NotFoundError(message)
+                             : absl::InternalError(message);
+    }
+    struct stat info{};
+    if (::fstat(fd_, &info) != 0) {
+      const int error = errno;
+      return absl::InternalError(absl::StrCat("cannot stat RDB file '", path,
+                                              "': ", std::strerror(error)));
+    }
+    if (!S_ISREG(info.st_mode) || info.st_size <= 0 ||
+        static_cast<std::uintmax_t>(info.st_size) >
+            std::numeric_limits<std::size_t>::max()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "RDB path is not a nonempty regular file: '", path, "'"));
+    }
+    size_ = static_cast<std::size_t>(info.st_size);
+    return absl::OkStatus();
+  }
+
+  std::size_t size() const { return size_; }
+  const absl::Status& status() const { return status_; }
+  void Reset() {
+    cached_bytes_ = 0;
+    status_ = absl::OkStatus();
+  }
+
+  // The returned span is valid only until another offset is requested. No
+  // parser-facing API exposes it; scalar and string reads copy before refill.
+  std::string_view Chunk(std::size_t at) {
+    if (!status_.ok() || at >= size_) return {};
+    if (at < cached_at_ || at - cached_at_ >= cached_bytes_) {
+      cached_at_ = at / buffer_.size() * buffer_.size();
+      cached_bytes_ = 0;
+      const auto bytes = std::min(buffer_.size(), size_ - cached_at_);
+      while (cached_bytes_ < bytes) {
+        const ssize_t count =
+            ::pread(fd_, buffer_.data() + cached_bytes_, bytes - cached_bytes_,
+                    static_cast<off_t>(cached_at_ + cached_bytes_));
+        if (count < 0) {
+          const int error = errno;
+          if (error == EINTR) continue;
+          status_ = absl::InternalError(absl::StrCat(
+              "cannot read RDB file at offset ", cached_at_ + cached_bytes_,
+              ": ", std::strerror(error)));
+          return {};
+        }
+        if (count == 0) {
+          status_ = Bad("RDB file was truncated while reading");
+          return {};
+        }
+        cached_bytes_ += static_cast<std::size_t>(count);
+      }
+    }
+    const auto offset = at - cached_at_;
+    return {buffer_.data() + offset, cached_bytes_ - offset};
+  }
+
+  bool Read(std::size_t at, std::size_t size, char* output) {
+    if (!status_.ok()) return false;
+    while (size != 0) {
+      const auto part = Chunk(at).substr(0, size);
+      if (part.empty()) return false;
+      std::memcpy(output, part.data(), part.size());
+      at += part.size();
+      output += part.size();
+      size -= part.size();
+    }
+    return true;
+  }
+
+ private:
+  int fd_ = -1;
+  std::size_t size_ = 0;
+  // Fixed per-reader I/O scratch, independent of file and value sizes.
+  std::array<char, 1024 * 1024> buffer_;
+  std::size_t cached_at_ = 0;
+  std::size_t cached_bytes_ = 0;
+  absl::Status status_;
+};
+
 class Reader {
  public:
   explicit Reader(std::string_view input) : input_(input) {}
-  std::size_t remaining() const { return input_.size() - at_; }
-  std::size_t position() const { return at_; }
-  bool done() const { return at_ == input_.size(); }
+  explicit Reader(FileInput* file, std::size_t at = 0) : file_(file), at_(at) {}
+  std::size_t remaining() const {
+    return (file_ ? file_->size() : input_.size()) - at_;
+  }
+  bool done() const { return remaining() == 0; }
   bool AccountExpanded(std::uint64_t bytes) {
     if (bytes > storage::kMaxStringBytes - expanded_bytes_) return false;
     expanded_bytes_ += bytes;
@@ -139,27 +240,42 @@ class Reader {
   void ResetExpandedAccounting() { expanded_bytes_ = 0; }
 
   bool Byte(std::uint8_t* value) {
-    if (at_ == input_.size()) return false;
-    *value = static_cast<std::uint8_t>(input_[at_++]);
+    return Read(1, reinterpret_cast<char*>(value));
+  }
+  bool Read(std::size_t size, char* value) {
+    if (size > remaining()) return false;
+    if (file_) {
+      if (!file_->Read(at_, size, value)) return false;
+    } else if (size != 0) {
+      std::memcpy(value, input_.data() + at_, size);
+    }
+    at_ += size;
     return true;
   }
-  bool Bytes(std::size_t size, std::string_view* value) {
+  bool Skip(std::size_t size) {
+    if (size > remaining()) return false;
+    at_ += size;
+    return true;
+  }
+  // Only packed, memory-backed inputs can lend stable views across reads.
+  bool View(std::size_t size, std::string_view* value) {
+    assert(file_ == nullptr);
     if (size > remaining()) return false;
     *value = input_.substr(at_, size);
     at_ += size;
     return true;
   }
   bool Le16(std::uint16_t* value) {
-    std::string_view bytes;
-    if (!Bytes(2, &bytes)) return false;
+    char bytes[2];
+    if (!Read(sizeof(bytes), bytes)) return false;
     *value =
         static_cast<unsigned char>(bytes[0]) |
         (static_cast<std::uint16_t>(static_cast<unsigned char>(bytes[1])) << 8);
     return true;
   }
   bool Le32(std::uint32_t* value) {
-    std::string_view bytes;
-    if (!Bytes(4, &bytes)) return false;
+    char bytes[4];
+    if (!Read(sizeof(bytes), bytes)) return false;
     *value = 0;
     for (unsigned i = 0; i < 4; ++i)
       *value |= static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[i]))
@@ -167,8 +283,8 @@ class Reader {
     return true;
   }
   bool Le64(std::uint64_t* value) {
-    std::string_view bytes;
-    if (!Bytes(8, &bytes)) return false;
+    char bytes[8];
+    if (!Read(sizeof(bytes), bytes)) return false;
     *value = 0;
     for (unsigned i = 0; i < 8; ++i)
       *value |= static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[i]))
@@ -176,15 +292,15 @@ class Reader {
     return true;
   }
   bool Be32(std::uint32_t* value) {
-    std::string_view bytes;
-    if (!Bytes(4, &bytes)) return false;
+    char bytes[4];
+    if (!Read(sizeof(bytes), bytes)) return false;
     *value = 0;
     for (unsigned char byte : bytes) *value = (*value << 8) | byte;
     return true;
   }
   bool Be64(std::uint64_t* value) {
-    std::string_view bytes;
-    if (!Bytes(8, &bytes)) return false;
+    char bytes[8];
+    if (!Read(sizeof(bytes), bytes)) return false;
     *value = 0;
     for (unsigned char byte : bytes) *value = (*value << 8) | byte;
     return true;
@@ -192,6 +308,7 @@ class Reader {
 
  private:
   std::string_view input_;
+  FileInput* file_ = nullptr;
   std::size_t at_ = 0;
   std::uint64_t expanded_bytes_ = 0;
 };
@@ -247,28 +364,35 @@ void WriteLength(std::string* out, std::uint64_t value) {
   }
 }
 
-bool LzfDecompress(std::string_view compressed, std::string* output) {
-  const auto* input = reinterpret_cast<const unsigned char*>(compressed.data());
-  std::size_t ip = 0, op = 0;
-  while (ip < compressed.size()) {
-    unsigned ctrl = input[ip++];
+// Decode compressed input directly into the admitted output. File reads may
+// cross any cache boundary, without retaining a second compressed blob.
+bool LzfDecompress(Reader* input, std::size_t remaining, std::string* output) {
+  auto byte = [&](std::uint8_t* value) {
+    if (remaining == 0) return false;
+    --remaining;
+    return input->Byte(value);
+  };
+  std::size_t op = 0;
+  while (remaining != 0) {
+    std::uint8_t ctrl = 0;
+    if (!byte(&ctrl)) return false;
     if (ctrl < 32) {
       const std::size_t length = ctrl + 1;
-      if (length > compressed.size() - ip || length > output->size() - op)
-        return false;
-      std::memcpy(output->data() + op, input + ip, length);
-      ip += length;
+      if (length > remaining || length > output->size() - op) return false;
+      if (!input->Read(length, output->data() + op)) return false;
+      remaining -= length;
       op += length;
       continue;
     }
     std::size_t length = ctrl >> 5;
     std::size_t distance = (ctrl & 0x1f) << 8;
-    if (ip == compressed.size()) return false;
+    std::uint8_t extra = 0;
     if (length == 7) {
-      length += input[ip++];
-      if (ip == compressed.size()) return false;
+      if (!byte(&extra)) return false;
+      length += extra;
     }
-    distance += input[ip++] + 1;
+    if (!byte(&extra)) return false;
+    distance += extra + 1;
     length += 2;
     if (distance > op || length > output->size() - op) return false;
     for (std::size_t i = 0; i < length; ++i)
@@ -291,14 +415,15 @@ absl::StatusOr<std::string> ReadString(Reader* reader) try {
     if (!reader->AccountExpanded(length->value)) {
       return Bad("expanded value exceeds Lavik limits");
     }
-    std::string_view value;
-    reader->Bytes(static_cast<std::size_t>(length->value), &value);
-    return std::string(value);
+    std::string value(static_cast<std::size_t>(length->value), '\0');
+    if (!reader->Read(value.size(), value.data()))
+      return Bad("truncated string");
+    return value;
   }
   if (length->value <= 2) {
     const unsigned bytes = length->value == 0 ? 1 : length->value == 1 ? 2 : 4;
-    std::string_view encoded;
-    if (!reader->Bytes(bytes, &encoded)) return Bad("truncated integer string");
+    char encoded[4];
+    if (!reader->Read(bytes, encoded)) return Bad("truncated integer string");
     std::uint32_t raw = 0;
     for (unsigned i = 0; i < bytes; ++i)
       raw |= static_cast<std::uint32_t>(static_cast<unsigned char>(encoded[i]))
@@ -324,10 +449,10 @@ absl::StatusOr<std::string> ReadString(Reader* reader) try {
   if (!reader->AccountExpanded(output_size->value)) {
     return Bad("expanded value exceeds Lavik limits");
   }
-  std::string_view compressed;
-  reader->Bytes(static_cast<std::size_t>(compressed_size->value), &compressed);
   std::string output(static_cast<std::size_t>(output_size->value), '\0');
-  if (!LzfDecompress(compressed, &output)) return Bad("invalid LZF data");
+  if (!LzfDecompress(reader, static_cast<std::size_t>(compressed_size->value),
+                     &output))
+    return Bad("invalid LZF data");
   return output;
 } catch (const std::length_error&) {
   return absl::ResourceExhaustedError("RDB string is too large");
@@ -347,8 +472,7 @@ absl::Status SkipModuleBody(Reader* reader) {
     }
     if (opcode->value == 3 || opcode->value == 4) {
       const std::size_t bytes = opcode->value == 3 ? 4 : 8;
-      std::string_view ignored;
-      if (!reader->Bytes(bytes, &ignored)) {
+      if (!reader->Skip(bytes)) {
         return Bad("truncated Redis Module floating-point value");
       }
       continue;
@@ -688,7 +812,7 @@ absl::StatusOr<std::vector<std::string>> DecodeIntset(
   std::int64_t previous = std::numeric_limits<std::int64_t>::min();
   for (std::uint32_t i = 0; i < count; ++i) {
     std::string_view bytes;
-    reader.Bytes(width, &bytes);
+    reader.View(width, &bytes);
     std::uint64_t raw = 0;
     for (unsigned j = 0; j < width; ++j)
       raw |= static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[j]))
@@ -983,14 +1107,11 @@ absl::StatusOr<Stream> DecodeStreamRdb(Reader* reader, std::uint8_t type) {
       return Bad("invalid Stream PEL count");
     std::map<Id, Pending> pending;
     for (std::uint64_t pi = 0; pi < pel_count->value; ++pi) {
-      std::string_view raw;
-      std::uint64_t delivery = 0;
-      if (!reader->Bytes(16, &raw) || !reader->Le64(&delivery))
-        return Bad("truncated Stream PEL");
-      Reader id_reader(raw);
       Id id;
-      id_reader.Be64(&id.ms);
-      id_reader.Be64(&id.seq);
+      std::uint64_t delivery = 0;
+      if (!reader->Be64(&id.ms) || !reader->Be64(&id.seq) ||
+          !reader->Le64(&delivery))
+        return Bad("truncated Stream PEL");
       auto deliveries = ReadLength(reader);
       if (!deliveries.ok() || deliveries->encoded ||
           !pending.emplace(id, Pending{id, {}, delivery, deliveries->value})
@@ -1017,13 +1138,9 @@ absl::StatusOr<Stream> DecodeStreamRdb(Reader* reader, std::uint8_t type) {
           local_count->value > pending.size())
         return Bad("invalid Stream consumer PEL");
       for (std::uint64_t li = 0; li < local_count->value; ++li) {
-        std::string_view raw;
-        if (!reader->Bytes(16, &raw))
-          return Bad("truncated Stream consumer PEL");
-        Reader id_reader(raw);
         Id id;
-        id_reader.Be64(&id.ms);
-        id_reader.Be64(&id.seq);
+        if (!reader->Be64(&id.ms) || !reader->Be64(&id.seq))
+          return Bad("truncated Stream consumer PEL");
         auto found = pending.find(id);
         if (found == pending.end() || !found->second.consumer.empty())
           return Bad("dangling Stream consumer PEL");
@@ -1104,12 +1221,10 @@ absl::StatusOr<LogicalValue> DecodeRdbObject(Reader* reader,
         else if (size == 255)
           score = -std::numeric_limits<double>::infinity();
         else {
-          std::string_view text;
-          if (!reader->Bytes(size, &text)) return Bad("truncated Zset score");
-          auto parsed =
-              std::from_chars(text.data(), text.data() + text.size(), score);
-          if (parsed.ec != std::errc{} ||
-              parsed.ptr != text.data() + text.size())
+          char text[252];
+          if (!reader->Read(size, text)) return Bad("truncated Zset score");
+          auto parsed = std::from_chars(text, text + size, score);
+          if (parsed.ec != std::errc{} || parsed.ptr != text + size)
             return Bad("invalid Zset score");
         }
       }
@@ -1268,9 +1383,8 @@ absl::StatusOr<std::size_t> MeasureString(Reader* reader) {
     } else
       return Bad("unknown encoded string");
   }
-  std::string_view ignored;
   if (decoded > storage::kMaxStringBytes || encoded > reader->remaining() ||
-      !reader->Bytes(static_cast<std::size_t>(encoded), &ignored))
+      !reader->Skip(static_cast<std::size_t>(encoded)))
     return Bad("string length exceeds payload");
   return static_cast<std::size_t>(decoded);
 }
@@ -1287,11 +1401,10 @@ absl::StatusOr<double> ReadCollectionScore(Reader* reader, std::uint8_t type) {
     if (size == 253) return Bad("invalid Zset score");
     if (size == 254) return std::numeric_limits<double>::infinity();
     if (size == 255) return -std::numeric_limits<double>::infinity();
-    std::string_view text;
-    if (!reader->Bytes(size, &text)) return Bad("truncated Zset score");
-    auto parsed =
-        std::from_chars(text.data(), text.data() + text.size(), score);
-    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
+    char text[252];
+    if (!reader->Read(size, text)) return Bad("truncated Zset score");
+    auto parsed = std::from_chars(text, text + size, score);
+    if (parsed.ec != std::errc{} || parsed.ptr != text + size)
       return Bad("invalid Zset score");
   }
   if (std::isnan(score)) return Bad("invalid Zset score");
@@ -1536,7 +1649,7 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
     for (std::uint32_t i = 0; i < count; ++i) {
       std::uint32_t size = 0;
       std::string_view value;
-      if (!reader.Le32(&size) || !reader.Bytes(size, &value))
+      if (!reader.Le32(&size) || !reader.View(size, &value))
         return Bad("truncated Lavik List");
       values.emplace_back(value);
     }
@@ -1562,8 +1675,8 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
     for (std::uint32_t i = 0; i < count; ++i) {
       std::string_view field, value;
       std::uint32_t fs = 0, vs = 0;
-      if (!reader.Le32(&fs) || !reader.Le32(&vs) || !reader.Bytes(fs, &field) ||
-          !reader.Bytes(vs, &value))
+      if (!reader.Le32(&fs) || !reader.Le32(&vs) || !reader.View(fs, &field) ||
+          !reader.View(vs, &value))
         return Bad("truncated Lavik Hash");
       pairs.emplace_back(std::string(field), std::string(value));
     }
@@ -1593,7 +1706,7 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
       std::uint32_t size = 0;
       std::string_view member;
       if (!reader.Le64(&bits) || !reader.Le32(&size) ||
-          !reader.Bytes(size, &member))
+          !reader.View(size, &member))
         return Bad("truncated Lavik Zset");
       double score = std::bit_cast<double>(bits);
       if (std::isnan(score)) return Bad("NaN Lavik Zset score");
@@ -1617,7 +1730,7 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
     auto read_text = [&](std::string* value) {
       std::uint32_t size = 0;
       std::string_view text;
-      if (!reader.Le32(&size) || !reader.Bytes(size, &text)) return false;
+      if (!reader.Le32(&size) || !reader.View(size, &text)) return false;
       value->assign(text);
       return true;
     };
@@ -1971,33 +2084,19 @@ absl::StatusOr<std::string> EncodeRdbObject(const LogicalValue& logical) {
 }  // namespace
 
 struct FileReader::Impl {
-  Impl(void* mapping, std::size_t size, unsigned version)
-      : mapping_(mapping),
-        size_(size),
-        input_(static_cast<const char*>(mapping), size),
-        version_(version),
-        reader_(input_.substr(9)) {}
-
-  ~Impl() {
-    if (mapping_ != MAP_FAILED) {
-      ::munmap(mapping_, size_);
-    }
-  }
-
   void Rewind() {
     collection_.reset();
-    reader_ = Reader(input_.substr(9));
+    input_.Reset();
+    reader_ = Reader(&input_, 9);
     db_id_ = 0;
     expire_at_ms_.reset();
     entry_metadata_ = false;
     finished_ = false;
   }
 
-  void* mapping_ = MAP_FAILED;
-  std::size_t size_ = 0;
-  std::string_view input_;
+  FileInput input_;
   unsigned version_ = 0;
-  Reader reader_;
+  Reader reader_{&input_};
   std::uint8_t db_id_ = 0;
   std::optional<std::uint64_t> expire_at_ms_;
   bool entry_metadata_ = false;
@@ -2011,97 +2110,86 @@ FileReader::FileReader(FileReader&&) noexcept = default;
 FileReader& FileReader::operator=(FileReader&&) noexcept = default;
 FileReader::~FileReader() = default;
 
-absl::StatusOr<FileReader> FileReader::Open(const std::string& path) {
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    const int error = errno;
-    const std::string message = absl::StrCat("cannot open RDB file '", path,
-                                             "': ", std::strerror(error));
-    return error == ENOENT ? absl::NotFoundError(message)
-                           : absl::InternalError(message);
+absl::StatusOr<FileReader> FileReader::Open(const std::string& path) try {
+  // Allocate the stable source before opening its descriptor. Impl owns both
+  // on every error path, and moving FileReader never invalidates its cursors.
+  auto impl = std::make_unique<Impl>();
+  auto status = impl->input_.Open(path);
+  if (!status.ok()) return status;
+  auto& input = impl->input_;
+  char header[9];
+  if (input.size() < 10) {
+    return absl::InvalidArgumentError("invalid RDB file header");
   }
-
-  struct stat info{};
-  if (::fstat(fd, &info) != 0) {
-    const int error = errno;
-    ::close(fd);
-    return absl::InternalError(absl::StrCat("cannot stat RDB file '", path,
-                                            "': ", std::strerror(error)));
-  }
-  if (!S_ISREG(info.st_mode) || info.st_size <= 0 ||
-      static_cast<std::uintmax_t>(info.st_size) >
-          std::numeric_limits<std::size_t>::max()) {
-    ::close(fd);
-    return absl::InvalidArgumentError(
-        absl::StrCat("RDB path is not a nonempty regular file: '", path, "'"));
-  }
-
-  const std::size_t size = static_cast<std::size_t>(info.st_size);
-  void* mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-  const int map_error = errno;
-  ::close(fd);
-  if (mapping == MAP_FAILED) {
-    return absl::InternalError(absl::StrCat("cannot map RDB file '", path,
-                                            "': ", std::strerror(map_error)));
-  }
-
-  auto unmap_on_error = [&] { ::munmap(mapping, size); };
-  const std::string_view input(static_cast<const char*>(mapping), size);
-  if (input.size() < 10 || !input.starts_with("REDIS")) {
-    unmap_on_error();
+  if (!input.Read(0, sizeof(header), header)) return input.status();
+  if (!std::string_view(header, sizeof(header)).starts_with("REDIS")) {
     return absl::InvalidArgumentError("invalid RDB file header");
   }
   unsigned version = 0;
-  const char* version_begin = input.data() + 5;
+  const char* version_begin = header + 5;
   const char* version_end = version_begin + 4;
   const auto parsed = std::from_chars(version_begin, version_end, version);
   if (parsed.ec != std::errc{} || parsed.ptr != version_end || version == 0 ||
       version > kVersion) {
-    const std::string version_text(input.substr(5, 4));
-    unmap_on_error();
     return absl::InvalidArgumentError(
-        absl::StrCat("unsupported RDB file version '", version_text, "'"));
+        absl::StrCat("unsupported RDB file version '",
+                     std::string_view(version_begin, 4), "'"));
   }
 
   // The checksum footer was introduced with RDB version 5. Redis writes a
   // zero checksum when checksum generation is disabled, which loaders accept.
   if (version >= 5) {
     if (input.size() < 18) {
-      unmap_on_error();
       return absl::InvalidArgumentError("truncated RDB checksum footer");
     }
-    Reader footer(input.substr(input.size() - 8));
+    Reader footer(&input, input.size() - 8);
     std::uint64_t expected = 0;
-    footer.Le64(&expected);
-    if (expected != 0 && Crc64(input.substr(0, input.size() - 8)) != expected) {
-      unmap_on_error();
-      return absl::InvalidArgumentError("RDB file checksum is invalid");
+    if (!footer.Le64(&expected)) return input.status();
+    if (expected != 0) {
+      std::uint64_t crc = 0;
+      const auto end = input.size() - 8;
+      for (std::size_t at = 0; at < end;) {
+        const auto part = input.Chunk(at).substr(0, end - at);
+        if (!input.status().ok()) return input.status();
+        crc = UpdateCrc64(crc, part);
+        at += part.size();
+      }
+      if (Reflect64(crc) != expected) {
+        return absl::InvalidArgumentError("RDB file checksum is invalid");
+      }
     }
   }
-
-  try {
-    return FileReader(std::make_unique<Impl>(mapping, size, version));
-  } catch (const std::bad_alloc&) {
-    unmap_on_error();
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM RDB file reader");
-  }
+  impl->version_ = version;
+  impl->Rewind();
+  return FileReader(std::move(impl));
+} catch (const std::bad_alloc&) {
+  RecordMemoryRejection();
+  return absl::ResourceExhaustedError("OOM RDB file reader");
 }
 
-absl::StatusOr<std::optional<FileEntry>> FileReader::Next() {
-  return NextImpl(false);
+absl::StatusOr<std::optional<FileEntry>> FileReader::Next() try {
+  auto entry = NextImpl(false);
+  if (!impl_->input_.status().ok()) return impl_->input_.status();
+  return entry;
+} catch (const std::bad_alloc&) {
+  RecordMemoryRejection();
+  return absl::ResourceExhaustedError("OOM RDB file entry");
 }
 
 absl::StatusOr<std::optional<FileEntry>> FileReader::NextStreaming() try {
-  return NextImpl(true);
+  auto entry = NextImpl(true);
+  if (!impl_->input_.status().ok()) return impl_->input_.status();
+  return entry;
 } catch (const std::bad_alloc&) {
   RecordMemoryRejection();
   return absl::ResourceExhaustedError("OOM RDB file entry");
 }
 
 absl::StatusOr<storage::CollectionPage> FileReader::ReadCollectionPage() {
+  if (!impl_->input_.status().ok()) return impl_->input_.status();
   if (!impl_->collection_) return Bad("no active RDB collection");
   auto page = impl_->collection_->Next(&impl_->reader_);
+  if (!impl_->input_.status().ok()) return impl_->input_.status();
   if (page.ok() && page->done_) impl_->collection_.reset();
   return page;
 }
@@ -2116,6 +2204,7 @@ absl::Status FileReader::DrainCollection() {
 
 absl::StatusOr<std::optional<FileEntry>> FileReader::NextImpl(
     bool stream_collections) {
+  if (!impl_->input_.status().ok()) return impl_->input_.status();
   if (impl_->collection_) return Bad("RDB collection must be drained first");
   if (impl_->finished_) return std::optional<FileEntry>();
 

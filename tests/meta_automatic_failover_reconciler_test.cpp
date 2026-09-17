@@ -746,6 +746,34 @@ class MetaAutomaticFailoverReconcilerTimeoutTest
 };
 
 TEST_F(MetaAutomaticFailoverReconcilerTest,
+       DiagnosticsCatchUpAfterConfigurationOnlyCommit) {
+  SeedCluster();
+  std::atomic<int> generated_ids{0};
+  InstallReconciler(CountingIds(generated_ids));
+  StartEligibleGeneration(1);
+  ASSERT_TRUE(WaitForLeadershipWarmup(1));
+
+  const auto before = machine_->last_commit_index();
+  ASSERT_TRUE(WaitUntil([&] {
+    return diagnostics_->Snapshot().evaluated_applied_index_ == before;
+  }));
+  const auto stores_high_water = coordinator_->CommittedHighWater();
+  // A new leader commits a Raft configuration without a Meta command event.
+  // Status still compares the detector's cut with this full applied cursor;
+  // it must recover without waiting for an unrelated topology mutation.
+  nuraft::ptr<nuraft::cluster_config> config;
+  machine_->commit_config(before + 1, config);
+  ASSERT_EQ(machine_->last_commit_index(), before + 1);
+  EXPECT_EQ(coordinator_->CommittedHighWater(), stores_high_water);
+  EXPECT_TRUE(WaitUntil([&] {
+    return diagnostics_->Snapshot().evaluated_applied_index_ == before + 1;
+  }));
+  EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 0);
+  EXPECT_EQ(GroupStatus().blocker_,
+            MetaAutomaticFailoverBlocker::kLeadershipWarmup);
+}
+
+TEST_F(MetaAutomaticFailoverReconcilerTest,
        NewGenerationRepeatsWarmupAndAFullDebounce) {
   SeedCluster();
   std::atomic<int> generated_ids{0};

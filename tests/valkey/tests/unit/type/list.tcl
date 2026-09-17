@@ -1065,9 +1065,11 @@ foreach {pop} {BLPOP BLMPOP_LEFT} {
         $watching_client get somekey{t}
         $watching_client read
         $watching_client exec
-        # Blocked BLPOPLPUSH may create problems, unblock it.
-        r lpush srclist{t} element
+        # Finish EXEC while the move is still blocked. Commands on separate
+        # connections can otherwise race across Lavik workers, letting the
+        # cleanup LPUSH legitimately invalidate WATCH before EXEC runs.
         set res [$watching_client read]
+        r lpush srclist{t} element
         $blocked_client close
         $watching_client close
         set _ $res

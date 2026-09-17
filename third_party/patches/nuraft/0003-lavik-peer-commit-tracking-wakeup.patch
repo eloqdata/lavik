@@ -1,0 +1,63 @@
+diff --git a/src/handle_commit.cxx b/src/handle_commit.cxx
+--- a/src/handle_commit.cxx
++++ b/src/handle_commit.cxx
+@@ -111,18 +111,29 @@ void raft_server::commit_in_bg() {
+     pthread_setname_np(thread_name.c_str());
+ #endif
+ 
++    // Disabling all-peer completion can leave an unscanned target behind.
++    // It is not runnable work while tracking is disabled: the scanner would
++    // return without advancing it, keeping this thread busy forever. Retain
++    // the target so re-enabling tracking can still finish its notifications.
++    auto has_pending_sm_notification = [this]() {
++        return sm_commit_notifier_target_idx_ > sm_commit_notifier_notified_idx_ &&
++               ctx_->get_params()->track_peers_sm_commit_idx_;
++    };
++
+     while (true) {
+      try {
+         // WARNING:
+         //   If `sm_commit_paused_` is set, we shouldn't enter
+         //   `commit_in_bg_exec()`, as it will cause an infinite loop.
+-        while ( ( quick_commit_index_ <= sm_commit_index_ ||
+-                  sm_commit_index_ >= log_store_->next_slot() - 1 ||
+-                  sm_commit_paused_ ) &&
+-                sm_commit_notifier_target_idx_ == sm_commit_notifier_notified_idx_ ) {
++        // Shutdown must reach the stop check even if work remains queued.
++        while ( stopping_ ||
++                ( ( quick_commit_index_ <= sm_commit_index_ ||
++                    sm_commit_index_ >= log_store_->next_slot() - 1 ||
++                    sm_commit_paused_ ) &&
++                  !has_pending_sm_notification() ) ) {
+             std::unique_lock<std::mutex> lock(commit_cv_lock_);
+ 
+-            auto wait_check = [this]() {
++            auto wait_check = [this, &has_pending_sm_notification]() {
+                 // Wake up (escape this loop) on `true`.
+ 
+                 if (stopping_) {
+@@ -130,7 +141,7 @@ void raft_server::commit_in_bg() {
+                     // WARNING: `stopping_` flag should have the highest priority.
+                     return true;
+                 }
+-                if (sm_commit_notifier_target_idx_ > sm_commit_notifier_notified_idx_) {
++                if (has_pending_sm_notification()) {
+                     return true;
+                 }
+                 if (sm_commit_paused_) {
+diff --git a/src/raft_server.cxx b/src/raft_server.cxx
+--- a/src/raft_server.cxx
++++ b/src/raft_server.cxx
+@@ -383,6 +383,12 @@ void raft_server::update_params(const raft_params& new_params) {
+         p->set_hb_interval(clone->heart_beat_interval_);
+         p->resume_hb_speed();
+     }
++    // Peer-SM tracking participates in the commit thread's wait predicate.
++    // Re-enabling it must wake retained notifications even without a new log.
++    {
++        std::unique_lock<std::mutex> commit_lock(commit_cv_lock_);
++        commit_cv_.notify_all();
++    }
+ }
+ 
+ void raft_server::apply_and_log_current_params() {

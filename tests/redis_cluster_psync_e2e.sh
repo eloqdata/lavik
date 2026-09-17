@@ -34,13 +34,23 @@ cleanup() {
       tail -100 "$redis_log" >&2 2>/dev/null || true
     done
   fi
-  if [[ -n $lavik_pid ]]; then
-    kill "$lavik_pid" 2>/dev/null || true
-    wait "$lavik_pid" 2>/dev/null || true
-  fi
-  if ((${#redis_pids[@]})); then
-    kill "${redis_pids[@]}" 2>/dev/null || true
-    wait "${redis_pids[@]}" 2>/dev/null || true
+  # Stop all peers before joining any of them: leaving Redis live while
+  # joining its replica can strand cleanup in an upstream socket read.
+  # This fixture checks PSYNC data, not graceful-shutdown durability.
+  local pids=("${redis_pids[@]}")
+  if [[ -n $lavik_pid ]]; then pids+=("$lavik_pid"); fi
+  if ((${#pids[@]})); then
+    kill "${pids[@]}" 2>/dev/null || true
+    for _ in {1..100}; do
+      local alive=false
+      for pid in "${pids[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then alive=true; fi
+      done
+      if ! "$alive"; then break; fi
+      sleep 0.1
+    done
+    kill -KILL "${pids[@]}" 2>/dev/null || true
+    wait "${pids[@]}" 2>/dev/null || true
   fi
   if [[ $case_dir == "${case_template%XXXXXX}"* ]]; then
     rm -rf -- "$case_dir"
@@ -117,7 +127,8 @@ for port in "${master_ports[@]}"; do
 done
 
 fallocate -l 128M "$case_dir/lavik.data"
-"$lavik_bin" --logtostderr --port "$lavik_port" --threads 3 \
+# Keep three workers for cross-worker replication on two-CPU hosted runners.
+"$lavik_bin" --logtostderr --port "$lavik_port" --threads 3 --no-pin-workers \
   --recv-buffers-per-worker 0 --max-memory 8589934592 --flush-max-ms 20 \
   --data-file "$case_dir/lavik.data" >"$case_dir/lavik.log" 2>&1 &
 lavik_pid=$!

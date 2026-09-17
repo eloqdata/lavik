@@ -50,10 +50,11 @@ struct FileEntry {
   std::optional<std::uint64_t> expected_items_{};
 };
 
-// Memory-maps and validates one complete Redis RDB file. Files produced by
-// RDB versions 1 through 11 are accepted. Next() materializes only one value
-// at a time, so importing a large database does not retain the whole dataset
-// in process memory.
+// Reads Redis RDB versions 1 through 11 using bounded file I/O scratch. Open()
+// validates the header and optional checksum before exposing any entries.
+// The reader owns the open descriptor; callers must keep its contents immutable
+// until destruction, including across validation and application passes.
+// Next() materializes one value; NextStreaming() yields collection pages.
 class FileReader {
  public:
   static absl::StatusOr<FileReader> Open(const std::string& path);
@@ -73,6 +74,8 @@ class FileReader {
   // read is terminal for that import attempt; rewind before trying again.
   absl::StatusOr<storage::CollectionPage> ReadCollectionPage();
   absl::Status DrainCollection();
+  // Restarts parsing on the same open file, discarding cached bytes and any
+  // read error. This does not revalidate the checksum or reopen the pathname.
   void Rewind();
   unsigned version() const noexcept;
 

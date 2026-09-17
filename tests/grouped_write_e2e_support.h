@@ -245,6 +245,7 @@ class Server {
       ::dup2(log, STDOUT_FILENO);
       ::dup2(log, STDERR_FILENO);
       ::close(log);
+      // Worker counts exercise handoffs and may exceed the CI host CPU count.
       std::vector<std::string> args{server_binary,
                                     "--bind",
                                     "127.0.0.1",
@@ -252,6 +253,7 @@ class Server {
                                     std::to_string(port_),
                                     "--threads",
                                     std::to_string(workers),
+                                    "--no-pin-workers",
                                     "--recv-buffers-per-worker",
                                     "8",
                                     "--max-memory",
@@ -298,6 +300,19 @@ class Server {
     return {std::istreambuf_iterator<char>(input), {}};
   }
   void PreserveOnFailure() { preserve_on_failure_ = true; }
+  // Observe termination without reaping: Wait() must still report the actual
+  // exit status, and the fixture remains responsible for child cleanup.
+  bool Running() const {
+    if (pid_ <= 0) return false;
+    siginfo_t info{};
+    int result;
+    do {
+      result = ::waitid(P_PID, static_cast<id_t>(pid_), &info,
+                        WEXITED | WNOHANG | WNOWAIT);
+    } while (result < 0 && errno == EINTR);
+    Check(result == 0, "checking server exit failed");
+    return info.si_pid == 0;
+  }
   void RecordDiagnostics(std::string_view reason, std::string_view info = {}) {
     std::ofstream output(log_, std::ios::app);
     output << "\nTEST DIAGNOSTICS " << reason << " pid=" << pid_ << '\n'

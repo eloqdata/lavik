@@ -386,11 +386,58 @@ determinism boundary, invariant matrix, trace/replay commands, and hardware
 allowlist rules. The CTest labels are `cluster-model`,
 `cluster-integration`, `cluster-soak`, and `cluster-hardware`.
 
+## Continuous integration
+
+The [CI workflow](../../.github/workflows/ci.yml) runs on pushes to `main`, pull
+requests, and manual dispatch. A formatting job checks every maintained Lavik C/C++
+source through the pinned pre-commit hook. Two independent test jobs build and
+run natively on `ubuntu-24.04` (AMD64) and `ubuntu-24.04-arm` (ARM64).
+
+The workflow initializes the public `eloqdata/bycorf` submodule at the exact
+gitlink revision from the tested Lavik commit. It does not need a deploy key or
+an extra Actions secret, so fork pull requests can run the same software suite.
+The main checkout does not persist credentials.
+
+Both use Clang 18, Debug, `BUILD_TESTING=ON`, `LAVIK_BUILD_META=ON`,
+`LAVIK_BUILD_FAULT_SERVER=ON`, and `LAVIK_ENABLE_OPT=OFF`. Debug is required
+for the Meta fault gates; the Data fault server alone does not enable them.
+Redis, Python, and TCL are installed before configuration so the conditional
+integration targets are present. The jobs fetch the pinned io_uring runtime
+dependencies; SPDK is not part of this build.
+`BUILD_TESTING=ON` also enables Bycorf's registered software regressions,
+including connection/timer, connection-storage lifetime, and backend-selection
+checks, through Bycorf's own CTest definitions.
+Process fixtures that use more than two workers disable CPU pinning, preserving
+cross-worker coverage on two-CPU runners.
+
+After building all targets, run the same suite locally with:
+
+```bash
+./scripts/run_ci_tests.sh build_ci
+```
+
+The runner executes all registered CTest cases serially, the three opt-in large
+codec regressions, native large-List and large-Hash tests, the >1 GiB RDB
+import/export test, and every vendored Valkey TCL suite under its compatibility
+harness policy. It continues with the remaining suites after a failure and
+returns nonzero if any suite fails. The ordinary CTest report still marks the
+large codec cases disabled and the large RDB case skipped; their explicit runs
+have separate logs. The hardware safety gate skips because hosted runners have
+no allowlisted scratch block device. Raw-device/SPDK verification requires a
+separate hardware host.
+
+Allow several GiB of free space for private test files under `/mnt/dev` and
+`/tmp`, and enable io_uring with a sufficient memlock limit. CI prepares these
+on its disposable VMs. Test logs and JUnit results live in
+`<build-dir>/test-results/`; CI retains them as a per-architecture artifact for
+seven days. The test jobs run independently of formatting and of each other's
+outcome.
+
 ## Source formatting
 
 Lavik uses the Google style, parses source as C++23, and pins clang-format
-23.1.0. Its Bycorf submodule maintains its own formatter pin. Install
-`pre-commit` once and enable the repository hook:
+23.1.1. Its Bycorf submodule maintains its own formatter pin. Install `pre-commit`
+once and enable the repository hook:
 
 ```bash
 sudo apt-get install pre-commit
@@ -408,7 +455,7 @@ pre-commit run clang-format --all-files
 ```
 
 The CMake `format` and `format-check` targets use a system installation only
-when it reports exactly version 23.1.0. This exact check prevents a local tool
+when it reports exactly version 23.1.1. This exact check prevents a local tool
 upgrade from silently rewriting unrelated code. The pre-commit hook is the
 portable path when that system binary is unavailable.
 

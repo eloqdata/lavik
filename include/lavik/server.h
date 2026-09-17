@@ -67,7 +67,7 @@ struct ServerOptions {
   std::int64_t slowlog_log_slower_than_us_ = kDefaultSlowLogThresholdMicros;
   std::size_t slowlog_max_len_ = kDefaultSlowLogMaxLen;
   std::uint64_t lua_time_limit_ms_ = 5000;
-  std::size_t registered_buffer_bytes_ = 256ULL * 1024 * 1024;
+  std::size_t registered_buffer_bytes_ = 64ULL * 1024 * 1024;
   unsigned storage_write_buffer_count_ = 4;
   std::size_t storage_read_buffer_bytes_ = 1ULL * 1024 * 1024;
   std::size_t replication_publish_queue_bytes_ = 16ULL * 1024 * 1024;
@@ -117,6 +117,9 @@ struct ServerOptions {
   ReplicationOptions replication_options_;
 };
 
+// Selects the configured I/O backends before starting workers and blocks until
+// shutdown. Call before other Bycorf I/O freezes the process-wide backend
+// choice. Returns nonzero on configuration, initialization, or runtime failure.
 int RunServer(ServerOptions options);
 
 }  // namespace lavik

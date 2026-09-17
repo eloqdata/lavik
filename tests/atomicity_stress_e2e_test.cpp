@@ -277,6 +277,7 @@ class ServerProcess {
           std::to_string(port),
           "--threads",
           "4",
+          "--no-pin-workers",
           "--recv-buffers-per-worker",
           "0",
           "--flush-max-ms",

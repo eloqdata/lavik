@@ -98,7 +98,7 @@ if (LAVIK_ASAN_BUILD AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     "AddressSanitizer builds require Clang. GCC does not preserve coroutine "
     "symmetric transfers under ASan and can overflow the native stack.")
 endif()
-set(LAVIK_CLANG_FORMAT_REQUIRED_VERSION "23.1.0")
+set(LAVIK_CLANG_FORMAT_REQUIRED_VERSION "23.1.1")
 string(REPLACE "." "\\." LAVIK_CLANG_FORMAT_VERSION_REGEX
   "${LAVIK_CLANG_FORMAT_REQUIRED_VERSION}")
 find_program(LAVIK_CLANG_FORMAT NAMES clang-format-23 clang-format)
@@ -148,8 +148,11 @@ else()
 endif()
 
 set(BYCORF_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-# Keep the runtime dependency boundary aligned with Lavik, including when
-# bypass is turned off again in an existing build directory.
+# Use Bycorf's own test registration so new software regressions also run in
+# Lavik CI against the exact linked runtime revision.
+set(BYCORF_BUILD_TESTS ${BUILD_TESTING} CACHE BOOL "" FORCE)
+# Keep the embedded runtime on the same dependency boundary, including when
+# turning bypass off in an existing build directory.
 set(BYCORF_KERNEL_BYPASS ${LAVIK_KERNEL_BYPASS} CACHE BOOL "" FORCE)
 # This must be set before Bycorf's first find_package(OpenSSL). Static release
 # artifacts can then run without libssl.so or libcrypto.so on the target.
@@ -724,6 +727,24 @@ if (BUILD_TESTING)
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE FALSE)
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO FALSE)
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL FALSE)
+  # Bycorf registers its test executables before this block. Apply the same
+  # test-only IPO policy without changing its production libraries.
+  get_property(bycorf_targets DIRECTORY "${LAVIK_BYCORF_SOURCE_DIR}"
+    PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(bycorf_target IN LISTS bycorf_targets)
+    get_target_property(bycorf_target_type ${bycorf_target} TYPE)
+    if (bycorf_target_type STREQUAL "EXECUTABLE")
+      set_target_properties(${bycorf_target} PROPERTIES
+        INTERPROCEDURAL_OPTIMIZATION_RELEASE FALSE
+        INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO FALSE
+        INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL FALSE)
+      if (LAVIK_ENABLE_OPT AND LAVIK_IPO_SUPPORTED AND
+          CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_link_options(${bycorf_target} PRIVATE
+          "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-flto=thin>")
+      endif()
+    endif()
+  endforeach()
 
   if (LAVIK_ENABLE_OPT AND LAVIK_IPO_SUPPORTED AND
       CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -923,10 +944,27 @@ if (BUILD_TESTING)
         RUN_SERIAL TRUE
       )
 
+      # Preparing the large reply commits 2,500 nodes through real Raft.
+      # Keep that setup budget separate from the transport/CLI contract gate;
+      # the slow-reader gate still asserts the production 5-second deadline.
+      add_test(
+        NAME meta_integration.admin_slow_reader
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/ctl_client.py
+                $<TARGET_FILE:lavik-meta>
+                $<TARGET_FILE:lavik-ctl>
+                --case=slow-reader
+      )
+      set_tests_properties(meta_integration.admin_slow_reader PROPERTIES
+        LABELS meta-integration
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+      )
+
       # Metadata process gates: leader-change safety, WAL/snapshot
       # recovery matrix, membership-change semantics, transport
-      # connect/cancel/timeout, mTLS, the observation
-      # observation-lifecycle gate, and Meta partition safety.
+      # connect/cancel/timeout, mTLS, observation lifecycle, and Meta partition
+      # safety.
       # The backpressure gate enforces a production RSS budget, so sanitizer
       # allocator quarantine would turn it into a measurement of ASan retention
       # instead of the bounded live Raft queues it is intended to cover.
@@ -988,7 +1026,9 @@ if (BUILD_TESTING)
         )
         set_tests_properties(meta_integration.gate_cluster_create PROPERTIES
           LABELS meta-integration
-          TIMEOUT 300
+          # Multiple independent creation/recovery scenarios each elect Meta
+          # and wait out finite-lease handoff before checking serving readiness.
+          TIMEOUT 600
           RUN_SERIAL TRUE
         )
 
@@ -1118,28 +1158,6 @@ if (BUILD_TESTING)
       message(STATUS "python3 not found; meta integration tests are disabled")
     endif()
   endif()
-
-  # bycorf's connect/timer verification harness, run under ctest. Lavik
-  # forces BYCORF_BUILD_EXAMPLES=OFF, so the bycorf-side example target never
-  # materializes in this build; compile the source directly here instead (it
-  # only uses bycorf public headers). The suite deliberately sleeps past armed
-  # deadlines to catch stale-timeout dispatches, hence the 90s budget.
-  add_executable(bycorf_connect_timer_check
-    "${LAVIK_BYCORF_SOURCE_DIR}/example/connect_timer_check.cpp"
-  )
-  target_link_libraries(bycorf_connect_timer_check PRIVATE bycorf::core)
-  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(bycorf_connect_timer_check PRIVATE
-      -Wall -Wextra -Wpedantic)
-  endif()
-  add_test(
-    NAME bycorf_connect_timer_check
-    COMMAND bycorf_connect_timer_check
-  )
-  set_tests_properties(bycorf_connect_timer_check PROPERTIES
-    LABELS bycorf
-    TIMEOUT 90
-  )
 
   add_executable(lavik_cluster_fault
     tests/cluster/fault_harness_main.cpp
@@ -1288,7 +1306,10 @@ if (BUILD_TESTING)
       )
       set_tests_properties(cluster_integration.rebuild_protocol_guards PROPERTIES
         LABELS cluster-integration
-        TIMEOUT 120
+        # This entry runs nine process fixtures, including crash/restart and
+        # forced reconnects. Their combined runtime exceeds two minutes on
+        # hosted runners; each fixture retains its own bounded progress waits.
+        TIMEOUT 300
         RUN_SERIAL TRUE
       )
     endif()
@@ -1590,6 +1611,7 @@ if (BUILD_TESTING)
       NAME lavik_grouped_hash_write_e2e
       COMMAND lavik_grouped_hash_write_e2e_test $<TARGET_FILE:lavik>
     )
+    # The complete crash/restart matrix can exceed four minutes in Debug.
     set_tests_properties(lavik_grouped_hash_write_e2e PROPERTIES
       TIMEOUT 600 RUN_SERIAL TRUE
     )

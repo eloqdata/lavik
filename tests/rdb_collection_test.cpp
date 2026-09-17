@@ -355,6 +355,28 @@ TEST(RdbCollectionImportTest,
   }
 }
 
+TEST(RdbCollectionImportTest, ReportsTruncationBetweenPages) {
+  CollectionImportFile file;
+  WriteImportFixture(file.path(), ValueType::kList, false);
+  auto reader = FileReader::Open(file.path());
+  ASSERT_TRUE(reader.ok()) << reader.status();
+  ASSERT_TRUE(reader->NextStreaming().ok());
+  auto first = reader->ReadCollectionPage();
+  ASSERT_TRUE(first.ok()) << first.status();
+  ASSERT_FALSE(first->done_);
+  // The first page is already decoded. A short read of the next file segment
+  // must fail the import instead of exposing an incomplete final page.
+  ASSERT_EQ(::truncate(file.path(), 1024 * 1024 + 5), 0);
+  auto status = reader->DrainCollection();
+  ASSERT_FALSE(status.ok());
+  EXPECT_NE(status.message().find("truncated while reading"),
+            std::string_view::npos);
+  EXPECT_EQ(reader->ReadCollectionPage().status(), status);
+  reader->Rewind();
+  ASSERT_TRUE(reader->NextStreaming().ok());
+  EXPECT_EQ(reader->DrainCollection(), status);
+}
+
 TEST(RdbCollectionImportTest, QuicklistDrainsNodesWithoutAnAggregateString) {
   CollectionImportFile file;
   auto writer = FileWriter::Open(file.path());

@@ -54,6 +54,7 @@
 #include "absl/strings/str_join.h"
 #include "backup.h"
 #include "blocking_wait.h"
+#include "bycorf/io/backend_options.h"
 #include "bycorf/net/server.h"
 #include "bycorf/net/tcp_service.h"
 #include "bycorf/net/tcp_stream.h"
@@ -924,8 +925,8 @@ Task<absl::Status> RedisService::ImportRdb() {
   auto reader = rdb::FileReader::Open(load_rdb_file_);
   if (!reader.ok()) co_return reader.status();
 
-  // Validate every object before mutating storage. The mapped file is then
-  // rewound and decoded a second time one entry at a time during application.
+  // Validate every object before mutating storage. The open file is then
+  // rewound and decoded a second time through bounded reads during application.
   std::uint64_t entry_count = 0;
   std::uint64_t skipped_count = 0;
   std::vector<std::string> function_libraries;

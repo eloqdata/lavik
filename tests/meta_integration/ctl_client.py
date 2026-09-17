@@ -15,9 +15,10 @@
 
 """End-to-end gate for lavik-ctl over Unix and TCP transports.
 
-Usage: ctl_client.py /path/to/lavik-meta /path/to/lavik-ctl [workdir]
+Usage: ctl_client.py META CTL [workdir] [--case=transports|slow-reader]
 """
 
+import argparse
 import os
 import re
 import socket
@@ -793,12 +794,22 @@ def admin_slow_reader_gate(node):
                     raise H.Failure(
                         f"slow-reader fixture node {index}: {reply!r}")
 
-    # Diagnostics may lag the last registration and yield ERR cut_changed.
-    # That short reply has no send watchdog; require a successful capture
-    # before testing the deadline on a parked large response.
-    H.wait_until("slow-reader status snapshot catches up", 10,
-                 lambda: node.ctl("clusterstatus 1").startswith(
-                     "OK clusterstatus 1 "))
+    # Command commit precedes the detector's asynchronous status publication.
+    # ERR cut_changed is a small, persistent-connection reply and intentionally
+    # has no large-response send watchdog. Establish the complete current cut
+    # before testing backpressure, then verify the slow request got that payload.
+    deadline = time.monotonic() + 10
+    while True:
+        reply = node.ctl("clusterstatus 1")
+        if reply.startswith("OK clusterstatus 1 "):
+            break
+        if (reply not in ("ERR cut_changed", "ERR busy") or
+                time.monotonic() >= deadline):
+            raise H.Failure(f"slow-reader status preparation: {reply!r}")
+        time.sleep(0.05)
+    expected_bytes = len(reply.encode()) + 1
+    H.log(f"slow-reader fixture ready: {node_count} nodes, "
+          f"{expected_bytes} reply bytes")
 
     slow = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1_024)
@@ -807,6 +818,15 @@ def admin_slow_reader_gate(node):
     started = time.monotonic()
     slow.sendall(b"clusterstatus 1\n")
     try:
+        prefix = slow.recv(64)
+        while (len(prefix) < len(b"OK clusterstatus 1 ") and
+               b"\n" not in prefix):
+            chunk = slow.recv(64 - len(prefix))
+            if not chunk:
+                break
+            prefix += chunk
+        if not prefix.startswith(b"OK clusterstatus 1 "):
+            raise H.Failure(f"slow reader did not receive status: {prefix!r}")
         # A parked large status write must not pin the Bycorf worker: unrelated
         # Admin traffic still completes while the 5-second send watchdog owns
         # the slow connection.
@@ -820,12 +840,15 @@ def admin_slow_reader_gate(node):
 
         time.sleep(max(0.0, 5.75 - (time.monotonic() - started)))
         saw_eof = False
+        received_bytes = len(prefix)
         while True:
             chunk = slow.recv(65_536)
             if not chunk:
                 saw_eof = True
                 break
-        if not saw_eof or time.monotonic() - started > 8.0:
+            received_bytes += len(chunk)
+        if (not saw_eof or received_bytes >= expected_bytes or
+                time.monotonic() - started > 8.0):
             raise H.Failure("slow status reader was not closed by send deadline")
     finally:
         slow.close()
@@ -836,6 +859,19 @@ def admin_slow_reader_gate(node):
     if '"result":"not_ready"' not in cluster.stdout:
         raise H.Failure("status capture did not recover after slow reader")
     H.log("slow Admin status reader deadline and worker isolation — OK")
+
+
+def slow_reader_gate(workdir):
+    directory = os.path.join(workdir, "slow-reader")
+    os.makedirs(directory, exist_ok=True)
+    node = H.Node(
+        META, directory, 1, args=H.raft_args(snapshot_distance=100_000))
+    try:
+        node.start(bootstrap=True)
+        H.wait_until("slow-reader ctl leader", 10, node.is_leader)
+        admin_slow_reader_gate(node)
+    finally:
+        node.terminate()
 
 
 def unix_gate(workdir):
@@ -880,7 +916,6 @@ def unix_gate(workdir):
         if run(["--socket", node.ctl_path, "unknown"], expected=2) != \
                 "ERR unknown-command":
             raise H.Failure("ERR reply did not produce exit status 2")
-        admin_slow_reader_gate(node)
         H.log("lavik-ctl Unix transport and exit statuses — OK")
     finally:
         node.terminate()
@@ -1120,9 +1155,24 @@ def mtls_gate(workdir):
 
 
 def main():
-    harness_argv = [sys.argv[0], META] + sys.argv[3:]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("meta")
+    parser.add_argument("ctl")
+    parser.add_argument("workdir", nargs="?")
+    parser.add_argument("--case", choices=("transports", "slow-reader"),
+                        default="transports")
+    args = parser.parse_args()
+    global META, CTL
+    META = os.path.abspath(args.meta)
+    CTL = os.path.abspath(args.ctl)
+    harness_argv = [sys.argv[0], META]
+    if args.workdir is not None:
+        harness_argv.append(args.workdir)
     workdir, keep = H.make_workdir(harness_argv, "meta_ctl_client_")
     try:
+        if args.case == "slow-reader":
+            slow_reader_gate(workdir)
+            return
         ctl_characterization_gate(workdir)
         raw_argument_gate(workdir)
         scripted_cluster_gate(workdir)
@@ -1140,15 +1190,10 @@ def main():
         H.cleanup(workdir, keep)
 
 
-if len(sys.argv) < 3:
-    print(__doc__, file=sys.stderr)
-    sys.exit(2)
-META = os.path.abspath(sys.argv[1])
-CTL = os.path.abspath(sys.argv[2])
-H.set_tag("meta-ctl-client")
-
-try:
-    main()
-except (H.Failure, OSError, subprocess.SubprocessError) as error:
-    H.log(f"FAIL: {error}")
-    sys.exit(1)
+if __name__ == "__main__":
+    H.set_tag("meta-ctl-client")
+    try:
+        main()
+    except (H.Failure, OSError, subprocess.SubprocessError) as error:
+        H.log(f"FAIL: {error}")
+        sys.exit(1)

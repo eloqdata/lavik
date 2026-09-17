@@ -816,7 +816,14 @@ start_server {tags {"hash"}} {
         set k [dict remove $k ZIP_STR_14B]
         assert_equal [dict get $k ZIP_STR_32B] [string repeat x 65535]
         set k [dict remove $k ZIP_STR_32B]
-        set _ $k
+        # HGETALL order depends on the storage representation. Check every
+        # field/value pair without requiring ziplist insertion order.
+        assert_equal 6 [dict size $k]
+        set ordered {}
+        foreach field {ZIP_INT_8B ZIP_INT_16B ZIP_INT_32B ZIP_INT_64B ZIP_INT_IMM_MIN ZIP_INT_IMM_MAX} {
+            lappend ordered $field [dict get $k $field]
+        }
+        set _ $ordered
     } {ZIP_INT_8B 127 ZIP_INT_16B 32767 ZIP_INT_32B 2147483647 ZIP_INT_64B 9223372036854775808 ZIP_INT_IMM_MIN 0 ZIP_INT_IMM_MAX 12}
 
     test {Hash ziplist of various encodings - sanitize dump} {
@@ -833,7 +840,12 @@ start_server {tags {"hash"}} {
         set k [dict remove $k ZIP_STR_14B]
         assert_equal [dict get $k ZIP_STR_32B] [string repeat x 65535]
         set k [dict remove $k ZIP_STR_32B]
-        set _ $k
+        assert_equal 6 [dict size $k]
+        set ordered {}
+        foreach field {ZIP_INT_8B ZIP_INT_16B ZIP_INT_32B ZIP_INT_64B ZIP_INT_IMM_MIN ZIP_INT_IMM_MAX} {
+            lappend ordered $field [dict get $k $field]
+        }
+        set _ $ordered
     } {ZIP_INT_8B 127 ZIP_INT_16B 32767 ZIP_INT_32B 2147483647 ZIP_INT_64B 9223372036854775808 ZIP_INT_IMM_MIN 0 ZIP_INT_IMM_MAX 12}
 
     # On some platforms strtold("+inf") with valgrind returns a non-inf result

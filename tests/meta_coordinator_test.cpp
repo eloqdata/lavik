@@ -1703,8 +1703,7 @@ TEST_F(MetaCoordinatorServerTest, ValidateHooksObserveAndRejectBeforeAppend) {
   EXPECT_TRUE(machine_->StoresSnapshot().topology_.GroupExists("g1"));
 }
 
-TEST_F(MetaCoordinatorServerTest,
-       UncertainOutcomeTimeoutAndCancelAreReconcilable) {
+TEST_F(MetaCoordinatorServerTest, UncertainOutcomeTimeoutIsReconcilable) {
   StartServer({.client_req_timeout_ms_ = 600});
   // The seam bounds the round trip itself (NuRaft's async_handler mode has
   // no client-side timeout): inject a short one.
@@ -1747,12 +1746,25 @@ TEST_F(MetaCoordinatorServerTest,
       },
       std::chrono::seconds(10)));
   EXPECT_EQ(machine_->StoresSnapshot().audit_.size(), 2u);
+}
+
+TEST_F(MetaCoordinatorServerTest, UncertainOutcomeCancelIsReconcilable) {
+  StartServer();
+  MetaCoordinatorOptions options;
+  // Cancellation and the proposal deadline are first-wins. Keep this
+  // deadline beyond the append/completion waits below so shutdown, rather
+  // than the timeout case's 300 ms timer, determines the result on a busy host.
+  options.propose_timeout_ms_ = 30'000;
+  MakeCoordinator(options);
+  WaitLeader();
+  ASSERT_TRUE(ProposeSync(MakeRegister(0x51)).ok());
 
   // Cancel path: an in-flight propose resolves CANCELLED on shutdown — the
   // same uncertain-outcome class (the entry is durable in the WAL and may be
   // committed by a future leader). Wait for the WAL append first so the
   // propose is genuinely in flight when the server stops.
   server_->pause_state_machine_execution(5000);
+  ASSERT_TRUE(server_->is_state_machine_execution_paused());
   const std::uint64_t slot_before = wal_->next_slot();
   auto task = coordinator_->Propose(MakeRegister(0x53), TestPrincipal());
   std::promise<void> done;
@@ -1765,6 +1777,9 @@ TEST_F(MetaCoordinatorServerTest,
   handle.resume();
   ASSERT_TRUE(WaitFor([&] { return wal_->next_slot() > slot_before; },
                       std::chrono::seconds(10)));
+  EXPECT_FALSE(machine_->StoresSnapshot()
+                   .identity_.FindNode(MakeNodeId(0x53))
+                   .has_value());
   ShutdownRaft();
   ASSERT_EQ(signal.wait_for(std::chrono::seconds(15)),
             std::future_status::ready);
