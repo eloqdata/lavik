@@ -155,7 +155,7 @@ After installing the bypass dependencies, use
 archive with DPDK/SPDK support.
 
 The archive contains `lavik`, `lavik-meta`, `lavik-ctl`, `LICENSE`, and notices
-under `dist/`. This command builds the `minimal` variant. Main-branch
+under `dist/`. Without the bypass option, packaging builds the `minimal` variant. Main-branch
 [Ubuntu release CI](.github/workflows/release.yml) builds both variants for
 x86_64 and ARM64. Download the four archives and their SHA-256 files from
 [Nightly](https://github.com/eloqdata/lavik/releases/tag/nightly), which is
