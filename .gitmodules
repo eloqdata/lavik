@@ -1,6 +1,6 @@
 [submodule "bycorf"]
 	path = bycorf
-	url = https://github.com/thweetkomputer/celer.git
+	url = https://github.com/eloqdata/bycorf.git
 [submodule "third_party/mimalloc"]
 	path = third_party/mimalloc
 	url = https://github.com/microsoft/mimalloc.git

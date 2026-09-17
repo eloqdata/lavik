@@ -32,6 +32,14 @@ test a separate Bycorf checkout without replacing the repository's submodule.
 The default remains the pinned `bycorf/` checkout. Record both revisions when
 comparing performance with an alternate runtime.
 
+The pinned runtime is hosted at [eloqdata/bycorf](https://github.com/eloqdata/bycorf).
+In an existing checkout, refresh the locally cached submodule URL before updating:
+
+```bash
+git submodule sync -- bycorf
+git submodule update --init bycorf
+```
+
 When aggressive optimization is enabled, CMake's IPO support configures both
 compilation and linking for the non-Debug server and every bundled runtime
 library that feeds it, including Bycorf and the C libraries. Test-only
