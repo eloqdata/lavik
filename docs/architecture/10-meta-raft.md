@@ -166,7 +166,9 @@ one local capture may be in progress alongside it. The application image cap is
 so deployments must allow multiple image-sized allocations at that cap.
 Saturated log queues cannot consume control reservations. Saturation stops new
 storage-dependent work, including new local election terms, while same-term
-heartbeat processing remains available.
+heartbeat processing remains available. An authenticated higher term revokes
+authority immediately even at saturation; one retained maximum-term observation
+waits for ordered persistence capacity, without acknowledging the rejected RPC.
 
 Failed local snapshot preparation preserves the previous recovery root and
 increments the existing snapshot-failure guard. Publication, WAL, replay or

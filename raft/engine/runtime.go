@@ -110,6 +110,7 @@ type Runtime struct {
 	bulkQueue             []snapshotWork
 	preparedIncoming      *pb.Message
 	resignApplied         uint64
+	deferredTerm          *pb.Message
 }
 
 // Open recovers local state before starting any timers. Transport must not
@@ -444,6 +445,9 @@ func (r *Runtime) run() {
 		close(r.done)
 	}()
 	for {
+		if failure = r.advanceDeferredTerm(); failure != nil {
+			return
+		}
 		if !r.replayed && r.core.applied >= r.replayTarget {
 			r.replayed = true
 			close(r.replayDone)
@@ -511,7 +515,7 @@ func (r *Runtime) run() {
 				// A blocked vote writer must not accumulate unlimited new local
 				// election terms. Stable leaders still tick/send/check quorum;
 				// followers continue servicing same-term heartbeat traffic.
-				if !r.storageFull() || r.core.status().IsLeader {
+				if r.deferredTerm == nil && (!r.storageFull() || r.core.status().IsLeader) {
 					r.core.raw.Tick()
 				}
 			}
@@ -693,6 +697,34 @@ func (r *Runtime) step(m *pb.Message) error {
 	if !r.knownPeer(m.GetFrom()) {
 		return nil
 	}
+	if r.deferredTerm != nil && m.GetTerm() <= r.deferredTerm.GetTerm() {
+		// Do not grant a lower-term vote or revive old protocol work while
+		// the observed higher term is waiting for its metadata reservation.
+		return nil
+	}
+	// Pre-vote requests and successful pre-vote replies describe a prospective
+	// term, not evidence that the peer has advanced its durable term.
+	higherTerm := m.GetTerm() > s.Term && m.GetType() != pb.MsgPreVote &&
+		!(m.GetType() == pb.MsgPreVoteResp && !m.GetReject())
+	if higherTerm && (r.storageFull() || (m.GetType() == pb.MsgApp && len(m.Entries) > 0 && r.logFull())) {
+		// The bounded mandatory-state reservation may be exhausted. Revoke
+		// application authority now and retain only the maximum observed term.
+		// Once space returns, a reject-only local observation lets RawNode
+		// demote/persist in order without retaining this RPC or granting a vote.
+		if r.deferredTerm == nil || m.GetTerm() > r.deferredTerm.GetTerm() {
+			r.deferredTerm = &pb.Message{Type: pb.MsgVoteResp.Enum(), From: new(raft.LocalAppendThread), To: new(r.cfg.Local.ID), Term: m.Term, Reject: new(true)}
+		}
+		return nil
+	}
+	if higherTerm && m.GetType() == pb.MsgHeartbeatResp {
+		// A stale challenge is not a liveness proof, but an authenticated
+		// higher term must still demote us before its persistence completes.
+		err := r.core.raw.Step(m)
+		if errors.Is(err, raft.ErrStepPeerNotFound) {
+			return nil
+		}
+		return err
+	}
 	if m.GetType() == pb.MsgApp && len(m.Entries) > 0 && r.logFull() {
 		return nil
 	}
@@ -735,6 +767,22 @@ func (r *Runtime) step(m *pb.Message) error {
 		return nil
 	}
 	return err
+}
+
+func (r *Runtime) advanceDeferredTerm() error {
+	if r.deferredTerm == nil || r.storageFull() {
+		return nil
+	}
+	message := r.deferredTerm
+	r.deferredTerm = nil
+	if message.GetTerm() <= r.core.status().Term {
+		return nil
+	}
+	// Use the local executor address so removal of the original peer cannot
+	// erase an already authenticated term observation. This reject-only message
+	// is stepped strictly in a higher term: Raft demotes before dispatching it,
+	// so it cannot count as a vote, acknowledge storage, or elect a candidate.
+	return r.core.raw.Step(message)
 }
 
 func (r *Runtime) ready() error {

@@ -176,7 +176,7 @@ func (r *Runtime) authorityRole(role Role) Role {
 			r.epochRevoked = true
 		}
 	}
-	if r.epochRevoked || !r.knownPeer(r.cfg.Local.ID) {
+	if r.epochRevoked || (r.deferredTerm != nil && r.deferredTerm.GetTerm() > role.Term) || !r.knownPeer(r.cfg.Local.ID) {
 		role.IsLeader = false
 		role.CaughtUp = false
 	}

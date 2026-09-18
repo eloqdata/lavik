@@ -98,7 +98,7 @@ func (r *Runtime) advanceMembership() error {
 		return nil
 	}
 	status := r.core.status()
-	if !status.IsLeader || r.epochRevoked || status.Term != op.term {
+	if !status.IsLeader || r.epochRevoked || r.deferredTerm != nil || status.Term != op.term {
 		op.result <- Result{Err: ErrStopped}
 		r.memberChange = nil
 		return nil

@@ -94,3 +94,45 @@ func TestPublishedEvidenceExpiresOnRevocationAndReconnect(t *testing.T) {
 		})
 	}
 }
+
+func TestStorageSaturationCannotHideHigherTerm(t *testing.T) {
+	r := &Runtime{cfg: Config{Local: testMembers()[0], Heartbeat: 100 * time.Millisecond, ElectionTicks: 3, QueueCapacity: 8, MaxPendingBytes: 2 << 20},
+		core: testCore(t, 1), disk: &diskStore{}, transport: &generationLink{}, protocolLeader: true, protocolTerm: 1,
+		leaderSince: time.Now(), pendingTasks: 40, liveness: map[uint64]*peerLiveness{2: {confirmed: time.Now()}}}
+	role := Role{Term: 1, IsLeader: true, CaughtUp: true}
+	if !r.authorityRole(role).IsLeader {
+		t.Fatal("missing initial authority")
+	}
+	for _, term := range []uint64{2, 5, 3} {
+		if err := r.step(&pb.Message{Type: pb.MsgHeartbeat.Enum(), From: new(uint64(2)), To: new(uint64(1)), Term: new(term)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r.deferredTerm == nil || r.deferredTerm.GetTerm() != 5 || r.authorityRole(role).IsLeader {
+		t.Fatal("full storage hid a higher term or retained the wrong observation")
+	}
+	if r.core.status().Term != 1 {
+		t.Fatal("saturated queue admitted another persistence task")
+	}
+	// A concurrent committed removal cannot make an authenticated, already
+	// observed term disappear when the older disk completion finally arrives.
+	r.core.conf = r.core.raw.ApplyConfChange(&pb.ConfChange{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: new(uint64(2))})
+	delete(r.core.members, 2)
+	r.pendingTasks = 0
+	if err := r.advanceDeferredTerm(); err != nil {
+		t.Fatal(err)
+	}
+	if r.core.status().Term != 5 || r.core.status().IsLeader {
+		t.Fatal("deferred term did not demote before processing more work")
+	}
+}
+
+func TestHigherTermHeartbeatReplyDemotesWithoutCountingStaleProof(t *testing.T) {
+	r := &Runtime{cfg: Config{Local: testMembers()[0], QueueCapacity: 8, MaxPendingBytes: 2 << 20}, core: testCore(t, 1), liveness: map[uint64]*peerLiveness{}}
+	if err := r.step(&pb.Message{Type: pb.MsgHeartbeatResp.Enum(), From: new(uint64(2)), To: new(uint64(1)), Term: new(uint64(2)), Context: []byte("stale")}); err != nil {
+		t.Fatal(err)
+	}
+	if r.core.status().Term != 2 || len(r.liveness) != 0 {
+		t.Fatal("higher term ignored or stale reply counted as quorum evidence")
+	}
+}
