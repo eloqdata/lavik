@@ -495,10 +495,7 @@ L 1111.68 745.524
    <text style="font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="75.816" transform="rotate(-0 51.84 75.816)">1B keys × 1 KiB · 60 s/run · 16 memtier threads · pipeline 1</text>
   </g>
   <g id="text_39">
-   <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="804.492" transform="rotate(-0 51.84 804.492)">Lavik v0.1.0-beta.1 · defrag enabled · six NVMe devices via SPDK · peers on RAID0/XFS storage tiers</text>
-  </g>
-  <g id="text_40">
-   <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="823.8672" transform="rotate(-0 51.84 823.8672)">September 18, 2026 · peer controls reused from the same day's earlier sweep</text>
+   <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="804.492" transform="rotate(-0 51.84 804.492)">Lavik v0.1.0-beta.1 · six NVMe devices via SPDK · peers on RAID0/XFS storage tiers</text>
   </g>
   <g id="legend_1">
    <g id="line2d_55">
@@ -510,7 +507,7 @@ L 333.628086 116.151203
      <use xlink:href="#m06f3b145af" x="318.678086" y="116.151203" style="fill: #1473e6; stroke: #1473e6; stroke-linejoin: miter"/>
     </g>
    </g>
-   <g id="text_41">
+   <g id="text_40">
     <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #17202a" x="342.828086" y="120.176203" transform="rotate(-0 342.828086 120.176203)">Lavik SPDK · 16 workers</text>
    </g>
    <g id="line2d_56">
@@ -522,7 +519,7 @@ L 542.645977 116.151203
      <use xlink:href="#m1580a30127" x="527.695977" y="116.151203" style="fill: #e97827; stroke: #e97827; stroke-linejoin: miter"/>
     </g>
    </g>
-   <g id="text_42">
+   <g id="text_41">
     <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #17202a" x="551.845977" y="120.176203" transform="rotate(-0 551.845977 120.176203)">Dragonfly · Tiered Storage</text>
    </g>
    <g id="line2d_57">
@@ -534,7 +531,7 @@ L 764.509727 116.151203
      <use xlink:href="#m68e1e27000" x="749.559727" y="116.151203" style="fill: #c84c8a; stroke: #c84c8a; stroke-linejoin: miter"/>
     </g>
    </g>
-   <g id="text_43">
+   <g id="text_42">
     <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #17202a" x="773.709727" y="120.176203" transform="rotate(-0 773.709727 120.176203)">Garnet · Storage Tier</text>
    </g>
   </g>

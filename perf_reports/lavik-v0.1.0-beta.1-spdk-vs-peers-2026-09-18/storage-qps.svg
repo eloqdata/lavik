@@ -592,10 +592,7 @@ L 1111.68 745.524
    <text style="font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="75.816" transform="rotate(-0 51.84 75.816)">1B keys × 1 KiB · 60 s/run · 16 memtier threads · pipeline 1</text>
   </g>
   <g id="text_33">
-   <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="804.492" transform="rotate(-0 51.84 804.492)">Lavik v0.1.0-beta.1 · defrag enabled · six NVMe devices via SPDK · peers on RAID0/XFS storage tiers</text>
-  </g>
-  <g id="text_34">
-   <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="823.8672" transform="rotate(-0 51.84 823.8672)">September 18, 2026 · peer controls reused from the same day's earlier sweep</text>
+   <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="804.492" transform="rotate(-0 51.84 804.492)">Lavik v0.1.0-beta.1 · six NVMe devices via SPDK · peers on RAID0/XFS storage tiers</text>
   </g>
   <g id="legend_1">
    <g id="patch_44">
@@ -606,7 +603,7 @@ L 303.728086 112.126203
 z
 " style="fill: url(#h48bb6e0eb0); stroke: #ffffff; stroke-linejoin: miter"/>
    </g>
-   <g id="text_35">
+   <g id="text_34">
     <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #17202a" x="342.828086" y="120.176203" transform="rotate(-0 342.828086 120.176203)">Lavik SPDK · 16 workers</text>
    </g>
    <g id="patch_45">
@@ -617,7 +614,7 @@ L 512.745977 112.126203
 z
 " style="fill: url(#heefd260676); stroke: #ffffff; stroke-linejoin: miter"/>
    </g>
-   <g id="text_36">
+   <g id="text_35">
     <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #17202a" x="551.845977" y="120.176203" transform="rotate(-0 551.845977 120.176203)">Dragonfly · Tiered Storage</text>
    </g>
    <g id="patch_46">
@@ -628,7 +625,7 @@ L 734.609727 112.126203
 z
 " style="fill: url(#h41df76501f); stroke: #ffffff; stroke-linejoin: miter"/>
    </g>
-   <g id="text_37">
+   <g id="text_36">
     <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #17202a" x="773.709727" y="120.176203" transform="rotate(-0 773.709727 120.176203)">Garnet · Storage Tier</text>
    </g>
   </g>

@@ -554,10 +554,7 @@ L 1111.68 745.524
    <text style="font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="75.816" transform="rotate(-0 51.84 75.816)">10M keys × 1 KiB · 30 s/run · 16 memtier threads · pipeline 1</text>
   </g>
   <g id="text_33">
-   <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="804.492" transform="rotate(-0 51.84 804.492)">Lavik v0.1.0-beta.1 · defrag enabled · six NVMe devices via SPDK · Redis/Valkey in DRAM</text>
-  </g>
-  <g id="text_34">
-   <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="823.8672" transform="rotate(-0 51.84 823.8672)">September 18, 2026 · peer controls reused from the same day's earlier sweep</text>
+   <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="804.492" transform="rotate(-0 51.84 804.492)">Lavik v0.1.0-beta.1 · six NVMe devices via SPDK · Redis/Valkey in DRAM</text>
   </g>
   <g id="legend_1">
    <g id="patch_38">
@@ -568,7 +565,7 @@ L 277.499102 112.126203
 z
 " style="fill: url(#h48bb6e0eb0); stroke: #ffffff; stroke-linejoin: miter"/>
    </g>
-   <g id="text_35">
+   <g id="text_34">
     <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #17202a" x="316.599102" y="120.176203" transform="rotate(-0 316.599102 120.176203)">Lavik SPDK · 16 workers</text>
    </g>
    <g id="patch_39">
@@ -579,7 +576,7 @@ L 486.516992 112.126203
 z
 " style="fill: url(#heefd260676); stroke: #ffffff; stroke-linejoin: miter"/>
    </g>
-   <g id="text_36">
+   <g id="text_35">
     <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #17202a" x="525.616992" y="120.176203" transform="rotate(-0 525.616992 120.176203)">Redis · 16 I/O threads</text>
    </g>
    <g id="patch_40">
@@ -590,7 +587,7 @@ L 680.617227 112.126203
 z
 " style="fill: url(#h41df76501f); stroke: #ffffff; stroke-linejoin: miter"/>
    </g>
-   <g id="text_37">
+   <g id="text_36">
     <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #17202a" x="719.717227" y="120.176203" transform="rotate(-0 719.717227 120.176203)">Valkey · GET 16 / SET 8 I/O threads</text>
    </g>
   </g>

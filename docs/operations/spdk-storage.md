@@ -31,7 +31,7 @@ the standard package needs `libnuma1` and `libuuid1`.
 
 The binary archive does not bundle SPDK's host setup script. Obtain the helper
 from the source revision matching the package; this does not require compiling
-Lavik. For the beta used in the September 18 benchmark:
+Lavik. For v0.1.0-beta.1:
 
 ```bash
 git clone --branch v0.1.0-beta.1 --depth 1 https://github.com/eloqdata/lavik.git lavik-spdk-setup
@@ -122,8 +122,8 @@ driver state and rerun the same allowlisted config after enabling the mode.
 Set the extracted binary's absolute path and adjust the bind address and CPU
 list to your machine. The default worker count follows the CPU affinity, so
 `taskset -c 0-15` selects 16 workers. The example omits `v0.1.0-beta.1`
-defaults: kernel TCP, loopback address, port 6379, pinned workers, disabled
-metrics, and enabled defrag:
+defaults: kernel TCP, loopback address, port 6379, pinned workers, and disabled
+metrics:
 
 ```bash
 LAVIK_BINARY='/opt/lavik-v0.1.0-beta.1-linux-x86_64/lavik'
@@ -152,14 +152,12 @@ server. Query the same bind address and port used at launch:
 
 ```bash
 redis-cli -h 127.0.0.1 -p 6379 PING
-redis-cli -h 127.0.0.1 -p 6379 CONFIG GET defrag-paused
 redis-cli -h 127.0.0.1 -p 6379 CONFIG GET spdk-max-completions-per-poll
 ```
 
-Expect `PONG`, `no`, and `16`, respectively. The foreground pre-poll option
+Expect `PONG` and `16`, respectively. The foreground pre-poll option
 keeps its startup default; verify `spdk_foreground_pre_poll_us=5` in the startup
-log rather than through `CONFIG GET`. Defrag being enabled does
-not mean a reclamation job must be active when queried. Inspect startup logs
+log rather than through `CONFIG GET`. Inspect startup logs
 for SPDK initialization and the selected namespaces before loading data.
 
 ## Stop and restore the host

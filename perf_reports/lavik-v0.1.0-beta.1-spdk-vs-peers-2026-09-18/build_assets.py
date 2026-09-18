@@ -101,8 +101,6 @@ def style_axis(ax, title, connections, *, metric="qps", maximum=None):
 
 def save(fig, name, footer):
     fig.text(.045, .045, footer, fontsize=11.5, color="#566573")
-    fig.text(.045, .022, "September 18, 2026 · peer controls reused from the same day's earlier sweep",
-             fontsize=10.5, color="#566573")
     for extension in ["svg", "png"]:
         # Omit wall-clock metadata and fix SVG IDs for reproducible review diffs.
         fig.savefig(ROOT / f"{name}.{extension}", dpi=150,
@@ -158,7 +156,7 @@ def comparisons(rows, group, *, metric="qps"):
                 ax.plot(range(len(connections)), values, color=COLORS[system],
                         marker=["s", "^", "D"][index], linewidth=2.6, markersize=6)
         ax.set_xlim(-.55, len(connections) - .45)
-    footer = "Lavik v0.1.0-beta.1 · defrag enabled · six NVMe devices via SPDK · " + (
+    footer = "Lavik v0.1.0-beta.1 · six NVMe devices via SPDK · " + (
         "Redis/Valkey in DRAM" if group == "memory" else "peers on RAID0/XFS storage tiers")
     save(fig, group + ("-qps" if throughput else "-p999"), footer)
 

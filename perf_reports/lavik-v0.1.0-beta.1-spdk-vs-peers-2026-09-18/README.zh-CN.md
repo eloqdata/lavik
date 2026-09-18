@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Lavik v0.1.0-beta.1：开启 defrag 的 SPDK 与竞品对比
+# Lavik v0.1.0-beta.1：SPDK 与竞品对比
 
 [English](README.md) | **简体中文**
 
-2026 年 9 月 18 日。使用实际下载的标准 beta 发布包，在独立清盘重灌的数据集上测量 SPDK；报告包含新测的 22 个 Lavik 点，以及当天早些时候在相同主机上完成的 124 个竞品对照点。本报告不纳入 io_uring。
+使用实际下载的标准 beta 发布包，在独立清盘重灌的数据集上测量 SPDK；报告包含新测的 22 个 Lavik 点，以及当天早些时候在相同主机上完成的 124 个竞品对照点。本报告不纳入 io_uring。
 
 - 1000 万条 GET：SPDK 峰值 **1012.2k QPS**（640 连接），该点 p99 **3.599 ms**、p99.9 **5.631 ms**。
 - 1000 万条 SET：SPDK 峰值 **930.5k QPS**（1280 连接），该点 p99 **4.799 ms**、p99.9 **8.095 ms**。
@@ -133,7 +133,6 @@ sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
 
 10 亿条使用相同配置，并增加 `--shutdown-checkpoint`。两个数据集都清盘后
 重新灌入，不复用其他后端的 checkpoint。EAL 预留 8 GiB，不是 Lavik 总内存上限。
-不传 `--defrag-paused`，每个正式点前确认 `CONFIG GET defrag-paused` 为 `no`；
 `--spdk-max-completions-per-poll=16` 将默认值 `8` 改为 `16`；
 `--tomb-raider-interval-ms=0` 关闭默认每天一次的 tombstone 扫描。
 `CONFIG GET spdk-max-completions-per-poll` 为 `16`，foreground pre-poll
@@ -148,13 +147,13 @@ EAL 环境变量、盘序列号/PCI 地址、配置检查、绑定/恢复日志�
 
 - 实测标准 `v0.1.0-beta.1` 发布包，源提交 `3955b98d43b312324aa8d52775df52cfb111c0d0`，二进制 SHA-256 `b14da83ef4f3146848e8b27f4c556d01696e8f28398cf38f3a97bd68d68b1a31`；版本输出为 `lavik 0.1.0-beta.1`。发布的归档校验值已通过核对，没有自行编译或修改源码。
 - 服务端为 EPYC 9V74（8 核 / 16 线程，约 126 GiB RAM），客户端为 EPYC 9V45（16 核，约 31 GiB RAM），均限制在 CPU 0–15。产品串行运行，期间不调整 CPU/IRQ 策略。
-- Lavik 为 16 worker、kernel TCP、6 块 NVMe SPDK、busy-poll 20 µs、foreground/background budget 1000/10 µs、background warrant 1%、defrag 开启、Tomb Raider 关闭。8 GiB hugepages，completion cap=16，foreground pre-poll=5 µs。每组结束恢复驱动、hugepages 和 VFIO 原值。
+- Lavik 为 16 worker、kernel TCP、6 块 NVMe SPDK、busy-poll 20 µs、foreground/background budget 1000/10 µs、background warrant 1%、Tomb Raider 关闭。8 GiB hugepages，completion cap=16，foreground pre-poll=5 µs。每组结束恢复驱动、hugepages 和 VFIO 原值。
 - Redis 8.8.0、Valkey 9.1.0 扫描 1/2/4/8/16 I/O 线程，关闭 AOF 和自动快照；每个配置从该产品新灌并验证的基线 RDB 重启。Dragonfly 1.40.2 使用 16 proactor、96 GiB maxmemory 和 Tiered Storage；Garnet 2.1.5 使用 64 GiB hybrid log、32 GiB read cache、16 GiB index 和 Libaio Storage Tier。存储对照使用相同 6 块盘组成的 RAID0/XFS 文件。
 - memtier 2.5.1，16 线程，pipeline=1，无限速；十进制键 1..N、无前缀、1024 B value，均匀随机 GET 或覆盖 SET。10M 每点 30 秒、80/160/320/640/1280 连接；1B 每点 60 秒，另加 2560 连接。Lavik 10M、Redis、Valkey 预热 GET 10 秒；Dragonfly、Garnet 额外预热 GET 180 秒（8 线程、80 连接）；Lavik 1B 不额外预热。
 - 10M 保留历史脚本的默认相关随机流；1B 全部产品使用 `--distinct-client-seed`，避免多个客户端重复同一随机序列制造缓存局部性。与 9 月 6 日原报告相比，客户端随机流和 Clang/native → GCC/x86-64-v2 构建有差异，不能把差异单独归因于代码。
 - 全部配置测前检查精确键数和采样值长度；除 Garnet 外，测后也完成同样检查。Garnet 测前暂停后续压缩，等待日志边界稳定并完成扫描后恢复 Lookup；每个正式点确认 Lookup。其 12 个正式点结束后按用户要求停止耗时测后扫描，测后键数和值长度未验证。中断记录和实际 SIGTERM 退出码保留在证据里。测前扫描也会影响缓存历史。
 - 146 个正式点均无连接错误，GET 无 miss。这不能替代 Garnet 缺少的测后精确计数。本轮新测 22 个 SPDK 点，复用当天早些时候的 124 个竞品点；来源、时间戳见 `control-provenance.json` 和原始证据。先前 nightly 和 io_uring 尝试单独保存，均不计入本报告。
-- 各产品的每个命令、连接数和服务端线程配置均测一轮：10M 每点 30 秒，1B 每点 60 秒；峰值为连接数扫描的最大值。产品的内存预算、缓存、磁盘拓扑和持久性语义不同；不能跨 10M / 1B 两组混排，也不能声称等持久性成本。上一轮 Lavik 为 97f63d0 且暂停 defrag，本轮为 3955b98 且开启 defrag，两轮变化不能只归因于 defrag。详细方法见英文版。
+- 各产品的每个命令、连接数和服务端线程配置均测一轮：10M 每点 30 秒，1B 每点 60 秒；峰值为连接数扫描的最大值。产品的内存预算、缓存、磁盘拓扑和持久性语义不同；不能跨 10M / 1B 两组混排，也不能声称等持久性成本。详细方法见英文版。
 
 ¹ 线程含义不同：Lavik 为 worker，Redis/Valkey 为 I/O 线程，Dragonfly 为 proactor，Garnet 为线程池最低线程数；Garnet 实际总线程数不固定为 16，全部线程共享 CPU 0–15。
 
