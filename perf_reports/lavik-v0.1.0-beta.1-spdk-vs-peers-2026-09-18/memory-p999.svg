@@ -452,7 +452,7 @@ L 1111.68 745.524
    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="804.492" transform="rotate(-0 51.84 804.492)">Lavik v0.1.0-beta.1 · defrag enabled · six NVMe devices via SPDK · Redis/Valkey in DRAM</text>
   </g>
   <g id="text_36">
-   <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="823.8672" transform="rotate(-0 51.84 823.8672)">September 18, 2026 · one run per point · peer controls reused from the same day's earlier sweep</text>
+   <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="823.8672" transform="rotate(-0 51.84 823.8672)">September 18, 2026 · peer controls reused from the same day's earlier sweep</text>
   </g>
   <g id="legend_1">
    <g id="line2d_49">

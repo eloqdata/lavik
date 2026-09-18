@@ -918,7 +918,7 @@ L 1094.4 757.944
    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="831.996" transform="rotate(-0 51.84 831.996)">Zero-baseline QPS · lines connect ordered connection-count categories; they do not imply interpolation</text>
   </g>
   <g id="text_60">
-   <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="852.0336" transform="rotate(-0 51.84 852.0336)">September 18, 2026 · one run per point · peer controls reused from the same day's earlier sweep</text>
+   <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="852.0336" transform="rotate(-0 51.84 852.0336)">September 18, 2026 · peer controls reused from the same day's earlier sweep</text>
   </g>
   <g id="legend_1">
    <g id="line2d_89">

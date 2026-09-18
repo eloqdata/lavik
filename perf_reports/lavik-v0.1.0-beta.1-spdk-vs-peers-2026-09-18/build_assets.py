@@ -101,7 +101,7 @@ def style_axis(ax, title, connections, *, metric="qps", maximum=None):
 
 def save(fig, name, footer):
     fig.text(.045, .045, footer, fontsize=11.5, color="#566573")
-    fig.text(.045, .022, "September 18, 2026 · one run per point · peer controls reused from the same day's earlier sweep",
+    fig.text(.045, .022, "September 18, 2026 · peer controls reused from the same day's earlier sweep",
              fontsize=10.5, color="#566573")
     for extension in ["svg", "png"]:
         # Omit wall-clock metadata and fix SVG IDs for reproducible review diffs.

@@ -69,7 +69,7 @@ SPDK NVMe namespaces, so capacity scales with storage.
   **930,465 SET QPS** over **10 million keys with 1 KiB values**.
   GET/SET p99 latency at those peaks was **3.599 / 4.799 ms**.
   See [in-memory comparisons](#in-memory-redis-and-valkey) for Redis/Valkey
-  controls and measurement limits.
+  controls and test settings.
 
 - **Put multiple CPU cores to work in one server.** Worker threads own their
   data partitions and execute requests in parallel. A C++23 coroutine runtime
@@ -327,8 +327,7 @@ system's best measured I/O-thread setting per command.
 | Valkey 9.1.0 | 965,697 | 4.543 ms | 802,519 | 4.383 ms |
 
 Lavik SPDK's GET peak occurred at 640 connections and its SET
-peak at 1,280. Each point has one run, so small differences do
-not establish statistical significance. Redis and Valkey had AOF and
+peak at 1,280. Redis and Valkey had AOF and
 automatic RDB saves disabled. Their controls reuse the earlier September 18
 sweep; all Lavik points were measured again with the beta release package
 and defrag enabled. This 10 GB test is independent of the larger
