@@ -55,7 +55,7 @@ SPDK NVMe namespaces, so capacity scales with storage.
   devices, or directly on NVMe through SPDK.
 
 - **Multiples of the throughput of disk-backed alternatives.** In the
-  **one-billion-key, 1 TB** test, Lavik v0.1.0-beta.1 reached **952,560 GET QPS**:
+  **one-billion-key, 1 TB** test, [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) reached **952,560 GET QPS**:
   **2.04× Dragonfly's and 2.13× Garnet's peak read throughput**.
   In the broader 200-million-key comparison, Lavik SPDK delivered
   **2.44–4.93× the throughput of Pika, Apache Kvrocks, and Tendis** across
@@ -248,7 +248,7 @@ for persistent files, raw devices, and storage expansion.
 ## Benchmark
 
 **Lavik delivers multi-fold throughput gains over several disk-backed KV
-systems.** The v0.1.0-beta.1 comparison includes
+systems.** The [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) benchmarks compare
 throughput and tail latency against Redis, Valkey, Dragonfly, and Garnet.
 
 Browse the [performance reports](perf_reports/README.md) for full results in
@@ -285,7 +285,7 @@ throughput was **1.65× Dragonfly's and 1.51× Garnet's**; write throughput was
 
 The [1 TB storage-tier test](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md#1b-keys--1-kib-storage-tier-controls)
 used **one billion 1 KiB values** on an AMD EPYC 9V74 server with six NVMe
-drives. The downloaded Lavik v0.1.0-beta.1 with SPDK peaked
+drives. The [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) release with SPDK peaked
 at **952,560 GET QPS**, or **2.04× Dragonfly's and 2.13× Garnet's peak read throughput**.
 Its **764,939 SET QPS** was **1.42× Dragonfly's and 1.02× Garnet's**.
 These compare each system's highest measured point within its concurrency
@@ -308,8 +308,8 @@ covering workloads A/B/C/D and their tail latencies.
 
 The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md#10m-keys--1-kib-in-memory-controls)
 used an AMD EPYC 9V74 server with approximately 126 GiB RAM and
-**10 million keys with 1 KiB values** (about 10 GB). The downloaded Lavik
-v0.1.0-beta.1 used SPDK with six raw NVMe
+**10 million keys with 1 KiB values** (about 10 GB). The
+[Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) release used SPDK with six raw NVMe
 devices and separately loaded datasets. Redis 8.8.0 and Valkey 9.1.0 held
 the complete dataset in memory. Tests swept 80–1,280 connections with
 pipeline=1 and 30-second measurement windows, selecting each in-memory
@@ -326,7 +326,7 @@ system's best measured I/O-thread setting per command.
 Lavik SPDK's GET peak occurred at 640 connections and its SET
 peak at 1,280. Redis and Valkey had AOF and
 automatic RDB saves disabled. Their controls reuse an earlier sweep on the same
-hosts; all Lavik points were measured with the beta release package. This 10 GB
+hosts; all Lavik points were measured with the release package. This 10 GB
 test is independent of the larger storage-tier benchmark above.
 
 ## Important notes
