@@ -410,6 +410,19 @@ class FiniteExpirationAuthorityService final : public bycorf::Service {
 
 }  // namespace
 
+TEST(StorageReplicationTest, RejectsDisabledDatabaseCounts) {
+  lavik::storage::StorageEngineOptions options;
+  options.database_count_ = 1;
+  lavik::storage::StorageEngine engine(std::move(options));
+
+  // Reject an invalid range before touching worker/session state. In
+  // particular, the standalone default must not silently become DB0-only.
+  for (const std::uint8_t count : {0, 2, 16}) {
+    const auto result = engine.BeginPartitionReplication(1, 0, count);
+    EXPECT_EQ(result.status().code(), absl::StatusCode::kInvalidArgument);
+  }
+}
+
 TEST(StorageEngineRuntimeFailureTest,
      PermanentRequestFenceAlsoPublishesTheMonitorLatch) {
   lavik::storage::StorageEngine engine({});

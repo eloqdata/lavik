@@ -716,10 +716,9 @@ absl::StatusOr<PartitionReplicationStart>
 StorageEngine::Impl::BeginPartitionReplication(std::uint64_t session_id,
                                                std::uint16_t partition_id,
                                                std::uint8_t db_count) {
-  if (db_count == 0 || db_count > kLogicalDatabaseCount) {
+  if (db_count == 0 || db_count > options_.database_count_) {
     return absl::InvalidArgumentError("invalid full-sync database count");
   }
-  db_count = std::min(db_count, options_.database_count_);
   WorkerStore& store = CurrentStore();
   const auto session = store.fullsync_sessions_.find(session_id);
   if (session == store.fullsync_sessions_.end()) {
