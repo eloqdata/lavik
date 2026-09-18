@@ -62,7 +62,7 @@ SPDK NVMe namespaces, so capacity scales with storage.
   the tested read, write, and mixed workloads.
   See [disk-backed comparisons](#disk-backed-kv-systems).
 
-- **NVMe storage, higher throughput than in-memory Redis and Valkey.**
+- **NVMe storage, beyond in-memory throughput.**
   In the 10-million-key
   benchmark, Lavik's peak GET throughput was **3.6% higher than Redis and
   4.8% higher than Valkey**. Its peak SET throughput was **2.2% higher than
