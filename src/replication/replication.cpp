@@ -7554,7 +7554,11 @@ class ReplicationManager::ReplicationGroup {
       if (cluster_recovery_ != nullptr) {
         auto revoked = co_await ReconcileClusterRecovery(std::nullopt);
         if (!revoked.ok()) co_return revoked;
-        if (cluster_rebuild_ != context)
+        // Joining recovery may change readiness within the same context.
+        // Retirement must not continue with the pre-suspension proof.
+        if (cluster_rebuild_ != context ||
+            context->state_.load(std::memory_order_acquire) != state ||
+            context->ready_token_.has_value() != completed_ready)
           co_return absl::AbortedError(
               "population changed while recovery was joined");
       }
