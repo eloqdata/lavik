@@ -220,12 +220,6 @@ class AuthorityGuard {
   AuthorityAdmission CaptureAndAdmit(const RequestView& request,
                                      MonotonicTime now) const;
 
-  // Read-only admission has the same finite-lease and routing checks, but
-  // retains no per-request proof across suspension. Thread-local snapshot
-  // ownership keeps this synchronous decision free of shared refcount writes
-  // and admission allocations. request.is_write_ must be false.
-  Decision AdmitRead(const RequestView& request, MonotonicTime now) const;
-
   // Lower-level verification of topology, session generation, and lease
   // deadline captured at admission. This call does not enter an in-flight cell
   // and is not by itself a safe request-mutation boundary; request paths use

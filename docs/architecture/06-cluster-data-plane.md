@@ -472,9 +472,9 @@ owned snapshots without acquiring the writer mutex. Ordinary renewals neither
 close request admission nor drain readers. Deadline-only renewal preserves
 the revocation generation; revocation invalidates earlier write proofs.
 Cached snapshots still require a current absolute-deadline check on every
-lease-dependent admission and mutation recheck. Read-only commands borrow
-snapshots during synchronous admission; writes retain their proof across
-suspension for the existing owner-side and final mutation rechecks.
+lease-dependent admission and mutation recheck. Reads and writes use the same
+admission path; only writes retain their proof across suspension for the
+existing owner-side and final mutation rechecks.
 
 Finite leases are required only for a Meta-managed local primary. Admission
 and the final mutation recheck both prove the current session, group

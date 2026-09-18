@@ -17,7 +17,6 @@
 #include "lavik/cluster/authority.h"
 
 #include <algorithm>
-#include <cassert>
 #include <limits>
 #include <utility>
 
@@ -356,25 +355,6 @@ AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
     admission.decision_.kind_ = Decision::Kind::kClusterDownUnbound;
   }
   return admission;
-}
-
-Decision AuthorityGuard::AdmitRead(const RequestView& request,
-                                   MonotonicTime now) const {
-  assert(!request.is_write_);
-  std::uint64_t version = 0;
-  const auto& state = CurrentCachedWithVersion(topology_, &version);
-  Decision decision = Admit(state.get(), request);
-  if (decision.kind_ != Decision::Kind::kServe || state == nullptr ||
-      request.slots_.empty()) {
-    return decision;
-  }
-  const GroupView* group = state->GroupForSlot(request.slots_.front());
-  if (group != nullptr &&
-      group->primary_node_index_ == state->SelfNodeIndex() &&
-      !LeaseCovers(CurrentAuthority(), *state, request.slots_, now)) {
-    decision.kind_ = Decision::Kind::kClusterDownUnbound;
-  }
-  return decision;
 }
 
 RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,

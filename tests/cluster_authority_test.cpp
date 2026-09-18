@@ -160,31 +160,6 @@ struct TestAuthorityControl {
   lavik::cluster::testing::TestTopologyInstaller topology;
 };
 
-TEST(ClusterAuthoritySnapshotTest, ReadAdmissionKeepsRoutingAndLeaseChecks) {
-  TestAuthorityControl control;
-  const std::array<std::uint16_t, 1> local{kSlotInA};
-  const std::array<std::uint16_t, 1> remote{kSlotInB};
-  const std::array<std::uint16_t, 2> cross{kSlotInA, kSlotInB};
-  const auto now = lavik::cluster::MonotonicTime{};
-  EXPECT_EQ(control.authority.AdmitRead(MakeRequest(local, false), now).kind_,
-            Decision::Kind::kLoading);
-  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), now).ok());
-  for (const auto slots : {std::span<const std::uint16_t>(local),
-                           std::span<const std::uint16_t>(remote),
-                           std::span<const std::uint16_t>(cross)}) {
-    const auto request = MakeRequest(slots, false);
-    const auto read = control.authority.AdmitRead(request, now);
-    const auto captured = control.authority.CaptureAndAdmit(request, now);
-    EXPECT_EQ(read.kind_, captured.decision().kind_);
-    EXPECT_EQ(read.moved_host_, captured.decision().moved_host_);
-    EXPECT_EQ(read.moved_port_, captured.decision().moved_port_);
-  }
-  ASSERT_TRUE(control.topology.Install(BuildState(kNodeR), now).ok());
-  EXPECT_EQ(
-      control.authority.AdmitRead(MakeRequest(local, false, true), now).kind_,
-      Decision::Kind::kServeStaleRead);
-}
-
 TEST(ClusterAuthoritySnapshotTest, CachedReadExpiresWithoutAnyPublication) {
   using namespace std::chrono_literals;
   TestAuthorityControl control;
@@ -192,12 +167,14 @@ TEST(ClusterAuthoritySnapshotTest, CachedReadExpiresWithoutAnyPublication) {
   ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), start, 10ms).ok());
   const std::array<std::uint16_t, 1> slots{kSlotInA};
   const auto read = MakeRequest(slots, false);
-  EXPECT_EQ(control.authority.AdmitRead(read, start + 9ms).kind_,
-            Decision::Kind::kServe);
+  EXPECT_EQ(
+      control.authority.CaptureAndAdmit(read, start + 9ms).decision().kind_,
+      Decision::Kind::kServe);
   const auto write =
       control.authority.CaptureAndAdmit(MakeRequest(slots, true), start + 9ms);
-  EXPECT_EQ(control.authority.AdmitRead(read, start + 10ms).kind_,
-            Decision::Kind::kClusterDownUnbound);
+  EXPECT_EQ(
+      control.authority.CaptureAndAdmit(read, start + 10ms).decision().kind_,
+      Decision::Kind::kClusterDownUnbound);
   EXPECT_EQ(control.authority.RecheckAtMutation(write, start + 10ms),
             RecheckResult::kReject);
 }
@@ -210,18 +187,21 @@ TEST(ClusterAuthoritySnapshotTest,
   ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), start, 10ms).ok());
   const std::array<std::uint16_t, 1> slots{kSlotInA};
   const auto read = MakeRequest(slots, false);
-  ASSERT_EQ(control.authority.AdmitRead(read, start + 4ms).kind_,
-            Decision::Kind::kServe);
+  ASSERT_EQ(
+      control.authority.CaptureAndAdmit(read, start + 4ms).decision().kind_,
+      Decision::Kind::kServe);
   const auto write =
       control.authority.CaptureAndAdmit(MakeRequest(slots, true), start + 4ms);
   ASSERT_TRUE(
       control.topology.Install(BuildState(kNodeA), start + 5ms, 10ms).ok());
-  EXPECT_EQ(control.authority.AdmitRead(read, start + 11ms).kind_,
-            Decision::Kind::kServe);
+  EXPECT_EQ(
+      control.authority.CaptureAndAdmit(read, start + 11ms).decision().kind_,
+      Decision::Kind::kServe);
   EXPECT_EQ(control.authority.RecheckAtMutation(write, start + 11ms),
             RecheckResult::kOk);
-  EXPECT_EQ(control.authority.AdmitRead(read, start + 15ms).kind_,
-            Decision::Kind::kClusterDownUnbound);
+  EXPECT_EQ(
+      control.authority.CaptureAndAdmit(read, start + 15ms).decision().kind_,
+      Decision::Kind::kClusterDownUnbound);
 }
 
 TEST(ClusterAuthoritySnapshotTest,
@@ -241,12 +221,13 @@ TEST(ClusterAuthoritySnapshotTest,
   for (int i = 0; i < 4; ++i) {
     readers.emplace_back([&] {
       const auto request = MakeRequest(slots, false);
-      if (control.authority.AdmitRead(request, now).kind_ !=
+      if (control.authority.CaptureAndAdmit(request, now).decision().kind_ !=
           Decision::Kind::kServe)
         ++failures;
       started.fetch_add(1, std::memory_order_release);
       while (phase.load(std::memory_order_acquire) == 0) {
-        const auto decision = control.authority.AdmitRead(request, now);
+        const auto decision =
+            control.authority.CaptureAndAdmit(request, now).decision();
         if (phase.load(std::memory_order_acquire) == 0 &&
             decision.kind_ != Decision::Kind::kServe)
           ++failures;
@@ -254,7 +235,7 @@ TEST(ClusterAuthoritySnapshotTest,
       while (phase.load(std::memory_order_acquire) != 2)
         std::this_thread::yield();
       for (int n = 0; n < 100; ++n) {
-        if (control.authority.AdmitRead(request, now).kind_ !=
+        if (control.authority.CaptureAndAdmit(request, now).decision().kind_ !=
             Decision::Kind::kClusterDownUnbound)
           ++failures;
         if (control.authority.Recheck(write, now) != RecheckResult::kReject)
@@ -289,17 +270,18 @@ TEST(ClusterAuthoritySnapshotTest, ReusedAddressDoesNotReuseCachedAuthority) {
   const auto request = MakeRequest(slots, false);
   control.emplace();
   ASSERT_TRUE(control->topology.Install(BuildState(kNodeA), now, 10ms).ok());
-  EXPECT_EQ(control->authority.AdmitRead(request, now).kind_,
+  EXPECT_EQ(control->authority.CaptureAndAdmit(request, now).decision().kind_,
             Decision::Kind::kServe);
   control.reset();
   control.emplace();
   ASSERT_TRUE(control->topology.Install(BuildState(kNodeA), now, 20ms).ok());
-  EXPECT_EQ(control->authority.AdmitRead(request, now + 15ms).kind_,
-            Decision::Kind::kServe);
+  EXPECT_EQ(
+      control->authority.CaptureAndAdmit(request, now + 15ms).decision().kind_,
+      Decision::Kind::kServe);
   control.reset();
   control.emplace();
   ASSERT_TRUE(control->topology.Install(BuildState(kNodeB), now, 20ms).ok());
-  EXPECT_EQ(control->authority.AdmitRead(request, now).kind_,
+  EXPECT_EQ(control->authority.CaptureAndAdmit(request, now).decision().kind_,
             Decision::Kind::kMoved);
 }
 
@@ -578,6 +560,12 @@ TEST(ClusterAuthorityTest,
     auto assigned = authority.CaptureAndAdmit(MakeRequest(slots, false), {});
     std::weak_ptr<const ServingState> replaced = assigned.state();
     cache.Publish(nullptr);
+    // Refresh the request-thread cache so the lifetime assertions below
+    // measure admission ownership without an extra cached snapshot owner.
+    EXPECT_EQ(authority.CaptureAndAdmit(MakeRequest(slots, false), {})
+                  .decision()
+                  .kind_,
+              Decision::Kind::kLoading);
     assigned = std::move(moved);
     EXPECT_TRUE(replaced.expired());
     EXPECT_TRUE(moved.decision().moved_host_.empty());
