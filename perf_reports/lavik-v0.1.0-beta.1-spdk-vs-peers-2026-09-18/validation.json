@@ -1,0 +1,15 @@
+{
+  "formal_points": 146,
+  "new_lavik_points": 22,
+  "reused_peer_points": 124,
+  "backend": "SPDK",
+  "defrag_paused": false,
+  "checked_sessions": 14,
+  "fully_verified_sessions": 13,
+  "post_validation_waivers": [
+    "storage/garnet/validation-after-waived.json"
+  ],
+  "zero_connection_errors": true,
+  "zero_get_misses": true,
+  "source_revision": "3955b98d43b312324aa8d52775df52cfb111c0d0"
+}

@@ -1,0 +1,111 @@
+group,product,system,server_threads,thread_role,workload,connections,keys,value_bytes,test_seconds,client_seed_mode,qps,avg_ms,p50_ms,p99_ms,p999_ms,p9999_ms,requests,client_cores,server_cores_enclosing_window,host_steal_percent_enclosing_window,connection_errors,source
+memory,Lavik defrag enabled / SPDK,lavik-spdk,16,workers,GET,80,10000000,1024,30,default-correlated,390494.48,0.20433,0.199,0.335,0.639,1.495,11714937,5.686,15.2427,0.0,0,memory/lavik-spdk/get-c80.json
+memory,Lavik defrag enabled / SPDK,lavik-spdk,16,workers,GET,160,10000000,1024,30,default-correlated,609160.94,0.2621,0.255,0.487,1.079,2.031,18276429,8.377,15.4623,0.0,0,memory/lavik-spdk/get-c160.json
+memory,Lavik defrag enabled / SPDK,lavik-spdk,16,workers,GET,320,10000000,1024,30,default-correlated,803016.34,0.39803,0.359,0.959,2.023,4.927,24093402,10.542,15.566,0.0,0,memory/lavik-spdk/get-c320.json
+memory,Lavik defrag enabled / SPDK,lavik-spdk,16,workers,GET,640,10000000,1024,30,default-correlated,1012179.91,0.63192,0.543,3.599,5.631,10.239,30370038,13.868,15.4569,0.0,0,memory/lavik-spdk/get-c640.json
+memory,Lavik defrag enabled / SPDK,lavik-spdk,16,workers,GET,1280,10000000,1024,30,default-correlated,940713.3,1.36,0.831,9.791,14.079,20.095,28227239,12.875,15.4428,0.0,0,memory/lavik-spdk/get-c1280.json
+memory,Lavik defrag enabled / SPDK,lavik-spdk,16,workers,SET,80,10000000,1024,30,default-correlated,473383.96,0.16863,0.151,0.591,1.823,2.751,14202011,6.887,14.5215,0.0,0,memory/lavik-spdk/set-c80.json
+memory,Lavik defrag enabled / SPDK,lavik-spdk,16,workers,SET,160,10000000,1024,30,default-correlated,633848.95,0.25212,0.223,1.071,2.431,3.503,19015840,8.788,15.2243,0.0,0,memory/lavik-spdk/set-c160.json
+memory,Lavik defrag enabled / SPDK,lavik-spdk,16,workers,SET,320,10000000,1024,30,default-correlated,759487.71,0.42098,0.359,1.671,2.847,4.511,22787891,10.343,14.9444,0.0,0,memory/lavik-spdk/set-c320.json
+memory,Lavik defrag enabled / SPDK,lavik-spdk,16,workers,SET,640,10000000,1024,30,default-correlated,876266.19,0.72995,0.567,3.567,5.183,8.511,26292226,12.153,15.5979,0.0,0,memory/lavik-spdk/set-c640.json
+memory,Lavik defrag enabled / SPDK,lavik-spdk,16,workers,SET,1280,10000000,1024,30,default-correlated,930464.99,1.3752,1.143,4.799,8.095,17.535,27919578,13.238,15.172,0.0,0,memory/lavik-spdk/set-c1280.json
+memory,Redis 8.8.0,redis,1,io-threads,GET,80,10000000,1024,30,default-correlated,153082.52,0.52225,0.487,0.831,1.151,2.351,4592524,2.165,0.982,0.0,0,memory/redis/io1/get-c80.json
+memory,Redis 8.8.0,redis,1,io-threads,GET,160,10000000,1024,30,default-correlated,157963.78,1.01232,0.951,1.839,1.975,2.687,4739034,2.3,0.9747,0.0,0,memory/redis/io1/get-c160.json
+memory,Redis 8.8.0,redis,1,io-threads,GET,320,10000000,1024,30,default-correlated,157926.29,2.02539,1.927,3.855,4.351,5.535,4738377,2.286,0.9795,0.0,0,memory/redis/io1/get-c320.json
+memory,Redis 8.8.0,redis,1,io-threads,GET,640,10000000,1024,30,default-correlated,155628.27,4.11117,3.967,7.999,9.407,12.223,4670094,1.928,0.9417,0.0,0,memory/redis/io1/get-c640.json
+memory,Redis 8.8.0,redis,1,io-threads,GET,1280,10000000,1024,30,default-correlated,135527.96,9.44473,8.703,17.535,22.783,27.391,4066782,1.615,0.9397,0.0,0,memory/redis/io1/get-c1280.json
+memory,Redis 8.8.0,redis,1,io-threads,SET,80,10000000,1024,30,default-correlated,141386.14,0.56566,0.519,0.903,1.135,2.127,4241622,1.989,0.9456,0.0,0,memory/redis/io1/set-c80.json
+memory,Redis 8.8.0,redis,1,io-threads,SET,160,10000000,1024,30,default-correlated,147828.0,1.08195,1.007,1.943,2.095,2.991,4434995,2.148,0.9492,0.0,0,memory/redis/io1/set-c160.json
+memory,Redis 8.8.0,redis,1,io-threads,SET,320,10000000,1024,30,default-correlated,148280.23,2.15752,2.063,4.095,4.415,5.727,4449064,2.145,0.9441,0.0,0,memory/redis/io1/set-c320.json
+memory,Redis 8.8.0,redis,1,io-threads,SET,640,10000000,1024,30,default-correlated,144757.38,4.42126,4.255,8.575,10.879,13.631,4343026,1.765,0.9453,0.0,0,memory/redis/io1/set-c640.json
+memory,Redis 8.8.0,redis,1,io-threads,SET,1280,10000000,1024,30,default-correlated,132317.94,9.6715,9.023,18.047,23.423,36.607,3971655,1.622,0.9357,0.0,0,memory/redis/io1/set-c1280.json
+memory,Redis 8.8.0,redis,2,io-threads,GET,80,10000000,1024,30,default-correlated,159791.05,0.50031,0.503,0.743,0.919,1.703,4793786,2.253,1.1631,0.0,0,memory/redis/io2/get-c80.json
+memory,Redis 8.8.0,redis,2,io-threads,GET,160,10000000,1024,30,default-correlated,156291.35,1.02315,0.831,1.855,2.079,2.831,4689088,2.291,1.0998,0.0,0,memory/redis/io2/get-c160.json
+memory,Redis 8.8.0,redis,2,io-threads,GET,320,10000000,1024,30,default-correlated,159579.35,2.0044,1.815,3.775,4.351,5.631,4788044,2.335,1.1144,0.0,0,memory/redis/io2/get-c320.json
+memory,Redis 8.8.0,redis,2,io-threads,GET,640,10000000,1024,30,default-correlated,158706.87,4.03173,3.887,7.871,10.047,13.247,4762242,1.938,1.0776,0.0,0,memory/redis/io2/get-c640.json
+memory,Redis 8.8.0,redis,2,io-threads,GET,1280,10000000,1024,30,default-correlated,135888.01,9.41978,8.767,18.175,22.527,29.951,4077129,1.646,1.049,0.0,0,memory/redis/io2/get-c1280.json
+memory,Redis 8.8.0,redis,2,io-threads,SET,80,10000000,1024,30,default-correlated,140556.25,0.56901,0.623,0.903,1.087,1.735,4216723,1.965,1.094,0.0,0,memory/redis/io2/set-c80.json
+memory,Redis 8.8.0,redis,2,io-threads,SET,160,10000000,1024,30,default-correlated,146851.96,1.08902,0.887,2.063,2.271,2.927,4406174,2.168,1.0823,0.0,0,memory/redis/io2/set-c160.json
+memory,Redis 8.8.0,redis,2,io-threads,SET,320,10000000,1024,30,default-correlated,148383.69,2.15611,1.967,4.095,4.863,6.143,4451768,2.14,1.0777,0.0,0,memory/redis/io2/set-c320.json
+memory,Redis 8.8.0,redis,2,io-threads,SET,640,10000000,1024,30,default-correlated,146867.69,4.35726,4.223,8.511,10.943,13.695,4406455,1.816,1.0622,0.0,0,memory/redis/io2/set-c640.json
+memory,Redis 8.8.0,redis,2,io-threads,SET,1280,10000000,1024,30,default-correlated,122610.11,10.43822,10.047,19.711,24.063,35.071,3679952,1.525,1.0427,0.0,0,memory/redis/io2/set-c1280.json
+memory,Redis 8.8.0,redis,4,io-threads,GET,80,10000000,1024,30,default-correlated,345041.04,0.23128,0.223,0.423,0.551,1.007,10351434,5.077,3.3352,0.0,0,memory/redis/io4/get-c80.json
+memory,Redis 8.8.0,redis,4,io-threads,GET,160,10000000,1024,30,default-correlated,415231.48,0.38457,0.383,0.607,0.751,1.911,12458103,6.157,3.4109,0.0,0,memory/redis/io4/get-c160.json
+memory,Redis 8.8.0,redis,4,io-threads,GET,320,10000000,1024,30,default-correlated,418773.35,0.76324,0.791,1.255,1.575,3.855,12564289,6.329,3.3802,0.0,0,memory/redis/io4/get-c320.json
+memory,Redis 8.8.0,redis,4,io-threads,GET,640,10000000,1024,30,default-correlated,436230.41,1.46608,1.191,2.751,4.735,9.599,13089015,6.585,3.2194,0.0,0,memory/redis/io4/get-c640.json
+memory,Redis 8.8.0,redis,4,io-threads,GET,1280,10000000,1024,30,default-correlated,434769.12,2.94255,2.607,5.951,12.415,19.071,13047944,6.657,3.2119,0.0,0,memory/redis/io4/get-c1280.json
+memory,Redis 8.8.0,redis,4,io-threads,SET,80,10000000,1024,30,default-correlated,335185.68,0.23826,0.231,0.423,0.535,0.743,10055669,4.988,3.3353,0.0,0,memory/redis/io4/set-c80.json
+memory,Redis 8.8.0,redis,4,io-threads,SET,160,10000000,1024,30,default-correlated,392258.07,0.40732,0.399,0.631,0.783,1.463,11768396,5.904,3.3008,0.0,0,memory/redis/io4/set-c160.json
+memory,Redis 8.8.0,redis,4,io-threads,SET,320,10000000,1024,30,default-correlated,392054.34,0.81551,0.855,1.399,1.743,4.511,11763806,5.966,3.2278,0.0,0,memory/redis/io4/set-c320.json
+memory,Redis 8.8.0,redis,4,io-threads,SET,640,10000000,1024,30,default-correlated,401368.95,1.59377,1.303,3.071,5.023,9.919,12042015,6.15,3.2235,0.0,0,memory/redis/io4/set-c640.json
+memory,Redis 8.8.0,redis,4,io-threads,SET,1280,10000000,1024,30,default-correlated,396396.41,3.22823,2.895,6.751,12.927,18.943,11894467,6.045,3.1793,0.0,0,memory/redis/io4/set-c1280.json
+memory,Redis 8.8.0,redis,8,io-threads,GET,80,10000000,1024,30,default-correlated,440056.68,0.18124,0.175,0.351,0.447,0.615,13201803,6.347,6.0813,0.0,0,memory/redis/io8/get-c80.json
+memory,Redis 8.8.0,redis,8,io-threads,GET,160,10000000,1024,30,default-correlated,590544.95,0.27037,0.263,0.543,0.735,1.631,17716558,8.212,6.9039,0.0,0,memory/redis/io8/get-c160.json
+memory,Redis 8.8.0,redis,8,io-threads,GET,320,10000000,1024,30,default-correlated,702442.15,0.45507,0.439,0.943,1.455,4.159,21076082,9.18,7.1674,0.0,0,memory/redis/io8/get-c320.json
+memory,Redis 8.8.0,redis,8,io-threads,GET,640,10000000,1024,30,default-correlated,807686.17,0.79182,0.695,2.671,4.479,9.023,24233135,10.764,7.2058,0.0,0,memory/redis/io8/get-c640.json
+memory,Redis 8.8.0,redis,8,io-threads,GET,1280,10000000,1024,30,default-correlated,835793.73,1.53061,1.335,4.415,8.831,16.639,25081182,11.552,7.1534,0.0,0,memory/redis/io8/get-c1280.json
+memory,Redis 8.8.0,redis,8,io-threads,SET,80,10000000,1024,30,default-correlated,434791.45,0.18357,0.175,0.359,0.487,1.055,13044211,6.423,6.0936,0.0,0,memory/redis/io8/set-c80.json
+memory,Redis 8.8.0,redis,8,io-threads,SET,160,10000000,1024,30,default-correlated,585796.6,0.27271,0.263,0.543,0.711,1.519,17574290,8.243,6.9161,0.0,0,memory/redis/io8/set-c160.json
+memory,Redis 8.8.0,redis,8,io-threads,SET,320,10000000,1024,30,default-correlated,692106.65,0.46204,0.447,0.959,1.431,4.223,20764068,9.29,7.2787,0.0,0,memory/redis/io8/set-c320.json
+memory,Redis 8.8.0,redis,8,io-threads,SET,640,10000000,1024,30,default-correlated,787429.91,0.81233,0.703,2.863,4.639,9.151,23626429,10.735,7.2368,0.0,0,memory/redis/io8/set-c640.json
+memory,Redis 8.8.0,redis,8,io-threads,SET,1280,10000000,1024,30,default-correlated,814410.2,1.57074,1.327,4.671,8.447,16.127,24440911,11.655,7.2636,0.0,0,memory/redis/io8/set-c1280.json
+memory,Redis 8.8.0,redis,16,io-threads,GET,80,10000000,1024,30,default-correlated,424582.46,0.18785,0.183,0.335,0.455,0.655,12737724,6.191,8.4921,0.0,0,memory/redis/io16/get-c80.json
+memory,Redis 8.8.0,redis,16,io-threads,GET,160,10000000,1024,30,default-correlated,574701.86,0.27791,0.271,0.559,0.911,2.255,17241788,7.803,10.0161,0.0,0,memory/redis/io16/get-c160.json
+memory,Redis 8.8.0,redis,16,io-threads,GET,320,10000000,1024,30,default-correlated,769130.32,0.41556,0.391,0.975,1.663,4.575,23077057,10.108,11.532,0.0,0,memory/redis/io16/get-c320.json
+memory,Redis 8.8.0,redis,16,io-threads,GET,640,10000000,1024,30,default-correlated,919798.51,0.69532,0.559,3.471,4.831,8.095,27595827,12.389,12.3963,0.0,0,memory/redis/io16/get-c640.json
+memory,Redis 8.8.0,redis,16,io-threads,GET,1280,10000000,1024,30,default-correlated,976800.89,1.30981,1.119,4.671,8.031,17.407,29308649,13.581,12.3142,0.0,0,memory/redis/io16/get-c1280.json
+memory,Redis 8.8.0,redis,16,io-threads,SET,80,10000000,1024,30,default-correlated,397637.11,0.20083,0.191,0.359,0.479,0.695,11929270,5.86,7.9583,0.0,0,memory/redis/io16/set-c80.json
+memory,Redis 8.8.0,redis,16,io-threads,SET,160,10000000,1024,30,default-correlated,570473.64,0.28002,0.271,0.535,0.735,1.687,17114624,8.096,9.5646,0.0,0,memory/redis/io16/set-c160.json
+memory,Redis 8.8.0,redis,16,io-threads,SET,320,10000000,1024,30,default-correlated,717899.87,0.44541,0.423,0.983,1.759,4.287,21537912,9.727,11.0515,0.0,0,memory/redis/io16/set-c320.json
+memory,Redis 8.8.0,redis,16,io-threads,SET,640,10000000,1024,30,default-correlated,851460.27,0.75113,0.615,3.071,4.575,8.575,25551140,11.746,12.0778,0.0,0,memory/redis/io16/set-c640.json
+memory,Redis 8.8.0,redis,16,io-threads,SET,1280,10000000,1024,30,default-correlated,910426.33,1.40542,1.167,4.831,8.127,16.895,27319153,13.003,11.9156,0.0,0,memory/redis/io16/set-c1280.json
+memory,Valkey 9.1.0,valkey,1,io-threads,GET,80,10000000,1024,30,default-correlated,145676.11,0.54879,0.511,0.895,1.047,2.047,4370349,2.075,0.9815,0.0,0,memory/valkey/io1/get-c80.json
+memory,Valkey 9.1.0,valkey,1,io-threads,GET,160,10000000,1024,30,default-correlated,153277.59,1.04331,0.983,1.895,2.039,2.719,4598523,2.211,0.9743,0.0,0,memory/valkey/io1/get-c160.json
+memory,Valkey 9.1.0,valkey,1,io-threads,GET,320,10000000,1024,30,default-correlated,155408.09,2.05836,1.967,3.935,4.223,5.727,4662636,2.266,0.9493,0.0,0,memory/valkey/io1/get-c320.json
+memory,Valkey 9.1.0,valkey,1,io-threads,GET,640,10000000,1024,30,default-correlated,153631.34,4.16494,4.031,8.095,9.279,12.287,4610202,1.89,0.9411,0.0,0,memory/valkey/io1/get-c640.json
+memory,Valkey 9.1.0,valkey,1,io-threads,GET,1280,10000000,1024,30,default-correlated,140694.42,9.09987,8.639,17.151,22.783,30.847,4221602,1.618,0.9388,0.0,0,memory/valkey/io1/get-c1280.json
+memory,Valkey 9.1.0,valkey,1,io-threads,SET,80,10000000,1024,30,default-correlated,143506.09,0.55728,0.511,0.871,1.023,1.951,4305199,2.029,0.9465,0.0,0,memory/valkey/io1/set-c80.json
+memory,Valkey 9.1.0,valkey,1,io-threads,SET,160,10000000,1024,30,default-correlated,145804.26,1.09695,1.023,1.967,2.127,2.943,4374292,2.135,0.9494,0.0,0,memory/valkey/io1/set-c160.json
+memory,Valkey 9.1.0,valkey,1,io-threads,SET,320,10000000,1024,30,default-correlated,145607.86,2.19704,2.079,4.159,4.799,5.759,4368916,2.109,0.9429,0.0,0,memory/valkey/io1/set-c320.json
+memory,Valkey 9.1.0,valkey,1,io-threads,SET,640,10000000,1024,30,default-correlated,141952.2,4.50801,4.351,8.767,10.623,13.311,4259059,1.726,0.946,0.0,0,memory/valkey/io1/set-c640.json
+memory,Valkey 9.1.0,valkey,1,io-threads,SET,1280,10000000,1024,30,default-correlated,130767.47,9.78623,9.151,18.303,23.807,95.743,3924943,1.583,0.9358,0.0,0,memory/valkey/io1/set-c1280.json
+memory,Valkey 9.1.0,valkey,2,io-threads,GET,80,10000000,1024,30,default-correlated,162096.56,0.49325,0.479,0.663,1.015,2.127,4863088,2.232,1.9718,0.0,0,memory/valkey/io2/get-c80.json
+memory,Valkey 9.1.0,valkey,2,io-threads,GET,160,10000000,1024,30,default-correlated,152943.89,1.04562,1.039,1.223,1.519,2.623,4588621,2.14,1.9797,0.0,0,memory/valkey/io2/get-c160.json
+memory,Valkey 9.1.0,valkey,2,io-threads,GET,320,10000000,1024,30,default-correlated,157561.78,2.03045,2.031,2.207,3.023,5.151,4727070,2.252,1.9431,0.0,0,memory/valkey/io2/get-c320.json
+memory,Valkey 9.1.0,valkey,2,io-threads,GET,640,10000000,1024,30,default-correlated,158224.25,4.04424,4.031,4.607,7.583,10.879,4747350,2.285,1.944,0.0,0,memory/valkey/io2/get-c640.json
+memory,Valkey 9.1.0,valkey,2,io-threads,GET,1280,10000000,1024,30,default-correlated,149710.4,8.55045,8.319,11.711,19.327,23.679,4492157,2.17,1.9345,0.0,0,memory/valkey/io2/get-c1280.json
+memory,Valkey 9.1.0,valkey,2,io-threads,SET,80,10000000,1024,30,default-correlated,144666.95,0.55281,0.543,0.743,0.967,1.959,4340053,2.044,1.9457,0.0,0,memory/valkey/io2/set-c80.json
+memory,Valkey 9.1.0,valkey,2,io-threads,SET,160,10000000,1024,30,default-correlated,151503.93,1.05574,1.055,1.247,1.727,2.735,4545185,2.16,1.9445,0.0,0,memory/valkey/io2/set-c160.json
+memory,Valkey 9.1.0,valkey,2,io-threads,SET,320,10000000,1024,30,default-correlated,146799.99,2.17915,2.175,2.351,3.375,5.535,4404847,2.09,1.9476,0.0,0,memory/valkey/io2/set-c320.json
+memory,Valkey 9.1.0,valkey,2,io-threads,SET,640,10000000,1024,30,default-correlated,148388.84,4.31197,4.319,4.927,8.447,11.391,4452518,2.154,1.9406,0.0,0,memory/valkey/io2/set-c640.json
+memory,Valkey 9.1.0,valkey,2,io-threads,SET,1280,10000000,1024,30,default-correlated,134252.2,9.53249,9.087,12.415,18.687,22.783,4029050,1.965,1.9387,0.0,0,memory/valkey/io2/set-c1280.json
+memory,Valkey 9.1.0,valkey,4,io-threads,GET,80,10000000,1024,30,default-correlated,408344.45,0.19542,0.191,0.327,0.423,0.615,12250537,5.843,3.9606,0.0,0,memory/valkey/io4/get-c80.json
+memory,Valkey 9.1.0,valkey,4,io-threads,GET,160,10000000,1024,30,default-correlated,424952.01,0.37578,0.375,0.551,0.703,1.631,12749502,6.066,3.9692,0.0,0,memory/valkey/io4/get-c160.json
+memory,Valkey 9.1.0,valkey,4,io-threads,GET,320,10000000,1024,30,default-correlated,440408.53,0.72577,0.719,0.951,1.335,3.743,13213069,6.308,3.9349,0.0,0,memory/valkey/io4/get-c320.json
+memory,Valkey 9.1.0,valkey,4,io-threads,GET,640,10000000,1024,30,default-correlated,446155.33,1.43331,1.407,1.823,4.511,9.279,13388385,6.421,3.8964,0.0,0,memory/valkey/io4/get-c640.json
+memory,Valkey 9.1.0,valkey,4,io-threads,GET,1280,10000000,1024,30,default-correlated,442891.12,2.88874,2.847,3.695,11.903,18.303,13291160,6.483,3.8933,0.0,0,memory/valkey/io4/get-c1280.json
+memory,Valkey 9.1.0,valkey,4,io-threads,SET,80,10000000,1024,30,default-correlated,381335.58,0.20945,0.199,0.359,0.551,0.783,11440290,5.407,3.9446,0.0,0,memory/valkey/io4/set-c80.json
+memory,Valkey 9.1.0,valkey,4,io-threads,SET,160,10000000,1024,30,default-correlated,396496.17,0.40307,0.407,0.575,0.719,1.471,11895407,5.559,3.975,0.0,0,memory/valkey/io4/set-c160.json
+memory,Valkey 9.1.0,valkey,4,io-threads,SET,320,10000000,1024,30,default-correlated,405793.91,0.7879,0.775,1.031,1.495,3.919,12174880,5.902,3.9644,0.0,0,memory/valkey/io4/set-c320.json
+memory,Valkey 9.1.0,valkey,4,io-threads,SET,640,10000000,1024,30,default-correlated,409711.57,1.56122,1.543,1.871,4.383,8.895,12293698,6.026,3.9411,0.0,0,memory/valkey/io4/set-c640.json
+memory,Valkey 9.1.0,valkey,4,io-threads,SET,1280,10000000,1024,30,default-correlated,409845.64,3.12233,3.071,4.447,11.583,17.663,12298304,6.077,3.8882,0.0,0,memory/valkey/io4/set-c1280.json
+memory,Valkey 9.1.0,valkey,8,io-threads,GET,80,10000000,1024,30,default-correlated,542965.85,0.14687,0.143,0.287,0.415,0.639,16289341,7.524,7.9039,0.0,0,memory/valkey/io8/get-c80.json
+memory,Valkey 9.1.0,valkey,8,io-threads,GET,160,10000000,1024,30,default-correlated,667212.38,0.23947,0.223,0.551,0.927,2.511,20016779,8.665,7.9026,0.0,0,memory/valkey/io8/get-c160.json
+memory,Valkey 9.1.0,valkey,8,io-threads,GET,320,10000000,1024,30,default-correlated,789830.67,0.40467,0.359,1.159,2.591,4.703,23697875,10.238,7.9364,0.0,0,memory/valkey/io8/get-c320.json
+memory,Valkey 9.1.0,valkey,8,io-threads,GET,640,10000000,1024,30,default-correlated,831080.27,0.76938,0.623,3.503,6.111,10.431,24939065,10.902,7.9511,0.0,0,memory/valkey/io8/get-c640.json
+memory,Valkey 9.1.0,valkey,8,io-threads,GET,1280,10000000,1024,30,default-correlated,857049.4,1.49257,1.239,4.607,8.383,17.407,25718485,11.812,7.9098,0.0,0,memory/valkey/io8/get-c1280.json
+memory,Valkey 9.1.0,valkey,8,io-threads,SET,80,10000000,1024,30,default-correlated,526527.71,0.15162,0.143,0.287,0.407,0.687,15795995,7.443,7.9077,0.0,0,memory/valkey/io8/set-c80.json
+memory,Valkey 9.1.0,valkey,8,io-threads,SET,160,10000000,1024,30,default-correlated,655290.63,0.24388,0.231,0.519,0.727,1.791,19660618,8.801,7.9358,0.0,0,memory/valkey/io8/set-c160.json
+memory,Valkey 9.1.0,valkey,8,io-threads,SET,320,10000000,1024,30,default-correlated,725464.97,0.44079,0.399,1.199,2.703,4.895,21765810,9.587,7.9485,0.0,0,memory/valkey/io8/set-c320.json
+memory,Valkey 9.1.0,valkey,8,io-threads,SET,640,10000000,1024,30,default-correlated,783710.69,0.81626,0.671,3.519,6.271,10.367,23512972,10.509,7.94,0.0,0,memory/valkey/io8/set-c640.json
+memory,Valkey 9.1.0,valkey,8,io-threads,SET,1280,10000000,1024,30,default-correlated,802519.39,1.59398,1.423,4.383,8.895,16.895,24083728,11.261,7.8889,0.0,0,memory/valkey/io8/set-c1280.json
+memory,Valkey 9.1.0,valkey,16,io-threads,GET,80,10000000,1024,30,default-correlated,544238.03,0.14652,0.143,0.279,0.559,0.695,16327677,7.587,9.8979,0.0,0,memory/valkey/io16/get-c80.json
+memory,Valkey 9.1.0,valkey,16,io-threads,GET,160,10000000,1024,30,default-correlated,692905.05,0.23057,0.223,0.519,0.815,2.911,20788055,8.959,12.8313,0.0,0,memory/valkey/io16/get-c160.json
+memory,Valkey 9.1.0,valkey,16,io-threads,GET,320,10000000,1024,30,default-correlated,826689.24,0.38666,0.319,1.463,3.167,5.119,24802472,10.81,14.7324,0.0,0,memory/valkey/io16/get-c320.json
+memory,Valkey 9.1.0,valkey,16,io-threads,GET,640,10000000,1024,30,default-correlated,897768.48,0.71236,0.559,3.583,5.631,9.727,26935894,11.804,14.4931,0.0,0,memory/valkey/io16/get-c640.json
+memory,Valkey 9.1.0,valkey,16,io-threads,GET,1280,10000000,1024,30,default-correlated,965696.86,1.32488,1.111,4.543,8.159,16.895,28978643,13.163,15.2289,0.0,0,memory/valkey/io16/get-c1280.json
+memory,Valkey 9.1.0,valkey,16,io-threads,SET,80,10000000,1024,30,default-correlated,510893.13,0.15629,0.151,0.295,0.543,0.727,15327055,7.278,11.1265,0.0,0,memory/valkey/io16/set-c80.json
+memory,Valkey 9.1.0,valkey,16,io-threads,SET,160,10000000,1024,30,default-correlated,607620.26,0.26297,0.255,0.527,0.823,2.975,18229549,8.296,14.4409,0.0,0,memory/valkey/io16/set-c160.json
+memory,Valkey 9.1.0,valkey,16,io-threads,SET,320,10000000,1024,30,default-correlated,686302.75,0.46588,0.439,1.015,2.175,4.703,20594131,8.924,14.0968,0.0,0,memory/valkey/io16/set-c320.json
+memory,Valkey 9.1.0,valkey,16,io-threads,SET,640,10000000,1024,30,default-correlated,703116.23,0.90964,0.847,3.423,6.495,11.199,21098638,9.216,11.8009,0.0,0,memory/valkey/io16/set-c640.json
+memory,Valkey 9.1.0,valkey,16,io-threads,SET,1280,10000000,1024,30,default-correlated,741468.56,1.72518,1.663,4.127,9.535,18.047,22254811,10.4,11.0847,0.0,0,memory/valkey/io16/set-c1280.json

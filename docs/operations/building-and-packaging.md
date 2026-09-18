@@ -207,6 +207,9 @@ before device initialization. Existing SPDK launch commands must now include
 `--storage=spdk`, and existing DPDK network commands must include
 `--network=dpdk`. Backend selection is not a live `CONFIG SET` option.
 
+For a complete release-package startup example, device binding, hugepage
+configuration, and host restoration, follow [SPDK storage](spdk-storage.md).
+
 Device binding remains an operator step. Supply the complete selected NIC and
 NVMe allowlist in `BYCORF_EAL_ARGS` before launch; either accelerator can be the
 first EAL user. With neither selected, EAL and its device discovery are inactive.
