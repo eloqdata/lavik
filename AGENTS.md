@@ -30,6 +30,16 @@ limitations under the License.
 - When code and documentation disagree, treat code as authoritative and repair the documentation in the same change.
 <!-- END bootstrap-project: engineering-standards -->
 
+## Concurrency and performance
+
+- Avoid introducing process-wide or cross-worker mutexes that can block worker
+  threads, especially on request paths. Prefer worker-local ownership, immutable
+  snapshots, message passing, or narrowly scoped atomics where they preserve the
+  required correctness and lifetime guarantees. When a shared blocking mutex is
+  necessary, document why the alternatives are unsuitable and, if workers can
+  contend on it, measure its effect on throughput and tail latency under relevant
+  concurrency.
+
 ## Repository documentation
 
 - Operations: before changing build or packaging, metrics and monitoring,
