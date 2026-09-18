@@ -18,7 +18,7 @@
 
 // Raft-free model for `lavik-ctl cluster-status`. The server
 // translates its committed/runtime state into these bounded values; clients
-// strictly decode them and never need NuRaft types or a public leader-route
+// strictly decode them and never need Raft types or a public leader-route
 // cache.
 
 #include <chrono>

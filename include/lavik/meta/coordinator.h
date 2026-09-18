@@ -25,18 +25,11 @@
 //
 // ASSEMBLY, OWNERSHIP, AND DESTRUCTION ORDER
 //
-// The coordinator is assembled at process wiring time from pieces the caller
-// owns: it holds a refcounted nuraft::ptr on the raft_server (an in-flight
-// Propose must never see a destroyed core) and plain references to the
-// MetaStateMachine, the WAL v1 NuraftLogStore (fail-safe gate only), and the
-// leader-local MetaObservationStore. Those three references MUST outlive the
-// coordinator. Destruction contract (mirrors the state machine's shutdown
-// contract in state_machine.h):
-//   stop ingress -> proposal_executor::Shutdown() -> raft_launcher::shutdown()
-//   -> MetaStateMachine::WaitForSnapshotWriterIdle() -> destroy coordinator
-//   -> destroy state machine / log store.
-// Executor shutdown first submits every accepted mutation to NuRaft; launcher
-// shutdown then resolves pending cmd_results (normally CANCELLED). The
+// The caller owns the state machine and leader-local observation store; both
+// outlive the coordinator. A shared MetaRaft reference keeps accepted proposals
+// connected to their result owner. Process teardown stops workflow owners and
+// ingress, drains proposal submission, then joins MetaRaft before draining the
+// Bycorf foreign mailbox. The state machine outlives all Go callbacks. The
 // coordinator destructor drains in-flight proposals, cancels and joins all
 // registered reconcilers, detaches the commit-event sink, and cancels every
 // live subscription before it returns. A Propose task dropped by its caller
@@ -54,17 +47,17 @@
 //     worker in production). The observation store is internally serialized
 //     because commit-driven revalidation runs on the dispatch thread.
 //   - The commit round trip suspends. Submission goes through the injected
-//     proposal executor before entering NuRaft's mutation path, so WAL work
+//     proposal executor before entering Raft's mutation path, so WAL work
 //     never blocks the production Bycorf worker. Short read-only role/config
 //     checks remain on the caller. Completion then goes through the injected
 //     options.foreign_executor_ — production resumes through Bycorf's target
 //     worker mailbox so the continuation (and the awaiting reconciler) lands
 //     back on its owner. There is deliberately no implicit inline fallback:
 //     a coordinator attached to Raft requires this executor, preventing a
-//     NuRaft or timeout thread from accidentally running Bycorf-owned code.
+//     Raft or timeout thread from accidentally running Bycorf-owned code.
 //     Plain-thread tests opt into an explicit inline policy. A Propose task
 //     destroyed while suspended is SAFE: the awaiter detaches, and the late
-//     NuRaft completion fills a shared waiter and resumes nothing.
+//     Raft completion fills a shared waiter and resumes nothing.
 //   - Commit events: the MetaStateMachine invokes the coordinator's sink from
 //     its commit thread, under the state mutex, right after ApplyCommitted
 //     (MetaCommitEventSink, state_machine.h). The sink is O(1) and never
@@ -73,11 +66,10 @@
 //     run on THAT thread, serialize per subscription, and must be quick and
 //     never block indefinitely.
 //   - Leadership transitions: BecomeLeader()/BecomeFollower() are wired from
-//     the NuRaft init_options::raft_callback_ (meta_main; tests may drive
-//     them directly). NuRaft may hold raft_server::lock_ while invoking the
-//     callback, so both are O(1) queue pushes onto the coordinator's
-//     leadership thread; reconciler Start()/CancelAndWait() always run on
-//     that thread, strictly serialized per reconciler.
+//     MetaRaft's ordered role callback (tests may drive them directly). The
+//     protocol owner must not wait, so both are O(1) queue pushes onto the
+//     coordinator's leadership thread; reconciler Start()/CancelAndWait()
+//     always run on that thread, strictly serialized per reconciler.
 //   - Propose timeouts: a dedicated timer thread walks a deadline queue
 //     (options_.propose_timeout_ms_). It touches only weak references to
 //     proposal waiters, never coordinator state, so it is teardown-safe.
@@ -125,22 +117,12 @@
 #include "lavik/meta/commands.h"
 #include "lavik/meta/observation_store.h"
 #include "lavik/meta/proposal_executor.h"
+#include "lavik/meta/raft.h"
 #include "lavik/meta/state_apply.h"
-// NuRaft's headers are not -Wpedantic-clean.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#include "libnuraft/ptr.hxx"
-#pragma GCC diagnostic pop
-
-namespace nuraft {
-class raft_server;
-}
 
 namespace lavik::meta {
 
 class MetaStateMachine;
-class NuraftLogStore;
 class MetaCoordinator;
 // Opaque propose-timeout machinery (coordinator.cpp); see
 // MetaCoordinatorOptions::propose_timeout_ms_.
@@ -365,14 +347,13 @@ class MetaLeaderContext {
 };
 
 // A leader-scoped control loop. Start() is called on the coordinator's
-// leadership thread after BecomeLeader (which NuRaft's
-// wait_for_sm_catchup_on_becoming_leader_ gates until the SM has caught up:
-// the reconciler's first CommittedView already reflects the re-confirmed
-// prefix). Start must return quickly — spawn the real work on the
-// reconciler's own thread/coroutine. CancelAndWait() runs on BecomeFollower
-// (and during coordinator teardown) and must not return until the reconciler
-// has fully stopped touching the context. Calls are strictly serialized per
-// reconciler: Start, then CancelAndWait, then possibly Start again.
+// leadership thread after the current-term application and fresh-quorum
+// fences permit BecomeLeader. Start must return quickly — spawn the real work
+// on the reconciler's own thread/coroutine. CancelAndWait() runs on
+// BecomeFollower (and during coordinator teardown) and must not return until
+// the reconciler has fully stopped touching the context. Calls are strictly
+// serialized per reconciler: Start, then CancelAndWait, then possibly Start
+// again.
 //
 // Idempotency contract: reconcilers advance ONLY through Propose;
 // operation idempotency keys, expected_revision CAS, and the apply layer's
@@ -400,10 +381,10 @@ struct MetaCoordinatorOptions {
   //   count (0 = no tolerance: always gate; 3 = gate at 3 failures).
   std::uint64_t max_consecutive_snapshot_failures_ = 3;
   // The audit gate itself has no numeric knob: it reads the committed
-  // store's capacity and reserves headroom until NuRaft resolves each append,
+  // store's capacity and reserves headroom until Raft resolves each append,
   // including after a caller-side uncertain timeout.
   std::size_t default_subscription_capacity_ = 1024;
-  // Propose round-trip timeout. NuRaft's async_handler return method has NO
+  // Propose round-trip timeout. The Raft result has no
   // client-side timeout (only its blocking mode enforces
   // client_req_timeout_), so the seam bounds the wait itself: on expiry the
   // proposal resolves kDeadlineExceeded with the uncertain-outcome message;
@@ -420,7 +401,7 @@ struct MetaCoordinatorOptions {
   // the caller-side timeout and coordinator.
   bycorf::ForeignExecutor foreign_executor_{};
   // Component tests without a Bycorf runtime must opt in explicitly. Production
-  // assembly must never enable this or NuRaft/timer threads could run
+  // assembly must never enable this or Raft/timer threads could run
   // worker-owned continuations inline.
   bool inline_resume_for_testing_ = false;
 };
@@ -434,8 +415,8 @@ class MetaCoordinator {
   // machine and starts the dispatch, leadership, and propose-timer threads. It
   // throws std::invalid_argument when a non-null server has neither a foreign
   // executor nor the explicit component-test inline policy.
-  MetaCoordinator(nuraft::ptr<nuraft::raft_server> server,
-                  MetaStateMachine& state_machine, NuraftLogStore& log_store,
+  MetaCoordinator(std::shared_ptr<MetaRaft> server,
+                  MetaStateMachine& state_machine,
                   MetaObservationStore& observations,
                   MetaCoordinatorOptions options = {});
   ~MetaCoordinator();
@@ -493,8 +474,8 @@ class MetaCoordinator {
   // reconciler without waiting for a new transition.
   void RunAsLeader(std::shared_ptr<MetaReconciler> reconciler);
 
-  // Raft role edges, wired from NuRaft's init_options::raft_callback_
-  // (BecomeLeader/BecomeFollower). O(1), non-blocking, safe from NuRaft
+  // Raft role edges, wired from MetaRaft's ordered role callback
+  // (BecomeLeader/BecomeFollower). O(1), non-blocking, safe from Raft
   // callback threads. Every edge is queued in arrival order: in particular, a
   // Follower edge is an uncancellable barrier whose CancelAndWait and volatile
   // observation reset finish before a later Leader edge may restart work. The
@@ -526,9 +507,8 @@ class MetaCoordinator {
   void DispatchMain();
   void LeadershipMain();
 
-  nuraft::ptr<nuraft::raft_server> server_;  // refcounted; may be null
+  std::shared_ptr<MetaRaft> server_;  // refcounted; may be null
   MetaStateMachine& state_machine_;
-  NuraftLogStore& log_store_;
   MetaObservationStore& observations_;
   const MetaCoordinatorOptions options_;
   // Declared before the observing pointer so the fallback owner outlives it.
@@ -583,10 +563,10 @@ class MetaCoordinator {
   MetaLeaderContext leader_context_;
 };
 
-// Process-wiring bridge between NuRaft role callbacks and MetaCoordinator.
+// Process-wiring bridge between Raft role callbacks and MetaCoordinator.
 // The callback records its exact edge synchronously, then asks the Bycorf
 // worker to Drain; this preserves callback order even if worker notifications
-// are delayed or coalesced. NuRaft can emit edges before the coordinator is
+// are delayed or coalesced. Raft can emit edges before the coordinator is
 // assembled, so Attach drains the retained prefix too. DetachAndStop is a
 // lifetime/order barrier: after it returns no callback can enqueue into the old
 // coordinator. Its target is non-owning and must remain alive from Attach

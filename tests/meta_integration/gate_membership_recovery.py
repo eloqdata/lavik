@@ -176,11 +176,9 @@ def recovery_cut(workdir, add, phase, snapshot=False, failover=False):
                               restored.ctl(add_request(target))]
                 return replies == ["OK", "ERR rejected"]
 
-            # A newly elected leader appends NuRaft's same-membership config
-            # copy before accepting another config request. Operation
-            # completion and identity retirement are already committed, but
-            # that internal config round can transiently return
-            # `config-changing`; observe the stable admission result.
+            # Completion and retirement are already committed. Allow the
+            # recovered workflow to release its membership reservation,
+            # then observe the stable admission result.
             try:
                 H.wait_until("removed identity is terminally retired", 5,
                              terminally_retired)

@@ -25,10 +25,11 @@
 #include "lavik/meta/coordinator.h"
 #include "lavik/meta/data_control_runtime_status.h"
 #include "lavik/meta/membership_reconciler.h"
+#include "lavik/meta/raft.h"
 
 namespace lavik::meta {
 
-// Read-only adapter projection from NuRaft. `last_response_age_us_` is elapsed
+// Read-only adapter projection from Raft. `last_response_age_us_` is elapsed
 // time since a transport-verified response, not a wall-clock timestamp.
 struct MetaClusterCreatePeerProgress {
   std::uint32_t server_id_ = 0;
@@ -79,8 +80,7 @@ class MetaClusterCreateReconciler final : public MetaReconciler {
       bycorf::ForeignExecutor executor,
       std::shared_ptr<MetaMembershipGate> membership_gate,
       std::shared_ptr<MetaDataControlRuntimeStatus> runtime_status,
-      nuraft::ptr<nuraft::raft_server> server,
-      std::uint64_t max_peer_response_age_us);
+      std::shared_ptr<MetaRaft> server, std::uint64_t max_peer_response_age_us);
   ~MetaClusterCreateReconciler() override;
   void Start(MetaLeaderContext& context) override;
   void CancelAndWait() override;

@@ -61,16 +61,9 @@
 #include "lavik/meta/hash.h"
 #include "lavik/meta/identity_verifier.h"
 #include "lavik/meta/observation_store.h"
+#include "lavik/meta/raft.h"
 #include "lavik/numeric_endpoint.h"
 #include "spdlog/spdlog.h"
-
-// NuRaft's headers are not -Wpedantic-clean.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#include "libnuraft/cluster_config.hxx"
-#include "libnuraft/raft_server.hxx"
-#pragma GCC diagnostic pop
 
 namespace lavik::meta {
 namespace {
@@ -1253,7 +1246,7 @@ MetaLeaderRuntimeDisposition MetaLeaderRuntimeGuard::Observe(
 
 struct MetaDataControlServer::Core {
   bycorf::ForeignExecutor foreign_executor_;
-  nuraft::ptr<nuraft::raft_server> server_;
+  std::shared_ptr<MetaRaft> server_;
   // Non-owning. MetaCoordinator owns this reconciler and therefore outlives
   // every Core access; keeping this edge non-owning avoids a cycle.
   MetaCoordinator* coordinator_ = nullptr;
@@ -1519,11 +1512,10 @@ bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
         "Meta data-control detected a suspend gap; quarantining authority "
         "for {} ms of active runtime",
         core.options_.leadership_validity_ms_);
-    // NuRaft's cached live-leader flag may itself be stale after suspend.
-    // Immediate resignation is synchronous for a multi-member cluster, so
-    // this generation cannot become eligible merely because the Bycorf worker
-    // runs before NuRaft's next heartbeat timer. NuRaft intentionally keeps a
-    // sole member leader; the active-time guard safely covers that case.
+    // Raft's cached live-leader flag may itself be stale after suspend.
+    // Immediate revocation is synchronous at the C++ boundary, so an older
+    // role callback cannot restore grants before the Go owner processes the
+    // resignation. A sole voter must still pass its active-time quarantine.
     core.server_->yield_leadership(/*immediate_yield=*/true);
     if (core.worker_ != nullptr) {
       std::vector<bycorf::Connection*> sessions;
@@ -1614,12 +1606,12 @@ void FinishLiveSessionTask(const std::shared_ptr<LiveSessionState>& state,
 
 absl::StatusOr<MetaMemberIdentity> LocalConfiguredIdentity(
     const MetaDataControlServer::Core& core,
-    const nuraft::ptr<nuraft::cluster_config>& config) {
+    const std::shared_ptr<MetaRaftConfig>& config) {
   if (config == nullptr) {
     return absl::FailedPreconditionError(
-        "NuRaft has no committed membership configuration");
+        "Raft has no committed membership configuration");
   }
-  for (const nuraft::ptr<nuraft::srv_config>& member : config->get_servers()) {
+  for (const std::shared_ptr<MetaRaftMember>& member : config->get_servers()) {
     if (member == nullptr ||
         member->get_id() != static_cast<int>(core.options_.server_id_)) {
       continue;
@@ -1628,30 +1620,30 @@ absl::StatusOr<MetaMemberIdentity> LocalConfiguredIdentity(
     if (!identity.ok()) return identity.status();
     if (identity->server_id_ != member->get_id()) {
       return absl::FailedPreconditionError(
-          "local NuRaft member aux identity has a mismatched server id");
+          "local Raft member aux identity has a mismatched server id");
     }
     return *identity;
   }
   return absl::FailedPreconditionError(
-      "local server is absent from NuRaft membership");
+      "local server is absent from Raft membership");
 }
 
 absl::Status ValidateCommittedConfigBindings(
-    const nuraft::ptr<nuraft::cluster_config>& config,
+    const std::shared_ptr<MetaRaftConfig>& config,
     const MetaCommittedView& view) {
   if (config == nullptr) {
     return absl::FailedPreconditionError(
-        "NuRaft has no committed membership configuration");
+        "Raft has no committed membership configuration");
   }
-  for (const nuraft::ptr<nuraft::srv_config>& member : config->get_servers()) {
+  for (const std::shared_ptr<MetaRaftMember>& member : config->get_servers()) {
     if (member == nullptr || member->get_id() <= 0) {
       return absl::FailedPreconditionError(
-          "NuRaft membership contains an invalid member");
+          "Raft membership contains an invalid member");
     }
     auto identity = MetaMemberIdentity::DecodeAux(member->get_aux());
     if (!identity.ok() || identity->server_id_ != member->get_id()) {
       return absl::FailedPreconditionError(
-          "NuRaft member has invalid canonical aux identity");
+          "Raft member has invalid canonical aux identity");
     }
     const auto committed = view.identity().FindMetaMember(
         static_cast<std::uint32_t>(member->get_id()));
@@ -1661,12 +1653,12 @@ absl::Status ValidateCommittedConfigBindings(
         committed->ctl_endpoint_ !=
             std::optional<std::string>(identity->ctl_endpoint_)) {
       return absl::FailedPreconditionError(
-          "NuRaft member descriptor differs from its committed identity "
+          "Raft member descriptor differs from its committed identity "
           "binding");
     }
     if (!ParseMetaEndpoint(*committed).ok()) {
       return absl::FailedPreconditionError(
-          "NuRaft member lacks a usable committed data-control endpoint");
+          "Raft member lacks a usable committed data-control endpoint");
     }
   }
   return absl::OkStatus();
@@ -1702,8 +1694,7 @@ bycorf::Task<absl::Status> ReconcileLocalMetaMember(
   } completion{core, generation};
 
   while (StillLeader(*core, generation)) {
-    const nuraft::ptr<nuraft::cluster_config> config =
-        core->server_->get_config();
+    const std::shared_ptr<MetaRaftConfig> config = core->server_->get_config();
     auto local_identity = LocalConfiguredIdentity(*core, config);
     absl::Status status = local_identity.status();
     if (local_identity.ok()) {
@@ -3020,8 +3011,8 @@ absl::Status MetaDataControlServer::ValidateOptions(
 
 absl::StatusOr<std::shared_ptr<MetaDataControlServer>>
 MetaDataControlServer::Create(
-    bycorf::ForeignExecutor foreign_executor,
-    nuraft::ptr<nuraft::raft_server> server, MetaCoordinator& coordinator,
+    bycorf::ForeignExecutor foreign_executor, std::shared_ptr<MetaRaft> server,
+    MetaCoordinator& coordinator,
     std::shared_ptr<MetaObservationStore> observations,
     MetaDataControlServerOptions options) {
   if (!foreign_executor.valid() || server == nullptr ||

@@ -35,7 +35,7 @@
 // out-of-order new index, or an index at/below the pruned floor means the
 // apply layer lost the log index <-> record correspondence; that is an
 // implementation bug and the store FAILS STOP (spdlog::critical + abort, the
-// same policy as NuraftStateMgr::system_exit) rather than corrupt the audit
+// same fail-stop policy as the Raft runtime) rather than corrupt the audit
 // trail. The same deterministic input byte stream aborts every node at the
 // same index, so this cannot fork the group.
 //

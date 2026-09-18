@@ -154,36 +154,43 @@ def main():
             raise H.Failure(
                 f"addsrv existing member: {reply}, want ERR already-exists")
 
-        # A ctl reply follows both the committed config and committed identity
-        # retirement, so two calls made serially are not concurrent. Pause
-        # node5 and issue the first removal on another ctl session; NuRaft
-        # retains its single-change gate while awaiting the leave response.
-        node5.pause()
+        # Keep an add pending on an offline learner. Removing an offline
+        # voter can commit without that voter's response, so pausing the
+        # removal target would not establish concurrent operations.
+        node6 = H.Node(BINARY, workdir, 6, args=args)
+        extras.append(node6)
+        phases_before = leader.log_tail(lines=2000).count("phase=change-config")
         first_result = {}
 
-        def remove_node5():
+        def add_node6():
             first_result["reply"] = leader.ctl(
-                f"removesrv {node5.id}", timeout=15)
+                f"addsrv {node6.id} {node6.endpoint} "
+                f"{node6.data_control_endpoint} {node6.ctl_endpoint}",
+                timeout=15)
 
-        first_thread = threading.Thread(target=remove_node5,
-                                        name="remove-node5")
+        first_thread = threading.Thread(target=add_node6, name="add-node6")
         first_thread.start()
-        time.sleep(0.1)
-        try:
-            second = leader.ctl(f"removesrv {nodes[2].id}")
-        finally:
-            node5.resume()
-        first_thread.join(timeout=15)
-        if first_thread.is_alive():
-            raise H.Failure("first removesrv did not finish after node5 resume")
-        first = first_result.get("reply", "ERR missing-result")
-        H.log(f"phase 4: removesrv {node5.id} -> {first}; "
-              f"overlapping removesrv {nodes[2].id} -> {second}")
-        if first != "OK":
-            raise H.Failure(f"removesrv node {node5.id}: {first}")
+        H.wait_until("offline learner owns membership reservation", 10,
+                     lambda: leader.log_tail(lines=2000).count(
+                         "phase=change-config") > phases_before)
+        second = leader.ctl(f"removesrv {node5.id}")
         if second != "ERR config-changing":
             raise H.Failure(
                 f"concurrent removesrv: {second}, want ERR config-changing")
+        node6.start(bootstrap=False)
+        H.join_and_verify(leader, node6)
+        first_thread.join(timeout=15)
+        if first_thread.is_alive():
+            raise H.Failure("first addsrv did not finish after node6 start")
+        first = first_result.get("reply", "ERR missing-result")
+        if first != "OK" and not first.startswith("ERR uncertain-outcome operation="):
+            raise H.Failure(f"pending addsrv node {node6.id}: {first}")
+        history.check([node6], timeout=30, desc="serialized learner catch-up")
+        for removed in (node6, node5):
+            reply = leader.ctl(f"removesrv {removed.id}")
+            if reply != "OK":
+                raise H.Failure(f"removesrv node {removed.id}: {reply}")
+        node6.kill9()
         ok_before = load.ok_count
         H.wait_until("cluster keeps committing after phase-4 removesrv",
                      15, lambda: load.ok_count > ok_before + 5)
@@ -197,7 +204,7 @@ def main():
         reply = leader.ctl(f"removesrv {leader.id}")
         H.log(f"phase 5: removesrv leader node {leader.id} -> {reply}")
         if reply == "OK":
-            # NuRaft accepted a leader step-down: the rest must re-elect
+            # Raft accepted a leader step-down: the rest must re-elect
             # and keep every acknowledged write.
             H.log("phase 5: leader removal accepted; waiting re-election")
             rest = [n for n in members if n.id != leader.id]

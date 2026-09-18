@@ -96,7 +96,7 @@ struct MetaNodeRecord {
   bool operator==(const MetaNodeRecord&) const = default;
 };
 
-// Durable first-stage identity for a NuRaft member. Retirement preserves the
+// Durable first-stage identity for a Raft member. Retirement preserves the
 // principal tombstone so a certificate identity is never rebound to another
 // server id.
 struct MetaMemberRecord {

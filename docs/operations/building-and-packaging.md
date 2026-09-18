@@ -53,6 +53,14 @@ submodules; follow the complete source checkout steps in the
 [README](../../README.md#build-from-source). Other distributions require
 manual installation of equivalent dependencies.
 
+Meta requires the Go toolchain pinned by `raft/go.mod` (currently 1.26.8),
+CGO, and the configured C compiler. The Ubuntu installer includes a Go bootstrap
+compiler; Go automatically downloads the pinned toolchain and checksummed
+modules on first configuration/build. CI uses `actions/setup-go` with that same
+module file. No etcd submodule or running etcd service is required. Offline
+builders must prepopulate the Go toolchain/module caches. Set
+`-DLAVIK_GO_EXECUTABLE=/path/to/go` to select an installed toolchain.
+
 Optimized local builds use the current machine's instruction set by default:
 
 ```bash
@@ -140,8 +148,7 @@ Initialize the required dependencies explicitly; SPDK uses Bycorf's direct DPDK
 submodule, so its nested DPDK checkout is not needed:
 
 ```bash
-git submodule update --init bycorf third_party/mimalloc third_party/nuraft
-git -C third_party/nuraft submodule update --init asio
+git submodule update --init bycorf third_party/mimalloc
 git -C bycorf submodule update --init third_party/liburing third_party/abseil \
   third_party/spdk third_party/dpdk
 git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto

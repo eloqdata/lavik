@@ -19,12 +19,12 @@ Single 3-node cluster on the proxy mesh, continuous propose load
 throughout:
 
 1. Half-open peer, 3 rounds: the follower's inbound proxy accepts but
-   blackholes every byte. The native NuRaft Asio contract under test: the
+   blackholes every byte. The Go transport contract under test: the
    leader's sends to that peer must fail inside bounded RPC timeouts, never
    hang forever. Observable evidence: (a) the quorum keeps committing
    while the follower's committed index stays frozen, (b) the leader's
-   logs gain either an adapter "response error" or NuRaft's bounded
-   "not active long time" reconnect signal. Each round ends with heal()
+   transport-failure counter increases after a bounded handshake or write
+   deadline. Each round ends with heal()
    and a bounded (<15s) catch-up.
 2. Refused peer, 1 round: refuse mode (ECONNREFUSED) exercises the fast
    connect-failure path with the same assertions.
@@ -53,8 +53,7 @@ FLAP_CYCLES = 20
 
 def rpc_failure_count(nodes):
     """Count across members so an election cannot move the evidence stream."""
-    return sum(node.count_log_lines("response error") +
-               node.count_log_lines("not active long time")
+    return sum(int(node.status()["rpc_failures"])
                for node in nodes if node.alive())
 
 
@@ -93,15 +92,25 @@ def fault_round(nodes, mesh, history, mode, window_s, round_name):
     if c1 <= c0:
         raise H.Failure(f"{round_name}: quorum stalled during {mode} "
                         f"(committed {c0} -> {c1})")
-    live_leader = H.find_leader(quorum)
-    _, reply = live_leader.propose(f"{round_name}-live")
-    if not reply.startswith("OK "):
-        raise H.Failure(f"{round_name}: propose during {mode}: {reply}")
+    # Status and proposal are separate requests. The injected asymmetric
+    # partition can elect another leader between them; require a real commit
+    # within a fixed deadline rather than treating the status as a lease.
+    def commits_during_fault():
+        for candidate in quorum:
+            if not candidate.is_leader():
+                continue
+            _, reply = candidate.propose(f"{round_name}-live")
+            if reply.startswith("OK "):
+                return True
+        return False
+
+    H.wait_until(f"{round_name}: quorum commits during {mode}", 5,
+                 commits_during_fault)
     f1 = follower.committed()
     if f1 > f0 + 10:
         raise H.Failure(f"{round_name}: isolated node {follower.id} kept "
                         f"advancing ({f0} -> {f1}); fault not effective")
-    # Handler completion and NuRaft's log write are asynchronous with respect
+    # Network completion and status publication are asynchronous with respect
     # to the control socket. Keep the fault active for a short bounded grace
     # period and sample all members: comparing two instantaneous counts from
     # one leader made this gate flaky when an election moved the log stream or
@@ -115,7 +124,7 @@ def fault_round(nodes, mesh, history, mode, window_s, round_name):
 
     if evidence1 <= evidence0:
         raise H.Failure(
-            f"{round_name}: no peer RPC failure evidence in cluster logs; "
+            f"{round_name}: no peer RPC failure evidence in transport counters; "
             f"Raft transport may be hanging instead of timing out")
     H.log(f"{round_name}: quorum committed {c0} -> {c1}, node "
           f"{follower.id} frozen at {f1}; cluster RPC failure/reconnect "
@@ -129,7 +138,7 @@ def fault_round(nodes, mesh, history, mode, window_s, round_name):
 
 def flap_stress(nodes, mesh, history, follower_id):
     """Rapid drop/heal flapping: every flap cuts established connections
-    and forces client recreation, hammering the Asio client's connect/cancel
+    and forces client recreation, hammering the connection owner's connect/cancel
     and exactly-once drain paths."""
     proxy = mesh.proxy(follower_id)
     H.log(f"flap: {FLAP_CYCLES} drop/heal cycles on node {follower_id} "
@@ -163,8 +172,7 @@ def main():
     # leader's live log. With the smoke's reserved=0 and distance=30 under
     # sustained load, the leader compacts those away during the sync and
     # the follower chases one stale snapshot after another; a 500-entry
-    # reserve window keeps the post-sync append path open (NuRaft's own
-    # default is 100000). Compaction still fires every 30 entries.
+    # reserve window keeps the post-sync append path open. Compaction still fires every 30 entries.
     args = H.raft_args(reserved_log_items=500)
     nodes = H.make_nodes(BINARY, workdir, 3, args=args)
     mesh = H.Mesh()

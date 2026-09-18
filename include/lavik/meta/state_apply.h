@@ -178,7 +178,7 @@ struct MetaApplyResult {
   bool operator==(const MetaApplyResult&) const = default;
 };
 
-// Process-local NuRaft completion payload. It is not part of the durable WAL
+// Process-local Raft completion payload. It is not part of the durable WAL
 // or snapshot format; carrying the apply verdict in cmd_result avoids racing
 // a later audit rotation/prune when the proposer resumes.
 std::string EncodeMetaApplyResult(const MetaApplyResult& result);
