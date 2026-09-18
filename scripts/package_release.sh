@@ -58,9 +58,43 @@ BUILD_JOBS=${LAVIK_PACKAGE_JOBS:-$(nproc)}
 VERSION=$(git -C "$REPO_ROOT" describe --tags --always --dirty --exclude=nightly)
 VERSION=${VERSION//\//-}
 REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD)
+VERSION_SUFFIX=-dev
+RELEASE_TAG=${LAVIK_PACKAGE_TAG:-}
+if [[ -n "$RELEASE_TAG" ]]; then
+  # Tagged packages must identify the release in both filenames and binaries;
+  # changing only the archive name would leave --version reporting -dev.
+  tag_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?$'
+  if [[ ! "$RELEASE_TAG" =~ $tag_pattern ]]; then
+    echo "LAVIK_PACKAGE_TAG must be vX.Y.Z or vX.Y.Z-prerelease" >&2
+    exit 1
+  fi
+  TAG_VERSION=${RELEASE_TAG#v}
+  BASE_VERSION=${TAG_VERSION%%-*}
+  VERSION_SUFFIX=${TAG_VERSION#"$BASE_VERSION"}
+  IFS=. read -ra identifiers <<<"${VERSION_SUFFIX#-}"
+  for identifier in "${identifiers[@]}"; do
+    if [[ "$identifier" =~ ^0[0-9]+$ ]]; then
+      echo "Numeric prerelease identifiers must not have leading zeros" >&2
+      exit 1
+    fi
+  done
+  PROJECT_VERSION=$(sed -nE 's/^project\(lavik VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' "$REPO_ROOT/CMakeLists.txt")
+  if [[ "$BASE_VERSION" != "$PROJECT_VERSION" ]]; then
+    echo "Tag version $BASE_VERSION does not match CMake project version $PROJECT_VERSION" >&2
+    exit 1
+  fi
+  if [[ "$(git -C "$REPO_ROOT" rev-parse "refs/tags/$RELEASE_TAG^{commit}")" != "$REVISION" ]]; then
+    echo "Release tag must point to the checked-out commit" >&2
+    exit 1
+  fi
+  VERSION=$RELEASE_TAG
+fi
 # CI keeps stable nightly asset names while VERSION/REVISION identify the
 # actual source build inside the archive.
 PACKAGE_VERSION=${LAVIK_PACKAGE_VERSION:-$VERSION}
+if [[ -n "$RELEASE_TAG" ]]; then
+  PACKAGE_VERSION=$RELEASE_TAG
+fi
 if [[ ! "$PACKAGE_VERSION" =~ ^[A-Za-z0-9._+-]+$ ]]; then
   echo "LAVIK_PACKAGE_VERSION must be a filename-safe version or channel" >&2
   exit 1
@@ -91,7 +125,8 @@ cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
   -DLAVIK_ENABLE_OPT=ON \
   -DLAVIK_MARCH="$PACKAGE_MARCH" \
   -DLAVIK_STATIC_OPENSSL=ON \
-  -DLAVIK_STATIC_CXX_RUNTIME=ON
+  -DLAVIK_STATIC_CXX_RUNTIME=ON \
+  -DLAVIK_VERSION_SUFFIX="$VERSION_SUFFIX"
 cmake --build "$BUILD_DIR" --target "${APPS[@]}" -j"$BUILD_JOBS"
 
 cmake -E remove_directory "$STAGE_DIR"
