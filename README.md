@@ -182,6 +182,13 @@ features must use `minimal`. On ARM64, the standard package additionally
 requires the CRC32 instruction extension. The requirement applies to the
 package even when bypass is not selected at startup.
 
+Prebuilt packages use these CPU targets for portability across supported
+machines. To enable additional CPU optimizations available on your deployment
+machine, [build from source](#build-from-source) there with
+`./scripts/build_release.sh`, which uses `-march=native`. Performance gains
+depend on the workload and toolchain; the resulting binaries may not run on
+CPUs with fewer instruction-set features.
+
 Both variants require **Linux 6.1 or newer** with usable io_uring for `lavik`
 and `lavik-meta`, including when DPDK/SPDK is selected. Worker initialization
 requires `IORING_SETUP_DEFER_TASKRUN`, introduced in Linux 6.1, with no fallback

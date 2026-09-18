@@ -59,6 +59,12 @@ Optimized local builds use the current machine's instruction set by default:
 ./scripts/build_release.sh
 ```
 
+Build on the deployment machine to enable CPU optimizations beyond the
+portable release package's baseline. Performance gains depend on the workload
+and toolchain; benchmark with representative traffic. These binaries may not
+run on CPUs with fewer instruction-set features, so use a shared CPU target
+when building for a fleet of different machines.
+
 Additional arguments are forwarded to CMake, for example
 `./scripts/build_release.sh -DLAVIK_KERNEL_BYPASS=ON` after installing and
 initializing the bypass dependencies below.
