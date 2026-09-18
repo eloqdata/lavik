@@ -582,6 +582,20 @@ const std::shared_ptr<const ServingState>& CurrentCachedWithVersion(
     const std::uint64_t version = cache.version();
     const std::uint64_t after = cache.publication_sequence();
     if (before == after) {
+      if (state != nullptr) {
+        // Give this thread a separate control block that owns one reference
+        // to the published snapshot. Aliasing preserves the ServingState
+        // address, but per-request copies update this block instead of the
+        // global snapshot's count. Allocate only on cache refresh. Retained
+        // admissions may cross workers or outlive this TLS entry, so the
+        // local block must still use thread-safe shared ownership.
+        const ServingState* snapshot = state.get();
+        auto local_owner =
+            std::make_shared<std::shared_ptr<const ServingState>>(
+                std::move(state));
+        state = std::shared_ptr<const ServingState>(std::move(local_owner),
+                                                    snapshot);
+      }
       entry_identity = cache.cache_identity();
       entry = std::move(state);
       entry_version = version;

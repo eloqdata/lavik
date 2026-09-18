@@ -435,11 +435,13 @@ class TopologyCache {
 // publication sequence and compare it with a fresh publication_sequence()
 // afterwards; an unchanged even token proves no publication — and therefore
 // no drain — raced the registration.
-// Returns a reference to the calling thread's cached snapshot — no refcount
-// traffic on the shared control block. The reference stays valid until the
-// calling thread's next CurrentCachedWithVersion call; callers that need the
-// snapshot across suspension points (the admission record on the request)
-// copy it deliberately.
+// Returns a reference to the calling thread's cached snapshot. Each refresh
+// creates an independent shared_ptr control block owning one reference to
+// the published snapshot; it aliases the same ServingState, without copying
+// topology data. Per-request copies update this local block, not the global
+// snapshot's count. The count remains atomic for cross-worker admissions.
+// The returned reference stays valid until this thread's next call; copying
+// it retains the snapshot across suspension, cache refresh, and thread exit.
 const std::shared_ptr<const ServingState>& CurrentCachedWithVersion(
     TopologyCache& cache, std::uint64_t* version_out,
     std::uint64_t* publication_sequence_out = nullptr);

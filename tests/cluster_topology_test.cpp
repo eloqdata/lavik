@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -680,6 +681,46 @@ TEST(TopologyCacheTest, CachedReaderIsScopedToCacheInstance) {
   EXPECT_EQ(version, 1);
   EXPECT_EQ(CurrentCachedWithVersion(second_cache, &version), second);
   EXPECT_EQ(version, 1);
+}
+
+TEST(TopologyCacheTest, CachedOwnersIsolateRequestCopiesAndOutliveWorkers) {
+  TopologyCache cache;
+  auto published = MakeState(1);
+  std::weak_ptr<const ServingState> retired = published;
+  cache.Publish(published);
+  std::array<std::shared_ptr<const ServingState>, 2> owners;
+  std::vector<std::thread> workers;
+  for (std::size_t i = 0; i < owners.size(); ++i) {
+    workers.emplace_back([&, i] {
+      std::uint64_t version = 0;
+      owners[i] = CurrentCachedWithVersion(cache, &version);
+      const auto& hit = CurrentCachedWithVersion(cache, &version);
+      EXPECT_FALSE(owners[i].owner_before(hit));
+      EXPECT_FALSE(hit.owner_before(owners[i]));
+    });
+  }
+  for (auto& worker : workers) worker.join();
+  EXPECT_EQ(owners[0].get(), published.get());
+  EXPECT_EQ(owners[1].get(), published.get());
+  EXPECT_TRUE(owners[0].owner_before(owners[1]) ||
+              owners[1].owner_before(owners[0]));
+  const auto global_references = published.use_count();
+  {
+    std::vector<std::shared_ptr<const ServingState>> requests(100, owners[0]);
+    EXPECT_EQ(published.use_count(), global_references);
+  }
+
+  // Both originating threads (and their TLS caches) have exited. Retained
+  // requests must still own the old snapshot after publication replaces it,
+  // and releasing them on another thread must release that snapshot too.
+  cache.Publish(MakeState(2));
+  published.reset();
+  ASSERT_FALSE(retired.expired());
+  EXPECT_EQ(owners[0]->topology_epoch(), 1);
+  owners[0].reset();
+  EXPECT_FALSE(retired.expired());
+  owners[1].reset();
+  EXPECT_TRUE(retired.expired());
 }
 
 TEST(TopologyCacheTest, PublicationSequenceBracketsCompletedPairs) {

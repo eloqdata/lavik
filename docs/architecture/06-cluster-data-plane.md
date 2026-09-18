@@ -94,11 +94,13 @@ authority token — owner identity, term, grant, and readiness, precomputed at
 build time — so an unrelated group's republication does not disturb
 in-flight work.
 
-Request-path reads go through a thread-local snapshot cache that re-reads only
-the publication sequence per call; a hit returns the last observed snapshot
-with no shared-memory writes at all. This keeps the admission gate free of
-cross-worker serialization — a direct `atomic<shared_ptr>` load per request
-would serialize on the toolchain's internal spin bit.
+Request-path reads go through a thread-local snapshot cache that checks the
+publication sequence before reusing its snapshot. Each worker has an
+independent ownership handle retaining the same published topology object;
+requests retain that handle rather than directly sharing global snapshot
+ownership. Retained admissions remain valid across cache refresh, worker
+exit, and cross-worker execution. The topology contents and per-group
+in-flight cells remain shared, preserving snapshot identity and fence drains.
 
 Readiness is per group and deliberately excludes the grant bit: a fenced
 group is not "still loading", it has no safe owner. Keyed requests consult
