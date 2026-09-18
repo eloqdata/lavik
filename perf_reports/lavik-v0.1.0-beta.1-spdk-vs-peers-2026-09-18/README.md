@@ -98,8 +98,10 @@ The six benchmark controllers were:
 These addresses and serials belong to this host. Replace them with your own
 verified dedicated controllers; binding affects all namespaces on a
 controller. `LAVIK_SPDK_SETUP` and `LAVIK_BINARY` below are the helper and
-extracted package paths set in the guide. The only path adaptation in the
-launch example is the binary/log location; all benchmark options are retained.
+extracted package paths set in the guide. The launch example omits fixed
+`v0.1.0-beta.1` defaults and adapts the binary/log paths. `--threads=16` fixes
+the benchmark worker count because the default depends on the host CPU count.
+The exact acquisition command is preserved in `server-command.json`.
 
 The benchmark saved the previous hugepage/VFIO settings, cleared each
 serial-allowlisted scratch device with `blkdiscard` while it was owned by the
@@ -121,21 +123,11 @@ sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
   env BYCORF_DPDK_MEMORY_MB=8192 \
   BYCORF_EAL_ARGS='-a f698:00:00.0 -a d2b4:00:00.0 -a 9038:00:00.0 -a 3da6:00:00.0 -a 674c:00:00.0 -a d408:00:00.0' \
   taskset -c 0-15 "$LAVIK_BINARY" \
-  --network=kernel \
   --storage=spdk \
   --bind=172.16.0.4 \
-  --port=6379 \
-  --metrics-port=0 \
   --threads=16 \
-  --pin-workers \
-  --maxclients=10000 \
-  --busy-poll-us=20 \
-  --foreground-budget-us=1000 \
-  --background-budget-us=10 \
-  --background-warrant-percent=1 \
   --tomb-raider-interval-ms=0 \
   --spdk-max-completions-per-poll=16 \
-  --spdk-foreground-pre-poll-us=5 \
   --log-dir=/var/log/lavik/benchmark \
   --data-file=spdk://f698:00:00.0/1 \
   --data-file=spdk://d2b4:00:00.0/1 \
@@ -150,8 +142,10 @@ For the independent 1B-key load, use the same settings and add
 from scratch. No checkpoint from another backend is reused. The 8 GiB EAL
 reservation is separate from Lavik's other memory use. Defrag is enabled
 without `--defrag-paused`, and `CONFIG GET defrag-paused` must return `no`.
-`CONFIG GET spdk-max-completions-per-poll` returns `16`; the 5 µs foreground
-pre-poll is a startup-only option, recorded in the launch command/log.
+`--spdk-max-completions-per-poll=16` overrides the default of `8`, and
+`--tomb-raider-interval-ms=0` disables the default daily tombstone sweep.
+`CONFIG GET spdk-max-completions-per-poll` returns `16`. The foreground
+pre-poll keeps its default of 5 µs.
 
 The archive contains the exact `server-command.json`, `eal-environment.json`,
 `devices-before.json`, runtime checks, driver setup/reset logs, and before/after

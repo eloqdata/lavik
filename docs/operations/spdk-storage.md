@@ -17,7 +17,7 @@ limitations under the License.
 # SPDK storage with kernel TCP
 
 Use this guide to run a standard Lavik release package on dedicated NVMe
-namespaces with `--network=kernel --storage=spdk`. Network traffic continues
+namespaces with `--storage=spdk`. Network traffic continues
 through Linux; no NIC rebinding or DPDK network setup is required.
 
 ## Package and setup helper
@@ -120,8 +120,9 @@ driver state and rerun the same allowlisted config after enabling the mode.
 ## Start Lavik and check the configuration
 
 Set the extracted binary's absolute path. Adjust the bind address, CPU list,
-and worker count to your machine. The example uses 16 logical CPUs and keeps
-defrag enabled by omitting `--defrag-paused`:
+and worker count to your machine. The example fixes 16 workers on 16 logical
+CPUs and omits the fixed defaults of `v0.1.0-beta.1`: kernel TCP, loopback
+address, port 6379, pinned workers, disabled metrics, and enabled defrag:
 
 ```bash
 LAVIK_BINARY='/opt/lavik-v0.1.0-beta.1-linux-x86_64/lavik'
@@ -134,16 +135,16 @@ done
 sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
   env BYCORF_EAL_ARGS="$LAVIK_EAL_ARGS" BYCORF_DPDK_MEMORY_MB=8192 \
   taskset -c 0-15 "$LAVIK_BINARY" \
-  --network=kernel --storage=spdk --bind=127.0.0.1 --port=6379 \
-  --threads=16 --pin-workers --metrics-port=0 \
-  --spdk-max-completions-per-poll=16 --spdk-foreground-pre-poll-us=5 \
+  --storage=spdk --threads=16 \
+  --spdk-max-completions-per-poll=16 \
   "${LAVIK_DATA_ARGS[@]}"
 ```
 
 Both the EAL allowlist and the `--data-file` list must cover the intended
 controllers/storage set. The latter uses SPDK URIs, never `/dev/nvme...`
-paths. The completion and pre-poll values above are the benchmark's settings;
-other scheduler and workload parameters are recorded in its report.
+paths. The completion cap of 16 overrides the default of 8 to match the
+benchmark; foreground pre-poll keeps its default of 5 µs. The benchmark
+report records its other explicit settings.
 
 Use another terminal with a Redis-compatible CLI to inspect the running
 server. Query the same bind address and port used at launch:
@@ -155,7 +156,7 @@ redis-cli -h 127.0.0.1 -p 6379 CONFIG GET spdk-max-completions-per-poll
 ```
 
 Expect `PONG`, `no`, and `16`, respectively. The foreground pre-poll option
-is a startup setting; verify `spdk_foreground_pre_poll_us=5` in the startup
+keeps its startup default; verify `spdk_foreground_pre_poll_us=5` in the startup
 log rather than through `CONFIG GET`. Defrag being enabled does
 not mean a reclamation job must be active when queried. Inspect startup logs
 for SPDK initialization and the selected namespaces before loading data.

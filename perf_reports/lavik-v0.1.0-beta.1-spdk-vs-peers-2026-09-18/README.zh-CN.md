@@ -96,8 +96,9 @@ Redis、Valkey 按每个命令的实测峰值固定选择一个 I/O 线程配置
 
 上表地址只属于本次主机，复现时替换为自己核对过的专用控制器；绑定会影响
 该控制器的全部 namespace。下面的 `LAVIK_SPDK_SETUP`、`LAVIK_BINARY` 按指南
-设为绑定脚本和解压后二进制的路径。启动示例仅替换二进制/日志目录，保留
-本次全部性能参数。
+设为绑定脚本和解压后二进制的路径。启动示例省略 `v0.1.0-beta.1` 的固定
+默认参数，并替换二进制/日志目录。`--threads=16` 用于固定压测线程数，
+因为默认值取决于主机核数。实际采集的完整命令保存在 `server-command.json` 中。
 
 本次先保存 hugepages/VFIO 原值，在内核驱动下按序列号核对专用盘并逐盘
 `blkdiscard`，再绑定 VFIO。因为测试 VM 没有暴露 IOMMU，本次在绑定前临时
@@ -117,21 +118,11 @@ sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
   env BYCORF_DPDK_MEMORY_MB=8192 \
   BYCORF_EAL_ARGS='-a f698:00:00.0 -a d2b4:00:00.0 -a 9038:00:00.0 -a 3da6:00:00.0 -a 674c:00:00.0 -a d408:00:00.0' \
   taskset -c 0-15 "$LAVIK_BINARY" \
-  --network=kernel \
   --storage=spdk \
   --bind=172.16.0.4 \
-  --port=6379 \
-  --metrics-port=0 \
   --threads=16 \
-  --pin-workers \
-  --maxclients=10000 \
-  --busy-poll-us=20 \
-  --foreground-budget-us=1000 \
-  --background-budget-us=10 \
-  --background-warrant-percent=1 \
   --tomb-raider-interval-ms=0 \
   --spdk-max-completions-per-poll=16 \
-  --spdk-foreground-pre-poll-us=5 \
   --log-dir=/var/log/lavik/benchmark \
   --data-file=spdk://f698:00:00.0/1 \
   --data-file=spdk://d2b4:00:00.0/1 \
@@ -144,8 +135,10 @@ sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
 10 亿条使用相同配置，并增加 `--shutdown-checkpoint`。两个数据集都清盘后
 重新灌入，不复用其他后端的 checkpoint。EAL 预留 8 GiB，不是 Lavik 总内存上限。
 不传 `--defrag-paused`，每个正式点前确认 `CONFIG GET defrag-paused` 为 `no`；
-`CONFIG GET spdk-max-completions-per-poll` 为 `16`。5 µs foreground pre-poll
-仅在启动时设置，保留在启动命令及日志中，不通过 `CONFIG GET` 查询。
+`--spdk-max-completions-per-poll=16` 将默认值 `8` 改为 `16`；
+`--tomb-raider-interval-ms=0` 关闭默认每天一次的 tombstone 扫描。
+`CONFIG GET spdk-max-completions-per-poll` 为 `16`，foreground pre-poll
+沿用默认的 5 µs。
 
 原始证据中 `memory/lavik-spdk/`、`storage/lavik-spdk/` 分别保存完整启动命令、
 EAL 环境变量、盘序列号/PCI 地址、配置检查、绑定/恢复日志和宿主设置前后值。
