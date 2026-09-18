@@ -505,6 +505,14 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
   return state;
 }
 
+namespace {
+std::atomic<std::uint64_t> next_topology_cache_identity{1};
+}
+
+TopologyCache::TopologyCache()
+    : cache_identity_(next_topology_cache_identity.fetch_add(
+          1, std::memory_order_relaxed)) {}
+
 std::shared_ptr<const ServingState> TopologyCache::Current() const {
   return current_.load();
 }
@@ -549,13 +557,13 @@ std::uint64_t TopologyCache::publication_sequence() const {
 const std::shared_ptr<const ServingState>& CurrentCachedWithVersion(
     TopologyCache& cache, std::uint64_t* version_out,
     std::uint64_t* publication_sequence_out) {
-  thread_local const TopologyCache* entry_cache = nullptr;
+  thread_local std::uint64_t entry_identity = 0;
   thread_local std::shared_ptr<const ServingState> entry;
   thread_local std::uint64_t entry_version = 0;
   thread_local std::uint64_t entry_sequence = 0;
   const std::uint64_t sequence = cache.publication_sequence();
-  if ((sequence & 1U) == 0 && entry_cache == &cache && entry != nullptr &&
-      entry_sequence == sequence) {
+  if ((sequence & 1U) == 0 && entry_identity == cache.cache_identity() &&
+      entry != nullptr && entry_sequence == sequence) {
     *version_out = entry_version;
     if (publication_sequence_out != nullptr) {
       *publication_sequence_out = sequence;
@@ -565,7 +573,8 @@ const std::shared_ptr<const ServingState>& CurrentCachedWithVersion(
   // Miss: an odd sequence means a writer is between the state store and
   // version bump. Matching even sequence reads prove both values came from
   // one completed publication. Include the cache identity in the TLS entry:
-  // tests and embedders may consult multiple caches whose versions coincide.
+  // tests and embedders may reuse an address for caches whose versions
+  // coincide.
   for (;;) {
     const std::uint64_t before = cache.publication_sequence();
     if ((before & 1U) != 0) continue;
@@ -573,7 +582,7 @@ const std::shared_ptr<const ServingState>& CurrentCachedWithVersion(
     const std::uint64_t version = cache.version();
     const std::uint64_t after = cache.publication_sequence();
     if (before == after) {
-      entry_cache = &cache;
+      entry_identity = cache.cache_identity();
       entry = std::move(state);
       entry_version = version;
       entry_sequence = before;

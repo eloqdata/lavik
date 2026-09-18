@@ -465,6 +465,17 @@ authorities. This committed-state precondition complements the per-session
 Fence/FDS drain: a source that has not consumed the replacement can never keep
 an old lease while the destination begins serving the same slot.
 
+The authority guard publishes session, leases, and revocation generation as
+one immutable snapshot, independently of committed topology. Control-plane
+writers serialize publication; request admission and mutation rechecks read
+owned snapshots without acquiring the writer mutex. Ordinary renewals neither
+close request admission nor drain readers. Deadline-only renewal preserves
+the revocation generation; revocation invalidates earlier write proofs.
+Cached snapshots still require a current absolute-deadline check on every
+lease-dependent admission and mutation recheck. Read-only commands borrow
+snapshots during synchronous admission; writes retain their proof across
+suspension for the existing owner-side and final mutation rechecks.
+
 Finite leases are required only for a Meta-managed local primary. Admission
 and the final mutation recheck both prove the current session, group
 assignment, Group Term, projection, and unexpired

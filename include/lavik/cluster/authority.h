@@ -220,6 +220,12 @@ class AuthorityGuard {
   AuthorityAdmission CaptureAndAdmit(const RequestView& request,
                                      MonotonicTime now) const;
 
+  // Read-only admission has the same finite-lease and routing checks, but
+  // retains no per-request proof across suspension. Thread-local snapshot
+  // ownership keeps this synchronous decision free of shared refcount writes
+  // and admission allocations. request.is_write_ must be false.
+  Decision AdmitRead(const RequestView& request, MonotonicTime now) const;
+
   // Lower-level verification of topology, session generation, and lease
   // deadline captured at admission. This call does not enter an in-flight cell
   // and is not by itself a safe request-mutation boundary; request paths use
@@ -249,17 +255,30 @@ class AuthorityGuard {
     SessionIdentity session_;
     AuthorityAnchor anchor_;
     MonotonicTime deadline_;
-    // Mutable because admission is logically read-only. It suppresses a hot
-    // request stream from counting the same locally observed expiry more than
-    // once; a later renewal clears it.
-    mutable bool expiration_recorded_ = false;
+    // Copies of a published lease share one expiration receipt, so concurrent
+    // readers and the expiry timer count it once. Renewal installs a fresh
+    // receipt; ordinary admission never writes this atomic.
+    std::shared_ptr<std::atomic<bool>> expiration_recorded_ =
+        std::make_shared<std::atomic<bool>>(false);
+  };
+
+  struct AuthorityState {
+    std::optional<SessionIdentity> session_;
+    std::unordered_map<std::string, Lease> leases_;
+    std::uint64_t generation_ = 1;
   };
 
   static std::optional<AuthorityAnchor> LocalPrimaryAnchor(
       const ServingState& state, std::string_view group_id);
-  bool LeaseCoversLocked(const ServingState& state,
-                         std::span<const std::uint16_t> slots,
-                         MonotonicTime now) const;
+  bool LeaseCovers(const AuthorityState& authority, const ServingState& state,
+                   std::span<const std::uint16_t> slots,
+                   MonotonicTime now) const;
+  // The returned reference is valid until this thread's next CurrentAuthority
+  // call. Callers must not suspend while borrowing it.
+  const AuthorityState& CurrentAuthority() const;
+  // Writer-only: allocate the immutable copy before publishing; no reader
+  // drain, request gate closure, or wait for old snapshot owners is needed.
+  void PublishAuthorityLocked();
   absl::Status RenewLease(const SessionIdentity& session,
                           const AuthorityAnchor& anchor, MonotonicTime deadline,
                           MonotonicTime now);
@@ -282,10 +301,13 @@ class AuthorityGuard {
   void InvalidateAll();
 
   TopologyCache& topology_;
+  // Only control-plane writers acquire this mutex. Request admission and
+  // mutation rechecks read immutable, independently versioned snapshots.
   mutable std::mutex mutex_;
-  std::optional<SessionIdentity> session_;
-  std::unordered_map<std::string, Lease> leases_;
-  std::uint64_t generation_ = 1;
+  AuthorityState writer_state_;
+  std::atomic<std::shared_ptr<const AuthorityState>> published_authority_;
+  std::atomic<std::uint64_t> authority_version_{0};
+  const std::uint64_t cache_identity_;
 
   friend class NodeControlInstaller;
 };

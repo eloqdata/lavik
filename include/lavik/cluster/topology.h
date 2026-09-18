@@ -395,6 +395,9 @@ class ServingStateBuilder {
 // unrelated groups republishing does not disturb in-flight writes.
 class TopologyCache {
  public:
+  TopologyCache();
+  // Distinguishes lifetimes even when a new cache reuses the same address.
+  std::uint64_t cache_identity() const { return cache_identity_; }
   // nullptr until the first publish; callers treat that as "not ready".
   std::shared_ptr<const ServingState> Current() const;
   // Publishes `state`; a content-identical state is a no-op (same version).
@@ -417,6 +420,7 @@ class TopologyCache {
   std::atomic<std::shared_ptr<const ServingState>> current_;
   std::atomic<std::uint64_t> version_{0};
   std::atomic<std::uint64_t> publication_sequence_{0};
+  const std::uint64_t cache_identity_;
 };
 
 // Request-path reader for the cache: keeps the last observed snapshot in a

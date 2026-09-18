@@ -17,6 +17,7 @@
 #include "lavik/cluster/authority.h"
 
 #include <algorithm>
+#include <cassert>
 #include <limits>
 #include <utility>
 
@@ -27,6 +28,9 @@
 namespace lavik::cluster {
 
 namespace {
+
+// TLS entries must not survive destruction followed by address reuse.
+std::atomic<std::uint64_t> next_authority_cache_identity{1};
 
 // Storage recovery and initial population both gate serving. Grant state is
 // deliberately not part of readiness: a fenced group is handled by the
@@ -233,7 +237,46 @@ bool MutationAdmissionUnchanged(const ServingState& admitted,
 
 }  // namespace
 
-AuthorityGuard::AuthorityGuard(TopologyCache& topology) : topology_(topology) {}
+AuthorityGuard::AuthorityGuard(TopologyCache& topology)
+    : topology_(topology),
+      published_authority_(std::make_shared<const AuthorityState>()),
+      cache_identity_(next_authority_cache_identity.fetch_add(
+          1, std::memory_order_relaxed)) {}
+
+const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority() const {
+  struct Cached {
+    std::uint64_t identity = 0;
+    std::uint64_t version = 0;
+    std::shared_ptr<const AuthorityState> state;
+  };
+  thread_local Cached cached;
+  std::uint64_t version = authority_version_.load(std::memory_order_acquire);
+  if (cached.identity == cache_identity_ && cached.version == version) {
+    return *cached.state;
+  }
+  for (;;) {
+    auto state = published_authority_.load(std::memory_order_acquire);
+    const std::uint64_t after =
+        authority_version_.load(std::memory_order_acquire);
+    if (version == after) {
+      cached.identity = cache_identity_;
+      cached.version = version;
+      cached.state = std::move(state);
+      return *cached.state;
+    }
+    version = after;
+  }
+}
+
+void AuthorityGuard::PublishAuthorityLocked() {
+  auto state = std::make_shared<const AuthorityState>(writer_state_);
+  published_authority_.store(std::move(state), std::memory_order_release);
+  // This version is only a cache invalidation hint, not part of the lease
+  // proof. A refresh racing the store may see the next complete snapshot
+  // before this increment; that is safe and the increment refreshes it again.
+  // Once publication returns, acquire-version readers cannot reuse old state.
+  authority_version_.fetch_add(1, std::memory_order_release);
+}
 
 std::optional<AuthorityAnchor> AuthorityGuard::LocalPrimaryAnchor(
     const ServingState& state, std::string_view group_id) {
@@ -250,10 +293,11 @@ std::optional<AuthorityAnchor> AuthorityGuard::LocalPrimaryAnchor(
   };
 }
 
-bool AuthorityGuard::LeaseCoversLocked(const ServingState& state,
-                                       std::span<const std::uint16_t> slots,
-                                       MonotonicTime now) const {
-  if (!session_.has_value()) return false;
+bool AuthorityGuard::LeaseCovers(const AuthorityState& authority,
+                                 const ServingState& state,
+                                 std::span<const std::uint16_t> slots,
+                                 MonotonicTime now) const {
+  if (!authority.session_.has_value()) return false;
 
   // Redis admits only same-slot requests, but keeping this loop general makes
   // the lease proof fail closed if a future caller reaches the seam before
@@ -264,13 +308,14 @@ bool AuthorityGuard::LeaseCoversLocked(const ServingState& state,
     if (group == nullptr || group->group_id_ == checked_group) continue;
     checked_group = group->group_id_;
     if (group->primary_node_index_ != state.SelfNodeIndex()) continue;
-    const auto lease = leases_.find(group->group_id_);
-    if (lease == leases_.end() || lease->second.session_ != *session_) {
+    const auto lease = authority.leases_.find(group->group_id_);
+    if (lease == authority.leases_.end() ||
+        lease->second.session_ != *authority.session_) {
       return false;
     }
     if (lease->second.deadline_ <= now) {
-      if (!lease->second.expiration_recorded_) {
-        lease->second.expiration_recorded_ = true;
+      if (!lease->second.expiration_recorded_->exchange(
+              true, std::memory_order_relaxed)) {
         RecordClusterControlLeaseExpiration();
       }
       return false;
@@ -285,7 +330,8 @@ bool AuthorityGuard::LeaseCoversLocked(const ServingState& state,
 AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
                                                    MonotonicTime now) const {
   AuthorityAdmission admission;
-  admission.state_ = topology_.Current();
+  std::uint64_t version = 0;
+  admission.state_ = CurrentCachedWithVersion(topology_, &version);
   admission.slots_.assign(request.slots_.begin(), request.slots_.end());
   admission.decision_ = Admit(admission.state_.get(), request);
 
@@ -303,13 +349,32 @@ AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
     return admission;
   }
 
-  const std::lock_guard lock(mutex_);
-  admission.gate_generation_ = generation_;
+  const AuthorityState& authority = CurrentAuthority();
+  admission.gate_generation_ = authority.generation_;
   admission.lease_checked_ = true;
-  if (!LeaseCoversLocked(*admission.state_, admission.slots_, now)) {
+  if (!LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
     admission.decision_.kind_ = Decision::Kind::kClusterDownUnbound;
   }
   return admission;
+}
+
+Decision AuthorityGuard::AdmitRead(const RequestView& request,
+                                   MonotonicTime now) const {
+  assert(!request.is_write_);
+  std::uint64_t version = 0;
+  const auto& state = CurrentCachedWithVersion(topology_, &version);
+  Decision decision = Admit(state.get(), request);
+  if (decision.kind_ != Decision::Kind::kServe || state == nullptr ||
+      request.slots_.empty()) {
+    return decision;
+  }
+  const GroupView* group = state->GroupForSlot(request.slots_.front());
+  if (group != nullptr &&
+      group->primary_node_index_ == state->SelfNodeIndex() &&
+      !LeaseCovers(CurrentAuthority(), *state, request.slots_, now)) {
+    decision.kind_ = Decision::Kind::kClusterDownUnbound;
+  }
+  return decision;
 }
 
 RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,
@@ -326,13 +391,15 @@ RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,
   }
 
   if (admission.lease_checked_) {
-    const std::lock_guard lock(mutex_);
-    if (admission.gate_generation_ != generation_ ||
-        !LeaseCoversLocked(*admission.state_, admission.slots_, now)) {
+    const AuthorityState& authority = CurrentAuthority();
+    if (admission.gate_generation_ != authority.generation_ ||
+        !LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
       return RecheckResult::kReject;
     }
   }
-  return AuthorityUnchanged(*admission.state_, topology_.Current().get(),
+  std::uint64_t version = 0;
+  return AuthorityUnchanged(*admission.state_,
+                            CurrentCachedWithVersion(topology_, &version).get(),
                             admission.slots_)
              ? RecheckResult::kOk
              : RecheckResult::kReject;
@@ -396,17 +463,19 @@ absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
         "lease grant expired before authority installation");
   }
   const std::lock_guard lock(mutex_);
-  if (!session_.has_value() || *session_ != session) {
-    leases_.clear();
-    session_ = session;
-    ++generation_;
+  if (!writer_state_.session_.has_value() ||
+      *writer_state_.session_ != session) {
+    writer_state_.leases_.clear();
+    writer_state_.session_ = session;
+    ++writer_state_.generation_;
   }
 
-  const auto existing = leases_.find(anchor.group_id_);
-  if (existing != leases_.end() && existing->second.session_ == session &&
+  const auto existing = writer_state_.leases_.find(anchor.group_id_);
+  if (existing != writer_state_.leases_.end() &&
+      existing->second.session_ == session &&
       existing->second.anchor_ == anchor) {
     if (existing->second.deadline_ <= now) {
-      // Extending this object would preserve generation_ and retroactively
+      // Extending this object would preserve the generation and retroactively
       // validate work admitted before expiry. NodeControl must first run the
       // exact expiration cleanup transition, which removes this lease and
       // advances the generation before a later grant can be installed.
@@ -417,12 +486,15 @@ absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
     // work. Replacing generation here would turn a healthy heartbeat into a
     // spurious write abort.
     existing->second.deadline_ = deadline;
-    existing->second.expiration_recorded_ = false;
+    existing->second.expiration_recorded_ =
+        std::make_shared<std::atomic<bool>>(false);
+    PublishAuthorityLocked();
     return absl::OkStatus();
   }
-  leases_.insert_or_assign(anchor.group_id_,
-                           Lease{session, anchor, deadline, false});
-  ++generation_;
+  writer_state_.leases_.insert_or_assign(anchor.group_id_,
+                                         Lease{session, anchor, deadline});
+  ++writer_state_.generation_;
+  PublishAuthorityLocked();
   return absl::OkStatus();
 }
 
@@ -430,11 +502,12 @@ bool AuthorityGuard::HasExactLease(const SessionIdentity& session,
                                    const AuthorityAnchor& anchor,
                                    MonotonicTime deadline,
                                    MonotonicTime now) const {
-  const std::lock_guard lock(mutex_);
-  if (!session_.has_value() || *session_ != session) return false;
-  const auto lease = leases_.find(anchor.group_id_);
-  return lease != leases_.end() && lease->second.session_ == session &&
-         lease->second.anchor_ == anchor &&
+  const AuthorityState& authority = CurrentAuthority();
+  if (!authority.session_.has_value() || *authority.session_ != session)
+    return false;
+  const auto lease = authority.leases_.find(anchor.group_id_);
+  return lease != authority.leases_.end() &&
+         lease->second.session_ == session && lease->second.anchor_ == anchor &&
          lease->second.deadline_ == deadline && deadline > now;
 }
 
@@ -443,36 +516,43 @@ bool AuthorityGuard::ExpireLease(const SessionIdentity& session,
                                  MonotonicTime deadline, MonotonicTime now) {
   if (now < deadline) return false;
   const std::lock_guard lock(mutex_);
-  if (!session_.has_value() || *session_ != session) return false;
-  const auto lease = leases_.find(anchor.group_id_);
-  if (lease == leases_.end() || lease->second.session_ != session ||
-      lease->second.anchor_ != anchor || lease->second.deadline_ != deadline) {
+  if (!writer_state_.session_.has_value() || *writer_state_.session_ != session)
+    return false;
+  const auto lease = writer_state_.leases_.find(anchor.group_id_);
+  if (lease == writer_state_.leases_.end() ||
+      lease->second.session_ != session || lease->second.anchor_ != anchor ||
+      lease->second.deadline_ != deadline) {
     return false;
   }
-  const bool already_recorded = lease->second.expiration_recorded_;
-  leases_.erase(lease);
-  ++generation_;
+  const bool already_recorded = lease->second.expiration_recorded_->exchange(
+      true, std::memory_order_relaxed);
+  writer_state_.leases_.erase(lease);
+  ++writer_state_.generation_;
+  PublishAuthorityLocked();
   if (!already_recorded) RecordClusterControlLeaseExpiration();
   return true;
 }
 
 void AuthorityGuard::InvalidateSession(const SessionIdentity& session) {
   const std::lock_guard lock(mutex_);
-  if (!session_.has_value() || *session_ != session) return;
-  session_.reset();
-  leases_.clear();
-  ++generation_;
+  if (!writer_state_.session_.has_value() || *writer_state_.session_ != session)
+    return;
+  writer_state_.session_.reset();
+  writer_state_.leases_.clear();
+  ++writer_state_.generation_;
+  PublishAuthorityLocked();
 }
 
 void AuthorityGuard::InvalidateAnchorsChanged(const ServingState* before,
                                               const ServingState& after) {
   const std::lock_guard lock(mutex_);
   bool invalidated = false;
-  for (auto it = leases_.begin(); it != leases_.end();) {
+  for (auto it = writer_state_.leases_.begin();
+       it != writer_state_.leases_.end();) {
     const std::optional<AuthorityAnchor> current =
         LocalPrimaryAnchor(after, it->first);
     if (!current.has_value() || *current != it->second.anchor_) {
-      it = leases_.erase(it);
+      it = writer_state_.leases_.erase(it);
       invalidated = true;
     } else {
       ++it;
@@ -482,29 +562,35 @@ void AuthorityGuard::InvalidateAnchorsChanged(const ServingState* before,
   // publishing `after`. Existing leases are enough to identify admissions
   // that can be live, so no generation churn is needed without one.
   (void)before;
-  if (invalidated) ++generation_;
+  if (invalidated) {
+    ++writer_state_.generation_;
+    PublishAuthorityLocked();
+  }
 }
 
 void AuthorityGuard::Fence(const AuthorityAnchor& anchor) {
   const std::lock_guard lock(mutex_);
-  const auto lease = leases_.find(anchor.group_id_);
-  if (lease == leases_.end()) return;
-  leases_.erase(lease);
-  ++generation_;
+  const auto lease = writer_state_.leases_.find(anchor.group_id_);
+  if (lease == writer_state_.leases_.end()) return;
+  writer_state_.leases_.erase(lease);
+  ++writer_state_.generation_;
+  PublishAuthorityLocked();
 }
 
 void AuthorityGuard::InvalidateLeases() {
   const std::lock_guard lock(mutex_);
-  if (leases_.empty()) return;
-  leases_.clear();
-  ++generation_;
+  if (writer_state_.leases_.empty()) return;
+  writer_state_.leases_.clear();
+  ++writer_state_.generation_;
+  PublishAuthorityLocked();
 }
 
 void AuthorityGuard::InvalidateAll() {
   const std::lock_guard lock(mutex_);
-  session_.reset();
-  leases_.clear();
-  ++generation_;
+  writer_state_.session_.reset();
+  writer_state_.leases_.clear();
+  ++writer_state_.generation_;
+  PublishAuthorityLocked();
 }
 
 }  // namespace lavik::cluster

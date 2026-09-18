@@ -17,6 +17,8 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -157,6 +159,149 @@ struct TestAuthorityControl {
   lavik::cluster::NodeControlInstaller installer;
   lavik::cluster::testing::TestTopologyInstaller topology;
 };
+
+TEST(ClusterAuthoritySnapshotTest, ReadAdmissionKeepsRoutingAndLeaseChecks) {
+  TestAuthorityControl control;
+  const std::array<std::uint16_t, 1> local{kSlotInA};
+  const std::array<std::uint16_t, 1> remote{kSlotInB};
+  const std::array<std::uint16_t, 2> cross{kSlotInA, kSlotInB};
+  const auto now = lavik::cluster::MonotonicTime{};
+  EXPECT_EQ(control.authority.AdmitRead(MakeRequest(local, false), now).kind_,
+            Decision::Kind::kLoading);
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), now).ok());
+  for (const auto slots : {std::span<const std::uint16_t>(local),
+                           std::span<const std::uint16_t>(remote),
+                           std::span<const std::uint16_t>(cross)}) {
+    const auto request = MakeRequest(slots, false);
+    const auto read = control.authority.AdmitRead(request, now);
+    const auto captured = control.authority.CaptureAndAdmit(request, now);
+    EXPECT_EQ(read.kind_, captured.decision().kind_);
+    EXPECT_EQ(read.moved_host_, captured.decision().moved_host_);
+    EXPECT_EQ(read.moved_port_, captured.decision().moved_port_);
+  }
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeR), now).ok());
+  EXPECT_EQ(
+      control.authority.AdmitRead(MakeRequest(local, false, true), now).kind_,
+      Decision::Kind::kServeStaleRead);
+}
+
+TEST(ClusterAuthoritySnapshotTest, CachedReadExpiresWithoutAnyPublication) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), start, 10ms).ok());
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  const auto read = MakeRequest(slots, false);
+  EXPECT_EQ(control.authority.AdmitRead(read, start + 9ms).kind_,
+            Decision::Kind::kServe);
+  const auto write =
+      control.authority.CaptureAndAdmit(MakeRequest(slots, true), start + 9ms);
+  EXPECT_EQ(control.authority.AdmitRead(read, start + 10ms).kind_,
+            Decision::Kind::kClusterDownUnbound);
+  EXPECT_EQ(control.authority.RecheckAtMutation(write, start + 10ms),
+            RecheckResult::kReject);
+}
+
+TEST(ClusterAuthoritySnapshotTest,
+     RenewalRefreshesDeadlineWithoutAbortingWrite) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), start, 10ms).ok());
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  const auto read = MakeRequest(slots, false);
+  ASSERT_EQ(control.authority.AdmitRead(read, start + 4ms).kind_,
+            Decision::Kind::kServe);
+  const auto write =
+      control.authority.CaptureAndAdmit(MakeRequest(slots, true), start + 4ms);
+  ASSERT_TRUE(
+      control.topology.Install(BuildState(kNodeA), start + 5ms, 10ms).ok());
+  EXPECT_EQ(control.authority.AdmitRead(read, start + 11ms).kind_,
+            Decision::Kind::kServe);
+  EXPECT_EQ(control.authority.RecheckAtMutation(write, start + 11ms),
+            RecheckResult::kOk);
+  EXPECT_EQ(control.authority.AdmitRead(read, start + 15ms).kind_,
+            Decision::Kind::kClusterDownUnbound);
+}
+
+TEST(ClusterAuthoritySnapshotTest,
+     ConcurrentRenewalsThenFenceInvalidateReaders) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto now = lavik::cluster::MonotonicTime{};
+  const auto state = BuildState(kNodeA);
+  ASSERT_TRUE(control.topology.Install(state, now).ok());
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  const auto write =
+      control.authority.CaptureAndAdmit(MakeRequest(slots, true), now);
+  std::atomic<unsigned> started{0};
+  std::atomic<unsigned> phase{0};
+  std::atomic<unsigned> failures{0};
+  std::vector<std::thread> readers;
+  for (int i = 0; i < 4; ++i) {
+    readers.emplace_back([&] {
+      const auto request = MakeRequest(slots, false);
+      if (control.authority.AdmitRead(request, now).kind_ !=
+          Decision::Kind::kServe)
+        ++failures;
+      started.fetch_add(1, std::memory_order_release);
+      while (phase.load(std::memory_order_acquire) == 0) {
+        const auto decision = control.authority.AdmitRead(request, now);
+        if (phase.load(std::memory_order_acquire) == 0 &&
+            decision.kind_ != Decision::Kind::kServe)
+          ++failures;
+      }
+      while (phase.load(std::memory_order_acquire) != 2)
+        std::this_thread::yield();
+      for (int n = 0; n < 100; ++n) {
+        if (control.authority.AdmitRead(request, now).kind_ !=
+            Decision::Kind::kClusterDownUnbound)
+          ++failures;
+        if (control.authority.Recheck(write, now) != RecheckResult::kReject)
+          ++failures;
+      }
+    });
+  }
+  while (started.load(std::memory_order_acquire) != 4)
+    std::this_thread::yield();
+  for (int i = 0; i < 100; ++i) {
+    if (!control.topology.Install(state, now, 1h + std::chrono::seconds(i))
+             .ok())
+      ++failures;
+  }
+  phase.store(1, std::memory_order_release);
+  auto group = GroupA();
+  group.granted_ = false;
+  if (!control.topology.Install(BuildState(kNodeA, group, GroupB()), now).ok())
+    ++failures;
+  phase.store(2, std::memory_order_release);
+  for (auto& reader : readers) reader.join();
+  EXPECT_EQ(failures.load(), 0u);
+  EXPECT_EQ(control.authority.RecheckAtMutation(write, now),
+            RecheckResult::kReject);
+}
+
+TEST(ClusterAuthoritySnapshotTest, ReusedAddressDoesNotReuseCachedAuthority) {
+  using namespace std::chrono_literals;
+  std::optional<TestAuthorityControl> control;
+  const auto now = lavik::cluster::MonotonicTime{};
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  const auto request = MakeRequest(slots, false);
+  control.emplace();
+  ASSERT_TRUE(control->topology.Install(BuildState(kNodeA), now, 10ms).ok());
+  EXPECT_EQ(control->authority.AdmitRead(request, now).kind_,
+            Decision::Kind::kServe);
+  control.reset();
+  control.emplace();
+  ASSERT_TRUE(control->topology.Install(BuildState(kNodeA), now, 20ms).ok());
+  EXPECT_EQ(control->authority.AdmitRead(request, now + 15ms).kind_,
+            Decision::Kind::kServe);
+  control.reset();
+  control.emplace();
+  ASSERT_TRUE(control->topology.Install(BuildState(kNodeB), now, 20ms).ok());
+  EXPECT_EQ(control->authority.AdmitRead(request, now).kind_,
+            Decision::Kind::kMoved);
+}
 
 // MOVED targets always carry the concrete advertised host plus both ports;
 // the Redis layer picks the port by the connection's TLS state.
