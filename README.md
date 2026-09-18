@@ -63,13 +63,11 @@ SPDK NVMe namespaces, so capacity scales with storage.
   the tested read, write, and mixed workloads.
   See [disk-backed comparisons](#disk-backed-kv-systems).
 
-- **NVMe storage, near in-memory performance.** On an AMD EPYC 9V74 server
-  with approximately 126 GiB RAM and six raw NVMe drives, Lavik v0.1.0-beta.1
-  with SPDK and defrag enabled reached **1,012,180 GET QPS** and
-  **930,465 SET QPS** over **10 million keys with 1 KiB values**.
-  GET/SET p99 latency at those peaks was **3.599 / 4.799 ms**.
-  See [in-memory comparisons](#in-memory-redis-and-valkey) for Redis/Valkey
-  controls and test settings.
+- **NVMe storage, near in-memory performance.** In the 10-million-key
+  benchmark, Lavik's peak GET throughput was **3.6% higher than Redis and
+  4.8% higher than Valkey**. Its peak SET throughput was **2.2% higher than
+  Redis and 15.9% higher than Valkey**.
+  See [in-memory comparisons](#in-memory-redis-and-valkey) for full results.
 
 - **Put multiple CPU cores to work in one server.** Worker threads own their
   data partitions and execute requests in parallel. A C++23 coroutine runtime

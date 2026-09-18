@@ -119,10 +119,11 @@ driver state and rerun the same allowlisted config after enabling the mode.
 
 ## Start Lavik and check the configuration
 
-Set the extracted binary's absolute path. Adjust the bind address, CPU list,
-and worker count to your machine. The example fixes 16 workers on 16 logical
-CPUs and omits the fixed defaults of `v0.1.0-beta.1`: kernel TCP, loopback
-address, port 6379, pinned workers, disabled metrics, and enabled defrag:
+Set the extracted binary's absolute path and adjust the bind address and CPU
+list to your machine. The default worker count follows the CPU affinity, so
+`taskset -c 0-15` selects 16 workers. The example omits `v0.1.0-beta.1`
+defaults: kernel TCP, loopback address, port 6379, pinned workers, disabled
+metrics, and enabled defrag:
 
 ```bash
 LAVIK_BINARY='/opt/lavik-v0.1.0-beta.1-linux-x86_64/lavik'
@@ -135,7 +136,7 @@ done
 sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
   env BYCORF_EAL_ARGS="$LAVIK_EAL_ARGS" BYCORF_DPDK_MEMORY_MB=8192 \
   taskset -c 0-15 "$LAVIK_BINARY" \
-  --storage=spdk --threads=16 \
+  --storage=spdk \
   --spdk-max-completions-per-poll=16 \
   "${LAVIK_DATA_ARGS[@]}"
 ```

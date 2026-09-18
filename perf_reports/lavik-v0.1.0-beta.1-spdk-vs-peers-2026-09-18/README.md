@@ -99,8 +99,8 @@ These addresses and serials belong to this host. Replace them with your own
 verified dedicated controllers; binding affects all namespaces on a
 controller. `LAVIK_SPDK_SETUP` and `LAVIK_BINARY` below are the helper and
 extracted package paths set in the guide. The launch example omits fixed
-`v0.1.0-beta.1` defaults and adapts the binary/log paths. `--threads=16` fixes
-the benchmark worker count because the default depends on the host CPU count.
+`v0.1.0-beta.1` defaults and adapts the binary/log paths. The default worker
+count follows the 16 CPUs selected by `taskset`.
 The exact acquisition command is preserved in `server-command.json`.
 
 The benchmark saved the previous hugepage/VFIO settings, cleared each
@@ -125,7 +125,6 @@ sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
   taskset -c 0-15 "$LAVIK_BINARY" \
   --storage=spdk \
   --bind=172.16.0.4 \
-  --threads=16 \
   --tomb-raider-interval-ms=0 \
   --spdk-max-completions-per-poll=16 \
   --log-dir=/var/log/lavik/benchmark \

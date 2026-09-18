@@ -97,8 +97,8 @@ Redis、Valkey 按每个命令的实测峰值固定选择一个 I/O 线程配置
 上表地址只属于本次主机，复现时替换为自己核对过的专用控制器；绑定会影响
 该控制器的全部 namespace。下面的 `LAVIK_SPDK_SETUP`、`LAVIK_BINARY` 按指南
 设为绑定脚本和解压后二进制的路径。启动示例省略 `v0.1.0-beta.1` 的固定
-默认参数，并替换二进制/日志目录。`--threads=16` 用于固定压测线程数，
-因为默认值取决于主机核数。实际采集的完整命令保存在 `server-command.json` 中。
+默认参数，并替换二进制/日志目录。线程数默认跟随 `taskset` 选定的 16 个 CPU。
+实际采集的完整命令保存在 `server-command.json` 中。
 
 本次先保存 hugepages/VFIO 原值，在内核驱动下按序列号核对专用盘并逐盘
 `blkdiscard`，再绑定 VFIO。因为测试 VM 没有暴露 IOMMU，本次在绑定前临时
@@ -120,7 +120,6 @@ sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
   taskset -c 0-15 "$LAVIK_BINARY" \
   --storage=spdk \
   --bind=172.16.0.4 \
-  --threads=16 \
   --tomb-raider-interval-ms=0 \
   --spdk-max-completions-per-poll=16 \
   --log-dir=/var/log/lavik/benchmark \
