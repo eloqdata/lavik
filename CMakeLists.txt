@@ -1312,7 +1312,7 @@ if (BUILD_TESTING)
       )
       set_tests_properties(cluster_integration.rebuild_protocol_guards PROPERTIES
         LABELS cluster-integration
-        # This entry runs nine process fixtures, including crash/restart and
+        # This entry runs multiple process fixtures, including crash/restart and
         # forced reconnects. Their combined runtime exceeds two minutes on
         # hosted runners; each fixture retains its own bounded progress waits.
         TIMEOUT 300
@@ -1364,6 +1364,7 @@ if (BUILD_TESTING)
     tests/native_replay_test.cpp
     tests/native_reparent_test.cpp
     tests/replica_applied_frontier_test.cpp
+    tests/full_sync_handoff_test.cpp
     tests/ring_buffer_test.cpp
     tests/tx_lock_test.cpp
     tests/storage_format_test.cpp

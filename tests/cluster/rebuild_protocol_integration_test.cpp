@@ -77,6 +77,103 @@ std::size_t CountOccurrences(std::string_view text, std::string_view needle) {
 }
 
 TEST(RebuildProtocolIntegrationTest,
+     IndependentHandoffsCompleteBeforeFirstAckAndRemoveStalePartitions) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires the deterministic handoff completion barrier";
+#endif
+  TempDirectory directory("async-handoff-order");
+  const auto source_data = directory.path() / "source.data";
+  const auto target_data = directory.path() / "target.data";
+  const auto source_log = directory.path() / "source.log";
+  const auto target_log = directory.path() / "target.log";
+  CreateDataFile(source_data, 128ULL * 1024 * 1024);
+  CreateDataFile(target_data, 128ULL * 1024 * 1024);
+  PortReservation source_reservation;
+  PortReservation target_reservation;
+  const auto source_port = source_reservation.ReleaseForSpawn();
+  const auto target_port = target_reservation.ReleaseForSpawn();
+  ChildProcess source(ServerArguments(source_port, source_data), source_log);
+  ChildProcess target(
+      ServerArguments(target_port, target_data), target_log,
+      {{"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK", "1"}});
+  WaitForStartup(source_port, "async handoff source");
+  WaitForStartup(target_port, "async handoff target");
+  RespClient source_client = Connect(source_port);
+  RespClient target_client = Connect(target_port);
+  ASSERT_EQ(source_client.Command({"SET", "retained", "value"}), "+OK");
+  ASSERT_EQ(target_client.Command({"SET", "stale", "must-disappear"}), "+OK");
+  ASSERT_EQ(target_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  // Partition zero cannot ACK until another partition has ACKed. A sender
+  // that waits after every handoff, or a serial target, cannot finish this
+  // FULL.
+  WaitUntil("out-of-order handoff completes FULL", 20s, [&] {
+    return target_client.Command({"INFO", "replication"})
+               .find("lavik_replication_state:online") != std::string::npos;
+  });
+  const std::string log = ReadFile(target_log);
+  const auto held = log.find("holding first partition handoff");
+  const auto later = log.find("acknowledged async partition handoff 1");
+  const auto first = log.find("acknowledged async partition handoff 0");
+  ASSERT_NE(held, std::string::npos);
+  ASSERT_NE(later, std::string::npos);
+  ASSERT_NE(first, std::string::npos);
+  EXPECT_LT(held, later);
+  EXPECT_LT(later, first);
+  EXPECT_EQ(CountOccurrences(ReadFile(source_log), "selected=FULL"), 1);
+  ASSERT_EQ(target_client.Command({"READONLY"}), "+OK");
+  EXPECT_EQ(target_client.Command({"GET", "retained"}), "$5\r\nvalue");
+  EXPECT_EQ(target_client.Command({"EXISTS", "stale"}), ":0");
+  ASSERT_EQ(source_client.Command({"SET", "retained", "after-cut"}), "+OK");
+  WaitUntil("online writes follow the handoff cut", 10s, [&] {
+    return target_client.Command({"GET", "retained"}) == "$9\r\nafter-cut";
+  });
+}
+
+TEST(RebuildProtocolIntegrationTest, CancellationJoinsOutstandingHandoffTasks) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires the deterministic handoff completion barrier";
+#endif
+  TempDirectory directory("async-handoff-cancel");
+  const auto source_data = directory.path() / "source.data";
+  const auto target_data = directory.path() / "target.data";
+  const auto target_log = directory.path() / "target.log";
+  CreateDataFile(source_data, 128ULL * 1024 * 1024);
+  CreateDataFile(target_data, 128ULL * 1024 * 1024);
+  PortReservation source_reservation;
+  PortReservation target_reservation;
+  const auto source_port = source_reservation.ReleaseForSpawn();
+  const auto target_port = target_reservation.ReleaseForSpawn();
+  ChildProcess source(ServerArguments(source_port, source_data),
+                      directory.path() / "source.log");
+  ChildProcess target(
+      ServerArguments(target_port, target_data), target_log,
+      {{"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK", "cancel"}});
+  WaitForStartup(source_port, "cancel handoff source");
+  WaitForStartup(target_port, "cancel handoff target");
+  RespClient target_client = Connect(target_port);
+  ASSERT_EQ(target_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  WaitUntil("handoff remains outstanding", 10s, [&] {
+    return ReadFile(target_log).find("holding first partition handoff") !=
+           std::string::npos;
+  });
+  EXPECT_EQ(target_client.Command({"INFO", "replication"})
+                .find("lavik_replication_state:online"),
+            std::string::npos);
+  // Return from role change proves cancellation joined tasks holding the old
+  // stream; the withheld partition must not later publish an ACK or readiness.
+  EXPECT_EQ(target_client.Command({"REPLICAOF", "NO", "ONE"}), "+OK");
+  // An interrupted destructive FULL has no complete population to promote.
+  EXPECT_TRUE(
+      target_client.Command({"GET", "after-cancel"}).starts_with("-LOADING"));
+  EXPECT_EQ(ReadFile(target_log).find("acknowledged async partition handoff 0"),
+            std::string::npos);
+}
+
+TEST(RebuildProtocolIntegrationTest,
      SourceCannotPublishOnlineBeforeTargetFlowProof) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP()

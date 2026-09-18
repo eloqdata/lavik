@@ -876,6 +876,28 @@ logical epoch, including zero for a non-member, against the exact target-local
 epoch returned by reset. On the target, every handoff marks the corresponding
 empty or populated partition as tailing.
 
+Partition handoffs are independent asynchronous completions. Each source flow
+owns a session-local ledger covering every assigned physical partition:
+not sent, in flight, or acknowledged. It registers a handoff before sending
+and sends immediately while its bounded in-flight window has room. Only an
+exact partition/sequence ACK decreases the unfinished count. One flow-local
+reader dispatches all FULL ACKs, allowing handoff completion out of order
+without confusing record, command, or cut acknowledgements. The target keeps
+frame admission in sequence order but dispatches independent handoffs to their
+partition workers; it records the cluster proof before acknowledging each
+completion. ACK frame writes remain serialized. Same-partition dependencies,
+reset, and cut boundaries join pending handoffs. Cancellation joins all
+handoff tasks before the stream and rebuild attempt can be retired.
+
+The handoff ledger is not durable and has no partition-level resend protocol.
+A failed FULL session follows the existing whole-attempt recovery rules.
+The wire frames are unchanged: a source waiting after each handoff remains
+compatible because it cannot introduce overlapping handoff requests, and a
+target processing requests serially remains compatible with the source ACK
+dispatcher. A flow cannot reach the final cut until every partition is
+acknowledged. After scanning, it continues draining live writes while awaiting
+handoff and peer-flow completion.
+
 At the final cut, the source closes and drains snapshot-transaction admission,
 closes and drains command database gates, drains replacement and session
 queues, fences each shared backlog, pins each returned stable cursor, stops

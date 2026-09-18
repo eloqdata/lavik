@@ -66,6 +66,7 @@
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/sync.h"
 #include "bycorf/runtime/worker.h"
+#include "full_sync_handoff.h"
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/cluster/lease_clock.h"
 #include "lavik/command.h"
@@ -273,10 +274,11 @@ constexpr std::size_t kOverrideRecordsPerBatch = 256;
 // and drains the remaining finite prefix completely.
 constexpr std::size_t kFullSyncInterleaveCommands = kFullSyncSchedulingItems;
 // Candidate epochs are independent of the source-side scan fence. Persist a
-// group in one target fdatasync, then install/scan/handoff one source
-// partition at a time. This keeps the one-partition memory bound without
-// issuing one metadata durability round-trip for every empty partition.
+// group in one target fdatasync, then scan one source partition at a time
+// while handoffs complete independently. This keeps the scan memory bound
+// without issuing one metadata durability round-trip for every empty partition.
 constexpr std::size_t kFullSyncResetBatch = 64;
+constexpr std::size_t kFullSyncHandoffWindow = 64;
 constexpr std::size_t kMaxDataFrame = 12U * 1024U * 1024U;
 constexpr std::uint32_t kDataFrameMagic = 0x3146564c;  // "LVF1" in LE.
 constexpr std::uint8_t kDataFrameVersion = 1;
@@ -671,57 +673,6 @@ Task<absl::StatusOr<std::pair<DataFrameKind, std::string>>> ReadDataFrame(
   }
   co_return std::make_pair(static_cast<DataFrameKind>(kind),
                            std::move(*payload));
-}
-
-Task<absl::Status> WriteFrameAndWaitAck(TcpStream& stream, DataFrameKind kind,
-                                        std::string_view payload,
-                                        std::uint16_t partition_id) {
-  absl::Status sent = co_await WriteDataFrame(stream, kind, payload);
-  if (!sent.ok()) co_return sent;
-  auto ack = co_await ReadDataFrame(stream);
-  if (!ack.ok()) co_return ack.status();
-  if (ack->first != DataFrameKind::kAck) {
-    co_return absl::InvalidArgumentError("replication frame ACK expected");
-  }
-  DataReader reader(ack->second);
-  std::uint16_t acknowledged_partition = 0;
-  if (!reader.U16(&acknowledged_partition) ||
-      acknowledged_partition != partition_id || reader.remaining() != 8) {
-    co_return absl::InvalidArgumentError("malformed replication frame ACK");
-  }
-  co_return absl::OkStatus();
-}
-
-Task<absl::Status> WaitFullSyncAck(TcpStream& stream,
-                                   std::uint16_t partition_id,
-                                   std::uint64_t fullsync_sequence) {
-  auto ack = co_await ReadDataFrame(stream);
-  if (!ack.ok()) co_return ack.status();
-  if (ack->first != DataFrameKind::kAck) {
-    co_return absl::InvalidArgumentError("full-sync frame ACK expected");
-  }
-  DataReader reader(ack->second);
-  std::uint16_t acknowledged_partition = 0;
-  std::uint64_t acknowledged_sequence = 0;
-  if (!reader.U16(&acknowledged_partition) ||
-      !reader.U64(&acknowledged_sequence) || reader.remaining() != 0 ||
-      acknowledged_partition != partition_id ||
-      acknowledged_sequence != fullsync_sequence) {
-    co_return absl::InvalidArgumentError("malformed full-sync frame ACK");
-  }
-  co_return absl::OkStatus();
-}
-
-Task<absl::Status> WriteFullSyncFrameAndWaitAck(
-    TcpStream& stream, DataFrameKind kind, std::string_view body,
-    std::uint16_t partition_id, std::uint64_t fullsync_sequence) {
-  std::string payload;
-  payload.reserve(sizeof(fullsync_sequence) + body.size());
-  PutU64(payload, fullsync_sequence);
-  PutString(payload, body);
-  absl::Status sent = co_await WriteDataFrame(stream, kind, payload);
-  if (!sent.ok()) co_return sent;
-  co_return co_await WaitFullSyncAck(stream, partition_id, fullsync_sequence);
 }
 
 Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream) {
@@ -13013,29 +12964,179 @@ class ReplicationManager::ReplicationGroup {
     co_return receiver_status;
   }
 
+  struct ReplicaHandoffState {
+    // Flow-local lifetime extends until every handoff task has joined. The
+    // ACK mutex serializes frame bytes, not partition completion order.
+    std::array<bool, storage::kLogicalStorageShards> pending_{};
+    bycorf::AsyncMutex ack_mutex_;
+    bycorf::AsyncNotification changed_;
+    std::size_t active_ = 0;
+    std::size_t completed_ = 0;
+    absl::Status status_;
+    bool stopping_ = false;
+  };
+
+  Task<absl::Status> SendReplicaFullSyncAck(
+      TcpStream& stream, const std::shared_ptr<ReplicaHandoffState>& state,
+      std::uint16_t partition, std::uint64_t sequence) {
+    std::string payload;
+    PutU16(payload, partition);
+    PutU64(payload, sequence);
+    std::string frame;
+    absl::Status encoded = ReserveReplicationString(
+        &frame, kDataFrameHeaderBytes + payload.size());
+    if (!encoded.ok()) co_return encoded;
+    encoded = AppendDataFrame(&frame, DataFrameKind::kAck, payload);
+    if (!encoded.ok()) co_return encoded;
+
+    // All writers run on this flow's worker, but WriteAll can suspend after a
+    // short write. Keep another ACK from interleaving with the remaining bytes.
+    co_await state->ack_mutex_.Lock();
+    absl::Status sent = state->status_;
+    if (sent.ok() && state->stopping_) {
+      sent = absl::CancelledError("FULL ACK sender is stopping");
+    }
+    if (sent.ok()) {
+      sent = co_await WriteText(stream, frame);
+    }
+    state->ack_mutex_.Unlock(*bycorf::ThisWorker().self_);
+    co_return sent;
+  }
+
+  Task<absl::Status> ApplyReplicaHandoff(
+      const std::shared_ptr<ReplicaSession>& session,
+      const std::shared_ptr<ReplicaHandoffState>& state,
+      std::uint16_t partition, std::uint64_t epoch) {
+    LAVIK_FAULT_INJECT(
+        if (const char* hold = std::getenv(
+                "LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK");
+            partition == 0 && hold != nullptr) {
+          spdlog::info("holding first partition handoff until a later ACK");
+          while (
+              (state->completed_ == 0 || std::string_view(hold) == "cancel") &&
+              !state->stopping_ && state->status_.ok() &&
+              !session->cancelled()) {
+            co_await state->changed_.Wait();
+          }
+        });
+    if (state->stopping_ || session->cancelled()) {
+      co_return absl::CancelledError("partition handoff cancelled");
+    }
+    const unsigned owner = partition % storage_->worker_count();
+    absl::Status handed_off = co_await bycorf::SubmitTaskTo(
+        owner, [this, session, partition, epoch]() {
+          return storage_->HandoffReplicaPartition(session->session_id_,
+                                                   partition, epoch);
+        });
+    if (!handed_off.ok()) co_return handed_off;
+    if (state->stopping_ || session->cancelled()) {
+      co_return absl::CancelledError("partition handoff superseded");
+    }
+    co_return co_await RecordClusterHandoffProof(session->cluster_rebuild_,
+                                                 partition, epoch);
+  }
+
+  Task<absl::Status> TrackReplicaHandoff(
+      TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
+      const std::shared_ptr<ReplicaHandoffState>& state,
+      std::uint16_t partition, std::uint64_t epoch, std::uint64_t sequence) {
+    absl::Status result =
+        co_await ApplyReplicaHandoff(session, state, partition, epoch);
+    if (result.ok() && (state->stopping_ || session->cancelled())) {
+      result = absl::CancelledError("partition handoff superseded before ACK");
+    }
+    if (result.ok()) {
+      result =
+          co_await SendReplicaFullSyncAck(stream, state, partition, sequence);
+    }
+    if (!result.ok()) {
+      if (state->status_.ok()) state->status_ = result;
+      session->Cancel();
+    } else {
+      ++state->completed_;
+      LAVIK_FAULT_INJECT(
+          if (std::getenv(
+                  "LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK") !=
+                  nullptr &&
+              (state->completed_ == 1 || partition == 0)) {
+            spdlog::info("acknowledged async partition handoff {}", partition);
+          });
+    }
+    state->pending_[partition] = false;
+    --state->active_;
+    state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
+    co_return result;
+  }
+
   Task<absl::Status> RunReplicaFlowData(
       TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
       unsigned flow_id) {
+    auto state = std::make_shared<ReplicaHandoffState>();
+    absl::Status result =
+        co_await ReceiveReplicaFlowData(stream, session, flow_id, state);
+    // No task may retain the stream or mutate this attempt after its owning
+    // flow returns to the coordinator's abort/reparent cleanup.
+    state->stopping_ = true;
+    if (!result.ok()) {
+      session->Cancel();
+      (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
+    }
+    state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
+    while (state->active_ != 0) co_await state->changed_.Wait();
+    if (!state->status_.ok()) co_return state->status_;
+    co_return result;
+  }
+
+  Task<absl::Status> WaitReplicaHandoffs(
+      const std::shared_ptr<ReplicaSession>& session,
+      const std::shared_ptr<ReplicaHandoffState>& state,
+      std::optional<std::uint16_t> partition = std::nullopt,
+      std::size_t active_limit = 0) {
+    while (state->status_.ok() &&
+           (partition.has_value() ? state->pending_[*partition]
+                                  : state->active_ > active_limit)) {
+      // Cancel closes session sockets, but a completion wait owns no pending
+      // socket I/O. Bound cancellation latency before joining handoff tasks.
+      if (session->cancelled()) {
+        co_return absl::CancelledError("handoff wait cancelled");
+      }
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+    if (session->cancelled()) {
+      co_return absl::CancelledError("handoff wait cancelled");
+    }
+    co_return state->status_;
+  }
+
+  Task<absl::Status> ReceiveReplicaFlowData(
+      TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
+      unsigned flow_id, const std::shared_ptr<ReplicaHandoffState>& state) {
     absl::flat_hash_map<std::uint16_t, std::uint64_t> epochs;
     std::uint64_t expected_fullsync_sequence = 1;
     std::optional<std::uint64_t> online_next_lsn;
     std::uint64_t staged_command_lsn = 0;
     std::uint32_t next_command_fragment = 0;
     std::string staged_command;
-    auto send_ack = [&stream](std::uint16_t partition_id,
-                              std::uint64_t sequence) -> Task<absl::Status> {
-      std::string payload;
-      payload.reserve(10);
-      PutU16(payload, partition_id);
-      PutU64(payload, sequence);
-      co_return co_await WriteDataFrame(stream, DataFrameKind::kAck, payload);
+    auto send_ack = [this, &stream, &state](std::uint16_t partition_id,
+                                            std::uint64_t sequence) {
+      return SendReplicaFullSyncAck(stream, state, partition_id, sequence);
     };
     while (stream.IsOpen()) {
       auto frame = co_await ReadDataFrame(stream);
       if (!frame.ok()) co_return frame.status();
+      if (!state->status_.ok()) co_return state->status_;
       absl::Status phase =
           session->ValidateDataFramePhase(flow_id, frame->first);
       if (!phase.ok()) co_return phase;
+      if (frame->first == DataFrameKind::kReset ||
+          frame->first == DataFrameKind::kFullSyncCut ||
+          frame->first == DataFrameKind::kCursor ||
+          frame->first == DataFrameKind::kCommand) {
+        absl::Status waited = co_await WaitReplicaHandoffs(session, state);
+        if (!waited.ok()) co_return waited;
+      }
       if (frame->first == DataFrameKind::kReset) {
         DataReader reader(frame->second);
         std::uint32_t reset_count = 0;
@@ -13113,20 +13214,19 @@ class ReplicationManager::ReplicationGroup {
           co_return absl::InvalidArgumentError(
               "malformed partition handoff frame");
         }
-        const unsigned owner = partition_id % storage_->worker_count();
-        const std::uint64_t epoch = epochs.at(partition_id);
-        absl::Status handed_off = co_await bycorf::SubmitTaskTo(
-            owner, [this, session, partition_id, epoch]() {
-              return storage_->HandoffReplicaPartition(session->session_id_,
-                                                       partition_id, epoch);
-            });
-        if (!handed_off.ok()) co_return handed_off;
-        absl::Status handoff_recorded = co_await RecordClusterHandoffProof(
-            session->cluster_rebuild_, partition_id, epoch);
-        if (!handoff_recorded.ok()) co_return handoff_recorded;
-        absl::Status acknowledged = co_await send_ack(partition_id, sequence);
-        if (!acknowledged.ok()) co_return acknowledged;
+        if (state->pending_[partition_id]) {
+          co_return absl::InvalidArgumentError("overlapping partition handoff");
+        }
+        absl::Status waited = co_await WaitReplicaHandoffs(
+            session, state, std::nullopt, kFullSyncHandoffWindow - 1);
+        if (!waited.ok()) co_return waited;
+        state->pending_[partition_id] = true;
+        ++state->active_;
+        // Receive order remains contiguous; completion and ACK order need not.
         ++expected_fullsync_sequence;
+        bycorf::ThisWorker().self_->Spawn(
+            TrackReplicaHandoff(stream, session, state, partition_id,
+                                epochs.at(partition_id), sequence));
       } else if (frame->first == DataFrameKind::kFullSyncCommand) {
         DataReader reader(frame->second);
         std::uint64_t sequence = 0;
@@ -13154,6 +13254,9 @@ class ReplicationManager::ReplicationGroup {
         }
         const bool first = (flags & first_flag) != 0;
         const bool last = (flags & last_flag) != 0;
+        absl::Status waited =
+            co_await WaitReplicaHandoffs(session, state, partition_id);
+        if (!waited.ok()) co_return waited;
         const unsigned owner = partition_id % storage_->worker_count();
         if (first) {
           if (fragment != 0 || staged_command_lsn != 0) {
@@ -13503,6 +13606,9 @@ class ReplicationManager::ReplicationGroup {
         }
         const unsigned owner = records->first % storage_->worker_count();
         const std::uint16_t partition_id = records->first;
+        absl::Status waited =
+            co_await WaitReplicaHandoffs(session, state, partition_id);
+        if (!waited.ok()) co_return waited;
         const std::uint64_t epoch = found->second;
         const bool desired_partition =
             session->cluster_rebuild_ == nullptr ||
@@ -13853,9 +13959,120 @@ class ReplicationManager::ReplicationGroup {
   }
 #endif
 
+  struct FullSyncAckState {
+    FullSyncAckState(unsigned flow, unsigned flows)
+        : handoffs_(storage::kLogicalStorageShards, flow, flows) {}
+    detail::FullSyncHandoffProgress handoffs_;
+    // Non-handoff ACKs share the same reader. Handoff ownership lives only in
+    // the partition ledger; these entries belong to records, commands and cut.
+    absl::flat_hash_map<std::uint64_t, std::uint16_t> expected_;
+    bycorf::AsyncNotification changed_;
+    absl::Status status_;
+    bool stopping_ = false;
+    bool receiver_done_ = false;
+  };
+
+  Task<absl::Status> ReceiveFullSyncAcks(
+      TcpStream& stream, const std::shared_ptr<MasterSession>& session,
+      unsigned flow, const std::shared_ptr<FullSyncAckState>& state) {
+    absl::Status result;
+    while (!state->stopping_) {
+      while (!state->stopping_ && state->expected_.empty() &&
+             state->handoffs_.inflight() == 0) {
+        co_await state->changed_.Wait();
+      }
+      if (state->stopping_) break;
+      auto frame = co_await ReadDataFrame(stream);
+      if (!frame.ok()) {
+        result = frame.status();
+        break;
+      }
+      DataReader reader(frame->second);
+      std::uint16_t partition = 0;
+      std::uint64_t sequence = 0;
+      if (frame->first != DataFrameKind::kAck || !reader.U16(&partition) ||
+          !reader.U64(&sequence) || reader.remaining() != 0) {
+        result = absl::InvalidArgumentError("malformed full-sync ACK");
+        break;
+      }
+      auto handoff = state->handoffs_.Acknowledge(partition, sequence);
+      if (!handoff.ok()) {
+        result = handoff.status();
+        break;
+      }
+      if (!*handoff) {
+        const auto expected = state->expected_.find(sequence);
+        if (expected == state->expected_.end() ||
+            expected->second != partition) {
+          result = absl::InvalidArgumentError("unexpected full-sync ACK");
+          break;
+        }
+        state->expected_.erase(expected);
+      }
+      session->TouchProgress(flow);
+      state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
+    }
+    state->status_ = result;
+    state->receiver_done_ = true;
+    state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
+    if (!result.ok()) {
+      // The sender may be waiting at a cross-flow cut barrier rather than
+      // awaiting this ACK. Abort the whole session to wake both kinds of wait.
+      session->Cancel();
+    }
+    co_return result;
+  }
+
+  Task<absl::Status> WaitFullSyncRequest(
+      const std::shared_ptr<FullSyncAckState>& state, std::uint64_t sequence) {
+    while (state->status_.ok() && state->expected_.contains(sequence)) {
+      co_await state->changed_.Wait();
+    }
+    co_return state->status_;
+  }
+
+  Task<absl::Status> SendFullSyncRequest(
+      TcpStream& stream, const std::shared_ptr<FullSyncAckState>& state,
+      DataFrameKind kind, std::string_view body, std::uint16_t partition,
+      std::uint64_t sequence) {
+    if (!state->status_.ok()) co_return state->status_;
+    if (!state->expected_.emplace(sequence, partition).second) {
+      co_return absl::InternalError("overlapping full-sync ACK sequence");
+    }
+    state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
+    std::string payload;
+    // RESET predates the sequenced FULL frames and retains its wire layout.
+    if (kind != DataFrameKind::kReset) PutU64(payload, sequence);
+    PutString(payload, body);
+    absl::Status sent = co_await WriteDataFrame(stream, kind, payload);
+    if (!sent.ok()) co_return sent;
+    co_return co_await WaitFullSyncRequest(state, sequence);
+  }
+
   Task<absl::Status> RunMasterFlowData(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
       unsigned flow_id) {
+    auto state =
+        std::make_shared<FullSyncAckState>(flow_id, storage_->worker_count());
+    bycorf::ThisWorker().self_->Spawn(
+        ReceiveFullSyncAcks(stream, session, flow_id, state));
+    auto cursor = co_await RunMasterFullSync(stream, session, flow_id, state);
+    // The reader must relinquish the socket before ONLINE starts reading its
+    // own ACKs. On failure, unblock any outstanding read before joining it.
+    state->stopping_ = true;
+    state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
+    if (!cursor.ok()) (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
+    while (!state->receiver_done_) co_await state->changed_.Wait();
+    if (!state->status_.ok()) co_return state->status_;
+    if (!cursor.ok()) co_return cursor.status();
+    state.reset();
+    co_return co_await EnterMasterFlowBacklog(stream, session, flow_id, *cursor,
+                                              0);
+  }
+
+  Task<absl::StatusOr<std::uint64_t>> RunMasterFullSync(
+      TcpStream& stream, const std::shared_ptr<MasterSession>& session,
+      unsigned flow_id, const std::shared_ptr<FullSyncAckState>& ack_state) {
     auto fullsync_start = storage_->BeginFullSyncSession(session->id_);
     if (!fullsync_start.ok()) co_return fullsync_start.status();
     const auto source_db_epochs = fullsync_start->db_epochs_;
@@ -13897,8 +14114,8 @@ class ReplicationManager::ReplicationGroup {
         std::string payload;
         absl::Status encoded = EncodeRecords(partition_id, batch, &payload);
         if (!encoded.ok()) co_return encoded;
-        absl::Status sent = co_await WriteFullSyncFrameAndWaitAck(
-            stream, DataFrameKind::kRecords, payload, partition_id,
+        absl::Status sent = co_await SendFullSyncRequest(
+            stream, ack_state, DataFrameKind::kRecords, payload, partition_id,
             fullsync_sequence);
         if (!sent.ok()) co_return sent;
         session->TouchProgress(flow_id);
@@ -14157,6 +14374,8 @@ class ReplicationManager::ReplicationGroup {
                 DataFrameCrc32c(payload));
             if (!frame_header.ok()) co_return frame_header;
             if (last) {
+              ack_state->expected_.emplace(
+                  fullsync_sequence, encoded.item_.command_->partition_id_);
               pending_acks.push_back(PendingFullSyncAck{
                   .partition_id_ = encoded.item_.command_->partition_id_,
                   .sequence_ = fullsync_sequence,
@@ -14186,14 +14405,15 @@ class ReplicationManager::ReplicationGroup {
                 iovec{.iov_base = frame_payloads[index].data(),
                       .iov_len = frame_payloads[index].size()});
           }
+          ack_state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
           absl::Status sent = co_await stream.WriteAllV(wire_batch);
           if (!sent.ok()) co_return sent;
           // Sending bytes is protocol progress even when the command's final
           // fragment (and therefore its ACK) is still minutes away.
           session->TouchProgress(flow_id);
           for (const PendingFullSyncAck& expected : pending_acks) {
-            absl::Status acknowledged = co_await WaitFullSyncAck(
-                stream, expected.partition_id_, expected.sequence_);
+            absl::Status acknowledged =
+                co_await WaitFullSyncRequest(ack_state, expected.sequence_);
             if (!acknowledged.ok()) co_return acknowledged;
             storage_->AcknowledgeFullSyncPublishItem(session->id_,
                                                      expected.item_id_);
@@ -14288,12 +14508,16 @@ class ReplicationManager::ReplicationGroup {
                                                            payload_offset),
                               count));
         if (!read.ok()) co_return read;
+        if (last) {
+          ack_state->expected_.emplace(sequence, 0);
+          ack_state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
+        }
         absl::Status sent = co_await WriteDataFrame(
             stream, DataFrameKind::kFullSyncCommand, payload);
         if (!sent.ok()) co_return sent;
         session->TouchProgress(flow_id);
         if (last) {
-          co_return co_await WaitFullSyncAck(stream, 0, sequence);
+          co_return co_await WaitFullSyncRequest(ack_state, sequence);
         }
         offset += count;
       } while (offset < total);
@@ -14376,23 +14600,38 @@ class ReplicationManager::ReplicationGroup {
 
     auto send_partition_handoff =
         [&](std::uint16_t partition_id) -> Task<absl::Status> {
-      std::string handoff_body;
-      PutU16(handoff_body, partition_id);
-      // Partition handoff no longer identifies a shared-backlog cursor. It is
-      // only a target-side completion marker; the final cut supplies the
-      // stable ONLINE cursor for the whole flow.
-      PutU64(handoff_body, 1);
-      absl::Status sent = co_await WriteFullSyncFrameAndWaitAck(
-          stream, DataFrameKind::kPartitionHandoff, handoff_body, partition_id,
-          fullsync_sequence);
+      // This is an in-flight ceiling, never a batch-fill threshold. Every
+      // ready partition is sent immediately whenever a slot is available.
+      while (ack_state->status_.ok() &&
+             ack_state->handoffs_.inflight() >= kFullSyncHandoffWindow) {
+        co_await ack_state->changed_.Wait();
+      }
+      if (!ack_state->status_.ok()) co_return ack_state->status_;
+      absl::Status begun =
+          ack_state->handoffs_.Begin(partition_id, fullsync_sequence);
+      if (!begun.ok()) co_return begun;
+      ack_state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
+      std::string payload;
+      PutU64(payload, fullsync_sequence++);
+      PutU16(payload, partition_id);
+      // Handoff proves partition completion; the final cut supplies the
+      // stable cursor for the entire flow.
+      PutU64(payload, 1);
+      absl::Status sent = co_await WriteDataFrame(
+          stream, DataFrameKind::kPartitionHandoff, payload);
       if (!sent.ok()) co_return sent;
-      ++fullsync_sequence;
+      session->TouchProgress(flow_id);
       LAVIK_FAULT_INJECT(if (const char* configured =
                                  std::getenv("LAVIK_REPLICATION_PAUSE_FULLSYNC_"
                                              "AFTER_HANDOFF_MS");
                              configured != nullptr &&
                              !replication_fullsync_handoff_pause_used_.exchange(
                                  true, std::memory_order_acq_rel)) {
+        while (ack_state->status_.ok() &&
+               !ack_state->handoffs_.acknowledged(partition_id)) {
+          co_await ack_state->changed_.Wait();
+        }
+        if (!ack_state->status_.ok()) co_return ack_state->status_;
         std::uint64_t pause_ms = 0;
         const std::size_t length = std::strlen(configured);
         const auto parsed =
@@ -14480,8 +14719,9 @@ class ReplicationManager::ReplicationGroup {
       session->SetProgress(
           flow_id, ReplicationPhase::kReset, fullsync_backlog_cursor.lsn_,
           fullsync_backlog_cursor.fragment_index_, reset_partitions.back(), 0);
-      absl::Status sent = co_await WriteFrameAndWaitAck(
-          stream, DataFrameKind::kReset, reset, kResetBatchAckPartition);
+      absl::Status sent =
+          co_await SendFullSyncRequest(stream, ack_state, DataFrameKind::kReset,
+                                       reset, kResetBatchAckPartition, 0);
       if (!sent.ok()) {
         cleanup();
         co_return sent;
@@ -14711,6 +14951,32 @@ class ReplicationManager::ReplicationGroup {
     // that FIFO moving until the last flow has finished its scan, then do one
     // final bounded pass so the gate-closed cut has only a small race tail to
     // drain.
+    // Keep the live publisher moving while ACKs are outstanding. Merely
+    // sending every partition must not release the all-flow cut barrier.
+    while (ack_state->handoffs_.unfinished() != 0) {
+      if (!ack_state->status_.ok()) {
+        cleanup();
+        co_return ack_state->status_;
+      }
+      absl::Status published =
+          co_await drain_fullsync_publish_queue(kFullSyncReadyWaitCommands);
+      if (!published.ok()) {
+        cleanup();
+        co_return published;
+      }
+      if (session->cancelled()) {
+        cleanup();
+        co_return absl::CancelledError("session ended while awaiting handoffs");
+      }
+      if (ack_state->handoffs_.unfinished() != 0) {
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
+        if (!waited.ok()) {
+          cleanup();
+          co_return waited;
+        }
+      }
+    }
     session->MarkSnapshotScanComplete();
     do {
       absl::Status published = co_await drain_fullsync_publish_queue(
@@ -14863,9 +15129,9 @@ class ReplicationManager::ReplicationGroup {
     // backlog pressure accounts for post-fence writes normally.
     std::string cut_body;
     PutU64(cut_body, *backlog_cursor);
-    absl::Status cut_sent = co_await WriteFullSyncFrameAndWaitAck(
-        stream, DataFrameKind::kFullSyncCut, cut_body, kResetBatchAckPartition,
-        fullsync_sequence);
+    absl::Status cut_sent = co_await SendFullSyncRequest(
+        stream, ack_state, DataFrameKind::kFullSyncCut, cut_body,
+        kResetBatchAckPartition, fullsync_sequence);
     if (!cut_sent.ok()) {
       co_return cut_sent;
     }
@@ -14890,8 +15156,7 @@ class ReplicationManager::ReplicationGroup {
           ? absl::UnavailableError("injected post-cut reset and disconnected")
           : injected;
     }
-    co_return co_await EnterMasterFlowBacklog(stream, session, flow_id,
-                                              *backlog_cursor, 0);
+    co_return *backlog_cursor;
   }
 
   Task<absl::Status> EnterMasterFlowBacklog(
