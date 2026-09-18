@@ -38,8 +38,8 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/status/status.h"
 #include "lavik/cluster/lease_clock.h"
@@ -251,14 +251,16 @@ class AuthorityGuard {
     MonotonicTime deadline_;
     // Copies of a published lease share one expiration receipt, so concurrent
     // readers and the expiry timer count it once. Renewal installs a fresh
-    // receipt; ordinary admission never writes this atomic.
+    // receipt; ordinary admission never writes this atomic. Relaxed ordering
+    // suffices for metric deduplication; this flag publishes no authority
+    // state.
     std::shared_ptr<std::atomic<bool>> expiration_recorded_ =
         std::make_shared<std::atomic<bool>>(false);
   };
 
   struct AuthorityState {
     std::optional<SessionIdentity> session_;
-    std::unordered_map<std::string, Lease> leases_;
+    absl::flat_hash_map<std::string, Lease> leases_;
     std::uint64_t generation_ = 1;
   };
 

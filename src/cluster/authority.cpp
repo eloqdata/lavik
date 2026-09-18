@@ -532,7 +532,7 @@ void AuthorityGuard::InvalidateAnchorsChanged(const ServingState* before,
     const std::optional<AuthorityAnchor> current =
         LocalPrimaryAnchor(after, it->first);
     if (!current.has_value() || *current != it->second.anchor_) {
-      it = writer_state_.leases_.erase(it);
+      writer_state_.leases_.erase(it++);
       invalidated = true;
     } else {
       ++it;
