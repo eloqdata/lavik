@@ -28,6 +28,7 @@ limitations under the License.
 - Keep one-off source audits and task-specific investigations in task, issue, or pull-request context rather than repository documentation.
 - Before unfamiliar work, read `docs/README.md` and the relevant architecture documents. Consult design documents only when historical rationale or prior alternatives are relevant.
 - When code and documentation disagree, treat code as authoritative and repair the documentation in the same change.
+- Avoid introducing process-wide or cross-worker mutexes that can block worker threads, especially on request paths. Prefer worker-local ownership, immutable snapshots, message passing, or narrowly scoped atomics where they preserve the required correctness and lifetime guarantees. When a shared blocking mutex is necessary, document why the alternatives are unsuitable and, if workers can contend on it, measure its effect on throughput and tail latency under relevant concurrency.
 <!-- END bootstrap-project: engineering-standards -->
 
 ## Repository documentation

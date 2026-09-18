@@ -6,6 +6,7 @@ name: Ubuntu release packages
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -52,6 +53,7 @@ jobs:
       LAVIK_PACKAGE_JOBS: '2'
       LAVIK_PACKAGE_KERNEL_BYPASS: ${{ matrix.bypass }}
       LAVIK_PACKAGE_VERSION: nightly
+      LAVIK_PACKAGE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
       CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -102,11 +104,20 @@ jobs:
             test -s "$package_dir/$notice"
           done
           test "$(cat "$package_dir/REVISION")" = "$GITHUB_SHA"
+          if [[ -n "$LAVIK_PACKAGE_TAG" ]]; then
+            test "$(cat "$package_dir/VERSION")" = "$LAVIK_PACKAGE_TAG"
+          fi
           for app in lavik lavik-meta lavik-ctl; do
             binary=$(find unpacked -type f -name "$app")
             test -n "$binary"
             "$binary" --help >/dev/null 2>&1
             "$binary" --version
+            if [[ -n "$LAVIK_PACKAGE_TAG" ]]; then
+              # lavik-meta also reports its pinned NuRaft revision.
+              read -r binary_name binary_version _ <<<"$("$binary" --version)"
+              test "$binary_name" = "$app"
+              test "$binary_version" = "${LAVIK_PACKAGE_TAG#v}"
+            fi
           done
           smoke_args=()
           if [[ "$LAVIK_PACKAGE_KERNEL_BYPASS" == OFF ]]; then
@@ -196,3 +207,65 @@ jobs:
             gh release create nightly "${assets[@]}" --target "$GITHUB_SHA" \
               --title 'Nightly (main)' --prerelease --latest=false --notes-file notes.md
           fi
+
+  release:
+    name: Publish tagged release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: lavik-ubuntu-24.04-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish complete tagged set
+        run: |
+          # Resolve annotated and lightweight tags to commits. A moved tag must
+          # not publish artifacts built from the original event's commit.
+          tag_sha=$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)
+          test "$tag_sha" = "$GITHUB_SHA"
+
+          cd dist
+          assets=()
+          for arch in x86_64 aarch64; do
+            for suffix in '' '-minimal'; do
+              archive="lavik-$RELEASE_TAG-linux-$arch$suffix.tar.gz"
+              test -s "$archive"
+              test -s "$archive.sha256"
+              sha256sum --check "$archive.sha256"
+              assets+=("$archive" "$archive.sha256")
+            done
+          done
+
+          cat > notes.md <<'EOF'
+          Ubuntu 24.04 / GCC 13 release build.
+
+          All packages include lavik, lavik-meta, lavik-ctl, LICENSE and notices.
+          - Standard: DPDK/SPDK included; x86-64-v2 or ARMv8-A+CRC32 required.
+          - Minimal: kernel TCP/io_uring only; compiler-default CPU target.
+
+          Both variants require Linux 6.1+ with io_uring enabled for lavik and
+          lavik-meta, including DPDK/SPDK deployments, and Ubuntu 24.04-compatible glibc.
+          EOF
+          printf '\nSource: [%s](https://github.com/%s/commit/%s)\n' \
+            "$GITHUB_SHA" "$GH_REPO" "$GITHUB_SHA" >> notes.md
+          printf '\n[Hardware and platform requirements](https://github.com/%s/blob/%s/README.md#release-hardware-and-platform-requirements)\n' \
+            "$GH_REPO" "$GITHUB_SHA" >> notes.md
+
+          release_args=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            release_args+=(--prerelease --latest=false)
+          fi
+          # Create only: reruns must never overwrite a published version's assets.
+          gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag \
+            --title "Lavik $RELEASE_TAG" --notes-file notes.md --generate-notes \
+            "${release_args[@]}"

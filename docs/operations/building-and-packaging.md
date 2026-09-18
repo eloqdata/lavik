@@ -59,6 +59,12 @@ Optimized local builds use the current machine's instruction set by default:
 ./scripts/build_release.sh
 ```
 
+Build on the deployment machine to enable CPU optimizations beyond the
+portable release package's baseline. Performance gains depend on the workload
+and toolchain; benchmark with representative traffic. These binaries may not
+run on CPUs with fewer instruction-set features, so use a shared CPU target
+when building for a fleet of different machines.
+
 Additional arguments are forwarded to CMake, for example
 `./scripts/build_release.sh -DLAVIK_KERNEL_BYPASS=ON` after installing and
 initializing the bypass dependencies below.
@@ -507,6 +513,15 @@ standard package. Other useful overrides are `LAVIK_PACKAGE_BUILD_DIR`,
 `LAVIK_PACKAGE_VERSION=nightly` selects stable nightly archive names without
 changing the source version recorded in `VERSION` or the full commit in
 `REVISION`. The moving `nightly` tag is excluded from source-version discovery.
+For a tagged release, set `LAVIK_PACKAGE_TAG=v0.1.0-beta.1` instead. This takes
+precedence over `LAVIK_PACKAGE_VERSION`, uses the exact tag for the archive and
+`VERSION`, and sets the executable version to `0.1.0-beta.1`. The tag must
+resolve to the checked-out commit and its numeric version must match
+`project(lavik VERSION ...)` in `CMakeLists.txt`. Tags accept `vX.Y.Z` with an
+optional SemVer prerelease suffix; build metadata (`+...`) is not supported.
+Packaging explicitly resets the CMake version suffix to `-dev` for untagged
+builds, or to the tag's suffix (empty for a stable release), so a reused build
+directory cannot retain a previous release's suffix.
 
 The bundled Abseil CRC32C engine requires both SSE4.2 and PCLMUL at compile time
 to enable its x86 hardware implementation. A baseline `x86-64` build uses its
@@ -560,14 +575,16 @@ on Ubuntu install `libnuma1` and `libuuid1`. Static OpenSSL and C++ runtime
 checks apply to all three executables in either package variant.
 
 [Ubuntu release packages](../../.github/workflows/release.yml) runs on every
-push to `main` and can also be started with `workflow_dispatch`. It builds on
+push to `main` or a `v*` tag and can also be started with `workflow_dispatch`.
+It builds on
 native `ubuntu-24.04` (x86_64) and `ubuntu-24.04-arm` (aarch64) runners using
 GCC 13, producing four packages: both variants for both architectures.
 Each job checks the license files and all three executables after extracting
 the archive, runs kernel/io_uring SET/GET and recovery smoke checks on disposable
 files, and uploads the archive and checksum as an Actions artifact for 30 days.
 CI calls `scripts/package_release.sh` directly with the selected variant and
-`LAVIK_PACKAGE_VERSION=nightly`; tar creation, license inclusion, executable
+`LAVIK_PACKAGE_VERSION=nightly` for branch builds or `LAVIK_PACKAGE_TAG` for
+version tags; tar creation, license inclusion, executable
 checks and checksums are shared with local packaging.
 
 After all four jobs succeed on `main`, a separate job updates the
@@ -588,8 +605,36 @@ publish, and a completed build skips publication if `main` has already
 advanced. Workflow runs are serialized so a new push cannot cancel an active
 asset upload; GitHub keeps the newest pending run. Manual builds on other
 branches upload Actions artifacts without updating nightly. The publication
-job alone has `contents: write`; it uses the workflow's `GITHUB_TOKEN`.
+jobs alone have `contents: write`; they use the workflow's `GITHUB_TOKEN`.
 No scheduled build is needed: a push to main triggers the replacement.
+
+### Tagged releases
+
+Commit the workflow and packaging changes before tagging: the workflow is
+loaded from the tagged revision. Ensure `CMakeLists.txt` has the intended
+numeric version (for example, `0.1.0`), then push one release tag:
+
+```bash
+git tag -a v0.1.0-beta.1 -m 'Lavik 0.1.0-beta.1'
+git push origin v0.1.0-beta.1
+```
+
+Both annotated and lightweight tags are supported. All four package jobs must
+succeed before the workflow creates a GitHub Release for that tag with four
+archives and their checksums. For example, the standard x86_64 archive is
+`lavik-v0.1.0-beta.1-linux-x86_64.tar.gz`; its executables report
+`0.1.0-beta.1` with `--version`. Release notes include the source commit,
+platform requirements, and GitHub-generated changes. Tags with a prerelease
+suffix (`-beta.1`, `-rc.1`, etc.) create prereleases and do not become Latest;
+tags without a suffix create regular releases with GitHub's automatic Latest
+selection. Tag builds do not update nightly.
+
+An invalid version tag, a mismatch with the CMake version, or a moved tag
+fails the release path. Publication creates a new release only; it never
+overwrites existing release assets. A failed build can be rerun from Actions;
+if interrupted publication left a draft, inspect and remove that unpublished
+draft before retrying. Once published, use a new tag for any changed contents.
+Manual dispatch on a version tag follows the same release path.
 
 The Ubuntu 24.04 build environment determines the glibc compatibility floor;
 these are not packages targeting older Ubuntu releases.
