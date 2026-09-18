@@ -799,7 +799,7 @@ StorageEngine::Impl::ReadRdbSnapshotBatch(std::uint64_t session_id,
       }
 
       if (!result.cursor_.finalizing_) {
-        if (result.cursor_.db_id_ < kLogicalDatabaseCount) {
+        if (result.cursor_.db_id_ < options_.database_count_) {
           const std::size_t remaining = count - result.values_.size();
           const auto scan_start = result.cursor_.index_cursor_;
           auto scanned = co_await ScanPartition(

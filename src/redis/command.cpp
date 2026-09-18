@@ -12735,7 +12735,8 @@ Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {
     std::uint64_t db_id = 0;
     std::uint64_t argc = 0;
     if (!parse_size(args[offset++], &db_id) ||
-        db_id >= storage::kLogicalDatabaseCount ||
+        db_id >= (g_storage != nullptr ? g_storage->database_count()
+                                       : storage::kLogicalDatabaseCount) ||
         !parse_size(args[offset++], &argc) || argc == 0 ||
         argc > args.size() - offset) {
       co_return absl::InvalidArgumentError("invalid replicated EXEC command");
@@ -12772,6 +12773,9 @@ Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {
 }
 
 Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
+  if (g_storage != nullptr && command.db_id_ >= g_storage->database_count()) {
+    co_return absl::InvalidArgumentError("replicated database is not enabled");
+  }
   if (!command.args_.empty() && command.args_[0] == kReplicatedExecCommand) {
     co_return co_await ApplyReplicatedExec(command.args_);
   }
@@ -12871,6 +12875,9 @@ Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
 
 Task<absl::Status> ApplyRedisReplicatedCommand(
     const ReplicatedCommand& command) {
+  if (g_storage != nullptr && command.db_id_ >= g_storage->database_count()) {
+    co_return absl::InvalidArgumentError("replicated database is not enabled");
+  }
   if (command.args_.empty()) {
     co_return absl::InvalidArgumentError("empty Redis replication command");
   }
@@ -12922,7 +12929,9 @@ Task<absl::Status> ApplyRedisReplicatedTransaction(
   context.queued_.reserve(commands.size());
   for (const ReplicatedCommand& command : commands) {
     if (command.args_.empty() ||
-        command.db_id_ >= storage::kLogicalDatabaseCount) {
+        command.db_id_ >= (g_storage != nullptr
+                               ? g_storage->database_count()
+                               : storage::kLogicalDatabaseCount)) {
       co_return absl::InvalidArgumentError(
           "malformed Redis replicated transaction command");
     }

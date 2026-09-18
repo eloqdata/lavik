@@ -270,7 +270,7 @@ void StorageEngine::Impl::QueueExpiredCandidate(WorkerStore& store,
 void StorageEngine::Impl::AdvanceExpiryMap(WorkerStore& store) {
   store.expiry_scan_cursor_ = 0;
   ++store.expiry_db_cursor_;
-  if (store.expiry_db_cursor_ == kLogicalDatabaseCount) {
+  if (store.expiry_db_cursor_ == options_.database_count_) {
     store.expiry_db_cursor_ = 0;
     ++store.expiry_partition_cursor_;
     if (store.expiry_partition_cursor_ == store.partitions_.size()) {
@@ -294,7 +294,7 @@ std::size_t StorageEngine::Impl::DiscardStaleExpirationCandidates(
 Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
     WorkerStore& store, WorkerStore::ExpireCandidate candidate) {
   if (candidate.partition_id_ >= kLogicalStorageShards ||
-      candidate.db_id_ >= kLogicalDatabaseCount ||
+      candidate.db_id_ >= options_.database_count_ ||
       expiration_pause_count_.load(std::memory_order_acquire) != 0) {
     co_return absl::OkStatus();
   }
@@ -506,7 +506,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
       if (partition.indexes_[store->index_maintenance_db_cursor_].Maintain()) {
         continue;
       }
-      if (++store->index_maintenance_db_cursor_ == kLogicalDatabaseCount) {
+      if (++store->index_maintenance_db_cursor_ == options_.database_count_) {
         store->index_maintenance_db_cursor_ = 0;
         if (++store->index_maintenance_partition_cursor_ ==
             store->partitions_.size()) {

@@ -635,6 +635,10 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           ++records;
           continue;
         }
+        if (record.db_id_ >= options_.database_count_) {
+          co_return absl::FailedPreconditionError(
+              "storage contains current records in a disabled database");
+        }
         const bool ordered = record.value_type_ == ValueType::kList ||
                              record.value_type_ == ValueType::kSortedSet;
         const auto ordered_kind = record.value_type_ == ValueType::kList
@@ -937,6 +941,10 @@ absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
     if (recovered.replication_epoch_ != partition.replication_epoch_) {
       return absl::OkStatus();
     }
+    if (recovered.db_id_ >= options_.database_count_) {
+      return absl::FailedPreconditionError(
+          "storage contains current records in a disabled database");
+    }
     partition.mutation_sequence_ = std::max(
         partition.mutation_sequence_, recovered.location_.mutation_sequence_);
     auto& index = partition.indexes_[recovered.db_id_];
@@ -1125,7 +1133,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     // Resolve it against the small, owner-local index array exactly once per
     // grouped key. Physical identity disambiguates a reused name across DBs.
     const Digest digest = ComputeDigest(key);
-    for (std::uint8_t db = 0; db < kLogicalDatabaseCount; ++db) {
+    for (std::uint8_t db = 0; db < options_.database_count_; ++db) {
       for (const auto* candidate :
            partition.indexes_[db].FindCandidates(digest, key)) {
         if (candidate == entry) {

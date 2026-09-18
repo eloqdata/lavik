@@ -2394,6 +2394,8 @@ int RunServer(ServerOptions options) {
   }
 
   storage::StorageEngineOptions storage_options;
+  storage_options.database_count_ =
+      options.cluster_enabled_ ? 1 : storage::kLogicalDatabaseCount;
   storage_options.data_files_ = std::move(options.data_files_);
   storage_options.reset_data_files_ = options.load_rdb_replace_;
   storage_options.shutdown_checkpoint_ = options.shutdown_checkpoint_;

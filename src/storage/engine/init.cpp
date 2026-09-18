@@ -250,6 +250,10 @@ absl::Status InitializeAddedDeviceMetadata(
 }  // namespace
 
 absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
+  if (options_.database_count_ == 0 ||
+      options_.database_count_ > kLogicalDatabaseCount) {
+    return absl::InvalidArgumentError("invalid runtime database count");
+  }
   if (worker_count == 0 || options_.data_files_.empty()) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "storage requires workers and at least one data file");
@@ -913,19 +917,31 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         /*externally_admitted=*/true,
         /*externally_accounted=*/false,
         /*owner_shard=*/i + 1);
-    store.partitions_.reserve((kLogicalStorageShards + worker_count - 1 - i) /
-                              worker_count);
+    const std::size_t partition_count =
+        (kLogicalStorageShards + worker_count - 1 - i) / worker_count;
+    const std::size_t index_count = partition_count * options_.database_count_;
+    store.partitions_.reserve(partition_count);
+    store.partition_indexes_.reserve(index_count);
+    store.partition_grouped_objects_.reserve(index_count);
+    // Construct directly with the shared arena. In particular, do not create
+    // and then discard a private grouped-object arena for every empty DB.
+    for (std::size_t index = 0; index < index_count; ++index) {
+      store.partition_indexes_.emplace_back(store.record_index_entry_arena_);
+      store.partition_grouped_objects_.emplace_back(
+          store.record_index_entry_arena_);
+    }
     for (std::uint32_t partition = i; partition < kLogicalStorageShards;
          partition += worker_count) {
       store.partitions_.emplace_back();
       WorkerStore::PartitionStore& partition_store = store.partitions_.back();
       partition_store.id_ = static_cast<std::uint16_t>(partition);
-      for (RecordIndex& index : partition_store.indexes_) {
-        index.SetEntryArena(store.record_index_entry_arena_);
-      }
-      for (GroupedObjectIndex& index : partition_store.grouped_objects_) {
-        index = GroupedObjectIndex(store.record_index_entry_arena_);
-      }
+      const std::size_t offset =
+          (store.partitions_.size() - 1) * options_.database_count_;
+      partition_store.indexes_ = std::span(store.partition_indexes_)
+                                     .subspan(offset, options_.database_count_);
+      partition_store.grouped_objects_ =
+          std::span(store.partition_grouped_objects_)
+              .subspan(offset, options_.database_count_);
       partition_store.replication_epoch_ =
           epoch_values_[kLogicalDatabaseCount + partition];
       partition_store.replica_candidate_epoch_ =
@@ -1312,7 +1328,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     // copies before the cold scan merges them. The successful path avoids
     // this O(keys) auxiliary hash table entirely.
     for (auto& partition : store.partitions_) {
-      for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
         partition.indexes_[db_id].ForEach([&](RecordIndex::Entry& entry) {
           store.recovery_lsns_.insert_or_assign(
               &entry, std::numeric_limits<std::uint64_t>::max());
@@ -1417,7 +1433,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       });
   if (expiration_authority_.load(std::memory_order_acquire)) {
     for (auto& partition : store.partitions_) {
-      for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
         // Recovery rebuilds this count alongside every winning index entry.
         // A zero count proves that no value in this index carries an expiry,
         // so scanning all buckets cannot discover work. This matters
@@ -1549,7 +1565,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     // accounting in bounded batches instead of retaining one reference per
     // live key until the complete pass finishes.
     for (auto& partition : store.partitions_) {
-      for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
         auto& index = partition.indexes_[db_id];
         RecordIndex::StableScanCursor cursor;
         bool exhausted = false;

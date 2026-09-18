@@ -394,6 +394,9 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   co_await key_store.store_state_mutex_.Lock();
   UnlockGuard write_unlock(&key_store.store_state_mutex_, key_store.worker_);
 
+  // Cold recovery rejects current records in disabled DBs. Obsolete records
+  // can still occupy old blocks and must not index a nonexistent runtime DB.
+  if (record.db_id_ >= options_.database_count_) co_return std::nullopt;
   auto& partition = PartitionForKey(key_store, key);
   auto& index = partition.indexes_[record.db_id_];
   const Digest digest = ComputeDigest(key);

@@ -121,6 +121,10 @@ unsigned StorageEngine::OwnerForKey(std::string_view key) const noexcept {
   return impl_->OwnerForKey(key);
 }
 
+std::uint8_t StorageEngine::database_count() const noexcept {
+  return impl_->database_count();
+}
+
 unsigned StorageEngine::worker_count() const noexcept {
   return impl_->worker_count();
 }

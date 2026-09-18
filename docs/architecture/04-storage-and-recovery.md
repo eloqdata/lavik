@@ -61,9 +61,14 @@ The selection does not alter the durable format.
 Storage separates three ownership domains:
 
 - A logical partition is one of the 16,384 Redis hash slots. Its current key
-  owner is `partition_id % worker_count`; that worker owns the partition's 16
-  logical-database indexes, mutation sequence, replication epoch, counts, and
-  snapshot state.
+  owner is `partition_id % worker_count`; that worker owns the partition's
+  enabled logical-database indexes, mutation sequence, replication epoch,
+  counts, and snapshot state. Cluster mode constructs only DB0 indexes;
+  standalone mode constructs all 16. Each worker owns contiguous index arrays
+  backed by its shared entry arena, with partitions holding fixed views into
+  those arrays. Durable epochs and checkpoint capacity tables retain all 16
+  database slots in both modes. Recovery rejects current records in disabled
+  databases rather than hiding an existing standalone dataset.
 - A physical block has one current runtime owner. When the worker topology
   matches the topology recorded in its header, recovery retains the original
   writer if that worker can access the device. Otherwise recovery hashes the

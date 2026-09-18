@@ -1556,11 +1556,13 @@ class StorageEngine::Impl {
       };
 
       std::uint16_t id_ = 0;
-      std::array<RecordIndex, kLogicalDatabaseCount> indexes_;
+      // Views into the worker's fixed, contiguous index arrays. Prepare binds
+      // them once; neither the arrays nor their arena move afterwards.
+      std::span<RecordIndex> indexes_;
       // Sparse second-level metadata: ordinary String and compact collection
       // keys never consult this table. Its population follows the top-level
       // index through detach/reset; handles alone do not pin physical data.
-      std::array<GroupedObjectIndex, kLogicalDatabaseCount> grouped_objects_;
+      std::span<GroupedObjectIndex> grouped_objects_;
       // A grouped view belongs to one partition/DB population. The worker's
       // broader index_generations_ invalidates ordinary suspended IO, but a
       // reset of an unrelated partition must not invalidate retained views
@@ -1569,7 +1571,7 @@ class StorageEngine::Impl {
       // Conservative full-sync coverage ownership for each index. The owner
       // worker updates this only when an index identity is created or erased;
       // value and TTL replacements leave it unchanged. Keeping the aggregate
-      // beside the fixed index array lets session admission inspect a bounded
+      // beside the indexes lets session admission inspect a bounded
       // number of counters instead of synchronously scanning every key.
       std::array<std::uint64_t, kLogicalDatabaseCount>
           fullsync_coverage_bytes_{};
@@ -1614,6 +1616,8 @@ class StorageEngine::Impl {
     // Declaring the arena before partitions and detached populations makes it
     // outlive every map during reverse-order WorkerStore destruction.
     std::shared_ptr<ScanHashMapEntryArena> record_index_entry_arena_;
+    std::vector<RecordIndex> partition_indexes_;
+    std::vector<GroupedObjectIndex> partition_grouped_objects_;
     std::vector<PartitionStore> partitions_;
     // Present only while a shutdown checkpoint is being restored. Keeping the
     // exact counts owner-local permits a post-load equality check without
@@ -2268,6 +2272,9 @@ class StorageEngine::Impl {
   Task<absl::Status> DiscardTxUndoLocal(std::uint64_t txid);
 
   unsigned worker_count() const noexcept { return worker_count_; }
+  std::uint8_t database_count() const noexcept {
+    return options_.database_count_;
+  }
 
   std::size_t LocalSize(std::uint8_t db_id) const noexcept {
     assert(db_id < kLogicalDatabaseCount);

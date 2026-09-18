@@ -765,6 +765,9 @@ if (BUILD_TESTING)
   add_test(NAME lavik_runtime_backends
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_backends_smoke.py $<TARGET_FILE:lavik>)
   set_tests_properties(lavik_runtime_backends PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+  add_test(NAME lavik_database_modes
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/database_modes_smoke.py $<TARGET_FILE:lavik>)
+  set_tests_properties(lavik_database_modes PROPERTIES TIMEOUT 120)
   add_test(NAME lavik_version COMMAND lavik --version)
   set_tests_properties(lavik_version PROPERTIES
     PASS_REGULAR_EXPRESSION "lavik ${LAVIK_VERSION}")

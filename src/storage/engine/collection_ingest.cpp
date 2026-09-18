@@ -105,7 +105,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
     TxShardWrites* outer, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
-  if (db_id >= kLogicalDatabaseCount || digest != ComputeDigest(key) ||
+  if (db_id >= options_.database_count_ || digest != ComputeDigest(key) ||
       !reader ||
       (type != ValueType::kHash && type != ValueType::kSet &&
        type != ValueType::kList && type != ValueType::kSortedSet) ||

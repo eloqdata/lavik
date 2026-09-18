@@ -269,6 +269,8 @@ Task<absl::Status> StorageEngine::Impl::AdvanceDbEpoch(std::uint8_t db_id,
 
 void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
                                         std::uint8_t db_id) {
+  // Epoch metadata covers all 16 DBs even when runtime indexes cover DB0 only.
+  if (db_id >= options_.database_count_) return;
   // FLUSHDB invalidates every watcher of this database, including watches
   // on keys that never existed (Redis semantics).
   tx::CurrentTxShard().MarkAllWatched(db_id);

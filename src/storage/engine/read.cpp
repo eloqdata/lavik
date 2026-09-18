@@ -646,7 +646,7 @@ Task<absl::StatusOr<ExpirationInfo>> StorageEngine::ReadKeyMetadataLocked(
 
 Task<absl::StatusOr<ExpirationInfo>> StorageEngine::Impl::ReadKeyMetadata(
     std::uint8_t db_id, std::string_view key) {
-  if (db_id >= kLogicalDatabaseCount)
+  if (db_id >= options_.database_count_)
     co_return absl::InvalidArgumentError("invalid logical database");
   const auto digest = ComputeDigest(key);
   auto hold = co_await tx::CurrentTxShard().AcquireKey(
@@ -656,7 +656,7 @@ Task<absl::StatusOr<ExpirationInfo>> StorageEngine::Impl::ReadKeyMetadata(
 
 Task<absl::StatusOr<ExpirationInfo>> StorageEngine::Impl::ReadKeyMetadataLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest) {
-  if (db_id >= kLogicalDatabaseCount || digest != ComputeDigest(key))
+  if (db_id >= options_.database_count_ || digest != ComputeDigest(key))
     co_return absl::InvalidArgumentError("invalid metadata key identity");
   auto& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);

@@ -719,6 +719,7 @@ StorageEngine::Impl::BeginPartitionReplication(std::uint64_t session_id,
   if (db_count == 0 || db_count > kLogicalDatabaseCount) {
     return absl::InvalidArgumentError("invalid full-sync database count");
   }
+  db_count = std::min(db_count, options_.database_count_);
   WorkerStore& store = CurrentStore();
   const auto session = store.fullsync_sessions_.find(session_id);
   if (session == store.fullsync_sessions_.end()) {
@@ -751,7 +752,7 @@ StorageEngine::Impl::BeginPartitionReplication(std::uint64_t session_id,
 
 absl::StatusOr<bool> StorageEngine::Impl::TrySkipEmptyPartitionDbReplication(
     std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id) {
-  if (db_id >= kLogicalDatabaseCount) {
+  if (db_id >= options_.database_count_) {
     return absl::InvalidArgumentError("invalid full-sync database");
   }
   WorkerStore& store = CurrentStore();
@@ -783,7 +784,7 @@ absl::StatusOr<bool> StorageEngine::Impl::TrySkipEmptyPartitionDbReplication(
 
 absl::Status StorageEngine::Impl::BeginPartitionDbReplication(
     std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id) {
-  if (db_id >= kLogicalDatabaseCount) {
+  if (db_id >= options_.database_count_) {
     return absl::InvalidArgumentError("invalid full-sync database");
   }
   WorkerStore& store = CurrentStore();
@@ -849,8 +850,8 @@ StorageEngine::Impl::SnapshotPartition(std::uint64_t session_id,
                                        std::size_t count,
                                        std::size_t read_concurrency,
                                        std::size_t max_bytes) {
-  if (db_id >= kLogicalDatabaseCount || count == 0 || read_concurrency == 0 ||
-      max_bytes == 0) {
+  if (db_id >= options_.database_count_ || count == 0 ||
+      read_concurrency == 0 || max_bytes == 0) {
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "invalid partition snapshot request");
   }
@@ -1295,7 +1296,7 @@ absl::Status StorageEngine::Impl::CompletePartitionReplication(
 
 absl::Status StorageEngine::Impl::CompletePartitionDbReplication(
     std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id) {
-  if (db_id >= kLogicalDatabaseCount) {
+  if (db_id >= options_.database_count_) {
     return absl::InvalidArgumentError("invalid full-sync database");
   }
   WorkerStore& store = CurrentStore();
@@ -1453,7 +1454,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     std::string key_;
   };
   std::vector<OldKey> old_keys;
-  for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+  for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
     struct ExternalKey {
       RecordLocation location_;
       ExtentManifest extents_;
@@ -1592,8 +1593,8 @@ StorageEngine::Impl::ResetReplicaPartitions(
     sync->session_id_ = session_id;
     sync->replication_epoch_ = epoch_updates[index].second;
     sync->source_db_epochs_ = reset.db_epochs_;
-    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      sync->local_db_epochs_[db_id] = local_db_epochs[db_id];
+    sync->local_db_epochs_ = local_db_epochs;
+    for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
       ++partition.grouped_generations_[db_id];
       QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
                          &partition.grouped_objects_[db_id]);
@@ -1699,7 +1700,7 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
   UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
   for (std::size_t i = 0; i < partition_ids.size(); ++i) {
     auto& partition = PartitionFor(store, partition_ids[i]);
-    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+    for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
       ++partition.grouped_generations_[db_id];
       QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
                          &partition.grouped_objects_[db_id]);
@@ -1856,7 +1857,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
   for (const SnapshotRecord& record : records) {
     std::optional<SnapshotRecord> materialized;
     const SnapshotRecord* effective = &record;
-    if (record.db_id_ >= kLogicalDatabaseCount ||
+    if (record.db_id_ >= options_.database_count_ ||
         RedisSlot(record.key_) != partition_id) {
       co_return absl::Status(absl::StatusCode::kInvalidArgument,
                              "replica record belongs to another partition");
@@ -2342,7 +2343,8 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
           auto* sync = partition.replica_sync_.get();
           if (sync == nullptr || sync->session_id_ != session_id) continue;
           discarded_any = true;
-          for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+          for (std::uint8_t db_id = 0; db_id < options_.database_count_;
+               ++db_id) {
             ++partition.grouped_generations_[db_id];
             QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
                                &partition.grouped_objects_[db_id]);
