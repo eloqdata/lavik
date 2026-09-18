@@ -3015,8 +3015,8 @@ absl::StatusOr<MetaApplyResult> DecodeMetaApplyResult(std::string_view bytes) {
   if (!command_tag.ok()) return command_tag.status();
   if (*command_tag <
           static_cast<std::uint16_t>(MetaCommandTag::kRegisterNode) ||
-      *command_tag > static_cast<std::uint16_t>(
-                         MetaCommandTag::kCommitUncontrolledFailover)) {
+      *command_tag >
+          static_cast<std::uint16_t>(MetaCommandTag::kStartCandidateRecovery)) {
     return MetaFailStopError("unknown apply-result command tag");
   }
   auto detail = r.ReadString(kMaxMetaAuditDetailBytes);

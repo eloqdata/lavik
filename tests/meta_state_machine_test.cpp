@@ -205,6 +205,31 @@ nuraft::ptr<nuraft::buffer> EncodeOrDie(const MetaCommand& cmd) {
   return *encoded;
 }
 
+TEST(MetaApplyResultTest, StartCandidateRecoveryRoundTrips) {
+  for (auto verdict :
+       {MetaAuditVerdict::kAccepted, MetaAuditVerdict::kRejected}) {
+    const lavik::meta::MetaApplyResult result{
+        verdict, verdict == MetaAuditVerdict::kAccepted ? "" : "rejected", 42,
+        lavik::meta::MetaCommandTag::kStartCandidateRecovery};
+    const auto decoded = lavik::meta::DecodeMetaApplyResult(
+        lavik::meta::EncodeMetaApplyResult(result));
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    EXPECT_EQ(*decoded, result);
+  }
+}
+
+TEST(MetaApplyResultTest, RejectsTagsAboveStartCandidateRecovery) {
+  for (std::uint16_t tag : {39, 65535}) {
+    const lavik::meta::MetaApplyResult result{
+        MetaAuditVerdict::kAccepted, "", 42,
+        static_cast<lavik::meta::MetaCommandTag>(tag)};
+    const auto decoded = lavik::meta::DecodeMetaApplyResult(
+        lavik::meta::EncodeMetaApplyResult(result));
+    ASSERT_FALSE(decoded.ok()) << tag;
+    EXPECT_EQ(decoded.status().message(), "unknown apply-result command tag");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // MetaStateMachine component tests
 // ---------------------------------------------------------------------------
