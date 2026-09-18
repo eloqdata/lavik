@@ -102,6 +102,14 @@ TEST(RebuildProtocolIntegrationTest,
   RespClient target_client = Connect(target_port);
   ASSERT_EQ(source_client.Command({"SET", "retained", "value"}), "+OK");
   ASSERT_EQ(target_client.Command({"SET", "stale", "must-disappear"}), "+OK");
+  // Standalone FULL must still scan nonzero DBs while empty DBs take the fast
+  // path. Reset also has to remove the target's old keys from those DBs.
+  ASSERT_EQ(source_client.Command({"SELECT", "15"}), "+OK");
+  ASSERT_EQ(source_client.Command({"SET", "retained", "db15"}), "+OK");
+  ASSERT_EQ(source_client.Command({"SELECT", "0"}), "+OK");
+  ASSERT_EQ(target_client.Command({"SELECT", "15"}), "+OK");
+  ASSERT_EQ(target_client.Command({"SET", "stale", "old-db15"}), "+OK");
+  ASSERT_EQ(target_client.Command({"SELECT", "0"}), "+OK");
   ASSERT_EQ(target_client.Command(
                 {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
             "+OK");
@@ -125,6 +133,10 @@ TEST(RebuildProtocolIntegrationTest,
   ASSERT_EQ(target_client.Command({"READONLY"}), "+OK");
   EXPECT_EQ(target_client.Command({"GET", "retained"}), "$5\r\nvalue");
   EXPECT_EQ(target_client.Command({"EXISTS", "stale"}), ":0");
+  ASSERT_EQ(target_client.Command({"SELECT", "15"}), "+OK");
+  EXPECT_EQ(target_client.Command({"GET", "retained"}), "$4\r\ndb15");
+  EXPECT_EQ(target_client.Command({"EXISTS", "stale"}), ":0");
+  ASSERT_EQ(target_client.Command({"SELECT", "0"}), "+OK");
   ASSERT_EQ(source_client.Command({"SET", "retained", "after-cut"}), "+OK");
   WaitUntil("online writes follow the handoff cut", 10s, [&] {
     return target_client.Command({"GET", "retained"}) == "$9\r\nafter-cut";

@@ -14073,6 +14073,8 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::StatusOr<std::uint64_t>> RunMasterFullSync(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
       unsigned flow_id, const std::shared_ptr<FullSyncAckState>& ack_state) {
+    const std::uint8_t db_count =
+        cluster_enabled_ ? 1 : storage::kLogicalDatabaseCount;
     auto fullsync_start = storage_->BeginFullSyncSession(session->id_);
     if (!fullsync_start.ok()) co_return fullsync_start.status();
     const auto source_db_epochs = fullsync_start->db_epochs_;
@@ -14695,6 +14697,8 @@ class ReplicationManager::ReplicationGroup {
       co_return absl::OkStatus();
     };
 
+    // Empty scans may complete without suspending. Yield periodically for
+    // foreground work and ACK processing without imposing a fixed delay.
     std::size_t processed_partitions = 0;
     std::uint32_t next_partition = flow_id;
     while (next_partition < storage::kLogicalStorageShards) {
@@ -14764,17 +14768,12 @@ class ReplicationManager::ReplicationGroup {
             co_return sent;
           }
           if ((++processed_partitions & 63U) == 0) {
-            absl::Status yielded = co_await bycorf::SleepFor(
-                *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-            if (!yielded.ok()) {
-              cleanup();
-              co_return yielded;
-            }
+            co_await bycorf::Yield(*bycorf::ThisWorker().self_);
           }
           continue;
         }
-        auto start =
-            storage_->BeginPartitionReplication(session->id_, partition_id);
+        auto start = storage_->BeginPartitionReplication(
+            session->id_, partition_id, db_count);
         if (!start.ok()) {
           cleanup();
           co_return start.status();
@@ -14808,8 +14807,14 @@ class ReplicationManager::ReplicationGroup {
           pending_snapshot_bytes = kRecordsFrameHeaderBytes;
           co_return absl::OkStatus();
         };
-        for (std::uint8_t db_id = 0; db_id < storage::kLogicalDatabaseCount;
-             ++db_id) {
+        for (std::uint8_t db_id = 0; db_id < db_count; ++db_id) {
+          auto skipped = storage_->TrySkipEmptyPartitionDbReplication(
+              session->id_, partition_id, db_id);
+          if (!skipped.ok()) {
+            cleanup();
+            co_return skipped.status();
+          }
+          if (*skipped) continue;
           for (;;) {
             absl::Status db_started = storage_->BeginPartitionDbReplication(
                 session->id_, partition_id, db_id);
@@ -14820,7 +14825,10 @@ class ReplicationManager::ReplicationGroup {
             }
             co_await bycorf::Yield(*bycorf::ThisWorker().self_);
           }
-          if ((start->nonempty_db_mask_ & (std::uint16_t{1} << db_id)) != 0) {
+          {
+            // An admitted write may have populated this DB while Begin waited.
+            // Scan after admission drains instead of using an earlier empty
+            // observation to decide whether baseline records are needed.
             std::uint64_t cursor = 0;
             do {
               auto batch = co_await storage_->SnapshotPartition(
@@ -14901,12 +14909,7 @@ class ReplicationManager::ReplicationGroup {
           }
         }
         if ((++processed_partitions & 63U) == 0) {
-          absl::Status yielded = co_await bycorf::SleepFor(
-              *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-          if (!yielded.ok()) {
-            cleanup();
-            co_return yielded;
-          }
+          co_await bycorf::Yield(*bycorf::ThisWorker().self_);
         }
 
         // Close this partition's scan window without suspending between the

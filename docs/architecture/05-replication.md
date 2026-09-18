@@ -876,6 +876,14 @@ logical epoch, including zero for a non-member, against the exact target-local
 epoch returned by reset. On the target, every handoff marks the corresponding
 empty or populated partition as tailing.
 
+Cluster sources export DB 0 only; standalone sources cover all logical DBs.
+An empty source DB may move directly to tailing without a baseline scan only
+when its owning worker also observes no outstanding unstarted write admission.
+That check and transition do not suspend, so later writes enter the full-sync
+publish FIFO. An admitted write keeps the scan necessary until its admission
+drains. Target reset still clears every logical DB in every physical partition,
+including DBs excluded from source export.
+
 Partition handoffs are independent asynchronous completions. Each source flow
 owns a session-local ledger covering every assigned physical partition:
 not sent, in flight, or acknowledged. It registers a handoff before sending

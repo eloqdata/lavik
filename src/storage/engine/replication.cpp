@@ -714,7 +714,11 @@ void StorageEngine::Impl::EndFullSyncSession(std::uint64_t session_id) {
 
 absl::StatusOr<PartitionReplicationStart>
 StorageEngine::Impl::BeginPartitionReplication(std::uint64_t session_id,
-                                               std::uint16_t partition_id) {
+                                               std::uint16_t partition_id,
+                                               std::uint8_t db_count) {
+  if (db_count == 0 || db_count > kLogicalDatabaseCount) {
+    return absl::InvalidArgumentError("invalid full-sync database count");
+  }
   WorkerStore& store = CurrentStore();
   const auto session = store.fullsync_sessions_.find(session_id);
   if (session == store.fullsync_sessions_.end()) {
@@ -732,18 +736,49 @@ StorageEngine::Impl::BeginPartitionReplication(std::uint64_t session_id,
     ClearFullSyncCapture(store, session_id, capture->second);
   }
   capture->second.baseline_version_ = partition.mutation_sequence_;
+  // Cluster export excludes DBs 1..15. They require neither a scan nor a
+  // per-DB completion, but must not hold the partition completion barrier.
   capture->second.db_phases_.fill(
-      WorkerStore::FullSyncCapture::DbPhase::kUnstarted);
+      WorkerStore::FullSyncCapture::DbPhase::kTailing);
+  std::fill_n(capture->second.db_phases_.begin(), db_count,
+              WorkerStore::FullSyncCapture::DbPhase::kUnstarted);
   capture->second.phase_ = WorkerStore::FullSyncCapture::Phase::kCapturing;
   PartitionReplicationStart result;
   result.baseline_version_ = capture->second.baseline_version_;
-  for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-    result.db_epochs_[db_id] = session->second.db_epochs_[db_id];
-    if (partition.live_key_count_[db_id] != 0) {
-      result.nonempty_db_mask_ |= static_cast<std::uint16_t>(1U << db_id);
-    }
-  }
+  result.db_epochs_ = session->second.db_epochs_;
   return result;
+}
+
+absl::StatusOr<bool> StorageEngine::Impl::TrySkipEmptyPartitionDbReplication(
+    std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id) {
+  if (db_id >= kLogicalDatabaseCount) {
+    return absl::InvalidArgumentError("invalid full-sync database");
+  }
+  WorkerStore& store = CurrentStore();
+  auto& partition = PartitionFor(store, partition_id);
+  const auto session = store.fullsync_sessions_.find(session_id);
+  auto capture = partition.fullsync_subscribers_.find(session_id);
+  if (session == store.fullsync_sessions_.end() ||
+      session->second.db_epoch_invalidated_ ||
+      capture == partition.fullsync_subscribers_.end() ||
+      capture->second.phase_ !=
+          WorkerStore::FullSyncCapture::Phase::kCapturing ||
+      capture->second.db_phases_[db_id] !=
+          WorkerStore::FullSyncCapture::DbPhase::kUnstarted) {
+    return absl::FailedPreconditionError("full-sync database is not unstarted");
+  }
+  const std::uint32_t target_id =
+      (static_cast<std::uint32_t>(partition_id) << 8) | db_id;
+  if (partition.live_key_count_[db_id] != 0 ||
+      session->second.unstarted_admissions_.contains(target_id)) {
+    return false;
+  }
+  // No suspension separates the empty/admission check from TAILING. A write
+  // admitted afterwards must reserve publish credit instead of relying on a
+  // future baseline scan. No scanning state was created, so nothing to clear.
+  capture->second.db_phases_[db_id] =
+      WorkerStore::FullSyncCapture::DbPhase::kTailing;
+  return true;
 }
 
 absl::Status StorageEngine::Impl::BeginPartitionDbReplication(

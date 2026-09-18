@@ -1184,6 +1184,86 @@ class ReplicationLogService final : public bycorf::Service {
     co_return absl::OkStatus();
   }
 
+  bycorf::Task<absl::Status> ExerciseEmptyFullSyncDbs() {
+    constexpr std::uint64_t kSession = 901;
+    absl::Status enabled =
+        co_await storage_->EnableReplicationLog(kSession, 8 * kMiB);
+    if (!enabled.ok()) co_return enabled;
+    const std::string key = "empty-fullsync{skip-db}";
+    const auto partition = lavik::storage::RedisSlot(key);
+    auto session = storage_->BeginFullSyncSession(kSession);
+    if (!session.ok()) co_return session.status();
+    auto start = storage_->BeginPartitionReplication(kSession, partition, 1);
+    if (!start.ok()) co_return start.status();
+    Check(!storage_->CompletePartitionReplication(kSession, partition).ok(),
+          "DB0 was completed before its empty check");
+    auto skipped =
+        storage_->TrySkipEmptyPartitionDbReplication(kSession, partition, 0);
+    if (!skipped.ok()) co_return skipped.status();
+    Check(*skipped, "empty DB required a baseline scan");
+    // A write arriving after the synchronous skip must be delivered through
+    // the publisher even though no snapshot or DB scan was ever opened.
+    absl::Status written =
+        co_await ExecuteClientCommand(0, {"SET", key, "after-skip"}, "+OK\r\n");
+    if (!written.ok()) co_return written;
+    auto queued = storage_->PeekFullSyncPublishItems(kSession, 1);
+    if (!queued.ok()) co_return queued.status();
+    Check(queued->size() == 1 && queued->front().command_ != nullptr &&
+              queued->front().command_->partition_id_ == partition,
+          "write after empty DB skip escaped full-sync publication");
+    storage_->AcknowledgeFullSyncPublishItem(kSession, queued->front().id_);
+    absl::Status completed =
+        storage_->CompletePartitionReplication(kSession, partition);
+    if (!completed.ok()) co_return completed;
+    storage_->EndFullSyncSession(kSession);
+
+    // An admitted UNSTARTED write may not have a live key yet. It must hold
+    // the empty fast path closed until a baseline scan can observe its result.
+    constexpr std::uint64_t kAdmittedSession = 902;
+    const std::string admitted_key = "empty-fullsync{admitted-db}";
+    const auto admitted_partition = lavik::storage::RedisSlot(admitted_key);
+    Check(admitted_partition != partition, "test partitions must differ");
+    session = storage_->BeginFullSyncSession(kAdmittedSession);
+    if (!session.ok()) co_return session.status();
+    auto admission = co_await storage_->AcquireReplicationPublisherAdmission(
+        128, lavik::storage::ReplicationPublisherTarget{
+                 .partition_id_ = admitted_partition, .db_id_ = 0});
+    if (!admission.ok()) co_return admission.status();
+    start = storage_->BeginPartitionReplication(kAdmittedSession,
+                                                admitted_partition, 1);
+    if (!start.ok()) co_return start.status();
+    skipped = storage_->TrySkipEmptyPartitionDbReplication(
+        kAdmittedSession, admitted_partition, 0);
+    if (!skipped.ok()) co_return skipped.status();
+    Check(!*skipped, "empty fast path ignored an admitted write");
+    Check(absl::IsUnavailable(storage_->BeginPartitionDbReplication(
+              kAdmittedSession, admitted_partition, 0)),
+          "baseline scan passed an outstanding admission");
+    auto value = co_await storage_->Set(0, admitted_key, "before-scan", {});
+    if (!value.ok()) co_return value.status();
+    storage_->ReleaseReplicationPublisherAdmission(*admission, 128);
+    absl::Status started = storage_->BeginPartitionDbReplication(
+        kAdmittedSession, admitted_partition, 0);
+    if (!started.ok()) co_return started;
+    auto batch = co_await storage_->SnapshotPartition(
+        kAdmittedSession, admitted_partition, 0, 0, 16);
+    if (!batch.ok()) co_return batch.status();
+    Check(batch->records_.size() == 1 &&
+              batch->records_.front().key_ == admitted_key &&
+              batch->records_.front().value_ == "before-scan",
+          "baseline missed a write admitted before the empty check");
+    storage_->AcknowledgePartitionSnapshotRecords(
+        kAdmittedSession, admitted_partition, batch->records_);
+    completed = storage_->CompletePartitionDbReplication(kAdmittedSession,
+                                                         admitted_partition, 0);
+    if (!completed.ok()) co_return completed;
+    completed = storage_->CompletePartitionReplication(kAdmittedSession,
+                                                       admitted_partition);
+    if (!completed.ok()) co_return completed;
+    storage_->EndFullSyncSession(kAdmittedSession);
+    co_return co_await storage_->DisableReplicationLog();
+  }
+
   bycorf::Task<absl::Status> ExercisePartitionHandoff() {
     constexpr std::uint64_t kSession = 404;
     constexpr std::uint8_t kDb = 4;
@@ -2690,7 +2770,9 @@ class ReplicationLogService final : public bycorf::Service {
   }
 
   bycorf::Task<absl::Status> Exercise() {
-    absl::Status status = co_await ExerciseSharedHistoryQuota();
+    absl::Status status = co_await ExerciseEmptyFullSyncDbs();
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseSharedHistoryQuota();
     if (!status.ok()) co_return status;
     status = co_await ExerciseMutationPrecondition();
     if (!status.ok()) co_return status;

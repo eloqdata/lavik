@@ -289,8 +289,15 @@ void StorageEngine::EndFullSyncSession(std::uint64_t session_id) {
 
 absl::StatusOr<PartitionReplicationStart>
 StorageEngine::BeginPartitionReplication(std::uint64_t session_id,
-                                         std::uint16_t partition_id) {
-  return impl_->BeginPartitionReplication(session_id, partition_id);
+                                         std::uint16_t partition_id,
+                                         std::uint8_t db_count) {
+  return impl_->BeginPartitionReplication(session_id, partition_id, db_count);
+}
+
+absl::StatusOr<bool> StorageEngine::TrySkipEmptyPartitionDbReplication(
+    std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id) {
+  return impl_->TrySkipEmptyPartitionDbReplication(session_id, partition_id,
+                                                   db_id);
 }
 
 absl::Status StorageEngine::BeginPartitionDbReplication(
