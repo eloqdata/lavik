@@ -193,14 +193,9 @@ def run(args, workdir):
             # Shutdown the replica before cutting its source; the restarted
             # candidate must retain the source's two-flow layout, not its own.
             replica.terminate()
-        automatic_fence = case not in ("manual-fence", "eligible-candidate")
-        # Recovery creates a fresh source history and reauthenticates the Meta
-        # session. A one-second detector can race the ordinary reconnect
-        # backoff and fence that recovered Owner again, with either Raft
-        # backend. Use the default window throughout recovery; the separate
-        # automatic-failover gates cover the accelerated detector policy.
+        short_threshold = case not in ("manual-fence", "eligible-candidate")
         reply = fixture.leader.put_automatic_uncontrolled_failover_policy(
-            2, suspect_after_ms=5000 if automatic_fence else 600_000)
+            2, suspect_after_ms=1000 if short_threshold else 600_000)
         if not reply.startswith("OK "):
             raise H.Failure(f"could not configure recovery detector: {reply}")
         if publish_fault:
@@ -218,7 +213,7 @@ def run(args, workdir):
             require_exit_at_fault(target)
         restart(fixture, target)
         if case in ("incomplete-full", "eligible-candidate"):
-            require_fenced(fixture, target, 2 if automatic_fence else 1)
+            require_fenced(fixture, target, 2 if short_threshold else 1)
             reply = fixture.leader.ctl(
                 f"promote {F.GROUP} --node {target.node_id} --accept-data-loss")
             expected = ("no-readable-recovered-population" if case == "incomplete-full"
@@ -230,7 +225,7 @@ def run(args, workdir):
         eligible = case in ("clean-owner", "clean-replica", "after-publish",
                             "before-consume")
         if not eligible:
-            require_fenced(fixture, target, 2 if automatic_fence else 1)
+            require_fenced(fixture, target, 2 if short_threshold else 1)
             if case == "manual-fence":
                 # Promote after a lease-only heartbeat has replaced the role
                 # report. Recovery availability must survive this interval;
@@ -243,6 +238,14 @@ def run(args, workdir):
                 before = target.metric(metric, labels)
                 target.wait_metric(metric, lambda value: value > before,
                                    "next lease heartbeat is denied", labels=labels)
+            if short_threshold:
+                # The one-second threshold accelerates the initial fence above.
+                # Operator recovery creates a fresh source history and reconnects
+                # Meta. Restore the default detection window for that handoff so a
+                # normal reconnect cannot immediately fence the recovered Owner.
+                reply = fixture.leader.put_automatic_uncontrolled_failover_policy(3)
+                if not reply.startswith("OK "):
+                    raise H.Failure(f"could not restore recovery detector: {reply}")
             promote(fixture, target)
         wait_serving(fixture, target, 2)
         require_data(target)
