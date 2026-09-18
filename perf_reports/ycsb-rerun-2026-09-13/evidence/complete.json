@@ -4,7 +4,7 @@
   "phases": 32,
   "host_restored": true,
   "aerospike_final_records": 108328377,
-  "keylane_final_records": 109699918,
+  "lavik_final_records": 109699918,
   "aerospike_default_service_running": true,
-  "keylane_stopped": true
+  "lavik_stopped": true
 }

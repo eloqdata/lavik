@@ -4,25 +4,25 @@
   "build_checkout_commit": "1b6c0d3b605cc0c8ffb9c1da4e134a269a747e69",
   "source_equality_check": "git diff main HEAD -- . ':!perf_reports' returned no differences; tracked production worktree was clean",
   "published_scope": [
-    "include/keylane/storage/scan_hash_map.h",
+    "include/lavik/storage/scan_hash_map.h",
     "src/storage/engine/defrag.cpp",
     "tests/scan_hash_map_test.cpp"
   ],
   "report_not_pushed_with_code": true,
-  "binary": "/mnt/dev/keylane-main-f666837.siARSe/keylane",
+  "binary": "/mnt/dev/lavik-main-f666837.siARSe/lavik",
   "sha256": "9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266",
   "configuration": {
     "compiler": "/usr/bin/c++",
     "build_type": "Release",
-    "KEYLANE_ENABLE_OPT": true,
-    "KEYLANE_MARCH": "native",
-    "KEYLANE_WITH_SPDK": false,
-    "KEYLANE_STATIC_CXX_RUNTIME": true,
-    "KEYLANE_STATIC_OPENSSL": true,
-    "KEYLANE_BUILD_FAULT_SERVER": false,
-    "KEYLANE_BUILD_META": true,
-    "KEYLANE_ENABLE_READ_LATENCY_TRACE": false,
-    "KEYLANE_ENABLE_SET_LATENCY_TRACE": false
+    "LAVIK_ENABLE_OPT": true,
+    "LAVIK_MARCH": "native",
+    "LAVIK_WITH_SPDK": false,
+    "LAVIK_STATIC_CXX_RUNTIME": true,
+    "LAVIK_STATIC_OPENSSL": true,
+    "LAVIK_BUILD_FAULT_SERVER": false,
+    "LAVIK_BUILD_META": true,
+    "LAVIK_ENABLE_READ_LATENCY_TRACE": false,
+    "LAVIK_ENABLE_SET_LATENCY_TRACE": false
   },
   "validation": {
     "focused_unit_tests": {"passed": 56, "xml": "main-f666837-unit-tests.xml"},

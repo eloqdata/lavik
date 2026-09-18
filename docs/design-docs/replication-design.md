@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Keylane 主从复制设计
+# Lavik 主从复制设计
 
 > 状态：正式功能规范，与当前实现同步
 >
-> 范围：Keylane 到 Keylane 的原生主从复制；storage format version 保持 1
+> 范围：Lavik 到 Lavik 的原生主从复制；storage format version 保持 1
 
 ## 1. 核心结论
 
-Keylane 使用 replica 主动连接 master 的模型。一个 master 可以同时服务多个 replica，
+Lavik 使用 replica 主动连接 master 的模型。一个 master 可以同时服务多个 replica，
 每个 replica 有独立 session 和发送游标，但所有 replica 共享每个 source worker 上的一份
 内存 backlog。
 
@@ -69,7 +69,7 @@ ONLINE_REPLICA -- REPLICAOF NO ONE --> MASTER（保留完整数据）
 所有普通数据命令都返回：
 
 ```text
-LOADING Keylane is loading the dataset from the primary
+LOADING Lavik is loading the dataset from the primary
 ```
 
 允许的管理命令包括 `PING`、`ECHO`、`AUTH`、`SELECT`、`CLIENT`、`REPLICAOF`、
@@ -104,7 +104,7 @@ Baseline frame 使用 partition 开始扫描时的 `baseline_version=S`。写路
 
 ## 4. 连接、TLS 和 CLIENT 管理
 
-复制使用普通 Redis listener 上的 Keylane 原生握手：control connection 建立 session，随后
+复制使用普通 Redis listener 上的 Lavik 原生握手：control connection 建立 session，随后
 每个 source worker 建立一个 data flow。Source 和 target worker 数可以不同，partition 仍按
 逻辑 slot/owner 路由到 target worker。
 
@@ -188,7 +188,7 @@ storage write buffer 和 read buffer 从注册预算中按需借用并复用。R
 进程内存，不再消耗注册预算。若 `RLIMIT_MEMLOCK`、设备注册限制或配置预算不足，启动诊断必须
 给出所需 bytes、当前 limit 和调整建议；不能按某一台开发机写死。
 
-SPDK backend 只适配 Keylane 自己的 buffer 注册和 token 使用，不修改第三方 SPDK 源码。
+SPDK backend 只适配 Lavik 自己的 buffer 注册和 token 使用，不修改第三方 SPDK 源码。
 
 ## 7. Full sync：DB-by-DB 扫描和逐 key coverage
 
@@ -307,10 +307,10 @@ ONLINE flow LSN。增量 command 与 ONLINE backlog 使用相同的批量发送�
 不会因最终 ACK 尚未到达而被 stall monitor 误杀。断线时未完成 session 整体取消，因此不会把
 只有部分 fragment 的命令带入下一次 full sync。
 
-Prometheus 按 worker 暴露 `keylane_fullsync_publish_queue_bytes`、
-`keylane_fullsync_publish_queue_admitted_bytes`、
-`keylane_fullsync_publish_queue_capacity_bytes`、`keylane_fullsync_sessions` 和
-`keylane_fullsync_publish_queue_backpressure_waits_total`，与普通 ONLINE backlog 指标分开，避免把
+Prometheus 按 worker 暴露 `lavik_fullsync_publish_queue_bytes`、
+`lavik_fullsync_publish_queue_admitted_bytes`、
+`lavik_fullsync_publish_queue_capacity_bytes`、`lavik_fullsync_sessions` 和
+`lavik_fullsync_publish_queue_backpressure_waits_total`，与普通 ONLINE backlog 指标分开，避免把
 full-sync credit 等待误判为 backlog 没有反压。
 
 ## 9. 最终 cut

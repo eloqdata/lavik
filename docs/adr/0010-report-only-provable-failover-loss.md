@@ -24,7 +24,7 @@ Terminal failover outcomes classify loss as `none` or `unknown`. Controlled
 abort without authority movement, normal controlled Cutover, and Cutover of
 the same authorized paused-source Candidate Action may report `none`; ordinary
 uncontrolled recovery and Candidate replacement report `unknown`. Without a
-committed final Source frontier, Keylane does not claim bounded loss, a numeric
+committed final Source frontier, Lavik does not claim bounded loss, a numeric
 RPO, or a proven frontier from replica offsets alone.
 
 Controlled outcomes remain self-contained in the existing Operation result.

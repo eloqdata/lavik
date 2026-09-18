@@ -8,4 +8,4 @@ grain: 3145728
 sector-size: 512
 
 /dev/md127p1 : start=       12288, size=   268435456, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=33F27D15-2EAD-4A86-94B0-F858D315334F, name="aerospike-bench80"
-/dev/md127p2 : start=   268449792, size=  4294967296, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=6AE73491-1ED8-4633-8CC6-03063E710483, name="keylane-uring-bench80"
+/dev/md127p2 : start=   268449792, size=  4294967296, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=6AE73491-1ED8-4633-8CC6-03063E710483, name="lavik-uring-bench80"

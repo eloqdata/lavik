@@ -1,7 +1,7 @@
 {
   "start_utc": "2026-09-16T02:59:37Z",
-  "keylane_commit": "f666837b0038ab65564a17cb3a0bca8530f8e1be",
-  "keylane_sha256": "9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266",
+  "lavik_commit": "f666837b0038ab65564a17cb3a0bca8530f8e1be",
+  "lavik_sha256": "9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266",
   "aerospike_sha256": "6e1b2bd6deebd5816f4f369ac1db4151217ed0be3b66578bdd6f15c24e6af8d0",
   "order": [
     "aerospike",
@@ -33,8 +33,8 @@
   },
   "aerospike_configuration": "# Single-node YCSB device namespace. Performance settings use server defaults.\nservice {\n}\nlogging {\n    console {\n        context any info\n    }\n}\nnetwork {\n    service {\n        address 172.16.0.4\n        port 3000\n    }\n    heartbeat {\n        address 127.0.0.1\n        mode mesh\n        port 3002\n    }\n    fabric {\n        address 127.0.0.1\n        port 3001\n    }\n    admin {\n        address 127.0.0.1\n        port 3003\n    }\n}\nnamespace ycsb {\n    replication-factor 1\n    storage-engine device {\n        device /dev/md127p3\n    }\n}\n",
   "script_sha256": {
-    "runner.py": "78b0eb6d35ca42e1c5684781f72546301ed66f0b90bcef6dc637f5288d576751",
-    "host_policy.py": "68b8b96db0af81c43408b19d88feb191daeee57ad41871e8ad02a72208f0b095",
-    "ycsb_client.py": "4672a5d73718e4fc3ea154d9d714f2f911d80e3e8ed36127ab551d7e61034d37"
+    "runner.py": "054ae4522b44891f242cc25b2dd2696b45c5f036cc89e5f1eee4bfe1eb3c7c82",
+    "host_policy.py": "92ea164e8ddce95ccd6f7ed033a9c8e3f2851ae5c631e396456df7ce22b86a1f",
+    "ycsb_client.py": "ad19b9d39c93d0fb98acd194ecb91694cf24425874e829d574f784cc16ac63f9"
   }
 }

@@ -176,7 +176,7 @@ taskset -c 0-15 /usr/bin/memtier_benchmark \
 Valkey 读取模板；写入测试将 GET 替换为 SET：
 
 ```bash
-taskset -c 0-15 /tmp/keylane-valkey-offset/valkey-benchmark \
+taskset -c 0-15 /tmp/lavik-valkey-offset/valkey-benchmark \
   -h 10.0.0.4 -p 6379 \
   -c 80 --threads 8 -P 1 \
   --warmup 5 --duration 300 --precision 3 --seed 20260826 \
@@ -193,7 +193,7 @@ taskset -c 0-15 /tmp/keylane-valkey-offset/valkey-benchmark \
 - Lavik commit：`c9f981732539fd32b6ec9000d2608f03e698691b`
 - celer commit：`0a70d22086fb14435464253991ca6fc6a90f19d5`
 - 每项主要测试只有一个 300 秒正式窗口；Valkey 额外预热五秒。
-- 所有主要客户端退出码均为零，前后 `DBSIZE` 均为 500,000,000，`keylane_memory_rejected_commands_total` 一直为零。
+- 所有主要客户端退出码均为零，前后 `DBSIZE` 均为 500,000,000，`lavik_memory_rejected_commands_total` 一直为零。
 - 所有主要服务 journal 窗口均没有 error、fatal、OOM 或 latency-trace 日志。
 - 除异常裸设备 Valkey 读取的重测外，这是单主机、单次测试对比，没有测量跨独立进程重启的置信区间。
 - 后端顺序使用相同物理设备，而非同时使用。温度低于警告阈值，SMART 未报告 media error。
@@ -211,4 +211,4 @@ taskset -c 0-15 /tmp/keylane-valkey-offset/valkey-benchmark \
 ## 证据
 
 - 经复核的精简结果已包含在上述主要结果表中。
-- 历史原始运行根目录：`perf_runs/keylane-500m2k-spdk-vs-iouring-memtier-valkey-12c-20260826/`
+- 历史原始运行根目录：`perf_runs/lavik-500m2k-spdk-vs-iouring-memtier-valkey-12c-20260826/`

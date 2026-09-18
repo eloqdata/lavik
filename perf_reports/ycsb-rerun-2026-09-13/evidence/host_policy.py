@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Record host policy and apply Keylane-only isolation with exact restoration.
+"""Record host policy and apply Lavik-only isolation with exact restoration.
 
 IRQ identities belong to one boot and PCI function. Restoration checks both;
 task restoration also checks start time, so recycled TIDs cannot be changed.
@@ -106,14 +106,14 @@ def initialize():
     save('host-original.json', state)
 
 
-def apply_keylane():
+def apply_lavik():
     assert os.geteuid() == 0
     assert_default()
     assert not run(['pgrep', '-x', 'asd'], check=False)
-    assert not run(['pgrep', '-x', 'keylane'], check=False)
-    assert not (ROOT / 'keylane-policy-before.json').exists()
+    assert not run(['pgrep', '-x', 'lavik'], check=False)
+    assert not (ROOT / 'lavik-policy-before.json').exists()
     before = snapshot(True)
-    save('keylane-policy-before.json', before)
+    save('lavik-policy-before.json', before)
     for unit in UNITS:
         run(['systemctl', 'set-property', '--runtime', unit, 'AllowedCPUs=12-15'])
     WORKQUEUE.write_text('f000\n')
@@ -130,11 +130,11 @@ def apply_keylane():
             moved.append(thread)
         except (OSError, ProcessLookupError) as error:
             skipped.append({'tid': thread['tid'], 'error': str(error)})
-    save('keylane-policy-applied.json', {'moved': moved, 'skipped': skipped, 'after': snapshot(True)})
-    assert_keylane()
+    save('lavik-policy-applied.json', {'moved': moved, 'skipped': skipped, 'after': snapshot(True)})
+    assert_lavik()
 
 
-def assert_keylane(current=None):
+def assert_lavik(current=None):
     current = current or snapshot()
     original = json.loads((ROOT / 'host-original.json').read_text())
     assert current['boot_id'] == original['boot_id']
@@ -150,12 +150,12 @@ def assert_keylane(current=None):
 
 
 def restore():
-    p = ROOT / 'keylane-policy-before.json'
+    p = ROOT / 'lavik-policy-before.json'
     if not p.exists():
         return assert_default()
     before = json.loads(p.read_text())
     assert before['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip()
-    assert not run(['pgrep', '-x', 'keylane'], check=False)
+    assert not run(['pgrep', '-x', 'lavik'], check=False)
     for unit, value in before['units'].items():
         run(['systemctl', 'set-property', '--runtime', unit, 'AllowedCPUs=' + value])
     WORKQUEUE.write_text(before['workqueue'] + '\n')

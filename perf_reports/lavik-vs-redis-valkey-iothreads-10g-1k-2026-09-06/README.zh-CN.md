@@ -49,11 +49,11 @@ Valkey GET 在 16 threads 最佳，但 Valkey SET 在 8 threads 最佳，增加�
 16 threads 后下降 4.7%。
 
 若需要比较更多磁盘型 Redis 兼容系统及不同持久化、WAL、compaction
-配置，请参阅[更完整的持久化与分层存储对比报告](../keylane-vs-dragonfly-tiering-2026-08-11/README.zh-CN.md)。
+配置，请参阅[更完整的持久化与分层存储对比报告](../lavik-vs-dragonfly-tiering-2026-08-11/README.zh-CN.md)。
 
 ## Lavik 与调优后纯内存系统的差距
 
-![Lavik、Redis、Valkey 不同连接数 QPS](best-memory-vs-keylane-qps.png)
+![Lavik、Redis、Valkey 不同连接数 QPS](best-memory-vs-lavik-qps.png)
 
 图中的纯内存配置按命令选择本轮实测最优线程数：Redis GET/SET 都是
 16 I/O threads；Valkey GET 是 16、SET 是 8。Lavik 固定为 16 workers。
@@ -177,7 +177,7 @@ Lavik 的 GET 在 1,280 连接达到 784,179 QPS，是 Dragonfly 峰值的
 ## 实施方法
 
 - Lavik 使用代码提交
-  [`29dc8e6`](https://github.com/thweetkomputer/keylane/commit/29dc8e6b87c40196dc397759690252944f1196f0)，
+  [`29dc8e6`](https://github.com/thweetkomputer/lavik/commit/29dc8e6b87c40196dc397759690252944f1196f0)，
   Clang 18 Release、`-march=native`、16 workers、六块独立 raw NVMe 的
   io_uring 后端、暂停 defrag。二进制 SHA-256 为
   `ef8cc3f1b815fe123f408626f8d4dadfc3a509ed7f63ab5de17e3e237b2d82fd`。
@@ -198,12 +198,16 @@ Lavik 的 GET 在 1,280 连接达到 784,179 QPS，是 Dragonfly 峰值的
   同一 RAID0/XFS 上的 Storage Tier。Dragonfly 在正式 GET 前额外运行
   180 秒随机读预热。
 - 复现入口为 [`run_memory_sweep.sh`](run_memory_sweep.sh) 和
-  [`run_keylane_sweep.sh`](run_keylane_sweep.sh)；规范化与图表生成入口为
+  [`run_lavik_sweep.sh`](run_lavik_sweep.sh)；规范化与图表生成入口为
   [`build_assets.py`](build_assets.py)。纯内存组 110 个正式点见
   [`results.csv`](results.csv)，分层存储组 36 个正式点见
   [`storage-results.csv`](storage-results.csv)；对应的原始输入哈希分别见
   [`raw-SHA256SUMS`](raw-SHA256SUMS) 和
   [`storage-raw-SHA256SUMS`](storage-raw-SHA256SUMS)。
+
+报告、脚本、CSV 和校验清单中的产品名称及路径均已统一为 Lavik。
+外部原始输入未随仓库提供，其已记录的哈希保持不变；复现时需将这些输入
+放到 `build_assets.py` 使用的规范化路径下。
 
 ## 限制、异常与稳健性
 

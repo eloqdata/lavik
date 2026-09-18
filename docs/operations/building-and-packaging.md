@@ -146,6 +146,11 @@ cmake -S . -B build-dpdk-net -G Ninja \
 cmake --build build-dpdk-net --target lavik -j4
 ```
 
+To test Lavik against a separate Bycorf checkout, add
+`-DLAVIK_BYCORF_SOURCE_DIR=/absolute/path/to/bycorf-worktree` to the configure
+command above. Initialize the bypass dependencies in that checkout as well.
+Record both repository revisions when validating the integration.
+
 On AArch64, use GCC for the bypass build because the pinned SPDK ISA-L Crypto
 dependency requires GCC. The private FreeBSD stack is built separately with
 Clang by the BSD build helper; both compilers are therefore required. Ordinary
@@ -158,8 +163,15 @@ files use `--storage=uring`; the bypass build also supports
 `--storage=spdk` and `spdk://` NVMe paths. Select `--network=dpdk` explicitly;
 compiling support alone leaves the default kernel network active. Use a fresh
 disposable file and disable the metrics listener with
-`--metrics-port=0` for the initial standalone SET/GET run. TLS, replication,
-and cluster use are outside this prototype's validation scope.
+`--metrics-port=0` for the initial standalone SET/GET run. Bind Lavik to the
+configured stack address and configure the TAP after initialization as described
+in the Bycorf runbook. Pin memtier to CPUs outside the server worker set; for
+example, keep it off CPUs 0 and 1 when those CPUs run two Lavik workers.
+
+TLS, replication, and cluster use are outside this prototype's validation scope.
+Lavik's replication handoff and application paths that operate directly on
+Linux descriptors have not been ported to the DPDK backend. BSD socket handles
+must stay on their owning worker and use Bycorf's stream operations.
 
 The default DPDK build supports up to 128 network workers. Set
 `-DBYCORF_DPDK_MAX_WORKERS=N` to change this capacity (1–1023); Bycorf builds a

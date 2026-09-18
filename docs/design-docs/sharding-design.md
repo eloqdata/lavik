@@ -43,7 +43,7 @@ Runtime (celer)
  ├── workers_[0..N]          threads + io_uring + cross-core queues
  └── (generic submit_to)     run a closure on any worker, resume on origin
 
-keylane
+lavik
  ├── shards_[0..N]           the DATA: each = std::array<HashTable, 16>
  │                           shards_[i] touched only by worker i
  └── services (port+handler) Redis:6379, RPC:7000, Admin:8080
@@ -82,7 +82,7 @@ required for this path.
 
 Fast path: `target == current_worker` → run `fn` inline, no queue, no suspend.
 
-## keylane: shards + routing
+## lavik: shards + routing
 
 ```cpp
 struct Shard { std::array<HashTable, 16> dbs_; };   // per-worker data slice
@@ -104,7 +104,7 @@ else
 - `SubmitTo` awaiter; integrate drain into `Worker::Run` poll loop + eventfd wake.
 - Test: trivial cross-core call returns correct result.
 
-**Phase B — keylane shards**
+**Phase B — lavik shards**
 - `Shard { std::array<HashTable,16> }`; Runtime/owner holds `shards_[0..N]`.
 - `ShardContext { worker_id(), shards_ }` passed to handlers.
 

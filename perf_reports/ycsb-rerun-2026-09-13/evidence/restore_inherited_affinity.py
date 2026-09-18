@@ -40,7 +40,7 @@ def main():
     assert os.geteuid() == 0
     assert not (ROOT / 'inherited-affinity-restored.json').exists()
     host.assert_default()
-    baseline = json.loads((ROOT / 'keylane-policy-before.json').read_text())
+    baseline = json.loads((ROOT / 'lavik-policy-before.json').read_text())
     old = {t['pid']: t for t in baseline['threads'] if t['tid'] == t['pid']}
     recognized = {'codex', 'codex-code-mode', 'sshd', '(udev-worker)', 'psimon'}
     before = host.snapshot(True)

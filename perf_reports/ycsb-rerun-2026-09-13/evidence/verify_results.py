@@ -34,9 +34,9 @@ PERCENTILES = {'p99_ms': '99thPercentileLatency(us)',
                'p9999_ms': '99.99PercentileLatency(us)'}
 
 
-# Publication added this exact license notice after the experiment recorded
-# script hashes. Keep those original digests authoritative: only this prefix
-# may be removed, and the resulting bytes must still match the recorded hash.
+# Some archived script hashes predate this exact publication license notice.
+# Name normalization updates the affected script hashes along with the scripts;
+# only this prefix may be removed when checking a pre-notice hash.
 _ARCHIVE_LICENSE_HEADER = b"""# Copyright (C) 2026 EloqData Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,7 +55,7 @@ _ARCHIVE_LICENSE_HEADER = b"""# Copyright (C) 2026 EloqData Inc.
 
 
 def check_script_digest(name, expected):
-    """Verify the measured script, allowing only the later publication notice."""
+    """Verify the archived script, allowing only the publication notice."""
     body = (ROOT / name).read_bytes()
     if hashlib.sha256(body).hexdigest() == expected:
         return
@@ -104,7 +104,7 @@ def check_database(mode, side):
     """Reconcile deployment claims with effective settings, not just argv."""
     process = side['process']
     assert process['affinity'] == list(range(16 if mode == 'aerospike' else 12))
-    assert process['sha256'] == (runner.AERO_SHA if mode == 'aerospike' else runner.KEYLANE_SHA)
+    assert process['sha256'] == (runner.AERO_SHA if mode == 'aerospike' else runner.LAVIK_SHA)
     if mode == 'aerospike':
         service = runner.kv(side['service_config'])
         assert service['auto-pin'] == 'none' and service['service-threads'] == '80'
@@ -120,7 +120,7 @@ def check_database(mode, side):
         for name, expected in defaults.items():
             assert namespace[name] == expected, (name, namespace[name])
     else:
-        assert '/keylane-bench.slice/' in process['cgroup']
+        assert '/lavik-bench.slice/' in process['cgroup']
         argv = process['argv']
         for name, expected in (('--threads', '12'), ('--flush-max-ms', '100'),
                                ('--data-file', '/dev/md127p4')):
@@ -257,7 +257,7 @@ def verify(allow_partial=False):
         else:
             assert props['recordcount'] == '100000000'
         if mode == 'hreplace':
-            assert props['redis.updatecommand'] == 'keylane.hreplace' and props['redis.scanindex'] == 'none'
+            assert props['redis.updatecommand'] == 'lavik.hreplace' and props['redis.scanindex'] == 'none'
         a, z = data(phase['host_before']), data(phase['host_after'])
         for side in (a, z):
             check_host(mode, side['host'], original, require_effective=True)
@@ -291,7 +291,7 @@ def verify(allow_partial=False):
         for mode in counts:
             assert data(mode + '-complete.json')['records'] == counts[mode]
         assert data('complete.json')['aerospike_final_records'] == counts['aerospike']
-        assert data('complete.json')['keylane_final_records'] == counts['hreplace']
+        assert data('complete.json')['lavik_final_records'] == counts['hreplace']
         final = data('aerospike-final-ready.json')
         assert final['dbsize'] == counts['aerospike']
         check_host('aerospike', final['host'], original)
@@ -299,13 +299,13 @@ def verify(allow_partial=False):
         assert data('aerospike-final-samples.json') == data('aerospike-completed-samples.json')
     return {'complete': len(totals) == 16, 'rows': rows, 'total_qps': totals, 'final_records': counts,
             'recordcount_at_start_each': 100_000_000,
-            'comparison': 'Aerospike server defaults and original host policy; Keylane 12 workers with 12+4 host isolation. Fresh equal starting datasets; different CPU allocations and database defaults.'}
+            'comparison': 'Aerospike server defaults and original host policy; Lavik 12 workers with 12+4 host isolation. Fresh equal starting datasets; different CPU allocations and database defaults.'}
 
 
 def markdown(summary):
     rows = {(r['mode'], r['workload'], r['target'], r['operation']): r for r in summary['rows']}
     totals = {(r['mode'], r['workload'], r['target']): r for r in summary['total_qps']}
-    lines = ['| Workload | 限速 | 操作 | Aerospike（默认参数、原始宿主配置） | Keylane（100ms、12+4 隔离） |',
+    lines = ['| Workload | 限速 | 操作 | Aerospike（默认参数、原始宿主配置） | Lavik（100ms、12+4 隔离） |',
              '|---|---|---|---:|---:|']
     for w in 'ABCD':
         for t in (0, 100000):

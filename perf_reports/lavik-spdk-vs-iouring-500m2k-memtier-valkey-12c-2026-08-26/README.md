@@ -177,7 +177,7 @@ taskset -c 0-15 /usr/bin/memtier_benchmark \
 Valkey read shape; SET replaced GET for the write run:
 
 ```bash
-taskset -c 0-15 /tmp/keylane-valkey-offset/valkey-benchmark \
+taskset -c 0-15 /tmp/lavik-valkey-offset/valkey-benchmark \
   -h 10.0.0.4 -p 6379 \
   -c 80 --threads 8 -P 1 \
   --warmup 5 --duration 300 --precision 3 --seed 20260826 \
@@ -194,7 +194,7 @@ Client versions and hashes:
 - Lavik commit: `c9f981732539fd32b6ec9000d2608f03e698691b`
 - celer commit: `0a70d22086fb14435464253991ca6fc6a90f19d5`
 - Every primary run used one 300-second measured window; Valkey additionally used a five-second warmup.
-- All primary client exit codes were zero, `DBSIZE` was 500,000,000 before and after, and `keylane_memory_rejected_commands_total` remained zero.
+- All primary client exit codes were zero, `DBSIZE` was 500,000,000 before and after, and `lavik_memory_rejected_commands_total` remained zero.
 - No primary service-journal window contained error, fatal, OOM, or latency-trace lines.
 - This is a single-host, single-run comparison except for the repeated anomalous raw Valkey read. Confidence intervals across independent process restarts were not measured.
 - The backends used the same physical devices sequentially, not simultaneously. Temperature stayed below warning thresholds and SMART reported no media errors.
@@ -212,4 +212,4 @@ Client versions and hashes:
 ## Evidence
 
 - Compact reviewed results are included in the headline tables above.
-- Raw run root: `perf_runs/keylane-500m2k-spdk-vs-iouring-memtier-valkey-12c-20260826/`
+- Raw run root: `perf_runs/lavik-500m2k-spdk-vs-iouring-memtier-valkey-12c-20260826/`

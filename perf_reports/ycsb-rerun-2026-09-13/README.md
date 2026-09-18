@@ -65,7 +65,7 @@ D does not read records inserted during the run, so it is D-Uniform. Both databa
 | Item | Aerospike | Lavik |
 |---|---|---|
 | Process CPU availability | 0–15, 16 logical CPUs / 8 physical cores; no additional CPU-affinity options | 0–11, 12 logical CPUs / 6 physical cores; 12 pinned workers |
-| systemd placement | Default `system.slice`, without AllowedCPUs/CPUAffinity settings | Dedicated `keylane-bench.slice`, AllowedCPUs/CPUAffinity=0–11 |
+| systemd placement | Default `system.slice`, without AllowedCPUs/CPUAffinity settings | Dedicated `lavik-bench.slice`, AllowedCPUs/CPUAffinity=0–11 |
 | System tasks | No additional CPU restrictions on `system.slice`, `user.slice`, or `init.scope` | These tasks restricted to CPUs 12–15 |
 | Unbound workqueue | Original `ffff`, CPUs 0–15 | `f000`, CPUs 12–15 |
 | Test NIC IRQs | Original driver layout: 16 completion IRQs on CPUs 0–15 | The NIC's 17 IRQs distributed round-robin over CPUs 12–15 |
@@ -74,7 +74,7 @@ D does not read records inserted during the run, so it is D-Uniform. Both databa
 
 All Aerospike thread affinities, `auto-pin=none`, and the original IRQ configuration were checked before and after every phase. Lavik tuning was applied only after all Aerospike tests completed and Aerospike stopped; the original state was restored afterward. Before and after each Lavik warmup and measurement, configured values and effective IRQ placement were checked. Interrupt-count deltas confirmed that this NIC's IRQs did not execute on CPUs 0–11. Fixed per-CPU kernel threads and managed NVMe IRQs are not arbitrarily movable system tasks.
 
-[Original host snapshot](evidence/host-original.json) · [Lavik tuning evidence](evidence/keylane-policy-applied.json) · [Host restoration evidence](evidence/host-restored.json) · [Affinity restoration for newly created helper threads](evidence/inherited-affinity-restored.json)
+[Original host snapshot](evidence/host-original.json) · [Lavik tuning evidence](evidence/lavik-policy-applied.json) · [Host restoration evidence](evidence/host-restored.json) · [Affinity restoration for newly created helper threads](evidence/inherited-affinity-restored.json)
 
 ## Database settings
 
@@ -95,7 +95,7 @@ All Aerospike thread affinities, `auto-pin=none`, and the original IRQ configura
 
 Aerospike configuration specified only the required cluster-name, listening/single-node communication, namespace, RF=1, and block device. It did not override thread count, auto-pin, caches, flushing, index budget, or reclamation. The file-descriptor limit was the package systemd unit's 100,000. The complete [configuration](evidence/aerospike.conf), [actual startup command](evidence/aerospike-measured-server-command.json), and [effective settings](evidence/aerospike-measured-ready.json) are retained. Default values refer to queries from this run.
 
-Lavik reused the original report's binary: GCC 13.3 / Release / O3 / native / LTO, SHA256 `9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266`. The [build evidence](evidence/keylane-build.json) and [startup command](evidence/hreplace-measured-server-command.json) record all settings. 100ms is the periodic flush trigger interval; an ordinary successful write does not promise per-write synchronous durability. Data fdatasync precedes block-header fdatasync. Active expiration used this revision's default budget.
+Lavik reused the original report's binary: GCC 13.3 / Release / O3 / native / LTO, SHA256 `9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266`. The [build evidence](evidence/lavik-build.json) and [startup command](evidence/hreplace-measured-server-command.json) record all settings. 100ms is the periodic flush trigger interval; an ordinary successful write does not promise per-write synchronous durability. Data fdatasync precedes block-header fdatasync. Active expiration used this revision's default budget.
 
 ## Load generation and metric definitions
 
@@ -145,7 +145,12 @@ Compare throughput and tails separately: **Aerospike had lower p999 for every un
 
 ## Raw evidence and offline verification
 
-[Results JSON](results.json) · [Operation CSV](summary.csv) (including average/maximum latency and success counts) · [All phases](evidence/phases.json) · [Initial test runner](evidence/runner.py) · [Lavik continuation script](evidence/resume_keylane.py) · [File checksums](SHA256SUMS)
+Archived text and filenames use the current Lavik name, including metric
+prefixes, product keys, and recorded paths. This is a naming normalization;
+measurements and revision identifiers are unchanged. Archived script hashes
+and `SHA256SUMS` cover the normalized files in this directory.
+
+[Results JSON](results.json) · [Operation CSV](summary.csv) (including average/maximum latency and success counts) · [All phases](evidence/phases.json) · [Initial test runner](evidence/runner.py) · [Lavik continuation script](evidence/resume_lavik.py) · [File checksums](SHA256SUMS)
 
 After Aerospike completed, the first switchover stopped because it immediately checked an IRQ affinity change that would become effective only on the next interrupt. The host was restored automatically; Lavik had not yet started. The switchover check was then corrected to confirm effective IRQ placement after load traffic, retaining all completed Aerospike results. This was a setup-phase failure; no measured window was replaced. Original scripts, [continuation evidence](evidence/resume.json), and failure records are archived.
 

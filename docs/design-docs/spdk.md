@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Running Keylane with SPDK
+# Running Lavik with SPDK
 
-Keylane can access one or more local NVMe namespaces directly through SPDK.
+Lavik can access one or more local NVMe namespaces directly through SPDK.
 Networking remains on celer/io_uring; only the storage backend changes. This
 guide is hardware-independent; benchmark-host details belong in
 [`PERF_SESSION_HANDOFF.md`](../../PERF_SESSION_HANDOFF.md).
@@ -27,8 +27,8 @@ or workspace disk.
 
 > **Data safety:** verify that none of the selected controller's namespaces is
 > mounted, used as swap, part of LVM/RAID, or needed by another service.
-> Binding does not erase a disk, but starting Keylane on an unlabeled namespace
-> initializes it as Keylane storage. Always pass an explicit `PCI_ALLOWED`
+> Binding does not erase a disk, but starting Lavik on an unlabeled namespace
+> initializes it as Lavik storage. Always pass an explicit `PCI_ALLOWED`
 > allowlist to SPDK's setup script.
 
 ## 1. Fetch the complete source tree
@@ -36,8 +36,8 @@ or workspace disk.
 SPDK is pinned as a nested celer submodule, so initialize recursively:
 
 ```sh
-git clone --recurse-submodules REPOSITORY_URL keylane
-cd keylane
+git clone --recurse-submodules REPOSITORY_URL lavik
+cd lavik
 git submodule update --init --recursive
 ```
 
@@ -48,7 +48,7 @@ running it on a managed host:
 sudo celer/third_party/spdk/scripts/pkgdep.sh
 ```
 
-Keylane additionally requires CMake 3.20 or newer, Ninja, a C++23 compiler,
+Lavik additionally requires CMake 3.20 or newer, Ninja, a C++23 compiler,
 pkg-config, OpenSSL development files, and NUMA development files.
 
 ## 2. Build the SPDK variant
@@ -57,13 +57,13 @@ pkg-config, OpenSSL development files, and NUMA development files.
 cmake -S . -B bld-spdk -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=ON \
-  -DKEYLANE_ENABLE_OPT=ON \
-  -DKEYLANE_WITH_SPDK=ON
+  -DLAVIK_ENABLE_OPT=ON \
+  -DLAVIK_WITH_SPDK=ON
 cmake --build bld-spdk -j "$(nproc)"
 ```
 
-`KEYLANE_WITH_SPDK=ON` statically links the pinned SPDK/DPDK storage stack. A
-normal io_uring build uses `-DKEYLANE_WITH_SPDK=OFF` in a separate build
+`LAVIK_WITH_SPDK=ON` statically links the pinned SPDK/DPDK storage stack. A
+normal io_uring build uses `-DLAVIK_WITH_SPDK=OFF` in a separate build
 directory.
 
 ## 3. Select controllers and namespaces safely
@@ -85,7 +85,7 @@ Record all three identities for every selected disk:
 - namespace ID (NSID), commonly `1`, as reported by `nvme list-ns` or
   `nvme id-ns`.
 
-The Keylane URI is `spdk://PCI_BDF/NSID`; for example:
+The Lavik URI is `spdk://PCI_BDF/NSID`; for example:
 
 ```text
 spdk://0000:01:00.0/1
@@ -128,11 +128,11 @@ sum(registered-buffer-mb-per-worker × worker-count per process)
 Round upward generously, verify free hugepages after startup, and account for
 NUMA placement. `scripts/setup.sh --help` documents `HUGENODE`, `HUGEPGSZ`,
 `NRHUGE`, and persistent hugepage options. On NUMA hosts, keep the NVMe PCI
-device, hugepages, and Keylane worker CPUs on the same node when possible.
+device, hugepages, and Lavik worker CPUs on the same node when possible.
 
 After setup, use `lspci -Dnnk` to confirm that only the selected controllers
 use `vfio-pci`. Their kernel `/dev/nvme*` namespaces should no longer appear.
-Run Keylane as `SPDK_TARGET_USER`, and configure an adequate locked-memory
+Run Lavik as `SPDK_TARGET_USER`, and configure an adequate locked-memory
 limit (commonly `LimitMEMLOCK=infinity` in systemd or `ulimit -l unlimited` in
 an administrative launch wrapper).
 
@@ -146,26 +146,26 @@ sudo sh -c 'echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode'
 Do not use that mode on production or multi-tenant systems; it removes DMA
 isolation.
 
-## 5. Start and validate one Keylane instance
+## 5. Start and validate one Lavik instance
 
 Choose deployment-specific addresses, ports, CPUs, and the URI discovered
 above. Current defaults include the production tuning used by this baseline,
 so only deployment-specific values are required:
 
 ```sh
-KEYLANE_BIND_IP=127.0.0.1
-KEYLANE_CPUS=0-7
-KEYLANE_SPDK_URI='spdk://0000:01:00.0/1'
+LAVIK_BIND_IP=127.0.0.1
+LAVIK_CPUS=0-7
+LAVIK_SPDK_URI='spdk://0000:01:00.0/1'
 
-taskset -c "$KEYLANE_CPUS" ./bld-spdk/keylane \
-  --bind="$KEYLANE_BIND_IP" \
-  --data-file="$KEYLANE_SPDK_URI"
+taskset -c "$LAVIK_CPUS" ./bld-spdk/lavik \
+  --bind="$LAVIK_BIND_IP" \
+  --data-file="$LAVIK_SPDK_URI"
 ```
 
 Redis traffic uses the default port 6379. Prometheus metrics are disabled by
 default; add `--metrics-port=9100` only when a metrics collector is needed.
 
-Keylane pins workers by default. It reads the inherited affinity mask and maps
+Lavik pins workers by default. It reads the inherited affinity mask and maps
 worker 0 to the first allowed CPU, worker 1 to the second, and so on. Thus
 `taskset -c 8-15 ...` automatically creates eight workers and maps them to CPUs
 8 through 15 rather than
@@ -179,7 +179,7 @@ poll-mode workers are particularly sensitive to migration and preemption while
 I/O is outstanding.
 
 For latency-sensitive deployments, also reserve physical cores for the network
-device's completion IRQs and keep them disjoint from the Keylane worker set.
+device's completion IRQs and keep them disjoint from the Lavik worker set.
 See [Network IRQ Affinity Tuning for Tail Latency](../operations/irq-affinity-tuning.md).
 
 `--spdk-max-completions-per-poll=8` bounds one event-loop poll's completion
@@ -210,10 +210,10 @@ Startup fails if the budget cannot fit the configured storage write pool.
 
 On io_uring, buffer registration itself is probed at runtime. Kernels before
 5.12 normally charge it to the process `RLIMIT_MEMLOCK`; if registration fails,
-Keylane logs the requested per-worker bytes plus the runtime soft/hard limits
+Lavik logs the requested per-worker bytes plus the runtime soft/hard limits
 and keeps the same fixed-size reusable pools on the unregistered-I/O path.
 Linux 5.12+ with native io_uring workers uses cgroup memory accounting instead,
-so Keylane does not incorrectly cap those machines from `ulimit -l`. SPDK uses
+so Lavik does not incorrectly cap those machines from `ulimit -l`. SPDK uses
 its DMA-addressability check and fails startup if a pool buffer is not DMA
 addressable; no SPDK source modification is required.
 
@@ -226,10 +226,10 @@ and provides no proactive response to Linux or cgroup memory pressure.
 Wait for `storage recovery complete` before sending traffic, then validate:
 
 ```sh
-redis-cli -h "$KEYLANE_BIND_IP" -p "$KEYLANE_PORT" PING
-redis-cli -h "$KEYLANE_BIND_IP" -p "$KEYLANE_PORT" DBSIZE
-redis-cli -h "$KEYLANE_BIND_IP" -p "$KEYLANE_PORT" DEFRAG STATUS
-curl "http://$KEYLANE_BIND_IP:$KEYLANE_METRICS_PORT/metrics"
+redis-cli -h "$LAVIK_BIND_IP" -p "$LAVIK_PORT" PING
+redis-cli -h "$LAVIK_BIND_IP" -p "$LAVIK_PORT" DBSIZE
+redis-cli -h "$LAVIK_BIND_IP" -p "$LAVIK_PORT" DEFRAG STATUS
+curl "http://$LAVIK_BIND_IP:$LAVIK_METRICS_PORT/metrics"
 ```
 
 ## 6. Use multiple NVMe devices
@@ -246,7 +246,7 @@ sudo env \
   HUGEMEM=8192 \
   celer/third_party/spdk/scripts/setup.sh
 
-./bld-spdk/keylane \
+./bld-spdk/lavik \
   --port=6379 \
   --metrics-port=9100 \
   --threads=8 \
@@ -257,9 +257,9 @@ sudo env \
 
 Namespaces on one controller share that controller's hardware resources and
 failure domain; namespaces on distinct controllers have separate PCI paths.
-Keylane treats each namespace URI as one storage device in either case.
+Lavik treats each namespace URI as one storage device in either case.
 
-At startup Keylane reads the negotiated I/O queue count from every physical
+At startup Lavik reads the negotiated I/O queue count from every physical
 controller, then assigns controller qpairs to workers deterministically. One
 worker uses one qpair for all configured namespaces on the same controller;
 that qpair is submitted and polled only by that worker. Controller owner counts
@@ -276,17 +276,17 @@ qpair for their source controller. Normal overwrite and defrag paths relocate
 live data onto the current key owner's local controller over time. The
 io_uring build retains its all-device allocation fallback.
 
-All paths in one process must include the complete persisted Keylane storage
-set. To add fresh namespaces, stop Keylane and restart it with every existing
+All paths in one process must include the complete persisted Lavik storage
+set. To add fresh namespaces, stop Lavik and restart it with every existing
 URI plus the zero-label new URIs. The fixed metadata on new namespaces is
 initialized automatically; existing data remains in place. Expansion is safe
 to retry after interruption. A foreign initialized namespace is rejected, so
-clear its Keylane label before intentionally reusing it as a new member.
+clear its Lavik label before intentionally reusing it as a new member.
 Argument order does not define persistent device identity after initialization.
 Online addition and device removal are not implemented.
 
-To expand an existing SPDK set, stop Keylane before changing driver ownership.
-If the new namespace contains an old Keylane storage set, temporarily expose
+To expand an existing SPDK set, stop Lavik before changing driver ownership.
+If the new namespace contains an old Lavik storage set, temporarily expose
 it through the kernel, verify its PCI-to-device mapping, and clear only its
 label before binding it to VFIO. Never clear an existing member being kept.
 
@@ -306,7 +306,7 @@ sudo env \
   HUGEMEM=8192 \
   celer/third_party/spdk/scripts/setup.sh
 
-./bld-spdk/keylane \
+./bld-spdk/lavik \
   --port=6379 \
   --metrics-port=9100 \
   --threads=8 \

@@ -20,10 +20,10 @@ limitations under the License.
 
 Accepted
 
-Keylane has not yet shipped its first stable release. The failover command,
+Lavik has not yet shipped its first stable release. The failover command,
 snapshot, Full Desired State, and Operation-result layouts are development
 formats, so their schemas can be replaced without legacy decoders, dual writes,
-or mixed-version negotiation. Keylane-owned format markers stay at v1 during
+or mixed-version negotiation. Lavik-owned format markers stay at v1 during
 this pre-stable phase rather than gaining additional development versions.
 An equal marker does not establish compatibility with an earlier layout.
 

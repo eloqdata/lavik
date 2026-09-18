@@ -38,7 +38,7 @@ inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
 // Pre-deployment format changes directly replace version 1. Compatibility
 // with earlier development media is intentionally unsupported because its
 // missing system-state lineage cannot be inferred safely. Lavik signatures
-// also reject media from the former Keylane development format.
+// also reject media bearing obsolete development signatures.
 inline constexpr std::uint32_t kStorageFormatVersion = 1;
 inline constexpr unsigned kLocalBlockIdBits = 27;
 inline constexpr std::uint64_t kLocalBlockIdLimit = std::uint64_t{1}

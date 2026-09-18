@@ -16,7 +16,7 @@ limitations under the License.
 
 # Redis compatibility target
 
-Keylane targets Redis Open Source 7.2 semantics for every command it exposes.
+Lavik targets Redis Open Source 7.2 semantics for every command it exposes.
 This is a command-level compatibility promise: unsupported Redis 7.2 commands
 remain unsupported, while supported commands must match Redis 7.2 syntax,
 atomicity, errors, and RESP2 replies.
@@ -52,9 +52,9 @@ listpack, and all three Stream listpack layouts). The `ttl` argument supplies
 the new relative deadline; `ABSTTL` makes it an absolute Unix millisecond
 deadline, and `REPLACE` is atomic with the write. Redis Module values and RDB
 types introduced after Redis 7.2 are unsupported. `IDLETIME` and `FREQ` are
-rejected explicitly because Keylane does not persist Redis eviction metadata.
+rejected explicitly because Lavik does not persist Redis eviction metadata.
 
-Successful `RESTORE` mutations use the normal Keylane replication log. A
+Successful `RESTORE` mutations use the normal Lavik replication log. A
 relative TTL is rewritten to `RESTORE ... REPLACE ABSTTL` before publication,
 so replica delay cannot extend the key lifetime; an already elapsed replacement
 is propagated as a deletion. `DUMP` is read-only and is never replicated.
@@ -62,16 +62,16 @@ is propagated as a deletion. `DUMP` is read-only and is never replicated.
 ## Startup RDB import
 
 `--load-rdb <path>` (or the Redis-style `load-rdb <path>` configuration
-directive) imports one complete Redis RDB after Keylane storage recovery and
-before network listeners open. The target Keylane dataset must be empty. This
+directive) imports one complete Redis RDB after Lavik storage recovery and
+before network listeners open. The target Lavik dataset must be empty. This
 is a one-shot migration option: remove it after the first successful startup,
-because a later restart recovers the imported Keylane records and therefore no
+because a later restart recovers the imported Lavik records and therefore no
 longer has an empty target.
 
 `--load-rdb-replace` explicitly discards the contents of every configured
 `--data-file` before importing. Its configuration-file equivalent is
 `load-rdb-replace yes`. Replacement first validates the complete RDB and all
-storage paths; only then does it erase Keylane's fixed storage metadata and
+storage paths; only then does it erase Lavik's fixed storage metadata and
 assign a new storage-set identity. Old data blocks are made unreachable, not
 securely overwritten. The reset is destructive and cannot be atomic across
 multiple devices, so retain the source RDB until startup succeeds and remove
@@ -83,7 +83,7 @@ historical object encodings supported by `RESTORE`, logical databases 0 through
 validates the file checksum before writing any keys and performs a complete
 object-validation pass before the import pass. Self-describing Redis Function
 libraries, Module 2 values, and Module auxiliary records are skipped with a
-warning because Keylane cannot represent them. Pre-release Module/Function
+warning because Lavik cannot represent them. Pre-release Module/Function
 formats, databases above 15, malformed records, and unknown object types whose
 boundaries cannot be determined safely are rejected. Expired keys are
 validated but not inserted.
@@ -91,9 +91,9 @@ validated but not inserted.
 ## Redis PSYNC follower
 
 `--redis-replicaof <host> <port>` (or `redis-replicaof <host> <port>` in the
-configuration file) explicitly starts Keylane as a read-only Redis follower.
+configuration file) explicitly starts Lavik as a read-only Redis follower.
 Runtime `REPLICAOF <host> <port>` and the ordinary `replicaof` configuration
-directive automatically distinguish Keylane from Redis: Keylane first attempts
+directive automatically distinguish Lavik from Redis: Lavik first attempts
 `KLPSYNC`, and falls back to Redis only when the peer explicitly returns an
 unknown-command error for `KLPSYNC`. Authentication, network, and other
 protocol errors are never treated as protocol detection failures.
@@ -102,17 +102,17 @@ Redis mode imports a length-delimited FULLRESYNC RDB and then applies the RESP
 replication stream directly to storage. `SELECT`, keepalive `PING`, `REPLCONF
 GETACK`, and `MULTI`/`EXEC` streams are handled explicitly. Transient reconnects
 retain the Redis replication id and byte offset in memory and request partial
-resynchronization. These cursors are not recovered after a Keylane process
+resynchronization. These cursors are not recovered after a Lavik process
 restart because storage writes and offsets do not yet share a crash-atomic
 commit record; restart therefore requests a new FULLRESYNC.
 
-When the endpoint is a slot-owning Redis Cluster master, Keylane reads
+When the endpoint is a slot-owning Redis Cluster master, Lavik reads
 `CLUSTER NODES` and freezes the complete 0-16383 slot layout.
 `ADDREPLICAOF <host> <port>` registers each remaining master. Every addition
 must report the same layout and a slot set disjoint from all registered
 sources; overlap is rejected before starting a session or mutating storage.
-Keylane remains `LOADING` until every advertised slot-owning master is
-registered and synchronized. Each master sees the same Keylane listening port
+Lavik remains `LOADING` until every advertised slot-owning master is
+registered and synchronized. Each master sees the same Lavik listening port
 as a downstream replica because every PSYNC connection sends `REPLCONF
 listening-port`.
 
@@ -130,20 +130,20 @@ partial-resync retry. A required FULLRESYNC makes the node `LOADING` while that
 source's slots are rebuilt. A background topology check accepts failover when
 a new master owns exactly the same slot set, switches the endpoint, and tries
 PSYNC. Two consecutive observations of migrating/importing, overlapping,
-incomplete, or changed slot ownership stop all Redis sources and leave Keylane
+incomplete, or changed slot ownership stop all Redis sources and leave Lavik
 in `LOADING`; re-run `REPLICAOF` and the required `ADDREPLICAOF` commands after
 the cluster reaches a new stable layout. Online resharding is intentionally not
 merged.
 
-While attached to Redis, Keylane does not accept downstream Keylane
+While attached to Redis, Lavik does not accept downstream Lavik
 replication sessions. `REPLICAOF NO ONE` disconnects all sources, retains a
 complete dataset, enables expiration authority and local writes, and makes the
-node an independent Keylane source. A later `REPLICAOF <host> <port>` may
-follow either Keylane or Redis through the same safe detection. The command is
+node an independent Lavik source. A later `REPLICAOF <host> <port>` may
+follow either Lavik or Redis through the same safe detection. The command is
 local role control and is never sent to the remote server. Runtime additions
 and Redis cursors are not persisted, so orchestration must replay additions
 after restart. RDB Module and Function records are skipped with a warning;
-incremental commands Keylane cannot replay stop the session instead of
+incremental commands Lavik cannot replay stop the session instead of
 silently diverging.
 
 Redis 7.2's wire formatting is part of the compatibility target. Sorted Set

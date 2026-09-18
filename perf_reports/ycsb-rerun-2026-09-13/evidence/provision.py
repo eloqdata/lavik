@@ -71,7 +71,7 @@ def main():
     assert [p['uuid'].lower() for p in old['partitions']] == [
         '33f27d15-2ead-4a86-94b0-f858d315334f',
         '6ae73491-1ed8-4633-8cc6-03063e710483']
-    assert sp.run(['pgrep', '-x', 'keylane'], capture_output=True).returncode == 1
+    assert sp.run(['pgrep', '-x', 'lavik'], capture_output=True).returncode == 1
     previous = json.loads((ROOT / 'preserved-aerospike.json').read_text())
     pid = previous['pid']
     assert Path(f'/proc/{pid}/exe').resolve() == Path('/usr/bin/asd')
@@ -88,7 +88,7 @@ def main():
     run(['sgdisk', '--backup=' + str(ROOT / 'gpt-before.bin'), MD])
     (ROOT / 'gpt-before.txt').write_text(run(['sfdisk', '--dump', MD]))
     # Align both starts and sizes to the LCM of a full 3 MiB RAID stripe and
-    # an 8 MiB Keylane block. Both products receive the same fresh capacity.
+    # an 8 MiB Lavik block. Both products receive the same fresh capacity.
     alignment = 24 * 2**20 // 512
     size = (2**40 // 512 // alignment) * alignment
     end = max(p['start'] + p['size'] for p in old['partitions'])
@@ -98,7 +98,7 @@ def main():
          f'--new=3:{start}:{start + size - 1}', '--typecode=3:8300',
          '--change-name=3:aerospike-ycsb-default-20260916',
          f'--new=4:{start + size}:{start + 2 * size - 1}', '--typecode=4:8300',
-         '--change-name=4:keylane-ycsb-tuned-20260916', MD])
+         '--change-name=4:lavik-ycsb-tuned-20260916', MD])
     run(['partprobe', MD])
     run(['udevadm', 'settle'])
     new = json.loads(run(['sfdisk', '--json', MD]))['partitiontable']

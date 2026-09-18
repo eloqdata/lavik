@@ -364,16 +364,15 @@ proc run_external_server_test {code overrides} {
     }
 
     r flushall
-    # Keylane does not implement Redis Functions yet. This is test isolation
-    # housekeeping rather than part of the data-structure tests, so tolerate
-    # an unknown-command response when exercising an external Keylane server.
+    # Clear Functions for test isolation when the external server supports
+    # them; tolerate older server builds that lack this housekeeping command.
     catch {r function flush}
 
     # store overrides
     set saved_config {}
     foreach {param val} $overrides {
         # Upstream uses start_server overrides to select internal encodings and
-        # persistence modes. An external Keylane process cannot be restarted
+        # persistence modes. An external Lavik process cannot be restarted
         # with those Valkey-only settings, so ignore unsupported overrides.
         if {[catch {set current [r config get $param]}] ||
             [llength $current] < 2 ||

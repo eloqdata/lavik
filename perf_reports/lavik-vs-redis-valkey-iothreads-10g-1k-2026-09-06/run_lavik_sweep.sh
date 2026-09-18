@@ -22,9 +22,9 @@ set -euo pipefail
 
 readonly CLIENT_HOST=172.16.0.5
 readonly SERVER_HOST=172.16.0.4
-readonly BINARY=/mnt/dev/keylane/bld-iouring-peer-1t/keylane
+readonly BINARY=/mnt/dev/lavik/bld-iouring-peer-1t/lavik
 readonly REDIS_CLI=/mnt/dev/peer-bench/redis/v8.8.0/src/src/redis-cli
-readonly RESULT_ROOT=/mnt/dev/peer-bench/results-2026-09-06/redis-valkey-iothreads-10g-1k/keylane
+readonly RESULT_ROOT=/mnt/dev/peer-bench/results-2026-09-06/redis-valkey-iothreads-10g-1k/lavik
 readonly CLIENT_THREADS=16
 readonly KEY_MIN=1
 readonly KEY_MAX=10000000
@@ -85,7 +85,7 @@ run_memtier() {
   uname -a
   lscpu
   free -h
-  git -C /mnt/dev/keylane show -s --format='%H %ci %s' 29dc8e6
+  git -C /mnt/dev/lavik show -s --format='%H %ci %s' 29dc8e6
   "${BINARY}" --version
   sha256sum "${BINARY}"
   printf 'client=%s\nkeys=%s\nvalue_bytes=1024\nclient_threads=%s\n' \
@@ -95,7 +95,7 @@ run_memtier() {
   printf 'devices=%s\n' "${DEVICES[*]}"
 } >"${RESULT_ROOT}/INFO.txt"
 
-echo "[$(date -u +%T)] keylane: starting fresh six-device raw io_uring store"
+echo "[$(date -u +%T)] lavik: starting fresh six-device raw io_uring store"
 sudo -n taskset -c 0-15 "${BINARY}" \
   --bind="${SERVER_HOST}" --port=6379 --metrics-port=9100 \
   --threads=16 --pin-workers --maxclients=10000 \
@@ -125,7 +125,7 @@ for _ in $(seq 1 600); do
 done
 "${REDIS_CLI}" -h "${SERVER_HOST}" -p 6379 ping | grep -q PONG
 
-echo "[$(date -u +%T)] keylane: creating 10M-key baseline"
+echo "[$(date -u +%T)] lavik: creating 10M-key baseline"
 ssh -o BatchMode=yes "${CLIENT_HOST}" \
   "ulimit -n 65535; exec taskset -c 0-15 memtier_benchmark \
     --server=${SERVER_HOST} --port=6379 --protocol=redis \
@@ -139,7 +139,7 @@ ssh -o BatchMode=yes "${CLIENT_HOST}" \
 
 dbsize=$("${REDIS_CLI}" -h "${SERVER_HOST}" -p 6379 dbsize)
 [[ "${dbsize}" == "${KEY_COUNT}" ]] || {
-  echo "unexpected Keylane DB size: ${dbsize}" >&2
+  echo "unexpected Lavik DB size: ${dbsize}" >&2
   exit 1
 }
 ssh -o BatchMode=yes "${CLIENT_HOST}" \
@@ -153,7 +153,7 @@ ssh -o BatchMode=yes "${CLIENT_HOST}" \
 
 for workload in GET SET; do
   for connection_count in "${CONNECTIONS[@]}"; do
-    echo "[$(date -u +%T)] keylane: ${workload} c=${connection_count}"
+    echo "[$(date -u +%T)] lavik: ${workload} c=${connection_count}"
     run_memtier \
       "${RESULT_ROOT}/${workload,,}-c${connection_count}.txt" \
       "${workload}" "${connection_count}"
@@ -171,4 +171,4 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 trap - EXIT
-echo "[$(date -u +%T)] keylane: sweep complete; service stopped"
+echo "[$(date -u +%T)] lavik: sweep complete; service stopped"

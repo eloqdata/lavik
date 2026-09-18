@@ -145,7 +145,7 @@ Bind the six dedicated namespaces to `vfio-pci` and start Lavik with all
 of this read measurement.
 
 ```bash
-taskset -c 0-15 /mnt/dev/keylane-spdk-main \
+taskset -c 0-15 /mnt/dev/lavik-spdk-main \
   --bind=172.16.0.4 --port=6379 --metrics-port=9100 \
   --threads=16 --pin-workers --busy-poll-us=20 \
   --foreground-budget-us=1000 --background-budget-us=10 \

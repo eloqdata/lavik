@@ -54,11 +54,11 @@ Traceback (most recent call last):
   File "/mnt/dev/ycsb-default-host-rerun-20260916/runner.py", line 403, in <module>
     main()
   File "/mnt/dev/ycsb-default-host-rerun-20260916/runner.py", line 334, in main
-    if mode == 'hreplace': host.apply_keylane()
+    if mode == 'hreplace': host.apply_lavik()
                            ^^^^^^^^^^^^^^^^^^^^
-  File "/mnt/dev/ycsb-default-host-rerun-20260916/host_policy.py", line 120, in apply_keylane
-    assert_keylane()
-  File "/mnt/dev/ycsb-default-host-rerun-20260916/host_policy.py", line 132, in assert_keylane
+  File "/mnt/dev/ycsb-default-host-rerun-20260916/host_policy.py", line 120, in apply_lavik
+    assert_lavik()
+  File "/mnt/dev/ycsb-default-host-rerun-20260916/host_policy.py", line 132, in assert_lavik
     assert value['configured'] == value['effective'] and value['effective'] in ('12', '13', '14', '15')
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 AssertionError

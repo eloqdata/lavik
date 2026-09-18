@@ -56,11 +56,11 @@ but Valkey SET was best with 8 and regressed by 4.7% at 16.
 
 For a broader comparison of disk-backed Redis-compatible systems and their
 different persistence, WAL, and compaction settings, see the
-[detailed persistence and storage-tier report](../keylane-vs-dragonfly-tiering-2026-08-11/README.md).
+[detailed persistence and storage-tier report](../lavik-vs-dragonfly-tiering-2026-08-11/README.md).
 
 ## The gap between Lavik and tuned in-memory systems
 
-![Lavik, Redis, and Valkey QPS by connection count](best-memory-vs-keylane-qps.png)
+![Lavik, Redis, and Valkey QPS by connection count](best-memory-vs-lavik-qps.png)
 
 The in-memory configuration is selected per command from the measured sweep:
 Redis uses 16 I/O threads for GET and SET; Valkey uses 16 for GET and 8 for SET.
@@ -197,7 +197,7 @@ must be selected for the workload.
 ## Methodology
 
 - Lavik used commit
-  [`29dc8e6`](https://github.com/thweetkomputer/keylane/commit/29dc8e6b87c40196dc397759690252944f1196f0),
+  [`29dc8e6`](https://github.com/thweetkomputer/lavik/commit/29dc8e6b87c40196dc397759690252944f1196f0),
   a Clang 18 Release build with `-march=native`, 16 workers, an io_uring backend
   on six independent raw NVMe devices, and defragmentation paused. The binary's
   SHA-256 was
@@ -223,12 +223,17 @@ must be selected for the workload.
   Storage Tier on the same RAID0/XFS volume. Dragonfly received an additional
   180-second random-GET warmup before formal GET testing.
 - Reproduction entry points are [`run_memory_sweep.sh`](run_memory_sweep.sh)
-  and [`run_keylane_sweep.sh`](run_keylane_sweep.sh). Normalization and chart
+  and [`run_lavik_sweep.sh`](run_lavik_sweep.sh). Normalization and chart
   generation are implemented by [`build_assets.py`](build_assets.py). The 110
   in-memory points are in [`results.csv`](results.csv); the 36 storage-tier
   points are in [`storage-results.csv`](storage-results.csv). Raw-input hashes
   are recorded in [`raw-SHA256SUMS`](raw-SHA256SUMS) and
   [`storage-raw-SHA256SUMS`](storage-raw-SHA256SUMS).
+
+Product labels and paths use the current Lavik name throughout the report,
+scripts, CSVs, and checksum manifests. External raw inputs are not bundled;
+their recorded hashes are unchanged. Reproduction requires placing those
+inputs at the normalized paths used by `build_assets.py`.
 
 ## Limitations, anomalies, and robustness checks
 

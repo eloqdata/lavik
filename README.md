@@ -248,7 +248,7 @@ English and Simplified Chinese.
 
 ### Disk-backed KV systems
 
-Our [Redis-compatible storage-tier benchmark](perf_reports/keylane-vs-dragonfly-tiering-2026-08-11/README.md)
+Our [Redis-compatible storage-tier benchmark](perf_reports/lavik-vs-dragonfly-tiering-2026-08-11/README.md)
 compares Lavik with Garnet, Dragonfly, Pika, Apache Kvrocks,
 Tendis, and KeyDB On Flash. Server and client ran on separate Azure
 `Standard_L16s_v3` VMs. Each backend used two NVMe drives and **200 million
@@ -275,7 +275,7 @@ Across these read, write, and mixed workloads, **Lavik SPDK delivered
 throughput was **1.65× Dragonfly's and 1.51× Garnet's**; write throughput was
 **1.97× and 1.08×**, respectively.
 
-The separate [1 TB storage-tier test](perf_reports/keylane-vs-redis-valkey-iothreads-10g-1k-2026-09-06/README.md#1-tb-storage-tier-lavik-leads-dragonfly-and-garnet)
+The separate [1 TB storage-tier test](perf_reports/lavik-vs-redis-valkey-iothreads-10g-1k-2026-09-06/README.md#1-tb-storage-tier-lavik-leads-dragonfly-and-garnet)
 used **one billion 1 KiB values** on an AMD EPYC 9V74 server with six NVMe
 drives. Lavik raw io_uring peaked at **784,179 GET QPS**, or **2.07× Dragonfly's
 and 2.36× Garnet's peak read throughput**. Its **856,523 SET QPS** was
@@ -295,14 +295,14 @@ covering workloads A/B/C/D and their tail latencies.
 
 ### In-memory Redis and Valkey
 
-The [Redis/Valkey comparison](perf_reports/keylane-vs-redis-valkey-iothreads-10g-1k-2026-09-06/README.md)
+The [Redis/Valkey comparison](perf_reports/lavik-vs-redis-valkey-iothreads-10g-1k-2026-09-06/README.md)
 used an AMD EPYC 9V74 server with 125 GiB RAM and **10 million keys with 1 KiB
 values** (about 10 GB). Lavik used io_uring on six raw NVMe devices; Redis
 8.8.0 and Valkey 9.1.0 held the complete dataset in memory. Tests swept
 80–1,280 connections with pipeline=1 and 30-second measurement windows,
 selecting each in-memory system's best measured I/O-thread setting per command.
 
-![Lavik versus tuned in-memory Redis and Valkey across connection counts](perf_reports/keylane-vs-redis-valkey-iothreads-10g-1k-2026-09-06/best-memory-vs-keylane-qps.svg)
+![Lavik versus tuned in-memory Redis and Valkey across connection counts](perf_reports/lavik-vs-redis-valkey-iothreads-10g-1k-2026-09-06/best-memory-vs-lavik-qps.svg)
 
 | System | Peak GET QPS | GET p99 | Peak SET QPS | SET p99 |
 |---|---:|---:|---:|---:|

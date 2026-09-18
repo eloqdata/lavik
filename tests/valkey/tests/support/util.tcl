@@ -1078,7 +1078,7 @@ proc prepare_value {size} {
 proc memory_usage {key} {
     if {$::external} {
         # This helper is used only to cover Valkey's objectComputeSize paths.
-        # Keylane has different storage accounting and no MEMORY command.
+        # Lavik has different storage accounting and no MEMORY command.
         return 1
     }
     set usage [r memory usage $key]

@@ -216,12 +216,12 @@ redis-cli -h 10.0.0.4 -p 6379 DEFRAG STATUS
 
 ```bash
 sudo systemd-run \
-  --unit=keylane-spdk.service \
+  --unit=lavik-spdk.service \
   --collect \
   --property=AllowedCPUs=0-15 \
   --property=LimitMEMLOCK=infinity \
   --property=LimitNOFILE=infinity \
-  /path/to/bld-spdk/keylane \
+  /path/to/bld-spdk/lavik \
   --bind=10.0.0.4 \
   --data-file=spdk://69f9:00:00.0/1 \
   --data-file=spdk://021d:00:00.0/1
@@ -235,8 +235,8 @@ sudo systemd-run \
 cmake -S . -B bld-iouring-files -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=OFF \
-  -DKEYLANE_ENABLE_OPT=ON \
-  -DKEYLANE_WITH_SPDK=OFF
+  -DLAVIK_ENABLE_OPT=ON \
+  -DLAVIK_WITH_SPDK=OFF
 cmake --build bld-iouring-files -j 16
 ```
 
@@ -247,31 +247,31 @@ cmake --build bld-iouring-files -j 16
 ```bash
 sudo wipefs -a /dev/nvme0n1
 sudo wipefs -a /dev/nvme1n1
-sudo mkfs.xfs -f -L keylane0 /dev/nvme0n1
-sudo mkfs.xfs -f -L keylane1 /dev/nvme1n1
+sudo mkfs.xfs -f -L lavik0 /dev/nvme0n1
+sudo mkfs.xfs -f -L lavik1 /dev/nvme1n1
 
 sudo mkdir -p /mnt/data0 /mnt/data1
 sudo mount -o noatime /dev/nvme0n1 /mnt/data0
 sudo mount -o noatime /dev/nvme1n1 /mnt/data1
 sudo chown "$(id -un):$(id -gn)" /mnt/data0 /mnt/data1
 
-fallocate -l 1600G /mnt/data0/keylane.data
-fallocate -l 1600G /mnt/data1/keylane.data
+fallocate -l 1600G /mnt/data0/lavik.data
+fallocate -l 1600G /mnt/data1/lavik.data
 ```
 
 `1,600 GiB` 是本机实验值，不是 Lavik 固定要求。部署时应按实际磁盘容量预留文件系统日志和运维空间；每个新文件必须是 8 MiB 的整数倍。Lavik 不会在启动时创建、扩展或 truncate 文件。
 
 ```bash
 sudo systemd-run \
-  --unit=keylane-iouring-files.service \
+  --unit=lavik-iouring-files.service \
   --collect \
   --property=AllowedCPUs=0-15 \
   --property=LimitMEMLOCK=infinity \
   --property=LimitNOFILE=infinity \
-  /path/to/bld-iouring-files/keylane \
+  /path/to/bld-iouring-files/lavik \
   --bind=10.0.0.4 \
-  --data-file=/mnt/data0/keylane.data \
-  --data-file=/mnt/data1/keylane.data
+  --data-file=/mnt/data0/lavik.data \
+  --data-file=/mnt/data1/lavik.data
 ```
 
 本次启动日志确认每个文件容量为 1,717,986,918,400 bytes、各有 204,799 个 data blocks，两个设备分别分配 8 个 home workers，direct-I/O alignment 为 4,096 bytes。
@@ -281,7 +281,7 @@ sudo systemd-run \
 raw 版本需要卸载文件系统并独占设备。以下操作会使原文件系统和 Lavik 文件数据不可访问；`wipefs` 加前 8 MiB zeroout 用于建立新的 Lavik metadata/bitmap，不是全盘安全擦除，旧数据块可能仍物理存在但不会进入新存储集。
 
 ```bash
-sudo systemctl kill -s SIGINT keylane-iouring-files.service
+sudo systemctl kill -s SIGINT lavik-iouring-files.service
 sudo umount /mnt/data0
 sudo umount /mnt/data1
 
@@ -293,12 +293,12 @@ sudo blkdiscard --zeroout --force \
   --offset 0 --length 8388608 /dev/nvme1n1
 
 sudo systemd-run \
-  --unit=keylane-iouring-block.service \
+  --unit=lavik-iouring-block.service \
   --collect \
   --property=AllowedCPUs=0-15 \
   --property=LimitMEMLOCK=infinity \
   --property=LimitNOFILE=infinity \
-  /path/to/bld-iouring-files/keylane \
+  /path/to/bld-iouring-files/lavik \
   --bind=10.0.0.4 \
   --data-file=/dev/nvme0n1 \
   --data-file=/dev/nvme1n1

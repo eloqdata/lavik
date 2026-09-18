@@ -33,7 +33,7 @@ import time
 ROOT = Path(__file__).resolve().parent
 CLIENT = "172.16.0.5"
 SERVER = "172.16.0.4"
-KEYLANE = "/mnt/dev/keylane/build/keylane"
+LAVIK = "/mnt/dev/lavik/build/lavik"
 AERO = "/usr/bin/asd"
 COUNTS = {"warmup": 1_000_000, "measured": 5_000_000}
 WORKLOADS = {"A": (0.5, 0.5, 0), "B": (0.95, 0.05, 0), "C": (1, 0, 0), "D": (0.95, 0, 0.05)}
@@ -90,16 +90,16 @@ def ready(mode):
 
 
 def switch(mode):
-    binary = AERO if mode == "aerospike" else KEYLANE
-    stop(KEYLANE if mode == "aerospike" else AERO)
+    binary = AERO if mode == "aerospike" else LAVIK
+    stop(LAVIK if mode == "aerospike" else AERO)
     if not matching_pids(binary):
         if mode == "aerospike":
             command = [AERO, "--config-file", "/mnt/dev/aerospike-md0.conf", "--foreground"]
         else:
-            command = ["taskset", "-c", "0-15", KEYLANE, "--bind", SERVER,
+            command = ["taskset", "-c", "0-15", LAVIK, "--bind", SERVER,
                        "--port", "16379", "--metrics-port", "19100", "--threads", "16",
                        "--pin-workers", "--shutdown-checkpoint", "--log-dir",
-                       "/mnt/dev/keylane-md0-keylane", "--data-file", "/dev/md0p1"]
+                       "/mnt/dev/lavik-md0-lavik", "--data-file", "/dev/md0p1"]
         with (ROOT / f"{mode}-server.stdout").open("a") as output:
             subprocess.Popen(["sudo", "-n", "bash", "-c",
                               "ulimit -n 20000; exec " + shlex.join(command)],
@@ -216,7 +216,7 @@ def run(mode, workload, workers, phase, *, target=0, measurement_interval="op", 
     else:
         props.update({"redis.host": SERVER, "redis.port": 16379, "redis.scanindex": "none",
                       "redis.timeout": 10000, "redis.cluster": "false",
-                      "redis.updatecommand": "keylane.hreplace" if mode == "hreplace" else "hmset"})
+                      "redis.updatecommand": "lavik.hreplace" if mode == "hreplace" else "hmset"})
     args = [dist + "/bin/ycsb", "run", binding, "-s", "-threads", str(workers),
             "-P", dist + "/workloads/workloada"]
     if target:

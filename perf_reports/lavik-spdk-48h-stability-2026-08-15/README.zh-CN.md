@@ -176,21 +176,21 @@ Prometheus 位于 client，保留 30 天数据，每 5 秒抓取一次 Lavik met
 
 ```promql
 # GET + SET QPS
-sum(rate(keylane_command_calls_total{command=~"get|set"}[5m]))
+sum(rate(lavik_command_calls_total{command=~"get|set"}[5m]))
 
 # p99.9 / p99.99，分别把 P 替换为 0.999 和 0.9999
 histogram_quantile(
   P,
   sum by (le) (
-    rate(keylane_command_duration_seconds_bucket{command=~"get|set"}[5m])
+    rate(lavik_command_duration_seconds_bucket{command=~"get|set"}[5m])
   )
 )
 
 # 两块设备合计已占用容量
-sum(keylane_storage_capacity_bytes - keylane_storage_available_bytes)
+sum(lavik_storage_capacity_bytes - lavik_storage_available_bytes)
 
 # 成功 defrag block 速率
-sum(rate(keylane_storage_defrag_runs_total{result="success"}[5m]))
+sum(rate(lavik_storage_defrag_runs_total{result="success"}[5m]))
 ```
 
 严格 48 小时窗口为 `2026-08-13 07:06:30` 至 `2026-08-15 07:06:30 UTC`。

@@ -65,7 +65,7 @@ D 不读取本轮新增记录，因此属于 D-Uniform。两库起始规模相�
 | 项目 | Aerospike | Lavik |
 |---|---|---|
 | 进程可用 CPU | 0–15，16 逻辑 CPU / 8 物理核；无额外 CPU 亲和性参数 | 0–11，12 逻辑 CPU / 6 物理核；12 个固定 worker |
-| systemd 放置 | 默认 `system.slice`，不设置 AllowedCPUs/CPUAffinity | 独立 `keylane-bench.slice`，AllowedCPUs/CPUAffinity=0–11 |
+| systemd 放置 | 默认 `system.slice`，不设置 AllowedCPUs/CPUAffinity | 独立 `lavik-bench.slice`，AllowedCPUs/CPUAffinity=0–11 |
 | 系统任务 | `system.slice`、`user.slice`、`init.scope` 无额外 CPU 限制 | 上述任务限制到 CPU 12–15 |
 | unbound workqueue | 原始 `ffff`，CPU 0–15 | `f000`，CPU 12–15 |
 | 测试网卡 IRQ | 驱动原始分布：16 个 completion IRQ 对应 CPU 0–15 | 该网卡的 17 个 IRQ 轮转到 CPU 12–15 |
@@ -74,7 +74,7 @@ D 不读取本轮新增记录，因此属于 D-Uniform。两库起始规模相�
 
 Aerospike 的所有线程亲和性、`auto-pin=none` 和原始 IRQ 配置在各阶段前后均通过检查。Lavik 调优只在 Aerospike 全部测完并停止后应用，结束后恢复原始状态。Lavik 各预热及正式阶段前后都检查配置值与实际 IRQ 落点，并通过中断计数差值确认该网卡 IRQ 未在 CPU 0–11 上运行。固定 per-CPU 内核线程与 managed NVMe IRQ 不属于可任意迁移的系统任务。
 
-[原始宿主快照](evidence/host-original.json) · [Lavik 调优凭据](evidence/keylane-policy-applied.json) · [宿主恢复凭据](evidence/host-restored.json) · [新建辅助线程的亲和性恢复](evidence/inherited-affinity-restored.json)
+[原始宿主快照](evidence/host-original.json) · [Lavik 调优凭据](evidence/lavik-policy-applied.json) · [宿主恢复凭据](evidence/host-restored.json) · [新建辅助线程的亲和性恢复](evidence/inherited-affinity-restored.json)
 
 ## 两数据库参数
 
@@ -95,7 +95,7 @@ Aerospike 的所有线程亲和性、`auto-pin=none` 和原始 IRQ 配置在各�
 
 Aerospike 配置只指定必需的 cluster-name、监听/单节点通信、namespace、RF=1 与块设备，未覆盖线程数、auto-pin、缓存、刷盘、索引预算或回收参数。文件描述符上限使用安装包 systemd unit 的 100,000。完整[配置文件](evidence/aerospike.conf)、[实际启动命令](evidence/aerospike-measured-server-command.json)及[生效配置](evidence/aerospike-measured-ready.json)均保留；默认值以本次运行的查询结果为准。
 
-Lavik 沿用原报告相同二进制，GCC 13.3 / Release / O3 / native / LTO，SHA256 `9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266`。[构建凭据](evidence/keylane-build.json)和[启动命令](evidence/hreplace-measured-server-command.json)记录完整参数。100ms 为周期刷盘触发间隔，普通写成功不承诺逐条同步持久化；数据 fdatasync 后再提交块头 fdatasync。主动过期使用该版本默认预算。
+Lavik 沿用原报告相同二进制，GCC 13.3 / Release / O3 / native / LTO，SHA256 `9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266`。[构建凭据](evidence/lavik-build.json)和[启动命令](evidence/hreplace-measured-server-command.json)记录完整参数。100ms 为周期刷盘触发间隔，普通写成功不承诺逐条同步持久化；数据 fdatasync 后再提交块头 fdatasync。主动过期使用该版本默认预算。
 
 ## 压测与指标口径
 
@@ -145,7 +145,11 @@ Lavik 沿用原报告相同二进制，GCC 13.3 / Release / O3 / native / LTO，
 
 ## 原始证据与离线复核
 
-[结果 JSON](results.json) · [操作明细 CSV](summary.csv)（含平均、最大延迟与成功数） · [全部阶段](evidence/phases.json) · [初始测试脚本](evidence/runner.py) · [Lavik 继续执行脚本](evidence/resume_keylane.py) · [文件校验值](SHA256SUMS)
+归档文本和文件名已统一使用 Lavik，包括指标前缀、产品键名和记录中的路径。
+此调整仅规范名称，测量数值和版本标识保持不变；归档脚本哈希及
+`SHA256SUMS` 校验的是本目录中名称规范化后的文件。
+
+[结果 JSON](results.json) · [操作明细 CSV](summary.csv)（含平均、最大延迟与成功数） · [全部阶段](evidence/phases.json) · [初始测试脚本](evidence/runner.py) · [Lavik 继续执行脚本](evidence/resume_lavik.py) · [文件校验值](SHA256SUMS)
 
 Aerospike 测完后，第一次切换因立即检查尚待下一次中断才生效的 IRQ affinity 而停止，宿主已自动恢复；当时尚未启动 Lavik。随后修正切换校验，在装载流量后确认实际 IRQ 落点，并保留了全部已完成的 Aerospike 结果。此故障发生在设置阶段，没有正式窗口被替换。原始脚本、[继续执行凭据](evidence/resume.json)和失败记录均归档。
 

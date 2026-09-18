@@ -561,5 +561,5 @@
     "hreplace": 109699918
   },
   "recordcount_at_start_each": 100000000,
-  "comparison": "Aerospike server defaults and original host policy; Keylane 12 workers with 12+4 host isolation. Fresh equal starting datasets; different CPU allocations and database defaults."
+  "comparison": "Aerospike server defaults and original host policy; Lavik 12 workers with 12+4 host isolation. Fresh equal starting datasets; different CPU allocations and database defaults."
 }

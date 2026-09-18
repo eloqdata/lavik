@@ -391,12 +391,12 @@ redis-cli -h 10.0.0.4 -p 6379 DEFRAG STATUS
 
 ```bash
 sudo systemd-run \
-  --unit=keylane-spdk.service \
+  --unit=lavik-spdk.service \
   --collect \
   --property=AllowedCPUs=0-15 \
   --property=LimitMEMLOCK=infinity \
   --property=LimitNOFILE=infinity \
-  /path/to/bld-spdk/keylane \
+  /path/to/bld-spdk/lavik \
   --bind=10.0.0.4 \
   --data-file=spdk://69f9:00:00.0/1 \
   --data-file=spdk://021d:00:00.0/1
@@ -411,8 +411,8 @@ regular files use the same binary:
 cmake -S . -B bld-iouring-files -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=OFF \
-  -DKEYLANE_ENABLE_OPT=ON \
-  -DKEYLANE_WITH_SPDK=OFF
+  -DLAVIK_ENABLE_OPT=ON \
+  -DLAVIK_WITH_SPDK=OFF
 cmake --build bld-iouring-files -j 16
 ```
 
@@ -425,16 +425,16 @@ system disk.
 ```bash
 sudo wipefs -a /dev/nvme0n1
 sudo wipefs -a /dev/nvme1n1
-sudo mkfs.xfs -f -L keylane0 /dev/nvme0n1
-sudo mkfs.xfs -f -L keylane1 /dev/nvme1n1
+sudo mkfs.xfs -f -L lavik0 /dev/nvme0n1
+sudo mkfs.xfs -f -L lavik1 /dev/nvme1n1
 
 sudo mkdir -p /mnt/data0 /mnt/data1
 sudo mount -o noatime /dev/nvme0n1 /mnt/data0
 sudo mount -o noatime /dev/nvme1n1 /mnt/data1
 sudo chown "$(id -un):$(id -gn)" /mnt/data0 /mnt/data1
 
-fallocate -l 1600G /mnt/data0/keylane.data
-fallocate -l 1600G /mnt/data1/keylane.data
+fallocate -l 1600G /mnt/data0/lavik.data
+fallocate -l 1600G /mnt/data1/lavik.data
 ```
 
 `1,600 GiB` was specific to this machine, not a fixed Lavik requirement.
@@ -444,15 +444,15 @@ truncate these files at startup.
 
 ```bash
 sudo systemd-run \
-  --unit=keylane-iouring-files.service \
+  --unit=lavik-iouring-files.service \
   --collect \
   --property=AllowedCPUs=0-15 \
   --property=LimitMEMLOCK=infinity \
   --property=LimitNOFILE=infinity \
-  /path/to/bld-iouring-files/keylane \
+  /path/to/bld-iouring-files/lavik \
   --bind=10.0.0.4 \
-  --data-file=/mnt/data0/keylane.data \
-  --data-file=/mnt/data1/keylane.data
+  --data-file=/mnt/data0/lavik.data \
+  --data-file=/mnt/data1/lavik.data
 ```
 
 The logs confirmed 1,717,986,918,400 bytes and 204,799 data blocks per file,
@@ -467,7 +467,7 @@ metadata and bitmap state; it is not a secure full-device erase, so old data
 blocks may remain physically present but are excluded from the new storage set.
 
 ```bash
-sudo systemctl kill -s SIGINT keylane-iouring-files.service
+sudo systemctl kill -s SIGINT lavik-iouring-files.service
 sudo umount /mnt/data0
 sudo umount /mnt/data1
 
@@ -479,12 +479,12 @@ sudo blkdiscard --zeroout --force \
   --offset 0 --length 8388608 /dev/nvme1n1
 
 sudo systemd-run \
-  --unit=keylane-iouring-block.service \
+  --unit=lavik-iouring-block.service \
   --collect \
   --property=AllowedCPUs=0-15 \
   --property=LimitMEMLOCK=infinity \
   --property=LimitNOFILE=infinity \
-  /path/to/bld-iouring-files/keylane \
+  /path/to/bld-iouring-files/lavik \
   --bind=10.0.0.4 \
   --data-file=/dev/nvme0n1 \
   --data-file=/dev/nvme1n1

@@ -32,8 +32,7 @@ with (ROOT / 'summary.csv').open(newline='') as stream:
 assert csv_rows == [{name: str(value) for name, value in row.items()} for row in actual['rows']]
 # Preserve the archived Chinese table renderer. Translate only its labels
 # so both published reports must contain the same verified measurements.
-# Published labels use Lavik; archived evidence retains the measured identifiers.
-chinese_table = verify_results.markdown(actual).replace('Keylane', 'Lavik')
+chinese_table = verify_results.markdown(actual)
 english_table = chinese_table
 for source, translated in (
     ('不限速', 'Unlimited'),

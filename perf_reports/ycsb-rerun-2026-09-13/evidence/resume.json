@@ -5,7 +5,7 @@
   "failed_transition": "setup-attempts/2-deferred-irq-migration",
   "reason": "effective IRQ affinity is deferred until the next interrupt; validate completion queues under traffic",
   "script_sha256": {
-    "resume_keylane.py": "01ea8a95d89b310b557d1033274a0814bf30b92039aa8779a99d5c58a0b3df88",
-    "host_policy_v2.py": "49707a764059afd709b7050506709931c349247748cbd67fe341c9ec9858b2a0"
+    "resume_lavik.py": "9731a558d8549d4f97fea8f44593c9faddf09fb7b597e9d4e8883183bac66519",
+    "host_policy_v2.py": "f2007f461bb4da01b83ec829252c0f5230df902bf006dfa8d00a6b788a8e3e28"
   }
 }

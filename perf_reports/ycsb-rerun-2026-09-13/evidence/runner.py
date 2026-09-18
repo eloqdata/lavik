@@ -39,11 +39,11 @@ import host_policy as host
 import ycsb_client as bench
 
 ROOT = Path(__file__).resolve().parent
-KEYLANE = '/mnt/dev/keylane-main-f666837.siARSe/keylane'
-KEYLANE_SHA = '9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266'
+LAVIK = '/mnt/dev/lavik-main-f666837.siARSe/lavik'
+LAVIK_SHA = '9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266'
 AERO_SHA = '6e1b2bd6deebd5816f4f369ac1db4151217ed0be3b66578bdd6f15c24e6af8d0'
 UNITS = {'aerospike': 'aerospike-ycsb-default-20260916.service',
-         'hreplace': 'keylane-ycsb-tuned-20260916.service'}
+         'hreplace': 'lavik-ycsb-tuned-20260916.service'}
 COUNT = 100_000_000
 LABEL = 'fresh100m-20260916'
 D_STARTS = {(100000, 'warmup'): 2_000_000_000,
@@ -118,7 +118,7 @@ def no_client():
 def process(mode):
     pid = int(run(['systemctl', 'show', UNITS[mode], '-p', 'MainPID', '--value']))
     assert pid > 1
-    executable = KEYLANE if mode == 'hreplace' else '/usr/bin/asd'
+    executable = LAVIK if mode == 'hreplace' else '/usr/bin/asd'
     assert Path(f'/proc/{pid}/exe').resolve() == Path(executable)
     assert bench.matching_pids(executable) == [pid]
     affinity = sorted(os.sched_getaffinity(pid))
@@ -151,7 +151,7 @@ def metric_values(raw):
 
 
 def state(mode):
-    policy = host.assert_default() if mode == 'aerospike' else host.assert_keylane()
+    policy = host.assert_default() if mode == 'aerospike' else host.assert_lavik()
     result = {'utc': now(), 'monotonic': time.monotonic(), 'host': policy, 'process': process(mode),
               'diskstats': Path('/proc/diskstats').read_text(),
               'interrupts': Path('/proc/interrupts').read_text(),
@@ -180,7 +180,7 @@ def state(mode):
 def start(mode, stage):
     no_client()
     assert not run(['pgrep', '-x', 'asd'], check=False)
-    assert not run(['pgrep', '-x', 'keylane'], check=False)
+    assert not run(['pgrep', '-x', 'lavik'], check=False)
     command = ['systemd-run', '--unit', UNITS[mode], '--collect', '-p', 'TimeoutStopSec=300',
         '-p', 'StandardOutput=append:' + str(ROOT / (mode + '-server.stdout')),
         '-p', 'StandardError=inherit']
@@ -190,14 +190,14 @@ def start(mode, stage):
         # normal system.slice placement and no CPU-affinity override.
         command += ['-p', 'LimitNOFILE=100000', '/usr/bin/asd', '--config-file', str(ROOT / 'aerospike.conf'), '--foreground']
     else:
-        host.assert_keylane()
-        command += ['--slice=keylane-bench.slice', '-p', 'AllowedCPUs=0-11', '-p', 'CPUAffinity=0-11',
-            '-p', 'LimitNOFILE=20000', KEYLANE, '--bind', bench.SERVER, '--port', '16379',
+        host.assert_lavik()
+        command += ['--slice=lavik-bench.slice', '-p', 'AllowedCPUs=0-11', '-p', 'CPUAffinity=0-11',
+            '-p', 'LimitNOFILE=20000', LAVIK, '--bind', bench.SERVER, '--port', '16379',
             '--metrics-port', '19100', '--threads', '12', '--pin-workers', '--shutdown-checkpoint',
             '--data-file', '/dev/md127p4', '--flush-max-ms', '100',
-            '--log-dir', str(ROOT / 'keylane-server-logs')]
+            '--log-dir', str(ROOT / 'lavik-server-logs')]
     save(f'{mode}-{stage}-server-command.json', {'utc': now(), 'argv': command,
-        'binary_sha256': sha(KEYLANE if mode == 'hreplace' else '/usr/bin/asd')})
+        'binary_sha256': sha(LAVIK if mode == 'hreplace' else '/usr/bin/asd')})
     run(command)
     deadline = time.monotonic() + 1500
     while True:
@@ -223,7 +223,7 @@ def stop(mode):
     no_client()
     result = sp.run(['systemctl', 'stop', UNITS[mode]], text=True, capture_output=True, timeout=330)
     assert result.returncode == 0 or 'not loaded' in result.stderr, result.stderr
-    executable = KEYLANE if mode == 'hreplace' else '/usr/bin/asd'
+    executable = LAVIK if mode == 'hreplace' else '/usr/bin/asd'
     deadline = time.monotonic() + 30
     while bench.matching_pids(executable):
         assert time.monotonic() < deadline, f'{mode} did not drain'
@@ -313,11 +313,11 @@ def validate_counts(mode, before, after, parsed):
             assert z[k] == a[k], (k, a[k], z[k])
     else:
         a, z = metric_values(before['metrics']), metric_values(after['metrics'])
-        for op, command in (('READ', 'hgetall'), ('UPDATE', 'keylane.hreplace'), ('INSERT', 'hmset')):
-            key = 'keylane_command_calls_total{command="' + command + '"}'
+        for op, command in (('READ', 'hgetall'), ('UPDATE', 'lavik.hreplace'), ('INSERT', 'hmset')):
+            key = 'lavik_command_calls_total{command="' + command + '"}'
             assert z.get(key, 0) - a.get(key, 0) == operations[op], (key, operations[op])
         for error in ('error', 'resource_exhausted'):
-            key = 'keylane_storage_defrag_runs_total{result="' + error + '"}'
+            key = 'lavik_storage_defrag_runs_total{result="' + error + '"}'
             assert z.get(key, 0) == a.get(key, 0), key
 
 
@@ -327,10 +327,10 @@ def main():
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     assert (ROOT / 'provision-complete.json').exists()
     assert not (ROOT / 'experiment.json').exists(), 'One-shot batch; inspect partial results before resuming'
-    assert sha(KEYLANE) == KEYLANE_SHA and sha('/usr/bin/asd') == AERO_SHA
+    assert sha(LAVIK) == LAVIK_SHA and sha('/usr/bin/asd') == AERO_SHA
     no_client()
-    environment = {'start_utc': now(), 'keylane_commit': 'f666837b0038ab65564a17cb3a0bca8530f8e1be',
-        'keylane_sha256': KEYLANE_SHA, 'aerospike_sha256': AERO_SHA,
+    environment = {'start_utc': now(), 'lavik_commit': 'f666837b0038ab65564a17cb3a0bca8530f8e1be',
+        'lavik_sha256': LAVIK_SHA, 'aerospike_sha256': AERO_SHA,
         'order': ['aerospike', 'hreplace'], 'workload_order': ['C', 'A', 'B', 'D'],
         'rates': [100000, 0], 'threads': 256, 'measurement_seconds': 300,
         'warmup_operations': 1000000, 'fresh_records_each': COUNT,
@@ -345,7 +345,7 @@ def main():
     current_mode = None
     try:
         for mode in environment['order']:
-            if mode == 'hreplace': host.apply_keylane()
+            if mode == 'hreplace': host.apply_lavik()
             else: host.assert_default()
             current_mode = mode
             progress('starting-load', mode=mode, complete=len(results), total=16)
@@ -398,8 +398,8 @@ def main():
         assert final['dbsize'] == aero_count
         assert samples('aerospike', 'final') == json.loads((ROOT / 'aerospike-completed-samples.json').read_text())
         save('complete.json', {'utc': now(), 'complete': 16, 'phases': 32, 'host_restored': True,
-            'aerospike_final_records': aero_count, 'keylane_final_records': results[-1]['after_records'],
-            'aerospike_default_service_running': True, 'keylane_stopped': True})
+            'aerospike_final_records': aero_count, 'lavik_final_records': results[-1]['after_records'],
+            'aerospike_default_service_running': True, 'lavik_stopped': True})
         progress('complete', complete=16, total=16)
     except BaseException:
         save('failure.json', {'utc': now(), 'traceback': traceback.format_exc(), 'mode': current_mode,

@@ -18,7 +18,7 @@ limitations under the License.
 
 ## Goals
 
-Keylane's persistent layout must not require the process to restart with the
+Lavik's persistent layout must not require the process to restart with the
 same worker count. The design keeps the shared-nothing fast path when the
 topology is unchanged without creating one physical append stream per logical
 partition.

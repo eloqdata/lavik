@@ -17,9 +17,9 @@ limitations under the License.
 # Meta control plane operations
 
 Lavik clusters require Lavik binaries and certificates with `lavik://` URI
-SANs on every member. Recreate data and Meta directories from earlier Keylane
-development builds; mixed identifiers and rolling upgrades from those builds
-are unsupported.
+SANs on every member. Recreate data and Meta directories from development
+builds that used obsolete identifiers; mixed identifiers and rolling upgrades
+from those builds are unsupported.
 
 ## Process and storage prerequisites
 

@@ -16,7 +16,7 @@ limitations under the License.
 
 # Historical design references
 
-This directory preserves Keylane design proposals, prior detailed
+This directory preserves Lavik design proposals, prior detailed
 specifications, compatibility and integration research, tradeoffs, and
 architectural evolution. It is intentionally separate from the explanatory
 [`architecture/`](../architecture/README.md) directory and the procedural

@@ -32,7 +32,7 @@ publishes the result for limit enforcement; the periodic path does not read
 Release builds keep mimalloc's generic per-allocation statistics disabled
 (`MI_STAT=0`). With that setting the malloc class counters are intentionally not
 balanced on every allocation and free, so they must not be interpreted as live
-bytes. Keylane's hooks maintain a thread-local usable-byte total and publish it
+bytes. Lavik's hooks maintain a thread-local usable-byte total and publish it
 with a relaxed store to the current worker's private cache line; there is no
 locked read-modify-write in the worker allocation path. Mimalloc's page-level
 committed and reserved counters are sampled only for an explicit metrics or
@@ -60,13 +60,13 @@ overstates typical index growth. Operators should leave headroom between
 
 Prometheus exports:
 
-- `keylane_memory_current_bytes`: cached allocator bytes used for admission.
-- `keylane_memory_used_bytes`: allocator usable bytes.
-- `keylane_memory_rss_bytes`: RSS sampled on the metrics/INFO request.
-- `keylane_memory_committed_bytes`: mimalloc committed pages.
-- `keylane_memory_reserved_bytes`: mimalloc reserved virtual address space.
-- `keylane_memory_max_bytes`: configured budget.
-- `keylane_memory_rejected_commands_total`: commands rejected before execution.
+- `lavik_memory_current_bytes`: cached allocator bytes used for admission.
+- `lavik_memory_used_bytes`: allocator usable bytes.
+- `lavik_memory_rss_bytes`: RSS sampled on the metrics/INFO request.
+- `lavik_memory_committed_bytes`: mimalloc committed pages.
+- `lavik_memory_reserved_bytes`: mimalloc reserved virtual address space.
+- `lavik_memory_max_bytes`: configured budget.
+- `lavik_memory_rejected_commands_total`: commands rejected before execution.
 
 `INFO memory` exposes the same model through `used_memory`, `used_memory_rss`,
 `used_memory_peak`, `maxmemory`, `allocator_active`, `allocator_resident`,

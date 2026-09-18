@@ -31,10 +31,10 @@ IO_THREADS = (1, 2, 4, 8, 16)
 MEMORY_PRODUCTS = {
     "redis": "Redis 8.8.0",
     "valkey": "Valkey 9.1.0",
-    "keylane": "Keylane raw io_uring",
+    "lavik": "Lavik raw io_uring",
 }
 STORAGE_PRODUCTS = {
-    "keylane-raw": "Keylane raw io_uring",
+    "lavik-raw": "Lavik raw io_uring",
     "dragonfly": "Dragonfly v1.40.2",
     "garnet": "Garnet v2.1.5",
 }
@@ -87,8 +87,8 @@ for product in ("redis", "valkey"):
 
 for workload in ("GET", "SET"):
     for connections in MEMORY_CONNECTIONS:
-        path = MEMORY_RAW_ROOT / "keylane" / f"{workload.lower()}-c{connections}.txt"
-        rows.append(parse_log(path, "keylane", 16, "workers", workload, connections))
+        path = MEMORY_RAW_ROOT / "lavik" / f"{workload.lower()}-c{connections}.txt"
+        rows.append(parse_log(path, "lavik", 16, "workers", workload, connections))
         source_files.append(path)
 
 if len(rows) != 110:
@@ -131,7 +131,7 @@ def parse_storage_log(path: Path, product: str, workload: str, connections: int)
     row = totals[0]
     return {
         "product": STORAGE_PRODUCTS[product],
-        "backend": "six raw NVMe" if product == "keylane-raw" else "RAID0/XFS storage tier",
+        "backend": "six raw NVMe" if product == "lavik-raw" else "RAID0/XFS storage tier",
         "workload": workload,
         "connections": connections,
         "qps": float(row[1]),
@@ -182,8 +182,7 @@ with (REPORT_ROOT / "storage-raw-SHA256SUMS").open("w", encoding="utf-8") as out
 
 
 def svg_text(x, y, value, *, size=20, anchor="start", weight=400, fill="#17202A"):
-    # Keep raw-result product keys intact while publishing the current name.
-    label = str(value).replace("Keylane", "Lavik")
+    label = str(value)
     return (
         f'<text x="{x}" y="{y}" font-family="Arial, sans-serif" '
         f'font-size="{size}" font-weight="{weight}" text-anchor="{anchor}" '
@@ -268,7 +267,7 @@ def render_iothread_scaling():
 def render_best_comparison():
     width, height = 1600, 1170
     product_specs = (
-        ("Keylane raw io_uring", "Keylane · 16 workers", 16, "#1473E6", "diag"),
+        ("Lavik raw io_uring", "Lavik · 16 workers", 16, "#1473E6", "diag"),
         ("Redis 8.8.0", "Redis · 16 I/O threads", 16, "#E97827", "dots"),
     )
     # Valkey's measured optimum differs by command, so its selected thread
@@ -287,11 +286,11 @@ def render_best_comparison():
         '<pattern id="dots" width="10" height="10" patternUnits="userSpaceOnUse"><circle cx="3" cy="3" r="1.6" fill="#FFFFFF" opacity="0.55"/></pattern>',
         '<pattern id="cross" width="12" height="12" patternUnits="userSpaceOnUse"><path d="M2,2 L10,10 M10,2 L2,10" stroke="#FFFFFF" stroke-width="1.5" opacity="0.45"/></pattern>',
         '</defs>',
-        svg_text(70, 65, "Keylane versus tuned in-memory Redis and Valkey", size=35, weight=700),
+        svg_text(70, 65, "Lavik versus tuned in-memory Redis and Valkey", size=35, weight=700),
         svg_text(70, 105, "Same 10M-key × 1 KiB workload; each memory system uses its measured best thread count", size=21, fill="#566573"),
     ]
     legends = (
-        ("Keylane · 16 workers", "#1473E6", "diag"),
+        ("Lavik · 16 workers", "#1473E6", "diag"),
         ("Redis · 16 I/O threads", "#E97827", "dots"),
         ("Valkey · GET 16 / SET 8 I/O threads", "#C84C8A", "cross"),
     )
@@ -324,15 +323,15 @@ def render_best_comparison():
                 svg.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width}" height="{bar_height:.2f}" rx="2" fill="url(#{pattern})"/>')
             svg.append(svg_text(center, bottom + 31, f"{connections:,}", size=18, anchor="middle", fill="#34495E"))
         svg.append(svg_text(left + chart_width / 2, bottom + 67, "Concurrent connections", size=18, anchor="middle", weight=700))
-    svg.append(svg_text(70, 1145, "Keylane reads values from six raw NVMe devices; Redis and Valkey keep the complete dataset in DRAM.", size=17, fill="#566573"))
+    svg.append(svg_text(70, 1145, "Lavik reads values from six raw NVMe devices; Redis and Valkey keep the complete dataset in DRAM.", size=17, fill="#566573"))
     svg.append("</svg>")
-    (REPORT_ROOT / "best-memory-vs-keylane-qps.svg").write_text("\n".join(svg) + "\n", encoding="utf-8")
+    (REPORT_ROOT / "best-memory-vs-lavik-qps.svg").write_text("\n".join(svg) + "\n", encoding="utf-8")
 
 
 def render_storage_comparison():
     width, height = 1800, 1170
     product_specs = (
-        ("Keylane raw io_uring", "Keylane · raw NVMe", "#1473E6", "diag"),
+        ("Lavik raw io_uring", "Lavik · raw NVMe", "#1473E6", "diag"),
         ("Dragonfly v1.40.2", "Dragonfly · Tiered Storage", "#E97827", "dots"),
         ("Garnet v2.1.5", "Garnet · Storage Tier", "#C84C8A", "cross"),
     )
@@ -349,7 +348,7 @@ def render_storage_comparison():
         '<pattern id="dots" width="10" height="10" patternUnits="userSpaceOnUse"><circle cx="3" cy="3" r="1.6" fill="#FFFFFF" opacity="0.55"/></pattern>',
         '<pattern id="cross" width="12" height="12" patternUnits="userSpaceOnUse"><path d="M2,2 L10,10 M10,2 L2,10" stroke="#FFFFFF" stroke-width="1.5" opacity="0.45"/></pattern>',
         '</defs>',
-        svg_text(70, 65, "Keylane, Dragonfly, and Garnet storage-tier throughput", size=35, weight=700),
+        svg_text(70, 65, "Lavik, Dragonfly, and Garnet storage-tier throughput", size=35, weight=700),
         svg_text(70, 105, "1B keys × 1 KiB · 60 s/run · 16 memtier threads · pipeline 1", size=21, fill="#566573"),
     ]
     for index, (_, label, color, pattern) in enumerate(product_specs):
@@ -380,7 +379,7 @@ def render_storage_comparison():
                 svg.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width}" height="{bar_height:.2f}" rx="2" fill="url(#{pattern})"/>')
             svg.append(svg_text(center, bottom + 31, f"{connections:,}", size=18, anchor="middle", fill="#34495E"))
         svg.append(svg_text(left + chart_width / 2, bottom + 67, "Concurrent connections", size=18, anchor="middle", weight=700))
-    svg.append(svg_text(70, 1145, "Keylane uses six raw NVMe devices; Dragonfly and Garnet use tier files on the same six-device RAID0/XFS.", size=17, fill="#566573"))
+    svg.append(svg_text(70, 1145, "Lavik uses six raw NVMe devices; Dragonfly and Garnet use tier files on the same six-device RAID0/XFS.", size=17, fill="#566573"))
     svg.append("</svg>")
     (REPORT_ROOT / "storage-tier-comparison-qps.svg").write_text("\n".join(svg) + "\n", encoding="utf-8")
 

@@ -16,7 +16,7 @@ limitations under the License.
 
 # TLS and password authentication
 
-Keylane can expose plaintext and TLS Redis endpoints at the same time. TLS is
+Lavik can expose plaintext and TLS Redis endpoints at the same time. TLS is
 implemented in Celer over the existing io_uring transport with an OpenSSL BIO
 pair; plaintext connections continue to use multishot receive when available,
 while TLS connections use per-connection receive buffers.
@@ -27,9 +27,9 @@ while TLS connections use per-connection receive buffers.
 bind 127.0.0.1 ::1 redis.example.internal
 port 6379
 tls-port 6380
-tls-cert-file /etc/keylane/server.crt
-tls-key-file /etc/keylane/server.key
-tls-ca-cert-file /etc/keylane/ca.crt
+tls-cert-file /etc/lavik/server.crt
+tls-key-file /etc/lavik/server.key
+tls-ca-cert-file /etc/lavik/ca.crt
 tls-auth-clients no
 requirepass client-secret
 ```
@@ -65,7 +65,7 @@ all of them with TLS:
 ```text
 replicaof redis-primary.example.internal 6380
 tls-replication yes
-tls-ca-cert-file /etc/keylane/ca.crt
+tls-ca-cert-file /etc/lavik/ca.crt
 masteruser default
 masterauth source-secret
 ```

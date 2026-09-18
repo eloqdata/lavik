@@ -175,21 +175,21 @@ Prometheus ran on the client with 30-day retention and scraped Lavik metrics eve
 
 ```promql
 # GET + SET QPS
-sum(rate(keylane_command_calls_total{command=~"get|set"}[5m]))
+sum(rate(lavik_command_calls_total{command=~"get|set"}[5m]))
 
 # p99.9 / p99.99: replace P with 0.999 or 0.9999, respectively
 histogram_quantile(
   P,
   sum by (le) (
-    rate(keylane_command_duration_seconds_bucket{command=~"get|set"}[5m])
+    rate(lavik_command_duration_seconds_bucket{command=~"get|set"}[5m])
   )
 )
 
 # Total used capacity across both devices
-sum(keylane_storage_capacity_bytes - keylane_storage_available_bytes)
+sum(lavik_storage_capacity_bytes - lavik_storage_available_bytes)
 
 # Successful defrag blocks per second
-sum(rate(keylane_storage_defrag_runs_total{result="success"}[5m]))
+sum(rate(lavik_storage_defrag_runs_total{result="success"}[5m]))
 ```
 
 The strict 48-hour interval is `2026-08-13 07:06:30` through `2026-08-15 07:06:30 UTC`.

@@ -1,6 +1,6 @@
 # Valkey-derived hash-table code
 
-`include/keylane/storage/scan_hash_map.h` is a modified C++ specialization of
+`include/lavik/storage/scan_hash_map.h` is a modified C++ specialization of
 the hash-table design and scan algorithm in Valkey's `src/hashtable.c`.
 
 - Upstream project: Valkey
@@ -11,5 +11,5 @@ the hash-table design and scan algorithm in Valkey's `src/hashtable.c`.
 The adaptation retains the 64-byte bucket layout, chained overflow buckets,
 two-table incremental expansion, and stateless reverse-bit scan cursor. It
 removes Valkey runtime allocation, random-number, time, configuration, and
-generic callback dependencies; specializes entries for Keylane's digest, key,
+generic callback dependencies; specializes entries for Lavik's digest, key,
 and storage location; and adds full-key collision checks.

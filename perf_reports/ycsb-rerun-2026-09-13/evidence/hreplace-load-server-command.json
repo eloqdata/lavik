@@ -3,7 +3,7 @@
   "argv": [
     "systemd-run",
     "--unit",
-    "keylane-ycsb-tuned-20260916.service",
+    "lavik-ycsb-tuned-20260916.service",
     "--collect",
     "-p",
     "TimeoutStopSec=300",
@@ -11,14 +11,14 @@
     "StandardOutput=append:/mnt/dev/ycsb-default-host-rerun-20260916/hreplace-server.stdout",
     "-p",
     "StandardError=inherit",
-    "--slice=keylane-bench.slice",
+    "--slice=lavik-bench.slice",
     "-p",
     "AllowedCPUs=0-11",
     "-p",
     "CPUAffinity=0-11",
     "-p",
     "LimitNOFILE=20000",
-    "/mnt/dev/keylane-main-f666837.siARSe/keylane",
+    "/mnt/dev/lavik-main-f666837.siARSe/lavik",
     "--bind",
     "172.16.0.4",
     "--port",
@@ -34,7 +34,7 @@
     "--flush-max-ms",
     "100",
     "--log-dir",
-    "/mnt/dev/ycsb-default-host-rerun-20260916/keylane-server-logs"
+    "/mnt/dev/ycsb-default-host-rerun-20260916/lavik-server-logs"
   ],
   "binary_sha256": "9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266"
 }

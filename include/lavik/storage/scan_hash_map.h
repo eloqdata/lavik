@@ -6,14 +6,14 @@
  *
  * Copyright (c) 2024-present, Valkey contributors
  * Copyright (c) 2006-2020, Redis Ltd.
- * Copyright (c) 2026, Keylane contributors
+ * Copyright (c) 2026, Lavik contributors
  *
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * The complete license text is in third_party/valkey/COPYING. This C++
  * specialization retains Valkey's cache-line bucket layout, incremental
  * two-table resizing, and stateless reverse-bit scan algorithm. It replaces
- * Valkey runtime dependencies and generic callbacks with Keylane-owned entries.
+ * Valkey runtime dependencies and generic callbacks with Lavik-owned entries.
  */
 
 #include <mimalloc.h>

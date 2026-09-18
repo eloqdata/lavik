@@ -261,7 +261,7 @@ cleanup as another durable phase.
   use v1 with in-place schema replacement and no compatibility promise for
   earlier development layouts. Incompatible data directories must be recreated.
   Lavik uses its own format signatures, `LAVIK.*` native commands and
-  `lavik://` principal URIs; earlier Keylane development identifiers are not
+  `lavik://` principal URIs; obsolete development identifiers are not
   accepted as aliases. External standards such as Redis RESP/RDB retain their
   own versioning.
 - Replication and full-sync queues use admission/backpressure. They must not

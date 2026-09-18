@@ -16,7 +16,7 @@ limitations under the License.
 
 # Logical Databases and SELECT
 
-Keylane supports the Redis logical database range `0..15`. A new connection
+Lavik supports the Redis logical database range `0..15`. A new connection
 starts in DB 0.
 
 ## Connection state
@@ -56,7 +56,7 @@ changing DB does not alter key distribution. The complete key participates in
 equality, so two distinct keys with the same SHA-1 digest remain separate
 records.
 
-The primary index uses `ScanHashMap`, a Keylane-specific C++ adaptation of
+The primary index uses `ScanHashMap`, a Lavik-specific C++ adaptation of
 Valkey's cache-line bucket hash table. Entries have stable addresses, expansion
 is incremental, and the reverse-bit cursor does not allocate server-side scan
 state.

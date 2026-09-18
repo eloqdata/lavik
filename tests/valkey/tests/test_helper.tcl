@@ -150,13 +150,13 @@ proc r {args} {
     }
 
     # Data-structure suites use CONFIG only to force Valkey's internal object
-    # encodings. Keylane has different storage internals, so retain those
+    # encodings. Lavik has different storage internals, so retain those
     # values in the harness when testing an external server.
     if {$::external && [string equal -nocase [lindex $args 0] config]} {
         set operation [string tolower [lindex $args 1]]
         set parameter [string tolower [lindex $args 2]]
         # Stream trimming semantics depend on this value, so exercise
-        # Keylane's runtime setting instead of merely emulating it here.
+        # Lavik's runtime setting instead of merely emulating it here.
         if {$operation eq "get" && $parameter ne "stream-node-max-entries"} {
             if {![dict exists $::external_config $parameter]} {
                 dict set ::external_config $parameter 0

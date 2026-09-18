@@ -22,7 +22,7 @@ Accepted
 
 Uncontrolled recovery orders live Compatibility Domains by descending Source
 Group Term, then reuses the existing vector selector only among Candidates in
-one exact domain. This maps Redis's topology-recency preference onto Keylane's
+one exact domain. This maps Redis's topology-recency preference onto Lavik's
 already committed Group term without adding a durable history graph or domain
 epoch. Distinct histories created in one term have equal recency and are tried
 in canonical domain-identity order; their LSNs are never compared, and a

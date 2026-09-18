@@ -182,8 +182,8 @@ control_revision，更新确认额外使用 request_id。
 
 ## 验证与审查记录
 
-所有命令使用 NVMe 构建与临时目录：`/mnt/local_nvme/keylane-f2b2`。
-`KEYLANE_TEST_DATA_DIR=/mnt/local_nvme/f2t` 指向同一测试目录；成员恢复的长场景名
+所有命令使用 NVMe 构建与临时目录：`/mnt/local_nvme/lavik-f2b2`。
+`LAVIK_TEST_DATA_DIR=/mnt/local_nvme/f2t` 指向同一测试目录；成员恢复的长场景名
 额外使用显式短目录 `test-data/mr` / `test-data/mr1`，使 Unix socket 路径小于系统上限。
 Debug / Clang 18，kernel bypass 关闭；未运行 ASan、TSan 或性能基准。
 

@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Keylane 双机主从性能测试报告
+# Lavik 双机主从性能测试报告
 
 测试日期：2026-08-18 UTC
 
 ## 1. 测试结论
 
-本次测试在两台独立的 16 vCPU 服务器上部署 Keylane 主从，每台 Keylane
+本次测试在两台独立的 16 vCPU 服务器上部署 Lavik 主从，每台 Lavik
 使用 12 个核心和两块 NVMe，另外 4 个核心用于网络 IRQ/softirq。主从均持有
 400,000,000 条、value 大小随机分布在 1,000-4,000 字节的数据，总数据量约
 1 TB。
@@ -45,8 +45,8 @@ limitations under the License.
 
 ## 2. 版本与构建
 
-- 被测代码：Keylane `main`，测试开始时为 `ec22e4f`。
-- Release/SPDK 二进制：`/mnt/dev/keylane/bld-spdk/keylane`。
+- 被测代码：Lavik `main`，测试开始时为 `ec22e4f`。
+- Release/SPDK 二进制：`/mnt/dev/lavik/bld-spdk/lavik`。
 - 二进制 SHA-256：
   `5592677e5a40acb264ba0ccc3d5167bfaf9739cf6903c6eae4ecaf525662c31a`。
 - 未使用 ASAN。
@@ -55,7 +55,7 @@ limitations under the License.
 
 ## 3. 测试拓扑
 
-| 角色 | 地址 | Keylane CPU | 网络 CPU | 存储 |
+| 角色 | 地址 | Lavik CPU | 网络 CPU | 存储 |
 |---|---|---:|---:|---|
 | 主节点 | `10.0.0.4:6379` | 0-11，12 workers | 12-15 | `43bc:00:00.0/1`、`58bf:00:00.0/1` |
 | 从节点 | `10.0.0.7:6379` | 0-11，12 workers | 12-15 | `3f5e:00:00.0/1`、`489e:00:00.0/1` |
@@ -69,7 +69,7 @@ networking VF，只有 `hv_netvsc`；其 RX queue 的 RPS mask 设置为 `f000`�
 RX softirq 引导到 CPU 12-15。因此两台机器的标称 CPU/存储配置相同，但网络
 路径并不完全相同。
 
-## 4. Keylane 运行参数
+## 4. Lavik 运行参数
 
 主从公共关键参数：
 
@@ -168,7 +168,7 @@ shard 的主从分配读请求：
 | 1:1 SET:GET | 99,986.19 | 0.269 ms | 0.255 ms | 0.543 ms | 1.319 ms | 2.303 ms |
 | 100% SET | 99,999.76 | 0.289 ms | 0.271 ms | 0.663 ms | 1.671 ms | 3.503 ms |
 
-### 7.3 Keylane CPU
+### 7.3 Lavik CPU
 
 100% 表示一个逻辑 CPU：
 
@@ -198,7 +198,7 @@ shard 的主从分配读请求：
 | 1:1 SET:GET | 49,919.15 | 0.262 ms | 0.247 ms | 0.527 ms | 0.863 ms | 1.711 ms |
 | 100% SET | 49,920.41 | 0.263 ms | 0.247 ms | 0.575 ms | 1.167 ms | 2.415 ms |
 
-### 8.3 Keylane CPU
+### 8.3 Lavik CPU
 
 | 主节点 workload | 主节点 CPU | 从节点 CPU |
 |---|---:|---:|
@@ -235,7 +235,7 @@ shard 的主从分配读请求：
 - 两档负载共 12 个正式 memtier 进程，错误响应均为 0。
 - GET miss 为 0。
 - MOVED 和 ASK 均为 0。
-- 测试期间没有新增 Keylane warning 或 error 日志。
+- 测试期间没有新增 Lavik warning 或 error 日志。
 - 复制始终为一个 control connection 加 12 个 data-flow connections。
 - 最终 `INFO replication`：从节点 online，`lag=0`。
 - 最终主从 `DBSIZE`：400,000,000 / 400,000,000。
@@ -264,24 +264,24 @@ shard 的主从分配读请求：
 memtier 日志位于客户端 `10.0.0.5`：
 
 ```text
-/tmp/keylane-100k-{read,mixed,write}-{primary,secondary}-300s.memtier
-/tmp/keylane-50k-{read,mixed,write}-{primary,secondary}-300s.memtier
+/tmp/lavik-100k-{read,mixed,write}-{primary,secondary}-300s.memtier
+/tmp/lavik-50k-{read,mixed,write}-{primary,secondary}-300s.memtier
 ```
 
 主节点保存的每秒 pidstat 和测试前后 Prometheus 快照：
 
 ```text
-/tmp/keylane-100k-{read,mixed,write}-{master,replica}.pidstat
-/tmp/keylane-100k-{read,mixed,write}-{master,replica}-{before,after}.metrics
-/tmp/keylane-50k-{read,mixed,write}-{master,replica}.pidstat
-/tmp/keylane-50k-{read,mixed,write}-{master,replica}-{before,after}.metrics
+/tmp/lavik-100k-{read,mixed,write}-{master,replica}.pidstat
+/tmp/lavik-100k-{read,mixed,write}-{master,replica}-{before,after}.metrics
+/tmp/lavik-50k-{read,mixed,write}-{master,replica}.pidstat
+/tmp/lavik-50k-{read,mixed,write}-{master,replica}-{before,after}.metrics
 ```
 
 服务日志：
 
 ```text
-主节点：/tmp/keylane-full1t-master.log
-从节点：10.0.0.7:/home/azureuser/keylane/logs/full1t-replica.log
+主节点：/tmp/lavik-full1t-master.log
+从节点：10.0.0.7:/home/azureuser/lavik/logs/full1t-replica.log
 ```
 
 ## 13. 测试限制

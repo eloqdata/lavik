@@ -16,7 +16,7 @@
 """Continue after the setup-only IRQ validation failure; retain all Aero results.
 
 The original scripts and completed receipts are immutable. The first controller
-stopped before opening Keylane's fresh partition and restored host settings.
+stopped before opening Lavik's fresh partition and restored host settings.
 This continuation permits deferred IRQ migration during setup, requires data
 queue convergence after load, and checks actual CPU IRQ deltas for every phase.
 """
@@ -70,7 +70,7 @@ def main():
     assert not (ROOT / 'resume.json').exists(), 'One-shot continuation'
     failure = json.loads((ROOT / 'failure.json').read_text())
     assert failure['completed'] == 8 and failure['mode'] is None
-    assert 'host.apply_keylane()' in failure['traceback']
+    assert 'host.apply_lavik()' in failure['traceback']
     phases = json.loads((ROOT / 'phases.json').read_text())
     results = json.loads((ROOT / 'results.json').read_text())
     assert len(phases) == 16 and len(results) == 8
@@ -78,24 +78,24 @@ def main():
     assert not list(ROOT.glob('hreplace-*-server-command.json'))
     r.no_client()
     assert not r.run(['pgrep', '-x', 'asd'], check=False)
-    assert not r.run(['pgrep', '-x', 'keylane'], check=False)
+    assert not r.run(['pgrep', '-x', 'lavik'], check=False)
     host.assert_default()
-    assert r.sha(r.KEYLANE) == r.KEYLANE_SHA
+    assert r.sha(r.LAVIK) == r.LAVIK_SHA
     experiment = json.loads((ROOT / 'experiment.json').read_text())
     for name, digest in experiment['script_sha256'].items():
         assert r.sha(ROOT / name) == digest
     archive = ROOT / 'setup-attempts' / '2-deferred-irq-migration'
     archive.mkdir()
-    for name in ('failure.json', 'progress.json', 'keylane-policy-before.json',
-                 'keylane-policy-applied.json', 'host-restored.json'):
+    for name in ('failure.json', 'progress.json', 'lavik-policy-before.json',
+                 'lavik-policy-applied.json', 'host-restored.json'):
         shutil.move(ROOT / name, archive / name)
     r.save('resume.json', {'utc': r.now(), 'retained_formal_windows': 8,
         'retained_phases': 16, 'failed_transition': str(archive.relative_to(ROOT)),
         'reason': 'effective IRQ affinity is deferred until the next interrupt; validate completion queues under traffic',
-        'script_sha256': {name: r.sha(ROOT / name) for name in ('resume_keylane.py', 'host_policy_v2.py')}})
+        'script_sha256': {name: r.sha(ROOT / name) for name in ('resume_lavik.py', 'host_policy_v2.py')}})
     current_mode = None
     try:
-        host.apply_keylane()
+        host.apply_lavik()
         current_mode = 'hreplace'
         r.progress('starting-load', mode=current_mode, complete=8, total=16)
         r.start(current_mode, 'load')
@@ -151,8 +151,8 @@ def main():
         assert final['dbsize'] == aero_count
         assert r.samples('aerospike', 'final') == json.loads((ROOT / 'aerospike-completed-samples.json').read_text())
         r.save('complete.json', {'utc': r.now(), 'complete': 16, 'phases': 32, 'host_restored': True,
-            'aerospike_final_records': aero_count, 'keylane_final_records': expected_count,
-            'aerospike_default_service_running': True, 'keylane_stopped': True})
+            'aerospike_final_records': aero_count, 'lavik_final_records': expected_count,
+            'aerospike_default_service_running': True, 'lavik_stopped': True})
         r.progress('complete', complete=16, total=16)
     except BaseException:
         r.save('failure.json', {'utc': r.now(), 'traceback': traceback.format_exc(), 'mode': current_mode,

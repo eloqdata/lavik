@@ -64,7 +64,7 @@
     "-p",
     "redis.cluster=false",
     "-p",
-    "redis.updatecommand=keylane.hreplace"
+    "redis.updatecommand=lavik.hreplace"
   ],
   "start_utc": "2026-09-16T04:20:11Z",
   "runtime_ms": 2321,
@@ -173,7 +173,7 @@
       "99.99PercentileLatency(us)": 25167
     }
   },
-  "sha256": "6c288eee7b4b14922f28aff048f43c2fdd0714f03cf9efc8b6b5c2f7eee321f6",
+  "sha256": "c5c924838d4d425c4e413458b39223b7f5f4d2fc86b1abb7caaac4eeff01be5c",
   "exit_code": 0,
   "end_utc": "2026-09-16T04:20:14Z",
   "before_records": 100000000,

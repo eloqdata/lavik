@@ -18,7 +18,7 @@ limitations under the License.
 
 ## Implemented scope
 
-Keylane reserves a capacity-derived prefix in every configured file or raw
+Lavik reserves a capacity-derived prefix in every configured file or raw
 block device. The prefix contains:
 
 - the immutable device label;
@@ -110,7 +110,7 @@ and startup requires the complete device set.
 
 `FLUSHDB` persists the new DB epoch before dropping the in-memory DB indexes.
 Recovery ignores records with an older DB epoch, so no per-key disk rewrite is
-required. After the indexes are cleared, Keylane marks their old locations dead.
+required. After the indexes are cleared, Lavik marks their old locations dead.
 If this makes the worker's active append block completely dead, `FLUSHDB` seals
 that block immediately and queues it for flush; a mixed active block remains
 open so live records from other logical databases are not disturbed. Once the

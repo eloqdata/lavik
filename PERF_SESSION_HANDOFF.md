@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Keylane Performance Session Handoff
+# Lavik Performance Session Handoff
 
 Updated: 2026-08-21 UTC
 
@@ -61,7 +61,7 @@ read waves with a completion barrier, retains dynamic
 `replication-snapshot-read-concurrency`, and reuses the already-computed key
 digest during snapshot acknowledgement without changing the wire format. The
 deployed binary is
-`bin/keylane-perf-20260821-snapshot-barrier-final`, SHA-256
+`bin/lavik-perf-20260821-snapshot-barrier-final`, SHA-256
 `c93767271430c00ce625292c366fa31ade880b50fb2aba14fa381692a5ed15ac`.
 The current primary PID is 171886 and replica PID is 35937; the replica was
 cleared by zeroing only the first 8 MiB of each replica device and is currently
@@ -76,7 +76,7 @@ unchanged at 2.591/4.127/5.343 ms; GET tails rose to
 improve latency: snapshot work consumes the freed scheduling and I/O capacity,
 so read-tail isolation requires explicit admission or budgeting.
 
-The Release/SPDK binary was `bin/keylane-perf-20260821`, SHA-256
+The Release/SPDK binary was `bin/lavik-perf-20260821`, SHA-256
 `e340769db8549f5d26140ccbcff699443dd0ae30ca454d6ad318e7d4be1bd09d`.
 The primary on `10.0.0.4` and replica on `10.0.0.7` each used two NVMe devices
 and 12 workers on CPUs 0-11, with CPUs 12-15 reserved for network IRQ or
@@ -115,9 +115,9 @@ capacity.
 
 The current primary PID is 126030 and the current replica PID is 22738. Both
 are ONLINE at 400,000,000 keys and lag zero. Formal memtier logs remain on the
-client at `/tmp/keylane-{fullsync,online}-*.memtier`; local and replica CPU and
-metrics samples remain under matching `/tmp/keylane-*.pidstat` and
-`/tmp/keylane-*.metrics.csv` names.
+client at `/tmp/lavik-{fullsync,online}-*.memtier`; local and replica CPU and
+metrics samples remain under matching `/tmp/lavik-*.pidstat` and
+`/tmp/lavik-*.metrics.csv` names.
 
 ## 2026-08-20 local 20-GB continuous-write full-sync validation
 
@@ -184,7 +184,7 @@ builds.
 ## 2026-08-18 two-host 1-TB primary/replica controlled-load results
 
 The current `main` build at `ec22e4f` was tested with a primary on `10.0.0.4`
-and a replica on `10.0.0.7`. Each Keylane process used 12 workers on CPUs
+and a replica on `10.0.0.7`. Each Lavik process used 12 workers on CPUs
 0-11 and both local NVMe devices through SPDK; CPUs 12-15 were reserved for
 network IRQ/softirq work. The primary and replica each contained exactly
 400,000,000 `kv_` keys with random 1,000-4,000 byte values. Both nodes remained
@@ -215,7 +215,7 @@ Concurrent replica-only GET results:
     1:1 SET:GET    99,986.19      0.269 ms  0.255 ms  0.543 ms  1.319 ms  2.303 ms
     100% SET       99,999.76      0.289 ms  0.271 ms  0.663 ms  1.671 ms  3.503 ms
 
-Average Keylane process CPU usage, where 100% is one logical CPU:
+Average Lavik process CPU usage, where 100% is one logical CPU:
 
     Primary load  Primary CPU  Replica CPU
     100% GET       542.66%      557.62%
@@ -224,16 +224,16 @@ Average Keylane process CPU usage, where 100% is one logical CPU:
 
 All six memtier processes exited successfully with zero error responses,
 warnings, misses, MOVED, or ASK replies. Replication remained online with 12
-data flows and `lag=0`; neither Keylane log gained a new warning or error. The
+data flows and `lag=0`; neither Lavik log gained a new warning or error. The
 replica CPU increase from 5.58 cores in the read/read workload to 7.03 cores
 while the primary wrote at 100,000 SET/s measures the extra replication-apply
 cost while it continued serving the same 100,000 GET/s.
 
 Raw memtier logs are on `10.0.0.5` as
-`/tmp/keylane-100k-{read,mixed,write}-{primary,secondary}-300s.memtier`.
-Per-second Keylane CPU samples and before/after Prometheus snapshots are on the
-primary as `/tmp/keylane-100k-{read,mixed,write}-{master,replica}.pidstat` and
-`/tmp/keylane-100k-{read,mixed,write}-{master,replica}-{before,after}.metrics`.
+`/tmp/lavik-100k-{read,mixed,write}-{primary,secondary}-300s.memtier`.
+Per-second Lavik CPU samples and before/after Prometheus snapshots are on the
+primary as `/tmp/lavik-100k-{read,mixed,write}-{master,replica}.pidstat` and
+`/tmp/lavik-100k-{read,mixed,write}-{master,replica}-{before,after}.metrics`.
 
 The identical six tests were repeated at a 50,000-op/s target per process by
 changing only the per-connection rate limit from 1,250 to 625. Memtier's
@@ -254,7 +254,7 @@ Concurrent replica-only GET results:
     1:1 SET:GET    49,919.15      0.262 ms  0.247 ms  0.527 ms  0.863 ms  1.711 ms
     100% SET       49,920.41      0.263 ms  0.247 ms  0.575 ms  1.167 ms  2.415 ms
 
-Average Keylane process CPU usage at the 50,000-op/s target:
+Average Lavik process CPU usage at the 50,000-op/s target:
 
     Primary load  Primary CPU  Replica CPU
     100% GET       304.79%      320.84%
@@ -274,13 +274,13 @@ is not caused by replication apply pressure.
 All six 50,000-op/s clients also completed with zero errors, warnings, misses,
 MOVED, or ASK replies. Replication remained online with 12 flows and `lag=0`,
 and both nodes still reported 400,000,000 keys. The raw logs use the matching
-`/tmp/keylane-50k-{read,mixed,write}-{primary,secondary}-300s.memtier` names on
-`10.0.0.5`; CPU and metrics files on the primary use the same `keylane-50k-`
+`/tmp/lavik-50k-{read,mixed,write}-{primary,secondary}-300s.memtier` names on
+`10.0.0.5`; CPU and metrics files on the primary use the same `lavik-50k-`
 prefix.
 
 ## 2026-08-18 replication throughput and IRQ session
 
-This session ran from uncommitted changes on Keylane `main` at
+This session ran from uncommitted changes on Lavik `main` at
 `fcb06253ef54`. The source and replica use separate Microsoft NVMe Direct
 Disks through SPDK: the source is `spdk://43bc:00:00.0/1` on port 6379 and the
 replica is `spdk://58bf:00:00.0/1` on port 6380. Only the first 8 MiB of each
@@ -318,8 +318,8 @@ consumer.
 
 The final runtime layout is 6+6+4 on the 16-vCPU server:
 
-- source Keylane: CPUs 0-5, `--threads=6`;
-- replica Keylane: CPUs 6-11, `--threads=6`;
+- source Lavik: CPUs 0-5, `--threads=6`;
+- replica Lavik: CPUs 6-11, `--threads=6`;
 - mlx5 IRQs 58-74: CPUs 12-15, with completion IRQs round-robin;
 - memtier remains remote on 10.0.0.5, pinned to its CPUs 8-15.
 
@@ -337,7 +337,7 @@ all six cores while the replica used about 2.8 cores.
 
 ### SET latency trace
 
-An independent `KEYLANE_ENABLE_SET_LATENCY_TRACE` CMake option now instruments
+An independent `LAVIK_ENABLE_SET_LATENCY_TRACE` CMake option now instruments
 the SET path. It is off by default. The trace reports per-worker 10-second
 distributions for cross-worker routing, key and store locks, lookup, append,
 new-block wait/allocation, encoding, index update, replication publication,
@@ -427,7 +427,7 @@ to 8 before attaching the empty replica. Full sync copied 27,991,053 keys in
 minutes 37 seconds. Source CPU averaged about 543% and replica CPU about 117%
 during the middle of the snapshot. Both nodes ended at 27,991,053 keys with
 six flows online, and neither log contained warnings, errors, overflow, or
-disconnects. Logs are `/tmp/keylane-snapshot-q8-{master,replica}.log`.
+disconnects. Logs are `/tmp/lavik-snapshot-q8-{master,replica}.log`.
 
 One independent recovery anomaly preceded the test: immediately before the
 source restart its live DBSIZE was 27,237,851, while the new process recovered
@@ -450,16 +450,16 @@ and reads only matched values. Supported names are `defrag-paused`,
     CONFIG SET tomb-raider-interval-ms 60000
 
 The trace-run logs are
-`/tmp/keylane-fcb0625-settrace-6c-{master,replica}.log`; the clean patched
-replica log is `/tmp/keylane-fcb0625-sessionfix-replica.log`. The final live
+`/tmp/lavik-fcb0625-settrace-6c-{master,replica}.log`; the clean patched
+replica log is `/tmp/lavik-fcb0625-sessionfix-replica.log`. The final live
 state is 27,237,851 keys on both nodes,
-`keylane_replication_state:online`, and six connected flows. `irqbalance` is
+`lavik_replication_state:online`, and six connected flows. `irqbalance` is
 not installed or active, but the manual IRQ affinity is runtime state and must
 be reapplied after a reboot or NIC driver rebind.
 
 ## Current source state
 
-- Keylane branch: main; this handoff update contains the SPDK tail-latency
+- Lavik branch: main; this handoff update contains the SPDK tail-latency
   tuning and default worker-pinning integration.
 - Celer submodule: 2f93c69 perf: reduce SPDK worker tail latency
 - mimalloc submodule: acf2fdd (v3.4.5)
@@ -483,15 +483,15 @@ Build:
 
     cmake -S . -B bld \
       -DCMAKE_BUILD_TYPE=Release \
-      -DKEYLANE_ENABLE_READ_LATENCY_TRACE=OFF \
-      -DKEYLANE_WITH_SPDK=OFF
+      -DLAVIK_ENABLE_READ_LATENCY_TRACE=OFF \
+      -DLAVIK_WITH_SPDK=OFF
     cmake --build bld -j 8
 
-Mimalloc is now mandatory: `KEYLANE_USE_MIMALLOC` no longer exists. Every
-Keylane build links mimalloc 3.4.5, compiles with `MI_NO_THP=ON` and
+Mimalloc is now mandatory: `LAVIK_USE_MIMALLOC` no longer exists. Every
+Lavik build links mimalloc 3.4.5, compiles with `MI_NO_THP=ON` and
 `MI_DEFAULT_ARENA_EAGER_COMMIT=1`. Recovery keeps mimalloc's native 1,000 ms
 purge delay; after every worker has finished recovery and forced a local heap
-collection, Keylane switches to the configured online delay, which defaults to
+collection, Lavik switches to the configured online delay, which defaults to
 60,000 ms. The startup log is the source of truth and should report
 `recovery_purge_delay=1000 online_purge_delay=60000 arena_eager_commit=1
 allow_thp=0`, followed by the online-switch log after recovery.
@@ -505,25 +505,25 @@ SPDK build:
       libssl-dev
     cmake -S . -B bld-spdk \
       -DCMAKE_BUILD_TYPE=Release \
-      -DKEYLANE_ENABLE_READ_LATENCY_TRACE=OFF \
-      -DKEYLANE_WITH_SPDK=ON
+      -DLAVIK_ENABLE_READ_LATENCY_TRACE=OFF \
+      -DLAVIK_WITH_SPDK=ON
     cmake --build bld-spdk -j 8
 
-`KEYLANE_WITH_SPDK=ON` changes only the storage backend. Networking remains on
+`LAVIK_WITH_SPDK=ON` changes only the storage backend. Networking remains on
 celer/io_uring. SPDK v26.05 is a nested celer submodule pinned at
 `d519b163cbc0e2f28c35d9bc86d610da368b032c`; SPDK and DPDK are linked
-statically, so `bld-spdk/keylane` has no runtime `libspdk` or `librte`
+statically, so `bld-spdk/lavik` has no runtime `libspdk` or `librte`
 dependency.
 
 ## Machine and storage
 
-- Keylane uses CPUs 0-7 with 8 workers.
+- Lavik uses CPUs 0-7 with 8 workers.
 - memtier uses CPUs 8-15 with 8 threads and 10 connections per thread.
 - Historical io_uring device: `/dev/nvme1n1`, PCI `021d:00:00.0`,
   1,920,383,410,176 bytes total. It still contains the previous dataset.
 - Current SPDK test device: first NVMe, PCI `69f9:00:00.0`, namespace 1,
-  exposed to Keylane as `spdk://69f9:00:00.0/1` with the same capacity.
-- Current Keylane automatically uses the complete raw-device capacity. It
+  exposed to Lavik as `spdk://69f9:00:00.0/1` with the same capacity.
+- Current Lavik automatically uses the complete raw-device capacity. It
   exposed 228,926 8 MiB data blocks, including eight defrag-reserve blocks,
   and 1,920,370,475,008 usable data bytes in this session.
 - The first NVMe was verified unmounted and without a filesystem signature,
@@ -578,17 +578,17 @@ Initial fill:
       --key-pattern=P:P
 
 Ordinary blkdiscard did not guarantee zero reads on this Azure NVMe. To erase
-and refill an io_uring device, stop Keylane and use the zeroing discard:
+and refill an io_uring device, stop Lavik and use the zeroing discard:
 
     sudo blkdiscard -z -f --length 644245094400 /dev/nvme1n1
 
 This command is destructive.
 
-## Keylane launch
+## Lavik launch
 
 The current SPDK server uses:
 
-    sudo taskset -c 0-7 ./bld-spdk/keylane \
+    sudo taskset -c 0-7 ./bld-spdk/lavik \
       --bind=10.0.0.4 \
       --port=6379 \
       --metrics-port=9100 \
@@ -626,7 +626,7 @@ Before starting it, reserve hugepages and bind only the first controller:
       HUGEMEM=4096 ./scripts/setup.sh
     cd ../../..
 
-To return only that controller to the kernel NVMe driver after Keylane stops:
+To return only that controller to the kernel NVMe driver after Lavik stops:
 
     cd celer/third_party/spdk
     sudo env PCI_ALLOWED='69f9:00:00.0' ./scripts/setup.sh reset
@@ -634,7 +634,7 @@ To return only that controller to the kernel NVMe driver after Keylane stops:
 
 The comparable io_uring launch is:
 
-    sudo taskset -c 0-7 ./bld/keylane \
+    sudo taskset -c 0-7 ./bld/lavik \
       --bind=10.0.0.4 \
       --port=6380 \
       --metrics-port=9101 \
@@ -660,7 +660,7 @@ The 2026-08-10 tail investigation isolated the two servers by pausing the
 inactive process with `SIGSTOP`; Prometheus scraping was also disabled for one
 control. Removing Prometheus made no measurable difference: SPDK remained at
 0.22182 ms average, 1.111 ms p99.9, and 2.479 ms p99.99. Grafana queries
-Prometheus rather than Keylane directly, and scrape duration was about 1 ms,
+Prometheus rather than Lavik directly, and scrape duration was about 1 ms,
 so monitoring was ruled out as the SPDK tail source.
 
 Celer previously inherited the process-level `taskset -c 0-7` mask for every
@@ -705,7 +705,7 @@ result establishes that SPDK itself is no longer slower than io_uring here,
 but a longer production-window percentile must retain those system-level
 stalls rather than selecting only the best interval.
 
-After rebasing Keylane `e552276` and deploying final main `231da6b` with Celer
+After rebasing Lavik `e552276` and deploying final main `231da6b` with Celer
 `2f93c69`, the user-refilled dataset reported 206,811,216 total keys. Keys
 `kv_1`, `kv_100000000`, and `kv_200000000` were each 2000 bytes, and the full
 random benchmark range was all hits. The first post-recovery window contained
@@ -753,7 +753,7 @@ Historical tcmalloc launch used before mimalloc became mandatory (not the
 current process and not supported by current CMake):
 
     sudo env LD_PRELOAD=/lib/x86_64-linux-gnu/libtcmalloc.so.4 \
-      taskset -c 0-7 ./bld-libc/keylane \
+      taskset -c 0-7 ./bld-libc/lavik \
       --bind=10.0.0.4 \
       --port=6379 \
       --metrics-port=9100 \
@@ -770,7 +770,7 @@ from current main because the allocator switch was removed.
 
 Graceful stop:
 
-    pid=$(pgrep -n -x keylane)
+    pid=$(pgrep -n -x lavik)
     kill -INT "$pid"
 
 Wait for shutdown so partial write buffers are flushed before restarting.
@@ -859,7 +859,7 @@ SET:GET = 1:1, 300 seconds:
 
 Collect iostat without the misleading since-boot first report:
 
-    iostat -y -t -xmd 1 305 > /tmp/keylane-test.iostat
+    iostat -y -t -xmd 1 305 > /tmp/lavik-test.iostat
 
 This works only while the controller is owned by the kernel NVMe driver. SPDK
 owns the first controller through VFIO, so its operations are intentionally
@@ -890,8 +890,8 @@ numbers for the following two-hour 1:1 run.
 
 Artifacts use this prefix:
 
-    /tmp/keylane-spdk-defrag-basic-{read,1to10,1to1}.{memtier,pidstat}
-    /tmp/keylane-spdk-defrag-basic-{read,1to10,1to1}.{before,after}.metrics
+    /tmp/lavik-spdk-defrag-basic-{read,1to10,1to1}.{memtier,pidstat}
+    /tmp/lavik-spdk-defrag-basic-{read,1to10,1to1}.{before,after}.metrics
 
 The two-hour 1:1 run started at `2026-08-10T08:36:31Z` and is scheduled to end
 at `2026-08-10T10:36:31Z`. It uses the same 100,000 ops/s command as the
@@ -900,16 +900,16 @@ before the workload, so the first background round is expected approximately
 ten minutes into the window. Prometheus and Grafana were both healthy when the
 run started. Full-window artifacts are:
 
-    /tmp/keylane-spdk-defrag-2h-1to1.memtier
-    /tmp/keylane-spdk-defrag-2h-1to1.pidstat
-    /tmp/keylane-spdk-defrag-2h-1to1.timeline
-    /tmp/keylane-spdk-defrag-2h-1to1.{before,after}.metrics
-    /tmp/keylane-spdk-defrag-2h-1to1.{before,after}.info
+    /tmp/lavik-spdk-defrag-2h-1to1.memtier
+    /tmp/lavik-spdk-defrag-2h-1to1.pidstat
+    /tmp/lavik-spdk-defrag-2h-1to1.timeline
+    /tmp/lavik-spdk-defrag-2h-1to1.{before,after}.metrics
+    /tmp/lavik-spdk-defrag-2h-1to1.{before,after}.info
 
 ### SPDK v26.05 backend on the first NVMe
 
-This 2026-08-10 test used the local `KEYLANE_WITH_SPDK=ON` implementation,
-SPDK v26.05, statically linked DPDK, mandatory mimalloc, eight Keylane workers
+This 2026-08-10 test used the local `LAVIK_WITH_SPDK=ON` implementation,
+SPDK v26.05, statically linked DPDK, mandatory mimalloc, eight Lavik workers
 on CPUs 0-7, and the first NVMe at `69f9:00:00.0`. Networking remained
 io_uring. The storage URI was `spdk://69f9:00:00.0/1`, flush submissions were
 128 KiB, purge and tomb raider were disabled, THP was compile-time disabled,
@@ -917,7 +917,7 @@ and eager arena commit was compile-time enabled.
 
 The first multi-worker attempt exposed a critical DPDK integration detail:
 `spdk_env_init(core_mask=0x1)` changed the calling thread's affinity to CPU 0,
-so all subsequently created Keylane workers inherited CPU 0. Fill throughput
+so all subsequently created Lavik workers inherited CPU 0. Fill throughput
 was only 52,547 SET/s. The backend now saves and restores the caller's affinity
 around SPDK initialization. After the fix, all workers inherited CPUs 0-7 and
 the device was zeroed before the formal refill.
@@ -980,7 +980,7 @@ delay measurement. Kernel `iostat` cannot observe the VFIO-owned controller,
 so do not compare the SPDK run using missing block-layer statistics.
 
 One pre-refill smoke test repeatedly overwrote the same redis-benchmark key
-about 10,000 times. After restart, the existing Keylane defrag path reported
+about 10,000 times. After restart, the existing Lavik defrag path reported
 `block live-byte accounting underflow`, and a later FLUSHALL reclamation
 reported that the storage writer had stopped. The fresh sequential refill and
 all formal SPDK windows did not reproduce it: defrag error stayed zero. Keep
@@ -989,8 +989,8 @@ failure as an NVMe completion error.
 
 Artifacts:
 
-    /tmp/keylane-spdk-fill.perf.data
-    /tmp/keylane-spdk-fill.perf.record
+    /tmp/lavik-spdk-fill.perf.data
+    /tmp/lavik-spdk-fill.perf.record
 
 ### Latest 8c171a9 kernel perf attribution before SPDK
 
@@ -998,10 +998,10 @@ The user-run 1:1 memtier workload on the io_uring build used 16 threads, ten
 connections per thread, a total requested rate of 100,000 ops/s, the
 `kv_1..kv_200000000` range, random 1000-4000-byte values, and tomb raider
 disabled. A 30-second profile saved as
-`/tmp/keylane-8c171a9-live-memtier.perf.data` captured 48,134 samples with zero
+`/tmp/lavik-8c171a9-live-memtier.perf.data` captured 48,134 samples with zero
 lost samples.
 
-The raw perf DSO split was 57.31% kernel, 39.42% Keylane, and 2.89% libc, but
+The raw perf DSO split was 57.31% kernel, 39.42% Lavik, and 2.89% libc, but
 perf callchain collection inflated kernel cost. A less intrusive pidstat window
 measured 120.6% user and 108.8% system CPU, so kernel work was approximately
 47.4% of server CPU. The device sustained about 50,000 reads/s and 132 MiB/s,
@@ -1093,7 +1093,7 @@ reproduced the approximately 692 MiB/s read bandwidth but entered the recurring
 NVMe slow plateau and delivered only 96,553 ops/s; it is excluded from the clean
 result above. Defrag run, active, and pending metrics were all zero.
 
-To isolate the mixed workload, Keylane was then gracefully restarted with
+To isolate the mixed workload, Lavik was then gracefully restarted with
 `--tomb-raider-interval-ms=0`. Before the test, five consecutive idle samples
 reported zero device reads and writes, and `INFO` reported zero tomb-raider
 rounds. The clean SET:GET=1:10 window gave:
@@ -1116,23 +1116,23 @@ not cause the observed read amplification; it came from the background sweep.
 
 Artifacts:
 
-    /tmp/keylane-3a247ca-miab-control-*
-    /tmp/keylane-3a247ca-miab-purge-off-*
-    /tmp/keylane-3a247ca-miab-eager-commit-*
-    /tmp/keylane-3a247ca-miab-thp-off-*
-    /tmp/keylane-3a247ca-miab-purge-thp-off-*
-    /tmp/keylane-3a247ca-miab-control-confirm-*
-    /tmp/keylane-3a247ca-miab-control-ratio1-10*
-    /tmp/keylane-3a247ca-mimalloc-tomb-off-*
+    /tmp/lavik-3a247ca-miab-control-*
+    /tmp/lavik-3a247ca-miab-purge-off-*
+    /tmp/lavik-3a247ca-miab-eager-commit-*
+    /tmp/lavik-3a247ca-miab-thp-off-*
+    /tmp/lavik-3a247ca-miab-purge-thp-off-*
+    /tmp/lavik-3a247ca-miab-control-confirm-*
+    /tmp/lavik-3a247ca-miab-control-ratio1-10*
+    /tmp/lavik-3a247ca-mimalloc-tomb-off-*
 
 ### Latest main 3a247ca mimalloc memory-accounting retest
 
 This 2026-08-10 UTC retest fast-forwarded main from 99e1d01 to 3a247ca and
-rebuilt Release with `KEYLANE_USE_MIMALLOC=ON`, mimalloc 3.4.5, LTO, and
+rebuilt Release with `LAVIK_USE_MIMALLOC=ON`, mimalloc 3.4.5, LTO, and
 detailed GET tracing disabled. Celer remained at b3d78fe. The existing raw-disk
 dataset was preserved; no refill was required.
 
-Keylane started without an explicit `--max-memory` override. It selected the
+Lavik started without an explicit `--max-memory` override. It selected the
 automatic 108,010,510,746-byte (100.59 GiB) limit. Recovery scanned 215,543,309
 physical records in 133.12 seconds and all workers were ready after 154.22
 seconds. `DBSIZE` returned exactly 200,000,000, and `kv_1`, `kv_100000000`, and
@@ -1185,17 +1185,17 @@ smaller 3a247ca index footprint; the previous process RSS was approximately
 
 Artifacts:
 
-    /tmp/keylane-3a247ca-w8-mimalloc-fixed-server.log
-    /tmp/keylane-3a247ca-w8-mimalloc-fixed-read80-{a,b,c}.{memtier,pidstat,iostat}
-    /tmp/keylane-3a247ca-w8-mimalloc-fixed-read80-{a,b,c}.{before,after}.metrics
-    /tmp/keylane-3a247ca-w8-mimalloc-fixed-ratio1-10.{memtier,pidstat,iostat}
-    /tmp/keylane-3a247ca-w8-mimalloc-fixed-ratio1-10.{before,after}.metrics
+    /tmp/lavik-3a247ca-w8-mimalloc-fixed-server.log
+    /tmp/lavik-3a247ca-w8-mimalloc-fixed-read80-{a,b,c}.{memtier,pidstat,iostat}
+    /tmp/lavik-3a247ca-w8-mimalloc-fixed-read80-{a,b,c}.{before,after}.metrics
+    /tmp/lavik-3a247ca-w8-mimalloc-fixed-ratio1-10.{memtier,pidstat,iostat}
+    /tmp/lavik-3a247ca-w8-mimalloc-fixed-ratio1-10.{before,after}.metrics
 
 ### Latest main 99e1d01 mimalloc retest and allocator tail A/B
 
 This 2026-08-10 UTC retest started from a discarded `/dev/nvme1n1` and
 refilled exactly 200,000,000 keys named `kv_1` through `kv_200000000`, each
-with a fixed 2,000-byte value. Keylane used CPUs 0-7 with eight workers;
+with a fixed 2,000-byte value. Lavik used CPUs 0-7 with eight workers;
 memtier used CPUs 8-15 with eight threads and ten connections per thread. The
 build was Release with native optimization, LTO, mimalloc 3.4.5, and detailed
 GET tracing disabled.
@@ -1231,7 +1231,7 @@ preceded any rejected write traffic:
 The first 1:10 attempt was invalid. After recovery, the allocator gauge was
 93,053,255,680 bytes while RSS was approximately 38.0 GB. During overwriting
 SETs the gauge rose above the automatically selected 108,010,510,746-byte
-limit, even though RSS remained approximately 38.0 GB. Keylane rejected
+limit, even though RSS remained approximately 38.0 GB. Lavik rejected
 350,000 commands with `OOM command not allowed when used memory >
 'maxmemory'`. The same failure reproduced in the atomicity stress test. The
 server was restarted with `--max-memory=1tb`; the invalid window is excluded
@@ -1278,7 +1278,7 @@ exhaustion in this workload.
 The new pure-read p99.99 was reproducibly near 3.9 ms even though average,
 p99, CPU, device throughput, and average read await did not regress. A
 same-commit allocator A/B used `bld-libc`, built with
-`KEYLANE_USE_MIMALLOC=OFF`; all other build, server, dataset, CPU, and memtier
+`LAVIK_USE_MIMALLOC=OFF`; all other build, server, dataset, CPU, and memtier
 parameters were unchanged. Two clean 60-second windows gave:
 
     Allocator      Average       p99          p99.9        p99.99
@@ -1296,29 +1296,29 @@ large part of the new extreme tail; isolating allocator behavior from
 sampling disabled. One libc window hit the recurring NVMe slowdown and is
 excluded from the clean A/B average.
 
-The logged TSC conversion frequency is not responsible. Keylane reported
+The logged TSC conversion frequency is not responsible. Lavik reported
 2,793.437-2,793.439 MHz, matching the kernel's 2,793.437 MHz detection. The
 machine uses TSC as its clocksource and advertises `constant_tsc`,
 `nonstop_tsc`, `tsc_reliable`, and `tsc_known_freq`.
 
 Artifacts:
 
-    /tmp/keylane-99e1d01-w8-refill-server.log
-    /tmp/keylane-99e1d01-w8-refill.{memtier,iostat,pidstat}
-    /tmp/keylane-99e1d01-w8-recovery-server.log
-    /tmp/keylane-99e1d01-w8-read80.{memtier,iostat,pidstat}
-    /tmp/keylane-99e1d01-w8-max1tb-server.log
-    /tmp/keylane-99e1d01-w8-max1tb-mixed1to10.{memtier,iostat,pidstat}
-    /tmp/keylane-99e1d01-w8-max1tb-mixed1to1-300s.{memtier,iostat,pidstat}
-    /tmp/keylane-99e1d01-w8-max1tb-read80-confirm.{memtier,iostat,pidstat}
-    /tmp/keylane-99e1d01-w8-libc-server.log
-    /tmp/keylane-99e1d01-w8-libc-read80-{a,b,c}.{memtier,iostat,pidstat}
+    /tmp/lavik-99e1d01-w8-refill-server.log
+    /tmp/lavik-99e1d01-w8-refill.{memtier,iostat,pidstat}
+    /tmp/lavik-99e1d01-w8-recovery-server.log
+    /tmp/lavik-99e1d01-w8-read80.{memtier,iostat,pidstat}
+    /tmp/lavik-99e1d01-w8-max1tb-server.log
+    /tmp/lavik-99e1d01-w8-max1tb-mixed1to10.{memtier,iostat,pidstat}
+    /tmp/lavik-99e1d01-w8-max1tb-mixed1to1-300s.{memtier,iostat,pidstat}
+    /tmp/lavik-99e1d01-w8-max1tb-read80-confirm.{memtier,iostat,pidstat}
+    /tmp/lavik-99e1d01-w8-libc-server.log
+    /tmp/lavik-99e1d01-w8-libc-read80-{a,b,c}.{memtier,iostat,pidstat}
 
 ### Latest main 390197c fresh refill and standard retest
 
 This 2026-08-09/10 UTC retest started from an empty `/dev/nvme1n1`, used the
 launch command above, and refilled exactly 200,000,000 fixed-size 2,000-byte
-values. Keylane used CPUs 0-7 with eight workers. memtier used CPUs 8-15 with
+values. Lavik used CPUs 0-7 with eight workers. memtier used CPUs 8-15 with
 eight threads, ten connections per thread, and the full 200-million-key range.
 The build was Release with native optimization, LTO, and detailed GET latency
 tracing enabled.
@@ -1396,19 +1396,19 @@ the 1:1 tail above includes the current default periodic-maintenance behavior.
 
 After all workloads, DB 0 still contained exactly 200,000,000 keys, DB 1 was
 empty, and the three sampled values remained 2,000 bytes. The server log had
-no fatal, assertion, corruption, checksum, storage, or request errors. Keylane
+no fatal, assertion, corruption, checksum, storage, or request errors. Lavik
 was stopped cleanly and all storage buffers were durably flushed.
 
 Artifacts:
 
-    /tmp/keylane-390197c-w8-refill-server.log
-    /tmp/keylane-390197c-w8-refill.{memtier,iostat,pidstat}
-    /tmp/keylane-390197c-w8-recovery-bench-server.log
-    /tmp/keylane-390197c-w8-read80-warmup.memtier
-    /tmp/keylane-390197c-w8-read80.{memtier,iostat,pidstat}
-    /tmp/keylane-390197c-w8-read80-confirm.{memtier,iostat,pidstat}
-    /tmp/keylane-390197c-w8-mixed1to10.{memtier,iostat,pidstat}
-    /tmp/keylane-390197c-w8-mixed1to1-300s.{memtier,iostat,pidstat}
+    /tmp/lavik-390197c-w8-refill-server.log
+    /tmp/lavik-390197c-w8-refill.{memtier,iostat,pidstat}
+    /tmp/lavik-390197c-w8-recovery-bench-server.log
+    /tmp/lavik-390197c-w8-read80-warmup.memtier
+    /tmp/lavik-390197c-w8-read80.{memtier,iostat,pidstat}
+    /tmp/lavik-390197c-w8-read80-confirm.{memtier,iostat,pidstat}
+    /tmp/lavik-390197c-w8-mixed1to10.{memtier,iostat,pidstat}
+    /tmp/lavik-390197c-w8-mixed1to1-300s.{memtier,iostat,pidstat}
 
 ### Pure read clean windows
 
@@ -1431,9 +1431,9 @@ Best clean window:
 
 ### Latest main refill, 8 workers, 80 connections
 
-Source was Keylane c3488d9 with celer a5cd07d. The raw device was zeroed and
+Source was Lavik c3488d9 with celer a5cd07d. The raw device was zeroed and
 refilled from scratch with exactly 200,000,000 fixed-size 2000-byte values.
-Keylane was pinned to CPUs 0-7; memtier used 8 threads and 10 connections per
+Lavik was pinned to CPUs 0-7; memtier used 8 threads and 10 connections per
 thread on CPUs 8-15.
 
 Fresh fill:
@@ -1463,7 +1463,7 @@ Pure random GET, 60 seconds, rate-limited to 100K operations/s:
     hits:        6,000,080
     misses:      0
 
-Keylane used 278.31% CPU on average (157.64% user and 120.67% system). NVMe
+Lavik used 278.31% CPU on average (157.64% user and 120.67% system). NVMe
 averaged 100,013 reads/s and 250.29 MiB/s with 0.130 ms read await, 2.56 KiB
 requests, queue depth 13.06, and 45.6% utilization.
 
@@ -1474,7 +1474,7 @@ result because perf attachment disturbed its first five seconds.
 
 ### Pure-read tail-latency attribution
 
-The c3488d9 build had `KEYLANE_ENABLE_READ_LATENCY_TRACE=ON`. Across the 48
+The c3488d9 build had `LAVIK_ENABLE_READ_LATENCY_TRACE=ON`. Across the 48
 worker/10-second reports covering approximately 6.0 million GETs, the
 request-weighted average server-side phases were:
 
@@ -1540,7 +1540,7 @@ tail by itself.
 
 ### Accept-time connection-balancing retest
 
-This retest used the same Keylane c3488d9 data and 8-worker/80-connection
+This retest used the same Lavik c3488d9 data and 8-worker/80-connection
 100K GET/s workload, with the local Celer accept-time round-robin placement
 described above. Recovery reported 200,000,000 live keys; DB 1 was empty; the
 first, middle, and last sampled values were all 2000 bytes. All benchmark GETs
@@ -1591,12 +1591,12 @@ intervals separately.
 
 Artifacts:
 
-    /tmp/keylane-c3488d9-w8-accept-balance-retest-server.log
-    /tmp/keylane-c3488d9-w8-accept-balance-read80.memtier
-    /tmp/keylane-c3488d9-w8-accept-balance-read80.{iostat,pidstat}
-    /tmp/keylane-c3488d9-w8-accept-balance-read80.perf.data
-    /tmp/keylane-c3488d9-w8-accept-balance-read80-perf.memtier
-    /tmp/keylane-c3488d9-w8-accept-balance-read80-confirm.memtier
+    /tmp/lavik-c3488d9-w8-accept-balance-retest-server.log
+    /tmp/lavik-c3488d9-w8-accept-balance-read80.memtier
+    /tmp/lavik-c3488d9-w8-accept-balance-read80.{iostat,pidstat}
+    /tmp/lavik-c3488d9-w8-accept-balance-read80.perf.data
+    /tmp/lavik-c3488d9-w8-accept-balance-read80-perf.memtier
+    /tmp/lavik-c3488d9-w8-accept-balance-read80-confirm.memtier
 
 ### Direct-from-read-buffer String GET retest
 
@@ -1655,15 +1655,15 @@ affected sample rather than used for the code comparison.
 
 Artifacts:
 
-    /tmp/keylane-c3488d9-w8-direct-frame-retest-server.log
-    /tmp/keylane-c3488d9-w8-direct-frame-read80-warmup.memtier
-    /tmp/keylane-c3488d9-w8-direct-frame-read80.{memtier,iostat,pidstat}
-    /tmp/keylane-c3488d9-w8-direct-frame-read80-confirm.{memtier,iostat,pidstat}
+    /tmp/lavik-c3488d9-w8-direct-frame-retest-server.log
+    /tmp/lavik-c3488d9-w8-direct-frame-read80-warmup.memtier
+    /tmp/lavik-c3488d9-w8-direct-frame-read80.{memtier,iostat,pidstat}
+    /tmp/lavik-c3488d9-w8-direct-frame-read80-confirm.{memtier,iostat,pidstat}
 
 ### Five-minute p99/p99.9/p99.99 retest, three workloads
 
 The direct-frame build was also run for 300 seconds per workload with p99,
-p99.9, and p99.99 enabled. The setup remained 8 Keylane workers on CPUs 0-7,
+p99.9, and p99.99 enabled. The setup remained 8 Lavik workers on CPUs 0-7,
 8 memtier threads with 10 connections each on CPUs 8-15, a 200-million-key
 random range, fixed 2000-byte values, and a requested 100K aggregate operation
 rate. The modes ran in order: pure read, SET:GET=1:10, then SET:GET=1:1. The
@@ -1713,17 +1713,17 @@ bytes. No server errors or checksum failures were logged.
 
 Artifacts:
 
-    /tmp/keylane-c3488d9-w8-direct-frame-5m-server.log
-    /tmp/keylane-c3488d9-w8-direct-frame-read80-5m.{memtier,iostat,pidstat}
-    /tmp/keylane-c3488d9-w8-direct-frame-setget10-5m.{memtier,iostat,pidstat}
-    /tmp/keylane-c3488d9-w8-direct-frame-setget1-5m.{memtier,iostat,pidstat}
+    /tmp/lavik-c3488d9-w8-direct-frame-5m-server.log
+    /tmp/lavik-c3488d9-w8-direct-frame-read80-5m.{memtier,iostat,pidstat}
+    /tmp/lavik-c3488d9-w8-direct-frame-setget10-5m.{memtier,iostat,pidstat}
+    /tmp/lavik-c3488d9-w8-direct-frame-setget1-5m.{memtier,iostat,pidstat}
 
 ### 50 GiB regular-file online defrag impact
 
-This test used Keylane 767bb11 with Celer 0afbc77 and an isolated 50 GiB
-preallocated regular file at `/mnt/data0/keylane-defrag-50g.data` on the
+This test used Lavik 767bb11 with Celer 0afbc77 and an isolated 50 GiB
+preallocated regular file at `/mnt/data0/lavik-defrag-50g.data` on the
 `/dev/nvme0n1` ext4 filesystem. It did not touch the 200-million-key raw-device
-dataset or Dragonfly's files. Keylane exposed 6,399 8 MiB blocks with 4 KiB
+dataset or Dragonfly's files. Lavik exposed 6,399 8 MiB blocks with 4 KiB
 direct-I/O alignment. The file was filled with 8,000,000 fixed 2000-byte values
 at 454,823.41 SET/s; the smaller live set deliberately left enough free space
 for relocation.
@@ -1731,7 +1731,7 @@ for relocation.
 The controlled foreground workload was split into two independent clients:
 50K random GET/s as the measured online business and 50K random SET/s as the
 fragmentation source. Both used 8 threads and 10 connections per thread on
-CPUs 8-15, while the 8 Keylane workers remained on CPUs 0-7. With 8 million
+CPUs 8-15, while the 8 Lavik workers remained on CPUs 0-7. With 8 million
 keys, random replacement is expected to reduce the original-record live ratio
 to 50% after approximately `-ln(0.5) * 8M / 50K = 111` seconds. The observed
 SET slowdown began at seconds 107-110, matching the code's 50% threshold.
@@ -1764,7 +1764,7 @@ First-60-second server and device averages were:
 
 The first active window raised server CPU by 12.5%, read bandwidth by 33.9%,
 and write bandwidth by 49.2%. It did not exhaust either global resource:
-Keylane peaked at 303% of the 800% available CPU, while NVMe utilization
+Lavik peaked at 303% of the 800% available CPU, while NVMe utilization
 averaged 33.1% and peaked at 37.9%. The server phase trace isolates the first
 window's added delay:
 
@@ -1806,15 +1806,15 @@ follow-up tests.
 
 Artifacts:
 
-    /tmp/keylane-c3488d9-w8-defrag50g-server.log
-    /tmp/keylane-c3488d9-w8-defrag50g-fill.memtier
-    /tmp/keylane-c3488d9-w8-defrag50g-churn-set50k.memtier
-    /tmp/keylane-c3488d9-w8-defrag50g-nodefrag-read50k.memtier
-    /tmp/keylane-c3488d9-w8-defrag50g-nodefrag.{iostat,pidstat,perf.data}
-    /tmp/keylane-c3488d9-w8-defrag50g-active-read50k.memtier
-    /tmp/keylane-c3488d9-w8-defrag50g-active.{iostat,pidstat,perf.data}
-    /tmp/keylane-c3488d9-w8-defrag50g-post-{set50k,read50k}.memtier
-    /tmp/keylane-c3488d9-w8-defrag50g-post.{iostat,pidstat,perf.data}
+    /tmp/lavik-c3488d9-w8-defrag50g-server.log
+    /tmp/lavik-c3488d9-w8-defrag50g-fill.memtier
+    /tmp/lavik-c3488d9-w8-defrag50g-churn-set50k.memtier
+    /tmp/lavik-c3488d9-w8-defrag50g-nodefrag-read50k.memtier
+    /tmp/lavik-c3488d9-w8-defrag50g-nodefrag.{iostat,pidstat,perf.data}
+    /tmp/lavik-c3488d9-w8-defrag50g-active-read50k.memtier
+    /tmp/lavik-c3488d9-w8-defrag50g-active.{iostat,pidstat,perf.data}
+    /tmp/lavik-c3488d9-w8-defrag50g-post-{set50k,read50k}.memtier
+    /tmp/lavik-c3488d9-w8-defrag50g-post.{iostat,pidstat,perf.data}
 
 ### Round-budget defrag correctness smoke test
 
@@ -1829,7 +1829,7 @@ classification.
 
 The test first loaded 100,000 unique 2,000-byte values, then ran independent
 50K random SET/s and 50K random GET/s clients concurrently for 30 seconds on
-CPUs 8-15. Keylane used eight workers on CPUs 0-7. Repeated replacement
+CPUs 8-15. Lavik used eight workers on CPUs 0-7. Repeated replacement
 triggered defrag quickly in the small file; scheduler logs reported thousands
 of background resumes on every worker throughout the measured interval.
 
@@ -1840,7 +1840,7 @@ of background resumes on every worker throughout the measured interval.
 All 1,500,019 measured GETs were hits. `DBSIZE` remained exactly 100,000 and
 the first, arbitrary, middle, and last sampled values were all 2,000 bytes. No
 defrag, checksum, corruption, or storage errors were logged. The temporary
-1 GiB file was deleted after Keylane stopped; the retained 50 GiB defrag file
+1 GiB file was deleted after Lavik stopped; the retained 50 GiB defrag file
 and the raw-device dataset were not modified.
 
 In steady 10-second scheduler windows, average rounds were approximately
@@ -1856,8 +1856,8 @@ before/active comparison.
 
 Artifacts:
 
-    /tmp/keylane-round-budget-smoke-v2-{fill,write,read}.txt
-    /tmp/keylane-round-budget-smoke-v2-server.log
+    /tmp/lavik-round-budget-smoke-v2-{fill,write,read}.txt
+    /tmp/lavik-round-budget-smoke-v2-server.log
 
 ### Unlimited fixed-key overwrite with round-budget defrag
 
@@ -1866,7 +1866,7 @@ The retained 50 GiB file was recovered with exactly 8,000,000 live
 that logical key range: four memtier threads with ten connections each randomly
 overwrote those keys without rate limiting for 180 seconds. A separate,
 identically configured GET client on the other four client CPUs attempted
-50K GET/s throughout. Keylane remained on CPUs 0-7. A matching read-only
+50K GET/s throughout. Lavik remained on CPUs 0-7. A matching read-only
 baseline and a 60-second read-only run after writes stopped used the exact same
 GET client configuration.
 
@@ -1890,7 +1890,7 @@ ten-second window averaged about 268K SET/s, fell to 209K SET/s in seconds
 
 Unlimited overwrite therefore makes the defrag effect unmistakable, but it is
 an intentional saturation test rather than an isolated defrag comparison:
-Keylane used essentially all eight server CPUs and NVMe utilization averaged
+Lavik used essentially all eight server CPUs and NVMe utilization averaged
 97%, with a queue depth of 22.4. Defrag increased physical reads to 1.27 GiB/s
 because it scans whole blocks while foreground GETs continue.
 
@@ -1912,19 +1912,19 @@ After writes stopped, background resumes returned to zero and the 60-second GET
 result, CPU, and device metrics returned almost exactly to the read-only
 baseline. `DBSIZE` remained 8,000,000, four sampled values were all 2,000 bytes,
 and no storage, defrag, checksum, space-exhaustion, or request errors were
-logged. Keylane was stopped cleanly and the 50 GiB file was retained.
+logged. Lavik was stopped cleanly and the 50 GiB file was retained.
 
 Artifacts:
 
-    /tmp/keylane-roundbudget-unlimited-server.log
-    /tmp/keylane-roundbudget-unlimited-baseline-match-{read.txt,read.realtime,iostat,pidstat}
-    /tmp/keylane-roundbudget-unlimited-active-{write.txt,write.realtime,read.txt,read.realtime,iostat,pidstat}
-    /tmp/keylane-roundbudget-unlimited-post-{read.txt,read.realtime,iostat,pidstat}
+    /tmp/lavik-roundbudget-unlimited-server.log
+    /tmp/lavik-roundbudget-unlimited-baseline-match-{read.txt,read.realtime,iostat,pidstat}
+    /tmp/lavik-roundbudget-unlimited-active-{write.txt,write.realtime,read.txt,read.realtime,iostat,pidstat}
+    /tmp/lavik-roundbudget-unlimited-post-{read.txt,read.realtime,iostat,pidstat}
 
-### Current Keylane versus Dragonfly comparison, 8 workers, 80 connections
+### Current Lavik versus Dragonfly comparison, 8 workers, 80 connections
 
 These results use the same 200-million-key range, fixed 2000-byte values,
-CPU split, memtier concurrency, and 100K operation/s limit. Keylane is 767bb11
+CPU split, memtier concurrency, and 100K operation/s limit. Lavik is 767bb11
 with Celer 0afbc77, including accept balancing and direct String GET framing.
 Dragonfly is v1.40.0, build e4ebd, and was launched as:
 
@@ -1941,60 +1941,60 @@ Dragonfly is v1.40.0, build e4ebd, and was launched as:
 Dragonfly was freshly filled on the new ext4 tiered device. Refill comparison:
 
     System       SET/s         Average       p99          p99.9       p99.99
-    Keylane      460,364.10    0.17661 ms    0.487 ms     1.215 ms    not captured
+    Lavik      460,364.10    0.17661 ms    0.487 ms     1.215 ms    not captured
     Dragonfly    305,953.70    0.26120 ms    0.863 ms     1.463 ms    2.255 ms
 
-Dragonfly's refill throughput was 33.5% below Keylane's; equivalently,
-Keylane was 50.5% faster. After refill, Dragonfly reported exactly 200,000,000
+Dragonfly's refill throughput was 33.5% below Lavik's; equivalently,
+Lavik was 50.5% faster. After refill, Dragonfly reported exactly 200,000,000
 keys. Its first, middle, and last values were all 2000 bytes.
 
 Pure random read, 60 seconds:
 
     System       GET/s         Average       p99          p99.9       p99.99
-    Keylane       99,996.84    0.24371 ms    not captured 1.143 ms    1.959 ms
+    Lavik       99,996.84    0.24371 ms    not captured 1.143 ms    1.959 ms
     Dragonfly     99,998.17    0.23004 ms    0.543 ms     0.983 ms    1.775 ms
 
 Both systems reached the 100K/s rate limit with zero misses. Dragonfly's
 average, p99.9, and p99.99 were respectively 5.6%, 14.0%, and 9.4% lower.
-Keylane averaged 263.20% server CPU and 250.27 MiB/s of NVMe reads; Dragonfly
+Lavik averaged 263.20% server CPU and 250.27 MiB/s of NVMe reads; Dragonfly
 averaged 241.46% CPU and 388.28 MiB/s. The difference in physical bandwidth is
-mainly 2.56 KiB aligned reads for Keylane versus 4 KiB filesystem reads for
+mainly 2.56 KiB aligned reads for Lavik versus 4 KiB filesystem reads for
 Dragonfly.
 
 SET:GET = 1:1, 60 seconds:
 
     System       Type       Ops/s       Average       p99.9       p99.99
-    Keylane      SET       50,000.29    0.12316 ms    1.287 ms    2.495 ms
-    Keylane      GET       49,999.18    0.27528 ms    1.295 ms    2.223 ms
-    Keylane      Total     99,999.47    0.19922 ms    1.287 ms    2.367 ms
+    Lavik      SET       50,000.29    0.12316 ms    1.287 ms    2.495 ms
+    Lavik      GET       49,999.18    0.27528 ms    1.295 ms    2.223 ms
+    Lavik      Total     99,999.47    0.19922 ms    1.287 ms    2.367 ms
     Dragonfly    SET       49,999.73    0.18575 ms    1.127 ms    1.759 ms
     Dragonfly    GET       49,998.41    0.35186 ms    1.511 ms    1.927 ms
     Dragonfly    Total     99,998.13    0.26880 ms    1.399 ms    1.879 ms
 
-At the same capped throughput, Keylane's total average latency was 25.9%
+At the same capped throughput, Lavik's total average latency was 25.9%
 lower. Its SET and GET averages were 33.7% and 21.8% lower. Dragonfly had the
 better p99.99 tails: SET, GET, and total were 29.5%, 13.3%, and 20.6% lower.
-Server CPU averaged 250.36% for Keylane and 278.85% for Dragonfly.
+Server CPU averaged 250.36% for Lavik and 278.85% for Dragonfly.
 
 SET:GET = 1:10, 60-second clean confirmation:
 
     System       Type       Ops/s       Average       p99.9       p99.99
-    Keylane      SET        9,091.74    0.09749 ms    1.567 ms    2.431 ms
-    Keylane      GET       90,907.04    0.24167 ms    1.231 ms    2.191 ms
-    Keylane      Total     99,998.78    0.22856 ms    1.255 ms    2.239 ms
+    Lavik      SET        9,091.74    0.09749 ms    1.567 ms    2.431 ms
+    Lavik      GET       90,907.04    0.24167 ms    1.231 ms    2.191 ms
+    Lavik      Total     99,998.78    0.22856 ms    1.255 ms    2.239 ms
     Dragonfly    SET        9,091.74    0.14056 ms    0.879 ms    1.503 ms
     Dragonfly    GET       90,906.79    0.25534 ms    0.967 ms    1.663 ms
     Dragonfly    Total     99,998.54    0.24490 ms    0.967 ms    1.663 ms
 
-Keylane's total average latency was 6.7% lower, with SET and GET averages 30.2%
+Lavik's total average latency was 6.7% lower, with SET and GET averages 30.2%
 and 5.4% lower. Dragonfly's SET and GET p99.99 were 38.2% and 24.1% lower;
-its total p99.99 was 25.7% lower. Server CPU averaged 269.75% for Keylane and
+its total p99.99 was 25.7% lower. Server CPU averaged 269.75% for Lavik and
 262.92% for Dragonfly. All GETs hit on both systems.
 
 The first Dragonfly 1:10 attempt encountered the recurring six-second NVMe
 slowdown and finished at 97,230.91 operations/s. Its SET and GET p99.99 were
 1.759 ms and 2.367 ms. The clean confirmation above is the comparison headline,
-matching the treatment of the corresponding Keylane run. Both raw runs remain
+matching the treatment of the corresponding Lavik run. Both raw runs remain
 available in /tmp.
 
 After all Dragonfly mixed tests, DBSIZE remained exactly 200,000,000; sampled
@@ -2005,7 +2005,7 @@ historical comparison, but it was no longer running during the 390197c retest.
 
 ### Pure read, one connection, 10 workers
 
-Keylane used 10 workers pinned to CPUs 0-9. memtier used one thread and one
+Lavik used 10 workers pinned to CPUs 0-9. memtier used one thread and one
 connection pinned to CPUs 10-15. The test ran for 60 seconds against the full
 200-million-key range with fixed 2000-byte values and no rate limit.
 
@@ -2019,7 +2019,7 @@ connection pinned to CPUs 10-15. The test ran for 60 seconds against the full
     hits:        310,470
     misses:      0
 
-Keylane phase logging reported 167.2 to 169.6 us average total latency and
+Lavik phase logging reported 167.2 to 169.6 us average total latency and
 119.0 to 119.6 us storage-I/O latency. Device read await averaged 0.112 ms.
 The single serial connection limits throughput to approximately the reciprocal
 of the average request latency; this is not a server throughput limit.
@@ -2095,34 +2095,34 @@ p99.99 remained 2.479 ms.
 
 These disappear after reboot:
 
-    /tmp/keylane-raw512-fill-iostat.log
-    /tmp/keylane-raw512-read-iostat.log
-    /tmp/keylane-raw512-read-memtier.log
-    /tmp/keylane-raw512-flush128-mixed-server.log
-    /tmp/keylane-raw512-flush128-mixed.iostat
-    /tmp/keylane-raw512-flush128-mixed.memtier
-    /tmp/keylane-raw512-flush128-mixed-1to1.iostat
-    /tmp/keylane-raw512-flush128-mixed-1to1.memtier
-    /tmp/keylane-raw512-flush128-mixed-1to1-300s.iostat
-    /tmp/keylane-raw512-flush128-mixed-1to1-300s.memtier
-    /tmp/keylane-main411-w10-oneconn-read.memtier
-    /tmp/keylane-main411-w10-oneconn-read.pidstat
-    /tmp/keylane-main411-w10-oneconn-read.iostat
-    /tmp/keylane-main411-w10-oneconn-server.log
-    /tmp/keylane-c3488d9-w8-refill-server.log
-    /tmp/keylane-c3488d9-w8-refill.memtier
-    /tmp/keylane-c3488d9-w8-refill.iostat
-    /tmp/keylane-c3488d9-w8-refill.pidstat
-    /tmp/keylane-c3488d9-w8-recovery-server.log
-    /tmp/keylane-c3488d9-w8-read-warmup.memtier
-    /tmp/keylane-c3488d9-w8-read80.memtier
-    /tmp/keylane-c3488d9-w8-read80.iostat
-    /tmp/keylane-c3488d9-w8-read80.pidstat
-    /tmp/keylane-c3488d9-w8-read80.perf.data
-    /tmp/keylane-c3488d9-w8-read80-perf.memtier
-    /tmp/keylane-c3488d9-w8-mixed1to1.{memtier,iostat,pidstat}
-    /tmp/keylane-c3488d9-w8-mixed1to10.{memtier,iostat,pidstat}
-    /tmp/keylane-c3488d9-w8-mixed1to10-confirm.{memtier,iostat,pidstat}
+    /tmp/lavik-raw512-fill-iostat.log
+    /tmp/lavik-raw512-read-iostat.log
+    /tmp/lavik-raw512-read-memtier.log
+    /tmp/lavik-raw512-flush128-mixed-server.log
+    /tmp/lavik-raw512-flush128-mixed.iostat
+    /tmp/lavik-raw512-flush128-mixed.memtier
+    /tmp/lavik-raw512-flush128-mixed-1to1.iostat
+    /tmp/lavik-raw512-flush128-mixed-1to1.memtier
+    /tmp/lavik-raw512-flush128-mixed-1to1-300s.iostat
+    /tmp/lavik-raw512-flush128-mixed-1to1-300s.memtier
+    /tmp/lavik-main411-w10-oneconn-read.memtier
+    /tmp/lavik-main411-w10-oneconn-read.pidstat
+    /tmp/lavik-main411-w10-oneconn-read.iostat
+    /tmp/lavik-main411-w10-oneconn-server.log
+    /tmp/lavik-c3488d9-w8-refill-server.log
+    /tmp/lavik-c3488d9-w8-refill.memtier
+    /tmp/lavik-c3488d9-w8-refill.iostat
+    /tmp/lavik-c3488d9-w8-refill.pidstat
+    /tmp/lavik-c3488d9-w8-recovery-server.log
+    /tmp/lavik-c3488d9-w8-read-warmup.memtier
+    /tmp/lavik-c3488d9-w8-read80.memtier
+    /tmp/lavik-c3488d9-w8-read80.iostat
+    /tmp/lavik-c3488d9-w8-read80.pidstat
+    /tmp/lavik-c3488d9-w8-read80.perf.data
+    /tmp/lavik-c3488d9-w8-read80-perf.memtier
+    /tmp/lavik-c3488d9-w8-mixed1to1.{memtier,iostat,pidstat}
+    /tmp/lavik-c3488d9-w8-mixed1to10.{memtier,iostat,pidstat}
+    /tmp/lavik-c3488d9-w8-mixed1to10-confirm.{memtier,iostat,pidstat}
     /tmp/dragonfly-v1.40-w8-tiered-server.log
     /tmp/dragonfly-v1.40-w8-refill.{memtier,iostat,pidstat}
     /tmp/dragonfly-v1.40-w8-read80.{memtier,iostat,pidstat}
@@ -2139,16 +2139,16 @@ These disappear after reboot:
 2. Clean device windows still have software or individual-I/O tail latency.
    Clean pure-read p99.9 is about 1 ms and p99.99 is about 2-3 ms.
 
-3. Detailed Keylane phase histograms show storage IO and cross-core routing both
+3. Detailed Lavik phase histograms show storage IO and cross-core routing both
    contribute to p99.99. One-second iostat cannot reveal individual IO tails.
 
 4. A useful next test is simultaneous block-layer eBPF latency tracing and
-   Keylane phase histograms during a clean 100K QPS window.
+   Lavik phase histograms during a clean 100K QPS window.
 
 5. For a fair flush-size comparison, restart with --flush-size-kb=8192 and run
    the same five-minute 1:1 workload. Compare GET p99.9/p99.99, wareq-sz, and
    per-second read await against the 128 KiB results.
 
-6. No Keylane or Dragonfly process was left running after the 390197c retest.
-   The final Keylane shutdown drained requests and durably flushed all storage
+6. No Lavik or Dragonfly process was left running after the 390197c retest.
+   The final Lavik shutdown drained requests and durably flushed all storage
    buffers.
