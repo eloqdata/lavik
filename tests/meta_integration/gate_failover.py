@@ -683,6 +683,33 @@ def wait_owner(fixture, owner, nodes, timeout=90):
         raise H.Failure(f"{error}; status={latest}") from error
 
 
+def wait_candidate_source(fixture, owner, term, candidate_ids):
+    """Wait for Meta's candidate evidence after local replication catches up."""
+    source_history = replication_info_fields(
+        fixture.by_id[owner])["master_replid"]
+    expected = {
+        "source_term": str(term), "source_node": owner,
+        "source_history": source_history,
+        "storage_ready": "true", "population_ready": "true",
+    }
+
+    def advertised():
+        fixture.rediscover_leader(time.monotonic() + 5)
+        reply = fixture.leader.observations(GROUP)
+        if not reply.startswith("OK candidates="):
+            raise H.Failure(f"candidate observation query failed: {reply}")
+        for entry in reply.split()[2:]:
+            fields = dict(field.split("=", 1) for field in entry.split(","))
+            if (fields.get("node") in candidate_ids and
+                    all(fields.get(key) == value
+                        for key, value in expected.items())):
+                return True
+        return False
+
+    H.wait_until("Meta observes a candidate in the current source domain",
+                 30, advertised)
+
+
 def wait_serving_owner(fixture, owner, connected_nodes, timeout=90):
     """Wait for cutover while a deliberately partitioned member is stale."""
     latest = None
@@ -962,9 +989,9 @@ class FailoverFixture:
         # replica-initialization operation. Once the Owner-only topology is
         # Created, both replicas enter through the production steady
         # FollowOwner path that failover also relies on after cutover.
-        # Allow the deliberately serial topology setup and controlled-failover
-        # fault cuts to finish within a finite, long suspicion interval. Gates
-        # for automatic detection install their short threshold once READY.
+        # Allow topology setup and controlled-failover fault cuts to finish
+        # within a finite, long suspicion interval. Automatic detection gates
+        # install their short threshold once READY.
         write_manifest(
             self.manifest, self.metas, self.data_nodes[:1],
             automatic_uncontrolled_failover_suspect_after_ms=
@@ -972,7 +999,10 @@ class FailoverFixture:
         for proxy in self.control_proxies:
             proxy.start()
         for meta in self.metas:
-            meta.start(initial_cluster_manifest=self.manifest)
+            # Spawn all peers before waiting for the elected leader and stable
+            # membership. start() mutates fault-hook environment variables, so
+            # launch sequentially without introducing concurrent Python calls.
+            meta.start(initial_cluster_manifest=self.manifest, wait_ready=False)
         self.leader = H.find_leader(self.metas, timeout=20)
         membership_deadline = time.monotonic() + 10
         latest = None
@@ -992,12 +1022,20 @@ class FailoverFixture:
         leader_seed = getattr(
             self.leader, "advertised_data_control_endpoint",
             self.leader.data_control_endpoint)
-        for data in self.data_nodes[:1]:
+        starting_nodes = self.data_nodes if add_follower else self.data_nodes[:1]
+        for data in starting_nodes:
             # A bootstrap seed is not a leader-discovery service. Once the
             # first FDS is installed, committed membership drives reconnects;
             # before that point a non-leader seed can only reject the client.
             data.seed = leader_seed
-            data.start()
+            data.start(wait_ready=False)
+        # All Data storage initialization can overlap. Replica control sessions
+        # retry at a short bounded interval until Owner-only creation finishes
+        # and their identities can be registered for steady FollowOwner.
+        H.wait_until(
+            "initial Data metrics listeners", 20,
+            lambda: all(data.alive() and data._metrics_ready()
+                        for data in starting_nodes))
 
         created = run_command([
             self.ctl, "cluster-create", "--manifest", self.manifest,
@@ -1008,28 +1046,40 @@ class FailoverFixture:
             raise H.Failure(f"cluster-create was not accepted: {created!r}")
         wait_ready(self, "initial Owner-only cluster reaches READY")
         if add_follower:
-            self.add_replica(CANDIDATE)
-            self.add_replica(FOLLOWER)
+            self.add_replicas((CANDIDATE, FOLLOWER), started=True)
 
     def add_replica(self, node_id):
-        replica = self.by_id[node_id]
+        self.add_replicas((node_id,))
+
+    def add_replicas(self, node_ids, *, started=False):
+        """Assign replicas without waiting for each population to become ready."""
+        replicas = [self.by_id[node_id] for node_id in node_ids]
         self.rediscover_leader(time.monotonic() + 5)
-        replica.seed = getattr(
+        seed = getattr(
             self.leader, "advertised_data_control_endpoint",
             self.leader.data_control_endpoint)
-        replica.start()
-        registered = self.leader.registernode(
-            node_id, f"lavik://node/{node_id}", "replica",
-            endpoints=(replica.advertised_endpoint,))
-        if not registered.startswith("OK "):
-            raise H.Failure(
-                f"replica {node_id[:8]} registration failed: {registered}")
-        assigned = self.leader.assignnode(GROUP, node_id, "replica")
-        if not assigned.startswith("OK "):
-            raise H.Failure(
-                f"replica {node_id[:8]} assignment failed: {assigned}")
+        for replica in replicas:
+            node_id = replica.node_id
+            registered = self.leader.registernode(
+                node_id, f"lavik://node/{node_id}", "replica",
+                endpoints=(replica.advertised_endpoint,))
+            if not registered.startswith("OK "):
+                raise H.Failure(
+                    f"replica {node_id[:8]} registration failed: {registered}")
+        if not started:
+            for replica in replicas:
+                replica.seed = seed
+                replica.start(wait_ready=False)
+        # Group revision and topology epoch use CAS, so commit assignments in
+        # order. Their FULL populations can then run concurrently; READY is a
+        # single barrier after every replica has been assigned.
+        for replica in replicas:
+            assigned = self.leader.assignnode(GROUP, replica.node_id, "replica")
+            if not assigned.startswith("OK "):
+                raise H.Failure(
+                    f"replica {replica.node_id[:8]} assignment failed: {assigned}")
         wait_ready(self,
-                   f"replica {node_id[:8]} follows Owner and cluster "
+                   "assigned replicas follow Owner and cluster "
                    "returns to READY")
 
     def seed_and_wait_for_replicas(self, key, value, replica_ids):
@@ -1240,6 +1290,12 @@ def run_controlled(meta_binary, data_binary, ctl, redis_cli, workdir,
         # owner's grant. The next transition must treat that id as authority
         # provenance for the current owner, not as a pending activation on its
         # newly selected candidate.
+        # Local reparent/data visibility can precede its next Meta heartbeat.
+        # The second failover needs advertised evidence in the new source domain.
+        wait_candidate_source(
+            fixture, successor, 2,
+            tuple(node.node_id for node in fixture.data_nodes
+                  if node.node_id != successor))
         second_operation_id = fixture.submit_failover()
         if second_operation_id == operation_id:
             raise H.Failure("second controlled failover reused operation id")
@@ -1366,29 +1422,7 @@ def run_full_fallback(meta_binary, data_binary, ctl, redis_cli, workdir,
             # Local replay can finish before its next Meta heartbeat. The
             # next controlled transition needs a candidate in the new source
             # domain, not merely a preserved parent-domain Ready population.
-            source_history = replication_info_fields(
-                fixture.by_id[owner])["master_replid"]
-            expected_candidate = {
-                "node": peer, "source_term": str(term), "source_node": owner,
-                "source_history": source_history,
-                "storage_ready": "true", "population_ready": "true",
-            }
-
-            def peer_advertised_current_source():
-                fixture.rediscover_leader(time.monotonic() + 5)
-                reply = fixture.leader.observations(GROUP)
-                if not reply.startswith("OK candidates="):
-                    raise H.Failure(f"candidate observation query failed: {reply}")
-                for entry in reply.split()[2:]:
-                    fields = dict(field.split("=", 1)
-                                  for field in entry.split(","))
-                    if all(fields.get(key) == value
-                           for key, value in expected_candidate.items()):
-                        return True
-                return False
-
-            H.wait_until("Meta observes the peer in the current source domain",
-                         30, peer_advertised_current_source)
+            wait_candidate_source(fixture, owner, term, (peer,))
 
         # Only the immediate parent bridge survives. The paused replica still
         # owns term-1 Active and must now rebuild from the term-3 Owner.

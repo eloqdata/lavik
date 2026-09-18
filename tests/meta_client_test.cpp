@@ -104,23 +104,18 @@ TEST(MetaControlIdentityTest, UnresolvedSeedBootstrapsFromServerHello) {
   EXPECT_TRUE(ValidateDialedMetaIdentity(seed, hello_member).ok());
 }
 
-TEST(MetaReconnectBackoffTest, UsesFullJitterAndResetsOnlyExplicitly) {
-  MetaReconnectBackoff backoff;
-  EXPECT_EQ(MetaReconnectBackoff::MaximumWindow(),
-            std::chrono::milliseconds(10000));
-  EXPECT_EQ(backoff.window(), std::chrono::milliseconds(1000));
-  EXPECT_EQ(backoff.Next(0), std::chrono::milliseconds(0));
-  EXPECT_EQ(backoff.window(), std::chrono::milliseconds(2000));
-  EXPECT_EQ(backoff.Next(2000), std::chrono::milliseconds(2000));
-  EXPECT_EQ(backoff.window(), std::chrono::milliseconds(4000));
-  (void)backoff.Next(999999);
-  (void)backoff.Next(999999);
-  EXPECT_EQ(backoff.window(), MetaReconnectBackoff::MaximumWindow());
-  (void)backoff.Next(999999);
-  EXPECT_EQ(backoff.window(), MetaReconnectBackoff::MaximumWindow());
-
-  backoff.Reset();
-  EXPECT_EQ(backoff.window(), std::chrono::milliseconds(1000));
+TEST(MetaReconnectPolicyTest, RepeatedFailuresKeepRetryWithinBoundedJitter) {
+  EXPECT_EQ(MetaReconnectPolicy::MaximumDelay(),
+            std::chrono::milliseconds(120));
+  EXPECT_EQ(MetaReconnectPolicy::Next(0), std::chrono::milliseconds(80));
+  EXPECT_EQ(MetaReconnectPolicy::Next(20), std::chrono::milliseconds(100));
+  EXPECT_EQ(MetaReconnectPolicy::Next(40), std::chrono::milliseconds(120));
+  for (std::uint64_t attempt = 0; attempt < 1000; ++attempt) {
+    const auto delay = MetaReconnectPolicy::Next(attempt * 7919);
+    EXPECT_GE(delay, std::chrono::milliseconds(80));
+    EXPECT_LE(delay, MetaReconnectPolicy::MaximumDelay());
+  }
+  EXPECT_EQ(MetaReconnectPolicy::Next(0), std::chrono::milliseconds(80));
 }
 
 TEST(MetaSessionRunResultTest,

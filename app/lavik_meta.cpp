@@ -893,11 +893,19 @@ int main(int argc, char** argv) {
       std::make_shared<lavik::meta::MetaMembershipReconciler>(
           foreign_executor, *proposal_executor, server, state_machine,
           state_mgr, membership_gate);
+  // Older Data binaries use exponential retry with up to 10 seconds of sleep.
+  // No handshake field negotiates that bound, so retain their observation
+  // grace during rolling upgrades even though current clients retry promptly.
+  constexpr auto kLegacyDataReconnectDelay = std::chrono::seconds(10);
+  const auto data_reconnect_grace =
+      std::max(std::chrono::duration_cast<std::chrono::milliseconds>(
+                   kLegacyDataReconnectDelay),
+               lavik::cluster::MetaReconnectPolicy::MaximumDelay());
   const std::uint64_t leader_observation_grace_ms =
       static_cast<std::uint64_t>(std::max<std::int64_t>(
           observation_ttl_ms,
           static_cast<std::int64_t>(options.election_ms_high_) +
-              lavik::cluster::MetaReconnectBackoff::MaximumWindow().count()));
+              data_reconnect_grace.count()));
   lavik::meta::MetaAutomaticFailoverReconcilerOptions
       automatic_failover_options;
   automatic_failover_options.data_control_runtime_status_ =

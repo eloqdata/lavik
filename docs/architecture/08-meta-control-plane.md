@@ -327,9 +327,11 @@ workflow state. Demotion or shutdown cancels and joins local planning/proposal
 work while leaving the committed transition for the next leader. A leadership
 warmup equal to the observation grace prevents a new leader from treating
 not-yet-reported boots as failures. The process derives that grace as at least
-the Raft election upper bound plus Data's maximum reconnect window, and never
-shorter than the observation TTL. This covers a healthy Data process that just
-misses the winning election round without delaying explicit disconnect or
+the Raft election upper bound plus the maximum supported Data reconnect delay,
+and never shorter than the observation TTL. The delay bound retains ten seconds
+for older Data binaries during rolling upgrades; current clients retry within
+120 ms, but the session handshake does not negotiate their retry policy. This
+covers a healthy Data process that just misses the winning election round without delaying explicit disconnect or
 typed action-failure evidence.
 
 The absolute Controlled deadline is a leader-side proposal-admission cutoff,

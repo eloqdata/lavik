@@ -1210,14 +1210,13 @@ std::string EncodeRebuildAuthorityIdentity(const AuthorityAnchor& anchor) {
                       anchor.group_term_);
 }
 
-std::chrono::milliseconds MetaReconnectBackoff::Next(
+std::chrono::milliseconds MetaReconnectPolicy::Next(
     std::uint64_t entropy) noexcept {
-  const auto current = window_;
-  const std::uint64_t choices = static_cast<std::uint64_t>(current.count()) + 1;
-  const auto delay =
-      std::chrono::milliseconds(static_cast<std::int64_t>(entropy % choices));
-  window_ = std::min(window_ * 2, MaximumWindow());
-  return delay;
+  constexpr auto minimum = std::chrono::milliseconds(80);
+  constexpr auto choices =
+      static_cast<std::uint64_t>((MaximumDelay() - minimum).count()) + 1;
+  return minimum + std::chrono::milliseconds(
+                       static_cast<std::int64_t>(entropy % choices));
 }
 
 MetaEndpointDirectory::MetaEndpointDirectory(
@@ -3222,11 +3221,10 @@ struct MetaControlClientService::Impl {
   TopologyCache& topology_;
   ReplicationManager& replication_;
   MetaEndpointDirectory directory_;
-  MetaReconnectBackoff backoff_;
   std::atomic<bool> stopping_{false};
   unsigned prepared_thread_count_ = 0;
   // Worker-zero-owned, first result wins. Stop can arrive while connected or
-  // during reconnect backoff; both paths must join the same preserve-nothing
+  // during reconnect delay; both paths must join the same preserve-nothing
   // target-population barrier before WaitUntilQuiesced returns.
   std::optional<absl::Status> shutdown_population_result_;
 
@@ -3321,7 +3319,6 @@ bycorf::Task<absl::Status> MetaControlClientService::Run(
         break;
       }
       if (valid_ack) {
-        impl_->backoff_.Reset();
         break;
       }
     }
@@ -3336,7 +3333,7 @@ bycorf::Task<absl::Status> MetaControlClientService::Run(
       completed.SetResult(run_status);
       co_return run_status;
     }
-    auto remaining = impl_->backoff_.Next(*entropy);
+    auto remaining = MetaReconnectPolicy::Next(*entropy);
     while (remaining > std::chrono::milliseconds::zero() &&
            !impl_->stopping_.load(std::memory_order_acquire) &&
            !worker.stop_requested()) {

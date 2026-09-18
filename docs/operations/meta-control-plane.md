@@ -471,10 +471,11 @@ waiting for that process to restart when an eligible replacement exists;
 otherwise Meta clears the failed action and waits with no candidate. A Meta
 leader change temporarily waits for fresh boot-scoped observations, then
 resumes from the committed Group transition. The warmup covers the configured
-election upper bound plus Data's maximum reconnect sleep (and is never shorter
-than the observation TTL); do not infer failure solely from that bounded
-interval. A candidate's current-session disconnect or typed action failure
-takes effect immediately. An exact source disconnect starts its independent
+election upper bound plus a ten-second reconnect allowance for older Data
+binaries (and is never shorter than the observation TTL). Current Data retries
+every 80–120 ms; the compatibility allowance remains for rolling upgrades. Do
+not infer failure solely from that bounded interval. A candidate's current-session
+disconnect or typed action failure takes effect immediately. An exact source disconnect starts its independent
 grace and degrades only if that grace expires or replacement evidence appears.
 
 Uncontrolled recovery has Redis Cluster-grade asynchronous loss semantics. It

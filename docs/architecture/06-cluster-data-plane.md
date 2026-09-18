@@ -260,8 +260,10 @@ process from becoming current even though the durable data files remain.
 
 The Data process connects outward from configured numeric seed endpoints. It
 tries the accepted leader hint, the latest in-memory committed directory, then
-the configured bootstrap seeds, with full-jitter exponential backoff from one
-to ten seconds.
+the configured bootstrap seeds. Retry rounds wait 100 ms with bounded jitter
+from 80 to 120 ms, both at startup and after session loss. Failures do not
+accumulate backoff: control loss closes serving admission, so an available Meta
+leader must remain promptly discoverable.
 An unresolved seed remains a fallback even when a learned member currently
 announces the same endpoint, because endpoint ownership can legitimately change
 across reconfiguration. A response replaces the in-memory directory atomically
@@ -270,8 +272,8 @@ agree. A learned dial target pins that exact prior committed principal against
 the new `ServerHello`; only an unresolved configured seed may bootstrap its
 binding from the authenticated Hello. The hint and directory are intentionally
 not persisted. Connect, TLS, Hello, read progress, and write progress each have
-a ten-second bound; backoff resets only after an accepted session has produced
-a valid `HeartbeatAck`.
+a ten-second bound. Retry timing is independent of session success or failure
+count.
 
 The session uses control protocol v1 with framing independent of TCP packets.
 A fixed header carries type, length, per-direction sequence, and CRC32C. Frames

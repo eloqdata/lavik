@@ -113,23 +113,18 @@ absl::Status FitHeartbeatToSingleFrame(control::Heartbeat& heartbeat);
 // the complete authority anchor.
 std::string EncodeRebuildAuthorityIdentity(const AuthorityAnchor& anchor);
 
-// Full-jitter reconnect policy: draw uniformly from [0, current_window], then
-// double the window up to 10 seconds. Call Reset only after an accepted
-// session has produced a valid HeartbeatAck.
-class MetaReconnectBackoff {
+// Retry every 100 ms with bounded jitter, both during startup and after session
+// loss. There is no failure-count state: control loss closes serving admission,
+// so repeated failures must not accumulate additional recovery delay.
+class MetaReconnectPolicy {
  public:
-  // Shared with Meta's new-leader observation warmup so a live Data process
-  // cannot be declared absent while still inside a permitted reconnect sleep.
-  static constexpr std::chrono::milliseconds MaximumWindow() noexcept {
-    return std::chrono::seconds(10);
+  static constexpr std::chrono::milliseconds MaximumDelay() noexcept {
+    return std::chrono::milliseconds(120);
   }
 
-  std::chrono::milliseconds Next(std::uint64_t entropy) noexcept;
-  void Reset() noexcept { window_ = std::chrono::milliseconds(1000); }
-  std::chrono::milliseconds window() const noexcept { return window_; }
-
- private:
-  std::chrono::milliseconds window_{1000};
+  // Uniformly choose an interval in [80, 120] ms to spread simultaneous
+  // redials.
+  static std::chrono::milliseconds Next(std::uint64_t entropy) noexcept;
 };
 
 // Volatile discovery directory. A known leader is tried first, then the
