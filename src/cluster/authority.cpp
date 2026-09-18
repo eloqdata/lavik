@@ -53,7 +53,7 @@ bool InvolvedGroupsReady(const ServingState& state,
 }  // namespace
 
 AuthorityAdmission::AuthorityAdmission(AuthorityAdmission&& other) noexcept
-    : decision_(std::move(other.decision_)),
+    : decision_(std::exchange(other.decision_, Decision{})),
       state_(std::move(other.state_)),
       slots_(std::move(other.slots_)),
       gate_generation_(other.gate_generation_),
@@ -66,7 +66,8 @@ AuthorityAdmission::AuthorityAdmission(AuthorityAdmission&& other) noexcept
 AuthorityAdmission& AuthorityAdmission::operator=(
     AuthorityAdmission&& other) noexcept {
   if (this == &other) return *this;
-  decision_ = std::move(other.decision_);
+  // The moved-from admission no longer owns the snapshot behind its host.
+  decision_ = std::exchange(other.decision_, Decision{});
   state_ = std::move(other.state_);
   slots_ = std::move(other.slots_);
   gate_generation_ = other.gate_generation_;

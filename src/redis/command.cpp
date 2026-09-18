@@ -940,16 +940,19 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
       .loading_allowed_ = LoadingAllowedCommand(request) &&
                           request.kind_ != CommandKind::kPublish,
   };
-  auto admission = std::make_shared<const cluster::AuthorityAdmission>(
-      runtime->authority_guard_.CaptureAndAdmit(view,
-                                                cluster::LeaseClockNow()));
-  if (!EmitClusterDecision(admission->decision(), request.connection_tls_,
+  auto admission =
+      runtime->authority_guard_.CaptureAndAdmit(view, cluster::LeaseClockNow());
+  if (!EmitClusterDecision(admission.decision(), request.connection_tls_,
                            reply_builder, reply)) {
-    // Reads intentionally have no owner-side re-check, so retaining their
-    // proof would only bounce a shared reference-count cacheline between
-    // workers. Writes must retain the lease generation and deadline captured
-    // together with their committed topology.
-    if (is_write) request.cluster_authority_admission_ = std::move(admission);
+    // Reads need no owner-side re-check; rejected requests already have their
+    // reply. Only admitted writes allocate a shared proof to retain across
+    // worker hops and storage checks. The local admission owns any borrowed
+    // MOVED host until EmitClusterDecision has copied it into the reply.
+    if (is_write) {
+      request.cluster_authority_admission_ =
+          std::make_shared<const cluster::AuthorityAdmission>(
+              std::move(admission));
+    }
     return false;
   }
   return true;

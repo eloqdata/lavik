@@ -78,9 +78,11 @@ struct Decision {
   };
   Kind kind_ = Kind::kServe;
   std::uint16_t moved_slot_ = 0;
-  std::string moved_host_;  // concrete advertised address, never empty
   std::uint16_t moved_port_ = 0;
   std::uint16_t moved_tls_port_ = 0;
+  // Only kMoved uses this nonempty address. Borrows the node's host from the
+  // admitted ServingState, which must outlive every use of this view.
+  std::string_view moved_host_;
 };
 
 // Single admission decision, evaluated against one committed snapshot.
@@ -93,6 +95,8 @@ struct Decision {
 // kMoved — the redirect target applies its own grant gate and answers
 // CLUSTERDOWN, so the client never reaches a writable fenced node; the grant
 // bit is only consumed by the node holding it.
+// The returned Decision borrows its MOVED host from `state`; callers must keep
+// that snapshot alive until the address has been consumed.
 Decision Admit(const ServingState* state, const RequestView& request);
 
 // Owner-side authority re-check result. The request path first registers its
@@ -163,6 +167,8 @@ class AuthorityAdmission {
   AuthorityAdmission(AuthorityAdmission&& other) noexcept;
   AuthorityAdmission& operator=(AuthorityAdmission&& other) noexcept;
 
+  // state_ owns the borrowed MOVED host. Copying this decision does not retain
+  // that ownership; consume its address before releasing or replacing state_.
   const Decision& decision() const noexcept { return decision_; }
   const std::shared_ptr<const ServingState>& state() const noexcept {
     return state_;

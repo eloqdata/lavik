@@ -23,12 +23,14 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "cluster/test_topology_installer.h"
 #include "lavik/cluster/authority.h"
 #include "lavik/cluster/node_control.h"
 #include "lavik/cluster/topology.h"
+#include "lavik/resp.h"
 
 namespace {
 
@@ -397,6 +399,60 @@ TEST(ClusterAuthorityTest, NonMemberMovesToPrimary) {
   const std::array<std::uint16_t, 1> slots{kSlotInA};
   ExpectMovedToNodeA(Admit(state.get(), MakeRequest(slots, false)), kSlotInA);
   ExpectMovedToNodeA(Admit(state.get(), MakeRequest(slots, true)), kSlotInA);
+}
+
+TEST(ClusterAuthorityTest,
+     MovedHostSurvivesSnapshotReplacementAndAdmissionMoves) {
+  const std::array<std::string, 3> hosts{
+      "10.0.0.1", "2001:db8:85a3:0000:0000:8a2e:0370:7334",
+      std::string(180, 'x') + ".example.org"};
+  for (const std::string& host : hosts) {
+    SCOPED_TRACE(host);
+    lavik::cluster::TopologyCache cache;
+    AuthorityGuard authority(cache);
+    std::weak_ptr<const ServingState> retired;
+    {
+      ServingStateBuilder builder;
+      builder.AddNode(MakeNode(kNodeA, host, 7000, 17000));
+      builder.AddGroup(MakeGroup(kGroupA, kNodeAIndex, 0, 9999));
+      auto state = builder.Build();
+      ASSERT_TRUE(state.ok()) << state.status();
+      retired = *state;
+      cache.Publish(std::move(*state));
+    }
+    const std::array<std::uint16_t, 1> slots{kSlotInA};
+    auto admission = authority.CaptureAndAdmit(MakeRequest(slots, false), {});
+    ASSERT_EQ(admission.decision().kind_, Decision::Kind::kMoved);
+    cache.Publish(BuildState(kNodeB));
+    ASSERT_FALSE(retired.expired());
+
+    lavik::cluster::AuthorityAdmission moved(std::move(admission));
+    EXPECT_TRUE(admission.decision().moved_host_.empty());
+    // Replacing an existing admission must transfer the new view and its
+    // snapshot together, even when that retires the destination's old owner.
+    auto assigned = authority.CaptureAndAdmit(MakeRequest(slots, false), {});
+    std::weak_ptr<const ServingState> replaced = assigned.state();
+    cache.Publish(nullptr);
+    assigned = std::move(moved);
+    EXPECT_TRUE(replaced.expired());
+    EXPECT_TRUE(moved.decision().moved_host_.empty());
+    EXPECT_EQ(assigned.decision().moved_host_, host);
+
+    auto shared = std::make_shared<const lavik::cluster::AuthorityAdmission>(
+        std::move(assigned));
+    std::string reply;
+    std::thread worker([owned = std::move(shared), &host, &reply] {
+      EXPECT_EQ(owned->decision().moved_host_, host);
+      lavik::ReplyBuilder builder;
+      reply = lavik::AppendMovedError(builder, owned->decision().moved_slot_,
+                                      owned->decision().moved_host_,
+                                      owned->decision().moved_port_);
+    });
+    worker.join();
+    EXPECT_TRUE(retired.expired());
+    // Network output owns the encoded bytes after the last admission dies.
+    EXPECT_EQ(reply, "-MOVED 5 " + host + ":7000\r\n");
+  }
 }
 
 TEST(ClusterAuthorityTest, AuthorityUnchangedAcrossEqualStates) {
