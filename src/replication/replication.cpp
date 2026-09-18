@@ -256,6 +256,9 @@ Task<absl::Status> WaitAtSourceAdmissionFaultBarrier(
 // there is deliberately no wall-clock limit on the whole synchronization.
 constexpr auto kFullSyncStallTimeout = std::chrono::minutes(10);
 constexpr auto kReconnectDelay = std::chrono::seconds(1);
+// A new Owner may still be opening admission when replicas first reconnect.
+// Keep that transient denial from adding a full second to convergence.
+constexpr auto kNativeReconnectDelay = std::chrono::milliseconds(100);
 constexpr auto kRedisTopologyPollInterval = std::chrono::seconds(2);
 // Keep snapshot reads and captured writes on a small, symmetric scheduling
 // quantum. Snapshot records are accumulated separately into transfer-sized
@@ -10798,8 +10801,11 @@ class ReplicationManager::ReplicationGroup {
       StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
       spdlog::warn("replication connection to {}:{} ended: {}", upstream.host_,
                    upstream.port_, connected.message());
+      // The pre-mutation FULL path has a three-retry budget; preserve its
+      // lease-renewal window while ordinary following reconnects promptly.
       absl::Status slept = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, kReconnectDelay);
+          *bycorf::ThisWorker().self_,
+          lease_admission_retry ? kReconnectDelay : kNativeReconnectDelay);
       if (!slept.ok()) {
         coordinator_started_ = false;
         co_return slept;
