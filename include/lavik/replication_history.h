@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -55,11 +56,15 @@ struct NativeHistoryRecordInfo {
   bool operator==(const NativeHistoryRecordInfo&) const = default;
 };
 
-// One shared history quota for the group's published primary blocks and
-// optional canonical secondary effects. Primary publication reclaims secondary
+// One worker's history quota for published primary blocks and optional
+// canonical secondary effects, stored with the source backlog's block storage.
+// The quota counts allocated block capacity; indexes also enter process memory
+// accounting. Primary publication reclaims secondary
 // entries synchronously and never waits for a secondary reader. Metadata and
 // payload allocations also participate in ordinary retained-memory accounting.
-// Thread-safe; no method calls storage or holds a lock across a suspension.
+// All access, including PrimaryCharge release, belongs to the owning worker.
+// Cross-worker callers must submit work to that owner and receive copies. A
+// complete effect stays on its apply worker even when it spans several flows.
 class ReplicationHistory {
   struct Impl;
 
@@ -97,9 +102,17 @@ class ReplicationHistory {
 
   // Call only after the entire logical effect has applied successfully. An
   // admission failure loses optional coverage, never application progress.
-  // Duplicate/invalid participant records reject the entire cache insertion.
+  // Flow LSNs must increase on this worker (gaps are allowed). Duplicate, late
+  // or invalid participant records reject the entire cache insertion. Complete
+  // effects stay together in a block, so block eviction never splits an effect.
   bool TryRetain(std::string_view history_id,
                  std::vector<NativeHistoryRecord> records);
+  // Single-flow completion uses the same block append without allocating a
+  // temporary participant vector. The caller retains ownership of the bytes.
+  bool TryRetainOne(std::string_view history_id,
+                    const NativeHistoryRecord& record);
+  // Local intervals may interleave with another worker's intervals for the
+  // same origin flow. Export must merge them before applying its wire limit.
   std::vector<std::vector<NativeHistoryRange>> Coverage(
       std::string_view history_id, std::size_t max_ranges_per_flow = 8) const;
   absl::StatusOr<std::vector<NativeHistoryRecordInfo>> DescribeEffect(
@@ -115,6 +128,8 @@ class ReplicationHistory {
   std::size_t secondary_bytes() const;
 
  private:
+  bool RetainSorted(std::string_view history_id,
+                    std::span<const NativeHistoryRecord> records);
   std::shared_ptr<Impl> impl_;
 };
 

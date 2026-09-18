@@ -36,6 +36,13 @@ struct NativeRecoveryAdvertisement {
 inline constexpr std::size_t kRecoveryMetadataBytes = 256 * 1024;
 inline constexpr std::size_t kRecoveryReceiveBytes = 8 * 1024 * 1024;
 
+// Coalesces copied worker-local intervals before retaining the newest eight
+// ranges per origin flow. Truncating individual workers first would lose a
+// continuous suffix whose ordinary and transactional events have different
+// apply owners. This is availability evidence; readers still revalidate bytes.
+std::vector<std::vector<NativeHistoryRange>> MergeWorkerHistoryCoverage(
+    std::vector<std::vector<NativeHistoryRange>> ranges);
+
 absl::StatusOr<std::string> EncodeRecoveryAdvertisement(
     const NativeRecoveryAdvertisement& report);
 absl::StatusOr<NativeRecoveryAdvertisement> DecodeRecoveryAdvertisement(

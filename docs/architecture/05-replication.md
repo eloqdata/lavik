@@ -355,13 +355,30 @@ or complete replacement succeeds.
 
 ### Retained history and Candidate Recovery
 
-Every native follower retains an optional bounded suffix of original canonical
-logical effects after complete apply. Initial FULL contributes no fabricated
+Meta-managed native followers retain an optional bounded suffix of original
+canonical logical effects after complete apply. Initial FULL contributes no fabricated
 history: retention begins with subsequent online events. The boot-local
-`ReplicationHistory` owns this cache and the accounting for published child
-blocks under one `repl-backlog-size` quota. Child publication has priority and
-may evict the secondary cache to zero without waiting for readers. A complete cluster Owner retains its current native domain across transient
-downstream disconnections; bounded log eviction still applies. Publisher,
+`ReplicationHistory` owns one worker's cache and published child-block
+accounting. Source backlog and replica history share owner-local append-only
+block storage and sparse cursor lookup. Their retention policies remain distinct:
+source publication obeys consumer ACK pins, while optional replica history may
+be discarded without waiting. Complete replica effects remain together in a
+block, and their original domain, flow identities and LSNs survive independently
+of internal block cursors. Export builds origin-record lookup indexes on demand;
+these indexes do not participate in Applied publication.
+`repl-backlog-size` counts allocated history block capacity and is divided into
+fixed worker quotas using the primary backlog's block allocation; idle quota is
+not borrowed across workers. Block indexes and payloads also participate in
+ordinary retained-memory accounting.
+All cache reads, insertion, eviction and primary-charge release execute on that
+worker without a shared history mutex. A cross-flow logical effect stays whole
+on its apply worker. Export submits copy-out requests to the owning workers and
+merges their coverage before bounding the advertised ranges. History reset
+joins owner-local resets before publishing the replacement lineage; superseded
+reset requests cannot overwrite a newer worker-local reset. Child publication
+has priority and may evict its worker's secondary cache to zero without waiting
+for readers. A complete cluster Owner retains its current native domain across
+transient downstream disconnections; bounded log eviction still applies. Publisher,
 receive/reassembly, and transport memory have separate bounded process-memory
 charges. Readers copy bounded chunks without pinning cache entries; eviction
 withdraws coverage, never application progress or Owner write admission.
@@ -1262,6 +1279,8 @@ FLUSH/full-sync interleavings. Two legacy replication tests in
 | Runtime source-log and target full-sync interfaces | `include/lavik/storage/engine.h` |
 | Durable catalog, full-sync invalidation, population eligibility, and promotion base | `src/storage/engine/system_state.cpp`, `src/storage/engine/init.cpp` |
 | Backlog blocks, publisher/session queues, capture state, and target sync state | `src/storage/engine/impl.h` |
+| Shared owner-local history block allocation, append and sparse lookup | `src/replication/log_block.h`, `src/replication/log_block.cpp` |
+| Replica effect retention, origin-record export lookup, and shared worker quota | `include/lavik/replication_history.h`, `src/replication/replication_history.cpp` |
 | In-memory append/read/fence/retention, capacity, invalidation, and control publication | `src/storage/engine/replication_log.cpp` |
 | Manifest-filtered full-sync scanning, replacements, handoff, target reset/apply/promotion/abort, detached-index reclaim, cascade and DB-gate limitations | `src/storage/engine/replication.cpp`, `src/storage/engine/write.cpp` |
 | Frame layout, event kinds, fragmentation, and checksums | `include/lavik/storage/format.h`, `src/storage/format.cpp` |

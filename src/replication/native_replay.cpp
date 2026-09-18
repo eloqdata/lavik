@@ -184,11 +184,22 @@ absl::StatusOr<NativeReplayEffect> NativeReplay::PrepareEffect(
   return effect;
 }
 
+absl::Status NativeReplay::PublishAfterApply(unsigned publisher,
+                                             NativeHistoryRecord record) {
+  if (!applied_ || (!histories_.empty() && publisher >= histories_.size()))
+    return absl::FailedPreconditionError("native replay has no Applied cut");
+  auto status = applied_->AdvanceAfterApply(record.flow_id_, record.lsn_);
+  if (status.ok() && !histories_.empty() && !record.canonical_.empty())
+    histories_[publisher]->TryRetainOne(history_id_, record);
+  return status;
+}
+
 absl::Status NativeReplay::PublishAfterApply(
     unsigned publisher,
     std::span<const ReplicaAppliedFrontier::FlowApplied> updates,
     std::vector<NativeHistoryRecord> records) {
-  if (!applied_ || updates.empty())
+  if (!applied_ || updates.empty() ||
+      (!histories_.empty() && publisher >= histories_.size()))
     return absl::FailedPreconditionError("native replay has no Applied cut");
   auto status = updates.size() == 1
                     ? applied_->AdvanceAfterApply(updates.front().flow_id_,
@@ -205,8 +216,8 @@ absl::Status NativeReplay::PublishAfterApply(
                         update.applied_lsn_ == record.lsn_;
                });
       });
-  if (status.ok() && history_ && complete_retention)
-    history_->TryRetain(history_id_, std::move(records));
+  if (status.ok() && !histories_.empty() && complete_retention)
+    histories_[publisher]->TryRetain(history_id_, std::move(records));
   return status;
 }
 

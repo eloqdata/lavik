@@ -59,6 +59,28 @@ absl::Status Validate(const NativeRecoveryAdvertisement& report) {
 }
 }  // namespace
 
+std::vector<std::vector<NativeHistoryRange>> MergeWorkerHistoryCoverage(
+    std::vector<std::vector<NativeHistoryRange>> ranges) {
+  for (auto& flow : ranges) {
+    std::ranges::sort(flow, {}, &NativeHistoryRange::first_lsn_);
+    std::size_t count = 0;
+    for (const auto range : flow) {
+      if (count != 0 && flow[count - 1].end_lsn_ >= range.first_lsn_) {
+        flow[count - 1].end_lsn_ =
+            std::max(flow[count - 1].end_lsn_, range.end_lsn_);
+      } else {
+        flow[count++] = range;
+      }
+    }
+    // The sampled input can contain many more ranges than the wire result.
+    // Release its allocation before the caller drops the temporary merge
+    // charge; resize/erase alone would retain that unbounded capacity.
+    flow = std::vector<NativeHistoryRange>(
+        flow.begin() + (count > 8 ? count - 8 : 0), flow.begin() + count);
+  }
+  return ranges;
+}
+
 absl::StatusOr<std::string> EncodeRecoveryAdvertisement(
     const NativeRecoveryAdvertisement& report) {
   auto status = Validate(report);

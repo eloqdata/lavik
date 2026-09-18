@@ -1235,11 +1235,11 @@ class StorageEngine {
   // Runtime-only source replication backlog for the current storage worker.
   // These calls must execute on that worker. The log is shared by every
   // downstream replica; each replica owns only a ReplicationLogCursor.
-  // Installs the group's shared primary/secondary history accounting before
-  // replication starts. Published blocks retain their own charge through
-  // release.
+  // Installs one worker's primary/secondary history accounting before workers
+  // start, or on that worker before enabling its log. Published blocks retain
+  // their own charge through owner-local release.
   void SetReplicationHistory(
-      std::shared_ptr<lavik::ReplicationHistory> history);
+      unsigned worker_id, std::shared_ptr<lavik::ReplicationHistory> history);
 
   bycorf::Task<absl::Status> EnableReplicationLog(std::uint64_t log_epoch,
                                                   std::size_t capacity_bytes);

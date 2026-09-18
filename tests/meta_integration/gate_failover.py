@@ -818,7 +818,8 @@ class FailoverFixture:
     def __init__(self, meta_binary, data_binary, ctl, scenario,
                  require_fault_hook, pause_after_begin_ms=8_000,
                  pause_after_authorize_ms=None,
-                 pause_after_prepared_ms=None, proxy_data_control=False):
+                 pause_after_prepared_ms=None, proxy_data_control=False,
+                 data_workers=1):
         self.ctl = ctl
         self.scenario = scenario
         os.makedirs(scenario, mode=0o700)
@@ -885,11 +886,11 @@ class FailoverFixture:
 
         self.data_nodes = [
             DataProcess(data_binary, os.path.join(scenario, "owner"), OWNER,
-                        data_seed(self.metas[0])),
+                        data_seed(self.metas[0]), workers=data_workers),
             DataProcess(data_binary, os.path.join(scenario, "candidate"),
-                        CANDIDATE, data_seed(self.metas[1])),
+                        CANDIDATE, data_seed(self.metas[1]), workers=data_workers),
             DataProcess(data_binary, os.path.join(scenario, "follower"),
-                        FOLLOWER, data_seed(self.metas[2])),
+                        FOLLOWER, data_seed(self.metas[2]), workers=data_workers),
         ]
         self.by_id = {node.node_id: node for node in self.data_nodes}
         self.manifest = os.path.join(scenario, "cluster.toml")
@@ -1158,7 +1159,9 @@ def run_controlled(meta_binary, data_binary, ctl, redis_cli, workdir,
     del redis_cli  # RESP is driven directly so errors remain inspectable.
     fixture = FailoverFixture(
         meta_binary, data_binary, ctl, os.path.join(workdir, "controlled"),
-        require_fault_hook)
+        # Exercise owner-local history reset, quota and coverage collection
+        # across workers through two successive partial reparent operations.
+        require_fault_hook, data_workers=2)
     read_probe = None
     try:
         fixture.start_created()

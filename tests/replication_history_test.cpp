@@ -17,6 +17,7 @@
 #include "lavik/replication_history.h"
 
 #include "gtest/gtest.h"
+#include "log_block.h"
 
 namespace lavik {
 namespace {
@@ -107,6 +108,87 @@ TEST(ReplicationHistoryTest,
   EXPECT_FALSE(history.TryRetain("parent", {{0, 11, "new-tail"}}));
   primary.Reset();
   EXPECT_TRUE(history.TryRetain("parent", {{0, 11, "new-tail"}}));
+}
+
+TEST(ReplicationHistoryTest, RolloverWithdrawsEveryParticipantOfAnEffect) {
+  ReplicationHistory history(256);
+  ASSERT_TRUE(history.Reset("parent", 2).ok());
+  ASSERT_TRUE(history.TryRetain(
+      "parent", {{0, 7, std::string(64, 'a')}, {1, 9, "marker"}}));
+  auto copy = history.Read("parent", 1, 9, 0, 64);
+  ASSERT_TRUE(copy.ok());
+  // The next complete effect fits the quota, but not the remaining block.
+  ASSERT_TRUE(history.TryRetain("parent", {{0, 8, std::string(128, 'b')}}));
+  EXPECT_FALSE(history.DescribeEffect("parent", 0, 7).ok());
+  EXPECT_FALSE(history.Read("parent", 1, 9, 0, 64).ok());
+  EXPECT_EQ(copy->bytes_, "marker");
+  EXPECT_EQ(history.Coverage("parent")[0],
+            (std::vector<NativeHistoryRange>{{8, 9}}));
+  EXPECT_TRUE(history.Coverage("parent")[1].empty());
+  EXPECT_EQ(history.Read("parent", 0, 8, 127, 64)->bytes_, "b");
+}
+
+TEST(ReplicationHistoryTest, ExportIndexHandlesAppendsGapsAndLineageReset) {
+  ReplicationHistory history(32768);
+  ASSERT_TRUE(history.Reset("parent", 2).ok());
+  ASSERT_TRUE(history.TryRetain("parent", {{0, 1, "one"}}));
+  ASSERT_TRUE(history.Read("parent", 0, 1, 0, 64).ok());
+  for (std::uint64_t lsn = 2; lsn < 160; ++lsn) {
+    ASSERT_TRUE(history.TryRetain("parent", {{0, lsn * 2, std::to_string(lsn)},
+                                             {1, lsn * 3, "participant"}}));
+    auto manifest = history.DescribeEffect("parent", 1, lsn * 3);
+    ASSERT_TRUE(manifest.ok()) << manifest.status();
+    ASSERT_EQ(manifest->size(), 2);
+    EXPECT_EQ((*manifest)[0].lsn_, lsn * 2);
+    auto copy = history.Read("parent", 0, lsn * 2, 0, 64);
+    ASSERT_TRUE(copy.ok());
+    EXPECT_EQ(copy->bytes_, std::to_string(lsn));
+    EXPECT_FALSE(history.Read("parent", 0, lsn * 2 - 1, 0, 64).ok());
+  }
+  EXPECT_EQ(history.Read("parent", 0, 1, 0, 64)->bytes_, "one");
+  ASSERT_TRUE(history.Reset("child", 2).ok());
+  ASSERT_TRUE(history.TryRetain("child", {{0, 1, "child-one"}}));
+  EXPECT_FALSE(history.Read("parent", 0, 1, 0, 64).ok());
+  EXPECT_EQ(history.Read("child", 0, 1, 0, 64)->bytes_, "child-one");
+}
+
+TEST(ReplicationHistoryTest, LargeEffectRemainsWholeAcrossNormalBlockSize) {
+  constexpr auto kMiB = 1024 * 1024;
+  ReplicationHistory history(24 * kMiB);
+  ASSERT_TRUE(history.Reset("parent", 2).ok());
+  ASSERT_TRUE(history.TryRetain(
+      "parent", {{0, 7, std::string(8 * kMiB, 'x')}, {1, 9, "marker"}}));
+  auto tail = history.Read("parent", 0, 7, 8 * kMiB - 2, 64);
+  ASSERT_TRUE(tail.ok());
+  EXPECT_EQ(tail->bytes_, "xx");
+  EXPECT_EQ(tail->total_bytes_, 8 * kMiB);
+  auto manifest = history.DescribeEffect("parent", 1, 9);
+  ASSERT_TRUE(manifest.ok());
+  ASSERT_EQ(manifest->size(), 2);
+  auto primary = history.ChargePrimary(24 * kMiB);
+  EXPECT_FALSE(history.Read("parent", 1, 9, 0, 64).ok());
+  EXPECT_EQ(history.secondary_bytes(), 0);
+}
+
+TEST(ReplicationLogBlockTest, ReuseResetsSparseCursorsWithoutReallocating) {
+  auto block = detail::ReplicationLogBlock::Allocate(16384);
+  ASSERT_TRUE(block.ok());
+  auto* allocation = block->bytes_.get();
+  for (std::uint64_t lsn = 1; lsn <= 130; ++lsn) {
+    auto output = block->AppendBuffer(64);
+    output.front() = std::byte(lsn);
+    block->CommitAppend(lsn, 0, output.size());
+  }
+  EXPECT_EQ(block->FindOffset(65), 64 * 64);
+  EXPECT_EQ(block->FindOffset(130), 128 * 64);
+  block->Reset();
+  EXPECT_EQ(block->bytes_.get(), allocation);
+  auto output = block->AppendBuffer(64);
+  output.front() = std::byte{42};
+  block->CommitAppend(900, 0, output.size());
+  EXPECT_EQ(block->FindOffset(900), 0);
+  EXPECT_EQ(block->first_lsn_, 900);
+  EXPECT_EQ(block->frame_count_, 1);
 }
 
 }  // namespace

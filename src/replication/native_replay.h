@@ -52,10 +52,10 @@ struct NativeReplayEffect {
 class NativeReplay {
  public:
   NativeReplay(std::shared_ptr<ReplicaAppliedFrontier> applied,
-               std::shared_ptr<ReplicationHistory> history,
+               std::vector<std::shared_ptr<ReplicationHistory>> histories,
                std::string history_id)
       : applied_(std::move(applied)),
-        history_(std::move(history)),
+        histories_(std::move(histories)),
         history_id_(std::move(history_id)) {}
 
   // Validates a fully received original logical effect. Missing fragments or
@@ -66,14 +66,20 @@ class NativeReplay {
   // Shared completion boundary for normal streaming, recovery and partial
   // replay. Call only after storage has applied every part of the logical
   // effect; publication precedes network ACK and survives transport loss.
+  // publisher is the calling worker; only its cache is accessed. All records
+  // of a transaction/control effect remain together on that worker.
   absl::Status PublishAfterApply(
       unsigned publisher,
       std::span<const ReplicaAppliedFrontier::FlowApplied> updates,
       std::vector<NativeHistoryRecord> records);
+  // Ordinary single-flow events carry their applied identity directly. Empty
+  // canonical bytes omit optional retention, never the completed apply.
+  absl::Status PublishAfterApply(unsigned publisher,
+                                 NativeHistoryRecord record);
 
  private:
   std::shared_ptr<ReplicaAppliedFrontier> applied_;
-  std::shared_ptr<ReplicationHistory> history_;
+  const std::vector<std::shared_ptr<ReplicationHistory>> histories_;
   const std::string history_id_;
 };
 

@@ -2893,7 +2893,7 @@ struct ReplicaSession {
 
   std::shared_ptr<ClusterFollowOwnerContext> cluster_follow_;
   std::shared_ptr<detail::ReplicaAppliedFrontier> applied_frontier_;
-  std::shared_ptr<ReplicationHistory> retained_history_;
+  std::vector<std::shared_ptr<ReplicationHistory>> retained_histories_;
   std::string source_history_id_;
   std::shared_ptr<detail::NativeReplay> replay_;
   bool allow_initial_cursor_ = false;
@@ -3717,9 +3717,13 @@ class ReplicationManager::ReplicationGroup {
                                   storage::kStorageBlockBytes,
                               std::memory_order_relaxed);
     if (cluster_enabled_) {
-      retained_history_ =
-          std::make_shared<ReplicationHistory>(backlog_size_bytes_.load());
-      storage_->SetReplicationHistory(retained_history_);
+      for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
+        auto history = std::make_shared<ReplicationHistory>(
+            BacklogCapacityForFlow(worker, backlog_size_bytes_.load()));
+        retained_histories_.push_back(history);
+        storage_->SetReplicationHistory(worker, std::move(history));
+      }
+      retained_reset_revisions_.resize(storage_->worker_count());
     }
     backlog_backpressure_.store(options.backlog_backpressure_,
                                 std::memory_order_relaxed);
@@ -4217,7 +4221,7 @@ class ReplicationManager::ReplicationGroup {
     if (recovered) {
       // Exercise the production verified-recovery boundary without repeating
       // the storage certificate/crash protocol covered by process tests.
-      co_return InstallRecoveredPopulation(
+      co_return co_await InstallRecoveredPopulation(
           {std::move(ready_identity), directive.required_applied_next_lsns_});
     }
     RebuildDirective rebuild{
@@ -5300,13 +5304,93 @@ class ReplicationManager::ReplicationGroup {
     co_return absl::OkStatus();
   }
 
+  Task<absl::Status> ResetRetainedHistory(std::string history,
+                                          unsigned flow_count) {
+    AssertStateOwner();
+    const auto revision = ++retained_reset_revision_;
+    for (unsigned worker = 0; worker < retained_histories_.size(); ++worker) {
+      auto status = co_await bycorf::SubmitTo(worker, [this, worker, revision,
+                                                       history, flow_count] {
+        auto& installed = retained_reset_revisions_[worker];
+        if (revision < installed)
+          return absl::CancelledError("retained history reset superseded");
+        auto reset = retained_histories_[worker]->Reset(history, flow_count);
+        if (reset.ok()) installed = revision;
+        return reset;
+      });
+      if (!status.ok()) co_return status;
+      if (revision != retained_reset_revision_)
+        co_return absl::CancelledError("retained history reset superseded");
+    }
+    co_return absl::OkStatus();
+  }
+
+  Task<std::vector<std::vector<NativeHistoryRange>>> RetainedCoverage(
+      std::string history) {
+    AssertStateOwner();
+    const auto revision = retained_reset_revision_;
+    struct Sample {
+      RetainedMemoryCharge charge_;
+      std::vector<std::vector<NativeHistoryRange>> ranges_;
+    };
+    std::vector<RetainedMemoryCharge> charges;
+    std::vector<std::vector<NativeHistoryRange>> coverage;
+    for (unsigned worker = 0; worker < retained_histories_.size(); ++worker) {
+      // Alternating apply owners can fragment local coverage into one range
+      // per record. Reserve a conservative copy/merge budget on that owner:
+      // Four times the block capacity covers both the sampled ranges and
+      // vector growth while merging, even for tiny transaction participants.
+      // The fixed term covers both origin-flow vector headers. Admission
+      // failure simply omits optional coverage. Keep the charge until merge
+      // finishes; the bounded wire result uses the export's transport budget.
+      auto local = co_await bycorf::SubmitTo(worker, [this, worker, history] {
+        constexpr auto kHeaders =
+            2 * 1024 * sizeof(std::vector<NativeHistoryRange>);
+        const auto& cache = retained_histories_[worker];
+        const auto bytes = cache->secondary_bytes();
+        if (bytes > (std::numeric_limits<std::size_t>::max() - kHeaders) / 4)
+          return Sample{};
+        auto reservation = TryReserveMemory(4 * bytes + kHeaders);
+        if (!reservation.has_value()) return Sample{};
+        Sample sample;
+        sample.charge_.Adopt(&*reservation, 4 * bytes + kHeaders);
+        sample.ranges_ =
+            cache->Coverage(history, std::numeric_limits<std::size_t>::max());
+        return sample;
+      });
+      if (revision != retained_reset_revision_) co_return decltype(coverage){};
+      if (coverage.size() < local.ranges_.size())
+        coverage.resize(local.ranges_.size());
+      for (std::size_t flow = 0; flow < local.ranges_.size(); ++flow)
+        coverage[flow].insert(coverage[flow].end(), local.ranges_[flow].begin(),
+                              local.ranges_[flow].end());
+      charges.push_back(std::move(local.charge_));
+    }
+    co_return detail::MergeWorkerHistoryCoverage(std::move(coverage));
+  }
+
   Task<absl::Status> SendRetainedEffect(
       TcpStream& stream, std::string_view history,
       const detail::NativeRecoveryAdvertisement& report, unsigned flow,
       std::uint64_t lsn, std::function<bool()> current) {
     if (!current())
       co_return absl::CancelledError("retained export was revoked");
-    auto effect = retained_history_->DescribeEffect(history, flow, lsn);
+    absl::StatusOr<std::vector<NativeHistoryRecordInfo>> effect =
+        absl::NotFoundError("retained history has a gap");
+    unsigned owner = 0;
+    // Ordinary events live with their flow; complete transactions live with
+    // their apply owner. Discover that owner once, then fetch every chunk
+    // there.
+    for (unsigned probe = 0; probe < retained_histories_.size(); ++probe) {
+      owner = (flow + probe) % retained_histories_.size();
+      effect = co_await bycorf::SubmitTo(owner, [this, owner, history, flow,
+                                                 lsn] {
+        return retained_histories_[owner]->DescribeEffect(history, flow, lsn);
+      });
+      if (!current())
+        co_return absl::CancelledError("retained export was revoked");
+      if (effect.ok()) break;
+    }
     if (!effect.ok()) co_return effect.status();
     for (const auto& record : *effect) {
       if (!detail::RecoveryCovers(report, record.flow_id_, record.lsn_))
@@ -5321,8 +5405,13 @@ class ReplicationManager::ReplicationGroup {
       for (std::size_t offset = 0; offset < record.bytes_;) {
         if (!current())
           co_return absl::CancelledError("recovery export was revoked");
-        auto chunk = retained_history_->Read(history, record.flow_id_,
-                                             record.lsn_, offset, 64 * 1024);
+        auto chunk = co_await bycorf::SubmitTo(
+            owner, [this, owner, history, record, offset] {
+              return retained_histories_[owner]->Read(
+                  history, record.flow_id_, record.lsn_, offset, 64 * 1024);
+            });
+        if (!current())
+          co_return absl::CancelledError("retained export was revoked");
         if (!chunk.ok()) co_return chunk.status();
         if (chunk->total_bytes_ != record.bytes_)
           co_return absl::DataLossError(
@@ -5441,7 +5530,7 @@ class ReplicationManager::ReplicationGroup {
       co_return absl::InvalidArgumentError(
           "partial parent cursor layout mismatch");
     const auto bridge = history_bridge_;
-    auto coverage = retained_history_->Coverage(parent.source_history_id_);
+    auto coverage = co_await RetainedCoverage(parent.source_history_id_);
     const bool child_available = co_await ChildOriginAvailable(bridge);
     const auto current = [&] {
       return !transfer->sockets_.cancelled() &&
@@ -5637,7 +5726,10 @@ class ReplicationManager::ReplicationGroup {
     if (!cut.ok()) co_return cut.status();
     detail::NativeRecoveryAdvertisement report{
         boot_id_, std::move(*cut),
-        retained_history_->Coverage(local.domain_.source_history_id_)};
+        co_await RetainedCoverage(local.domain_.source_history_id_)};
+    if (cluster_recovery_ != scope || scope->sockets_.cancelled() ||
+        scope->Expired() || !FailoverReplicaDomainMatches(local))
+      co_return absl::CancelledError("recovery export was revoked");
     if (report.coverage_.empty())
       report.coverage_.resize(local.domain_.flow_count_);
     for (unsigned flow = 0; flow < report.coverage_.size(); ++flow) {
@@ -5849,7 +5941,7 @@ class ReplicationManager::ReplicationGroup {
       if (!seeded.ok()) co_return seeded;
       auto retained = recovered
                           ? absl::OkStatus()
-                          : retained_history_->Reset(
+                          : co_await ResetRetainedHistory(
                                 action->desired_.domain_.source_history_id_,
                                 action->desired_.domain_.flow_count_);
       if (!retained.ok()) co_return retained;
@@ -5896,7 +5988,7 @@ class ReplicationManager::ReplicationGroup {
     const auto applied = applied_frontier_;
     auto initial = applied->TrySnapshot();
     if (!initial.ok()) co_return initial.status();
-    detail::NativeReplay replay(applied, retained_history_,
+    detail::NativeReplay replay(applied, retained_histories_,
                                 action->desired_.domain_.source_history_id_);
     std::vector<std::shared_ptr<RecoveryPeerSession>> peers;
     const auto receive_budget = std::make_shared<RecoveryReceiveBudget>();
@@ -6122,7 +6214,8 @@ class ReplicationManager::ReplicationGroup {
       scope.source_boot_id_ = boot_id_;
       scope.source_history_id_ = NewReplicationId();
       base.frontier_.assign(storage_->worker_count(), 1);
-      absl::Status installed = InstallRecoveredPopulation(std::move(base));
+      absl::Status installed =
+          co_await InstallRecoveredPopulation(std::move(base));
       if (!installed.ok()) {
         PublishFailoverActionFailure(context, "operator-recovery",
                                      installed.ToString());
@@ -7653,8 +7746,12 @@ class ReplicationManager::ReplicationGroup {
         "in-progress cluster rebuild was cancelled after control loss");
   }
 
-  absl::Status InstallRecoveredPopulation(
+  Task<absl::Status> InstallRecoveredPopulation(
       detail::RecoveredPopulation population) {
+    AssertStateOwner();
+    const auto old_population = cluster_rebuild_;
+    const auto old_action = cluster_failover_action_;
+    const auto old_follow = cluster_follow_owner_;
     auto& identity = population.identity_;
     identity.target_boot_id_ = boot_id_;
     identity.directive_revision_ = 1;
@@ -7665,16 +7762,21 @@ class ReplicationManager::ReplicationGroup {
     // The certificate recovers only a complete cut, never historical payload.
     // Bind an empty cache so newly applied donor/parent events retain their
     // original lineage and can become the next promotion's secondary suffix.
-    auto retained = retained_history_->Reset(identity.source_history_id_,
-                                             population.frontier_.size());
-    if (!retained.ok()) return retained;
+    auto retained = co_await ResetRetainedHistory(identity.source_history_id_,
+                                                  population.frontier_.size());
+    if (!retained.ok()) co_return retained;
+    if (cluster_rebuild_ != old_population ||
+        cluster_failover_action_ != old_action ||
+        cluster_follow_owner_ != old_follow || cluster_control_stopping_ ||
+        (old_action != nullptr && old_action->cancelled_))
+      co_return absl::CancelledError("recovered population install superseded");
     auto ready =
         cluster_group_->RecoverPopulation(identity, population.frontier_);
-    if (!ready.ok()) return ready.status();
+    if (!ready.ok()) co_return ready.status();
     auto frontier = std::make_shared<detail::ReplicaAppliedFrontier>(
         population.frontier_.size(), storage_->worker_count());
     absl::Status installed = frontier->InstallNextLsns(population.frontier_);
-    if (!installed.ok()) return installed;
+    if (!installed.ok()) co_return installed;
     cluster_rebuild_ =
         std::make_shared<ClusterRebuildContext>(std::move(*ready));
     applied_frontier_ = std::move(frontier);
@@ -7684,7 +7786,7 @@ class ReplicationManager::ReplicationGroup {
     recovered_population_fenced_ = true;
     storage_->SetReplicaLoading(true);
     storage_->SetExpirationAuthority(false);
-    return absl::OkStatus();
+    co_return absl::OkStatus();
   }
 
   Task<absl::Status> RecoverClusterPopulation() {
@@ -7712,7 +7814,8 @@ class ReplicationManager::ReplicationGroup {
       co_return absl::DataLossError(
           "clean shutdown proof does not match durable population");
     }
-    absl::Status installed = InstallRecoveredPopulation(std::move(*proof));
+    absl::Status installed =
+        co_await InstallRecoveredPopulation(std::move(*proof));
     if (installed.ok())
       spdlog::info(
           "consumed clean shutdown proof; recovered candidate remains fenced");
@@ -9123,15 +9226,20 @@ class ReplicationManager::ReplicationGroup {
       if (worker == 0) {
         configured =
             co_await storage_->SetReplicationLogCapacity(flow_capacity);
+        if (configured.ok() && !retained_histories_.empty())
+          retained_histories_[worker]->SetCapacity(flow_capacity);
       } else {
-        configured =
-            co_await bycorf::SubmitTaskTo(worker, [this, flow_capacity]() {
-              return storage_->SetReplicationLogCapacity(flow_capacity);
+        configured = co_await bycorf::SubmitTaskTo(
+            worker, [this, worker, flow_capacity]() -> Task<absl::Status> {
+              auto status =
+                  co_await storage_->SetReplicationLogCapacity(flow_capacity);
+              if (status.ok() && !retained_histories_.empty())
+                retained_histories_[worker]->SetCapacity(flow_capacity);
+              co_return status;
             });
       }
       if (!configured.ok()) co_return configured;
     }
-    if (retained_history_) retained_history_->SetCapacity(effective);
     backlog_size_bytes_.store(effective, std::memory_order_release);
     co_return absl::OkStatus();
   }
@@ -11311,7 +11419,7 @@ class ReplicationManager::ReplicationGroup {
         detail::PlanNativeReparent(bridge, parent, *cursor, report->coverage_,
                                    true) == detail::NativeReparentPlan::kFull)
       co_return false;
-    detail::NativeReplay replay(applied, retained_history_,
+    detail::NativeReplay replay(applied, retained_histories_,
                                 parent.source_history_id_);
     const auto budget = std::make_shared<RecoveryReceiveBudget>();
     std::vector<std::unique_ptr<RecoveryReceivedEffect>> pending;
@@ -11415,8 +11523,8 @@ class ReplicationManager::ReplicationGroup {
     auto group = PopulationGroupToken(desired.group_id_);
     // Cache turnover is optional and cannot change Active's proof. Allocate it
     // before the atomic no-suspension identity/cursor/publication below.
-    status = retained_history_->Reset(upstream_history, child.flow_count_);
-    if (!status.ok()) co_return false;
+    status = co_await ResetRetainedHistory(upstream_history, child.flow_count_);
+    if (!status.ok() || !current()) co_return false;
     auto ready = cluster_group_->SwitchHistory(*population->ready_token_, child,
                                                *population->manifest_, *cursor,
                                                *boundary, *origin);
@@ -11747,22 +11855,26 @@ class ReplicationManager::ReplicationGroup {
     }
     {
       AssertStateOwner();
-      if (retained_history_) {
+      if (!retained_histories_.empty()) {
         if (!upstream_history_id_.has_value() ||
             *upstream_history_id_ != words[5] ||
             source_worker_count_ != source_workers ||
             !local_population_matches_response) {
-          auto reset =
-              retained_history_->Reset(std::string(words[5]), source_workers);
+          auto reset = co_await ResetRetainedHistory(std::string(words[5]),
+                                                     source_workers);
           if (!reset.ok()) co_return reset;
+          if (active_replica_session_ != session || session->cancelled() ||
+              role_epoch_.load(std::memory_order_relaxed) != role_epoch ||
+              replica_reconfiguration_running_)
+            co_return absl::CancelledError("native history install superseded");
         }
-        session->retained_history_ = retained_history_;
+        session->retained_histories_ = retained_histories_;
         session->source_history_id_ = std::string(words[5]);
       }
       applied_frontier_ = next_frontier;
       session->applied_frontier_ = std::move(next_frontier);
       session->replay_ = std::make_shared<detail::NativeReplay>(
-          session->applied_frontier_, session->retained_history_,
+          session->applied_frontier_, session->retained_histories_,
           std::string(words[5]));
       session->InitializeFullSyncState(*initial_next_lsns);
       if (active_replica_session_ == session) {
@@ -12337,7 +12449,7 @@ class ReplicationManager::ReplicationGroup {
     if (prepared.canonical_charge_ != nullptr)
       arrival->canonical_charges_.push_back(
           std::move(prepared.canonical_charge_));
-    if (session->retained_history_)
+    if (!session->retained_histories_.empty())
       arrival->canonical_records_.push_back(
           {prepared.flow_id_, prepared.lsn_, std::move(prepared.canonical_)});
     ++arrival->arrival_count_;
@@ -12418,7 +12530,7 @@ class ReplicationManager::ReplicationGroup {
       }
       arrival->arrived_[flow_id] = true;
       arrival->lsns_[flow_id] = lsn;
-      if (session->retained_history_)
+      if (!session->retained_histories_.empty())
         arrival->canonical_records_.push_back(
             {flow_id, lsn, std::move(canonical)});
       ++arrival->arrival_count_;
@@ -12617,14 +12729,9 @@ class ReplicationManager::ReplicationGroup {
         // Applied is a storage boundary. Publish the cursor here so promotion
         // can close the transport and still capture every command whose local
         // mutation completed; ACK delivery is not part of that proof.
-        std::vector<NativeHistoryRecord> effect;
-        if (session->retained_history_)
-          effect.push_back(
-              {flow_id, pending.lsn_, std::move(pending.canonical_)});
-        const std::array updates{
-            detail::ReplicaAppliedFrontier::FlowApplied{flow_id, pending.lsn_}};
         applied = session->replay_->PublishAfterApply(
-            bycorf::ThisWorker().id_, updates, std::move(effect));
+            bycorf::ThisWorker().id_,
+            {flow_id, pending.lsn_, std::move(pending.canonical_)});
         if (!applied.ok()) {
           (void)co_await InvalidateReplicaContinuation(session);
           co_return applied;
@@ -12834,7 +12941,7 @@ class ReplicationManager::ReplicationGroup {
         break;
       }
       auto canonical_charge =
-          session->retained_history_
+          !session->retained_histories_.empty()
               ? TryReserveCanonical(session->canonical_receive_bytes_,
                                     staged_command.capacity())
               : nullptr;
@@ -13256,9 +13363,12 @@ class ReplicationManager::ReplicationGroup {
           // complete all-flow continuation vector before releasing peers or
           // ACKing any cut: a disconnect in that interval must reconnect at
           // the stable cut rather than replaying an old-history cursor.
-          if (session->retained_history_) {
-            auto reset = session->retained_history_->Reset(
+          if (!session->retained_histories_.empty()) {
+            auto reset = co_await ResetRetainedHistory(
                 session->source_history_id_, session->source_worker_count_);
+            if (reset.ok() && session->cancelled())
+              reset =
+                  absl::CancelledError("full-sync history install cancelled");
             if (!reset.ok()) {
               session->promotion_complete_->Abort(reset);
               co_return reset;
@@ -16163,7 +16273,11 @@ class ReplicationManager::ReplicationGroup {
   std::atomic<unsigned> snapshot_read_concurrency_{
       kDefaultReplicationSnapshotReadConcurrency};
   std::atomic<std::size_t> snapshot_batch_size_{kSnapshotKeysPerBatch};
-  std::shared_ptr<ReplicationHistory> retained_history_;
+  std::vector<std::shared_ptr<ReplicationHistory>> retained_histories_;
+  // Controller revision is worker-0-owned; each element is touched only on
+  // its corresponding worker. Fan-outs may overlap across a suspension.
+  std::uint64_t retained_reset_revision_ = 0;
+  std::vector<std::uint64_t> retained_reset_revisions_;
   std::atomic<std::size_t> backlog_size_bytes_{0};
   // Mirrors the fully installed storage policy for CONFIG GET; publisher
   // rollover reads the storage-owned atomic directly.

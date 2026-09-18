@@ -233,7 +233,7 @@ class ReplicationLogService final : public bycorf::Service {
     auto history = std::make_shared<lavik::ReplicationHistory>(8 * kMiB);
     auto reset = history->Reset("parent", 2);
     if (!reset.ok()) co_return reset;
-    storage_->SetReplicationHistory(history);
+    storage_->SetReplicationHistory(0, history);
     auto enabled = co_await storage_->EnableReplicationLog(900, 8 * kMiB);
     if (!enabled.ok()) co_return enabled;
     Check(history->TryRetain("parent", {{0, 10, "payload"}, {1, 20, "marker"}}),
@@ -253,7 +253,7 @@ class ReplicationLogService final : public bycorf::Service {
     if (!disabled.ok()) co_return disabled;
     Check(history->primary_bytes() == 0,
           "retired child block leaked its history charge");
-    storage_->SetReplicationHistory(nullptr);
+    storage_->SetReplicationHistory(0, nullptr);
     co_return absl::OkStatus();
   }
 

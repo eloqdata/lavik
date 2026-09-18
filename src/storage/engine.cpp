@@ -342,8 +342,8 @@ void StorageEngine::ReleaseFullSyncValue(std::uint64_t session_id,
 }
 
 void StorageEngine::SetReplicationHistory(
-    std::shared_ptr<lavik::ReplicationHistory> history) {
-  impl_->SetReplicationHistory(std::move(history));
+    unsigned worker_id, std::shared_ptr<lavik::ReplicationHistory> history) {
+  impl_->SetReplicationHistory(worker_id, std::move(history));
 }
 
 Task<absl::Status> StorageEngine::EnableReplicationLog(

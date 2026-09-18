@@ -26,14 +26,6 @@
 namespace lavik::storage {
 namespace {
 
-constexpr std::size_t kSparseFrameStride = 64;
-constexpr std::size_t kMinimumReplicationFrameBytes =
-    AlignRecord(sizeof(ReplicationFrameHeader));
-constexpr std::size_t kMaximumSparseOffsetsPerBlock =
-    (kStorageBlockBytes / kMinimumReplicationFrameBytes + kSparseFrameStride -
-     1) /
-    kSparseFrameStride;
-
 bool AddAllocationCharge(std::size_t requested, std::size_t* total) noexcept {
   const std::size_t usable = AllocatorUsableSizeForRequest(requested);
   if (usable == std::numeric_limits<std::size_t>::max() ||
@@ -251,7 +243,7 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
       replication_publish_queue_bytes_.load(std::memory_order_acquire);
   auto staging = TryReserveMemory(staging_bytes);
   if (!staging.has_value()) {
-    if (auto history = replication_history_.load(std::memory_order_acquire)) {
+    if (const auto& history = CurrentStore().replication_history_) {
       history->ReclaimSecondary(staging_bytes);
       staging = TryReserveMemory(staging_bytes);
     }
@@ -1305,44 +1297,20 @@ Task<absl::Status> StorageEngine::Impl::ReclaimReplicationLogPrefix(
 
 auto StorageEngine::Impl::AllocateReplicationLogBlock()
     -> absl::StatusOr<WorkerStore::ReplicationLogBlock> {
-  const std::size_t sparse_bytes = AllocatorUsableSizeForRequest(
-      kMaximumSparseOffsetsPerBlock *
-      sizeof(WorkerStore::ReplicationSparseOffset));
-  const std::size_t block_bytes =
-      AllocatorUsableSizeForRequest(kStorageBlockBytes);
-  if (sparse_bytes == std::numeric_limits<std::size_t>::max() ||
-      block_bytes == std::numeric_limits<std::size_t>::max() ||
-      sparse_bytes > std::numeric_limits<std::size_t>::max() - block_bytes) {
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "maxmemory cannot allocate an in-memory replication backlog block");
-  }
-  auto reservation = TryReserveMemory(sparse_bytes + block_bytes);
-  if (!reservation.has_value()) {
-    // Standby and publisher memory have priority under process pressure, but
-    // spare memory is not a reason to discard a usable direct-parent suffix.
-    // Publishing a primary block separately enforces the shared history quota.
-    if (auto history = replication_history_.load(std::memory_order_acquire)) {
-      history->ReclaimSecondary(sparse_bytes + block_bytes);
-      reservation = TryReserveMemory(sparse_bytes + block_bytes);
+  using Block = ::lavik::detail::ReplicationLogBlock;
+  auto allocated = Block::Allocate(kStorageBlockBytes);
+  if (!allocated.ok()) {
+    // Standby and publisher memory have priority under process pressure.
+    if (const auto& history = CurrentStore().replication_history_) {
+      history->ReclaimSecondary(Block::AllocationBytes(kStorageBlockBytes));
+      allocated = Block::Allocate(kStorageBlockBytes);
     }
   }
-  if (!reservation.has_value()) {
+  if (!allocated.ok()) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "maxmemory cannot allocate an in-memory replication backlog block");
+    return allocated.status();
   }
-
-  // One permit covers both retained allocations. Once admitted, physical
-  // allocator exhaustion follows the process-wide fail-fast policy rather
-  // than exposing a second maxmemory decision after half a block is live.
-  const RetainedAllocationDomain domain{.externally_admitted_ = true};
-  WorkerStore::ReplicationLogBlock block(domain);
-  block.sparse_offsets_.reserve(kMaximumSparseOffsetsPerBlock);
-  block.bytes_.reset(static_cast<std::byte*>(TryAllocateRetainedBytes(
-      domain, kStorageBlockBytes, alignof(std::max_align_t))));
-  reservation->Release();
-  return block;
+  return WorkerStore::ReplicationLogBlock(std::move(*allocated));
 }
 
 void StorageEngine::Impl::EnsureReplicationLogStandby(WorkerStore& store) {
@@ -1410,11 +1378,20 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
     }
     return retained_lsn;
   };
+  std::optional<WorkerStore::ReplicationLogBlock> recycled;
   auto evict_event = [&]() {
     std::uint64_t evicted_through = log.blocks_.front().last_lsn_;
     do {
       evicted_through =
           std::max(evicted_through, log.blocks_.front().last_lsn_);
+      // Reuse one retired allocation for the next active block. Retention has
+      // already authorized eviction; reset its identity and charge before it
+      // can publish new bytes. Multi-block events still disappear as a whole.
+      if (!recycled) {
+        recycled.emplace(std::move(log.blocks_.front()));
+        recycled->history_charge_.Reset();
+        recycled->Reset();
+      }
       log.blocks_.pop_front();
     } while (!log.blocks_.empty() && log.blocks_.front().sealed_ &&
              log.blocks_.front().first_lsn_ <= evicted_through);
@@ -1488,9 +1465,11 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
   }
 
   ReplicationHistory::PrimaryCharge history_charge;
-  if (auto history = replication_history_.load(std::memory_order_acquire))
+  if (const auto& history = CurrentStore().replication_history_)
     history_charge = history->ChargePrimary(kStorageBlockBytes);
-  if (log.standby_block_.has_value()) {
+  if (recycled) {
+    log.blocks_.push_back(std::move(*recycled));
+  } else if (log.standby_block_.has_value()) {
     log.blocks_.push_back(std::move(*log.standby_block_));
     log.standby_block_.reset();
   } else {
@@ -1608,9 +1587,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
     const bool first = fragment_index == 0;
     const bool last = payload_offset + payload_bytes == payload_size;
     const std::uint32_t frame_offset = block.committed_bytes_;
-    std::span<std::byte> payload(
-        block.bytes_.get() + frame_offset + sizeof(ReplicationFrameHeader),
-        payload_bytes);
+    auto frame = block.AppendBuffer(frame_bytes);
+    auto payload = frame.subspan(sizeof(ReplicationFrameHeader), payload_bytes);
     if (event.payload_source_ != nullptr) {
       absl::Status loaded =
           co_await event.payload_source_->Read(payload_offset, payload);
@@ -1649,20 +1627,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
       co_return absl::Status(absl::StatusCode::kInternal,
                              "failed to encode replication frame");
     }
-    if (block.frame_count_ % kSparseFrameStride == 0) {
-      assert(block.sparse_offsets_.size() < block.sparse_offsets_.capacity());
-      block.sparse_offsets_.push_back({
-          .lsn_ = lsn,
-          .fragment_index_ = fragment_index,
-          .byte_offset_ = frame_offset,
-      });
-    }
-    if (block.frame_count_ == 0) {
-      block.first_lsn_ = lsn;
-    }
-    block.last_lsn_ = lsn;
-    block.committed_bytes_ += static_cast<std::uint32_t>(frame_bytes);
-    ++block.frame_count_;
+    block.CommitAppend(lsn, fragment_index, frame_bytes);
     payload_offset += payload_bytes;
     ++fragment_index;
     emitted = true;
@@ -1733,18 +1698,8 @@ StorageEngine::Impl::ReadReplicationLog(ReplicationLogCursor next,
     }
     const std::byte* bytes = block.bytes_.get();
 
-    std::uint32_t offset = 0;
-    const auto sparse = std::upper_bound(
-        block.sparse_offsets_.begin(), block.sparse_offsets_.end(), batch.next_,
-        [](const ReplicationLogCursor& cursor,
-           const WorkerStore::ReplicationSparseOffset& entry) {
-          return CursorBefore(
-              cursor,
-              {.lsn_ = entry.lsn_, .fragment_index_ = entry.fragment_index_});
-        });
-    if (sparse != block.sparse_offsets_.begin()) {
-      offset = std::prev(sparse)->byte_offset_;
-    }
+    std::uint32_t offset =
+        block.FindOffset(batch.next_.lsn_, batch.next_.fragment_index_);
     while (offset < block.committed_bytes_) {
       ReplicationFrameHeader header{};
       const std::span<const std::byte> available(

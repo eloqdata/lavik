@@ -465,6 +465,7 @@ add_library(lavik_module
   src/replication/replica_applied_frontier.cpp
   src/replication/replication_group.cpp
   src/replication/replication_history.cpp
+  src/replication/log_block.cpp
   src/replication/native_replay.cpp
   src/replication/native_recovery.cpp
   src/replication/native_reparent.cpp
