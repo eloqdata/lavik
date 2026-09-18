@@ -313,6 +313,10 @@ bool AuthorityGuard::LeaseCovers(const AuthorityState& authority,
       return false;
     }
     if (lease->second.deadline_ <= now) {
+      // Request admission/rechecks can discover expiry on several workers
+      // before control-plane cleanup runs. An atomic metric increment alone
+      // would count each observer, not each lease expiry. Claim the shared
+      // receipt atomically; separate load/store operations could both win.
       if (!lease->second.expiration_recorded_->exchange(
               true, std::memory_order_relaxed)) {
         RecordClusterControlLeaseExpiration();
@@ -504,6 +508,11 @@ bool AuthorityGuard::ExpireLease(const SessionIdentity& session,
       lease->second.deadline_ != deadline) {
     return false;
   }
+  // Called by the expiry timer, or by lease-grant handling that first cleans
+  // up an overdue lease. mutex_ serializes writers but does not exclude
+  // snapshot readers in LeaseCovers(), so this cleanup must claim the same
+  // receipt before incrementing the metric. An unconditional increment would
+  // double-count an expiry already observed by a reader.
   const bool already_recorded = lease->second.expiration_recorded_->exchange(
       true, std::memory_order_relaxed);
   writer_state_.leases_.erase(lease);
