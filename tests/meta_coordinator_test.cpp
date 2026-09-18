@@ -664,12 +664,9 @@ TEST_F(MetaCoordinatorComponentTest, CommittedViewFactsAnswerFromStores) {
 }
 
 // ---------------------------------------------------------------------------
-// raft_server integration (single node, real adapters)
+// MetaRaft integration (single voter, real C ABI and WAL)
 // ---------------------------------------------------------------------------
 
-// Minimal real-time scheduler: one thread per delayed task (same pattern as
-// meta_state_machine_test.cpp; cancelled tasks exit cheaply because
-// delayed_task::execute() re-checks the cancellation flag).
 struct ServerKnobs {
   int client_req_timeout_ms_ = 5000;
   int election_ms_low_ = 150;
@@ -705,7 +702,7 @@ class MetaCoordinatorServerTest : public ::testing::Test {
 
   // Launches the raft core WITHOUT waiting for leadership: tests wire the
   // coordinator and reconcilers first, so the organic BecomeLeader callback
-  // (gated by wait_for_sm_catchup) is never missed.
+  // (gated by the current-term application fence) is never missed.
   void LaunchServer(const ServerKnobs& knobs = {}) {
     auto options = lavik::test::SingleMetaOptions(dir_);
     options.election_ms_ = knobs.election_ms_low_;
@@ -1631,7 +1628,7 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeTimeoutIsReconcilable) {
   // the SM runs it, so the client round times out first.
   apply_barrier_.Pause();
   ASSERT_TRUE(apply_barrier_.paused());
-  const std::uint64_t slot_before_timeout = server_->DurableIndex();
+  const std::uint64_t slot_before_timeout = machine_->last_commit_index();
   auto timed_out = ProposeSync(MakeRegister(0x52));
   ASSERT_FALSE(timed_out.ok());
   EXPECT_EQ(timed_out.status().code(), absl::StatusCode::kDeadlineExceeded);
@@ -1659,6 +1656,65 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeTimeoutIsReconcilable) {
   EXPECT_EQ(machine_->StoresSnapshot().audit_.size(), 2u);
 }
 
+TEST_F(MetaCoordinatorServerTest, UncertainOutcomeDemotionIsReconcilable) {
+  StartServer();
+  MetaCoordinatorOptions options;
+  options.propose_timeout_ms_ = 30'000;
+  MakeCoordinator(options);
+  WaitLeader();
+  const auto baseline = ProposeSync(MakeRegister(0x51));
+  ASSERT_TRUE(baseline.ok()) << baseline.status();
+
+  // A committed command can still be waiting on C++ application when the
+  // protocol owner withdraws authority. Its caller must reconcile the result;
+  // returning the pre-append "not leader" rejection would falsely imply that
+  // retrying a different request cannot duplicate the operation's effect.
+  apply_barrier_.Pause();
+  // Use the exact prior completion, since the periodic status observer may
+  // still advertise an older durability watermark when that callback arrives.
+  const std::uint64_t slot_before = baseline->log_index_;
+  auto task = coordinator_->Propose(MakeRegister(0x54), TestPrincipal());
+  std::promise<void> done;
+  std::future<void> signal = done.get_future();
+  task.SetCompletionCallback(
+      &done, [](void* ctx, std::coroutine_handle<>) noexcept {
+        static_cast<std::promise<void>*>(ctx)->set_value();
+      });
+  auto handle = std::move(task).ReleaseHandle();
+  handle.resume();
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        return server_->DurableIndex() > slot_before &&
+               server_->get_committed_log_idx() > slot_before;
+      },
+      std::chrono::seconds(10)));
+  ASSERT_TRUE(apply_barrier_.paused());
+  server_->yield_leadership();
+  ASSERT_EQ(signal.wait_for(std::chrono::seconds(15)),
+            std::future_status::ready);
+  auto demoted = std::move(handle.promise().value_);
+  handle.destroy();
+  ASSERT_FALSE(demoted.ok());
+  EXPECT_EQ(demoted.status().code(), absl::StatusCode::kCancelled);
+  EXPECT_NE(demoted.status().message().find("uncertain"), std::string::npos)
+      << demoted.status();
+  EXPECT_FALSE(machine_->StoresSnapshot()
+                   .identity_.FindNode(MakeNodeId(0x54))
+                   .has_value());
+
+  // The result really is uncertain: this committed command applies after its
+  // callback has been cancelled, leaving one effect and one audit receipt.
+  apply_barrier_.Resume();
+  ASSERT_TRUE(WaitFor(
+      [this] {
+        return machine_->StoresSnapshot()
+            .identity_.FindNode(MakeNodeId(0x54))
+            .has_value();
+      },
+      std::chrono::seconds(10)));
+  EXPECT_EQ(machine_->StoresSnapshot().audit_.size(), 2u);
+}
+
 TEST_F(MetaCoordinatorServerTest, UncertainOutcomeCancelIsReconcilable) {
   StartServer();
   MetaCoordinatorOptions options;
@@ -1676,7 +1732,7 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeCancelIsReconcilable) {
   // propose is genuinely in flight when the server stops.
   apply_barrier_.Pause();
   ASSERT_TRUE(apply_barrier_.paused());
-  const std::uint64_t slot_before = server_->DurableIndex();
+  const std::uint64_t slot_before = machine_->last_commit_index();
   auto task = coordinator_->Propose(MakeRegister(0x53), TestPrincipal());
   std::promise<void> done;
   std::future<void> signal = done.get_future();

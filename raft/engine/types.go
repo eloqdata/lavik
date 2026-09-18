@@ -19,6 +19,9 @@ var (
 	ErrStopped   = errors.New("raft stopped")
 	ErrBusy      = errors.New("raft queue capacity exceeded")
 	ErrNotLeader = errors.New("not leader")
+	// ErrUncertain follows Raft admission: the proposal may still commit or
+	// apply after demotion. ErrNotLeader is reserved for pre-append rejection.
+	ErrUncertain = errors.New("raft proposal outcome is uncertain")
 )
 
 // Member is the durable descriptor associated with a Raft member ID. IDs and

@@ -364,7 +364,7 @@ func (r *Runtime) publish() {
 		// callbacks; later replay still applies their committed effects exactly
 		// once and never fabricates a successful client result.
 		for key, waiter := range r.waiters {
-			waiter <- Result{Err: ErrNotLeader}
+			waiter <- Result{Err: ErrUncertain}
 			delete(r.waiters, key)
 		}
 	}
