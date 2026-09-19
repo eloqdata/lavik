@@ -1355,29 +1355,27 @@ class ScanHashMap {
   // use the returned live pointer rather than reconstructing one from address.
   const Entry* FindAddress(std::uintptr_t address,
                            std::uint32_t hash) const noexcept {
-    if (address == 0) {
-      return nullptr;
-    }
-    const int tables = Rehashing() ? 2 : 1;
-    for (int t = 0; t < tables; ++t) {
-      const Table& table = tables_[t];
-      if (!table.buckets_) {
-        continue;
-      }
-      const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
-      while (bucket != nullptr) {
-        for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
-          if (Occupied(*bucket, slot)) {
-            const Entry* entry = Resolve(bucket->entries_[slot]);
-            if (reinterpret_cast<std::uintptr_t>(entry) == address) {
-              return entry;
-            }
-          }
-        }
-        bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
-      }
-    }
-    return nullptr;
+    return FindAddressImpl<false>(address, hash, 0);
+  }
+
+  // Optional bucket fingerprint for FindAddress. Capture it from the same
+  // immutable key digest as AddressHash while the entry is still live.
+  static std::uint8_t AddressTag(const Digest& digest) noexcept {
+    return HashTag(Hash(digest));
+  }
+
+  Entry* FindAddress(std::uintptr_t address, std::uint32_t hash,
+                     std::uint8_t tag) noexcept {
+    return const_cast<Entry*>(
+        std::as_const(*this).FindAddress(address, hash, tag));
+  }
+
+  // Like the address-only overload, but rejects unrelated bucket slots before
+  // resolving arena handles. A matching tag is only a filter: address equality
+  // and the caller's version checks are still required, including after reuse.
+  const Entry* FindAddress(std::uintptr_t address, std::uint32_t hash,
+                           std::uint8_t tag) const noexcept {
+    return FindAddressImpl<true>(address, hash, tag);
   }
 
   // Updates an entry without changing its address when the policy-selected
@@ -2348,6 +2346,37 @@ class ScanHashMap {
         }
       }
       bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
+    }
+    return nullptr;
+  }
+
+  template <bool FilterTag>
+  const Entry* FindAddressImpl(std::uintptr_t address, std::uint32_t hash,
+                               std::uint8_t tag) const noexcept {
+    if (address == 0) {
+      return nullptr;
+    }
+    const int tables = Rehashing() ? 2 : 1;
+    for (int t = 0; t < tables; ++t) {
+      const Table& table = tables_[t];
+      if (!table.buckets_) {
+        continue;
+      }
+      const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+      while (bucket != nullptr) {
+        for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+          if (Occupied(*bucket, slot)) {
+            if constexpr (FilterTag) {
+              if (bucket->hashes_[slot] != tag) continue;
+            }
+            const Entry* entry = Resolve(bucket->entries_[slot]);
+            if (reinterpret_cast<std::uintptr_t>(entry) == address) {
+              return entry;
+            }
+          }
+        }
+        bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
+      }
     }
     return nullptr;
   }

@@ -561,6 +561,10 @@ struct RelocationSource {
   std::uint64_t block_id_ = 0;
   std::uint64_t allocation_epoch_ = 0;
   std::uint32_t record_offset_ = 0;
+  // Present only for an already-verified inline string whose immutable
+  // payload is copied unchanged. Relocation can reuse its CRC instead of
+  // scanning the destination bytes a second time; other writes compute it.
+  std::optional<std::uint32_t> verified_payload_checksum_ = std::nullopt;
 
   bool Matches(const RecordLocationCore& location) const noexcept {
     return location.block_id() == block_id_ &&
@@ -601,6 +605,9 @@ struct RecordIdentity {
   std::uint32_t entry_hash_ = 0;
   std::uint16_t partition_id_ = 0;
   std::uint8_t db_id_ = 0;
+  // Use the remaining padding byte to reject unrelated bucket slots without
+  // resolving their arena handles. The key digest is immutable across flush.
+  std::uint8_t entry_tag_ = 0;
 };
 
 static_assert(sizeof(RecordIdentity) == 96);
@@ -3688,9 +3695,6 @@ class StorageEngine::Impl {
 
   bool IsActiveBlock(const WorkerStore& store,
                      std::uint64_t block_id) const noexcept;
-
-  bool IsDefragCandidate(const WorkerStore& store,
-                         std::uint64_t block_id) const noexcept;
 
   void MaybeQueueDefrag(WorkerStore& store, std::uint64_t block_id);
 
