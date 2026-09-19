@@ -133,10 +133,10 @@ class DataProcess:
             "--flush-max-ms", "20",
             "--data-file", self.data_path,
             "--rdb-dir", self.workdir,
-            "--cluster-enabled",
-            "--cluster-node-id", self.node_id,
-            "--cluster-meta-seed", self.seed,
-            "--cluster-announce-ip", "127.0.0.1",
+            "--client-mode", "cluster", "--meta-managed", "yes",
+            "--node-id", self.node_id,
+            "--meta-seed", self.seed,
+            "--announce-ip", "127.0.0.1",
         ]
         if self.tls is not None:
             ca_cert, cert, key = self.tls

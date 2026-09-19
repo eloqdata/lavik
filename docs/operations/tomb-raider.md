@@ -39,7 +39,7 @@ starts in off mode.
 ## Replication role changes
 
 The cleanup loop is launched only when the node has expiration authority at
-startup. `cluster-enabled` startup withholds that authority, so the loop is not
+startup. `meta-managed yes` startup withholds that authority, so the loop is not
 launched in that mode. The native FULL path also closes command database
 admission and crosses the storage quiesce boundary before its first destructive
 reset; the callable cluster rebuild adapter reaches that same path.

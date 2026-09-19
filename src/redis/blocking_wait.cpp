@@ -538,8 +538,7 @@ std::optional<CommandReply> RegisterClusterBlockingWriteAttemptImpl(
   assert(guards != nullptr);
   guards->clear();
   const std::span<const std::uint16_t> slots = request.ClusterSlots();
-  if (!cluster::ClusterEnabled() || request.replication_origin_ ||
-      slots.empty()) {
+  if (!cluster::MetaManaged() || request.replication_origin_ || slots.empty()) {
     return std::nullopt;
   }
   cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
@@ -548,6 +547,7 @@ std::optional<CommandReply> RegisterClusterBlockingWriteAttemptImpl(
       .is_write_ = true,
       .connection_readonly_ = false,
       .loading_allowed_ = false,
+      .client_mode_ = cluster::GetClientMode(),
   };
   for (;;) {
     auto admission = std::make_shared<const cluster::AuthorityAdmission>(

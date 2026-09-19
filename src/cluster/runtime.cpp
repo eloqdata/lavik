@@ -20,7 +20,8 @@ namespace lavik::cluster {
 
 namespace {
 std::unique_ptr<ClusterRuntime> g_cluster_runtime;
-}
+ClientMode g_client_mode = ClientMode::kSingle;
+}  // namespace
 
 ClusterRuntime::ClusterRuntime(std::unique_ptr<NodeControlActions> actions)
     : control_actions_(std::move(actions)),
@@ -33,7 +34,15 @@ ClusterRuntime::ClusterRuntime(std::unique_ptr<NodeControlActions> actions)
 
 ClusterRuntime* GetClusterRuntime() noexcept { return g_cluster_runtime.get(); }
 
-bool ClusterEnabled() noexcept { return g_cluster_runtime != nullptr; }
+ClientMode GetClientMode() noexcept { return g_client_mode; }
+
+bool IsClusterClientMode() noexcept {
+  return g_client_mode == ClientMode::kCluster;
+}
+
+bool MetaManaged() noexcept { return g_cluster_runtime != nullptr; }
+
+void SetClientMode(ClientMode mode) noexcept { g_client_mode = mode; }
 
 void InstallClusterRuntime(std::unique_ptr<ClusterRuntime> runtime) noexcept {
   g_cluster_runtime = std::move(runtime);

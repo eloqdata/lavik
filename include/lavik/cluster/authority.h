@@ -42,6 +42,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/status/status.h"
+#include "lavik/client_mode.h"
 #include "lavik/cluster/lease_clock.h"
 #include "lavik/cluster/topology.h"
 
@@ -63,6 +64,8 @@ struct RequestView {
   // Whitelisted during recovery (PING/INFO/CLUSTER/CONFIG/... — the Redis
   // layer mirrors the existing is_loading allowlist verbatim).
   bool loading_allowed_ = false;
+  // Client slot restrictions are independent of the authority being checked.
+  ClientMode client_mode_ = ClientMode::kCluster;
 };
 
 struct Decision {
@@ -89,14 +92,14 @@ struct Decision {
 // `state` may be null (nothing published yet → kLoading for everything except
 // loading_allowed_ commands). Evaluation order mirrors Redis getNodeByQuery:
 // loading gate, then first-key unbound (kClusterDownUnbound), then cross-slot
-// (kCrossSlot), then ownership (kServe / kServeStaleRead / kMoved). A group
-// whose grant is fenced has no safe owner: when self is that fenced primary,
-// keyed requests get kClusterDownUnbound. A fenced remote primary still gets
-// kMoved — the redirect target applies its own grant gate and answers
-// CLUSTERDOWN, so the client never reaches a writable fenced node; the grant
-// bit is only consumed by the node holding it.
-// The returned Decision borrows its MOVED host from `state`; callers must keep
-// that snapshot alive until the address has been consumed.
+// (kCrossSlot, for Cluster clients), then ownership (kServe / kServeStaleRead /
+// kMoved). A group whose grant is fenced has no safe owner: when self is that
+// fenced primary, keyed requests get kClusterDownUnbound. A fenced remote
+// primary still gets kMoved — the redirect target applies its own grant gate
+// and answers CLUSTERDOWN, so the client never reaches a writable fenced node;
+// the grant bit is only consumed by the node holding it. The returned Decision
+// borrows its MOVED host from `state`; callers must keep that snapshot alive
+// until the address has been consumed.
 Decision Admit(const ServingState* state, const RequestView& request);
 
 // Owner-side authority re-check result. The request path first registers its

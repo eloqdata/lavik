@@ -601,7 +601,8 @@ std::string_view ExecuteHello(const PasswordAuthenticator& authenticator,
   reply.AppendInteger(static_cast<long long>(std::min<std::uint64_t>(
       ctx.conn_id_, std::numeric_limits<long long>::max())));
   reply.AppendBulkString("mode");
-  reply.AppendBulkString(cluster::ClusterEnabled() ? "cluster" : "standalone");
+  reply.AppendBulkString(cluster::IsClusterClientMode() ? "cluster"
+                                                        : "standalone");
   reply.AppendBulkString("role");
   reply.AppendBulkString(
       replication != nullptr && replication->is_replica() ? "slave" : "master");
@@ -2153,9 +2154,10 @@ int RunServer(ServerOptions options) {
   bycorf::FreezeIoBackends();
   spdlog::info("I/O backends: network={} storage={} rings=one-per-worker",
                options.network_backend_, options.storage_backend_);
-  // Cluster mode delegates population lifecycle to Meta/NodeControl and
+  // Meta management delegates population lifecycle to NodeControl and
   // disables standalone replication control and export.
-  options.replication_options_.cluster_enabled_ = options.cluster_enabled_;
+  options.replication_options_.meta_managed_ = options.meta_managed_;
+  cluster::SetClientMode(options.client_mode_);
   auto allowed_max_clients = MaxClientsAllowedByFileLimit(options.max_clients_);
   if (!allowed_max_clients.ok()) {
     spdlog::error("maxclients file-descriptor setup failed: {}",
@@ -2367,8 +2369,9 @@ int RunServer(ServerOptions options) {
   }
 
   storage::StorageEngineOptions storage_options;
-  storage_options.database_count_ =
-      options.cluster_enabled_ ? 1 : storage::kLogicalDatabaseCount;
+  storage_options.database_count_ = options.client_mode_ == ClientMode::kCluster
+                                        ? 1
+                                        : storage::kLogicalDatabaseCount;
   storage_options.data_files_ = std::move(options.data_files_);
   storage_options.reset_data_files_ = options.load_rdb_replace_;
   storage_options.shutdown_checkpoint_ = options.shutdown_checkpoint_;
@@ -2382,7 +2385,7 @@ int RunServer(ServerOptions options) {
   // A node configured with an upstream must not create local
   // expiration mutation sequences. It still hides expired values by their
   // absolute deadline and applies the primary's replicated tombstone.
-  storage_options.expiration_authority_ = !options.cluster_enabled_ &&
+  storage_options.expiration_authority_ = !options.meta_managed_ &&
                                           !options.replicaof_.has_value() &&
                                           !options.redis_replicaof_.has_value();
   storage_options.tomb_raider_interval_ms_ = options.tomb_raider_interval_ms_;
@@ -2418,10 +2421,10 @@ int RunServer(ServerOptions options) {
       options.replication_publish_queue_bytes_;
   options.replication_options_.redis_psync_ =
       options.redis_replicaof_.has_value();
-  if (options.cluster_enabled_) {
+  if (options.meta_managed_) {
     // The Meta session and native replication protocol must name the same
     // stable data node; boot and history incarnations remain manager-owned.
-    options.replication_options_.node_id_override_ = options.cluster_node_id_;
+    options.replication_options_.node_id_override_ = options.node_id_;
   }
   std::optional<ReplicaOfConfig> replication_upstream =
       options.redis_replicaof_.has_value() ? std::move(options.redis_replicaof_)
@@ -2442,13 +2445,13 @@ int RunServer(ServerOptions options) {
                 options.thread_count_, options.config_file_);
   tx::TxRuntime::Create(options.thread_count_);
 
-  // Redis Cluster data plane: install the process-wide runtime before any
+  // Meta control: install the process-wide runtime before any
   // listener accepts a client. It starts without serving topology and stays
   // fail-closed until Meta supplies an authenticated complete state. Storage
   // also starts unready, so non-whitelisted commands answer LOADING until
   // recovery completes.
   std::unique_ptr<cluster::MetaControlClientService> meta_control_client;
-  if (options.cluster_enabled_) {
+  if (options.meta_managed_) {
     std::unique_ptr<cluster::NodeControlActions> control_actions =
         cluster::CreateReplicationNodeControlActions(replication,
                                                      options.tls_replication_);
@@ -2457,24 +2460,23 @@ int RunServer(ServerOptions options) {
     // Announce-address defaults: an explicit announce ip wins; otherwise the
     // first non-wildcard bind address; a wildcard bind stays empty so
     // discovery self entries keep the "use the startup node" convention.
-    runtime->announce_ip_ = options.cluster_announce_ip_;
+    runtime->announce_ip_ = options.announce_ip_;
     if (runtime->announce_ip_.empty()) {
       const std::string& first_bind = options.bind_addresses_.front();
       const bool wildcard =
           first_bind == "*" || first_bind == "0.0.0.0" || first_bind == "::";
       if (!wildcard) runtime->announce_ip_ = first_bind;
     }
-    runtime->announce_port_ = options.cluster_announce_port_ != 0
-                                  ? options.cluster_announce_port_
-                                  : options.port_;
-    runtime->announce_tls_port_ = options.cluster_announce_tls_port_ != 0
-                                      ? options.cluster_announce_tls_port_
+    runtime->announce_port_ =
+        options.announce_port_ != 0 ? options.announce_port_ : options.port_;
+    runtime->announce_tls_port_ = options.announce_tls_port_ != 0
+                                      ? options.announce_tls_port_
                                       : options.tls_port_;
     cluster::InstallClusterRuntime(std::move(runtime));
     auto created = cluster::MetaControlClientService::Create(
         cluster::MetaControlClientOptions{
-            .seeds_ = options.cluster_meta_seeds_,
-            .node_id_ = options.cluster_node_id_,
+            .seeds_ = options.meta_seeds_,
+            .node_id_ = options.node_id_,
             .request_worker_count_ = options.thread_count_,
             .tls_context_ =
                 options.tls_replication_ ? tls_client_context : nullptr,

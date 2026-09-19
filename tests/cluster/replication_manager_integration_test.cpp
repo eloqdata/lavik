@@ -1670,7 +1670,7 @@ TEST(ReplicationManagerIntegrationTest,
   lavik::storage::StorageEngine storage(std::move(storage_options));
   ASSERT_TRUE(storage.Prepare(2).ok());
   lavik::ReplicationOptions options;
-  options.cluster_enabled_ = true;
+  options.meta_managed_ = true;
   lavik::ReplicationManager replication(&storage, options, std::nullopt);
   CrossWorkerControlService service(replication);
   bycorf::Server server;
@@ -1959,7 +1959,7 @@ void RunPromotionPrepareCase(std::string_view fault_stage) {
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions replication_options;
-  replication_options.cluster_enabled_ = true;
+  replication_options.meta_managed_ = true;
   replication_options.node_id_override_ = std::string(40, '9');
   lavik::ReplicationManager replication(
       &storage, std::move(replication_options), std::nullopt);
@@ -3654,7 +3654,7 @@ void RunCandidateRecoveryCase(unsigned mode, unsigned parent_mode = 0,
   ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
   lavik::ReplicationOptions options;
-  options.cluster_enabled_ = true;
+  options.meta_managed_ = true;
   options.node_id_override_ = std::string(40, '9');
   lavik::ReplicationManager replication(&storage, std::move(options),
                                         std::nullopt);
@@ -5194,7 +5194,7 @@ TEST(ReplicationManagerIntegrationTest,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions replication_options;
-  replication_options.cluster_enabled_ = true;
+  replication_options.meta_managed_ = true;
   replication_options.node_id_override_ = expected_node_id;
   replication_options.listen_port_ = kReplicationPort;
   lavik::ReplicationManager replication(
@@ -5241,7 +5241,7 @@ void RunTargetLeaseAdmissionRetryCase(unsigned suspended_responses,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions replication_options;
-  replication_options.cluster_enabled_ = true;
+  replication_options.meta_managed_ = true;
   replication_options.node_id_override_ = expected_node_id;
   replication_options.listen_port_ = kReplicationPort;
   lavik::ReplicationManager replication(
@@ -5295,7 +5295,7 @@ TEST(ReplicationManagerIntegrationTest,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions replication_options;
-  replication_options.cluster_enabled_ = true;
+  replication_options.meta_managed_ = true;
   replication_options.node_id_override_ = expected_node_id;
   lavik::ReplicationManager replication(
       &storage, std::move(replication_options), std::nullopt);
@@ -5338,7 +5338,7 @@ TEST(ReplicationManagerIntegrationTest,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions replication_options;
-  replication_options.cluster_enabled_ = true;
+  replication_options.meta_managed_ = true;
   replication_options.node_id_override_ = expected_node_id;
   lavik::ReplicationManager replication(
       &storage, std::move(replication_options), std::nullopt);
@@ -5383,7 +5383,7 @@ void RunRecoverableEmptyPopulationFault(const char* environment_name,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions replication_options;
-  replication_options.cluster_enabled_ = true;
+  replication_options.meta_managed_ = true;
   replication_options.node_id_override_ = expected_node_id;
   lavik::ReplicationManager replication(
       &storage, std::move(replication_options), std::nullopt);
@@ -5556,7 +5556,7 @@ void RunFailoverActionDispositionCase(PreparedActionDisposition disposition,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
-  options.cluster_enabled_ = true;
+  options.meta_managed_ = true;
   options.node_id_override_ = std::string(40, '9');
   lavik::ReplicationManager replication(&storage, std::move(options),
                                         std::nullopt);
@@ -5685,7 +5685,7 @@ void RunFailoverActionWatchdogCase(std::string_view fault_variable,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
-  options.cluster_enabled_ = true;
+  options.meta_managed_ = true;
   options.node_id_override_ = std::string(40, '9');
   lavik::ReplicationManager replication(&storage, std::move(options),
                                         std::nullopt);
@@ -5741,7 +5741,7 @@ TEST(ReplicationManagerIntegrationTest,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
-  options.cluster_enabled_ = true;
+  options.meta_managed_ = true;
   options.node_id_override_ = std::string(40, '9');
   lavik::ReplicationManager replication(&storage, std::move(options),
                                         std::nullopt);
@@ -5807,7 +5807,7 @@ void RunInFlightSelfOriginActionCase(NativeActionDisposition disposition,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
-  options.cluster_enabled_ = true;
+  options.meta_managed_ = true;
   options.node_id_override_ = std::string(40, '9');
   lavik::ReplicationManager replication(&storage, std::move(options),
                                         std::nullopt);
@@ -5857,7 +5857,7 @@ TEST(ReplicationManagerIntegrationTest,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
-  options.cluster_enabled_ = true;
+  options.meta_managed_ = true;
   options.node_id_override_ = std::string(40, '9');
   lavik::ReplicationManager replication(&storage, std::move(options),
                                         std::nullopt);
@@ -5905,7 +5905,7 @@ TEST(ReplicationManagerIntegrationTest,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
-  options.cluster_enabled_ = true;
+  options.meta_managed_ = true;
   options.node_id_override_ = local_node_id;
   options.listen_port_ = kReplicationPort;
   lavik::ReplicationManager replication(&storage, std::move(options),
@@ -5945,7 +5945,7 @@ TEST(ReplicationManagerIntegrationTest,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
-  options.cluster_enabled_ = true;
+  options.meta_managed_ = true;
   options.node_id_override_ = local_node_id;
   lavik::ReplicationManager replication(&storage, std::move(options),
                                         std::nullopt);
@@ -6001,7 +6001,7 @@ TEST(ReplicationManagerIntegrationTest,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
-  options.cluster_enabled_ = true;
+  options.meta_managed_ = true;
   options.node_id_override_ = std::string(40, '9');
   lavik::ReplicationManager replication(&storage, std::move(options),
                                         std::nullopt);

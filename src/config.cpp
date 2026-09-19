@@ -449,38 +449,49 @@ absl::Status ApplyRedisConfigDirective(
     }
     return absl::OkStatus();
   }
-  // Redis Cluster data plane. These directives are
+  // Client semantics and Meta control. These directives are
   // startup-only: runtime CONFIG SET goes through the separate
   // kRuntimeConfigs table and never reaches this function.
-  if (name == "cluster-enabled") {
+  if (name == "client-mode") {
     if (directive.size() != 2) return WrongArgumentCount(name);
-    auto enabled = ParseYesNo(directive[1], name);
-    if (!enabled.ok()) return enabled.status();
-    options->cluster_enabled_ = *enabled;
-    return absl::OkStatus();
-  }
-  if (name == "cluster-announce-ip" || name == "cluster-node-id" ||
-      name == "cluster-meta-seed") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    if (name == "cluster-announce-ip") {
-      options->cluster_announce_ip_ = directive[1];
-    } else if (name == "cluster-node-id") {
-      options->cluster_node_id_ = directive[1];
+    if (directive[1] == "single") {
+      options->client_mode_ = ClientMode::kSingle;
+    } else if (directive[1] == "cluster") {
+      options->client_mode_ = ClientMode::kCluster;
     } else {
-      options->cluster_meta_seeds_.push_back(directive[1]);
+      return absl::InvalidArgumentError(
+          "client-mode must be single or cluster");
     }
     return absl::OkStatus();
   }
-  if (name == "cluster-announce-port" || name == "cluster-announce-tls-port") {
+  if (name == "meta-managed") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    auto enabled = ParseYesNo(directive[1], name);
+    if (!enabled.ok()) return enabled.status();
+    options->meta_managed_ = *enabled;
+    return absl::OkStatus();
+  }
+  if (name == "announce-ip" || name == "node-id" || name == "meta-seed") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    if (name == "announce-ip") {
+      options->announce_ip_ = directive[1];
+    } else if (name == "node-id") {
+      options->node_id_ = directive[1];
+    } else {
+      options->meta_seeds_.push_back(directive[1]);
+    }
+    return absl::OkStatus();
+  }
+  if (name == "announce-port" || name == "announce-tls-port") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     // 0 follows the corresponding listen port (port / tls-port).
     std::uint16_t port = 0;
     absl::Status parsed = ParseUnsigned(directive[1], name, &port, true);
     if (!parsed.ok()) return parsed;
-    if (name == "cluster-announce-port") {
-      options->cluster_announce_port_ = port;
+    if (name == "announce-port") {
+      options->announce_port_ = port;
     } else {
-      options->cluster_announce_tls_port_ = port;
+      options->announce_tls_port_ = port;
     }
     return absl::OkStatus();
   }
@@ -661,25 +672,34 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
     return absl::InvalidArgumentError(
         "client-query-buffer-limit must be between 1mb and LONG_MAX bytes");
   }
-  // Redis Cluster data plane. Meta owns the only supported topology and
-  // authority source, so cluster mode is mutually exclusive with both
-  // replication upstream directives; runtime REPLICAOF is rejected separately
-  // at the command layer.
-  if (options.cluster_enabled_) {
-    if (options.cluster_meta_seeds_.empty()) {
+  // Validate client semantics independently from the authority source.
+  // Meta-managed nodes cannot also consume an external Redis dataset.
+  if (options.client_mode_ == ClientMode::kCluster && !options.meta_managed_) {
+    return absl::InvalidArgumentError(
+        "client-mode cluster requires meta-managed yes");
+  }
+  // Single admission does not yet bind every command to Group authority. Do
+  // not open listeners or touch storage for that combination until it does.
+  if (options.client_mode_ == ClientMode::kSingle && options.meta_managed_) {
+    return absl::InvalidArgumentError(
+        "Meta-managed Single is not available: authority admission is not "
+        "implemented");
+  }
+  if (options.meta_managed_) {
+    if (options.meta_seeds_.empty()) {
       return absl::InvalidArgumentError(
-          "cluster-enabled requires at least one cluster-meta-seed for the "
-          "Meta-managed Cluster");
+          "meta-managed requires at least one meta-seed for the "
+          "Meta-managed node");
     }
-    if (!IsLowerHexNodeId(options.cluster_node_id_)) {
+    if (!IsLowerHexNodeId(options.node_id_)) {
       return absl::InvalidArgumentError(
-          "Meta-managed cluster mode requires cluster-node-id as 40 lowercase "
+          "Meta-managed mode requires node-id as 40 lowercase "
           "hex characters");
     }
-    for (const std::string& seed : options.cluster_meta_seeds_) {
+    for (const std::string& seed : options.meta_seeds_) {
       if (!IsNumericEndpoint(seed)) {
-        return absl::InvalidArgumentError(absl::StrCat(
-            "cluster-meta-seed must be a numeric IP endpoint: ", seed));
+        return absl::InvalidArgumentError(
+            absl::StrCat("meta-seed must be a numeric IP endpoint: ", seed));
       }
     }
     // The data-control connection reuses the replication TLS identity. An
@@ -694,29 +714,27 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
     if (options.replicaof_.has_value() ||
         options.redis_replicaof_.has_value()) {
       return absl::InvalidArgumentError(
-          "cluster-enabled cannot be combined with replicaof or "
+          "meta-managed cannot be combined with replicaof or "
           "redis-replicaof");
     }
     if (!options.load_rdb_file_.empty()) {
       return absl::InvalidArgumentError(
-          "cluster-enabled cannot be combined with load-rdb");
+          "meta-managed cannot be combined with load-rdb");
     }
     // MOVED and discovery replies must name at least one reachable client
     // endpoint. A zero announce port follows the corresponding listen port,
     // so a TLS-only deployment (port 0, tls-port > 0) resolves a nonzero
     // announced TLS port and is valid. This runs before the generic
     // port/tls-port check below so cluster deployments get this message.
-    const std::uint16_t announced_port = options.cluster_announce_port_ != 0
-                                             ? options.cluster_announce_port_
-                                             : options.port_;
-    const std::uint16_t announced_tls_port =
-        options.cluster_announce_tls_port_ != 0
-            ? options.cluster_announce_tls_port_
-            : options.tls_port_;
+    const std::uint16_t announced_port =
+        options.announce_port_ != 0 ? options.announce_port_ : options.port_;
+    const std::uint16_t announced_tls_port = options.announce_tls_port_ != 0
+                                                 ? options.announce_tls_port_
+                                                 : options.tls_port_;
     if (announced_port == 0 && announced_tls_port == 0) {
       return absl::InvalidArgumentError(
-          "cluster-enabled requires an announced client port: set port, "
-          "tls-port, cluster-announce-port, or cluster-announce-tls-port");
+          "meta-managed requires an announced client port: set port, "
+          "tls-port, announce-port, or announce-tls-port");
     }
   }
   if (options.port_ == 0 && options.tls_port_ == 0) {
