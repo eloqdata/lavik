@@ -219,12 +219,14 @@ The compact Stream payload uses the current `LXS1` layout, including persisted
 macro-node entry counts that preserve approximate-trim boundaries across
 restart and RDB export/import. It does not reconstruct those boundaries from
 current settings or accept earlier development layouts without node counts.
-Lavik-owned storage schemas remain at v1 while unreleased; incompatible
-development media is recreated, not migrated. Redis RDB versions follow the
-external Redis format independently.
+Lavik-owned storage schemas remain at v1 before the first stable release,
+including beta releases; incompatible development media is recreated, not
+migrated. Published stable formats follow the
+[system compatibility contract](01-overview.md#cross-cutting-invariants).
+Redis RDB versions follow the external Redis format independently.
 
 The current version-1 format also includes checkpoint metadata and the
-system-state root and manifest. During pre-deployment development this layout
+system-state root and manifest. Before the first stable release this layout
 directly replaces earlier layouts that also used version 1; there is no
 compatibility decoder. Older media, including the earlier 104-byte record
 layout, must be reset before this build starts.
