@@ -35,8 +35,7 @@
 #include "lavik/meta/cluster_create.h"
 #include "lavik/meta/hash.h"
 #include "lavik/meta/population_manifest_store.h"
-#include "libnuraft/raft_params.hxx"
-#include "libnuraft/raft_server.hxx"
+#include "lavik/meta/raft.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::meta {
@@ -1218,7 +1217,7 @@ struct MetaClusterCreateReconciler::Core {
   bycorf::ForeignExecutor executor_;
   std::shared_ptr<MetaMembershipGate> membership_gate_;
   std::shared_ptr<MetaDataControlRuntimeStatus> runtime_status_;
-  nuraft::ptr<nuraft::raft_server> server_;
+  std::shared_ptr<MetaRaft> server_;
   std::uint64_t max_peer_response_age_us_ = 0;
   // Worker-owned except the atomic ingress/stop-completion flags below.
   bool running_ = false;
@@ -1229,28 +1228,10 @@ struct MetaClusterCreateReconciler::Core {
   std::atomic<bool> stopping_{false};
 };
 
-template <typename CoreT>
-void SetPeerSmCommitTracking(const std::shared_ptr<CoreT>& core, bool enabled) {
-  auto params = core->server_->get_current_params();
-  if (params.track_peers_sm_commit_idx_ == enabled) return;
-  params.track_peers_sm_commit_idx_ = enabled;
-  core->server_->update_params(params);
-  spdlog::info("cluster-create peer SM commit tracking {}",
-               enabled ? "enabled" : "disabled");
-}
-
-bool IsWaitingAtMetaBarrier(const MetaOperationRecord& operation) {
-  return operation.kind_ == kMetaClusterCreateOperationKind &&
-         !IsTerminal(operation.lifecycle_) &&
-         (operation.kind_phase_blob_.empty() ||
-          operation.kind_phase_blob_ == kRootPhaseWaitMetaBarrier);
-}
-
 MetaClusterCreateReconciler::MetaClusterCreateReconciler(
     bycorf::ForeignExecutor executor, std::shared_ptr<MetaMembershipGate> gate,
     std::shared_ptr<MetaDataControlRuntimeStatus> runtime,
-    nuraft::ptr<nuraft::raft_server> server,
-    std::uint64_t max_peer_response_age_us)
+    std::shared_ptr<MetaRaft> server, std::uint64_t max_peer_response_age_us)
     : core_(std::make_shared<Core>()) {
   core_->executor_ = std::move(executor);
   core_->membership_gate_ = std::move(gate);
@@ -1262,17 +1243,6 @@ MetaClusterCreateReconciler::~MetaClusterCreateReconciler() { Shutdown(); }
 
 void MetaClusterCreateReconciler::Start(MetaLeaderContext& context) {
   const auto core = core_;
-  // Start is serialized on the coordinator's leadership thread. Establish
-  // leader completion semantics here, before an earlier-registered reconciler
-  // can run a genesis binding proposal on the worker executor.
-  const auto view = context.CommittedView();
-  const auto& lifecycle = view.topology().ClusterLifecycle();
-  const auto operation =
-      lifecycle.state_ == MetaClusterLifecycle::kCreating
-          ? view.operation().FindOperation(lifecycle.root_operation_id_)
-          : std::optional<MetaOperationRecord>{};
-  SetPeerSmCommitTracking(
-      core, operation.has_value() && IsWaitingAtMetaBarrier(*operation));
   if (!core->executor_.Notify([core, context = &context]() noexcept {
         if (core->shutdown_) return;
         if (core->running_) std::terminate();
@@ -1338,15 +1308,8 @@ bycorf::Task<absl::Status> MetaClusterCreateReconciler::Run(
         has_creation
             ? view.operation().FindOperation(lifecycle.root_operation_id_)
             : std::optional<MetaOperationRecord>{};
-    // NuRaft's tracking switch has two inseparable effects: followers report
-    // their SM commit index, while a leader delays every client completion
-    // until all peers have applied it. Followers therefore keep the switch on,
-    // but a leader enables it only while proving the creation barrier. The root
-    // SubmitOperation committed before this point under normal majority
-    // semantics; fresh heartbeats repopulate peer progress after enabling.
-    const bool waiting_at_meta_barrier =
-        operation.has_value() && IsWaitingAtMetaBarrier(*operation);
-    SetPeerSmCommitTracking(core, waiting_at_meta_barrier);
+    // The runtime always reports actual peer application. Only this planner
+    // imposes the all-genesis-member barrier; writes retain majority semantics.
     if (!operation.has_value())
       lease.reset();
     else {
@@ -1417,19 +1380,6 @@ bycorf::Task<absl::Status> MetaClusterCreateReconciler::Run(
             auto request = cluster::control::GenerateId128();
             if (!request.ok()) std::terminate();
             std::visit([&](auto& c) { c.request_id_ = *request; }, command);
-            if (waiting_at_meta_barrier) {
-              const auto* transition =
-                  std::get_if<TransitionOperationPhase>(&command);
-              if (transition != nullptr &&
-                  transition->kind_phase_blob_ != kRootPhaseWaitMetaBarrier) {
-                // The already-observed peer indexes prove B. Publish the
-                // durable exit (including recovery-required) with ordinary
-                // majority completion; if it does not commit, the next loop
-                // re-enables tracking from the retained barrier phase.
-                SetPeerSmCommitTracking(core, false);
-              }
-            }
-            // Cancellation never rolls back or submits a compensating fence.
             // An accepted proposal may still commit; the next owner re-reads
             // its effect before deciding whether anything remains to do.
             const auto applied = co_await context->Propose(std::move(command));
@@ -1454,12 +1404,6 @@ bycorf::Task<absl::Status> MetaClusterCreateReconciler::Run(
     if (!slept.ok()) break;
   }
   lease.reset();
-  if (!core->shutdown_) {
-    // A demoted node is a follower again and must be ready to report progress
-    // to whichever peer owns a recovered creation barrier next. Permanent
-    // shutdown does not reopen all-peer completion while ingress is draining.
-    SetPeerSmCommitTracking(core, true);
-  }
   core->running_ = false;
   for (const auto& waiter : core->waiters_) waiter->set_value();
   core->waiters_.clear();

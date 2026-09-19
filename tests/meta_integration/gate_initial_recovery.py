@@ -23,10 +23,7 @@ import harness as H  # noqa: E402
 
 
 def bindings_complete(node):
-    return (os.path.exists(os.path.join(
-                node.data_dir, "initial_bindings_complete.dat")) and
-            not os.path.exists(os.path.join(
-                node.data_dir, "initial_bindings.dat")))
+    return node.status()["initial_bindings_pending"] == "0"
 
 
 def prove_write(nodes, leader, value):
@@ -160,8 +157,7 @@ def main():
         run_case(binary, workdir, snapshot=False)
         run_case(binary, workdir, snapshot=True)
         if has_crash_hooks(binary):
-            for point in ("before-membership", "after-candidate", "after-config",
-                          "after-baseline", "after-completion"):
+            for point in ("before-membership", "after-file", "after-marker"):
                 run_case(binary, workdir, snapshot=True,
                          crash_point=f"meta-snapshot-{point}")
         else:

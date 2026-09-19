@@ -128,7 +128,7 @@ TEST(OrderedCompactCodecTest, SizingSeparatesItemsFromAggregateCapacity) {
 }
 
 void CheckLargeLogicalRoundTrip(OrderedCollectionKind kind) {
-  // Opt-in boundary coverage retains only the source and encoding, then the
+  // Boundary coverage retains only the source and encoding, then the
   // encoding and decoded items, keeping payload memory near 2 GiB per case.
   constexpr std::size_t kItemBytes = kMaxRecordPayloadBytes / 3 + 1;
   std::vector<OrderedCollectionEntry> entries;
@@ -156,12 +156,11 @@ void CheckLargeLogicalRoundTrip(OrderedCollectionKind kind) {
   }
 }
 
-TEST(OrderedCompactCodecTest, DISABLED_LargeListRoundTripsBeyondRecordLimit) {
+TEST(OrderedCompactCodecTest, LargeListRoundTripsBeyondRecordLimit) {
   CheckLargeLogicalRoundTrip(OrderedCollectionKind::kList);
 }
 
-TEST(OrderedCompactCodecTest,
-     DISABLED_LargeSortedSetRoundTripsBeyondRecordLimit) {
+TEST(OrderedCompactCodecTest, LargeSortedSetRoundTripsBeyondRecordLimit) {
   CheckLargeLogicalRoundTrip(OrderedCollectionKind::kSortedSet);
 }
 

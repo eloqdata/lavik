@@ -39,10 +39,7 @@
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/meta/coordinator.h"
 #include "lavik/meta/data_control_runtime_status.h"
-
-namespace nuraft {
-class raft_server;
-}
+#include "lavik/meta/raft.h"
 
 namespace bycorf {
 struct Connection;
@@ -342,7 +339,7 @@ struct MetaDataControlServerOptions {
   // observation TTL, because a valid resolved heartbeat cadence may exceed
   // this value.
   std::uint32_t session_progress_timeout_ms_ = 10000;
-  // Upper bound supplied by process assembly from NuRaft's configured
+  // Upper bound supplied by process assembly from Raft's configured
   // leadership-expiry window. The current global Authority Lease Policy may
   // request less.
   std::uint32_t leadership_validity_ms_ = 0;
@@ -472,12 +469,12 @@ enum class MetaLeaderRuntimeDisposition : std::uint8_t {
   kQuarantineStarted,
 };
 
-// Suspend-aware validity barrier layered over NuRaft's active-monotonic
+// Suspend-aware validity barrier layered over Raft's active-monotonic
 // leadership expiry. A host pause can let another Meta member win an election
 // while the old process's CLOCK_MONOTONIC-based peer timers stand still. Once
 // CLOCK_BOOTTIME has advanced by one leadership-validity window beyond the
 // active clock, authority remains quarantined until the old process itself has
-// run for one full validity window. That active interval gives NuRaft's peer
+// run for one full validity window. That active interval gives Raft's peer
 // liveness check time to expire or observe the newer term before this process
 // can issue another authority-bearing message.
 //
@@ -545,7 +542,7 @@ class MetaDataControlServer final : public MetaReconciler {
   // and leader task, through a completed Shutdown/CancelAndWait drain.
   static absl::StatusOr<std::shared_ptr<MetaDataControlServer>> Create(
       bycorf::ForeignExecutor foreign_executor,
-      nuraft::ptr<nuraft::raft_server> server, MetaCoordinator& coordinator,
+      std::shared_ptr<MetaRaft> server, MetaCoordinator& coordinator,
       std::shared_ptr<MetaObservationStore> observations,
       MetaDataControlServerOptions options);
 

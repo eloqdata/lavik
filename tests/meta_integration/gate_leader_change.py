@@ -106,10 +106,9 @@ def assert_election_events(round_name, victim, new_leader, survivors,
                            victim_term, kill_wall, observed_wall):
     """raft_callback_ assertions for one kill round; returns the new term.
 
-    With wait_for_sm_catchup_on_becoming_leader_=true NuRaft fires
-    BecomeLeader exactly when the state machine reaches the leader's
-    pre-election log end, which is the same commit advancement the gate
-    observes as committed >= pre — so the callback's log timestamp must sit
+    The role relay exposes BecomeLeader only after actual application of
+    the current-term fence and fresh quorum liveness. This includes the
+    commit advancement the gate observes as committed >= pre — so the callback's log timestamp must sit
     within EVENT_TS_SLACK_S of that observation point (and after the kill).
     """
     status_term = new_leader.term()

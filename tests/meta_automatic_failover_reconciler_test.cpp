@@ -43,12 +43,10 @@
 #include "lavik/meta/data_control_server.h"
 #include "lavik/meta/failover.h"
 #include "lavik/meta/hash.h"
-#include "lavik/meta/nuraft_log_store.h"
-#include "lavik/meta/nuraft_state_mgr.h"
 #include "lavik/meta/observation_store.h"
 #include "lavik/meta/proposal_executor.h"
 #include "lavik/meta/state_machine.h"
-#include "libnuraft/nuraft.hxx"
+#include "support/meta_raft.h"
 #include "support/test_data_path.h"
 
 namespace lavik::meta {
@@ -126,53 +124,6 @@ T RunTaskSync(bycorf::Task<T> task) {
   return result;
 }
 
-class ThreadScheduler final : public nuraft::delayed_task_scheduler {
- public:
-  ~ThreadScheduler() override { Shutdown(); }
-
-  void schedule(nuraft::ptr<nuraft::delayed_task>& task,
-                nuraft::int32 delay_ms) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (stopped_) return;
-    threads_.emplace_back([this, task, delay_ms] {
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        stopped_cv_.wait_for(lock, std::chrono::milliseconds(delay_ms),
-                             [this] { return stopped_; });
-        if (stopped_) return;
-      }
-      task->execute();
-    });
-  }
-
-  void Shutdown() {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      stopped_ = true;
-    }
-    stopped_cv_.notify_all();
-    for (std::thread& thread : threads_) {
-      if (thread.joinable()) thread.join();
-    }
-    threads_.clear();
-  }
-
- private:
-  void cancel_impl(nuraft::ptr<nuraft::delayed_task>&) override {}
-
-  std::mutex mutex_;
-  std::condition_variable stopped_cv_;
-  bool stopped_ = false;
-  std::vector<std::thread> threads_;
-};
-
-class NullRpcClientFactory final : public nuraft::rpc_client_factory {
- public:
-  nuraft::ptr<nuraft::rpc_client> create_client(const std::string&) override {
-    return nullptr;
-  }
-};
-
 class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
  protected:
   struct SeedState {
@@ -211,53 +162,32 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     ASSERT_TRUE(initialized_result.get().ok());
     executor_ = runtime_->GetForeignExecutor(0);
 
-    const NuraftMemberConfig local{1, "127.0.0.1:19601", "lavik://meta/1",
-                                   "127.0.0.1:19701", "127.0.0.1:19801"};
-    NuraftStateMgrOpenOptions manager_options{.data_dir_ = dir_,
-                                              .local_member_ = local};
-    manager_options.initial_cluster_ = std::vector{local};
-    auto manager = NuraftStateMgr::Open(std::move(manager_options));
-    ASSERT_TRUE(manager.ok()) << manager.status();
-    manager_ = nuraft::ptr<NuraftStateMgr>(std::move(*manager));
     auto machine = MetaStateMachine::Open(dir_);
     ASSERT_TRUE(machine.ok()) << machine.status();
-    machine_ = nuraft::ptr<MetaStateMachine>(std::move(*machine));
+    machine_ = std::shared_ptr<MetaStateMachine>(std::move(*machine));
 
-    scheduler_ = nuraft::cs_new<ThreadScheduler>();
-    nuraft::raft_params params;
-    params.with_election_timeout_lower(500);
-    params.with_election_timeout_upper(900);
-    params.with_hb_interval(50);
-    params.with_snapshot_enabled(0);
-    params.with_reserved_log_items(0);
-    params.with_client_req_timeout(5'000);
-    params.return_method_ = nuraft::raft_params::async_handler;
-    params.wait_for_sm_catchup_on_becoming_leader_ = true;
-    nuraft::context* context = new nuraft::context(
-        manager_, machine_, /*listener=*/nullptr, /*logger=*/nullptr,
-        nuraft::cs_new<NullRpcClientFactory>(), scheduler_, params);
-    nuraft::raft_server::init_options init_options;
-    init_options.raft_callback_ = [this](nuraft::cb_func::Type type,
-                                         nuraft::cb_func::Param*) {
-      std::lock_guard<std::mutex> lock(role_mutex_);
-      if (coordinator_ == nullptr) return nuraft::cb_func::Ok;
-      if (type == nuraft::cb_func::BecomeLeader) {
+    auto options = test::SingleMetaOptions(dir_);
+    options.election_ms_ = 500;
+    options.role_ = [this](bool leader, std::uint64_t) {
+      std::lock_guard lock(role_mutex_);
+      if (!coordinator_) return;
+      if (leader)
         coordinator_->BecomeLeader();
-      } else if (type == nuraft::cb_func::BecomeFollower) {
+      else
         coordinator_->BecomeFollower();
-      }
-      return nuraft::cb_func::Ok;
     };
-    server_ = nuraft::cs_new<nuraft::raft_server>(context, init_options);
-
-    nuraft::ptr<nuraft::log_store> store = manager_->load_log_store();
-    wal_ = static_cast<NuraftLogStore*>(store.get());
+    auto raft = MetaRaft::Open(std::move(options), *machine_);
+    ASSERT_TRUE(raft.ok()) << raft.status();
+    server_ = std::move(*raft);
     MetaCoordinatorOptions coordinator_options;
     coordinator_options.foreign_executor_ = executor_;
     coordinator_options.propose_timeout_ms_ = ProposeTimeoutMs();
     coordinator_options.proposal_executor_ = &proposal_executor_;
-    coordinator_ = std::make_unique<MetaCoordinator>(
-        server_, *machine_, *wal_, observations_, coordinator_options);
+    {
+      std::lock_guard lock(role_mutex_);
+      coordinator_ = std::make_unique<MetaCoordinator>(
+          server_, *machine_, observations_, coordinator_options);
+    }
     ASSERT_TRUE(WaitUntil([this] { return server_->is_leader(); }, 15s));
     // Harmless if the organic callback already arrived; it closes the tiny
     // fixture-only race between election and callback target attachment.
@@ -274,13 +204,8 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     if (reconciler_ != nullptr) reconciler_->Shutdown();
     reconciler_.reset();
     if (server_ != nullptr) server_->shutdown();
-    if (machine_ != nullptr) machine_->WaitForSnapshotWriterIdle();
     server_.reset();
-    if (scheduler_ != nullptr) scheduler_->Shutdown();
-    scheduler_.reset();
     machine_.reset();
-    manager_.reset();
-    wal_ = nullptr;
     executor_.WaitUntilIdle();
     runtime_->RequestStop();
     runtime_->WaitUntilStopped();
@@ -720,11 +645,8 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
   std::filesystem::path dir_;
   std::unique_ptr<bycorf::Runtime> runtime_;
   bycorf::ForeignExecutor executor_;
-  nuraft::ptr<NuraftStateMgr> manager_;
-  nuraft::ptr<MetaStateMachine> machine_;
-  NuraftLogStore* wal_ = nullptr;
-  nuraft::ptr<ThreadScheduler> scheduler_;
-  nuraft::ptr<nuraft::raft_server> server_;
+  std::shared_ptr<MetaStateMachine> machine_;
+  std::shared_ptr<lavik::meta::MetaRaft> server_;
   MetaObservationStore observations_;
   MetaProposalExecutor proposal_executor_;
   std::unique_ptr<MetaCoordinator> coordinator_;
@@ -768,8 +690,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   // A new leader commits a Raft configuration without a Meta command event.
   // Status still compares the detector's cut with this full applied cursor;
   // it must recover without waiting for an unrelated topology mutation.
-  nuraft::ptr<nuraft::cluster_config> config;
-  machine_->commit_config(before + 1, config);
+  machine_->Advance(before + 1);
   ASSERT_EQ(machine_->last_commit_index(), before + 1);
   EXPECT_EQ(coordinator_->CommittedHighWater(), stores_high_water);
   EXPECT_TRUE(WaitUntil([&] {

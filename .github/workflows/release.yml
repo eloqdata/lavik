@@ -60,10 +60,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: raft/go.mod
+          cache-dependency-path: raft/go.sum
+
       - name: Initialize pinned dependencies
         run: |
-          git submodule update --init bycorf third_party/mimalloc third_party/nuraft
-          git -C third_party/nuraft submodule update --init asio
+          git submodule update --init bycorf third_party/mimalloc
           git -C bycorf submodule update --init third_party/liburing third_party/abseil
 
       - name: Initialize bypass dependencies
@@ -113,7 +117,7 @@ jobs:
             "$binary" --help >/dev/null 2>&1
             "$binary" --version
             if [[ -n "$LAVIK_PACKAGE_TAG" ]]; then
-              # lavik-meta also reports its pinned NuRaft revision.
+              # lavik-meta also reports its pinned etcd Raft version.
               read -r binary_name binary_version _ <<<"$("$binary" --version)"
               test "$binary_name" = "$app"
               test "$binary_version" = "${LAVIK_PACKAGE_TAG#v}"

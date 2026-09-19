@@ -16,11 +16,9 @@
 
 #pragma once
 
-// NuRaft's public mutation APIs may synchronously enter storage or internal
-// locks before returning their asynchronous result handle. Meta ingress runs
-// on a single bycorf worker, so those calls must cross this bounded executor:
-// the worker only queues work and later resumes through
-// bycorf::ForeignExecutor.
+// Bounded admission and completion waits for Meta mutations/snapshots. Snapshot
+// publication can wait for storage, so it stays off the single Bycorf worker.
+// That worker only enqueues work and resumes through bycorf::ForeignExecutor.
 
 #include <condition_variable>
 #include <cstddef>
@@ -63,7 +61,7 @@ class MetaProposalExecutor {
   std::thread thread_;
 };
 
-// NuRaft accepts only one membership change at a time. Initial cluster creation
+// Raft accepts only one membership change at a time. Initial cluster creation
 // shares this gate so membership cannot race its singleton lifecycle admission.
 // Every Admin listener and both workflow reconcilers share one gate. After
 // intent submission the background owner holds the lease; the durable Creating

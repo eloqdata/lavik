@@ -65,39 +65,32 @@ back process startup.
 
 Before the first start, give every initial Meta process the same canonical
 cluster manifest through `--initial-cluster-manifest`. The manifest's complete
-`[[meta_members]]` set becomes one NuRaft genesis configuration; one, three,
+`[[meta_members]]` set becomes one Raft genesis configuration; one, three,
 and five initial voters follow the same path and use ordinary randomized
 election. Each process's `--id` and initial Raft address must match its
 manifest descriptor. Data-control and Admin process addresses are local binds;
 their manifest values are the durable advertised routes.
 
-The manifest is a bootstrap-only input. After `cluster_config.dat` exists,
-restart with the same id, data directory, compatible listeners, and TLS mode
-but omit `--initial-cluster-manifest`; replaying it is rejected. A pristine
-process started without a manifest is instead an election-disabled waiting
-joiner for a future `addsrv`. Internally, `initial_bindings.dat` keeps initial
-transport recovery enabled only until every genesis identity binding commits;
-`initial_bindings_complete.dat` permanently disambiguates that completed state
-from the initial two-file publication prefix. A waiting process's
-`waiting_joiner.dat` survives pre-add config replay and is removed only after
-the installed config includes its local id and it applies all bindings through
-that committed membership config. `raft_started.dat` is published before the
-first durable vote so a later loss of both vote and WAL cannot make an active
-genesis directory look unused. Once either path converges,
-`transport_bindings.dat` holds the exact last-converged descriptors and their
-state-machine replay watermark; future `addsrv` and `removesrv` changes update
-that same reusable baseline transactionally with `cluster_config.dat`. A
-transient `transport_bindings.next` is resolved during crash recovery. A late
-initial member may catch up through either WAL or a snapshot after membership
-has changed. Before opening Raft transport or elections, restart validates the
-snapshot and reconciles its embedded membership with the durable config. It
-automatically completes interrupted config/baseline/lifecycle writes when that
-snapshot supplies the evidence; a later config needs its matching WAL entry
-(except an election-disabled joiner's pending invite). Conflicting configurations
-or missing recovery evidence prevent startup. Do not
-edit or delete these files or other Raft state to turn an old member into a new
-one; missing, mismatched, or malformed lifecycle state intentionally prevents
-startup.
+The manifest is a bootstrap-only input. After `RAFT` exists, restart with the
+same id and directory but omit `--initial-cluster-manifest`; replaying it is
+rejected. A pristine node without a manifest is an election-disabled waiting
+joiner for a future `addsrv`. `status` reports `initial_bindings_pending=0`
+once all genesis identities have been applied.
+
+Meta stores the etcd WAL in `<data-dir>/wal/` and snapshots in
+`<data-dir>/snap/`. The same directory holds `RAFT` with the local identity and
+initial membership, the one-way `STARTED` marker, and an optional immutable
+`JOIN` invitation for dynamic catch-up. Recovery verifies the newest published
+snapshot and replays the persisted committed suffix before opening peer ingress.
+Missing, conflicting or corrupt evidence prevents startup. Do not edit/delete
+these files to make an old member appear new. See the
+[durable root contract](../architecture/10-meta-raft.md#durable-root-and-recovery).
+
+The election interval is randomized in `[low, 2*low)` with whole heartbeat
+ticks. `--election-ms-low` must be 3–60 heartbeat intervals and
+`--election-ms-high` must equal twice the lower bound. WAL, snapshot and GC work
+run independently of the protocol loop. The former `--raft-io-threads`,
+`--raft-log-level`, and `--snapshot-sync-timeout-ms` options are unsupported.
 
 ## Send administrative commands
 
@@ -300,7 +293,7 @@ updated Meta and CLI together.
 Repeat `[[meta_members]]` for every first-wave voter. IDs and each endpoint
 class must be unique; entries are canonicalized by ID, all members are voters,
 and the principal is fixed as `lavik://meta/<id>`. At admission the manifest
-set must exactly equal NuRaft's committed descriptors, the identity store, and
+set must exactly equal Raft's committed descriptors, the identity store, and
 the Admin/Data-control directories. Cluster Create never calls `add_srv`.
 Its durable root first waits at a fixed Raft barrier until every remote Meta
 has recently replied and reports its state machine applied through the root's
@@ -670,7 +663,7 @@ For later expansion, replacement, or contraction, start a pristine waiting
 joiner without a manifest and use the reusable membership workflow below.
 `addsrv` and `removesrv` persist a workflow before changing identity or Raft
 membership. `OK` means the requested configuration and identity changes have
-committed, not just that NuRaft accepted an invite. Before adding the next member, poll the
+committed, not just that Raft accepted an invite. Before adding the next member, poll the
 new member's `status` until it remains alive and its `committed` index reaches
 the leader value observed after the add. The current `status` command does not
 list the membership set; a replicated write observed on the joiner is the
@@ -773,9 +766,8 @@ command.
 
 Do not mix plaintext and mTLS members. Enabling or disabling Raft TLS on an
 existing cluster requires a coordinated restart of all members; it does not
-change the WAL or snapshot format. `--raft-io-threads` sizes NuRaft's native
-Asio pool (default 2); it does not change the single Bycorf control-session
-worker or make WAL synchronization asynchronous.
+change the WAL or snapshot format. Control, replication and snapshot traffic
+use independent Go connections. Bycorf retains its single control-session worker.
 
 ## Configure Data nodes
 
@@ -902,7 +894,7 @@ Lease expiry is suspend-aware: Data checks deadlines with Linux
 configured Raft election lower bound before its first otherwise-valid grant.
 The second interval is an internally derived cross-host clock margin, not a
 separate operator setting. A host suspend therefore consumes an existing lease
-instead of extending it. Meta additionally detects suspend against NuRaft's
+instead of extending it. Meta additionally detects suspend against Raft's
 active clock, closes authority sessions, logs a quarantine warning, and
 requests immediate resignation; a sole member must run for one election-lower-
 bound interval before accepting authority again. Repeated client reconnects
@@ -1021,7 +1013,7 @@ lavik-ctl --socket /var/lib/lavik/meta-1/meta-admin.sock \
 ```
 
 The leader first commits and audits the complete membership intent, then its
-background owner binds identity and invokes NuRaft `add_srv`. A successful
+background owner binds identity and invokes Raft `add_srv`. A successful
 invite alone does not complete the task. `ERR config-changing` indicates a
 different active workflow; an uncertain-outcome reply retains the original
 operation id and the leader continues retrying independently of the client.
@@ -1051,15 +1043,20 @@ committed and the remaining cluster has elected a healthy leader.
 Send one LF-terminated command per connection or keep a connection open and
 read exactly one reply line per command. `status` reports whether that member
 is leader, its server id, committed and snapshot indexes, and current term. It
-is a local view; compare all members when diagnosing lag.
+is a local view; compare all members when diagnosing lag. `first_log_idx`
+identifies the retained logical suffix, `pending_raft_bytes` reports unfinished
+persistence, `rpc_failures` counts connection/send failures, and `gc_failures`
+counts consecutive reclamation failures. Vote grant/rejection counters include
+PreVote and are useful when diagnosing stale candidates.
 
-Automatic snapshots run according to `--snapshot-distance`; `snapshot` asks
-the leader for a commit-serialized capture and returns its cut index. The reply
-means capture succeeded, while durable publication and WAL compaction complete
-asynchronously. Monitor logs for `snapshot write failed`, snapshot decode or
-install errors, and repeated snapshot failures. A leader that exceeds the
-uncompacted-WAL or repeated-snapshot-failure guard rejects new proposals with
-`RESOURCE_EXHAUSTED` rather than expanding indefinitely.
+Automatic snapshots run according to `--snapshot-distance`; `snapshot` returns
+its exact cut only after the file and WAL publication marker are durable and
+memory compaction completes. Whole-file GC runs separately and retains the
+boundary WAL segment; a small log may continue using one preallocated etcd
+segment after logical compaction. Monitor snapshot failures, `gc_failures`,
+filesystem capacity, and the `etcd Raft fail-stop` diagnostic. Retained logical
+log growth or repeated snapshot failures activate the existing proposal guard.
+The runtime also bounds pending queues and retained memory independently.
 
 When that guard fires:
 
@@ -1076,15 +1073,11 @@ When that guard fires:
    new server id and matching certificate for the replacement. Never wipe a
    quorum simultaneously.
 
-The formal WAL/snapshot format does not migrate prototype `raft_log.dat` or
-`LSN1` snapshots. Back up such a directory, then bootstrap a fresh formal
-cluster; startup intentionally refuses to guess at a conversion.
-
 ## Binary replacement and format compatibility
 
 Before the first stable release, all Lavik-owned durable and control formats
-use v1, including the Raft command envelope, topology store,
-segmented-WAL container, membership descriptors and intents, cluster-create
+retain their current development versions, including the Raft command envelope, topology store,
+membership descriptors and intents, cluster-create
 intents, and cluster-status binary/JSON payloads. There is no decoder for
 superseded pre-release layouts. Development directories from an incompatible
 layout must be rebuilt even when their markers are also v1; marker checks
@@ -1148,7 +1141,7 @@ correct the underlying disk, permission, or size problem first.
 The gate accepts one effect-producing recovery proposal at a time. It rejects a
 stale or no-op command before Raft append, even when the command's verb is on
 the recovery allowlist. A client timeout does not release the reservation: the
-next recovery proposal remains rejected until NuRaft resolves the first one's
+next recovery proposal remains rejected until Raft resolves the first one's
 actual outcome. Reconcile that outcome from the leader's committed view before
 moving to the next step.
 

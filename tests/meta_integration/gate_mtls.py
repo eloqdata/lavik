@@ -42,13 +42,12 @@ N4. trusted CA, wrong SAN: a joiner holding a cert signed by the very CA
     check; equally isolated, cluster fine. N3/N4 share one cluster whose
     CA the gate builds and controls (tests/tls ships no ca.key).
 N5. trusted CA and correct endpoint SAN, but a URI SAN naming another member
-    id: TLS succeeds and the server rejects the first Raft request before it
-    reaches NuRaft.
+    id: startup rejects the mismatched local identity; corrected credentials
+    permit a subsequent join and retirement.
 
-Every negative scenario asserts the isolated node is still ALIVE with a
-working ctl surface (a crash would itself be a finding) and that the
-cluster's writes never stop. Handshake and URI-binding evidence is taken from
-NuRaft's native Asio and Lavik peer-verification log paths.
+N1–N4 assert the isolated node stays alive with a working ctl surface and
+that the cluster keeps writing. Transport-failure counters establish rejection;
+N5 separately asserts local identity validation before serving.
 
 Usage: gate_mtls.py /path/to/lavik-meta [workdir]
 """
@@ -173,8 +172,7 @@ def expect_isolated(leader, joiner, history, seq_start, label,
     # Snapshot the evidence before inviting the peer. The first TLS failure
     # can be logged before the successful addsrv reply reaches this process;
     # sampling afterward would misclassify that real failure as old evidence.
-    evidence0 = sum(leader.count_log_lines(pattern)
-                    for pattern in evidence_patterns)
+    evidence0 = int(leader.status()["rpc_failures"])
     invite = leader.ctl(
         f"addsrv {joiner.id} {joiner.endpoint} "
         f"{joiner.data_control_endpoint} {joiner.ctl_endpoint}")
@@ -216,18 +214,16 @@ def expect_isolated(leader, joiner, history, seq_start, label,
     # The retained operation retries asynchronously, so wait for bounded new evidence rather than
     # racing the log writer at the end of the isolation window.
     evidence_deadline = time.monotonic() + 5.0
-    evidence1 = sum(leader.count_log_lines(pattern)
-                    for pattern in evidence_patterns)
+    evidence1 = int(leader.status()["rpc_failures"])
     while evidence1 <= evidence0 and time.monotonic() < evidence_deadline:
         time.sleep(0.05)
-        evidence1 = sum(leader.count_log_lines(pattern)
-                        for pattern in evidence_patterns)
+        evidence1 = int(leader.status()["rpc_failures"])
     if evidence1 <= evidence0:
         raise H.Failure(f"{label}: no '{evidence_label}' evidence in "
-                        f"leader log")
+                        f"transport counters")
     H.log(f"{label}: node {joiner.id} isolated (alive, committed=0), "
-          f"quorum committed {committed0} -> {committed1}, leader log "
-          f"'{evidence_label}' lines {evidence0} -> {evidence1}")
+          f"quorum committed {committed0} -> {committed1}, transport counters "
+          f"'{evidence_label}' failures {evidence0} -> {evidence1}")
     # Fix only the joiner's transport credentials. No replacement addsrv:
     # the original durable task must resume after authentication succeeds.
     joiner.terminate()
@@ -242,9 +238,8 @@ def expect_isolated(leader, joiner, history, seq_start, label,
         retire_replies[:] = [leader.ctl(f"removesrv {joiner.id}")]
         return retire_replies == ["OK"]
 
-    # A leader can append NuRaft's same-membership config copy immediately
-    # after the recovered add completes.  That internal round briefly returns
-    # `config-changing`; wait for the stable, idempotent retirement result.
+    # The durable workflow may still be releasing its membership reservation.
+    # Wait for the stable, idempotent retirement result.
     try:
         H.wait_until(f"{label}: repaired member retires", 5,
                      terminally_retired)
@@ -331,8 +326,7 @@ def main():
         joiners.append(tls_joiner)
         tls_joiner.start(bootstrap=False)
         # The plaintext leader's client fails against the TLS listener; the
-        # native Asio service surfaces it through NuRaft's join-path error log
-        # ("rpc error response ... closed: peer EOF").
+        # transport-failure counter records the bounded handshake failure.
         expect_isolated(plain_leader, tls_joiner, hist_b, 200,
                         "N1b-tls-joiner", "rpc error response", H.raft_args())
 
@@ -388,12 +382,22 @@ def main():
             name_prefix="wrong-id", principal_id=99)
         wrongid_joiner = H.Node(BINARY, dir_c, 6, args=wrongid_args)
         joiners.append(wrongid_joiner)
+        # The local identity check now fails before ingress. Verify that the
+        # mismatched certificate cannot start, then use the corrected identity
+        # in a real join to exercise peer authentication as well.
+        wrongid_joiner.start(bootstrap=False, wait_ready=False)
+        H.wait_until("wrong local principal fails startup", 10,
+                     lambda: not wrongid_joiner.alive())
+        if wrongid_joiner.proc.returncode == 0:
+            raise H.Failure("wrong member certificate was accepted")
+        wrongid_joiner.args = member_tls_args(
+            os.path.join(workdir, "repaired_id"), ca2_crt, ca2_key, 6)
         wrongid_joiner.start(bootstrap=False)
-        expect_isolated(leader_c, wrongid_joiner, hist_c, 500,
-                        "N5-wrong-member-id",
-                        ("rejected Raft peer",
-                         "RPC peer verification failed"), member_tls_args(
-                             os.path.join(workdir, "repaired_id"), ca2_crt, ca2_key, 6))
+        H.join_and_verify(leader_c, wrongid_joiner)
+        H.wait_until("repaired member retires", 10,
+                     lambda: leader_c.ctl("removesrv 6") == "OK")
+        wrongid_joiner.terminate()
+        H.log("N5: wrong local principal rejected; corrected peer joined and retired")
 
         # ---- teardown: members must SIGTERM cleanly; the isolated joiners
         # never joined, so shutting them down cleanly is asserted too.

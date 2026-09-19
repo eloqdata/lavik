@@ -404,7 +404,7 @@ def main():
             # preserving the laggard's old population and per-flow cursors.
             import gate_failover as F
             F.run_full_fallback(C.META, C.DATA, C.CTL, C.REDIS_CLI,
-                                str(root), True, cut_disconnect=True)
+                                str(root), False, cut_disconnect=True)
             divergent_tail(root, 0)
             divergent_tail(root, 1)
             rejected_full(root, "checksum", {
