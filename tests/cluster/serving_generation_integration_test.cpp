@@ -40,9 +40,14 @@ using lavik::test::WaitUntil;
 std::string g_lavik_binary;
 std::string g_redis_binary;
 
-std::vector<std::string> RedisArguments(std::uint16_t port) {
-  return {g_redis_binary, "--port", std::to_string(port),   "--save", "",
-          "--appendonly", "no",     "--repl-diskless-sync", "no"};
+std::vector<std::string> RedisArguments(
+    std::uint16_t port, const std::filesystem::path& directory) {
+  // PSYNC can create dump.rdb even with scheduled saves disabled. Isolate both
+  // that file and startup recovery from other cases and previous test runs.
+  return {
+      g_redis_binary,    "--port", std::to_string(port),   "--save", "",
+      "--appendonly",    "no",     "--repl-diskless-sync", "no",     "--dir",
+      directory.string()};
 }
 
 std::vector<std::string> ServerArguments(std::uint16_t port,
@@ -76,18 +81,17 @@ TEST(ServingGenerationIntegrationTest,
 #endif
   ASSERT_FALSE(g_lavik_binary.empty());
   TempDirectory directory("serving-generation");
-  const std::filesystem::path source_data = directory.path() / "source.data";
   const std::filesystem::path target_data = directory.path() / "target.data";
   const std::filesystem::path source_log = directory.path() / "source.log";
   const std::filesystem::path target_log = directory.path() / "target.log";
-  CreateDataFile(source_data, 128ULL * 1024 * 1024);
   CreateDataFile(target_data, 128ULL * 1024 * 1024);
 
   PortReservation source_reservation;
   PortReservation target_reservation;
   const std::uint16_t source_port = source_reservation.ReleaseForSpawn();
   const std::uint16_t target_port = target_reservation.ReleaseForSpawn();
-  ChildProcess source(RedisArguments(source_port), source_log);
+  ChildProcess source(RedisArguments(source_port, directory.path()),
+                      source_log);
   ChildProcess target(ServerArguments(target_port, target_data), target_log,
                       {{"LAVIK_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS", "5000"}});
 
@@ -184,18 +188,17 @@ TEST(ServingGenerationIntegrationTest, WatchIsBoundToItsServingGeneration) {
 #endif
   ASSERT_FALSE(g_lavik_binary.empty());
   TempDirectory directory("watch-serving-generation");
-  const std::filesystem::path source_data = directory.path() / "source.data";
   const std::filesystem::path target_data = directory.path() / "target.data";
   const std::filesystem::path source_log = directory.path() / "source.log";
   const std::filesystem::path target_log = directory.path() / "target.log";
-  CreateDataFile(source_data, 128ULL * 1024 * 1024);
   CreateDataFile(target_data, 128ULL * 1024 * 1024);
 
   PortReservation source_reservation;
   PortReservation target_reservation;
   const std::uint16_t source_port = source_reservation.ReleaseForSpawn();
   const std::uint16_t target_port = target_reservation.ReleaseForSpawn();
-  ChildProcess source(RedisArguments(source_port), source_log);
+  ChildProcess source(RedisArguments(source_port, directory.path()),
+                      source_log);
   ChildProcess target(ServerArguments(target_port, target_data), target_log,
                       {{"LAVIK_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS", "5000"}});
 
