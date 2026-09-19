@@ -18,6 +18,10 @@
 
 #include <mimalloc.h>
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -2048,34 +2052,22 @@ class ScanHashMap {
     return static_cast<std::uint8_t>(hash >> 56);
   }
 
-  // Compare the twelve bucket fingerprints with ordinary integer operations.
-  // Each byte addition stays within its lane, unlike subtract-based zero-byte
-  // detection, so adjacent tags cannot create a false match by borrowing.
-  // Empty slots can also match (notably tag zero); callers must still check
-  // occupancy before resolving a handle, then verify the complete key.
+#if defined(__SSE2__)
+  // Match flush-receipt fingerprints before resolving arena handles. Empty
+  // slots can match tag zero, so callers still check occupancy and address.
   static std::uint16_t MatchingTags(const Bucket& bucket,
                                     std::uint8_t tag) noexcept {
     static_assert(kEntriesPerBucket == 12);
-    std::uint64_t head;
-    std::uint32_t tail;
-    std::memcpy(&head, bucket.hashes_.data(), sizeof(head));
-    std::memcpy(&tail, bucket.hashes_.data() + sizeof(head), sizeof(tail));
-    if constexpr (std::endian::native == std::endian::big) {
-      head = std::byteswap(head);
-      tail = std::byteswap(tail);
-    }
-    const std::uint64_t repeated = tag * 0x0101010101010101ULL;
-    auto equal_bytes = [repeated](std::uint64_t word) {
-      constexpr std::uint64_t kLowBits = 0x7f7f7f7f7f7f7f7fULL;
-      const std::uint64_t diff = word ^ repeated;
-      const std::uint64_t high_bits =
-          ~(((diff & kLowBits) + kLowBits) | diff | kLowBits);
-      // Gather one high bit per byte into the corresponding low bitmap bit.
-      return static_cast<std::uint8_t>((high_bits * 0x0002040810204081ULL) >>
-                                       56);
-    };
-    return equal_bytes(head) | ((equal_bytes(tail) & 0x0fU) << 8);
+    // SSE2 is part of the portable x86-64 baseline. Copy from the complete
+    // Bucket object so the 16-byte load stays within its representation; the
+    // four bytes beyond hashes_ are discarded by the twelve-slot mask.
+    __m128i bytes;
+    std::memcpy(&bytes, &bucket, sizeof(bytes));
+    const __m128i repeated = _mm_set1_epi8(static_cast<char>(tag));
+    return static_cast<std::uint16_t>(
+        _mm_movemask_epi8(_mm_cmpeq_epi8(bytes, repeated)) & 0x0fff);
   }
+#endif
 
   static std::uint64_t EntryHash(const Entry& entry) noexcept {
     return Hash(entry.key_complete() ? ComputeDigest(entry.key())
@@ -2351,10 +2343,8 @@ class ScanHashMap {
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
     while (bucket != nullptr) {
-      for (std::uint16_t matches = MatchingTags(*bucket, tag); matches != 0;
-           matches &= matches - 1) {
-        const std::size_t slot = std::countr_zero(matches);
-        if (Occupied(*bucket, slot)) {
+      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
           Entry* entry = Resolve(bucket->entries_[slot]);
           if (KeyEquals(*entry, digest, key)) return entry;
         }
@@ -2370,10 +2360,8 @@ class ScanHashMap {
     const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
     while (bucket != nullptr) {
-      for (std::uint16_t matches = MatchingTags(*bucket, tag); matches != 0;
-           matches &= matches - 1) {
-        const std::size_t slot = std::countr_zero(matches);
-        if (Occupied(*bucket, slot)) {
+      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
           const Entry* entry = Resolve(bucket->entries_[slot]);
           if (KeyEquals(*entry, digest, key)) return entry;
         }
@@ -2397,14 +2385,30 @@ class ScanHashMap {
       }
       const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
       while (bucket != nullptr) {
-        for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
-          if (Occupied(*bucket, slot)) {
-            if constexpr (FilterTag) {
-              if (bucket->hashes_[slot] != tag) continue;
+#if defined(__SSE2__)
+        if constexpr (FilterTag) {
+          for (std::uint16_t matches = MatchingTags(*bucket, tag); matches != 0;
+               matches &= matches - 1) {
+            const std::size_t slot = std::countr_zero(matches);
+            if (Occupied(*bucket, slot)) {
+              const Entry* entry = Resolve(bucket->entries_[slot]);
+              if (reinterpret_cast<std::uintptr_t>(entry) == address) {
+                return entry;
+              }
             }
-            const Entry* entry = Resolve(bucket->entries_[slot]);
-            if (reinterpret_cast<std::uintptr_t>(entry) == address) {
-              return entry;
+          }
+        } else
+#endif
+        {
+          for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+            if (Occupied(*bucket, slot)) {
+              if constexpr (FilterTag) {
+                if (bucket->hashes_[slot] != tag) continue;
+              }
+              const Entry* entry = Resolve(bucket->entries_[slot]);
+              if (reinterpret_cast<std::uintptr_t>(entry) == address) {
+                return entry;
+              }
             }
           }
         }
@@ -2423,10 +2427,8 @@ class ScanHashMap {
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
     while (bucket != nullptr) {
-      for (std::uint16_t matches = MatchingTags(*bucket, tag); matches != 0;
-           matches &= matches - 1) {
-        const std::size_t slot = std::countr_zero(matches);
-        if (Occupied(*bucket, slot)) {
+      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
           Entry* entry = Resolve(bucket->entries_[slot]);
           if (KeyEquals(*entry, digest, key)) result->push_back(entry);
         }
@@ -2443,10 +2445,8 @@ class ScanHashMap {
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
     while (bucket != nullptr) {
-      for (std::uint16_t matches = MatchingTags(*bucket, tag); matches != 0;
-           matches &= matches - 1) {
-        const std::size_t slot = std::countr_zero(matches);
-        if (Occupied(*bucket, slot)) {
+      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
           Entry* entry = Resolve(bucket->entries_[slot]);
           if (KeyEquals(*entry, digest, key) && accept(std::as_const(*entry)))
             return entry;

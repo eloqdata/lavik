@@ -138,8 +138,8 @@ def check_borrowed_payloads():
         assert client.batch([[b'SET', b'empty-value', b'']]) == [b'OK']
         for group in chunks(keys):
             assert client.batch([[b'SET', key, old] for key in group]) == [b'OK'] * len(group)
-    # Recovered keys move to three hash owners while the old blocks retain
-    # their recorded writers. Defrag therefore exercises the remote view path.
+    # Recovery remaps keys and physical blocks independently across three
+    # owners. Defrag must keep borrowed views alive across remote submissions.
     with server(3) as (client, metrics):
         changed = [key for i, key in enumerate(keys) if i % 5 != 0]
         for _ in range(2):

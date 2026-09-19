@@ -3147,7 +3147,10 @@ acquire_active_stream:
     }
     if (external) {
       store.external_manifests_.insert_or_assign(inserted_entry, extents);
-    } else {
+    } else if (!store.external_manifests_.empty()) {
+      // Inline-only stores have no manifest to remove. Keep external-to-inline
+      // replacement cleanup while avoiding an empty hash-table probe on each
+      // ordinary overwrite and relocation.
       store.external_manifests_.erase(inserted_entry);
     }
   }
