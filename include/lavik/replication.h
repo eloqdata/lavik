@@ -91,10 +91,10 @@ struct DesiredClusterUpstream {
 };
 
 struct ReplicationOptions {
-  // Cluster mode is always Meta-managed. It disables standalone upstream
-  // control and Redis PSYNC export; native export requires an exact population
-  // grant from the active Meta session.
-  bool cluster_enabled_ = false;
+  // Meta management is independent of client mode. It disables external
+  // upstream control and Redis PSYNC export; native export requires an exact
+  // population grant from the active Meta session.
+  bool meta_managed_ = false;
   // Set by the Meta control adapter to its validated 160-bit data-node
   // identity. Standalone deployments use a fresh CSPRNG identity each boot.
   std::optional<std::string> node_id_override_;
@@ -121,8 +121,8 @@ struct ReplicationOptions {
   // Bounded source publisher staging memory on each worker. A single larger
   // command may exceed this waterline only while it is the exclusive item.
   std::size_t publish_queue_bytes_per_worker_ = 16ULL * 1024 * 1024;
-  // Compatibility override declaring that the initial upstream speaks Redis
-  // PSYNC. Ordinary replicaof performs safe protocol detection instead.
+  // Explicit Redis subscription alias. Both aliases validate the initial
+  // endpoint and every consuming connection before accepting Redis PSYNC.
   bool redis_psync_ = false;
   // Retain the post-cut Redis export cursor. When disabled (the default), a
   // slow Redis replica is disconnected after it falls behind the bounded

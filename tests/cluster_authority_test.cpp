@@ -160,6 +160,30 @@ struct TestAuthorityControl {
   lavik::cluster::testing::TestTopologyInstaller topology;
 };
 
+TEST(ClusterAuthoritySnapshotTest,
+     SingleClientStillRequiresEverySlotAuthority) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), start, 10ms).ok());
+  const std::array<std::uint16_t, 2> local{kSlotInA, kOtherSlotInA};
+  auto request = MakeRequest(local, true);
+  EXPECT_EQ(control.authority.CaptureAndAdmit(request, start).decision().kind_,
+            Decision::Kind::kCrossSlot);
+  request.client_mode_ = lavik::ClientMode::kSingle;
+  const auto admission = control.authority.CaptureAndAdmit(request, start);
+  EXPECT_EQ(admission.decision().kind_, Decision::Kind::kServe);
+  EXPECT_EQ(control.authority.RecheckAtMutation(admission, start + 10ms),
+            RecheckResult::kReject);
+  EXPECT_EQ(
+      control.authority.CaptureAndAdmit(request, start + 10ms).decision().kind_,
+      Decision::Kind::kClusterDownUnbound);
+  const std::array<std::uint16_t, 2> remote{kSlotInA, kSlotInB};
+  request.slots_ = remote;
+  EXPECT_EQ(control.authority.CaptureAndAdmit(request, start).decision().kind_,
+            Decision::Kind::kMoved);
+}
+
 TEST(ClusterAuthoritySnapshotTest, CachedReadExpiresWithoutAnyPublication) {
   using namespace std::chrono_literals;
   TestAuthorityControl control;

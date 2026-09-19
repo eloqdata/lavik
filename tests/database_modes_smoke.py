@@ -44,9 +44,9 @@ def server(binary, directory, label, *, cluster=False, checkpoint=False,
     if checkpoint:
         args.append("--shutdown-checkpoint")
     if cluster:
-        args += ["--cluster-enabled", "--cluster-node-id", "1" * 40,
-                 "--cluster-meta-seed", "127.0.0.1:9",
-                 "--cluster-announce-ip", "127.0.0.1"]
+        args += ["--client-mode", "cluster", "--meta-managed", "yes", "--node-id", "1" * 40,
+                 "--meta-seed", "127.0.0.1:9",
+                 "--announce-ip", "127.0.0.1"]
     with log_path.open("w") as log:
         process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
         connection = None

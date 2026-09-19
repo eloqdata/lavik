@@ -16,6 +16,33 @@ limitations under the License.
 
 # Cluster deployment quick start
 
+Data startup uses two independent options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `client-mode single|cluster` | `single` | Redis client semantics and DB range (16 DBs or DB0) |
+| `meta-managed yes|no` | `no` | Meta authority, control session and native replication |
+
+Use the same values on the CLI (`--client-mode cluster --meta-managed yes`).
+Configuration files load first; explicitly supplied CLI values override them.
+Cluster without Meta and managed Single are rejected before storage preparation;
+managed Single is not yet available. Non-Meta Single retains Redis/Redis Cluster
+follower support through `replicaof`, `redis-replicaof`, `REPLICAOF`/`SLAVEOF`,
+and `ADDREPLICAOF`. These entry points reject Lavik upstreams before retiring
+existing subscriptions or replacing data. Lavik peers use Meta native Follow
+Owner. A runtime probe failure leaves the old subscription intact; startup
+network failures retry without opening service, and unsupported upstreams remain
+fenced. Existing process-local Redis offsets support reconnect, not durable
+cross-process resume or automatic Meta takeover.
+
+**Configuration change:** `cluster-enabled` and the old `cluster-*` identity,
+seed and announce options have been removed, without aliases. Use `client-mode`,
+`meta-managed`, `meta-seed`, `node-id`, `announce-ip`, `announce-port` and
+`announce-tls-port`. Meta-managed nodes require a stable 40-character lowercase
+hex node ID and numeric Meta seed endpoints; they reject external upstreams and
+`load-rdb`. TLS requirements are unchanged. Old generated launch scripts must be
+regenerated or edited before restarting with this version.
+
 Build the three cluster binaries and launch a local cluster:
 
 ```bash
