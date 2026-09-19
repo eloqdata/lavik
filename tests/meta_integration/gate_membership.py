@@ -25,9 +25,9 @@ One cluster under a continuous propose load; serial phases:
    addsrv while it is down. Restart it and prove catch-up without replacing
    its membership. Interrupted invites are covered by gate_membership_recovery.
 4. Conflicting ops: addsrv for an existing member returns "ERR already-exists";
-   a different removesrv while one is in flight returns "ERR config-changing". The first
-   target is paused and the commands use separate ctl sessions so the overlap
-   is deterministic.
+   removesrv while an offline learner's addsrv is pending returns
+   "ERR config-changing". Starting the learner must complete that same
+   operation without another addsrv, then replicate a committed probe.
 5. A new request to remove the current leader is rejected before submission.
    A previously admitted removal target elected during recovery is a distinct
    case handled by the background driver's leadership handoff.
@@ -37,6 +37,7 @@ Usage: gate_membership.py /path/to/lavik-meta [workdir]
 """
 
 import os
+import re
 import sys
 import threading
 import time
@@ -159,7 +160,13 @@ def main():
         # removal target would not establish concurrent operations.
         node6 = H.Node(BINARY, workdir, 6, args=args)
         extras.append(node6)
-        phases_before = leader.log_tail(lines=2000).count("phase=change-config")
+
+        def membership_changes():
+            return set(re.findall(
+                r"membership ([0-9a-f]{32}) phase=change-config\b",
+                leader.log_tail(lines=2000)))
+
+        operations_before = membership_changes()
         first_result = {}
 
         def add_node6():
@@ -171,20 +178,32 @@ def main():
         first_thread = threading.Thread(target=add_node6, name="add-node6")
         first_thread.start()
         H.wait_until("offline learner owns membership reservation", 10,
-                     lambda: leader.log_tail(lines=2000).count(
-                         "phase=change-config") > phases_before)
+                     lambda: len(membership_changes() - operations_before) == 1)
+        operation, = membership_changes() - operations_before
         second = leader.ctl(f"removesrv {node5.id}")
         if second != "ERR config-changing":
             raise H.Failure(
                 f"concurrent removesrv: {second}, want ERR config-changing")
         node6.start(bootstrap=False)
-        H.join_and_verify(leader, node6)
+        # A bounded Admin wait may report uncertainty, but the original durable
+        # operation must complete. Do not issue another addsrv: retrying could
+        # hide a lost operation by admitting a replacement task.
+        H.wait_until("original learner add completes without resubmission", 30,
+                     lambda: leader.getop(operation) == "OK completed member-added")
         first_thread.join(timeout=15)
         if first_thread.is_alive():
             raise H.Failure("first addsrv did not finish after node6 start")
         first = first_result.get("reply", "ERR missing-result")
-        if first != "OK" and not first.startswith("ERR uncertain-outcome operation="):
+        if first not in ("OK", f"ERR uncertain-outcome operation={operation}"):
             raise H.Failure(f"pending addsrv node {node6.id}: {first}")
+        H.log(f"phase 4: addsrv {node6.id} operation={operation} -> {first}; "
+              f"overlapping removesrv {node5.id} -> {second}; "
+              "original operation completed")
+        probe = "membership-serialization"
+        op_id, reply = leader.propose(probe)
+        if not reply.startswith("OK "):
+            raise H.Failure(f"post-join probe: {reply}")
+        history.record(op_id, probe)
         history.check([node6], timeout=30, desc="serialized learner catch-up")
         for removed in (node6, node5):
             reply = leader.ctl(f"removesrv {removed.id}")
