@@ -1034,11 +1034,15 @@ if (BUILD_TESTING)
           RUN_SERIAL TRUE
         )
 
+        set(LAVIK_NATIVE_GATE_SERVER lavik)
+        if (TARGET lavik_fault_server)
+          set(LAVIK_NATIVE_GATE_SERVER lavik_fault_server)
+        endif()
         add_test(
           NAME meta_integration.gate_native_replication
           COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
                   ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_native_replication.py
-                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:${LAVIK_NATIVE_GATE_SERVER}>
                   $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
         )
         set_tests_properties(meta_integration.gate_native_replication PROPERTIES
@@ -1443,10 +1447,6 @@ endforeach()
     set_tests_properties(lavik_pubsub_e2e PROPERTIES
       TIMEOUT 120
       RUN_SERIAL TRUE)
-
-    find_program(LAVIK_REDIS_SERVER_EXECUTABLE redis-server)
-    if (LAVIK_REDIS_SERVER_EXECUTABLE)
-    endif()
 
     add_executable(lavik_flushdb_reclaim_e2e_test
       tests/flushdb_reclaim_e2e_test.cpp

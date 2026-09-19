@@ -146,7 +146,7 @@ spelling and `ADDREPLICAOF` uses the same native-protocol exclusion probe;
 that check before PSYNC, including reconnects, so endpoint replacement cannot
 start a destructive native import. An unavailable runtime probe returns an
 error without replacing the old subscription. Startup network failures retry;
-an unsupported protocol stops that attempt while keeping the node fenced and
+a confirmed native upstream stops that attempt while keeping the node fenced and
 recovered data intact. Meta native relationships use Follow Owner instead.
 
 The retained non-Meta `REPLICAOF NO ONE` implementation uses the role-transition path

@@ -299,6 +299,57 @@ def full_tail(root):
             reader.close()
 
 
+def committed_cursor_reconnect(root, name, source_faults=None, target_faults=None):
+    with pair(root, name, source_faults=source_faults,
+              target_faults=target_faults) as (meta, source, target, writer):
+        ready(meta)
+        if source_faults:
+            assert "injected post-cut reset" in Path(source.log_path).read_text()
+        if target_faults and "LAVIK_REPLICATION_DROP_AFTER_FULLSYNC_CUT" in target_faults:
+            assert "injected disconnect after full-sync cut acknowledgement" in Path(target.log_path).read_text()
+        reader = Client(target, readonly=True)
+        try:
+            for i in range(64):
+                writer.call("SET", f"cursor-warmup-{i}", "ready")
+            assert writer.call("WAIT", 1, 5000) == 1
+            old_full = Path(source.log_path).read_text().count("selected=FULL")
+            writer.call("INCR", "cancelled-apply-counter")
+            if target_faults and "LAVIK_REPLICATION_CANCEL_PEER_FLOW_AFTER_COMMAND_APPLY_ONCE" in target_faults:
+                H.wait_until("cancel after committed apply", 30, lambda:
+                             "injected peer-flow session cancellation after command apply" in Path(target.log_path).read_text())
+            H.wait_until("committed cursor reconnect", 30, lambda:
+                         "selected=CONTINUE" in Path(source.log_path).read_text())
+            H.wait_until("committed increment applied once", 30, lambda:
+                         reader.call("GET", "cancelled-apply-counter") == "1")
+            assert reader.call("GET", "{native}seed") == "baseline"
+            assert Path(source.log_path).read_text().count("selected=FULL") == old_full
+        finally:
+            reader.close()
+
+
+def divergent_tail(root, flow):
+    with pair(root, f"divergent-{flow}", source_faults={
+            "LAVIK_REPLICATION_DIVERGENT_TAIL_ONCE": "1",
+            "LAVIK_REPLICATION_DIVERGENT_TAIL_FLOW": str(flow)},
+            target_workers=2) as (meta, source, target, writer):
+        ready(meta)
+        key = "divergent-counter"
+        while writer.call("CLUSTER", "KEYSLOT", key) % 2 != flow:
+            key += "x"
+        assert writer.call("INCR", key) == 1
+        H.wait_until("divergent tail reaches flow", 30, lambda:
+                     "injected divergent replication tail" in Path(source.log_path).read_text())
+        H.wait_until("all continuation cursors invalidated", 30, lambda:
+                     "invalidated native replication continuation" in Path(target.log_path).read_text())
+        # A gap invalidates the entire population. The follower may not use
+        # the other flow's cursor to become readable without fresh authority.
+        reader = Client(target, readonly=True)
+        try:
+            rejects(reader, ("GET", "{native}seed"), "LOADING")
+        finally:
+            reader.close()
+
+
 def backpressured_shutdown(root):
     with pair(root, "backpressure", source_workers=1, target_workers=1) as (meta, source, target, writer):
         ready(meta)
@@ -345,6 +396,17 @@ def main():
         if C.has_fault(C.DATA, b"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK"):
             handoff_order(root)
             cancelled_handoff(root)
+            committed_cursor_reconnect(root, "cancel-apply", target_faults={
+                "LAVIK_REPLICATION_CANCEL_PEER_FLOW_AFTER_COMMAND_APPLY_ONCE": "cancelled-apply-counter"})
+            committed_cursor_reconnect(root, "post-cut-reset", source_faults={
+                "LAVIK_REPLICATION_POST_CUT_RESET_ONCE": "1"})
+            # Two controlled owner changes create a replacement history while
+            # preserving the laggard's old population and per-flow cursors.
+            import gate_failover as F
+            F.run_full_fallback(C.META, C.DATA, C.CTL, C.REDIS_CLI,
+                                str(root), False, cut_disconnect=True)
+            divergent_tail(root, 0)
+            divergent_tail(root, 1)
             rejected_full(root, "checksum", {
                 "LAVIK_REPLICATION_CORRUPT_FULLSYNC_RECORD_FRAME_ONCE": "1"}, {},
                 "replication frame CRC32C mismatch")

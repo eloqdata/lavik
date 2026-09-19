@@ -182,6 +182,9 @@ class RedisPsyncSource {
         const int probe_fd =
             ::accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
         if (probe_fd < 0) _exit(125);
+        const auto identity = ReadRespCommand(probe_fd);
+        if (identity.empty() || identity.front() != "INFO") _exit(125);
+        SendAll(probe_fd, "$0\r\n\r\n");
         const auto probe = ReadRespCommand(probe_fd);
         if (probe.empty() || probe.front() != "LVPSYNC") _exit(125);
         SendAll(probe_fd, "-ERR unknown command 'LVPSYNC'\r\n");
@@ -204,6 +207,8 @@ class RedisPsyncSource {
             throw std::runtime_error("unexpected Redis replication handshake");
           }
         };
+        expect("INFO");
+        SendAll(client_fd, "$0\r\n\r\n");
         expect("LVPSYNC");
         SendAll(client_fd, "-ERR unknown command 'LVPSYNC'\r\n");
         expect("CLUSTER");
