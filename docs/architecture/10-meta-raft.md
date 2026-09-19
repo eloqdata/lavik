@@ -185,12 +185,9 @@ callbacks, then closes WAL. An uninterruptible filesystem call can delay joining
 but cannot preserve authority. C++ drains its foreign-executor producers before
 stopping Bycorf; callback owners remain alive throughout that drain.
 
-The peer protocol and storage have one current implementation. Incompatible
-development layouts are replaced in place for fresh clusters without a legacy
-decoder, migration, or mixed-layout negotiation. Meta commands and
-business-store encodings retain their current semantics. The Go toolchain and
-module checksums are pinned; etcd is a Go Module dependency, not a submodule or
-an external service.
+Meta commands and business-store encodings retain their current semantics.
+The Go toolchain and module checksums are pinned; etcd is a Go Module dependency,
+not a submodule or an external service.
 
 ## Source map
 

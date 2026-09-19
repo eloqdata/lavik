@@ -1079,18 +1079,11 @@ Before the first stable release, all Lavik-owned durable and control formats
 retain their current development versions, including the Raft command envelope, topology store,
 membership descriptors and intents, cluster-create
 intents, and cluster-status binary/JSON payloads. There is no decoder for
-superseded pre-release layouts. The current Meta implementation uses etcd's
-WAL and snapshot encodings directly, with no backend-specific format selector
-or versioned directory. Development directories from an incompatible
+superseded pre-release layouts. Development directories from an incompatible
 layout must be rebuilt even when their markers are also v1; marker checks
 cannot detect every same-marker schema change. Equal version numbers do not
 make incompatible builds safe to mix.
-
-This development exception includes beta releases and ends at the first stable
-release. Subsequent storage-format changes must state which released data
-formats remain readable and provide a supported upgrade or migration path.
-
-Current builds provide no mixed-format window or in-band format switch. For a binary-only
+There is no mixed-format window or in-band format switch. For a binary-only
 change that preserves every durable format, replace one follower at a time,
 wait for catch-up, and replace the leader last. Before any replacement, back
 up every member and record the membership, term, commit index, and snapshot
