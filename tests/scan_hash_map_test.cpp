@@ -44,6 +44,7 @@ TEST(ScanHashMapTest, LookupCoversEveryFingerprintWithHolesAndCollisions) {
   for (std::uint64_t tag = 0; tag < 256; ++tag) {
     Map map;
     std::vector<Map::Entry*> entries;
+    std::vector<std::uintptr_t> addresses;
     std::vector<Digest> digests;
     for (std::uint64_t slot = 0; slot < 12; ++slot) {
       const std::uint64_t actual = slot % 3 == 0 ? tag ^ 1 : tag;
@@ -51,12 +52,17 @@ TEST(ScanHashMapTest, LookupCoversEveryFingerprintWithHolesAndCollisions) {
       auto* entry = map.InsertNew(digest, "external", slot, false);
       ASSERT_NE(entry, nullptr);
       entries.push_back(entry);
+      addresses.push_back(reinterpret_cast<std::uintptr_t>(entry));
       digests.push_back(digest);
     }
     for (std::size_t slot = 0; slot < 12; ++slot) {
       EXPECT_EQ(map.Find(digests[slot], "external"), entries[slot]);
       EXPECT_EQ(std::as_const(map).Find(digests[slot], "external"),
                 entries[slot]);
+      EXPECT_EQ(
+          map.FindAddress(addresses[slot], Map::AddressHash(digests[slot]),
+                          Map::AddressTag(digests[slot])),
+          entries[slot]);
       EXPECT_EQ(map.FindCandidates(digests[slot], "external"),
                 (std::vector<Map::Entry*>{entries[slot]}));
       EXPECT_EQ(map.FindCandidateIf(digests[slot], "external",
@@ -71,6 +77,10 @@ TEST(ScanHashMapTest, LookupCoversEveryFingerprintWithHolesAndCollisions) {
     for (std::size_t slot = 0; slot < 12; ++slot) {
       EXPECT_EQ(map.Find(digests[slot], "external"),
                 slot % 2 == 0 ? nullptr : entries[slot]);
+      EXPECT_EQ(
+          map.FindAddress(addresses[slot], Map::AddressHash(digests[slot]),
+                          Map::AddressTag(digests[slot])),
+          slot % 2 == 0 ? nullptr : entries[slot]);
     }
     EXPECT_EQ(map.Find(Digest{(tag << 56) | 255}, "external"), nullptr);
   }
