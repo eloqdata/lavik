@@ -350,6 +350,35 @@ std::string ConfigPair(std::string_view name, std::string_view value,
          std::to_string(value.size()) + "\r\n" + std::string(value);
 }
 
+void VerifySetPayloads(RespClient& client, bool write) {
+  // Exercise empty payloads, copy/CRC tails, and external-key prefixes. Read
+  // again after restart so the decoder checks the persisted CRC independently
+  // of the in-memory value and the encoder's copy implementation.
+  for (std::size_t key_bytes : {16, 5001}) {
+    for (std::size_t value_bytes : {0, 1, 15, 16, 17, 255, 256, 257, 1023,
+                                    1024, 4095, 4096, 8191, 8192, 8193}) {
+      const std::string key = "copy-crc-" + std::to_string(value_bytes) +
+                              std::string(key_bytes, 'k');
+      std::string value(value_bytes, '\0');
+      for (std::size_t i = 0; i < value.size(); ++i) {
+        value[i] = static_cast<char>((i * 37) % 256);
+      }
+      if (write) {
+        // Unconditional SET must replace another type and clear its TTL even
+        // though it no longer inspects that old value before append.
+        Expect(client.Command({"RPUSH", key, "old"}), ":1", "payload seed");
+        Expect(client.Command({"PEXPIRE", key, "60000"}), ":1",
+               "payload seed TTL");
+        Expect(client.Command({"SET", key, value}), "+OK", "payload SET");
+      }
+      Expect(client.Command({"GET", key}),
+             "$" + std::to_string(value_bytes) + "\r\n" + value,
+             "payload GET");
+      Expect(client.Command({"PTTL", key}), ":-1", "payload TTL cleared");
+    }
+  }
+}
+
 void VerifyExpirationConfig(RespClient& client, std::uint16_t port) {
   struct Setting {
     std::string_view name;
@@ -586,6 +615,14 @@ int main(int argc, char** argv) {
              "SET NX GET create");
       Expect(client.Command({"GET", "missing"}), "$3\r\nnew",
              "GET created value");
+
+      Expect(client.Command({"RPUSH", "set-get-type", "old"}), ":1",
+             "SET GET wrong-type seed");
+      Expect(client.Command({"SET", "set-get-type", "new", "GET"}),
+             "-WRONGTYPE Operation against a key holding the wrong kind of value",
+             "SET GET preserves type check");
+      Expect(client.Command({"LINDEX", "set-get-type", "0"}), "$3\r\nold",
+             "SET GET wrong-type preserves value");
 
       Expect(client.Command({"SET", "ttl", "one", "PX", "2000"}), "+OK",
              "SET PX");
@@ -825,6 +862,7 @@ int main(int argc, char** argv) {
       Expect(client.Command(
                  {"CONFIG", "SET", "active-expiration-interval-ms", "37"}),
              "+OK", "change expiration config before restart");
+      VerifySetPayloads(client, true);
       server.Stop();
     }
 
@@ -841,6 +879,7 @@ int main(int argc, char** argv) {
              "restart expired TTL");
       Expect(client.Command({"GET", "restart-live"}), "$1\r\nv",
              "restart live value");
+      VerifySetPayloads(client, false);
       ExpectRange(IntegerReply(client.Command({"PTTL", "restart-live"}),
                                "restart-live PTTL"),
                   1, 60000, "restart live TTL");

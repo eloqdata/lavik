@@ -17,6 +17,7 @@
 #include <exception>
 #include <new>
 
+#include "absl/crc/crc32c.h"
 #include "absl/strings/str_cat.h"
 #include "impl.h"
 #include "lavik/memory.h"
@@ -150,14 +151,22 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
   if (trace != nullptr) trace->store_lock_acquired_ns_ = SetTraceNowNanos();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
 
-  auto& index = partition.indexes_[db_id];
-  auto* found = index.Find(digest, key);
-  if (found != nullptr && !found->key_complete()) [[unlikely]] {
-    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
-    if (!resolved.ok()) {
-      co_return resolved.status();
+  RecordIndex::Entry* found = nullptr;
+  // Only options that observe the old value need a pre-append lookup. The
+  // writer resolves the current entry after preparing its append block anyway
+  // (preparation may release store state), and owns replacement accounting,
+  // WATCH invalidation, and retirement for unconditional writes of any type.
+  if (options.condition_ != SetCondition::kNone || options.keep_ttl_ ||
+      options.return_old_value_) {
+    auto& index = partition.indexes_[db_id];
+    found = index.Find(digest, key);
+    if (found != nullptr && !found->key_complete()) [[unlikely]] {
+      auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+      if (!resolved.ok()) {
+        co_return resolved.status();
+      }
+      found = *resolved;
     }
-    found = *resolved;
   }
   bool exists = found != nullptr && found->value_.kind() == RecordKind::kValue;
   // Expiry metadata is out-of-line and uncommon in the no-TTL workload. Do
@@ -2992,15 +3001,20 @@ acquire_active_stream:
                                      record_header_bytes);
   std::byte* payload_output =
       staging.data_ + record_offset + record_header_bytes;
+  // Fuse copying with CRC calculation so inline SET values do not require a
+  // second pass over the staging payload. Continue the CRC across an external
+  // key prefix; an extent manifest, in contrast, is the entire root payload.
+  absl::crc32c_t payload_checksum{0};
   if (key_external && !external) [[unlikely]] {
-    std::memcpy(payload_output, key.data(), key.size());
+    payload_checksum =
+        absl::MemcpyCrc32c(payload_output, key.data(), key.size());
     payload_output += key.size();
   }
   if (!value.empty()) {
-    std::memcpy(payload_output, value.data(), value.size());
+    payload_checksum = absl::MemcpyCrc32c(
+        payload_output, value.data(), value.size(), payload_checksum);
   }
-  record.payload_checksum_ = Crc32c(std::span<const std::byte>(
-      staging.data_ + record_offset + record_header_bytes, payload_bytes));
+  record.payload_checksum_ = static_cast<std::uint32_t>(payload_checksum);
   if (!EncodeRecordHeader(record, key, record_output)) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "record checksum encoding failed");
