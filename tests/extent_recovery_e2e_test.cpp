@@ -19,6 +19,8 @@
 // blocks it points at, and the owner of an extent block after a worker-count
 // change is unrelated to the owner of the block holding the manifest. This
 // test restarts with a different worker count and expects the data back.
+// Inline records also exercise a recycled staging buffer across full and
+// partial flushes, followed by cold recovery without an index checkpoint.
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -42,6 +44,7 @@
 #include <utility>
 #include <vector>
 
+#include "../include/lavik/storage/format.h"
 #include "support/test_data_path.h"
 
 namespace {
@@ -244,7 +247,8 @@ class ServerProcess {
  public:
   ServerProcess(std::string binary, std::uint16_t port,
                 const std::string& data_path, const std::string& log_path,
-                unsigned threads) {
+                unsigned threads,
+                const std::vector<std::string>& extra_arguments = {}) {
     pid_ = ::fork();
     if (pid_ < 0) {
       Fail("fork failed");
@@ -270,6 +274,8 @@ class ServerProcess {
           "--data-file",
           data_path,
       };
+      arguments.insert(arguments.end(), extra_arguments.begin(),
+                       extra_arguments.end());
       std::vector<char*> child_argv;
       child_argv.reserve(arguments.size() + 1);
       for (std::string& argument : arguments) {
@@ -366,6 +372,57 @@ int main(int argc, char** argv) {
         "lavik-extent-recovery-" + std::to_string(::getpid()));
     const std::string data_path = prefix + ".data";
     const std::string log_path = prefix + ".log";
+    const std::uint16_t port = FindFreePort();
+    (void)::unlink(data_path.c_str());
+    (void)::unlink(log_path.c_str());
+
+    // A single staging buffer must be recycled between these full blocks.
+    // Nonzero prior contents must not escape into the next block's headers,
+    // record alignment bytes, or the page tails of periodic partial flushes.
+    // Disable checkpoints so the restart validates the actual record stream.
+    CreateDataFile(data_path, 256ULL * 1024 * 1024);
+    std::vector<std::pair<std::string, std::string>> reused_records;
+    for (int i = 0; i < 4; ++i) {
+      const std::string key = "reuse-full-" + std::to_string(i);
+      const std::size_t bytes = lavik::storage::kStorageBlockBytes -
+                                lavik::storage::kBlockHeaderBytes -
+                                lavik::storage::RecordHeaderBytes(key.size());
+      reused_records.emplace_back(key, std::string(bytes, 'F'));
+    }
+    for (int i = 0; i < 32; ++i) {
+      const std::size_t bytes = i < 8 ? i : 4093 + i;
+      reused_records.emplace_back("reuse-tail-" + std::to_string(i),
+                                  std::string(bytes, 'T'));
+    }
+    reused_records.emplace_back(std::string(5001, 'K'), std::string(12, 'E'));
+    {
+      ServerProcess server(
+          argv[1], port, data_path, log_path, 1,
+          {"--storage-write-buffers-per-worker=1", "--flush-max-ms=10",
+           "--defrag-paused", "--no-shutdown-checkpoint"});
+      RespClient client = ConnectReady(port);
+      for (std::size_t i = 0; i < reused_records.size(); ++i) {
+        const auto& [key, payload] = reused_records[i];
+        Expect(client.Command({"SET", key, payload}), "+OK", "recycled SET");
+        if (i >= 4 && i % 4 == 0) {
+          std::this_thread::sleep_for(25ms);
+        }
+      }
+      server.Stop();
+    }
+    {
+      ServerProcess server(argv[1], port, data_path, log_path, 2,
+                           {"--no-shutdown-checkpoint"});
+      RespClient client = ConnectReady(port);
+      for (const auto& [key, payload] : reused_records) {
+        const char fill = payload.empty() ? '\0' : payload.front();
+        if (client.CommandBulkLength({"GET", key}, fill) !=
+            static_cast<std::int64_t>(payload.size())) {
+          Fail("recycled staging record changed after cold recovery");
+        }
+      }
+      server.Stop();
+    }
     (void)::unlink(data_path.c_str());
     (void)::unlink(log_path.c_str());
     CreateDataFile(data_path, 768ULL * 1024 * 1024);
@@ -375,7 +432,6 @@ int main(int argc, char** argv) {
     const std::string inline_combined_value(1ULL * 1024 * 1024, 'I');
     const std::string shared_extent_key(6ULL * 1024 * 1024, 's');
     const std::string shared_extent_value(6ULL * 1024 * 1024, 'S');
-    const std::uint16_t port = FindFreePort();
 
     // Written under four workers.
     {

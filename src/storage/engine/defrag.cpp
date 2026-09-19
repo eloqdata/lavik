@@ -19,6 +19,20 @@
 
 namespace lavik::storage {
 
+namespace {
+
+bool CheckPayloadOnKeyOwner(const RecordHeader& record) noexcept {
+  // These keys are contained in the checksummed header; routing and deciding
+  // whether the record is still current need no payload bytes. Extent/key
+  // manifests and transaction/group records retain the eager validation path.
+  return record.kind_ == RecordKind::kValue &&
+         record.value_type_ == ValueType::kString && !record.key_external_ &&
+         !record.external_ && !record.grouped_ && !record.auxiliary_group_ &&
+         record.txid_ == 0;
+}
+
+}  // namespace
+
 void StorageEngine::Impl::SpawnExtentReclaim(
     WorkerStore& store, std::shared_ptr<const std::vector<ExtentRef>> extents) {
   active_extent_reclaims_.fetch_add(1, std::memory_order_acq_rel);
@@ -129,28 +143,21 @@ Task<absl::Status> StorageEngine::Impl::ReclaimExtents(
   co_return absl::OkStatus();
 }
 
-bool StorageEngine::Impl::IsDefragCandidate(
-    const WorkerStore& store, std::uint64_t block_id) const noexcept {
-  const BlockState* state = FindBlockState(store, block_id);
+void StorageEngine::Impl::MaybeQueueDefrag(WorkerStore& store,
+                                           std::uint64_t block_id) {
+  BlockState* state = FindBlockState(store, block_id);
   if (state == nullptr || !state->allocated_ || state->defrag_queued_ ||
       state->defragging_ || state->pins_ != 0 || state->in_memory_ ||
       state->kind_ != BlockKind::kRecords || state->flush_queued_ ||
       state->flush_in_progress_ || IsActiveBlock(store, block_id) ||
       state->committed_bytes_ <= kBlockHeaderBytes) {
-    return false;
+    return;
   }
   const std::uint64_t used = state->committed_bytes_ - kBlockHeaderBytes;
-  const std::uint64_t live_ratio =
-      used == 0
-          ? 0
-          : (static_cast<std::uint64_t>(state->live_bytes_) * 1000) / used;
-  return live_ratio <= 500;
-}
-
-void StorageEngine::Impl::MaybeQueueDefrag(WorkerStore& store,
-                                           std::uint64_t block_id) {
-  BlockState* state = FindBlockState(store, block_id);
-  if (state == nullptr || !IsDefragCandidate(store, block_id)) {
+  // Preserve the integer-rounded threshold: floor(1000 * live / used) <= 500
+  // is exactly 1000 * live < 501 * used for positive used. Both products fit
+  // in uint64_t, so candidate checks need no division or rounding change.
+  if (static_cast<std::uint64_t>(state->live_bytes_) * 1000 >= used * 501) {
     return;
   }
   state->defrag_queued_ = true;
@@ -520,8 +527,15 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   // first matching record instead of allocating/materializing all candidates.
   RecordIndex::Entry* current = index.FindCandidateIf(
       digest, key, [&](const RecordIndex::Entry& candidate) {
-        return MaterializeIndexLocation(candidate).SamePhysicalRecord(
-            source_location);
+        // Most scanned versions have already been replaced. Reject a changed
+        // block/offset from the compact entry before following its BlockState
+        // pointer to recover the allocation epoch. Matching prefixes still
+        // require the full physical identity check, including that epoch.
+        return candidate.value_.block_id() == source_location.block_id() &&
+               candidate.value_.record_offset() ==
+                   source_location.record_offset() &&
+               MaterializeIndexLocation(candidate).SamePhysicalRecord(
+                   source_location);
       });
   if (current == nullptr) {
     co_return std::optional<RelocationDurabilityFence>{};
@@ -533,6 +547,11 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   if (EffectiveRecordDbEpoch(partition, record.db_id_) != record.db_epoch_) {
     co_return std::optional<RelocationDurabilityFence>{};
   }
+  const bool verify_payload = CheckPayloadOnKeyOwner(record);
+  if (verify_payload &&
+      Crc32c(std::as_bytes(std::span(value))) != record.payload_checksum_) {
+    co_return absl::InternalError("payload checksum mismatch during defrag");
+  }
   const RelocationSource source{
       .db_epoch_ = record.db_epoch_,
       .replication_epoch_ = partition.replication_epoch_,
@@ -540,6 +559,9 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       .block_id_ = source_location.block_id(),
       .allocation_epoch_ = source_location.allocation_epoch(),
       .record_offset_ = source_location.record_offset(),
+      .verified_payload_checksum_ =
+          verify_payload ? std::optional(record.payload_checksum_)
+                         : std::nullopt,
   };
   GroupedHashObject::PreparedHandle grouped_builder;
   std::optional<GroupedObjectIndex::Publication> grouped_publication;
@@ -865,10 +887,15 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
         record.kind_ != RecordKind::kTxCommit &&
         DbEpoch(record.db_id_) != record.db_epoch_) {
       record_offset += record.total_disk_bytes_;
-      absl::Status paced = co_await DefragRecordCheckpoint(store);
-      if (!paced.ok()) {
-        source.defragging_ = false;
-        co_return paced;
+      if (defrag_config_.record_sleep_us_.load(std::memory_order_acquire) ==
+          0) {
+        co_await bycorf::Yield(*store.worker_);
+      } else {
+        absl::Status paced = co_await DefragRecordCheckpoint(store);
+        if (!paced.ok()) {
+          source.defragging_ = false;
+          co_return paced;
+        }
       }
       continue;
     }
@@ -876,7 +903,12 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
         block_data.buffer_.data_ + record_offset + record.header_bytes_;
     const auto payload =
         std::span<const std::byte>(payload_data, record.payload_bytes_);
-    if (Crc32c(payload) != record.payload_checksum_) {
+    // An obsolete inline string cannot become a recovery winner through this
+    // pass. Let its key owner prove that it is still current before spending
+    // CPU on the payload; the immutable scan buffer stays alive across that
+    // await. Every payload that is actually copied is checked before writing.
+    if (!CheckPayloadOnKeyOwner(record) &&
+        Crc32c(payload) != record.payload_checksum_) {
       source.defragging_ = false;
       co_return absl::Status(absl::StatusCode::kInternal,
                              "payload checksum mismatch during defrag");
@@ -958,10 +990,14 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       continue;
     }
     const unsigned key_owner = OwnerForKey(disk_key);
-    const std::string key(disk_key);
+    // Relocation is awaited before advancing this scan. Both the immutable
+    // block buffer and loaded_key remain owned by this frame until the local
+    // or remote writer finishes, so borrowing avoids allocating/copying every
+    // payload, including records the index will reject as already obsolete.
+    const std::string_view key = disk_key;
     const std::size_t key_prefix =
         record.key_external_ && !record.external_ ? record.key_bytes_ : 0;
-    const std::string value(
+    const std::string_view value(
         reinterpret_cast<const char*>(payload_data + key_prefix),
         record.payload_bytes_ - key_prefix);
     absl::StatusOr<std::optional<RelocationDurabilityFence>> relocated(
@@ -1005,10 +1041,16 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     // With record_sleep_us=0 this is the cooperative background-budget
     // checkpoint. A positive value forces an asynchronous pause after every
     // record, smoothing one block's CPU, cross-core, and device-I/O burst.
-    absl::Status paced = co_await DefragRecordCheckpoint(store);
-    if (!paced.ok()) {
-      source.defragging_ = false;
-      co_return paced;
+    // The ordinary budget checkpoint is an awaiter and needs no nested task
+    // frame. Allocate the sleep coroutine only for explicitly paced defrag.
+    if (defrag_config_.record_sleep_us_.load(std::memory_order_acquire) == 0) {
+      co_await bycorf::Yield(*store.worker_);
+    } else {
+      absl::Status paced = co_await DefragRecordCheckpoint(store);
+      if (!paced.ok()) {
+        source.defragging_ = false;
+        co_return paced;
+      }
     }
   }
   co_return absl::OkStatus();
