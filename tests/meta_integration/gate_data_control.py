@@ -89,7 +89,9 @@ def allocate_data_file(path, size=DATA_FILE_BYTES):
 
 class DataProcess:
     def __init__(self, binary, workdir, node_id, seed, tls=None, workers=1,
-                 tls_only=False):
+                 tls_only=False, environment=None, extra_args=()):
+        self.environment = environment
+        self.extra_args = extra_args
         self.binary = binary
         self.node_id = node_id
         self.workdir = workdir
@@ -149,7 +151,8 @@ class DataProcess:
             ])
         self.log_file = open(self.log_path, "ab")
         self.proc = subprocess.Popen(
-            args, stdout=self.log_file, stderr=subprocess.STDOUT)
+            args + list(self.extra_args), stdout=self.log_file,
+            stderr=subprocess.STDOUT, env=self.environment)
         H.log(f"Data node {self.node_id[:8]} started "
               f"(pid {self.proc.pid}, seed {self.seed})")
         if wait_ready:
