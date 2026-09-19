@@ -520,8 +520,8 @@ TEST(GroupedHashTest, LogicalEncodingSizeCanExceedStringAndRecordLimits) {
   EXPECT_EQ(*AppendHashEntrySize(limit - 8, 0, 0, limit), limit);
 }
 
-TEST(GroupedHashTest, DISABLED_LargeLogicalValueRoundTripsBeyondRecordLimit) {
-  // This opt-in regression exercises the actual codec above both historical
+TEST(GroupedHashTest, LargeLogicalValueRoundTripsBeyondRecordLimit) {
+  // This regression exercises the actual codec above both historical
   // caps. Release the source strings before decoding to bound peak payload
   // memory to roughly 2 GiB instead of retaining three complete copies.
   constexpr std::size_t kValueBytes = kMaxRecordPayloadBytes / 3 + 1;

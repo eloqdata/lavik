@@ -107,6 +107,21 @@ jobs:
         run: |
           # Registered io_uring buffers must not depend on the runner's memlock limit.
           sudo prlimit --pid "$$" --memlock=unlimited
+          # Exercise the hardware safety gate with an unmounted private loop
+          # device. Actual NVMe/SPDK scenarios still require a hardware host.
+          scratch_image=$(mktemp "$RUNNER_TEMP/lavik-ci-gate.XXXXXX")
+          scratch_device=
+          cleanup() {
+            if [[ -n "$scratch_device" ]]; then
+              sudo losetup --detach "$scratch_device"
+            fi
+            rm -f -- "$scratch_image"
+          }
+          trap cleanup EXIT
+          truncate -s 16M "$scratch_image"
+          scratch_device=$(sudo losetup --find --show "$scratch_image")
+          export LAVIK_CLUSTER_HARDWARE_OPT_IN=1
+          export LAVIK_CLUSTER_SCRATCH_DEVICE="$scratch_device"
           ./scripts/run_ci_tests.sh build_ci
       - name: Upload test results
         if: ${{ !cancelled() }}

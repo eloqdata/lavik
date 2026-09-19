@@ -1348,6 +1348,21 @@ if (BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/replication
   )
   gtest_discover_tests(lavik_unit_tests)
+  # Each large codec regression retains roughly 2 GiB of payload. Apply these
+  # properties after discovery, so parallel CTest runs keep other tests parallel
+  # but never overlap a large codec case with another test.
+  file(GENERATE
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/lavik_large_codec_properties.cmake"
+    CONTENT [[
+foreach(test_name IN LISTS lavik_unit_tests_TESTS)
+  if(test_name MATCHES "[.]Large.*RoundTripsBeyondRecordLimit$")
+    set_tests_properties("${test_name}" PROPERTIES
+      LABELS large-codec RUN_SERIAL TRUE TIMEOUT 300)
+  endif()
+endforeach()
+]])
+  set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/lavik_large_codec_properties.cmake")
 
   add_test(
     NAME lavik_cli.cluster_control_surface

@@ -446,15 +446,22 @@ After building all targets, run the same suite locally with:
 ./scripts/run_ci_tests.sh build_ci
 ```
 
-The runner executes all registered CTest cases serially, the three opt-in large
-codec regressions, native large-List and large-Hash tests, the >1 GiB RDB
-import/export test, and every vendored Valkey TCL suite under its compatibility
-harness policy. It continues with the remaining suites after a failure and
+The runner executes all registered CTest cases serially, including the three
+large codec regressions, followed by native large-List and large-Hash tests,
+the >1 GiB RDB import/export test, and every vendored Valkey TCL suite under its
+compatibility harness policy. The large codec cases are enabled by default and
+carry the `large-codec` label; each runs without concurrent CTest cases even
+when invoked with `ctest --parallel`, since each retains roughly 2 GiB of
+payload. The runner continues with the remaining suites after a failure and
 returns nonzero if any suite fails. The ordinary CTest report still marks the
-large codec cases disabled and the large RDB case skipped; their explicit runs
-have separate logs. The hardware safety gate skips because hosted runners have
-no allowlisted scratch block device. Raw-device/SPDK verification requires a
-separate hardware host.
+large RDB case skipped; its explicit run has a separate log.
+
+CI enables the hardware safety gate using a private temporary file-backed loop
+device, which is detached when the suite exits. This exercises the scratch
+device eligibility checks; raw-device/SPDK verification still requires a
+separate hardware host. Local runs skip this gate unless
+`LAVIK_CLUSTER_HARDWARE_OPT_IN=1`; once enabled, a valid, unmounted
+`LAVIK_CLUSTER_SCRATCH_DEVICE` block device is required.
 
 Allow several GiB of free space for private test files under `/mnt/dev` and
 `/tmp`, and enable io_uring with a sufficient memlock limit. CI prepares these
