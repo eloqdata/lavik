@@ -165,10 +165,14 @@ class Forwarder:
             peer.join(timeout=3)
 
 
-def changing_endpoint(lavik, redis, root):
-    with process(lavik, root / "changed-native", "native") as (native, native_port, _), \
+def changing_endpoint(lavik, redis, root, managed=False):
+    native_args = (("--client-mode", "cluster", "--meta-managed", "yes",
+                    "--node-id", "1" * 40, "--meta-seed", "127.0.0.1:1")
+                   if managed else ())
+    with process(lavik, root / "changed-native", "native", extra=native_args) as (native, native_port, _), \
          process(redis, root / "changed-redis", "redis", redis=True) as (source, source_port, _):
-        native.call("SET", "must-not-import", "native")
+        if not managed:
+            native.call("SET", "must-not-import", "native")
         source.call("SET", "redis-value", "redis")
         # Discovery uses one connection. Every consumer attempt sees Lavik,
         # including an explicit Redis alias supplied at startup.
@@ -308,6 +312,27 @@ def exercise(lavik, redis, root):
             assert target.call("GET", "baseline") == "db15"
 
 
+def managed_native_rejection(lavik, redis, root):
+    args = ("--client-mode", "cluster", "--meta-managed", "yes",
+            "--node-id", "1" * 40, "--meta-seed", "127.0.0.1:1")
+    with process(lavik, root / "managed-native", "source", extra=args) as (_, port, _):
+        with process(lavik, root / "managed-reject", "runtime") as (target, _, _):
+            target.call("SET", "preserved", "local")
+            reject(target, ("REPLICAOF", "127.0.0.1", port), "Redis")
+            assert target.call("GET", "preserved") == "local"
+        with process(lavik, root / "managed-reject", "startup", extra=(
+                "--redis-replicaof", "127.0.0.1", str(port))) as (target, _, log):
+            H.wait_until("managed native classified", 15,
+                         lambda: "requires a Redis" in log.read_text())
+            attempts = log.read_text().count("requires a Redis")
+            time.sleep(1.2)
+            assert log.read_text().count("requires a Redis") == attempts
+            reject(target, ("GET", "preserved"), "LOADING")
+    directory = root / "managed-endpoint"
+    directory.mkdir()
+    changing_endpoint(lavik, redis, directory, managed=True)
+
+
 def mode_contract(lavik, root):
     for args, expected in [
             (("--client-mode", "cluster"), "requires meta-managed yes"),
@@ -354,6 +379,8 @@ def authenticated_startup(lavik, redis, root):
     with process(redis, root / "auth-source", "source", redis=True,
                  extra=("--requirepass", "source-secret"), password="source-secret") as (source, port, _):
         source.call("SET", "authenticated", "baseline")
+        # Identity reporting is optional: replication users need not gain INFO.
+        source.call("ACL", "SETUSER", "default", "-info")
         for index, spelling in enumerate(("replicaof", "redis-replicaof", "cli")):
             directory = root / f"auth-target-{index}"
             directory.mkdir()
@@ -382,6 +409,7 @@ if __name__ == "__main__":
         exercise(sys.argv[1], sys.argv[2], Path(directory))
         authenticated_startup(sys.argv[1], sys.argv[2], Path(directory))
         changing_endpoint(sys.argv[1], sys.argv[2], Path(directory))
+        managed_native_rejection(sys.argv[1], sys.argv[2], Path(directory))
         interrupted_transaction(sys.argv[1], sys.argv[2], Path(directory))
         unavailable_startup(sys.argv[1], sys.argv[2], Path(directory))
     print("Redis follower checks passed")

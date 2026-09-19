@@ -398,7 +398,7 @@ def run_plaintext(meta_binary, data_binary, workdir):
                         ["FUNCTION", "FLUSH"],
                         ["FUNCTION", "RESTORE", "invalid"]):
             expected = (f"-ERR {' '.join(command[:2])} is not allowed "
-                        "in cluster mode")
+                        "in Meta-managed mode")
             actual = data.command_head(command)
             if actual != expected:
                 raise H.Failure(

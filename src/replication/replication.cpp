@@ -895,8 +895,8 @@ std::vector<std::uint16_t> RedisSlotsVector(const RedisSlotSet& slots) {
   return result;
 }
 
-bool SameRedisSlotLayout(const RedisClusterTopology& left,
-                         const RedisClusterTopology& right) {
+bool SameRedisClusterTopology(const RedisClusterTopology& left,
+                              const RedisClusterTopology& right) {
   // Slot ranges alone identify neither a cluster nor its members: two fresh
   // clusters normally have identical layouts. Keep membership as well so a
   // master/replica role swap is allowed only within the same known cluster.
@@ -8799,8 +8799,8 @@ class ReplicationManager::ReplicationGroup {
         co_return absl::FailedPreconditionError(
             "Redis Cluster replication changed while adding the source");
       }
-      if (!SameRedisSlotLayout(*expected_redis_topology_,
-                               *discovery->topology_)) {
+      if (!SameRedisClusterTopology(*expected_redis_topology_,
+                                    *discovery->topology_)) {
         co_return absl::FailedPreconditionError(
             "Redis Cluster slot topology changed; reconfigure with "
             "REPLICAOF");
@@ -10091,10 +10091,37 @@ class ReplicationManager::ReplicationGroup {
   // Only Redis's explicit unknown-command response identifies this protocol;
   // never downgrade authentication failures or native rejection into PSYNC.
   Task<absl::Status> RequireRedisUpstream(TcpStream& stream) {
+    // Managed Lavik refuses anonymous native sessions before returning a native
+    // handshake. Its public identity still lets us reject the endpoint without
+    // creating a session or retrying an authorization failure indefinitely.
+    const std::string identity_command =
+        EncodeRespCommand(std::vector<std::string>{"INFO", "server"});
+    auto status = co_await WriteText(stream, identity_command);
+    if (!status.ok()) co_return status;
+    auto identity = co_await ReadRedisBulkReply(stream);
+    if (!identity.ok()) {
+      // INFO is optional identity evidence, not a new replication ACL
+      // requirement. Permission/renamed-command errors still require the
+      // positive Redis protocol check below; AUTH and transport failures do
+      // not.
+      const auto message = identity.status().message();
+      if (!absl::IsFailedPrecondition(identity.status()) ||
+          (!message.starts_with("-NOPERM") &&
+           !message.starts_with("-ERR unknown command"))) {
+        co_return identity.status();
+      }
+    }
+    if (identity.ok() &&
+        (identity->starts_with("lavik_version:") ||
+         identity->find("\r\nlavik_version:") != std::string::npos)) {
+      co_return absl::UnimplementedError(
+          "external replication requires a Redis or Redis Cluster upstream; "
+          "Lavik native replication requires Meta Follow Owner");
+    }
     const std::vector<std::string> args{
         "LVPSYNC", std::string(kProtocolVersion), "?", "?", "?", "?", "?", "?"};
     const std::string encoded = EncodeRespCommand(args);
-    auto status = co_await WriteText(stream, encoded);
+    status = co_await WriteText(stream, encoded);
     if (!status.ok()) co_return status;
     auto response = co_await ReadLine(stream);
     if (!response.ok()) co_return response.status();
@@ -10458,8 +10485,9 @@ class ReplicationManager::ReplicationGroup {
       bool compatible = false;
       if (observed.ok() && observed->has_value()) {
         AssertStateOwner();
-        compatible = expected_redis_topology_.has_value() &&
-                     SameRedisSlotLayout(*expected_redis_topology_, **observed);
+        compatible =
+            expected_redis_topology_.has_value() &&
+            SameRedisClusterTopology(*expected_redis_topology_, **observed);
       }
       if (compatible) {
         incompatible_observations = 0;
@@ -11154,7 +11182,7 @@ class ReplicationManager::ReplicationGroup {
     if (!topology.ok()) co_return topology.status();
     if (redis_cluster_) {
       if (!topology->has_value() || !expected_redis_topology_.has_value() ||
-          !SameRedisSlotLayout(*expected_redis_topology_, **topology) ||
+          !SameRedisClusterTopology(*expected_redis_topology_, **topology) ||
           (*topology)->self_id_ != source->node_id_) {
         co_return absl::FailedPreconditionError(
             "Redis consumer endpoint no longer belongs to its source topology");
