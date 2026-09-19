@@ -86,7 +86,7 @@ func appliedProposal(t *testing.T, r *Runtime, data string) Result {
 }
 
 func TestEveryStorageExecutorStageLeavesStableTermLive(t *testing.T) {
-	for _, stage := range []string{"wal-write", "wal-sync", "snapshot-file", "snapshot-rename", "snapshot-directory", "snapshot-publication", "wal-gc", "snapshot-gc"} {
+	for _, stage := range []string{"wal-write", "wal-sync", "snapshot-file", "snapshot-rename", "snapshot-directory", "snapshot-publication", "snapshot-release", "wal-gc", "snapshot-gc"} {
 		t.Run(stage, func(t *testing.T) {
 			var target atomic.Uint64
 			entered, release := make(chan struct{}), make(chan struct{})
@@ -149,7 +149,7 @@ func TestEveryStorageExecutorStageLeavesStableTermLive(t *testing.T) {
 					}
 				}
 			}
-			if stage == "wal-write" || stage == "wal-sync" || stage == "snapshot-publication" {
+			if stage == "wal-write" || stage == "wal-sync" || stage == "snapshot-publication" || stage == "snapshot-release" {
 				select {
 				case got := <-result:
 					t.Fatalf("durability response escaped blocked stage: %+v", got)

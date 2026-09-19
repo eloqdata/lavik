@@ -303,14 +303,44 @@ func (s *diskStore) savePrepared(m *pb.Message, prepared bool) error {
 		}
 	}
 	hs := &pb.HardState{Term: m.Term, Vote: m.Vote, Commit: m.Commit}
+	if !raft.IsEmptySnap(m.Snapshot) {
+		index := m.Snapshot.Metadata.GetIndex()
+		if hs.GetCommit() < index {
+			return errors.New("received snapshot has no covering HardState commit")
+		}
+		// Recovery accepts a marker only when the WAL commit covers it. Make
+		// the prepared image and marker durable first, so a crash never leaves
+		// a commit beyond the recoverable log/snapshot. Keep the old GC cut
+		// until the entire append transaction has completed.
+		if err := s.writeSnapshotMarker(m.Snapshot); err != nil {
+			return err
+		}
+		if len(m.Entries) > 0 {
+			// A torn suffix write must not leave entries beyond a log gap while
+			// recovery still ignores the new marker. First anchor the snapshot
+			// itself, then persist the suffix and its final commit normally.
+			base := proto.Clone(hs).(*pb.HardState)
+			base.Commit = new(index)
+			if err := s.saveWAL(base, nil); err != nil {
+				return err
+			}
+		}
+	}
+	if err := s.saveWAL(hs, m.Entries); err != nil {
+		return err
+	}
+	if !raft.IsEmptySnap(m.Snapshot) {
+		return s.releaseSnapshot(m.Snapshot.Metadata.GetIndex())
+	}
+	return nil
+}
+
+func (s *diskStore) saveWAL(hs *pb.HardState, entries []*pb.Entry) error {
 	if err := s.fault("wal-write"); err != nil {
 		return err
 	}
-	if err := s.wal.Save(hs, m.Entries); err != nil {
+	if err := s.wal.Save(hs, entries); err != nil {
 		return err
-	}
-	if !raft.IsEmptyHardState(hs) {
-		s.hard = hs
 	}
 	// WAL.Save may skip fsync for a commit-only update. We promise a durable
 	// prefix for every completion, including the persisted commit watermark.
@@ -320,8 +350,8 @@ func (s *diskStore) savePrepared(m *pb.Message, prepared bool) error {
 	if err := s.wal.Sync(); err != nil {
 		return err
 	}
-	if !raft.IsEmptySnap(m.Snapshot) {
-		return s.publishSnapshotMarker(m.Snapshot)
+	if !raft.IsEmptyHardState(hs) {
+		s.hard = hs
 	}
 	return nil
 }
@@ -333,8 +363,8 @@ func (s *diskStore) publishSnapshot(image *pb.Snapshot) error {
 	return s.publishSnapshotMarker(image)
 }
 
-// prepareSnapshot runs on the bulk executor for a local capture. Publishing
-// the WAL marker belongs to the ordered append executor and is a separate step.
+// prepareSnapshot runs on the bulk executor for captured and received images.
+// The WAL marker and covering HardState belong to the ordered append executor.
 func (s *diskStore) prepareSnapshot(image *pb.Snapshot) error {
 	dir := filepath.Join(s.dir, "snap")
 	// etcd's snapshot encoder provides the checksum. Stage in a private
@@ -387,6 +417,15 @@ func (s *diskStore) publishSnapshotMarker(image *pb.Snapshot) error {
 	if s.hard.GetCommit() < index {
 		return errors.New("snapshot publication overtook durable commit")
 	}
+	if err := s.writeSnapshotMarker(image); err != nil {
+		return err
+	}
+	return s.releaseSnapshot(index)
+}
+
+// A received marker may precede its covering HardState. Neither WAL locks nor
+// the GC frontier can advance until both are durable.
+func (s *diskStore) writeSnapshotMarker(image *pb.Snapshot) error {
 	if err := s.fault("snapshot-publication"); err != nil {
 		return err
 	}
@@ -394,6 +433,19 @@ func (s *diskStore) publishSnapshotMarker(image *pb.Snapshot) error {
 		return err
 	}
 	crashPoint("meta-snapshot-after-marker")
+	return nil
+}
+
+func (s *diskStore) releaseSnapshot(index uint64) error {
+	if index <= s.gcCut.Load() {
+		return nil
+	}
+	if s.hard.GetCommit() < index {
+		return errors.New("snapshot reclamation overtook durable commit")
+	}
+	if err := s.fault("snapshot-release"); err != nil {
+		return err
+	}
 	// Only the ordered append owner touches WAL locks. Bulk reclamation uses
 	// its own file handles and cannot hold the WAL mutex during unlink/fsync.
 	if err := s.wal.ReleaseLockTo(index); err != nil {

@@ -19,14 +19,17 @@ import (
 // calls. Its owner must deliver append completions in submission order. Ready
 // responses remain attached to their task until that task has really finished.
 type core struct {
-	raw               *raft.RawNode
-	memory            *raft.MemoryStorage
-	id                uint64
-	conf              *pb.ConfState
-	members           map[uint64]Member
-	applied           uint64
-	durable           uint64
-	snapshot          uint64
+	raw      *raft.RawNode
+	memory   *raft.MemoryStorage
+	id       uint64
+	conf     *pb.ConfState
+	members  map[uint64]Member
+	applied  uint64
+	durable  uint64
+	snapshot uint64
+	// RawNode restores configuration when it accepts a snapshot, before disk
+	// persistence and application installation advance snapshot/applied.
+	restoreIndex      uint64
 	configIndex       uint64
 	logBytes          map[uint64]uint64
 	retainedBytes     uint64
@@ -54,6 +57,7 @@ func newCore(cfg Config, g genesis, rec recovered) (*core, error) {
 		}
 		c.applied = rec.snapshot.Metadata.GetIndex()
 		c.snapshot = c.applied
+		c.restoreIndex = c.applied
 		c.configIndex = c.applied
 	}
 	if err := c.memory.Append(rec.entries); err != nil {
@@ -117,6 +121,10 @@ func (c *core) status() Status {
 // on the new branch. RawNode independently qualifies its attached responses.
 func (c *core) noteAppend(m *pb.Message) {
 	if !raft.IsEmptySnap(m.Snapshot) {
+		// Only a Ready carrying an actual storage snapshot establishes this
+		// fence. Rejected snapshots and log-matching commit fast-forwards do
+		// not restore RawNode's configuration.
+		c.restoreIndex = max(c.restoreIndex, m.Snapshot.Metadata.GetIndex())
 		c.pendingOverwrites[m] = min(c.applied, c.durable)
 		c.logicalLast = m.Snapshot.Metadata.GetIndex()
 	}
@@ -237,11 +245,20 @@ func (c *core) compact(index uint64) error {
 }
 
 // appliedEntry runs on the core only after the ordered application executor
-// confirms the entry. Configuration changes are never inferred from receipt,
-// a proposal's acceptance, or a transport connection.
+// confirms the entry. A snapshot accepted by RawNode supersedes covered
+// configuration changes even while its application installation is pending.
 func (c *core) appliedEntry(e *pb.Entry) error {
 	if e.GetIndex() != c.applied+1 {
 		return fmt.Errorf("apply gap: have %d, got %d", c.applied, e.GetIndex())
+	}
+	if e.GetIndex() <= c.restoreIndex {
+		// The application executor must still drain and acknowledge its old
+		// ordered jobs. Their membership effects belong to a prefix RawNode
+		// has already replaced: replaying ApplyConfChange would corrupt the
+		// restored voter/learner sets. Installation publishes the new member
+		// descriptors and configuration together; capture waits for that cut.
+		c.applied = e.GetIndex()
+		return nil
 	}
 	switch e.GetType() {
 	case pb.EntryConfChange:

@@ -63,6 +63,12 @@ commands. Client success includes the actual command verdict; a timeout,
 demotion, or cancellation leaves an uncertain outcome that must be reconciled
 by the existing operation idempotency key.
 
+RawNode restores its quorum configuration when it accepts an incoming snapshot,
+ahead of persistence and C++ installation. Older application jobs still drain
+in order, but covered configuration completions cannot modify that restored
+configuration. Local snapshot capture waits for installation to publish a
+matching application, descriptor, and configuration cut.
+
 A leader becomes usable only after applying an entry from its current term and
 obtaining a fresh voter majority. This is an application fence, not perpetual
 equality between applied and commit: ordinary pipelining does not repeatedly
@@ -125,9 +131,14 @@ never becomes fresh genesis automatically.
 Capture runs between application jobs at an exact applied index and includes
 that cut's Raft configuration and descriptors. The bulk executor stages a
 checksummed file, renames it, and syncs its directory. Only then may the ordered
-append executor publish and sync the WAL snapshot marker. The cut cannot exceed
-the durable commit watermark. Memory compaction and unlock of covered WAL
-segments follow publication. Reclamation deletes whole unlocked segments while
+append executor write and sync the WAL snapshot marker. A locally captured cut
+cannot exceed durable commit. A received image's marker becomes durable before
+the HardState that advances commit past the old log; recovery selects a marker
+only when durable commit covers it. If the same append includes a log suffix,
+the snapshot cut's commit is durable before writing that suffix, so a partial
+suffix cannot leave a gap behind an ineligible recovery image. Memory compaction
+and unlock of covered WAL segments follow the complete publication transaction.
+Reclamation deletes whole unlocked segments while
 retaining the boundary predecessor and the newest two published-or-older images;
 it never rewrites the surviving log suffix. A held message owns its snapshot
 bytes independently of file reclamation.

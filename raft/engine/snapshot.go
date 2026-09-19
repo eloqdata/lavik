@@ -48,7 +48,18 @@ func (r *Runtime) Snapshot() (<-chan Result, error) {
 }
 
 func (r *Runtime) maybeCapture() {
-	if r.snapshotInProgress || r.applyInProgress || r.core.applied == 0 || r.core.applied <= r.core.snapshot {
+	if r.snapshotInProgress || r.applyInProgress || r.core.restoreIndex > r.core.snapshot {
+		// Covered application completions cannot update the restored Raft
+		// configuration. Wait for the incoming image to install the matching
+		// application/descriptor/configuration cut before capturing again.
+		return
+	}
+	if r.core.applied <= r.core.snapshot {
+		// An incoming image can satisfy a request queued behind an old apply
+		// job. Do not strand that waiter when there is no newer cut to capture.
+		if r.snapshotWaiter != nil {
+			r.finishSnapshot(r.core.snapshot, nil)
+		}
 		return
 	}
 	first, _ := r.core.memory.FirstIndex()
