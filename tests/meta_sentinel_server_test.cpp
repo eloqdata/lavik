@@ -15,9 +15,11 @@
  */
 
 #include <arpa/inet.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <future>
 #include <memory>
 #include <string>
@@ -120,6 +122,71 @@ TEST(MetaSentinelServerTest,
   ::close(client);
   runtime.server_->Shutdown();
   runtime.server_->Shutdown();
+}
+
+TEST(MetaSentinelServerTest, ShutdownDrainsAcceptWhenWakeSocketCannotBeOpened) {
+  // Isolate the descriptor limit and timeout from other tests and the Go
+  // runtime's background threads. The exec-based child starts its own worker.
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  ASSERT_EXIT(
+      {
+        ::alarm(10);
+        {
+          const int client = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+          ASSERT_GE(client, 0);
+          sockaddr_in address{};
+          address.sin_family = AF_INET;
+          address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+          ASSERT_EQ(::bind(client, reinterpret_cast<sockaddr*>(&address),
+                           sizeof(address)),
+                    0);
+          socklen_t size = sizeof(address);
+          ASSERT_EQ(::getsockname(client, reinterpret_cast<sockaddr*>(&address),
+                                  &size),
+                    0);
+          ::close(client);
+
+          SentinelRuntime runtime;
+          ASSERT_TRUE(runtime.initialized_.get_future().get().ok());
+          lavik::meta::MetaSentinelServerOptions options;
+          options.address_ =
+              "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+          auto created = lavik::meta::MetaSentinelServer::Create(
+              runtime.runtime_.GetForeignExecutor(0), std::move(options));
+          ASSERT_TRUE(created.ok());
+          runtime.server_ = std::move(*created);
+          ASSERT_TRUE(runtime.server_->Start().ok());
+
+          const int peer = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+          ASSERT_GE(peer, 0);
+          ASSERT_EQ(::connect(peer, reinterpret_cast<sockaddr*>(&address),
+                              sizeof(address)),
+                    0);
+          ASSERT_EQ(::send(peer, "PING\r\n", 6, MSG_NOSIGNAL), 6);
+          char reply[7];
+          ASSERT_EQ(::recv(peer, reply, sizeof(reply), MSG_WAITALL),
+                    sizeof(reply));
+          ASSERT_EQ(std::string(reply, sizeof(reply)), "+PONG\r\n");
+
+          rlimit previous{};
+          ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &previous), 0);
+          rlimit exhausted = previous;
+          exhausted.rlim_cur = 0;
+          ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &exhausted), 0);
+          ASSERT_EQ(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0), -1);
+          ASSERT_EQ(errno, EMFILE);
+          // The listener is accepting again and the established session is
+          // idle. Shutdown must drain both without creating another socket.
+          runtime.server_->Shutdown();
+          ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &previous), 0);
+          ASSERT_EQ(::recv(peer, reply, sizeof(reply), 0), 0);
+          ::close(peer);
+          runtime.server_->Shutdown();
+          runtime.server_.reset();
+        }
+        ::_exit(0);
+      },
+      ::testing::ExitedWithCode(0), "");
 }
 
 }  // namespace
