@@ -22,6 +22,7 @@ case_template=${LAVIK_TEST_DATA_DIR:-/tmp}/lavik-redis-cluster-e2e-XXXXXX
 case_dir=$(mktemp -d "${case_template}")
 redis_pids=()
 lavik_pid=
+native_pid=
 
 cleanup() {
   status=$?
@@ -39,6 +40,7 @@ cleanup() {
   # This fixture checks PSYNC data, not graceful-shutdown durability.
   local pids=("${redis_pids[@]}")
   if [[ -n $lavik_pid ]]; then pids+=("$lavik_pid"); fi
+  if [[ -n $native_pid ]]; then pids+=("$native_pid"); fi
   if ((${#pids[@]})); then
     kill "${pids[@]}" 2>/dev/null || true
     for _ in {1..100}; do
@@ -64,10 +66,10 @@ import socket
 
 sockets = []
 ports = []
-while len(ports) < 4:
+while len(ports) < 8:
     port = random.randrange(20000, 45000)
     candidates = [port]
-    if len(ports) < 3:
+    if len(ports) < 6:
         candidates.append(port + 10000)  # Redis Cluster bus port.
     opened = []
     try:
@@ -85,9 +87,12 @@ print(*ports, sep="\n")
 PY
 )
 master_ports=("${ports[0]}" "${ports[1]}" "${ports[2]}")
-lavik_port=${ports[3]}
+other_ports=("${ports[3]}" "${ports[4]}" "${ports[5]}")
+all_redis_ports=("${master_ports[@]}" "${other_ports[@]}")
+lavik_port=${ports[6]}
+native_port=${ports[7]}
 
-for port in "${master_ports[@]}"; do
+for port in "${all_redis_ports[@]}"; do
   node_dir=$case_dir/$port
   mkdir "$node_dir"
   "$redis_server" --port "$port" --cluster-enabled yes \
@@ -97,7 +102,7 @@ for port in "${master_ports[@]}"; do
   redis_pids+=("$!")
 done
 
-for port in "${master_ports[@]}"; do
+for port in "${all_redis_ports[@]}"; do
   for _ in {1..200}; do
     "$redis_cli" -p "$port" ping >/dev/null 2>&1 && break
     sleep 0.05
@@ -108,7 +113,10 @@ done
 printf 'yes\n' | "$redis_cli" --cluster create \
   "127.0.0.1:${master_ports[0]}" "127.0.0.1:${master_ports[1]}" \
   "127.0.0.1:${master_ports[2]}" --cluster-replicas 0 >/dev/null
-for port in "${master_ports[@]}"; do
+printf 'yes\n' | "$redis_cli" --cluster create \
+  "127.0.0.1:${other_ports[0]}" "127.0.0.1:${other_ports[1]}" \
+  "127.0.0.1:${other_ports[2]}" --cluster-replicas 0 >/dev/null
+for port in "${all_redis_ports[@]}"; do
   for _ in {1..200}; do
     "$redis_cli" -p "$port" cluster info | tr -d '\r' | \
       grep -q '^cluster_state:ok$' && break
@@ -151,8 +159,26 @@ overlap=$("$redis_cli" -p "$lavik_port" addreplicaof 127.0.0.1 \
 grep -q 'slot overlap' <<<"$overlap"
 "$redis_cli" -p "$lavik_port" addreplicaof 127.0.0.1 \
   "${master_ports[1]}" >/dev/null
+# No subset of sources may expose a partially imported logical dataset.
+incomplete=$("$redis_cli" -p "$lavik_port" get '{a}baseline' 2>&1)
+grep -q 'LOADING' <<<"$incomplete"
+wrong_cluster=$("$redis_cli" -p "$lavik_port" addreplicaof 127.0.0.1 \
+  "${other_ports[2]}" 2>&1)
+grep -q 'topology changed' <<<"$wrong_cluster"
 "$redis_cli" -p "$lavik_port" addreplicaof 127.0.0.1 \
   "${master_ports[2]}" >/dev/null
+
+fallocate -l 128M "$case_dir/native.data"
+"$lavik_bin" --logtostderr --port "$native_port" --threads 1 --no-pin-workers \
+  --recv-buffers-per-worker 0 --max-memory 1073741824 \
+  --data-file "$case_dir/native.data" >"$case_dir/native.log" 2>&1 &
+native_pid=$!
+for _ in {1..200}; do
+  "$redis_cli" -p "$native_port" ping >/dev/null 2>&1 && break
+  sleep 0.05
+done
+native_rejected=$("$redis_cli" -p "$lavik_port" addreplicaof 127.0.0.1 "$native_port" 2>&1)
+grep -q 'external replication requires a Redis' <<<"$native_rejected"
 
 for _ in {1..400}; do
   "$redis_cli" -p "$lavik_port" info replication 2>/dev/null | \

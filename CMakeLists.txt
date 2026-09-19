@@ -1404,6 +1404,10 @@ endforeach()
     find_program(LAVIK_REDIS_SERVER_EXECUTABLE redis-server)
     find_program(LAVIK_REDIS_CLI_EXECUTABLE redis-cli)
     if (LAVIK_REDIS_SERVER_EXECUTABLE AND LAVIK_REDIS_CLI_EXECUTABLE)
+      add_test(NAME lavik_redis_follower
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_follower_smoke.py
+                $<TARGET_FILE:lavik> ${LAVIK_REDIS_SERVER_EXECUTABLE})
+      set_tests_properties(lavik_redis_follower PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE)
       add_test(
         NAME lavik_redis_cluster_psync_e2e
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_cluster_psync_e2e.sh
