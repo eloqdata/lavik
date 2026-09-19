@@ -1,0 +1,27 @@
+{
+  "lavik": {
+    "path": "/mnt/dev/peer-bench/defrag-enabled-beta1-retest-2026-09-18/downloads/lavik-v0.1.0-beta.1-linux-x86_64/lavik",
+    "sha256": "b14da83ef4f3146848e8b27f4c556d01696e8f28398cf38f3a97bd68d68b1a31",
+    "version": "lavik 0.1.0-beta.1",
+    "revision": "3955b98d43b312324aa8d52775df52cfb111c0d0"
+  },
+  "redis": {
+    "path": "/mnt/dev/peer-bench/redis/v8.8.0/src/src/redis-server",
+    "sha256": "91bc016e933b716b41226bf8958576a51bca2403f68d9f26a7d6f7d94ebb3ffe",
+    "version": "Redis server v=8.8.0 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=1817b7f2026e7f24"
+  },
+  "valkey": {
+    "path": "/mnt/dev/peer-bench/valkey/v9.1.0/src/src/valkey-server",
+    "sha256": "a44b46cd7eeaf3409c38f9ee3a9f8db2488acadf1224fc9e51580aaeb651afea",
+    "version": "Valkey server v=9.1.0 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=4012781e100171d6"
+  },
+  "dragonfly": {
+    "path": "/mnt/dev/peer-bench/dragonfly/v1.40.2/dragonfly-x86_64",
+    "sha256": "a9b8529a45c360688362bb209aefed9ad526b61dec7ec25d330eca56aaba46ad",
+    "version": "dragonfly \u001b[0;32mv1.40.2-e94300e6990093ec093cfb00d60c2e77ea4907e4\u001b[m\nbuild time: \u001b[0;33m2026-09-02 08:56:25\u001b[m"
+  },
+  "garnet": {
+    "path": "/mnt/dev/peer-bench/garnet/v2.1.5/net10.0/GarnetServer",
+    "sha256": "ed674ad5481eefa4cca26ee2d5b3838a564395158ae4e42accb7be6e4c47bf49"
+  }
+}

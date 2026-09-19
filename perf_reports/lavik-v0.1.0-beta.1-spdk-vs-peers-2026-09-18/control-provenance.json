@@ -1,0 +1,14 @@
+{
+  "source_root": "/mnt/dev/peer-bench/nightly-uring-spdk-retest-2026-09-18",
+  "source_report": "lavik-nightly-uring-spdk-vs-peers-2026-09-18",
+  "reused_controls": [
+    "memory/redis",
+    "memory/valkey",
+    "storage/dragonfly",
+    "storage/garnet"
+  ],
+  "new_lavik_points": 22,
+  "new_defrag_paused": false,
+  "source_evidence_sha256": "5f6cf4ab4ecb13a9ef0f7b2c8817518fccd3ae065ff4486bf8b578ed3a285ef0",
+  "new_lavik_backend": "SPDK only"
+}

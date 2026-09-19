@@ -1,0 +1,36 @@
+{
+  "ref": {
+    "ref": "refs/tags/v0.1.0-beta.1",
+    "node_id": "REF_kwDOSDhkabdyZWZzL3RhZ3MvdjAuMS4wLWJldGEuMQ",
+    "url": "https://api.github.com/repos/eloqdata/lavik/git/refs/tags/v0.1.0-beta.1",
+    "object": {
+      "sha": "12c50eb732f2573735d9e9fa0388faa20093f87e",
+      "type": "tag",
+      "url": "https://api.github.com/repos/eloqdata/lavik/git/tags/12c50eb732f2573735d9e9fa0388faa20093f87e"
+    }
+  },
+  "annotated_tag": {
+    "node_id": "TA_kwDOSDhkadoAKDEyYzUwZWI3MzJmMjU3MzczNWQ5ZTlmYTAzODhmYWEyMDA5M2Y4N2U",
+    "sha": "12c50eb732f2573735d9e9fa0388faa20093f87e",
+    "url": "https://api.github.com/repos/eloqdata/lavik/git/tags/12c50eb732f2573735d9e9fa0388faa20093f87e",
+    "tagger": {
+      "name": "Jerry Zhao",
+      "email": "ch3nzhao@gmail.com",
+      "date": "2026-09-18T15:29:18Z"
+    },
+    "object": {
+      "sha": "3955b98d43b312324aa8d52775df52cfb111c0d0",
+      "type": "commit",
+      "url": "https://api.github.com/repos/eloqdata/lavik/git/commits/3955b98d43b312324aa8d52775df52cfb111c0d0"
+    },
+    "tag": "v0.1.0-beta.1",
+    "message": "Lavik 0.1.0-beta.1\n",
+    "verification": {
+      "verified": false,
+      "reason": "unsigned",
+      "signature": null,
+      "payload": null,
+      "verified_at": null
+    }
+  }
+}

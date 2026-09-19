@@ -55,19 +55,19 @@ SPDK NVMe namespaces, so capacity scales with storage.
   devices, or directly on NVMe through SPDK.
 
 - **Multiples of the throughput of disk-backed alternatives.** In the
-  **one-billion-key, 1 TB** test, Lavik reached **784,179 GET QPS**:
-  **2.07× Dragonfly's and 2.36× Garnet's peak read throughput**. In the broader
-  200-million-key comparison, Lavik SPDK delivered **2.44–4.93× the throughput
-  of Pika, Apache Kvrocks, and Tendis** across the tested read, write, and mixed
-  workloads. See [disk-backed comparisons](#disk-backed-kv-systems).
+  **one-billion-key, 1 TB** test, [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) reached **952,560 GET QPS**:
+  **2.04× Dragonfly's and 2.13× Garnet's peak read throughput**.
+  In the broader 200-million-key comparison, Lavik SPDK delivered
+  **2.44–4.93× the throughput of Pika, Apache Kvrocks, and Tendis** across
+  the tested read, write, and mixed workloads.
+  See [disk-backed comparisons](#disk-backed-kv-systems).
 
-- **NVMe storage, near in-memory performance.** On an AMD EPYC 9V74 server
-  with 125 GiB RAM and six raw NVMe drives, Lavik reached **828,502 GET QPS**
-  and **984,452 SET QPS** over **10 million keys with 1 KiB values**. That is
-  **86–87% of tuned in-memory Redis/Valkey read throughput**, while writes
-  were **12.5% faster than Redis and 23.7% faster than Valkey**. GET/SET p99
-  latency was **4.543 / 4.575 ms**, comparable to both in-memory systems at
-  peak throughput. See [in-memory comparisons](#in-memory-redis-and-valkey).
+- **NVMe storage, beyond in-memory throughput.**
+  In the 10-million-key
+  benchmark, Lavik's peak GET throughput was **3.6% higher than Redis and
+  4.8% higher than Valkey**. Its peak SET throughput was **2.2% higher than
+  Redis and 15.9% higher than Valkey**.
+  See [in-memory comparisons](#in-memory-redis-and-valkey) for full results.
 
 - **Put multiple CPU cores to work in one server.** Worker threads own their
   data partitions and execute requests in parallel. A C++23 coroutine runtime
@@ -200,7 +200,9 @@ The standard package additionally needs the NUMA and UUID runtime libraries
 (`libnuma1` and `libuuid1` on Ubuntu). It defaults to kernel TCP/io_uring;
 DPDK/SPDK must be explicitly selected and provisioned. Its bundled DPDK network
 drivers are TAP, ring, and virtio, so it does not support every physical NIC.
-SPDK mode requires an SPDK-accessible NVMe device.
+SPDK mode requires an SPDK-accessible NVMe device. Follow the
+[SPDK storage guide](docs/operations/spdk-storage.md) for device binding,
+hugepage setup, a release-package launch command, and host restoration.
 
 See [Building and packaging](docs/operations/building-and-packaging.md)
 for dependency setup, standard-package builds, and compatibility details.
@@ -246,9 +248,8 @@ for persistent files, raw devices, and storage expansion.
 ## Benchmark
 
 **Lavik delivers multi-fold throughput gains over several disk-backed KV
-systems and approaches tuned in-memory Redis and Valkey performance.** The
-measurements below show where those gains occur, including the remaining read
-throughput gap and Lavik's higher peak write throughput in the in-memory test.
+systems.** The [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) benchmarks compare
+throughput and tail latency against Redis, Valkey, Dragonfly, and Garnet.
 
 Browse the [performance reports](perf_reports/README.md) for full results in
 English and Simplified Chinese.
@@ -282,16 +283,19 @@ Across these read, write, and mixed workloads, **Lavik SPDK delivered
 throughput was **1.65× Dragonfly's and 1.51× Garnet's**; write throughput was
 **1.97× and 1.08×**, respectively.
 
-The separate [1 TB storage-tier test](perf_reports/lavik-vs-redis-valkey-iothreads-10g-1k-2026-09-06/README.md#1-tb-storage-tier-lavik-leads-dragonfly-and-garnet)
+The [1 TB storage-tier test](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md#1b-keys--1-kib-storage-tier-controls)
 used **one billion 1 KiB values** on an AMD EPYC 9V74 server with six NVMe
-drives. Lavik raw io_uring peaked at **784,179 GET QPS**, or **2.07× Dragonfly's
-and 2.36× Garnet's peak read throughput**. Its **856,523 SET QPS** was
-**1.44× Dragonfly's and 1.12× Garnet's**. These are peak-to-peak comparisons
-within that test's own concurrency sweep, separate from the dual-NVMe table
-above.
+drives. The [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) release with SPDK peaked
+at **952,560 GET QPS**, or **2.04× Dragonfly's and 2.13× Garnet's peak read throughput**.
+Its **764,939 SET QPS** was **1.42× Dragonfly's and 1.02× Garnet's**.
+These compare each system's highest measured point within its concurrency
+sweep and are separate from the dual-NVMe table above. Lavik SPDK
+used freshly loaded datasets; the controls reuse measurements from an earlier
+sweep on the same hosts. Garnet's post-measurement full key-count scan
+was omitted after its formal tests completed, as documented in the report.
 
-Lavik SPDK's read p99 was **0.455 ms**, versus 2.303 ms for Garnet and
-2.911 ms for Dragonfly. These results use each system's recorded
+In the August 12 dual-NVMe test, Lavik SPDK's read p99 was **0.455 ms**,
+versus 2.303 ms for Garnet and 2.911 ms for Dragonfly. These results use each system's recorded
 cache, warmup, and persistence settings; uniform random access is unfavorable
 to KeyDB On Flash's hot-tier design. The report documents those differences
 and reproduction commands. Its separate Azure Managed Redis test used a
@@ -302,28 +306,28 @@ covering workloads A/B/C/D and their tail latencies.
 
 ### In-memory Redis and Valkey
 
-The [Redis/Valkey comparison](perf_reports/lavik-vs-redis-valkey-iothreads-10g-1k-2026-09-06/README.md)
-used an AMD EPYC 9V74 server with 125 GiB RAM and **10 million keys with 1 KiB
-values** (about 10 GB). Lavik used io_uring on six raw NVMe devices; Redis
-8.8.0 and Valkey 9.1.0 held the complete dataset in memory. Tests swept
-80–1,280 connections with pipeline=1 and 30-second measurement windows,
-selecting each in-memory system's best measured I/O-thread setting per command.
+The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md#10m-keys--1-kib-in-memory-controls)
+used an AMD EPYC 9V74 server with approximately 126 GiB RAM and
+**10 million keys with 1 KiB values** (about 10 GB). The
+[Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) release used SPDK with six raw NVMe
+devices and separately loaded datasets. Redis 8.8.0 and Valkey 9.1.0 held
+the complete dataset in memory. Tests swept 80–1,280 connections with
+pipeline=1 and 30-second measurement windows, selecting each in-memory
+system's best measured I/O-thread setting per command.
 
-![Lavik versus tuned in-memory Redis and Valkey across connection counts](perf_reports/lavik-vs-redis-valkey-iothreads-10g-1k-2026-09-06/best-memory-vs-lavik-qps.svg)
+![Lavik SPDK versus tuned in-memory Redis and Valkey](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/memory-qps.svg)
 
 | System | Peak GET QPS | GET p99 | Peak SET QPS | SET p99 |
 |---|---:|---:|---:|---:|
-| **Lavik — raw io_uring** | **828,502** | **4.543 ms** | **984,452** | **4.575 ms** |
-| Redis 8.8.0 | 964,267 | 4.671 ms | 874,879 | 4.767 ms |
-| Valkey 9.1.0 | 948,300 | 4.479 ms | 796,145 | 4.319 ms |
+| Lavik SPDK | 1,012,180 | 3.599 ms | 930,465 | 4.799 ms |
+| Redis 8.8.0 | 976,801 | 4.671 ms | 910,426 | 4.831 ms |
+| Valkey 9.1.0 | 965,697 | 4.543 ms | 802,519 | 4.383 ms |
 
-**Lavik approaches in-memory read throughput and exceeds both systems' peak
-write throughput in this test.** It achieved **85.9% of Redis's and 87.4% of
-Valkey's peak GET QPS**—a read gap of 14.1% and 12.6%—while SET throughput was
-**12.5% above Redis and 23.7% above Valkey**, with similar p99 latency. All
-peaks occurred at 1,280 connections. Redis and Valkey
-had AOF and automatic RDB saves disabled; Lavik had defragmentation paused.
-This 10 GB test is independent of the larger storage-tier benchmark above.
+Lavik SPDK's GET peak occurred at 640 connections and its SET
+peak at 1,280. Redis and Valkey had AOF and
+automatic RDB saves disabled. Their controls reuse an earlier sweep on the same
+hosts; all Lavik points were measured with the release package. This 10 GB
+test is independent of the larger storage-tier benchmark above.
 
 ## Important notes
 
