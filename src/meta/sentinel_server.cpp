@@ -400,8 +400,17 @@ void MetaSentinelServer::Shutdown() {
         core->shutdown_ = true;
         if (core->accepting_) {
           auto wake = OpenAcceptWake(core->endpoint_);
-          if (!wake.ok()) std::terminate();
-          core->wake_fd_ = *wake;
+          if (wake.ok()) {
+            core->wake_fd_ = *wake;
+          } else {
+            // Socket exhaustion must not make shutdown fatal. Shutting down
+            // the existing Linux TCP listener wakes its armed io_uring accept
+            // without allocating an fd. Close also prevents completion from
+            // rearming accept. Keep the listener object and accepting_ alive
+            // until AcceptLoop consumes the completion and reports its exit.
+            (void)::shutdown(core->listener_.NativeFd(), SHUT_RDWR);
+            (void)core->listener_.Close();
+          }
         } else {
           (void)core->listener_.Close();
         }
