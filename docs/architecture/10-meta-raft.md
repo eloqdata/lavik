@@ -105,20 +105,21 @@ only after a full active interval, through the existing Data quarantine.
 
 ## Durable root and recovery
 
-The storage format is `lavik-etcd-raft-v1`:
+Meta owns one current storage layout directly under its configured data
+directory. WAL and snapshot files use etcd's native encodings:
 
 | Path | Durable meaning |
 |---|---|
 | `RAFT` | Immutable local identity and exact initial Meta vector; duplicated in WAL metadata |
-| `raft-v1/STARTED` | One-way evidence published before the first consensus write |
-| `raft-v1/JOIN` | Optional immutable invitation and committed configuration cut for a waiting joiner |
-| `raft-v1/wal/*.wal` | etcd checksummed WAL: entries, HardState and published snapshot markers |
-| `raft-v1/snap/*.snap` | etcd checksummed snapshots: Raft index/term/configuration plus the `LMS1` descriptor/application envelope |
+| `STARTED` | One-way evidence published before the first consensus write |
+| `JOIN` | Optional immutable invitation and committed configuration cut for a waiting joiner |
+| `wal/*.wal` | etcd checksummed WAL: entries, HardState and published snapshot markers |
+| `snap/*.snap` | etcd checksummed snapshots: Raft index/term/configuration plus the `LMS1` descriptor/application envelope |
 
 A pristine directory with a manifest bootstraps exactly one, three or five
 voters. A pristine directory without one is a waiting joiner with no voter
 configuration. A manifest is rejected on restart. Missing or contradictory
-root/startup evidence fails closed; a nonempty legacy or damaged directory
+root/startup evidence fails closed; a nonempty or damaged directory
 never becomes fresh genesis automatically.
 
 Capture runs between application jobs at an exact applied index and includes
@@ -184,8 +185,9 @@ callbacks, then closes WAL. An uninterruptible filesystem call can delay joining
 but cannot preserve authority. C++ drains its foreign-executor producers before
 stopping Bycorf; callback owners remain alive throughout that drain.
 
-The peer wire and durable layout are incompatible with NuRaft. There is no old
-format reader, migration, or mixed-backend rolling upgrade. Meta commands and
+The peer protocol and storage have one current implementation. Incompatible
+development layouts are replaced in place for fresh clusters without a legacy
+decoder, migration, or mixed-layout negotiation. Meta commands and
 business-store encodings retain their current semantics. The Go toolchain and
 module checksums are pinned; etcd is a Go Module dependency, not a submodule or
 an external service.

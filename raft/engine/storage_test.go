@@ -51,7 +51,7 @@ func TestWALRotationSnapshotReclamationAndTailRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeEntries(t, disk, 1, 120, 1)
-	files, _ := filepath.Glob(filepath.Join(disk.dir, "wal", "*.wal"))
+	files, _ := filepath.Glob(filepath.Join(cfg.Dir, "wal", "*.wal"))
 	if len(files) < 3 {
 		t.Fatal("fixture did not rotate WAL")
 	}
@@ -63,11 +63,11 @@ func TestWALRotationSnapshotReclamationAndTailRecovery(t *testing.T) {
 	if err := disk.reclaim(110); err != nil {
 		t.Fatal(err)
 	}
-	after, _ := filepath.Glob(filepath.Join(disk.dir, "wal", "*.wal"))
+	after, _ := filepath.Glob(filepath.Join(cfg.Dir, "wal", "*.wal"))
 	if len(after) >= len(files) {
 		t.Fatal("no covered segment reclaimed")
 	}
-	images, _ := filepath.Glob(filepath.Join(disk.dir, "snap", "*.snap"))
+	images, _ := filepath.Glob(filepath.Join(cfg.Dir, "snap", "*.snap"))
 	if len(images) != 2 {
 		t.Fatalf("want current and previous images, got %d", len(images))
 	}
@@ -256,15 +256,23 @@ func TestPristineWaitingAndRestartClassification(t *testing.T) {
 		d.wal.Close()
 		t.Fatal("restart accepted a new genesis")
 	}
-	for _, legacy := range []string{"raft_log.dat", "cluster_config.dat", "wal", "snapshot_1.dat"} {
-		t.Run(legacy, func(t *testing.T) {
+	// Losing RAFT must not let partial durable state bootstrap a fresh voter.
+	for _, existing := range []string{"STARTED", "JOIN", "wal", "snap", "raft_log.dat", "cluster_config.dat", "snapshot_1.dat", "unrelated"} {
+		t.Run(existing, func(t *testing.T) {
 			cfg := storageConfig(t)
-			if err := os.WriteFile(filepath.Join(cfg.Dir, legacy), nil, 0600); err != nil {
+			path := filepath.Join(cfg.Dir, existing)
+			var err error
+			if existing == "wal" || existing == "snap" {
+				err = os.Mkdir(path, 0700)
+			} else {
+				err = os.WriteFile(path, nil, 0600)
+			}
+			if err != nil {
 				t.Fatal(err)
 			}
 			if d, _, err := openDisk(cfg); err == nil {
 				d.wal.Close()
-				t.Fatal("legacy directory accepted")
+				t.Fatal("non-pristine directory accepted as fresh genesis")
 			}
 		})
 	}

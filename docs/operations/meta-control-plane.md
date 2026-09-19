@@ -77,8 +77,9 @@ rejected. A pristine node without a manifest is an election-disabled waiting
 joiner for a future `addsrv`. `status` reports `initial_bindings_pending=0`
 once all genesis identities have been applied.
 
-The `RAFT` marker identifies `lavik-etcd-raft-v1`; `raft-v1/` contains the
-etcd WAL and snapshots, the one-way `STARTED` marker, and an optional immutable
+Meta stores the etcd WAL in `<data-dir>/wal/` and snapshots in
+`<data-dir>/snap/`. The same directory holds `RAFT` with the local identity and
+initial membership, the one-way `STARTED` marker, and an optional immutable
 `JOIN` invitation for dynamic catch-up. Recovery verifies the newest published
 snapshot and replays the persisted committed suffix before opening peer ingress.
 Missing, conflicting or corrupt evidence prevents startup. Do not edit/delete
@@ -1072,18 +1073,15 @@ When that guard fires:
    new server id and matching certificate for the replacement. Never wipe a
    quorum simultaneously.
 
-The etcd Raft wire and `lavik-etcd-raft-v1` directories are incompatible with
-NuRaft, including its segmented WAL and older prototypes. Back up the old
-cluster and use fresh directories with a coordinated binary replacement. No
-legacy reader, data migration, or mixed-backend rolling upgrade is provided.
-
 ## Binary replacement and format compatibility
 
 Before the first stable release, all Lavik-owned durable and control formats
 retain their current development versions, including the Raft command envelope, topology store,
 membership descriptors and intents, cluster-create
 intents, and cluster-status binary/JSON payloads. There is no decoder for
-superseded pre-release layouts. Development directories from an incompatible
+superseded pre-release layouts. The current Meta implementation uses etcd's
+WAL and snapshot encodings directly, with no backend-specific format selector
+or versioned directory. Development directories from an incompatible
 layout must be rebuilt even when their markers are also v1; marker checks
 cannot detect every same-marker schema change. Equal version numbers do not
 make incompatible builds safe to mix.

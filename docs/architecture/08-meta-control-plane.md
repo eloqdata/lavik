@@ -817,8 +817,8 @@ committed directory together; partial descriptors are rejected.
 Incompatible development data directories are recreated. Meta has no in-band
 schema-switch command; incompatible changes require coordinated replacement
 of communicating binaries. Readers reject unknown markers, malformed fields,
-and trailing bytes, including in the segmented WAL; these checks cannot detect
-every incompatible same-marker layout.
+and trailing bytes; the etcd WAL and snapshot readers validate their own framing
+and checksums. These checks cannot detect every incompatible same-marker layout.
 
 ## Authentication, membership, and audit
 

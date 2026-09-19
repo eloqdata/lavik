@@ -24,10 +24,11 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const storageFormat = "lavik-etcd-raft-v1"
+// STARTED distinguishes an untouched waiting joiner from a node whose Raft
+// state was lost. Its fixed contents also detect interrupted marker writes.
+const startedEvidence = "started\n"
 
 type genesis struct {
-	Format  string   `json:"format"`
 	Local   Member   `json:"local"`
 	Initial []Member `json:"initial"`
 }
@@ -114,8 +115,10 @@ func openDisk(cfg Config) (*diskStore, recovered, error) {
 	if err := os.MkdirAll(cfg.Dir, 0700); err != nil {
 		return nil, rec, err
 	}
-	dir := filepath.Join(cfg.Dir, "raft-v1")
-	marker := filepath.Join(cfg.Dir, "RAFT")
+	// Meta owns one current layout directly in its data directory. RAFT is
+	// durable identity/bootstrap evidence, not a storage-version selector.
+	dir := cfg.Dir
+	marker := filepath.Join(dir, "RAFT")
 	meta, err := readBounded(marker, 1<<20)
 	fresh := errors.Is(err, os.ErrNotExist)
 	if err != nil && !fresh {
@@ -129,7 +132,7 @@ func openDisk(cfg Config) (*diskStore, recovered, error) {
 		if err != nil {
 			return nil, rec, err
 		}
-		// A missing marker must not turn a damaged or legacy directory into a
+		// A missing marker must not turn an existing or damaged directory into a
 		// fresh election-eligible node. Only a stale administrative socket is
 		// unrelated to durable state and may predate initialization.
 		for _, f := range files {
@@ -150,7 +153,7 @@ func openDisk(cfg Config) (*diskStore, recovered, error) {
 		if len(cfg.Initial) != 0 && (!seen[cfg.Local.ID] || len(cfg.Initial)%2 == 0 || len(cfg.Initial) > 5) {
 			return nil, rec, errors.New("genesis requires 1, 3, or 5 voters including local member")
 		}
-		g := genesis{Format: storageFormat, Local: cfg.Local, Initial: cfg.Initial}
+		g := genesis{Local: cfg.Local, Initial: cfg.Initial}
 		meta, err = json.Marshal(g)
 		if err != nil {
 			return nil, rec, err
@@ -169,16 +172,13 @@ func openDisk(cfg Config) (*diskStore, recovered, error) {
 		if err = syncDirectory(dir); err != nil {
 			return nil, rec, err
 		}
-		if err = syncDirectory(cfg.Dir); err != nil {
-			return nil, rec, err
-		}
 	}
 	s := &diskStore{dir: dir, beforeSave: cfg.beforeSave, beforeIO: cfg.beforeIO}
 	if err := json.Unmarshal(meta, &s.genesis); err != nil {
 		return nil, rec, err
 	}
-	if s.genesis.Format != storageFormat || s.genesis.Local.ID != cfg.Local.ID || s.genesis.Local.Principal != cfg.Local.Principal {
-		return nil, rec, errors.New("Meta storage format or local identity mismatch")
+	if s.genesis.Local.ID != cfg.Local.ID || s.genesis.Local.Principal != cfg.Local.Principal {
+		return nil, rec, errors.New("Meta local identity mismatch")
 	}
 	waldir := filepath.Join(dir, "wal")
 	if !fresh {
@@ -191,7 +191,7 @@ func openDisk(cfg Config) (*diskStore, recovered, error) {
 			return nil, rec, err
 		}
 		s.started = err == nil
-		if s.started && string(evidence) != storageFormat {
+		if s.started && string(evidence) != startedEvidence {
 			return nil, rec, errors.New("corrupt Raft startup evidence")
 		}
 	}
@@ -289,7 +289,7 @@ func (s *diskStore) savePrepared(m *pb.Message, prepared bool) error {
 		}
 	}
 	if !s.started {
-		if err := writeExclusive(filepath.Join(s.dir, "STARTED"), []byte(storageFormat)); err != nil {
+		if err := writeExclusive(filepath.Join(s.dir, "STARTED"), []byte(startedEvidence)); err != nil {
 			return err
 		}
 		if err := syncDirectory(s.dir); err != nil {
