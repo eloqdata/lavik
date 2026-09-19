@@ -18,10 +18,6 @@
 
 #include <mimalloc.h>
 
-#if defined(__SSE2__)
-#include <emmintrin.h>
-#endif
-
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -2052,23 +2048,6 @@ class ScanHashMap {
     return static_cast<std::uint8_t>(hash >> 56);
   }
 
-#if defined(__SSE2__)
-  // Match flush-receipt fingerprints before resolving arena handles. Empty
-  // slots can match tag zero, so callers still check occupancy and address.
-  static std::uint16_t MatchingTags(const Bucket& bucket,
-                                    std::uint8_t tag) noexcept {
-    static_assert(kEntriesPerBucket == 12);
-    // SSE2 is part of the portable x86-64 baseline. Copy from the complete
-    // Bucket object so the 16-byte load stays within its representation; the
-    // four bytes beyond hashes_ are discarded by the twelve-slot mask.
-    __m128i bytes;
-    std::memcpy(&bytes, &bucket, sizeof(bytes));
-    const __m128i repeated = _mm_set1_epi8(static_cast<char>(tag));
-    return static_cast<std::uint16_t>(
-        _mm_movemask_epi8(_mm_cmpeq_epi8(bytes, repeated)) & 0x0fff);
-  }
-#endif
-
   static std::uint64_t EntryHash(const Entry& entry) noexcept {
     return Hash(entry.key_complete() ? ComputeDigest(entry.key())
                                      : entry.external_key_digest());
@@ -2385,30 +2364,14 @@ class ScanHashMap {
       }
       const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
       while (bucket != nullptr) {
-#if defined(__SSE2__)
-        if constexpr (FilterTag) {
-          for (std::uint16_t matches = MatchingTags(*bucket, tag); matches != 0;
-               matches &= matches - 1) {
-            const std::size_t slot = std::countr_zero(matches);
-            if (Occupied(*bucket, slot)) {
-              const Entry* entry = Resolve(bucket->entries_[slot]);
-              if (reinterpret_cast<std::uintptr_t>(entry) == address) {
-                return entry;
-              }
+        for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+          if (Occupied(*bucket, slot)) {
+            if constexpr (FilterTag) {
+              if (bucket->hashes_[slot] != tag) continue;
             }
-          }
-        } else
-#endif
-        {
-          for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
-            if (Occupied(*bucket, slot)) {
-              if constexpr (FilterTag) {
-                if (bucket->hashes_[slot] != tag) continue;
-              }
-              const Entry* entry = Resolve(bucket->entries_[slot]);
-              if (reinterpret_cast<std::uintptr_t>(entry) == address) {
-                return entry;
-              }
+            const Entry* entry = Resolve(bucket->entries_[slot]);
+            if (reinterpret_cast<std::uintptr_t>(entry) == address) {
+              return entry;
             }
           }
         }

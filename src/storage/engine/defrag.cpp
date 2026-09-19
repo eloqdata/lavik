@@ -527,15 +527,8 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   // first matching record instead of allocating/materializing all candidates.
   RecordIndex::Entry* current = index.FindCandidateIf(
       digest, key, [&](const RecordIndex::Entry& candidate) {
-        // Most scanned versions have already been replaced. Reject a changed
-        // block/offset from the compact entry before following its BlockState
-        // pointer to recover the allocation epoch. Matching prefixes still
-        // require the full physical identity check, including that epoch.
-        return candidate.value_.block_id() == source_location.block_id() &&
-               candidate.value_.record_offset() ==
-                   source_location.record_offset() &&
-               MaterializeIndexLocation(candidate).SamePhysicalRecord(
-                   source_location);
+        return MaterializeIndexLocation(candidate).SamePhysicalRecord(
+            source_location);
       });
   if (current == nullptr) {
     co_return std::optional<RelocationDurabilityFence>{};
