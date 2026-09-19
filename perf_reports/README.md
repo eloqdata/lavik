@@ -27,7 +27,7 @@ Each report provides an English `README.md` and a Simplified Chinese
 | SPDK 48-hour online stability | 2026-08-15 | [English](lavik-spdk-48h-stability-2026-08-15/README.md) | [简体中文](lavik-spdk-48h-stability-2026-08-15/README.zh-CN.md) |
 | One billion keys: SPDK value-size scaling on 16 workers | 2026-08-31 | [English](lavik-spdk-dfly-bench-1b-value-size-limit-16worker-2026-08-31/README.md) | [简体中文](lavik-spdk-dfly-bench-1b-value-size-limit-16worker-2026-08-31/README.zh-CN.md) |
 | SPDK vs. raw io_uring: 500M keys, 2 KiB values | 2026-08-26 | [English](lavik-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26/README.md) | [简体中文](lavik-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26/README.zh-CN.md) |
-| Persistence and storage tiers: Dragonfly, Garnet, Kvrocks, Pika, Tendis, KeyDB, and Azure Managed Redis | 2026-08-11 | [English](lavik-vs-dragonfly-tiering-2026-08-11/README.md) | [简体中文](lavik-vs-dragonfly-tiering-2026-08-11/README.zh-CN.md) |
+| Storage tiers: six NVMe drives, 100 ms Lavik flush, Dragonfly, Garnet, Kvrocks, Pika, Tendis, and KeyDB | 2026-09-19 | [English](lavik-vs-dragonfly-tiering-2026-08-11/README.md) | [简体中文](lavik-vs-dragonfly-tiering-2026-08-11/README.zh-CN.md) |
 | v0.1.0-beta.1 release: SPDK versus peers | — | [English](lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md) | [简体中文](lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.zh-CN.md) |
 | Lavik–Aerospike YCSB A/B/C/D throughput and tail latency | 2026-09-16 | [English](ycsb-rerun-2026-09-13/README.md) | [简体中文](ycsb-rerun-2026-09-13/README.zh-CN.md) |
 

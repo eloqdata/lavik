@@ -64,7 +64,8 @@ struct StorageEngineOptions {
   // consumption during startup and can be changed before the next clean
   // shutdown through CONFIG once request serving begins.
   bool shutdown_checkpoint_ = false;
-  std::uint32_t flush_max_ms_ = 1000;
+  // Maximum partial-block age before periodic flushing requests submission.
+  std::uint32_t flush_max_ms_ = 100;
   // Minimum delay between transaction-generation rotations/cleaning rounds.
   // Zero disables the cleaner; it can be changed at runtime through CONFIG.
   std::uint32_t tx_cleaner_cooldown_ms_ = 60'000;

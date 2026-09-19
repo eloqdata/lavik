@@ -1,0 +1,164 @@
+[
+  {
+    "system": "lavik-spdk",
+    "workload": "get",
+    "archive_path": "flush100/runs/lavik-spdk/get.json",
+    "sha256": "e63a62507c559ad3fe43abb9383180a5f79739c0fb2056d2459ad2c0b8ff59b6"
+  },
+  {
+    "system": "lavik-spdk",
+    "workload": "mixed",
+    "archive_path": "flush100/runs/lavik-spdk/mixed.json",
+    "sha256": "6fafb12f54b55329e7b289236f35b96dc35a02bffdfb3b4df4eee950768917b4"
+  },
+  {
+    "system": "lavik-spdk",
+    "workload": "set",
+    "archive_path": "flush100/runs/lavik-spdk/set.json",
+    "sha256": "8e2c58eb01d5130b4ab0737ad808395978f379ae91935c94475f15afa96b7fd7"
+  },
+  {
+    "system": "lavik-raw",
+    "workload": "get",
+    "archive_path": "flush100/runs/lavik-raw/get.json",
+    "sha256": "85c23b049e999fccd56eef16dba45c17ce6a44d6b214200dfdc2a41ee225ecd9"
+  },
+  {
+    "system": "lavik-raw",
+    "workload": "mixed",
+    "archive_path": "flush100/runs/lavik-raw/mixed.json",
+    "sha256": "f5762c9e114118cdaf798914a9b8f1abb2e06bf8548dd8826ac78f187dd82f92"
+  },
+  {
+    "system": "lavik-raw",
+    "workload": "set",
+    "archive_path": "flush100/runs/lavik-raw/set.json",
+    "sha256": "a1d49e980444f8a43ba391135d1f232545a1bd97d4a5d7913fd1a53d9010f936"
+  },
+  {
+    "system": "lavik-files",
+    "workload": "get",
+    "archive_path": "flush100/runs/lavik-files/get.json",
+    "sha256": "256ab675867524164c4a251b9e3d45c570349658ce0b0ad48f7cdb01068818d1"
+  },
+  {
+    "system": "lavik-files",
+    "workload": "mixed",
+    "archive_path": "flush100/runs/lavik-files/mixed.json",
+    "sha256": "a7e3879d7dfdf7ceded459ec37cad55d9a0a9a97ce1df13575d999640ead06f7"
+  },
+  {
+    "system": "lavik-files",
+    "workload": "set",
+    "archive_path": "flush100/runs/lavik-files/set.json",
+    "sha256": "22e07130ed10b80d52b0a4d7466f8dea5f5affcc0e4071d55888566163a2b4e1"
+  },
+  {
+    "system": "garnet",
+    "workload": "get",
+    "archive_path": "baseline/runs/garnet/get.json",
+    "sha256": "15df609b58f1327f2fa8d0e830f9e461ccced7e1af1d50e95277966756679d8a"
+  },
+  {
+    "system": "garnet",
+    "workload": "mixed",
+    "archive_path": "baseline/runs/garnet/mixed.json",
+    "sha256": "790978f0ec1fc01c2e608bd4286e1534be10ad9d17657fb173052e0f34c32fe6"
+  },
+  {
+    "system": "garnet",
+    "workload": "set",
+    "archive_path": "baseline/runs/garnet/set.json",
+    "sha256": "73c4d4c95ae0f48bdb9f142c8d11ae01711852635a9105ba3aac849354bc2e64"
+  },
+  {
+    "system": "dragonfly",
+    "workload": "get",
+    "archive_path": "baseline/runs/dragonfly/get.json",
+    "sha256": "c9afda7255f1738aa346866f2adbf287ab6f0ddf7a96185784ebde48c6e9452e"
+  },
+  {
+    "system": "dragonfly",
+    "workload": "mixed",
+    "archive_path": "baseline/runs/dragonfly/mixed.json",
+    "sha256": "d7ea20a8ff34aca1ef84171f7d2ccdcbebcd0ad01d76633ac81122bb727ee4c5"
+  },
+  {
+    "system": "dragonfly",
+    "workload": "set",
+    "archive_path": "baseline/runs/dragonfly/set.json",
+    "sha256": "2afd3aeb8c9e48999ecf4df7ae3ae6c59a46dcf134131a13d5a8bbd053dffe2b"
+  },
+  {
+    "system": "pika",
+    "workload": "get",
+    "archive_path": "baseline/runs/pika/get.json",
+    "sha256": "1137889191731268eb498c497de0c6d4829956d64fcf3ec2fa1352f1b9f86488"
+  },
+  {
+    "system": "pika",
+    "workload": "mixed",
+    "archive_path": "baseline/runs/pika/mixed.json",
+    "sha256": "b7142da584bb1fa84634670c7043e1d3ddb3fa641f65f5895456fdc005b34bba"
+  },
+  {
+    "system": "pika",
+    "workload": "set",
+    "archive_path": "baseline/runs/pika/set.json",
+    "sha256": "d2ecee1eca60208304c044fb4430ec9d39e0578f9e6968fa165616846ded45e8"
+  },
+  {
+    "system": "kvrocks",
+    "workload": "get",
+    "archive_path": "baseline/runs/kvrocks/get.json",
+    "sha256": "ae41161b8184ac622d3ae7d29e697060c01a52dbc32b9b867a2f35c74a5ac254"
+  },
+  {
+    "system": "kvrocks",
+    "workload": "mixed",
+    "archive_path": "baseline/runs/kvrocks/mixed.json",
+    "sha256": "b8e3d98e482109424572d417845539872d58c2078cd3e7aa709da02b0d3d652d"
+  },
+  {
+    "system": "kvrocks",
+    "workload": "set",
+    "archive_path": "baseline/runs/kvrocks/set.json",
+    "sha256": "376bb648c99482ef125fe3407936fe824d3b1a9e3aee831cf00d83461e4f4672"
+  },
+  {
+    "system": "tendis",
+    "workload": "get",
+    "archive_path": "baseline/runs/tendis/get.json",
+    "sha256": "c638194e0aa3bda4707b38137b192a10c4be1f00149123be8e2b3edf850ee613"
+  },
+  {
+    "system": "tendis",
+    "workload": "mixed",
+    "archive_path": "baseline/runs/tendis/mixed.json",
+    "sha256": "11f5f356a137b01be980707b33a146d184b9925686d8c9c516582bc69f15aa93"
+  },
+  {
+    "system": "tendis",
+    "workload": "set",
+    "archive_path": "baseline/runs/tendis/set.json",
+    "sha256": "4fba7c667064cdb80a21d147f1fe00e55562e1d0a32a4ad745ed60b6c36fafdd"
+  },
+  {
+    "system": "keydb",
+    "workload": "get",
+    "archive_path": "baseline/runs/keydb/get.json",
+    "sha256": "fee3f0cbd35a1b407206c1356a8b768eeb7445d732ea503c56e1e528aaa0f048"
+  },
+  {
+    "system": "keydb",
+    "workload": "mixed",
+    "archive_path": "baseline/runs/keydb/mixed.json",
+    "sha256": "ef36990251f1f449dc8fe87ef33200e2afb29cc338410014da9481240488af1a"
+  },
+  {
+    "system": "keydb",
+    "workload": "set",
+    "archive_path": "baseline/runs/keydb/set.json",
+    "sha256": "315f12f79eb4c730225d754cdce464e5e4440e81c0ae2eb6c30220ac38b9cf7c"
+  }
+]

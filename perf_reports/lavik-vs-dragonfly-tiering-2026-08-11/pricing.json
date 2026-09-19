@@ -1,0 +1,44 @@
+{
+  "machine": {
+    "vmSize": "Standard_L16aos_v4",
+    "location": "japaneast",
+    "zone": "3",
+    "osType": "Linux"
+  },
+  "currency": "USD",
+  "purchase_model": "Linux pay-as-you-go retail, no discounts",
+  "hourly_rate": "2.128",
+  "monthly_hours": 730,
+  "monthly_estimate": "1553.44",
+  "source_url": "https://prices.azure.com/api/retail/prices?%24filter=serviceName+eq+%27Virtual+Machines%27+and+armRegionName+eq+%27japaneast%27+and+armSkuName+eq+%27Standard_L16aos_v4%27&currencyCode=%27USD%27",
+  "retrieved_at": "2026-09-19T01:31:34.472058+00:00",
+  "selected_meter": {
+    "currencyCode": "USD",
+    "tierMinimumUnits": 0.0,
+    "retailPrice": 2.128,
+    "unitPrice": 2.128,
+    "armRegionName": "japaneast",
+    "location": "JA East",
+    "effectiveStartDate": "2025-10-01T00:00:00Z",
+    "meterId": "ac5b1b40-db13-5d98-a95a-cb8d79fc87c6",
+    "meterName": "L16aos v4",
+    "productId": "DZH318Z0FXBV",
+    "skuId": "DZH318Z0FXBV/00FS",
+    "productName": "Virtual Machines Laosv4 Series",
+    "skuName": "L16aos v4",
+    "serviceName": "Virtual Machines",
+    "serviceId": "DZH313Z7MMC8",
+    "serviceFamily": "Compute",
+    "unitOfMeasure": "1 Hour",
+    "type": "Consumption",
+    "isPrimaryMeterRegion": true,
+    "armSkuName": "Standard_L16aos_v4"
+  },
+  "excludes": [
+    "benchmark client",
+    "managed disks",
+    "network charges",
+    "taxes"
+  ],
+  "scope": "All local database configurations share this server VM; Azure Managed Redis is outside this rerun."
+}

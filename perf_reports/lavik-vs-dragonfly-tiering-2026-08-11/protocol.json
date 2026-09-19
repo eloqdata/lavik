@@ -1,0 +1,64 @@
+{
+  "main_revision": "b0dbb38fe36863fe5458cab42853529c5a5ba1eb",
+  "lavik_release": "v0.1.0-beta.1",
+  "keys": 200000000,
+  "key_prefix": "kv_",
+  "value_bytes": [
+    1000,
+    4000
+  ],
+  "value_distribution": "uniform random",
+  "fill_connections": 640,
+  "formal_client_threads": 8,
+  "formal_connections": 80,
+  "formal_seconds": 300,
+  "workloads_in_order": [
+    "get",
+    "mixed",
+    "set"
+  ],
+  "reload": "one fresh full load per product/backend; three formal workloads share that load",
+  "nvme_serials": [
+    "40291d45b421bc880001",
+    "40291d45b421bc880002",
+    "40291d45b421bc880003",
+    "40291d45b421bc880004",
+    "40291d45b421bc880005",
+    "40291d45b421bc880006"
+  ],
+  "peer_versions": {
+    "dragonfly": "1.40.1",
+    "garnet": "2.1.3",
+    "kvrocks": "2.16.0",
+    "pika": "v4.0.3 (binary reports 4.0.2)",
+    "tendis": "2.8.4-rocksdb-v8.5.3",
+    "keydb": "6.3.4"
+  },
+  "scope": "local storage group only; Azure Managed Redis excluded",
+  "disk_count": 6,
+  "user_confirmed_scope": {
+    "nvme_disks": 6,
+    "local_storage_group_only": true,
+    "recorded_at": "2026-09-18T19:24:56.881036+00:00"
+  },
+  "lavik_flush_max_ms": 100,
+  "lavik_result_source": "flush100/runs",
+  "peer_result_source": "baseline/runs",
+  "lavik_binary_source": "Official published v0.1.0-beta.1 executable with explicit --flush-max-ms=100; not rebuilt for the benchmark",
+  "lavik_sampling": "Additional read-only INFO/DEFRAG samples every 5 seconds in flush rerun",
+  "defrag_settings": {
+    "fill_get": {
+      "max_active_per_device": 8,
+      "block_sleep_ms": 0
+    },
+    "mixed": {
+      "max_active_per_device": 2,
+      "block_sleep_ms": 15
+    },
+    "set": {
+      "max_active_per_device": 6,
+      "block_sleep_ms": 0
+    },
+    "record_sleep_us": 0
+  }
+}

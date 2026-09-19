@@ -1,0 +1,36 @@
+{
+  "lavik": {
+    "path": "/mnt/dev/peer-bench/tiering-beta1-retest-2026-09-18/downloads/lavik-v0.1.0-beta.1-linux-x86_64/lavik",
+    "sha256": "b14da83ef4f3146848e8b27f4c556d01696e8f28398cf38f3a97bd68d68b1a31"
+  },
+  "dragonfly": {
+    "path": "/mnt/dev/peer-bench/dragonfly/dragonfly-v1.40.1",
+    "sha256": "1d2b6654f4488ebc3f6cd5061199158880f6d957534705cd548a909108507b8b"
+  },
+  "garnet": {
+    "path": "/mnt/dev/peer-bench/tiering-beta1-retest-2026-09-18/downloads/garnet/net10.0/GarnetServer",
+    "sha256": "a91d470ae5dfc628b332f2f988898390c0ffedaf8630df54892f6117efb236ef",
+    "runtime": "Microsoft.NETCore.App 10.0.11",
+    "packaging_adjustments": "libnative_device.so copied into runtimes/linux-x64/native and libaio SONAME changed to libaio.so.1t64; no product source changes"
+  },
+  "pika": {
+    "path": "/mnt/dev/peer-bench/tiering-beta1-retest-2026-09-18/sources/pika/output/pika",
+    "sha256": "89448f5131d61e3effed23ec834ec1c5be757710e6067b55e20afdef772bda99",
+    "source_revision": "d16db1eee9aadb1db42338269936deb7b584ddcc"
+  },
+  "tendis": {
+    "path": "/mnt/dev/peer-bench/tiering-beta1-retest-2026-09-18/downloads/tendis/tendisplus-2.8.4-rocksdb-v8.5.3/bin/tendisplus",
+    "sha256": "b1646168115e19ed8c1f92099183bdfa422786e3978541d3c45f57047af9d302"
+  },
+  "kvrocks": {
+    "path": "/mnt/dev/peer-bench/tiering-beta1-retest-2026-09-18/sources/kvrocks/build/kvrocks",
+    "sha256": "e1b91029b6e1ac74034c946428345ce853a9ee5d1b3c851249efdf3d3a5b734f",
+    "source_revision": "28440b5cba12a791b058713cbbae4ef86fbf37a2"
+  },
+  "keydb": {
+    "path": "/mnt/dev/peer-bench/tiering-beta1-retest-2026-09-18/sources/keydb/src/keydb-server",
+    "sha256": "574ab8528897b9f8221cdfd2aed9e0a6afd350568d204ff16c1a2d4601c91fc8",
+    "source_revision": "7e7e5e57d25fe246a8201f0acf5e7363c0bf1e14",
+    "build_adjustments": "two cstdint includes for GCC 13; link RocksDB detected liburing/gflags/numa dependencies; see host/keydb-build.patch"
+  }
+}
