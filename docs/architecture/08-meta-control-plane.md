@@ -18,33 +18,22 @@ limitations under the License.
 
 ## Boundary and state model
 
-`lavik-meta` is a separate C++ process for durable cluster metadata. It
-embeds NuRaft and uses its native Asio service for Raft peer sockets, timers,
-and TLS. One Bycorf worker owns the configured Unix and/or TCP administrative
-listeners and the process-lifetime Data-control listener; a bounded proposal
-executor keeps
-synchronous NuRaft API entry and WAL I/O off that worker. NuRaft and
-proposal-executor threads return typed notifications or coroutine handles
-through Bycorf's foreign MPSC mailbox, which reuses the worker's normal wake
-sequence and eventfd. The main Lavik data-plane executable remains
-Raft-free. Followers keep accepting Data connections long enough to return the
-committed member directory and leader hint. Only a caught-up leader installs
-the publisher that may create sessions, project desired state, evaluate lease
-challenges, or accept results, and starts the leader-local Automatic Failover
-Detector. Demotion cancels those owners and begins closing, then joins, all
-sessions and leader-scoped tasks from its leadership generation before the
-coordinator reports the transition complete. Shutdown first stops the
-creation, membership, Automatic Failover Detector, and Failover Transition
-reconcilers without waiting for remote results, then
-cancels administrative result waits and drains every listener, then quiesces Data
-sessions and
-all NuRaft/proposal-executor producers, waits for the foreign executor's
-accepted prefix to reach the Meta worker, and only then stops the generic Bycorf
-runtime. An active demotion or first shutdown drain is fail-stop if the worker
-mailbox cannot accept its notification: reporting success would permit a later
-leader epoch to reuse authority that was never revoked. Once shutdown has
-synchronously drained the worker, later reconciler cancellation and object
-destruction are no-ops and do not depend on a still-running executor.
+`lavik-meta` is a separate C++ process for durable cluster metadata. Its
+[Meta Raft runtime](10-meta-raft.md) embeds etcd-io/raft in a Go C archive and
+owns consensus, peer sockets, ordered persistence, application dispatch and
+snapshot files. The C++ state machine retains deterministic business semantics.
+One Bycorf worker owns Admin and Data-control sessions; bounded proposal work
+and cross-runtime completions use the existing foreign executor mailbox.
+The Data executable and operator client remain Raft-free.
+
+Followers return the committed member directory and leader hint. Only a leader
+with current-term application and fresh quorum evidence may start the publisher
+and Automatic Failover Detector. Demotion revokes that authority immediately,
+then cancels and joins all owners from its leadership generation. Shutdown stops
+workflow owners and ingress, drains proposals and all Go callback producers,
+waits for accepted foreign notifications, then stops Bycorf. A failed demotion
+notification is fail-stop; no later leader generation may reuse authority whose
+revocation was not delivered.
 
 The process exposes three independent network responsibilities. `--addr` is
 the local Raft listener, `--data-control-addr` accepts Data-node control
@@ -261,7 +250,7 @@ against the complete stores and must atomically produce `Created` with
 `cluster-created`, or `ProvisioningFailed` with an abort; validating only the
 operation half is not safe recovery. A no-op prune, stale revision, or other
 nominally whitelisted command is rejected before Raft append.
-The recovery reservation follows the actual NuRaft proposal until it resolves,
+The recovery reservation follows the actual Raft proposal until it resolves,
 even if its caller times out, so another recovery step cannot overtake an
 uncertain outcome. After enough state is removed, a successful snapshot clears
 the snapshot/WAL pressure rather than Data-local state synthesizing authority.
@@ -282,15 +271,15 @@ proposals cannot overbook the window.
 
 `MetaCoordinator` is the in-process API used by reconcilers, the Data-session
 publisher, and the administrative adapter. `Propose` accepts model commands
-rather than NuRaft types. On the leader it takes one atomic committed view,
+rather than Raft types. On the leader it takes one atomic committed view,
 applies fail-safe and
 registered semantic validation, injects the transport-authorized actor and a
 readable proposal time, encodes the current durable format, submits to
 Raft through the proposal executor, and returns the apply result carried by
-NuRaft's completion. It never re-reads a record that bounded audit rotation may
+Raft's completion. It never re-reads a record that bounded audit rotation may
 already have evicted. Followers return a not-leader status without appending.
 Membership workflows hold one exclusive leader-local lease through completion,
-so NuRaft never receives overlapping configuration changes.
+so Raft never receives overlapping configuration changes.
 
 Failover's registered proposal hook also closes the gap between a planner read
 and Raft append. At the coordinator's single proposal timestamp it rechecks the
@@ -308,7 +297,7 @@ the authoritative conflict check during apply.
 Committed subscribers atomically receive a complete `CommittedView`, its
 cursor, and a bounded ordered subscription. Replay can redeliver an index, so
 consumers deduplicate by index. Queue overflow cancels the subscription and
-requires resynchronization from a new full view. Each NuRaft role callback
+requires resynchronization from a new full view. Each Raft role callback
 synchronously records its exact edge in `MetaLeadershipRelay` before scheduling
 a Bycorf drain, so a stalled worker or coordinator cannot collapse a rapid
 Leader/Follower/Leader sequence into its final role. The relay also preserves
@@ -316,7 +305,7 @@ edges racing startup attachment and makes shutdown detachment a lifetime
 barrier. `MetaCoordinator` consumes one ordered event queue for reconciler
 registration and role edges. A Follower event always cancels and joins every
 leader reconciler, then invalidates volatile observations, before a later
-Leader event can restart anything. Promotion still waits for NuRaft to catch
+Leader event can restart anything. Promotion still waits for Raft to catch
 the state machine up.
 
 `MetaFailoverReconciler` is a leader-scoped, level-triggered driver. It starts
@@ -657,15 +646,15 @@ an Automatic Failover Detector decision, or another Meta message. Renewal
 synchronously expires an already-due lease before considering a replacement,
 so a late Ack cannot revive authority across the deadline.
 
-NuRaft's peer-response expiry uses active `CLOCK_MONOTONIC` time, so a Meta
+Raft's peer-response expiry uses active `CLOCK_MONOTONIC` time, so a Meta
 host suspend can otherwise preserve an old process's cached leader verdict
 while other members elect a replacement. A leader-scoped Data-control task
 continuously compares that clock with `CLOCK_BOOTTIME`, including when no Data
 session is active; accumulated suspend divergence of at least
 `D` closes the leadership generation's authority sessions and synchronously
-requests immediate NuRaft resignation. In a multi-member cluster the old
-generation cannot become eligible again. NuRaft intentionally keeps a sole
-member leader, so that case must instead run for another full `D` of active
+requests immediate Raft resignation. In a multi-member cluster the old
+generation cannot become eligible again. A sole
+member may reopen leadership only after running for another full `D` of active
 time; a further suspend restarts the wait. Live control boundaries, directives,
 result proposals, and grants all pass this barrier. It covers the same-identity
 case whose ordinary `2D` handoff entry matured before suspension.
@@ -787,100 +776,20 @@ yield/resume revalidation lifecycle.
 
 ## Durability and recovery
 
-The durable source of truth is the newest completed state-machine snapshot plus
-the following Raft WAL. Snapshot capture serializes an exact applied-index cut
-under the state-machine mutex, excluding committed apply; a writer thread
-performs file I/O after capture. A snapshot becomes eligible for log compaction
-only after its atomic durable publication succeeds. Incoming snapshots are
-size-bounded, decoded completely, and installed synchronously as one replacement
-state.
-
-Election log freshness includes the compacted prefix: RequestVote compares the
-last logical log term first, then its index. When no WAL suffix remains, the
-snapshot's last-included index and term supply that boundary, including after
-restart. A surviving WAL suffix supplies its own last entry instead. Compaction
-therefore cannot make a current voter consider an older candidate up to date.
-
-WAL v1 uses checksum-protected `log-<first-index>.seg` files. Segments roll at
-a size trigger. Compaction writes the complete surviving suffix to a synced
-`compact-<first-index>.ready` intent before replacing the old segment set;
-startup finishes such an intent after a crash. A reported pre-publication
-failure leaves both the live index and old segments authoritative. Append
-batches become durable at NuRaft's flush hooks;
-membership state and vote state use atomic rename plus file and directory
-sync. Recovery retains the intact contiguous prefix and truncates a torn tail.
-A checksum-valid segment or compact-intent header with an unsupported format
-version is rejected before recovery modifies any files.
-The older prototype's `raft_log.dat` and `LSN1` snapshots are intentionally
-incompatible and cause startup to fail with an explicit format error.
-
-Before NuRaft opens its network or election timer, a pristine initial member
-loads the canonical full Meta vector from `--initial-cluster-manifest` and
-atomically publishes it as `cluster_config.dat`. A one-, three-, or five-voter
-genesis differs only in vector length. Every member starts the same ordinary
-randomized election; there is no distinguished bootstrap candidate. The
-manifest is rejected once any durable config exists and is never read on
-restart. `initial_bindings.dat` retains that exact genesis descriptor set
-until local committed apply has observed every identity binding. It
-survives election-time config copies and restarts, then is atomically removed
-after `initial_bindings_complete.dat` is published as a permanent tombstone;
-the tombstone prevents a completed zero-index genesis from being mistaken for
-the config-first publication crash prefix. A pristine process with no manifest
-instead persists
-`waiting_joiner.dat` before its singleton placeholder config and disables its
-initial election. That marker makes restart and partial dynamic-join catch-up
-remain election-disabled, and is durably removed only after the joiner applies
-the identity bindings through its committed config entry. An invite may
-publish that config before the joiner receives a WAL segment; the marker keeps
-that recoverable prefix distinct from an incomplete ordinary member.
-The first persisted NuRaft vote also publishes `raft_started.dat` before the
-vote itself. For genesis and ordinary members this irreversible boundary makes
-loss of both the vote and WAL distinguishable from a process that never opened
-Raft; waiting joiners retain their explicitly narrower pre-WAL recovery rule.
-
-After either lifecycle converges, `transport_bindings.dat` records the exact
-full descriptor set and the state-machine watermark that proved or followed
-its identity bindings. An ordinary restart may use those descriptors only
-while replay remains below that watermark. Committed dynamic membership
-changes reuse the same baseline: `save_config()` publishes a bounded
-`transport_bindings.next`, replaces `cluster_config.dat`, and durably promotes
-the candidate. Recovery either discards a candidate paired with the old config
-or completes a candidate paired with the new config; any other pairing fails
-closed. Snapshot installation uses the validated snapshot's embedded NuRaft
-configuration and identity projection to update this same config/baseline pair
-and finish local genesis or join catch-up. Retired genesis bindings still prove
-that initialization completed; they grant no active membership. Extra bindings
-may belong to the normal two-phase membership workflow.
-
-The durable snapshot also supplies redo evidence for an interrupted installation.
-Before transport or elections start, recovery validates the complete snapshot
-and compares configuration-entry indices. A newer snapshot configuration replaces
-an older disk configuration; equal-index configurations must agree. A later disk
-configuration must lie beyond the snapshot's applied index and match its exact
-surviving WAL entry. Election-disabled waiting joiners retain their narrower
-invite-before-WAL exception. A snapshot that precedes binding completion preserves
-the matching baseline's later replay watermark. Conflicting or insufficient
-evidence fails startup; a covered membership entry can never disappear merely
-because compaction removed it from the WAL.
-
-This is Raft transport recovery state, not a Cluster Create operation
-or membership workflow record. Config indices, a genesis completion tombstone,
-the Raft-started marker, or a transport baseline require the matching server
-state and segmented WAL to exist. Missing, oversized, truncated, or
-contradictory state fails closed rather than replaying genesis.
-
-The persisted state-machine watermark is the snapshot index, not every applied
-WAL index. After restart, a post-snapshot tail remains invisible until Raft
-legally reconfirms it with a current-term quorum; depending on the elected
-leader, it is then committed as a prefix or overwritten. With no quorum the
-Meta plane is unavailable rather than exposing an unconfirmed decision.
-Client timeouts therefore mean an uncertain outcome and must be resolved by
-the operation's stable idempotency key.
+The durable source of truth is the newest published etcd snapshot plus the
+following Raft WAL. The [runtime document](10-meta-raft.md#durable-root-and-recovery)
+defines publication, compaction, crash recovery, genesis and join evidence.
+C++ snapshot capture excludes later application and labels exactly the captured
+cut. Installation validates the whole candidate before replacing any store.
+The stored application watermark is the snapshot index; recovery replays only
+the WAL's persisted committed suffix before opening peer ingress. Uncommitted
+entries require subsequent Raft commitment and may instead be replaced.
+A timeout remains an uncertain proposal outcome, reconciled by operation ID.
 
 ## Format compatibility
 
 The Meta/Data control wire, commands, stores, records, operation intents,
-exports, snapshots, physical segmented WAL, Admin binary payloads, and
+exports, Admin binary payloads, and
 cluster-status JSON schema use their current v1 layouts. Before Lavik's
 first stable release, development layouts are replaced in place for fresh
 clusters without a legacy decoder, migration, or mixed-layout negotiation.
@@ -893,9 +802,10 @@ snapshots retain registered-family raw histories and typed-decodable current
 values.
 
 Every configured Meta identity has one canonical concrete numeric Data-control
-endpoint and one canonical concrete numeric Admin endpoint. NuRaft's
-`srv_config::aux` `LMI1` descriptor carries the server id, derived principal,
-and both endpoints; Raft keeps its endpoint in the native field. The descriptor
+endpoint and one canonical concrete numeric Admin endpoint. The C++ `LMI1`
+descriptor carries server id, principal and both endpoints. The bridge carries
+these decoded fields and the Raft endpoint in committed configuration contexts
+and snapshots. The descriptor
 and committed identity binding must agree exactly. Advertised Data-control and
 Admin addresses may route through an explicit proxy instead of equaling local
 binds; restart may likewise rebind a Raft listener behind a transport proxy
@@ -907,40 +817,19 @@ committed directory together; partial descriptors are rejected.
 Incompatible development data directories are recreated. Meta has no in-band
 schema-switch command; incompatible changes require coordinated replacement
 of communicating binaries. Readers reject unknown markers, malformed fields,
-and trailing bytes, including in the segmented WAL; these checks cannot detect
-every incompatible same-marker layout.
+and trailing bytes; the etcd WAL and snapshot readers validate their own framing
+and checksums. These checks cannot detect every incompatible same-marker layout.
 
 ## Authentication, membership, and audit
 
-Raft transport is plaintext by default, matching the data-plane deployment
-model. It still checks claimed source and destination ids against NuRaft
-configuration descriptors and committed identity-store bindings, but those
-claims are not cryptographically authenticated; deployments whose network is
-not fully trusted enable optional mutual TLS. The Raft verifier requires
-exactly one recognized canonical `lavik://meta/<server-id>` URI SAN but
-ignores unrelated URI SANs; certificates reused by Data control are subject to
-the stricter total-URI rule below. An IP or DNS SAN covers the advertised Raft
-endpoint. The NuRaft configuration
-identity descriptor, the CA-authenticated certificate, and the committed
-identity-store binding must all match the claimed source id; neither the
-configuration nor the store binding grants membership alone. During
-manifest-bootstrapped genesis, the complete config descriptor may temporarily
-stand in for a not-yet-applied binding only while the durable initial-binding
-marker names that unchanged descriptor set. The membership reconciler commits
-missing bindings in server-id order; every member closes its local marker
-synchronously when committed log or snapshot apply proves convergence.
-Transport checks identity and reads recovery state without advancing that
-lifecycle. A dynamic waiting joiner has a second narrow catch-up window only
-while its durable waiting marker is
-present. Replaying a pre-add config cannot close that window: the marker is
-removed only after the installed config includes the local id, every descriptor
-binding is visible, and the state machine has applied through that config
-index. The config can arrive before the earlier binding command. With
-mTLS these windows also require the exact certificate identity; plaintext
-deployments rely on network isolation. Ordinary replay uses only the exact
-descriptor set in `transport_bindings.dat`, only below its recorded watermark;
-at or above that cut a config descriptor never substitutes for a missing or
-conflicting binding.
+Raft transport is plaintext by default and optional mTLS authenticates the
+canonical Meta principal against the CA and committed descriptor. Plaintext
+membership checks rely on network isolation. The runtime publishes a small
+immutable peer authorization view after actual identity/configuration apply;
+network and heartbeat paths never copy `MetaStores` or take its state lock.
+Genesis and waiting-joiner grace are bounded by durable evidence and the applied
+cut described in [Meta Raft](10-meta-raft.md#durable-root-and-recovery).
+Retirement always wins over grace and queued connections.
 
 Initial identity recovery is not a Cluster Create child operation. The
 existing `MetaMembershipReconciler` holds the shared membership gate, compares
@@ -950,19 +839,20 @@ descriptor conflict fails closed. Once this convergence is complete, the
 same reconciler handles only ordinary reusable membership workflows.
 
 Dynamic membership is a leader-owned `meta-membership-workflow-v1` operation.
-Before either identity or NuRaft mutation, Admin commits a bounded versioned
+Before either identity or Raft mutation, Admin commits a bounded versioned
 intent containing the requested target, all three endpoints, principal, and
 the baseline peer descriptors and identity bindings. Peer descriptors retain
 voter/joiner flags, priority and data-center attributes; election-only config
 log indices are not semantic membership changes. A recovered owner accepts
-only that exact baseline or requested post-state, never overwrites a changed
+only that exact baseline, the expected learner intermediate state, or requested post-state, never overwrites a changed
 peer set or reactivates a retired identity. Legacy partial changes without an
 intent are not inferred as authorized workflows.
 
 `MetaMembershipReconciler` scans the recovered non-terminal journal on each
 leader transition. Add binds identity before invoking `add_srv`; remove
 observes the committed configuration without the member before retiring its
-identity. NuRaft's accepted invite/leave result is not a commit certificate.
+identity. Learner promotion additionally requires fresh actual application
+through the current commit. Submission alone is not a commit certificate.
 The owner checks the actual committed configuration, checkpoints each phase,
 and completes the operation only after all effects are present. Recovery also
 handles a crash between an effect and its phase checkpoint. If the removal
@@ -975,12 +865,12 @@ the existing task; conflicting requests cannot bypass it after timeout or restar
 Generic Admin submit/complete/abort commands cannot create or abandon a
 membership workflow. A timed-out invite can still commit, so cancelling its
 wait does not release this reservation. Demotion joins only queued/local
-NuRaft API entry and local proposals; remote-result callbacks own inert result
+Raft API entry and local proposals; remote-result callbacks own inert result
 storage, not a reconciler or leader context. The next owner retries from the
 committed state. Incompatible recovery retains an inspectable
 `recovery-required` phase instead of guessing a rollback.
 The retired binding also disambiguates the short interval after removal commits
-but before NuRaft publishes its new in-memory configuration. Reactivation of
+but before Raft publishes its new in-memory configuration. Reactivation of
 retired principals is rejected. Every member commits numeric Data-control and
 Admin endpoints in canonical `IPv4:port` or `[IPv6]:port` spelling. Data seeds
 use the former directory; operator discovery uses the latter. Neither
@@ -1175,13 +1065,10 @@ Creation and Meta membership changes share admission, with the durable
 Before changing Data topology, the root remains in `wait-meta-barrier`. Its
 submit log index is the fixed barrier `B`: every remote member in the genesis
 configuration must have a recent transport-verified response and report a
-state-machine commit index at least `B`. NuRaft peer-SM tracking remains
-enabled on followers so their responses carry that index. A leader enables it
-only while this phase is active, because the same NuRaft switch also delays
-ordinary client completion until every peer applies the write; outside the
-genesis barrier, leader proposals retain normal majority availability. The
+state-machine commit index at least `B`. Raft heartbeats always report actual
+application progress, independently of ordinary durable-majority completion. The
 reconciler also requires exact agreement among the manifest Meta vector,
-NuRaft descriptors, committed
+Raft descriptors, committed
 identity bindings, and both advertised Meta directories. It never calls
 `add_srv`; initial membership already exists as the full genesis
 configuration. Cluster Create retains the shared membership admission gate
@@ -1302,11 +1189,11 @@ audit history rather than replacing it.
 | Pure Owner Serviceability cut, causal lease confirmation, leader-local detector state, automatic Begin adapter, and generation-bracketed diagnostics | `include/lavik/meta/owner_serviceability.h`, `src/meta/owner_serviceability.cpp`, `include/lavik/meta/automatic_failover_detector.h`, `src/meta/automatic_failover_detector.cpp`, `include/lavik/meta/automatic_failover_reconciler.h`, `src/meta/automatic_failover_reconciler.cpp` |
 | Volatile candidate/failover observations and deterministic compatibility-domain plan selection | `include/lavik/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/lavik/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
 | Pure per-node projection including resolved lease duration, Data-derived heartbeat cadence, and failover/activation/follow-owner state, plus the leader-scoped Data-session publisher and causal heartbeat admission | `include/lavik/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/lavik/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
-| Manifest-bootstrapped initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `include/lavik/meta/nuraft_state_mgr.h`, `src/meta/nuraft_state_mgr.cpp`, `app/lavik_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |
+| Manifest-bootstrapped initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `raft/engine/storage.go`, `raft/engine/join.go`, `app/lavik_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |
 | Atomic Genesis lifecycle, strict Bootstrap Policy Defaults, durable creation admission, Meta catch-up barrier, and leader-owned recovery | `include/lavik/meta/cluster_create.h`, `src/meta/cluster_create.cpp`, `include/lavik/meta/topology_store.h`, `src/meta/topology_store.cpp`, `src/meta/state_apply.cpp`, `src/meta/ctl_server.cpp`, `include/lavik/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `app/lavik_meta.cpp` |
 | Durable post-genesis Meta membership intent, exact-config recovery, leadership handoff, and identity retirement | `include/lavik/meta/membership_reconciler.h`, `src/meta/membership_reconciler.cpp`, `src/meta/ctl_server.cpp`, `src/meta/state_apply.cpp`, `tests/meta_integration/gate_membership_recovery.py` |
 | Shared Meta/Data frame, object-transfer, failover observation, transition, and activation formats | `include/lavik/cluster/control_protocol.h`, `include/lavik/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
-| Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/lavik/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |
+| Asynchronous Raft protocol, WAL, snapshots, authentication and quorum liveness | [Meta Raft runtime](10-meta-raft.md), `raft/engine/`, `include/lavik/meta/raft.h`, `src/meta/raft.cpp`, `src/meta/proposal_executor.cpp` |
 | Meta session transport retirement and Connection-storage lifetime | `src/meta/ctl_server.cpp`, `src/meta/data_control_server.cpp`, `bycorf/include/bycorf/net/connection.h`, `bycorf/src/runtime/worker.cpp` |
 | Foreign-thread typed completion ingress and worker wakeup | `bycorf/include/bycorf/runtime/foreign_executor.h`, `bycorf/src/runtime/foreign_executor.cpp`, `bycorf/include/bycorf/runtime/cross_core.h`, `bycorf/src/runtime/worker.cpp` |
 | TLS identity, RBAC, Unix peer credentials, Admin transport, cluster status, controlled failover, and initial cluster creation | `include/lavik/meta/identity_verifier.h`, `include/lavik/meta/ctl_server.h`, `include/lavik/meta/admin_client.h`, `include/lavik/meta/cluster_status.h`, `include/lavik/meta/cluster_create.h`, `include/lavik/meta/failover_admin.h`, `app/lavik_meta.cpp`, `app/lavik_ctl.cpp`, `bycorf/src/net/` |

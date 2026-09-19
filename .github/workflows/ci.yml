@@ -65,13 +65,17 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: raft/go.mod
+          cache-dependency-path: raft/go.sum
+
       - name: Initialize runtime dependencies
         # Public submodules use the exact gitlinks from the tested commit.
         # SPDK and its transitive dependencies are only needed by hardware builds.
         run: |
-          git submodule update --init --depth 1 bycorf third_party/mimalloc third_party/nuraft
+          git submodule update --init --depth 1 bycorf third_party/mimalloc
           git -C bycorf submodule update --init --depth 1 third_party/abseil third_party/liburing
-          git -C third_party/nuraft submodule update --init --depth 1 asio
       - name: Install build and test dependencies
         run: |
           sudo apt-get update
@@ -83,6 +87,8 @@ jobs:
           sudo sysctl -w kernel.io_uring_disabled=0
           # Large-collection fixtures create private regular files here.
           sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/dev
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l raft)"
       - name: Configure
         # Debug enables the Meta fault hooks as well as the Data crash tests.
         run: |
@@ -101,6 +107,21 @@ jobs:
         run: |
           # Registered io_uring buffers must not depend on the runner's memlock limit.
           sudo prlimit --pid "$$" --memlock=unlimited
+          # Exercise the hardware safety gate with an unmounted private loop
+          # device. Actual NVMe/SPDK scenarios still require a hardware host.
+          scratch_image=$(mktemp "$RUNNER_TEMP/lavik-ci-gate.XXXXXX")
+          scratch_device=
+          cleanup() {
+            if [[ -n "$scratch_device" ]]; then
+              sudo losetup --detach "$scratch_device"
+            fi
+            rm -f -- "$scratch_image"
+          }
+          trap cleanup EXIT
+          truncate -s 16M "$scratch_image"
+          scratch_device=$(sudo losetup --find --show "$scratch_image")
+          export LAVIK_CLUSTER_HARDWARE_OPT_IN=1
+          export LAVIK_CLUSTER_SCRATCH_DEVICE="$scratch_device"
           ./scripts/run_ci_tests.sh build_ci
       - name: Upload test results
         if: ${{ !cancelled() }}

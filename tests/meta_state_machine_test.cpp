@@ -14,22 +14,13 @@
  * limitations under the License.
  */
 
-// Tests for MetaStateMachine and its integration with the WAL v1
-// NuraftLogStore through a real raft_server.
+// MetaStateMachine component tests exercise direct apply, exact-cut owned
+// snapshots, atomic installation, replay/audit uniqueness, and fail-stop on
+// invalid committed commands. Component snapshot files are test fixtures;
+// crash-durable WAL and publication are tested by raft/engine.
 //
-// Vertical slices:
-//   1. Component contract: real commands committed directly into the state
-//      machine; kill/reopen recovery (close + reopen stands in for process
-//      restart; fdatasync-before-return is what makes it crash-safe);
-//      snapshot exact cut point; snapshot -> compact -> reopen; logical
-//      snapshot transmission; audit uniqueness under
-//      replay; domain-reject vs fail-stop classification (death test).
-//   2. Core-driven integration: a single-node raft_server running on the
-//      real adapters (NuraftStateMgr + WAL v1 NuraftLogStore +
-//      MetaStateMachine) proves the persistence ordering the Raft core
-//      relies on, replay-based recovery after restart, and clean shutdown
-//      across changes to peer commit tracking. These integration tests use
-//      the production state machine with real commands.
+// Integration tests run the production C ABI and Go etcd/raft runtime with a
+// single voter, covering committed replay, snapshot compaction, and shutdown.
 //
 // ACTOR ON THE WIRE: the command codec encodes the trusted-entry-injected
 // ActorContext (actor_principal, readable_time) as ordinary bounded fields of
@@ -61,14 +52,11 @@
 #include "lavik/meta/commands.h"
 #include "lavik/meta/encoding.h"
 #include "lavik/meta/hash.h"
-#include "lavik/meta/nuraft_log_store.h"
-#include "lavik/meta/nuraft_state_mgr.h"
 #include "lavik/meta/state_apply.h"
 #include "lavik/meta/state_machine.h"
-#include "libnuraft/nuraft.hxx"
-#include "libnuraft/raft_server_handler.hxx"
 #include "spdlog/sinks/ostream_sink.h"
 #include "spdlog/spdlog.h"
+#include "support/meta_raft.h"
 #include "support/test_data_path.h"
 
 namespace {
@@ -79,8 +67,6 @@ using lavik::meta::MetaCommand;
 using lavik::meta::MetaRequestId;
 using lavik::meta::MetaStateMachine;
 using lavik::meta::MetaStores;
-using lavik::meta::NuraftLogStore;
-using lavik::meta::NuraftStateMgr;
 using lavik::meta::RegisterNode;
 using lavik::meta::SubmitOperation;
 
@@ -198,7 +184,8 @@ CreateGroup MakeCreateGroup(const std::string& group_id,
 
 // Committed wire encoding wrapped for the raft log. nullptr on encode failure;
 // callers ASSERT_NE.
-nuraft::ptr<nuraft::buffer> EncodeOrDie(const MetaCommand& cmd) {
+std::shared_ptr<lavik::meta::MetaRaftBuffer> EncodeOrDie(
+    const MetaCommand& cmd) {
   auto encoded = MetaStateMachine::EncodeCommand(cmd);
   EXPECT_TRUE(encoded.ok()) << encoded.status();
   if (!encoded.ok()) return nullptr;
@@ -239,76 +226,37 @@ class MetaStateMachineTest : public ::testing::Test {
   void SetUp() override { dir_ = MakeTestDir("w3a", "sm"); }
   void TearDown() override { RemoveTestDir(dir_); }
 
+  // Persistence belongs to the Go engine. These unit tests retain an owned
+  // image and explicitly restore through the same Install seam used by replay.
   absl::StatusOr<std::unique_ptr<MetaStateMachine>> Open() {
-    return MetaStateMachine::Open(dir_);
+    auto machine = MetaStateMachine::Open(dir_);
+    if (machine.ok() && captured_) {
+      auto status = (*machine)->Install(captured_->index, captured_->bytes);
+      if (!status.ok()) return status;
+    }
+    return machine;
   }
-
+  struct Image {
+    uint64_t index;
+    uint64_t term;
+    std::string bytes;
+  };
+  std::optional<Image> captured_;
   // Commits one encoded command at `log_idx` and returns the stores copy.
   void Commit(MetaStateMachine& machine, uint64_t log_idx,
               const MetaCommand& cmd) {
-    nuraft::ptr<nuraft::buffer> buf = EncodeOrDie(cmd);
+    std::shared_ptr<lavik::meta::MetaRaftBuffer> buf = EncodeOrDie(cmd);
     ASSERT_NE(buf, nullptr);
-    nuraft::ptr<nuraft::buffer> result = machine.commit(log_idx, *buf);
+    std::shared_ptr<lavik::meta::MetaRaftBuffer> result =
+        machine.commit(log_idx, *buf);
     ASSERT_NE(result, nullptr);
   }
 
-  // Drives create_snapshot and waits for the async writer thread to invoke
-  // when_done; snapshot file IO deliberately runs off the calling thread.
-  void CreateSnapshot(MetaStateMachine& machine, uint64_t log_idx,
-                      uint64_t log_term) {
-    nuraft::ptr<nuraft::cluster_config> config =
-        nuraft::cs_new<nuraft::cluster_config>();
-    nuraft::snapshot snap(log_idx, log_term, config);
-    std::mutex done_mutex;
-    std::condition_variable done_cv;
-    bool done = false;
-    bool result = false;
-    nuraft::async_result<bool>::handler_type handler =
-        [&](bool& ret, nuraft::ptr<std::exception>& err) {
-          EXPECT_EQ(err, nullptr);
-          std::lock_guard<std::mutex> lock(done_mutex);
-          done = true;
-          result = ret;
-          done_cv.notify_one();
-        };
-    machine.create_snapshot(snap, handler);
-    std::unique_lock<std::mutex> lock(done_mutex);
-    ASSERT_TRUE(done_cv.wait_for(lock, std::chrono::seconds(30), [&] {
-      return done;
-    })) << "snapshot writer thread never completed";
-    ASSERT_TRUE(result);
-  }
-
-  // Streams one snapshot's logical objects into the serialized MetaStores
-  // envelope (the exact bytes a follower would receive).
-  std::string StreamSnapshot(MetaStateMachine& machine,
-                             nuraft::snapshot& snap) {
-    std::string bytes;
-    void* ctx = nullptr;
-    uint64_t obj_id = 0;
-    bool is_last = false;
-    size_t objects = 0;
-    while (!is_last) {
-      nuraft::ptr<nuraft::buffer> data;
-      const int rc =
-          machine.read_logical_snp_obj(snap, ctx, obj_id, data, is_last);
-      EXPECT_EQ(rc, 0);
-      if (rc != 0) break;
-      if (data != nullptr && data->size() > 0) {
-        bytes.append(reinterpret_cast<const char*>(data->data_begin()),
-                     data->size());
-      }
-      ++obj_id;
-      ++objects;
-      EXPECT_LT(objects, 10000u);  // runaway protocol guard
-      if (objects >= 10000u) break;
-    }
-    machine.free_user_snp_ctx(ctx);
-    return bytes;
-  }
-
-  std::filesystem::path SnapshotPath(uint64_t log_idx) {
-    return dir_ / ("snapshot_" + std::to_string(log_idx) + ".dat");
+  void CreateSnapshot(MetaStateMachine& machine, uint64_t index,
+                      uint64_t term) {
+    auto bytes = machine.Capture(index);
+    ASSERT_TRUE(bytes.ok()) << bytes.status();
+    captured_ = Image{index, term, std::move(*bytes)};
   }
 
   std::filesystem::path dir_;
@@ -356,12 +304,11 @@ TEST_F(MetaStateMachineTest, LateConfigurationCallbackCannotRegressCursor) {
   std::unique_ptr<MetaStateMachine> machine = std::move(*opened);
 
   Commit(*machine, 2, MakeRegister(0x11));
-  nuraft::ptr<nuraft::cluster_config> config =
-      nuraft::cs_new<nuraft::cluster_config>();
-  machine->commit_config(/*log_idx=*/1, config);
+  // The new executor delivers all entry kinds in one ordered stream.
+  // A regressing completion is a protocol bug, never a cursor rollback.
+  EXPECT_DEATH(machine->Advance(1), "");
   EXPECT_EQ(machine->last_commit_index(), 2u);
-
-  machine->commit_config(/*log_idx=*/3, config);
+  machine->Advance(3);
   EXPECT_EQ(machine->last_commit_index(), 3u);
 }
 
@@ -398,7 +345,8 @@ TEST_F(MetaStateMachineTest, UndecodableCommitFailsStop) {
         auto opened = MetaStateMachine::Open(dir_);
         if (!opened.ok()) return;
         std::unique_ptr<MetaStateMachine> machine = std::move(*opened);
-        nuraft::ptr<nuraft::buffer> garbage = nuraft::buffer::alloc(3);
+        std::shared_ptr<lavik::meta::MetaRaftBuffer> garbage =
+            lavik::meta::MetaRaftBuffer::alloc(3);
         std::memcpy(garbage->data_begin(), "xyz", 3);
         machine->commit(1, *garbage);
       },
@@ -406,8 +354,10 @@ TEST_F(MetaStateMachineTest, UndecodableCommitFailsStop) {
 }
 
 TEST_F(MetaStateMachineTest, RestartWithoutSnapshotReplaysFromScratch) {
-  nuraft::ptr<nuraft::buffer> c1 = EncodeOrDie(MakeRegister(0x11));
-  nuraft::ptr<nuraft::buffer> c2 = EncodeOrDie(MakeRegister(0x22));
+  std::shared_ptr<lavik::meta::MetaRaftBuffer> c1 =
+      EncodeOrDie(MakeRegister(0x11));
+  std::shared_ptr<lavik::meta::MetaRaftBuffer> c2 =
+      EncodeOrDie(MakeRegister(0x22));
   ASSERT_NE(c1, nullptr);
   ASSERT_NE(c2, nullptr);
   {
@@ -426,7 +376,7 @@ TEST_F(MetaStateMachineTest, RestartWithoutSnapshotReplaysFromScratch) {
   ASSERT_TRUE(reopened.ok()) << reopened.status();
   std::unique_ptr<MetaStateMachine> machine = std::move(*reopened);
   EXPECT_EQ(machine->last_commit_index(), 0u);
-  EXPECT_EQ(machine->last_snapshot(), nullptr);
+  EXPECT_FALSE(captured_.has_value());
   EXPECT_EQ(machine->StoresSnapshot().identity_.NodeCount(), 0u);
 
   machine->commit(1, *c1);
@@ -476,9 +426,12 @@ TEST_F(
   complete.expected_revision_ = 0;
   complete.result_ = "cluster-created";
 
-  const nuraft::ptr<nuraft::buffer> root_bytes = EncodeOrDie(root);
-  const nuraft::ptr<nuraft::buffer> automatic_bytes = EncodeOrDie(automatic);
-  const nuraft::ptr<nuraft::buffer> complete_bytes = EncodeOrDie(complete);
+  const std::shared_ptr<lavik::meta::MetaRaftBuffer> root_bytes =
+      EncodeOrDie(root);
+  const std::shared_ptr<lavik::meta::MetaRaftBuffer> automatic_bytes =
+      EncodeOrDie(automatic);
+  const std::shared_ptr<lavik::meta::MetaRaftBuffer> complete_bytes =
+      EncodeOrDie(complete);
   ASSERT_NE(root_bytes, nullptr);
   ASSERT_NE(automatic_bytes, nullptr);
   ASSERT_NE(complete_bytes, nullptr);
@@ -518,7 +471,7 @@ TEST_F(
   apply_and_expect_rejected(*machine);
 }
 
-TEST_F(MetaStateMachineTest, SnapshotIsDurableAcrossRestart) {
+TEST_F(MetaStateMachineTest, SnapshotInstallRestoresAllStores) {
   {
     auto opened = Open();
     ASSERT_TRUE(opened.ok()) << opened.status();
@@ -528,19 +481,17 @@ TEST_F(MetaStateMachineTest, SnapshotIsDurableAcrossRestart) {
     Commit(*machine, 3, MakeCreateGroup("g1", 1));
     CreateSnapshot(*machine, /*log_idx=*/3, /*log_term=*/5);
 
-    nuraft::ptr<nuraft::snapshot> last = machine->last_snapshot();
-    ASSERT_NE(last, nullptr);
-    EXPECT_EQ(last->get_last_log_idx(), 3u);
-    EXPECT_EQ(last->get_last_log_term(), 5u);
+    ASSERT_TRUE(captured_.has_value());
+    EXPECT_EQ(captured_->index, 3u);
+    EXPECT_EQ(captured_->term, 5u);
   }
 
   auto reopened = Open();
   ASSERT_TRUE(reopened.ok()) << reopened.status();
   std::unique_ptr<MetaStateMachine> machine = std::move(*reopened);
   EXPECT_EQ(machine->last_commit_index(), 3u);
-  nuraft::ptr<nuraft::snapshot> last = machine->last_snapshot();
-  ASSERT_NE(last, nullptr);
-  EXPECT_EQ(last->get_last_log_idx(), 3u);
+  ASSERT_TRUE(captured_.has_value());
+  EXPECT_EQ(captured_->index, 3u);
   const MetaStores stores = machine->StoresSnapshot();
   EXPECT_EQ(stores.identity_.NodeCount(), 2u);
   EXPECT_TRUE(stores.topology_.GroupExists("g1"));
@@ -549,7 +500,7 @@ TEST_F(MetaStateMachineTest, SnapshotIsDurableAcrossRestart) {
 }
 
 TEST_F(MetaStateMachineTest,
-       UncontrolledFailoverTransitionIsDurableAcrossSnapshotRestart) {
+       UncontrolledFailoverTransitionSurvivesSnapshotInstall) {
   auto opened = Open();
   ASSERT_TRUE(opened.ok()) << opened.status();
   std::unique_ptr<MetaStateMachine> machine = std::move(*opened);
@@ -778,10 +729,10 @@ TEST_F(MetaStateMachineTest, SnapshotExactCutPoint) {
   Commit(*machine, 4, MakeRegister(0x44));
   EXPECT_EQ(machine->last_commit_index(), 4u);
 
-  nuraft::ptr<nuraft::snapshot> snap = machine->last_snapshot();
-  ASSERT_NE(snap, nullptr);
-  ASSERT_EQ(snap->get_last_log_idx(), 2u);
-  const std::string envelope = StreamSnapshot(*machine, *snap);
+  ASSERT_TRUE(captured_.has_value());
+  ASSERT_EQ(captured_->index, 2u);
+  const std::string envelope = captured_->bytes;
+  EXPECT_FALSE(machine->Capture(2).ok());
   auto snap_stores = MetaStores::Deserialize(envelope);
   ASSERT_TRUE(snap_stores.ok()) << snap_stores.status();
   EXPECT_EQ(snap_stores->identity_.NodeCount(), 2u);
@@ -800,8 +751,10 @@ TEST_F(MetaStateMachineTest, ReplayAfterSnapshotDoesNotGrowAudit) {
   // applied after the last snapshot are REPLAYED after a crash. Replay of
   // the same log index must produce the identical audit record — the window
   // keyed by log index does not grow during replay.
-  nuraft::ptr<nuraft::buffer> c4 = EncodeOrDie(MakeRegister(0x44));
-  nuraft::ptr<nuraft::buffer> c5 = EncodeOrDie(MakeRegister(0x55));
+  std::shared_ptr<lavik::meta::MetaRaftBuffer> c4 =
+      EncodeOrDie(MakeRegister(0x44));
+  std::shared_ptr<lavik::meta::MetaRaftBuffer> c5 =
+      EncodeOrDie(MakeRegister(0x55));
   ASSERT_NE(c4, nullptr);
   ASSERT_NE(c5, nullptr);
 
@@ -845,131 +798,42 @@ TEST_F(MetaStateMachineTest, ReplayAfterSnapshotDoesNotGrowAudit) {
   EXPECT_EQ(*stores.audit_.Serialize(), audit_before);
 }
 
-TEST_F(MetaStateMachineTest, LogicalSnapshotTransmissionRoundTrip) {
-  // Leader side: commit real commands and snapshot them.
-  auto leader_opened = Open();
-  ASSERT_TRUE(leader_opened.ok()) << leader_opened.status();
-  std::unique_ptr<MetaStateMachine> leader = std::move(*leader_opened);
-  Commit(*leader, 1, MakeRegister(0x11));
-  Commit(*leader, 2, MakeRegister(0x22));
-  Commit(*leader, 3, MakeCreateGroup("g1", 1));
-  CreateSnapshot(*leader, 3, 2);
-  nuraft::ptr<nuraft::snapshot> snap = leader->last_snapshot();
-  ASSERT_NE(snap, nullptr);
-
-  // Follower side: receive every logical object, then apply. The received
-  // snapshot is durable before apply (save_logical_snp_obj writes the file;
-  // apply_snapshot loads it).
-  std::filesystem::path follower_dir = MakeTestDir("w3a", "sm_follower");
-  auto follower_opened = MetaStateMachine::Open(follower_dir);
-  ASSERT_TRUE(follower_opened.ok()) << follower_opened.status();
-  std::unique_ptr<MetaStateMachine> follower = std::move(*follower_opened);
-
-  void* read_ctx = nullptr;
-  uint64_t obj_id = 0;
-  bool is_last = false;
-  bool is_first = true;
-  size_t objects = 0;
-  while (!is_last) {
-    nuraft::ptr<nuraft::buffer> data;
-    const int rc =
-        leader->read_logical_snp_obj(*snap, read_ctx, obj_id, data, is_last);
-    ASSERT_EQ(rc, 0);
-    ASSERT_NE(data, nullptr);
-    follower->save_logical_snp_obj(*snap, obj_id, *data, is_first, is_last);
-    is_first = false;
-    ++objects;
-    ASSERT_LT(objects, 10000u);  // runaway protocol guard
-  }
-  leader->free_user_snp_ctx(read_ctx);
-  EXPECT_GE(objects, 1u);
-
-  ASSERT_TRUE(follower->apply_snapshot(*snap));
-  {
-    const MetaStores leader_stores = leader->StoresSnapshot();
-    const MetaStores follower_stores = follower->StoresSnapshot();
-    EXPECT_EQ(follower_stores.identity_.NodeCount(), 2u);
-    EXPECT_TRUE(follower_stores.topology_.GroupExists("g1"));
-    EXPECT_EQ(follower_stores.topology_.TopologyEpoch(), 1u);
-    EXPECT_EQ(follower_stores.audit_.size(), 3u);
-    EXPECT_EQ(follower_stores.audit_.Serialize(),
-              leader_stores.audit_.Serialize());
-  }
-  EXPECT_EQ(follower->last_commit_index(), 3u);
-
-  // The received snapshot is durable: a fresh open sees the same state.
-  follower.reset();
-  auto reopened = MetaStateMachine::Open(follower_dir);
-  ASSERT_TRUE(reopened.ok()) << reopened.status();
-  follower = std::move(*reopened);
-  EXPECT_EQ(follower->StoresSnapshot().identity_.NodeCount(), 2u);
-  EXPECT_EQ(follower->last_commit_index(), 3u);
-  ASSERT_NE(follower->last_snapshot(), nullptr);
-  EXPECT_EQ(follower->last_snapshot()->get_last_log_idx(), 3u);
-  RemoveTestDir(follower_dir);
+TEST_F(MetaStateMachineTest, SnapshotInstallValidatesBeforeReplacingState) {
+  auto leader = Open();
+  ASSERT_TRUE(leader.ok());
+  Commit(**leader, 1, MakeRegister(0x11));
+  Commit(**leader, 2, MakeRegister(0x22));
+  Commit(**leader, 3, MakeCreateGroup("g1", 1));
+  const auto image = (*leader)->Capture(3);
+  ASSERT_TRUE(image.ok()) << image.status();
+  auto follower = Open();
+  ASSERT_TRUE(follower.ok());
+  ASSERT_TRUE((*follower)->Install(3, *image).ok());
+  EXPECT_EQ((*follower)->StoresSnapshot().audit_.Serialize(),
+            (*leader)->StoresSnapshot().audit_.Serialize());
+  EXPECT_EQ((*follower)->StoresSnapshot().identity_.NodeCount(), 2u);
+  EXPECT_TRUE((*follower)->StoresSnapshot().topology_.GroupExists("g1"));
+  EXPECT_EQ((*follower)->last_commit_index(), 3u);
+  EXPECT_FALSE((*follower)->Install(4, "corrupt image").ok());
+  EXPECT_FALSE((*follower)->Install(2, *image).ok());
+  EXPECT_EQ((*follower)->last_commit_index(), 3u);
+  EXPECT_EQ((*follower)->StoresSnapshot().audit_.Serialize(),
+            (*leader)->StoresSnapshot().audit_.Serialize());
 }
 
-TEST_F(MetaStateMachineTest, MidStreamPruneKeepsPinnedSnapshotStreamable) {
-  // Snapshot-sync livelock regression: pruning a snapshot whose read stream
-  // is still open
-  // fails the stream's next read, NuRaft resets the sync context on a failed
-  // read and restarts from object zero with the newest snapshot, so a
-  // follower whose stream time exceeded the snapshot interval could never
-  // complete a sync. A snapshot with an open read stream must stay alive
-  // until free_user_snp_ctx; only unpinned snapshots may be pruned.
-  auto opened = Open();
-  ASSERT_TRUE(opened.ok()) << opened.status();
-  std::unique_ptr<MetaStateMachine> machine = std::move(*opened);
-
-  Commit(*machine, 1, MakeRegister(0x11));
-  Commit(*machine, 2, MakeRegister(0x22));
-  Commit(*machine, 3, MakeRegister(0x33));
-  CreateSnapshot(*machine, 3, 1);
-
-  // Open a read stream on snapshot 3; the pin is held until free_user_snp_ctx
-  // even though this small envelope streams as a single last object.
-  nuraft::ptr<nuraft::snapshot> snap3 = machine->last_snapshot();
-  ASSERT_NE(snap3, nullptr);
-  ASSERT_EQ(snap3->get_last_log_idx(), 3u);
-  void* ctx = nullptr;
-  nuraft::ptr<nuraft::buffer> data;
-  bool is_last = false;
-  ASSERT_EQ(machine->read_logical_snp_obj(*snap3, ctx, 0, data, is_last), 0);
-  ASSERT_NE(ctx, nullptr);
-
-  // A newer snapshot arrives while the stream on 3 is (formally) open: the
-  // pinned snapshot survives the prune.
-  Commit(*machine, 4, MakeRegister(0x44));
-  CreateSnapshot(*machine, 4, 1);
-  EXPECT_TRUE(std::filesystem::exists(SnapshotPath(3)));
-  EXPECT_TRUE(std::filesystem::exists(SnapshotPath(4)));
-  // The open stream still serves its snapshot.
-  EXPECT_TRUE(is_last);
-  ASSERT_NE(data, nullptr);
-
-  machine->free_user_snp_ctx(ctx);
-
-  // Only after the pin is released does the next prune drop snapshots 3/4.
-  Commit(*machine, 5, MakeRegister(0x55));
-  CreateSnapshot(*machine, 5, 1);
-  EXPECT_FALSE(std::filesystem::exists(SnapshotPath(3)));
-  EXPECT_FALSE(std::filesystem::exists(SnapshotPath(4)));
-  EXPECT_TRUE(std::filesystem::exists(SnapshotPath(5)));
-
-  // A fresh read stream on a pruned snapshot fails with -1 (NuRaft's
-  // retry-with-newer signal) and allocates no cursor.
-  {
-    nuraft::ptr<nuraft::cluster_config> config =
-        nuraft::cs_new<nuraft::cluster_config>();
-    nuraft::snapshot stale_snap(3, 1, config);
-    void* stale_ctx = nullptr;
-    nuraft::ptr<nuraft::buffer> stale_data;
-    bool stale_last = false;
-    EXPECT_EQ(machine->read_logical_snp_obj(stale_snap, stale_ctx, 0,
-                                            stale_data, stale_last),
-              -1);
-    EXPECT_EQ(stale_ctx, nullptr);
-  }
+TEST_F(MetaStateMachineTest, CapturedImageRemainsOwnedWhileLiveStateAdvances) {
+  auto machine = Open();
+  ASSERT_TRUE(machine.ok());
+  Commit(**machine, 1, MakeRegister(0x11));
+  auto first = (*machine)->Capture(1);
+  ASSERT_TRUE(first.ok());
+  Commit(**machine, 2, MakeRegister(0x22));
+  auto second = (*machine)->Capture(2);
+  ASSERT_TRUE(second.ok());
+  const auto old = MetaStores::Deserialize(*first);
+  ASSERT_TRUE(old.ok());
+  EXPECT_EQ(old->identity_.NodeCount(), 1u);
+  EXPECT_NE(*first, *second);
 }
 
 TEST_F(MetaStateMachineTest, SubmitOperationSeqEqualsLogIndex) {
@@ -1009,422 +873,98 @@ TEST_F(MetaStateMachineTest, SubmitOperationSeqEqualsLogIndex) {
 }
 
 // ---------------------------------------------------------------------------
-// raft_server integration over the real adapters (single node)
+// MetaRaft integration over the real adapters (single node)
 // ---------------------------------------------------------------------------
 
-// Minimal real-time scheduler for driving the Raft core in tests: one thread
-// per delayed task. Cancelled tasks still wake and exit cheaply because
-// delayed_task::execute() checks the cancellation flag.
-class ThreadScheduler : public nuraft::delayed_task_scheduler {
- public:
-  ~ThreadScheduler() override { Shutdown(); }
-
-  void schedule(nuraft::ptr<nuraft::delayed_task>& task,
-                nuraft::int32 milliseconds) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (stopped_) return;
-    threads_.emplace_back([this, task, milliseconds]() {
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        stopped_cv_.wait_for(lock, std::chrono::milliseconds(milliseconds),
-                             [this] { return stopped_; });
-      }
-      if (!stopped_) task->execute();
-    });
-  }
-
-  void Shutdown() {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      stopped_ = true;
-    }
-    stopped_cv_.notify_all();
-    for (std::thread& thread : threads_) {
-      if (thread.joinable()) thread.join();
-    }
-  }
-
- private:
-  // delayed_task::cancel() already flips the flag execute() checks, so no
-  // scheduler-side bookkeeping is needed.
-  void cancel_impl(nuraft::ptr<nuraft::delayed_task>& task) override {}
-
-  std::mutex mutex_;
-  std::condition_variable stopped_cv_;
-  bool stopped_ = false;
-  std::vector<std::thread> threads_;
-};
-
-// Single-node clusters never open peer connections.
-class NullRpcClientFactory : public nuraft::rpc_client_factory {
- public:
-  nuraft::ptr<nuraft::rpc_client> create_client(
-      const std::string& endpoint) override {
-    return nullptr;
-  }
-};
-
+// Real C ABI integration: recovery and capture use the production Go WAL and
+// snapshot executor, while application results remain typed C++ Meta verdicts.
 class MetaServerIntegrationTest : public ::testing::Test {
  protected:
-  void SetUp() override { dir_ = MakeTestDir("w3a", "server"); }
+  void SetUp() override { dir_ = MakeTestDir("raft", "server"); }
   void TearDown() override {
     StopServer();
     RemoveTestDir(dir_);
   }
-
-  // Opens the persistent state without launching the Raft core, so tests can
-  // observe the recovered on-disk state before any replay kicks in.
-  void OpenStorage() {
-    const lavik::meta::NuraftMemberConfig local{
-        1, "127.0.0.1:9601", "lavik://meta/1", "127.0.0.1:9701",
-        "127.0.0.1:9801"};
-    lavik::meta::NuraftStateMgrOpenOptions options{.data_dir_ = dir_,
-                                                   .local_member_ = local};
-    if (!std::filesystem::exists(std::filesystem::path(dir_) /
-                                 "cluster_config.dat")) {
-      options.initial_cluster_ = std::vector{local};
-    }
-    auto mgr = NuraftStateMgr::Open(std::move(options));
-    ASSERT_TRUE(mgr.ok()) << mgr.status();
-    mgr_ = nuraft::ptr<NuraftStateMgr>(std::move(*mgr));
-
+  void StartServer(uint64_t distance = 0) {
     auto machine = MetaStateMachine::Open(dir_);
     ASSERT_TRUE(machine.ok()) << machine.status();
-    machine_ = nuraft::ptr<MetaStateMachine>(std::move(*machine));
+    machine_ = std::move(*machine);
+    auto options = lavik::test::SingleMetaOptions(dir_);
+    options.snapshot_distance_ = distance;
+    auto server = lavik::meta::MetaRaft::Open(std::move(options), *machine_);
+    ASSERT_TRUE(server.ok()) << server.status();
+    server_ = std::move(*server);
+    ASSERT_TRUE(WaitFor([&] { return server_->is_leader(); },
+                        std::chrono::seconds(15)));
   }
-
-  void LaunchServer(int snapshot_distance, bool elect_leader = true,
-                    bool disable_peer_tracking_on_leadership = false) {
-    scheduler_ = nuraft::cs_new<ThreadScheduler>();
-
-    nuraft::raft_params params;
-    params.with_election_timeout_lower(150);
-    params.with_election_timeout_upper(300);
-    params.with_hb_interval(50);
-    params.with_snapshot_enabled(snapshot_distance);
-    params.with_reserved_log_items(0);
-    params.with_client_req_timeout(5000);
-    params.track_peers_sm_commit_idx_ = disable_peer_tracking_on_leadership;
-    params.wait_for_sm_catchup_on_becoming_leader_ =
-        disable_peer_tracking_on_leadership;
-
-    nuraft::context* ctx = new nuraft::context(
-        mgr_, machine_, /*listener=*/nullptr, /*logger=*/nullptr,
-        nuraft::cs_new<NullRpcClientFactory>(), scheduler_, params);
-    nuraft::raft_server::init_options options;
-    options.skip_initial_election_timeout_ = !elect_leader;
-    if (disable_peer_tracking_on_leadership) {
-      // Production's creation reconciler switches a caught-up leader from
-      // all-peer confirmation to majority completion. Do it synchronously at
-      // the role callback to leave a pending notifier target deterministically,
-      // before the commit thread has scanned it. Context replacement is the
-      // thread-safe parameter publication used by raft_server::update_params.
-      options.raft_callback_ = [ctx](nuraft::cb_func::Type type,
-                                     nuraft::cb_func::Param*) {
-        if (type == nuraft::cb_func::BecomeLeader) {
-          auto updated =
-              nuraft::cs_new<nuraft::raft_params>(*ctx->get_params());
-          updated->track_peers_sm_commit_idx_ = false;
-          ctx->set_params(updated);
-        }
-        return nuraft::cb_func::Ok;
-      };
-    }
-    server_ = nuraft::cs_new<nuraft::raft_server>(ctx, options);
-    if (elect_leader) {
-      ASSERT_TRUE(WaitFor([this] { return server_->is_leader(); },
-                          std::chrono::seconds(15)));
-    }
-  }
-
-  void StartServer(int snapshot_distance) {
-    OpenStorage();
-    LaunchServer(snapshot_distance);
-  }
-
   void StopServer() {
-    if (server_) {
-      server_->shutdown();
-    }
-    if (machine_) {
-      // Shutdown contract (state_machine.h): shutdown() joins the commit
-      // thread, so no new snapshot jobs arrive; drain the SM writer so an
-      // in-flight when_done lands on the still-alive core before reset().
-      machine_->WaitForSnapshotWriterIdle();
-    }
-    if (server_) {
-      server_.reset();
-    }
-    if (scheduler_) {
-      scheduler_->Shutdown();
-      scheduler_.reset();
-    }
+    if (server_) server_->shutdown();
+    server_.reset();
     machine_.reset();
-    mgr_.reset();
   }
-
-  // Proposes one committed command and waits for the commit result.
   void AppendAndWait(const MetaCommand& cmd) {
-    nuraft::ptr<nuraft::buffer> buf = EncodeOrDie(cmd);
-    ASSERT_NE(buf, nullptr);
-    std::vector<nuraft::ptr<nuraft::buffer>> logs;
-    logs.push_back(buf);
-    nuraft::ptr<nuraft::cmd_result<nuraft::ptr<nuraft::buffer>>> result =
-        server_->append_entries(logs);
+    const auto buffer = EncodeOrDie(cmd);
+    auto result = server_->append_entries({buffer});
     ASSERT_TRUE(WaitFor([&] { return result->has_result(); },
                         std::chrono::seconds(10)));
-    EXPECT_EQ(result->get_result_code(), nuraft::cmd_result_code::OK)
-        << result->get_result_str();
-    EXPECT_TRUE(result->get_accepted());
+    ASSERT_EQ(result->get_result_code(), lavik::meta::MetaRaftResultCode::OK);
   }
-
-  std::size_t NodeCount() {
-    return machine_->StoresSnapshot().identity_.NodeCount();
-  }
-
   std::filesystem::path dir_;
-  nuraft::ptr<NuraftStateMgr> mgr_;
-  nuraft::ptr<MetaStateMachine> machine_;
-  nuraft::ptr<ThreadScheduler> scheduler_;
-  nuraft::ptr<nuraft::raft_server> server_;
+  std::shared_ptr<MetaStateMachine> machine_;
+  std::shared_ptr<lavik::meta::MetaRaft> server_;
 };
 
-TEST_F(MetaServerIntegrationTest,
-       DisablingPeerCommitTrackingDoesNotStrandShutdown) {
-  StartServer(/*snapshot_distance=*/0);
-  AppendAndWait(MakeRegister(0x10));
-  StopServer();
-  OpenStorage();
-  ASSERT_NO_FATAL_FAILURE(LaunchServer(
-      /*snapshot_distance=*/0, /*elect_leader=*/true,
-      /*disable_peer_tracking_on_leadership=*/true));
-  ASSERT_TRUE(WaitFor(
-      [this] {
-        return !server_->get_current_params().track_peers_sm_commit_idx_;
-      },
-      std::chrono::seconds(5)));
-  AppendAndWait(MakeRegister(0x11));
-
-  auto shutdown =
-      std::async(std::launch::async, [this] { server_->shutdown(); });
-  const auto stopped = shutdown.wait_for(std::chrono::seconds(2));
-  if (stopped != std::future_status::ready) {
-    // Unstick the old implementation so failure is an assertion, not a hung
-    // test process: re-enabling tracking lets it retire its stale target and
-    // reach the stop check. The production fix must not need this transition.
-    auto params = server_->get_current_params();
-    params.track_peers_sm_commit_idx_ = true;
-    server_->update_params(params);
-  }
-  shutdown.get();
-  server_.reset();
-  EXPECT_EQ(stopped, std::future_status::ready);
-}
-
 TEST_F(MetaServerIntegrationTest, CommitThenRestartReplaysLog) {
-  StartServer(/*snapshot_distance=*/0);
+  StartServer();
   AppendAndWait(MakeRegister(0x11));
   AppendAndWait(MakeRegister(0x22));
-  EXPECT_EQ(NodeCount(), 2u);
+  const auto term = server_->get_term();
   StopServer();
-
-  // Restart on the same directory: no snapshot exists, so the recovered state
-  // machine is empty at commit index 0. (Checked before the core starts: a
-  // re-elected leader re-commits the durable log almost immediately.)
-  OpenStorage();
-  EXPECT_EQ(machine_->last_commit_index(), 0u);
-  EXPECT_EQ(NodeCount(), 0u);
-
-  // The new leader's first current-term entry lets it commit everything
-  // before it; replay then re-applies the pre-restart entries after quorum
-  // confirmation.
-  LaunchServer(/*snapshot_distance=*/0);
+  StartServer();
+  EXPECT_EQ(machine_->StoresSnapshot().identity_.NodeCount(), 2u);
+  EXPECT_GT(server_->get_term(), term);
   AppendAndWait(MakeRegister(0x33));
-  ASSERT_TRUE(
-      WaitFor([this] { return NodeCount() == 3u; }, std::chrono::seconds(10)));
-
-  // The vote from the second election was persisted.
-  nuraft::ptr<nuraft::srv_state> state = mgr_->read_state();
-  ASSERT_NE(state, nullptr);
-  EXPECT_GE(state->get_term(), 2u);
+  EXPECT_EQ(machine_->StoresSnapshot().identity_.NodeCount(), 3u);
 }
 
 TEST_F(MetaServerIntegrationTest, SnapshotCompactionAndRestart) {
-  StartServer(/*snapshot_distance=*/0);
-  for (std::uint8_t ii = 0; ii < 9; ++ii) {
-    AppendAndWait(MakeRegister(static_cast<std::uint8_t>(0x10 + ii)));
-  }
-  ASSERT_EQ(NodeCount(), 9u);
-
-  // Manual snapshot on the latest committed index. serialize_commit_=true is
-  // MANDATORY for the manual path: serialize_commit_=true, or equivalently
-  // schedule_snapshot_creation(), excludes the commit thread
-  // while the state machine captures, which is what makes the cut point
-  // exact. The state machine writes the file asynchronously off the
-  // commit thread, so compaction completes when the writer's when_done
-  // reaches the core; wait for it.
-  nuraft::raft_server::create_snapshot_options options;
-  options.serialize_commit_ = true;
-  const uint64_t snapshot_index = server_->create_snapshot(options);
-  ASSERT_GT(snapshot_index, 0u);
-  // The SM records last_snapshot_ before when_done reaches the core, so the
-  // completed log compaction implies both.
-  nuraft::ptr<nuraft::log_store> store = mgr_->load_log_store();
-  ASSERT_TRUE(
-      WaitFor([&] { return store->start_index() == snapshot_index + 1; },
-              std::chrono::seconds(10)));
-  ASSERT_NE(machine_->last_snapshot(), nullptr);
-  EXPECT_EQ(machine_->last_snapshot()->get_last_log_idx(), snapshot_index);
+  StartServer();
+  for (uint8_t i = 0x10; i < 0x19; ++i) AppendAndWait(MakeRegister(i));
+  const auto snapshot = server_->create_snapshot({});
+  ASSERT_GT(snapshot, 0u);
+  ASSERT_TRUE(WaitFor([&] { return server_->FirstLogIndex() == snapshot + 1; },
+                      std::chrono::seconds(5)));
   StopServer();
-
-  // Restart: the stores and the durable commit index come from the snapshot,
-  // before any replay. (Checked before the core starts for determinism.)
-  OpenStorage();
-  EXPECT_EQ(machine_->last_commit_index(), snapshot_index);
-  EXPECT_EQ(NodeCount(), 9u);
-  nuraft::ptr<nuraft::log_store> reopened_store = mgr_->load_log_store();
-  EXPECT_EQ(reopened_store->start_index(), snapshot_index + 1);
-
-  // The cluster still accepts writes after recovery. (Seed 0x19: MakeNodeId
-  // folds to the low nibble, so 0x19 is the first pattern not colliding with
-  // the 0x10..0x18 batch above.)
-  LaunchServer(/*snapshot_distance=*/0);
+  StartServer();
+  EXPECT_GE(machine_->last_commit_index(), snapshot);
+  EXPECT_EQ(machine_->StoresSnapshot().identity_.NodeCount(), 9u);
+  EXPECT_GE(server_->FirstLogIndex(), snapshot + 1);
   AppendAndWait(MakeRegister(0x19));
-  ASSERT_TRUE(
-      WaitFor([this] { return NodeCount() == 10u; }, std::chrono::seconds(10)));
+  EXPECT_EQ(machine_->StoresSnapshot().identity_.NodeCount(), 10u);
 }
 
-TEST_F(MetaServerIntegrationTest, AutoSnapshotOnCommitThread) {
-  // The automatic path: snapshot_and_compact runs create_snapshot ON the
-  // commit thread at a commit boundary (handle_commit.cxx), so this exercises
-  // the exact-cut capture plus the async writer hand-off where they actually
-  // live in production — unlike the unit tests, which drive create_snapshot
-  // directly.
-  StartServer(/*snapshot_distance=*/5);
-  for (std::uint8_t ii = 0; ii < 12; ++ii) {
-    AppendAndWait(MakeRegister(static_cast<std::uint8_t>(0x30 + ii)));
-  }
-  nuraft::ptr<nuraft::log_store> store = mgr_->load_log_store();
-  ASSERT_TRUE(WaitFor(
-      [this] {
-        return machine_->last_snapshot() != nullptr &&
-               machine_->last_snapshot()->get_last_log_idx() > 0;
-      },
-      std::chrono::seconds(10)));
-  // Compaction follows the durable snapshot (on_snapshot_completed), moving
-  // the WAL start forward.
-  ASSERT_TRUE(WaitFor([&] { return store->start_index() > 1; },
+TEST_F(MetaServerIntegrationTest, AutomaticSnapshotAndTailReplay) {
+  StartServer(5);
+  for (uint8_t i = 0x30; i < 0x3c; ++i) AppendAndWait(MakeRegister(i));
+  ASSERT_TRUE(WaitFor([&] { return server_->FirstLogIndex() > 1; },
                       std::chrono::seconds(10)));
-  EXPECT_EQ(NodeCount(), 12u);
+  const auto snapshot = server_->get_last_snapshot_idx();
   StopServer();
-
-  // Restart recovers the snapshotted prefix from the snapshot file and the
-  // post-snapshot tail by replay; the full state must come back.
-  OpenStorage();
-  ASSERT_NE(machine_->last_snapshot(), nullptr);
-  // A later automatic snapshot may publish while the final appends drain.
-  // Compare recovery with the newest durable cut, not the first cut observed
-  // above.
-  EXPECT_EQ(machine_->last_commit_index(),
-            machine_->last_snapshot()->get_last_log_idx());
-  LaunchServer(/*snapshot_distance=*/5);
-  AppendAndWait(MakeRegister(0x3c));  // low-nibble pattern "c...", unused above
-  ASSERT_TRUE(
-      WaitFor([this] { return NodeCount() == 13u; }, std::chrono::seconds(10)));
+  StartServer(5);
+  EXPECT_GE(server_->get_last_snapshot_idx(), snapshot);
+  EXPECT_EQ(machine_->StoresSnapshot().identity_.NodeCount(), 12u);
+  AppendAndWait(MakeRegister(0x3c));
+  EXPECT_EQ(machine_->StoresSnapshot().identity_.NodeCount(), 13u);
 }
 
-// Exercise the same request dispatcher as the peer transport, including term
-// updates and durable voted_for. Multi-member authentication and elections are
-// covered by gate_snapshot_vote; this seam isolates log-freshness decisions.
-class VoteRequestDriver : public nuraft::raft_server_handler {
- public:
-  using nuraft::raft_server_handler::process_req;
-};
-
-class MetaVoteIntegrationTest
-    : public MetaServerIntegrationTest,
-      public ::testing::WithParamInterface<std::string> {};
-
-TEST_P(MetaVoteIntegrationTest, ComparesLogicalLogAfterCompaction) {
-  const std::string history = GetParam();
-  ASSERT_NO_FATAL_FAILURE(OpenStorage());
-  ASSERT_NO_FATAL_FAILURE(LaunchServer(/*snapshot_distance=*/0,
-                                       /*elect_leader=*/history != "Empty"));
-  uint64_t last_index = 0;
-  uint64_t last_term = 0;
-  if (history != "Empty") {
-    AppendAndWait(MakeRegister(0x11));
-    AppendAndWait(MakeRegister(0x22));
-    auto store = mgr_->load_log_store();
-    last_index = store->next_slot() - 1;
-    last_term = store->last_entry()->get_term();
-    ASSERT_GT(last_term, 0u);
-    if (history != "Wal") {
-      nuraft::raft_server::create_snapshot_options options;
-      options.serialize_commit_ = true;
-      ASSERT_EQ(server_->create_snapshot(options), last_index);
-      ASSERT_TRUE(
-          WaitFor([&] { return store->start_index() == last_index + 1; },
-                  std::chrono::seconds(10)));
-      ASSERT_EQ(store->next_slot(), store->start_index());
-      ASSERT_EQ(store->last_entry()->get_term(), 0u);
-      ASSERT_EQ(machine_->last_snapshot()->get_last_log_term(), last_term);
-      if (history == "SnapshotRestart" || history == "SnapshotWithTail") {
-        StopServer();
-        ASSERT_NO_FATAL_FAILURE(OpenStorage());
-        ASSERT_EQ(machine_->last_snapshot()->get_last_log_idx(), last_index);
-        ASSERT_EQ(machine_->last_snapshot()->get_last_log_term(), last_term);
-        ASSERT_NO_FATAL_FAILURE(
-            LaunchServer(/*snapshot_distance=*/0,
-                         /*elect_leader=*/history == "SnapshotWithTail"));
-        if (history == "SnapshotWithTail") {
-          AppendAndWait(MakeRegister(0x33));
-          store = mgr_->load_log_store();
-          ASSERT_GT(store->last_entry()->get_term(), last_term);
-          last_index = store->next_slot() - 1;
-          last_term = store->last_entry()->get_term();
-        } else {
-          ASSERT_EQ(mgr_->load_log_store()->next_slot(), last_index + 1);
-          ASSERT_EQ(mgr_->load_log_store()->last_entry()->get_term(), 0u);
-        }
-      }
-    }
-  }
-
-  // Keep real core threads, but stop timer callbacks so a local election
-  // cannot race the synthetic requests. Each request starts a fresh election
-  // term so a previous granted vote cannot mask the freshness decision.
-  scheduler_->Shutdown();
-  const auto vote = [&](uint64_t candidate_term, uint64_t candidate_index,
-                        bool expected_grant) {
-    SCOPED_TRACE(::testing::Message()
-                 << "candidate (" << candidate_term << ", " << candidate_index
-                 << "), voter (" << last_term << ", " << last_index << ")");
-    const uint64_t election_term = mgr_->read_state()->get_term() + 1;
-    nuraft::req_msg request(election_term,
-                            nuraft::msg_type::request_vote_request,
-                            /*src=*/2, /*dst=*/1, candidate_term,
-                            candidate_index, /*commit_idx=*/0);
-    auto response = VoteRequestDriver::process_req(server_.get(), request);
-    ASSERT_NE(response, nullptr);
-    EXPECT_EQ(response->get_accepted(), expected_grant);
-    EXPECT_EQ(mgr_->read_state()->get_voted_for(), expected_grant ? 2 : -1);
-  };
-  if (last_index > 0) {
-    vote(last_term - 1, last_index + 100, false);
-    vote(last_term, last_index - 1, false);
-  }
-  vote(last_term, last_index, true);
-  vote(last_term, last_index + 1, true);
-  vote(last_term + 1, last_index > 0 ? last_index - 1 : 0, true);
+TEST_F(MetaServerIntegrationTest, ShutdownJoinsAllCallbacks) {
+  StartServer();
+  AppendAndWait(MakeRegister(0x10));
+  AppendAndWait(MakeRegister(0x11));
+  auto closing = std::async(std::launch::async, [&] { server_->shutdown(); });
+  EXPECT_EQ(closing.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  closing.get();
 }
-
-INSTANTIATE_TEST_SUITE_P(History, MetaVoteIntegrationTest,
-                         ::testing::Values("Empty", "Wal", "Snapshot",
-                                           "SnapshotRestart",
-                                           "SnapshotWithTail"),
-                         [](const ::testing::TestParamInfo<std::string>& info) {
-                           return info.param;
-                         });
 
 }  // namespace

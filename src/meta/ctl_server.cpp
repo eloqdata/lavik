@@ -46,19 +46,6 @@
 #include "bycorf/net/tcp_stream.h"
 #include "bycorf/net/tls.h"
 #include "bycorf/runtime/worker.h"
-#include "spdlog/spdlog.h"
-// NuRaft's headers are not -Wpedantic-clean.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#include "libnuraft/async.hxx"
-#include "libnuraft/buffer.hxx"
-#include "libnuraft/cluster_config.hxx"
-#include "libnuraft/raft_params.hxx"
-#include "libnuraft/raft_server.hxx"
-#include "libnuraft/srv_config.hxx"
-#pragma GCC diagnostic pop
-
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/cluster/control_transport.h"
 #include "lavik/meta/automatic_failover_detector.h"
@@ -76,8 +63,10 @@
 #include "lavik/meta/observation_store.h"
 #include "lavik/meta/population_manifest_store.h"
 #include "lavik/meta/proposal_executor.h"
+#include "lavik/meta/raft.h"
 #include "lavik/meta/state_machine.h"
 #include "lavik/numeric_endpoint.h"
+#include "spdlog/spdlog.h"
 
 namespace lavik::meta {
 
@@ -85,8 +74,8 @@ namespace lavik::meta {
 // outlives individual sessions via shared_ptr.
 struct MetaCtlServer::Core {
   bycorf::ForeignExecutor foreign_executor_;
-  nuraft::ptr<nuraft::raft_server> server_;
-  nuraft::ptr<MetaStateMachine> state_machine_;
+  std::shared_ptr<MetaRaft> server_;
+  std::shared_ptr<MetaStateMachine> state_machine_;
   std::shared_ptr<MetaCoordinator> coordinator_;
   // Leader-local observation store. Internally serialized because
   // ctl ingestion and commit-driven revalidation run on different threads.
@@ -322,10 +311,10 @@ absl::StatusOr<int> OpenCtlShutdownAcceptWakeSocket(
 }
 
 std::vector<std::uint32_t> ConfigServerIds(
-    const nuraft::ptr<nuraft::cluster_config>& config) {
+    const std::shared_ptr<MetaRaftConfig>& config) {
   std::vector<std::uint32_t> ids;
   if (config == nullptr) return ids;
-  for (const nuraft::ptr<nuraft::srv_config>& member : config->get_servers()) {
+  for (const std::shared_ptr<MetaRaftMember>& member : config->get_servers()) {
     if (member != nullptr && member->get_id() > 0) {
       ids.push_back(static_cast<std::uint32_t>(member->get_id()));
     }
@@ -362,11 +351,11 @@ std::vector<ClusterMetaMemberWireV1> StatusMembers(
 }
 
 std::string BuildClusterHeadReply(
-    const nuraft::ptr<nuraft::raft_server>& server,
-    const nuraft::ptr<MetaStateMachine>& state_machine) {
+    const std::shared_ptr<MetaRaft>& server,
+    const std::shared_ptr<MetaStateMachine>& state_machine) {
   const MetaCommittedStatusView view = state_machine->StatusSnapshot();
   const auto members = ActiveMetaMembers(view);
-  const nuraft::ptr<nuraft::cluster_config> config = server->get_config();
+  const std::shared_ptr<MetaRaftConfig> config = server->get_config();
   if (config == nullptr || members.empty()) return "ERR leader_not_caught_up";
   // Use one role observation for both fields. A promotion can otherwise land
   // between two is_leader() reads and create a structurally corrupt head that
@@ -403,8 +392,8 @@ std::string BuildClusterHeadReply(
 }
 
 std::string BuildClusterStatusReply(
-    const nuraft::ptr<nuraft::raft_server>& server,
-    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaRaft>& server,
+    const std::shared_ptr<MetaStateMachine>& state_machine,
     const std::shared_ptr<MetaDataControlRuntimeStatus>& runtime_status,
     const std::shared_ptr<MetaAutomaticFailoverDiagnosticsRegistry>&
         automatic_failover_diagnostics,
@@ -415,8 +404,7 @@ std::string BuildClusterStatusReply(
   if (!before_leader_alive) return "ERR leader_not_caught_up";
 
   const std::uint64_t before_term = server->get_term();
-  const nuraft::ptr<nuraft::cluster_config> before_config =
-      server->get_config();
+  const std::shared_ptr<MetaRaftConfig> before_config = server->get_config();
   if (before_config == nullptr) return "ERR leader_not_caught_up";
   const std::uint64_t before_config_index = before_config->get_log_idx();
   const std::vector<std::uint32_t> before_config_ids =
@@ -827,7 +815,7 @@ std::string BuildClusterStatusReply(
   // Leadership/config/directory bracket: ordinary topology commits after the
   // compact snapshot do not invalidate that snapshot, but a leadership or
   // routing-identity change would make the response a mixed authority cut.
-  const nuraft::ptr<nuraft::cluster_config> after_config = server->get_config();
+  const std::shared_ptr<MetaRaftConfig> after_config = server->get_config();
   const MetaCommittedStatusView after_view = state_machine->StatusSnapshot();
   const MetaDataControlLeadershipState after_leadership =
       runtime_status->LeadershipState();
@@ -864,8 +852,8 @@ const char* AuditPolicyName(MetaAuditPolicy policy) {
   return "unknown";
 }
 
-// Parking state for one asynchronous NuRaft round trip (append_entries,
-// add_srv, remove_srv). NuRaft may complete inline before await_suspend(), so
+// Parking state for one asynchronous Raft round trip (append_entries,
+// add_srv, remove_srv). Raft may complete inline before await_suspend(), so
 // ready_ and waiter_ form a small handshake independent of mailbox timing.
 struct AsyncReply {
   ~AsyncReply() {
@@ -947,7 +935,7 @@ void CompleteAsyncReply(
   // An empty handle means completion won the race with await_suspend(); the
   // coroutine observes ready_ and continues without a mailbox round trip.
   if (waiter && !foreign_executor.Resume(waiter)) {
-    // Runtime teardown starts only after NuRaft and the proposal executor are
+    // Runtime teardown starts only after Raft and the proposal executor are
     // quiescent. Rejection here therefore indicates a lifecycle violation
     // that would otherwise leave a session suspended forever.
     std::terminate();
@@ -1136,7 +1124,7 @@ const char* ObsAuditKindName(MetaObsAuditKind kind) {
   return "unknown";
 }
 
-using CmdResult = nuraft::cmd_result<nuraft::ptr<nuraft::buffer>>;
+using CmdResult = MetaRaftResult;
 
 // Proposes one encoded meta command and resolves to "OK <log_idx>" only when
 // the entry commits and this leader's state machine reports an accepted apply
@@ -1172,7 +1160,7 @@ bycorf::Task<std::string> ProposeCommand(
 
 bycorf::Task<std::string> HandleSubmitOp(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
     const std::string& kind, const std::string& payload,
     const MetaReplicationHistoryId& replication_history_id) {
@@ -1207,7 +1195,7 @@ bycorf::Task<std::string> HandleSubmitOp(
 
 bycorf::Task<std::string> HandleCompleteOp(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
     const std::string& result) {
   const auto lifecycle = state_machine->ClusterLifecycle();
@@ -1225,7 +1213,7 @@ bycorf::Task<std::string> HandleCompleteOp(
   if (!record.has_value()) {
     co_return "ERR not-found";
   }
-  // Releasing this reservation while NuRaft still owns an accepted invite or
+  // Releasing this reservation while Raft still owns an accepted invite or
   // leave would allow a second workflow to overtake its uncertain outcome.
   if (record->kind_ == kMetaMembershipOperationKind ||
       record->kind_ == kMetaClusterCreateOperationKind ||
@@ -1257,7 +1245,7 @@ bycorf::Task<std::string> HandleCompleteOp(
 
 bycorf::Task<std::string> HandleAbortOp(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
     const std::string& reason) {
   const auto lifecycle = state_machine->ClusterLifecycle();
@@ -1299,7 +1287,7 @@ bycorf::Task<std::string> HandleAbortOp(
 }
 
 // Non-linearizable read of committed operator state (see the header).
-std::string HandleGetOp(nuraft::ptr<MetaStateMachine> state_machine,
+std::string HandleGetOp(std::shared_ptr<MetaStateMachine> state_machine,
                         const MetaOperationId& id) {
   std::optional<MetaOperationRecord> record = state_machine->FindOperation(id);
   if (!record.has_value()) {
@@ -1348,7 +1336,7 @@ std::string FailoverError(std::string_view stage, std::string_view code) {
 
 bycorf::Task<std::string> HandleFailover(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const FailoverAdminRequestV1& request) {
   const MetaStores before = state_machine->StoresSnapshot();
   if (before.topology_.ClusterLifecycle().state_ !=
@@ -1398,7 +1386,7 @@ bycorf::Task<std::string> HandleFailover(
 // append.
 bycorf::Task<std::string> HandlePromote(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     const std::shared_ptr<MetaObservationStore>& observations,
     AuthenticatedPrincipal principal, const std::string& group_id,
     const std::string& node_id) {
@@ -1486,7 +1474,7 @@ bycorf::Task<std::string> HandlePromote(
 
 bycorf::Task<std::string> HandleRegisterNode(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal authenticated, const std::string& node_id,
     const std::string& principal, MetaNodeRole role,
     std::vector<std::string> endpoints) {
@@ -1513,7 +1501,7 @@ bycorf::Task<std::string> HandleRegisterNode(
   co_return reply;
 }
 
-std::string HandleGetNode(nuraft::ptr<MetaStateMachine> state_machine,
+std::string HandleGetNode(std::shared_ptr<MetaStateMachine> state_machine,
                           const std::string& node_id) {
   const std::optional<MetaNodeRecord> record = state_machine->FindNode(node_id);
   if (!record.has_value()) {
@@ -1529,7 +1517,7 @@ std::string HandleGetNode(nuraft::ptr<MetaStateMachine> state_machine,
 // from a committed snapshot. Effect-verified like submitop.
 bycorf::Task<std::string> HandleCreateGroup(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id) {
   CreateGroup command;
   command.request_id_ = MakeRequestId();
@@ -1552,7 +1540,7 @@ bycorf::Task<std::string> HandleCreateGroup(
 // a fresh nonzero 128-bit CSPRNG identity immediately before submission.
 bycorf::Task<std::string> HandleAssignNode(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
     const std::string& node_id, MetaNodeRole role) {
   const MetaStores before = state_machine->StoresSnapshot();
@@ -1598,7 +1586,7 @@ bycorf::Task<std::string> HandleAssignNode(
 // anchor to.
 bycorf::Task<std::string> HandleBeginGroupTerm(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
     std::uint64_t expected, std::uint64_t next) {
   BeginGroupTerm command;
@@ -1642,7 +1630,7 @@ bycorf::Task<std::string> HandlePutPolicy(
   co_return reply;
 }
 
-std::string HandleGetPolicy(nuraft::ptr<MetaStateMachine> state_machine,
+std::string HandleGetPolicy(std::shared_ptr<MetaStateMachine> state_machine,
                             const std::string& policy_id) {
   const MetaPolicyStore& policy = state_machine->StoresSnapshot().policy_;
   const auto version = policy.LatestVersion(policy_id);
@@ -1655,7 +1643,7 @@ std::string HandleGetPolicy(nuraft::ptr<MetaStateMachine> state_machine,
 
 bycorf::Task<std::string> HandleSetSlotMap(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, std::uint16_t first_slot,
     std::uint16_t last_slot, const std::string& group_id) {
   const MetaStores before = state_machine->StoresSnapshot();
@@ -1686,7 +1674,7 @@ bycorf::Task<std::string> HandleSetSlotMap(
 
 bycorf::Task<std::string> HandleActivateAuthority(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
     std::uint64_t expected_term, const std::string& owner_node_id) {
   const MetaStores before = state_machine->StoresSnapshot();
@@ -1716,7 +1704,7 @@ bycorf::Task<std::string> HandleActivateAuthority(
 
 bycorf::Task<std::string> HandleFenceGroup(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
     std::uint64_t expected_term) {
   FenceGroup command;
@@ -1744,7 +1732,7 @@ bycorf::Task<std::string> HandleFenceGroup(
 // ctl-side consistency check and is not fabricated into evidence.
 bycorf::Task<std::string> HandleTransitionOp(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
     const std::string& phase, const MetaReplicationHistoryId& history) {
   const std::optional<MetaOperationRecord> record =
@@ -1800,8 +1788,8 @@ std::string ClusterAlreadyCreatedError(
 // Admission persists the whole plan BEFORE topology mutation. The leader
 // reconciler, not this connection or its timeout, owns all subsequent work.
 bycorf::Task<std::string> HandleClusterCreate(
-    const nuraft::ptr<nuraft::raft_server>& server,
-    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaRaft>& server,
+    const std::shared_ptr<MetaStateMachine>& state_machine,
     const std::shared_ptr<MetaCoordinator>& coordinator,
     const std::shared_ptr<MetaMembershipGate>& membership_gate,
     AuthenticatedPrincipal principal, const ClusterCreateManifestV1& manifest,
@@ -1943,7 +1931,7 @@ bycorf::Task<std::string> HandlePruneOperationArchive(
 
 bycorf::Task<std::string> HandleArchiveOperations(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, std::vector<std::uint64_t> seqs) {
   ArchiveOperations command;
   command.request_id_ = MakeRequestId();
@@ -1979,7 +1967,8 @@ std::string HandleAdoptSession(
 // committed snapshot.
 std::string HandleObsIngest(
     const std::shared_ptr<MetaObservationStore>& obs_store,
-    nuraft::ptr<MetaStateMachine> state_machine, MetaObservation observation) {
+    std::shared_ptr<MetaStateMachine> state_machine,
+    MetaObservation observation) {
   const std::int64_t now = NowUnixMs();
   obs_store->SweepExpired(now);
   MetaStores stores = state_machine->StoresSnapshot();
@@ -2020,7 +2009,7 @@ std::string HandleObsIngest(
 
 std::string HandleObservations(
     const std::shared_ptr<MetaObservationStore>& obs_store,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     const std::optional<std::string>& group_id) {
   obs_store->SweepExpired(NowUnixMs());
   if (!group_id.has_value()) {
@@ -2067,8 +2056,8 @@ std::string HandleObsAudit(
 }
 
 bycorf::Task<std::string> HandleConfigChange(
-    nuraft::ptr<nuraft::raft_server> server,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaRaft> server,
+    std::shared_ptr<MetaStateMachine> state_machine,
     const std::shared_ptr<MetaCoordinator>& coordinator,
     AuthenticatedPrincipal principal,
     const std::shared_ptr<MetaMembershipGate>& membership_gate, bool add,
@@ -2252,7 +2241,7 @@ bool ParseServerId(const std::string& text, int& out) {
 // on its dispatch thread, independently of this command's response.
 bycorf::Task<std::string> DispatchMutationVerb(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& command,
     const std::vector<std::string>& tokens) {
   if (command == "submitop") {
@@ -2478,8 +2467,8 @@ bycorf::Task<std::string> DispatchMutationVerb(
 // serialized because commit-driven revalidation can run concurrently with
 // this worker.
 bycorf::Task<std::string> DispatchCommand(
-    nuraft::ptr<nuraft::raft_server> server,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    std::shared_ptr<MetaRaft> server,
+    std::shared_ptr<MetaStateMachine> state_machine,
     const std::shared_ptr<MetaCoordinator>& coordinator,
     std::shared_ptr<MetaObservationStore> obs_store,
     bycorf::ForeignExecutor foreign_executor,
@@ -2736,7 +2725,15 @@ bycorf::Task<std::string> DispatchCommand(
         " id=" + std::to_string(server->get_id()) +
         " committed=" + std::to_string(server->get_committed_log_idx()) +
         " snapshot_idx=" + std::to_string(server->get_last_snapshot_idx()) +
+        " first_log_idx=" + std::to_string(server->FirstLogIndex()) +
+        " rpc_failures=" + std::to_string(server->RpcFailures()) +
+        " vote_rejections=" + std::to_string(server->VoteRejections()) +
+        " vote_grants=" + std::to_string(server->VoteGrants()) +
+        " gc_failures=" + std::to_string(server->GcFailures()) +
+        " pending_raft_bytes=" + std::to_string(server->PendingBytes()) +
         " term=" + std::to_string(server->get_term()) +
+        " initial_bindings_pending=" +
+        std::to_string(server->initial_bindings_pending() ? 1 : 0) +
         " audit_policy=" + AuditPolicyName(audit.policy()) +
         " audit_size=" + std::to_string(audit.size()) +
         " audit_capacity=" + std::to_string(audit.capacity()) +
@@ -2766,20 +2763,15 @@ bycorf::Task<std::string> DispatchCommand(
         add ? tokens[4] : std::string(), member_principal, shutdown);
   }
   if (command == "snapshot") {
-    // A manual snapshot must serialize against the commit
-    // thread — serialize_commit_ blocks the background commit until the
-    // state machine's exact-cut capture returns (NuRaft semantics per
-    // raft_server.hxx create_snapshot_options). The capture is synchronous on
-    // the proposal executor, bounded by kMaxMetaSnapshotBytes, and can add
-    // substantial proposal latency near that cap. The durability write is
-    // handed to the state machine's writer thread, so the reply only
-    // guarantees the cut point, and compaction completes asynchronously. A
-    // round already in flight fails fast (returns 0).
+    // The Go application executor captures an exact cut. This wait runs on
+    // the proposal executor; its result includes durable file/marker
+    // publication and memory compaction, while whole-file reclamation remains
+    // asynchronous.
     std::shared_ptr<AsyncReply> state = std::make_shared<AsyncReply>();
     const absl::Status submitted =
         proposal_executor.Submit([server, foreign_executor, state]() mutable {
           try {
-            nuraft::raft_server::create_snapshot_options options;
+            MetaRaft::create_snapshot_options options;
             options.serialize_commit_ = true;
             const std::uint64_t idx = server->create_snapshot(options);
             CompleteAsyncReply(
@@ -2906,9 +2898,8 @@ absl::Status MetaCtlServer::ValidateOptions(
 
 // static
 absl::StatusOr<std::shared_ptr<MetaCtlServer>> MetaCtlServer::Create(
-    bycorf::ForeignExecutor foreign_executor,
-    nuraft::ptr<nuraft::raft_server> server,
-    nuraft::ptr<MetaStateMachine> state_machine,
+    bycorf::ForeignExecutor foreign_executor, std::shared_ptr<MetaRaft> server,
+    std::shared_ptr<MetaStateMachine> state_machine,
     std::shared_ptr<MetaCoordinator> coordinator,
     std::shared_ptr<MetaObservationStore> obs_store,
     MetaProposalExecutor& proposal_executor,

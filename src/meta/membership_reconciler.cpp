@@ -29,11 +29,10 @@
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/fault_injection.h"
 #include "lavik/meta/identity_verifier.h"
-#include "lavik/meta/nuraft_state_mgr.h"
 #include "lavik/meta/proposal_executor.h"
+#include "lavik/meta/raft.h"
 #include "lavik/meta/state_machine.h"
 #include "lavik/numeric_endpoint.h"
-#include "libnuraft/raft_server.hxx"
 #include "spdlog/spdlog.h"
 
 namespace lavik::meta {
@@ -126,7 +125,7 @@ absl::StatusOr<MetaMemberRecord> ReadBinding(MetaReader& r) {
 }  // namespace
 
 absl::StatusOr<std::vector<MetaMembershipPeer>> CaptureMembershipConfig(
-    const nuraft::ptr<nuraft::cluster_config>& config) {
+    const std::shared_ptr<MetaRaftConfig>& config) {
   if (!config || config->is_async_replication() ||
       !config->get_user_ctx().empty())
     return Conflict("unsupported or missing membership configuration");
@@ -293,7 +292,18 @@ Plan PlanMembershipStep(const MetaCommittedView& view,
   std::sort(after.begin(), after.end(),
             [](const auto& a, const auto& b) { return a.id_ < b.id_; });
   const bool done = config == after;
-  if (!done && config != p.before_)
+  auto learner_stage = after;
+  if (p.add_ && !p.target_.learner_) {
+    for (auto& peer : learner_stage) {
+      if (peer.id_ == p.target_.id_) peer.learner_ = true;
+    }
+  }
+  // Adding a voter has one committed intermediate configuration. Keeping the
+  // exact descriptor/baseline checks makes this stage recoverable by a new
+  // leader without accepting an unrelated membership change as progress.
+  const bool catching_up =
+      p.add_ && !p.target_.learner_ && config == learner_stage;
+  if (!done && !catching_up && config != p.before_)
     return Conflict("membership configuration diverged from intent");
   for (const auto& expected : p.bindings_) {
     auto current = view.identity().FindMetaMember(expected.server_id_);
@@ -323,7 +333,7 @@ Plan PlanMembershipStep(const MetaCommittedView& view,
   }
   if (p.add_ && !binding) return Conflict("membership binding disappeared");
   if (phase == "change-config") {
-    // NuRaft's accepted invite/leave reply is not a committed configuration.
+    // Raft's accepted invite/leave reply is not a committed configuration.
     // Only the exact post-state authorizes identity retirement/completion.
     if (done) return Phase(op, "config-committed");
     if (!p.add_ && local_id == p.target_.id_)
@@ -355,9 +365,8 @@ Plan PlanMembershipStep(const MetaCommittedView& view,
 struct MetaMembershipReconciler::Core {
   bycorf::ForeignExecutor executor_;
   MetaProposalExecutor* proposals_;
-  nuraft::ptr<nuraft::raft_server> server_;
-  nuraft::ptr<MetaStateMachine> state_machine_;
-  nuraft::ptr<NuraftStateMgr> state_mgr_;
+  std::shared_ptr<MetaRaft> server_;
+  std::shared_ptr<MetaStateMachine> state_machine_;
   std::shared_ptr<MetaMembershipGate> gate_;
   bool running_ = false, cancelled_ = true, shutdown_ = false;
   std::atomic<bool> stopping_{false}, stopped_{false};
@@ -370,16 +379,14 @@ struct MetaMembershipReconciler::Core {
 };
 MetaMembershipReconciler::MetaMembershipReconciler(
     bycorf::ForeignExecutor executor, MetaProposalExecutor& proposals,
-    nuraft::ptr<nuraft::raft_server> server,
-    nuraft::ptr<MetaStateMachine> machine,
-    nuraft::ptr<NuraftStateMgr> state_mgr,
+    std::shared_ptr<MetaRaft> server, std::shared_ptr<MetaStateMachine> machine,
+
     std::shared_ptr<MetaMembershipGate> gate)
     : core_(std::make_shared<Core>()) {
   core_->executor_ = std::move(executor);
   core_->proposals_ = &proposals;
   core_->server_ = std::move(server);
   core_->state_machine_ = std::move(machine);
-  core_->state_mgr_ = std::move(state_mgr);
   core_->gate_ = std::move(gate);
 }
 MetaMembershipReconciler::~MetaMembershipReconciler() { Shutdown(); }
@@ -461,7 +468,7 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
       auto initial_binding =
           configured.ok() ? PlanInitialMetaBindings(
                                 view, *configured,
-                                core->state_mgr_->initial_bindings_pending())
+                                core->server_->initial_bindings_pending())
                           : absl::StatusOr<std::optional<BindMetaMember>>(
                                 configured.status());
       if (!initial_binding.ok() || initial_binding->has_value()) {
@@ -513,25 +520,6 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
                                                std::chrono::milliseconds(25));
         if (!slept.ok()) break;
         continue;
-      }
-      if (core->state_mgr_->initial_bindings_pending()) {
-        // Clear transport grace only after the complete identity projection
-        // is authoritative. The marker is durable so a crash or another
-        // election-time config copy cannot strand an unfinished genesis.
-        if (absl::Status status =
-                core->state_mgr_->CompleteInitialBindings(view.applied_index());
-            !status.ok()) {
-          if (last_cut != status.message()) {
-            spdlog::critical(
-                "initial Meta identity completion could not be persisted: {}",
-                status.message());
-            last_cut = std::string(status.message());
-          }
-          auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                                 std::chrono::milliseconds(25));
-          if (!slept.ok()) break;
-          continue;
-        }
       }
     }
     if (op == operations.end()) {
@@ -626,11 +614,10 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
                     server->yield_leadership();
                     attempt->replied_ = true;
                   } else {
-                    nuraft::ptr<nuraft::cmd_result<nuraft::ptr<nuraft::buffer>>>
-                        result;
+                    std::shared_ptr<MetaRaftResult> result;
                     if (action == MetaMembershipRaftAction::kAdd) {
                       const auto& t = intent.target_;
-                      nuraft::srv_config peer(
+                      MetaRaftMember peer(
                           t.id_, t.dc_id_, t.endpoint_,
                           MetaMemberIdentity{
                               static_cast<int>(t.id_), t.principal_,

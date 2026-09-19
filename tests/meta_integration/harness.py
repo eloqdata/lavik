@@ -35,7 +35,7 @@ Stdlib-only building blocks for driving multi-node lavik-meta clusters:
   byte), `refuse` (listener closed, connect() fails with RST), per-chunk
   `delay` in both directions, and `heal` back to normal.
 - `Mesh`: one destination-side Proxy per node so every byte of inter-node
-  raft traffic crosses the destination node's proxy. NuRaft stores a
+  raft traffic crosses the destination node's proxy. Raft stores a
   single endpoint per server in the cluster config and all sources share
   127.0.0.1, so faults are injectable per destination node, not per
   (src, dst) pair: cutting node F's proxy models "F cannot receive"
@@ -262,7 +262,7 @@ class Node:
             if bootstrap and manifest is not None:
                 raise Failure("bootstrap and initial_cluster_manifest conflict")
             if bootstrap and not os.path.exists(
-                    os.path.join(self.data_dir, "cluster_config.dat")):
+                    os.path.join(self.data_dir, "RAFT")):
                 manifest = os.path.join(
                     self.workdir, f"initial-meta-{self.id}.toml")
                 write_initial_cluster_manifest(manifest, [self])
@@ -1057,8 +1057,8 @@ def bootstrap_cluster(nodes, mesh=None):
 def bootstrap_meshed_cluster(nodes, mesh):
     """Bootstrap a cluster where EVERY node's advertised endpoint is a
     proxy port. The bootstrap node's endpoint is baked into the durable
-    cluster config from --addr on first boot and NuRaft's add_srv refuses
-    to update an existing server (SERVER_ALREADY_EXISTS), so the bootstrap
+    cluster config from --addr on first boot. The advertised descriptor is
+    immutable for that member ID, so the bootstrap
     node is bounced once onto a fresh bind port and its proxy takes over
     the baked port. Joined nodes are simply added by proxy endpoint."""
     first = nodes[0]
@@ -1096,10 +1096,9 @@ def propose_ops(leader, first, count, prefix="key", history=None):
 def manual_snapshot(node, timeout=15.0):
     """Drive the ctl `snapshot` verb to OK and return the snapshot index.
 
-    The snapshot's durable write runs on the SM writer thread, so a previous
-    round (e.g. an automatic snapshot that
-    just fired) can still be in flight — NuRaft's create_snapshot then
-    fails fast and the ctl answers "ERR snapshot-failed". Retry instead of
+    The bulk and append executors may still be publishing an automatic
+    snapshot, so a concurrent manual request fails fast and the ctl answers
+    "ERR snapshot-failed". Retry instead of
     treating that race as a gate failure."""
     result = {}
 
@@ -1112,18 +1111,6 @@ def manual_snapshot(node, timeout=15.0):
 
     wait_until(f"node {node.id} manual snapshot", timeout, attempt)
     return result["idx"]
-
-
-def wal_segment_first_indexes(node):
-    """Sorted first indexes of the node's WAL v1 segments
-    (log-<first_idx>.seg; nuraft_log_store.h). Compaction unlinks covered
-    segments and rewrites the boundary one, so once the log prefix is
-    compacted the minimum first index advances past 1."""
-    firsts = []
-    for name in os.listdir(node.data_dir):
-        if name.startswith("log-") and name.endswith(".seg"):
-            firsts.append(int(name[4:-4]))
-    return sorted(firsts)
 
 
 def wait_cluster_committed(nodes, idx, timeout=15.0):

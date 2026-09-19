@@ -9448,15 +9448,6 @@ class ReplicationManager::ReplicationGroup {
                 "node lost valid source state during PSYNC setup")
           : sent;
     }
-    if (bycorf::ThisWorker().id_ == 0) {
-      StartIdleReplicationHistoryMonitor();
-    } else {
-      (void)co_await bycorf::SubmitTo(0, [this] {
-        StartIdleReplicationHistoryMonitor();
-        return true;
-      });
-    }
-
     absl::Status configured = ConfigureConnectedFd(stream.NativeFd());
     if (!configured.ok()) co_return configured;
     const std::uint64_t session_id =
@@ -9471,6 +9462,16 @@ class ReplicationManager::ReplicationGroup {
 
     absl::Status status = co_await ResetInvalidReplicationHistory();
     if (!status.ok()) co_return status;
+    // An idle monitor may have been finishing a previous history's reset.
+    // Join that reset before checking whether this export needs a monitor.
+    if (bycorf::ThisWorker().id_ == 0) {
+      StartIdleReplicationHistoryMonitor();
+    } else {
+      (void)co_await bycorf::SubmitTo(0, [this] {
+        StartIdleReplicationHistoryMonitor();
+        return true;
+      });
+    }
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       const std::size_t flow_capacity = BacklogCapacityForFlow(
           worker, backlog_size_bytes_.load(std::memory_order_acquire));
@@ -15597,10 +15598,14 @@ class ReplicationManager::ReplicationGroup {
       co_return absl::FailedPreconditionError(
           "node lost valid source state during the native handshake");
     }
-    StartIdleReplicationHistoryMonitor();
     const bool protocol_probe = args[2] == "?";
     absl::Status history_ready = co_await EnsureReplicationHistoryReady();
     if (!history_ready.ok()) co_return history_ready;
+    // A retiring idle monitor can still be running while we wait for its
+    // reset. Check only after that wait so its exit cannot leave the newly
+    // enabled history without a monitor. The active control pins history
+    // until this handshake publishes its session or returns.
+    StartIdleReplicationHistoryMonitor();
     std::string replica_node_id;
     std::uint16_t replica_port = 0;
     std::string replica_host;
@@ -16327,6 +16332,26 @@ class ReplicationManager::ReplicationGroup {
         continue;
       }
 
+      // Exercise a handshake arriving after the final idle check while the
+      // per-worker disable operations still yield under reset ownership.
+      LAVIK_FAULT_INJECT(
+          if (LAVIK_FAULT_MATCHES(
+                  "LAVIK_REPLICATION_PAUSE_IDLE_HISTORY_UNTIL_CONTROL_ONCE",
+                  "1") &&
+              !std::exchange(replication_idle_history_pause_used_, true)) {
+            spdlog::info(
+                "paused idle history retirement until next native control");
+            while (active_master_controls_.load(std::memory_order_acquire) ==
+                   0) {
+              if (replication_shutdown_requested_.load(
+                      std::memory_order_acquire))
+                co_return absl::OkStatus();
+              absl::Status waited = co_await bycorf::SleepFor(
+                  *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
+              if (!waited.ok()) co_return waited;
+            }
+          });
+
       absl::Status disabled = absl::OkStatus();
       for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
         disabled = co_await bycorf::SubmitTaskTo(
@@ -16547,6 +16572,7 @@ class ReplicationManager::ReplicationGroup {
   std::atomic<bool> replication_fullsync_pause_used_{false};
   std::atomic<bool> replication_fullsync_handoff_pause_used_{false};
   std::atomic<bool> replication_fullsync_catalog_pause_used_{false};
+  bool replication_idle_history_pause_used_ = false;  // worker 0 only
 #endif
   std::atomic<unsigned> snapshot_read_concurrency_{
       kDefaultReplicationSnapshotReadConcurrency};

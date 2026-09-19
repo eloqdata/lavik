@@ -14,7 +14,8 @@ Install Ubuntu 24.04 build packages for Lavik, lavik-meta, and lavik-ctl.
   -h, --help    Show this help.
 
 Run as your normal user; only apt uses sudo when needed. This script installs
-system packages, not Git submodules. See README.md for the complete build steps.
+system packages, not Git submodules. The Go bootstrap compiler downloads the
+exact toolchain pinned by raft/go.mod when Meta is configured. See README.md for the complete build steps.
 EOF
 }
 
@@ -45,7 +46,7 @@ fi
 
 packages=(
   build-essential gcc-13 g++-13 cmake ninja-build git
-  pkg-config python3 libssl-dev
+  pkg-config python3 libssl-dev golang-go
 )
 if "$with_bypass"; then
   packages+=(

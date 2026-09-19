@@ -180,6 +180,10 @@ unmounted `LAVIK_CLUSTER_SCRATCH_DEVICE` block device. The gate is a safety
 precondition; raw/SPDK scenarios must use the `cluster-hardware` label and keep
 destructive targets inside that allowlist.
 
+The standard AMD64 and ARM64 software CI jobs enable this gate with a private
+temporary loop device and detach it after the suite. That exercises the gate's
+device checks; it does not provide physical-device or SPDK coverage.
+
 The trace CLI can generate, replay, and minimize artifacts:
 
 ```bash

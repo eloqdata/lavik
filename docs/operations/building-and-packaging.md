@@ -53,6 +53,16 @@ submodules; follow the complete source checkout steps in the
 [README](../../README.md#build-from-source). Other distributions require
 manual installation of equivalent dependencies.
 
+Meta requires the Go toolchain pinned by `raft/go.mod` (currently 1.26.8),
+CGO, and the configured C compiler. The Ubuntu installer includes a Go bootstrap
+compiler; Go automatically downloads the pinned toolchain and checksummed
+modules on first configuration/build. CMake sets `GOTOOLCHAIN` to the exact
+version for configuration, archive builds and tests, including when the local
+Go launcher is newer. CI uses `actions/setup-go` with that same
+module file. No etcd submodule or running etcd service is required. Offline
+builders must prepopulate the Go toolchain/module caches. Set
+`-DLAVIK_GO_EXECUTABLE=/path/to/go` to select the Go launcher.
+
 Optimized local builds use the current machine's instruction set by default:
 
 ```bash
@@ -140,8 +150,7 @@ Initialize the required dependencies explicitly; SPDK uses Bycorf's direct DPDK
 submodule, so its nested DPDK checkout is not needed:
 
 ```bash
-git submodule update --init bycorf third_party/mimalloc third_party/nuraft
-git -C third_party/nuraft submodule update --init asio
+git submodule update --init bycorf third_party/mimalloc
 git -C bycorf submodule update --init third_party/liburing third_party/abseil \
   third_party/spdk third_party/dpdk
 git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
@@ -437,15 +446,22 @@ After building all targets, run the same suite locally with:
 ./scripts/run_ci_tests.sh build_ci
 ```
 
-The runner executes all registered CTest cases serially, the three opt-in large
-codec regressions, native large-List and large-Hash tests, the >1 GiB RDB
-import/export test, and every vendored Valkey TCL suite under its compatibility
-harness policy. It continues with the remaining suites after a failure and
+The runner executes all registered CTest cases serially, including the three
+large codec regressions, followed by native large-List and large-Hash tests,
+the >1 GiB RDB import/export test, and every vendored Valkey TCL suite under its
+compatibility harness policy. The large codec cases are enabled by default and
+carry the `large-codec` label; each runs without concurrent CTest cases even
+when invoked with `ctest --parallel`, since each retains roughly 2 GiB of
+payload. The runner continues with the remaining suites after a failure and
 returns nonzero if any suite fails. The ordinary CTest report still marks the
-large codec cases disabled and the large RDB case skipped; their explicit runs
-have separate logs. The hardware safety gate skips because hosted runners have
-no allowlisted scratch block device. Raw-device/SPDK verification requires a
-separate hardware host.
+large RDB case skipped; its explicit run has a separate log.
+
+CI enables the hardware safety gate using a private temporary file-backed loop
+device, which is detached when the suite exits. This exercises the scratch
+device eligibility checks; raw-device/SPDK verification still requires a
+separate hardware host. Local runs skip this gate unless
+`LAVIK_CLUSTER_HARDWARE_OPT_IN=1`; once enabled, a valid, unmounted
+`LAVIK_CLUSTER_SCRATCH_DEVICE` block device is required.
 
 Allow several GiB of free space for private test files under `/mnt/dev` and
 `/tmp`, and enable io_uring with a sufficient memlock limit. CI prepares these

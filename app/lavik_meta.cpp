@@ -14,38 +14,14 @@
  * limitations under the License.
  */
 
-// Entry point of the Raft-backed meta control plane.
-// lavik-meta is the only lavik artifact that links NuRaft: cluster
-// membership and other control-plane metadata live on the meta plane, while
-// the data-plane binary (lavik) and its tests stay Raft-free by
-// construction (guarded in the root CMakeLists.txt).
-//
-// Process layout:
-//   - main thread: CLI parse, assembly, startup waits, signal polling, and
-//     the ordered teardown. raft_server construction/teardown happen here;
-//     NuRaft's public API is thread-safe.
-//   - one bycorf Runtime worker: ctl/Data Node control transports, with
-//     authentication determined by the selected listener mode.
-//   - one bounded proposal-executor thread: synchronous entry into NuRaft's
-//     mutation/snapshot APIs, keeping their locks and WAL IO off Bycorf.
-//   - NuRaft native Asio workers: peer RPC and timers. NuRaft commit/append
-//     threads perform synchronous durability IO; completion and role events
-//     return to Bycorf through the Runtime's foreign executor mailbox.
-//
-// Teardown order (main thread, on SIGTERM/SIGINT):
-//   workflow reconcilers Shutdown() -> ctl Shutdown() ->
-//   Data control Shutdown() -> coordinator demotion ->
-//   proposal executor drain -> raft_launcher::shutdown() ->
-//   MetaStateMachine::WaitForSnapshotWriterIdle() -> release Raft ref -> Bycorf
-//   Runtime stop + join -> coordinator release.
-// shutdown() joins the commit thread — the only producer of automatic
-// snapshot jobs — and the writer drain lets an in-flight when_done reach the
-// still-alive core before reset (the shutdown contract in
-// state_machine.h). Once those producers quiesce, ForeignExecutor drains its
-// accepted notifications before the generic Bycorf Runtime is stopped, and
-// raft_server owns the
-// nuraft::context through a unique_ptr member — the caller must never delete
-// the context itself.
+// Entry point of the Meta control plane. The C++ state machine and Bycorf
+// Admin/Data worker are connected to the Go Raft runtime through a C ABI.
+// Go owns peer sockets, ticks, WAL, application ordering and snapshot workers.
+// Only lavik-meta links the archive; the Data binary and lavik-ctl stay
+// Raft-free. Shutdown drains workflow owners, Admin/Data sessions, and proposal
+// submission, then joins every Go callback producer before draining the foreign
+// mailbox and stopping Bycorf. A blocked disk syscall may delay shutdown, never
+// role revocation.
 
 #include <signal.h>
 #include <unistd.h>
@@ -71,24 +47,6 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "bycorf/runtime/runtime.h"
-#include "spdlog/sinks/stdout_color_sinks.h"
-#include "spdlog/spdlog.h"
-// NuRaft's headers are not -Wpedantic-clean.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#include "libnuraft/basic_types.hxx"
-#include "libnuraft/callback.hxx"
-#include "libnuraft/cluster_config.hxx"
-#include "libnuraft/context.hxx"
-#include "libnuraft/launcher.hxx"
-#include "libnuraft/logger.hxx"
-#include "libnuraft/raft_params.hxx"
-#include "libnuraft/raft_server.hxx"
-#include "libnuraft/rpc_listener.hxx"
-#include "libnuraft/srv_config.hxx"
-#pragma GCC diagnostic pop
-
 #include "lavik/cluster/meta_client.h"
 #include "lavik/meta/automatic_failover_reconciler.h"
 #include "lavik/meta/cluster_create.h"
@@ -101,18 +59,17 @@
 #include "lavik/meta/failover_reconciler.h"
 #include "lavik/meta/identity_verifier.h"
 #include "lavik/meta/membership_reconciler.h"
-#include "lavik/meta/nuraft_asio_transport.h"
-#include "lavik/meta/nuraft_log_store.h"
-#include "lavik/meta/nuraft_state_mgr.h"
 #include "lavik/meta/observation_store.h"
 #include "lavik/meta/proposal_executor.h"
+#include "lavik/meta/raft.h"
 #include "lavik/meta/state_machine.h"
 #include "lavik/numeric_endpoint.h"
 #include "lavik/version.h"
+#include "spdlog/sinks/stdout_color_sinks.h"
+#include "spdlog/spdlog.h"
 
 namespace {
 
-using lavik::meta::MetaAsioTransportConfig;
 using lavik::meta::MetaCoordinator;
 using lavik::meta::MetaCoordinatorOptions;
 using lavik::meta::MetaCtlServer;
@@ -123,10 +80,6 @@ using lavik::meta::MetaLeadershipRelay;
 using lavik::meta::MetaMembershipGate;
 using lavik::meta::MetaProposalExecutor;
 using lavik::meta::MetaStateMachine;
-using lavik::meta::NuraftMemberConfig;
-using lavik::meta::NuraftStartupMode;
-using lavik::meta::NuraftStateMgr;
-using lavik::meta::NuraftStateMgrOpenOptions;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -135,10 +88,10 @@ using lavik::meta::NuraftStateMgrOpenOptions;
 struct CliOptions {
   int id_ = 0;
   bool has_id_ = false;
-  // Process-local listeners. The initial manifest and then durable NuRaft
+  // Process-local listeners. The initial manifest and then durable Raft
   // config remain authoritative for advertised membership endpoints.
   std::string raft_addr_;
-  // Kept distinct from the NuRaft endpoint: data nodes neither speak nor
+  // Kept distinct from the Raft endpoint: data nodes neither speak nor
   // discover through the Raft transport.
   std::string data_control_addr_;
   std::string data_dir_;
@@ -157,13 +110,9 @@ struct CliOptions {
   int election_ms_high_ = 600;
   int snapshot_distance_ = 1000;
   // Zero keeps no reserve: every snapshot compacts the whole prefix. This
-  // also makes compaction observable in small process-level test clusters
-  // (NuRaft's default of 100000 would suppress it at that scale).
+  // also makes compaction observable in small process-level test clusters.
   int reserved_log_items_ = 0;
   int client_req_timeout_ms_ = 3000;
-  int snapshot_sync_timeout_ms_ = 0;  // 0 = NuRaft default
-  int raft_log_level_ = 4;            // NuRaft level: 6=trace .. 1=fatal
-  int raft_io_threads_ = 2;
 };
 
 struct EndpointParts {
@@ -184,8 +133,7 @@ void PrintUsage(const char* program) {
       "          [--heartbeat-ms N] [--election-ms-low N] [--election-ms-high "
       "N]\n"
       "          [--snapshot-distance N] [--reserved-log-items N]\n"
-      "          [--client-req-timeout-ms N] [--snapshot-sync-timeout-ms N]\n"
-      "          [--raft-io-threads N] [--raft-log-level 1..6] [--version] "
+      "          [--client-req-timeout-ms N] [--version] "
       "[--help]\n",
       program);
 }
@@ -240,9 +188,9 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
       return options;
     }
     if (name == "--version") {
-      std::printf("lavik-meta %.*s (nuraft %s)\n",
+      std::printf("lavik-meta %.*s (etcd/raft v3.7.0)\n",
                   static_cast<int>(lavik::kVersion.size()),
-                  lavik::kVersion.data(), LAVIK_NURAFT_PINNED_COMMIT);
+                  lavik::kVersion.data());
       *early_exit = true;
       *early_exit_code = 0;
       return options;
@@ -322,21 +270,6 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
         return absl::Status(absl::StatusCode::kInvalidArgument,
                             "bad --client-req-timeout-ms");
       }
-    } else if (name == "--snapshot-sync-timeout-ms") {
-      if (!ParseInt(value, 0, 600000, &options.snapshot_sync_timeout_ms_)) {
-        return absl::Status(absl::StatusCode::kInvalidArgument,
-                            "bad --snapshot-sync-timeout-ms");
-      }
-    } else if (name == "--raft-log-level") {
-      if (!ParseInt(value, 1, 6, &options.raft_log_level_)) {
-        return absl::Status(absl::StatusCode::kInvalidArgument,
-                            "bad --raft-log-level");
-      }
-    } else if (name == "--raft-io-threads") {
-      if (!ParseInt(value, 1, 128, &options.raft_io_threads_)) {
-        return absl::Status(absl::StatusCode::kInvalidArgument,
-                            "bad --raft-io-threads");
-      }
     } else {
       return absl::Status(absl::StatusCode::kInvalidArgument,
                           "unknown argument: " + std::string(name));
@@ -390,140 +323,20 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
   if (options.ctl_addr_.empty() && ctl_tls_any) {
     return absl::InvalidArgumentError("ctl TLS options require --ctl-addr");
   }
-  if (options.election_ms_low_ >= options.election_ms_high_) {
-    return absl::Status(absl::StatusCode::kInvalidArgument,
-                        "--election-ms-low must be < --election-ms-high");
+  // etcd randomizes elections in [N, 2N) ticks. Retain the upper-bound CLI
+  // spelling as an explicit consistency check because lease/observation
+  // assembly also uses it; accepting another value would misstate the timing.
+  if (options.election_ms_high_ != 2 * options.election_ms_low_) {
+    return absl::InvalidArgumentError(
+        "--election-ms-high must equal twice --election-ms-low");
   }
-  if (options.heartbeat_ms_ * 2 > options.election_ms_low_) {
-    return absl::Status(absl::StatusCode::kInvalidArgument,
-                        "--heartbeat-ms must be <= half of --election-ms-low");
+  if (options.election_ms_low_ % options.heartbeat_ms_ != 0 ||
+      options.election_ms_low_ < 3 * options.heartbeat_ms_ ||
+      options.election_ms_low_ > 60 * options.heartbeat_ms_) {
+    return absl::InvalidArgumentError(
+        "--election-ms-low must be 3..60 whole heartbeat ticks");
   }
   return options;
-}
-
-// ---------------------------------------------------------------------------
-// NuRaft logger -> spdlog (stderr, node-id prefix from the process pattern)
-// ---------------------------------------------------------------------------
-
-class MetaNuraftLogger : public nuraft::logger {
- public:
-  explicit MetaNuraftLogger(int level) : level_(level) {}
-
-  void set_level(int level) override {
-    level_.store(level, std::memory_order_release);
-  }
-  int get_level() override { return level_.load(std::memory_order_acquire); }
-
-  void put_details(int level, const char* source_file, const char* func_name,
-                   size_t line_number, const std::string& log_line) override {
-    const char* base = std::strrchr(source_file, '/');
-    spdlog::log(MapLevel(level), "[raft] {}:{} {}: {}",
-                base != nullptr ? base + 1 : source_file, line_number,
-                func_name, log_line);
-  }
-
-  void debug(const std::string& log_line) override {
-    spdlog::debug("[raft] {}", log_line);
-  }
-  void info(const std::string& log_line) override {
-    spdlog::info("[raft] {}", log_line);
-  }
-  void warn(const std::string& log_line) override {
-    spdlog::warn("[raft] {}", log_line);
-  }
-  void err(const std::string& log_line) override {
-    spdlog::error("[raft] {}", log_line);
-  }
-
- private:
-  static spdlog::level::level_enum MapLevel(int level) {
-    // NuRaft levels: 6=trace, 5=debug, 4=info, 3=warn, 2=error, 1=fatal.
-    switch (level) {
-      case 6:
-        return spdlog::level::trace;
-      case 5:
-        return spdlog::level::debug;
-      case 4:
-        return spdlog::level::info;
-      case 3:
-        return spdlog::level::warn;
-      case 2:
-        return spdlog::level::err;
-      default:
-        return spdlog::level::critical;
-    }
-  }
-
-  std::atomic<int> level_;
-};
-
-// ---------------------------------------------------------------------------
-// NuRaft raft_callback_: rare role/config transitions -> spdlog. The process
-// gates grep these lines to assert leader-change internals directly (the
-// externally observable leader=1/committed signals alone do not prove the
-// callback path fired).
-// ---------------------------------------------------------------------------
-
-// Name of a callback event worth an audit line; nullptr = skip. The chatty
-// per-request events (ProcessReq, HeartBeat, append-entry traffic) are never
-// logged, so the trail stays greppable.
-const char* RaftEventName(nuraft::cb_func::Type type) {
-  switch (type) {
-    case nuraft::cb_func::BecomeLeader:
-      return "BecomeLeader";
-    case nuraft::cb_func::BecomeFollower:
-      return "BecomeFollower";
-    case nuraft::cb_func::LeaderSmCatchingUp:
-      return "LeaderSmCatchingUp";
-    case nuraft::cb_func::NewConfig:
-      return "NewConfig";
-    case nuraft::cb_func::JoinedCluster:
-      return "JoinedCluster";
-    case nuraft::cb_func::RemovedFromCluster:
-      return "RemovedFromCluster";
-    case nuraft::cb_func::ResignationFromLeader:
-      return "ResignationFromLeader";
-    default:
-      return nullptr;
-  }
-}
-
-// init_options::raft_callback_ hook. NuRaft invokes callbacks from its own
-// threads and, in the sm-catchup path (handle_commit.cxx), while holding
-// raft_server::lock_, so this must stay fast and never block: it logs the
-// rare transitions and always returns Ok (never vetoes the operation).
-nuraft::cb_func::ReturnCode RaftEventCallback(nuraft::cb_func::Type type,
-                                              nuraft::cb_func::Param* param) {
-  const char* event = RaftEventName(type);
-  if (event == nullptr) {
-    return nuraft::cb_func::Ok;
-  }
-  // ctx is a ulong term for the three role-transition events and a ulong
-  // config log index for NewConfig; the remaining logged events have none.
-  std::string_view ctx_key;
-  nuraft::ulong ctx_value = 0;
-  switch (type) {
-    case nuraft::cb_func::BecomeLeader:
-    case nuraft::cb_func::BecomeFollower:
-    case nuraft::cb_func::LeaderSmCatchingUp:
-      ctx_key = "term";
-      ctx_value = *static_cast<const nuraft::ulong*>(param->ctx);
-      break;
-    case nuraft::cb_func::NewConfig:
-      ctx_key = "log_idx";
-      ctx_value = *static_cast<const nuraft::ulong*>(param->ctx);
-      break;
-    default:
-      break;
-  }
-  if (!ctx_key.empty()) {
-    spdlog::info("[raft-cb] event={} my_id={} leader_id={} {}={}", event,
-                 param->myId, param->leaderId, ctx_key, ctx_value);
-  } else {
-    spdlog::info("[raft-cb] event={} my_id={} leader_id={}", event, param->myId,
-                 param->leaderId);
-  }
-  return nuraft::cb_func::Ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -587,7 +400,7 @@ absl::StatusOr<std::string> ReadInitialClusterManifest(
 }
 
 // ParseClusterCreateManifest has already established the canonical tcp://
-// scheme; this adapter supplies NuRaft's scheme-free endpoint representation.
+// scheme; this adapter supplies Raft's scheme-free endpoint representation.
 std::string StripValidatedTcpEndpointScheme(
     std::string_view manifest_endpoint) {
   constexpr std::string_view kTcpPrefix = "tcp://";
@@ -664,22 +477,23 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // --- durable state (synchronous file IO, main thread) ---
-  const NuraftMemberConfig local_member{
-      .server_id_ = options.id_,
-      .raft_endpoint_ = lavik::FormatNumericEndpoint(
-          {.host_ = raft_endpoint->host_, .port_ = raft_endpoint->port_}),
-      .principal_ = "lavik://meta/" + std::to_string(options.id_),
-      .data_control_endpoint_ =
-          lavik::FormatNumericEndpoint({.host_ = data_control_endpoint->host_,
-                                        .port_ = data_control_endpoint->port_}),
-      .ctl_endpoint_ = ctl_endpoint_text,
-  };
-  NuraftStateMgrOpenOptions state_options{
-      .data_dir_ = options.data_dir_,
-      .local_member_ = local_member,
-      .initial_cluster_ = std::nullopt,
-  };
+  lavik::meta::MetaRaftOptions raft_options;
+  raft_options.id_ = options.id_;
+  raft_options.data_dir_ = options.data_dir_;
+  raft_options.listen_ = lavik::FormatNumericEndpoint(
+      {.host_ = raft_endpoint->host_, .port_ = raft_endpoint->port_});
+  raft_options.local_data_ =
+      lavik::FormatNumericEndpoint({.host_ = data_control_endpoint->host_,
+                                    .port_ = data_control_endpoint->port_});
+  raft_options.local_admin_ = ctl_endpoint_text;
+  raft_options.tls_ca_ = options.tls_ca_;
+  raft_options.tls_cert_ = options.tls_cert_;
+  raft_options.tls_key_ = options.tls_key_;
+  raft_options.heartbeat_ms_ = options.heartbeat_ms_;
+  raft_options.election_ms_ = options.election_ms_low_;
+  raft_options.client_timeout_ms_ = options.client_req_timeout_ms_;
+  raft_options.snapshot_distance_ = options.snapshot_distance_;
+  raft_options.reserved_log_items_ = options.reserved_log_items_;
   if (!options.initial_cluster_manifest_.empty()) {
     auto bytes = ReadInitialClusterManifest(options.initial_cluster_manifest_);
     if (!bytes.ok()) {
@@ -693,61 +507,31 @@ int main(int argc, char** argv) {
                        manifest.status().message());
       return 1;
     }
-    std::vector<NuraftMemberConfig> initial;
-    initial.reserve(manifest->meta_members_.size());
     for (const auto& member : manifest->meta_members_) {
-      initial.push_back({
-          .server_id_ = static_cast<std::int32_t>(member.server_id_),
-          .raft_endpoint_ =
+      raft_options.initial_.push_back(
+          std::make_shared<lavik::meta::MetaRaftMember>(
+              member.server_id_, 0,
               StripValidatedTcpEndpointScheme(member.raft_endpoint_),
-          .principal_ = "lavik://meta/" + std::to_string(member.server_id_),
-          .data_control_endpoint_ =
-              StripValidatedTcpEndpointScheme(member.data_control_endpoint_),
-          .ctl_endpoint_ =
-              StripValidatedTcpEndpointScheme(member.ctl_endpoint_),
-      });
+              lavik::meta::MetaMemberIdentity{
+                  static_cast<std::int32_t>(member.server_id_),
+                  "lavik://meta/" + std::to_string(member.server_id_),
+                  StripValidatedTcpEndpointScheme(
+                      member.data_control_endpoint_),
+                  StripValidatedTcpEndpointScheme(member.ctl_endpoint_)}
+                  .EncodeAux()));
     }
-    state_options.initial_cluster_ = std::move(initial);
   }
-  auto mgr_or = NuraftStateMgr::Open(std::move(state_options));
-  if (!mgr_or.ok()) {
-    spdlog::critical("state manager open failed: {}",
-                     mgr_or.status().message());
-    return 1;
-  }
-  nuraft::ptr<NuraftStateMgr> state_mgr(std::move(*mgr_or));
   auto machine_or = MetaStateMachine::Open(options.data_dir_);
   if (!machine_or.ok()) {
-    // The current durable layout is intentionally incompatible with the
-    // legacy single-file WAL and "LSN1" snapshots. Those formats held no
-    // production data, so boot refuses them loudly and the remedy is to wipe
-    // the directory rather than attempt migration.
     spdlog::critical("state machine open failed: {}",
                      machine_or.status().message());
     return 1;
   }
-  nuraft::ptr<MetaStateMachine> state_machine(std::move(*machine_or));
-  state_machine->AttachStateMgr(state_mgr);
-
-  MetaAsioTransportConfig transport_config;
-  transport_config.bind_address_ = raft_endpoint->host_;
-  transport_config.tls_ca_cert_file_ = options.tls_ca_;
-  transport_config.tls_cert_file_ = options.tls_cert_;
-  transport_config.tls_key_file_ = options.tls_key_;
-  transport_config.io_threads_ =
-      static_cast<std::size_t>(options.raft_io_threads_);
-  auto asio_options_or = lavik::meta::BuildMetaAsioOptions(
-      transport_config, state_mgr, state_machine);
-  if (!asio_options_or.ok()) {
-    spdlog::critical("Raft Asio transport setup failed: {}",
-                     asio_options_or.status().message());
-    return 1;
-  }
-  nuraft::asio_service::options asio_options = std::move(*asio_options_or);
+  std::shared_ptr<MetaStateMachine> state_machine(std::move(*machine_or));
 
   // --- Bycorf runtime ---
   // One worker owns ctl/Data Node transport. Runtime owns its thread,
-  // MPSC mailbox, and wake eventfd. NuRaft posts typed notifications directly
+  // MPSC mailbox, and wake eventfd. Raft posts typed notifications directly
   // through the worker's foreign executor without touching Bycorf TLS.
   bycorf::Runtime bycorf_runtime;
   std::promise<absl::Status> init_promise;
@@ -778,85 +562,31 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // --- raft core ---
-  nuraft::raft_params params;
-  params.with_election_timeout_lower(options.election_ms_low_);
-  params.with_election_timeout_upper(options.election_ms_high_);
-  params.with_hb_interval(options.heartbeat_ms_);
-  // Data-control leases are never allowed to outlive NuRaft's own belief in
-  // leadership. NuRaft's zero default expands to 20 heartbeats, which is
-  // longer than this deployment's election lower bound and can overlap a new
-  // leader; pin expiry to that lower bound explicitly.
-  params.with_leadership_expiry(options.election_ms_low_);
-  params.with_snapshot_enabled(options.snapshot_distance_);
-  params.with_reserved_log_items(options.reserved_log_items_);
-  params.with_client_req_timeout(options.client_req_timeout_ms_);
-  if (options.snapshot_sync_timeout_ms_ > 0) {
-    params.snapshot_sync_ctx_timeout_ = options.snapshot_sync_timeout_ms_;
-  }
-  // The ctl surface rejects non-leader writes instead of relying on NuRaft's
-  // follower auto-forwarding path.
-  params.auto_forwarding_ = false;
-  params.return_method_ = nuraft::raft_params::async_handler;
-  params.parallel_log_appending_ = false;
-  params.wait_for_sm_catchup_on_becoming_leader_ = true;
-  // Followers must attach their SM commit index to AppendEntries responses so
-  // a creation leader can prove the fixed genesis barrier. The leader-scoped
-  // cluster-create reconciler disables this mode outside wait-meta-barrier:
-  // on a leader NuRaft also changes every client completion from local commit
-  // to all-peer SM commit, which would otherwise destroy majority availability.
-  params.track_peers_sm_commit_idx_ = true;
-
-  auto raft_logger =
-      std::make_shared<MetaNuraftLogger>(options.raft_log_level_);
-
-  nuraft::raft_server::init_options init_opts;
-  init_opts.skip_initial_election_timeout_ =
-      state_mgr->startup_mode() == NuraftStartupMode::kWaitingJoiner;
-  // Construction necessarily precedes MetaCoordinator assembly because the
-  // coordinator needs the raft_server. The relay retains every role edge
-  // from that window and remains the shutdown lifetime barrier for callbacks
-  // already accepted by Bycorf's foreign mailbox.
+  // The relay preserves every role edge, including edges delivered before
+  // coordinator assembly. Authority revocation itself is atomic in MetaRaft.
   auto leadership_relay = std::make_shared<MetaLeadershipRelay>();
-  init_opts.raft_callback_ = [foreign_executor, leadership_relay](
-                                 nuraft::cb_func::Type type,
-                                 nuraft::cb_func::Param* param) {
-    const nuraft::cb_func::ReturnCode logged = RaftEventCallback(type, param);
-    int role = -1;
-    if (type == nuraft::cb_func::BecomeLeader) {
-      role = 1;
-    } else if (type == nuraft::cb_func::BecomeFollower) {
-      role = 0;
-    }
-    if (role != -1) {
-      // Record this exact edge before deferring delivery. Reading a shared
-      // "latest role" in the worker would collapse Leader -> Follower ->
-      // Leader and skip the authority-revocation barrier; recording before
-      // Notify also preserves callback order if mailbox producers interleave.
-      role == 1 ? leadership_relay->RecordLeaderEdge()
-                : leadership_relay->RecordFollowerEdge();
-      const bool accepted = foreign_executor.Notify(
-          [leadership_relay]() noexcept { leadership_relay->Drain(); });
-      if (!accepted) {
-        // This path is quiesced before Runtime shutdown. Losing a role edge
-        // here would leave leader-only control logic in the wrong state.
-        std::terminate();
-      }
-    }
-    return logged;
+  raft_options.role_ = [foreign_executor, leadership_relay](
+                           bool leader, std::uint64_t term) {
+    leader ? leadership_relay->RecordLeaderEdge()
+           : leadership_relay->RecordFollowerEdge();
+    if (!foreign_executor.Notify([leadership_relay, leader, term]() noexcept {
+          spdlog::info("[raft-cb] event={} term={}",
+                       leader ? "BecomeLeader" : "BecomeFollower", term);
+          leadership_relay->Drain();
+        }))
+      std::terminate();
   };
-  nuraft::raft_launcher launcher;
-  nuraft::ptr<nuraft::raft_server> server =
-      launcher.init(state_machine, state_mgr, raft_logger, raft_endpoint->port_,
-                    asio_options, params, init_opts);
-  if (server == nullptr) {
-    spdlog::critical("failed to start NuRaft Asio listener on {}",
-                     options.raft_addr_);
+  auto raft_or =
+      lavik::meta::MetaRaft::Open(std::move(raft_options), *state_machine);
+  if (!raft_or.ok()) {
+    spdlog::critical("etcd Raft startup failed: {}",
+                     raft_or.status().message());
     foreign_executor.WaitUntilIdle();
     bycorf_runtime.RequestStop();
     bycorf_runtime.WaitUntilStopped();
     return 1;
   }
+  auto server = std::move(*raft_or);
 
   int exit_code = 0;
   std::vector<std::shared_ptr<MetaCtlServer>> ctl_servers;
@@ -875,14 +605,12 @@ int main(int argc, char** argv) {
       std::make_shared<lavik::meta::MetaDataControlRuntimeStatus>();
   auto automatic_failover_diagnostics =
       std::make_shared<lavik::meta::MetaAutomaticFailoverDiagnosticsRegistry>();
-  nuraft::ptr<nuraft::log_store> raft_log_store = state_mgr->load_log_store();
-  auto* wal = static_cast<lavik::meta::NuraftLogStore*>(raft_log_store.get());
   MetaCoordinatorOptions coordinator_options;
   coordinator_options.proposal_executor_ = proposal_executor.get();
   coordinator_options.foreign_executor_ = foreign_executor;
   std::shared_ptr<MetaCoordinator> coordinator =
-      std::make_shared<MetaCoordinator>(server, *state_machine, *wal,
-                                        *obs_store, coordinator_options);
+      std::make_shared<MetaCoordinator>(server, *state_machine, *obs_store,
+                                        coordinator_options);
   coordinator->AddValidateHook(lavik::meta::ValidateFailoverProposal);
   leadership_relay->Attach(*coordinator);
   auto cluster_create_reconciler =
@@ -892,7 +620,7 @@ int main(int argc, char** argv) {
   auto membership_reconciler =
       std::make_shared<lavik::meta::MetaMembershipReconciler>(
           foreign_executor, *proposal_executor, server, state_machine,
-          state_mgr, membership_gate);
+          membership_gate);
   // Older Data binaries use exponential retry with up to 10 seconds of sleep.
   // No handshake field negotiates that bound, so retain their observation
   // grace during rolling upgrades even though current clients retry promptly.
@@ -1074,12 +802,11 @@ int main(int argc, char** argv) {
       ctl_display += options.ctl_addr_;
     }
     spdlog::info(
-        "node {} up: raft={} data-control={} ctl={} data-dir={} startup={} "
+        "node {} up: raft={} data-control={} ctl={} data-dir={} "
+        "backend=etcd/raft "
         "tls={}",
         options.id_, options.raft_addr_, options.data_control_addr_,
-        ctl_display, options.data_dir_,
-        static_cast<int>(state_mgr->startup_mode()),
-        transport_config.TlsEnabled());
+        ctl_display, options.data_dir_, !options.tls_ca_.empty());
     while (g_shutdown_requested == 0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
@@ -1095,8 +822,8 @@ int main(int argc, char** argv) {
   cluster_create_reconciler->Shutdown();
   membership_reconciler->Shutdown();
   // Stop both ingress surfaces first, then synchronously revoke the
-  // leader-scoped publisher before quiescing NuRaft/Asio while the Bycorf
-  // worker mailbox and snapshot writer remain alive.
+  // leader-scoped publisher before quiescing the Go runtime while the Bycorf
+  // worker mailbox and application callbacks remain alive.
   // Admin goes first so no new capture can race Data-control teardown.
   for (const auto& ctl : ctl_servers) {
     ctl->Shutdown();
@@ -1110,19 +837,12 @@ int main(int argc, char** argv) {
   // this queued edge is consumed.
   leadership_relay->DetachAndStop();
   coordinator->BecomeFollower();
-  // No new Bycorf ingress or leader work is accepted. Drain queued NuRaft
-  // mutation/snapshot entry before stopping its Asio service; cmd_result
+  // No new Bycorf ingress or leader work is accepted. Drain queued Raft
+  // mutation/snapshot entry before joining its Go executors; result
   // completions can still use the live foreign executor while shutdown
   // resolves rounds.
   proposal_executor->Shutdown();
-  if (!launcher.shutdown()) {
-    spdlog::error("NuRaft Asio shutdown did not quiesce within its timeout");
-    exit_code = 1;
-  }
-  // Snapshot-writer drain between shutdown() and reset(), per the shutdown
-  // contract in state_machine.h: an in-flight when_done must reach the
-  // core while it is still alive.
-  state_machine->WaitForSnapshotWriterIdle();
+  server->shutdown();
   server.reset();
   // Every foreign producer is now quiescent. Drain its accepted mailbox
   // prefix before stopping the generic Runtime, keeping this lifecycle policy

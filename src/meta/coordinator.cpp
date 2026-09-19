@@ -33,18 +33,9 @@
 #include <utility>
 #include <variant>
 
-#include "lavik/meta/nuraft_log_store.h"
+#include "lavik/meta/raft.h"
 #include "lavik/meta/state_machine.h"
 #include "spdlog/spdlog.h"
-// NuRaft's headers are not -Wpedantic-clean.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#include "libnuraft/async.hxx"
-#include "libnuraft/buffer.hxx"
-#include "libnuraft/raft_server.hxx"
-#include "libnuraft/srv_config.hxx"
-#pragma GCC diagnostic pop
 
 namespace lavik::meta {
 
@@ -85,7 +76,7 @@ class AuditReservation {
 };
 
 // Exactly one durability-recovery proposal may be unresolved at a time. The
-// lease follows NuRaft's completion rather than the caller coroutine, so a
+// lease follows Raft's completion rather than the caller coroutine, so a
 // timeout cannot admit a duplicate against the same committed view.
 class FailSafeRecoveryReservation {
  public:
@@ -277,10 +268,10 @@ MetaStoresFacts::FailoverTransitionById(
 
 namespace {
 
-using CmdResult = nuraft::cmd_result<nuraft::ptr<nuraft::buffer>>;
+using CmdResult = MetaRaftResult;
 
-// Shared wait state for one Propose round trip. The NuRaft completion handler
-// (any NuRaft thread, or inline on the caller for an already-completed
+// Shared wait state for one Propose round trip. The Raft completion handler
+// (any Raft thread, or inline on the caller for an already-completed
 // result) fills the raw outcome and resumes the suspended coroutine through
 // the foreign executor. If the Propose task was destroyed while suspended,
 // the awaiter detached the handle and the completion just drops. Shared
@@ -291,12 +282,12 @@ struct ProposeWaiter {
   std::coroutine_handle<> awaiting_{};
   bool ready_ = false;
   bool detached_ = false;
-  nuraft::cmd_result_code code_ = nuraft::cmd_result_code::CANCELLED;
+  MetaRaftResultCode code_ = MetaRaftResultCode::CANCELLED;
   std::optional<MetaApplyResult> apply_result_;
   bool has_exception_ = false;
   bycorf::ForeignExecutor foreign_executor_;
   bool inline_resume_ = false;
-  // Released only when NuRaft resolves the append, not when the caller's
+  // Released only when Raft resolves the append, not when the caller's
   // local deadline wins. That distinction closes the uncertain-tail audit
   // overflow race.
   std::unique_ptr<AuditReservation> audit_reservation_;
@@ -306,7 +297,7 @@ struct ProposeWaiter {
   std::unique_ptr<FailSafeRecoveryReservation> recovery_reservation_;
 };
 
-// Awaiter for the NuRaft round trip. The destructor runs on every exit from
+// Awaiter for the Raft round trip. The destructor runs on every exit from
 // the co_await expression — including destruction of a suspended frame — and
 // detaches the waiter so a late completion can never resume a dead coroutine.
 class ProposeAwaiter {
@@ -355,7 +346,7 @@ void ScheduleProposeResume(const ProposeWaiter& waiter,
 }
 
 void CompletePropose(const std::shared_ptr<ProposeWaiter>& waiter,
-                     CmdResult& result, nuraft::ptr<std::exception>& err) {
+                     CmdResult& result, std::shared_ptr<std::exception>& err) {
   std::coroutine_handle<> to_resume;
   {
     std::lock_guard<std::mutex> lock(waiter->mu_);
@@ -368,13 +359,13 @@ void CompletePropose(const std::shared_ptr<ProposeWaiter>& waiter,
       return;
     }
     waiter->code_ = result.get_result_code();
-    // Shutdown delivers CANCELLED together with a "Request cancelled."
-    // exception — the code is the signal, the exception only colour.
+    // Shutdown delivers CANCELLED; a missing exception does not turn an
+    // unresolved proposal into a successful application outcome.
     waiter->has_exception_ = (err != nullptr);
-    if (waiter->code_ == nuraft::cmd_result_code::OK) {
+    if (waiter->code_ == MetaRaftResultCode::OK) {
       // The state machine's commit() return carries the exact apply outcome;
       // do not re-read the rotating/prunable audit window after resumption.
-      nuraft::ptr<nuraft::buffer>& payload = result.get();
+      std::shared_ptr<MetaRaftBuffer>& payload = result.get();
       if (payload != nullptr) {
         const std::string_view bytes(
             reinterpret_cast<const char*>(payload->data_begin()),
@@ -402,7 +393,7 @@ void FailProposeDispatch(const std::shared_ptr<ProposeWaiter>& waiter) {
       waiter->recovery_reservation_.reset();
       return;
     }
-    waiter->code_ = nuraft::cmd_result_code::FAILED;
+    waiter->code_ = MetaRaftResultCode::FAILED;
     waiter->ready_ = true;
     if (!waiter->detached_ && waiter->awaiting_) {
       to_resume = waiter->awaiting_;
@@ -675,8 +666,8 @@ absl::Status UncertainOutcome(absl::StatusCode code, const std::string& what) {
 
 // ---------------------------------------------------------------------------
 // MetaProposeTimer: one thread walking a deadline queue of proposal waiters.
-// NuRaft's async_handler return method resolves cmd_results only on commit or
-// shutdown — it has no client-side timeout — so the seam bounds the wait
+// Raft resolves results on application, demotion or shutdown; the coordinator
+// owns client deadlines and bounds the wait
 // itself. Expiry resolves the waiter as TIMEOUT (first-wins against a late
 // raft completion). The thread holds only weak waiter references and never
 // touches coordinator state, so destruction just stops and joins.
@@ -737,7 +728,7 @@ class MetaProposeTimer {
     {
       std::lock_guard<std::mutex> lock(waiter->mu_);
       if (waiter->ready_) return;  // the raft completion won
-      waiter->code_ = nuraft::cmd_result_code::TIMEOUT;
+      waiter->code_ = MetaRaftResultCode::TIMEOUT;
       waiter->ready_ = true;
       if (!waiter->detached_ && waiter->awaiting_) {
         to_resume = waiter->awaiting_;
@@ -776,14 +767,12 @@ class MetaCoordinator::InFlightGuard {
 // MetaCoordinator
 // ---------------------------------------------------------------------------
 
-MetaCoordinator::MetaCoordinator(nuraft::ptr<nuraft::raft_server> server,
+MetaCoordinator::MetaCoordinator(std::shared_ptr<MetaRaft> server,
                                  MetaStateMachine& state_machine,
-                                 NuraftLogStore& log_store,
                                  MetaObservationStore& observations,
                                  MetaCoordinatorOptions options)
     : server_(std::move(server)),
       state_machine_(state_machine),
-      log_store_(log_store),
       observations_(observations),
       options_(std::move(options)),
       owned_proposal_executor_(options_.proposal_executor_ == nullptr
@@ -917,7 +906,7 @@ absl::Status MetaCoordinator::NotLeaderStatus() const {
   const std::int32_t leader = server_->get_leader();
   if (leader >= 0) {
     hint = "id=" + std::to_string(leader);
-    const nuraft::ptr<nuraft::srv_config> config =
+    const std::shared_ptr<MetaRaftMember> config =
         server_->get_srv_config(leader);
     if (config != nullptr) {
       hint += " endpoint=" + config->get_endpoint();
@@ -1310,7 +1299,7 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
     }
   }
 
-  const std::uint64_t uncompacted = log_store_.UncompactedBytes();
+  const std::uint64_t uncompacted = server_->UncompactedBytes();
   const std::uint64_t snapshot_failures =
       state_machine_.consecutive_snapshot_failures();
   const bool wal_fail_safe = uncompacted > options_.max_uncompacted_wal_bytes_;
@@ -1376,29 +1365,29 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   waiter->inline_resume_ = options_.inline_resume_for_testing_;
   waiter->audit_reservation_ = std::move(audit_reservation);
   waiter->recovery_reservation_ = std::move(recovery_reservation);
-  std::vector<nuraft::ptr<nuraft::buffer>> logs;
+  std::vector<std::shared_ptr<MetaRaftBuffer>> logs;
   logs.push_back(*encoded);
   const absl::Status submitted = proposal_executor_->Submit(
       [server = server_, logs = std::move(logs), waiter]() mutable {
         try {
-          nuraft::ptr<CmdResult> result = server->append_entries(logs);
+          std::shared_ptr<CmdResult> result = server->append_entries(logs);
           if (result == nullptr) {
             FailProposeDispatch(waiter);
             return;
           }
           // Registration belongs inside the task's exception boundary too:
-          // without a handler, neither NuRaft nor the executor can resolve
+          // without a handler, neither Raft nor the executor can resolve
           // the waiter for this dispatch.
-          result->when_ready(
-              [waiter](CmdResult& completed, nuraft::ptr<std::exception>& err) {
-                CompletePropose(waiter, completed, err);
-              });
+          result->when_ready([waiter](CmdResult& completed,
+                                      std::shared_ptr<std::exception>& err) {
+            CompletePropose(waiter, completed, err);
+          });
         } catch (...) {
           FailProposeDispatch(waiter);
         }
       });
   if (!submitted.ok()) co_return submitted;
-  // The seam's own round-trip bound (NuRaft's async_handler mode has no
+  // The seam's own round-trip bound (Raft results have no
   // client-side timeout). It includes executor queueing time and first-wins
   // against the raft completion.
   propose_timer_->Arm(
@@ -1409,15 +1398,15 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
 
   // The waiter is filled (see ProposeAwaiter for the happens-before).
   switch (waiter->code_) {
-    case nuraft::cmd_result_code::OK:
+    case MetaRaftResultCode::OK:
       break;
-    case nuraft::cmd_result_code::TIMEOUT:
+    case MetaRaftResultCode::TIMEOUT:
       co_return UncertainOutcome(absl::StatusCode::kDeadlineExceeded,
                                  "timed out");
-    case nuraft::cmd_result_code::CANCELLED:
+    case MetaRaftResultCode::CANCELLED:
       co_return UncertainOutcome(absl::StatusCode::kCancelled,
                                  "was cancelled (shutdown or leadership loss)");
-    case nuraft::cmd_result_code::NOT_LEADER:
+    case MetaRaftResultCode::NOT_LEADER:
       co_return NotLeaderStatus();
     default:
       co_return UncertainOutcome(

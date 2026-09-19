@@ -56,12 +56,13 @@ failover state. Data consumes a complete bootstrap once, then independent
 routing, local control and task updates. Initial creation, Meta-member
 addition/removal, and per-Group failover are recovered by the current leader,
 independent of an Admin client's connection or wait deadline. It links the
-pinned NuRaft submodule, whose native Asio service owns Raft peer communication;
+[Meta Raft runtime](10-meta-raft.md), a Go C archive with pinned etcd Raft/WAL
+modules and independent protocol, disk and peer-connection owners;
 Bycorf owns the separate administrative and Data-node sessions. The Raft-free
 `lavik-ctl` operator client sends direct administrative commands; its
 `cluster-status` command discovers the current Meta leader and reads one stable
 cluster-readiness cut through that surface; `failover` submits a durable
-controlled transition and `getop` follows its operator-visible outcome. NuRaft
+controlled transition and `getop` follows its operator-visible outcome. Raft
 is linked only into `lavik-meta`: the data-plane executable, operator client, their supporting
 libraries, and their focused tests never see consensus code, and the build
 enforces that boundary at configure time.
@@ -295,7 +296,7 @@ cleanup as another durable phase.
 |---|---|
 | Bycorf | Pinned git submodule compiled into Lavik for runtime, network, TLS, cross-core, HTTP, io_uring, and optional SPDK support |
 | mimalloc | Pinned allocator submodule; the official global new/delete override serves ordinary C++ allocations, while retained storage calls mimalloc through explicitly accounted domains |
-| NuRaft | Pinned Raft consensus submodule linked only by `lavik-meta`; its native Asio service owns Raft peer sockets, timers, and TLS and uses the Asio headers shipped in the NuRaft source tree |
+| etcd Raft | Pinned Go Modules embedded in `lavik-meta` through a C archive; owns protocol, peer connections, WAL and snapshot persistence independently of Bycorf |
 | OpenSSL | TLS server/client contexts; release builds can link it statically |
 | Redis/Valkey clients | RESP2 by default; `HELLO 2`/`HELLO 3` selects connection-level reply semantics, including RESP3 maps, sets, booleans, doubles, nulls, and push frames where handlers expose them |
 | Redis Sentinel | Discovers topology through Redis-compatible `INFO`, `ROLE`, client metadata, and Pub/Sub connections; drives failover with `REPLICAOF`, `CONFIG REWRITE`, and client eviction, using `replica-priority` for candidate preference |
@@ -313,7 +314,7 @@ those deployment boundaries remain unknown here.
 | Claim | Repository source |
 |---|---|
 | Language level, targets, dependencies, source units, and test entry points | `CMakeLists.txt` |
-| Meta control-plane composition, failover reconciler, and NuRaft layering boundary | `CMakeLists.txt`, `app/lavik_meta.cpp`, `include/lavik/meta/`, `src/meta/`, `.gitmodules` |
+| Meta control-plane composition, failover reconciler, and Raft layering boundary | `CMakeLists.txt`, `app/lavik_meta.cpp`, `include/lavik/meta/`, `src/meta/`, `.gitmodules` |
 | CLI/config parsing and top-level process entry | `app/lavik.cpp`, `include/lavik/config.h`, `src/config.cpp` |
 | Module construction, worker startup barriers, readiness, and shutdown ordering | `include/lavik/server.h`, `src/redis/server.cpp` |
 | Bycorf runtime and service dependency | `.gitmodules`, `bycorf/include/bycorf/runtime/`, `bycorf/include/bycorf/net/`, `bycorf/src/` |

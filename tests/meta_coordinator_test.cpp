@@ -14,21 +14,20 @@
  * limitations under the License.
  */
 
-// Tests for the in-process coordinator API, which hides NuRaft from control
+// Tests for the in-process coordinator API, which hides Raft from control
 // sessions and operation reconcilers.
 //
 // Two slices:
 //   1. Component tests (MetaCoordinatorComponentTest): a MetaCoordinator over a
-//      bare MetaStateMachine + WAL v1 NuraftLogStore with NO raft_server,
+//      bare MetaStateMachine without a MetaRaft runtime,
 //      driven by direct SM commit() calls. Covers the subscription contract
 //      (atomic {view, cursor, subscription} triple, strict commit order, the
 //      documented replay duplicate-index/dedup rule, bounded-queue backpressure
 //      cancel, handle-destruction unsubscribe), the view-backed
 //      MetaCommittedFacts adapter, and the no-server fast-fail of Propose.
-//   2. Single-node raft_server integration (MetaCoordinatorServerTest): real
-//      elections and commits over the real adapters (NuraftStateMgr + WAL v1 +
-//      MetaStateMachine), mirroring meta_state_machine_test.cpp's
-//      ThreadScheduler/NullRpcClientFactory harness. Covers Propose (actor
+//   2. Single-node MetaRaft integration (MetaCoordinatorServerTest): real
+//      elections, C ABI callbacks, and etcd WAL persistence with the production
+//      MetaStateMachine. Covers Propose (actor
 //      injection, verdict from the audit store), NOT_LEADER, the three
 //      fail-safe gates with constructor-injected thresholds, ValidateProposal
 //      hooks, uncertain-outcome semantics (timeout/cancel; reconcile via the
@@ -68,13 +67,11 @@
 #include "lavik/meta/coordinator.h"
 #include "lavik/meta/failover.h"
 #include "lavik/meta/hash.h"
-#include "lavik/meta/nuraft_log_store.h"
-#include "lavik/meta/nuraft_state_mgr.h"
 #include "lavik/meta/observation_store.h"
 #include "lavik/meta/state_machine.h"
-#include "libnuraft/nuraft.hxx"
 #include "spdlog/sinks/ostream_sink.h"
 #include "spdlog/spdlog.h"
+#include "support/meta_raft.h"
 #include "support/test_data_path.h"
 
 // Trusted test peer for the passkey-protected principal boundary. Tests use
@@ -111,8 +108,6 @@ using lavik::meta::MetaRequestId;
 using lavik::meta::MetaStateMachine;
 using lavik::meta::MetaStoresFacts;
 using lavik::meta::MetaSubscriptionStart;
-using lavik::meta::NuraftLogStore;
-using lavik::meta::NuraftStateMgr;
 using lavik::meta::RegisterNode;
 using lavik::meta::SubmitOperation;
 using lavik::meta::TransitionOperationPhase;
@@ -231,7 +226,7 @@ RegisterNode MakeRegister(std::uint8_t seed) {
 
 // Drives one seam Task to completion from a plain thread. The completion
 // callback gives the happens-before edge for reading the promise value; a
-// suspended task destroyed on the timeout path detaches its NuRaft waiter
+// suspended task destroyed on the timeout path detaches its Raft waiter
 // (the coordinator's awaiter contract), so this cannot dangle.
 template <typename T>
 T RunTaskSync(bycorf::Task<T> task) {
@@ -294,21 +289,17 @@ class MetaCoordinatorComponentTest : public ::testing::Test {
     auto machine = MetaStateMachine::Open(dir_);
     ASSERT_TRUE(machine.ok()) << machine.status();
     machine_ = std::move(*machine);
-    auto wal = NuraftLogStore::Open(dir_ / "wal");
-    ASSERT_TRUE(wal.ok()) << wal.status();
-    wal_ = std::move(*wal);
   }
 
   void TearDown() override {
     coordinator_.reset();
     machine_.reset();
-    wal_.reset();
     RemoveTestDir(dir_);
   }
 
   void MakeCoordinator(MetaCoordinatorOptions options = {}) {
     coordinator_ = std::make_unique<MetaCoordinator>(
-        nuraft::ptr<nuraft::raft_server>(nullptr), *machine_, *wal_,
+        std::shared_ptr<lavik::meta::MetaRaft>(nullptr), *machine_,
         observations_, std::move(options));
   }
 
@@ -321,7 +312,6 @@ class MetaCoordinatorComponentTest : public ::testing::Test {
 
   std::filesystem::path dir_;
   std::unique_ptr<MetaStateMachine> machine_;
-  std::unique_ptr<NuraftLogStore> wal_;
   MetaObservationStore observations_;
   std::unique_ptr<MetaCoordinator> coordinator_;
 };
@@ -674,58 +664,8 @@ TEST_F(MetaCoordinatorComponentTest, CommittedViewFactsAnswerFromStores) {
 }
 
 // ---------------------------------------------------------------------------
-// raft_server integration (single node, real adapters)
+// MetaRaft integration (single voter, real C ABI and WAL)
 // ---------------------------------------------------------------------------
-
-// Minimal real-time scheduler: one thread per delayed task (same pattern as
-// meta_state_machine_test.cpp; cancelled tasks exit cheaply because
-// delayed_task::execute() re-checks the cancellation flag).
-class ThreadScheduler : public nuraft::delayed_task_scheduler {
- public:
-  ~ThreadScheduler() override { Shutdown(); }
-
-  void schedule(nuraft::ptr<nuraft::delayed_task>& task,
-                nuraft::int32 milliseconds) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (stopped_) return;
-    threads_.emplace_back([this, task, milliseconds]() {
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        stopped_cv_.wait_for(lock, std::chrono::milliseconds(milliseconds),
-                             [this] { return stopped_; });
-      }
-      if (!stopped_) task->execute();
-    });
-  }
-
-  void Shutdown() {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      stopped_ = true;
-    }
-    stopped_cv_.notify_all();
-    for (std::thread& thread : threads_) {
-      if (thread.joinable()) thread.join();
-    }
-  }
-
- private:
-  void cancel_impl(nuraft::ptr<nuraft::delayed_task>& task) override {}
-
-  std::mutex mutex_;
-  std::condition_variable stopped_cv_;
-  bool stopped_ = false;
-  std::vector<std::thread> threads_;
-};
-
-// Single-node clusters never open peer connections.
-class NullRpcClientFactory : public nuraft::rpc_client_factory {
- public:
-  nuraft::ptr<nuraft::rpc_client> create_client(
-      const std::string& endpoint) override {
-    return nullptr;
-  }
-};
 
 struct ServerKnobs {
   int client_req_timeout_ms_ = 5000;
@@ -755,60 +695,30 @@ class MetaCoordinatorServerTest : public ::testing::Test {
   }
 
   void OpenStorage() {
-    const lavik::meta::NuraftMemberConfig local{
-        1, "127.0.0.1:9601", "lavik://meta/1", "127.0.0.1:9701",
-        "127.0.0.1:9801"};
-    lavik::meta::NuraftStateMgrOpenOptions options{.data_dir_ = dir_,
-                                                   .local_member_ = local};
-    if (!std::filesystem::exists(std::filesystem::path(dir_) /
-                                 "cluster_config.dat")) {
-      options.initial_cluster_ = std::vector{local};
-    }
-    auto mgr = NuraftStateMgr::Open(std::move(options));
-    ASSERT_TRUE(mgr.ok()) << mgr.status();
-    mgr_ = nuraft::ptr<NuraftStateMgr>(std::move(*mgr));
     auto machine = MetaStateMachine::Open(dir_);
     ASSERT_TRUE(machine.ok()) << machine.status();
-    machine_ = nuraft::ptr<MetaStateMachine>(std::move(*machine));
+    machine_ = std::shared_ptr<MetaStateMachine>(std::move(*machine));
   }
 
   // Launches the raft core WITHOUT waiting for leadership: tests wire the
   // coordinator and reconcilers first, so the organic BecomeLeader callback
-  // (gated by wait_for_sm_catchup) is never missed.
+  // (gated by the current-term application fence) is never missed.
   void LaunchServer(const ServerKnobs& knobs = {}) {
-    scheduler_ = nuraft::cs_new<ThreadScheduler>();
-    nuraft::raft_params params;
-    params.with_election_timeout_lower(knobs.election_ms_low_);
-    params.with_election_timeout_upper(knobs.election_ms_high_);
-    params.with_hb_interval(50);
-    params.with_snapshot_enabled(0);
-    params.with_reserved_log_items(0);
-    params.with_client_req_timeout(knobs.client_req_timeout_ms_);
-    params.return_method_ = nuraft::raft_params::async_handler;
-    // Production parity (meta_main): the BecomeLeader callback fires only
-    // after the SM caught up — RunAsLeader reconcilers never see a partial
-    // replay through CommittedView.
-    params.wait_for_sm_catchup_on_becoming_leader_ = true;
-
-    nuraft::context* ctx = new nuraft::context(
-        mgr_, machine_, /*listener=*/nullptr, /*logger=*/nullptr,
-        nuraft::cs_new<NullRpcClientFactory>(), scheduler_, params);
-    nuraft::raft_server::init_options init_opts;
-    init_opts.raft_callback_ = [this](nuraft::cb_func::Type type,
-                                      nuraft::cb_func::Param*) {
-      // NuRaft may invoke this while holding raft_server::lock_; the
-      // coordinator's Become* methods are O(1) queue pushes by contract.
-      std::lock_guard<std::mutex> lock(role_mu_);
-      MetaCoordinator* target = forward_target_;
-      if (target == nullptr) return nuraft::cb_func::Ok;
-      if (type == nuraft::cb_func::BecomeLeader) {
-        target->BecomeLeader();
-      } else if (type == nuraft::cb_func::BecomeFollower) {
-        target->BecomeFollower();
-      }
-      return nuraft::cb_func::Ok;
+    auto options = lavik::test::SingleMetaOptions(dir_);
+    options.election_ms_ = knobs.election_ms_low_;
+    options.client_timeout_ms_ = knobs.client_req_timeout_ms_;
+    options.before_apply_ = [this] { apply_barrier_.Wait(); };
+    options.role_ = [this](bool leader, std::uint64_t) {
+      std::lock_guard lock(role_mu_);
+      if (forward_target_ == nullptr) return;
+      if (leader)
+        forward_target_->BecomeLeader();
+      else
+        forward_target_->BecomeFollower();
     };
-    server_ = nuraft::cs_new<nuraft::raft_server>(ctx, init_opts);
+    auto opened = lavik::meta::MetaRaft::Open(std::move(options), *machine_);
+    ASSERT_TRUE(opened.ok()) << opened.status();
+    server_ = std::move(*opened);
     server_running_ = true;
   }
 
@@ -818,8 +728,6 @@ class MetaCoordinatorServerTest : public ::testing::Test {
   }
 
   void MakeCoordinator(MetaCoordinatorOptions options = {}) {
-    nuraft::ptr<nuraft::log_store> store = mgr_->load_log_store();
-    wal_ = static_cast<NuraftLogStore*>(store.get());
     // This fixture drives Tasks from an ordinary test thread and has no Bycorf
     // worker. Keep that exceptional execution policy explicit rather than
     // relying on a production-dangerous inline fallback in MetaCoordinator.
@@ -827,7 +735,7 @@ class MetaCoordinatorServerTest : public ::testing::Test {
       options.inline_resume_for_testing_ = true;
     }
     coordinator_ = std::make_unique<MetaCoordinator>(
-        server_, *machine_, *wal_, observations_, std::move(options));
+        server_, *machine_, observations_, std::move(options));
     {
       std::lock_guard<std::mutex> lock(role_mu_);
       forward_target_ = coordinator_.get();
@@ -835,6 +743,7 @@ class MetaCoordinatorServerTest : public ::testing::Test {
   }
 
   void StopServer() {
+    apply_barrier_.Resume();
     {
       std::lock_guard<std::mutex> lock(role_mu_);
       forward_target_ = nullptr;
@@ -847,19 +756,10 @@ class MetaCoordinatorServerTest : public ::testing::Test {
       server_->shutdown();
       server_running_ = false;
     }
-    if (machine_) {
-      machine_->WaitForSnapshotWriterIdle();
-    }
     if (server_) {
       server_.reset();
     }
-    if (scheduler_) {
-      scheduler_->Shutdown();
-      scheduler_.reset();
-    }
     machine_.reset();
-    mgr_.reset();
-    wal_ = nullptr;
   }
 
   // Mid-test stop of only the raft core (the uncertain-outcome cancel path);
@@ -1041,12 +941,10 @@ class MetaCoordinatorServerTest : public ::testing::Test {
   }
 
   std::filesystem::path dir_;
-  nuraft::ptr<NuraftStateMgr> mgr_;
-  nuraft::ptr<MetaStateMachine> machine_;
-  NuraftLogStore* wal_ = nullptr;  // owned by mgr_
-  nuraft::ptr<ThreadScheduler> scheduler_;
-  nuraft::ptr<nuraft::raft_server> server_;
+  std::shared_ptr<MetaStateMachine> machine_;
+  std::shared_ptr<lavik::meta::MetaRaft> server_;
   bool server_running_ = false;
+  lavik::test::MetaApplyBarrier apply_barrier_;
   MetaObservationStore observations_;
   std::unique_ptr<MetaCoordinator> coordinator_;
   std::mutex role_mu_;
@@ -1090,12 +988,10 @@ TEST_F(MetaCoordinatorServerTest, ProposeInjectsActorAndReturnsAuditVerdict) {
 TEST_F(MetaCoordinatorServerTest,
        AttachedCoordinatorRequiresContinuationExecutor) {
   StartServer();
-  nuraft::ptr<nuraft::log_store> store = mgr_->load_log_store();
-  wal_ = static_cast<NuraftLogStore*>(store.get());
 
   EXPECT_THROW(
       {
-        MetaCoordinator coordinator(server_, *machine_, *wal_, observations_,
+        MetaCoordinator coordinator(server_, *machine_, observations_,
                                     MetaCoordinatorOptions{});
       },
       std::invalid_argument);
@@ -1103,10 +999,7 @@ TEST_F(MetaCoordinatorServerTest,
 
 TEST_F(MetaCoordinatorServerTest, ProposeNotLeaderThenLeader) {
   // A wide election window keeps the first self-election seconds away, so the
-  // first Propose deterministically lands while the node is still a follower
-  // (skip_initial_election_timeout_ is NOT an option: NuRaft reads it as
-  // "wait to be contacted by a leader", which never comes for a one-node
-  // group).
+  // first Propose deterministically lands while the node is still a follower.
   StartServer({.election_ms_low_ = 3000, .election_ms_high_ = 6000});
   MakeCoordinator();
   auto not_leader = ProposeSync(MakeRegister(0x21));
@@ -1523,7 +1416,7 @@ TEST_F(MetaCoordinatorServerTest,
   options.propose_timeout_ms_ = 250;
   MakeCoordinator(options);
 
-  server_->pause_state_machine_execution(5000);
+  apply_barrier_.Pause();
   lavik::meta::ArchiveOperations archive;
   archive.request_id_ = MakeRequestId(0x3f);
   archive.operation_seqs_ = {submitted->log_index_};
@@ -1536,7 +1429,7 @@ TEST_F(MetaCoordinatorServerTest,
   ASSERT_FALSE(overlapping.ok());
   EXPECT_EQ(overlapping.status().code(), absl::StatusCode::kResourceExhausted);
 
-  server_->resume_state_machine_execution();
+  apply_barrier_.Resume();
   ASSERT_TRUE(WaitFor(
       [&] {
         return machine_->StoresSnapshot()
@@ -1559,7 +1452,7 @@ TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
   // Select strict-export through the replicated command before filling the
   // window. The setup command is itself audited and counts toward capacity.
   const std::uint64_t before = server_->get_committed_log_idx();
-  std::vector<nuraft::ptr<nuraft::buffer>> logs;
+  std::vector<std::shared_ptr<lavik::meta::MetaRaftBuffer>> logs;
   logs.reserve(lavik::meta::kMaxMetaAuditWindowRecords);
   lavik::meta::SetAuditPolicy policy;
   policy.request_id_ = MakeRequestId(0x31);
@@ -1575,12 +1468,20 @@ TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
     ASSERT_TRUE(encoded.ok()) << encoded.status();
     logs.push_back(*encoded);
   }
-  auto batch = server_->append_entries(logs);
-  ASSERT_NE(batch, nullptr);
-  ASSERT_TRUE(
-      WaitFor([&] { return batch->has_result(); }, std::chrono::seconds(25)));
-  ASSERT_EQ(batch->get_result_code(), nuraft::cmd_result_code::OK)
-      << batch->get_result_str();
+  for (size_t offset = 0; offset < logs.size(); offset += 128) {
+    std::vector<std::shared_ptr<lavik::meta::MetaRaftResult>> pending;
+    for (size_t i = offset; i < std::min(offset + 128, logs.size()); ++i)
+      pending.push_back(server_->append_entries({logs[i]}));
+    ASSERT_TRUE(WaitFor(
+        [&] {
+          return std::all_of(
+              pending.begin(), pending.end(),
+              [](const auto& value) { return value->has_result(); });
+        },
+        std::chrono::seconds(25)));
+    for (const auto& value : pending)
+      ASSERT_EQ(value->get_result_code(), lavik::meta::MetaRaftResultCode::OK);
+  }
   ASSERT_EQ(machine_->StoresSnapshot().audit_.size(),
             lavik::meta::kMaxMetaAuditWindowRecords);
   ASSERT_GE(machine_->last_commit_index(),
@@ -1611,7 +1512,7 @@ TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
     ++first_audit_index;
   }
   ASSERT_LE(first_audit_index, machine_->last_commit_index());
-  server_->pause_state_machine_execution(5000);
+  apply_barrier_.Pause();
   lavik::meta::PruneAudit first_prune;
   first_prune.request_id_ = MakeRequestId(0x35);
   first_prune.through_log_index_ = first_audit_index;
@@ -1625,7 +1526,7 @@ TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
   ASSERT_FALSE(reserved.ok());
   EXPECT_EQ(reserved.status().code(), absl::StatusCode::kResourceExhausted);
 
-  server_->resume_state_machine_execution();
+  apply_barrier_.Resume();
   ASSERT_TRUE(WaitFor(
       [&] {
         return machine_->StoresSnapshot().audit_.pruned_floor() >=
@@ -1712,8 +1613,8 @@ TEST_F(MetaCoordinatorServerTest, ValidateHooksObserveAndRejectBeforeAppend) {
 
 TEST_F(MetaCoordinatorServerTest, UncertainOutcomeTimeoutIsReconcilable) {
   StartServer({.client_req_timeout_ms_ = 600});
-  // The seam bounds the round trip itself (NuRaft's async_handler mode has
-  // no client-side timeout): inject a short one.
+  // The coordinator owns the caller deadline; Raft still applies a proposal
+  // whose client has timed out.
   MetaCoordinatorOptions options;
   options.propose_timeout_ms_ = 300;
   MakeCoordinator(options);
@@ -1721,20 +1622,20 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeTimeoutIsReconcilable) {
   ASSERT_TRUE(ProposeSync(MakeRegister(0x51)).ok());
 
   // Timeout-then-commit — the strong uncertain-outcome case. Pausing SM
-  // execution (NuRaft's public pause_state_machine_execution) stalls the
+  // execution through the application-executor barrier stalls the
   // apply without touching the append path: the entry lands in the WAL and
   // reaches (single-node) quorum, but the cmd_result cannot complete until
   // the SM runs it, so the client round times out first.
-  server_->pause_state_machine_execution(5000);
-  ASSERT_TRUE(server_->is_state_machine_execution_paused());
-  const std::uint64_t slot_before_timeout = wal_->next_slot();
+  apply_barrier_.Pause();
+  ASSERT_TRUE(apply_barrier_.paused());
+  const std::uint64_t slot_before_timeout = machine_->last_commit_index();
   auto timed_out = ProposeSync(MakeRegister(0x52));
   ASSERT_FALSE(timed_out.ok());
   EXPECT_EQ(timed_out.status().code(), absl::StatusCode::kDeadlineExceeded);
   EXPECT_NE(timed_out.status().message().find("uncertain"), std::string::npos)
       << timed_out.status();
   // The entry was genuinely in flight: appended to the WAL, never applied.
-  EXPECT_GT(wal_->next_slot(), slot_before_timeout);
+  EXPECT_GT(server_->DurableIndex(), slot_before_timeout);
   EXPECT_FALSE(machine_->StoresSnapshot()
                    .identity_.FindNode(MakeNodeId(0x52))
                    .has_value());
@@ -1744,11 +1645,70 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeTimeoutIsReconcilable) {
   // timeout as failure and retried a NON-idempotent command would now have
   // double-applied it — the seam's commands are idempotent by design, and the
   // documented reconciliation is via CommittedView.
-  server_->resume_state_machine_execution();
+  apply_barrier_.Resume();
   ASSERT_TRUE(WaitFor(
       [this] {
         return machine_->StoresSnapshot()
             .identity_.FindNode(MakeNodeId(0x52))
+            .has_value();
+      },
+      std::chrono::seconds(10)));
+  EXPECT_EQ(machine_->StoresSnapshot().audit_.size(), 2u);
+}
+
+TEST_F(MetaCoordinatorServerTest, UncertainOutcomeDemotionIsReconcilable) {
+  StartServer();
+  MetaCoordinatorOptions options;
+  options.propose_timeout_ms_ = 30'000;
+  MakeCoordinator(options);
+  WaitLeader();
+  const auto baseline = ProposeSync(MakeRegister(0x51));
+  ASSERT_TRUE(baseline.ok()) << baseline.status();
+
+  // A committed command can still be waiting on C++ application when the
+  // protocol owner withdraws authority. Its caller must reconcile the result;
+  // returning the pre-append "not leader" rejection would falsely imply that
+  // retrying a different request cannot duplicate the operation's effect.
+  apply_barrier_.Pause();
+  // Use the exact prior completion, since the periodic status observer may
+  // still advertise an older durability watermark when that callback arrives.
+  const std::uint64_t slot_before = baseline->log_index_;
+  auto task = coordinator_->Propose(MakeRegister(0x54), TestPrincipal());
+  std::promise<void> done;
+  std::future<void> signal = done.get_future();
+  task.SetCompletionCallback(
+      &done, [](void* ctx, std::coroutine_handle<>) noexcept {
+        static_cast<std::promise<void>*>(ctx)->set_value();
+      });
+  auto handle = std::move(task).ReleaseHandle();
+  handle.resume();
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        return server_->DurableIndex() > slot_before &&
+               server_->get_committed_log_idx() > slot_before;
+      },
+      std::chrono::seconds(10)));
+  ASSERT_TRUE(apply_barrier_.paused());
+  server_->yield_leadership();
+  ASSERT_EQ(signal.wait_for(std::chrono::seconds(15)),
+            std::future_status::ready);
+  auto demoted = std::move(handle.promise().value_);
+  handle.destroy();
+  ASSERT_FALSE(demoted.ok());
+  EXPECT_EQ(demoted.status().code(), absl::StatusCode::kCancelled);
+  EXPECT_NE(demoted.status().message().find("uncertain"), std::string::npos)
+      << demoted.status();
+  EXPECT_FALSE(machine_->StoresSnapshot()
+                   .identity_.FindNode(MakeNodeId(0x54))
+                   .has_value());
+
+  // The result really is uncertain: this committed command applies after its
+  // callback has been cancelled, leaving one effect and one audit receipt.
+  apply_barrier_.Resume();
+  ASSERT_TRUE(WaitFor(
+      [this] {
+        return machine_->StoresSnapshot()
+            .identity_.FindNode(MakeNodeId(0x54))
             .has_value();
       },
       std::chrono::seconds(10)));
@@ -1770,9 +1730,9 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeCancelIsReconcilable) {
   // same uncertain-outcome class (the entry is durable in the WAL and may be
   // committed by a future leader). Wait for the WAL append first so the
   // propose is genuinely in flight when the server stops.
-  server_->pause_state_machine_execution(5000);
-  ASSERT_TRUE(server_->is_state_machine_execution_paused());
-  const std::uint64_t slot_before = wal_->next_slot();
+  apply_barrier_.Pause();
+  ASSERT_TRUE(apply_barrier_.paused());
+  const std::uint64_t slot_before = machine_->last_commit_index();
   auto task = coordinator_->Propose(MakeRegister(0x53), TestPrincipal());
   std::promise<void> done;
   std::future<void> signal = done.get_future();
@@ -1782,7 +1742,7 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeCancelIsReconcilable) {
       });
   auto handle = std::move(task).ReleaseHandle();
   handle.resume();
-  ASSERT_TRUE(WaitFor([&] { return wal_->next_slot() > slot_before; },
+  ASSERT_TRUE(WaitFor([&] { return server_->DurableIndex() > slot_before; },
                       std::chrono::seconds(10)));
   EXPECT_FALSE(machine_->StoresSnapshot()
                    .identity_.FindNode(MakeNodeId(0x53))
@@ -1934,8 +1894,8 @@ TEST_F(MetaCoordinatorServerTest, ReconcilerStartCancelRestartIsIdempotent) {
       observations_.CurrentGeneration(old_epoch_session.node_id_).has_value());
 
   // BecomeFollower cancels and JOINS the reconciler; BecomeFollower is
-  // driven directly here because a single-node raft group cannot demote
-  // itself (NuRaft yield_leadership is a no-op for a one-node group).
+  // driven directly here to test reconciler cancellation independently of
+  // the single-voter Raft authority quarantine.
   coordinator_->BecomeFollower();
   ASSERT_TRUE(WaitFor([&] { return reconciler->cancels() == 1; },
                       std::chrono::seconds(10)));

@@ -33,6 +33,7 @@
 #include <future>
 #include <iterator>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -3823,6 +3824,63 @@ TEST(ListE2eTest, ClientKillDisconnectsReplicaSocketsAndReplicaReconnects) {
   EXPECT_TRUE(wait_for_value("after-client-kill-type", "three"));
 
   replica.Stop();
+  source.Stop();
+}
+
+TEST(ListE2eTest, HandshakeDuringIdleHistoryRetirementKeepsMonitorAlive) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a fault-enabled server";
+#endif
+  ASSERT_FALSE(g_lavik_binary.empty());
+  const std::string prefix = lavik::test::TestDataPathPrefix() +
+                             "lavik-idle-history-handshake-e2e-" +
+                             std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path), log_cleanup(log_path);
+  const int fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+
+  const std::uint16_t port = FindFreePort();
+  ServerProcess source(
+      g_lavik_binary, port, data_path, log_path, 2, {}, {},
+      {{"LAVIK_REPLICATION_PAUSE_IDLE_HISTORY_UNTIL_CONTROL_ONCE", "1"}});
+  RespClient source_client(port);
+  {
+    RespClient probe(port);
+    ASSERT_TRUE(probe.Command({"LVPSYNC", "1", "?", "?", "?", "?", "?", "?"})
+                    .starts_with("+LVFULLRESYNC "));
+  }
+  // Hold the old monitor after its idle decision, where disabling the worker
+  // logs may yield. The next control must wait for that reset and still leave
+  // a monitor responsible for the history it subsequently enables.
+  ASSERT_TRUE(WaitForLog(
+      log_path, "paused idle history retirement until next native control"));
+  std::string history;
+  {
+    RespClient probe(port);
+    const std::string reply =
+        probe.Command({"LVPSYNC", "1", "?", "?", "?", "?", "?", "?"});
+    ASSERT_TRUE(reply.starts_with("+LVFULLRESYNC ")) << reply;
+    std::istringstream fields(reply);
+    for (unsigned field = 0; field <= 5; ++field) {
+      ASSERT_TRUE(static_cast<bool>(fields >> history)) << reply;
+    }
+    ASSERT_EQ(history.size(), 40U) << reply;
+  }
+  const std::string retained_history = "master_replid:" + history + "\r\n";
+  const auto deadline = std::chrono::steady_clock::now() + 30s;
+  std::string info;
+  do {
+    info = source_client.Command({"INFO", "replication"});
+    if (info.find(retained_history) == std::string::npos) break;
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_NE(info.find("master_replid:"), std::string::npos) << info;
+  EXPECT_EQ(info.find(retained_history), std::string::npos) << info;
   source.Stop();
 }
 

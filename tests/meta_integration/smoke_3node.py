@@ -130,7 +130,7 @@ def main():
         leader = H.find_leader(survivors)
         # There are no Data sessions to refresh runtime eligibility, and no
         # further Meta command is issued before this status read. Reconciliation
-        # must follow NuRaft's leader-alive transition on its own after election.
+        # must follow Raft's leader hint on its own after election.
         cluster_status = subprocess.run(
             [CTL, "cluster-status", "--addr", leader.ctl_endpoint,
              "--allow-plaintext-admin", "--json"],
@@ -165,23 +165,18 @@ def main():
                          lambda node=node: node.snapshot_idx() > 0)
         H.log("automatic snapshots observed on all nodes")
 
-        # 7. Manual snapshot on the current leader: the ctl drives
-        #    create_snapshot with serialize_commit (exact cut point), the
-        #    durable write + log compaction then complete asynchronously —
-        #    poll for both the snapshot index and the WAL v1 segment
-        #    compaction (min log-*.seg first index advances past 1).
+        # 7. Manual snapshot returns only after durable publication. Check the
+        # retained logical suffix; whole-file GC is exercised by the Go tests
+        # with forced WAL rotation (small smoke logs share one etcd segment).
         leader = H.find_leader(nodes)
         snap_idx = H.manual_snapshot(leader)
         leader.wait_committed(snap_idx)
         H.wait_until(f"leader snapshot_idx >= {snap_idx}", 20,
                      lambda: leader.snapshot_idx() >= snap_idx)
-        H.wait_until("leader WAL compaction", 20,
-                     lambda: H.wal_segment_first_indexes(leader)
-                     and H.wal_segment_first_indexes(leader)[0] > 1)
-        first_indexes = H.wal_segment_first_indexes(leader)
-        H.log(f"manual snapshot at idx {snap_idx}; leader WAL segments "
-              f"start at {first_indexes[0]} ({len(first_indexes)} segment"
-              f" file(s))")
+        H.wait_until("leader log compaction", 20,
+                     lambda: int(leader.status()["first_log_idx"]) > 1)
+        H.log(f"manual snapshot at idx {snap_idx}; first retained log "
+              f"index {leader.status()['first_log_idx']}")
 
         # 8. Remove quorum and prove the same external command reports a
         # retryable control-plane outage (exit 3), rather than claiming the

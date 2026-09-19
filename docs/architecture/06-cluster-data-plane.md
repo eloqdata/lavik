@@ -542,12 +542,11 @@ suspend-aware guard and remain handoff-pending until `2D`; only then may a
 written `NodeNotReady` retire the marker. This avoids both a pre-send ABA
 window and permanent handoff blocking when the Owner remains unhealthy.
 
-NuRaft's peer-liveness timer uses active `CLOCK_MONOTONIC` time, which does not
+Raft's peer-liveness timer uses active `CLOCK_MONOTONIC` time, which does not
 advance while a Meta host is suspended. Data control therefore also compares
 that clock with `CLOCK_BOOTTIME`. Once their accumulated divergence reaches
 `D`, it closes the leadership generation's authority sessions and requests an
-immediate NuRaft resignation. A sole member, for which resignation is a no-op,
-must run for another full `D` of active monotonic time before authority can be
+immediate Raft resignation. A sole member must run for another full `D` of active monotonic time before authority can be
 eligible; a further suspend extends that wait. All control boundaries, directives,
 results, and lease grants pass this gate. Thus an old multi-member leader
 cannot resume after a replacement election and refresh the same stale identity

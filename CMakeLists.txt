@@ -199,11 +199,11 @@ set(MI_EXTRA_CPPDEFS "MI_DEFAULT_ARENA_EAGER_COMMIT=1" CACHE STRING "" FORCE)
 add_subdirectory(third_party/mimalloc)
 
 option(LAVIK_BUILD_META
-  "Build the lavik-meta Raft control plane (requires the recursive nuraft submodule)"
+  "Build the lavik-meta Raft control plane (requires Go 1.26.8)"
   ON)
 if (LAVIK_BUILD_META)
   # Shared operator transport stays below lavik_meta_core so the CLI and
-  # operator library have no NuRaft dependency.
+  # operator library have no Raft dependency.
   add_library(lavik_meta_admin STATIC
     src/meta/admin_client.cpp
     src/meta/cluster_create.cpp
@@ -223,74 +223,40 @@ if (LAVIK_BUILD_META)
     target_compile_options(lavik_meta_admin PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 
-  if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuraft/CMakeLists.txt)
-    message(FATAL_ERROR
-      "nuraft submodule not found; run git submodule update --init --recursive")
+  find_program(LAVIK_GO_EXECUTABLE NAMES go REQUIRED)
+  # go.mod's toolchain directive only upgrades an older launcher. Select the
+  # exact version for configuration, builds and tests even with a newer Go.
+  set(LAVIK_GO_TOOLCHAIN go1.26.8)
+  execute_process(COMMAND ${CMAKE_COMMAND} -E env GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
+      ${LAVIK_GO_EXECUTABLE} env GOVERSION
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft
+    OUTPUT_VARIABLE LAVIK_GO_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
+  if (NOT LAVIK_GO_VERSION STREQUAL LAVIK_GO_TOOLCHAIN)
+    message(FATAL_ERROR "Meta requires ${LAVIK_GO_TOOLCHAIN}; found ${LAVIK_GO_VERSION}")
   endif()
-  if (NOT EXISTS
-      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuraft/asio/asio/include/asio.hpp)
-    message(FATAL_ERROR
-      "nuraft/asio submodule not found; run git submodule update --init --recursive")
+  file(GLOB_RECURSE LAVIK_RAFT_GO_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/raft/*.go ${CMAKE_CURRENT_SOURCE_DIR}/raft/*.h)
+  set(LAVIK_RAFT_ARCHIVE ${CMAKE_CURRENT_BINARY_DIR}/liblavik_raft.a)
+  set(LAVIK_RAFT_BUILD_TAGS "")
+  if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(LAVIK_RAFT_BUILD_TAGS "-tags=lavik_faults")
   endif()
-  # Apply the pinned Lavik patch set to an isolated build-tree copy. The
-  # third-party checkout stays pristine, configure is repeatable, and a patch
-  # that no longer applies fails before compilation instead of drifting.
-  set(LAVIK_NURAFT_SOURCE_DIR
-      ${CMAKE_CURRENT_BINARY_DIR}/_lavik_nuraft_source)
-  file(REMOVE_RECURSE ${LAVIK_NURAFT_SOURCE_DIR})
-  file(MAKE_DIRECTORY ${LAVIK_NURAFT_SOURCE_DIR})
-  file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuraft/
-       DESTINATION ${LAVIK_NURAFT_SOURCE_DIR}
-       PATTERN ".git" EXCLUDE)
-  find_program(LAVIK_GIT_EXECUTABLE git REQUIRED)
-  file(GLOB LAVIK_NURAFT_PATCHES CONFIGURE_DEPENDS
-       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches/nuraft/*.patch)
-  list(SORT LAVIK_NURAFT_PATCHES)
-  foreach(LAVIK_NURAFT_PATCH IN LISTS LAVIK_NURAFT_PATCHES)
-    execute_process(
-      # The isolated copy may live underneath Lavik's own worktree. Stop
-      # repository discovery at the build root so git applies paths relative
-      # to WORKING_DIRECTORY instead of silently skipping every path outside
-      # the generated directory's prefix in the parent repository.
-      COMMAND ${CMAKE_COMMAND} -E env
-              GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}
-              ${LAVIK_GIT_EXECUTABLE} apply --check ${LAVIK_NURAFT_PATCH}
-      WORKING_DIRECTORY ${LAVIK_NURAFT_SOURCE_DIR}
-      RESULT_VARIABLE LAVIK_NURAFT_PATCH_CHECK)
-    if (NOT LAVIK_NURAFT_PATCH_CHECK EQUAL 0)
-      message(FATAL_ERROR "NuRaft patch no longer applies: ${LAVIK_NURAFT_PATCH}")
-    endif()
-    execute_process(
-      COMMAND ${CMAKE_COMMAND} -E env
-              GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}
-              ${LAVIK_GIT_EXECUTABLE} apply ${LAVIK_NURAFT_PATCH}
-      WORKING_DIRECTORY ${LAVIK_NURAFT_SOURCE_DIR}
-      COMMAND_ERROR_IS_FATAL ANY)
-  endforeach()
-  unset(LAVIK_NURAFT_PATCH)
-  unset(LAVIK_NURAFT_PATCHES)
-  set(DISABLE_ASIO OFF)
-  set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  set(ASIO_INCLUDE_DIR
-      ${LAVIK_NURAFT_SOURCE_DIR}/asio/asio/include CACHE PATH "" FORCE)
-  # NuRaft's tests subdirectory builds its asio-based harness whenever
-  # BUILD_TESTING is on. Shadow lavik's global test enablement for this
-  # subdirectory only, then restore it for lavik's own test targets.
-  set(LAVIK_SAVED_BUILD_TESTING ${BUILD_TESTING})
-  set(BUILD_TESTING OFF)
-  add_subdirectory(${LAVIK_NURAFT_SOURCE_DIR}
-                   ${CMAKE_CURRENT_BINARY_DIR}/_lavik_nuraft_build)
-  set(BUILD_TESTING ${LAVIK_SAVED_BUILD_TESTING})
-  unset(LAVIK_SAVED_BUILD_TESTING)
-  # NuRaft's headers are not warning-clean under -Wpedantic/-Wunused-parameter;
-  # consumers compile with -Wall -Wextra -Wpedantic, so treat them as SYSTEM.
-  get_target_property(LAVIK_NURAFT_IFACE_INCLUDES static_lib
-    INTERFACE_INCLUDE_DIRECTORIES)
-  if (LAVIK_NURAFT_IFACE_INCLUDES)
-    set_target_properties(static_lib PROPERTIES
-      INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${LAVIK_NURAFT_IFACE_INCLUDES}")
-  endif()
-  unset(LAVIK_NURAFT_IFACE_INCLUDES)
+  add_custom_command(OUTPUT ${LAVIK_RAFT_ARCHIVE}
+    COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=1 CC=${CMAKE_C_COMPILER}
+      GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
+      ${LAVIK_GO_EXECUTABLE} build -mod=readonly ${LAVIK_RAFT_BUILD_TAGS} -buildmode=c-archive
+      -o ${LAVIK_RAFT_ARCHIVE} ./bridge
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft
+    DEPENDS ${LAVIK_RAFT_GO_SOURCES} raft/go.mod raft/go.sum
+      include/lavik/meta/raft_bridge.h
+    VERBATIM)
+  add_custom_target(lavik_raft_archive DEPENDS ${LAVIK_RAFT_ARCHIVE})
+  add_library(lavik_raft STATIC IMPORTED GLOBAL)
+  set_target_properties(lavik_raft PROPERTIES IMPORTED_LOCATION ${LAVIK_RAFT_ARCHIVE})
+  add_dependencies(lavik_raft lavik_raft_archive)
+  target_link_libraries(lavik_raft INTERFACE ${CMAKE_DL_LIBS} pthread m)
+
 endif()
 
 set(LAVIK_LUA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua/src")
@@ -612,13 +578,10 @@ if (UNIX)
 endif()
 
 if (LAVIK_BUILD_META)
-  # Architecture layering: Raft is a meta-plane concern. NuRaft is linked
-  # only into lavik-meta; lavik, lavik_module, and the test binaries
-  # must stay Raft-free so the data plane never sees consensus code.
-  #
-  # lavik_meta_core carries durability and control logic; Bycorf owns
-  # foreign-thread completion ingress while NuRaft's native Asio service owns
-  # peer transport and timers.
+  # Architecture layering: only lavik-meta and Meta tests link the Go Raft
+  # archive. Data and operator targets stay Raft-free. Bycorf owns C++
+  # control-worker ingress; the Go runtime owns consensus, peer transport,
+  # timers, WAL, and snapshot I/O.
   set(LAVIK_META_CORE_SOURCES
     src/meta/audit_store.cpp
     src/meta/automatic_failover_detector.cpp
@@ -647,9 +610,7 @@ if (LAVIK_BUILD_META)
     src/meta/state_machine.cpp
     src/meta/topology_store.cpp
     src/meta/value_codec.cpp
-    src/meta/nuraft_asio_transport.cpp
-    src/meta/nuraft_log_store.cpp
-    src/meta/nuraft_state_mgr.cpp
+    src/meta/raft.cpp
   )
   add_library(lavik_meta_core STATIC ${LAVIK_META_CORE_SOURCES})
   target_include_directories(lavik_meta_core PUBLIC
@@ -661,7 +622,7 @@ if (LAVIK_BUILD_META)
     lavik::lease_clock
     lavik::control_transport
     lavik::control_protocol
-    NuRaft::static_lib
+    lavik_raft
     bycorf::core
   )
   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -673,9 +634,6 @@ if (LAVIK_BUILD_META)
   )
   target_include_directories(lavik-meta PRIVATE
     ${LAVIK_GENERATED_INCLUDE_DIR}
-  )
-  target_compile_definitions(lavik-meta PRIVATE
-    LAVIK_NURAFT_PINNED_COMMIT=\"0b01b185b46b8e482f6c384b636c35605121a41e\"
   )
   target_link_libraries(lavik-meta PRIVATE
     lavik_meta_core
@@ -715,12 +673,12 @@ if (LAVIK_BUILD_META)
   endif()
 
   # Negative guard for the layering rule above: fail at configure time if
-  # nuraft ever leaks into the data-plane module's link interface.
+  # consensus code ever leaks into the data-plane module's link interface.
   get_target_property(LAVIK_MODULE_IFACE_LIBS lavik_module
     INTERFACE_LINK_LIBRARIES)
-  if (LAVIK_MODULE_IFACE_LIBS MATCHES "nuraft|NuRaft")
+  if (LAVIK_MODULE_IFACE_LIBS MATCHES "lavik_raft")
     message(FATAL_ERROR
-      "lavik_module must not link NuRaft; Raft is meta-plane only")
+      "lavik_module must not link Raft; Raft is meta-plane only")
   endif()
 endif()
 
@@ -879,7 +837,15 @@ if (BUILD_TESTING)
       TEST_PREFIX cluster_status.
       PROPERTIES LABELS "meta;operator" TIMEOUT 30)
 
-    # Meta-plane tests. Links lavik_meta_core (NuRaft); the data-plane unit
+    add_test(NAME meta_raft.go
+      COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=1 CC=${CMAKE_C_COMPILER}
+        GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
+        ${LAVIK_GO_EXECUTABLE} test -mod=readonly -race -count=1 ./...)
+    set_tests_properties(meta_raft.go PROPERTIES
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft
+      LABELS "meta;raft" TIMEOUT 180 RUN_SERIAL TRUE)
+
+    # Meta-plane tests. Links lavik_meta_core (etcd Raft); the data-plane unit
     # test binary stays Raft-free, while this binary also links the data module
     # for explicit Meta-projection-to-Data-validation contract tests.
     add_executable(lavik_meta_tests
@@ -904,7 +870,6 @@ if (BUILD_TESTING)
       tests/meta_owner_serviceability_test.cpp
       tests/meta_security_test.cpp
       tests/meta_state_machine_test.cpp
-      tests/meta_store_test.cpp
       tests/meta_stores_test.cpp
     )
     target_link_libraries(lavik_meta_tests PRIVATE
@@ -1383,6 +1348,21 @@ if (BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/replication
   )
   gtest_discover_tests(lavik_unit_tests)
+  # Each large codec regression retains roughly 2 GiB of payload. Apply these
+  # properties after discovery, so parallel CTest runs keep other tests parallel
+  # but never overlap a large codec case with another test.
+  file(GENERATE
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/lavik_large_codec_properties.cmake"
+    CONTENT [[
+foreach(test_name IN LISTS lavik_unit_tests_TESTS)
+  if(test_name MATCHES "[.]Large.*RoundTripsBeyondRecordLimit$")
+    set_tests_properties("${test_name}" PROPERTIES
+      LABELS large-codec RUN_SERIAL TRUE TIMEOUT 300)
+  endif()
+endforeach()
+]])
+  set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/lavik_large_codec_properties.cmake")
 
   add_test(
     NAME lavik_cli.cluster_control_surface

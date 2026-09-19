@@ -51,8 +51,7 @@ def run_case(binary, workdir, mode):
             node.start(initial_cluster_manifest=manifest)
         leader = H.find_leader(nodes[:3])
         H.wait_until("all initial members complete genesis", 10, lambda: all(
-            os.path.exists(os.path.join(node.data_dir,
-                                        "initial_bindings_complete.dat"))
+            node.status()["initial_bindings_pending"] == "0"
             for node in nodes[:3]))
         index = H.propose_ops(leader, 0, 1, prefix="before-offline",
                               history=history)
@@ -71,15 +70,10 @@ def run_case(binary, workdir, mode):
         survivor = next(node for node in nodes[:2] if node is not leader)
         if mode != "wal":
             snapshot_index = H.manual_snapshot(survivor)
-            H.wait_until("snapshot durable and WAL entirely compacted", 10,
+            H.wait_until("snapshot durable and logical log compacted", 10,
                          lambda: survivor.snapshot_idx() == snapshot_index
-                         and H.wal_segment_first_indexes(survivor)
-                         == [snapshot_index + 1]
-                         # WAL v1's remaining segment contains only its
-                         # 20-byte header, hence last_entry() has term zero.
-                         and os.path.getsize(os.path.join(
-                             survivor.data_dir,
-                             f"log-{snapshot_index + 1}.seg")) == 20)
+                         and int(survivor.status()["first_log_idx"]) == snapshot_index + 1)
+
 
         removed = [node for node in active if node is not survivor]
         for node in removed:
@@ -91,27 +85,16 @@ def run_case(binary, workdir, mode):
                 raise H.Failure("restart did not recover the compacted snapshot")
 
         minority = [survivor, late]
-        offsets = {node.id: os.path.getsize(node.log_path) for node in minority}
+        before_votes = survivor.status()
         late.start()
-        # A timeout looking for a public leader used to pass even though the
-        # old core granted the stale vote, entered become_leader, then stalled
-        # while its peer attempted to roll back an already committed prefix.
-        decisions = []
-        deadline = time.monotonic() + 4
-        while time.monotonic() < deadline:
-            for node in minority:
-                log = read_since(node, offsets[node.id])
-                if "BECOME LEADER" in log or "rollback logs" in log:
-                    raise H.Failure(f"{mode}: node {node.id} elected or rolled back")
-            decisions = re.findall(
-                rf"\[VOTE REQ\] my role \w+, from peer {late.id},"
-                r".*?decision: ([OX])", read_since(survivor, offsets[survivor.id]),
-                flags=re.DOTALL)
-            if "O" in decisions:
-                raise H.Failure(f"{mode}: compacted member granted a stale vote")
-            time.sleep(0.05)
-        if not decisions:
-            raise H.Failure(f"{mode}: no stale RequestVote decision observed")
+        # Require actual denied Vote/PreVote replies, rather than inferring
+        # log freshness solely from the absence of a public leader.
+        H.wait_until("stale candidate vote rejected", 6,
+                     lambda: int(survivor.status()["vote_rejections"]) >
+                     int(before_votes["vote_rejections"]))
+        time.sleep(1)
+        if int(survivor.status()["vote_grants"]) != int(before_votes["vote_grants"]):
+            raise H.Failure(f"{mode}: compacted member granted a stale vote")
         H.assert_intact(minority, mode)
         if survivor.committed() < index:
             raise H.Failure(f"{mode}: committed state regressed")

@@ -1694,7 +1694,7 @@ def run_live_leader_demotion(meta_binary, data_binary, ctl, redis_cli, workdir,
         follower_events_before = old_leader.log_tail(lines=2000).count(
             "[raft-cb] event=BecomeFollower")
 
-        # Freeze the quorum rather than killing the leader. NuRaft must revoke
+        # Freeze the quorum rather than killing the leader. Raft must revoke
         # its live leadership, and the leader-scoped Data publisher must close
         # and drain every authority session before CancelAndWait returns.
         for follower in followers:

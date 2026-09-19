@@ -130,10 +130,7 @@ def run_count(workdir, count):
         H.wait_until(
             f"all {count} members close initial binding grace", 10,
             lambda: all(
-                not os.path.exists(os.path.join(node.data_dir,
-                                                "initial_bindings.dat")) and
-                os.path.exists(os.path.join(
-                    node.data_dir, "initial_bindings_complete.dat"))
+                node.status()["initial_bindings_pending"] == "0"
                 for node in nodes))
         before_restart = max(node.committed() for node in nodes)
 
