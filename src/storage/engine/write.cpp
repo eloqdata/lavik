@@ -17,7 +17,6 @@
 #include <exception>
 #include <new>
 
-#include "absl/crc/crc32c.h"
 #include "absl/strings/str_cat.h"
 #include "impl.h"
 #include "lavik/memory.h"
@@ -2554,7 +2553,8 @@ acquire_active_stream:
               : FixedBuffer{.data_ = heap_buffer,
                             .size_ = options_.buffers_.write_buffer_bytes_,
                             .index_ = 0};
-      if (staging_buffer.data_ == nullptr || staging_buffer.size_ == 0) {
+      if (staging_buffer.data_ == nullptr ||
+          staging_buffer.size_ < kBlockHeaderBytes) {
         if (write_buffer_id != 0) {
           store.buffers_.ReleaseWriteBuffer(write_buffer_id);
         } else {
@@ -2566,7 +2566,13 @@ acquire_active_stream:
                                "active write staging allocation is invalid");
       }
       const std::uint64_t block_id = allocated->block_id_;
-      std::fill_n(staging_buffer.data_, staging_buffer.size_, std::byte{0});
+      // A recycled buffer may contain valid headers from another block. Both
+      // slots must start zero for the first flush's stale-header protection.
+      // Appends initialize every record byte (including alignment padding),
+      // and flush initializes its page tail before writing only the committed
+      // prefix. Clearing the rest of the buffer would rewrite those bytes
+      // twice.
+      std::fill_n(staging_buffer.data_, kBlockHeaderBytes, std::byte{0});
       active_stream() = ActiveBlock{
           .block_id_ = block_id,
           .writer_id_ = writer_id,
@@ -3001,20 +3007,24 @@ acquire_active_stream:
                                      record_header_bytes);
   std::byte* payload_output =
       staging.data_ + record_offset + record_header_bytes;
-  // Fuse copying with CRC calculation so inline SET values do not require a
-  // second pass over the staging payload. Continue the CRC across an external
-  // key prefix; an extent manifest, in contrast, is the entire root payload.
-  absl::crc32c_t payload_checksum{0};
   if (key_external && !external) [[unlikely]] {
-    payload_checksum =
-        absl::MemcpyCrc32c(payload_output, key.data(), key.size());
+    std::memcpy(payload_output, key.data(), key.size());
     payload_output += key.size();
   }
   if (!value.empty()) {
-    payload_checksum = absl::MemcpyCrc32c(
-        payload_output, value.data(), value.size(), payload_checksum);
+    std::memcpy(payload_output, value.data(), value.size());
   }
-  record.payload_checksum_ = static_cast<std::uint32_t>(payload_checksum);
+  assert(relocation == nullptr ||
+         !relocation->verified_payload_checksum_.has_value() ||
+         (kind == RecordKind::kValue && value_type == ValueType::kString &&
+          !external && !key_external && !auxiliary && !grouped_root));
+  record.payload_checksum_ =
+      relocation != nullptr &&
+              relocation->verified_payload_checksum_.has_value()
+          ? *relocation->verified_payload_checksum_
+          : Crc32c(std::span<const std::byte>(
+                staging.data_ + record_offset + record_header_bytes,
+                payload_bytes));
   if (!EncodeRecordHeader(record, key, record_output)) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "record checksum encoding failed");
@@ -3212,6 +3222,7 @@ acquire_active_stream:
       .partition_id_ =
           partition_ptr == nullptr ? std::uint16_t{0} : partition_ptr->id_,
       .db_id_ = db_id,
+      .entry_tag_ = RecordIndex::AddressTag(digest),
   });
   if (tx != nullptr && tx->collect_undo_ && inserted_entry != nullptr) {
     TxUndoLog& undo = store.tx_undo_[txid];
@@ -3326,7 +3337,16 @@ acquire_active_stream:
   // protected by RelocationDurabilityFence, and the defrag pass needs the
   // decrement to observe the block emptying within the same pass.
   if (for_defrag && !defer_defrag_retirement && previous.has_value()) {
-    absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(*previous));
+    // The local retirement cannot suspend. Match flush settlement's direct
+    // owner-local path instead of allocating a child coroutine for every
+    // relocated record; foreign block owners still use the existing handoff.
+    const RetiredRecord retired = RetiredRecordOf(*previous);
+    absl::Status dead;
+    if (retired.block_owner_ == store.worker_->id()) {
+      dead = MarkRecordDeadLocal(retired.block_owner_, retired);
+    } else {
+      dead = co_await MarkRecordDead(retired);
+    }
     if (!dead.ok()) {
       LatchRuntimeFailure(store);
       co_return dead;

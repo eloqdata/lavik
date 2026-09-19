@@ -37,6 +37,134 @@ using lavik::storage::ScanHashMapEntryArena;
 
 }  // namespace
 
+TEST(ScanHashMapTest, LookupCoversEveryFingerprintWithHolesAndCollisions) {
+  using Map = ScanHashMap<std::uint64_t, 0>;
+  // A saturated direct bucket puts all positions (including the final four)
+  // on the lookup path. Exercise all byte values and nearby differing tags.
+  for (std::uint64_t tag = 0; tag < 256; ++tag) {
+    Map map;
+    std::vector<Map::Entry*> entries;
+    std::vector<Digest> digests;
+    for (std::uint64_t slot = 0; slot < 12; ++slot) {
+      const std::uint64_t actual = slot % 3 == 0 ? tag ^ 1 : tag;
+      const Digest digest{(actual << 56) | slot};
+      auto* entry = map.InsertNew(digest, "external", slot, false);
+      ASSERT_NE(entry, nullptr);
+      entries.push_back(entry);
+      digests.push_back(digest);
+    }
+    for (std::size_t slot = 0; slot < 12; ++slot) {
+      EXPECT_EQ(map.Find(digests[slot], "external"), entries[slot]);
+      EXPECT_EQ(std::as_const(map).Find(digests[slot], "external"),
+                entries[slot]);
+      EXPECT_EQ(map.FindCandidates(digests[slot], "external"),
+                (std::vector<Map::Entry*>{entries[slot]}));
+      EXPECT_EQ(map.FindCandidateIf(digests[slot], "external",
+                                    [](const auto&) { return true; }),
+                entries[slot]);
+    }
+    // Holes retain old fingerprint bytes; neither a cleared handle nor a
+    // fingerprint collision may become a key match.
+    for (std::size_t slot = 0; slot < 12; slot += 2) {
+      ASSERT_TRUE(map.Erase(entries[slot]));
+    }
+    for (std::size_t slot = 0; slot < 12; ++slot) {
+      EXPECT_EQ(map.Find(digests[slot], "external"),
+                slot % 2 == 0 ? nullptr : entries[slot]);
+    }
+    EXPECT_EQ(map.Find(Digest{(tag << 56) | 255}, "external"), nullptr);
+  }
+}
+
+TEST(ScanHashMapTest,
+     TaggedAddressSurvivesChainCompactionAndRejectsStaleSlots) {
+  // One bucket forces overflow chains; pairs share a tag so filtering alone
+  // cannot establish identity. External keys allow controlled digest values.
+  using Map = ScanHashMap<std::uint64_t, 0>;
+  Map map;
+  struct Saved {
+    std::uintptr_t address;
+    Digest digest;
+  };
+  std::vector<Saved> saved;
+  for (std::uint64_t i = 0; i < 48; ++i) {
+    const Digest digest{((i / 2) << 56) | 7};
+    auto* entry = map.InsertNew(digest, "external", i, false);
+    ASSERT_NE(entry, nullptr);
+    saved.push_back({reinterpret_cast<std::uintptr_t>(entry), digest});
+  }
+  auto lookup = [&](const Saved& value) {
+    return map.FindAddress(value.address, Map::AddressHash(value.digest),
+                           Map::AddressTag(value.digest));
+  };
+  EXPECT_EQ(map.FindAddress(0, 7, 0), nullptr);
+  EXPECT_EQ(map.FindAddress(1, 7, 0), nullptr);
+  for (std::size_t i = 0; i < saved.size(); i += 3) {
+    auto* entry = lookup(saved[i]);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->value(), i);
+    ASSERT_TRUE(map.Erase(entry));
+    EXPECT_EQ(lookup(saved[i]), nullptr);
+  }
+  for (std::size_t i = 0; i < saved.size(); ++i) {
+    if (i % 3 == 0) continue;
+    auto* entry = lookup(saved[i]);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->value(), i);
+    EXPECT_EQ(std::as_const(map).FindAddress(saved[i].address, 7,
+                                             Map::AddressTag(saved[i].digest)),
+              entry);
+    EXPECT_EQ(map.FindAddress(saved[i].address, 7,
+                              Map::AddressTag(saved[i].digest) ^ 0x80),
+              nullptr);
+  }
+  // The arena may reuse an erased address. A new, differently tagged key
+  // must not become visible through the old receipt in that case either.
+  for (std::uint64_t i = 0; i < 48; ++i) {
+    ASSERT_NE(
+        map.InsertNew(Digest{((128 + i) << 56) | 7}, "external", i, false),
+        nullptr);
+  }
+  for (std::size_t i = 0; i < saved.size(); i += 3) {
+    EXPECT_EQ(lookup(saved[i]), nullptr);
+  }
+}
+
+TEST(ScanHashMapTest, TaggedAddressResolvesBothTablesDuringRehash) {
+  using Map = ScanHashMap<std::uint64_t>;
+  Map map;
+  ASSERT_TRUE(map.PreallocateForExpectedSize(576));
+  std::uint64_t inserted = 0;
+  Map::Entry* old_entry = nullptr;
+  while (!map.rehashing() && inserted < 2048) {
+    auto* entry = map.InsertNew(Digest{(7ULL << 56) | inserted}, "external",
+                                inserted, false);
+    ASSERT_NE(entry, nullptr);
+    if (inserted == 63) old_entry = entry;
+    ++inserted;
+  }
+  ASSERT_TRUE(map.rehashing());
+  ASSERT_NE(old_entry, nullptr);
+  const Digest digest{(7ULL << 56) | 63};
+  auto* new_entry = map.InsertNew(digest, "external", 9999, false);
+  ASSERT_NE(new_entry, nullptr);
+  ASSERT_TRUE(map.rehashing());
+  auto check = [&] {
+    for (auto* entry : {old_entry, new_entry}) {
+      EXPECT_EQ(
+          map.FindAddress(reinterpret_cast<std::uintptr_t>(entry),
+                          Map::AddressHash(digest), Map::AddressTag(digest)),
+          entry);
+    }
+  };
+  check();
+  for (unsigned i = 0; i < 512 && map.Maintain(); ++i) {
+    check();
+  }
+  ASSERT_FALSE(map.rehashing());
+  check();
+}
+
 TEST(ScanHashMapTest, CandidatePredicateOnlySeesMatchingKeys) {
   ScanHashMap<std::uint64_t> map;
   unsigned calls = 0;
@@ -175,6 +303,10 @@ TEST(ScanHashMapTest, EraseShrinksAndReleasesBucketsWithoutFurtherRequests) {
   EXPECT_EQ(map.allocated_bucket_count(), 1);
   EXPECT_EQ(map.FindAddress(reinterpret_cast<std::uintptr_t>(entries[0]),
                             map.AddressHash(ComputeDigest("shrink-0"))),
+            entries[0]);
+  EXPECT_EQ(map.FindAddress(reinterpret_cast<std::uintptr_t>(entries[0]),
+                            map.AddressHash(ComputeDigest("shrink-0")),
+                            map.AddressTag(ComputeDigest("shrink-0"))),
             entries[0]);
   ASSERT_TRUE(map.Erase(entries[0]));
   EXPECT_FALSE(map.has_allocated_storage());

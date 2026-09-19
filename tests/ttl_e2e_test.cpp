@@ -355,8 +355,8 @@ void VerifySetPayloads(RespClient& client, bool write) {
   // again after restart so the decoder checks the persisted CRC independently
   // of the in-memory value and the encoder's copy implementation.
   for (std::size_t key_bytes : {16, 5001}) {
-    for (std::size_t value_bytes : {0, 1, 15, 16, 17, 255, 256, 257, 1023,
-                                    1024, 4095, 4096, 8191, 8192, 8193}) {
+    for (std::size_t value_bytes : {0, 1, 15, 16, 17, 255, 256, 257, 1023, 1024,
+                                    4095, 4096, 8191, 8192, 8193}) {
       const std::string key = "copy-crc-" + std::to_string(value_bytes) +
                               std::string(key_bytes, 'k');
       std::string value(value_bytes, '\0');
@@ -372,8 +372,7 @@ void VerifySetPayloads(RespClient& client, bool write) {
         Expect(client.Command({"SET", key, value}), "+OK", "payload SET");
       }
       Expect(client.Command({"GET", key}),
-             "$" + std::to_string(value_bytes) + "\r\n" + value,
-             "payload GET");
+             "$" + std::to_string(value_bytes) + "\r\n" + value, "payload GET");
       Expect(client.Command({"PTTL", key}), ":-1", "payload TTL cleared");
     }
   }
@@ -618,9 +617,10 @@ int main(int argc, char** argv) {
 
       Expect(client.Command({"RPUSH", "set-get-type", "old"}), ":1",
              "SET GET wrong-type seed");
-      Expect(client.Command({"SET", "set-get-type", "new", "GET"}),
-             "-WRONGTYPE Operation against a key holding the wrong kind of value",
-             "SET GET preserves type check");
+      Expect(
+          client.Command({"SET", "set-get-type", "new", "GET"}),
+          "-WRONGTYPE Operation against a key holding the wrong kind of value",
+          "SET GET preserves type check");
       Expect(client.Command({"LINDEX", "set-get-type", "0"}), "$3\r\nold",
              "SET GET wrong-type preserves value");
 

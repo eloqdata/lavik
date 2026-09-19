@@ -1597,6 +1597,14 @@ if (BUILD_TESTING)
     )
     set_tests_properties(lavik_extent_recovery_e2e PROPERTIES TIMEOUT 600)
 
+    add_test(
+      NAME lavik_defrag_payload_e2e
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/defrag_payload_e2e.py
+              $<TARGET_FILE:lavik>
+    )
+    set_tests_properties(lavik_defrag_payload_e2e PROPERTIES TIMEOUT 240)
+
     add_executable(lavik_grouped_recovery_e2e_test
       tests/grouped_recovery_e2e_test.cpp
     )
