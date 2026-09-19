@@ -92,6 +92,104 @@ ticks. `--election-ms-low` must be 3–60 heartbeat intervals and
 run independently of the protocol loop. The former `--raft-io-threads`,
 `--raft-log-level`, and `--snapshot-sync-timeout-ms` options are unsupported.
 
+## Sentinel client endpoint
+
+Meta can expose a dedicated Redis Sentinel-compatible RESP port. It is disabled
+unless `--sentinel-addr` is explicitly supplied. The following starts a waiting
+Meta joiner with a Sentinel endpoint; connection commands work before membership
+or a Data cluster exists. Use the initial-cluster manifest described above when
+bootstrapping a new Meta cluster.
+
+```sh
+lavik-meta --id 1 --addr 127.0.0.1:7001 \
+  --data-control-addr 127.0.0.1:7101 --ctl-addr 127.0.0.1:7201 \
+  --data-dir ./meta-1 \
+  --sentinel-addr 127.0.0.1:26379 \
+  --sentinel-requirepass sentinel-secret --sentinel-maxclients 256
+
+redis-cli -h 127.0.0.1 -p 26379 --askpass PING
+redis-cli -h 127.0.0.1 -p 26379 --askpass HELLO 3
+```
+
+Enter `sentinel-secret` at each prompt. These are example credentials. The
+listener requires a concrete numeric IPv4 or bracketed IPv6 address and a
+nonzero port distinct from the other local listeners. An invalid configuration
+or bind failure prevents successful process startup. Sentinel options without
+an address are rejected. An omitted or empty `--sentinel-requirepass` permits
+unauthenticated connections. In that case `AUTH password` reports that no
+password is configured, while `AUTH default password` succeeds and other
+usernames fail, following Redis 7.2 Sentinel. Data's existing AUTH behavior is
+preserved independently.
+
+The Sentinel listener currently uses plaintext TCP. Meta's Raft/control and
+Admin TLS settings do not enable TLS on this port. Keep it on a trusted network
+until Sentinel TLS is available; the endpoint is not an Admin interface.
+
+### Independent Sentinel and Data authentication
+
+A pure standalone Lavik Data process, with no replicas and no Meta, continues
+to authenticate clients directly. Add `--requirepass data-secret` to the normal
+Data launch command using its prepared storage, then connect directly:
+
+```sh
+redis-cli -h 127.0.0.1 -p 6379 --askpass SET example value
+redis-cli -h 127.0.0.1 -p 6379 --askpass GET example
+```
+
+Enter `data-secret` for these Data connections. The same Data setting is used
+when a client obtains its Data address through Sentinel: Sentinel authentication
+protects the Sentinel connection, and Data authentication protects each Data
+connection. Configure the client's Sentinel password and Data password
+separately. A successful Sentinel AUTH grants neither Data access nor Meta
+operator authority. Meta does not forward application AUTH to Data.
+
+### Current command and resource contract
+
+| Command | Supported behavior |
+|---|---|
+| `AUTH password`, `AUTH default password` | Authenticate this Sentinel connection; other usernames fail |
+| `HELLO [2\|3] [AUTH default password] [SETNAME name]` | Negotiate RESP; failure preserves the previous state; reply identifies Lavik in Sentinel mode |
+| `PING [message]` | PONG or the supplied message |
+| `CLIENT SETNAME`, `CLIENT SETINFO LIB-NAME/LIB-VER` | Store validated connection-local metadata |
+| `QUIT`, `RESET` | Close after OK, or clear identity metadata and return to RESP2 and the initial authentication state |
+| Sentinel queries, including `GET-MASTER-ADDR-BY-NAME` and `MASTERS` | Explicit unsupported-command error; Primary discovery is not yet available |
+| Data, Pub/Sub, replication, Admin, and Sentinel management/election commands | Rejected, even after successful authentication |
+
+When a password is configured, only AUTH, HELLO, QUIT, and RESET execute
+before authentication; registered CLIENT arity errors are checked first, as
+in Redis. New connections start in RESP2. This connection-level
+support is not a claim of complete Sentinel client discovery or failover
+compatibility.
+
+The supported AUTH, HELLO, PING and CLIENT connection commands target Redis
+7.2.14 Sentinel. CI compares their complete RESP frames and error messages
+against recorded replies from that reference, including authentication and
+protocol state after failures. Only HELLO's product name, version and connection
+ID are normalized; its field types, order and RESP2/RESP3 framing remain exact.
+The checked-in reference can also be replayed against a real Redis binary:
+
+```sh
+python3 tests/meta_integration/sentinel_compat.py /path/to/redis-7.2.14/src/redis-server
+```
+
+Compatibility has explicit boundaries: QUIT and RESET are Lavik extensions
+(Redis 7.2 Sentinel does not expose them); unsupported commands, malformed
+input and Lavik resource-limit errors follow the local contract above. Client
+names and library metadata values reject embedded NUL bytes rather than reproducing Redis 7.2's
+C-string validation quirk. These exceptions are tested separately from the
+Redis wire contract. The fixture covers a finite set of inputs, not every
+possible command stream or another Redis release.
+
+`--sentinel-maxclients` defaults to 256 and counts unauthenticated connections.
+Requests and replies each have a 64 KiB ceiling. These are protocol byte limits,
+not an RSS limit: parser argument storage and connection metadata also use
+bounded memory. The server writes replies in order and does not retain an
+unbounded pipeline or output queue. Authentication, partial-request assembly,
+and blocked writes have ten-second deadlines. Authenticated idle connections
+remain open. Malformed or oversized input, output overflow, and expired
+deadlines close the affected connection and release its slot. Process shutdown
+also drains idle, partial-request, and blocked-write connections.
+
 ## Send administrative commands
 
 Direct `lavik-ctl` commands send one LF-terminated request to the

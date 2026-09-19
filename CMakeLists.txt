@@ -198,6 +198,19 @@ set(MI_TRACK_ASAN ${LAVIK_ASAN_BUILD} CACHE BOOL "" FORCE)
 set(MI_EXTRA_CPPDEFS "MI_DEFAULT_ARENA_EAGER_COMMIT=1" CACHE STRING "" FORCE)
 add_subdirectory(third_party/mimalloc)
 
+# RESP and default-user authentication are shared by Data and Meta Sentinel.
+# This target deliberately has no storage, command dispatch or Raft dependency.
+add_library(lavik_resp_protocol STATIC
+  src/redis/resp.cpp
+  src/redis/password_authenticator.cpp
+)
+target_include_directories(lavik_resp_protocol PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(lavik_resp_protocol PUBLIC
+  absl::status absl::statusor absl::strings OpenSSL::Crypto
+)
+
 option(LAVIK_BUILD_META
   "Build the lavik-meta Raft control plane (requires Go 1.26.8)"
   ON)
@@ -436,7 +449,6 @@ add_library(lavik_module
   src/replication/native_recovery.cpp
   src/replication/native_reparent.cpp
   src/replication/replication.cpp
-  src/redis/resp.cpp
   src/redis/rdb.cpp
   src/redis/rdb_collection.cpp
   src/redis/rdb_import.cpp
@@ -484,6 +496,7 @@ target_compile_definitions(lavik_module PUBLIC
   LAVIK_ENABLE_TEST_FAULTS=$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>
 )
 target_link_libraries(lavik_module PUBLIC
+  lavik_resp_protocol
   lavik::lease_clock
   lavik::control_transport
   lavik::control_protocol
@@ -592,6 +605,7 @@ if (LAVIK_BUILD_META)
     src/meta/control_projector.cpp
     src/meta/coordinator.cpp
     src/meta/ctl_server.cpp
+    src/meta/sentinel_server.cpp
     src/meta/data_control_server.cpp
     src/meta/data_control_runtime_status.cpp
     src/meta/encoding.cpp
@@ -614,9 +628,11 @@ if (LAVIK_BUILD_META)
   )
   add_library(lavik_meta_core STATIC ${LAVIK_META_CORE_SOURCES})
   target_include_directories(lavik_meta_core PUBLIC
+    ${LAVIK_GENERATED_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_link_libraries(lavik_meta_core PUBLIC
+    lavik_resp_protocol
     OpenSSL::Crypto
     lavik_meta_admin
     lavik::lease_clock
@@ -868,6 +884,7 @@ if (BUILD_TESTING)
       tests/meta_model_test.cpp
       tests/meta_observation_test.cpp
       tests/meta_owner_serviceability_test.cpp
+      tests/meta_sentinel_server_test.cpp
       tests/meta_security_test.cpp
       tests/meta_state_machine_test.cpp
       tests/meta_stores_test.cpp
@@ -914,6 +931,18 @@ if (BUILD_TESTING)
       set_tests_properties(meta_integration.ctl_client PROPERTIES
         LABELS meta-integration
         TIMEOUT 60
+        RUN_SERIAL TRUE
+      )
+
+      add_test(
+        NAME meta_integration.sentinel
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_sentinel.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+      )
+      set_tests_properties(meta_integration.sentinel PROPERTIES
+        LABELS meta-integration
+        TIMEOUT 120
         RUN_SERIAL TRUE
       )
 
