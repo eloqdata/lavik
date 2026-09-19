@@ -22,7 +22,7 @@ limitations under the License.
 ownership boundary: proposals, immutable status, role edges, and owned byte
 buffers cross a versioned C ABI; no Go pointer is retained by C++. The C++
 `MetaStateMachine` owns the six business stores and deterministic command
-semantics. Bycorf continues to own Admin and Data sessions. The Data executable
+semantics. Bycorf continues to own Admin, Sentinel, and Data sessions. The Data executable
 and `lavik-ctl` do not link Go or Raft.
 
 One Go event loop exclusively owns `RawNode`, its memory log, configuration,

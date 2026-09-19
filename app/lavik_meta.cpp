@@ -62,6 +62,7 @@
 #include "lavik/meta/observation_store.h"
 #include "lavik/meta/proposal_executor.h"
 #include "lavik/meta/raft.h"
+#include "lavik/meta/sentinel_server.h"
 #include "lavik/meta/state_machine.h"
 #include "lavik/numeric_endpoint.h"
 #include "lavik/version.h"
@@ -95,6 +96,10 @@ struct CliOptions {
   // discover through the Raft transport.
   std::string data_control_addr_;
   std::string data_dir_;
+  std::string sentinel_addr_;
+  std::string sentinel_requirepass_;
+  int sentinel_maxclients_ = 256;
+  bool sentinel_options_supplied_ = false;
   std::string ctl_addr_;    // required remote "ip:port" control surface
   std::string ctl_socket_;  // default: <data-dir>/meta-admin.sock
   std::vector<uid_t> ctl_allowed_uids_;
@@ -127,6 +132,8 @@ void PrintUsage(const char* program) {
       "--data-dir PATH "
       "[--ctl-socket PATH] --ctl-addr ip:port "
       "[--initial-cluster-manifest FILE]\n"
+      "          [--sentinel-addr ip:port] [--sentinel-requirepass PASSWORD] "
+      "[--sentinel-maxclients N]\n"
       "          [--tls-ca F --tls-cert F --tls-key F]\n"
       "          [--ctl-allow-uid N] [--ctl-tls-ca F --ctl-tls-cert F "
       "--ctl-tls-key F]\n"
@@ -218,6 +225,18 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
       options.data_dir_ = std::string(value);
     } else if (name == "--ctl-addr") {
       options.ctl_addr_ = std::string(value);
+    } else if (name == "--sentinel-addr") {
+      options.sentinel_addr_ = std::string(value);
+      options.sentinel_options_supplied_ = true;
+    } else if (name == "--sentinel-requirepass") {
+      options.sentinel_requirepass_ = std::string(value);
+      options.sentinel_options_supplied_ = true;
+    } else if (name == "--sentinel-maxclients") {
+      if (!ParseInt(value, 1, 0x7fffffff, &options.sentinel_maxclients_)) {
+        return absl::InvalidArgumentError(
+            "--sentinel-maxclients must be positive");
+      }
+      options.sentinel_options_supplied_ = true;
     } else if (name == "--ctl-socket") {
       options.ctl_socket_ = std::string(value);
     } else if (name == "--initial-cluster-manifest") {
@@ -290,6 +309,24 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
   if (options.data_dir_.empty()) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "--data-dir is required");
+  }
+  if (options.sentinel_options_supplied_) {
+    const auto sentinel = lavik::ParseNumericEndpoint(options.sentinel_addr_);
+    if (!sentinel || sentinel->host_ == "0.0.0.0" || sentinel->host_ == "::" ||
+        sentinel->host_ == "::ffff:0.0.0.0") {
+      return absl::InvalidArgumentError(
+          "--sentinel-addr must be a concrete numeric IP and nonzero port");
+    }
+    for (const auto& address :
+         {options.raft_addr_, options.data_control_addr_, options.ctl_addr_}) {
+      const auto other = lavik::ParseNumericEndpoint(address);
+      if (other && other->port_ == sentinel->port_ &&
+          (other->host_ == sentinel->host_ || other->host_ == "0.0.0.0" ||
+           other->host_ == "::")) {
+        return absl::InvalidArgumentError(
+            "Sentinel address conflicts with another Meta listener");
+      }
+    }
   }
   if (options.ctl_socket_.empty()) {
     options.ctl_socket_ = options.data_dir_ + "/meta-admin.sock";
@@ -591,6 +628,7 @@ int main(int argc, char** argv) {
   int exit_code = 0;
   std::vector<std::shared_ptr<MetaCtlServer>> ctl_servers;
   std::shared_ptr<MetaDataControlServer> data_control;
+  std::shared_ptr<lavik::meta::MetaSentinelServer> sentinel;
   const std::uint32_t observation_ttl_ms = static_cast<std::uint32_t>(
       std::max(options.election_ms_high_, options.heartbeat_ms_ * 3));
   lavik::meta::MetaObservationStore::Limits observation_limits;
@@ -783,6 +821,28 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (exit_code == 0 && !options.sentinel_addr_.empty()) {
+    lavik::meta::MetaSentinelServerOptions sentinel_options;
+    sentinel_options.address_ = options.sentinel_addr_;
+    sentinel_options.requirepass_ = std::move(options.sentinel_requirepass_);
+    sentinel_options.maxclients_ =
+        static_cast<std::size_t>(options.sentinel_maxclients_);
+    auto created = lavik::meta::MetaSentinelServer::Create(
+        foreign_executor, std::move(sentinel_options));
+    if (!created.ok()) {
+      spdlog::critical("Sentinel server create failed: {}",
+                       created.status().message());
+      exit_code = 1;
+    } else {
+      sentinel = *created;
+      const auto bound = sentinel->Start();
+      if (!bound.ok()) {
+        spdlog::critical("Sentinel listener bind failed: {}", bound.message());
+        exit_code = 1;
+      }
+    }
+  }
+
   if (exit_code == 0) {
     // Register leader-scoped Data publication only after every configured
     // listener has bound. In particular, initial reconciliation must not
@@ -802,11 +862,12 @@ int main(int argc, char** argv) {
       ctl_display += options.ctl_addr_;
     }
     spdlog::info(
-        "node {} up: raft={} data-control={} ctl={} data-dir={} "
-        "backend=etcd/raft "
-        "tls={}",
+        "node {} up: raft={} data-control={} ctl={} sentinel={} data-dir={} "
+        "backend=etcd/raft tls={}",
         options.id_, options.raft_addr_, options.data_control_addr_,
-        ctl_display, options.data_dir_, !options.tls_ca_.empty());
+        ctl_display,
+        options.sentinel_addr_.empty() ? "disabled" : options.sentinel_addr_,
+        options.data_dir_, !options.tls_ca_.empty());
     while (g_shutdown_requested == 0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
@@ -821,7 +882,8 @@ int main(int argc, char** argv) {
   automatic_failover_reconciler->Shutdown();
   cluster_create_reconciler->Shutdown();
   membership_reconciler->Shutdown();
-  // Stop both ingress surfaces first, then synchronously revoke the
+  if (sentinel != nullptr) sentinel->Shutdown();
+  // Stop the control ingress surfaces, then synchronously revoke the
   // leader-scoped publisher before quiescing the Go runtime while the Bycorf
   // worker mailbox and application callbacks remain alive.
   // Admin goes first so no new capture can race Data-control teardown.

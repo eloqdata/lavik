@@ -22,7 +22,8 @@ limitations under the License.
 [Meta Raft runtime](10-meta-raft.md) embeds etcd-io/raft in a Go C archive and
 owns consensus, peer sockets, ordered persistence, application dispatch and
 snapshot files. The C++ state machine retains deterministic business semantics.
-One Bycorf worker owns Admin and Data-control sessions; bounded proposal work
+One Bycorf worker owns Admin, optional Sentinel, and Data-control sessions;
+bounded proposal work
 and cross-runtime completions use the existing foreign executor mailbox.
 The Data executable and operator client remain Raft-free.
 
@@ -35,7 +36,8 @@ waits for accepted foreign notifications, then stops Bycorf. A failed demotion
 notification is fail-stop; no later leader generation may reuse authority whose
 revocation was not delivered.
 
-The process exposes three independent network responsibilities. `--addr` is
+The process exposes independent Raft, Data-control, Admin, and optional
+Sentinel network responsibilities. `--addr` is
 the local Raft listener, `--data-control-addr` accepts Data-node control
 sessions, and the required concrete `--ctl-addr` is the remote operator/Admin
 listener. Admin also defaults to a mode-0600 Unix socket unless an explicit
@@ -44,6 +46,36 @@ policy, capture limiter, and retained-reply budget. The manifest and durable
 membership descriptor own the advertised routes, which may name explicit
 proxies rather than these local binds. Wildcard Admin binds and port zero are
 invalid.
+
+`--sentinel-addr` explicitly enables a separate plaintext RESP client endpoint.
+`MetaSentinelServer` owns its worker-local sessions and a closed command
+allowlist. It supports authentication, RESP2/RESP3 negotiation, client identity
+metadata, health checks, and connection reset/close. Unsupported Sentinel
+queries, election/management commands, Data commands, and Admin commands fail
+without entering either other dispatcher. This endpoint has no dependency on
+Data-cluster readiness or Meta leadership for these connection commands.
+
+The Sentinel password is independent of Data's `requirepass`. Both processes
+use the immutable default-user `PasswordAuthenticator` and the shared RESP
+parser/reply builder, but each connection authenticates locally. Sentinel
+credentials never construct a Meta operator principal or authenticate a Data
+connection. Standalone Data requires no Meta process to authenticate clients.
+Sentinel session state is separate from Data's full connection context and is
+never committed to Raft. HELLO identifies `mode=sentinel`, without a Data role;
+its validation completes before authentication, name, or protocol changes.
+Supported connection replies follow the Redis 7.2 Sentinel wire contract,
+with independent product identity. QUIT/RESET are explicit Lavik extensions;
+unsupported commands and local resource limits retain fail-closed errors.
+
+Sentinel admission counts all accepted sessions, including unauthenticated
+ones. Input, output, and identity storage are bounded independently of Data's
+budgets; a session executes and writes one response before admitting its next
+command. Authentication, partial requests, and blocked writes have finite
+lifetimes, while authenticated idle connections can remain open. Each session
+borrows its Bycorf Connection before its coroutine starts and releases it only
+after its local users and deadlines unwind. Startup checks the Sentinel bind
+before starting leader-owned workflows; failure rolls back the process. Shutdown
+drains Sentinel accepts and sessions before the control worker stops.
 
 The state machine owns one `MetaStores` value containing six committed
 stores:
@@ -1196,6 +1228,7 @@ audit history rather than replacing it.
 | Asynchronous Raft protocol, WAL, snapshots, authentication and quorum liveness | [Meta Raft runtime](10-meta-raft.md), `raft/engine/`, `include/lavik/meta/raft.h`, `src/meta/raft.cpp`, `src/meta/proposal_executor.cpp` |
 | Meta session transport retirement and Connection-storage lifetime | `src/meta/ctl_server.cpp`, `src/meta/data_control_server.cpp`, `bycorf/include/bycorf/net/connection.h`, `bycorf/src/runtime/worker.cpp` |
 | Foreign-thread typed completion ingress and worker wakeup | `bycorf/include/bycorf/runtime/foreign_executor.h`, `bycorf/src/runtime/foreign_executor.cpp`, `bycorf/include/bycorf/runtime/cross_core.h`, `bycorf/src/runtime/worker.cpp` |
+| Independent Sentinel RESP entry, local password verification, bounded sessions and lifecycle | `include/lavik/meta/sentinel_server.h`, `src/meta/sentinel_server.cpp`, `include/lavik/password_authenticator.h`, `src/redis/password_authenticator.cpp`, `src/redis/resp.cpp`, `app/lavik_meta.cpp`, `tests/meta_integration/gate_sentinel.py` |
 | TLS identity, RBAC, Unix peer credentials, Admin transport, cluster status, controlled failover, and initial cluster creation | `include/lavik/meta/identity_verifier.h`, `include/lavik/meta/ctl_server.h`, `include/lavik/meta/admin_client.h`, `include/lavik/meta/cluster_status.h`, `include/lavik/meta/cluster_create.h`, `include/lavik/meta/failover_admin.h`, `app/lavik_meta.cpp`, `app/lavik_ctl.cpp`, `bycorf/src/net/` |
 | Automatic-failover status wire/model plus JSON and text rendering | `include/lavik/meta/cluster_status.h`, `src/meta/cluster_status.cpp`, `tests/meta_cluster_status_test.cpp` |
 | Recovery, partition, membership, failover, and security gates | `tests/meta_*`, `tests/meta_integration/` |

@@ -17,8 +17,6 @@
 #include "lavik/server.h"
 
 #include <mimalloc.h>
-#include <openssl/crypto.h>
-#include <openssl/sha.h>
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/resource.h>
@@ -70,6 +68,7 @@
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
 #include "lavik/monitor.h"
+#include "lavik/password_authenticator.h"
 #include "lavik/pubsub.h"
 #include "lavik/rdb.h"
 #include "lavik/replication.h"
@@ -518,32 +517,6 @@ void CleanupShutdownSignalHandler() noexcept {
 enum class WaitResult {
   kSignal,
   kStopped,
-};
-
-class PasswordAuthenticator {
- public:
-  explicit PasswordAuthenticator(std::string_view password)
-      : required_(!password.empty()) {
-    SHA256(reinterpret_cast<const unsigned char*>(password.data()),
-           password.size(), digest_.data());
-  }
-
-  bool required() const noexcept { return required_; }
-
-  bool Authenticate(std::string_view username,
-                    std::string_view password) const noexcept {
-    if (!required_) return username == "default";
-    std::array<unsigned char, SHA256_DIGEST_LENGTH> candidate{};
-    SHA256(reinterpret_cast<const unsigned char*>(password.data()),
-           password.size(), candidate.data());
-    const bool password_matches =
-        CRYPTO_memcmp(candidate.data(), digest_.data(), digest_.size()) == 0;
-    return username == "default" && password_matches;
-  }
-
- private:
-  bool required_ = false;
-  std::array<unsigned char, SHA256_DIGEST_LENGTH> digest_{};
 };
 
 bool ValidClientName(std::string_view name) {

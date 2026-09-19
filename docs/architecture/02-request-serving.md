@@ -26,6 +26,12 @@ or streaming. Bycorf owns sockets and worker scheduling below the boundary.
 Transaction coordination, durable records, and replication sessions remain
 separate modules reached through explicit interfaces.
 
+The RESP parser/reply builder and default-user password verifier form a small
+shared library also used by Meta's Sentinel server. That server owns separate
+sessions and its own command allowlist; sharing these primitives does not
+share credentials or expose Data dispatch. Data AUTH, HELLO, and RESET remain
+local connection operations, including in standalone deployments without Meta.
+
 The implementation is split across shared protocol/session interfaces and
 focused command families under `src/redis/`. `src/redis/command.cpp` is the
 integration point for command admission, cross-worker routing, transactions,
