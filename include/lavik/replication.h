@@ -91,10 +91,10 @@ struct DesiredClusterUpstream {
 };
 
 struct ReplicationOptions {
-  // Cluster mode is always Meta-managed. It disables standalone upstream
-  // control and Redis PSYNC export; native export requires an exact population
-  // grant from the active Meta session.
-  bool cluster_enabled_ = false;
+  // Meta management is independent of client mode. It disables external
+  // upstream control and Redis PSYNC export; native export requires an exact
+  // population grant from the active Meta session.
+  bool meta_managed_ = false;
   // Set by the Meta control adapter to its validated 160-bit data-node
   // identity. Standalone deployments use a fresh CSPRNG identity each boot.
   std::optional<std::string> node_id_override_;

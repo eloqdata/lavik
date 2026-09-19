@@ -84,7 +84,7 @@ std::string_view DiscoveryHost(const cluster::ServingState& state,
 }
 
 // Client port a discovery reply advertises for `node`. The self entry honors
-// the cluster-announce-port/-tls-port overrides (NAT deployments), which the
+// the announce-port/-tls-port overrides (NAT deployments), which the
 // startup wiring resolves to the listening ports when unset; every other node
 // advertises its file port, selected by the connection's TLS state.
 std::uint16_t DiscoveryPort(const cluster::ServingState& state,

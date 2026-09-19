@@ -113,6 +113,23 @@ Decision Admit(const ServingState* state, const RequestView& request) {
     return decision;
   }
 
+  if (request.client_mode_ == ClientMode::kSingle &&
+      request.slots_.size() > 1) {
+    // Single may span slots, but every involved slot still needs its own
+    // ownership decision. CaptureAndAdmit retains the complete slot set for
+    // the lease, in-flight registration, and final mutation checks.
+    for (std::size_t index = 0; index < request.slots_.size(); ++index) {
+      RequestView one_slot = request;
+      one_slot.slots_ = request.slots_.subspan(index, 1);
+      const Decision current = Admit(state, one_slot);
+      if (current.kind_ != Decision::Kind::kServe &&
+          current.kind_ != Decision::Kind::kServeStaleRead)
+        return current;
+      if (current.kind_ == Decision::Kind::kServeStaleRead) decision = current;
+    }
+    return decision;
+  }
+
   // First-key unbound outranks cross-slot (Redis checks coverage before the
   // single-slot rule): [unbound-slot key, other-slot key] yields CLUSTERDOWN,
   // not CROSSSLOT.

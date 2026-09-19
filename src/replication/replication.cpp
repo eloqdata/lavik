@@ -3629,9 +3629,8 @@ class ReplicationManager::ReplicationGroup {
                    std::atomic<std::uint64_t>* serving_generation)
       : storage_(storage),
         serving_generation_(serving_generation),
-        cluster_enabled_(options.cluster_enabled_),
-        upstream_(cluster_enabled_ ? std::nullopt
-                                   : std::move(initial_upstream)),
+        meta_managed_(options.meta_managed_),
+        upstream_(meta_managed_ ? std::nullopt : std::move(initial_upstream)),
         upstream_caches_(
             std::make_unique<UpstreamSnapshot[]>(storage->worker_count())),
         applied_frontier_(std::make_shared<detail::ReplicaAppliedFrontier>(
@@ -3648,9 +3647,9 @@ class ReplicationManager::ReplicationGroup {
         tls_context_(options.use_tls_ ? options.tls_context_ : nullptr),
         masteruser_(options.masteruser_),
         masterauth_(options.masterauth_),
-        redis_psync_(cluster_enabled_ ? false : options.redis_psync_),
+        redis_psync_(meta_managed_ ? false : options.redis_psync_),
         redis_export_backpressure_(options.redis_export_backpressure_) {
-    if (cluster_enabled_) {
+    if (meta_managed_) {
       cluster_group_ =
           std::make_unique<lavik::ReplicationGroup>(node_id_, boot_id_);
     }
@@ -3658,7 +3657,7 @@ class ReplicationManager::ReplicationGroup {
         reinterpret_cast<const std::byte*>(boot_id_.data()), boot_id_.size());
     next_redis_full_sync_session_id_.store(storage::Crc64(boot_bytes),
                                            std::memory_order_relaxed);
-    if (cluster_enabled_ && initial_upstream.has_value()) {
+    if (meta_managed_ && initial_upstream.has_value()) {
       // Server config rejects this combination, but ReplicationManager is also
       // a public embedding seam. Ignore the standalone source here so a direct
       // caller cannot bypass cluster replication policy.
@@ -3670,7 +3669,7 @@ class ReplicationManager::ReplicationGroup {
     backlog_size_bytes_.store(std::max(minimum_blocks, configured_blocks) *
                                   storage::kStorageBlockBytes,
                               std::memory_order_relaxed);
-    if (cluster_enabled_) {
+    if (meta_managed_) {
       for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
         auto history = std::make_shared<ReplicationHistory>(
             BacklogCapacityForFlow(worker, backlog_size_bytes_.load()));
@@ -3699,7 +3698,7 @@ class ReplicationManager::ReplicationGroup {
         group_id_ = (**recovered_base).group_id_;
       }
     }
-    if (upstream_.has_value() || cluster_enabled_) {
+    if (upstream_.has_value() || meta_managed_) {
       StoreRole(ReplicationRole::kConnecting, std::memory_order_relaxed);
       role_epoch_.store(1, std::memory_order_relaxed);
     }
@@ -3737,7 +3736,7 @@ class ReplicationManager::ReplicationGroup {
                 std::move(upstream), std::move(directive), std::move(manifest));
           });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "cluster rebuild directives require Meta-managed population mode");
     }
@@ -4014,7 +4013,7 @@ class ReplicationManager::ReplicationGroup {
                                                       std::move(manifest));
           });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "empty population initialization requires Meta-managed mode");
     }
@@ -4599,7 +4598,7 @@ class ReplicationManager::ReplicationGroup {
             return StartClusterPromotionPrepareDirective(std::move(directive));
           });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "promotion prepare requires Meta-managed population mode");
     }
@@ -4890,7 +4889,7 @@ class ReplicationManager::ReplicationGroup {
             return ReconcileClusterSourcePause(std::move(desired));
           });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "source pause reconciliation requires Meta-managed population mode");
     }
@@ -5199,7 +5198,7 @@ class ReplicationManager::ReplicationGroup {
           });
     }
     AssertStateOwner();
-    if (!cluster_enabled_)
+    if (!meta_managed_)
       co_return absl::FailedPreconditionError(
           "recovery requires Meta-managed replication");
     if (desired.has_value()) {
@@ -6479,7 +6478,7 @@ class ReplicationManager::ReplicationGroup {
                                                   pending_activation_action_id);
           });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "failover action reconciliation requires Meta-managed population "
           "mode");
@@ -6732,7 +6731,7 @@ class ReplicationManager::ReplicationGroup {
             return ActivateClusterPreparedPromotion(std::move(activation));
           });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "cluster promotion activation requires Meta-managed population "
           "mode");
@@ -6840,7 +6839,7 @@ class ReplicationManager::ReplicationGroup {
         return EnableClusterExpirationAuthorityUntil(deadline_since_boot);
       });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "finite expiration authority requires Meta-managed population mode");
     }
@@ -6863,7 +6862,7 @@ class ReplicationManager::ReplicationGroup {
       co_return co_await bycorf::SubmitTaskTo(
           0, [this] { return RevokeClusterExpirationAuthority(); });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "expiration revocation requires Meta-managed population mode");
     }
@@ -6885,7 +6884,7 @@ class ReplicationManager::ReplicationGroup {
 
   absl::StatusOr<std::pair<DesiredClusterUpstream, PopulationManifest>>
   NormalizeClusterFollowOwner(DesiredClusterUpstream desired) const {
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       return absl::FailedPreconditionError(
           "follow-owner reconciliation requires Meta-managed population "
           "mode");
@@ -7241,7 +7240,7 @@ class ReplicationManager::ReplicationGroup {
             return ReconcileClusterFollowOwner(std::move(desired));
           });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "follow-owner reconciliation requires Meta-managed population "
           "mode");
@@ -7401,7 +7400,7 @@ class ReplicationManager::ReplicationGroup {
                 preserve_current_follow_attempt, reason);
           });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "population reconciliation requires Meta-managed population mode");
     }
@@ -7751,7 +7750,7 @@ class ReplicationManager::ReplicationGroup {
     AssertStateOwner();
     auto record = co_await storage_->ConsumePopulationRecovery();
     if (!record.ok()) co_return record.status();
-    if (!cluster_enabled_ || !record->has_value()) co_return absl::OkStatus();
+    if (!meta_managed_ || !record->has_value()) co_return absl::OkStatus();
     auto scope = detail::DecodeRecoveredPopulation((**record).identity_);
     if (!scope.ok()) co_return scope.status();
     if (scope->identity_.target_node_id_ != node_id_) {
@@ -7785,7 +7784,7 @@ class ReplicationManager::ReplicationGroup {
       co_return co_await bycorf::SubmitTaskTo(
           0, [this]() { return CancelClusterRebuildForShutdown(); });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "population shutdown requires Meta-managed population mode");
     }
@@ -7855,7 +7854,7 @@ class ReplicationManager::ReplicationGroup {
     }
     RequestShutdown();
     absl::Status result = absl::OkStatus();
-    if (cluster_enabled_) {
+    if (meta_managed_) {
       // The Meta transition additionally retires its Ready proof. It is
       // idempotent when the control client already completed the same barrier.
       result = co_await CancelClusterRebuildForShutdown();
@@ -8001,7 +8000,7 @@ class ReplicationManager::ReplicationGroup {
             return AuthorizeClusterRebuildSource(std::move(directive));
           });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "cluster source authorization requires Meta-managed population "
           "mode");
@@ -8095,7 +8094,7 @@ class ReplicationManager::ReplicationGroup {
         return EnableClusterRebuildSourceAdmissionUntil(deadline_since_boot);
       });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "cluster source admission requires Meta-managed population mode");
     }
@@ -8159,7 +8158,7 @@ class ReplicationManager::ReplicationGroup {
                 expected_authorization_replays);
           });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!meta_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
           "cluster source revocation requires Meta-managed population mode");
     }
@@ -8380,7 +8379,7 @@ class ReplicationManager::ReplicationGroup {
             return SetUpstream(std::move(upstream));
           });
     }
-    if (cluster_enabled_) {
+    if (meta_managed_) {
       co_return absl::FailedPreconditionError(
           "REPLICAOF is unavailable in cluster mode");
     }
@@ -8757,7 +8756,7 @@ class ReplicationManager::ReplicationGroup {
             return AddUpstream(std::move(upstream));
           });
     }
-    if (cluster_enabled_) {
+    if (meta_managed_) {
       co_return absl::FailedPreconditionError(
           "ADDREPLICAOF is unavailable in cluster mode");
     }
@@ -9394,7 +9393,7 @@ class ReplicationManager::ReplicationGroup {
                                 "a fenced node cannot export Redis PSYNC")
                           : sent;
     }
-    if (cluster_enabled_) {
+    if (meta_managed_) {
       absl::Status sent = co_await WriteText(
           stream,
           "-ERR Redis replication export is unavailable in cluster mode\r\n");
@@ -10569,7 +10568,7 @@ class ReplicationManager::ReplicationGroup {
     storage_->SetReplicaLoading(true);
     storage_->SetExpirationAuthority(false);
     StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
-    if (cluster_enabled_) {
+    if (meta_managed_) {
       bycorf::ThisWorker().self_->Spawn(
           RevokeClusterRebuildSourceAuthorizations());
     }
@@ -11912,7 +11911,7 @@ class ReplicationManager::ReplicationGroup {
           absl::CancelledError("replication role epoch was replaced");
       co_return stopped.ok() ? replaced : stopped;
     }
-    if (cluster_enabled_ && session->cluster_rebuild_ != nullptr &&
+    if (meta_managed_ && session->cluster_rebuild_ != nullptr &&
         session->cluster_rebuild_->ready_token_.has_value()) {
       auto cut = session->applied_frontier_->TrySnapshot();
       if (!cut.ok()) co_return cut.status();
@@ -14073,8 +14072,7 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::StatusOr<std::uint64_t>> RunMasterFullSync(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
       unsigned flow_id, const std::shared_ptr<FullSyncAckState>& ack_state) {
-    const std::uint8_t db_count =
-        cluster_enabled_ ? 1 : storage::kLogicalDatabaseCount;
+    const std::uint8_t db_count = storage_->database_count();
     auto fullsync_start = storage_->BeginFullSyncSession(session->id_);
     if (!fullsync_start.ok()) co_return fullsync_start.status();
     const auto source_db_epochs = fullsync_start->db_epochs_;
@@ -15483,8 +15481,8 @@ class ReplicationManager::ReplicationGroup {
         args.size() > 4 && (args[3] == "?" || IsReplicationId(args[3]) ||
                             ((population_handshake || follow_handshake) &&
                              IsPopulationGroupToken(args[3])));
-    if ((!cluster_enabled_ && args.size() != 8) ||
-        (cluster_enabled_ && !population_handshake && !follow_handshake) ||
+    if ((!meta_managed_ && args.size() != 8) ||
+        (meta_managed_ && !population_handshake && !follow_handshake) ||
         args[1] != kProtocolVersion || !requested_group_valid ||
         (args[4] != "?" && !IsReplicationId(args[4])) ||
         (args[5] != "?" && !IsReplicationId(args[5])) ||
@@ -15905,8 +15903,8 @@ class ReplicationManager::ReplicationGroup {
           stalled ? "replica flow made no full-sync progress for 10 minutes"
                   : "replica flows did not complete full synchronization");
     }
-    if (cluster_enabled_ && (session->steady_export_.has_value() ||
-                             session->population_export_ != nullptr)) {
+    if (meta_managed_ && (session->steady_export_.has_value() ||
+                          session->population_export_ != nullptr)) {
       co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
       bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       if (!session->cancelled() && history_id_ == source_history_id &&
@@ -16178,7 +16176,7 @@ class ReplicationManager::ReplicationGroup {
     // and a future failover. Transient absence of sockets is not a reason to
     // rotate it. Its bounded log still evicts normally; demotion, invalidation
     // and explicit source retirement own the history lifetime.
-    return (cluster_enabled_ && cluster_rebuild_ != nullptr &&
+    return (meta_managed_ && cluster_rebuild_ != nullptr &&
             cluster_rebuild_->ready_token_.has_value()) ||
            !master_sessions_.empty() || !retired_master_sessions_.empty() ||
            source_authorizations_.RetainsSourceHistory() ||
@@ -16215,7 +16213,7 @@ class ReplicationManager::ReplicationGroup {
         bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
         FinalizeRetiredMasterSessionsLocked();
         if (MasterHistoryHasConsumersLocked()) continue;
-        if (cluster_enabled_) {
+        if (meta_managed_) {
           // Meta binds source authorizations and population proofs to this
           // history. Finish retiring disconnected sessions, but leave history
           // retirement to explicit cluster role/population transitions. The
@@ -16279,7 +16277,7 @@ class ReplicationManager::ReplicationGroup {
       // events without ACK backpressure, so keeping the sequence alive does
       // not retain an unbounded history. Standalone idle retirement is
       // unchanged.
-      if (cluster_enabled_) continue;
+      if (meta_managed_) continue;
 
       // Serialize with history reset and handshake setup, then let every
       // command admitted against this history finish publishing before the
@@ -16406,7 +16404,7 @@ class ReplicationManager::ReplicationGroup {
   // reach it without following this pImpl. Bit zero is serving-open and the
   // remaining bits are a monotonic dataset generation.
   std::atomic<std::uint64_t>* const serving_generation_;
-  const bool cluster_enabled_;
+  const bool meta_managed_;
   // The existing discovery cancellation set also covers target-session
   // sockets, including connect/TLS. It is declared before their shared owners
   // so it outlives them. Only socket lifecycle/shutdown touches this registry;

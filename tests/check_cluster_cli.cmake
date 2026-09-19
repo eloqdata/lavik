@@ -26,9 +26,19 @@ set(help_text "${help_stdout}${help_stderr}")
 if(NOT help_result EQUAL 0)
   message(FATAL_ERROR "lavik --help failed: ${help_text}")
 endif()
-foreach(required IN ITEMS "--cluster-node-id" "--cluster-meta-seed")
+foreach(required IN ITEMS "--client-mode" "--meta-managed" "--node-id" "--meta-seed")
   string(FIND "${help_text}" "${required}" found)
   if(found EQUAL -1)
     message(FATAL_ERROR "lavik --help omitted ${required}")
+  endif()
+endforeach()
+
+foreach(removed IN ITEMS "--cluster-enabled" "--cluster-node-id" "--cluster-meta-seed"
+                         "--cluster-announce-ip" "--cluster-announce-port"
+                         "--cluster-announce-tls-port")
+  execute_process(COMMAND "${LAVIK_EXECUTABLE}" "${removed}" yes
+    RESULT_VARIABLE result OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+  if(result EQUAL 0 OR NOT "${stdout}${stderr}" MATCHES "not expected|unknown|unrecognized")
+    message(FATAL_ERROR "removed option was not rejected: ${removed}: ${stdout}${stderr}")
   endif()
 endforeach()

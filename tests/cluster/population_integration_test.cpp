@@ -46,11 +46,11 @@ TEST(PopulationIntegrationTest,
   PortReservation reservation;
   const std::uint16_t port = reservation.ReleaseForSpawn();
   ChildProcess process(
-      {g_lavik_binary, "--cluster-enabled", "--port", std::to_string(port),
-       "--cluster-node-id", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-       "--cluster-meta-seed", "127.0.0.1:1", "--threads", "1",
-       "--no-pin-workers", "--logtostderr", "--recv-buffers-per-worker", "0",
-       "--data-file", data.string()},
+      {g_lavik_binary, "--client-mode", "cluster", "--meta-managed", "yes",
+       "--port", std::to_string(port), "--node-id",
+       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--meta-seed", "127.0.0.1:1",
+       "--threads", "1", "--no-pin-workers", "--logtostderr",
+       "--recv-buffers-per-worker", "0", "--data-file", data.string()},
       log);
 
   WaitUntil("cluster node startup", 20s, [&] {
@@ -63,7 +63,7 @@ TEST(PopulationIntegrationTest,
   EXPECT_EQ(client.Command({"SET", "unassigned", "value"}),
             "-LOADING Lavik is loading the dataset from the primary");
   EXPECT_EQ(client.Command({"REPLICAOF", "NO", "ONE"}),
-            "-ERR REPLICAOF not allowed in cluster mode.");
+            "-ERR REPLICAOF not allowed in Meta-managed mode.");
   process.Stop(SIGINT);
 }
 

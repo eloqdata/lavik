@@ -63,8 +63,8 @@ Storage separates three ownership domains:
 - A logical partition is one of the 16,384 Redis hash slots. Its current key
   owner is `partition_id % worker_count`; that worker owns the partition's
   enabled logical-database indexes, mutation sequence, replication epoch,
-  counts, and snapshot state. Cluster mode constructs only DB0 indexes;
-  standalone mode constructs all 16. Each worker owns contiguous index arrays
+  counts, and snapshot state. Cluster client mode constructs only DB0 indexes;
+  Single client mode constructs all 16, independently of Meta management. Each worker owns contiguous index arrays
   backed by its shared entry arena, with partitions holding fixed views into
   those arrays. Durable epochs and checkpoint capacity tables retain all 16
   database slots in both modes. Recovery rejects current records in disabled
@@ -773,7 +773,7 @@ record blocks. A shielding value cannot use this escape valve because an
 older durable value could reappear.
 
 Tomb Raider is a separate, optional cleanup loop launched at worker startup
-only when the node is then the expiration authority. Cluster startup does not
+only when the node is then the expiration authority. Meta-managed startup does not
 grant that authority and therefore does not launch the loop. Once
 launched, the loop does not recheck authority on its own; the standalone
 `REPLICAOF` transition therefore explicitly quiesces it before installing an
