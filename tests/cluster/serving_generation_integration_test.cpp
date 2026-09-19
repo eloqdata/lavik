@@ -38,6 +38,12 @@ using lavik::test::TempDirectory;
 using lavik::test::WaitUntil;
 
 std::string g_lavik_binary;
+std::string g_redis_binary;
+
+std::vector<std::string> RedisArguments(std::uint16_t port) {
+  return {g_redis_binary, "--port", std::to_string(port),   "--save", "",
+          "--appendonly", "no",     "--repl-diskless-sync", "no"};
+}
 
 std::vector<std::string> ServerArguments(std::uint16_t port,
                                          const std::filesystem::path& data) {
@@ -81,7 +87,7 @@ TEST(ServingGenerationIntegrationTest,
   PortReservation target_reservation;
   const std::uint16_t source_port = source_reservation.ReleaseForSpawn();
   const std::uint16_t target_port = target_reservation.ReleaseForSpawn();
-  ChildProcess source(ServerArguments(source_port, source_data), source_log);
+  ChildProcess source(RedisArguments(source_port), source_log);
   ChildProcess target(ServerArguments(target_port, target_data), target_log,
                       {{"LAVIK_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS", "5000"}});
 
@@ -189,7 +195,7 @@ TEST(ServingGenerationIntegrationTest, WatchIsBoundToItsServingGeneration) {
   PortReservation target_reservation;
   const std::uint16_t source_port = source_reservation.ReleaseForSpawn();
   const std::uint16_t target_port = target_reservation.ReleaseForSpawn();
-  ChildProcess source(ServerArguments(source_port, source_data), source_log);
+  ChildProcess source(RedisArguments(source_port), source_log);
   ChildProcess target(ServerArguments(target_port, target_data), target_log,
                       {{"LAVIK_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS", "5000"}});
 
@@ -254,10 +260,11 @@ TEST(ServingGenerationIntegrationTest, WatchIsBoundToItsServingGeneration) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
+  if (argc != 3) {
     return 2;
   }
   g_lavik_binary = argv[1];
+  g_redis_binary = argv[2];
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

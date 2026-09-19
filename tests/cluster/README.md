@@ -123,17 +123,13 @@ successful response. A success is accepted only when both durability and the
 authority-at-decision evidence are true.
 
 `population_integration_test.cpp` is the current real-process cluster-admission
-test: it proves `cluster-enabled` starts LOADING, permits `PING`, and rejects
+test: it proves `meta-managed yes` starts LOADING, permits `PING`, and rejects
 standalone `REPLICAOF`. `replication_group_test.cpp` covers directive
 monotonicity, one-group assignment, safe-source/reset authorization, complete
 physical reset, sparse-manifest handoff, logical-to-local epoch matching,
 all-flow cuts, ready/fail-stop publication, proof invalidation, and a fresh
 `NOT_READY` group after API reconstruction at each rebuild boundary.
-`rebuild_protocol_integration_test.cpp` also kills a real target after an
-acknowledged partial handoff, proves recovery rejects the mixed SSD population,
-performs a fresh full sync, and proves the completed population becomes visible
-while retaining the durable incomplete-sync fence. The
-production manager consumes that API through `NodeControlInstaller`; the Meta
+The production manager consumes that API through `NodeControlInstaller`; the Meta
 integration suites cover authenticated transport, lease, projection, and
 directive delivery, while the native manager suite covers the real storage
 transition.
@@ -146,20 +142,17 @@ rejection, and idempotent empty revocation without adding a test-only control
 protocol. `source_authorization_test.cpp` separately proves same-revision
 multi-target grants, exact replay, revision supersession, revoked-watermark
 rejection, and idempotent empty revocation.
-`serving_generation_integration_test.cpp` proves that blocked requests,
-cross-worker WATCH registration, and a self-gated KEYS scan admitted before
-replacement cannot cross into the new dataset, and
-`rebuild_failure_integration_test.cpp` proves an uncertain native promotion
-stops the current boot without retrying.
-`rebuild_protocol_integration_test.cpp` exercises adversarial source behavior:
-the target must reject `LVONLINE` before its local flow proof and must reject a
-reset after the full-sync cut without losing the promoted population. It also
-injects a divergent online LSN and proves that every continuation cursor is
-discarded before the replacement full rebuild returns online, and verifies
-that an acknowledged full-sync cut cannot leave only part of the resume vector
-installed when the connection drops. A corrupted data frame forces a fresh
-full sync, and target process crashes verify recovery of both partial and
-promoted SSD images remains fail-closed.
+`serving_generation_integration_test.cpp` uses a real Redis upstream to prove
+that blocked requests, WATCH registration, and a self-gated KEYS scan admitted
+before replacement cannot cross into the new dataset.
+`../meta_integration/gate_native_replication.py` uses real Meta bootstrap and
+Follow Owner to verify native FULL and incremental data, heterogeneous workers,
+collection streams, non-idempotent tails, transactions, Pub/Sub, WAIT,
+reconnect, backpressure, shutdown, handoff ordering/cancellation, and rejection
+of corrupt frames or premature ONLINE. A failed directed rebuild remains
+fenced and reports its failure to Meta. The manager integration additionally
+checks that a Meta-managed source exports DB15 when its storage enables 16
+DBs; production managed Single startup stays disabled.
 
 ## Running and extending
 

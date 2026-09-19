@@ -722,7 +722,7 @@ class ReplicationManagerService final : public bycorf::Service {
     if (!startup_wait.ok()) co_return startup_wait;
     if (source_->accepted() != 0) {
       co_return TestFailure(
-          "cluster-enabled manager used a standalone initial upstream");
+          "Meta-managed manager used an external initial upstream");
     }
 
     auto manifest = lavik::PopulationManifest::Create({{42, 9}, {16'383, 11}});
@@ -4472,11 +4472,12 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
       lavik::storage::StorageEngine* storage,
       lavik::ReplicationManager* replication,
       std::filesystem::path admission_entered = {},
-      std::filesystem::path revocation_closed = {})
+      std::filesystem::path revocation_closed = {}, bool verify_db15 = false)
       : storage_(storage),
         replication_(replication),
         admission_entered_(std::move(admission_entered)),
-        revocation_closed_(std::move(revocation_closed)) {}
+        revocation_closed_(std::move(revocation_closed)),
+        verify_db15_(verify_db15) {}
 
   void Prepare(unsigned thread_count) override {
     if (thread_count != 1) {
@@ -4599,7 +4600,7 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
     const auto deadline = std::chrono::steady_clock::now() + 5s;
     while (response.find("\r\n") == std::string::npos &&
            std::chrono::steady_clock::now() < deadline) {
-      char buffer[512];
+      char buffer[1];
       const ssize_t received = ::recv(peer, buffer, sizeof(buffer), 0);
       if (received > 0) {
         response.append(buffer, static_cast<std::size_t>(received));
@@ -4647,10 +4648,77 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
     return result;
   }
 
+  bycorf::Task<absl::StatusOr<std::string>> ReadPeerBytes(
+      bycorf::Worker& worker, int peer, std::size_t size) {
+    std::string bytes(size, '\0');
+    std::size_t offset = 0;
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (offset < size && std::chrono::steady_clock::now() < deadline) {
+      const auto received =
+          ::recv(peer, bytes.data() + offset, size - offset, 0);
+      if (received > 0) {
+        offset += static_cast<std::size_t>(received);
+      } else if (received == 0) {
+        co_return TestFailure("FULL probe closed before DB15 record");
+      } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+        co_return absl::ErrnoToStatus(errno, "FULL probe");
+      } else {
+        auto waited = co_await bycorf::SleepFor(worker, 1ms);
+        if (!waited.ok()) co_return waited;
+      }
+    }
+    if (offset != size) co_return TestFailure("FULL probe timed out");
+    co_return bytes;
+  }
+
+  bycorf::Task<absl::Status> CheckFullDb15(bycorf::Worker& worker, int peer,
+                                           std::string_view key) {
+    const auto u32 = [](std::string_view value, unsigned offset) {
+      std::uint32_t result = 0;
+      for (unsigned i = 0; i < 4; ++i)
+        result |= std::uint32_t(static_cast<unsigned char>(value[offset + i]))
+                  << (8 * i);
+      return result;
+    };
+    // The authorized source's first reset covers partition zero. ACK that
+    // reset, then require an actual DB15 snapshot record before its handoff.
+    // This pins the manager's effective FULL range, beyond storage-only tests.
+    for (unsigned frame = 0; frame < 4; ++frame) {
+      auto header = co_await ReadPeerBytes(worker, peer, 16);
+      if (!header.ok()) co_return header.status();
+      if (header->substr(0, 4) != "LVF1" || u32(*header, 8) > 1024 * 1024)
+        co_return TestFailure("invalid FULL probe header");
+      auto payload = co_await ReadPeerBytes(worker, peer, u32(*header, 8));
+      if (!payload.ok()) co_return payload.status();
+      if (static_cast<std::uint32_t>(absl::ComputeCrc32c(*payload)) !=
+          u32(*header, 12))
+        co_return TestFailure("invalid FULL probe checksum");
+      if ((*header)[5] == 2 && payload->find(key) != std::string::npos &&
+          payload->find("managed-db15") != std::string::npos)
+        co_return absl::OkStatus();
+      if ((*header)[5] != 1)
+        co_return TestFailure("managed FULL omitted its DB15 record");
+      std::string ack_payload(10, '\0');
+      ack_payload[0] = ack_payload[1] = static_cast<char>(0xff);
+      std::string ack("LVF1\x01\x03\x10\x00", 8);
+      const auto append_u32 = [&](std::uint32_t value) {
+        for (unsigned i = 0; i < 4; ++i)
+          ack.push_back(static_cast<char>(value >> (8 * i)));
+      };
+      append_u32(10);
+      append_u32(static_cast<std::uint32_t>(absl::ComputeCrc32c(ack_payload)));
+      ack += ack_payload;
+      if (::send(peer, ack.data(), ack.size(), MSG_NOSIGNAL) !=
+          static_cast<ssize_t>(ack.size()))
+        co_return TestFailure("could not ACK FULL reset");
+    }
+    co_return TestFailure("managed FULL omitted its DB15 record");
+  }
+
   bycorf::Task<absl::Status> Exercise(bycorf::Worker& worker) {
     const lavik::ReplicationIdentity local =
         co_await replication_->ObserveIdentity();
-    auto manifest = lavik::PopulationManifest::Create({});
+    auto manifest = lavik::PopulationManifest::Create({{0, 1}});
     if (!manifest.ok()) co_return manifest.status();
     lavik::RebuildIdentity identity{
         .group_id_ = "source-follow-group",
@@ -4674,6 +4742,14 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
     if (!initialized.ok()) co_return initialized.status();
     if (absl::Status ready = co_await initialized->Await(); !ready.ok()) {
       co_return ready;
+    }
+    std::string db15_key = "managed-single-db15";
+    if (verify_db15_) {
+      for (unsigned candidate = 0; lavik::storage::RedisSlot(db15_key) != 0;
+           ++candidate)
+        db15_key = "managed-single-db15-" + std::to_string(candidate);
+      auto stored = co_await storage_->Set(15, db15_key, "managed-db15", {});
+      if (!stored.ok()) co_return stored.status();
     }
     auto watermark = co_await replication_->CaptureNativeReplicationWatermark();
     if (!watermark.ok() || !watermark->has_value() ||
@@ -5006,6 +5082,7 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
         .owner_assignment_id_ = identity.assignment_id_,
         .manifest_revision_ = identity.manifest_revision_,
         .manifest_id_ = identity.manifest_id_,
+        .manifest_entries_ = {{0, 1}},
         .partition_replication_epoch_ = identity.partition_replication_epoch_,
         .members_ =
             {
@@ -5129,6 +5206,12 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
           "steady source did not reuse native CONTINUE/FULL selection");
     }
 
+    if (verify_db15_) {
+      auto checked =
+          co_await CheckFullDb15(worker, second_flow->peer_fd_, db15_key);
+      if (!checked.ok()) co_return checked;
+    }
+
     reconciled =
         co_await replication_->ReconcileClusterFollowOwner(std::nullopt);
     if (!reconciled.ok()) co_return reconciled;
@@ -5168,6 +5251,7 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
   std::filesystem::path revocation_closed_;
   std::vector<std::shared_ptr<RequestResult>> retained_requests_;
   std::vector<int> peer_fds_;
+  bool verify_db15_ = false;
   absl::Status result_ = absl::OkStatus();
 };
 
@@ -5952,7 +6036,8 @@ TEST(ReplicationManagerIntegrationTest,
   lavik::InitStorage(&storage, &replication);
   EnsureTxRuntime();
 
-  FollowOwnerSourceAuthorizationService service(&storage, &replication);
+  FollowOwnerSourceAuthorizationService service(&storage, &replication, {}, {},
+                                                true);
   bycorf::Server server;
   server.AddService(&service);
   bycorf::ServerOptions runtime;
