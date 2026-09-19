@@ -56,10 +56,12 @@ manual installation of equivalent dependencies.
 Meta requires the Go toolchain pinned by `raft/go.mod` (currently 1.26.8),
 CGO, and the configured C compiler. The Ubuntu installer includes a Go bootstrap
 compiler; Go automatically downloads the pinned toolchain and checksummed
-modules on first configuration/build. CI uses `actions/setup-go` with that same
+modules on first configuration/build. CMake sets `GOTOOLCHAIN` to the exact
+version for configuration, archive builds and tests, including when the local
+Go launcher is newer. CI uses `actions/setup-go` with that same
 module file. No etcd submodule or running etcd service is required. Offline
 builders must prepopulate the Go toolchain/module caches. Set
-`-DLAVIK_GO_EXECUTABLE=/path/to/go` to select an installed toolchain.
+`-DLAVIK_GO_EXECUTABLE=/path/to/go` to select the Go launcher.
 
 Optimized local builds use the current machine's instruction set by default:
 

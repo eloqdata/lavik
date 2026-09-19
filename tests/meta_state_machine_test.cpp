@@ -873,12 +873,9 @@ TEST_F(MetaStateMachineTest, SubmitOperationSeqEqualsLogIndex) {
 }
 
 // ---------------------------------------------------------------------------
-// raft_server integration over the real adapters (single node)
+// MetaRaft integration over the real adapters (single node)
 // ---------------------------------------------------------------------------
 
-// Minimal real-time scheduler for driving the Raft core in tests: one thread
-// per delayed task. Cancelled tasks still wake and exit cheaply because
-// delayed_task::execute() checks the cancellation flag.
 // Real C ABI integration: recovery and capture use the production Go WAL and
 // snapshot executor, while application results remain typed C++ Meta verdicts.
 class MetaServerIntegrationTest : public ::testing::Test {

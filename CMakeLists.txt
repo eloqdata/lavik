@@ -224,12 +224,16 @@ if (LAVIK_BUILD_META)
   endif()
 
   find_program(LAVIK_GO_EXECUTABLE NAMES go REQUIRED)
-  execute_process(COMMAND ${LAVIK_GO_EXECUTABLE} env GOVERSION
+  # go.mod's toolchain directive only upgrades an older launcher. Select the
+  # exact version for configuration, builds and tests even with a newer Go.
+  set(LAVIK_GO_TOOLCHAIN go1.26.8)
+  execute_process(COMMAND ${CMAKE_COMMAND} -E env GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
+      ${LAVIK_GO_EXECUTABLE} env GOVERSION
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft
     OUTPUT_VARIABLE LAVIK_GO_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE
     COMMAND_ERROR_IS_FATAL ANY)
-  if (NOT LAVIK_GO_VERSION STREQUAL "go1.26.8")
-    message(FATAL_ERROR "Meta requires Go 1.26.8; found ${LAVIK_GO_VERSION}")
+  if (NOT LAVIK_GO_VERSION STREQUAL LAVIK_GO_TOOLCHAIN)
+    message(FATAL_ERROR "Meta requires ${LAVIK_GO_TOOLCHAIN}; found ${LAVIK_GO_VERSION}")
   endif()
   file(GLOB_RECURSE LAVIK_RAFT_GO_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/raft/*.go ${CMAKE_CURRENT_SOURCE_DIR}/raft/*.h)
@@ -240,6 +244,7 @@ if (LAVIK_BUILD_META)
   endif()
   add_custom_command(OUTPUT ${LAVIK_RAFT_ARCHIVE}
     COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=1 CC=${CMAKE_C_COMPILER}
+      GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
       ${LAVIK_GO_EXECUTABLE} build -mod=readonly ${LAVIK_RAFT_BUILD_TAGS} -buildmode=c-archive
       -o ${LAVIK_RAFT_ARCHIVE} ./bridge
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft
@@ -834,6 +839,7 @@ if (BUILD_TESTING)
 
     add_test(NAME meta_raft.go
       COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=1 CC=${CMAKE_C_COMPILER}
+        GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
         ${LAVIK_GO_EXECUTABLE} test -mod=readonly -race -count=1 ./...)
     set_tests_properties(meta_raft.go PROPERTIES
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft

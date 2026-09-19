@@ -183,8 +183,11 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     coordinator_options.foreign_executor_ = executor_;
     coordinator_options.propose_timeout_ms_ = ProposeTimeoutMs();
     coordinator_options.proposal_executor_ = &proposal_executor_;
-    coordinator_ = std::make_unique<MetaCoordinator>(
-        server_, *machine_, observations_, coordinator_options);
+    {
+      std::lock_guard lock(role_mutex_);
+      coordinator_ = std::make_unique<MetaCoordinator>(
+          server_, *machine_, observations_, coordinator_options);
+    }
     ASSERT_TRUE(WaitUntil([this] { return server_->is_leader(); }, 15s));
     // Harmless if the organic callback already arrived; it closes the tiny
     // fixture-only race between election and callback target attachment.

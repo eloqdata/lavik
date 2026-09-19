@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync/atomic"
 
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
@@ -244,7 +245,37 @@ func openDisk(cfg Config) (*diskStore, recovered, error) {
 		}
 		s.gcCut.Store(rec.snapshot.Metadata.GetIndex())
 	}
+	if err := s.removeSnapshotStages(); err != nil {
+		_ = s.wal.Close()
+		return nil, rec, fmt.Errorf("Meta snapshot staging cleanup: %w", err)
+	}
 	return s, rec, nil
+}
+
+// Cleanup runs only after WAL ownership and recovery validation, before any
+// executors start. A crash can bypass prepareSnapshot's deferred cleanup; these
+// private directories never contain a published root. Leave final image names
+// and unrelated files alone, including images renamed before WAL publication.
+func (s *diskStore) removeSnapshotStages() error {
+	dir := filepath.Join(s.dir, "snap")
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	removed := false
+	for _, file := range files {
+		if !file.IsDir() || !strings.HasPrefix(file.Name(), "prepare-") {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, file.Name())); err != nil {
+			return err
+		}
+		removed = true
+	}
+	if removed {
+		return syncDirectory(dir)
+	}
+	return nil
 }
 
 // save completes only once all prior append tasks and this task are durable.

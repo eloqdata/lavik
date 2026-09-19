@@ -11,8 +11,10 @@ extern "C" {
 
 /* All input bytes are copied before the call returns. Callback output uses
  * malloc; Go copies and frees it before returning to its executor. No Go
- * pointer or borrowed C++ buffer survives a call. The owner remains alive until
- * close. */
+ * pointer or borrowed C++ buffer survives a call. The error buffer returned by
+ * lavik_raft_open and the output buffer returned by lavik_raft_status are
+ * malloc-allocated and transferred to the caller, which must free them.
+ * The owner remains alive until close. */
 typedef struct LavikRaftBytes {
   void* data;
   uint64_t size;

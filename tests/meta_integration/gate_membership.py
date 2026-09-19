@@ -162,9 +162,13 @@ def main():
         extras.append(node6)
 
         def membership_changes():
+            # The load writer can roll phase markers out of log_tail's window.
+            # Track exact operation IDs across the complete process log.
+            with open(leader.log_path, encoding="utf-8", errors="replace") as log:
+                text = log.read()
             return set(re.findall(
                 r"membership ([0-9a-f]{32}) phase=change-config\b",
-                leader.log_tail(lines=2000)))
+                text))
 
         operations_before = membership_changes()
         first_result = {}

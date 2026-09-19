@@ -118,6 +118,65 @@ func TestPreparedSnapshotDoesNotAdvanceRecoveryRoot(t *testing.T) {
 	}
 }
 
+func TestRecoveryRemovesAbandonedSnapshotStages(t *testing.T) {
+	cfg := storageConfig(t)
+	disk, _, err := openDisk(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeEntries(t, disk, 1, 10, 1)
+	if err = disk.publishSnapshot(testImage(t, 5, 1, []byte("published"))); err != nil {
+		t.Fatal(err)
+	}
+	if err = disk.prepareSnapshot(testImage(t, 10, 1, []byte("unpublished"))); err != nil {
+		t.Fatal(err)
+	}
+	if err = disk.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(disk.dir, "snap")
+	name := fmt.Sprintf("%016x-%016x.snap", 1, 10)
+	prepared, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Crashes before the image rename and after it can leave populated or
+	// empty staging directories. Neither is a published recovery root.
+	stages := []string{filepath.Join(dir, "prepare-before-rename"), filepath.Join(dir, "prepare-after-rename")}
+	for _, stage := range stages {
+		if err := os.Mkdir(stage, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(stages[0], name), prepared, 0600); err != nil {
+		t.Fatal(err)
+	}
+	note := filepath.Join(dir, "prepare-operator-note")
+	if err := os.WriteFile(note, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Initial = nil
+	disk, rec, err := openDisk(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disk.wal.Close()
+	for _, stage := range stages {
+		if _, err := os.Stat(stage); !os.IsNotExist(err) {
+			t.Fatalf("abandoned snapshot stage survived recovery: %s: %v", stage, err)
+		}
+	}
+	if rec.snapshot.Metadata.GetIndex() != 5 || rec.hard.GetCommit() != 10 || len(rec.entries) != 5 {
+		t.Fatal("staging cleanup changed the published recovery root or WAL suffix")
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, name)); err != nil || !bytes.Equal(data, prepared) {
+		t.Fatalf("staging cleanup changed the renamed, unpublished image: %v", err)
+	}
+	if data, err := os.ReadFile(note); err != nil || string(data) != "keep" {
+		t.Fatalf("staging cleanup changed an unrelated file: %v", err)
+	}
+}
+
 func TestRecoveryFailsClosedOnMissingOrCorruptEvidence(t *testing.T) {
 	for _, kind := range []string{"marker", "started", "started-content", "wal", "snapshot-missing", "snapshot-checksum", "wal-checksum", "genesis-mismatch"} {
 		t.Run(kind, func(t *testing.T) {
