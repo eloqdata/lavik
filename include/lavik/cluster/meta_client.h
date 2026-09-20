@@ -357,6 +357,8 @@ class MetaControlClientService final : public bycorf::Service {
   MetaControlClientService& operator=(const MetaControlClientService&) = delete;
 
   void Prepare(unsigned thread_count) override;
+  // Worker zero waits for the installer's storage readiness before opening a
+  // Meta session. Publish readiness only after all local startup recovery ends.
   bycorf::Task<absl::Status> Run(bycorf::Worker& worker,
                                  bycorf::ServiceContext context) override;
   void Stop() noexcept override;

@@ -205,11 +205,9 @@ std::uint64_t SecondsSince(std::uint64_t started_nanos) noexcept {
 }
 
 #if LAVIK_FAULTS_ENABLED
-// A configured path turns the corresponding promotion stall into a
-// deterministic coroutine barrier. Tests observe the created file, then
-// supersede the action through the public reconciliation API. The runner
-// resumes only after that action is no longer current, eliminating timing as
-// evidence for which side of the durability boundary was exercised.
+// Signal that a test-only coroutine barrier has been reached. The caller
+// owns the release condition (for example action replacement or marker removal)
+// so tests need not infer progress from elapsed time.
 absl::Status SignalFaultBarrier(const char* variable,
                                 std::string_view barrier_name) {
   const char* path = std::getenv(variable);
@@ -7710,6 +7708,21 @@ class ReplicationManager::ReplicationGroup {
     const auto old_population = cluster_rebuild_;
     const auto old_action = cluster_failover_action_;
     const auto old_follow = cluster_follow_owner_;
+    LAVIK_FAULT_INJECT({
+      // Hold the same snapshot that the retained-history await must preserve.
+      // The process test removes this marker to release startup recovery.
+      const char* barrier = std::getenv("LAVIK_RECOVERY_INSTALL_BARRIER_PATH");
+      if (barrier != nullptr && *barrier != '\0') {
+        absl::Status signalled = SignalFaultBarrier(
+            "LAVIK_RECOVERY_INSTALL_BARRIER_PATH", "population recovery");
+        if (!signalled.ok()) co_return signalled;
+        while (::access(barrier, F_OK) == 0) {
+          absl::Status waited = co_await bycorf::SleepFor(
+              *bycorf::ThisWorker().self_, std::chrono::milliseconds(10));
+          if (!waited.ok()) co_return waited;
+        }
+      }
+    });
     auto& identity = population.identity_;
     identity.target_boot_id_ = boot_id_;
     identity.directive_revision_ = 1;

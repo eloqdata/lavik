@@ -3287,6 +3287,30 @@ bycorf::Task<absl::Status> MetaControlClientService::Run(
     co_return run_status;
   }
 
+  // Disk, catalog and population recovery own local replication state until
+  // RedisService publishes storage readiness. Even an ordinary FDS can install
+  // FollowOwner while recovery yields, invalidating its one-shot clean proof.
+  // Both this service and the readiness publisher run on worker zero.
+  while (!impl_->installer_.storage_ready()) {
+    if (impl_->stopping_.load(std::memory_order_acquire) ||
+        worker.stop_requested()) {
+      // No control session or directive has started. In particular, do not
+      // cancel population state still owned by the startup recovery coroutine.
+      completed.SetResult(absl::OkStatus());
+      co_return absl::OkStatus();
+    }
+    absl::Status slept =
+        co_await bycorf::SleepFor(worker, kDeadlinePollInterval);
+    if (!slept.ok()) {
+      if (impl_->stopping_.load(std::memory_order_acquire) ||
+          worker.stop_requested()) {
+        slept = absl::OkStatus();
+      }
+      completed.SetResult(slept);
+      co_return slept;
+    }
+  }
+
   bool attempted = false;
   while (!impl_->stopping_.load(std::memory_order_acquire) &&
          !worker.stop_requested()) {

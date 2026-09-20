@@ -131,9 +131,10 @@ operator --> lavik-ctl cluster-status / failover / getop
    workers finish recovery and allocator cleanup before the process becomes
    ready.
 4. Worker 0 recovers and validates the durable Function catalog on every
-   worker, then performs an optional validated RDB import before the readiness
-   flag is published. Replication is notified only after worker storage and
-   catalog recovery are ready.
+   worker and restores any recoverable cluster population, then performs an
+   optional validated RDB import before publishing readiness. Replication is
+   notified and the Meta control client may open its first session only after
+   local startup recovery is complete.
 5. On a shutdown signal, new requests and accepts are closed; Meta control,
    active requests, replication target/source work, and RDB backup work drain
    before storage is durably flushed. When configured, shutdown transaction

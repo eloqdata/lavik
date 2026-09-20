@@ -807,6 +807,13 @@ in cluster mode because the two topology sources are mutually exclusive.
 
 ## Meta control and configuration
 
+The outbound Meta control client waits for local storage readiness before
+opening its first session. Readiness includes disk, Function-catalog and
+population recovery, so FDS installation and directives cannot supersede an
+in-progress startup recovery. This wait runs cooperatively on worker zero and
+can end on shutdown without starting control work. Meta availability is not a
+dependency of local recovery.
+
 Meta-controlled state enters only through the asynchronous client/session path
 and `NodeControlInstaller`, which can wait for replication revocation and
 request drains before acknowledging a transition. Production startup never

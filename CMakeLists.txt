@@ -1134,8 +1134,9 @@ if (BUILD_TESTING)
             RUN_SERIAL TRUE
           )
         endforeach()
-        foreach(recovery_case IN ITEMS clean-owner clean-replica crash-operator
-                                       manual-fence before-publish after-publish
+        foreach(recovery_case IN ITEMS startup-barrier startup-stop clean-owner
+                                       clean-replica crash-operator manual-fence
+                                       before-publish after-publish
                                        before-consume after-consume
                                        incomplete-full eligible-candidate)
           string(REPLACE "-" "_" recovery_test_suffix "${recovery_case}")

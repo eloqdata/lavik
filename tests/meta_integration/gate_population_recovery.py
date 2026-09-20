@@ -16,7 +16,8 @@
 """Exercise restart eligibility and explicit operator recovery through real processes.
 
 Assertions use Meta's public status/admin API and Redis commands. Fault sites
-cut only the durable proof boundary; they do not bypass elections or leases.
+cut durable proof boundaries or hold startup recovery; they do not bypass
+elections or leases.
 """
 
 import argparse
@@ -26,16 +27,18 @@ import re
 import signal
 import socket
 import sys
+import threading
 import time
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate_automatic_failover as A  # noqa: E402
 import gate_failover as F  # noqa: E402
 import harness as H  # noqa: E402
 
-CASES = ("clean-owner", "clean-replica", "crash-operator", "manual-fence",
-         "before-publish", "after-publish", "before-consume", "after-consume",
-         "incomplete-full", "eligible-candidate")
+CASES = ("startup-barrier", "startup-stop", "clean-owner", "clean-replica",
+         "crash-operator", "manual-fence", "before-publish", "after-publish",
+         "before-consume", "after-consume", "incomplete-full", "eligible-candidate")
 
 
 @contextmanager
@@ -67,6 +70,69 @@ def restart(fixture, data, fault=None):
         # Startup crash cuts may precede the metrics listener. The caller
         # awaits the distinct fault exit instead of mistaking it for timeout.
         data.start(wait_ready=fault is None)
+
+
+class StartupProxy(H.Proxy):
+    """Observe every connection attempt, including one before recovery pauses."""
+
+    def __init__(self, target_port):
+        super().__init__("recovery-startup", target_port)
+        self.connected = threading.Event()
+
+    def _on_accept(self, conn):
+        self.connected.set()
+        super()._on_accept(conn)
+
+
+def restart_at_recovery_barrier(fixture, data, workdir, *, stop=False):
+    leader = fixture.rediscover_leader(time.monotonic() + 5)
+    proxy = StartupProxy(int(leader.data_control_endpoint.rsplit(":", 1)[1]))
+    barrier = os.path.join(workdir, "population-recovery-held")
+    try:
+        proxy.start()
+        H.wait_until("startup proxy is listening", 5,
+                     lambda: proxy._listener is not None)
+        data.seed = proxy.endpoint
+        with patch.dict(os.environ, {
+                "LAVIK_RECOVERY_INSTALL_BARRIER_PATH": barrier}):
+            data.start(wait_ready=False)
+        H.wait_until("population recovery reaches the install barrier", 20,
+                     lambda: os.path.exists(barrier))
+        # Keep recovery suspended across many control-client scheduler turns.
+        # No Meta connection may start, even before the install marker appears.
+        if proxy.connected.wait(timeout=1):
+            raise H.Failure("Meta connected before population recovery completed")
+        if data.proc.poll() is not None:
+            raise H.Failure("Data exited while population recovery was held")
+        if stop:
+            log_offset = os.path.getsize(data.log_path)
+            data.proc.send_signal(signal.SIGINT)
+            # Startup has no replication shutdown monitor yet: the process
+            # must exit unsuccessfully without certifying a clean checkpoint,
+            # but the Meta startup wait must still quiesce without hanging.
+            if data.proc.wait(timeout=20) != 1:
+                raise H.Failure("interrupted startup did not fail closed")
+            with open(data.log_path, encoding="utf-8") as log:
+                log.seek(log_offset)
+                shutdown_log = log.read()
+            quiesced = "Meta control client quiesced before storage flush"
+            if quiesced not in shutdown_log:
+                raise H.Failure("Meta startup wait did not quiesce on shutdown")
+            if "all storage buffers durably flushed" in shutdown_log:
+                raise H.Failure("interrupted recovery published a clean checkpoint")
+            if proxy.connected.is_set():
+                raise H.Failure("Meta connected during interrupted startup")
+            return proxy
+        os.unlink(barrier)
+        H.wait_until("Meta connects after population recovery", 20,
+                     proxy.connected.is_set)
+        return proxy
+    except BaseException:
+        proxy.close()
+        raise
+    finally:
+        if os.path.exists(barrier):
+            os.unlink(barrier)
 
 
 def wait_serving(fixture, data, term):
@@ -173,6 +239,7 @@ def run(args, workdir):
     owner.workers = 2
     replica = fixture.by_id[F.CANDIDATE]
     case = args.case
+    startup_proxy = None
     publish_fault = ("recovery_" + case.replace("-", "_proof_")
                      if case.endswith("publish") else None)
     try:
@@ -211,7 +278,14 @@ def run(args, workdir):
         if case.endswith("consume"):
             restart(fixture, target, "recovery_" + case.replace("-", "_proof_"))
             require_exit_at_fault(target)
-        restart(fixture, target)
+        if case in ("startup-barrier", "startup-stop"):
+            startup_proxy = restart_at_recovery_barrier(
+                fixture, target, workdir, stop=case == "startup-stop")
+            if case == "startup-stop":
+                fixture.clean_shutdown()
+                return
+        else:
+            restart(fixture, target)
         if case in ("incomplete-full", "eligible-candidate"):
             require_fenced(fixture, target, 2 if short_threshold else 1)
             reply = fixture.leader.ctl(
@@ -222,8 +296,8 @@ def run(args, workdir):
                 raise H.Failure(f"unsafe promote was not rejected: {reply}")
             fixture.clean_shutdown()
             return
-        eligible = case in ("clean-owner", "clean-replica", "after-publish",
-                            "before-consume")
+        eligible = case in ("startup-barrier", "clean-owner", "clean-replica",
+                            "after-publish", "before-consume")
         if not eligible:
             require_fenced(fixture, target, 2 if short_threshold else 1)
             if case == "manual-fence":
@@ -265,6 +339,8 @@ def run(args, workdir):
         raise
     finally:
         fixture.force_kill()
+        if startup_proxy is not None:
+            startup_proxy.close()
 
 
 def main():
