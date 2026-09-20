@@ -214,7 +214,7 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   EXPECT_EQ(options.bind_addresses_,
             (std::vector<std::string>{"0.0.0.0", "::1", "redis.internal"}));
   EXPECT_EQ(options.port_, 6380);
-  EXPECT_EQ(options.thread_count_, 4u);
+  EXPECT_EQ(options.shard_count_, 4u);
   EXPECT_EQ(options.max_clients_, 12000u);
   EXPECT_TRUE(options.maxmemory_clients_.percentage_);
   EXPECT_EQ(options.maxmemory_clients_.value_, 7u);
@@ -525,7 +525,7 @@ TEST(RedisConfigTest, LoadsFileAndReportsLineNumber) {
   ASSERT_TRUE(loaded.ok()) << loaded;
   EXPECT_EQ(options.config_file_, valid.path().string());
   EXPECT_EQ(options.port_, 6381);
-  EXPECT_EQ(options.thread_count_, 2u);
+  EXPECT_EQ(options.shard_count_, 2u);
   EXPECT_EQ(options.registered_buffer_bytes_, 128ULL * 1024 * 1024);
   EXPECT_EQ(options.storage_write_buffer_count_, 3u);
   EXPECT_EQ(options.replication_publish_queue_bytes_, 12ULL * 1024 * 1024);

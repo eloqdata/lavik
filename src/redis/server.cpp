@@ -854,8 +854,11 @@ void RedisService::OnConnectionClosed() noexcept {
 
 void RedisService::Prepare(unsigned thread_count) {
   active_clients_.store(0, std::memory_order_relaxed);
-  request_gate_.Prepare(thread_count);
   TcpService::Prepare(thread_count);
+  // The final runtime worker belongs to Meta, never to storage or a recovery
+  // barrier. Global data-worker IDs remain the contiguous prefix [0, N).
+  thread_count = storage_->worker_count();
+  request_gate_.Prepare(thread_count);
   PrepareMonitor(thread_count);
   PreparePubSub(thread_count);
   recovery_ready_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
@@ -1070,14 +1073,6 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
   }
 
   if (worker.id() == 0) {
-    {
-      std::lock_guard lock(replication_quiesce_mutex_);
-      // No coroutine suspension occurs between publishing this bit and
-      // spawning MonitorRuntimeHealth below. A main-thread waiter may arrive
-      // in that interval; it can safely block until the worker starts the
-      // requested barrier.
-      replication_quiesce_monitor_available_ = true;
-    }
     // Every worker has completed recovery and online allocator setup before
     // this boundary. Publish readiness only after an optional startup RDB
     // import has also completed successfully on every worker.
@@ -1086,9 +1081,11 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
       // This releases the Meta client's startup wait. The installer folds
       // this process-local readiness bit into the first complete FDS; it is
       // never persisted as authority.
+      auto* runtime = cluster::GetClusterRuntime();
       const absl::Status published =
-          cluster::GetClusterRuntime()->node_control_installer_.SetStorageReady(
-              true);
+          co_await SubmitTo(runtime->control_worker_id_, [runtime] {
+            return runtime->node_control_installer_.SetStorageReady(true);
+          });
       if (!published.ok()) {
         spdlog::error("cluster storage-ready publication failed: {}",
                       published.message());
@@ -1098,6 +1095,13 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
 
   spdlog::info("worker[{}] direct-IO storage initialized", worker.id());
   if (worker.id() == 0) {
+    {
+      std::lock_guard lock(replication_quiesce_mutex_);
+      // Publish only after the awaited control-worker readiness notification.
+      // No suspension occurs before spawning the monitor, so a main-thread
+      // shutdown waiter can rely on its quiescence barrier becoming available.
+      replication_quiesce_monitor_available_ = true;
+    }
     // Keep this periodic maintenance tree in the same background task class as
     // the memory sampler it replaced. The synchronous storage-failure latch
     // already closes request and replication gates, so asynchronous cluster
@@ -1427,8 +1431,11 @@ Task<absl::Status> RedisService::MonitorRuntimeHealth(Worker& worker) {
       ready_.store(false, std::memory_order_release);
       cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
       if (runtime != nullptr) {
-        const absl::Status fenced = co_await runtime->node_control_installer_
-                                        .LoseStorageReadinessTransition();
+        const absl::Status fenced = co_await bycorf::SubmitTaskTo(
+            runtime->control_worker_id_, [runtime] {
+              return runtime->node_control_installer_
+                  .LoseStorageReadinessTransition();
+            });
         if (!fenced.ok()) {
           runtime_failure_cleanup_failed_.store(true,
                                                 std::memory_order_release);
@@ -2140,6 +2147,11 @@ int RunServer(ServerOptions options) {
     spdlog::error("configuration error: {}", validated.message());
     return 1;
   }
+  auto cpu_ids = ResolveWorkerCpuIds(options);
+  if (!cpu_ids.ok()) {
+    spdlog::error("CPU placement failed: {}", cpu_ids.status().message());
+    return 1;
+  }
   const auto backends = bycorf::ConfigureIoBackends(
       {.dpdk_network = options.network_backend_ == "dpdk",
        .spdk_storage = options.storage_backend_ == "spdk"});
@@ -2308,7 +2320,7 @@ int RunServer(ServerOptions options) {
       mi_option_get(mi_option_allow_thp));
   spdlog::info(
       "lavik version={} listening on {}:{} tls_port={} metrics_port={} "
-      "threads={} "
+      "shards={} "
       "maxclients={} maxclients_fd_reserve={} "
       "pin_workers={} "
       "idle_timeout_ms={} "
@@ -2328,7 +2340,7 @@ int RunServer(ServerOptions options) {
       "defrag_record_sleep_us={} defrag_paused={} shutdown_checkpoint={} "
       "replication_backlog_backpressure={}",
       kVersion, bind_display, options.port_, options.tls_port_,
-      options.metrics_port_, options.thread_count_, options.max_clients_,
+      options.metrics_port_, options.shard_count_, options.max_clients_,
       kMaxClientsFileDescriptorReserve, options.pin_workers_,
       options.idle_timeout_ms_, options.busy_poll_us_,
       options.foreground_budget_us_, options.background_budget_us_,
@@ -2346,7 +2358,7 @@ int RunServer(ServerOptions options) {
       options.replication_options_.backlog_backpressure_);
 
   const absl::Status memory_status =
-      InitMemoryLimit(options.max_memory_bytes_, options.thread_count_,
+      InitMemoryLimit(options.max_memory_bytes_, options.shard_count_,
                       options.maxmemory_clients_);
   if (!memory_status.ok()) {
     spdlog::error("memory limit setup failed: {}", memory_status.message());
@@ -2424,7 +2436,7 @@ int RunServer(ServerOptions options) {
   storage_options.buffers_.read_payload_bytes_ =
       options.storage_read_buffer_bytes_;
   storage::StorageEngine storage(std::move(storage_options));
-  absl::Status storage_status = storage.Prepare(options.thread_count_);
+  absl::Status storage_status = storage.Prepare(options.shard_count_);
   if (!storage_status.ok()) [[unlikely]] {
     spdlog::error("storage prepare failed: {}", storage_status.message());
     CleanupShutdownSignalHandler();
@@ -2462,13 +2474,13 @@ int RunServer(ServerOptions options) {
       &storage,
       absl::StrCat(options.rdb_dir_, options.rdb_dir_.ends_with('/') ? "" : "/",
                    options.dbfilename_));
-  InitWorkerMetrics(options.thread_count_);
-  InitSlowLog(options.thread_count_, options.slowlog_log_slower_than_us_,
+  InitWorkerMetrics(options.shard_count_);
+  InitSlowLog(options.shard_count_, options.slowlog_log_slower_than_us_,
               options.slowlog_max_len_);
   SetLuaScriptBusyThresholdMs(options.lua_time_limit_ms_);
   SetServerInfo(std::move(advertised_bind), advertised_port,
-                options.thread_count_, options.config_file_);
-  tx::TxRuntime::Create(options.thread_count_);
+                options.shard_count_, options.config_file_);
+  tx::TxRuntime::Create(options.shard_count_);
 
   // Meta control: install the process-wide runtime before any
   // listener accepts a client. It starts without serving topology and stays
@@ -2498,11 +2510,13 @@ int RunServer(ServerOptions options) {
                                       ? options.announce_tls_port_
                                       : options.tls_port_;
     cluster::InstallClusterRuntime(std::move(runtime));
+    cluster::GetClusterRuntime()->control_worker_id_ = options.shard_count_;
     auto created = cluster::MetaControlClientService::Create(
         cluster::MetaControlClientOptions{
             .seeds_ = options.meta_seeds_,
             .node_id_ = options.node_id_,
-            .request_worker_count_ = options.thread_count_,
+            .request_worker_count_ = options.shard_count_,
+            .control_worker_id_ = options.shard_count_,
             .tls_context_ =
                 options.tls_replication_ ? tls_client_context : nullptr,
             .service_ = service_declaration,
@@ -2523,8 +2537,13 @@ int RunServer(ServerOptions options) {
 
   bycorf::ServerOptions runtime_options;
   runtime_options.bind_addresses_ = options.bind_addresses_;
-  runtime_options.thread_count_ = options.thread_count_;
+  runtime_options.thread_count_ = options.shard_count_ + 1;
   runtime_options.pin_workers_ = options.pin_workers_;
+  runtime_options.cpu_ids_ = std::move(*cpu_ids);
+  spdlog::info("runtime workers={} data_shards={} control_worker={} cpus={}",
+               runtime_options.thread_count_, options.shard_count_,
+               options.shard_count_,
+               absl::StrJoin(runtime_options.cpu_ids_, ","));
   runtime_options.idle_timeout_ms_ = options.idle_timeout_ms_;
   runtime_options.recv_buffer_count_ = options.recv_buffer_count_;
   runtime_options.busy_poll_us_ = options.busy_poll_us_;
@@ -2547,14 +2566,22 @@ int RunServer(ServerOptions options) {
   }
   std::unique_ptr<Service> metrics;
   Server server;
+  std::vector<unsigned> data_workers;
+  for (unsigned id = 0; id < options.shard_count_; ++id)
+    data_workers.push_back(id);
+  redis.SetWorkers(data_workers);
   redis.BindServer(&server);
   server.AddService(&redis);
   if (meta_control_client != nullptr) {
+    meta_control_client->SetWorkers({options.shard_count_});
     server.AddService(meta_control_client.get());
   }
   if (options.metrics_port_ != 0) {
     metrics = CreateMetricsService(options.metrics_port_, &storage,
                                    [&redis] { return redis.ready(); });
+    // Scraping includes shard fan-out and response rendering. Keep that work
+    // with the data services so it cannot occupy the Meta control worker.
+    metrics->SetWorkers(data_workers);
     server.AddService(metrics.get());
   }
   auto start_status = server.Start(runtime_options);

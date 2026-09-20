@@ -46,7 +46,18 @@ taskset -c "$LAVIK_CPUSET" ./build/lavik \
   --data-file /var/lib/lavik/data
 ```
 
-`LAVIK_CPUSET` and `LAVIK_THREADS` pin workers to the selected CPUs.
+`LAVIK_CPUSET` and `LAVIK_THREADS` select the CPU set and data shard count.
+`--shards N` is the preferred spelling; `--threads N` and `-t N` remain aliases.
+Lavik starts N data workers plus one final control worker, including in
+standalone mode. The data layout and per-shard budgets continue to use N.
+
+With pinning enabled, workers cycle over the inherited affinity mask. Use
+`--cpus 2,4,6,8` (or `cpus 2,4,6,8` in a config file) to select a different
+ordered list inside that mask. Four shards then map to CPUs 2,4,6,8 and the
+control worker maps to CPU 2. Supplying N+1 entries specifies the complete
+mapping; repeated CPU IDs are supported. `--no-pin-workers` disables pinning
+and cannot be combined with an explicit CPU list. Startup logs show the
+resolved worker count, shard count, control worker ID and CPU mapping.
 `LAVIK_IRQ_CPUSET` is the disjoint CPU set to reserve for the OS and NIC IRQs.
 Apply that reservation in your service manager or follow the
 [IRQ tuning guide](irq-affinity-tuning.md) when manually configuring IRQs.

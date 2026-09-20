@@ -53,9 +53,12 @@ struct ServerOptions {
   std::string requirepass_;
   std::string masteruser_ = "default";
   std::string masterauth_;
-  unsigned thread_count_ = 1;
+  // Data shards occupy workers [0, shard_count_). Meta uses the additional
+  // worker shard_count_; it owns no data shard or storage buffers.
+  unsigned shard_count_ = 1;
   std::uint64_t max_clients_ = kDefaultMaxClients;
   bool pin_workers_ = true;
+  std::vector<unsigned> cpu_ids_;
   int idle_timeout_ms_ = -1;
   unsigned recv_buffer_count_ = 1024;
   unsigned busy_poll_us_ = 20;

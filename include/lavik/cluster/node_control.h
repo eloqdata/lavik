@@ -456,9 +456,9 @@ class NodeControlActions {
   // Non-suspending, non-mutating lookup: only an exact, still-valid completed
   // population may return its original completion. A miss falls through to
   // normal mutation admission; implementations must never initiate a reset.
-  virtual std::optional<NodeDirectiveCompletion> FindCompletedPopulation(
-      const NodeDirective& /*directive*/) const {
-    return std::nullopt;
+  virtual bycorf::Task<std::optional<NodeDirectiveCompletion>>
+  FindCompletedPopulation(const NodeDirective& /*directive*/) const {
+    co_return std::nullopt;
   }
   virtual bycorf::Task<absl::Status> ApplyDirective(
       NodeDirective directive) = 0;
@@ -490,17 +490,18 @@ class NodeControlInstaller {
   NodeControlInstaller(const NodeControlInstaller&) = delete;
   NodeControlInstaller& operator=(const NodeControlInstaller&) = delete;
 
-  // Publishes routing on worker 0 while preserving exact local control,
-  // task admission, exports, and leases. Rejects any local control change.
+  // Publishes routing on the control worker while preserving exact local
+  // control, task admission, exports, and leases. Rejects any local control
+  // change.
   absl::Status InstallRouting(PreparedFullState prepared_state);
 
   // Installs one completely decoded and validated snapshot through a test
   // adapter that never receives directives. Directive-capable adapters must
   // use InstallFullStateTransition(), even when a particular snapshot appears
   // to require no cleanup: concurrent admission is what makes the synchronous
-  // path unsafe. Meta transitions run on worker 0. Lower source indices and
-  // same-assignment counter regressions fail closed; equal-index replay is
-  // idempotent.
+  // path unsafe. Meta transitions run on the control worker. Lower source
+  // indices and same-assignment counter regressions fail closed; equal-index
+  // replay is idempotent.
   absl::Status InstallFullState(PreparedFullState prepared_state,
                                 ProjectionBasis projection_basis);
 

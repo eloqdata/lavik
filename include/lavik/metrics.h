@@ -83,6 +83,15 @@ struct WorkerMetricsSnapshot {
 // instead of per-worker shards. Deliberately no node, session, assignment, or
 // group labels are exposed: those identities are high-cardinality and belong
 // in structured logs rather than Prometheus series.
+enum class ClusterControlWait { kObservation, kLeaseInstallation };
+inline constexpr std::array<std::uint64_t, 10> kControlWaitBoundsUs{
+    100, 500, 1000, 5000, 10000, 50000, 100000, 300000, 1000000, 5000000};
+struct ClusterControlWaitSnapshot {
+  // Disjoint buckets; the last is overflow. Export converts to cumulative.
+  std::array<std::uint64_t, kControlWaitBoundsUs.size() + 1> buckets_{};
+  std::uint64_t sum_us_ = 0;
+};
+
 struct ClusterControlMetricsSnapshot {
   std::uint64_t connected_ = 0;
   std::uint64_t reconnects_ = 0;
@@ -93,6 +102,7 @@ struct ClusterControlMetricsSnapshot {
   std::uint64_t lease_expirations_ = 0;
   std::uint64_t directive_successes_ = 0;
   std::uint64_t directive_failures_ = 0;
+  std::array<ClusterControlWaitSnapshot, 2> waits_{};
 };
 
 void SetClusterControlConnected(bool connected) noexcept;
@@ -103,6 +113,8 @@ void RecordClusterControlLeaseGrant() noexcept;
 void RecordClusterControlLeaseDenial() noexcept;
 void RecordClusterControlLeaseExpiration() noexcept;
 void RecordClusterControlDirectiveResult(bool succeeded) noexcept;
+void RecordClusterControlWait(ClusterControlWait stage,
+                              std::uint64_t us) noexcept;
 ClusterControlMetricsSnapshot GetClusterControlMetrics() noexcept;
 
 void InitWorkerMetrics(unsigned worker_count);

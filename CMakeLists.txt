@@ -1388,7 +1388,12 @@ if (BUILD_TESTING)
     tests/storage_capacity_test.cpp
     tests/tx_cleaner_test.cpp
     tests/tcp_nodelay_accept_test.cpp
+    tests/worker_placement_test.cpp
   )
+  if(LAVIK_KERNEL_BYPASS)
+    add_executable(lavik_dpdk_control_check tests/dpdk_control_check.cpp)
+    target_link_libraries(lavik_dpdk_control_check PRIVATE bycorf::core)
+  endif()
   target_link_libraries(lavik_unit_tests
     PRIVATE lavik::module GTest::gtest_main
   )

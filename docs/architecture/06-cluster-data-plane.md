@@ -47,6 +47,16 @@ seams:
   node controller; neither it nor replication writes `TopologyCache`
   directly.
 
+The final runtime worker owns the Meta client and every NodeControlInstaller
+mutation, including readiness changes submitted by data worker 0. Redis
+connections and data shards occupy only the preceding workers. Replication's
+coordinator remains on data worker 0; control observations and actions cross
+that ownership boundary through coroutine submissions. Moving the control
+session prevents a synchronous data command from occupying its event loop,
+but an observation or lease-installation barrier can still wait for data work.
+These barriers retain their safety checks and are not replaced with stale
+positive readiness or authority observations.
+
 The Redis/storage boundary adds a transport-neutral final seam:
 `storage::MutationPrecondition` carries the captured admission through every
 suspending storage preparation step and validates it at logical publication.
@@ -527,10 +537,10 @@ failed, publishes storage-unready, joins older directive admission and every
 control transition already across the loss cut, then performs a final source
 revocation and target-population cancellation and drains retired requests.
 Storage writers set a process-wide latch and close the request gate
-immediately; worker zero drives this asynchronous controller barrier. An
-uncertain cleanup result stops the server without a clean checkpoint. Neither
-a later FDS nor a population proof can clear the latch; recovery requires
-process restart.
+immediately; data worker zero submits this controller barrier to the control
+worker. An uncertain cleanup result stops the server without a clean
+checkpoint. Neither a later FDS nor a population proof can clear the latch;
+recovery requires process restart.
 
 Meta's leadership expiry and every granted lease are bounded by the Raft
 election lower bound `D`, and a leader stops sessions synchronously on
@@ -851,9 +861,9 @@ The read-only mode bootstrap precedes storage initialization. The outbound
 full Meta control client then waits for local storage readiness before opening
 its first session. Readiness includes disk, Function-catalog and population
 recovery, so FDS installation and directives cannot supersede an in-progress
-startup recovery. This wait runs cooperatively on worker zero and can end on
-shutdown without starting control work. Opening the full control session is
-not a dependency of local recovery.
+startup recovery. This wait runs cooperatively on the control worker and can
+end on shutdown without starting control work. Opening the full control
+session is not a dependency of local recovery.
 
 Meta-controlled topology and authority enter through the asynchronous
 client/session path and `NodeControlInstaller`, which can wait for replication revocation and

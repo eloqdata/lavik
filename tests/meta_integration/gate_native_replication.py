@@ -174,6 +174,13 @@ def replay_and_reconnect(root):
         ready(meta)
         reader = Client(target, readonly=True)
         try:
+            # The source has two data shards and the target has three. Their
+            # extra Meta workers must never become replication flows.
+            info = dict(line.split(":", 1) for line in
+                        reader.call("INFO", "replication").splitlines()
+                        if ":" in line)
+            assert info.get("lavik_source_workers") == "2", info
+            assert info.get("lavik_connected_flows") == "2", info
             assert reader.call("GET", "{native}seed") == "baseline"
             assert reader.call("HGET", "{native}hash", "keep") == "value"
             assert reader.call("LRANGE", "{native}list", 0, -1) == ["a", "b"]

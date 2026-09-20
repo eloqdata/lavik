@@ -69,4 +69,9 @@ absl::Status RewriteRedisConfigFile(const std::string& path,
 // have both been applied.
 absl::Status ValidateServerOptions(const ServerOptions& options);
 
+// Resolve cyclic shard/control placement against the inherited CPU affinity.
+// Empty result means unpinned; explicit CPU IDs must be permitted by the OS.
+absl::StatusOr<std::vector<unsigned>> ResolveWorkerCpuIds(
+    const ServerOptions& options);
+
 }  // namespace lavik

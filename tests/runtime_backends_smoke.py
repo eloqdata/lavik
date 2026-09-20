@@ -69,7 +69,7 @@ def run(binary, network, data, directory, iteration, populate):
             while time.monotonic() < ready:
                 assert p.poll() is None, path.read_text()[-5000:]
                 if network == 'dpdk' and not tap_ready:
-                    if path.read_text().count('bycorf0: Ethernet address:') < 2:
+                    if path.read_text().count('bycorf0: Ethernet address:') < 3:
                         time.sleep(.05); continue
                     sp.run(['ip', 'link', 'set', 'bycorfdp0', 'address', '02:00:00:00:00:01'], check=True)
                     sp.run(['ip', 'address', 'add', '198.18.0.1/24', 'dev', 'bycorfdp0'], check=True)
@@ -86,7 +86,7 @@ def run(binary, network, data, directory, iteration, populate):
                 try: rings.append(os.readlink(fd))
                 except FileNotFoundError: pass  # unrelated short-lived descriptors
 
-            assert sum('io_uring' in f for f in rings) == 2, rings
+            assert sum('io_uring' in f for f in rings) == 3, rings
             if network == 'kernel': assert 'EAL:' not in path.read_text()
             values = {f'backend-{i}': bytes([65+i % 26]) * (1024 if i < 31 else 262144) for i in range(32)}
             if populate:
@@ -101,7 +101,7 @@ def run(binary, network, data, directory, iteration, populate):
             # Leave a live connection to cover the selected backend's close path.
             p.send_signal(signal.SIGTERM)
             assert p.wait(timeout=45) == 0, path.read_text()[-5000:]
-            print(network, iteration, 'PASS: data, recovery, 2 workers / 2 rings, clean shutdown', flush=True)
+            print(network, iteration, 'PASS: data, recovery, 2 shards + control / 3 rings, clean shutdown', flush=True)
         finally:
             if sock: sock.close()
             if p.poll() is None:

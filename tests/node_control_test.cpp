@@ -486,10 +486,10 @@ class RecordingActions final : public NodeControlActions {
         [this] { return deferred_directive_result_; });
   }
 
-  std::optional<NodeDirectiveCompletion> FindCompletedPopulation(
+  bycorf::Task<std::optional<NodeDirectiveCompletion>> FindCompletedPopulation(
       const NodeDirective& directive) const override {
-    if (completed_population_ != directive) return std::nullopt;
-    return NodeDirectiveCompletion::StartedTerminal(absl::OkStatus());
+    if (completed_population_ != directive) co_return std::nullopt;
+    co_return NodeDirectiveCompletion::StartedTerminal(absl::OkStatus());
   }
 
   absl::Status DrainAssignment(const AuthorityAnchor& anchor) override {

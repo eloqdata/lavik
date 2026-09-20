@@ -17,6 +17,7 @@
 #include "lavik/config.h"
 
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -37,6 +38,8 @@
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
+#include "bycorf/runtime/cross_core.h"
 #include "lavik/numeric_endpoint.h"
 
 namespace lavik {
@@ -411,9 +414,21 @@ absl::Status ApplyRedisConfigDirective(
     options->shutdown_checkpoint_ = *enabled;
     return absl::OkStatus();
   }
-  if (name == "threads" || name == "io-threads") {
+  if (name == "shards" || name == "threads" || name == "io-threads") {
     if (directive.size() != 2) return WrongArgumentCount(name);
-    return ParseUnsigned(directive[1], name, &options->thread_count_, false);
+    return ParseUnsigned(directive[1], name, &options->shard_count_, false);
+  }
+  if (name == "cpus") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    std::vector<unsigned> cpus;
+    for (std::string_view item : absl::StrSplit(directive[1], ',')) {
+      unsigned cpu = 0;
+      auto status = ParseUnsigned(item, name, &cpu, true);
+      if (!status.ok()) return status;
+      cpus.push_back(cpu);
+    }
+    options->cpu_ids_ = std::move(cpus);
+    return absl::OkStatus();
   }
   if (name == "maxclients") {
     if (directive.size() != 2) return WrongArgumentCount(name);
@@ -623,6 +638,13 @@ absl::Status ApplyRedisConfigDirective(
 }
 
 absl::Status ValidateServerOptions(const ServerOptions& options) {
+  if (options.shard_count_ == 0 ||
+      options.shard_count_ > std::numeric_limits<bycorf::WorkerId>::max() - 1) {
+    return absl::InvalidArgumentError("shards exceeds runtime worker capacity");
+  }
+  if (!options.cpu_ids_.empty() && !options.pin_workers_) {
+    return absl::InvalidArgumentError("cpus requires pin-workers");
+  }
   if (options.network_backend_ != "kernel" &&
       options.network_backend_ != "dpdk")
     return absl::InvalidArgumentError("network must be kernel or dpdk");
@@ -772,15 +794,48 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
     return absl::InvalidArgumentError(
         "storage write buffer count must be nonzero");
   }
-  if (options.thread_count_ > std::numeric_limits<std::size_t>::max() /
-                                  storage::kStorageBlockBytes ||
+  if (options.shard_count_ > std::numeric_limits<std::size_t>::max() /
+                                 storage::kStorageBlockBytes ||
       options.replication_options_.backlog_size_bytes_ <
-          static_cast<std::size_t>(options.thread_count_) *
+          static_cast<std::size_t>(options.shard_count_) *
               storage::kStorageBlockBytes) {
     return absl::InvalidArgumentError(
         "repl-backlog-size must provide at least one 8 MiB block per worker");
   }
   return absl::OkStatus();
+}
+
+absl::StatusOr<std::vector<unsigned>> ResolveWorkerCpuIds(
+    const ServerOptions& options) {
+  if (!options.pin_workers_) return std::vector<unsigned>{};
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (::sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+    return absl::InternalError("cannot read inherited CPU affinity");
+  }
+  std::vector<unsigned> cpus = options.cpu_ids_;
+  if (cpus.empty()) {
+    for (unsigned cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+      if (CPU_ISSET(cpu, &allowed)) cpus.push_back(cpu);
+    }
+  }
+  if (cpus.empty()) return absl::InvalidArgumentError("no allowed CPUs");
+  const auto valid = [&](unsigned cpu) {
+    return cpu < CPU_SETSIZE && CPU_ISSET(cpu, &allowed);
+  };
+  for (unsigned cpu : cpus) {
+    if (!valid(cpu)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("CPU ", cpu, " is outside inherited affinity"));
+    }
+  }
+  std::vector<unsigned> result;
+  const unsigned total = options.shard_count_ + 1;
+  result.reserve(total);
+  for (unsigned worker = 0; worker < total; ++worker) {
+    result.push_back(cpus[worker % cpus.size()]);
+  }
+  return result;
 }
 
 absl::Status LoadRedisConfigFile(const std::string& path,

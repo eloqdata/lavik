@@ -45,6 +45,7 @@
 #include "bycorf/io/storage.h"
 #include "bycorf/net/tcp_stream.h"
 #include "bycorf/net/tls.h"
+#include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/sync.h"
 #include "bycorf/runtime/worker.h"
 #include "lavik/cluster/control_transport.h"
@@ -457,7 +458,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
     co_return co_await replication_.CancelClusterRebuildForShutdown();
   }
 
-  std::optional<NodeDirectiveCompletion> FindCompletedPopulation(
+  bycorf::Task<std::optional<NodeDirectiveCompletion>> FindCompletedPopulation(
       const NodeDirective& directive) const override {
     std::vector<PopulationManifestEntry> entries;
     entries.reserve(directive.manifest_entries_.size());
@@ -465,11 +466,13 @@ class ReplicationNodeControlActions final : public NodeControlActions {
       entries.push_back({entry.partition_id_, entry.logical_epoch_});
     auto manifest = PopulationManifest::Create(std::move(entries));
     if (!manifest.ok() || manifest->id().bytes_ != directive.manifest_digest_)
-      return std::nullopt;
-    auto completed = replication_.FindCompletedClusterPopulation(
-        NativePopulationDirective(directive, *manifest));
-    if (!completed.has_value()) return std::nullopt;
-    return NodeDirectiveCompletion(
+      co_return std::nullopt;
+    auto completed = co_await bycorf::SubmitTo(
+        0, [this, native = NativePopulationDirective(directive, *manifest)] {
+          return replication_.FindCompletedClusterPopulation(native);
+        });
+    if (!completed.has_value()) co_return std::nullopt;
+    co_return NodeDirectiveCompletion(
         [completion = std::move(*completed)] { return completion.result(); });
   }
 
@@ -1512,7 +1515,7 @@ struct MetaControlClientService::Impl {
     std::uint32_t challenged_authority_lease_duration_ms_ = 0;
   };
 
-  // Every field is worker-zero-owned. Detached session tasks retain this
+  // Every field is control-worker-owned. Detached session tasks retain this
   // object, while RunSession joins those tasks before destroying the writer
   // and stream they reference.
   struct SessionState {
@@ -1625,8 +1628,9 @@ struct MetaControlClientService::Impl {
   absl::Status WaitUntilQuiesced() {
     RequestStop();
     std::unique_lock lock(shutdown_mu_);
-    // If worker zero has not started, stopping_ prevents it from entering a
-    // session later; there is consequently no control mutation to join.
+    // If the control worker has not started, stopping_ prevents it from
+    // entering a session later; there is consequently no control mutation to
+    // join.
     if (!run_started_) return absl::OkStatus();
     shutdown_cv_.wait(lock, [this] { return run_finished_; });
     return run_status_;
@@ -2367,6 +2371,7 @@ struct MetaControlClientService::Impl {
     std::uint64_t heartbeat_sequence = 1;
     while (!state->closing_) {
       if (co_await QuiesceHeartbeatIfRequested(state)) continue;
+      const auto observation_started = std::chrono::steady_clock::now();
       const ReplicationIdentity latest =
           co_await replication_.ObserveIdentity();
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
@@ -2429,6 +2434,11 @@ struct MetaControlClientService::Impl {
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
       const ReplicationIdentity after_failover_status =
           co_await replication_.ObserveIdentity();
+      RecordClusterControlWait(
+          ClusterControlWait::kObservation,
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - observation_started)
+              .count());
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
       const detail::MetaSessionReplicationIdentityDecision identity_decision =
           detail::EvaluateMetaSessionReplicationIdentity(
@@ -2715,6 +2725,7 @@ struct MetaControlClientService::Impl {
           !joined.ok()) {
         co_return joined;
       }
+      const auto grant_started = std::chrono::steady_clock::now();
       absl::Status authority =
           co_await installer_.ApplyLeaseGrantTransition(AuthorityMessage{
               .kind_ = AuthorityMessage::Kind::kLeaseGrant,
@@ -2734,6 +2745,11 @@ struct MetaControlClientService::Impl {
               .granted_duration_ =
                   std::chrono::milliseconds(grant->granted_duration_ms),
           });
+      RecordClusterControlWait(
+          ClusterControlWait::kLeaseInstallation,
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - grant_started)
+              .count());
       if (!authority.ok()) co_return authority;
       if (discarded_directive) {
         co_return absl::AbortedError(
@@ -3304,11 +3320,13 @@ void MetaControlClientService::Prepare(unsigned thread_count) {
 
 bycorf::Task<absl::Status> MetaControlClientService::Run(
     bycorf::Worker& worker, bycorf::ServiceContext) {
-  if (worker.id() != 0) co_return absl::OkStatus();
+  if (worker.id() != impl_->options_.control_worker_id_)
+    co_return absl::OkStatus();
   impl_->BeginRun();
   absl::Status run_status = absl::OkStatus();
   Impl::RunCompletionGuard completed(*impl_);
-  if (impl_->prepared_thread_count_ != impl_->options_.request_worker_count_) {
+  if (impl_->prepared_thread_count_ < impl_->options_.request_worker_count_ ||
+      impl_->options_.control_worker_id_ >= impl_->prepared_thread_count_) {
     run_status = absl::FailedPreconditionError(
         "Meta control worker count changed after configuration");
     completed.SetResult(run_status);
@@ -3318,7 +3336,7 @@ bycorf::Task<absl::Status> MetaControlClientService::Run(
   // Disk, catalog and population recovery own local replication state until
   // RedisService publishes storage readiness. Even an ordinary FDS can install
   // FollowOwner while recovery yields, invalidating its one-shot clean proof.
-  // Both this service and the readiness publisher run on worker zero.
+  // This service and the submitted readiness update share the control worker.
   while (!impl_->installer_.storage_ready()) {
     if (impl_->stopping_.load(std::memory_order_acquire) ||
         worker.stop_requested()) {

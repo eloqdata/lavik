@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
   app.set_version_flag("--version", "lavik " + std::string(lavik::kVersion));
 
   lavik::ServerOptions options;
-  options.thread_count_ = DefaultWorkerThreadCount();
+  options.shard_count_ = DefaultWorkerThreadCount();
   std::string config_file;
   if (argc > 1 && argv[1][0] != '-') {
     config_file = argv[1];
@@ -179,7 +179,8 @@ int main(int argc, char** argv) {
                  "Maximum log files retained, including the active file")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
-  app.add_option("-t,--threads", options.thread_count_, "Worker thread count")
+  app.add_option("-t,--threads,--shards", options.shard_count_,
+                 "Data shard count (plus one control worker)")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   app.add_option("--maxclients", options.max_clients_,
@@ -187,8 +188,11 @@ int main(int argc, char** argv) {
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   app.add_flag("--pin-workers,!--no-pin-workers", options.pin_workers_,
-               "Pin workers one-to-one to CPUs in the inherited affinity mask")
+               "Pin workers cyclically to the selected or inherited CPUs")
       ->capture_default_str();
+  app.add_option("--cpus", options.cpu_ids_,
+                 "Logical CPU IDs, cycled over workers")
+      ->delimiter(',');
   app.add_option("-i,--idle-timeout", options.idle_timeout_ms_,
                  "Idle timeout in ms (-1 = disabled)")
       ->capture_default_str();

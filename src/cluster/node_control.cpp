@@ -1748,8 +1748,19 @@ bycorf::Task<NodeDirectiveCompletion> NodeControlInstaller::StartDirective(
             ValidateDirectiveForStart(directive, /*replay_lookup=*/true);
         !valid.ok())
       co_return terminal(std::move(valid));
-    if (auto completed = actions_.FindCompletedPopulation(directive))
-      co_return std::move(*completed);
+    const auto lookup_generation = directive_admission_generation_;
+    auto completed = co_await actions_.FindCompletedPopulation(directive);
+    // The replication owner can be another worker. A completed lookup cannot
+    // carry an old session/control proof across this suspension.
+    if (lookup_generation != directive_admission_generation_) {
+      co_return terminal(absl::FailedPreconditionError(
+          "population replay lookup crossed a control transition"));
+    }
+    if (auto valid =
+            ValidateDirectiveForStart(directive, /*replay_lookup=*/true);
+        !valid.ok())
+      co_return terminal(std::move(valid));
+    if (completed) co_return std::move(*completed);
   }
   if (absl::Status valid = ValidateDirectiveForStart(directive); !valid.ok()) {
     co_return terminal(std::move(valid));

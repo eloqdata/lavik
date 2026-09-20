@@ -30,6 +30,20 @@ A ready-to-run Prometheus and Grafana deployment, including a provisioned
 dashboard and multi-node discovery, is available in
 [`deploy/monitoring`](../../deploy/monitoring/README.md).
 
+`lavik_cluster_control_wait_seconds` measures completed Meta control steps,
+with `stage="observation"` for data-state collection and
+`stage="lease_installation"` for authority installation. It includes
+cross-worker waits and is exported as a histogram in seconds. These timings
+are diagnostics, not a 1 ms scheduling guarantee or an automatic warning
+threshold. Compare their distribution with the effective heartbeat interval
+and lease duration; use `lavik_cluster_control_lease_expirations_total` to
+identify actual local lease failures.
+
+The Grafana overview includes a collapsed **Meta Control Plane** row for these step
+timings, connection state, lease decisions, expirations, reconnects, and
+directive results. The metrics HTTP service runs on the data workers; the
+last runtime worker remains dedicated to Meta control tasks.
+
 ## Memory limit
 
 `--max-memory` (also accepted as `--maxmemory`) sets the process memory limit
@@ -92,7 +106,10 @@ accounting. RSS and allocator diagnostics remain outside command execution.
 - `lavik_command_duration_seconds`: command execution histogram, from
   dispatch through reply construction; socket response writes are excluded.
 - `lavik_connections`: all current TCP connections, including Redis clients,
-  Prometheus scrapes, and replication connections.
+  Prometheus scrapes, replication, and outgoing Meta control streams. The
+  process counter is read atomically without scheduling work on the control
+  worker. `lavik_cluster_control_connected` separately reports whether Meta
+  has accepted the control session.
 - `lavik_connected_clients`: current Redis client connections. This is always
   less than or equal to `lavik_connections`.
 

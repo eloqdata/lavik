@@ -340,6 +340,7 @@ struct MetaControlClientOptions {
   std::vector<std::string> seeds_;
   std::string node_id_;
   unsigned request_worker_count_ = 0;
+  unsigned control_worker_id_ = 0;
   // Null means plaintext. When present, the same CA/client identity used for
   // Data-to-Data replication is reused for Meta control mTLS.
   std::shared_ptr<bycorf::TlsContext> tls_context_;
@@ -369,10 +370,10 @@ class MetaControlClientService final : public bycorf::Service {
                                  bycorf::ServiceContext context) override;
   void Stop() noexcept override;
 
-  // Joins the worker-0 session, including any directive execution and the
+  // Joins the control-worker session, including any directive execution and the
   // final fail-closed NodeControl transition. Call after Stop() and before a
   // graceful storage checkpoint. This call blocks and must run outside worker
-  // 0 while that worker and the hosting Runtime can still make progress.
+  // threads while the control worker and runtime can still make progress.
   // Failure means native replication cleanup is uncertain and the caller must
   // not publish a normal shutdown checkpoint.
   absl::Status WaitUntilQuiesced();
