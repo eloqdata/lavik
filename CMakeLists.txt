@@ -1152,7 +1152,8 @@ if (BUILD_TESTING)
         foreach(recovery_case IN ITEMS clean-owner clean-replica crash-operator
                                        manual-fence before-publish after-publish
                                        before-consume after-consume
-                                       incomplete-full eligible-candidate)
+                                       incomplete-full eligible-candidate
+                                       promoted-follower)
           string(REPLACE "-" "_" recovery_test_suffix "${recovery_case}")
           add_test(
             NAME meta_integration.gate_population_recovery_${recovery_test_suffix}
