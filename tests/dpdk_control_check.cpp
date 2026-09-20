@@ -41,6 +41,32 @@ class ControlService : public bycorf::Service {
   }
 
  private:
+  bycorf::Task<absl::Status> CheckLocal(bycorf::Worker& worker) {
+    // Worker 2 has no data listener. Native local routing must honor service
+    // placement and return replies to this worker's client-port stripe.
+    for (unsigned n = 0; n < 16; ++n) {
+      auto connected =
+          co_await bycorf::ConnectTcp(worker, "198.18.0.2", 16404, 1s);
+      if (!connected.ok()) co_return connected.status();
+      auto stream = std::move(*connected);
+      auto borrow = stream.BorrowStorage();
+      if (!bycorf::detail::IsDpdkSocket(stream.NativeFd()))
+        co_return absl::InternalError("local connection used a kernel socket");
+      std::array<std::byte, 1> owner{};
+      auto read = co_await stream.ReadSome(owner);
+      stream.Close().IgnoreError();
+      if (!read.ok()) co_return read.status();
+      if (*read != 1 || std::to_integer<unsigned>(owner[0]) >= 2)
+        co_return absl::InternalError("local connection missed data placement");
+    }
+    auto refused = co_await bycorf::ConnectTcp(worker, "198.18.0.2", 16406, 1s);
+    if (refused.ok() ||
+        refused.status().code() == absl::StatusCode::kDeadlineExceeded)
+      co_return absl::InternalError("local refused connect did not complete");
+    std::cout << "PASS DPDK local control-to-data connects and refusal\n";
+    co_return absl::OkStatus();
+  }
+
   bycorf::Task<absl::Status> Check(bycorf::Worker& worker) {
     const auto until = std::chrono::steady_clock::now() + 30s;
     while (std::chrono::steady_clock::now() < until) {
@@ -81,6 +107,8 @@ class ControlService : public bycorf::Service {
         co_return absl::InternalError(
             "connect deadline did not retire DPDK operation");
       }
+      auto local = co_await CheckLocal(worker);
+      if (!local.ok()) co_return local;
       std::cout
           << "PASS DPDK control connect, echo, refusal, timeout on worker 2\n";
       co_return absl::OkStatus();
