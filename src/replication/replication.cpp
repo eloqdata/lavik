@@ -366,6 +366,33 @@ Task<absl::StatusOr<TcpStream>> ConnectTcp(
       ::close(fd);
       continue;
     }
+    const bool loopback = [&] {
+      if (address->ai_family == AF_INET) {
+        const auto* ip = reinterpret_cast<const sockaddr_in*>(address->ai_addr);
+        return (ntohl(ip->sin_addr.s_addr) >> 24) == 127;
+      }
+      if (address->ai_family == AF_INET6) {
+        const auto* ip =
+            reinterpret_cast<const sockaddr_in6*>(address->ai_addr);
+        return IN6_IS_ADDR_LOOPBACK(&ip->sin6_addr) ||
+               (IN6_IS_ADDR_V4MAPPED(&ip->sin6_addr) &&
+                ip->sin6_addr.s6_addr[12] == 127);
+      }
+      return false;
+    }();
+    if (loopback) {
+      // Linux loopback can negotiate ~64 KiB segments, then clamp the receive
+      // window below one such segment under a replication burst. That stalls
+      // backlog progress behind TCP's window probe timer. Negotiate smaller
+      // segments before connect so the peer can fill a reduced window; keep
+      // receive-buffer autotuning and non-loopback path MTUs unchanged.
+      const int segment_bytes = 16 * 1024;
+      if (::setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &segment_bytes,
+                       sizeof(segment_bytes)) != 0) {
+        ::close(fd);
+        continue;
+      }
+    }
     if (sockets != nullptr && !sockets->Add(fd)) {
       ::close(fd);
       ::freeaddrinfo(addresses);
@@ -5976,7 +6003,7 @@ auto ReplicationManager::ReplicationGroup::is_loading() const noexcept -> bool {
 }
 
 auto ReplicationManager::ReplicationGroup::dataset_read_state(
-    bool serve_stale) const noexcept -> DatasetReadState {
+    const std::atomic<bool>& serve_stale) const noexcept -> DatasetReadState {
   if (!meta_managed_ || !single_client_mode_) {
     return is_loading() ? DatasetReadState::kLoading
                         : DatasetReadState::kReadable;
@@ -5987,8 +6014,10 @@ auto ReplicationManager::ReplicationGroup::dataset_read_state(
     return DatasetReadState::kLoading;
   }
   const auto role = role_.load(std::memory_order_acquire);
-  return !serve_stale && role != ReplicationRole::kMaster &&
-                 role != ReplicationRole::kOnline
+  // The policy matters only for a disconnected managed Single replica. Keep
+  // its CONFIG SET publication out of healthy owner/replica and Cluster reads.
+  return role != ReplicationRole::kMaster && role != ReplicationRole::kOnline &&
+                 !serve_stale.load(std::memory_order_acquire)
              ? DatasetReadState::kStaleDisabled
              : DatasetReadState::kReadable;
 }
@@ -8438,7 +8467,34 @@ auto ReplicationManager::ReplicationGroup::RunReplicaOnlineFlowData(
     // Loopback and fast LAN reads can remain immediately-ready for hundreds
     // of megabytes. Give the owner-local FIFO consumer a bounded scheduling
     // opportunity even when ingress never naturally suspends.
-    if ((++received_commands % kFullSyncSchedulingItems) == 0) {
+    ++received_commands;
+#if LAVIK_FAULTS_ENABLED
+    if (received_commands == 4096) {
+      if (const char* configured =
+              std::getenv("LAVIK_TEST_NATIVE_SMALL_RECEIVE_WINDOW")) {
+        // Shrink after steady replay has grown the loopback TCP window/MSS.
+        unsigned requested = 0;
+        if (!ParseUnsigned(configured, &requested) || requested < 4096 ||
+            requested > 65536) {
+          receiver_status =
+              absl::InvalidArgumentError("invalid test receive window");
+          break;
+        }
+        const int receive_bytes = static_cast<int>(requested);
+        const int window_bytes = static_cast<int>(requested);
+        if (::setsockopt(stream.NativeFd(), SOL_SOCKET, SO_RCVBUF,
+                         &receive_bytes, sizeof(receive_bytes)) != 0 ||
+            ::setsockopt(stream.NativeFd(), IPPROTO_TCP, TCP_WINDOW_CLAMP,
+                         &window_bytes, sizeof(window_bytes)) != 0) {
+          receiver_status =
+              absl::InternalError("cannot inject small receive window");
+          break;
+        }
+        spdlog::info("test native receive window reduced on flow {}", flow_id);
+      }
+    }
+#endif
+    if ((received_commands % kFullSyncSchedulingItems) == 0) {
       co_await bycorf::Yield(*bycorf::ThisWorker().self_);
     }
   }
@@ -12210,7 +12266,7 @@ bool ReplicationManager::is_loading() const noexcept {
 
 ReplicationManager::DatasetReadState ReplicationManager::dataset_read_state()
     const noexcept {
-  return group_->dataset_read_state(replica_serve_stale_data());
+  return group_->dataset_read_state(replica_serve_stale_data_);
 }
 
 bool ReplicationManager::reject_writes() const noexcept {

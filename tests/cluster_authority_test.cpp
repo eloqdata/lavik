@@ -327,6 +327,21 @@ TEST(ClusterAuthoritySnapshotTest,
       Decision::Kind::kClusterDownUnbound);
 }
 
+TEST(ClusterAuthoritySnapshotTest, ShorterRenewalExpiresAlreadyAdmittedWrite) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), start, 100ms).ok());
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  const auto write =
+      control.authority.CaptureAndAdmit(MakeRequest(slots, true), start + 4ms);
+  ASSERT_TRUE(
+      control.topology.Install(BuildState(kNodeA), start + 5ms, 10ms).ok());
+  EXPECT_EQ(control.authority.Recheck(write, start + 14ms), RecheckResult::kOk);
+  EXPECT_EQ(control.authority.RecheckAtMutation(write, start + 15ms),
+            RecheckResult::kReject);
+}
+
 TEST(ClusterAuthoritySnapshotTest,
      ConcurrentRenewalsThenFenceInvalidateReaders) {
   using namespace std::chrono_literals;

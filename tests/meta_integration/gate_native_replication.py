@@ -542,6 +542,31 @@ def backpressured_shutdown(root):
             target.resume()
 
 
+def small_receive_window(root):
+    def seed(writer):
+        # Exercise FULL before steady replay grows the loopback window/MSS
+        # and the target's fault reduces its receive window.
+        writer.call("SET", "{window}seed", "s" * (2 * 1024 * 1024))
+
+    with pair(root, "small-receive-window", seed=seed,
+              source_workers=1, target_workers=1, target_faults={
+                  "LAVIK_TEST_NATIVE_SMALL_RECEIVE_WINDOW": "24576"}) as (meta, source, target, writer):
+        ready(meta)
+        writer.call("SET", "{window}trigger", "online")
+        # A real publisher burst must drain through native replay and ACKs.
+        # The reduced window used to put each large segment behind TCP's
+        # ~200ms probe timer, despite both processes remaining ONLINE.
+        for batch in range(64):
+            writer.socket.sendall(b"".join(C.encode_resp(
+                ["SET", f"{{window}}key-{index}", "v" * 1024])
+                for index in range(512)))
+            for _ in range(512):
+                assert C.read_resp(writer.reader) == "OK"
+        assert "test native receive window reduced" in Path(target.log_path).read_text()
+        assert writer.call("WAIT", 1, 12000) == 1
+        assert C.readonly_get(target, "{window}key-511") == "v" * 1024
+
+
 def main():
     C.META, C.DATA, C.CTL, C.REDIS_CLI = map(os.path.abspath, sys.argv[1:5])
     H.set_tag("native-replication")
@@ -554,6 +579,7 @@ def main():
         backpressured_shutdown(root)
         if C.has_fault(C.DATA, b"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK"):
             full_tail_expiration_effects(root)
+            small_receive_window(root)
             handoff_order(root)
             cancelled_handoff(root)
             committed_cursor_reconnect(root, "cancel-apply", target_faults={

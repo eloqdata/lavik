@@ -1116,9 +1116,10 @@ and return the node to loading.
 Lavik does not serve Redis PSYNC or REPLCONF. RedisShake ScanReader exports the
 keyspace through ordinary authenticated INFO, SCAN, DUMP, and PTTL commands.
 DUMP payloads use RDB 11, requiring Redis 7.2 or newer at the destination.
-Single exposes DB0–15; Cluster exposes DB0 and discovery for its slot owners.
-Meta-managed sources retain normal readiness and authority admission: this path
-does not grant access to fenced data or enable managed Single startup.
+Standalone Single exposes DB0–15; Cluster exposes DB0 and discovery for its
+slot owners. Managed Single serves DB0 but currently rejects global SCAN/export
+until those paths acquire complete Group authority. Meta-managed sources retain
+normal readiness and authority admission; export cannot read fenced data.
 
 This is a one-shot keyspace export with keyspace notifications disabled. It
 preserves supported key values and remaining TTLs, but does not transfer the

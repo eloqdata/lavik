@@ -50,12 +50,10 @@ namespace lavik::cluster {
 
 // What the admission gate knows about one command.
 struct RequestView {
-  // Distinct hash slots of the command's keys. Empty means the command takes
-  // no keys OR key extraction failed: both admit locally (readiness still
-  // applies), mirroring Redis getNodeByQuery returning myself for zero keys
-  // and letting the command produce its own argument error. The Redis adapter
-  // rejects persistent zero-key mutations because no group-scoped authority
-  // can prove ownership for them.
+  // Distinct hash slots of the command's keys. In Cluster, empty means no keys
+  // or failed key extraction and admits locally after readiness; the Redis
+  // adapter rejects persistent zero-key mutations without a Group proof.
+  // Single binds non-diagnostic empty-key access to its full-keyspace Group.
   std::span<const std::uint16_t> slots_;
   // Includes runtime-only mutations such as PUBLISH that advance the
   // replication frontier even though they do not change the keyspace.
@@ -71,7 +69,7 @@ struct RequestView {
 struct Decision {
   enum class Kind : std::uint8_t {
     kServe,               // execute locally
-    kServeStaleRead,      // replica read admitted under READONLY
+    kServeStaleRead,      // replica read; Cluster requires READONLY
     kMoved,               // another node owns the slot; endpoint filled below
     kReadOnly,            // Single replica rejects writes without redirection
     kClusterDownUnbound,  // first key's slot has no owner
@@ -95,10 +93,11 @@ struct Decision {
 // loading gate, then first-key unbound (kClusterDownUnbound), then cross-slot
 // (kCrossSlot, for Cluster clients), then ownership (kServe / kServeStaleRead /
 // kMoved). A group whose grant is fenced has no safe owner: when self is that
-// fenced primary, keyed requests get kClusterDownUnbound. A fenced remote
-// primary still gets kMoved — the redirect target applies its own grant gate
-// and answers CLUSTERDOWN, so the client never reaches a writable fenced node;
-// the grant bit is only consumed by the node holding it. The returned Decision
+// fenced primary, keyed requests get kClusterDownUnbound. In Cluster, a fenced
+// remote primary still gets kMoved and applies its own grant gate. Single
+// never redirects: replicas reject writes with kReadOnly and an unavailable
+// Owner yields kClusterDownUnbound (mapped to MASTERDOWN by the adapter).
+// The grant bit is only consumed by the node holding it. The returned Decision
 // borrows its MOVED host from `state`; callers must keep that snapshot alive
 // until the address has been consumed.
 Decision Admit(const ServingState* state, const RequestView& request);
@@ -196,6 +195,8 @@ class AuthorityAdmission {
   std::shared_ptr<const ServingState> state_;
   absl::InlinedVector<std::uint16_t, 4> slots_;
   std::uint64_t gate_generation_ = 0;
+  std::uint64_t lease_revision_ = 0;
+  MonotonicTime lease_deadline_{};
   bool lease_checked_ = false;
   bool single_group_ = false;
   mutable std::atomic<bool> mutation_started_{false};
@@ -269,13 +270,16 @@ class AuthorityGuard {
     std::optional<SessionIdentity> session_;
     absl::flat_hash_map<std::string, Lease> leases_;
     std::uint64_t generation_ = 1;
+    // Changes on every immutable publication, including deadline-only renewal.
+    // Unlike generation_, this only invalidates a lookup shortcut, not work.
+    std::uint64_t revision_ = 0;
   };
 
   static std::optional<AuthorityAnchor> LocalPrimaryAnchor(
       const ServingState& state, std::string_view group_id);
   bool LeaseCovers(const AuthorityState& authority, const ServingState& state,
-                   std::span<const std::uint16_t> slots,
-                   MonotonicTime now) const;
+                   std::span<const std::uint16_t> slots, MonotonicTime now,
+                   MonotonicTime* earliest_deadline = nullptr) const;
   // The returned reference is valid until this thread's next CurrentAuthority
   // call. Callers must not suspend while borrowing it.
   const AuthorityState& CurrentAuthority() const;

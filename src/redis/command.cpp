@@ -957,10 +957,10 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
       runtime->authority_guard_.CaptureAndAdmit(view, cluster::LeaseClockNow());
   if (!EmitClusterDecision(admission.decision(), request.connection_tls_,
                            reply_builder, reply)) {
-    // Reads need no owner-side re-check; rejected requests already have their
-    // reply. Only admitted writes allocate a shared proof to retain across
-    // worker hops and storage checks. The local admission owns any borrowed
-    // MOVED host until EmitClusterDecision has copied it into the reply.
+    // Writes and Single multi-shard reads retain a proof across worker hops
+    // and storage checks. Ordinary Single reads take a fresh synchronous
+    // admission after waits, without allocating a shared proof. The local
+    // admission owns any borrowed MOVED host until its reply is encoded.
     if (is_write || (cluster::GetClientMode() == ClientMode::kSingle &&
                      request.spec_ != nullptr &&
                      (request.spec_->flags_ & kCmdMultiShard) != 0)) {
@@ -976,8 +976,8 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
 // Owner-side authority re-check for non-transactional writes, called from
 // ExecuteCommandBody after every
 // suspending admission (publisher admission, DB gate, snapshot/order gates)
-// and before the handler runs. Reads are intentionally not re-checked
-// according to the stale-read policy. Returns the standard redirect/error
+// and before the handler runs. Single reads use CommandServingGenerationError
+// for their separate population/authority check. Returns the redirect/error
 // reply when authority changed; std::nullopt when the write may proceed.
 std::optional<CommandReply> RecheckClusterWriteAuthority(
     const CommandRequest& request, ReplyBuilder& reply_builder,
@@ -989,8 +989,9 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
   }
   cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
   for (;;) {
-    const std::shared_ptr<const cluster::AuthorityAdmission> admission =
-        request.cluster_authority_admission_;
+    // The synchronous check finishes before this request can replace its
+    // proof; borrow it without another atomic shared-ownership update.
+    const auto& admission = request.cluster_authority_admission_;
     // Requests execute on stable Bycorf workers, so the worker id is the exact
     // stripe identity required by the admitted ServingState.
     if (runtime->authority_guard_.RegisterAndRecheck(
@@ -4139,11 +4140,13 @@ PreparedDumpReply PrepareDumpReply(std::string payload) {
 Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
                                          ReplyBuilder& reply_builder,
                                          ReadLatencyTrace* read_trace = nullptr,
-                                         SetLatencyTrace* set_trace = nullptr) {
-  // This is the common single-key owner-worker entry, after any dispatch hop.
-  // The DB gate pins the population across storage I/O; a fresh authority
-  // check here also catches a lease/fence change while that hop was queued.
-  if (!ClusterRequestIsWrite(request)) {
+                                         SetLatencyTrace* set_trace = nullptr,
+                                         bool recheck_after_dispatch = false) {
+  // ExecuteCommandBody checks reads after acquiring the DB gate. Local reads
+  // reach this entry without another wait; only a dispatched read needs to
+  // repeat the check for changes while its worker hop was queued. The DB gate
+  // continues to pin the population across storage I/O in either case.
+  if (recheck_after_dispatch && !ClusterRequestIsWrite(request)) {
     if (const char* error = CommandServingGenerationError(request);
         error != nullptr) {
       co_return BuiltReply(reply_builder.AppendError(error));
@@ -12408,8 +12411,8 @@ Task<CommandReply> ExecuteCommandBody(
         if (target != ThisWorker().id_) {
           co_return co_await SubmitTaskTo(
               target, [&request, &reply_builder]() -> Task<CommandReply> {
-                co_return co_await ExecuteStorageCommand(request,
-                                                         reply_builder);
+                co_return co_await ExecuteStorageCommand(
+                    request, reply_builder, nullptr, nullptr, true);
               });
         }
       }
@@ -12559,7 +12562,7 @@ Task<CommandReply> ExecuteCommandBody(
                 [&request, &reply_builder, &trace]() -> Task<CommandReply> {
                   trace.owner_start_ns_ = ReadTraceNowNanos();
                   CommandReply result = co_await ExecuteStorageCommand(
-                      request, reply_builder, &trace);
+                      request, reply_builder, &trace, nullptr, true);
                   trace.owner_done_ns_ = ReadTraceNowNanos();
                   co_return result;
                 });
@@ -12589,7 +12592,7 @@ Task<CommandReply> ExecuteCommandBody(
                 [&request, &reply_builder, &trace]() -> Task<CommandReply> {
                   trace.owner_start_ns_ = SetTraceNowNanos();
                   CommandReply result = co_await ExecuteStorageCommand(
-                      request, reply_builder, nullptr, &trace);
+                      request, reply_builder, nullptr, &trace, true);
                   trace.owner_done_ns_ = SetTraceNowNanos();
                   co_return result;
                 });
@@ -12607,8 +12610,8 @@ Task<CommandReply> ExecuteCommandBody(
         if (target != ThisWorker().id_) {
           co_return co_await SubmitTaskTo(
               target, [&request, &reply_builder]() -> Task<CommandReply> {
-                co_return co_await ExecuteStorageCommand(request,
-                                                         reply_builder);
+                co_return co_await ExecuteStorageCommand(
+                    request, reply_builder, nullptr, nullptr, true);
               });
         }
       }

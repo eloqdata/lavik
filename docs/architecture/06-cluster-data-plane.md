@@ -145,8 +145,8 @@ revoking an otherwise unchanged finite lease.
 
 `Admit` is a pure function over one committed snapshot and a request view
 (distinct key slots, write intent, connection READONLY state, loading
-whitelist membership), so the full decision matrix is testable offline. Its
-evaluation order mirrors Redis `getNodeByQuery`:
+whitelist membership), so the full decision matrix is testable offline. For
+Cluster clients, its evaluation order mirrors Redis `getNodeByQuery`:
 
 The request record retains only the first slot and, when present, one distinct
 slot as a CROSSSLOT witness. More distinct slots cannot change the decision,
@@ -168,7 +168,7 @@ slot without a general-purpose vector allocation or footprint.
    target applies its own grant gate and answers CLUSTERDOWN, so a redirect
    never lands a client on a writable fenced node.
 
-Commands without keys — including commands whose key extraction fails, such
+In Cluster, commands without keys — including failed key extraction, such
 as a malformed `EVAL` numkeys — admit locally (readiness still applies) and
 produce their own argument errors, the same treatment Redis gives zero-key
 commands. Runtime `PUBLISH` is the exception: it derives a slot from the

@@ -500,6 +500,15 @@ absl::Status InstallShutdownSignalHandler() {
     g_signal_event_fd = -1;
     return absl::Status(absl::StatusCode::kInternal, "sigaction setup failed");
   }
+  // OpenSSL's synchronous socket BIO cannot use MSG_NOSIGNAL. Bootstrap must
+  // observe EPIPE/TLS status and retry a peer restart, rather than terminate
+  // before the worker runtime exists. Other socket writers also handle EPIPE.
+  action.sa_handler = SIG_IGN;
+  if (sigaction(SIGPIPE, &action, nullptr) != 0) {
+    close(g_signal_event_fd);
+    g_signal_event_fd = -1;
+    return absl::InternalError("SIGPIPE setup failed");
+  }
   return absl::OkStatus();
 }
 
@@ -509,6 +518,7 @@ void CleanupShutdownSignalHandler() noexcept {
   action.sa_handler = SIG_DFL;
   (void)sigaction(SIGINT, &action, nullptr);
   (void)sigaction(SIGTERM, &action, nullptr);
+  (void)sigaction(SIGPIPE, &action, nullptr);
   if (g_signal_event_fd >= 0) {
     close(g_signal_event_fd);
     g_signal_event_fd = -1;

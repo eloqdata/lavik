@@ -3413,6 +3413,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   auto handshake_deadline = ArmDeadline(
       *core->worker_, connection, kHandshakeTimeout, "TLS and ClientHello");
   std::optional<MetaPrincipalIdentity> tls_identity;
+  absl::Status tls_identity_status;
   if (core->tls_context_ != nullptr) {
     const absl::Status tls =
         co_await stream.StartTls(core->tls_context_, /*server=*/true);
@@ -3422,23 +3423,21 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
     }
     auto sans = stream.PeerCertificateUriSans();
     if (!sans.ok()) {
-      handshake_deadline->complete_ = true;
-      co_return finish(sans.status());
+      tls_identity_status = sans.status();
+    } else if (sans->size() != 1) {
+      tls_identity_status = absl::UnauthenticatedError(
+          "data-control client must present exactly one URI SAN");
+    } else {
+      auto identity = AuthenticateMetaUriSans(*sans);
+      if (!identity.ok()) {
+        tls_identity_status = identity.status();
+      } else if (identity->role_ != MetaPrincipalRole::kDataNode) {
+        tls_identity_status = absl::PermissionDeniedError(
+            "control certificate is not a data-node identity");
+      } else {
+        tls_identity = std::move(*identity);
+      }
     }
-    if (sans->size() != 1) {
-      handshake_deadline->complete_ = true;
-      co_return finish(absl::UnauthenticatedError(
-          "data-control client must present exactly one URI SAN"));
-    }
-    auto identity = AuthenticateMetaUriSans(*sans);
-    if (!identity.ok() || identity->role_ != MetaPrincipalRole::kDataNode) {
-      handshake_deadline->complete_ = true;
-      co_return finish(
-          identity.ok() ? absl::PermissionDeniedError(
-                              "control certificate is not a data-node identity")
-                        : identity.status());
-    }
-    tls_identity = std::move(*identity);
   }
 
   auto hello_message = co_await io.ReadHandshake();
@@ -3446,6 +3445,22 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   if (!hello_message.ok()) co_return finish(hello_message.status(), true);
   if (const auto* bootstrap =
           std::get_if<control::BootstrapHello>(&*hello_message)) {
+    if (!tls_identity_status.ok()) {
+      // The CA accepted this certificate, but its application identity is
+      // invalid. A bare EOF would make bootstrap retry forever as if Meta had
+      // restarted. Reject explicitly without disclosing committed topology
+      // or claiming a Data session. The existing handshake deadline bounds
+      // how long an invalid principal can wait to identify its request type.
+      control::BootstrapReply reply;
+      reply.server = BuildServerHello(*core, {}, {}, false);
+      reply.disposition = control::BootstrapDisposition::kUnauthorized;
+      reply.server.rejection_reason =
+          std::string(tls_identity_status.message());
+      const auto sent =
+          co_await io.Send(control::MessagePriority::kReliable,
+                           control::WireMessage(std::move(reply)));
+      co_return finish(sent.ok() ? tls_identity_status : sent);
+    }
     // This branch deliberately precedes node-slot claims, session adoption,
     // projections and lease installation. Storage/history do not exist yet.
     auto captured =
@@ -3488,6 +3503,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
     co_return finish(co_await io.Send(control::MessagePriority::kReliable,
                                       control::WireMessage(std::move(reply))));
   }
+  if (!tls_identity_status.ok()) co_return finish(tls_identity_status);
   const auto* hello = std::get_if<control::ClientHello>(&*hello_message);
   if (hello == nullptr) {
     co_return finish(absl::InvalidArgumentError("expected ClientHello"), true);

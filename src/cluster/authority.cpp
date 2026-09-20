@@ -78,6 +78,8 @@ AuthorityAdmission::AuthorityAdmission(AuthorityAdmission&& other) noexcept
       state_(std::move(other.state_)),
       slots_(std::move(other.slots_)),
       gate_generation_(other.gate_generation_),
+      lease_revision_(other.lease_revision_),
+      lease_deadline_(other.lease_deadline_),
       lease_checked_(other.lease_checked_),
       single_group_(other.single_group_),
       mutation_started_(
@@ -93,6 +95,8 @@ AuthorityAdmission& AuthorityAdmission::operator=(
   state_ = std::move(other.state_);
   slots_ = std::move(other.slots_);
   gate_generation_ = other.gate_generation_;
+  lease_revision_ = other.lease_revision_;
+  lease_deadline_ = other.lease_deadline_;
   lease_checked_ = other.lease_checked_;
   single_group_ = other.single_group_;
   mutation_started_.store(
@@ -171,9 +175,9 @@ Decision Admit(const ServingState* state, const RequestView& request) {
     return decision;
   }
 
-  // A READONLY connection on a replica of the owning group serves reads
-  // locally; staleness is the client's explicit choice. Writes and
-  // non-READONLY reads redirect to the primary.
+  // Single replicas admit ordinary reads and reject writes with READONLY.
+  // Cluster replicas require an explicit READONLY connection; other accesses
+  // redirect to the primary. Population/link policy is checked by replication.
   if (self_index != kNoNodeIndex &&
       (request.client_mode_ == ClientMode::kSingle ||
        (!request.is_write_ && request.connection_readonly_))) {
@@ -301,6 +305,7 @@ const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority() const {
 }
 
 void AuthorityGuard::PublishAuthorityLocked() {
+  ++writer_state_.revision_;
   auto state = std::make_shared<const AuthorityState>(writer_state_);
   published_authority_.store(std::move(state), std::memory_order_release);
   // This version is only a cache invalidation hint, not part of the lease
@@ -328,8 +333,10 @@ std::optional<AuthorityAnchor> AuthorityGuard::LocalPrimaryAnchor(
 bool AuthorityGuard::LeaseCovers(const AuthorityState& authority,
                                  const ServingState& state,
                                  std::span<const std::uint16_t> slots,
-                                 MonotonicTime now) const {
+                                 MonotonicTime now,
+                                 MonotonicTime* earliest_deadline) const {
   if (!authority.session_.has_value()) return false;
+  if (earliest_deadline != nullptr) *earliest_deadline = MonotonicTime::max();
 
   // Single carries one representative slot for its full-keyspace Group.
   // Cluster admission enforces same-slot requests; keep this helper general
@@ -356,9 +363,20 @@ bool AuthorityGuard::LeaseCovers(const AuthorityState& authority,
       }
       return false;
     }
-    const std::optional<AuthorityAnchor> current =
-        LocalPrimaryAnchor(state, group->group_id_);
-    if (!current.has_value() || lease->second.anchor_ != *current) return false;
+    // The slot lookup already resolved this Group and the lease lookup used
+    // its id. Compare the remaining anchor fields in place: constructing an
+    // owning AuthorityAnchor here repeats the Group lookup and string copies
+    // at every admission and mutation recheck.
+    if (state.SelfNodeIndex() == kNoNodeIndex || !group->granted_ ||
+        !GroupReady(*group) ||
+        lease->second.anchor_.assignment_id_ != group->assignment_id_ ||
+        lease->second.anchor_.group_term_ != group->group_term_) {
+      return false;
+    }
+    if (earliest_deadline != nullptr) {
+      *earliest_deadline =
+          std::min(*earliest_deadline, lease->second.deadline_);
+    }
   }
   return true;
 }
@@ -389,8 +407,10 @@ AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
 
   const AuthorityState& authority = CurrentAuthority();
   admission.gate_generation_ = authority.generation_;
+  admission.lease_revision_ = authority.revision_;
   admission.lease_checked_ = true;
-  if (!LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
+  if (!LeaseCovers(authority, *admission.state_, admission.slots_, now,
+                   &admission.lease_deadline_)) {
     admission.decision_.kind_ = Decision::Kind::kClusterDownUnbound;
   }
   return admission;
@@ -411,13 +431,25 @@ RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,
 
   if (admission.lease_checked_) {
     const AuthorityState& authority = CurrentAuthority();
-    if (admission.gate_generation_ != authority.generation_ ||
+    if (admission.gate_generation_ != authority.generation_) {
+      return RecheckResult::kReject;
+    }
+    // Admission already checked these exact immutable leases against the
+    // retained topology. Until publication or expiry, repeating Group/hash
+    // lookups and anchor comparisons adds no proof. Renewal (even a shorter
+    // deadline) changes revision, while expiry still goes through LeaseCovers
+    // to record its one-time metric. Topology/fence checks remain below.
+    if ((admission.lease_revision_ != authority.revision_ ||
+         now >= admission.lease_deadline_) &&
         !LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
       return RecheckResult::kReject;
     }
   }
   std::uint64_t version = 0;
-  const auto current = CurrentCachedWithVersion(topology_, &version);
+  // This synchronous comparison cannot suspend or refresh this thread's cache
+  // again. Borrow its pinned snapshot to avoid unnecessary atomic shared
+  // ownership updates on every mutation.
+  const auto& current = CurrentCachedWithVersion(topology_, &version);
   // A representative slot proves the whole dataset only while its one-Group
   // topology remains intact, including across a publication before mutation.
   if (admission.single_group_ && !admission.slots_.empty() &&
@@ -451,7 +483,10 @@ RecheckResult AuthorityGuard::RegisterAndRecheck(
   // brackets registration against a concurrent publisher's drain.
   std::uint64_t unused_version = 0;
   std::uint64_t publication_before = 0;
-  const std::shared_ptr<const ServingState> registration_state =
+  // Registration cannot suspend. This cache entry is consumed before Recheck
+  // can refresh it, so retaining another shared owner would only add atomic
+  // reference-count traffic to every write.
+  const auto& registration_state =
       CurrentCachedWithVersion(topology_, &unused_version, &publication_before);
 
   const std::shared_ptr<const ServingState>& admitted_state = admission.state();

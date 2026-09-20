@@ -292,8 +292,7 @@ absl::StatusOr<SslContext> MakeTlsContext(const SyncTlsOptions& options) {
 }
 
 absl::Status WaitForSsl(SSL* ssl, int result, IoDeadline deadline,
-                        std::string_view operation, bool authentication_phase,
-                        bool partial_reply = false) {
+                        std::string_view operation) {
   const int error = SSL_get_error(ssl, result);
   if (error == SSL_ERROR_WANT_READ) {
     return WaitFor(SSL_get_fd(ssl), POLLIN, deadline, operation);
@@ -301,23 +300,17 @@ absl::Status WaitForSsl(SSL* ssl, int result, IoDeadline deadline,
   if (error == SSL_ERROR_WANT_WRITE) {
     return WaitFor(SSL_get_fd(ssl), POLLOUT, deadline, operation);
   }
-  if (partial_reply) {
-    return absl::DataLossError("server closed before terminating its reply");
+  // TLS 1.3 may report the server's client-certificate rejection on the first
+  // application read, after SSL_connect succeeded. Explicit alerts remain
+  // fatal at every stage; only an unexpected EOF is retryable transport loss.
+  if (error == SSL_ERROR_SSL &&
+      ERR_GET_REASON(ERR_peek_error()) != SSL_R_UNEXPECTED_EOF_WHILE_READING) {
+    return OpenSslStatus(operation);
   }
   if (error == SSL_ERROR_SYSCALL && errno != 0) {
     return ErrnoStatus(operation);
   }
-  // A peer restart during the handshake is transport loss, not evidence of
-  // an incompatible certificate. Explicit TLS alerts and verification errors
-  // still fail startup instead of retrying an invalid identity forever.
-  if (authentication_phase &&
-      (error == SSL_ERROR_ZERO_RETURN || error == SSL_ERROR_SYSCALL ||
-       (error == SSL_ERROR_SSL && ERR_GET_REASON(ERR_peek_error()) ==
-                                      SSL_R_UNEXPECTED_EOF_WHILE_READING))) {
-    return OpenSslTransportStatus(operation);
-  }
-  return authentication_phase ? OpenSslStatus(operation)
-                              : OpenSslTransportStatus(operation);
+  return OpenSslTransportStatus(operation);
 }
 
 absl::StatusOr<SslSession> StartTls(SSL_CTX* context, int fd,
@@ -344,8 +337,7 @@ absl::StatusOr<SslSession> StartTls(SSL_CTX* context, int fd,
     errno = 0;
     const int result = SSL_connect(raw);
     if (result == 1) break;
-    if (absl::Status ready =
-            WaitForSsl(raw, result, deadline, "TLS handshake", true);
+    if (absl::Status ready = WaitForSsl(raw, result, deadline, "TLS handshake");
         !ready.ok()) {
       return ready;
     }
@@ -370,8 +362,7 @@ absl::Status TlsWriteAll(SSL* ssl, std::string_view bytes,
       bytes.remove_prefix(static_cast<std::size_t>(written));
       continue;
     }
-    if (absl::Status ready =
-            WaitForSsl(ssl, written, deadline, "TLS write", false);
+    if (absl::Status ready = WaitForSsl(ssl, written, deadline, "TLS write");
         !ready.ok()) {
       return ready;
     }
@@ -401,7 +392,7 @@ struct SyncStream::Impl {
           return absl::UnavailableError("peer closed before completing reply");
         }
         if (auto status =
-                WaitForSsl(tls_->get(), received, deadline_, "TLS read", false);
+                WaitForSsl(tls_->get(), received, deadline_, "TLS read");
             !status.ok())
           return status;
       } else {

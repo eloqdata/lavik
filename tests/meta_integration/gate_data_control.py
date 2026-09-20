@@ -544,17 +544,17 @@ def make_leaf(workdir, ca_cert, ca_key, name, uri):
             os.path.join(workdir, f"{name}.key"))
 
 
-def assert_wrong_uri_rejected(data, meta):
+def assert_identity_rejected(data, meta, reason):
     code = data.proc.wait(timeout=10)
-    assert code != 0, data.log_tail()
-    assert "Data identity does not match" in data.log_tail(), data.log_tail()
+    assert code == 1, (code, data.log_tail())
+    assert reason in data.log_tail(), data.log_tail()
     assert observation_count(meta) == 0
     try:
         socket.create_connection(("127.0.0.1", data.redis_port), .2).close()
     except OSError:
         pass
     else:
-        raise H.Failure("wrong-URI boot opened Redis")
+        raise H.Failure("rejected identity opened Redis")
 
 
 def run_mtls(meta_binary, data_binary, workdir):
@@ -570,6 +570,15 @@ def run_mtls(meta_binary, data_binary, workdir):
     bad_cert, bad_key = make_leaf(
         cert_dir, ca_cert, ca_key, "data-wrong-uri",
         f"lavik://node/{OTHER_DATA_NODE}")
+    duplicate_cert, duplicate_key = make_leaf(
+        cert_dir, ca_cert, ca_key, "data-duplicate-uri",
+        f"lavik://node/{BAD_DATA_NODE},URI:lavik://node/{OTHER_DATA_NODE}")
+    untrusted_dir = os.path.join(cert_dir, "untrusted")
+    os.makedirs(untrusted_dir)
+    untrusted_ca, untrusted_key = make_ca(untrusted_dir)
+    untrusted_cert, untrusted_client_key = make_leaf(
+        untrusted_dir, untrusted_ca, untrusted_key, "data-untrusted",
+        f"lavik://node/{BAD_DATA_NODE}")
 
     meta_dir = os.path.join(scenario, "meta")
     os.makedirs(meta_dir, exist_ok=True)
@@ -592,9 +601,27 @@ def run_mtls(meta_binary, data_binary, workdir):
             tls=(ca_cert, bad_cert, bad_key))
         register_data_node(meta, bad_data)
         bad_data.start(wait_ready=False)
-        assert_wrong_uri_rejected(bad_data, meta)
+        assert_identity_rejected(bad_data, meta, "Data identity does not match")
         bad_data.terminate()
         H.log("mTLS: trusted certificate with wrong Data URI SAN rejected")
+
+        # TLS 1.3 can deliver a client-certificate rejection after SSL_connect
+        # succeeds. CA-valid role/SAN errors instead require a typed bootstrap
+        # rejection; a silent close looks like a retryable Meta restart.
+        for name, cert, key, reason in (
+                ("wrong-role", meta_cert, meta_key, "not a data-node identity"),
+                ("duplicate-uri", duplicate_cert, duplicate_key,
+                 "exactly one URI SAN"),
+                ("untrusted", untrusted_cert, untrusted_client_key,
+                 "unknown ca")):
+            bad_data = DataProcess(
+                data_binary, os.path.join(scenario, f"data-{name}"),
+                BAD_DATA_NODE, meta.data_control_endpoint,
+                tls=(ca_cert, cert, key))
+            bad_data.start(wait_ready=False)
+            assert_identity_rejected(bad_data, meta, reason)
+            bad_data.terminate()
+            H.log(f"mTLS: {name} fails startup without opening Redis")
 
         good_data = DataProcess(
             data_binary, os.path.join(scenario, "data-good"), DATA_NODE,

@@ -49,6 +49,8 @@ struct SyncTarget {
 // worker, storage, Admin permission or Raft dependency. One absolute deadline
 // covers connect, handshake and every byte of the exchange. A readable cancel
 // fd interrupts every wait; ownership and contents of that fd stay with caller.
+// TLS uses OpenSSL's socket BIO, so the executable must ignore SIGPIPE and
+// handle the returned transport status (as both Data and lavik-ctl do).
 class SyncStream {
  public:
   static absl::StatusOr<std::unique_ptr<SyncStream>> Connect(

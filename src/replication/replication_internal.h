@@ -2229,7 +2229,8 @@ class ReplicationManager::ReplicationGroup {
   bool is_redis_follower() const noexcept;
 
   bool is_loading() const noexcept;
-  DatasetReadState dataset_read_state(bool serve_stale) const noexcept;
+  DatasetReadState dataset_read_state(
+      const std::atomic<bool>& serve_stale) const noexcept;
 
   absl::Status SetSnapshotReadConcurrency(unsigned concurrency) noexcept;
 
