@@ -261,6 +261,8 @@ enum class DataFrameKind : std::uint8_t {
   // Full-sync publish frames carry source partition metadata but use a
   // session-local contiguous ACK sequence independent of ONLINE flow LSNs.
   kFullSyncCommand = 8,
+  // Inclusive, completed ONLINE flow LSNs. FULL and cursor ACKs remain kAck.
+  kAckRange = 9,
 };
 
 void PutU8(std::string& output, std::uint8_t value);
@@ -392,7 +394,10 @@ Task<absl::StatusOr<std::string>> ReadExact(TcpStream& stream,
 Task<absl::StatusOr<std::pair<DataFrameKind, std::string>>> ReadDataFrame(
     TcpStream& stream);
 
-Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream);
+// Optional progress distinguishes an unsupported-handshake EOF from a
+// truncated reply, which must never trigger capability fallback.
+Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream,
+                                           bool* received_any = nullptr);
 
 Task<absl::StatusOr<std::string>> ReadRedisBulkReply(TcpStream& stream);
 
@@ -2456,6 +2461,8 @@ class ReplicationManager::ReplicationGroup {
   };
 
   struct ReplicaOnlineApplyState {
+    // Immutable negotiation result, owned by this flow worker.
+    bool ack_ranges_ = false;
     std::deque<ReplicaOnlineCommand> commands_;
     std::deque<ReplicaOnlineCompletion> completions_;
     bycorf::AsyncNotification command_ready_;
@@ -2500,7 +2507,7 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> RunReplicaOnlineFlowData(
       TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
       unsigned flow_id, std::uint64_t first_expected_lsn,
-      std::pair<DataFrameKind, std::string> first_frame);
+      std::pair<DataFrameKind, std::string> first_frame, bool ack_ranges);
 
   struct ReplicaHandoffState {
     // Flow-local lifetime extends until every handoff task has joined. The
@@ -2530,7 +2537,7 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> RunReplicaFlowData(
       TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
-      unsigned flow_id);
+      unsigned flow_id, bool ack_ranges);
 
   Task<absl::Status> WaitReplicaHandoffs(
       const std::shared_ptr<ReplicaSession>& session,
@@ -2540,7 +2547,8 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> ReceiveReplicaFlowData(
       TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
-      unsigned flow_id, const std::shared_ptr<ReplicaHandoffState>& state);
+      unsigned flow_id, const std::shared_ptr<ReplicaHandoffState>& state,
+      bool ack_ranges);
 
   bool ShouldInjectFlowDrop(unsigned flow_id);
 
@@ -2608,7 +2616,7 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> RunMasterFlowData(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
-      unsigned flow_id);
+      unsigned flow_id, bool ack_ranges);
 
   Task<absl::StatusOr<std::uint64_t>> RunMasterFullSync(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
@@ -2616,9 +2624,11 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> EnterMasterFlowBacklog(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
-      unsigned flow_id, std::uint64_t next_lsn, std::uint32_t fragment_index);
+      unsigned flow_id, std::uint64_t next_lsn, std::uint32_t fragment_index,
+      bool ack_ranges);
 
   struct MasterBacklogDuplexState {
+    bool ack_ranges_ = false;
     std::deque<std::uint64_t> expected_acks_;
     bycorf::AsyncNotification expected_ack_ready_;
     bycorf::AsyncNotification receiver_done_ready_;
@@ -2644,7 +2654,7 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> RunMasterFlowBacklog(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
-      unsigned flow_id, storage::ReplicationLogCursor cursor);
+      unsigned flow_id, storage::ReplicationLogCursor cursor, bool ack_ranges);
 
   Task<absl::Status> RunAdoptedConnection(Connection* connection,
                                           std::vector<std::string> args,

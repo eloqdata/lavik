@@ -1421,6 +1421,10 @@ endforeach()
   )
 
   if (UNIX)
+    add_test(NAME lavik_native_ack_e2e
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/native_ack_e2e.py
+              $<TARGET_FILE:lavik>)
+    set_tests_properties(lavik_native_ack_e2e PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
     find_program(LAVIK_REDIS_SERVER_EXECUTABLE redis-server)
     find_program(LAVIK_REDIS_CLI_EXECUTABLE redis-cli)
     if (LAVIK_REDIS_SERVER_EXECUTABLE AND LAVIK_REDIS_CLI_EXECUTABLE)

@@ -57,7 +57,8 @@ def reject(client, args, text):
 
 
 @contextmanager
-def process(binary, directory, name, *, redis=False, extra=(), port=None, password=None):
+def process(binary, directory, name, *, redis=False, extra=(), port=None, password=None,
+            workers=2):
     port = port or H.free_port()
     directory.mkdir(exist_ok=True)
     if redis:
@@ -71,7 +72,7 @@ def process(binary, directory, name, *, redis=False, extra=(), port=None, passwo
                 os.posix_fallocate(file.fileno(), 0, 256 * 1024 * 1024)
         args = [binary, *([str(directory / "lavik.conf")] if (directory / "lavik.conf").exists() else []),
                 "--bind", "127.0.0.1", "--port", str(port),
-                "--threads", "2", "--no-pin-workers", "--metrics-port", "0",
+                "--threads", str(workers), "--no-pin-workers", "--metrics-port", "0",
                 "--recv-buffers-per-worker", "0", "--max-memory", "1G",
                 "--registered-buffer-mb-per-worker", "64",
                 "--data-file", str(data), "--rdb-dir", str(directory), "--logtostderr"]

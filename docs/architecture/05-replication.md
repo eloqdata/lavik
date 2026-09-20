@@ -608,8 +608,12 @@ Redis listener. Worker 0 owns the `LVPSYNC` control connection. The source has
 one `LVFLOW` data connection per source worker and adopts each flow socket onto
 that worker. A target may have a different worker count; it assigns source flow
 `n` to target worker `n % target_worker_count` without changing the source flow
-identity. Native protocol v1 is the only supported native wire format; there is
-no compatibility layout from an earlier deployment. The control hello carries
+identity. Native protocol v1 supports an optional `ACKRANGE` capability on the
+`LVFLOW` request and response. A target sends range ACKs only after the source
+echoes the capability; an ordinary four-word response retains individual ACKs.
+A peer that closes the extended request without replying is retried once with
+the original request on a fresh, equally authenticated connection. Partial or
+malformed replies never trigger that fallback. The control hello carries
 the group,
 replica incarnation, replica boot, requested history context, and complete
 Applied vector; the response supplies the source group, boot, history, session,
@@ -698,7 +702,14 @@ explicit retained-memory admission succeeds, unexpected physical allocation
 failure is process-fatal rather than converted to a second admission result.
 
 The source sends bounded batches while a separate receiver validates ACK order
-and advances the retained cursor. Sending can continue across batch boundaries
+and advances the retained cursor. A negotiated ONLINE range ACK carries two
+little-endian 64-bit inclusive LSN endpoints in frame kind 9. It represents
+at most 128 already-completed, contiguous events on one flow; an incomplete transaction or
+a gap ends the range without delaying earlier completions. Before advancing
+retention or `WAIT`, the source checks the entire bounded interval against its
+sent-event queue. FULL, cursor and singleton ACKs retain their original format.
+Neither native history nor applied-frontier semantics depend on this transport
+compression. Sending can continue across batch boundaries
 so every participant of a cross-flow transaction can reach its rendezvous;
 socket backpressure bounds outstanding output. A full-sync flow that stalls, or
 an online flow with unacknowledged work whose ACK cursor stops advancing, is
