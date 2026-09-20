@@ -30,7 +30,10 @@ printf '%s  %s\n' \
   21326da3f66c0aead4c8204c0ac52ff905337a77cadd169f75ac22835ea30025 \
   "$work/redis.tar.gz" | sha256sum --check
 tar -xzf "$work/redis.tar.gz" -C "$work"
-make -C "$work/redis-7.2.14" -j"${LAVIK_TEST_BUILD_JOBS:-2}" \
+# The top-level Makefile starts a separate recursive make for each goal.
+# Build both in one src invocation so parallel goals share the dependency graph
+# instead of racing dependency cleanup and writes to the same Lua archive.
+make -C "$work/redis-7.2.14/src" -j"${LAVIK_TEST_BUILD_JOBS:-2}" \
   MALLOC=libc BUILD_TLS=yes REDIS_CFLAGS= REDIS_LDFLAGS= redis-server redis-cli
 mkdir -p "$1"
 install -m 755 "$work/redis-7.2.14/src/redis-server" \
