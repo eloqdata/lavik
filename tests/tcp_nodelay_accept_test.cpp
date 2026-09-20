@@ -21,6 +21,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -34,6 +35,7 @@
 #include "bycorf/net/server.h"
 #include "bycorf/net/service.h"
 #include "bycorf/net/tcp_listener.h"
+#include "bycorf/net/tcp_stream.h"
 #include "bycorf/runtime/task.h"
 #include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
@@ -314,6 +316,106 @@ TEST(TcpListenerAcceptTest, UnixClosePreservesReplacementPath) {
   EXPECT_EQ(contents, "replacement");
   std::filesystem::remove_all(directory);
 }
+
+// Keep the worker running after local close: shutting the ring down would
+// release the stuck kernel receive and hide a missing cancellation.
+class ClosePendingReadService final : public Service {
+ public:
+  explicit ClosePendingReadService(bool read_ahead) : read_ahead_(read_ahead) {}
+  void Prepare(unsigned) override {}
+  void Stop() noexcept override { listener_.Close().IgnoreError(); }
+  int port() const { return port_.load(); }
+  bool read_finished() const { return read_finished_.load(); }
+
+  Task<absl::Status> Run(Worker& worker, ServiceContext) override {
+    auto status = listener_.Bind(&worker, "127.0.0.1", 0);
+    if (!status.ok()) {
+      port_.store(-1);
+      co_return status;
+    }
+    sockaddr_in address{};
+    socklen_t size = sizeof(address);
+    if (::getsockname(listener_.NativeFd(),
+                      reinterpret_cast<sockaddr*>(&address), &size) != 0) {
+      port_.store(-1);
+      co_return absl::InternalError("getsockname failed");
+    }
+    port_.store(ntohs(address.sin_port));
+    auto accepted = co_await listener_.Accept();
+    if (!accepted.ok()) co_return accepted.status();
+    TcpStream stream(*accepted);
+    auto borrow = stream.BorrowStorage();
+    status = stream.SetReadAhead(read_ahead_);
+    if (!status.ok()) co_return status;
+    worker.Spawn(CloseAfterTimer(worker, stream));
+    std::array<std::byte, 1> bytes{};
+    (void)co_await stream.ReadSome(bytes);
+    read_finished_.store(true);
+    while (!worker.stop_requested()) {
+      // Exercise the borrowed stream after completions and reclamation sweep.
+      (void)stream.Close();
+      if (!(co_await SleepFor(worker, std::chrono::milliseconds(10))).ok())
+        break;
+    }
+    co_return absl::OkStatus();
+  }
+
+ private:
+  static Task<absl::Status> CloseAfterTimer(Worker& worker, TcpStream& stream) {
+    auto slept = co_await SleepFor(worker, std::chrono::milliseconds(50));
+    if (!slept.ok()) co_return slept;
+    co_return stream.Close();
+  }
+  const bool read_ahead_;
+  TcpListener listener_;
+  std::atomic<int> port_{0};
+  std::atomic<bool> read_finished_{false};
+};
+
+class TcpStreamCloseTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(TcpStreamCloseTest, PendingReceiveDoesNotKeepPeerConnected) {
+  ClosePendingReadService service(GetParam());
+  Server server;
+  server.AddService(&service);
+  ServerOptions options;
+  options.thread_count_ = 1;
+  options.pin_workers_ = false;
+  options.recv_buffer_count_ = GetParam() ? 64 : 0;
+  ASSERT_TRUE(server.Start(options).ok());
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (service.port() == 0 && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  ASSERT_GT(service.port(), 0);
+  const int client = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ASSERT_GE(client, 0);
+  timeval timeout{1, 0};
+  ASSERT_EQ(
+      ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)),
+      0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(service.port());
+  ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr), 1);
+  ASSERT_EQ(
+      ::connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+      0);
+  char byte;
+  const ssize_t received = ::recv(client, &byte, 1, 0);
+  const int receive_errno = errno;
+  EXPECT_EQ(received, 0) << "local close did not reach peer: "
+                         << std::strerror(receive_errno);
+  while (!service.read_finished() &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_TRUE(service.read_finished());
+  ::close(client);
+  server.RequestStop();
+  server.WaitUntilStopped();
+}
+
+INSTANTIATE_TEST_SUITE_P(ReceiveModes, TcpStreamCloseTest, ::testing::Bool());
 
 }  // namespace
 }  // namespace bycorf

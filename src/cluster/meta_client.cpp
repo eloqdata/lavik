@@ -39,6 +39,7 @@
 #include <variant>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -2814,6 +2815,11 @@ struct MetaControlClientService::Impl {
         worker, endpoint.host_, endpoint.port_, kConnectTimeout);
     if (!connected.ok()) co_return connected.status();
     bycorf::TcpStream stream = std::move(*connected);
+    // Watchdogs can close the transport while cleanup awaits data workers.
+    // Keep its storage alive through every session user, and close on early
+    // handshake/redirect returns as well as the established-session path.
+    auto storage_borrow = stream.BorrowStorage();
+    auto close_stream = absl::MakeCleanup([&stream] { (void)stream.Close(); });
     if (stopping_.load(std::memory_order_acquire)) {
       (void)stream.Close();
       // No session state was installed, so this is successful quiescence.
