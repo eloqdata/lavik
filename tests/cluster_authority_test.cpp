@@ -160,28 +160,82 @@ struct TestAuthorityControl {
   lavik::cluster::testing::TestTopologyInstaller topology;
 };
 
-TEST(ClusterAuthoritySnapshotTest,
-     SingleClientStillRequiresEverySlotAuthority) {
+std::shared_ptr<const ServingState> BuildSingleState(GroupView group) {
+  ServingStateBuilder builder;
+  builder.SetTopologyEpoch(1).SetInFlightStripeCount(4);
+  builder.SetSelfNodeIndex(kNodeAIndex);
+  builder.AddNode(MakeNode(kNodeA, "10.0.0.1", 7000, 17000));
+  builder.AddGroup(std::move(group));
+  auto state = builder.Build();
+  EXPECT_TRUE(state.ok()) << state.status();
+  return state.ok() ? *state : nullptr;
+}
+
+TEST(ClusterAuthoritySnapshotTest, SingleClientUsesOneFullGroupAuthority) {
   using namespace std::chrono_literals;
   TestAuthorityControl control;
   const auto start = lavik::cluster::MonotonicTime{};
-  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), start, 10ms).ok());
-  const std::array<std::uint16_t, 2> local{kSlotInA, kOtherSlotInA};
-  auto request = MakeRequest(local, true);
+  const auto state =
+      BuildSingleState(MakeGroup(kGroupA, kNodeAIndex, 0, 16383));
+  ASSERT_TRUE(control.topology.Install(state, start, 10ms).ok());
+  const std::array<std::uint16_t, 3> slots{0, kSlotInB, 16383};
+  auto request = MakeRequest(slots, true);
   EXPECT_EQ(control.authority.CaptureAndAdmit(request, start).decision().kind_,
             Decision::Kind::kCrossSlot);
   request.client_mode_ = lavik::ClientMode::kSingle;
-  const auto admission = control.authority.CaptureAndAdmit(request, start);
-  EXPECT_EQ(admission.decision().kind_, Decision::Kind::kServe);
-  EXPECT_EQ(control.authority.RecheckAtMutation(admission, start + 10ms),
+  auto admission = control.authority.CaptureAndAdmit(request, start);
+  ASSERT_EQ(admission.decision().kind_, Decision::Kind::kServe);
+  // One representative slot carries the full Group's lease and drain proof.
+  ASSERT_EQ(admission.slots().size(), 1u);
+  AuthorityInFlightGuards guards;
+  ASSERT_EQ(control.authority.RegisterAndRecheck(admission, 0, start, &guards),
+            RecheckResult::kOk);
+  EXPECT_EQ(guards.size(), 1u);
+  EXPECT_EQ(control.cache.Current()->GroupInFlightCount(kGroupA), 1u);
+  // Moving the proof must preserve Single's topology constraint as well.
+  auto moved = std::move(admission);
+  EXPECT_EQ(control.authority.RecheckAtMutation(moved, start + 10ms),
             RecheckResult::kReject);
   EXPECT_EQ(
       control.authority.CaptureAndAdmit(request, start + 10ms).decision().kind_,
       Decision::Kind::kClusterDownUnbound);
-  const std::array<std::uint16_t, 2> remote{kSlotInA, kSlotInB};
-  request.slots_ = remote;
-  EXPECT_EQ(control.authority.CaptureAndAdmit(request, start).decision().kind_,
-            Decision::Kind::kMoved);
+  guards.clear();
+  // The first slot keeps its owner and token, but losing full coverage or
+  // splitting the keyspace must invalidate the whole-dataset admission.
+  control.cache.Publish(
+      BuildSingleState(MakeGroup(kGroupA, kNodeAIndex, 0, 9999)));
+  EXPECT_EQ(control.authority.Recheck(moved, start), RecheckResult::kReject);
+  control.cache.Publish(BuildState(kNodeA));
+  EXPECT_EQ(control.authority.Recheck(moved, start), RecheckResult::kReject);
+}
+
+TEST(ClusterAuthoritySnapshotTest, SingleClientRejectsNonFullGroupTopology) {
+  const std::array<std::uint16_t, 2> slots{kSlotInA, kOtherSlotInA};
+  auto request = MakeRequest(slots, true);
+  request.client_mode_ = lavik::ClientMode::kSingle;
+  for (const auto& state :
+       {BuildState(kNodeA),
+        BuildSingleState(MakeGroup(kGroupA, kNodeAIndex, 0, 9999))}) {
+    EXPECT_EQ(Admit(state.get(), request).kind_,
+              Decision::Kind::kClusterDownUnbound);
+  }
+}
+
+TEST(ClusterAuthoritySnapshotTest, SingleClientHonorsFullGroupServingGates) {
+  const std::array<std::uint16_t, 2> slots{0, 16383};
+  auto request = MakeRequest(slots, true);
+  request.client_mode_ = lavik::ClientMode::kSingle;
+  auto group = MakeGroup(kGroupA, kNodeAIndex, 0, 16383);
+  group.granted_ = false;
+  EXPECT_EQ(Admit(BuildSingleState(group).get(), request).kind_,
+            Decision::Kind::kClusterDownUnbound);
+  group.granted_ = true;
+  group.mutations_paused_ = true;
+  EXPECT_EQ(Admit(BuildSingleState(group).get(), request).kind_,
+            Decision::Kind::kTryAgain);
+  group.storage_ready_ = false;
+  EXPECT_EQ(Admit(BuildSingleState(group).get(), request).kind_,
+            Decision::Kind::kLoading);
 }
 
 TEST(ClusterAuthoritySnapshotTest, CachedReadExpiresWithoutAnyPublication) {

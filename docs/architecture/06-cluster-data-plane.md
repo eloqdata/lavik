@@ -70,8 +70,12 @@ installs `ClusterRuntime` (topology cache, authority guard, node controller,
 action adapter, and resolved announce addresses) before any worker serves;
 without Meta management the runtime is null. Authority and lifecycle checks
 consult management status, never the client mode. Cluster clients require Meta
-management. Managed Single startup is rejected until its command admission can
-bind the entire dataset to Group authority.
+management. Managed Single has one Group covering the entire keyspace. Its
+keyed admission carries one representative slot for that Group's readiness,
+lease, in-flight registration, and mutation rechecks; it rejects snapshots that
+violate the single full-Group constraint. Cluster admission retains its
+same-slot rule. Managed Single startup remains rejected until the remaining
+whole-dataset authority integration in #90 is complete.
 
 ## ServingState: the published unit of truth
 

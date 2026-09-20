@@ -176,6 +176,8 @@ class AuthorityAdmission {
   const std::shared_ptr<const ServingState>& state() const noexcept {
     return state_;
   }
+  // Authority-bearing slots; Single retains only the first request slot as
+  // the representative of its sole full-keyspace Group.
   std::span<const std::uint16_t> slots() const noexcept { return slots_; }
   // A final storage check records whether any mutation in this admission has
   // linearized and whether a later one was rejected. Callers use the pair to
@@ -194,6 +196,7 @@ class AuthorityAdmission {
   absl::InlinedVector<std::uint16_t, 4> slots_;
   std::uint64_t gate_generation_ = 0;
   bool lease_checked_ = false;
+  bool single_group_ = false;
   mutable std::atomic<bool> mutation_started_{false};
   mutable std::atomic<bool> final_recheck_failed_{false};
 };

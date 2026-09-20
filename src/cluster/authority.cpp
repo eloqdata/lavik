@@ -31,6 +31,19 @@ namespace {
 // TLS entries must not survive destruction followed by address reuse.
 std::atomic<std::uint64_t> next_authority_cache_identity{1};
 
+// Managed Single has one authority for the entire keyspace. A representative
+// slot lets the existing lease/drain/token machinery check that Group once.
+std::span<const std::uint16_t> AuthoritySlots(const RequestView& request) {
+  return request.client_mode_ == ClientMode::kSingle && !request.slots_.empty()
+             ? request.slots_.first(1)
+             : request.slots_;
+}
+
+bool HasSingleFullGroup(const ServingState* state) {
+  return state != nullptr && state->Groups().size() == 1 &&
+         state->CoverageComplete();
+}
+
 // Storage recovery and initial population both gate serving. Grant state is
 // deliberately not part of readiness: a fenced group is handled by the
 // ownership step below (no safe owner), not reported as still loading.
@@ -61,6 +74,7 @@ AuthorityAdmission::AuthorityAdmission(AuthorityAdmission&& other) noexcept
       slots_(std::move(other.slots_)),
       gate_generation_(other.gate_generation_),
       lease_checked_(other.lease_checked_),
+      single_group_(other.single_group_),
       mutation_started_(
           other.mutation_started_.load(std::memory_order_relaxed)),
       final_recheck_failed_(
@@ -75,6 +89,7 @@ AuthorityAdmission& AuthorityAdmission::operator=(
   slots_ = std::move(other.slots_);
   gate_generation_ = other.gate_generation_;
   lease_checked_ = other.lease_checked_;
+  single_group_ = other.single_group_;
   mutation_started_.store(
       other.mutation_started_.load(std::memory_order_relaxed),
       std::memory_order_relaxed);
@@ -86,6 +101,7 @@ AuthorityAdmission& AuthorityAdmission::operator=(
 
 Decision Admit(const ServingState* state, const RequestView& request) {
   Decision decision;
+  const auto slots = AuthoritySlots(request);
 
   // Loading gate, first in Redis's order too (processCommand runs its loading
   // check before getNodeByQuery): loading, then first-key unbound, then
@@ -94,9 +110,8 @@ Decision Admit(const ServingState* state, const RequestView& request) {
   // unconditionally so clients can probe health and discovery while storage
   // recovers — the Redis layer mirrors the existing is_loading allowlist.
   const bool ready =
-      state != nullptr &&
-      (request.slots_.empty() ? state->FullyReady()
-                              : InvolvedGroupsReady(*state, request.slots_));
+      state != nullptr && (slots.empty() ? state->FullyReady()
+                                         : InvolvedGroupsReady(*state, slots));
   if (!ready) {
     decision.kind_ = request.loading_allowed_ ? Decision::Kind::kServe
                                               : Decision::Kind::kLoading;
@@ -108,45 +123,34 @@ Decision Admit(const ServingState* state, const RequestView& request) {
   // because an empty slot set cannot name authority or a drain cell. Callers
   // also report key-extraction failure as empty so malformed commands reach
   // their own argument error, matching Redis getNodeByQuery.
-  if (request.slots_.empty()) {
+  if (slots.empty()) {
     decision.kind_ = Decision::Kind::kServe;
     return decision;
   }
 
   if (request.client_mode_ == ClientMode::kSingle &&
-      request.slots_.size() > 1) {
-    // Single may span slots, but every involved slot still needs its own
-    // ownership decision. CaptureAndAdmit retains the complete slot set for
-    // the lease, in-flight registration, and final mutation checks.
-    for (std::size_t index = 0; index < request.slots_.size(); ++index) {
-      RequestView one_slot = request;
-      one_slot.slots_ = request.slots_.subspan(index, 1);
-      const Decision current = Admit(state, one_slot);
-      if (current.kind_ != Decision::Kind::kServe &&
-          current.kind_ != Decision::Kind::kServeStaleRead)
-        return current;
-      if (current.kind_ == Decision::Kind::kServeStaleRead) decision = current;
-    }
+      !HasSingleFullGroup(state)) {
+    decision.kind_ = Decision::Kind::kClusterDownUnbound;
     return decision;
   }
 
   // First-key unbound outranks cross-slot (Redis checks coverage before the
   // single-slot rule): [unbound-slot key, other-slot key] yields CLUSTERDOWN,
   // not CROSSSLOT.
-  const std::uint16_t slot = request.slots_.front();
+  const std::uint16_t slot = slots.front();
   const GroupView* group = state->GroupForSlot(slot);
   if (group == nullptr) {
     decision.kind_ = Decision::Kind::kClusterDownUnbound;
     return decision;
   }
-  for (const std::uint16_t other : request.slots_.subspan(1)) {
+  for (const std::uint16_t other : slots.subspan(1)) {
     if (other != slot) {
       decision.kind_ = Decision::Kind::kCrossSlot;
       return decision;
     }
   }
 
-  // Single-slot request from here on; the loading gate already established
+  // One authority Group from here on; the loading gate already established
   // the owning group's readiness.
   const NodeIndex self_index = state->SelfNodeIndex();
   if (self_index == group->primary_node_index_) {
@@ -315,9 +319,9 @@ bool AuthorityGuard::LeaseCovers(const AuthorityState& authority,
                                  MonotonicTime now) const {
   if (!authority.session_.has_value()) return false;
 
-  // Redis admits only same-slot requests, but keeping this loop general makes
-  // the lease proof fail closed if a future caller reaches the seam before
-  // applying the cross-slot verdict.
+  // Single carries one representative slot for its full-keyspace Group.
+  // Cluster admission enforces same-slot requests; keep this helper general
+  // so callers cannot accidentally omit a Group from the lease proof.
   std::string_view checked_group;
   for (const std::uint16_t slot : slots) {
     const GroupView* group = state.GroupForSlot(slot);
@@ -352,7 +356,9 @@ AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
   AuthorityAdmission admission;
   std::uint64_t version = 0;
   admission.state_ = CurrentCachedWithVersion(topology_, &version);
-  admission.slots_.assign(request.slots_.begin(), request.slots_.end());
+  const auto slots = AuthoritySlots(request);
+  admission.slots_.assign(slots.begin(), slots.end());
+  admission.single_group_ = request.client_mode_ == ClientMode::kSingle;
   admission.decision_ = Admit(admission.state_.get(), request);
 
   if (admission.decision_.kind_ != Decision::Kind::kServe ||
@@ -399,9 +405,14 @@ RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,
     }
   }
   std::uint64_t version = 0;
-  return AuthorityUnchanged(*admission.state_,
-                            CurrentCachedWithVersion(topology_, &version).get(),
-                            admission.slots_)
+  const auto current = CurrentCachedWithVersion(topology_, &version);
+  // A representative slot proves the whole dataset only while its one-Group
+  // topology remains intact, including across a publication before mutation.
+  if (admission.single_group_ && !admission.slots_.empty() &&
+      !HasSingleFullGroup(current.get())) {
+    return RecheckResult::kReject;
+  }
+  return AuthorityUnchanged(*admission.state_, current.get(), admission.slots_)
              ? RecheckResult::kOk
              : RecheckResult::kReject;
 }
