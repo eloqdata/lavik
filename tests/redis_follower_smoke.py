@@ -90,8 +90,11 @@ def process(binary, directory, name, *, redis=False, extra=(), port=None, passwo
                     assert client.call("PING") == "PONG"
                     break
                 except OSError:
+                    if client is not None:
+                        client.close()
+                        client = None
                     time.sleep(.05)
-            assert client is not None, log_path.read_text()
+            assert client is not None, "server readiness deadline expired\n" + log_path.read_text()
             yield client, port, log_path
         except BaseException:
             print(log_path.read_text()[-12000:], file=sys.stderr)
@@ -150,9 +153,12 @@ class Forwarder:
                                 return
                             if key.fileobj is outgoing and self.cut_after is not None:
                                 remaining = self.cut_after
-                                self.cut_after = None
                                 key.data.sendall(data[:remaining])
-                                return
+                                remaining -= min(len(data), remaining)
+                                self.cut_after = remaining or None
+                                if remaining == 0:
+                                    return
+                                continue
                             key.data.sendall(data)
             except OSError:
                 return
@@ -163,6 +169,34 @@ class Forwarder:
         self.thread.join(timeout=3)
         for peer in self.peers:
             peer.join(timeout=3)
+
+
+def fragmented_disconnect():
+    """Keep the fault's byte boundary independent of TCP receive chunking."""
+    with socket.socket() as source:
+        source.bind(("127.0.0.1", 0))
+        source.listen()
+        source.settimeout(2)
+        proxy = Forwarder(lambda _: source.getsockname()[1])
+        proxy.cut_after = 5
+        try:
+            with socket.create_connection(("127.0.0.1", proxy.port), 2) as target:
+                upstream, _ = source.accept()
+                with upstream, target.makefile("rb") as reader:
+                    upstream.sendall(b"ab")
+                    # Observing this prefix before sending the rest forces
+                    # two relay reads, regardless of packet coalescing.
+                    assert reader.read(2) == b"ab"
+                    upstream.sendall(b"cdefgh")
+                    assert reader.read() == b"cde"
+            # The cut is consumed once; a replacement connection stays usable.
+            with socket.create_connection(("127.0.0.1", proxy.port), 2) as target:
+                upstream, _ = source.accept()
+                with upstream, target.makefile("rb") as reader:
+                    upstream.sendall(b"reconnected")
+                    assert reader.read(11) == b"reconnected"
+        finally:
+            proxy.close()
 
 
 def changing_endpoint(lavik, redis, root, managed=False):
@@ -353,8 +387,8 @@ def mode_contract(lavik, root):
         (directory / "lavik.conf").write_text(
             "client-mode single\nmeta-managed no\n" if cluster else
             "client-mode cluster\nmeta-managed yes\n")
-        args = ["--client-mode", "cluster" if cluster else "single",
-                "--meta-managed", "yes" if cluster else "no"]
+        args = ["--client-mode", "CLUSTER" if cluster else "SiNgLe",
+                "--meta-managed", "YeS" if cluster else "NO"]
         if cluster:
             args += ["--node-id", "1" * 40, "--meta-seed", "127.0.0.1:9"]
         with process(lavik, directory, "mode", extra=args) as (client, _, _):
@@ -403,6 +437,7 @@ def authenticated_startup(lavik, redis, root):
 
 
 if __name__ == "__main__":
+    fragmented_disconnect()
     with tempfile.TemporaryDirectory(prefix="lavik-redis-follower-",
                                      dir=os.environ.get("LAVIK_TEST_DATA_DIR")) as directory:
         mode_contract(sys.argv[1], Path(directory))

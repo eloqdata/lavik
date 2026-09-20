@@ -383,6 +383,21 @@ TEST(RedisConfigTest, RemovedModeDirectivesAreRejected) {
   }
 }
 
+TEST(RedisConfigTest, ModeValuesAreCaseInsensitive) {
+  ServerOptions options;
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"client-mode", "CLUSTER"}, &options).ok());
+  EXPECT_EQ(options.client_mode_, lavik::ClientMode::kCluster);
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"meta-managed", "YeS"}, &options).ok());
+  EXPECT_TRUE(options.meta_managed_);
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"client-mode", "SiNgLe"}, &options).ok());
+  EXPECT_EQ(options.client_mode_, lavik::ClientMode::kSingle);
+  ASSERT_TRUE(ApplyRedisConfigDirective({"meta-managed", "NO"}, &options).ok());
+  EXPECT_FALSE(options.meta_managed_);
+}
+
 TEST(RedisConfigTest, ClusterModeRejectsStandalonePopulationSources) {
   ServerOptions options;
   ASSERT_TRUE(

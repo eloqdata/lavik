@@ -20,8 +20,8 @@ Data startup uses two independent options:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `client-mode single|cluster` | `single` | Redis client semantics and DB range (16 DBs or DB0) |
-| `meta-managed yes|no` | `no` | Meta authority, control session and native replication |
+| `client-mode single\|cluster` | `single` | Redis client semantics and DB range (16 DBs or DB0) |
+| `meta-managed yes\|no` | `no` | Meta authority, control session and native replication |
 
 Use the same values on the CLI (`--client-mode cluster --meta-managed yes`).
 Configuration files load first; explicitly supplied CLI values override them.

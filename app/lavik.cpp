@@ -136,7 +136,7 @@ int main(int argc, char** argv) {
                                       : lavik::ClientMode::kSingle;
          },
          "Redis client semantics: single or cluster")
-      ->check(CLI::IsMember({"single", "cluster"}))
+      ->transform(CLI::IsMember({"single", "cluster"}, CLI::ignore_case))
       ->default_str("single");
   app.add_option_function<std::string>(
          "--meta-managed",
@@ -144,7 +144,7 @@ int main(int argc, char** argv) {
            options.meta_managed_ = managed == "yes";
          },
          "Use Meta authority and native replication: yes or no")
-      ->check(CLI::IsMember({"yes", "no"}))
+      ->transform(CLI::IsMember({"yes", "no"}, CLI::ignore_case))
       ->default_str("no");
   app.add_option("--meta-seed", options.meta_seeds_,
                  "Numeric Meta data-control endpoint; repeat for bootstrap");

@@ -454,9 +454,10 @@ absl::Status ApplyRedisConfigDirective(
   // kRuntimeConfigs table and never reaches this function.
   if (name == "client-mode") {
     if (directive.size() != 2) return WrongArgumentCount(name);
-    if (directive[1] == "single") {
+    const std::string mode = absl::AsciiStrToLower(directive[1]);
+    if (mode == "single") {
       options->client_mode_ = ClientMode::kSingle;
-    } else if (directive[1] == "cluster") {
+    } else if (mode == "cluster") {
       options->client_mode_ = ClientMode::kCluster;
     } else {
       return absl::InvalidArgumentError(

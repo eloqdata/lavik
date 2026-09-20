@@ -819,8 +819,8 @@ values after their absolute deadline; without a valid lease, recovery cannot
 append the authoritative tombstone or reclaim the retained winner.
 
 Startup-only directives configure the subsystem: `client-mode` (default
-`single`), `meta-managed` (default `no`), repeatable `meta-seed`, required
-managed `node-id`, and
+`single`), `meta-managed` (default `no`), repeatable `meta-seed`,
+`node-id` (required only when `meta-managed yes`), and
 `announce-ip`, `announce-port`, and
 `announce-tls-port`. Announce values default to the first non-wildcard
 bind address and the corresponding listen ports; a wildcard bind leaves the
