@@ -543,6 +543,11 @@ fresh bootstrap and does not depend on retained delta history. Protocol v1
 layouts evolve in place for fresh clusters, without migration or mixed-version
 negotiation.
 
+Each publication retains its own validated committed high-water, separate from
+the installed projection's cursor. Transfer boundaries and final adoption reuse
+that proof until a newer commit arrives, so delivering one object does not
+repeatedly rebuild and encode the same manifests on the heartbeat worker.
+
 The Data-control wire protocol has a fixed versioned header, per-direction
 sequence, payload length, and CRC32C. Frames are bounded to 16 KiB. Larger
 objects use Start/Chunk/End with object identity, ordered offsets, and a

@@ -241,8 +241,9 @@ std::optional<std::uint64_t> ConfirmedLeaseForHeartbeat(
     const std::optional<MetaObservedOwnerProjection>& owner_projection);
 
 // Applies this Meta process's leadership-validity ceiling to a deterministic
-// Policy projection, then rebuilds the encoded bytes that the
-// scalar influences. Local Raft timing must never enter committed apply.
+// Policy projection, rebuilding its encoded bytes only when that ceiling
+// changes the duration (or no encoding exists). The input must be an unmodified
+// projector batch. Local Raft timing must never enter committed apply.
 absl::Status ApplyLeadershipValidityLimit(NodeControlBatch& batch,
                                           std::uint32_t leadership_validity_ms);
 

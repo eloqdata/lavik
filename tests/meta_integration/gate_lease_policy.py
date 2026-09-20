@@ -19,6 +19,8 @@ Delay a complete control update for four old lease windows while forwarding
 heartbeats and their Acks. Only transport sequences/CRCs are regenerated; all
 business identities, decisions, payloads and per-object ordering are retained.
 This separates slow policy publication from an actual disconnected leader.
+Then exercise two primary/replica pairs sharing one Meta worker to cover
+publication CPU cost across concurrent sessions without a forwarding proxy.
 """
 import os
 from pathlib import Path
@@ -229,8 +231,73 @@ def run(root):
         proxy.close()
 
 
+def run_multi(root):
+    """Four publishers share one Meta worker; no proxy masks their CPU cost."""
+    root.mkdir()
+    (root / "meta").mkdir()
+    meta = H.Node(C.META, str(root / "meta"), 1,
+                  args=H.raft_args(snapshot_distance=100000,
+                                   election_ms_low=2000, election_ms_high=4000))
+    nodes = [DataProcess(C.DATA, str(root / name), node_id,
+                         meta.data_control_endpoint)
+             for name, node_id in (("primary1", C.PRIMARY_1), ("replica1", C.REPLICA_1),
+                                  ("primary2", C.PRIMARY_2), ("replica2", C.REPLICA_2))]
+    manifest = root / "cluster.toml"
+    C.write_multi_manifest(manifest, nodes, True, meta)
+    clients = []
+    expires = "lavik_cluster_control_lease_expirations_total"
+    try:
+        meta.start(initial_cluster_manifest=str(manifest))
+        meta.wait_leader()
+        for node in nodes:
+            node.start()
+        C.command(os.environ.copy(), [C.CTL, "cluster-create", "--manifest",
+                  str(manifest), "--socket", meta.ctl_path, "--yes"])
+        C.wait_cluster_ready(meta, "four-node cluster ready", 90)
+        clients = [Client(nodes[0]), Client(nodes[2])]
+        keys = [C.key_in_range("policy-multi-1", 0, 8191),
+                C.key_in_range("policy-multi-2", 8192, 16383)]
+        baseline = [node.metric(expires) for node in nodes]
+        for version in range(2, 10):
+            duration = 300 if version % 2 == 0 else 2000
+            assert meta.put_authority_lease_policy(version, duration).startswith("OK")
+            # Keep checking actual write authority throughout publication,
+            # including the intervals hidden by a final READY-only assertion.
+            deadline = time.monotonic() + 1.0
+            count = 0
+            while time.monotonic() < deadline:
+                for client, key in zip(clients, keys):
+                    value = f"{version}:{count}"
+                    assert client.call("SET", key, value, "PX", 10000) == "OK"
+                    assert client.call("GET", key) == value
+                count += 1
+                time.sleep(0.01)
+            C.wait_cluster_ready(meta, "four-node policy applied", 15)
+            assert [node.metric(expires) for node in nodes] == baseline
+            H.log(f"PASS: four-node policy version={version} duration={duration}, "
+                  f"{count} writes per primary")
+        for client in clients:
+            client.close()
+        clients.clear()
+        for node in reversed(nodes):
+            node.terminate()
+        meta.terminate()
+    except BaseException:
+        H.dump_node_logs([meta])
+        for node in nodes:
+            print(node.log_tail(lines=100), file=sys.stderr)
+        raise
+    finally:
+        for client in clients:
+            client.close()
+        for node in nodes:
+            node.force_kill()
+        meta.force_kill()
+
+
 if __name__ == "__main__":
     C.META, C.DATA, C.CTL, C.REDIS_CLI = map(os.path.abspath, sys.argv[1:5])
     with tempfile.TemporaryDirectory(prefix="lavik-policy-",
                                      dir=os.environ.get("LAVIK_TEST_DATA_DIR")) as directory:
         run(Path(directory))
+        run_multi(Path(directory) / "multi")

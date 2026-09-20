@@ -683,8 +683,14 @@ absl::Status detail::ApplyLeadershipValidityLimit(
         "authority lease and leadership-validity durations must be nonzero");
   }
   control::FullDesiredState& state = batch.full_state;
-  state.authority_lease_duration_ms =
+  const auto resolved =
       std::min(state.authority_lease_duration_ms, leadership_validity_ms);
+  // ProjectNode already validated and encoded this immutable graph. Do not
+  // serialize every manifest a second time when the limit changes nothing.
+  if (resolved == state.authority_lease_duration_ms &&
+      !batch.encoded_full_state.empty())
+    return absl::OkStatus();
+  state.authority_lease_duration_ms = resolved;
 
   auto encoded = control::EncodeFullDesiredState(state);
   if (!encoded.ok()) return encoded.status();
@@ -2110,7 +2116,8 @@ bycorf::Task<absl::Status> FenceSupersededAuthorityLive(
 bycorf::Task<absl::StatusOr<MetaReplacementDisposition>>
 CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
                           const NodeControlBatch& installed,
-                          const NodeControlBatch& replacement) {
+                          const NodeControlBatch& replacement,
+                          std::uint64_t* publication_high_water) {
   if (!AuthoritySessionsAllowed(*state->core_, state->leadership_generation_)) {
     co_return absl::CancelledError(
         "Meta authority is unavailable during FullDesiredState publication");
@@ -2126,8 +2133,7 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
   const std::uint64_t published_index =
       state->commit_signal_->published_index_.load(std::memory_order_acquire);
   if (!detail::TransferBoundaryNeedsProjectionValidation(
-          published_index, high_water,
-          state->validated_committed_high_water_)) {
+          published_index, high_water, *publication_high_water)) {
     co_return MetaReplacementDisposition::kContinue;
   }
 
@@ -2152,11 +2158,11 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
   const MetaReplacementDisposition disposition = EvaluateNodeReplacement(
       replacement.full_state, latest->full_state, state->node_id_);
   if (disposition == MetaReplacementDisposition::kContinue) {
-    // Keep projection_superseded_ set until the complete object is Applied
-    // and the final stable-view check succeeds. This cursor only avoids
-    // re-projecting the same semantic no-op commit at every 64 KiB boundary.
-    detail::RecordEquivalentTransferBoundary(
-        view.applied_index(), &state->validated_committed_high_water_);
+    // The transferred object has its own validation cursor. Advancing the
+    // installed cursor here could hide a required retry if this transfer is
+    // subsequently aborted before Data can apply it.
+    detail::RecordEquivalentTransferBoundary(view.applied_index(),
+                                             publication_high_water);
   }
   co_return disposition;
 }
@@ -2165,7 +2171,8 @@ bycorf::Task<absl::StatusOr<detail::MetaPublisherTransferDisposition>>
 SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
                       const NodeControlBatch& installed,
                       const NodeControlBatch& replacement,
-                      const control::NodeControlUpdate& update) {
+                      const control::NodeControlUpdate& update,
+                      std::uint64_t* publication_high_water) {
   auto encoded = control::EncodeNodeControlUpdate(update);
   if (!encoded.ok()) co_return encoded.status();
   const std::string_view bytes = *encoded;
@@ -2179,8 +2186,8 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
   }
 
   if (bytes.size() <= control::kMaxFramePayloadBytes) {
-    auto boundary =
-        co_await CheckLiveTransferBoundary(state, installed, replacement);
+    auto boundary = co_await CheckLiveTransferBoundary(
+        state, installed, replacement, publication_high_water);
     if (!boundary.ok()) co_return boundary.status();
     if (*boundary == MetaReplacementDisposition::kAbortSuperseded) {
       co_return detail::ClassifyPublisherSupersession(
@@ -2206,8 +2213,8 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
       ClearPublisherApplied(state);
       co_return sent;
     }
-    boundary =
-        co_await CheckLiveTransferBoundary(state, installed, replacement);
+    boundary = co_await CheckLiveTransferBoundary(state, installed, replacement,
+                                                  publication_high_water);
     if (!boundary.ok()) {
       ClearPublisherApplied(state);
       co_return boundary.status();
@@ -2240,8 +2247,8 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
     co_return sent;
   }
 
-  auto boundary =
-      co_await CheckLiveTransferBoundary(state, installed, replacement);
+  auto boundary = co_await CheckLiveTransferBoundary(
+      state, installed, replacement, publication_high_water);
   if (!boundary.ok()) {
     co_return boundary.status();
   }
@@ -2269,8 +2276,8 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
         !sent.ok()) {
       co_return sent;
     }
-    boundary =
-        co_await CheckLiveTransferBoundary(state, installed, replacement);
+    boundary = co_await CheckLiveTransferBoundary(state, installed, replacement,
+                                                  publication_high_water);
     if (!boundary.ok()) {
       co_return boundary.status();
     }
@@ -2305,7 +2312,8 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
     ClearPublisherApplied(state);
     co_return sent;
   }
-  boundary = co_await CheckLiveTransferBoundary(state, installed, replacement);
+  boundary = co_await CheckLiveTransferBoundary(state, installed, replacement,
+                                                publication_high_water);
   if (!boundary.ok()) {
     ClearPublisherApplied(state);
     co_return boundary.status();
@@ -2336,6 +2344,10 @@ bycorf::Task<absl::Status> SessionPublisherBody(
       co_return absl::ResourceExhaustedError(
           "Meta commit subscription overflowed for data-control publisher");
     }
+    // Projection/encoding work is bulk work even though its owner is the
+    // control worker. Let fresh I/O run before another publication slice.
+    co_await bycorf::Yield(*state->worker_);
+    if (state->closing_) break;
     const std::uint64_t high_water =
         state->core_->coordinator_->CommittedHighWater();
     if (!CommitPending(*state->commit_signal_,
@@ -2392,8 +2404,12 @@ bycorf::Task<absl::Status> SessionPublisherBody(
     if (!request_id.ok()) co_return request_id.status();
     update.request_id = *request_id;
     latest->full_state.control_revision = next.local.revision;
-    auto published =
-        co_await SendControlUpdateLive(state, *installed, *latest, update);
+    // This exact committed view was just projected and compared. Neither
+    // transfer boundaries nor Applied need to rebuild it unless a newer
+    // commit arrives. The cursor is local to this replacement, not installed_.
+    std::uint64_t publication_high_water = view.applied_index();
+    auto published = co_await SendControlUpdateLive(
+        state, *installed, *latest, update, &publication_high_water);
     if (!published.ok()) {
       co_return published.status();
     }
@@ -2430,20 +2446,25 @@ bycorf::Task<absl::Status> SessionPublisherBody(
     // against an intermediate control state.
     const std::uint64_t stable_high_water =
         state->core_->coordinator_->CommittedHighWater();
-    auto cached_stable_view =
-        CommittedViewAtLeast(*state->core_, stable_high_water);
-    if (!cached_stable_view.ok()) co_return cached_stable_view.status();
-    const MetaCommittedView& stable_view = **cached_stable_view;
-    auto stable =
-        ProjectNodeBounded(*state->core_, stable_view, state->node_id_);
-    if (!stable.ok() ||
-        EvaluateNodeReplacement(state->installed_->full_state,
-                                stable->full_state, state->node_id_) ==
-            MetaReplacementDisposition::kAbortSuperseded) {
-      continue;
+    if (detail::TransferBoundaryNeedsProjectionValidation(
+            state->commit_signal_->published_index_.load(
+                std::memory_order_acquire),
+            stable_high_water, publication_high_water)) {
+      auto cached_stable_view =
+          CommittedViewAtLeast(*state->core_, stable_high_water);
+      if (!cached_stable_view.ok()) co_return cached_stable_view.status();
+      const MetaCommittedView& stable_view = **cached_stable_view;
+      auto stable =
+          ProjectNodeBounded(*state->core_, stable_view, state->node_id_);
+      if (!stable.ok() ||
+          EvaluateNodeReplacement(state->installed_->full_state,
+                                  stable->full_state, state->node_id_) ==
+              MetaReplacementDisposition::kAbortSuperseded)
+        continue;
+      publication_high_water = stable_view.applied_index();
     }
     state->validated_committed_high_water_ = std::max(
-        state->validated_committed_high_water_, stable_view.applied_index());
+        state->validated_committed_high_water_, publication_high_water);
     state->projection_superseded_ = false;
     state->core_->options_.runtime_status_->PublishCurrent(
         state->node_id_, state->boot_id_, state->session_id_,
