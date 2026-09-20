@@ -20,6 +20,7 @@ Usage: gate_cluster_create.py META DATA CTL REDIS_CLI [workdir]
 
 import json
 import os
+from pathlib import Path
 import re
 import socket
 import ssl
@@ -1291,6 +1292,20 @@ def run_multi_group_case(workdir, automatic, interactive,
                     f"creating status omitted guidance: {status_result}")
             H.log(f"{name}: accepted create stayed incomplete; status named "
                   "the blocked Group/Node and next action")
+            # Genesis acceptance can precede bootstrap/local recovery. This
+            # case checks blocked creation, then ordinary clean shutdown;
+            # interruption during recovery has a separate fail-closed gate.
+            def local_recovery_complete():
+                for node in started_nodes:
+                    if not node.alive():
+                        return False
+                    log = Path(node.log_path).read_text()
+                    if any(f"worker[{worker}] direct-IO storage initialized"
+                           not in log for worker in range(node.workers)):
+                        return False
+                return True
+            H.wait_until("started Data nodes finish local recovery", 20,
+                         local_recovery_complete)
             for node in started_nodes:
                 node.terminate()
             meta.terminate()

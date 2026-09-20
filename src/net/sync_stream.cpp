@@ -389,7 +389,8 @@ struct SyncStream::Impl {
       if (received > 0) return static_cast<std::size_t>(received);
       if (tls_) {
         if (SSL_get_error(tls_->get(), received) == SSL_ERROR_ZERO_RETURN) {
-          return absl::UnavailableError("peer closed before completing reply");
+          return absl::UnavailableError(
+              "server closed before terminating its reply");
         }
         if (auto status =
                 WaitForSsl(tls_->get(), received, deadline_, "TLS read");
@@ -397,7 +398,8 @@ struct SyncStream::Impl {
           return status;
       } else {
         if (received == 0)
-          return absl::UnavailableError("peer closed before completing reply");
+          return absl::UnavailableError(
+              "server closed before terminating its reply");
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) return ErrnoStatus("read");
         if (auto status = WaitFor(fd_.get(), POLLIN, deadline_, "read");

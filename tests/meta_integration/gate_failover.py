@@ -62,10 +62,14 @@ class FailoverMetaNode(H.Node):
     def start(self, *args, **kwargs):
         variables = {
             PAUSE_BEGIN_HOOK.decode(): self.pause_after_begin_ms,
-            "LAVIK_TEST_PAUSE_FAILOVER_AFTER_AUTOMATIC_BEGIN_MS": self.pause_after_automatic_begin_ms,
             PAUSE_AUTHORIZE_HOOK.decode(): self.pause_after_authorize_ms,
             PAUSE_PREPARED_HOOK.decode(): self.pause_after_prepared_ms,
         }
+        if self.pause_after_automatic_begin_ms is not None:
+            # The automatic-failover gate also supplies this hook through its
+            # environment. An unset fixture override must preserve that cut.
+            variables["LAVIK_TEST_PAUSE_FAILOVER_AFTER_AUTOMATIC_BEGIN_MS"] = \
+                self.pause_after_automatic_begin_ms
         previous = {name: os.environ.get(name) for name in variables}
         try:
             # Commands use the advertised loopback admin endpoint. A short
