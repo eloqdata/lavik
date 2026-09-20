@@ -470,10 +470,16 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
         .changed_groups_ = {},
     };
     RecordLocation relocated;
+    // Like root relocation below, auxiliary relocation must bypass the
+    // foreground allocation gate. Salvage may hold the last registered write
+    // buffer while a foreground allocator owns that gate and waits for a
+    // buffer: joining its queue would prevent either side from completing.
+    // Retain the store lock and use the defrag reserve/heap-buffer fallback.
     absl::Status written = co_await WriteRecordLocked(
         key_store, record.db_id_, key, value, record.kind_, record.value_type_,
         0, digest, clear_txid ? 0 : record.txid_, record.mutation_sequence_,
-        true, true, record.external_, record.key_external_,
+        /*for_defrag=*/true, /*unlock_writer_while_waiting=*/false,
+        record.external_, record.key_external_,
         record.logical_size_, extents, &relocated, &source, nullptr, nullptr,
         nullptr, nullptr, nullptr, &partition, &descriptor);
     if (!written.ok()) co_return written;
