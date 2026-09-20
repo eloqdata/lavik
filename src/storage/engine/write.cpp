@@ -119,14 +119,9 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(
     SetLatencyTrace* trace, std::optional<std::uint16_t> routed_partition_id,
     const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
-  const Digest digest = ComputeDigest(key);
-  if (trace != nullptr) trace->key_lock_start_ns_ = SetTraceNowNanos();
-  auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
-  if (trace != nullptr) trace->key_lock_acquired_ns_ = SetTraceNowNanos();
-  co_return co_await SetLocked(db_id, key, digest, value, options, nullptr,
-                               replication, trace, routed_partition_id,
-                               mutation_precondition);
+  return SetWithLockState(db_id, key, ComputeDigest(key), value, options,
+                          nullptr, replication, trace, routed_partition_id,
+                          mutation_precondition, true);
 }
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
@@ -135,7 +130,31 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
     ReplicationCommandAppend* replication, SetLatencyTrace* trace,
     std::optional<std::uint16_t> routed_partition_id,
     const MutationPrecondition* mutation_precondition) {
+  return SetWithLockState(db_id, key, digest, value, options, tx, replication,
+                          trace, routed_partition_id, mutation_precondition,
+                          false);
+}
+
+Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
+    std::uint8_t db_id, std::string_view key, Digest digest,
+    std::string_view value, SetOptions options, TxShardWrites* tx,
+    ReplicationCommandAppend* replication, SetLatencyTrace* trace,
+    std::optional<std::uint16_t> routed_partition_id,
+    const MutationPrecondition* mutation_precondition, bool acquire_key_lock) {
   assert(db_id < kLogicalDatabaseCount);
+  if (acquire_key_lock && trace != nullptr) {
+    trace->key_lock_start_ns_ = SetTraceNowNanos();
+  }
+  // Keep the key guard in the writer's frame, before its store-state guard,
+  // so it still outlives every append wait and the final store-state unlock.
+  // Transaction callers already own this guard and must not reacquire it.
+  auto key_lock = acquire_key_lock ? co_await tx::CurrentTxShard().AcquireKey(
+                                         db_id, tx::FingerprintOf(digest),
+                                         tx::LockMode::kExclusive)
+                                   : tx::TxShard::Guard{};
+  if (acquire_key_lock && trace != nullptr) {
+    trace->key_lock_acquired_ns_ = SetTraceNowNanos();
+  }
   WorkerStore& store = CurrentStore();
   // The route hint is produced from this exact key immediately before the
   // cross-core handoff. Debug builds recheck that contract; optimized builds
