@@ -2376,20 +2376,21 @@ struct MetaControlClientService::Impl {
   }
 
   bycorf::Task<absl::Status> SleepHeartbeatInterval(
-      const std::shared_ptr<SessionState>& state) {
+      const std::shared_ptr<SessionState>& state, std::int64_t sent_at_ms) {
     const auto revision = state->desired_->local.revision;
-    const auto deadline =
-        std::chrono::steady_clock::now() + state->heartbeat_interval_;
+    // The lease starts when the challenge is written, not when its Ack is
+    // received. Charge response latency against the interval too; sleeping a
+    // full interval after a slow Ack can consume the next renewal's budget.
+    // An overdue iteration sends only one fresh heartbeat, never catch-up work.
+    const auto deadline_ms = sent_at_ms + state->heartbeat_interval_.count();
     while (!state->closing_ && state->desired_->local.revision == revision &&
            !state->heartbeat_projection_gate_.pause_requested()) {
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline) break;
+      const auto now_ms = LeaseClockMillis();
+      if (now_ms >= deadline_ms) break;
       const absl::Status slept = co_await bycorf::SleepFor(
           *state->worker_,
-          std::min(
-              deadline - now,
-              std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                  kDeadlinePollInterval)));
+          std::min(std::chrono::milliseconds(deadline_ms - now_ms),
+                   kDeadlinePollInterval));
       if (!slept.ok()) co_return slept;
     }
     co_return absl::OkStatus();
@@ -2633,8 +2634,8 @@ struct MetaControlClientService::Impl {
           control::MessagePriority::kAuthority,
           control::WireMessage(std::move(heartbeat)),
           [state, sent_at_ms, challenge_nonce] {
-            if (!challenge_nonce.has_value()) return;
             *sent_at_ms = LeaseClockMillis();
+            if (!challenge_nonce.has_value()) return;
             if (!state->challenge_tracker_
                      .MarkWritten(*challenge_nonce, **sent_at_ms)
                      .ok()) {
@@ -2656,8 +2657,8 @@ struct MetaControlClientService::Impl {
         ++heartbeat_sequence;
         continue;
       }
-      if (challenge_nonce.has_value() && !sent_at_ms->has_value()) {
-        result = absl::InternalError("lease challenge was not marked sent");
+      if (!sent_at_ms->has_value()) {
+        result = absl::InternalError("heartbeat was not marked sent");
         break;
       }
       const bool ack_still_pending =
@@ -2681,7 +2682,7 @@ struct MetaControlClientService::Impl {
       // A policy update can pause and resume entirely while Write/Wait is
       // suspended. Do not sleep on the superseded projection's cadence.
       if (state->desired_->local.revision != challenge_revision) continue;
-      result = co_await SleepHeartbeatInterval(state);
+      result = co_await SleepHeartbeatInterval(state, **sent_at_ms);
       if (!result.ok()) break;
     }
 

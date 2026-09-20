@@ -1057,6 +1057,15 @@ if (BUILD_TESTING)
         )
         set_tests_properties(meta_integration.gate_lease_policy PROPERTIES
           LABELS meta-integration TIMEOUT 180 RUN_SERIAL TRUE)
+        add_test(
+          NAME meta_integration.gate_heartbeat_cadence
+          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_heartbeat_cadence.py
+                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                  $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+        )
+        set_tests_properties(meta_integration.gate_heartbeat_cadence PROPERTIES
+          LABELS meta-integration TIMEOUT 120 RUN_SERIAL TRUE)
         if (TARGET lavik_fault_server)
           set(LAVIK_NATIVE_GATE_SERVER lavik_fault_server)
         endif()
