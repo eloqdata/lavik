@@ -953,6 +953,16 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
                           request.kind_ != CommandKind::kPublish,
       .client_mode_ = cluster::GetClientMode(),
   };
+  const bool retain_proof =
+      is_write || (cluster::GetClientMode() == ClientMode::kSingle &&
+                   request.spec_ != nullptr &&
+                   (request.spec_->flags_ & kCmdMultiShard) != 0);
+  if (!retain_proof) {
+    const auto decision =
+        runtime->authority_guard_.DecideNow(view, cluster::LeaseClockNow());
+    return EmitClusterDecision(decision, request.connection_tls_, reply_builder,
+                               reply);
+  }
   auto admission =
       runtime->authority_guard_.CaptureAndAdmit(view, cluster::LeaseClockNow());
   if (!EmitClusterDecision(admission.decision(), request.connection_tls_,
@@ -961,13 +971,9 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
     // and storage checks. Ordinary Single reads take a fresh synchronous
     // admission after waits, without allocating a shared proof. The local
     // admission owns any borrowed MOVED host until its reply is encoded.
-    if (is_write || (cluster::GetClientMode() == ClientMode::kSingle &&
-                     request.spec_ != nullptr &&
-                     (request.spec_->flags_ & kCmdMultiShard) != 0)) {
-      request.cluster_authority_admission_ =
-          std::make_shared<const cluster::AuthorityAdmission>(
-              std::move(admission));
-    }
+    request.cluster_authority_admission_ =
+        std::make_shared<const cluster::AuthorityAdmission>(
+            std::move(admission));
     return false;
   }
   return true;
@@ -11742,10 +11748,10 @@ const char* CommandServingGenerationError(
                                     .connection_readonly_ = true,
                                     .loading_allowed_ = false,
                                     .client_mode_ = ClientMode::kSingle};
-    const auto admission =
-        cluster::GetClusterRuntime()->authority_guard_.CaptureAndAdmit(
+    const auto decision =
+        cluster::GetClusterRuntime()->authority_guard_.DecideNow(
             view, cluster::LeaseClockNow());
-    switch (admission.decision().kind_) {
+    switch (decision.kind_) {
       case cluster::Decision::Kind::kServe:
       case cluster::Decision::Kind::kServeStaleRead:
         break;

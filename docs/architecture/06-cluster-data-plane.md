@@ -30,7 +30,8 @@ seams:
 - `TopologyCache` holds the committed `ServingState` and publishes it
   atomically.
 - `AuthorityGuard` is the request-path authority boundary:
-  `CaptureAndAdmit` records the routing and finite-lease proof, while
+  `DecideNow` checks synchronous reads against the current authority;
+  `CaptureAndAdmit` retains the same routing and finite-lease proof, while
   `RegisterAndRecheck` atomically registers in-flight work and closes the
   publication race. Free `Admit` and `AuthorityUnchanged` are pure routing
   helpers, not request-path substitutes.

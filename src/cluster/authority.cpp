@@ -389,31 +389,48 @@ AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
   const auto slots = AuthoritySlots(request);
   admission.slots_.assign(slots.begin(), slots.end());
   admission.single_group_ = request.client_mode_ == ClientMode::kSingle;
-  admission.decision_ = Admit(admission.state_.get(), request);
-
-  if (admission.decision_.kind_ != Decision::Kind::kServe ||
-      admission.state_ == nullptr || admission.slots_.empty()) {
-    return admission;
-  }
-
-  // Only an owner serving its own group consumes Meta authority. Replica
-  // READONLY decisions use kServeStaleRead and redirects carry no admission.
-  const GroupView* group =
-      admission.state_->GroupForSlot(admission.slots_.front());
-  if (group == nullptr ||
-      group->primary_node_index_ != admission.state_->SelfNodeIndex()) {
-    return admission;
-  }
-
-  const AuthorityState& authority = CurrentAuthority();
-  admission.gate_generation_ = authority.generation_;
-  admission.lease_revision_ = authority.revision_;
-  admission.lease_checked_ = true;
-  if (!LeaseCovers(authority, *admission.state_, admission.slots_, now,
-                   &admission.lease_deadline_)) {
-    admission.decision_.kind_ = Decision::Kind::kClusterDownUnbound;
-  }
+  admission.decision_ =
+      DecideWithLease(admission.state_.get(), request, now, &admission);
   return admission;
+}
+
+Decision AuthorityGuard::DecideNow(const RequestView& request,
+                                   MonotonicTime now) const {
+  std::uint64_t version = 0;
+  const auto& state = CurrentCachedWithVersion(topology_, &version);
+  return DecideWithLease(state.get(), request, now, nullptr);
+}
+
+Decision AuthorityGuard::DecideWithLease(const ServingState* state,
+                                         const RequestView& request,
+                                         MonotonicTime now,
+                                         AuthorityAdmission* proof) const {
+  Decision decision = Admit(state, request);
+  const auto slots = AuthoritySlots(request);
+  if (decision.kind_ != Decision::Kind::kServe || state == nullptr ||
+      slots.empty()) {
+    return decision;
+  }
+
+  // Only an Owner consumes Meta authority. A synchronous read need not retain
+  // shared ownership or construct the write proof, but uses exactly the same
+  // lease/session checks as an admission that survives storage preparation.
+  const GroupView* group = state->GroupForSlot(slots.front());
+  if (group == nullptr ||
+      group->primary_node_index_ != state->SelfNodeIndex()) {
+    return decision;
+  }
+  const AuthorityState& authority = CurrentAuthority();
+  if (proof != nullptr) {
+    proof->gate_generation_ = authority.generation_;
+    proof->lease_revision_ = authority.revision_;
+    proof->lease_checked_ = true;
+  }
+  if (!LeaseCovers(authority, *state, slots, now,
+                   proof != nullptr ? &proof->lease_deadline_ : nullptr)) {
+    decision.kind_ = Decision::Kind::kClusterDownUnbound;
+  }
+  return decision;
 }
 
 RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,

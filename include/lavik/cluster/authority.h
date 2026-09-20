@@ -228,6 +228,12 @@ class AuthorityGuard {
   AuthorityAdmission CaptureAndAdmit(const RequestView& request,
                                      MonotonicTime now) const;
 
+  // Synchronous verdict using the same topology and lease rules, without
+  // retaining a proof. Consume any borrowed MOVED endpoint before another
+  // topology-cache lookup on this thread; never carry it across suspension.
+  // Mutations still require CaptureAndAdmit and its registration/final checks.
+  Decision DecideNow(const RequestView& request, MonotonicTime now) const;
+
   // Lower-level verification of topology, session generation, and lease
   // deadline captured at admission. This call does not enter an in-flight cell
   // and is not by itself a safe request-mutation boundary; request paths use
@@ -275,6 +281,9 @@ class AuthorityGuard {
     std::uint64_t revision_ = 0;
   };
 
+  Decision DecideWithLease(const ServingState* state,
+                           const RequestView& request, MonotonicTime now,
+                           AuthorityAdmission* proof) const;
   static std::optional<AuthorityAnchor> LocalPrimaryAnchor(
       const ServingState& state, std::string_view group_id);
   bool LeaseCovers(const AuthorityState& authority, const ServingState& state,

@@ -283,6 +283,41 @@ TEST(ClusterAuthoritySnapshotTest, SingleClientHonorsFullGroupServingGates) {
             Decision::Kind::kLoading);
 }
 
+TEST(ClusterAuthoritySnapshotTest,
+     SynchronousReadUsesCurrentLeaseAndPopulation) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  auto group = MakeGroup(kGroupA, kNodeAIndex, 0, 16383);
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  auto read = MakeRequest(slots, false);
+  read.client_mode_ = lavik::ClientMode::kSingle;
+  EXPECT_EQ(control.authority.DecideNow(read, start).kind_,
+            Decision::Kind::kLoading);
+  ASSERT_TRUE(
+      control.topology.Install(BuildSingleState(group), start, 10ms).ok());
+  EXPECT_EQ(control.authority.DecideNow(read, start + 9ms).kind_,
+            Decision::Kind::kServe);
+  ASSERT_TRUE(
+      control.topology.Install(BuildSingleState(group), start + 9ms, 10ms)
+          .ok());
+  EXPECT_EQ(control.authority.DecideNow(read, start + 18ms).kind_,
+            Decision::Kind::kServe);
+  EXPECT_EQ(control.authority.DecideNow(read, start + 19ms).kind_,
+            Decision::Kind::kClusterDownUnbound);
+  EXPECT_FALSE(
+      control.topology.Install(BuildSingleState(group), start + 19ms, 10ms)
+          .ok());
+  group.population_ready_ = false;
+  control.cache.Publish(BuildSingleState(group));
+  EXPECT_EQ(control.authority.DecideNow(read, start + 20ms).kind_,
+            Decision::Kind::kLoading);
+  group.population_ready_ = true;
+  control.cache.Publish(BuildSingleState(group, true));
+  EXPECT_EQ(control.authority.DecideNow(read, start + 21ms).kind_,
+            Decision::Kind::kServeStaleRead);
+}
+
 TEST(ClusterAuthoritySnapshotTest, CachedReadExpiresWithoutAnyPublication) {
   using namespace std::chrono_literals;
   TestAuthorityControl control;
