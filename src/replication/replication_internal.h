@@ -200,11 +200,9 @@ std::uint64_t SteadyNanos() noexcept;
 std::uint64_t SecondsSince(std::uint64_t started_nanos) noexcept;
 
 #if LAVIK_FAULTS_ENABLED
-// A configured path turns the corresponding promotion stall into a
-// deterministic coroutine barrier. Tests observe the created file, then
-// supersede the action through the public reconciliation API. The runner
-// resumes only after that action is no longer current, eliminating timing as
-// evidence for which side of the durability boundary was exercised.
+// Signal that a test-only coroutine barrier has been reached. The caller
+// owns the release condition (for example action replacement or marker removal)
+// so tests need not infer progress from elapsed time.
 absl::Status SignalFaultBarrier(const char* variable,
                                 std::string_view barrier_name);
 

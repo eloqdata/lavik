@@ -4955,6 +4955,21 @@ auto ReplicationManager::ReplicationGroup::InstallRecoveredPopulation(
   const auto old_population = cluster_rebuild_;
   const auto old_action = cluster_failover_action_;
   const auto old_follow = cluster_follow_owner_;
+  LAVIK_FAULT_INJECT({
+    // Hold the same snapshot that the retained-history await must preserve.
+    // The process test removes this marker to release startup recovery.
+    const char* barrier = std::getenv("LAVIK_RECOVERY_INSTALL_BARRIER_PATH");
+    if (barrier != nullptr && *barrier != '\0') {
+      absl::Status signalled = SignalFaultBarrier(
+          "LAVIK_RECOVERY_INSTALL_BARRIER_PATH", "population recovery");
+      if (!signalled.ok()) co_return signalled;
+      while (::access(barrier, F_OK) == 0) {
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(10));
+        if (!waited.ok()) co_return waited;
+      }
+    }
+  });
   auto& identity = population.identity_;
   identity.target_boot_id_ = boot_id_;
   identity.directive_revision_ = 1;

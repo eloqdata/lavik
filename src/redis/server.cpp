@@ -1072,9 +1072,9 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
     // import has also completed successfully on every worker.
     ready_.store(true, std::memory_order_release);
     if (cluster::GetClusterRuntime() != nullptr) {
-      // Meta topology may not have arrived yet. The installer remembers this
-      // process-local readiness bit and folds it into the first complete FDS;
-      // it is never persisted as authority.
+      // This releases the Meta client's startup wait. The installer folds
+      // this process-local readiness bit into the first complete FDS; it is
+      // never persisted as authority.
       const absl::Status published =
           cluster::GetClusterRuntime()->node_control_installer_.SetStorageReady(
               true);

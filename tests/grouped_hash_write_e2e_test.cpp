@@ -844,6 +844,11 @@ TEST(GroupedHashWriteE2e, PublicationHandoffOomFailsClosedAndRecoversOldGraph) {
 #endif
   const std::string old_value(20 * 1024, 'o');
   const std::string new_value(20 * 1024, 'n');
+  // The deadline must still be in the future when storage selects the grouped
+  // metadata path. An elapsed deadline takes the tombstone path instead and
+  // never reaches the publication-handoff fault this test is exercising.
+  constexpr auto expiration_ttl = 5000ms;
+  const std::string expiration_ms = std::to_string(expiration_ttl.count());
   struct Case {
     std::vector<std::string> initial_, mutation_, read_;
     std::string expected_;
@@ -865,7 +870,7 @@ TEST(GroupedHashWriteE2e, PublicationHandoffOomFailsClosedAndRecoversOldGraph) {
                                  {"ZSCORE", "handoff", old_value},
                                  "1"},
                                 {{"HSET", "handoff", "field", old_value},
-                                 {"PEXPIRE", "handoff", "1"},
+                                 {"PEXPIRE", "handoff", expiration_ms},
                                  {"HGET", "handoff", "field"},
                                  old_value}};
   for (const auto& test : cases) {
@@ -891,6 +896,13 @@ TEST(GroupedHashWriteE2e, PublicationHandoffOomFailsClosedAndRecoversOldGraph) {
       EXPECT_NE(failed.text_.find("OOM"), std::string::npos);
       EXPECT_EQ(client.Command(test.read_).kind_, '-');
       EXPECT_EQ(client.Command({"TYPE", "handoff"}).kind_, '-');
+      if (test.mutation_.front() == "PEXPIRE") {
+        // A failed published root must remain unreadable even after its
+        // tentative TTL elapses; expiry must not hide the failed decision.
+        std::this_thread::sleep_for(expiration_ttl + 100ms);
+        EXPECT_EQ(client.Command(test.read_).kind_, '-');
+        EXPECT_EQ(client.Command({"TYPE", "handoff"}).kind_, '-');
+      }
       // The fixture terminates this fail-stopped child without committing its
       // undecided root. Recovery must select the preceding complete graph.
     }
