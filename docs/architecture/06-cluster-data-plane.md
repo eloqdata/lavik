@@ -125,9 +125,10 @@ in-flight work.
 Request-path reads go through a thread-local snapshot cache that checks the
 publication sequence before reusing its snapshot. Each worker has an
 independent ownership handle retaining the same published topology object;
-requests retain that handle rather than directly sharing global snapshot
-ownership. Retained admissions remain valid across cache refresh, worker
-exit, and cross-worker execution. The topology contents and per-group
+requests that need a retained admission own that handle rather than directly
+sharing global snapshot ownership. Synchronous decisions borrow the worker's
+handle without extending its lifetime. Retained admissions remain valid across
+cache refresh, worker exit, and cross-worker execution. The topology contents and per-group
 in-flight cells remain shared, preserving snapshot identity and fence drains.
 
 Readiness is per group and deliberately excludes the grant bit: a fenced
@@ -232,17 +233,19 @@ Replication replay is exempt from every re-check: applied commands are
 already ordered by the replication stream and carry no client fencing
 semantics.
 
-Reads are intentionally not re-checked. A read gated at admission may observe
-data committed before a concurrent fence — the same staleness window Redis
-Cluster clients accept across failover. Writes have no such window: the
-combination of admission, the owner-side choke points, the final storage
+Ordinary Cluster reads are intentionally not re-checked for authority. A read
+gated at admission may observe data committed before a concurrent fence — the
+same staleness window Redis Cluster clients accept across failover. Single
+reads recheck their Group authority at DB admission and after a worker hop;
+both modes retain population-generation fencing. Writes have no such window:
+the combination of admission, the owner-side choke points, the final storage
 precondition, and per-group tokens guarantees a stale topology causes
 redirection or temporary unavailability, never a second writer.
 
-Only writes retain ownership of the admitted snapshot across suspension
-points. Reads finish their decision while the thread-local cache keeps the
-snapshot alive and carry no per-request shared reference afterwards, matching
-their intentionally absent owner-side re-check.
+Writes and Single multi-shard reads retain ownership of the admitted snapshot
+across suspension points. Ordinary reads finish each decision while the
+thread-local cache keeps the snapshot alive and carry no per-request shared
+reference afterwards. A Single read's later check uses the current snapshot.
 
 Executions register their admitted groups when they pass the re-check and
 unregister at completion, so a fence publisher can observe whether any

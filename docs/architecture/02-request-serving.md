@@ -135,17 +135,19 @@ racing closure is either rejected or remains visible to the drain.
    `TRYAGAIN`. Cluster mode disables the
    standalone replica-MOVED shim: a population source transfers data but never
    supplies client-routing authority. The cluster gate also runs at `MULTI`
-   queue time so a rejected command aborts the queued transaction. An admitted
-   request carries its key slots and the snapshot it was admitted against into
-   execution for the owner-side authority re-check.
+   queue time so a rejected command aborts the queued transaction. Managed
+   Single uses the same Group authority without redirects. Writes and Single
+   multi-shard reads retain their admission snapshot and key slots for execution
+   checks; synchronous reads borrow the worker's snapshot.
 5. `ExecuteCommand` and `ExecuteAdmittedCommand` reserve replication publisher
    capacity for source writes before database/key work. Eligible single-key
    writes are moved directly to their owner so admission and mutation share the
    owner-local fast path.
 6. `ExecuteCommandBody` enforces replica write policy and memory admission,
    manages database and replication gates, then calls the relevant local,
-   storage, transaction, blocking, RDB, or administrative handler. In cluster
-   mode, admitted writes re-check their authority against the current
+   storage, transaction, blocking, RDB, or administrative handler. Single reads
+   recheck Group authority after DB admission and after a worker hop. In either
+   managed mode, admitted writes re-check their authority against the current
    `ServingState` after these outer admissions and before the handler runs;
    transactional writes also re-check per shard through a validator hook on
    `tx::Transaction`. Because a handler can still suspend on key/store locks,
