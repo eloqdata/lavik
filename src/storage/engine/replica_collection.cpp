@@ -383,14 +383,23 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
           after.entries_.push_back(std::move(field));
       }
     }
-    for (auto& field : incoming.entries_) {
-      if (std::any_of(
-              after.entries_.begin(), after.entries_.end(),
-              [&](const auto& other) { return other.field_ == field.field_; }))
-        co_return absl::InvalidArgumentError(
-            "replica collection contains a duplicate field/member");
+    for (auto& field : incoming.entries_)
       after.entries_.push_back(std::move(field));
-    }
+    // A batch can touch most existing groups. Scanning that accumulated image
+    // once per incoming field makes large-key FULL sync quadratic and can
+    // monopolize the worker for seconds. Hash/Set order is not semantic: sort
+    // the already-owned image without a second index, then check exact binary
+    // identities, including duplicates across previously committed batches.
+    std::sort(after.entries_.begin(), after.entries_.end(),
+              [](const auto& left, const auto& right) {
+                return left.field_ < right.field_;
+              });
+    if (std::adjacent_find(after.entries_.begin(), after.entries_.end(),
+                           [](const auto& left, const auto& right) {
+                             return left.field_ == right.field_;
+                           }) != after.entries_.end())
+      co_return absl::InvalidArgumentError(
+          "replica collection contains a duplicate field/member");
     const auto written = co_await CommitGroupedHashMutationLocked(
         store, partition, stage.db_id_, stage.key_, digest, previous,
         std::move(after), std::move(touched),

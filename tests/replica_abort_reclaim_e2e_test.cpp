@@ -15,6 +15,7 @@
  */
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -93,10 +94,11 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
   explicit ReplicaAbortReclaimService(
       StorageEngine* storage,
       lavik::storage::ValueType large_type = lavik::storage::ValueType::kNone,
-      bool verify_ingest = false)
+      bool verify_ingest = false, bool abort_only = false)
       : storage_(storage),
         large_type_(large_type),
-        verify_ingest_(verify_ingest) {}
+        verify_ingest_(verify_ingest),
+        abort_only_(abort_only) {}
 
   void Prepare(unsigned thread_count) override {
     Check(thread_count == 1, "replica-reclaim test requires one worker");
@@ -108,7 +110,9 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
     lavik::BindMemoryAccountingShard(worker.id());
     lavik::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
     result_ = co_await storage_->InitializeWorker(worker);
-    if (verify_ingest_) {
+    if (abort_only_) {
+      if (result_.ok()) result_ = co_await ExerciseSmallStackAbort();
+    } else if (verify_ingest_) {
       if (result_.ok()) result_ = co_await VerifyOrdinaryCollectionIngest();
     } else if (large_type_ != lavik::storage::ValueType::kNone) {
       if (result_.ok()) result_ = co_await ExerciseLargeCollection();
@@ -135,6 +139,31 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
+  bycorf::Task<absl::Status> ExerciseSmallStackAbort() {
+    using namespace lavik::storage;
+    std::uint64_t session = 1800;
+    for (const auto type : {ValueType::kHash, ValueType::kSet}) {
+      ++session;
+      auto reset = co_await ResetFullRoot(session);
+      if (!reset.ok()) co_return reset.status();
+      const auto key = "abort-stack-" + std::to_string(unsigned(type));
+      const auto partition = RedisSlot(key);
+      const auto sent = co_await SendCollection(
+          session, (*reset)[partition].replication_epoch_, key, type, 1, 1);
+      if (!sent.ok()) co_return sent;
+      // Abort an uncommitted, multi-page grouped object among all 16,384
+      // partitions. Both empty stages and local retirement/pin cleanup must
+      // avoid chains of immediately completed Task awaits in Debug builds.
+      const auto aborted = co_await storage_->AbortReplicaRoot(session);
+      if (!aborted.ok()) co_return aborted;
+      Check(!co_await storage_->Exists(0, key),
+            "small-stack abort exposed an uncommitted collection");
+      storage_->SetReplicaLoading(false);
+    }
+    std::cout << "small-stack grouped replica abort PASS" << std::endl;
+    co_return absl::OkStatus();
+  }
+
   bycorf::Task<absl::Status> VerifyOrdinaryCollectionIngest() {
     using namespace lavik::storage;
     for (auto type : {ValueType::kHash, ValueType::kSet, ValueType::kList,
@@ -503,12 +532,18 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
               << " rss=" << memory.rss_bytes_ << std::endl;
     co_return absl::OkStatus();
   }
-  static std::string CollectionBytes(lavik::storage::ValueType type,
-                                     char fill) {
+  static std::string CollectionBytes(lavik::storage::ValueType type, char fill,
+                                     std::optional<unsigned> duplicate = {}) {
     using namespace lavik::storage;
     CollectionPage page{.value_type_ = type};
     for (unsigned i = 0; i < kStreamEntries; ++i) {
-      const auto name = std::to_string(i);
+      // Include empty and binary field identities; uniqueness is not C-string
+      // equality. Duplicate fixtures repeat the first identity in one batch
+      // or after an earlier batch has already published its staged root.
+      const auto ordinal = duplicate == i ? 0 : i;
+      const auto name =
+          ordinal == 0 ? std::string{}
+                       : std::string("field\0", 6) + std::to_string(ordinal);
       if (type == ValueType::kHash)
         page.fields_.push_back({name, std::string(2048, fill)});
       else if (type == ValueType::kSortedSet)
@@ -537,7 +572,11 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
                                             lavik::storage::ValueType type,
                                             std::uint64_t sequence,
                                             unsigned mode, char fill = 'v') {
-    const auto encoded = CollectionBytes(type, fill);
+    const auto duplicate = mode == 3 ? std::optional<unsigned>(1)
+                           : mode == 4
+                               ? std::optional<unsigned>(kStreamEntries - 1)
+                               : std::nullopt;
+    const auto encoded = CollectionBytes(type, fill, duplicate);
     SnapshotRecord frame{.kind_ = SnapshotRecord::Kind::kValueBegin,
                          .db_id_ = 0,
                          .db_epoch_ = storage_->DbEpoch(0),
@@ -583,7 +622,9 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
       const std::string key =
           "native-collection-" + std::to_string(unsigned(type));
       const auto partition = RedisSlot(key);
-      for (unsigned mode = 0; mode < 3; ++mode) {
+      const unsigned modes =
+          type == ValueType::kHash || type == ValueType::kSet ? 5 : 3;
+      for (unsigned mode = 0; mode < modes; ++mode) {
         ++session;
         std::vector<ReplicaPartitionEpoch> epochs;
         if (mode == 0) {
@@ -603,17 +644,20 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
         }
         const auto epoch = mode == 0 ? epochs.front().replication_epoch_
                                      : epochs[partition].replication_epoch_;
-        if (mode == 2) {
+        if (mode >= 2) {
           const auto seeded =
               co_await SendCollection(session, epoch, key, type, 1, 0);
           if (!seeded.ok()) co_return seeded;
         }
         const auto sent = co_await SendCollection(session, epoch, key, type,
-                                                  mode == 2 ? 2 : 1, mode,
-                                                  mode == 2 ? 'x' : 'v');
-        if (mode == 2) {
+                                                  mode >= 2 ? 2 : 1, mode,
+                                                  mode >= 2 ? 'x' : 'v');
+        if (mode >= 2) {
           Check(!sent.ok(),
-                "truncated collection stream unexpectedly committed");
+                "malformed collection stream unexpectedly committed");
+          if (mode >= 3)
+            Check(absl::IsInvalidArgument(sent),
+                  "duplicate collection identity did not fail validation");
           auto restored = co_await storage_->ReadRawValue(0, key);
           if (!restored.ok()) co_return restored.status();
           Check(restored->value_type_ == type &&
@@ -872,12 +916,13 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
   StorageEngine* storage_ = nullptr;
   lavik::storage::ValueType large_type_;
   bool verify_ingest_ = false;
+  bool abort_only_ = false;
   bycorf::Worker* worker_ = nullptr;
   absl::Status result_ = absl::UnknownError("test service did not run");
 };
 
 int Run(const std::string& path, lavik::storage::ValueType large_type,
-        bool verify_ingest = false) {
+        bool verify_ingest = false, bool abort_only = false) {
   StorageEngineOptions options;
   options.data_files_ = {path};
   options.buffers_.registered_bytes_ = 64 * kMiB;
@@ -897,7 +942,8 @@ int Run(const std::string& path, lavik::storage::ValueType large_type,
     return 1;
   }
   lavik::tx::TxRuntime::Create(1);
-  ReplicaAbortReclaimService service(&storage, large_type, verify_ingest);
+  ReplicaAbortReclaimService service(&storage, large_type, verify_ingest,
+                                     abort_only);
   bycorf::Server server;
   server.AddService(&service);
   bycorf::ServerOptions runtime;
@@ -924,6 +970,21 @@ int main(int argc, char** argv) {
     using lavik::storage::ValueType;
     if (argc == 3 && std::string_view(argv[1]) == "--verify-ingest")
       return Run(argv[2], ValueType::kNone, true);
+    if (argc == 2 && std::string_view(argv[1]) == "--small-stack-abort") {
+      // Set the default before the runtime creates its worker. One MiB keeps
+      // the regression small while detecting input-sized native stack growth;
+      // the production incident exhausted an ordinary eight-MiB worker stack.
+      pthread_attr_t attributes;
+      Check(pthread_getattr_default_np(&attributes) == 0 &&
+                pthread_attr_setstacksize(&attributes, kMiB) == 0 &&
+                pthread_setattr_default_np(&attributes) == 0,
+            "cannot set the abort regression worker stack");
+      pthread_attr_destroy(&attributes);
+      ScopedDataFile data_file(lavik::test::TestDataPath("lavik-abort-stack-") +
+                               std::to_string(::getpid()) + ".data");
+      data_file.Create();
+      return Run(data_file.path(), ValueType::kNone, false, true);
+    }
     ValueType large_type = ValueType::kNone;
     if (argc == 2 && std::string_view(argv[1]) == "--large-list")
       large_type = ValueType::kList;
