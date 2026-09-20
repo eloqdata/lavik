@@ -8432,6 +8432,9 @@ auto ReplicationManager::ReplicationGroup::TrackReplicaOnlineStage(
   state->stage_status_ =
       co_await StageReplicaOnlineCommands(session, flow_id, state);
   state->stage_done_ = true;
+  // Ingress may be waiting for queue capacity rather than socket I/O. Its
+  // predicate includes stage_done_, so terminal staging must wake it too.
+  state->capacity_ready_.NotifyAll(*bycorf::ThisWorker().self_);
   state->stage_done_ready_.NotifyAll(*bycorf::ThisWorker().self_);
   state->completion_ready_.NotifyAll(*bycorf::ThisWorker().self_);
   if (!state->stage_status_.ok()) {
@@ -8447,6 +8450,9 @@ auto ReplicationManager::ReplicationGroup::TrackReplicaOnlineAcks(
   state->ack_status_ =
       co_await AckReplicaOnlineCommands(stream, session, flow_id, state);
   state->ack_done_ = true;
+  // A full ingress queue must observe terminal ACK failure even when no
+  // consumer will ever pop another command and publish capacity again.
+  state->capacity_ready_.NotifyAll(*bycorf::ThisWorker().self_);
   state->ack_done_ready_.NotifyAll(*bycorf::ThisWorker().self_);
   state->completion_capacity_ready_.NotifyAll(*bycorf::ThisWorker().self_);
   if (!state->ack_status_.ok()) {
@@ -8556,6 +8562,11 @@ auto ReplicationManager::ReplicationGroup::RunReplicaOnlineFlowData(
     }
     while (state->commands_.size() >= kOnlineQueueCommands &&
            !state->stage_done_ && !state->ack_done_) {
+      LAVIK_FAULT_INJECT(
+          if (std::getenv("LAVIK_REPLICATION_REPORT_ONLINE_BACKPRESSURE") !=
+              nullptr) {
+            spdlog::info("replica online ingress waiting for command capacity");
+          });
       co_await state->capacity_ready_.Wait();
     }
     if (state->stage_done_ || state->ack_done_) {

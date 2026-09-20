@@ -611,6 +611,24 @@ def small_receive_window(root):
         assert C.readonly_get(target, "{window}key-511") == "v" * 1024
 
 
+def target_queue_shutdown(root):
+    # Hold the FIFO consumer until the receiver has filled its bounded queue.
+    # Socket shutdown cannot wake that capacity wait: terminal stage/ACK
+    # publication must explicitly notify ingress before the flow can join.
+    with pair(root, "target-queue-shutdown", source_workers=1, target_workers=1,
+              target_faults={
+                  "LAVIK_REPLICATION_PAUSE_BEFORE_COMMAND_APPLY_MS": "8000",
+                  "LAVIK_REPLICATION_REPORT_ONLINE_BACKPRESSURE": "1",
+              }) as (meta, _source, target, writer):
+        ready(meta)
+        for i in range(600):
+            assert writer.call("SET", "{queue-shutdown}key", str(i)) == "OK"
+        H.wait_until("replica ingress is waiting for queue capacity", 10, lambda:
+                     "replica online ingress waiting for command capacity" in
+                     Path(target.log_path).read_text())
+        target.terminate()
+        assert "replication targets quiesced before storage flush" in Path(target.log_path).read_text()
+
 def main():
     C.META, C.DATA, C.CTL, C.REDIS_CLI = map(os.path.abspath, sys.argv[1:5])
     H.set_tag("native-replication")
@@ -625,6 +643,7 @@ def main():
             full_tail_publish_before_reset(root)
             full_tail_expiration_effects(root)
             small_receive_window(root)
+            target_queue_shutdown(root)
             handoff_order(root)
             cancelled_handoff(root)
             committed_cursor_reconnect(root, "cancel-apply", target_faults={
