@@ -1015,6 +1015,61 @@ TEST(ScanHashMapTest, SaturatedAddressSpaceUsesBucketChains) {
   EXPECT_EQ(map.size(), kEntries / 2);
 }
 
+TEST(ScanHashMapTest, ConstAndMutableLookupCrossBucketBoundaries) {
+  // One primary bucket forces both lookup continuations through several
+  // overflow buckets. Vary key sizes to cover inline and libc comparisons,
+  // as well as one-byte and multi-byte length metadata.
+  ScanHashMap<std::uint64_t, 0> map;
+  constexpr std::size_t lengths[] = {7, 8, 16, 17, 127, 128, 16384};
+  std::vector<std::string> keys;
+  for (std::size_t i = 0; i < 48; ++i) {
+    std::string key = "key-" + std::to_string(i);
+    key.resize(lengths[i % std::size(lengths)], 'x');
+    ASSERT_NE(map.InsertNew(ComputeDigest(key), key, i), nullptr);
+    keys.push_back(std::move(key));
+  }
+  auto check = [&](std::size_t erased_stride) {
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      const auto digest = ComputeDigest(keys[i]);
+      const auto* entry = std::as_const(map).Find(digest, keys[i]);
+      EXPECT_EQ(map.Find(digest, keys[i]), entry);
+      if (erased_stride != 0 && i % erased_stride == 0) {
+        EXPECT_EQ(entry, nullptr);
+      } else {
+        ASSERT_NE(entry, nullptr);
+        EXPECT_EQ(entry->value(), i);
+      }
+    }
+  };
+  check(0);
+  for (std::size_t i = 0; i < keys.size(); i += 3) {
+    ASSERT_TRUE(map.Erase(ComputeDigest(keys[i]), keys[i]));
+  }
+  check(3);
+}
+
+TEST(ScanHashMapTest, CandidateExceptionInOverflowPreservesTraversal) {
+  ScanHashMap<std::uint64_t, 0> map;
+  const Digest digest{0xff00000000000007ULL};
+  for (std::uint64_t i = 0; i < 36; ++i) {
+    ASSERT_NE(map.InsertNew(digest, "external", i, false), nullptr);
+  }
+  const auto before = map.FindCandidates(digest, "external");
+  unsigned calls = 0;
+  EXPECT_THROW(map.FindCandidateIf(digest, "external",
+                                   [&](const auto&) -> bool {
+                                     if (++calls == 13) throw 7;
+                                     return false;
+                                   }),
+               int);
+  EXPECT_EQ(calls, 13);
+  EXPECT_EQ(map.FindCandidates(digest, "external"), before);
+  EXPECT_EQ(map.FindCandidateIf(
+                digest, "external",
+                [](const auto& entry) { return entry.value() == 35; }),
+            before.back());
+}
+
 TEST(ScanHashMapTest,
      ScanDoesNotMissStableEntriesWhenMutationOccursBetweenCalls) {
   ScanHashMap<std::uint64_t> map;
