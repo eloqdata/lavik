@@ -46,6 +46,11 @@ def run(root, meta, data, ctl, mode, case):
     for node in fixture.data_nodes:
         node.environment = {**os.environ, "LAVIK_TEST_RECOVERY_TRACE": "1"}
     source.environment["LAVIK_TEST_NATIVE_EVENT_CUT_FILE"] = str(cut_file)
+    if case == "complete":
+        # Candidate and donor receive recovery authorization independently.
+        # Keep the real population/coverage, but make the first authorized
+        # handshake fail exactly as it would before the donor installs FDS.
+        donor2.environment["LAVIK_TEST_RECOVERY_REJECT_FIRST_REQUEST"] = "1"
     keys = [flow_key(flow) for flow in range(2)]
     if case in ("budget", "donor-failure", "leader-change", "candidate-replace"):
         donor1.environment["LAVIK_TEST_RECOVERY_EFFECT_DELAY_MS"] = "3000"
@@ -162,6 +167,8 @@ def run(root, meta, data, ctl, mode, case):
         elif case == "coverage-gap":
             assert reason == "coverage-unavailable" and recovered == [3, 3], (reason, recovered)
         if case == "complete":
+            assert Path(donor2.log_path).read_text().count(
+                "test recovery donor rejected first discovery request") == 1
             for donor, flow in ((donor1, 0), (donor2, 1)):
                 log = Path(donor.log_path).read_text()
                 for delta in (3, 4):

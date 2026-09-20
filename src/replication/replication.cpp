@@ -2958,6 +2958,17 @@ auto ReplicationManager::ReplicationGroup::ServeRecoveryDonor(
     co_return absl::PermissionDeniedError(
         "native recovery export has no current FDS scope");
   }
+  // Exercise independently delivered FDS: a healthy donor can reject the
+  // first discovery request before its matching scope is installed. Inject
+  // only after real authorization, before advertising any population data.
+  LAVIK_FAULT_INJECT(
+      if (!scope->test_rejected_first_request_ &&
+          std::getenv("LAVIK_TEST_RECOVERY_REJECT_FIRST_REQUEST") != nullptr) {
+        scope->test_rejected_first_request_ = true;
+        spdlog::info("test recovery donor rejected first discovery request");
+        co_return absl::PermissionDeniedError(
+            "native recovery export has no current FDS scope");
+      });
   if (scope->active_exports_ >= 32)
     co_return absl::ResourceExhaustedError(
         "recovery donor connection bound reached");
@@ -3138,11 +3149,45 @@ auto ReplicationManager::ReplicationGroup::RunRecoveryPeer(
     co_return absl::ResourceExhaustedError(
         "recovery peer cannot reserve metadata memory");
   peer->metadata_charge_.Adopt(&*metadata_reservation, kPeerMetadataBytes);
+  // FDS reaches the Candidate and each donor independently. A first request
+  // can precede the donor's matching authorization; keep discovery alive for
+  // another connection instead of freezing an envelope that omits that donor.
+  // The coordinator cancels this socket set at its existing discovery cutoff,
+  // and the committed recovery deadline/revocation still bounds every attempt.
+  // Once advertised, coverage belongs to this connection: never replace that
+  // report or retry a transfer against a different cut.
+  while (cluster_recovery_ == scope && !peer->sockets_.cancelled() &&
+         !scope->Expired()) {
+    auto result = co_await RunRecoveryPeerConnection(scope, peer, budget);
+    if (peer->report_.has_value() || peer->sockets_.cancelled() ||
+        scope->Expired() || cluster_recovery_ != scope)
+      co_return result;
+    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                            std::chrono::milliseconds(5));
+    if (!waited.ok()) co_return waited;
+  }
+  co_return absl::CancelledError("recovery discovery ended");
+}
+
+auto ReplicationManager::ReplicationGroup::RunRecoveryPeerConnection(
+    const std::shared_ptr<ClusterRecoveryContext>& scope,
+    const std::shared_ptr<RecoveryPeerSession>& peer,
+    const std::shared_ptr<RecoveryReceiveBudget>& budget)
+    -> Task<absl::Status> {
+  AssertStateOwner();
   auto connected = co_await ConnectTcp(
       peer->peer_.endpoint_.host_, peer->peer_.endpoint_.port_, tls_context_,
       &peer->sockets_, /*cancellable_dns=*/true);
   if (!connected.ok()) co_return connected.status();
   TcpStream stream = std::move(*connected);
+  // TcpStream is a non-owning handle. Close even on authentication/decoding
+  // errors before retrying discovery. The membership declared after this
+  // guard removes the fd first: shutdown must never see a closed descriptor
+  // that another worker could already have reused.
+  struct CloseGuard {
+    TcpStream& stream_;
+    ~CloseGuard() { stream_.Close().IgnoreError(); }
+  } close{stream};
   ScopedSocketSetMembership membership(&peer->sockets_, stream.NativeFd());
   auto status = co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
   if (!status.ok()) co_return status;

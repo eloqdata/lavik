@@ -995,6 +995,9 @@ struct ClusterRecoveryContext {
   const cluster::LeaseTime lease_deadline_;
   unsigned active_exports_ = 0;  // Coordinator worker only.
   bool watcher_finished_ = false;
+#if LAVIK_FAULTS_ENABLED
+  bool test_rejected_first_request_ = false;
+#endif
 };
 
 struct TimedSocketContext {
@@ -2073,6 +2076,11 @@ class ReplicationManager::ReplicationGroup {
       std::shared_ptr<ClusterRecoveryContext> scope,
       std::shared_ptr<RecoveryPeerSession> peer,
       std::shared_ptr<RecoveryReceiveBudget> budget);
+
+  Task<absl::Status> RunRecoveryPeerConnection(
+      const std::shared_ptr<ClusterRecoveryContext>& scope,
+      const std::shared_ptr<RecoveryPeerSession>& peer,
+      const std::shared_ptr<RecoveryReceiveBudget>& budget);
 
   void MaybeStartCandidateRecovery();
 
