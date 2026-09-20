@@ -270,10 +270,10 @@ id, unique client port and storage path. For example, repeat this pattern for
 the ids and ports named by the manifest:
 
 ```sh
-lavik --cluster-enabled \
-  --cluster-node-id 1111111111111111111111111111111111111111 \
-  --cluster-meta-seed 127.0.0.1:7301 \
-  --cluster-announce-ip 127.0.0.1 --port 6371 \
+lavik --client-mode cluster --meta-managed yes \
+  --node-id 1111111111111111111111111111111111111111 \
+  --meta-seed 127.0.0.1:7301 \
+  --announce-ip 127.0.0.1 --port 6371 \
   --data-file /var/lib/lavik/data-primary-1/lavik.data
 ```
 
@@ -973,11 +973,11 @@ node remains fenced/LOADING. Never interpret `activateauthority` returning
 For a plaintext development deployment, start the registered node with:
 
 ```sh
-lavik --cluster-enabled \
-  --cluster-node-id 0123456789abcdef0123456789abcdef01234567 \
-  --cluster-meta-seed 10.0.0.11:7300 \
-  --cluster-meta-seed 10.0.0.12:7300 \
-  --cluster-meta-seed 10.0.0.13:7300 \
+lavik --client-mode cluster --meta-managed yes \
+  --node-id 0123456789abcdef0123456789abcdef01234567 \
+  --meta-seed 10.0.0.11:7300 \
+  --meta-seed 10.0.0.12:7300 \
+  --meta-seed 10.0.0.13:7300 \
   --data-file /var/lib/lavik/data-1/lavik.data
 ```
 
@@ -1019,10 +1019,10 @@ client/server usages. The URI must equal the active Meta identity binding for
 that node. For example:
 
 ```sh
-lavik --cluster-enabled \
-  --cluster-node-id 0123456789abcdef0123456789abcdef01234567 \
-  --cluster-meta-seed 10.0.0.11:7300 \
-  --cluster-meta-seed 10.0.0.12:7300 \
+lavik --client-mode cluster --meta-managed yes \
+  --node-id 0123456789abcdef0123456789abcdef01234567 \
+  --meta-seed 10.0.0.11:7300 \
+  --meta-seed 10.0.0.12:7300 \
   --tls-port 6380 --tls-auth-clients yes --tls-replication \
   --tls-ca-cert-file /etc/lavik/data/ca.crt \
   --tls-cert-file /etc/lavik/data/node-01234567.crt \

@@ -399,7 +399,7 @@ CommandReply ExecuteSimpleLocalCommand(const CommandRequest& request,
             reply_builder.AppendError("ERR DB index is out of range");
         return reply;
       }
-      if (cluster::ClusterEnabled() && db_id != 0) {
+      if (cluster::IsClusterClientMode() && db_id != 0) {
         // Redis rejects every non-zero database in cluster mode
         // (db.c selectCommand); SELECT 0 stays a successful no-op.
         reply.encoded_ = reply_builder.AppendError(
@@ -488,7 +488,7 @@ Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
 
   if (request.kind_ == CommandKind::kPublish) {
     cluster::AuthorityInFlightGuards cluster_in_flights;
-    if (cluster::ClusterEnabled() && !request.replication_origin_ &&
+    if (cluster::MetaManaged() && !request.replication_origin_ &&
         request.replication_capture_ == nullptr) {
       if (std::optional<CommandReply> rejected = RecheckClusterWriteAuthority(
               request, reply_builder, &cluster_in_flights);
@@ -582,11 +582,10 @@ Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
 
 Task<CommandReply> ExecuteReplicaOf(const CommandRequest& request,
                                     ReplyBuilder& reply_builder) {
-  // Redis rejects REPLICAOF in cluster mode before even validating arguments
-  // (replication.c replicaofCommand); the trailing period is verbatim.
-  if (cluster::ClusterEnabled()) {
+  // Meta owns role changes, regardless of the configured client semantics.
+  if (cluster::MetaManaged()) {
     co_return BuiltReply(reply_builder.AppendError(
-        "ERR REPLICAOF not allowed in cluster mode."));
+        "ERR REPLICAOF not allowed in Meta-managed mode."));
   }
   auto parsed = ParseReplicaOfRequest(request.args_);
   if (!parsed.ok()) {
@@ -615,11 +614,11 @@ Task<CommandReply> ExecuteReplicaOf(const CommandRequest& request,
 
 Task<CommandReply> ExecuteAddReplicaOf(const CommandRequest& request,
                                        ReplyBuilder& reply_builder) {
-  // Same cluster-mode rejection as REPLICAOF: two topology sources must never
+  // Same Meta-managed rejection as REPLICAOF: two topology sources must never
   // coexist on one node.
-  if (cluster::ClusterEnabled()) {
+  if (cluster::MetaManaged()) {
     co_return BuiltReply(reply_builder.AppendError(
-        "ERR REPLICAOF not allowed in cluster mode."));
+        "ERR ADDREPLICAOF not allowed in Meta-managed mode."));
   }
   auto parsed = ParseReplicaOfRequest(request.args_);
   if (!parsed.ok() || !parsed->host_.has_value()) {
@@ -939,6 +938,7 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
       .connection_readonly_ = ctx.cluster_readonly_,
       .loading_allowed_ = LoadingAllowedCommand(request) &&
                           request.kind_ != CommandKind::kPublish,
+      .client_mode_ = cluster::GetClientMode(),
   };
   auto admission =
       runtime->authority_guard_.CaptureAndAdmit(view, cluster::LeaseClockNow());
@@ -967,7 +967,7 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
 std::optional<CommandReply> RecheckClusterWriteAuthority(
     const CommandRequest& request, ReplyBuilder& reply_builder,
     cluster::AuthorityInFlightGuards* in_flights) {
-  if (!cluster::ClusterEnabled() || request.replication_origin_ ||
+  if (!cluster::MetaManaged() || request.replication_origin_ ||
       request.cluster_authority_admission_ == nullptr ||
       request.ClusterSlots().empty() || !ClusterRequestIsWrite(request)) {
     return std::nullopt;
@@ -994,6 +994,7 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
         .is_write_ = true,
         .connection_readonly_ = false,
         .loading_allowed_ = false,
+        .client_mode_ = cluster::GetClientMode(),
     };
     auto fresh = std::make_shared<const cluster::AuthorityAdmission>(
         runtime->authority_guard_.CaptureAndAdmit(view,
@@ -1009,7 +1010,7 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
 
 Task<CommandReply> ExecuteCluster(const CommandRequest& request,
                                   ReplyBuilder& reply_builder) {
-  if (cluster::ClusterEnabled()) {
+  if (cluster::IsClusterClientMode()) {
     // Cluster mode serves the real discovery surface (SLOTS/NODES/MYID/INFO/
     // KEYSLOT) from the committed ServingState; the legacy shim below fakes
     // full coverage from replication state for standalone mode only.
@@ -4609,7 +4610,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
     // Redis reports redis_mode in the Server section (server.c); cluster
     // clients and operators read it together with the # Cluster section.
     info += std::string("redis_mode:") +
-            (cluster::ClusterEnabled() ? "cluster" : "standalone") + "\r\n";
+            (cluster::IsClusterClientMode() ? "cluster" : "standalone") +
+            "\r\n";
     info += "process_id:" + std::to_string(::getpid()) + "\r\n";
     info += "run_id:" + replication.local_node_id_ + "\r\n";
     info += "tcp_port:" + std::to_string(g_server_port) + "\r\n";
@@ -4927,7 +4929,7 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
     // included; clients key off cluster_enabled.
     info += "# Cluster\r\n";
     info += std::string("cluster_enabled:") +
-            (cluster::ClusterEnabled() ? "1" : "0") + "\r\n\r\n";
+            (cluster::IsClusterClientMode() ? "1" : "0") + "\r\n\r\n";
   }
   if (wants("keyspace")) {
     info += "# Keyspace\r\n";
@@ -5650,7 +5652,7 @@ absl::StatusOr<CopyOptions> ParseCopyOptions(const CommandRequest& request) {
     }
     return absl::InvalidArgumentError("syntax error");
   }
-  if (cluster::ClusterEnabled() && options.destination_db_ != 0) {
+  if (cluster::IsClusterClientMode() && options.destination_db_ != 0) {
     // Cluster mode has no cross-database COPY (Redis db.c copyCommand). This
     // single choke point covers ExecuteCopy, the EXEC precompute, and the EXEC
     // sequential fallback.
@@ -7568,7 +7570,7 @@ Task<std::string> ExecuteLuaRedisCall(
     });
   }
 
-  if (cluster::ClusterEnabled() && !command.replication_origin_) {
+  if (cluster::IsClusterClientMode() && !command.replication_origin_) {
     // Cluster backstop on top of declared-key confinement: every accessed key
     // must stay within the slot set the script was admitted with. Redis raises
     // this same error from its script path (getNodeByQuery for scripts).
@@ -7936,7 +7938,7 @@ Task<std::string> ExecuteEvalWithTransaction(
     co_return EncodeError(absl::StrCat("ERR Error compiling script: ",
                                        execution.status().message()));
   }
-  if (function_kind && cluster::ClusterEnabled() &&
+  if (function_kind && cluster::IsClusterClientMode() &&
       ((*execution)->function_flags() & kLuaFunctionNoCluster) != 0) {
     // Redis refuses no-cluster functions on cluster nodes (script.c; the text
     // is verbatim and addReplyError prefixes "-ERR "). The check sits after
@@ -9348,7 +9350,7 @@ Task<CommandReply> ExecuteExecBody(
   std::vector<std::uint16_t> exec_cluster_slots;
   std::shared_ptr<const cluster::AuthorityAdmission> exec_admission;
   cluster::AuthorityInFlightGuards exec_in_flights;
-  if (cluster::ClusterEnabled() && !ctx.strict_replication_apply_) {
+  if (cluster::MetaManaged() && !ctx.strict_replication_apply_) {
     for (std::size_t i = 0; i < queued.size(); ++i) {
       const CommandRequest& cmd = queued[i];
       if (cmd.spec_ == nullptr || !key_errors[i].empty()) {
@@ -9381,7 +9383,7 @@ Task<CommandReply> ExecuteExecBody(
         }
       }
     }
-    if (exec_cluster_slots.size() > 1) {
+    if (cluster::IsClusterClientMode() && exec_cluster_slots.size() > 1) {
       co_await DropWatches(ctx);
       co_return BuiltReply(AppendCrossSlotError(reply_builder));
     }
@@ -9394,6 +9396,7 @@ Task<CommandReply> ExecuteExecBody(
           // Writes are never loading-whitelisted; a not-ready snapshot must
           // answer LOADING rather than serve the write.
           .loading_allowed_ = false,
+          .client_mode_ = cluster::GetClientMode(),
       };
       for (;;) {
         auto candidate = std::make_shared<const cluster::AuthorityAdmission>(
@@ -11569,7 +11572,7 @@ absl::Status ValidateClusterStorageMutation(const void* opaque) {
 
 storage::MutationPrecondition ClusterMutationPrecondition(
     const CommandRequest& request) {
-  if (!cluster::ClusterEnabled() || request.replication_origin_ ||
+  if (!cluster::MetaManaged() || request.replication_origin_ ||
       request.cluster_authority_admission_ == nullptr ||
       request.ClusterSlots().empty() || !ClusterRequestIsWrite(request)) {
     return {};
@@ -11612,6 +11615,7 @@ CommandReply ClusterAuthorityChangedReply(std::span<const std::uint16_t> slots,
       // Same rule as the dispatch gate: writes are never whitelisted, so a
       // snapshot that lost readiness maps to LOADING instead of serving.
       .loading_allowed_ = false,
+      .client_mode_ = cluster::GetClientMode(),
   };
   cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
   const cluster::AuthorityAdmission fresh =
@@ -11641,7 +11645,7 @@ absl::Status ValidateClusterShardAuthority(void* opaque, unsigned /*shard*/) {
 void InstallClusterShardValidator(tx::Transaction& transaction,
                                   const CommandRequest& request,
                                   ClusterShardValidatorContext& context) {
-  if (!cluster::ClusterEnabled() || request.replication_origin_ ||
+  if (!cluster::MetaManaged() || request.replication_origin_ ||
       request.cluster_authority_admission_ == nullptr ||
       request.ClusterSlots().empty()) {
     return;
@@ -11651,7 +11655,7 @@ void InstallClusterShardValidator(tx::Transaction& transaction,
 }
 
 absl::Status RecheckClusterRequestAuthority(const CommandRequest& request) {
-  if (!cluster::ClusterEnabled() || request.replication_origin_ ||
+  if (!cluster::MetaManaged() || request.replication_origin_ ||
       request.cluster_authority_admission_ == nullptr ||
       request.ClusterSlots().empty()) {
     return absl::OkStatus();
@@ -11729,7 +11733,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
             : "BUSY Redis is busy running a script. You can only call SCRIPT "
               "KILL or SHUTDOWN NOSAVE."));
   }
-  if (cluster::ClusterEnabled()) {
+  if (cluster::MetaManaged()) {
     const std::string_view unscoped_mutation = UnscopedClusterMutation(request);
     if (!unscoped_mutation.empty()) {
       // Meta authority is deliberately finite per group and can never prove a
@@ -11738,7 +11742,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       // cannot make the command appear potentially valid after recovery.
       if (ctx.in_multi_) ctx.multi_dirty_ = true;
       co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
-          "ERR ", unscoped_mutation, " is not allowed in cluster mode")));
+          "ERR ", unscoped_mutation, " is not allowed in Meta-managed mode")));
     }
   }
   if (g_replication != nullptr && g_replication->is_loading()) [[unlikely]] {
@@ -11750,7 +11754,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
           "LOADING Lavik is loading the dataset from the primary"));
     }
   }
-  if (cluster::ClusterEnabled()) {
+  if (cluster::MetaManaged()) {
     // Cluster admission gate: redirect or refuse before any
     // execution, including at MULTI queue time so EXEC aborts dirty. The
     // admitted ServingState snapshot rides on the request for the owner-side

@@ -63,11 +63,19 @@ decides *which node* serves a key; the worker mapping inside a node
 own arbitration boundary — the cluster layer reaches it only through a
 generic per-shard validator hook that knows nothing about clusters.
 
-Cluster mode is a startup-only, process-wide choice. The runtime
-(`ClusterRuntime`: topology cache, authority guard, node controller, action
-adapter, and resolved announce addresses) is installed
-before any listener accepts a client; in standalone mode it is null and every
-cluster code path is inert.
+Client semantics (`client-mode single|cluster`) and Meta management
+(`meta-managed yes|no`) are independent startup-only choices. Client mode
+selects Redis discovery, DB/slot rules, and HELLO/INFO reporting. Meta management
+installs `ClusterRuntime` (topology cache, authority guard, node controller,
+action adapter, and resolved announce addresses) before any worker serves;
+without Meta management the runtime is null. Authority and lifecycle checks
+consult management status, never the client mode. Cluster clients require Meta
+management. Managed Single has one Group covering the entire keyspace. Its
+keyed admission carries one representative slot for that Group's readiness,
+lease, in-flight registration, and mutation rechecks; it rejects snapshots that
+violate the single full-Group constraint. Cluster admission retains its
+same-slot rule. Managed Single startup remains rejected until the remaining
+whole-dataset authority integration in #90 is complete.
 
 ## ServingState: the published unit of truth
 
@@ -814,13 +822,14 @@ installs a local topology or positive authority. Read paths still hide expired
 values after their absolute deadline; without a valid lease, recovery cannot
 append the authoritative tombstone or reclaim the retained winner.
 
-Startup-only directives configure the subsystem: `cluster-enabled` (default
-`no`); repeatable `cluster-meta-seed`; required `cluster-node-id`; and
-`cluster-announce-ip`, `cluster-announce-port`, and
-`cluster-announce-tls-port`. Announce values default to the first non-wildcard
+Startup-only directives configure the subsystem: `client-mode` (default
+`single`), `meta-managed` (default `no`), repeatable `meta-seed`,
+`node-id` (required only when `meta-managed yes`), and
+`announce-ip`, `announce-port`, and
+`announce-tls-port`. Announce values default to the first non-wildcard
 bind address and the corresponding listen ports; a wildcard bind leaves the
 announce host empty so discovery self entries keep the startup-node convention.
-Cluster mode requires a canonical 40-character lowercase node id and at least
+Meta management requires a canonical 40-character lowercase node id and at least
 one numeric Meta seed. It refuses coexistence with either replication upstream
 directive (two topology sources never mix; runtime `REPLICAOF` is rejected
 separately at the command layer), and requires at least one reachable announced

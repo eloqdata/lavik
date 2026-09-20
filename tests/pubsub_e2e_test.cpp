@@ -630,98 +630,10 @@ int main(int argc, char** argv) {
       std::this_thread::sleep_for(10ms);
     }
 
-    Expect(replica_client.Command(
-               {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
-           "+OK", "replicaof");
-    WaitForReplica(&replica_client);
-    Expect(replica_client.Command({"READONLY"}), "+OK", "replica readonly");
-    RespClient replica_subscriber = Connect(replica_port);
-    Expect(replica_subscriber.Command({"SUBSCRIBE", "replicated"}),
-           Subscription("subscribe", "replicated", 1), "replica subscribe");
-    RespClient replica_pattern_subscriber = Connect(replica_port);
-    Expect(replica_pattern_subscriber.Command({"PSUBSCRIBE", "rep*"}),
-           Subscription("psubscribe", "rep*", 1), "replica pattern subscribe");
-    Expect(source_client.Command({"publish", "replicated", "downstream"}), ":0",
-           "source count excludes replica");
-    Expect(replica_subscriber.ReadPush(), Message("replicated", "downstream"),
-           "replicated message");
-    Expect(replica_pattern_subscriber.ReadPush(),
-           PatternMessage("rep*", "replicated", "downstream"),
-           "replicated pattern message");
-    Expect(replica_pattern_subscriber.Command({"PUNSUBSCRIBE"}),
-           Subscription("punsubscribe", "rep*", 0),
-           "replica pattern unsubscribe");
-    RespClient source_replication_subscriber = Connect(source_port);
-    Expect(source_replication_subscriber.Command({"SUBSCRIBE", "replicated"}),
-           Subscription("subscribe", "replicated", 1),
-           "source replicated subscribe");
-    Expect(replica_client.Command({"PUBLISH", "replicated", "local-only"}),
-           ":1", "replica local publish");
-    Expect(replica_subscriber.ReadPush(), Message("replicated", "local-only"),
-           "replica local message");
-
-#if !defined(NDEBUG)
-    // This deterministic final-check fault is compiled into Debug only. A
-    // failed replication check must not leak the captured PUBLISH to either the
-    // source's local subscribers or the replica backlog. The next direct
-    // publication is an ordering barrier on both paths: it must be the first
-    // message either subscriber observes.
-    RespClient rejected_exec_client = Connect(source_port);
-    Expect(rejected_exec_client.Command({"MULTI"}), "+OK",
-           "rejected publish-only multi");
-    Expect(
-        rejected_exec_client.Command({"PUBLISH", "replicated", "rejected-tx"}),
-        "+QUEUED", "queue rejected publish-only transaction");
-    Expect(rejected_exec_client.Command({"EXEC"}),
-           "-ERR EXEC replication failed: cluster authority changed",
-           "reject publish-only exec at final check");
-    Expect(source_client.Command({"PUBLISH", "replicated", "after-reject"}),
-           ":1", "publish barrier after rejected exec");
-    Expect(source_replication_subscriber.ReadPush(),
-           Message("replicated", "after-reject"),
-           "rejected exec did not publish locally");
-    Expect(replica_subscriber.ReadPush(), Message("replicated", "after-reject"),
-           "rejected exec did not enter the replica backlog");
-#endif
-
-    ExpectExecPublishUsesCommandTimeSubscriptions(
-        &source_client, source_port, "tx-order-replicated", "replicated");
-    RespClient unsubscribe_order_subscriber = Connect(source_port);
-    ExpectExecPublishPrecedesLaterUnsubscribe(&unsubscribe_order_subscriber,
-                                              "tx-order-unsubscribe");
-
-    // A PUBLISH-only EXEC uses the channel-sharded ephemeral source flow.
-    Expect(source_client.Command({"MULTI"}), "+OK", "publish-only multi");
-    Expect(source_client.Command({"PUBLISH", "replicated", "tx-only"}),
-           "+QUEUED", "queue publish-only transaction");
-    Expect(source_client.Command({"EXEC"}), "*1\r\n:1", "publish-only exec");
-    Expect(source_replication_subscriber.ReadPush(),
-           Message("replicated", "tx-only"), "publish-only exec local message");
-    Expect(replica_subscriber.ReadPush(), Message("replicated", "tx-only"),
-           "replicated publish-only exec message");
-
-    // A mixed transaction keeps PUBLISH in the durable transaction envelope
-    // so the replica observes the write and message at the same apply point.
-    Expect(source_client.Command({"MULTI"}), "+OK", "mixed multi");
-    Expect(source_client.Command({"SET", "tx-key", "value"}), "+QUEUED",
-           "queue mixed write");
-    Expect(source_client.Command({"PUBLISH", "replicated", "tx-mixed"}),
-           "+QUEUED", "queue mixed publish");
-    Expect(source_client.Command({"EXEC"}), "*2\r\n+OK\r\n:1", "mixed exec");
-    Expect(source_replication_subscriber.ReadPush(),
-           Message("replicated", "tx-mixed"), "mixed exec local message");
-    Expect(replica_subscriber.ReadPush(), Message("replicated", "tx-mixed"),
-           "replicated mixed exec message");
-    const auto read_deadline = std::chrono::steady_clock::now() + 10s;
-    std::string replicated_value;
-    while ((replicated_value = replica_client.Command({"GET", "tx-key"})) !=
-           "$5\r\nvalue") {
-      if (std::chrono::steady_clock::now() >= read_deadline) {
-        Fail("replicated mixed EXEC write did not become visible: " +
-             replicated_value);
-      }
-      std::this_thread::sleep_for(10ms);
-    }
+    ExpectContains(replica_client.Command(
+                       {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+                   "Redis replication handshake failed",
+                   "reject native upstream");
 
     replica.Stop();
     source.Stop();

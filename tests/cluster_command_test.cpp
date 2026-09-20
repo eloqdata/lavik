@@ -159,9 +159,13 @@ class ClusterRuntimeGuard {
  public:
   explicit ClusterRuntimeGuard(
       std::unique_ptr<cluster::ClusterRuntime> runtime) {
+    cluster::SetClientMode(lavik::ClientMode::kCluster);
     cluster::InstallClusterRuntime(std::move(runtime));
   }
-  ~ClusterRuntimeGuard() { cluster::InstallClusterRuntime(nullptr); }
+  ~ClusterRuntimeGuard() {
+    cluster::SetClientMode(lavik::ClientMode::kSingle);
+    cluster::InstallClusterRuntime(nullptr);
+  }
 };
 
 lavik::CommandRequest MakeRequest(std::vector<std::string> args,
@@ -251,7 +255,20 @@ std::string SlotsNode(std::string_view host, std::uint16_t port,
                       "\r\n", lavik::EncodeBulkString(node_id));
 }
 
+TEST(ClusterCommandTest, ClientSemanticsAreIndependentOfMetaRuntime) {
+  ClusterRuntimeGuard guard(MakeRuntime(nullptr));
+  lavik::ConnectionContext context;
+  EXPECT_EQ(RunDispatch(context, {"SELECT", "15"}),
+            "-ERR SELECT is not allowed in cluster mode\r\n");
+  cluster::SetClientMode(lavik::ClientMode::kSingle);
+  EXPECT_EQ(RunDispatch(context, {"SELECT", "15"}), "+OK\r\n");
+  // Selecting Single does not grant external role control on a managed node.
+  EXPECT_EQ(RunDispatch(context, {"REPLICAOF", "NO", "ONE"}),
+            "-ERR REPLICAOF not allowed in Meta-managed mode.\r\n");
+}
+
 TEST(ClusterCommandTest, KeySlotWorksWithoutClusterState) {
+  cluster::SetClientMode(lavik::ClientMode::kSingle);
   cluster::InstallClusterRuntime(nullptr);
   EXPECT_EQ(RunClusterCommand(MakeRequest({"CLUSTER", "KEYSLOT", "foo"})),
             lavik::EncodeInteger(lavik::storage::RedisSlot("foo")));
@@ -276,6 +293,7 @@ TEST(ClusterCommandTest, PublishUsesItsChannelSlotAndHonorsControlledPause) {
 }
 
 TEST(ClusterCommandTest, SubcommandErrorsMatchRedis) {
+  cluster::SetClientMode(lavik::ClientMode::kSingle);
   cluster::InstallClusterRuntime(nullptr);
   const auto expect_error = [](std::vector<std::string> args,
                                std::string_view subcommand) {
@@ -319,6 +337,7 @@ TEST(ClusterCommandTest, MyIdReportsSelfNodeId) {
 
 TEST(ClusterCommandTest, MyIdIsEmptyWithoutSelf) {
   // No runtime installed at all.
+  cluster::SetClientMode(lavik::ClientMode::kSingle);
   cluster::InstallClusterRuntime(nullptr);
   EXPECT_EQ(RunClusterCommand(MakeRequest({"CLUSTER", "MYID"})),
             lavik::EncodeBulkString(""));
@@ -602,6 +621,9 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
             cluster::Decision::Kind::kServe);
 
   ClusterRuntimeGuard runtime_guard(std::move(runtime));
+  // Client semantics must not disable the existing authority proof. This
+  // internal seam is usable before managed Single startup is supported.
+  cluster::SetClientMode(lavik::ClientMode::kSingle);
   EXPECT_TRUE(lavik::RecheckClusterRequestAuthority(request).ok());
   ASSERT_TRUE(
       cluster::GetClusterRuntime()
