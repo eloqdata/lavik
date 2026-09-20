@@ -958,8 +958,7 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
                    request.spec_ != nullptr &&
                    (request.spec_->flags_ & kCmdMultiShard) != 0);
   if (!retain_proof) {
-    const auto decision =
-        runtime->authority_guard_.DecideNow(view, cluster::LeaseClockNow());
+    const auto decision = runtime->authority_guard_.DecideNow(view);
     return EmitClusterDecision(decision, request.connection_tls_, reply_builder,
                                reply);
   }
@@ -11749,8 +11748,7 @@ const char* CommandServingGenerationError(
                                     .loading_allowed_ = false,
                                     .client_mode_ = ClientMode::kSingle};
     const auto decision =
-        cluster::GetClusterRuntime()->authority_guard_.DecideNow(
-            view, cluster::LeaseClockNow());
+        cluster::GetClusterRuntime()->authority_guard_.DecideNow(view);
     switch (decision.kind_) {
       case cluster::Decision::Kind::kServe:
       case cluster::Decision::Kind::kServeStaleRead:

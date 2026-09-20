@@ -233,6 +233,9 @@ class AuthorityGuard {
   // topology-cache lookup on this thread; never carry it across suspension.
   // Mutations still require CaptureAndAdmit and its registration/final checks.
   Decision DecideNow(const RequestView& request, MonotonicTime now) const;
+  // Samples the lease clock only when needed; cached replica reads consume
+  // population authority but no Owner lease. No clock value survives a call.
+  Decision DecideNow(const RequestView& request) const;
 
   // Lower-level verification of topology, session generation, and lease
   // deadline captured at admission. This call does not enter an in-flight cell
@@ -282,9 +285,11 @@ class AuthorityGuard {
   };
 
   struct LeaseCheck {
-    std::uint64_t revision = 0;
+    std::uint64_t publication_version = 0;
     MonotonicTime deadline{};
   };
+  Decision DecideNowImpl(const RequestView& request,
+                         std::optional<MonotonicTime> now) const;
   Decision DecideWithLease(const ServingState* state,
                            const RequestView& request, MonotonicTime now,
                            AuthorityAdmission* proof,
@@ -296,7 +301,8 @@ class AuthorityGuard {
                    MonotonicTime* earliest_deadline = nullptr) const;
   // The returned reference is valid until this thread's next CurrentAuthority
   // call. Callers must not suspend while borrowing it.
-  const AuthorityState& CurrentAuthority() const;
+  const AuthorityState& CurrentAuthority(
+      std::uint64_t* publication_version = nullptr) const;
   // Writer-only: allocate the immutable copy before publishing; no reader
   // drain, request gate closure, or wait for old snapshot owners is needed.
   void PublishAuthorityLocked();

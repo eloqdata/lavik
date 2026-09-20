@@ -279,7 +279,8 @@ AuthorityGuard::AuthorityGuard(TopologyCache& topology)
       cache_identity_(next_authority_cache_identity.fetch_add(
           1, std::memory_order_relaxed)) {}
 
-const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority() const {
+const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority(
+    std::uint64_t* publication_version) const {
   struct Cached {
     std::uint64_t identity = 0;
     std::uint64_t version = 0;
@@ -288,6 +289,7 @@ const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority() const {
   thread_local Cached cached;
   std::uint64_t version = authority_version_.load(std::memory_order_acquire);
   if (cached.identity == cache_identity_ && cached.version == version) {
+    if (publication_version != nullptr) *publication_version = cached.version;
     return *cached.state;
   }
   for (;;) {
@@ -298,6 +300,7 @@ const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority() const {
       cached.identity = cache_identity_;
       cached.version = version;
       cached.state = std::move(state);
+      if (publication_version != nullptr) *publication_version = version;
       return *cached.state;
     }
     version = after;
@@ -396,9 +399,15 @@ AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
 
 Decision AuthorityGuard::DecideNow(const RequestView& request,
                                    MonotonicTime now) const {
-  std::uint64_t version = 0;
-  std::uint64_t sequence = 0;
-  const auto& state = CurrentCachedWithVersion(topology_, &version, &sequence);
+  return DecideNowImpl(request, now);
+}
+
+Decision AuthorityGuard::DecideNow(const RequestView& request) const {
+  return DecideNowImpl(request, std::nullopt);
+}
+
+Decision AuthorityGuard::DecideNowImpl(const RequestView& request,
+                                       std::optional<MonotonicTime> now) const {
   // Single's complete Group authorizes every read through the same predicate.
   // Keep only successful verdicts in worker-local memory; exact publication
   // identity and lease expiry remain checked on every call. This avoids both
@@ -408,7 +417,6 @@ Decision AuthorityGuard::DecideNow(const RequestView& request,
       request.client_mode_ == ClientMode::kSingle && !request.is_write_ &&
       !request.loading_allowed_ &&
       (request.slots_.empty() || request.slots_.front() < kSlotCount);
-  if (!single_read) return DecideWithLease(state.get(), request, now, nullptr);
   struct CachedRead {
     std::uint64_t identity = 0;
     std::uint64_t sequence = 0;
@@ -416,17 +424,30 @@ Decision AuthorityGuard::DecideNow(const RequestView& request,
     LeaseCheck lease;
   };
   thread_local CachedRead cached;
-  if (cached.identity == cache_identity_ && cached.sequence == sequence &&
+  std::uint64_t sequence = topology_.publication_sequence();
+  // A successful verdict needs neither borrowed snapshot when their exact
+  // publication identities are unchanged. An odd topology sequence always
+  // takes the coherent slow path. The authority version is captured together
+  // with the immutable lease snapshot, not sampled after its validation.
+  if (single_read && (sequence & 1U) == 0 &&
+      cached.identity == cache_identity_ && cached.sequence == sequence &&
       (cached.kind == Decision::Kind::kServeStaleRead ||
-       (now < cached.lease.deadline &&
-        cached.lease.revision == CurrentAuthority().revision_))) {
+       (cached.lease.publication_version ==
+            authority_version_.load(std::memory_order_acquire) &&
+        (now.has_value() ? *now : LeaseClockNow()) < cached.lease.deadline))) {
     Decision decision;
     decision.kind_ = cached.kind;
     return decision;
   }
+  std::uint64_t version = 0;
+  const auto& state = CurrentCachedWithVersion(topology_, &version, &sequence);
+  const MonotonicTime checked_at = now.has_value() ? *now : LeaseClockNow();
+  if (!single_read) {
+    return DecideWithLease(state.get(), request, checked_at, nullptr);
+  }
   LeaseCheck lease;
   const Decision decision =
-      DecideWithLease(state.get(), request, now, nullptr, &lease);
+      DecideWithLease(state.get(), request, checked_at, nullptr, &lease);
   if (decision.kind_ == Decision::Kind::kServe ||
       decision.kind_ == Decision::Kind::kServeStaleRead) {
     cached = {.identity = cache_identity_,
@@ -459,13 +480,13 @@ Decision AuthorityGuard::DecideWithLease(const ServingState* state,
       group->primary_node_index_ != state->SelfNodeIndex()) {
     return decision;
   }
-  const AuthorityState& authority = CurrentAuthority();
+  const AuthorityState& authority = CurrentAuthority(
+      lease_check == nullptr ? nullptr : &lease_check->publication_version);
   if (proof != nullptr) {
     proof->gate_generation_ = authority.generation_;
     proof->lease_revision_ = authority.revision_;
     proof->lease_checked_ = true;
   }
-  if (lease_check != nullptr) lease_check->revision = authority.revision_;
   MonotonicTime* deadline = proof != nullptr         ? &proof->lease_deadline_
                             : lease_check != nullptr ? &lease_check->deadline
                                                      : nullptr;
