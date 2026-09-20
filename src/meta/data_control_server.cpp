@@ -980,6 +980,21 @@ MetaReplacementDisposition EvaluateNodeReplacement(
 }
 }  // namespace
 
+bool CanRenewDuringLeasePolicyUpdate(const control::FullDesiredState& installed,
+                                     const control::FullDesiredState& latest,
+                                     std::string_view node_id) {
+  if (installed.authority_lease_duration_ms == 0 ||
+      latest.authority_lease_duration_ms <
+          installed.authority_lease_duration_ms)
+    return false;
+  const auto before = control::SelectNodeControlState(installed, node_id);
+  auto after = control::SelectNodeControlState(latest, node_id);
+  after.local.lease_duration_ms = before.local.lease_duration_ms;
+  const auto changes = control::DiffNodeControlState(before, after);
+  return !changes.routing && !changes.local && !changes.directory &&
+         !changes.tasks;
+}
+
 absl::StatusOr<std::vector<control::WireMetaEndpoint>>
 BuildCommittedMetaDirectory(const MetaCommittedView& view) {
   std::vector<control::WireMetaEndpoint> directory;
@@ -1344,6 +1359,10 @@ struct LiveSessionState {
   // boundaries deny authority if the coordinator high-water advances first,
   // even while the subscription callback is still queued cross-thread.
   std::uint64_t validated_committed_high_water_ = 0;
+  // A separate certificate permits only old-duration renewal during a
+  // compatible policy publication. It never makes the projection current for
+  // directives/status, and is cleared whenever installed_ changes.
+  std::uint64_t renewable_committed_high_water_ = 0;
   control::NodeControlState selected_;
   std::vector<control::WireAuthorityAnchor> fenced_authorities_;
 
@@ -2118,6 +2137,12 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
   auto latest = ProjectNodeBounded(*state->core_, view, state->node_id_);
   const control::FullDesiredState* latest_state =
       latest.ok() ? &latest->full_state : nullptr;
+  state->renewable_committed_high_water_ =
+      latest.ok() &&
+              CanRenewDuringLeasePolicyUpdate(
+                  installed.full_state, latest->full_state, state->node_id_)
+          ? view.applied_index()
+          : 0;
   if (absl::Status fenced =
           co_await FenceSupersededAuthorityLive(state, installed, latest_state);
       !fenced.ok()) {
@@ -2327,6 +2352,12 @@ bycorf::Task<absl::Status> SessionPublisherBody(
     std::shared_ptr<const NodeControlBatch> installed = state->installed_;
     const control::FullDesiredState* latest_state =
         latest.ok() ? &latest->full_state : nullptr;
+    state->renewable_committed_high_water_ =
+        latest.ok() &&
+                CanRenewDuringLeasePolicyUpdate(
+                    installed->full_state, latest->full_state, state->node_id_)
+            ? view.applied_index()
+            : 0;
     if (!latest.ok() ||
         EvaluateNodeReplacement(installed->full_state, latest->full_state,
                                 state->node_id_) ==
@@ -2377,6 +2408,7 @@ bycorf::Task<absl::Status> SessionPublisherBody(
     state->core_->full_states_sent_.fetch_add(1, std::memory_order_relaxed);
     state->selected_ = std::move(next);
     state->installed_ = RetainProjection(std::move(*latest));
+    state->renewable_committed_high_water_ = 0;
     state->publisher_adoption_gate_.MarkProjectionAdopted();
     state->response_changed_.NotifyAll(*state->worker_);
     // The live installation now owns the replacement. Drop the publisher's
@@ -2720,10 +2752,12 @@ bycorf::Task<absl::Status> RunEstablishedSession(
       const bool leader_valid =
           AuthoritySessionsAllowed(*state->core_,
                                    state->leadership_generation_) &&
-          !CommitPending(*state->commit_signal_,
-                         state->validated_committed_high_water_) &&
-          !state->projection_superseded_ &&
-          state->validated_committed_high_water_ >= committed_high_water;
+          (ProjectionCurrent(*state) ||
+           (state->renewable_committed_high_water_ != 0 &&
+            !CommitPending(*state->commit_signal_,
+                           state->renewable_committed_high_water_) &&
+            state->renewable_committed_high_water_ >=
+                state->core_->coordinator_->CommittedHighWater()));
       std::optional<control::LeaseChallenge> challenge;
       if (const auto* authority = std::get_if<control::AuthorityLeaseRequest>(
               &heartbeat->role_information)) {

@@ -495,6 +495,13 @@ class NodeControlInstaller {
   // change.
   absl::Status InstallRouting(PreparedFullState prepared_state);
 
+  // Control-worker-only policy update after the caller has verified that all
+  // other selected control objects are unchanged. Preserves existing finite
+  // deadlines and capability tokens; the next exact grant changes the lease.
+  // Returns false without mutation if another transition requires a barrier.
+  bool TryUpdateLeasePolicy(ProjectionBasis previous, ProjectionBasis next,
+                            std::uint32_t duration_ms);
+
   // Installs one completely decoded and validated snapshot through a test
   // adapter that never receives directives. Directive-capable adapters must
   // use InstallFullStateTransition(), even when a particular snapshot appears

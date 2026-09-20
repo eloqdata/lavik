@@ -399,6 +399,54 @@ control::FullDesiredState Desired() {
   return desired;
 }
 
+TEST(MetaDataControlLeaseTest,
+     PolicyBridgeRequiresUnchangedScopeAndNondecreasingDuration) {
+  auto installed = Desired();
+  installed.groups.front().members.push_back(
+      control::WireDesiredMember{.node_id = Identity('1')});
+  auto latest = installed;
+  ++latest.control_revision;
+  latest.authority_lease_duration_ms *= 2;
+  const auto compatible = [&](const auto& next) {
+    return lavik::meta::CanRenewDuringLeasePolicyUpdate(installed, next,
+                                                        Identity('1'));
+  };
+  EXPECT_TRUE(compatible(latest));
+  EXPECT_TRUE(compatible(installed));
+  auto changed = latest;
+  changed.authority_lease_duration_ms =
+      installed.authority_lease_duration_ms - 1;
+  EXPECT_FALSE(compatible(changed));
+  changed = latest;
+  changed.groups.front().grant_active = false;
+  EXPECT_FALSE(compatible(changed));
+  changed = latest;
+  ++changed.groups.front().group_term;
+  EXPECT_FALSE(compatible(changed));
+  changed = latest;
+  changed.groups.front().owner_node_id = Identity('2');
+  EXPECT_FALSE(compatible(changed));
+  changed = latest;
+  changed.groups.front().owner_assignment_id = Bytes<16>(0x33);
+  EXPECT_FALSE(compatible(changed));
+  changed = latest;
+  ++changed.groups.front().manifest_revision;
+  EXPECT_FALSE(compatible(changed));
+  changed = latest;
+  ++changed.groups.front().partition_replication_epoch;
+  EXPECT_FALSE(compatible(changed));
+  changed = latest;
+  changed.current_directives.push_back(
+      control::WireProjectedDirective{.recipient_node_id = Identity('1')});
+  EXPECT_FALSE(compatible(changed));
+  changed = latest;
+  changed.meta_directory.push_back(
+      {.server_id = 4, .host = "127.0.0.1", .port = 1234});
+  EXPECT_FALSE(compatible(changed));
+  installed.authority_lease_duration_ms = 0;
+  EXPECT_FALSE(compatible(latest));
+}
+
 control::LeaseChallenge Challenge() {
   return control::LeaseChallenge{
       .nonce = Bytes<16>(0x11),

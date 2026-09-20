@@ -529,6 +529,14 @@ MetaReplacementDisposition EvaluateReplacementDisposition(
     const cluster::control::FullDesiredState& replacement,
     const cluster::control::FullDesiredState& latest);
 
+// An installed projection may keep receiving its exact old-duration grants
+// while a longer lease policy is delivered. Every other selected object must
+// be unchanged. The caller must bind this proof to the current committed
+// high-water and installed object, and independently validate leadership.
+bool CanRenewDuringLeasePolicyUpdate(
+    const cluster::control::FullDesiredState& installed,
+    const cluster::control::FullDesiredState& latest, std::string_view node_id);
+
 class MetaDataControlServer final : public MetaReconciler {
  public:
   // Opaque shared state is public only so translation-unit helpers can name

@@ -521,7 +521,15 @@ the session and bootstrap restores current state. Data validates the selected
 state before installation. Routing-only updates preserve local execution,
 source exports, population readiness and finite leases. Local control or task
 changes quiesce heartbeat/control work and reconcile before acknowledgement.
-Data derives heartbeat cadence as `max(1 ms, resolved lease duration / 3)`.
+A pure lease-duration update can preserve those same capabilities and install
+on the control worker without joining data workers. Meta may continue granting
+the exact installed duration while a nondecreasing policy update is delivered,
+only after comparing all selected objects against the latest committed
+high-water. Any further commit invalidates that renewal proof until revalidated;
+it never authorizes directives or marks the replacement projection current.
+Shorter policies cannot renew the old longer duration.
+Data derives heartbeat cadence as `max(1 ms, resolved lease duration / 3)`;
+an owner retains the faster old cadence until its first new-duration grant.
 Policy documents and versions remain Meta-owned. `steady_replication_enabled`
 is true only for a Created cluster; explicit population or failover work
 otherwise owns local replication ingress.

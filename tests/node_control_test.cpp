@@ -1739,6 +1739,34 @@ class LeaseExpiryService final : public bycorf::Service {
     EXPECT_TRUE(control_.installer.TryRenewLease(grant));
     EXPECT_EQ(original_lease->deadline(),
               (grant.sent_at_ + grant.granted_duration_).time_since_epoch());
+    // Pure policy changes preserve request/TTL/source capability identity and
+    // install their next grant without ever calling the blocked data actions.
+    const auto old_deadline = original_lease->deadline();
+    EXPECT_FALSE(
+        control_.installer.TryUpdateLeasePolicy(Basis(9), Basis(11), 2000));
+    EXPECT_FALSE(
+        control_.installer.TryUpdateLeasePolicy(Basis(10), Basis(10), 2000));
+    EXPECT_FALSE(
+        control_.installer.TryUpdateLeasePolicy(Basis(10), Basis(11), 0));
+    EXPECT_TRUE(
+        control_.installer.TryUpdateLeasePolicy(Basis(10), Basis(11), 2000));
+    EXPECT_EQ(original_lease->deadline(), old_deadline);
+    EXPECT_FALSE(control_.installer.TryRenewLease(grant));
+    grant.projection_ = Basis(11);
+    EXPECT_FALSE(control_.installer.TryRenewLease(grant));
+    grant.granted_duration_ = 2s;
+    EXPECT_TRUE(control_.installer.TryRenewLease(grant));
+    EXPECT_EQ(original_lease->deadline(),
+              (grant.sent_at_ + 2s).time_since_epoch());
+    EXPECT_TRUE(
+        control_.installer.TryUpdateLeasePolicy(Basis(11), Basis(12), 1000));
+    grant.projection_ = Basis(12);
+    EXPECT_FALSE(control_.installer.TryRenewLease(grant));
+    grant.granted_duration_ = lease_duration;
+    EXPECT_TRUE(control_.installer.TryRenewLease(grant));
+    EXPECT_EQ(original_lease->deadline(), old_deadline);
+    EXPECT_EQ(control_.actions.expiration_lease_, original_lease);
+    EXPECT_EQ(control_.actions.source_lease_, original_lease);
     control_.actions.block_expiration_authority_enable_ = false;
     control_.actions.block_source_admission_enable_ = false;
     result_ = co_await control_.installer.ApplyLeaseGrantTransition(grant);

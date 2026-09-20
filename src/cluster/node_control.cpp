@@ -1286,6 +1286,23 @@ absl::Status NodeControlInstaller::InstallRouting(PreparedFullState prepared) {
                                &effects);
 }
 
+bool NodeControlInstaller::TryUpdateLeasePolicy(ProjectionBasis previous,
+                                                ProjectionBasis next,
+                                                std::uint32_t duration_ms) {
+  if (!projection_basis_ || *projection_basis_ != previous ||
+      next.control_revision_ <= previous.control_revision_ ||
+      duration_ms == 0 || storage_failed_ ||
+      !active_control_transitions_.empty() ||
+      source_revocation_transitions_ != 0)
+    return false;
+  projection_basis_ = next;
+  authority_lease_duration_ms_ = duration_ms;
+  for (const auto& [group, schedule] : lease_expiry_schedules_) {
+    if (schedule->projection_ == previous) schedule->projection_ = next;
+  }
+  return true;
+}
+
 bycorf::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
     PreparedFullState prepared_state, ProjectionBasis projection_basis,
     bool local_population_transition_expected,
@@ -1439,19 +1456,33 @@ bool NodeControlInstaller::TryRenewLease(const AuthorityMessage& message) {
       schedule.session_ != message.session_ ||
       schedule.anchor_ != message.anchor_ ||
       schedule.projection_ != message.projection_ ||
-      schedule.admission_generation_ != directive_admission_generation_ ||
-      schedule.granted_duration_ != message.granted_duration_)
+      schedule.admission_generation_ != directive_admission_generation_)
+    return false;
+  const bool policy_changed =
+      schedule.granted_duration_ != message.granted_duration_;
+  const MonotonicTime now = LeaseClockNow();
+  if (policy_changed &&
+      (message.granted_duration_ !=
+           std::chrono::milliseconds(authority_lease_duration_ms_) ||
+       !ValidateLeaseGrantContext(message, now).ok()))
     return false;
   const MonotonicTime deadline = SaturatingLeaseDeadline(message);
-  // A delayed/out-of-order same-epoch grant must not shorten authority. Such
-  // cases retain the full validation and timer-replacement path below.
-  if (deadline < schedule.deadline_ || deadline == MonotonicTime::max())
+  // Only an exact newly installed policy may shorten the shared deadline.
+  // Replays at the old duration cannot extend authority after a policy change.
+  if (message.granted_duration_ !=
+          std::chrono::milliseconds(authority_lease_duration_ms_) ||
+      (!policy_changed && deadline < schedule.deadline_) ||
+      deadline == MonotonicTime::max())
     return false;
-  if (!schedule.lease_->Renew(LeaseClockNow().time_since_epoch(),
+  if (!schedule.lease_->Renew(now.time_since_epoch(),
                               deadline.time_since_epoch())) {
     return false;
   }
   schedule.deadline_ = deadline;
+  schedule.granted_duration_ = message.granted_duration_;
+  schedule.recheck_interval_ =
+      std::min(schedule.recheck_interval_,
+               LeaseExpiryRecheckInterval(message.granted_duration_));
   return true;
 }
 
@@ -1667,10 +1698,10 @@ bycorf::Task<absl::Status> NodeControlInstaller::ExpireLeaseAt(
   if (!schedule->active_ || schedule->timer_generation_ != timer_generation) {
     co_return absl::OkStatus();
   }
-  // Renewal updates the shared schedule. An extension keeps this timer unless
-  // the new grant requires a shorter recheck slice; a deadline shortening or
-  // smaller slice replaces its generation, so this stale task cannot touch
-  // the replacement lease.
+  // Atomic renewal, including a policy change, updates this shared schedule.
+  // Relative sleeps are bounded; request/TTL/source admission also checks the
+  // atomic deadline synchronously. Full grant installation can replace the
+  // timer generation, in which case this stale task cannot touch its lease.
   co_return co_await FinishExpiredLeaseTransition(schedule, LeaseClockNow());
 }
 

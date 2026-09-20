@@ -2208,7 +2208,27 @@ struct MetaControlClientService::Impl {
             next->local.lease_duration_ms)) > state->observation_ttl_)
       co_return absl::InvalidArgumentError(
           "heartbeat interval exceeds observation TTL");
-    if (local_changed || tasks_changed) {
+    // Duration changes neither replace authority identity nor invalidate any
+    // data-worker capability. Keep the original finite lease until a grant
+    // for the new policy arrives. An in-flight directive/control transition
+    // retains the ordinary joined installation path.
+    const bool policy_only =
+        local_changed && !tasks_changed && !routing_changed &&
+        next->local.lease_duration_ms !=
+            state->desired_->local.lease_duration_ms &&
+        next->local.groups == state->desired_->local.groups &&
+        next->local.manifests == state->desired_->local.manifests &&
+        next->directory == state->desired_->directory &&
+        !state->directive_runner_running_ && state->directive_queue_.empty() &&
+        installer_.TryUpdateLeasePolicy(
+            ProjectionBasis{state->desired_->local.revision},
+            ProjectionBasis{next->local.revision},
+            next->local.lease_duration_ms);
+    if (policy_only) {
+      // Detach a previous-projection Ack and order Applied before the next
+      // challenge, without waiting for a producer sampling a busy data shard.
+      RequestHeartbeatPause(state);
+    } else if (local_changed || tasks_changed) {
       DisableDirectiveDispatch(state);
       RequestHeartbeatPause(state);
       if (auto status = co_await WaitForHeartbeatQuiesced(state); !status.ok())
@@ -2234,15 +2254,23 @@ struct MetaControlClientService::Impl {
     }
     directory_ = std::move(directory);
     state->desired_ = std::move(next);
-    state->heartbeat_interval_ =
+    const auto next_interval =
         std::chrono::milliseconds(control::DataHeartbeatIntervalMs(
             state->desired_->local.lease_duration_ms));
+    // The old short lease still protects service until the first new grant.
+    // Slowing down immediately after installing a longer policy can expire it.
+    state->heartbeat_interval_ =
+        local_changed && MetaLeaseChallengeRotation::IsCommittedOwner(
+                             state->desired_->local.groups, options_.node_id_)
+            ? std::min(state->heartbeat_interval_, next_interval)
+            : next_interval;
     if (auto status =
             co_await SendApplied(writer, *state->desired_, update.request_id);
         !status.ok())
       co_return status;
     state->directive_dispatch_enabled_ = true;
     ResumeHeartbeat(state);
+    if (policy_only) co_return absl::OkStatus();
     co_return co_await QueueCurrentTasks(state);
   }
 
@@ -2349,9 +2377,10 @@ struct MetaControlClientService::Impl {
 
   bycorf::Task<absl::Status> SleepHeartbeatInterval(
       const std::shared_ptr<SessionState>& state) {
+    const auto revision = state->desired_->local.revision;
     const auto deadline =
         std::chrono::steady_clock::now() + state->heartbeat_interval_;
-    while (!state->closing_ &&
+    while (!state->closing_ && state->desired_->local.revision == revision &&
            !state->heartbeat_projection_gate_.pause_requested()) {
       const auto now = std::chrono::steady_clock::now();
       if (now >= deadline) break;
@@ -2599,6 +2628,7 @@ struct MetaControlClientService::Impl {
           heartbeat_challenge.has_value()
               ? std::optional<control::WireId128>(heartbeat_challenge->nonce)
               : std::nullopt;
+      const auto challenge_revision = state->desired_->local.revision;
       result = co_await state->writer_->Write(
           control::MessagePriority::kAuthority,
           control::WireMessage(std::move(heartbeat)),
@@ -2612,7 +2642,8 @@ struct MetaControlClientService::Impl {
             }
           });
       if (!result.ok()) break;
-      if (state->heartbeat_projection_gate_.pause_requested()) {
+      if (state->heartbeat_projection_gate_.pause_requested() ||
+          state->desired_->local.revision != challenge_revision) {
         // RequestHeartbeatPause detached this sequence from authority before
         // waiting for the write. The successful write means Meta will still
         // advance its business sequence, so resume at the following value and
@@ -2647,6 +2678,9 @@ struct MetaControlClientService::Impl {
         break;
       }
       ++heartbeat_sequence;
+      // A policy update can pause and resume entirely while Write/Wait is
+      // suspended. Do not sleep on the superseded projection's cadence.
+      if (state->desired_->local.revision != challenge_revision) continue;
       result = co_await SleepHeartbeatInterval(state);
       if (!result.ok()) break;
     }
@@ -2762,6 +2796,8 @@ struct MetaControlClientService::Impl {
             "lease installation overtook queued directive admission");
       }
       if (!renewed) state->directive_dispatch_enabled_ = true;
+      state->heartbeat_interval_ = std::chrono::milliseconds(
+          control::DataHeartbeatIntervalMs(grant->granted_duration_ms));
       RecordClusterControlLeaseGrant();
     } else if (const auto* denied =
                    std::get_if<control::LeaseDenied>(&ack.lease_decision)) {

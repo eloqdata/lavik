@@ -498,6 +498,13 @@ progress, but its lease decision is ignored. Heartbeats resume only after the
 new desired object is installed and `FullStateApplied` is written, so an old
 Ack cannot causally confirm the replacement projection and an old Ready proof
 cannot be evaluated against a new assignment, manifest, or population epoch.
+Pure duration changes with identical selected objects and no concurrent control
+or directive admission barrier can install directly on the control worker.
+They detach old challenges and order `FullStateApplied` before the next one,
+but need not join data-worker observations because their identity is unchanged.
+The existing finite deadline survives installation; a grant matching the new
+policy updates the shared deadline atomically, including when the policy shrinks.
+An owner keeps the shorter heartbeat cadence until that grant is installed.
 
 Task admission replies with `DirectiveResponse.started`; the asynchronous
 `DirectiveResult` is accepted independently of that response. There is no
