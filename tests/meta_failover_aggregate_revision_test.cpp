@@ -50,6 +50,7 @@ std::string NodeId(std::uint8_t suffix) {
 meta::SubmitOperation ClusterCreateRoot() {
   meta::ClusterCreateManifestV1 manifest;
   manifest.schema_version_ = 1;
+  manifest.client_mode_ = lavik::ClientMode::kCluster;
   manifest.meta_members_ = {{1, "tcp://127.0.0.1:7101", "tcp://127.0.0.1:7301",
                              "tcp://127.0.0.1:7201"}};
   manifest.data_nodes_ = {{NodeId(1), "tcp://127.0.0.1:6379"}};
@@ -96,8 +97,10 @@ void PopulateActivatedFixture(Fixture& fixture,
   // orderings that a correctly sequenced ApplyCommitted stream cannot emit.
   const meta::SubmitOperation root = ClusterCreateRoot();
   ASSERT_TRUE(fixture.stores.operation_.SubmitOperation(root, 1).ok());
-  ASSERT_TRUE(
-      fixture.stores.topology_.BeginClusterCreate(root.operation_id_, 1).ok());
+  ASSERT_TRUE(fixture.stores.topology_
+                  .BeginClusterCreate(root.operation_id_, 1,
+                                      lavik::ClientMode::kCluster)
+                  .ok());
 
   meta::CompleteOperation complete;
   complete.request_id_ = Filled<16>(0x03);

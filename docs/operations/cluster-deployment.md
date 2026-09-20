@@ -16,17 +16,30 @@ limitations under the License.
 
 # Cluster deployment quick start
 
-Data startup uses two independent options:
+Data without `meta-seed` starts standalone. With Meta seeds, Data obtains the
+immutable `client_mode = "single" | "cluster"` from the committed creation
+manifest before initializing storage. Do not configure a local client mode.
+A managed node waits for Meta creation and registration without opening Redis;
+identity or capability incompatibility fails startup. A cluster's mode cannot
+be changed after creation.
 
-| Option | Default | Meaning |
-|---|---|---|
-| `client-mode single\|cluster` | `single` | Redis client semantics and DB range (16 DBs or DB0) |
-| `meta-managed yes\|no` | `no` | Meta authority, control session and native replication |
+Managed Single has exactly one Group covering every slot. It serves DB0 basic
+single-key commands, collections, TTL and PUBLISH through shared Group authority.
+Complete replicas accept ordinary read connections without READONLY. Configure
+`replica-serve-stale-data yes|no` in the file or through CONFIG GET/SET; the default
+`yes` permits complete stale data during disconnection. `no` returns MASTERDOWN
+for data requests while the replication link is down. Initial FULL and invalid
+populations return LOADING in either setting; replicas always reject mutations.
+Multi-key operations, nonzero DBs, transactions, scripts, blocking operations
+and global data/catalog paths remain explicitly unsupported in managed Single.
+Cluster retains its current routing and READONLY contract.
 
-Use the same values on the CLI (`--client-mode cluster --meta-managed yes`).
-Configuration files load first; explicitly supplied CLI values override them.
-Cluster without Meta and managed Single are rejected before storage preparation;
-managed Single is not yet available. Non-Meta Single retains Redis/Redis Cluster
+No seeds means the existing standalone recovery rules also apply to files last
+used by a managed node. There is no detach step or extra persisted management
+marker. An incomplete destructive FULL remains protected by the existing
+storage integrity fence.
+
+Non-Meta Single retains Redis/Redis Cluster
 follower support through `replicaof`, `redis-replicaof`, `REPLICAOF`/`SLAVEOF`,
 and `ADDREPLICAOF`. These entry points reject Lavik upstreams before retiring
 existing subscriptions or replacing data. Lavik peers use Meta native Follow
@@ -41,8 +54,9 @@ automatically. Existing process-local Redis offsets support reconnect, not durab
 cross-process resume or automatic Meta takeover.
 
 **Configuration change:** `cluster-enabled` and the old `cluster-*` identity,
-seed and announce options have been removed, without aliases. Use `client-mode`,
-`meta-managed`, `meta-seed`, `node-id`, `announce-ip`, `announce-port` and
+seed and announce options have been removed, without aliases. Local `client-mode`
+and `meta-managed` options are also removed and return migration hints. Use
+`meta-seed`, `node-id`, `announce-ip`, `announce-port` and
 `announce-tls-port`. Meta-managed nodes require a stable 40-character lowercase
 hex node ID and numeric Meta seed endpoints; they reject external upstreams and
 `load-rdb`. TLS requirements are unchanged. Old generated launch scripts must be

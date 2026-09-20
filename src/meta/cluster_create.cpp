@@ -106,6 +106,8 @@ bool CanonicalEndpoint(std::string_view value,
 
 absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
   if (manifest == nullptr || manifest->schema_version_ != 1 ||
+      !manifest->client_mode_.has_value() ||
+      !IsValidClientMode(*manifest->client_mode_) ||
       manifest->meta_members_.empty() || manifest->data_nodes_.empty() ||
       manifest->groups_.empty() ||
       manifest->meta_members_.size() > kMaxManifestItems ||
@@ -113,6 +115,10 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
       manifest->groups_.size() > kMaxManifestItems ||
       manifest->slot_ranges_.size() > kMaxManifestItems) {
     return Invalid("clustercreate manifest is not a supported v1 topology");
+  }
+  if (manifest->client_mode_ == ClientMode::kSingle &&
+      manifest->groups_.size() != 1) {
+    return Invalid("Single requires exactly one Group covering all slots");
   }
   if (manifest->automatic_uncontrolled_failover_suspect_after_ms_ <
           kMinimumAutomaticFailoverSuspectAfterMs ||
@@ -570,6 +576,16 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
         auto value = ParseUnsigned<std::uint32_t>(item);
         if (!value.ok()) return value.status();
         result.schema_version_ = *value;
+      } else if (item.name == "client_mode") {
+        auto value = ParseString(item);
+        if (!value.ok()) return value.status();
+        if (*value == "single") {
+          result.client_mode_ = ClientMode::kSingle;
+        } else if (*value == "cluster") {
+          result.client_mode_ = ClientMode::kCluster;
+        } else {
+          return Invalid("client_mode must be single or cluster");
+        }
       } else if (item.name == "slot_strategy") {
         auto value = ParseString(item);
         if (!value.ok()) return value.status();
@@ -686,8 +702,10 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
   if (section != Section::kNone) {
     if (absl::Status status = finish_section(); !status.ok()) return status;
   }
-  if (!top_fields.contains("schema_version") || result.meta_members_.empty()) {
-    return Invalid("manifest requires schema_version and Meta members");
+  if (!top_fields.contains("schema_version") ||
+      !top_fields.contains("client_mode") || result.meta_members_.empty()) {
+    return Invalid(
+        "manifest requires schema_version, client_mode and Meta members");
   }
   if (result.slots_generated_ && !result.slot_ranges_.empty()) {
     return Invalid("slot_strategy and slot_ranges are mutually exclusive");
@@ -716,6 +734,7 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
   writer.Raw(
       std::string_view(reinterpret_cast<const char*>(root_operation_id.data()),
                        root_operation_id.size()));
+  writer.U16(static_cast<std::uint16_t>(*manifest.client_mode_) + 1);
   writer.U32(static_cast<std::uint32_t>(
       manifest.automatic_uncontrolled_failover_suspect_after_ms_));
   writer.U32(static_cast<std::uint32_t>(manifest.authority_lease_duration_ms_));
@@ -798,6 +817,11 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
 
   ClusterCreateManifestV1 manifest;
   manifest.schema_version_ = 1;
+  auto client_mode = reader.U16();
+  if (!client_mode.ok() || *client_mode < 1 || *client_mode > 2) {
+    return Invalid("invalid clustercreate client_mode");
+  }
+  manifest.client_mode_ = static_cast<ClientMode>(*client_mode - 1);
   auto suspect_after_ms = reader.U32();
   auto authority_lease_duration_ms = reader.U32();
   auto candidate_recovery_budget_ms = reader.U32();

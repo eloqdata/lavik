@@ -100,7 +100,9 @@ struct ServerOptions {
   std::uint32_t defrag_record_sleep_us_ = 0;
   bool defrag_paused_ = false;
   std::optional<ReplicaOfConfig> replicaof_;
-  // Client semantics and authority source are independent startup choices.
+  // Internal startup facts: management is derived from Meta seeds and the
+  // client mode is resolved before storage initialization. No external
+  // switches.
   ClientMode client_mode_ = ClientMode::kSingle;
   bool meta_managed_ = false;
   // Meta is the only supported control source. The directory learned from

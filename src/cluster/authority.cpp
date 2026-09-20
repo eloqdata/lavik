@@ -34,9 +34,14 @@ std::atomic<std::uint64_t> next_authority_cache_identity{1};
 // Managed Single has one authority for the entire keyspace. A representative
 // slot lets the existing lease/drain/token machinery check that Group once.
 std::span<const std::uint16_t> AuthoritySlots(const RequestView& request) {
-  return request.client_mode_ == ClientMode::kSingle && !request.slots_.empty()
-             ? request.slots_.first(1)
-             : request.slots_;
+  if (request.client_mode_ != ClientMode::kSingle) return request.slots_;
+  if (!request.slots_.empty()) return request.slots_.first(1);
+  // Keyless data still belongs to the one Group; only diagnostics may bypass
+  // authority. This also closes the empty-key-set escape hatch for new paths.
+  static constexpr std::uint16_t representative = 0;
+  return request.loading_allowed_
+             ? request.slots_
+             : std::span<const std::uint16_t>(&representative, 1);
 }
 
 bool HasSingleFullGroup(const ServingState* state) {
@@ -169,14 +174,21 @@ Decision Admit(const ServingState* state, const RequestView& request) {
   // A READONLY connection on a replica of the owning group serves reads
   // locally; staleness is the client's explicit choice. Writes and
   // non-READONLY reads redirect to the primary.
-  if (self_index != kNoNodeIndex && !request.is_write_ &&
-      request.connection_readonly_) {
+  if (self_index != kNoNodeIndex &&
+      (request.client_mode_ == ClientMode::kSingle ||
+       (!request.is_write_ && request.connection_readonly_))) {
     for (NodeIndex replica_index : group->replica_node_indices_) {
       if (replica_index == self_index) {
-        decision.kind_ = Decision::Kind::kServeStaleRead;
+        decision.kind_ = request.is_write_ ? Decision::Kind::kReadOnly
+                                           : Decision::Kind::kServeStaleRead;
         return decision;
       }
     }
+  }
+
+  if (request.client_mode_ == ClientMode::kSingle) {
+    decision.kind_ = Decision::Kind::kClusterDownUnbound;
+    return decision;
   }
 
   const NodeDescriptor* primary = state->NodeAt(group->primary_node_index_);

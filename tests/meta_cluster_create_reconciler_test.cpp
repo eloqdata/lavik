@@ -56,6 +56,8 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
     }
 
     manifest_.schema_version_ = 1;
+
+    manifest_.client_mode_ = lavik::ClientMode::kCluster;
     for (const std::uint32_t id : {1U, 2U, 3U}) {
       manifest_.meta_members_.push_back(
           {id, "tcp://127.0.0.1:" + std::to_string(7100 + id),

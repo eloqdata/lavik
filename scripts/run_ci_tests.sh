@@ -22,8 +22,9 @@ build_dir=$(realpath -- "${1:-build_ci}")
 results_dir="$build_dir/test-results"
 mkdir -p "$results_dir"
 
-if [[ ! -d /mnt/dev || ! -w /mnt/dev ]]; then
-  echo "Large-collection tests require a writable /mnt/dev for private scratch files." >&2
+export LAVIK_TEST_DATA_DIR=${LAVIK_TEST_DATA_DIR:-/mnt/dev}
+if [[ ! -d "$LAVIK_TEST_DATA_DIR" || ! -w "$LAVIK_TEST_DATA_DIR" ]]; then
+  echo "Tests require a writable LAVIK_TEST_DATA_DIR for private scratch files." >&2
   exit 1
 fi
 

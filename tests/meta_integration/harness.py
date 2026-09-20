@@ -148,7 +148,7 @@ def write_initial_meta_manifest(path, members):
     exercise Raft and membership. Nothing persists the Data portion until an
     operator submits `cluster-create`.
     """
-    lines = ["schema_version = 1", ""]
+    lines = ["schema_version = 1", 'client_mode = "cluster"', ""]
     for node_id, raft, data_control, ctl in sorted(members):
         lines.extend([
             "[[meta_members]]",

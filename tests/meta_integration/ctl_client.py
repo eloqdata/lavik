@@ -355,7 +355,7 @@ def scripted_cluster_create_gate(workdir):
     manifest = os.path.join(directory, "cluster.toml")
     with open(manifest, "w", encoding="utf-8") as output:
         output.write(
-            "schema_version = 1\n\n"
+            'schema_version = 1\nclient_mode = "cluster"\n\n'
             "[[meta_members]]\nid = 1\n"
             'raft_endpoint = "tcp://127.0.0.1:7001"\n'
             'data_control_endpoint = "tcp://127.0.0.1:7101"\n'
@@ -1054,7 +1054,7 @@ def mtls_gate(workdir):
         create_node = "0123456789abcdef0123456789abcdef01234567"
         with open(create_manifest, "w", encoding="utf-8") as output:
             output.write(
-                "schema_version = 1\n\n"
+                'schema_version = 1\nclient_mode = "cluster"\n\n'
                 "[[meta_members]]\nid = 1\n"
                 f'raft_endpoint = "tcp://127.0.0.1:{raft_port}"\n'
                 f'data_control_endpoint = "tcp://127.0.0.1:{data_control_port}"\n'

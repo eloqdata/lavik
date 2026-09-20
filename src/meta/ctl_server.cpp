@@ -459,6 +459,7 @@ std::string BuildClusterStatusReply(
       .topology_epoch_ = view.topology_epoch_,
   };
   status.lifecycle_revision_ = view.cluster_lifecycle_.Revision();
+  status.client_mode_ = view.cluster_lifecycle_.client_mode_;
   switch (view.cluster_lifecycle_.state_) {
     case MetaClusterLifecycle::kUninitialized:
       status.cluster_state_ = view.cluster_non_pristine_

@@ -31,6 +31,7 @@
 #include "absl/status/statusor.h"
 #include "bycorf/net/tcp_stream.h"
 #include "bycorf/runtime/task.h"
+#include "lavik/client_mode.h"
 #include "lavik/replication_group.h"
 
 namespace bycorf {
@@ -95,12 +96,14 @@ struct ReplicationOptions {
   // upstream control; native export requires an exact
   // population grant from the active Meta session.
   bool meta_managed_ = false;
+  ClientMode client_mode_ = ClientMode::kSingle;
   // Set by the Meta control adapter to its validated 160-bit data-node
   // identity. Standalone deployments use a fresh CSPRNG identity each boot.
   std::optional<std::string> node_id_override_;
   // Consulted only while this node has an upstream. REPLICAOF NO ONE opens
   // writes only after the shared promotion durability path succeeds.
   bool replica_read_only_ = true;
+  bool replica_serve_stale_data_ = true;
   // Redis Sentinel promotes only replicas with a nonzero priority and prefers
   // lower values. This is runtime mutable through CONFIG SET.
   unsigned replica_priority_ = 100;
@@ -798,6 +801,16 @@ class ReplicationManager {
   bycorf::Task<std::uint64_t> CountOnlineNativeReplicas() const;
   bool is_replica() const noexcept;
   bool is_loading() const noexcept;
+  enum class DatasetReadState { kReadable, kLoading, kStaleDisabled };
+  // Client reads distinguish incomplete populations from an offline link.
+  // Recovery and role transitions continue using is_loading().
+  DatasetReadState dataset_read_state() const noexcept;
+  bool replica_serve_stale_data() const noexcept {
+    return replica_serve_stale_data_.load(std::memory_order_acquire);
+  }
+  void SetReplicaServeStaleData(bool enabled) noexcept {
+    replica_serve_stale_data_.store(enabled, std::memory_order_release);
+  }
   bool reject_writes() const noexcept;
   // Changes before a topology directive retires or creates a publication
   // history. Command admission uses it to reject writes delayed across that
@@ -822,6 +835,7 @@ class ReplicationManager {
   // token directly in the public manager rather than behind ReplicationGroup's
   // pImpl pointer; transitions remain cold and receive this atomic by address.
   std::atomic<std::uint64_t> serving_generation_{3};
+  std::atomic<bool> replica_serve_stale_data_{true};
   std::unique_ptr<ReplicationGroup> group_;
   ReplicationOptions options_;
 };

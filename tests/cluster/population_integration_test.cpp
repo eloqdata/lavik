@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <sys/wait.h>
+
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -36,8 +38,7 @@ using lavik::test::WaitUntil;
 
 std::string g_lavik_binary;
 
-TEST(PopulationIntegrationTest,
-     ClusterProcessStartsFailClosedAndRejectsStandaloneRoleControl) {
+TEST(PopulationIntegrationTest, ManagedStartupWaitsForMetaWithoutOpeningRedis) {
   ASSERT_FALSE(g_lavik_binary.empty());
   TempDirectory directory("cluster-population");
   const std::filesystem::path data = directory.path() / "node.data";
@@ -46,25 +47,21 @@ TEST(PopulationIntegrationTest,
   PortReservation reservation;
   const std::uint16_t port = reservation.ReleaseForSpawn();
   ChildProcess process(
-      {g_lavik_binary, "--client-mode", "cluster", "--meta-managed", "yes",
-       "--port", std::to_string(port), "--node-id",
+      {g_lavik_binary, "--port", std::to_string(port), "--node-id",
        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--meta-seed", "127.0.0.1:1",
        "--threads", "1", "--no-pin-workers", "--logtostderr",
        "--recv-buffers-per-worker", "0", "--data-file", data.string()},
       log);
 
-  WaitUntil("cluster node startup", 20s, [&] {
-    RespClient client = Connect(port, 200ms);
-    return client.Command({"PING"}) == "+PONG";
+  WaitUntil("bootstrap retries unavailable Meta", 20s, [&] {
+    return lavik::test::ReadFile(log).find("waiting for Meta bootstrap:") !=
+           std::string::npos;
   });
-  RespClient client = Connect(port);
-  EXPECT_EQ(client.Command({"GET", "unassigned"}),
-            "-LOADING Lavik is loading the dataset from the primary");
-  EXPECT_EQ(client.Command({"SET", "unassigned", "value"}),
-            "-LOADING Lavik is loading the dataset from the primary");
-  EXPECT_EQ(client.Command({"REPLICAOF", "NO", "ONE"}),
-            "-ERR REPLICAOF not allowed in Meta-managed mode.");
-  process.Stop(SIGINT);
+  EXPECT_THROW(Connect(port, 200ms), std::runtime_error);
+  ASSERT_EQ(::kill(process.pid(), SIGINT), 0);
+  const int status = process.Wait(2s);
+  EXPECT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 }  // namespace

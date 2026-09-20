@@ -2229,6 +2229,7 @@ class ReplicationManager::ReplicationGroup {
   bool is_redis_follower() const noexcept;
 
   bool is_loading() const noexcept;
+  DatasetReadState dataset_read_state(bool serve_stale) const noexcept;
 
   absl::Status SetSnapshotReadConcurrency(unsigned concurrency) noexcept;
 
@@ -2680,6 +2681,7 @@ class ReplicationManager::ReplicationGroup {
   // remaining bits are a monotonic dataset generation.
   std::atomic<std::uint64_t>* const serving_generation_;
   const bool meta_managed_;
+  const bool single_client_mode_;
   // The existing discovery cancellation set also covers target-session
   // sockets, including connect/TLS. It is declared before their shared owners
   // so it outlives them. Only socket lifecycle/shutdown touches this registry;

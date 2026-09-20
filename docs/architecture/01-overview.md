@@ -115,12 +115,15 @@ operator --> lavik-ctl cluster-status / failover / getop
 | Meta control plane | Replicate metadata commands and typed global Policy, project node-specific desired state, publish leader-scoped Data sessions, detect sustained current-Owner failure, reconcile committed failover transitions, and expose authenticated administration plus stable cluster readiness | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaControlProjector`, `meta::MetaDataControlServer`, `meta::MetaAutomaticFailoverReconciler`, `meta::MetaFailoverReconciler` |
 | Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account retained memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
 
-Client mode and management status are separate startup inputs. `client-mode`
-selects Single (16 logical DBs) or Cluster (DB0) semantics; `meta-managed`
-selects the Meta session and finite-authority lifecycle. Default startup is
-Single without Meta. Cluster requires Meta; managed Single is not yet admitted
-at startup. Invalid combinations fail before storage preparation. Configuration
-names and deployment examples are in the [deployment guide](../operations/cluster-deployment.md).
+Meta seeds determine management status. Without seeds, Data starts standalone
+with 16 logical DBs and the existing Redis follower/recovery behavior. With
+seeds, Data first authenticates to Meta and obtains the immutable committed
+Single or Cluster client mode before constructing storage or opening Redis.
+Cluster uses DB0 storage; Single retains the standalone storage layout but
+currently exposes only safe DB0 commands under Group authority. The Topology
+root owns the mode; Data has no local mode override or durable management
+provenance marker. Configuration migration and supported commands are described
+in the [deployment guide](../operations/cluster-deployment.md).
 
 ## Process lifecycle
 
@@ -128,7 +131,9 @@ names and deployment examples are in the [deployment guide](../operations/cluste
    validates the combined options, and initializes logging.
 2. `RunServer` selects Bycorf's process-wide I/O backends before storage probing,
    buffer allocation, or worker startup freezes the selection. It then
-   initializes the memory budget, signal handling, storage engine, replication
+   initializes the memory budget and signal handling, performs cancellable
+   read-only Meta bootstrap on the main thread when seeds are configured, then
+   constructs the storage engine, replication
    manager, cluster topology/authority/node-controller runtime,
    command/storage bindings, metrics shards, transaction runtime, and Bycorf
    service graph. Meta-managed mode starts the outbound Meta control client

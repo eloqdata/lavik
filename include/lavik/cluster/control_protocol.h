@@ -36,6 +36,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "lavik/client_mode.h"
 
 namespace lavik::cluster::control {
 
@@ -101,6 +102,8 @@ enum class MessageType : std::uint16_t {
   // existing TransferKind::kFullDesiredState Start/Chunk/End form.
   kFullDesiredState = 18,
   kNodeControlUpdate = 19,
+  kBootstrapHello = 20,
+  kBootstrapReply = 21,
 };
 
 struct Frame {
@@ -161,6 +164,43 @@ struct WireMetaEndpoint {
                          const WireMetaEndpoint&) = default;
 };
 
+// Immutable Genesis identity and service mode. A bootstrap response, regular
+// session and every projection must name the same declaration for this boot.
+struct ServiceDeclaration {
+  std::optional<ClientMode> client_mode;
+  WireId128 creation_id{};
+  std::uint64_t genesis_commit_index = 0;
+  bool operator==(const ServiceDeclaration&) const = default;
+};
+
+inline constexpr std::uint32_t kSingleServiceMode = 1;
+inline constexpr std::uint32_t kClusterServiceMode = 2;
+inline constexpr std::uint32_t kDb0GroupAuthority = 1;
+inline constexpr std::uint32_t kReplicaPopulationRead = 2;
+
+struct ClientServiceCapabilities {
+  // Zero means unreported, never the current build's implicit defaults.
+  std::uint32_t supported_modes = 0;
+  std::uint32_t services = 0;
+  std::optional<ClientMode> installed_mode;
+  std::uint32_t database_count = 0;
+  bool operator==(const ClientServiceCapabilities&) const = default;
+};
+
+// Shared by bootstrap and boot-bound session admission. Only a compatible
+// admitted session can publish initialization, candidate or activation proof.
+absl::Status ValidateClientService(
+    const ServiceDeclaration& declaration,
+    const ClientServiceCapabilities& capabilities, bool require_installed);
+
+struct BootstrapHello {
+  std::uint16_t minimum_version = kProtocolVersion;
+  std::uint16_t maximum_version = kProtocolVersion;
+  std::string node_id;
+  ClientServiceCapabilities capabilities;
+  bool operator==(const BootstrapHello&) const = default;
+};
+
 struct ClientHello {
   std::uint16_t minimum_version = kProtocolVersion;
   std::uint16_t maximum_version = kProtocolVersion;
@@ -170,6 +210,8 @@ struct ClientHello {
   // Native source layout for this boot/history, independent of any upstream
   // source layout when this node is a replica. Zero is not a valid layout.
   std::uint32_t replication_flow_count = 0;
+  ServiceDeclaration service;
+  ClientServiceCapabilities capabilities;
 
   friend bool operator==(const ClientHello&, const ClientHello&) = default;
 };
@@ -178,6 +220,7 @@ enum class ServerHelloDisposition : std::uint8_t {
   kAccepted = 1,
   kNotLeader = 2,
   kLeaderUnknown = 3,
+  kRejected = 4,
 };
 
 struct ServerHello {
@@ -191,8 +234,25 @@ struct ServerHello {
   std::vector<WireMetaEndpoint> directory;
   std::uint32_t observation_ttl_ms = 0;
   std::uint32_t session_progress_timeout_ms = 0;
+  ServiceDeclaration service;
+  std::string rejection_reason;
 
   friend bool operator==(const ServerHello&, const ServerHello&) = default;
+};
+
+enum class BootstrapDisposition : std::uint8_t {
+  kReady = 1,
+  kRetry = 2,
+  kIncompatible = 3,
+  kUnauthorized = 4,
+};
+
+struct BootstrapReply {
+  BootstrapDisposition disposition = BootstrapDisposition::kRetry;
+  // Reuses authenticated leader discovery. Session identity/generation are
+  // always zero: bootstrap never creates a lease-bearing Data session.
+  ServerHello server;
+  bool operator==(const BootstrapReply&) const = default;
 };
 
 enum class TransferKind : std::uint16_t {
@@ -882,6 +942,7 @@ struct WireProjectedDirective {
 // Complete node-specific semantic projection sent either as one typed frame
 // or as a FullDesiredState large object after each accepted session.
 struct FullDesiredState {
+  ServiceDeclaration service;
   // Bootstrap seed for local control and routing revisions. Later updates
   // advance each object independently; Data does not follow a Meta log index.
   std::uint64_t control_revision = 0;
@@ -948,6 +1009,7 @@ struct TaskChanges {
 // version. request_id correlates the acknowledgement; it is not a state
 // version.
 struct NodeControlUpdate {
+  ServiceDeclaration service;
   WireId128 request_id{};
   std::optional<RoutingState> routing;
   std::optional<LocalGroupState> local;
@@ -958,6 +1020,7 @@ struct NodeControlUpdate {
 
 // Data's retained control state. FullDesiredState is a bootstrap input only.
 struct NodeControlState {
+  ServiceDeclaration service;
   RoutingState routing;
   LocalGroupState local;
   MetaDirectoryState directory;
@@ -1014,11 +1077,11 @@ bool SameDesiredState(const FullDesiredState& left,
                       const FullDesiredState& right);
 
 using WireMessage =
-    std::variant<ClientHello, ServerHello, TransferStart, TransferChunk,
-                 TransferEnd, TransferAbort, FullStateApplied, Heartbeat,
-                 HeartbeatAck, Fence, FenceAck, Directive, DirectiveResponse,
-                 DirectiveResult, ResultCommitted, ResultNoLongerTracked,
-                 FullDesiredState, NodeControlUpdate>;
+    std::variant<BootstrapHello, BootstrapReply, ClientHello, ServerHello,
+                 TransferStart, TransferChunk, TransferEnd, TransferAbort,
+                 FullStateApplied, Heartbeat, HeartbeatAck, Fence, FenceAck,
+                 Directive, DirectiveResponse, DirectiveResult, ResultCommitted,
+                 ResultNoLongerTracked, FullDesiredState, NodeControlUpdate>;
 
 MessageType MessageTypeOf(const WireMessage& message) noexcept;
 

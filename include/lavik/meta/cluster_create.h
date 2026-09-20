@@ -22,11 +22,13 @@
 // identity and advertised topology.
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "lavik/client_mode.h"
 #include "lavik/meta/commands.h"
 #include "lavik/meta/policy_store.h"
 
@@ -68,6 +70,9 @@ struct ClusterCreateManifestV1 {
   };
 
   std::uint32_t schema_version_ = 0;
+  // Absence is invalid, including callers constructing a manifest directly.
+  // Meta commits this once; Data never supplies a local default for it.
+  std::optional<ClientMode> client_mode_;
   std::uint64_t automatic_uncontrolled_failover_suspect_after_ms_ =
       kDefaultAutomaticFailoverSuspectAfterMs;
   std::uint64_t authority_lease_duration_ms_ = kDefaultAuthorityLeaseDurationMs;

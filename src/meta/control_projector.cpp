@@ -386,6 +386,9 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
     return Inconsistent("committed view has applied index zero");
   }
   control::FullDesiredState state;
+  const auto& lifecycle = stores.topology_.ClusterLifecycle();
+  state.service = {lifecycle.client_mode_, lifecycle.root_operation_id_,
+                   lifecycle.genesis_commit_index_};
   state.control_revision = applied_index;
   state.topology_epoch = stores.topology_.TopologyEpoch();
   const std::optional<MetaAuthorityLeasePolicy> authority_lease =

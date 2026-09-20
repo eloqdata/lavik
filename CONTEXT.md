@@ -21,6 +21,26 @@ control plane and node-local data-plane enforcement.
 
 ## Language
 
+**Client Service Mode**:
+The client-facing command and keyspace contract: Single or Cluster. It is
+independent of whether Meta manages the deployment and grants no serving
+authority by itself.
+
+**Single**:
+A Client Service Mode exposing one logical dataset without a same-slot
+restriction on commands' keys. In a Meta-managed deployment, that dataset
+belongs to one Group covering the entire slot space.
+_Avoid_: Standalone when referring to Meta-managed Single
+
+**Cluster**:
+A Client Service Mode exposing slot-based routing and Redis Cluster command
+constraints. It describes the client contract, not a separate HA mechanism.
+
+**Stale Replica Read**:
+A read of a replica's complete local population without a freshness guarantee
+relative to the Owner. It neither requires nor grants Owner write authority;
+temporary replication disconnection does not itself invalidate that population.
+
 **Committed State**:
 The deterministic Meta control-plane state replicated by Raft and restored by
 a replacement Meta leader. An in-progress failover must retain enough state

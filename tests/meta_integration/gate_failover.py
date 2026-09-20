@@ -40,10 +40,12 @@ import harness as H  # noqa: E402
 from gate_data_control import DataProcess  # noqa: E402
 
 
+CLIENT_MODE = "cluster"
 GROUP = "failover-group"
 OWNER = "1111111111111111111111111111111111111111"
 CANDIDATE = "2222222222222222222222222222222222222222"
 FOLLOWER = "3333333333333333333333333333333333333333"
+SECOND_DONOR = "4444444444444444444444444444444444444444"
 PAUSE_BEGIN_HOOK = b"LAVIK_TEST_PAUSE_FAILOVER_AFTER_BEGIN_MS"
 PAUSE_AUTHORIZE_HOOK = b"LAVIK_TEST_PAUSE_FAILOVER_AFTER_AUTHORIZE_MS"
 PAUSE_PREPARED_HOOK = b"LAVIK_TEST_PAUSE_FAILOVER_AFTER_PREPARED_MS"
@@ -53,12 +55,14 @@ class FailoverMetaNode(H.Node):
     """Starts Meta with the optional failover cut and TCP admin transport."""
 
     pause_after_begin_ms = None
+    pause_after_automatic_begin_ms = None
     pause_after_authorize_ms = None
     pause_after_prepared_ms = None
 
     def start(self, *args, **kwargs):
         variables = {
             PAUSE_BEGIN_HOOK.decode(): self.pause_after_begin_ms,
+            "LAVIK_TEST_PAUSE_FAILOVER_AFTER_AUTOMATIC_BEGIN_MS": self.pause_after_automatic_begin_ms,
             PAUSE_AUTHORIZE_HOOK.decode(): self.pause_after_authorize_ms,
             PAUSE_PREPARED_HOOK.decode(): self.pause_after_prepared_ms,
         }
@@ -189,7 +193,7 @@ class IdentityDropProxy:
     def _classify_and_forward(self, connection):
         prefix = bytearray()
         identities = tuple(
-            node_id.encode() for node_id in (OWNER, CANDIDATE, FOLLOWER))
+            node_id.encode() for node_id in (OWNER, CANDIDATE, FOLLOWER, SECOND_DONOR))
         identity = None
         try:
             connection.settimeout(5.0)
@@ -343,12 +347,12 @@ def meta_manifest_lines(metas):
     return lines
 
 
-def write_manifest(path, metas, data_nodes, *,
+def write_manifest(path, metas, data_nodes, *, client_mode="cluster",
                    automatic_uncontrolled_failover_suspect_after_ms=None):
     by_id = {node.node_id: node for node in data_nodes}
     replicas = sorted(node_id for node_id in by_id if node_id != OWNER)
     replica_list = ", ".join(f'"{node_id}"' for node_id in replicas)
-    lines = ["schema_version = 1", ""] + meta_manifest_lines(metas)
+    lines = ["schema_version = 1", f'client_mode = "{client_mode}"', ""] + meta_manifest_lines(metas)
     for node_id in sorted(by_id):
         lines.extend([
             "[[data_nodes]]",
@@ -537,7 +541,7 @@ class ContinuousSetProbe:
 
     _EXPECTED_REJECTIONS = (
         "-MOVED ", "-TRYAGAIN ", "-CLUSTERDOWN ", "-LOADING ",
-        "-READONLY ")
+        "-READONLY ", "-MASTERDOWN ")
 
     def __init__(self, data, key, writer):
         self.data = data
@@ -846,7 +850,8 @@ class FailoverFixture:
                  require_fault_hook, pause_after_begin_ms=8_000,
                  pause_after_authorize_ms=None,
                  pause_after_prepared_ms=None, proxy_data_control=False,
-                 data_workers=1):
+                 data_workers=1, client_mode=None, four_data=False):
+        self.client_mode = client_mode or CLIENT_MODE
         self.ctl = ctl
         self.scenario = scenario
         os.makedirs(scenario, mode=0o700)
@@ -919,6 +924,10 @@ class FailoverFixture:
             DataProcess(data_binary, os.path.join(scenario, "follower"),
                         FOLLOWER, data_seed(self.metas[2]), workers=data_workers),
         ]
+        if four_data:
+            self.data_nodes.append(DataProcess(
+                data_binary, os.path.join(scenario, "second-donor"), SECOND_DONOR,
+                data_seed(self.metas[0]), workers=data_workers))
         self.by_id = {node.node_id: node for node in self.data_nodes}
         self.manifest = os.path.join(scenario, "cluster.toml")
         self.operation_id = None
@@ -993,7 +1002,7 @@ class FailoverFixture:
         # within a finite, long suspicion interval. Automatic detection gates
         # install their short threshold once READY.
         write_manifest(
-            self.manifest, self.metas, self.data_nodes[:1],
+            self.manifest, self.metas, self.data_nodes[:1], client_mode=self.client_mode,
             automatic_uncontrolled_failover_suspect_after_ms=
             automatic_uncontrolled_failover_suspect_after_ms)
         for proxy in self.control_proxies:
@@ -1034,7 +1043,8 @@ class FailoverFixture:
         # and their identities can be registered for steady FollowOwner.
         H.wait_until(
             "initial Data metrics listeners", 20,
-            lambda: all(data.alive() and data._metrics_ready()
+            lambda: all(data.alive() and (data._metrics_ready() or
+                        "waiting for Meta bootstrap:" in data.log_tail())
                         for data in starting_nodes))
 
         created = run_command([
@@ -1046,7 +1056,7 @@ class FailoverFixture:
             raise H.Failure(f"cluster-create was not accepted: {created!r}")
         wait_ready(self, "initial Owner-only cluster reaches READY")
         if add_follower:
-            self.add_replicas((CANDIDATE, FOLLOWER), started=True)
+            self.add_replicas(tuple(node.node_id for node in self.data_nodes[1:]), started=True)
 
     def add_replica(self, node_id):
         self.add_replicas((node_id,))
@@ -2016,7 +2026,7 @@ def run_lease_fence(meta_binary, data_binary, ctl, redis_cli, workdir,
             raise H.Failure("partition unexpectedly stopped old Redis port")
         old_rejection = redis_error(
             fixture.by_id[OWNER], ["SET", key, "stale-owner-write"])
-        if not old_rejection.startswith(("CLUSTERDOWN", "TRYAGAIN", "MOVED")):
+        if not old_rejection.startswith(("CLUSTERDOWN", "TRYAGAIN", "MOVED", "MASTERDOWN", "READONLY")):
             raise H.Failure(
                 f"old Owner returned an unexpected fence: {old_rejection}")
         if redis_call(fixture.by_id[successor], ["GET", key]) != post_cutover:
@@ -2203,11 +2213,14 @@ def parse_args():
                  "source-degrade-reselect"),
         required=True)
     parser.add_argument("--require-fault-hook", action="store_true")
+    parser.add_argument("--mode", choices=("single", "cluster"), default="cluster")
     return parser.parse_args()
 
 
 def main():
+    global CLIENT_MODE
     args = parse_args()
+    CLIENT_MODE = args.mode
     binaries = {
         name: os.path.abspath(getattr(args, name))
         for name in ("meta", "data", "ctl", "redis_cli")

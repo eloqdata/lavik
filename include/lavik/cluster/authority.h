@@ -73,6 +73,7 @@ struct Decision {
     kServe,               // execute locally
     kServeStaleRead,      // replica read admitted under READONLY
     kMoved,               // another node owns the slot; endpoint filled below
+    kReadOnly,            // Single replica rejects writes without redirection
     kClusterDownUnbound,  // first key's slot has no owner
     kCrossSlot,           // keys span multiple slots
     kLoading,             // no ready ServingState / storage not ready

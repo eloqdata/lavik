@@ -128,24 +128,18 @@ int main(int argc, char** argv) {
   app.add_option("--redis-replicaof", redis_replicaof_cli,
                  "Explicitly follow Redis using PSYNC: HOST PORT")
       ->expected(2);
-  app.add_option_function<std::string>(
-         "--client-mode",
-         [&options](const std::string& mode) {
-           options.client_mode_ = mode == "cluster"
-                                      ? lavik::ClientMode::kCluster
-                                      : lavik::ClientMode::kSingle;
-         },
-         "Redis client semantics: single or cluster")
-      ->transform(CLI::IsMember({"single", "cluster"}, CLI::ignore_case))
-      ->default_str("single");
-  app.add_option_function<std::string>(
-         "--meta-managed",
-         [&options](const std::string& managed) {
-           options.meta_managed_ = managed == "yes";
-         },
-         "Use Meta authority and native replication: yes or no")
-      ->transform(CLI::IsMember({"yes", "no"}, CLI::ignore_case))
-      ->default_str("no");
+  for (const std::string name : {"--client-mode", "--meta-managed"}) {
+    app.add_option_function<std::string>(
+        name,
+        [name](const std::string&) {
+          throw CLI::ValidationError(
+              name,
+              "removed: configure --meta-seed and declare client_mode in the "
+              "Meta creation manifest; "
+              "omit Meta seeds for standalone mode");
+        },
+        "Removed; mode is declared by Meta");
+  }
   app.add_option("--meta-seed", options.meta_seeds_,
                  "Numeric Meta data-control endpoint; repeat for bootstrap");
   app.add_option("--node-id", options.node_id_,

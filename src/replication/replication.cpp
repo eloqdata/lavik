@@ -16,10 +16,35 @@
 
 #include "replication_internal.h"
 
+#if LAVIK_FAULTS_ENABLED
+#include <fstream>
+#endif
+
 namespace lavik {
 namespace replication_internal {
 
 std::atomic<unsigned> recovery_resolvers_in_flight{0};
+
+#if LAVIK_FAULTS_ENABLED
+// Test-only event boundary control. The harness atomically publishes this tiny
+// file after real FULL has completed, using observed flow cursors. Production
+// builds contain neither filesystem reads nor a new suspension point.
+std::optional<std::uint64_t> TestEventSendCut(std::string_view target,
+                                              unsigned flow) {
+  const char* path = std::getenv("LAVIK_TEST_NATIVE_EVENT_CUT_FILE");
+  if (path == nullptr) return std::nullopt;
+  std::ifstream input(path);
+  std::string node;
+  unsigned selected_flow = 0;
+  std::uint64_t next_lsn = 0;
+  for (unsigned row = 0;
+       row < 128 && input >> node >> selected_flow >> next_lsn; ++row) {
+    if (node == target && selected_flow == flow && next_lsn != 0)
+      return next_lsn;
+  }
+  return std::nullopt;
+}
+#endif
 
 absl::StatusOr<std::pair<std::uint16_t, std::vector<SnapshotRecord>>>
 DecodeRecords(std::string_view payload) try {
@@ -899,6 +924,7 @@ ReplicationManager::ReplicationGroup::ReplicationGroup(
     : storage_(storage),
       serving_generation_(serving_generation),
       meta_managed_(options.meta_managed_),
+      single_client_mode_(options.client_mode_ == ClientMode::kSingle),
       upstream_(meta_managed_ ? std::nullopt : std::move(initial_upstream)),
       upstream_caches_(
           std::make_unique<UpstreamSnapshot[]>(storage->worker_count())),
@@ -1100,6 +1126,7 @@ auto ReplicationManager::ReplicationGroup::StartClusterRebuildDirective(
   // The candidate is already fully validated, so closing admission cannot
   // turn a malformed or stale directive into a denial of service against a
   // healthy population. From here on, any uncertain teardown is fail-stop.
+  native_dataset_valid_.store(false, std::memory_order_release);
   StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
   storage_->SetReplicaLoading(true);
   storage_->SetExpirationAuthority(false);
@@ -1348,10 +1375,10 @@ auto ReplicationManager::ReplicationGroup::StartEmptyPopulationInitialization(
     replica_reconfiguration_running_ = true;
   }
 
+  native_dataset_valid_.store(false, std::memory_order_release);
   StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
   storage_->SetReplicaLoading(true);
   storage_->SetExpirationAuthority(false);
-  native_dataset_valid_.store(false, std::memory_order_release);
 
   auto authorization =
       cluster_group_->BeginEmptyPopulation(directive.identity_, manifest);
@@ -2463,6 +2490,7 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterRecovery(
   if (!meta_managed_)
     co_return absl::FailedPreconditionError(
         "recovery requires Meta-managed replication");
+
   if (desired.has_value()) {
     const auto& action = desired->action_;
     const auto member = [&](std::string_view node,
@@ -2953,6 +2981,9 @@ auto ReplicationManager::ReplicationGroup::ServeRecoveryDonor(
   if (!encoded.ok()) co_return encoded.status();
   auto status = co_await WriteRecoveryFrame(stream, *encoded);
   if (!status.ok()) co_return status;
+#if LAVIK_FAULTS_ENABLED
+  bool delayed_first_effect = false;
+#endif
   while (cluster_recovery_ == scope && !scope->sockets_.cancelled() &&
          !scope->Expired()) {
     auto request = co_await ReadLine(stream);
@@ -2974,9 +3005,36 @@ auto ReplicationManager::ReplicationGroup::ServeRecoveryDonor(
       return cluster_recovery_ == scope && !scope->sockets_.cancelled() &&
              !scope->Expired() && FailoverReplicaDomainMatches(local);
     };
+    LAVIK_FAULT_INJECT(if (!delayed_first_effect) {
+      delayed_first_effect = true;
+      const char* configured =
+          std::getenv("LAVIK_TEST_RECOVERY_EFFECT_DELAY_MS");
+      std::uint64_t milliseconds = 0;
+      if (configured != nullptr && ParseUnsigned(configured, &milliseconds) &&
+          milliseconds <= 60000) {
+        spdlog::info("test recovery donor waiting candidate={} flow={} lsn={}",
+                     scope->desired_.action_.candidate_node_id_, flow, lsn);
+        const auto until = std::chrono::steady_clock::now() +
+                           std::chrono::milliseconds(milliseconds);
+        while (current() && std::chrono::steady_clock::now() < until) {
+          auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                                 std::chrono::milliseconds(5));
+          if (!slept.ok()) co_return slept;
+        }
+        if (!current())
+          co_return absl::CancelledError("recovery delay cancelled");
+      }
+    });
     status = co_await SendRetainedEffect(
         stream, local.domain_.source_history_id_, report, flow, lsn, current);
     if (!status.ok()) co_return status;
+    LAVIK_FAULT_INJECT(if (std::getenv("LAVIK_TEST_RECOVERY_TRACE") !=
+                           nullptr) {
+      spdlog::info(
+          "test recovery donor exported group={} candidate={} flow={} lsn={}",
+          local.group_id_, scope->desired_.action_.candidate_node_id_, flow,
+          lsn);
+    });
   }
   co_return absl::OkStatus();
 }
@@ -3133,6 +3191,13 @@ auto ReplicationManager::ReplicationGroup::RunCandidateRecovery(
     return cluster_failover_action_ == action && cluster_recovery_ == scope &&
            !action->cancelled_ && !cluster_control_stopping_;
   };
+  LAVIK_FAULT_INJECT(if (std::getenv("LAVIK_TEST_RECOVERY_TRACE") != nullptr) {
+    spdlog::info(
+        "test candidate recovery started transition={} action={} deadline={}",
+        HexBytes(action->desired_.transition_id_),
+        HexBytes(action->desired_.action_id_),
+        action->desired_.recovery_deadline_unix_ms_.value_or(0));
+  });
 #if LAVIK_FAULTS_ENABLED
   if (LAVIK_FAULT_MATCHES("LAVIK_REPLICATION_SEED_READY_RECOVERY_CANDIDATE",
                           HexBytes(action->desired_.action_id_))) {
@@ -4285,6 +4350,7 @@ auto ReplicationManager::ReplicationGroup::StopClusterFollowIngress(
       upstream_node_id_.reset();
       upstream_history_id_.reset();
       native_dataset_valid_.store(false, std::memory_order_release);
+      StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
     }
   }
   while (coordinator_started_) {
@@ -4377,6 +4443,7 @@ auto ReplicationManager::ReplicationGroup::BeginClusterFollowFullPopulation(
   cluster_rebuild_ = population;
   session->cluster_rebuild_ = std::move(population);
   native_dataset_valid_.store(false, std::memory_order_release);
+  StoreRole(ReplicationRole::kSyncing, std::memory_order_release);
   applied_frontier_.reset();
   upstream_node_id_.reset();
   upstream_history_id_.reset();
@@ -5837,36 +5904,36 @@ auto ReplicationManager::ReplicationGroup::status() const
 auto ReplicationManager::ReplicationGroup::StoreRole(
     ReplicationRole next, std::memory_order order) noexcept -> void {
   constexpr std::uint64_t kServingOpen = 1;
-  const auto serves_dataset = [](ReplicationRole role) {
-    return role == ReplicationRole::kMaster || role == ReplicationRole::kOnline;
-  };
-
-  // Construction precedes worker startup; afterwards only worker zero may
-  // publish a role. These two stores cannot interleave with another role
-  // transition because there is no suspension between them. Data-command
-  // admission still reads only the packed atomic generation/open token.
+  // Worker zero owns the Ready proof and publishes its read permission through
+  // the existing generation. A transport reconnect does not replace a complete
+  // Single population; FULL and proof invalidation do, even at the same role.
   assert(bycorf::ThisWorker().self_ == nullptr ||
          bycorf::ThisWorker().id_ == 0);
   const ReplicationRole previous = role_.load(std::memory_order_relaxed);
-  if (previous == next) {
-    if (next == ReplicationRole::kOnline) {
-      link_state_changed_nanos_.store(SteadyNanos(), std::memory_order_release);
-    }
-    return;
-  }
-
-  const bool was_serving = serves_dataset(previous);
-  const bool will_serve = serves_dataset(next);
-  if (was_serving) {
-    const std::uint64_t current =
-        serving_generation_->load(std::memory_order_relaxed);
+  const std::uint64_t current =
+      serving_generation_->load(std::memory_order_relaxed);
+  const bool was_serving = (current & kServingOpen) != 0;
+  const bool complete_replica =
+      meta_managed_ && single_client_mode_ &&
+      native_dataset_valid_.load(std::memory_order_acquire) &&
+      !failed_stopped_.load(std::memory_order_acquire) &&
+      cluster_rebuild_ != nullptr &&
+      cluster_rebuild_->ready_token_.has_value() &&
+      cluster_rebuild_->state_.load(std::memory_order_acquire) ==
+          ReplicationGroupState::kReady;
+  const bool will_serve =
+      next == ReplicationRole::kMaster ||
+      (meta_managed_ && single_client_mode_ ? complete_replica
+                                            : next == ReplicationRole::kOnline);
+  const bool same_population_reconnect = complete_replica &&
+                                         previous != ReplicationRole::kMaster &&
+                                         next != ReplicationRole::kMaster;
+  if (was_serving &&
+      (!will_serve || (previous != next && !same_population_reconnect))) {
     std::uint64_t generation = (current & ~kServingOpen) + 2;
-    if (generation == 0) generation = 2;  // Reserve zero for closed capture.
+    if (generation == 0) generation = 2;
     serving_generation_->store(generation | (will_serve ? kServingOpen : 0),
                                std::memory_order_release);
-    // Blocking commands own no DB gate while asleep. Wake all of them so
-    // they can observe the new generation before examining replacement
-    // data; baseline population is not required to emit key notifications.
     NotifyServingGenerationChanged();
   }
 
@@ -5906,6 +5973,24 @@ auto ReplicationManager::ReplicationGroup::is_loading() const noexcept -> bool {
   return storage_->ReplicaRecoveryFenced() ||
          role == ReplicationRole::kConnecting ||
          role == ReplicationRole::kSyncing;
+}
+
+auto ReplicationManager::ReplicationGroup::dataset_read_state(
+    bool serve_stale) const noexcept -> DatasetReadState {
+  if (!meta_managed_ || !single_client_mode_) {
+    return is_loading() ? DatasetReadState::kLoading
+                        : DatasetReadState::kReadable;
+  }
+  if (storage_->ReplicaRecoveryFenced() ||
+      !native_dataset_valid_.load(std::memory_order_acquire) ||
+      (serving_generation_->load(std::memory_order_acquire) & 1) == 0) {
+    return DatasetReadState::kLoading;
+  }
+  const auto role = role_.load(std::memory_order_acquire);
+  return !serve_stale && role != ReplicationRole::kMaster &&
+                 role != ReplicationRole::kOnline
+             ? DatasetReadState::kStaleDisabled
+             : DatasetReadState::kReadable;
 }
 
 auto ReplicationManager::ReplicationGroup::SetSnapshotReadConcurrency(
@@ -10660,6 +10745,9 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowBacklog(
   bycorf::ThisWorker().self_->Spawn(
       TrackMasterFlowBacklogAcks(stream, session, flow_id, duplex));
   absl::Status sender_status = absl::OkStatus();
+#if LAVIK_FAULTS_ENABLED
+  bool cut_reported = false;
+#endif
   while (stream.IsOpen()) {
     if (duplex->receiver_done_) {
       sender_status = duplex->receiver_status_;
@@ -10676,6 +10764,34 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowBacklog(
       sender_status = batch.status();
       break;
     }
+#if LAVIK_FAULTS_ENABLED
+    if (const auto cut = TestEventSendCut(session->node_id_, flow_id)) {
+      const auto boundary = std::find_if(
+          batch->frames_.begin(), batch->frames_.end(), [&](const auto& frame) {
+            return frame.header_.lsn_ >= *cut &&
+                   frame.header_.fragment_index_ == 0;
+          });
+      if (boundary != batch->frames_.end()) {
+        batch->next_ = {.lsn_ = boundary->header_.lsn_, .fragment_index_ = 0};
+        batch->frames_.erase(boundary, batch->frames_.end());
+        batch->at_tail_ = false;
+        if (batch->frames_.empty()) {
+          if (!cut_reported) {
+            spdlog::info(
+                "test native event send paused target={} flow={} next_lsn={}",
+                session->node_id_, flow_id, batch->next_.lsn_);
+            cut_reported = true;
+          }
+          // Check ordinary cancellation/ACK receiver failure on each turn;
+          // no flow join or process shutdown depends on releasing the fault.
+          sender_status = co_await bycorf::SleepFor(
+              *bycorf::ThisWorker().self_, std::chrono::milliseconds(5));
+          if (!sender_status.ok()) break;
+          continue;
+        }
+      }
+    }
+#endif
     constexpr std::size_t kOnlinePayloadHeaderBytes = 8 + 4 + 1;
     constexpr std::size_t kOnlineWireHeaderBytes =
         kDataFrameHeaderBytes + kOnlinePayloadHeaderBytes;
@@ -11781,7 +11897,8 @@ auto ReplicationManager::ReplicationGroup::EnsureReplicationHistoryReady()
 ReplicationManager::ReplicationManager(
     storage::StorageEngine* storage, ReplicationOptions options,
     std::optional<ReplicaOfConfig> initial_upstream)
-    : group_(std::make_unique<ReplicationGroup>(
+    : replica_serve_stale_data_(options.replica_serve_stale_data_),
+      group_(std::make_unique<ReplicationGroup>(
           storage, std::move(initial_upstream), options, &serving_generation_)),
       options_(std::move(options)) {}
 
@@ -12089,6 +12206,11 @@ bool ReplicationManager::is_replica() const noexcept {
 
 bool ReplicationManager::is_loading() const noexcept {
   return group_->is_loading();
+}
+
+ReplicationManager::DatasetReadState ReplicationManager::dataset_read_state()
+    const noexcept {
+  return group_->dataset_read_state(replica_serve_stale_data());
 }
 
 bool ReplicationManager::reject_writes() const noexcept {

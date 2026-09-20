@@ -736,8 +736,13 @@ TEST(ControlProtocolCodecTest, HelloRequiresBoundedSourceFlowCount) {
   for (std::uint32_t count : {0U, 1025U}) {
     hello.replication_flow_count = count;
     EXPECT_FALSE(control::EncodeMessage(control::WireMessage{hello}).ok());
-    std::string malformed = encoded->substr(0, encoded->size() - 4);
-    AppendBe32(&malformed, count);
+    // Version range plus three fixed-width identities precede the source
+    // layout. Service capability fields follow it and must remain intact.
+    constexpr std::size_t flow_offset = 4 + 3 * 40;
+    std::string flow;
+    AppendBe32(&flow, count);
+    std::string malformed = *encoded;
+    malformed.replace(flow_offset, 4, flow);
     EXPECT_FALSE(
         control::DecodeMessage(MessageType::kClientHello, malformed).ok());
   }
@@ -746,6 +751,58 @@ TEST(ControlProtocolCodecTest, HelloRequiresBoundedSourceFlowCount) {
                    .ok());
   EXPECT_FALSE(
       control::DecodeMessage(MessageType::kClientHello, *encoded + "x").ok());
+}
+
+TEST(ControlProtocolCodecTest,
+     BootstrapRequiresReportedAndInstalledCapabilities) {
+  const control::ServiceDeclaration service{lavik::ClientMode::kSingle, Id(3),
+                                            11};
+  control::ClientServiceCapabilities caps;
+  EXPECT_FALSE(control::ValidateClientService(service, caps, false).ok());
+  caps.supported_modes =
+      control::kSingleServiceMode | control::kClusterServiceMode;
+  caps.services = control::kDb0GroupAuthority | control::kReplicaPopulationRead;
+  EXPECT_TRUE(control::ValidateClientService(service, caps, false).ok());
+  EXPECT_FALSE(control::ValidateClientService(service, caps, true).ok());
+  caps.installed_mode = lavik::ClientMode::kSingle;
+  caps.database_count = 16;
+  EXPECT_TRUE(control::ValidateClientService(service, caps, true).ok());
+  caps.database_count = 1;
+  EXPECT_FALSE(control::ValidateClientService(service, caps, true).ok());
+  caps.installed_mode = lavik::ClientMode::kCluster;
+  EXPECT_FALSE(control::ValidateClientService(service, caps, true).ok());
+  auto cluster = service;
+  cluster.client_mode = lavik::ClientMode::kCluster;
+  EXPECT_TRUE(control::ValidateClientService(cluster, caps, true).ok());
+  caps.services = control::kReplicaPopulationRead;
+  EXPECT_FALSE(control::ValidateClientService(cluster, caps, true).ok());
+  EXPECT_FALSE(control::ValidateClientService({}, caps, false).ok());
+}
+
+TEST(ControlProtocolCodecTest, BootstrapRoundTripCannotCreateASession) {
+  control::BootstrapHello request{
+      .node_id = std::string(40, 'a'),
+      .capabilities = {.supported_modes = 3, .services = 3}};
+  auto encoded = control::EncodeMessage(request);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded = control::DecodeMessage(MessageType::kBootstrapHello, *encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(std::get<control::BootstrapHello>(*decoded), request);
+  EXPECT_FALSE(control::DecodeMessage(MessageType::kBootstrapHello,
+                                      encoded->substr(0, encoded->size() - 1))
+                   .ok());
+  control::BootstrapReply reply;
+  reply.disposition = control::BootstrapDisposition::kReady;
+  reply.server.meta_server_id = 1;
+  reply.server.raft_term = 2;
+  reply.server.service = {lavik::ClientMode::kSingle, Id(3), 11};
+  encoded = control::EncodeMessage(reply);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  decoded = control::DecodeMessage(MessageType::kBootstrapReply, *encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(std::get<control::BootstrapReply>(*decoded), reply);
+  reply.server.session_generation = 1;
+  EXPECT_FALSE(control::EncodeMessage(reply).ok());
 }
 
 TEST(ControlProtocolCodecTest,

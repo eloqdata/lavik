@@ -270,7 +270,7 @@ id, unique client port and storage path. For example, repeat this pattern for
 the ids and ports named by the manifest:
 
 ```sh
-lavik --client-mode cluster --meta-managed yes \
+lavik \
   --node-id 1111111111111111111111111111111111111111 \
   --meta-seed 127.0.0.1:7301 \
   --announce-ip 127.0.0.1 --port 6371 \
@@ -290,6 +290,7 @@ An automatically allocated two-Group topology is:
 
 ```toml
 schema_version = 1
+client_mode = "cluster"
 slot_strategy = "contiguous-even"
 
 [bootstrap_policy]
@@ -973,7 +974,7 @@ node remains fenced/LOADING. Never interpret `activateauthority` returning
 For a plaintext development deployment, start the registered node with:
 
 ```sh
-lavik --client-mode cluster --meta-managed yes \
+lavik \
   --node-id 0123456789abcdef0123456789abcdef01234567 \
   --meta-seed 10.0.0.11:7300 \
   --meta-seed 10.0.0.12:7300 \
@@ -1019,7 +1020,7 @@ client/server usages. The URI must equal the active Meta identity binding for
 that node. For example:
 
 ```sh
-lavik --client-mode cluster --meta-managed yes \
+lavik \
   --node-id 0123456789abcdef0123456789abcdef01234567 \
   --meta-seed 10.0.0.11:7300 \
   --meta-seed 10.0.0.12:7300 \

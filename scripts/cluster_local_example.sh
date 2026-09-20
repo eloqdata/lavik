@@ -75,6 +75,7 @@ owns_pid() {
 write_manifest() {
   cat >"$root/cluster.toml" <<'EOF'
 schema_version = 1
+client_mode = "cluster"
 slot_strategy = "contiguous-even"
 
 [[meta_members]]
@@ -151,7 +152,7 @@ start_data() {
   local i=$1
   "$lavik_bin" --bind 127.0.0.1 --port "$((6370 + i))" \
     --threads 1 --no-pin-workers \
-    --client-mode cluster --meta-managed yes --node-id "${node_ids[i-1]}" \
+    --node-id "${node_ids[i-1]}" \
     --announce-ip 127.0.0.1 \
     --meta-seed 127.0.0.1:7301 \
     --meta-seed 127.0.0.1:7302 \

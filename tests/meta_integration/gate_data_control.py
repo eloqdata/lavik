@@ -25,8 +25,7 @@ complete object; no Data-side persisted control state participates.
 The mTLS scenario uses a real single-member Meta process.  A CA-authenticated
 Data certificate with the committed ``lavik://node/<id>`` URI SAN completes
 the same FDS/heartbeat flow.  A certificate signed by the same CA but naming a
-different Data principal must remain connected to neither control authority
-nor FDS while the process itself stays healthy.
+different Data principal must fail bootstrap without opening a Redis listener.
 
 The plaintext scenario commits one assigned slot-owning group and active
 authority.  A fresh Meta-managed Data node intentionally has no ReadyToken
@@ -135,7 +134,6 @@ class DataProcess:
             "--flush-max-ms", "20",
             "--data-file", self.data_path,
             "--rdb-dir", self.workdir,
-            "--client-mode", "cluster", "--meta-managed", "yes",
             "--node-id", self.node_id,
             "--meta-seed", self.seed,
             "--announce-ip", "127.0.0.1",
@@ -157,8 +155,9 @@ class DataProcess:
               f"(pid {self.proc.pid}, seed {self.seed})")
         if wait_ready:
             H.wait_until(
-                f"Data node {self.node_id[:8]} metrics listener", 20,
-                lambda: self.alive() and self._metrics_ready())
+                f"Data node {self.node_id[:8]} startup", 20,
+                lambda: self.alive() and (self._metrics_ready() or
+                    "waiting for Meta bootstrap:" in self.log_tail()))
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
@@ -294,6 +293,16 @@ def register_data_node(leader, data):
     expect_ok(reply, f"register Data node {data.node_id[:8]}")
 
 
+def commit_service_mode(leader, metas):
+    # A real Genesis declares the mode. The never-started bootstrap Owner keeps
+    # initialization pending while this gate exercises an independent unready
+    # assignment and its lease-denial path through the ordinary Data session.
+    import gate_cluster_create as C
+    request = C.create_request(metas, "f" * 40,
+                               f"tcp://127.0.0.1:{H.free_port()}", "bootstrap-group")
+    expect_ok(leader.ctl(request), "commit cluster client mode")
+
+
 def seed_assigned_authority(leader, data):
     expect_commit(leader.creategroup(GROUP), "create assigned group")
     expect_commit(leader.assignnode(GROUP, data.node_id),
@@ -374,6 +383,7 @@ def run_plaintext(meta_binary, data_binary, workdir):
     data = None
     try:
         leader = H.bootstrap_cluster(nodes)
+        commit_service_mode(leader, nodes)
         follower = next(node for node in nodes if node.id != leader.id)
         data = DataProcess(data_binary, os.path.join(scenario, "data"),
                            DATA_NODE, follower.data_control_endpoint)
@@ -535,22 +545,16 @@ def make_leaf(workdir, ca_cert, ca_key, name, uri):
 
 
 def assert_wrong_uri_rejected(data, meta):
-    deadline = time.monotonic() + 4.0
-    while time.monotonic() < deadline:
-        if not data.alive():
-            raise H.Failure("wrong-URI Data process crashed")
-        connected = data.metric("lavik_cluster_control_connected")
-        full_states = data.metric(
-            "lavik_cluster_control_full_states_applied_total")
-        if connected != 0 or full_states != 0:
-            raise H.Failure(
-                "wrong-URI Data certificate reached an accepted FDS")
-        if observation_count(meta) != 0:
-            raise H.Failure(
-                "wrong-URI Data certificate published an observation")
-        time.sleep(0.1)
-    if data.metric("lavik_cluster_control_reconnects_total") < 1:
-        raise H.Failure("wrong-URI Data process did not retry the handshake")
+    code = data.proc.wait(timeout=10)
+    assert code != 0, data.log_tail()
+    assert "Data identity does not match" in data.log_tail(), data.log_tail()
+    assert observation_count(meta) == 0
+    try:
+        socket.create_connection(("127.0.0.1", data.redis_port), .2).close()
+    except OSError:
+        pass
+    else:
+        raise H.Failure("wrong-URI boot opened Redis")
 
 
 def run_mtls(meta_binary, data_binary, workdir):
@@ -578,6 +582,7 @@ def run_mtls(meta_binary, data_binary, workdir):
     try:
         meta.start(bootstrap=True)
         meta.wait_leader()
+        commit_service_mode(meta, [meta])
         expect_commit(meta.put_authority_lease_policy(1),
                       "commit Authority Lease Policy")
 
@@ -586,7 +591,7 @@ def run_mtls(meta_binary, data_binary, workdir):
             BAD_DATA_NODE, meta.data_control_endpoint,
             tls=(ca_cert, bad_cert, bad_key))
         register_data_node(meta, bad_data)
-        bad_data.start()
+        bad_data.start(wait_ready=False)
         assert_wrong_uri_rejected(bad_data, meta)
         bad_data.terminate()
         H.log("mTLS: trusted certificate with wrong Data URI SAN rejected")

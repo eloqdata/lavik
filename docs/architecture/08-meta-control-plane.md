@@ -171,7 +171,7 @@ cluster owns at most one logical Data cluster. The root Cluster Create
 one atomic apply delta; root completion or abort similarly updates the
 operation and terminal lifecycle together. These transitions do not advance
 the topology epoch. The topology record permanently retains the root operation
-id, Genesis commit index, lifecycle state, and a bounded non-sensitive failure
+id, Genesis commit index, immutable client service mode, lifecycle state, and a bounded non-sensitive failure
 summary. The public lifecycle revision is derived as 0 for Uninitialized, 1 for
 Creating, and 2 for either terminal state; terminal outcome is also derived
 from that state, while the manifest remains only in the root operation during
@@ -568,6 +568,16 @@ observation TTL plus that fixed progress budget before declaring the session
 idle. This keeps long but valid `D / 3` heartbeat cadences connected, lets the
 detector classify heartbeat expiry before transport teardown, and still turns
 a stalled partial frame or peer into a finite failure.
+The Data-control listener also accepts an authenticated, read-only bootstrap
+query containing a Data identity and supported client/service capabilities. It
+returns the committed declaration and Meta directory before storage exists on
+Data, without claiming a Data session or publishing observations. An initialized
+Topology and registered node suffice; the cluster need not be Created. Regular
+ClientHello binds the same declaration to actual installed capabilities and DB
+layout. Incompatible boots cannot publish the Ready or candidate observations
+used by initialization, selection and activation. Missing capabilities are
+rejected rather than inferred from a protocol version.
+
 Sockets that have not completed TLS when enabled, a valid `ClientHello`, and a
 committed active node/certificate binding also consume one of 4096 pending-
 handshake permits. The listener closes excess sockets before starting their
@@ -1037,7 +1047,9 @@ Data sessions are READY. Empty and partially configured clusters are stable
 errors, includes a status explanation and an operator next action.
 
 `lavik-ctl cluster-create` reuses the same private leader discovery and
-status-capture seam and accepts only manifest schema v1. A manifest names the
+status-capture seam and accepts only manifest schema v1. Every manifest explicitly
+declares `client_mode = "single" | "cluster"`; Single must have exactly one Group
+covering `0..16383`, including after later topology mutations. A manifest names the
 complete initial Meta vector—id plus canonical numeric Raft, Data-control, and
 Admin endpoints—one or more canonical Data identities with advertised
 `client_endpoint` (`tcp://`) and/or `tls_endpoint` (`tls://`), and one or more
@@ -1068,7 +1080,8 @@ After an `Uninitialized` and pristine client check, the CLI generates a root
 operation id and sends one `clustercreate 1` request to the discovered leader.
 `MetaCtlServer` proposes the existing `SubmitOperation` command with the
 normalized manifest as a `cluster-create-workflow-v1` intent. At that Raft
-index, `ApplyCommitted` atomically inserts the root and enters `Creating`; this
+index, `ApplyCommitted` atomically inserts the root, records its immutable mode
+in Topology and enters `Creating`; this
 Genesis commit is the command's success point. The server replies
 `OK clustercreate 1 <genesis-index> <root-id>` immediately, without waiting for
 workflow phases, Data readiness, or Redis probes. `--timeout-ms` covers leader

@@ -115,6 +115,26 @@ TEST(MetaControlMapperTest, LocalEndpointChangeAdvancesOnlyRelevantControl) {
   EXPECT_EQ(after.local.revision, before.local.revision + 1);
 }
 
+TEST(MetaControlMapperTest, SingleRetainsReplicaBindingWhenOwnerIsFenced) {
+  auto desired = DesiredState();
+  desired.service.client_mode = lavik::ClientMode::kSingle;
+  desired.groups.front().slot_ranges = {{0, 16383}};
+  desired.groups.front().grant_active = false;
+  auto selected = control::SelectNodeControlState(desired, kNode2);
+  auto prepared = cluster::PrepareNodeControlState(selected, kNode2, 2);
+  ASSERT_TRUE(prepared.ok()) << prepared.status();
+  const auto* group = prepared->serving_state_->FindGroup("group-a");
+  ASSERT_NE(group, nullptr);
+  EXPECT_FALSE(group->granted_);
+  EXPECT_TRUE(prepared->serving_state_->CoverageComplete());
+  EXPECT_EQ(group->replica_node_indices_.front(),
+            prepared->serving_state_->SelfNodeIndex());
+  selected.routing.groups.front().slots = {{1, 16383}};
+  EXPECT_FALSE(cluster::PrepareNodeControlState(selected, kNode2, 2).ok());
+  selected.routing.groups.clear();
+  EXPECT_FALSE(cluster::PrepareNodeControlState(selected, kNode2, 2).ok());
+}
+
 TEST(MetaControlMapperTest, BuildsCompleteImmutableServingState) {
   auto prepared = cluster::PrepareMetaFullState(DesiredState(), kNode1, 4);
   ASSERT_TRUE(prepared.ok()) << prepared.status();

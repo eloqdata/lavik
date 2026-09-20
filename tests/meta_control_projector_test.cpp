@@ -536,7 +536,9 @@ TEST(MetaControlProjector,
   EXPECT_FALSE(creating->full_state.groups.front().steady_replication_enabled);
 
   const lavik::meta::MetaOperationId root = Bytes<16>(0xc1);
-  ASSERT_TRUE(fixture.stores.topology_.BeginClusterCreate(root, 1).ok());
+  ASSERT_TRUE(fixture.stores.topology_
+                  .BeginClusterCreate(root, 1, lavik::ClientMode::kCluster)
+                  .ok());
   ASSERT_TRUE(fixture.stores.topology_.CompleteClusterCreate(root).ok());
   auto created = MetaControlProjector::ProjectNode(
       MetaCommittedView(std::move(fixture.stores), 100), fixture.target);

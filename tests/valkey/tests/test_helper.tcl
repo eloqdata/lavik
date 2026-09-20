@@ -281,8 +281,8 @@ proc run_solo {name code} {
 proc cleanup {} {
     if {!$::quiet} {puts -nonewline "Cleanup: may take some time... "}
     flush stdout
-    catch {exec rm -rf {*}[glob tests/tmp/redis.conf.*]}
-    catch {exec rm -rf {*}[glob tests/tmp/server.*]}
+    catch {exec rm -rf {*}[glob -directory $::tmproot redis.conf.*]}
+    catch {exec rm -rf {*}[glob -directory $::tmproot server.*]}
     if {!$::quiet} {puts "OK"}
 }
 

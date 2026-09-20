@@ -18,9 +18,9 @@ limitations under the License.
 
 ## Responsibility and boundary
 
-This subsystem makes a Lavik process a Redis Cluster data node: it decides,
-for every client command, whether this node may serve it, must redirect it to
-the owning node, or must refuse it with a standard cluster error. Ordinary
+This subsystem controls request authority for Meta-managed Single and Cluster
+Data nodes. It decides whether this node may serve a command, must refuse it,
+or, in Cluster mode, must redirect it to the owning node. Ordinary
 requests never consult an external control plane; each node answers from its
 locally committed view of slot ownership, authority, and readiness.
 
@@ -63,19 +63,38 @@ decides *which node* serves a key; the worker mapping inside a node
 own arbitration boundary — the cluster layer reaches it only through a
 generic per-shard validator hook that knows nothing about clusters.
 
-Client semantics (`client-mode single|cluster`) and Meta management
-(`meta-managed yes|no`) are independent startup-only choices. Client mode
-selects Redis discovery, DB/slot rules, and HELLO/INFO reporting. Meta management
-installs `ClusterRuntime` (topology cache, authority guard, node controller,
-action adapter, and resolved announce addresses) before any worker serves;
-without Meta management the runtime is null. Authority and lifecycle checks
-consult management status, never the client mode. Cluster clients require Meta
-management. Managed Single has one Group covering the entire keyspace. Its
-keyed admission carries one representative slot for that Group's readiness,
-lease, in-flight registration, and mutation rechecks; it rejects snapshots that
-violate the single full-Group constraint. Cluster admission retains its
-same-slot rule. Managed Single startup remains rejected until the remaining
-whole-dataset authority integration in #90 is complete.
+Meta seeds select managed startup. An authenticated read-only request on the
+Data-control port returns the committed client mode, creation identity and
+Genesis index before storage construction. This synchronous startup transport
+shares framing, TLS identity and discovery with the full control session; it
+creates no session, history, Ready proof or lease. It waits with bounded,
+cancellable retries for an available leader, committed creation and registered
+Data identity. Explicit identity or capability incompatibility fails startup.
+Redis is not listening during bootstrap. Storage recovery thereafter retains
+normal LOADING behavior.
+
+The full session checks the pinned declaration and the actual installed mode,
+database count and boot service capabilities before accepting any observations
+or activation. Modes never change within a cluster lifecycle. Meta management
+installs `ClusterRuntime` before workers serve; without Meta seeds that runtime
+is null and the existing standalone startup/recovery path applies. No local
+management marker or detach procedure is stored with Data.
+
+Control-session loss withdraws optional recovery transport capabilities. An
+equal committed projection on the replacement session reapplies local control
+intent, including recovery, because prior reconciliation does not prove those
+capabilities remain installed. The existing action and absolute Recovery
+Deadline survive this replay.
+
+Managed Single requires one Group covering every slot. Topology installation,
+request admission and mutation rechecks enforce that invariant. Keyed and
+keyless data requests use one representative Group slot for authority and
+mutation drain; different key slots alone do not reject Single requests.
+Owner reads and writes require a live lease, and Controlled Pause fences writes.
+Complete replicas read directly without READONLY or an Owner lease. Fenced
+Owner intent remains distinct from replica membership, preventing an old Owner
+from acquiring stale-read privileges through lease loss. Cluster retains its
+same-slot routing and explicit READONLY behavior.
 
 ## ServingState: the published unit of truth
 
@@ -783,6 +802,15 @@ so `EXEC` aborts rather than creating a slotless authority exception.
 `FUNCTION KILL` and `FUNCTION STATS` remain available while loading so an
 executing Function can be stopped or inspected; they do not mutate the catalog.
 
+Managed Single currently admits DB0 single-key storage commands, TTL operations
+and PUBLISH through the common Group gate. Multi-key operations, nonzero DBs,
+transactions, scripts, blocking paths and global data/catalog operations that
+lack complete safe integration return explicit unsupported errors. Diagnostics
+remain separate from data authority. Single returns LOADING for incomplete
+population, READONLY for replica mutations, MASTERDOWN for unavailable Owner
+authority or disabled stale reads, and TRYAGAIN for Controlled Pause. Normal
+role changes do not produce MOVED.
+
 ## CLUSTER subcommands and discovery surface
 
 Cluster mode serves `SLOTS`, `NODES`, `MYID`, `INFO`, and `KEYSLOT` from the
@@ -815,23 +843,23 @@ in cluster mode because the two topology sources are mutually exclusive.
 
 ## Meta control and configuration
 
-The outbound Meta control client waits for local storage readiness before
-opening its first session. Readiness includes disk, Function-catalog and
-population recovery, so FDS installation and directives cannot supersede an
-in-progress startup recovery. This wait runs cooperatively on worker zero and
-can end on shutdown without starting control work. Meta availability is not a
-dependency of local recovery.
+The read-only mode bootstrap precedes storage initialization. The outbound
+full Meta control client then waits for local storage readiness before opening
+its first session. Readiness includes disk, Function-catalog and population
+recovery, so FDS installation and directives cannot supersede an in-progress
+startup recovery. This wait runs cooperatively on worker zero and can end on
+shutdown without starting control work. Opening the full control session is
+not a dependency of local recovery.
 
-Meta-controlled state enters only through the asynchronous client/session path
-and `NodeControlInstaller`, which can wait for replication revocation and
+Meta-controlled topology and authority enter through the asynchronous
+client/session path and `NodeControlInstaller`, which can wait for replication revocation and
 request drains before acknowledging a transition. Production startup never
 installs a local topology or positive authority. Read paths still hide expired
 values after their absolute deadline; without a valid lease, recovery cannot
 append the authoritative tombstone or reclaim the retained winner.
 
-Startup-only directives configure the subsystem: `client-mode` (default
-`single`), `meta-managed` (default `no`), repeatable `meta-seed`,
-`node-id` (required only when `meta-managed yes`), and
+Startup-only directives configure the subsystem: repeatable `meta-seed`,
+`node-id` (required with Meta seeds), and
 `announce-ip`, `announce-port`, and
 `announce-tls-port`. Announce values default to the first non-wildcard
 bind address and the corresponding listen ports; a wildcard bind leaves the
@@ -895,6 +923,7 @@ incomplete-full-sync fence without a local topology source.
 | Meta/Data protocol framing, resolved Authority Lease field and derived heartbeat cadence, independent failover observations, transition/activation projection, complete-object transfer, and bounded writer scheduling | `include/lavik/cluster/control_protocol.h`, `include/lavik/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Node controller, full-state validation, controlled pause, provisional activation, finite authority, drain, follow-owner reconciliation, and typed replication adaptation | `include/lavik/cluster/node_control.h`, `include/lavik/cluster/meta_control.h`, `src/cluster/node_control.cpp`, `src/cluster/meta_control.cpp`, `include/lavik/replication.h`, `src/replication/replication.cpp` |
 | Meta discovery, outbound Data control session, stop-and-wait causal heartbeat cadence, and finite-lease expiry | `include/lavik/cluster/meta_client.h`, `src/cluster/meta_client.cpp` |
+| Authenticated pre-storage mode discovery using the shared bounded startup/CLI transport | `include/lavik/cluster/bootstrap.h`, `src/cluster/bootstrap.cpp`, `include/lavik/net/sync_stream.h`, `src/net/sync_stream.cpp` |
 | Process-wide runtime installation | `include/lavik/cluster/runtime.h`, `src/cluster/runtime.cpp` |
 | Cluster admission gate, controlled TRYAGAIN/PUBLISH handling, owner/final re-check plumbing, outcome finalization, EXEC/Lua/blocking integration, and mode-restricted command policies | `src/redis/command.cpp`, `src/redis/cluster_gate.h`, `src/redis/blocking_wait.cpp` |
 | CLUSTER subcommands and discovery replies | `src/redis/cluster_command.cpp`, `src/redis/cluster_command.h` |

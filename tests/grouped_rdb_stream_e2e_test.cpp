@@ -620,7 +620,7 @@ TEST(GroupedRdbStreamE2e, BackupStreamsFourTypesThenImportsAndRestarts) {
 TEST(GroupedRdbStreamE2e,
      LargeListOverOneGiBImportsAndExportsWithoutAggregate) {
   if (std::getenv("LAVIK_RUN_LARGE_RDB") == nullptr)
-    GTEST_SKIP() << "opt-in private /mnt/dev 4 GiB image and >1 GiB RDB";
+    GTEST_SKIP() << "opt-in private 4 GiB image and >1 GiB RDB";
   constexpr std::uint64_t count = 140000;
   constexpr std::size_t member_bytes = 8192;
   static_assert(count * member_bytes > 1024ULL * 1024 * 1024);
@@ -629,7 +629,7 @@ TEST(GroupedRdbStreamE2e,
   // for that transient peak while keeping the process budget below the value
   // size; fixed I/O buffers have a separate budget.
   constexpr std::string_view max_memory = "640M";
-  PrivateDisk disk(4ULL * 1024 * 1024 * 1024, "/mnt/dev");
+  PrivateDisk disk(4ULL * 1024 * 1024 * 1024);
   // A failed multi-minute run must retain its only recovery/timeout evidence.
   // Successful runs still remove all private artifacts.
   disk.PreserveOnFailure();

@@ -219,8 +219,7 @@ acquire them.
 
 ### Meta-managed lifecycle
 
-`meta-managed yes` together with configured `meta-seed` and `node-id`
-selects the fail-closed population mode for a process that may own at
+Configured `meta-seed` and `node-id` select the fail-closed population mode for a process that may own at
 most one replication group. The manager starts in `connecting`, ordinary reads
 and writes return LOADING, and storage starts without expiration authority.
 Meta management rejects startup `replicaof`, `redis-replicaof`, and `load-rdb`;
@@ -228,6 +227,18 @@ runtime `REPLICAOF`/`SLAVEOF` (including `NO ONE`) and `ADDREPLICAOF` are also
 rejected, as are unauthenticated native and Redis replication exports. These
 restrictions prevent standalone role control or imported data from being
 mistaken for an authorized cluster population.
+
+Managed Single separates transport role from complete-population read permission.
+Worker 0 derives serving generation from the existing Ready proof, native data
+validity and population incarnation. A same-population reconnect preserves that
+generation; destructive FULL, proof invalidation or uncertain apply closes it
+before draining DB operations. FULL cancellation cannot restore an old proof.
+Client read checks consume the published generation; no second population
+registry, read lease or blocking cross-worker request lock is introduced.
+`replica-serve-stale-data no` additionally requires an online replication link.
+Expired values remain invisible on replicas without granting authority to delete
+them. Cluster preserves its existing READONLY and loading rules. Both managed
+modes share Recovery, Prepare, Activate and Follow Owner.
 
 The configured stable data-node identity is also the
 ReplicationManager's local node identity. Status, the boot-scoped
@@ -1143,8 +1154,8 @@ HA support: a new native upstream still requires Meta authorization.
 
 | Setting or command | Current scope and behavior |
 |---|---|
-| `client-mode` / `--client-mode` | Single or Cluster client semantics and effective DB range; startup-only |
-| `meta-managed` / `--meta-managed` | Meta-controlled one-node-one-group lifecycle requiring `node-id` and `meta-seed`; rejects external upstream and `load-rdb`; the manager also ignores an external upstream supplied by an embedder |
+| `meta-seed` / `--meta-seed` | Selects Meta management and read-only mode bootstrap before storage; requires `node-id`, rejects external upstream and `load-rdb` |
+| `replica-serve-stale-data` | Managed Single complete replicas remain readable during link loss by default (`yes`); file configuration and CONFIG GET/SET accept `yes` or `no` |
 | Cluster control adapter | Node-controller-only source rebuild and source-less first-population admission/completion handles, population status, and source authorize/revoke APIs; Meta transport remains outside `ReplicationManager` |
 | `replicaof host port` / `REPLICAOF` | Non-Meta Redis/Redis Cluster subscription with PSYNC handshake before changing roles; Lavik native upstreams are rejected |
 | `redis-replicaof host port` / `--redis-replicaof` | Explicit non-Meta startup Redis PSYNC source; uses the same handshake |

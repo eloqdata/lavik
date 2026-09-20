@@ -2041,6 +2041,7 @@ lavik::meta::SubmitOperation MakeClusterCreateSubmit(
     std::uint8_t seed, std::string group_id = "group-a") {
   lavik::meta::ClusterCreateManifestV1 manifest;
   manifest.schema_version_ = 1;
+  manifest.client_mode_ = lavik::ClientMode::kCluster;
   manifest.meta_members_ = {{1, "tcp://127.0.0.1:7101", "tcp://127.0.0.1:7301",
                              "tcp://127.0.0.1:7201"}};
   manifest.data_nodes_ = {{std::string(40, '1'), "tcp://127.0.0.1:6379"}};
@@ -2298,7 +2299,9 @@ TEST(MetaStateApply, SnapshotValidatesClusterLifecycleAggregate) {
   {
     MetaStores stores;
     const auto root = MakeOperationId(0x76);
-    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root, 9).ok());
+    ASSERT_TRUE(stores.topology_
+                    .BeginClusterCreate(root, 9, lavik::ClientMode::kCluster)
+                    .ok());
     ExpectAggregateSnapshotFailStop(stores);
   }
   {
@@ -2308,8 +2311,10 @@ TEST(MetaStateApply, SnapshotValidatesClusterLifecycleAggregate) {
     root.intent_ = other.intent_;
     root.intent_hash_ = lavik::meta::MetaSha256(root.intent_);
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 10).ok());
-    ASSERT_TRUE(
-        stores.topology_.BeginClusterCreate(root.operation_id_, 10).ok());
+    ASSERT_TRUE(stores.topology_
+                    .BeginClusterCreate(root.operation_id_, 10,
+                                        lavik::ClientMode::kCluster)
+                    .ok());
     ExpectAggregateSnapshotFailStop(stores);
   }
   {
@@ -2382,8 +2387,10 @@ TEST(MetaStateApply, ClusterRootTerminalizationRequiresExactGenesisAnchor) {
     MetaStores stores;
     const auto root = MakeClusterCreateSubmit(0x75);
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 28).ok());
-    ASSERT_TRUE(
-        stores.topology_.BeginClusterCreate(root.operation_id_, 29).ok());
+    ASSERT_TRUE(stores.topology_
+                    .BeginClusterCreate(root.operation_id_, 29,
+                                        lavik::ClientMode::kCluster)
+                    .ok());
     lavik::meta::CompleteOperation complete;
     complete.operation_id_ = root.operation_id_;
     complete.expected_revision_ = 0;
@@ -2400,8 +2407,10 @@ TEST(MetaStateApply, ClusterRootTerminalizationRequiresExactGenesisAnchor) {
     auto root = MakeClusterCreateSubmit(0x76);
     root.kind_ = "migration";
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 31).ok());
-    ASSERT_TRUE(
-        stores.topology_.BeginClusterCreate(root.operation_id_, 31).ok());
+    ASSERT_TRUE(stores.topology_
+                    .BeginClusterCreate(root.operation_id_, 31,
+                                        lavik::ClientMode::kCluster)
+                    .ok());
     lavik::meta::AbortOperation abort;
     abort.operation_id_ = root.operation_id_;
     abort.expected_revision_ = 0;
@@ -2420,8 +2429,10 @@ TEST(MetaStateApply, ClusterRootTerminalizationRequiresExactGenesisAnchor) {
     root.intent_ = other.intent_;
     root.intent_hash_ = lavik::meta::MetaSha256(root.intent_);
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 33).ok());
-    ASSERT_TRUE(
-        stores.topology_.BeginClusterCreate(root.operation_id_, 33).ok());
+    ASSERT_TRUE(stores.topology_
+                    .BeginClusterCreate(root.operation_id_, 33,
+                                        lavik::ClientMode::kCluster)
+                    .ok());
     lavik::meta::CompleteOperation complete;
     complete.operation_id_ = root.operation_id_;
     complete.expected_revision_ = 0;
@@ -2436,8 +2447,10 @@ TEST(MetaStateApply, ClusterRootTerminalizationRequiresExactGenesisAnchor) {
     MetaStores stores;
     const auto root = MakeClusterCreateSubmit(0x79);
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 35).ok());
-    ASSERT_TRUE(
-        stores.topology_.BeginClusterCreate(root.operation_id_, 36).ok());
+    ASSERT_TRUE(stores.topology_
+                    .BeginClusterCreate(root.operation_id_, 36,
+                                        lavik::ClientMode::kCluster)
+                    .ok());
     lavik::meta::AbortOperation abort;
     abort.operation_id_ = root.operation_id_;
     abort.expected_revision_ = 0;
@@ -2520,8 +2533,10 @@ TEST(MetaStateApply, ClusterRootTerminalReplayRejectsInvalidGenesisAnchor) {
     auto root = MakeClusterCreateSubmit(0x7b);
     root.kind_ = "migration";
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 38).ok());
-    ASSERT_TRUE(
-        stores.topology_.BeginClusterCreate(root.operation_id_, 38).ok());
+    ASSERT_TRUE(stores.topology_
+                    .BeginClusterCreate(root.operation_id_, 38,
+                                        lavik::ClientMode::kCluster)
+                    .ok());
     lavik::meta::CompleteOperation complete;
     complete.operation_id_ = root.operation_id_;
     complete.expected_revision_ = 0;
@@ -2539,8 +2554,10 @@ TEST(MetaStateApply, ClusterRootTerminalReplayRejectsInvalidGenesisAnchor) {
     root.intent_ = other.intent_;
     root.intent_hash_ = lavik::meta::MetaSha256(root.intent_);
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 40).ok());
-    ASSERT_TRUE(
-        stores.topology_.BeginClusterCreate(root.operation_id_, 40).ok());
+    ASSERT_TRUE(stores.topology_
+                    .BeginClusterCreate(root.operation_id_, 40,
+                                        lavik::ClientMode::kCluster)
+                    .ok());
     lavik::meta::CompleteOperation complete;
     complete.operation_id_ = root.operation_id_;
     complete.expected_revision_ = 0;
@@ -2555,8 +2572,10 @@ TEST(MetaStateApply, ClusterRootTerminalReplayRejectsInvalidGenesisAnchor) {
     MetaStores stores;
     const auto root = MakeClusterCreateSubmit(0x7e);
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 42).ok());
-    ASSERT_TRUE(
-        stores.topology_.BeginClusterCreate(root.operation_id_, 43).ok());
+    ASSERT_TRUE(stores.topology_
+                    .BeginClusterCreate(root.operation_id_, 43,
+                                        lavik::ClientMode::kCluster)
+                    .ok());
     lavik::meta::AbortOperation abort;
     abort.operation_id_ = root.operation_id_;
     abort.expected_revision_ = 0;
@@ -2585,8 +2604,10 @@ TEST(MetaStateApply, ClusterRootSubmitReplayRejectsASingleStoreEffect) {
   }
   {
     MetaStores stores;
-    ASSERT_TRUE(
-        stores.topology_.BeginClusterCreate(root.operation_id_, 32).ok());
+    ASSERT_TRUE(stores.topology_
+                    .BeginClusterCreate(root.operation_id_, 32,
+                                        lavik::ClientMode::kCluster)
+                    .ok());
 
     ApplyRejected(stores, 32, MetaCommand{root});
 

@@ -406,6 +406,12 @@ CommandReply ExecuteSimpleLocalCommand(const CommandRequest& request,
             "ERR SELECT is not allowed in cluster mode");
         return reply;
       }
+      if (cluster::MetaManaged() && db_id != 0) {
+        reply.encoded_ = reply_builder.AppendError(
+            "ERR nonzero databases are not yet supported in Meta-managed "
+            "Single mode");
+        return reply;
+      }
       if (db_id >= storage::kLogicalDatabaseCount) {
         reply.encoded_ =
             reply_builder.AppendError("ERR DB index is out of range");
@@ -894,6 +900,10 @@ bool EmitClusterDecision(const cluster::Decision& decision, bool connection_tls,
     case cluster::Decision::Kind::kServe:
     case cluster::Decision::Kind::kServeStaleRead:
       return false;
+    case cluster::Decision::Kind::kReadOnly:
+      reply->encoded_ = reply_builder.AppendError(
+          "READONLY You can't write against a read only replica.");
+      return true;
     case cluster::Decision::Kind::kMoved:
       reply->encoded_ = AppendMovedError(
           reply_builder, decision.moved_slot_, decision.moved_host_,
@@ -903,7 +913,10 @@ bool EmitClusterDecision(const cluster::Decision& decision, bool connection_tls,
       reply->encoded_ = AppendCrossSlotError(reply_builder);
       return true;
     case cluster::Decision::Kind::kClusterDownUnbound:
-      reply->encoded_ = AppendClusterDownUnboundError(reply_builder);
+      reply->encoded_ = cluster::GetClientMode() == ClientMode::kSingle
+                            ? reply_builder.AppendError(
+                                  "MASTERDOWN No available primary authority")
+                            : AppendClusterDownUnboundError(reply_builder);
       return true;
     case cluster::Decision::Kind::kLoading:
       // Cluster readiness comes from the published ServingState, not from an
@@ -948,7 +961,9 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
     // reply. Only admitted writes allocate a shared proof to retain across
     // worker hops and storage checks. The local admission owns any borrowed
     // MOVED host until EmitClusterDecision has copied it into the reply.
-    if (is_write) {
+    if (is_write || (cluster::GetClientMode() == ClientMode::kSingle &&
+                     request.spec_ != nullptr &&
+                     (request.spec_->flags_ & kCmdMultiShard) != 0)) {
       request.cluster_authority_admission_ =
           std::make_shared<const cluster::AuthorityAdmission>(
               std::move(admission));
@@ -1325,6 +1340,8 @@ constexpr std::string_view kReplicationBacklogBackpressureConfig =
     "replication-backlog-backpressure";
 constexpr std::string_view kReplicationPublishQueueConfig =
     "replication-publish-queue-mb-per-worker";
+constexpr std::string_view kReplicaServeStaleConfig =
+    "replica-serve-stale-data";
 constexpr std::string_view kReplicaPriorityConfig = "replica-priority";
 constexpr std::string_view kDefragPausedConfig = "defrag-paused";
 constexpr std::string_view kDefragMaxActiveConfig =
@@ -1370,6 +1387,7 @@ enum class RuntimeConfigKey : std::uint8_t {
   kReplicationBacklogBackpressure,
   kReplicationPublishQueue,
   kReplicaPriority,
+  kReplicaServeStale,
   kDefragPaused,
   kDefragMaxActive,
   kDefragSleep,
@@ -1414,6 +1432,8 @@ constexpr std::array kRuntimeConfigs{
                             RuntimeConfigKey::kReplicationBacklogBackpressure},
     RuntimeConfigDescriptor{kReplicationPublishQueueConfig,
                             RuntimeConfigKey::kReplicationPublishQueue},
+    RuntimeConfigDescriptor{kReplicaServeStaleConfig,
+                            RuntimeConfigKey::kReplicaServeStale},
     RuntimeConfigDescriptor{kReplicaPriorityConfig,
                             RuntimeConfigKey::kReplicaPriority},
     RuntimeConfigDescriptor{kDefragPausedConfig,
@@ -1568,7 +1588,8 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
            config.key_ == RuntimeConfigKey::kReplicationBacklogSize ||
            config.key_ == RuntimeConfigKey::kReplicationBacklogBackpressure ||
            config.key_ == RuntimeConfigKey::kReplicationPublishQueue ||
-           config.key_ == RuntimeConfigKey::kReplicaPriority) &&
+           config.key_ == RuntimeConfigKey::kReplicaPriority ||
+           config.key_ == RuntimeConfigKey::kReplicaServeStale) &&
           g_replication == nullptr) {
         continue;
       }
@@ -1592,6 +1613,8 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
           return std::to_string(
               g_replication->publish_queue_bytes_per_worker() /
               (1024ULL * 1024));
+        case RuntimeConfigKey::kReplicaServeStale:
+          return g_replication->replica_serve_stale_data() ? "yes" : "no";
         case RuntimeConfigKey::kReplicaPriority:
           return std::to_string(g_replication->replica_priority());
         case RuntimeConfigKey::kDefragPaused:
@@ -1758,6 +1781,16 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
                 .upstream_ = std::nullopt,
                 .value_ = value * kMiB,
             });
+      }
+    } else if (config->key_ == RuntimeConfigKey::kReplicaServeStale) {
+      const auto enabled = ParseConfigYesNo(args[3]);
+      if (g_replication == nullptr) {
+        configured =
+            absl::FailedPreconditionError("replication backend is unavailable");
+      } else if (!enabled.has_value()) {
+        configured = absl::InvalidArgumentError("value must be 'yes' or 'no'");
+      } else {
+        g_replication->SetReplicaServeStaleData(*enabled);
       }
     } else if (config->key_ == RuntimeConfigKey::kReplicaPriority) {
       if (g_replication == nullptr) {
@@ -4107,6 +4140,15 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
                                          ReplyBuilder& reply_builder,
                                          ReadLatencyTrace* read_trace = nullptr,
                                          SetLatencyTrace* set_trace = nullptr) {
+  // This is the common single-key owner-worker entry, after any dispatch hop.
+  // The DB gate pins the population across storage I/O; a fresh authority
+  // check here also catches a lease/fence change while that hop was queued.
+  if (!ClusterRequestIsWrite(request)) {
+    if (const char* error = CommandServingGenerationError(request);
+        error != nullptr) {
+      co_return BuiltReply(reply_builder.AppendError(error));
+    }
+  }
   CommandReply reply;
   const auto& args = request.args_;
   switch (request.kind_) {
@@ -11689,6 +11731,35 @@ const char* CommandServingGenerationError(
       g_replication == nullptr) {
     return nullptr;
   }
+  if (cluster::MetaManaged() &&
+      cluster::GetClientMode() == ClientMode::kSingle &&
+      !ClusterRequestIsWrite(request)) {
+    const cluster::RequestView view{.slots_ = request.ClusterSlots(),
+                                    .is_write_ = false,
+                                    .connection_readonly_ = true,
+                                    .loading_allowed_ = false,
+                                    .client_mode_ = ClientMode::kSingle};
+    const auto admission =
+        cluster::GetClusterRuntime()->authority_guard_.CaptureAndAdmit(
+            view, cluster::LeaseClockNow());
+    switch (admission.decision().kind_) {
+      case cluster::Decision::Kind::kServe:
+      case cluster::Decision::Kind::kServeStaleRead:
+        break;
+      case cluster::Decision::Kind::kLoading:
+        return "LOADING Redis is loading the dataset in memory";
+      default:
+        return "MASTERDOWN No available primary authority";
+    }
+  }
+  const auto read_state = g_replication->dataset_read_state();
+  if (read_state == ReplicationManager::DatasetReadState::kLoading) {
+    return "LOADING Lavik is loading the dataset from the primary";
+  }
+  if (read_state == ReplicationManager::DatasetReadState::kStaleDisabled) {
+    return "MASTERDOWN Link with primary is down and replica-serve-stale-data "
+           "is set to no";
+  }
   if (g_replication->ServingGenerationMatches(request.serving_generation_)) {
     return nullptr;
   }
@@ -11744,14 +11815,48 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
           "ERR ", unscoped_mutation, " is not allowed in Meta-managed mode")));
     }
+    if (!request.replication_origin_ &&
+        cluster::GetClientMode() == ClientMode::kSingle) {
+      // Scope follows command execution shapes, not individual data types.
+      // Later tickets can remove a boundary only after wiring its waits,
+      // participants and durable/catalog effects into Group authority.
+      const auto flags = request.spec_ == nullptr ? 0u : request.spec_->flags_;
+      const bool keyless_data =
+          (flags & kCmdUsesDbGate) != 0 && (flags & kCmdNoKeys) != 0;
+      bool multiple_keys = false;
+      if ((flags & kCmdMultiShard) != 0 && request.spec_ != nullptr) {
+        const auto keys = DetermineKeys(*request.spec_, request.args_);
+        multiple_keys = !keys.ok() || keys->count() != 1;
+      }
+      const bool deferred =
+          kind == CommandKind::kMulti || kind == CommandKind::kExec ||
+          kind == CommandKind::kWatch || kind == CommandKind::kUnwatch ||
+          kind == CommandKind::kDiscard || kind == CommandKind::kScript ||
+          kind == CommandKind::kFunction || kind == CommandKind::kSortRo ||
+          kind == CommandKind::kKeys || kind == CommandKind::kSave ||
+          kind == CommandKind::kBgSave ||
+          (flags & (kCmdMovableKeys | kCmdMayBlock | kCmdDynamicWrite)) != 0 ||
+          multiple_keys || keyless_data;
+      if (deferred && !script_kill && !function_kill && !function_stats) {
+        if (ctx.in_multi_) ctx.multi_dirty_ = true;
+        co_return BuiltReply(reply_builder.AppendError(
+            "ERR command is not yet supported in Meta-managed Single mode"));
+      }
+      if (request.db_id_ != 0) {
+        co_return BuiltReply(
+            reply_builder.AppendError("ERR nonzero databases are not yet "
+                                      "supported in Meta-managed Single mode"));
+      }
+    }
   }
-  if (g_replication != nullptr && g_replication->is_loading()) [[unlikely]] {
-    // The whitelist is shared verbatim with the cluster gate. In cluster mode
-    // this is the target-side population fence; ClusterGateReject below still
-    // performs the independent topology/authority admission.
-    if (!LoadingAllowedCommand(request)) {
+  if (g_replication != nullptr && !LoadingAllowedCommand(request)) {
+    const auto state = g_replication->dataset_read_state();
+    if (state != ReplicationManager::DatasetReadState::kReadable) [[unlikely]] {
       co_return BuiltReply(reply_builder.AppendError(
-          "LOADING Lavik is loading the dataset from the primary"));
+          state == ReplicationManager::DatasetReadState::kStaleDisabled
+              ? "MASTERDOWN Link with primary is down and "
+                "replica-serve-stale-data is set to no"
+              : "LOADING Lavik is loading the dataset from the primary"));
     }
   }
   if (cluster::MetaManaged()) {

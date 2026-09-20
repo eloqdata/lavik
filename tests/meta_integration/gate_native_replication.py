@@ -33,6 +33,8 @@ import gate_cluster_create as C
 import harness as H
 from gate_data_control import DataProcess
 
+CLIENT_MODE = "cluster"
+
 
 class Client:
     def __init__(self, node, readonly=False):
@@ -59,7 +61,8 @@ class Client:
 @contextmanager
 def pair(root, name, source_faults=None, target_faults=None, seed=None,
          source_workers=2, target_workers=3, raft_args=None,
-         require_seed_before_full=False):
+         require_seed_before_full=False, client_mode=None):
+    client_mode = client_mode or CLIENT_MODE
     directory = root / name
     directory.mkdir()
     meta = H.Node(C.META, str(directory), 1,
@@ -72,7 +75,7 @@ def pair(root, name, source_faults=None, target_faults=None, seed=None,
     target = DataProcess(C.DATA, str(directory / "target"), C.REPLICA_1,
                          proxy.endpoint, workers=target_workers,
                          environment={**os.environ, **(target_faults or {})})
-    lines = ['schema_version = 1', 'slot_strategy = "contiguous-even"']
+    lines = ['schema_version = 1', f'client_mode = "{client_mode}"', 'slot_strategy = "contiguous-even"']
     lines += C.meta_manifest_lines(meta)
     for node in (source, target):
         lines += ['[[data_nodes]]', f'id = "{node.node_id}"',

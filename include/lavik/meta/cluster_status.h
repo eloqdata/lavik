@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "lavik/client_mode.h"
+
 // Raft-free model for `lavik-ctl cluster-status`. The server
 // translates its committed/runtime state into these bounded values; clients
 // strictly decode them and never need Raft types or a public leader-route
@@ -153,6 +155,7 @@ enum class ClusterStateWireV1 : std::uint8_t {
 struct ClusterStatusWireV1 {
   ClusterCaptureWireV1 capture_;
   ClusterStateWireV1 cluster_state_ = ClusterStateWireV1::kUninitialized;
+  std::optional<ClientMode> client_mode_;
   std::uint64_t lifecycle_revision_ = 0;
   std::optional<std::string> root_operation_id_;
   std::optional<std::uint64_t> genesis_commit_index_;

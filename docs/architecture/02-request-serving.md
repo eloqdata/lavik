@@ -383,7 +383,7 @@ relationships are established by Meta Follow Owner.
 The retained management-only `MULTI`/`EXEC` handling preserves command order and
 individual replies; it never bypasses these management checks. `CONFIG REWRITE`
 persists the current single-upstream configuration and priority while preserving
-startup client-mode and Meta settings. External Sentinel control of Lavik HA is
+startup Meta seeds and identity settings. External Sentinel control of Lavik HA is
 outside the supported deployment contract.
 
 `CONFIG GET/SET maxclients` exposes the live connection limit, while `INFO clients`
