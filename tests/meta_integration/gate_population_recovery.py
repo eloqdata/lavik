@@ -32,10 +32,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate_automatic_failover as A  # noqa: E402
 import gate_failover as F  # noqa: E402
 import harness as H  # noqa: E402
+from gate_data_control import allocate_data_file  # noqa: E402
 
 CASES = ("clean-owner", "clean-replica", "crash-operator", "manual-fence",
          "before-publish", "after-publish", "before-consume", "after-consume",
-         "incomplete-full", "eligible-candidate")
+         "incomplete-full", "eligible-candidate", "promoted-follower")
 
 
 @contextmanager
@@ -173,14 +174,53 @@ def run(args, workdir):
     owner.workers = 2
     replica = fixture.by_id[F.CANDIDATE]
     case = args.case
+    if case == "promoted-follower":
+        # Two promotions and repeated FULL consume more allocation generations
+        # than the small default fixture can retain before reclamation.
+        for member in (owner, replica):
+            os.makedirs(member.workdir, exist_ok=True)
+            allocate_data_file(member.data_path, 1024 * 1024 * 1024)
     publish_fault = ("recovery_" + case.replace("-", "_proof_")
                      if case.endswith("publish") else None)
     try:
         with crash_at(publish_fault):
             fixture.start_created(add_follower=False)
-        if case in ("clean-replica", "eligible-candidate"):
+        if case in ("clean-replica", "eligible-candidate", "promoted-follower"):
             fixture.add_replica(F.CANDIDATE)
         seed(owner)
+        if case == "promoted-follower":
+            # A promoted cluster Owner persists the logical Meta group name.
+            # Crash it before it can adopt a successor's wire identity, then
+            # require ordinary FOLLOW/FULL after the remaining member takes over.
+            wait_replica_cut(owner)
+            F.wait_candidate_source(fixture, F.OWNER, 1, {F.CANDIDATE})
+            operation = fixture.submit_failover()
+            F.wait_operation(fixture, operation,
+                             "OK completed failover-completed",
+                             "first replica is promoted", timeout=60)
+            wait_serving(fixture, replica, 2)
+            F.wait_candidate_source(fixture, F.CANDIDATE, 2, {F.OWNER})
+            wait_replica_cut(replica)
+            wait_durable(replica)
+            reply = fixture.leader.put_automatic_uncontrolled_failover_policy(
+                2, suspect_after_ms=5000)
+            if not reply.startswith("OK "):
+                raise H.Failure(f"could not configure recovery detector: {reply}")
+            replica.force_kill()
+            wait_serving(fixture, owner, 3)
+            restart(fixture, replica)
+            F.wait_ready(fixture, "restarted promoted member rejoins", timeout=40)
+            info = F.replication_info_fields(replica)
+            if info.get("lavik_replication_group_id") != F.GROUP.encode().hex():
+                raise H.Failure(f"recovered cluster wire group differs: {info}")
+            if F.redis_call(owner, ["SET", "recovery:after-rejoin", "verified"]) != "OK":
+                raise H.Failure("recovered Owner rejected post-rejoin write")
+            H.wait_until("restarted member receives new replicated writes", 20,
+                         lambda: F.readonly_get(replica, "recovery:after-rejoin")
+                         == "verified")
+            require_data(owner)
+            fixture.clean_shutdown()
+            return
         if case == "incomplete-full":
             restart(fixture, replica, "system-state-device-root-durable")
             fixture.leader.registernode(

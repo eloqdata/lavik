@@ -963,7 +963,14 @@ ReplicationManager::ReplicationGroup::ReplicationGroup(
       // later catalog generation is valid because every catalog commit is
       // serialized through the same system-state writer and preserves the
       // base; an earlier generation can never authorize the recovered data.
-      group_id_ = (**recovered_base).group_id_;
+      // Meta-managed promotion persists the logical Meta group name, whereas
+      // native replication carries its hex-encoded population token. A
+      // restarted former owner must use the same wire identity as a live
+      // owner when it reconnects as a replica (including a fresh FULL).
+      // Standalone promotion already persists the native replication id.
+      group_id_ = meta_managed_
+                      ? PopulationGroupToken((**recovered_base).group_id_)
+                      : (**recovered_base).group_id_;
     }
   }
   if (upstream_.has_value() || meta_managed_) {
