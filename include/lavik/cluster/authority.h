@@ -281,9 +281,14 @@ class AuthorityGuard {
     std::uint64_t revision_ = 0;
   };
 
+  struct LeaseCheck {
+    std::uint64_t revision = 0;
+    MonotonicTime deadline{};
+  };
   Decision DecideWithLease(const ServingState* state,
                            const RequestView& request, MonotonicTime now,
-                           AuthorityAdmission* proof) const;
+                           AuthorityAdmission* proof,
+                           LeaseCheck* lease_check = nullptr) const;
   static std::optional<AuthorityAnchor> LocalPrimaryAnchor(
       const ServingState& state, std::string_view group_id);
   bool LeaseCovers(const AuthorityState& authority, const ServingState& state,

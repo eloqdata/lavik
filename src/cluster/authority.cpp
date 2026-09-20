@@ -397,14 +397,53 @@ AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
 Decision AuthorityGuard::DecideNow(const RequestView& request,
                                    MonotonicTime now) const {
   std::uint64_t version = 0;
-  const auto& state = CurrentCachedWithVersion(topology_, &version);
-  return DecideWithLease(state.get(), request, now, nullptr);
+  std::uint64_t sequence = 0;
+  const auto& state = CurrentCachedWithVersion(topology_, &version, &sequence);
+  // Single's complete Group authorizes every read through the same predicate.
+  // Keep only successful verdicts in worker-local memory; exact publication
+  // identity and lease expiry remain checked on every call. This avoids both
+  // repeated Group/lease lookups and per-request ownership, without adding a
+  // second authority, shared atomics, or a command-specific permission rule.
+  const bool single_read =
+      request.client_mode_ == ClientMode::kSingle && !request.is_write_ &&
+      !request.loading_allowed_ &&
+      (request.slots_.empty() || request.slots_.front() < kSlotCount);
+  if (!single_read) return DecideWithLease(state.get(), request, now, nullptr);
+  struct CachedRead {
+    std::uint64_t identity = 0;
+    std::uint64_t sequence = 0;
+    Decision::Kind kind = Decision::Kind::kLoading;
+    LeaseCheck lease;
+  };
+  thread_local CachedRead cached;
+  if (cached.identity == cache_identity_ && cached.sequence == sequence &&
+      (cached.kind == Decision::Kind::kServeStaleRead ||
+       (now < cached.lease.deadline &&
+        cached.lease.revision == CurrentAuthority().revision_))) {
+    Decision decision;
+    decision.kind_ = cached.kind;
+    return decision;
+  }
+  LeaseCheck lease;
+  const Decision decision =
+      DecideWithLease(state.get(), request, now, nullptr, &lease);
+  if (decision.kind_ == Decision::Kind::kServe ||
+      decision.kind_ == Decision::Kind::kServeStaleRead) {
+    cached = {.identity = cache_identity_,
+              .sequence = sequence,
+              .kind = decision.kind_,
+              .lease = lease};
+  } else {
+    cached.identity = 0;
+  }
+  return decision;
 }
 
 Decision AuthorityGuard::DecideWithLease(const ServingState* state,
                                          const RequestView& request,
                                          MonotonicTime now,
-                                         AuthorityAdmission* proof) const {
+                                         AuthorityAdmission* proof,
+                                         LeaseCheck* lease_check) const {
   Decision decision = Admit(state, request);
   const auto slots = AuthoritySlots(request);
   if (decision.kind_ != Decision::Kind::kServe || state == nullptr ||
@@ -426,8 +465,11 @@ Decision AuthorityGuard::DecideWithLease(const ServingState* state,
     proof->lease_revision_ = authority.revision_;
     proof->lease_checked_ = true;
   }
-  if (!LeaseCovers(authority, *state, slots, now,
-                   proof != nullptr ? &proof->lease_deadline_ : nullptr)) {
+  if (lease_check != nullptr) lease_check->revision = authority.revision_;
+  MonotonicTime* deadline = proof != nullptr         ? &proof->lease_deadline_
+                            : lease_check != nullptr ? &lease_check->deadline
+                                                     : nullptr;
+  if (!LeaseCovers(authority, *state, slots, now, deadline)) {
     decision.kind_ = Decision::Kind::kClusterDownUnbound;
   }
   return decision;
@@ -467,6 +509,13 @@ RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,
   // again. Borrow its pinned snapshot to avoid unnecessary atomic shared
   // ownership updates on every mutation.
   const auto& current = CurrentCachedWithVersion(topology_, &version);
+  // Owner tokens deliberately exclude replica membership. A retained replica
+  // read is reusable only on its exact snapshot; a fresh admission must prove
+  // membership again after publication, even if the Owner/term did not change.
+  if (admission.decision_.kind_ == Decision::Kind::kServeStaleRead &&
+      current.get() != admission.state_.get()) {
+    return RecheckResult::kReject;
+  }
   // A representative slot proves the whole dataset only while its one-Group
   // topology remains intact, including across a publication before mutation.
   if (admission.single_group_ && !admission.slots_.empty() &&
