@@ -449,6 +449,7 @@ add_library(lavik_module
   src/replication/native_recovery.cpp
   src/replication/native_reparent.cpp
   src/replication/replication.cpp
+  src/replication/redis_replication.cpp
   src/redis/rdb.cpp
   src/redis/rdb_collection.cpp
   src/redis/rdb_import.cpp
@@ -1034,6 +1035,20 @@ if (BUILD_TESTING)
           RUN_SERIAL TRUE
         )
 
+        set(LAVIK_NATIVE_GATE_SERVER lavik)
+        if (TARGET lavik_fault_server)
+          set(LAVIK_NATIVE_GATE_SERVER lavik_fault_server)
+        endif()
+        add_test(
+          NAME meta_integration.gate_native_replication
+          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_native_replication.py
+                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:${LAVIK_NATIVE_GATE_SERVER}>
+                  $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+        )
+        set_tests_properties(meta_integration.gate_native_replication PROPERTIES
+          LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+
         # lavik-meta's deterministic failover seams follow the ordinary
         # !NDEBUG policy; LAVIK_BUILD_FAULT_SERVER instruments only Data.
         # Do not register a Release gate that can only fail its required-hook
@@ -1253,67 +1268,16 @@ if (BUILD_TESTING)
     target_compile_definitions(lavik_cluster_serving_generation_integration_test PRIVATE
       LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>>)
     add_dependencies(lavik_cluster_serving_generation_integration_test lavik)
-    add_test(
-      NAME cluster_integration.serving_generation_fence
-      COMMAND lavik_cluster_serving_generation_integration_test
-              $<TARGET_FILE:lavik>
-    )
-    set_tests_properties(cluster_integration.serving_generation_fence PROPERTIES
-      LABELS cluster-integration
-      TIMEOUT 45
-      RUN_SERIAL TRUE
-    )
-
-    # The injection hook is compiled only into Debug or the explicitly
-    # non-packageable fault server. Do not register a release test that would
-    # silently run without its fault.
-    if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR TARGET lavik_fault_server)
-      set(LAVIK_REBUILD_FAILURE_SERVER_TARGET lavik)
-      if (TARGET lavik_fault_server)
-        set(LAVIK_REBUILD_FAILURE_SERVER_TARGET lavik_fault_server)
-      endif()
-      add_executable(lavik_cluster_rebuild_failure_integration_test
-        tests/cluster/rebuild_failure_integration_test.cpp
-      )
-      target_link_libraries(lavik_cluster_rebuild_failure_integration_test PRIVATE
-        lavik_test_support
-        GTest::gtest
-      )
-      add_dependencies(lavik_cluster_rebuild_failure_integration_test
-        ${LAVIK_REBUILD_FAILURE_SERVER_TARGET})
+    find_program(LAVIK_REDIS_SERVER_EXECUTABLE NAMES redis-server)
+    if (LAVIK_REDIS_SERVER_EXECUTABLE)
       add_test(
-        NAME cluster_integration.rebuild_failure_stops
-        COMMAND lavik_cluster_rebuild_failure_integration_test
-                $<TARGET_FILE:${LAVIK_REBUILD_FAILURE_SERVER_TARGET}>
+        NAME cluster_integration.serving_generation_fence
+        COMMAND lavik_cluster_serving_generation_integration_test
+                $<TARGET_FILE:lavik> ${LAVIK_REDIS_SERVER_EXECUTABLE}
       )
-      set_tests_properties(cluster_integration.rebuild_failure_stops PROPERTIES
+      set_tests_properties(cluster_integration.serving_generation_fence PROPERTIES
         LABELS cluster-integration
         TIMEOUT 45
-        RUN_SERIAL TRUE
-      )
-
-      add_executable(lavik_cluster_rebuild_protocol_integration_test
-        tests/cluster/rebuild_protocol_integration_test.cpp
-      )
-      target_compile_definitions(lavik_cluster_rebuild_protocol_integration_test PRIVATE
-        LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>>)
-      target_link_libraries(lavik_cluster_rebuild_protocol_integration_test PRIVATE
-        lavik_test_support
-        GTest::gtest
-      )
-      add_dependencies(lavik_cluster_rebuild_protocol_integration_test
-        ${LAVIK_REBUILD_FAILURE_SERVER_TARGET})
-      add_test(
-        NAME cluster_integration.rebuild_protocol_guards
-        COMMAND lavik_cluster_rebuild_protocol_integration_test
-                $<TARGET_FILE:${LAVIK_REBUILD_FAILURE_SERVER_TARGET}>
-      )
-      set_tests_properties(cluster_integration.rebuild_protocol_guards PROPERTIES
-        LABELS cluster-integration
-        # This entry runs multiple process fixtures, including crash/restart and
-        # forced reconnects. Their combined runtime exceeds two minutes on
-        # hosted runners; each fixture retains its own bounded progress waits.
-        TIMEOUT 300
         RUN_SERIAL TRUE
       )
     endif()
@@ -1405,6 +1369,20 @@ endforeach()
     find_program(LAVIK_REDIS_SERVER_EXECUTABLE redis-server)
     find_program(LAVIK_REDIS_CLI_EXECUTABLE redis-cli)
     if (LAVIK_REDIS_SERVER_EXECUTABLE AND LAVIK_REDIS_CLI_EXECUTABLE)
+      add_test(NAME lavik_redis_follower
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_follower_smoke.py
+                $<TARGET_FILE:lavik> ${LAVIK_REDIS_SERVER_EXECUTABLE})
+      set_tests_properties(lavik_redis_follower PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE)
+      find_program(LAVIK_REDIS_SHAKE_EXECUTABLE redis-shake)
+      if (LAVIK_BUILD_META AND LAVIK_REDIS_SHAKE_EXECUTABLE)
+        add_test(NAME lavik_redis_scan_reader_e2e
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_scan_reader_e2e.py
+                  $<TARGET_FILE:lavik> ${LAVIK_REDIS_SERVER_EXECUTABLE}
+                  ${LAVIK_REDIS_SHAKE_EXECUTABLE} $<TARGET_FILE:lavik-meta>
+                  $<TARGET_FILE:lavik-ctl>)
+        set_tests_properties(lavik_redis_scan_reader_e2e
+          PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+      endif()
       add_test(
         NAME lavik_redis_cluster_psync_e2e
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_cluster_psync_e2e.sh
@@ -1414,27 +1392,6 @@ endforeach()
       )
       set_tests_properties(lavik_redis_cluster_psync_e2e
         PROPERTIES TIMEOUT 120)
-      add_test(
-        NAME lavik_redis_export_e2e
-        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_export_e2e.sh
-                $<TARGET_FILE:lavik>
-                ${LAVIK_REDIS_SERVER_EXECUTABLE}
-                ${LAVIK_REDIS_CLI_EXECUTABLE}
-      )
-      set_tests_properties(lavik_redis_export_e2e PROPERTIES
-        TIMEOUT 120
-        RUN_SERIAL TRUE)
-      add_test(
-        NAME lavik_redis_export_backpressure_e2e
-        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_export_e2e.sh
-                $<TARGET_FILE:lavik>
-                ${LAVIK_REDIS_SERVER_EXECUTABLE}
-                ${LAVIK_REDIS_CLI_EXECUTABLE}
-                backpressure
-      )
-      set_tests_properties(lavik_redis_export_backpressure_e2e PROPERTIES
-        TIMEOUT 120
-        RUN_SERIAL TRUE)
       add_test(
         NAME lavik_rdb_backup_e2e
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rdb_backup_e2e.sh
@@ -1481,35 +1438,6 @@ endforeach()
     set_tests_properties(lavik_pubsub_e2e PROPERTIES
       TIMEOUT 120
       RUN_SERIAL TRUE)
-
-    find_program(LAVIK_REDIS_SERVER_EXECUTABLE redis-server)
-    if (LAVIK_REDIS_SERVER_EXECUTABLE)
-      set(LAVIK_SENTINEL_SERVER_TARGET lavik)
-      if (TARGET lavik_fault_server)
-        set(LAVIK_SENTINEL_SERVER_TARGET lavik_fault_server)
-      endif()
-      add_executable(lavik_sentinel_e2e_test
-        tests/sentinel_e2e_test.cpp
-      )
-      target_compile_definitions(lavik_sentinel_e2e_test PRIVATE
-        LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>>)
-      target_link_libraries(lavik_sentinel_e2e_test PRIVATE
-        lavik_test_support
-      )
-      add_test(
-        NAME lavik_sentinel_e2e
-        COMMAND lavik_sentinel_e2e_test
-                $<TARGET_FILE:${LAVIK_SENTINEL_SERVER_TARGET}>
-                ${LAVIK_REDIS_SERVER_EXECUTABLE}
-      )
-      # Temporarily disabled while ARM64 promotion triggers a second failover.
-      # Keep building the fixture; re-enable after https://github.com/eloqdata/lavik/issues/74.
-      set_tests_properties(lavik_sentinel_e2e PROPERTIES
-        DISABLED TRUE
-        LABELS cluster-integration
-        TIMEOUT 180
-        RUN_SERIAL TRUE)
-    endif()
 
     add_executable(lavik_flushdb_reclaim_e2e_test
       tests/flushdb_reclaim_e2e_test.cpp

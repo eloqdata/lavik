@@ -89,7 +89,9 @@ def allocate_data_file(path, size=DATA_FILE_BYTES):
 
 class DataProcess:
     def __init__(self, binary, workdir, node_id, seed, tls=None, workers=1,
-                 tls_only=False):
+                 tls_only=False, environment=None, extra_args=()):
+        self.environment = environment
+        self.extra_args = extra_args
         self.binary = binary
         self.node_id = node_id
         self.workdir = workdir
@@ -133,10 +135,10 @@ class DataProcess:
             "--flush-max-ms", "20",
             "--data-file", self.data_path,
             "--rdb-dir", self.workdir,
-            "--cluster-enabled",
-            "--cluster-node-id", self.node_id,
-            "--cluster-meta-seed", self.seed,
-            "--cluster-announce-ip", "127.0.0.1",
+            "--client-mode", "cluster", "--meta-managed", "yes",
+            "--node-id", self.node_id,
+            "--meta-seed", self.seed,
+            "--announce-ip", "127.0.0.1",
         ]
         if self.tls is not None:
             ca_cert, cert, key = self.tls
@@ -149,7 +151,8 @@ class DataProcess:
             ])
         self.log_file = open(self.log_path, "ab")
         self.proc = subprocess.Popen(
-            args, stdout=self.log_file, stderr=subprocess.STDOUT)
+            args + list(self.extra_args), stdout=self.log_file,
+            stderr=subprocess.STDOUT, env=self.environment)
         H.log(f"Data node {self.node_id[:8]} started "
               f"(pid {self.proc.pid}, seed {self.seed})")
         if wait_ready:
@@ -395,7 +398,7 @@ def run_plaintext(meta_binary, data_binary, workdir):
                         ["FUNCTION", "FLUSH"],
                         ["FUNCTION", "RESTORE", "invalid"]):
             expected = (f"-ERR {' '.join(command[:2])} is not allowed "
-                        "in cluster mode")
+                        "in Meta-managed mode")
             actual = data.command_head(command)
             if actual != expected:
                 raise H.Failure(

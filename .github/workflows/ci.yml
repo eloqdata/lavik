@@ -81,7 +81,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang-18 cmake ninja-build libssl-dev openssl python3 \
-            redis-server redis-tools tcl
+            curl tcl
       - name: Prepare test host
         run: |
           sudo sysctl -w kernel.io_uring_disabled=0
@@ -89,6 +89,12 @@ jobs:
           sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/dev
       - name: Check Go formatting
         run: test -z "$(gofmt -l raft)"
+      - name: Install Redis integration peers
+        run: |
+          ./scripts/install_test_redis.sh "$RUNNER_TEMP/redis"
+          echo "$RUNNER_TEMP/redis" >> "$GITHUB_PATH"
+          ./scripts/install_test_redisshake.sh "$RUNNER_TEMP/redis-shake"
+          echo "$RUNNER_TEMP/redis-shake" >> "$GITHUB_PATH"
       - name: Configure
         # Debug enables the Meta fault hooks as well as the Data crash tests.
         run: |

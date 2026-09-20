@@ -17,8 +17,8 @@
 #pragma once
 
 // Process-wide cluster data-plane runtime. Installed once at
-// startup when `cluster-enabled yes`, before any client connection is
-// served; nullptr in standalone mode. The object graph and advertised
+// startup when `meta-managed yes`, before any client connection is
+// served; nullptr when not Meta-managed. The object graph and advertised
 // endpoints are immutable after installation; the cache, authority guard, and
 // node controller own their documented synchronized/worker-affine state.
 
@@ -26,6 +26,7 @@
 #include <memory>
 #include <string>
 
+#include "lavik/client_mode.h"
 #include "lavik/cluster/node_control.h"
 #include "lavik/cluster/topology.h"
 
@@ -43,7 +44,7 @@ struct ClusterRuntime {
   AuthorityGuard authority_guard_;
   NodeControlInstaller node_control_installer_;
   // Advertised address of this node for discovery self entries (the
-  // cluster-announce-* values after defaults resolve). An empty host keeps
+  // announce-* values after defaults resolve). An empty host keeps
   // the existing wildcard-bind convention: clients dial the startup node's
   // address (see ClusterSlotsHost in src/redis/command.cpp).
   std::string announce_ip_;
@@ -52,7 +53,15 @@ struct ClusterRuntime {
 };
 
 ClusterRuntime* GetClusterRuntime() noexcept;
-bool ClusterEnabled() noexcept;
+// Client protocol semantics never depend on whether a Meta runtime exists.
+ClientMode GetClientMode() noexcept;
+// Convenience predicate for Cluster-only Redis behavior.
+bool IsClusterClientMode() noexcept;
+// A managed process installs its runtime before any worker starts serving.
+bool MetaManaged() noexcept;
+// Startup-only; tests must restore the default after tearing down their
+// runtime.
+void SetClientMode(ClientMode mode) noexcept;
 
 // Installs the runtime during startup. Not thread-safe by design: call it
 // before worker threads begin serving.

@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "lavik/client_mode.h"
 #include "lavik/logging.h"
 #include "lavik/memory.h"
 #include "lavik/replication.h"
@@ -75,7 +76,8 @@ struct ServerOptions {
   ClientBufferLimit maxmemory_clients_;
   std::size_t client_query_buffer_limit_bytes_ = kDefaultClientQueryBufferLimit;
   std::size_t inline_key_max_bytes_ = storage::kDefaultInlineKeyBytes;
-  std::uint32_t flush_max_ms_ = 1000;
+  // Bound partial-block age without waiting for size-triggered submission.
+  std::uint32_t flush_max_ms_ = 100;
   std::size_t flush_size_bytes_ = 128ULL * 1024;
   std::vector<std::string> data_files_{"lavik.data"};
   // Build and publish an index checkpoint after a clean shutdown drain. The
@@ -98,19 +100,20 @@ struct ServerOptions {
   std::uint32_t defrag_record_sleep_us_ = 0;
   bool defrag_paused_ = false;
   std::optional<ReplicaOfConfig> replicaof_;
-  // Redis Cluster data plane. All startup-only.
-  bool cluster_enabled_ = false;
+  // Client semantics and authority source are independent startup choices.
+  ClientMode client_mode_ = ClientMode::kSingle;
+  bool meta_managed_ = false;
   // Meta is the only supported control source. The directory learned from
   // Meta is process-local and is never persisted by the data node.
-  std::vector<std::string> cluster_meta_seeds_;
+  std::vector<std::string> meta_seeds_;
   // Stable 160-bit data-node identity. Boot/session incarnations remain
   // volatile and are generated separately.
-  std::string cluster_node_id_;
+  std::string node_id_;
   // Advertised client endpoints. 0 port = follow port_ / tls_port_; an empty
   // announce ip keeps the wildcard-bind startup-node convention for self.
-  std::string cluster_announce_ip_;
-  std::uint16_t cluster_announce_port_ = 0;
-  std::uint16_t cluster_announce_tls_port_ = 0;
+  std::string announce_ip_;
+  std::uint16_t announce_port_ = 0;
+  std::uint16_t announce_tls_port_ = 0;
   // Explicit Redis PSYNC compatibility alias. It may name a standalone Redis
   // server or the first master of a Redis Cluster.
   std::optional<ReplicaOfConfig> redis_replicaof_;

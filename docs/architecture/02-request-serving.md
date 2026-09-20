@@ -82,8 +82,7 @@ authentication, cluster-read, transaction, WATCH, native replication
 watermark, and name state.
 
 The service recognizes authentication and replication handshakes before
-ordinary dispatch. An isolated Redis `PSYNC` connection is transferred to the
-Redis exporter; an isolated native Lavik handshake is transferred to the
+ordinary dispatch. An isolated native Lavik handshake is transferred to the
 replication manager. Other authenticated traffic enters the request-drain gate
 used by graceful shutdown. That gate stores a closed bit and active count in
 one cache-line-isolated shard per worker. Normal traffic therefore mutates only
@@ -374,15 +373,18 @@ recorded after the reset traversal returns, but the traversal does not globally
 quiesce requests, so concurrent commands can also contribute post-reset
 samples.
 
-Redis Sentinel observes compatible `ROLE`, `INFO replication`, `CLIENT`, and
-Pub/Sub behavior. It can drive role changes and persistence through
-`REPLICAOF`, `CONFIG REWRITE`, and client eviction. Sentinel sends those
-management commands together in `MULTI`/`EXEC`; Lavik accepts a dedicated
-management-only batch, preserves its command order and individual replies, and
-uses the role transition rather than a process-wide transaction to provide the
-storage admission boundary. Runtime `replica-priority` controls promotion
-eligibility and preference, while `CONFIG REWRITE` persists the current
-single-upstream role configuration.
+The external replication command surface accepts only Redis/Redis Cluster
+upstreams. `REPLICAOF` and `SLAVEOF host port` complete AUTH/PSYNC before changing
+roles or retiring an existing subscription; `ADDREPLICAOF` additionally checks
+matching master slot layouts and disjoint slots; callers select the cluster. All Meta-managed nodes reject these
+commands, including `NO ONE`, independently of client mode. Lavik native
+relationships are established by Meta Follow Owner.
+
+The retained management-only `MULTI`/`EXEC` handling preserves command order and
+individual replies; it never bypasses these management checks. `CONFIG REWRITE`
+persists the current single-upstream configuration and priority while preserving
+startup client-mode and Meta settings. External Sentinel control of Lavik HA is
+outside the supported deployment contract.
 
 `CONFIG GET/SET maxclients` exposes the live connection limit, while `INFO clients`
 reports it alongside the active client gauges. The startup
@@ -441,4 +443,4 @@ real server executable.
 | Pub/Sub session queues, worker-local registries, fan-out, and subscribed connection serving | `include/lavik/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
 | SLOWLOG shards, command-stat reset, and client/Sentinel administration | `include/lavik/slowlog.h`, `src/redis/slowlog.cpp`, `include/lavik/metrics.h`, `src/metrics.cpp`, `src/redis/command.cpp` |
 | Redis RDB import/export and backup commands | `include/lavik/rdb.h`, `src/redis/rdb.cpp`, `include/lavik/rdb_collection.h`, `src/redis/rdb_collection.cpp`, `src/redis/backup.h`, `src/redis/backup.cpp` |
-| Parser, metadata, configuration, max-client admission, and end-to-end command coverage | `tests/resp_test.cpp`, `tests/command_table_test.cpp`, `tests/config_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/metrics_e2e_test.cpp`, `tests/sentinel_e2e_test.cpp`, `tests/list_e2e_test.cpp` |
+| Parser, metadata, configuration, max-client admission, and end-to-end command coverage | `tests/resp_test.cpp`, `tests/command_table_test.cpp`, `tests/config_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/metrics_e2e_test.cpp`, `tests/redis_follower_smoke.py`, `tests/list_e2e_test.cpp` |

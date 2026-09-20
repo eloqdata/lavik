@@ -151,11 +151,11 @@ start_data() {
   local i=$1
   "$lavik_bin" --bind 127.0.0.1 --port "$((6370 + i))" \
     --threads 1 --no-pin-workers \
-    --cluster-enabled --cluster-node-id "${node_ids[i-1]}" \
-    --cluster-announce-ip 127.0.0.1 \
-    --cluster-meta-seed 127.0.0.1:7301 \
-    --cluster-meta-seed 127.0.0.1:7302 \
-    --cluster-meta-seed 127.0.0.1:7303 \
+    --client-mode cluster --meta-managed yes --node-id "${node_ids[i-1]}" \
+    --announce-ip 127.0.0.1 \
+    --meta-seed 127.0.0.1:7301 \
+    --meta-seed 127.0.0.1:7302 \
+    --meta-seed 127.0.0.1:7303 \
     --data-file "$root/data-$i/lavik.data" --log-dir "$root/data-$i/logs" \
     >"$root/data-$i.log" 2>&1 &
   write_pid "data-$i" "$!"

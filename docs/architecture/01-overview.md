@@ -72,7 +72,7 @@ libraries, and their focused tests never see consensus code, and the build
 enforces that boundary at configure time.
 
 ```text
-Redis/Valkey clients, Sentinels, and replicas
+Redis/Valkey clients and replicas
                 |
         Bycorf TCP/TLS services
                 |
@@ -110,10 +110,17 @@ operator --> lavik-ctl cluster-status / failover / getop
 | Transaction coordination | Serialize conflicting key access across workers and execute single- or multi-shard command hops | `tx::TxRuntime`, `tx::Transaction`, `tx::TxShard` |
 | Storage and recovery | Own logical indexes and physical blocks, execute reads and appends, recover durable state, and reclaim obsolete data | `storage::StorageEngine` |
 | Function catalog | Stage one complete process-global Function definition set on every worker, commit its existing `FUNCTION DUMP` encoding, swap runtimes, and recover it before service readiness | `FunctionCatalog` |
-| Replication | Own one replication group, node role and sessions; publish native logs, run full/partial synchronization, prepare and activate a Meta-selected successor, follow the committed owner, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
+| Replication | Own one replication group, node role and sessions; publish native logs, run full/partial synchronization, prepare and activate a Meta-selected successor, follow the committed owner, consume Redis PSYNC, and apply trusted replay | `ReplicationManager` |
 | Cluster data plane | Admit, redirect, pause, or refuse requests by Meta-projected slot ownership, failover state, and finite authority; reconcile failover actions and owner following; serve Redis Cluster discovery | `cluster::AuthorityGuard::CaptureAndAdmit` / `RegisterAndRecheck`, `cluster::TopologyCache`, `cluster::NodeControlInstaller`, `cluster::MetaControlClientService` |
 | Meta control plane | Replicate metadata commands and typed global Policy, project node-specific desired state, publish leader-scoped Data sessions, detect sustained current-Owner failure, reconcile committed failover transitions, and expose authenticated administration plus stable cluster readiness | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaControlProjector`, `meta::MetaDataControlServer`, `meta::MetaAutomaticFailoverReconciler`, `meta::MetaFailoverReconciler` |
 | Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account retained memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
+
+Client mode and management status are separate startup inputs. `client-mode`
+selects Single (16 logical DBs) or Cluster (DB0) semantics; `meta-managed`
+selects the Meta session and finite-authority lifecycle. Default startup is
+Single without Meta. Cluster requires Meta; managed Single is not yet admitted
+at startup. Invalid combinations fail before storage preparation. Configuration
+names and deployment examples are in the [deployment guide](../operations/cluster-deployment.md).
 
 ## Process lifecycle
 
@@ -124,7 +131,7 @@ operator --> lavik-ctl cluster-status / failover / getop
    initializes the memory budget, signal handling, storage engine, replication
    manager, cluster topology/authority/node-controller runtime,
    command/storage bindings, metrics shards, transaction runtime, and Bycorf
-   service graph. Cluster mode always starts the outbound Meta control client
+   service graph. Meta-managed mode starts the outbound Meta control client
    fenced; no topology or positive authority is restored locally.
 3. On every worker, `RedisService::Run` binds the memory and transaction shards
    and awaits `StorageEngine::InitializeWorker`. Recovery barriers ensure all
@@ -304,8 +311,8 @@ cleanup as another durable phase.
 | etcd Raft | Pinned Go Modules embedded in `lavik-meta` through a C archive; owns protocol, peer connections, WAL and snapshot persistence independently of Bycorf |
 | OpenSSL | TLS server/client contexts; release builds can link it statically |
 | Redis/Valkey clients | RESP2 by default; `HELLO 2`/`HELLO 3` selects connection-level reply semantics, including RESP3 maps, sets, booleans, doubles, nulls, and push frames where handlers expose them |
-| Redis Sentinel | Discovers topology through Redis-compatible `INFO`, `ROLE`, client metadata, and Pub/Sub connections; drives failover with `REPLICAOF`, `CONFIG REWRITE`, and client eviction, using `replica-priority` for candidate preference |
-| Lavik or Redis upstreams/downstreams | Native replication, Redis PSYNC following, and Redis-compatible export |
+| Redis follower | Non-Meta nodes consume one Redis server or disjoint masters of one Redis Cluster using AUTH, PSYNC/RDB and ordered replay; external REPLICAOF rejects Lavik peers, whose relationships are Meta-controlled |
+| Keyspace export | RedisShake ScanReader uses ordinary authenticated scan/read commands, including Cluster discovery; Lavik does not serve Redis PSYNC |
 | Local storage | Existing files, raw block devices, or `spdk://` namespaces supplied through repeated `--data-file` options |
 | RDB files | Startup import and Redis-compatible `SAVE`/`BGSAVE` output through filesystem paths |
 | Prometheus/Grafana | Plaintext HTTP `/metrics`; optional Compose deployment under `deploy/monitoring/` |
@@ -328,7 +335,7 @@ those deployment boundaries remain unknown here.
 | Pub/Sub sessions, worker-local registries, fan-out, and bounded output | `include/lavik/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
 | Transaction boundary | `include/lavik/tx/`, `src/tx/` |
 | Storage boundary and focused lifecycle units | `include/lavik/storage/engine.h`, `include/lavik/storage/format.h`, `src/storage/engine/`, `src/storage/format.cpp` |
-| Replication manager, cluster failover/follow-owner adapters, protocol, Sentinel-visible role state, and log boundary | `include/lavik/replication.h`, `include/lavik/replication_command.h`, `src/replication/`, `src/storage/engine/replication_log.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/sentinel_e2e_test.cpp` |
+| Replication manager, cluster failover/follow-owner adapters, protocol, Redis-visible role state, and log boundary | `include/lavik/replication.h`, `include/lavik/replication_command.h`, `src/replication/`, `src/storage/engine/replication_log.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/redis_follower_smoke.py` |
 | Cluster topology, authority, controlled mutation pause, node control, and Meta/Data session | `include/lavik/cluster/`, `src/cluster/`, `src/redis/cluster_gate.h`, `src/redis/command.cpp`, `src/redis/blocking_wait.cpp`, `src/redis/server.cpp` |
 | Memory accounting, slow log, command statistics, and Prometheus service | `include/lavik/memory.h`, `src/memory.cpp`, `include/lavik/metrics.h`, `src/metrics.cpp`, `include/lavik/slowlog.h`, `src/redis/slowlog.cpp` |
 | Build, release, and package commands | `scripts/build_debug.sh`, `scripts/build_release.sh`, `scripts/package_release.sh`, `docs/operations/building-and-packaging.md` |

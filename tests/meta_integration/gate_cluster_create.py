@@ -1066,17 +1066,17 @@ def assert_redis_topology_and_replication(nodes):
         "function(keys, args) return 1 end)")
     for arguments, expected in (
             (["REPLICAOF", "127.0.0.1", "1"],
-             "ERR REPLICAOF not allowed in cluster mode."),
-            (["FLUSHDB"], "ERR FLUSHDB is not allowed in cluster mode"),
-            (["FLUSHALL"], "ERR FLUSHALL is not allowed in cluster mode"),
+             "ERR REPLICAOF not allowed in Meta-managed mode."),
+            (["FLUSHDB"], "ERR FLUSHDB is not allowed in Meta-managed mode"),
+            (["FLUSHALL"], "ERR FLUSHALL is not allowed in Meta-managed mode"),
             (["FUNCTION", "LOAD", rejected_library],
-             "ERR FUNCTION LOAD is not allowed in cluster mode"),
+             "ERR FUNCTION LOAD is not allowed in Meta-managed mode"),
             (["FUNCTION", "DELETE", "missing-library"],
-             "ERR FUNCTION DELETE is not allowed in cluster mode"),
+             "ERR FUNCTION DELETE is not allowed in Meta-managed mode"),
             (["FUNCTION", "FLUSH"],
-             "ERR FUNCTION FLUSH is not allowed in cluster mode"),
+             "ERR FUNCTION FLUSH is not allowed in Meta-managed mode"),
             (["FUNCTION", "RESTORE", "payload"],
-             "ERR FUNCTION RESTORE is not allowed in cluster mode")):
+             "ERR FUNCTION RESTORE is not allowed in Meta-managed mode")):
         actual = redis_error(by_id[PRIMARY_1], arguments)
         if actual != expected:
             raise H.Failure(
@@ -1093,7 +1093,7 @@ def assert_redis_topology_and_replication(nodes):
             raise H.Failure("primary rejected MULTI before policy check")
         function_reply = reader.readline()
         if function_reply != (
-                b"-ERR FUNCTION LOAD is not allowed in cluster mode\r\n"):
+                b"-ERR FUNCTION LOAD is not allowed in Meta-managed mode\r\n"):
             raise H.Failure(
                 "transactional FUNCTION LOAD returned "
                 f"{function_reply!r}")
@@ -1795,12 +1795,13 @@ def main():
         H.cleanup(workdir, keep)
 
 
-if len(sys.argv) not in (5, 6):
-    print(__doc__, file=sys.stderr)
-    sys.exit(2)
-META = os.path.abspath(sys.argv[1])
-DATA = os.path.abspath(sys.argv[2])
-CTL = os.path.abspath(sys.argv[3])
-REDIS_CLI = os.path.abspath(sys.argv[4])
-H.set_tag("cluster-create")
-sys.exit(main())
+if __name__ == "__main__":
+    if len(sys.argv) not in (5, 6):
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    META = os.path.abspath(sys.argv[1])
+    DATA = os.path.abspath(sys.argv[2])
+    CTL = os.path.abspath(sys.argv[3])
+    REDIS_CLI = os.path.abspath(sys.argv[4])
+    H.set_tag("cluster-create")
+    sys.exit(main())

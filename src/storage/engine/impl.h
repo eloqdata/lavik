@@ -1866,6 +1866,16 @@ class StorageEngine::Impl {
       std::optional<std::uint16_t> routed_partition_id = std::nullopt,
       const MutationPrecondition* mutation_precondition = nullptr);
 
+  // Own the digest and optional key guard in the common SET frame. Ordinary
+  // SET avoids a wrapper coroutine allocation; pre-locked callers retain
+  // their existing guard and both paths take store state in the same order.
+  Task<absl::StatusOr<SetResult>> SetWithLockState(
+      std::uint8_t db_id, std::string_view key, Digest digest,
+      std::string_view value, SetOptions options, TxShardWrites* tx,
+      ReplicationCommandAppend* replication, SetLatencyTrace* trace,
+      std::optional<std::uint16_t> routed_partition_id,
+      const MutationPrecondition* mutation_precondition, bool acquire_key_lock);
+
   Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
       std::span<const std::string_view> values,

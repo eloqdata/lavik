@@ -221,8 +221,10 @@ TEST(MetaControlMapperTest,
       // Local readiness publication rebuilds the routing view. It must retain
       // the derived maximum even for Groups absent from that routing view.
       ASSERT_TRUE(runtime->node_control_installer_.SetStorageReady(true).ok());
+      cluster::SetClientMode(lavik::ClientMode::kCluster);
       cluster::InstallClusterRuntime(std::move(runtime));
       absl::Cleanup reset_runtime = [] {
+        cluster::SetClientMode(lavik::ClientMode::kSingle);
         cluster::InstallClusterRuntime(nullptr);
       };
       const std::string info = command("INFO");
