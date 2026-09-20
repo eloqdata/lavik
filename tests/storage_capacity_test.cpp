@@ -45,6 +45,10 @@ class ExpirationAuthorityTestPeer {
             std::memory_order_acquire));
   }
 
+  static absl::Status ValidateGrant(const std::shared_ptr<const void>& grant) {
+    return StorageEngine::Impl::ValidateExpirationAuthority(grant.get());
+  }
+
   static bool IsCancellation(const absl::Status& status) {
     return StorageEngine::Impl::IsExpirationAuthorityCancellation(status);
   }
@@ -457,6 +461,38 @@ TEST(StorageExpirationAuthorityTest,
       absl::DataLossError("unrelated storage corruption")));
   EXPECT_FALSE(lavik::storage::ExpirationAuthorityTestPeer::IsCancellation(
       absl::FailedPreconditionError("unmarked precondition")));
+}
+
+TEST(StorageExpirationAuthorityTest,
+     SharedRenewalPreservesCapturedMutationCapability) {
+  using namespace std::chrono_literals;
+  using Peer = lavik::storage::ExpirationAuthorityTestPeer;
+  lavik::storage::StorageEngine engine({});
+  const auto deadline = FarFutureExpirationDeadline() - 1s;
+  const auto lease = std::make_shared<lavik::LeaseDeadline>(deadline);
+  ASSERT_TRUE(engine.SetExpirationAuthorityUntil(lease).ok());
+  auto captured = Peer::CurrentGrant(engine);
+  ASSERT_TRUE(Peer::ValidateGrant(captured).ok());
+  EXPECT_TRUE(lease->Renew(deadline - 1s, deadline + 1s));
+  EXPECT_EQ(captured, Peer::CurrentGrant(engine));
+  EXPECT_TRUE(Peer::ValidateGrant(captured).ok());
+  lease->Revoke();
+  EXPECT_TRUE(Peer::IsCancellation(Peer::ValidateGrant(captured)));
+  ASSERT_TRUE(
+      engine.SetExpirationAuthorityUntil(FarFutureExpirationDeadline()).ok());
+  EXPECT_TRUE(Peer::IsCancellation(Peer::ValidateGrant(captured)));
+  EXPECT_TRUE(Peer::ValidateGrant(Peer::CurrentGrant(engine)).ok());
+}
+
+TEST(StorageExpirationAuthorityTest, LocalRoleLossRevokesSharedLease) {
+  lavik::storage::StorageEngine engine({});
+  const auto lease =
+      std::make_shared<lavik::LeaseDeadline>(FarFutureExpirationDeadline());
+  ASSERT_TRUE(engine.SetExpirationAuthorityUntil(lease).ok());
+  engine.SetExpirationAuthority(false);
+  EXPECT_FALSE(lease->valid_at(std::chrono::nanoseconds(1)));
+  EXPECT_FALSE(
+      lease->Renew(std::chrono::nanoseconds(1), FarFutureExpirationDeadline()));
 }
 
 TEST(StorageExpirationAuthorityTest, LegacyPermanentGrantIsIdempotent) {

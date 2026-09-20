@@ -400,10 +400,14 @@ class RecordingActions final : public NodeControlActions {
     co_return promotion_activation_status_;
   }
 
+  std::shared_ptr<LeaseDeadline> expiration_lease_;
+  std::shared_ptr<LeaseDeadline> source_lease_;
+
   bycorf::Task<absl::Status> EnableExpirationAuthorityUntil(
-      MonotonicTime deadline) override {
+      std::shared_ptr<LeaseDeadline> lease) override {
     ++expiration_authority_enables_;
-    expiration_authority_deadline_ = deadline;
+    expiration_authority_deadline_ = MonotonicTime(lease->deadline());
+    expiration_lease_ = lease;
     control_events_.push_back("enable-expiration");
     expiration_authority_enable_entered_ = true;
     if (on_expiration_authority_enable_) {
@@ -421,9 +425,10 @@ class RecordingActions final : public NodeControlActions {
   }
 
   bycorf::Task<absl::Status> EnableSourceAdmissionForLease(
-      MonotonicTime deadline) override {
+      std::shared_ptr<LeaseDeadline> lease) override {
     ++source_admission_enables_;
-    source_admission_deadline_ = deadline;
+    source_admission_deadline_ = MonotonicTime(lease->deadline());
+    source_lease_ = lease;
     control_events_.push_back("enable-source-admission");
     source_admission_enable_entered_ = true;
     if (on_source_admission_enable_) on_source_admission_enable_();
@@ -1627,6 +1632,34 @@ TEST(NodeControlInstallerTest,
   EXPECT_FALSE(service.writable_after_);
 }
 
+TEST(LeaseDeadlineTest, ExpirationAndRevocationAreTerminalForRenewal) {
+  LeaseDeadline lease(100ns);
+  EXPECT_TRUE(lease.Renew(50ns, 150ns));
+  EXPECT_TRUE(lease.valid_at(120ns));
+  EXPECT_FALSE(lease.Renew(150ns, 200ns));
+  EXPECT_FALSE(lease.valid_at(150ns));
+  EXPECT_FALSE(
+      lease.Renew(50ns, 200ns));  // Descheduled renewer sampled old time.
+  lease.Revoke();
+  EXPECT_FALSE(lease.Renew(1ns, 300ns));
+}
+
+TEST(LeaseDeadlineTest, ConcurrentRevocationCannotBeLostByRenewal) {
+  for (unsigned iteration = 0; iteration != 100; ++iteration) {
+    LeaseDeadline lease(100ns);
+    std::atomic<bool> start{false};
+    std::thread revoke([&] {
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      lease.Revoke();
+    });
+    start.store(true, std::memory_order_release);
+    (void)lease.Renew(50ns, 200ns);
+    revoke.join();
+    EXPECT_FALSE(lease.valid_at(50ns));
+    EXPECT_FALSE(lease.Renew(50ns, 300ns));
+  }
+}
+
 class LeaseExpiryService final : public bycorf::Service {
  public:
   explicit LeaseExpiryService(bycorf::Server* server) : server_(server) {}
@@ -1683,7 +1716,34 @@ class LeaseExpiryService final : public bycorf::Service {
     }
     grant.sent_at_ = LeaseClockNow();
     grant.granted_duration_ = lease_duration;
+    const auto original_lease = control_.actions.expiration_lease_;
+    EXPECT_EQ(original_lease, control_.actions.source_lease_);
+    EXPECT_EQ(control_.actions.expiration_authority_enables_, 1);
+    EXPECT_EQ(control_.actions.source_admission_enables_, 1);
+    // A blocked data-worker activation callback would never complete. The
+    // synchronous renewal must succeed without invoking either callback.
+    control_.actions.block_expiration_authority_enable_ = true;
+    control_.actions.block_source_admission_enable_ = true;
+    auto mismatched = grant;
+    mismatched.session_ = Session(2);
+    EXPECT_FALSE(control_.installer.TryRenewLease(mismatched));
+    mismatched = grant;
+    mismatched.projection_ = Basis(11);
+    EXPECT_FALSE(control_.installer.TryRenewLease(mismatched));
+    mismatched = grant;
+    ++mismatched.anchor_.group_term_;
+    EXPECT_FALSE(control_.installer.TryRenewLease(mismatched));
+    mismatched = grant;
+    mismatched.granted_duration_ = 2s;
+    EXPECT_FALSE(control_.installer.TryRenewLease(mismatched));
+    EXPECT_TRUE(control_.installer.TryRenewLease(grant));
+    EXPECT_EQ(original_lease->deadline(),
+              (grant.sent_at_ + grant.granted_duration_).time_since_epoch());
+    control_.actions.block_expiration_authority_enable_ = false;
+    control_.actions.block_source_admission_enable_ = false;
     result_ = co_await control_.installer.ApplyLeaseGrantTransition(grant);
+    EXPECT_EQ(control_.actions.expiration_authority_enables_, 1);
+    EXPECT_EQ(control_.actions.source_admission_enables_, 1);
     if (!result_.ok()) {
       server_->RequestStop();
       co_return result_;
@@ -1698,6 +1758,8 @@ class LeaseExpiryService final : public bycorf::Service {
       co_return result_;
     }
     constexpr std::array<std::uint16_t, 1> slots{12};
+    EXPECT_TRUE(original_lease->valid_at(LeaseClockNow().time_since_epoch()));
+    EXPECT_EQ(original_lease, control_.actions.source_lease_);
     old_timer_preserved_lease_ =
         control_.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
                 .decision()
@@ -1716,8 +1778,10 @@ class LeaseExpiryService final : public bycorf::Service {
             .kind_ == Decision::Kind::kClusterDownUnbound;
     expiry_preserved_source_capabilities_ =
         control_.actions.session_clears_ == 0;
+    EXPECT_FALSE(original_lease->valid_at(LeaseClockNow().time_since_epoch()));
     grant.sent_at_ = LeaseClockNow();
     grant.granted_duration_ = lease_duration;
+    EXPECT_FALSE(control_.installer.TryRenewLease(grant));
     renewal_succeeded_after_expiry_ =
         (co_await control_.installer.ApplyLeaseGrantTransition(grant)).ok();
     revocations_ = control_.actions.expiration_authority_revocations_;

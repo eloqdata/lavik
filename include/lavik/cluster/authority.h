@@ -45,6 +45,7 @@
 #include "lavik/client_mode.h"
 #include "lavik/cluster/lease_clock.h"
 #include "lavik/cluster/topology.h"
+#include "lavik/lease_deadline.h"
 
 namespace lavik::cluster {
 
@@ -272,10 +273,10 @@ class AuthorityGuard {
   struct Lease {
     SessionIdentity session_;
     AuthorityAnchor anchor_;
-    MonotonicTime deadline_;
+    std::shared_ptr<LeaseDeadline> deadline_;
     // Copies of a published lease share one expiration receipt, so concurrent
-    // readers and the expiry timer count it once. Renewal installs a fresh
-    // receipt; ordinary admission never writes this atomic. Relaxed ordering
+    // readers and the expiry timer count it once per authority epoch.
+    // Ordinary admission never writes this atomic. Relaxed ordering
     // suffices for metric deduplication; this flag publishes no authority
     // state.
     std::shared_ptr<std::atomic<bool>> expiration_recorded_ =
@@ -313,7 +314,8 @@ class AuthorityGuard {
   void PublishAuthorityLocked();
   absl::Status RenewLease(const SessionIdentity& session,
                           const AuthorityAnchor& anchor, MonotonicTime deadline,
-                          MonotonicTime now);
+                          MonotonicTime now,
+                          std::shared_ptr<LeaseDeadline> lease = nullptr);
   // NodeControl uses this after an awaited dependent activation to prove that
   // the exact lease it installed still exists and remains live.
   bool HasExactLease(const SessionIdentity& session,

@@ -1282,8 +1282,13 @@ class StorageEngine::Impl {
         std::chrono::nanoseconds deadline_since_boot)
         : deadline_since_boot_(deadline_since_boot) {}
 
+    explicit ExpirationAuthorityGrant(std::shared_ptr<LeaseDeadline> lease)
+        : deadline_since_boot_(std::chrono::nanoseconds::zero()),
+          lease_(std::move(lease)) {}
+
     std::atomic<bool> active_{true};
     const std::chrono::nanoseconds deadline_since_boot_;
+    const std::shared_ptr<LeaseDeadline> lease_;
   };
 
 #if LAVIK_FAULTS_ENABLED
@@ -2219,6 +2224,10 @@ class StorageEngine::Impl {
 
   absl::Status SetExpirationAuthorityUntil(
       std::chrono::nanoseconds deadline_since_boot) noexcept;
+  // Binds a shared finite lease once. Ordinary control-worker renewal updates
+  // captured expiration capabilities without submitting work to data workers.
+  absl::Status SetExpirationAuthorityUntil(
+      std::shared_ptr<LeaseDeadline> lease) noexcept;
 
   std::shared_ptr<ExpirationAuthorityGrant> CurrentExpirationAuthority()
       const noexcept;

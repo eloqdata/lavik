@@ -185,6 +185,11 @@ absl::Status StorageEngine::SetExpirationAuthorityUntil(
   return impl_->SetExpirationAuthorityUntil(deadline_since_boot);
 }
 
+absl::Status StorageEngine::SetExpirationAuthorityUntil(
+    std::shared_ptr<LeaseDeadline> lease) noexcept {
+  return impl_->SetExpirationAuthorityUntil(std::move(lease));
+}
+
 std::uint32_t StorageEngine::ExpirationPauseCount() const noexcept {
   return impl_->ExpirationPauseCount();
 }

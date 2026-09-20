@@ -2119,7 +2119,7 @@ class ReplicationManager::ReplicationGroup {
       ClusterFailoverActivation activation);
 
   Task<absl::Status> EnableClusterExpirationAuthorityUntil(
-      std::chrono::nanoseconds deadline_since_boot);
+      std::shared_ptr<LeaseDeadline> lease);
 
   Task<absl::Status> RevokeClusterExpirationAuthority();
 
@@ -2173,7 +2173,7 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> RevokeClusterRebuildSourceAuthorizations();
 
   Task<absl::Status> EnableClusterRebuildSourceAdmissionUntil(
-      std::chrono::nanoseconds deadline_since_boot);
+      std::shared_ptr<LeaseDeadline> lease);
 
   Task<absl::Status>
   ClearClusterRebuildSourceAuthorizationsForSessionReplacement(

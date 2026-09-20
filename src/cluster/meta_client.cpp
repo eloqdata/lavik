@@ -415,15 +415,15 @@ class ReplicationNodeControlActions final : public NodeControlActions {
   }
 
   bycorf::Task<absl::Status> EnableExpirationAuthorityUntil(
-      MonotonicTime deadline) override {
+      std::shared_ptr<LeaseDeadline> lease) override {
     co_return co_await replication_.EnableClusterExpirationAuthorityUntil(
-        deadline.time_since_epoch());
+        std::move(lease));
   }
 
   bycorf::Task<absl::Status> EnableSourceAdmissionForLease(
-      MonotonicTime deadline) override {
+      std::shared_ptr<LeaseDeadline> lease) override {
     co_return co_await replication_.EnableClusterRebuildSourceAdmissionUntil(
-        deadline.time_since_epoch());
+        std::move(lease));
   }
 
   bycorf::Task<absl::Status> RevokeExpirationAuthority() override {
@@ -2714,38 +2714,43 @@ struct MetaControlClientService::Impl {
       const std::int64_t grant_ms = grant->granted_duration_ms;
       const auto grant_sent_at =
           MonotonicTime(std::chrono::milliseconds(*deadline_ms - grant_ms));
-      // Authority transitions are barriers for the short admission lane. A
-      // queued directive was validated before this grant and must be replayed
-      // from the current projection instead of overtaking lease installation.
-      const bool discarded_directive =
-          !state->directive_queue_.empty() ||
-          (state->directive_runner_running_ &&
-           state->directive_completion_tasks_ != 0);
-      DisableDirectiveDispatch(state);
-      if (absl::Status joined = co_await WaitForDirectiveExecutor(state);
-          !joined.ok()) {
-        co_return joined;
-      }
       const auto grant_started = std::chrono::steady_clock::now();
-      absl::Status authority =
-          co_await installer_.ApplyLeaseGrantTransition(AuthorityMessage{
-              .kind_ = AuthorityMessage::Kind::kLeaseGrant,
-              .session_ = state->session_,
-              .projection_ =
-                  ProjectionBasis{
-                      .control_revision_ = grant->control_revision,
-                  },
-              .anchor_ =
-                  AuthorityAnchor{
-                      .group_id_ = grant->group_id,
-                      .assignment_id_ =
-                          AssignmentId::FromBytes(grant->assignment_id),
-                      .group_term_ = grant->group_term,
-                  },
-              .sent_at_ = grant_sent_at,
-              .granted_duration_ =
-                  std::chrono::milliseconds(grant->granted_duration_ms),
-          });
+      const AuthorityMessage authority_message = AuthorityMessage{
+          .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+          .session_ = state->session_,
+          .projection_ =
+              ProjectionBasis{
+                  .control_revision_ = grant->control_revision,
+              },
+          .anchor_ =
+              AuthorityAnchor{
+                  .group_id_ = grant->group_id,
+                  .assignment_id_ =
+                      AssignmentId::FromBytes(grant->assignment_id),
+                  .group_term_ = grant->group_term,
+              },
+          .sent_at_ = grant_sent_at,
+          .granted_duration_ =
+              std::chrono::milliseconds(grant->granted_duration_ms),
+      };
+      absl::Status authority;
+      bool discarded_directive = false;
+      const bool renewed = installer_.TryRenewLease(authority_message);
+      if (!renewed) {
+        // First installation and authority changes retain the directive
+        // barrier. Ordinary renewal must not wait for a directive running on a
+        // data worker.
+        discarded_directive = !state->directive_queue_.empty() ||
+                              (state->directive_runner_running_ &&
+                               state->directive_completion_tasks_ != 0);
+        DisableDirectiveDispatch(state);
+        if (absl::Status joined = co_await WaitForDirectiveExecutor(state);
+            !joined.ok()) {
+          co_return joined;
+        }
+        authority =
+            co_await installer_.ApplyLeaseGrantTransition(authority_message);
+      }
       RecordClusterControlWait(
           ClusterControlWait::kLeaseInstallation,
           std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2756,7 +2761,7 @@ struct MetaControlClientService::Impl {
         co_return absl::AbortedError(
             "lease installation overtook queued directive admission");
       }
-      state->directive_dispatch_enabled_ = true;
+      if (!renewed) state->directive_dispatch_enabled_ = true;
       RecordClusterControlLeaseGrant();
     } else if (const auto* denied =
                    std::get_if<control::LeaseDenied>(&ack.lease_decision)) {

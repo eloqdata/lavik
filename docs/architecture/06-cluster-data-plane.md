@@ -53,9 +53,11 @@ connections and data shards occupy only the preceding workers. Replication's
 coordinator remains on data worker 0; control observations and actions cross
 that ownership boundary through coroutine submissions. Moving the control
 session prevents a synchronous data command from occupying its event loop,
-but an observation or lease-installation barrier can still wait for data work.
-These barriers retain their safety checks and are not replaced with stale
-positive readiness or authority observations.
+but observations and first installation after an authority transition can
+still wait for data work. Unchanged, unexpired lease renewal updates one
+shared atomic deadline on the control worker without submissions, locks, or
+joining directive work. First installation and invalidating transitions retain
+their data-worker barriers and fresh readiness checks.
 
 The Redis/storage boundary adds a transport-neutral final seam:
 `storage::MutationPrecondition` carries the captured admission through every
@@ -515,12 +517,18 @@ authorities. This committed-state precondition complements the per-session
 Fence/FDS drain: a source that has not consumed the replacement can never keep
 an old lease while the destination begins serving the same slot.
 
-The authority guard publishes session, leases, and revocation generation as
-one immutable snapshot, independently of committed topology. Control-plane
-writers serialize publication; request admission and mutation rechecks read
-owned snapshots without acquiring the writer mutex. Ordinary renewals neither
-close request admission nor drain readers. Deadline-only renewal preserves
-the revocation generation; revocation invalidates earlier write proofs.
+The authority guard publishes session, lease identities, and revocation
+generation as one immutable snapshot, independently of committed topology.
+Each lease identity owns a shared lock-free atomic CLOCK_BOOTTIME deadline,
+bound to request admission, active expiration, and native source admission
+at initial installation. Unchanged session, projection, anchor, duration, and
+controller admission generation allow the control worker to renew that one
+word without republishing a snapshot or waiting for data workers. Ordinary
+renewal preserves the revocation generation and captured mutation capabilities.
+Invalidation revokes the shared epoch before publishing a new snapshot;
+readers never acquire the control writer mutex. Local replication role loss
+also revokes the common epoch when it disables expiration, independently of
+the next heartbeat observation.
 Cached snapshots still require a current absolute-deadline check on every
 lease-dependent admission and mutation recheck. Reads and writes use the same
 admission path; only writes retain their proof across suspension for the
@@ -656,7 +664,9 @@ transition first: it advances the authority generation, retires the stale
 timer, closes new source admission, joins older directive admissions, and
 drains retired requests before considering the replacement grant. A
 same-anchor heartbeat can extend only a lease that never expired, so pre-expiry
-admissions cannot be revived by a delayed timer.
+admissions cannot be revived by a delayed timer. The first consumer observing
+expiry marks that epoch terminal with an atomic compare/exchange; a renewer
+that sampled an older clock cannot undo an already-observed expiration.
 
 Population directives carry a kind-specific bounded `payload`; their mutation
 classification follows kind and has no independently supplied flag. `initialize-empty-population` uses its
@@ -703,11 +713,11 @@ exact still-valid population completion through a non-mutating lookup even
 while that population is serving. This path neither clears readiness nor
 starts work; no match retains all ordinary destructive-admission and drain
 checks. No local result record can reopen authority after restart.
-The production node controller and replication control state share worker
-zero: validation and exact-result lookup do not suspend or acquire a global
-state mutex. Other workers request population observations through the
-replication owner's asynchronous API, while data-flow progress remains
-worker-local and independently sampled.
+The production node controller owns the final control worker; replication
+control state belongs to data worker zero. NodeControl validation is local,
+while replication actions and exact-result lookup cross the replication
+owner's asynchronous API. Data-flow progress remains worker-local and
+independently sampled.
 
 The local Group failover transition is a separate level-triggered control object. It
 names the transition/revision, controlled or uncontrolled mode, target term,

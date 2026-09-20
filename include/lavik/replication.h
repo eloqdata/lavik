@@ -32,6 +32,7 @@
 #include "bycorf/net/tcp_stream.h"
 #include "bycorf/runtime/task.h"
 #include "lavik/client_mode.h"
+#include "lavik/lease_deadline.h"
 #include "lavik/replication_group.h"
 
 namespace bycorf {
@@ -661,6 +662,9 @@ class ReplicationManager {
   // lease/FDS recheck. The absolute deadline uses CLOCK_BOOTTIME semantics.
   bycorf::Task<absl::Status> EnableClusterExpirationAuthorityUntil(
       std::chrono::nanoseconds deadline_since_boot);
+  // Installs the shared epoch used by lock-free ordinary renewals.
+  bycorf::Task<absl::Status> EnableClusterExpirationAuthorityUntil(
+      std::shared_ptr<LeaseDeadline> lease);
 
   // Revokes future active-expiration work and drains any already-entered
   // cycle without disturbing an outer controlled-source pause.
@@ -749,6 +753,9 @@ class ReplicationManager {
   // replay it after a live projection refresh.
   bycorf::Task<absl::Status> EnableClusterRebuildSourceAdmissionUntil(
       std::chrono::nanoseconds deadline_since_boot);
+  // Installs the shared epoch used by lock-free ordinary renewals.
+  bycorf::Task<absl::Status> EnableClusterRebuildSourceAdmissionUntil(
+      std::shared_ptr<LeaseDeadline> lease);
 
   // Clears capabilities inherited from an older desired-state projection
   // without advancing the committed revoke floor. A disconnected control

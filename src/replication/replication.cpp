@@ -4223,11 +4223,11 @@ auto ReplicationManager::ReplicationGroup::ActivateClusterPreparedPromotion(
 }
 
 auto ReplicationManager::ReplicationGroup::
-    EnableClusterExpirationAuthorityUntil(
-        std::chrono::nanoseconds deadline_since_boot) -> Task<absl::Status> {
+    EnableClusterExpirationAuthorityUntil(std::shared_ptr<LeaseDeadline> lease)
+        -> Task<absl::Status> {
   if (bycorf::ThisWorker().id_ != 0) {
-    co_return co_await bycorf::SubmitTaskTo(0, [this, deadline_since_boot] {
-      return EnableClusterExpirationAuthorityUntil(deadline_since_boot);
+    co_return co_await bycorf::SubmitTaskTo(0, [this, lease] {
+      return EnableClusterExpirationAuthorityUntil(lease);
     });
   }
   if (!meta_managed_ || cluster_group_ == nullptr) {
@@ -4245,7 +4245,7 @@ auto ReplicationManager::ReplicationGroup::
     co_return absl::FailedPreconditionError(
         "finite expiration authority requires an active ready owner");
   }
-  co_return storage_->SetExpirationAuthorityUntil(deadline_since_boot);
+  co_return storage_->SetExpirationAuthorityUntil(lease);
 }
 
 auto ReplicationManager::ReplicationGroup::RevokeClusterExpirationAuthority()
@@ -5496,10 +5496,10 @@ auto ReplicationManager::ReplicationGroup::
 
 auto ReplicationManager::ReplicationGroup::
     EnableClusterRebuildSourceAdmissionUntil(
-        std::chrono::nanoseconds deadline_since_boot) -> Task<absl::Status> {
+        std::shared_ptr<LeaseDeadline> lease) -> Task<absl::Status> {
   if (bycorf::ThisWorker().id_ != 0) {
-    co_return co_await bycorf::SubmitTaskTo(0, [this, deadline_since_boot] {
-      return EnableClusterRebuildSourceAdmissionUntil(deadline_since_boot);
+    co_return co_await bycorf::SubmitTaskTo(0, [this, lease] {
+      return EnableClusterRebuildSourceAdmissionUntil(lease);
     });
   }
   if (!meta_managed_ || cluster_group_ == nullptr) {
@@ -5522,11 +5522,11 @@ auto ReplicationManager::ReplicationGroup::
   }
   const std::chrono::nanoseconds now_since_boot =
       cluster::LeaseClockNow().time_since_epoch();
-  if (deadline_since_boot <= now_since_boot) {
+  if (lease == nullptr || !lease->valid_at(now_since_boot)) {
     co_return absl::DeadlineExceededError(
         "cluster source admission lease already expired");
   }
-  source_authorizations_.EnableLeaseAdmissionUntil(deadline_since_boot);
+  source_authorizations_.EnableLeaseAdmissionUntil(lease);
   co_return absl::OkStatus();
 }
 
@@ -12227,7 +12227,13 @@ Task<absl::Status> ReplicationManager::ActivateClusterPreparedPromotion(
 
 Task<absl::Status> ReplicationManager::EnableClusterExpirationAuthorityUntil(
     std::chrono::nanoseconds deadline_since_boot) {
-  return group_->EnableClusterExpirationAuthorityUntil(deadline_since_boot);
+  return group_->EnableClusterExpirationAuthorityUntil(
+      std::make_shared<LeaseDeadline>(deadline_since_boot));
+}
+
+Task<absl::Status> ReplicationManager::EnableClusterExpirationAuthorityUntil(
+    std::shared_ptr<LeaseDeadline> lease) {
+  return group_->EnableClusterExpirationAuthorityUntil(std::move(lease));
 }
 
 Task<absl::Status> ReplicationManager::RevokeClusterExpirationAuthority() {
@@ -12298,7 +12304,13 @@ ReplicationManager::RevokeClusterRebuildSourceAuthorizations() {
 
 Task<absl::Status> ReplicationManager::EnableClusterRebuildSourceAdmissionUntil(
     std::chrono::nanoseconds deadline_since_boot) {
-  return group_->EnableClusterRebuildSourceAdmissionUntil(deadline_since_boot);
+  return group_->EnableClusterRebuildSourceAdmissionUntil(
+      std::make_shared<LeaseDeadline>(deadline_since_boot));
+}
+
+Task<absl::Status> ReplicationManager::EnableClusterRebuildSourceAdmissionUntil(
+    std::shared_ptr<LeaseDeadline> lease) {
+  return group_->EnableClusterRebuildSourceAdmissionUntil(std::move(lease));
 }
 
 Task<absl::Status> ClusterRebuildCompletion::Await() const {

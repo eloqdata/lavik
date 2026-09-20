@@ -414,15 +414,15 @@ class NodeControlActions {
   // both only after a post-await local control/session/deadline recheck.
   virtual bycorf::Task<absl::Status> ActivatePreparedPromotion(
       PreparedFailoverActivation activation);
-  // Installs the same absolute CLOCK_BOOTTIME deadline used by the request
-  // lease. Returning success means expiration can run only until that finite
-  // cut; it does not imply request authority.
+  // Binds the shared CLOCK_BOOTTIME lease also used by request admission.
+  // Returning success permits expiration only while this epoch remains valid;
+  // ordinary renewal updates it without calling the adapter again.
   virtual bycorf::Task<absl::Status> EnableExpirationAuthorityUntil(
-      MonotonicTime deadline);
+      std::shared_ptr<LeaseDeadline> lease);
   // Opens new POPULATION source handshakes after the request lease itself is
   // installed. Implementations must serialize this with native admission.
   virtual bycorf::Task<absl::Status> EnableSourceAdmissionForLease(
-      MonotonicTime deadline);
+      std::shared_ptr<LeaseDeadline> lease);
   // Closes active expiration and joins work that entered before the close.
   // Every asynchronous authority-loss barrier invokes this before returning.
   virtual bycorf::Task<absl::Status> RevokeExpirationAuthority();
@@ -513,6 +513,12 @@ class NodeControlInstaller {
   // projection and complete authority anchor must still match installed state.
   absl::Status ApplyAuthority(const AuthorityMessage& authority_message,
                               MonotonicTime now);
+
+  // Control-worker-only, non-suspending renewal of an already installed epoch.
+  // Returns false when a transition, expiry, or changed projection requires the
+  // full installation barrier. Success updates all three authority consumers
+  // with one lock-free atomic operation and preserves admitted request proofs.
+  bool TryRenewLease(const AuthorityMessage& message);
 
   // Meta-only grant boundary. Installs the grant and schedules expiry with
   // bounded relative waits that repeatedly check its suspend-aware deadline.
@@ -656,6 +662,10 @@ class NodeControlInstaller {
     AuthorityAnchor anchor_;
     MonotonicTime deadline_;
     MonotonicDuration recheck_interval_;
+    std::shared_ptr<LeaseDeadline> lease_;
+    ProjectionBasis projection_;
+    MonotonicDuration granted_duration_;
+    std::uint64_t admission_generation_ = 0;
     std::uint64_t timer_generation_ = 1;
     bool active_ = true;
   };

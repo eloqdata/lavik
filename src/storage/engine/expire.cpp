@@ -97,6 +97,9 @@ bool StorageEngine::Impl::ExpirationAuthorityIsValid(
       !authority->active_.load(std::memory_order_acquire)) {
     return false;
   }
+  if (authority->lease_ != nullptr) {
+    return authority->lease_->valid_at(BootTimeSinceEpoch());
+  }
   return authority->deadline_since_boot_ == std::chrono::nanoseconds::max() ||
          BootTimeSinceEpoch() < authority->deadline_since_boot_;
 }
@@ -167,6 +170,10 @@ void StorageEngine::Impl::SetExpirationAuthority(bool authority) noexcept {
       // Invalidate before publishing its replacement. Work already carrying
       // the old capability will then fail its final mutation precondition.
       current->active_.store(false, std::memory_order_release);
+      // Local replication role loss can precede the next control observation.
+      // Retire the common epoch now, so an in-flight Meta Ack cannot renew
+      // request/source authority after the owner has disabled expiration.
+      if (current->lease_ != nullptr) current->lease_->Revoke();
     }
     if (active_expiration_authority_.compare_exchange_weak(
             current, replacement, std::memory_order_acq_rel,
@@ -182,19 +189,28 @@ void StorageEngine::Impl::SetExpirationAuthority(bool authority) noexcept {
 
 absl::Status StorageEngine::Impl::SetExpirationAuthorityUntil(
     std::chrono::nanoseconds deadline_since_boot) noexcept {
-  if (BootTimeSinceEpoch() >= deadline_since_boot) {
+  try {
+    return SetExpirationAuthorityUntil(
+        std::make_shared<LeaseDeadline>(deadline_since_boot));
+  } catch (const std::bad_alloc&) {
+    return absl::ResourceExhaustedError("failed to allocate expiration lease");
+  }
+}
+
+absl::Status StorageEngine::Impl::SetExpirationAuthorityUntil(
+    std::shared_ptr<LeaseDeadline> lease) noexcept {
+  if (lease == nullptr || !lease->valid_at(BootTimeSinceEpoch())) {
     return absl::DeadlineExceededError(
         "expiration authority deadline has already elapsed");
   }
   std::shared_ptr<ExpirationAuthorityGrant> replacement;
   try {
-    replacement =
-        std::make_shared<ExpirationAuthorityGrant>(deadline_since_boot);
+    replacement = std::make_shared<ExpirationAuthorityGrant>(lease);
   } catch (const std::bad_alloc&) {
     return absl::ResourceExhaustedError(
         "failed to allocate expiration authority grant");
   }
-  if (BootTimeSinceEpoch() >= deadline_since_boot) {
+  if (!lease->valid_at(BootTimeSinceEpoch())) {
     return absl::DeadlineExceededError(
         "expiration authority deadline elapsed during installation");
   }

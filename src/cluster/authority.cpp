@@ -359,7 +359,10 @@ bool AuthorityGuard::LeaseCovers(const AuthorityState& authority,
         lease->second.session_ != *authority.session_) {
       return false;
     }
-    if (lease->second.deadline_ <= now) {
+    if (!lease->second.deadline_->valid_at(now.time_since_epoch())) {
+      if (lease->second.deadline_->deadline() ==
+          std::chrono::nanoseconds::zero())
+        return false;
       // Request admission/rechecks can discover expiry on several workers
       // before control-plane cleanup runs. An atomic metric increment alone
       // would count each observer, not each lease expiry. Claim the shared
@@ -631,10 +634,10 @@ RecheckResult AuthorityGuard::RegisterAndRecheck(
   return RecheckResult::kReject;
 }
 
-absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
-                                        const AuthorityAnchor& anchor,
-                                        MonotonicTime deadline,
-                                        MonotonicTime now) {
+absl::Status AuthorityGuard::RenewLease(
+    const SessionIdentity& session, const AuthorityAnchor& anchor,
+    MonotonicTime deadline, MonotonicTime now,
+    std::shared_ptr<LeaseDeadline> shared_lease) {
   if (!session.complete()) {
     return absl::InvalidArgumentError("lease session identity is incomplete");
   }
@@ -645,6 +648,8 @@ absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
   const std::lock_guard lock(mutex_);
   if (!writer_state_.session_.has_value() ||
       *writer_state_.session_ != session) {
+    for (const auto& [id, lease] : writer_state_.leases_)
+      lease.deadline_->Revoke();
     writer_state_.leases_.clear();
     writer_state_.session_ = session;
     ++writer_state_.generation_;
@@ -654,7 +659,7 @@ absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
   if (existing != writer_state_.leases_.end() &&
       existing->second.session_ == session &&
       existing->second.anchor_ == anchor) {
-    if (existing->second.deadline_ <= now) {
+    if (!existing->second.deadline_->valid_at(now.time_since_epoch())) {
       // Extending this object would preserve the generation and retroactively
       // validate work admitted before expiry. NodeControl must first run the
       // exact expiration cleanup transition, which removes this lease and
@@ -665,14 +670,23 @@ absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
     // Deadline-only renewal is deliberately invisible to already admitted
     // work. Replacing generation here would turn a healthy heartbeat into a
     // spurious write abort.
-    existing->second.deadline_ = deadline;
-    existing->second.expiration_recorded_ =
-        std::make_shared<std::atomic<bool>>(false);
-    PublishAuthorityLocked();
+    if (shared_lease != nullptr) {
+      existing->second.deadline_->Revoke();
+      existing->second.deadline_ = std::move(shared_lease);
+      PublishAuthorityLocked();
+    } else if (!existing->second.deadline_->Renew(
+                   now.time_since_epoch(), deadline.time_since_epoch())) {
+      return absl::FailedPreconditionError("lease was revoked during renewal");
+    }
     return absl::OkStatus();
   }
-  writer_state_.leases_.insert_or_assign(anchor.group_id_,
-                                         Lease{session, anchor, deadline});
+  if (existing != writer_state_.leases_.end())
+    existing->second.deadline_->Revoke();
+  if (shared_lease == nullptr) {
+    shared_lease = std::make_shared<LeaseDeadline>(deadline.time_since_epoch());
+  }
+  writer_state_.leases_.insert_or_assign(
+      anchor.group_id_, Lease{session, anchor, std::move(shared_lease)});
   ++writer_state_.generation_;
   PublishAuthorityLocked();
   return absl::OkStatus();
@@ -688,7 +702,8 @@ bool AuthorityGuard::HasExactLease(const SessionIdentity& session,
   const auto lease = authority.leases_.find(anchor.group_id_);
   return lease != authority.leases_.end() &&
          lease->second.session_ == session && lease->second.anchor_ == anchor &&
-         lease->second.deadline_ == deadline && deadline > now;
+         lease->second.deadline_->deadline() == deadline.time_since_epoch() &&
+         deadline > now;
 }
 
 bool AuthorityGuard::ExpireLease(const SessionIdentity& session,
@@ -701,7 +716,7 @@ bool AuthorityGuard::ExpireLease(const SessionIdentity& session,
   const auto lease = writer_state_.leases_.find(anchor.group_id_);
   if (lease == writer_state_.leases_.end() ||
       lease->second.session_ != session || lease->second.anchor_ != anchor ||
-      lease->second.deadline_ != deadline) {
+      lease->second.deadline_->deadline() != deadline.time_since_epoch()) {
     return false;
   }
   // Called by the expiry timer, or by lease-grant handling that first cleans
@@ -711,6 +726,7 @@ bool AuthorityGuard::ExpireLease(const SessionIdentity& session,
   // double-count an expiry already observed by a reader.
   const bool already_recorded = lease->second.expiration_recorded_->exchange(
       true, std::memory_order_relaxed);
+  lease->second.deadline_->Revoke();
   writer_state_.leases_.erase(lease);
   ++writer_state_.generation_;
   PublishAuthorityLocked();
@@ -723,6 +739,8 @@ void AuthorityGuard::InvalidateSession(const SessionIdentity& session) {
   if (!writer_state_.session_.has_value() || *writer_state_.session_ != session)
     return;
   writer_state_.session_.reset();
+  for (const auto& [id, lease] : writer_state_.leases_)
+    lease.deadline_->Revoke();
   writer_state_.leases_.clear();
   ++writer_state_.generation_;
   PublishAuthorityLocked();
@@ -737,6 +755,7 @@ void AuthorityGuard::InvalidateAnchorsChanged(const ServingState* before,
     const std::optional<AuthorityAnchor> current =
         LocalPrimaryAnchor(after, it->first);
     if (!current.has_value() || *current != it->second.anchor_) {
+      it->second.deadline_->Revoke();
       writer_state_.leases_.erase(it++);
       invalidated = true;
     } else {
@@ -757,6 +776,7 @@ void AuthorityGuard::Fence(const AuthorityAnchor& anchor) {
   const std::lock_guard lock(mutex_);
   const auto lease = writer_state_.leases_.find(anchor.group_id_);
   if (lease == writer_state_.leases_.end()) return;
+  lease->second.deadline_->Revoke();
   writer_state_.leases_.erase(lease);
   ++writer_state_.generation_;
   PublishAuthorityLocked();
@@ -765,6 +785,8 @@ void AuthorityGuard::Fence(const AuthorityAnchor& anchor) {
 void AuthorityGuard::InvalidateLeases() {
   const std::lock_guard lock(mutex_);
   if (writer_state_.leases_.empty()) return;
+  for (const auto& [id, lease] : writer_state_.leases_)
+    lease.deadline_->Revoke();
   writer_state_.leases_.clear();
   ++writer_state_.generation_;
   PublishAuthorityLocked();
@@ -773,6 +795,8 @@ void AuthorityGuard::InvalidateLeases() {
 void AuthorityGuard::InvalidateAll() {
   const std::lock_guard lock(mutex_);
   writer_state_.session_.reset();
+  for (const auto& [id, lease] : writer_state_.leases_)
+    lease.deadline_->Revoke();
   writer_state_.leases_.clear();
   ++writer_state_.generation_;
   PublishAuthorityLocked();
