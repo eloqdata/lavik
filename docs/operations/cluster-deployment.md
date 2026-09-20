@@ -30,9 +30,14 @@ managed Single is not yet available. Non-Meta Single retains Redis/Redis Cluster
 follower support through `replicaof`, `redis-replicaof`, `REPLICAOF`/`SLAVEOF`,
 and `ADDREPLICAOF`. These entry points reject Lavik upstreams before retiring
 existing subscriptions or replacing data. Lavik peers use Meta native Follow
-Owner. A runtime probe failure leaves the old subscription intact; startup
-network failures retry without opening service, and unsupported upstreams remain
-fenced. Existing process-local Redis offsets support reconnect, not durable
+Owner. A runtime AUTH/PSYNC handshake failure leaves the old subscription intact.
+Preparation times out after ten seconds; retry if Redis is busy with a background
+save that delays FULLRESYNC. Startup network failures retry without opening
+service, and unsupported upstreams remain
+fenced and retry. Cluster source checks compare master counts and slot groups;
+operators must select sources from the same cluster. Replica membership changes
+do not interrupt subscription, and a new master for the same slots is followed
+automatically. Existing process-local Redis offsets support reconnect, not durable
 cross-process resume or automatic Meta takeover.
 
 **Configuration change:** `cluster-enabled` and the old `cluster-*` identity,
@@ -82,3 +87,38 @@ Meta state. Do not run `init` or `create` again for an existing cluster.
 
 For TLS, Meta membership changes, or controlled failover, use the focused
 [Meta control-plane runbook](meta-control-plane.md).
+
+## Exporting with RedisShake ScanReader
+
+Lavik no longer serves PSYNC export; `redis-export-backpressure` is removed.
+Use RedisShake ScanReader for one-shot keyspace export to Redis 7.2 or newer
+(the destination must accept Lavik's RDB 11 DUMP payloads). A tested RedisShake
+v4.6.2 configuration is:
+
+```toml
+[scan_reader]
+cluster = true
+address = "127.0.0.1:6371"
+password = ""
+scan = true
+ksn = false
+
+[redis_writer]
+address = "127.0.0.1:6379"
+
+[advanced]
+rdb_restore_command_behavior = "rewrite"
+```
+
+Run `redis-shake shake.toml`. Set `cluster = false` for Single, which scans all
+populated DBs including DB15; Cluster discovers slot owners and scans DB0.
+Supply passwords and TLS options appropriate to the deployment. The example
+replaces target keys with the same name, so use an empty migration destination.
+Stop application writes and keep topology stable while scanning for a complete
+migration. Verify the destination before switching clients; this does not
+provide a cross-node snapshot or continuous synchronization.
+
+Values and remaining TTLs transfer through SCAN/DUMP/PTTL. Functions, ACLs, and
+server configuration require separate migration. Meta-managed sources must
+remain ready and authorized for ordinary reads; ScanReader does not bypass
+fencing. The supported startup matrix above remains unchanged.

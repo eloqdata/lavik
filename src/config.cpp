@@ -511,13 +511,7 @@ absl::Status ApplyRedisConfigDirective(
     options->replication_options_.replica_priority_ = priority;
     return absl::OkStatus();
   }
-  if (name == "redis-export-backpressure") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    auto enabled = ParseYesNo(directive[1], name);
-    if (!enabled.ok()) return enabled.status();
-    options->replication_options_.redis_export_backpressure_ = *enabled;
-    return absl::OkStatus();
-  }
+
   if (name == "replication-backlog-backpressure") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     auto enabled = ParseYesNo(directive[1], name);

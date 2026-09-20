@@ -92,7 +92,7 @@ struct DesiredClusterUpstream {
 
 struct ReplicationOptions {
   // Meta management is independent of client mode. It disables external
-  // upstream control and Redis PSYNC export; native export requires an exact
+  // upstream control; native export requires an exact
   // population grant from the active Meta session.
   bool meta_managed_ = false;
   // Set by the Meta control adapter to its validated 160-bit data-node
@@ -121,13 +121,8 @@ struct ReplicationOptions {
   // Bounded source publisher staging memory on each worker. A single larger
   // command may exceed this waterline only while it is the exclusive item.
   std::size_t publish_queue_bytes_per_worker_ = 16ULL * 1024 * 1024;
-  // Explicit Redis subscription alias. Both aliases validate the initial
-  // endpoint and every consuming connection before accepting Redis PSYNC.
+  // Explicit Redis subscription alias; all external sources use Redis PSYNC.
   bool redis_psync_ = false;
-  // Retain the post-cut Redis export cursor. When disabled (the default), a
-  // slow Redis replica is disconnected after it falls behind the bounded
-  // backlog instead of applying backpressure to foreground writes.
-  bool redis_export_backpressure_ = false;
   // Number of keys one source flow admits into a snapshot scheduling round.
   // Sampled for every round so CONFIG SET takes effect during full sync.
   std::size_t snapshot_batch_size_ = 64;
@@ -788,10 +783,6 @@ class ReplicationManager {
   bycorf::Task<absl::Status> ServeNativeConnection(
       bycorf::TcpStream& stream, std::vector<std::string> args,
       std::uint64_t client_id, std::string client_address, bool tls);
-  bycorf::Task<absl::Status> ServeRedisExportConnection(
-      bycorf::TcpStream& stream, std::vector<std::string> args,
-      std::uint64_t client_id, std::string client_address, bool tls,
-      bool eof_capable);
 
   // Captures all source commands already queued on every worker. A missing
   // value means no native replication history is currently active; callers

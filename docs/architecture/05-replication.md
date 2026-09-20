@@ -19,7 +19,7 @@ limitations under the License.
 ## Responsibility and boundary
 
 The replication subsystem owns node role, upstream and downstream session
-lifetime, native Lavik synchronization, Redis PSYNC interoperability, and
+lifetime, native Lavik synchronization, Redis PSYNC consumption, and
 trusted replay. `ReplicationManager` owns exactly one deep `ReplicationGroup`;
 its administrative boundary is directives, peer sockets, and coherent
 observation. Multiple Redis Cluster source connections are participants
@@ -32,6 +32,12 @@ reset, transfer, cut, promotion, activation, follow-owner, and abort paths. The
 Data-side node controller is the only caller for Meta-delivered rebuild and
 failover desired state, source authorization, revocation, and finite expiration
 authority; transport code cannot bypass the replication adapter.
+
+Native transport and Meta lifecycle live in `replication.cpp`; Redis handshake,
+RDB consumption, ordered replay, and Cluster source coordination live in
+`redis_replication.cpp`. Both use the same group owner and private declarations
+in `replication_internal.h`, preserving worker affinity, cancellation, and role
+transitions across the two transports.
 
 Replication moves deterministic logical commands, snapshot records, and the
 process-global Redis Function catalog, not physical block addresses or record
@@ -120,15 +126,16 @@ disconnected Redis follower with a valid dataset retains read-only access. A con
 authoritative active expiration; it applies the source's absolute deadlines
 and replicated deletion effects instead.
 
-Only an unfenced master can accept native LVPSYNC/LVFLOW or Redis PSYNC export.
+Only an unfenced master can accept ordinary native LVPSYNC/LVFLOW.
 An online follower rejects those source handshakes because cascading is not
 implemented. A node detached during an incomplete full sync may report
 `role:master`, but its durable LOADING fence also prevents it from exporting
 the invalidated or partial population.
 
-`REPLICAOF host port` first authenticates and identifies a Redis upstream.
+`REPLICAOF host port` first authenticates, discovers standalone or Cluster
+slot ownership, and completes the Redis PSYNC handshake on its consumer connection.
 Failure leaves the current role, data, and subscription unchanged. A successful
-probe is followed by joining any automatic session teardown, closing the
+handshake is followed by joining any automatic session teardown, closing the
 reconfiguration gate, and changing the role epoch. The gate prevents a new
 coordinator attempt throughout cancellation and promotion; the epoch rejects
 continuations from the old attempt. It cancels the old upstream while database
@@ -139,15 +146,19 @@ database gates: an in-progress full sync may itself hold those gates while it
 waits for a catalog acknowledgement. The old source log remains enabled until
 admitted commands have drained, so their reserved events can still publish;
 only then is that history disabled. The transition replaces the desired
-upstream, disables local expiration authority, and reconnects asynchronously.
-External subscription accepts only Redis or Redis Cluster. Every startup
-spelling and `ADDREPLICAOF` uses the same native-protocol exclusion probe;
-`redis-replicaof` is not a bypass. An authenticated consumer connection repeats
-that check before PSYNC, including reconnects, so endpoint replacement cannot
-start a destructive native import. An unavailable runtime probe returns an
-error without replacing the old subscription. Startup network failures retry;
-a confirmed native upstream stops that attempt while keeping the node fenced and
-recovered data intact. Meta native relationships use Follow Owner instead.
+upstream, disables local expiration authority, and starts consumption
+asynchronously.
+External subscription uses Redis or Redis Cluster's replication protocol. Every
+startup spelling and `ADDREPLICAOF` uses this same handshake, with no product
+identity probe or native fallback. The prepared connection is retained across
+the role transition and consumed directly; reconnect uses normal AUTH/PSYNC
+with the saved replid/offset. A failed runtime handshake leaves the old
+subscription intact. Preparation has a ten-second deadline; a Redis background
+save that delays FULLRESYNC beyond it can require a runtime retry. Startup
+handshake failures retry while keeping the node
+fenced and recovered data intact. Lavik does not implement incoming PSYNC, so
+Lavik peers cannot establish an external subscription. Meta native relationships
+use Follow Owner instead.
 
 The retained non-Meta `REPLICAOF NO ONE` implementation uses the role-transition path
 and the same private prepare/activate kernel used by Meta-managed promotion.
@@ -685,7 +696,7 @@ eventually cancelled. A progressing full sync has no overall wall-clock limit.
 ## Runtime backlog and backpressure
 
 Each source worker has one heap-backed backlog shared by all downstream native
-sessions and the Redis exporter. Downstreams own only their cursors and
+sessions. Downstreams own only their cursors and
 retention pins. `repl-backlog-size` is a global quota divided across workers in
 8 MiB blocks, and block ownership is covered by worker-local retained-memory
 admission. Per-worker LSNs start at one for a new history and increase
@@ -698,7 +709,7 @@ native session can no longer continue. Meta-managed Owners keep their source
 sequence active even without consumers so a clean shutdown can certify the
 final all-flow frontier; unpinned log entries remain bounded and evictable.
 For standalone sources, after every disconnected native replica
-reaches that state and no native session, Redis exporter, installed population
+reaches that state and no native session, installed population
 capability, or FDS replay reservation is active, the manager closes and drains
 command admission, rechecks that the source is still idle, rotates the history
 ID, and disables all worker logs. Draining preserves events and fences already
@@ -728,8 +739,7 @@ after every flow reaches its corresponding fence. A history change invalidates
 the cached vector and causes the connection to establish a new cut; offsets
 from different histories are never compared. The initial connection offset
 precedes all events, so every online native replica satisfies it without a
-fence. Redis PSYNC export acknowledgements are deliberately excluded from this
-native-replica count.
+fence.
 
 The source-side native session registry and history/continuation leases are
 shared by control and flow coroutines on different workers. They are protected
@@ -1076,44 +1086,29 @@ In standalone Redis PSYNC compatibility mode, one Lavik process can follow
 multiple masters of one Redis Cluster; these are sources for one imported
 dataset, not multiple cluster-managed replication groups. Each source must be
 a slot-owning master, and `ADDREPLICAOF` accepts only a source with disjoint
-slots and the same complete topology. The node becomes online only when
+slots and the same master count and slot grouping. The caller is responsible
+for selecting sources from the same Redis Cluster: node identities and replica
+membership are not compared. The topology monitor follows a replacement master
+for the same slot group without requiring the user to add it again. The node becomes online only when
 registered sources cover all 16,384 slots, the source count matches the
 topology's master count, every source dataset is valid, and the topology is not
 faulted. Two consecutive incompatible topology observations fault the topology
 and return the node to loading.
 
-### Exporting to Redis
+### ScanReader export
 
-Redis export is available only in standalone mode while Lavik is a master,
-requires the replica to advertise diskless EOF support, and permits one export
-connection at a time. Every Meta-managed node rejects it because Redis PSYNC cannot
-carry the exact population authorization required by the cluster data plane.
-The exporter closes command gates, starts one RDB snapshot per worker,
-fences every replication log, reopens writes, and streams a bounded-queue RDB
-followed by online backlog events. It snapshots the Function catalog inside
-the same cut and emits Redis 7 `FUNCTION2` entries before the key records.
-Grouped keys retain their exact snapshot graph and stream admitted pages
-through the incremental collection encoder. A whole-key lease serializes one
-queue producer token across workers: producer-local FIFO alone would not
-prevent different keys' fragments from interleaving at the consumer. Output
-fragments are at most 1 MiB; page memory and graph pins remain owned across
-network backpressure and are released on completion or cancellation.
+Lavik does not serve Redis PSYNC or REPLCONF. RedisShake ScanReader exports the
+keyspace through ordinary authenticated INFO, SCAN, DUMP, and PTTL commands.
+DUMP payloads use RDB 11, requiring Redis 7.2 or newer at the destination.
+Single exposes DB0–15; Cluster exposes DB0 and discovery for its slot owners.
+Meta-managed sources retain normal readiness and authority admission: this path
+does not grant access to fenced data or enable managed Single startup.
 
-The backlog merger reads one head event per worker. Ready cross-worker
-transactions and control barriers take priority over unrelated mutations; a
-transaction is emitted once as Redis `MULTI`/`EXEC`, and a flush is emitted
-once after matching copies are present on every worker. Without
-`redis-export-backpressure`, a slow Redis replica that falls below a backlog
-floor is disconnected and must full-sync again. With it enabled, the exporter
-pins its cursors; pressure from those pins follows the global
-`replication-backlog-backpressure` wait-or-full-sync policy.
-
-`LAVIK.HREPLACE` uses the native command stream between Lavik nodes.
-Redis export lowers each successful replacement to `DEL` followed by `HSET`
-inside the enclosing `MULTI`/`EXEC`; source-captured `PERSIST`/`PEXPIREAT`
-effects preserve the final absolute expiry. Failed existence conditions do
-not publish a replacement. Standard Redis replicas never receive the extension
-command, and replacement does not require reading old fields for export.
+This is a one-shot keyspace export with keyspace notifications disabled. It
+preserves supported key values and remaining TTLs, but does not transfer the
+Function catalog, ACLs, or configuration. It has ordinary SCAN consistency,
+not an atomic snapshot or continuous replication; a stable topology and
+quiesced writes are required for a complete migration.
 
 ### Redis role-management surface
 
@@ -1146,9 +1141,9 @@ HA support: a new native upstream still requires Meta authorization.
 | `client-mode` / `--client-mode` | Single or Cluster client semantics and effective DB range; startup-only |
 | `meta-managed` / `--meta-managed` | Meta-controlled one-node-one-group lifecycle requiring `node-id` and `meta-seed`; rejects external upstream and `load-rdb`; the manager also ignores an external upstream supplied by an embedder |
 | Cluster control adapter | Node-controller-only source rebuild and source-less first-population admission/completion handles, population status, and source authorize/revoke APIs; Meta transport remains outside `ReplicationManager` |
-| `replicaof host port` / `REPLICAOF` | Non-Meta Redis/Redis Cluster subscription with protocol verification before changing roles; Lavik native upstreams are rejected |
-| `redis-replicaof host port` / `--redis-replicaof` | Explicit non-Meta startup Redis PSYNC source; subject to the same Redis-only probe |
-| `ADDREPLICAOF host port` | Standalone runtime addition of a disjoint master from the active Redis Cluster; rejected in cluster-managed mode |
+| `replicaof host port` / `REPLICAOF` | Non-Meta Redis/Redis Cluster subscription with PSYNC handshake before changing roles; Lavik native upstreams are rejected |
+| `redis-replicaof host port` / `--redis-replicaof` | Explicit non-Meta startup Redis PSYNC source; uses the same handshake |
+| `ADDREPLICAOF host port` | Standalone runtime addition of a disjoint master with matching slot layout; rejected in cluster-managed mode |
 | `replica-read-only` | Startup write policy; `REPLICAOF NO ONE` is writable regardless |
 | `replica-priority` | Startup/runtime Sentinel election priority, default 100; zero is ineligible and lower nonzero values are preferred |
 | `CONFIG REWRITE` | Atomically persists the current single upstream mode and `replica-priority`; unavailable without a config file or with multiple Redis Cluster sources |
@@ -1158,7 +1153,6 @@ HA support: a new native upstream still requires Meta authorization.
 | `replication-publish-queue-mb-per-worker` | Startup/CLI/runtime staging waterline, default 16 MiB per active worker log and per active full-sync session |
 | `replication-snapshot-batch-size` | Startup/CLI/runtime scan scheduling batch, default 64 |
 | `replication-snapshot-read-concurrency` | Runtime-only read concurrency, default 16 and maximum 128 |
-| `redis-export-backpressure` | Startup/CLI selection between cursor pinning and disconnect-on-gap |
 
 `INFO replication` reports Redis/Sentinel-compatible role, link and offset
 fields alongside group, boot and replica-incarnation IDs, upstream identity,
@@ -1224,7 +1218,7 @@ connection metrics.
   forces its full sync; neither policy can leave a successful primary write
   out of the source history.
 - Native cascading replication is unsupported. A node with an upstream rejects
-  ordinary native downstream handshakes and Redis export. Recovery-only export
+  ordinary native downstream handshakes. Recovery-only export
   has a separate current FDS/action scope; replica apply never republishes
   upstream effects as new events.
 - Meta-managed post-cutover topology asks every non-owner to follow the new
@@ -1280,20 +1274,19 @@ of Meta management; the storage suite covers reset and disabled-DB recovery.
 `tests/redis_follower_smoke.py` uses real Redis for startup/command entry,
 authentication, DB15 reset/import, transactions, Functions, reconnects, and
 interrupted transaction replay. It verifies non-destructive native rejection,
-including endpoint changes between discovery and consumption or on reconnect.
-`tests/redis_cluster_psync_e2e.sh` verifies membership identity, overlapping and
-incomplete slot coverage, same-generation full completion, incremental replay,
-and partial reconnect across multiple sources. `tests/redis_export_e2e.sh`
-covers diskless baseline transfer, online writes, transactions, flush, detach,
-Function transfer, and both export configuration modes.
+including endpoint changes on reconnect, and ensures the initial PSYNC
+connection is reused. `tests/redis_cluster_psync_e2e.sh` verifies overlapping
+and incomplete slot coverage, same-generation full completion, incremental
+replay, partial reconnect, replica membership changes, and master failover.
+`tests/redis_scan_reader_e2e.py` runs RedisShake against authenticated Single
+(DB0 and DB15) and a two-Group Meta-managed Cluster, including values and TTLs.
 
 Configuration and command tests cover the startup support matrix, removed
 names, overrides, reporting, and independent client semantics and authority.
 `tests/cluster/serving_generation_integration_test.cpp` uses a real Redis
 upstream to verify that blocked commands, WATCH and KEYS cannot cross dataset
 replacement. External Sentinel HA is outside the supported contract.
-There is no focused malformed-LRC1 decoder matrix or forced slow-reader Redis
-export test.
+There is no focused malformed-LRC1 decoder matrix.
 
 ## Source map
 
@@ -1301,7 +1294,8 @@ export test.
 |---|---|
 | Public roles, options, status, and manager boundary | `include/lavik/replication.h` |
 | Single-group rebuild identity, safe-source authorization, logical/local epoch mapping, manifest/reset proof, readiness, clean recovery, and fail-stop contract | `include/lavik/replication_group.h`, `src/replication/replication_group.cpp`, `src/replication/population_recovery.h` |
-| Callable cluster directive/status/source-authorization, failover prepare/activation, source pause, and follow-owner adapters; native control/data protocol, duplex online flow, role lifecycle, Redis follower/export, topology, Function full sync, and reconnect behavior | `include/lavik/replication.h`, `src/replication/replication.cpp` |
+| Callable cluster directive/status/source-authorization, failover prepare/activation, source pause, and follow-owner adapters; native control/data protocol, duplex online flow, role lifecycle, Function full sync, and reconnect behavior | `include/lavik/replication.h`, `src/replication/replication.cpp` |
+| Redis AUTH/PSYNC consumption, RDB import, ordered replay, and slot topology coordination under the shared group owner | `src/replication/redis_replication.cpp`, `src/replication/replication_internal.h` |
 | Lock-free live target Applied frontier and coherent cross-flow snapshots | `src/replication/replica_applied_frontier.h`, `src/replication/replica_applied_frontier.cpp` |
 | Canonical command format and deterministic expiration effects | `include/lavik/replication_command.h`, `src/replication/command.cpp` |
 | REPLICAOF/Sentinel commands, serving-generation fencing, blocking-wait invalidation, MSET publication admission/order, Function and PUBLISH capture, transaction/control capture, and trusted replay | `include/lavik/command.h`, `src/redis/command.cpp`, `src/redis/blocking_wait.cpp`, `src/redis/command_table.cpp` |
@@ -1317,4 +1311,4 @@ export test.
 | Manifest-filtered full-sync scanning, replacements, handoff, target reset/apply/promotion/abort, detached-index reclaim, cascade and DB-gate limitations | `src/storage/engine/replication.cpp`, `src/storage/engine/write.cpp` |
 | Frame layout, event kinds, fragmentation, and checksums | `include/lavik/storage/format.h`, `src/storage/format.cpp` |
 | Startup/runtime replication configuration, cluster fail-closed admission, and atomic CONFIG REWRITE | `app/lavik.cpp`, `include/lavik/server.h`, `src/config.cpp`, `src/redis/command.cpp`, `src/redis/server.cpp` |
-| Native, group-model, cluster-startup/manager/generation/failure/protocol-guard/failover/follow-owner, log, MSET, Pub/Sub, Redis PSYNC/export, RDB, format, and configuration verification | `tests/replication_group_test.cpp`, `tests/cluster/cluster_invariants.cpp`, `tests/cluster/fault_harness_test.cpp`, `tests/cluster/population_integration_test.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/cluster/serving_generation_integration_test.cpp`, `tests/meta_integration/gate_native_replication.py`, `tests/replication_log_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/redis_follower_smoke.py`, `tests/redis_cluster_psync_e2e.sh`, `tests/redis_export_e2e.sh`, `tests/multi_exec_e2e_test.cpp`, `tests/rdb_test.cpp`, `tests/replication_command_test.cpp`, `tests/storage_format_test.cpp`, `tests/config_test.cpp` |
+| Native, group-model, cluster-startup/manager/generation/failure/protocol-guard/failover/follow-owner, log, MSET, Pub/Sub, Redis PSYNC/ScanReader, RDB, format, and configuration verification | `tests/replication_group_test.cpp`, `tests/cluster/cluster_invariants.cpp`, `tests/cluster/fault_harness_test.cpp`, `tests/cluster/population_integration_test.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/cluster/serving_generation_integration_test.cpp`, `tests/meta_integration/gate_native_replication.py`, `tests/replication_log_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/redis_follower_smoke.py`, `tests/redis_cluster_psync_e2e.sh`, `tests/redis_scan_reader_e2e.py`, `tests/multi_exec_e2e_test.cpp`, `tests/rdb_test.cpp`, `tests/replication_command_test.cpp`, `tests/storage_format_test.cpp`, `tests/config_test.cpp` |

@@ -470,6 +470,16 @@ on its disposable VMs. Test logs and JUnit results live in
 seven days. The test jobs run independently of formatting and of each other's
 outcome.
 
+The RedisShake ScanReader integration test additionally needs RedisShake on
+PATH (or `-DLAVIK_REDIS_SHAKE_EXECUTABLE=/path/to/redis-shake`) and Meta enabled.
+The ScanReader destination must accept RDB 11 payloads (Redis 7.2 or newer).
+CI builds pinned, checksummed Redis 7.2.14 using
+`scripts/install_test_redis.sh <destination-directory>` and installs the
+pinned, checksummed RedisShake v4.6.2 binary using
+`scripts/install_test_redisshake.sh <destination-directory>` on x86_64 and ARM64.
+Local configurations without this optional test client omit that test; it is
+not a Lavik runtime dependency.
+
 ## Source formatting
 
 Lavik uses the Google style, parses source as C++23, and pins clang-format

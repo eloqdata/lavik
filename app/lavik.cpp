@@ -240,10 +240,7 @@ int main(int argc, char** argv) {
       ->capture_default_str()
       ->check(
           CLI::Range(std::size_t{1}, lavik::kMaxReplicationSnapshotBatchSize));
-  app.add_flag("--redis-export-backpressure,!--no-redis-export-backpressure",
-               options.replication_options_.redis_export_backpressure_,
-               "Backpressure writes when a Redis PSYNC export falls behind")
-      ->capture_default_str();
+
   app.add_flag(
          "--replication-backlog-backpressure,"
          "!--no-replication-backlog-backpressure",

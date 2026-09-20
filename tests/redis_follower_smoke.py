@@ -208,38 +208,18 @@ def changing_endpoint(lavik, redis, root, managed=False):
         if not managed:
             native.call("SET", "must-not-import", "native")
         source.call("SET", "redis-value", "redis")
-        # Discovery uses one connection. Every consumer attempt sees Lavik,
-        # including an explicit Redis alias supplied at startup.
+        # The connection that passes PSYNC is the consumer, not a probe. Any
+        # second connection reaches Lavik, whose ordinary handshake rejects it.
         proxy = Forwarder(lambda count: source_port if count == 1 else native_port)
-        directory = root / "changed-target"
-        try:
-            with process(lavik, directory, "seed") as (target, _, _):
-                target.call("SET", "retained-before-full", "local")
-            with process(lavik, directory, "switched", extra=(
-                    "--redis-replicaof", "127.0.0.1", str(proxy.port))) as (target, _, log):
-                H.wait_until("consumer rejects changed native endpoint", 15,
-                             lambda: "external replication requires a Redis" in log.read_text())
-                rejects_before = proxy.accepted
-                time.sleep(1.2)
-                assert proxy.accepted == rejects_before, "confirmed native endpoint was retried"
-                reject(target, ("GET", "retained-before-full"), "LOADING")
-            with process(lavik, directory, "recover") as (target, _, _):
-                assert target.call("GET", "retained-before-full") == "local"
-                assert target.call("EXISTS", "must-not-import") == 0
-        finally:
-            proxy.close()
-        # A reconnect must repeat the type check before any incremental apply.
-        endpoint = [source_port]
-        proxy = Forwarder(lambda _: endpoint[0])
         try:
             with process(lavik, root / "changed-online", "online") as (target, _, log):
                 target.call("REPLICAOF", "127.0.0.1", proxy.port)
                 H.wait_until("initial Redis endpoint online", 20,
                              lambda: target.call("GET", "redis-value") == "redis")
-                endpoint[0] = native_port
+                assert proxy.accepted == 1, "PSYNC connection was not reused"
                 source.call("CLIENT", "KILL", "TYPE", "REPLICA")
-                H.wait_until("reconnect rejects changed native endpoint", 15,
-                             lambda: "external replication requires a Redis" in log.read_text())
+                H.wait_until("reconnect handshake rejects unsupported endpoint", 15,
+                             lambda: "Redis replication handshake failed" in log.read_text())
                 assert "role:slave" in target.call("INFO", "replication")
                 reject(target, ("SET", "unfenced", "wrong"), "READONLY")
                 assert target.call("GET", "redis-value") == "redis"
@@ -294,8 +274,9 @@ def exercise(lavik, redis, root):
     with process(lavik, root / "native", "native") as (native, native_port, _), \
          process(lavik, root / "target", "target") as (target, _, target_log):
         assert target.call("SET", "retained", "original") == "OK"
-        reject(target, ("REPLICAOF", "127.0.0.1", native_port), "Redis")
-        reject(target, ("SLAVEOF", "127.0.0.1", native_port), "Redis")
+        reject(native, ("PSYNC", "?", "-1"), "unknown command")
+        reject(target, ("REPLICAOF", "127.0.0.1", native_port), "ERR")
+        reject(target, ("SLAVEOF", "127.0.0.1", native_port), "ERR")
         assert target.call("GET", "retained") == "original"
         assert "role:master" in target.call("INFO", "replication")
         target.call("SELECT", 15)
@@ -320,7 +301,7 @@ def exercise(lavik, redis, root):
             assert source.call("EXEC") == ["OK", "OK"]
             H.wait_until("transaction replay", 10,
                          lambda: target.call("MGET", "tx-a", "tx-b") == ["a", "b"])
-            reject(target, ("REPLICAOF", "127.0.0.1", native_port), "Redis")
+            reject(target, ("REPLICAOF", "127.0.0.1", native_port), "ERR")
             reject(target, ("REPLICAOF", "127.0.0.1", H.free_port()), "ERR")
             assert target.call("GET", "baseline") == "db15"
             assert source.call("SET", "after-reject", "still-following") == "OK"
@@ -331,14 +312,14 @@ def exercise(lavik, redis, root):
             H.wait_until("partial reconnect", 15,
                          lambda: target.call("GET", "exact-once") == "1" and
                          "Redis partial resynchronization continued" in target_log.read_text())
-    # Both startup forms must identify a native peer without erasing recovered data.
+    # Both startup forms must reject an unsupported handshake before replacing data.
     with process(lavik, root / "native", "native-again") as (_, native_port, _):
         for index, option in enumerate(("replicaof", "redis-replicaof")):
             (root / "target" / "lavik.conf").write_text(f"{option} 127.0.0.1 {native_port}\n")
             with process(lavik, root / "target", f"rejected-{index}",
                          extra=()) as (target, _, log):
                 H.wait_until("unsupported startup upstream", 15,
-                             lambda: "requires a Redis" in log.read_text())
+                             lambda: "Redis replication handshake" in log.read_text())
                 reject(target, ("GET", "baseline"), "LOADING")
         (root / "target" / "lavik.conf").unlink()
         with process(lavik, root / "target", "recover") as (target, _, _):
@@ -352,15 +333,12 @@ def managed_native_rejection(lavik, redis, root):
     with process(lavik, root / "managed-native", "source", extra=args) as (_, port, _):
         with process(lavik, root / "managed-reject", "runtime") as (target, _, _):
             target.call("SET", "preserved", "local")
-            reject(target, ("REPLICAOF", "127.0.0.1", port), "Redis")
+            reject(target, ("REPLICAOF", "127.0.0.1", port), "ERR")
             assert target.call("GET", "preserved") == "local"
         with process(lavik, root / "managed-reject", "startup", extra=(
                 "--redis-replicaof", "127.0.0.1", str(port))) as (target, _, log):
-            H.wait_until("managed native classified", 15,
-                         lambda: "requires a Redis" in log.read_text())
-            attempts = log.read_text().count("requires a Redis")
-            time.sleep(1.2)
-            assert log.read_text().count("requires a Redis") == attempts
+            H.wait_until("managed endpoint handshake rejected", 15,
+                         lambda: "Redis replication handshake" in log.read_text())
             reject(target, ("GET", "preserved"), "LOADING")
     directory = root / "managed-endpoint"
     directory.mkdir()

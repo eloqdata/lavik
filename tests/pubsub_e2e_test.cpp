@@ -632,7 +632,7 @@ int main(int argc, char** argv) {
 
     ExpectContains(replica_client.Command(
                        {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
-                   "external replication requires a Redis",
+                   "Redis replication handshake failed",
                    "reject native upstream");
 
     replica.Stop();

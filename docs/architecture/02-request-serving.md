@@ -82,8 +82,7 @@ authentication, cluster-read, transaction, WATCH, native replication
 watermark, and name state.
 
 The service recognizes authentication and replication handshakes before
-ordinary dispatch. An isolated Redis `PSYNC` connection is transferred to the
-Redis exporter; an isolated native Lavik handshake is transferred to the
+ordinary dispatch. An isolated native Lavik handshake is transferred to the
 replication manager. Other authenticated traffic enters the request-drain gate
 used by graceful shutdown. That gate stores a closed bit and active count in
 one cache-line-isolated shard per worker. Normal traffic therefore mutates only
@@ -375,9 +374,9 @@ quiesce requests, so concurrent commands can also contribute post-reset
 samples.
 
 The external replication command surface accepts only Redis/Redis Cluster
-upstreams. `REPLICAOF` and `SLAVEOF host port` probe the peer before changing
+upstreams. `REPLICAOF` and `SLAVEOF host port` complete AUTH/PSYNC before changing
 roles or retiring an existing subscription; `ADDREPLICAOF` additionally checks
-same-cluster membership and disjoint slots. All Meta-managed nodes reject these
+matching master slot layouts and disjoint slots; callers select the cluster. All Meta-managed nodes reject these
 commands, including `NO ONE`, independently of client mode. Lavik native
 relationships are established by Meta Follow Owner.
 

@@ -179,24 +179,6 @@ class RedisPsyncSource {
     }
     if (pid_ == 0) {
       try {
-        const int probe_fd =
-            ::accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
-        if (probe_fd < 0) _exit(125);
-        const auto identity = ReadRespCommand(probe_fd);
-        if (identity.empty() || identity.front() != "INFO") _exit(125);
-        SendAll(probe_fd, "$0\r\n\r\n");
-        const auto probe = ReadRespCommand(probe_fd);
-        if (probe.empty() || probe.front() != "LVPSYNC") _exit(125);
-        SendAll(probe_fd, "-ERR unknown command 'LVPSYNC'\r\n");
-        const int discovery_fd = probe_fd;
-        if (discovery_fd < 0) _exit(125);
-        const std::vector<std::string> discovery =
-            ReadRespCommand(discovery_fd);
-        if (discovery.empty() || discovery.front() != "CLUSTER") _exit(125);
-        SendAll(discovery_fd,
-                "-ERR This instance has cluster support disabled\r\n");
-        ::close(discovery_fd);
-
         const int client_fd =
             ::accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
         ::close(listen_fd);
@@ -207,10 +189,6 @@ class RedisPsyncSource {
             throw std::runtime_error("unexpected Redis replication handshake");
           }
         };
-        expect("INFO");
-        SendAll(client_fd, "$0\r\n\r\n");
-        expect("LVPSYNC");
-        SendAll(client_fd, "-ERR unknown command 'LVPSYNC'\r\n");
         expect("CLUSTER");
         SendAll(client_fd,
                 "-ERR This instance has cluster support disabled\r\n");

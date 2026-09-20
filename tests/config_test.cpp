@@ -139,9 +139,6 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
                   .ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"replica-read-only", "no"}, &options).ok());
-  ASSERT_TRUE(
-      ApplyRedisConfigDirective({"redis-export-backpressure", "yes"}, &options)
-          .ok());
   ASSERT_TRUE(ApplyRedisConfigDirective(
                   {"replication-backlog-backpressure", "no"}, &options)
                   .ok());
@@ -209,7 +206,6 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   EXPECT_EQ(options.replicaof_->host_, "redis.internal");
   EXPECT_EQ(options.replicaof_->port_, 6379);
   EXPECT_FALSE(options.replication_options_.replica_read_only_);
-  EXPECT_TRUE(options.replication_options_.redis_export_backpressure_);
   EXPECT_FALSE(options.replication_options_.backlog_backpressure_);
   EXPECT_EQ(options.replication_options_.replica_priority_, 42u);
   EXPECT_EQ(options.replication_publish_queue_bytes_, 64ULL * 1024 * 1024);
@@ -299,9 +295,9 @@ TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
           .ok());
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"replica-priority", "-1"}, &options).ok());
-  EXPECT_FALSE(ApplyRedisConfigDirective({"redis-export-backpressure", "maybe"},
-                                         &options)
-                   .ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"redis-export-backpressure", "yes"}, &options)
+          .ok());
   EXPECT_FALSE(ApplyRedisConfigDirective(
                    {"replication-backlog-backpressure", "maybe"}, &options)
                    .ok());

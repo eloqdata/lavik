@@ -66,10 +66,10 @@ import socket
 
 sockets = []
 ports = []
-while len(ports) < 8:
+while len(ports) < 6:
     port = random.randrange(20000, 45000)
     candidates = [port]
-    if len(ports) < 6:
+    if len(ports) < 4:
         candidates.append(port + 10000)  # Redis Cluster bus port.
     opened = []
     try:
@@ -87,10 +87,10 @@ print(*ports, sep="\n")
 PY
 )
 master_ports=("${ports[0]}" "${ports[1]}" "${ports[2]}")
-other_ports=("${ports[3]}" "${ports[4]}" "${ports[5]}")
-all_redis_ports=("${master_ports[@]}" "${other_ports[@]}")
-lavik_port=${ports[6]}
-native_port=${ports[7]}
+replica_port=${ports[3]}
+all_redis_ports=("${master_ports[@]}" "$replica_port")
+lavik_port=${ports[4]}
+native_port=${ports[5]}
 
 for port in "${all_redis_ports[@]}"; do
   node_dir=$case_dir/$port
@@ -113,10 +113,7 @@ done
 printf 'yes\n' | "$redis_cli" --cluster create \
   "127.0.0.1:${master_ports[0]}" "127.0.0.1:${master_ports[1]}" \
   "127.0.0.1:${master_ports[2]}" --cluster-replicas 0 >/dev/null
-printf 'yes\n' | "$redis_cli" --cluster create \
-  "127.0.0.1:${other_ports[0]}" "127.0.0.1:${other_ports[1]}" \
-  "127.0.0.1:${other_ports[2]}" --cluster-replicas 0 >/dev/null
-for port in "${all_redis_ports[@]}"; do
+for port in "${master_ports[@]}"; do
   for _ in {1..200}; do
     "$redis_cli" -p "$port" cluster info | tr -d '\r' | \
       grep -q '^cluster_state:ok$' && break
@@ -162,9 +159,6 @@ grep -q 'slot overlap' <<<"$overlap"
 # No subset of sources may expose a partially imported logical dataset.
 incomplete=$("$redis_cli" -p "$lavik_port" get '{a}baseline' 2>&1)
 grep -q 'LOADING' <<<"$incomplete"
-wrong_cluster=$("$redis_cli" -p "$lavik_port" addreplicaof 127.0.0.1 \
-  "${other_ports[2]}" 2>&1)
-grep -q 'topology changed' <<<"$wrong_cluster"
 "$redis_cli" -p "$lavik_port" addreplicaof 127.0.0.1 \
   "${master_ports[2]}" >/dev/null
 
@@ -178,7 +172,7 @@ for _ in {1..200}; do
   sleep 0.05
 done
 native_rejected=$("$redis_cli" -p "$lavik_port" addreplicaof 127.0.0.1 "$native_port" 2>&1)
-grep -q 'external replication requires a Redis' <<<"$native_rejected"
+grep -q 'ERR' <<<"$native_rejected"
 
 for _ in {1..400}; do
   "$redis_cli" -p "$lavik_port" info replication 2>/dev/null | \
@@ -244,3 +238,35 @@ for _ in {1..200}; do
   sleep 0.05
 done
 ((partial_count >= 3))
+
+# Replica membership changes do not change the subscribed master slot layout.
+# Wait beyond two topology polls so the former all-node identity check would
+# fail here, before exercising the original automatic master replacement path.
+master_id=$("$redis_cli" -p "${master_ports[0]}" cluster myid)
+[[ $("$redis_cli" -p "$replica_port" cluster meet 127.0.0.1 "${master_ports[0]}") == OK ]]
+for _ in {1..200}; do
+  "$redis_cli" -p "$replica_port" cluster nodes | grep -q "$master_id" && break
+  sleep 0.05
+done
+[[ $("$redis_cli" -p "$replica_port" cluster replicate "$master_id") == OK ]]
+for _ in {1..400}; do
+  "$redis_cli" -p "$replica_port" info replication | tr -d '\r' | grep -q '^master_link_status:up$' && break
+  sleep 0.05
+done
+sleep 5
+[[ $("$redis_cli" -p "$lavik_port" get '{a}baseline') == one ]]
+[[ $("$redis_cli" -p "$replica_port" cluster failover) == OK ]]
+for _ in {1..400}; do
+  "$redis_cli" -p "$replica_port" info replication | tr -d '\r' | grep -q '^role:master$' && break
+  sleep 0.05
+done
+# {b} hashes to slot 3300, owned by the first master created above.
+for _ in {1..400}; do
+  [[ $("$redis_cli" -p "$replica_port" set '{b}after-failover' followed) == OK ]] && break
+  sleep 0.05
+done
+for _ in {1..400}; do
+  [[ $("$redis_cli" -p "$lavik_port" get '{b}after-failover' 2>/dev/null || true) == followed ]] && break
+  sleep 0.05
+done
+[[ $("$redis_cli" -p "$lavik_port" get '{b}after-failover') == followed ]]
