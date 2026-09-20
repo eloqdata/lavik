@@ -479,9 +479,9 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
         key_store, record.db_id_, key, value, record.kind_, record.value_type_,
         0, digest, clear_txid ? 0 : record.txid_, record.mutation_sequence_,
         /*for_defrag=*/true, /*unlock_writer_while_waiting=*/false,
-        record.external_, record.key_external_,
-        record.logical_size_, extents, &relocated, &source, nullptr, nullptr,
-        nullptr, nullptr, nullptr, &partition, &descriptor);
+        record.external_, record.key_external_, record.logical_size_, extents,
+        &relocated, &source, nullptr, nullptr, nullptr, nullptr, nullptr,
+        &partition, &descriptor);
     if (!written.ok()) co_return written;
     // Physical allocation can suspend owner serialization. Re-resolve the
     // incarnation and exact group address afterward; a client update, another
