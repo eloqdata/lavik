@@ -2260,8 +2260,8 @@ struct MetaControlClientService::Impl {
     // The old short lease still protects service until the first new grant.
     // Slowing down immediately after installing a longer policy can expire it.
     state->heartbeat_interval_ =
-        local_changed && MetaLeaseChallengeRotation::IsCommittedOwner(
-                             state->desired_->local.groups, options_.node_id_)
+        MetaLeaseChallengeRotation::IsCommittedOwner(
+            state->desired_->local.groups, options_.node_id_)
             ? std::min(state->heartbeat_interval_, next_interval)
             : next_interval;
     if (auto status =
