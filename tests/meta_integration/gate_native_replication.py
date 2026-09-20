@@ -43,7 +43,11 @@ class Client:
             assert self.call("READONLY") == "OK"
 
     def call(self, *args):
-        self.socket.sendall(C.encode_resp([str(arg) for arg in args]))
+        values = [arg if isinstance(arg, bytes) else str(arg).encode()
+                  for arg in args]
+        self.socket.sendall(f"*{len(values)}\r\n".encode() + b"".join(
+            f"${len(value)}\r\n".encode() + value + b"\r\n"
+            for value in values))
         return C.read_resp(self.reader)
 
     def close(self):
@@ -53,10 +57,12 @@ class Client:
 
 @contextmanager
 def pair(root, name, source_faults=None, target_faults=None, seed=None,
-         source_workers=2, target_workers=3):
+         source_workers=2, target_workers=3, raft_args=None,
+         require_seed_before_full=False):
     directory = root / name
     directory.mkdir()
-    meta = H.Node(C.META, str(directory), 1, args=C.creation_raft_args())
+    meta = H.Node(C.META, str(directory), 1,
+                  args=C.creation_raft_args() if raft_args is None else raft_args)
     proxy = C.DirectiveBarrier(meta.data_control_port, recipients=(C.REPLICA_1,))
     meta.advertised_data_control_endpoint = proxy.endpoint
     source = DataProcess(C.DATA, str(directory / "source"), C.PRIMARY_1,
@@ -85,13 +91,24 @@ def pair(root, name, source_faults=None, target_faults=None, seed=None,
                   str(manifest), "--socket", meta.ctl_path, "--yes"])
         held, release = proxy.recipients[C.REPLICA_1]
         H.wait_until("native target directive held", 30, held.is_set)
+        if require_seed_before_full:
+            # The one-frame barrier intentionally permits later sessions to
+            # reconnect. Pause this registered target while a larger seed is
+            # built so no reconnect can turn the FULL test into live replay.
+            # Retain its boot identity throughout the initialization workflow.
+            target.pause()
         writer = Client(source)
         clients.append(writer)
         H.wait_until("source authority before FULL", 20,
                      lambda: writer.call("SET", "{native}seed", "baseline") == "OK")
         if seed:
             seed(writer)
+        if require_seed_before_full:
+            assert "replication target session" not in Path(target.log_path).read_text(), \
+                "target started FULL before the seed finished"
         release.set()
+        if require_seed_before_full:
+            target.resume()
         yield meta, source, target, writer
         for client in clients:
             client.close()
@@ -223,6 +240,71 @@ def replay_and_reconnect(root):
             assert time.monotonic() - started < 10
         finally:
             source.resume()
+
+
+def dense_hash_and_set_full_sync(root):
+    # Many short identities exercise duplicate validation against a growing
+    # staged object. A few large values do not expose the quadratic scan that
+    # previously monopolized the replica worker during FULL sync.
+    count = 32768
+
+    def dump(kind):
+        # Plain RDB Hash/Set with short binary strings, version 11 and Redis's
+        # CRC64 footer. RESTORE seeds one bounded stream instead of repeatedly
+        # rewriting an ever-growing object or hitting compact HREPLACE's argc
+        # limit. Build payloads before holding the target's control directive.
+        data = bytearray([kind, 0x80]) + count.to_bytes(4, "big")
+        for i in range(count):
+            member = f"member\0{i:08d}".ljust(48, "x").encode()
+            data += bytes([len(member)]) + member
+            if kind == 4:
+                data += b"\x20" + b"v" * 32
+        data += b"\x0b\x00"
+        polynomial = int(f"{0xad93d23594c935a9:064b}"[::-1], 2)
+        table = []
+        for byte in range(256):
+            crc = byte
+            for _ in range(8):
+                crc = (crc >> 1) ^ (polynomial if crc & 1 else 0)
+            table.append(crc)
+        crc = 0
+        for byte in data:
+            crc = table[(crc ^ byte) & 255] ^ (crc >> 8)
+        return bytes(data) + crc.to_bytes(8, "little")
+
+    hash_payload, set_payload = dump(4), dump(2)
+
+    def seed(writer):
+        H.log(f"seeding dense Hash with {count} fields")
+        assert writer.call("RESTORE", "{dense}hash", 0, hash_payload) == "OK"
+        H.log(f"seeding dense Set with {count} members")
+        assert writer.call("RESTORE", "{dense}set", 0, set_payload) == "OK"
+
+    # This gate verifies ingestion and payload integrity under the ordinary
+    # five-second authority lease. Subsecond lease tests expose a separate
+    # data-observation stall and must not prevent this ingestion test starting.
+    with pair(root, "dense-collections", seed=seed, require_seed_before_full=True,
+              raft_args=H.raft_args(snapshot_distance=100000,
+                                    election_ms_low=5000,
+                                    election_ms_high=10000)) as (meta, _, target, writer):
+        started = time.monotonic()
+        ready(meta)
+        reader = Client(target, readonly=True)
+        try:
+            assert reader.call("HLEN", "{dense}hash") == count
+            assert reader.call("SCARD", "{dense}set") == count
+            # Compare every member/value; cardinality alone could hide damage
+            # introduced while reordering a Hash/Set ingestion batch.
+            assert sorted(reader.call("SMEMBERS", "{dense}set")) == sorted(
+                writer.call("SMEMBERS", "{dense}set"))
+            expected = writer.call("HGETALL", "{dense}hash")
+            actual = reader.call("HGETALL", "{dense}hash")
+            assert dict(zip(actual[::2], actual[1::2])) == dict(
+                zip(expected[::2], expected[1::2]))
+        finally:
+            reader.close()
+        H.log(f"dense Hash/Set FULL verified {count} members each in "
+              f"{time.monotonic() - started:.3f}s")
 
 
 def handoff_order(root):
@@ -411,6 +493,7 @@ def main():
                                      dir=os.environ.get("LAVIK_TEST_DATA_DIR")) as directory:
         root = Path(directory)
         replay_and_reconnect(root)
+        dense_hash_and_set_full_sync(root)
         full_tail(root)
         backpressured_shutdown(root)
         if C.has_fault(C.DATA, b"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK"):
