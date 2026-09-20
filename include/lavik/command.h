@@ -501,8 +501,11 @@ struct CommandReply {
 
 // The direct GET result is moved through several coroutine promises. Keep its
 // common representation at 72 bytes so adding rare reply state cannot silently
-// restore the former larger coroutine frames.
+// restore the former larger coroutine frames. Diagnostic builds deliberately
+// carry stage timestamps; this size contract applies only with tracing off.
+#if !LAVIK_ENABLE_READ_LATENCY_TRACE && !LAVIK_ENABLE_SET_LATENCY_TRACE
 static_assert(sizeof(CommandReply) == 72);
+#endif
 
 absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
                                                    std::uint8_t db_id);

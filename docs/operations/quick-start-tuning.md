@@ -54,3 +54,8 @@ Apply that reservation in your service manager or follow the
 Use the same data path and generated CPU plan on restart. Storage files must
 exist before Lavik starts; see [multi-device storage](multi-device-storage.md)
 when using several files or raw devices.
+
+The server and generated plan both default to `--flush-max-ms=100`. This bounds
+the age of a partially filled write block before periodic flushing requests
+submission; size-triggered writes can flush sooner. The setting remains
+configurable, and the default write-submission size remains 128 KiB.
