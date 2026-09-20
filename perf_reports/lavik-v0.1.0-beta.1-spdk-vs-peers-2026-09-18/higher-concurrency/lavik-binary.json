@@ -1,0 +1,17 @@
+{
+  "name": "lavik",
+  "path": "/mnt/dev/peer-bench/concurrency-10m-2026-09-20/binaries/lavik",
+  "sha256": "22ef59b0a9895ec5d48316dcac924672c831c96debb8785fddf5a8612521d16f",
+  "lavik_base": "8b7a11d1c8c6d9ae8ceb52c4233571cd9dfb636e",
+  "runtime": "f301f367b3177134c7a7a35698e07b22d3185627",
+  "compiler": "GCC 13",
+  "build_type": "Release",
+  "lto": true,
+  "march": "x86-64-v2",
+  "hardware_crc_experiment": false,
+  "faults": false,
+  "traces": false,
+  "meta": false,
+  "kernel_bypass": true,
+  "version_suffix": "-dev"
+}

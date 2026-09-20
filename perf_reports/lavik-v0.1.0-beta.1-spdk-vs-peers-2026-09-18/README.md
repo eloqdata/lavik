@@ -18,7 +18,7 @@ limitations under the License.
 
 **English** | [简体中文](README.zh-CN.md)
 
-Measured the downloaded standard beta release package on fresh SPDK datasets. This report contains 22 new Lavik points and 124 reused peer-control points from an earlier sweep on the same hosts. io_uring is excluded from this report.
+The original measurements below use the downloaded standard beta release package on fresh SPDK datasets. A separate higher-concurrency follow-up uses the optimization branch and is labeled accordingly. This report contains 22 new Lavik points and 124 reused peer-control points from an earlier sweep on the same hosts. io_uring is excluded from this report.
 
 - 10M GET: SPDK peak **1012.2k QPS** at 640 connections; p99 **3.599 ms**, p99.9 **5.631 ms** at that point.
 - 10M SET: SPDK peak **930.5k QPS** at 1280 connections; p99 **4.799 ms**, p99.9 **8.095 ms** at that point.
@@ -26,6 +26,24 @@ Measured the downloaded standard beta release package on fresh SPDK datasets. Th
 - 1B SET: SPDK peak **764.9k QPS** at 1280 connections; p99 **10.879 ms**, p99.9 **16.639 ms** at that point.
 
 ## 10M keys × 1 KiB: in-memory controls
+
+### Higher-concurrency follow-up — current optimization branch
+
+This follow-up uses Lavik commit [`8b7a11d`](https://github.com/eloqdata/lavik/commit/8b7a11d1c8c6d9ae8ceb52c4233571cd9dfb636e) from [PR #124](https://github.com/eloqdata/lavik/pull/124), with SPDK and kernel TCP, default 100 ms flushing, and 16 workers. Redis and Valkey both use 16 I/O threads. These are current-branch results; the original beta-package measurements remain below.
+
+![GET and SET throughput from 320 to 3840 connections](higher-concurrency/throughput.png)
+
+| System | GET peak QPS (connections) | SET peak QPS (connections) |
+|---|---:|---:|
+| Lavik SPDK | 1,016,587 (960) | 951,893 (1280) |
+| Redis 8.8.0 · I/O=16 | 1,011,652 (2880) | 931,332 (1920) |
+| Valkey 9.1.0 · I/O=16 | 980,076 (1920) | 742,239 (2240) |
+
+All three systems cover the same 12 connection counts, from 320 to 3840 in steps of 320, for both commands. Each peak is the mean of three 30-second runs. Redis GET continues improving past 1280 connections, reaching 1,011,652 QPS at 2880; all six curves have a measured descending side. Lavik and Redis GET peaks are close (about 0.5% apart); Lavik SET is about 2.2% higher at the respective measured peaks.
+
+[Full data, configuration and reproducible chart](higher-concurrency/README.md) · [CSV](higher-concurrency/results.csv) · [SVG](higher-concurrency/throughput.svg)
+
+### Original beta-package measurements
 
 ![10M throughput](memory-qps.png)
 

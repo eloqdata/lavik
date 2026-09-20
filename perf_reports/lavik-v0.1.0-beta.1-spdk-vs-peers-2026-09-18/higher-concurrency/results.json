@@ -1,0 +1,1114 @@
+[
+  {
+    "product": "lavik-spdk",
+    "op": "GET",
+    "connections": 320,
+    "n": 1,
+    "qps": 812265.29,
+    "qps_min": 812265.29,
+    "qps_max": 812265.29,
+    "p99_ms": 0.943,
+    "p999_ms": 2.047,
+    "client_cpu_cores": 10.600794888750057,
+    "sources": [
+      "lavik-spdk/get-r1-c320.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "GET",
+    "connections": 640,
+    "n": 3,
+    "qps": 1013273.7566666667,
+    "qps_min": 1011807.38,
+    "qps_max": 1016050.97,
+    "p99_ms": 3.583,
+    "p999_ms": 5.673666666666667,
+    "client_cpu_cores": 13.478208317107088,
+    "sources": [
+      "lavik-spdk/get-r2-c640.result.json",
+      "lavik-spdk/get-r1-c640.result.json",
+      "lavik-spdk/get-r3-c640.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "GET",
+    "connections": 960,
+    "n": 3,
+    "qps": 1016587.1966666667,
+    "qps_min": 1014966.15,
+    "qps_max": 1017805.13,
+    "p99_ms": 4.1803333333333335,
+    "p999_ms": 7.4656666666666665,
+    "client_cpu_cores": 13.832401381459972,
+    "sources": [
+      "matrix/lavik-spdk/get-r2-c960.result.json",
+      "matrix/lavik-spdk/get-r3-c960.result.json",
+      "matrix/lavik-spdk/get-r1-c960.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "GET",
+    "connections": 1280,
+    "n": 3,
+    "qps": 940896.1466666667,
+    "qps_min": 931791.56,
+    "qps_max": 949867.09,
+    "p99_ms": 9.577666666666667,
+    "p999_ms": 14.377666666666666,
+    "client_cpu_cores": 12.38355989148942,
+    "sources": [
+      "lavik-spdk/get-r2-c1280.result.json",
+      "lavik-spdk/get-r3-c1280.result.json",
+      "lavik-spdk/get-r1-c1280.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "GET",
+    "connections": 1600,
+    "n": 1,
+    "qps": 903667.72,
+    "qps_min": 903667.72,
+    "qps_max": 903667.72,
+    "p99_ms": 15.615,
+    "p999_ms": 20.095,
+    "client_cpu_cores": 11.73525024941663,
+    "sources": [
+      "matrix/lavik-spdk/get-r1-c1600.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "GET",
+    "connections": 1920,
+    "n": 1,
+    "qps": 872540.52,
+    "qps_min": 872540.52,
+    "qps_max": 872540.52,
+    "p99_ms": 20.735,
+    "p999_ms": 25.855,
+    "client_cpu_cores": 11.363415569576475,
+    "sources": [
+      "matrix/lavik-spdk/get-r1-c1920.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "GET",
+    "connections": 2240,
+    "n": 1,
+    "qps": 833956.91,
+    "qps_min": 833956.91,
+    "qps_max": 833956.91,
+    "p99_ms": 26.879,
+    "p999_ms": 34.559,
+    "client_cpu_cores": 10.945621992971127,
+    "sources": [
+      "matrix/lavik-spdk/get-r1-c2240.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "GET",
+    "connections": 2560,
+    "n": 1,
+    "qps": 797767.88,
+    "qps_min": 797767.88,
+    "qps_max": 797767.88,
+    "p99_ms": 32.383,
+    "p999_ms": 41.471,
+    "client_cpu_cores": 10.613411016477945,
+    "sources": [
+      "lavik-spdk/get-r1-c2560.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "GET",
+    "connections": 2880,
+    "n": 1,
+    "qps": 775028.32,
+    "qps_min": 775028.32,
+    "qps_max": 775028.32,
+    "p99_ms": 36.863,
+    "p999_ms": 50.687,
+    "client_cpu_cores": 10.348991451007754,
+    "sources": [
+      "matrix/lavik-spdk/get-r1-c2880.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "GET",
+    "connections": 3200,
+    "n": 1,
+    "qps": 754163.81,
+    "qps_min": 754163.81,
+    "qps_max": 754163.81,
+    "p99_ms": 41.727,
+    "p999_ms": 55.039,
+    "client_cpu_cores": 10.208045296661126,
+    "sources": [
+      "matrix/lavik-spdk/get-r1-c3200.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "GET",
+    "connections": 3520,
+    "n": 1,
+    "qps": 739773.86,
+    "qps_min": 739773.86,
+    "qps_max": 739773.86,
+    "p99_ms": 46.079,
+    "p999_ms": 59.647,
+    "client_cpu_cores": 10.062758876217393,
+    "sources": [
+      "matrix/lavik-spdk/get-r1-c3520.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "GET",
+    "connections": 3840,
+    "n": 1,
+    "qps": 728256.33,
+    "qps_min": 728256.33,
+    "qps_max": 728256.33,
+    "p99_ms": 49.663,
+    "p999_ms": 65.023,
+    "client_cpu_cores": 10.01577447785884,
+    "sources": [
+      "matrix/lavik-spdk/get-r1-c3840.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "SET",
+    "connections": 320,
+    "n": 1,
+    "qps": 808781.17,
+    "qps_min": 808781.17,
+    "qps_max": 808781.17,
+    "p99_ms": 1.863,
+    "p999_ms": 3.359,
+    "client_cpu_cores": 10.656526701971188,
+    "sources": [
+      "lavik-spdk/set-r1-c320.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "SET",
+    "connections": 640,
+    "n": 3,
+    "qps": 908316.37,
+    "qps_min": 904173.17,
+    "qps_max": 910416.25,
+    "p99_ms": 3.583,
+    "p999_ms": 5.2363333333333335,
+    "client_cpu_cores": 12.307279723800514,
+    "sources": [
+      "lavik-spdk/set-r3-c640.result.json",
+      "lavik-spdk/set-r1-c640.result.json",
+      "lavik-spdk/set-r2-c640.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "SET",
+    "connections": 960,
+    "n": 3,
+    "qps": 944444.8366666667,
+    "qps_min": 935180.14,
+    "qps_max": 955670.12,
+    "p99_ms": 4.137666666666666,
+    "p999_ms": 6.804333333333333,
+    "client_cpu_cores": 13.007594899687255,
+    "sources": [
+      "matrix/lavik-spdk/set-r3-c960.result.json",
+      "matrix/lavik-spdk/set-r1-c960.result.json",
+      "matrix/lavik-spdk/set-r2-c960.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "SET",
+    "connections": 1280,
+    "n": 3,
+    "qps": 951893.3666666667,
+    "qps_min": 942550.27,
+    "qps_max": 959958.36,
+    "p99_ms": 4.681666666666667,
+    "p999_ms": 7.913666666666667,
+    "client_cpu_cores": 13.002180544706906,
+    "sources": [
+      "lavik-spdk/set-r3-c1280.result.json",
+      "lavik-spdk/set-r2-c1280.result.json",
+      "lavik-spdk/set-r1-c1280.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "SET",
+    "connections": 1600,
+    "n": 1,
+    "qps": 943399.07,
+    "qps_min": 943399.07,
+    "qps_max": 943399.07,
+    "p99_ms": 5.311,
+    "p999_ms": 10.239,
+    "client_cpu_cores": 12.909103061579641,
+    "sources": [
+      "matrix/lavik-spdk/set-r1-c1600.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "SET",
+    "connections": 1920,
+    "n": 1,
+    "qps": 916060.16,
+    "qps_min": 916060.16,
+    "qps_max": 916060.16,
+    "p99_ms": 6.143,
+    "p999_ms": 14.463,
+    "client_cpu_cores": 12.567698930602344,
+    "sources": [
+      "matrix/lavik-spdk/set-r1-c1920.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "SET",
+    "connections": 2240,
+    "n": 1,
+    "qps": 882549.93,
+    "qps_min": 882549.93,
+    "qps_max": 882549.93,
+    "p99_ms": 7.199,
+    "p999_ms": 23.551,
+    "client_cpu_cores": 12.32061312026669,
+    "sources": [
+      "matrix/lavik-spdk/set-r1-c2240.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "SET",
+    "connections": 2560,
+    "n": 1,
+    "qps": 864901.01,
+    "qps_min": 864901.01,
+    "qps_max": 864901.01,
+    "p99_ms": 8.511,
+    "p999_ms": 31.615,
+    "client_cpu_cores": 12.040749370335387,
+    "sources": [
+      "lavik-spdk/set-r1-c2560.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "SET",
+    "connections": 2880,
+    "n": 1,
+    "qps": 807353.11,
+    "qps_min": 807353.11,
+    "qps_max": 807353.11,
+    "p99_ms": 12.543,
+    "p999_ms": 65.279,
+    "client_cpu_cores": 11.37342358887957,
+    "sources": [
+      "matrix/lavik-spdk/set-r1-c2880.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "SET",
+    "connections": 3200,
+    "n": 1,
+    "qps": 766603.88,
+    "qps_min": 766603.88,
+    "qps_max": 766603.88,
+    "p99_ms": 18.175,
+    "p999_ms": 107.007,
+    "client_cpu_cores": 11.047022517714012,
+    "sources": [
+      "matrix/lavik-spdk/set-r1-c3200.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "SET",
+    "connections": 3520,
+    "n": 1,
+    "qps": 730800.49,
+    "qps_min": 730800.49,
+    "qps_max": 730800.49,
+    "p99_ms": 26.367,
+    "p999_ms": 160.767,
+    "client_cpu_cores": 10.653531644624898,
+    "sources": [
+      "matrix/lavik-spdk/set-r1-c3520.result.json"
+    ]
+  },
+  {
+    "product": "lavik-spdk",
+    "op": "SET",
+    "connections": 3840,
+    "n": 1,
+    "qps": 706602.59,
+    "qps_min": 706602.59,
+    "qps_max": 706602.59,
+    "p99_ms": 29.695,
+    "p999_ms": 197.631,
+    "client_cpu_cores": 10.372867216086911,
+    "sources": [
+      "matrix/lavik-spdk/set-r1-c3840.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "GET",
+    "connections": 320,
+    "n": 1,
+    "qps": 786092.66,
+    "qps_min": 786092.66,
+    "qps_max": 786092.66,
+    "p99_ms": 0.911,
+    "p999_ms": 1.367,
+    "client_cpu_cores": 9.925940597964154,
+    "sources": [
+      "redis-io16/get-r1-c320.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "GET",
+    "connections": 640,
+    "n": 1,
+    "qps": 925469.22,
+    "qps_min": 925469.22,
+    "qps_max": 925469.22,
+    "p99_ms": 3.295,
+    "p999_ms": 4.575,
+    "client_cpu_cores": 12.24879447763519,
+    "sources": [
+      "redis-io16/get-r1-c640.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "GET",
+    "connections": 960,
+    "n": 1,
+    "qps": 964389.66,
+    "qps_min": 964389.66,
+    "qps_max": 964389.66,
+    "p99_ms": 4.095,
+    "p999_ms": 6.815,
+    "client_cpu_cores": 12.946253807802382,
+    "sources": [
+      "arithmetic/redis-io16/get-r1-c960.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "GET",
+    "connections": 1280,
+    "n": 3,
+    "qps": 981624.4933333333,
+    "qps_min": 978371.76,
+    "qps_max": 983327.57,
+    "p99_ms": 4.628333333333334,
+    "p999_ms": 7.753666666666667,
+    "client_cpu_cores": 13.011803812229092,
+    "sources": [
+      "redis-io16/get-r2-c1280.result.json",
+      "redis-io16/get-r3-c1280.result.json",
+      "redis-io16/get-r1-c1280.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "GET",
+    "connections": 1600,
+    "n": 1,
+    "qps": 989307.37,
+    "qps_min": 989307.37,
+    "qps_max": 989307.37,
+    "p99_ms": 5.215,
+    "p999_ms": 10.175,
+    "client_cpu_cores": 13.080119868132723,
+    "sources": [
+      "arithmetic/redis-io16/get-r1-c1600.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "GET",
+    "connections": 1920,
+    "n": 1,
+    "qps": 998252.77,
+    "qps_min": 998252.77,
+    "qps_max": 998252.77,
+    "p99_ms": 5.759,
+    "p999_ms": 11.903,
+    "client_cpu_cores": 13.308541278491937,
+    "sources": [
+      "arithmetic/redis-io16/get-r1-c1920.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "GET",
+    "connections": 2240,
+    "n": 1,
+    "qps": 1006476.62,
+    "qps_min": 1006476.62,
+    "qps_max": 1006476.62,
+    "p99_ms": 6.271,
+    "p999_ms": 14.015,
+    "client_cpu_cores": 13.53635024737575,
+    "sources": [
+      "arithmetic/redis-io16/get-r1-c2240.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "GET",
+    "connections": 2560,
+    "n": 3,
+    "qps": 1011514.9133333333,
+    "qps_min": 1004147.41,
+    "qps_max": 1018627.62,
+    "p99_ms": 6.751,
+    "p999_ms": 15.508333333333333,
+    "client_cpu_cores": 14.11767174084471,
+    "sources": [
+      "redis-io16/get-r3-c2560.result.json",
+      "redis-io16/get-r2-c2560.result.json",
+      "redis-io16/get-r1-c2560.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "GET",
+    "connections": 2880,
+    "n": 3,
+    "qps": 1011651.9133333333,
+    "qps_min": 1006576.41,
+    "qps_max": 1016687.33,
+    "p99_ms": 7.455,
+    "p999_ms": 17.449666666666666,
+    "client_cpu_cores": 14.009430213719048,
+    "sources": [
+      "arithmetic/redis-io16/get-r1-c2880.result.json",
+      "arithmetic/redis-io16/get-r2-c2880.result.json",
+      "arithmetic/redis-io16/get-r3-c2880.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "GET",
+    "connections": 3200,
+    "n": 1,
+    "qps": 1003418.96,
+    "qps_min": 1003418.96,
+    "qps_max": 1003418.96,
+    "p99_ms": 8.767,
+    "p999_ms": 20.607,
+    "client_cpu_cores": 13.793844605933018,
+    "sources": [
+      "arithmetic/redis-io16/get-r1-c3200.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "GET",
+    "connections": 3520,
+    "n": 1,
+    "qps": 976101.85,
+    "qps_min": 976101.85,
+    "qps_max": 976101.85,
+    "p99_ms": 10.175,
+    "p999_ms": 23.551,
+    "client_cpu_cores": 13.499004255121589,
+    "sources": [
+      "arithmetic/redis-io16/get-r1-c3520.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "GET",
+    "connections": 3840,
+    "n": 1,
+    "qps": 968924.7,
+    "qps_min": 968924.7,
+    "qps_max": 968924.7,
+    "p99_ms": 11.007,
+    "p999_ms": 24.575,
+    "client_cpu_cores": 13.729411110100807,
+    "sources": [
+      "matrix/redis-io16/get-r1-c3840.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "SET",
+    "connections": 320,
+    "n": 1,
+    "qps": 733240.96,
+    "qps_min": 733240.96,
+    "qps_max": 733240.96,
+    "p99_ms": 0.951,
+    "p999_ms": 1.423,
+    "client_cpu_cores": 9.744337223830165,
+    "sources": [
+      "redis-io16/set-r1-c320.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "SET",
+    "connections": 640,
+    "n": 1,
+    "qps": 861761.79,
+    "qps_min": 861761.79,
+    "qps_max": 861761.79,
+    "p99_ms": 3.023,
+    "p999_ms": 4.447,
+    "client_cpu_cores": 11.685772871087796,
+    "sources": [
+      "redis-io16/set-r1-c640.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "SET",
+    "connections": 960,
+    "n": 1,
+    "qps": 902446.83,
+    "qps_min": 902446.83,
+    "qps_max": 902446.83,
+    "p99_ms": 4.127,
+    "p999_ms": 6.687,
+    "client_cpu_cores": 12.53129977596456,
+    "sources": [
+      "arithmetic/redis-io16/set-r1-c960.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "SET",
+    "connections": 1280,
+    "n": 3,
+    "qps": 919609.11,
+    "qps_min": 918059.41,
+    "qps_max": 920589.22,
+    "p99_ms": 4.724333333333334,
+    "p999_ms": 7.775,
+    "client_cpu_cores": 12.602630321481643,
+    "sources": [
+      "redis-io16/set-r3-c1280.result.json",
+      "redis-io16/set-r2-c1280.result.json",
+      "redis-io16/set-r1-c1280.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "SET",
+    "connections": 1600,
+    "n": 1,
+    "qps": 922551.98,
+    "qps_min": 922551.98,
+    "qps_max": 922551.98,
+    "p99_ms": 5.343,
+    "p999_ms": 9.215,
+    "client_cpu_cores": 12.768831646788673,
+    "sources": [
+      "arithmetic/redis-io16/set-r1-c1600.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "SET",
+    "connections": 1920,
+    "n": 3,
+    "qps": 931332.0333333333,
+    "qps_min": 926622.57,
+    "qps_max": 934525.78,
+    "p99_ms": 5.961666666666666,
+    "p999_ms": 11.732333333333333,
+    "client_cpu_cores": 13.065387948725363,
+    "sources": [
+      "arithmetic/redis-io16/set-r1-c1920.result.json",
+      "matrix/redis-io16/set-r1-c1920.result.json",
+      "matrix/redis-io16/set-r2-c1920.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "SET",
+    "connections": 2240,
+    "n": 1,
+    "qps": 910365.29,
+    "qps_min": 910365.29,
+    "qps_max": 910365.29,
+    "p99_ms": 6.719,
+    "p999_ms": 14.911,
+    "client_cpu_cores": 12.73657443471009,
+    "sources": [
+      "arithmetic/redis-io16/set-r1-c2240.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "SET",
+    "connections": 2560,
+    "n": 3,
+    "qps": 900988.7466666667,
+    "qps_min": 894899.83,
+    "qps_max": 906382.65,
+    "p99_ms": 7.487,
+    "p999_ms": 17.407,
+    "client_cpu_cores": 12.715756951005162,
+    "sources": [
+      "redis-io16/set-r3-c2560.result.json",
+      "redis-io16/set-r1-c2560.result.json",
+      "redis-io16/set-r2-c2560.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "SET",
+    "connections": 2880,
+    "n": 1,
+    "qps": 875854.57,
+    "qps_min": 875854.57,
+    "qps_max": 875854.57,
+    "p99_ms": 8.767,
+    "p999_ms": 20.735,
+    "client_cpu_cores": 12.538690346605438,
+    "sources": [
+      "matrix/redis-io16/set-r1-c2880.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "SET",
+    "connections": 3200,
+    "n": 1,
+    "qps": 849378.83,
+    "qps_min": 849378.83,
+    "qps_max": 849378.83,
+    "p99_ms": 9.919,
+    "p999_ms": 22.015,
+    "client_cpu_cores": 12.313170334894048,
+    "sources": [
+      "matrix/redis-io16/set-r1-c3200.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "SET",
+    "connections": 3520,
+    "n": 1,
+    "qps": 832607.46,
+    "qps_min": 832607.46,
+    "qps_max": 832607.46,
+    "p99_ms": 11.135,
+    "p999_ms": 25.855,
+    "client_cpu_cores": 12.096826750954701,
+    "sources": [
+      "matrix/redis-io16/set-r1-c3520.result.json"
+    ]
+  },
+  {
+    "product": "redis-io16",
+    "op": "SET",
+    "connections": 3840,
+    "n": 1,
+    "qps": 806657.33,
+    "qps_min": 806657.33,
+    "qps_max": 806657.33,
+    "p99_ms": 11.839,
+    "p999_ms": 31.615,
+    "client_cpu_cores": 11.92779880188577,
+    "sources": [
+      "matrix/redis-io16/set-r1-c3840.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "GET",
+    "connections": 320,
+    "n": 1,
+    "qps": 813560.7,
+    "qps_min": 813560.7,
+    "qps_max": 813560.7,
+    "p99_ms": 1.111,
+    "p999_ms": 2.479,
+    "client_cpu_cores": 10.315650251466364,
+    "sources": [
+      "arithmetic/valkey-io16/get-r1-c320.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "GET",
+    "connections": 640,
+    "n": 1,
+    "qps": 892455.8,
+    "qps_min": 892455.8,
+    "qps_max": 892455.8,
+    "p99_ms": 3.567,
+    "p999_ms": 5.567,
+    "client_cpu_cores": 11.12575141865671,
+    "sources": [
+      "valkey-io16/get-r1-c640.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "GET",
+    "connections": 960,
+    "n": 1,
+    "qps": 922368.07,
+    "qps_min": 922368.07,
+    "qps_max": 922368.07,
+    "p99_ms": 4.015,
+    "p999_ms": 6.847,
+    "client_cpu_cores": 12.057146808094078,
+    "sources": [
+      "arithmetic/valkey-io16/get-r1-c960.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "GET",
+    "connections": 1280,
+    "n": 1,
+    "qps": 957124.35,
+    "qps_min": 957124.35,
+    "qps_max": 957124.35,
+    "p99_ms": 4.447,
+    "p999_ms": 8.191,
+    "client_cpu_cores": 12.340064424659632,
+    "sources": [
+      "arithmetic/valkey-io16/get-r1-c1280.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "GET",
+    "connections": 1600,
+    "n": 1,
+    "qps": 971807.18,
+    "qps_min": 971807.18,
+    "qps_max": 971807.18,
+    "p99_ms": 4.895,
+    "p999_ms": 10.239,
+    "client_cpu_cores": 12.639236891422927,
+    "sources": [
+      "arithmetic/valkey-io16/get-r1-c1600.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "GET",
+    "connections": 1920,
+    "n": 3,
+    "qps": 980075.5533333333,
+    "qps_min": 974430.39,
+    "qps_max": 986174.5,
+    "p99_ms": 5.417666666666666,
+    "p999_ms": 11.775,
+    "client_cpu_cores": 13.198410270436584,
+    "sources": [
+      "arithmetic/valkey-io16/get-r1-c1920.result.json",
+      "arithmetic/valkey-io16/get-r3-c1920.result.json",
+      "arithmetic/valkey-io16/get-r2-c1920.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "GET",
+    "connections": 2240,
+    "n": 1,
+    "qps": 967271.33,
+    "qps_min": 967271.33,
+    "qps_max": 967271.33,
+    "p99_ms": 6.047,
+    "p999_ms": 14.463,
+    "client_cpu_cores": 12.810313910453564,
+    "sources": [
+      "arithmetic/valkey-io16/get-r1-c2240.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "GET",
+    "connections": 2560,
+    "n": 1,
+    "qps": 960394.28,
+    "qps_min": 960394.28,
+    "qps_max": 960394.28,
+    "p99_ms": 6.591,
+    "p999_ms": 16.767,
+    "client_cpu_cores": 12.786986127108596,
+    "sources": [
+      "arithmetic/valkey-io16/get-r1-c2560.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "GET",
+    "connections": 2880,
+    "n": 1,
+    "qps": 955730.75,
+    "qps_min": 955730.75,
+    "qps_max": 955730.75,
+    "p99_ms": 7.263,
+    "p999_ms": 19.711,
+    "client_cpu_cores": 12.813116619531156,
+    "sources": [
+      "matrix/valkey-io16/get-r1-c2880.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "GET",
+    "connections": 3200,
+    "n": 1,
+    "qps": 932093.76,
+    "qps_min": 932093.76,
+    "qps_max": 932093.76,
+    "p99_ms": 8.511,
+    "p999_ms": 22.271,
+    "client_cpu_cores": 12.607109012275313,
+    "sources": [
+      "matrix/valkey-io16/get-r1-c3200.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "GET",
+    "connections": 3520,
+    "n": 1,
+    "qps": 922827.96,
+    "qps_min": 922827.96,
+    "qps_max": 922827.96,
+    "p99_ms": 9.535,
+    "p999_ms": 23.039,
+    "client_cpu_cores": 12.62992115935899,
+    "sources": [
+      "matrix/valkey-io16/get-r1-c3520.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "GET",
+    "connections": 3840,
+    "n": 1,
+    "qps": 891181.76,
+    "qps_min": 891181.76,
+    "qps_max": 891181.76,
+    "p99_ms": 10.751,
+    "p999_ms": 25.471,
+    "client_cpu_cores": 12.370296214354521,
+    "sources": [
+      "matrix/valkey-io16/get-r1-c3840.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "SET",
+    "connections": 320,
+    "n": 1,
+    "qps": 669872.22,
+    "qps_min": 669872.22,
+    "qps_max": 669872.22,
+    "p99_ms": 1.015,
+    "p999_ms": 2.207,
+    "client_cpu_cores": 8.757390871849294,
+    "sources": [
+      "arithmetic/valkey-io16/set-r1-c320.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "SET",
+    "connections": 640,
+    "n": 1,
+    "qps": 699190.21,
+    "qps_min": 699190.21,
+    "qps_max": 699190.21,
+    "p99_ms": 2.815,
+    "p999_ms": 6.111,
+    "client_cpu_cores": 9.055103231346454,
+    "sources": [
+      "arithmetic/valkey-io16/set-r1-c640.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "SET",
+    "connections": 960,
+    "n": 1,
+    "qps": 721280.26,
+    "qps_min": 721280.26,
+    "qps_max": 721280.26,
+    "p99_ms": 3.423,
+    "p999_ms": 7.487,
+    "client_cpu_cores": 9.619594869513191,
+    "sources": [
+      "arithmetic/valkey-io16/set-r1-c960.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "SET",
+    "connections": 1280,
+    "n": 1,
+    "qps": 737739.62,
+    "qps_min": 737739.62,
+    "qps_max": 737739.62,
+    "p99_ms": 3.983,
+    "p999_ms": 9.535,
+    "client_cpu_cores": 9.805126924081604,
+    "sources": [
+      "arithmetic/valkey-io16/set-r1-c1280.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "SET",
+    "connections": 1600,
+    "n": 3,
+    "qps": 738389.75,
+    "qps_min": 730634.88,
+    "qps_max": 746853.95,
+    "p99_ms": 4.223,
+    "p999_ms": 12.052333333333333,
+    "client_cpu_cores": 9.986657824528802,
+    "sources": [
+      "arithmetic/valkey-io16/set-r1-c1600.result.json",
+      "arithmetic/valkey-io16/set-r3-c1600.result.json",
+      "arithmetic/valkey-io16/set-r2-c1600.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "SET",
+    "connections": 1920,
+    "n": 3,
+    "qps": 738081.2533333333,
+    "qps_min": 728103.42,
+    "qps_max": 745089.87,
+    "p99_ms": 4.863,
+    "p999_ms": 15.167,
+    "client_cpu_cores": 10.117966301513677,
+    "sources": [
+      "arithmetic/valkey-io16/set-r1-c1920.result.json",
+      "arithmetic/valkey-io16/set-r2-c1920.result.json",
+      "arithmetic/valkey-io16/set-r3-c1920.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "SET",
+    "connections": 2240,
+    "n": 3,
+    "qps": 742238.6799999999,
+    "qps_min": 733738.19,
+    "qps_max": 752820.82,
+    "p99_ms": 5.620333333333334,
+    "p999_ms": 17.279,
+    "client_cpu_cores": 10.156502393410037,
+    "sources": [
+      "arithmetic/valkey-io16/set-r1-c2240.result.json",
+      "matrix/valkey-io16/set-r1-c2240.result.json",
+      "matrix/valkey-io16/set-r2-c2240.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "SET",
+    "connections": 2560,
+    "n": 1,
+    "qps": 712690.97,
+    "qps_min": 712690.97,
+    "qps_max": 712690.97,
+    "p99_ms": 6.495,
+    "p999_ms": 19.583,
+    "client_cpu_cores": 9.927683700322673,
+    "sources": [
+      "arithmetic/valkey-io16/set-r1-c2560.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "SET",
+    "connections": 2880,
+    "n": 1,
+    "qps": 708045.84,
+    "qps_min": 708045.84,
+    "qps_max": 708045.84,
+    "p99_ms": 7.391,
+    "p999_ms": 21.759,
+    "client_cpu_cores": 10.01595118147046,
+    "sources": [
+      "matrix/valkey-io16/set-r1-c2880.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "SET",
+    "connections": 3200,
+    "n": 1,
+    "qps": 676810.12,
+    "qps_min": 676810.12,
+    "qps_max": 676810.12,
+    "p99_ms": 8.383,
+    "p999_ms": 25.471,
+    "client_cpu_cores": 9.678595626182023,
+    "sources": [
+      "matrix/valkey-io16/set-r1-c3200.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "SET",
+    "connections": 3520,
+    "n": 1,
+    "qps": 670435.75,
+    "qps_min": 670435.75,
+    "qps_max": 670435.75,
+    "p99_ms": 9.791,
+    "p999_ms": 26.879,
+    "client_cpu_cores": 9.775690897741347,
+    "sources": [
+      "matrix/valkey-io16/set-r1-c3520.result.json"
+    ]
+  },
+  {
+    "product": "valkey-io16",
+    "op": "SET",
+    "connections": 3840,
+    "n": 1,
+    "qps": 661873.56,
+    "qps_min": 661873.56,
+    "qps_max": 661873.56,
+    "p99_ms": 12.159,
+    "p999_ms": 29.567,
+    "client_cpu_cores": 9.670298296976178,
+    "sources": [
+      "matrix/valkey-io16/set-r1-c3840.result.json"
+    ]
+  }
+]

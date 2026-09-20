@@ -1,0 +1,73 @@
+product,op,connections,n,qps,qps_min,qps_max,p99_ms,p999_ms,client_cpu_cores,sources
+lavik-spdk,GET,320,1,812265.29,812265.29,812265.29,0.943,2.047,10.600794888750057,['lavik-spdk/get-r1-c320.result.json']
+lavik-spdk,GET,640,3,1013273.7566666667,1011807.38,1016050.97,3.583,5.673666666666667,13.478208317107088,"['lavik-spdk/get-r2-c640.result.json', 'lavik-spdk/get-r1-c640.result.json', 'lavik-spdk/get-r3-c640.result.json']"
+lavik-spdk,GET,960,3,1016587.1966666667,1014966.15,1017805.13,4.1803333333333335,7.4656666666666665,13.832401381459972,"['matrix/lavik-spdk/get-r2-c960.result.json', 'matrix/lavik-spdk/get-r3-c960.result.json', 'matrix/lavik-spdk/get-r1-c960.result.json']"
+lavik-spdk,GET,1280,3,940896.1466666667,931791.56,949867.09,9.577666666666667,14.377666666666666,12.38355989148942,"['lavik-spdk/get-r2-c1280.result.json', 'lavik-spdk/get-r3-c1280.result.json', 'lavik-spdk/get-r1-c1280.result.json']"
+lavik-spdk,GET,1600,1,903667.72,903667.72,903667.72,15.615,20.095,11.73525024941663,['matrix/lavik-spdk/get-r1-c1600.result.json']
+lavik-spdk,GET,1920,1,872540.52,872540.52,872540.52,20.735,25.855,11.363415569576475,['matrix/lavik-spdk/get-r1-c1920.result.json']
+lavik-spdk,GET,2240,1,833956.91,833956.91,833956.91,26.879,34.559,10.945621992971127,['matrix/lavik-spdk/get-r1-c2240.result.json']
+lavik-spdk,GET,2560,1,797767.88,797767.88,797767.88,32.383,41.471,10.613411016477945,['lavik-spdk/get-r1-c2560.result.json']
+lavik-spdk,GET,2880,1,775028.32,775028.32,775028.32,36.863,50.687,10.348991451007754,['matrix/lavik-spdk/get-r1-c2880.result.json']
+lavik-spdk,GET,3200,1,754163.81,754163.81,754163.81,41.727,55.039,10.208045296661126,['matrix/lavik-spdk/get-r1-c3200.result.json']
+lavik-spdk,GET,3520,1,739773.86,739773.86,739773.86,46.079,59.647,10.062758876217393,['matrix/lavik-spdk/get-r1-c3520.result.json']
+lavik-spdk,GET,3840,1,728256.33,728256.33,728256.33,49.663,65.023,10.01577447785884,['matrix/lavik-spdk/get-r1-c3840.result.json']
+lavik-spdk,SET,320,1,808781.17,808781.17,808781.17,1.863,3.359,10.656526701971188,['lavik-spdk/set-r1-c320.result.json']
+lavik-spdk,SET,640,3,908316.37,904173.17,910416.25,3.583,5.2363333333333335,12.307279723800514,"['lavik-spdk/set-r3-c640.result.json', 'lavik-spdk/set-r1-c640.result.json', 'lavik-spdk/set-r2-c640.result.json']"
+lavik-spdk,SET,960,3,944444.8366666667,935180.14,955670.12,4.137666666666666,6.804333333333333,13.007594899687255,"['matrix/lavik-spdk/set-r3-c960.result.json', 'matrix/lavik-spdk/set-r1-c960.result.json', 'matrix/lavik-spdk/set-r2-c960.result.json']"
+lavik-spdk,SET,1280,3,951893.3666666667,942550.27,959958.36,4.681666666666667,7.913666666666667,13.002180544706906,"['lavik-spdk/set-r3-c1280.result.json', 'lavik-spdk/set-r2-c1280.result.json', 'lavik-spdk/set-r1-c1280.result.json']"
+lavik-spdk,SET,1600,1,943399.07,943399.07,943399.07,5.311,10.239,12.909103061579641,['matrix/lavik-spdk/set-r1-c1600.result.json']
+lavik-spdk,SET,1920,1,916060.16,916060.16,916060.16,6.143,14.463,12.567698930602344,['matrix/lavik-spdk/set-r1-c1920.result.json']
+lavik-spdk,SET,2240,1,882549.93,882549.93,882549.93,7.199,23.551,12.32061312026669,['matrix/lavik-spdk/set-r1-c2240.result.json']
+lavik-spdk,SET,2560,1,864901.01,864901.01,864901.01,8.511,31.615,12.040749370335387,['lavik-spdk/set-r1-c2560.result.json']
+lavik-spdk,SET,2880,1,807353.11,807353.11,807353.11,12.543,65.279,11.37342358887957,['matrix/lavik-spdk/set-r1-c2880.result.json']
+lavik-spdk,SET,3200,1,766603.88,766603.88,766603.88,18.175,107.007,11.047022517714012,['matrix/lavik-spdk/set-r1-c3200.result.json']
+lavik-spdk,SET,3520,1,730800.49,730800.49,730800.49,26.367,160.767,10.653531644624898,['matrix/lavik-spdk/set-r1-c3520.result.json']
+lavik-spdk,SET,3840,1,706602.59,706602.59,706602.59,29.695,197.631,10.372867216086911,['matrix/lavik-spdk/set-r1-c3840.result.json']
+redis-io16,GET,320,1,786092.66,786092.66,786092.66,0.911,1.367,9.925940597964154,['redis-io16/get-r1-c320.result.json']
+redis-io16,GET,640,1,925469.22,925469.22,925469.22,3.295,4.575,12.24879447763519,['redis-io16/get-r1-c640.result.json']
+redis-io16,GET,960,1,964389.66,964389.66,964389.66,4.095,6.815,12.946253807802382,['arithmetic/redis-io16/get-r1-c960.result.json']
+redis-io16,GET,1280,3,981624.4933333333,978371.76,983327.57,4.628333333333334,7.753666666666667,13.011803812229092,"['redis-io16/get-r2-c1280.result.json', 'redis-io16/get-r3-c1280.result.json', 'redis-io16/get-r1-c1280.result.json']"
+redis-io16,GET,1600,1,989307.37,989307.37,989307.37,5.215,10.175,13.080119868132723,['arithmetic/redis-io16/get-r1-c1600.result.json']
+redis-io16,GET,1920,1,998252.77,998252.77,998252.77,5.759,11.903,13.308541278491937,['arithmetic/redis-io16/get-r1-c1920.result.json']
+redis-io16,GET,2240,1,1006476.62,1006476.62,1006476.62,6.271,14.015,13.53635024737575,['arithmetic/redis-io16/get-r1-c2240.result.json']
+redis-io16,GET,2560,3,1011514.9133333333,1004147.41,1018627.62,6.751,15.508333333333333,14.11767174084471,"['redis-io16/get-r3-c2560.result.json', 'redis-io16/get-r2-c2560.result.json', 'redis-io16/get-r1-c2560.result.json']"
+redis-io16,GET,2880,3,1011651.9133333333,1006576.41,1016687.33,7.455,17.449666666666666,14.009430213719048,"['arithmetic/redis-io16/get-r1-c2880.result.json', 'arithmetic/redis-io16/get-r2-c2880.result.json', 'arithmetic/redis-io16/get-r3-c2880.result.json']"
+redis-io16,GET,3200,1,1003418.96,1003418.96,1003418.96,8.767,20.607,13.793844605933018,['arithmetic/redis-io16/get-r1-c3200.result.json']
+redis-io16,GET,3520,1,976101.85,976101.85,976101.85,10.175,23.551,13.499004255121589,['arithmetic/redis-io16/get-r1-c3520.result.json']
+redis-io16,GET,3840,1,968924.7,968924.7,968924.7,11.007,24.575,13.729411110100807,['matrix/redis-io16/get-r1-c3840.result.json']
+redis-io16,SET,320,1,733240.96,733240.96,733240.96,0.951,1.423,9.744337223830165,['redis-io16/set-r1-c320.result.json']
+redis-io16,SET,640,1,861761.79,861761.79,861761.79,3.023,4.447,11.685772871087796,['redis-io16/set-r1-c640.result.json']
+redis-io16,SET,960,1,902446.83,902446.83,902446.83,4.127,6.687,12.53129977596456,['arithmetic/redis-io16/set-r1-c960.result.json']
+redis-io16,SET,1280,3,919609.11,918059.41,920589.22,4.724333333333334,7.775,12.602630321481643,"['redis-io16/set-r3-c1280.result.json', 'redis-io16/set-r2-c1280.result.json', 'redis-io16/set-r1-c1280.result.json']"
+redis-io16,SET,1600,1,922551.98,922551.98,922551.98,5.343,9.215,12.768831646788673,['arithmetic/redis-io16/set-r1-c1600.result.json']
+redis-io16,SET,1920,3,931332.0333333333,926622.57,934525.78,5.961666666666666,11.732333333333333,13.065387948725363,"['arithmetic/redis-io16/set-r1-c1920.result.json', 'matrix/redis-io16/set-r1-c1920.result.json', 'matrix/redis-io16/set-r2-c1920.result.json']"
+redis-io16,SET,2240,1,910365.29,910365.29,910365.29,6.719,14.911,12.73657443471009,['arithmetic/redis-io16/set-r1-c2240.result.json']
+redis-io16,SET,2560,3,900988.7466666667,894899.83,906382.65,7.487,17.407,12.715756951005162,"['redis-io16/set-r3-c2560.result.json', 'redis-io16/set-r1-c2560.result.json', 'redis-io16/set-r2-c2560.result.json']"
+redis-io16,SET,2880,1,875854.57,875854.57,875854.57,8.767,20.735,12.538690346605438,['matrix/redis-io16/set-r1-c2880.result.json']
+redis-io16,SET,3200,1,849378.83,849378.83,849378.83,9.919,22.015,12.313170334894048,['matrix/redis-io16/set-r1-c3200.result.json']
+redis-io16,SET,3520,1,832607.46,832607.46,832607.46,11.135,25.855,12.096826750954701,['matrix/redis-io16/set-r1-c3520.result.json']
+redis-io16,SET,3840,1,806657.33,806657.33,806657.33,11.839,31.615,11.92779880188577,['matrix/redis-io16/set-r1-c3840.result.json']
+valkey-io16,GET,320,1,813560.7,813560.7,813560.7,1.111,2.479,10.315650251466364,['arithmetic/valkey-io16/get-r1-c320.result.json']
+valkey-io16,GET,640,1,892455.8,892455.8,892455.8,3.567,5.567,11.12575141865671,['valkey-io16/get-r1-c640.result.json']
+valkey-io16,GET,960,1,922368.07,922368.07,922368.07,4.015,6.847,12.057146808094078,['arithmetic/valkey-io16/get-r1-c960.result.json']
+valkey-io16,GET,1280,1,957124.35,957124.35,957124.35,4.447,8.191,12.340064424659632,['arithmetic/valkey-io16/get-r1-c1280.result.json']
+valkey-io16,GET,1600,1,971807.18,971807.18,971807.18,4.895,10.239,12.639236891422927,['arithmetic/valkey-io16/get-r1-c1600.result.json']
+valkey-io16,GET,1920,3,980075.5533333333,974430.39,986174.5,5.417666666666666,11.775,13.198410270436584,"['arithmetic/valkey-io16/get-r1-c1920.result.json', 'arithmetic/valkey-io16/get-r3-c1920.result.json', 'arithmetic/valkey-io16/get-r2-c1920.result.json']"
+valkey-io16,GET,2240,1,967271.33,967271.33,967271.33,6.047,14.463,12.810313910453564,['arithmetic/valkey-io16/get-r1-c2240.result.json']
+valkey-io16,GET,2560,1,960394.28,960394.28,960394.28,6.591,16.767,12.786986127108596,['arithmetic/valkey-io16/get-r1-c2560.result.json']
+valkey-io16,GET,2880,1,955730.75,955730.75,955730.75,7.263,19.711,12.813116619531156,['matrix/valkey-io16/get-r1-c2880.result.json']
+valkey-io16,GET,3200,1,932093.76,932093.76,932093.76,8.511,22.271,12.607109012275313,['matrix/valkey-io16/get-r1-c3200.result.json']
+valkey-io16,GET,3520,1,922827.96,922827.96,922827.96,9.535,23.039,12.62992115935899,['matrix/valkey-io16/get-r1-c3520.result.json']
+valkey-io16,GET,3840,1,891181.76,891181.76,891181.76,10.751,25.471,12.370296214354521,['matrix/valkey-io16/get-r1-c3840.result.json']
+valkey-io16,SET,320,1,669872.22,669872.22,669872.22,1.015,2.207,8.757390871849294,['arithmetic/valkey-io16/set-r1-c320.result.json']
+valkey-io16,SET,640,1,699190.21,699190.21,699190.21,2.815,6.111,9.055103231346454,['arithmetic/valkey-io16/set-r1-c640.result.json']
+valkey-io16,SET,960,1,721280.26,721280.26,721280.26,3.423,7.487,9.619594869513191,['arithmetic/valkey-io16/set-r1-c960.result.json']
+valkey-io16,SET,1280,1,737739.62,737739.62,737739.62,3.983,9.535,9.805126924081604,['arithmetic/valkey-io16/set-r1-c1280.result.json']
+valkey-io16,SET,1600,3,738389.75,730634.88,746853.95,4.223,12.052333333333333,9.986657824528802,"['arithmetic/valkey-io16/set-r1-c1600.result.json', 'arithmetic/valkey-io16/set-r3-c1600.result.json', 'arithmetic/valkey-io16/set-r2-c1600.result.json']"
+valkey-io16,SET,1920,3,738081.2533333333,728103.42,745089.87,4.863,15.167,10.117966301513677,"['arithmetic/valkey-io16/set-r1-c1920.result.json', 'arithmetic/valkey-io16/set-r2-c1920.result.json', 'arithmetic/valkey-io16/set-r3-c1920.result.json']"
+valkey-io16,SET,2240,3,742238.6799999999,733738.19,752820.82,5.620333333333334,17.279,10.156502393410037,"['arithmetic/valkey-io16/set-r1-c2240.result.json', 'matrix/valkey-io16/set-r1-c2240.result.json', 'matrix/valkey-io16/set-r2-c2240.result.json']"
+valkey-io16,SET,2560,1,712690.97,712690.97,712690.97,6.495,19.583,9.927683700322673,['arithmetic/valkey-io16/set-r1-c2560.result.json']
+valkey-io16,SET,2880,1,708045.84,708045.84,708045.84,7.391,21.759,10.01595118147046,['matrix/valkey-io16/set-r1-c2880.result.json']
+valkey-io16,SET,3200,1,676810.12,676810.12,676810.12,8.383,25.471,9.678595626182023,['matrix/valkey-io16/set-r1-c3200.result.json']
+valkey-io16,SET,3520,1,670435.75,670435.75,670435.75,9.791,26.879,9.775690897741347,['matrix/valkey-io16/set-r1-c3520.result.json']
+valkey-io16,SET,3840,1,661873.56,661873.56,661873.56,12.159,29.567,9.670298296976178,['matrix/valkey-io16/set-r1-c3840.result.json']

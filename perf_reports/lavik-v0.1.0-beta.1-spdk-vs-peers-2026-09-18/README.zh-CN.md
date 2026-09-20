@@ -18,7 +18,7 @@ limitations under the License.
 
 [English](README.md) | **简体中文**
 
-使用实际下载的标准 beta 发布包，在独立清盘重灌的数据集上测量 SPDK；报告包含新测的 22 个 Lavik 点，以及当天早些时候在相同主机上完成的 124 个竞品对照点。本报告不纳入 io_uring。
+下方原始测量使用实际下载的标准 beta 发布包，在独立清盘重灌的数据集上测量 SPDK；更高并发补测单独标注，使用当前优化分支。原始报告包含新测的 22 个 Lavik 点，以及当天早些时候在相同主机上完成的 124 个竞品对照点。本报告不纳入 io_uring。
 
 - 1000 万条 GET：SPDK 峰值 **1012.2k QPS**（640 连接），该点 p99 **3.599 ms**、p99.9 **5.631 ms**。
 - 1000 万条 SET：SPDK 峰值 **930.5k QPS**（1280 连接），该点 p99 **4.799 ms**、p99.9 **8.095 ms**。
@@ -26,6 +26,24 @@ limitations under the License.
 - 10 亿条 SET：SPDK 峰值 **764.9k QPS**（1280 连接），该点 p99 **10.879 ms**、p99.9 **16.639 ms**。
 
 ## 1000 万条：Redis / Valkey 内存组
+
+### 更高并发补测：当前优化分支
+
+本轮 Lavik 使用 [PR #124](https://github.com/eloqdata/lavik/pull/124) 的提交 [`8b7a11d`](https://github.com/eloqdata/lavik/commit/8b7a11d1c8c6d9ae8ceb52c4233571cd9dfb636e)，采用 SPDK、内核 TCP、默认 100 ms flush 和 16 个 worker；Redis、Valkey 均使用 16 个 I/O 线程。这是当前分支的结果，原 beta 发布包的数据保留在下方。
+
+![320 至 3840 连接的 GET、SET 吞吐量](higher-concurrency/throughput.png)
+
+| System | GET peak QPS (connections) | SET peak QPS (connections) |
+|---|---:|---:|
+| Lavik SPDK | 1,016,587 (960) | 951,893 (1280) |
+| Redis 8.8.0 · I/O=16 | 1,011,652 (2880) | 931,332 (1920) |
+| Valkey 9.1.0 · I/O=16 | 980,076 (1920) | 742,239 (2240) |
+
+三个系统的 GET、SET 均覆盖 320～3840、步长 320 的全部 12 个连接数。各峰值取三轮、每轮 30 秒的平均值。Redis GET 在 1280 连接后仍能提升，在 2880 连接达到 1,011,652 QPS；六条曲线均测到了峰值后的下降区间。Lavik 与 Redis 的 GET 峰值接近（相差约 0.5%），SET 在各自实测峰值处高约 2.2%。
+
+[完整数据、配置与绘图脚本](higher-concurrency/README.md) · [CSV](higher-concurrency/results.csv) · [SVG](higher-concurrency/throughput.svg)
+
+### 原 beta 发布包测量
 
 ![吞吐量](memory-qps.png)
 
