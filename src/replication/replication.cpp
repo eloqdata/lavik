@@ -8254,13 +8254,16 @@ auto ReplicationManager::ReplicationGroup::AckReplicaOnlineCommands(
     TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
     unsigned flow_id, const std::shared_ptr<ReplicaOnlineApplyState>& state)
     -> Task<absl::Status> {
-  auto send_ack = [&stream](std::uint64_t lsn) -> Task<absl::Status> {
-    std::string payload;
-    payload.reserve(10);
-    PutU16(payload, 0);
-    PutU64(payload, lsn);
-    co_return co_await WriteDataFrame(stream, DataFrameKind::kAck, payload);
-  };
+  // Keep one ACK frame per event and its exact LSN, but send already-ready
+  // completions together. This worker owns the queue and wire buffer. Never
+  // wait to fill a batch or hold earlier ACKs behind an incomplete transaction:
+  // sparse traffic and WAIT retain immediate progress without timers or locks.
+  std::string frames;
+  absl::Status reserved = ReserveReplicationString(
+      &frames, kBacklogBatchFrames * (kDataFrameHeaderBytes + 10));
+  if (!reserved.ok()) co_return reserved;
+  std::string payload;
+  payload.reserve(10);
 
   for (;;) {
     while (state->completions_.empty() && !state->stage_done_) {
@@ -8277,31 +8280,47 @@ auto ReplicationManager::ReplicationGroup::AckReplicaOnlineCommands(
       co_return absl::UnavailableError("replication flow staging queue closed");
     }
 
-    ReplicaOnlineCompletion pending = std::move(state->completions_.front());
-    state->completions_.pop_front();
-    state->completion_capacity_ready_.NotifyAll(*bycorf::ThisWorker().self_);
-    const bool transaction = pending.transaction_ != nullptr;
-    absl::Status applied = absl::OkStatus();
-    if (transaction) {
-      applied = co_await WaitForReplicaTransaction(pending.transaction_);
-    }
-    if (!applied.ok()) {
-      (void)co_await InvalidateReplicaContinuation(session);
-      co_return applied;
-    }
+    frames.clear();
+    std::size_t count = 0;
+    do {
+      ReplicaOnlineCompletion pending = std::move(state->completions_.front());
+      state->completions_.pop_front();
+      state->completion_capacity_ready_.NotifyAll(*bycorf::ThisWorker().self_);
+      const bool transaction = pending.transaction_ != nullptr;
+      absl::Status applied = absl::OkStatus();
+      if (transaction) {
+        applied = co_await WaitForReplicaTransaction(pending.transaction_);
+      }
+      if (!applied.ok()) {
+        (void)co_await InvalidateReplicaContinuation(session);
+        co_return applied;
+      }
 
-    // Every event publishes its cursor at apply completion. ACK is transport
-    // feedback only and must not overwrite a newer cursor after staging has
-    // advanced farther on this flow.
-    if (transaction && ShouldInjectFlowDropAfterTransaction(flow_id)) {
-      co_return absl::UnavailableError(
-          "injected replication flow disconnect after transaction");
-    }
-    if (!transaction && ShouldInjectFlowDropAfterCommandApply(flow_id)) {
-      co_return absl::UnavailableError(
-          "injected replication flow disconnect after command apply");
-    }
-    absl::Status acknowledged = co_await send_ack(pending.lsn_);
+      // Every event publishes its cursor at apply completion. ACK is transport
+      // feedback only and must not overwrite a newer cursor after staging has
+      // advanced farther on this flow.
+      if (transaction && ShouldInjectFlowDropAfterTransaction(flow_id)) {
+        co_return absl::UnavailableError(
+            "injected replication flow disconnect after transaction");
+      }
+      if (!transaction && ShouldInjectFlowDropAfterCommandApply(flow_id)) {
+        co_return absl::UnavailableError(
+            "injected replication flow disconnect after command apply");
+      }
+      payload.clear();
+      PutU16(payload, 0);
+      PutU64(payload, pending.lsn_);
+      absl::Status appended =
+          AppendDataFrame(&frames, DataFrameKind::kAck, payload);
+      if (!appended.ok()) co_return appended;
+      ++count;
+      // Flush before taking a transaction that may suspend, and whenever no
+      // completion is ready. No event is acknowledged before its apply proof.
+      if (state->completions_.empty() ||
+          state->completions_.front().transaction_ != nullptr)
+        break;
+    } while (count < kBacklogBatchFrames);
+    absl::Status acknowledged = co_await WriteText(stream, frames);
     if (!acknowledged.ok()) co_return acknowledged;
   }
 }
