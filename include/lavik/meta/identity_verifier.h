@@ -43,7 +43,7 @@ enum class MetaPrincipalRole : std::uint8_t {
 struct MetaPrincipalIdentity {
   std::string principal_;
   MetaPrincipalRole role_ = MetaPrincipalRole::kDataNode;
-  // Data-node id for kDataNode and decimal NuRaft server id for kMetaMember.
+  // Data-node id for kDataNode and decimal Raft server id for kMetaMember.
   // Operators have no bound subject id.
   std::string subject_id_;
   bool operator==(const MetaPrincipalIdentity&) const = default;
@@ -73,10 +73,10 @@ absl::StatusOr<MetaPrincipalIdentity> AuthenticateLocalOperator(
 absl::Status ValidateDataNodePrincipal(std::string_view node_id,
                                        std::string_view principal);
 
-// NuRaft persists this descriptor in srv_config::aux. It is the complete
-// advertised identity needed to authenticate transport and reconstruct the
-// committed Meta directory; the Raft endpoint remains in srv_config's native
-// endpoint field.
+// LMI1 is the C++ member/directory descriptor. The Go bridge carries its
+// decoded fields in committed Raft configuration contexts and snapshot
+// metadata. It is independent of the listener bind and must agree with the
+// identity store.
 struct MetaMemberIdentity {
   std::int32_t server_id_ = 0;
   std::string principal_;

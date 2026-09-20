@@ -561,6 +561,10 @@ struct RelocationSource {
   std::uint64_t block_id_ = 0;
   std::uint64_t allocation_epoch_ = 0;
   std::uint32_t record_offset_ = 0;
+  // Present only for an already-verified inline string whose immutable
+  // payload is copied unchanged. Relocation can reuse its CRC instead of
+  // scanning the destination bytes a second time; other writes compute it.
+  std::optional<std::uint32_t> verified_payload_checksum_ = std::nullopt;
 
   bool Matches(const RecordLocationCore& location) const noexcept {
     return location.block_id() == block_id_ &&
@@ -601,6 +605,9 @@ struct RecordIdentity {
   std::uint32_t entry_hash_ = 0;
   std::uint16_t partition_id_ = 0;
   std::uint8_t db_id_ = 0;
+  // Use the remaining padding byte to reject unrelated bucket slots without
+  // resolving their arena handles. The key digest is immutable across flush.
+  std::uint8_t entry_tag_ = 0;
 };
 
 static_assert(sizeof(RecordIdentity) == 96);
@@ -1858,6 +1865,16 @@ class StorageEngine::Impl {
       SetLatencyTrace* trace = nullptr,
       std::optional<std::uint16_t> routed_partition_id = std::nullopt,
       const MutationPrecondition* mutation_precondition = nullptr);
+
+  // Own the digest and optional key guard in the common SET frame. Ordinary
+  // SET avoids a wrapper coroutine allocation; pre-locked callers retain
+  // their existing guard and both paths take store state in the same order.
+  Task<absl::StatusOr<SetResult>> SetWithLockState(
+      std::uint8_t db_id, std::string_view key, Digest digest,
+      std::string_view value, SetOptions options, TxShardWrites* tx,
+      ReplicationCommandAppend* replication, SetLatencyTrace* trace,
+      std::optional<std::uint16_t> routed_partition_id,
+      const MutationPrecondition* mutation_precondition, bool acquire_key_lock);
 
   Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
@@ -3688,9 +3705,6 @@ class StorageEngine::Impl {
 
   bool IsActiveBlock(const WorkerStore& store,
                      std::uint64_t block_id) const noexcept;
-
-  bool IsDefragCandidate(const WorkerStore& store,
-                         std::uint64_t block_id) const noexcept;
 
   void MaybeQueueDefrag(WorkerStore& store, std::uint64_t block_id);
 

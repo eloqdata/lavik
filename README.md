@@ -120,8 +120,7 @@ sudo apt-get install -y git
 git clone https://github.com/eloqdata/lavik.git
 cd lavik
 ./scripts/install_build_deps.sh
-git submodule update --init bycorf third_party/mimalloc third_party/nuraft
-git -C third_party/nuraft submodule update --init asio
+git submodule update --init bycorf third_party/mimalloc
 git -C bycorf submodule update --init third_party/liburing third_party/abseil
 
 ./scripts/build_release.sh

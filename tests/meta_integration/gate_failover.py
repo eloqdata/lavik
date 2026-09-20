@@ -1369,18 +1369,31 @@ def run_controlled(meta_binary, data_binary, ctl, redis_cli, workdir,
 
 
 def run_full_fallback(meta_binary, data_binary, ctl, redis_cli, workdir,
-                      require_fault_hook):
+                      require_fault_hook, *, cut_disconnect=False):
     """A complete replica missing the direct parent completes destructive FULL."""
     del redis_cli
     fixture = FailoverFixture(
         meta_binary, data_binary, ctl, os.path.join(workdir, "full-fallback"),
-        require_fault_hook, pause_after_begin_ms=1)
+        require_fault_hook, pause_after_begin_ms=1,
+        data_workers=2 if cut_disconnect else 1)
     laggard = fixture.by_id[FOLLOWER]
+    counters = ("cut-counter-{foo}", "cut-counter-{user1000}")
+    if cut_disconnect:
+        laggard.environment = {**os.environ,
+            "LAVIK_REPLICATION_DROP_AFTER_FULLSYNC_CUT": "2"}
+        for node_id in (OWNER, CANDIDATE):
+            fixture.by_id[node_id].environment = {**os.environ,
+                "LAVIK_REPLICATION_PAUSE_FULLSYNC_BEFORE_CUT_MS": "1500"}
     paused = False
     try:
         fixture.start_created()
         key = "{failover-gate}full-fallback"
         fixture.seed_and_wait_for_replicas(key, "initial", (CANDIDATE, FOLLOWER))
+        if cut_disconnect:
+            assert [redis_call(fixture.by_id[OWNER], ["CLUSTER", "KEYSLOT", counter]) % 2
+                    for counter in counters] == [0, 1]
+            for counter in counters:
+                fixture.seed_and_wait_for_replicas(counter, "0", (CANDIDATE, FOLLOWER))
         with open(laggard.log_path, encoding="utf-8") as log:
             initial_fulls = log.read().count("durably invalidated system state")
         laggard.proc.send_signal(signal.SIGSTOP)
@@ -1428,6 +1441,18 @@ def run_full_fallback(meta_binary, data_binary, ctl, redis_cli, workdir,
         # owns term-1 Active and must now rebuild from the term-3 Owner.
         laggard.proc.send_signal(signal.SIGCONT)
         paused = False
+        if cut_disconnect:
+            def replacement_started():
+                with open(laggard.log_path, encoding="utf-8") as log:
+                    return log.read().count("durably invalidated system state") > initial_fulls
+            H.wait_until("replacement population admitted", 30, replacement_started)
+            for expected in range(1, 6):
+                for counter in counters:
+                    assert redis_call(fixture.by_id[owner], ["INCR", counter]) == expected
+            def cut_was_disconnected():
+                with open(laggard.log_path, encoding="utf-8") as log:
+                    return "injected disconnect after full-sync cut acknowledgement" in log.read()
+            H.wait_until("replacement FULL cut connection loss", 30, cut_was_disconnected)
         H.wait_until("old complete replica finishes FULL fallback", 45,
                      lambda: readonly_get(laggard, key) == "term-3")
         with open(laggard.log_path, encoding="utf-8") as log:
@@ -1438,6 +1463,10 @@ def run_full_fallback(meta_binary, data_binary, ctl, redis_cli, workdir,
             raise H.Failure("Owner rejected the post-FULL write")
         H.wait_until("rebuilt replica follows subsequent writes", 20,
                      lambda: readonly_get(laggard, key) == "after-full")
+        if cut_disconnect:
+            for counter in counters:
+                H.wait_until("replacement cut preserves exact-once counter", 20,
+                             lambda: readonly_get(laggard, counter) == "5")
         wait_ready(fixture, "FULL fallback restores cluster readiness")
         fixture.require_expected_processes_alive()
         H.log("trusted Active with missing parent completed FULL and resumed FOLLOW")
@@ -1694,7 +1723,7 @@ def run_live_leader_demotion(meta_binary, data_binary, ctl, redis_cli, workdir,
         follower_events_before = old_leader.log_tail(lines=2000).count(
             "[raft-cb] event=BecomeFollower")
 
-        # Freeze the quorum rather than killing the leader. NuRaft must revoke
+        # Freeze the quorum rather than killing the leader. Raft must revoke
         # its live leadership, and the leader-scoped Data publisher must close
         # and drain every authority session before CancelAndWait returns.
         for follower in followers:

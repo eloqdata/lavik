@@ -41,9 +41,9 @@
 #include "lavik/meta/failover.h"
 #include "lavik/meta/failover_reconciler.h"
 #include "lavik/meta/hash.h"
-#include "lavik/meta/nuraft_log_store.h"
 #include "lavik/meta/state_apply.h"
 #include "lavik/meta/state_machine.h"
+#include "support/meta_raft.h"
 #include "support/test_data_path.h"
 
 namespace {
@@ -2058,9 +2058,6 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   auto machine_or = meta::MetaStateMachine::Open(test_dir.string());
   ASSERT_TRUE(machine_or.ok()) << machine_or.status();
   auto machine = std::move(*machine_or);
-  auto wal_or = meta::NuraftLogStore::Open((test_dir / "wal").string());
-  ASSERT_TRUE(wal_or.ok()) << wal_or.status();
-  auto wal = std::move(*wal_or);
   std::uint64_t committed_index = 0;
   auto commit = [&](const meta::MetaCommand& command) {
     auto encoded = meta::MetaStateMachine::EncodeCommand(command);
@@ -2140,7 +2137,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   meta::MetaCoordinatorOptions coordinator_options;
   coordinator_options.foreign_executor_ = executor;
   auto coordinator = std::make_unique<meta::MetaCoordinator>(
-      nuraft::ptr<nuraft::raft_server>(nullptr), *machine, *wal, observations,
+      std::shared_ptr<lavik::meta::MetaRaft>(nullptr), *machine, observations,
       coordinator_options);
 
   std::atomic<std::int64_t> clock{900};
@@ -2234,7 +2231,6 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   runtime.WaitUntilStopped();
   EXPECT_EQ(runtime.exit_code(), 0);
   machine.reset();
-  wal.reset();
   std::filesystem::remove_all(test_dir, cleanup_error);
 }
 
@@ -2253,9 +2249,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   auto machine_or = meta::MetaStateMachine::Open(test_dir.string());
   ASSERT_TRUE(machine_or.ok()) << machine_or.status();
   auto machine = std::move(*machine_or);
-  auto wal_or = meta::NuraftLogStore::Open((test_dir / "wal").string());
-  ASSERT_TRUE(wal_or.ok()) << wal_or.status();
-  auto wal = std::move(*wal_or);
+
   std::uint64_t committed_index = 0;
   auto commit = [&](const meta::MetaCommand& command) {
     auto encoded = meta::MetaStateMachine::EncodeCommand(command);
@@ -2454,7 +2448,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   meta::MetaCoordinatorOptions coordinator_options;
   coordinator_options.foreign_executor_ = executor;
   auto coordinator = std::make_unique<meta::MetaCoordinator>(
-      nuraft::ptr<nuraft::raft_server>(nullptr), *machine, *wal, observations,
+      std::shared_ptr<lavik::meta::MetaRaft>(nullptr), *machine, observations,
       coordinator_options);
 
   std::atomic<std::int64_t> clock{900};
@@ -2561,7 +2555,6 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   runtime.WaitUntilStopped();
   EXPECT_EQ(runtime.exit_code(), 0);
   machine.reset();
-  wal.reset();
   std::filesystem::remove_all(test_dir, cleanup_error);
 }
 

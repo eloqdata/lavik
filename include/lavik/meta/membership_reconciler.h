@@ -23,11 +23,9 @@
 #include <vector>
 
 #include "lavik/meta/coordinator.h"
-#include "libnuraft/cluster_config.hxx"
+#include "lavik/meta/raft.h"
 
 namespace lavik::meta {
-
-class NuraftStateMgr;
 
 // Semantic configuration identity: election-time config log indices are not
 // membership changes. Preserve every peer attribute so recovery never turns a
@@ -54,10 +52,10 @@ struct MetaMembershipIntent {
   bool operator==(const MetaMembershipIntent&) const = default;
 };
 
-// Capture the committed NuRaft peer set, sorted by id. Unsupported global
+// Capture the committed Raft peer set, sorted by id. Unsupported global
 // configuration modes fail closed instead of being omitted from the intent.
 absl::StatusOr<std::vector<MetaMembershipPeer>> CaptureMembershipConfig(
-    const nuraft::ptr<nuraft::cluster_config>& config);
+    const std::shared_ptr<MetaRaftConfig>& config);
 // Reconciles the identity-store projection of a loaded config. Missing
 // bindings are legal only while the state manager's durable genesis marker is
 // active; one deterministic BindMetaMember effect is returned at a time.
@@ -77,16 +75,16 @@ absl::StatusOr<std::optional<MetaMembershipStep>> PlanMembershipStep(
     const MetaCommittedView&, const MetaOperationRecord&,
     const std::vector<MetaMembershipPeer>& config, std::uint32_t local_id);
 
-// Leader-owned membership workflow. Local NuRaft API entry runs on the
+// Leader-owned membership workflow. Local Raft API entry runs on the
 // proposal executor. Demotion joins that entry, not remote invite/leave
 // completion; callbacks retain only their own inert result storage.
 class MetaMembershipReconciler final : public MetaReconciler {
  public:
   MetaMembershipReconciler(bycorf::ForeignExecutor executor,
                            MetaProposalExecutor& proposals,
-                           nuraft::ptr<nuraft::raft_server> server,
-                           nuraft::ptr<MetaStateMachine> state_machine,
-                           nuraft::ptr<NuraftStateMgr> state_mgr,
+                           std::shared_ptr<MetaRaft> server,
+                           std::shared_ptr<MetaStateMachine> state_machine,
+
                            std::shared_ptr<MetaMembershipGate> gate);
   ~MetaMembershipReconciler() override;
   void Start(MetaLeaderContext&) override;

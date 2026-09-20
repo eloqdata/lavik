@@ -17,8 +17,6 @@
 #include "lavik/server.h"
 
 #include <mimalloc.h>
-#include <openssl/crypto.h>
-#include <openssl/sha.h>
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/resource.h>
@@ -70,6 +68,7 @@
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
 #include "lavik/monitor.h"
+#include "lavik/password_authenticator.h"
 #include "lavik/pubsub.h"
 #include "lavik/rdb.h"
 #include "lavik/replication.h"
@@ -520,32 +519,6 @@ enum class WaitResult {
   kStopped,
 };
 
-class PasswordAuthenticator {
- public:
-  explicit PasswordAuthenticator(std::string_view password)
-      : required_(!password.empty()) {
-    SHA256(reinterpret_cast<const unsigned char*>(password.data()),
-           password.size(), digest_.data());
-  }
-
-  bool required() const noexcept { return required_; }
-
-  bool Authenticate(std::string_view username,
-                    std::string_view password) const noexcept {
-    if (!required_) return username == "default";
-    std::array<unsigned char, SHA256_DIGEST_LENGTH> candidate{};
-    SHA256(reinterpret_cast<const unsigned char*>(password.data()),
-           password.size(), candidate.data());
-    const bool password_matches =
-        CRYPTO_memcmp(candidate.data(), digest_.data(), digest_.size()) == 0;
-    return username == "default" && password_matches;
-  }
-
- private:
-  bool required_ = false;
-  std::array<unsigned char, SHA256_DIGEST_LENGTH> digest_{};
-};
-
 bool ValidClientName(std::string_view name) {
   return std::none_of(name.begin(), name.end(), [](unsigned char c) {
     return c == 0 || std::isspace(c);
@@ -628,7 +601,8 @@ std::string_view ExecuteHello(const PasswordAuthenticator& authenticator,
   reply.AppendInteger(static_cast<long long>(std::min<std::uint64_t>(
       ctx.conn_id_, std::numeric_limits<long long>::max())));
   reply.AppendBulkString("mode");
-  reply.AppendBulkString(cluster::ClusterEnabled() ? "cluster" : "standalone");
+  reply.AppendBulkString(cluster::IsClusterClientMode() ? "cluster"
+                                                        : "standalone");
   reply.AppendBulkString("role");
   reply.AppendBulkString(
       replication != nullptr && replication->is_replica() ? "slave" : "master");
@@ -1302,47 +1276,74 @@ constexpr std::size_t kMaximumBatchedReplyBytes = 64 * 1024;
 
 struct PendingReplyBatch {
   std::string bytes_;
+  // Empty diagnostic vectors still occupy the connection coroutine frame and
+  // participate in every batch's lifetime; omit them when tracing is off.
+#if LAVIK_ENABLE_READ_LATENCY_TRACE
   std::vector<ReadLatencyTrace> read_traces_;
+#endif
+#if LAVIK_ENABLE_SET_LATENCY_TRACE
   std::vector<SetLatencyTrace> set_traces_;
+#endif
 
   bool empty() const noexcept { return bytes_.empty(); }
 
-  void Append(std::string_view bytes, ReadLatencyTrace read_trace = {},
-              SetLatencyTrace set_trace = {}) {
+  void Append(std::string_view bytes,
+              [[maybe_unused]] ReadLatencyTrace read_trace = {},
+              [[maybe_unused]] SetLatencyTrace set_trace = {}) {
     bytes_.append(bytes);
+#if LAVIK_ENABLE_READ_LATENCY_TRACE
     if (read_trace.request_start_ns_ != 0) {
       read_traces_.push_back(std::move(read_trace));
     }
+#endif
+#if LAVIK_ENABLE_SET_LATENCY_TRACE
     if (set_trace.request_start_ns_ != 0) {
       set_traces_.push_back(std::move(set_trace));
     }
+#endif
   }
 };
+
+#if !LAVIK_ENABLE_READ_LATENCY_TRACE && !LAVIK_ENABLE_SET_LATENCY_TRACE
+static_assert(sizeof(PendingReplyBatch) == sizeof(std::string));
+#endif
 
 Task<absl::Status> FlushReplyBatch(TcpStream& stream,
                                    PendingReplyBatch* batch) {
   if (batch->empty()) co_return absl::OkStatus();
 
+#if LAVIK_ENABLE_READ_LATENCY_TRACE
   for (ReadLatencyTrace& trace : batch->read_traces_) {
     trace.send_start_ns_ = ReadTraceNowNanos();
   }
+#endif
+#if LAVIK_ENABLE_SET_LATENCY_TRACE
   for (SetLatencyTrace& trace : batch->set_traces_) {
     trace.send_start_ns_ = SetTraceNowNanos();
   }
+#endif
   absl::Status status = co_await stream.WriteAll(std::span<const std::byte>(
       reinterpret_cast<const std::byte*>(batch->bytes_.data()),
       batch->bytes_.size()));
+#if LAVIK_ENABLE_READ_LATENCY_TRACE
   for (ReadLatencyTrace& trace : batch->read_traces_) {
     trace.send_complete_ns_ = ReadTraceNowNanos();
     RecordReadLatency(trace);
   }
+#endif
+#if LAVIK_ENABLE_SET_LATENCY_TRACE
   for (SetLatencyTrace& trace : batch->set_traces_) {
     trace.send_complete_ns_ = SetTraceNowNanos();
     RecordSetLatency(trace);
   }
+#endif
   batch->bytes_.clear();
+#if LAVIK_ENABLE_READ_LATENCY_TRACE
   batch->read_traces_.clear();
+#endif
+#if LAVIK_ENABLE_SET_LATENCY_TRACE
   batch->set_traces_.clear();
+#endif
   co_return status;
 }
 
@@ -1891,49 +1892,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       continue;
     }
 
-    if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "REPLCONF")) {
-      if (args.size() < 3 || (args.size() & 1U) == 0) {
-        const std::string_view encoded = ctx.reply_builder_.AppendError(
-            "ERR wrong number of arguments for 'replconf' command");
-        absl::Status written = co_await WriteOrBatchReply(
-            stream, encoded, !ready.empty(), &pending_replies);
-        if (!written.ok()) co_return written;
-        continue;
-      }
-      for (std::size_t index = 1; index + 1 < args.size(); index += 2) {
-        if (absl::EqualsIgnoreCase(args[index], "capa") &&
-            absl::EqualsIgnoreCase(args[index + 1], "eof")) {
-          ctx.redis_replica_eof_ = true;
-        }
-      }
-      const std::string_view encoded =
-          ctx.reply_builder_.AppendSimpleString("OK");
-      absl::Status written = co_await WriteOrBatchReply(
-          stream, encoded, !ready.empty(), &pending_replies);
-      if (!written.ok()) co_return written;
-      continue;
-    }
-
-    if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "PSYNC")) {
-      if (!ready.empty() || !input.View().empty() || !parser.idle()) {
-        co_return absl::InvalidArgumentError(
-            "PSYNC handshake must be an isolated command");
-      }
-      absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
-      if (!flushed.ok()) co_return flushed;
-      ConnectionClosed();
-      ctx.counted_as_client_ = false;
-      auto peer_address = stream.PeerAddress();
-      const std::string address =
-          peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
-      const bool tls = stream.IsTls();
-      UnregisterClientConnection(ctx.conn_id_);
-      command_memory.Release();
-      co_return co_await replication_->ServeRedisExportConnection(
-          stream, std::move(command.args_), ctx.conn_id_, address, tls,
-          ctx.redis_replica_eof_);
-    }
-
     if (ReplicationManager::IsNativeHandshake(command.args_)) {
       if (!ready.empty() || !input.View().empty() || !parser.idle()) {
         co_return absl::InvalidArgumentError(
@@ -2180,9 +2138,10 @@ int RunServer(ServerOptions options) {
   bycorf::FreezeIoBackends();
   spdlog::info("I/O backends: network={} storage={} rings=one-per-worker",
                options.network_backend_, options.storage_backend_);
-  // Cluster mode delegates population lifecycle to Meta/NodeControl and
+  // Meta management delegates population lifecycle to NodeControl and
   // disables standalone replication control and export.
-  options.replication_options_.cluster_enabled_ = options.cluster_enabled_;
+  options.replication_options_.meta_managed_ = options.meta_managed_;
+  cluster::SetClientMode(options.client_mode_);
   auto allowed_max_clients = MaxClientsAllowedByFileLimit(options.max_clients_);
   if (!allowed_max_clients.ok()) {
     spdlog::error("maxclients file-descriptor setup failed: {}",
@@ -2394,8 +2353,9 @@ int RunServer(ServerOptions options) {
   }
 
   storage::StorageEngineOptions storage_options;
-  storage_options.database_count_ =
-      options.cluster_enabled_ ? 1 : storage::kLogicalDatabaseCount;
+  storage_options.database_count_ = options.client_mode_ == ClientMode::kCluster
+                                        ? 1
+                                        : storage::kLogicalDatabaseCount;
   storage_options.data_files_ = std::move(options.data_files_);
   storage_options.reset_data_files_ = options.load_rdb_replace_;
   storage_options.shutdown_checkpoint_ = options.shutdown_checkpoint_;
@@ -2409,7 +2369,7 @@ int RunServer(ServerOptions options) {
   // A node configured with an upstream must not create local
   // expiration mutation sequences. It still hides expired values by their
   // absolute deadline and applies the primary's replicated tombstone.
-  storage_options.expiration_authority_ = !options.cluster_enabled_ &&
+  storage_options.expiration_authority_ = !options.meta_managed_ &&
                                           !options.replicaof_.has_value() &&
                                           !options.redis_replicaof_.has_value();
   storage_options.tomb_raider_interval_ms_ = options.tomb_raider_interval_ms_;
@@ -2445,10 +2405,10 @@ int RunServer(ServerOptions options) {
       options.replication_publish_queue_bytes_;
   options.replication_options_.redis_psync_ =
       options.redis_replicaof_.has_value();
-  if (options.cluster_enabled_) {
+  if (options.meta_managed_) {
     // The Meta session and native replication protocol must name the same
     // stable data node; boot and history incarnations remain manager-owned.
-    options.replication_options_.node_id_override_ = options.cluster_node_id_;
+    options.replication_options_.node_id_override_ = options.node_id_;
   }
   std::optional<ReplicaOfConfig> replication_upstream =
       options.redis_replicaof_.has_value() ? std::move(options.redis_replicaof_)
@@ -2469,13 +2429,13 @@ int RunServer(ServerOptions options) {
                 options.thread_count_, options.config_file_);
   tx::TxRuntime::Create(options.thread_count_);
 
-  // Redis Cluster data plane: install the process-wide runtime before any
+  // Meta control: install the process-wide runtime before any
   // listener accepts a client. It starts without serving topology and stays
   // fail-closed until Meta supplies an authenticated complete state. Storage
   // also starts unready, so non-whitelisted commands answer LOADING until
   // recovery completes.
   std::unique_ptr<cluster::MetaControlClientService> meta_control_client;
-  if (options.cluster_enabled_) {
+  if (options.meta_managed_) {
     std::unique_ptr<cluster::NodeControlActions> control_actions =
         cluster::CreateReplicationNodeControlActions(replication,
                                                      options.tls_replication_);
@@ -2484,24 +2444,23 @@ int RunServer(ServerOptions options) {
     // Announce-address defaults: an explicit announce ip wins; otherwise the
     // first non-wildcard bind address; a wildcard bind stays empty so
     // discovery self entries keep the "use the startup node" convention.
-    runtime->announce_ip_ = options.cluster_announce_ip_;
+    runtime->announce_ip_ = options.announce_ip_;
     if (runtime->announce_ip_.empty()) {
       const std::string& first_bind = options.bind_addresses_.front();
       const bool wildcard =
           first_bind == "*" || first_bind == "0.0.0.0" || first_bind == "::";
       if (!wildcard) runtime->announce_ip_ = first_bind;
     }
-    runtime->announce_port_ = options.cluster_announce_port_ != 0
-                                  ? options.cluster_announce_port_
-                                  : options.port_;
-    runtime->announce_tls_port_ = options.cluster_announce_tls_port_ != 0
-                                      ? options.cluster_announce_tls_port_
+    runtime->announce_port_ =
+        options.announce_port_ != 0 ? options.announce_port_ : options.port_;
+    runtime->announce_tls_port_ = options.announce_tls_port_ != 0
+                                      ? options.announce_tls_port_
                                       : options.tls_port_;
     cluster::InstallClusterRuntime(std::move(runtime));
     auto created = cluster::MetaControlClientService::Create(
         cluster::MetaControlClientOptions{
-            .seeds_ = options.cluster_meta_seeds_,
-            .node_id_ = options.cluster_node_id_,
+            .seeds_ = options.meta_seeds_,
+            .node_id_ = options.node_id_,
             .request_worker_count_ = options.thread_count_,
             .tls_context_ =
                 options.tls_replication_ ? tls_client_context : nullptr,

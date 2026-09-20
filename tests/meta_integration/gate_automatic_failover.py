@@ -324,7 +324,7 @@ def kill_logged_meta(fixture, marker, timeout=40):
     paused.kill9()
     # rediscover_leader is an election-race helper for an already elected
     # cluster and intentionally probes each seed once. Here the old leader was
-    # just killed, so wait through NuRaft's failure detector and election.
+    # just killed, so wait through Raft's failure detector and election.
     fixture.leader = H.find_leader(
         [meta for meta in fixture.metas if meta.id != paused.id], timeout=20)
     return paused

@@ -713,9 +713,12 @@ int main(int argc, char** argv) {
       }
 
       // Reapable: the only older record expires on its own, after which
-      // nothing on disk needs the tombstone.
-      Expect(client.Command({"SET", "reapable", "v", "PX", "100"}), "+OK",
-             "reapable SET");
+      // nothing on disk needs the tombstone. Leave room for CI scheduling
+      // delays between SET and DEL so expiration does not win the deletion.
+      constexpr auto reapable_ttl = 5000ms;
+      const std::string reapable_ttl_ms = std::to_string(reapable_ttl.count());
+      Expect(client.Command({"SET", "reapable", "v", "PX", reapable_ttl_ms}),
+             "+OK", "reapable SET");
       Expect(client.Command({"DEL", "reapable"}), ":1", "reapable DEL");
       // Not reapable: the buried value never expires, so the tombstone is
       // the only thing standing between it and resurrection.
@@ -727,7 +730,7 @@ int main(int argc, char** argv) {
       // Let the buried TTL lapse, then require a round that started after
       // that: its sweep must see the value as expired and reap exactly the
       // one tombstone.
-      std::this_thread::sleep_for(200ms);
+      std::this_thread::sleep_for(reapable_ttl + 100ms);
       long long rounds = AwaitRoundBeyond(client, 0);
       rounds = AwaitRoundBeyond(client, rounds);
       const auto deadline = std::chrono::steady_clock::now() + 30s;

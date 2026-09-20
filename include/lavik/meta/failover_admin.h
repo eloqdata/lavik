@@ -18,7 +18,7 @@
 
 // Raft-free wire model for the dedicated controlled-failover operator entry.
 // The Admin server translates this bounded request into the durable
-// FailoverOperationIntent; clients do not depend on Meta stores or NuRaft.
+// FailoverOperationIntent; clients do not depend on Meta stores or Raft.
 
 #include <chrono>
 #include <cstdint>

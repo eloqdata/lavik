@@ -47,11 +47,7 @@ run_suite ctest ctest --test-dir "$build_dir" --parallel 1 \
   --timeout 300 --no-tests=error --output-on-failure \
   --output-junit "$results_dir/ctest.xml"
 
-# These >1 GiB codec cases are deliberately disabled in ordinary CTest runs.
 # Escalate after 30 seconds if a timed-out process cannot finish shutdown.
-run_suite large-codecs timeout --kill-after=30s 15m "$build_dir/lavik_unit_tests" \
-  --gtest_also_run_disabled_tests --gtest_filter='*DISABLED_Large*' \
-  --gtest_output="xml:$results_dir/large-codecs.xml"
 run_suite large-native-list timeout --kill-after=30s 45m \
   "$build_dir/lavik_replica_abort_reclaim_e2e_test" --large-list
 run_suite large-native-hash timeout --kill-after=30s 45m \

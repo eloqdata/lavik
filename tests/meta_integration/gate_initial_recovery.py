@@ -23,10 +23,7 @@ import harness as H  # noqa: E402
 
 
 def bindings_complete(node):
-    return (os.path.exists(os.path.join(
-                node.data_dir, "initial_bindings_complete.dat")) and
-            not os.path.exists(os.path.join(
-                node.data_dir, "initial_bindings.dat")))
+    return node.status()["initial_bindings_pending"] == "0"
 
 
 def prove_write(nodes, leader, value):
@@ -34,9 +31,12 @@ def prove_write(nodes, leader, value):
     if not reply.startswith("OK "):
         raise H.Failure(f"proposal failed: {reply}")
     H.wait_cluster_committed(nodes, int(reply[3:]), timeout=20)
+    # Commit visibility does not fence the follower's asynchronous apply.
     for node in nodes:
-        if node.getop(operation_id) != f"OK completed {value}":
-            raise H.Failure(f"node {node.id} did not apply {value}")
+        H.wait_until(
+            f"node {node.id} applies operation {operation_id} ({value})", 20,
+            lambda node=node: node.alive()
+            and node.getop(operation_id) == f"OK completed {value}")
 
 
 def start_with_crash(node, point):
@@ -160,8 +160,7 @@ def main():
         run_case(binary, workdir, snapshot=False)
         run_case(binary, workdir, snapshot=True)
         if has_crash_hooks(binary):
-            for point in ("before-membership", "after-candidate", "after-config",
-                          "after-baseline", "after-completion"):
+            for point in ("before-membership", "after-file", "after-marker"):
                 run_case(binary, workdir, snapshot=True,
                          crash_point=f"meta-snapshot-{point}")
         else:

@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <set>
@@ -43,76 +44,6 @@ struct ScopedEnvironment {
   const char* name_;
   std::optional<std::string> old_;
 };
-
-// This uses the real diskless PSYNC exporter, not the native replication
-// transport. Keep only a possible EOF-token prefix between reads; the target
-// subsequently consumes the captured file through its ordinary RDB importer.
-void CapturePsyncRdb(std::uint16_t port, const std::string& path) {
-  const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  Check(fd >= 0, "PSYNC socket failed");
-  struct CloseFd {
-    int fd;
-    ~CloseFd() { ::close(fd); }
-  } close{fd};
-  sockaddr_in address{.sin_family = AF_INET,
-                      .sin_port = htons(port),
-                      .sin_addr = {.s_addr = htonl(INADDR_LOOPBACK)}};
-  Check(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ==
-            0,
-        "PSYNC connect failed");
-  timeval timeout{.tv_sec = 45};
-  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-  auto send = [&](std::string_view bytes) {
-    while (!bytes.empty()) {
-      const auto n = ::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
-      if (n < 0 && errno == EINTR) continue;
-      Check(n > 0, "PSYNC send failed");
-      bytes.remove_prefix(n);
-    }
-  };
-  auto line = [&]() {
-    std::string value;
-    while (!value.ends_with("\r\n")) {
-      char next;
-      const auto n = ::recv(fd, &next, 1, 0);
-      if (n < 0 && errno == EINTR) continue;
-      Check(n == 1 && value.size() < 512, "PSYNC response header failed");
-      value.push_back(next);
-    }
-    value.resize(value.size() - 2);
-    return value;
-  };
-  send("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$3\r\neof\r\n");
-  Check(line() == "+OK", "PSYNC EOF capability rejected");
-  send("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n");
-  Check(line().starts_with("+FULLRESYNC "), "PSYNC full sync rejected");
-  const auto header = line();
-  Check(header.starts_with("$EOF:") && header.size() == 45,
-        "PSYNC EOF framing malformed");
-  const auto marker = header.substr(5);
-  std::ofstream file(path, std::ios::binary | std::ios::trunc);
-  Check(file.good(), "PSYNC capture file failed");
-  std::array<char, 256 * 1024> buffer;
-  std::string pending;
-  for (;;) {
-    const auto n = ::recv(fd, buffer.data(), buffer.size(), 0);
-    if (n < 0 && errno == EINTR) continue;
-    Check(n > 0, "PSYNC RDB ended before marker");
-    pending.append(buffer.data(), n);
-    if (const auto end = pending.find(marker); end != std::string::npos) {
-      file.write(pending.data(), end);
-      file.close();
-      Check(file.good(), "PSYNC capture write failed");
-      return;
-    }
-    if (pending.size() >= marker.size()) {
-      const auto bytes = pending.size() - marker.size() + 1;
-      file.write(pending.data(), bytes);
-      Check(file.good(), "PSYNC capture write failed");
-      pending.erase(0, bytes);
-    }
-  }
-}
 
 TEST(GroupedRdbStreamE2e, FourTypesMultiPageLargeItemsAndMultipleWorkers) {
   PrivateDisk disk;
@@ -591,10 +522,10 @@ TEST(GroupedRdbStreamE2e, StartupImportStreamsPagesAndSortsUnorderedZsetInput) {
   ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
-TEST(GroupedRdbStreamE2e, DisklessPsyncStreamsFourTypesThenImportsAndRestarts) {
+TEST(GroupedRdbStreamE2e, BackupStreamsFourTypesThenImportsAndRestarts) {
   PrivateDisk source_disk;
   PrivateDisk target_disk;
-  const std::string input = target_disk.path() + ".psync.rdb";
+  const std::string input = target_disk.path() + ".backup.rdb";
   struct RemoveInput {
     const std::string& path;
     ~RemoveInput() { ::unlink(path.c_str()); }
@@ -633,7 +564,17 @@ TEST(GroupedRdbStreamE2e, DisklessPsyncStreamsFourTypesThenImportsAndRestarts) {
           writer.Command({"SET", "plain-" + std::to_string(n), "v"}).text_,
           "OK");
     writer.Durable();
-    ASSERT_NO_THROW(CapturePsyncRdb(source.port(), input)) << source.Log();
+    ASSERT_EQ(writer.Command({"BGSAVE"}).kind_, '+');
+    const auto backup_deadline = std::chrono::steady_clock::now() + 45s;
+    while (source.Log().find("RDB backup completed:") == std::string::npos &&
+           std::chrono::steady_clock::now() < backup_deadline)
+      std::this_thread::sleep_for(10ms);
+    ASSERT_NE(source.Log().find("RDB backup completed:"), std::string::npos)
+        << source.Log();
+    // Server teardown removes its default dump. Retain the import input
+    // independently so the target can start after the source has stopped.
+    ASSERT_NO_THROW(
+        std::filesystem::rename(source_disk.path() + ".rdb", input));
     auto reader = lavik::rdb::FileReader::Open(input);
     ASSERT_TRUE(reader.ok()) << reader.status();
     unsigned keys = 0;

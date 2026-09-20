@@ -119,14 +119,9 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(
     SetLatencyTrace* trace, std::optional<std::uint16_t> routed_partition_id,
     const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
-  const Digest digest = ComputeDigest(key);
-  if (trace != nullptr) trace->key_lock_start_ns_ = SetTraceNowNanos();
-  auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
-  if (trace != nullptr) trace->key_lock_acquired_ns_ = SetTraceNowNanos();
-  co_return co_await SetLocked(db_id, key, digest, value, options, nullptr,
-                               replication, trace, routed_partition_id,
-                               mutation_precondition);
+  return SetWithLockState(db_id, key, ComputeDigest(key), value, options,
+                          nullptr, replication, trace, routed_partition_id,
+                          mutation_precondition, true);
 }
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
@@ -135,7 +130,31 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
     ReplicationCommandAppend* replication, SetLatencyTrace* trace,
     std::optional<std::uint16_t> routed_partition_id,
     const MutationPrecondition* mutation_precondition) {
+  return SetWithLockState(db_id, key, digest, value, options, tx, replication,
+                          trace, routed_partition_id, mutation_precondition,
+                          false);
+}
+
+Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
+    std::uint8_t db_id, std::string_view key, Digest digest,
+    std::string_view value, SetOptions options, TxShardWrites* tx,
+    ReplicationCommandAppend* replication, SetLatencyTrace* trace,
+    std::optional<std::uint16_t> routed_partition_id,
+    const MutationPrecondition* mutation_precondition, bool acquire_key_lock) {
   assert(db_id < kLogicalDatabaseCount);
+  if (acquire_key_lock && trace != nullptr) {
+    trace->key_lock_start_ns_ = SetTraceNowNanos();
+  }
+  // Keep the key guard in the writer's frame, before its store-state guard,
+  // so it still outlives every append wait and the final store-state unlock.
+  // Transaction callers already own this guard and must not reacquire it.
+  auto key_lock = acquire_key_lock ? co_await tx::CurrentTxShard().AcquireKey(
+                                         db_id, tx::FingerprintOf(digest),
+                                         tx::LockMode::kExclusive)
+                                   : tx::TxShard::Guard{};
+  if (acquire_key_lock && trace != nullptr) {
+    trace->key_lock_acquired_ns_ = SetTraceNowNanos();
+  }
   WorkerStore& store = CurrentStore();
   // The route hint is produced from this exact key immediately before the
   // cross-core handoff. Debug builds recheck that contract; optimized builds
@@ -150,14 +169,22 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
   if (trace != nullptr) trace->store_lock_acquired_ns_ = SetTraceNowNanos();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
 
-  auto& index = partition.indexes_[db_id];
-  auto* found = index.Find(digest, key);
-  if (found != nullptr && !found->key_complete()) [[unlikely]] {
-    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
-    if (!resolved.ok()) {
-      co_return resolved.status();
+  RecordIndex::Entry* found = nullptr;
+  // Only options that observe the old value need a pre-append lookup. The
+  // writer resolves the current entry after preparing its append block anyway
+  // (preparation may release store state), and owns replacement accounting,
+  // WATCH invalidation, and retirement for unconditional writes of any type.
+  if (options.condition_ != SetCondition::kNone || options.keep_ttl_ ||
+      options.return_old_value_) {
+    auto& index = partition.indexes_[db_id];
+    found = index.Find(digest, key);
+    if (found != nullptr && !found->key_complete()) [[unlikely]] {
+      auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+      if (!resolved.ok()) {
+        co_return resolved.status();
+      }
+      found = *resolved;
     }
-    found = *resolved;
   }
   bool exists = found != nullptr && found->value_.kind() == RecordKind::kValue;
   // Expiry metadata is out-of-line and uncommon in the no-TTL workload. Do
@@ -2545,7 +2572,8 @@ acquire_active_stream:
               : FixedBuffer{.data_ = heap_buffer,
                             .size_ = options_.buffers_.write_buffer_bytes_,
                             .index_ = 0};
-      if (staging_buffer.data_ == nullptr || staging_buffer.size_ == 0) {
+      if (staging_buffer.data_ == nullptr ||
+          staging_buffer.size_ < kBlockHeaderBytes) {
         if (write_buffer_id != 0) {
           store.buffers_.ReleaseWriteBuffer(write_buffer_id);
         } else {
@@ -2557,7 +2585,13 @@ acquire_active_stream:
                                "active write staging allocation is invalid");
       }
       const std::uint64_t block_id = allocated->block_id_;
-      std::fill_n(staging_buffer.data_, staging_buffer.size_, std::byte{0});
+      // A recycled buffer may contain valid headers from another block. Both
+      // slots must start zero for the first flush's stale-header protection.
+      // Appends initialize every record byte (including alignment padding),
+      // and flush initializes its page tail before writing only the committed
+      // prefix. Clearing the rest of the buffer would rewrite those bytes
+      // twice.
+      std::fill_n(staging_buffer.data_, kBlockHeaderBytes, std::byte{0});
       active_stream() = ActiveBlock{
           .block_id_ = block_id,
           .writer_id_ = writer_id,
@@ -2999,8 +3033,17 @@ acquire_active_stream:
   if (!value.empty()) {
     std::memcpy(payload_output, value.data(), value.size());
   }
-  record.payload_checksum_ = Crc32c(std::span<const std::byte>(
-      staging.data_ + record_offset + record_header_bytes, payload_bytes));
+  assert(relocation == nullptr ||
+         !relocation->verified_payload_checksum_.has_value() ||
+         (kind == RecordKind::kValue && value_type == ValueType::kString &&
+          !external && !key_external && !auxiliary && !grouped_root));
+  record.payload_checksum_ =
+      relocation != nullptr &&
+              relocation->verified_payload_checksum_.has_value()
+          ? *relocation->verified_payload_checksum_
+          : Crc32c(std::span<const std::byte>(
+                staging.data_ + record_offset + record_header_bytes,
+                payload_bytes));
   if (!EncodeRecordHeader(record, key, record_output)) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "record checksum encoding failed");
@@ -3198,6 +3241,7 @@ acquire_active_stream:
       .partition_id_ =
           partition_ptr == nullptr ? std::uint16_t{0} : partition_ptr->id_,
       .db_id_ = db_id,
+      .entry_tag_ = RecordIndex::AddressTag(digest),
   });
   if (tx != nullptr && tx->collect_undo_ && inserted_entry != nullptr) {
     TxUndoLog& undo = store.tx_undo_[txid];
@@ -3312,7 +3356,16 @@ acquire_active_stream:
   // protected by RelocationDurabilityFence, and the defrag pass needs the
   // decrement to observe the block emptying within the same pass.
   if (for_defrag && !defer_defrag_retirement && previous.has_value()) {
-    absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(*previous));
+    // The local retirement cannot suspend. Match flush settlement's direct
+    // owner-local path instead of allocating a child coroutine for every
+    // relocated record; foreign block owners still use the existing handoff.
+    const RetiredRecord retired = RetiredRecordOf(*previous);
+    absl::Status dead;
+    if (retired.block_owner_ == store.worker_->id()) {
+      dead = MarkRecordDeadLocal(retired.block_owner_, retired);
+    } else {
+      dead = co_await MarkRecordDead(retired);
+    }
     if (!dead.ok()) {
       LatchRuntimeFailure(store);
       co_return dead;

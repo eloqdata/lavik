@@ -493,8 +493,8 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       // applies to the replacement entry's own location.
       RecordIndex& index = PartitionFor(*store, identity.partition_id_)
                                .indexes_[identity.db_id_];
-      RecordIndex::Entry* current_entry =
-          index.FindAddress(identity.entry_address_, identity.entry_hash_);
+      RecordIndex::Entry* current_entry = index.FindAddress(
+          identity.entry_address_, identity.entry_hash_, identity.entry_tag_);
       if (current_entry == nullptr) {
         continue;
       }

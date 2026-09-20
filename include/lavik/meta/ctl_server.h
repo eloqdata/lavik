@@ -17,7 +17,7 @@
 #pragma once
 
 // MetaCtlServer: authorized line-protocol administration and observation
-// surface of lavik-meta, served on its Bycorf control worker. NuRaft's Asio
+// surface of lavik-meta, served on its Bycorf control worker. Raft's Go
 // peer transport has an independent runtime.
 //
 // Local administration defaults to a mode-0600 AF_UNIX socket and derives
@@ -40,7 +40,7 @@
 //                             apply consumed the index but refused the
 //                             command; "ERR not-leader" on a follower;
 //                             otherwise "ERR <code>" (replication timeout is
-//                             NuRaft's client_req_timeout_).
+//                             Raft's client_req_timeout_).
 //   completeop <id32hex> [<result>]
 //                          -> propose CompleteOperation with the record's
 //                             current committed revision as the CAS token;
@@ -128,7 +128,7 @@
 //   addsrv <id> <raft-ip:port> <data-control-ip:port> <ctl-ip:port>
 //          [<lavik://meta/id>]
 //                          -> persists a membership workflow before binding
-//                             identity or invoking NuRaft. "OK" means the
+//                             identity or invoking Raft. "OK" means the
 //                             exact configuration and identity are committed.
 //                             A wait timeout returns uncertain-outcome with
 //                             an operation id; the leader keeps retrying.
@@ -233,22 +233,13 @@
 #include "lavik/meta/cluster_status.h"
 #include "lavik/meta/committed_status_view.h"
 #include "lavik/meta/data_control_runtime_status.h"
-// NuRaft's headers are not -Wpedantic-clean.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#include "libnuraft/ptr.hxx"
-#pragma GCC diagnostic pop
+#include "lavik/meta/raft.h"
 
 namespace bycorf {
 struct Connection;
 class TcpStream;
 class Worker;
 }  // namespace bycorf
-
-namespace nuraft {
-class raft_server;
-}  // namespace nuraft
 
 namespace lavik::meta {
 
@@ -264,7 +255,7 @@ class MetaStateMachine;
 namespace detail {
 
 // Pure representation of both sides of the server's clusterstatus bracket.
-// Keeping comparison free of NuRaft calls makes every invalidating transition
+// Keeping comparison free of Raft calls makes every invalidating transition
 // directly testable while the capture path remains the sole owner of reads.
 struct MetaClusterStatusBracket {
   bool is_leader_ = false;
@@ -397,8 +388,8 @@ class MetaCtlServer {
 
   static absl::StatusOr<std::shared_ptr<MetaCtlServer>> Create(
       bycorf::ForeignExecutor foreign_executor,
-      nuraft::ptr<nuraft::raft_server> server,
-      nuraft::ptr<MetaStateMachine> state_machine,
+      std::shared_ptr<MetaRaft> server,
+      std::shared_ptr<MetaStateMachine> state_machine,
       std::shared_ptr<MetaCoordinator> coordinator,
       std::shared_ptr<MetaObservationStore> obs_store,
       // Non-owning: process assembly must keep the executor alive until the

@@ -18,6 +18,12 @@
 
 #include <mimalloc.h>
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -1355,29 +1361,27 @@ class ScanHashMap {
   // use the returned live pointer rather than reconstructing one from address.
   const Entry* FindAddress(std::uintptr_t address,
                            std::uint32_t hash) const noexcept {
-    if (address == 0) {
-      return nullptr;
-    }
-    const int tables = Rehashing() ? 2 : 1;
-    for (int t = 0; t < tables; ++t) {
-      const Table& table = tables_[t];
-      if (!table.buckets_) {
-        continue;
-      }
-      const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
-      while (bucket != nullptr) {
-        for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
-          if (Occupied(*bucket, slot)) {
-            const Entry* entry = Resolve(bucket->entries_[slot]);
-            if (reinterpret_cast<std::uintptr_t>(entry) == address) {
-              return entry;
-            }
-          }
-        }
-        bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
-      }
-    }
-    return nullptr;
+    return FindAddressImpl<false>(address, hash, 0);
+  }
+
+  // Optional bucket fingerprint for FindAddress. Capture it from the same
+  // immutable key digest as AddressHash while the entry is still live.
+  static std::uint8_t AddressTag(const Digest& digest) noexcept {
+    return HashTag(Hash(digest));
+  }
+
+  Entry* FindAddress(std::uintptr_t address, std::uint32_t hash,
+                     std::uint8_t tag) noexcept {
+    return const_cast<Entry*>(
+        std::as_const(*this).FindAddress(address, hash, tag));
+  }
+
+  // Like the address-only overload, but rejects unrelated bucket slots before
+  // resolving arena handles. A matching tag is only a filter: address equality
+  // and the caller's version checks are still required, including after reuse.
+  const Entry* FindAddress(std::uintptr_t address, std::uint32_t hash,
+                           std::uint8_t tag) const noexcept {
+    return FindAddressImpl<true>(address, hash, tag);
   }
 
   // Updates an entry without changing its address when the policy-selected
@@ -2050,6 +2054,54 @@ class ScanHashMap {
     return static_cast<std::uint8_t>(hash >> 56);
   }
 
+  // Fingerprints only reject candidates. Erased slots retain their old tag,
+  // and live keys can collide, so callers still check occupancy and key
+  // equality. Low-to-high iteration preserves candidate/predicate ordering.
+  // Keep the mask in a full integer register instead of narrowing and then
+  // zero-extending it before each bit scan.
+  static std::uint32_t MatchingTags(const Bucket& bucket,
+                                    std::uint8_t tag) noexcept {
+    static_assert(kEntriesPerBucket == 12);
+    static_assert(offsetof(Bucket, hashes_) == 0);
+    static_assert(alignof(Bucket) >= 16);
+    [[maybe_unused]] constexpr unsigned kTagBits =
+        (1U << kEntriesPerBucket) - 1;
+#if defined(__SSE2__)
+    // Load from the complete bucket object: the last four bytes belong to
+    // the first handle, not the fingerprint array, and must be masked out.
+    // This remains within the object even for the final allocated bucket.
+    // Preserve the bucket alignment through memcpy so the compare can fold
+    // the bucket read into its memory operand.
+    __m128i bytes;
+    std::memcpy(&bytes, std::assume_aligned<alignof(Bucket)>(&bucket),
+                sizeof(bytes));
+    return static_cast<std::uint32_t>(
+        _mm_movemask_epi8(
+            _mm_cmpeq_epi8(bytes, _mm_set1_epi8(static_cast<char>(tag)))) &
+        kTagBits);
+#elif defined(__ARM_NEON)
+    const uint8x16_t bytes =
+        vld1q_u8(reinterpret_cast<const std::uint8_t*>(&bucket));
+    const uint8x16_t equal = vceqq_u8(bytes, vdupq_n_u8(tag));
+    // Each half has distinct bit weights, so pairwise widening sums produce
+    // two eight-bit masks without carries between fingerprint positions.
+    constexpr std::uint8_t weights[16] = {1, 2, 4, 8, 16, 32, 64, 128,
+                                          1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t bits = vandq_u8(equal, vld1q_u8(weights));
+    const uint64x2_t masks = vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(bits)));
+    return static_cast<std::uint32_t>(
+        (vgetq_lane_u64(masks, 0) | (vgetq_lane_u64(masks, 1) << 8)) &
+        kTagBits);
+#else
+    std::uint32_t matches = 0;
+    for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+      matches |= static_cast<std::uint32_t>(
+          static_cast<unsigned>(bucket.hashes_[slot] == tag) << slot);
+    }
+    return matches;
+#endif
+  }
+
   static std::uint64_t EntryHash(const Entry& entry) noexcept {
     return Hash(entry.key_complete() ? ComputeDigest(entry.key())
                                      : entry.external_key_digest());
@@ -2316,22 +2368,72 @@ class ScanHashMap {
     return AssignRehashDestinations(target, target_indexes, plan);
   }
 
+  // Consume the primary bucket's fingerprint mask before considering the
+  // overflow chain. Keeping that continuation out of line avoids preserving
+  // a broadcast vector across key-comparison calls on the first-bucket path.
+  // Collisions, empty slots and chain order keep their ordinary checks.
+  [[gnu::always_inline]] Entry* FindInBucket(Bucket& bucket,
+                                             const Digest& digest,
+                                             std::string_view key,
+                                             std::uint8_t tag) {
+    for (std::uint32_t matches = MatchingTags(bucket, tag); matches != 0;
+         matches &= matches - 1) {
+      const std::size_t slot = std::countr_zero(matches);
+      if (Occupied(bucket, slot)) {
+        Entry* entry = Resolve(bucket.entries_[slot]);
+        if (KeyEquals(*entry, digest, key)) return entry;
+      }
+    }
+    return nullptr;
+  }
+
+  [[gnu::noinline]] Entry* FindInBucketChain(Table& table, Bucket* bucket,
+                                             const Digest& digest,
+                                             std::string_view key) {
+    const std::uint8_t tag = HashTag(Hash(digest));
+    do {
+      if (Entry* found = FindInBucket(*bucket, digest, key, tag)) return found;
+      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
+    } while (bucket != nullptr);
+    return nullptr;
+  }
+
   Entry* FindInTable(Table& table, const Digest& digest, std::string_view key,
                      std::uint64_t hash) {
-    if (!table.buckets_) {
-      return nullptr;
-    }
+    if (!table.buckets_) return nullptr;
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
-    while (bucket != nullptr) {
-      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
-        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
-          Entry* entry = Resolve(bucket->entries_[slot]);
-          if (KeyEquals(*entry, digest, key)) return entry;
-        }
+    if (Entry* found = FindInBucket(*bucket, digest, key, tag)) return found;
+    return Chained(*bucket)
+               ? FindInBucketChain(table, Child(table, bucket), digest, key)
+               : nullptr;
+  }
+
+  [[gnu::always_inline]] const Entry* FindInBucket(const Bucket& bucket,
+                                                   const Digest& digest,
+                                                   std::string_view key,
+                                                   std::uint8_t tag) const {
+    for (std::uint32_t matches = MatchingTags(bucket, tag); matches != 0;
+         matches &= matches - 1) {
+      const std::size_t slot = std::countr_zero(matches);
+      if (Occupied(bucket, slot)) {
+        const Entry* entry = Resolve(bucket.entries_[slot]);
+        if (KeyEquals(*entry, digest, key)) return entry;
       }
-      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
     }
+    return nullptr;
+  }
+
+  [[gnu::noinline]] const Entry* FindInBucketChain(const Table& table,
+                                                   const Bucket* bucket,
+                                                   const Digest& digest,
+                                                   std::string_view key) const {
+    const std::uint8_t tag = HashTag(Hash(digest));
+    do {
+      if (const Entry* found = FindInBucket(*bucket, digest, key, tag))
+        return found;
+      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
+    } while (bucket != nullptr);
     return nullptr;
   }
 
@@ -2340,14 +2442,40 @@ class ScanHashMap {
     if (!table.buckets_) return nullptr;
     const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
-    while (bucket != nullptr) {
-      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
-        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
-          const Entry* entry = Resolve(bucket->entries_[slot]);
-          if (KeyEquals(*entry, digest, key)) return entry;
-        }
+    if (const Entry* found = FindInBucket(*bucket, digest, key, tag))
+      return found;
+    return Chained(*bucket)
+               ? FindInBucketChain(table, Child(table, bucket), digest, key)
+               : nullptr;
+  }
+
+  template <bool FilterTag>
+  const Entry* FindAddressImpl(std::uintptr_t address, std::uint32_t hash,
+                               std::uint8_t tag) const noexcept {
+    if (address == 0) {
+      return nullptr;
+    }
+    const int tables = Rehashing() ? 2 : 1;
+    for (int t = 0; t < tables; ++t) {
+      const Table& table = tables_[t];
+      if (!table.buckets_) {
+        continue;
       }
-      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
+      const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+      while (bucket != nullptr) {
+        for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+          if (Occupied(*bucket, slot)) {
+            if constexpr (FilterTag) {
+              if (bucket->hashes_[slot] != tag) continue;
+            }
+            const Entry* entry = Resolve(bucket->entries_[slot]);
+            if (reinterpret_cast<std::uintptr_t>(entry) == address) {
+              return entry;
+            }
+          }
+        }
+        bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
+      }
     }
     return nullptr;
   }
@@ -2361,8 +2489,10 @@ class ScanHashMap {
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
     while (bucket != nullptr) {
-      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
-        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
+      for (std::uint32_t matches = MatchingTags(*bucket, tag); matches != 0;
+           matches &= matches - 1) {
+        const std::size_t slot = std::countr_zero(matches);
+        if (Occupied(*bucket, slot)) {
           Entry* entry = Resolve(bucket->entries_[slot]);
           if (KeyEquals(*entry, digest, key)) result->push_back(entry);
         }
@@ -2372,23 +2502,52 @@ class ScanHashMap {
   }
 
   template <typename Predicate>
+  [[gnu::always_inline]] Entry* FindCandidateInBucket(Bucket& bucket,
+                                                      const Digest& digest,
+                                                      std::string_view key,
+                                                      std::uint8_t tag,
+                                                      Predicate& accept) {
+    for (std::uint32_t matches = MatchingTags(bucket, tag); matches != 0;
+         matches &= matches - 1) {
+      const std::size_t slot = std::countr_zero(matches);
+      if (Occupied(bucket, slot)) {
+        Entry* entry = Resolve(bucket.entries_[slot]);
+        if (KeyEquals(*entry, digest, key) && accept(std::as_const(*entry)))
+          return entry;
+      }
+    }
+    return nullptr;
+  }
+
+  template <typename Predicate>
+  [[gnu::noinline]] Entry* FindCandidateInBucketChain(Table& table,
+                                                      Bucket* bucket,
+                                                      const Digest& digest,
+                                                      std::string_view key,
+                                                      Predicate& accept) {
+    const std::uint8_t tag = HashTag(Hash(digest));
+    do {
+      if (Entry* found =
+              FindCandidateInBucket(*bucket, digest, key, tag, accept))
+        return found;
+      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
+    } while (bucket != nullptr);
+    return nullptr;
+  }
+
+  template <typename Predicate>
   Entry* FindCandidateInTable(Table& table, const Digest& digest,
                               std::string_view key, std::uint64_t hash,
                               Predicate& accept) {
     if (!table.buckets_) return nullptr;
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
-    while (bucket != nullptr) {
-      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
-        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
-          Entry* entry = Resolve(bucket->entries_[slot]);
-          if (KeyEquals(*entry, digest, key) && accept(std::as_const(*entry)))
-            return entry;
-        }
-      }
-      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
-    }
-    return nullptr;
+    if (Entry* found = FindCandidateInBucket(*bucket, digest, key, tag, accept))
+      return found;
+    return Chained(*bucket)
+               ? FindCandidateInBucketChain(table, Child(table, bucket), digest,
+                                            key, accept)
+               : nullptr;
   }
 
   Entry* FindWithoutStep(const Digest& digest, std::string_view key) {

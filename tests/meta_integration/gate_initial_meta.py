@@ -60,10 +60,14 @@ def prove_replicated(nodes, leader, value):
         raise H.Failure(f"initial membership proposal failed: {reply}")
     index = int(reply[3:])
     H.wait_cluster_committed(nodes, index, timeout=20)
+    # Followers publish commit before their asynchronous state-machine apply.
+    # Observe this operation locally on every member before asserting recovery.
     for node in nodes:
-        if node.getop(operation_id) != f"OK completed {value}":
-            raise H.Failure(
-                f"node {node.id} did not apply initial membership proposal")
+        H.wait_until(
+            f"node {node.id} applies initial membership operation {operation_id}",
+            20,
+            lambda node=node: node.alive()
+            and node.getop(operation_id) == f"OK completed {value}")
 
 
 def run_count(workdir, count):
@@ -130,10 +134,7 @@ def run_count(workdir, count):
         H.wait_until(
             f"all {count} members close initial binding grace", 10,
             lambda: all(
-                not os.path.exists(os.path.join(node.data_dir,
-                                                "initial_bindings.dat")) and
-                os.path.exists(os.path.join(
-                    node.data_dir, "initial_bindings_complete.dat"))
+                node.status()["initial_bindings_pending"] == "0"
                 for node in nodes))
         before_restart = max(node.committed() for node in nodes)
 
