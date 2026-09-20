@@ -1275,47 +1275,74 @@ constexpr std::size_t kMaximumBatchedReplyBytes = 64 * 1024;
 
 struct PendingReplyBatch {
   std::string bytes_;
+  // Empty diagnostic vectors still occupy the connection coroutine frame and
+  // participate in every batch's lifetime; omit them when tracing is off.
+#if LAVIK_ENABLE_READ_LATENCY_TRACE
   std::vector<ReadLatencyTrace> read_traces_;
+#endif
+#if LAVIK_ENABLE_SET_LATENCY_TRACE
   std::vector<SetLatencyTrace> set_traces_;
+#endif
 
   bool empty() const noexcept { return bytes_.empty(); }
 
-  void Append(std::string_view bytes, ReadLatencyTrace read_trace = {},
-              SetLatencyTrace set_trace = {}) {
+  void Append(std::string_view bytes,
+              [[maybe_unused]] ReadLatencyTrace read_trace = {},
+              [[maybe_unused]] SetLatencyTrace set_trace = {}) {
     bytes_.append(bytes);
+#if LAVIK_ENABLE_READ_LATENCY_TRACE
     if (read_trace.request_start_ns_ != 0) {
       read_traces_.push_back(std::move(read_trace));
     }
+#endif
+#if LAVIK_ENABLE_SET_LATENCY_TRACE
     if (set_trace.request_start_ns_ != 0) {
       set_traces_.push_back(std::move(set_trace));
     }
+#endif
   }
 };
+
+#if !LAVIK_ENABLE_READ_LATENCY_TRACE && !LAVIK_ENABLE_SET_LATENCY_TRACE
+static_assert(sizeof(PendingReplyBatch) == sizeof(std::string));
+#endif
 
 Task<absl::Status> FlushReplyBatch(TcpStream& stream,
                                    PendingReplyBatch* batch) {
   if (batch->empty()) co_return absl::OkStatus();
 
+#if LAVIK_ENABLE_READ_LATENCY_TRACE
   for (ReadLatencyTrace& trace : batch->read_traces_) {
     trace.send_start_ns_ = ReadTraceNowNanos();
   }
+#endif
+#if LAVIK_ENABLE_SET_LATENCY_TRACE
   for (SetLatencyTrace& trace : batch->set_traces_) {
     trace.send_start_ns_ = SetTraceNowNanos();
   }
+#endif
   absl::Status status = co_await stream.WriteAll(std::span<const std::byte>(
       reinterpret_cast<const std::byte*>(batch->bytes_.data()),
       batch->bytes_.size()));
+#if LAVIK_ENABLE_READ_LATENCY_TRACE
   for (ReadLatencyTrace& trace : batch->read_traces_) {
     trace.send_complete_ns_ = ReadTraceNowNanos();
     RecordReadLatency(trace);
   }
+#endif
+#if LAVIK_ENABLE_SET_LATENCY_TRACE
   for (SetLatencyTrace& trace : batch->set_traces_) {
     trace.send_complete_ns_ = SetTraceNowNanos();
     RecordSetLatency(trace);
   }
+#endif
   batch->bytes_.clear();
+#if LAVIK_ENABLE_READ_LATENCY_TRACE
   batch->read_traces_.clear();
+#endif
+#if LAVIK_ENABLE_SET_LATENCY_TRACE
   batch->set_traces_.clear();
+#endif
   co_return status;
 }
 
