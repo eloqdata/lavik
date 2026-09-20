@@ -60,10 +60,14 @@ def prove_replicated(nodes, leader, value):
         raise H.Failure(f"initial membership proposal failed: {reply}")
     index = int(reply[3:])
     H.wait_cluster_committed(nodes, index, timeout=20)
+    # Followers publish commit before their asynchronous state-machine apply.
+    # Observe this operation locally on every member before asserting recovery.
     for node in nodes:
-        if node.getop(operation_id) != f"OK completed {value}":
-            raise H.Failure(
-                f"node {node.id} did not apply initial membership proposal")
+        H.wait_until(
+            f"node {node.id} applies initial membership operation {operation_id}",
+            20,
+            lambda node=node: node.alive()
+            and node.getop(operation_id) == f"OK completed {value}")
 
 
 def run_count(workdir, count):

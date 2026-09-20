@@ -68,10 +68,8 @@ def main():
         history.record(op_id, "warmup1")
         warmup_idx = int(reply[3:])
         H.wait_cluster_committed(nodes, warmup_idx)
-        for node in nodes:
-            if node.getop(op_id) != "OK completed warmup1":
-                raise H.Failure(
-                    f"node {node.id} did not replicate the warmup op")
+        # The history probe waits for local apply, which can lag Raft commit.
+        history.check(nodes, desc="warmup operation")
         H.log("3-node cluster converged")
 
         # Status discovery starts at a real follower and uses only the

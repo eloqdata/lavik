@@ -31,9 +31,12 @@ def prove_write(nodes, leader, value):
     if not reply.startswith("OK "):
         raise H.Failure(f"proposal failed: {reply}")
     H.wait_cluster_committed(nodes, int(reply[3:]), timeout=20)
+    # Commit visibility does not fence the follower's asynchronous apply.
     for node in nodes:
-        if node.getop(operation_id) != f"OK completed {value}":
-            raise H.Failure(f"node {node.id} did not apply {value}")
+        H.wait_until(
+            f"node {node.id} applies operation {operation_id} ({value})", 20,
+            lambda node=node: node.alive()
+            and node.getop(operation_id) == f"OK completed {value}")
 
 
 def start_with_crash(node, point):
