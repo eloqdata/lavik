@@ -486,24 +486,9 @@ not a Lavik runtime dependency.
 
 ## Source formatting
 
-Lavik uses the Google style, parses source as C++23, and pins clang-format
-23.1.1. Its Bycorf submodule maintains its own formatter pin. Install `pre-commit`
-once and enable the repository hook:
-
-```bash
-sudo apt-get install pre-commit
-pre-commit install
-```
-
-The first run creates an isolated hook environment and downloads the pinned
-formatter; clang-format is not a Lavik runtime or build dependency. Commits
-then format staged first-party C and C++ files. When formatting changes a file,
-the commit stops so the result can be reviewed and staged before retrying. To
-format every maintained source file explicitly, run:
-
-```bash
-pre-commit run clang-format --all-files
-```
+See the [contributing guide](../../CONTRIBUTING.md#set-up-formatting-once)
+for the pinned pre-commit formatter, installation, quick formatting commands,
+and the commit workflow.
 
 The CMake `format` and `format-check` targets use a system installation only
 when it reports exactly version 23.1.1. This exact check prevents a local tool
