@@ -31,6 +31,10 @@ connection profiles, cluster creation, replica resizing, recovery, and Docker
 verification. The [architecture](../docs/architecture/11-admin.md) explains
 ownership and the shared database boundary.
 
+For a fresh machine, use the [three-node Docker quick start](quickstart/README.md)
+to launch one primary, two replicas, three Meta voters, and Admin, then
+initialize the cluster in the browser.
+
 From a source checkout with initialized submodules:
 
 ```sh

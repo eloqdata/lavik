@@ -1,0 +1,104 @@
+# Copyright (C) 2026 EloqData Inc. Licensed under the Apache License, Version 2.0.
+name: lavik-admin-quickstart
+
+# The build volume keeps Linux executables inside Docker, including on Macs.
+# This is a source-based local example; the standalone production Admin image
+# is configured separately in ../compose.yaml.
+x-node: &node
+  image: lavik-admin-toolchain:local
+  init: true
+  entrypoint: [sh, /quickstart/start.sh]
+  security_opt: [seccomp=unconfined]
+  restart: unless-stopped
+  stop_grace_period: 30s
+
+services:
+  build:
+    image: lavik-admin-toolchain:local
+    profiles: [tools]
+    working_dir: /src
+    volumes:
+      - ../..:/src:ro
+      - build:/build
+    environment:
+      GOCACHE: /build/go-cache
+      GOMODCACHE: /build/go-modcache
+    command:
+      - sh
+      - -ec
+      - |
+        cmake -S /src -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          '-DCMAKE_CXX_FLAGS_RELEASE=-O1 -DNDEBUG' \
+          -DLAVIK_ENABLE_OPT=OFF -DBUILD_TESTING=OFF
+        cmake --build /build --target lavik lavik-meta lavik-ctl -j2
+
+  meta-1:
+    <<: *node
+    command: [meta, "1"]
+    volumes: [".:/quickstart:ro", "build:/build:ro", "meta-1:/data"]
+    networks:
+      cluster: {ipv4_address: 172.29.91.11}
+  meta-2:
+    <<: *node
+    command: [meta, "2"]
+    volumes: [".:/quickstart:ro", "build:/build:ro", "meta-2:/data"]
+    networks:
+      cluster: {ipv4_address: 172.29.91.12}
+  meta-3:
+    <<: *node
+    command: [meta, "3"]
+    volumes: [".:/quickstart:ro", "build:/build:ro", "meta-3:/data"]
+    networks:
+      cluster: {ipv4_address: 172.29.91.13}
+
+  data-1:
+    <<: *node
+    command: [data, "1"]
+    volumes: [".:/quickstart:ro", "build:/build:ro", "data-1:/data"]
+    networks:
+      cluster: {ipv4_address: 172.29.91.21}
+  data-2:
+    <<: *node
+    command: [data, "2"]
+    volumes: [".:/quickstart:ro", "build:/build:ro", "data-2:/data"]
+    networks:
+      cluster: {ipv4_address: 172.29.91.22}
+  data-3:
+    <<: *node
+    command: [data, "3"]
+    volumes: [".:/quickstart:ro", "build:/build:ro", "data-3:/data"]
+    networks:
+      cluster: {ipv4_address: 172.29.91.23}
+
+  admin:
+    image: lavik-admin-toolchain:local
+    init: true
+    working_dir: /admin
+    command: [node, server.mjs]
+    restart: unless-stopped
+    volumes: ["..:/admin:ro", "build:/build:ro", "admin:/data"]
+    environment:
+      LAVIK_CTL: /build/lavik-ctl
+      LAVIK_ADMIN_DATA: /data/lavik-admin
+      LAVIK_ADMIN_BIND: 0.0.0.0
+      LAVIK_ADMIN_ORIGIN: http://localhost:${LAVIK_QUICKSTART_PORT:-4173}
+    ports: ["127.0.0.1:${LAVIK_QUICKSTART_PORT:-4173}:4173"]
+    networks:
+      cluster: {ipv4_address: 172.29.91.10}
+
+# Lavik advertises numeric endpoints, so every participant must see the same
+# stable IPs. Run client commands inside this network to follow slot redirects.
+networks:
+  cluster:
+    ipam:
+      config: [{subnet: 172.29.91.0/24}]
+
+volumes:
+  build:
+  admin:
+  meta-1:
+  meta-2:
+  meta-3:
+  data-1:
+  data-2:
+  data-3:

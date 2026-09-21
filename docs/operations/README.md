@@ -38,6 +38,7 @@ or safety boundaries.
 | [Network IRQ affinity tuning](irq-affinity-tuning.md) | Measuring or changing host IRQ placement for latency tuning |
 | [Monitoring stack](../../deploy/monitoring/README.md) | Running the repository's Prometheus and Grafana deployment |
 | [Lavik Admin](lavik-admin.md) | Running the browser/CLI fleet workspace, connecting clusters, resizing replicas, and verifying it locally with Docker |
+| [Three-node Admin quick start](../../admin/quickstart/README.md) | Starting one primary, two replicas, three Meta voters, and Admin in Docker, then initializing the cluster in the browser |
 
 ## Maintenance
 

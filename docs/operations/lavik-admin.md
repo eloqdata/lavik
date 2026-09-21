@@ -27,6 +27,12 @@ the Admin image alone does not update separately deployed Meta or Data nodes.
 
 ## Run in Docker
 
+To start a new local cluster as well as Admin, follow the
+[three-node Docker quick start](../../admin/quickstart/README.md). It starts
+one primary, two replicas, three Meta voters, and Admin, with persistent
+volumes and browser-driven initialization. The commands below start the
+standalone Admin service for connecting to separately deployed clusters.
+
 Initialize the repository submodules and follow the prerequisites in the
 [build guide](building-and-packaging.md). From the repository root:
 
