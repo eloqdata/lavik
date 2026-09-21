@@ -158,7 +158,8 @@ in the [deployment guide](../operations/cluster-deployment.md).
 4. On every data worker, `RedisService::Run` binds the memory and transaction shards
    and awaits `StorageEngine::InitializeWorker`. Recovery barriers ensure all
    workers finish recovery and allocator cleanup before the process becomes
-   ready.
+   ready. A fatal storage or catalog startup error stops the entire runtime,
+   including the control worker, before the all-worker teardown barriers join.
 5. Data worker 0 recovers and validates the durable Function catalog on every
    data worker and restores any recoverable cluster population, then performs an
    optional validated RDB import before publishing readiness. Replication is

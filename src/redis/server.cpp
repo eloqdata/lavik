@@ -1017,7 +1017,10 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
     startup_failed_.store(true, std::memory_order_release);
     spdlog::error("worker[{}] storage initialization failed: {}", worker.id(),
                   status.message());
-    worker.RequestStop();
+    // Teardown joins every runtime worker, including the control worker which
+    // does not participate in storage recovery. A local stop strands peers at
+    // that barrier after a fatal startup error.
+    server_->RequestStop();
     co_return status;
   }
 
@@ -1068,7 +1071,7 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
       spdlog::error("startup catalog/RDB recovery failed: {}",
                     status.message());
     }
-    worker.RequestStop();
+    server_->RequestStop();
     co_return status;
   }
 
