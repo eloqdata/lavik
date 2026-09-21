@@ -2088,13 +2088,17 @@ void StorageEngine::Impl::FullSyncCaptureOnCommit(
   const bool has_ordered_base =
       db_phase == WorkerStore::FullSyncCapture::DbPhase::kTailing ||
       phase != nullptr;
-  if (has_ordered_base && (command != nullptr || transaction_effect)) {
+  if (has_ordered_base &&
+      (command != nullptr || transaction_effect ||
+       db_phase == WorkerStore::FullSyncCapture::DbPhase::kTailing)) {
     if (command != nullptr) {
       (void)TryEnqueueFullSyncCommand(store, session_id, std::move(command));
     } else {
-      // Transaction participants have no independently replayable command.
-      // Put their after-image identity in the same FIFO so a later ordinary
-      // command can never overtake it.
+      // Storage-origin changes (including expiration) and transaction
+      // participants can lack a replayable command. Once the DB is tailing,
+      // its scan credit belongs to the next DB/partition; keep after-images
+      // in the already-admitted FIFO so they cannot reserve another scan
+      // arena or be overtaken by a later command.
       (void)TryEnqueueFullSyncRecord(store, session_id, record);
     }
     return;

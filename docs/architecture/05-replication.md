@@ -779,6 +779,11 @@ Each `(partition, database)` moves through `unstarted`, `scanning`, and
 - a covered key, or any key in a tailing database, enters the ordered session
   command FIFO.
 
+Storage-origin mutations without a replayable command, including active
+expiration in a tailing database, enter that FIFO as after-images. Their
+publisher admission is independent of the reusable coverage reservation owned
+by the database currently being scanned.
+
 Baseline scans tolerate index growth and shrinking: continuously present keys
 remain enumerable, and per-key capture state suppresses repeated bucket visits
 while preserving concurrent after-images. Baseline values are captured under
