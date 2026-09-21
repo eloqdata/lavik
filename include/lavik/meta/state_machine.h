@@ -61,8 +61,8 @@ class MetaStateMachine {
   MetaCommittedStatusView StatusSnapshot() const;
   // Returns at most 100 live-journal summaries after an immutable submit
   // sequence, in sequence order, without copying retained operation payloads.
-  std::vector<MetaOperationSummary> OperationSummaries(
-      std::uint64_t after, std::size_t limit) const;
+  std::vector<MetaOperationSummary> OperationSummaries(std::uint64_t after,
+                                                       std::size_t limit) const;
   // Copies only the requested group's committed topology under the state lock.
   std::optional<MetaTopologyGroupView> FindGroup(const std::string& id) const {
     std::lock_guard lock(mutex_);

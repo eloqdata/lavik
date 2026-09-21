@@ -2994,15 +2994,21 @@ TEST(NodeControlInstallerTest,
     EXPECT_TRUE(built.ok());
     return built.ok() ? *built : nullptr;
   };
-  ASSERT_TRUE(control.installer.InstallFullState(
-      FullState(state(1, true), Assignment(2)), Basis(10)).ok());
+  ASSERT_TRUE(
+      control.installer
+          .InstallFullState(FullState(state(1, true), Assignment(2)), Basis(10))
+          .ok());
   PreparedFullState removed{.serving_state_ = state(2, false),
                             .authority_lease_duration_ms_ = 5000};
-  EXPECT_TRUE(control.installer.InstallFullState(std::move(removed), Basis(11)).ok());
+  EXPECT_TRUE(
+      control.installer.InstallFullState(std::move(removed), Basis(11)).ok());
   ASSERT_NE(control.cache.Current(), nullptr);
-  EXPECT_EQ(control.cache.Current()->FindGroup("group-a")->manifest_revision_, 0u);
-  EXPECT_TRUE(control.installer.InstallFullState(
-      FullState(state(3, true), Assignment(3)), Basis(12)).ok());
+  EXPECT_EQ(control.cache.Current()->FindGroup("group-a")->manifest_revision_,
+            0u);
+  EXPECT_TRUE(
+      control.installer
+          .InstallFullState(FullState(state(3, true), Assignment(3)), Basis(12))
+          .ok());
 }
 
 TEST(NodeControlInstallerTest,

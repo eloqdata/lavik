@@ -292,17 +292,17 @@ std::vector<MetaOperationSummary> MetaStateMachine::OperationSummaries(
   }
   const auto count = std::min(limit, ordered.size());
   std::partial_sort(ordered.begin(), ordered.begin() + count, ordered.end(),
-      [](const auto* a, const auto* b) {
-        return a->operation_seq_ < b->operation_seq_;
-      });
+                    [](const auto* a, const auto* b) {
+                      return a->operation_seq_ < b->operation_seq_;
+                    });
   std::vector<MetaOperationSummary> result;
   result.reserve(count);
   for (std::size_t i = 0; i < count; ++i) {
     const auto& operation = *ordered[i];
     result.push_back({operation.operation_id_, operation.operation_seq_,
-        operation.lifecycle_, operation.kind_.substr(0, 512),
-        operation.kind_phase_blob_.substr(0, 512),
-        operation.terminal_result_.substr(0, 512)});
+                      operation.lifecycle_, operation.kind_.substr(0, 512),
+                      operation.kind_phase_blob_.substr(0, 512),
+                      operation.terminal_result_.substr(0, 512)});
   }
   return result;
 }

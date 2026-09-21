@@ -262,7 +262,8 @@ class MetaStateMachineTest : public ::testing::Test {
   std::filesystem::path dir_;
 };
 
-TEST_F(MetaStateMachineTest, OperationSummariesAreBoundedAndPaginateBySequence) {
+TEST_F(MetaStateMachineTest,
+       OperationSummariesAreBoundedAndPaginateBySequence) {
   auto opened = Open();
   ASSERT_TRUE(opened.ok());
   auto machine = std::move(*opened);
@@ -285,7 +286,8 @@ TEST_F(MetaStateMachineTest, OperationSummariesAreBoundedAndPaginateBySequence) 
   EXPECT_EQ(next[0].kind_, "admin-test");
   EXPECT_TRUE(machine->OperationSummaries(3, 100).empty());
   EXPECT_TRUE(machine->OperationSummaries(0, 0).empty());
-  EXPECT_EQ(machine->FindOperation(first[0].operation_id_)->intent_.size(), 10000u);
+  EXPECT_EQ(machine->FindOperation(first[0].operation_id_)->intent_.size(),
+            10000u);
 }
 
 TEST_F(MetaStateMachineTest, CommitAppliesRealCommands) {

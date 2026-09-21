@@ -294,14 +294,20 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
         options.operation_id_.find_first_not_of("0123456789abcdef") !=
             std::string::npos ||
         options.operation_id_.find_first_not_of('0') == std::string::npos) {
-      Fail("failover requires --operation-id HEX32 and --deadline-unix-ms together");
+      Fail(
+          "failover requires --operation-id HEX32 and --deadline-unix-ms "
+          "together");
     }
     std::uint64_t deadline = 0;
-    const auto parsed = std::from_chars(options.deadline_unix_ms_.data(),
-        options.deadline_unix_ms_.data() + options.deadline_unix_ms_.size(), deadline);
+    const auto parsed = std::from_chars(
+        options.deadline_unix_ms_.data(),
+        options.deadline_unix_ms_.data() + options.deadline_unix_ms_.size(),
+        deadline);
     if (parsed.ec != std::errc{} ||
-        parsed.ptr != options.deadline_unix_ms_.data() + options.deadline_unix_ms_.size() ||
-        deadline == 0) Fail("invalid --deadline-unix-ms");
+        parsed.ptr != options.deadline_unix_ms_.data() +
+                          options.deadline_unix_ms_.size() ||
+        deadline == 0)
+      Fail("invalid --deadline-unix-ms");
   }
   if (options.cluster_status_ || options.cluster_create_ || options.failover_) {
     if (!options.command_.empty()) {
@@ -606,8 +612,10 @@ int RunFailover(const Options& options) {
       id[i] = static_cast<std::uint8_t>(byte);
     }
     std::uint64_t deadline = 0;
-    std::from_chars(options.deadline_unix_ms_.data(),
-        options.deadline_unix_ms_.data() + options.deadline_unix_ms_.size(), deadline);
+    std::from_chars(
+        options.deadline_unix_ms_.data(),
+        options.deadline_unix_ms_.data() + options.deadline_unix_ms_.size(),
+        deadline);
     request.operation_id_ = id;
     request.absolute_deadline_unix_ms_ = deadline;
   }

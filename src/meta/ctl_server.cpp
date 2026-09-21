@@ -2381,9 +2381,9 @@ bycorf::Task<std::string> DispatchMutationVerb(
         !ParseU64(tokens[3], revision) || revision == 0) {
       co_return "ERR bad-request";
     }
-    co_return co_await HandleUnassignNode(
-        coordinator, std::move(state_machine), std::move(principal),
-        tokens[1], tokens[2], revision);
+    co_return co_await HandleUnassignNode(coordinator, std::move(state_machine),
+                                          std::move(principal), tokens[1],
+                                          tokens[2], revision);
   }
   if (command == "begingroupterm") {
     if (tokens.size() != 4 || tokens[1].empty() ||
@@ -2668,11 +2668,11 @@ bycorf::Task<std::string> DispatchCommand(
       command == "abortop" || command == "archiveoperations" ||
       command == "registernode" || command == "creategroup" ||
       command == "assignnode" || command == "unassignnode" ||
-      command == "begingroupterm" ||
-      command == "putpolicy" || command == "setslotmap" ||
-      command == "activateauthority" || command == "fencegroup" ||
-      command == "transitionop" || command == "pruneaudit" ||
-      command == "setauditpolicy" || command == "pruneoperations") {
+      command == "begingroupterm" || command == "putpolicy" ||
+      command == "setslotmap" || command == "activateauthority" ||
+      command == "fencegroup" || command == "transitionop" ||
+      command == "pruneaudit" || command == "setauditpolicy" ||
+      command == "pruneoperations") {
     std::string reply = co_await DispatchMutationVerb(
         coordinator, state_machine, std::move(principal), command, tokens);
     co_return reply;
@@ -2691,14 +2691,16 @@ bycorf::Task<std::string> DispatchCommand(
     // These views are for both UI and CLI clients. Reject follower reads so
     // reconnecting to a seed cannot silently roll an operation's state back.
     if (!server->is_leader() || !server->is_leader_alive() ||
-        !server->is_leader_sm_fully_caught_up()) co_return "ERR not-leader";
+        !server->is_leader_sm_fully_caught_up())
+      co_return "ERR not-leader";
     if (command == "getgroup") {
       if (tokens.size() != 2) co_return "ERR bad-request";
       const auto group = state_machine->FindGroup(tokens[1]);
       if (!group) co_return "ERR not-found";
-      co_return absl::StrCat("OK revision=", group->revision_, " term=",
-          group->record_.group_term_, " owner=", group->record_.owner_,
-          " transition=", group->failover_transition_ ? 1 : 0);
+      co_return absl::StrCat("OK revision=", group->revision_,
+                             " term=", group->record_.group_term_,
+                             " owner=", group->record_.owner_, " transition=",
+                             group->failover_transition_ ? 1 : 0);
     }
     std::uint64_t after = 0, limit = 100;
     if (tokens.size() != 3 || !ParseU64(tokens[1], after) ||
@@ -2714,10 +2716,10 @@ bycorf::Task<std::string> DispatchCommand(
       const auto id = HexEncode(std::string_view(
           reinterpret_cast<const char*>(operation.operation_id_.data()),
           operation.operation_id_.size()));
-      reply += absl::StrCat(" ", id, ":", operation.operation_seq_, ":",
+      reply += absl::StrCat(
+          " ", id, ":", operation.operation_seq_, ":",
           LifecycleName(operation.lifecycle_), ":", HexEncode(operation.kind_),
-          ":", HexEncode(operation.phase_), ":",
-          HexEncode(operation.result_));
+          ":", HexEncode(operation.phase_), ":", HexEncode(operation.result_));
     }
     co_return reply;
   }

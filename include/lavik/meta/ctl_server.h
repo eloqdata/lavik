@@ -75,9 +75,9 @@
 //                             tcp:// or tls://; an active node needs one or
 //                             two before its desired state can be projected.
 //   getnode <node_id>      -> "OK principal=<p> role=<primary|replica>
-//                             revision=<n> retired=<0|1> endpoints=<comma-list>"
-//                             / "ERR not-found";
-//                             same non-linearizable read semantics as getop.
+//                             revision=<n> retired=<0|1>
+//                             endpoints=<comma-list>" / "ERR not-found"; same
+//                             non-linearizable read semantics as getop.
 //   getgroup <group_id>    -> leader-only "OK revision=<n> term=<n> owner=<id>
 //                             transition=<0|1>" / "ERR not-found".
 //   listops <after> <limit>
