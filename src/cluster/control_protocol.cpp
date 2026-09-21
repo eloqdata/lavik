@@ -2394,7 +2394,7 @@ MessageType MessageTypeOf(const WireMessage& message) noexcept {
       message);
 }
 
-absl::StatusOr<std::string> EncodeMessage(const WireMessage& message) {
+absl::StatusOr<EncodedMessage> EncodeMessage(const WireMessage& message) {
   auto encoded = std::visit(
       [](const auto& value) -> absl::StatusOr<std::string> {
         using T = std::decay_t<decltype(value)>;
@@ -2409,11 +2409,11 @@ absl::StatusOr<std::string> EncodeMessage(const WireMessage& message) {
       },
       message);
   if (!encoded.ok()) return encoded.status();
-  if (RequiresSingleFrame(MessageTypeOf(message)) &&
-      encoded->size() > kMaxFramePayloadBytes) {
+  const MessageType type = MessageTypeOf(message);
+  if (RequiresSingleFrame(type) && encoded->size() > kMaxFramePayloadBytes) {
     return ResourceLimit("non-fragmentable control message exceeds one frame");
   }
-  return encoded;
+  return EncodedMessage{type, std::move(*encoded)};
 }
 
 absl::StatusOr<WireMessage> DecodeMessage(MessageType type,

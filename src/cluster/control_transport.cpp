@@ -226,24 +226,22 @@ bool ControlFrameStream::DisarmWriteDeadline() noexcept {
 }
 
 absl::Status ControlWriteQueue::Enqueue(MessagePriority priority,
-                                        WireMessage message) {
-  auto payload = EncodeMessage(message);
-  if (!payload.ok()) return payload.status();
-  if (payload->size() > kMaxFramePayloadBytes) {
+                                        EncodedMessage encoded) {
+  if (encoded.payload.size() > kMaxFramePayloadBytes) {
     return absl::ResourceExhaustedError(
         "control message requires an object transfer");
   }
-  const std::size_t bytes = kFrameHeaderBytes + payload->size();
+  const std::size_t bytes = kFrameHeaderBytes + encoded.payload.size();
   if (bytes > max_bytes_ || queued_bytes_ > max_bytes_ - bytes) {
     return absl::ResourceExhaustedError("control writer queue is full");
   }
   lanes_[Lane(priority)].push_back(
-      Item{.message_ = std::move(message), .bytes_ = bytes});
+      Item{.encoded_ = std::move(encoded), .bytes_ = bytes});
   queued_bytes_ += bytes;
   return absl::OkStatus();
 }
 
-std::optional<std::pair<MessagePriority, WireMessage>>
+std::optional<std::pair<MessagePriority, EncodedMessage>>
 ControlWriteQueue::Pop() {
   for (std::size_t lane = 0; lane < lanes_.size(); ++lane) {
     if (lanes_[lane].empty()) continue;
@@ -251,7 +249,7 @@ ControlWriteQueue::Pop() {
     lanes_[lane].pop_front();
     queued_bytes_ -= item.bytes_;
     return std::pair{static_cast<MessagePriority>(lane),
-                     std::move(item.message_)};
+                     std::move(item.encoded_)};
   }
   return std::nullopt;
 }
@@ -330,10 +328,8 @@ bycorf::Task<absl::Status> ControlFrameStream::WriteEncoded(
 }
 
 bycorf::Task<absl::Status> ControlFrameStream::WriteMessage(
-    const WireMessage& message, std::function<void()> before_write) {
-  auto payload = EncodeMessage(message);
-  if (!payload.ok()) co_return payload.status();
-  auto encoded = encoder_.Encode(MessageTypeOf(message), *payload);
+    EncodedMessage message, std::function<void()> before_write) {
+  auto encoded = encoder_.Encode(message.type, message.payload);
   if (!encoded.ok()) co_return encoded.status();
   co_return co_await WriteEncoded(std::move(*encoded), std::move(before_write));
 }
@@ -397,7 +393,7 @@ struct ControlSessionWriter::Request {
 
 struct ControlSessionWriter::Impl {
   struct Scheduled {
-    WireMessage message_;
+    EncodedMessage encoded_;
     std::shared_ptr<Request> request_;
   };
 
@@ -435,12 +431,22 @@ struct ControlSessionWriter::Impl {
     return absl::OkStatus();
   }
 
-  absl::Status QueueFrame(MessagePriority priority, WireMessage message,
+  absl::Status QueueFrame(MessagePriority priority, EncodedMessage encoded,
                           const std::shared_ptr<Request>& request) {
-    const absl::Status queued = frames_.Enqueue(priority, std::move(message));
+    const absl::Status queued = frames_.Enqueue(priority, std::move(encoded));
     if (!queued.ok()) return queued;
     requests_[Lane(priority)].push_back(request);
     return absl::OkStatus();
+  }
+
+  // Transfer envelopes are built on the spot; they encode here, once, before
+  // entering the same single-encoding pipeline as producer-supplied messages.
+  absl::Status QueueTypedFrame(MessagePriority priority,
+                               const WireMessage& message,
+                               const std::shared_ptr<Request>& request) {
+    auto encoded = EncodeMessage(message);
+    if (!encoded.ok()) return encoded.status();
+    return QueueFrame(priority, std::move(*encoded), request);
   }
 
   absl::StatusOr<Scheduled> PopFrame() {
@@ -454,7 +460,7 @@ struct ControlSessionWriter::Impl {
     }
     std::shared_ptr<Request> request = std::move(owners.front());
     owners.pop_front();
-    return Scheduled{.message_ = std::move(frame->second),
+    return Scheduled{.encoded_ = std::move(frame->second),
                      .request_ = std::move(request)};
   }
 
@@ -507,13 +513,13 @@ struct ControlSessionWriter::Impl {
 
   absl::Status QueueTransferStart(const std::shared_ptr<Request>& request) {
     const std::string& bytes = *request->transfer_bytes_;
-    return QueueFrame(MessagePriority::kReliable,
-                      WireMessage(TransferStart{
-                          .kind = request->transfer_kind_,
-                          .object_id = request->object_id_,
-                          .total_length = bytes.size(),
-                      }),
-                      request);
+    return QueueTypedFrame(MessagePriority::kReliable,
+                           WireMessage(TransferStart{
+                               .kind = request->transfer_kind_,
+                               .object_id = request->object_id_,
+                               .total_length = bytes.size(),
+                           }),
+                           request);
   }
 
   absl::Status PromoteNextTransfer() {
@@ -530,9 +536,9 @@ struct ControlSessionWriter::Impl {
     if (request->transfer_phase_ == Phase::kStart) {
       if (bytes.empty()) {
         request->transfer_phase_ = Phase::kEnd;
-        return QueueFrame(MessagePriority::kReliable,
-                          WireMessage(TransferEnd{request->object_id_}),
-                          request);
+        return QueueTypedFrame(MessagePriority::kReliable,
+                               WireMessage(TransferEnd{request->object_id_}),
+                               request);
       }
       request->transfer_phase_ = Phase::kChunk;
     } else if (request->transfer_phase_ == Phase::kChunk) {
@@ -540,9 +546,9 @@ struct ControlSessionWriter::Impl {
       request->queued_chunk_bytes_ = 0;
       if (request->next_offset_ == bytes.size()) {
         request->transfer_phase_ = Phase::kEnd;
-        return QueueFrame(MessagePriority::kReliable,
-                          WireMessage(TransferEnd{request->object_id_}),
-                          request);
+        return QueueTypedFrame(MessagePriority::kReliable,
+                               WireMessage(TransferEnd{request->object_id_}),
+                               request);
       }
     } else {
       return absl::FailedPreconditionError(
@@ -552,13 +558,14 @@ struct ControlSessionWriter::Impl {
     const std::size_t count = std::min(kControlTransferChunkBytes,
                                        bytes.size() - request->next_offset_);
     request->queued_chunk_bytes_ = count;
-    return QueueFrame(MessagePriority::kBulk,
-                      WireMessage(TransferChunk{
-                          .object_id = request->object_id_,
-                          .offset = request->next_offset_,
-                          .bytes = bytes.substr(request->next_offset_, count),
-                      }),
-                      request);
+    return QueueTypedFrame(
+        MessagePriority::kBulk,
+        WireMessage(TransferChunk{
+            .object_id = request->object_id_,
+            .offset = request->next_offset_,
+            .bytes = bytes.substr(request->next_offset_, count),
+        }),
+        request);
   }
 
   WriteFunction write_frame_;
@@ -580,9 +587,9 @@ struct ControlSessionWriter::Impl {
 ControlSessionWriter::ControlSessionWriter(ControlFrameStream& frames,
                                            std::size_t max_queue_bytes)
     : ControlSessionWriter(
-          [&frames](WireMessage message, std::function<void()> before_write)
+          [&frames](EncodedMessage message, std::function<void()> before_write)
               -> bycorf::Task<absl::Status> {
-            co_return co_await frames.WriteMessage(message,
+            co_return co_await frames.WriteMessage(std::move(message),
                                                    std::move(before_write));
           },
           max_queue_bytes) {}
@@ -596,17 +603,31 @@ ControlSessionWriter::~ControlSessionWriter() = default;
 bycorf::Task<absl::Status> ControlSessionWriter::Write(
     MessagePriority priority, WireMessage message,
     std::function<void()> before_write) {
+  // Preserve the historical error precedence: an unusable writer rejects even
+  // an unencodable message. The EncodedMessage overload repeats these checks
+  // (idempotent, two comparisons) for its own callers.
   if (absl::Status bound = impl_->BindWorker(); !bound.ok()) co_return bound;
   if (impl_->terminal_error_.has_value()) {
     co_return *impl_->terminal_error_;
   }
   auto encoded = EncodeMessage(message);
   if (!encoded.ok()) co_return encoded.status();
-  if (encoded->size() > kMaxFramePayloadBytes) {
+  co_return co_await Write(priority, std::move(*encoded),
+                           std::move(before_write));
+}
+
+bycorf::Task<absl::Status> ControlSessionWriter::Write(
+    MessagePriority priority, EncodedMessage encoded,
+    std::function<void()> before_write) {
+  if (absl::Status bound = impl_->BindWorker(); !bound.ok()) co_return bound;
+  if (impl_->terminal_error_.has_value()) {
+    co_return *impl_->terminal_error_;
+  }
+  if (encoded.payload.size() > kMaxFramePayloadBytes) {
     co_return absl::ResourceExhaustedError(
         "control message requires an object transfer");
   }
-  const std::size_t reservation = kFrameHeaderBytes + encoded->size();
+  const std::size_t reservation = kFrameHeaderBytes + encoded.payload.size();
   if (absl::Status reserved = impl_->Reserve(reservation); !reserved.ok()) {
     co_return reserved;
   }
@@ -615,7 +636,7 @@ bycorf::Task<absl::Status> ControlSessionWriter::Write(
   request->reservation_bytes_ = reservation;
   request->before_write_ = std::move(before_write);
   if (absl::Status queued =
-          impl_->QueueFrame(priority, std::move(message), request);
+          impl_->QueueFrame(priority, std::move(encoded), request);
       !queued.ok()) {
     impl_->outstanding_bytes_ -= reservation;
     co_return queued;
@@ -641,10 +662,13 @@ bycorf::Task<absl::Status> ControlSessionWriter::WriteFullDesiredState(
         "FullDesiredState exceeds its object-size limit");
   }
   if (encoded->size() <= kMaxFramePayloadBytes) {
+    // Validation decode only: the canonical bytes are already the exact
+    // kFullDesiredState payload, so the write path forwards them unchanged.
     auto desired = DecodeFullDesiredState(*encoded);
     if (!desired.ok()) co_return desired.status();
-    co_return co_await Write(MessagePriority::kReliable,
-                             WireMessage(std::move(*desired)));
+    co_return co_await Write(
+        MessagePriority::kReliable,
+        EncodedMessage{MessageType::kFullDesiredState, *encoded});
   }
 
   auto object_id = GenerateId128();
@@ -732,7 +756,7 @@ bycorf::Task<absl::Status> ControlSessionWriter::Drive() {
       before_write = std::move(request->before_write_);
     }
     absl::Status written = co_await impl_->write_frame_(
-        std::move(scheduled->message_), std::move(before_write));
+        std::move(scheduled->encoded_), std::move(before_write));
     impl_->active_request_.reset();
     if (!written.ok()) {
       impl_->terminal_error_ = written;
