@@ -8702,10 +8702,6 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
           co_return absl::InvalidArgumentError(
               "full-sync mutation precedes partition reset");
         }
-        const bool ephemeral =
-            publish || (command.ok() && !command->args_.empty() &&
-                        (command->args_[0] == kReplicatedExecCommand ||
-                         EqualCaseInsensitive(command->args_[0], "FUNCTION")));
         const bool partitionless =
             publish || (command.ok() && !command->args_.empty() &&
                         EqualCaseInsensitive(command->args_[0], "FUNCTION"));
@@ -8713,7 +8709,11 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
             session->cluster_rebuild_ == nullptr || partitionless ||
             session->cluster_rebuild_->manifest_
                     ->logical_epochs()[partition_id] != 0;
-        if (!ephemeral && desired_partition) {
+        // Canonical single-key mutations can be wrapped in __LAVIK_EXEC_V1
+        // with PERSIST/PEXPIREAT effects. The wrapper still writes the hidden
+        // partition and must retain its source sequence through every child.
+        // Only PUBLISH and the separate Function catalog bypass this context.
+        if (!partitionless && desired_partition) {
           absl::Status begun = co_await bycorf::SubmitTaskTo(
               owner, [this, session, partition_id, partition_sequence]() {
                 return storage_->BeginReplicaTailCommand(
@@ -8740,7 +8740,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
           applied = absl::OkStatus();
         }
         absl::Status ended = absl::OkStatus();
-        if (!ephemeral && desired_partition) {
+        if (!partitionless && desired_partition) {
           ended = co_await bycorf::SubmitTaskTo(
               owner, [this, session, partition_id, partition_sequence]() {
                 return storage_->EndReplicaTailCommand(

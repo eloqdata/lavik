@@ -390,6 +390,50 @@ def full_tail(root):
             reader.close()
 
 
+def full_tail_expiration_effects(root):
+    # The source pauses after handing off partition zero. Mutations made in
+    # that window must use FULL command replay, not the initial snapshot or
+    # the ONLINE backlog. Canonical TTL effects wrap these single-key writes
+    # in __LAVIK_EXEC_V1; that wrapper still needs the partition apply context.
+    tag = next(f"full-tail-{i}" for i in range(100000)
+               if C.redis_slot(f"full-tail-{i}") == 0)
+    prefix = "{" + tag + "}"
+    counter, collection = prefix + "counter", prefix + "hash"
+
+    def seed(writer):
+        assert writer.call("SET", counter, 0) == "OK"
+        assert writer.call("HSET", collection, "before", "snapshot") == 1
+        assert writer.call("PEXPIRE", collection, 120000) == 1
+
+    with pair(root, "full-tail-expiration-effects", source_faults={
+            "LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "3000"},
+            seed=seed, require_seed_before_full=True,
+            source_workers=1, target_workers=2) as (meta, source, target, writer):
+        H.wait_until("partition zero handed off before mutations", 30, lambda:
+                     "paused full sync after acknowledged handoff partition 0 "
+                     in Path(source.log_path).read_text())
+        assert writer.call("INCR", counter) == 1
+        assert writer.call("HSET", collection, "after", "tail") == 1
+        deadline = writer.call("PEXPIRETIME", collection)
+        ready(meta)
+        reader = Client(target, readonly=True)
+        try:
+            assert reader.call("GET", counter) == "1"
+            assert reader.call("PTTL", counter) == -1
+            assert reader.call("HGET", collection, "before") == "snapshot"
+            assert reader.call("HGET", collection, "after") == "tail"
+            assert reader.call("PEXPIRETIME", collection) == deadline
+            assert writer.call("INCR", counter) == 2
+            assert writer.call("WAIT", 1, 5000) == 1
+            assert reader.call("GET", counter) == "2"
+        finally:
+            reader.close()
+        # A failed apply followed by a replacement snapshot could produce the
+        # same values. Require this first FULL to complete without that retry.
+        assert Path(source.log_path).read_text().count("selected=FULL") == 1
+        assert "outside its apply context" not in Path(target.log_path).read_text()
+
+
 def post_cut_reset_reconnect(root):
     with pair(root, "post-cut-reset", source_faults={
             "LAVIK_REPLICATION_POST_CUT_RESET_ONCE": "1"}) as (meta, source, target, writer):
@@ -506,6 +550,7 @@ def main():
         full_tail(root)
         backpressured_shutdown(root)
         if C.has_fault(C.DATA, b"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK"):
+            full_tail_expiration_effects(root)
             handoff_order(root)
             cancelled_handoff(root)
             committed_cursor_reconnect(root, "cancel-apply", target_faults={
