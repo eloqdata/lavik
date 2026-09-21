@@ -16,10 +16,10 @@ limitations under the License.
 
 # TLS and password authentication
 
-Lavik can expose plaintext and TLS Redis endpoints at the same time. TLS is
-implemented in Celer over the existing io_uring transport with an OpenSSL BIO
-pair; plaintext connections continue to use multishot receive when available,
-while TLS connections use per-connection receive buffers.
+Lavik can expose plaintext and TLS Redis endpoints at the same time. This
+guide covers kernel TCP serving and outgoing replication authentication.
+Bycorf provides the TLS transport. The release archive includes this guide as
+`tls-and-auth.md` beside the executables.
 
 ## Server configuration
 
@@ -51,16 +51,22 @@ key.
 - `optional` verifies a client certificate when one is supplied.
 - `yes` requires a client certificate signed by `tls-ca-cert-file`.
 
+Both `optional` and `yes` require `tls-ca-cert-file`. Configure
+`tls-cert-file` and `tls-key-file` together, including when they are used only
+as an outgoing client identity. Certificate authentication does not replace
+Redis password authentication.
+
 `requirepass` enables the single Redis `default` user. Clients may use either
 `AUTH <password>` or `AUTH default <password>`. Other commands return `NOAUTH`
 until authentication succeeds. This implementation intentionally does not add
 the Redis ACL command/file model; put `requirepass` in the main configuration
 file when the password must survive a restart.
 
-## TLS replication
+## Following Redis over TLS
 
-A replica can authenticate every control and data-flow connection and protect
-all of them with TLS:
+In non-Meta mode, `replicaof` follows an external Redis or Redis Cluster
+source using PSYNC. It does not establish native Lavik replication. Configure
+the source's TLS port, trusted CA, and Redis credentials:
 
 ```text
 replicaof redis-primary.example.internal 6380
@@ -74,5 +80,20 @@ The upstream certificate is verified against the exact `replicaof` hostname or
 IP address. A hostname is also sent as TLS SNI. If `tls-cert-file` and
 `tls-key-file` are configured on the replica, that identity is also presented
 to an upstream which requires client certificates.
+
+`tls-replication yes` requires `tls-ca-cert-file`; only the `default`
+replication user is supported.
+
+## Meta-managed TLS
+
+Meta-managed nodes establish native Lavik replication through Follow Owner,
+not `replicaof`. When `tls-replication yes` is enabled, native control and all
+data-flow connections use TLS. Data also reuses that client identity for its
+Meta control session, requiring the CA, certificate and private key together.
+Meta membership and Data-node identity must be provisioned through the Meta
+control plane; a Redis password alone does not authorize those sessions.
+
+For deployment instructions, see the repository's
+[Meta control-plane guide](https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-control-plane.md).
 
 Metrics endpoints remain plaintext.

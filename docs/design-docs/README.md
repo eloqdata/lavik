@@ -34,23 +34,10 @@ them.
 
 | Document | Scope and status |
 |---|---|
-| [Native replication design](replication-design.md) | Historical native replication protocol and feature design |
 | [Recovery metadata design](recovery-metadata-design.md) | Historical persistent metadata and crash-consistency rationale |
 | [Storage block ownership](storage-block-ownership.md) | Historical ownership design and transition rationale |
 | [Logical databases and `SELECT`](logical-databases.md) | Historical database identity, routing, indexing, and command design |
-| [Memory accounting](memory-accounting.md) | Historical allocation accounting and admission design |
-| [Redis compatibility target](redis-compatibility.md) | Historical Redis/Valkey compatibility target and research |
-| [SPDK integration](spdk.md) | Historical SPDK integration design and setup research |
-| [TLS and password authentication](tls-and-auth.md) | Historical TLS and authentication integration design |
-
-## Proposals and design history
-
-| Document | Scope and status |
-|---|---|
-| [Large-key redesign constraints](large-key-design.md) | Constraints for a future redesign; explicitly not a description of the current representation |
-| [Transaction design](transaction-design.md) | Original transaction proposal, decisions, milestones, and chronological extensions |
-| [Cross-shard architecture design](sharding-design.md) | Historical worker/shard plan; current ownership is documented elsewhere |
-| [Meta / Data control simplification](meta-data-control-simplification.md) | Requested 2026-09-16 record of nine findings, redundant fields and SHA uses, completed removals, and the proposed directive/local-state redesign |
+| [Redis 7.2 compatibility rationale](redis-compatibility.md) | Baseline selection and wire-format research; not a current feature inventory |
 
 ## Maintenance
 

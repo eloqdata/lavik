@@ -194,12 +194,15 @@ WATCH registration is split between connection and shard state. The
 connection retains each full key, digest, owner, database, fingerprint, and its
 WATCH-time liveness. The owner shard retains a sticky dirty bit per connection
 under `(database, fingerprint)`; it never dereferences the connection.
+Sticky marks detect an intervening mutation even if a value is restored or a
+tombstone is reclaimed.
 
 Real mutation paths mark the fingerprint at the storage append funnel. Active
 expiry paths that can remove a value without that append mark explicitly, and
 database detach marks every registration for that database, including keys
-that did not exist. Keyed `EXEC` takes its transaction locks before checking
-that every shard entry remains clean and every full key's liveness matches its
+that did not exist. Keyed `EXEC` takes its transaction locks, including shared
+locks on watched-only keys, before checking that every shard entry remains
+clean and every full key's liveness matches its
 snapshot. `UNWATCH`, `DISCARD`, an `EXEC` outcome that consumes the queued
 transaction, and connection cleanup remove the shard registrations.
 

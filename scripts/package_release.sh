@@ -150,7 +150,7 @@ for app in "${APPS[@]}"; do
   "$STAGE_DIR/$app" --help >/dev/null 2>&1
 done
 install -m 0644 "$REPO_ROOT/LICENSE" "$REPO_ROOT/NOTICE" "$STAGE_DIR/"
-install -m 0644 "$REPO_ROOT/docs/design-docs/tls-and-auth.md" \
+install -m 0644 "$REPO_ROOT/docs/operations/tls-and-auth.md" \
   "$STAGE_DIR/tls-and-auth.md"
 OPENSSL_LICENSE=${LAVIK_OPENSSL_LICENSE:-/usr/share/common-licenses/Apache-2.0}
 if [[ ! -f "$OPENSSL_LICENSE" ]]; then

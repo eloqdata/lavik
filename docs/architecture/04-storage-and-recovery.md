@@ -979,7 +979,7 @@ Current test evidence includes:
 - [Worker-count-independent storage ownership](../design-docs/storage-block-ownership.md)
 - [Multi-device storage](../operations/multi-device-storage.md)
 - [Tomb Raider scheduling](../operations/tomb-raider.md)
-- [Running with SPDK](../design-docs/spdk.md)
+- [Running with SPDK](../operations/spdk-storage.md)
 
 The linked design documents are historical references, while the operations
 documents are procedural guidance. This focused architecture document and

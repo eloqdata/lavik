@@ -519,6 +519,8 @@ versioned archive and `.tar.gz.sha256` file under `dist/`. The checksum uses a
 relative archive name so `sha256sum --check *.sha256` works after downloading.
 The archive carries the project LICENSE and NOTICE, plus
 the Apache-2.0 license text required by the statically linked OpenSSL code.
+It also includes the [TLS and password authentication guide](tls-and-auth.md)
+as `tls-and-auth.md` beside the executables.
 It explicitly configures `LAVIK_BUILD_META=ON`, `BUILD_TESTING=OFF`, and
 `LAVIK_BUILD_FAULT_SERVER=OFF`; CMake also rejects the fault-server option
 whenever `BUILD_TESTING` is off.
