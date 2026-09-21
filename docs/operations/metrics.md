@@ -135,7 +135,8 @@ group, assignment, directive, or operation identifiers as labels:
 - `lavik_cluster_control_protocol_errors_total`: sessions closed for invalid
   framing or protocol state.
 - `lavik_cluster_control_full_states_applied_total`: complete desired-state
-  projections installed atomically.
+  projections installed atomically, including lease-policy-only updates
+  installed through the control worker's fast path.
 - `lavik_cluster_control_lease_decisions_total{decision="granted|denied"}`:
   finite-authority outcomes returned by Meta.
 - `lavik_cluster_control_lease_expirations_total`: locally detected lease

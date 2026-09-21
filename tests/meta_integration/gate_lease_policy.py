@@ -236,8 +236,7 @@ def run_multi(root):
     root.mkdir()
     (root / "meta").mkdir()
     meta = H.Node(C.META, str(root / "meta"), 1,
-                  args=H.raft_args(snapshot_distance=100000,
-                                   election_ms_low=2000, election_ms_high=4000))
+                  args=C.creation_raft_args())
     nodes = [DataProcess(C.DATA, str(root / name), node_id,
                          meta.data_control_endpoint)
              for name, node_id in (("primary1", C.PRIMARY_1), ("replica1", C.REPLICA_1),

@@ -2254,6 +2254,11 @@ struct MetaControlClientService::Impl {
     }
     directory_ = std::move(directory);
     state->desired_ = std::move(next);
+    if (policy_only) {
+      // This path installs the new local projection without Install(), but
+      // it has the same applied-state observability boundary.
+      RecordClusterControlFullStateApplied();
+    }
     const auto next_interval =
         std::chrono::milliseconds(control::DataHeartbeatIntervalMs(
             state->desired_->local.lease_duration_ms));
