@@ -229,6 +229,94 @@ class ReplicationLogService final : public bycorf::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
+  bycorf::Task<absl::Status> ExerciseTailingMutationDuringNextPartitionScan() {
+    constexpr std::uint64_t kSession = 850;
+    constexpr std::uint8_t kDb = 0;
+    const std::string first_key = "tailing-credit{completed-partition}";
+    const std::string second_key = "tailing-credit{scanning-partition}";
+    const auto first_partition = lavik::storage::RedisSlot(first_key);
+    const auto second_partition = lavik::storage::RedisSlot(second_key);
+    Check(first_partition != second_partition, "fixture partitions overlap");
+    auto written = co_await storage_->Set(kDb, first_key, "first", {});
+    if (!written.ok()) co_return written.status();
+    auto second_written = co_await storage_->Set(kDb, second_key, "second", {});
+    if (!second_written.ok()) co_return second_written.status();
+    auto enabled = co_await storage_->EnableReplicationLog(kSession, 8 * kMiB);
+    if (!enabled.ok()) co_return enabled;
+    const auto reserved_before =
+        lavik::GetMemoryStats().fullsync_reserved_bytes_;
+    auto session = storage_->BeginFullSyncSession(kSession);
+    if (!session.ok()) co_return session.status();
+    auto first =
+        storage_->BeginPartitionReplication(kSession, first_partition, 1);
+    if (!first.ok()) co_return first.status();
+    auto status =
+        storage_->BeginPartitionDbReplication(kSession, first_partition, kDb);
+    if (!status.ok()) co_return status;
+    auto baseline = co_await storage_->SnapshotPartition(
+        kSession, first_partition, kDb, 0, 16, 2);
+    if (!baseline.ok()) co_return baseline.status();
+    Check(baseline->cursor_ == 0 && baseline->records_.size() == 1,
+          "first partition baseline is incomplete");
+    storage_->AcknowledgePartitionSnapshotRecords(kSession, first_partition,
+                                                  baseline->records_);
+    status = storage_->CompletePartitionDbReplication(kSession, first_partition,
+                                                      kDb);
+    if (!status.ok()) co_return status;
+    status = storage_->CompletePartitionReplication(kSession, first_partition);
+    if (!status.ok()) co_return status;
+
+    auto second =
+        storage_->BeginPartitionReplication(kSession, second_partition, 1);
+    if (!second.ok()) co_return second.status();
+    status =
+        storage_->BeginPartitionDbReplication(kSession, second_partition, kDb);
+    if (!status.ok()) co_return status;
+    auto scanning = co_await storage_->SnapshotPartition(
+        kSession, second_partition, kDb, 0, 16, 2);
+    if (!scanning.ok()) co_return scanning.status();
+    const auto reserved_scanning =
+        lavik::GetMemoryStats().fullsync_reserved_bytes_;
+    Check(reserved_scanning >= reserved_before &&
+              reserved_scanning - reserved_before <
+                  ScanHashMapEntryArena::kSmallSpanAdmissionBytes,
+          "second partition did not occupy the reusable scan arena credit");
+
+    // Storage-origin changes such as active expiry have no client command.
+    // The completed partition must use its admitted FIFO credit while the
+    // next partition owns the session's single reusable scan-arena reserve.
+    auto removed = co_await storage_->Delete(kDb, first_key);
+    if (!removed.ok()) co_return removed.status();
+    Check(
+        storage_->FullSyncSessionValid(kSession),
+        "tailing mutation invalidated full sync while another partition scans");
+    std::vector<std::string> after_args{"SET", first_key, "after"};
+    status =
+        co_await ExecuteClientCommand(kDb, std::move(after_args), "+OK\r\n");
+    if (!status.ok()) co_return status;
+    auto queued = storage_->PeekFullSyncPublishItems(kSession, 2);
+    if (!queued.ok()) co_return queued.status();
+    Check(queued->size() == 2 && (*queued)[0].record_.has_value() &&
+              (*queued)[0].record_->key_ == first_key &&
+              (*queued)[0].record_->kind_ ==
+                  lavik::storage::SnapshotRecord::Kind::kDelete &&
+              (*queued)[1].command_ != nullptr &&
+              (*queued)[1].id_ == (*queued)[0].id_ + 1,
+          "tailing after-image did not precede the later client command");
+    Check(lavik::GetMemoryStats().fullsync_reserved_bytes_ == reserved_scanning,
+          "tailing mutation consumed another scan-arena reservation");
+    for (const auto& item : *queued)
+      storage_->AcknowledgeFullSyncPublishItem(kSession, item.id_);
+    storage_->AcknowledgePartitionSnapshotRecords(kSession, second_partition,
+                                                  scanning->records_);
+    storage_->EndPartitionReplication(kSession, first_partition);
+    storage_->EndPartitionReplication(kSession, second_partition);
+    storage_->EndFullSyncSession(kSession);
+    Check(lavik::GetMemoryStats().fullsync_reserved_bytes_ == reserved_before,
+          "tailing mutation fixture leaked coverage credit");
+    co_return co_await storage_->DisableReplicationLog();
+  }
+
   bycorf::Task<absl::Status> ExerciseSharedHistoryQuota() {
     auto history = std::make_shared<lavik::ReplicationHistory>(8 * kMiB);
     auto reset = history->Reset("parent", 2);
@@ -1203,8 +1291,9 @@ class ReplicationLogService final : public bycorf::Service {
     Check(*skipped, "empty DB required a baseline scan");
     // A write arriving after the synchronous skip must be delivered through
     // the publisher even though no snapshot or DB scan was ever opened.
+    std::vector<std::string> after_skip_args{"SET", key, "after-skip"};
     absl::Status written =
-        co_await ExecuteClientCommand(0, {"SET", key, "after-skip"}, "+OK\r\n");
+        co_await ExecuteClientCommand(0, std::move(after_skip_args), "+OK\r\n");
     if (!written.ok()) co_return written;
     auto queued = storage_->PeekFullSyncPublishItems(kSession, 1);
     if (!queued.ok()) co_return queued.status();
@@ -1508,13 +1597,12 @@ class ReplicationLogService final : public bycorf::Service {
     storage_->AcknowledgeFullSyncPublishItem(kSession,
                                              expiry_filler->front().id_);
     storage_->ResumeExpiration();
-    std::optional<PartitionFullSyncBatch> expired_replacement;
+    std::optional<lavik::storage::FullSyncPublishItem> expired_replacement;
     for (unsigned attempt = 0; attempt < 200; ++attempt) {
-      auto batch = co_await storage_->ReadPartitionFullSyncOverrides(
-          kSession, partition_id, 16);
+      auto batch = storage_->PeekFullSyncPublishItems(kSession, 1);
       if (!batch.ok()) co_return batch.status();
-      if (!batch->records_.empty()) {
-        expired_replacement.emplace(std::move(*batch));
+      if (!batch->empty()) {
+        expired_replacement.emplace(batch->front());
         break;
       }
       slept =
@@ -1522,13 +1610,13 @@ class ReplicationLogService final : public bycorf::Service {
       if (!slept.ok()) co_return slept;
     }
     Check(expired_replacement.has_value() &&
-              expired_replacement->records_.size() == 1 &&
-              expired_replacement->records_.front().key_ == expiring_key &&
-              expired_replacement->records_.front().kind_ ==
+              expired_replacement->record_.has_value() &&
+              expired_replacement->record_->key_ == expiring_key &&
+              expired_replacement->record_->kind_ ==
                   lavik::storage::SnapshotRecord::Kind::kDelete,
           "active expiration did not resume after full-sync credit was freed");
-    storage_->AcknowledgePartitionFullSyncOverrides(
-        kSession, partition_id, expired_replacement->records_);
+    storage_->AcknowledgeFullSyncPublishItem(kSession,
+                                             expired_replacement->id_);
     queue_capacity =
         co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
     if (!queue_capacity.ok()) co_return queue_capacity;
@@ -2770,7 +2858,10 @@ class ReplicationLogService final : public bycorf::Service {
   }
 
   bycorf::Task<absl::Status> Exercise() {
-    absl::Status status = co_await ExerciseEmptyFullSyncDbs();
+    absl::Status status =
+        co_await ExerciseTailingMutationDuringNextPartitionScan();
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseEmptyFullSyncDbs();
     if (!status.ok()) co_return status;
     status = co_await ExerciseSharedHistoryQuota();
     if (!status.ok()) co_return status;
