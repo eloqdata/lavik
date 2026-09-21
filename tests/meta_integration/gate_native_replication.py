@@ -316,8 +316,8 @@ def dense_collection_full_sync(root):
                 writer.call("SMEMBERS", "{dense}set"))
             expected = writer.call("HGETALL", "{dense}hash")
             actual = reader.call("HGETALL", "{dense}hash")
-            assert dict(zip(actual[::2], actual[1::2])) == dict(
-                zip(expected[::2], expected[1::2]))
+            assert dict(zip(actual[::2], actual[1::2], strict=True)) == dict(
+                zip(expected[::2], expected[1::2], strict=True))
             assert reader.call("ZRANGE", "{dense}zset", 0, -1, "WITHSCORES") == \
                 writer.call("ZRANGE", "{dense}zset", 0, -1, "WITHSCORES")
         finally:

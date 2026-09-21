@@ -1411,6 +1411,13 @@ if (BUILD_TESTING)
   if(LAVIK_KERNEL_BYPASS)
     add_executable(lavik_dpdk_control_check tests/dpdk_control_check.cpp)
     target_link_libraries(lavik_dpdk_control_check PRIVATE bycorf::core)
+    add_test(NAME lavik_dpdk_control
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/dpdk_control_smoke.py
+        $<TARGET_FILE:lavik_dpdk_control_check>)
+    # The smoke owns a fixed TAP and ports; never overlap other CTest jobs.
+    set_tests_properties(lavik_dpdk_control PROPERTIES
+      LABELS dpdk SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
   endif()
   target_link_libraries(lavik_unit_tests
     PRIVATE lavik::module GTest::gtest_main

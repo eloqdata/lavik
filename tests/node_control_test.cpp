@@ -1153,6 +1153,7 @@ class ProvisionalActivationService final : public bycorf::Service {
     kSessionLossDuringPromotionActivation,
     kSessionLossDuringExpirationEnable,
     kSessionLossDuringSourceAdmissionEnable,
+    kObservedExpiryDuringSourceAdmissionEnable,
     kExpiresDuringActivation,
     kRestartedWinnerWithPriorBootAction,
     kSteadyOwner,
@@ -1253,6 +1254,13 @@ class ProvisionalActivationService final : public bycorf::Service {
     };
     control_.actions.on_source_admission_enable_ = [this] {
       lease_installed_before_source_admission_ = CanWrite();
+      if (scenario_ == Scenario::kObservedExpiryDuringSourceAdmissionEnable) {
+        // Model another consumer reaching the deadline while the installer
+        // still has an earlier clock sample. Observed expiry is terminal even
+        // though deadline() continues to report the original positive cut.
+        const auto& lease = control_.actions.source_lease_;
+        EXPECT_FALSE(lease->valid_at(lease->deadline()));
+      }
     };
 
     if (scenario_ == Scenario::kBlockedSuccess ||
@@ -1500,6 +1508,25 @@ TEST(NodeControlInstallerTest,
 
   ASSERT_TRUE(service.session_loss_result_.ok())
       << service.session_loss_result_;
+  EXPECT_TRUE(service.lease_installed_before_source_admission_);
+  EXPECT_EQ(service.grant_result_.code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(service.grant_result_.message(),
+            "source admission activation crossed a changed or expired "
+            "control session");
+  EXPECT_FALSE(service.writable_after_);
+  EXPECT_EQ(service.control_.actions.source_admission_enables_, 1);
+  EXPECT_GE(service.control_.actions.expiration_authority_revocations_, 1);
+}
+
+TEST(NodeControlInstallerTest,
+     ObservedExpiryDuringSourceAdmissionEnableFailsClosed) {
+  bycorf::Server server;
+  ProvisionalActivationService service(
+      &server, ProvisionalActivationService::Scenario::
+                   kObservedExpiryDuringSourceAdmissionEnable);
+  RunProvisionalActivationService(service, server);
+
   EXPECT_TRUE(service.lease_installed_before_source_admission_);
   EXPECT_EQ(service.grant_result_.code(),
             absl::StatusCode::kFailedPrecondition);

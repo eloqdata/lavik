@@ -702,10 +702,12 @@ bool AuthorityGuard::HasExactLease(const SessionIdentity& session,
   if (!authority.session_.has_value() || *authority.session_ != session)
     return false;
   const auto lease = authority.leases_.find(anchor.group_id_);
+  // deadline() preserves the cut after observed expiry. A caller with an
+  // earlier clock sample must still reject that terminal capability state.
   return lease != authority.leases_.end() &&
          lease->second.session_ == session && lease->second.anchor_ == anchor &&
          lease->second.deadline_->deadline() == deadline.time_since_epoch() &&
-         deadline > now;
+         lease->second.deadline_->valid_at(now.time_since_epoch());
 }
 
 bool AuthorityGuard::ExpireLease(const SessionIdentity& session,

@@ -246,6 +246,14 @@ python3 tests/runtime_backends_smoke.py build-dpdk-net/lavik
 sudo python3 tests/runtime_backends_smoke.py build-dpdk-net/lavik --dpdk
 ```
 
+With `BUILD_TESTING=ON` and `LAVIK_KERNEL_BYPASS=ON`, CTest also registers
+`lavik_dpdk_control` to check data-listener placement and outgoing control-worker
+connections over a temporary TAP. It runs serially and skips with exit code 77
+when `iproute2`, access to `/dev/net/tun`, or effective `CAP_NET_ADMIN` and
+`CAP_NET_RAW` capabilities are unavailable, or `bycorfdp0` already exists.
+Once these prerequisites pass, runtime failures fail the test. It does not
+rebind physical NICs.
+
 ### AddressSanitizer builds
 
 AddressSanitizer builds use Clang so coroutine symmetric transfers remain tail

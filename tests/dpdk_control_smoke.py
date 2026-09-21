@@ -2,6 +2,7 @@
 """DPDK-only control connect and service placement over an owned temporary TAP."""
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -9,7 +10,29 @@ import tempfile
 import time
 
 tap = 'bycorfdp0'
-assert not Path('/sys/class/net', tap).exists(), 'refusing to alter an existing TAP'
+
+
+def skip(reason):
+    print(f'SKIP: {reason}', flush=True)
+    sys.exit(77)
+
+
+# A bypass build can run under an unprivileged CTest runner. Check prerequisites
+# before starting EAL or creating the TAP; real failures after startup must fail.
+if sys.platform != 'linux':
+    skip('DPDK control smoke requires Linux')
+if shutil.which('ip') is None:
+    skip('DPDK control smoke requires iproute2')
+if not os.access('/dev/net/tun', os.R_OK | os.W_OK):
+    skip('DPDK control smoke requires access to /dev/net/tun')
+caps = next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+            if line.startswith('CapEff:'))
+required_caps = (1 << 12) | (1 << 13)  # CAP_NET_ADMIN and CAP_NET_RAW.
+if int(caps, 16) & required_caps != required_caps:
+    skip('DPDK control smoke requires CAP_NET_ADMIN and CAP_NET_RAW')
+if Path('/sys/class/net', tap).exists():
+    skip(f'refusing to alter existing TAP {tap}')
+
 env = {k: v for k, v in os.environ.items() if not k.startswith('BYCORF_')}
 env.update(BYCORF_DPDK_MODE='adaptive', BYCORF_DPDK_QUEUES='1',
            BYCORF_DPDK_RX_STEERING='hash', BYCORF_DPDK_IP='198.18.0.2',

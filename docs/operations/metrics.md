@@ -128,8 +128,8 @@ histogram_quantile(
 Meta-managed Data nodes export process-level control health without node,
 group, assignment, directive, or operation identifiers as labels:
 
-- `lavik_cluster_control_connected`: 1 while worker 0 owns an accepted Meta
-  session, otherwise 0.
+- `lavik_cluster_control_connected`: 1 while the final runtime worker (the Meta
+  control worker) owns an accepted Meta session, otherwise 0.
 - `lavik_cluster_control_reconnects_total`: reconnect rounds after the first
   attempt.
 - `lavik_cluster_control_protocol_errors_total`: sessions closed for invalid
