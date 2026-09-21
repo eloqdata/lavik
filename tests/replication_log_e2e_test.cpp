@@ -1085,8 +1085,8 @@ class ReplicationLogService final : public bycorf::Service {
     if (!remaining_record.ok()) co_return remaining_record.status();
     Check(remaining_record->value_ == "third",
           "the covered-key FIFO lost the committed after-image");
-    storage_->AcknowledgeFullSyncPublishItem(
-        kSecondSession, remaining_result->front().id_);
+    storage_->AcknowledgeFullSyncPublishItem(kSecondSession,
+                                             remaining_result->front().id_);
     storage_->EndPartitionReplication(kSecondSession, partition_id);
     storage_->EndFullSyncSession(kFirstSession);
     storage_->EndFullSyncSession(kSecondSession);

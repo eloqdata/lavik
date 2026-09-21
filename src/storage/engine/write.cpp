@@ -2118,10 +2118,9 @@ void StorageEngine::Impl::FullSyncCaptureOnCommit(
   auto& latest_by_key = capture.latest_by_key_[record.db_id_];
   auto found = latest_by_key.find(record.key_);
   const bool replacing = found != latest_by_key.end();
-  if (!replacing &&
-      !TryConsumeFullSyncCoverageCredit(store, session_id, capture,
-                                        record.key_.size(),
-                                        /*allocates_arena_entry=*/false)) {
+  if (!replacing && !TryConsumeFullSyncCoverageCredit(
+                        store, session_id, capture, record.key_.size(),
+                        /*allocates_arena_entry=*/false)) {
     // The durable foreground mutation remains valid. Full sync is the
     // lower-priority consumer, so invalidate only that session before any
     // unbudgeted override container allocation can occur.
@@ -2271,9 +2270,9 @@ void StorageEngine::Impl::PublishCommittedFullSyncEffects(
     for (std::uint64_t session_id : effect.session_ids_) {
       auto capture = partition.fullsync_subscribers_.find(session_id);
       if (capture == partition.fullsync_subscribers_.end()) continue;
-      FullSyncCaptureOnCommit(
-          store, session_id, capture->second, effect.record_,
-          ComputeDigest(effect.record_.key_), nullptr);
+      FullSyncCaptureOnCommit(store, session_id, capture->second,
+                              effect.record_,
+                              ComputeDigest(effect.record_.key_), nullptr);
     }
   }
   shard->fullsync_effects_.clear();
