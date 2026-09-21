@@ -1813,6 +1813,11 @@ class StorageEngine::Impl {
     // cycle's deletes — including block-allocation waits that release
     // store_state_mutex mid-append.
     bool expiry_cycle_running_ = false;
+    // Cache ownership, never validity. Each worker aliases the shared grant
+    // through its own control block so queued candidates and mutation guards
+    // do not contend on the published grant's reference count.
+    std::shared_ptr<ExpirationAuthorityGrant> expiration_authority_cache_;
+    std::uint64_t expiration_authority_version_ = 0;
     std::deque<ExpireCandidate> expired_candidates_;
   };
 
@@ -2229,8 +2234,8 @@ class StorageEngine::Impl {
   absl::Status SetExpirationAuthorityUntil(
       std::shared_ptr<LeaseDeadline> lease) noexcept;
 
-  std::shared_ptr<ExpirationAuthorityGrant> CurrentExpirationAuthority()
-      const noexcept;
+  std::shared_ptr<ExpirationAuthorityGrant> CurrentExpirationAuthority(
+      WorkerStore& store) const noexcept;
 
   static bool ExpirationAuthorityIsValid(
       const ExpirationAuthorityGrant* authority) noexcept;
@@ -3842,6 +3847,10 @@ class StorageEngine::Impl {
   std::atomic<bool> expiration_authority_{true};
   std::atomic<std::shared_ptr<ExpirationAuthorityGrant>>
       active_expiration_authority_;
+  // An invalidation counter, not an authority token. Increment after each
+  // replacement publication, including removal. Ordinary shared-lease renewal
+  // does not change the grant or this counter. Zero denotes an unfilled cache.
+  std::atomic<std::uint64_t> expiration_authority_version_{1};
 #if LAVIK_FAULTS_ENABLED
   // Unit tests use this synchronous hook to revoke an exact grant after the
   // early check without relying on scheduler timing. It is absent from

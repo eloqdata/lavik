@@ -38,6 +38,18 @@ namespace lavik::storage {
 
 class ExpirationAuthorityTestPeer {
  public:
+  using WorkerCache = StorageEngine::Impl::WorkerStore;
+
+  static std::shared_ptr<const void> CachedGrant(
+      const StorageEngine& storage, WorkerCache& cache) {
+    return storage.impl_->CurrentExpirationAuthority(cache);
+  }
+
+  static std::uint64_t PublicationVersion(const StorageEngine& storage) {
+    return storage.impl_->expiration_authority_version_.load(
+        std::memory_order_acquire);
+  }
+
   static std::shared_ptr<const void> CurrentGrant(
       const StorageEngine& storage) {
     return std::static_pointer_cast<const void>(
@@ -67,7 +79,7 @@ class ExpirationAuthorityTestPeer {
       return absl::FailedPreconditionError(
           "stale queue test did not start with an empty queue");
     }
-    auto stale = impl->CurrentExpirationAuthority();
+    auto stale = impl->CurrentExpirationAuthority(store);
     if (stale == nullptr) {
       return absl::FailedPreconditionError(
           "stale queue test has no initial authority");
@@ -75,7 +87,7 @@ class ExpirationAuthorityTestPeer {
     absl::Status replaced = storage.SetExpirationAuthorityUntil(
         std::chrono::nanoseconds::max() - std::chrono::nanoseconds(1));
     if (!replaced.ok()) return replaced;
-    auto current = impl->CurrentExpirationAuthority();
+    auto current = impl->CurrentExpirationAuthority(store);
     if (current == nullptr || current == stale) {
       return absl::FailedPreconditionError(
           "stale queue test did not replace its exact authority");
@@ -131,6 +143,43 @@ class ExpirationAuthorityTestPeer {
     storage.impl_->ResumeExpiration();
     co_return co_await storage.impl_->ExpireCandidate(store,
                                                       std::move(candidate));
+  }
+
+  static bycorf::Task<absl::Status> ExpireWhileKeyLocked(
+      StorageEngine& storage, std::function<absl::Status()> transition) {
+    auto* impl = storage.impl_.get();
+    auto& store = impl->CurrentStore();
+    if (store.expired_candidates_.empty())
+      co_return absl::NotFoundError("no queued expiration candidate");
+    auto candidate = std::move(store.expired_candidates_.front());
+    store.expired_candidates_.pop_front();
+    auto hold = co_await tx::CurrentTxShard().AcquireKey(
+        candidate.db_id_, tx::FingerprintOf(candidate.digest_),
+        tx::LockMode::kExclusive);
+    auto task = impl->ExpireCandidate(store, std::move(candidate));
+    auto handle = std::move(task).ReleaseHandle();
+    task = bycorf::Task<absl::Status>(handle);
+    bycorf::AsyncNotification completed;
+    task.SetCompletionCallback(&completed, [](void* context, auto) noexcept {
+      static_cast<bycorf::AsyncNotification*>(context)->NotifyAll(
+          *bycorf::ThisWorker().self_);
+    });
+    // Start the real delete while holding its key. It must pass the early
+    // authority check and suspend at AcquireKey before the transition runs.
+    impl->ResumeExpiration();
+    handle.resume();
+    const bool suspended = !task.done();
+    auto paused = co_await impl->QuiesceExpiration();
+    auto changed = suspended ? transition() : absl::FailedPreconditionError(
+        "expiration did not suspend behind the held key");
+    // Refresh the worker cache while the pending mutation retains the old
+    // local control block. This must neither dangle nor reauthorize that work.
+    (void)impl->CurrentExpirationAuthority(store);
+    hold.Reset();
+    while (!task.done()) co_await completed.Wait();
+    if (!paused.ok()) co_return paused;
+    if (!changed.ok()) co_return changed;
+    co_return std::move(task).TakeResult();
   }
 #endif
 };
@@ -247,6 +296,8 @@ class FiniteExpirationAuthorityService final : public bycorf::Service {
     result_ = co_await ExerciseDiskFullFallbackPrecondition();
     if (!result_.ok()) co_return Finish();
     result_ = co_await ExerciseCurrentGrant();
+    if (!result_.ok()) co_return Finish();
+    result_ = co_await ExerciseCachedGrantTransitions();
 #endif
     co_return Finish();
   }
@@ -379,6 +430,48 @@ class FiniteExpirationAuthorityService final : public bycorf::Service {
     }
     co_return absl::OkStatus();
   }
+
+  bycorf::Task<absl::Status> ExerciseCachedGrantTransitions() {
+    using Peer = lavik::storage::ExpirationAuthorityTestPeer;
+    for (unsigned scenario = 0; scenario != 3; ++scenario) {
+      const auto deadline =
+          FarFutureExpirationDeadline() - std::chrono::seconds(1);
+      auto lease = std::make_shared<lavik::LeaseDeadline>(deadline);
+      auto granted = storage_->SetExpirationAuthorityUntil(lease);
+      if (!granted.ok()) co_return granted;
+      auto prepared = co_await SeedExpired(
+          "expiration-cache-{foo}-" + std::to_string(scenario));
+      if (!prepared.ok()) co_return prepared;
+      const auto before = storage_->LocalSize(0);
+      absl::Status expired;
+      if (scenario == 0) {
+        // A queued local alias cannot survive authority revocation as a
+        // permission to delete, even though it still owns the grant object.
+        storage_->SetExpirationAuthority(false);
+        expiration_paused_ = false;
+        expired = co_await Peer::ResumeAndExpireFront(*storage_);
+        auto paused = co_await storage_->QuiesceExpiration();
+        expiration_paused_ = paused.ok();
+        if (!paused.ok()) co_return paused;
+      } else {
+        expired = co_await Peer::ExpireWhileKeyLocked(*storage_, [&] {
+          if (scenario == 1)
+            return storage_->SetExpirationAuthorityUntil(
+                FarFutureExpirationDeadline());
+          return lease->Renew(deadline - std::chrono::seconds(1),
+                              FarFutureExpirationDeadline())
+                     ? absl::OkStatus()
+                     : absl::FailedPreconditionError("shared lease renewal failed");
+        });
+      }
+      if (!expired.ok()) co_return expired;
+      const auto expected = before - (scenario == 2 ? 1 : 0);
+      if (storage_->LocalSize(0) != expected)
+        co_return absl::FailedPreconditionError(
+            "cached expiration grant changed mutation authorization");
+    }
+    co_return absl::OkStatus();
+  }
 #endif
 
   bycorf::Task<absl::Status> QueueExpired(std::string_view key) {
@@ -493,6 +586,66 @@ TEST(StorageExpirationAuthorityTest, LocalRoleLossRevokesSharedLease) {
   EXPECT_FALSE(lease->valid_at(std::chrono::nanoseconds(1)));
   EXPECT_FALSE(
       lease->Renew(std::chrono::nanoseconds(1), FarFutureExpirationDeadline()));
+}
+
+TEST(StorageExpirationAuthorityTest, WorkersOwnSeparateCachedControlBlocks) {
+  using Peer = lavik::storage::ExpirationAuthorityTestPeer;
+  lavik::storage::StorageEngine engine({});
+  Peer::WorkerCache worker0, worker1;
+  auto global = Peer::CurrentGrant(engine);
+  auto local0 = Peer::CachedGrant(engine, worker0);
+  auto local1 = Peer::CachedGrant(engine, worker1);
+  ASSERT_NE(local0, nullptr);
+  EXPECT_EQ(local0.get(), global.get());
+  EXPECT_EQ(local1.get(), global.get());
+  EXPECT_TRUE(local0.owner_before(local1) || local1.owner_before(local0));
+  EXPECT_TRUE(local0.owner_before(global) || global.owner_before(local0));
+  const auto global_refs = global.use_count();
+  std::vector<std::shared_ptr<const void>> candidates;
+  for (unsigned i = 0; i != 64; ++i)
+    candidates.push_back(Peer::CachedGrant(engine, worker0));
+  EXPECT_EQ(global.use_count(), global_refs);
+  EXPECT_FALSE(local0.owner_before(candidates.back()));
+  EXPECT_FALSE(candidates.back().owner_before(local0));
+
+  engine.SetExpirationAuthority(false);
+  EXPECT_EQ(Peer::CachedGrant(engine, worker0), nullptr);
+  EXPECT_EQ(Peer::CachedGrant(engine, worker1), nullptr);
+  EXPECT_TRUE(Peer::IsCancellation(Peer::ValidateGrant(candidates.front())));
+  engine.SetExpirationAuthority(true);
+  auto replacement = Peer::CachedGrant(engine, worker0);
+  ASSERT_NE(replacement, nullptr);
+  EXPECT_NE(replacement.get(), local0.get());
+  EXPECT_TRUE(Peer::IsCancellation(Peer::ValidateGrant(local0)));
+  EXPECT_TRUE(Peer::ValidateGrant(replacement).ok());
+}
+
+TEST(StorageExpirationAuthorityTest, SharedRenewalKeepsWorkerCacheAndLiveChecks) {
+  using namespace std::chrono_literals;
+  using Peer = lavik::storage::ExpirationAuthorityTestPeer;
+  lavik::storage::StorageEngineOptions options;
+  options.expiration_authority_ = false;
+  lavik::storage::StorageEngine engine(std::move(options));
+  Peer::WorkerCache cache;
+  EXPECT_EQ(Peer::CachedGrant(engine, cache), nullptr);
+  const auto deadline = FarFutureExpirationDeadline() - 1s;
+  auto lease = std::make_shared<lavik::LeaseDeadline>(deadline);
+  ASSERT_TRUE(engine.SetExpirationAuthorityUntil(lease).ok());
+  auto captured = Peer::CachedGrant(engine, cache);
+  ASSERT_NE(captured, nullptr);
+  const auto version = Peer::PublicationVersion(engine);
+  ASSERT_TRUE(lease->Renew(deadline - 1s, deadline + 1s));
+  EXPECT_EQ(Peer::PublicationVersion(engine), version);
+  auto renewed = Peer::CachedGrant(engine, cache);
+  EXPECT_EQ(renewed.get(), captured.get());
+  EXPECT_FALSE(renewed.owner_before(captured));
+  EXPECT_FALSE(captured.owner_before(renewed));
+  // Even without cache invalidation, the captured epoch's terminal expiry
+  // must be observed by both cache hits and already queued mutation guards.
+  EXPECT_FALSE(lease->valid_at(FarFutureExpirationDeadline()));
+  EXPECT_EQ(Peer::PublicationVersion(engine), version);
+  EXPECT_EQ(Peer::CachedGrant(engine, cache), nullptr);
+  EXPECT_TRUE(Peer::IsCancellation(Peer::ValidateGrant(captured)));
 }
 
 TEST(StorageExpirationAuthorityTest, LegacyPermanentGrantIsIdempotent) {
