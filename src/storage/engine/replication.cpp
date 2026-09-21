@@ -2300,7 +2300,8 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
       UnlockGuard replica_unlock(&store.replica_apply_mutex_, store.worker_);
       for (auto& partition : store.partitions_) {
         if (!partition.replica_sync_ ||
-            partition.replica_sync_->session_id_ != session_id)
+            partition.replica_sync_->session_id_ != session_id ||
+            !partition.replica_value_stage_)
           continue;
         const auto aborted = co_await AbortReplicaValueStage(store, partition);
         if (!aborted.ok()) co_return aborted;

@@ -383,14 +383,12 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
           after.entries_.push_back(std::move(field));
       }
     }
-    for (auto& field : incoming.entries_) {
-      if (std::any_of(
-              after.entries_.begin(), after.entries_.end(),
-              [&](const auto& other) { return other.field_ == field.field_; }))
-        co_return absl::InvalidArgumentError(
-            "replica collection contains a duplicate field/member");
+    for (auto& field : incoming.entries_)
       after.entries_.push_back(std::move(field));
-    }
+    // SplitHashGroup validates exact field identities before any batch writes.
+    // Equal fields route to the same group, so this covers both incoming and
+    // earlier staged entries. Rechecking the combined image here would add a
+    // whole-image sort/scan on top of that required per-group validation.
     const auto written = co_await CommitGroupedHashMutationLocked(
         store, partition, stage.db_id_, stage.key_, digest, previous,
         std::move(after), std::move(touched),
@@ -409,31 +407,17 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
     for (auto& item : page.elements_)
       entries.push_back({.value_ = std::move(item)});
   } else {
+    // Every streamed Sorted Set starts with a fresh indexed root. Page
+    // planning rejects repeated members within the batch; preparing the
+    // member index rejects collisions with earlier, untouched ordered pages,
+    // including the same member at another score, before either graph writes.
+    // Keep that invariant explicit instead of scanning all prior pages here.
+    if (previous && !previous->has_member_index())
+      co_return absl::DataLossError(
+          "collection staged Sorted Set has no member index");
     for (auto& item : page.scored_members_)
       entries.push_back(
           {.value_ = std::move(item.member_), .score_ = item.score_});
-    // There is no resident per-member index for grouped Sorted Sets. Validate
-    // exact uniqueness with bounded page reads, including different scores;
-    // sorted adjacency alone cannot detect a repeated member at another score.
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-      for (std::size_t j = 0; j < i; ++j)
-        if (entries[j].value_ == entries[i].value_)
-          co_return absl::InvalidArgumentError(
-              "duplicate replica sorted member");
-    }
-    if (previous) {
-      for (const auto& metadata : previous->ordered_directory().groups()) {
-        auto old = co_await LoadOrderedGroupSnapshot(
-            store, partition, stage.db_id_, stage.key_, digest, previous,
-            metadata.id_);
-        if (!old.ok()) co_return old.status();
-        for (const auto& old_entry : old->snapshot_.entries_)
-          for (const auto& entry : entries)
-            if (entry.value_ == old_entry.value_)
-              co_return absl::InvalidArgumentError(
-                  "duplicate replica sorted member");
-      }
-    }
   }
   OrderedCollectionMutationPlan plan;
   if (!previous) {

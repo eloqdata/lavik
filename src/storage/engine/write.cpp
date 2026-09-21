@@ -1190,10 +1190,20 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       co_return absl::InternalError("replica absence undo lost its entry");
     RemoveFullSyncCoverageEntry(partition, entry->db_id_, key_bytes);
     unlock.Unlock();
-    auto dead = co_await MarkRecordDead(root_retirement);
+    // Local cleanup is synchronous. Awaiting a freshly completed Task for
+    // every receipt can grow the native stack in an unoptimized coroutine
+    // build; a large interrupted FULL can retain tens of thousands of them.
+    absl::Status dead;
+    if (root_retirement.block_owner_ == store.worker_->id())
+      dead = MarkRecordDeadLocal(store.worker_->id(), root_retirement);
+    else
+      dead = co_await MarkRecordDead(root_retirement);
     if (dead.ok() && entry->applied_grouped_retirements_) {
       for (const auto& child : *entry->applied_grouped_retirements_) {
-        dead = co_await MarkRecordDead(child);
+        if (child.block_owner_ == store.worker_->id())
+          dead = MarkRecordDeadLocal(store.worker_->id(), child);
+        else
+          dead = co_await MarkRecordDead(child);
         if (!dead.ok()) break;
       }
     }
@@ -1202,17 +1212,20 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       // the original predecessor was absent. They are release-only receipts.
       for (const auto& pin : *entry->previous_grouped_retirements_) {
         if (!pin.dependency_pinned_) continue;
-        auto release = [this, pin]() -> Task<absl::Status> {
-          auto& owner = *stores_[pin.block_owner_];
-          co_await owner.store_state_mutex_.Lock();
-          UnlockGuard pin_unlock(&owner.store_state_mutex_, owner.worker_);
-          UnpinTxDependencyLocal(owner, pin.block_id_, pin.allocation_epoch_);
-          co_return absl::OkStatus();
-        };
-        if (pin.block_owner_ == store.worker_->id())
-          dead = co_await release();
-        else
+        if (pin.block_owner_ == store.worker_->id()) {
+          co_await store.store_state_mutex_.Lock();
+          UnlockGuard pin_unlock(&store.store_state_mutex_, store.worker_);
+          UnpinTxDependencyLocal(store, pin.block_id_, pin.allocation_epoch_);
+        } else {
+          auto release = [this, pin]() -> Task<absl::Status> {
+            auto& owner = *stores_[pin.block_owner_];
+            co_await owner.store_state_mutex_.Lock();
+            UnlockGuard pin_unlock(&owner.store_state_mutex_, owner.worker_);
+            UnpinTxDependencyLocal(owner, pin.block_id_, pin.allocation_epoch_);
+            co_return absl::OkStatus();
+          };
           dead = co_await bycorf::SubmitTaskTo(pin.block_owner_, release);
+        }
         if (!dead.ok()) break;
       }
     }

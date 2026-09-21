@@ -1428,6 +1428,9 @@ endforeach()
     )
     set_tests_properties(lavik_replica_abort_reclaim_e2e PROPERTIES
       TIMEOUT 180)
+    add_test(NAME lavik_replica_abort_small_stack
+      COMMAND lavik_replica_abort_reclaim_e2e_test --small-stack-abort)
+    set_tests_properties(lavik_replica_abort_small_stack PROPERTIES TIMEOUT 60)
 
     add_executable(lavik_pubsub_e2e_test
       tests/pubsub_e2e_test.cpp
