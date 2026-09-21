@@ -18,8 +18,7 @@ limitations under the License.
 
 Lavik can expose plaintext and TLS Redis endpoints at the same time. This
 guide covers kernel TCP serving and outgoing replication authentication.
-Bycorf provides the TLS transport. The release archive includes this guide as
-`tls-and-auth.md` beside the executables.
+Bycorf provides the TLS transport.
 
 ## Server configuration
 
