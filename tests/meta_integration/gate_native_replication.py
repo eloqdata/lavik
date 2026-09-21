@@ -390,6 +390,43 @@ def full_tail(root):
             reader.close()
 
 
+def full_tail_publish_before_reset(root):
+    # One source worker resets only the first batch before handing off slot 0.
+    # Publish into the last slot while that flow is paused: both the bare
+    # command and the EXEC envelope must replay before their transport slot
+    # has any replica storage context.
+    tag = next(f"full-publish-{i}" for i in range(100000)
+               if C.redis_slot(f"full-publish-{i}") == 16383)
+    channel = "{" + tag + "}channel"
+    with pair(root, "full-tail-publish-before-reset", source_faults={
+            "LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "3000"},
+            require_seed_before_full=True,
+            source_workers=1, target_workers=2) as (meta, source, target, writer):
+        H.wait_until("partition zero handed off before publications", 30, lambda:
+                     "paused full sync after acknowledged handoff partition 0 "
+                     in Path(source.log_path).read_text())
+        subscriber = Client(target)
+        try:
+            assert subscriber.call("SUBSCRIBE", channel) == ["subscribe", channel, 1]
+            assert writer.call("PUBLISH", channel, "bare") == 0
+            assert writer.call("MULTI") == "OK"
+            assert writer.call("PUBLISH", channel, "first") == "QUEUED"
+            assert writer.call("PUBLISH", channel, "second") == "QUEUED"
+            assert writer.call("EXEC") == [0, 0]
+            for message in ("bare", "first", "second"):
+                assert C.read_resp(subscriber.reader) == ["message", channel, message]
+            ready(meta)
+            assert writer.call("PUBLISH", channel, "online") == 0
+            assert writer.call("WAIT", 1, 5000) == 1
+            # The next message also proves that the FULL cut did not replay
+            # the preceding publications a second time through ONLINE.
+            assert C.read_resp(subscriber.reader) == ["message", channel, "online"]
+        finally:
+            subscriber.close()
+        assert Path(source.log_path).read_text().count("selected=FULL") == 1
+        assert "precedes partition reset" not in Path(target.log_path).read_text()
+
+
 def full_tail_expiration_effects(root):
     # The source pauses after handing off partition zero. Mutations made in
     # that window must use FULL command replay, not the initial snapshot or
@@ -550,6 +587,7 @@ def main():
         full_tail(root)
         backpressured_shutdown(root)
         if C.has_fault(C.DATA, b"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK"):
+            full_tail_publish_before_reset(root)
             full_tail_expiration_effects(root)
             handoff_order(root)
             cancelled_handoff(root)

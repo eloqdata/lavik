@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "lavik/command.h"
@@ -139,6 +140,75 @@ TEST(ReplicationCommandTest, OtherWritesStillReceiveExpirationEffect) {
                           std::string(lavik::kReplicatedExecCommand), "2", "3",
                           "4", "HSET", "key", "field", "value", "3", "3",
                           "PEXPIREAT", "key", "123456"}));
+}
+
+TEST(ReplicationCommandTest,
+     ClassifiesOnlyCompletePublishEffectsAsPartitionless) {
+  EXPECT_TRUE(lavik::IsPublishOnlyReplicationCommand(
+      {0, {"pUbLiSh", "channel", "message"}}));
+  EXPECT_TRUE(lavik::IsPublishOnlyReplicationCommand(
+      {0, lavik::EncodeReplicationCommandEffects(
+              {{0, {"PUBLISH", "first", "SET"}},
+               {15, {"publish", "second", "__LAVIK_EXEC_V1"}}})}));
+
+  // A PUBLISH child does not exempt the storage effects beside it, regardless
+  // of their position in the envelope. TTL wrappers must retain their source
+  // sequence for every child.
+  EXPECT_FALSE(lavik::IsPublishOnlyReplicationCommand(
+      {0, lavik::EncodeReplicationCommandEffects(
+              {{0, {"PUBLISH", "channel", "message"}},
+               {0, {"SET", "key", "value"}}})}));
+  EXPECT_FALSE(lavik::IsPublishOnlyReplicationCommand(
+      {0, lavik::EncodeReplicationCommandEffects(
+              {{0, {"SET", "key", "value"}},
+               {0, {"PUBLISH", "channel", "message"}}})}));
+  for (const std::uint64_t deadline : {0ULL, 123456ULL}) {
+    std::vector<std::string> args{"HSET", "key", "field", "value"};
+    lavik::AppendReplicationExpirationEffect(&args, 0, 0, "key", true,
+                                             deadline);
+    EXPECT_FALSE(lavik::IsPublishOnlyReplicationCommand({0, std::move(args)}));
+  }
+  EXPECT_FALSE(
+      lavik::IsPublishOnlyReplicationCommand({0, {"FUNCTION", "FLUSH"}}));
+}
+
+TEST(ReplicationCommandTest,
+     MalformedPublishEnvelopesCannotBypassPartitionReset) {
+  const auto valid = lavik::EncodeReplicationCommandEffects(
+      {{0, {"PUBLISH", "channel", "message"}}});
+  for (std::size_t size = 0; size < valid.size(); ++size) {
+    SCOPED_TRACE(size);
+    auto truncated = valid;
+    truncated.resize(size);
+    EXPECT_FALSE(lavik::IsPublishOnlyReplicationCommand({0, truncated}));
+  }
+  const std::vector<std::pair<std::size_t, std::string>> corruptions{
+      {1, "0"},
+      {1, "2"},
+      {1, "-1"},
+      {1, "1suffix"},
+      {1, "18446744073709551616"},
+      {2, "16"},
+      {2, "-1"},
+      {2, "0suffix"},
+      {3, "2"},
+      {3, "4"},
+      {3, "3suffix"},
+      {4, "__LAVIK_EXEC_V1"}};
+  for (const auto& [index, value] : corruptions) {
+    SCOPED_TRACE(value);
+    auto malformed = valid;
+    malformed[index] = value;
+    EXPECT_FALSE(lavik::IsPublishOnlyReplicationCommand({0, malformed}));
+  }
+  auto trailing = valid;
+  trailing.push_back("extra");
+  EXPECT_FALSE(lavik::IsPublishOnlyReplicationCommand({0, trailing}));
+  EXPECT_FALSE(lavik::IsPublishOnlyReplicationCommand({16, valid}));
+  EXPECT_FALSE(
+      lavik::IsPublishOnlyReplicationCommand({0, {"PUBLISH", "channel"}}));
+  EXPECT_FALSE(lavik::IsPublishOnlyReplicationCommand(
+      {0, {"PUBLISH", "channel", "message", "extra"}}));
 }
 
 TEST(ReplicationCommandTest, StagingBudgetIncludesShortArgumentOwners) {

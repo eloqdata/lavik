@@ -844,10 +844,11 @@ the same bounded full-sync command FIFOs without creating snapshot state.
 Partition reset epochs are installed on the target in bounded batches, so a
 channel-sharded `PUBLISH` may arrive before its transport partition's batch.
 The target still validates its partition range, frame order, fragmentation,
-and LRC1 body, but only decoded `PUBLISH` is exempt from the installed-epoch
-check because it cannot touch the rebuilding dataset. Durable commands and
-runtime envelopes that can apply storage effects continue to require that epoch
-before replay.
+and LRC1 body. A bare `PUBLISH` or a structurally valid EXEC envelope containing
+only `PUBLISH` children needs neither an installed partition epoch nor a storage
+apply context, because it cannot touch the rebuilding dataset. Envelopes with
+storage effects, including canonical writes paired with expiration effects,
+require that epoch and retain one source sequence throughout their apply.
 In Meta-managed mode `PUBLISH` also carries slot-scoped mutation authority
 through its final replication-publication check. A controlled failover pauses
 new publications and drains those already admitted before freezing the source

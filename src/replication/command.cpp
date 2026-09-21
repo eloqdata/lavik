@@ -22,6 +22,7 @@
 #include <new>
 #include <optional>
 
+#include "absl/strings/match.h"
 #include "lavik/memory.h"
 #include "lavik/replication_command.h"
 
@@ -337,6 +338,44 @@ absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
   return command;
 } catch (const std::length_error&) {
   return absl::ResourceExhaustedError("replication command is too large");
+}
+
+bool IsPublishOnlyReplicationCommand(
+    const ReplicatedCommand& command) noexcept {
+  if (command.db_id_ >= storage::kLogicalDatabaseCount) return false;
+  const std::span<const std::string> args(command.args_);
+  if (args.empty()) return false;
+  auto is_publish = [](std::span<const std::string> child) {
+    return child.size() == 3 && absl::EqualsIgnoreCase(child[0], "PUBLISH");
+  };
+  if (args[0] != kReplicatedExecCommand) return is_publish(args);
+  if (args.size() < 2) return false;
+  auto parse_size = [](std::string_view text, std::uint64_t* value) {
+    const auto parsed =
+        std::from_chars(text.data(), text.data() + text.size(), *value);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+  };
+  std::uint64_t count = 0;
+  // Each child needs its DB, argc, and all three PUBLISH arguments. Check
+  // the complete envelope before granting the partition-reset exemption;
+  // a valid leading publication must not hide a later storage mutation.
+  if (!parse_size(args[1], &count) || count == 0 ||
+      count > (args.size() - 2) / 5) {
+    return false;
+  }
+  std::size_t offset = 2;
+  for (std::uint64_t index = 0; index < count; ++index) {
+    std::uint64_t db_id = 0;
+    std::uint64_t argc = 0;
+    if (!parse_size(args[offset], &db_id) ||
+        db_id >= storage::kLogicalDatabaseCount ||
+        !parse_size(args[offset + 1], &argc) || argc != 3 ||
+        !is_publish(args.subspan(offset + 2, 3))) {
+      return false;
+    }
+    offset += 5;
+  }
+  return offset == args.size();
 }
 
 void AppendReplicationExpirationEffect(std::vector<std::string>* args,
