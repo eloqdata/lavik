@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "bycorf/net/server.h"
+#include "bycorf/runtime/worker.h"
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
 #include "lavik/storage/detail/collection_compact_stream.h"
@@ -142,7 +143,8 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
   bycorf::Task<absl::Status> ExerciseSmallStackAbort() {
     using namespace lavik::storage;
     std::uint64_t session = 1800;
-    for (const auto type : {ValueType::kHash, ValueType::kSet}) {
+    for (const auto type :
+         {ValueType::kHash, ValueType::kSet, ValueType::kSortedSet}) {
       ++session;
       auto reset = co_await ResetFullRoot(session);
       if (!reset.ok()) co_return reset.status();
@@ -533,10 +535,12 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
     co_return absl::OkStatus();
   }
   static std::string CollectionBytes(lavik::storage::ValueType type, char fill,
-                                     std::optional<unsigned> duplicate = {}) {
+                                     std::optional<unsigned> duplicate = {},
+                                     unsigned count = kStreamEntries,
+                                     std::size_t payload_bytes = 2048) {
     using namespace lavik::storage;
     CollectionPage page{.value_type_ = type};
-    for (unsigned i = 0; i < kStreamEntries; ++i) {
+    for (unsigned i = 0; i < count; ++i) {
       // Include empty and binary field identities; uniqueness is not C-string
       // equality. Duplicate fixtures repeat the first identity in one batch
       // or after an earlier batch has already published its staged root.
@@ -545,12 +549,19 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
           ordinal == 0 ? std::string{}
                        : std::string("field\0", 6) + std::to_string(ordinal);
       if (type == ValueType::kHash)
-        page.fields_.push_back({name, std::string(2048, fill)});
+        page.fields_.push_back({name, std::string(payload_bytes, fill)});
       else if (type == ValueType::kSortedSet)
+        // A repeated member keeps the new score, so ordering alone cannot
+        // reject it. The last-entry duplicate is outside the rewritten tail
+        // pages and must be caught by the persisted member index.
         page.scored_members_.push_back(
-            {name + std::string(2048, fill), double(i)});
+            {ordinal == 0 ? std::string{}
+                          : name + std::string(payload_bytes, fill),
+             double(i)});
       else
-        page.elements_.push_back(name + std::string(2048, fill));
+        page.elements_.push_back(type == ValueType::kSet && ordinal == 0
+                                     ? std::string{}
+                                     : name + std::string(payload_bytes, fill));
     }
     auto measured = CollectionCompactEncoder::MeasurePage(page);
     Check(measured.ok(), "collection fixture measurement failed");
@@ -572,11 +583,17 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
                                             lavik::storage::ValueType type,
                                             std::uint64_t sequence,
                                             unsigned mode, char fill = 'v') {
-    const auto duplicate = mode == 3 ? std::optional<unsigned>(1)
-                           : mode == 4
-                               ? std::optional<unsigned>(kStreamEntries - 1)
-                               : std::nullopt;
-    const auto encoded = CollectionBytes(type, fill, duplicate);
+    // The small-stack regression targets abort, not fixture construction.
+    // Larger items bound setup writes per fixed-size transport chunk; yielding
+    // between chunks avoids GCC Debug's immediate-write completion chains.
+    // The object still spans several batches with squashed roots and pins.
+    const unsigned count = abort_only_ ? 64 : kStreamEntries;
+    const std::size_t payload_bytes = abort_only_ ? 64 * 1024 : 2048;
+    const auto duplicate = mode == 3   ? std::optional<unsigned>(1)
+                           : mode == 4 ? std::optional<unsigned>(count - 1)
+                                       : std::nullopt;
+    const auto encoded =
+        CollectionBytes(type, fill, duplicate, count, payload_bytes);
     SnapshotRecord frame{.kind_ = SnapshotRecord::Kind::kValueBegin,
                          .db_id_ = 0,
                          .db_epoch_ = storage_->DbEpoch(0),
@@ -589,7 +606,7 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
                          .value_ = std::string(8, '\0')};
     for (unsigned byte = 0; byte < 8; ++byte)
       frame.value_[byte] =
-          static_cast<char>(std::uint64_t{kStreamEntries} >> (8 * byte));
+          static_cast<char>(std::uint64_t{count} >> (8 * byte));
     const auto partition = lavik::storage::RedisSlot(key);
     auto apply = [&]() {
       return storage_->ApplyReplicaRecords(session, partition, epoch,
@@ -607,6 +624,7 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
       frame.value_ = encoded.substr(offset, bytes);
       status = co_await apply();
       if (!status.ok()) co_return status;
+      if (abort_only_) co_await bycorf::Yield(*worker_);
     }
     if (mode == 1) co_return status;
     frame.kind_ = SnapshotRecord::Kind::kValueCommit;
@@ -622,8 +640,7 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
       const std::string key =
           "native-collection-" + std::to_string(unsigned(type));
       const auto partition = RedisSlot(key);
-      const unsigned modes =
-          type == ValueType::kHash || type == ValueType::kSet ? 5 : 3;
+      const unsigned modes = type == ValueType::kList ? 3 : 5;
       for (unsigned mode = 0; mode < modes; ++mode) {
         ++session;
         std::vector<ReplicaPartitionEpoch> epochs;
@@ -655,9 +672,16 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
         if (mode >= 2) {
           Check(!sent.ok(),
                 "malformed collection stream unexpectedly committed");
-          if (mode >= 3)
-            Check(absl::IsInvalidArgument(sent),
+          if (mode >= 3) {
+            // Batch-local duplicates fail input validation. A Sorted Set
+            // collision with an earlier, untouched page is rejected by the
+            // ordered/member-index consistency check before publication.
+            const bool indexed_collision =
+                type == ValueType::kSortedSet && mode == 4;
+            Check(indexed_collision ? absl::IsDataLoss(sent)
+                                    : absl::IsInvalidArgument(sent),
                   "duplicate collection identity did not fail validation");
+          }
           auto restored = co_await storage_->ReadRawValue(0, key);
           if (!restored.ok()) co_return restored.status();
           Check(restored->value_type_ == type &&

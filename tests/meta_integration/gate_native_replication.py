@@ -24,6 +24,7 @@ import os
 import concurrent.futures
 from pathlib import Path
 import subprocess
+import struct
 import sys
 import tempfile
 import time
@@ -242,15 +243,15 @@ def replay_and_reconnect(root):
             source.resume()
 
 
-def dense_hash_and_set_full_sync(root):
+def dense_collection_full_sync(root):
     # Many short identities exercise duplicate validation against a growing
     # staged object. A few large values do not expose the quadratic scan that
     # previously monopolized the replica worker during FULL sync.
     count = 32768
 
     def dump(kind):
-        # Plain RDB Hash/Set with short binary strings, version 11 and Redis's
-        # CRC64 footer. RESTORE seeds one bounded stream instead of repeatedly
+        # Plain RDB Hash/Set/ZSet with short binary strings, version 11 and a
+        # Redis CRC64 footer. RESTORE seeds one bounded stream instead of repeatedly
         # rewriting an ever-growing object or hitting compact HREPLACE's argc
         # limit. Build payloads before holding the target's control directive.
         data = bytearray([kind, 0x80]) + count.to_bytes(4, "big")
@@ -258,7 +259,10 @@ def dense_hash_and_set_full_sync(root):
             member = f"member\0{i:08d}".ljust(48, "x").encode()
             data += bytes([len(member)]) + member
             if kind == 4:
-                data += b"\x20" + b"v" * 32
+                value = f"value\0{i:08d}".ljust(32, "v").encode()
+                data += bytes([len(value)]) + value
+            elif kind == 5:
+                data += struct.pack("<d", float(i))
         data += b"\x0b\x00"
         polynomial = int(f"{0xad93d23594c935a9:064b}"[::-1], 2)
         table = []
@@ -272,13 +276,15 @@ def dense_hash_and_set_full_sync(root):
             crc = table[(crc ^ byte) & 255] ^ (crc >> 8)
         return bytes(data) + crc.to_bytes(8, "little")
 
-    hash_payload, set_payload = dump(4), dump(2)
+    hash_payload, set_payload, zset_payload = dump(4), dump(2), dump(5)
 
     def seed(writer):
         H.log(f"seeding dense Hash with {count} fields")
         assert writer.call("RESTORE", "{dense}hash", 0, hash_payload) == "OK"
         H.log(f"seeding dense Set with {count} members")
         assert writer.call("RESTORE", "{dense}set", 0, set_payload) == "OK"
+        H.log(f"seeding dense ZSet with {count} members")
+        assert writer.call("RESTORE", "{dense}zset", 0, zset_payload) == "OK"
 
     # This gate verifies ingestion and payload integrity under the ordinary
     # five-second authority lease. Subsecond lease tests expose a separate
@@ -293,17 +299,20 @@ def dense_hash_and_set_full_sync(root):
         try:
             assert reader.call("HLEN", "{dense}hash") == count
             assert reader.call("SCARD", "{dense}set") == count
-            # Compare every member/value; cardinality alone could hide damage
-            # introduced while reordering a Hash/Set ingestion batch.
+            assert reader.call("ZCARD", "{dense}zset") == count
+            # Distinct values and scores expose association errors that counts
+            # alone, or a fixture with one repeated Hash value, cannot detect.
             assert sorted(reader.call("SMEMBERS", "{dense}set")) == sorted(
                 writer.call("SMEMBERS", "{dense}set"))
             expected = writer.call("HGETALL", "{dense}hash")
             actual = reader.call("HGETALL", "{dense}hash")
             assert dict(zip(actual[::2], actual[1::2])) == dict(
                 zip(expected[::2], expected[1::2]))
+            assert reader.call("ZRANGE", "{dense}zset", 0, -1, "WITHSCORES") == \
+                writer.call("ZRANGE", "{dense}zset", 0, -1, "WITHSCORES")
         finally:
             reader.close()
-        H.log(f"dense Hash/Set FULL verified {count} members each in "
+        H.log(f"dense Hash/Set/ZSet FULL verified {count} members each in "
               f"{time.monotonic() - started:.3f}s")
 
 
@@ -493,7 +502,7 @@ def main():
                                      dir=os.environ.get("LAVIK_TEST_DATA_DIR")) as directory:
         root = Path(directory)
         replay_and_reconnect(root)
-        dense_hash_and_set_full_sync(root)
+        dense_collection_full_sync(root)
         full_tail(root)
         backpressured_shutdown(root)
         if C.has_fault(C.DATA, b"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK"):
