@@ -16,6 +16,10 @@ limitations under the License.
 
 # Building and packaging
 
+The optional [Lavik Admin service](lavik-admin.md) has a separate Docker
+package containing Node.js, its browser assets, and `lavik-ctl`. It connects
+to existing Meta and Data deployments; its container does not run io_uring.
+
 ## Kernel requirements
 
 Running `lavik` or `lavik-meta` requires **Linux 6.1 or newer** with io_uring

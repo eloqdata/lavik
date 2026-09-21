@@ -24,6 +24,17 @@ namespace lavik::meta {
 using MetaCommitEventSink =
     std::function<void(std::uint64_t, const MetaApplyResult&)>;
 
+// Bounded diagnostic projection; never carries an operation's opaque intent,
+// directives, or receipts. Text previews may be truncated to 512 bytes.
+struct MetaOperationSummary {
+  MetaOperationId operation_id_{};
+  std::uint64_t operation_seq_ = 0;
+  MetaOperationLifecycle lifecycle_ = MetaOperationLifecycle::kSubmitted;
+  std::string kind_;
+  std::string phase_;
+  std::string result_;
+};
+
 // The C++ state machine owns the six volatile committed stores. Go owns their
 // durable WAL/snapshot recovery root, and replays only its committed prefix.
 // Applied is never restored beyond the snapshot's actual state. Apply may run
@@ -48,6 +59,15 @@ class MetaStateMachine {
   absl::Status Install(std::uint64_t index, std::string_view image);
   MetaStores StoresSnapshot() const;
   MetaCommittedStatusView StatusSnapshot() const;
+  // Returns at most 100 live-journal summaries after an immutable submit
+  // sequence, in sequence order, without copying retained operation payloads.
+  std::vector<MetaOperationSummary> OperationSummaries(std::uint64_t after,
+                                                       std::size_t limit) const;
+  // Copies only the requested group's committed topology under the state lock.
+  std::optional<MetaTopologyGroupView> FindGroup(const std::string& id) const {
+    std::lock_guard lock(mutex_);
+    return stores_.topology_.FindGroup(id);
+  }
   void SetCommitEventSink(MetaCommitEventSink sink);
   std::uint64_t last_commit_index() const { return last_committed_idx_.load(); }
   std::uint64_t state_change_index() const noexcept {

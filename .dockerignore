@@ -1,0 +1,20 @@
+# Build contexts must not contain credentials, local state, or test artifacts.
+.git
+**/.git
+.codex
+.agents
+.cache
+.lavik-admin
+admin/.lavik-admin
+**/.env
+admin/node_modules
+admin/test-results
+admin/playwright-report
+build
+build_*
+build-*
+out
+dist
+perf_reports
+third_party/nuraft
+**/__pycache__

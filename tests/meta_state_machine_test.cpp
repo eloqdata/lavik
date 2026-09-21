@@ -262,6 +262,34 @@ class MetaStateMachineTest : public ::testing::Test {
   std::filesystem::path dir_;
 };
 
+TEST_F(MetaStateMachineTest,
+       OperationSummariesAreBoundedAndPaginateBySequence) {
+  auto opened = Open();
+  ASSERT_TRUE(opened.ok());
+  auto machine = std::move(*opened);
+  for (std::uint64_t i = 1; i <= 3; ++i) {
+    SubmitOperation operation;
+    operation.request_id_ = MakeRequestId(static_cast<std::uint8_t>(i));
+    operation.operation_id_ = MakeRequestId(static_cast<std::uint8_t>(4 - i));
+    operation.kind_ = "admin-test";
+    operation.intent_ = std::string(10000, 'x');
+    operation.intent_hash_ = lavik::meta::MetaSha256(operation.intent_);
+    Commit(*machine, i, operation);
+  }
+  const auto first = machine->OperationSummaries(0, 2);
+  ASSERT_EQ(first.size(), 2u);
+  EXPECT_EQ(first[0].operation_seq_, 1u);
+  EXPECT_EQ(first[1].operation_seq_, 2u);
+  const auto next = machine->OperationSummaries(2, 1000);
+  ASSERT_EQ(next.size(), 1u);
+  EXPECT_EQ(next[0].operation_seq_, 3u);
+  EXPECT_EQ(next[0].kind_, "admin-test");
+  EXPECT_TRUE(machine->OperationSummaries(3, 100).empty());
+  EXPECT_TRUE(machine->OperationSummaries(0, 0).empty());
+  EXPECT_EQ(machine->FindOperation(first[0].operation_id_)->intent_.size(),
+            10000u);
+}
+
 TEST_F(MetaStateMachineTest, CommitAppliesRealCommands) {
   auto opened = Open();
   ASSERT_TRUE(opened.ok()) << opened.status();

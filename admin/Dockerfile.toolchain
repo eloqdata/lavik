@@ -1,0 +1,12 @@
+# Copyright (C) 2026 EloqData Inc. Licensed under the Apache License, Version 2.0.
+FROM golang:1.26.8-bookworm AS go
+FROM node:24.15.0-bookworm-slim AS node
+FROM ubuntu:24.04
+COPY --from=go /usr/local/go /usr/local/go
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+ENV PATH="/usr/local/go/bin:${PATH}"
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build git pkg-config libssl-dev zlib1g-dev \
+    libaio-dev liburing-dev ca-certificates python3 redis-tools \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src

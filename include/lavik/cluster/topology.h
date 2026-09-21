@@ -248,8 +248,9 @@ class [[nodiscard]] InFlightGuard {
 struct GroupView {
   std::string group_id_;
   NodeIndex primary_node_index_ = kNoNodeIndex;
-  // Meta creates a fresh assignment incarnation on remove/re-add. Authority
-  // terms are compared only while this identity is unchanged.
+  // The Owner's assignment incarnation, also present on remote routes.
+  // Authority terms are compared while this identity is unchanged. Local
+  // population continuity uses the selected control's member assignment.
   AssignmentId assignment_id_;
   // This is the committed desired grant, not a live lease. A Meta-managed
   // primary serves only while AuthorityGuard also holds an unexpired lease.

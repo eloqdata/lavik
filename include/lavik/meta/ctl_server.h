@@ -75,8 +75,22 @@
 //                             tcp:// or tls://; an active node needs one or
 //                             two before its desired state can be projected.
 //   getnode <node_id>      -> "OK principal=<p> role=<primary|replica>
-//                             revision=<n> retired=<0|1>" / "ERR not-found";
-//                             same non-linearizable read semantics as getop.
+//                             revision=<n> retired=<0|1>
+//                             endpoints=<comma-list>" / "ERR not-found"; same
+//                             non-linearizable read semantics as getop.
+//   getgroup <group_id>    -> leader-only "OK revision=<n> term=<n> owner=<id>
+//                             transition=<0|1>" / "ERR not-found".
+//   listops <after> <limit>
+//                          -> leader-only "OK listops-v1" followed by up to
+//                             100 id:sequence:lifecycle:kind_hex:phase_hex:
+//                             result_hex entries, ordered by immutable submit
+//                             sequence. Opaque intent/directives and archived
+//                             operations are excluded; text previews are
+//                             bounded to 512 bytes per field.
+//   unassignnode <group_id> <node_id40hex> <expected_revision>
+//                          -> remove a non-Owner member of a Created cluster,
+//                             retaining the reviewed membership revision as
+//                             CAS. Active failover blocks membership changes.
 //   putpolicy <policy_id> <version> <content>
 //                          -> commit one immutable policy version; content is
 //                             a strict compact JSON token in a registered

@@ -951,6 +951,15 @@ override; cluster discovery verifies each numeric Admin IP against the
 certificate IP SAN and never falls back between TLS and plaintext. A Unix
 seed can use configured TLS credentials for subsequent remote leader access.
 
+[Lavik Admin](11-admin.md) reuses this transport for its browser/CLI fleet
+workspace. Leader-only `getgroup` reads expose membership revisions, and
+`listops` returns bounded summaries from the live operation journal.
+`getnode` includes the registered client endpoints. Replica removal uses
+`unassignnode` with the reviewed membership revision; it rejects the current
+Owner and an active failover and proposes the existing membership command.
+Meta retains serving authority and committed operation state independently
+of the Admin catalog.
+
 `lavik-ctl cluster-status` normally performs exactly two reads:
 `clusterhead 1` against the supplied seed to learn the current committed Admin
 directory, then `clusterstatus 1` against the indicated leader. Redirect,
@@ -964,7 +973,8 @@ while one follower is unreachable.
 
 `lavik-ctl failover GROUP` uses the same leader discovery, verifies a Created
 cluster and committed Group, generates an operation id and absolute transition
-deadline, and submits one `failover 1` request. Its success point is the
+deadline unless the caller supplies both with `--operation-id` and
+`--deadline-unix-ms`, and submits one `failover 1` request. Its success point is the
 operation commit, not Data cutover. A caller retrying this mutation must retain
 both the operation id and absolute deadline; recomputing either changes the
 intent. Timeout, cancellation, or a generic failure after proposal begins is

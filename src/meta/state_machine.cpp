@@ -16,6 +16,7 @@
 
 #include "lavik/meta/state_machine.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -279,6 +280,31 @@ absl::StatusOr<std::unique_ptr<MetaStateMachine>> MetaStateMachine::Open(
 MetaStores MetaStateMachine::StoresSnapshot() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return stores_;
+}
+
+std::vector<MetaOperationSummary> MetaStateMachine::OperationSummaries(
+    std::uint64_t after, std::size_t limit) const {
+  std::lock_guard lock(mutex_);
+  limit = std::min<std::size_t>(limit, 100);
+  std::vector<const MetaOperationRecord*> ordered;
+  for (const auto& operation : stores_.operation_.LiveOperationsView()) {
+    if (operation.operation_seq_ > after) ordered.push_back(&operation);
+  }
+  const auto count = std::min(limit, ordered.size());
+  std::partial_sort(ordered.begin(), ordered.begin() + count, ordered.end(),
+                    [](const auto* a, const auto* b) {
+                      return a->operation_seq_ < b->operation_seq_;
+                    });
+  std::vector<MetaOperationSummary> result;
+  result.reserve(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto& operation = *ordered[i];
+    result.push_back({operation.operation_id_, operation.operation_seq_,
+                      operation.lifecycle_, operation.kind_.substr(0, 512),
+                      operation.kind_phase_blob_.substr(0, 512),
+                      operation.terminal_result_.substr(0, 512)});
+  }
+  return result;
 }
 
 MetaCommittedStatusView MetaStateMachine::StatusSnapshot() const {

@@ -19,4 +19,4 @@ repos:
       - id: clang-format
         name: clang-format 23.1.1
         files: '^(app/|include/lavik/|src/|tests/).*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$'
-        exclude: '^include/lavik/CLI11\.hpp$'
+        exclude: '^include/lavik/CLI11\.hpp$|^third_party/'

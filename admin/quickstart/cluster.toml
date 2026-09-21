@@ -1,0 +1,38 @@
+# Copyright (C) 2026 EloqData Inc. Licensed under the Apache License, Version 2.0.
+schema_version = 1
+slot_strategy = "contiguous-even"
+
+[[meta_members]]
+id = 1
+raft_endpoint = "tcp://172.29.91.11:7100"
+ctl_endpoint = "tcp://172.29.91.11:7200"
+data_control_endpoint = "tcp://172.29.91.11:7300"
+
+[[meta_members]]
+id = 2
+raft_endpoint = "tcp://172.29.91.12:7100"
+ctl_endpoint = "tcp://172.29.91.12:7200"
+data_control_endpoint = "tcp://172.29.91.12:7300"
+
+[[meta_members]]
+id = 3
+raft_endpoint = "tcp://172.29.91.13:7100"
+ctl_endpoint = "tcp://172.29.91.13:7200"
+data_control_endpoint = "tcp://172.29.91.13:7300"
+
+[[data_nodes]]
+id = "0000000000000000000000000000000000000001"
+client_endpoint = "tcp://172.29.91.21:6379"
+
+[[data_nodes]]
+id = "0000000000000000000000000000000000000002"
+client_endpoint = "tcp://172.29.91.22:6379"
+
+[[data_nodes]]
+id = "0000000000000000000000000000000000000003"
+client_endpoint = "tcp://172.29.91.23:6379"
+
+[[groups]]
+id = "group-1"
+primary = "0000000000000000000000000000000000000001"
+replicas = ["0000000000000000000000000000000000000002", "0000000000000000000000000000000000000003"]

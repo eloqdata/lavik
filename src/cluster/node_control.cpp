@@ -1146,8 +1146,18 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
           new_group->assignment_id_ != old_group.assignment_id_) {
         continue;
       }
+      // Remote routes omit population manifests. Removing this node from a
+      // group therefore clears its local manifest revision while retaining
+      // the Owner's assignment and term in routing. That is loss of local
+      // control, not a regression of a retained population incarnation.
+      const bool retains_local_control =
+          FindControlIdentity(desired_cluster_controls_, old_group.group_id_) !=
+              nullptr &&
+          FindControlIdentity(prepared_state.desired_cluster_controls_,
+                              old_group.group_id_) != nullptr;
       if (new_group->group_term_ < old_group.group_term_ ||
-          new_group->manifest_revision_ < old_group.manifest_revision_) {
+          (retains_local_control &&
+           new_group->manifest_revision_ < old_group.manifest_revision_)) {
         return absl::FailedPreconditionError(absl::StrCat(
             "same-assignment control counter regressed for group '",
             old_group.group_id_, "'"));

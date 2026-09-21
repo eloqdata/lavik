@@ -2971,6 +2971,47 @@ TEST(NodeControlInstallerTest,
 }
 
 TEST(NodeControlInstallerTest,
+     RemovedReplicaCanRetainRemoteRouteAndRejoinWithNewAssignment) {
+  DynamicControl control;
+  const auto state = [](std::uint64_t epoch, bool member) {
+    ServingStateBuilder builder;
+    NodeDescriptor replica = MakeNode(kNodeB, 7001);
+    if (member) replica.primary_node_index_ = 0;
+    builder.SetTopologyEpoch(epoch)
+        .SetSelfNodeIndex(1)
+        .AddNode(MakeNode(kNodeA, 7000))
+        .AddNode(std::move(replica));
+    GroupView group;
+    group.group_id_ = "group-a";
+    group.primary_node_index_ = 0;
+    group.assignment_id_ = Assignment(1);
+    group.group_term_ = 1;
+    group.manifest_revision_ = member ? 1 : 0;
+    group.slot_ranges_.push_back({0, kSlotCount - 1});
+    if (member) group.replica_node_indices_.push_back(1);
+    builder.AddGroup(std::move(group));
+    auto built = builder.Build();
+    EXPECT_TRUE(built.ok());
+    return built.ok() ? *built : nullptr;
+  };
+  ASSERT_TRUE(
+      control.installer
+          .InstallFullState(FullState(state(1, true), Assignment(2)), Basis(10))
+          .ok());
+  PreparedFullState removed{.serving_state_ = state(2, false),
+                            .authority_lease_duration_ms_ = 5000};
+  EXPECT_TRUE(
+      control.installer.InstallFullState(std::move(removed), Basis(11)).ok());
+  ASSERT_NE(control.cache.Current(), nullptr);
+  EXPECT_EQ(control.cache.Current()->FindGroup("group-a")->manifest_revision_,
+            0u);
+  EXPECT_TRUE(
+      control.installer
+          .InstallFullState(FullState(state(3, true), Assignment(3)), Basis(12))
+          .ok());
+}
+
+TEST(NodeControlInstallerTest,
      StorageReadinessIsLocalAndRepublishedAtomically) {
   DynamicControl control;
   ASSERT_TRUE(
