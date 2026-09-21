@@ -60,6 +60,11 @@ VERSION=${VERSION//\//-}
 REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD)
 VERSION_SUFFIX=-dev
 RELEASE_TAG=${LAVIK_PACKAGE_TAG:-}
+PROJECT_VERSION=$(sed -nE 's/^project\(lavik VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' "$REPO_ROOT/CMakeLists.txt")
+if [[ ! "$PROJECT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Cannot read the Lavik project version from CMakeLists.txt" >&2
+  exit 1
+fi
 if [[ -n "$RELEASE_TAG" ]]; then
   # Tagged packages must identify the release in both filenames and binaries;
   # changing only the archive name would leave --version reporting -dev.
@@ -78,7 +83,6 @@ if [[ -n "$RELEASE_TAG" ]]; then
       exit 1
     fi
   done
-  PROJECT_VERSION=$(sed -nE 's/^project\(lavik VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' "$REPO_ROOT/CMakeLists.txt")
   if [[ "$BASE_VERSION" != "$PROJECT_VERSION" ]]; then
     echo "Tag version $BASE_VERSION does not match CMake project version $PROJECT_VERSION" >&2
     exit 1
@@ -88,6 +92,10 @@ if [[ -n "$RELEASE_TAG" ]]; then
     exit 1
   fi
   VERSION=$RELEASE_TAG
+elif [[ "${LAVIK_PACKAGE_VERSION:-}" == nightly ]]; then
+  # The nearest historical tag is provenance, not the nightly binary version.
+  # Follow CMake's numeric version across bumps; REVISION records the source.
+  VERSION=$PROJECT_VERSION$VERSION_SUFFIX
 fi
 # CI keeps stable nightly asset names while VERSION/REVISION identify the
 # actual source build inside the archive.
@@ -149,16 +157,9 @@ for app in "${APPS[@]}"; do
   fi
   "$STAGE_DIR/$app" --help >/dev/null 2>&1
 done
-install -m 0644 "$REPO_ROOT/LICENSE" "$REPO_ROOT/NOTICE" "$STAGE_DIR/"
-install -m 0644 "$REPO_ROOT/docs/design-docs/tls-and-auth.md" \
-  "$STAGE_DIR/tls-and-auth.md"
-OPENSSL_LICENSE=${LAVIK_OPENSSL_LICENSE:-/usr/share/common-licenses/Apache-2.0}
-if [[ ! -f "$OPENSSL_LICENSE" ]]; then
-  echo "OpenSSL license text not found at $OPENSSL_LICENSE" >&2
-  echo "Set LAVIK_OPENSSL_LICENSE to the Apache-2.0 license file." >&2
-  exit 1
-fi
-install -m 0644 "$OPENSSL_LICENSE" "$STAGE_DIR/OPENSSL-LICENSE.txt"
+install -m 0644 "$REPO_ROOT/LICENSE" "$STAGE_DIR/"
+python3 "$REPO_ROOT/scripts/package_notices.py" \
+  --build-dir "$BUILD_DIR" --output "$STAGE_DIR/THIRD_PARTY_NOTICES"
 printf '%s\n' "$VERSION" >"$STAGE_DIR/VERSION"
 printf '%s\n' "$REVISION" >"$STAGE_DIR/REVISION"
 

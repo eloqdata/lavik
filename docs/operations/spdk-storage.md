@@ -41,6 +41,11 @@ git -C bycorf submodule update --init third_party/spdk
 LAVIK_SPDK_SETUP="$PWD/bycorf/third_party/spdk/scripts/setup.sh"
 ```
 
+For a source build, follow [building and packaging](building-and-packaging.md)
+to initialize and build the pinned bypass dependencies with
+`LAVIK_KERNEL_BYPASS=ON`. The same setup helper and explicit runtime
+`--storage=spdk` selection apply to a locally built binary.
+
 The commands below use Bash, `sudo`, `pciutils`, and the standard Linux
 `util-linux` tools. Run them on the host that owns the NVMe controllers.
 
@@ -104,6 +109,14 @@ before starting other large services and inspect the helper's error output.
 Never run `setup.sh config` with an empty allowlist: its default device scope
 is broader than this guide's selected controllers.
 
+Size the host's hugepage reservation for all simultaneous SPDK processes,
+including each worker's storage-buffer budget, overflow buffers and SPDK/DPDK
+overhead. Check free hugepages after startup; a per-worker buffer setting is
+not a process-wide cap. On NUMA hosts, keep the selected NVMe controllers,
+hugepages and worker CPUs on the same node where possible. Keep network IRQ
+cores separate from workers when following the
+[IRQ affinity guide](irq-affinity-tuning.md).
+
 The benchmark VM did not expose an IOMMU and temporarily used VFIO's unsafe
 no-IOMMU mode. This removes DMA isolation and is specific to that dedicated
 benchmark environment. If reproducing in an equally isolated VM that requires
@@ -159,6 +172,12 @@ Expect `PONG` and `16`, respectively. The foreground pre-poll option
 keeps its startup default; verify `spdk_foreground_pre_poll_us=5` in the startup
 log rather than through `CONFIG GET`. Inspect startup logs
 for SPDK initialization and the selected namespaces before loading data.
+
+Separate instances must use disjoint namespaces and distinct listener ports.
+For storage-set expansion, worker/controller affinity and queue-capacity
+constraints, follow [multi-device storage](multi-device-storage.md). Benchmark
+configurations and reproduction results belong in the
+[performance reports](../../perf_reports/README.md).
 
 ## Stop and restore the host
 

@@ -132,13 +132,16 @@ its own flow layout.
 
 **Active Population**:
 A node's complete current population, together with the Compatibility Domain
-and progress that describe it. Its validity is independent of the progress
-of a replacement population.
+and progress that describe it. Preserving it throughout an isolated FULL
+replacement is planned in [ADR 0020](docs/adr/0020-preserve-candidate-eligibility-during-reparent.md)
+and [#45](https://github.com/eloqdata/lavik/issues/45). Current FULL admission
+instead invalidates the old population before rebuilding it in place.
 
 **Staging Population**:
-An isolated prospective replacement for the Active Population. It is not a
-source of serving or Candidate evidence before complete replacement is
-validated and activated.
+A planned isolated replacement for the Active Population, not yet implemented
+(ADR 0020 / #45). Under that design it is not a source of serving or Candidate
+evidence before complete replacement is validated and activated. The current
+LOADING rebuild is destructive and does not have a separate staging root.
 
 **Loss Assessment**:
 The terminal statement of whether a failover discarded Source data. `none`

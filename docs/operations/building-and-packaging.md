@@ -517,8 +517,20 @@ mode, statically links OpenSSL plus the GNU C++/compiler runtimes, strips staged
 copies, verifies each executable's linkage and `--help`, and writes a
 versioned archive and `.tar.gz.sha256` file under `dist/`. The checksum uses a
 relative archive name so `sha256sum --check *.sha256` works after downloading.
-The archive carries the project LICENSE and NOTICE, plus
-the Apache-2.0 license text required by the statically linked OpenSSL code.
+The archive carries `LICENSE` (the shared Apache-2.0 text) and
+`THIRD_PARTY_NOTICES`, which includes the project's `NOTICE`, upstream
+attributions, and other license terms. `scripts/package_notices.py` collects
+these from the pinned native sources, Meta's Go dependency graph and toolchain,
+and the Ubuntu packages owning the selected static OpenSSL and GNU runtime
+archives. Standard packages additionally include DPDK/SPDK and FreeBSD notices.
+The collector conservatively retains notices within enabled dependency trees;
+it is not an inventory of individual objects retained by the linker.
+Required notice inputs must be present or packaging fails. Packaging uses
+Ubuntu-provided OpenSSL/GNU archives and their installed copyright files;
+custom dependency distributions require adapting the collector's inputs.
+When adding a native dependency, update the collector's explicit manifest.
+Go modules are discovered automatically with the pinned toolchain and
+`go list -mod=readonly -deps ./bridge`.
 It explicitly configures `LAVIK_BUILD_META=ON`, `BUILD_TESTING=OFF`, and
 `LAVIK_BUILD_FAULT_SERVER=OFF`; CMake also rejects the fault-server option
 whenever `BUILD_TESTING` is off.
@@ -539,9 +551,12 @@ for a specific fleet; an explicitly empty value selects the compiler default
 on either architecture. This does not lower DPDK/SPDK's CPU requirements in a
 standard package. Other useful overrides are `LAVIK_PACKAGE_BUILD_DIR`,
 `LAVIK_PACKAGE_OUTPUT_DIR`, and `LAVIK_PACKAGE_JOBS`.
-`LAVIK_PACKAGE_VERSION=nightly` selects stable nightly archive names without
-changing the source version recorded in `VERSION` or the full commit in
-`REVISION`. The moving `nightly` tag is excluded from source-version discovery.
+`LAVIK_PACKAGE_VERSION=nightly` selects stable nightly archive names and writes
+the CMake project version plus `-dev` to `VERSION`, matching the executables.
+For example, a project version bump from `0.1.0` to `0.1.1` changes nightly's
+`VERSION` from `0.1.0-dev` to `0.1.1-dev`. `REVISION` records the full source
+commit. Local packages without a channel override keep their Git-described
+archive name and `VERSION`; that description excludes the moving `nightly` tag.
 For a tagged release, set `LAVIK_PACKAGE_TAG=v0.1.0-beta.1` instead. This takes
 precedence over `LAVIK_PACKAGE_VERSION`, uses the exact tag for the archive and
 `VERSION`, and sets the executable version to `0.1.0-beta.1`. The tag must

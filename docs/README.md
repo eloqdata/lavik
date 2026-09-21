@@ -37,6 +37,15 @@ authoritative for those procedures.
 Keep one-off source audits and task-specific investigation reports in their
 task, issue, or pull-request context rather than adding them to this tree.
 
+Planned features and unfinished work are tracked in
+[GitHub Issues](https://github.com/eloqdata/lavik/issues). Benchmark results and
+reproduction details live in the [performance reports](../perf_reports/README.md).
+
+The [domain glossary](../CONTEXT.md) defines shared terminology, including
+explicitly marked planned concepts. [Architecture decision records](adr/)
+preserve decisions and their implementation status; they do not replace the
+current architecture model.
+
 ## Reading order
 
 1. Start with the [architecture index](architecture/README.md).
