@@ -99,6 +99,12 @@ class ReplicationCommandPayloadSource final
 absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
     std::string_view encoded);
 
+// Identifies a well-formed PUBLISH or a nonempty V1 EXEC containing only
+// PUBLISH children. These effects need no partition state during native FULL
+// replay. Malformed envelopes and any storage effects return false; ordinary
+// replay still validates enabled databases and command execution.
+bool IsPublishOnlyReplicationCommand(const ReplicatedCommand& command) noexcept;
+
 // Turns one journaled mutation into a strict replicated EXEC and appends the
 // exact committed after-image for the key's expiration metadata. A past
 // absolute deadline intentionally deletes the value on a delayed replica.

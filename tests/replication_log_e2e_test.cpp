@@ -229,6 +229,73 @@ class ReplicationLogService final : public bycorf::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
+  bycorf::Task<absl::Status> ExerciseScannedKeyStorageChangeOrder() {
+    constexpr std::uint8_t kDb = 0;
+    for (bool acknowledge_baseline : {false, true}) {
+      const std::uint64_t session_id = acknowledge_baseline ? 852 : 851;
+      const std::string key = acknowledge_baseline
+                                  ? "scanned-expiry{acknowledged}"
+                                  : "scanned-expiry{inflight}";
+      const auto partition_id = lavik::storage::RedisSlot(key);
+      std::vector<std::string> initial{"HSET", key, "baseline", "value"};
+      auto status =
+          co_await ExecuteClientCommand(kDb, std::move(initial), ":1\r\n");
+      if (!status.ok()) co_return status;
+      status = co_await storage_->EnableReplicationLog(session_id, 8 * kMiB);
+      if (!status.ok()) co_return status;
+      auto session = storage_->BeginFullSyncSession(session_id);
+      if (!session.ok()) co_return session.status();
+      auto start =
+          storage_->BeginPartitionReplication(session_id, partition_id, 1);
+      if (!start.ok()) co_return start.status();
+      status =
+          storage_->BeginPartitionDbReplication(session_id, partition_id, kDb);
+      if (!status.ok()) co_return status;
+      auto baseline = co_await storage_->SnapshotPartition(
+          session_id, partition_id, kDb, 0, 16, 2);
+      if (!baseline.ok()) co_return baseline.status();
+      Check(baseline->records_.size() == 1,
+            "scanned-key baseline is incomplete");
+      if (acknowledge_baseline)
+        storage_->AcknowledgePartitionSnapshotRecords(session_id, partition_id,
+                                                      baseline->records_);
+
+      // This DB is still SCANNING, but this key already has an ordered base.
+      // A storage-origin deletion must not move it back to replacement capture:
+      // doing so can put the later List after-image ahead of its queued HSET.
+      std::vector<std::string> mutation{"HSET", key, "pending", "value"};
+      status =
+          co_await ExecuteClientCommand(kDb, std::move(mutation), ":1\r\n");
+      if (!status.ok()) co_return status;
+      auto removed = co_await storage_->Delete(kDb, key);
+      if (!removed.ok()) co_return removed.status();
+      std::vector<std::string> replacement{"LPUSH", key, "new-type"};
+      status =
+          co_await ExecuteClientCommand(kDb, std::move(replacement), ":1\r\n");
+      if (!status.ok()) co_return status;
+      auto pending = storage_->PeekFullSyncPublishItems(session_id, 8);
+      if (!pending.ok()) co_return pending.status();
+      Check(pending->size() == 3 && (*pending)[0].command_ != nullptr &&
+                (*pending)[1].record_.has_value() &&
+                (*pending)[1].record_->kind_ ==
+                    lavik::storage::SnapshotRecord::Kind::kDelete &&
+                (*pending)[2].command_ != nullptr,
+            "scanned-key deletion left the FIFO and reordered a type change");
+      auto overrides = co_await storage_->ReadPartitionFullSyncOverrides(
+          session_id, partition_id, 8);
+      if (!overrides.ok()) co_return overrides.status();
+      Check(overrides->records_.empty(),
+            "a covered key returned to unordered replacement capture");
+      for (const auto& item : *pending)
+        storage_->AcknowledgeFullSyncPublishItem(session_id, item.id_);
+      storage_->EndPartitionReplication(session_id, partition_id);
+      storage_->EndFullSyncSession(session_id);
+      status = co_await storage_->DisableReplicationLog();
+      if (!status.ok()) co_return status;
+    }
+    co_return absl::OkStatus();
+  }
+
   bycorf::Task<absl::Status> ExerciseTailingMutationDuringNextPartitionScan() {
     constexpr std::uint64_t kSession = 850;
     constexpr std::uint8_t kDb = 0;
@@ -867,6 +934,7 @@ class ReplicationLogService final : public bycorf::Service {
     constexpr std::uint64_t kSecondSession = 202;
     constexpr std::uint8_t kDb = 3;
     const std::string key = "fullsync-override{coalesce}";
+    const std::string uncovered_key = "fullsync-uncovered{coalesce}";
     const std::string sequence_bump = "fullsync-sequence{coalesce}";
     const std::uint16_t partition_id = lavik::storage::RedisSlot(key);
     const std::uint64_t reserved_before =
@@ -948,7 +1016,9 @@ class ReplicationLogService final : public bycorf::Service {
               reserved_before_snapshot,
           "full-sync coverage allocation did not consume reserved credit");
 
-    auto first = co_await storage_->Set(kDb, key, "first", {});
+    // Coalescing applies only before this key has an acknowledged baseline.
+    // The earlier snapshot key is already covered and would use the FIFO.
+    auto first = co_await storage_->Set(kDb, uncovered_key, "first", {});
     if (!first.ok()) co_return first.status();
     auto stale_result = co_await storage_->ReadPartitionFullSyncOverrides(
         kFirstSession, partition_id, 16);
@@ -958,7 +1028,7 @@ class ReplicationLogService final : public bycorf::Service {
         stale.records_.size() == 1 && stale.records_.front().value_ == "first",
         "full-sync subscriber did not capture the first committed value");
 
-    auto second = co_await storage_->Set(kDb, key, "second", {});
+    auto second = co_await storage_->Set(kDb, uncovered_key, "second", {});
     if (!second.ok()) co_return second.status();
     storage_->AcknowledgePartitionFullSyncOverrides(kFirstSession, partition_id,
                                                     stale.records_);
@@ -996,18 +1066,27 @@ class ReplicationLogService final : public bycorf::Service {
           "full-sync ACK did not release the second session override");
 
     storage_->EndPartitionReplication(kFirstSession, partition_id);
-    auto third = co_await storage_->Set(kDb, key, "third", {});
+    auto third = co_await storage_->Set(kDb, uncovered_key, "third", {});
     if (!third.ok()) co_return third.status();
     auto ended = co_await storage_->ReadPartitionFullSyncOverrides(
         kFirstSession, partition_id, 16);
     Check(!ended.ok(), "ended full-sync session remained subscribed");
-    auto remaining_result = co_await storage_->ReadPartitionFullSyncOverrides(
-        kSecondSession, partition_id, 16);
+    // The acknowledged override is now the ordered baseline. Later storage
+    // effects must stay in this subscriber's FIFO, just like client commands.
+    auto remaining_result =
+        storage_->PeekFullSyncPublishItems(kSecondSession, 16);
     if (!remaining_result.ok()) co_return remaining_result.status();
-    PartitionFullSyncBatch remaining = std::move(*remaining_result);
-    Check(remaining.records_.size() == 1 &&
-              remaining.records_.front().value_ == "third",
+    Check(remaining_result->size() == 1 &&
+              remaining_result->front().record_.has_value() &&
+              remaining_result->front().record_->key_ == uncovered_key,
           "ending one full-sync session affected another subscriber");
+    auto remaining_record = co_await storage_->MaterializeFullSyncPublishRecord(
+        kSecondSession, partition_id, *remaining_result->front().record_);
+    if (!remaining_record.ok()) co_return remaining_record.status();
+    Check(remaining_record->value_ == "third",
+          "the covered-key FIFO lost the committed after-image");
+    storage_->AcknowledgeFullSyncPublishItem(kSecondSession,
+                                             remaining_result->front().id_);
     storage_->EndPartitionReplication(kSecondSession, partition_id);
     storage_->EndFullSyncSession(kFirstSession);
     storage_->EndFullSyncSession(kSecondSession);
@@ -2858,8 +2937,9 @@ class ReplicationLogService final : public bycorf::Service {
   }
 
   bycorf::Task<absl::Status> Exercise() {
-    absl::Status status =
-        co_await ExerciseTailingMutationDuringNextPartitionScan();
+    absl::Status status = co_await ExerciseScannedKeyStorageChangeOrder();
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseTailingMutationDuringNextPartitionScan();
     if (!status.ok()) co_return status;
     status = co_await ExerciseEmptyFullSyncDbs();
     if (!status.ok()) co_return status;

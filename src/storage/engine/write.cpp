@@ -2086,8 +2086,7 @@ void StorageEngine::Impl::FullSyncCaptureOnCommit(
     WorkerStore& store, std::uint64_t session_id,
     WorkerStore::FullSyncCapture& capture, const SnapshotRecord& record,
     const Digest& digest,
-    std::shared_ptr<const ReplicationCommandAppend> command,
-    bool transaction_effect) {
+    std::shared_ptr<const ReplicationCommandAppend> command) {
   const auto active_session = store.fullsync_sessions_.find(session_id);
   if (active_session == store.fullsync_sessions_.end() ||
       active_session->second.db_epoch_invalidated_) {
@@ -2101,52 +2100,31 @@ void StorageEngine::Impl::FullSyncCaptureOnCommit(
   const bool has_ordered_base =
       db_phase == WorkerStore::FullSyncCapture::DbPhase::kTailing ||
       phase != nullptr;
-  if (has_ordered_base &&
-      (command != nullptr || transaction_effect ||
-       db_phase == WorkerStore::FullSyncCapture::DbPhase::kTailing)) {
+  if (has_ordered_base) {
     if (command != nullptr) {
       (void)TryEnqueueFullSyncCommand(store, session_id, std::move(command));
     } else {
-      // Storage-origin changes (including expiration) and transaction
-      // participants can lack a replayable command. Once the DB is tailing,
-      // its scan credit belongs to the next DB/partition; keep after-images
-      // in the already-admitted FIFO so they cannot reserve another scan
-      // arena or be overtaken by a later command.
+      // Once this key has a baseline, every later effect shares its FIFO,
+      // including expiration while other keys in this DB are still scanning.
+      // Returning a covered key to override capture could send its newer type
+      // before an older queued command. A tailing DB also no longer owns scan
+      // credit, so its after-images must use the existing publisher admission.
       (void)TryEnqueueFullSyncRecord(store, session_id, record);
     }
     return;
   }
-  // An unseen key, or a committed transaction participant for which there is
-  // no independently replayable command, is represented by its latest
-  // after-image. A later scanner observation skips this key; an older ACK can
-  // never erase the newer sequence below.
+  // An uncovered key is represented by its latest after-image. A later
+  // scanner observation skips it; an older ACK cannot erase a newer sequence.
   auto& latest_by_key = capture.latest_by_key_[record.db_id_];
   auto found = latest_by_key.find(record.key_);
   const bool replacing = found != latest_by_key.end();
-  const bool transfers_coverage_credit = phase != nullptr;
-  if (!replacing && !transfers_coverage_credit &&
-      !TryConsumeFullSyncCoverageCredit(store, session_id, capture,
-                                        record.key_.size(),
-                                        /*allocates_arena_entry=*/false)) {
+  if (!replacing && !TryConsumeFullSyncCoverageCredit(
+                        store, session_id, capture, record.key_.size(),
+                        /*allocates_arena_entry=*/false)) {
     // The durable foreground mutation remains valid. Full sync is the
     // lower-priority consumer, so invalidate only that session before any
     // unbudgeted override container allocation can occur.
     return;
-  }
-  if (phase != nullptr &&
-      phase->value_ !=
-          WorkerStore::FullSyncCapture::KeyPhase::kTailingWithOverrideCredit &&
-      record.key_.size() > options_.inline_key_max_bytes_) {
-    assert(record.key_.size() >= sizeof(Digest));
-    const std::size_t additional_key_bytes =
-        (record.key_.size() - sizeof(Digest)) * 2;
-    if (!TryConsumeFullSyncCredit(store, session_id, capture,
-                                  additional_key_bytes)) {
-      return;
-    }
-  }
-  if (phase != nullptr) {
-    capture.key_phases_.Erase(phase);
   }
   if (found != latest_by_key.end()) {
     auto previous = capture.overrides_.find(found->second);
@@ -2292,9 +2270,9 @@ void StorageEngine::Impl::PublishCommittedFullSyncEffects(
     for (std::uint64_t session_id : effect.session_ids_) {
       auto capture = partition.fullsync_subscribers_.find(session_id);
       if (capture == partition.fullsync_subscribers_.end()) continue;
-      FullSyncCaptureOnCommit(
-          store, session_id, capture->second, effect.record_,
-          ComputeDigest(effect.record_.key_), nullptr, true);
+      FullSyncCaptureOnCommit(store, session_id, capture->second,
+                              effect.record_,
+                              ComputeDigest(effect.record_.key_), nullptr);
     }
   }
   shard->fullsync_effects_.clear();

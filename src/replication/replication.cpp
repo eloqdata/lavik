@@ -8946,13 +8946,12 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
       ++next_command_fragment;
       if (last) {
         auto command = DecodeReplicationCommand(staged_command);
-        const bool publish = command.ok() && !command->args_.empty() &&
-                             EqualCaseInsensitive(command->args_[0], "PUBLISH");
-        // PUBLISH is routed by its channel slot only to spread transport
-        // work; it owns no partition state. Sentinel traffic can therefore
-        // reach the bounded full-sync FIFO before that slot's reset batch.
-        // Reassemble and validate it normally, but keep the installed-epoch
-        // invariant for every command that can touch the hidden dataset.
+        const bool publish =
+            command.ok() && IsPublishOnlyReplicationCommand(*command);
+        // Bare and EXEC-only PUBLISH effects use a channel slot for transport,
+        // but own no partition state and may precede that slot's reset batch.
+        // Inspect every envelope child before exempting it; storage mutations
+        // still require the installed epoch and their source-sequence context.
         if (command.ok() && !publish &&
             epochs.find(partition_id) == epochs.end()) {
           co_return absl::InvalidArgumentError(
@@ -8968,7 +8967,8 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
         // Canonical single-key mutations can be wrapped in __LAVIK_EXEC_V1
         // with PERSIST/PEXPIREAT effects. The wrapper still writes the hidden
         // partition and must retain its source sequence through every child.
-        // Only PUBLISH and the separate Function catalog bypass this context.
+        // Only publish-only effects and the separate Function catalog bypass
+        // this context.
         if (!partitionless && desired_partition) {
           absl::Status begun = co_await bycorf::SubmitTaskTo(
               owner, [this, session, partition_id, partition_sequence]() {

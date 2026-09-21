@@ -3396,8 +3396,7 @@ class StorageEngine::Impl {
       WorkerStore& store, std::uint64_t session_id,
       WorkerStore::FullSyncCapture& capture, const SnapshotRecord& record,
       const Digest& digest,
-      std::shared_ptr<const ReplicationCommandAppend> command = nullptr,
-      bool transaction_effect = false);
+      std::shared_ptr<const ReplicationCommandAppend> command = nullptr);
   bool TryEnqueueFullSyncCommand(
       WorkerStore& store, std::uint64_t session_id,
       std::shared_ptr<const ReplicationCommandAppend> command);
