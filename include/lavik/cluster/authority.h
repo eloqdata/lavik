@@ -196,8 +196,9 @@ class AuthorityAdmission {
   std::shared_ptr<const ServingState> state_;
   absl::InlinedVector<std::uint16_t, 4> slots_;
   std::uint64_t gate_generation_ = 0;
-  std::uint64_t lease_revision_ = 0;
-  MonotonicTime lease_deadline_{};
+  // Retain the capability, never a sampled deadline: renewal and revocation
+  // change this object without publishing a replacement authority snapshot.
+  std::shared_ptr<LeaseDeadline> lease_;
   bool lease_checked_ = false;
   bool single_group_ = false;
   // Exact publication fingerprints of the snapshots behind state_ and the
@@ -287,14 +288,11 @@ class AuthorityGuard {
     std::optional<SessionIdentity> session_;
     absl::flat_hash_map<std::string, Lease> leases_;
     std::uint64_t generation_ = 1;
-    // Changes on every immutable publication, including deadline-only renewal.
-    // Unlike generation_, this only invalidates a lookup shortcut, not work.
-    std::uint64_t revision_ = 0;
   };
 
   struct LeaseCheck {
     std::uint64_t publication_version = 0;
-    MonotonicTime deadline{};
+    std::shared_ptr<LeaseDeadline> lease;
   };
   Decision DecideWithLease(const ServingState* state,
                            const RequestView& request, MonotonicTime now,
@@ -302,9 +300,10 @@ class AuthorityGuard {
                            LeaseCheck* lease_check = nullptr) const;
   static std::optional<AuthorityAnchor> LocalPrimaryAnchor(
       const ServingState& state, std::string_view group_id);
-  bool LeaseCovers(const AuthorityState& authority, const ServingState& state,
-                   std::span<const std::uint16_t> slots, MonotonicTime now,
-                   MonotonicTime* earliest_deadline = nullptr) const;
+  bool LeaseCovers(
+      const AuthorityState& authority, const ServingState& state,
+      std::span<const std::uint16_t> slots, MonotonicTime now,
+      std::shared_ptr<LeaseDeadline>* single_lease = nullptr) const;
   // The returned reference is valid until this thread's next CurrentAuthority
   // call. Callers must not suspend while borrowing it.
   const AuthorityState& CurrentAuthority(

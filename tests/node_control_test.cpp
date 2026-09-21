@@ -1660,6 +1660,93 @@ TEST(LeaseDeadlineTest, ConcurrentRevocationCannotBeLostByRenewal) {
   }
 }
 
+// Drive the same shared capability that TTL and source admission receive,
+// without publishing topology or waiting for the expiry timer to catch up.
+class AtomicLeaseCacheService final : public bycorf::Service {
+ public:
+  AtomicLeaseCacheService(bycorf::Server* server, bool revoke)
+      : server_(server), revoke_(revoke) {}
+  void Prepare(unsigned) override {}
+  void Stop() noexcept override {}
+
+  bycorf::Task<absl::Status> Run(bycorf::Worker&,
+                                 bycorf::ServiceContext) override {
+    result_ = control_.installer.SetStorageReady(true);
+    if (result_.ok()) {
+      result_ = control_.installer.InstallFullState(
+          WithLease(FullState(MakeState()), 5s), Basis(10));
+    }
+    const auto start = LeaseClockNow();
+    if (result_.ok()) {
+      AuthorityMessage grant{
+          .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+          .session_ = Session(1),
+          .projection_ = Basis(10),
+          .anchor_ = Anchor(*control_.cache.Current()),
+          .sent_at_ = start,
+          .granted_duration_ = 5s,
+      };
+      result_ = co_await control_.installer.ApplyLeaseGrantTransition(grant);
+    }
+    if (result_.ok()) {
+      const std::array<std::uint16_t, 1> slots{12};
+      auto read = WriteRequest(slots);
+      read.is_write_ = false;
+      read.client_mode_ = ClientMode::kSingle;
+      auto write = control_.guard.CaptureAndAdmit(WriteRequest(slots), start);
+      EXPECT_EQ(write.decision().kind_, Decision::Kind::kServe);
+      EXPECT_EQ(control_.guard.DecideNow(read, start).kind_,
+                Decision::Kind::kServe);
+      const auto sequence = control_.cache.publication_sequence();
+      const auto lease = control_.actions.expiration_lease_;
+      EXPECT_EQ(lease, control_.actions.source_lease_);
+      // Even an admission captured before renewal observes the extension.
+      EXPECT_TRUE(lease->Renew(start.time_since_epoch(),
+                               (start + 10s).time_since_epoch()));
+      EXPECT_EQ(control_.guard.DecideNow(read, start + 6s).kind_,
+                Decision::Kind::kServe);
+      EXPECT_EQ(control_.guard.Recheck(write, start + 6s), RecheckResult::kOk);
+      if (revoke_) {
+        lease->Revoke();
+      } else {
+        // Shorten after a cached successful read, without snapshot publication.
+        EXPECT_TRUE(lease->Renew((start + 6s).time_since_epoch(),
+                                 (start + 7s).time_since_epoch()));
+      }
+      EXPECT_EQ(control_.cache.publication_sequence(), sequence);
+      EXPECT_EQ(control_.guard.DecideNow(read, start + 7s).kind_,
+                Decision::Kind::kClusterDownUnbound);
+      EXPECT_EQ(control_.guard.RecheckAtMutation(write, start + 7s),
+                RecheckResult::kReject);
+      EXPECT_TRUE(write.final_recheck_failed());
+    }
+    server_->RequestStop();
+    co_return result_;
+  }
+
+  bycorf::Server* server_;
+  bool revoke_;
+  DynamicControl control_;
+  absl::Status result_ =
+      absl::UnknownError("atomic lease cache test did not run");
+};
+
+TEST(NodeControlInstallerTest, CachedAdmissionObservesAtomicLeaseChanges) {
+  for (const bool revoke : {false, true}) {
+    SCOPED_TRACE(revoke ? "revocation" : "shorter deadline");
+    bycorf::Server server;
+    AtomicLeaseCacheService service(&server, revoke);
+    server.AddService(&service);
+    bycorf::ServerOptions options;
+    options.thread_count_ = 1;
+    options.pin_workers_ = false;
+    options.recv_buffer_count_ = 0;
+    ASSERT_TRUE(server.Start(options).ok());
+    server.WaitUntilStopped();
+    EXPECT_TRUE(service.result_.ok()) << service.result_;
+  }
+}
+
 class LeaseExpiryService final : public bycorf::Service {
  public:
   explicit LeaseExpiryService(bycorf::Server* server) : server_(server) {}

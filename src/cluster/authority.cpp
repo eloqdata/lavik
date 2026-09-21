@@ -78,8 +78,7 @@ AuthorityAdmission::AuthorityAdmission(AuthorityAdmission&& other) noexcept
       state_(std::move(other.state_)),
       slots_(std::move(other.slots_)),
       gate_generation_(other.gate_generation_),
-      lease_revision_(other.lease_revision_),
-      lease_deadline_(other.lease_deadline_),
+      lease_(std::move(other.lease_)),
       lease_checked_(other.lease_checked_),
       single_group_(other.single_group_),
       topology_sequence_(other.topology_sequence_),
@@ -97,8 +96,7 @@ AuthorityAdmission& AuthorityAdmission::operator=(
   state_ = std::move(other.state_);
   slots_ = std::move(other.slots_);
   gate_generation_ = other.gate_generation_;
-  lease_revision_ = other.lease_revision_;
-  lease_deadline_ = other.lease_deadline_;
+  lease_ = std::move(other.lease_);
   lease_checked_ = other.lease_checked_;
   single_group_ = other.single_group_;
   topology_sequence_ = other.topology_sequence_;
@@ -312,7 +310,6 @@ const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority(
 }
 
 void AuthorityGuard::PublishAuthorityLocked() {
-  ++writer_state_.revision_;
   auto state = std::make_shared<const AuthorityState>(writer_state_);
   published_authority_.store(std::move(state), std::memory_order_release);
   // This version is only a cache invalidation hint, not part of the lease
@@ -337,13 +334,13 @@ std::optional<AuthorityAnchor> AuthorityGuard::LocalPrimaryAnchor(
   };
 }
 
-bool AuthorityGuard::LeaseCovers(const AuthorityState& authority,
-                                 const ServingState& state,
-                                 std::span<const std::uint16_t> slots,
-                                 MonotonicTime now,
-                                 MonotonicTime* earliest_deadline) const {
+bool AuthorityGuard::LeaseCovers(
+    const AuthorityState& authority, const ServingState& state,
+    std::span<const std::uint16_t> slots, MonotonicTime now,
+    std::shared_ptr<LeaseDeadline>* single_lease) const {
   if (!authority.session_.has_value()) return false;
-  if (earliest_deadline != nullptr) *earliest_deadline = MonotonicTime::max();
+  if (single_lease != nullptr) single_lease->reset();
+  bool multiple_leases = false;
 
   // Single carries one representative slot for its full-keyspace Group.
   // Cluster admission enforces same-slot requests; keep this helper general
@@ -383,9 +380,26 @@ bool AuthorityGuard::LeaseCovers(const AuthorityState& authority,
         lease->second.anchor_.group_term_ != group->group_term_) {
       return false;
     }
-    if (earliest_deadline != nullptr) {
-      *earliest_deadline =
-          std::min(*earliest_deadline, lease->second.deadline_);
+    if (single_lease != nullptr && !multiple_leases) {
+      // The fast path is valid for one capability only. A future caller that
+      // spans distinct local Groups must recheck every lease in the slow path.
+      if (*single_lease == nullptr ||
+          *single_lease == lease->second.deadline_) {
+        // Admissions copy this worker's control block. Keep one global owner
+        // only when the capability changes, just like the topology cache;
+        // atomic deadline renewal does not refresh ownership or allocate.
+        thread_local std::shared_ptr<LeaseDeadline> local_lease;
+        if (local_lease.get() != lease->second.deadline_.get()) {
+          auto owner = std::make_shared<std::shared_ptr<LeaseDeadline>>(
+              lease->second.deadline_);
+          local_lease = std::shared_ptr<LeaseDeadline>(
+              std::move(owner), lease->second.deadline_.get());
+        }
+        *single_lease = local_lease;
+      } else {
+        single_lease->reset();
+        multiple_leases = true;
+      }
     }
   }
   return true;
@@ -427,13 +441,17 @@ Decision AuthorityGuard::DecideNow(const RequestView& request,
   // A successful verdict needs neither borrowed snapshot when their exact
   // publication identities are unchanged. An odd topology sequence always
   // takes the coherent slow path. The authority version is captured together
-  // with the immutable lease snapshot, not sampled after its validation.
+  // with the immutable lease identity, not sampled after its validation.
+  // The shared capability itself is checked even when no snapshot changed:
+  // ordinary renewal, shortening and revocation update its atomic deadline.
   if (single_read && (sequence & 1U) == 0 &&
       cached.identity == cache_identity_ && cached.sequence == sequence &&
       (cached.kind == Decision::Kind::kServeStaleRead ||
        (cached.lease.publication_version ==
             authority_version_.load(std::memory_order_acquire) &&
-        (now.has_value() ? *now : LeaseClockNow()) < cached.lease.deadline))) {
+        cached.lease.lease != nullptr &&
+        cached.lease.lease->valid_at(
+            (now.has_value() ? *now : LeaseClockNow()).time_since_epoch())))) {
     Decision decision;
     decision.kind_ = cached.kind;
     return decision;
@@ -486,14 +504,13 @@ Decision AuthorityGuard::DecideWithLease(const ServingState* state,
                              : nullptr);
   if (proof != nullptr) {
     proof->gate_generation_ = authority.generation_;
-    proof->lease_revision_ = authority.revision_;
     proof->authority_version_ = proof_version;
     proof->lease_checked_ = true;
   }
-  MonotonicTime* deadline = proof != nullptr         ? &proof->lease_deadline_
-                            : lease_check != nullptr ? &lease_check->deadline
-                                                     : nullptr;
-  if (!LeaseCovers(authority, *state, slots, now, deadline)) {
+  auto* lease = proof != nullptr         ? &proof->lease_
+                : lease_check != nullptr ? &lease_check->lease
+                                         : nullptr;
+  if (!LeaseCovers(authority, *state, slots, now, lease)) {
     decision.kind_ = Decision::Kind::kClusterDownUnbound;
   }
   return decision;
@@ -513,31 +530,16 @@ RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,
   }
 
   if (admission.lease_checked_) {
-    // An unchanged authority publication proves the captured generation,
-    // revision and lease set without borrowing the snapshot. The deadline
-    // alone still advances, so it is compared on every call; expiry or any
-    // republication falls back to the full snapshot checks.
+    // An unchanged publication preserves the capability's identity, not its
+    // validity. The deadline may be shortened or revoked without publication.
+    // On expiry, use LeaseCovers to claim the one-time expiration metric.
     if (admission.authority_version_ !=
-        authority_version_.load(std::memory_order_acquire)) {
+            authority_version_.load(std::memory_order_acquire) ||
+        admission.lease_ == nullptr ||
+        !admission.lease_->valid_at(now.time_since_epoch())) {
       const AuthorityState& authority = CurrentAuthority();
-      if (admission.gate_generation_ != authority.generation_) {
-        return RecheckResult::kReject;
-      }
-      // Admission already checked these exact immutable leases against the
-      // retained topology. Until publication or expiry, repeating Group/hash
-      // lookups and anchor comparisons adds no proof. Renewal (even a shorter
-      // deadline) changes revision, while expiry still goes through LeaseCovers
-      // to record its one-time metric. Topology/fence checks remain below.
-      if ((admission.lease_revision_ != authority.revision_ ||
-           now >= admission.lease_deadline_) &&
+      if (admission.gate_generation_ != authority.generation_ ||
           !LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
-        return RecheckResult::kReject;
-      }
-    } else if (now >= admission.lease_deadline_) {
-      // Expiry must still flow through LeaseCovers for its one-time metric,
-      // even though no republication could have renewed the lease.
-      const AuthorityState& authority = CurrentAuthority();
-      if (!LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
         return RecheckResult::kReject;
       }
     }
