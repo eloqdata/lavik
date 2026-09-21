@@ -148,7 +148,6 @@ absl::StatusOr<control::ServiceDeclaration> BootstrapClientService(
   }
   MetaEndpointDirectory directory(std::move(seeds));
   std::string last_reason;
-  std::uint64_t attempt = 0;
   while (true) {
     for (const auto& endpoint : directory.Candidates()) {
       auto reply = QueryMode(options, endpoint);
@@ -193,8 +192,12 @@ absl::StatusOr<control::ServiceDeclaration> BootstrapClientService(
           break;
       }
     }
+    // One fixed 100 ms wait between full candidate rounds. Startup failures
+    // must not accumulate additional delay, matching MetaReconnectPolicy's
+    // no-failure-count rule; simultaneous Data boots are few enough that the
+    // session-reconnect jitter is not needed here.
     if (auto status =
-            Backoff(options.cancel_fd, MetaReconnectPolicy::Next(++attempt));
+            Backoff(options.cancel_fd, std::chrono::milliseconds(100));
         !status.ok())
       return status;
   }
