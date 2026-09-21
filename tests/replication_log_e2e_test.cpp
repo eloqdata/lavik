@@ -3183,8 +3183,75 @@ class ReplicationLogService final : public bycorf::Service {
     co_return status;
   }
 
+  bycorf::Task<absl::Status> ExerciseReplicaBackupAdmission() {
+    auto seeded = co_await storage_->Set(6, "backup-copy-source", "value", {});
+    if (!seeded.ok()) co_return seeded.status();
+    for (unsigned kind = 0; kind < 3; ++kind) {
+      const std::string counter = "backup-cut-counter-" + std::to_string(kind);
+      const std::vector<ReplicatedCommand> redis_commands{
+          {.db_id_ = 6, .args_ = {"INCR", counter}},
+          {.db_id_ = 7, .args_ = {"INCR", counter}},
+      };
+      const ReplicatedCommand native_command{
+          .db_id_ = 6,
+          .args_ = {std::string(lavik::kReplicatedExecCommand), "2", "6", "2",
+                    "INCR", counter, "7", "2", "INCR", counter},
+      };
+      const ReplicatedCommand copy_command{
+          .db_id_ = 6,
+          .args_ = {"COPY", "backup-copy-source", "backup-copy-target", "DB",
+                    "7"},
+      };
+      Check(lavik::CloseAllCommandDbGates(), "could not acquire backup cut");
+      bool started = false;
+      bool finished = false;
+      absl::Status replay = absl::UnknownError("replica apply did not run");
+      auto apply = [&]() -> bycorf::Task<absl::Status> {
+        started = true;
+        if (kind == 0) {
+          replay = co_await lavik::ApplyReplicatedCommand(native_command);
+        } else if (kind == 1) {
+          replay =
+              co_await lavik::ApplyRedisReplicatedTransaction(redis_commands);
+        } else {
+          replay = co_await lavik::ApplyReplicatedCommand(copy_command);
+        }
+        finished = true;
+        co_return absl::OkStatus();
+      };
+      worker_->Spawn(apply());
+      for (unsigned turn = 0; turn < 32; ++turn) {
+        co_await bycorf::Yield(*worker_);
+      }
+      const bool waited = started && !finished;
+      const bool cut_drained = !lavik::CommandDbOperationsActive();
+      lavik::OpenAllCommandDbGates();
+      while (!finished) co_await bycorf::Yield(*worker_);
+      Check(waited, "replica replay failed instead of waiting for backup cut");
+      Check(cut_drained, "replica waiter retained database admission");
+      if (!replay.ok()) co_return replay;
+      if (kind < 2) {
+        for (std::uint8_t db : {6, 7}) {
+          std::vector<std::string> args{"GET", counter};
+          auto checked =
+              co_await ExecuteClientCommand(db, std::move(args), "$1\r\n1\r\n");
+          if (!checked.ok()) co_return checked;
+        }
+      } else {
+        std::vector<std::string> args{"GET", "backup-copy-target"};
+        auto checked = co_await ExecuteClientCommand(7, std::move(args),
+                                                     "$5\r\nvalue\r\n");
+        if (!checked.ok()) co_return checked;
+      }
+    }
+    std::cout << "Replica EXEC/COPY backup admission PASS\n";
+    co_return absl::OkStatus();
+  }
+
   bycorf::Task<absl::Status> Exercise() {
-    absl::Status status = co_await ExerciseScannedKeyStorageChangeOrder();
+    absl::Status status = co_await ExerciseReplicaBackupAdmission();
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseScannedKeyStorageChangeOrder();
     if (!status.ok()) co_return status;
     status = co_await ExerciseTailingMutationDuringNextPartitionScan();
     if (!status.ok()) co_return status;

@@ -38,6 +38,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -2841,8 +2842,9 @@ class DbOperationGuard {
   bool active_ = true;
 };
 
-// Gates several databases at once (EXEC spanning databases via SELECT); the
-// destructor releases whatever was successfully begun.
+// Gates several databases at once (COPY or EXEC spanning databases via SELECT).
+// A failed acquisition retains no admissions, so a backup/flush cut can drain
+// while replicated commands wait for the gates to reopen.
 class MultiDbOperationGuard {
  public:
   MultiDbOperationGuard() = default;
@@ -2857,11 +2859,17 @@ class MultiDbOperationGuard {
     dbs_.clear();
   }
 
-  bool Add(std::uint8_t db_id) {
-    if (!TryBeginDbOperation(db_id)) {
-      return false;
+  bool TryAcquire(std::span<const std::uint8_t> db_ids) {
+    assert(dbs_.empty());
+    // Allocate before admission so an allocation failure cannot leak a count.
+    dbs_.reserve(db_ids.size());
+    for (const std::uint8_t db : db_ids) {
+      if (!TryBeginDbOperation(db)) {
+        Release();
+        return false;
+      }
+      dbs_.push_back(db);
     }
-    dbs_.push_back(db_id);
     return true;
   }
 
@@ -5794,11 +5802,23 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
   }
 
   MultiDbOperationGuard db_guard;
-  if (!db_guard.Add(request.db_id_) ||
-      (options->destination_db_ != request.db_id_ &&
-       !db_guard.Add(options->destination_db_))) {
-    co_return BuiltReply(
-        AppendTryAgainError(reply_builder, "database flush is in progress"));
+  const std::array<std::uint8_t, 2> copy_dbs{request.db_id_,
+                                             options->destination_db_};
+  const auto gate_dbs = std::span(copy_dbs).first(
+      request.db_id_ == options->destination_db_ ? 1 : 2);
+  while (!db_guard.TryAcquire(gate_dbs)) {
+    if (!request.replication_origin_) {
+      co_return BuiltReply(
+          AppendTryAgainError(reply_builder, "database flush is in progress"));
+    }
+    // A local backup cut must not invalidate an otherwise valid replication
+    // stream. Wait before taking key locks or applying any mutation.
+    absl::Status waited = co_await bycorf::SleepFor(
+        *ThisWorker().self_, std::chrono::milliseconds(1));
+    if (!waited.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR database admission failed: ", waited.message())));
+    }
   }
   if (!CommandWriteAdmissionIsCurrent(request)) {
     co_return BuiltReply(reply_builder.AppendError(
@@ -9572,11 +9592,21 @@ Task<CommandReply> ExecuteExecBody(
   };
 
   MultiDbOperationGuard db_guard;
-  for (const std::uint8_t db : gate_dbs) {
-    if (!db_guard.Add(db)) {
+  while (!db_guard.TryAcquire(gate_dbs)) {
+    if (!ctx.strict_replication_apply_) {
       co_await DropWatches(ctx);
       co_return finalize_exec_reply(BuiltReply(
           AppendTryAgainError(reply_builder, "database flush is in progress")));
+    }
+    // Replica EXEC waits at admission, never by retrying a partially applied
+    // transaction. Release every acquired DB before suspension so the cut can
+    // drain even when it closed a later database in this transaction.
+    absl::Status waited = co_await bycorf::SleepFor(
+        *ThisWorker().self_, std::chrono::milliseconds(1));
+    if (!waited.ok()) {
+      co_await DropWatches(ctx);
+      co_return finalize_exec_reply(BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR database admission failed: ", waited.message()))));
     }
   }
   if (source_write && write_admission_role_epoch.has_value() &&

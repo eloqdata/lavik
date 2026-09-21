@@ -1026,6 +1026,13 @@ this client fence while the population is closed.
 
 ## Online apply and rendezvous
 
+Replicated commands wait for local database cuts, including the cut that starts
+an RDB backup. Cross-database `EXEC` and `COPY` release partial database
+admissions before waiting and acquire all required gates before applying any
+mutation. A temporary local cut therefore delays replay without invalidating
+the source history; errors from actual command execution remain fatal to the
+replication session.
+
 The target disables transport-level socket read-ahead on native flow
 connections. Its application receiver nevertheless validates frame identity
 and fragment order, reassembles and decodes complete LRC1 commands, and places
