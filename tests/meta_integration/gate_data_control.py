@@ -319,6 +319,11 @@ def assert_grantless_session(data, leader, minimum_fds=1):
     data.wait_metric(
         "lavik_cluster_control_connected", lambda value: value == 1,
         f"Data node {data.node_id[:8]} accepts Meta leader")
+    # The HTTP scrape and outgoing Meta stream live on different workers.
+    # The process connection gauge must include both without polling Meta's
+    # event loop or confusing a live transport with an accepted control session.
+    if data.metric("lavik_connections") < 2:
+        raise H.Failure("connection gauge omitted the outgoing Meta stream")
     data.wait_metric(
         "lavik_cluster_control_full_states_applied_total",
         lambda value: value >= minimum_fds,

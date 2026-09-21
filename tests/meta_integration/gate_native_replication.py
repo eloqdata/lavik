@@ -174,6 +174,13 @@ def replay_and_reconnect(root):
         ready(meta)
         reader = Client(target, readonly=True)
         try:
+            # The source has two data shards and the target has three. Their
+            # extra Meta workers must never become replication flows.
+            info = dict(line.split(":", 1) for line in
+                        reader.call("INFO", "replication").splitlines()
+                        if ":" in line)
+            assert info.get("lavik_source_workers") == "2", info
+            assert info.get("lavik_connected_flows") == "2", info
             assert reader.call("GET", "{native}seed") == "baseline"
             assert reader.call("HGET", "{native}hash", "keep") == "value"
             assert reader.call("LRANGE", "{native}list", 0, -1) == ["a", "b"]
@@ -309,8 +316,8 @@ def dense_collection_full_sync(root):
                 writer.call("SMEMBERS", "{dense}set"))
             expected = writer.call("HGETALL", "{dense}hash")
             actual = reader.call("HGETALL", "{dense}hash")
-            assert dict(zip(actual[::2], actual[1::2])) == dict(
-                zip(expected[::2], expected[1::2]))
+            assert dict(zip(actual[::2], actual[1::2], strict=True)) == dict(
+                zip(expected[::2], expected[1::2], strict=True))
             assert reader.call("ZRANGE", "{dense}zset", 0, -1, "WITHSCORES") == \
                 writer.call("ZRANGE", "{dense}zset", 0, -1, "WITHSCORES")
         finally:
@@ -474,6 +481,64 @@ def full_tail_expiration_effects(root):
         assert "outside its apply context" not in Path(target.log_path).read_text()
 
 
+
+def full_tail_type_reuse(root):
+    # Keep these commands behind one acknowledged handoff so they traverse
+    # FULL's command/after-image FIFO before the ONLINE boundary. Multi-key
+    # writes use committed participant records; single-key writes carry their
+    # original command and its TTL companion.
+    tag = next(f"full-reuse-{i}" for i in range(100000)
+               if C.redis_slot(f"full-reuse-{i}") == 0)
+    prefix = "{" + tag + "}"
+    key, counter, other, copied = [prefix + name for name in
+                                  ("typed", "counter", "other", "copied")]
+
+    def seed(writer):
+        assert writer.call("SET", key, "seed") == "OK"
+        assert writer.call("MSET", counter, 0, other, 0) == "OK"
+
+    with pair(root, "full-tail-type-reuse", source_faults={
+            "LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "5000"},
+            seed=seed, require_seed_before_full=True,
+            source_workers=1, target_workers=2,
+            raft_args=H.raft_args(snapshot_distance=100000,
+                                  election_ms_low=5000,
+                                  election_ms_high=10000)) as (meta, source, target, writer):
+        H.wait_until("type reuse partition handed off", 30, lambda:
+                     "paused full sync after acknowledged handoff partition 0 "
+                     in Path(source.log_path).read_text())
+        for i in range(8):
+            # An absolute past deadline deletes immediately, with no sleep or
+            # scheduler race required to advance from one value type to another.
+            assert writer.call("PEXPIREAT", key, 1) == 1
+            assert writer.call("HSET", key, "f", str(i)) == 1
+            assert writer.call("PEXPIREAT", key, 1) == 1
+            assert writer.call("RPUSH", key, str(i)) == 1
+            assert writer.call("MULTI") == "OK"
+            assert writer.call("INCR", counter) == "QUEUED"
+            assert writer.call("MSET", other, str(i), copied, "temporary") == "QUEUED"
+            assert writer.call("RPUSH", key, "tx") == "QUEUED"
+            assert writer.call("EXEC") == [i + 1, "OK", 2]
+        assert writer.call("COPY", counter, copied, "REPLACE") == 1
+        assert writer.call("PEXPIRE", key, 120000) == 1
+        deadline = writer.call("PEXPIRETIME", key)
+        ready(meta)
+        reader = Client(target, readonly=True)
+        try:
+            assert reader.call("LRANGE", key, 0, -1) == ["7", "tx"]
+            assert reader.call("GET", counter) == "8"
+            assert reader.call("GET", other) == "7"
+            assert reader.call("GET", copied) == "8"
+            assert reader.call("PEXPIRETIME", key) == deadline
+            assert writer.call("RPUSH", key, "online") == 3
+            assert writer.call("WAIT", 1, 5000) == 1
+            assert reader.call("LRANGE", key, 0, -1) == ["7", "tx", "online"]
+        finally:
+            reader.close()
+        assert Path(source.log_path).read_text().count("selected=FULL") == 1
+        assert "WRONGTYPE" not in Path(target.log_path).read_text()
+
+
 def post_cut_reset_reconnect(root):
     with pair(root, "post-cut-reset", source_faults={
             "LAVIK_REPLICATION_POST_CUT_RESET_ONCE": "1"}) as (meta, source, target, writer):
@@ -604,6 +669,24 @@ def small_receive_window(root):
         assert C.readonly_get(target, "{window}key-511") == "v" * 1024
 
 
+def target_queue_shutdown(root):
+    # Hold the FIFO consumer until the receiver has filled its bounded queue.
+    # Socket shutdown cannot wake that capacity wait: terminal stage/ACK
+    # publication must explicitly notify ingress before the flow can join.
+    with pair(root, "target-queue-shutdown", source_workers=1, target_workers=1,
+              target_faults={
+                  "LAVIK_REPLICATION_PAUSE_BEFORE_COMMAND_APPLY_MS": "8000",
+                  "LAVIK_REPLICATION_REPORT_ONLINE_BACKPRESSURE": "1",
+              }) as (meta, _source, target, writer):
+        ready(meta)
+        for i in range(600):
+            assert writer.call("SET", "{queue-shutdown}key", str(i)) == "OK"
+        H.wait_until("replica ingress is waiting for queue capacity", 10, lambda:
+                     "replica online ingress waiting for command capacity" in
+                     Path(target.log_path).read_text())
+        target.terminate()
+        assert "replication targets quiesced before storage flush" in Path(target.log_path).read_text()
+
 def main():
     C.META, C.DATA, C.CTL, C.REDIS_CLI = map(os.path.abspath, sys.argv[1:5])
     H.set_tag("native-replication")
@@ -618,6 +701,8 @@ def main():
             full_tail_publish_before_reset(root)
             full_tail_expiration_effects(root)
             small_receive_window(root)
+            full_tail_type_reuse(root)
+            target_queue_shutdown(root)
             handoff_order(root)
             cancelled_handoff(root)
             committed_cursor_reconnect(root, "cancel-apply", target_faults={

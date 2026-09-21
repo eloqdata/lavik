@@ -241,8 +241,9 @@ std::optional<std::uint64_t> ConfirmedLeaseForHeartbeat(
     const std::optional<MetaObservedOwnerProjection>& owner_projection);
 
 // Applies this Meta process's leadership-validity ceiling to a deterministic
-// Policy projection, then rebuilds the encoded bytes that the
-// scalar influences. Local Raft timing must never enter committed apply.
+// Policy projection, rebuilding its encoded bytes only when that ceiling
+// changes the duration (or no encoding exists). The input must be an unmodified
+// projector batch. Local Raft timing must never enter committed apply.
 absl::Status ApplyLeadershipValidityLimit(NodeControlBatch& batch,
                                           std::uint32_t leadership_validity_ms);
 
@@ -528,6 +529,14 @@ enum class MetaReplacementDisposition : std::uint8_t {
 MetaReplacementDisposition EvaluateReplacementDisposition(
     const cluster::control::FullDesiredState& replacement,
     const cluster::control::FullDesiredState& latest);
+
+// An installed projection may keep receiving its exact old-duration grants
+// while a longer lease policy is delivered. Every other selected object must
+// be unchanged. The caller must bind this proof to the current committed
+// high-water and installed object, and independently validate leadership.
+bool CanRenewDuringLeasePolicyUpdate(
+    const cluster::control::FullDesiredState& installed,
+    const cluster::control::FullDesiredState& latest, std::string_view node_id);
 
 class MetaDataControlServer final : public MetaReconciler {
  public:

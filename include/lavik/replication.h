@@ -32,6 +32,7 @@
 #include "bycorf/net/tcp_stream.h"
 #include "bycorf/runtime/task.h"
 #include "lavik/client_mode.h"
+#include "lavik/lease_deadline.h"
 #include "lavik/replication_group.h"
 
 namespace bycorf {
@@ -437,6 +438,17 @@ struct ClusterFailoverActionStatus {
   std::optional<ClusterCandidateRecoveryResult> recovery_;
 };
 
+// Immutable heartbeat inputs published together by the replication owner.
+// Ordinary renewal reads this value without scheduling work on a data shard.
+// The version binds the sampled frontier and identity to one publication.
+struct ReplicationHeartbeatObservation {
+  std::uint64_t version_ = 0;
+  ReplicationIdentity identity_;
+  ClusterPopulationStatus population_;
+  ClusterSourcePauseStatus source_pause_;
+  ClusterFailoverActionStatus failover_;
+};
+
 // FDS-owned subset of population identity. Assignment and immutable manifest
 // plus the Meta partition-replication epoch decide whether a completed local
 // population still belongs to the group; a term additionally scopes an
@@ -563,6 +575,11 @@ class ReplicationManager {
   // collecting replication progress or downstream session status.
   bycorf::Task<ReplicationIdentity> ObserveIdentity() const;
 
+  // Reads a published owner snapshot; never submits to or waits for a shard.
+  // Candidate progress uses a bounded coherent sample of the retained frontier.
+  ReplicationHeartbeatObservation ObserveHeartbeat() const;
+  bool HeartbeatObservationIsCurrent(std::uint64_t version) const;
+
   // Copies the immutable desired-upstream snapshot. Runtime workers cache it
   // locally; unchanged reads require no cross-worker hop or shared refcount
   // update. This is not an admission proof: retain role and mode checks.
@@ -661,6 +678,9 @@ class ReplicationManager {
   // lease/FDS recheck. The absolute deadline uses CLOCK_BOOTTIME semantics.
   bycorf::Task<absl::Status> EnableClusterExpirationAuthorityUntil(
       std::chrono::nanoseconds deadline_since_boot);
+  // Installs the shared epoch used by lock-free ordinary renewals.
+  bycorf::Task<absl::Status> EnableClusterExpirationAuthorityUntil(
+      std::shared_ptr<LeaseDeadline> lease);
 
   // Revokes future active-expiration work and drains any already-entered
   // cycle without disturbing an outer controlled-source pause.
@@ -749,6 +769,9 @@ class ReplicationManager {
   // replay it after a live projection refresh.
   bycorf::Task<absl::Status> EnableClusterRebuildSourceAdmissionUntil(
       std::chrono::nanoseconds deadline_since_boot);
+  // Installs the shared epoch used by lock-free ordinary renewals.
+  bycorf::Task<absl::Status> EnableClusterRebuildSourceAdmissionUntil(
+      std::shared_ptr<LeaseDeadline> lease);
 
   // Clears capabilities inherited from an older desired-state projection
   // without advancing the committed revoke floor. A disconnected control

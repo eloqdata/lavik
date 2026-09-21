@@ -1282,8 +1282,13 @@ class StorageEngine::Impl {
         std::chrono::nanoseconds deadline_since_boot)
         : deadline_since_boot_(deadline_since_boot) {}
 
+    explicit ExpirationAuthorityGrant(std::shared_ptr<LeaseDeadline> lease)
+        : deadline_since_boot_(std::chrono::nanoseconds::zero()),
+          lease_(std::move(lease)) {}
+
     std::atomic<bool> active_{true};
     const std::chrono::nanoseconds deadline_since_boot_;
+    const std::shared_ptr<LeaseDeadline> lease_;
   };
 
 #if LAVIK_FAULTS_ENABLED
@@ -1808,6 +1813,11 @@ class StorageEngine::Impl {
     // cycle's deletes — including block-allocation waits that release
     // store_state_mutex mid-append.
     bool expiry_cycle_running_ = false;
+    // Cache ownership, never validity. Each worker aliases the shared grant
+    // through its own control block so queued candidates and mutation guards
+    // do not contend on the published grant's reference count.
+    std::shared_ptr<ExpirationAuthorityGrant> expiration_authority_cache_;
+    std::uint64_t expiration_authority_version_ = 0;
     std::deque<ExpireCandidate> expired_candidates_;
   };
 
@@ -2219,9 +2229,13 @@ class StorageEngine::Impl {
 
   absl::Status SetExpirationAuthorityUntil(
       std::chrono::nanoseconds deadline_since_boot) noexcept;
+  // Binds a shared finite lease once. Ordinary control-worker renewal updates
+  // captured expiration capabilities without submitting work to data workers.
+  absl::Status SetExpirationAuthorityUntil(
+      std::shared_ptr<LeaseDeadline> lease) noexcept;
 
-  std::shared_ptr<ExpirationAuthorityGrant> CurrentExpirationAuthority()
-      const noexcept;
+  std::shared_ptr<ExpirationAuthorityGrant> CurrentExpirationAuthority(
+      WorkerStore& store) const noexcept;
 
   static bool ExpirationAuthorityIsValid(
       const ExpirationAuthorityGrant* authority) noexcept;
@@ -2689,6 +2703,10 @@ class StorageEngine::Impl {
   Task<absl::Status> EndReplicaTailCommand(std::uint64_t session_id,
                                            std::uint16_t partition_id,
                                            std::uint64_t partition_sequence);
+  Task<absl::StatusOr<bool>> ReplicaCommandNeedsApply(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::uint64_t partition_sequence, std::uint8_t db_id,
+      std::string_view key);
 
   Task<absl::Status> ApplyReplicaRecords(
       std::uint64_t session_id, std::uint16_t partition_id,
@@ -3833,6 +3851,10 @@ class StorageEngine::Impl {
   std::atomic<bool> expiration_authority_{true};
   std::atomic<std::shared_ptr<ExpirationAuthorityGrant>>
       active_expiration_authority_;
+  // An invalidation counter, not an authority token. Increment after each
+  // replacement publication, including removal. Ordinary shared-lease renewal
+  // does not change the grant or this counter. Zero denotes an unfilled cache.
+  std::atomic<std::uint64_t> expiration_authority_version_{1};
 #if LAVIK_FAULTS_ENABLED
   // Unit tests use this synchronous hook to revoke an exact grant after the
   // early check without relying on scheduler timing. It is absent from

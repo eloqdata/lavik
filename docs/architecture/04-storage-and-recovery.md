@@ -751,7 +751,16 @@ deadline uses Linux `CLOCK_BOOTTIME` and cannot outlive the matching finite
 serving lease. Each queued expiration candidate carries the exact capability
 through the final storage mutation precondition. Expiry, replacement, or
 revocation therefore cancels delayed work without turning that cancellation
-into a storage failure; a later grant installs a distinct capability.
+into a storage failure. Initial installation binds the same atomic lease
+deadline used by request and native-source admission. Ordinary same-epoch
+renewal updates this shared deadline and preserves queued capabilities;
+renewal after expiry or revocation installs a distinct epoch after cleanup.
+Workers cache ownership of the shared capability through independent reference
+counts; queued candidates retain their captured capability across cache refresh.
+Validity is never cached: admission and final mutation checks still observe the
+capability's revocation state and shared lease deadline.
+Disabling expiration on local owner loss revokes the shared epoch immediately,
+so an outstanding Meta Ack cannot renew stale owner authority.
 
 `QuiesceExpiration` is a nestable drain independent of authority revocation.
 Controlled failover holds it after request mutation drain while the old owner

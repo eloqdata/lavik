@@ -97,15 +97,46 @@ bool StorageEngine::Impl::ExpirationAuthorityIsValid(
       !authority->active_.load(std::memory_order_acquire)) {
     return false;
   }
+  if (authority->lease_ != nullptr) {
+    return authority->lease_->valid_at(BootTimeSinceEpoch());
+  }
   return authority->deadline_since_boot_ == std::chrono::nanoseconds::max() ||
          BootTimeSinceEpoch() < authority->deadline_since_boot_;
 }
 
 std::shared_ptr<StorageEngine::Impl::ExpirationAuthorityGrant>
-StorageEngine::Impl::CurrentExpirationAuthority() const noexcept {
-  auto authority = active_expiration_authority_.load(std::memory_order_acquire);
-  return ExpirationAuthorityIsValid(authority.get()) ? std::move(authority)
-                                                     : nullptr;
+StorageEngine::Impl::CurrentExpirationAuthority(
+    WorkerStore& store) const noexcept {
+  const auto version =
+      expiration_authority_version_.load(std::memory_order_acquire);
+  if (store.expiration_authority_version_ != version) [[unlikely]] {
+    auto authority =
+        active_expiration_authority_.load(std::memory_order_acquire);
+    if (authority != nullptr) {
+      auto* grant = authority.get();
+      try {
+        auto owner =
+            std::make_shared<std::shared_ptr<ExpirationAuthorityGrant>>(
+                std::move(authority));
+        authority =
+            std::shared_ptr<ExpirationAuthorityGrant>(std::move(owner), grant);
+      } catch (const std::bad_alloc&) {
+        // Leave the cache version unchanged so the next attempt can retry;
+        // inability to retain a capability must never authorize a deletion.
+        return nullptr;
+      }
+    }
+    store.expiration_authority_cache_ = std::move(authority);
+    // Sample the version BEFORE the pointer. A concurrent publication can
+    // cause an extra refresh, but cannot label an old grant with a new version
+    // and leave the cache stale indefinitely. Publishers revoke the old grant
+    // before replacement, so a cache hit during publication fails closed.
+    store.expiration_authority_version_ = version;
+  }
+  const auto& authority = store.expiration_authority_cache_;
+  // Revocation and lease expiry/renewal remain live reads on every use. Retain
+  // the exact grant in queued work even after this worker refreshes its cache.
+  return ExpirationAuthorityIsValid(authority.get()) ? authority : nullptr;
 }
 
 absl::Status StorageEngine::Impl::ValidateExpirationAuthority(
@@ -167,10 +198,17 @@ void StorageEngine::Impl::SetExpirationAuthority(bool authority) noexcept {
       // Invalidate before publishing its replacement. Work already carrying
       // the old capability will then fail its final mutation precondition.
       current->active_.store(false, std::memory_order_release);
+      // Local replication role loss can precede the next control observation.
+      // Retire the common epoch now, so an in-flight Meta Ack cannot renew
+      // request/source authority after the owner has disabled expiration.
+      if (current->lease_ != nullptr) current->lease_->Revoke();
     }
     if (active_expiration_authority_.compare_exchange_weak(
             current, replacement, std::memory_order_acq_rel,
             std::memory_order_acquire)) {
+      if (current != replacement) {
+        expiration_authority_version_.fetch_add(1, std::memory_order_release);
+      }
       if (authority) {
         expiration_authority_.store(replacement != nullptr,
                                     std::memory_order_release);
@@ -182,19 +220,28 @@ void StorageEngine::Impl::SetExpirationAuthority(bool authority) noexcept {
 
 absl::Status StorageEngine::Impl::SetExpirationAuthorityUntil(
     std::chrono::nanoseconds deadline_since_boot) noexcept {
-  if (BootTimeSinceEpoch() >= deadline_since_boot) {
+  try {
+    return SetExpirationAuthorityUntil(
+        std::make_shared<LeaseDeadline>(deadline_since_boot));
+  } catch (const std::bad_alloc&) {
+    return absl::ResourceExhaustedError("failed to allocate expiration lease");
+  }
+}
+
+absl::Status StorageEngine::Impl::SetExpirationAuthorityUntil(
+    std::shared_ptr<LeaseDeadline> lease) noexcept {
+  if (lease == nullptr || !lease->valid_at(BootTimeSinceEpoch())) {
     return absl::DeadlineExceededError(
         "expiration authority deadline has already elapsed");
   }
   std::shared_ptr<ExpirationAuthorityGrant> replacement;
   try {
-    replacement =
-        std::make_shared<ExpirationAuthorityGrant>(deadline_since_boot);
+    replacement = std::make_shared<ExpirationAuthorityGrant>(lease);
   } catch (const std::bad_alloc&) {
     return absl::ResourceExhaustedError(
         "failed to allocate expiration authority grant");
   }
-  if (BootTimeSinceEpoch() >= deadline_since_boot) {
+  if (!lease->valid_at(BootTimeSinceEpoch())) {
     return absl::DeadlineExceededError(
         "expiration authority deadline elapsed during installation");
   }
@@ -207,6 +254,7 @@ absl::Status StorageEngine::Impl::SetExpirationAuthorityUntil(
     if (active_expiration_authority_.compare_exchange_weak(
             current, replacement, std::memory_order_acq_rel,
             std::memory_order_acquire)) {
+      expiration_authority_version_.fetch_add(1, std::memory_order_release);
       return absl::OkStatus();
     }
   }
@@ -245,7 +293,7 @@ void StorageEngine::Impl::QueueExpiredCandidate(WorkerStore& store,
                                                 std::uint8_t db_id,
                                                 const RecordIndex::Entry& entry,
                                                 std::string_view known_key) {
-  auto expiration_authority = CurrentExpirationAuthority();
+  auto expiration_authority = CurrentExpirationAuthority(store);
   if (expiration_authority == nullptr ||
       store.expired_candidates_.size() >= kMaxQueuedExpiredCandidates ||
       entry.value_.kind() != RecordKind::kValue || ExpireAt(entry) == 0) {
@@ -530,7 +578,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
             store->expired_candidates_.front().expiration_authority_.get())) {
       continue;
     }
-    if (CurrentExpirationAuthority() == nullptr) continue;
+    if (CurrentExpirationAuthority(*store) == nullptr) continue;
 
     const std::uint64_t now_ms = UnixTimeMillis();
     for (std::size_t step = 0;

@@ -47,6 +47,22 @@ seams:
   node controller; neither it nor replication writes `TopologyCache`
   directly.
 
+The final runtime worker owns the Meta client and every NodeControlInstaller
+mutation, including readiness changes submitted by data worker 0. Redis
+connections and data shards occupy only the preceding workers. Replication's
+coordinator remains on data worker 0. It publishes immutable heartbeat inputs
+at population, identity, source-pause, and failover state changes before
+suspending or notifying completion. The control worker reads one published
+version without submitting work to a data shard; live replica progress is a
+bounded coherent sample of the frontier retained by that same snapshot.
+Heartbeat construction rechecks the publication after any readiness transition
+that could suspend, so it cannot combine retired observations with a new proof.
+Control actions and first installation after an authority transition retain
+their data-worker barriers and fresh readiness checks. Unchanged, unexpired
+lease renewal updates one shared atomic deadline on the control worker without
+submissions or joining directive work. A slow data command can delay action
+completion without making ordinary heartbeat construction wait in its queue.
+
 The Redis/storage boundary adds a transport-neutral final seam:
 `storage::MutationPrecondition` carries the captured admission through every
 suspending storage preparation step and validates it at logical publication.
@@ -486,6 +502,13 @@ progress, but its lease decision is ignored. Heartbeats resume only after the
 new desired object is installed and `FullStateApplied` is written, so an old
 Ack cannot causally confirm the replacement projection and an old Ready proof
 cannot be evaluated against a new assignment, manifest, or population epoch.
+Pure duration changes with identical selected objects and no concurrent control
+or directive admission barrier can install directly on the control worker.
+They detach old challenges and order `FullStateApplied` before the next one,
+but need not join data-worker observations because their identity is unchanged.
+The existing finite deadline survives installation; a grant matching the new
+policy updates the shared deadline atomically, including when the policy shrinks.
+An owner keeps the shorter heartbeat cadence until that grant is installed.
 
 Task admission replies with `DirectiveResponse.started`; the asynchronous
 `DirectiveResult` is accepted independently of that response. There is no
@@ -505,12 +528,18 @@ authorities. This committed-state precondition complements the per-session
 Fence/FDS drain: a source that has not consumed the replacement can never keep
 an old lease while the destination begins serving the same slot.
 
-The authority guard publishes session, leases, and revocation generation as
-one immutable snapshot, independently of committed topology. Control-plane
-writers serialize publication; request admission and mutation rechecks read
-owned snapshots without acquiring the writer mutex. Ordinary renewals neither
-close request admission nor drain readers. Deadline-only renewal preserves
-the revocation generation; revocation invalidates earlier write proofs.
+The authority guard publishes session, lease identities, and revocation
+generation as one immutable snapshot, independently of committed topology.
+Each lease identity owns a shared lock-free atomic CLOCK_BOOTTIME deadline,
+bound to request admission, active expiration, and native source admission
+at initial installation. Unchanged session, projection, anchor, duration, and
+controller admission generation allow the control worker to renew that one
+word without republishing a snapshot or waiting for data workers. Ordinary
+renewal preserves the revocation generation and captured mutation capabilities.
+Invalidation revokes the shared epoch before publishing a new snapshot;
+readers never acquire the control writer mutex. Local replication role loss
+also revokes the common epoch when it disables expiration, independently of
+the next heartbeat observation.
 Cached snapshots still require a current absolute-deadline check on every
 lease-dependent admission and mutation recheck. Reads and writes use the same
 admission path; only writes retain their proof across suspension for the
@@ -527,10 +556,10 @@ failed, publishes storage-unready, joins older directive admission and every
 control transition already across the loss cut, then performs a final source
 revocation and target-population cancellation and drains retired requests.
 Storage writers set a process-wide latch and close the request gate
-immediately; worker zero drives this asynchronous controller barrier. An
-uncertain cleanup result stops the server without a clean checkpoint. Neither
-a later FDS nor a population proof can clear the latch; recovery requires
-process restart.
+immediately; data worker zero submits this controller barrier to the control
+worker. An uncertain cleanup result stops the server without a clean
+checkpoint. Neither a later FDS nor a population proof can clear the latch;
+recovery requires process restart.
 
 Meta's leadership expiry and every granted lease are bounded by the Raft
 election lower bound `D`, and a leader stops sessions synchronously on
@@ -646,7 +675,9 @@ transition first: it advances the authority generation, retires the stale
 timer, closes new source admission, joins older directive admissions, and
 drains retired requests before considering the replacement grant. A
 same-anchor heartbeat can extend only a lease that never expired, so pre-expiry
-admissions cannot be revived by a delayed timer.
+admissions cannot be revived by a delayed timer. The first consumer observing
+expiry marks that epoch terminal with an atomic compare/exchange; a renewer
+that sampled an older clock cannot undo an already-observed expiration.
 
 Population directives carry a kind-specific bounded `payload`; their mutation
 classification follows kind and has no independently supplied flag. `initialize-empty-population` uses its
@@ -693,11 +724,11 @@ exact still-valid population completion through a non-mutating lookup even
 while that population is serving. This path neither clears readiness nor
 starts work; no match retains all ordinary destructive-admission and drain
 checks. No local result record can reopen authority after restart.
-The production node controller and replication control state share worker
-zero: validation and exact-result lookup do not suspend or acquire a global
-state mutex. Other workers request population observations through the
-replication owner's asynchronous API, while data-flow progress remains
-worker-local and independently sampled.
+The production node controller owns the final control worker; replication
+control state belongs to data worker zero. NodeControl validation is local,
+while replication actions and exact-result lookup cross the replication
+owner's asynchronous API. Data-flow progress remains worker-local and
+independently sampled.
 
 The local Group failover transition is a separate level-triggered control object. It
 names the transition/revision, controlled or uncontrolled mode, target term,
@@ -851,9 +882,9 @@ The read-only mode bootstrap precedes storage initialization. The outbound
 full Meta control client then waits for local storage readiness before opening
 its first session. Readiness includes disk, Function-catalog and population
 recovery, so FDS installation and directives cannot supersede an in-progress
-startup recovery. This wait runs cooperatively on worker zero and can end on
-shutdown without starting control work. Opening the full control session is
-not a dependency of local recovery.
+startup recovery. This wait runs cooperatively on the control worker and can
+end on shutdown without starting control work. Opening the full control
+session is not a dependency of local recovery.
 
 Meta-controlled topology and authority enter through the asynchronous
 client/session path and `NodeControlInstaller`, which can wait for replication revocation and

@@ -1813,6 +1813,46 @@ Task<absl::Status> StorageEngine::Impl::EndReplicaTailCommand(
   co_return absl::OkStatus();
 }
 
+Task<absl::StatusOr<bool>> StorageEngine::Impl::ReplicaCommandNeedsApply(
+    std::uint64_t session_id, std::uint16_t partition_id,
+    std::uint64_t partition_sequence, std::uint8_t db_id,
+    std::string_view key) {
+  WorkerStore& store = CurrentStore();
+  if (db_id >= options_.database_count_ || partition_id != RedisSlot(key) ||
+      partition_id % worker_count_ != store.worker_->id()) {
+    co_return absl::InvalidArgumentError("invalid FULL command key owner");
+  }
+  const Digest digest = ComputeDigest(key);
+  auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+  co_await store.store_state_mutex_.Lock();
+  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  auto& partition = PartitionFor(store, partition_id);
+  auto context_current = [&] {
+    const auto* sync = partition.replica_sync_.get();
+    return sync != nullptr && sync->session_id_ == session_id &&
+           sync->command_sequence_ == partition_sequence;
+  };
+  if (!context_current()) {
+    co_return absl::FailedPreconditionError(
+        "FULL command coverage checked outside its apply context");
+  }
+  auto found =
+      co_await FindVerifiedEntry(store, partition.indexes_[db_id], digest, key);
+  if (!found.ok()) co_return found.status();
+  if (!context_current()) {
+    co_return absl::FailedPreconditionError(
+        "FULL command context changed during coverage lookup");
+  }
+  // Check physical version before Redis type/expiry semantics. A later
+  // after-image can already contain this mutation, even when it is a
+  // tombstone or has expired. Reapplying an equal-version INCR/LPUSH is not
+  // idempotent; an older HSET can fail against a newer List before reaching
+  // the storage writer's version guard.
+  co_return *found == nullptr ||
+      (*found)->value_.mutation_sequence_ < partition_sequence;
+}
+
 Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     std::uint64_t session_id, std::uint16_t partition_id,
     std::uint64_t replication_epoch, std::span<const SnapshotRecord> records) {

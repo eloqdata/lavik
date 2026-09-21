@@ -414,15 +414,15 @@ class NodeControlActions {
   // both only after a post-await local control/session/deadline recheck.
   virtual bycorf::Task<absl::Status> ActivatePreparedPromotion(
       PreparedFailoverActivation activation);
-  // Installs the same absolute CLOCK_BOOTTIME deadline used by the request
-  // lease. Returning success means expiration can run only until that finite
-  // cut; it does not imply request authority.
+  // Binds the shared CLOCK_BOOTTIME lease also used by request admission.
+  // Returning success permits expiration only while this epoch remains valid;
+  // ordinary renewal updates it without calling the adapter again.
   virtual bycorf::Task<absl::Status> EnableExpirationAuthorityUntil(
-      MonotonicTime deadline);
+      std::shared_ptr<LeaseDeadline> lease);
   // Opens new POPULATION source handshakes after the request lease itself is
   // installed. Implementations must serialize this with native admission.
   virtual bycorf::Task<absl::Status> EnableSourceAdmissionForLease(
-      MonotonicTime deadline);
+      std::shared_ptr<LeaseDeadline> lease);
   // Closes active expiration and joins work that entered before the close.
   // Every asynchronous authority-loss barrier invokes this before returning.
   virtual bycorf::Task<absl::Status> RevokeExpirationAuthority();
@@ -456,9 +456,9 @@ class NodeControlActions {
   // Non-suspending, non-mutating lookup: only an exact, still-valid completed
   // population may return its original completion. A miss falls through to
   // normal mutation admission; implementations must never initiate a reset.
-  virtual std::optional<NodeDirectiveCompletion> FindCompletedPopulation(
-      const NodeDirective& /*directive*/) const {
-    return std::nullopt;
+  virtual bycorf::Task<std::optional<NodeDirectiveCompletion>>
+  FindCompletedPopulation(const NodeDirective& /*directive*/) const {
+    co_return std::nullopt;
   }
   virtual bycorf::Task<absl::Status> ApplyDirective(
       NodeDirective directive) = 0;
@@ -490,17 +490,25 @@ class NodeControlInstaller {
   NodeControlInstaller(const NodeControlInstaller&) = delete;
   NodeControlInstaller& operator=(const NodeControlInstaller&) = delete;
 
-  // Publishes routing on worker 0 while preserving exact local control,
-  // task admission, exports, and leases. Rejects any local control change.
+  // Publishes routing on the control worker while preserving exact local
+  // control, task admission, exports, and leases. Rejects any local control
+  // change.
   absl::Status InstallRouting(PreparedFullState prepared_state);
+
+  // Control-worker-only policy update after the caller has verified that all
+  // other selected control objects are unchanged. Preserves existing finite
+  // deadlines and capability tokens; the next exact grant changes the lease.
+  // Returns false without mutation if another transition requires a barrier.
+  bool TryUpdateLeasePolicy(ProjectionBasis previous, ProjectionBasis next,
+                            std::uint32_t duration_ms);
 
   // Installs one completely decoded and validated snapshot through a test
   // adapter that never receives directives. Directive-capable adapters must
   // use InstallFullStateTransition(), even when a particular snapshot appears
   // to require no cleanup: concurrent admission is what makes the synchronous
-  // path unsafe. Meta transitions run on worker 0. Lower source indices and
-  // same-assignment counter regressions fail closed; equal-index replay is
-  // idempotent.
+  // path unsafe. Meta transitions run on the control worker. Lower source
+  // indices and same-assignment counter regressions fail closed; equal-index
+  // replay is idempotent.
   absl::Status InstallFullState(PreparedFullState prepared_state,
                                 ProjectionBasis projection_basis);
 
@@ -512,6 +520,12 @@ class NodeControlInstaller {
   // projection and complete authority anchor must still match installed state.
   absl::Status ApplyAuthority(const AuthorityMessage& authority_message,
                               MonotonicTime now);
+
+  // Control-worker-only, non-suspending renewal of an already installed epoch.
+  // Returns false when a transition, expiry, or changed projection requires the
+  // full installation barrier. Success updates all three authority consumers
+  // with one lock-free atomic operation and preserves admitted request proofs.
+  bool TryRenewLease(const AuthorityMessage& message);
 
   // Meta-only grant boundary. Installs the grant and schedules expiry with
   // bounded relative waits that repeatedly check its suspend-aware deadline.
@@ -655,6 +669,10 @@ class NodeControlInstaller {
     AuthorityAnchor anchor_;
     MonotonicTime deadline_;
     MonotonicDuration recheck_interval_;
+    std::shared_ptr<LeaseDeadline> lease_;
+    ProjectionBasis projection_;
+    MonotonicDuration granted_duration_;
+    std::uint64_t admission_generation_ = 0;
     std::uint64_t timer_generation_ = 1;
     bool active_ = true;
   };

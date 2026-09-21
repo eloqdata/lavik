@@ -33,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "bycorf/io/storage.h"
@@ -283,12 +284,12 @@ bycorf::Task<absl::Status> NodeControlActions::ActivatePreparedPromotion(
 }
 
 bycorf::Task<absl::Status> NodeControlActions::EnableExpirationAuthorityUntil(
-    MonotonicTime /*deadline*/) {
+    std::shared_ptr<LeaseDeadline> /*lease*/) {
   co_return absl::OkStatus();
 }
 
 bycorf::Task<absl::Status> NodeControlActions::EnableSourceAdmissionForLease(
-    MonotonicTime /*deadline*/) {
+    std::shared_ptr<LeaseDeadline> /*lease*/) {
   co_return absl::OkStatus();
 }
 
@@ -1285,6 +1286,23 @@ absl::Status NodeControlInstaller::InstallRouting(PreparedFullState prepared) {
                                &effects);
 }
 
+bool NodeControlInstaller::TryUpdateLeasePolicy(ProjectionBasis previous,
+                                                ProjectionBasis next,
+                                                std::uint32_t duration_ms) {
+  if (!projection_basis_ || *projection_basis_ != previous ||
+      next.control_revision_ <= previous.control_revision_ ||
+      duration_ms == 0 || storage_failed_ ||
+      !active_control_transitions_.empty() ||
+      source_revocation_transitions_ != 0)
+    return false;
+  projection_basis_ = next;
+  authority_lease_duration_ms_ = duration_ms;
+  for (const auto& [group, schedule] : lease_expiry_schedules_) {
+    if (schedule->projection_ == previous) schedule->projection_ = next;
+  }
+  return true;
+}
+
 bycorf::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
     PreparedFullState prepared_state, ProjectionBasis projection_basis,
     bool local_population_transition_expected,
@@ -1421,6 +1439,53 @@ absl::Status NodeControlInstaller::ApplyAuthority(
   return result;
 }
 
+bool NodeControlInstaller::TryRenewLease(const AuthorityMessage& message) {
+  // Every authority-changing transition invalidates admissions before it can
+  // suspend. Matching this generation and projection reuses the full checks
+  // performed when this epoch's request/TTL/source capabilities were bound.
+  if (message.kind_ != AuthorityMessage::Kind::kLeaseGrant || storage_failed_ ||
+      !active_control_transitions_.empty() ||
+      source_revocation_transitions_ != 0 || !projection_basis_.has_value() ||
+      message.projection_ != *projection_basis_) {
+    return false;
+  }
+  const auto found = lease_expiry_schedules_.find(message.anchor_.group_id_);
+  if (found == lease_expiry_schedules_.end()) return false;
+  auto& schedule = *found->second;
+  if (!schedule.active_ || schedule.lease_ == nullptr ||
+      schedule.session_ != message.session_ ||
+      schedule.anchor_ != message.anchor_ ||
+      schedule.projection_ != message.projection_ ||
+      schedule.admission_generation_ != directive_admission_generation_)
+    return false;
+  const bool policy_changed =
+      schedule.granted_duration_ != message.granted_duration_;
+  const MonotonicTime now = LeaseClockNow();
+  if (policy_changed &&
+      (message.granted_duration_ !=
+           std::chrono::milliseconds(authority_lease_duration_ms_) ||
+       !ValidateLeaseGrantContext(message, now).ok()))
+    return false;
+  const MonotonicTime deadline = SaturatingLeaseDeadline(message);
+  // Only an exact newly installed policy may shorten the shared deadline.
+  // Replays at the old duration cannot extend authority after a policy change.
+  if (message.granted_duration_ !=
+          std::chrono::milliseconds(authority_lease_duration_ms_) ||
+      (!policy_changed && deadline < schedule.deadline_) ||
+      deadline == MonotonicTime::max())
+    return false;
+  if (!schedule.lease_->Renew(now.time_since_epoch(),
+                              deadline.time_since_epoch())) {
+    return false;
+  }
+  schedule.deadline_ = deadline;
+  schedule.granted_duration_ = message.granted_duration_;
+  schedule.recheck_interval_ =
+      std::min(schedule.recheck_interval_,
+               LeaseExpiryRecheckInterval(message.granted_duration_));
+  return true;
+}
+
 bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
     const AuthorityMessage& message) {
   if (message.kind_ != AuthorityMessage::Kind::kLeaseGrant) {
@@ -1432,6 +1497,7 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
     co_return absl::FailedPreconditionError(
         "Meta lease transition requires a Bycorf worker");
   }
+  if (TryRenewLease(message)) co_return absl::OkStatus();
   const MonotonicTime deadline = SaturatingLeaseDeadline(message);
   MonotonicTime now = LeaseClockNow();
   auto initial = ValidateLeaseGrantContext(message, now);
@@ -1455,6 +1521,11 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
     if (!initial.ok()) co_return initial.status();
   }
 
+  const auto lease =
+      std::make_shared<LeaseDeadline>(deadline.time_since_epoch());
+  // A failed initial installation must close every consumer, including TTL
+  // installed before request authority, before asynchronous cleanup can wait.
+  auto revoke_on_failure = absl::MakeCleanup([lease] { lease->Revoke(); });
   const std::optional<DesiredClusterControl> pinned_desired = *initial;
   const std::uint64_t pinned_generation = directive_admission_generation_;
   if (pinned_desired.has_value() &&
@@ -1477,17 +1548,20 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
     if (absl::Status activated =
             co_await actions_.ActivatePreparedPromotion(std::move(activation));
         !activated.ok()) {
+      lease->Revoke();
       co_return co_await FailClosedLeaseGrantTransition(message,
                                                         std::move(activated));
     }
     now = LeaseClockNow();
     auto rechecked = ValidateLeaseGrantContext(message, now);
     if (!rechecked.ok()) {
+      lease->Revoke();
       co_return co_await FailClosedLeaseGrantTransition(message,
                                                         rechecked.status());
     }
     if (directive_admission_generation_ != pinned_generation ||
         *rechecked != pinned_desired) {
+      lease->Revoke();
       co_return co_await FailClosedLeaseGrantTransition(
           message, absl::FailedPreconditionError(
                        "promotion activation crossed a changed control "
@@ -1496,18 +1570,21 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
   }
 
   if (absl::Status expiration =
-          co_await actions_.EnableExpirationAuthorityUntil(deadline);
+          co_await actions_.EnableExpirationAuthorityUntil(lease);
       !expiration.ok()) {
+    lease->Revoke();
     co_return co_await FailClosedLeaseGrantTransition(message,
                                                       std::move(expiration));
   }
   now = LeaseClockNow();
   auto final = ValidateLeaseGrantContext(message, now);
   if (!final.ok()) {
+    lease->Revoke();
     co_return co_await FailClosedLeaseGrantTransition(message, final.status());
   }
   if (directive_admission_generation_ != pinned_generation ||
       *final != pinned_desired) {
+    lease->Revoke();
     co_return co_await FailClosedLeaseGrantTransition(
         message,
         absl::FailedPreconditionError(
@@ -1515,26 +1592,30 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
             "session"));
   }
   if (absl::Status installed = authority_.RenewLease(
-          message.session_, message.anchor_, deadline, now);
+          message.session_, message.anchor_, deadline, now, lease);
       !installed.ok()) {
+    lease->Revoke();
     co_return co_await FailClosedLeaseGrantTransition(message,
                                                       std::move(installed));
   }
   if (absl::Status source_admission =
-          co_await actions_.EnableSourceAdmissionForLease(deadline);
+          co_await actions_.EnableSourceAdmissionForLease(lease);
       !source_admission.ok()) {
+    lease->Revoke();
     co_return co_await FailClosedLeaseGrantTransition(
         message, std::move(source_admission));
   }
   now = LeaseClockNow();
   final = ValidateLeaseGrantContext(message, now);
   if (!final.ok()) {
+    lease->Revoke();
     co_return co_await FailClosedLeaseGrantTransition(message, final.status());
   }
   if (directive_admission_generation_ != pinned_generation ||
       *final != pinned_desired ||
       !authority_.HasExactLease(message.session_, message.anchor_, deadline,
                                 now)) {
+    lease->Revoke();
     co_return co_await FailClosedLeaseGrantTransition(
         message, absl::FailedPreconditionError(
                      "source admission activation crossed a changed or expired "
@@ -1551,6 +1632,10 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
         .deadline_ = deadline,
         .recheck_interval_ =
             LeaseExpiryRecheckInterval(message.granted_duration_),
+        .lease_ = lease,
+        .projection_ = message.projection_,
+        .granted_duration_ = message.granted_duration_,
+        .admission_generation_ = pinned_generation,
     });
     lease_expiry_schedules_.insert_or_assign(message.anchor_.group_id_,
                                              schedule);
@@ -1565,6 +1650,10 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
     schedule->anchor_ = message.anchor_;
     schedule->deadline_ = deadline;
     schedule->recheck_interval_ = recheck_interval;
+    schedule->lease_ = lease;
+    schedule->projection_ = message.projection_;
+    schedule->granted_duration_ = message.granted_duration_;
+    schedule->admission_generation_ = pinned_generation;
     if (deadline < old_deadline || recheck_interval < old_recheck_interval) {
       ++schedule->timer_generation_;
       spawn_timer = true;
@@ -1578,6 +1667,7 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
     worker->Spawn(ExpireLeaseAt(schedule, schedule->timer_generation_,
                                 std::move(lifetime)));
   }
+  std::move(revoke_on_failure).Cancel();
   co_return absl::OkStatus();
 }
 
@@ -1608,10 +1698,10 @@ bycorf::Task<absl::Status> NodeControlInstaller::ExpireLeaseAt(
   if (!schedule->active_ || schedule->timer_generation_ != timer_generation) {
     co_return absl::OkStatus();
   }
-  // Renewal updates the shared schedule. An extension keeps this timer unless
-  // the new grant requires a shorter recheck slice; a deadline shortening or
-  // smaller slice replaces its generation, so this stale task cannot touch
-  // the replacement lease.
+  // Atomic renewal, including a policy change, updates this shared schedule.
+  // Relative sleeps are bounded; request/TTL/source admission also checks the
+  // atomic deadline synchronously. Full grant installation can replace the
+  // timer generation, in which case this stale task cannot touch its lease.
   co_return co_await FinishExpiredLeaseTransition(schedule, LeaseClockNow());
 }
 
@@ -1748,8 +1838,19 @@ bycorf::Task<NodeDirectiveCompletion> NodeControlInstaller::StartDirective(
             ValidateDirectiveForStart(directive, /*replay_lookup=*/true);
         !valid.ok())
       co_return terminal(std::move(valid));
-    if (auto completed = actions_.FindCompletedPopulation(directive))
-      co_return std::move(*completed);
+    const auto lookup_generation = directive_admission_generation_;
+    auto completed = co_await actions_.FindCompletedPopulation(directive);
+    // The replication owner can be another worker. A completed lookup cannot
+    // carry an old session/control proof across this suspension.
+    if (lookup_generation != directive_admission_generation_) {
+      co_return terminal(absl::FailedPreconditionError(
+          "population replay lookup crossed a control transition"));
+    }
+    if (auto valid =
+            ValidateDirectiveForStart(directive, /*replay_lookup=*/true);
+        !valid.ok())
+      co_return terminal(std::move(valid));
+    if (completed) co_return std::move(*completed);
   }
   if (absl::Status valid = ValidateDirectiveForStart(directive); !valid.ok()) {
     co_return terminal(std::move(valid));

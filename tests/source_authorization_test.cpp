@@ -58,6 +58,24 @@ lavik::RebuildDirective Directive(std::uint64_t term, std::uint64_t revision,
   };
 }
 
+TEST(SourceAuthorizationLedgerTest, SharedLeaseRenewalAndRevocation) {
+  using namespace std::chrono_literals;
+  lavik::detail::SourceAuthorizationLedger ledger;
+  const auto lease = std::make_shared<lavik::LeaseDeadline>(100ns);
+  ledger.EnableLeaseAdmissionUntil(lease);
+  EXPECT_TRUE(ledger.LeaseAdmissionOpen(50ns));
+  EXPECT_TRUE(lease->Renew(50ns, 200ns));
+  EXPECT_TRUE(ledger.LeaseAdmissionOpen(150ns));
+  ledger.SuspendLeaseAdmission();
+  EXPECT_FALSE(ledger.LeaseAdmissionOpen(150ns));
+  // Suspending native admission does not revoke client write authority.
+  EXPECT_TRUE(lease->valid_at(150ns));
+  ledger.EnableLeaseAdmissionUntil(lease);
+  lease->Revoke();
+  EXPECT_FALSE(ledger.LeaseAdmissionOpen(150ns));
+  EXPECT_FALSE(lease->Renew(150ns, 300ns));
+}
+
 TEST(SourceAuthorizationLedgerTest,
      SameRevisionAllowsMultipleTargetsUntilRevocation) {
   lavik::detail::SourceAuthorizationLedger ledger;

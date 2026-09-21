@@ -20,11 +20,13 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "lavik/lease_deadline.h"
 #include "lavik/replication_group.h"
 
 namespace lavik::detail {
@@ -150,18 +152,19 @@ class SourceAuthorizationLedger {
   // Lease admission is a separate, O(1) gate over current FDS capabilities.
   // Expiry can therefore stop new exports without destroying the exact
   // authorization that the same current projection will need after renewal.
+  void EnableLeaseAdmissionUntil(std::chrono::nanoseconds deadline_since_boot) {
+    lease_ = std::make_shared<LeaseDeadline>(deadline_since_boot);
+  }
   void EnableLeaseAdmissionUntil(
-      std::chrono::nanoseconds deadline_since_boot) noexcept {
-    lease_admission_deadline_ = deadline_since_boot;
+      std::shared_ptr<LeaseDeadline> lease) noexcept {
+    lease_ = std::move(lease);
   }
   // Read-only partial export uses the same current finite Owner lease gate.
   bool LeaseAdmissionOpen(
       std::chrono::nanoseconds now_since_boot) const noexcept {
-    return now_since_boot < lease_admission_deadline_;
+    return lease_ != nullptr && lease_->valid_at(now_since_boot);
   }
-  void SuspendLeaseAdmission() noexcept {
-    lease_admission_deadline_ = std::chrono::nanoseconds::zero();
-  }
+  void SuspendLeaseAdmission() noexcept { lease_.reset(); }
 
   // An authorize-source command and its sibling rebuild command deliberately
   // have different delivery identities, revisions, and attempt lifecycles.
@@ -206,7 +209,7 @@ class SourceAuthorizationLedger {
       return pending_replays_ != 0
                  ? SourceAuthorizationDisposition::kLeaseSuspended
                  : SourceAuthorizationDisposition::kNotAuthorized;
-    return now_since_boot < lease_admission_deadline_
+    return LeaseAdmissionOpen(now_since_boot)
                ? SourceAuthorizationDisposition::kAuthorized
                : SourceAuthorizationDisposition::kLeaseSuspended;
   }
@@ -263,7 +266,7 @@ class SourceAuthorizationLedger {
   std::optional<Version> revoked_through_;
   std::vector<RebuildDirective> active_;
   std::size_t pending_replays_ = 0;
-  std::chrono::nanoseconds lease_admission_deadline_{};
+  std::shared_ptr<LeaseDeadline> lease_;
 };
 
 }  // namespace lavik::detail

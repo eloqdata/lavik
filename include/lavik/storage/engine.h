@@ -33,6 +33,7 @@
 
 #include "absl/status/statusor.h"
 #include "bycorf/runtime/task.h"
+#include "lavik/lease_deadline.h"
 #include "lavik/memory.h"
 #include "lavik/read_trace.h"
 #include "lavik/set_trace.h"
@@ -1364,6 +1365,13 @@ class StorageEngine {
   bycorf::Task<absl::Status> EndReplicaTailCommand(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::uint64_t partition_sequence);
+  // Tests a key against the currently installed FULL command context. Call on
+  // its owner before applying any effect of that command. Snapshot records,
+  // including tombstones and expired values, cover equal/older commands.
+  bycorf::Task<absl::StatusOr<bool>> ReplicaCommandNeedsApply(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::uint64_t partition_sequence, std::uint8_t db_id,
+      std::string_view key);
   bycorf::Task<absl::Status> ApplyReplicaRecords(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::uint64_t replication_epoch, std::span<const SnapshotRecord> records);
@@ -1631,8 +1639,9 @@ class StorageEngine {
   // capability. A false-to-true transition installs a fresh permanent
   // capability, while repeating true for the current valid permanent grant is
   // idempotent; replacing a finite grant with permanent still cancels the
-  // finite capability. This call never grants client mutation authority by
-  // itself.
+  // finite capability. Retiring a bound shared lease also revokes its request
+  // and source admission epoch, so local role loss cannot race ordinary Meta
+  // renewal. This call never grants client mutation authority by itself.
   void SetExpirationAuthority(bool authority) noexcept;
   // Installs a fresh, revocable active-expiration capability whose absolute
   // deadline is measured from Linux CLOCK_BOOTTIME. Queued work carries that
@@ -1642,6 +1651,10 @@ class StorageEngine {
   // authority or affect Tomb Raider.
   absl::Status SetExpirationAuthorityUntil(
       std::chrono::nanoseconds deadline_since_boot) noexcept;
+  // Binds a shared finite lease once. Ordinary control-worker renewal updates
+  // captured expiration capabilities without submitting work to data workers.
+  absl::Status SetExpirationAuthorityUntil(
+      std::shared_ptr<LeaseDeadline> lease) noexcept;
   std::uint32_t ExpirationPauseCount() const noexcept;
 
   // Process-wide runtime settings, readable and writable from any worker.

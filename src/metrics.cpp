@@ -28,6 +28,7 @@
 #include <utility>
 
 #include "absl/strings/str_cat.h"
+#include "bycorf/net/connection_stats.h"
 #include "bycorf/net/http_service.h"
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/cycle_clock.h"
@@ -69,12 +70,9 @@ struct WorkerMetricsData {
 // cache lines without imposing that alignment on cross-worker return values.
 struct alignas(64) WorkerMetricsShard : WorkerMetricsData {};
 
-using WorkerMetricsTransfer = std::pair<WorkerMetricsData, std::uint64_t>;
-
 static_assert(alignof(WorkerMetricsShard) == 64);
 static_assert(sizeof(WorkerMetricsShard) % 64 == 0);
 static_assert(alignof(WorkerMetricsData) <= alignof(std::max_align_t));
-static_assert(alignof(WorkerMetricsTransfer) <= alignof(std::max_align_t));
 static_assert(alignof(WorkerMetricsSnapshot) <= alignof(std::max_align_t));
 static_assert(alignof(bycorf::Worker::StorageIoStats) <=
               alignof(std::max_align_t));
@@ -86,6 +84,12 @@ std::array<std::uint64_t, kCommandLatencyBucketUpperUs.size()>
 double g_counter_frequency = 1.0;
 
 struct ClusterControlMetrics {
+  struct Wait {
+    std::array<std::atomic<std::uint64_t>, kControlWaitBoundsUs.size() + 1>
+        buckets{};
+    std::atomic<std::uint64_t> sum_us{0};
+  };
+  std::array<Wait, 2> waits;
   std::atomic<std::uint64_t> connected_{0};
   std::atomic<std::uint64_t> reconnects_{0};
   std::atomic<std::uint64_t> protocol_errors_{0};
@@ -142,8 +146,18 @@ void RecordClusterControlDirectiveResult(bool succeeded) noexcept {
   counter.fetch_add(1, std::memory_order_relaxed);
 }
 
+void RecordClusterControlWait(ClusterControlWait stage,
+                              std::uint64_t us) noexcept {
+  auto& wait = g_cluster_control_metrics.waits[static_cast<unsigned>(stage)];
+  const auto bucket = std::lower_bound(kControlWaitBoundsUs.begin(),
+                                       kControlWaitBoundsUs.end(), us) -
+                      kControlWaitBoundsUs.begin();
+  wait.sum_us.fetch_add(us, std::memory_order_relaxed);
+  wait.buckets[bucket].fetch_add(1, std::memory_order_relaxed);
+}
+
 ClusterControlMetricsSnapshot GetClusterControlMetrics() noexcept {
-  return ClusterControlMetricsSnapshot{
+  ClusterControlMetricsSnapshot snapshot{
       .connected_ =
           g_cluster_control_metrics.connected_.load(std::memory_order_relaxed),
       .reconnects_ =
@@ -165,6 +179,16 @@ ClusterControlMetricsSnapshot GetClusterControlMetrics() noexcept {
       .directive_failures_ = g_cluster_control_metrics.directive_failures_.load(
           std::memory_order_relaxed),
   };
+  for (unsigned stage = 0; stage < snapshot.waits_.size(); ++stage) {
+    const auto& source = g_cluster_control_metrics.waits[stage];
+    auto& target = snapshot.waits_[stage];
+    for (unsigned bucket = 0; bucket < target.buckets_.size(); ++bucket) {
+      target.buckets_[bucket] =
+          source.buckets[bucket].load(std::memory_order_relaxed);
+    }
+    target.sum_us_ = source.sum_us.load(std::memory_order_relaxed);
+  }
+  return snapshot;
 }
 
 std::uint64_t WorkerMetricsSnapshot::TotalCalls() const noexcept {
@@ -304,17 +328,15 @@ bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
   result.counter_frequency_ = g_counter_frequency;
   for (unsigned worker = 0; worker < g_worker_metrics_count; ++worker) {
     // Copy on the owner rather than reading its live cache lines remotely.
-    // Explicitly slice off the live shard's alignment before returning: pair
-    // deduction from WorkerMetricsShard would over-align the coroutine frame.
-    const auto [shard, connections] =
-        co_await bycorf::SubmitTo(worker, [worker]() -> WorkerMetricsTransfer {
-          return {
-              static_cast<const WorkerMetricsData&>(g_worker_metrics[worker]),
-              bycorf::ThisWorker().self_->ActiveConnectionCount()};
+    // Slice off the live shard's alignment so it does not over-align the
+    // coroutine frame holding the transfer value.
+    const auto shard =
+        co_await bycorf::SubmitTo(worker, [worker]() -> WorkerMetricsData {
+          return static_cast<const WorkerMetricsData&>(
+              g_worker_metrics[worker]);
         });
     const bycorf::Worker::StorageIoStats storage_io = co_await bycorf::SubmitTo(
         worker, [] { return bycorf::ThisWorker().self_->storage_io_stats(); });
-    result.connections_ += connections;
     result.connected_clients_ += shard.connected_clients_;
     result.blocked_clients_ += shard.blocked_clients_;
     result.replication_control_connections_ +=
@@ -344,6 +366,9 @@ bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
       }
     }
   }
+  // Includes outgoing Meta streams without scheduling a metrics task on the
+  // control worker. This counter is updated only at stream open/close.
+  result.connections_ = bycorf::ProcessActiveConnectionCount();
   co_return result;
 }
 
@@ -498,7 +523,7 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
       "lavik_storage_io_bytes_total{operation=\"fdatasync\"} ",
       worker_metrics.storage_fdatasyncs_.bytes_, "\n",
       "# HELP lavik_connections Current TCP connections, including Redis "
-      "clients, metrics scrapes, and replication.\n"
+      "clients, metrics scrapes, replication, and Meta control.\n"
       "# TYPE lavik_connections gauge\n"
       "lavik_connections ",
       worker_metrics.connections_, "\n",
@@ -521,7 +546,8 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
       "# TYPE lavik_replication_flow_connections gauge\n"
       "lavik_replication_flow_connections ",
       worker_metrics.replication_flow_connections_, "\n",
-      "# HELP lavik_cluster_control_connected Whether worker 0 currently "
+      "# HELP lavik_cluster_control_connected Whether the control worker "
+      "currently "
       "holds an accepted Meta control session.\n"
       "# TYPE lavik_cluster_control_connected gauge\n"
       "lavik_cluster_control_connected ",
@@ -673,6 +699,30 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
       "# HELP lavik_worker_memory_limit_bytes Retained-memory admission "
       "limit assigned to this worker.\n"
       "# TYPE lavik_worker_memory_limit_bytes gauge\n");
+  absl::StrAppend(
+      &output,
+      "# HELP lavik_cluster_control_wait_seconds Time spent collecting data "
+      "observations or installing leases, including cross-worker waits.\n"
+      "# TYPE lavik_cluster_control_wait_seconds histogram\n");
+  for (unsigned stage = 0; stage < control_metrics.waits_.size(); ++stage) {
+    const char* label = stage == 0 ? "observation" : "lease_installation";
+    const auto& wait = control_metrics.waits_[stage];
+    std::uint64_t count = 0;
+    for (unsigned bucket = 0; bucket < wait.buckets_.size(); ++bucket) {
+      count += wait.buckets_[bucket];
+      const std::string bound =
+          bucket == kControlWaitBoundsUs.size()
+              ? "+Inf"
+              : absl::StrCat(kControlWaitBoundsUs[bucket] / 1e6);
+      absl::StrAppend(&output,
+                      "lavik_cluster_control_wait_seconds_bucket{stage=\"",
+                      label, "\",le=\"", bound, "\"} ", count, "\n");
+    }
+    absl::StrAppend(
+        &output, "lavik_cluster_control_wait_seconds_count{stage=\"", label,
+        "\"} ", count, "\n", "lavik_cluster_control_wait_seconds_sum{stage=\"",
+        label, "\"} ", wait.sum_us_ / 1e6, "\n");
+  }
   const unsigned memory_workers = MemoryAccountingWorkerCount();
   for (unsigned worker = 0; worker < memory_workers; ++worker) {
     const WorkerMemoryStats memory = GetWorkerMemoryStats(worker);

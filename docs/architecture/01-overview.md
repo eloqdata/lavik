@@ -145,16 +145,27 @@ in the [deployment guide](../operations/cluster-deployment.md).
    command/storage bindings, metrics shards, transaction runtime, and Bycorf
    service graph. Meta-managed mode starts the outbound Meta control client
    fenced; no topology or positive authority is restored locally.
-3. On every worker, `RedisService::Run` binds the memory and transaction shards
+3. The runtime has N data workers and one final control worker, where N is
+   the configured shard count. Redis listeners and connections, metrics,
+   replication data flows, memory accounting and storage occupy only the data
+   prefix. The control worker owns Meta sessions and NodeControl transitions;
+   it remains idle when Meta is not configured. All workers use the same
+   selected network and storage backends. CPU placement cycles over an explicit
+   list or the inherited affinity mask, allowing multiple workers on one CPU.
+   Optional exclusive Meta placement
+   reserves its final logical CPU and keeps all data workers on the others;
+   automatic sizing subtracts that reserved CPU from N.
+4. On every data worker, `RedisService::Run` binds the memory and transaction shards
    and awaits `StorageEngine::InitializeWorker`. Recovery barriers ensure all
    workers finish recovery and allocator cleanup before the process becomes
-   ready.
-4. Worker 0 recovers and validates the durable Function catalog on every
-   worker and restores any recoverable cluster population, then performs an
+   ready. A fatal storage or catalog startup error stops the entire runtime,
+   including the control worker, before the all-worker teardown barriers join.
+5. Data worker 0 recovers and validates the durable Function catalog on every
+   data worker and restores any recoverable cluster population, then performs an
    optional validated RDB import before publishing readiness. Replication is
    notified and the Meta control client may open its first session only after
    local startup recovery is complete.
-5. On a shutdown signal, new requests and accepts are closed; Meta control,
+6. On a shutdown signal, new requests and accepts are closed; Meta control,
    active requests, replication target/source work, and RDB backup work drain
    before storage is durably flushed. When configured, shutdown transaction
    cleaning relocates committed tagged winners into durable ordinary records;

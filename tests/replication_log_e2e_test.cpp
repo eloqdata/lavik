@@ -2936,6 +2936,253 @@ class ReplicationLogService final : public bycorf::Service {
     co_return absl::OkStatus();
   }
 
+  bycorf::Task<absl::Status> ApplyFullCommandForTest(
+      std::uint64_t sequence, std::uint8_t database,
+      std::vector<std::string> args) {
+    constexpr std::uint64_t session = 153;
+    const auto partition = lavik::storage::RedisSlot("{full-command}list");
+    auto begun = co_await storage_->BeginReplicaTailCommand(session, partition,
+                                                            sequence);
+    if (!begun.ok()) co_return begun;
+    ReplicatedCommand command{.db_id_ = database, .args_ = std::move(args)};
+    auto applied = co_await lavik::ApplyFullSyncCommand(command, session,
+                                                        partition, sequence);
+    auto ended =
+        co_await storage_->EndReplicaTailCommand(session, partition, sequence);
+    co_return applied.ok() ? ended : applied;
+  }
+
+  bycorf::Task<absl::Status> ExerciseFullCommandCoverage() {
+    constexpr std::uint64_t session = 153;
+    constexpr std::uint8_t db = 0;
+    const std::string list = "{full-command}list";
+    const std::string counter = "{full-command}counter";
+    const auto partition = lavik::storage::RedisSlot(list);
+    auto status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    // No expiration/reaping task may remove the physical coverage records
+    // while a target population is being rebuilt.
+    storage_->SetExpirationAuthority(false);
+    lavik::storage::ReplicaPartitionReset reset{.partition_id_ = partition};
+    for (unsigned index = 0; index < reset.db_epochs_.size(); ++index) {
+      reset.db_epochs_[index] = storage_->DbEpoch(index);
+    }
+    auto epochs = co_await storage_->ResetReplicaPartitions(
+        session, std::span(&reset, 1));
+    if (!epochs.ok()) co_return epochs.status();
+    status = co_await storage_->HandoffReplicaPartition(
+        session, partition, epochs->front().replication_epoch_);
+    if (!status.ok()) co_return status;
+
+    auto check = [&](std::uint8_t database, std::string key,
+                     std::uint64_t sequence,
+                     bool expected) -> bycorf::Task<absl::Status> {
+      auto begun = co_await storage_->BeginReplicaTailCommand(
+          session, partition, sequence);
+      if (!begun.ok()) co_return begun;
+      auto needed = co_await storage_->ReplicaCommandNeedsApply(
+          session, partition, sequence, database, key);
+      auto ended = co_await storage_->EndReplicaTailCommand(session, partition,
+                                                            sequence);
+      if (!needed.ok()) co_return needed.status();
+      Check(*needed == expected, "FULL physical coverage decision differs");
+      co_return ended;
+    };
+
+    std::vector<std::string> command_args;
+    // Reproduce the live mismatch exactly: physical List 961, HSET 955.
+    // The later list must survive both older HSET and equal-version RPUSH.
+    command_args = {"RPUSH", list, "latest"};
+    status = co_await ApplyFullCommandForTest(961, db, std::move(command_args));
+    if (!status.ok()) co_return status;
+    command_args = {std::string(lavik::kReplicatedExecCommand),
+                    "2",
+                    "0",
+                    "4",
+                    "HSET",
+                    list,
+                    "f",
+                    "v",
+                    "0",
+                    "2",
+                    "PERSIST",
+                    list};
+    status = co_await ApplyFullCommandForTest(955, db, std::move(command_args));
+    if (!status.ok()) co_return status;
+    command_args = {"RPUSH", list, "latest"};
+    status = co_await ApplyFullCommandForTest(961, db, std::move(command_args));
+    if (!status.ok()) co_return status;
+    command_args = {"LRANGE", list, "0", "-1"};
+    status = co_await ExecuteClientCommand(db, std::move(command_args),
+                                           "*1\r\n$6\r\nlatest\r\n");
+    if (!status.ok()) co_return status;
+    std::cout << "FULL older WRONGTYPE and equal RPUSH coverage PASS\n";
+
+    command_args = {"SET", counter, "10"};
+    status =
+        co_await ApplyFullCommandForTest(1000, db, std::move(command_args));
+    if (!status.ok()) co_return status;
+    command_args = {"INCR", counter};
+    status =
+        co_await ApplyFullCommandForTest(1000, db, std::move(command_args));
+    if (!status.ok()) co_return status;
+    command_args = {"GET", counter};
+    status = co_await ExecuteClientCommand(db, std::move(command_args),
+                                           "$2\r\n10\r\n");
+    if (!status.ok()) co_return status;
+    const auto deadline =
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count()) +
+        600000;
+    command_args = {std::string(lavik::kReplicatedExecCommand),
+                    "2",
+                    "0",
+                    "2",
+                    "INCR",
+                    counter,
+                    "0",
+                    "3",
+                    "PEXPIREAT",
+                    counter,
+                    std::to_string(deadline)};
+    status =
+        co_await ApplyFullCommandForTest(1001, db, std::move(command_args));
+    if (!status.ok()) co_return status;
+    auto expiry = co_await storage_->GetExpiration(db, counter);
+    Check(
+        expiry.exists_ && expiry.expire_at_ms_ == deadline,
+        "FULL skipped TTL companion after its mutation installed the sequence");
+    command_args = {std::string(lavik::kReplicatedExecCommand),
+                    "2",
+                    "0",
+                    "2",
+                    "INCR",
+                    counter,
+                    "0",
+                    "2",
+                    "PERSIST",
+                    counter};
+    status =
+        co_await ApplyFullCommandForTest(1002, db, std::move(command_args));
+    if (!status.ok()) co_return status;
+    expiry = co_await storage_->GetExpiration(db, counter);
+    Check(expiry.exists_ && expiry.expire_at_ms_ == 0,
+          "FULL skipped PERSIST companion");
+    command_args = {"GET", counter};
+    status = co_await ExecuteClientCommand(db, std::move(command_args),
+                                           "$2\r\n12\r\n");
+    if (!status.ok()) co_return status;
+    std::cout << "FULL equal INCR and TTL envelope coverage PASS\n";
+
+    for (const bool deleted : {false, true}) {
+      const std::string key =
+          deleted ? "{full-command}deleted" : "{full-command}expired";
+      lavik::storage::SnapshotRecord record{
+          .kind_ = deleted ? lavik::storage::SnapshotRecord::Kind::kDelete
+                           : lavik::storage::SnapshotRecord::Kind::kValue,
+          .db_id_ = db,
+          .db_epoch_ = reset.db_epochs_[db],
+          .mutation_sequence_ = 1100,
+          .expire_at_ms_ = deleted ? 0UL : 1UL,
+          .value_type_ = lavik::storage::ValueType::kString,
+          .logical_size_ = deleted ? 0UL : 1UL,
+          .key_ = key,
+          .value_ = deleted ? "" : "v",
+      };
+      status = co_await storage_->ApplyReplicaRecords(
+          session, partition, epochs->front().replication_epoch_,
+          std::span(&record, 1));
+      if (!status.ok()) co_return status;
+      status = co_await check(db, key, 1100, false);
+      if (!status.ok()) co_return status;
+      command_args = {"HSET", key, "f", "stale"};
+      status =
+          co_await ApplyFullCommandForTest(1099, db, std::move(command_args));
+      if (!status.ok()) co_return status;
+      Check(!co_await storage_->Exists(db, key),
+            "FULL resurrected a covered expired/deleted value");
+    }
+    std::cout << "FULL tombstone and expired physical coverage PASS\n";
+
+    // Coverage is per (DB, key), and independent canonical children can have
+    // different coverage. Skipping one must not drop a required sibling.
+    command_args = {std::string(lavik::kReplicatedExecCommand),
+                    "3",
+                    "0",
+                    "4",
+                    "HSET",
+                    list,
+                    "f",
+                    "stale",
+                    "1",
+                    "4",
+                    "HSET",
+                    list,
+                    "f",
+                    "other-db",
+                    "1",
+                    "2",
+                    "PERSIST",
+                    list};
+    status = co_await ApplyFullCommandForTest(960, db, std::move(command_args));
+    if (!status.ok()) co_return status;
+    command_args = {"HGET", list, "f"};
+    status = co_await ExecuteClientCommand(1, std::move(command_args),
+                                           "$8\r\nother-db\r\n");
+    if (!status.ok()) co_return status;
+    command_args = {"LLEN", list};
+    status =
+        co_await ExecuteClientCommand(db, std::move(command_args), ":1\r\n");
+    if (!status.ok()) co_return status;
+    // Multi-key source writes reach FULL as participant after-images. An
+    // unexpected noncanonical child cannot safely combine different covered
+    // versions, and must fail before an earlier child has mutated anything.
+    const std::string untouched = "{full-command}untouched";
+    command_args = {std::string(lavik::kReplicatedExecCommand),
+                    "2",
+                    "0",
+                    "3",
+                    "SET",
+                    untouched,
+                    "bad",
+                    "0",
+                    "5",
+                    "MSET",
+                    list,
+                    "bad",
+                    counter,
+                    "bad"};
+    status = co_await ApplyFullCommandForTest(980, db, std::move(command_args));
+    Check(!status.ok(), "FULL accepted a partially covered multi-key child");
+    Check(!co_await storage_->Exists(db, untouched),
+          "FULL validation partially applied an invalid envelope");
+    command_args = {std::string(lavik::kReplicatedExecCommand),
+                    "1",
+                    "0",
+                    "4",
+                    "HSET",
+                    list};
+    status = co_await ApplyFullCommandForTest(955, db, std::move(command_args));
+    Check(!status.ok(), "FULL coverage hid a malformed covered command");
+    auto outside = co_await storage_->ReplicaCommandNeedsApply(
+        session, partition, 960, db, list);
+    Check(!outside.ok(), "FULL coverage escaped its apply context");
+    status =
+        co_await storage_->BeginReplicaTailCommand(session, partition, 1200);
+    if (!status.ok()) co_return status;
+    auto stale = co_await storage_->ReplicaCommandNeedsApply(
+        session + 1, partition, 1200, db, list);
+    Check(!stale.ok(), "FULL coverage accepted a stale session");
+    status = co_await storage_->EndReplicaTailCommand(session, partition, 1200);
+    if (!status.ok()) co_return status;
+    std::cout << "FULL mixed envelope, database and session coverage PASS\n";
+    status = co_await storage_->AbortReplicaRoot(session);
+    storage_->SetReplicaLoading(false);
+    co_return status;
+  }
+
   bycorf::Task<absl::Status> Exercise() {
     absl::Status status = co_await ExerciseScannedKeyStorageChangeOrder();
     if (!status.ok()) co_return status;
@@ -2964,6 +3211,9 @@ class ReplicationLogService final : public bycorf::Service {
     if (!status.ok()) co_return status;
 
     status = co_await ExerciseFullSyncDuringTombstoneReaping();
+    if (!status.ok()) co_return status;
+
+    status = co_await ExerciseFullCommandCoverage();
     if (!status.ok()) co_return status;
 
     // The backlog is process memory only. Restart recovers primary records and

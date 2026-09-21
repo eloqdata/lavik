@@ -185,6 +185,11 @@ absl::Status StorageEngine::SetExpirationAuthorityUntil(
   return impl_->SetExpirationAuthorityUntil(deadline_since_boot);
 }
 
+absl::Status StorageEngine::SetExpirationAuthorityUntil(
+    std::shared_ptr<LeaseDeadline> lease) noexcept {
+  return impl_->SetExpirationAuthorityUntil(std::move(lease));
+}
+
 std::uint32_t StorageEngine::ExpirationPauseCount() const noexcept {
   return impl_->ExpirationPauseCount();
 }
@@ -550,6 +555,14 @@ Task<absl::Status> StorageEngine::ApplyReplicaRecords(
     std::uint64_t replication_epoch, std::span<const SnapshotRecord> records) {
   return impl_->ApplyReplicaRecords(session_id, partition_id, replication_epoch,
                                     records);
+}
+
+Task<absl::StatusOr<bool>> StorageEngine::ReplicaCommandNeedsApply(
+    std::uint64_t session_id, std::uint16_t partition_id,
+    std::uint64_t partition_sequence, std::uint8_t db_id,
+    std::string_view key) {
+  return impl_->ReplicaCommandNeedsApply(session_id, partition_id,
+                                         partition_sequence, db_id, key);
 }
 
 Task<absl::Status> StorageEngine::PromoteReplicaRoot(std::uint64_t session_id) {

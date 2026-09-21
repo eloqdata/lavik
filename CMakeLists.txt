@@ -95,8 +95,8 @@ if (LAVIK_COMPILER_AND_LINKER_FLAGS MATCHES "-fsanitize=[^ ]*address")
 endif()
 if (LAVIK_ASAN_BUILD AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   message(FATAL_ERROR
-    "AddressSanitizer builds require Clang. GCC does not preserve coroutine "
-    "symmetric transfers under ASan and can overflow the native stack.")
+    "AddressSanitizer builds currently support Clang only. The full GCC "
+    "sanitizer build is not covered by the supported validation matrix.")
 endif()
 set(LAVIK_CLANG_FORMAT_REQUIRED_VERSION "23.1.1")
 string(REPLACE "." "\\." LAVIK_CLANG_FORMAT_VERSION_REGEX
@@ -1048,6 +1048,24 @@ if (BUILD_TESTING)
         )
 
         set(LAVIK_NATIVE_GATE_SERVER lavik)
+        add_test(
+          NAME meta_integration.gate_lease_policy
+          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_lease_policy.py
+                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                  $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+        )
+        set_tests_properties(meta_integration.gate_lease_policy PROPERTIES
+          LABELS meta-integration TIMEOUT 180 RUN_SERIAL TRUE)
+        add_test(
+          NAME meta_integration.gate_heartbeat_cadence
+          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_heartbeat_cadence.py
+                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                  $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+        )
+        set_tests_properties(meta_integration.gate_heartbeat_cadence PROPERTIES
+          LABELS meta-integration TIMEOUT 120 RUN_SERIAL TRUE)
         if (TARGET lavik_fault_server)
           set(LAVIK_NATIVE_GATE_SERVER lavik_fault_server)
         endif()
@@ -1388,7 +1406,19 @@ if (BUILD_TESTING)
     tests/storage_capacity_test.cpp
     tests/tx_cleaner_test.cpp
     tests/tcp_nodelay_accept_test.cpp
+    tests/worker_placement_test.cpp
   )
+  if(LAVIK_KERNEL_BYPASS)
+    add_executable(lavik_dpdk_control_check tests/dpdk_control_check.cpp)
+    target_link_libraries(lavik_dpdk_control_check PRIVATE bycorf::core)
+    add_test(NAME lavik_dpdk_control
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/dpdk_control_smoke.py
+        $<TARGET_FILE:lavik_dpdk_control_check>)
+    # The smoke owns a fixed TAP and ports; never overlap other CTest jobs.
+    set_tests_properties(lavik_dpdk_control PROPERTIES
+      LABELS dpdk SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
+  endif()
   target_link_libraries(lavik_unit_tests
     PRIVATE lavik::module GTest::gtest_main
   )

@@ -36,6 +36,10 @@ struct ClusterRuntime {
   explicit ClusterRuntime(
       std::unique_ptr<NodeControlActions> actions = nullptr);
 
+  // Sole owner of NodeControlInstaller. Data workers submit readiness changes
+  // here; request admission continues to read immutable published snapshots.
+  unsigned control_worker_id_ = 0;
+
   TopologyCache topology_cache_;
   NullNodeControlActions null_control_actions_;
   // Production owns the ReplicationManager adapter for exactly as long as the

@@ -521,7 +521,19 @@ the session and bootstrap restores current state. Data validates the selected
 state before installation. Routing-only updates preserve local execution,
 source exports, population readiness and finite leases. Local control or task
 changes quiesce heartbeat/control work and reconcile before acknowledgement.
-Data derives heartbeat cadence as `max(1 ms, resolved lease duration / 3)`.
+A pure lease-duration update can preserve those same capabilities and install
+on the control worker without joining data workers. Meta may continue granting
+the exact installed duration while a nondecreasing policy update is delivered,
+only after comparing all selected objects against the latest committed
+high-water. Any further commit invalidates that renewal proof until revalidated;
+it never authorizes directives or marks the replacement projection current.
+Shorter policies cannot renew the old longer duration.
+Data derives heartbeat cadence as `max(1 ms, resolved lease duration / 3)`;
+an owner retains the faster old cadence until its first new-duration grant.
+The interval starts at the actual heartbeat write on the lease clock, so Ack
+latency consumes the interval instead of adding another full sleep. Only one
+heartbeat is outstanding; an overdue cycle sends one fresh observation rather
+than replaying missed ticks. Lease expiry still uses the challenge's write time.
 Policy documents and versions remain Meta-owned. `steady_replication_enabled`
 is true only for a Created cluster; explicit population or failover work
 otherwise owns local replication ingress.
@@ -534,6 +546,11 @@ A partial transfer never changes Data control state. Reconnection starts from
 fresh bootstrap and does not depend on retained delta history. Protocol v1
 layouts evolve in place for fresh clusters, without migration or mixed-version
 negotiation.
+
+Each publication retains its own validated committed high-water, separate from
+the installed projection's cursor. Transfer boundaries and final adoption reuse
+that proof until a newer commit arrives, so delivering one object does not
+repeatedly rebuild and encode the same manifests on the heartbeat worker.
 
 The Data-control wire protocol has a fixed versioned header, per-direction
 sequence, payload length, and CRC32C. Frames are bounded to 16 KiB. Larger

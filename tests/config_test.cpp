@@ -17,6 +17,7 @@
 #include "lavik/config.h"
 
 #include <gtest/gtest.h>
+#include <sched.h>
 
 #include <chrono>
 #include <filesystem>
@@ -214,7 +215,7 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   EXPECT_EQ(options.bind_addresses_,
             (std::vector<std::string>{"0.0.0.0", "::1", "redis.internal"}));
   EXPECT_EQ(options.port_, 6380);
-  EXPECT_EQ(options.thread_count_, 4u);
+  EXPECT_EQ(options.shard_count_, 4u);
   EXPECT_EQ(options.max_clients_, 12000u);
   EXPECT_TRUE(options.maxmemory_clients_.percentage_);
   EXPECT_EQ(options.maxmemory_clients_.value_, 7u);
@@ -362,6 +363,65 @@ TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"maxclients", "many"}, &options).ok());
   EXPECT_FALSE(ApplyRedisConfigDirective({"appendonly", "yes"}, &options).ok());
+}
+
+TEST(RedisConfigTest, AutomaticShardsAndExclusiveMetaCpu) {
+  cpu_set_t allowed;
+  ASSERT_EQ(::sched_getaffinity(0, sizeof(allowed), &allowed), 0);
+  std::vector<unsigned> cpus;
+  for (unsigned cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+    if (CPU_ISSET(cpu, &allowed)) cpus.push_back(cpu);
+  ASSERT_FALSE(cpus.empty());
+  ServerOptions options;
+  EXPECT_FALSE(options.meta_exclusive_cpu_);
+  options.shard_count_ = 0;
+  ASSERT_TRUE(lavik::ResolveAutomaticShardCount(&options).ok());
+  EXPECT_EQ(options.shard_count_, cpus.size());
+  auto shared = lavik::ResolveWorkerCpuIds(options);
+  ASSERT_TRUE(shared.ok()) << shared.status();
+  EXPECT_EQ(shared->size(), cpus.size() + 1);
+  EXPECT_EQ(shared->back(), cpus.front());
+
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"meta-exclusive-cpu", "yes"}, &options).ok());
+  options.shard_count_ = 0;
+  if (cpus.size() == 1) {
+    EXPECT_FALSE(lavik::ResolveAutomaticShardCount(&options).ok());
+    return;
+  }
+  ASSERT_TRUE(lavik::ResolveAutomaticShardCount(&options).ok());
+  EXPECT_EQ(options.shard_count_, cpus.size() - 1);
+  auto exclusive = lavik::ResolveWorkerCpuIds(options);
+  ASSERT_TRUE(exclusive.ok()) << exclusive.status();
+  EXPECT_EQ(*exclusive, cpus);
+
+  // Explicit shard counts survive auto resolution and oversubscribe only data
+  // CPUs.
+  options.cpu_ids_ = {cpus.front(), cpus.back()};
+  ASSERT_TRUE(ApplyRedisConfigDirective({"shards", "9"}, &options).ok());
+  ASSERT_TRUE(lavik::ResolveAutomaticShardCount(&options).ok());
+  EXPECT_EQ(options.shard_count_, 9u);
+  exclusive = lavik::ResolveWorkerCpuIds(options);
+  ASSERT_TRUE(exclusive.ok());
+  EXPECT_EQ(exclusive->size(), 10u);
+  for (unsigned worker = 0; worker < 9; ++worker)
+    EXPECT_EQ((*exclusive)[worker], cpus.front());
+  EXPECT_EQ(exclusive->back(), cpus.back());
+
+  options.cpu_ids_ = {cpus.front(), cpus.back(), cpus.front()};
+  EXPECT_FALSE(lavik::ResolveWorkerCpuIds(options).ok());
+  options.cpu_ids_ = {cpus.front()};
+  EXPECT_FALSE(lavik::ResolveWorkerCpuIds(options).ok());
+  options.cpu_ids_.clear();
+  options.pin_workers_ = false;
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+  EXPECT_FALSE(lavik::ResolveWorkerCpuIds(options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"meta-exclusive-cpu", "maybe"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"meta-exclusive-cpu", "no"}, &options).ok());
+  EXPECT_TRUE(lavik::ResolveWorkerCpuIds(options)->empty());
 }
 
 TEST(RedisConfigTest, MetaSeedsSelectManagementWithoutLocalMode) {
@@ -525,7 +585,7 @@ TEST(RedisConfigTest, LoadsFileAndReportsLineNumber) {
   ASSERT_TRUE(loaded.ok()) << loaded;
   EXPECT_EQ(options.config_file_, valid.path().string());
   EXPECT_EQ(options.port_, 6381);
-  EXPECT_EQ(options.thread_count_, 2u);
+  EXPECT_EQ(options.shard_count_, 2u);
   EXPECT_EQ(options.registered_buffer_bytes_, 128ULL * 1024 * 1024);
   EXPECT_EQ(options.storage_write_buffer_count_, 3u);
   EXPECT_EQ(options.replication_publish_queue_bytes_, 12ULL * 1024 * 1024);

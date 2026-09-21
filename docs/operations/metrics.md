@@ -30,6 +30,20 @@ A ready-to-run Prometheus and Grafana deployment, including a provisioned
 dashboard and multi-node discovery, is available in
 [`deploy/monitoring`](../../deploy/monitoring/README.md).
 
+`lavik_cluster_control_wait_seconds` measures completed Meta control steps,
+with `stage="observation"` for data-state collection and
+`stage="lease_installation"` for authority installation. It includes
+cross-worker waits and is exported as a histogram in seconds. These timings
+are diagnostics, not a 1 ms scheduling guarantee or an automatic warning
+threshold. Compare their distribution with the effective heartbeat interval
+and lease duration; use `lavik_cluster_control_lease_expirations_total` to
+identify actual local lease failures.
+
+The Grafana overview includes a collapsed **Meta Control Plane** row for these step
+timings, connection state, lease decisions, expirations, reconnects, and
+directive results. The metrics HTTP service runs on the data workers; the
+last runtime worker remains dedicated to Meta control tasks.
+
 ## Memory limit
 
 `--max-memory` (also accepted as `--maxmemory`) sets the process memory limit
@@ -92,7 +106,10 @@ accounting. RSS and allocator diagnostics remain outside command execution.
 - `lavik_command_duration_seconds`: command execution histogram, from
   dispatch through reply construction; socket response writes are excluded.
 - `lavik_connections`: all current TCP connections, including Redis clients,
-  Prometheus scrapes, and replication connections.
+  Prometheus scrapes, replication, and outgoing Meta control streams. The
+  process counter is read atomically without scheduling work on the control
+  worker. `lavik_cluster_control_connected` separately reports whether Meta
+  has accepted the control session.
 - `lavik_connected_clients`: current Redis client connections. This is always
   less than or equal to `lavik_connections`.
 
@@ -111,14 +128,15 @@ histogram_quantile(
 Meta-managed Data nodes export process-level control health without node,
 group, assignment, directive, or operation identifiers as labels:
 
-- `lavik_cluster_control_connected`: 1 while worker 0 owns an accepted Meta
-  session, otherwise 0.
+- `lavik_cluster_control_connected`: 1 while the final runtime worker (the Meta
+  control worker) owns an accepted Meta session, otherwise 0.
 - `lavik_cluster_control_reconnects_total`: reconnect rounds after the first
   attempt.
 - `lavik_cluster_control_protocol_errors_total`: sessions closed for invalid
   framing or protocol state.
 - `lavik_cluster_control_full_states_applied_total`: complete desired-state
-  projections installed atomically.
+  projections installed atomically, including lease-policy-only updates
+  installed through the control worker's fast path.
 - `lavik_cluster_control_lease_decisions_total{decision="granted|denied"}`:
   finite-authority outcomes returned by Meta.
 - `lavik_cluster_control_lease_expirations_total`: locally detected lease

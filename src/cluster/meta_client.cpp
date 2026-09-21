@@ -39,12 +39,14 @@
 #include <variant>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "bycorf/io/storage.h"
 #include "bycorf/net/tcp_stream.h"
 #include "bycorf/net/tls.h"
+#include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/sync.h"
 #include "bycorf/runtime/worker.h"
 #include "lavik/cluster/control_transport.h"
@@ -413,15 +415,15 @@ class ReplicationNodeControlActions final : public NodeControlActions {
   }
 
   bycorf::Task<absl::Status> EnableExpirationAuthorityUntil(
-      MonotonicTime deadline) override {
+      std::shared_ptr<LeaseDeadline> lease) override {
     co_return co_await replication_.EnableClusterExpirationAuthorityUntil(
-        deadline.time_since_epoch());
+        std::move(lease));
   }
 
   bycorf::Task<absl::Status> EnableSourceAdmissionForLease(
-      MonotonicTime deadline) override {
+      std::shared_ptr<LeaseDeadline> lease) override {
     co_return co_await replication_.EnableClusterRebuildSourceAdmissionUntil(
-        deadline.time_since_epoch());
+        std::move(lease));
   }
 
   bycorf::Task<absl::Status> RevokeExpirationAuthority() override {
@@ -457,7 +459,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
     co_return co_await replication_.CancelClusterRebuildForShutdown();
   }
 
-  std::optional<NodeDirectiveCompletion> FindCompletedPopulation(
+  bycorf::Task<std::optional<NodeDirectiveCompletion>> FindCompletedPopulation(
       const NodeDirective& directive) const override {
     std::vector<PopulationManifestEntry> entries;
     entries.reserve(directive.manifest_entries_.size());
@@ -465,11 +467,13 @@ class ReplicationNodeControlActions final : public NodeControlActions {
       entries.push_back({entry.partition_id_, entry.logical_epoch_});
     auto manifest = PopulationManifest::Create(std::move(entries));
     if (!manifest.ok() || manifest->id().bytes_ != directive.manifest_digest_)
-      return std::nullopt;
-    auto completed = replication_.FindCompletedClusterPopulation(
-        NativePopulationDirective(directive, *manifest));
-    if (!completed.has_value()) return std::nullopt;
-    return NodeDirectiveCompletion(
+      co_return std::nullopt;
+    auto completed = co_await bycorf::SubmitTo(
+        0, [this, native = NativePopulationDirective(directive, *manifest)] {
+          return replication_.FindCompletedClusterPopulation(native);
+        });
+    if (!completed.has_value()) co_return std::nullopt;
+    co_return NodeDirectiveCompletion(
         [completion = std::move(*completed)] { return completion.result(); });
   }
 
@@ -1512,7 +1516,7 @@ struct MetaControlClientService::Impl {
     std::uint32_t challenged_authority_lease_duration_ms_ = 0;
   };
 
-  // Every field is worker-zero-owned. Detached session tasks retain this
+  // Every field is control-worker-owned. Detached session tasks retain this
   // object, while RunSession joins those tasks before destroying the writer
   // and stream they reference.
   struct SessionState {
@@ -1625,8 +1629,9 @@ struct MetaControlClientService::Impl {
   absl::Status WaitUntilQuiesced() {
     RequestStop();
     std::unique_lock lock(shutdown_mu_);
-    // If worker zero has not started, stopping_ prevents it from entering a
-    // session later; there is consequently no control mutation to join.
+    // If the control worker has not started, stopping_ prevents it from
+    // entering a session later; there is consequently no control mutation to
+    // join.
     if (!run_started_) return absl::OkStatus();
     shutdown_cv_.wait(lock, [this] { return run_finished_; });
     return run_status_;
@@ -2203,7 +2208,27 @@ struct MetaControlClientService::Impl {
             next->local.lease_duration_ms)) > state->observation_ttl_)
       co_return absl::InvalidArgumentError(
           "heartbeat interval exceeds observation TTL");
-    if (local_changed || tasks_changed) {
+    // Duration changes neither replace authority identity nor invalidate any
+    // data-worker capability. Keep the original finite lease until a grant
+    // for the new policy arrives. An in-flight directive/control transition
+    // retains the ordinary joined installation path.
+    const bool policy_only =
+        local_changed && !tasks_changed && !routing_changed &&
+        next->local.lease_duration_ms !=
+            state->desired_->local.lease_duration_ms &&
+        next->local.groups == state->desired_->local.groups &&
+        next->local.manifests == state->desired_->local.manifests &&
+        next->directory == state->desired_->directory &&
+        !state->directive_runner_running_ && state->directive_queue_.empty() &&
+        installer_.TryUpdateLeasePolicy(
+            ProjectionBasis{state->desired_->local.revision},
+            ProjectionBasis{next->local.revision},
+            next->local.lease_duration_ms);
+    if (policy_only) {
+      // Detach a previous-projection Ack and order Applied before the next
+      // challenge, without waiting for a producer sampling a busy data shard.
+      RequestHeartbeatPause(state);
+    } else if (local_changed || tasks_changed) {
       DisableDirectiveDispatch(state);
       RequestHeartbeatPause(state);
       if (auto status = co_await WaitForHeartbeatQuiesced(state); !status.ok())
@@ -2229,15 +2254,28 @@ struct MetaControlClientService::Impl {
     }
     directory_ = std::move(directory);
     state->desired_ = std::move(next);
-    state->heartbeat_interval_ =
+    if (policy_only) {
+      // This path installs the new local projection without Install(), but
+      // it has the same applied-state observability boundary.
+      RecordClusterControlFullStateApplied();
+    }
+    const auto next_interval =
         std::chrono::milliseconds(control::DataHeartbeatIntervalMs(
             state->desired_->local.lease_duration_ms));
+    // The old short lease still protects service until the first new grant.
+    // Slowing down immediately after installing a longer policy can expire it.
+    state->heartbeat_interval_ =
+        MetaLeaseChallengeRotation::IsCommittedOwner(
+            state->desired_->local.groups, options_.node_id_)
+            ? std::min(state->heartbeat_interval_, next_interval)
+            : next_interval;
     if (auto status =
             co_await SendApplied(writer, *state->desired_, update.request_id);
         !status.ok())
       co_return status;
     state->directive_dispatch_enabled_ = true;
     ResumeHeartbeat(state);
+    if (policy_only) co_return absl::OkStatus();
     co_return co_await QueueCurrentTasks(state);
   }
 
@@ -2343,19 +2381,21 @@ struct MetaControlClientService::Impl {
   }
 
   bycorf::Task<absl::Status> SleepHeartbeatInterval(
-      const std::shared_ptr<SessionState>& state) {
-    const auto deadline =
-        std::chrono::steady_clock::now() + state->heartbeat_interval_;
-    while (!state->closing_ &&
+      const std::shared_ptr<SessionState>& state, std::int64_t sent_at_ms) {
+    const auto revision = state->desired_->local.revision;
+    // The lease starts when the challenge is written, not when its Ack is
+    // received. Charge response latency against the interval too; sleeping a
+    // full interval after a slow Ack can consume the next renewal's budget.
+    // An overdue iteration sends only one fresh heartbeat, never catch-up work.
+    const auto deadline_ms = sent_at_ms + state->heartbeat_interval_.count();
+    while (!state->closing_ && state->desired_->local.revision == revision &&
            !state->heartbeat_projection_gate_.pause_requested()) {
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline) break;
+      const auto now_ms = LeaseClockMillis();
+      if (now_ms >= deadline_ms) break;
       const absl::Status slept = co_await bycorf::SleepFor(
           *state->worker_,
-          std::min(
-              deadline - now,
-              std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                  kDeadlinePollInterval)));
+          std::min(std::chrono::milliseconds(deadline_ms - now_ms),
+                   kDeadlinePollInterval));
       if (!slept.ok()) co_return slept;
     }
     co_return absl::OkStatus();
@@ -2367,13 +2407,14 @@ struct MetaControlClientService::Impl {
     std::uint64_t heartbeat_sequence = 1;
     while (!state->closing_) {
       if (co_await QuiesceHeartbeatIfRequested(state)) continue;
-      const ReplicationIdentity latest =
-          co_await replication_.ObserveIdentity();
+      const auto observation_started = std::chrono::steady_clock::now();
+      auto observation = replication_.ObserveHeartbeat();
+      const ReplicationIdentity& latest = observation.identity_;
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
       if (detail::ReplicationIdentityRequiresMetaReconnect(
               state->replication_identity_, latest)) {
         const ClusterFailoverActionStatus identity_transition_status =
-            co_await replication_.cluster_failover_action_status();
+            observation.failover_;
         if (state->heartbeat_projection_gate_.pause_requested()) continue;
         if (detail::EvaluateMetaSessionReplicationIdentity(
                 state->replication_identity_, latest,
@@ -2384,8 +2425,7 @@ struct MetaControlClientService::Impl {
           break;
         }
       }
-      ClusterPopulationStatus population =
-          co_await replication_.cluster_population_status();
+      ClusterPopulationStatus population = std::move(observation.population_);
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
       auto readiness = PopulationProof(population, *state->desired_);
       const bool losing_readiness =
@@ -2418,17 +2458,20 @@ struct MetaControlClientService::Impl {
       }
 
       ClusterSourcePauseStatus source_pause_status =
-          co_await replication_.cluster_source_pause_status();
+          std::move(observation.source_pause_);
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
-      // A first identity mismatch may have sampled Preparing before the native
-      // action published Prepared or Failed. Resample after the other awaited
-      // heartbeat inputs, then use this one action snapshot for both the final
-      // identity decision and the observation placed on the wire.
+      // Readiness transitions can suspend. Never combine their result with a
+      // snapshot retired by a concurrent population/identity/action change.
+      if (!replication_.HeartbeatObservationIsCurrent(observation.version_))
+        continue;
       ClusterFailoverActionStatus failover_status =
-          co_await replication_.cluster_failover_action_status();
-      if (state->heartbeat_projection_gate_.pause_requested()) continue;
-      const ReplicationIdentity after_failover_status =
-          co_await replication_.ObserveIdentity();
+          std::move(observation.failover_);
+      const ReplicationIdentity& after_failover_status = observation.identity_;
+      RecordClusterControlWait(
+          ClusterControlWait::kObservation,
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - observation_started)
+              .count());
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
       const detail::MetaSessionReplicationIdentityDecision identity_decision =
           detail::EvaluateMetaSessionReplicationIdentity(
@@ -2588,12 +2631,13 @@ struct MetaControlClientService::Impl {
           heartbeat_challenge.has_value()
               ? std::optional<control::WireId128>(heartbeat_challenge->nonce)
               : std::nullopt;
+      const auto challenge_revision = state->desired_->local.revision;
       result = co_await state->writer_->Write(
           control::MessagePriority::kAuthority,
           control::WireMessage(std::move(heartbeat)),
           [state, sent_at_ms, challenge_nonce] {
-            if (!challenge_nonce.has_value()) return;
             *sent_at_ms = LeaseClockMillis();
+            if (!challenge_nonce.has_value()) return;
             if (!state->challenge_tracker_
                      .MarkWritten(*challenge_nonce, **sent_at_ms)
                      .ok()) {
@@ -2601,7 +2645,8 @@ struct MetaControlClientService::Impl {
             }
           });
       if (!result.ok()) break;
-      if (state->heartbeat_projection_gate_.pause_requested()) {
+      if (state->heartbeat_projection_gate_.pause_requested() ||
+          state->desired_->local.revision != challenge_revision) {
         // RequestHeartbeatPause detached this sequence from authority before
         // waiting for the write. The successful write means Meta will still
         // advance its business sequence, so resume at the following value and
@@ -2614,8 +2659,8 @@ struct MetaControlClientService::Impl {
         ++heartbeat_sequence;
         continue;
       }
-      if (challenge_nonce.has_value() && !sent_at_ms->has_value()) {
-        result = absl::InternalError("lease challenge was not marked sent");
+      if (!sent_at_ms->has_value()) {
+        result = absl::InternalError("heartbeat was not marked sent");
         break;
       }
       const bool ack_still_pending =
@@ -2636,7 +2681,10 @@ struct MetaControlClientService::Impl {
         break;
       }
       ++heartbeat_sequence;
-      result = co_await SleepHeartbeatInterval(state);
+      // A policy update can pause and resume entirely while Write/Wait is
+      // suspended. Do not sleep on the superseded projection's cadence.
+      if (state->desired_->local.revision != challenge_revision) continue;
+      result = co_await SleepHeartbeatInterval(state, **sent_at_ms);
       if (!result.ok()) break;
     }
 
@@ -2703,43 +2751,56 @@ struct MetaControlClientService::Impl {
       const std::int64_t grant_ms = grant->granted_duration_ms;
       const auto grant_sent_at =
           MonotonicTime(std::chrono::milliseconds(*deadline_ms - grant_ms));
-      // Authority transitions are barriers for the short admission lane. A
-      // queued directive was validated before this grant and must be replayed
-      // from the current projection instead of overtaking lease installation.
-      const bool discarded_directive =
-          !state->directive_queue_.empty() ||
-          (state->directive_runner_running_ &&
-           state->directive_completion_tasks_ != 0);
-      DisableDirectiveDispatch(state);
-      if (absl::Status joined = co_await WaitForDirectiveExecutor(state);
-          !joined.ok()) {
-        co_return joined;
+      const auto grant_started = std::chrono::steady_clock::now();
+      const AuthorityMessage authority_message = AuthorityMessage{
+          .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+          .session_ = state->session_,
+          .projection_ =
+              ProjectionBasis{
+                  .control_revision_ = grant->control_revision,
+              },
+          .anchor_ =
+              AuthorityAnchor{
+                  .group_id_ = grant->group_id,
+                  .assignment_id_ =
+                      AssignmentId::FromBytes(grant->assignment_id),
+                  .group_term_ = grant->group_term,
+              },
+          .sent_at_ = grant_sent_at,
+          .granted_duration_ =
+              std::chrono::milliseconds(grant->granted_duration_ms),
+      };
+      absl::Status authority;
+      bool discarded_directive = false;
+      const bool renewed = installer_.TryRenewLease(authority_message);
+      if (!renewed) {
+        // First installation and authority changes retain the directive
+        // barrier. Ordinary renewal must not wait for a directive running on a
+        // data worker.
+        discarded_directive = !state->directive_queue_.empty() ||
+                              (state->directive_runner_running_ &&
+                               state->directive_completion_tasks_ != 0);
+        DisableDirectiveDispatch(state);
+        if (absl::Status joined = co_await WaitForDirectiveExecutor(state);
+            !joined.ok()) {
+          co_return joined;
+        }
+        authority =
+            co_await installer_.ApplyLeaseGrantTransition(authority_message);
       }
-      absl::Status authority =
-          co_await installer_.ApplyLeaseGrantTransition(AuthorityMessage{
-              .kind_ = AuthorityMessage::Kind::kLeaseGrant,
-              .session_ = state->session_,
-              .projection_ =
-                  ProjectionBasis{
-                      .control_revision_ = grant->control_revision,
-                  },
-              .anchor_ =
-                  AuthorityAnchor{
-                      .group_id_ = grant->group_id,
-                      .assignment_id_ =
-                          AssignmentId::FromBytes(grant->assignment_id),
-                      .group_term_ = grant->group_term,
-                  },
-              .sent_at_ = grant_sent_at,
-              .granted_duration_ =
-                  std::chrono::milliseconds(grant->granted_duration_ms),
-          });
+      RecordClusterControlWait(
+          ClusterControlWait::kLeaseInstallation,
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - grant_started)
+              .count());
       if (!authority.ok()) co_return authority;
       if (discarded_directive) {
         co_return absl::AbortedError(
             "lease installation overtook queued directive admission");
       }
-      state->directive_dispatch_enabled_ = true;
+      if (!renewed) state->directive_dispatch_enabled_ = true;
+      state->heartbeat_interval_ = std::chrono::milliseconds(
+          control::DataHeartbeatIntervalMs(grant->granted_duration_ms));
       RecordClusterControlLeaseGrant();
     } else if (const auto* denied =
                    std::get_if<control::LeaseDenied>(&ack.lease_decision)) {
@@ -2798,6 +2859,11 @@ struct MetaControlClientService::Impl {
         worker, endpoint.host_, endpoint.port_, kConnectTimeout);
     if (!connected.ok()) co_return connected.status();
     bycorf::TcpStream stream = std::move(*connected);
+    // Watchdogs can close the transport while cleanup awaits data workers.
+    // Keep its storage alive through every session user, and close on early
+    // handshake/redirect returns as well as the established-session path.
+    auto storage_borrow = stream.BorrowStorage();
+    auto close_stream = absl::MakeCleanup([&stream] { (void)stream.Close(); });
     if (stopping_.load(std::memory_order_acquire)) {
       (void)stream.Close();
       // No session state was installed, so this is successful quiescence.
@@ -3304,11 +3370,13 @@ void MetaControlClientService::Prepare(unsigned thread_count) {
 
 bycorf::Task<absl::Status> MetaControlClientService::Run(
     bycorf::Worker& worker, bycorf::ServiceContext) {
-  if (worker.id() != 0) co_return absl::OkStatus();
+  if (worker.id() != impl_->options_.control_worker_id_)
+    co_return absl::OkStatus();
   impl_->BeginRun();
   absl::Status run_status = absl::OkStatus();
   Impl::RunCompletionGuard completed(*impl_);
-  if (impl_->prepared_thread_count_ != impl_->options_.request_worker_count_) {
+  if (impl_->prepared_thread_count_ < impl_->options_.request_worker_count_ ||
+      impl_->options_.control_worker_id_ >= impl_->prepared_thread_count_) {
     run_status = absl::FailedPreconditionError(
         "Meta control worker count changed after configuration");
     completed.SetResult(run_status);
@@ -3318,7 +3386,7 @@ bycorf::Task<absl::Status> MetaControlClientService::Run(
   // Disk, catalog and population recovery own local replication state until
   // RedisService publishes storage readiness. Even an ordinary FDS can install
   // FollowOwner while recovery yields, invalidating its one-shot clean proof.
-  // Both this service and the readiness publisher run on worker zero.
+  // This service and the submitted readiness update share the control worker.
   while (!impl_->installer_.storage_ready()) {
     if (impl_->stopping_.load(std::memory_order_acquire) ||
         worker.stop_requested()) {

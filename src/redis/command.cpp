@@ -12826,9 +12826,12 @@ Task<CommandReply> ExecuteCommand(CommandRequest& request,
   return ExecuteAdmittedCommand(request, reply_builder, client_id, connection);
 }
 
-Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {
+namespace {
+
+absl::StatusOr<std::vector<CommandRequest>> ParseReplicatedExec(
+    const std::vector<std::string>& args) {
   if (args.size() < 2 || args[0] != kReplicatedExecCommand) {
-    co_return absl::InvalidArgumentError("malformed replicated EXEC");
+    return absl::InvalidArgumentError("malformed replicated EXEC");
   }
   auto parse_size = [](std::string_view text, std::uint64_t* output) noexcept {
     const char* begin = text.data();
@@ -12838,15 +12841,14 @@ Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {
   };
   std::uint64_t command_count = 0;
   if (!parse_size(args[1], &command_count) || command_count > args.size() - 2) {
-    co_return absl::InvalidArgumentError("invalid replicated EXEC count");
+    return absl::InvalidArgumentError("invalid replicated EXEC count");
   }
-  ConnectionContext context;
-  context.strict_replication_apply_ = true;
-  context.queued_.reserve(static_cast<std::size_t>(command_count));
+  std::vector<CommandRequest> commands;
+  commands.reserve(static_cast<std::size_t>(command_count));
   std::size_t offset = 2;
   for (std::uint64_t index = 0; index < command_count; ++index) {
     if (offset + 2 > args.size()) {
-      co_return absl::InvalidArgumentError("truncated replicated EXEC");
+      return absl::InvalidArgumentError("truncated replicated EXEC");
     }
     std::uint64_t db_id = 0;
     std::uint64_t argc = 0;
@@ -12855,7 +12857,7 @@ Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {
                                        : storage::kLogicalDatabaseCount) ||
         !parse_size(args[offset++], &argc) || argc == 0 ||
         argc > args.size() - offset) {
-      co_return absl::InvalidArgumentError("invalid replicated EXEC command");
+      return absl::InvalidArgumentError("invalid replicated EXEC command");
     }
     RespCommand wire;
     wire.args_.insert(wire.args_.end(), args.begin() + offset,
@@ -12863,7 +12865,7 @@ Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {
     offset += static_cast<std::size_t>(argc);
     auto request =
         BuildCommandRequest(std::move(wire), static_cast<std::uint8_t>(db_id));
-    if (!request.ok()) co_return request.status();
+    if (!request.ok()) return request.status();
     if (request->spec_ == nullptr ||
         (request->spec_->flags_ & kCmdGlobal) != 0 ||
         request->kind_ == CommandKind::kMulti ||
@@ -12871,15 +12873,123 @@ Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {
         request->kind_ == CommandKind::kDiscard ||
         request->kind_ == CommandKind::kWatch ||
         request->kind_ == CommandKind::kUnwatch) {
-      co_return absl::InvalidArgumentError(
+      return absl::InvalidArgumentError(
           "unsupported command in replicated EXEC");
     }
     request->replication_origin_ = true;
-    context.queued_.push_back(std::move(*request));
+    commands.push_back(std::move(*request));
   }
   if (offset != args.size()) {
-    co_return absl::InvalidArgumentError("trailing replicated EXEC data");
+    return absl::InvalidArgumentError("trailing replicated EXEC data");
   }
+  return commands;
+}
+
+}  // namespace
+
+Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {
+  auto commands = ParseReplicatedExec(args);
+  if (!commands.ok()) co_return commands.status();
+  ConnectionContext context;
+  context.strict_replication_apply_ = true;
+  context.queued_ = std::move(*commands);
+  ReplyBuilder reply_builder;
+  CommandReply reply = co_await ExecuteExec(context, reply_builder);
+  if (!reply.encoded_.empty() && reply.encoded_.front() == '-') {
+    co_return absl::FailedPreconditionError(std::string(reply.encoded_));
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> ApplyFullSyncCommand(const ReplicatedCommand& command,
+                                        std::uint64_t session_id,
+                                        std::uint16_t partition_id,
+                                        std::uint64_t partition_sequence) {
+  if (g_storage == nullptr || command.args_.empty()) {
+    co_return absl::InvalidArgumentError("empty FULL command or no storage");
+  }
+  std::vector<CommandRequest> commands;
+  if (command.args_[0] == kReplicatedExecCommand) {
+    auto parsed = ParseReplicatedExec(command.args_);
+    if (!parsed.ok()) co_return parsed.status();
+    commands = std::move(*parsed);
+  } else {
+    auto request = BuildCommandRequest(RespCommand{.args_ = command.args_},
+                                       command.db_id_);
+    if (!request.ok()) co_return request.status();
+    request->replication_origin_ = true;
+    commands.push_back(std::move(*request));
+  }
+
+  struct KeyCoverage {
+    std::uint8_t db_id_;
+    std::string_view key_;
+    bool needs_apply_;
+  };
+  std::vector<KeyCoverage> coverage;
+  std::vector<bool> apply;
+  apply.reserve(commands.size());
+  // Decide against the pre-command population once per key. A successful
+  // HSET writes this sequence before its PERSIST child; checking each child
+  // at execution time would incorrectly discard that child's TTL effect.
+  // FULL owns one serialized flow per partition while client admission is
+  // closed, so no foreground mutation can change these decisions before EXEC.
+  for (const auto& request : commands) {
+    if (request.spec_ == nullptr || (request.spec_->flags_ & kCmdGlobal) != 0) {
+      co_return absl::InvalidArgumentError("unsupported FULL mutation");
+    }
+    auto keys = DetermineKeys(*request.spec_, request.args_);
+    if (!keys.ok()) co_return keys.status();
+    if (keys->empty()) {
+      co_return absl::InvalidArgumentError("FULL mutation has no key");
+    }
+    bool covered = false;
+    bool uncovered = false;
+    for (std::size_t index = keys->first_; index <= keys->last_;
+         index += keys->step_) {
+      const std::string_view key = request.args_[index];
+      auto cached = std::find_if(
+          coverage.begin(), coverage.end(), [&](const KeyCoverage& item) {
+            return item.db_id_ == request.db_id_ && item.key_ == key;
+          });
+      bool needs_apply;
+      if (cached != coverage.end()) {
+        needs_apply = cached->needs_apply_;
+      } else {
+        const unsigned owner = g_storage->OwnerForKey(key);
+        auto check = [&, db_id = request.db_id_, key]() {
+          return g_storage->ReplicaCommandNeedsApply(
+              session_id, partition_id, partition_sequence, db_id, key);
+        };
+        absl::StatusOr<bool> result;
+        if (owner == bycorf::ThisWorker().id_) {
+          result = co_await check();
+        } else {
+          result = co_await bycorf::SubmitTaskTo(owner, check);
+        }
+        if (!result.ok()) co_return result.status();
+        needs_apply = *result;
+        coverage.push_back({request.db_id_, key, needs_apply});
+      }
+      uncovered |= needs_apply;
+      covered |= !needs_apply;
+    }
+    // Multi-key source transactions use participant after-images during FULL.
+    // Do not reinterpret a mixed-coverage command or partially replay its
+    // inputs: that cannot preserve the original command's semantics.
+    if (covered && uncovered) {
+      co_return absl::FailedPreconditionError(
+          "FULL command spans partially covered keys");
+    }
+    apply.push_back(uncovered);
+  }
+
+  ConnectionContext context;
+  context.strict_replication_apply_ = true;
+  for (std::size_t index = 0; index < commands.size(); ++index) {
+    if (apply[index]) context.queued_.push_back(std::move(commands[index]));
+  }
+  if (context.queued_.empty()) co_return absl::OkStatus();
   ReplyBuilder reply_builder;
   CommandReply reply = co_await ExecuteExec(context, reply_builder);
   if (!reply.encoded_.empty() && reply.encoded_.front() == '-') {
