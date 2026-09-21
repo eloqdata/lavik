@@ -95,7 +95,9 @@ jobs:
           test -s "$RUNNER_TEMP/spdk-rpc-autogen.h"
 
       - name: Build and verify release package
-        run: ./scripts/package_release.sh
+        run: |
+          python3 tests/test_package_notices.py
+          ./scripts/package_release.sh
 
       - name: Verify archived executables
         run: |
@@ -104,9 +106,18 @@ jobs:
           mkdir unpacked
           tar -xzf ./*.tar.gz -C unpacked
           package_dir=$(find unpacked -mindepth 1 -maxdepth 1 -type d)
-          for notice in LICENSE NOTICE OPENSSL-LICENSE.txt; do
+          for notice in LICENSE THIRD_PARTY_NOTICES; do
             test -s "$package_dir/$notice"
           done
+          test ! -e "$package_dir/OPENSSL-LICENSE.txt"
+          grep -Fq 'Upstream-Name: OpenSSL' "$package_dir/THIRD_PARTY_NOTICES"
+          grep -Fq 'go.etcd.io/raft/v3@' "$package_dir/THIRD_PARTY_NOTICES"
+          if [[ "$LAVIK_PACKAGE_KERNEL_BYPASS" == ON ]]; then
+            grep -Fq 'bycorf/third_party/spdk/LICENSE' "$package_dir/THIRD_PARTY_NOTICES"
+          elif grep -Fq 'bycorf/third_party/spdk/LICENSE' "$package_dir/THIRD_PARTY_NOTICES"; then
+            echo 'Minimal package contains standard-only dependency notices' >&2
+            exit 1
+          fi
           test "$(cat "$package_dir/REVISION")" = "$GITHUB_SHA"
           if [[ -n "$LAVIK_PACKAGE_TAG" ]]; then
             test "$(cat "$package_dir/VERSION")" = "$LAVIK_PACKAGE_TAG"

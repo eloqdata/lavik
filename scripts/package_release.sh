@@ -157,14 +157,9 @@ for app in "${APPS[@]}"; do
   fi
   "$STAGE_DIR/$app" --help >/dev/null 2>&1
 done
-install -m 0644 "$REPO_ROOT/LICENSE" "$REPO_ROOT/NOTICE" "$STAGE_DIR/"
-OPENSSL_LICENSE=${LAVIK_OPENSSL_LICENSE:-/usr/share/common-licenses/Apache-2.0}
-if [[ ! -f "$OPENSSL_LICENSE" ]]; then
-  echo "OpenSSL license text not found at $OPENSSL_LICENSE" >&2
-  echo "Set LAVIK_OPENSSL_LICENSE to the Apache-2.0 license file." >&2
-  exit 1
-fi
-install -m 0644 "$OPENSSL_LICENSE" "$STAGE_DIR/OPENSSL-LICENSE.txt"
+install -m 0644 "$REPO_ROOT/LICENSE" "$STAGE_DIR/"
+python3 "$REPO_ROOT/scripts/package_notices.py" \
+  --build-dir "$BUILD_DIR" --output "$STAGE_DIR/THIRD_PARTY_NOTICES"
 printf '%s\n' "$VERSION" >"$STAGE_DIR/VERSION"
 printf '%s\n' "$REVISION" >"$STAGE_DIR/REVISION"
 
