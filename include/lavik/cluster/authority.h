@@ -199,6 +199,12 @@ class AuthorityAdmission {
   MonotonicTime lease_deadline_{};
   bool lease_checked_ = false;
   bool single_group_ = false;
+  // Exact publication fingerprints of the snapshots behind state_ and the
+  // lease proof. Recheck compares these against the current atomics first:
+  // an unchanged fingerprint makes the corresponding snapshot comparison
+  // trivially true without walking the thread-local snapshot caches.
+  std::uint64_t topology_sequence_ = 0;
+  std::uint64_t authority_version_ = 0;
   mutable std::atomic<bool> mutation_started_{false};
   mutable std::atomic<bool> final_recheck_failed_{false};
 };

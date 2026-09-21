@@ -82,6 +82,8 @@ AuthorityAdmission::AuthorityAdmission(AuthorityAdmission&& other) noexcept
       lease_deadline_(other.lease_deadline_),
       lease_checked_(other.lease_checked_),
       single_group_(other.single_group_),
+      topology_sequence_(other.topology_sequence_),
+      authority_version_(other.authority_version_),
       mutation_started_(
           other.mutation_started_.load(std::memory_order_relaxed)),
       final_recheck_failed_(
@@ -99,6 +101,8 @@ AuthorityAdmission& AuthorityAdmission::operator=(
   lease_deadline_ = other.lease_deadline_;
   lease_checked_ = other.lease_checked_;
   single_group_ = other.single_group_;
+  topology_sequence_ = other.topology_sequence_;
+  authority_version_ = other.authority_version_;
   mutation_started_.store(
       other.mutation_started_.load(std::memory_order_relaxed),
       std::memory_order_relaxed);
@@ -388,7 +392,8 @@ AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
                                                    MonotonicTime now) const {
   AuthorityAdmission admission;
   std::uint64_t version = 0;
-  admission.state_ = CurrentCachedWithVersion(topology_, &version);
+  admission.state_ = CurrentCachedWithVersion(topology_, &version,
+                                              &admission.topology_sequence_);
   const auto slots = AuthoritySlots(request);
   admission.slots_.assign(slots.begin(), slots.end());
   admission.single_group_ = request.client_mode_ == ClientMode::kSingle;
@@ -471,11 +476,15 @@ Decision AuthorityGuard::DecideWithLease(const ServingState* state,
       group->primary_node_index_ != state->SelfNodeIndex()) {
     return decision;
   }
+  std::uint64_t proof_version = 0;
   const AuthorityState& authority = CurrentAuthority(
-      lease_check == nullptr ? nullptr : &lease_check->publication_version);
+      lease_check != nullptr ? &lease_check->publication_version
+      : proof != nullptr     ? &proof_version
+                             : nullptr);
   if (proof != nullptr) {
     proof->gate_generation_ = authority.generation_;
     proof->lease_revision_ = authority.revision_;
+    proof->authority_version_ = proof_version;
     proof->lease_checked_ = true;
   }
   MonotonicTime* deadline = proof != nullptr         ? &proof->lease_deadline_
@@ -501,20 +510,41 @@ RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,
   }
 
   if (admission.lease_checked_) {
-    const AuthorityState& authority = CurrentAuthority();
-    if (admission.gate_generation_ != authority.generation_) {
-      return RecheckResult::kReject;
+    // An unchanged authority publication proves the captured generation,
+    // revision and lease set without borrowing the snapshot. The deadline
+    // alone still advances, so it is compared on every call; expiry or any
+    // republication falls back to the full snapshot checks.
+    if (admission.authority_version_ !=
+        authority_version_.load(std::memory_order_acquire)) {
+      const AuthorityState& authority = CurrentAuthority();
+      if (admission.gate_generation_ != authority.generation_) {
+        return RecheckResult::kReject;
+      }
+      // Admission already checked these exact immutable leases against the
+      // retained topology. Until publication or expiry, repeating Group/hash
+      // lookups and anchor comparisons adds no proof. Renewal (even a shorter
+      // deadline) changes revision, while expiry still goes through LeaseCovers
+      // to record its one-time metric. Topology/fence checks remain below.
+      if ((admission.lease_revision_ != authority.revision_ ||
+           now >= admission.lease_deadline_) &&
+          !LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
+        return RecheckResult::kReject;
+      }
+    } else if (now >= admission.lease_deadline_) {
+      // Expiry must still flow through LeaseCovers for its one-time metric,
+      // even though no republication could have renewed the lease.
+      const AuthorityState& authority = CurrentAuthority();
+      if (!LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
+        return RecheckResult::kReject;
+      }
     }
-    // Admission already checked these exact immutable leases against the
-    // retained topology. Until publication or expiry, repeating Group/hash
-    // lookups and anchor comparisons adds no proof. Renewal (even a shorter
-    // deadline) changes revision, while expiry still goes through LeaseCovers
-    // to record its one-time metric. Topology/fence checks remain below.
-    if ((admission.lease_revision_ != authority.revision_ ||
-         now >= admission.lease_deadline_) &&
-        !LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
-      return RecheckResult::kReject;
-    }
+  }
+  const std::uint64_t sequence = topology_.publication_sequence();
+  if ((sequence & 1U) == 0 && sequence == admission.topology_sequence_) {
+    // No publication since admission: the current snapshot is the admitted
+    // one, so the stale-read pointer, single-group and token comparisons
+    // would all trivially pass. Skip the thread-local snapshot cache walk.
+    return RecheckResult::kOk;
   }
   std::uint64_t version = 0;
   // This synchronous comparison cannot suspend or refresh this thread's cache
@@ -555,20 +585,33 @@ RecheckResult AuthorityGuard::RegisterAndRecheck(
     MonotonicTime now, AuthorityInFlightGuards* guards) const {
   guards->clear();
 
-  // CurrentCachedWithVersion spins through an odd sequence and returns only
-  // after observing one completed publication. The snapshot itself is not
-  // used here: Recheck is the sole authority comparator, while the sequence
-  // brackets registration against a concurrent publisher's drain.
-  std::uint64_t unused_version = 0;
-  std::uint64_t publication_before = 0;
-  // Registration cannot suspend. This cache entry is consumed before Recheck
-  // can refresh it, so retaining another shared owner would only add atomic
-  // reference-count traffic to every write.
-  const auto& registration_state =
-      CurrentCachedWithVersion(topology_, &unused_version, &publication_before);
-
   const std::shared_ptr<const ServingState>& admitted_state = admission.state();
   if (admitted_state == nullptr) return RecheckResult::kReject;
+
+  // Fast path: the admitted topology is still the current publication. Its
+  // pointer identity makes the mutation-admission comparison below trivial,
+  // and the sequence alone brackets registration against a concurrent
+  // publisher's drain. An odd or advanced sequence falls back to borrowing a
+  // coherent snapshot: CurrentCachedWithVersion spins through an odd sequence
+  // and returns only after observing one completed publication.
+  std::uint64_t unused_version = 0;
+  std::uint64_t publication_before = topology_.publication_sequence();
+  const ServingState* registration_state = nullptr;
+  if ((publication_before & 1U) == 0 &&
+      publication_before == admission.topology_sequence_) {
+    registration_state = admitted_state.get();
+  } else {
+    // The snapshot itself is not used beyond the comparison: Recheck is the
+    // sole authority comparator, while the sequence brackets registration
+    // against a concurrent publisher's drain. Registration cannot suspend.
+    // This cache entry is consumed before Recheck can refresh it, so
+    // retaining another shared owner would only add atomic reference-count
+    // traffic to every write.
+    registration_state = CurrentCachedWithVersion(topology_, &unused_version,
+                                                  &publication_before)
+                             .get();
+  }
+
   for (const std::uint16_t slot : admission.slots()) {
     GroupInFlight* cell = admitted_state->InFlightCellForSlot(slot);
     if (cell == nullptr) continue;
@@ -579,7 +622,7 @@ RecheckResult AuthorityGuard::RegisterAndRecheck(
   }
 
   if (topology_.publication_sequence() == publication_before &&
-      MutationAdmissionUnchanged(*admitted_state, registration_state.get(),
+      MutationAdmissionUnchanged(*admitted_state, registration_state,
                                  admission.slots()) &&
       Recheck(admission, now) == RecheckResult::kOk) {
     return RecheckResult::kOk;
