@@ -31,7 +31,6 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
-#include <condition_variable>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -784,10 +783,11 @@ class RedisService final : public TcpService, public ClientLimit {
   // joins every native/Redis target root before the main thread may checkpoint
   // storage.
   std::atomic<bool> replication_quiesce_requested_{false};
-  std::mutex replication_quiesce_mutex_;
-  std::condition_variable replication_quiesce_cv_;
-  bool replication_quiesce_monitor_available_ = false;
-  bool replication_quiesce_complete_ = false;
+  std::atomic<bool> replication_quiesce_monitor_available_{false};
+  std::atomic<bool> replication_quiesce_complete_{false};
+  // Worker zero writes the result once, then release-publishes completion.
+  // Only the process main thread waits; its acquire observes the immutable
+  // result without making a worker take a mutex. Neither flag is reset.
   absl::Status replication_quiesce_status_;
   RequestGate request_gate_;
   Server* server_ = nullptr;
@@ -879,13 +879,13 @@ absl::Status RedisService::WaitForReplicationQuiesced() {
   // The monitor performs coroutine-affine joins and storage-root retirement.
   replication_->RequestShutdown();
   replication_quiesce_requested_.store(true, std::memory_order_release);
-  std::unique_lock lock(replication_quiesce_mutex_);
-  if (!replication_quiesce_monitor_available_) {
+  if (!replication_quiesce_monitor_available_.load(std::memory_order_acquire)) {
     return absl::FailedPreconditionError(
         "replication shutdown monitor did not finish startup");
   }
-  replication_quiesce_cv_.wait(
-      lock, [this] { return replication_quiesce_complete_; });
+  // Atomic wait checks the value before sleeping, so completion published
+  // before this call cannot lose its wakeup.
+  replication_quiesce_complete_.wait(false, std::memory_order_acquire);
   return replication_quiesce_status_;
 }
 
@@ -1098,13 +1098,11 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
 
   spdlog::info("worker[{}] direct-IO storage initialized", worker.id());
   if (worker.id() == 0) {
-    {
-      std::lock_guard lock(replication_quiesce_mutex_);
-      // Publish only after the awaited control-worker readiness notification.
-      // No suspension occurs before spawning the monitor, so a main-thread
-      // shutdown waiter can rely on its quiescence barrier becoming available.
-      replication_quiesce_monitor_available_ = true;
-    }
+    // Publish only after the awaited control-worker readiness notification.
+    // No suspension occurs before spawning the monitor, so a main-thread
+    // shutdown waiter can rely on its quiescence barrier becoming available.
+    replication_quiesce_monitor_available_.store(true,
+                                                 std::memory_order_release);
     // Keep this periodic maintenance tree in the same background task class as
     // the memory sampler it replaced. The synchronous storage-failure latch
     // already closes request and replication gates, so asynchronous cluster
@@ -1419,12 +1417,9 @@ Task<absl::Status> RedisService::MonitorRuntimeHealth(Worker& worker) {
     if (!replication_quiesce_handled &&
         replication_quiesce_requested_.load(std::memory_order_acquire)) {
       absl::Status quiesced = co_await replication_->QuiesceForShutdown();
-      {
-        std::lock_guard lock(replication_quiesce_mutex_);
-        replication_quiesce_status_ = std::move(quiesced);
-        replication_quiesce_complete_ = true;
-      }
-      replication_quiesce_cv_.notify_all();
+      replication_quiesce_status_ = std::move(quiesced);
+      replication_quiesce_complete_.store(true, std::memory_order_release);
+      replication_quiesce_complete_.notify_all();
       replication_quiesce_handled = true;
     }
     RefreshMemoryStats();
@@ -1471,13 +1466,10 @@ Task<absl::Status> RedisService::MonitorRuntimeHealth(Worker& worker) {
   }
   if (!replication_quiesce_handled &&
       replication_quiesce_requested_.load(std::memory_order_acquire)) {
-    {
-      std::lock_guard lock(replication_quiesce_mutex_);
-      replication_quiesce_status_ = absl::CancelledError(
-          "replication shutdown monitor stopped before target quiescence");
-      replication_quiesce_complete_ = true;
-    }
-    replication_quiesce_cv_.notify_all();
+    replication_quiesce_status_ = absl::CancelledError(
+        "replication shutdown monitor stopped before target quiescence");
+    replication_quiesce_complete_.store(true, std::memory_order_release);
+    replication_quiesce_complete_.notify_all();
   }
   co_return absl::OkStatus();
 }
