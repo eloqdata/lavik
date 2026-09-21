@@ -60,6 +60,11 @@ VERSION=${VERSION//\//-}
 REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD)
 VERSION_SUFFIX=-dev
 RELEASE_TAG=${LAVIK_PACKAGE_TAG:-}
+PROJECT_VERSION=$(sed -nE 's/^project\(lavik VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' "$REPO_ROOT/CMakeLists.txt")
+if [[ ! "$PROJECT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Cannot read the Lavik project version from CMakeLists.txt" >&2
+  exit 1
+fi
 if [[ -n "$RELEASE_TAG" ]]; then
   # Tagged packages must identify the release in both filenames and binaries;
   # changing only the archive name would leave --version reporting -dev.
@@ -78,7 +83,6 @@ if [[ -n "$RELEASE_TAG" ]]; then
       exit 1
     fi
   done
-  PROJECT_VERSION=$(sed -nE 's/^project\(lavik VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' "$REPO_ROOT/CMakeLists.txt")
   if [[ "$BASE_VERSION" != "$PROJECT_VERSION" ]]; then
     echo "Tag version $BASE_VERSION does not match CMake project version $PROJECT_VERSION" >&2
     exit 1
@@ -88,6 +92,10 @@ if [[ -n "$RELEASE_TAG" ]]; then
     exit 1
   fi
   VERSION=$RELEASE_TAG
+elif [[ "${LAVIK_PACKAGE_VERSION:-}" == nightly ]]; then
+  # The nearest historical tag is provenance, not the nightly binary version.
+  # Follow CMake's numeric version across bumps; REVISION records the source.
+  VERSION=$PROJECT_VERSION$VERSION_SUFFIX
 fi
 # CI keeps stable nightly asset names while VERSION/REVISION identify the
 # actual source build inside the archive.

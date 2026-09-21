@@ -110,18 +110,22 @@ jobs:
           test "$(cat "$package_dir/REVISION")" = "$GITHUB_SHA"
           if [[ -n "$LAVIK_PACKAGE_TAG" ]]; then
             test "$(cat "$package_dir/VERSION")" = "$LAVIK_PACKAGE_TAG"
+            expected_binary_version=${LAVIK_PACKAGE_TAG#v}
+          else
+            project_version=$(sed -nE 's/^project\(lavik VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' ../CMakeLists.txt)
+            test -n "$project_version"
+            expected_binary_version=$project_version-dev
+            test "$(cat "$package_dir/VERSION")" = "$expected_binary_version"
           fi
           for app in lavik lavik-meta lavik-ctl; do
             binary=$(find unpacked -type f -name "$app")
             test -n "$binary"
             "$binary" --help >/dev/null 2>&1
             "$binary" --version
-            if [[ -n "$LAVIK_PACKAGE_TAG" ]]; then
-              # lavik-meta also reports its pinned etcd Raft version.
-              read -r binary_name binary_version _ <<<"$("$binary" --version)"
-              test "$binary_name" = "$app"
-              test "$binary_version" = "${LAVIK_PACKAGE_TAG#v}"
-            fi
+            # lavik-meta also reports its pinned etcd Raft version.
+            read -r binary_name binary_version _ <<<"$("$binary" --version)"
+            test "$binary_name" = "$app"
+            test "$binary_version" = "$expected_binary_version"
           done
           smoke_args=()
           if [[ "$LAVIK_PACKAGE_KERNEL_BYPASS" == OFF ]]; then
