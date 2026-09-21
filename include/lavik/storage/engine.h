@@ -1365,6 +1365,13 @@ class StorageEngine {
   bycorf::Task<absl::Status> EndReplicaTailCommand(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::uint64_t partition_sequence);
+  // Tests a key against the currently installed FULL command context. Call on
+  // its owner before applying any effect of that command. Snapshot records,
+  // including tombstones and expired values, cover equal/older commands.
+  bycorf::Task<absl::StatusOr<bool>> ReplicaCommandNeedsApply(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::uint64_t partition_sequence, std::uint8_t db_id,
+      std::string_view key);
   bycorf::Task<absl::Status> ApplyReplicaRecords(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::uint64_t replication_epoch, std::span<const SnapshotRecord> records);

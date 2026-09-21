@@ -9105,6 +9105,9 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
                     command->args_[0] == "FLUSHALL")) {
           applied = absl::InvalidArgumentError(
               "full-sync publish queue contains a non-mutation event");
+        } else if (desired_partition && !partitionless) {
+          applied = co_await ApplyFullSyncCommand(
+              *command, session->session_id_, partition_id, partition_sequence);
         } else if (desired_partition) {
           applied = co_await ApplyReplicatedCommand(*command);
         } else {

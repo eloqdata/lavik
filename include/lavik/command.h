@@ -699,6 +699,15 @@ Task<absl::Status> ReplaceLuaFunctionCatalog(
 // applies their ordered effects atomically on the replica.
 Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command);
 
+// Replays a FULL mutation after checking which effects are already covered by
+// newer/equal per-key snapshot versions. The caller owns the partition's
+// BeginReplicaTailCommand/EndReplicaTailCommand context and serializes its
+// flow, so all coverage decisions precede every command/TTL effect.
+Task<absl::Status> ApplyFullSyncCommand(const ReplicatedCommand& command,
+                                        std::uint64_t session_id,
+                                        std::uint16_t partition_id,
+                                        std::uint64_t partition_sequence);
+
 // Replays Redis's ordinary single-connection replication stream. Redis emits
 // raw FLUSH commands and groups MULTI/EXEC commands without Lavik's native
 // epoch/envelope metadata, so these need a distinct trusted apply path.

@@ -840,6 +840,15 @@ committed during the LOADING rebuild publish their participant after-images
 only after the commit decision. `FLUSHDB` or `FLUSHALL` invalidates an active
 capture attempt so the next attempt starts from the new database epochs.
 
+Before replaying a FULL command, the receiver compares each affected key's
+physical source version with the incoming sequence, including expired records
+and tombstones. An equal or newer record covers that key's effects before Redis
+type checks or non-idempotent operations run. Canonical envelope children share
+a pre-execution coverage decision per `(database, key)`, so the mutation and its
+absolute-expiration or persistence companion are applied or skipped together.
+The serialized partition flow and LOADING admission preserve those decisions
+through execution; commands retain their session-bound source sequence.
+
 Grouped target views use partition/database-local population generations.
 Reset batches invalidate only the indexes they detach; promotion changes
 visibility without changing the candidate's index identity. The worker-wide

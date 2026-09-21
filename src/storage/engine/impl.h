@@ -2703,6 +2703,10 @@ class StorageEngine::Impl {
   Task<absl::Status> EndReplicaTailCommand(std::uint64_t session_id,
                                            std::uint16_t partition_id,
                                            std::uint64_t partition_sequence);
+  Task<absl::StatusOr<bool>> ReplicaCommandNeedsApply(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::uint64_t partition_sequence, std::uint8_t db_id,
+      std::string_view key);
 
   Task<absl::Status> ApplyReplicaRecords(
       std::uint64_t session_id, std::uint16_t partition_id,
