@@ -204,7 +204,9 @@ def scripted_cluster_gate(workdir):
 
     def lifecycle(state, revision, root=None, genesis=None, phase=None,
                   failure=None):
-        payload = bytes([state]) + struct.pack(">Q", revision)
+        # The unreleased status layout carries the committed mode immediately
+        # after lifecycle state: unset before creation, Cluster in these cases.
+        payload = bytes([state, 2 if state else 0]) + struct.pack(">Q", revision)
         payload += bytes([root is not None])
         if root is not None:
             payload += wire_string(root)
@@ -289,8 +291,9 @@ def scripted_cluster_gate(workdir):
     ready = run_server(
         "ready", lambda command: ready_replies.get(command, "ERR bad-request"),
         ["--json"], expected=0)
-    if '"result":"ready"' not in ready.stdout:
-        raise H.Failure(f"scripted READY output missing: {ready.stdout!r}")
+    if ('"result":"ready"' not in ready.stdout or
+            '"client_mode":"cluster"' not in ready.stdout):
+        raise H.Failure(f"scripted READY output or committed mode missing: {ready.stdout!r}")
 
     # Both command-first and traditional global-options-first invocations
     # reach the client command, without changing raw `status` semantics.
@@ -355,7 +358,7 @@ def scripted_cluster_create_gate(workdir):
     manifest = os.path.join(directory, "cluster.toml")
     with open(manifest, "w", encoding="utf-8") as output:
         output.write(
-            "schema_version = 1\n\n"
+            'schema_version = 1\nclient_mode = "cluster"\n\n'
             "[[meta_members]]\nid = 1\n"
             'raft_endpoint = "tcp://127.0.0.1:7001"\n'
             'data_control_endpoint = "tcp://127.0.0.1:7101"\n'
@@ -394,7 +397,9 @@ def scripted_cluster_create_gate(workdir):
 
     def lifecycle(state, revision, root=None, genesis=None, phase=None,
                   failure=None):
-        payload = bytes([state]) + struct.pack(">Q", revision)
+        # The unreleased status layout carries the committed mode immediately
+        # after lifecycle state: unset before creation, Cluster in these cases.
+        payload = bytes([state, 2 if state else 0]) + struct.pack(">Q", revision)
         payload += bytes([root is not None])
         if root is not None:
             payload += wire_string(root)
@@ -549,7 +554,9 @@ def scripted_failover_gate(workdir):
 
     def lifecycle(state, revision, root=None, genesis=None, phase=None,
                   failure=None):
-        payload = bytes([state]) + struct.pack(">Q", revision)
+        # The unreleased status layout carries the committed mode immediately
+        # after lifecycle state: unset before creation, Cluster in these cases.
+        payload = bytes([state, 2 if state else 0]) + struct.pack(">Q", revision)
         payload += bytes([root is not None])
         if root is not None:
             payload += wire_string(root)
@@ -1054,7 +1061,7 @@ def mtls_gate(workdir):
         create_node = "0123456789abcdef0123456789abcdef01234567"
         with open(create_manifest, "w", encoding="utf-8") as output:
             output.write(
-                "schema_version = 1\n\n"
+                'schema_version = 1\nclient_mode = "cluster"\n\n'
                 "[[meta_members]]\nid = 1\n"
                 f'raft_endpoint = "tcp://127.0.0.1:{raft_port}"\n'
                 f'data_control_endpoint = "tcp://127.0.0.1:{data_control_port}"\n'

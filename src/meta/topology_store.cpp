@@ -63,6 +63,11 @@ absl::Status CheckClusterRoot(const MetaOperationId& root_operation_id,
 
 absl::Status ValidateClusterLifecycle(
     const MetaClusterLifecycleState& lifecycle) {
+  if ((lifecycle.state_ == MetaClusterLifecycle::kUninitialized) !=
+          !lifecycle.client_mode_.has_value() ||
+      (lifecycle.client_mode_ && !IsValidClientMode(*lifecycle.client_mode_))) {
+    return MetaFailStopError("invalid cluster client mode in snapshot");
+  }
   const bool root_is_zero = IsZero(lifecycle.root_operation_id_);
   switch (lifecycle.state_) {
     case MetaClusterLifecycle::kUninitialized:
@@ -116,7 +121,10 @@ absl::Status CheckNextTopologyEpoch(std::uint64_t current,
 
 absl::Status MetaTopologyStore::BeginClusterCreate(
     const MetaOperationId& root_operation_id,
-    std::uint64_t genesis_commit_index) {
+    std::uint64_t genesis_commit_index, ClientMode client_mode) {
+  if (!IsValidClientMode(client_mode)) {
+    return MetaDomainRejectError("invalid cluster client mode");
+  }
   if (auto status = CheckClusterRoot(root_operation_id, genesis_commit_index);
       !status.ok()) {
     return status;
@@ -124,6 +132,7 @@ absl::Status MetaTopologyStore::BeginClusterCreate(
   if (cluster_lifecycle_.state_ != MetaClusterLifecycle::kUninitialized &&
       cluster_lifecycle_.root_operation_id_ == root_operation_id &&
       cluster_lifecycle_.genesis_commit_index_ == genesis_commit_index &&
+      cluster_lifecycle_.client_mode_ == client_mode &&
       ValidateClusterLifecycle(cluster_lifecycle_).ok()) {
     return absl::OkStatus();
   }
@@ -131,6 +140,7 @@ absl::Status MetaTopologyStore::BeginClusterCreate(
     return MetaDomainRejectError("cluster has already accepted creation");
   }
   cluster_lifecycle_.state_ = MetaClusterLifecycle::kCreating;
+  cluster_lifecycle_.client_mode_ = client_mode;
 
   cluster_lifecycle_.root_operation_id_ = root_operation_id;
   cluster_lifecycle_.genesis_commit_index_ = genesis_commit_index;
@@ -148,6 +158,13 @@ absl::Status MetaTopologyStore::CompleteClusterCreate(
       cluster_lifecycle_.root_operation_id_ != root_operation_id) {
     return MetaDomainRejectError(
         "cluster create completion does not match the active root");
+  }
+  if (cluster_lifecycle_.client_mode_ == ClientMode::kSingle &&
+      (groups_.size() != 1 ||
+       std::any_of(slots_.begin(), slots_.end(),
+                   [](const std::string& owner) { return owner.empty(); }))) {
+    return MetaDomainRejectError(
+        "Single creation requires one fully covered Group");
   }
   cluster_lifecycle_.state_ = MetaClusterLifecycle::kCreated;
 
@@ -204,6 +221,10 @@ absl::Status MetaTopologyStore::Apply(const CreateGroup& cmd) {
   }
   if (groups_.size() >= kMaxMetaGroups) {
     return MetaDomainRejectError("group cap reached");
+  }
+  if (cluster_lifecycle_.client_mode_ == ClientMode::kSingle &&
+      !groups_.empty()) {
+    return MetaDomainRejectError("Single requires exactly one Group");
   }
   GroupState group;
   group.revision_ = 1;
@@ -329,6 +350,20 @@ absl::Status MetaTopologyStore::Apply(const SetSlotMap& cmd) {
               [](const MetaSlotAssignment& a, const MetaSlotAssignment& b) {
                 return a.first_slot_ < b.first_slot_;
               });
+    if (cluster_lifecycle_.client_mode_ == ClientMode::kSingle) {
+      std::uint32_t next = 0;
+      for (const auto& range : sorted) {
+        if (range.first_slot_ != next || groups_.size() != 1 ||
+            range.group_id_ != groups_.begin()->first) {
+          return MetaDomainRejectError(
+              "Single requires one fully covered Group");
+        }
+        next = static_cast<std::uint32_t>(range.last_slot_) + 1;
+      }
+      if (next != kMetaSlotCount) {
+        return MetaDomainRejectError("Single requires complete slot coverage");
+      }
+    }
     for (std::size_t i = 1; i < sorted.size(); ++i) {
       if (sorted[i].first_slot_ <= sorted[i - 1].last_slot_) {
         return MetaDomainRejectError("overlapping slot ranges");
@@ -722,6 +757,10 @@ std::vector<MetaTopologyGroupView> MetaTopologyStore::Groups() const {
 void MetaTopologyStore::WriteSnapshot(MetaWriter& w) const {
   w.WriteU16(kMetaTopologyStoreFormatVersion);
   w.WriteU8(static_cast<std::uint8_t>(cluster_lifecycle_.state_));
+  w.WriteU8(cluster_lifecycle_.client_mode_
+                ? static_cast<std::uint8_t>(*cluster_lifecycle_.client_mode_) +
+                      1
+                : 0);
 
   WriteFixedArray(w, cluster_lifecycle_.root_operation_id_);
   w.WriteU64(cluster_lifecycle_.genesis_commit_index_);
@@ -807,6 +846,9 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   }
   auto lifecycle_state = r.ReadU8();
   if (!lifecycle_state.ok()) return lifecycle_state.status();
+  auto client_mode = r.ReadU8();
+  if (!client_mode.ok()) return client_mode.status();
+  if (*client_mode > 2) return MetaFailStopError("unknown cluster client mode");
   auto root_operation_id = ReadFixedArray<16>(r);
   if (!root_operation_id.ok()) return root_operation_id.status();
   auto genesis_commit_index = r.ReadU64();
@@ -825,6 +867,10 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   MetaTopologyStore store;
   store.cluster_lifecycle_.state_ =
       static_cast<MetaClusterLifecycle>(*lifecycle_state);
+  if (*client_mode != 0) {
+    store.cluster_lifecycle_.client_mode_ =
+        static_cast<ClientMode>(*client_mode - 1);
+  }
 
   store.cluster_lifecycle_.root_operation_id_ = *root_operation_id;
   store.cluster_lifecycle_.genesis_commit_index_ = *genesis_commit_index;
@@ -988,6 +1034,16 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     }
   }
   if (auto st = r.Finish(); !st.ok()) return st;
+  if (store.cluster_lifecycle_.client_mode_ == ClientMode::kSingle &&
+      (store.groups_.size() > 1 ||
+       ((!runs->empty() ||
+         store.cluster_lifecycle_.state_ == MetaClusterLifecycle::kCreated) &&
+        (store.groups_.size() != 1 ||
+         std::any_of(
+             store.slots_.begin(), store.slots_.end(),
+             [](const std::string& owner) { return owner.empty(); }))))) {
+    return MetaFailStopError("invalid Single topology in snapshot");
+  }
   return store;
 }
 

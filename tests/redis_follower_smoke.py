@@ -11,7 +11,7 @@
 # limitations under the License.
 
 """Exercise the external follower contract against real Redis and Lavik peers."""
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import os
 from pathlib import Path
 import signal
@@ -57,7 +57,8 @@ def reject(client, args, text):
 
 
 @contextmanager
-def process(binary, directory, name, *, redis=False, extra=(), port=None, password=None):
+def process(binary, directory, name, *, redis=False, extra=(), port=None, password=None,
+            workers=2):
     port = port or H.free_port()
     directory.mkdir(exist_ok=True)
     if redis:
@@ -71,7 +72,7 @@ def process(binary, directory, name, *, redis=False, extra=(), port=None, passwo
                 os.posix_fallocate(file.fileno(), 0, 256 * 1024 * 1024)
         args = [binary, *([str(directory / "lavik.conf")] if (directory / "lavik.conf").exists() else []),
                 "--bind", "127.0.0.1", "--port", str(port),
-                "--threads", "2", "--no-pin-workers", "--metrics-port", "0",
+                "--threads", str(workers), "--no-pin-workers", "--metrics-port", "0",
                 "--recv-buffers-per-worker", "0", "--max-memory", "1G",
                 "--registered-buffer-mb-per-worker", "64",
                 "--data-file", str(data), "--rdb-dir", str(directory), "--logtostderr"]
@@ -199,14 +200,16 @@ def fragmented_disconnect():
             proxy.close()
 
 
-def changing_endpoint(lavik, redis, root, managed=False):
-    native_args = (("--client-mode", "cluster", "--meta-managed", "yes",
-                    "--node-id", "1" * 40, "--meta-seed", "127.0.0.1:1")
-                   if managed else ())
-    with process(lavik, root / "changed-native", "native", extra=native_args) as (native, native_port, _), \
-         process(redis, root / "changed-redis", "redis", redis=True) as (source, source_port, _):
-        if not managed:
+def changing_endpoint(lavik, redis, root, managed_port=None):
+    with ExitStack() as stack:
+        if managed_port is None:
+            native, native_port, _ = stack.enter_context(
+                process(lavik, root / "changed-native", "native"))
             native.call("SET", "must-not-import", "native")
+        else:
+            native_port = managed_port
+        source, source_port, _ = stack.enter_context(
+            process(redis, root / "changed-redis", "redis", redis=True))
         source.call("SET", "redis-value", "redis")
         # The connection that passes PSYNC is the consumer, not a probe. Any
         # second connection reaches Lavik, whose ordinary handshake rejects it.
@@ -327,10 +330,12 @@ def exercise(lavik, redis, root):
             assert target.call("GET", "baseline") == "db15"
 
 
-def managed_native_rejection(lavik, redis, root):
-    args = ("--client-mode", "cluster", "--meta-managed", "yes",
-            "--node-id", "1" * 40, "--meta-seed", "127.0.0.1:1")
-    with process(lavik, root / "managed-native", "source", extra=args) as (_, port, _):
+def managed_native_rejection(lavik, redis, root, meta, ctl):
+    import gate_native_replication as N
+    N.C.META, N.C.DATA, N.C.CTL = meta, lavik, ctl
+    with N.pair(root, "managed-native") as (meta_node, source, _, _writer):
+        N.ready(meta_node)
+        port = source.redis_port
         with process(lavik, root / "managed-reject", "runtime") as (target, _, _):
             target.call("SET", "preserved", "local")
             reject(target, ("REPLICAOF", "127.0.0.1", port), "ERR")
@@ -340,17 +345,17 @@ def managed_native_rejection(lavik, redis, root):
             H.wait_until("managed endpoint handshake rejected", 15,
                          lambda: "Redis replication handshake" in log.read_text())
             reject(target, ("GET", "preserved"), "LOADING")
-    directory = root / "managed-endpoint"
-    directory.mkdir()
-    changing_endpoint(lavik, redis, directory, managed=True)
+        directory = root / "managed-endpoint"
+        directory.mkdir()
+        changing_endpoint(lavik, redis, directory, managed_port=port)
 
 
 def mode_contract(lavik, root):
     for args, expected in [
-            (("--client-mode", "cluster"), "requires meta-managed yes"),
-            (("--meta-managed", "yes"), "authority admission"),
-            (("--client-mode", "bogus"), "single"),
-            (("--meta-managed", "maybe"), "yes"),
+            (("--client-mode", "cluster"), "removed"),
+            (("--meta-managed", "yes"), "removed"),
+            (("--client-mode", "bogus"), "removed"),
+            (("--meta-managed", "maybe"), "removed"),
             (("--cluster-enabled",), "not expected")]:
         absent = root / "must-not-create.data"
         result = subprocess.run([lavik, *args, "--data-file", str(absent)],
@@ -358,32 +363,22 @@ def mode_contract(lavik, root):
         assert result.returncode != 0, result
         assert expected in result.stdout + result.stderr, result
         assert not absent.exists()
-    for cluster in (False, True):
-        directory = root / f"mode-{cluster}"
-        directory.mkdir()
-        # File values are deliberately opposite to the CLI override.
-        (directory / "lavik.conf").write_text(
-            "client-mode single\nmeta-managed no\n" if cluster else
-            "client-mode cluster\nmeta-managed yes\n")
-        args = ["--client-mode", "CLUSTER" if cluster else "SiNgLe",
-                "--meta-managed", "YeS" if cluster else "NO"]
-        if cluster:
-            args += ["--node-id", "1" * 40, "--meta-seed", "127.0.0.1:9"]
-        with process(lavik, directory, "mode", extra=args) as (client, _, _):
-            for version in (2, 3):
-                hello = client.call("HELLO", version)
-                if isinstance(hello, list):
-                    hello = dict(zip(hello[::2], hello[1::2]))
-                assert hello["mode"] == ("cluster" if cluster else "standalone")
-                info = client.call("INFO", "server")
-                assert "redis_mode:" + hello["mode"] in info
-                assert "cluster_enabled:" + str(int(cluster)) in client.call("INFO", "cluster")
-            if cluster:
-                reject(client, ("SELECT", 15), "cluster mode")
-                reject(client, ("SET", "fenced", "value"), "LOADING")
-            else:
-                assert client.call("SELECT", 15) == "OK"
-                assert client.call("SET", "value", "db15") == "OK"
+    for directive in ("client-mode single", "meta-managed no"):
+        config = root / "legacy.conf"
+        config.write_text(directive + "\n")
+        result = subprocess.run([lavik, str(config)], capture_output=True,
+                                text=True, timeout=10)
+        assert result.returncode != 0 and "removed" in result.stdout + result.stderr, result
+    with process(lavik, root / "standalone-mode", "mode") as (client, _, _):
+        for version in (2, 3):
+            hello = client.call("HELLO", version)
+            if isinstance(hello, list):
+                hello = dict(zip(hello[::2], hello[1::2]))
+            assert hello["mode"] == "standalone"
+            assert "redis_mode:standalone" in client.call("INFO", "server")
+            assert "cluster_enabled:0" in client.call("INFO", "cluster")
+        assert client.call("SELECT", 15) == "OK"
+        assert client.call("SET", "value", "db15") == "OK"
 
 
 def authenticated_startup(lavik, redis, root):
@@ -422,7 +417,9 @@ if __name__ == "__main__":
         exercise(sys.argv[1], sys.argv[2], Path(directory))
         authenticated_startup(sys.argv[1], sys.argv[2], Path(directory))
         changing_endpoint(sys.argv[1], sys.argv[2], Path(directory))
-        managed_native_rejection(sys.argv[1], sys.argv[2], Path(directory))
+        if len(sys.argv) >= 5:
+            managed_native_rejection(sys.argv[1], sys.argv[2], Path(directory),
+                                     sys.argv[3], sys.argv[4])
         interrupted_transaction(sys.argv[1], sys.argv[2], Path(directory))
         unavailable_startup(sys.argv[1], sys.argv[2], Path(directory))
     print("Redis follower checks passed")

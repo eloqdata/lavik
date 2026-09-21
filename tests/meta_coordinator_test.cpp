@@ -793,6 +793,7 @@ class MetaCoordinatorServerTest : public ::testing::Test {
                               bool begin_transition) {
     lavik::meta::ClusterCreateManifestV1 manifest;
     manifest.schema_version_ = 1;
+    manifest.client_mode_ = lavik::ClientMode::kCluster;
     manifest.meta_members_ = {{1, "tcp://127.0.0.1:7101",
                                "tcp://127.0.0.1:7301", "tcp://127.0.0.1:7201"}};
     manifest.data_nodes_ = {{state.owner_, "tcp://127.0.0.1:6379"}};

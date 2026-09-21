@@ -814,6 +814,29 @@ TEST(NodeControlInstallerTest,
 }
 
 TEST(NodeControlInstallerTest,
+     SessionReplacementReconcilesEqualControlAfterRevokingRecovery) {
+  DynamicControl control;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+  auto install = [&] {
+    return RunTaskSync(control.installer.InstallFullStateTransition(
+        WithDesiredControl(FullState(MakeState())), Basis(10)));
+  };
+  ASSERT_TRUE(install().ok());
+  ASSERT_EQ(control.actions.cluster_control_reconciliations_, 1);
+  ASSERT_TRUE(install().ok());
+  ASSERT_EQ(control.actions.cluster_control_reconciliations_, 1);
+
+  // Session cleanup cancels optional recovery transports even though durable
+  // action/deadline and topology remain unchanged. The replacement session
+  // must reapply that intent instead of treating the cached control as live.
+  ASSERT_TRUE(RunTaskSync(control.installer.LoseSessionTransition(
+                              Session(1), "Meta leader changed"))
+                  .ok());
+  ASSERT_TRUE(install().ok());
+  EXPECT_EQ(control.actions.cluster_control_reconciliations_, 2);
+}
+
+TEST(NodeControlInstallerTest,
      GrantlessControlPreservesEstablishedExportWithStablePopulationScope) {
   DynamicControl control;
   ASSERT_TRUE(control.installer.SetStorageReady(true).ok());

@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -342,6 +343,11 @@ struct MetaControlClientOptions {
   // Null means plaintext. When present, the same CA/client identity used for
   // Data-to-Data replication is reused for Meta control mTLS.
   std::shared_ptr<bycorf::TlsContext> tls_context_;
+  control::ServiceDeclaration service_;
+  control::ClientServiceCapabilities capabilities_;
+  // Startup declaration/capability disagreement is terminal for this boot.
+  // The callback wakes the main thread; worker-zero still performs its drain.
+  std::function<void()> incompatible_service_;
 };
 
 class MetaControlClientService final : public bycorf::Service {

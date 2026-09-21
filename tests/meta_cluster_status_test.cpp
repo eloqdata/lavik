@@ -55,6 +55,7 @@ ClusterStatusWireV1 ReadyStatus(std::vector<ClusterMetaMemberWireV1> members,
                      .topology_epoch_ = 3};
   status.cluster_state_ = ClusterStateWireV1::kCreated;
   status.lifecycle_revision_ = 2;
+  status.client_mode_ = lavik::ClientMode::kCluster;
   status.root_operation_id_ = "00112233445566778899aabbccddeeff";
   status.genesis_commit_index_ = 10;
   status.meta_available_ = true;
@@ -257,6 +258,7 @@ TEST(MetaClusterStatusWireTest, ReportsCreatingAndFailedLifecycle) {
   status.meta_members_ = {{.server_id_ = 1, .is_leader_ = true}};
   status.cluster_state_ = ClusterStateWireV1::kCreating;
   status.lifecycle_revision_ = 1;
+  status.client_mode_ = lavik::ClientMode::kCluster;
   status.root_operation_id_ = "00112233445566778899aabbccddeeff";
   status.genesis_commit_index_ = 12;
   status.cluster_create_phase_ = "initialize-groups";
@@ -279,6 +281,7 @@ TEST(MetaClusterStatusWireTest, ReportsCreatingAndFailedLifecycle) {
   status.cluster_create_phase_ = "initialize-groups";
   status.cluster_state_ = ClusterStateWireV1::kProvisioningFailed;
   status.lifecycle_revision_ = 2;
+  status.client_mode_ = lavik::ClientMode::kCluster;
   status.cluster_create_phase_.reset();
   status.provisioning_failure_summary_ = "cluster-create provisioning failed";
   EXPECT_TRUE(EncodeClusterStatusReply(status).ok());
@@ -717,6 +720,7 @@ TEST(MetaClusterStatusRenderTest, RejectsInconsistentLifecycleInput) {
   ClusterStatusWireV1 status;
   status.cluster_state_ = ClusterStateWireV1::kCreated;
   status.lifecycle_revision_ = 2;
+  status.client_mode_ = lavik::ClientMode::kCluster;
   status.root_operation_id_ = "00112233445566778899aabbccddeeff";
   lavik::meta::ClusterStatusOutcome outcome{
       .result_ = ClusterStatusResult::kNotReady, .status_ = status};

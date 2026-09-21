@@ -247,7 +247,9 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
           return Invalid(absl::StrCat("group ", group.group_id,
                                       " owner assignment does not match"));
         }
-      } else if (group.grant_active && owner_index.has_value()) {
+      } else if ((group.grant_active ||
+                  desired.service.client_mode == ClientMode::kSingle) &&
+                 owner_index.has_value()) {
         nodes[node->second].primary_node_index_ = *owner_index;
       }
       nodes[node->second].group_term_ = group.group_term;
@@ -327,10 +329,14 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
     }
     desired_cluster_controls.push_back(std::move(desired_control));
 
-    // Durable owner intent remains available for heartbeat role
-    // classification while fenced. Its slots remain unbound until Meta
-    // commits a fresh activation.
-    if (!source.grant_active) continue;
+    // Single replicas retain their Group binding while its Owner is fenced:
+    // complete population reads do not consume the Owner grant. The durable
+    // owner identity still prevents that old Owner from becoming a reader.
+    // Cluster keeps its existing unbound routing behavior while fenced.
+    if (!source.grant_active &&
+        (desired.service.client_mode != ClientMode::kSingle ||
+         !source.owner_node_id.has_value()))
+      continue;
     const NodeIndex primary = node_indices.at(*source.owner_node_id);
     GroupView group;
     group.group_id_ = source.group_id;
@@ -379,9 +385,29 @@ absl::StatusOr<PreparedFullState> PrepareNodeControlState(
   if (state.local.groups.size() > 1 || state.local.manifests.size() > 1) {
     return Invalid("Data supports one local Group population");
   }
+  if (state.service.client_mode == ClientMode::kSingle) {
+    // Validate the complete committed route even when authority is revoked and
+    // the serving projection consequently has no active Group yet.
+    if (state.routing.groups.size() != 1) {
+      return Invalid("Single requires exactly one complete Group");
+    }
+    auto ranges = state.routing.groups.front().slots;
+    std::sort(ranges.begin(), ranges.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::uint32_t next = 0;
+    for (const auto& range : ranges) {
+      if (range.first != next || range.last < range.first ||
+          range.last >= 16384) {
+        return Invalid("Single requires complete slot coverage");
+      }
+      next = static_cast<std::uint32_t>(range.last) + 1;
+    }
+    if (next != 16384) return Invalid("Single requires complete slot coverage");
+  }
   // Reuse local population/authority validation without retaining remote
   // assignments, manifests or failover workflows in the Data control model.
   control::FullDesiredState local{
+      .service = state.service,
       .control_revision = state.local.revision,
       .topology_epoch = state.routing.revision,
       .authority_lease_duration_ms = state.local.lease_duration_ms,
@@ -449,9 +475,12 @@ absl::StatusOr<PreparedFullState> PrepareNodeControlState(
       owner_member |= route.owner == member;
       auto& node = descriptors[found->second];
       node.group_term_ = route.term;
-      node.primary_node_index_ = route.available && route.owner != member
-                                     ? owner->second
-                                     : kNoNodeIndex;
+      node.primary_node_index_ =
+          (route.available ||
+           state.service.client_mode == ClientMode::kSingle) &&
+                  route.owner && route.owner != member
+              ? owner->second
+              : kNoNodeIndex;
     }
     if (route.owner && !owner_member)
       return Invalid("routing owner is not a member");
@@ -460,7 +489,10 @@ absl::StatusOr<PreparedFullState> PrepareNodeControlState(
     if (is_local && (local.groups.empty() ||
                      local.groups.front().group_id != route.group_id))
       return Invalid("routing assigns local node without local control");
-    if (!route.available) continue;
+    if (!route.available &&
+        !(state.service.client_mode == ClientMode::kSingle && is_local &&
+          route.owner))
+      continue;
     if (is_local) {
       for (const auto& group : prepared->serving_state_->Groups())
         builder.AddGroup(group);

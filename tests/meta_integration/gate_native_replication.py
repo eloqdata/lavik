@@ -33,6 +33,8 @@ import gate_cluster_create as C
 import harness as H
 from gate_data_control import DataProcess
 
+CLIENT_MODE = "cluster"
+
 
 class Client:
     def __init__(self, node, readonly=False):
@@ -59,7 +61,8 @@ class Client:
 @contextmanager
 def pair(root, name, source_faults=None, target_faults=None, seed=None,
          source_workers=2, target_workers=3, raft_args=None,
-         require_seed_before_full=False):
+         require_seed_before_full=False, client_mode=None):
+    client_mode = client_mode or CLIENT_MODE
     directory = root / name
     directory.mkdir()
     meta = H.Node(C.META, str(directory), 1,
@@ -72,7 +75,7 @@ def pair(root, name, source_faults=None, target_faults=None, seed=None,
     target = DataProcess(C.DATA, str(directory / "target"), C.REPLICA_1,
                          proxy.endpoint, workers=target_workers,
                          environment={**os.environ, **(target_faults or {})})
-    lines = ['schema_version = 1', 'slot_strategy = "contiguous-even"']
+    lines = ['schema_version = 1', f'client_mode = "{client_mode}"', 'slot_strategy = "contiguous-even"']
     lines += C.meta_manifest_lines(meta)
     for node in (source, target):
         lines += ['[[data_nodes]]', f'id = "{node.node_id}"',
@@ -539,6 +542,31 @@ def backpressured_shutdown(root):
             target.resume()
 
 
+def small_receive_window(root):
+    def seed(writer):
+        # Exercise FULL before steady replay grows the loopback window/MSS
+        # and the target's fault reduces its receive window.
+        writer.call("SET", "{window}seed", "s" * (2 * 1024 * 1024))
+
+    with pair(root, "small-receive-window", seed=seed,
+              source_workers=1, target_workers=1, target_faults={
+                  "LAVIK_TEST_NATIVE_SMALL_RECEIVE_WINDOW": "24576"}) as (meta, source, target, writer):
+        ready(meta)
+        writer.call("SET", "{window}trigger", "online")
+        # A real publisher burst must drain through native replay and ACKs.
+        # The reduced window used to put each large segment behind TCP's
+        # ~200ms probe timer, despite both processes remaining ONLINE.
+        for batch in range(64):
+            writer.socket.sendall(b"".join(C.encode_resp(
+                ["SET", f"{{window}}key-{index}", "v" * 1024])
+                for index in range(512)))
+            for _ in range(512):
+                assert C.read_resp(writer.reader) == "OK"
+        assert "test native receive window reduced" in Path(target.log_path).read_text()
+        assert writer.call("WAIT", 1, 12000) == 1
+        assert C.readonly_get(target, "{window}key-511") == "v" * 1024
+
+
 def main():
     C.META, C.DATA, C.CTL, C.REDIS_CLI = map(os.path.abspath, sys.argv[1:5])
     H.set_tag("native-replication")
@@ -551,6 +579,7 @@ def main():
         backpressured_shutdown(root)
         if C.has_fault(C.DATA, b"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK"):
             full_tail_expiration_effects(root)
+            small_receive_window(root)
             handoff_order(root)
             cancelled_handoff(root)
             committed_cursor_reconnect(root, "cancel-apply", target_faults={

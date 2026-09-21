@@ -17,7 +17,7 @@
 #pragma once
 
 // Process-wide cluster data-plane runtime. Installed once at
-// startup when `meta-managed yes`, before any client connection is
+// startup when Meta seeds are configured, before any client connection is
 // served; nullptr when not Meta-managed. The object graph and advertised
 // endpoints are immutable after installation; the cache, authority guard, and
 // node controller own their documented synchronized/worker-affine state.

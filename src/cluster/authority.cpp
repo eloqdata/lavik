@@ -34,9 +34,14 @@ std::atomic<std::uint64_t> next_authority_cache_identity{1};
 // Managed Single has one authority for the entire keyspace. A representative
 // slot lets the existing lease/drain/token machinery check that Group once.
 std::span<const std::uint16_t> AuthoritySlots(const RequestView& request) {
-  return request.client_mode_ == ClientMode::kSingle && !request.slots_.empty()
-             ? request.slots_.first(1)
-             : request.slots_;
+  if (request.client_mode_ != ClientMode::kSingle) return request.slots_;
+  if (!request.slots_.empty()) return request.slots_.first(1);
+  // Keyless data still belongs to the one Group; only diagnostics may bypass
+  // authority. This also closes the empty-key-set escape hatch for new paths.
+  static constexpr std::uint16_t representative = 0;
+  return request.loading_allowed_
+             ? request.slots_
+             : std::span<const std::uint16_t>(&representative, 1);
 }
 
 bool HasSingleFullGroup(const ServingState* state) {
@@ -73,8 +78,12 @@ AuthorityAdmission::AuthorityAdmission(AuthorityAdmission&& other) noexcept
       state_(std::move(other.state_)),
       slots_(std::move(other.slots_)),
       gate_generation_(other.gate_generation_),
+      lease_revision_(other.lease_revision_),
+      lease_deadline_(other.lease_deadline_),
       lease_checked_(other.lease_checked_),
       single_group_(other.single_group_),
+      topology_sequence_(other.topology_sequence_),
+      authority_version_(other.authority_version_),
       mutation_started_(
           other.mutation_started_.load(std::memory_order_relaxed)),
       final_recheck_failed_(
@@ -88,8 +97,12 @@ AuthorityAdmission& AuthorityAdmission::operator=(
   state_ = std::move(other.state_);
   slots_ = std::move(other.slots_);
   gate_generation_ = other.gate_generation_;
+  lease_revision_ = other.lease_revision_;
+  lease_deadline_ = other.lease_deadline_;
   lease_checked_ = other.lease_checked_;
   single_group_ = other.single_group_;
+  topology_sequence_ = other.topology_sequence_;
+  authority_version_ = other.authority_version_;
   mutation_started_.store(
       other.mutation_started_.load(std::memory_order_relaxed),
       std::memory_order_relaxed);
@@ -166,17 +179,24 @@ Decision Admit(const ServingState* state, const RequestView& request) {
     return decision;
   }
 
-  // A READONLY connection on a replica of the owning group serves reads
-  // locally; staleness is the client's explicit choice. Writes and
-  // non-READONLY reads redirect to the primary.
-  if (self_index != kNoNodeIndex && !request.is_write_ &&
-      request.connection_readonly_) {
+  // Single replicas admit ordinary reads and reject writes with READONLY.
+  // Cluster replicas require an explicit READONLY connection; other accesses
+  // redirect to the primary. Population/link policy is checked by replication.
+  if (self_index != kNoNodeIndex &&
+      (request.client_mode_ == ClientMode::kSingle ||
+       (!request.is_write_ && request.connection_readonly_))) {
     for (NodeIndex replica_index : group->replica_node_indices_) {
       if (replica_index == self_index) {
-        decision.kind_ = Decision::Kind::kServeStaleRead;
+        decision.kind_ = request.is_write_ ? Decision::Kind::kReadOnly
+                                           : Decision::Kind::kServeStaleRead;
         return decision;
       }
     }
+  }
+
+  if (request.client_mode_ == ClientMode::kSingle) {
+    decision.kind_ = Decision::Kind::kClusterDownUnbound;
+    return decision;
   }
 
   const NodeDescriptor* primary = state->NodeAt(group->primary_node_index_);
@@ -263,7 +283,8 @@ AuthorityGuard::AuthorityGuard(TopologyCache& topology)
       cache_identity_(next_authority_cache_identity.fetch_add(
           1, std::memory_order_relaxed)) {}
 
-const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority() const {
+const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority(
+    std::uint64_t* publication_version) const {
   struct Cached {
     std::uint64_t identity = 0;
     std::uint64_t version = 0;
@@ -272,6 +293,7 @@ const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority() const {
   thread_local Cached cached;
   std::uint64_t version = authority_version_.load(std::memory_order_acquire);
   if (cached.identity == cache_identity_ && cached.version == version) {
+    if (publication_version != nullptr) *publication_version = cached.version;
     return *cached.state;
   }
   for (;;) {
@@ -282,6 +304,7 @@ const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority() const {
       cached.identity = cache_identity_;
       cached.version = version;
       cached.state = std::move(state);
+      if (publication_version != nullptr) *publication_version = version;
       return *cached.state;
     }
     version = after;
@@ -289,6 +312,7 @@ const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority() const {
 }
 
 void AuthorityGuard::PublishAuthorityLocked() {
+  ++writer_state_.revision_;
   auto state = std::make_shared<const AuthorityState>(writer_state_);
   published_authority_.store(std::move(state), std::memory_order_release);
   // This version is only a cache invalidation hint, not part of the lease
@@ -316,8 +340,10 @@ std::optional<AuthorityAnchor> AuthorityGuard::LocalPrimaryAnchor(
 bool AuthorityGuard::LeaseCovers(const AuthorityState& authority,
                                  const ServingState& state,
                                  std::span<const std::uint16_t> slots,
-                                 MonotonicTime now) const {
+                                 MonotonicTime now,
+                                 MonotonicTime* earliest_deadline) const {
   if (!authority.session_.has_value()) return false;
+  if (earliest_deadline != nullptr) *earliest_deadline = MonotonicTime::max();
 
   // Single carries one representative slot for its full-keyspace Group.
   // Cluster admission enforces same-slot requests; keep this helper general
@@ -344,9 +370,20 @@ bool AuthorityGuard::LeaseCovers(const AuthorityState& authority,
       }
       return false;
     }
-    const std::optional<AuthorityAnchor> current =
-        LocalPrimaryAnchor(state, group->group_id_);
-    if (!current.has_value() || lease->second.anchor_ != *current) return false;
+    // The slot lookup already resolved this Group and the lease lookup used
+    // its id. Compare the remaining anchor fields in place: constructing an
+    // owning AuthorityAnchor here repeats the Group lookup and string copies
+    // at every admission and mutation recheck.
+    if (state.SelfNodeIndex() == kNoNodeIndex || !group->granted_ ||
+        !GroupReady(*group) ||
+        lease->second.anchor_.assignment_id_ != group->assignment_id_ ||
+        lease->second.anchor_.group_term_ != group->group_term_) {
+      return false;
+    }
+    if (earliest_deadline != nullptr) {
+      *earliest_deadline =
+          std::min(*earliest_deadline, lease->second.deadline_);
+    }
   }
   return true;
 }
@@ -355,33 +392,108 @@ AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
                                                    MonotonicTime now) const {
   AuthorityAdmission admission;
   std::uint64_t version = 0;
-  admission.state_ = CurrentCachedWithVersion(topology_, &version);
+  admission.state_ = CurrentCachedWithVersion(topology_, &version,
+                                              &admission.topology_sequence_);
   const auto slots = AuthoritySlots(request);
   admission.slots_.assign(slots.begin(), slots.end());
   admission.single_group_ = request.client_mode_ == ClientMode::kSingle;
-  admission.decision_ = Admit(admission.state_.get(), request);
-
-  if (admission.decision_.kind_ != Decision::Kind::kServe ||
-      admission.state_ == nullptr || admission.slots_.empty()) {
-    return admission;
-  }
-
-  // Only an owner serving its own group consumes Meta authority. Replica
-  // READONLY decisions use kServeStaleRead and redirects carry no admission.
-  const GroupView* group =
-      admission.state_->GroupForSlot(admission.slots_.front());
-  if (group == nullptr ||
-      group->primary_node_index_ != admission.state_->SelfNodeIndex()) {
-    return admission;
-  }
-
-  const AuthorityState& authority = CurrentAuthority();
-  admission.gate_generation_ = authority.generation_;
-  admission.lease_checked_ = true;
-  if (!LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
-    admission.decision_.kind_ = Decision::Kind::kClusterDownUnbound;
-  }
+  admission.decision_ =
+      DecideWithLease(admission.state_.get(), request, now, &admission);
   return admission;
+}
+
+Decision AuthorityGuard::DecideNow(const RequestView& request,
+                                   std::optional<MonotonicTime> now) const {
+  // Single's complete Group authorizes every read through the same predicate.
+  // Keep only successful verdicts in worker-local memory; exact publication
+  // identity and lease expiry remain checked on every call. This avoids both
+  // repeated Group/lease lookups and per-request ownership, without adding a
+  // second authority, shared atomics, or a command-specific permission rule.
+  const bool single_read =
+      request.client_mode_ == ClientMode::kSingle && !request.is_write_ &&
+      !request.loading_allowed_ &&
+      (request.slots_.empty() || request.slots_.front() < kSlotCount);
+  struct CachedRead {
+    std::uint64_t identity = 0;
+    std::uint64_t sequence = 0;
+    Decision::Kind kind = Decision::Kind::kLoading;
+    LeaseCheck lease;
+  };
+  thread_local CachedRead cached;
+  std::uint64_t sequence = topology_.publication_sequence();
+  // A successful verdict needs neither borrowed snapshot when their exact
+  // publication identities are unchanged. An odd topology sequence always
+  // takes the coherent slow path. The authority version is captured together
+  // with the immutable lease snapshot, not sampled after its validation.
+  if (single_read && (sequence & 1U) == 0 &&
+      cached.identity == cache_identity_ && cached.sequence == sequence &&
+      (cached.kind == Decision::Kind::kServeStaleRead ||
+       (cached.lease.publication_version ==
+            authority_version_.load(std::memory_order_acquire) &&
+        (now.has_value() ? *now : LeaseClockNow()) < cached.lease.deadline))) {
+    Decision decision;
+    decision.kind_ = cached.kind;
+    return decision;
+  }
+  std::uint64_t version = 0;
+  const auto& state = CurrentCachedWithVersion(topology_, &version, &sequence);
+  const MonotonicTime checked_at = now.has_value() ? *now : LeaseClockNow();
+  if (!single_read) {
+    return DecideWithLease(state.get(), request, checked_at, nullptr);
+  }
+  LeaseCheck lease;
+  const Decision decision =
+      DecideWithLease(state.get(), request, checked_at, nullptr, &lease);
+  if (decision.kind_ == Decision::Kind::kServe ||
+      decision.kind_ == Decision::Kind::kServeStaleRead) {
+    cached = {.identity = cache_identity_,
+              .sequence = sequence,
+              .kind = decision.kind_,
+              .lease = lease};
+  } else {
+    cached.identity = 0;
+  }
+  return decision;
+}
+
+Decision AuthorityGuard::DecideWithLease(const ServingState* state,
+                                         const RequestView& request,
+                                         MonotonicTime now,
+                                         AuthorityAdmission* proof,
+                                         LeaseCheck* lease_check) const {
+  Decision decision = Admit(state, request);
+  const auto slots = AuthoritySlots(request);
+  if (decision.kind_ != Decision::Kind::kServe || state == nullptr ||
+      slots.empty()) {
+    return decision;
+  }
+
+  // Only an Owner consumes Meta authority. A synchronous read need not retain
+  // shared ownership or construct the write proof, but uses exactly the same
+  // lease/session checks as an admission that survives storage preparation.
+  const GroupView* group = state->GroupForSlot(slots.front());
+  if (group == nullptr ||
+      group->primary_node_index_ != state->SelfNodeIndex()) {
+    return decision;
+  }
+  std::uint64_t proof_version = 0;
+  const AuthorityState& authority = CurrentAuthority(
+      lease_check != nullptr ? &lease_check->publication_version
+      : proof != nullptr     ? &proof_version
+                             : nullptr);
+  if (proof != nullptr) {
+    proof->gate_generation_ = authority.generation_;
+    proof->lease_revision_ = authority.revision_;
+    proof->authority_version_ = proof_version;
+    proof->lease_checked_ = true;
+  }
+  MonotonicTime* deadline = proof != nullptr         ? &proof->lease_deadline_
+                            : lease_check != nullptr ? &lease_check->deadline
+                                                     : nullptr;
+  if (!LeaseCovers(authority, *state, slots, now, deadline)) {
+    decision.kind_ = Decision::Kind::kClusterDownUnbound;
+  }
+  return decision;
 }
 
 RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,
@@ -398,14 +510,54 @@ RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,
   }
 
   if (admission.lease_checked_) {
-    const AuthorityState& authority = CurrentAuthority();
-    if (admission.gate_generation_ != authority.generation_ ||
-        !LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
-      return RecheckResult::kReject;
+    // An unchanged authority publication proves the captured generation,
+    // revision and lease set without borrowing the snapshot. The deadline
+    // alone still advances, so it is compared on every call; expiry or any
+    // republication falls back to the full snapshot checks.
+    if (admission.authority_version_ !=
+        authority_version_.load(std::memory_order_acquire)) {
+      const AuthorityState& authority = CurrentAuthority();
+      if (admission.gate_generation_ != authority.generation_) {
+        return RecheckResult::kReject;
+      }
+      // Admission already checked these exact immutable leases against the
+      // retained topology. Until publication or expiry, repeating Group/hash
+      // lookups and anchor comparisons adds no proof. Renewal (even a shorter
+      // deadline) changes revision, while expiry still goes through LeaseCovers
+      // to record its one-time metric. Topology/fence checks remain below.
+      if ((admission.lease_revision_ != authority.revision_ ||
+           now >= admission.lease_deadline_) &&
+          !LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
+        return RecheckResult::kReject;
+      }
+    } else if (now >= admission.lease_deadline_) {
+      // Expiry must still flow through LeaseCovers for its one-time metric,
+      // even though no republication could have renewed the lease.
+      const AuthorityState& authority = CurrentAuthority();
+      if (!LeaseCovers(authority, *admission.state_, admission.slots_, now)) {
+        return RecheckResult::kReject;
+      }
     }
   }
+  const std::uint64_t sequence = topology_.publication_sequence();
+  if ((sequence & 1U) == 0 && sequence == admission.topology_sequence_) {
+    // No publication since admission: the current snapshot is the admitted
+    // one, so the stale-read pointer, single-group and token comparisons
+    // would all trivially pass. Skip the thread-local snapshot cache walk.
+    return RecheckResult::kOk;
+  }
   std::uint64_t version = 0;
-  const auto current = CurrentCachedWithVersion(topology_, &version);
+  // This synchronous comparison cannot suspend or refresh this thread's cache
+  // again. Borrow its pinned snapshot to avoid unnecessary atomic shared
+  // ownership updates on every mutation.
+  const auto& current = CurrentCachedWithVersion(topology_, &version);
+  // Owner tokens deliberately exclude replica membership. A retained replica
+  // read is reusable only on its exact snapshot; a fresh admission must prove
+  // membership again after publication, even if the Owner/term did not change.
+  if (admission.decision_.kind_ == Decision::Kind::kServeStaleRead &&
+      current.get() != admission.state_.get()) {
+    return RecheckResult::kReject;
+  }
   // A representative slot proves the whole dataset only while its one-Group
   // topology remains intact, including across a publication before mutation.
   if (admission.single_group_ && !admission.slots_.empty() &&
@@ -433,17 +585,33 @@ RecheckResult AuthorityGuard::RegisterAndRecheck(
     MonotonicTime now, AuthorityInFlightGuards* guards) const {
   guards->clear();
 
-  // CurrentCachedWithVersion spins through an odd sequence and returns only
-  // after observing one completed publication. The snapshot itself is not
-  // used here: Recheck is the sole authority comparator, while the sequence
-  // brackets registration against a concurrent publisher's drain.
-  std::uint64_t unused_version = 0;
-  std::uint64_t publication_before = 0;
-  const std::shared_ptr<const ServingState> registration_state =
-      CurrentCachedWithVersion(topology_, &unused_version, &publication_before);
-
   const std::shared_ptr<const ServingState>& admitted_state = admission.state();
   if (admitted_state == nullptr) return RecheckResult::kReject;
+
+  // Fast path: the admitted topology is still the current publication. Its
+  // pointer identity makes the mutation-admission comparison below trivial,
+  // and the sequence alone brackets registration against a concurrent
+  // publisher's drain. An odd or advanced sequence falls back to borrowing a
+  // coherent snapshot: CurrentCachedWithVersion spins through an odd sequence
+  // and returns only after observing one completed publication.
+  std::uint64_t unused_version = 0;
+  std::uint64_t publication_before = topology_.publication_sequence();
+  const ServingState* registration_state = nullptr;
+  if ((publication_before & 1U) == 0 &&
+      publication_before == admission.topology_sequence_) {
+    registration_state = admitted_state.get();
+  } else {
+    // The snapshot itself is not used beyond the comparison: Recheck is the
+    // sole authority comparator, while the sequence brackets registration
+    // against a concurrent publisher's drain. Registration cannot suspend.
+    // This cache entry is consumed before Recheck can refresh it, so
+    // retaining another shared owner would only add atomic reference-count
+    // traffic to every write.
+    registration_state = CurrentCachedWithVersion(topology_, &unused_version,
+                                                  &publication_before)
+                             .get();
+  }
+
   for (const std::uint16_t slot : admission.slots()) {
     GroupInFlight* cell = admitted_state->InFlightCellForSlot(slot);
     if (cell == nullptr) continue;
@@ -454,7 +622,7 @@ RecheckResult AuthorityGuard::RegisterAndRecheck(
   }
 
   if (topology_.publication_sequence() == publication_before &&
-      MutationAdmissionUnchanged(*admitted_state, registration_state.get(),
+      MutationAdmissionUnchanged(*admitted_state, registration_state,
                                  admission.slots()) &&
       Recheck(admission, now) == RecheckResult::kOk) {
     return RecheckResult::kOk;

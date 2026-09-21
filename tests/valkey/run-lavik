@@ -24,6 +24,8 @@ DATA_FILE=$(mktemp \
   "${LAVIK_TEST_DATA_DIR:-/tmp}/lavik-valkey.XXXXXX.data")
 LOG_FILE=$(mktemp \
   "${LAVIK_TEST_DATA_DIR:-/tmp}/lavik-valkey.XXXXXX.log")
+RDB_DIR=$(mktemp -d \
+  "${LAVIK_TEST_DATA_DIR:-/tmp}/lavik-valkey-rdb.XXXXXX")
 SERVER_PID=
 
 cleanup() {
@@ -42,6 +44,7 @@ cleanup() {
         wait "$SERVER_PID" 2>/dev/null || true
     fi
     rm -f "$DATA_FILE" "$LOG_FILE"
+    rm -rf "$RDB_DIR"
     exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -62,7 +65,7 @@ truncate -s "${LAVIK_TEST_DATA_SIZE:-8G}" "$DATA_FILE"
     --registered-buffer-mb-per-worker "${LAVIK_TEST_BUFFER_MB:-64}" \
     --replication-publish-queue-mb-per-worker "${LAVIK_TEST_REPLICATION_QUEUE_MB:-8}" \
     --max-memory "${LAVIK_TEST_MAX_MEMORY:-2147483648}" \
-    --data-file "$DATA_FILE" >"$LOG_FILE" 2>&1 &
+    --data-file "$DATA_FILE" --rdb-dir "$RDB_DIR" >"$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 
 ready=0

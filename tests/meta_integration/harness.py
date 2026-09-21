@@ -148,7 +148,7 @@ def write_initial_meta_manifest(path, members):
     exercise Raft and membership. Nothing persists the Data portion until an
     operator submits `cluster-create`.
     """
-    lines = ["schema_version = 1", ""]
+    lines = ["schema_version = 1", 'client_mode = "cluster"', ""]
     for node_id, raft, data_control, ctl in sorted(members):
         lines.extend([
             "[[meta_members]]",
@@ -200,6 +200,8 @@ class Node:
         self.data_control_port = free_port()
         self.ctl_port = free_port()
         self.ctl_path = os.path.join(self.data_dir, "meta-admin.sock")
+        self._short_ctl_path = None
+        self._short_ctl_directory = None
         self.args = list(args) if args is not None else raft_args()
         self.proc = None
         self.log_file = None
@@ -243,9 +245,29 @@ class Node:
         EADDRINUSE even with SO_REUSEADDR. Instant kill/restart cycles hit
         that window routinely, so the harness absorbs it instead of
         requiring every gate to sprinkle sleeps."""
+        if explicit_ctl_socket and len(os.fsencode(self.ctl_path)) >= 108:
+            # Deep scenario names under a provisioned scratch mount can exceed
+            # sockaddr_un even though the data path is valid. Keep auxiliary
+            # sockets on the caller's selected scratch filesystem as well.
+            socket_root = (os.environ.get("TMPDIR") or
+                           os.environ.get("LAVIK_TEST_DATA_DIR") or
+                           tempfile.gettempdir())
+            # The authenticated admin listener requires a private parent;
+            # scratch roots themselves may intentionally be shared directories.
+            self._short_ctl_directory = tempfile.mkdtemp(
+                prefix="mc-", dir=socket_root)
+            self._short_ctl_path = os.path.join(
+                self._short_ctl_directory, "ctl.sock")
+            if len(os.fsencode(self._short_ctl_path)) >= 108:
+                os.rmdir(self._short_ctl_directory)
+                raise Failure("TMPDIR is too long for a test control socket")
+            self.ctl_path = self._short_ctl_path
         for attempt in range(6):
             if self.alive():
                 raise Failure(f"node {self.id} is already running")
+            if self._short_ctl_directory is not None:
+                # Retry/restart reuses the endpoint after prior cleanup.
+                os.makedirs(self._short_ctl_directory, mode=0o700, exist_ok=True)
             if raft_port is not None:
                 self.raft_port = raft_port
             args = [
@@ -542,6 +564,15 @@ class Node:
         if self.log_file is not None:
             self.log_file.close()
             self.log_file = None
+        if self._short_ctl_path is not None:
+            try:
+                os.unlink(self._short_ctl_path)
+            except OSError:
+                pass
+            try:
+                os.rmdir(self._short_ctl_directory)
+            except OSError:
+                pass
 
     def log_tail(self, lines=40):
         try:

@@ -449,28 +449,12 @@ absl::Status ApplyRedisConfigDirective(
     }
     return absl::OkStatus();
   }
-  // Client semantics and Meta control. These directives are
-  // startup-only: runtime CONFIG SET goes through the separate
-  // kRuntimeConfigs table and never reaches this function.
-  if (name == "client-mode") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    const std::string mode = absl::AsciiStrToLower(directive[1]);
-    if (mode == "single") {
-      options->client_mode_ = ClientMode::kSingle;
-    } else if (mode == "cluster") {
-      options->client_mode_ = ClientMode::kCluster;
-    } else {
-      return absl::InvalidArgumentError(
-          "client-mode must be single or cluster");
-    }
-    return absl::OkStatus();
-  }
-  if (name == "meta-managed") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    auto enabled = ParseYesNo(directive[1], name);
-    if (!enabled.ok()) return enabled.status();
-    options->meta_managed_ = *enabled;
-    return absl::OkStatus();
+  if (name == "client-mode" || name == "meta-managed") {
+    return absl::InvalidArgumentError(
+        absl::StrCat(name,
+                     " was removed: configure meta-seed and declare "
+                     "client_mode in the Meta creation manifest; "
+                     "omit Meta seeds for standalone mode"));
   }
   if (name == "announce-ip" || name == "node-id" || name == "meta-seed") {
     if (directive.size() != 2) return WrongArgumentCount(name);
@@ -494,6 +478,13 @@ absl::Status ApplyRedisConfigDirective(
     } else {
       options->announce_tls_port_ = port;
     }
+    return absl::OkStatus();
+  }
+  if (name == "replica-serve-stale-data") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    auto enabled = ParseYesNo(directive[1], name);
+    if (!enabled.ok()) return enabled.status();
+    options->replication_options_.replica_serve_stale_data_ = *enabled;
     return absl::OkStatus();
   }
   if (name == "replica-read-only") {
@@ -667,25 +658,9 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
     return absl::InvalidArgumentError(
         "client-query-buffer-limit must be between 1mb and LONG_MAX bytes");
   }
-  // Validate client semantics independently from the authority source.
-  // Meta-managed nodes cannot also consume an external Redis dataset.
-  if (options.client_mode_ == ClientMode::kCluster && !options.meta_managed_) {
-    return absl::InvalidArgumentError(
-        "client-mode cluster requires meta-managed yes");
-  }
-  // Single admission does not yet bind every command to Group authority. Do
-  // not open listeners or touch storage for that combination until it does.
-  if (options.client_mode_ == ClientMode::kSingle && options.meta_managed_) {
-    return absl::InvalidArgumentError(
-        "Meta-managed Single is not available: authority admission is not "
-        "implemented");
-  }
-  if (options.meta_managed_) {
-    if (options.meta_seeds_.empty()) {
-      return absl::InvalidArgumentError(
-          "meta-managed requires at least one meta-seed for the "
-          "Meta-managed node");
-    }
+  // Meta seeds are the only management switch. Client semantics are resolved
+  // from committed Meta state on the startup thread before storage exists.
+  if (!options.meta_seeds_.empty()) {
     if (!IsLowerHexNodeId(options.node_id_)) {
       return absl::InvalidArgumentError(
           "Meta-managed mode requires node-id as 40 lowercase "

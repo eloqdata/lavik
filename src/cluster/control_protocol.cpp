@@ -284,7 +284,7 @@ std::uint32_t Crc32c(std::string_view bytes) noexcept {
 
 bool IsKnownMessageType(std::uint16_t raw) noexcept {
   return raw >= static_cast<std::uint16_t>(MessageType::kClientHello) &&
-         raw <= static_cast<std::uint16_t>(MessageType::kNodeControlUpdate);
+         raw <= static_cast<std::uint16_t>(MessageType::kBootstrapReply);
 }
 
 bool IsZeroHash(const WireHash256& hash) noexcept {
@@ -1248,6 +1248,92 @@ absl::StatusOr<LeaseGranted> ReadLeaseGranted(Reader& reader) {
   return grant;
 }
 
+std::uint8_t ModeTag(std::optional<ClientMode> mode) {
+  if (!mode) return 0;
+  return *mode == ClientMode::kSingle    ? 1
+         : *mode == ClientMode::kCluster ? 2
+                                         : 255;
+}
+
+absl::StatusOr<std::optional<ClientMode>> ReadMode(Reader& reader) {
+  auto tag = reader.U8();
+  if (!tag.ok()) return tag.status();
+  if (*tag > 2) return ProtocolError("invalid client mode");
+  if (*tag == 0) return std::optional<ClientMode>{};
+  return std::optional<ClientMode>{static_cast<ClientMode>(*tag - 1)};
+}
+
+void WriteService(Writer& writer, const ServiceDeclaration& service) {
+  writer.U8(ModeTag(service.client_mode));
+  writer.Fixed(service.creation_id);
+  writer.U64(service.genesis_commit_index);
+}
+
+absl::StatusOr<ServiceDeclaration> ReadService(Reader& reader) {
+  auto mode = ReadMode(reader);
+  if (!mode.ok()) return mode.status();
+  auto id = reader.Fixed<16>();
+  if (!id.ok()) return id.status();
+  auto index = reader.U64();
+  if (!index.ok()) return index.status();
+  return ServiceDeclaration{*mode, *id, *index};
+}
+
+void WriteCapabilities(Writer& writer, const ClientServiceCapabilities& caps) {
+  writer.U32(caps.supported_modes);
+  writer.U32(caps.services);
+  writer.U8(ModeTag(caps.installed_mode));
+  writer.U32(caps.database_count);
+}
+
+absl::StatusOr<ClientServiceCapabilities> ReadCapabilities(Reader& reader) {
+  auto modes = reader.U32();
+  if (!modes.ok()) return modes.status();
+  auto services = reader.U32();
+  if (!services.ok()) return services.status();
+  auto mode = ReadMode(reader);
+  if (!mode.ok()) return mode.status();
+  auto databases = reader.U32();
+  if (!databases.ok()) return databases.status();
+  return ClientServiceCapabilities{*modes, *services, *mode, *databases};
+}
+
+absl::StatusOr<std::string> Encode(const BootstrapHello& hello) {
+  if (hello.minimum_version == 0 ||
+      hello.minimum_version > hello.maximum_version) {
+    return ProtocolError("invalid BootstrapHello version range");
+  }
+  Writer writer;
+  writer.U16(hello.minimum_version);
+  writer.U16(hello.maximum_version);
+  if (auto status = WriteIdentity(writer, hello.node_id, "bootstrap node id");
+      !status.ok())
+    return status;
+  WriteCapabilities(writer, hello.capabilities);
+  return writer.Take();
+}
+
+absl::StatusOr<WireMessage> DecodeBootstrapHello(std::string_view bytes) {
+  Reader reader(bytes);
+  BootstrapHello hello;
+  auto minimum = reader.U16();
+  if (!minimum.ok()) return minimum.status();
+  auto maximum = reader.U16();
+  if (!maximum.ok()) return maximum.status();
+  if (*minimum == 0 || *minimum > *maximum)
+    return ProtocolError("invalid BootstrapHello version range");
+  hello.minimum_version = *minimum;
+  hello.maximum_version = *maximum;
+  auto node = ReadIdentity(reader, "bootstrap node id");
+  if (!node.ok()) return node.status();
+  hello.node_id = std::move(*node);
+  auto caps = ReadCapabilities(reader);
+  if (!caps.ok()) return caps.status();
+  hello.capabilities = *caps;
+  if (auto status = Finish(reader); !status.ok()) return status;
+  return WireMessage{std::move(hello)};
+}
+
 absl::StatusOr<std::string> Encode(const ClientHello& hello) {
   if (hello.minimum_version == 0 ||
       hello.minimum_version > hello.maximum_version) {
@@ -1274,6 +1360,8 @@ absl::StatusOr<std::string> Encode(const ClientHello& hello) {
     return status;
   }
   writer.U32(hello.replication_flow_count);
+  WriteService(writer, hello.service);
+  WriteCapabilities(writer, hello.capabilities);
   return std::move(writer).Take();
 }
 
@@ -1305,13 +1393,19 @@ absl::StatusOr<WireMessage> DecodeClientHello(std::string_view bytes) {
     return ProtocolError("invalid ClientHello replication flow count");
   }
   hello.replication_flow_count = *count;
+  auto service = ReadService(reader);
+  if (!service.ok()) return service.status();
+  hello.service = *service;
+  auto caps = ReadCapabilities(reader);
+  if (!caps.ok()) return caps.status();
+  hello.capabilities = *caps;
   if (absl::Status status = Finish(reader); !status.ok()) return status;
   return WireMessage{std::move(hello)};
 }
 
 absl::StatusOr<std::string> Encode(const ServerHello& hello) {
   const auto disposition = static_cast<std::uint8_t>(hello.disposition);
-  if (disposition < 1 || disposition > 3) {
+  if (disposition < 1 || disposition > 4) {
     return ProtocolError("unknown ServerHello disposition");
   }
   if (hello.directory.size() > kMaxDirectoryEntries) {
@@ -1334,6 +1428,11 @@ absl::StatusOr<std::string> Encode(const ServerHello& hello) {
   }
   writer.U32(hello.observation_ttl_ms);
   writer.U32(hello.session_progress_timeout_ms);
+  WriteService(writer, hello.service);
+  if (auto status = writer.String(hello.rejection_reason, kMaxIdentifierBytes,
+                                  "hello rejection");
+      !status.ok())
+    return status;
   return std::move(writer).Take();
 }
 
@@ -1342,7 +1441,7 @@ absl::StatusOr<WireMessage> DecodeServerHello(std::string_view bytes) {
   ServerHello hello;
   auto disposition = reader.U8();
   if (!disposition.ok()) return disposition.status();
-  if (*disposition < 1 || *disposition > 3) {
+  if (*disposition < 1 || *disposition > 4) {
     return ProtocolError("unknown ServerHello disposition");
   }
   hello.disposition = static_cast<ServerHelloDisposition>(*disposition);
@@ -1385,8 +1484,47 @@ absl::StatusOr<WireMessage> DecodeServerHello(std::string_view bytes) {
   auto progress_timeout = reader.U32();
   if (!progress_timeout.ok()) return progress_timeout.status();
   hello.session_progress_timeout_ms = *progress_timeout;
+  auto service = ReadService(reader);
+  if (!service.ok()) return service.status();
+  hello.service = *service;
+  auto reason = reader.String(kMaxIdentifierBytes);
+  if (!reason.ok()) return reason.status();
+  hello.rejection_reason = std::move(*reason);
   if (absl::Status status = Finish(reader); !status.ok()) return status;
   return WireMessage{std::move(hello)};
+}
+
+absl::Status ValidateBootstrapReply(const BootstrapReply& reply) {
+  const auto disposition = static_cast<std::uint8_t>(reply.disposition);
+  if (disposition < 1 || disposition > 4 ||
+      reply.server.session_generation != 0 ||
+      reply.server.session_id != WireId128{})
+    return ProtocolError("invalid BootstrapReply");
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> Encode(const BootstrapReply& reply) {
+  if (auto status = ValidateBootstrapReply(reply); !status.ok()) return status;
+  auto server = Encode(reply.server);
+  if (!server.ok()) return server.status();
+  Writer writer;
+  writer.U8(static_cast<std::uint8_t>(reply.disposition));
+  writer.Raw(*server);
+  return writer.Take();
+}
+
+absl::StatusOr<WireMessage> DecodeBootstrapReply(std::string_view bytes) {
+  Reader reader(bytes);
+  auto disposition = reader.U8();
+  if (!disposition.ok()) return disposition.status();
+  auto remaining = reader.Raw(reader.remaining());
+  if (!remaining.ok()) return remaining.status();
+  auto server = DecodeServerHello(*remaining);
+  if (!server.ok()) return server.status();
+  BootstrapReply reply{static_cast<BootstrapDisposition>(*disposition),
+                       std::get<ServerHello>(std::move(*server))};
+  if (auto status = ValidateBootstrapReply(reply); !status.ok()) return status;
+  return WireMessage{std::move(reply)};
 }
 
 absl::StatusOr<std::string> Encode(const TransferStart& start) {
@@ -2175,11 +2313,45 @@ absl::StatusOr<WireMessage> DecodeResultNoLongerTracked(
 
 }  // namespace
 
+absl::Status ValidateClientService(
+    const ServiceDeclaration& declaration,
+    const ClientServiceCapabilities& capabilities, bool require_installed) {
+  if (!declaration.client_mode ||
+      !IsValidClientMode(*declaration.client_mode) ||
+      declaration.creation_id == WireId128{} ||
+      declaration.genesis_commit_index == 0) {
+    return absl::FailedPreconditionError(
+        "committed client service declaration is missing");
+  }
+  const auto mode = *declaration.client_mode;
+  const auto required_mode =
+      mode == ClientMode::kSingle ? kSingleServiceMode : kClusterServiceMode;
+  constexpr auto required_services =
+      kDb0GroupAuthority | kReplicaPopulationRead;
+  if ((capabilities.supported_modes & required_mode) == 0 ||
+      (capabilities.services & required_services) != required_services) {
+    return absl::FailedPreconditionError(
+        "Data boot lacks required client mode or service capabilities");
+  }
+  if (require_installed &&
+      (capabilities.installed_mode != declaration.client_mode ||
+       capabilities.database_count !=
+           (mode == ClientMode::kSingle ? 16u : 1u))) {
+    return absl::FailedPreconditionError(
+        "Data installed client mode or storage layout is incompatible");
+  }
+  return absl::OkStatus();
+}
+
 MessageType MessageTypeOf(const WireMessage& message) noexcept {
   return std::visit(
       [](const auto& value) -> MessageType {
         using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T, ClientHello>) {
+        if constexpr (std::is_same_v<T, BootstrapHello>) {
+          return MessageType::kBootstrapHello;
+        } else if constexpr (std::is_same_v<T, BootstrapReply>) {
+          return MessageType::kBootstrapReply;
+        } else if constexpr (std::is_same_v<T, ClientHello>) {
           return MessageType::kClientHello;
         } else if constexpr (std::is_same_v<T, NodeControlUpdate>) {
           return MessageType::kNodeControlUpdate;
@@ -2255,6 +2427,10 @@ absl::StatusOr<WireMessage> DecodeMessage(MessageType type,
       if (!update.ok()) return update.status();
       return WireMessage{std::move(*update)};
     }
+    case MessageType::kBootstrapHello:
+      return DecodeBootstrapHello(payload);
+    case MessageType::kBootstrapReply:
+      return DecodeBootstrapReply(payload);
     case MessageType::kClientHello:
       return DecodeClientHello(payload);
     case MessageType::kServerHello:
@@ -2298,6 +2474,8 @@ absl::StatusOr<WireMessage> DecodeMessage(MessageType type,
 
 bool RequiresSingleFrame(MessageType type) noexcept {
   switch (type) {
+    case MessageType::kBootstrapHello:
+    case MessageType::kBootstrapReply:
     case MessageType::kHeartbeat:
     case MessageType::kHeartbeatAck:  // contains the authority grant
     case MessageType::kFence:
@@ -3167,6 +3345,7 @@ absl::Status WriteFullDesiredStateBody(Writer& writer,
     return ProtocolError("FullDesiredState lease duration is invalid");
   }
   writer.U16(kProtocolVersion);
+  WriteService(writer, state.service);
   writer.U64(state.control_revision);
   writer.U64(state.topology_epoch);
   writer.U32(state.authority_lease_duration_ms);
@@ -3284,6 +3463,9 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
   if (*version != kProtocolVersion) {
     return ProtocolError("unsupported FullDesiredState version");
   }
+  auto service = ReadService(reader);
+  if (!service.ok()) return service.status();
+  state.service = *service;
   auto index = reader.U64();
   if (!index.ok()) return index.status();
   state.control_revision = *index;
@@ -3362,7 +3544,8 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(std::string&& encoded) {
 
 bool SameDesiredState(const FullDesiredState& left,
                       const FullDesiredState& right) {
-  if (left.topology_epoch != right.topology_epoch ||
+  if (left.service != right.service ||
+      left.topology_epoch != right.topology_epoch ||
       left.authority_lease_duration_ms != right.authority_lease_duration_ms ||
       left.meta_directory != right.meta_directory ||
       left.nodes != right.nodes || left.groups != right.groups ||
@@ -3376,6 +3559,7 @@ bool SameDesiredState(const FullDesiredState& left,
 absl::StatusOr<std::string> EncodeNodeControlUpdate(
     const NodeControlUpdate& update) {
   Writer writer;
+  WriteService(writer, update.service);
   writer.Fixed(update.request_id);
   writer.Bool(update.tasks.has_value());
   if (update.tasks) {
@@ -3405,6 +3589,9 @@ absl::StatusOr<NodeControlUpdate> DecodeNodeControlUpdate(
     return ResourceLimit("node update exceeds its cap");
   Reader reader(bytes);
   NodeControlUpdate update;
+  auto service = ReadService(reader);
+  if (!service.ok()) return service.status();
+  update.service = *service;
   auto id = reader.Fixed<16>();
   if (!id.ok()) return id.status();
   update.request_id = *id;
@@ -3443,6 +3630,7 @@ absl::StatusOr<NodeControlUpdate> DecodeNodeControlUpdate(
 NodeControlState SelectNodeControlState(const FullDesiredState& source,
                                         std::string_view node_id) {
   NodeControlState state;
+  state.service = source.service;
   state.routing.revision = source.control_revision;
   state.routing.nodes = source.nodes;
   state.local.revision = source.control_revision;
@@ -3482,6 +3670,7 @@ NodeControlState SelectNodeControlState(const FullDesiredState& source,
 NodeControlUpdate DiffNodeControlState(const NodeControlState& previous,
                                        NodeControlState& next) {
   NodeControlUpdate update;
+  update.service = next.service;
   const auto diff = [](const auto& old_value, auto& new_value, auto& change) {
     new_value.revision = old_value.revision;
     if (old_value != new_value) {
@@ -3542,6 +3731,9 @@ NodeControlUpdate DiffNodeControlState(const NodeControlState& previous,
 
 absl::Status ApplyNodeControlUpdate(NodeControlState& state,
                                     const NodeControlUpdate& update) {
+  if (state.service != update.service) {
+    return absl::FailedPreconditionError("cluster service declaration changed");
+  }
   // Validate the entire request before publishing any module. A gap in the
   // task delta requires reconnect/bootstrap; complete objects can skip
   // revisions.

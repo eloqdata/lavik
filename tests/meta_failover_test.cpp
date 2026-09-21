@@ -84,7 +84,9 @@ struct ProposalFixture {
 
   ProposalFixture() {
     const MetaOperationId root = Bytes<16>(0x01);
-    EXPECT_TRUE(stores.topology_.BeginClusterCreate(root, 1).ok());
+    EXPECT_TRUE(stores.topology_
+                    .BeginClusterCreate(root, 1, lavik::ClientMode::kCluster)
+                    .ok());
     PutPolicy automatic;
     automatic.request_id_ = Bytes<16>(0x0f);
     automatic.policy_id_ = std::string(kAutomaticUncontrolledFailoverPolicyId);

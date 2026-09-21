@@ -123,8 +123,8 @@ successful response. A success is accepted only when both durability and the
 authority-at-decision evidence are true.
 
 `population_integration_test.cpp` is the current real-process cluster-admission
-test: it proves `meta-managed yes` starts LOADING, permits `PING`, and rejects
-standalone `REPLICAOF`. `replication_group_test.cpp` covers directive
+test: it proves a configured Meta seed keeps Redis closed until bootstrap can
+obtain the committed mode, and that this wait responds to shutdown. `replication_group_test.cpp` covers directive
 monotonicity, one-group assignment, safe-source/reset authorization, complete
 physical reset, sparse-manifest handoff, logical-to-local epoch matching,
 all-flow cuts, ready/fail-stop publication, proof invalidation, and a fresh

@@ -75,14 +75,40 @@ def restart(fixture, data, fault=None):
 
 
 class StartupProxy(H.Proxy):
-    """Observe every connection attempt, including one before recovery pauses."""
+    """Distinguish pre-storage bootstrap from the full control session."""
 
     def __init__(self, target_port):
         super().__init__("recovery-startup", target_port)
         self.connected = threading.Event()
+        self.bootstrapped = threading.Event()
 
     def _on_accept(self, conn):
-        self.connected.set()
+        # Peek without consuming bytes so the ordinary proxy forwards the
+        # original frame. A TCP accept alone is expected before storage opens:
+        # BootstrapHello (20) obtains mode without creating a Data session.
+        # Treat any other prefix as control work, including malformed input,
+        # so a protocol change cannot silently weaken the startup assertion.
+        deadline = time.monotonic() + 3
+        conn.settimeout(0.2)
+        prefix = b""
+        try:
+            while len(prefix) < 8 and time.monotonic() < deadline:
+                try:
+                    prefix = conn.recv(8, socket.MSG_PEEK)
+                except socket.timeout:
+                    continue
+                if not prefix:
+                    break
+                if len(prefix) < 8:
+                    time.sleep(0.005)
+        except OSError:
+            conn.close()
+            return
+        conn.settimeout(None)
+        if prefix == b"LVCP\x00\x01\x00\x14":
+            self.bootstrapped.set()
+        else:
+            self.connected.set()
         super()._on_accept(conn)
 
 
@@ -100,10 +126,12 @@ def restart_at_recovery_barrier(fixture, data, workdir, *, stop=False):
             data.start(wait_ready=False)
         H.wait_until("population recovery reaches the install barrier", 20,
                      lambda: os.path.exists(barrier))
+        if not proxy.bootstrapped.is_set():
+            raise H.Failure("population recovery began without mode bootstrap")
         # Keep recovery suspended across many control-client scheduler turns.
-        # No Meta connection may start, even before the install marker appears.
+        # No full session may start, even before the install marker appears.
         if proxy.connected.wait(timeout=1):
-            raise H.Failure("Meta connected before population recovery completed")
+            raise H.Failure("Meta session opened before population recovery completed")
         if data.proc.poll() is not None:
             raise H.Failure("Data exited while population recovery was held")
         if stop:
@@ -123,10 +151,10 @@ def restart_at_recovery_barrier(fixture, data, workdir, *, stop=False):
             if "all storage buffers durably flushed" in shutdown_log:
                 raise H.Failure("interrupted recovery published a clean checkpoint")
             if proxy.connected.is_set():
-                raise H.Failure("Meta connected during interrupted startup")
+                raise H.Failure("Meta session opened during interrupted startup")
             return proxy
         os.unlink(barrier)
-        H.wait_until("Meta connects after population recovery", 20,
+        H.wait_until("Meta session opens after population recovery", 20,
                      proxy.connected.is_set)
         return proxy
     except BaseException:

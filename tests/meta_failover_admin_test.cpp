@@ -101,6 +101,7 @@ ClusterStatusWireV1 ReadyStatus() {
                      .topology_epoch_ = 3};
   status.cluster_state_ = ClusterStateWireV1::kCreated;
   status.lifecycle_revision_ = 2;
+  status.client_mode_ = ClientMode::kCluster;
   status.root_operation_id_ = "00112233445566778899aabbccddeeff";
   status.genesis_commit_index_ = 10;
   status.meta_available_ = true;

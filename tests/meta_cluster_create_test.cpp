@@ -34,6 +34,7 @@ constexpr std::string_view kNodeC = "2123456789abcdef0123456789abcdef01234567";
 constexpr std::string_view kNodeD = "3123456789abcdef0123456789abcdef01234567";
 constexpr std::string_view kValidManifest = R"toml(
 schema_version = 1
+client_mode = "cluster"
 slot_strategy = "contiguous-even"
 
 [[meta_members]]
@@ -87,7 +88,8 @@ std::string ReplaceOnce(std::string input, std::string_view from,
 
 std::string AutoManifest(std::size_t count) {
   std::string result =
-      "schema_version = 1\nslot_strategy = \"contiguous-even\"\n"
+      "schema_version = 1\nclient_mode = \"cluster\"\nslot_strategy = "
+      "\"contiguous-even\"\n"
       "[[meta_members]]\nid = 1\n"
       "raft_endpoint = \"tcp://127.0.0.1:7101\"\n"
       "data_control_endpoint = \"tcp://127.0.0.1:7301\"\n"
@@ -128,6 +130,37 @@ TEST(ClusterCreateManifestTest, NormalizesMultipleGroupsAndAllocatesSlots) {
             (ClusterCreateManifestV1::SlotRange{8192, 16383, "group-2"}));
   EXPECT_EQ(manifest->automatic_uncontrolled_failover_suspect_after_ms_, 5000u);
   EXPECT_EQ(manifest->authority_lease_duration_ms_, 5000u);
+}
+
+TEST(ClusterCreateManifestTest, RequiresExplicitClientServiceMode) {
+  EXPECT_FALSE(
+      ParseClusterCreateManifest(ReplaceOnce(std::string(kValidManifest),
+                                             "client_mode = \"cluster\"\n", ""))
+          .ok());
+  EXPECT_TRUE(ParseClusterCreateManifest(kValidManifest).ok());
+  EXPECT_FALSE(
+      ParseClusterCreateManifest(ReplaceOnce(std::string(kValidManifest),
+                                             "client_mode = \"cluster\"",
+                                             "client_mode = \"single\""))
+          .ok());
+  for (const auto mode : {ClientMode::kSingle, ClientMode::kCluster}) {
+    const auto manifest = ParseClusterCreateManifest(ReplaceOnce(
+        AutoManifest(1), "client_mode = \"cluster\"",
+        "client_mode = \"" + std::string(ClientModeName(mode)) + "\""));
+    ASSERT_TRUE(manifest.ok()) << manifest.status();
+    EXPECT_EQ(manifest->client_mode_, mode);
+    const auto encoded = EncodeClusterCreateRequest(*manifest, OperationId(9));
+    ASSERT_TRUE(encoded.ok()) << encoded.status();
+    MetaOperationId root{};
+    const auto decoded = DecodeClusterCreateRequest(*encoded, &root);
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    EXPECT_EQ(decoded->client_mode_, mode);
+  }
+  EXPECT_FALSE(
+      ParseClusterCreateManifest(ReplaceOnce(std::string(kValidManifest),
+                                             "client_mode = \"cluster\"",
+                                             "client_mode = \"invalid\""))
+          .ok());
 }
 
 TEST(ClusterCreateManifestTest,
@@ -206,6 +239,7 @@ TEST(ClusterCreateManifestTest, AllocatesNonDivisorGroupCountsExactly) {
 TEST(ClusterCreateManifestTest, ExplicitRangesAreCanonicalAndFullyCovered) {
   constexpr std::string_view text = R"toml(
 schema_version = 1
+client_mode = "cluster"
 [[meta_members]]
 id = 1
 raft_endpoint = "tcp://127.0.0.1:7101"
@@ -250,7 +284,8 @@ group = "group-1"
 TEST(ClusterCreateManifestTest, InputOrderCannotChangeNormalizedWire) {
   const auto manifest = [](bool shuffled) {
     std::string text =
-        "schema_version = 1\nslot_strategy = \"contiguous-even\"\n"
+        "schema_version = 1\nclient_mode = \"cluster\"\nslot_strategy = "
+        "\"contiguous-even\"\n"
         "[[meta_members]]\nid = 1\n"
         "raft_endpoint = \"tcp://127.0.0.1:7101\"\n"
         "data_control_endpoint = \"tcp://127.0.0.1:7301\"\n"
@@ -402,7 +437,8 @@ TEST(ClusterCreateManifestTest,
 
 TEST(ClusterCreateManifestTest, RejectsInvalidReplicaMembership) {
   const std::string base =
-      "schema_version = 1\nslot_strategy = \"contiguous-even\"\n"
+      "schema_version = 1\nclient_mode = \"cluster\"\nslot_strategy = "
+      "\"contiguous-even\"\n"
       "[[meta_members]]\nid = 1\n"
       "raft_endpoint = \"tcp://127.0.0.1:7101\"\n"
       "data_control_endpoint = \"tcp://127.0.0.1:7301\"\n"
@@ -723,6 +759,7 @@ TEST(ClusterCreateOperatorTest, RejectsActiveCreateBeforeMutation) {
   ClusterStatusWireV1 empty = EmptyStatus(head);
   empty.cluster_state_ = ClusterStateWireV1::kCreating;
   empty.lifecycle_revision_ = 1;
+  empty.client_mode_ = ClientMode::kCluster;
   empty.root_operation_id_ = "00112233445566778899aabbccddeeff";
   empty.genesis_commit_index_ = 8;
   empty.cluster_create_phase_ = "register-data";
@@ -786,8 +823,10 @@ TEST(ClusterCreateOperatorTest,
       status.root_operation_id_ = "00112233445566778899aabbccddeeff";
       status.genesis_commit_index_ = 8;
       status.lifecycle_revision_ = 2;
+      status.client_mode_ = ClientMode::kCluster;
       if (state == ClusterStateWireV1::kCreating) {
         status.lifecycle_revision_ = 1;
+        status.client_mode_ = ClientMode::kCluster;
         status.cluster_create_phase_ = "register-data";
       } else if (state == ClusterStateWireV1::kProvisioningFailed) {
         status.provisioning_failure_summary_ = "initial population failed";

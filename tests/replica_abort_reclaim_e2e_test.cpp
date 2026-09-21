@@ -1017,9 +1017,8 @@ int main(int argc, char** argv) {
     else
       Check(argc == 1, "usage: replica_abort [--large-list|--large-hash]");
     const bool large = large_type != ValueType::kNone;
-    const std::string prefix =
-        large ? "/mnt/dev/lavik-native-large-"
-              : lavik::test::TestDataPath("lavik-replica-abort-reclaim-");
+    const std::string prefix = lavik::test::TestDataPath(
+        large ? "lavik-native-large-" : "lavik-replica-abort-reclaim-");
     ScopedDataFile data_file(prefix + std::to_string(::getpid()) + ".data");
     data_file.Create(large);
     const auto result = Run(data_file.path(), large_type);

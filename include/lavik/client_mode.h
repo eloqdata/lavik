@@ -16,10 +16,20 @@
 
 #pragma once
 
+#include <string_view>
+
 namespace lavik {
 
 // Startup-only Redis client semantics, independent of Meta ownership and
 // leases.
 enum class ClientMode { kSingle, kCluster };
+
+constexpr bool IsValidClientMode(ClientMode mode) noexcept {
+  return mode == ClientMode::kSingle || mode == ClientMode::kCluster;
+}
+
+constexpr std::string_view ClientModeName(ClientMode mode) noexcept {
+  return mode == ClientMode::kSingle ? "single" : "cluster";
+}
 
 }  // namespace lavik

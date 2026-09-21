@@ -15,7 +15,7 @@
 
 """Verify DB0-only cluster recovery and standalone DB15 across mode changes."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import os
 from pathlib import Path
 import signal
@@ -23,11 +23,55 @@ import socket
 import subprocess
 import sys
 import tempfile
+import struct
 import time
 
 sys.path.insert(0, str(Path(__file__).parent / "meta_integration"))
 import gate_failover as F
 import harness as H
+import gate_cluster_create as C
+
+
+class BootstrapOnly(H.Proxy):
+    """Use real committed bootstrap without authorizing population replacement."""
+    def _pump(self, src, dst, pair):
+        if src is pair[0]:
+            prefix = bytearray()
+            try:
+                while len(prefix) < 28:
+                    part = src.recv(28 - len(prefix))
+                    if not part:
+                        return
+                    prefix.extend(part)
+                _, _, kind = struct.unpack_from(">IHH", prefix)
+                if kind != 20:
+                    self._cut_pair(pair)
+                    return
+                dst.sendall(prefix)
+            except OSError:
+                self._cut_pair(pair)
+                return
+        super()._pump(src, dst, pair)
+
+
+@contextmanager
+def mode_source(directory, label, endpoint):
+    (directory / (label + "-meta")).mkdir()
+    meta = H.Node(C.META, str(directory / (label + "-meta")), 1,
+                  args=C.creation_raft_args())
+    proxy = BootstrapOnly("mode-bootstrap", meta.data_control_port)
+    meta.advertised_data_control_endpoint = proxy.endpoint
+    try:
+        proxy.start()
+        meta.start(bootstrap=True)
+        meta.wait_leader()
+        request = C.create_request(meta, "1" * 40, endpoint, "group")
+        reply = meta.ctl(request)
+        assert reply.startswith("OK clustercreate"), reply
+        yield proxy.endpoint
+    finally:
+        proxy.close()
+        meta.force_kill()
 
 
 @contextmanager
@@ -43,11 +87,12 @@ def server(binary, directory, label, *, cluster=False, checkpoint=False,
             "--rdb-dir", str(directory), "--logtostderr"]
     if checkpoint:
         args.append("--shutdown-checkpoint")
-    if cluster:
-        args += ["--client-mode", "cluster", "--meta-managed", "yes", "--node-id", "1" * 40,
-                 "--meta-seed", "127.0.0.1:9",
-                 "--announce-ip", "127.0.0.1"]
-    with log_path.open("w") as log:
+    with ExitStack() as stack:
+        if cluster:
+            seed = stack.enter_context(mode_source(directory, label, f"tcp://127.0.0.1:{port}"))
+            args += ["--node-id", "1" * 40, "--meta-seed", seed,
+                     "--announce-ip", "127.0.0.1"]
+        log = stack.enter_context(log_path.open("w"))
         process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
         connection = None
         try:
@@ -129,6 +174,7 @@ def exercise(binary, directory, checkpoint):
 
 
 def main():
+    C.META, C.CTL = map(os.path.abspath, sys.argv[2:4])
     with tempfile.TemporaryDirectory(
             prefix="lavik-database-modes-",
             dir=os.environ.get("LAVIK_TEST_DATA_DIR")) as workdir:

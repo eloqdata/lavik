@@ -2185,6 +2185,8 @@ struct MetaControlClientService::Impl {
       const std::shared_ptr<SessionState>& state,
       control::ControlSessionWriter& writer,
       const control::NodeControlUpdate& update) {
+    if (auto status = CheckClientService(update.service); !status.ok())
+      co_return status;
     auto next = std::make_shared<control::NodeControlState>(*state->desired_);
     if (auto status = control::ApplyNodeControlUpdate(*next, update);
         !status.ok())
@@ -2778,6 +2780,17 @@ struct MetaControlClientService::Impl {
     co_return absl::OkStatus();
   }
 
+  absl::Status CheckClientService(const control::ServiceDeclaration& service) {
+    auto status =
+        control::ValidateClientService(service, options_.capabilities_, true);
+    if (status.ok() && service != options_.service_) {
+      status = absl::FailedPreconditionError(
+          "Meta client service declaration changed after bootstrap");
+    }
+    if (!status.ok()) service_incompatible_ = true;
+    return status;
+  }
+
   bycorf::Task<detail::MetaSessionRunResult> RunSession(
       bycorf::Worker& worker, const MetaControlEndpoint& endpoint,
       bool* valid_heartbeat_ack) {
@@ -2832,6 +2845,8 @@ struct MetaControlClientService::Impl {
             .boot_id = replication_identity.boot_id_,
             .replication_history_id = replication_identity.local_history_id_,
             .replication_flow_count = options_.request_worker_count_,
+            .service = options_.service_,
+            .capabilities = options_.capabilities_,
         }));
     if (!hello_sent.ok()) {
       const bool expired = socket_deadline.Disarm();
@@ -2899,10 +2914,16 @@ struct MetaControlClientService::Impl {
         co_return identity;
       }
     }
+    if (hello->disposition == control::ServerHelloDisposition::kRejected) {
+      service_incompatible_ = true;
+      co_return absl::FailedPreconditionError(hello->rejection_reason);
+    }
     if (hello->disposition != control::ServerHelloDisposition::kAccepted) {
       directory_ = std::move(next_directory);
       co_return absl::UnavailableError("connected Meta node is not leader");
     }
+    if (auto status = CheckClientService(hello->service); !status.ok())
+      co_return status;
     if (!hello->leader_id.has_value() ||
         *hello->leader_id != hello->meta_server_id ||
         IsZero(hello->session_id) || hello->session_generation == 0 ||
@@ -2931,6 +2952,8 @@ struct MetaControlClientService::Impl {
       auto initial =
           co_await ReceiveFullState(frames, socket_deadline, progress_timeout);
       if (!initial.ok()) co_return initial.status();
+      if (auto status = CheckClientService(initial->service); !status.ok())
+        co_return status;
       if (control::DataHeartbeatIntervalMs(
               initial->authority_lease_duration_ms) >
           hello->observation_ttl_ms) {
@@ -3222,6 +3245,7 @@ struct MetaControlClientService::Impl {
   ReplicationManager& replication_;
   MetaEndpointDirectory directory_;
   std::atomic<bool> stopping_{false};
+  bool service_incompatible_ = false;  // worker zero only
   unsigned prepared_thread_count_ = 0;
   // Worker-zero-owned, first result wins. Stop can arrive while connected or
   // during reconnect delay; both paths must join the same preserve-nothing
@@ -3248,6 +3272,10 @@ MetaControlClientService::Create(MetaControlClientOptions options,
     return absl::InvalidArgumentError(
         "Meta control requires workers and at least one seed");
   }
+  if (auto status = control::ValidateClientService(options.service_,
+                                                   options.capabilities_, true);
+      !status.ok())
+    return status;
   std::vector<MetaControlEndpoint> seeds;
   seeds.reserve(options.seeds_.size());
   for (const std::string& seed : options.seeds_) {
@@ -3327,6 +3355,12 @@ bycorf::Task<absl::Status> MetaControlClientService::Run(
       const detail::MetaSessionRunResult session =
           co_await impl_->RunSession(worker, endpoint, &valid_ack);
       const absl::Status& reported = session.report_status();
+      if (impl_->service_incompatible_) {
+        run_status = reported;
+        impl_->stopping_.store(true, std::memory_order_release);
+        if (impl_->options_.incompatible_service_)
+          impl_->options_.incompatible_service_();
+      }
       if (!reported.ok() && reported.code() != absl::StatusCode::kCancelled) {
         spdlog::warn("Meta control session to {} ended: {}",
                      EndpointText(endpoint.host_, endpoint.port_),

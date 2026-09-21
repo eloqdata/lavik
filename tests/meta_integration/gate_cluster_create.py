@@ -20,6 +20,7 @@ Usage: gate_cluster_create.py META DATA CTL REDIS_CLI [workdir]
 
 import json
 import os
+from pathlib import Path
 import re
 import socket
 import ssl
@@ -78,7 +79,7 @@ def write_manifest(path, endpoint, metas):
         metas = [metas]
     with open(path, "w", encoding="utf-8") as output:
         output.write(
-            "schema_version = 1\n\n" +
+            'schema_version = 1\nclient_mode = "cluster"\n\n' +
             "\n".join(meta_manifest_lines(*metas)) +
             "[[data_nodes]]\n"
             f'id = "{DATA_NODE}"\n'
@@ -142,7 +143,7 @@ def create_request(meta, node_id, endpoint, group_id, meta_id=None,
     operation_id = operation_id or os.urandom(16)
     # Direct admission/recovery cases construct the same current v1 durable
     # intent as the CLI. Older persisted layouts are deliberately unsupported.
-    payload = struct.pack(">H", 1) + operation_id
+    payload = struct.pack(">H", 1) + operation_id + struct.pack(">H", 2)
     payload += struct.pack(">III", 5000, 5000, 2000)
     payload += struct.pack(">I", len(metas))
     for member in sorted(metas, key=lambda item: item.id):
@@ -203,12 +204,15 @@ class InitialProjectionBarrier(H.Proxy):
                     if not chunk:
                         raise H.Failure("Meta closed before ServerHello")
                     prefix += chunk
-                if (struct.unpack_from(">IHH", prefix) != (0x4c564350, 1, 2) or
-                        prefix[28] != 1):
-                    raise H.Failure("expected an accepted v1 ServerHello")
-                self.blocked.set()
-                if not self.release.wait(8):
-                    raise H.Failure("initial projection barrier timed out")
+                magic, version, kind = struct.unpack_from(">IHH", prefix)
+                if magic != 0x4c564350 or version != 1:
+                    raise H.Failure("expected a v1 control frame")
+                # Read-only bootstrap and follower redirects precede the
+                # regular session and must not hold creation behind storage.
+                if kind == 2 and prefix[28] == 1:
+                    self.blocked.set()
+                    if not self.release.wait(8):
+                        raise H.Failure("initial projection barrier timed out")
                 dst.sendall(prefix)
             except (OSError, H.Failure) as error:
                 self.error = str(error)
@@ -798,7 +802,7 @@ def run_five_meta_response_loss_case(workdir):
 
 def write_multi_manifest(path, nodes, automatic, meta):
     by_id = {node.node_id: node for node in nodes}
-    lines = ["schema_version = 1"]
+    lines = ["schema_version = 1", 'client_mode = "cluster"']
     if automatic:
         lines.append('slot_strategy = "contiguous-even"')
     lines.extend([""] + meta_manifest_lines(meta))
@@ -1288,6 +1292,20 @@ def run_multi_group_case(workdir, automatic, interactive,
                     f"creating status omitted guidance: {status_result}")
             H.log(f"{name}: accepted create stayed incomplete; status named "
                   "the blocked Group/Node and next action")
+            # Genesis acceptance can precede bootstrap/local recovery. This
+            # case checks blocked creation, then ordinary clean shutdown;
+            # interruption during recovery has a separate fail-closed gate.
+            def local_recovery_complete():
+                for node in started_nodes:
+                    if not node.alive():
+                        return False
+                    log = Path(node.log_path).read_text()
+                    if any(f"worker[{worker}] direct-IO storage initialized"
+                           not in log for worker in range(node.workers)):
+                        return False
+                return True
+            H.wait_until("started Data nodes finish local recovery", 20,
+                         local_recovery_complete)
             for node in started_nodes:
                 node.terminate()
             meta.terminate()
@@ -1419,7 +1437,7 @@ def run_tls_create_case(workdir, tls_only):
             DATA, os.path.join(scenario, f"data-{index}"), node_id,
             meta.data_control_endpoint, tls=(ca, cert, key), tls_only=tls_only))
     manifest = os.path.join(scenario, "cluster.toml")
-    lines = (['schema_version = 1', 'slot_strategy = "contiguous-even"'] +
+    lines = (['schema_version = 1', 'client_mode = "cluster"', 'slot_strategy = "contiguous-even"'] +
              meta_manifest_lines(meta))
     for node in nodes:
         lines.extend(['[[data_nodes]]', f'id = "{node.node_id}"'])
@@ -1492,7 +1510,7 @@ def run_group_id_probe_case(workdir):
     manifest = os.path.join(scenario, "cluster.toml")
     # Keep a delimiter-like character in the durable identifier so the
     # lifecycle path proves it does not reinterpret Group ids as probe keys.
-    lines = (['schema_version = 1', 'slot_strategy = "contiguous-even"'] +
+    lines = (['schema_version = 1', 'client_mode = "cluster"', 'slot_strategy = "contiguous-even"'] +
              meta_manifest_lines(meta))
     for node, group_id in zip(nodes, ("group-2}", "z")):
         lines.extend(['[[data_nodes]]', f'id = "{node.node_id}"',
@@ -1561,14 +1579,15 @@ class DirectiveBarrier(H.Proxy):
                 if magic != 0x4c564350 or version != 1 or size > (1 << 20):
                     raise H.Failure("unexpected control frame")
                 payload = exact(size)
-                # NodeControlUpdate starts with request id and optional task delta.
+                # NodeControlUpdate starts with a 25-byte service declaration,
+                # then request id and optional task delta.
                 # The barrier holds the actual task delivery, whose body is no
                 # longer resent as a separate Directive after FDS installation.
                 task_offset = None
-                if kind == 19 and len(payload) >= 37 and payload[16]:
-                    upserts = struct.unpack_from(">I", payload, 33)[0]
+                if kind == 19 and len(payload) >= 62 and payload[41]:
+                    upserts = struct.unpack_from(">I", payload, 58)[0]
                     if upserts:
-                        task_offset = 37
+                        task_offset = 62
                 if (self.result and kind == 14) or (not self.result and task_offset is not None):
                     blocked, release = self.blocked, self.release
                     if self.recipients:

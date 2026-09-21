@@ -1816,6 +1816,11 @@ absl::Status NodeControlInstaller::InvalidateSessionNow(
   // already inside NodeControlActions when this generation advanced.
   InvalidateDirectiveAdmissions();
   authority_.InvalidateSession(session);
+  // Session retirement also revokes optional recovery scopes. The cached
+  // committed intent is no longer proof that those effects remain installed;
+  // an equal projection from the replacement session must reconcile it again.
+  // Replication retains the action identity and its original recovery deadline.
+  cluster_control_reconciled_ = false;
   RetireAllLeaseSchedules();
   return absl::OkStatus();
 }

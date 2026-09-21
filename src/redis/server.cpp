@@ -60,6 +60,7 @@
 #include "bycorf/runtime/sync.h"
 #include "client_limit.h"
 #include "function_catalog.h"
+#include "lavik/cluster/bootstrap.h"
 #include "lavik/cluster/meta_client.h"
 #include "lavik/cluster/runtime.h"
 #include "lavik/command.h"
@@ -499,6 +500,15 @@ absl::Status InstallShutdownSignalHandler() {
     g_signal_event_fd = -1;
     return absl::Status(absl::StatusCode::kInternal, "sigaction setup failed");
   }
+  // OpenSSL's synchronous socket BIO cannot use MSG_NOSIGNAL. Bootstrap must
+  // observe EPIPE/TLS status and retry a peer restart, rather than terminate
+  // before the worker runtime exists. Other socket writers also handle EPIPE.
+  action.sa_handler = SIG_IGN;
+  if (sigaction(SIGPIPE, &action, nullptr) != 0) {
+    close(g_signal_event_fd);
+    g_signal_event_fd = -1;
+    return absl::InternalError("SIGPIPE setup failed");
+  }
   return absl::OkStatus();
 }
 
@@ -508,6 +518,7 @@ void CleanupShutdownSignalHandler() noexcept {
   action.sa_handler = SIG_DFL;
   (void)sigaction(SIGINT, &action, nullptr);
   (void)sigaction(SIGTERM, &action, nullptr);
+  (void)sigaction(SIGPIPE, &action, nullptr);
   if (g_signal_event_fd >= 0) {
     close(g_signal_event_fd);
     g_signal_event_fd = -1;
@@ -2122,6 +2133,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
 }  // namespace
 
 int RunServer(ServerOptions options) {
+  options.meta_managed_ = !options.meta_seeds_.empty();
+  options.client_mode_ = ClientMode::kSingle;
   const absl::Status validated = ValidateServerOptions(options);
   if (!validated.ok()) {
     spdlog::error("configuration error: {}", validated.message());
@@ -2141,7 +2154,6 @@ int RunServer(ServerOptions options) {
   // Meta management delegates population lifecycle to NodeControl and
   // disables standalone replication control and export.
   options.replication_options_.meta_managed_ = options.meta_managed_;
-  cluster::SetClientMode(options.client_mode_);
   auto allowed_max_clients = MaxClientsAllowedByFileLimit(options.max_clients_);
   if (!allowed_max_clients.ok()) {
     spdlog::error("maxclients file-descriptor setup failed: {}",
@@ -2353,6 +2365,33 @@ int RunServer(ServerOptions options) {
   }
 
   storage::StorageEngineOptions storage_options;
+  cluster::control::ServiceDeclaration service_declaration;
+  auto service_capabilities = cluster::SupportedClientServiceCapabilities();
+  if (options.meta_managed_) {
+    cluster::DataBootstrapOptions bootstrap{
+        .seeds = options.meta_seeds_,
+        .node_id = options.node_id_,
+        .capabilities = service_capabilities,
+        .cancel_fd = g_signal_event_fd};
+    if (options.tls_replication_) {
+      bootstrap.tls =
+          net::SyncTlsOptions{.ca_file_ = options.tls_ca_cert_file_,
+                              .certificate_file_ = options.tls_cert_file_,
+                              .private_key_file_ = options.tls_key_file_};
+    }
+    auto mode = cluster::BootstrapClientService(bootstrap);
+    if (!mode.ok()) {
+      spdlog::error("Meta bootstrap ended: {}", mode.status().message());
+      CleanupShutdownSignalHandler();
+      return absl::IsCancelled(mode.status()) ? 0 : 1;
+    }
+    service_declaration = *mode;
+    options.client_mode_ = *mode->client_mode;
+    spdlog::info("Meta committed client mode: {}",
+                 ClientModeName(options.client_mode_));
+  }
+  cluster::SetClientMode(options.client_mode_);
+  options.replication_options_.client_mode_ = options.client_mode_;
   storage_options.database_count_ = options.client_mode_ == ClientMode::kCluster
                                         ? 1
                                         : storage::kLogicalDatabaseCount;
@@ -2391,6 +2430,8 @@ int RunServer(ServerOptions options) {
     CleanupShutdownSignalHandler();
     return 1;
   }
+  service_capabilities.installed_mode = options.client_mode_;
+  service_capabilities.database_count = storage.database_count();
   options.replication_options_.listen_port_ = options.port_;
   if (options.tls_replication_ && options.tls_port_ != 0) {
     options.replication_options_.listen_port_ = options.tls_port_;
@@ -2464,6 +2505,9 @@ int RunServer(ServerOptions options) {
             .request_worker_count_ = options.thread_count_,
             .tls_context_ =
                 options.tls_replication_ ? tls_client_context : nullptr,
+            .service_ = service_declaration,
+            .capabilities_ = service_capabilities,
+            .incompatible_service_ = [] { ShutdownSignalHandler(0); },
         },
         cluster::GetClusterRuntime()->node_control_installer_,
         cluster::GetClusterRuntime()->topology_cache_, replication);

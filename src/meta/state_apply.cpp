@@ -294,7 +294,8 @@ bool LiveClusterCreateRootMatchesLifecycle(
   }
   MetaOperationId intent_root{};
   const auto manifest = DecodeClusterCreateRequest(root.intent_, &intent_root);
-  return manifest.ok() && intent_root == lifecycle.root_operation_id_;
+  return manifest.ok() && intent_root == lifecycle.root_operation_id_ &&
+         manifest->client_mode_ == lifecycle.client_mode_;
 }
 
 bool ExistingClusterCreateEffectMatches(const MetaStores& stores,
@@ -2403,6 +2404,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       absl::StrCat("SubmitOperation kind=", cmd.kind_,
                    " id=", HexBytes(cmd.operation_id_), " seq=", log_index);
   const bool creation = cmd.kind_ == kMetaClusterCreateOperationKind;
+  std::optional<ClientMode> creation_mode;
   std::optional<std::string> failover_group_id;
   const auto& lifecycle = stores.topology_.ClusterLifecycle();
   if (cmd.kind_ == kFailoverOperationKind &&
@@ -2431,13 +2433,13 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   }
   if (creation) {
     MetaOperationId intent_root{};
-    if (const auto manifest =
-            DecodeClusterCreateRequest(cmd.intent_, &intent_root);
-        !manifest.ok()) {
+    const auto manifest = DecodeClusterCreateRequest(cmd.intent_, &intent_root);
+    if (!manifest.ok()) {
       return Rejected(absl::StrCat("invalid canonical cluster-create intent: ",
                                    manifest.status().message()),
                       std::move(summary));
     }
+    creation_mode = manifest->client_mode_;
     if (intent_root != cmd.operation_id_) {
       return Rejected("cluster-create intent root id mismatch",
                       std::move(summary));
@@ -2464,8 +2466,8 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
     const auto result = stores.operation_.SubmitOperation(injected, log_index);
     if (!result.ok()) return Rejected(result.status(), std::move(summary));
     if (creation) {
-      if (const absl::Status status =
-              stores.topology_.BeginClusterCreate(cmd.operation_id_, log_index);
+      if (const absl::Status status = stores.topology_.BeginClusterCreate(
+              cmd.operation_id_, log_index, *creation_mode);
           !status.ok()) {
         return Rejected(status, std::move(summary));
       }
@@ -2521,8 +2523,8 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   const auto result = stores.operation_.SubmitOperation(injected, log_index);
   if (!result.ok()) return Rejected(result.status(), std::move(summary));
   if (creation) {
-    if (const absl::Status status =
-            stores.topology_.BeginClusterCreate(cmd.operation_id_, log_index);
+    if (const absl::Status status = stores.topology_.BeginClusterCreate(
+            cmd.operation_id_, log_index, *creation_mode);
         !status.ok()) {
       return Rejected(status, std::move(summary));
     }

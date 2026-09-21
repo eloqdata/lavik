@@ -95,6 +95,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "lavik/client_mode.h"
 #include "lavik/meta/commands.h"
 #include "lavik/meta/encoding.h"
 
@@ -114,6 +115,9 @@ enum class MetaClusterLifecycle : std::uint8_t {
 
 struct MetaClusterLifecycleState {
   MetaClusterLifecycle state_ = MetaClusterLifecycle::kUninitialized;
+  // Absent only before Genesis. This declaration is immutable, independent
+  // of readiness and retained after the creation operation is archived.
+  std::optional<ClientMode> client_mode_;
   MetaOperationId root_operation_id_{};
   std::uint64_t genesis_commit_index_ = 0;
   std::string failure_summary_;
@@ -169,7 +173,8 @@ class MetaTopologyStore {
   // Cluster creation never advances topology_epoch.
   // Exact calls replay as no-ops; Created and ProvisioningFailed are terminal.
   absl::Status BeginClusterCreate(const MetaOperationId& root_operation_id,
-                                  std::uint64_t genesis_commit_index);
+                                  std::uint64_t genesis_commit_index,
+                                  ClientMode client_mode);
   absl::Status CompleteClusterCreate(const MetaOperationId& root_operation_id);
   absl::Status FailClusterCreate(const MetaOperationId& root_operation_id,
                                  std::string failure_summary);

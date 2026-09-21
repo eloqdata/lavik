@@ -1751,9 +1751,17 @@ absl::Status ValidateHello(const control::ClientHello& hello) {
   return absl::OkStatus();
 }
 
+control::ServiceDeclaration CommittedClientService(
+    const MetaCommittedView& view) {
+  const auto& lifecycle = view.topology().ClusterLifecycle();
+  return {lifecycle.client_mode_, lifecycle.root_operation_id_,
+          lifecycle.genesis_commit_index_};
+}
+
 control::ServerHello BuildServerHello(
     const MetaDataControlServer::Core& core,
-    std::vector<control::WireMetaEndpoint> directory, bool accepted,
+    std::vector<control::WireMetaEndpoint> directory,
+    const control::ServiceDeclaration& service, bool accepted,
     const control::WireId128& session_id = {},
     std::uint64_t session_generation = 0) {
   const std::int32_t leader = core.server_->get_leader();
@@ -1783,6 +1791,7 @@ control::ServerHello BuildServerHello(
       .directory = std::move(directory),
       .observation_ttl_ms = core.options_.observation_ttl_ms_,
       .session_progress_timeout_ms = core.options_.session_progress_timeout_ms_,
+      .service = service,
   };
 }
 
@@ -3404,6 +3413,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   auto handshake_deadline = ArmDeadline(
       *core->worker_, connection, kHandshakeTimeout, "TLS and ClientHello");
   std::optional<MetaPrincipalIdentity> tls_identity;
+  absl::Status tls_identity_status;
   if (core->tls_context_ != nullptr) {
     const absl::Status tls =
         co_await stream.StartTls(core->tls_context_, /*server=*/true);
@@ -3413,28 +3423,92 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
     }
     auto sans = stream.PeerCertificateUriSans();
     if (!sans.ok()) {
-      handshake_deadline->complete_ = true;
-      co_return finish(sans.status());
+      tls_identity_status = sans.status();
+    } else if (sans->size() != 1) {
+      tls_identity_status = absl::UnauthenticatedError(
+          "data-control client must present exactly one URI SAN");
+    } else {
+      auto identity = AuthenticateMetaUriSans(*sans);
+      if (!identity.ok()) {
+        tls_identity_status = identity.status();
+      } else if (identity->role_ != MetaPrincipalRole::kDataNode) {
+        tls_identity_status = absl::PermissionDeniedError(
+            "control certificate is not a data-node identity");
+      } else {
+        tls_identity = std::move(*identity);
+      }
     }
-    if (sans->size() != 1) {
-      handshake_deadline->complete_ = true;
-      co_return finish(absl::UnauthenticatedError(
-          "data-control client must present exactly one URI SAN"));
-    }
-    auto identity = AuthenticateMetaUriSans(*sans);
-    if (!identity.ok() || identity->role_ != MetaPrincipalRole::kDataNode) {
-      handshake_deadline->complete_ = true;
-      co_return finish(
-          identity.ok() ? absl::PermissionDeniedError(
-                              "control certificate is not a data-node identity")
-                        : identity.status());
-    }
-    tls_identity = std::move(*identity);
   }
 
   auto hello_message = co_await io.ReadHandshake();
   handshake_deadline->complete_ = true;
   if (!hello_message.ok()) co_return finish(hello_message.status(), true);
+  if (const auto* bootstrap =
+          std::get_if<control::BootstrapHello>(&*hello_message)) {
+    if (!tls_identity_status.ok()) {
+      // The CA accepted this certificate, but its application identity is
+      // invalid. A bare EOF would make bootstrap retry forever as if Meta had
+      // restarted. Reject explicitly without disclosing committed topology
+      // or claiming a Data session. The existing handshake deadline bounds
+      // how long an invalid principal can wait to identify its request type.
+      control::BootstrapReply reply;
+      reply.server = BuildServerHello(*core, {}, {}, false);
+      reply.disposition = control::BootstrapDisposition::kUnauthorized;
+      reply.server.rejection_reason =
+          std::string(tls_identity_status.message());
+      const auto sent =
+          co_await io.Send(control::MessagePriority::kReliable,
+                           control::WireMessage(std::move(reply)));
+      co_return finish(sent.ok() ? tls_identity_status : sent);
+    }
+    // This branch deliberately precedes node-slot claims, session adoption,
+    // projections and lease installation. Storage/history do not exist yet.
+    auto captured =
+        CommittedViewAtLeast(*core, core->coordinator_->CommittedHighWater());
+    if (!captured.ok()) co_return finish(captured.status());
+    const auto& view = **captured;
+    auto directory = BuildCommittedMetaDirectory(view);
+    if (!directory.ok()) co_return finish(directory.status());
+    const bool leader =
+        core->leader_ready_for_data_ &&
+        AuthoritySessionsAllowed(*core, core->leadership_generation_);
+    control::BootstrapReply reply;
+    reply.server = BuildServerHello(*core, std::move(*directory),
+                                    CommittedClientService(view), leader);
+    const auto node = view.identity().FindNode(bootstrap->node_id);
+    const bool wrong_identity =
+        tls_identity &&
+        (tls_identity->subject_id_ != bootstrap->node_id ||
+         (node && tls_identity->principal_ != node->principal_));
+    if (wrong_identity || (node && node->retired_)) {
+      // An identity that contradicts the committed binding must not learn
+      // committed topology or service metadata. Mirror the TLS-identity
+      // failure branch above; the kRetry path below intentionally keeps the
+      // directory so unregistered nodes can discover the leader.
+      reply.server = BuildServerHello(*core, {}, {}, false);
+      reply.disposition = control::BootstrapDisposition::kUnauthorized;
+      reply.server.rejection_reason =
+          "Data identity does not match active committed binding";
+    } else if (bootstrap->minimum_version > control::kProtocolVersion ||
+               bootstrap->maximum_version < control::kProtocolVersion) {
+      reply.disposition = control::BootstrapDisposition::kIncompatible;
+      reply.server.rejection_reason = "no supported control protocol version";
+    } else if (!leader || !node || !reply.server.service.client_mode) {
+      reply.disposition = control::BootstrapDisposition::kRetry;
+      reply.server.rejection_reason =
+          "waiting for leader, cluster creation or Data registration";
+    } else if (auto status = control::ValidateClientService(
+                   reply.server.service, bootstrap->capabilities, false);
+               !status.ok()) {
+      reply.disposition = control::BootstrapDisposition::kIncompatible;
+      reply.server.rejection_reason = std::string(status.message());
+    } else {
+      reply.disposition = control::BootstrapDisposition::kReady;
+    }
+    co_return finish(co_await io.Send(control::MessagePriority::kReliable,
+                                      control::WireMessage(std::move(reply))));
+  }
+  if (!tls_identity_status.ok()) co_return finish(tls_identity_status);
   const auto* hello = std::get_if<control::ClientHello>(&*hello_message);
   if (hello == nullptr) {
     co_return finish(absl::InvalidArgumentError("expected ClientHello"), true);
@@ -3468,19 +3542,34 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   }
   auto directory = BuildCommittedMetaDirectory(*view);
   if (!directory.ok()) co_return finish(directory.status());
+  const auto committed_service = CommittedClientService(*view);
   const bool accepted_leader =
       core->leader_ready_for_data_ &&
       AuthoritySessionsAllowed(*core, core->leadership_generation_);
   if (!accepted_leader) {
-    const absl::Status sent =
-        co_await io.Send(control::MessagePriority::kReliable,
-                         control::WireMessage(BuildServerHello(
-                             *core, std::move(*directory), false)));
+    const absl::Status sent = co_await io.Send(
+        control::MessagePriority::kReliable,
+        control::WireMessage(BuildServerHello(*core, std::move(*directory),
+                                              committed_service, false)));
     core->redirected_sessions_.fetch_add(1, std::memory_order_relaxed);
     redirected_session = true;
     // The completion guard releases the permit only after the bounded write
     // completes, so repeated valid Hellos cannot accumulate redirect tasks.
     co_return finish(sent);
+  }
+
+  const auto compatible = control::ValidateClientService(
+      committed_service, hello->capabilities, true);
+  if (!compatible.ok() || hello->service != committed_service) {
+    auto rejection = BuildServerHello(*core, std::move(*directory),
+                                      committed_service, false);
+    rejection.disposition = control::ServerHelloDisposition::kRejected;
+    rejection.rejection_reason =
+        compatible.ok() ? "cluster service declaration changed after bootstrap"
+                        : std::string(compatible.message());
+    co_return finish(
+        co_await io.Send(control::MessagePriority::kReliable,
+                         control::WireMessage(std::move(rejection))));
   }
 
   // One leader-scoped subscription fans out an O(1) cursor notification to
@@ -3500,6 +3589,10 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
       CommittedViewAtLeast(*core, core->coordinator_->CommittedHighWater());
   if (!cached_view.ok()) co_return finish(cached_view.status());
   view = *cached_view;
+  if (CommittedClientService(*view) != committed_service) {
+    co_return finish(absl::FailedPreconditionError(
+        "cluster service declaration changed during handshake"));
+  }
 
   // The first registry/directory read was sufficient for a follower redirect,
   // but an accepted session must bind its identity and Hello to the same
@@ -3569,8 +3662,8 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   if (absl::Status sent =
           co_await io.Send(control::MessagePriority::kReliable,
                            control::WireMessage(BuildServerHello(
-                               *core, std::move(*directory), true, *session_id,
-                               session_generation)));
+                               *core, std::move(*directory), committed_service,
+                               true, *session_id, session_generation)));
       !sent.ok()) {
     co_return finish(sent);
   }

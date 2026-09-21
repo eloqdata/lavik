@@ -267,6 +267,13 @@ absl::Status ValidateAutomaticFailoverDiagnostics(
 }
 
 absl::Status ValidateClusterLifecycle(const ClusterStatusWireV1& status) {
+  const bool initialized =
+      status.cluster_state_ != ClusterStateWireV1::kUninitialized &&
+      status.cluster_state_ != ClusterStateWireV1::kNonPristine;
+  if (initialized != status.client_mode_.has_value() ||
+      (status.client_mode_ && !IsValidClientMode(*status.client_mode_))) {
+    return absl::InvalidArgumentError("inconsistent cluster client mode");
+  }
   const bool has_identity = status.root_operation_id_.has_value() &&
                             status.genesis_commit_index_.has_value() &&
                             *status.genesis_commit_index_ != 0 &&
@@ -947,6 +954,9 @@ absl::StatusOr<std::string> EncodeClusterStatusReply(
   writer.U64(status.capture_.committed_index_);
   writer.U64(status.capture_.topology_epoch_);
   writer.U8(static_cast<std::uint8_t>(status.cluster_state_));
+  writer.U8(status.client_mode_
+                ? static_cast<std::uint8_t>(*status.client_mode_) + 1
+                : 0);
   writer.U64(status.lifecycle_revision_);
   if (absl::Status wrote = OptionalString(writer, status.root_operation_id_);
       !wrote.ok()) {
@@ -1072,6 +1082,12 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
     return absl::DataLossError("invalid cluster lifecycle state");
   }
   status.cluster_state_ = static_cast<ClusterStateWireV1>(*cluster_state);
+  auto client_mode = reader.U8();
+  if (!client_mode.ok()) return client_mode.status();
+  if (*client_mode > 2)
+    return absl::DataLossError("invalid cluster client mode");
+  if (*client_mode != 0)
+    status.client_mode_ = static_cast<ClientMode>(*client_mode - 1);
   auto lifecycle_revision = reader.U64();
   if (!lifecycle_revision.ok()) return lifecycle_revision.status();
   status.lifecycle_revision_ = *lifecycle_revision;
@@ -1401,6 +1417,7 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
     json += ",\"cluster_ready\":false,\"capture\":null";
     json += ",\"meta_members\":[],\"data_nodes\":[],\"groups\":[]";
     json += ",\"cluster_state\":null,\"lifecycle_revision\":null";
+    json += ",\"client_mode\":null";
     json += ",\"root_operation_id\":null,\"genesis_commit_index\":null";
     json += ",\"cluster_create_phase\":null";
     json += ",\"provisioning_failure_summary\":null";
@@ -1417,6 +1434,9 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
   json +=
       ",\"cluster_state\":" + Quote(ClusterStateName(status.cluster_state_));
   json += ",\"lifecycle_revision\":" + U64Json(status.lifecycle_revision_);
+  json += ",\"client_mode\":" +
+          (status.client_mode_ ? Quote(ClientModeName(*status.client_mode_))
+                               : "null");
   json +=
       ",\"root_operation_id\":" + OptionalStringJson(status.root_operation_id_);
   json += ",\"genesis_commit_index\":" +
@@ -1564,6 +1584,8 @@ absl::StatusOr<std::string> RenderClusterStatusText(
       " lifecycle_revision=" + std::to_string(status.lifecycle_revision_) +
       "\n";
   if (status.root_operation_id_.has_value()) {
+    text += "client_mode=" + std::string(ClientModeName(*status.client_mode_)) +
+            "\n";
     text += "root_operation=" + *status.root_operation_id_ +
             " genesis_commit=" + std::to_string(*status.genesis_commit_index_) +
             "\n";

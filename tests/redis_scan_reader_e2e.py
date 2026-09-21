@@ -98,7 +98,7 @@ def managed_cluster(lavik, redis, shake, meta_binary, ctl, root):
     meta = H.Node(meta_binary, str(directory), 1, args=C.creation_raft_args())
     nodes = [DataProcess(lavik, str(directory / f"source-{i}"), str(i + 1) * 40,
                          meta.data_control_endpoint, workers=2) for i in range(2)]
-    lines = ['schema_version = 1', 'slot_strategy = "contiguous-even"']
+    lines = ['schema_version = 1', 'client_mode = "cluster"', 'slot_strategy = "contiguous-even"']
     lines += C.meta_manifest_lines(meta)
     for i, node in enumerate(nodes):
         lines += ['[[data_nodes]]', f'id = "{node.node_id}"',

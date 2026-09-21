@@ -26,33 +26,13 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "lavik/net/sync_stream.h"
 
 namespace lavik::meta {
 
-using MetaAdminDeadline = std::chrono::steady_clock::time_point;
-
-struct MetaAdminTlsOptions {
-  std::string ca_file_;
-  std::string certificate_file_;
-  std::string private_key_file_;
-  // Empty verifies the numeric endpoint's IP SAN. This override exists only
-  // for direct lavik-ctl commands; cluster discovery deliberately
-  // leaves it empty so learned addresses cannot change certificate identity.
-  std::string server_name_;
-};
-
-struct MetaAdminTarget {
-  enum class Transport {
-    kUnix,
-    kTcpPlaintext,
-    kTcpMtls,
-  };
-
-  Transport transport_ = Transport::kUnix;
-  // Unix socket path for kUnix; canonical numeric IP:port otherwise.
-  std::string endpoint_;
-  MetaAdminTlsOptions tls_;
-};
+using MetaAdminDeadline = net::SyncDeadline;
+using MetaAdminTlsOptions = net::SyncTlsOptions;
+using MetaAdminTarget = net::SyncTarget;
 
 // Attaches/queries transport evidence that the Admin command itself was not
 // written. ClusterCreate uses this distinction after leader discovery:

@@ -108,11 +108,11 @@ GroupView GroupBWithGap() {
   return MakeGroup(kGroupB, kNodeBIndex, 10000, 15000);
 }
 
-std::shared_ptr<const ServingState> BuildState(std::string_view self,
-                                               GroupView group_a,
-                                               GroupView group_b) {
+std::shared_ptr<const ServingState> BuildState(
+    std::string_view self, GroupView group_a, GroupView group_b,
+    std::uint64_t topology_epoch = 1) {
   ServingStateBuilder builder;
-  builder.SetTopologyEpoch(1).SetInFlightStripeCount(4);
+  builder.SetTopologyEpoch(topology_epoch).SetInFlightStripeCount(4);
   if (self == kNodeA) {
     builder.SetSelfNodeIndex(kNodeAIndex);
   } else if (self == kNodeB) {
@@ -160,11 +160,17 @@ struct TestAuthorityControl {
   lavik::cluster::testing::TestTopologyInstaller topology;
 };
 
-std::shared_ptr<const ServingState> BuildSingleState(GroupView group) {
+std::shared_ptr<const ServingState> BuildSingleState(
+    GroupView group, bool self_is_replica = false,
+    std::uint64_t topology_epoch = 1) {
   ServingStateBuilder builder;
-  builder.SetTopologyEpoch(1).SetInFlightStripeCount(4);
-  builder.SetSelfNodeIndex(kNodeAIndex);
+  builder.SetTopologyEpoch(topology_epoch).SetInFlightStripeCount(4);
+  builder.SetSelfNodeIndex(self_is_replica ? 1 : kNodeAIndex);
   builder.AddNode(MakeNode(kNodeA, "10.0.0.1", 7000, 17000));
+  auto replica = MakeNode(kNodeR, "10.0.0.3", 7002, 17002);
+  replica.primary_node_index_ = kNodeAIndex;
+  builder.AddNode(std::move(replica));
+  group.replica_node_indices_ = {1};
   builder.AddGroup(std::move(group));
   auto state = builder.Build();
   EXPECT_TRUE(state.ok()) << state.status();
@@ -209,6 +215,141 @@ TEST(ClusterAuthoritySnapshotTest, SingleClientUsesOneFullGroupAuthority) {
   EXPECT_EQ(control.authority.Recheck(moved, start), RecheckResult::kReject);
 }
 
+TEST(ClusterAuthoritySnapshotTest,
+     SingleReplicaReadNeedsNoReadonlyOrOwnerGrant) {
+  auto group = MakeGroup(kGroupA, kNodeAIndex, 0, 16383);
+  group.granted_ = false;
+  const auto state = BuildSingleState(group, true);
+  const std::array<std::uint16_t, 1> slots{42};
+  auto request = MakeRequest(slots, false);
+  request.client_mode_ = lavik::ClientMode::kSingle;
+  EXPECT_EQ(Admit(state.get(), request).kind_, Decision::Kind::kServeStaleRead);
+  request.is_write_ = true;
+  EXPECT_EQ(Admit(state.get(), request).kind_, Decision::Kind::kReadOnly);
+  request.is_write_ = false;
+  // An old Owner has no replica privilege merely because its grant expired.
+  EXPECT_EQ(Admit(BuildSingleState(group).get(), request).kind_,
+            Decision::Kind::kClusterDownUnbound);
+}
+
+TEST(ClusterAuthoritySnapshotTest,
+     SingleReadProofLosesRemovedReplicaMembership) {
+  TestAuthorityControl control;
+  auto group = MakeGroup(kGroupA, kNodeAIndex, 0, 16383);
+  control.cache.Publish(BuildSingleState(group, true));
+  const std::array<std::uint16_t, 1> slots{42};
+  auto request = MakeRequest(slots, false);
+  request.client_mode_ = lavik::ClientMode::kSingle;
+  EXPECT_EQ(
+      control.authority.DecideNow(request, lavik::cluster::MonotonicTime{})
+          .kind_,
+      Decision::Kind::kServeStaleRead);
+  const auto admission = control.authority.CaptureAndAdmit(request, {});
+  ASSERT_EQ(admission.decision().kind_, Decision::Kind::kServeStaleRead);
+  ASSERT_EQ(control.authority.Recheck(admission, {}), RecheckResult::kOk);
+  ServingStateBuilder builder;
+  builder.SetTopologyEpoch(2).SetInFlightStripeCount(4).SetSelfNodeIndex(1);
+  builder.AddNode(MakeNode(kNodeA, "10.0.0.1", 7000, 17000));
+  builder.AddNode(MakeNode(kNodeR, "10.0.0.3", 7002, 17002));
+  builder.AddGroup(group);
+  auto removed = builder.Build();
+  ASSERT_TRUE(removed.ok()) << removed.status();
+  control.cache.Publish(*removed);
+  EXPECT_NE(
+      control.authority.DecideNow(request, lavik::cluster::MonotonicTime{})
+          .kind_,
+      Decision::Kind::kServeStaleRead);
+  EXPECT_EQ(control.authority.Recheck(admission, {}), RecheckResult::kReject);
+}
+
+TEST(ClusterAuthoritySnapshotTest,
+     StaleReadProofDiesOnTokenEqualRepublication) {
+  TestAuthorityControl control;
+  auto group = MakeGroup(kGroupA, kNodeAIndex, 0, 16383);
+  control.cache.Publish(BuildSingleState(group, true));
+  const std::array<std::uint16_t, 1> slots{42};
+  auto request = MakeRequest(slots, false);
+  request.client_mode_ = lavik::ClientMode::kSingle;
+  const auto admission = control.authority.CaptureAndAdmit(request, {});
+  ASSERT_EQ(admission.decision().kind_, Decision::Kind::kServeStaleRead);
+  ASSERT_EQ(control.authority.Recheck(admission, {}), RecheckResult::kOk);
+  // A retained replica read is valid only on its exact snapshot. An epoch
+  // bump changes the content hash but not the group authority token; the new
+  // publication must still revoke the proof.
+  control.cache.Publish(BuildSingleState(group, true, /*topology_epoch=*/2));
+  EXPECT_EQ(control.authority.Recheck(admission, {}), RecheckResult::kReject);
+}
+
+TEST(ClusterAuthoritySnapshotTest,
+     TokenEqualRepublicationKeepsWriteAdmissionValid) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  ASSERT_TRUE(control.topology
+                  .Install(BuildState(kNodeA, GroupA(), GroupB(),
+                                      /*topology_epoch=*/1),
+                           start, 100ms)
+                  .ok());
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  const auto write =
+      control.authority.CaptureAndAdmit(MakeRequest(slots, true), start);
+  ASSERT_EQ(write.decision().kind_, Decision::Kind::kServe);
+  // An epoch bump makes the republication real (the cache dedupes identical
+  // content), but the group token is unchanged, so the token comparison must
+  // still carry the write proof and its registration bracket.
+  ASSERT_TRUE(control.topology
+                  .Install(BuildState(kNodeA, GroupA(), GroupB(),
+                                      /*topology_epoch=*/2),
+                           start, 100ms)
+                  .ok());
+  EXPECT_EQ(control.authority.Recheck(write, start + 1ms), RecheckResult::kOk);
+  AuthorityInFlightGuards guards;
+  EXPECT_EQ(
+      control.authority.RegisterAndRecheck(write, 0, start + 1ms, &guards),
+      RecheckResult::kOk);
+  EXPECT_FALSE(guards.empty());
+}
+
+TEST(ClusterAuthoritySnapshotTest,
+     RecheckRejectsLeaseExpiredWithoutRepublication) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), start, 10ms).ok());
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  const auto write =
+      control.authority.CaptureAndAdmit(MakeRequest(slots, true), start);
+  ASSERT_EQ(write.decision().kind_, Decision::Kind::kServe);
+  EXPECT_EQ(control.authority.Recheck(write, start + 9ms), RecheckResult::kOk);
+  // Expiry is detected against the unchanged publication's own deadline and
+  // still flows through LeaseCovers for its one-time metric.
+  EXPECT_EQ(control.authority.Recheck(write, start + 10ms),
+            RecheckResult::kReject);
+}
+
+TEST(ClusterAuthoritySnapshotTest,
+     SingleKeylessDataAccessStillConsumesAuthority) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  ASSERT_TRUE(
+      control.topology
+          .Install(BuildSingleState(MakeGroup(kGroupA, kNodeAIndex, 0, 16383)),
+                   start, 10ms)
+          .ok());
+  auto request = MakeRequest({}, false);
+  request.client_mode_ = lavik::ClientMode::kSingle;
+  auto admission = control.authority.CaptureAndAdmit(request, start);
+  EXPECT_EQ(admission.decision().kind_, Decision::Kind::kServe);
+  EXPECT_EQ(admission.slots().size(), 1u);
+  EXPECT_EQ(control.authority.Recheck(admission, start + 10ms),
+            RecheckResult::kReject);
+  request.loading_allowed_ = true;  // diagnostics carry no data authority
+  EXPECT_EQ(
+      control.authority.CaptureAndAdmit(request, start + 10ms).decision().kind_,
+      Decision::Kind::kServe);
+}
+
 TEST(ClusterAuthoritySnapshotTest, SingleClientRejectsNonFullGroupTopology) {
   const std::array<std::uint16_t, 2> slots{kSlotInA, kOtherSlotInA};
   auto request = MakeRequest(slots, true);
@@ -236,6 +377,88 @@ TEST(ClusterAuthoritySnapshotTest, SingleClientHonorsFullGroupServingGates) {
   group.storage_ready_ = false;
   EXPECT_EQ(Admit(BuildSingleState(group).get(), request).kind_,
             Decision::Kind::kLoading);
+}
+
+TEST(ClusterAuthoritySnapshotTest,
+     SynchronousReadUsesCurrentLeaseAndPopulation) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  auto group = MakeGroup(kGroupA, kNodeAIndex, 0, 16383);
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  auto read = MakeRequest(slots, false);
+  read.client_mode_ = lavik::ClientMode::kSingle;
+  EXPECT_EQ(control.authority.DecideNow(read, start).kind_,
+            Decision::Kind::kLoading);
+  ASSERT_TRUE(
+      control.topology.Install(BuildSingleState(group), start, 10ms).ok());
+  EXPECT_EQ(control.authority.DecideNow(read, start + 9ms).kind_,
+            Decision::Kind::kServe);
+  ASSERT_TRUE(
+      control.topology.Install(BuildSingleState(group), start + 9ms, 10ms)
+          .ok());
+  EXPECT_EQ(control.authority.DecideNow(read, start + 18ms).kind_,
+            Decision::Kind::kServe);
+  EXPECT_EQ(control.authority.DecideNow(read, start + 19ms).kind_,
+            Decision::Kind::kClusterDownUnbound);
+  EXPECT_FALSE(
+      control.topology.Install(BuildSingleState(group), start + 19ms, 10ms)
+          .ok());
+  group.population_ready_ = false;
+  control.cache.Publish(BuildSingleState(group));
+  EXPECT_EQ(control.authority.DecideNow(read, start + 20ms).kind_,
+            Decision::Kind::kLoading);
+  group.population_ready_ = true;
+  control.cache.Publish(BuildSingleState(group, true));
+  EXPECT_EQ(control.authority.DecideNow(read, start + 21ms).kind_,
+            Decision::Kind::kServeStaleRead);
+}
+
+TEST(ClusterAuthoritySnapshotTest, CachedSingleReadObservesShorterRenewal) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  const auto state =
+      BuildSingleState(MakeGroup(kGroupA, kNodeAIndex, 0, 16383));
+  ASSERT_TRUE(control.topology.Install(state, start, 10ms).ok());
+  const std::array<std::uint16_t, 1> first_slot{0};
+  const std::array<std::uint16_t, 1> last_slot{16383};
+  auto read = MakeRequest(first_slot, false);
+  read.client_mode_ = lavik::ClientMode::kSingle;
+  EXPECT_EQ(control.authority.DecideNow(read, start + 4ms).kind_,
+            Decision::Kind::kServe);
+  read.slots_ = last_slot;
+  EXPECT_EQ(control.authority.DecideNow(read, start + 4ms).kind_,
+            Decision::Kind::kServe);
+  ASSERT_TRUE(control.topology.Install(state, start + 5ms, 1ms).ok());
+  EXPECT_EQ(control.authority.DecideNow(read, start + 5ms).kind_,
+            Decision::Kind::kServe);
+  EXPECT_EQ(control.authority.DecideNow(read, start + 6ms).kind_,
+            Decision::Kind::kClusterDownUnbound);
+  TestAuthorityControl other;
+  other.cache.Publish(state);
+  EXPECT_EQ(other.authority.DecideNow(read, start + 5ms).kind_,
+            Decision::Kind::kClusterDownUnbound);
+}
+
+TEST(ClusterAuthoritySnapshotTest, CachedSingleReadRejectsInvalidSlot) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  ASSERT_TRUE(
+      control.topology
+          .Install(BuildSingleState(MakeGroup(kGroupA, kNodeAIndex, 0, 16383)),
+                   start, 10ms)
+          .ok());
+  const std::array<std::uint16_t, 1> valid_slot{0};
+  const std::array<std::uint16_t, 1> invalid_slot{16384};
+  auto read = MakeRequest(valid_slot, false);
+  read.client_mode_ = lavik::ClientMode::kSingle;
+  EXPECT_EQ(control.authority.DecideNow(read, start).kind_,
+            Decision::Kind::kServe);
+  read.slots_ = invalid_slot;
+  EXPECT_EQ(control.authority.DecideNow(read, start).kind_,
+            Decision::Kind::kClusterDownUnbound);
 }
 
 TEST(ClusterAuthoritySnapshotTest, CachedReadExpiresWithoutAnyPublication) {
@@ -280,6 +503,21 @@ TEST(ClusterAuthoritySnapshotTest,
   EXPECT_EQ(
       control.authority.CaptureAndAdmit(read, start + 15ms).decision().kind_,
       Decision::Kind::kClusterDownUnbound);
+}
+
+TEST(ClusterAuthoritySnapshotTest, ShorterRenewalExpiresAlreadyAdmittedWrite) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), start, 100ms).ok());
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  const auto write =
+      control.authority.CaptureAndAdmit(MakeRequest(slots, true), start + 4ms);
+  ASSERT_TRUE(
+      control.topology.Install(BuildState(kNodeA), start + 5ms, 10ms).ok());
+  EXPECT_EQ(control.authority.Recheck(write, start + 14ms), RecheckResult::kOk);
+  EXPECT_EQ(control.authority.RecheckAtMutation(write, start + 15ms),
+            RecheckResult::kReject);
 }
 
 TEST(ClusterAuthoritySnapshotTest,

@@ -571,6 +571,10 @@ std::optional<CommandReply> RegisterClusterBlockingWriteAttemptImpl(
 
     CommandReply reply;
     switch (decision.kind_) {
+      case cluster::Decision::Kind::kReadOnly:
+        reply.encoded_ = reply_builder.AppendError(
+            "READONLY You can't write against a read only replica.");
+        break;
       case cluster::Decision::Kind::kMoved: {
         const std::uint16_t port =
             request.connection_tls_ && decision.moved_tls_port_ != 0

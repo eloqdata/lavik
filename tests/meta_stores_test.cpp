@@ -566,7 +566,8 @@ TEST(MetaTopologyStore, ClusterLifecycleBeginsAndCompletesIndependently) {
   EXPECT_EQ(store.ClusterLifecycle().Revision(), 0u);
   EXPECT_EQ(store.TopologyEpoch(), 0u);
 
-  ASSERT_TRUE(store.BeginClusterCreate(root, 42).ok());
+  ASSERT_TRUE(
+      store.BeginClusterCreate(root, 42, lavik::ClientMode::kCluster).ok());
   EXPECT_EQ(store.ClusterLifecycle().state_, MetaClusterLifecycle::kCreating);
   EXPECT_EQ(store.ClusterLifecycle().Revision(), 1u);
   EXPECT_EQ(store.ClusterLifecycle().root_operation_id_, root);
@@ -574,9 +575,11 @@ TEST(MetaTopologyStore, ClusterLifecycleBeginsAndCompletesIndependently) {
 
   EXPECT_EQ(store.TopologyEpoch(), 0u);
 
-  ASSERT_TRUE(store.BeginClusterCreate(root, 42).ok());
+  ASSERT_TRUE(
+      store.BeginClusterCreate(root, 42, lavik::ClientMode::kCluster).ok());
   EXPECT_EQ(store.ClusterLifecycle().Revision(), 1u);
-  ExpectDomainReject(store.BeginClusterCreate(MakeOperationId(0x92), 43));
+  ExpectDomainReject(store.BeginClusterCreate(MakeOperationId(0x92), 43,
+                                              lavik::ClientMode::kCluster));
 
   ASSERT_TRUE(store.CompleteClusterCreate(root).ok());
   EXPECT_EQ(store.ClusterLifecycle().state_, MetaClusterLifecycle::kCreated);
@@ -593,7 +596,8 @@ TEST(MetaTopologyStore, ClusterLifecycleBeginsAndCompletesIndependently) {
 TEST(MetaTopologyStore, ClusterLifecycleFailureIsBoundedAndSerialized) {
   MetaTopologyStore store;
   const MetaOperationId root = MakeOperationId(0x93);
-  ASSERT_TRUE(store.BeginClusterCreate(root, 77).ok());
+  ASSERT_TRUE(
+      store.BeginClusterCreate(root, 77, lavik::ClientMode::kCluster).ok());
   ASSERT_TRUE(store.FailClusterCreate(root, "initial population failed").ok());
 
   const auto loaded = MetaTopologyStore::Deserialize(store.Serialize());
@@ -1040,6 +1044,45 @@ SetSlotMap MakeSlotMap(std::vector<lavik::meta::MetaSlotAssignment> ranges,
   return cmd;
 }
 
+TEST(MetaTopologyStore, SingleModeSurvivesRestoreAndGuardsTopologyChanges) {
+  MetaTopologyStore store;
+  const auto root = MakeOperationId(0x94);
+  ASSERT_TRUE(
+      store.BeginClusterCreate(root, 1, lavik::ClientMode::kSingle).ok());
+  ExpectDomainReject(
+      store.BeginClusterCreate(root, 1, lavik::ClientMode::kCluster));
+  ExpectDomainReject(store.CompleteClusterCreate(root));
+  auto restored = MetaTopologyStore::Deserialize(store.Serialize());
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->ClusterLifecycle().client_mode_,
+            lavik::ClientMode::kSingle);
+
+  ASSERT_TRUE(store.Apply(MakeCreateGroup("single", 1)).ok());
+  ExpectDomainReject(store.Apply(MakeCreateGroup("another", 2)));
+  ExpectDomainReject(store.Apply(MakeSlotMap({{0, 16382, "single"}}, 2)));
+  EXPECT_EQ(store.TopologyEpoch(), 1u);
+  ASSERT_TRUE(
+      store
+          .Apply(MakeSlotMap({{0, 8191, "single"}, {8192, 16383, "single"}}, 2))
+          .ok());
+  ASSERT_TRUE(store.CompleteClusterCreate(root).ok());
+  restored = MetaTopologyStore::Deserialize(store.Serialize());
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->ClusterLifecycle(), store.ClusterLifecycle());
+  ExpectDomainReject(restored->Apply(MakeCreateGroup("another", 3)));
+  ExpectDomainReject(restored->Apply(MakeSlotMap({}, 3)));
+  ExpectDomainReject(restored->Apply(MakeSlotMap({{1, 16383, "single"}}, 3)));
+  EXPECT_EQ(restored->Serialize(), store.Serialize());
+
+  auto corrupt = store.Serialize();
+  // Mode is the first byte after the format and lifecycle tags. A legacy
+  // or unknown declaration must not silently acquire Cluster semantics.
+  corrupt[3] = 0;
+  EXPECT_FALSE(MetaTopologyStore::Deserialize(corrupt).ok());
+  corrupt[3] = 3;
+  EXPECT_FALSE(MetaTopologyStore::Deserialize(corrupt).ok());
+}
+
 // Two groups at epochs 1 and 2.
 void MakeTwoGroups(MetaTopologyStore& store) {
   ASSERT_TRUE(store.Apply(MakeCreateGroup("group-a", 1)).ok());
@@ -1378,6 +1421,7 @@ std::string MakeTopologyBlob(
   lavik::meta::MetaWriter w;
   w.WriteU16(lavik::meta::kMetaTopologyStoreFormatVersion);
   w.WriteU8(static_cast<std::uint8_t>(MetaClusterLifecycle::kUninitialized));
+  w.WriteU8(0);  // no client mode before Genesis
   lavik::meta::WriteFixedArray(w, MetaOperationId{});
   w.WriteU64(0);
   w.WriteString("");
