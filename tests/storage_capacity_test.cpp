@@ -186,6 +186,100 @@ class ExpirationAuthorityTestPeer {
 #endif
 };
 
+// Hold real generation leases while exercising the bounded staging pool. The
+// peer advances only the generation number: no cleaner may retire these live
+// transactions and accidentally make capacity available to the writer.
+class WriteBufferPressureTestPeer {
+ public:
+  static bycorf::Task<absl::Status> Exercise(StorageEngine& storage,
+                                             bool extent) {
+    using namespace std::chrono_literals;
+    auto& impl = *storage.impl_;
+    auto& store = impl.CurrentStore();
+    std::vector<TxShardWrites> held(4);
+    for (std::size_t i = 0; i < held.size(); ++i) {
+      const auto txid = StorageEngine::AllocateWriteTxid();
+      storage.InitializeTxWrites(txid, std::span(&held[i], 1));
+      const std::string key = "pressure-held-" + std::to_string(i);
+      auto written = co_await storage.SetLocked(0, key, ComputeDigest(key),
+                                                "retained", {}, &held[i]);
+      if (!written.ok()) co_return written.status();
+      impl.current_tx_generation_.fetch_add(1, std::memory_order_seq_cst);
+    }
+    if (store.buffers_.available_write_buffers() != 0)
+      co_return absl::FailedPreconditionError(
+          "fixture did not exhaust staging");
+
+    // First make every active tail durable. A later pressure seal must also
+    // release an already-flushed buffer, without waiting for another append.
+    impl.FlushActiveBlock(store);
+    while (store.flush_running_) co_await bycorf::SleepFor(*store.worker_, 1ms);
+    if (store.buffers_.available_write_buffers() != 0)
+      co_return absl::FailedPreconditionError(
+          "flush unexpectedly sealed a tail");
+
+    // Keep one reader pin across the pressure seal. The other three buffers
+    // suffice for progress, but this buffer must not be recycled yet.
+    const auto block_id = store.active_tx_blocks_.begin()->second->block_id_;
+    auto* pinned = impl.FindBlockState(store, block_id);
+    ++pinned->pins_;
+    const auto pinned_slot = pinned->staging_slot_;
+
+    const std::string value(extent ? 9 * 1024 * 1024 : 64, 'p');
+    auto pending = storage.Set(0, "pressure-new", value);
+    auto handle = std::move(pending).ReleaseHandle();
+    pending = decltype(pending)(handle);
+    handle.resume();
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!pending.done() && std::chrono::steady_clock::now() < deadline)
+      co_await bycorf::SleepFor(*store.worker_, 1ms);
+    const bool stalled = !pending.done();
+    if (stalled) {
+      // Unstick the original implementation so the negative test joins its
+      // suspended writer and releases leases instead of hanging test teardown.
+      co_await store.store_state_mutex_.Lock();
+      impl.SealActiveBlocks(store);
+      store.store_state_mutex_.Unlock(*store.worker_);
+    }
+    while (!pending.done()) co_await bycorf::SleepFor(*store.worker_, 1ms);
+    auto written = std::move(pending).TakeResult();
+    const bool pin_preserved = pinned->staging_slot_ == pinned_slot &&
+                               pinned->release_pending_ && !pinned->in_memory_;
+    --pinned->pins_;
+    if (pinned->release_pending_) impl.ReleaseStagingBuffer(store, *pinned);
+    if (!written.ok()) co_return written.status();
+    if (stalled)
+      co_return absl::DeadlineExceededError(
+          "writer waited for buffers retained by live transaction generations");
+    if (!pin_preserved)
+      co_return absl::DataLossError("pressure seal recycled a pinned buffer");
+
+    // The pressure seal must not revoke leases or lose their tagged data.
+    // Appending the commit decisions may itself need another pressure seal.
+    for (auto& tx : held) {
+      std::vector<TxShardWrites*> shards{&tx};
+      auto committed =
+          co_await storage.CommitTxWrites(tx.txid_, std::move(shards));
+      if (!committed.ok()) co_return committed;
+    }
+    for (std::size_t i = 0; i < held.size(); ++i) {
+      const std::string key = "pressure-held-" + std::to_string(i);
+      auto got = co_await storage.Get(0, key);
+      if (!got.ok()) co_return got.status();
+      const auto bytes = got->value_bytes();
+      if (std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                           bytes.size()) != "retained")
+        co_return absl::DataLossError("pressure seal changed a tagged value");
+    }
+    auto length = co_await storage.StringLength(0, "pressure-new");
+    if (!length.ok()) co_return length.status();
+    if (*length != value.size())
+      co_return absl::DataLossError(
+          "pressure writer returned the wrong length");
+    co_return absl::OkStatus();
+  }
+};
+
 }  // namespace lavik::storage
 
 namespace {
@@ -508,6 +602,31 @@ class FiniteExpirationAuthorityService final : public bycorf::Service {
       absl::UnknownError("finite expiration authority test did not run");
 };
 
+class WriteBufferPressureService final : public bycorf::Service {
+ public:
+  WriteBufferPressureService(lavik::storage::StorageEngine& storage,
+                             bool extent)
+      : storage_(storage), extent_(extent) {}
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker,
+                                 bycorf::ServiceContext) override {
+    lavik::BindMemoryAccountingShard(worker.id());
+    lavik::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
+    result_ = co_await storage_.InitializeWorker(worker);
+    if (result_.ok())
+      result_ = co_await lavik::storage::WriteBufferPressureTestPeer::Exercise(
+          storage_, extent_);
+    worker.RequestStop();
+    co_return result_;
+  }
+  void Prepare(unsigned) override {}
+  void Stop() noexcept override {}
+  absl::Status result_ = absl::UnknownError("pressure test did not run");
+
+ private:
+  lavik::storage::StorageEngine& storage_;
+  bool extent_;
+};
+
 }  // namespace
 
 TEST(StorageReplicationTest, RejectsDisabledDatabaseCounts) {
@@ -701,7 +820,7 @@ TEST(StorageExpirationAuthorityTest,
   lavik::InitWorkerMetrics(1);
   ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
-  lavik::tx::TxRuntime::Create(1);
+  if (lavik::tx::TxRuntime::Get() == nullptr) lavik::tx::TxRuntime::Create(1);
 
   bycorf::Server server;
   FiniteExpirationAuthorityService service(&storage, &server);
@@ -803,4 +922,36 @@ TEST(StorageCapacityTest, RejectsForeignDeviceDuringExpansion) {
                "explicit storage reset did not replace foreign device sets");
   ASSERT_CHECK(Prepare({foreign, first}).ok(),
                "reset storage set could not be reopened");
+}
+
+TEST(StorageCapacityTest, LiveTransactionGenerationsCannotStarveStaging) {
+  for (bool extent : {false, true}) {
+    SCOPED_TRACE(extent ? "extent writer" : "inline writer");
+    const std::string path = lavik::test::TestDataPath(
+        "lavik-buffer-pressure-" + std::to_string(::getpid()) +
+        (extent ? "-extent.data" : "-inline.data"));
+    Cleanup cleanup{{path}};
+    ASSERT_TRUE(CreateFile(path, 256 * kMiB));
+    lavik::storage::StorageEngineOptions options;
+    options.data_files_ = {path};
+    options.buffers_.registered_bytes_ = 64 * kMiB;
+    options.buffers_.storage_write_buffer_count_ = 4;
+    options.tx_cleaner_cooldown_ms_ = 0;
+    options.expiration_authority_ = false;
+    lavik::storage::StorageEngine storage(std::move(options));
+    lavik::InitWorkerMetrics(1);
+    ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+    ASSERT_TRUE(storage.Prepare(1).ok());
+    if (lavik::tx::TxRuntime::Get() == nullptr) lavik::tx::TxRuntime::Create(1);
+    WriteBufferPressureService service(storage, extent);
+    bycorf::Server server;
+    server.AddService(&service);
+    bycorf::ServerOptions runtime;
+    runtime.thread_count_ = 1;
+    runtime.pin_workers_ = false;
+    runtime.recv_buffer_count_ = 0;
+    ASSERT_TRUE(server.Start(runtime).ok());
+    server.WaitUntilStopped();
+    EXPECT_TRUE(service.result_.ok()) << service.result_;
+  }
 }

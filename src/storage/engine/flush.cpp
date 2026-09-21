@@ -256,8 +256,16 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         // burn a slot and two fdatasyncs.
         state->flush_queued_ = false;
         if (!IsActiveBlock(*store, block_id)) {
-          ReleaseStagingBuffer(*store, *state);
-          MaybeQueueDefrag(*store, block_id);
+          // A pressure seal can retire an already-durable active tail while
+          // readers still hold its staging memory. Match normal flush
+          // completion: the last pin, not the seal, returns that buffer.
+          state->in_memory_ = false;
+          if (state->pins_ > 0) {
+            state->release_pending_ = true;
+          } else {
+            ReleaseStagingBuffer(*store, *state);
+            MaybeQueueDefrag(*store, block_id);
+          }
         }
         continue;
       }

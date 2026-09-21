@@ -1696,6 +1696,7 @@ class StorageEngine {
 
  private:
   friend class ExpirationAuthorityTestPeer;
+  friend class WriteBufferPressureTestPeer;
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
