@@ -23,8 +23,8 @@ the Admin UI. Each Data node gets a persistent 1 GiB file.
 
 This is a local learning environment. All containers share one physical host,
 so it does not provide availability across machine failures. Meta/Data traffic
-uses plaintext inside a dedicated Docker network; only the browser port is
-published, bound to localhost. Meta/Data containers enable io_uring through
+uses plaintext inside a dedicated Docker network; the browser port and three
+Data client ports are published only on localhost. Meta/Data containers enable io_uring through
 `seccomp=unconfined`; Admin does not need that setting. The example uses the
 build-toolchain image to avoid a separate host compiler or Redis CLI install.
 Use the [standalone Admin deployment guide](../../docs/operations/lavik-admin.md)
@@ -113,7 +113,49 @@ docker compose -f admin/quickstart/compose.yaml exec admin \
 
 `GET` should return `hello from Lavik`, and `fleet-list` should include `demo`.
 Client commands run inside the Docker network so cluster redirects can reach
-the advertised node IPs. The Data ports are not published to the Mac host.
+the advertised node IPs.
+
+### Connecting from the Mac host
+
+Docker Desktop keeps `172.29.91.*` inside its Linux VM. A host command such as
+`redis-cli -h 172.29.91.21 -p 6379` cannot reach that private network. Use these
+published addresses for direct node access instead:
+
+| Node | Inside Docker | On the host |
+|---|---|---|
+| `data-1` | `172.29.91.21:6379` | `127.0.0.1:16379` |
+| `data-2` | `172.29.91.22:6379` | `127.0.0.1:16380` |
+| `data-3` | `172.29.91.23:6379` | `127.0.0.1:16381` |
+
+```sh
+redis-cli -h 127.0.0.1 -p 16379 PING
+```
+
+For keyed reads and writes, choose the **current primary** shown in Admin's
+Topology view. Its host port follows the table above; failover can change
+which node is primary. For example, when `data-2` is primary:
+
+```sh
+redis-cli -h 127.0.0.1 -p 16380 GET greeting
+```
+
+Use the Docker-based `redis-cli -c` commands above for automatic redirects.
+Host port publishing does not rewrite `MOVED` replies or `CLUSTER SLOTS`:
+they still contain the internal addresses required by Meta, Data, and Admin.
+Enabling `-c` in a Mac-hosted client can therefore hang after a redirect to
+another node. An application running on the host needs explicit endpoint
+mapping support in its cluster client, or should run inside this Docker
+network. The selected ports avoid an existing service on host port 6379.
+
+If updating an already-running quick start, applying these new port mappings
+recreates the Data containers. Retain their volumes and recreate replicas
+before the current primary, waiting for **Healthy** between changes:
+
+```sh
+docker compose -f admin/quickstart/compose.yaml up -d --no-deps data-1
+```
+
+Repeat for the other nodes in the appropriate order for their current roles.
 
 You can now use **Switch primary** to exercise controlled failover, browse
 keys, and inspect the shared Operations view.

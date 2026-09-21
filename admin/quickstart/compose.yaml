@@ -55,18 +55,21 @@ services:
     <<: *node
     command: [data, "1"]
     volumes: [".:/quickstart:ro", "build:/build:ro", "data-1:/data"]
+    ports: ["127.0.0.1:16379:6379"]
     networks:
       cluster: {ipv4_address: 172.29.91.21}
   data-2:
     <<: *node
     command: [data, "2"]
     volumes: [".:/quickstart:ro", "build:/build:ro", "data-2:/data"]
+    ports: ["127.0.0.1:16380:6379"]
     networks:
       cluster: {ipv4_address: 172.29.91.22}
   data-3:
     <<: *node
     command: [data, "3"]
     volumes: [".:/quickstart:ro", "build:/build:ro", "data-3:/data"]
+    ports: ["127.0.0.1:16381:6379"]
     networks:
       cluster: {ipv4_address: 172.29.91.23}
 
@@ -87,7 +90,8 @@ services:
       cluster: {ipv4_address: 172.29.91.10}
 
 # Lavik advertises numeric endpoints, so every participant must see the same
-# stable IPs. Run client commands inside this network to follow slot redirects.
+# stable IPs. Host ports provide direct node access; cluster redirects still
+# name these internal IPs. Run redis-cli -c inside Docker to follow them.
 networks:
   cluster:
     ipam:
