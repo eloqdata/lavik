@@ -115,10 +115,11 @@ StorageEngine::Impl::CurrentExpirationAuthority(
     if (authority != nullptr) {
       auto* grant = authority.get();
       try {
-        auto owner = std::make_shared<std::shared_ptr<ExpirationAuthorityGrant>>(
-            std::move(authority));
-        authority = std::shared_ptr<ExpirationAuthorityGrant>(std::move(owner),
-                                                             grant);
+        auto owner =
+            std::make_shared<std::shared_ptr<ExpirationAuthorityGrant>>(
+                std::move(authority));
+        authority =
+            std::shared_ptr<ExpirationAuthorityGrant>(std::move(owner), grant);
       } catch (const std::bad_alloc&) {
         // Leave the cache version unchanged so the next attempt can retry;
         // inability to retain a capability must never authorize a deletion.

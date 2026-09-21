@@ -40,8 +40,8 @@ class ExpirationAuthorityTestPeer {
  public:
   using WorkerCache = StorageEngine::Impl::WorkerStore;
 
-  static std::shared_ptr<const void> CachedGrant(
-      const StorageEngine& storage, WorkerCache& cache) {
+  static std::shared_ptr<const void> CachedGrant(const StorageEngine& storage,
+                                                 WorkerCache& cache) {
     return storage.impl_->CurrentExpirationAuthority(cache);
   }
 
@@ -170,8 +170,10 @@ class ExpirationAuthorityTestPeer {
     handle.resume();
     const bool suspended = !task.done();
     auto paused = co_await impl->QuiesceExpiration();
-    auto changed = suspended ? transition() : absl::FailedPreconditionError(
-        "expiration did not suspend behind the held key");
+    auto changed = suspended
+                       ? transition()
+                       : absl::FailedPreconditionError(
+                             "expiration did not suspend behind the held key");
     // Refresh the worker cache while the pending mutation retains the old
     // local control block. This must neither dangle nor reauthorize that work.
     (void)impl->CurrentExpirationAuthority(store);
@@ -439,8 +441,8 @@ class FiniteExpirationAuthorityService final : public bycorf::Service {
       auto lease = std::make_shared<lavik::LeaseDeadline>(deadline);
       auto granted = storage_->SetExpirationAuthorityUntil(lease);
       if (!granted.ok()) co_return granted;
-      auto prepared = co_await SeedExpired(
-          "expiration-cache-{foo}-" + std::to_string(scenario));
+      auto prepared = co_await SeedExpired("expiration-cache-{foo}-" +
+                                           std::to_string(scenario));
       if (!prepared.ok()) co_return prepared;
       const auto before = storage_->LocalSize(0);
       absl::Status expired;
@@ -461,7 +463,8 @@ class FiniteExpirationAuthorityService final : public bycorf::Service {
           return lease->Renew(deadline - std::chrono::seconds(1),
                               FarFutureExpirationDeadline())
                      ? absl::OkStatus()
-                     : absl::FailedPreconditionError("shared lease renewal failed");
+                     : absl::FailedPreconditionError(
+                           "shared lease renewal failed");
         });
       }
       if (!expired.ok()) co_return expired;
@@ -620,7 +623,8 @@ TEST(StorageExpirationAuthorityTest, WorkersOwnSeparateCachedControlBlocks) {
   EXPECT_TRUE(Peer::ValidateGrant(replacement).ok());
 }
 
-TEST(StorageExpirationAuthorityTest, SharedRenewalKeepsWorkerCacheAndLiveChecks) {
+TEST(StorageExpirationAuthorityTest,
+     SharedRenewalKeepsWorkerCacheAndLiveChecks) {
   using namespace std::chrono_literals;
   using Peer = lavik::storage::ExpirationAuthorityTestPeer;
   lavik::storage::StorageEngineOptions options;
