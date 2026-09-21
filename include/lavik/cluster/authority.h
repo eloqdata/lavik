@@ -232,10 +232,11 @@ class AuthorityGuard {
   // retaining a proof. Consume any borrowed MOVED endpoint before another
   // topology-cache lookup on this thread; never carry it across suspension.
   // Mutations still require CaptureAndAdmit and its registration/final checks.
-  Decision DecideNow(const RequestView& request, MonotonicTime now) const;
-  // Samples the lease clock only when needed; cached replica reads consume
-  // population authority but no Owner lease. No clock value survives a call.
-  Decision DecideNow(const RequestView& request) const;
+  // A null `now` samples the lease clock lazily, only when a verdict actually
+  // needs a deadline comparison; cached replica reads consume population
+  // authority but no Owner lease. No clock value survives a call.
+  Decision DecideNow(const RequestView& request,
+                     std::optional<MonotonicTime> now = std::nullopt) const;
 
   // Lower-level verification of topology, session generation, and lease
   // deadline captured at admission. This call does not enter an in-flight cell
@@ -288,8 +289,6 @@ class AuthorityGuard {
     std::uint64_t publication_version = 0;
     MonotonicTime deadline{};
   };
-  Decision DecideNowImpl(const RequestView& request,
-                         std::optional<MonotonicTime> now) const;
   Decision DecideWithLease(const ServingState* state,
                            const RequestView& request, MonotonicTime now,
                            AuthorityAdmission* proof,

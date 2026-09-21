@@ -239,8 +239,10 @@ TEST(ClusterAuthoritySnapshotTest,
   const std::array<std::uint16_t, 1> slots{42};
   auto request = MakeRequest(slots, false);
   request.client_mode_ = lavik::ClientMode::kSingle;
-  EXPECT_EQ(control.authority.DecideNow(request, {}).kind_,
-            Decision::Kind::kServeStaleRead);
+  EXPECT_EQ(
+      control.authority.DecideNow(request, lavik::cluster::MonotonicTime{})
+          .kind_,
+      Decision::Kind::kServeStaleRead);
   const auto admission = control.authority.CaptureAndAdmit(request, {});
   ASSERT_EQ(admission.decision().kind_, Decision::Kind::kServeStaleRead);
   ASSERT_EQ(control.authority.Recheck(admission, {}), RecheckResult::kOk);
@@ -252,8 +254,10 @@ TEST(ClusterAuthoritySnapshotTest,
   auto removed = builder.Build();
   ASSERT_TRUE(removed.ok()) << removed.status();
   control.cache.Publish(*removed);
-  EXPECT_NE(control.authority.DecideNow(request, {}).kind_,
-            Decision::Kind::kServeStaleRead);
+  EXPECT_NE(
+      control.authority.DecideNow(request, lavik::cluster::MonotonicTime{})
+          .kind_,
+      Decision::Kind::kServeStaleRead);
   EXPECT_EQ(control.authority.Recheck(admission, {}), RecheckResult::kReject);
 }
 

@@ -398,16 +398,7 @@ AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
 }
 
 Decision AuthorityGuard::DecideNow(const RequestView& request,
-                                   MonotonicTime now) const {
-  return DecideNowImpl(request, now);
-}
-
-Decision AuthorityGuard::DecideNow(const RequestView& request) const {
-  return DecideNowImpl(request, std::nullopt);
-}
-
-Decision AuthorityGuard::DecideNowImpl(const RequestView& request,
-                                       std::optional<MonotonicTime> now) const {
+                                   std::optional<MonotonicTime> now) const {
   // Single's complete Group authorizes every read through the same predicate.
   // Keep only successful verdicts in worker-local memory; exact publication
   // identity and lease expiry remain checked on every call. This avoids both
