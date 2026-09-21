@@ -377,8 +377,17 @@ struct SyncStream::Impl {
   std::optional<SslContext> tls_context_;
   std::optional<SslSession> tls_;
   IoDeadline deadline_;
+  // Bytes ReadLine pulled past the first newline; every later read must
+  // consume them before touching the transport again.
+  std::string leftover_;
 
   absl::StatusOr<std::size_t> ReadSome(std::span<char> buffer) {
+    if (!leftover_.empty()) {
+      const std::size_t count = std::min(buffer.size(), leftover_.size());
+      std::memcpy(buffer.data(), leftover_.data(), count);
+      leftover_.erase(0, count);
+      return count;
+    }
     while (true) {
       if (auto status = CheckDeadline(deadline_); !status.ok()) return status;
       errno = 0;
@@ -486,7 +495,12 @@ absl::StatusOr<std::string> SyncStream::ReadLine(std::size_t max_bytes) {
     if (prefix.size() > max_bytes - reply.size())
       return absl::ResourceExhaustedError("reply exceeds limit");
     reply.append(prefix);
-    if (newline != std::string_view::npos) break;
+    if (newline != std::string_view::npos) {
+      // Anything already read past the newline belongs to the next message;
+      // keep it for the next ReadLine/ReadExact instead of dropping it.
+      impl_->leftover_.assign(chunk.substr(newline + 1));
+      break;
+    }
   }
   if (!reply.empty() && reply.back() == '\r') reply.pop_back();
   return reply;

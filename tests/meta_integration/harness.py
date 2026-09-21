@@ -567,11 +567,11 @@ class Node:
         if self._short_ctl_path is not None:
             try:
                 os.unlink(self._short_ctl_path)
-            except FileNotFoundError:
+            except OSError:
                 pass
             try:
                 os.rmdir(self._short_ctl_directory)
-            except FileNotFoundError:
+            except OSError:
                 pass
 
     def log_tail(self, lines=40):

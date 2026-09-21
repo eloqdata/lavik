@@ -23,8 +23,8 @@ results_dir="$build_dir/test-results"
 mkdir -p "$results_dir"
 
 export LAVIK_TEST_DATA_DIR=${LAVIK_TEST_DATA_DIR:-/mnt/dev}
-if [[ ! -d "$LAVIK_TEST_DATA_DIR" || ! -w "$LAVIK_TEST_DATA_DIR" ]]; then
-  echo "Tests require a writable LAVIK_TEST_DATA_DIR for private scratch files." >&2
+if [[ ! -d "$LAVIK_TEST_DATA_DIR" || ! -w "$LAVIK_TEST_DATA_DIR" || ! -x "$LAVIK_TEST_DATA_DIR" ]]; then
+  echo "Tests require a writable and searchable LAVIK_TEST_DATA_DIR for private scratch files." >&2
   exit 1
 fi
 
