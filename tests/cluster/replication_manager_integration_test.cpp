@@ -129,6 +129,64 @@ bycorf::Task<absl::Status> CheckLightweightQueries(
   co_return absl::OkStatus();
 }
 
+// Compare the push-published heartbeat view with the existing fresh owner
+// query. Version changes bracket genuine concurrent transitions, not missing
+// publications.
+bycorf::Task<lavik::ClusterPopulationStatus> CheckedPopulation(
+    const lavik::ReplicationManager& replication) {
+  auto before = replication.ObserveHeartbeat();
+  auto fresh = co_await replication.cluster_population_status();
+  auto published = replication.ObserveHeartbeat();
+  if (before.version_ == published.version_) {
+    const auto& actual = published.population_;
+    EXPECT_EQ(actual.state_, fresh.state_);
+    EXPECT_EQ(actual.local_node_id_, fresh.local_node_id_);
+    EXPECT_EQ(actual.local_boot_id_, fresh.local_boot_id_);
+    EXPECT_EQ(actual.ready_token_.has_value(), fresh.ready_token_.has_value());
+    if (actual.ready_token_ && fresh.ready_token_)
+      EXPECT_EQ(actual.ready_token_->identity(),
+                fresh.ready_token_->identity());
+    EXPECT_EQ(actual.recovered_, fresh.recovered_);
+    EXPECT_EQ(actual.failover_candidate_eligible_,
+              fresh.failover_candidate_eligible_);
+    EXPECT_EQ(actual.operator_recovery_identity_,
+              fresh.operator_recovery_identity_);
+    EXPECT_EQ(actual.failure_reason_, fresh.failure_reason_);
+  }
+  co_return fresh;
+}
+
+bycorf::Task<lavik::ClusterFailoverActionStatus> CheckedFailover(
+    const lavik::ReplicationManager& replication) {
+  auto before = replication.ObserveHeartbeat();
+  auto fresh = co_await replication.cluster_failover_action_status();
+  auto published = replication.ObserveHeartbeat();
+  if (before.version_ == published.version_) {
+    const auto& actual = published.failover_;
+    EXPECT_EQ(actual.state_, fresh.state_);
+    EXPECT_EQ(actual.action_, fresh.action_);
+    EXPECT_EQ(actual.prepared_, fresh.prepared_);
+    EXPECT_EQ(actual.recovery_, fresh.recovery_);
+    EXPECT_EQ(actual.failure_class_, fresh.failure_class_);
+    EXPECT_EQ(actual.failure_detail_, fresh.failure_detail_);
+  }
+  co_return fresh;
+}
+
+bycorf::Task<lavik::ClusterSourcePauseStatus> CheckedSourcePause(
+    const lavik::ReplicationManager& replication) {
+  auto before = replication.ObserveHeartbeat();
+  auto fresh = co_await replication.cluster_source_pause_status();
+  auto published = replication.ObserveHeartbeat();
+  if (before.version_ == published.version_) {
+    EXPECT_EQ(published.source_pause_.desired_, fresh.desired_);
+    EXPECT_EQ(published.source_pause_.stable_next_lsns_,
+              fresh.stable_next_lsns_);
+    EXPECT_EQ(published.source_pause_.failure_detail_, fresh.failure_detail_);
+  }
+  co_return fresh;
+}
+
 std::string RespBulk(std::string_view value) {
   return "$" + std::to_string(value.size()) + "\r\n" + std::string(value) +
          "\r\n";
@@ -705,7 +763,7 @@ class ReplicationManagerService final : public bycorf::Service {
     }
 
     const lavik::ClusterPopulationStatus initial =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     if (initial.local_node_id_ != expected_node_id_ ||
         !IsCanonicalReplicationId(initial.local_boot_id_) ||
         initial.state_ != lavik::ReplicationGroupState::kNotReady ||
@@ -753,7 +811,7 @@ class ReplicationManagerService final : public bycorf::Service {
           "cluster rebuild accepted an empty source endpoint");
     }
     const lavik::ClusterPopulationStatus after_invalid =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     if (after_invalid.state_ != lavik::ReplicationGroupState::kNotReady ||
         after_invalid.ready_token_.has_value()) {
       co_return TestFailure("an invalid directive changed population state");
@@ -823,7 +881,7 @@ class ReplicationManagerService final : public bycorf::Service {
     lavik::ClusterPopulationStatus after_mismatch;
     const auto mismatch_deadline = std::chrono::steady_clock::now() + 5s;
     do {
-      after_mismatch = co_await replication_->cluster_population_status();
+      after_mismatch = co_await CheckedPopulation(*replication_);
       if (after_mismatch.state_ == lavik::ReplicationGroupState::kNotReady)
         break;
       absl::Status waited = co_await bycorf::SleepFor(worker, 1ms);
@@ -842,7 +900,7 @@ class ReplicationManagerService final : public bycorf::Service {
     if (!started.ok()) co_return started.status();
     lavik::ClusterRebuildCompletion in_progress = std::move(*started);
     const lavik::ClusterPopulationStatus rebuilding =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     if (rebuilding.state_ != lavik::ReplicationGroupState::kRebuilding ||
         rebuilding.ready_token_.has_value()) {
       co_return TestFailure("accepted cluster directive was not REBUILDING");
@@ -906,7 +964,7 @@ class ReplicationManagerService final : public bycorf::Service {
     }
 
     const lavik::ClusterPopulationStatus replaced =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     if (replaced.state_ != lavik::ReplicationGroupState::kRebuilding ||
         replaced.ready_token_.has_value()) {
       co_return TestFailure(
@@ -1076,7 +1134,7 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
       co_return TestFailure("scripted native source failed to start");
     }
     const lavik::ClusterPopulationStatus initial =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     auto manifest = lavik::PopulationManifest::Create({{42, 9}, {16'383, 11}});
     if (!manifest.ok()) co_return manifest.status();
     lavik::RebuildDirective directive = TargetDirective(initial, *manifest);
@@ -1109,7 +1167,7 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
           "terminal non-lease/protocol failure started another retry");
     }
     const lavik::ClusterPopulationStatus population =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     if (population.state_ != lavik::ReplicationGroupState::kNotReady ||
         population.ready_token_.has_value()) {
       co_return TestFailure("terminal retry outcome retained a rebuild proof");
@@ -1169,7 +1227,7 @@ class EmptyPopulationService final : public bycorf::Service {
     const lavik::ReplicationIdentity local =
         co_await replication_->ObserveIdentity();
     const lavik::ClusterPopulationStatus cold =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     if (cold.state_ != lavik::ReplicationGroupState::kNotReady ||
         cold.ready_token_.has_value() || !replication_->is_loading() ||
         !replication_->reject_writes()) {
@@ -1239,7 +1297,7 @@ class EmptyPopulationService final : public bycorf::Service {
             "injected empty-population failure unexpectedly completed");
       }
       const lavik::ClusterPopulationStatus failed =
-          co_await replication_->cluster_population_status();
+          co_await CheckedPopulation(*replication_);
       const lavik::ReplicationStatus observed =
           co_await replication_->Observe();
       const bool expect_fail_stop =
@@ -1280,7 +1338,7 @@ class EmptyPopulationService final : public bycorf::Service {
       co_return TestFailure("empty population replay lost the original result");
 
     const lavik::ClusterPopulationStatus ready =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     if (ready.state_ != lavik::ReplicationGroupState::kReady ||
         !ready.ready_token_.has_value() ||
         ready.ready_token_->identity() != identity ||
@@ -1411,7 +1469,7 @@ class EmptyPopulationService final : public bycorf::Service {
       co_return reconciled;
     }
     const lavik::ClusterPopulationStatus after_removal =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     if (after_removal.state_ != lavik::ReplicationGroupState::kReady ||
         !after_removal.ready_token_.has_value() ||
         after_removal.ready_token_->identity() != identity) {
@@ -1460,7 +1518,7 @@ class EmptyPopulationService final : public bycorf::Service {
       co_return TestFailure(
           "empty population replay revived an invalidated proof");
     }
-    const auto invalidated = co_await replication_->cluster_population_status();
+    const auto invalidated = co_await CheckedPopulation(*replication_);
     if (invalidated.state_ != lavik::ReplicationGroupState::kNotReady ||
         invalidated.ready_token_.has_value() || !replication_->is_loading() ||
         !replication_->reject_writes()) {
@@ -1563,6 +1621,14 @@ class CrossWorkerControlService final : public bycorf::Service {
       finished_.store(true, std::memory_order_release);
     } else {
       while (!finished_.load(std::memory_order_acquire)) {
+        if (stall_requested_.load(std::memory_order_acquire)) {
+          owner_stalled_.store(true, std::memory_order_release);
+          const auto deadline = std::chrono::steady_clock::now() + 2s;
+          while (!release_owner_.load(std::memory_order_acquire) &&
+                 std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+          owner_stalled_.store(false, std::memory_order_release);
+        }
         auto waited = co_await bycorf::SleepFor(worker, 1ms);
         if (!waited.ok()) co_return waited;
       }
@@ -1596,7 +1662,7 @@ class CrossWorkerControlService final : public bycorf::Service {
   bycorf::Task<absl::Status> Exercise() {
     auto checked = co_await CheckEveryWorker(std::nullopt);
     if (!checked.ok()) co_return checked;
-    const auto initial = co_await replication_.cluster_population_status();
+    const auto initial = co_await CheckedPopulation(replication_);
     auto manifest = lavik::PopulationManifest::Create({{42, 9}});
     if (!manifest.ok()) co_return manifest.status();
     auto directive = TargetDirective(initial, *manifest);
@@ -1618,7 +1684,7 @@ class CrossWorkerControlService final : public bycorf::Service {
       previous = std::move(*started);
       checked = co_await CheckEveryWorker(upstream);
       if (!checked.ok()) co_return checked;
-      const auto population = co_await replication_.cluster_population_status();
+      const auto population = co_await CheckedPopulation(replication_);
       if (population.state_ != lavik::ReplicationGroupState::kRebuilding ||
           population.ready_token_.has_value()) {
         co_return TestFailure("remote heartbeat observed an incoherent proof");
@@ -1631,6 +1697,25 @@ class CrossWorkerControlService final : public bycorf::Service {
         co_return TestFailure("unfinished rebuild replayed as ready");
     }
 
+    stall_requested_.store(true, std::memory_order_release);
+    while (!owner_stalled_.load(std::memory_order_acquire)) {
+      auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, 1ms);
+      if (!waited.ok()) co_return waited;
+    }
+    const auto stable = replication_.ObserveHeartbeat();
+    for (unsigned read = 0; read < 1000; ++read) {
+      const auto observed = replication_.ObserveHeartbeat();
+      if (observed.version_ != stable.version_ ||
+          observed.population_.state_ !=
+              lavik::ReplicationGroupState::kRebuilding)
+        co_return TestFailure(
+            "heartbeat snapshot changed while owner was stalled");
+    }
+    const bool owner_still_stalled =
+        owner_stalled_.load(std::memory_order_acquire);
+    release_owner_.store(true, std::memory_order_release);
+    if (!owner_still_stalled)
+      co_return TestFailure("heartbeat reads waited for data owner progress");
     ready_for_shutdown_.store(true, std::memory_order_release);
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
       (void)co_await replication_.Observe();
@@ -1643,7 +1728,7 @@ class CrossWorkerControlService final : public bycorf::Service {
         !absl::IsCancelled(*previous->result())) {
       co_return TestFailure("shutdown did not retire the accepted attempt");
     }
-    const auto population = co_await replication_.cluster_population_status();
+    const auto population = co_await CheckedPopulation(replication_);
     if (population.state_ != lavik::ReplicationGroupState::kNotReady ||
         population.ready_token_.has_value()) {
       co_return TestFailure("shutdown retained population readiness");
@@ -1652,6 +1737,9 @@ class CrossWorkerControlService final : public bycorf::Service {
   }
 
   lavik::ReplicationManager& replication_;
+  std::atomic<bool> stall_requested_{false};
+  std::atomic<bool> owner_stalled_{false};
+  std::atomic<bool> release_owner_{false};
   std::atomic<bool> ready_for_shutdown_{false};
   std::atomic<bool> shutdown_requested_{false};
   std::atomic<bool> finished_{false};
@@ -1732,7 +1820,7 @@ class PromotionPrepareService final : public bycorf::Service {
     auto manifest = lavik::PopulationManifest::Create({});
     if (!manifest.ok()) co_return manifest.status();
     const lavik::ClusterPopulationStatus initial =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     lavik::RebuildIdentity identity{
         .group_id_ = std::string(40, 'd'),
         .assignment_id_ = "candidate-assignment",
@@ -1814,7 +1902,7 @@ class PromotionPrepareService final : public bycorf::Service {
     }
     const lavik::ReplicationStatus status = co_await replication_->Observe();
     const lavik::ClusterPopulationStatus population =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     if (status.role_ != lavik::ReplicationRole::kSyncing ||
         status.failed_stopped_ || !replication_->is_loading() ||
         !replication_->reject_writes() ||
@@ -2055,7 +2143,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
     }
     if (result_.ok()) {
       const lavik::ClusterFailoverActionStatus status =
-          co_await replication_->cluster_failover_action_status();
+          co_await CheckedFailover(*replication_);
       if (status.state_ != lavik::ClusterFailoverActionState::kNone ||
           status.action_.has_value()) {
         result_ = TestFailure(
@@ -2084,7 +2172,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
 
   bycorf::Task<absl::Status> Exercise() {
     const lavik::ClusterPopulationStatus population =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     lavik::DesiredClusterFailoverAction action;
     action.transition_id_.fill(1);
     action.action_id_.fill(2);
@@ -2115,7 +2203,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
         co_await replication_->ReconcileClusterFailoverAction(action);
     if (!reconciled.ok()) co_return reconciled;
     lavik::ClusterFailoverActionStatus status =
-        co_await replication_->cluster_failover_action_status();
+        co_await CheckedFailover(*replication_);
     if (!status.action_.has_value() || *status.action_ != action ||
         status.state_ !=
             lavik::ClusterFailoverActionState::kWaitingForAuthorization) {
@@ -2125,7 +2213,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
 
     reconciled = co_await replication_->ReconcileClusterFailoverAction(action);
     if (!reconciled.ok()) co_return reconciled;
-    status = co_await replication_->cluster_failover_action_status();
+    status = co_await CheckedFailover(*replication_);
     if (!status.action_.has_value() || *status.action_ != action ||
         status.state_ !=
             lavik::ClusterFailoverActionState::kWaitingForAuthorization) {
@@ -2138,7 +2226,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
       absl::Status waited = co_await bycorf::SleepFor(
           *bycorf::ThisWorker().self_, std::chrono::milliseconds(50));
       if (!waited.ok()) co_return waited;
-      status = co_await replication_->cluster_failover_action_status();
+      status = co_await CheckedFailover(*replication_);
       if (status.state_ !=
               lavik::ClusterFailoverActionState::kWaitingForAuthorization ||
           status.failure_class_ == "watchdog") {
@@ -2177,7 +2265,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
       const auto preparing_deadline =
           std::chrono::steady_clock::now() + std::chrono::seconds(5);
       do {
-        status = co_await replication_->cluster_failover_action_status();
+        status = co_await CheckedFailover(*replication_);
         if (status.state_ == lavik::ClusterFailoverActionState::kPreparing) {
           break;
         }
@@ -2215,7 +2303,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
           fault_barriers_.runner_terminal_,
           "superseded failover runner terminal barrier");
       if (!barrier.ok()) co_return barrier;
-      status = co_await replication_->cluster_failover_action_status();
+      status = co_await CheckedFailover(*replication_);
       if (replace_while_preparing) {
         if (!status.action_.has_value() ||
             status.action_->action_id_ != replacement_action_id ||
@@ -2292,7 +2380,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
               "CONTINUE from its retained proof");
         }
         const lavik::ClusterPopulationStatus retained =
-            co_await replication_->cluster_population_status();
+            co_await CheckedPopulation(*replication_);
         if (retained.state_ != lavik::ReplicationGroupState::kReady ||
             !retained.ready_token_.has_value()) {
           co_return TestFailure(
@@ -2333,7 +2421,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
       const auto successor_deadline =
           std::chrono::steady_clock::now() + std::chrono::seconds(5);
       do {
-        status = co_await replication_->cluster_failover_action_status();
+        status = co_await CheckedFailover(*replication_);
         if (status.state_ == lavik::ClusterFailoverActionState::kPrepared ||
             status.state_ == lavik::ClusterFailoverActionState::kFailed) {
           break;
@@ -2358,7 +2446,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
     }
     const auto deadline = std::chrono::steady_clock::now() + 10s;
     do {
-      status = co_await replication_->cluster_failover_action_status();
+      status = co_await CheckedFailover(*replication_);
       if (status.state_ == lavik::ClusterFailoverActionState::kPrepared ||
           status.state_ == lavik::ClusterFailoverActionState::kFailed) {
         break;
@@ -2375,7 +2463,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
             "watchdog did not publish the exact terminal ActionFailed");
       }
       lavik::ClusterPopulationStatus failed_population =
-          co_await replication_->cluster_population_status();
+          co_await CheckedPopulation(*replication_);
       if (failed_population.ready_token_.has_value() &&
           failed_population.failover_candidate_eligible_) {
         co_return TestFailure(
@@ -2389,8 +2477,8 @@ class FailoverActionReconcileService final : public bycorf::Service {
       reconciled =
           co_await replication_->ReconcileClusterFailoverAction(replacement);
       if (!reconciled.ok()) co_return reconciled;
-      status = co_await replication_->cluster_failover_action_status();
-      failed_population = co_await replication_->cluster_population_status();
+      status = co_await CheckedFailover(*replication_);
+      failed_population = co_await CheckedPopulation(*replication_);
       if (!status.action_.has_value() || *status.action_ != replacement ||
           status.state_ !=
               lavik::ClusterFailoverActionState::kWaitingForAuthorization ||
@@ -2435,7 +2523,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
       if (!initialized.ok()) co_return initialized.status();
       absl::Status ready = co_await initialized->Await();
       if (!ready.ok()) co_return ready;
-      failed_population = co_await replication_->cluster_population_status();
+      failed_population = co_await CheckedPopulation(*replication_);
       if (!failed_population.failover_candidate_eligible_) {
         co_return TestFailure(
             "a replacement population remained suppressed by an old action");
@@ -2473,7 +2561,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
     const lavik::ClusterFailoverPreparedContext prepared = *status.prepared_;
     reconciled = co_await replication_->ReconcileClusterFailoverAction(action);
     if (!reconciled.ok()) co_return reconciled;
-    status = co_await replication_->cluster_failover_action_status();
+    status = co_await CheckedFailover(*replication_);
     if (status.state_ != lavik::ClusterFailoverActionState::kPrepared ||
         status.prepared_ != prepared) {
       co_return TestFailure("prepared action replay repeated local effects");
@@ -2492,7 +2580,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
     reconciled =
         co_await replication_->ReconcileClusterFailoverAction(degraded);
     if (!reconciled.ok()) co_return reconciled;
-    status = co_await replication_->cluster_failover_action_status();
+    status = co_await CheckedFailover(*replication_);
     if (!status.action_.has_value() || *status.action_ != degraded ||
         status.state_ != lavik::ClusterFailoverActionState::kPrepared ||
         status.prepared_ != prepared) {
@@ -2514,7 +2602,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
         reconciled =
             co_await replication_->ReconcileClusterFailoverAction(replacement);
         if (!reconciled.ok()) co_return reconciled;
-        status = co_await replication_->cluster_failover_action_status();
+        status = co_await CheckedFailover(*replication_);
         if (!status.action_.has_value() || *status.action_ != replacement ||
             status.state_ !=
                 lavik::ClusterFailoverActionState::kWaitingForAuthorization) {
@@ -2543,7 +2631,7 @@ class FailoverActionReconcileService final : public bycorf::Service {
     reconciled = co_await replication_->ReconcileClusterFailoverAction(
         std::nullopt, action.action_id_);
     if (!reconciled.ok()) co_return reconciled;
-    status = co_await replication_->cluster_failover_action_status();
+    status = co_await CheckedFailover(*replication_);
     if (status.action_.has_value() ||
         status.state_ != lavik::ClusterFailoverActionState::kNone) {
       co_return TestFailure("action removal retained boot-local progress");
@@ -3181,7 +3269,7 @@ class CandidateRecoveryService final : public bycorf::Service {
     const auto wait_until = std::chrono::steady_clock::now() + 5s;
     lavik::ClusterFailoverActionStatus observed;
     do {
-      observed = co_await replication_->cluster_failover_action_status();
+      observed = co_await CheckedFailover(*replication_);
       if (observed.state_ ==
           lavik::ClusterFailoverActionState::kRecoveryComplete)
         break;
@@ -3223,7 +3311,7 @@ class CandidateRecoveryService final : public bycorf::Service {
     status = co_await replication_->ReconcileClusterFailoverAction(action);
     if (!status.ok()) co_return status;
     do {
-      observed = co_await replication_->cluster_failover_action_status();
+      observed = co_await CheckedFailover(*replication_);
       if (observed.state_ == lavik::ClusterFailoverActionState::kPrepared)
         break;
       if (observed.state_ == lavik::ClusterFailoverActionState::kFailed)
@@ -3329,7 +3417,7 @@ class CandidateRecoveryService final : public bycorf::Service {
     if (!status.ok()) co_return status;
     status = co_await JoinNativeProbe(*probe);
     if (!status.ok()) co_return status;
-    const auto population = co_await replication_->cluster_population_status();
+    const auto population = co_await CheckedPopulation(*replication_);
     if (!population.failover_candidate_eligible_ ||
         population.applied_next_lsns_ != expected_)
       co_return TestFailure("donor revocation changed its candidate proof");
@@ -3510,7 +3598,7 @@ class CandidateRecoveryService final : public bycorf::Service {
     const auto deadline = std::chrono::steady_clock::now() + 5s;
     lavik::ClusterPopulationStatus population;
     do {
-      population = co_await replication_->cluster_population_status();
+      population = co_await CheckedPopulation(*replication_);
       if (switched ? parent_->continued()
           : parent_mode_ == 7
               ? (storage_->ReplicaRecoveryFenced() &&
@@ -3533,7 +3621,7 @@ class CandidateRecoveryService final : public bycorf::Service {
       co_return TestFailure("recovered Active did not admit destructive FULL");
     status = co_await replication_->ReconcileClusterFollowOwner(std::nullopt);
     if (!status.ok()) co_return status;
-    population = co_await replication_->cluster_population_status();
+    population = co_await CheckedPopulation(*replication_);
     if (parent_mode_ == 7) {
       if (population.ready_token_.has_value() ||
           population.applied_next_lsns_.has_value() ||
@@ -3896,7 +3984,7 @@ class NativeFailoverActionService final : public bycorf::Service {
       const auto preparing_deadline =
           std::chrono::steady_clock::now() + std::chrono::seconds(5);
       do {
-        status = co_await replication_->cluster_failover_action_status();
+        status = co_await CheckedFailover(*replication_);
         if (status.state_ == lavik::ClusterFailoverActionState::kPreparing) {
           break;
         }
@@ -3928,7 +4016,7 @@ class NativeFailoverActionService final : public bycorf::Service {
           fault_barriers_.runner_terminal_,
           "self-origin superseded failover runner terminal barrier");
       if (!barrier.ok()) co_return barrier;
-      status = co_await replication_->cluster_failover_action_status();
+      status = co_await CheckedFailover(*replication_);
       if (status.state_ != lavik::ClusterFailoverActionState::kNone ||
           status.action_.has_value() || !status.failure_class_.empty() ||
           !status.failure_detail_.empty() || status.prepared_.has_value()) {
@@ -3974,7 +4062,7 @@ class NativeFailoverActionService final : public bycorf::Service {
     }
     const auto deadline = std::chrono::steady_clock::now() + 10s;
     do {
-      status = co_await replication_->cluster_failover_action_status();
+      status = co_await CheckedFailover(*replication_);
       if (status.state_ == lavik::ClusterFailoverActionState::kPrepared ||
           status.state_ == lavik::ClusterFailoverActionState::kFailed) {
         break;
@@ -4093,7 +4181,7 @@ class ClusterSourcePauseService final : public bycorf::Service {
           "failed source pause did not retain exactly one expiration pause");
     }
     lavik::ClusterSourcePauseStatus status =
-        co_await replication_->cluster_source_pause_status();
+        co_await CheckedSourcePause(*replication_);
     if (!status.desired_.has_value() || *status.desired_ != pause ||
         status.stable_next_lsns_.has_value() ||
         status.failure_detail_.empty()) {
@@ -4116,7 +4204,7 @@ class ClusterSourcePauseService final : public bycorf::Service {
           ? TestFailure("source pause replacement opened expiry")
           : reconciled;
     }
-    status = co_await replication_->cluster_source_pause_status();
+    status = co_await CheckedSourcePause(*replication_);
     if (!status.desired_.has_value() || *status.desired_ != replacement ||
         !status.stable_next_lsns_.has_value() ||
         status.stable_next_lsns_->size() != 1 ||
@@ -4128,7 +4216,7 @@ class ClusterSourcePauseService final : public bycorf::Service {
 
     reconciled =
         co_await replication_->ReconcileClusterSourcePause(replacement);
-    status = co_await replication_->cluster_source_pause_status();
+    status = co_await CheckedSourcePause(*replication_);
     if (!reconciled.ok() || status.stable_next_lsns_ != stable ||
         storage_->ExpirationPauseCount() != 1) {
       co_return TestFailure("exact source pause replay repeated local effects");
@@ -4139,7 +4227,7 @@ class ClusterSourcePauseService final : public bycorf::Service {
     if (!reconciled.ok() || storage_->ExpirationPauseCount() != 0) {
       co_return TestFailure("source pause removal did not resume expiration");
     }
-    status = co_await replication_->cluster_source_pause_status();
+    status = co_await CheckedSourcePause(*replication_);
     if (status.desired_.has_value() || status.stable_next_lsns_.has_value()) {
       co_return TestFailure("source pause removal retained an observation");
     }
@@ -4225,7 +4313,7 @@ class FollowOwnerReconcileService final : public bycorf::Service {
     const auto deadline = std::chrono::steady_clock::now() + 5s;
     do {
       const lavik::ClusterPopulationStatus population =
-          co_await replication_->cluster_population_status();
+          co_await CheckedPopulation(*replication_);
       if (population.state_ == lavik::ReplicationGroupState::kRebuilding &&
           !population.ready_token_.has_value() &&
           replication_->upstream().has_value()) {
@@ -4253,7 +4341,7 @@ class FollowOwnerReconcileService final : public bycorf::Service {
     if (!waited.ok()) co_return waited;
 
     const lavik::ClusterPopulationStatus population =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     if (population.state_ != lavik::ReplicationGroupState::kNotReady ||
         population.ready_token_.has_value() ||
         replication_->upstream().has_value()) {
@@ -4321,7 +4409,7 @@ class FollowOwnerReconcileService final : public bycorf::Service {
     if (!waited.ok()) co_return waited;
 
     const lavik::ClusterPopulationStatus before_export_ready =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     const lavik::ReplicationIdentity after_fence =
         co_await replication_->ObserveIdentity();
     if (before_export_ready.state_ != lavik::ReplicationGroupState::kReady ||
@@ -4368,7 +4456,7 @@ class FollowOwnerReconcileService final : public bycorf::Service {
     const auto admission_deadline = std::chrono::steady_clock::now() + 5s;
     lavik::ClusterPopulationStatus after_export_ready;
     do {
-      after_export_ready = co_await replication_->cluster_population_status();
+      after_export_ready = co_await CheckedPopulation(*replication_);
       if (after_export_ready.state_ ==
               lavik::ReplicationGroupState::kRebuilding &&
           storage_->ReplicaRecoveryFenced())
@@ -4415,7 +4503,7 @@ class FollowOwnerReconcileService final : public bycorf::Service {
     reconciled =
         co_await replication_->ReconcileClusterFollowOwner(std::nullopt);
     if (!reconciled.ok()) co_return reconciled;
-    const auto interrupted = co_await replication_->cluster_population_status();
+    const auto interrupted = co_await CheckedPopulation(*replication_);
     if (interrupted.ready_token_.has_value() ||
         interrupted.applied_next_lsns_.has_value() ||
         !storage_->ReplicaRecoveryFenced() ||
@@ -5236,7 +5324,7 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
           "idle source cleanup retired Meta's owned replication history");
     }
     const lavik::ClusterPopulationStatus population =
-        co_await replication_->cluster_population_status();
+        co_await CheckedPopulation(*replication_);
     if (population.state_ != lavik::ReplicationGroupState::kReady ||
         !population.ready_token_.has_value() || replication_->is_replica()) {
       co_return TestFailure(

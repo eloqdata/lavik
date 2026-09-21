@@ -58,6 +58,17 @@ control worker maps to CPU 2. Supplying N+1 entries specifies the complete
 mapping; repeated CPU IDs are supported. `--no-pin-workers` disables pinning
 and cannot be combined with an explicit CPU list. Startup logs show the
 resolved worker count, shard count, control worker ID and CPU mapping.
+`--meta-exclusive-cpu` (config: `meta-exclusive-cpu yes`) defaults to false.
+It reserves the final selected logical CPU for the Meta worker and cycles data
+workers over the remaining CPUs. Without an explicit shard count, ten selected
+CPUs produce ten data workers plus Meta by default, or nine data workers plus
+Meta with this option. An explicit `--shards N` keeps N data workers, even when
+N exceeds the available data CPUs; none are pinned to the reserved Meta CPU.
+The option requires pinning and at least two selected CPUs; the reserved CPU
+must not also appear earlier in an explicit list. This isolates Lavik workers,
+not other processes, IRQs, or SMT siblings. Keep an explicit shard count when
+restarting existing storage: changing automatic sizing can change its layout.
+
 `LAVIK_IRQ_CPUSET` is the disjoint CPU set to reserve for the OS and NIC IRQs.
 Apply that reservation in your service manager or follow the
 [IRQ tuning guide](irq-affinity-tuning.md) when manually configuring IRQs.

@@ -438,6 +438,17 @@ struct ClusterFailoverActionStatus {
   std::optional<ClusterCandidateRecoveryResult> recovery_;
 };
 
+// Immutable heartbeat inputs published together by the replication owner.
+// Ordinary renewal reads this value without scheduling work on a data shard.
+// The version binds the sampled frontier and identity to one publication.
+struct ReplicationHeartbeatObservation {
+  std::uint64_t version_ = 0;
+  ReplicationIdentity identity_;
+  ClusterPopulationStatus population_;
+  ClusterSourcePauseStatus source_pause_;
+  ClusterFailoverActionStatus failover_;
+};
+
 // FDS-owned subset of population identity. Assignment and immutable manifest
 // plus the Meta partition-replication epoch decide whether a completed local
 // population still belongs to the group; a term additionally scopes an
@@ -563,6 +574,11 @@ class ReplicationManager {
   // Copies the current node, boot, and local history identities without
   // collecting replication progress or downstream session status.
   bycorf::Task<ReplicationIdentity> ObserveIdentity() const;
+
+  // Reads a published owner snapshot; never submits to or waits for a shard.
+  // Candidate progress uses a bounded coherent sample of the retained frontier.
+  ReplicationHeartbeatObservation ObserveHeartbeat() const;
+  bool HeartbeatObservationIsCurrent(std::uint64_t version) const;
 
   // Copies the immutable desired-upstream snapshot. Runtime workers cache it
   // locally; unchanged reads require no cross-worker hop or shared refcount

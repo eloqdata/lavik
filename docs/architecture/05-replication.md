@@ -98,22 +98,29 @@ this action.
 ## Runtime ownership
 
 Worker zero owns mutable role, upstream configuration, target sessions,
-population proofs, source authorizations, and failure state. Control commands
-and observations from other workers enter through Bycorf submissions and resume
-on their caller's worker. No process-thread mutex serializes this state.
-The node controller shares that owner, so validation and non-suspending exact
-completion lookup form one uninterrupted decision. Per-worker immutable
-upstream caches serve legacy MOVED replies without an owner hop; role and
-serving-generation admission remain atomic and independent of that cache.
+population proofs, source authorizations, and failure state. Control actions
+and fresh queries from other workers enter through Bycorf submissions and
+resume on their caller's worker. The node controller runs on the final control
+worker and awaits these owner-side actions at transition boundaries.
+Per-worker immutable upstream caches serve legacy MOVED replies without an
+owner hop; role and serving-generation admission remain atomic and independent
+of that cache.
+
+Ordinary heartbeats read an immutable owner-published snapshot containing
+identity, population proof, source-pause evidence, and failover progress. State
+changes publish a complete replacement before suspending or signaling their
+completion; proof withdrawal and terminal failure retire positive evidence at
+that boundary. The control worker retains one snapshot and its corresponding
+frontier, samples flow progress with bounded atomic reads, and rechecks the
+snapshot version after a suspending readiness transition. Heartbeat production
+therefore does not wait for a busy data worker to execute a query.
 
 Data flows remain on their assigned workers and publish progress through their
 existing session/frontier boundaries. A malformed or failed flow awaits
 owner-side exact-session invalidation before completing teardown; a retired
-flow cannot invalidate its replacement. Population heartbeat sampling runs on
-the owner without suspending while it captures the proof, and validates the
-concurrently published frontier independently. The downstream registry retains
-its coroutine-aware cross-worker gate because source flow workers also access
-it; it does not block an operating-system worker thread.
+flow cannot invalidate its replacement. The downstream registry retains its
+coroutine-aware cross-worker gate because source flow workers also access it;
+it does not block an operating-system worker thread.
 
 ## Roles and lifecycle
 

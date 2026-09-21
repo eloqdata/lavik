@@ -2403,13 +2403,13 @@ struct MetaControlClientService::Impl {
     while (!state->closing_) {
       if (co_await QuiesceHeartbeatIfRequested(state)) continue;
       const auto observation_started = std::chrono::steady_clock::now();
-      const ReplicationIdentity latest =
-          co_await replication_.ObserveIdentity();
+      auto observation = replication_.ObserveHeartbeat();
+      const ReplicationIdentity& latest = observation.identity_;
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
       if (detail::ReplicationIdentityRequiresMetaReconnect(
               state->replication_identity_, latest)) {
         const ClusterFailoverActionStatus identity_transition_status =
-            co_await replication_.cluster_failover_action_status();
+            observation.failover_;
         if (state->heartbeat_projection_gate_.pause_requested()) continue;
         if (detail::EvaluateMetaSessionReplicationIdentity(
                 state->replication_identity_, latest,
@@ -2420,8 +2420,7 @@ struct MetaControlClientService::Impl {
           break;
         }
       }
-      ClusterPopulationStatus population =
-          co_await replication_.cluster_population_status();
+      ClusterPopulationStatus population = std::move(observation.population_);
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
       auto readiness = PopulationProof(population, *state->desired_);
       const bool losing_readiness =
@@ -2454,17 +2453,15 @@ struct MetaControlClientService::Impl {
       }
 
       ClusterSourcePauseStatus source_pause_status =
-          co_await replication_.cluster_source_pause_status();
+          std::move(observation.source_pause_);
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
-      // A first identity mismatch may have sampled Preparing before the native
-      // action published Prepared or Failed. Resample after the other awaited
-      // heartbeat inputs, then use this one action snapshot for both the final
-      // identity decision and the observation placed on the wire.
+      // Readiness transitions can suspend. Never combine their result with a
+      // snapshot retired by a concurrent population/identity/action change.
+      if (!replication_.HeartbeatObservationIsCurrent(observation.version_))
+        continue;
       ClusterFailoverActionStatus failover_status =
-          co_await replication_.cluster_failover_action_status();
-      if (state->heartbeat_projection_gate_.pause_requested()) continue;
-      const ReplicationIdentity after_failover_status =
-          co_await replication_.ObserveIdentity();
+          std::move(observation.failover_);
+      const ReplicationIdentity& after_failover_status = observation.identity_;
       RecordClusterControlWait(
           ClusterControlWait::kObservation,
           std::chrono::duration_cast<std::chrono::microseconds>(

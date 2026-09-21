@@ -418,6 +418,13 @@ absl::Status ApplyRedisConfigDirective(
     if (directive.size() != 2) return WrongArgumentCount(name);
     return ParseUnsigned(directive[1], name, &options->shard_count_, false);
   }
+  if (name == "meta-exclusive-cpu") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    auto enabled = ParseYesNo(directive[1], name);
+    if (!enabled.ok()) return enabled.status();
+    options->meta_exclusive_cpu_ = *enabled;
+    return absl::OkStatus();
+  }
   if (name == "cpus") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     std::vector<unsigned> cpus;
@@ -642,6 +649,10 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
       options.shard_count_ > std::numeric_limits<bycorf::WorkerId>::max() - 1) {
     return absl::InvalidArgumentError("shards exceeds runtime worker capacity");
   }
+  if (options.meta_exclusive_cpu_ && !options.pin_workers_) {
+    return absl::InvalidArgumentError(
+        "meta-exclusive-cpu requires pin-workers");
+  }
   if (!options.cpu_ids_.empty() && !options.pin_workers_) {
     return absl::InvalidArgumentError("cpus requires pin-workers");
   }
@@ -805,9 +816,10 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::vector<unsigned>> ResolveWorkerCpuIds(
+namespace {
+
+absl::StatusOr<std::vector<unsigned>> SelectedWorkerCpus(
     const ServerOptions& options) {
-  if (!options.pin_workers_) return std::vector<unsigned>{};
   cpu_set_t allowed;
   CPU_ZERO(&allowed);
   if (::sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
@@ -829,12 +841,50 @@ absl::StatusOr<std::vector<unsigned>> ResolveWorkerCpuIds(
           absl::StrCat("CPU ", cpu, " is outside inherited affinity"));
     }
   }
+  if (options.meta_exclusive_cpu_) {
+    if (!options.pin_workers_)
+      return absl::InvalidArgumentError(
+          "meta-exclusive-cpu requires pin-workers");
+    const unsigned reserved = cpus.back();
+    // Repeated IDs must not sneak the reserved CPU back into the data pool.
+    if (cpus.size() < 2 ||
+        std::find(cpus.begin(), cpus.end() - 1, reserved) != cpus.end() - 1) {
+      return absl::InvalidArgumentError(
+          "meta-exclusive-cpu requires a distinct final CPU and at least two "
+          "CPUs");
+    }
+  }
+  return cpus;
+}
+
+}  // namespace
+
+absl::Status ResolveAutomaticShardCount(ServerOptions* options) {
+  if (options->shard_count_ != 0) return absl::OkStatus();
+  auto cpus = SelectedWorkerCpus(*options);
+  if (!cpus.ok()) return cpus.status();
+  options->shard_count_ = static_cast<unsigned>(cpus->size()) -
+                          static_cast<unsigned>(options->meta_exclusive_cpu_);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::vector<unsigned>> ResolveWorkerCpuIds(
+    const ServerOptions& options) {
+  if (!options.pin_workers_ && !options.meta_exclusive_cpu_)
+    return std::vector<unsigned>{};
+  auto selected = SelectedWorkerCpus(options);
+  if (!selected.ok()) return selected.status();
+  const auto& cpus = *selected;
+  const auto data_cpu_count = cpus.size() - options.meta_exclusive_cpu_;
   std::vector<unsigned> result;
   const unsigned total = options.shard_count_ + 1;
   result.reserve(total);
-  for (unsigned worker = 0; worker < total; ++worker) {
-    result.push_back(cpus[worker % cpus.size()]);
+  for (unsigned worker = 0; worker < options.shard_count_; ++worker) {
+    result.push_back(cpus[worker % data_cpu_count]);
   }
+  result.push_back(options.meta_exclusive_cpu_
+                       ? cpus.back()
+                       : cpus[options.shard_count_ % cpus.size()]);
   return result;
 }
 

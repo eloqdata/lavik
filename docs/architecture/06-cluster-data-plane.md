@@ -50,14 +50,18 @@ seams:
 The final runtime worker owns the Meta client and every NodeControlInstaller
 mutation, including readiness changes submitted by data worker 0. Redis
 connections and data shards occupy only the preceding workers. Replication's
-coordinator remains on data worker 0; control observations and actions cross
-that ownership boundary through coroutine submissions. Moving the control
-session prevents a synchronous data command from occupying its event loop,
-but observations and first installation after an authority transition can
-still wait for data work. Unchanged, unexpired lease renewal updates one
-shared atomic deadline on the control worker without submissions, locks, or
-joining directive work. First installation and invalidating transitions retain
-their data-worker barriers and fresh readiness checks.
+coordinator remains on data worker 0. It publishes immutable heartbeat inputs
+at population, identity, source-pause, and failover state changes before
+suspending or notifying completion. The control worker reads one published
+version without submitting work to a data shard; live replica progress is a
+bounded coherent sample of the frontier retained by that same snapshot.
+Heartbeat construction rechecks the publication after any readiness transition
+that could suspend, so it cannot combine retired observations with a new proof.
+Control actions and first installation after an authority transition retain
+their data-worker barriers and fresh readiness checks. Unchanged, unexpired
+lease renewal updates one shared atomic deadline on the control worker without
+submissions or joining directive work. A slow data command can delay action
+completion without making ordinary heartbeat construction wait in its queue.
 
 The Redis/storage boundary adds a transport-neutral final seam:
 `storage::MutationPrecondition` carries the captured admission through every

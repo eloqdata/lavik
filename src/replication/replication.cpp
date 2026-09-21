@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "absl/cleanup/cleanup.h"
 #include "replication_internal.h"
 
 #if LAVIK_FAULTS_ENABLED
@@ -946,6 +947,25 @@ bool IsLeaseAdmissionSuspended(const absl::Status& status) {
 
 }  // namespace replication_internal
 
+namespace {
+
+void SampleHeartbeatFrontier(
+    ClusterPopulationStatus& population,
+    const std::shared_ptr<detail::ReplicaAppliedFrontier>& frontier) {
+  if (frontier == nullptr || !population.ready_token_.has_value()) return;
+  auto sample = frontier->TrySnapshot();
+  const auto& cut = population.ready_token_->cut_vector();
+  if (sample.ok() && sample->size() == cut.size() &&
+      std::equal(sample->begin(), sample->end(), cut.begin(),
+                 [](std::uint64_t live, std::uint64_t start) {
+                   return live >= start;
+                 })) {
+    population.applied_next_lsns_ = std::move(*sample);
+  }
+}
+
+}  // namespace
+
 ReplicationManager::ReplicationGroup::ReplicationGroup(
     storage::StorageEngine* storage,
     std::optional<ReplicaOfConfig> initial_upstream,
@@ -1036,6 +1056,11 @@ ReplicationManager::ReplicationGroup::ReplicationGroup(
   // Every external upstream uses the Redis PSYNC connection path.
   initial_redis_connection_pending_ = upstream_.has_value();
   PublishUpstreamSnapshot();
+  auto initial = std::make_shared<HeartbeatSnapshot>();
+  initial->observation_.identity_ = {node_id_, boot_id_, history_id_};
+  initial->observation_.population_.local_node_id_ = node_id_;
+  initial->observation_.population_.local_boot_id_ = boot_id_;
+  published_heartbeat_.store(std::move(initial), std::memory_order_release);
 }
 
 auto ReplicationManager::ReplicationGroup::StorageReady(bycorf::Worker& worker)
@@ -1189,6 +1214,7 @@ auto ReplicationManager::ReplicationGroup::StartClusterRebuildDirective(
       role_epoch_.fetch_add(1, std::memory_order_acq_rel);
     }
   }
+  PublishHeartbeatObservation();
   // Cancellation is synchronous and must precede the first await below.
   // Otherwise the old control coroutine could publish ONLINE after serving
   // was closed but before its sockets were revoked.
@@ -1267,6 +1293,7 @@ auto ReplicationManager::ReplicationGroup::StartClusterRebuildDirective(
         SetDesiredUpstream(std::nullopt);
         upstream_node_id_.reset();
         upstream_history_id_.reset();
+        PublishHeartbeatObservation();
       }
       co_return absl::CancelledError(
           "cluster rebuild supersession stopped for process shutdown");
@@ -1309,6 +1336,7 @@ auto ReplicationManager::ReplicationGroup::StartClusterRebuildDirective(
     co_return absl::AbortedError(reason);
   }
 
+  PublishHeartbeatObservation();
   StartCoordinator();
   co_return context->completion_;
 }
@@ -1446,6 +1474,7 @@ auto ReplicationManager::ReplicationGroup::StartEmptyPopulationInitialization(
     LatchReplicationFailure(reason);
     co_return absl::AbortedError(reason);
   }
+  PublishHeartbeatObservation();
   bycorf::ThisWorker().self_->Spawn(RunEmptyPopulationInitialization(context));
   co_return context->completion_;
 }
@@ -1549,6 +1578,7 @@ auto ReplicationManager::ReplicationGroup::
     group_id_ = PopulationGroupToken(directive.identity_.group_id_);
     source_worker_count_ = directive.required_applied_next_lsns_.size();
     native_dataset_valid_.store(true, std::memory_order_release);
+    PublishHeartbeatObservation();
   }
   co_return absl::OkStatus();
 }
@@ -1671,6 +1701,7 @@ auto ReplicationManager::ReplicationGroup::AdoptLocalOwnerHistory()
   // Native Owner progress is sampled from its live source logs. Retaining a
   // fixed replica frontier here would advertise a stale child cursor.
   applied_frontier_.reset();
+  PublishHeartbeatObservation();
   return absl::OkStatus();
 }
 
@@ -1900,6 +1931,7 @@ auto ReplicationManager::ReplicationGroup::RunClusterPromotionPrepare(
   }
   recovered_population_fenced_ = false;
   native_dataset_valid_.store(true, std::memory_order_release);
+  PublishHeartbeatObservation();
   context->completion_->Resolve(*prepared);
   co_return absl::OkStatus();
 }
@@ -2030,6 +2062,7 @@ auto ReplicationManager::ReplicationGroup::
   StoreRole(ReplicationRole::kSyncing, std::memory_order_release);
   storage_->SetReplicaLoading(true);
   storage_->SetExpirationAuthority(false);
+  PublishHeartbeatObservation();
   if (session != nullptr) session->Cancel();
   bycorf::ThisWorker().self_->Spawn(RunClusterPromotionPrepare(
       context, population, std::move(frontier), std::move(session),
@@ -2094,6 +2127,7 @@ auto ReplicationManager::ReplicationGroup::
   StoreRole(ReplicationRole::kSyncing, std::memory_order_release);
   storage_->SetReplicaLoading(true);
   storage_->SetExpirationAuthority(false);
+  PublishHeartbeatObservation();
   bycorf::ThisWorker().self_->Spawn(RunClusterPromotionPrepare(
       context, std::move(population), nullptr, nullptr,
       /*native_population=*/true));
@@ -2165,8 +2199,11 @@ auto ReplicationManager::ReplicationGroup::CaptureClusterSourcePause(
   if (cluster_source_pause_ != context) {
     co_return absl::AbortedError("cluster source pause was replaced");
   }
+  const auto publish =
+      absl::MakeCleanup([this] { PublishHeartbeatObservation(); });
   context->stable_next_lsns_.reset();
   context->failure_detail_.clear();
+  PublishHeartbeatObservation();
   if (!SourcePausePopulationMatches(context->desired_)) {
     const absl::Status mismatch = absl::FailedPreconditionError(
         "cluster source pause does not match the ready owner population");
@@ -2224,6 +2261,7 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterSourcePause(
       previous->expiration_pause_held_ = false;
       storage_->ResumeExpiration();
     }
+    PublishHeartbeatObservation();
     co_return absl::OkStatus();
   }
   if (absl::Status valid = ValidateClusterSourcePause(*desired); !valid.ok()) {
@@ -2246,11 +2284,13 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterSourcePause(
     cluster_source_pause_->expiration_pause_held_ = false;
   }
   cluster_source_pause_ = next;
+  PublishHeartbeatObservation();
   if (!next->expiration_pause_held_) {
     absl::Status quiesced = co_await storage_->QuiesceExpiration();
     if (!quiesced.ok()) {
       if (cluster_source_pause_ == next) {
         next->failure_detail_ = quiesced.ToString();
+        PublishHeartbeatObservation();
       }
       co_return quiesced;
     }
@@ -2269,32 +2309,35 @@ auto ReplicationManager::ReplicationGroup::cluster_source_pause_status() const
     co_return co_await bycorf::SubmitTaskTo(
         0, [this] { return cluster_source_pause_status(); });
   }
+  co_return CaptureSourcePauseStatus();
+}
+
+auto ReplicationManager::ReplicationGroup::CaptureSourcePauseStatus() const
+    -> ClusterSourcePauseStatus {
   AssertStateOwner();
   ClusterSourcePauseStatus result;
-  const std::shared_ptr<ClusterSourcePauseContext> context =
-      cluster_source_pause_;
-  if (context == nullptr) co_return result;
+  const auto& context = cluster_source_pause_;
+  if (context == nullptr) return result;
   result.desired_ = context->desired_;
   result.failure_detail_ = context->failure_detail_;
-  if (!context->stable_next_lsns_.has_value() ||
-      !SourcePausePopulationMatches(context->desired_)) {
-    co_return result;
-  }
-  const ReplicationIdentity current = co_await identity();
-  if (cluster_source_pause_ != context ||
-      current.local_node_id_ != context->desired_.source_node_id_ ||
-      current.boot_id_ != context->desired_.source_boot_id_ ||
-      current.local_history_id_ != context->desired_.source_history_id_) {
-    if (cluster_source_pause_ == context) {
+  if (context->stable_next_lsns_.has_value() &&
+      SourcePausePopulationMatches(context->desired_)) {
+    // History writes are also owned by worker zero. This capture cannot yield
+    // between checking the lineage and copying its paused frontier.
+    if (node_id_ == context->desired_.source_node_id_ &&
+        boot_id_ == context->desired_.source_boot_id_ &&
+        history_id_ == context->desired_.source_history_id_) {
+      result.stable_next_lsns_ = context->stable_next_lsns_;
+    } else {
+      // Retire the cached cut as well: exact desired-state replay must retry
+      // capture rather than treating a different history's old cut as complete.
       context->stable_next_lsns_.reset();
       context->failure_detail_ =
           "native source identity changed after pause capture";
       result.failure_detail_ = context->failure_detail_;
     }
-    co_return result;
   }
-  result.stable_next_lsns_ = context->stable_next_lsns_;
-  co_return result;
+  return result;
 }
 
 auto ReplicationManager::ReplicationGroup::FailoverPopulationMatches(
@@ -2380,6 +2423,7 @@ auto ReplicationManager::ReplicationGroup::PublishFailoverActionFailure(
   context->failure_detail_ = std::move(failure_detail);
   context->failure_published_ = true;
   failed_failover_candidate_ = context->desired_;
+  PublishHeartbeatObservation();
 }
 
 auto ReplicationManager::ReplicationGroup::FailoverActionWatchdog() const
@@ -3251,6 +3295,7 @@ auto ReplicationManager::ReplicationGroup::MaybeStartCandidateRecovery()
   action->recovery_started_ = true;
   action->recovery_running_ = true;
   action->state_ = ClusterFailoverActionState::kRecovering;
+  PublishHeartbeatObservation();
   bycorf::ThisWorker().self_->Spawn(RunCandidateRecovery(action, scope));
 }
 
@@ -3324,6 +3369,7 @@ auto ReplicationManager::ReplicationGroup::RunCandidateRecovery(
         action->recovery_ = ClusterCandidateRecoveryResult{
             std::move(*cut), "coverage-unavailable"};
         action->state_ = ClusterFailoverActionState::kRecoveryComplete;
+        PublishHeartbeatObservation();
         co_return absl::OkStatus();
       }
     }
@@ -3498,6 +3544,7 @@ auto ReplicationManager::ReplicationGroup::RunCandidateRecovery(
   action->recovery_ =
       ClusterCandidateRecoveryResult{std::move(*final), std::move(reason)};
   action->state_ = ClusterFailoverActionState::kRecoveryComplete;
+  PublishHeartbeatObservation();
   spdlog::info(
       "candidate recovery completed group={} action={} reason={} applied={}",
       action->desired_.group_id_, HexBytes(action->desired_.action_id_),
@@ -3569,6 +3616,7 @@ auto ReplicationManager::ReplicationGroup::RunClusterFailoverAction(
       co_return installed;
     }
     operator_recovery_active_ = true;
+    PublishHeartbeatObservation();
   }
   if (cluster_rebuild_ != nullptr && !cluster_rebuild_->manifest_.has_value()) {
     auto manifest =
@@ -3615,6 +3663,7 @@ auto ReplicationManager::ReplicationGroup::RunClusterFailoverAction(
     }
     if (!FailoverPopulationMatches(context->desired_)) {
       context->state_ = ClusterFailoverActionState::kWaitingForPopulation;
+      PublishHeartbeatObservation();
       absl::Status waited =
           co_await WaitForFailoverActionRetry(context, watchdog_deadline);
       if (!waited.ok()) {
@@ -3631,6 +3680,7 @@ auto ReplicationManager::ReplicationGroup::RunClusterFailoverAction(
       auto watermark = co_await CaptureNativeReplicationWatermark();
       if (!watermark.ok()) {
         context->state_ = ClusterFailoverActionState::kRetrying;
+        PublishHeartbeatObservation();
         absl::Status waited =
             co_await WaitForFailoverActionRetry(context, watchdog_deadline);
         if (!waited.ok()) {
@@ -3641,6 +3691,7 @@ auto ReplicationManager::ReplicationGroup::RunClusterFailoverAction(
       }
       if (!watermark->has_value()) {
         context->state_ = ClusterFailoverActionState::kWaitingForPopulation;
+        PublishHeartbeatObservation();
         absl::Status waited =
             co_await WaitForFailoverActionRetry(context, watchdog_deadline);
         if (!waited.ok()) {
@@ -3672,6 +3723,7 @@ auto ReplicationManager::ReplicationGroup::RunClusterFailoverAction(
       auto current = applied_frontier_->TrySnapshot();
       if (!current.ok()) {
         context->state_ = ClusterFailoverActionState::kRetrying;
+        PublishHeartbeatObservation();
         absl::Status waited =
             co_await WaitForFailoverActionRetry(context, watchdog_deadline);
         if (!waited.ok()) {
@@ -3694,6 +3746,7 @@ auto ReplicationManager::ReplicationGroup::RunClusterFailoverAction(
     }
     context->prepare_directive_ = directive;
     context->state_ = ClusterFailoverActionState::kPreparing;
+    PublishHeartbeatObservation();
     absl::StatusOr<
         std::shared_ptr<detail::ClusterPromotionPrepareCompletionState>>
         started{absl::UnknownError("failover promotion was not dispatched")};
@@ -3721,6 +3774,7 @@ auto ReplicationManager::ReplicationGroup::RunClusterFailoverAction(
            cluster_promotion_prepare_ == nullptr);
       if (transient) {
         context->state_ = ClusterFailoverActionState::kRetrying;
+        PublishHeartbeatObservation();
         absl::Status waited =
             co_await WaitForFailoverActionRetry(context, watchdog_deadline);
         if (!waited.ok()) {
@@ -3793,6 +3847,7 @@ auto ReplicationManager::ReplicationGroup::RunClusterFailoverAction(
           .promotion_ = **result,
       };
       context->state_ = ClusterFailoverActionState::kPrepared;
+      PublishHeartbeatObservation();
     }
     finish();
     co_return absl::OkStatus();
@@ -3930,9 +3985,11 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFailoverAction(
           ClusterFailoverActionState::kWaitingForPopulation;
       cluster_failover_action_->runner_started_ = true;
       cluster_failover_action_->runner_finished_ = false;
+      PublishHeartbeatObservation();
       bycorf::ThisWorker().self_->Spawn(
           RunClusterFailoverAction(cluster_failover_action_));
     }
+    PublishHeartbeatObservation();
     MaybeStartCandidateRecovery();
     co_return absl::OkStatus();
   }
@@ -3946,6 +4003,7 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFailoverAction(
         cluster_failover_action_;
     previous->cancelled_ = true;
     cluster_failover_action_.reset();
+    PublishHeartbeatObservation();
     RequestFailoverPromotionCancellation(previous);
     if (previous->recovery_running_ && cluster_recovery_ != nullptr)
       cluster_recovery_->sockets_.Cancel();
@@ -4034,10 +4092,12 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFailoverAction(
           ClusterFailoverActionState::kWaitingForPopulation;
       cluster_failover_action_->runner_started_ = true;
       cluster_failover_action_->runner_finished_ = false;
+      PublishHeartbeatObservation();
       bycorf::ThisWorker().self_->Spawn(
           RunClusterFailoverAction(cluster_failover_action_));
     }
   }
+  PublishHeartbeatObservation();
   MaybeStartCandidateRecovery();
   co_return absl::OkStatus();
 }
@@ -4048,16 +4108,21 @@ auto ReplicationManager::ReplicationGroup::cluster_failover_action_status()
     co_return co_await bycorf::SubmitTaskTo(
         0, [this] { return cluster_failover_action_status(); });
   }
+  co_return CaptureFailoverActionStatus();
+}
+
+auto ReplicationManager::ReplicationGroup::CaptureFailoverActionStatus() const
+    -> ClusterFailoverActionStatus {
   AssertStateOwner();
   ClusterFailoverActionStatus result;
-  if (cluster_failover_action_ == nullptr) co_return result;
+  if (cluster_failover_action_ == nullptr) return result;
   result.state_ = cluster_failover_action_->state_;
   result.action_ = cluster_failover_action_->desired_;
   result.prepared_ = cluster_failover_action_->prepared_;
   result.recovery_ = cluster_failover_action_->recovery_;
   result.failure_class_ = cluster_failover_action_->failure_class_;
   result.failure_detail_ = cluster_failover_action_->failure_detail_;
-  co_return result;
+  return result;
 }
 
 auto ReplicationManager::ReplicationGroup::FindClusterFailoverPreparedContext(
@@ -4219,6 +4284,7 @@ auto ReplicationManager::ReplicationGroup::ActivateClusterPreparedPromotion(
   operator_recovery_active_ = false;
   activated_failover_activation_ = activation;
   activated_failover_prepared_context_ = prepared;
+  PublishHeartbeatObservation();
   co_return absl::OkStatus();
 }
 
@@ -4424,6 +4490,7 @@ auto ReplicationManager::ReplicationGroup::StopClusterFollowIngress(
       applied_frontier_.reset();
       upstream_node_id_.reset();
       upstream_history_id_.reset();
+      PublishHeartbeatObservation();
       native_dataset_valid_.store(false, std::memory_order_release);
       StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
     }
@@ -4522,6 +4589,7 @@ auto ReplicationManager::ReplicationGroup::BeginClusterFollowFullPopulation(
   applied_frontier_.reset();
   upstream_node_id_.reset();
   upstream_history_id_.reset();
+  PublishHeartbeatObservation();
   retained_failover_activation_action_id_.reset();
   retained_failover_prepared_context_.reset();
   retained_failover_desired_action_.reset();
@@ -4621,6 +4689,7 @@ auto ReplicationManager::ReplicationGroup::FreezeFormerOwnerPopulation(
   applied_frontier_ = std::move(applied);
   upstream_node_id_ = std::move(upstream_node);
   upstream_history_id_ = std::move(upstream_history);
+  PublishHeartbeatObservation();
   co_return absl::OkStatus();
 }
 
@@ -4947,6 +5016,7 @@ auto ReplicationManager::ReplicationGroup::RetireClusterPopulation(
     applied_frontier_.reset();
     upstream_node_id_.reset();
     upstream_history_id_.reset();
+    PublishHeartbeatObservation();
     replica_session_id_ = 0;
     source_worker_count_ = 0;
     role_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -5143,6 +5213,7 @@ auto ReplicationManager::ReplicationGroup::InstallRecoveredPopulation(
   upstream_history_id_ = identity.source_history_id_;
   group_id_ = PopulationGroupToken(identity.group_id_);
   recovered_population_fenced_ = true;
+  PublishHeartbeatObservation();
   storage_->SetReplicaLoading(true);
   storage_->SetExpirationAuthority(false);
   co_return absl::OkStatus();
@@ -5161,6 +5232,7 @@ auto ReplicationManager::ReplicationGroup::RecoverClusterPopulation()
         "recovered storage belongs to another Data node");
   }
   recovered_population_ = *scope;
+  PublishHeartbeatObservation();
   if ((**record).clean_proof_.empty()) {
     spdlog::info(
         "cluster population requires rebuild or operator recovery: no clean "
@@ -5347,6 +5419,14 @@ auto ReplicationManager::ReplicationGroup::cluster_population_status() const
     co_return co_await bycorf::SubmitTaskTo(
         0, [this] { return cluster_population_status(); });
   }
+  auto result = CapturePopulationStatus();
+  SampleHeartbeatFrontier(result, applied_frontier_);
+  co_return result;
+}
+
+auto ReplicationManager::ReplicationGroup::CapturePopulationStatus() const
+    -> ClusterPopulationStatus {
+  AssertStateOwner();
   ClusterPopulationStatus result;
   result.local_node_id_ = node_id_;
   result.local_boot_id_ = boot_id_;
@@ -5358,7 +5438,6 @@ auto ReplicationManager::ReplicationGroup::cluster_population_status() const
     result.operator_recovery_identity_ = recovered_population_->identity_;
     result.operator_recovery_identity_->target_boot_id_ = boot_id_;
   }
-  std::shared_ptr<detail::ReplicaAppliedFrontier> frontier;
   {
     AssertStateOwner();
     result.state_ =
@@ -5371,7 +5450,6 @@ auto ReplicationManager::ReplicationGroup::cluster_population_status() const
         cluster_rebuild_ != nullptr &&
         cluster_rebuild_->ready_token_.has_value()) {
       result.ready_token_ = cluster_rebuild_->ready_token_;
-      frontier = applied_frontier_;
       if (failed_failover_candidate_.has_value() &&
           ReadyPopulationIsSuppressed(*failed_failover_candidate_)) {
         result.failover_candidate_eligible_ = false;
@@ -5379,24 +5457,7 @@ auto ReplicationManager::ReplicationGroup::cluster_population_status() const
     }
     result.failure_reason_ = failure_reason_;
   }
-  // Flow workers publish frontier cells independently. This owner-local
-  // sample never suspends, so the population proof cannot change beneath
-  // it; only the frontier's own concurrent publication needs validation.
-  if (frontier != nullptr && result.ready_token_.has_value()) {
-    // A missing vector withdraws the node's previous Meta candidate, so
-    // preserve bounded retries for short publication races.
-    auto snapshot = frontier->TrySnapshot();
-    if (snapshot.ok() &&
-        snapshot->size() == result.ready_token_->cut_vector().size() &&
-        std::equal(snapshot->begin(), snapshot->end(),
-                   result.ready_token_->cut_vector().begin(),
-                   [](std::uint64_t live, std::uint64_t cut) {
-                     return live >= cut;
-                   })) {
-      result.applied_next_lsns_ = std::move(*snapshot);
-    }
-  }
-  co_return result;
+  return result;
 }
 
 auto ReplicationManager::ReplicationGroup::AuthorizeClusterRebuildSource(
@@ -6337,6 +6398,40 @@ auto ReplicationManager::ReplicationGroup::AssertStateOwner() noexcept -> void {
          bycorf::ThisWorker().id_ == 0);
 }
 
+auto ReplicationManager::ReplicationGroup::PublishHeartbeatObservation()
+    -> void {
+  AssertStateOwner();
+  if (!meta_managed_) return;
+  if (heartbeat_version_ == std::numeric_limits<std::uint64_t>::max())
+    std::terminate();
+  auto next = std::make_shared<HeartbeatSnapshot>();
+  next->observation_ = {
+      .version_ = ++heartbeat_version_,
+      .identity_ = {node_id_, boot_id_, history_id_},
+      .population_ = CapturePopulationStatus(),
+      .source_pause_ = CaptureSourcePauseStatus(),
+      .failover_ = CaptureFailoverActionStatus(),
+  };
+  next->frontier_ = applied_frontier_;
+  // Complete the owner mutation before publishing. Readers retain immutable
+  // state and its frontier, including while an old population is retired.
+  published_heartbeat_.store(std::move(next), std::memory_order_release);
+}
+
+auto ReplicationManager::ReplicationGroup::ObserveHeartbeat() const
+    -> ReplicationHeartbeatObservation {
+  auto snapshot = published_heartbeat_.load(std::memory_order_acquire);
+  auto result = snapshot->observation_;
+  SampleHeartbeatFrontier(result.population_, snapshot->frontier_);
+  return result;
+}
+
+auto ReplicationManager::ReplicationGroup::HeartbeatObservationIsCurrent(
+    std::uint64_t version) const -> bool {
+  return published_heartbeat_.load(std::memory_order_acquire)
+             ->observation_.version_ == version;
+}
+
 auto ReplicationManager::ReplicationGroup::PublishUpstreamSnapshot() -> void {
   const auto version = upstream_version_.load(std::memory_order_relaxed);
   if (version == std::numeric_limits<std::uint64_t>::max()) std::terminate();
@@ -6355,6 +6450,7 @@ auto ReplicationManager::ReplicationGroup::SetDesiredUpstream(
   if (upstream_ == upstream) return;
   upstream_ = std::move(upstream);
   PublishUpstreamSnapshot();
+  if (cluster_source_pause_ != nullptr) PublishHeartbeatObservation();
 }
 
 auto ReplicationManager::ReplicationGroup::EmptyPopulationCurrent(
@@ -6402,6 +6498,7 @@ auto ReplicationManager::ReplicationGroup::FinishEmptyPopulationFailure(
                             std::memory_order_release);
     }
   }
+  PublishHeartbeatObservation();
   context->completion_->Resolve(failure);
   co_return failure;
 }
@@ -6634,6 +6731,7 @@ auto ReplicationManager::ReplicationGroup::RunEmptyPopulationInitialization(
   // Population readiness does not convey a write lease. NodeControl enables
   // a finite expiration capability only after the matching FDS and lease
   // deadline pass their final activation recheck.
+  PublishHeartbeatObservation();
   context->completion_->Resolve(absl::OkStatus());
   co_return absl::OkStatus();
 }
@@ -6726,6 +6824,7 @@ auto ReplicationManager::ReplicationGroup::LatchReplicationFailure(
     }
     latched_reason = failure_reason_;
   }
+  PublishHeartbeatObservation();
   if (completion != nullptr) {
     completion->Resolve(absl::InternalError(
         absl::StrCat("replication failed-stopped: ", latched_reason)));
@@ -6887,6 +6986,7 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
         }
         upstream_node_id_.reset();
         upstream_history_id_.reset();
+        PublishHeartbeatObservation();
       }
       replica_session_teardown_running_ = false;
       const bool current_follow =
@@ -7136,6 +7236,7 @@ auto ReplicationManager::ReplicationGroup::ReplayAndSwitchParent(
   storage_->SetReplicaLoading(false);
   recovered_population_fenced_ = false;
   native_dataset_valid_.store(true, std::memory_order_release);
+  PublishHeartbeatObservation();
   // Local commit precedes ACK. Losing this write cannot undo Ready or make
   // an initial child cursor ambiguous on the following ordinary CONTINUE.
   (void)co_await WriteText(stream, "ACK\r\n");
@@ -7468,6 +7569,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
       upstream_node_id_ = std::string(words[2]);
       group_id_ = std::string(words[3]);
       upstream_history_id_ = std::string(words[5]);
+      PublishHeartbeatObservation();
       replica_session_id_ = session_id;
       source_worker_count_ = source_workers;
     }
@@ -9228,6 +9330,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
               co_return replaced;
             }
           }
+          PublishHeartbeatObservation();
           session->cluster_rebuild_->completion_->Resolve(absl::OkStatus());
         } else {
           native_dataset_valid_.store(true, std::memory_order_release);
@@ -9504,6 +9607,7 @@ auto ReplicationManager::ReplicationGroup::InvalidateReplicaContinuation(
       cluster_population_invalidated = true;
     }
   }
+  PublishHeartbeatObservation();
   if (continuation_invalidated) {
     spdlog::warn(
         "invalidated native replication continuation; replacement session "
@@ -11793,6 +11897,7 @@ auto ReplicationManager::ReplicationGroup::DrainSourceEgress()
     retired_master_sessions_.clear();
     disconnected_replica_leases_.clear();
     history_id_ = NewReplicationId();
+    PublishHeartbeatObservation();
     history_bridge_.reset();
     continuation_proofs_.clear();
   }
@@ -12012,6 +12117,7 @@ auto ReplicationManager::ReplicationGroup::MonitorIdleReplicationHistory()
                 disconnected_replica_leases_.empty();
       if (disable) {
         history_id_ = NewReplicationId();
+        PublishHeartbeatObservation();
         history_bridge_.reset();
         continuation_proofs_.clear();
       }
@@ -12100,6 +12206,7 @@ auto ReplicationManager::ReplicationGroup::EnsureReplicationHistoryReady()
     master_sessions_.clear();
     disconnected_replica_leases_.clear();
     history_id_ = NewReplicationId();
+    PublishHeartbeatObservation();
     history_bridge_.reset();
     continuation_proofs_.clear();
   }
@@ -12160,6 +12267,15 @@ Task<absl::Status> ReplicationManager::ApplyDirective(
 
 Task<ReplicationStatus> ReplicationManager::Observe() const {
   return group_->status();
+}
+
+ReplicationHeartbeatObservation ReplicationManager::ObserveHeartbeat() const {
+  return group_->ObserveHeartbeat();
+}
+
+bool ReplicationManager::HeartbeatObservationIsCurrent(
+    std::uint64_t version) const {
+  return group_->HeartbeatObservationIsCurrent(version);
 }
 
 Task<ReplicationIdentity> ReplicationManager::ObserveIdentity() const {

@@ -15,14 +15,12 @@
  */
 
 #include <mimalloc.h>
-#include <sched.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <limits>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -31,23 +29,6 @@
 #include "lavik/logging.h"
 #include "lavik/server.h"
 #include "lavik/version.h"
-
-namespace {
-
-unsigned DefaultWorkerThreadCount() {
-  cpu_set_t allowed;
-  CPU_ZERO(&allowed);
-  if (::sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
-    const int count = CPU_COUNT(&allowed);
-    if (count > 0) {
-      return static_cast<unsigned>(count);
-    }
-  }
-  const unsigned count = std::thread::hardware_concurrency();
-  return count == 0 ? 1U : count;
-}
-
-}  // namespace
 
 int main(int argc, char** argv) {
   // Compile-time defaults make THP and eager commit effective during
@@ -61,7 +42,8 @@ int main(int argc, char** argv) {
   app.set_version_flag("--version", "lavik " + std::string(lavik::kVersion));
 
   lavik::ServerOptions options;
-  options.shard_count_ = DefaultWorkerThreadCount();
+  // Resolve auto sizing after both the file and CLI have selected CPU policy.
+  options.shard_count_ = 0;
   std::string config_file;
   if (argc > 1 && argv[1][0] != '-') {
     config_file = argv[1];
@@ -180,8 +162,9 @@ int main(int argc, char** argv) {
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   app.add_option("-t,--threads,--shards", options.shard_count_,
-                 "Data shard count (plus one control worker)")
-      ->capture_default_str()
+                 "Data shard count (default: selected CPUs, reserving one with "
+                 "--meta-exclusive-cpu)")
+      ->default_str("auto")
       ->check(CLI::PositiveNumber);
   app.add_option("--maxclients", options.max_clients_,
                  "Maximum concurrent client connections")
@@ -189,6 +172,10 @@ int main(int argc, char** argv) {
       ->check(CLI::PositiveNumber);
   app.add_flag("--pin-workers,!--no-pin-workers", options.pin_workers_,
                "Pin workers cyclically to the selected or inherited CPUs")
+      ->capture_default_str();
+  app.add_flag("--meta-exclusive-cpu,!--no-meta-exclusive-cpu",
+               options.meta_exclusive_cpu_,
+               "Reserve the last selected CPU for the Meta worker")
       ->capture_default_str();
   app.add_option("--cpus", options.cpu_ids_,
                  "Logical CPU IDs, cycled over workers")
@@ -387,6 +374,11 @@ int main(int argc, char** argv) {
     return 2;
   }
   options.client_query_buffer_limit_bytes_ = *parsed_query_buffer_limit;
+  const absl::Status resolved = lavik::ResolveAutomaticShardCount(&options);
+  if (!resolved.ok()) {
+    std::cerr << "Configuration error: " << resolved.message() << '\n';
+    return 2;
+  }
   const absl::Status validated = lavik::ValidateServerOptions(options);
   if (!validated.ok()) {
     std::cerr << "Configuration error: " << validated.message() << '\n';

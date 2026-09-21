@@ -58,6 +58,8 @@ struct ServerOptions {
   unsigned shard_count_ = 1;
   std::uint64_t max_clients_ = kDefaultMaxClients;
   bool pin_workers_ = true;
+  // Reserve the final selected CPU for Meta; data workers cycle over the rest.
+  bool meta_exclusive_cpu_ = false;
   std::vector<unsigned> cpu_ids_;
   int idle_timeout_ms_ = -1;
   unsigned recv_buffer_count_ = 1024;

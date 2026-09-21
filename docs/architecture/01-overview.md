@@ -152,6 +152,9 @@ in the [deployment guide](../operations/cluster-deployment.md).
    it remains idle when Meta is not configured. All workers use the same
    selected network and storage backends. CPU placement cycles over an explicit
    list or the inherited affinity mask, allowing multiple workers on one CPU.
+   Optional exclusive Meta placement
+   reserves its final logical CPU and keeps all data workers on the others;
+   automatic sizing subtracts that reserved CPU from N.
 4. On every data worker, `RedisService::Run` binds the memory and transaction shards
    and awaits `StorageEngine::InitializeWorker`. Recovery barriers ensure all
    workers finish recovery and allocator cleanup before the process becomes

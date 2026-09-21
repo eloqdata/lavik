@@ -2225,6 +2225,14 @@ class ReplicationManager::ReplicationGroup {
   Task<std::uint64_t> CountOnlineNativeReplicas() const;
 
   Task<ReplicationIdentity> identity() const;
+  ReplicationHeartbeatObservation ObserveHeartbeat() const;
+  bool HeartbeatObservationIsCurrent(std::uint64_t version) const;
+  ClusterPopulationStatus CapturePopulationStatus() const;
+  ClusterSourcePauseStatus CaptureSourcePauseStatus() const;
+  ClusterFailoverActionStatus CaptureFailoverActionStatus() const;
+  // Owner-only publication must precede suspension after proof/identity
+  // changes.
+  void PublishHeartbeatObservation();
 
   std::optional<ReplicaOfConfig> upstream() const;
 
@@ -2707,13 +2715,20 @@ class ReplicationManager::ReplicationGroup {
   // heartbeat and progress never acquire its descriptor-lifetime mutex.
   SocketSet outbound_sockets_;
   // All mutable role/population/session state below is owned by worker zero.
-  // Foreign workers query or change it with Bycorf messages, never a native
-  // thread lock. Flow-owned progress and command admission stay independent.
+  // Control actions and fresh queries use Bycorf messages. Ordinary heartbeats
+  // read an immutable owner-published snapshot, with no data-worker round trip.
+  // Flow-owned progress and command admission stay independent.
   std::optional<ReplicaOfConfig> upstream_;
   struct UpstreamSnapshot {
     std::uint64_t version_ = 0;
     std::optional<ReplicaOfConfig> endpoint_;
   };
+  struct HeartbeatSnapshot {
+    ReplicationHeartbeatObservation observation_;
+    std::shared_ptr<detail::ReplicaAppliedFrontier> frontier_;
+  };
+  std::atomic<std::shared_ptr<const HeartbeatSnapshot>> published_heartbeat_;
+  std::uint64_t heartbeat_version_ = 0;  // worker 0; initialized before startup
   std::atomic<std::shared_ptr<const UpstreamSnapshot>> published_upstream_;
   std::atomic<std::uint64_t> upstream_version_{0};
   // Each cache is accessed only by its indexed worker, never by the writer.
