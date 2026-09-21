@@ -19,6 +19,9 @@ limitations under the License.
 This directory separates current architecture documentation, historical design
 references, and operational runbooks for Lavik.
 
+For development setup, builds, tests, formatting, and commit steps, start
+with the [contributing guide](../CONTRIBUTING.md).
+
 ## Documentation map
 
 | Directory | Purpose | Authority |

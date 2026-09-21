@@ -336,15 +336,10 @@ test is independent of the larger storage-tier benchmark above.
 - A replication restart can require a full synchronization.
 - Raw block and SPDK paths require exclusive device ownership.
 
-## Development
+## Contributing
 
-```bash
-./scripts/build_debug.sh
-ctest --test-dir build_debug --output-on-failure
-
-# Vendored Valkey data-structure compatibility suites
-LAVIK_BIN="$PWD/build_debug/lavik" tests/valkey/run-lavik
-```
+See the [contributing guide](CONTRIBUTING.md) for development setup, building
+and testing, formatting with pre-commit, and committing a change.
 
 Useful references:
 
