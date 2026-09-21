@@ -780,8 +780,10 @@ Each `(partition, database)` moves through `unstarted`, `scanning`, and
   command FIFO.
 
 Storage-origin mutations without a replayable command, including active
-expiration in a tailing database, enter that FIFO as after-images. Their
-publisher admission is independent of the reusable coverage reservation owned
+expiration, enter that FIFO as after-images whenever the key is covered or
+its database is tailing. A covered key stays ordered even while other keys in
+the database are still scanning; it never returns to replacement capture.
+Publisher admission is independent of the reusable coverage reservation owned
 by the database currently being scanned.
 
 Baseline scans tolerate index growth and shrinking: continuously present keys
