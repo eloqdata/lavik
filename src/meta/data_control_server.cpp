@@ -313,6 +313,11 @@ class SessionIo {
     co_return co_await writer_.Write(priority, std::move(message));
   }
 
+  bycorf::Task<absl::Status> Send(control::MessagePriority priority,
+                                  control::EncodedMessage encoded) {
+    co_return co_await writer_.Write(priority, std::move(encoded));
+  }
+
   void FailDeadline(std::string_view operation) {
     worker_.BeginClose(
         connection_,
@@ -1047,7 +1052,7 @@ BuildCommittedMetaDirectory(const MetaCommittedView& view) {
   control::WireMessage probe_message(std::move(probe));
   auto encoded = control::EncodeMessage(probe_message);
   if (!encoded.ok()) return encoded.status();
-  if (encoded->size() > control::kMaxFramePayloadBytes) {
+  if (encoded->payload.size() > control::kMaxFramePayloadBytes) {
     return absl::ResourceExhaustedError(
         "committed Meta directory cannot fit in ServerHello");
   }
@@ -1876,9 +1881,14 @@ bycorf::Task<absl::Status> SendFullState(
   };
   const std::string_view bytes = batch->encoded_full_state;
   if (auto status = validate(); !status.ok()) co_return status;
+  // The batch already holds the canonical encoding, which is exactly the
+  // kFullDesiredState frame payload; forward it instead of re-encoding the
+  // typed projection.
   if (bytes.size() <= control::kMaxFramePayloadBytes)
-    co_return co_await io.Send(control::MessagePriority::kReliable,
-                               control::WireMessage(batch->full_state));
+    co_return co_await io.Send(
+        control::MessagePriority::kReliable,
+        control::EncodedMessage{control::MessageType::kFullDesiredState,
+                                std::string(bytes)});
   auto object_id = control::GenerateId128();
   if (!object_id.ok()) co_return object_id.status();
   if (auto status =
@@ -2207,8 +2217,12 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
       ClearPublisherApplied(state);
       co_return armed;
     }
+    // The size probe's encoding is the exact kNodeControlUpdate payload;
+    // bytes aliases it and is read no further on the frame path.
     if (absl::Status sent = co_await state->io_->Send(
-            control::MessagePriority::kReliable, control::WireMessage(update));
+            control::MessagePriority::kReliable,
+            control::EncodedMessage{control::MessageType::kNodeControlUpdate,
+                                    std::move(*encoded)});
         !sent.ok()) {
       ClearPublisherApplied(state);
       co_return sent;

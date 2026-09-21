@@ -1566,16 +1566,20 @@ TEST(MetaCandidateProgressTest,
                   },
           },
   };
-  ASSERT_TRUE(FitHeartbeatToSingleFrame(heartbeat).ok());
+  auto fitted = FitHeartbeatToSingleFrame(heartbeat);
+  ASSERT_TRUE(fitted.ok()) << fitted.status();
   const auto* candidate =
       std::get_if<control::ReplicaCandidate>(&heartbeat.role_information);
   ASSERT_NE(candidate, nullptr);
   EXPECT_EQ(candidate->progress.assignment_id.front(), 0x31);
   EXPECT_EQ(candidate->progress.applied_next_lsns,
             (std::vector<std::uint64_t>{10, 20}));
-  auto encoded = control::EncodeMessage(control::WireMessage(heartbeat));
-  ASSERT_TRUE(encoded.ok()) << encoded.status();
-  EXPECT_LE(encoded->size(), control::kMaxFramePayloadBytes);
+  // The returned bytes are the canonical encoding of the fitted heartbeat:
+  // re-encoding the mutated object must reproduce them exactly.
+  EXPECT_LE(fitted->size(), control::kMaxFramePayloadBytes);
+  auto reencoded = control::EncodeMessage(control::WireMessage(heartbeat));
+  ASSERT_TRUE(reencoded.ok()) << reencoded.status();
+  EXPECT_EQ(reencoded->payload, *fitted);
   EXPECT_LT(heartbeat.health.summary.size(), control::kMaxFramePayloadBytes);
 }
 

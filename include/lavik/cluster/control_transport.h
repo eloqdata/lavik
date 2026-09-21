@@ -82,21 +82,22 @@ enum class MessagePriority : std::uint8_t {
 
 // Bounded scheduling queue used by a session's sole writer. Authority cannot
 // be trapped behind bulk transfer data: dequeue always checks the four lanes
-// in priority order. The bound includes each frame header plus its encoded
-// payload, and an oversized enqueue is rejected without evicting reliable
-// work.
+// in priority order. Items carry the once-encoded payload so admission
+// accounting reads its size instead of re-encoding; the bound includes each
+// frame header plus its encoded payload, and an oversized enqueue is rejected
+// without evicting reliable work.
 class ControlWriteQueue {
  public:
   explicit ControlWriteQueue(std::size_t max_bytes) : max_bytes_(max_bytes) {}
 
-  absl::Status Enqueue(MessagePriority priority, WireMessage message);
-  std::optional<std::pair<MessagePriority, WireMessage>> Pop();
+  absl::Status Enqueue(MessagePriority priority, EncodedMessage encoded);
+  std::optional<std::pair<MessagePriority, EncodedMessage>> Pop();
   std::size_t queued_bytes() const noexcept { return queued_bytes_; }
   bool empty() const noexcept { return queued_bytes_ == 0; }
 
  private:
   struct Item {
-    WireMessage message_;
+    EncodedMessage encoded_;
     std::size_t bytes_ = 0;
   };
 
@@ -132,8 +133,10 @@ class ControlFrameStream {
 
   // before_write runs after framing and immediately before the first
   // WriteAll. Lease challenges use it to capture the only valid sent_at.
+  // The message arrives already payload-encoded exactly once by the caller;
+  // header assembly, sequencing, and CRC still happen here at write time.
   bycorf::Task<absl::Status> WriteMessage(
-      const WireMessage& message,
+      EncodedMessage message,
       std::function<void()> before_write = std::function<void()>{});
 
  private:
@@ -167,7 +170,7 @@ class ControlFrameStream {
 class ControlSessionWriter {
  public:
   using WriteFunction = std::function<bycorf::Task<absl::Status>(
-      WireMessage, std::function<void()>)>;
+      EncodedMessage, std::function<void()>)>;
 
   ControlSessionWriter(ControlFrameStream& frames, std::size_t max_queue_bytes);
   // Injectable frame sink for focused transport tests and non-socket
@@ -179,8 +182,16 @@ class ControlSessionWriter {
   ControlSessionWriter(const ControlSessionWriter&) = delete;
   ControlSessionWriter& operator=(const ControlSessionWriter&) = delete;
 
+  // The WireMessage overload encodes the payload once and delegates to the
+  // EncodedMessage overload. Callers that already hold the canonical bytes
+  // (the heartbeat fit-check, transfer-or-frame size probes, retained
+  // canonical FullDesiredState bytes) hand them in directly so no stage
+  // re-encodes.
   bycorf::Task<absl::Status> Write(
       MessagePriority priority, WireMessage message,
+      std::function<void()> before_write = std::function<void()>{});
+  bycorf::Task<absl::Status> Write(
+      MessagePriority priority, EncodedMessage encoded,
       std::function<void()> before_write = std::function<void()>{});
 
   // Sends canonical EncodeFullDesiredState output through the reliable lane

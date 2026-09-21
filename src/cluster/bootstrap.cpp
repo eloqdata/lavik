@@ -47,7 +47,7 @@ absl::StatusOr<control::BootstrapReply> QueryMode(
   if (!payload.ok()) return payload.status();
   control::FrameEncoder encoder;
   auto request =
-      encoder.Encode(control::MessageType::kBootstrapHello, *payload);
+      encoder.Encode(control::MessageType::kBootstrapHello, payload->payload);
   if (!request.ok()) return request.status();
   if (auto status = (*stream)->WriteAll(*request); !status.ok()) return status;
   auto header_bytes = (*stream)->ReadExact(control::kFrameHeaderBytes);

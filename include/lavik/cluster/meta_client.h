@@ -107,8 +107,11 @@ control::DirectiveResultStatus ClassifyDirectiveResultStatus(
 
 // Fits the soft health and single role payload into the mandatory one-frame
 // heartbeat. Human-readable summary text is the only truncatable field; an
-// indivisible candidate is omitted only as a defensive last resort.
-absl::Status FitHeartbeatToSingleFrame(control::Heartbeat& heartbeat);
+// indivisible candidate is omitted only as a defensive last resort. Returns
+// the canonical payload of the fitted heartbeat so the sender hands those
+// bytes to the writer instead of encoding a second time.
+absl::StatusOr<std::string> FitHeartbeatToSingleFrame(
+    control::Heartbeat& heartbeat);
 
 // Versioned, delimiter-safe identity used by the native rebuild adapter for
 // the complete authority anchor.

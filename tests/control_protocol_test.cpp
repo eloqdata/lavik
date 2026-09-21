@@ -219,7 +219,8 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
   control::WireMessage message = heartbeat;
   auto encoded = control::EncodeMessage(message);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  auto decoded = control::DecodeMessage(MessageType::kHeartbeat, *encoded);
+  auto decoded =
+      control::DecodeMessage(MessageType::kHeartbeat, encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   ASSERT_TRUE(std::holds_alternative<control::Heartbeat>(*decoded));
   EXPECT_EQ(std::get<control::Heartbeat>(*decoded), heartbeat);
@@ -242,7 +243,8 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
   };
   encoded = control::EncodeMessage(control::WireMessage{ack});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  decoded = control::DecodeMessage(MessageType::kHeartbeatAck, *encoded);
+  decoded =
+      control::DecodeMessage(MessageType::kHeartbeatAck, encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::HeartbeatAck>(*decoded), ack);
 
@@ -253,7 +255,8 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
   };
   encoded = control::EncodeMessage(control::WireMessage{ack});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  decoded = control::DecodeMessage(MessageType::kHeartbeatAck, *encoded);
+  decoded =
+      control::DecodeMessage(MessageType::kHeartbeatAck, encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::HeartbeatAck>(*decoded), ack);
 }
@@ -275,8 +278,8 @@ TEST(ControlProtocolCodecTest,
 
   auto encoded = control::EncodeMessage(control::WireMessage{hello});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  auto decoded =
-      control::DecodeMessage(MessageType::kServerHello, std::move(*encoded));
+  auto decoded = control::DecodeMessage(MessageType::kServerHello,
+                                        std::move(encoded->payload));
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   ASSERT_TRUE(std::holds_alternative<control::ServerHello>(*decoded));
   EXPECT_EQ(std::get<control::ServerHello>(*decoded), hello);
@@ -308,7 +311,8 @@ TEST(ControlProtocolCodecTest, RoundTripsTypedReplicaCandidate) {
 
   auto encoded = control::EncodeMessage(control::WireMessage{heartbeat});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  auto decoded = control::DecodeMessage(MessageType::kHeartbeat, *encoded);
+  auto decoded =
+      control::DecodeMessage(MessageType::kHeartbeat, encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::Heartbeat>(*decoded), heartbeat);
 }
@@ -336,14 +340,14 @@ TEST(ControlProtocolCodecTest, RejectsMalformedTypedCandidateAndRoleTag) {
   auto encoded = control::EncodeMessage(control::WireMessage{heartbeat});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
 
-  std::string zero_cursor = *encoded;
+  std::string zero_cursor = encoded->payload;
   std::fill(zero_cursor.end() - 8, zero_cursor.end(), '\0');
   EXPECT_EQ(control::DecodeMessage(MessageType::kHeartbeat, zero_cursor)
                 .status()
                 .code(),
             absl::StatusCode::kInvalidArgument);
 
-  std::string trailing = *encoded;
+  std::string trailing = encoded->payload;
   trailing.push_back('\0');
   EXPECT_EQ(
       control::DecodeMessage(MessageType::kHeartbeat, trailing).status().code(),
@@ -353,11 +357,12 @@ TEST(ControlProtocolCodecTest, RejectsMalformedTypedCandidateAndRoleTag) {
   no_role.heartbeat_sequence = 2;
   encoded = control::EncodeMessage(control::WireMessage{no_role});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  ASSERT_GE(encoded->size(), 2u);
-  (*encoded)[encoded->size() - 2] = static_cast<char>(99);
-  EXPECT_EQ(
-      control::DecodeMessage(MessageType::kHeartbeat, *encoded).status().code(),
-      absl::StatusCode::kInvalidArgument);
+  ASSERT_GE(encoded->payload.size(), 2u);
+  encoded->payload[encoded->payload.size() - 2] = static_cast<char>(99);
+  EXPECT_EQ(control::DecodeMessage(MessageType::kHeartbeat, encoded->payload)
+                .status()
+                .code(),
+            absl::StatusCode::kInvalidArgument);
 
   auto* candidate =
       std::get_if<control::ReplicaCandidate>(&heartbeat.role_information);
@@ -408,9 +413,10 @@ TEST(ControlProtocolCodecTest, MaximumCandidateProgressStillFitsOneFrame) {
 
   const auto payload = control::EncodeMessage(control::WireMessage{heartbeat});
   ASSERT_TRUE(payload.ok()) << payload.status();
-  EXPECT_LE(payload->size(), control::kMaxFramePayloadBytes);
+  EXPECT_LE(payload->payload.size(), control::kMaxFramePayloadBytes);
   control::FrameEncoder encoder;
-  EXPECT_TRUE(encoder.Encode(control::MessageType::kHeartbeat, *payload).ok());
+  EXPECT_TRUE(
+      encoder.Encode(control::MessageType::kHeartbeat, payload->payload).ok());
 }
 
 TEST(ControlProtocolCodecTest,
@@ -458,8 +464,8 @@ TEST(ControlProtocolCodecTest,
     const auto encoded =
         control::EncodeMessage(control::WireMessage{heartbeat});
     ASSERT_TRUE(encoded.ok()) << encoded.status();
-    const auto decoded =
-        control::DecodeMessage(control::MessageType::kHeartbeat, *encoded);
+    const auto decoded = control::DecodeMessage(
+        control::MessageType::kHeartbeat, encoded->payload);
     ASSERT_TRUE(decoded.ok()) << decoded.status();
     EXPECT_EQ(std::get<control::Heartbeat>(*decoded), heartbeat);
   }
@@ -482,8 +488,8 @@ TEST(ControlProtocolCodecTest, RecoveryCompletionRoundTripsActualFrontier) {
   heartbeat.failover_observation = complete;
   auto encoded = control::EncodeMessage(control::WireMessage{heartbeat});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  auto decoded =
-      control::DecodeMessage(control::MessageType::kHeartbeat, *encoded);
+  auto decoded = control::DecodeMessage(control::MessageType::kHeartbeat,
+                                        encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::Heartbeat>(*decoded), heartbeat);
   complete.applied_next_lsns = {12, 0};
@@ -511,10 +517,10 @@ TEST(ControlProtocolCodecTest,
                                 control::kMaxCandidateFlows, 1)};
   auto encoded = control::EncodeMessage(control::WireMessage{heartbeat});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  EXPECT_LE(encoded->size(), control::kMaxFramePayloadBytes);
+  EXPECT_LE(encoded->payload.size(), control::kMaxFramePayloadBytes);
   constexpr std::size_t kObservationTagOffset = 16 + 8 + 3 + 4 + 4 + 1 + 1;
-  ASSERT_GT(encoded->size(), kObservationTagOffset);
-  std::string unknown_kind = *encoded;
+  ASSERT_GT(encoded->payload.size(), kObservationTagOffset);
+  std::string unknown_kind = encoded->payload;
   unknown_kind[kObservationTagOffset] = static_cast<char>(99);
   EXPECT_EQ(
       control::DecodeMessage(control::MessageType::kHeartbeat, unknown_kind)
@@ -563,7 +569,7 @@ TEST(ControlProtocolCodecTest,
           std::string(control::kMaxFailoverFailureDetailBytes, 'd')};
   encoded = control::EncodeMessage(control::WireMessage{heartbeat});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  EXPECT_LE(encoded->size(), control::kMaxFramePayloadBytes);
+  EXPECT_LE(encoded->payload.size(), control::kMaxFramePayloadBytes);
 
   auto* failed =
       std::get_if<control::ActionFailed>(&*heartbeat.failover_observation);
@@ -622,7 +628,8 @@ TEST(ControlProtocolCodecTest,
   };
   auto encoded = control::EncodeMessage(control::WireMessage{directive});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  auto decoded = control::DecodeMessage(MessageType::kDirective, *encoded);
+  auto decoded =
+      control::DecodeMessage(MessageType::kDirective, encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::Directive>(*decoded), directive);
 
@@ -642,7 +649,8 @@ TEST(ControlProtocolCodecTest,
   };
   encoded = control::EncodeMessage(control::WireMessage{receipt});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  decoded = control::DecodeMessage(MessageType::kDirectiveResponse, *encoded);
+  decoded =
+      control::DecodeMessage(MessageType::kDirectiveResponse, encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::DirectiveResponse>(*decoded), receipt);
 
@@ -656,7 +664,8 @@ TEST(ControlProtocolCodecTest,
   };
   encoded = control::EncodeMessage(control::WireMessage{result});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  decoded = control::DecodeMessage(MessageType::kDirectiveResult, *encoded);
+  decoded =
+      control::DecodeMessage(MessageType::kDirectiveResult, encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::DirectiveResult>(*decoded), result);
 
@@ -668,7 +677,8 @@ TEST(ControlProtocolCodecTest,
   };
   encoded = control::EncodeMessage(control::WireMessage{committed});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  decoded = control::DecodeMessage(MessageType::kResultCommitted, *encoded);
+  decoded =
+      control::DecodeMessage(MessageType::kResultCommitted, encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::ResultCommitted>(*decoded), committed);
 
@@ -679,8 +689,8 @@ TEST(ControlProtocolCodecTest,
   };
   encoded = control::EncodeMessage(control::WireMessage{forgotten});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  decoded =
-      control::DecodeMessage(MessageType::kResultNoLongerTracked, *encoded);
+  decoded = control::DecodeMessage(MessageType::kResultNoLongerTracked,
+                                   encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::ResultNoLongerTracked>(*decoded), forgotten);
 }
@@ -716,7 +726,8 @@ TEST(ControlProtocolCodecTest, RoundTripsSourceLessPopulationInitialization) {
 
   auto encoded = control::EncodeMessage(control::WireMessage{directive});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  auto decoded = control::DecodeMessage(MessageType::kDirective, *encoded);
+  auto decoded =
+      control::DecodeMessage(MessageType::kDirective, encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::Directive>(*decoded), directive);
 }
@@ -730,7 +741,8 @@ TEST(ControlProtocolCodecTest, HelloRequiresBoundedSourceFlowCount) {
   };
   auto encoded = control::EncodeMessage(control::WireMessage{hello});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  auto decoded = control::DecodeMessage(MessageType::kClientHello, *encoded);
+  auto decoded =
+      control::DecodeMessage(MessageType::kClientHello, encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::ClientHello>(*decoded), hello);
   for (std::uint32_t count : {0U, 1025U}) {
@@ -741,16 +753,18 @@ TEST(ControlProtocolCodecTest, HelloRequiresBoundedSourceFlowCount) {
     constexpr std::size_t flow_offset = 4 + 3 * 40;
     std::string flow;
     AppendBe32(&flow, count);
-    std::string malformed = *encoded;
+    std::string malformed = encoded->payload;
     malformed.replace(flow_offset, 4, flow);
     EXPECT_FALSE(
         control::DecodeMessage(MessageType::kClientHello, malformed).ok());
   }
-  EXPECT_FALSE(control::DecodeMessage(MessageType::kClientHello,
-                                      encoded->substr(0, encoded->size() - 4))
+  EXPECT_FALSE(control::DecodeMessage(
+                   MessageType::kClientHello,
+                   encoded->payload.substr(0, encoded->payload.size() - 4))
                    .ok());
   EXPECT_FALSE(
-      control::DecodeMessage(MessageType::kClientHello, *encoded + "x").ok());
+      control::DecodeMessage(MessageType::kClientHello, encoded->payload + "x")
+          .ok());
 }
 
 TEST(ControlProtocolCodecTest,
@@ -785,11 +799,13 @@ TEST(ControlProtocolCodecTest, BootstrapRoundTripCannotCreateASession) {
       .capabilities = {.supported_modes = 3, .services = 3}};
   auto encoded = control::EncodeMessage(request);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  auto decoded = control::DecodeMessage(MessageType::kBootstrapHello, *encoded);
+  auto decoded =
+      control::DecodeMessage(MessageType::kBootstrapHello, encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::BootstrapHello>(*decoded), request);
-  EXPECT_FALSE(control::DecodeMessage(MessageType::kBootstrapHello,
-                                      encoded->substr(0, encoded->size() - 1))
+  EXPECT_FALSE(control::DecodeMessage(
+                   MessageType::kBootstrapHello,
+                   encoded->payload.substr(0, encoded->payload.size() - 1))
                    .ok());
   control::BootstrapReply reply;
   reply.disposition = control::BootstrapDisposition::kReady;
@@ -798,7 +814,8 @@ TEST(ControlProtocolCodecTest, BootstrapRoundTripCannotCreateASession) {
   reply.server.service = {lavik::ClientMode::kSingle, Id(3), 11};
   encoded = control::EncodeMessage(reply);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  decoded = control::DecodeMessage(MessageType::kBootstrapReply, *encoded);
+  decoded =
+      control::DecodeMessage(MessageType::kBootstrapReply, encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::BootstrapReply>(*decoded), reply);
   reply.server.session_generation = 1;
@@ -1078,12 +1095,14 @@ TEST(ControlProtocolFullStateTest,
             control::MessageType::kFullDesiredState);
   auto encoded = control::EncodeMessage(message);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  ASSERT_LE(encoded->size(), control::kMaxFramePayloadBytes);
+  ASSERT_LE(encoded->payload.size(), control::kMaxFramePayloadBytes);
 
   control::FrameEncoder frame_encoder;
-  auto framed = frame_encoder.Encode(control::MessageTypeOf(message), *encoded);
+  auto framed =
+      frame_encoder.Encode(control::MessageTypeOf(message), encoded->payload);
   ASSERT_TRUE(framed.ok()) << framed.status();
-  EXPECT_EQ(framed->size(), control::kFrameHeaderBytes + encoded->size());
+  EXPECT_EQ(framed->size(),
+            control::kFrameHeaderBytes + encoded->payload.size());
   control::FrameDecoder frame_decoder;
   auto frame = frame_decoder.Decode(*framed);
   ASSERT_TRUE(frame.ok()) << frame.status();
@@ -1243,8 +1262,8 @@ TEST(ControlProtocolTransferTest,
   };
   auto encoded = control::EncodeMessage(control::WireMessage(named_abort));
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  auto decoded =
-      control::DecodeMessage(control::MessageType::kTransferAbort, *encoded);
+  auto decoded = control::DecodeMessage(control::MessageType::kTransferAbort,
+                                        encoded->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::TransferAbort>(*decoded), named_abort);
 

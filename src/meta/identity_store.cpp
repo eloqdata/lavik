@@ -196,7 +196,8 @@ absl::Status ValidateActiveMetaDirectory(
       .session_progress_timeout_ms = 1,
   };
   auto encoded = control::EncodeMessage(control::WireMessage(std::move(probe)));
-  if (!encoded.ok() || encoded->size() > control::kMaxFramePayloadBytes) {
+  if (!encoded.ok() ||
+      encoded->payload.size() > control::kMaxFramePayloadBytes) {
     return absl::ResourceExhaustedError(
         "active Meta directory cannot fit in one ServerHello frame");
   }

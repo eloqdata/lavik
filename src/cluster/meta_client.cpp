@@ -1134,8 +1134,13 @@ absl::Status detail::ValidateResolvedLeaseGrantDuration(
   return absl::OkStatus();
 }
 
-absl::Status FitHeartbeatToSingleFrame(control::Heartbeat& heartbeat) {
-  const auto fits = [&]() -> absl::StatusOr<bool> {
+absl::StatusOr<std::string> FitHeartbeatToSingleFrame(
+    control::Heartbeat& heartbeat) {
+  // Encodes the current heartbeat and, when it fits, hands the canonical
+  // payload back through *payload. Heartbeat is non-fragmentable, so
+  // EncodeMessage already rejects an oversized encoding with
+  // ResourceExhausted, which reads here as "does not fit".
+  const auto fits = [&](std::string* payload) -> absl::StatusOr<bool> {
     auto encoded = control::EncodeMessage(control::WireMessage(heartbeat));
     if (!encoded.ok()) {
       if (encoded.status().code() == absl::StatusCode::kResourceExhausted) {
@@ -1143,34 +1148,43 @@ absl::Status FitHeartbeatToSingleFrame(control::Heartbeat& heartbeat) {
       }
       return encoded.status();
     }
-    return encoded->size() <= control::kMaxFramePayloadBytes;
+    if (encoded->payload.size() > control::kMaxFramePayloadBytes) return false;
+    *payload = std::move(encoded->payload);
+    return true;
   };
-  auto initial = fits();
+  std::string fitted;
+  auto initial = fits(&fitted);
   if (!initial.ok()) return initial.status();
-  if (*initial) return absl::OkStatus();
+  if (*initial) return fitted;
 
-  const auto shorten_summary = [&]() -> absl::StatusOr<bool> {
+  const auto shorten_summary =
+      [&](std::string* payload) -> absl::StatusOr<bool> {
     constexpr std::string_view kSuffix = "...[truncated]";
     const std::string original = heartbeat.health.summary;
     heartbeat.health.summary.clear();
-    auto base = fits();
+    std::string candidate_bytes;
+    auto base = fits(&candidate_bytes);
     if (!base.ok()) return base.status();
     if (!*base) {
       heartbeat.health.summary = original;
       return false;
     }
 
+    // The cleared summary is known to fit; keep its bytes so a search that
+    // never improves on it still returns the fitting encoding.
     std::string best;
+    std::string best_bytes = std::move(candidate_bytes);
     std::size_t low = 0;
     std::size_t high = std::min(original.size(), control::kMaxOpaqueFieldBytes);
     while (low <= high) {
       const std::size_t prefix = low + (high - low) / 2;
       heartbeat.health.summary.assign(original.data(), prefix);
       if (prefix < original.size()) heartbeat.health.summary.append(kSuffix);
-      auto candidate = fits();
+      auto candidate = fits(&candidate_bytes);
       if (!candidate.ok()) return candidate.status();
       if (*candidate) {
         best = heartbeat.health.summary;
+        best_bytes = std::move(candidate_bytes);
         low = prefix + 1;
       } else {
         if (prefix == 0) break;
@@ -1178,12 +1192,13 @@ absl::Status FitHeartbeatToSingleFrame(control::Heartbeat& heartbeat) {
       }
     }
     heartbeat.health.summary = std::move(best);
+    *payload = std::move(best_bytes);
     return true;
   };
 
-  auto summary_fit = shorten_summary();
+  auto summary_fit = shorten_summary(&fitted);
   if (!summary_fit.ok()) return summary_fit.status();
-  if (*summary_fit) return absl::OkStatus();
+  if (*summary_fit) return fitted;
 
   if (!std::holds_alternative<control::ReplicaCandidate>(
           heartbeat.role_information)) {
@@ -1194,9 +1209,9 @@ absl::Status FitHeartbeatToSingleFrame(control::Heartbeat& heartbeat) {
   heartbeat.health.summary = absl::StrCat(
       "candidate progress omitted: single-frame limit",
       heartbeat.health.summary.empty() ? "" : "; ", heartbeat.health.summary);
-  summary_fit = shorten_summary();
+  summary_fit = shorten_summary(&fitted);
   if (!summary_fit.ok()) return summary_fit.status();
-  if (*summary_fit) return absl::OkStatus();
+  if (*summary_fit) return fitted;
   return absl::ResourceExhaustedError(
       "heartbeat fixed fields exceed the single-frame protocol limit");
 }
@@ -1840,12 +1855,12 @@ struct MetaControlClientService::Impl {
   bycorf::Task<absl::Status> SendDirectiveResult(
       control::ControlSessionWriter& writer,
       const control::DirectiveResult& result) {
-    const control::WireMessage message(result);
-    auto encoded = control::EncodeMessage(message);
+    auto encoded = control::EncodeMessage(control::WireMessage(result));
     if (!encoded.ok()) co_return encoded.status();
-    if (encoded->size() <= control::kMaxFramePayloadBytes) {
+    // The size probe's encoding is reused for the send itself on both paths.
+    if (encoded->payload.size() <= control::kMaxFramePayloadBytes) {
       co_return co_await writer.Write(control::MessagePriority::kReliable,
-                                      message);
+                                      std::move(*encoded));
     }
 
     // The transfer contains the ordinary DirectiveResult payload, so the
@@ -1854,7 +1869,8 @@ struct MetaControlClientService::Impl {
     // application-level acknowledgement for the completed result.
     auto object_id = control::GenerateId128();
     if (!object_id.ok()) co_return object_id.status();
-    auto owned = std::make_shared<const std::string>(std::move(*encoded));
+    auto owned =
+        std::make_shared<const std::string>(std::move(encoded->payload));
     co_return co_await writer.WriteTransfer(
         control::TransferKind::kDirectiveResult, *object_id, std::move(owned));
   }
@@ -2614,8 +2630,9 @@ struct MetaControlClientService::Impl {
           }
         }
       }
-      result = FitHeartbeatToSingleFrame(heartbeat);
-      if (!result.ok()) {
+      auto fitted = FitHeartbeatToSingleFrame(heartbeat);
+      if (!fitted.ok()) {
+        result = fitted.status();
         state->challenge_tracker_.Cancel();
         break;
       }
@@ -2632,9 +2649,12 @@ struct MetaControlClientService::Impl {
               ? std::optional<control::WireId128>(heartbeat_challenge->nonce)
               : std::nullopt;
       const auto challenge_revision = state->desired_->local.revision;
+      // The fit-check already produced the canonical payload; the writer
+      // forwards those exact bytes rather than encoding the heartbeat again.
       result = co_await state->writer_->Write(
           control::MessagePriority::kAuthority,
-          control::WireMessage(std::move(heartbeat)),
+          control::EncodedMessage{control::MessageType::kHeartbeat,
+                                  std::move(*fitted)},
           [state, sent_at_ms, challenge_nonce] {
             *sent_at_ms = LeaseClockMillis();
             if (!challenge_nonce.has_value()) return;

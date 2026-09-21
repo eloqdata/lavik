@@ -1085,10 +1085,19 @@ using WireMessage =
 
 MessageType MessageTypeOf(const WireMessage& message) noexcept;
 
+// A payload paired with its message type. payload is the canonical encoding
+// of a WireMessage holding the typed alternative for type; the send pipeline
+// threads it through admission accounting and frame assembly so a message is
+// encoded exactly once per send.
+struct EncodedMessage {
+  MessageType type;
+  std::string payload;
+};
+
 // Encodes/decodes a message payload.  The frame header is deliberately a
 // separate operation so transport queues can select priority before assigning
 // the per-direction frame sequence number.
-absl::StatusOr<std::string> EncodeMessage(const WireMessage& message);
+absl::StatusOr<EncodedMessage> EncodeMessage(const WireMessage& message);
 absl::StatusOr<WireMessage> DecodeMessage(MessageType type,
                                           std::string_view payload);
 

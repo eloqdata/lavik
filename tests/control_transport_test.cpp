@@ -97,6 +97,17 @@ absl::StatusOr<std::string> FullStatePayload(std::size_t padding_bytes) {
 using WriterScenario =
     std::function<bycorf::Task<absl::Status>(bycorf::Worker&)>;
 
+// Queue-level tests enqueue pre-encoded items now that the queue no longer
+// encodes; a failure here is a test bug, not queue behavior.
+control::EncodedMessage MustEncode(control::WireMessage message) {
+  auto encoded = control::EncodeMessage(message);
+  if (!encoded.ok()) {
+    ADD_FAILURE() << encoded.status();
+    return {control::MessageType::kClientHello, {}};
+  }
+  return std::move(*encoded);
+}
+
 bycorf::Task<absl::Status> CompleteWriterScenario(
     std::shared_ptr<WriterScenario> scenario, bycorf::Worker* worker,
     std::shared_ptr<std::promise<absl::Status>> completed) {
@@ -245,10 +256,10 @@ struct PriorityWriterScenario {
     co_return absl::OkStatus();
   }
 
-  bycorf::Task<absl::Status> WriteFrame(control::WireMessage message,
+  bycorf::Task<absl::Status> WriteFrame(control::EncodedMessage message,
                                         std::function<void()> before_write) {
     if (before_write) before_write();
-    const control::MessageType type = control::MessageTypeOf(message);
+    const control::MessageType type = message.type;
     trace_.push_back(type);
     if (type == control::MessageType::kTransferChunk && !injected_) {
       injected_ = true;
@@ -261,7 +272,7 @@ struct PriorityWriterScenario {
   bycorf::Task<absl::Status> Run(bycorf::Worker& worker) {
     worker_ = &worker;
     control::ControlSessionWriter writer(
-        [this](control::WireMessage message,
+        [this](control::EncodedMessage message,
                std::function<void()> before_write) {
           return WriteFrame(std::move(message), std::move(before_write));
         },
@@ -300,7 +311,7 @@ struct ErrorWriterScenario {
     co_return absl::OkStatus();
   }
 
-  bycorf::Task<absl::Status> WriteFrame(control::WireMessage,
+  bycorf::Task<absl::Status> WriteFrame(control::EncodedMessage,
                                         std::function<void()> before_write) {
     ++sink_calls_;
     if (before_write) before_write();
@@ -315,7 +326,7 @@ struct ErrorWriterScenario {
   bycorf::Task<absl::Status> Run(bycorf::Worker& worker) {
     worker_ = &worker;
     control::ControlSessionWriter writer(
-        [this](control::WireMessage message,
+        [this](control::EncodedMessage message,
                std::function<void()> before_write) {
           return WriteFrame(std::move(message), std::move(before_write));
         },
@@ -368,18 +379,26 @@ struct SerializedTransfersScenario {
     co_return absl::OkStatus();
   }
 
-  bycorf::Task<absl::Status> WriteFrame(control::WireMessage message,
+  bycorf::Task<absl::Status> WriteFrame(control::EncodedMessage message,
                                         std::function<void()> before_write) {
     if (before_write) before_write();
-    const control::MessageType type = control::MessageTypeOf(message);
+    const control::MessageType type = message.type;
     std::uint8_t object_tag = 0;
-    if (const auto* start = std::get_if<control::TransferStart>(&message)) {
-      object_tag = start->object_id[0];
-    } else if (const auto* chunk =
-                   std::get_if<control::TransferChunk>(&message)) {
-      object_tag = chunk->object_id[0];
-    } else if (const auto* end = std::get_if<control::TransferEnd>(&message)) {
-      object_tag = end->object_id[0];
+    if (type == control::MessageType::kTransferStart ||
+        type == control::MessageType::kTransferChunk ||
+        type == control::MessageType::kTransferEnd) {
+      // The sink receives once-encoded bytes; decode to inspect typed fields.
+      auto decoded = control::DecodeMessage(message.type, message.payload);
+      if (!decoded.ok()) co_return decoded.status();
+      if (const auto* start = std::get_if<control::TransferStart>(&*decoded)) {
+        object_tag = start->object_id[0];
+      } else if (const auto* chunk =
+                     std::get_if<control::TransferChunk>(&*decoded)) {
+        object_tag = chunk->object_id[0];
+      } else if (const auto* end =
+                     std::get_if<control::TransferEnd>(&*decoded)) {
+        object_tag = end->object_id[0];
+      }
     }
     trace_.push_back(TraceEntry{type, object_tag});
 
@@ -398,7 +417,7 @@ struct SerializedTransfersScenario {
   bycorf::Task<absl::Status> Run(bycorf::Worker& worker) {
     worker_ = &worker;
     control::ControlSessionWriter writer(
-        [this](control::WireMessage message,
+        [this](control::EncodedMessage message,
                std::function<void()> before_write) {
           return WriteFrame(std::move(message), std::move(before_write));
         },
@@ -431,7 +450,7 @@ struct SerializedTransfersScenario {
 };
 
 struct OversizedWriterScenario {
-  bycorf::Task<absl::Status> WriteFrame(control::WireMessage,
+  bycorf::Task<absl::Status> WriteFrame(control::EncodedMessage,
                                         std::function<void()>) {
     ++sink_calls_;
     co_return absl::OkStatus();
@@ -439,7 +458,7 @@ struct OversizedWriterScenario {
 
   bycorf::Task<absl::Status> Run(bycorf::Worker&) {
     control::ControlSessionWriter writer(
-        [this](control::WireMessage message,
+        [this](control::EncodedMessage message,
                std::function<void()> before_write) {
           return WriteFrame(std::move(message), std::move(before_write));
         },
@@ -456,7 +475,7 @@ struct OversizedWriterScenario {
 };
 
 struct FullStateWriterScenario {
-  bycorf::Task<absl::Status> WriteFrame(control::WireMessage message,
+  bycorf::Task<absl::Status> WriteFrame(control::EncodedMessage message,
                                         std::function<void()> before_write) {
     if (before_write) before_write();
     frames_.push_back(std::move(message));
@@ -477,7 +496,7 @@ struct FullStateWriterScenario {
     large_bytes_ = *large;
 
     control::ControlSessionWriter writer(
-        [this](control::WireMessage message,
+        [this](control::EncodedMessage message,
                std::function<void()> before_write) {
           return WriteFrame(std::move(message), std::move(before_write));
         },
@@ -489,21 +508,101 @@ struct FullStateWriterScenario {
     co_return absl::OkStatus();
   }
 
-  std::vector<control::WireMessage> frames_;
+  std::vector<control::EncodedMessage> frames_;
   std::string small_bytes_;
   std::string large_bytes_;
   absl::Status small_status_ = absl::UnknownError("not run");
   absl::Status large_status_ = absl::UnknownError("not run");
 };
 
+struct PreEncodedWriterScenario {
+  bycorf::Task<absl::Status> WriteFrame(control::EncodedMessage message,
+                                        std::function<void()> before_write) {
+    if (before_write) before_write();
+    received_.push_back(std::move(message));
+    co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::Status> Run(bycorf::Worker&) {
+    control::ControlSessionWriter writer(
+        [this](control::EncodedMessage message,
+               std::function<void()> before_write) {
+          return WriteFrame(std::move(message), std::move(before_write));
+        },
+        4 * control::kMaxFrameBytes);
+    auto encoded = control::EncodeMessage(Hello('7'));
+    if (!encoded.ok()) co_return encoded.status();
+    expected_type_ = encoded->type;
+    expected_payload_ = encoded->payload;
+    typed_status_ =
+        co_await writer.Write(control::MessagePriority::kReliable, Hello('7'));
+    preencoded_status_ = co_await writer.Write(
+        control::MessagePriority::kReliable,
+        control::EncodedMessage{encoded->type, encoded->payload});
+    // The pre-encoded overload trusts the caller's bytes: opaque content is
+    // forwarded untouched rather than validated or re-encoded.
+    opaque_status_ = co_await writer.Write(
+        control::MessagePriority::kReliable,
+        control::EncodedMessage{control::MessageType::kClientHello,
+                                std::string("\x00\x01not-a-real-hello", 18)});
+    co_return absl::OkStatus();
+  }
+
+  std::vector<control::EncodedMessage> received_;
+  control::MessageType expected_type_ = control::MessageType::kClientHello;
+  std::string expected_payload_;
+  absl::Status typed_status_ = absl::UnknownError("not run");
+  absl::Status preencoded_status_ = absl::UnknownError("not run");
+  absl::Status opaque_status_ = absl::UnknownError("not run");
+};
+
+struct OversizedPreEncodedWriterScenario {
+  bycorf::Task<absl::Status> WriteFrame(control::EncodedMessage,
+                                        std::function<void()>) {
+    ++sink_calls_;
+    co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::Status> Run(bycorf::Worker&) {
+    control::ControlSessionWriter writer(
+        [this](control::EncodedMessage message,
+               std::function<void()> before_write) {
+          return WriteFrame(std::move(message), std::move(before_write));
+        },
+        4 * control::kMaxFrameBytes);
+    status_ = co_await writer.Write(
+        control::MessagePriority::kReliable,
+        control::EncodedMessage{
+            control::MessageType::kDirective,
+            std::string(control::kMaxFramePayloadBytes + 1, 'x')});
+    failed_after_reject_ = writer.failed();
+    // The rejection is admission-local: the writer still accepts later work.
+    follow_up_ =
+        co_await writer.Write(control::MessagePriority::kReliable, Hello('9'));
+    co_return absl::OkStatus();
+  }
+
+  absl::Status status_ = absl::UnknownError("not run");
+  absl::Status follow_up_ = absl::UnknownError("not run");
+  std::size_t sink_calls_ = 0;
+  bool failed_after_reject_ = true;
+};
+
 TEST(ControlWriteQueueTest, AuthorityOvertakesEarlierBulkAndSoftWork) {
   control::ControlWriteQueue queue(4096);
-  ASSERT_TRUE(queue.Enqueue(control::MessagePriority::kSoft, Hello('1')).ok());
-  ASSERT_TRUE(queue.Enqueue(control::MessagePriority::kBulk, Hello('2')).ok());
   ASSERT_TRUE(
-      queue.Enqueue(control::MessagePriority::kAuthority, Hello('3')).ok());
+      queue.Enqueue(control::MessagePriority::kSoft, MustEncode(Hello('1')))
+          .ok());
   ASSERT_TRUE(
-      queue.Enqueue(control::MessagePriority::kReliable, Hello('4')).ok());
+      queue.Enqueue(control::MessagePriority::kBulk, MustEncode(Hello('2')))
+          .ok());
+  ASSERT_TRUE(
+      queue
+          .Enqueue(control::MessagePriority::kAuthority, MustEncode(Hello('3')))
+          .ok());
+  ASSERT_TRUE(
+      queue.Enqueue(control::MessagePriority::kReliable, MustEncode(Hello('4')))
+          .ok());
 
   const auto authority = queue.Pop();
   const auto reliable = queue.Pop();
@@ -525,19 +624,20 @@ TEST(ControlWriteQueueTest, RejectsOverflowWithoutDiscardingQueuedMessage) {
   auto payload = control::EncodeMessage(first);
   ASSERT_TRUE(payload.ok()) << payload.status();
   control::ControlWriteQueue queue(control::kFrameHeaderBytes +
-                                   payload->size());
-  ASSERT_TRUE(
-      queue.Enqueue(control::MessagePriority::kReliable, std::move(first))
-          .ok());
+                                   payload->payload.size());
+  ASSERT_TRUE(queue
+                  .Enqueue(control::MessagePriority::kReliable,
+                           MustEncode(std::move(first)))
+                  .ok());
   const std::size_t before = queue.queued_bytes();
   const absl::Status rejected =
       queue.Enqueue(control::MessagePriority::kAuthority,
-                    control::ClientHello{
+                    MustEncode(control::ClientHello{
                         .node_id = std::string(40, 'd'),
                         .boot_id = std::string(40, 'e'),
                         .replication_history_id = std::string(40, 'f'),
                         .replication_flow_count = 3,
-                    });
+                    }));
   EXPECT_EQ(rejected.code(), absl::StatusCode::kResourceExhausted);
   EXPECT_EQ(queue.queued_bytes(), before);
   ASSERT_TRUE(queue.Pop().has_value());
@@ -546,8 +646,13 @@ TEST(ControlWriteQueueTest, RejectsOverflowWithoutDiscardingQueuedMessage) {
 
 TEST(ControlWriteQueueTest, RejectsMessageThatRequiresObjectTransfer) {
   control::ControlWriteQueue queue(2 * control::kMaxFrameBytes);
+  // Directive is fragmentable, so encoding succeeds past the frame cap; the
+  // queue rejects it on size.
+  auto oversized = control::EncodeMessage(OversizedDirective());
+  ASSERT_TRUE(oversized.ok()) << oversized.status();
+  ASSERT_GT(oversized->payload.size(), control::kMaxFramePayloadBytes);
   const absl::Status rejected =
-      queue.Enqueue(control::MessagePriority::kReliable, OversizedDirective());
+      queue.Enqueue(control::MessagePriority::kReliable, std::move(*oversized));
   EXPECT_EQ(rejected.code(), absl::StatusCode::kResourceExhausted);
   EXPECT_TRUE(queue.empty());
 }
@@ -657,25 +762,61 @@ TEST(ControlSessionWriterTest,
   ASSERT_TRUE(scenario->large_status_.ok()) << scenario->large_status_;
 
   ASSERT_GE(scenario->frames_.size(), 5u);
-  const auto* direct =
-      std::get_if<control::FullDesiredState>(&scenario->frames_.front());
-  ASSERT_NE(direct, nullptr);
-  const auto direct_bytes = control::EncodeFullDesiredState(*direct);
-  ASSERT_TRUE(direct_bytes.ok()) << direct_bytes.status();
-  EXPECT_EQ(*direct_bytes, scenario->small_bytes_);
+  // The frame path forwards the canonical bytes unchanged: the sink receives
+  // exactly the buffer WriteFullDesiredState was handed.
+  EXPECT_EQ(scenario->frames_.front().type,
+            control::MessageType::kFullDesiredState);
+  EXPECT_EQ(scenario->frames_.front().payload, scenario->small_bytes_);
 
-  const auto* start =
-      std::get_if<control::TransferStart>(&scenario->frames_[1]);
-  ASSERT_NE(start, nullptr);
-  EXPECT_EQ(start->kind, control::TransferKind::kFullDesiredState);
-  EXPECT_EQ(start->total_length, scenario->large_bytes_.size());
+  ASSERT_EQ(scenario->frames_[1].type, control::MessageType::kTransferStart);
+  const auto start = control::DecodeMessage(scenario->frames_[1].type,
+                                            scenario->frames_[1].payload);
+  ASSERT_TRUE(start.ok()) << start.status();
+  const auto* start_fields = std::get_if<control::TransferStart>(&*start);
+  ASSERT_NE(start_fields, nullptr);
+  EXPECT_EQ(start_fields->kind, control::TransferKind::kFullDesiredState);
+  EXPECT_EQ(start_fields->total_length, scenario->large_bytes_.size());
+  EXPECT_EQ(scenario->frames_.back().type, control::MessageType::kTransferEnd);
   EXPECT_TRUE(
-      std::holds_alternative<control::TransferEnd>(scenario->frames_.back()));
-  EXPECT_TRUE(std::all_of(
-      scenario->frames_.begin() + 2, scenario->frames_.end() - 1,
-      [](const control::WireMessage& frame) {
-        return std::holds_alternative<control::TransferChunk>(frame);
-      }));
+      std::all_of(scenario->frames_.begin() + 2, scenario->frames_.end() - 1,
+                  [](const control::EncodedMessage& frame) {
+                    return frame.type == control::MessageType::kTransferChunk;
+                  }));
+}
+
+TEST(ControlSessionWriterTest, PreEncodedPayloadPassesThroughVerbatim) {
+  auto scenario = std::make_shared<PreEncodedWriterScenario>();
+  const absl::Status run = RunWriterScenario(
+      [scenario](bycorf::Worker& worker) { return scenario->Run(worker); });
+  ASSERT_TRUE(run.ok()) << run;
+  ASSERT_TRUE(scenario->typed_status_.ok()) << scenario->typed_status_;
+  ASSERT_TRUE(scenario->preencoded_status_.ok())
+      << scenario->preencoded_status_;
+  ASSERT_TRUE(scenario->opaque_status_.ok()) << scenario->opaque_status_;
+  ASSERT_EQ(scenario->received_.size(), 3u);
+  // The typed overload's single encoding and the caller-supplied encoding of
+  // the same message arrive byte-identical.
+  EXPECT_EQ(scenario->received_[0].type, scenario->expected_type_);
+  EXPECT_EQ(scenario->received_[0].payload, scenario->expected_payload_);
+  EXPECT_EQ(scenario->received_[1].type, scenario->expected_type_);
+  EXPECT_EQ(scenario->received_[1].payload, scenario->expected_payload_);
+  // Bytes the writer was handed arrive untouched even when they are not a
+  // valid encoding of the declared type.
+  EXPECT_EQ(scenario->received_[2].type, control::MessageType::kClientHello);
+  EXPECT_EQ(scenario->received_[2].payload,
+            std::string("\x00\x01not-a-real-hello", 18));
+}
+
+TEST(ControlSessionWriterTest,
+     OversizedPreEncodedPayloadFailsWithoutPoisoningWriter) {
+  auto scenario = std::make_shared<OversizedPreEncodedWriterScenario>();
+  const absl::Status run = RunWriterScenario(
+      [scenario](bycorf::Worker& worker) { return scenario->Run(worker); });
+  ASSERT_TRUE(run.ok()) << run;
+  EXPECT_EQ(scenario->status_.code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_FALSE(scenario->failed_after_reject_);
+  EXPECT_TRUE(scenario->follow_up_.ok()) << scenario->follow_up_;
+  EXPECT_EQ(scenario->sink_calls_, 1u);
 }
 
 }  // namespace
