@@ -95,8 +95,8 @@ if (LAVIK_COMPILER_AND_LINKER_FLAGS MATCHES "-fsanitize=[^ ]*address")
 endif()
 if (LAVIK_ASAN_BUILD AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   message(FATAL_ERROR
-    "AddressSanitizer builds require Clang. GCC does not preserve coroutine "
-    "symmetric transfers under ASan and can overflow the native stack.")
+    "AddressSanitizer builds currently support Clang only. The full GCC "
+    "sanitizer build is not covered by the supported validation matrix.")
 endif()
 set(LAVIK_CLANG_FORMAT_REQUIRED_VERSION "23.1.1")
 string(REPLACE "." "\\." LAVIK_CLANG_FORMAT_VERSION_REGEX

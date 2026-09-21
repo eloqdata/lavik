@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -327,7 +328,8 @@ class ChildServer {
                        std::string_view fail_group_batch = {},
                        std::string_view fail_transaction_write = {},
                        std::string_view pause_record_write = {},
-                       std::string_view pause_root_pin = {}) {
+                       std::string_view pause_root_pin = {},
+                       rlim_t stack_bytes = 0) {
     const int listener = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     Check(listener >= 0, "port socket failed");
     sockaddr_in address{.sin_family = AF_INET,
@@ -346,6 +348,11 @@ class ChildServer {
     pid_ = ::fork();
     Check(pid_ >= 0, "fork failed");
     if (pid_ == 0) {
+      if (stack_bytes != 0) {
+        // Apply before exec so newly created worker threads inherit this bound.
+        const rlimit limit{stack_bytes, stack_bytes};
+        if (::setrlimit(RLIMIT_STACK, &limit) != 0) ::_exit(127);
+      }
       if (!crash_point.empty()) {
         ::setenv("LAVIK_CRASH_POINT", std::string(crash_point).c_str(), 1);
       }
@@ -611,6 +618,50 @@ TEST(GroupedRecoveryE2e, RejectsCommittedRootWithMissingGroup) {
   ChildServer server(image);
   EXPECT_NE(server.Wait(), 0) << server.Log();
   EXPECT_NE(server.Log().find("Hash"), std::string::npos);
+}
+
+TEST(GroupedRecoveryE2e, ManyInlineOrderedRootsRecoverOnSmallStack) {
+  RecordImage image;
+  constexpr unsigned kKeys = 4096;
+  for (unsigned i = 0; i < kKeys; ++i) {
+    const auto kind = i % 2 == 0 ? OrderedCollectionKind::kList
+                                 : OrderedCollectionKind::kSortedSet;
+    const std::string key = "inline-" + std::to_string(i);
+    image.OrderedGroup(
+        key,
+        OrderedGroupSnapshot{.kind_ = kind,
+                             .incarnation_ = 17,
+                             .id_ = 1,
+                             .entries_ = {{"value", i % 2 == 0 ? 0.0 : 3.5}}},
+        1);
+    image.OrderedRoot(key,
+                      OrderedCollectionRoot{.kind_ = kind,
+                                            .incarnation_ = 17,
+                                            .item_count_ = 1,
+                                            .first_group_ = 1,
+                                            .last_group_ = 1,
+                                            .next_group_id_ = 2,
+                                            .group_count_ = 1,
+                                            .revision_ = 1},
+                      1);
+  }
+  image.Finish();
+  // Inline metadata needs no I/O between roots. A small worker stack catches
+  // synchronous coroutine-transfer chains without a multi-GiB fixture.
+  ChildServer server(image, false, {}, false, false, {}, {}, {}, {},
+                     256 * 1024);
+  EXPECT_EQ(server.Command({"DBSIZE"}), ":" + std::to_string(kKeys));
+  for (unsigned i : {0U, 1U, kKeys / 2, kKeys / 2 + 1, kKeys - 2, kKeys - 1}) {
+    const std::string key = "inline-" + std::to_string(i);
+    if (i % 2 == 0) {
+      EXPECT_EQ(server.Command({"LLEN", key}), ":1");
+      EXPECT_EQ(server.Command({"LINDEX", key, "0"}), "value");
+    } else {
+      EXPECT_EQ(server.Command({"ZCARD", key}), ":1");
+      EXPECT_EQ(server.Command({"ZSCORE", key, "value"}), "3.5");
+    }
+  }
+  EXPECT_EQ(server.Wait(true), 0) << server.Log();
 }
 
 TEST(GroupedRecoveryE2e, LegacySortedSetCanStillMutateAndRecover) {
