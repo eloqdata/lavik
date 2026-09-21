@@ -3481,6 +3481,11 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
         (tls_identity->subject_id_ != bootstrap->node_id ||
          (node && tls_identity->principal_ != node->principal_));
     if (wrong_identity || (node && node->retired_)) {
+      // An identity that contradicts the committed binding must not learn
+      // committed topology or service metadata. Mirror the TLS-identity
+      // failure branch above; the kRetry path below intentionally keeps the
+      // directory so unregistered nodes can discover the leader.
+      reply.server = BuildServerHello(*core, {}, {}, false);
       reply.disposition = control::BootstrapDisposition::kUnauthorized;
       reply.server.rejection_reason =
           "Data identity does not match active committed binding";
