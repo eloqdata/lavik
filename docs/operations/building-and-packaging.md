@@ -124,6 +124,15 @@ production libraries. Clang test links enable its LLVM bitcode reader without
 compiling the test sources with IPO. Debug builds also omit IPO to keep iteration time
 predictable. LTO is not required for functional correctness.
 
+Bycorf's public CMake target enables `-foptimize-sibling-calls` for GCC,
+including Debug builds. Immediate coroutine calls and returns rely on this
+option to bound native stack use; it does not enable general optimization or
+disable Debug assertions. Do not override it with `-fno-optimize-sibling-calls`
+on coroutine translation units. Runtime transfers and completed I/O resume
+directly, without an intermediate dispatcher. Keep the bounded-stack Task and
+grouped-recovery regressions in toolchain validation; sanitizer guidance is
+[below](#addresssanitizer-builds).
+
 The release build produces `lavik`, `lavik-meta`, and the Raft-free
 `lavik-ctl` operator client. `lavik-meta` and `lavik-ctl` provide direct
 administration and cluster readiness. To build them from an existing build
