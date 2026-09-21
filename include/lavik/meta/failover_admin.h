@@ -52,8 +52,8 @@ struct FailoverRequestOptions {
   // These fields are an all-or-none exact idempotency pair. An embedding that
   // retries must preserve both the retained operation id and the absolute
   // workflow deadline; recomputing the latter would change the durable intent.
-  // The CLI leaves both empty and reports its generated id on every uncertain
-  // outcome.
+  // The CLI generates these by default; fleet callers can supply the retained
+  // pair with --operation-id and --deadline-unix-ms before submission.
   std::optional<MetaOperationId> operation_id_;
   std::optional<std::uint64_t> absolute_deadline_unix_ms_;
 };

@@ -6278,6 +6278,12 @@ auto ReplicationManager::ReplicationGroup::ServeNativeConnection(
     UnregisterClientConnection(client_id);
     if (!status.ok()) {
       spdlog::warn("replication native handshake failed: {}", status.message());
+      // A target may observe new membership before this Owner's control
+      // update arrives. End a rejected handshake immediately so its native
+      // coordinator can retry against the converged relationship. The outer
+      // TcpService still owns descriptor destruction; shutdown only wakes
+      // the peer and cannot recycle a descriptor borrowed by RunSession.
+      (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
     }
     co_return status;
   }

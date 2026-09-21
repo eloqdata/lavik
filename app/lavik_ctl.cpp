@@ -98,6 +98,8 @@ struct Options {
   bool allow_plaintext_admin_ = false;
   std::string manifest_path_;
   std::string failover_group_;
+  std::string operation_id_;
+  std::string deadline_unix_ms_;
   int failover_timeout_ms_ = 120'000;
   bool failover_timeout_explicit_ = false;
   std::vector<std::string> command_;
@@ -124,11 +126,16 @@ void PrintUsage(const char* program) {
       "     [--tls-ca FILE --tls-cert FILE --tls-key FILE]\n"
       "     [--allow-plaintext-admin] [--timeout-ms N]\n"
       "     [--failover-timeout-ms N]\n"
+      "     [--operation-id HEX32 --deadline-unix-ms N]\n"
       "\n"
       "Recovery: --socket PATH promote GROUP --node NODE --accept-data-loss\n"
       "Select one readable recovered population when no automatic candidate "
       "exists.\n"
       "Direct commands are sent to the specified Meta node as one line.\n"
+      "Lavik Admin: --socket /path/to/admin.sock fleet-list, fleet-add NAME\n"
+      "IP:PORT, fleet-status NAME, fleet-operations NAME, fleet-failover NAME\n"
+      "GROUP, fleet-replica-add NAME GROUP NODE ENDPOINT, or\n"
+      "fleet-replica-remove NAME GROUP NODE. These share the Admin catalog.\n"
       "status reports that node's state; cluster-status discovers the leader\n"
       "and reports cluster readiness. cluster-create creates the v1 multi-\n"
       "Data, multi-Group topology and returns after its Genesis commit. Use\n"
@@ -253,6 +260,8 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
         assign("--tls-cert", &options.tls_cert_) ||
         assign("--tls-key", &options.tls_key_) ||
         assign("--tls-server-name", &options.tls_server_name_) ||
+        assign("--operation-id", &options.operation_id_) ||
+        assign("--deadline-unix-ms", &options.deadline_unix_ms_) ||
         assign("--manifest", &options.manifest_path_)) {
       continue;
     }
@@ -280,6 +289,20 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
   }
 
   for (; index < argc; ++index) options.command_.emplace_back(argv[index]);
+  if (!options.operation_id_.empty() || !options.deadline_unix_ms_.empty()) {
+    if (!options.failover_ || options.operation_id_.size() != 32 ||
+        options.operation_id_.find_first_not_of("0123456789abcdef") !=
+            std::string::npos ||
+        options.operation_id_.find_first_not_of('0') == std::string::npos) {
+      Fail("failover requires --operation-id HEX32 and --deadline-unix-ms together");
+    }
+    std::uint64_t deadline = 0;
+    const auto parsed = std::from_chars(options.deadline_unix_ms_.data(),
+        options.deadline_unix_ms_.data() + options.deadline_unix_ms_.size(), deadline);
+    if (parsed.ec != std::errc{} ||
+        parsed.ptr != options.deadline_unix_ms_.data() + options.deadline_unix_ms_.size() ||
+        deadline == 0) Fail("invalid --deadline-unix-ms");
+  }
   if (options.cluster_status_ || options.cluster_create_ || options.failover_) {
     if (!options.command_.empty()) {
       Fail(std::string(options.cluster_status_   ? "cluster-status"
@@ -572,6 +595,22 @@ int RunFailover(const Options& options) {
       .operation_id_ = std::nullopt,
       .absolute_deadline_unix_ms_ = std::nullopt,
   };
+  // Fleet callers persist this exact pair before starting a subprocess. A
+  // lost process/reply can then be resolved by getop without inventing intent.
+  if (!options.operation_id_.empty()) {
+    lavik::meta::MetaOperationId id{};
+    for (std::size_t i = 0; i < id.size(); ++i) {
+      unsigned byte = 0;
+      std::from_chars(options.operation_id_.data() + 2 * i,
+                      options.operation_id_.data() + 2 * i + 2, byte, 16);
+      id[i] = static_cast<std::uint8_t>(byte);
+    }
+    std::uint64_t deadline = 0;
+    std::from_chars(options.deadline_unix_ms_.data(),
+        options.deadline_unix_ms_.data() + options.deadline_unix_ms_.size(), deadline);
+    request.operation_id_ = id;
+    request.absolute_deadline_unix_ms_ = deadline;
+  }
   lavik::meta::ClusterOperator cluster;
   auto outcome =
       cluster.Failover(AdminTarget(options), request, cluster_options);

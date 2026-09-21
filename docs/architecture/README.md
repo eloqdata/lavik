@@ -35,6 +35,7 @@ references rather than current architecture.
 | Cluster data plane | Slot routing, finite authority admission, controlled-failover write pause, selected local control, independent route/task updates, failover activation and replica following, pre-storage mode bootstrap, Meta discovery/session handling, and Single/Redis Cluster compatibility | [Cluster data plane](06-cluster-data-plane.md) |
 | Meta control plane | Raft-backed metadata, manifest-bootstrapped multi-member genesis, six durable stores with Topology-owned immutable service mode and lifecycle, per-Group term/owner/authority and failover transitions, atomic creation admission, Data-session publishing, independent Sentinel client sessions, cluster status, leader-owned workflow recovery, membership identity, and WAL/snapshots | [Meta control plane](08-meta-control-plane.md) |
 | Meta Raft runtime | Single-owner consensus, asynchronous WAL/application dependencies, snapshot recovery, peer authentication and bounded quorum liveness | [Meta Raft runtime](10-meta-raft.md) |
+| Admin and fleet management | Shared browser/CLI cluster catalog, persistent operator requests, Meta integration, replica resizing, and bounded data inspection | [Lavik Admin](11-admin.md) |
 
 Metrics, memory accounting, logging, configuration, and the Bycorf runtime cross
 several subsystems and are summarized in the system overview rather than
@@ -97,3 +98,4 @@ architecture update.
 | Cluster data plane has topology, finite authority, node-controller, Meta-client/session, failover observation, and Redis gate boundaries | `include/lavik/cluster/`, `src/cluster/`, `src/redis/cluster_command.cpp`, `src/redis/command.cpp`, `src/redis/server.cpp` |
 | Meta control plane separates deterministic committed state with a topology-owned single-Data-cluster lifecycle and per-Group failover transitions, pure node projection, volatile observations, leader-scoped publishing/reconciliation, authenticated administration, an independent Sentinel RESP client entry, atomic initial creation, stable cluster status, manifest-bootstrapped initial membership, and the C++/Go Raft boundary | `include/lavik/meta/`, `src/meta/`, `app/lavik_meta.cpp`, `app/lavik_ctl.cpp` |
 | Bycorf is a pinned runtime submodule | `.gitmodules`, `CMakeLists.txt`, `bycorf/include/bycorf/`, `bycorf/src/` |
+| Lavik Admin and the CLI fleet socket share one catalog while Meta remains authoritative for each cluster | `admin/server.mjs`, `admin/fleet.mjs`, `admin/store.mjs`, `app/lavik_ctl.cpp` |

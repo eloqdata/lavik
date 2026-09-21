@@ -72,3 +72,8 @@ Thumbs.db
 build-lavik/
 dump.rdb
 /deploy/monitoring/.env
+/admin/node_modules/
+/admin/test-results/
+/admin/playwright-report/
+/.lavik-admin/
+/admin/.lavik-admin/

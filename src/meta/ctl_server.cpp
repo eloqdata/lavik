@@ -1511,7 +1511,15 @@ std::string HandleGetNode(std::shared_ptr<MetaStateMachine> state_machine,
   return "OK principal=" + record->principal_ +
          " role=" + RoleName(record->role_) +
          " revision=" + std::to_string(record->revision_) +
-         (record->retired_ ? " retired=1" : " retired=0");
+         (record->retired_ ? " retired=1" : " retired=0") +
+         " endpoints=" + [&] {
+           std::string endpoints;
+           for (const auto& endpoint : record->endpoints_) {
+             if (!endpoints.empty()) endpoints += ',';
+             endpoints += endpoint;
+           }
+           return endpoints;
+         }();
 }
 
 // creategroup <group_id>: the topology epoch is absolute (current + 1), read
@@ -1580,6 +1588,49 @@ bycorf::Task<std::string> HandleAssignNode(
                             member.role_ == role;
                    });
   co_return installed == after->members_.end() ? "ERR rejected" : reply;
+}
+
+// Replica removal uses the revision the operator reviewed. In particular,
+// reconnect/retry cannot remove a later assignment of the same node id.
+bycorf::Task<std::string> HandleUnassignNode(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    std::shared_ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, const std::string& group_id,
+    const std::string& node_id, std::uint64_t expected_revision) {
+  const MetaStores before = state_machine->StoresSnapshot();
+  const auto group = before.topology_.FindGroup(group_id);
+  if (!group.has_value()) co_return "ERR not-found";
+  if (before.topology_.ClusterLifecycle().state_ !=
+          MetaClusterLifecycle::kCreated ||
+      group->record_.owner_ == node_id || group->failover_transition_) {
+    co_return "ERR owner-or-transition-cannot-be-removed";
+  }
+  if (group->revision_ != expected_revision) co_return "ERR stale-revision";
+  if (std::none_of(group->members_.begin(), group->members_.end(),
+                   [&](const MetaGroupMember& member) {
+                     return member.node_id_ == node_id;
+                   })) {
+    co_return "ERR not-a-member";
+  }
+  RemoveNodeFromGroup command;
+  command.request_id_ = MakeRequestId();
+  command.group_id_ = group_id;
+  command.node_id_ = node_id;
+  command.expected_revision_ = expected_revision;
+  command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
+  const std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (!reply.starts_with("OK ")) co_return reply;
+  // Concurrent topology commits can reject an appended CAS command. As with
+  // assignment, report success only when the requested effect is visible.
+  const auto after = state_machine->FindGroup(group_id);
+  if (!after || std::any_of(after->members_.begin(), after->members_.end(),
+                            [&](const MetaGroupMember& member) {
+                              return member.node_id_ == node_id;
+                            })) {
+    co_return "ERR rejected";
+  }
+  co_return reply;
 }
 
 // begingroupterm <group_id> <expected> <new>: promotes the committed
@@ -2323,6 +2374,17 @@ bycorf::Task<std::string> DispatchMutationVerb(
                                         std::move(principal), tokens[1],
                                         tokens[2], role);
   }
+  if (command == "unassignnode") {
+    std::uint64_t revision = 0;
+    if (tokens.size() != 4 || tokens[1].empty() ||
+        tokens[1].size() > kMaxMetaGroupIdBytes || !IsNodeId(tokens[2]) ||
+        !ParseU64(tokens[3], revision) || revision == 0) {
+      co_return "ERR bad-request";
+    }
+    co_return co_await HandleUnassignNode(
+        coordinator, std::move(state_machine), std::move(principal),
+        tokens[1], tokens[2], revision);
+  }
   if (command == "begingroupterm") {
     if (tokens.size() != 4 || tokens[1].empty() ||
         tokens[1].size() > kMaxMetaGroupIdBytes) {
@@ -2605,7 +2667,8 @@ bycorf::Task<std::string> DispatchCommand(
   if (command == "submitop" || command == "completeop" ||
       command == "abortop" || command == "archiveoperations" ||
       command == "registernode" || command == "creategroup" ||
-      command == "assignnode" || command == "begingroupterm" ||
+      command == "assignnode" || command == "unassignnode" ||
+      command == "begingroupterm" ||
       command == "putpolicy" || command == "setslotmap" ||
       command == "activateauthority" || command == "fencegroup" ||
       command == "transitionop" || command == "pruneaudit" ||
@@ -2623,6 +2686,40 @@ bycorf::Task<std::string> DispatchCommand(
       co_return "ERR bad-request";
     }
     co_return HandleGetOp(std::move(state_machine), id);
+  }
+  if (command == "getgroup" || command == "listops") {
+    // These views are for both UI and CLI clients. Reject follower reads so
+    // reconnecting to a seed cannot silently roll an operation's state back.
+    if (!server->is_leader() || !server->is_leader_alive() ||
+        !server->is_leader_sm_fully_caught_up()) co_return "ERR not-leader";
+    if (command == "getgroup") {
+      if (tokens.size() != 2) co_return "ERR bad-request";
+      const auto group = state_machine->FindGroup(tokens[1]);
+      if (!group) co_return "ERR not-found";
+      co_return absl::StrCat("OK revision=", group->revision_, " term=",
+          group->record_.group_term_, " owner=", group->record_.owner_,
+          " transition=", group->failover_transition_ ? 1 : 0);
+    }
+    std::uint64_t after = 0, limit = 100;
+    if (tokens.size() != 3 || !ParseU64(tokens[1], after) ||
+        !ParseU64(tokens[2], limit) || limit == 0 || limit > 100) {
+      co_return "ERR bad-request";
+    }
+    const auto operations = state_machine->OperationSummaries(after, limit);
+    // Hex fields make the one-line format unambiguous for arbitrary opaque
+    // operation kinds/results. Pagination is by immutable submit sequence;
+    // archived records are deliberately outside this live-journal view.
+    std::string reply = "OK listops-v1";
+    for (const auto& operation : operations) {
+      const auto id = HexEncode(std::string_view(
+          reinterpret_cast<const char*>(operation.operation_id_.data()),
+          operation.operation_id_.size()));
+      reply += absl::StrCat(" ", id, ":", operation.operation_seq_, ":",
+          LifecycleName(operation.lifecycle_), ":", HexEncode(operation.kind_),
+          ":", HexEncode(operation.phase_), ":",
+          HexEncode(operation.result_));
+    }
+    co_return reply;
   }
   if (command == "getnode") {
     if (tokens.size() != 2 || !IsNodeId(tokens[1])) {

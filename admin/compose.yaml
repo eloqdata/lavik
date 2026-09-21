@@ -1,0 +1,17 @@
+# Copyright (C) 2026 EloqData Inc. Licensed under the Apache License, Version 2.0.
+services:
+  admin:
+    build:
+      context: ..
+      dockerfile: admin/Dockerfile
+    image: lavik-admin:local
+    ports:
+      - "127.0.0.1:4173:4173"
+    environment:
+      LAVIK_ADMIN_ORIGIN: http://localhost:4173
+    volumes:
+      - admin-data:/data
+    restart: unless-stopped
+    init: true
+volumes:
+  admin-data:

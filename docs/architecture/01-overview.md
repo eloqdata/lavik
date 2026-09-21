@@ -102,6 +102,13 @@ operator --> lavik-ctl cluster-status / failover / getop
 
 ## Component responsibilities
 
+[Lavik Admin](11-admin.md) is an optional operator service outside the Data
+and Meta processes. Its browser and `lavik-ctl` fleet entry share a persistent
+multi-cluster catalog and request history. It reuses the Meta operator client
+for authority-bearing operations and reads Data directly for bounded metrics,
+key inspection, and command execution. Cluster state remains in each
+deployment's Meta Raft store; the fleet catalog supplies connection discovery.
+
 | Component | Responsibility | Main interface |
 |---|---|---|
 | Process shell | Parse configuration, initialize logging and memory limits, compose modules, start services, and coordinate graceful shutdown | `app/lavik.cpp`, `lavik::RunServer` |
