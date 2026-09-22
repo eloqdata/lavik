@@ -665,8 +665,8 @@ Task<CommandReply> ExecuteRdbBackupCommand(const CommandRequest& request,
     co_return Reply(
         reply_builder.AppendError("ERR RDB backup is not configured"));
   }
-  const bool schedule = request.kind_ == CommandKind::kBgSave &&
-                        request.args_.size() == 2;
+  const bool schedule =
+      request.kind_ == CommandKind::kBgSave && request.args_.size() == 2;
   if (schedule && !absl::EqualsIgnoreCase(request.args_[1], "SCHEDULE")) {
     co_return Reply(reply_builder.AppendError("ERR syntax error"));
   }
@@ -721,26 +721,27 @@ Task<absl::Status> RunRdbBackupScheduler(bycorf::Worker& worker) {
     if (g_automatic_backups_stopped.load(std::memory_order_acquire)) {
       co_return absl::OkStatus();
     }
-    if (g_save_rules.empty() || g_backup_active.load(std::memory_order_relaxed) ||
+    if (g_save_rules.empty() ||
+        g_backup_active.load(std::memory_order_relaxed) ||
         std::chrono::steady_clock::now() < g_next_automatic_attempt) {
       continue;
     }
 
-    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                             std::chrono::steady_clock::now() -
-                             g_last_successful_save)
-                             .count();
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - g_last_successful_save)
+            .count();
     bool time_eligible = false;
     for (const RdbSaveRule& rule : g_save_rules) {
-      if (elapsed >= 0 && static_cast<std::uint64_t>(elapsed) >= rule.seconds_) {
+      if (elapsed >= 0 &&
+          static_cast<std::uint64_t>(elapsed) >= rule.seconds_) {
         time_eligible = true;
         break;
       }
     }
     if (!time_eligible) continue;
 
-    const std::uint64_t changes =
-        co_await CollectDatasetChangesSinceLastSave();
+    const std::uint64_t changes = co_await CollectDatasetChangesSinceLastSave();
     // Shutdown and explicit commands can run while the cross-worker
     // collection is suspended. Re-check ownership state before starting work
     // from a decision made against that earlier snapshot.
@@ -752,7 +753,8 @@ Task<absl::Status> RunRdbBackupScheduler(bycorf::Worker& worker) {
     }
     bool should_save = false;
     for (const RdbSaveRule& rule : g_save_rules) {
-      if (elapsed >= 0 && static_cast<std::uint64_t>(elapsed) >= rule.seconds_ &&
+      if (elapsed >= 0 &&
+          static_cast<std::uint64_t>(elapsed) >= rule.seconds_ &&
           changes >= rule.changes_) {
         should_save = true;
         break;

@@ -473,8 +473,8 @@ absl::Status ApplyRedisConfigDirective(
       absl::Status status =
           ParseUnsigned(directive[i], "save seconds", &rule.seconds_, false);
       if (!status.ok()) return status;
-      status = ParseUnsigned(directive[i + 1], "save changes",
-                             &rule.changes_, true);
+      status =
+          ParseUnsigned(directive[i + 1], "save changes", &rule.changes_, true);
       if (!status.ok()) return status;
       parsed.push_back(rule);
     }

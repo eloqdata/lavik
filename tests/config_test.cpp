@@ -122,23 +122,20 @@ TEST(RedisConfigTest, ParsesRedisClientQueryBufferLimitRange) {
 
 TEST(RedisConfigTest, ParsesAutomaticRdbSavePolicies) {
   ServerOptions options;
-  ASSERT_TRUE(ApplyRedisConfigDirective(
-                  {"save", "3600", "1", "300", "100"}, &options)
-                  .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"save", "3600", "1", "300", "100"}, &options)
+          .ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"save", "60", "10000"}, &options).ok());
-  EXPECT_EQ(options.rdb_save_rules_,
-            (std::vector<lavik::RdbSaveRule>{{3600, 1},
-                                              {300, 100},
-                                              {60, 10000}}));
+  EXPECT_EQ(options.rdb_save_rules_, (std::vector<lavik::RdbSaveRule>{
+                                         {3600, 1}, {300, 100}, {60, 10000}}));
 
   EXPECT_FALSE(ApplyRedisConfigDirective({"save", "60"}, &options).ok());
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"save", "seconds", "1"}, &options).ok());
   EXPECT_FALSE(ApplyRedisConfigDirective({"save", "0", "1"}, &options).ok());
   ASSERT_TRUE(ApplyRedisConfigDirective({"save", "60", "0"}, &options).ok());
-  EXPECT_EQ(options.rdb_save_rules_.back(),
-            (lavik::RdbSaveRule{60, 0}));
+  EXPECT_EQ(options.rdb_save_rules_.back(), (lavik::RdbSaveRule{60, 0}));
 
   ASSERT_TRUE(ApplyRedisConfigDirective({"save", ""}, &options).ok());
   EXPECT_TRUE(options.rdb_save_rules_.empty());
