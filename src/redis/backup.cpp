@@ -674,7 +674,11 @@ Task<CommandReply> ExecuteRdbBackupCommand(const CommandRequest& request,
   std::shared_ptr<BackupJob> job = TryStartBackup(context);
   if (job == nullptr) {
     if (schedule) {
-      if (!g_scheduled_backup.has_value()) g_scheduled_backup = context;
+      // Every successful reply promises a successor for the request's serving
+      // generation. Coalescing therefore keeps the newest acknowledged fence:
+      // retaining an older one could make the only successor fail after a
+      // generation transition even though the newer caller received success.
+      g_scheduled_backup = context;
       co_return Reply(
           reply_builder.AppendSimpleString("Background saving scheduled"));
     }

@@ -239,16 +239,18 @@ closed population.
 Worker zero owns RDB backup scheduling. `SAVE`, `BGSAVE`, and `LASTSAVE`
 requests arriving on other workers submit their control step there, while an
 active backup fans snapshot capture and scanning back out to every data worker.
-`BGSAVE SCHEDULE` retains at most one immutable follow-up request context and
-starts it after the active job retires. Configured `save <seconds> <changes>`
-policies are alternatives whose time and change thresholds must both hold. If
-at least one policy exists, a one-second worker-zero coroutine evaluates them
-using low-frequency collection of the worker-local change counters; no timer
-coroutine exists when automatic saves are disabled. Successful snapshots
-advance each worker's saved cut, so mutations after the snapshot cut remain
-eligible for a later automatic save. Shutdown disables new policy-driven saves
-and lets the background policy timer exit at its next wakeup, while an active
-or explicitly scheduled job drains before storage flush.
+`BGSAVE SCHEDULE` retains at most one immutable follow-up request context,
+replacing it with the latest acknowledged request so its serving-generation
+fence remains current, and starts it after the active job retires. Configured
+`save <seconds> <changes>` policies are alternatives whose time and change
+thresholds must both hold. If at least one policy exists, a one-second
+worker-zero coroutine evaluates them using low-frequency collection of the
+worker-local change counters; no timer coroutine exists when automatic saves
+are disabled. Successful snapshots advance each worker's saved cut, so
+mutations after the snapshot cut remain eligible for a later automatic save.
+Shutdown disables new policy-driven saves and lets the background policy timer
+exit at its next wakeup, while an active or explicitly scheduled job drains
+before storage flush.
 
 ## Session and transaction behavior
 
