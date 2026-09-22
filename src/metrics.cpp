@@ -248,6 +248,17 @@ void MarkLocalDatasetChangesSaved(std::uint64_t total) noexcept {
                std::min(total, shard.dataset_changes_total_));
 }
 
+bycorf::Task<std::uint64_t> CollectDatasetChangesSinceLastSave() {
+  std::uint64_t changes = 0;
+  for (unsigned worker = 0; worker < g_worker_metrics_count; ++worker) {
+    changes += co_await bycorf::SubmitTo(worker, [worker] {
+      const WorkerMetricsShard& shard = g_worker_metrics[worker];
+      return shard.dataset_changes_total_ - shard.dataset_changes_saved_;
+    });
+  }
+  co_return changes;
+}
+
 void RecordReplicationConnectionOpened(
     ReplicationConnectionKind kind) noexcept {
   WorkerMetricsShard& shard = g_worker_metrics[bycorf::ThisWorker().id_];

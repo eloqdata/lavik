@@ -35,6 +35,16 @@ namespace lavik {
 inline constexpr long kDefaultMimallocPurgeDelayMs = 60'000;
 inline constexpr std::uint64_t kDefaultMaxClients = 10'000;
 
+// One Redis `save <seconds> <changes>` policy. A background RDB save becomes
+// eligible only after both thresholds have been reached since the last
+// successful save; multiple policies are alternatives.
+struct RdbSaveRule {
+  std::uint64_t seconds_ = 0;
+  std::uint64_t changes_ = 0;
+
+  bool operator==(const RdbSaveRule&) const = default;
+};
+
 struct ServerOptions {
   // Startup-only choices; compiled-in capabilities remain optional.
   std::string network_backend_ = "kernel";
@@ -92,6 +102,9 @@ struct ServerOptions {
   // whether data_files_ names regular files, block devices, or SPDK devices.
   std::string rdb_dir_{"."};
   std::string dbfilename_{"dump.rdb"};
+  // Empty preserves Lavik's historical opt-in persistence behavior. Redis
+  // configuration files can add one or more automatic RDB save policies.
+  std::vector<RdbSaveRule> rdb_save_rules_;
   // One-shot logical import performed after storage recovery and before any
   // listener opens. The target Lavik dataset must be empty.
   std::string load_rdb_file_;

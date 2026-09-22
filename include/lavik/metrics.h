@@ -131,6 +131,10 @@ void RecordClientUnblocked() noexcept;
 void RecordDatasetChanges(std::uint64_t count = 1) noexcept;
 [[nodiscard]] std::uint64_t LocalDatasetChangesTotal() noexcept;
 void MarkLocalDatasetChangesSaved(std::uint64_t total) noexcept;
+// Collects the exact process-wide unsaved-change count by reading each shard
+// on its owning worker. This is intentionally a low-frequency control-path
+// operation; ordinary writes update only worker-local counters.
+bycorf::Task<std::uint64_t> CollectDatasetChangesSinceLastSave();
 
 enum class ReplicationConnectionKind : std::uint8_t {
   kControl,

@@ -455,6 +455,33 @@ absl::Status ApplyRedisConfigDirective(
     options->client_query_buffer_limit_bytes_ = *limit;
     return absl::OkStatus();
   }
+  if (name == "save") {
+    // Redis uses `save ""` to disable every automatic snapshot policy. Other
+    // forms contain one or more seconds/changes pairs and repeated directives
+    // accumulate policies.
+    if (directive.size() == 2 && directive[1].empty()) {
+      options->rdb_save_rules_.clear();
+      return absl::OkStatus();
+    }
+    if (directive.size() < 3 || directive.size() % 2 == 0) {
+      return WrongArgumentCount(name);
+    }
+    std::vector<RdbSaveRule> parsed;
+    parsed.reserve((directive.size() - 1) / 2);
+    for (std::size_t i = 1; i < directive.size(); i += 2) {
+      RdbSaveRule rule;
+      absl::Status status =
+          ParseUnsigned(directive[i], "save seconds", &rule.seconds_, false);
+      if (!status.ok()) return status;
+      status =
+          ParseUnsigned(directive[i + 1], "save changes", &rule.changes_, true);
+      if (!status.ok()) return status;
+      parsed.push_back(rule);
+    }
+    options->rdb_save_rules_.insert(options->rdb_save_rules_.end(),
+                                    parsed.begin(), parsed.end());
+    return absl::OkStatus();
+  }
   if (name == "replicaof" || name == "redis-replicaof") {
     if (directive.size() != 3) return WrongArgumentCount(name);
     if (directive[1].empty()) {

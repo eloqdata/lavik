@@ -342,6 +342,9 @@ test is independent of the larger storage-tier benchmark above.
 - A successful write is not a synchronous `fsync` fence; see the
   [storage architecture](docs/architecture/04-storage-and-recovery.md) before
   selecting failure semantics.
+- Redis-style configuration files may enable automatic RDB snapshots with
+  `save <seconds> <changes>` pairs; `save ""` disables them. Lavik keeps
+  automatic snapshots disabled when no `save` directive is present.
 - A replication restart can require a full synchronization.
 - Raw block and SPDK paths require exclusive device ownership.
 

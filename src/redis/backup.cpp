@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -36,6 +37,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/sync.h"
@@ -194,10 +196,28 @@ class RdbOutputQueue {
   std::thread thread_;
 };
 
+// Only the fields used by the delayed snapshot fence survive the command that
+// requested BGSAVE SCHEDULE. Keeping this immutable value avoids retaining a
+// connection-owned CommandRequest after its reply has been sent.
+struct BackupRequestContext {
+  std::uint64_t serving_generation_ = 0;
+  bool serving_generation_valid_ = false;
+  bool replication_origin_ = false;
+};
+
+BackupRequestContext CaptureRequestContext(const CommandRequest& request) {
+  return BackupRequestContext{
+      .serving_generation_ = request.serving_generation_,
+      .serving_generation_valid_ =
+          static_cast<bool>(request.serving_generation_valid_),
+      .replication_origin_ = static_cast<bool>(request.replication_origin_),
+  };
+}
+
 class BackupJob : public std::enable_shared_from_this<BackupJob> {
  public:
   BackupJob(storage::StorageEngine* storage, std::string target_path,
-            std::uint64_t session_id, const CommandRequest& request)
+            std::uint64_t session_id, BackupRequestContext request)
       : storage_(storage),
         output_(std::move(target_path)),
         session_id_(session_id),
@@ -538,11 +558,31 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
 
 storage::StorageEngine* g_backup_storage = nullptr;
 std::string g_backup_target_path;
+std::vector<RdbSaveRule> g_save_rules;
+// Scheduling decisions and these two fields belong to worker zero. The atomic
+// active bit is only the main thread's low-frequency shutdown join; ordinary
+// writes never touch shared backup state.
+std::optional<BackupRequestContext> g_scheduled_backup;
+std::chrono::steady_clock::time_point g_last_successful_save;
+std::chrono::steady_clock::time_point g_next_automatic_attempt;
 std::atomic<bool> g_backup_active{false};
+std::atomic<bool> g_automatic_backups_stopped{false};
 std::atomic<std::uint64_t> g_next_backup_session{1};
 std::atomic<std::uint64_t> g_last_save_seconds{0};
 
+std::shared_ptr<BackupJob> MakeBackup(BackupRequestContext request) {
+  assert(bycorf::ThisWorker().id_ == 0);
+  std::uint64_t session =
+      g_next_backup_session.fetch_add(1, std::memory_order_relaxed);
+  if (session == 0) {
+    session = g_next_backup_session.fetch_add(1, std::memory_order_relaxed);
+  }
+  return std::make_shared<BackupJob>(g_backup_storage, g_backup_target_path,
+                                     session, request);
+}
+
 Task<absl::Status> FinishBackup(std::shared_ptr<BackupJob> job) {
+  assert(bycorf::ThisWorker().id_ == 0);
   absl::Status status = co_await job->Run();
   if (status.ok()) {
     const auto& cuts = job->saved_change_cuts();
@@ -557,29 +597,34 @@ Task<absl::Status> FinishBackup(std::shared_ptr<BackupJob> job) {
                          .count();
     g_last_save_seconds.store(now > 0 ? static_cast<std::uint64_t>(now) : 1,
                               std::memory_order_release);
+    g_last_successful_save = std::chrono::steady_clock::now();
+    g_next_automatic_attempt = g_last_successful_save;
     spdlog::info("RDB backup completed: {}", g_backup_target_path);
   } else {
+    // Match Redis's bounded retry behavior closely enough to avoid retrying a
+    // broken output path on every one-second policy tick.
+    g_next_automatic_attempt =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
     spdlog::error("RDB backup failed: {}", status.message());
+  }
+
+  if (g_scheduled_backup.has_value()) {
+    BackupRequestContext scheduled = *g_scheduled_backup;
+    g_scheduled_backup.reset();
+    auto next = MakeBackup(scheduled);
+    bycorf::ThisWorker().self_->Spawn(FinishBackup(std::move(next)));
+    co_return status;
   }
   g_backup_active.store(false, std::memory_order_release);
   g_backup_active.notify_all();
   co_return status;
 }
 
-std::shared_ptr<BackupJob> TryStartBackup(const CommandRequest& request) {
-  bool expected = false;
-  if (!g_backup_active.compare_exchange_strong(expected, true,
-                                               std::memory_order_acq_rel,
-                                               std::memory_order_acquire)) {
-    return nullptr;
-  }
-  std::uint64_t session =
-      g_next_backup_session.fetch_add(1, std::memory_order_relaxed);
-  if (session == 0) {
-    session = g_next_backup_session.fetch_add(1, std::memory_order_relaxed);
-  }
-  return std::make_shared<BackupJob>(g_backup_storage, g_backup_target_path,
-                                     session, request);
+std::shared_ptr<BackupJob> TryStartBackup(BackupRequestContext request) {
+  assert(bycorf::ThisWorker().id_ == 0);
+  if (g_backup_active.load(std::memory_order_relaxed)) return nullptr;
+  g_backup_active.store(true, std::memory_order_release);
+  return MakeBackup(request);
 }
 
 CommandReply Reply(std::string_view encoded) {
@@ -590,13 +635,28 @@ CommandReply Reply(std::string_view encoded) {
 
 }  // namespace
 
-void InitRdbBackup(storage::StorageEngine* storage, std::string target_path) {
+void InitRdbBackup(storage::StorageEngine* storage, std::string target_path,
+                   std::vector<RdbSaveRule> save_rules) {
   g_backup_storage = storage;
   g_backup_target_path = std::move(target_path);
+  g_save_rules = std::move(save_rules);
+  g_scheduled_backup.reset();
+  g_last_successful_save = std::chrono::steady_clock::now();
+  g_next_automatic_attempt = g_last_successful_save;
+  g_backup_active.store(false, std::memory_order_relaxed);
+  g_automatic_backups_stopped.store(false, std::memory_order_relaxed);
 }
+
+bool AutomaticRdbBackupsConfigured() noexcept { return !g_save_rules.empty(); }
 
 Task<CommandReply> ExecuteRdbBackupCommand(const CommandRequest& request,
                                            ReplyBuilder& reply_builder) {
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
+        0, [&request, &reply_builder]() -> Task<CommandReply> {
+          co_return co_await ExecuteRdbBackupCommand(request, reply_builder);
+        });
+  }
   if (request.kind_ == CommandKind::kLastSave) {
     co_return Reply(reply_builder.AppendInteger(
         g_last_save_seconds.load(std::memory_order_acquire)));
@@ -605,8 +665,23 @@ Task<CommandReply> ExecuteRdbBackupCommand(const CommandRequest& request,
     co_return Reply(
         reply_builder.AppendError("ERR RDB backup is not configured"));
   }
-  std::shared_ptr<BackupJob> job = TryStartBackup(request);
+  const bool schedule =
+      request.kind_ == CommandKind::kBgSave && request.args_.size() == 2;
+  if (schedule && !absl::EqualsIgnoreCase(request.args_[1], "SCHEDULE")) {
+    co_return Reply(reply_builder.AppendError("ERR syntax error"));
+  }
+  const BackupRequestContext context = CaptureRequestContext(request);
+  std::shared_ptr<BackupJob> job = TryStartBackup(context);
   if (job == nullptr) {
+    if (schedule) {
+      // Every successful reply promises a successor for the request's serving
+      // generation. Coalescing therefore keeps the newest acknowledged fence:
+      // retaining an older one could make the only successor fail after a
+      // generation transition even though the newer caller received success.
+      g_scheduled_backup = context;
+      co_return Reply(
+          reply_builder.AppendSimpleString("Background saving scheduled"));
+    }
     co_return Reply(
         reply_builder.AppendError("ERR Background save already in progress"));
   }
@@ -639,6 +714,69 @@ Task<CommandReply> ExecuteRdbBackupCommand(const CommandRequest& request,
         absl::StrCat("ERR RDB save failed: ", status.message())));
   }
   co_return Reply(reply_builder.AppendSimpleString("OK"));
+}
+
+Task<absl::Status> RunRdbBackupScheduler(bycorf::Worker& worker) {
+  assert(worker.id() == 0);
+  while (!worker.stop_requested()) {
+    absl::Status slept =
+        co_await bycorf::SleepFor(worker, std::chrono::seconds(1));
+    if (!slept.ok()) co_return absl::OkStatus();
+    if (g_automatic_backups_stopped.load(std::memory_order_acquire)) {
+      co_return absl::OkStatus();
+    }
+    if (g_save_rules.empty() ||
+        g_backup_active.load(std::memory_order_relaxed) ||
+        std::chrono::steady_clock::now() < g_next_automatic_attempt) {
+      continue;
+    }
+
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - g_last_successful_save)
+            .count();
+    bool time_eligible = false;
+    for (const RdbSaveRule& rule : g_save_rules) {
+      if (elapsed >= 0 &&
+          static_cast<std::uint64_t>(elapsed) >= rule.seconds_) {
+        time_eligible = true;
+        break;
+      }
+    }
+    if (!time_eligible) continue;
+
+    const std::uint64_t changes = co_await CollectDatasetChangesSinceLastSave();
+    // Shutdown and explicit commands can run while the cross-worker
+    // collection is suspended. Re-check ownership state before starting work
+    // from a decision made against that earlier snapshot.
+    if (g_automatic_backups_stopped.load(std::memory_order_acquire)) {
+      co_return absl::OkStatus();
+    }
+    if (g_backup_active.load(std::memory_order_relaxed)) {
+      continue;
+    }
+    bool should_save = false;
+    for (const RdbSaveRule& rule : g_save_rules) {
+      if (elapsed >= 0 &&
+          static_cast<std::uint64_t>(elapsed) >= rule.seconds_ &&
+          changes >= rule.changes_) {
+        should_save = true;
+        break;
+      }
+    }
+    if (!should_save) continue;
+
+    auto job = TryStartBackup(BackupRequestContext{});
+    if (job != nullptr) {
+      spdlog::info("automatic RDB save triggered after {} changes", changes);
+      worker.Spawn(FinishBackup(std::move(job)));
+    }
+  }
+  co_return absl::OkStatus();
+}
+
+void StopAutomaticRdbBackups() noexcept {
+  g_automatic_backups_stopped.store(true, std::memory_order_release);
 }
 
 void WaitForRdbBackupDrained() noexcept {
