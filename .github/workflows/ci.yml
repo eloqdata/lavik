@@ -68,7 +68,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: raft/go.mod
-          cache-dependency-path: raft/go.sum
+          cache-dependency-path: |
+            raft/go.sum
+            tests/meta_integration/cluster_client_go/go.sum
 
       - name: Initialize runtime dependencies
         # Public submodules use the exact gitlinks from the tested commit.
@@ -91,13 +93,15 @@ jobs:
           # Large-collection fixtures create private regular files here.
           sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/dev
       - name: Check Go formatting
-        run: test -z "$(gofmt -l raft)"
+        run: test -z "$(gofmt -l raft tests/meta_integration/cluster_client_go)"
       - name: Install Redis integration peers
         run: |
           ./scripts/install_test_redis.sh "$RUNNER_TEMP/redis"
           echo "$RUNNER_TEMP/redis" >> "$GITHUB_PATH"
           ./scripts/install_test_redisshake.sh "$RUNNER_TEMP/redis-shake"
           echo "$RUNNER_TEMP/redis-shake" >> "$GITHUB_PATH"
+          # Pinned standard Cluster/Sentinel client for the acceptance matrix.
+          ./scripts/install_test_redis_py.sh "$RUNNER_TEMP/redis-py"
       - name: Configure
         # Debug enables the Meta fault hooks as well as the Data crash tests.
         run: |
@@ -107,6 +111,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DLAVIK_ENABLE_OPT=OFF \
             -DLAVIK_ENABLE_TEST_FAULTS=ON \
+            -DLAVIK_CLUSTER_CLIENT_REDIS_PY="$RUNNER_TEMP/redis-py" \
             -DBUILD_TESTING=ON
       - name: Build all targets
         run: cmake --build build_ci --parallel "$(nproc)"
@@ -141,8 +146,10 @@ jobs:
             build_ci/meta-integration/**/*.log
             build_ci/meta-integration/**/*.json
             /mnt/dev/lavik-*.log
+            /mnt/dev/cluster_client_*/**/*.log
             /tmp/lavik-*/**/*.log
             /tmp/cluster_create_*/**/*.log
+            /tmp/cluster_client_*/**/*.log
             /tmp/meta_*/**/*.log
             /tmp/lavik-*.log
           if-no-files-found: ignore

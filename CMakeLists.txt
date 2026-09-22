@@ -1220,6 +1220,58 @@ if (BUILD_TESTING)
         )
       endforeach()
     endif()
+
+    # Fixed-version standard Cluster client compatibility matrix.
+    # Unlike the fault-hook failover gates, this gate drives only production
+    # surfaces (cluster-create/failover CLI, SIGKILL), so it registers in
+    # every build type. It needs the pinned redis-py tree produced by
+    # scripts/install_test_redis_py.sh; the go-redis driver is built from its
+    # checked-in go.mod/go.sum with the pinned toolchain.
+    set(LAVIK_CLUSTER_CLIENT_REDIS_PY "" CACHE PATH
+      "Directory holding the pinned redis-py package (scripts/install_test_redis_py.sh)")
+    if (LAVIK_CLUSTER_CLIENT_REDIS_PY AND
+        EXISTS "${LAVIK_CLUSTER_CLIENT_REDIS_PY}/redis/__init__.py")
+      set(cluster_client_go_dir
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/cluster_client_go")
+      set(cluster_client_go_bin
+        "${CMAKE_CURRENT_BINARY_DIR}/cluster-client-go/cluster-client-go")
+      add_custom_command(OUTPUT ${cluster_client_go_bin}
+        COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=0
+          GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
+          ${LAVIK_GO_EXECUTABLE} build -mod=readonly
+          -o ${cluster_client_go_bin} .
+        WORKING_DIRECTORY ${cluster_client_go_dir}
+        DEPENDS ${cluster_client_go_dir}/main.go
+                ${cluster_client_go_dir}/go.mod
+                ${cluster_client_go_dir}/go.sum
+        VERBATIM)
+      # ctest never builds; keep the driver in the default target set.
+      add_custom_target(lavik_cluster_client_go ALL
+        DEPENDS ${cluster_client_go_bin})
+      set(cluster_client_workdir
+        "${CMAKE_CURRENT_BINARY_DIR}/meta-integration/cluster-client")
+      file(MAKE_DIRECTORY "${cluster_client_workdir}")
+      add_test(
+        NAME meta_integration.gate_cluster_client
+        COMMAND ${CMAKE_COMMAND} -E env
+                "PYTHONPYCACHEPREFIX=${cluster_client_workdir}/pycache"
+                "LAVIK_CLUSTER_CLIENT_REDIS_PY=${LAVIK_CLUSTER_CLIENT_REDIS_PY}"
+                ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_cluster_client.py
+                $<TARGET_FILE:lavik-meta>
+                $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl>
+                ${cluster_client_go_bin}
+      )
+      set_tests_properties(meta_integration.gate_cluster_client PROPERTIES
+        LABELS "meta-integration;cluster-client"
+        TIMEOUT 600
+        RUN_SERIAL TRUE
+      )
+    else()
+      message(STATUS
+        "LAVIK_CLUSTER_CLIENT_REDIS_PY not set; cluster client matrix disabled")
+    endif()
   else()
     message(STATUS "python3 not found; meta integration tests are disabled")
   endif()

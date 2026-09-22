@@ -103,6 +103,64 @@ Meta state. Do not run `init` or `create` again for an existing cluster.
 For TLS, Meta membership changes, or controlled failover, use the focused
 [Meta control-plane runbook](meta-control-plane.md).
 
+## Cluster client compatibility matrix
+
+CI continuously verifies two pinned, unpatched, standard client libraries
+against a Meta-managed two-Group cluster, on both amd64 and arm64. Each client
+runs at RESP2 and RESP3 with `requirepass` authentication enabled, and the same
+connection pool must survive a controlled failover and a primary `SIGKILL`
+without being recreated:
+
+| Client | Pinned version | Pin enforcement |
+|---|---|---|
+| redis-py `RedisCluster` | 8.1.0 | `tests/meta_integration/requirements-redis-py.txt` sha256, installed with `pip --require-hashes`; the gate asserts `redis.__version__` |
+| go-redis `ClusterClient` | 9.22.0 | `tests/meta_integration/cluster_client_go/go.mod`+`go.sum` with `-mod=readonly`; the driver reports the compiled module version and the gate asserts it |
+
+Every cell of that matrix covers: slot discovery through `CLUSTER SLOTS` from a
+single seed node, `MOVED` redirection followed at owner change, cross-Group
+key isolation, server-side `CROSSSLOT` rejection for multi-key commands, and
+read/write recovery on the new owner after controlled failover (lossless) and
+after an uncontrolled primary crash (acknowledged writes the replica never
+saw may be absent). The matrix also covers the declared authentication and
+TLS client-port configurations, including that a TLS client discovers the
+advertised TLS endpoints. The gate is
+`meta_integration.gate_cluster_client`; to run it locally:
+
+```bash
+./scripts/install_test_redis_py.sh /tmp/redis-py
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON \
+  -DLAVIK_CLUSTER_CLIENT_REDIS_PY=/tmp/redis-py
+cmake --build build --parallel
+ctest --test-dir build -R meta_integration.gate_cluster_client --output-on-failure
+```
+
+Compatibility boundaries verified by the same gate:
+
+- The Cluster command surface is `CLUSTER SLOTS`, `NODES`, `INFO`, `KEYSLOT`,
+  and `MYID`. `CLUSTER SHARDS` and the slot-migration family (`SETSLOT`,
+  `ASKING`, `ADDSLOTS`, ...) are rejected by design; both pinned clients
+  discover slots through `CLUSTER SLOTS` only, so the rejection never affects
+  their routing.
+- Cross-slot multi-key handling differs by client and is part of the recorded
+  contract: redis-py 8.1.0 rejects a cross-slot `mget` client-side (its
+  per-slot fan-out lives in the explicit `mget_nonatomic`), while go-redis
+  9.22.0 routes the whole typed command by its first key and surfaces the
+  server's `CROSSSLOT` error. Server-side enforcement is proven through each
+  library's official pass-through (`execute_command(..., target_nodes=...)` /
+  `Do(...)`), and a rejected cross-slot `MSET` applies no partial write.
+- Cluster mode serves DB0 only, and there is no slot migration (`ASK`) because
+  ownership changes move whole slot ranges at once.
+- After an uncontrolled primary kill, rediscovery latency follows the client
+  library's own policy: redis-py reinitializes on connection errors, while
+  go-redis refreshes a crash-stale slot map once it ages past its
+  `ClusterStateReloadInterval` (default 60 s). A dead node answers no
+  `MOVED`, so deployments that need faster go-redis rediscovery should lower
+  that option. The gate enforces recovery within a 90 s per-client budget
+  covering that default and logs each cell's actual rediscovery latency.
+  Controlled failover cuts over with the old owner alive, so both clients can
+  follow `MOVED` against it; the gate enforces recovery within its 30 s
+  budget and logs the actual latencies.
+
 ## Exporting with RedisShake ScanReader
 
 Lavik no longer serves PSYNC export; `redis-export-backpressure` is removed.
