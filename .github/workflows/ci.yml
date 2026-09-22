@@ -85,7 +85,8 @@ jobs:
             build-essential clang-18 cmake ninja-build libssl-dev openssl python3 \
             python3-venv curl tcl
           python3 -m venv "$RUNNER_TEMP/lavik-test-venv"
-          "$RUNNER_TEMP/lavik-test-venv/bin/pip" install redis==8.1.0
+          "$RUNNER_TEMP/lavik-test-venv/bin/pip" install --require-hashes \
+            -r tests/meta_integration/requirements-redis-py.txt
           echo "$RUNNER_TEMP/lavik-test-venv/bin" >> "$GITHUB_PATH"
       - name: Prepare test host
         run: |

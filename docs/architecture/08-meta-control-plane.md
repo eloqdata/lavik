@@ -47,13 +47,61 @@ membership descriptor own the advertised routes, which may name explicit
 proxies rather than these local binds. Wildcard Admin binds and port zero are
 invalid.
 
-`--sentinel-addr` explicitly enables a separate plaintext RESP client endpoint.
-`MetaSentinelServer` owns its worker-local sessions and a closed command
-allowlist. It supports authentication, RESP2/RESP3 negotiation, client identity
-metadata, health checks, and connection reset/close. Unsupported Sentinel
-queries, election/management commands, Data commands, and Admin commands fail
-without entering either other dispatcher. This endpoint has no dependency on
-Data-cluster readiness or Meta leadership for these connection commands.
+`--sentinel-addr` explicitly enables a separate plaintext RESP client endpoint:
+the Discovery Entry. `MetaSentinelServer` owns its worker-local sessions and a
+closed command allowlist. It supports authentication, RESP2/RESP3 negotiation,
+client identity metadata, health checks, and connection reset/close, plus five
+Sentinel topology discovery verbs: `GET-MASTER-ADDR-BY-NAME`, `MASTER`,
+`MASTERS`, `REPLICAS`, and `SLAVES`. These connection commands have no
+dependency on Data-cluster readiness or Meta leadership. Sentinel management
+and election subcommands, Data commands, and Admin commands are explicitly
+rejected on every node without entering either other dispatcher; a rejection
+is a deterministic answer that does not depend on authority state.
+
+Discovery answers serve Meta-managed Single deployments only. The Service Name
+is the committed Group ID, matched exactly; any other name, and any deployment
+whose immutable client mode is Cluster, is an unknown service. The five
+discovery verbs are answered only while the local node holds Raft leadership
+and its state machine has fully caught up; a follower, a still-catching-up
+leader, or a waiting joiner closes the connection without a reply, so clients
+reach the leader by retrying their seed list. There is no private redirect.
+
+A discovery answer projects one compact committed view,
+`MetaStateMachine::StatusSnapshot`, cached per serving worker and rebuilt only
+when the state machine's `state_change_index` advances. The view is joined
+with mutex-consistent snapshots of two thread-safe volatile registries:
+`MetaDataControlRuntimeStatus` for session, health, and projection-anchor
+state, and `MetaAutomaticFailoverDiagnosticsRegistry` for detector state.
+Diagnostics are adopted only under their join-identity contract: the two
+volatile snapshots must name the same leadership generation and
+eligibility-continuity revision, and a Group's diagnostic anchor must equal
+the committed owner, assignment, and Group Term; any mismatch is read as no
+diagnostic, exactly as cluster-status resolves the same join. The request path
+takes no cross-worker blocking lock—the compact view's brief state lock
+follows the ctl-server precedent, and steady-state queries rebuild nothing.
+
+Publication is gated by committed authority alone: the lifecycle is Created,
+the immutable client mode is Single, one complete Group exists, its authority
+is active, and the committed Owner is not retired and advertises a usable
+`tcp://` client endpoint—a numeric IP with a nonzero, non-wildcard port. Raft,
+Data-control, and Admin endpoints are never published. Health never gates
+publication; it only sets flags. A published primary always carries the
+`master` flag, `s_down` reflects a detector SUSPECT/TRIGGERING cut whose
+identity and anchor pass the join checks above, and `disconnected` reflects a
+missing live Data-control session. `o_down` is never emitted: objective
+failure is expressed by withdrawing publication, so a Group whose committed
+authority is gone disappears from `MASTERS` and resolves to null instead of
+being advertised as down. Unknown services and withdrawn publications follow
+the Redis Sentinel null/error contract. Every committed, non-retired member
+except the current Owner is listed as a replica — the committed Owner record
+is the sole role authority, since failover commits never rewrite member
+roles; observation truth adds their `s_down`/`disconnected` flags,
+and `master_down` marks the absence of a publishable Primary. Within the
+leadership observation grace after a leader change, a node this leader has
+never observed is unknown rather than down; a node observed and then lost
+counts as down at any time. Discovery replies follow the Redis 7.2 Sentinel
+field shapes under RESP2 and RESP3; fields Meta cannot observe truthfully are
+omitted or carried as documented constants rather than fabricated.
 
 The Sentinel password is independent of Data's `requirepass`. Both processes
 use the immutable default-user `PasswordAuthenticator` and the shared RESP
@@ -63,9 +111,10 @@ connection. Standalone Data requires no Meta process to authenticate clients.
 Sentinel session state is separate from Data's full connection context and is
 never committed to Raft. HELLO identifies `mode=sentinel`, without a Data role;
 its validation completes before authentication, name, or protocol changes.
-Supported connection replies follow the Redis 7.2 Sentinel wire contract,
-with independent product identity. QUIT/RESET are explicit Lavik extensions;
-unsupported commands and local resource limits retain fail-closed errors.
+Supported connection and discovery replies follow the Redis 7.2 Sentinel wire
+contract, with independent product identity. QUIT/RESET are explicit Lavik
+extensions; unsupported commands and local resource limits retain fail-closed
+errors.
 
 Sentinel admission counts all accepted sessions, including unauthenticated
 ones. Input, output, and identity storage are bounded independently of Data's
@@ -1268,7 +1317,7 @@ audit history rather than replacing it.
 | Asynchronous Raft protocol, WAL, snapshots, authentication and quorum liveness | [Meta Raft runtime](10-meta-raft.md), `raft/engine/`, `include/lavik/meta/raft.h`, `src/meta/raft.cpp`, `src/meta/proposal_executor.cpp` |
 | Meta session transport retirement and Connection-storage lifetime | `src/meta/ctl_server.cpp`, `src/meta/data_control_server.cpp`, `bycorf/include/bycorf/net/connection.h`, `bycorf/src/runtime/worker.cpp` |
 | Foreign-thread typed completion ingress and worker wakeup | `bycorf/include/bycorf/runtime/foreign_executor.h`, `bycorf/src/runtime/foreign_executor.cpp`, `bycorf/include/bycorf/runtime/cross_core.h`, `bycorf/src/runtime/worker.cpp` |
-| Independent Sentinel RESP entry, local password verification, bounded sessions and lifecycle | `include/lavik/meta/sentinel_server.h`, `src/meta/sentinel_server.cpp`, `include/lavik/password_authenticator.h`, `src/redis/password_authenticator.cpp`, `src/redis/resp.cpp`, `app/lavik_meta.cpp`, `tests/meta_integration/gate_sentinel.py` |
+| Independent Sentinel Discovery Entry, local password verification, leader-only committed-authority discovery projection and flag join, silent-drop non-leader answers, bounded sessions and lifecycle | `include/lavik/meta/sentinel_server.h`, `src/meta/sentinel_server.cpp`, `include/lavik/meta/sentinel_discovery.h`, `src/meta/sentinel_discovery.cpp`, `include/lavik/meta/committed_status_view.h`, `include/lavik/meta/data_control_runtime_status.h`, `include/lavik/meta/automatic_failover_detector.h`, `include/lavik/password_authenticator.h`, `src/redis/password_authenticator.cpp`, `src/redis/resp.cpp`, `app/lavik_meta.cpp`, `tests/meta_sentinel_discovery_test.cpp`, `tests/meta_integration/gate_sentinel.py`, `tests/meta_integration/gate_sentinel_discovery.py` |
 | TLS identity, RBAC, Unix peer credentials, Admin transport, cluster status, controlled failover, and initial cluster creation | `include/lavik/meta/identity_verifier.h`, `include/lavik/meta/ctl_server.h`, `include/lavik/meta/admin_client.h`, `include/lavik/meta/cluster_status.h`, `include/lavik/meta/cluster_create.h`, `include/lavik/meta/failover_admin.h`, `app/lavik_meta.cpp`, `app/lavik_ctl.cpp`, `bycorf/src/net/` |
 | Automatic-failover status wire/model plus JSON and text rendering | `include/lavik/meta/cluster_status.h`, `src/meta/cluster_status.cpp`, `tests/meta_cluster_status_test.cpp` |
 | Recovery, partition, membership, failover, and security gates | `tests/meta_*`, `tests/meta_integration/` |

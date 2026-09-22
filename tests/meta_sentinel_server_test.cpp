@@ -20,15 +20,26 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "bycorf/runtime/runtime.h"
 #include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
+#include "lavik/meta/automatic_failover_detector.h"
+#include "lavik/meta/data_control_runtime_status.h"
+#include "lavik/meta/raft.h"
 #include "lavik/meta/sentinel_server.h"
+#include "lavik/meta/state_machine.h"
 #include "lavik/password_authenticator.h"
+#include "support/meta_raft.h"
+#include "support/test_data_path.h"
 
 namespace {
 
@@ -49,10 +60,19 @@ TEST(PasswordAuthenticatorTest, IndependentPasswordsAndBinaryInput) {
 
 // Exercise the public server options through an actual connection, using a
 // smaller output ceiling than the input ceiling to make output rejection
-// observable without changing production CLI defaults.
+// observable without changing production CLI defaults. Discovery needs real
+// authority inputs, so the fixture carries a single-node Raft stack; these
+// tests never wait for its election because none of them issues a discovery
+// verb.
 class SentinelRuntime {
  public:
   SentinelRuntime() {
+    const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+    dir_ = lavik::test::TestDataDirectory() /
+           ("lavik_sentinel_server_" + std::string(info->name()) + "_" +
+            std::to_string(::getpid()));
+    std::error_code ignored;
+    std::filesystem::remove_all(dir_, ignored);
     runtime_.Start(
         1,
         [this](unsigned, bycorf::Worker& worker) {
@@ -65,15 +85,60 @@ class SentinelRuntime {
           return 0;
         },
         false);
+    auto machine = lavik::meta::MetaStateMachine::Open(dir_);
+    if (!machine.ok()) {
+      machine_status_ = machine.status();
+      return;
+    }
+    machine_ =
+        std::shared_ptr<lavik::meta::MetaStateMachine>(std::move(*machine));
+    auto raft = lavik::meta::MetaRaft::Open(
+        lavik::test::SingleMetaOptions(dir_), *machine_);
+    if (!raft.ok()) {
+      machine_status_ = raft.status();
+      return;
+    }
+    raft_ = std::move(*raft);
+    runtime_status_ =
+        std::make_shared<lavik::meta::MetaDataControlRuntimeStatus>();
+    diagnostics_ = std::make_shared<
+        lavik::meta::MetaAutomaticFailoverDiagnosticsRegistry>();
   }
   ~SentinelRuntime() {
     if (server_) server_->Shutdown();
+    server_.reset();
+    if (raft_) {
+      raft_->shutdown();
+      raft_.reset();
+    }
+    machine_.reset();
     runtime_.GetForeignExecutor(0).WaitUntilIdle();
     runtime_.RequestStop();
     runtime_.WaitUntilStopped();
+    std::error_code ignored;
+    std::filesystem::remove_all(dir_, ignored);
   }
+
+  lavik::meta::MetaSentinelDiscoveryDependencies DiscoveryDependencies() {
+    lavik::meta::MetaSentinelDiscoveryDependencies dependencies;
+    dependencies.raft_ = raft_;
+    dependencies.state_machine_ = machine_.get();
+    dependencies.runtime_status_ = runtime_status_;
+    dependencies.diagnostics_ = diagnostics_;
+    dependencies.observation_ttl_ms_ = 500;
+    dependencies.leader_observation_grace_ms_ = 5000;
+    return dependencies;
+  }
+
+  std::filesystem::path dir_;
+  absl::Status machine_status_;
   std::promise<absl::Status> initialized_;
   bycorf::Runtime runtime_;
+  std::shared_ptr<lavik::meta::MetaStateMachine> machine_;
+  std::shared_ptr<lavik::meta::MetaRaft> raft_;
+  std::shared_ptr<lavik::meta::MetaDataControlRuntimeStatus> runtime_status_;
+  std::shared_ptr<lavik::meta::MetaAutomaticFailoverDiagnosticsRegistry>
+      diagnostics_;
   std::shared_ptr<lavik::meta::MetaSentinelServer> server_;
 };
 
@@ -91,11 +156,13 @@ TEST(MetaSentinelServerTest,
   ::close(fd);
   SentinelRuntime runtime;
   ASSERT_TRUE(runtime.initialized_.get_future().get().ok());
+  ASSERT_TRUE(runtime.machine_status_.ok()) << runtime.machine_status_;
   lavik::meta::MetaSentinelServerOptions options;
   options.address_ = "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
   options.reply_limit_ = 128;
   auto created = lavik::meta::MetaSentinelServer::Create(
-      runtime.runtime_.GetForeignExecutor(0), std::move(options));
+      runtime.runtime_.GetForeignExecutor(0), runtime.DiscoveryDependencies(),
+      std::move(options));
   ASSERT_TRUE(created.ok()) << created.status();
   runtime.server_ = *created;
   ASSERT_TRUE(runtime.server_->Start().ok());
@@ -130,7 +197,9 @@ TEST(MetaSentinelServerTest, ShutdownDrainsAcceptWhenWakeSocketCannotBeOpened) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   ASSERT_EXIT(
       {
-        ::alarm(10);
+        // The child now also boots the single-node Raft fixture before the
+        // descriptor-limit dance; keep headroom for loaded CI hosts.
+        ::alarm(30);
         {
           const int client = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
           ASSERT_GE(client, 0);
@@ -148,11 +217,13 @@ TEST(MetaSentinelServerTest, ShutdownDrainsAcceptWhenWakeSocketCannotBeOpened) {
 
           SentinelRuntime runtime;
           ASSERT_TRUE(runtime.initialized_.get_future().get().ok());
+          ASSERT_TRUE(runtime.machine_status_.ok());
           lavik::meta::MetaSentinelServerOptions options;
           options.address_ =
               "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
           auto created = lavik::meta::MetaSentinelServer::Create(
-              runtime.runtime_.GetForeignExecutor(0), std::move(options));
+              runtime.runtime_.GetForeignExecutor(0),
+              runtime.DiscoveryDependencies(), std::move(options));
           ASSERT_TRUE(created.ok());
           runtime.server_ = std::move(*created);
           ASSERT_TRUE(runtime.server_->Start().ok());
@@ -187,6 +258,128 @@ TEST(MetaSentinelServerTest, ShutdownDrainsAcceptWhenWakeSocketCannotBeOpened) {
         ::_exit(0);
       },
       ::testing::ExitedWithCode(0), "");
+}
+
+bool WaitFor(const std::function<bool()>& predicate,
+             std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate()) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return predicate();
+}
+
+// Reads exactly one complete reply of the expected size, or "" on EOF/timeout.
+std::string ReadReply(int client, std::size_t size) {
+  std::string reply(size, '\0');
+  std::size_t received = 0;
+  while (received < size) {
+    const ssize_t chunk =
+        ::recv(client, reply.data() + received, size - received, 0);
+    if (chunk <= 0) return std::string();
+    received += static_cast<std::size_t>(chunk);
+  }
+  return reply;
+}
+
+// The five discovery verbs are leader-only: a node that is not a caught-up
+// leader closes the connection without a reply so client seed lists rotate,
+// while management verbs keep their explicit error on any node. On the
+// leader, an uninitialized cluster answers from committed state: empty
+// MASTERS, null address, and the "No such master" error for named verbs.
+TEST(MetaSentinelServerTest, DiscoveryVerbsRequireCaughtUpLeader) {
+  const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ASSERT_GE(fd, 0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+            0);
+  socklen_t size = sizeof(address);
+  ASSERT_EQ(::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size), 0);
+  ::close(fd);
+  SentinelRuntime runtime;
+  ASSERT_TRUE(runtime.initialized_.get_future().get().ok());
+  ASSERT_TRUE(runtime.machine_status_.ok()) << runtime.machine_status_;
+  lavik::meta::MetaSentinelServerOptions options;
+  options.address_ = "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+  auto created = lavik::meta::MetaSentinelServer::Create(
+      runtime.runtime_.GetForeignExecutor(0), runtime.DiscoveryDependencies(),
+      std::move(options));
+  ASSERT_TRUE(created.ok()) << created.status();
+  runtime.server_ = *created;
+  ASSERT_TRUE(runtime.server_->Start().ok());
+
+  const auto connect = [&] {
+    const int client = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    EXPECT_GE(client, 0);
+    const timeval timeout{.tv_sec = 3, .tv_usec = 0};
+    EXPECT_EQ(::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                           sizeof(timeout)),
+              0);
+    EXPECT_EQ(::connect(client, reinterpret_cast<sockaddr*>(&address),
+                        sizeof(address)),
+              0);
+    return client;
+  };
+  const auto send = [](int client, std::string_view request) {
+    ASSERT_EQ(::send(client, request.data(), request.size(), MSG_NOSIGNAL),
+              request.size());
+  };
+  const auto expect_reply = [&](int client, std::string_view expected) {
+    EXPECT_EQ(ReadReply(client, expected.size()), expected);
+  };
+
+  // The fresh node is still electing: every discovery verb drops silently.
+  ASSERT_FALSE(runtime.raft_->is_leader());
+  for (std::string_view request :
+       {"*3\r\n$8\r\nSENTINEL\r\n$23\r\nGET-MASTER-ADDR-BY-NAME\r\n$"
+        "2\r\ng1\r\n",
+        "*3\r\n$8\r\nSENTINEL\r\n$6\r\nMASTER\r\n$2\r\ng1\r\n",
+        "*2\r\n$8\r\nSENTINEL\r\n$7\r\nMASTERS\r\n",
+        "*3\r\n$8\r\nSENTINEL\r\n$8\r\nREPLICAS\r\n$2\r\ng1\r\n",
+        "*3\r\n$8\r\nSENTINEL\r\n$6\r\nSLAVES\r\n$2\r\ng1\r\n"}) {
+    const int client = connect();
+    send(client, request);
+    char buffer[1];
+    EXPECT_EQ(::recv(client, buffer, sizeof(buffer), 0), 0) << request;
+    ::close(client);
+  }
+  // A management verb answers its explicit refusal without dropping, and a
+  // malformed discovery verb keeps its deterministic arity error.
+  {
+    const int client = connect();
+    send(client, "*3\r\n$8\r\nSENTINEL\r\n$7\r\nMONITOR\r\n$1\r\nx\r\n");
+    expect_reply(client, "-ERR SENTINEL subcommand is not supported\r\n");
+    send(client, "*3\r\n$8\r\nSENTINEL\r\n$7\r\nMASTERS\r\n$1\r\nx\r\n");
+    expect_reply(client,
+                 "-ERR wrong number of arguments for 'sentinel|masters' "
+                 "command\r\n");
+    send(client, "*1\r\n$4\r\nPING\r\n");
+    expect_reply(client, "+PONG\r\n");
+    ::close(client);
+  }
+
+  ASSERT_TRUE(
+      WaitFor([&] { return runtime.raft_->is_leader_sm_fully_caught_up(); },
+              std::chrono::seconds(15)));
+  const int leader = connect();
+  send(leader, "*2\r\n$8\r\nSENTINEL\r\n$7\r\nMASTERS\r\n");
+  expect_reply(leader, "*0\r\n");
+  send(
+      leader,
+      "*3\r\n$8\r\nSENTINEL\r\n$23\r\nGET-MASTER-ADDR-BY-NAME\r\n$2\r\ng1\r\n");
+  expect_reply(leader, "*-1\r\n");
+  send(leader, "*3\r\n$8\r\nSENTINEL\r\n$6\r\nMASTER\r\n$2\r\ng1\r\n");
+  expect_reply(leader, "-ERR No such master with that name\r\n");
+  send(leader, "*3\r\n$8\r\nSENTINEL\r\n$6\r\nSLAVES\r\n$2\r\ng1\r\n");
+  expect_reply(leader, "-ERR No such master with that name\r\n");
+  // The session survived every discovery answer.
+  send(leader, "*1\r\n$4\r\nPING\r\n");
+  expect_reply(leader, "+PONG\r\n");
+  ::close(leader);
+  runtime.server_->Shutdown();
 }
 
 }  // namespace

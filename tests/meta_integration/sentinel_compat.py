@@ -23,6 +23,12 @@ HELLO's product name, version and connection ID are normalized; framing, field
 order/types and all error bytes remain exact. QUIT/RESET, unsupported commands,
 malformed RESP, resource limits and embedded-NUL attributes have separate Lavik
 contracts and are deliberately not represented as Redis-equal behavior.
+
+Cases marked "discovery" hold the unknown-service discovery exchanges. Lavik
+answers them only on an authoritative (bootstrap leader) Meta node — a
+non-leader closes discovery connections without replying — so the replay entry
+points split by node role: check_port for any node, check_discovery_port only
+for a leader. Real Redis answers both on any Sentinel.
 """
 
 import argparse
@@ -113,7 +119,19 @@ def replay(port, case):
 def check_port(test, port, password):
     fixture = json.loads(FIXTURE.read_text())
     for case in fixture["cases"]:
-        if case["password"] == password:
+        if case["password"] == password and not case.get("discovery"):
+            with test.subTest(contract=case["name"]):
+                test.assertEqual(replay(port, case), case["replies"])
+
+
+def check_discovery_port(test, port, password):
+    """Discovery exchanges only against an authoritative (leader) node.
+
+    A non-leader Lavik Meta drops these connections without a reply; replaying
+    them there would deadlock the exact-byte comparison by design."""
+    fixture = json.loads(FIXTURE.read_text())
+    for case in fixture["cases"]:
+        if case["password"] == password and case.get("discovery"):
             with test.subTest(contract=case["name"]):
                 test.assertEqual(replay(port, case), case["replies"])
 

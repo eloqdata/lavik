@@ -23,6 +23,7 @@
 #include <array>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <future>
 #include <limits>
 #include <optional>
@@ -37,6 +38,9 @@
 #include "bycorf/runtime/sync.h"
 #include "bycorf/runtime/worker.h"
 #include "lavik/cluster/control_transport.h"
+#include "lavik/meta/raft.h"
+#include "lavik/meta/sentinel_discovery.h"
+#include "lavik/meta/state_machine.h"
 #include "lavik/numeric_endpoint.h"
 #include "lavik/password_authenticator.h"
 #include "lavik/resp.h"
@@ -54,7 +58,85 @@ struct SentinelSession {
   ReplyBuilder reply_{};
 };
 
-enum class SessionAction { kContinue, kReset, kClose };
+// kDrop closes the session without writing any reply. It exists solely for
+// the discovery verbs on a node that cannot currently speak with authority:
+// real Sentinel clients rotate their seed list only when a query goes
+// unanswered, and a follower has no truthful answer to give (no private
+// redirect exists on this surface). Every other refusal stays an explicit
+// error reply so deterministic validation feedback never looks like a
+// network failure.
+enum class SessionAction { kContinue, kReset, kClose, kDrop };
+
+// Worker-confined discovery inputs and per-worker caches. The dependencies
+// outlive the server by process assembly order; the committed-view cache is
+// rebuilt only when the state machine's change index advances, so a
+// steady-state query costs one atomic load plus the two registries' own
+// mutex-snapshots. Nothing here blocks across workers on the request path.
+struct DiscoverySource {
+  std::shared_ptr<MetaRaft> raft_;
+  MetaStateMachine* state_machine_ = nullptr;
+  std::shared_ptr<MetaDataControlRuntimeStatus> runtime_status_;
+  std::shared_ptr<MetaAutomaticFailoverDiagnosticsRegistry> diagnostics_;
+  std::uint32_t observation_ttl_ms_ = 0;
+  std::uint64_t leader_observation_grace_ms_ = 0;
+
+  bool cached_view_valid_ = false;
+  std::uint64_t cached_state_change_ = 0;
+  MetaCommittedStatusView cached_view_;
+
+  // Observation-grace bookkeeping: the window opens when the leader triplet
+  // starts passing and reopens whenever the runtime registry's leadership
+  // generation changes, so a handoff never turns a never-yet-observed node
+  // into a false down mark. Both edges reset the same start point.
+  bool leader_triplet_passed_ = false;
+  std::uint64_t grace_leadership_generation_ = 0;
+  std::chrono::steady_clock::time_point authority_since_{};
+};
+
+// Assembles one discovery cut when this node currently holds a caught-up
+// leadership, else nullopt. The runtime registry snapshot leads because its
+// leadership generation anchors the observation-grace window.
+std::optional<MetaDiscoveryCut> AuthoritativeDiscoveryCut(
+    DiscoverySource& source) {
+  const bool authoritative = source.raft_->is_leader() &&
+                             source.raft_->is_leader_alive() &&
+                             source.raft_->is_leader_sm_fully_caught_up();
+  const auto now = std::chrono::steady_clock::now();
+  if (authoritative && !source.leader_triplet_passed_) {
+    source.authority_since_ = now;
+  }
+  source.leader_triplet_passed_ = authoritative;
+  if (!authoritative) return std::nullopt;
+
+  MetaDiscoveryCut cut;
+  cut.runtime_ = source.runtime_status_->Snapshot();
+  if (cut.runtime_.leadership_generation_ !=
+      source.grace_leadership_generation_) {
+    source.grace_leadership_generation_ = cut.runtime_.leadership_generation_;
+    source.authority_since_ = now;
+  }
+  cut.observation_grace_active_ =
+      now - source.authority_since_ <
+      std::chrono::milliseconds(source.leader_observation_grace_ms_);
+  cut.observation_ttl_ms_ = source.observation_ttl_ms_;
+  cut.diagnostics_ = source.diagnostics_->Snapshot();
+  // Read the change index before the locked snapshot so a commit landing in
+  // between leaves the cache key older than the true index; the next query
+  // then rebuilds instead of serving the stale view indefinitely.
+  const std::uint64_t state_change =
+      source.state_machine_->state_change_index();
+  if (!source.cached_view_valid_ ||
+      state_change != source.cached_state_change_) {
+    source.cached_view_ = source.state_machine_->StatusSnapshot();
+    source.cached_state_change_ = state_change;
+    source.cached_view_valid_ = true;
+  }
+  cut.committed_ = source.cached_view_;
+  cut.now_unix_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+  return cut;
+}
 
 bool ValidAttribute(std::string_view value) {
   return std::all_of(value.begin(), value.end(), [](unsigned char byte) {
@@ -162,9 +244,63 @@ void ExecuteHello(const PasswordAuthenticator& authenticator,
   reply.AppendArrayHeader(0);
 }
 
+// SENTINEL subcommand dispatch. The five discovery verbs answer from
+// committed authority through the pure mapping layer; management and unknown
+// subcommands keep their explicit refusal on every node role because that
+// refusal is a deterministic answer, not a topology claim.
+SessionAction ExecuteSentinelCommand(DiscoverySource& source,
+                                     SentinelSession& session,
+                                     std::span<const std::string> args) {
+  auto& reply = session.reply_;
+  if (args.size() < 2) {
+    reply.AppendError("ERR wrong number of arguments for 'sentinel' command");
+    return SessionAction::kContinue;
+  }
+  const auto is = [&](std::string_view subcommand) {
+    return absl::EqualsIgnoreCase(args[1], subcommand);
+  };
+  const auto arity_error = [&](std::string_view subcommand) {
+    reply.AppendError("ERR wrong number of arguments for 'sentinel|" +
+                      std::string(subcommand) + "' command");
+    return SessionAction::kContinue;
+  };
+  const bool address = is("GET-MASTER-ADDR-BY-NAME");
+  const bool master = is("MASTER");
+  const bool masters = is("MASTERS");
+  const bool replicas = is("REPLICAS");
+  const bool slaves = is("SLAVES");
+  // Arity is validated before any authority check: the answer cannot depend
+  // on committed state, so a follower may (and should) report it explicitly.
+  if (address && args.size() != 3)
+    return arity_error("get-master-addr-by-name");
+  if (master && args.size() != 3) return arity_error("master");
+  if (masters && args.size() != 2) return arity_error("masters");
+  if (replicas && args.size() != 3) return arity_error("replicas");
+  if (slaves && args.size() != 3) return arity_error("slaves");
+  if (!address && !master && !masters && !replicas && !slaves) {
+    reply.AppendError("ERR SENTINEL subcommand is not supported");
+    return SessionAction::kContinue;
+  }
+  const std::optional<MetaDiscoveryCut> cut = AuthoritativeDiscoveryCut(source);
+  if (!cut.has_value()) {
+    return SessionAction::kDrop;
+  }
+  if (address) {
+    EncodeDiscoveryAddressReply(reply, *cut, args[2]);
+  } else if (master) {
+    EncodeDiscoveryMasterReply(reply, *cut, args[2]);
+  } else if (masters) {
+    EncodeDiscoveryMastersReply(reply, *cut);
+  } else {
+    // SLAVES is Redis's deprecated alias of REPLICAS; both share one reply.
+    EncodeDiscoveryReplicasReply(reply, *cut, args[2]);
+  }
+  return SessionAction::kContinue;
+}
+
 SessionAction ExecuteConnectionCommand(
-    const PasswordAuthenticator& authenticator, SentinelSession& session,
-    std::span<const std::string> args) {
+    const PasswordAuthenticator& authenticator, DiscoverySource& discovery,
+    SentinelSession& session, std::span<const std::string> args) {
   auto& reply = session.reply_;
   reply.Reset();
   if (args.empty()) return SessionAction::kContinue;
@@ -258,7 +394,7 @@ SessionAction ExecuteConnectionCommand(
           "ERR CLIENT subcommand is not supported by the Sentinel server");
     }
   } else if (is("SENTINEL")) {
-    reply.AppendError("ERR SENTINEL subcommand is not supported");
+    return ExecuteSentinelCommand(discovery, session, args);
   } else {
     // No fallback to either Data or Admin dispatch, including inline RESP.
     // Do not echo arguments: they may contain passwords or unbounded text.
@@ -291,14 +427,23 @@ absl::StatusOr<int> OpenAcceptWake(const NumericEndpoint& endpoint) {
 }  // namespace
 
 struct MetaSentinelServer::Core {
-  Core(bycorf::ForeignExecutor executor, MetaSentinelServerOptions options,
-       NumericEndpoint endpoint)
+  Core(bycorf::ForeignExecutor executor,
+       MetaSentinelDiscoveryDependencies discovery,
+       MetaSentinelServerOptions options, NumericEndpoint endpoint)
       : executor_(executor),
         authenticator_(options.requirepass_),
         options_(std::move(options)),
         endpoint_(std::move(endpoint)) {
     // Only the immutable digest is needed after construction.
     options_.requirepass_.clear();
+    discovery_ = DiscoverySource{
+        .raft_ = std::move(discovery.raft_),
+        .state_machine_ = discovery.state_machine_,
+        .runtime_status_ = std::move(discovery.runtime_status_),
+        .diagnostics_ = std::move(discovery.diagnostics_),
+        .observation_ttl_ms_ = discovery.observation_ttl_ms_,
+        .leader_observation_grace_ms_ = discovery.leader_observation_grace_ms_,
+    };
   }
 
   void NotifyDrained() {
@@ -311,6 +456,8 @@ struct MetaSentinelServer::Core {
   const PasswordAuthenticator authenticator_;
   MetaSentinelServerOptions options_;
   NumericEndpoint endpoint_;
+  // Discovery inputs are read and the caches written only on the Meta worker.
+  DiscoverySource discovery_;
   // All mutable state below is confined to the Meta worker. The main thread
   // observes bind/drain completion through one-shot promises, never a shared
   // request-path lock or a concurrently traversed session registry.
@@ -351,7 +498,9 @@ class MetaSentinelServer::SessionBorrow {
 };
 
 absl::StatusOr<std::shared_ptr<MetaSentinelServer>> MetaSentinelServer::Create(
-    bycorf::ForeignExecutor executor, MetaSentinelServerOptions options) {
+    bycorf::ForeignExecutor executor,
+    MetaSentinelDiscoveryDependencies discovery,
+    MetaSentinelServerOptions options) {
   auto endpoint = ParseNumericEndpoint(options.address_);
   if (!endpoint || endpoint->host_ == "0.0.0.0" || endpoint->host_ == "::" ||
       endpoint->host_ == "::ffff:0.0.0.0") {
@@ -362,9 +511,19 @@ absl::StatusOr<std::shared_ptr<MetaSentinelServer>> MetaSentinelServer::Create(
       options.reply_limit_ < 128 || options.progress_timeout_.count() <= 0) {
     return absl::InvalidArgumentError("invalid Sentinel resource limits");
   }
-  return std::shared_ptr<MetaSentinelServer>(
-      new MetaSentinelServer(std::make_shared<Core>(
-          executor, std::move(options), std::move(*endpoint))));
+  // Discovery is part of the surface contract: without authority inputs the
+  // five verbs could only ever drop connections, so missing dependencies are a
+  // startup error rather than a silent capability loss.
+  if (discovery.raft_ == nullptr || discovery.state_machine_ == nullptr ||
+      discovery.runtime_status_ == nullptr ||
+      discovery.diagnostics_ == nullptr || discovery.observation_ttl_ms_ == 0 ||
+      discovery.leader_observation_grace_ms_ == 0) {
+    return absl::InvalidArgumentError(
+        "Sentinel discovery dependencies must be valid");
+  }
+  return std::shared_ptr<MetaSentinelServer>(new MetaSentinelServer(
+      std::make_shared<Core>(executor, std::move(discovery), std::move(options),
+                             std::move(*endpoint))));
 }
 
 MetaSentinelServer::MetaSentinelServer(CorePtr core) : core_(std::move(core)) {}
@@ -536,9 +695,11 @@ bycorf::Task<absl::Status> MetaSentinelServer::SessionLoop(
         drop = true;
       } else {
         const bool was_authenticated = session.authenticated_;
-        const auto action = ExecuteConnectionCommand(
-            core->authenticator_, session, parsed.command_.args_);
-        drop = action == SessionAction::kClose;
+        const auto action =
+            ExecuteConnectionCommand(core->authenticator_, core->discovery_,
+                                     session, parsed.command_.args_);
+        drop =
+            action == SessionAction::kClose || action == SessionAction::kDrop;
         if (session.authenticated_) {
           (void)authentication_deadline.Disarm();
         } else if (action == SessionAction::kReset && was_authenticated) {
@@ -547,6 +708,9 @@ bycorf::Task<absl::Status> MetaSentinelServer::SessionLoop(
           // the initial deadline and hold an admission slot indefinitely.
           if (!authentication_deadline.Arm(timeout).ok()) drop = true;
         }
+        // kDrop is the discovery no-reply contract: the loop exits without
+        // entering the write path below.
+        if (action == SessionAction::kDrop) break;
       }
       auto reply = session.reply_.View();
       if (reply.size() > core->options_.reply_limit_) {
