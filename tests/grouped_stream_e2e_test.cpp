@@ -88,6 +88,57 @@ TEST(GroupedStreamE2e, AppendOnlyRewritesBoundedPagesAndRecovers) {
   EXPECT_EQ(client.Command({"XACK", "stream", "g", "1-0", "200-0"}).text_, "2");
 }
 
+TEST(GroupedStreamE2e, DeleteRoutesIdsAndPreservesPendingAndNodeBoundaries) {
+  PrivateDisk disk;
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(
+        client.Command({"CONFIG", "SET", "stream-node-max-entries", "3"}).text_,
+        "OK");
+    PopulateStream(client, "s", 200);
+    ASSERT_EQ(client.Command({"XGROUP", "CREATE", "s", "g", "0"}).text_, "OK");
+    ASSERT_EQ(client
+                  .Command({"XREADGROUP", "GROUP", "g", "c", "COUNT", "10",
+                            "STREAMS", "s", ">"})
+                  .kind_,
+              '*');
+    ASSERT_EQ(client
+                  .Command({"XDEL", "s", "1-0", "1-0", "4-0", "5-0", "6-0",
+                            "199-0", "200-0", "999-0"})
+                  .text_,
+              "6");
+    ASSERT_EQ(client.Command({"XLEN", "s"}).text_, "194");
+    auto pending = client.Command({"XPENDING", "s", "g"});
+    ASSERT_EQ(pending.kind_, '*') << pending.text_;
+    ASSERT_EQ(pending.items_[0].text_, "10");
+    // The first node now has two messages. Changing the configuration must
+    // not redefine it, nor may deleting a whole node merge its neighbours.
+    ASSERT_EQ(
+        client.Command({"CONFIG", "SET", "stream-node-max-entries", "100"})
+            .text_,
+        "OK");
+    EXPECT_EQ(client.Command({"XTRIM", "s", "MAXLEN", "~", "193", "LIMIT", "0"})
+                  .text_,
+              "0");
+    EXPECT_EQ(client.Command({"XTRIM", "s", "MAXLEN", "~", "192", "LIMIT", "0"})
+                  .text_,
+              "2");
+    EXPECT_EQ(
+        client.Command({"XACK", "s", "g", "1-0", "4-0", "5-0", "6-0"}).text_,
+        "4");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server server(disk, 3);
+  Client client(server.port());
+  EXPECT_EQ(client.Command({"XLEN", "s"}).text_, "192");
+  auto first = client.Command({"XRANGE", "s", "-", "+", "COUNT", "1"});
+  ASSERT_EQ(first.kind_, '*') << first.text_;
+  ASSERT_EQ(first.items_.size(), 1);
+  EXPECT_EQ(first.items_[0].items_[0].text_, "7-0");
+}
+
 TEST(GroupedStreamE2e, EmptyStreamRetainsGroupsAndPendingAcrossRecovery) {
   PrivateDisk disk;
   {
@@ -319,6 +370,19 @@ TEST(GroupedStreamE2e, AggregateAbove512MiBKeepsHotPathsAndRecoveryBounded) {
     // both maxmemory and the old compact image's 512 MiB encoding limit.
     PopulateStream(client, "s", 2050, 256 * 1024);
     ASSERT_EQ(client.Command({"XLEN", "s"}).text_, "2050");
+    ASSERT_EQ(client.Command({"XGROUP", "CREATE", "s", "new", "$"}).text_,
+              "OK");
+    ASSERT_EQ(client.Command({"XGROUP", "DESTROY", "s", "new"}).text_, "1");
+    ASSERT_EQ(
+        client.Command({"XSETID", "s", "2050-0", "ENTRIESADDED", "2050"}).text_,
+        "OK");
+    EXPECT_EQ(
+        client.Command({"XSETID", "s", "2050-0", "ENTRIESADDED", "1"}).kind_,
+        '-');
+    EXPECT_EQ(client.Command({"XINFO", "STREAM", "s"}).kind_, '*');
+    EXPECT_EQ(
+        client.Command({"XINFO", "STREAM", "s", "FULL", "COUNT", "1"}).kind_,
+        '*');
     auto range = client.Command({"XRANGE", "s", "2049-0", "+", "COUNT", "1"});
     ASSERT_EQ(range.kind_, '*') << range.text_;
     ASSERT_EQ(range.items_.size(), 1);
@@ -330,7 +394,24 @@ TEST(GroupedStreamE2e, AggregateAbove512MiBKeepsHotPathsAndRecoveryBounded) {
     ASSERT_EQ(delivered.kind_, '*') << delivered.text_;
     ASSERT_EQ(delivered.items_.size(), 1);
     EXPECT_EQ(delivered.items_[0].items_[1].items_[0].items_[0].text_, "1-0");
-    ASSERT_EQ(client.Command({"XACK", "s", "g", "1-0"}).text_, "1");
+    EXPECT_EQ(client.Command({"XPENDING", "s", "g"}).kind_, '*');
+    EXPECT_EQ(client.Command({"XPENDING", "s", "g", "-", "+", "1"}).kind_, '*');
+    EXPECT_EQ(client.Command({"XINFO", "GROUPS", "s"}).kind_, '*');
+    EXPECT_EQ(client.Command({"XINFO", "CONSUMERS", "s", "g"}).kind_, '*');
+    EXPECT_EQ(client
+                  .Command({"XREADGROUP", "GROUP", "g", "c", "COUNT", "1",
+                            "STREAMS", "s", "0"})
+                  .kind_,
+              '*');
+    EXPECT_EQ(client
+                  .Command({"XAUTOCLAIM", "s", "g", "other", "0", "0-0",
+                            "COUNT", "1", "JUSTID"})
+                  .kind_,
+              '*');
+    EXPECT_EQ(
+        client.Command({"XGROUP", "DELCONSUMER", "s", "g", "other"}).text_,
+        "1");
+    ASSERT_EQ(client.Command({"XACK", "s", "g", "1-0"}).text_, "0");
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
@@ -346,6 +427,20 @@ TEST(GroupedStreamE2e, AggregateAbove512MiBKeepsHotPathsAndRecoveryBounded) {
     ASSERT_EQ(delivered.items_.size(), 1);
     EXPECT_EQ(delivered.items_[0].items_[1].items_[0].items_[0].text_, "2-0");
     EXPECT_EQ(client.Command({"XACK", "s", "g", "2-0"}).text_, "1");
+    EXPECT_EQ(client.Command({"XDEL", "s", "3-0", "1000-0", "3-0"}).text_, "2");
+    EXPECT_EQ(
+        client.Command({"XADD", "s", "MAXLEN", "2000", "2052-0", "f", "trim"})
+            .text_,
+        "2052-0");
+    EXPECT_EQ(client.Command({"XLEN", "s"}).text_, "2000");
+    EXPECT_EQ(client.Command({"XTRIM", "s", "MINID", "2050-0"}).text_, "1997");
+    EXPECT_EQ(client.Command({"XLEN", "s"}).text_, "3");
+    EXPECT_EQ(client.Command({"XTRIM", "s", "MAXLEN", "0"}).text_, "3");
+    EXPECT_EQ(
+        client.Command({"XADD", "s", "MAXLEN", "0", "2053-0", "f", "gone"})
+            .text_,
+        "2053-0");
+    EXPECT_EQ(client.Command({"XLEN", "s"}).text_, "0");
     EXPECT_EQ(client.Command({"DEL", "s"}).text_, "1");
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
@@ -353,6 +448,133 @@ TEST(GroupedStreamE2e, AggregateAbove512MiBKeepsHotPathsAndRecoveryBounded) {
   Server server(disk);
   Client client(server.port());
   EXPECT_EQ(client.Command({"EXISTS", "s"}).text_, "0");
+}
+
+TEST(GroupedStreamE2e, LargeRepliesKeepSnapshotsAndDeletedHistory) {
+  PrivateDisk disk(2ULL * 1024 * 1024 * 1024);
+  Server server(disk, 2, {}, {}, false, 2, "256M", {}, "128M");
+  server.PreserveOnFailure();
+  Client client(server.port());
+  PopulateStream(client, "s", 256, 256 * 1024);
+  {
+    auto range = client.Command({"XRANGE", "s", "-", "+"});
+    ASSERT_EQ(range.kind_, '*') << range.text_;
+    ASSERT_EQ(range.items_.size(), 256);
+    EXPECT_EQ(range.items_.back().items_[0].text_, "256-0");
+    auto reverse =
+        client.Command({"XREVRANGE", "s", "(200-0", "(197-0", "COUNT", "2"});
+    ASSERT_EQ(reverse.items_.size(), 2);
+    EXPECT_EQ(reverse.items_[0].items_[0].text_, "199-0");
+    EXPECT_EQ(reverse.items_[1].items_[0].text_, "198-0");
+  }
+  ASSERT_EQ(client.Command({"XGROUP", "CREATE", "s", "g", "0"}).text_, "OK");
+  {
+    auto read =
+        client.Command({"XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"});
+    ASSERT_EQ(read.kind_, '*') << read.text_;
+    ASSERT_EQ(read.items_.size(), 1);
+    EXPECT_EQ(read.items_[0].items_[1].items_.size(), 256);
+  }
+  ASSERT_EQ(client.Command({"XDEL", "s", "1-0", "128-0"}).text_, "2");
+  {
+    auto history =
+        client.Command({"XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", "0"});
+    ASSERT_EQ(history.kind_, '*') << history.text_;
+    const auto& entries = history.items_[0].items_[1].items_;
+    ASSERT_EQ(entries.size(), 256);
+    EXPECT_EQ(entries[0].items_[1].text_, "-1");
+    EXPECT_EQ(entries[127].items_[1].text_, "-1");
+    EXPECT_EQ(entries.back().items_[1].items_[1].text_.size(), 256 * 1024);
+  }
+  {
+    auto info = client.Command({"XINFO", "STREAM", "s", "FULL", "COUNT", "0"});
+    ASSERT_EQ(info.kind_, '*') << info.text_;
+    EXPECT_EQ(info.items_[15].items_.size(), 254);
+  }
+  {
+    auto dump = client.Command({"DUMP", "s"});
+    ASSERT_EQ(dump.kind_, '$') << dump.text_;
+    EXPECT_GT(dump.text_.size(), 64 * 1000 * 1000);
+    // The imported deleted-message PEL survives value-only framing too.
+    ASSERT_EQ(client.Command({"RESTORE", "copy", "0", dump.text_}).text_, "OK");
+    EXPECT_EQ(client.Command({"XLEN", "copy"}).text_, "254");
+    EXPECT_EQ(client.Command({"XPENDING", "copy", "g"}).items_[0].text_, "256");
+  }
+  EXPECT_EQ(client.Command({"MULTI"}).text_, "OK");
+  EXPECT_EQ(client.Command({"XREAD", "STREAMS", "s", "0"}).text_, "QUEUED");
+  EXPECT_EQ(client.Command({"XRANGE", "s", "-", "+", "COUNT", "1"}).text_,
+            "QUEUED");
+  EXPECT_EQ(client.Command({"DEL", "s"}).text_, "QUEUED");
+  auto transaction = client.Command({"EXEC"});
+  ASSERT_EQ(transaction.kind_, '*') << transaction.text_;
+  ASSERT_EQ(transaction.items_.size(), 3);
+  ASSERT_EQ(transaction.items_[0].items_[0].items_[1].items_.size(), 254);
+  EXPECT_EQ(transaction.items_[1].items_[0].items_[0].text_, "2-0");
+  EXPECT_EQ(transaction.items_[2].text_, "1");
+}
+
+TEST(GroupedStreamE2e, LargeRdbRoundTripKeepsMessagesAndDeletedPendingBounded) {
+  PrivateDisk source(4ULL * 1024 * 1024 * 1024);
+  PrivateDisk target(4ULL * 1024 * 1024 * 1024);
+  const auto input = target.path() + ".input.rdb";
+  struct Cleanup {
+    std::string path;
+    ~Cleanup() { ::unlink(path.c_str()); }
+  } cleanup{input};
+  {
+    Server server(source, 2, {}, {}, false, 2, "256M");
+    Client client(server.port());
+    PopulateStream(client, "s", 2050, 256 * 1024);
+    ASSERT_EQ(client.Command({"XGROUP", "CREATE", "s", "g", "0"}).text_, "OK");
+    ASSERT_EQ(client
+                  .Command({"XREADGROUP", "GROUP", "g", "c", "COUNT", "10",
+                            "STREAMS", "s", ">"})
+                  .kind_,
+              '*');
+    ASSERT_EQ(client.Command({"XDEL", "s", "1-0"}).text_, "1");
+    ASSERT_EQ(client.Command({"BGSAVE"}).kind_, '+');
+    const auto deadline = std::chrono::steady_clock::now() + 180s;
+    while (server.Log().find("RDB backup completed:") == std::string::npos &&
+           server.Running() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(100ms);
+    ASSERT_NE(server.Log().find("RDB backup completed:"), std::string::npos)
+        << server.Log();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    ASSERT_EQ(::rename((source.path() + ".rdb").c_str(), input.c_str()), 0);
+  }
+  {
+    Server server(target, 3, {}, {}, false, 2, "256M", input);
+    const auto deadline = std::chrono::steady_clock::now() + 180s;
+    while (server.Log().find("loaded RDB file") == std::string::npos &&
+           server.Running() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(100ms);
+    ASSERT_NE(server.Log().find("loaded RDB file"), std::string::npos)
+        << server.Log();
+    Client client(server.port());
+    EXPECT_EQ(client.Command({"XLEN", "s"}).text_, "2049");
+    auto pending = client.Command({"XPENDING", "s", "g"});
+    ASSERT_EQ(pending.kind_, '*') << pending.text_;
+    ASSERT_EQ(pending.items_[0].text_, "10");
+    auto history = client.Command(
+        {"XREADGROUP", "GROUP", "g", "c", "COUNT", "1", "STREAMS", "s", "0"});
+    ASSERT_EQ(history.kind_, '*') << history.text_;
+    ASSERT_EQ(history.items_[0].items_[1].items_[0].items_[0].text_, "1-0");
+    EXPECT_EQ(history.items_[0].items_[1].items_[0].items_[1].kind_, '*');
+    EXPECT_EQ(history.items_[0].items_[1].items_[0].items_[1].text_, "-1");
+    auto range = client.Command({"XRANGE", "s", "2050-0", "+", "COUNT", "1"});
+    ASSERT_EQ(range.kind_, '*') << range.text_;
+    ASSERT_EQ(range.items_.size(), 1);
+    EXPECT_EQ(range.items_[0].items_[1].items_[1].text_,
+              std::string(256 * 1024, 'v'));
+    EXPECT_EQ(client.Command({"XACK", "s", "g", "1-0"}).text_, "1");
+    EXPECT_EQ(client.Command({"XADD", "s", "2051-0", "f", "new"}).text_,
+              "2051-0");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server server(target, 2, {}, {}, false, 2, "256M");
+  Client client(server.port());
+  EXPECT_EQ(client.Command({"XLEN", "s"}).text_, "2050");
 }
 
 class GroupedStreamCrashE2e : public testing::TestWithParam<const char*> {};
@@ -383,6 +605,44 @@ TEST_P(GroupedStreamCrashE2e, InterruptedAppendKeepsPreviousGraph) {
   EXPECT_EQ(client.Command({"XADD", "s", "151-0", "f", "retry"}).text_,
             "151-0");
 }
+TEST_P(GroupedStreamCrashE2e, InterruptedTrimKeepsMessagesAndPending) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires grouped crash hooks";
+#endif
+  PrivateDisk disk;
+  {
+    Server server(disk);
+    Client client(server.port());
+    PopulateStream(client, "s", 150);
+    ASSERT_EQ(client.Command({"XGROUP", "CREATE", "s", "g", "0"}).text_, "OK");
+    ASSERT_EQ(client
+                  .Command({"XREADGROUP", "GROUP", "g", "c", "COUNT", "2",
+                            "STREAMS", "s", ">"})
+                  .kind_,
+              '*');
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    Server server(disk, 2, GetParam());
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"XTRIM", "s", "MAXLEN", "1"}).text_, "QUEUED");
+    EXPECT_THROW(client.Command({"EXEC"}), std::runtime_error);
+    EXPECT_EQ(server.Wait(), 86) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"XLEN", "s"}).text_, "150");
+  EXPECT_EQ(client.Command({"XPENDING", "s", "g"}).items_[0].text_, "2");
+  EXPECT_EQ(client.Command({"XRANGE", "s", "-", "+", "COUNT", "1"})
+                .items_[0]
+                .items_[0]
+                .text_,
+            "1-0");
+  EXPECT_EQ(client.Command({"XTRIM", "s", "MAXLEN", "1"}).text_, "149");
+}
+
 INSTANTIATE_TEST_SUITE_P(
     BatchWindows, GroupedStreamCrashE2e,
     testing::Values("group-batch-before-root",

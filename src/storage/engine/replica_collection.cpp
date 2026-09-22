@@ -286,7 +286,7 @@ Task<absl::Status> StorageEngine::Impl::ConsumeReplicaCollection(
   if (!complete.ok()) co_return complete;
   complete = co_await flush_batch();
   if (!complete.ok()) co_return complete;
-  if (state->applied_count_ != stage.logical_size_)
+  if (state->applied_count_ != state->decoder_->item_count())
     co_return absl::DataLossError("replica collection cardinality mismatch");
   if (!state->skip_) {
     complete = co_await CommitTxWrites(state->writes_.txid_, {&state->writes_});

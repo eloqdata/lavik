@@ -28,6 +28,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "lavik/storage/collection_page.h"
+#include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
 
@@ -114,16 +115,21 @@ class CollectionCompactDecoder {
   absl::StatusOr<CollectionPage> TakePage(
       std::size_t* transferred_admission = nullptr);
   std::size_t pending_admitted_bytes() const noexcept {
-    return admission_count_.bytes_;
+    return admission_count_.bytes_ + stream_validator_charge_;
   }
 
   // Validates exact bytes/count and no partial header/entry at transport EOF.
   // A final ready page may still be taken after successful Finish. No trailing
   // bytes may subsequently be supplied. A truncated EOF poisons the decoder.
   absl::Status Finish();
+  // Stream wire items include metadata and PEL; the enclosing logical size
+  // counts messages and is independently checked by the record validator.
+  std::uint64_t item_count() const noexcept { return total_count_; }
 
  private:
   CollectionCompactDecoder() = default;
+  std::optional<StreamRecordValidator> stream_validator_;
+  std::size_t stream_validator_charge_ = 0;
   // Moving transfers the external admission receipt, never copies it. Before
   // overwriting a decoder, its owner releases the old pending receipt after
   // its buffers die, just as it must when destroying that decoder.

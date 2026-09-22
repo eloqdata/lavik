@@ -75,8 +75,10 @@ TEST(StreamRecords, RoundTripAndIncrementalValidation) {
       ASSERT_TRUE(validator.Read(record.value_).ok());
     EXPECT_TRUE(validator.Finish().ok());
     EXPECT_EQ(*EncodeStreamRecords(*records), wire);
+    std::size_t wire_bytes = 8;
+    for (const auto& record : *records) wire_bytes += 4 + record.value_.size();
     auto encoder = CollectionCompactEncoder::Create(
-        ValueType::kStream, records->size(), wire.size());
+        ValueType::kStream, records->size(), wire_bytes);
     ASSERT_TRUE(encoder.ok()) << encoder.status();
     std::string output;
     for (const auto& record : *records) {
@@ -86,7 +88,24 @@ TEST(StreamRecords, RoundTripAndIncrementalValidation) {
       while (auto bytes = encoder->Next()) output.append(*bytes);
     }
     EXPECT_TRUE(encoder->Finish().ok());
-    EXPECT_EQ(output, wire);
+    auto decoder =
+        CollectionCompactDecoder::Create(ValueType::kStream, n, output.size());
+    ASSERT_TRUE(decoder.ok()) << decoder.status();
+    std::vector<OrderedCollectionEntry> decoded;
+    // Exercise every framing boundary, including binary routing names.
+    for (std::size_t i = 0; i < output.size();) {
+      auto used = decoder->Consume(std::string_view(output).substr(i, 1));
+      ASSERT_TRUE(used.ok()) << used.status();
+      i += *used;
+      if (decoder->page_ready()) {
+        auto page = decoder->TakePage();
+        ASSERT_TRUE(page.ok()) << page.status();
+        for (auto& record : page->elements_)
+          decoded.push_back({.value_ = std::move(record)});
+      }
+    }
+    EXPECT_TRUE(decoder->Finish().ok());
+    EXPECT_EQ(*EncodeStreamRecords(decoded), wire);
   }
 }
 TEST(StreamRecords, RejectsTruncationAndWrongCounts) {

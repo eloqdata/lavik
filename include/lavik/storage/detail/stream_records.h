@@ -48,7 +48,8 @@ struct StreamRecordChange {
 absl::StatusOr<OrderedCollectionMutationPlan> PlanStreamRecordChanges(
     const OrderedGroupDirectory& directory,
     std::vector<LoadedOrderedGroup> loaded,
-    std::vector<StreamRecordChange> changes, std::uint64_t stream_length);
+    std::vector<StreamRecordChange> changes, std::uint64_t stream_length,
+    std::span<const std::uint64_t> retired_pages = {});
 
 // Checks a complete, ordered Stream record sequence in bounded space before
 // ingestion commits. Only the current group prefix and last key are retained;

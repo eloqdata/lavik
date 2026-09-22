@@ -220,3 +220,21 @@ update therefore falls back to the prior common generation; a set with no
 common valid generation fails startup. Interrupted expansion is safe to retry
 with the same complete path list. Removing a device and adding devices while
 the server is running are not implemented.
+
+## Temporary space for Stream conversion
+
+Stream RDB import uses unlinked files in the C library temporary directory
+(normally `/tmp`) to reorder logical records and join PEL owner associations.
+Export reorders consumer/PEL associations, and grouped DUMP spools its encoded
+reply to determine the bulk length. These files are separate from Lavik data
+files and RDB destination files. Provision temporary space for the converted
+Stream plus intermediate merge runs; concurrent conversions add their space
+requirements. Import sorting can temporarily retain both source runs and the
+merged run, and RDB listpack expansion can exceed compressed source size.
+
+A full temporary filesystem fails the conversion before publishing an imported
+key; it does not indicate that the Lavik storage device is full. Inspect `/tmp`
+capacity and process-open unlinked files when diagnosing conversion failures.
+Scratch files close automatically on success, failure or process exit. The
+synchronous reorder work can delay the executing worker, so schedule large RDB
+imports or DUMP operations with that latency cost in mind.

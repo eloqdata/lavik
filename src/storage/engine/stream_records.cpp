@@ -350,7 +350,8 @@ absl::StatusOr<std::string> EncodeStreamRecords(
 absl::StatusOr<OrderedCollectionMutationPlan> PlanStreamRecordChanges(
     const OrderedGroupDirectory& directory,
     std::vector<LoadedOrderedGroup> loaded,
-    std::vector<StreamRecordChange> changes, std::uint64_t stream_length) {
+    std::vector<StreamRecordChange> changes, std::uint64_t stream_length,
+    std::span<const std::uint64_t> retired_pages) {
   const auto& root = directory.root();
   if (root.kind_ != OrderedCollectionKind::kStream ||
       stream_length > UINT32_MAX)
@@ -374,6 +375,16 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanStreamRecordChanges(
   std::set<std::uint64_t> touched;
   std::set<std::string> keys;
   std::int64_t count = root.item_count_;
+  // Whole-page range deletion needs no message payload. The caller resolves
+  // both range boundaries against this same immutable directory beforehand.
+  std::set<std::uint64_t> retired;
+  for (const auto id : retired_pages) {
+    const auto* metadata = directory.Find(id);
+    if (!metadata || !retired.insert(id).second)
+      return absl::InvalidArgumentError("invalid Stream retired page");
+    count -= metadata->item_count_;
+    touched.insert(id);
+  }
   // Check routing against the original page boundaries before any mutation
   // changes a boundary key. Payload changes never change record ownership.
   for (const auto& change : changes) {
@@ -382,14 +393,16 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanStreamRecordChanges(
       return absl::InvalidArgumentError(
           "missing/repeated Stream mutation route");
     const auto& source = page->second;
-    if ((source.previous_ && !pages.contains(source.previous_)) ||
-        (source.next_ && !pages.contains(source.next_)))
+    if ((source.previous_ && !pages.contains(source.previous_) &&
+         !retired.contains(source.previous_)) ||
+        (source.next_ && !pages.contains(source.next_) &&
+         !retired.contains(source.next_)))
       return absl::InvalidArgumentError("Stream mutation needs adjacent pages");
     auto last = StreamRecordKey(source.entries_.back().value_);
     if (!last.ok()) return last.status();
     if (source.next_ && change.key_ > *last)
       return absl::InvalidArgumentError("Stream mutation exceeds page bound");
-    if (source.previous_) {
+    if (source.previous_ && !retired.contains(source.previous_)) {
       auto lower =
           StreamRecordKey(pages.at(source.previous_).entries_.back().value_);
       if (!lower.ok()) return lower.status();
@@ -468,7 +481,12 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanStreamRecordChanges(
       chain.push_back(old.id_);
       continue;
     }
-    auto page = std::move(pages.at(old.id_));
+    auto page = retired.contains(old.id_)
+                    ? OrderedGroupSnapshot{.kind_ = root.kind_,
+                                           .incarnation_ = root.incarnation_,
+                                           .id_ = old.id_,
+                                           .entries_ = {}}
+                    : std::move(pages.at(old.id_));
     if (page.entries_.empty()) {
       plan.writes_.push_back({.kind_ = root.kind_,
                               .incarnation_ = root.incarnation_,

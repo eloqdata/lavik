@@ -667,8 +667,7 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
   }
 
   const SavedValue physical = saved->value_;
-  if (physical.grouped_ != nullptr &&
-      physical.location_.value_type() != ValueType::kStream) {
+  if (physical.grouped_ != nullptr) {
     // The dirty-map entry remains Inflight until Finish/End. Its immutable
     // view and exact graph pins, not the current key index, own every page
     // read while a filesystem queue may suspend the producer.
@@ -1078,7 +1077,8 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
         store.rdb_snapshot_->invalidated_ = true;
         co_return loaded.status();
       }
-      if (page.value_type_ == ValueType::kList) {
+      if (page.value_type_ == ValueType::kList ||
+          page.value_type_ == ValueType::kStream) {
         page.elements_.reserve(loaded->snapshot_.entries_.size());
         for (auto& entry : loaded->snapshot_.entries_)
           page.elements_.push_back(std::move(entry.value_));
@@ -1122,7 +1122,9 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
     if (store.rdb_snapshot_->invalidated_)
       co_return absl::CancelledError(
           "RDB collection stream was cancelled during read");
-    const auto expected = stream.saved_->location_.logical_size_;
+    const auto expected = page.value_type_ == ValueType::kStream
+                              ? object->ordered_directory().root().item_count_
+                              : stream.saved_->location_.logical_size_;
     if (stream.emitted_ > expected ||
         page.size() > expected - stream.emitted_ ||
         (page.done_ && page.size() != expected - stream.emitted_)) {

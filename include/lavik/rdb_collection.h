@@ -19,6 +19,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string_view>
 
@@ -26,6 +27,8 @@
 #include "lavik/storage/collection_page.h"
 
 namespace lavik::rdb {
+
+class StreamFileEncoder;
 
 // Encodes one RDB file entry from independently loaded collection pages.
 // The key and current page are borrowed until their Next() sequence drains.
@@ -39,6 +42,10 @@ class CollectionFileEncoder {
       std::uint8_t db_id, std::string_view key, storage::ValueType type,
       std::uint64_t item_count, std::uint64_t expire_at_ms);
 
+  // Value-only encoding for DUMP; the caller appends the version/checksum.
+  static absl::StatusOr<CollectionFileEncoder> CreateDump(
+      storage::ValueType type, std::uint64_t item_count);
+
   // Drain the initial header with Next() before installing the first page.
   // A page must have the next sequential cursor and the same collection type.
   // Empty prefix-routing pages are legal and still advance the cursor.
@@ -49,6 +56,7 @@ class CollectionFileEncoder {
   absl::Status Finish() const;
 
  private:
+  std::shared_ptr<StreamFileEncoder> stream_;
   std::string_view Length(std::uint64_t value) noexcept;
   std::array<char, 40> header_{};
   std::array<char, 9> metadata_{};
@@ -63,6 +71,7 @@ class CollectionFileEncoder {
   unsigned header_phase_ = 0;
   unsigned entry_phase_ = 0;
   bool saw_last_ = false;
+  bool dump_ = false;
 };
 
 }  // namespace lavik::rdb

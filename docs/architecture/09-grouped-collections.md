@@ -24,8 +24,8 @@ compact values and complete, independently addressed group snapshots. Writes
 automatically promote compact collections at the encoded-size threshold; the
 grouped representation remains in use until the key is deleted or replaced.
 Streaming collection imports and grouped key transfers construct graphs directly.
-Stream RDB and native receiving retain their full-image adapters. Both ordinary
-and Debug builds use the same read, mutation, recovery and maintenance adapters.
+Stream RDB and native receiving also ingest logical records page by page. Both
+ordinary and Debug builds use the same read, mutation, recovery and maintenance adapters.
 
 Hash/Set use a persisted-seed prefix directory; List uses an ordered-page
 directory. Newly built Sorted Sets combine ordered `(score, member)` pages
@@ -383,7 +383,8 @@ The application pass rewinds the immutable input and feeds pages on the key
 owner, preserving page charges until consumption. EOF and optional declared
 cardinality are part of the atomic commit contract; quicklist node counts are
 not mistaken for element counts. RESTORE retains the ordinary RESP request
-size limits, and String/Stream or other integrations that explicitly request a
+size limits. Stream RDB ordering and PEL-owner joins use bounded temporary-file
+reordering; see [Streams](12-streams.md). Integrations explicitly requesting a
 whole compact image retain their materialization limits.
 
 COPY and RENAME retain key intents and transfer an immutable, exactly pinned

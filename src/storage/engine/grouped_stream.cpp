@@ -89,6 +89,7 @@ struct StorageEngine::Impl::StreamPageAccess {
   GroupedHashObject::Handle object_;
   std::vector<MemoryReservation> reservations_{};
   std::map<std::size_t, LoadedOrderedGroup> pages_{};
+  std::map<std::size_t, MemoryReservation> page_reservations_{};
 
   Task<absl::Status> Load(std::size_t index) {
     try {
@@ -103,7 +104,7 @@ struct StorageEngine::Impl::StreamPageAccess {
       if (!added.ok()) co_return added;
       auto admitted = budget.Reserve(6);
       if (!admitted.ok()) co_return admitted.status();
-      reservations_.push_back(std::move(*admitted));
+      page_reservations_.emplace(index, std::move(*admitted));
       auto page = co_await engine_.LoadOrderedGroupSnapshot(
           store_, partition_, db_id_, key_, digest_, object_, id.prefix_);
       if (!page.ok()) co_return page.status();
@@ -154,6 +155,25 @@ struct StorageEngine::Impl::StreamPageAccess {
       co_return absl::ResourceExhaustedError("OOM grouped Stream workspace");
     }
   }
+  // Returns the predecessor at or below a routing key. Logical node records
+  // are keyed by their first live ID, independently of physical page splits.
+  Task<absl::StatusOr<std::optional<std::string>>> Previous(
+      std::string_view wanted) {
+    auto index = co_await Route(wanted);
+    if (!index.ok()) co_return index.status();
+    for (;;) {
+      auto status = co_await Load(*index);
+      if (!status.ok()) co_return status;
+      const auto& entries = pages_.at(*index).snapshot_.entries_;
+      for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+        auto key = StreamRecordKey(it->value_);
+        if (!key.ok()) co_return key.status();
+        if (*key <= wanted) co_return std::optional(it->value_);
+      }
+      if (*index == 0) co_return std::nullopt;
+      --*index;
+    }
+  }
   Task<absl::StatusOr<std::string>> Required(std::string_view wanted) {
     try {
       auto record = co_await Find(wanted);
@@ -195,8 +215,373 @@ struct StorageEngine::Impl::StreamPageAccess {
       co_return absl::ResourceExhaustedError("OOM grouped Stream workspace");
     }
   }
+  Task<absl::Status> Visit(
+      std::string_view low, std::string_view high,
+      const std::function<absl::Status(std::string_view)>& visitor) {
+    auto first = co_await Route(low);
+    if (!first.ok()) co_return first.status();
+    for (auto i = *first; i < object_->ordered_directory().groups().size();
+         ++i) {
+      const bool cached = pages_.contains(i);
+      auto status = co_await Load(i);
+      if (!status.ok()) co_return status;
+      bool done = false;
+      for (const auto& entry : pages_.at(i).snapshot_.entries_) {
+        auto key = StreamRecordKey(entry.value_);
+        if (!key.ok()) co_return key.status();
+        if (*key >= high) {
+          done = true;
+          break;
+        }
+        if (*key < low) continue;
+        status = visitor(entry.value_);
+        if (!status.ok()) co_return status;
+      }
+      if (!cached) {
+        pages_.erase(i);
+        page_reservations_.erase(i);
+      }
+      if (done) break;
+      co_await bycorf::Yield(*store_.worker_);
+    }
+    co_return absl::OkStatus();
+  }
+  Task<absl::StatusOr<std::vector<std::string>>> ScanPending(
+      std::string_view prefix, const StreamPendingAccess& access) {
+    std::vector<std::string> result;
+    const auto& range = access.range_;
+    if (range.count_ == 0) co_return result;
+    const auto low = IdKey(std::string(prefix) + '\3', range.first_);
+    const auto high = IdKey(std::string(prefix) + '\3', range.last_);
+    auto first = co_await Route(low);
+    if (!first.ok()) co_return first.status();
+    for (auto i = *first; i < object_->ordered_directory().groups().size();
+         ++i) {
+      const bool cached = pages_.contains(i);
+      auto status = co_await Load(i);
+      if (!status.ok()) co_return status;
+      const auto before = result.size();
+      for (const auto& entry : pages_.at(i).snapshot_.entries_) {
+        auto key = StreamRecordKey(entry.value_);
+        if (!key.ok()) co_return key.status();
+        if (*key > high || (range.last_exclusive_ && *key == high))
+          co_return result;
+        if (*key < low || (range.first_exclusive_ && *key == low)) continue;
+        auto payload = StreamRecordPayload(entry.value_);
+        if (!payload.ok() || payload->size() < 36)
+          co_return absl::DataLossError("invalid Stream pending row");
+        const auto owner_bytes = Count(*payload, 16);
+        if (owner_bytes != payload->size() - 36)
+          co_return absl::DataLossError("invalid Stream pending owner");
+        if (access.consumer_ &&
+            payload->substr(20, owner_bytes) != *access.consumer_)
+          continue;
+        const auto delivered = ReadId(payload->substr(20 + owner_bytes))[0];
+        if (access.now_ms_ - std::min(access.now_ms_, delivered) <
+            access.min_idle_ms_)
+          continue;
+        result.push_back(entry.value_);
+        if (result.size() == range.count_) co_return result;
+      }
+      // A consumer filter can scan an arbitrarily large unrelated PEL. Its
+      // rejected pages and admission must not accumulate behind the cursor.
+      if (!cached && before == result.size()) {
+        pages_.erase(i);
+        page_reservations_.erase(i);
+      }
+      co_await bycorf::Yield(*store_.worker_);
+    }
+    co_return result;
+  }
+  // Interior pages are entirely inside the range: their checked directory
+  // cardinalities suffice. Only the two boundary pages need decoding.
+  Task<absl::StatusOr<std::uint64_t>> CountRange(std::string_view low,
+                                                 std::string_view high) {
+    if (low >= high) co_return 0;
+    auto first = co_await Route(low), last = co_await Route(high);
+    if (!first.ok()) co_return first.status();
+    if (!last.ok()) co_return last.status();
+    std::uint64_t count = 0;
+    const auto& groups = object_->ordered_directory().groups();
+    for (auto i = *first; i <= *last; ++i) {
+      if (i != *first && i != *last) {
+        count += groups[i].item_count_;
+        continue;
+      }
+      auto status = co_await Load(i);
+      if (!status.ok()) co_return status;
+      for (const auto& entry : pages_.at(i).snapshot_.entries_) {
+        auto key = StreamRecordKey(entry.value_);
+        if (!key.ok()) co_return key.status();
+        if (*key >= low && *key < high) ++count;
+      }
+    }
+    co_return count;
+  }
+  Task<absl::StatusOr<std::optional<std::string>>> Select(std::string_view low,
+                                                          std::string_view high,
+                                                          std::uint64_t rank) {
+    auto first = co_await Route(low), last = co_await Route(high);
+    if (!first.ok()) co_return first.status();
+    if (!last.ok()) co_return last.status();
+    const auto& groups = object_->ordered_directory().groups();
+    for (auto i = *first; i <= *last; ++i) {
+      if (i != *first && i != *last && rank >= groups[i].item_count_) {
+        rank -= groups[i].item_count_;
+        continue;
+      }
+      auto status = co_await Load(i);
+      if (!status.ok()) co_return status;
+      for (const auto& entry : pages_.at(i).snapshot_.entries_) {
+        auto key = StreamRecordKey(entry.value_);
+        if (!key.ok()) co_return key.status();
+        if (*key >= low && *key < high) {
+          if (rank == 0) co_return std::optional(entry.value_);
+          --rank;
+        }
+      }
+    }
+    co_return std::nullopt;
+  }
+  static void Change(std::vector<StreamRecordChange>& changes, std::string key,
+                     std::optional<std::string> record) {
+    auto found =
+        std::find_if(changes.begin(), changes.end(),
+                     [&](const auto& item) { return item.key_ == key; });
+    if (found == changes.end())
+      changes.push_back({.key_ = std::move(key), .record_ = std::move(record)});
+    else
+      found->record_ = std::move(record);
+  }
+  Task<absl::Status> EraseRange(std::string_view low, std::string_view high,
+                                std::vector<StreamRecordChange>& changes,
+                                std::vector<std::uint64_t>& retired) {
+    if (low >= high) co_return absl::OkStatus();
+    auto first = co_await Route(low), last = co_await Route(high);
+    if (!first.ok()) co_return first.status();
+    if (!last.ok()) co_return last.status();
+    std::erase_if(changes, [&](const auto& item) {
+      return item.key_ >= low && item.key_ < high;
+    });
+    const auto& groups = object_->ordered_directory().groups();
+    for (auto i = *first; i <= *last; ++i) {
+      if (i != *first && i != *last) {
+        retired.push_back(groups[i].id_);
+        continue;
+      }
+      auto status = co_await Load(i);
+      if (!status.ok()) co_return status;
+      for (const auto& entry : pages_.at(i).snapshot_.entries_) {
+        auto key = StreamRecordKey(entry.value_);
+        if (!key.ok()) co_return key.status();
+        if (*key >= low && *key < high)
+          Change(changes, std::string(*key), std::nullopt);
+      }
+    }
+    co_return absl::OkStatus();
+  }
+  Task<absl::StatusOr<std::uint64_t>> ErasePendingConsumer(
+      std::string_view prefix, std::string_view owner,
+      std::vector<StreamRecordChange>& changes,
+      std::vector<std::uint64_t>& retired) {
+    const std::string low = std::string(prefix) + '\3';
+    std::string high(prefix);
+    high.back() = '\1';
+    auto first = co_await Route(low), last = co_await Route(high);
+    if (!first.ok()) co_return first.status();
+    if (!last.ok()) co_return last.status();
+    std::uint64_t removed = 0;
+    const auto& groups = object_->ordered_directory().groups();
+    for (auto i = *first; i <= *last; ++i) {
+      const bool cached = pages_.contains(i);
+      auto status = co_await Load(i);
+      if (!status.ok()) co_return status;
+      std::vector<std::string> matches;
+      const auto& entries = pages_.at(i).snapshot_.entries_;
+      for (const auto& entry : entries) {
+        auto key = StreamRecordKey(entry.value_);
+        if (!key.ok()) co_return key.status();
+        if (*key < low || *key >= high) continue;
+        auto payload = StreamRecordPayload(entry.value_);
+        if (!payload.ok() || payload->size() < 36 ||
+            Count(*payload, 16) != payload->size() - 36)
+          co_return absl::DataLossError(
+              "invalid pending consumer removal record");
+        if (payload->substr(20, Count(*payload, 16)) == owner)
+          matches.emplace_back(*key);
+      }
+      removed += matches.size();
+      if (matches.size() == entries.size()) {
+        retired.push_back(groups[i].id_);
+        pages_.erase(i);
+        page_reservations_.erase(i);
+      } else if (matches.empty() && !cached) {
+        pages_.erase(i);
+        page_reservations_.erase(i);
+      } else {
+        // PEL IDs in this scan are unique and disjoint from the consumer
+        // header changes, so append directly rather than quadratic
+        // deduplication.
+        for (auto& key : matches)
+          changes.push_back({.key_ = std::move(key), .record_ = std::nullopt});
+      }
+      co_await bycorf::Yield(*store_.worker_);
+    }
+    co_return removed;
+  }
+  Task<absl::StatusOr<StreamTrimResult>> Trim(
+      const StreamTrimRequest& trim, std::vector<StreamRecordChange>& changes,
+      std::vector<std::uint64_t>& retired, std::uint64_t length) {
+    const std::string entries_begin(1, '\1'), entries_end(1, '\2');
+    const std::string nodes_begin(1, '\3'), nodes_end(1, '\4');
+    const auto old_length = object_->ordered_directory().root().logical_size();
+    std::optional<std::string> appended;
+    for (const auto& item : changes)
+      if (item.key_.starts_with(entries_begin) && item.record_)
+        appended = item.record_;
+    auto select = [&](std::uint64_t rank)
+        -> Task<absl::StatusOr<std::optional<std::string>>> {
+      if (rank == old_length) co_return appended;
+      co_return co_await Select(entries_begin, entries_end, rank);
+    };
+    auto node_at =
+        [&](std::string_view entry_key) -> Task<absl::StatusOr<std::string>> {
+      std::string wanted(entry_key);
+      wanted[0] = '\3';
+      auto previous = co_await Previous(wanted);
+      if (!previous.ok()) co_return previous.status();
+      std::optional<std::string> result;
+      if (*previous && (**previous).front() == '\3')
+        result = std::move(**previous);
+      // An append may create a new node or increment the old tail node.
+      for (const auto& change : changes) {
+        if (!change.key_.starts_with(nodes_begin) || !change.record_ ||
+            change.key_ > wanted)
+          continue;
+        auto current =
+            result ? StreamRecordKey(*result)
+                   : absl::StatusOr<std::string_view>(std::string_view{});
+        if (!current.ok()) co_return current.status();
+        if (!result || change.key_ >= *current) result = *change.record_;
+      }
+      if (!result) co_return absl::DataLossError("missing Stream trim node");
+      co_return std::move(*result);
+    };
+    std::uint64_t remove = 0;
+    if (trim.max_length_) {
+      remove = length > *trim.max_length_ ? length - *trim.max_length_ : 0;
+    } else {
+      auto count = co_await CountRange(entries_begin,
+                                       IdKey(entries_begin, trim.min_id_));
+      if (!count.ok()) co_return count.status();
+      remove = *count;
+      if (appended) {
+        auto value = StreamRecordPayload(*appended);
+        if (!value.ok()) co_return value.status();
+        if (ReadId(*value) < trim.min_id_) ++remove;
+      }
+    }
+    if (trim.approximate_ && trim.limit_ != 0)
+      remove = std::min(remove, trim.limit_);
+    if (remove > length)
+      co_return absl::DataLossError("Stream trim length mismatch");
+    std::optional<std::string> first, node;
+    if (remove < length) {
+      auto selected = co_await select(remove);
+      if (!selected.ok()) co_return selected.status();
+      if (!*selected)
+        co_return absl::DataLossError("missing Stream trim boundary");
+      first = std::move(**selected);
+      auto key = StreamRecordKey(*first);
+      if (!key.ok()) co_return key.status();
+      auto containing = co_await node_at(*key);
+      if (!containing.ok()) co_return containing.status();
+      node = std::move(*containing);
+      if (trim.approximate_ && remove != 0) {
+        auto start = StreamRecordKey(*node);
+        if (!start.ok()) co_return start.status();
+        std::string boundary(*start);
+        boundary[0] = '\1';
+        if (boundary != *key) {
+          auto count = co_await CountRange(entries_begin, boundary);
+          if (!count.ok()) co_return count.status();
+          remove = *count;
+          selected = co_await select(remove);
+          if (!selected.ok()) co_return selected.status();
+          if (!*selected)
+            co_return absl::DataLossError("missing Stream node boundary");
+          first = std::move(**selected);
+        }
+      }
+    }
+    StreamTrimResult result{.removed_ = remove, .length_ = length - remove};
+    if (first) {
+      auto value = StreamRecordPayload(*first);
+      if (!value.ok()) co_return value.status();
+      result.first_id_ = ReadId(*value);
+    }
+    if (remove == 0) co_return result;
+    std::string message_boundary = entries_end, node_boundary = nodes_end;
+    std::uint64_t remaining_nodes = 0;
+    if (first) {
+      auto key = StreamRecordKey(*first), node_key = StreamRecordKey(*node);
+      auto node_payload = StreamRecordPayload(*node);
+      if (!key.ok() || !node_key.ok() || !node_payload.ok() ||
+          node_payload->size() != 4)
+        co_return absl::DataLossError("invalid Stream trim boundary");
+      message_boundary = *key;
+      node_boundary = *node_key;
+      auto count = co_await CountRange(nodes_begin, node_boundary);
+      if (!count.ok()) co_return count.status();
+      auto all_nodes = co_await Required(entries_end);
+      if (!all_nodes.ok()) co_return all_nodes.status();
+      for (const auto& change : changes)
+        if (change.key_ == entries_end && change.record_)
+          all_nodes = *change.record_;
+      auto total = StreamRecordPayload(*all_nodes);
+      if (!total.ok() || total->size() != 4 || Count(*total) <= *count)
+        co_return absl::DataLossError("invalid Stream trim node count");
+      remaining_nodes = Count(*total) - *count;
+      std::string old_first(node_boundary);
+      old_first[0] = '\1';
+      auto preceding = co_await CountRange(entries_begin, old_first);
+      if (!preceding.ok()) co_return preceding.status();
+      const auto within = remove - *preceding;
+      if (within >= Count(*node_payload))
+        co_return absl::DataLossError("invalid partial Stream trim node");
+      if (within != 0) {
+        std::string new_key(message_boundary), count_bytes(4, '\0');
+        new_key[0] = '\3';
+        SetCount(count_bytes, 0, Count(*node_payload) - within);
+        Change(changes, node_boundary, std::nullopt);
+        Change(changes, new_key, Record(new_key, count_bytes));
+      }
+    }
+    auto status =
+        co_await EraseRange(entries_begin, message_boundary, changes, retired);
+    if (!status.ok()) co_return status;
+    status = co_await EraseRange(nodes_begin, node_boundary, changes, retired);
+    if (!status.ok()) co_return status;
+    std::string count(4, '\0');
+    SetCount(count, 0, remaining_nodes);
+    Change(changes, entries_end, Record(entries_end, count));
+    auto header = co_await Required(std::string_view("\0", 1));
+    if (!header.ok()) co_return header.status();
+    for (const auto& change : changes)
+      if (change.key_ == std::string_view("\0", 1) && change.record_)
+        header = *change.record_;
+    auto payload = StreamRecordPayload(*header);
+    if (!payload.ok() || payload->size() != 48)
+      co_return absl::DataLossError("invalid Stream trim header");
+    std::string bytes(*payload);
+    SetCount(bytes, 44, result.length_);
+    Change(changes, std::string("\0", 1),
+           Record(std::string_view("\0", 1), bytes));
+    co_return result;
+  }
   Task<absl::StatusOr<OrderedCollectionMutationPlan>> Plan(
-      std::vector<StreamRecordChange> changes, std::uint64_t length) {
+      std::vector<StreamRecordChange> changes, std::uint64_t length,
+      std::vector<std::uint64_t> retired = {}) {
     try {
       const auto& directory = object_->ordered_directory();
       const auto& groups = directory.groups();
@@ -208,7 +593,7 @@ struct StorageEngine::Impl::StreamPageAccess {
       // The returned plan owns directory-sized state through publication.
       // Keep its admission with this command's cache, beyond this coroutine.
       reservations_.push_back(std::move(*admitted));
-      if (changes.empty()) {
+      if (changes.empty() && retired.empty()) {
         // A Changed callback can intentionally publish identical metadata
         // (e.g. XGROUP SETID or replay of its exact after-state). Retain the
         // mutation/replication sequence semantics with one unchanged page.
@@ -220,11 +605,21 @@ struct StorageEngine::Impl::StreamPageAccess {
         plan.root_.revision_ = 0;
         co_return plan;
       }
+      const std::set<std::uint64_t> retired_set(retired.begin(), retired.end());
+      for (std::size_t i = 0; i < groups.size(); ++i) {
+        if (!retired_set.contains(groups[i].id_) &&
+            (retired_set.contains(groups[i].previous_) ||
+             retired_set.contains(groups[i].next_))) {
+          auto status = co_await Load(i);
+          if (!status.ok()) co_return status;
+        }
+      }
       for (auto& change : changes) {
         auto index = co_await Route(change.key_);
         if (!index.ok()) co_return index.status();
         for (auto adjacent = *index == 0 ? 0 : *index - 1;
              adjacent < std::min(*index + 2, groups.size()); ++adjacent) {
+          if (retired_set.contains(groups[adjacent].id_)) continue;
           auto status = co_await Load(adjacent);
           if (!status.ok()) co_return status;
         }
@@ -234,7 +629,7 @@ struct StorageEngine::Impl::StreamPageAccess {
       loaded.reserve(pages_.size());
       for (auto& [index, page] : pages_) loaded.push_back(std::move(page));
       co_return PlanStreamRecordChanges(directory, std::move(loaded),
-                                        std::move(changes), length);
+                                        std::move(changes), length, retired);
     } catch (const std::bad_alloc&) {
       RecordMemoryRejection();
       co_return absl::ResourceExhaustedError("OOM grouped Stream workspace");
@@ -270,10 +665,11 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
     std::string partial(*header_payload);
     SetCount(partial, 44, 0);
     partial.append(8, '\0');
-    auto update = callback(CompactValueView{
-        .encoded_ = partial,
-        .logical_size_ = 0,
-        .expire_at_ms_ = object->version().root_.expire_at_ms_});
+    auto update = callback(
+        CompactValueView{.encoded_ = partial,
+                         .logical_size_ = 0,
+                         .expire_at_ms_ = object->version().root_.expire_at_ms_,
+                         .stream_incremental_trim_ = true});
     if (!update.ok()) co_return update.status();
     if (!update->changed_) co_return absl::OkStatus();
     if (update->erase_ || update->reuse_encoded_ ||
@@ -352,7 +748,17 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
       changes.push_back({.key_ = std::string(*record_key),
                          .record_ = std::move(replacement)});
     }
-    auto plan = co_await cache.Plan(std::move(changes), length + 1);
+    std::uint64_t final_length = length + 1;
+    std::vector<std::uint64_t> retired;
+    if (update->stream_trim_) {
+      auto result = co_await cache.Trim(*update->stream_trim_, changes, retired,
+                                        final_length);
+      if (!result.ok()) co_return result.status();
+      final_length = result->length_;
+      if (update->stream_trim_complete_) update->stream_trim_complete_(*result);
+    }
+    auto plan = co_await cache.Plan(std::move(changes), final_length,
+                                    std::move(retired));
     if (!plan.ok()) co_return plan.status();
     co_return co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, object, std::move(*plan),
@@ -361,6 +767,437 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
   } catch (const std::bad_alloc&) {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("OOM grouped Stream workspace");
+  }
+}
+
+Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    TxShardWrites* tx, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
+  try {
+    StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
+    auto header = co_await cache.Required(std::string_view("\0", 1));
+    if (!header.ok()) co_return header.status();
+    auto payload = StreamRecordPayload(*header);
+    const auto length = object->ordered_directory().root().logical_size();
+    if (!payload.ok() || payload->size() != 48 || Count(*payload, 44) != length)
+      co_return absl::DataLossError("invalid Stream metadata header");
+    std::string partial(*payload);
+    SetCount(partial, 44, length != 0);
+    if (length != 0) {
+      auto last = co_await cache.Select(std::string_view("\1", 1),
+                                        std::string_view("\2", 1), length - 1);
+      if (!last.ok()) co_return last.status();
+      if (!*last) co_return absl::DataLossError("missing Stream last message");
+      auto value = StreamRecordPayload(**last);
+      if (!value.ok() || value->size() < 20)
+        co_return absl::DataLossError("invalid Stream last message");
+      partial.append(value->substr(0, 16));
+      partial.append(4, '\0');
+    }
+    const auto at = partial.size();
+    partial.resize(at + (length == 0 ? 8 : 12), '\0');
+    if (length != 0) {
+      SetCount(partial, at, 1);
+      SetCount(partial, at + 4, 1);
+    }
+    auto update = callback(
+        CompactValueView{.encoded_ = partial,
+                         .logical_size_ = length != 0,
+                         .expire_at_ms_ = object->version().root_.expire_at_ms_,
+                         .stream_length_ = length});
+    if (!update.ok()) co_return update.status();
+    if (!update->changed_) co_return absl::OkStatus();
+    if (update->erase_ || update->reuse_encoded_ ||
+        update->encoded_.size() != partial.size() ||
+        update->encoded_.substr(44) != partial.substr(44))
+      co_return absl::InvalidArgumentError(
+          "Stream metadata callback changed entries");
+    std::string bytes = update->encoded_.substr(0, 48);
+    SetCount(bytes, 44, length);
+    std::vector<StreamRecordChange> changes;
+    changes.push_back({.key_ = std::string("\0", 1),
+                       .record_ = Record(std::string_view("\0", 1), bytes)});
+    auto plan = co_await cache.Plan(std::move(changes), length);
+    if (!plan.ok()) co_return plan.status();
+    co_return co_await CommitGroupedOrderedMutationLocked(
+        store, partition, db_id, key, digest, object, std::move(*plan),
+        object->version().root_.expire_at_ms_, tx, replication,
+        mutation_precondition);
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM grouped Stream metadata");
+  }
+}
+
+Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    const StreamInspectAccess& access) {
+  try {
+    using Kind = StreamInspectAccess::Kind;
+    StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
+    StreamInspection inspection;
+    const auto length = object->ordered_directory().root().logical_size();
+    auto retain = [&](std::size_t bytes) -> absl::Status {
+      GroupedScratchBudget budget;
+      auto status = budget.AddBytes(bytes + 128);
+      if (!status.ok()) return status;
+      auto reservation = budget.Reserve(6);
+      if (!reservation.ok()) return reservation.status();
+      cache.reservations_.push_back(std::move(*reservation));
+      return absl::OkStatus();
+    };
+    auto header = co_await cache.Required(std::string_view("\0", 1));
+    if (!header.ok()) co_return header.status();
+    auto payload = StreamRecordPayload(*header);
+    if (!payload.ok() || payload->size() != 48 || Count(*payload, 44) != length)
+      co_return absl::DataLossError("invalid Stream inspection header");
+    std::string partial(*payload);
+    auto nodes = co_await cache.Required(std::string_view("\2", 1));
+    auto groups = co_await cache.Required(std::string_view("\4", 1));
+    if (!nodes.ok()) co_return nodes.status();
+    if (!groups.ok()) co_return groups.status();
+    auto node_count = StreamRecordPayload(*nodes),
+         group_count = StreamRecordPayload(*groups);
+    if (!node_count.ok() || !group_count.ok() || node_count->size() != 4 ||
+        group_count->size() != 4)
+      co_return absl::DataLossError("invalid Stream inspection counts");
+    inspection.nodes_ = Count(*node_count);
+    inspection.groups_ = Count(*group_count);
+    std::optional<std::array<std::uint64_t, 2>> first_id;
+    std::vector<std::string> entries;
+    if (length != 0) {
+      auto first = co_await cache.Select(std::string_view("\1", 1),
+                                         std::string_view("\2", 1), 0);
+      if (!first.ok()) co_return first.status();
+      if (!*first) co_return absl::DataLossError("missing Stream first entry");
+      auto value = StreamRecordPayload(**first);
+      if (!value.ok() || value->size() < 20)
+        co_return absl::DataLossError("invalid Stream first entry");
+      first_id = ReadId(*value);
+      if (access.kind_ == Kind::kStream) {
+        entries.push_back(std::move(**first));
+        if (length != 1) {
+          auto last = co_await cache.Select(
+              std::string_view("\1", 1), std::string_view("\2", 1), length - 1);
+          if (!last.ok()) co_return last.status();
+          if (!*last)
+            co_return absl::DataLossError("missing Stream last entry");
+          entries.push_back(std::move(**last));
+        }
+      } else if (access.kind_ == Kind::kFull) {
+        // Message output uses its own pinned cursor. Inspection needs only the
+        // first ID for header/lag semantics, even for FULL COUNT 0.
+        entries.push_back(std::move(**first));
+      }
+    }
+    SetCount(partial, 44, entries.size());
+    for (const auto& entry : entries) {
+      auto value = StreamRecordPayload(entry);
+      if (!value.ok()) co_return value.status();
+      partial.append(*value);
+    }
+    auto at = partial.size();
+    partial.resize(at + (entries.empty() ? 8 : 12), '\0');
+    if (!entries.empty()) {
+      SetCount(partial, at, 1);
+      SetCount(partial, at + 4, entries.size());
+    }
+    const auto group_count_offset = partial.size() - 4;
+    const bool single =
+        access.kind_ == Kind::kConsumers || access.kind_ == Kind::kPending;
+    std::string cursor =
+        single ? GroupPrefix(access.group_) : std::string(1, '\5');
+    while (access.kind_ != Kind::kStream) {
+      std::optional<std::string> selected;
+      if (single) {
+        auto found = co_await cache.Find(cursor + '\0');
+        if (!found.ok()) co_return found.status();
+        selected = std::move(*found);
+      } else {
+        auto found =
+            co_await cache.Select(cursor, std::string_view("\6", 1), 0);
+        if (!found.ok()) co_return found.status();
+        selected = std::move(*found);
+      }
+      if (!selected) break;
+      auto value = StreamRecordPayload(*selected);
+      if (!value.ok() || value->size() < 32 ||
+          Count(*value) != value->size() - 32)
+        co_return absl::DataLossError("invalid Stream inspection group");
+      std::string name(value->substr(4, Count(*value)));
+      const auto prefix = GroupPrefix(name);
+      std::string end(prefix);
+      end.back() = '\1';
+      auto status = retain(value->size());
+      if (!status.ok()) co_return status;
+      std::string group_header(*value);
+      StreamGroupSummary summary{
+          .name_ = name, .consumers_ = Count(*value, value->size() - 4)};
+      auto count = co_await cache.Required(prefix + '\2');
+      if (!count.ok()) co_return count.status();
+      auto count_value = StreamRecordPayload(*count);
+      if (!count_value.ok() || count_value->size() != 4)
+        co_return absl::DataLossError("invalid Stream inspection PEL count");
+      summary.pending_ = Count(*count_value);
+      std::vector<std::string> consumers, pending;
+      if (access.kind_ == Kind::kConsumers || access.kind_ == Kind::kFull) {
+        status =
+            co_await cache.Visit(prefix + '\1', prefix + '\2',
+                                 [&](std::string_view record) -> absl::Status {
+                                   auto value = StreamRecordPayload(record);
+                                   if (!value.ok()) return value.status();
+                                   auto admitted = retain(value->size());
+                                   if (!admitted.ok()) return admitted;
+                                   consumers.emplace_back(*value);
+                                   return absl::OkStatus();
+                                 });
+        if (!status.ok()) co_return status;
+        if (consumers.size() != summary.consumers_)
+          co_return absl::DataLossError(
+              "Stream inspection consumer count mismatch");
+      }
+      if (access.kind_ != Kind::kGroups) {
+        std::uint64_t seen = 0;
+        status = co_await cache.Visit(
+            prefix + '\3', end, [&](std::string_view record) -> absl::Status {
+              auto value = StreamRecordPayload(record);
+              if (!value.ok() || value->size() < 36 ||
+                  Count(*value, 16) != value->size() - 36)
+                return absl::DataLossError(
+                    "invalid Stream inspection pending row");
+              std::string owner(value->substr(20, Count(*value, 16)));
+              if (!summary.consumer_pending_.contains(owner)) {
+                auto admitted = retain(owner.size());
+                if (!admitted.ok()) return admitted;
+              }
+              auto& owner_count = summary.consumer_pending_[owner];
+              ++owner_count;
+              ++seen;
+              const auto id = ReadId(*value);
+              if (!summary.first_pending_) summary.first_pending_ = id;
+              summary.last_pending_ = id;
+              if (access.kind_ == Kind::kFull &&
+                  (access.count_ == 0 || seen <= access.count_ ||
+                   owner_count <= access.count_)) {
+                auto admitted = retain(value->size());
+                if (!admitted.ok()) return admitted;
+                pending.emplace_back(*value);
+              }
+              return absl::OkStatus();
+            });
+        if (!status.ok()) co_return status;
+        if (seen != summary.pending_)
+          co_return absl::DataLossError(
+              "Stream inspection pending count mismatch");
+      }
+      SetCount(group_header, group_header.size() - 4, consumers.size());
+      partial.append(group_header);
+      for (const auto& consumer : consumers) partial.append(consumer);
+      at = partial.size();
+      partial.resize(at + 4);
+      SetCount(partial, at, pending.size());
+      for (const auto& row : pending) partial.append(row);
+      inspection.summaries_.push_back(std::move(summary));
+      if (single) break;
+      cursor = std::move(end);
+      co_await bycorf::Yield(*store.worker_);
+    }
+    SetCount(partial, group_count_offset, inspection.summaries_.size());
+    auto update = callback(
+        CompactValueView{.encoded_ = partial,
+                         .logical_size_ = entries.size(),
+                         .expire_at_ms_ = object->version().root_.expire_at_ms_,
+                         .stream_length_ = length,
+                         .stream_first_id_ = first_id,
+                         .stream_inspection_ = &inspection});
+    if (!update.ok()) co_return update.status();
+    if (update->changed_)
+      co_return absl::InvalidArgumentError(
+          "Stream inspection callback mutated");
+    co_return absl::OkStatus();
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM grouped Stream inspection");
+  }
+}
+
+Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamTrimLocked(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    TxShardWrites* tx, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
+  try {
+    StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
+    auto header = co_await cache.Required(std::string_view("\0", 1));
+    if (!header.ok()) co_return header.status();
+    auto payload = StreamRecordPayload(*header);
+    const auto length = object->ordered_directory().root().logical_size();
+    if (!payload.ok() || payload->size() != 48 || Count(*payload, 44) != length)
+      co_return absl::DataLossError("invalid Stream trim header");
+    std::string partial(*payload);
+    SetCount(partial, 44, 0);
+    partial.append(8, '\0');
+    auto update = callback(
+        CompactValueView{.encoded_ = partial,
+                         .logical_size_ = 0,
+                         .expire_at_ms_ = object->version().root_.expire_at_ms_,
+                         .stream_incremental_trim_ = true});
+    if (!update.ok()) co_return update.status();
+    if (!update->changed_) co_return absl::OkStatus();
+    if (!update->stream_trim_ || update->erase_ || update->reuse_encoded_ ||
+        update->encoded_ != partial)
+      co_return absl::InvalidArgumentError("invalid incremental Stream trim");
+    std::vector<StreamRecordChange> changes;
+    std::vector<std::uint64_t> retired;
+    auto result =
+        co_await cache.Trim(*update->stream_trim_, changes, retired, length);
+    if (!result.ok()) co_return result.status();
+    if (update->stream_trim_complete_) update->stream_trim_complete_(*result);
+    if (result->removed_ == 0) co_return absl::OkStatus();
+    auto plan = co_await cache.Plan(std::move(changes), result->length_,
+                                    std::move(retired));
+    if (!plan.ok()) co_return plan.status();
+    co_return co_await CommitGroupedOrderedMutationLocked(
+        store, partition, db_id, key, digest, object, std::move(*plan),
+        object->version().root_.expire_at_ms_, tx, replication,
+        mutation_precondition);
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM grouped Stream trim");
+  }
+}
+
+Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    const StreamDeleteAccess& access, TxShardWrites* tx,
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
+  try {
+    StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
+    auto header = co_await cache.Required(std::string_view("\0", 1));
+    if (!header.ok()) co_return header.status();
+    auto payload = StreamRecordPayload(*header);
+    const auto length = object->ordered_directory().root().logical_size();
+    if (!payload.ok() || payload->size() != 48 || Count(*payload, 44) != length)
+      co_return absl::DataLossError("invalid Stream delete header");
+    std::string partial(*payload);
+    std::set<std::array<std::uint64_t, 2>> ids(access.ids_.begin(),
+                                               access.ids_.end());
+    std::set<std::string> deleted;
+    std::map<std::string, std::pair<std::uint32_t, std::uint32_t>> nodes;
+    std::vector<StreamRecordChange> changes;
+    for (const auto& id : ids) {
+      const auto entry_key = IdKey(std::string_view("\1", 1), id);
+      auto entry = co_await cache.Find(entry_key);
+      if (!entry.ok()) co_return entry.status();
+      if (!*entry) continue;
+      auto value = StreamRecordPayload(**entry);
+      if (!value.ok() || value->size() < 20)
+        co_return absl::DataLossError("invalid Stream delete entry");
+      // XDEL only needs identity, not field payloads. The synthetic view is
+      // delete-only and is checked below before any page can be published.
+      partial.append(value->substr(0, 16));
+      partial.append(4, '\0');
+      deleted.insert(entry_key);
+      changes.push_back({.key_ = entry_key, .record_ = std::nullopt});
+      auto node = co_await cache.Previous(IdKey(std::string_view("\3", 1), id));
+      if (!node.ok()) co_return node.status();
+      if (!*node || (**node).front() != '\3')
+        co_return absl::DataLossError("missing Stream delete node");
+      auto node_key = StreamRecordKey(**node);
+      auto node_value = StreamRecordPayload(**node);
+      if (!node_key.ok() || !node_value.ok() || node_value->size() != 4)
+        co_return absl::DataLossError("invalid Stream delete node");
+      auto& counts = nodes[std::string(*node_key)];
+      counts.first = Count(*node_value);
+      ++counts.second;
+    }
+    SetCount(partial, 44, deleted.size());
+    auto at = partial.size();
+    partial.resize(at + (deleted.empty() ? 8 : 12), '\0');
+    if (!deleted.empty()) {
+      SetCount(partial, at, 1);
+      SetCount(partial, at + 4, deleted.size());
+    }
+    auto update = callback(CompactValueView{
+        .encoded_ = partial,
+        .logical_size_ = deleted.size(),
+        .expire_at_ms_ = object->version().root_.expire_at_ms_});
+    if (!update.ok()) co_return update.status();
+    if (!update->changed_) co_return absl::OkStatus();
+    if (deleted.empty() || update->erase_ || update->reuse_encoded_ ||
+        update->logical_size_ != 0 || update->encoded_.size() != 56 ||
+        update->encoded_.substr(0, 20) != partial.substr(0, 20) ||
+        update->encoded_.substr(36, 8) != partial.substr(36, 8) ||
+        update->encoded_.substr(44) != std::string(12, '\0'))
+      co_return absl::InvalidArgumentError("invalid partial Stream deletion");
+    auto node_count = co_await cache.Required(std::string_view("\2", 1));
+    if (!node_count.ok()) co_return node_count.status();
+    auto count_payload = StreamRecordPayload(*node_count);
+    if (!count_payload.ok() || count_payload->size() != 4)
+      co_return absl::DataLossError("invalid Stream node count");
+    auto remaining_nodes = Count(*count_payload);
+    for (const auto& [node_key, counts] : nodes) {
+      const auto [live, removed] = counts;
+      if (removed > live || remaining_nodes == 0)
+        co_return absl::DataLossError("Stream delete node count mismatch");
+      std::string next_key = node_key;
+      if (removed == live) {
+        --remaining_nodes;
+        changes.push_back({.key_ = node_key, .record_ = std::nullopt});
+        continue;
+      }
+      std::string first_key = node_key;
+      first_key[0] = '\1';
+      if (deleted.contains(first_key)) {
+        auto next = co_await cache.Scan(first_key, std::string_view("\2", 1),
+                                        deleted.size() + 1, true);
+        if (!next.ok()) co_return next.status();
+        bool found = false;
+        for (const auto& record : *next) {
+          auto candidate = StreamRecordKey(record);
+          if (!candidate.ok()) co_return candidate.status();
+          if (deleted.contains(std::string(*candidate))) continue;
+          next_key = *candidate;
+          next_key[0] = '\3';
+          found = true;
+          break;
+        }
+        if (!found)
+          co_return absl::DataLossError("missing surviving Stream ID");
+        changes.push_back({.key_ = node_key, .record_ = std::nullopt});
+      }
+      std::string count(4, '\0');
+      SetCount(count, 0, live - removed);
+      changes.push_back({.key_ = next_key, .record_ = Record(next_key, count)});
+    }
+    std::string count(4, '\0');
+    SetCount(count, 0, remaining_nodes);
+    changes.push_back({.key_ = std::string("\2", 1),
+                       .record_ = Record(std::string_view("\2", 1), count)});
+    std::string new_header = update->encoded_.substr(0, 48);
+    SetCount(new_header, 44, length - deleted.size());
+    changes.push_back(
+        {.key_ = std::string("\0", 1),
+         .record_ = Record(std::string_view("\0", 1), new_header)});
+    auto plan =
+        co_await cache.Plan(std::move(changes), length - deleted.size());
+    if (!plan.ok()) co_return plan.status();
+    co_return co_await CommitGroupedOrderedMutationLocked(
+        store, partition, db_id, key, digest, object, std::move(*plan),
+        object->version().root_.expire_at_ms_, tx, replication,
+        mutation_precondition);
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM grouped Stream deletion");
   }
 }
 
@@ -466,7 +1303,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedHashObject::Handle object, const CompactValueCallback& callback,
-    const StreamGroupAccess& access, TxShardWrites* tx,
+    const StreamGroupAccess& access, bool read_only, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
   try {
@@ -498,11 +1335,39 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
       const auto last_id =
           ReadId(payload->substr(4 + access.group_.size(), 16));
       if (access.read_new_count_) {
-        auto selected = co_await cache.Scan(
-            IdKey(std::string_view("\1", 1), last_id),
-            std::string_view("\2", 1), *access.read_new_count_, true);
-        if (!selected.ok()) co_return selected.status();
-        entries = std::move(*selected);
+        if (access.entry_ids_only_) {
+          auto status = co_await cache.Visit(
+              IdKey(std::string_view("\1", 1), last_id),
+              std::string_view("\2", 1),
+              [&](std::string_view record) -> absl::Status {
+                auto payload = StreamRecordPayload(record);
+                if (!payload.ok() || payload->size() < 20)
+                  return absl::DataLossError("invalid delivery message");
+                const auto id = ReadId(*payload);
+                if (id <= last_id) return absl::OkStatus();
+                if (entries.size() == *access.read_new_count_)
+                  return absl::OutOfRangeError("delivery window complete");
+                auto charge = TryReserveMemory(512);
+                if (!charge)
+                  return absl::ResourceExhaustedError(
+                      "OOM Stream delivery IDs");
+                cache.reservations_.push_back(std::move(*charge));
+                std::string value(payload->substr(0, 16));
+                value.append(12, '\0');
+                SetCount(value, 16, 2);  // Valid placeholder field/value pair;
+                                         // fields are immutable.
+                entries.push_back(
+                    Record(IdKey(std::string_view("\1", 1), id), value));
+                return absl::OkStatus();
+              });
+          if (!status.ok() && !absl::IsOutOfRange(status)) co_return status;
+        } else {
+          auto selected = co_await cache.Scan(
+              IdKey(std::string_view("\1", 1), last_id),
+              std::string_view("\2", 1), *access.read_new_count_, true);
+          if (!selected.ok()) co_return selected.status();
+          entries = std::move(*selected);
+        }
         for (const auto& entry : entries) {
           auto value = StreamRecordPayload(entry);
           if (!value.ok() || value->size() < 20)
@@ -535,6 +1400,55 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
       if (!count_payload.ok() || count_payload->size() != 4)
         co_return absl::DataLossError("invalid partial Stream PEL count");
       total_pending = Count(*count_payload);
+      if (access.pending_scan_) {
+        auto selected =
+            co_await cache.ScanPending(prefix, *access.pending_scan_);
+        if (!selected.ok()) co_return selected.status();
+        for (const auto& row : *selected) {
+          auto payload = StreamRecordPayload(row);
+          if (!payload.ok()) co_return payload.status();
+          const auto id = ReadId(*payload);
+          pending_ids.insert(id);
+          if (access.pending_scan_->load_entries_) {
+            auto entry =
+                co_await cache.Find(IdKey(std::string_view("\1", 1), id));
+            if (!entry.ok()) co_return entry.status();
+            if (*entry) {
+              if (access.entry_ids_only_) {
+                auto payload = StreamRecordPayload(**entry);
+                if (!payload.ok() || payload->size() < 20)
+                  co_return absl::DataLossError("invalid history entry");
+                auto charge = TryReserveMemory(512);
+                if (!charge)
+                  co_return absl::ResourceExhaustedError(
+                      "OOM Stream history IDs");
+                cache.reservations_.push_back(std::move(*charge));
+                std::string value(payload->substr(0, 16));
+                value.append(12, '\0');
+                SetCount(value, 16, 2);  // Valid placeholder field/value pair;
+                                         // fields are immutable.
+                entries.push_back(
+                    Record(IdKey(std::string_view("\1", 1), id), value));
+                // ID probes must not accumulate the immutable message bodies
+                // while planning mutations to a separate PEL key range.
+                for (auto page = cache.pages_.begin();
+                     page != cache.pages_.end();) {
+                  const auto& rows = page->second.snapshot_.entries_;
+                  auto first = StreamRecordKey(rows.front().value_),
+                       last = StreamRecordKey(rows.back().value_);
+                  if (first.ok() && last.ok() && first->front() == '\1' &&
+                      last->front() == '\1') {
+                    cache.page_reservations_.erase(page->first);
+                    page = cache.pages_.erase(page);
+                  } else
+                    ++page;
+                }
+              } else
+                entries.push_back(std::move(**entry));
+            }
+          }
+        }
+      }
       for (const auto& id : pending_ids) {
         const auto pending_key = IdKey(prefix + '\3', id);
         allowed.insert(pending_key);
@@ -617,10 +1531,44 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
         .stream_first_id_ = first_id});
     if (!update.ok()) co_return update.status();
     if (!update->changed_) co_return absl::OkStatus();
-    if (!*group || update->erase_ || update->reuse_encoded_ ||
+    if (read_only || update->erase_ || update->reuse_encoded_ ||
         update->logical_size_ != entries.size())
       co_return absl::InvalidArgumentError(
           "partial Stream group changed key/entries");
+    if (access.destroy_) {
+      std::string empty(*header_payload);
+      SetCount(empty, 44, 0);
+      empty.append(8, '\0');
+      if (!entries.empty() || update->encoded_ != empty)
+        co_return absl::InvalidArgumentError(
+            "invalid Stream group destruction");
+      if (!*group) co_return absl::OkStatus();
+      std::vector<StreamRecordChange> changes;
+      std::vector<std::uint64_t> retired;
+      std::string end(prefix);
+      end.back() = '\1';
+      auto status = co_await cache.EraseRange(prefix, end, changes, retired);
+      if (!status.ok()) co_return status;
+      auto count_record = co_await cache.Required(std::string_view("\4", 1));
+      if (!count_record.ok()) co_return count_record.status();
+      auto payload = StreamRecordPayload(*count_record);
+      if (!payload.ok() || payload->size() != 4 || Count(*payload) == 0)
+        co_return absl::DataLossError("invalid Stream group count");
+      std::string count(4, '\0');
+      SetCount(count, 0, Count(*payload) - 1);
+      changes.push_back({.key_ = std::string("\4", 1),
+                         .record_ = Record(std::string_view("\4", 1), count)});
+      auto plan = co_await cache.Plan(
+          std::move(changes), object->ordered_directory().root().logical_size(),
+          std::move(retired));
+      if (!plan.ok()) co_return plan.status();
+      co_return co_await CommitGroupedOrderedMutationLocked(
+          store, partition, db_id, key, digest, object, std::move(*plan),
+          object->version().root_.expire_at_ms_, tx, replication,
+          mutation_precondition);
+    }
+    if (!*group && !access.create_)
+      co_return absl::InvalidArgumentError("partial Stream group was created");
     auto before = DecodeStreamRecords(partial, entries.size());
     auto after = DecodeStreamRecords(update->encoded_, entries.size());
     if (!before.ok()) co_return before.status();
@@ -657,8 +1605,27 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
     std::string group_payload(*new_group), count_payload(*new_count);
     SetCount(group_payload, group_payload.size() - 4, new_consumers);
     SetCount(count_payload, 0, new_pending);
-    old_records[group_key] = std::move(original_group);
-    old_records[count_key] = std::move(original_count);
+    if (*group) {
+      old_records[group_key] = std::move(original_group);
+      old_records[count_key] = std::move(original_count);
+    } else {
+      allowed.insert(std::string("\4", 1));
+      for (const auto& name : access.consumers_)
+        allowed.insert(ConsumerKey(prefix, name));
+      for (const auto& id : access.pending_ids_)
+        allowed.insert(IdKey(prefix + '\3', id));
+      auto count_record = co_await cache.Required(std::string_view("\4", 1));
+      if (!count_record.ok()) co_return count_record.status();
+      auto payload = StreamRecordPayload(*count_record);
+      if (!payload.ok() || payload->size() != 4 ||
+          Count(*payload) == UINT32_MAX)
+        co_return absl::DataLossError("invalid Stream group count");
+      std::string count(4, '\0');
+      SetCount(count, 0, Count(*payload) + 1);
+      old_records[std::string("\4", 1)] = std::move(*count_record);
+      new_records[std::string("\4", 1)] =
+          Record(std::string_view("\4", 1), count);
+    }
     new_records[group_key] = Record(group_key, group_payload);
     new_records[count_key] = Record(count_key, count_payload);
     std::vector<StreamRecordChange> changes;
@@ -679,8 +1646,26 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
             "partial Stream group inserted unloaded state");
       changes.push_back({.key_ = record_key, .record_ = std::move(value)});
     }
+    std::vector<std::uint64_t> retired;
+    if (access.remove_consumer_) {
+      const auto consumer_key = ConsumerKey(prefix, *access.remove_consumer_);
+      if (new_records.contains(consumer_key) ||
+          !old_records.contains(consumer_key))
+        co_return absl::InvalidArgumentError("invalid Stream consumer removal");
+      auto removed = co_await cache.ErasePendingConsumer(
+          prefix, *access.remove_consumer_, changes, retired);
+      if (!removed.ok()) co_return removed.status();
+      if (*removed > total_pending)
+        co_return absl::DataLossError("Stream consumer removal count mismatch");
+      std::string count(4, '\0');
+      SetCount(count, 0, total_pending - *removed);
+      StreamPageAccess::Change(changes, count_key, Record(count_key, count));
+      if (update->stream_pending_removed_)
+        update->stream_pending_removed_(*removed);
+    }
     auto plan = co_await cache.Plan(
-        std::move(changes), object->ordered_directory().root().logical_size());
+        std::move(changes), object->ordered_directory().root().logical_size(),
+        std::move(retired));
     if (!plan.ok()) co_return plan.status();
     co_return co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, object, std::move(*plan),

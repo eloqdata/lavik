@@ -202,6 +202,24 @@ def grouped_streams(root):
             H.wait_until("grouped Stream delivery/ACK/claim replay", 30,
                          lambda: state(reader) == expected)
             assert reader.call("XLEN", key) == 501
+            # Group creation and deletion must use sparse replay after FULL too.
+            assert writer.call("XGROUP", "CREATE", key, "later", "$") == "OK"
+            assert writer.call("XGROUP", "DESTROY", key, "later") == 1
+            assert writer.call("XDEL", key, "2-0", "2-0", "500-0") == 2
+            writer.call("XAUTOCLAIM", key, "g", "b", 0, "0", "COUNT", 10)
+            assert writer.call("XGROUP", "DELCONSUMER", key, "g", "a") > 0
+            writer.call("XADD", key, "MAXLEN", "~", 450, "LIMIT", 1000,
+                        "502-0", "f", "trimmed")
+            writer.call("XTRIM", key, "MAXLEN", "~", 350, "LIMIT", 1000)
+            expected = state(writer)
+            H.wait_until("grouped delete/consumer/approximate-trim replay", 30,
+                         lambda: state(reader) == expected)
+            writer.call("XADD", "{native-stream}compact", "MAXLEN", "~", 0,
+                        "LIMIT", 1, "1-0", "f", "v")
+            H.wait_until("compact approximate LIMIT replay", 30,
+                         lambda: reader.call("TYPE", "{native-stream}compact") == "stream"
+                         and reader.call("XLEN", "{native-stream}compact") == 0)
+
             writer.call("XTRIM", key, "MAXLEN", 0)
             expected = state(writer)
             H.wait_until("empty grouped Stream keeps replicated PEL", 30,

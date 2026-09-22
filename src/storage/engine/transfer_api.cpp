@@ -16,13 +16,14 @@
 
 #include "impl.h"
 #include "lavik/storage/detail/grouped_scratch.h"
+#include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
 
 Task<absl::StatusOr<TransferValue>>
-StorageEngine::Impl::ReadValueForTransferLocked(std::uint8_t db_id,
-                                                std::string_view key,
-                                                const Digest& digest) {
+StorageEngine::Impl::ReadValueForTransferLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    std::optional<StreamRangeAccess> stream_range) {
   try {
     // Only the callback escapes this coroutine. Its shared owner pins the exact
     // source graph, so RENAME may delete the source on another shard while the
@@ -38,6 +39,54 @@ StorageEngine::Impl::ReadValueForTransferLocked(std::uint8_t db_id,
       HashGroupMap<std::uint64_t>::const_iterator hash_cursor_;
       std::size_t cursor_ = 0;
       std::uint64_t emitted_ = 0;
+      std::optional<StreamRangeAccess> range_;
+      std::string first_, last_;
+      std::size_t first_page_ = 0, end_page_ = 0;
+      std::uint64_t range_count_ = 0;
+
+      // Locate a logical rank with O(log pages) admitted probes. Interior page
+      // cardinalities come from the immutable directory, not payload scans.
+      static Task<absl::StatusOr<std::pair<std::size_t, std::uint64_t>>> Bound(
+          Impl* engine, Source& source, std::string_view key, bool upper) {
+        const auto object = source.saved_.grouped_;
+        const auto& groups = object->ordered_directory().groups();
+        std::size_t lo = 0, hi = groups.size();
+        std::size_t index = groups.size(), offset = 0;
+        while (lo < hi) {
+          const auto mid = lo + (hi - lo) / 2;
+          const HashGroupId id{groups[mid].id_, 0};
+          const auto* physical = object->FindGroup(id);
+          if (!physical)
+            co_return absl::DataLossError("missing Stream range page");
+          GroupedScratchBudget budget;
+          auto status = budget.AddGroup(
+              physical->value_, object->ExtentsFor(id), source.key_.size());
+          if (!status.ok()) co_return status;
+          auto admission = budget.Reserve(1);
+          if (!admission.ok()) co_return admission.status();
+          auto page = co_await engine->LoadOrderedGroupSnapshot(
+              *source.store_, *source.partition_, source.db_id_, source.key_,
+              source.digest_, object, id.prefix_, true);
+          if (!page.ok()) co_return page.status();
+          const auto& entries = page->snapshot_.entries_;
+          std::size_t at = 0;
+          for (; at < entries.size(); ++at) {
+            auto entry_key = StreamRecordKey(entries[at].value_);
+            if (!entry_key.ok()) co_return entry_key.status();
+            if (upper ? *entry_key > key : *entry_key >= key) break;
+          }
+          if (at == entries.size())
+            lo = mid + 1;
+          else {
+            hi = mid;
+            index = mid;
+            offset = at;
+          }
+        }
+        std::uint64_t rank = offset;
+        for (std::size_t i = 0; i < index; ++i) rank += groups[i].item_count_;
+        co_return std::pair{index, rank};
+      }
       bool done_ = false;
       bool reading_ = false;
 
@@ -95,12 +144,35 @@ StorageEngine::Impl::ReadValueForTransferLocked(std::uint8_t db_id,
           } read_guard{source->reading_};
           source->reading_ = true;
           const auto object = source->saved_.grouped_;
+          if (source->range_ && source->range_count_ == 0) {
+            source->done_ = true;
+            co_return CollectionPage{.value_type_ = ValueType::kStream,
+                                     .done_ = true};
+          }
           HashGroupId id;
           if (object->is_ordered()) {
             if (source->cursor_ >= object->ordered_directory().groups().size())
               co_return absl::DataLossError(
                   "collection transfer cursor overflow");
-            id = {object->ordered_directory().groups()[source->cursor_].id_, 0};
+            const auto& groups = object->ordered_directory().groups();
+            auto index = source->range_
+                             ? (source->range_->reverse_
+                                    ? source->end_page_ - 1 - source->cursor_
+                                    : source->first_page_ + source->cursor_)
+                             : source->cursor_;
+            if (source->range_ && !source->range_->selected_ids_.empty()) {
+              std::string wanted(1, '\1');
+              for (auto part : source->range_->selected_ids_[source->emitted_])
+                for (unsigned i = 8; i != 0; --i)
+                  wanted.push_back(part >> ((i - 1) * 8));
+              auto bound = co_await Bound(engine, *source, wanted, false);
+              if (!bound.ok()) co_return bound.status();
+              index = bound->first;
+              if (index >= groups.size())
+                co_return absl::DataLossError(
+                    "missing selected Stream message");
+            }
+            id = {groups[index].id_, 0};
           } else {
             if (source->hash_cursor_ == object->directory().groups().end())
               co_return absl::DataLossError(
@@ -128,16 +200,51 @@ StorageEngine::Impl::ReadValueForTransferLocked(std::uint8_t db_id,
             if (page.value_type_ == ValueType::kList ||
                 page.value_type_ == ValueType::kStream) {
               page.elements_.reserve(count);
-              for (auto& entry : loaded->snapshot_.entries_)
+              if (source->range_ && source->range_->reverse_)
+                std::reverse(loaded->snapshot_.entries_.begin(),
+                             loaded->snapshot_.entries_.end());
+              for (auto& entry : loaded->snapshot_.entries_) {
+                if (source->range_) {
+                  auto key = StreamRecordKey(entry.value_);
+                  if (!key.ok()) co_return key.status();
+                  const auto& range = *source->range_;
+                  if ((range.first_exclusive_ ? *key <= source->first_
+                                              : *key < source->first_) ||
+                      (range.last_exclusive_ ? *key >= source->last_
+                                             : *key > source->last_))
+                    continue;
+                  if (!range.selected_ids_.empty()) {
+                    if (key->size() != 17) continue;
+                    std::array<std::uint64_t, 2> id{};
+                    for (unsigned part = 0; part < 2; ++part)
+                      for (unsigned byte = 0; byte < 8; ++byte)
+                        id[part] =
+                            (id[part] << 8) | static_cast<unsigned char>(
+                                                  (*key)[1 + part * 8 + byte]);
+                    if (!std::binary_search(range.selected_ids_.begin(),
+                                            range.selected_ids_.end(), id))
+                      continue;
+                  }
+                  if (page.elements_.size() ==
+                      source->range_count_ - source->emitted_)
+                    break;
+                }
                 page.elements_.push_back(std::move(entry.value_));
+              }
             } else {
               page.scored_members_.reserve(count);
               for (auto& entry : loaded->snapshot_.entries_)
                 page.scored_members_.push_back(
                     {std::move(entry.value_), entry.score_});
             }
-            page.done_ = source->cursor_ + 1 ==
-                         object->ordered_directory().groups().size();
+            page.done_ =
+                source->range_
+                    ? (page.size() == source->range_count_ - source->emitted_ ||
+                       (source->range_->selected_ids_.empty() &&
+                        source->cursor_ + 1 ==
+                            source->end_page_ - source->first_page_))
+                    : source->cursor_ + 1 ==
+                          object->ordered_directory().groups().size();
           } else {
             auto loaded = co_await engine->LoadHashGroupSnapshot(
                 *source->store_, *source->partition_, source->db_id_,
@@ -167,7 +274,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(std::uint8_t db_id,
             co_return absl::CancelledError(
                 "collection transfer population changed");
           const auto total =
-              object->is_ordered()
+              source->range_ ? source->range_count_
+              : object->is_ordered()
                   ? object->ordered_directory().root().item_count_
                   : source->saved_.location_.logical_size_;
           if (source->emitted_ > total ||
@@ -227,7 +335,14 @@ StorageEngine::Impl::ReadValueForTransferLocked(std::uint8_t db_id,
           std::numeric_limits<std::size_t>::max() - sizeof(Source) - 256)
         co_return absl::ResourceExhaustedError(
             "collection transfer metadata overflow");
-      const auto budget = sizeof(Source) + key.size() + 256;
+      const auto selected_bytes = stream_range
+                                      ? stream_range->selected_ids_.size() *
+                                            sizeof(std::array<std::uint64_t, 2>)
+                                      : 0;
+      if (selected_bytes > SIZE_MAX - sizeof(Source) - key.size() - 256)
+        co_return absl::ResourceExhaustedError(
+            "Stream selection size overflow");
+      const auto budget = sizeof(Source) + key.size() + 256 + selected_bytes;
       auto admission = TryReserveMemory(budget);
       if (!admission) {
         RecordMemoryRejection();
@@ -249,6 +364,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(std::uint8_t db_id,
       source->key_ = key;
       source->db_id_ = db_id;
       source->digest_ = digest;
+      if (location.value_type() == ValueType::kStream)
+        source->range_ = stream_range;
       source->saved_.location_ = location;
       source->saved_.extents_ = ExtentsFor(store, *found);
       source->saved_.grouped_ = std::move(*object);
@@ -275,8 +392,40 @@ StorageEngine::Impl::ReadValueForTransferLocked(std::uint8_t db_id,
       if (!source->saved_.grouped_->is_ordered())
         source->hash_cursor_ =
             source->saved_.grouped_->directory().groups().begin();
+      if (source->range_) {
+        const auto& range = *source->range_;
+        const auto make_key = [](const std::array<std::uint64_t, 2>& id) {
+          std::string key(1, '\1');
+          for (auto part : id)
+            for (unsigned i = 8; i != 0; --i)
+              key.push_back(part >> ((i - 1) * 8));
+          return key;
+        };
+        source->first_ = make_key(range.first_);
+        source->last_ = make_key(range.last_);
+        if (range.count_ && range.first_ <= range.last_) {
+          auto first = co_await Source::Bound(this, *source, source->first_,
+                                              range.first_exclusive_);
+          if (!first.ok()) co_return first.status();
+          auto end = co_await Source::Bound(this, *source, source->last_,
+                                            !range.last_exclusive_);
+          if (!end.ok()) co_return end.status();
+          source->first_page_ = first->first;
+          source->end_page_ = std::min(
+              end->first + 1,
+              source->saved_.grouped_->ordered_directory().groups().size());
+          source->range_count_ =
+              range.selected_ids_.empty()
+                  ? std::min(range.count_, end->second > first->second
+                                               ? end->second - first->second
+                                               : 0)
+                  : std::min<std::uint64_t>(range.count_,
+                                            range.selected_ids_.size());
+        }
+      }
       TransferValue result;
-      result.metadata_.logical_size_ = location.logical_size_;
+      result.metadata_.logical_size_ =
+          source->range_ ? source->range_count_ : location.logical_size_;
       result.metadata_.expire_at_ms_ = location.expire_at_ms_;
       result.metadata_.value_type_ = location.value_type();
       result.reader_ = [this, source] { return Source::Read(this, source); };
@@ -305,8 +454,9 @@ Task<absl::Status> StorageEngine::Impl::WriteValueForTransferLocked(
 }
 
 Task<absl::StatusOr<TransferValue>> StorageEngine::ReadValueForTransferLocked(
-    std::uint8_t db_id, std::string_view key, const Digest& digest) {
-  return impl_->ReadValueForTransferLocked(db_id, key, digest);
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    std::optional<StreamRangeAccess> stream_range) {
+  return impl_->ReadValueForTransferLocked(db_id, key, digest, stream_range);
 }
 
 Task<absl::Status> StorageEngine::WriteValueForTransferLocked(

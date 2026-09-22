@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -793,6 +794,20 @@ struct HashResult {
 // sets and Streams use this generic callback path. The callback runs while the
 // key's exclusive/shared intent
 // lock is held, making a decode/modify/encode cycle one atomic Redis command.
+// Derived inspection counts accompany a partial image. They are never encoded
+// as replacement group contents and are borrowed only during the callback.
+struct StreamGroupSummary {
+  std::string name_;
+  std::uint64_t consumers_ = 0;
+  std::uint64_t pending_ = 0;
+  std::optional<std::array<std::uint64_t, 2>> first_pending_, last_pending_;
+  std::map<std::string, std::uint64_t> consumer_pending_;
+};
+struct StreamInspection {
+  std::uint64_t nodes_ = 0, groups_ = 0;
+  std::vector<StreamGroupSummary> summaries_;
+};
+
 struct CompactValueView {
   std::string_view encoded_;
   std::uint64_t logical_size_ = 0;
@@ -800,6 +815,23 @@ struct CompactValueView {
   // Partial Stream group views retain global length/first-ID for lag estimates.
   std::optional<std::uint64_t> stream_length_ = std::nullopt;
   std::optional<std::array<std::uint64_t, 2>> stream_first_id_ = std::nullopt;
+  // Trimming is planned by storage against the complete logical graph after
+  // the callback validates syntax and, for XADD, selects the new message ID.
+  bool stream_incremental_trim_ = false;
+  const StreamInspection* stream_inspection_ = nullptr;
+};
+
+struct StreamTrimRequest {
+  std::optional<std::uint64_t> max_length_;
+  std::array<std::uint64_t, 2> min_id_{};
+  bool approximate_ = false;
+  std::uint64_t limit_ = 0;
+};
+
+struct StreamTrimResult {
+  std::uint64_t removed_ = 0;
+  std::uint64_t length_ = 0;
+  std::optional<std::array<std::uint64_t, 2>> first_id_;
 };
 
 struct CompactValueUpdate {
@@ -812,6 +844,14 @@ struct CompactValueUpdate {
   std::uint64_t logical_size_ = 0;
   // nullopt preserves the current deadline (or persistence for a new key).
   std::optional<std::uint64_t> expire_at_ms_;
+  std::optional<StreamTrimRequest> stream_trim_;
+  // Called once after planning, before publication, to canonicalize replication
+  // and the reply from the exact boundary. It must not access storage;
+  // allocation failure aborts planning before any publication.
+  std::function<void(const StreamTrimResult&)> stream_trim_complete_;
+  // DELCONSUMER receives its removed PEL cardinality after storage has scanned
+  // and planned the selected consumer's removals, before publishing the root.
+  std::function<void(std::uint64_t)> stream_pending_removed_;
 };
 
 // Inclusive/exclusive 128-bit ID bounds for a read-only Stream callback. The
@@ -823,12 +863,31 @@ struct StreamRangeAccess {
   bool first_exclusive_ = false;
   bool last_exclusive_ = false;
   bool reverse_ = false;
+  // Pinned reply sources may select sorted, unique IDs known to exist under
+  // the caller's intent. Empty means an ordinary contiguous ID range.
+  std::vector<std::array<std::uint64_t, 2>> selected_ids_;
+};
+
+// A writable callback sees only the named messages and may remove them. Storage
+// maintains their logical node boundaries; consumer groups and PEL are omitted.
+struct StreamDeleteAccess {
+  std::vector<std::array<std::uint64_t, 2>> ids_{};
 };
 
 // A writable callback may only remove the named pending IDs in this group.
 struct StreamAckAccess {
   std::string group_;
   std::vector<std::array<std::uint64_t, 2>> ids_{};
+};
+
+// PEL scans seek by ID and retain only matching rows. Pending-history reads
+// additionally load the corresponding messages; deleted messages stay absent.
+struct StreamPendingAccess {
+  StreamRangeAccess range_;
+  std::optional<std::string> consumer_;
+  std::uint64_t min_idle_ms_ = 0;
+  std::uint64_t now_ms_ = 0;
+  bool load_entries_ = false;
 };
 
 // A writable callback may update only this group's header, named consumers and
@@ -840,6 +899,20 @@ struct StreamGroupAccess {
   std::vector<std::array<std::uint64_t, 2>> pending_ids_{};
   std::vector<std::array<std::uint64_t, 2>> entry_ids_{};
   std::optional<std::uint64_t> read_new_count_ = std::nullopt;
+  std::optional<StreamPendingAccess> pending_scan_;
+  // Delivery callbacks need IDs/counters, while replies read immutable fields
+  // through a pinned range source after publication under the same key intent.
+  bool entry_ids_only_ = false;
+  bool create_ = false;
+  bool destroy_ = false;
+  std::optional<std::string> remove_consumer_;
+};
+
+struct StreamInspectAccess {
+  enum class Kind { kStream, kFull, kGroups, kConsumers, kPending };
+  Kind kind_ = Kind::kStream;
+  std::string group_;
+  std::uint64_t count_ = 10;  // Zero requests all output records.
 };
 
 // Select at most one access contract. Compact values still supply a complete
@@ -849,7 +922,11 @@ struct StreamGroupAccess {
 struct CompactAccessOptions {
   std::optional<std::uint32_t> stream_append_node_max_entries_ = std::nullopt;
   bool metadata_only_ = false;
+  bool stream_trim_ = false;
+  bool stream_header_ = false;
+  std::optional<StreamInspectAccess> stream_inspect_;
   std::optional<StreamRangeAccess> stream_range_ = std::nullopt;
+  std::optional<StreamDeleteAccess> stream_delete_ = std::nullopt;
   std::optional<StreamAckAccess> stream_ack_ = std::nullopt;
   std::optional<StreamGroupAccess> stream_group_ = std::nullopt;
 };
@@ -1559,8 +1636,12 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key, const Digest& digest);
   bycorf::Task<absl::StatusOr<RawValue>> ReadRawValue(std::uint8_t db_id,
                                                       std::string_view key);
+  // Captures a graph under the caller's key intent. The returned reader pins
+  // that version until released. A Stream range selects message records and
+  // reports its selected cardinality; other types ignore the range argument.
   bycorf::Task<absl::StatusOr<TransferValue>> ReadValueForTransferLocked(
-      std::uint8_t db_id, std::string_view key, const Digest& digest);
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      std::optional<StreamRangeAccess> stream_range = std::nullopt);
   bycorf::Task<absl::Status> WriteValueForTransferLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const TransferValue& value, TxShardWrites* tx = nullptr,

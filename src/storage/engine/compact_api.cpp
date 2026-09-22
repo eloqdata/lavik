@@ -83,16 +83,20 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   }
 
   const unsigned contracts =
-      access.metadata_only_ +
+      access.metadata_only_ + access.stream_trim_ + access.stream_header_ +
+      access.stream_inspect_.has_value() +
       access.stream_append_node_max_entries_.has_value() +
       access.stream_range_.has_value() + access.stream_ack_.has_value() +
-      access.stream_group_.has_value();
+      access.stream_group_.has_value() + access.stream_delete_.has_value();
   if (contracts > 1 ||
       (contracts != 0 && !access.metadata_only_ &&
        value_type != ValueType::kStream) ||
-      ((access.metadata_only_ || access.stream_range_) && !read_only) ||
+      ((access.metadata_only_ || access.stream_range_ ||
+        access.stream_inspect_) &&
+       !read_only) ||
       ((access.stream_append_node_max_entries_ || access.stream_ack_ ||
-        access.stream_group_) &&
+        access.stream_delete_ || access.stream_trim_ ||
+        access.stream_header_) &&
        read_only))
     co_return absl::InvalidArgumentError(
         "incompatible compact callback access contracts");
@@ -181,11 +185,41 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       co_return absl::OkStatus();
     }
     if (grouped && access.stream_group_) {
-      if (read_only || value_type != ValueType::kStream)
+      if (value_type != ValueType::kStream)
         co_return absl::InvalidArgumentError("invalid Stream group access");
       co_return co_await ExecuteGroupedStreamGroupLocked(
           store, partition, db_id, key, digest, grouped, callback,
-          *access.stream_group_, tx, replication, mutation_precondition);
+          *access.stream_group_, read_only, tx, replication,
+          mutation_precondition);
+    }
+    if (grouped && access.stream_inspect_) {
+      if (!read_only || value_type != ValueType::kStream)
+        co_return absl::InvalidArgumentError(
+            "invalid Stream inspection access");
+      co_return co_await ExecuteGroupedStreamInspect(
+          store, partition, db_id, key, digest, grouped, callback,
+          *access.stream_inspect_);
+    }
+    if (grouped && access.stream_header_) {
+      if (read_only || value_type != ValueType::kStream)
+        co_return absl::InvalidArgumentError("invalid Stream header access");
+      co_return co_await ExecuteGroupedStreamHeaderLocked(
+          store, partition, db_id, key, digest, grouped, callback, tx,
+          replication, mutation_precondition);
+    }
+    if (grouped && access.stream_trim_) {
+      if (read_only || value_type != ValueType::kStream)
+        co_return absl::InvalidArgumentError("invalid Stream trim access");
+      co_return co_await ExecuteGroupedStreamTrimLocked(
+          store, partition, db_id, key, digest, grouped, callback, tx,
+          replication, mutation_precondition);
+    }
+    if (grouped && access.stream_delete_) {
+      if (read_only || value_type != ValueType::kStream)
+        co_return absl::InvalidArgumentError("invalid Stream delete access");
+      co_return co_await ExecuteGroupedStreamDeleteLocked(
+          store, partition, db_id, key, digest, grouped, callback,
+          *access.stream_delete_, tx, replication, mutation_precondition);
     }
     if (grouped && access.stream_ack_) {
       if (read_only || value_type != ValueType::kStream)

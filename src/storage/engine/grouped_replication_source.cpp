@@ -329,7 +329,6 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
                                 location.value_type() == ValueType::kSet
                             ? 32
                             : 8;
-  if (location.value_type() == ValueType::kStream) bytes = 0;
   while (!stream->pages_done_) {
     auto page = co_await NextFullSyncCollectionPage(stream);
     if (!page.ok()) co_return page.status();

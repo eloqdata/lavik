@@ -824,7 +824,10 @@ and `commit` frames. Grouped sources pin an immutable root and its complete
 group graph, measure the compact wire length page by page, and traverse the
 same graph again to emit chunks. Source state retains one admitted decoded
 page; completion and cancellation release the graph only after active reads
-have finished. These source-local handles do not change the wire format.
+have finished. These source-local handles do not enter the wire format. Grouped Streams use
+portable `LSR1` length-framed logical records rather than a whole `LXS1` image;
+compatible peers decode those records incrementally with the same ingest
+transaction and complete-sequence validation contract.
 Non-collection targets reserve key plus encoded-value
 staging capacity from their worker-local memory share. Hash, Set, List and
 Sorted Set targets instead decode the same compact wire image incrementally,
