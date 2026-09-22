@@ -175,7 +175,9 @@ git -C bycorf submodule update --init third_party/liburing third_party/abseil \
 git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
 cmake -S . -B build-dpdk-net -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLAVIK_ENABLE_OPT=OFF \
-  -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+  -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+  -DBYCORF_SPDK_C_COMPILER=gcc-13 \
+  -DBYCORF_SPDK_CXX_COMPILER=g++-13 \
   -DLAVIK_KERNEL_BYPASS=ON -DBUILD_TESTING=OFF
 cmake --build build-dpdk-net --target lavik -j4
 ```
@@ -185,11 +187,12 @@ To test Lavik against a separate Bycorf checkout, add
 command above. Initialize the bypass dependencies in that checkout as well.
 Record both repository revisions when validating the integration.
 
-On AArch64, use GCC for the bypass build because the pinned SPDK ISA-L Crypto
-dependency requires GCC. The private FreeBSD stack is built separately with
-Clang by the BSD build helper; both compilers are therefore required. Ordinary
-kernel/io_uring builds support Clang. CMake invokes the BSD build helper
-automatically; Python 3 remains a build dependency. See Bycorf's
+On AArch64, the pinned SPDK ISA-L Crypto dependency requires GCC. Bycorf's
+separate SPDK compiler settings keep Lavik and DPDK on Clang while configuring
+SPDK and its nested libraries with GCC. The private FreeBSD stack is also built
+separately with Clang by the BSD build helper, so both compiler toolchains are
+required. CMake invokes the BSD build helper automatically; Python 3 remains a
+build dependency. See Bycorf's
 [prototype runbook](../../bycorf/docs/dpdk-prototype.md) for prerequisites, TAP
 setup, physical-device selection, poll/adaptive mode,
 and queue configuration. The default device is a virtual TAP. Ordinary data
