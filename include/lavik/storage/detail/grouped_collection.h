@@ -186,13 +186,22 @@ bool OrderedEntryLess(const OrderedCollectionEntry& left,
 // round trips. Callers validate scores before encoding; decoding rejects NaN.
 std::string EncodeSortedSetMemberScore(double score);
 absl::StatusOr<double> DecodeSortedSetMemberScore(std::string_view bytes);
+// Checks ordering between locally validated entries on opposite sides of a
+// page or splice boundary. Stream identity is its routing key, excluding the
+// payload; Lists impose no value ordering. Invalid boundaries return DataLoss.
+absl::Status ValidateOrderedEntryBoundary(OrderedCollectionKind kind,
+                                          const OrderedCollectionEntry& left,
+                                          const OrderedCollectionEntry& right);
+
+// Checks neighbour identity/links and the logical order of their boundary
+// entries; both snapshots must be live and nonempty.
 absl::Status ValidateOrderedGroupBoundary(const OrderedGroupSnapshot& left,
                                           const OrderedGroupSnapshot& right);
 
 // Only retained metadata belongs in the directory. Physical checksums,
 // enclosing key/DB/replication epochs and page payload checks are the adapter's
 // responsibility. record_token is caller-owned identity, never a pointer on
-// disk. Sorted Set ordering across pages must additionally be checked using
+// disk. Sorted Set and Stream ordering across pages must be checked using
 // ValidateOrderedGroupBoundary when their contents are read or recovered.
 struct RecoveredOrderedGroup {
   std::uint64_t incarnation_ = 0;

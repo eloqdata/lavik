@@ -162,8 +162,7 @@ absl::StatusOr<std::uint64_t> CollectionCompactEncoder::MeasurePage(
         type, first, second,
         type == ValueType::kSortedSet ? page.scored_members_[i].score_ : 0);
     if (!valid.ok()) return valid;
-    const auto bytes =
-        (type == ValueType::kStream ? 0 : EntryFraming(type)) + first + second;
+    const auto bytes = EntryFraming(type) + first + second;
     if (bytes > std::numeric_limits<std::uint64_t>::max() - result)
       return absl::OutOfRangeError("compact page byte length overflow");
     result += bytes;
@@ -346,10 +345,10 @@ absl::Status CollectionCompactDecoder::CompleteEntry() {
     if (key->size() > (SIZE_MAX - 128) / 4)
       return absl::ResourceExhaustedError("Stream validator size overflow");
     const auto needed = key->size() * 4 + 128;
-    if (admission_ && needed > stream_validator_charge_) {
-      auto admitted = admission_(needed - stream_validator_charge_);
+    if (admission_ && needed > stream_validator_charge_.bytes_) {
+      auto admitted = admission_(needed - stream_validator_charge_.bytes_);
       if (!admitted.ok()) return admitted;
-      stream_validator_charge_ = needed;
+      stream_validator_charge_.bytes_ = needed;
     }
     auto valid = stream_validator_->Read(first_);
     if (!valid.ok()) return valid;

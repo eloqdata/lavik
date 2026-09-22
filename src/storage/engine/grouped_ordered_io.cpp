@@ -222,11 +222,11 @@ StorageEngine::Impl::LoadGroupedOrderedValue(
       co_return absl::DataLossError(
           "ordered page links disagree with directory");
     }
-    if (!result.empty() &&
-        object->ordered_directory().root().kind_ !=
-            OrderedCollectionKind::kList &&
-        !OrderedEntryLess(result.back(), page->snapshot_.entries_.front())) {
-      co_return absl::DataLossError("Sorted Set page boundary is unordered");
+    if (!result.empty()) {
+      auto boundary = ValidateOrderedEntryBoundary(
+          object->ordered_directory().root().kind_, result.back(),
+          page->snapshot_.entries_.front());
+      if (!boundary.ok()) co_return boundary;
     }
     for (auto& entry : page->snapshot_.entries_) {
       result.push_back(std::move(entry));

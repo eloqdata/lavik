@@ -423,6 +423,25 @@ absl::StatusOr<OrderedGroupMetadata> OrderedGroupMetadataDecoder::Finish()
   return metadata_;
 }
 
+absl::Status ValidateOrderedEntryBoundary(OrderedCollectionKind kind,
+                                          const OrderedCollectionEntry& left,
+                                          const OrderedCollectionEntry& right) {
+  if (kind == OrderedCollectionKind::kStream) {
+    auto last = StreamRecordKey(left.value_);
+    auto first = StreamRecordKey(right.value_);
+    if (!last.ok()) return last.status();
+    if (!first.ok()) return first.status();
+    // Payload bytes must not make two records with the same routing key
+    // appear ordered across a page boundary.
+    if (*last >= *first)
+      return absl::DataLossError("Stream pages overlap or are unordered");
+  } else if (kind != OrderedCollectionKind::kList &&
+             !OrderedEntryLess(left, right)) {
+    return absl::DataLossError("Sorted Set pages overlap or are unordered");
+  }
+  return absl::OkStatus();
+}
+
 absl::Status ValidateOrderedGroupBoundary(const OrderedGroupSnapshot& left,
                                           const OrderedGroupSnapshot& right) {
   if (left.kind_ != right.kind_ || left.incarnation_ != right.incarnation_ ||
@@ -431,20 +450,8 @@ absl::Status ValidateOrderedGroupBoundary(const OrderedGroupSnapshot& left,
       right.entries_.empty()) {
     return absl::DataLossError("inconsistent ordered page neighbours");
   }
-  if (left.kind_ == OrderedCollectionKind::kStream) {
-    auto last = StreamRecordKey(left.entries_.back().value_);
-    auto first = StreamRecordKey(right.entries_.front().value_);
-    if (!last.ok()) return last.status();
-    if (!first.ok()) return first.status();
-    // Payload bytes must not make two records with the same routing key
-    // appear ordered across a page boundary.
-    if (*last >= *first)
-      return absl::DataLossError("Stream pages overlap or are unordered");
-  } else if (left.kind_ != OrderedCollectionKind::kList &&
-             !OrderedEntryLess(left.entries_.back(), right.entries_.front())) {
-    return absl::DataLossError("Sorted Set pages overlap or are unordered");
-  }
-  return absl::OkStatus();
+  return ValidateOrderedEntryBoundary(left.kind_, left.entries_.back(),
+                                      right.entries_.front());
 }
 
 absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
@@ -779,15 +786,19 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
   if (root.kind_ != OrderedCollectionKind::kList &&
       !replacement.entries_.empty()) {
     if (begin != 0 &&
-        !OrderedEntryLess(loaded.at(groups[begin - 1].id_).entries_.back(),
-                          replacement.entries_.front()))
+        !ValidateOrderedEntryBoundary(
+             root.kind_, loaded.at(groups[begin - 1].id_).entries_.back(),
+             replacement.entries_.front())
+             .ok())
       return absl::InvalidArgumentError(
-          "Sorted Set splice crosses its lower bound");
+          "ordered splice crosses its lower bound");
     if (end != groups.size() &&
-        !OrderedEntryLess(replacement.entries_.back(),
-                          loaded.at(groups[end].id_).entries_.front()))
+        !ValidateOrderedEntryBoundary(
+             root.kind_, replacement.entries_.back(),
+             loaded.at(groups[end].id_).entries_.front())
+             .ok())
       return absl::InvalidArgumentError(
-          "Sorted Set splice crosses its upper bound");
+          "ordered splice crosses its upper bound");
   }
 
   plan.root_.item_count_ = root.item_count_ - erase_count + entries.size();

@@ -32,6 +32,12 @@ absl::StatusOr<std::vector<OrderedCollectionEntry>> DecodeStreamRecords(
 // The returned view borrows the page entry and expires with it.
 absl::StatusOr<std::string_view> StreamRecordPayload(std::string_view record);
 
+// Returns a group header fragment only if its declared name and fixed fields
+// exactly fill the payload. The caller identifies the header by its routing
+// key; the borrowed view is safe to read at offsets derived from the name size.
+absl::StatusOr<std::string_view> StreamGroupHeaderPayload(
+    std::string_view record);
+
 // Extracts the exact binary routing key from an internal record.
 absl::StatusOr<std::string_view> StreamRecordKey(std::string_view record);
 

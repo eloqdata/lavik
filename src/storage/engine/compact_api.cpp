@@ -66,7 +66,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompact(
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
   co_return co_await ExecuteCompactLocked(
       db_id, key, digest, value_type, read_only, callback, nullptr, now_ms,
-      replication, false, mutation_precondition, access);
+      replication, false, mutation_precondition, std::move(access));
 }
 
 Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(

@@ -223,6 +223,15 @@ absl::StatusOr<std::string_view> StreamRecordPayload(std::string_view record) {
   return record.substr(key->size(), record.size() - key->size() - 4);
 }
 
+absl::StatusOr<std::string_view> StreamGroupHeaderPayload(
+    std::string_view record) {
+  auto payload = StreamRecordPayload(record);
+  if (!payload.ok()) return payload.status();
+  if (payload->size() < 32 || Get(*payload, 0, 4) != payload->size() - 32)
+    return absl::DataLossError("invalid Stream group header size");
+  return *payload;
+}
+
 absl::Status StreamRecordValidator::Read(std::string_view record) {
   if (failed_) return Invalid();
   auto read = [&]() -> absl::Status {

@@ -925,9 +925,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
         selected = std::move(*found);
       }
       if (!selected) break;
-      auto value = StreamRecordPayload(*selected);
-      if (!value.ok() || value->size() < 32 ||
-          Count(*value) != value->size() - 32)
+      auto value = StreamGroupHeaderPayload(*selected);
+      if (!value.ok())
         co_return absl::DataLossError("invalid Stream inspection group");
       std::string name(value->substr(4, Count(*value)));
       const auto prefix = GroupPrefix(name);
@@ -1327,9 +1326,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
         access.pending_ids_.begin(), access.pending_ids_.end());
     if (*group) {
       original_group = **group;
-      auto payload = StreamRecordPayload(original_group);
-      if (!payload.ok() || payload->size() < 32 ||
-          Count(*payload) != access.group_.size())
+      auto payload = StreamGroupHeaderPayload(original_group);
+      if (!payload.ok() || Count(*payload) != access.group_.size())
         co_return absl::DataLossError("invalid partial Stream group header");
       total_consumers = Count(*payload, payload->size() - 4);
       const auto last_id =

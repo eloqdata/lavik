@@ -108,6 +108,103 @@ TEST(StreamRecords, RoundTripAndIncrementalValidation) {
     EXPECT_EQ(*EncodeStreamRecords(decoded), wire);
   }
 }
+TEST(StreamRecords, DecoderMovesTransferPageAndValidatorAdmission) {
+  auto records = DecodeStreamRecords(Stream(2), 2);
+  ASSERT_TRUE(records.ok());
+  CollectionPage input{.value_type_ = ValueType::kStream};
+  for (const auto& record : *records) input.elements_.push_back(record.value_);
+  auto bytes = CollectionCompactEncoder::MeasurePage(input);
+  ASSERT_TRUE(bytes.ok());
+  auto encoder = CollectionCompactEncoder::Create(ValueType::kStream,
+                                                  records->size(), *bytes + 8);
+  ASSERT_TRUE(encoder.ok());
+  ASSERT_TRUE(encoder->StartPage(input).ok());
+  std::string wire;
+  while (auto fragment = encoder->Next()) wire.append(*fragment);
+  ASSERT_TRUE(encoder->Finish().ok());
+
+  for (bool take_before_move : {false, true}) {
+    SCOPED_TRACE(take_before_move);
+    std::size_t charged = 0, transferred = 0;
+    auto decoder = CollectionCompactDecoder::Create(
+        ValueType::kStream, 2, wire.size(), [&](std::size_t bytes) {
+          charged += bytes;
+          return absl::OkStatus();
+        });
+    ASSERT_TRUE(decoder.ok());
+    auto used = decoder->Consume(wire);
+    ASSERT_TRUE(used.ok()) << used.status();
+    EXPECT_EQ(*used, wire.size());
+    ASSERT_TRUE(decoder->page_ready());
+    if (take_before_move) {
+      auto page = decoder->TakePage(&transferred);
+      ASSERT_TRUE(page.ok());
+      EXPECT_EQ(page->elements_, input.elements_);
+    }
+    // Taking a page leaves the validator's identity charge with the decoder.
+    ASSERT_GT(decoder->pending_admitted_bytes(), 0);
+    EXPECT_EQ(decoder->pending_admitted_bytes() + transferred, charged);
+    auto moved = std::move(*decoder);
+    EXPECT_EQ(decoder->pending_admitted_bytes(), 0);
+    EXPECT_EQ(moved.pending_admitted_bytes() + transferred, charged);
+    auto assigned =
+        CollectionCompactDecoder::Create(ValueType::kStream, 2, wire.size());
+    ASSERT_TRUE(assigned.ok());
+    *assigned = std::move(moved);
+    EXPECT_EQ(moved.pending_admitted_bytes(), 0);
+    EXPECT_EQ(assigned->pending_admitted_bytes() + transferred, charged);
+    if (!take_before_move) {
+      auto page = assigned->TakePage(&transferred);
+      ASSERT_TRUE(page.ok());
+      EXPECT_EQ(page->elements_, input.elements_);
+    }
+    EXPECT_TRUE(assigned->Finish().ok());
+    EXPECT_GT(transferred, 0);
+    EXPECT_GT(assigned->pending_admitted_bytes(), 0);
+    EXPECT_EQ(assigned->pending_admitted_bytes() + transferred, charged);
+  }
+}
+
+TEST(StreamRecords, GroupHeaderRejectsTruncatedAndOversizedNames) {
+  for (const std::string name :
+       {std::string{}, std::string("g\0z", 3), std::string(64, 'g')}) {
+    // Build the routing envelope independently of the possibly corrupt
+    // payload. A valid routing key does not validate stored field offsets.
+    std::string key(1, '\5');
+    for (char ch : name) {
+      key.push_back(ch);
+      if (ch == '\0') key.push_back('\xff');
+    }
+    key.append("\0\0\0", 3);
+    auto wrap = [&](std::string_view payload) {
+      std::string record = key;
+      record.append(payload);
+      Put(record, key.size(), 4);
+      return record;
+    };
+    std::string payload;
+    String(payload, name);
+    payload.append(28, '\0');
+    auto record = wrap(payload);
+    auto valid = StreamGroupHeaderPayload(record);
+    ASSERT_TRUE(valid.ok()) << valid.status();
+    EXPECT_EQ(*valid, payload);
+    for (std::size_t size = 0; size < payload.size(); ++size) {
+      auto truncated = wrap(std::string_view(payload).substr(0, size));
+      EXPECT_EQ(StreamGroupHeaderPayload(truncated).status().code(),
+                absl::StatusCode::kDataLoss)
+          << size;
+    }
+    auto extra = wrap(payload + "x");
+    EXPECT_EQ(StreamGroupHeaderPayload(extra).status().code(),
+              absl::StatusCode::kDataLoss);
+    payload.replace(0, 4, 4, '\xff');
+    auto excessive = wrap(payload);
+    EXPECT_EQ(StreamGroupHeaderPayload(excessive).status().code(),
+              absl::StatusCode::kDataLoss);
+  }
+}
+
 TEST(StreamRecords, RejectsTruncationAndWrongCounts) {
   auto wire = Stream(3);
   for (std::size_t i = 0; i < wire.size(); ++i)
@@ -179,6 +276,69 @@ TEST(StreamRecords, AdjacentPagesCannotRepeatARecordKey) {
   right.entries_.front().value_[17 + payload->size() - 1] = 'y';
   EXPECT_FALSE(ValidateOrderedGroupBoundary(left, right).ok());
 }
+TEST(StreamRecords, SpliceBoundsRejectDuplicateIdsWithDifferentPayloads) {
+  auto records = DecodeStreamRecords(Stream(3, false), 3);
+  ASSERT_TRUE(records.ok());
+  OrderedCollectionRoot root{.kind_ = OrderedCollectionKind::kStream,
+                             .incarnation_ = 1,
+                             .item_count_ = 2,
+                             .first_group_ = 1,
+                             .last_group_ = 2,
+                             .next_group_id_ = 3,
+                             .group_count_ = 2,
+                             .revision_ = 1,
+                             .stream_length_ = 2};
+  std::vector<LoadedOrderedGroup> loaded{
+      {.sequence_ = 1,
+       .snapshot_ = {.kind_ = OrderedCollectionKind::kStream,
+                     .incarnation_ = 1,
+                     .id_ = 1,
+                     .next_ = 2,
+                     .entries_ = {(*records)[1]}}},
+      {.sequence_ = 1,
+       .snapshot_ = {.kind_ = OrderedCollectionKind::kStream,
+                     .incarnation_ = 1,
+                     .id_ = 2,
+                     .previous_ = 1,
+                     .entries_ = {(*records)[3]}}}};
+  std::vector<RecoveredOrderedGroup> metadata{{.incarnation_ = 1,
+                                               .id_ = 1,
+                                               .next_ = 2,
+                                               .sequence_ = 1,
+                                               .lsn_ = 1,
+                                               .item_count_ = 1,
+                                               .record_token_ = 1},
+                                              {.incarnation_ = 1,
+                                               .id_ = 2,
+                                               .previous_ = 1,
+                                               .sequence_ = 1,
+                                               .lsn_ = 2,
+                                               .item_count_ = 1,
+                                               .record_token_ = 2}};
+  auto directory = OrderedGroupDirectory::Recover(root, 1, metadata, {});
+  ASSERT_TRUE(directory.ok()) << directory.status();
+  auto lower = (*records)[1], upper = (*records)[3];
+  // Complete record bytes sort around the old neighbour, but the ID repeats.
+  // The payload lies between the 17-byte routing key and 4-byte key length.
+  lower.value_[lower.value_.size() - 5] = 'y';
+  upper.value_[upper.value_.size() - 5] = 'w';
+  EXPECT_EQ(PlanOrderedCollectionSplice(*directory, loaded, 1, 0, {lower})
+                .status()
+                .code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(PlanOrderedCollectionSplice(*directory, loaded, 0, 1, {upper})
+                .status()
+                .code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_TRUE(
+      PlanOrderedCollectionSplice(*directory, loaded, 1, 0, {(*records)[2]})
+          .ok());
+  // Splices spanning pages retain the old neighbour links during validation.
+  EXPECT_TRUE(
+      PlanOrderedCollectionSplice(*directory, loaded, 0, 2, {(*records)[2]})
+          .ok());
+}
+
 TEST(StreamRecords, BulkInsertionSplitsAndPreservesLogicalImage) {
   auto before = DecodeStreamRecords(Stream(0, false), 0);
   const auto wire = Stream(20000, false);

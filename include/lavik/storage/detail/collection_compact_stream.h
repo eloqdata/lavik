@@ -85,8 +85,8 @@ class CollectionCompactEncoder {
 // most one roughly 8 KiB page plus one indivisible large entry is assembled.
 // No allocation is sized from the aggregate count/length. The caller may await
 // admission/storage between TakePage and the next Consume call.
-// Supports Hash, Set, List and Sorted Set; Stream receiving uses its complete
-// LXS1 adapter until logical macro-node boundaries can be reconstructed here.
+// Supports compact Hash, Set, List and Sorted Set images, and LSR1 Stream
+// records with incremental validation across page boundaries.
 class CollectionCompactDecoder {
  public:
   CollectionCompactDecoder(const CollectionCompactDecoder&) = delete;
@@ -114,7 +114,7 @@ class CollectionCompactDecoder {
   absl::StatusOr<CollectionPage> TakePage(
       std::size_t* transferred_admission = nullptr);
   std::size_t pending_admitted_bytes() const noexcept {
-    return admission_count_.bytes_ + stream_validator_charge_;
+    return admission_count_.bytes_ + stream_validator_charge_.bytes_;
   }
 
   // Validates exact bytes/count and no partial header/entry at transport EOF.
@@ -127,8 +127,6 @@ class CollectionCompactDecoder {
 
  private:
   CollectionCompactDecoder() = default;
-  std::optional<StreamRecordValidator> stream_validator_;
-  std::size_t stream_validator_charge_ = 0;
   // Moving transfers the external admission receipt, never copies it. Before
   // overwriting a decoder, its owner releases the old pending receipt after
   // its buffers die, just as it must when destroying that decoder.
@@ -142,6 +140,8 @@ class CollectionCompactDecoder {
     }
     std::size_t bytes_ = 0;
   };
+  std::optional<StreamRecordValidator> stream_validator_;
+  AdmissionCount stream_validator_charge_;
   enum class Stage { kHeader, kEntryHeader, kFirst, kSecond, kDone };
   absl::Status ReadHeader();
   absl::Status ReadEntryHeader();
