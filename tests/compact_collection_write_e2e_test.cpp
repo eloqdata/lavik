@@ -584,6 +584,76 @@ TEST_P(GroupedWriteConcurrencyE2e, ColdWriteYieldsWorkerButRetainsKey) {
   ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
+TEST(GroupedWriteSemanticsE2e, EncoderPreflightAllocationFailureKeepsOldGraph) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires encoder preflight allocation-failure hook";
+#endif
+  const std::string key = "encoder-failure";
+  const std::string large(20 * 1024, 'o');
+  struct Case {
+    std::vector<std::string> seed_, mutation_, read_;
+    std::string expected_;
+  };
+  const std::vector<Case> cases{
+      {{"HSET", key, "f", large},
+       {"HSET", key, "f", "new", "extra", "new"},
+       {"HGET", key, "f"},
+       large},
+      {{"SADD", key, large},
+       {"SADD", key, "new", "extra"},
+       {"SCARD", key},
+       "1"},
+      {{"RPUSH", key, large},
+       {"RPUSH", key, "new", "extra"},
+       {"LLEN", key},
+       "1"},
+      {{"ZADD", key, "1", large},
+       {"ZADD", key, "2", large, "3", "new"},
+       {"ZSCORE", key, large},
+       "1"},
+  };
+  for (const auto& test : cases) {
+    SCOPED_TRACE(test.seed_.front());
+    PrivateDisk disk;
+    {
+      Server server(disk, 1);
+      Client client(server.port());
+      ASSERT_EQ(client.Command(test.seed_).text_, "1");
+      client.Durable();
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    }
+    ASSERT_FALSE(disk.Auxiliaries(key).empty());
+    {
+      ScopedFault fault("LAVIK_FAIL_GROUP_ENCODER_PREPARE_KEY", key.c_str());
+      Server server(disk, 1);
+      Client client(server.port());
+      const auto failed = client.Command(test.mutation_);
+      ASSERT_EQ(failed.kind_, '-');
+      EXPECT_EQ(failed.text_, "OOM preparing group encoders");
+      EXPECT_EQ(client.Command(test.read_).text_, test.expected_);
+      ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+      ASSERT_EQ(client.Command({"SET", "independent", "before"}).text_,
+                "QUEUED");
+      ASSERT_EQ(client.Command(test.mutation_).text_, "QUEUED");
+      ASSERT_EQ(client.Command({"SET", "independent", "after"}).text_,
+                "QUEUED");
+      const auto executed = client.Command({"EXEC"});
+      ASSERT_EQ(executed.items_.size(), 3);
+      EXPECT_EQ(executed.items_[0].text_, "OK");
+      EXPECT_EQ(executed.items_[1].kind_, '-');
+      EXPECT_EQ(executed.items_[1].text_, "OOM preparing group encoders");
+      EXPECT_EQ(executed.items_[2].text_, "OK");
+      EXPECT_EQ(client.Command(test.read_).text_, test.expected_);
+      client.Durable();
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    }
+    Server recovered(disk, 3);
+    Client client(recovered.port());
+    EXPECT_EQ(client.Command(test.read_).text_, test.expected_);
+    EXPECT_EQ(client.Command({"GET", "independent"}).text_, "after");
+  }
+}
+
 TEST(GroupedWriteSemanticsE2e, NoOpDeletionExecAndLuaRetainLogicalIdentity) {
   for (const auto kind : {GroupedKind::kHash, GroupedKind::kSet,
                           GroupedKind::kList, GroupedKind::kSortedSet}) {

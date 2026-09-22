@@ -22,10 +22,8 @@ Task<absl::StatusOr<HashGroupLocation>>
 StorageEngine::Impl::WriteOrderedGroupRecordLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const OrderedGroupSnapshot& snapshot, std::uint64_t revision,
-    TxShardWrites& tx, std::uint64_t batch_txid) {
-  auto encoder = OrderedGroupEncoder::Create(snapshot);
-  if (!encoder.ok()) co_return encoder.status();
+    const OrderedGroupSnapshot& snapshot, OrderedGroupEncoder encoder,
+    std::uint64_t revision, TxShardWrites& tx, std::uint64_t batch_txid) {
   // A page owns a complete snapshot. Its cursor borrows the entries until
   // every extent is durable; only then may the manifest enter the root batch.
   // In particular a single large List item is never split into a read-time
@@ -35,19 +33,19 @@ StorageEngine::Impl::WriteOrderedGroupRecordLocked(
                                               true) > kBlockHeaderSlotBytes;
   const std::size_t prefix_bytes = key_external ? key.size() : 0;
   if (!ValidRecordKeySize(key.size()) ||
-      prefix_bytes > kMaxRecordPayloadBytes - encoder->encoded_bytes()) {
+      prefix_bytes > kMaxRecordPayloadBytes - encoder.encoded_bytes()) {
     co_return absl::OutOfRangeError(
         "ordered page and external key exceed record payload limit");
   }
   const std::size_t inline_bytes = AlignRecord(
       RecordHeaderBytes(key.size(), key_external, true, false, true) +
-      prefix_bytes + encoder->encoded_bytes());
+      prefix_bytes + encoder.encoded_bytes());
   const bool external = inline_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
                         inline_bytes > options_.buffers_.write_buffer_bytes_;
   ExtentManifest extents;
   std::string payload;
   if (external) {
-    RecordPayloadCursor cursor(*encoder,
+    RecordPayloadCursor cursor(encoder,
                                key_external ? key : std::string_view{});
     auto written = co_await WriteExtentValueLocked(store, {}, {}, &cursor, key);
     if (!written.ok()) co_return written.status();
@@ -55,8 +53,8 @@ StorageEngine::Impl::WriteOrderedGroupRecordLocked(
     payload = EncodeManifest(*extents);
     LAVIK_MAYBE_CRASH_AT("group-extents-durable-before-record");
   } else {
-    payload.resize(encoder->encoded_bytes());
-    RecordPayloadCursor cursor(*encoder);
+    payload.resize(encoder.encoded_bytes());
+    RecordPayloadCursor cursor(encoder);
     auto status = cursor.Read(std::as_writable_bytes(std::span(payload)));
     if (status.ok()) status = cursor.Finish();
     if (!status.ok()) co_return status;

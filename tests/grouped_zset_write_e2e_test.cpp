@@ -60,6 +60,86 @@ std::vector<std::string> ZSetSeed(std::string key) {
   return command;
 }
 
+TEST(GroupedSortedSetWriteE2e, BatchedMemberIndexChangesMatchOrderedPages) {
+  PrivateDisk disk;
+  std::map<std::string, double> expected;
+  auto member = [](unsigned i) {
+    if (i % 3 == 0) return "m" + std::to_string(i);
+    if (i % 3 == 1) return std::string(128, 'm') + std::to_string(i);
+    return std::string("m\0", 2) + std::to_string(i);
+  };
+  auto verify = [&](Client& client) {
+    std::vector<std::string> lookup{"ZMSCORE", "batched-members"};
+    std::vector<std::pair<double, std::string>> ordered;
+    for (const auto& [name, score] : expected) {
+      lookup.push_back(name);
+      ordered.emplace_back(score, name);
+    }
+    // Prefix reads and ordered reads must agree after updates, insertions and
+    // removals spanning many leaves; checking only one graph misses divergence.
+    const auto scores = client.Command(lookup);
+    ASSERT_EQ(scores.items_.size(), expected.size());
+    std::size_t i = 0;
+    for (const auto& [name, score] : expected) {
+      ASSERT_EQ(scores.items_[i].kind_, '$');
+      EXPECT_EQ(std::stod(scores.items_[i++].text_), score) << name;
+    }
+    std::sort(ordered.begin(), ordered.end());
+    const auto range =
+        client.Command({"ZRANGE", "batched-members", "0", "-1", "WITHSCORES"});
+    ASSERT_EQ(range.items_.size(), 2 * ordered.size());
+    for (i = 0; i < ordered.size(); ++i) {
+      EXPECT_EQ(range.items_[2 * i].text_, ordered[i].second);
+      EXPECT_EQ(std::stod(range.items_[2 * i + 1].text_), ordered[i].first);
+    }
+    EXPECT_EQ(client.Command({"ZCARD", "batched-members"}).text_,
+              std::to_string(expected.size()));
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", "batched-members"};
+    for (unsigned i = 0; i < 1024; ++i) {
+      seed.insert(seed.end(), {std::to_string(i % 8), member(i)});
+      expected[member(i)] = i % 8;
+    }
+    ASSERT_EQ(client.Command(seed).text_, "1024");
+    std::vector<std::string> write{"ZADD", "batched-members"};
+    for (unsigned i = 0; i < 512; ++i) {
+      write.insert(write.end(), {"20", member(i), "-10", member(i + 1024)});
+      expected[member(i)] = 20;
+      expected[member(i + 1024)] = -10;
+    }
+    // Revisit both old and newly inserted identities after many other inputs.
+    write.insert(write.end(), {"-30", member(0), "30", member(1024)});
+    expected[member(0)] = -30;
+    expected[member(1024)] = 30;
+    ASSERT_EQ(client.Command(write).text_, "512");
+    verify(client);
+    ASSERT_EQ(client.Command(write).text_, "0");
+    std::vector<std::string> remove{"ZREM", "batched-members"};
+    for (unsigned i = 256; i < 768; ++i) {
+      remove.push_back(member(i));
+      expected.erase(member(i));
+    }
+    remove.insert(remove.end(), {member(256), "missing"});
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command(remove).text_, "QUEUED");
+    const auto executed = client.Command({"EXEC"});
+    ASSERT_EQ(executed.items_.size(), 1);
+    EXPECT_EQ(executed.items_[0].text_, "512");
+    EXPECT_EQ(client.Command({"ZSCORE", "batched-members", member(256)}).text_,
+              "-1");
+    verify(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_FALSE(disk.Auxiliaries("batched-members").empty());
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  verify(client);
+}
+
 TEST(GroupedSortedSetWriteE2e, MemberScoresUsePrefixPagesWithoutOrderedReads) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires ordered-read failure injection";

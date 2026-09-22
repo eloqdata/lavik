@@ -99,6 +99,99 @@ HashDiskLayout InspectHashLayout(const PrivateDisk& disk,
   return result;
 }
 
+TEST(GroupedHashWriteE2e, BatchedFieldsPreserveOrderAcrossGrowthAndRecovery) {
+  PrivateDisk disk;
+  std::map<std::string, std::string> expected;
+  auto field = [](unsigned i) {
+    // Exercise short strings that move with vector growth, heap strings and
+    // binary identities that must compare by their complete byte sequence.
+    if (i % 3 == 0) return "f" + std::to_string(i);
+    if (i % 3 == 1) return std::string(80, 'f') + std::to_string(i);
+    return std::string("f\0", 2) + std::to_string(i);
+  };
+  auto verify = [&](Client& client) {
+    EXPECT_EQ(client.Command({"HLEN", "batched"}).text_,
+              std::to_string(expected.size()));
+    std::vector<std::string> read{"HMGET", "batched"};
+    for (const auto& [name, value] : expected) read.push_back(name);
+    const auto reply = client.Command(read);
+    ASSERT_EQ(reply.items_.size(), expected.size());
+    std::size_t i = 0;
+    for (const auto& [name, value] : expected) {
+      EXPECT_EQ(reply.items_[i++].text_, value) << name;
+    }
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port()), watcher(server.port());
+    ASSERT_EQ(client
+                  .Command({"HSET", "batched", field(0), "first", field(0),
+                            "last", field(1), "keep"})
+                  .text_,
+              "2");
+    expected[field(0)] = "last";
+    expected[field(1)] = "keep";
+    // The first update starts compact; subsequent batches span prefix groups.
+    // Repeat both an existing and a new field after hundreds of appends.
+    for (unsigned batch = 0; batch < 4; ++batch) {
+      const unsigned begin = 2 + batch * 512;
+      std::vector<std::string> write{"HSET", "batched", field(0), "early"};
+      for (unsigned i = begin; i < begin + 512; ++i) {
+        write.push_back(field(i));
+        write.emplace_back(128, 'a' + batch);
+        expected[field(i)] = write.back();
+      }
+      write.insert(write.end(), {field(0), "updated", field(begin), "last"});
+      expected[field(0)] = "updated";
+      expected[field(begin)] = "last";
+      if (batch == 0) {
+        // A missing key takes unlocked creation's periodic Yield while the
+        // index is live; duplicate fields must still resolve after resumption.
+        auto create = write;
+        create[1] = "fresh-batched";
+        ASSERT_EQ(client.Command(create).text_, "513");
+        EXPECT_EQ(client.Command({"HGET", "fresh-batched", field(0)}).text_,
+                  "updated");
+        EXPECT_EQ(client.Command({"HGET", "fresh-batched", field(begin)}).text_,
+                  "last");
+      }
+      ASSERT_EQ(client.Command(write).text_, "512");
+      ASSERT_EQ(client.Command(write).text_, "0");
+      verify(client);
+    }
+    EXPECT_EQ(client.Command({"HSETNX", "batched", field(0), "ignored"}).text_,
+              "0");
+    EXPECT_EQ(client.Command({"HSETNX", "batched", "nx", "inserted"}).text_,
+              "1");
+    expected["nx"] = "inserted";
+    ASSERT_EQ(watcher.Command({"WATCH", "batched"}).text_, "OK");
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client
+                  .Command({"HSET", "batched", field(0), "transient", "tx",
+                            "first", field(0), "updated", "tx", "last"})
+                  .text_,
+              "QUEUED");
+    const auto committed = client.Command({"EXEC"});
+    ASSERT_EQ(committed.items_.size(), 1);
+    EXPECT_EQ(committed.items_[0].text_, "1");
+    expected["tx"] = "last";
+    ASSERT_EQ(watcher.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(watcher.Command({"HLEN", "batched"}).text_, "QUEUED");
+    EXPECT_EQ(watcher.Command({"EXEC"}).text_, "-1");
+    verify(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_FALSE(disk.Auxiliaries("batched").empty());
+  Server recovered(disk, 1);
+  Client client(recovered.port());
+  verify(client);
+  EXPECT_EQ(client.Command({"HLEN", "fresh-batched"}).text_, "513");
+  EXPECT_EQ(client.Command({"HGET", "fresh-batched", field(0)}).text_,
+            "updated");
+  EXPECT_EQ(client.Command({"HGET", "fresh-batched", field(2)}).text_, "last");
+}
+
 TEST(HashReplaceE2e, SemanticsTtlBinaryFieldsAndUnchangedStandardCommands) {
   PrivateDisk disk;
   Server server(disk);

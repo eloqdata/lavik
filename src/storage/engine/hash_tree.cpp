@@ -20,6 +20,7 @@
 #include <random>
 #include <set>
 
+#include "absl/container/flat_hash_map.h"
 #include "impl.h"
 #include "lavik/glob.h"
 #include "lavik/memory.h"
@@ -680,6 +681,39 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       case HashOperationKind::kSetIfAbsent: {
         if (operation.fields_.size() != operation.values_.size())
           co_return absl::InvalidArgumentError("Hash field/value mismatch");
+        const bool indexed = operation.fields_.size() > 1;
+        std::optional<MemoryReservation> lookup_scratch;
+        absl::flat_hash_map<std::string, std::size_t> field_positions;
+        if (indexed) {
+          // Selected groups share one vector, so scanning it for every input
+          // field makes a growing batch quadratic. Own the index keys: appends
+          // can move even SSO fields, and unlocked creation can suspend. Store
+          // positions rather than pointers, and destroy the index before the
+          // planner sorts/moves entries. Single-field writes need only a scan.
+          GroupedScratchBudget budget;
+          auto admit_field = [&](std::string_view field) -> absl::Status {
+            // Bound the copied key plus sparse hash slots/control bytes. Count
+            // every input, including duplicates, to admit the peak up front.
+            auto added = budget.AddBytes(256);
+            if (!added.ok()) return added;
+            return budget.AddBytes(field.size());
+          };
+          for (const auto& entry : compact.entries_) {
+            auto added = admit_field(entry.field_);
+            if (!added.ok()) co_return added;
+          }
+          for (const auto field : operation.fields_) {
+            auto added = admit_field(field);
+            if (!added.ok()) co_return added;
+          }
+          auto admitted = budget.Reserve(1);
+          if (!admitted.ok()) co_return admitted.status();
+          lookup_scratch.emplace(std::move(*admitted));
+          field_positions.reserve(compact.entries_.size() +
+                                  operation.fields_.size());
+          for (std::size_t i = 0; i < compact.entries_.size(); ++i)
+            field_positions.emplace(compact.entries_[i].field_, i);
+        }
         for (std::size_t i = 0; i < operation.fields_.size(); ++i) {
           if (unlocked_create && i != 0 && i % 256 == 0)
             co_await bycorf::Yield(*store.worker_);
@@ -688,7 +722,14 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
             co_return absl::OutOfRangeError(
                 "Hash field or value exceeds Redis-compatible 512 MiB limit");
           }
-          HashEntry* current = lookup(operation.fields_[i]);
+          HashEntry* current = nullptr;
+          if (indexed) {
+            auto position = field_positions.find(operation.fields_[i]);
+            if (position != field_positions.end())
+              current = &compact.entries_[position->second];
+          } else {
+            current = lookup(operation.fields_[i]);
+          }
           if (current != nullptr) {
             if (operation.kind_ == HashOperationKind::kSetIfAbsent) continue;
             if (current->value_ != operation.values_[i]) {
@@ -698,6 +739,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
             }
           } else {
             mark_group_changed(operation.fields_[i]);
+            if (indexed)
+              field_positions.emplace(operation.fields_[i],
+                                      compact.entries_.size());
             compact.entries_.push_back(
                 HashEntry{.digest_ = ComputeDigest(operation.fields_[i]),
                           .field_ = std::string(operation.fields_[i]),

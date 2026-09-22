@@ -3533,12 +3533,14 @@ class StorageEngine::Impl {
   // Writes one unpublished complete group snapshot. The receipt prevents its
   // transaction generation from retiring; the caller must either publish it
   // with the root's decision or reclaim it when that batch is abandoned.
+  // Pass an unconsumed encoder from the batch's complete preflight. Its exact
+  // snapshot must stay alive, unmoved and immutable through the awaited write.
   Task<absl::StatusOr<HashGroupLocation>> WriteHashGroupRecordLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      const HashGroupSnapshot& snapshot, std::uint64_t sequence,
-      TxShardWrites& tx, ValueType value_type = ValueType::kHash,
-      std::uint64_t batch_txid = 0);
+      const HashGroupSnapshot& snapshot, HashGroupEncoder encoder,
+      std::uint64_t sequence, TxShardWrites& tx,
+      ValueType value_type = ValueType::kHash, std::uint64_t batch_txid = 0);
 
   Task<absl::StatusOr<LoadedOrderedGroup>> LoadOrderedGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -3551,11 +3553,13 @@ class StorageEngine::Impl {
                           const Digest& digest,
                           GroupedHashObject::Handle object,
                           bool pinned = false);
+  // Consumes an unstarted preflight encoder with the same snapshot lifetime
+  // contract as WriteHashGroupRecordLocked, including across extent IO.
   Task<absl::StatusOr<HashGroupLocation>> WriteOrderedGroupRecordLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      const OrderedGroupSnapshot& snapshot, std::uint64_t revision,
-      TxShardWrites& tx, std::uint64_t batch_txid = 0);
+      const OrderedGroupSnapshot& snapshot, OrderedGroupEncoder encoder,
+      std::uint64_t revision, TxShardWrites& tx, std::uint64_t batch_txid = 0);
 
   Task<absl::Status> WriteRecordLocked(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,

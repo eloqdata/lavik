@@ -17,6 +17,7 @@
 #include <charconv>
 
 #include "impl.h"
+#include "lavik/storage/detail/grouped_scratch.h"
 
 namespace lavik::storage {
 namespace {
@@ -264,18 +265,37 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   auto root_payload = EncodeGroupedHashRoot(plan->root_);
   if (!root_payload.ok()) co_return root_payload.status();
   // Validate every indivisible field/envelope before the first disk write.
-  // The extent writer consumes the same checked cursor incrementally.
-  const bool external_key = key.size() > options_.inline_key_max_bytes_ ||
-                            RecordHeaderBytes(key.size(), false, true, false,
-                                              true) > kBlockHeaderSlotBytes;
-  for (const auto& snapshot : plan->writes_) {
-    const auto encoder = HashGroupEncoder::Create(snapshot);
-    if (!encoder.ok()) co_return encoder.status();
-    if (external_key &&
-        key.size() > kMaxRecordPayloadBytes - encoder->encoded_bytes()) {
-      co_return absl::OutOfRangeError(
-          "group snapshot and parent key exceed payload limit");
+  // Retain the checked encoders so writing does not rebuild each page's
+  // duplicate-field set. Their pointers borrow plan->writes_, which stays
+  // unmoved and immutable through all writes, including extent IO waits.
+  GroupedScratchBudget encoder_budget;
+  for (std::size_t i = 0; i < plan->writes_.size(); ++i) {
+    auto added = encoder_budget.AddBytes(sizeof(HashGroupEncoder));
+    if (!added.ok()) co_return added;
+  }
+  auto encoder_admission = encoder_budget.Reserve(1);
+  if (!encoder_admission.ok()) co_return encoder_admission.status();
+  std::vector<HashGroupEncoder> encoders;
+  try {
+    // No current-command pages have been staged if preflight allocation fails.
+    LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_GROUP_ENCODER_PREPARE_KEY", key);
+    encoders.reserve(plan->writes_.size());
+    const bool external_key = key.size() > options_.inline_key_max_bytes_ ||
+                              RecordHeaderBytes(key.size(), false, true, false,
+                                                true) > kBlockHeaderSlotBytes;
+    for (const auto& snapshot : plan->writes_) {
+      auto encoder = HashGroupEncoder::Create(snapshot);
+      if (!encoder.ok()) co_return encoder.status();
+      if (external_key &&
+          key.size() > kMaxRecordPayloadBytes - encoder->encoded_bytes()) {
+        co_return absl::OutOfRangeError(
+            "group snapshot and parent key exceed payload limit");
+      }
+      encoders.push_back(std::move(*encoder));
     }
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM preparing group encoders");
   }
   auto decision = PrepareGroupedDecision(*tx);
   if (!decision.ok()) co_return decision.status();
@@ -339,8 +359,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
               "OOM injected grouped auxiliary admission failure");
         });
     auto group = co_await WriteHashGroupRecordLocked(
-        store, partition, db_id, key, digest, snapshot, revision, *tx,
-        value_type, command_batch);
+        store, partition, db_id, key, digest, snapshot,
+        std::move(encoders[written.size()]), revision, *tx, value_type,
+        command_batch);
     if (!group.ok()) {
       const auto original = group.status();
       const auto abandoned = co_await abandon();
