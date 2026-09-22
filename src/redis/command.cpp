@@ -11666,10 +11666,6 @@ Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
 }  // namespace
 
 // ---- Cluster owner-side re-check definitions (declared in cluster_gate.h) --
-//
-// These are lavik-scope (not file-local) because the per-type multi-key
-// executors (set/zset/list/sort/string) inject the same validator into their
-// own transactions, and the blocking wait loop shares EmitClusterDecision.
 
 bool EmitClusterDecision(const cluster::Decision& decision, bool connection_tls,
                          ReplyBuilder& reply_builder, CommandReply* reply) {
