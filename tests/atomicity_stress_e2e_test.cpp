@@ -357,13 +357,47 @@ void ReportFailure(const std::string& message) {
   stop_flag.store(true, std::memory_order_release);
 }
 
+struct StressStart {
+  std::latch readers_connected_{4};
+  std::latch run_{1};
+  std::latch readers_observed_{4};
+};
+
+// Each reader owns one arrival at each checkpoint. Unwinding a failed reader
+// releases its arrivals after ReportFailure sets stop_flag, so neither main
+// nor a writer can hang waiting for a connection or snapshot that will not
+// come.
+class ReaderProgress {
+ public:
+  explicit ReaderProgress(StressStart& start) : start_(start) {}
+  ReaderProgress(const ReaderProgress&) = delete;
+  ReaderProgress& operator=(const ReaderProgress&) = delete;
+  ~ReaderProgress() {
+    Connected();
+    Observed();
+  }
+  void Connected() {
+    if (!std::exchange(connected_, true))
+      start_.readers_connected_.count_down();
+  }
+  void Observed() {
+    if (!std::exchange(observed_, true)) start_.readers_observed_.count_down();
+  }
+
+ private:
+  StressStart& start_;
+  bool connected_ = false;
+  bool observed_ = false;
+};
+
 // W1 atomically writes {a, b}, W2 atomically writes {b, c}; each value is
 // writer-tagged. Any snapshot where b carries W1's tag must show a == b, and
 // any snapshot where b carries W2's tag must show c == b.
 void Writer(std::uint16_t port, const char* tag, const char* first,
-            const char* second) {
+            const char* second, StressStart& start) {
   try {
     RespClient client = Connect(port);
+    start.run_.wait();
     for (std::uint64_t i = 1;
          i <= kWritesPerWriter && !stop_flag.load(std::memory_order_acquire);
          ++i) {
@@ -374,6 +408,9 @@ void Writer(std::uint16_t port, const char* tag, const char* first,
         ReportFailure("writer MSET failed: " + reply);
         return;
       }
+      // Keep the write interval open until every connected reader has
+      // actually completed a snapshot, even if that reader is descheduled.
+      if (i == 1) start.readers_observed_.wait();
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("writer: ") + error.what());
@@ -397,22 +434,31 @@ void CheckSnapshot(const std::vector<std::string>& abc, const char* context) {
   }
 }
 
-void MgetReader(std::uint16_t port, std::uint64_t& snapshots) {
+void MgetReader(std::uint16_t port, std::uint64_t& snapshots,
+                StressStart& start) {
+  ReaderProgress progress(start);
   try {
     RespClient client = Connect(port);
+    progress.Connected();
+    start.run_.wait();
     while (!stop_flag.load(std::memory_order_acquire)) {
       const std::string reply = client.Command({"MGET", "sa", "sb", "sc"});
       CheckSnapshot(RespClient::ParseFlatArray(reply), "MGET");
       ++snapshots;
+      progress.Observed();
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("mget reader: ") + error.what());
   }
 }
 
-void ExecReader(std::uint16_t port, std::uint64_t& snapshots) {
+void ExecReader(std::uint16_t port, std::uint64_t& snapshots,
+                StressStart& start) {
+  ReaderProgress progress(start);
   try {
     RespClient client = Connect(port);
+    progress.Connected();
+    start.run_.wait();
     while (!stop_flag.load(std::memory_order_acquire)) {
       if (client.Command({"MULTI"}) != "+OK") {
         ReportFailure("exec reader MULTI failed");
@@ -424,6 +470,7 @@ void ExecReader(std::uint16_t port, std::uint64_t& snapshots) {
       const std::string reply = client.Command({"EXEC"});
       CheckSnapshot(RespClient::ParseFlatArray(reply), "EXEC");
       ++snapshots;
+      progress.Observed();
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("exec reader: ") + error.what());
@@ -432,9 +479,10 @@ void ExecReader(std::uint16_t port, std::uint64_t& snapshots) {
 
 // Two writers hammer the same pair with their own tags; every snapshot must
 // show both keys equal.
-void PairWriter(std::uint16_t port, const char* tag) {
+void PairWriter(std::uint16_t port, const char* tag, StressStart& start) {
   try {
     RespClient client = Connect(port);
+    start.run_.wait();
     for (std::uint64_t i = 1;
          i <= kWritesPerWriter && !stop_flag.load(std::memory_order_acquire);
          ++i) {
@@ -445,15 +493,22 @@ void PairWriter(std::uint16_t port, const char* tag) {
         ReportFailure("pair writer MSET failed: " + reply);
         return;
       }
+      // Keep the write interval open until every connected reader has
+      // actually completed a snapshot, even if that reader is descheduled.
+      if (i == 1) start.readers_observed_.wait();
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("pair writer: ") + error.what());
   }
 }
 
-void PairReader(std::uint16_t port, std::uint64_t& snapshots) {
+void PairReader(std::uint16_t port, std::uint64_t& snapshots,
+                StressStart& start) {
+  ReaderProgress progress(start);
   try {
     RespClient client = Connect(port);
+    progress.Connected();
+    start.run_.wait();
     while (!stop_flag.load(std::memory_order_acquire)) {
       const std::string reply = client.Command({"MGET", "ha", "hb"});
       const auto values = RespClient::ParseFlatArray(reply);
@@ -466,6 +521,7 @@ void PairReader(std::uint16_t port, std::uint64_t& snapshots) {
                       "'");
       }
       ++snapshots;
+      progress.Observed();
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("pair reader: ") + error.what());
@@ -496,7 +552,11 @@ int main(int argc, char** argv) {
       ServerProcess server(argv[1], port, data_path, log_path);
       {
         RespClient seed = Connect(port);
-        if (seed.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "1"}) !=
+        // Exercise online cleaning without rotating sparse per-worker 8 MiB
+        // transaction blocks every millisecond. Rotation can otherwise exhaust
+        // this small device before old generations become reclaimable, even
+        // with a bounded number of writes.
+        if (seed.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "100"}) !=
             "+OK") {
           Fail("enabling transaction cleaner failed");
         }
@@ -506,27 +566,22 @@ int main(int argc, char** argv) {
         }
       }
 
-      // Start all contenders together. Each reader owns one counter; main
-      // inspects those counters only after joining, so they need no atomics.
-      std::latch start(8);
+      // Each reader owns one counter; main inspects it only after joining.
+      // Connection readiness and actual snapshot progress are separate gates.
+      StressStart start;
       std::array<std::uint64_t, 4> snapshots{};
       std::vector<std::thread> writers, readers;
-      auto launch = [&](auto& threads, auto action) {
-        threads.emplace_back([&, action] {
-          start.count_down();
-          start.wait();
-          action();
-        });
-      };
-      launch(writers, [&] { Writer(port, "W1:", "sa", "sb"); });
-      launch(writers, [&] { Writer(port, "W2:", "sb", "sc"); });
-      launch(writers, [&] { PairWriter(port, "P1:"); });
-      launch(writers, [&] { PairWriter(port, "P2:"); });
-      launch(readers, [&] { MgetReader(port, snapshots[0]); });
-      launch(readers, [&] { MgetReader(port, snapshots[1]); });
-      launch(readers, [&] { ExecReader(port, snapshots[2]); });
-      launch(readers, [&] { PairReader(port, snapshots[3]); });
+      writers.emplace_back([&] { Writer(port, "W1:", "sa", "sb", start); });
+      writers.emplace_back([&] { Writer(port, "W2:", "sb", "sc", start); });
+      writers.emplace_back([&] { PairWriter(port, "P1:", start); });
+      writers.emplace_back([&] { PairWriter(port, "P2:", start); });
+      readers.emplace_back([&] { MgetReader(port, snapshots[0], start); });
+      readers.emplace_back([&] { MgetReader(port, snapshots[1], start); });
+      readers.emplace_back([&] { ExecReader(port, snapshots[2], start); });
+      readers.emplace_back([&] { PairReader(port, snapshots[3], start); });
 
+      start.readers_connected_.wait();
+      start.run_.count_down();
       for (auto& writer : writers) writer.join();
       stop_flag.store(true, std::memory_order_release);
       for (auto& reader : readers) reader.join();
