@@ -123,6 +123,52 @@ TEST(GroupedCollectionTest, RootAndPageRoundTripBothKinds) {
   }
 }
 
+TEST(GroupedCollectionTest, StringAndStreamHaveDistinctDurableKinds) {
+  for (const auto kind :
+       {OrderedCollectionKind::kStream, OrderedCollectionKind::kString}) {
+    OrderedCollectionRoot root{.kind_ = kind,
+                               .incarnation_ = 17,
+                               .item_count_ = 4,
+                               .first_group_ = 1,
+                               .last_group_ = 1,
+                               .next_group_id_ = 2,
+                               .group_count_ = 1};
+    const bool stream = kind == OrderedCollectionKind::kStream;
+    if (stream) root.stream_length_ = 0;
+    auto encoded = EncodeOrderedCollectionRoot(root);
+    ASSERT_TRUE(encoded.ok()) << encoded.status();
+    EXPECT_EQ(static_cast<unsigned char>((*encoded)[12]), stream ? 3 : 4);
+    auto decoded = DecodeOrderedCollectionRoot(*encoded);
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    EXPECT_EQ(*decoded, root);
+    EXPECT_EQ(OrderedKind(OrderedValueType(kind)), kind);
+    // Stream requires its length extension; raw String roots must not acquire
+    // that interpretation merely because a kind byte is changed.
+    (*encoded)[12] = static_cast<char>(stream ? OrderedCollectionKind::kString
+                                              : OrderedCollectionKind::kStream);
+    EXPECT_FALSE(DecodeOrderedCollectionRoot(*encoded).ok());
+  }
+}
+
+TEST(GroupedCollectionTest, StringSegmentBoundariesDoNotOrderPayloadBytes) {
+  OrderedGroupSnapshot left{
+      .kind_ = OrderedCollectionKind::kString,
+      .incarnation_ = 17,
+      .id_ = 1,
+      .next_ = 2,
+      .entries_ = {{.value_ = std::string(kStringGroupBytes, 'z')}}};
+  auto right = left;
+  right.id_ = 2;
+  right.previous_ = 1;
+  right.next_ = 0;
+  // Fixed segments are ordered by position, not by their arbitrary bytes.
+  EXPECT_TRUE(ValidateOrderedGroupBoundary(left, right).ok());
+  right.entries_.front().value_.assign(kStringGroupBytes, 'a');
+  EXPECT_TRUE(ValidateOrderedGroupBoundary(left, right).ok());
+  right.previous_ = 0;
+  EXPECT_FALSE(ValidateOrderedGroupBoundary(left, right).ok());
+}
+
 TEST(GroupedCollectionTest, StringSegmentsValidateLengthsAndDirectPositions) {
   OrderedGroupSnapshot first{
       .kind_ = OrderedCollectionKind::kString,

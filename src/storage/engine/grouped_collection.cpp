@@ -202,7 +202,7 @@ absl::StatusOr<std::string> EncodeOrderedCollectionRoot(
   bytes.replace(0, kRootMagic.size(), kRootMagic);
   Store(bytes, 8, 1, 4);
   Store(bytes, 12, static_cast<unsigned>(root.kind_), 1);
-  // Both shapes are v1. An explicit presence flag, rather than length alone,
+  // All shapes are v1. An explicit presence flag, rather than length alone,
   // prevents a truncated indexed root from becoming a valid ordered-only root.
   Store(bytes, 13, root.member_index_ ? 1 : root.stream_length_ ? 2 : 0, 1);
   Store(bytes, 16, root.incarnation_, 8);
@@ -481,7 +481,7 @@ absl::Status ValidateOrderedEntryBoundary(OrderedCollectionKind kind,
     // appear ordered across a page boundary.
     if (*last >= *first)
       return absl::DataLossError("Stream pages overlap or are unordered");
-  } else if (kind != OrderedCollectionKind::kList &&
+  } else if (kind == OrderedCollectionKind::kSortedSet &&
              !OrderedEntryLess(left, right)) {
     return absl::DataLossError("Sorted Set pages overlap or are unordered");
   }

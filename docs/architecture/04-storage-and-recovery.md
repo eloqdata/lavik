@@ -39,8 +39,8 @@ records remain the durable source of truth and recovery falls back to scanning
 them whenever a checkpoint is absent or invalid. Collections have compact
 complete-value encodings. String, Hash, Set, List, Sorted Set and Stream also have
 independently addressable complete group snapshots, selected through a sparse
-object side index when the top-level index marks a grouped representation. Their serving, transaction,
-recovery and graph-lifecycle boundaries are described in
+object side index when the top-level index marks a grouped representation.
+Their serving, transaction, recovery and graph-lifecycle boundaries are described in
 [Grouped collections](09-grouped-collections.md). Collection writes promote
 automatically at the compact-size threshold, while streaming imports construct
 grouped graphs directly. Hash/Set use prefix routing; List uses ordered pages.

@@ -19,15 +19,16 @@ limitations under the License.
 ## Boundary and availability
 
 Grouped storage is a representation inside the storage engine, not a new
-Redis keyspace or a separate database. String, Hash, Set, List, Sorted Set and Stream support
-compact values and complete, independently addressed group snapshots. Writes
+Redis keyspace or a separate database. String, Hash, Set, List, Sorted Set and
+Stream support compact values and complete, independently addressed group snapshots. Writes
 automatically promote compact collections at 16 KiB of encoded size, with an
 8 KiB target per group shared by all six types. Indivisible entries and Hash
 collisions can exceed that target. The grouped representation remains in use
 until the key is deleted or replaced.
 Streaming collection imports and grouped key transfers construct graphs directly.
 Stream RDB and native receiving also ingest logical records page by page. Both
-ordinary and Debug builds use the same read, mutation, recovery and maintenance adapters.
+ordinary and Debug builds use the same read, mutation, recovery and maintenance
+adapters.
 
 Strings use fixed 8 KiB byte segments; Hash/Set use a persisted-seed prefix
 directory; List uses an ordered-page directory. Newly built Sorted Sets combine
@@ -139,12 +140,14 @@ decision when present. Auxiliary records never enter the user-key winner merge
 or Redis key/expiry counts.
 
 The version-1 ordered-root payload has type-checked shapes: 72 bytes describe
-only the ordered graph, including String segments; 136 bytes append the 64-byte Hash root for an indexed
-Sorted Set; an 80-byte Stream root appends its user-visible length. A member-index presence flag must agree with the payload length,
-so a truncated indexed root cannot decode as an ordered-only root.
+only the ordered graph, including String segments; 136 bytes append the 64-byte
+Hash root for an indexed Sorted Set; an 80-byte Stream root appends its
+user-visible length. A member-index presence flag must agree with the payload
+length, so a truncated indexed root cannot decode as an ordered-only root.
 
-String uses a distinct ordered kind whose root and page counts measure bytes.
-Its page payload is a checked 64-byte envelope followed by at most 8 KiB of
+The durable ordered kinds are List=1, Sorted Set=2, Stream=3 and String=4.
+String root and page counts measure bytes. Its page payload is a checked
+64-byte envelope followed by at most 8 KiB of
 raw bytes, without per-item framing. Recovery checks dense IDs, fixed segment
 lengths, links, and aggregate byte length. String value segments fit ordinary
 records; oversized parent keys retain the existing external-payload rules.
