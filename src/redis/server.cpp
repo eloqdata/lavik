@@ -1108,6 +1108,9 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
     // already closes request and replication gates, so asynchronous cluster
     // cleanup need not compete with request processing for foreground budget.
     worker.SpawnBackground(MonitorRuntimeHealth(worker));
+    if (AutomaticRdbBackupsConfigured()) {
+      worker.SpawnBackground(RunRdbBackupScheduler(worker));
+    }
   }
   replication_->StorageReady(worker);
   co_return co_await TcpService::Run(worker, ctx);
@@ -2470,7 +2473,8 @@ int RunServer(ServerOptions options) {
   InitRdbBackup(
       &storage,
       absl::StrCat(options.rdb_dir_, options.rdb_dir_.ends_with('/') ? "" : "/",
-                   options.dbfilename_));
+                   options.dbfilename_),
+      std::move(options.rdb_save_rules_));
   InitWorkerMetrics(options.shard_count_);
   InitSlowLog(options.shard_count_, options.slowlog_log_slower_than_us_,
               options.slowlog_max_len_);
@@ -2598,6 +2602,7 @@ int RunServer(ServerOptions options) {
                  (signal == 0 ? "unknown" : std::to_string(signal)));
 
     redis.StopAcceptingRequests();
+    StopAutomaticRdbBackups();
     server.StopAccepting();
     // A native or Redis downstream can pin a full backlog and suspend an
     // already-admitted publisher. Close replication transports before either

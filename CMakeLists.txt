@@ -1467,6 +1467,23 @@ endforeach()
         RUN_SERIAL TRUE)
     endif()
 
+    execute_process(
+      COMMAND ${Python3_EXECUTABLE} -c
+              "import redis; assert redis.__version__ == '8.1.0'"
+      RESULT_VARIABLE LAVIK_REDIS_PY_8_1_AVAILABLE
+      OUTPUT_QUIET
+      ERROR_QUIET)
+    if (LAVIK_REDIS_PY_8_1_AVAILABLE EQUAL 0)
+      add_test(
+        NAME lavik_redis_py_bgsave_e2e
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_py_bgsave_e2e.py
+                $<TARGET_FILE:lavik>)
+      set_tests_properties(lavik_redis_py_bgsave_e2e PROPERTIES
+        TIMEOUT 60
+        RUN_SERIAL TRUE)
+    endif()
+
     add_executable(lavik_replication_log_e2e_test
       tests/replication_log_e2e_test.cpp
     )

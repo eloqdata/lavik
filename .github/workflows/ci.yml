@@ -81,7 +81,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang-18 cmake ninja-build libssl-dev openssl python3 \
-            curl tcl
+            python3-venv curl tcl
+          python3 -m venv "$RUNNER_TEMP/lavik-test-venv"
+          "$RUNNER_TEMP/lavik-test-venv/bin/pip" install redis==8.1.0
+          echo "$RUNNER_TEMP/lavik-test-venv/bin" >> "$GITHUB_PATH"
       - name: Prepare test host
         run: |
           sudo sysctl -w kernel.io_uring_disabled=0

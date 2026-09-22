@@ -88,6 +88,7 @@ emit_hash_fields() {
 
 source_port=16479
 import_port=16480
+automatic_port=16481
 truncate -s 1G "${case_dir}/source.data"
 LAVIK_RDB_CAPTURE_PAUSE_MS=500 \
 "${lavik_bin}" --logtostderr --port "${source_port}" --threads 4 --no-pin-workers \
@@ -204,5 +205,51 @@ values=$("${redis_cli}" -p "${import_port}" --scan --pattern 'key:*' |
 [[ $("${redis_cli}" -p "${import_port}" function list libraryname rdb_library |
   grep -c rdb_get) -ge 1 ]]
 
+# A second request made after BGSAVE's global cut must schedule exactly one
+# successor while the first job continues scanning this deliberately large
+# dataset. Repeated SCHEDULE requests coalesce into that same successor.
+completed_before=$(grep -c "RDB backup completed:" "${case_dir}/import.log" || true)
+[[ $("${redis_cli}" -p "${import_port}" bgsave) == "Background saving started" ]]
+[[ $("${redis_cli}" -p "${import_port}" bgsave schedule) == \
+  "Background saving scheduled" ]]
+[[ $("${redis_cli}" -p "${import_port}" bgsave schedule) == \
+  "Background saving scheduled" ]]
+for _ in $(seq 1 6000); do
+  completed_now=$(grep -c "RDB backup completed:" "${case_dir}/import.log" || true)
+  if ((completed_now >= completed_before + 2)); then break; fi
+  sleep 0.01
+done
+((completed_now == completed_before + 2))
+[[ $("${redis_cli}" -p "${import_port}" bgsave not-a-mode 2>&1) == \
+  "ERR syntax error" ]]
+
+stop_server "${import_pid}"
+import_pid=
+
+# Automatic policies are opt-in. Each pair requires both elapsed time and the
+# unsaved-change threshold; the worker-zero scheduler checks once per second.
+cat >"${case_dir}/automatic.conf" <<EOF
+port ${automatic_port}
+save 1 1
+dir ${case_dir}
+dbfilename automatic.rdb
+EOF
+truncate -s 1G "${case_dir}/automatic.data"
+"${lavik_bin}" "${case_dir}/automatic.conf" --logtostderr --threads 2 \
+  --no-pin-workers --recv-buffers-per-worker 0 \
+  --data-file "${case_dir}/automatic.data" \
+  >"${case_dir}/automatic.log" 2>&1 &
+import_pid=$!
+wait_ready "${automatic_port}"
+"${redis_cli}" -p "${automatic_port}" set automatic-key value >/dev/null
+for _ in $(seq 1 1000); do
+  if [[ -s "${case_dir}/automatic.rdb" ]] &&
+    grep -q "automatic RDB save triggered" "${case_dir}/automatic.log"; then
+    break
+  fi
+  sleep 0.01
+done
+[[ -s "${case_dir}/automatic.rdb" ]]
+grep -q "automatic RDB save triggered" "${case_dir}/automatic.log"
 stop_server "${import_pid}"
 import_pid=
