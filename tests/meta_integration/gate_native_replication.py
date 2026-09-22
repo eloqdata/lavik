@@ -646,7 +646,13 @@ def backpressured_shutdown(root):
 
 
 def replica_backup_during_exec(root):
-    with pair(root, "replica-backup-exec") as (meta, source, target, writer):
+    # Release builds keep the concurrent smoke test; fault-enabled binaries
+    # additionally prove that replay reaches the closed backup gate.
+    deterministic = C.has_fault(C.DATA, b"LAVIK_BACKUP_CUT_HOLD_FILE")
+    hold = root / "backup-cut.hold"
+    faults = {"LAVIK_BACKUP_CUT_HOLD_FILE": str(hold)} if deterministic else {}
+    with pair(root, "replica-backup-exec", target_faults=faults) as (
+            meta, source, target, writer):
         ready(meta)
         reader = Client(target, readonly=True)
         stopped = threading.Event()
@@ -682,16 +688,33 @@ def replica_backup_during_exec(root):
                 raise
 
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 pending = pool.submit(write_transactions)
                 try:
                     assert started.wait(timeout=10)
                     dump = Path(target.workdir) / "dump.rdb"
-                    for _ in range(16):
+                    for iteration in range(16):
                         previous = dump.stat().st_mtime_ns if dump.exists() else 0
                         completed = Path(target.log_path).read_text().count(
                             "RDB backup completed:")
-                        H.wait_until("replica backup admitted", 10, start_backup)
+                        if deterministic and iteration == 0:
+                            hold.touch()
+                            # BGSAVE replies only after its cut reopens. Run it
+                            # separately while observing the target checkpoint.
+                            backup = pool.submit(start_backup)
+                            try:
+                                H.wait_until("backup gates closed", 10, lambda:
+                                    "backup test checkpoint: database gates closed" in
+                                    Path(target.log_path).read_text())
+                                H.wait_until("replica EXEC blocked by backup", 10, lambda:
+                                    "backup test checkpoint: replica EXEC waiting for database admission" in
+                                    Path(target.log_path).read_text())
+                                assert not backup.done(), "backup cut reopened before release"
+                            finally:
+                                hold.unlink(missing_ok=True)
+                            assert backup.result(timeout=10)
+                        else:
+                            H.wait_until("replica backup admitted", 10, start_backup)
                         H.wait_until("replica backup completed", 30, lambda:
                                      dump.exists() and dump.stat().st_mtime_ns != previous
                                      and Path(target.log_path).read_text().count(
@@ -699,6 +722,7 @@ def replica_backup_during_exec(root):
                         assert "lavik_replication_state:online" in reader.call(
                             "INFO", "replication")
                 finally:
+                    hold.unlink(missing_ok=True)
                     stopped.set()
                 count = pending.result(timeout=15)
             assert count > 0

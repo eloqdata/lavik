@@ -9598,6 +9598,16 @@ Task<CommandReply> ExecuteExecBody(
       co_return finalize_exec_reply(BuiltReply(
           AppendTryAgainError(reply_builder, "database flush is in progress")));
     }
+    LAVIK_FAULT_INJECT(
+        // The backup fixture waits for target-side contention, not merely a
+        // source acknowledgement. Emit once to avoid flooding a held gate.
+        static std::atomic<bool> reported = false;
+        if (std::getenv("LAVIK_BACKUP_CUT_HOLD_FILE") != nullptr &&
+            !reported.exchange(true, std::memory_order_relaxed)) {
+          spdlog::warn(
+              "backup test checkpoint: replica EXEC waiting for database "
+              "admission");
+        });
     // Replica EXEC waits at admission, never by retrying a partially applied
     // transaction. Release every acquired DB before suspension so the cut can
     // drain even when it closed a later database in this transaction.
