@@ -951,6 +951,10 @@ int Run(const std::string& path, lavik::storage::ValueType large_type,
   options.data_files_ = {path};
   options.buffers_.registered_bytes_ = 64 * kMiB;
   options.replication_publish_queue_bytes_ = 16 * kMiB;
+  // Segmented Strings retire transaction blocks, unlike the old extent-only
+  // fixture. Exercise online reclamation without waiting for its 60 s default.
+  options.tx_cleaner_cooldown_ms_ = 1;
+  options.flush_max_ms_ = 10;
   StorageEngine storage(std::move(options));
   lavik::InitWorkerMetrics(1);
   absl::Status memory = lavik::InitMemoryLimit(

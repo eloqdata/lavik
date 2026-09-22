@@ -868,8 +868,14 @@ substitute for the storage epoch used by recovery.
 
 Transaction cleaning rotates record-bearing generations, seals and flushes
 their blocks, collects committed decisions, and relocates current committed
-tagged winners into ordinary untagged record blocks. A generation is returned
-through the cold-free lifecycle only when it is sealed and durable and has no
+tagged winners into ordinary untagged record blocks. Rotation leaves at most
+one closed generation with outstanding transaction leases; the current
+generation remains open until those accepted transactions settle. This bounds
+the append streams needed by delayed commits rather than allowing a short
+cleaner cooldown to exhaust capacity with unretirable generations. Historical
+snapshot pins alone do not prevent rotation or cleanup of newer generations.
+A generation is returned through the cold-free lifecycle only when it is
+sealed and durable and has no
 active transaction leases, live tagged bytes, or dependency pins. When a
 transaction block is durably retired, its deferred external-key extent debt is
 released through the same asynchronous reclaim path as an ordinary record

@@ -191,6 +191,65 @@ class ExpirationAuthorityTestPeer {
 // transactions and accidentally make capacity available to the writer.
 class WriteBufferPressureTestPeer {
  public:
+  static bycorf::Task<absl::Status> ExerciseRotation(StorageEngine& storage) {
+    auto& impl = *storage.impl_;
+    TxShardWrites first;
+    storage.InitializeTxWrites(StorageEngine::AllocateWriteTxid(),
+                               std::span(&first, 1));
+    auto written = co_await storage.SetLocked(0, "rotation-first",
+                                              ComputeDigest("rotation-first"),
+                                              "first", {}, &first);
+    if (!written.ok()) co_return written.status();
+    auto cleaned = co_await impl.RunTxCleaner();
+    if (!cleaned.ok()) co_return cleaned;
+    const auto next = impl.current_tx_generation_.load();
+    if (next != first.generation_ + 1)
+      co_return absl::FailedPreconditionError("first generation did not close");
+
+    TxShardWrites second;
+    storage.InitializeTxWrites(StorageEngine::AllocateWriteTxid(),
+                               std::span(&second, 1));
+    written = co_await storage.SetLocked(0, "rotation-second",
+                                         ComputeDigest("rotation-second"),
+                                         "second", {}, &second);
+    if (!written.ok()) co_return written.status();
+    for (unsigned round = 0; round < 8; ++round) {
+      cleaned = co_await impl.RunTxCleaner();
+      if (!cleaned.ok()) co_return cleaned;
+      if (impl.current_tx_generation_.load() != next)
+        co_return absl::FailedPreconditionError(
+            "cleaner accumulated closed generations behind a live lease");
+    }
+    std::vector<TxShardWrites*> first_shards{&first};
+    auto committed =
+        co_await storage.CommitTxWrites(first.txid_, std::move(first_shards));
+    if (!committed.ok()) co_return committed;
+    first = {};
+    cleaned = co_await impl.RunTxCleaner();
+    if (!cleaned.ok()) co_return cleaned;
+    if (impl.current_tx_generation_.load() != next + 1)
+      co_return absl::FailedPreconditionError(
+          "lease release did not reenable rotation");
+    std::vector<TxShardWrites*> second_shards{&second};
+    committed =
+        co_await storage.CommitTxWrites(second.txid_, std::move(second_shards));
+    if (!committed.ok()) co_return committed;
+    second = {};
+    cleaned = co_await impl.RunTxCleaner();
+    if (!cleaned.ok()) co_return cleaned;
+    for (const auto& key : {"rotation-first", "rotation-second"}) {
+      auto value = co_await storage.Get(0, key);
+      if (!value.ok()) co_return value.status();
+      const auto bytes = value->value_bytes();
+      const std::string_view expected = std::string_view(key).substr(9);
+      if (std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                           bytes.size()) != expected)
+        co_return absl::DataLossError(
+            "generation rotation lost a committed value");
+    }
+    co_return absl::OkStatus();
+  }
+
   static bycorf::Task<absl::Status> Exercise(StorageEngine& storage,
                                              bool extent) {
     using namespace std::chrono_literals;
@@ -611,14 +670,17 @@ class FiniteExpirationAuthorityService final : public bycorf::Service {
 class WriteBufferPressureService final : public bycorf::Service {
  public:
   WriteBufferPressureService(lavik::storage::StorageEngine& storage,
-                             bool extent)
-      : storage_(storage), extent_(extent) {}
+                             bool extent, bool rotation = false)
+      : storage_(storage), extent_(extent), rotation_(rotation) {}
   bycorf::Task<absl::Status> Run(bycorf::Worker& worker,
                                  bycorf::ServiceContext) override {
     lavik::BindMemoryAccountingShard(worker.id());
     lavik::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
     result_ = co_await storage_.InitializeWorker(worker);
-    if (result_.ok())
+    if (result_.ok() && rotation_)
+      result_ = co_await lavik::storage::WriteBufferPressureTestPeer::
+          ExerciseRotation(storage_);
+    else if (result_.ok())
       result_ = co_await lavik::storage::WriteBufferPressureTestPeer::Exercise(
           storage_, extent_);
     worker.RequestStop();
@@ -634,6 +696,7 @@ class WriteBufferPressureService final : public bycorf::Service {
  private:
   lavik::storage::StorageEngine& storage_;
   bool extent_;
+  bool rotation_;
 };
 
 }  // namespace
@@ -963,4 +1026,31 @@ TEST(StorageCapacityTest, LiveTransactionGenerationsCannotStarveStaging) {
     server.WaitUntilStopped();
     EXPECT_TRUE(service.result_.ok()) << service.result_;
   }
+}
+
+TEST(StorageCapacityTest, CleanerBoundsGenerationsWhileCommitIsOutstanding) {
+  const std::string path = lavik::test::TestDataPath(
+      "lavik-generation-rotation-" + std::to_string(::getpid()) + ".data");
+  Cleanup cleanup{{path}};
+  ASSERT_TRUE(CreateFile(path, 128 * kMiB));
+  lavik::storage::StorageEngineOptions options;
+  options.data_files_ = {path};
+  options.buffers_.registered_bytes_ = 64 * kMiB;
+  options.tx_cleaner_cooldown_ms_ = 0;  // The peer drives exact cleaner rounds.
+  options.expiration_authority_ = false;
+  lavik::storage::StorageEngine storage(std::move(options));
+  lavik::InitWorkerMetrics(1);
+  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(storage.Prepare(1).ok());
+  if (lavik::tx::TxRuntime::Get() == nullptr) lavik::tx::TxRuntime::Create(1);
+  WriteBufferPressureService service(storage, false, true);
+  bycorf::Server server;
+  server.AddService(&service);
+  bycorf::ServerOptions runtime;
+  runtime.thread_count_ = 1;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(runtime).ok());
+  server.WaitUntilStopped();
+  EXPECT_TRUE(service.result_.ok()) << service.result_;
 }

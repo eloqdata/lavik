@@ -2451,20 +2451,30 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
           : (partition_ptr == nullptr ? nullptr
                                       : &partition_ptr->indexes_[db_id]);
   const bool transaction_append = txid != 0;
-  // Segment batches can exhaust a device after appending many small records.
-  // Leave two direct-I/O pages for the nested and outer decisions: flushing
-  // either decision consumes the remainder of its page. Keeping only a few
-  // header bytes free would still strand abandoned segments after padding.
-  const auto append_limit =
-      transaction_append && group != nullptr && value_type == ValueType::kString
-          ? kStorageBlockBytes - 2 * kDirectIoAlignment
-          : kStorageBlockBytes;
   const std::uint64_t tx_generation =
       transaction_append && tx != nullptr ? tx->generation_ : 0;
   if (transaction_append && tx_generation == 0) {
     co_return absl::InvalidArgumentError(
         "transaction record has no generation lease");
   }
+  // Several acknowledged segment batches can still await their decisions.
+  // Reserve direct-I/O pages for all local generation leases, not just the
+  // current command: flushing a decision consumes the remainder of its page.
+  // Include an extra nested/outer pair for a borrowed cross-worker receipt.
+  // Recompute after waits, when another writer may have acquired a lease.
+  auto append_limit = [&]() -> std::uint64_t {
+    if (!transaction_append || group == nullptr ||
+        value_type != ValueType::kString)
+      return kStorageBlockBytes;
+    const auto runtime = store.tx_generations_.find(tx_generation);
+    const auto leases = runtime == store.tx_generations_.end()
+                            ? 0
+                            : runtime->second->active_transactions_.load(
+                                  std::memory_order_acquire);
+    const auto pages = std::min<std::uint64_t>(
+        leases + 1, kStorageBlockBytes / (2 * kDirectIoAlignment));
+    return kStorageBlockBytes - pages * 2 * kDirectIoAlignment;
+  };
   const BlockKind append_block_kind =
       transaction_append ? BlockKind::kTransaction : BlockKind::kRecords;
   LAVIK_FAULT_INJECT(
@@ -2511,7 +2521,11 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
 acquire_active_stream:
   if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
   while (!active_stream().has_value() ||
-         active_stream()->committed_bytes_ + total_disk_bytes > append_limit) {
+         active_stream()->committed_bytes_ + total_disk_bytes >
+             append_limit()) {
+    if (total_disk_bytes + kBlockHeaderBytes > append_limit())
+      co_return absl::ResourceExhaustedError(
+          "transaction decisions occupy segment append capacity");
     // Waiting for a physical block must not hold store_state_mutex_: the
     // allocator, flush completion, and the elected writer may all need this
     // worker's state before the new stream can be published. The gate is per
@@ -2527,7 +2541,7 @@ acquire_active_stream:
       // reached the front. Reuse it instead of allocating a spare block.
       if (active_stream().has_value() &&
           active_stream()->committed_bytes_ + total_disk_bytes <=
-              append_limit) {
+              append_limit()) {
         continue;
       }
     }
@@ -2556,7 +2570,8 @@ acquire_active_stream:
     // Recheck after allocation released the store lock: a maintenance path
     // may have installed a successor, or another writer consumed the tail.
     if (active_stream().has_value() &&
-        active_stream()->committed_bytes_ + total_disk_bytes <= append_limit) {
+        active_stream()->committed_bytes_ + total_disk_bytes <=
+            append_limit()) {
       absl::Status returned = co_await return_reserved(*allocated);
       if (!returned.ok()) co_return returned;
       continue;
@@ -2799,7 +2814,7 @@ acquire_active_stream:
   // this coroutine is suspended. Re-enter allocation before dereferencing the
   // optional or appending to a replacement block that no longer has room.
   if (!active_stream().has_value() ||
-      active_stream()->committed_bytes_ + total_disk_bytes > append_limit) {
+      active_stream()->committed_bytes_ + total_disk_bytes > append_limit()) {
     goto acquire_active_stream;
   }
   const bool has_index_extra = expire_at_ms != 0;

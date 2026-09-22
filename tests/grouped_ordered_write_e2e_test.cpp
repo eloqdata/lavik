@@ -156,6 +156,62 @@ TEST(GroupedStringWriteE2e, TransactionsTransferAndRdbKeepStringSemantics) {
   EXPECT_EQ(client.Command({"GET", "restored"}).text_, value);
 }
 
+TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
+  // Grouped writes need a transaction stream in addition to ordinary cleaner
+  // output/tombstones. Bound the device to three foreground blocks, then fill
+  // it rather than assuming a byte count implies physical exhaustion.
+  PrivateDisk disk(96ULL * 1024 * 1024);
+  disk.PreserveOnFailure();
+  Server server(disk, 1);
+  server.PreserveOnFailure();
+  Client client(server.port());
+  const std::string value(900 * 1024, 'e');
+  ASSERT_EQ(client.Command({"DEFRAG", "RESUME"}).text_, "OK");
+  for (unsigned i = 0; i < 7; ++i) {
+    ASSERT_EQ(client
+                  .Command({"SET", "{expiry-387}" + std::to_string(i), value,
+                            "PX", "2000"})
+                  .text_,
+              "OK");
+  }
+  bool full = false;
+  for (unsigned i = 0; i < 32; ++i) {
+    const auto reply = client.Command(
+        {"SET", "{expiry-387}fill:" + std::to_string(i), value, "PX", "2000"});
+    if (reply.text_ == "OK") continue;
+    ASSERT_NE(reply.text_.find("out of disk space"), std::string::npos);
+    full = true;
+    break;
+  }
+  ASSERT_TRUE(full);
+  const auto deadline = std::chrono::steady_clock::now() + 15s;
+  Reply reply;
+  do {
+    // Enqueue lazy expiration as well: this is a storage-capacity test, not a
+    // deadline for a complete sweep of all partition/database maps.
+    for (unsigned i = 0; i < 32; ++i) {
+      (void)client.Command({"EXISTS", "{expiry-387}" + std::to_string(i),
+                            "{expiry-387}fill:" + std::to_string(i)});
+    }
+    reply = client.Command({"SET", "replacement", value});
+    if (reply.text_ == "OK") break;
+    ASSERT_NE(reply.text_.find("out of disk space"), std::string::npos);
+    std::this_thread::sleep_for(100ms);
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(reply.text_, "OK")
+      << client.Command({"INFO", "STATS"}).text_
+      << client.Command({"INFO", "KEYSPACE"}).text_ << server.Log();
+  EXPECT_EQ(client.Command({"GET", "replacement"}).text_, value);
+  client.Durable();
+  ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  EXPECT_EQ(server.Log().find("commit append failed"), std::string::npos)
+      << server.Log();
+  Server recovered(disk, 1);
+  Client reader(recovered.port());
+  EXPECT_EQ(reader.Command({"GET", "replacement"}).text_, value);
+  EXPECT_EQ(reader.Command({"EXISTS", "{expiry-387}0"}).text_, "0");
+}
+
 class GroupedStringCrashE2e : public testing::TestWithParam<const char*> {};
 
 TEST_P(GroupedStringCrashE2e, PartialSegmentBatchKeepsPreviousRoot) {

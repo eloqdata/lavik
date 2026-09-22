@@ -3770,9 +3770,6 @@ class StorageEngine::Impl {
   Task<std::vector<std::uint64_t>> ListTxGenerationsLocal(
       WorkerStore& store, std::uint64_t closed_before);
 
-  Task<bool> TxGenerationHasRecordsLocal(WorkerStore& store,
-                                         std::uint64_t generation);
-
   Task<absl::Status> ForgetTxGenerationLocal(WorkerStore& store,
                                              std::uint64_t generation);
   Task<absl::Status> PromoteTxGenerationLocal(

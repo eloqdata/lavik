@@ -473,6 +473,13 @@ std::uint64_t CopyCommittedHeaderToUnusedAllocatedBlock(
   return target;
 }
 
+// These fixtures target ordinary-block defrag, including its PAUSE contract.
+// Oversized parent keys keep large Strings in that layout; short-key grouped
+// String expiration/reclamation is covered by the grouped write suite.
+std::string OrdinaryKey(std::string_view suffix) {
+  return std::string(8193, 'k') + std::string(suffix);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -516,7 +523,7 @@ int main(int argc, char** argv) {
       unsigned inserted = 0;
       bool observed_full = false;
       for (unsigned i = 0; i < 32; ++i) {
-        const std::string key = "old-" + std::to_string(i);
+        const std::string key = OrdinaryKey("old-" + std::to_string(i));
         const std::string response = client.Command({"SET", key, value});
         if (response == "+OK") {
           ++inserted;
@@ -539,7 +546,7 @@ int main(int argc, char** argv) {
       Expect(client.Command({"DEFRAG", "PAUSE"}), "+OK", "DEFRAG PAUSE");
       Expect(client.Command({"FLUSHDB"}), "+OK", "FLUSHDB");
       const std::string paused_response =
-          client.Command({"SET", "paused-fresh", value});
+          client.Command({"SET", OrdinaryKey("paused-fresh"), value});
       if (!paused_response.starts_with("-ERR ") ||
           paused_response.find("out of disk space") == std::string::npos) {
         Fail("paused defrag did not report stable device exhaustion: " +
@@ -548,11 +555,12 @@ int main(int argc, char** argv) {
       Expect(client.Command({"DEFRAG", "RESUME"}), "+OK", "DEFRAG RESUME");
       // The active block has become entirely dead. Once resumed, this write
       // waits while defrag returns it to the ready pool.
-      Expect(client.Command({"SET", "fresh", value}), "+OK",
+      Expect(client.Command({"SET", OrdinaryKey("fresh"), value}), "+OK",
              "post-FLUSHDB SET");
       Expect(client.Command({"DBSIZE"}), ":1", "DBSIZE");
-      Expect(client.Command({"EXISTS", "old-0", "fresh"}), ":1",
-             "EXISTS before restart");
+      Expect(client.Command(
+                 {"EXISTS", OrdinaryKey("old-0"), OrdinaryKey("fresh")}),
+             ":1", "EXISTS before restart");
       server.Stop();
     }
 
@@ -579,13 +587,14 @@ int main(int argc, char** argv) {
         for (unsigned i = 0; i < kExpiringKeys; ++i) {
           // Keep the keys in one low-numbered partition so the assertion
           // measures retirement and reclaim, not a complete partition sweep.
-          const std::string key = "{expiry-387}" + std::to_string(i);
+          const std::string key =
+              OrdinaryKey("{expiry-387}" + std::to_string(i));
           Expect(client.Command({"SET", key, value, "PX", "5000"}), "+OK",
                  "full-device expiring SET");
         }
         bool observed_full = false;
         for (unsigned i = 0; i < 64; ++i) {
-          const std::string key = "full-live-" + std::to_string(i);
+          const std::string key = OrdinaryKey("full-live-" + std::to_string(i));
           const std::string response = client.Command({"SET", key, value});
           if (response == "+OK") continue;
           if (response.starts_with("-ERR ") &&
@@ -607,7 +616,7 @@ int main(int argc, char** argv) {
         bool write_recovered = false;
         while (std::chrono::steady_clock::now() < reclaim_deadline) {
           const std::string response =
-              client.Command({"SET", "after-full-expiry", value});
+              client.Command({"SET", OrdinaryKey("after-full-expiry"), value});
           if (response == "+OK") {
             write_recovered = true;
             break;
@@ -626,7 +635,8 @@ int main(int argc, char** argv) {
         std::vector<std::string> expiring_names;
         expiring_names.reserve(kExpiringKeys);
         for (unsigned i = 0; i < kExpiringKeys; ++i) {
-          expiring_names.push_back("{expiry-387}" + std::to_string(i));
+          expiring_names.push_back(
+              OrdinaryKey("{expiry-387}" + std::to_string(i)));
         }
         for (const std::string& key : expiring_names) exists.push_back(key);
         Expect(client.Command(exists), ":0", "full-device expired EXISTS");
@@ -635,10 +645,10 @@ int main(int argc, char** argv) {
       {
         ServerProcess server(argv[1], port, {expiry_full_path}, log_path);
         RespClient client = Connect(port);
-        Expect(client.Command({"EXISTS", "{expiry-387}0"}), ":0",
+        Expect(client.Command({"EXISTS", OrdinaryKey("{expiry-387}0")}), ":0",
                "full-device expired key after restart");
-        Expect(client.Command({"EXISTS", "after-full-expiry"}), ":1",
-               "full-device recovered write after restart");
+        Expect(client.Command({"EXISTS", OrdinaryKey("after-full-expiry")}),
+               ":1", "full-device recovered write after restart");
         server.Stop();
       }
     }
@@ -682,8 +692,9 @@ int main(int argc, char** argv) {
       RespClient client = Connect(port);
       Expect(client.Command({"PING"}), "+PONG", "restart PING");
       Expect(client.Command({"DBSIZE"}), ":1", "restart DBSIZE");
-      Expect(client.Command({"EXISTS", "old-0", "fresh"}), ":1",
-             "EXISTS after restart");
+      Expect(client.Command(
+                 {"EXISTS", OrdinaryKey("old-0"), OrdinaryKey("fresh")}),
+             ":1", "EXISTS after restart");
       server.Stop();
     }
 

@@ -1232,8 +1232,13 @@ int main(int argc, char** argv) {
                                  false, 4, {}, "1000");
     RespClient standby_control = ConnectReady(port);
     const std::string standby_payload(7 * 1024 * 1024, 's');
-    Expect(standby_control.Command(
-               {"SET", "standby-leader{standby}", standby_payload}),
+    // Oversized parent keys deliberately retain the legacy String layout.
+    // This fixture exercises ordinary-stream prefetch, not grouped tx IO.
+    const std::string standby_leader =
+        std::string(8193, 'k') + "leader{standby}";
+    const std::string standby_follower =
+        std::string(8193, 'k') + "follower{standby}";
+    Expect(standby_control.Command({"SET", standby_leader, standby_payload}),
            "+OK", "create ordinary stream and request its standby");
     const auto standby_marker_deadline = std::chrono::steady_clock::now() + 30s;
     bool standby_marker_seen = false;
@@ -1245,11 +1250,10 @@ int main(int argc, char** argv) {
       if (!standby_marker_seen) std::this_thread::sleep_for(20ms);
     }
     if (!standby_marker_seen) Fail("standby prefetch pause did not engage");
-    auto standby_waiter =
-        std::async(std::launch::async, [port, &standby_payload] {
+    auto standby_waiter = std::async(
+        std::launch::async, [port, &standby_payload, &standby_follower] {
           RespClient client = Connect(port);
-          return client.Command(
-              {"SET", "standby-follower{standby}", standby_payload});
+          return client.Command({"SET", standby_follower, standby_payload});
         });
     if (standby_waiter.wait_for(200ms) == std::future_status::ready) {
       Fail("ordinary rollover bypassed an in-flight standby prefetch");
@@ -1258,10 +1262,10 @@ int main(int argc, char** argv) {
       Fail("standby prefetch stranded an ordinary rollover");
     }
     Expect(standby_waiter.get(), "+OK", "ordinary standby rollover");
-    Expect(standby_control.Command({"STRLEN", "standby-leader{standby}"}),
-           ":7340032", "standby leader value length");
-    Expect(standby_control.Command({"STRLEN", "standby-follower{standby}"}),
-           ":7340032", "standby follower value length");
+    Expect(standby_control.Command({"STRLEN", standby_leader}), ":7340032",
+           "standby leader value length");
+    Expect(standby_control.Command({"STRLEN", standby_follower}), ":7340032",
+           "standby follower value length");
     standby_server.Stop();
 #endif
 
