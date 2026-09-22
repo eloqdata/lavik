@@ -2783,6 +2783,7 @@ class StorageEngine::Impl {
 
  private:
   friend class ExpirationAuthorityTestPeer;
+  friend class WriteBufferPressureTestPeer;
 
   struct DurableSystemState {
     std::uint64_t generation_ = 0;

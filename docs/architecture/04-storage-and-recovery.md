@@ -550,6 +550,14 @@ as SORT STORE and list-move operations still wait through tagged-record fences
 and commit-record append. Even an awaited `CommitTxWrites` only requests the
 commit-record flush; it is not a synchronous crash-durability fence.
 
+Staging-buffer pressure seals physical append streams before a writer waits
+for capacity. This does not retire transaction generations: live leases and
+tagged records survive, and later writes or commit decisions may open another
+block in the same generation. Flush completion returns sealed buffers after
+their last reader pin drains, including tails that were already durable.
+Capacity therefore does not depend on completing transactions that themselves
+need a staging buffer to commit.
+
 ### Reads and pins
 
 An ordinary single-key GET may resolve its complete inline-key index entry
