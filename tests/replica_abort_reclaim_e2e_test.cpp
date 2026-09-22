@@ -825,16 +825,25 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
 
   bycorf::Task<absl::Status> WaitForCapacityIncrease(std::uint64_t previous,
                                                      std::string_view failure) {
-    for (unsigned attempt = 0; attempt < 500; ++attempt) {
+    // A grouped String may retain thousands of segment records. Releasing its
+    // pin starts asynchronous promotion/flush/reclaim, not a fixed-latency
+    // operation; keep a bounded wall-clock budget independent of poll count.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    std::uint64_t available = previous;
+    do {
       absl::Status slept =
-          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(1));
+          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(10));
       if (!slept.ok()) co_return slept;
       const auto metrics = co_await storage_->CollectMetrics();
-      if (metrics.devices_.front().available_bytes_ > previous) {
+      available = metrics.devices_.front().available_bytes_;
+      if (available > previous) {
         co_return absl::OkStatus();
       }
-    }
-    co_return absl::FailedPreconditionError(std::string(failure));
+    } while (std::chrono::steady_clock::now() < deadline);
+    co_return absl::FailedPreconditionError(
+        std::string(failure) + ": previous=" + std::to_string(previous) +
+        " available=" + std::to_string(available));
   }
 
   void CheckRetainedMemory(std::optional<std::uint64_t>& first_retained,
