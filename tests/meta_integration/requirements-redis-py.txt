@@ -1,0 +1,5 @@
+# redis-py 8.1.0 — pinned standard client acceptance baseline for the Sentinel
+# and Cluster client compatibility gates. Pure-Python
+# wheel; redis-py has no required runtime dependencies on Python >= 3.11.3 (the
+# async-timeout marker does not apply).
+redis==8.1.0 --hash=sha256:a4fe1aac3d3b3cc791d4b3d5931c5a956045dc951ee74d1c913ee3ac4d2ee9fb
