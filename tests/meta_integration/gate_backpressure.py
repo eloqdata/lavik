@@ -83,34 +83,41 @@ def scenario_slow_link(binary, workdir):
         snap0 = slow.snapshot_idx()
 
         proxy.set_delay(SLOW_DELAY_S)
-        H.log(f"delaying node {slow.id} inbound {SLOW_DELAY_S}s/chunk for "
-              f"{SLOW_WINDOW_S}s (leader=node {leader.id}, "
-              f"rss0={rss0}kB, committed={c0})")
+        H.log(
+            f"delaying node {slow.id} inbound {SLOW_DELAY_S}s/chunk for "
+            f"{SLOW_WINDOW_S}s (leader=node {leader.id}, "
+            f"rss0={rss0}kB, committed={c0})"
+        )
         time.sleep(SLOW_WINDOW_S)
 
         # (a) quorum kept committing through the window.
         ok1 = load.ok_count
         c1 = H.max_committed([n for n in nodes if n.id != slow.id])
         if ok1 <= ok0:
-            raise H.Failure(f"propose made no progress during slow-link "
-                            f"({ok0} -> {ok1})")
+            raise H.Failure(
+                f"propose made no progress during slow-link ({ok0} -> {ok1})"
+            )
         if c1 < c0 + 10:
-            raise H.Failure(f"committed stalled during slow-link "
-                            f"({c0} -> {c1})")
+            raise H.Failure(f"committed stalled during slow-link ({c0} -> {c1})")
         rate = (ok1 - ok0) / SLOW_WINDOW_S
-        H.log(f"window done: ok {ok0} -> {ok1} ({rate:.0f}/s), "
-              f"quorum committed {c0} -> {c1}, node {slow.id} at "
-              f"{slow.committed()}")
+        H.log(
+            f"window done: ok {ok0} -> {ok1} ({rate:.0f}/s), "
+            f"quorum committed {c0} -> {c1}, node {slow.id} at "
+            f"{slow.committed()}"
+        )
 
         # (b) leader memory bounded.
         rss1 = H.read_rss_kb(leader.pid)
         growth = rss1 - rss0
-        H.log(f"leader RSS {rss0}kB -> {rss1}kB (delta {growth}kB, "
-              f"budget {RSS_BUDGET_KB}kB)")
+        H.log(
+            f"leader RSS {rss0}kB -> {rss1}kB (delta {growth}kB, "
+            f"budget {RSS_BUDGET_KB}kB)"
+        )
         if growth > RSS_BUDGET_KB:
             raise H.Failure(
                 f"leader RSS grew {growth}kB > {RSS_BUDGET_KB}kB behind a "
-                f"slow peer; egress/queue bound suspect")
+                f"slow peer; egress/queue bound suspect"
+            )
 
         # Freeze the successful-history target before healing. If load keeps
         # running while the lagging member installs a snapshot, aggressive
@@ -124,10 +131,11 @@ def scenario_slow_link(binary, workdir):
         # (c) heal and converge; record which catch-up path was taken.
         proxy.heal()
         slow.wait_committed(c1, timeout=30)
-        path = ("install_snapshot" if slow.snapshot_idx() > snap0
-                else "log-append")
-        H.log(f"node {slow.id} caught up via {path} "
-              f"(snapshot_idx {snap0} -> {slow.snapshot_idx()})")
+        path = "install_snapshot" if slow.snapshot_idx() > snap0 else "log-append"
+        H.log(
+            f"node {slow.id} caught up via {path} "
+            f"(snapshot_idx {snap0} -> {slow.snapshot_idx()})"
+        )
         history.check(nodes, timeout=30, desc="slow-link history")
 
         # (d) the mesh really carried the traffic.
@@ -170,19 +178,25 @@ def scenario_slow_recovery(binary, workdir):
         proxy.set_delay(SLOW_DELAY_S)
         last = H.propose_ops(leader, 0, 50, prefix="sr", history=history)
         snap_idx = H.manual_snapshot(leader)
-        H.log(f"node {slow.id} delayed; 50 operations committed (idx {last}) "
-              f"and leader snapshotted at {snap_idx}")
+        H.log(
+            f"node {slow.id} delayed; 50 operations committed (idx {last}) "
+            f"and leader snapshotted at {snap_idx}"
+        )
         proxy.heal()
 
         # The only possible catch-up path: the leader compacted past the
         # follower's last index, so install_snapshot must fire.
-        H.wait_until(f"node {slow.id} install_snapshot >= {snap_idx}", 30,
-                     lambda: slow.alive()
-                     and slow.snapshot_idx() >= snap_idx)
+        H.wait_until(
+            f"node {slow.id} install_snapshot >= {snap_idx}",
+            30,
+            lambda: slow.alive() and slow.snapshot_idx() >= snap_idx,
+        )
         slow.wait_committed(last, timeout=30)
         history.check(nodes, timeout=30, desc="slow-recovery history")
-        H.log(f"node {slow.id} recovered via install_snapshot "
-              f"(snapshot_idx={slow.snapshot_idx()})")
+        H.log(
+            f"node {slow.id} recovered via install_snapshot "
+            f"(snapshot_idx={slow.snapshot_idx()})"
+        )
         H.assert_intact(nodes, "slow-recovery")
         for node in nodes:
             node.terminate()
@@ -210,8 +224,7 @@ def main():
                 print(f"--- {path} tail ---", file=sys.stderr)
                 try:
                     with open(path, "r", errors="replace") as handle:
-                        print("".join(handle.readlines()[-40:]),
-                              file=sys.stderr)
+                        print("".join(handle.readlines()[-40:]), file=sys.stderr)
                 except OSError as log_exc:
                     print(f"<unreadable: {log_exc}>", file=sys.stderr)
         return 1

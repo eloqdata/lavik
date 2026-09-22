@@ -22,6 +22,7 @@ This separates slow policy publication from an actual disconnected leader.
 Then exercise two primary/replica pairs sharing one Meta worker to cover
 publication CPU cost across concurrent sessions without a forwarding proxy.
 """
+
 import os
 from pathlib import Path
 import select
@@ -42,7 +43,7 @@ def crc_table():
     for value in range(256):
         crc = value
         for _ in range(8):
-            crc = (crc >> 1) ^ (0x82f63b78 if crc & 1 else 0)
+            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
         result.append(crc)
     return result
 
@@ -51,10 +52,10 @@ CRC_TABLE = crc_table()
 
 
 def crc32c(data):
-    crc = 0xffffffff
+    crc = 0xFFFFFFFF
     for value in data:
         crc = CRC_TABLE[(crc ^ value) & 255] ^ (crc >> 8)
-    return crc ^ 0xffffffff
+    return crc ^ 0xFFFFFFFF
 
 
 class PolicyBarrier(H.Proxy):
@@ -95,9 +96,11 @@ class PolicyBarrier(H.Proxy):
                 payload = frame[28:]
                 offset = 29 + struct.unpack_from(">I", payload, 25)[0]
                 decision = payload[offset]
-                detail = (f"decision={decision} " +
-                          (f"duration={struct.unpack_from('>I', payload, len(payload) - 4)[0]}"
-                           if decision == 1 else ""))
+                detail = f"decision={decision} " + (
+                    f"duration={struct.unpack_from('>I', payload, len(payload) - 4)[0]}"
+                    if decision == 1
+                    else ""
+                )
             self.trace.append((time.time(), kind, detail))
 
         try:
@@ -111,9 +114,13 @@ class PolicyBarrier(H.Proxy):
                 header = exact(28)
                 magic, version, kind = struct.unpack_from(">IHH", header)
                 size = struct.unpack_from(">I", header, 12)[0]
-                assert magic == 0x4c564350 and version == 1 and size <= 16384
+                assert magic == 0x4C564350 and version == 1 and size <= 16384
                 frame = header + exact(size)
-                if self.armed.is_set() and not self.release.is_set() and kind in (3, 4, 5, 19):
+                if (
+                    self.armed.is_set()
+                    and not self.release.is_set()
+                    and kind in (3, 4, 5, 19)
+                ):
                     pending.append(frame)
                     self.held.set()
                 else:
@@ -128,13 +135,19 @@ class PolicyBarrier(H.Proxy):
 
 def run(root):
     (root / "meta").mkdir()
-    meta = H.Node(C.META, str(root / "meta"), 1,
-                  args=H.raft_args(snapshot_distance=100000,
-                                   election_ms_low=2000, election_ms_high=4000))
+    meta = H.Node(
+        C.META,
+        str(root / "meta"),
+        1,
+        args=H.raft_args(
+            snapshot_distance=100000, election_ms_low=2000, election_ms_high=4000
+        ),
+    )
     proxy = PolicyBarrier(meta.data_control_port)
     meta.advertised_data_control_endpoint = proxy.endpoint
-    data = DataProcess(C.DATA, str(root / "data"), C.DATA_NODE,
-                       proxy.endpoint, workers=2)
+    data = DataProcess(
+        C.DATA, str(root / "data"), C.DATA_NODE, proxy.endpoint, workers=2
+    )
     manifest = root / "cluster.toml"
     C.write_manifest(manifest, data.advertised_endpoint, meta)
     client = None
@@ -145,11 +158,24 @@ def run(root):
         meta.start(initial_cluster_manifest=str(manifest))
         meta.wait_leader()
         data.start()
-        C.command(os.environ.copy(), [C.CTL, "cluster-create", "--manifest",
-                  str(manifest), "--socket", meta.ctl_path, "--yes"])
+        C.command(
+            os.environ.copy(),
+            [
+                C.CTL,
+                "cluster-create",
+                "--manifest",
+                str(manifest),
+                "--socket",
+                meta.ctl_path,
+                "--yes",
+            ],
+        )
         C.wait_cluster_ready(meta, "initial owner authority", 60)
         client = Client(data)
-        assert client.call("SET", "{policy}large", b"x" * (2 * 1024 * 1024), "PX", 120000) == "OK"
+        assert (
+            client.call("SET", "{policy}large", b"x" * (2 * 1024 * 1024), "PX", 120000)
+            == "OK"
+        )
         assert meta.put_authority_lease_policy(2, 300).startswith("OK")
         C.wait_cluster_ready(meta, "short lease installed", 15)
         # Require sustained short grants, not merely one transient READY poll.
@@ -167,8 +193,12 @@ def run(root):
             assert client.call("GET", "{policy}sentinel") == str(writes)
             writes += 1
             time.sleep(0.01)
-        assert data.metric(grants) >= before + 4, "old projection stopped renewing during publication"
-        assert data.metric(expires) == baseline, "lease expired while only policy publication was delayed"
+        assert data.metric(grants) >= before + 4, (
+            "old projection stopped renewing during publication"
+        )
+        assert data.metric(expires) == baseline, (
+            "lease expired while only policy publication was delayed"
+        )
         proxy.release.set()
         C.wait_cluster_ready(meta, "long policy applied", 15)
         before = data.metric(grants)
@@ -180,18 +210,26 @@ def run(root):
             assert meta.put_authority_lease_policy(version, duration).startswith("OK")
             C.wait_cluster_ready(meta, "policy round trip", 15)
             before = data.metric(grants)
-            data.wait_metric(grants, lambda n: n >= before + 2, "renewals after policy change")
+            data.wait_metric(
+                grants, lambda n: n >= before + 2, "renewals after policy change"
+            )
             assert client.call("STRLEN", "{policy}large") == 2 * 1024 * 1024
-            assert data.metric(expires) == baseline, "policy round trip expired authority"
+            assert data.metric(expires) == baseline, (
+                "policy round trip expired authority"
+            )
         assert not proxy.errors, proxy.errors
-        H.log(f"PASS: {writes} writes across delayed publication; 8 policy changes; no expiry")
+        H.log(
+            f"PASS: {writes} writes across delayed publication; 8 policy changes; no expiry"
+        )
 
         # A later incompatible commit must invalidate the bridge even while
         # the publisher is waiting for the previous update's Applied receipt.
         assert meta.put_authority_lease_policy(12, 300).startswith("OK")
         C.wait_cluster_ready(meta, "short lease before bridge invalidation", 15)
         before = data.metric(grants)
-        data.wait_metric(grants, lambda n: n >= before + 3, "short grants before invalidation")
+        data.wait_metric(
+            grants, lambda n: n >= before + 3, "short grants before invalidation"
+        )
         assert data.metric(expires) == baseline
         proxy.held.clear()
         proxy.release.clear()
@@ -200,8 +238,12 @@ def run(root):
         before = data.metric(grants)
         data.wait_metric(grants, lambda n: n >= before + 4, "compatible bridge renewed")
         assert meta.put_authority_lease_policy(14, 150).startswith("OK")
-        data.wait_metric(expires, lambda n: n == baseline + 1,
-                         "shorter committed policy invalidates old renewal proof", timeout=5)
+        data.wait_metric(
+            expires,
+            lambda n: n == baseline + 1,
+            "shorter committed policy invalidates old renewal proof",
+            timeout=5,
+        )
         try:
             client.call("SET", "{policy}must-fence", "invalid")
         except H.Failure as error:
@@ -209,10 +251,14 @@ def run(root):
         else:
             raise AssertionError("old authority survived a shorter committed policy")
         proxy.release.set()
-        C.wait_cluster_ready(meta, "latest policy recovers after delayed publication", 15)
+        C.wait_cluster_ready(
+            meta, "latest policy recovers after delayed publication", 15
+        )
         assert client.call("SET", "{policy}recovered", "valid") == "OK"
         assert not proxy.errors, proxy.errors
-        H.log("PASS: a newer incompatible commit revokes the bridge and recovery succeeds")
+        H.log(
+            "PASS: a newer incompatible commit revokes the bridge and recovery succeeds"
+        )
         client.close()
         client = None
         data.terminate()
@@ -235,12 +281,16 @@ def run_multi(root):
     """Four publishers share one Meta worker; no proxy masks their CPU cost."""
     root.mkdir()
     (root / "meta").mkdir()
-    meta = H.Node(C.META, str(root / "meta"), 1,
-                  args=C.creation_raft_args())
-    nodes = [DataProcess(C.DATA, str(root / name), node_id,
-                         meta.data_control_endpoint)
-             for name, node_id in (("primary1", C.PRIMARY_1), ("replica1", C.REPLICA_1),
-                                  ("primary2", C.PRIMARY_2), ("replica2", C.REPLICA_2))]
+    meta = H.Node(C.META, str(root / "meta"), 1, args=C.creation_raft_args())
+    nodes = [
+        DataProcess(C.DATA, str(root / name), node_id, meta.data_control_endpoint)
+        for name, node_id in (
+            ("primary1", C.PRIMARY_1),
+            ("replica1", C.REPLICA_1),
+            ("primary2", C.PRIMARY_2),
+            ("replica2", C.REPLICA_2),
+        )
+    ]
     manifest = root / "cluster.toml"
     C.write_multi_manifest(manifest, nodes, True, meta)
     clients = []
@@ -250,12 +300,24 @@ def run_multi(root):
         meta.wait_leader()
         for node in nodes:
             node.start()
-        C.command(os.environ.copy(), [C.CTL, "cluster-create", "--manifest",
-                  str(manifest), "--socket", meta.ctl_path, "--yes"])
+        C.command(
+            os.environ.copy(),
+            [
+                C.CTL,
+                "cluster-create",
+                "--manifest",
+                str(manifest),
+                "--socket",
+                meta.ctl_path,
+                "--yes",
+            ],
+        )
         C.wait_cluster_ready(meta, "four-node cluster ready", 90)
         clients = [Client(nodes[0]), Client(nodes[2])]
-        keys = [C.key_in_range("policy-multi-1", 0, 8191),
-                C.key_in_range("policy-multi-2", 8192, 16383)]
+        keys = [
+            C.key_in_range("policy-multi-1", 0, 8191),
+            C.key_in_range("policy-multi-2", 8192, 16383),
+        ]
         baseline = [node.metric(expires) for node in nodes]
         for version in range(2, 10):
             duration = 300 if version % 2 == 0 else 2000
@@ -273,8 +335,10 @@ def run_multi(root):
                 time.sleep(0.01)
             C.wait_cluster_ready(meta, "four-node policy applied", 15)
             assert [node.metric(expires) for node in nodes] == baseline
-            H.log(f"PASS: four-node policy version={version} duration={duration}, "
-                  f"{count} writes per primary")
+            H.log(
+                f"PASS: four-node policy version={version} duration={duration}, "
+                f"{count} writes per primary"
+            )
         for client in clients:
             client.close()
         clients.clear()
@@ -296,7 +360,8 @@ def run_multi(root):
 
 if __name__ == "__main__":
     C.META, C.DATA, C.CTL, C.REDIS_CLI = map(os.path.abspath, sys.argv[1:5])
-    with tempfile.TemporaryDirectory(prefix="lavik-policy-",
-                                     dir=os.environ.get("LAVIK_TEST_DATA_DIR")) as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="lavik-policy-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
+    ) as directory:
         run(Path(directory))
         run_multi(Path(directory) / "multi")

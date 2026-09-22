@@ -21,16 +21,20 @@ import subprocess
 
 
 SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp", ".inc", ".go", ".s", ".S", ".asm"}
-LEGAL_NAME = re.compile(r"^(LICENSE|LICENCE|COPYING|COPYRIGHT|NOTICE|PATENTS)([.-].*)?$", re.I)
+LEGAL_NAME = re.compile(
+    r"^(LICENSE|LICENCE|COPYING|COPYRIGHT|NOTICE|PATENTS)([.-].*)?$", re.I
+)
 # Skip quoted strings before matching comments, so comment-like literals in
 # parsers and tests do not turn program text into a purported license notice.
 COMMENTS = re.compile(
     r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|'
-    r"/\*.*?\*/|//[^\n]*(?:\n[ \t]*//[^\n]*)*", re.S
+    r"/\*.*?\*/|//[^\n]*(?:\n[ \t]*//[^\n]*)*",
+    re.S,
 )
 NOTICE_MARKER = re.compile(
     r"copyright|SPDX-License-Identifier|permission is hereby granted|"
-    r"redistribution and use|licensed under", re.I
+    r"redistribution and use|licensed under",
+    re.I,
 )
 
 
@@ -65,7 +69,9 @@ class Notices:
 
     def __init__(self, apache_license):
         self.apache = self.normalize(apache_license)
-        self.apache_terms = self.normalize(apache_license.split("END OF TERMS AND CONDITIONS")[0])
+        self.apache_terms = self.normalize(
+            apache_license.split("END OF TERMS AND CONDITIONS")[0]
+        )
         self.entries = {}
 
     @staticmethod
@@ -90,9 +96,16 @@ class Notices:
     def sources(self, origin, path):
         if not path.exists():
             raise FileNotFoundError(path)
-        files = [path] if path.is_file() else sorted(
-            p for p in path.rglob("*") if p.suffix in SOURCE_SUFFIXES
-            and p.is_file() and not any(part.startswith(".") for part in p.relative_to(path).parts)
+        files = (
+            [path]
+            if path.is_file()
+            else sorted(
+                p
+                for p in path.rglob("*")
+                if p.suffix in SOURCE_SUFFIXES
+                and p.is_file()
+                and not any(part.startswith(".") for part in p.relative_to(path).parts)
+            )
         )
         for source in files:
             label = origin if path.is_file() else f"{origin}/{source.relative_to(path)}"
@@ -123,19 +136,28 @@ def native_notices(notices, root, bypass):
     # scripts/licenses/spdlog-LICENSE is upstream v1.14.1's license text:
     # https://github.com/gabime/spdlog/blob/v1.14.1/LICENSE
     required = [
-        "NOTICE", "bycorf/LICENSE", "bycorf/NOTICE",
-        "bycorf/third_party/abseil/LICENSE", "third_party/mimalloc/LICENSE",
-        "bycorf/third_party/liburing/LICENSE", "third_party/valkey/COPYING",
+        "NOTICE",
+        "bycorf/LICENSE",
+        "bycorf/NOTICE",
+        "bycorf/third_party/abseil/LICENSE",
+        "third_party/mimalloc/LICENSE",
+        "bycorf/third_party/liburing/LICENSE",
+        "third_party/valkey/COPYING",
         "scripts/licenses/spdlog-LICENSE",
         "include/spdlog/fmt/bundled/fmt.license.rst",
         "bycorf/third_party/spdlog/fmt/bundled/fmt.license.rst",
     ]
     sources = [
-        "bycorf/third_party/abseil/absl", "third_party/mimalloc/include",
-        "third_party/mimalloc/src", "bycorf/third_party/liburing/src",
-        "third_party/lua/src", "include/lavik/CLI11.hpp",
-        "include/lavik/storage/scan_hash_map.h", "include/spdlog",
-        "bycorf/third_party/spdlog", "bycorf/include/bycorf/runtime/concurrentqueue.h",
+        "bycorf/third_party/abseil/absl",
+        "third_party/mimalloc/include",
+        "third_party/mimalloc/src",
+        "bycorf/third_party/liburing/src",
+        "third_party/lua/src",
+        "include/lavik/CLI11.hpp",
+        "include/lavik/storage/scan_hash_map.h",
+        "include/spdlog",
+        "bycorf/third_party/spdlog",
+        "bycorf/include/bycorf/runtime/concurrentqueue.h",
     ]
     if bypass:
         required += [
@@ -152,10 +174,14 @@ def native_notices(notices, root, bypass):
                 required.append(str(path.relative_to(root)))
         required.append("bycorf/third_party/dpdk/license/bsd-3-clause.txt")
         sources += [
-            "bycorf/third_party/freebsd/sys", "bycorf/src/io/freebsd",
-            "bycorf/third_party/dpdk/lib", "bycorf/third_party/dpdk/drivers",
-            "bycorf/third_party/spdk/include", "bycorf/third_party/spdk/lib",
-            "bycorf/third_party/spdk/isa-l", "bycorf/third_party/spdk/isa-l-crypto",
+            "bycorf/third_party/freebsd/sys",
+            "bycorf/src/io/freebsd",
+            "bycorf/third_party/dpdk/lib",
+            "bycorf/third_party/dpdk/drivers",
+            "bycorf/third_party/spdk/include",
+            "bycorf/third_party/spdk/lib",
+            "bycorf/third_party/spdk/isa-l",
+            "bycorf/third_party/spdk/isa-l-crypto",
         ]
     for name in required:
         notices.file(name, root / name)
@@ -184,9 +210,19 @@ def go_notices(notices, root, executable, cc):
     kwargs = {"cwd": root / "raft", "env": env}
     goroot = Path(run(executable, "env", "GOROOT", **kwargs))
     notices.file(f"Go {toolchain[1]}/LICENSE", goroot / "LICENSE")
-    packages = list(json_objects(run(
-        executable, "list", "-mod=readonly", "-deps", "-json", "./bridge", **kwargs
-    )))
+    packages = list(
+        json_objects(
+            run(
+                executable,
+                "list",
+                "-mod=readonly",
+                "-deps",
+                "-json",
+                "./bridge",
+                **kwargs,
+            )
+        )
+    )
     modules = {}
     legal_directories = set()
     for package in packages:
@@ -198,7 +234,9 @@ def go_notices(notices, root, executable, cc):
                 raise ValueError("Release notices do not support replaced Go modules")
             modules[module["Path"]] = module
         boundary = Path(module["Dir"]) if module else goroot
-        prefix = f"{module['Path']}@{module['Version']}" if module else f"Go {toolchain[1]}"
+        prefix = (
+            f"{module['Path']}@{module['Version']}" if module else f"Go {toolchain[1]}"
+        )
         directory = Path(package["Dir"])
         # Retain package-local and inherited notices, without pulling licenses
         # from unrelated tools or test packages in the Go source distribution.
@@ -211,11 +249,15 @@ def go_notices(notices, root, executable, cc):
             directory = directory.parent
         for field in ("GoFiles", "CgoFiles", "CFiles", "HFiles", "SFiles"):
             for name in package.get(field, []):
-                notices.sources(f"Go/{package['ImportPath']}/{name}", Path(package["Dir"]) / name)
+                notices.sources(
+                    f"Go/{package['ImportPath']}/{name}", Path(package["Dir"]) / name
+                )
     for name, module in sorted(modules.items()):
         directory = Path(module["Dir"])
-        if not any(p.is_file() and p.name.upper().startswith(("LICENSE", "COPYING"))
-                   for p in directory.iterdir()):
+        if not any(
+            p.is_file() and p.name.upper().startswith(("LICENSE", "COPYING"))
+            for p in directory.iterdir()
+        ):
             raise ValueError(f"No license for Go module {name}")
     for origin, directory in sorted(legal_directories):
         notices.legal_files(origin, directory)
@@ -226,7 +268,9 @@ def system_notices(notices, cache):
     # OpenSSL/compiler version. Official releases use Ubuntu-provided archives.
     cxx = cache["CMAKE_CXX_COMPILER"]
     archives = [cache["OPENSSL_CRYPTO_LIBRARY"], cache["OPENSSL_SSL_LIBRARY"]]
-    archives += [run(cxx, f"-print-file-name={name}") for name in ("libstdc++.a", "libgcc.a")]
+    archives += [
+        run(cxx, f"-print-file-name={name}") for name in ("libstdc++.a", "libgcc.a")
+    ]
     packages = set()
     for archive in archives:
         path = Path(archive)
@@ -243,9 +287,18 @@ def system_notices(notices, cache):
         notices.add(f"Ubuntu {package} {version}/copyright", content)
         # Debian copyright files reference common license files rather than
         # embedding all terms. Resolve those references inside the archive too.
-        for license_name in sorted({name.rstrip(".") for name in re.findall(
-                r"/usr/share/common-licenses/([A-Za-z0-9.+-]+)", content)}):
-            notices.file(f"Common license: {license_name}", Path("/usr/share/common-licenses") / license_name)
+        for license_name in sorted(
+            {
+                name.rstrip(".")
+                for name in re.findall(
+                    r"/usr/share/common-licenses/([A-Za-z0-9.+-]+)", content
+                )
+            }
+        ):
+            notices.file(
+                f"Common license: {license_name}",
+                Path("/usr/share/common-licenses") / license_name,
+            )
 
 
 def main():

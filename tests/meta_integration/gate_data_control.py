@@ -87,8 +87,18 @@ def allocate_data_file(path, size=DATA_FILE_BYTES):
 
 
 class DataProcess:
-    def __init__(self, binary, workdir, node_id, seed, tls=None, workers=1,
-                 tls_only=False, environment=None, extra_args=()):
+    def __init__(
+        self,
+        binary,
+        workdir,
+        node_id,
+        seed,
+        tls=None,
+        workers=1,
+        tls_only=False,
+        environment=None,
+        extra_args=(),
+    ):
         self.environment = environment
         self.extra_args = extra_args
         self.binary = binary
@@ -123,41 +133,70 @@ class DataProcess:
         args = [
             self.binary,
             "--logtostderr",
-            "--port", str(self.redis_port),
-            "--metrics-port", str(self.metrics_port),
-            "--threads", str(self.workers),
+            "--port",
+            str(self.redis_port),
+            "--metrics-port",
+            str(self.metrics_port),
+            "--threads",
+            str(self.workers),
             "--no-pin-workers",
-            "--recv-buffers-per-worker", "0",
-            "--registered-buffer-mb-per-worker", "64",
-            "--repl-backlog-size", f"{8 * self.workers}mb",
-            "--max-memory", "1073741824",
-            "--flush-max-ms", "20",
-            "--data-file", self.data_path,
-            "--rdb-dir", self.workdir,
-            "--node-id", self.node_id,
-            "--meta-seed", self.seed,
-            "--announce-ip", "127.0.0.1",
+            "--recv-buffers-per-worker",
+            "0",
+            "--registered-buffer-mb-per-worker",
+            "64",
+            "--repl-backlog-size",
+            f"{8 * self.workers}mb",
+            "--max-memory",
+            "1073741824",
+            "--flush-max-ms",
+            "20",
+            "--data-file",
+            self.data_path,
+            "--rdb-dir",
+            self.workdir,
+            "--node-id",
+            self.node_id,
+            "--meta-seed",
+            self.seed,
+            "--announce-ip",
+            "127.0.0.1",
         ]
         if self.tls is not None:
             ca_cert, cert, key = self.tls
-            args.extend([
-                "--tls-replication",
-                "--tls-port", str(self.tls_port),
-                "--tls-ca-cert-file", ca_cert,
-                "--tls-cert-file", cert,
-                "--tls-key-file", key,
-            ])
+            args.extend(
+                [
+                    "--tls-replication",
+                    "--tls-port",
+                    str(self.tls_port),
+                    "--tls-ca-cert-file",
+                    ca_cert,
+                    "--tls-cert-file",
+                    cert,
+                    "--tls-key-file",
+                    key,
+                ]
+            )
         self.log_file = open(self.log_path, "ab")
         self.proc = subprocess.Popen(
-            args + list(self.extra_args), stdout=self.log_file,
-            stderr=subprocess.STDOUT, env=self.environment)
-        H.log(f"Data node {self.node_id[:8]} started "
-              f"(pid {self.proc.pid}, seed {self.seed})")
+            args + list(self.extra_args),
+            stdout=self.log_file,
+            stderr=subprocess.STDOUT,
+            env=self.environment,
+        )
+        H.log(
+            f"Data node {self.node_id[:8]} started "
+            f"(pid {self.proc.pid}, seed {self.seed})"
+        )
         if wait_ready:
             H.wait_until(
-                f"Data node {self.node_id[:8]} startup", 20,
-                lambda: self.alive() and (self._metrics_ready() or
-                    "waiting for Meta bootstrap:" in self.log_tail()))
+                f"Data node {self.node_id[:8]} startup",
+                20,
+                lambda: self.alive()
+                and (
+                    self._metrics_ready()
+                    or "waiting for Meta bootstrap:" in self.log_tail()
+                ),
+            )
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
@@ -170,10 +209,12 @@ class DataProcess:
             return False
 
     def metrics(self):
-        request = (b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-                   b"Connection: close\r\n\r\n")
+        request = (
+            b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        )
         with socket.create_connection(
-                ("127.0.0.1", self.metrics_port), timeout=1.0) as sock:
+            ("127.0.0.1", self.metrics_port), timeout=1.0
+        ) as sock:
             sock.settimeout(2.0)
             sock.sendall(request)
             response = bytearray()
@@ -191,13 +232,13 @@ class DataProcess:
         prefix = f"{name}{labels} "
         for line in self.metrics().splitlines():
             if line.startswith(prefix):
-                return int(float(line[len(prefix):]))
+                return int(float(line[len(prefix) :]))
         raise H.Failure(f"metric {name}{labels} is missing")
 
     def wait_metric(self, name, predicate, desc, timeout=20, labels=""):
         H.wait_until(
-            desc, timeout,
-            lambda: self.alive() and predicate(self.metric(name, labels)))
+            desc, timeout, lambda: self.alive() and predicate(self.metric(name, labels))
+        )
 
     def command_head(self, args):
         """Returns the first RESP line; these gates only inspect admission."""
@@ -208,7 +249,8 @@ class DataProcess:
             encoded.extend(value)
             encoded.extend(b"\r\n")
         with socket.create_connection(
-                ("127.0.0.1", self.redis_port), timeout=2.0) as sock:
+            ("127.0.0.1", self.redis_port), timeout=2.0
+        ) as sock:
             sock.settimeout(2.0)
             sock.sendall(encoded)
             response = bytearray()
@@ -238,19 +280,17 @@ class DataProcess:
         if code != 0:
             raise H.Failure(f"Data process exited with code {code}, want 0")
         log = self.log_tail(lines=200)
-        quiesced = log.rfind(
-            "Meta control client quiesced before storage flush")
+        quiesced = log.rfind("Meta control client quiesced before storage flush")
         flushing = log.rfind("all active requests drained; flushing storage")
         if quiesced < 0 or flushing < 0 or quiesced > flushing:
             raise H.Failure(
-                "Data shutdown did not quiesce Meta control before storage "
-                "flush")
+                "Data shutdown did not quiesce Meta control before storage flush"
+            )
         H.log(f"Data node {self.node_id[:8]}: clean exit 0")
 
     def pause(self):
         if not self.alive():
-            raise H.Failure(
-                f"Data node {self.node_id[:8]} is not running")
+            raise H.Failure(f"Data node {self.node_id[:8]} is not running")
         H.log(f"Data node {self.node_id[:8]}: SIGSTOP")
         self.proc.send_signal(signal.SIGSTOP)
 
@@ -289,7 +329,8 @@ def observation_count(node):
 def register_data_node(leader, data):
     reply = leader.ctl(
         f"registernode {data.node_id} lavik://node/{data.node_id} "
-        f"primary {data.advertised_endpoint}")
+        f"primary {data.advertised_endpoint}"
+    )
     expect_ok(reply, f"register Data node {data.node_id[:8]}")
 
 
@@ -298,27 +339,29 @@ def commit_service_mode(leader, metas):
     # initialization pending while this gate exercises an independent unready
     # assignment and its lease-denial path through the ordinary Data session.
     import gate_cluster_create as C
-    request = C.create_request(metas, "f" * 40,
-                               f"tcp://127.0.0.1:{H.free_port()}", "bootstrap-group")
+
+    request = C.create_request(
+        metas, "f" * 40, f"tcp://127.0.0.1:{H.free_port()}", "bootstrap-group"
+    )
     expect_ok(leader.ctl(request), "commit cluster client mode")
 
 
 def seed_assigned_authority(leader, data):
     expect_commit(leader.creategroup(GROUP), "create assigned group")
-    expect_commit(leader.assignnode(GROUP, data.node_id),
-                  "assign Data node")
+    expect_commit(leader.assignnode(GROUP, data.node_id), "assign Data node")
     expect_commit(leader.begingroupterm(GROUP, 0, 1), "begin group term")
-    expect_commit(leader.setslotmap(0, 16383, GROUP),
-                  "assign all slots")
+    expect_commit(leader.setslotmap(0, 16383, GROUP), "assign all slots")
     return expect_commit(
-        leader.activateauthority(GROUP, 1, data.node_id),
-        "activate authority")
+        leader.activateauthority(GROUP, 1, data.node_id), "activate authority"
+    )
 
 
 def assert_grantless_session(data, leader, minimum_fds=1):
     data.wait_metric(
-        "lavik_cluster_control_connected", lambda value: value == 1,
-        f"Data node {data.node_id[:8]} accepts Meta leader")
+        "lavik_cluster_control_connected",
+        lambda value: value == 1,
+        f"Data node {data.node_id[:8]} accepts Meta leader",
+    )
     # The HTTP scrape and outgoing Meta stream live on different workers.
     # The process connection gauge must include both without polling Meta's
     # event loop or confusing a live transport with an accepted control session.
@@ -327,55 +370,70 @@ def assert_grantless_session(data, leader, minimum_fds=1):
     data.wait_metric(
         "lavik_cluster_control_full_states_applied_total",
         lambda value: value >= minimum_fds,
-        f"Data node {data.node_id[:8]} applies FDS #{minimum_fds}")
+        f"Data node {data.node_id[:8]} applies FDS #{minimum_fds}",
+    )
     H.wait_until(
-        f"Meta leader {leader.id} ingests Data heartbeat", 15,
-        lambda: observation_count(leader) >= 2)
+        f"Meta leader {leader.id} ingests Data heartbeat",
+        15,
+        lambda: observation_count(leader) >= 2,
+    )
     if data.metric("lavik_cluster_control_protocol_errors_total") != 0:
         raise H.Failure("healthy session recorded a protocol error")
-    if data.metric(
-            "lavik_cluster_control_lease_decisions_total",
-            '{decision="granted"}') != 0:
+    if (
+        data.metric(
+            "lavik_cluster_control_lease_decisions_total", '{decision="granted"}'
+        )
+        != 0
+    ):
         raise H.Failure("grantless projection unexpectedly received a lease")
-    if data.metric(
-            "lavik_cluster_control_lease_decisions_total",
-            '{decision="denied"}') != 0:
+    if (
+        data.metric(
+            "lavik_cluster_control_lease_decisions_total", '{decision="denied"}'
+        )
+        != 0
+    ):
         raise H.Failure("NoChallenge heartbeat was counted as a lease denial")
 
 
-def assert_authority_challenge_denied(data, leader, minimum_fds=1,
-                                      prior_denials=0):
+def assert_authority_challenge_denied(data, leader, minimum_fds=1, prior_denials=0):
     data.wait_metric(
-        "lavik_cluster_control_connected", lambda value: value == 1,
-        f"Data node {data.node_id[:8]} accepts Meta leader")
+        "lavik_cluster_control_connected",
+        lambda value: value == 1,
+        f"Data node {data.node_id[:8]} accepts Meta leader",
+    )
     data.wait_metric(
         "lavik_cluster_control_full_states_applied_total",
         lambda value: value >= minimum_fds,
-        f"Data node {data.node_id[:8]} applies authority FDS #{minimum_fds}")
+        f"Data node {data.node_id[:8]} applies authority FDS #{minimum_fds}",
+    )
     data.wait_metric(
         "lavik_cluster_control_lease_decisions_total",
         lambda value: value > prior_denials,
         "assigned owner challenges authority and decodes LeaseDenied",
-        labels='{decision="denied"}')
+        labels='{decision="denied"}',
+    )
     # This scenario commits the exact owner/term/version anchor while the real
     # Data process has no ReadyToken. The server's typed policy unit test pins
     # that unique denial branch to LeaseDenialReason::kNodeNotReady.
     H.wait_until(
-        f"Meta leader {leader.id} ingests assigned Data heartbeat", 15,
-        lambda: observation_count(leader) >= 2)
-    if data.metric(
-            "lavik_cluster_control_lease_decisions_total",
-            '{decision="granted"}') != 0:
-        raise H.Failure(
-            "unpopulated assignment unexpectedly received a live lease")
+        f"Meta leader {leader.id} ingests assigned Data heartbeat",
+        15,
+        lambda: observation_count(leader) >= 2,
+    )
+    if (
+        data.metric(
+            "lavik_cluster_control_lease_decisions_total", '{decision="granted"}'
+        )
+        != 0
+    ):
+        raise H.Failure("unpopulated assignment unexpectedly received a live lease")
     if data.metric("lavik_cluster_control_protocol_errors_total") != 0:
         raise H.Failure("authority denial recorded a protocol error")
 
 
 def assert_keyed_write_fenced(data, label):
     reply = data.command_head(["SET", "{gate}key", "value"])
-    if not (reply.startswith("-LOADING") or
-            reply.startswith("-CLUSTERDOWN")):
+    if not (reply.startswith("-LOADING") or reply.startswith("-CLUSTERDOWN")):
         raise H.Failure(f"{label}: keyed write was not fenced: {reply}")
 
 
@@ -383,22 +441,29 @@ def run_plaintext(meta_binary, data_binary, workdir):
     scenario = os.path.join(workdir, "plaintext")
     os.makedirs(scenario, exist_ok=True)
     nodes = H.make_nodes(
-        meta_binary, scenario, 3,
-        args=H.raft_args(snapshot_distance=100000))
+        meta_binary, scenario, 3, args=H.raft_args(snapshot_distance=100000)
+    )
     data = None
     try:
         leader = H.bootstrap_cluster(nodes)
         commit_service_mode(leader, nodes)
         follower = next(node for node in nodes if node.id != leader.id)
-        data = DataProcess(data_binary, os.path.join(scenario, "data"),
-                           DATA_NODE, follower.data_control_endpoint)
-        expect_commit(leader.put_authority_lease_policy(1),
-                      "commit Authority Lease Policy")
+        data = DataProcess(
+            data_binary,
+            os.path.join(scenario, "data"),
+            DATA_NODE,
+            follower.data_control_endpoint,
+        )
+        expect_commit(
+            leader.put_authority_lease_policy(1), "commit Authority Lease Policy"
+        )
         register_data_node(leader, data)
         seeded_through = seed_assigned_authority(leader, data)
         H.wait_until(
-            "assigned authority reaches the follower seed", 15,
-            lambda: int(follower.status()["committed"]) >= seeded_through)
+            "assigned authority reaches the follower seed",
+            15,
+            lambda: int(follower.status()["committed"]) >= seeded_through,
+        )
 
         data.start()
         assert_authority_challenge_denied(data, leader)
@@ -407,42 +472,45 @@ def run_plaintext(meta_binary, data_binary, workdir):
         # have no group proof and remain rejected, while FUNCTION KILL/STATS
         # must bypass both loading fences so a running function cannot
         # deadlock a replacement population waiting for it to drain.
-        for command in (["FLUSHDB"], ["FLUSHALL"],
-                        ["FUNCTION", "LOAD", "invalid"],
-                        ["FUNCTION", "DELETE", "missing"],
-                        ["FUNCTION", "FLUSH"],
-                        ["FUNCTION", "RESTORE", "invalid"]):
-            expected = (f"-ERR {' '.join(command[:2])} is not allowed "
-                        "in Meta-managed mode")
+        for command in (
+            ["FLUSHDB"],
+            ["FLUSHALL"],
+            ["FUNCTION", "LOAD", "invalid"],
+            ["FUNCTION", "DELETE", "missing"],
+            ["FUNCTION", "FLUSH"],
+            ["FUNCTION", "RESTORE", "invalid"],
+        ):
+            expected = (
+                f"-ERR {' '.join(command[:2])} is not allowed in Meta-managed mode"
+            )
             actual = data.command_head(command)
             if actual != expected:
                 raise H.Failure(
-                    f"finite-authority global mutation gate: {actual}, "
-                    f"want {expected}")
+                    f"finite-authority global mutation gate: {actual}, want {expected}"
+                )
         stats = data.command_head(["FUNCTION", "STATS"])
         if stats.startswith("-LOADING"):
             raise H.Failure("FUNCTION STATS was hidden by a loading gate")
         kill = data.command_head(["FUNCTION", "KILL"])
         if not kill.startswith("-NOTBUSY"):
-            raise H.Failure(
-                f"FUNCTION KILL did not reach run control: {kill}")
-        redirected_reconnects = data.metric(
-            "lavik_cluster_control_reconnects_total")
+            raise H.Failure(f"FUNCTION KILL did not reach run control: {kill}")
+        redirected_reconnects = data.metric("lavik_cluster_control_reconnects_total")
         if redirected_reconnects < 1:
-            raise H.Failure(
-                "follower-only seed did not produce a redirect/reconnect")
-        first_fds = data.metric(
-            "lavik_cluster_control_full_states_applied_total")
+            raise H.Failure("follower-only seed did not produce a redirect/reconnect")
+        first_fds = data.metric("lavik_cluster_control_full_states_applied_total")
         denials_before_loss = data.metric(
-            "lavik_cluster_control_lease_decisions_total",
-            '{decision="denied"}')
+            "lavik_cluster_control_lease_decisions_total", '{decision="denied"}'
+        )
         H.log("plaintext: assigned authority challenge/denial verified")
 
         old_leader = leader
         old_leader.kill9()
         data.wait_metric(
-            "lavik_cluster_control_connected", lambda value: value == 0,
-            "Data node observes authority-session loss", timeout=5)
+            "lavik_cluster_control_connected",
+            lambda value: value == 0,
+            "Data node observes authority-session loss",
+            timeout=5,
+        )
         assert_keyed_write_fenced(data, "lost authority session")
         survivors = [node for node in nodes if node.id != old_leader.id]
         leader = H.find_leader(survivors, timeout=15)
@@ -450,21 +518,25 @@ def run_plaintext(meta_binary, data_binary, workdir):
             "lavik_cluster_control_full_states_applied_total",
             lambda value: value > first_fds,
             "Data node installs a fresh FDS after Meta leader change",
-            timeout=25)
+            timeout=25,
+        )
         data.wait_metric(
-            "lavik_cluster_control_connected", lambda value: value == 1,
-            "Data node reconnects to replacement Meta leader", timeout=10)
-        current_reconnects = data.metric(
-            "lavik_cluster_control_reconnects_total")
+            "lavik_cluster_control_connected",
+            lambda value: value == 1,
+            "Data node reconnects to replacement Meta leader",
+            timeout=10,
+        )
+        current_reconnects = data.metric("lavik_cluster_control_reconnects_total")
         if current_reconnects <= redirected_reconnects:
             raise H.Failure("leader death did not advance reconnect attempts")
         assert_authority_challenge_denied(
-            data, leader, minimum_fds=first_fds + 1,
-            prior_denials=denials_before_loss)
+            data, leader, minimum_fds=first_fds + 1, prior_denials=denials_before_loss
+        )
         H.log("plaintext: session loss remains fail-closed and reconnects")
 
         before_fence_fds = data.metric(
-            "lavik_cluster_control_full_states_applied_total")
+            "lavik_cluster_control_full_states_applied_total"
+        )
         expect_commit(leader.fencegroup(GROUP, 1), "fence active group")
         # Meta does not publish the grantless replacement until the Data node
         # has closed admission, run the superseded-anchor drain barrier, and
@@ -473,7 +545,9 @@ def run_plaintext(meta_binary, data_binary, workdir):
         data.wait_metric(
             "lavik_cluster_control_full_states_applied_total",
             lambda value: value > before_fence_fds,
-            "Data FenceAck releases grantless replacement FDS", timeout=15)
+            "Data FenceAck releases grantless replacement FDS",
+            timeout=15,
+        )
         if data.metric("lavik_cluster_control_protocol_errors_total") != 0:
             raise H.Failure("Fence/FenceAck recorded a protocol error")
         assert_keyed_write_fenced(data, "committed group fence")
@@ -481,28 +555,29 @@ def run_plaintext(meta_binary, data_binary, workdir):
 
         old_leader.start(bootstrap=False)
         H.wait_until(
-            "old Meta leader restarts as a caught-up follower", 20,
-            lambda: old_leader.getnode(DATA_NODE).startswith("OK "))
+            "old Meta leader restarts as a caught-up follower",
+            20,
+            lambda: old_leader.getnode(DATA_NODE).startswith("OK "),
+        )
         data.terminate()
         for node in nodes:
             node.terminate()
     except Exception:
         H.dump_node_logs(nodes)
         if data is not None:
-            print(f"--- Data log tail ({data.log_path}) ---",
-                  file=sys.stderr)
+            print(f"--- Data log tail ({data.log_path}) ---", file=sys.stderr)
             print(data.log_tail(), file=sys.stderr)
             if data.alive():
                 try:
                     control_metrics = [
-                        line for line in data.metrics().splitlines()
+                        line
+                        for line in data.metrics().splitlines()
                         if line.startswith("lavik_cluster_control_")
                     ]
                     print("--- Data control metrics ---", file=sys.stderr)
                     print("\n".join(control_metrics), file=sys.stderr)
                 except (OSError, H.Failure) as exc:
-                    print(f"<Data metrics unavailable: {exc}>",
-                          file=sys.stderr)
+                    print(f"<Data metrics unavailable: {exc}>", file=sys.stderr)
         raise
     finally:
         if data is not None:
@@ -512,41 +587,82 @@ def run_plaintext(meta_binary, data_binary, workdir):
 
 
 def run_openssl(args, cwd):
-    process = subprocess.run(["openssl"] + args, cwd=cwd,
-                             capture_output=True, text=True, timeout=60)
+    process = subprocess.run(
+        ["openssl"] + args, cwd=cwd, capture_output=True, text=True, timeout=60
+    )
     if process.returncode != 0:
-        raise H.Failure(
-            f"openssl {args[0]}: {process.stderr.strip()[:300]}")
+        raise H.Failure(f"openssl {args[0]}: {process.stderr.strip()[:300]}")
 
 
 def make_ca(workdir):
     os.makedirs(workdir, exist_ok=True)
-    run_openssl([
-        "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256",
-        "-keyout", "ca.key", "-out", "ca.crt", "-days", "2",
-        "-subj", "/CN=lavik-data-control-test-ca",
-    ], workdir)
-    return (os.path.join(workdir, "ca.crt"),
-            os.path.join(workdir, "ca.key"))
+    run_openssl(
+        [
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-sha256",
+            "-keyout",
+            "ca.key",
+            "-out",
+            "ca.crt",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=lavik-data-control-test-ca",
+        ],
+        workdir,
+    )
+    return (os.path.join(workdir, "ca.crt"), os.path.join(workdir, "ca.key"))
 
 
 def make_leaf(workdir, ca_cert, ca_key, name, uri):
-    run_openssl([
-        "req", "-newkey", "rsa:2048", "-nodes", "-sha256",
-        "-keyout", f"{name}.key", "-out", f"{name}.csr",
-        "-subj", f"/CN={name}",
-        "-addext", f"subjectAltName=IP:127.0.0.1,URI:{uri}",
-        "-addext", "extendedKeyUsage=serverAuth,clientAuth",
-        "-addext", "keyUsage=critical,digitalSignature,keyEncipherment",
-    ], workdir)
-    run_openssl([
-        "x509", "-req", "-in", f"{name}.csr",
-        "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial",
-        "-out", f"{name}.crt", "-days", "2", "-sha256",
-        "-copy_extensions", "copy",
-    ], workdir)
-    return (os.path.join(workdir, f"{name}.crt"),
-            os.path.join(workdir, f"{name}.key"))
+    run_openssl(
+        [
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-sha256",
+            "-keyout",
+            f"{name}.key",
+            "-out",
+            f"{name}.csr",
+            "-subj",
+            f"/CN={name}",
+            "-addext",
+            f"subjectAltName=IP:127.0.0.1,URI:{uri}",
+            "-addext",
+            "extendedKeyUsage=serverAuth,clientAuth",
+            "-addext",
+            "keyUsage=critical,digitalSignature,keyEncipherment",
+        ],
+        workdir,
+    )
+    run_openssl(
+        [
+            "x509",
+            "-req",
+            "-in",
+            f"{name}.csr",
+            "-CA",
+            ca_cert,
+            "-CAkey",
+            ca_key,
+            "-CAcreateserial",
+            "-out",
+            f"{name}.crt",
+            "-days",
+            "2",
+            "-sha256",
+            "-copy_extensions",
+            "copy",
+        ],
+        workdir,
+    )
+    return (os.path.join(workdir, f"{name}.crt"), os.path.join(workdir, f"{name}.key"))
 
 
 def assert_identity_rejected(data, meta, reason):
@@ -555,7 +671,7 @@ def assert_identity_rejected(data, meta, reason):
     assert reason in data.log_tail(), data.log_tail()
     assert observation_count(meta) == 0
     try:
-        socket.create_connection(("127.0.0.1", data.redis_port), .2).close()
+        socket.create_connection(("127.0.0.1", data.redis_port), 0.2).close()
     except OSError:
         pass
     else:
@@ -568,42 +684,58 @@ def run_mtls(meta_binary, data_binary, workdir):
     os.makedirs(cert_dir, exist_ok=True)
     ca_cert, ca_key = make_ca(cert_dir)
     meta_cert, meta_key = make_leaf(
-        cert_dir, ca_cert, ca_key, "meta-1", "lavik://meta/1")
+        cert_dir, ca_cert, ca_key, "meta-1", "lavik://meta/1"
+    )
     good_cert, good_key = make_leaf(
-        cert_dir, ca_cert, ca_key, "data-good",
-        f"lavik://node/{DATA_NODE}")
+        cert_dir, ca_cert, ca_key, "data-good", f"lavik://node/{DATA_NODE}"
+    )
     bad_cert, bad_key = make_leaf(
-        cert_dir, ca_cert, ca_key, "data-wrong-uri",
-        f"lavik://node/{OTHER_DATA_NODE}")
+        cert_dir, ca_cert, ca_key, "data-wrong-uri", f"lavik://node/{OTHER_DATA_NODE}"
+    )
     duplicate_cert, duplicate_key = make_leaf(
-        cert_dir, ca_cert, ca_key, "data-duplicate-uri",
-        f"lavik://node/{BAD_DATA_NODE},URI:lavik://node/{OTHER_DATA_NODE}")
+        cert_dir,
+        ca_cert,
+        ca_key,
+        "data-duplicate-uri",
+        f"lavik://node/{BAD_DATA_NODE},URI:lavik://node/{OTHER_DATA_NODE}",
+    )
     untrusted_dir = os.path.join(cert_dir, "untrusted")
     os.makedirs(untrusted_dir)
     untrusted_ca, untrusted_key = make_ca(untrusted_dir)
     untrusted_cert, untrusted_client_key = make_leaf(
-        untrusted_dir, untrusted_ca, untrusted_key, "data-untrusted",
-        f"lavik://node/{BAD_DATA_NODE}")
+        untrusted_dir,
+        untrusted_ca,
+        untrusted_key,
+        "data-untrusted",
+        f"lavik://node/{BAD_DATA_NODE}",
+    )
 
     meta_dir = os.path.join(scenario, "meta")
     os.makedirs(meta_dir, exist_ok=True)
     meta = H.Node(
-        meta_binary, meta_dir, 1,
-        args=H.raft_args(snapshot_distance=100000) +
-        H.tls_args(ca_cert, meta_cert, meta_key))
+        meta_binary,
+        meta_dir,
+        1,
+        args=H.raft_args(snapshot_distance=100000)
+        + H.tls_args(ca_cert, meta_cert, meta_key),
+    )
     bad_data = None
     good_data = None
     try:
         meta.start(bootstrap=True)
         meta.wait_leader()
         commit_service_mode(meta, [meta])
-        expect_commit(meta.put_authority_lease_policy(1),
-                      "commit Authority Lease Policy")
+        expect_commit(
+            meta.put_authority_lease_policy(1), "commit Authority Lease Policy"
+        )
 
         bad_data = DataProcess(
-            data_binary, os.path.join(scenario, "data-wrong-uri"),
-            BAD_DATA_NODE, meta.data_control_endpoint,
-            tls=(ca_cert, bad_cert, bad_key))
+            data_binary,
+            os.path.join(scenario, "data-wrong-uri"),
+            BAD_DATA_NODE,
+            meta.data_control_endpoint,
+            tls=(ca_cert, bad_cert, bad_key),
+        )
         register_data_node(meta, bad_data)
         bad_data.start(wait_ready=False)
         assert_identity_rejected(bad_data, meta, "Data identity does not match")
@@ -614,24 +746,29 @@ def run_mtls(meta_binary, data_binary, workdir):
         # succeeds. CA-valid role/SAN errors instead require a typed bootstrap
         # rejection; a silent close looks like a retryable Meta restart.
         for name, cert, key, reason in (
-                ("wrong-role", meta_cert, meta_key, "not a data-node identity"),
-                ("duplicate-uri", duplicate_cert, duplicate_key,
-                 "exactly one URI SAN"),
-                ("untrusted", untrusted_cert, untrusted_client_key,
-                 "unknown ca")):
+            ("wrong-role", meta_cert, meta_key, "not a data-node identity"),
+            ("duplicate-uri", duplicate_cert, duplicate_key, "exactly one URI SAN"),
+            ("untrusted", untrusted_cert, untrusted_client_key, "unknown ca"),
+        ):
             bad_data = DataProcess(
-                data_binary, os.path.join(scenario, f"data-{name}"),
-                BAD_DATA_NODE, meta.data_control_endpoint,
-                tls=(ca_cert, cert, key))
+                data_binary,
+                os.path.join(scenario, f"data-{name}"),
+                BAD_DATA_NODE,
+                meta.data_control_endpoint,
+                tls=(ca_cert, cert, key),
+            )
             bad_data.start(wait_ready=False)
             assert_identity_rejected(bad_data, meta, reason)
             bad_data.terminate()
             H.log(f"mTLS: {name} fails startup without opening Redis")
 
         good_data = DataProcess(
-            data_binary, os.path.join(scenario, "data-good"), DATA_NODE,
+            data_binary,
+            os.path.join(scenario, "data-good"),
+            DATA_NODE,
             meta.data_control_endpoint,
-            tls=(ca_cert, good_cert, good_key))
+            tls=(ca_cert, good_cert, good_key),
+        )
         register_data_node(meta, good_data)
         good_data.start()
         assert_grantless_session(good_data, meta)
@@ -643,20 +780,19 @@ def run_mtls(meta_binary, data_binary, workdir):
         for data in (bad_data, good_data):
             if data is None:
                 continue
-            print(f"--- Data log tail ({data.log_path}) ---",
-                  file=sys.stderr)
+            print(f"--- Data log tail ({data.log_path}) ---", file=sys.stderr)
             print(data.log_tail(), file=sys.stderr)
             if data.alive():
                 try:
                     control_metrics = [
-                        line for line in data.metrics().splitlines()
+                        line
+                        for line in data.metrics().splitlines()
                         if line.startswith("lavik_cluster_control_")
                     ]
                     print("--- Data control metrics ---", file=sys.stderr)
                     print("\n".join(control_metrics), file=sys.stderr)
                 except (OSError, H.Failure) as exc:
-                    print(f"<Data metrics unavailable: {exc}>",
-                          file=sys.stderr)
+                    print(f"<Data metrics unavailable: {exc}>", file=sys.stderr)
         raise
     finally:
         for data in (bad_data, good_data):
@@ -672,8 +808,7 @@ def main():
     work_argv = [sys.argv[0], sys.argv[1]]
     if len(sys.argv) == 4:
         work_argv.append(sys.argv[3])
-    workdir, keep = H.make_workdir(
-        work_argv, "meta_integration_data_control_")
+    workdir, keep = H.make_workdir(work_argv, "meta_integration_data_control_")
     started = time.monotonic()
     try:
         run_plaintext(sys.argv[1], sys.argv[2], workdir)
@@ -683,8 +818,7 @@ def main():
     except Exception as exc:  # noqa: BLE001 - process logs are the evidence
         print(f"[gate-data-control] FAIL: {exc}", file=sys.stderr)
         if keep:
-            print(f"[gate-data-control] retained workdir: {workdir}",
-                  file=sys.stderr)
+            print(f"[gate-data-control] retained workdir: {workdir}", file=sys.stderr)
         return 1
     finally:
         H.cleanup(workdir, keep)

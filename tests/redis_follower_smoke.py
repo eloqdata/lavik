@@ -11,6 +11,7 @@
 # limitations under the License.
 
 """Exercise the external follower contract against real Redis and Lavik peers."""
+
 from contextlib import contextmanager, ExitStack
 import os
 from pathlib import Path
@@ -39,7 +40,9 @@ class Client:
         if self.reader.peek(1)[:1] == b"%":
             self.reader.read(1)
             count = int(self.reader.readline())
-            return {F.read_resp(self.reader): F.read_resp(self.reader) for _ in range(count)}
+            return {
+                F.read_resp(self.reader): F.read_resp(self.reader) for _ in range(count)
+            }
         return F.read_resp(self.reader)
 
     def close(self):
@@ -57,25 +60,68 @@ def reject(client, args, text):
 
 
 @contextmanager
-def process(binary, directory, name, *, redis=False, extra=(), port=None, password=None,
-            workers=2):
+def process(
+    binary,
+    directory,
+    name,
+    *,
+    redis=False,
+    extra=(),
+    port=None,
+    password=None,
+    workers=2,
+):
     port = port or H.free_port()
     directory.mkdir(exist_ok=True)
     if redis:
-        args = [binary, "--bind", "127.0.0.1", "--port", str(port),
-                "--save", "", "--appendonly", "no", "--dir", str(directory),
-                "--repl-diskless-sync", "no"]
+        args = [
+            binary,
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+            "--dir",
+            str(directory),
+            "--repl-diskless-sync",
+            "no",
+        ]
     else:
         data = directory / "lavik.data"
         if not data.exists():
             with data.open("wb") as file:
                 os.posix_fallocate(file.fileno(), 0, 256 * 1024 * 1024)
-        args = [binary, *([str(directory / "lavik.conf")] if (directory / "lavik.conf").exists() else []),
-                "--bind", "127.0.0.1", "--port", str(port),
-                "--threads", str(workers), "--no-pin-workers", "--metrics-port", "0",
-                "--recv-buffers-per-worker", "0", "--max-memory", "1G",
-                "--registered-buffer-mb-per-worker", "64",
-                "--data-file", str(data), "--rdb-dir", str(directory), "--logtostderr"]
+        args = [
+            binary,
+            *(
+                [str(directory / "lavik.conf")]
+                if (directory / "lavik.conf").exists()
+                else []
+            ),
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--threads",
+            str(workers),
+            "--no-pin-workers",
+            "--metrics-port",
+            "0",
+            "--recv-buffers-per-worker",
+            "0",
+            "--max-memory",
+            "1G",
+            "--registered-buffer-mb-per-worker",
+            "64",
+            "--data-file",
+            str(data),
+            "--rdb-dir",
+            str(directory),
+            "--logtostderr",
+        ]
     log_path = directory / f"{name}.log"
     with log_path.open("w") as log:
         child = subprocess.Popen(args + list(extra), stdout=log, stderr=log)
@@ -94,8 +140,10 @@ def process(binary, directory, name, *, redis=False, extra=(), port=None, passwo
                     if client is not None:
                         client.close()
                         client = None
-                    time.sleep(.05)
-            assert client is not None, "server readiness deadline expired\n" + log_path.read_text()
+                    time.sleep(0.05)
+            assert client is not None, (
+                "server readiness deadline expired\n" + log_path.read_text()
+            )
             yield client, port, log_path
         except BaseException:
             print(log_path.read_text()[-12000:], file=sys.stderr)
@@ -113,6 +161,7 @@ def process(binary, directory, name, *, redis=False, extra=(), port=None, passwo
 
 class Forwarder:
     """Change an endpoint between discovery and its consuming TCP connection."""
+
     def __init__(self, endpoint):
         self.endpoint = endpoint
         self.accepted = 0
@@ -121,7 +170,7 @@ class Forwarder:
         self.listener.bind(("127.0.0.1", 0))
         self.port = self.listener.getsockname()[1]
         self.listener.listen()
-        self.listener.settimeout(.1)
+        self.listener.settimeout(0.1)
         self.stopped = threading.Event()
         self.thread = threading.Thread(target=self.run)
         self.peers = []
@@ -144,11 +193,14 @@ class Forwarder:
     def relay(self, incoming, endpoint):
         with incoming:
             try:
-                with socket.create_connection(("127.0.0.1", endpoint), 2) as outgoing, selectors.DefaultSelector() as poll:
+                with (
+                    socket.create_connection(("127.0.0.1", endpoint), 2) as outgoing,
+                    selectors.DefaultSelector() as poll,
+                ):
                     poll.register(incoming, selectors.EVENT_READ, outgoing)
                     poll.register(outgoing, selectors.EVENT_READ, incoming)
                     while not self.stopped.is_set():
-                        for key, _ in poll.select(.1):
+                        for key, _ in poll.select(0.1):
                             data = key.fileobj.recv(65536)
                             if not data:
                                 return
@@ -204,12 +256,14 @@ def changing_endpoint(lavik, redis, root, managed_port=None):
     with ExitStack() as stack:
         if managed_port is None:
             native, native_port, _ = stack.enter_context(
-                process(lavik, root / "changed-native", "native"))
+                process(lavik, root / "changed-native", "native")
+            )
             native.call("SET", "must-not-import", "native")
         else:
             native_port = managed_port
         source, source_port, _ = stack.enter_context(
-            process(redis, root / "changed-redis", "redis", redis=True))
+            process(redis, root / "changed-redis", "redis", redis=True)
+        )
         source.call("SET", "redis-value", "redis")
         # The connection that passes PSYNC is the consumer, not a probe. Any
         # second connection reaches Lavik, whose ordinary handshake rejects it.
@@ -217,12 +271,18 @@ def changing_endpoint(lavik, redis, root, managed_port=None):
         try:
             with process(lavik, root / "changed-online", "online") as (target, _, log):
                 target.call("REPLICAOF", "127.0.0.1", proxy.port)
-                H.wait_until("initial Redis endpoint online", 20,
-                             lambda: target.call("GET", "redis-value") == "redis")
+                H.wait_until(
+                    "initial Redis endpoint online",
+                    20,
+                    lambda: target.call("GET", "redis-value") == "redis",
+                )
                 assert proxy.accepted == 1, "PSYNC connection was not reused"
                 source.call("CLIENT", "KILL", "TYPE", "REPLICA")
-                H.wait_until("reconnect handshake rejects unsupported endpoint", 15,
-                             lambda: "Redis replication handshake failed" in log.read_text())
+                H.wait_until(
+                    "reconnect handshake rejects unsupported endpoint",
+                    15,
+                    lambda: "Redis replication handshake failed" in log.read_text(),
+                )
                 assert "role:slave" in target.call("INFO", "replication")
                 reject(target, ("SET", "unfenced", "wrong"), "READONLY")
                 assert target.call("GET", "redis-value") == "redis"
@@ -232,14 +292,19 @@ def changing_endpoint(lavik, redis, root, managed_port=None):
 
 
 def interrupted_transaction(lavik, redis, root):
-    with process(redis, root / "tx-redis", "source", redis=True) as (source, port, _), \
-         process(lavik, root / "tx-target", "target") as (target, _, log):
+    with (
+        process(redis, root / "tx-redis", "source", redis=True) as (source, port, _),
+        process(lavik, root / "tx-target", "target") as (target, _, log),
+    ):
         proxy = Forwarder(lambda _: port)
         try:
             source.call("SET", "db0-proof", "db0")
             target.call("REPLICAOF", "127.0.0.1", proxy.port)
-            H.wait_until("transaction source online", 20,
-                         lambda: target.call("GET", "db0-proof") == "db0")
+            H.wait_until(
+                "transaction source online",
+                20,
+                lambda: target.call("GET", "db0-proof") == "db0",
+            )
             full_count = log.read_text().count("Redis FULLRESYNC completed")
             source.call("SELECT", 15)
             # Cut after MULTI/SELECT and inside a value. No part of this
@@ -250,8 +315,11 @@ def interrupted_transaction(lavik, redis, root):
             source.call("INCR", "once")
             source.call("EXEC")
             target.call("SELECT", 15)
-            H.wait_until("interrupted MULTI replay", 20,
-                         lambda: target.call("GET", "once") == "1")
+            H.wait_until(
+                "interrupted MULTI replay",
+                20,
+                lambda: target.call("GET", "once") == "1",
+            )
             assert target.call("STRLEN", "large-tx") == 16384
             assert log.read_text().count("Redis FULLRESYNC completed") == full_count
             target.call("SELECT", 0)
@@ -263,19 +331,31 @@ def interrupted_transaction(lavik, redis, root):
 
 def unavailable_startup(lavik, redis, root):
     port = H.free_port()
-    with process(lavik, root / "retry-target", "target", extra=(
-            "--redis-replicaof", "127.0.0.1", str(port))) as (target, _, _):
+    with process(
+        lavik,
+        root / "retry-target",
+        "target",
+        extra=("--redis-replicaof", "127.0.0.1", str(port)),
+    ) as (target, _, _):
         reject(target, ("SET", "not-authoritative", "wrong"), "LOADING")
-        with process(redis, root / "late-source", "source", redis=True,
-                     port=port) as (source, _, _):
+        with process(redis, root / "late-source", "source", redis=True, port=port) as (
+            source,
+            _,
+            _,
+        ):
             source.call("SET", "late-upstream", "recovered")
-            H.wait_until("unavailable startup retries", 20,
-                         lambda: target.call("GET", "late-upstream") == "recovered")
+            H.wait_until(
+                "unavailable startup retries",
+                20,
+                lambda: target.call("GET", "late-upstream") == "recovered",
+            )
 
 
 def exercise(lavik, redis, root):
-    with process(lavik, root / "native", "native") as (native, native_port, _), \
-         process(lavik, root / "target", "target") as (target, _, target_log):
+    with (
+        process(lavik, root / "native", "native") as (native, native_port, _),
+        process(lavik, root / "target", "target") as (target, _, target_log),
+    ):
         assert target.call("SET", "retained", "original") == "OK"
         reject(native, ("PSYNC", "?", "-1"), "unknown command")
         reject(target, ("REPLICAOF", "127.0.0.1", native_port), "ERR")
@@ -285,14 +365,28 @@ def exercise(lavik, redis, root):
         target.call("SELECT", 15)
         target.call("SET", "old-db15", "must-clear")
         target.call("SELECT", 0)
-        with process(redis, root / "redis", "redis", redis=True) as (source, source_port, _):
+        with process(redis, root / "redis", "redis", redis=True) as (
+            source,
+            source_port,
+            _,
+        ):
             assert source.call("SELECT", 15) == "OK"
             assert source.call("SET", "baseline", "db15") == "OK"
             assert source.call("SET", "ttl", "live", "PX", 120000) == "OK"
-            assert source.call("FUNCTION", "LOAD", "#!lua name=follow\nredis.register_function{function_name='follow_value', callback=function() return 'function-value' end, flags={'no-writes'}}") == "follow"
+            assert (
+                source.call(
+                    "FUNCTION",
+                    "LOAD",
+                    "#!lua name=follow\nredis.register_function{function_name='follow_value', callback=function() return 'function-value' end, flags={'no-writes'}}",
+                )
+                == "follow"
+            )
             assert target.call("REPLICAOF", "127.0.0.1", source_port) == "OK"
-            H.wait_until("Redis full sync", 30,
-                         lambda: "master_link_status:up" in target.call("INFO", "replication"))
+            H.wait_until(
+                "Redis full sync",
+                30,
+                lambda: "master_link_status:up" in target.call("INFO", "replication"),
+            )
             assert target.call("SELECT", 15) == "OK"
             assert target.call("GET", "baseline") == "db15"
             assert target.call("EXISTS", "old-db15") == 0
@@ -302,27 +396,45 @@ def exercise(lavik, redis, root):
             assert source.call("SET", "tx-a", "a") == "QUEUED"
             assert source.call("SET", "tx-b", "b") == "QUEUED"
             assert source.call("EXEC") == ["OK", "OK"]
-            H.wait_until("transaction replay", 10,
-                         lambda: target.call("MGET", "tx-a", "tx-b") == ["a", "b"])
+            H.wait_until(
+                "transaction replay",
+                10,
+                lambda: target.call("MGET", "tx-a", "tx-b") == ["a", "b"],
+            )
             reject(target, ("REPLICAOF", "127.0.0.1", native_port), "ERR")
             reject(target, ("REPLICAOF", "127.0.0.1", H.free_port()), "ERR")
             assert target.call("GET", "baseline") == "db15"
             assert source.call("SET", "after-reject", "still-following") == "OK"
-            H.wait_until("old subscription after rejection", 10,
-                         lambda: target.call("GET", "after-reject") == "still-following")
+            H.wait_until(
+                "old subscription after rejection",
+                10,
+                lambda: target.call("GET", "after-reject") == "still-following",
+            )
             source.call("CLIENT", "KILL", "TYPE", "REPLICA")
             source.call("INCR", "exact-once")
-            H.wait_until("partial reconnect", 15,
-                         lambda: target.call("GET", "exact-once") == "1" and
-                         "Redis partial resynchronization continued" in target_log.read_text())
+            H.wait_until(
+                "partial reconnect",
+                15,
+                lambda: target.call("GET", "exact-once") == "1"
+                and "Redis partial resynchronization continued"
+                in target_log.read_text(),
+            )
     # Both startup forms must reject an unsupported handshake before replacing data.
     with process(lavik, root / "native", "native-again") as (_, native_port, _):
         for index, option in enumerate(("replicaof", "redis-replicaof")):
-            (root / "target" / "lavik.conf").write_text(f"{option} 127.0.0.1 {native_port}\n")
-            with process(lavik, root / "target", f"rejected-{index}",
-                         extra=()) as (target, _, log):
-                H.wait_until("unsupported startup upstream", 15,
-                             lambda: "Redis replication handshake" in log.read_text())
+            (root / "target" / "lavik.conf").write_text(
+                f"{option} 127.0.0.1 {native_port}\n"
+            )
+            with process(lavik, root / "target", f"rejected-{index}", extra=()) as (
+                target,
+                _,
+                log,
+            ):
+                H.wait_until(
+                    "unsupported startup upstream",
+                    15,
+                    lambda: "Redis replication handshake" in log.read_text(),
+                )
                 reject(target, ("GET", "baseline"), "LOADING")
         (root / "target" / "lavik.conf").unlink()
         with process(lavik, root / "target", "recover") as (target, _, _):
@@ -332,6 +444,7 @@ def exercise(lavik, redis, root):
 
 def managed_native_rejection(lavik, redis, root, meta, ctl):
     import gate_native_replication as N
+
     N.C.META, N.C.DATA, N.C.CTL = meta, lavik, ctl
     with N.pair(root, "managed-native") as (meta_node, source, _, _writer):
         N.ready(meta_node)
@@ -340,10 +453,17 @@ def managed_native_rejection(lavik, redis, root, meta, ctl):
             target.call("SET", "preserved", "local")
             reject(target, ("REPLICAOF", "127.0.0.1", port), "ERR")
             assert target.call("GET", "preserved") == "local"
-        with process(lavik, root / "managed-reject", "startup", extra=(
-                "--redis-replicaof", "127.0.0.1", str(port))) as (target, _, log):
-            H.wait_until("managed endpoint handshake rejected", 15,
-                         lambda: "Redis replication handshake" in log.read_text())
+        with process(
+            lavik,
+            root / "managed-reject",
+            "startup",
+            extra=("--redis-replicaof", "127.0.0.1", str(port)),
+        ) as (target, _, log):
+            H.wait_until(
+                "managed endpoint handshake rejected",
+                15,
+                lambda: "Redis replication handshake" in log.read_text(),
+            )
             reject(target, ("GET", "preserved"), "LOADING")
         directory = root / "managed-endpoint"
         directory.mkdir()
@@ -352,23 +472,31 @@ def managed_native_rejection(lavik, redis, root, meta, ctl):
 
 def mode_contract(lavik, root):
     for args, expected in [
-            (("--client-mode", "cluster"), "removed"),
-            (("--meta-managed", "yes"), "removed"),
-            (("--client-mode", "bogus"), "removed"),
-            (("--meta-managed", "maybe"), "removed"),
-            (("--cluster-enabled",), "not expected")]:
+        (("--client-mode", "cluster"), "removed"),
+        (("--meta-managed", "yes"), "removed"),
+        (("--client-mode", "bogus"), "removed"),
+        (("--meta-managed", "maybe"), "removed"),
+        (("--cluster-enabled",), "not expected"),
+    ]:
         absent = root / "must-not-create.data"
-        result = subprocess.run([lavik, *args, "--data-file", str(absent)],
-                                capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            [lavik, *args, "--data-file", str(absent)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         assert result.returncode != 0, result
         assert expected in result.stdout + result.stderr, result
         assert not absent.exists()
     for directive in ("client-mode single", "meta-managed no"):
         config = root / "legacy.conf"
         config.write_text(directive + "\n")
-        result = subprocess.run([lavik, str(config)], capture_output=True,
-                                text=True, timeout=10)
-        assert result.returncode != 0 and "removed" in result.stdout + result.stderr, result
+        result = subprocess.run(
+            [lavik, str(config)], capture_output=True, text=True, timeout=10
+        )
+        assert result.returncode != 0 and "removed" in result.stdout + result.stderr, (
+            result
+        )
     with process(lavik, root / "standalone-mode", "mode") as (client, _, _):
         for version in (2, 3):
             hello = client.call("HELLO", version)
@@ -383,8 +511,14 @@ def mode_contract(lavik, root):
 
 def authenticated_startup(lavik, redis, root):
     # Reuse a real server for both supported startup spellings and explicit CLI.
-    with process(redis, root / "auth-source", "source", redis=True,
-                 extra=("--requirepass", "source-secret"), password="source-secret") as (source, port, _):
+    with process(
+        redis,
+        root / "auth-source",
+        "source",
+        redis=True,
+        extra=("--requirepass", "source-secret"),
+        password="source-secret",
+    ) as (source, port, _):
         source.call("SET", "authenticated", "baseline")
         # Identity reporting is optional: replication users need not gain INFO.
         source.call("ACL", "SETUSER", "default", "-info")
@@ -395,31 +529,47 @@ def authenticated_startup(lavik, redis, root):
             if spelling != "cli":
                 config += f"{spelling} 127.0.0.1 {port}\n"
             (directory / "lavik.conf").write_text(config)
-            extra = ("--redis-replicaof", "127.0.0.1", str(port)) if spelling == "cli" else ()
+            extra = (
+                ("--redis-replicaof", "127.0.0.1", str(port))
+                if spelling == "cli"
+                else ()
+            )
             with process(lavik, directory, "target", extra=extra) as (target, _, _):
-                H.wait_until("authenticated startup full sync", 30,
-                             lambda: target.call("GET", "authenticated") == "baseline")
-                with process(redis, root / f"bad-auth-{index}", "bad-auth", redis=True,
-                             extra=("--requirepass", "different-secret"),
-                             password="different-secret") as (_, bad_port, _):
+                H.wait_until(
+                    "authenticated startup full sync",
+                    30,
+                    lambda: target.call("GET", "authenticated") == "baseline",
+                )
+                with process(
+                    redis,
+                    root / f"bad-auth-{index}",
+                    "bad-auth",
+                    redis=True,
+                    extra=("--requirepass", "different-secret"),
+                    password="different-secret",
+                ) as (_, bad_port, _):
                     reject(target, ("REPLICAOF", "127.0.0.1", bad_port), "ERR")
                 source.call("SET", "auth-tail", str(index))
-                H.wait_until("subscription survives authentication error", 10,
-                             lambda: target.call("GET", "auth-tail") == str(index))
-
+                H.wait_until(
+                    "subscription survives authentication error",
+                    10,
+                    lambda: target.call("GET", "auth-tail") == str(index),
+                )
 
 
 if __name__ == "__main__":
     fragmented_disconnect()
-    with tempfile.TemporaryDirectory(prefix="lavik-redis-follower-",
-                                     dir=os.environ.get("LAVIK_TEST_DATA_DIR")) as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="lavik-redis-follower-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
+    ) as directory:
         mode_contract(sys.argv[1], Path(directory))
         exercise(sys.argv[1], sys.argv[2], Path(directory))
         authenticated_startup(sys.argv[1], sys.argv[2], Path(directory))
         changing_endpoint(sys.argv[1], sys.argv[2], Path(directory))
         if len(sys.argv) >= 5:
-            managed_native_rejection(sys.argv[1], sys.argv[2], Path(directory),
-                                     sys.argv[3], sys.argv[4])
+            managed_native_rejection(
+                sys.argv[1], sys.argv[2], Path(directory), sys.argv[3], sys.argv[4]
+            )
         interrupted_transaction(sys.argv[1], sys.argv[2], Path(directory))
         unavailable_startup(sys.argv[1], sys.argv[2], Path(directory))
     print("Redis follower checks passed")

@@ -78,24 +78,35 @@ def main():
         # producer, so a stable result is exit 2 rather than exit 0.
         follower = next(node for node in nodes if node.id != leader.id)
         cluster_status = subprocess.run(
-            [CTL, "cluster-status", "--addr", follower.ctl_endpoint,
-             "--allow-plaintext-admin", "--json"],
-            capture_output=True, text=True, timeout=10)
-        if (cluster_status.returncode != 2 or
-                '"result":"not_ready"' not in cluster_status.stdout):
+            [
+                CTL,
+                "cluster-status",
+                "--addr",
+                follower.ctl_endpoint,
+                "--allow-plaintext-admin",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if (
+            cluster_status.returncode != 2
+            or '"result":"not_ready"' not in cluster_status.stdout
+        ):
             raise H.Failure(
                 "follower-seeded cluster status failed: "
                 f"exit={cluster_status.returncode} "
                 f"stdout={cluster_status.stdout!r} "
-                f"stderr={cluster_status.stderr!r}")
+                f"stderr={cluster_status.stderr!r}"
+            )
         H.log("follower seed discovered leader for cluster status")
 
         # 3. Commit 50 operations; verify byte-identical reads everywhere.
         last_idx = H.propose_ops(leader, 0, TOTAL_OPS_1, history=history)
         H.wait_cluster_committed(nodes, last_idx)
         history.check(nodes, timeout=30, desc="initial replication")
-        H.log(f"{TOTAL_OPS_1} operations replicated to all nodes "
-              f"(idx {last_idx})")
+        H.log(f"{TOTAL_OPS_1} operations replicated to all nodes (idx {last_idx})")
 
         # 4. Launch discovery against a survivor, then crash the current
         # leader while those real clients are in flight. Every outcome must
@@ -106,9 +117,20 @@ def main():
         transition_seed = survivors[0]
         transition_probes = [
             subprocess.Popen(
-                [CTL, "cluster-status", "--addr", transition_seed.ctl_endpoint,
-                 "--allow-plaintext-admin", "--timeout-ms", "1000", "--json"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                [
+                    CTL,
+                    "cluster-status",
+                    "--addr",
+                    transition_seed.ctl_endpoint,
+                    "--allow-plaintext-admin",
+                    "--timeout-ms",
+                    "1000",
+                    "--json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
             for _ in range(8)
         ]
         victim.kill9()
@@ -118,34 +140,47 @@ def main():
                 raise H.Failure(
                     "leader-change status probe became fatal: "
                     f"exit={probe.returncode} stdout={stdout!r} "
-                    f"stderr={stderr!r}")
-            expected_result = ("not_ready" if probe.returncode == 2
-                               else "retryable")
+                    f"stderr={stderr!r}"
+                )
+            expected_result = "not_ready" if probe.returncode == 2 else "retryable"
             if f'"result":"{expected_result}"' not in stdout:
                 raise H.Failure(
                     "leader-change status result disagreed with exit code: "
-                    f"exit={probe.returncode} stdout={stdout!r}")
+                    f"exit={probe.returncode} stdout={stdout!r}"
+                )
         leader = H.find_leader(survivors)
         # There are no Data sessions to refresh runtime eligibility, and no
         # further Meta command is issued before this status read. Reconciliation
         # must follow Raft's leader hint on its own after election.
         cluster_status = subprocess.run(
-            [CTL, "cluster-status", "--addr", leader.ctl_endpoint,
-             "--allow-plaintext-admin", "--json"],
-            capture_output=True, text=True, timeout=10)
-        if (cluster_status.returncode != 2 or
-                '"result":"not_ready"' not in cluster_status.stdout):
+            [
+                CTL,
+                "cluster-status",
+                "--addr",
+                leader.ctl_endpoint,
+                "--allow-plaintext-admin",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if (
+            cluster_status.returncode != 2
+            or '"result":"not_ready"' not in cluster_status.stdout
+        ):
             raise H.Failure(
                 "status probed or required the unavailable follower: "
                 f"exit={cluster_status.returncode} "
                 f"stdout={cluster_status.stdout!r} "
-                f"stderr={cluster_status.stderr!r}")
-        last_idx = H.propose_ops(leader, TOTAL_OPS_1, TOTAL_OPS_2,
-                                 history=history)
+                f"stderr={cluster_status.stderr!r}"
+            )
+        last_idx = H.propose_ops(leader, TOTAL_OPS_1, TOTAL_OPS_2, history=history)
         H.wait_cluster_committed(survivors, last_idx)
         history.check(survivors, timeout=30, desc="quorum after crash")
-        H.log(f"{TOTAL_OPS_2} more operations with node {victim.id} down "
-              f"(idx {last_idx})")
+        H.log(
+            f"{TOTAL_OPS_2} more operations with node {victim.id} down (idx {last_idx})"
+        )
 
         # 5. Restart the former leader on the same data dir; it must catch up
         #    via log replay and/or a snapshot install (distance 30 makes the leader
@@ -159,8 +194,11 @@ def main():
         # 6. Automatic snapshots fired on every node (and compaction with
         #    reserved_log_items=0 leaves the log starting past index 1).
         for node in nodes:
-            H.wait_until(f"node {node.id} automatic snapshot", 20,
-                         lambda node=node: node.snapshot_idx() > 0)
+            H.wait_until(
+                f"node {node.id} automatic snapshot",
+                20,
+                lambda node=node: node.snapshot_idx() > 0,
+            )
         H.log("automatic snapshots observed on all nodes")
 
         # 7. Manual snapshot returns only after durable publication. Check the
@@ -169,12 +207,20 @@ def main():
         leader = H.find_leader(nodes)
         snap_idx = H.manual_snapshot(leader)
         leader.wait_committed(snap_idx)
-        H.wait_until(f"leader snapshot_idx >= {snap_idx}", 20,
-                     lambda: leader.snapshot_idx() >= snap_idx)
-        H.wait_until("leader log compaction", 20,
-                     lambda: int(leader.status()["first_log_idx"]) > 1)
-        H.log(f"manual snapshot at idx {snap_idx}; first retained log "
-              f"index {leader.status()['first_log_idx']}")
+        H.wait_until(
+            f"leader snapshot_idx >= {snap_idx}",
+            20,
+            lambda: leader.snapshot_idx() >= snap_idx,
+        )
+        H.wait_until(
+            "leader log compaction",
+            20,
+            lambda: int(leader.status()["first_log_idx"]) > 1,
+        )
+        H.log(
+            f"manual snapshot at idx {snap_idx}; first retained log "
+            f"index {leader.status()['first_log_idx']}"
+        )
 
         # 8. Remove quorum and prove the same external command reports a
         # retryable control-plane outage (exit 3), rather than claiming the
@@ -185,15 +231,26 @@ def main():
                 node.kill9()
         time.sleep(0.8)
         no_quorum = subprocess.run(
-            [CTL, "cluster-status", "--addr", leader.ctl_endpoint,
-             "--allow-plaintext-admin", "--timeout-ms", "1000", "--json"],
-            capture_output=True, text=True, timeout=5)
-        if (no_quorum.returncode != 3 or
-                '"result":"retryable"' not in no_quorum.stdout):
+            [
+                CTL,
+                "cluster-status",
+                "--addr",
+                leader.ctl_endpoint,
+                "--allow-plaintext-admin",
+                "--timeout-ms",
+                "1000",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if no_quorum.returncode != 3 or '"result":"retryable"' not in no_quorum.stdout:
             raise H.Failure(
                 "no-quorum cluster status was not retryable: "
                 f"exit={no_quorum.returncode} stdout={no_quorum.stdout!r} "
-                f"stderr={no_quorum.stderr!r}")
+                f"stderr={no_quorum.stderr!r}"
+            )
         H.log("no-quorum cluster status returned RETRYABLE/3")
 
         # 9. Clean shutdown of the remaining process via SIGTERM.

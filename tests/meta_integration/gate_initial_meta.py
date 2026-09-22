@@ -50,7 +50,7 @@ def has_initial_binding_fault():
         while chunk := source.read(1 << 20):
             if needle in tail + chunk:
                 return True
-            tail = chunk[-len(needle):]
+            tail = chunk[-len(needle) :]
     return False
 
 
@@ -67,7 +67,8 @@ def prove_replicated(nodes, leader, value):
             f"node {node.id} applies initial membership operation {operation_id}",
             20,
             lambda node=node: node.alive()
-            and node.getop(operation_id) == f"OK completed {value}")
+            and node.getop(operation_id) == f"OK completed {value}",
+        )
 
 
 def run_count(workdir, count):
@@ -75,8 +76,8 @@ def run_count(workdir, count):
     os.makedirs(scenario, mode=0o700)
     nodes = [
         InitialBindingFaultNode(
-            META, scenario, node_id,
-            args=H.raft_args(snapshot_distance=100_000))
+            META, scenario, node_id, args=H.raft_args(snapshot_distance=100_000)
+        )
         for node_id in range(1, count + 1)
     ]
     manifest = os.path.join(scenario, "initial-cluster.toml")
@@ -106,11 +107,14 @@ def run_count(workdir, count):
             # the same manifest on its own first boot.
             if faults_enabled:
                 H.wait_until(
-                    "initial identity reconciler pauses after one binding", 10,
+                    "initial identity reconciler pauses after one binding",
+                    10,
                     lambda: any(
                         "initial Meta identity reconciliation paused after 1 "
                         "bindings" in node.log_tail(lines=300)
-                        for node in nodes[:2]))
+                        for node in nodes[:2]
+                    ),
+                )
                 leader = H.find_leader(nodes[:2], timeout=5)
                 leader.kill9()
                 for node in nodes[:2]:
@@ -120,22 +124,26 @@ def run_count(workdir, count):
                     node.start()
                 nodes[2].pause_after = None
             else:
-                H.log("SKIP mid-binding restart: ordinary Release erases "
-                      "the pause hook")
+                H.log(
+                    "SKIP mid-binding restart: ordinary Release erases the pause hook"
+                )
             nodes[2].start(initial_cluster_manifest=manifest)
             leader = H.find_leader(nodes, timeout=20)
         else:
             for node in nodes:
-                node.start(initial_cluster_manifest=manifest,
-                           explicit_ctl_socket=count != 1)
+                node.start(
+                    initial_cluster_manifest=manifest, explicit_ctl_socket=count != 1
+                )
             leader = H.find_leader(nodes, timeout=20)
 
         prove_replicated(nodes, leader, f"manifest-{count}")
         H.wait_until(
-            f"all {count} members close initial binding grace", 10,
+            f"all {count} members close initial binding grace",
+            10,
             lambda: all(
-                node.status()["initial_bindings_pending"] == "0"
-                for node in nodes))
+                node.status()["initial_bindings_pending"] == "0" for node in nodes
+            ),
+        )
         before_restart = max(node.committed() for node in nodes)
 
         for node in nodes:
@@ -149,8 +157,8 @@ def run_count(workdir, count):
             H.wait_no_regress(node, before_restart)
         prove_replicated(nodes, leader, f"restart-{count}")
         H.log(
-            f"manifest-bootstrapped {count}-Meta genesis and "
-            "manifest-free restart — OK")
+            f"manifest-bootstrapped {count}-Meta genesis and manifest-free restart — OK"
+        )
     except Exception:
         H.dump_node_logs(nodes, lines=120)
         raise

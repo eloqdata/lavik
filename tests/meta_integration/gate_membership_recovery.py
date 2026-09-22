@@ -14,6 +14,7 @@
 # limitations under the License.
 
 """Real-process durable membership recovery in temporary Meta directories."""
+
 import os
 import re
 import socket
@@ -29,9 +30,11 @@ class FaultNode(H.Node):
     action = "add"
 
     def start(self, *args, **kwargs):
-        values = {"LAVIK_TEST_PAUSE_MEMBERSHIP_PHASE": self.phase,
-                  "LAVIK_TEST_PAUSE_MEMBERSHIP_TARGET": "4",
-                  "LAVIK_TEST_PAUSE_MEMBERSHIP_ACTION": self.action}
+        values = {
+            "LAVIK_TEST_PAUSE_MEMBERSHIP_PHASE": self.phase,
+            "LAVIK_TEST_PAUSE_MEMBERSHIP_TARGET": "4",
+            "LAVIK_TEST_PAUSE_MEMBERSHIP_ACTION": self.action,
+        }
         previous = {key: os.environ.get(key) for key in values}
         try:
             for key, value in values.items():
@@ -49,19 +52,25 @@ class FaultNode(H.Node):
 
 
 def add_request(node):
-    return (f"addsrv {node.id} {node.endpoint} "
-            f"{node.data_control_endpoint} {node.ctl_endpoint}")
+    return (
+        f"addsrv {node.id} {node.endpoint} "
+        f"{node.data_control_endpoint} {node.ctl_endpoint}"
+    )
 
 
 def find_operation(node, phase, exclude=()):
-    matches = re.findall(r"membership ([0-9a-f]{32}) phase=" + re.escape(phase),
-                         node.log_tail(lines=1000))
+    matches = re.findall(
+        r"membership ([0-9a-f]{32}) phase=" + re.escape(phase),
+        node.log_tail(lines=1000),
+    )
     matches = [operation for operation in matches if operation not in exclude]
     return matches[-1] if matches else None
 
 
 def completed(node, operation, add):
-    return node.getop(operation) == "OK completed " + ("member-added" if add else "member-removed")
+    return node.getop(operation) == "OK completed " + (
+        "member-added" if add else "member-removed"
+    )
 
 
 def pending_invite(workdir):
@@ -99,14 +108,22 @@ def pending_invite(workdir):
         meta.start(bootstrap=True)
         meta.wait_leader()
         joiner.start(bootstrap=False)
-        H.wait_until("offline invite resumes without another addsrv", 30,
-                     lambda: completed(meta, operation, True))
+        H.wait_until(
+            "offline invite resumes without another addsrv",
+            30,
+            lambda: completed(meta, operation, True),
+        )
         probe, reply = meta.propose("membership-recovered")
         if not reply.startswith("OK "):
             raise H.Failure(reply)
-        H.wait_until("joiner receives committed probe", 10,
-                     lambda: joiner.getop(probe) == "OK completed membership-recovered")
-        H.log(f"offline-invite: snapshot recovery, stable operation, SIGTERM {elapsed:.3f}s")
+        H.wait_until(
+            "joiner receives committed probe",
+            10,
+            lambda: joiner.getop(probe) == "OK completed membership-recovered",
+        )
+        H.log(
+            f"offline-invite: snapshot recovery, stable operation, SIGTERM {elapsed:.3f}s"
+        )
     except Exception:
         H.dump_node_logs([meta, joiner])
         raise
@@ -116,11 +133,15 @@ def pending_invite(workdir):
 
 
 def recovery_cut(workdir, add, phase, snapshot=False, failover=False):
-    name = f"{'add' if add else 'remove'}-{phase}-{'failover' if failover else 'restart'}"
+    name = (
+        f"{'add' if add else 'remove'}-{phase}-{'failover' if failover else 'restart'}"
+    )
     scenario = os.path.join(workdir, name)
     os.makedirs(scenario)
     args = H.raft_args(snapshot_distance=100000, reserved_log_items=500)
-    nodes = [FaultNode(BINARY, scenario, 1, args=args)] + H.make_nodes(BINARY, scenario, 2, args=args, first_id=2)
+    nodes = [FaultNode(BINARY, scenario, 1, args=args)] + H.make_nodes(
+        BINARY, scenario, 2, args=args, first_id=2
+    )
     target = H.Node(BINARY, scenario, 4, args=args)
     nodes[0].phase = phase
     nodes[0].action = "add" if add else "remove"
@@ -133,12 +154,18 @@ def recovery_cut(workdir, add, phase, snapshot=False, failover=False):
         target.start(bootstrap=False)
         if not add:
             H.join_and_verify(leader, target)
-        old_operations = set(re.findall(r"membership ([0-9a-f]{32}) phase=",
-                                        leader.log_tail(lines=1000)))
+        old_operations = set(
+            re.findall(r"membership ([0-9a-f]{32}) phase=", leader.log_tail(lines=1000))
+        )
         connection.connect(leader.ctl_path)
-        connection.sendall((add_request(target) if add else "removesrv 4").encode() + b"\n")
-        H.wait_until(f"{name}: durable cut", 10,
-                     lambda: find_operation(leader, phase, old_operations))
+        connection.sendall(
+            (add_request(target) if add else "removesrv 4").encode() + b"\n"
+        )
+        H.wait_until(
+            f"{name}: durable cut",
+            10,
+            lambda: find_operation(leader, phase, old_operations),
+        )
         operation = find_operation(leader, phase, old_operations)
         if snapshot:
             H.manual_snapshot(leader)
@@ -160,32 +187,44 @@ def recovery_cut(workdir, add, phase, snapshot=False, failover=False):
             for node in nodes:
                 node.start(bootstrap=node.id == 1)
             restored = H.find_leader(nodes + ([target] if add else []), timeout=15)
-        H.wait_until(f"{name}: original task completes", 30,
-                     lambda: completed(restored, operation, add))
+        H.wait_until(
+            f"{name}: original task completes",
+            30,
+            lambda: completed(restored, operation, add),
+        )
         if add:
             probe, reply = restored.propose("after-membership-recovery")
             if not reply.startswith("OK "):
                 raise H.Failure(reply)
-            H.wait_until("target catches up", 15,
-                         lambda: target.getop(probe) == "OK completed after-membership-recovery")
+            H.wait_until(
+                "target catches up",
+                15,
+                lambda: target.getop(probe) == "OK completed after-membership-recovery",
+            )
         else:
             replies = []
 
             def terminally_retired():
-                replies[:] = [restored.ctl("removesrv 4"),
-                              restored.ctl(add_request(target))]
+                replies[:] = [
+                    restored.ctl("removesrv 4"),
+                    restored.ctl(add_request(target)),
+                ]
                 return replies == ["OK", "ERR rejected"]
 
             # Completion and retirement are already committed. Allow the
             # recovered workflow to release its membership reservation,
             # then observe the stable admission result.
             try:
-                H.wait_until("removed identity is terminally retired", 5,
-                             terminally_retired)
+                H.wait_until(
+                    "removed identity is terminally retired", 5, terminally_retired
+                )
             except H.Failure as error:
                 raise H.Failure(
-                    f"removed identity was not terminally retired: {replies}") from error
-        H.log(f"{name}: original operation completes without resubmission ({'snapshot' if snapshot else 'WAL'})")
+                    f"removed identity was not terminally retired: {replies}"
+                ) from error
+        H.log(
+            f"{name}: original operation completes without resubmission ({'snapshot' if snapshot else 'WAL'})"
+        )
     except Exception:
         H.dump_node_logs(nodes + [target])
         raise
@@ -202,7 +241,7 @@ def has_faults():
         while chunk := source.read(1 << 20):
             if needle in tail + chunk:
                 return True
-            tail = chunk[-len(needle):]
+            tail = chunk[-len(needle) :]
     return False
 
 
@@ -212,9 +251,13 @@ def main():
         pending_invite(workdir)
         if has_faults():
             for add, phase, snapshot in (
-                    (True, "submitted", False), (True, "change-config", False),
-                    (True, "config-committed", True), (False, "change-config", False),
-                    (False, "config-committed", True), (False, "identity-complete", False)):
+                (True, "submitted", False),
+                (True, "change-config", False),
+                (True, "config-committed", True),
+                (False, "change-config", False),
+                (False, "config-committed", True),
+                (False, "identity-complete", False),
+            ):
                 recovery_cut(workdir, add, phase, snapshot)
             recovery_cut(workdir, True, "change-config", failover=True)
             recovery_cut(workdir, False, "config-committed", failover=True)

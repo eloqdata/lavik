@@ -32,8 +32,7 @@ import harness as H  # noqa: E402
 
 def main():
     workdir, keep = H.make_workdir(sys.argv, "meta_partition_")
-    nodes = H.make_nodes(BINARY, workdir, 3,
-                         args=H.raft_args(snapshot_distance=100000))
+    nodes = H.make_nodes(BINARY, workdir, 3, args=H.raft_args(snapshot_distance=100000))
     try:
         leader = H.bootstrap_cluster(nodes)
         history = H.CommittedHistory()
@@ -48,14 +47,12 @@ def main():
         for follower in followers:
             follower.pause()
         isolated_id = leader.new_op_id()
-        isolated = leader.submitop(isolated_id, "partition", "minority",
-                                   timeout=6)
+        isolated = leader.submitop(isolated_id, "partition", "minority", timeout=6)
         if isolated.startswith("OK "):
             raise H.Failure("minority leader returned false commit success")
         if leader.committed() != before:
             raise H.Failure("minority advanced committed state")
-        H.wait_until("isolated leader steps down", 6,
-                     lambda: not leader.is_leader())
+        H.wait_until("isolated leader steps down", 6, lambda: not leader.is_leader())
         H.log(f"minority rejected write as {isolated} and stepped down")
 
         for follower in followers:
@@ -72,8 +69,7 @@ def main():
             states["values"] = [node.getop(isolated_id) for node in nodes]
             return len(set(states["values"])) == 1
 
-        H.wait_until("uncertain minority tail converges", 15,
-                     isolated_converged)
+        H.wait_until("uncertain minority tail converges", 15, isolated_converged)
         outcome = states["values"][0]
         if outcome == "OK submitted":
             # A follower may already hold the uncommitted tail in its kernel

@@ -34,9 +34,11 @@ def prove_write(nodes, leader, value):
     # Commit visibility does not fence the follower's asynchronous apply.
     for node in nodes:
         H.wait_until(
-            f"node {node.id} applies operation {operation_id} ({value})", 20,
+            f"node {node.id} applies operation {operation_id} ({value})",
+            20,
             lambda node=node: node.alive()
-            and node.getop(operation_id) == f"OK completed {value}")
+            and node.getop(operation_id) == f"OK completed {value}",
+        )
 
 
 def start_with_crash(node, point):
@@ -49,8 +51,7 @@ def start_with_crash(node, point):
             os.environ.pop("LAVIK_CRASH_POINT", None)
         else:
             os.environ["LAVIK_CRASH_POINT"] = previous
-    H.wait_until(f"node {node.id} reaches {point}", 20,
-                 lambda: not node.alive())
+    H.wait_until(f"node {node.id} reaches {point}", 20, lambda: not node.alive())
     if node.proc.returncode != 86:
         raise H.Failure(f"expected injected exit 86, got {node.proc.returncode}")
 
@@ -59,9 +60,12 @@ def run_case(binary, workdir, snapshot, crash_point=None):
     name = crash_point or ("snapshot" if snapshot else "wal")
     scenario = os.path.join(workdir, name)
     os.makedirs(scenario, mode=0o700)
-    nodes = H.make_nodes(binary, scenario, 4,
-                         args=H.raft_args(
-                             snapshot_distance=10 if snapshot else 100_000))
+    nodes = H.make_nodes(
+        binary,
+        scenario,
+        4,
+        args=H.raft_args(snapshot_distance=10 if snapshot else 100_000),
+    )
     late = nodes[2]
     manifest = os.path.join(scenario, "initial.toml")
     H.write_initial_cluster_manifest(manifest, nodes[:3])
@@ -73,8 +77,11 @@ def run_case(binary, workdir, snapshot, crash_point=None):
         for node in nodes[:2]:
             node.start(initial_cluster_manifest=manifest)
         leader = H.find_leader(nodes[:2])
-        H.wait_until("majority completes genesis", 10,
-                     lambda: all(bindings_complete(n) for n in nodes[:2]))
+        H.wait_until(
+            "majority completes genesis",
+            10,
+            lambda: all(bindings_complete(n) for n in nodes[:2]),
+        )
         nodes[3].start()
         H.join_and_verify(leader, nodes[3])
         active = [nodes[0], nodes[1], nodes[3]]
@@ -83,18 +90,25 @@ def run_case(binary, workdir, snapshot, crash_point=None):
             prove_write(active, leader, f"before-catchup-{sequence}")
         if snapshot:
             snapshot_index = H.manual_snapshot(leader)
-            H.wait_until("leader publishes membership snapshot", 10,
-                         lambda: leader.snapshot_idx() >= snapshot_index)
+            H.wait_until(
+                "leader publishes membership snapshot",
+                10,
+                lambda: leader.snapshot_idx() >= snapshot_index,
+            )
 
         if crash_point:
             start_with_crash(late, crash_point)
         late.start()
         H.wait_cluster_committed(nodes, leader.committed(), timeout=20)
-        H.wait_until("late member completes genesis", 10,
-                     lambda: bindings_complete(late))
+        H.wait_until(
+            "late member completes genesis", 10, lambda: bindings_complete(late)
+        )
         if snapshot:
-            H.wait_until("late member installs snapshot", 10,
-                         lambda: late.snapshot_idx() >= snapshot_index)
+            H.wait_until(
+                "late member installs snapshot",
+                10,
+                lambda: late.snapshot_idx() >= snapshot_index,
+            )
         elif late.snapshot_idx() != 0:
             raise H.Failure("WAL-only case unexpectedly used a snapshot")
 
@@ -122,8 +136,7 @@ def run_case(binary, workdir, snapshot, crash_point=None):
             raise H.Failure("two of four members elected a leader")
         for node in minority:
             try:
-                reply = node.put_automatic_uncontrolled_failover_policy(
-                    1, timeout=2)
+                reply = node.put_automatic_uncontrolled_failover_policy(1, timeout=2)
             except (OSError, H.Failure):
                 continue
             if reply.startswith("OK "):
@@ -149,7 +162,7 @@ def has_crash_hooks(binary):
         while chunk := source.read(1 << 20):
             if needle in tail + chunk:
                 return True
-            tail = chunk[-len(needle):]
+            tail = chunk[-len(needle) :]
     return False
 
 
@@ -161,8 +174,9 @@ def main():
         run_case(binary, workdir, snapshot=True)
         if has_crash_hooks(binary):
             for point in ("before-membership", "after-file", "after-marker"):
-                run_case(binary, workdir, snapshot=True,
-                         crash_point=f"meta-snapshot-{point}")
+                run_case(
+                    binary, workdir, snapshot=True, crash_point=f"meta-snapshot-{point}"
+                )
         else:
             H.log("SKIP snapshot crash cuts: binary has no fault hooks")
         return 0

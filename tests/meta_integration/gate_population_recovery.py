@@ -37,10 +37,21 @@ import gate_failover as F  # noqa: E402
 import harness as H  # noqa: E402
 from gate_data_control import allocate_data_file  # noqa: E402
 
-CASES = ("startup-barrier", "startup-stop", "clean-owner", "clean-replica",
-         "crash-operator", "manual-fence", "before-publish", "after-publish",
-         "before-consume", "after-consume", "incomplete-full", "eligible-candidate",
-         "promoted-follower")
+CASES = (
+    "startup-barrier",
+    "startup-stop",
+    "clean-owner",
+    "clean-replica",
+    "crash-operator",
+    "manual-fence",
+    "before-publish",
+    "after-publish",
+    "before-consume",
+    "after-consume",
+    "incomplete-full",
+    "eligible-candidate",
+    "promoted-follower",
+)
 
 
 @contextmanager
@@ -66,8 +77,7 @@ def require_exit_at_fault(data):
 
 
 def restart(fixture, data, fault=None):
-    data.seed = fixture.rediscover_leader(
-        time.monotonic() + 5).data_control_endpoint
+    data.seed = fixture.rediscover_leader(time.monotonic() + 5).data_control_endpoint
     with crash_at(fault):
         # Startup crash cuts may precede the metrics listener. The caller
         # awaits the distinct fault exit instead of mistaking it for timeout.
@@ -118,14 +128,17 @@ def restart_at_recovery_barrier(fixture, data, workdir, *, stop=False):
     barrier = os.path.join(workdir, "population-recovery-held")
     try:
         proxy.start()
-        H.wait_until("startup proxy is listening", 5,
-                     lambda: proxy._listener is not None)
+        H.wait_until(
+            "startup proxy is listening", 5, lambda: proxy._listener is not None
+        )
         data.seed = proxy.endpoint
-        with patch.dict(os.environ, {
-                "LAVIK_RECOVERY_INSTALL_BARRIER_PATH": barrier}):
+        with patch.dict(os.environ, {"LAVIK_RECOVERY_INSTALL_BARRIER_PATH": barrier}):
             data.start(wait_ready=False)
-        H.wait_until("population recovery reaches the install barrier", 20,
-                     lambda: os.path.exists(barrier))
+        H.wait_until(
+            "population recovery reaches the install barrier",
+            20,
+            lambda: os.path.exists(barrier),
+        )
         if not proxy.bootstrapped.is_set():
             raise H.Failure("population recovery began without mode bootstrap")
         # Keep recovery suspended across many control-client scheduler turns.
@@ -154,8 +167,9 @@ def restart_at_recovery_barrier(fixture, data, workdir, *, stop=False):
                 raise H.Failure("Meta session opened during interrupted startup")
             return proxy
         os.unlink(barrier)
-        H.wait_until("Meta session opens after population recovery", 20,
-                     proxy.connected.is_set)
+        H.wait_until(
+            "Meta session opens after population recovery", 20, proxy.connected.is_set
+        )
         return proxy
     except BaseException:
         proxy.close()
@@ -166,10 +180,14 @@ def restart_at_recovery_barrier(fixture, data, workdir, *, stop=False):
 
 
 def wait_serving(fixture, data, term):
-    A.wait_group(fixture, f"recovered Owner serves at term {term}",
-                 lambda g: g.get("term") == str(term) and
-                 g.get("owner_node_id") == data.node_id and
-                 g.get("serving_ready"), timeout=60)
+    A.wait_group(
+        fixture,
+        f"recovered Owner serves at term {term}",
+        lambda g: g.get("term") == str(term)
+        and g.get("owner_node_id") == data.node_id
+        and g.get("serving_ready"),
+        timeout=60,
+    )
 
 
 def seed(data):
@@ -181,8 +199,7 @@ def seed(data):
     F.redis_call(data, ["SET", "recovery:deleted", "gone"])
     F.redis_call(data, ["DEL", "recovery:deleted"])
     F.redis_call(data, ["HSET", "recovery:hash", "field", "v" * 20000])
-    F.redis_call(data, ["MSET", "{recovery-tx}a", "alpha",
-                       "{recovery-tx}b", "beta"])
+    F.redis_call(data, ["MSET", "{recovery-tx}a", "alpha", "{recovery-tx}b", "beta"])
     F.redis_call(data, ["SET", "recovery:complete", "yes"])
 
 
@@ -194,7 +211,10 @@ def require_data(data):
         raise H.Failure("recovered population resurrected a deletion")
     if F.redis_call(data, ["HGET", "recovery:hash", "field"]) != "v" * 20000:
         raise H.Failure("recovered grouped value differs")
-    if F.redis_call(data, ["MGET", "{recovery-tx}a", "{recovery-tx}b"]) != ["alpha", "beta"]:
+    if F.redis_call(data, ["MGET", "{recovery-tx}a", "{recovery-tx}b"]) != [
+        "alpha",
+        "beta",
+    ]:
         raise H.Failure("recovered transaction differs")
     if F.redis_call(data, ["SET", "recovery:after", "accepted"]) != "OK":
         raise H.Failure("activated Owner rejected a write")
@@ -204,8 +224,10 @@ def wait_replica_cut(owner):
     # WAIT must follow a write on the same connection: its all-flow watermark
     # covers the earlier seed writes even when source workers apply separately.
     with socket.create_connection(F.endpoint(owner), timeout=15) as connection:
-        connection.sendall(F.encode_resp(["SET", "recovery:barrier", "yes"]) +
-                           F.encode_resp(["WAIT", "1", "10000"]))
+        connection.sendall(
+            F.encode_resp(["SET", "recovery:barrier", "yes"])
+            + F.encode_resp(["WAIT", "1", "10000"])
+        )
         reader = connection.makefile("rb")
         if F.read_resp(reader) != "OK" or F.read_resp(reader) != 1:
             raise H.Failure("replica did not acknowledge the all-flow seed cut")
@@ -218,9 +240,15 @@ def wait_durable(data):
     def drained():
         info = F.redis_call(data, ["INFO", "stats"])
         fields = dict(line.split(":", 1) for line in info.splitlines() if ":" in line)
-        return all(fields.get(name) == "0" for name in (
-            "storage_dirty_staging_bytes", "storage_flushes_pending",
-            "storage_tx_commits_pending"))
+        return all(
+            fields.get(name) == "0"
+            for name in (
+                "storage_dirty_staging_bytes",
+                "storage_flushes_pending",
+                "storage_tx_commits_pending",
+            )
+        )
+
     H.wait_until("seed data is durable before crash", 20, drained)
 
 
@@ -230,10 +258,14 @@ def require_fenced(fixture, data, term):
     def listener_ready():
         with socket.create_connection(F.endpoint(data), timeout=1):
             return True
+
     H.wait_until("restarted Redis listener is available", 20, listener_ready)
-    A.wait_group(fixture, "restarted node has no serving authority",
-                 lambda g: g.get("term") == str(term) and
-                 not g.get("serving_ready"), timeout=40)
+    A.wait_group(
+        fixture,
+        "restarted node has no serving authority",
+        lambda g: g.get("term") == str(term) and not g.get("serving_ready"),
+        timeout=40,
+    )
     # Give several fresh candidate heartbeats a chance to drive selection.
     # An unknown frontier must never silently become an automatic candidate.
     deadline = time.monotonic() + 3
@@ -253,18 +285,36 @@ def promote(fixture, data):
     if not missing_ack.startswith("ERR promote expected:"):
         raise H.Failure(f"promote accepted missing data-loss consent: {missing_ack}")
     # Use the executable's direct-admin entry point, not local Data authority.
-    receipt = F.run_command([
-        fixture.ctl, "--socket", fixture.leader.ctl_path,
-        "promote", F.GROUP, "--node", data.node_id, "--accept-data-loss"])
-    if re.fullmatch(r"OK [1-9][0-9]* promote loss=unknown action=[0-9a-f]{32}\s*",
-                    receipt) is None:
+    receipt = F.run_command(
+        [
+            fixture.ctl,
+            "--socket",
+            fixture.leader.ctl_path,
+            "promote",
+            F.GROUP,
+            "--node",
+            data.node_id,
+            "--accept-data-loss",
+        ]
+    )
+    if (
+        re.fullmatch(
+            r"OK [1-9][0-9]* promote loss=unknown action=[0-9a-f]{32}\s*", receipt
+        )
+        is None
+    ):
         raise H.Failure(f"operator recovery receipt is not exact: {receipt}")
 
 
 def run(args, workdir):
-    fixture = F.FailoverFixture(args.meta, args.data, args.ctl,
-                                os.path.join(workdir, args.case), True,
-                                pause_after_begin_ms=0)
+    fixture = F.FailoverFixture(
+        args.meta,
+        args.data,
+        args.ctl,
+        os.path.join(workdir, args.case),
+        True,
+        pause_after_begin_ms=0,
+    )
     owner = fixture.by_id[F.OWNER]
     owner.workers = 2
     replica = fixture.by_id[F.CANDIDATE]
@@ -276,8 +326,9 @@ def run(args, workdir):
         for member in (owner, replica):
             os.makedirs(member.workdir, exist_ok=True)
             allocate_data_file(member.data_path, 1024 * 1024 * 1024)
-    publish_fault = ("recovery_" + case.replace("-", "_proof_")
-                     if case.endswith("publish") else None)
+    publish_fault = (
+        "recovery_" + case.replace("-", "_proof_") if case.endswith("publish") else None
+    )
     try:
         with crash_at(publish_fault):
             fixture.start_created(add_follower=False)
@@ -291,15 +342,20 @@ def run(args, workdir):
             wait_replica_cut(owner)
             F.wait_candidate_source(fixture, F.OWNER, 1, {F.CANDIDATE})
             operation = fixture.submit_failover()
-            F.wait_operation(fixture, operation,
-                             "OK completed failover-completed",
-                             "first replica is promoted", timeout=60)
+            F.wait_operation(
+                fixture,
+                operation,
+                "OK completed failover-completed",
+                "first replica is promoted",
+                timeout=60,
+            )
             wait_serving(fixture, replica, 2)
             F.wait_candidate_source(fixture, F.CANDIDATE, 2, {F.OWNER})
             wait_replica_cut(replica)
             wait_durable(replica)
             reply = fixture.leader.put_automatic_uncontrolled_failover_policy(
-                2, suspect_after_ms=5000)
+                2, suspect_after_ms=5000
+            )
             if not reply.startswith("OK "):
                 raise H.Failure(f"could not configure recovery detector: {reply}")
             replica.force_kill()
@@ -309,19 +365,27 @@ def run(args, workdir):
             info = F.replication_info_fields(replica)
             if info.get("lavik_replication_group_id") != F.GROUP.encode().hex():
                 raise H.Failure(f"recovered cluster wire group differs: {info}")
-            if F.redis_call(owner, ["SET", "recovery:after-rejoin", "verified"]) != "OK":
+            if (
+                F.redis_call(owner, ["SET", "recovery:after-rejoin", "verified"])
+                != "OK"
+            ):
                 raise H.Failure("recovered Owner rejected post-rejoin write")
-            H.wait_until("restarted member receives new replicated writes", 20,
-                         lambda: F.readonly_get(replica, "recovery:after-rejoin")
-                         == "verified")
+            H.wait_until(
+                "restarted member receives new replicated writes",
+                20,
+                lambda: F.readonly_get(replica, "recovery:after-rejoin") == "verified",
+            )
             require_data(owner)
             fixture.clean_shutdown()
             return
         if case == "incomplete-full":
             restart(fixture, replica, "system-state-device-root-durable")
             fixture.leader.registernode(
-                replica.node_id, f"lavik://node/{replica.node_id}", "replica",
-                endpoints=(replica.advertised_endpoint,))
+                replica.node_id,
+                f"lavik://node/{replica.node_id}",
+                "replica",
+                endpoints=(replica.advertised_endpoint,),
+            )
             fixture.leader.assignnode(F.GROUP, replica.node_id, "replica")
             require_exit_at_fault(replica)
         if case == "clean-replica":
@@ -331,14 +395,20 @@ def run(args, workdir):
             replica.terminate()
         short_threshold = case not in ("manual-fence", "eligible-candidate")
         reply = fixture.leader.put_automatic_uncontrolled_failover_policy(
-            2, suspect_after_ms=1000 if short_threshold else 600_000)
+            2, suspect_after_ms=1000 if short_threshold else 600_000
+        )
         if not reply.startswith("OK "):
             raise H.Failure(f"could not configure recovery detector: {reply}")
         if publish_fault:
             owner.proc.send_signal(signal.SIGINT)
             require_exit_at_fault(owner)
-        elif case in ("crash-operator", "manual-fence", "clean-replica",
-                       "incomplete-full", "eligible-candidate"):
+        elif case in (
+            "crash-operator",
+            "manual-fence",
+            "clean-replica",
+            "incomplete-full",
+            "eligible-candidate",
+        ):
             wait_durable(owner)
             owner.force_kill()
         else:
@@ -349,7 +419,8 @@ def run(args, workdir):
             require_exit_at_fault(target)
         if case in ("startup-barrier", "startup-stop"):
             startup_proxy = restart_at_recovery_barrier(
-                fixture, target, workdir, stop=case == "startup-stop")
+                fixture, target, workdir, stop=case == "startup-stop"
+            )
             if case == "startup-stop":
                 fixture.clean_shutdown()
                 return
@@ -358,29 +429,46 @@ def run(args, workdir):
         if case in ("incomplete-full", "eligible-candidate"):
             require_fenced(fixture, target, 2 if short_threshold else 1)
             reply = fixture.leader.ctl(
-                f"promote {F.GROUP} --node {target.node_id} --accept-data-loss")
-            expected = ("no-readable-recovered-population" if case == "incomplete-full"
-                        else "eligible-candidate-exists")
+                f"promote {F.GROUP} --node {target.node_id} --accept-data-loss"
+            )
+            expected = (
+                "no-readable-recovered-population"
+                if case == "incomplete-full"
+                else "eligible-candidate-exists"
+            )
             if reply != f"ERR promote {expected}":
                 raise H.Failure(f"unsafe promote was not rejected: {reply}")
             fixture.clean_shutdown()
             return
-        eligible = case in ("startup-barrier", "clean-owner", "clean-replica",
-                            "after-publish", "before-consume")
+        eligible = case in (
+            "startup-barrier",
+            "clean-owner",
+            "clean-replica",
+            "after-publish",
+            "before-consume",
+        )
         if not eligible:
             require_fenced(fixture, target, 2 if short_threshold else 1)
             if case == "manual-fence":
                 # Promote after a lease-only heartbeat has replaced the role
                 # report. Recovery availability must survive this interval;
                 # sampling an arbitrary heartbeat hid this regression.
-                H.wait_until("Meta observes the recovered population", 20,
-                             lambda: fixture.leader.observations(F.GROUP)
-                             .startswith("OK candidates=1 "))
+                H.wait_until(
+                    "Meta observes the recovered population",
+                    20,
+                    lambda: fixture.leader.observations(F.GROUP).startswith(
+                        "OK candidates=1 "
+                    ),
+                )
                 metric = "lavik_cluster_control_lease_decisions_total"
                 labels = '{decision="denied"}'
                 before = target.metric(metric, labels)
-                target.wait_metric(metric, lambda value: value > before,
-                                   "next lease heartbeat is denied", labels=labels)
+                target.wait_metric(
+                    metric,
+                    lambda value: value > before,
+                    "next lease heartbeat is denied",
+                    labels=labels,
+                )
             if short_threshold:
                 # The one-second threshold accelerates the initial fence above.
                 # Operator recovery creates a fresh source history and reconnects
@@ -396,7 +484,10 @@ def run(args, workdir):
             # A later-term Owner must record its current source domain too.
             # Also exercise the proof alongside the optional index checkpoint;
             # the first shutdown used the default checkpoint-disabled path.
-            if F.redis_call(target, ["CONFIG", "SET", "shutdown-checkpoint", "yes"]) != "OK":
+            if (
+                F.redis_call(target, ["CONFIG", "SET", "shutdown-checkpoint", "yes"])
+                != "OK"
+            ):
                 raise H.Failure("could not enable the optional shutdown checkpoint")
             target.terminate()
             restart(fixture, target)

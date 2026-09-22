@@ -14,6 +14,7 @@
 # limitations under the License.
 
 """An Ack's transit time must count toward the heartbeat interval."""
+
 import os
 from pathlib import Path
 import socket
@@ -31,6 +32,7 @@ from gate_native_replication import Client
 
 class AckDelay(H.Proxy):
     """Delay only Acks, preserving every byte and frame order."""
+
     def __init__(self, port):
         super().__init__("ack-delay", port)
         self.delay = 0.0
@@ -57,7 +59,7 @@ class AckDelay(H.Proxy):
                 header = exact(28)
                 magic, version, kind = struct.unpack_from(">IHH", header)
                 size = struct.unpack_from(">I", header, 12)[0]
-                assert magic == 0x4c564350 and version == 1 and size <= 16384
+                assert magic == 0x4C564350 and version == 1 and size <= 16384
                 frame = header + exact(size)
                 if kind == 9 and self.delay:
                     self.delayed.set()
@@ -73,9 +75,14 @@ class AckDelay(H.Proxy):
 
 def run(root):
     (root / "meta").mkdir()
-    meta = H.Node(C.META, str(root / "meta"), 1,
-                  args=H.raft_args(snapshot_distance=100000,
-                                   election_ms_low=2000, election_ms_high=4000))
+    meta = H.Node(
+        C.META,
+        str(root / "meta"),
+        1,
+        args=H.raft_args(
+            snapshot_distance=100000, election_ms_low=2000, election_ms_high=4000
+        ),
+    )
     proxy = AckDelay(meta.data_control_port)
     meta.advertised_data_control_endpoint = proxy.endpoint
     data = DataProcess(C.DATA, str(root / "data"), C.DATA_NODE, proxy.endpoint)
@@ -89,8 +96,18 @@ def run(root):
         meta.start(initial_cluster_manifest=str(manifest))
         meta.wait_leader()
         data.start()
-        C.command(os.environ.copy(), [C.CTL, "cluster-create", "--manifest",
-                  str(manifest), "--socket", meta.ctl_path, "--yes"])
+        C.command(
+            os.environ.copy(),
+            [
+                C.CTL,
+                "cluster-create",
+                "--manifest",
+                str(manifest),
+                "--socket",
+                meta.ctl_path,
+                "--yes",
+            ],
+        )
         C.wait_cluster_ready(meta, "initial owner", 60)
         assert meta.put_authority_lease_policy(2, 500).startswith("OK")
         C.wait_cluster_ready(meta, "500 ms policy installed", 15)
@@ -109,15 +126,19 @@ def run(root):
             assert client.call("SET", "{cadence}key", writes, "PX", 10000) == "OK"
             assert client.call("GET", "{cadence}key") == str(writes)
             writes += 1
-            time.sleep(.01)
+            time.sleep(0.01)
         assert data.metric(expires) == baseline, "Ack latency exhausted renewal budget"
         assert data.metric(grants) >= before + 10, "renewal stalled"
         assert not proxy.errors, proxy.errors
         H.log(f"PASS: {writes} write/read pairs with 200 ms Ack delay and 500 ms lease")
         # Scheduling earlier must not change the finite challenge-based lease.
-        proxy.delay = .7
-        data.wait_metric(expires, lambda n: n > baseline,
-                         "late Acks must expire authority", timeout=3)
+        proxy.delay = 0.7
+        data.wait_metric(
+            expires,
+            lambda n: n > baseline,
+            "late Acks must expire authority",
+            timeout=3,
+        )
         try:
             client.call("SET", "{cadence}must-fence", "invalid")
         except H.Failure as error:
@@ -145,6 +166,7 @@ def run(root):
 
 if __name__ == "__main__":
     C.META, C.DATA, C.CTL, C.REDIS_CLI = map(os.path.abspath, sys.argv[1:5])
-    with tempfile.TemporaryDirectory(prefix="lavik-cadence-",
-                                     dir=os.environ.get("LAVIK_TEST_DATA_DIR")) as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="lavik-cadence-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
+    ) as directory:
         run(Path(directory))

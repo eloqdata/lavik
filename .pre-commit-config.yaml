@@ -20,3 +20,35 @@ repos:
         name: clang-format 23.1.1
         files: '^(app/|include/lavik/|src/|tests/).*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$'
         exclude: '^include/lavik/CLI11\.hpp$|^third_party/'
+
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt
+        entry: gofmt -w
+        language: system
+        types: [go]
+        files: '^raft/'
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.13.0
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        args: [--fix, --select, E4,E9,F]
+        files: '^(admin/|scripts/|tests/).*\.py$'
+        exclude: '^(third_party/|bycorf/)'
+      - id: ruff-format
+        name: ruff format
+        files: '^(admin/|scripts/|tests/).*\.py$'
+        exclude: '^(third_party/|bycorf/)'
+
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v3.0.3
+    hooks:
+      - id: prettier
+        name: prettier
+        language_version: system
+        types_or: [javascript, json, yaml]
+        files: '^(admin/|deploy/).*\.(js|mjs|json|yaml|yml)$'
+        exclude: '^(third_party/|bycorf/)'

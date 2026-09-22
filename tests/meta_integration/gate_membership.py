@@ -54,8 +54,7 @@ def assert_frozen(node, settle_s=1.0, observe_s=0.7):
     time.sleep(observe_s)
     second = node.committed()
     if second != first:
-        raise H.Failure(
-            f"removed node {node.id} still advancing: {first} -> {second}")
+        raise H.Failure(f"removed node {node.id} still advancing: {first} -> {second}")
     H.log(f"node {node.id} frozen at committed={first} after removal")
 
 
@@ -98,24 +97,26 @@ def main():
         reply = leader.ctl(f"removesrv {victim.id}")
         if reply != "OK":
             raise H.Failure(f"removesrv node {victim.id}: {reply}")
-        H.wait_until("cluster keeps committing after removesrv", 15,
-                     lambda: load.ok_count > ok_before + 5)
+        H.wait_until(
+            "cluster keeps committing after removesrv",
+            15,
+            lambda: load.ok_count > ok_before + 5,
+        )
         assert_frozen(victim)
         victim.kill9()  # out of the cluster; shut it down
         members = [n for n in members if n.id != victim.id]
-        H.log(f"phase 2: node {victim.id} removed under load, "
-              f"cluster kept committing")
+        H.log(f"phase 2: node {victim.id} removed under load, cluster kept committing")
 
         # --- phase 3: post-join crash and repeated request ----------------
         node5 = H.Node(BINARY, workdir, 5, args=args)
         extras.append(node5)
         node5.start(bootstrap=False)
-        H.wait_until("node 5 ctl answers", 15,
-                     lambda: node5.alive() and node5.status())
+        H.wait_until("node 5 ctl answers", 15, lambda: node5.alive() and node5.status())
         leader = H.find_leader(members)
         reply = leader.ctl(
             f"addsrv 5 {node5.endpoint} {node5.data_control_endpoint} "
-            f"{node5.ctl_endpoint}")
+            f"{node5.ctl_endpoint}"
+        )
         if reply != "OK":
             raise H.Failure(f"addsrv node 5: {reply}")
         node5.kill9()
@@ -126,7 +127,8 @@ def main():
         while time.monotonic() < deadline:
             reply = leader.ctl(
                 f"addsrv 5 {node5.endpoint} {node5.data_control_endpoint} "
-                f"{node5.ctl_endpoint}")
+                f"{node5.ctl_endpoint}"
+            )
             if not observed or observed[-1] != reply:
                 observed.append(reply)
             # Already-exists confirms an accepted task was not replaced just
@@ -149,11 +151,11 @@ def main():
         existing = members[0] if members[0].id != leader.id else members[1]
         reply = leader.ctl(
             f"addsrv {existing.id} {existing.endpoint} "
-            f"{existing.data_control_endpoint} {existing.ctl_endpoint}")
+            f"{existing.data_control_endpoint} {existing.ctl_endpoint}"
+        )
         H.log(f"phase 4: addsrv existing member {existing.id} -> {reply}")
         if reply != "ERR already-exists":
-            raise H.Failure(
-                f"addsrv existing member: {reply}, want ERR already-exists")
+            raise H.Failure(f"addsrv existing member: {reply}, want ERR already-exists")
 
         # Keep an add pending on an offline learner. Removing an offline
         # voter can commit without that voter's response, so pausing the
@@ -166,9 +168,9 @@ def main():
             # Track exact operation IDs across the complete process log.
             with open(leader.log_path, encoding="utf-8", errors="replace") as log:
                 text = log.read()
-            return set(re.findall(
-                r"membership ([0-9a-f]{32}) phase=change-config\b",
-                text))
+            return set(
+                re.findall(r"membership ([0-9a-f]{32}) phase=change-config\b", text)
+            )
 
         operations_before = membership_changes()
         first_result = {}
@@ -177,32 +179,40 @@ def main():
             first_result["reply"] = leader.ctl(
                 f"addsrv {node6.id} {node6.endpoint} "
                 f"{node6.data_control_endpoint} {node6.ctl_endpoint}",
-                timeout=15)
+                timeout=15,
+            )
 
         first_thread = threading.Thread(target=add_node6, name="add-node6")
         first_thread.start()
-        H.wait_until("offline learner owns membership reservation", 10,
-                     lambda: len(membership_changes() - operations_before) == 1)
-        operation, = membership_changes() - operations_before
+        H.wait_until(
+            "offline learner owns membership reservation",
+            10,
+            lambda: len(membership_changes() - operations_before) == 1,
+        )
+        (operation,) = membership_changes() - operations_before
         second = leader.ctl(f"removesrv {node5.id}")
         if second != "ERR config-changing":
-            raise H.Failure(
-                f"concurrent removesrv: {second}, want ERR config-changing")
+            raise H.Failure(f"concurrent removesrv: {second}, want ERR config-changing")
         node6.start(bootstrap=False)
         # A bounded Admin wait may report uncertainty, but the original durable
         # operation must complete. Do not issue another addsrv: retrying could
         # hide a lost operation by admitting a replacement task.
-        H.wait_until("original learner add completes without resubmission", 30,
-                     lambda: leader.getop(operation) == "OK completed member-added")
+        H.wait_until(
+            "original learner add completes without resubmission",
+            30,
+            lambda: leader.getop(operation) == "OK completed member-added",
+        )
         first_thread.join(timeout=15)
         if first_thread.is_alive():
             raise H.Failure("first addsrv did not finish after node6 start")
         first = first_result.get("reply", "ERR missing-result")
         if first not in ("OK", f"ERR uncertain-outcome operation={operation}"):
             raise H.Failure(f"pending addsrv node {node6.id}: {first}")
-        H.log(f"phase 4: addsrv {node6.id} operation={operation} -> {first}; "
-              f"overlapping removesrv {node5.id} -> {second}; "
-              "original operation completed")
+        H.log(
+            f"phase 4: addsrv {node6.id} operation={operation} -> {first}; "
+            f"overlapping removesrv {node5.id} -> {second}; "
+            "original operation completed"
+        )
         probe = "membership-serialization"
         op_id, reply = leader.propose(probe)
         if not reply.startswith("OK "):
@@ -215,8 +225,11 @@ def main():
                 raise H.Failure(f"removesrv node {removed.id}: {reply}")
         node6.kill9()
         ok_before = load.ok_count
-        H.wait_until("cluster keeps committing after phase-4 removesrv",
-                     15, lambda: load.ok_count > ok_before + 5)
+        H.wait_until(
+            "cluster keeps committing after phase-4 removesrv",
+            15,
+            lambda: load.ok_count > ok_before + 5,
+        )
         assert_frozen(node5)
         node5.kill9()
         members = [n for n in members if n.id != node5.id]
@@ -238,8 +251,8 @@ def main():
         else:
             if reply != "ERR cannot-remove-leader":
                 raise H.Failure(
-                    f"removesrv leader: {reply}, "
-                    f"want ERR cannot-remove-leader")
+                    f"removesrv leader: {reply}, want ERR cannot-remove-leader"
+                )
             current = H.find_leader(members)
             _, check = current.propose("post-removesrv-leader")
             if not check.startswith("OK "):

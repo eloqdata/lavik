@@ -92,18 +92,20 @@ The first hook run downloads an isolated formatter environment. The
 there is no need to install clang-format separately. Lavik uses Google style
 with C++23 parsing, as configured in [.clang-format](.clang-format).
 
-The hook formats first-party C/C++ files under `app/`, `include/lavik/`,
-`src/`, and `tests/`, excluding the vendored `CLI11.hpp`. Bycorf maintains
-its own formatting configuration in its submodule.
+The hooks format first-party C/C++ files under `app/`, `include/lavik/`,
+`src/`, and `tests/`, Go files under `raft/`, Python files under `admin/`,
+`scripts/`, and `tests/`, and JavaScript, JSON, and YAML files under `admin/`
+and `deploy/`. Vendored code is excluded; Bycorf maintains its own formatting
+configuration in its submodule.
 
 To format all maintained source files immediately:
 
 ```bash
-pre-commit run clang-format --all-files
+pre-commit run --all-files
 ```
 
 To format only selected files, use
-`pre-commit run clang-format --files src/config.cpp` with your file paths.
+`pre-commit run --files src/config.cpp` with your file paths.
 Review the changes before staging them.
 
 ## Commit a change
