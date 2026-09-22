@@ -1,5 +1,10 @@
 // Copyright (C) 2026 EloqData Inc. Licensed under the Apache License, Version 2.0.
-import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+import {
+  Worker,
+  isMainThread,
+  parentPort,
+  workerData,
+} from "node:worker_threads";
 
 /** One worker owns the fleet database; SQLite fsync never stalls HTTP or Meta I/O. */
 export class Store {
@@ -7,18 +12,19 @@ export class Store {
     this.pending = new Map();
     this.sequence = 0;
     this.worker = new Worker(new URL(import.meta.url), { workerData: path });
-    this.worker.on('message', ({ id, value, error }) => {
+    this.worker.on("message", ({ id, value, error }) => {
       const pending = this.pending.get(id);
       this.pending.delete(id);
-      if (pending) error ? pending.reject(new Error(error)) : pending.resolve(value);
+      if (pending)
+        error ? pending.reject(new Error(error)) : pending.resolve(value);
     });
-    this.worker.on('error', error => {
+    this.worker.on("error", (error) => {
       this.failure = error;
       for (const pending of this.pending.values()) pending.reject(error);
       this.pending.clear();
     });
   }
-  query(sql, params = [], mode = 'all') {
+  query(sql, params = [], mode = "all") {
     if (this.failure) return Promise.reject(this.failure);
     return new Promise((resolve, reject) => {
       const id = ++this.sequence;
@@ -27,16 +33,20 @@ export class Store {
     });
   }
   async close() {
-    try { await this.query('', [], 'close'); }
-    finally { await this.worker.terminate(); }
+    try {
+      await this.query("", [], "close");
+    } finally {
+      await this.worker.terminate();
+    }
   }
 }
 
 if (!isMainThread) {
-  const { DatabaseSync } = await import('node:sqlite');
+  const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(workerData, { timeout: 0 });
-  const version = db.prepare('PRAGMA user_version').get().user_version;
-  if (version !== 0 && version !== 1) throw new Error(`Unsupported fleet database version: ${version}`);
+  const version = db.prepare("PRAGMA user_version").get().user_version;
+  if (version !== 0 && version !== 1)
+    throw new Error(`Unsupported fleet database version: ${version}`);
   db.exec(`
     PRAGMA journal_mode=WAL;
     PRAGMA synchronous=FULL;
@@ -59,14 +69,18 @@ if (!isMainThread) {
     ) STRICT;
     PRAGMA user_version=1;
   `);
-  parentPort.on('message', ({ id, sql, params, mode }) => {
+  parentPort.on("message", ({ id, sql, params, mode }) => {
     try {
       let value;
-      if (mode === 'close') db.close();
+      if (mode === "close") db.close();
       else {
         const statement = db.prepare(sql);
-        value = mode === 'run' ? statement.run(...params)
-          : mode === 'get' ? statement.get(...params) : statement.all(...params);
+        value =
+          mode === "run"
+            ? statement.run(...params)
+            : mode === "get"
+            ? statement.get(...params)
+            : statement.all(...params);
       }
       parentPort.postMessage({ id, value });
     } catch (error) {

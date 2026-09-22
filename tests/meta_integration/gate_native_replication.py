@@ -19,11 +19,11 @@ The old standalone REPLICAOF fixtures cannot authorize a native session. These
 checks use the same manifest/bootstrap and directive barrier as cluster-create;
 all native connections are admitted by production Meta and Follow Owner.
 """
+
 from contextlib import contextmanager
 import os
 import concurrent.futures
 from pathlib import Path
-import subprocess
 import struct
 import sys
 import tempfile
@@ -47,11 +47,13 @@ class Client:
             assert self.call("READONLY") == "OK"
 
     def call(self, *args):
-        values = [arg if isinstance(arg, bytes) else str(arg).encode()
-                  for arg in args]
-        self.socket.sendall(f"*{len(values)}\r\n".encode() + b"".join(
-            f"${len(value)}\r\n".encode() + value + b"\r\n"
-            for value in values))
+        values = [arg if isinstance(arg, bytes) else str(arg).encode() for arg in args]
+        self.socket.sendall(
+            f"*{len(values)}\r\n".encode()
+            + b"".join(
+                f"${len(value)}\r\n".encode() + value + b"\r\n" for value in values
+            )
+        )
         return C.read_resp(self.reader)
 
     def close(self):
@@ -60,29 +62,63 @@ class Client:
 
 
 @contextmanager
-def pair(root, name, source_faults=None, target_faults=None, seed=None,
-         source_workers=2, target_workers=3, raft_args=None,
-         require_seed_before_full=False, client_mode=None):
+def pair(
+    root,
+    name,
+    source_faults=None,
+    target_faults=None,
+    seed=None,
+    source_workers=2,
+    target_workers=3,
+    raft_args=None,
+    require_seed_before_full=False,
+    client_mode=None,
+):
     client_mode = client_mode or CLIENT_MODE
     directory = root / name
     directory.mkdir()
-    meta = H.Node(C.META, str(directory), 1,
-                  args=C.creation_raft_args() if raft_args is None else raft_args)
+    meta = H.Node(
+        C.META,
+        str(directory),
+        1,
+        args=C.creation_raft_args() if raft_args is None else raft_args,
+    )
     proxy = C.DirectiveBarrier(meta.data_control_port, recipients=(C.REPLICA_1,))
     meta.advertised_data_control_endpoint = proxy.endpoint
-    source = DataProcess(C.DATA, str(directory / "source"), C.PRIMARY_1,
-                         proxy.endpoint, workers=source_workers,
-                         environment={**os.environ, **(source_faults or {})})
-    target = DataProcess(C.DATA, str(directory / "target"), C.REPLICA_1,
-                         proxy.endpoint, workers=target_workers,
-                         environment={**os.environ, **(target_faults or {})})
-    lines = ['schema_version = 1', f'client_mode = "{client_mode}"', 'slot_strategy = "contiguous-even"']
+    source = DataProcess(
+        C.DATA,
+        str(directory / "source"),
+        C.PRIMARY_1,
+        proxy.endpoint,
+        workers=source_workers,
+        environment={**os.environ, **(source_faults or {})},
+    )
+    target = DataProcess(
+        C.DATA,
+        str(directory / "target"),
+        C.REPLICA_1,
+        proxy.endpoint,
+        workers=target_workers,
+        environment={**os.environ, **(target_faults or {})},
+    )
+    lines = [
+        "schema_version = 1",
+        f'client_mode = "{client_mode}"',
+        'slot_strategy = "contiguous-even"',
+    ]
     lines += C.meta_manifest_lines(meta)
     for node in (source, target):
-        lines += ['[[data_nodes]]', f'id = "{node.node_id}"',
-                  f'client_endpoint = "{node.advertised_endpoint}"']
-    lines += ['[[groups]]', 'id = "group-1"', f'primary = "{source.node_id}"',
-              f'replicas = ["{target.node_id}"]']
+        lines += [
+            "[[data_nodes]]",
+            f'id = "{node.node_id}"',
+            f'client_endpoint = "{node.advertised_endpoint}"',
+        ]
+    lines += [
+        "[[groups]]",
+        'id = "group-1"',
+        f'primary = "{source.node_id}"',
+        f'replicas = ["{target.node_id}"]',
+    ]
     manifest = directory / "cluster.toml"
     manifest.write_text("\n".join(lines) + "\n")
     clients = []
@@ -92,8 +128,18 @@ def pair(root, name, source_faults=None, target_faults=None, seed=None,
         meta.wait_leader()
         source.start()
         target.start()
-        C.command(os.environ.copy(), [C.CTL, "cluster-create", "--manifest",
-                  str(manifest), "--socket", meta.ctl_path, "--yes"])
+        C.command(
+            os.environ.copy(),
+            [
+                C.CTL,
+                "cluster-create",
+                "--manifest",
+                str(manifest),
+                "--socket",
+                meta.ctl_path,
+                "--yes",
+            ],
+        )
         held, release = proxy.recipients[C.REPLICA_1]
         H.wait_until("native target directive held", 30, held.is_set)
         if require_seed_before_full:
@@ -104,13 +150,17 @@ def pair(root, name, source_faults=None, target_faults=None, seed=None,
             target.pause()
         writer = Client(source)
         clients.append(writer)
-        H.wait_until("source authority before FULL", 20,
-                     lambda: writer.call("SET", "{native}seed", "baseline") == "OK")
+        H.wait_until(
+            "source authority before FULL",
+            20,
+            lambda: writer.call("SET", "{native}seed", "baseline") == "OK",
+        )
         if seed:
             seed(writer)
         if require_seed_before_full:
-            assert "replication target session" not in Path(target.log_path).read_text(), \
-                "target started FULL before the seed finished"
+            assert (
+                "replication target session" not in Path(target.log_path).read_text()
+            ), "target started FULL before the seed finished"
         release.set()
         if require_seed_before_full:
             target.resume()
@@ -167,7 +217,9 @@ def seed_collections(writer):
     writer.call("ZADD", "{native}paged-zset", *scores)
     writer.call("XADD", "{native}stream", "1-0", "field", "first")
     writer.call("XGROUP", "CREATE", "{native}stream", "group", "0")
-    writer.call("XREADGROUP", "GROUP", "group", "consumer", "STREAMS", "{native}stream", ">")
+    writer.call(
+        "XREADGROUP", "GROUP", "group", "consumer", "STREAMS", "{native}stream", ">"
+    )
 
 
 def replay_and_reconnect(root):
@@ -177,9 +229,11 @@ def replay_and_reconnect(root):
         try:
             # The source has two data shards and the target has three. Their
             # extra Meta workers must never become replication flows.
-            info = dict(line.split(":", 1) for line in
-                        reader.call("INFO", "replication").splitlines()
-                        if ":" in line)
+            info = dict(
+                line.split(":", 1)
+                for line in reader.call("INFO", "replication").splitlines()
+                if ":" in line
+            )
             assert info.get("lavik_source_workers") == "2", info
             assert info.get("lavik_connected_flows") == "2", info
             assert reader.call("GET", "{native}seed") == "baseline"
@@ -188,22 +242,51 @@ def replay_and_reconnect(root):
             assert reader.call("SCARD", "{native}set") == 2
             assert reader.call("ZRANGE", "{native}zset", 0, -1) == ["a", "b"]
             assert reader.call("STRLEN", "{native}large") == 2 * 1024 * 1024
-            assert reader.call("PEXPIRETIME", "{native}ttl") == writer.call("PEXPIRETIME", "{native}ttl")
+            assert reader.call("PEXPIRETIME", "{native}ttl") == writer.call(
+                "PEXPIRETIME", "{native}ttl"
+            )
             for client in (writer, reader):
-                for args in (("REPLICAOF", "NO", "ONE"),
-                             ("SLAVEOF", "127.0.0.1", source.redis_port),
-                             ("ADDREPLICAOF", "127.0.0.1", source.redis_port)):
+                for args in (
+                    ("REPLICAOF", "NO", "ONE"),
+                    ("SLAVEOF", "127.0.0.1", source.redis_port),
+                    ("ADDREPLICAOF", "127.0.0.1", source.redis_port),
+                ):
                     rejects(client, args, "not allowed")
-            for command, key in (("HLEN", "paged-hash"), ("SCARD", "paged-set"),
-                                 ("LLEN", "paged-list"), ("ZCARD", "paged-zset")):
+            for command, key in (
+                ("HLEN", "paged-hash"),
+                ("SCARD", "paged-set"),
+                ("LLEN", "paged-list"),
+                ("ZCARD", "paged-zset"),
+            ):
                 assert reader.call(command, "{native}" + key) == 256
-            assert reader.call("XINFO", "STREAM", "{native}stream", "FULL", "COUNT", 10) == writer.call("XINFO", "STREAM", "{native}stream", "FULL", "COUNT", 10)
+            assert reader.call(
+                "XINFO", "STREAM", "{native}stream", "FULL", "COUNT", 10
+            ) == writer.call("XINFO", "STREAM", "{native}stream", "FULL", "COUNT", 10)
             writer.call("XADD", "{native}stream", "2-0", "field", "second")
-            writer.call("XCLAIM", "{native}stream", "group", "claimed", 0,
-                        "1-0", "TIME", 123456, "RETRYCOUNT", 7, "JUSTID")
-            expected_stream = writer.call("XINFO", "STREAM", "{native}stream", "FULL", "COUNT", 10)
-            H.wait_until("stream consumer state replay", 20,
-                         lambda: reader.call("XINFO", "STREAM", "{native}stream", "FULL", "COUNT", 10) == expected_stream)
+            writer.call(
+                "XCLAIM",
+                "{native}stream",
+                "group",
+                "claimed",
+                0,
+                "1-0",
+                "TIME",
+                123456,
+                "RETRYCOUNT",
+                7,
+                "JUSTID",
+            )
+            expected_stream = writer.call(
+                "XINFO", "STREAM", "{native}stream", "FULL", "COUNT", 10
+            )
+            H.wait_until(
+                "stream consumer state replay",
+                20,
+                lambda: reader.call(
+                    "XINFO", "STREAM", "{native}stream", "FULL", "COUNT", 10
+                )
+                == expected_stream,
+            )
             # Replacement and non-idempotent commands must preserve type,
             # absolute expiry, transaction ordering, and exact apply counts.
             writer.call("LAVIK.HREPLACE", "{native}hash", "new", "replacement")
@@ -221,27 +304,44 @@ def replay_and_reconnect(root):
             old_full = Path(source.log_path).read_text().count("selected=FULL")
             assert writer.call("CLIENT", "KILL", "TYPE", "replica") > 0
             writer.call("INCR", "{native}count")
-            H.wait_until("Follow Owner resumes exactly once", 30,
-                         lambda: reader.call("GET", "{native}count") == "2")
-            H.wait_until("Follow Owner continuation", 30,
-                         lambda: "selected=CONTINUE" in Path(source.log_path).read_text())
+            H.wait_until(
+                "Follow Owner resumes exactly once",
+                30,
+                lambda: reader.call("GET", "{native}count") == "2",
+            )
+            H.wait_until(
+                "Follow Owner continuation",
+                30,
+                lambda: "selected=CONTINUE" in Path(source.log_path).read_text(),
+            )
             assert Path(source.log_path).read_text().count("selected=FULL") == old_full
             # Real transactions also carry ephemeral PUBLISH under authority.
             subscriber = Client(target, readonly=True)
             try:
-                assert subscriber.call("SUBSCRIBE", "{native}channel") == ["subscribe", "{native}channel", 1]
+                assert subscriber.call("SUBSCRIBE", "{native}channel") == [
+                    "subscribe",
+                    "{native}channel",
+                    1,
+                ]
                 writer.call("MULTI")
                 writer.call("SET", "{native}mixed", "written")
                 writer.call("PUBLISH", "{native}channel", "message")
                 writer.call("EXEC")
-                assert C.read_resp(subscriber.reader) == ["message", "{native}channel", "message"]
+                assert C.read_resp(subscriber.reader) == [
+                    "message",
+                    "{native}channel",
+                    "message",
+                ]
                 assert reader.call("GET", "{native}mixed") == "written"
             finally:
                 subscriber.close()
             # Expiration comes from the authoritative source and is replayed.
             writer.call("PEXPIRE", "{native}ttl", 20)
-            H.wait_until("replicated authoritative expiration", 10,
-                         lambda: reader.call("EXISTS", "{native}ttl") == 0)
+            H.wait_until(
+                "replicated authoritative expiration",
+                10,
+                lambda: reader.call("EXISTS", "{native}ttl") == 0,
+            )
         finally:
             reader.close()
         # Shutdown must join flow owners even if the upstream cannot reply.
@@ -275,7 +375,7 @@ def dense_collection_full_sync(root):
             elif kind == 5:
                 data += struct.pack("<d", float(i))
         data += b"\x0b\x00"
-        polynomial = int(f"{0xad93d23594c935a9:064b}"[::-1], 2)
+        polynomial = int(f"{0xAD93D23594C935A9:064b}"[::-1], 2)
         table = []
         for byte in range(256):
             crc = byte
@@ -300,10 +400,15 @@ def dense_collection_full_sync(root):
     # This gate verifies ingestion and payload integrity under the ordinary
     # five-second authority lease. Subsecond lease tests expose a separate
     # data-observation stall and must not prevent this ingestion test starting.
-    with pair(root, "dense-collections", seed=seed, require_seed_before_full=True,
-              raft_args=H.raft_args(snapshot_distance=100000,
-                                    election_ms_low=5000,
-                                    election_ms_high=10000)) as (meta, _, target, writer):
+    with pair(
+        root,
+        "dense-collections",
+        seed=seed,
+        require_seed_before_full=True,
+        raft_args=H.raft_args(
+            snapshot_distance=100000, election_ms_low=5000, election_ms_high=10000
+        ),
+    ) as (meta, _, target, writer):
         started = time.monotonic()
         ready(meta)
         reader = Client(target, readonly=True)
@@ -314,69 +419,114 @@ def dense_collection_full_sync(root):
             # Distinct values and scores expose association errors that counts
             # alone, or a fixture with one repeated Hash value, cannot detect.
             assert sorted(reader.call("SMEMBERS", "{dense}set")) == sorted(
-                writer.call("SMEMBERS", "{dense}set"))
+                writer.call("SMEMBERS", "{dense}set")
+            )
             expected = writer.call("HGETALL", "{dense}hash")
             actual = reader.call("HGETALL", "{dense}hash")
             assert dict(zip(actual[::2], actual[1::2], strict=True)) == dict(
-                zip(expected[::2], expected[1::2], strict=True))
-            assert reader.call("ZRANGE", "{dense}zset", 0, -1, "WITHSCORES") == \
-                writer.call("ZRANGE", "{dense}zset", 0, -1, "WITHSCORES")
+                zip(expected[::2], expected[1::2], strict=True)
+            )
+            assert reader.call(
+                "ZRANGE", "{dense}zset", 0, -1, "WITHSCORES"
+            ) == writer.call("ZRANGE", "{dense}zset", 0, -1, "WITHSCORES")
         finally:
             reader.close()
-        H.log(f"dense Hash/Set/ZSet FULL verified {count} members each in "
-              f"{time.monotonic() - started:.3f}s")
+        H.log(
+            f"dense Hash/Set/ZSet FULL verified {count} members each in "
+            f"{time.monotonic() - started:.3f}s"
+        )
 
 
 def handoff_order(root):
-    with pair(root, "handoff", target_faults={
-            "LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK": "1"},
-            source_workers=1, target_workers=1) as (meta, source, target, writer):
+    with pair(
+        root,
+        "handoff",
+        target_faults={"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK": "1"},
+        source_workers=1,
+        target_workers=1,
+    ) as (meta, source, target, writer):
         ready(meta)
         log = Path(target.log_path).read_text()
-        assert log.index("holding first partition handoff") < log.index("acknowledged async partition handoff 1") < log.index("acknowledged async partition handoff 0")
+        assert (
+            log.index("holding first partition handoff")
+            < log.index("acknowledged async partition handoff 1")
+            < log.index("acknowledged async partition handoff 0")
+        )
         assert C.readonly_get(target, "{native}seed") == "baseline"
         writer.call("INCR", "{native}tail")
-        H.wait_until("handoff tail", 20, lambda: C.readonly_get(target, "{native}tail") == "1")
+        H.wait_until(
+            "handoff tail", 20, lambda: C.readonly_get(target, "{native}tail") == "1"
+        )
 
 
 def cancelled_handoff(root):
-    with pair(root, "cancel-handoff", target_faults={
-            "LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK": "cancel"},
-            source_workers=1, target_workers=1) as (_, source, target, _writer):
-        H.wait_until("outstanding native handoff", 30,
-                     lambda: "holding first partition handoff" in Path(target.log_path).read_text())
+    with pair(
+        root,
+        "cancel-handoff",
+        target_faults={"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK": "cancel"},
+        source_workers=1,
+        target_workers=1,
+    ) as (_, source, target, _writer):
+        H.wait_until(
+            "outstanding native handoff",
+            30,
+            lambda: "holding first partition handoff"
+            in Path(target.log_path).read_text(),
+        )
         reader = Client(target, readonly=True)
         try:
             rejects(reader, ("GET", "{native}seed"), "LOADING")
         finally:
             reader.close()
         target.terminate()
-        assert "acknowledged async partition handoff 0" not in Path(target.log_path).read_text()
+        assert (
+            "acknowledged async partition handoff 0"
+            not in Path(target.log_path).read_text()
+        )
 
 
 def rejected_full(root, name, source_faults, target_faults, marker):
-    with pair(root, name, source_faults=source_faults,
-              target_faults=target_faults) as (meta, source, target, _writer):
-        H.wait_until(name + " fault reached", 30,
-                     lambda: marker in Path(target.log_path).read_text() + Path(source.log_path).read_text())
+    with pair(root, name, source_faults=source_faults, target_faults=target_faults) as (
+        meta,
+        source,
+        target,
+        _writer,
+    ):
+        H.wait_until(
+            name + " fault reached",
+            30,
+            lambda: marker
+            in Path(target.log_path).read_text() + Path(source.log_path).read_text(),
+        )
         reader = Client(target, readonly=True)
         try:
             rejects(reader, ("GET", "{native}seed"), "LOADING")
             rejects(reader, ("REPLICAOF", "NO", "ONE"), "not allowed")
             # A failed directed rebuild cannot manufacture an autonomous new
             # attempt or publish ONLINE without another Meta authorization.
-            H.wait_until(name + " reported to Meta", 30,
-                         lambda: C.cluster_status(meta).get("cluster_state") == "provisioning-failed")
-            assert "lavik_replication_state:online" not in reader.call("INFO", "replication")
+            H.wait_until(
+                name + " reported to Meta",
+                30,
+                lambda: C.cluster_status(meta).get("cluster_state")
+                == "provisioning-failed",
+            )
+            assert "lavik_replication_state:online" not in reader.call(
+                "INFO", "replication"
+            )
         finally:
             reader.close()
 
 
 def full_tail(root):
-    with pair(root, "full-tail", source_faults={
+    with pair(
+        root,
+        "full-tail",
+        source_faults={
             "LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "1000",
-            "LAVIK_REPLICATION_PAUSE_FULLSYNC_BEFORE_CUT_MS": "1000"},
-            seed=seed_collections) as (meta, source, target, writer):
+            "LAVIK_REPLICATION_PAUSE_FULLSYNC_BEFORE_CUT_MS": "1000",
+        },
+        seed=seed_collections,
+    ) as (meta, source, target, writer):
         for i in range(32):
             writer.call("MULTI")
             writer.call("INCR", "{native}count")
@@ -388,7 +538,9 @@ def full_tail(root):
         try:
             assert reader.call("GET", "{native}count") == "32"
             assert reader.call("HGET", "{native}paged-hash", "field0") == "31"
-            assert reader.call("LRANGE", "{native}list", 0, -1) == ["a", "b"] + list(map(str, range(32)))
+            assert reader.call("LRANGE", "{native}list", 0, -1) == ["a", "b"] + list(
+                map(str, range(32))
+            )
             # Pressure across changing source workers must release every
             # admission reservation, including writes on non-connection owners.
             writer.call("CONFIG", "SET", "replication-publish-queue-mb-per-worker", 1)
@@ -396,7 +548,9 @@ def full_tail(root):
                 writer.call("SET", f"waterline-{i % 17}", str(i) + "x" * 32768)
             assert writer.call("WAIT", 1, 5000) == 1
             for i in range(17):
-                assert reader.call("GET", f"waterline-{i}") == writer.call("GET", f"waterline-{i}")
+                assert reader.call("GET", f"waterline-{i}") == writer.call(
+                    "GET", f"waterline-{i}"
+                )
         finally:
             reader.close()
 
@@ -406,16 +560,26 @@ def full_tail_publish_before_reset(root):
     # Publish into the last slot while that flow is paused: both the bare
     # command and the EXEC envelope must replay before their transport slot
     # has any replica storage context.
-    tag = next(f"full-publish-{i}" for i in range(100000)
-               if C.redis_slot(f"full-publish-{i}") == 16383)
+    tag = next(
+        f"full-publish-{i}"
+        for i in range(100000)
+        if C.redis_slot(f"full-publish-{i}") == 16383
+    )
     channel = "{" + tag + "}channel"
-    with pair(root, "full-tail-publish-before-reset", source_faults={
-            "LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "3000"},
-            require_seed_before_full=True,
-            source_workers=1, target_workers=2) as (meta, source, target, writer):
-        H.wait_until("partition zero handed off before publications", 30, lambda:
-                     "paused full sync after acknowledged handoff partition 0 "
-                     in Path(source.log_path).read_text())
+    with pair(
+        root,
+        "full-tail-publish-before-reset",
+        source_faults={"LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "3000"},
+        require_seed_before_full=True,
+        source_workers=1,
+        target_workers=2,
+    ) as (meta, source, target, writer):
+        H.wait_until(
+            "partition zero handed off before publications",
+            30,
+            lambda: "paused full sync after acknowledged handoff partition 0 "
+            in Path(source.log_path).read_text(),
+        )
         subscriber = Client(target)
         try:
             assert subscriber.call("SUBSCRIBE", channel) == ["subscribe", channel, 1]
@@ -443,8 +607,9 @@ def full_tail_expiration_effects(root):
     # that window must use FULL command replay, not the initial snapshot or
     # the ONLINE backlog. Canonical TTL effects wrap these single-key writes
     # in __LAVIK_EXEC_V1; that wrapper still needs the partition apply context.
-    tag = next(f"full-tail-{i}" for i in range(100000)
-               if C.redis_slot(f"full-tail-{i}") == 0)
+    tag = next(
+        f"full-tail-{i}" for i in range(100000) if C.redis_slot(f"full-tail-{i}") == 0
+    )
     prefix = "{" + tag + "}"
     counter, collection = prefix + "counter", prefix + "hash"
 
@@ -453,13 +618,21 @@ def full_tail_expiration_effects(root):
         assert writer.call("HSET", collection, "before", "snapshot") == 1
         assert writer.call("PEXPIRE", collection, 120000) == 1
 
-    with pair(root, "full-tail-expiration-effects", source_faults={
-            "LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "3000"},
-            seed=seed, require_seed_before_full=True,
-            source_workers=1, target_workers=2) as (meta, source, target, writer):
-        H.wait_until("partition zero handed off before mutations", 30, lambda:
-                     "paused full sync after acknowledged handoff partition 0 "
-                     in Path(source.log_path).read_text())
+    with pair(
+        root,
+        "full-tail-expiration-effects",
+        source_faults={"LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "3000"},
+        seed=seed,
+        require_seed_before_full=True,
+        source_workers=1,
+        target_workers=2,
+    ) as (meta, source, target, writer):
+        H.wait_until(
+            "partition zero handed off before mutations",
+            30,
+            lambda: "paused full sync after acknowledged handoff partition 0 "
+            in Path(source.log_path).read_text(),
+        )
         assert writer.call("INCR", counter) == 1
         assert writer.call("HSET", collection, "after", "tail") == 1
         deadline = writer.call("PEXPIRETIME", collection)
@@ -482,32 +655,41 @@ def full_tail_expiration_effects(root):
         assert "outside its apply context" not in Path(target.log_path).read_text()
 
 
-
 def full_tail_type_reuse(root):
     # Keep these commands behind one acknowledged handoff so they traverse
     # FULL's command/after-image FIFO before the ONLINE boundary. Multi-key
     # writes use committed participant records; single-key writes carry their
     # original command and its TTL companion.
-    tag = next(f"full-reuse-{i}" for i in range(100000)
-               if C.redis_slot(f"full-reuse-{i}") == 0)
+    tag = next(
+        f"full-reuse-{i}" for i in range(100000) if C.redis_slot(f"full-reuse-{i}") == 0
+    )
     prefix = "{" + tag + "}"
-    key, counter, other, copied = [prefix + name for name in
-                                  ("typed", "counter", "other", "copied")]
+    key, counter, other, copied = [
+        prefix + name for name in ("typed", "counter", "other", "copied")
+    ]
 
     def seed(writer):
         assert writer.call("SET", key, "seed") == "OK"
         assert writer.call("MSET", counter, 0, other, 0) == "OK"
 
-    with pair(root, "full-tail-type-reuse", source_faults={
-            "LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "5000"},
-            seed=seed, require_seed_before_full=True,
-            source_workers=1, target_workers=2,
-            raft_args=H.raft_args(snapshot_distance=100000,
-                                  election_ms_low=5000,
-                                  election_ms_high=10000)) as (meta, source, target, writer):
-        H.wait_until("type reuse partition handed off", 30, lambda:
-                     "paused full sync after acknowledged handoff partition 0 "
-                     in Path(source.log_path).read_text())
+    with pair(
+        root,
+        "full-tail-type-reuse",
+        source_faults={"LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "5000"},
+        seed=seed,
+        require_seed_before_full=True,
+        source_workers=1,
+        target_workers=2,
+        raft_args=H.raft_args(
+            snapshot_distance=100000, election_ms_low=5000, election_ms_high=10000
+        ),
+    ) as (meta, source, target, writer):
+        H.wait_until(
+            "type reuse partition handed off",
+            30,
+            lambda: "paused full sync after acknowledged handoff partition 0 "
+            in Path(source.log_path).read_text(),
+        )
         for i in range(8):
             # An absolute past deadline deletes immediately, with no sleep or
             # scheduler race required to advance from one value type to another.
@@ -541,10 +723,16 @@ def full_tail_type_reuse(root):
 
 
 def post_cut_reset_reconnect(root):
-    with pair(root, "post-cut-reset", source_faults={
-            "LAVIK_REPLICATION_POST_CUT_RESET_ONCE": "1"}) as (meta, source, target, writer):
-        H.wait_until("post-cut reset injection", 30, lambda:
-                     "injected post-cut reset" in Path(source.log_path).read_text())
+    with pair(
+        root,
+        "post-cut-reset",
+        source_faults={"LAVIK_REPLICATION_POST_CUT_RESET_ONCE": "1"},
+    ) as (meta, source, target, writer):
+        H.wait_until(
+            "post-cut reset injection",
+            30,
+            lambda: "injected post-cut reset" in Path(source.log_path).read_text(),
+        )
         # The reset interrupts FULL before the source confirms every flow.
         # Recovery may need another FULL, especially with an empty flow at its
         # initial cursor. Assert the original contract: recovery preserves data
@@ -554,9 +742,13 @@ def post_cut_reset_reconnect(root):
         try:
             # Transport ONLINE can precede the new population's serving
             # projection; wait for the actual read path as well.
-            H.wait_until("post-cut reconnect serves preserved data", 30, lambda:
-                         "lavik_replication_state:online" in reader.call("INFO", "replication")
-                         and reader.call("GET", "{native}seed") == "baseline")
+            H.wait_until(
+                "post-cut reconnect serves preserved data",
+                30,
+                lambda: "lavik_replication_state:online"
+                in reader.call("INFO", "replication")
+                and reader.call("GET", "{native}seed") == "baseline",
+            )
             assert writer.call("INCR", "post-cut-counter") == 1
             assert writer.call("WAIT", 1, 5000) == 1
             assert reader.call("GET", "post-cut-counter") == "1"
@@ -566,7 +758,12 @@ def post_cut_reset_reconnect(root):
 
 
 def committed_cursor_reconnect(root, name, target_faults):
-    with pair(root, name, target_faults=target_faults) as (meta, source, target, writer):
+    with pair(root, name, target_faults=target_faults) as (
+        meta,
+        source,
+        target,
+        writer,
+    ):
         ready(meta)
         reader = Client(target, readonly=True)
         try:
@@ -575,13 +772,27 @@ def committed_cursor_reconnect(root, name, target_faults):
             assert writer.call("WAIT", 1, 5000) == 1
             old_full = Path(source.log_path).read_text().count("selected=FULL")
             writer.call("INCR", "cancelled-apply-counter")
-            if target_faults and "LAVIK_REPLICATION_CANCEL_PEER_FLOW_AFTER_COMMAND_APPLY_ONCE" in target_faults:
-                H.wait_until("cancel after committed apply", 30, lambda:
-                             "injected peer-flow session cancellation after command apply" in Path(target.log_path).read_text())
-            H.wait_until("committed cursor reconnect", 30, lambda:
-                         "selected=CONTINUE" in Path(source.log_path).read_text())
-            H.wait_until("committed increment applied once", 30, lambda:
-                         reader.call("GET", "cancelled-apply-counter") == "1")
+            if (
+                target_faults
+                and "LAVIK_REPLICATION_CANCEL_PEER_FLOW_AFTER_COMMAND_APPLY_ONCE"
+                in target_faults
+            ):
+                H.wait_until(
+                    "cancel after committed apply",
+                    30,
+                    lambda: "injected peer-flow session cancellation after command apply"
+                    in Path(target.log_path).read_text(),
+                )
+            H.wait_until(
+                "committed cursor reconnect",
+                30,
+                lambda: "selected=CONTINUE" in Path(source.log_path).read_text(),
+            )
+            H.wait_until(
+                "committed increment applied once",
+                30,
+                lambda: reader.call("GET", "cancelled-apply-counter") == "1",
+            )
             assert reader.call("GET", "{native}seed") == "baseline"
             assert Path(source.log_path).read_text().count("selected=FULL") == old_full
         finally:
@@ -589,19 +800,32 @@ def committed_cursor_reconnect(root, name, target_faults):
 
 
 def divergent_tail(root, flow):
-    with pair(root, f"divergent-{flow}", source_faults={
+    with pair(
+        root,
+        f"divergent-{flow}",
+        source_faults={
             "LAVIK_REPLICATION_DIVERGENT_TAIL_ONCE": "1",
-            "LAVIK_REPLICATION_DIVERGENT_TAIL_FLOW": str(flow)},
-            target_workers=2) as (meta, source, target, writer):
+            "LAVIK_REPLICATION_DIVERGENT_TAIL_FLOW": str(flow),
+        },
+        target_workers=2,
+    ) as (meta, source, target, writer):
         ready(meta)
         key = "divergent-counter"
         while writer.call("CLUSTER", "KEYSLOT", key) % 2 != flow:
             key += "x"
         assert writer.call("INCR", key) == 1
-        H.wait_until("divergent tail reaches flow", 30, lambda:
-                     "injected divergent replication tail" in Path(source.log_path).read_text())
-        H.wait_until("all continuation cursors invalidated", 30, lambda:
-                     "invalidated native replication continuation" in Path(target.log_path).read_text())
+        H.wait_until(
+            "divergent tail reaches flow",
+            30,
+            lambda: "injected divergent replication tail"
+            in Path(source.log_path).read_text(),
+        )
+        H.wait_until(
+            "all continuation cursors invalidated",
+            30,
+            lambda: "invalidated native replication continuation"
+            in Path(target.log_path).read_text(),
+        )
         # A gap invalidates the entire population. The follower may not use
         # the other flow's cursor to become readable without fresh authority.
         reader = Client(target, readonly=True)
@@ -612,7 +836,12 @@ def divergent_tail(root, flow):
 
 
 def backpressured_shutdown(root):
-    with pair(root, "backpressure", source_workers=1, target_workers=1) as (meta, source, target, writer):
+    with pair(root, "backpressure", source_workers=1, target_workers=1) as (
+        meta,
+        source,
+        target,
+        writer,
+    ):
         ready(meta)
         writer.call("CONFIG", "SET", "replication-publish-queue-mb-per-worker", 1)
         writer.call("SET", "ack-baseline", "ready")
@@ -622,8 +851,13 @@ def backpressured_shutdown(root):
             payload = "x" * (4 * 1024 * 1024)
             writer.call("SET", "pressure", payload)
             writer.call("SET", "pressure", payload)
-            H.wait_until("native source backlog pressure", 10,
-                         lambda: 'lavik_replication_backlog_backpressured{worker="0"} 1' in source.metrics())
+            H.wait_until(
+                "native source backlog pressure",
+                10,
+                lambda: 'lavik_replication_backlog_backpressured{worker="0"} 1'
+                in source.metrics(),
+            )
+
             def blocked_write():
                 client = Client(source)
                 try:
@@ -632,9 +866,10 @@ def backpressured_shutdown(root):
                     return "closed"
                 finally:
                     client.close()
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 pending = pool.submit(blocked_write)
-                time.sleep(.2)
+                time.sleep(0.2)
                 assert not pending.done()
                 assert writer.call("PING") == "PONG"
                 started = time.monotonic()
@@ -652,7 +887,11 @@ def replica_backup_during_exec(root):
     hold = root / "backup-cut.hold"
     faults = {"LAVIK_BACKUP_CUT_HOLD_FILE": str(hold)} if deterministic else {}
     with pair(root, "replica-backup-exec", target_faults=faults) as (
-            meta, source, target, writer):
+        meta,
+        source,
+        target,
+        writer,
+    ):
         ready(meta)
         reader = Client(target, readonly=True)
         stopped = threading.Event()
@@ -665,8 +904,12 @@ def replica_backup_during_exec(root):
                 while not stopped.is_set():
                     assert client.call("MULTI") == "OK"
                     assert client.call("INCR", "{backup}counter") == "QUEUED"
-                    assert client.call("COPY", "{backup}counter", "{backup}copy",
-                                       "REPLACE") == "QUEUED"
+                    assert (
+                        client.call(
+                            "COPY", "{backup}counter", "{backup}copy", "REPLACE"
+                        )
+                        == "QUEUED"
+                    )
                     count += 1
                     assert client.call("EXEC") == [count, 1]
                     started.set()
@@ -676,6 +919,7 @@ def replica_backup_during_exec(root):
                 client.close()
 
         old_full = Path(source.log_path).read_text().count("selected=FULL")
+
         def start_backup():
             try:
                 assert reader.call("BGSAVE") == "Background saving started"
@@ -695,32 +939,50 @@ def replica_backup_during_exec(root):
                     dump = Path(target.workdir) / "dump.rdb"
                     for iteration in range(16):
                         previous = dump.stat().st_mtime_ns if dump.exists() else 0
-                        completed = Path(target.log_path).read_text().count(
-                            "RDB backup completed:")
+                        completed = (
+                            Path(target.log_path)
+                            .read_text()
+                            .count("RDB backup completed:")
+                        )
                         if deterministic and iteration == 0:
                             hold.touch()
                             # BGSAVE replies only after its cut reopens. Run it
                             # separately while observing the target checkpoint.
                             backup = pool.submit(start_backup)
                             try:
-                                H.wait_until("backup gates closed", 10, lambda:
-                                    "backup test checkpoint: database gates closed" in
-                                    Path(target.log_path).read_text())
-                                H.wait_until("replica EXEC blocked by backup", 10, lambda:
-                                    "backup test checkpoint: replica EXEC waiting for database admission" in
-                                    Path(target.log_path).read_text())
-                                assert not backup.done(), "backup cut reopened before release"
+                                H.wait_until(
+                                    "backup gates closed",
+                                    10,
+                                    lambda: "backup test checkpoint: database gates closed"
+                                    in Path(target.log_path).read_text(),
+                                )
+                                H.wait_until(
+                                    "replica EXEC blocked by backup",
+                                    10,
+                                    lambda: "backup test checkpoint: replica EXEC waiting for database admission"
+                                    in Path(target.log_path).read_text(),
+                                )
+                                assert not backup.done(), (
+                                    "backup cut reopened before release"
+                                )
                             finally:
                                 hold.unlink(missing_ok=True)
                             assert backup.result(timeout=10)
                         else:
                             H.wait_until("replica backup admitted", 10, start_backup)
-                        H.wait_until("replica backup completed", 30, lambda:
-                                     dump.exists() and dump.stat().st_mtime_ns != previous
-                                     and Path(target.log_path).read_text().count(
-                                         "RDB backup completed:") > completed)
+                        H.wait_until(
+                            "replica backup completed",
+                            30,
+                            lambda: dump.exists()
+                            and dump.stat().st_mtime_ns != previous
+                            and Path(target.log_path)
+                            .read_text()
+                            .count("RDB backup completed:")
+                            > completed,
+                        )
                         assert "lavik_replication_state:online" in reader.call(
-                            "INFO", "replication")
+                            "INFO", "replication"
+                        )
                 finally:
                     hold.unlink(missing_ok=True)
                     stopped.set()
@@ -729,8 +991,10 @@ def replica_backup_during_exec(root):
             assert reader.call("GET", "{backup}counter") == str(count)
             assert reader.call("GET", "{backup}copy") == str(count)
             assert Path(source.log_path).read_text().count("selected=FULL") == old_full
-            assert "invalidated native replication continuation" not in Path(
-                target.log_path).read_text()
+            assert (
+                "invalidated native replication continuation"
+                not in Path(target.log_path).read_text()
+            )
         finally:
             reader.close()
 
@@ -741,18 +1005,26 @@ def small_receive_window(root):
         # and the target's fault reduces its receive window.
         writer.call("SET", "{window}seed", "s" * (2 * 1024 * 1024))
 
-    with pair(root, "small-receive-window", seed=seed,
-              source_workers=1, target_workers=1, target_faults={
-                  "LAVIK_TEST_NATIVE_SMALL_RECEIVE_WINDOW": "24576"}) as (meta, source, target, writer):
+    with pair(
+        root,
+        "small-receive-window",
+        seed=seed,
+        source_workers=1,
+        target_workers=1,
+        target_faults={"LAVIK_TEST_NATIVE_SMALL_RECEIVE_WINDOW": "24576"},
+    ) as (meta, source, target, writer):
         ready(meta)
         writer.call("SET", "{window}trigger", "online")
         # A real publisher burst must drain through native replay and ACKs.
         # The reduced window used to put each large segment behind TCP's
         # ~200ms probe timer, despite both processes remaining ONLINE.
         for batch in range(64):
-            writer.socket.sendall(b"".join(C.encode_resp(
-                ["SET", f"{{window}}key-{index}", "v" * 1024])
-                for index in range(512)))
+            writer.socket.sendall(
+                b"".join(
+                    C.encode_resp(["SET", f"{{window}}key-{index}", "v" * 1024])
+                    for index in range(512)
+                )
+            )
             for _ in range(512):
                 assert C.read_resp(writer.reader) == "OK"
         assert "test native receive window reduced" in Path(target.log_path).read_text()
@@ -764,25 +1036,38 @@ def target_queue_shutdown(root):
     # Hold the FIFO consumer until the receiver has filled its bounded queue.
     # Socket shutdown cannot wake that capacity wait: terminal stage/ACK
     # publication must explicitly notify ingress before the flow can join.
-    with pair(root, "target-queue-shutdown", source_workers=1, target_workers=1,
-              target_faults={
-                  "LAVIK_REPLICATION_PAUSE_BEFORE_COMMAND_APPLY_MS": "8000",
-                  "LAVIK_REPLICATION_REPORT_ONLINE_BACKPRESSURE": "1",
-              }) as (meta, _source, target, writer):
+    with pair(
+        root,
+        "target-queue-shutdown",
+        source_workers=1,
+        target_workers=1,
+        target_faults={
+            "LAVIK_REPLICATION_PAUSE_BEFORE_COMMAND_APPLY_MS": "8000",
+            "LAVIK_REPLICATION_REPORT_ONLINE_BACKPRESSURE": "1",
+        },
+    ) as (meta, _source, target, writer):
         ready(meta)
         for i in range(600):
             assert writer.call("SET", "{queue-shutdown}key", str(i)) == "OK"
-        H.wait_until("replica ingress is waiting for queue capacity", 10, lambda:
-                     "replica online ingress waiting for command capacity" in
-                     Path(target.log_path).read_text())
+        H.wait_until(
+            "replica ingress is waiting for queue capacity",
+            10,
+            lambda: "replica online ingress waiting for command capacity"
+            in Path(target.log_path).read_text(),
+        )
         target.terminate()
-        assert "replication targets quiesced before storage flush" in Path(target.log_path).read_text()
+        assert (
+            "replication targets quiesced before storage flush"
+            in Path(target.log_path).read_text()
+        )
+
 
 def main():
     C.META, C.DATA, C.CTL, C.REDIS_CLI = map(os.path.abspath, sys.argv[1:5])
     H.set_tag("native-replication")
-    with tempfile.TemporaryDirectory(prefix="lavik-meta-native-",
-                                     dir=os.environ.get("LAVIK_TEST_DATA_DIR")) as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="lavik-meta-native-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
+    ) as directory:
         root = Path(directory)
         replay_and_reconnect(root)
         replica_backup_during_exec(root)
@@ -797,22 +1082,43 @@ def main():
             target_queue_shutdown(root)
             handoff_order(root)
             cancelled_handoff(root)
-            committed_cursor_reconnect(root, "cancel-apply", target_faults={
-                "LAVIK_REPLICATION_CANCEL_PEER_FLOW_AFTER_COMMAND_APPLY_ONCE": "cancelled-apply-counter"})
+            committed_cursor_reconnect(
+                root,
+                "cancel-apply",
+                target_faults={
+                    "LAVIK_REPLICATION_CANCEL_PEER_FLOW_AFTER_COMMAND_APPLY_ONCE": "cancelled-apply-counter"
+                },
+            )
             post_cut_reset_reconnect(root)
             # Two controlled owner changes create a replacement history while
             # preserving the laggard's old population and per-flow cursors.
             import gate_failover as F
-            F.run_full_fallback(C.META, C.DATA, C.CTL, C.REDIS_CLI,
-                                str(root), False, cut_disconnect=True)
+
+            F.run_full_fallback(
+                C.META,
+                C.DATA,
+                C.CTL,
+                C.REDIS_CLI,
+                str(root),
+                False,
+                cut_disconnect=True,
+            )
             divergent_tail(root, 0)
             divergent_tail(root, 1)
-            rejected_full(root, "checksum", {
-                "LAVIK_REPLICATION_CORRUPT_FULLSYNC_RECORD_FRAME_ONCE": "1"}, {},
-                "replication frame CRC32C mismatch")
-            rejected_full(root, "early-online", {
-                "LAVIK_REPLICATION_EARLY_ONLINE": "1"}, {},
-                "injected ONLINE before local flow readiness")
+            rejected_full(
+                root,
+                "checksum",
+                {"LAVIK_REPLICATION_CORRUPT_FULLSYNC_RECORD_FRAME_ONCE": "1"},
+                {},
+                "replication frame CRC32C mismatch",
+            )
+            rejected_full(
+                root,
+                "early-online",
+                {"LAVIK_REPLICATION_EARLY_ONLINE": "1"},
+                {},
+                "injected ONLINE before local flow readiness",
+            )
     H.log("PASS")
 
 

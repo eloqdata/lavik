@@ -34,7 +34,11 @@ import sentinel_compat
 
 BINARY = os.path.abspath(sys.argv.pop(1))
 DATA_BINARY = None
-if len(sys.argv) > 1 and not sys.argv[1].startswith("-") and os.path.isfile(sys.argv[1]):
+if (
+    len(sys.argv) > 1
+    and not sys.argv[1].startswith("-")
+    and os.path.isfile(sys.argv[1])
+):
     DATA_BINARY = os.path.abspath(sys.argv.pop(1))
 
 
@@ -44,8 +48,9 @@ class RespError(bytes):
 
 def encode(*args):
     args = [arg if isinstance(arg, bytes) else str(arg).encode() for arg in args]
-    return (f"*{len(args)}\r\n".encode() +
-            b"".join(f"${len(arg)}\r\n".encode() + arg + b"\r\n" for arg in args))
+    return f"*{len(args)}\r\n".encode() + b"".join(
+        f"${len(arg)}\r\n".encode() + arg + b"\r\n" for arg in args
+    )
 
 
 class Client:
@@ -97,13 +102,29 @@ class SentinelTest(unittest.TestCase):
         self.addCleanup(self.root.cleanup)
         self.next_id = 1
 
-    def node(self, password="sentinel-secret", maxclients=256, host="127.0.0.1", bootstrap=False):
+    def node(
+        self,
+        password="sentinel-secret",
+        maxclients=256,
+        host="127.0.0.1",
+        bootstrap=False,
+    ):
         port = H.free_port()
         addr = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
-        node = H.Node(BINARY, self.root.name, self.next_id,
-                      args=H.raft_args() + ["--sentinel-addr", addr,
-                           "--sentinel-requirepass", password,
-                           "--sentinel-maxclients", str(maxclients)])
+        node = H.Node(
+            BINARY,
+            self.root.name,
+            self.next_id,
+            args=H.raft_args()
+            + [
+                "--sentinel-addr",
+                addr,
+                "--sentinel-requirepass",
+                password,
+                "--sentinel-maxclients",
+                str(maxclients),
+            ],
+        )
         self.next_id += 1
         self.addCleanup(node.force_kill)
         node.start(wait_ready=False, bootstrap=bootstrap)
@@ -161,12 +182,19 @@ class SentinelTest(unittest.TestCase):
         first = self.client(port)
         second = self.client(port)
         self.error(first.command("HELLO", 3), b"NOAUTH")
-        self.error(first.command("HELLO", 3, "AUTH", "other", "sentinel-secret"), b"WRONGPASS")
-        self.error(first.command("HELLO", 3, "AUTH", "default", "sentinel-secret",
-                                 "SETNAME", "bad name"), b"ERR")
+        self.error(
+            first.command("HELLO", 3, "AUTH", "other", "sentinel-secret"), b"WRONGPASS"
+        )
+        self.error(
+            first.command(
+                "HELLO", 3, "AUTH", "default", "sentinel-secret", "SETNAME", "bad name"
+            ),
+            b"ERR",
+        )
         self.error(first.command("PING"), b"NOAUTH")
-        hello = first.command("HELLO", 3, "AUTH", "default", "sentinel-secret",
-                              "SETNAME", "client-one")
+        hello = first.command(
+            "HELLO", 3, "AUTH", "default", "sentinel-secret", "SETNAME", "client-one"
+        )
         self.assertIsInstance(hello, dict)
         self.assertEqual(hello[b"mode"], b"sentinel")
         self.assertEqual(hello[b"proto"], 3)
@@ -176,16 +204,24 @@ class SentinelTest(unittest.TestCase):
         self.assertEqual(first.command("HELLO")[b"proto"], 3)
         self.error(first.command("HELLO", 4), b"NOPROTO")
         self.assertEqual(first.command("CLIENT", "SETNAME", "name-two"), b"OK")
-        self.assertEqual(first.command("CLIENT", "SETINFO", "LIB-NAME", "redis-py"), b"OK")
+        self.assertEqual(
+            first.command("CLIENT", "SETINFO", "LIB-NAME", "redis-py"), b"OK"
+        )
         self.assertEqual(first.command("CLIENT", "SETINFO", "LIB-VER", "8.1.0"), b"OK")
         self.error(first.command("CLIENT", "SETINFO", "LIB-VER", "bad version"), b"ERR")
         # Intentional stricter attribute validation than Redis 7.2's C-string
         # validator, which stops at the first NUL and accepts the suffix.
         self.error(first.command("CLIENT", "SETNAME", b"name\x00suffix"), b"ERR")
-        self.error(first.command("CLIENT", "SETINFO", "LIB-NAME", b"lib\x00suffix"), b"ERR")
+        self.error(
+            first.command("CLIENT", "SETINFO", "LIB-NAME", b"lib\x00suffix"), b"ERR"
+        )
         self.error(first.command("CLIENT", "LIST"), b"ERR")
-        first.sock.sendall(encode("RESET") + encode("PING") +
-                           encode("AUTH", "sentinel-secret") + encode("HELLO"))
+        first.sock.sendall(
+            encode("RESET")
+            + encode("PING")
+            + encode("AUTH", "sentinel-secret")
+            + encode("HELLO")
+        )
         self.assertEqual(first.read(), b"RESET")
         self.error(first.read(), b"NOAUTH")
         self.assertEqual(first.read(), b"OK")
@@ -202,24 +238,47 @@ class SentinelTest(unittest.TestCase):
         node, port = self.node(password="")
         client = self.client(port)
         self.assertEqual(client.command("PING", b"a\x00b"), b"a\x00b")
-        self.error(client.command("AUTH", "anything"), b"ERR AUTH <password> called without any password")
-        self.error(client.command("HELLO", 3, "AUTH", "other", "anything"), b"WRONGPASS")
-        self.assertIsInstance(client.command("HELLO", 3, "AUTH", "default", "anything"), dict)
-        for args in [("GET", "key"), ("SET", "key", "value"), ("MULTI",),
-                     ("EVAL", "return 1", 0), ("FCALL", "f", 0),
-                     ("PUBLISH", "+switch-master", "fake"), ("SUBSCRIBE", "x"),
-                     ("CONFIG", "SET", "requirepass", "x"), ("ACL", "LIST"),
-                     ("REPLICAOF", "127.0.0.1", 1), ("PSYNC", "?", -1),
-                     ("status",), ("clusterhead", 1), ("submitop", "x"),
-                     ("SENTINEL", "GET-MASTER-ADDR-BY-NAME", "mymaster"),
-                     ("SENTINEL", "MASTERS"), ("SENTINEL", "MONITOR", "x"),
-                     ("SENTINEL", "FAILOVER", "x"),
-                     ("SENTINEL", "IS-MASTER-DOWN-BY-ADDR", "127.0.0.1", 1, 1, "x")]:
+        self.error(
+            client.command("AUTH", "anything"),
+            b"ERR AUTH <password> called without any password",
+        )
+        self.error(
+            client.command("HELLO", 3, "AUTH", "other", "anything"), b"WRONGPASS"
+        )
+        self.assertIsInstance(
+            client.command("HELLO", 3, "AUTH", "default", "anything"), dict
+        )
+        for args in [
+            ("GET", "key"),
+            ("SET", "key", "value"),
+            ("MULTI",),
+            ("EVAL", "return 1", 0),
+            ("FCALL", "f", 0),
+            ("PUBLISH", "+switch-master", "fake"),
+            ("SUBSCRIBE", "x"),
+            ("CONFIG", "SET", "requirepass", "x"),
+            ("ACL", "LIST"),
+            ("REPLICAOF", "127.0.0.1", 1),
+            ("PSYNC", "?", -1),
+            ("status",),
+            ("clusterhead", 1),
+            ("submitop", "x"),
+            ("SENTINEL", "GET-MASTER-ADDR-BY-NAME", "mymaster"),
+            ("SENTINEL", "MASTERS"),
+            ("SENTINEL", "MONITOR", "x"),
+            ("SENTINEL", "FAILOVER", "x"),
+            ("SENTINEL", "IS-MASTER-DOWN-BY-ADDR", "127.0.0.1", 1, 1, "x"),
+        ]:
             with self.subTest(args=args):
                 self.error(client.command(*args), b"ERR")
-        for args in [("AUTH",), ("PING", "a", "b"), ("QUIT", "extra"),
-                     ("RESET", "extra"), ("CLIENT", "SETNAME"),
-                     ("HELLO", 3, "AUTH", "default")]:
+        for args in [
+            ("AUTH",),
+            ("PING", "a", "b"),
+            ("QUIT", "extra"),
+            ("RESET", "extra"),
+            ("CLIENT", "SETNAME"),
+            ("HELLO", 3, "AUTH", "default"),
+        ]:
             with self.subTest(args=args):
                 self.error(client.command(*args), b"ERR")
         self.assertEqual(client.command("RESET"), b"RESET")
@@ -234,13 +293,18 @@ class SentinelTest(unittest.TestCase):
             time.sleep(0.001)
         self.assertEqual(client.read()[b"proto"], 3)
         client.sock.sendall(b"".join(encode("PING", str(i)) for i in range(200)))
-        self.assertEqual([client.read() for _ in range(200)],
-                         [str(i).encode() for i in range(200)])
+        self.assertEqual(
+            [client.read() for _ in range(200)], [str(i).encode() for i in range(200)]
+        )
         client.sock.sendall(b"PING inline\r\n")
         self.assertEqual(client.read(), b"inline")
-        for malformed in [b"*wat\r\n", b"*1\r\n$-2\r\n", b"*1\r\n$1\r\nx!!",
-                          b"*9999999999999999999999999999999999999999\r\n",
-                          encode("PING", b"x" * (64 * 1024))]:
+        for malformed in [
+            b"*wat\r\n",
+            b"*1\r\n$-2\r\n",
+            b"*1\r\n$1\r\nx!!",
+            b"*9999999999999999999999999999999999999999\r\n",
+            encode("PING", b"x" * (64 * 1024)),
+        ]:
             with self.subTest(input=malformed[:32]):
                 bad = self.client(port)
                 bad.sock.sendall(malformed)
@@ -298,6 +362,7 @@ class SentinelTest(unittest.TestCase):
         slow = self.client(port)
         slow.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
         stop = threading.Event()
+
         def flood():
             try:
                 request = encode("PING", b"x" * 60000)
@@ -305,15 +370,20 @@ class SentinelTest(unittest.TestCase):
                     slow.sock.sendall(request)
             except OSError:
                 pass
+
         thread = threading.Thread(target=flood)
         thread.start()
         try:
             time.sleep(0.3)
             self.assertIn("leader=", node.ctl("status", timeout=2))
+
             def admission_recovered():
                 with contextlib.closing(Client(port)) as probe:
                     return probe.command("PING") == b"PONG"
-            H.wait_until("slow writer deadline releases client slot", 14, admission_recovered)
+
+            H.wait_until(
+                "slow writer deadline releases client slot", 14, admission_recovered
+            )
             node.terminate()
             self.assertLessEqual(node.proc.returncode, 0)
         finally:
@@ -335,46 +405,77 @@ class SentinelTest(unittest.TestCase):
         node.terminate()
 
     def test_configuration_rejected_before_start(self):
-        for extra in [["--sentinel-addr", "0.0.0.0:26379"],
-                      ["--sentinel-addr", "[::]:26379"],
-                      ["--sentinel-addr", "[::ffff:0.0.0.0]:26379"],
-                      ["--sentinel-addr", "localhost:26379"],
-                      ["--sentinel-addr", "127.0.0.1:0"],
-                      ["--sentinel-addr", "127.0.0.1:65001"],
-                      ["--sentinel-requirepass", "secret"],
-                      ["--sentinel-addr", "127.0.0.1:26379", "--sentinel-maxclients", "0"]]:
+        for extra in [
+            ["--sentinel-addr", "0.0.0.0:26379"],
+            ["--sentinel-addr", "[::]:26379"],
+            ["--sentinel-addr", "[::ffff:0.0.0.0]:26379"],
+            ["--sentinel-addr", "localhost:26379"],
+            ["--sentinel-addr", "127.0.0.1:0"],
+            ["--sentinel-addr", "127.0.0.1:65001"],
+            ["--sentinel-requirepass", "secret"],
+            ["--sentinel-addr", "127.0.0.1:26379", "--sentinel-maxclients", "0"],
+        ]:
             with self.subTest(options=extra):
-                result = subprocess.run([BINARY, "--id", "1", "--addr", "127.0.0.1:65001",
-                    "--data-control-addr", "127.0.0.1:65002", "--ctl-addr", "127.0.0.1:65003",
-                    "--data-dir", os.path.join(self.root.name, "invalid")] + extra,
-                    capture_output=True, timeout=5)
+                result = subprocess.run(
+                    [
+                        BINARY,
+                        "--id",
+                        "1",
+                        "--addr",
+                        "127.0.0.1:65001",
+                        "--data-control-addr",
+                        "127.0.0.1:65002",
+                        "--ctl-addr",
+                        "127.0.0.1:65003",
+                        "--data-dir",
+                        os.path.join(self.root.name, "invalid"),
+                    ]
+                    + extra,
+                    capture_output=True,
+                    timeout=5,
+                )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(b"entinel", result.stderr)
-                self.assertFalse(os.path.exists(os.path.join(self.root.name, "invalid")))
+                self.assertFalse(
+                    os.path.exists(os.path.join(self.root.name, "invalid"))
+                )
 
     def test_disabled_by_default_and_bind_failure_rolls_back(self):
         node = H.Node(BINARY, self.root.name, 1)
         self.addCleanup(node.force_kill)
         node.start()
-        H.wait_until("default Sentinel disabled", 3,
-                     lambda: "sentinel=disabled" in Path(node.log_path).read_text())
+        H.wait_until(
+            "default Sentinel disabled",
+            3,
+            lambda: "sentinel=disabled" in Path(node.log_path).read_text(),
+        )
         node.terminate()
         with socket.socket() as occupied:
             occupied.bind(("127.0.0.1", 0))
             occupied.listen()
-            node = H.Node(BINARY, self.root.name, 2,
-                          args=H.raft_args() + ["--sentinel-addr",
-                              f"127.0.0.1:{occupied.getsockname()[1]}"])
+            node = H.Node(
+                BINARY,
+                self.root.name,
+                2,
+                args=H.raft_args()
+                + ["--sentinel-addr", f"127.0.0.1:{occupied.getsockname()[1]}"],
+            )
             self.addCleanup(node.force_kill)
             node.start(wait_ready=False)
             self.assertNotEqual(node.proc.wait(timeout=10), 0)
-            self.assertIn("Sentinel listener bind failed", Path(node.log_path).read_text())
+            self.assertIn(
+                "Sentinel listener bind failed", Path(node.log_path).read_text()
+            )
+
             def ctl_closed():
                 try:
-                    with socket.create_connection(("127.0.0.1", node.ctl_port), timeout=0.1):
+                    with socket.create_connection(
+                        ("127.0.0.1", node.ctl_port), timeout=0.1
+                    ):
                         return False
                 except OSError:
                     return True
+
             # Kernel io_uring teardown may release its last accept reference
             # after waitpid returns; it must still retire within a bounded wait.
             H.wait_until("Admin listener rollback", 3, ctl_closed)
@@ -387,16 +488,38 @@ class SentinelTest(unittest.TestCase):
         with data.open("wb") as file:
             os.posix_fallocate(file.fileno(), 0, 256 * 1024 * 1024)
         logfile = self.enterContext((Path(self.root.name) / "data.log").open("w"))
-        args = [DATA_BINARY, "--bind", "127.0.0.1", "--port", str(port),
-                "--threads", "2", "--no-pin-workers", "--recv-buffers-per-worker", "0",
-                "--registered-buffer-mb-per-worker", "64", "--max-memory", "1G",
-                "--metrics-port", "0", "--data-file", str(data),
-                "--rdb-dir", self.root.name, "--logtostderr", "--requirepass", "data-secret"]
+        args = [
+            DATA_BINARY,
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--threads",
+            "2",
+            "--no-pin-workers",
+            "--recv-buffers-per-worker",
+            "0",
+            "--registered-buffer-mb-per-worker",
+            "64",
+            "--max-memory",
+            "1G",
+            "--metrics-port",
+            "0",
+            "--data-file",
+            str(data),
+            "--rdb-dir",
+            self.root.name,
+            "--logtostderr",
+            "--requirepass",
+            "data-secret",
+        ]
         proc = subprocess.Popen(args, stdout=logfile, stderr=subprocess.STDOUT)
+
         def cleanup():
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=10)
+
         self.addCleanup(cleanup)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -420,7 +543,9 @@ class SentinelTest(unittest.TestCase):
         self.assertIsInstance(client.command("HELLO"), dict)
         self.assertEqual(client.command("RESET"), b"RESET")
         self.error(client.command("GET", "key"), b"NOAUTH")
-        self.assertIsInstance(client.command("HELLO", 2, "AUTH", "default", "data-secret"), list)
+        self.assertIsInstance(
+            client.command("HELLO", 2, "AUTH", "default", "data-secret"), list
+        )
         node, sentinel_port = self.node()
         sentinel = self.client(sentinel_port)
         self.error(sentinel.command("AUTH", "data-secret"), b"WRONGPASS")

@@ -65,7 +65,8 @@ EVENT_TS_SLACK_S = 2.0
 
 CB_LINE = re.compile(
     r"^\[n\d+\] (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}) \[info\]"
-    r" \[raft-cb\] event=(\w+)")
+    r" \[raft-cb\] event=(\w+)"
+)
 CB_TERM = re.compile(r"\bterm=(\d+)")
 
 
@@ -93,17 +94,18 @@ def raft_cb_events(node, event, since_line=0):
                 if match is None or match.group(2) != event:
                     continue
                 wall = datetime.strptime(
-                    match.group(1), "%Y-%m-%dT%H:%M:%S.%f").timestamp()
+                    match.group(1), "%Y-%m-%dT%H:%M:%S.%f"
+                ).timestamp()
                 term = CB_TERM.search(line)
-                events.append(
-                    (wall, int(term.group(1)) if term is not None else None))
+                events.append((wall, int(term.group(1)) if term is not None else None))
     except OSError:
         pass
     return events
 
 
-def assert_election_events(round_name, victim, new_leader, survivors,
-                           victim_term, kill_wall, observed_wall):
+def assert_election_events(
+    round_name, victim, new_leader, survivors, victim_term, kill_wall, observed_wall
+):
     """raft_callback_ assertions for one kill round; returns the new term.
 
     The role relay exposes BecomeLeader only after actual application of
@@ -112,45 +114,62 @@ def assert_election_events(round_name, victim, new_leader, survivors,
     within EVENT_TS_SLACK_S of that observation point (and after the kill).
     """
     status_term = new_leader.term()
-    wins = [(ts, term) for ts, term in
-            raft_cb_events(new_leader, "BecomeLeader")
-            if term is not None and term > victim_term]
+    wins = [
+        (ts, term)
+        for ts, term in raft_cb_events(new_leader, "BecomeLeader")
+        if term is not None and term > victim_term
+    ]
     if not wins:
-        raise H.Failure(f"{round_name}: node {new_leader.id} log has no "
-                        f"BecomeLeader event above victim term {victim_term}")
+        raise H.Failure(
+            f"{round_name}: node {new_leader.id} log has no "
+            f"BecomeLeader event above victim term {victim_term}"
+        )
     become_ts, new_term = wins[-1]
     if new_term != status_term:
-        raise H.Failure(f"{round_name}: node {new_leader.id} BecomeLeader "
-                        f"term {new_term} != reported term {status_term}")
+        raise H.Failure(
+            f"{round_name}: node {new_leader.id} BecomeLeader "
+            f"term {new_term} != reported term {status_term}"
+        )
     if not kill_wall - 1.0 <= become_ts <= observed_wall + EVENT_TS_SLACK_S:
         raise H.Failure(
             f"{round_name}: node {new_leader.id} BecomeLeader timestamp "
             f"{become_ts:.3f} outside [{kill_wall - 1.0:.3f}, "
-            f"{observed_wall + EVENT_TS_SLACK_S:.3f}]")
+            f"{observed_wall + EVENT_TS_SLACK_S:.3f}]"
+        )
     if become_ts < observed_wall - EVENT_TS_SLACK_S:
         raise H.Failure(
             f"{round_name}: node {new_leader.id} BecomeLeader timestamp "
             f"predates the observable committed catch-up by "
-            f"{observed_wall - become_ts:.2f}s (> {EVENT_TS_SLACK_S}s)")
+            f"{observed_wall - become_ts:.2f}s (> {EVENT_TS_SLACK_S}s)"
+        )
     # The surviving follower sees the winner's higher term (vote request or
     # append entries) and steps into it: BecomeFollower at the new term.
     follower = next(n for n in survivors if n.id != new_leader.id)
-    if not any(term is not None and term >= new_term
-               for _, term in raft_cb_events(follower, "BecomeFollower")):
-        raise H.Failure(f"{round_name}: surviving follower node "
-                        f"{follower.id} log has no BecomeFollower at term "
-                        f">= {new_term}")
+    if not any(
+        term is not None and term >= new_term
+        for _, term in raft_cb_events(follower, "BecomeFollower")
+    ):
+        raise H.Failure(
+            f"{round_name}: surviving follower node "
+            f"{follower.id} log has no BecomeFollower at term "
+            f">= {new_term}"
+        )
     # The victim's pre-kill log must show its own election (the process is
     # dead and its log handle closed at this point, so the file holds only
     # pre-kill content).
-    if not any(term == victim_term
-               for _, term in raft_cb_events(victim, "BecomeLeader")):
-        raise H.Failure(f"{round_name}: victim node {victim.id} pre-kill log "
-                        f"has no BecomeLeader at its term {victim_term}")
-    H.log(f"{round_name}: [raft-cb] trail verified (node {new_leader.id} "
-          f"BecomeLeader term={new_term}, node {follower.id} "
-          f"BecomeFollower, victim node {victim.id} BecomeLeader "
-          f"term={victim_term})")
+    if not any(
+        term == victim_term for _, term in raft_cb_events(victim, "BecomeLeader")
+    ):
+        raise H.Failure(
+            f"{round_name}: victim node {victim.id} pre-kill log "
+            f"has no BecomeLeader at its term {victim_term}"
+        )
+    H.log(
+        f"{round_name}: [raft-cb] trail verified (node {new_leader.id} "
+        f"BecomeLeader term={new_term}, node {follower.id} "
+        f"BecomeFollower, victim node {victim.id} BecomeLeader "
+        f"term={victim_term})"
+    )
     return new_term
 
 
@@ -160,8 +179,7 @@ def leader_kill_round(nodes, history, round_name):
     leader = H.find_leader(nodes)
     pre = H.max_committed(nodes)
     victim_term = leader.term()
-    H.log(f"{round_name}: killing leader node {leader.id} "
-          f"(cluster committed={pre})")
+    H.log(f"{round_name}: killing leader node {leader.id} (cluster committed={pre})")
     started = time.monotonic()
     kill_wall = time.time()
     leader.kill9()
@@ -172,22 +190,24 @@ def leader_kill_round(nodes, history, round_name):
         raise H.Failure(f"{round_name}: dead node {leader.id} re-elected?!")
     if elapsed > ELECTION_ASSERT_S:
         raise H.Failure(
-            f"{round_name}: election took {elapsed:.1f}s, "
-            f"want < {ELECTION_ASSERT_S}s")
-    H.log(f"{round_name}: node {new_leader.id} elected in "
-          f"{elapsed:.2f}s")
+            f"{round_name}: election took {elapsed:.1f}s, want < {ELECTION_ASSERT_S}s"
+        )
+    H.log(f"{round_name}: node {new_leader.id} elected in {elapsed:.2f}s")
     # sm-catchup gate: once leader=1 is observable, the committed index
     # must already cover everything committed before the kill.
-    H.wait_until(f"{round_name}: new leader committed >= {pre}", 8,
-                 lambda: new_leader.committed() >= pre)
+    H.wait_until(
+        f"{round_name}: new leader committed >= {pre}",
+        8,
+        lambda: new_leader.committed() >= pre,
+    )
     observed_wall = time.time()
     _, reply = new_leader.propose(f"{round_name}-resume")
     if not reply.startswith("OK "):
         raise H.Failure(f"{round_name}: propose after election: {reply}")
     H.log(f"{round_name}: propose resumed (idx {reply[3:]})")
-    new_term = assert_election_events(round_name, leader, new_leader,
-                                      survivors, victim_term, kill_wall,
-                                      observed_wall)
+    new_term = assert_election_events(
+        round_name, leader, new_leader, survivors, victim_term, kill_wall, observed_wall
+    )
     return leader, new_leader, new_term
 
 
@@ -196,18 +216,24 @@ def restart_and_catchup(node, nodes, history, min_term):
     # only trusts lines appended from this boot onward.
     boot_mark = line_count(node)
     node.start(bootstrap=False)
-    H.wait_until(f"node {node.id} ctl answers", 15,
-                 lambda: node.alive() and node.status())
+    H.wait_until(
+        f"node {node.id} ctl answers", 15, lambda: node.alive() and node.status()
+    )
     history.check(nodes, timeout=30, desc=f"node {node.id} restart catch-up")
     # The rejoined node's stored term predates the failover, so the first
     # heartbeat bumps it: BecomeFollower at >= the post-failover term.
-    if not any(term is not None and term >= min_term
-               for _, term in raft_cb_events(node, "BecomeFollower",
-                                             since_line=boot_mark)):
-        raise H.Failure(f"node {node.id}: post-restart log has no "
-                        f"BecomeFollower at term >= {min_term}")
-    H.log(f"node {node.id} restarted and caught up (post-restart "
-          f"BecomeFollower term >= {min_term} verified)")
+    if not any(
+        term is not None and term >= min_term
+        for _, term in raft_cb_events(node, "BecomeFollower", since_line=boot_mark)
+    ):
+        raise H.Failure(
+            f"node {node.id}: post-restart log has no "
+            f"BecomeFollower at term >= {min_term}"
+        )
+    H.log(
+        f"node {node.id} restarted and caught up (post-restart "
+        f"BecomeFollower term >= {min_term} verified)"
+    )
 
 
 def link_fault_round(nodes, mesh, history, leader, follower, mode, hold_s):
@@ -224,14 +250,20 @@ def link_fault_round(nodes, mesh, history, leader, follower, mode, hold_s):
         proxy.set_refuse()
         detail = "connection refused"
     pre = H.max_committed(nodes)
-    H.log(f"link fault: {mode} ({detail}) on node {follower.id} inbound "
-          f"for {hold_s}s (committed={pre})")
+    H.log(
+        f"link fault: {mode} ({detail}) on node {follower.id} inbound "
+        f"for {hold_s}s (committed={pre})"
+    )
     time.sleep(hold_s)
     proxy.heal()
-    H.wait_until(f"post-{mode}: a leader exists", 20,
-                 lambda: any(n.alive() and n.is_leader() for n in nodes))
-    H.wait_until(f"post-{mode}: committed >= {pre}", 20,
-                 lambda: H.max_committed(nodes) >= pre)
+    H.wait_until(
+        f"post-{mode}: a leader exists",
+        20,
+        lambda: any(n.alive() and n.is_leader() for n in nodes),
+    )
+    H.wait_until(
+        f"post-{mode}: committed >= {pre}", 20, lambda: H.max_committed(nodes) >= pre
+    )
     current = H.find_leader(nodes)
     _, reply = current.propose(f"post-{mode}")
     if not reply.startswith("OK "):
@@ -279,20 +311,17 @@ def main():
         # Link-fault sanity on the proxy mesh (also proves the mesh modes
         # work against real raft traffic).
         leader = H.find_leader(nodes)
-        follower = next(n for n in nodes
-                        if n.id != leader.id and n.alive())
-        link_fault_round(nodes, mesh, history, leader, follower,
-                         "delay", 2.0)
-        link_fault_round(nodes, mesh, history, leader, follower,
-                         "drop", 1.5)
-        link_fault_round(nodes, mesh, history, leader, follower,
-                         "refuse", 1.0)
+        follower = next(n for n in nodes if n.id != leader.id and n.alive())
+        link_fault_round(nodes, mesh, history, leader, follower, "delay", 2.0)
+        link_fault_round(nodes, mesh, history, leader, follower, "drop", 1.5)
+        link_fault_round(nodes, mesh, history, leader, follower, "refuse", 1.0)
         for node in nodes:
             proxied = mesh.proxy(node.id).bytes_forwarded
             if proxied == 0:
                 raise H.Failure(
                     f"node {node.id}: proxy forwarded 0 bytes; "
-                    f"mesh is not carrying raft traffic")
+                    f"mesh is not carrying raft traffic"
+                )
             H.log(f"proxy n{node.id}: {proxied} bytes forwarded")
 
         load.stop()

@@ -34,6 +34,7 @@ import gate_cluster_create as C
 
 class BootstrapOnly(H.Proxy):
     """Use real committed bootstrap without authorizing population replacement."""
+
     def _pump(self, src, dst, pair):
         if src is pair[0]:
             prefix = bytearray()
@@ -57,8 +58,9 @@ class BootstrapOnly(H.Proxy):
 @contextmanager
 def mode_source(directory, label, endpoint):
     (directory / (label + "-meta")).mkdir()
-    meta = H.Node(C.META, str(directory / (label + "-meta")), 1,
-                  args=C.creation_raft_args())
+    meta = H.Node(
+        C.META, str(directory / (label + "-meta")), 1, args=C.creation_raft_args()
+    )
     proxy = BootstrapOnly("mode-bootstrap", meta.data_control_port)
     meta.advertised_data_control_endpoint = proxy.endpoint
     try:
@@ -75,23 +77,49 @@ def mode_source(directory, label, endpoint):
 
 
 @contextmanager
-def server(binary, directory, label, *, cluster=False, checkpoint=False,
-           rejected=False):
+def server(
+    binary, directory, label, *, cluster=False, checkpoint=False, rejected=False
+):
     port = H.free_port()
     log_path = directory / f"{label}.log"
-    args = [binary, "--bind", "127.0.0.1", "--port", str(port),
-            "--metrics-port", "0", "--threads", "2", "--no-pin-workers",
-            "--recv-buffers-per-worker", "0",
-            "--registered-buffer-mb-per-worker", "64", "--max-memory", "1G",
-            "--data-file", str(directory / "lavik.data"),
-            "--rdb-dir", str(directory), "--logtostderr"]
+    args = [
+        binary,
+        "--bind",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--metrics-port",
+        "0",
+        "--threads",
+        "2",
+        "--no-pin-workers",
+        "--recv-buffers-per-worker",
+        "0",
+        "--registered-buffer-mb-per-worker",
+        "64",
+        "--max-memory",
+        "1G",
+        "--data-file",
+        str(directory / "lavik.data"),
+        "--rdb-dir",
+        str(directory),
+        "--logtostderr",
+    ]
     if checkpoint:
         args.append("--shutdown-checkpoint")
     with ExitStack() as stack:
         if cluster:
-            seed = stack.enter_context(mode_source(directory, label, f"tcp://127.0.0.1:{port}"))
-            args += ["--node-id", "1" * 40, "--meta-seed", seed,
-                     "--announce-ip", "127.0.0.1"]
+            seed = stack.enter_context(
+                mode_source(directory, label, f"tcp://127.0.0.1:{port}")
+            )
+            args += [
+                "--node-id",
+                "1" * 40,
+                "--meta-seed",
+                seed,
+                "--announce-ip",
+                "127.0.0.1",
+            ]
         log = stack.enter_context(log_path.open("w"))
         process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
         connection = None
@@ -105,16 +133,18 @@ def server(binary, directory, label, *, cluster=False, checkpoint=False,
             while time.monotonic() < deadline:
                 assert process.poll() is None, log_path.read_text()
                 try:
-                    connection = socket.create_connection(("127.0.0.1", port), .2)
+                    connection = socket.create_connection(("127.0.0.1", port), 0.2)
                     break
                 except OSError:
-                    time.sleep(.02)
+                    time.sleep(0.02)
             assert connection is not None, log_path.read_text()
             connection.settimeout(10)
             with connection.makefile("rb") as reader:
+
                 def rpc(*args):
                     connection.sendall(F.encode_resp(list(args)))
                     return F.read_resp(reader)
+
                 assert rpc("PING") == "PONG"
                 yield rpc
             process.send_signal(signal.SIGINT)
@@ -137,8 +167,9 @@ def exercise(binary, directory, checkpoint):
         assert rpc("SET", "retained", "db15") == "OK"
     # Both checkpoint and cold recovery must fail closed. The failed attempt
     # must leave the original standalone data recoverable.
-    with server(binary, directory, "reject", cluster=True,
-                checkpoint=checkpoint, rejected=True):
+    with server(
+        binary, directory, "reject", cluster=True, checkpoint=checkpoint, rejected=True
+    ):
         pass
     if checkpoint:
         assert "cannot preallocate indexes" in (directory / "reject.log").read_text()
@@ -147,8 +178,9 @@ def exercise(binary, directory, checkpoint):
         assert rpc("SELECT", "15") == "OK"
         assert rpc("GET", "retained") == "db15"
         assert rpc("FLUSHDB", "SYNC") == "OK"
-    with server(binary, directory, "cluster", cluster=True,
-                checkpoint=checkpoint) as rpc:
+    with server(
+        binary, directory, "cluster", cluster=True, checkpoint=checkpoint
+    ) as rpc:
         # No Meta authority is granted here. Keyspace introspection still
         # proves storage recovery finished and only DB0 is populated.
         info = rpc("INFO", "keyspace")
@@ -176,8 +208,8 @@ def exercise(binary, directory, checkpoint):
 def main():
     C.META, C.CTL = map(os.path.abspath, sys.argv[2:4])
     with tempfile.TemporaryDirectory(
-            prefix="lavik-database-modes-",
-            dir=os.environ.get("LAVIK_TEST_DATA_DIR")) as workdir:
+        prefix="lavik-database-modes-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
+    ) as workdir:
         for checkpoint in (False, True):
             exercise(sys.argv[1], Path(workdir) / str(checkpoint), checkpoint)
     print("database mode recovery checks passed")

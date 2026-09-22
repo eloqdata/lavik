@@ -81,12 +81,16 @@ def main():
         history = H.CommittedHistory()
 
         # --- phase 1: committed anchors ----------------------------------
-        expect_ok(leader.put_authority_lease_policy(1),
-                  "put Authority Lease Policy")
-        expect_ok(leader.registernode(DATA_NODE, f"lavik://node/{DATA_NODE}",
-                                      "primary",
-                                      endpoints=("tcp://127.0.0.1:6379",)),
-                  "registernode")
+        expect_ok(leader.put_authority_lease_policy(1), "put Authority Lease Policy")
+        expect_ok(
+            leader.registernode(
+                DATA_NODE,
+                f"lavik://node/{DATA_NODE}",
+                "primary",
+                endpoints=("tcp://127.0.0.1:6379",),
+            ),
+            "registernode",
+        )
         expect_ok(leader.creategroup(GROUP), "creategroup")
         expect_ok(leader.assignnode(GROUP, DATA_NODE), "assignnode")
         expect_ok(leader.begingroupterm(GROUP, 0, 1), "begingroupterm 0->1")
@@ -95,9 +99,11 @@ def main():
         # --- phase 2: valid candidate accepted ---------------------------
         expect_ok(leader.adoptsession(DATA_NODE, BOOT_A, 1), "adoptsession 1")
         expect_ok(
-            leader.obs_candidate(DATA_NODE, BOOT_A, 1, GROUP,
-                                 term=1, manifest=0, history=7),
-            "candidate with correct term")
+            leader.obs_candidate(
+                DATA_NODE, BOOT_A, 1, GROUP, term=1, manifest=0, history=7
+            ),
+            "candidate with correct term",
+        )
         if candidate_count(leader, GROUP) != 1:
             raise H.Failure("accepted candidate not visible in query")
         H.log("phase 2: correct-term candidate accepted and queryable")
@@ -109,50 +115,79 @@ def main():
         if candidate_count(leader, GROUP) != 0:
             raise H.Failure("generation bump did not purge old observations")
         expect_ok(
-            leader.obs_candidate(DATA_NODE, BOOT_A, 2, GROUP,
-                                 term=1, manifest=0, history=7),
-            "re-report at gen 2")
+            leader.obs_candidate(
+                DATA_NODE, BOOT_A, 2, GROUP, term=1, manifest=0, history=7
+            ),
+            "re-report at gen 2",
+        )
 
         expect_err(
-            leader.obs_candidate(DATA_NODE, BOOT_A, 1, GROUP,
-                                 term=1, manifest=0, history=7),
-            "stale-generation candidate", "stale-generation")
+            leader.obs_candidate(
+                DATA_NODE, BOOT_A, 1, GROUP, term=1, manifest=0, history=7
+            ),
+            "stale-generation candidate",
+            "stale-generation",
+        )
         expect_err(
-            leader.obs_candidate(DATA_NODE, BOOT_A, 2, GROUP,
-                                 term=2, manifest=0, history=7),
-            "future-term candidate", "term-mismatch")
+            leader.obs_candidate(
+                DATA_NODE, BOOT_A, 2, GROUP, term=2, manifest=0, history=7
+            ),
+            "future-term candidate",
+            "term-mismatch",
+        )
         expect_err(
-            leader.obs_candidate(DATA_NODE, BOOT_A, 2, GROUP,
-                                 term=1, manifest=0, history=7,
-                                 partition_epoch=1),
-            "stale-population-epoch candidate", "partition-epoch-mismatch")
+            leader.obs_candidate(
+                DATA_NODE,
+                BOOT_A,
+                2,
+                GROUP,
+                term=1,
+                manifest=0,
+                history=7,
+                partition_epoch=1,
+            ),
+            "stale-population-epoch candidate",
+            "partition-epoch-mismatch",
+        )
         expect_err(
-            leader.obs_candidate(DATA_NODE, BOOT_B, 2, GROUP,
-                                 term=1, manifest=0, history=7),
-            "old-boot candidate", "boot-mismatch")
-        expect_err(leader.obs_boot(GHOST_NODE, BOOT_A, 1),
-                   "unregistered-node boot", "node-not-active")
+            leader.obs_candidate(
+                DATA_NODE, BOOT_B, 2, GROUP, term=1, manifest=0, history=7
+            ),
+            "old-boot candidate",
+            "boot-mismatch",
+        )
+        expect_err(
+            leader.obs_boot(GHOST_NODE, BOOT_A, 1),
+            "unregistered-node boot",
+            "node-not-active",
+        )
 
         audit = leader.obsaudit()
-        for needle in ("detail=superseded-by-generation:2",
-                       "detail=stale-generation",
-                       "detail=term-mismatch",
-                       "detail=partition-epoch-mismatch",
-                       "detail=boot-mismatch",
-                       "detail=node-not-active"):
+        for needle in (
+            "detail=superseded-by-generation:2",
+            "detail=stale-generation",
+            "detail=term-mismatch",
+            "detail=partition-epoch-mismatch",
+            "detail=boot-mismatch",
+            "detail=node-not-active",
+        ):
             if needle not in audit:
                 raise H.Failure(f"obsaudit missing {needle!r}: {audit}")
-        H.log("phase 3: forged generation/term/epoch/boot/node all rejected "
-              "and audited")
+        H.log(
+            "phase 3: forged generation/term/epoch/boot/node all rejected and audited"
+        )
 
         # --- phase 4: commit-driven observation invalidation -------------
         expect_ok(leader.begingroupterm(GROUP, 1, 2), "begingroupterm 1->2")
         if candidate_count(leader, GROUP) != 0:
             raise H.Failure("term advancement did not invalidate candidate")
         expect_err(
-            leader.obs_candidate(DATA_NODE, BOOT_A, 2, GROUP,
-                                 term=1, manifest=0, history=7),
-            "candidate from previous term", "term-mismatch")
+            leader.obs_candidate(
+                DATA_NODE, BOOT_A, 2, GROUP, term=1, manifest=0, history=7
+            ),
+            "candidate from previous term",
+            "term-mismatch",
+        )
         # Queries and admission reject the old term against committed facts
         # immediately. The dispatch thread separately purges the retained
         # candidate, so the commit reply need not include its audit record yet.
@@ -164,18 +199,23 @@ def main():
             return "detail=commit-stale:term-mismatch" in audit
 
         try:
-            H.wait_until("stale candidate purged and audited", 10,
-                         stale_candidate_purged)
+            H.wait_until(
+                "stale candidate purged and audited", 10, stale_candidate_purged
+            )
         except H.Failure as error:
             raise H.Failure(f"{error}; obsaudit={audit}") from error
         expect_ok(
-            leader.obs_candidate(DATA_NODE, BOOT_A, 2, GROUP,
-                                 term=2, manifest=0, history=7),
-            "candidate from current term")
+            leader.obs_candidate(
+                DATA_NODE, BOOT_A, 2, GROUP, term=2, manifest=0, history=7
+            ),
+            "candidate from current term",
+        )
         if candidate_count(leader, GROUP) != 1:
             raise H.Failure("current-term candidate not visible")
-        H.log("phase 4: committed term advancement purged stale candidate; "
-              "current-term report restored it")
+        H.log(
+            "phase 4: committed term advancement purged stale candidate; "
+            "current-term report restored it"
+        )
 
         # --- phase 5: leader-local obs, committed history unaffected ------
         for value in ("pre-kill-1", "pre-kill-2"):
@@ -193,14 +233,19 @@ def main():
         # until a fresh re-report the candidate set is empty even though the
         # committed group/term anchors exist on every node.
         if candidate_count(new_leader, GROUP) != 0:
-            raise H.Failure("new leader serves observations it never "
-                            "received (leader-local violation)")
-        expect_ok(new_leader.adoptsession(DATA_NODE, BOOT_A, 1),
-                  "re-adopt on new leader")
+            raise H.Failure(
+                "new leader serves observations it never "
+                "received (leader-local violation)"
+            )
         expect_ok(
-            new_leader.obs_candidate(DATA_NODE, BOOT_A, 1, GROUP,
-                                     term=2, manifest=0, history=7),
-            "re-report on new leader")
+            new_leader.adoptsession(DATA_NODE, BOOT_A, 1), "re-adopt on new leader"
+        )
+        expect_ok(
+            new_leader.obs_candidate(
+                DATA_NODE, BOOT_A, 1, GROUP, term=2, manifest=0, history=7
+            ),
+            "re-report on new leader",
+        )
         if candidate_count(new_leader, GROUP) != 1:
             raise H.Failure("re-reported candidate not visible")
         H.log("phase 5: new leader obs empty until re-report, then rebuilt")

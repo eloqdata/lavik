@@ -37,19 +37,19 @@ services:
     command: [meta, "1"]
     volumes: [".:/quickstart:ro", "build:/build:ro", "meta-1:/data"]
     networks:
-      cluster: {ipv4_address: 172.29.91.11}
+      cluster: { ipv4_address: 172.29.91.11 }
   meta-2:
     <<: *node
     command: [meta, "2"]
     volumes: [".:/quickstart:ro", "build:/build:ro", "meta-2:/data"]
     networks:
-      cluster: {ipv4_address: 172.29.91.12}
+      cluster: { ipv4_address: 172.29.91.12 }
   meta-3:
     <<: *node
     command: [meta, "3"]
     volumes: [".:/quickstart:ro", "build:/build:ro", "meta-3:/data"]
     networks:
-      cluster: {ipv4_address: 172.29.91.13}
+      cluster: { ipv4_address: 172.29.91.13 }
 
   data-1:
     <<: *node
@@ -57,21 +57,21 @@ services:
     volumes: [".:/quickstart:ro", "build:/build:ro", "data-1:/data"]
     ports: ["127.0.0.1:16379:6379"]
     networks:
-      cluster: {ipv4_address: 172.29.91.21}
+      cluster: { ipv4_address: 172.29.91.21 }
   data-2:
     <<: *node
     command: [data, "2"]
     volumes: [".:/quickstart:ro", "build:/build:ro", "data-2:/data"]
     ports: ["127.0.0.1:16380:6379"]
     networks:
-      cluster: {ipv4_address: 172.29.91.22}
+      cluster: { ipv4_address: 172.29.91.22 }
   data-3:
     <<: *node
     command: [data, "3"]
     volumes: [".:/quickstart:ro", "build:/build:ro", "data-3:/data"]
     ports: ["127.0.0.1:16381:6379"]
     networks:
-      cluster: {ipv4_address: 172.29.91.23}
+      cluster: { ipv4_address: 172.29.91.23 }
 
   admin:
     image: lavik-admin-toolchain:local
@@ -87,7 +87,7 @@ services:
       LAVIK_ADMIN_ORIGIN: http://localhost:${LAVIK_QUICKSTART_PORT:-4173}
     ports: ["127.0.0.1:${LAVIK_QUICKSTART_PORT:-4173}:4173"]
     networks:
-      cluster: {ipv4_address: 172.29.91.10}
+      cluster: { ipv4_address: 172.29.91.10 }
 
 # Lavik advertises numeric endpoints, so every participant must see the same
 # stable IPs. Host ports provide direct node access; cluster redirects still
@@ -95,7 +95,7 @@ services:
 networks:
   cluster:
     ipam:
-      config: [{subnet: 172.29.91.0/24}]
+      config: [{ subnet: 172.29.91.0/24 }]
 
 volumes:
   build:

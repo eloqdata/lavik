@@ -24,7 +24,6 @@ Usage: gate_snapshot_vote.py /path/to/lavik-meta [workdir]
 """
 
 import os
-import re
 import sys
 import time
 
@@ -40,8 +39,9 @@ def read_since(node, offset):
 def run_case(binary, workdir, mode):
     scenario = os.path.join(workdir, mode)
     os.makedirs(scenario)
-    nodes = H.make_nodes(binary, scenario, 4,
-                         args=H.raft_args(snapshot_distance=100_000))
+    nodes = H.make_nodes(
+        binary, scenario, 4, args=H.raft_args(snapshot_distance=100_000)
+    )
     late = nodes[2]
     manifest = os.path.join(scenario, "initial.toml")
     H.write_initial_cluster_manifest(manifest, nodes[:3])
@@ -50,11 +50,14 @@ def run_case(binary, workdir, mode):
         for node in nodes[:3]:
             node.start(initial_cluster_manifest=manifest)
         leader = H.find_leader(nodes[:3])
-        H.wait_until("all initial members complete genesis", 10, lambda: all(
-            node.status()["initial_bindings_pending"] == "0"
-            for node in nodes[:3]))
-        index = H.propose_ops(leader, 0, 1, prefix="before-offline",
-                              history=history)
+        H.wait_until(
+            "all initial members complete genesis",
+            10,
+            lambda: all(
+                node.status()["initial_bindings_pending"] == "0" for node in nodes[:3]
+            ),
+        )
+        index = H.propose_ops(leader, 0, 1, prefix="before-offline", history=history)
         H.wait_cluster_committed(nodes[:3], index)
         late.terminate()
 
@@ -70,10 +73,12 @@ def run_case(binary, workdir, mode):
         survivor = next(node for node in nodes[:2] if node is not leader)
         if mode != "wal":
             snapshot_index = H.manual_snapshot(survivor)
-            H.wait_until("snapshot durable and logical log compacted", 10,
-                         lambda: survivor.snapshot_idx() == snapshot_index
-                         and int(survivor.status()["first_log_idx"]) == snapshot_index + 1)
-
+            H.wait_until(
+                "snapshot durable and logical log compacted",
+                10,
+                lambda: survivor.snapshot_idx() == snapshot_index
+                and int(survivor.status()["first_log_idx"]) == snapshot_index + 1,
+            )
 
         removed = [node for node in active if node is not survivor]
         for node in removed:
@@ -89,9 +94,12 @@ def run_case(binary, workdir, mode):
         late.start()
         # Require actual denied Vote/PreVote replies, rather than inferring
         # log freshness solely from the absence of a public leader.
-        H.wait_until("stale candidate vote rejected", 6,
-                     lambda: int(survivor.status()["vote_rejections"]) >
-                     int(before_votes["vote_rejections"]))
+        H.wait_until(
+            "stale candidate vote rejected",
+            6,
+            lambda: int(survivor.status()["vote_rejections"])
+            > int(before_votes["vote_rejections"]),
+        )
         time.sleep(1)
         if int(survivor.status()["vote_grants"]) != int(before_votes["vote_grants"]):
             raise H.Failure(f"{mode}: compacted member granted a stale vote")
@@ -101,8 +109,7 @@ def run_case(binary, workdir, mode):
         for node in minority:
             if node.is_leader():
                 raise H.Failure(f"{mode}: two of four elected a leader")
-            reply = node.put_automatic_uncontrolled_failover_policy(
-                1, timeout=2)
+            reply = node.put_automatic_uncontrolled_failover_policy(1, timeout=2)
             if reply.startswith("OK "):
                 raise H.Failure(f"{mode}: two of four committed a write")
 

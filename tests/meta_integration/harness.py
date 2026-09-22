@@ -67,28 +67,33 @@ class Failure(Exception):
 _TAG = "meta-integration"
 _ALLOCATED_PORTS = set()
 
-AUTOMATIC_UNCONTROLLED_FAILOVER_POLICY_ID = (
-    "lavik.automatic-uncontrolled-failover-v1")
+AUTOMATIC_UNCONTROLLED_FAILOVER_POLICY_ID = "lavik.automatic-uncontrolled-failover-v1"
 AUTHORITY_LEASE_POLICY_ID = "lavik.authority-lease-v1"
 
 
 def automatic_uncontrolled_failover_policy(suspect_after_ms=5000):
     """Return the strict compact JSON accepted by the registered family."""
-    if (not isinstance(suspect_after_ms, int) or
-            isinstance(suspect_after_ms, bool) or
-            not 1000 <= suspect_after_ms <= 86_400_000):
+    if (
+        not isinstance(suspect_after_ms, int)
+        or isinstance(suspect_after_ms, bool)
+        or not 1000 <= suspect_after_ms <= 86_400_000
+    ):
         raise ValueError("automatic failover suspect_after_ms is out of range")
-    return ("{\"kind\":\"automatic-uncontrolled-failover-v1\","
-            f"\"suspect_after_ms\":{suspect_after_ms}}}")
+    return (
+        '{"kind":"automatic-uncontrolled-failover-v1",'
+        f'"suspect_after_ms":{suspect_after_ms}}}'
+    )
 
 
 def authority_lease_policy(duration_ms=5000):
     """Return the strict compact JSON accepted by the registered family."""
-    if (not isinstance(duration_ms, int) or isinstance(duration_ms, bool) or
-            not 100 <= duration_ms <= 86_400_000):
+    if (
+        not isinstance(duration_ms, int)
+        or isinstance(duration_ms, bool)
+        or not 100 <= duration_ms <= 86_400_000
+    ):
         raise ValueError("authority lease duration_ms is out of range")
-    return ("{\"kind\":\"authority-lease-v1\","
-            f"\"duration_ms\":{duration_ms}}}")
+    return f'{{"kind":"authority-lease-v1","duration_ms":{duration_ms}}}'
 
 
 def set_tag(tag):
@@ -127,16 +132,26 @@ def wait_until(desc, timeout, fn):
     raise Failure(f"timeout ({timeout}s) waiting for: {desc}")
 
 
-def raft_args(snapshot_distance=30, heartbeat_ms=100, election_ms_low=300,
-              election_ms_high=600, reserved_log_items=0):
+def raft_args(
+    snapshot_distance=30,
+    heartbeat_ms=100,
+    election_ms_low=300,
+    election_ms_high=600,
+    reserved_log_items=0,
+):
     """Fast process-test timing; small snapshot distance + zero reserve
     make automatic snapshotting and compaction really fire at test scale."""
     return [
-        "--heartbeat-ms", str(heartbeat_ms),
-        "--election-ms-low", str(election_ms_low),
-        "--election-ms-high", str(election_ms_high),
-        "--snapshot-distance", str(snapshot_distance),
-        "--reserved-log-items", str(reserved_log_items),
+        "--heartbeat-ms",
+        str(heartbeat_ms),
+        "--election-ms-low",
+        str(election_ms_low),
+        "--election-ms-high",
+        str(election_ms_high),
+        "--snapshot-distance",
+        str(snapshot_distance),
+        "--reserved-log-items",
+        str(reserved_log_items),
     ]
 
 
@@ -150,29 +165,33 @@ def write_initial_meta_manifest(path, members):
     """
     lines = ["schema_version = 1", 'client_mode = "cluster"', ""]
     for node_id, raft, data_control, ctl in sorted(members):
-        lines.extend([
-            "[[meta_members]]",
-            f"id = {node_id}",
-            f'raft_endpoint = "tcp://{raft}"',
-            f'data_control_endpoint = "tcp://{data_control}"',
-            f'ctl_endpoint = "tcp://{ctl}"',
+        lines.extend(
+            [
+                "[[meta_members]]",
+                f"id = {node_id}",
+                f'raft_endpoint = "tcp://{raft}"',
+                f'data_control_endpoint = "tcp://{data_control}"',
+                f'ctl_endpoint = "tcp://{ctl}"',
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "[[data_nodes]]",
+            'id = "ffffffffffffffffffffffffffffffffffffffff"',
+            'client_endpoint = "tcp://127.0.0.1:1"',
             "",
-        ])
-    lines.extend([
-        "[[data_nodes]]",
-        'id = "ffffffffffffffffffffffffffffffffffffffff"',
-        'client_endpoint = "tcp://127.0.0.1:1"',
-        "",
-        "[[groups]]",
-        'id = "initial-meta-placeholder"',
-        'primary = "ffffffffffffffffffffffffffffffffffffffff"',
-        "",
-        "[[slot_ranges]]",
-        "first = 0",
-        "last = 16383",
-        'group = "initial-meta-placeholder"',
-        "",
-    ])
+            "[[groups]]",
+            'id = "initial-meta-placeholder"',
+            'primary = "ffffffffffffffffffffffffffffffffffffffff"',
+            "",
+            "[[slot_ranges]]",
+            "first = 0",
+            "last = 16383",
+            'group = "initial-meta-placeholder"',
+            "",
+        ]
+    )
     with open(path, "w", encoding="utf-8") as output:
         output.write("\n".join(lines))
 
@@ -180,13 +199,20 @@ def write_initial_meta_manifest(path, members):
 def write_initial_cluster_manifest(path, nodes, raft_endpoints=None):
     """Write one canonical genesis input shared by every initial Meta node."""
     endpoints = raft_endpoints or {node.id: node.endpoint for node in nodes}
-    write_initial_meta_manifest(path, [
-        (node.id, endpoints[node.id],
-         getattr(node, "advertised_data_control_endpoint",
-                 node.data_control_endpoint),
-         getattr(node, "advertised_ctl_endpoint", node.ctl_endpoint))
-        for node in nodes
-    ])
+    write_initial_meta_manifest(
+        path,
+        [
+            (
+                node.id,
+                endpoints[node.id],
+                getattr(
+                    node, "advertised_data_control_endpoint", node.data_control_endpoint
+                ),
+                getattr(node, "advertised_ctl_endpoint", node.ctl_endpoint),
+            )
+            for node in nodes
+        ],
+    )
 
 
 class Node:
@@ -223,8 +249,14 @@ class Node:
     def ctl_endpoint(self):
         return f"127.0.0.1:{self.ctl_port}"
 
-    def start(self, bootstrap=False, raft_port=None, wait_ready=True,
-              initial_cluster_manifest=None, explicit_ctl_socket=True):
+    def start(
+        self,
+        bootstrap=False,
+        raft_port=None,
+        wait_ready=True,
+        initial_cluster_manifest=None,
+        explicit_ctl_socket=True,
+    ):
         """(Re)starts the process; the data dir is always reused, so a
         restart after kill9()/terminate() exercises WAL/snapshot replay.
         `raft_port` rebinds the raft listener (used by the mesh bootstrap;
@@ -249,15 +281,15 @@ class Node:
             # Deep scenario names under a provisioned scratch mount can exceed
             # sockaddr_un even though the data path is valid. Keep auxiliary
             # sockets on the caller's selected scratch filesystem as well.
-            socket_root = (os.environ.get("TMPDIR") or
-                           os.environ.get("LAVIK_TEST_DATA_DIR") or
-                           tempfile.gettempdir())
+            socket_root = (
+                os.environ.get("TMPDIR")
+                or os.environ.get("LAVIK_TEST_DATA_DIR")
+                or tempfile.gettempdir()
+            )
             # The authenticated admin listener requires a private parent;
             # scratch roots themselves may intentionally be shared directories.
-            self._short_ctl_directory = tempfile.mkdtemp(
-                prefix="mc-", dir=socket_root)
-            self._short_ctl_path = os.path.join(
-                self._short_ctl_directory, "ctl.sock")
+            self._short_ctl_directory = tempfile.mkdtemp(prefix="mc-", dir=socket_root)
+            self._short_ctl_path = os.path.join(self._short_ctl_directory, "ctl.sock")
             if len(os.fsencode(self._short_ctl_path)) >= 108:
                 os.rmdir(self._short_ctl_directory)
                 raise Failure("TMPDIR is too long for a test control socket")
@@ -272,34 +304,40 @@ class Node:
                 self.raft_port = raft_port
             args = [
                 self.binary,
-                "--id", str(self.id),
-                "--addr", self.endpoint,
-                "--data-control-addr", self.data_control_endpoint,
-                "--data-dir", self.data_dir,
-                "--ctl-addr", self.ctl_endpoint,
+                "--id",
+                str(self.id),
+                "--addr",
+                self.endpoint,
+                "--data-control-addr",
+                self.data_control_endpoint,
+                "--data-dir",
+                self.data_dir,
+                "--ctl-addr",
+                self.ctl_endpoint,
             ] + self.args
             if explicit_ctl_socket:
                 args.extend(["--ctl-socket", self.ctl_path])
             manifest = initial_cluster_manifest
             if bootstrap and manifest is not None:
                 raise Failure("bootstrap and initial_cluster_manifest conflict")
-            if bootstrap and not os.path.exists(
-                    os.path.join(self.data_dir, "RAFT")):
-                manifest = os.path.join(
-                    self.workdir, f"initial-meta-{self.id}.toml")
+            if bootstrap and not os.path.exists(os.path.join(self.data_dir, "RAFT")):
+                manifest = os.path.join(self.workdir, f"initial-meta-{self.id}.toml")
                 write_initial_cluster_manifest(manifest, [self])
             if manifest is not None:
                 args.extend(["--initial-cluster-manifest", manifest])
             # Append across restarts: one file holds the node's history.
             self.log_file = open(self.log_path, "ab")
             self.proc = subprocess.Popen(
-                args, stdout=self.log_file, stderr=subprocess.STDOUT)
+                args, stdout=self.log_file, stderr=subprocess.STDOUT
+            )
             self.paused = False
-            log(f"node {self.id} started (pid {self.proc.pid}, "
+            log(
+                f"node {self.id} started (pid {self.proc.pid}, "
                 f"raft {self.raft_port}, ctl {self.ctl_path},"
                 f"{self.ctl_endpoint}, "
                 f"initial_manifest={manifest is not None}, "
-                f"attempt {attempt + 1})")
+                f"attempt {attempt + 1})"
+            )
             if not wait_ready:
                 return
             deadline = time.monotonic() + 5.0
@@ -312,12 +350,13 @@ class Node:
                 except (OSError, Failure):
                     time.sleep(0.05)
             if self.alive():
-                raise Failure(
-                    f"node {self.id}: ctl did not answer within 5s of start")
+                raise Failure(f"node {self.id}: ctl did not answer within 5s of start")
             self.proc.wait(timeout=5)
             self._close_log()
-            log(f"node {self.id} exited during boot "
-                f"(attempt {attempt + 1}); retrying after backoff")
+            log(
+                f"node {self.id} exited during boot "
+                f"(attempt {attempt + 1}); retrying after backoff"
+            )
             time.sleep(0.25)
         raise Failure(f"node {self.id} failed to start after 6 attempts")
 
@@ -371,8 +410,7 @@ class Node:
     def _history_id(value):
         """Canonical 160-bit replication-history id used by the ctl wire."""
         if isinstance(value, str):
-            if len(value) != 40 or any(c not in "0123456789abcdef"
-                                       for c in value):
+            if len(value) != 40 or any(c not in "0123456789abcdef" for c in value):
                 raise Failure(f"invalid replication history id: {value!r}")
             return value
         if not isinstance(value, int) or value < 0 or value >= (1 << 160):
@@ -381,8 +419,7 @@ class Node:
 
     def submitop(self, op_id, kind, payload, timeout=5.0, history=0):
         suffix = f" {self._history_id(history)}" if history else ""
-        return self.ctl(f"submitop {op_id} {kind} {payload}{suffix}",
-                        timeout=timeout)
+        return self.ctl(f"submitop {op_id} {kind} {payload}{suffix}", timeout=timeout)
 
     def completeop(self, op_id, result="", timeout=5.0):
         suffix = f" {result}" if result else ""
@@ -393,18 +430,20 @@ class Node:
         return self.ctl(f"abortop {op_id}{suffix}", timeout=timeout)
 
     def archiveoperations(self, *seqs, timeout=5.0):
-        return self.ctl("archiveoperations " + " ".join(map(str, seqs)),
-                        timeout=timeout)
+        return self.ctl(
+            "archiveoperations " + " ".join(map(str, seqs)), timeout=timeout
+        )
 
     def getop(self, op_id):
         return self.ctl(f"getop {op_id}")
 
-    def registernode(self, node_id, principal, role="primary", timeout=5.0,
-                     endpoints=()):
+    def registernode(
+        self, node_id, principal, role="primary", timeout=5.0, endpoints=()
+    ):
         suffix = "" if not endpoints else " " + " ".join(endpoints)
         return self.ctl(
-            f"registernode {node_id} {principal} {role}{suffix}",
-            timeout=timeout)
+            f"registernode {node_id} {principal} {role}{suffix}", timeout=timeout
+        )
 
     def getnode(self, node_id):
         return self.ctl(f"getnode {node_id}")
@@ -420,78 +459,88 @@ class Node:
         return self.ctl(f"creategroup {group_id}", timeout=timeout)
 
     def assignnode(self, group_id, node_id, role="primary", timeout=5.0):
-        return self.ctl(f"assignnode {group_id} {node_id} {role}",
-                        timeout=timeout)
+        return self.ctl(f"assignnode {group_id} {node_id} {role}", timeout=timeout)
 
     def begingroupterm(self, group_id, expected, new, timeout=5.0):
-        return self.ctl(f"begingroupterm {group_id} {expected} {new}",
-                        timeout=timeout)
+        return self.ctl(f"begingroupterm {group_id} {expected} {new}", timeout=timeout)
 
     def putpolicy(self, policy_id, version, content, timeout=5.0):
-        return self.ctl(f"putpolicy {policy_id} {version} {content}",
-                        timeout=timeout)
+        return self.ctl(f"putpolicy {policy_id} {version} {content}", timeout=timeout)
 
     def put_automatic_uncontrolled_failover_policy(
-            self, version, suspect_after_ms=5000,
-            timeout=5.0):
+        self, version, suspect_after_ms=5000, timeout=5.0
+    ):
         return self.putpolicy(
-            AUTOMATIC_UNCONTROLLED_FAILOVER_POLICY_ID, version,
-            automatic_uncontrolled_failover_policy(
-                suspect_after_ms=suspect_after_ms),
-            timeout=timeout)
+            AUTOMATIC_UNCONTROLLED_FAILOVER_POLICY_ID,
+            version,
+            automatic_uncontrolled_failover_policy(suspect_after_ms=suspect_after_ms),
+            timeout=timeout,
+        )
 
-    def put_authority_lease_policy(self, version, duration_ms=5000,
-                                   timeout=5.0):
+    def put_authority_lease_policy(self, version, duration_ms=5000, timeout=5.0):
         return self.putpolicy(
-            AUTHORITY_LEASE_POLICY_ID, version,
-            authority_lease_policy(duration_ms), timeout=timeout)
+            AUTHORITY_LEASE_POLICY_ID,
+            version,
+            authority_lease_policy(duration_ms),
+            timeout=timeout,
+        )
 
     def getpolicy(self, policy_id):
         return self.ctl(f"getpolicy {policy_id}")
 
     def setslotmap(self, first, last, group_id, timeout=5.0):
-        return self.ctl(
-            f"setslotmap {first} {last} {group_id}",
-            timeout=timeout)
+        return self.ctl(f"setslotmap {first} {last} {group_id}", timeout=timeout)
 
-    def activateauthority(self, group_id, expected_term, owner_node_id,
-                          timeout=5.0):
+    def activateauthority(self, group_id, expected_term, owner_node_id, timeout=5.0):
         return self.ctl(
             f"activateauthority {group_id} {expected_term} {owner_node_id}",
-            timeout=timeout)
+            timeout=timeout,
+        )
 
     def fencegroup(self, group_id, expected_term, timeout=5.0):
-        return self.ctl(f"fencegroup {group_id} {expected_term}",
-                        timeout=timeout)
+        return self.ctl(f"fencegroup {group_id} {expected_term}", timeout=timeout)
 
     def transitionop(self, op_id, phase, history, timeout=5.0):
         return self.ctl(
-            f"transitionop {op_id} {phase} {self._history_id(history)}",
-                        timeout=timeout)
+            f"transitionop {op_id} {phase} {self._history_id(history)}", timeout=timeout
+        )
 
     def adoptsession(self, node_id, boot_hex, generation, timeout=5.0):
-        return self.ctl(f"adoptsession {node_id} {boot_hex} {generation}",
-                        timeout=timeout)
+        return self.ctl(
+            f"adoptsession {node_id} {boot_hex} {generation}", timeout=timeout
+        )
 
     def obs_boot(self, node_id, boot_hex, generation, timeout=5.0):
-        return self.ctl(f"obs boot {node_id} {boot_hex} {generation}",
-                        timeout=timeout)
+        return self.ctl(f"obs boot {node_id} {boot_hex} {generation}", timeout=timeout)
 
-    def obs_health(self, node_id, boot_hex, generation, health="ok",
-                   timeout=5.0):
-        return self.ctl(f"obs health {node_id} {boot_hex} {generation} "
-                        f"{health}", timeout=timeout)
+    def obs_health(self, node_id, boot_hex, generation, health="ok", timeout=5.0):
+        return self.ctl(
+            f"obs health {node_id} {boot_hex} {generation} {health}", timeout=timeout
+        )
 
-    def obs_candidate(self, node_id, boot_hex, generation, group, term,
-                      manifest, history, partition_epoch=0, timeout=5.0):
+    def obs_candidate(
+        self,
+        node_id,
+        boot_hex,
+        generation,
+        group,
+        term,
+        manifest,
+        history,
+        partition_epoch=0,
+        timeout=5.0,
+    ):
         return self.ctl(
             f"obs candidate {node_id} {boot_hex} {generation} {group} "
             f"{term} {manifest} {partition_epoch} {self._history_id(history)}",
-            timeout=timeout)
+            timeout=timeout,
+        )
 
     def observations(self, group=None, timeout=5.0):
-        return self.ctl("observations" if group is None
-                        else f"observations {group}", timeout=timeout)
+        return self.ctl(
+            "observations" if group is None else f"observations {group}",
+            timeout=timeout,
+        )
 
     def obsaudit(self, timeout=5.0):
         return self.ctl("obsaudit", timeout=timeout)
@@ -596,16 +645,19 @@ class Node:
         return count
 
     def wait_status(self, predicate, desc, timeout=10.0):
-        wait_until(desc, timeout,
-                   lambda: self.alive() and predicate(self.status()))
+        wait_until(desc, timeout, lambda: self.alive() and predicate(self.status()))
 
     def wait_leader(self, timeout=10.0):
-        self.wait_status(lambda s: s.get("leader") == "1",
-                         f"node {self.id} becomes leader", timeout)
+        self.wait_status(
+            lambda s: s.get("leader") == "1", f"node {self.id} becomes leader", timeout
+        )
 
     def wait_committed(self, idx, timeout=15.0):
-        self.wait_status(lambda s: int(s["committed"]) >= idx,
-                         f"node {self.id} committed >= {idx}", timeout)
+        self.wait_status(
+            lambda s: int(s["committed"]) >= idx,
+            f"node {self.id} committed >= {idx}",
+            timeout,
+        )
 
 
 class Proxy:
@@ -633,12 +685,10 @@ class Proxy:
     REFUSE = "refuse"
     DELAY = "delay"
 
-    def __init__(self, name, target_port, listen_port=None,
-                 target_host="127.0.0.1"):
+    def __init__(self, name, target_port, listen_port=None, target_host="127.0.0.1"):
         self.name = name
         self.target = (target_host, target_port)
-        self.listen_port = listen_port if listen_port is not None \
-            else free_port()
+        self.listen_port = listen_port if listen_port is not None else free_port()
         self._mode = self.NORMAL
         self._delay = 0.0
         self._lock = threading.Lock()
@@ -656,8 +706,8 @@ class Proxy:
     def start(self):
         self._running = True
         self._accept_thread = threading.Thread(
-            target=self._accept_loop, name=f"proxy-{self.name}-accept",
-            daemon=True)
+            target=self._accept_loop, name=f"proxy-{self.name}-accept", daemon=True
+        )
         self._accept_thread.start()
 
     # -- mode control ---------------------------------------------------
@@ -685,8 +735,7 @@ class Proxy:
         with self._lock:
             self._mode = mode
             self._delay = delay
-            cut = list(self._pairs) if mode in (self.DROP, self.REFUSE) \
-                else []
+            cut = list(self._pairs) if mode in (self.DROP, self.REFUSE) else []
             listener = None
             if mode == self.REFUSE and self._listener is not None:
                 listener, self._listener = self._listener, None
@@ -739,8 +788,9 @@ class Proxy:
         if mode == self.DROP:
             with self._lock:
                 self._held.add(conn)
-            threading.Thread(target=self._discard_loop, args=(conn,),
-                             daemon=True).start()
+            threading.Thread(
+                target=self._discard_loop, args=(conn,), daemon=True
+            ).start()
             return
         try:
             upstream = socket.create_connection(self.target, timeout=5)
@@ -751,8 +801,9 @@ class Proxy:
         with self._lock:
             self._pairs.add(pair)
         for src, dst in ((conn, upstream), (upstream, conn)):
-            threading.Thread(target=self._pump, args=(src, dst, pair),
-                             daemon=True).start()
+            threading.Thread(
+                target=self._pump, args=(src, dst, pair), daemon=True
+            ).start()
 
     def _pump(self, src, dst, pair):
         try:
@@ -828,10 +879,11 @@ class Mesh:
         self._proxies = {}
 
     def attach(self, node, listen_port=None, target_port=None):
-        proxy = Proxy(f"n{node.id}",
-                      target_port if target_port is not None
-                      else node.raft_port,
-                      listen_port=listen_port)
+        proxy = Proxy(
+            f"n{node.id}",
+            target_port if target_port is not None else node.raft_port,
+            listen_port=listen_port,
+        )
         proxy.start()
         self._proxies[node.id] = proxy
         return proxy
@@ -900,25 +952,24 @@ class CommittedHistory:
         probe_key, probe_value = items[-1]
         want_probe = f"OK completed {probe_value}"
         for node in nodes:
-            wait_until(f"{desc}: node {node.id} serves {probe_key}",
-                       timeout,
-                       lambda node=node: node.alive()
-                       and node.getop(probe_key) == want_probe)
+            wait_until(
+                f"{desc}: node {node.id} serves {probe_key}",
+                timeout,
+                lambda node=node: node.alive() and node.getop(probe_key) == want_probe,
+            )
             mismatches = []
             for key, value in items:
                 reply = node.getop(key)
                 if reply != f"OK completed {value}":
-                    mismatches.append(f"{key}: {reply!r} want "
-                                      f"OK completed {value}")
+                    mismatches.append(f"{key}: {reply!r} want OK completed {value}")
                     if len(mismatches) >= 5:
                         break
             if mismatches:
                 raise Failure(
                     f"{desc}: node {node.id} violated "
-                    f"meta.committed-state-monotonic: "
-                    + "; ".join(mismatches))
-        log(f"{desc}: {len(records)} operations verified on "
-            f"{len(nodes)} node(s)")
+                    f"meta.committed-state-monotonic: " + "; ".join(mismatches)
+                )
+        log(f"{desc}: {len(records)} operations verified on {len(nodes)} node(s)")
 
 
 class LoadThread:
@@ -932,8 +983,7 @@ class LoadThread:
     leader.
     """
 
-    def __init__(self, nodes, history, prefix="ld", interval=0.005,
-                 leader_picker=None):
+    def __init__(self, nodes, history, prefix="ld", interval=0.005, leader_picker=None):
         self.nodes = nodes
         self.history = history
         self.prefix = prefix
@@ -956,7 +1006,8 @@ class LoadThread:
 
     def start(self):
         self._thread = threading.Thread(
-            target=self._run, name=f"load-{self.prefix}", daemon=True)
+            target=self._run, name=f"load-{self.prefix}", daemon=True
+        )
         self._thread.start()
 
     def stop(self):
@@ -967,8 +1018,9 @@ class LoadThread:
             self._thread.join(timeout=timeout)
 
     def stats(self):
-        errs = ", ".join(f"{k}={v}" for k, v in sorted(
-            self.err_counts.items())) or "none"
+        errs = (
+            ", ".join(f"{k}={v}" for k, v in sorted(self.err_counts.items())) or "none"
+        )
         return f"load {self.prefix}: ok={self.ok_count} errors: {errs}"
 
     def _run(self):
@@ -999,8 +1051,10 @@ class LoadThread:
 
 
 def make_nodes(binary, workdir, count, args=None, first_id=1):
-    return [Node(binary, workdir, node_id, args=args)
-            for node_id in range(first_id, first_id + count)]
+    return [
+        Node(binary, workdir, node_id, args=args)
+        for node_id in range(first_id, first_id + count)
+    ]
 
 
 def find_leader(nodes, timeout=15.0, exclude=()):
@@ -1036,18 +1090,21 @@ def join_and_verify(leader, node, endpoint=None, timeout=30.0):
     finished joining just before a mid-invite crash), which the probe then
     confirms.
     """
-    wait_until(f"node {node.id} ctl answers", 15,
-               lambda: node.alive() and node.status())
+    wait_until(
+        f"node {node.id} ctl answers", 15, lambda: node.alive() and node.status()
+    )
     target = endpoint if endpoint is not None else node.endpoint
     deadline = time.monotonic() + timeout
     invited = False
     while time.monotonic() < deadline:
         reply = leader.ctl(
             f"addsrv {node.id} {target} {node.data_control_endpoint} "
-            f"{node.ctl_endpoint}")
-        acceptable = ("OK", "ERR joining", "ERR config-changing",
-                      "ERR already-exists")
-        if reply not in acceptable and not reply.startswith("ERR uncertain-outcome operation="):
+            f"{node.ctl_endpoint}"
+        )
+        acceptable = ("OK", "ERR joining", "ERR config-changing", "ERR already-exists")
+        if reply not in acceptable and not reply.startswith(
+            "ERR uncertain-outcome operation="
+        ):
             raise Failure(f"addsrv {node.id}: {reply}")
         invited = invited or reply in ("OK", "ERR already-exists")
         if invited:
@@ -1056,9 +1113,10 @@ def join_and_verify(leader, node, endpoint=None, timeout=30.0):
                 idx = int(preply[3:])
                 try:
                     wait_until(
-                        f"node {node.id} replicates probe", 5,
-                        lambda: node.alive()
-                        and node.getop(op_id) == "OK completed 1")
+                        f"node {node.id} replicates probe",
+                        5,
+                        lambda: node.alive() and node.getop(op_id) == "OK completed 1",
+                    )
                     log(f"node {node.id} joined (probe idx {idx})")
                     return
                 except Failure:
@@ -1157,7 +1215,9 @@ def wait_no_regress(node, pre_committed, timeout=20.0):
     is a poll, not a one-shot assert."""
     wait_until(
         f"node {node.id} committed >= {pre_committed} (no regress)",
-        timeout, lambda: node.alive() and node.committed() >= pre_committed)
+        timeout,
+        lambda: node.alive() and node.committed() >= pre_committed,
+    )
 
 
 def max_committed(nodes):
@@ -1173,8 +1233,7 @@ def max_committed(nodes):
 
 def dump_node_logs(nodes, lines=40):
     for node in nodes:
-        print(f"--- node {node.id} log tail ({node.log_path}) ---",
-              file=sys.stderr)
+        print(f"--- node {node.id} log tail ({node.log_path}) ---", file=sys.stderr)
         print(node.log_tail(lines), file=sys.stderr)
 
 
@@ -1226,10 +1285,13 @@ def assert_intact(nodes, desc=""):
     """Every node still alive, no fatal signatures in any log."""
     for node in nodes:
         if not node.alive():
-            raise Failure(f"{desc}: node {node.id} died unexpectedly "
-                          f"(exit {node.proc.returncode})")
+            raise Failure(
+                f"{desc}: node {node.id} died unexpectedly "
+                f"(exit {node.proc.returncode})"
+            )
         hits = node.count_log_lines(*CRASH_MARKERS)
         if hits:
             raise Failure(
                 f"{desc}: node {node.id} log holds {hits} crash-marker "
-                f"line(s): {CRASH_MARKERS}")
+                f"line(s): {CRASH_MARKERS}"
+            )

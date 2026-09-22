@@ -33,24 +33,26 @@ from redis_follower_smoke import process, F
 
 
 def crc32c(payload):
-    crc = 0xffffffff
+    crc = 0xFFFFFFFF
     for byte in payload:
         crc ^= byte
         for _ in range(8):
-            crc = (crc >> 1) ^ (0x82f63b78 if crc & 1 else 0)
-    return crc ^ 0xffffffff
+            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+    return crc ^ 0xFFFFFFFF
 
 
 def frame(kind, payload):
-    return struct.pack("<IBBHII", 0x3146564c, 1, kind, 16,
-                       len(payload), crc32c(payload)) + payload
+    return (
+        struct.pack("<IBBHII", 0x3146564C, 1, kind, 16, len(payload), crc32c(payload))
+        + payload
+    )
 
 
 def read_frame(reader):
     header = reader.read(16)
     assert len(header) == 16, f"truncated frame: {header!r}"
     magic, version, kind, size, length, checksum = struct.unpack("<IBBHII", header)
-    assert (magic, version, size) == (0x3146564c, 1, 16)
+    assert (magic, version, size) == (0x3146564C, 1, 16)
     assert length <= 64 * 1024 * 1024
     payload = reader.read(length)
     assert len(payload) == length and crc32c(payload) == checksum
@@ -60,25 +62,43 @@ def read_frame(reader):
 @contextmanager
 def online_peer(port, ranges):
     with ExitStack() as stack:
+
         def connection():
-            sock = stack.enter_context(socket.create_connection(("127.0.0.1", port), 10))
+            sock = stack.enter_context(
+                socket.create_connection(("127.0.0.1", port), 10)
+            )
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             return sock, stack.enter_context(sock.makefile("rb"))
 
         control, control_reader = connection()
         identity = uuid.uuid4().hex + "12345678"
-        control.sendall(F.encode_resp([
-            "LVPSYNC", "1", "?" + identity + ":12345", "?", "?",
-            identity, identity, "?"]))
+        control.sendall(
+            F.encode_resp(
+                [
+                    "LVPSYNC",
+                    "1",
+                    "?" + identity + ":12345",
+                    "?",
+                    "?",
+                    identity,
+                    identity,
+                    "?",
+                ]
+            )
+        )
         words = control_reader.readline().decode().strip().split()
         assert len(words) == 8 and words[0] == "+LVFULLRESYNC", words
         assert words[6] == "1", words
         flow, reader = connection()
-        flow.sendall(F.encode_resp([
-            "LVFLOW", "1", words[1], "0", "1", "0", words[7]] +
-            (["ACKRANGE"] if ranges else [])))
+        flow.sendall(
+            F.encode_resp(
+                ["LVFLOW", "1", words[1], "0", "1", "0", words[7]]
+                + (["ACKRANGE"] if ranges else [])
+            )
+        )
         assert reader.readline().decode().strip() == (
-            f"+LVFLOW {words[1]} 0 FULL" + (" ACKRANGE" if ranges else ""))
+            f"+LVFLOW {words[1]} 0 FULL" + (" ACKRANGE" if ranges else "")
+        )
         while True:
             kind, payload = read_frame(reader)
             if kind == 1:  # RESET has no session-local sequence.
@@ -103,8 +123,9 @@ def online_peer(port, ranges):
 
 
 def publish(client, flow_reader, count=16):
-    client.socket.sendall(b"".join(F.encode_resp(["SET", f"ack:{i}", "value"])
-                                 for i in range(count)))
+    client.socket.sendall(
+        b"".join(F.encode_resp(["SET", f"ack:{i}", "value"]) for i in range(count))
+    )
     for _ in range(count):
         assert F.read_resp(client.reader) == "OK"
     lsns = []
@@ -117,21 +138,41 @@ def publish(client, flow_reader, count=16):
 
 
 def main():
-    cases = ("valid", "legacy", "unnegotiated", "reversed", "wrong-start",
-             "unsent", "oversized", "overflow", "trailing", "duplicate")
-    with tempfile.TemporaryDirectory(prefix="lavik-native-ack-",
-                                     dir=os.environ.get("LAVIK_TEST_DATA_DIR")) as directory:
+    cases = (
+        "valid",
+        "legacy",
+        "unnegotiated",
+        "reversed",
+        "wrong-start",
+        "unsent",
+        "oversized",
+        "overflow",
+        "trailing",
+        "duplicate",
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="lavik-native-ack-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
+    ) as directory:
         for case in cases:
             # Independent sources keep a rejected ACK from affecting another
             # case's source history, session or reconnect-retention lease.
-            with process(sys.argv[1], Path(directory) / case, case,
-                         workers=1) as (client, port, _):
-                with online_peer(port, case not in ("legacy", "unnegotiated")) as (flow, reader):
+            with process(sys.argv[1], Path(directory) / case, case, workers=1) as (
+                client,
+                port,
+                _,
+            ):
+                with online_peer(port, case not in ("legacy", "unnegotiated")) as (
+                    flow,
+                    reader,
+                ):
                     lsns = publish(client, reader, 128 if case == "valid" else 16)
                     first, last = lsns[0], lsns[-1]
                     if case == "legacy":
-                        flow.sendall(b"".join(frame(3, struct.pack("<HQ", 0, lsn))
-                                              for lsn in lsns))
+                        flow.sendall(
+                            b"".join(
+                                frame(3, struct.pack("<HQ", 0, lsn)) for lsn in lsns
+                            )
+                        )
                         assert client.call("WAIT", 1, 2000) == 1
                         print(f"PASS: {case}", flush=True)
                         continue
@@ -154,8 +195,12 @@ def main():
                         next_lsns = publish(client, reader)
                         if case == "valid":
                             # A singleton remains legal after a range.
-                            flow.sendall(b"".join(frame(3, struct.pack("<HQ", 0, lsn))
-                                                  for lsn in next_lsns))
+                            flow.sendall(
+                                b"".join(
+                                    frame(3, struct.pack("<HQ", 0, lsn))
+                                    for lsn in next_lsns
+                                )
+                            )
                             assert client.call("WAIT", 1, 2000) == 1
                             print(f"PASS: {case}", flush=True)
                             continue

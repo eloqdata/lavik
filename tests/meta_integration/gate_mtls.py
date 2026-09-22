@@ -61,74 +61,141 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness as H  # noqa: E402
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ISOLATION_WINDOW_S = 4.0
 
 
 def run_openssl(args, cwd):
-    proc = subprocess.run(["openssl"] + args, cwd=cwd, capture_output=True,
-                          text=True, timeout=60)
+    proc = subprocess.run(
+        ["openssl"] + args, cwd=cwd, capture_output=True, text=True, timeout=60
+    )
     if proc.returncode != 0:
         raise H.Failure(f"openssl {args[0]}: {proc.stderr.strip()[:200]}")
 
 
 def make_ca(base_dir, cn):
     os.makedirs(base_dir, exist_ok=True)
-    run_openssl(["req", "-x509", "-newkey", "rsa:2048", "-nodes",
-                 "-keyout", "ca.key", "-out", "ca.crt", "-days", "2",
-                 "-subj", f"/CN={cn}"], base_dir)
-    return (os.path.join(base_dir, "ca.crt"), os.path.join(base_dir,
-                                                           "ca.key"))
+    run_openssl(
+        [
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "ca.key",
+            "-out",
+            "ca.crt",
+            "-days",
+            "2",
+            "-subj",
+            f"/CN={cn}",
+        ],
+        base_dir,
+    )
+    return (os.path.join(base_dir, "ca.crt"), os.path.join(base_dir, "ca.key"))
 
 
-def make_leaf(workdir, ca_crt, ca_key, name,
-              san="IP:127.0.0.1,DNS:localhost"):
+def make_leaf(workdir, ca_crt, ca_key, name, san="IP:127.0.0.1,DNS:localhost"):
     """CSR signed by the given CA (valid dates); `san` controls the
     subjectAltName extension copied into the cert."""
-    run_openssl(["req", "-newkey", "rsa:2048", "-nodes",
-                 "-keyout", f"{name}.key", "-out", f"{name}.csr",
-                 "-subj", "/CN=localhost",
-                 "-addext", f"subjectAltName={san}"],
-                workdir)
-    run_openssl(["x509", "-req", "-in", f"{name}.csr",
-                 "-CA", ca_crt, "-CAkey", ca_key, "-CAcreateserial",
-                 "-out", f"{name}.crt", "-days", "2",
-                 "-copy_extensions", "copy"], workdir)
-    return (os.path.join(workdir, f"{name}.crt"),
-            os.path.join(workdir, f"{name}.key"))
+    run_openssl(
+        [
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            f"{name}.key",
+            "-out",
+            f"{name}.csr",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            f"subjectAltName={san}",
+        ],
+        workdir,
+    )
+    run_openssl(
+        [
+            "x509",
+            "-req",
+            "-in",
+            f"{name}.csr",
+            "-CA",
+            ca_crt,
+            "-CAkey",
+            ca_key,
+            "-CAcreateserial",
+            "-out",
+            f"{name}.crt",
+            "-days",
+            "2",
+            "-copy_extensions",
+            "copy",
+        ],
+        workdir,
+    )
+    return (os.path.join(workdir, f"{name}.crt"), os.path.join(workdir, f"{name}.key"))
 
 
-def member_tls_args(workdir, ca_crt, ca_key, node_id, name_prefix="member",
-                    san_ip="127.0.0.1", principal_id=None):
+def member_tls_args(
+    workdir,
+    ca_crt,
+    ca_key,
+    node_id,
+    name_prefix="member",
+    san_ip="127.0.0.1",
+    principal_id=None,
+):
     """Generate one endpoint + identity-bound Raft member certificate."""
     os.makedirs(workdir, exist_ok=True)
     principal_id = node_id if principal_id is None else principal_id
     cert, key = make_leaf(
-        workdir, ca_crt, ca_key, f"{name_prefix}-{node_id}",
-        san=(f"IP:{san_ip},DNS:localhost,"
-             f"URI:lavik://meta/{principal_id}"))
+        workdir,
+        ca_crt,
+        ca_key,
+        f"{name_prefix}-{node_id}",
+        san=(f"IP:{san_ip},DNS:localhost,URI:lavik://meta/{principal_id}"),
+    )
     return H.raft_args() + H.tls_args(ca_crt, cert, key)
 
 
 def make_tls_nodes(binary, workdir, count, ca_crt, ca_key, first_id=1):
     cert_dir = os.path.join(workdir, "member_certs")
     os.makedirs(cert_dir, exist_ok=True)
-    return [H.Node(binary, workdir, node_id,
-                   args=member_tls_args(cert_dir, ca_crt, ca_key, node_id))
-            for node_id in range(first_id, first_id + count)]
+    return [
+        H.Node(
+            binary,
+            workdir,
+            node_id,
+            args=member_tls_args(cert_dir, ca_crt, ca_key, node_id),
+        )
+        for node_id in range(first_id, first_id + count)
+    ]
 
 
 def make_expired_leaf(workdir, ca_dir, ca_crt, ca_key, name, node_id):
     """Sign a leaf with a validity window entirely in the past, using
     `openssl ca -startdate/-enddate` (OpenSSL 1.1.1+). Raises Failure when
     the host openssl cannot; the caller turns that into a SKIP."""
-    run_openssl(["req", "-newkey", "rsa:2048", "-nodes",
-                 "-keyout", f"{name}.key", "-out", f"{name}.csr",
-                 "-subj", "/CN=localhost",
-                 "-addext", ("subjectAltName=IP:127.0.0.1,DNS:localhost,"
-                             f"URI:lavik://meta/{node_id}")],
-                workdir)
+    run_openssl(
+        [
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            f"{name}.key",
+            "-out",
+            f"{name}.csr",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            (f"subjectAltName=IP:127.0.0.1,DNS:localhost,URI:lavik://meta/{node_id}"),
+        ],
+        workdir,
+    )
     index = os.path.join(ca_dir, "index.txt")
     serial = os.path.join(ca_dir, "serial")
     with open(index, "w"):
@@ -153,17 +220,29 @@ copy_extensions = copy
 [ policy_loose ]
 commonName = supplied
 """)
-    run_openssl(["ca", "-batch", "-config", config,
-                 "-startdate", "20200101000000Z",
-                 "-enddate", "20210101000000Z",
-                 "-in", os.path.join(workdir, f"{name}.csr"),
-                 "-out", os.path.join(workdir, f"{name}.crt")], workdir)
-    return (os.path.join(workdir, f"{name}.crt"),
-            os.path.join(workdir, f"{name}.key"))
+    run_openssl(
+        [
+            "ca",
+            "-batch",
+            "-config",
+            config,
+            "-startdate",
+            "20200101000000Z",
+            "-enddate",
+            "20210101000000Z",
+            "-in",
+            os.path.join(workdir, f"{name}.csr"),
+            "-out",
+            os.path.join(workdir, f"{name}.crt"),
+        ],
+        workdir,
+    )
+    return (os.path.join(workdir, f"{name}.crt"), os.path.join(workdir, f"{name}.key"))
 
 
-def expect_isolated(leader, joiner, history, seq_start, label,
-                    evidence_patterns, recovery_args):
+def expect_isolated(
+    leader, joiner, history, seq_start, label, evidence_patterns, recovery_args
+):
     """Invite `joiner`, then prove for ISOLATION_WINDOW_S that the quorum
     keeps committing while the joiner makes zero raft progress."""
     if isinstance(evidence_patterns, str):
@@ -175,7 +254,8 @@ def expect_isolated(leader, joiner, history, seq_start, label,
     evidence0 = int(leader.status()["rpc_failures"])
     invite = leader.ctl(
         f"addsrv {joiner.id} {joiner.endpoint} "
-        f"{joiner.data_control_endpoint} {joiner.ctl_endpoint}")
+        f"{joiner.data_control_endpoint} {joiner.ctl_endpoint}"
+    )
     H.log(f"{label}: addsrv node {joiner.id} -> {invite}")
     pending = re.fullmatch(r"ERR uncertain-outcome operation=([0-9a-f]{32})", invite)
     if pending is None:
@@ -189,8 +269,7 @@ def expect_isolated(leader, joiner, history, seq_start, label,
     while time.monotonic() < deadline:
         op_id, reply = leader.propose(f"{label}{seq}")
         if not reply.startswith("OK "):
-            raise H.Failure(f"{label}: quorum write failed mid-isolation: "
-                            f"{reply}")
+            raise H.Failure(f"{label}: quorum write failed mid-isolation: {reply}")
         history.record(op_id, f"{label}{seq}")
         last_ok_id = op_id
         seq += 1
@@ -200,17 +279,20 @@ def expect_isolated(leader, joiner, history, seq_start, label,
     # campaigns (skip_initial_election_timeout_), and never commits.
     status = joiner.status()
     if status["committed"] != "0" or status["leader"] != "0":
-        raise H.Failure(f"{label}: isolated node {joiner.id} made raft "
-                        f"progress: {status}")
+        raise H.Failure(
+            f"{label}: isolated node {joiner.id} made raft progress: {status}"
+        )
     if joiner.getop(last_ok_id) != "ERR not-found":
         raise H.Failure(f"{label}: isolated node {joiner.id} serves data")
     if not joiner.alive():
-        raise H.Failure(f"{label}: isolated node {joiner.id} DIED "
-                        f"(exit {joiner.proc.returncode})")
+        raise H.Failure(
+            f"{label}: isolated node {joiner.id} DIED (exit {joiner.proc.returncode})"
+        )
     committed1 = leader.committed()
     if committed1 <= committed0:
-        raise H.Failure(f"{label}: quorum committed stalled "
-                        f"({committed0} -> {committed1})")
+        raise H.Failure(
+            f"{label}: quorum committed stalled ({committed0} -> {committed1})"
+        )
     # The retained operation retries asynchronously, so wait for bounded new evidence rather than
     # racing the log writer at the end of the isolation window.
     evidence_deadline = time.monotonic() + 5.0
@@ -219,18 +301,24 @@ def expect_isolated(leader, joiner, history, seq_start, label,
         time.sleep(0.05)
         evidence1 = int(leader.status()["rpc_failures"])
     if evidence1 <= evidence0:
-        raise H.Failure(f"{label}: no '{evidence_label}' evidence in "
-                        f"transport counters")
-    H.log(f"{label}: node {joiner.id} isolated (alive, committed=0), "
-          f"quorum committed {committed0} -> {committed1}, transport counters "
-          f"'{evidence_label}' failures {evidence0} -> {evidence1}")
+        raise H.Failure(
+            f"{label}: no '{evidence_label}' evidence in transport counters"
+        )
+    H.log(
+        f"{label}: node {joiner.id} isolated (alive, committed=0), "
+        f"quorum committed {committed0} -> {committed1}, transport counters "
+        f"'{evidence_label}' failures {evidence0} -> {evidence1}"
+    )
     # Fix only the joiner's transport credentials. No replacement addsrv:
     # the original durable task must resume after authentication succeeds.
     joiner.terminate()
     joiner.args = recovery_args
     joiner.start(bootstrap=False)
-    H.wait_until(f"{label}: original invite completes after credential repair", 30,
-                 lambda: leader.getop(operation_id) == "OK completed member-added")
+    H.wait_until(
+        f"{label}: original invite completes after credential repair",
+        30,
+        lambda: leader.getop(operation_id) == "OK completed member-added",
+    )
     history.check([joiner], timeout=20, desc=f"{label}: repaired joiner")
     retire_replies = []
 
@@ -241,13 +329,15 @@ def expect_isolated(leader, joiner, history, seq_start, label,
     # The durable workflow may still be releasing its membership reservation.
     # Wait for the stable, idempotent retirement result.
     try:
-        H.wait_until(f"{label}: repaired member retires", 5,
-                     terminally_retired)
+        H.wait_until(f"{label}: repaired member retires", 5, terminally_retired)
     except H.Failure as error:
         raise H.Failure(
-            f"{label}: repaired member did not retire: {retire_replies}") from error
+            f"{label}: repaired member did not retire: {retire_replies}"
+        ) from error
     joiner.terminate()
-    H.log(f"{label}: same operation recovered after credential repair and member retired")
+    H.log(
+        f"{label}: same operation recovered after credential repair and member retired"
+    )
     return seq
 
 
@@ -259,8 +349,8 @@ def main():
     hist_a = H.CommittedHistory()
     hist_b = H.CommittedHistory()
     hist_c = H.CommittedHistory()
-    clusters = []   # (nodes, history) for teardown
-    joiners = []    # isolated nodes, for teardown + log dumps
+    clusters = []  # (nodes, history) for teardown
+    joiners = []  # isolated nodes, for teardown + log dumps
     try:
         main_ca_dir = os.path.join(workdir, "main_ca")
         main_ca, main_ca_key = make_ca(main_ca_dir, "Lavik-Gate-Main-CA")
@@ -275,8 +365,11 @@ def main():
         last = H.propose_ops(leader, 0, 30, prefix="mt", history=hist_a)
         H.wait_cluster_committed(cluster_a, last, timeout=20)
         for node in cluster_a:
-            H.wait_until(f"node {node.id} automatic snapshot", 20,
-                         lambda node=node: node.snapshot_idx() > 0)
+            H.wait_until(
+                f"node {node.id} automatic snapshot",
+                20,
+                lambda node=node: node.snapshot_idx() > 0,
+            )
         hist_a.check(cluster_a, timeout=30, desc="P history")
         follower = next(n for n in cluster_a if n.id != leader.id)
         pre = follower.committed()
@@ -284,31 +377,52 @@ def main():
         follower.start(bootstrap=False)
         H.wait_no_regress(follower, pre, timeout=20)
         hist_a.check(cluster_a, timeout=30, desc="P post-crash")
-        H.log(f"P: 30 keys, snapshots, node {follower.id} crash/restart "
-              f"catch-up over mTLS — OK")
+        H.log(
+            f"P: 30 keys, snapshots, node {follower.id} crash/restart "
+            f"catch-up over mTLS — OK"
+        )
 
         # ---- scenario N1a: plaintext joiner vs TLS cluster --------------
         plain_joiner = H.Node(BINARY, dir_a, 4, args=H.raft_args())
         joiners.append(plain_joiner)
         plain_joiner.start(bootstrap=False)
-        expect_isolated(leader, plain_joiner, hist_a, 0, "N1a-plaintext",
-                        "SSL handshake", member_tls_args(
-                            os.path.join(workdir, "repaired_plain"), main_ca, main_ca_key, 4))
+        expect_isolated(
+            leader,
+            plain_joiner,
+            hist_a,
+            0,
+            "N1a-plaintext",
+            "SSL handshake",
+            member_tls_args(
+                os.path.join(workdir, "repaired_plain"), main_ca, main_ca_key, 4
+            ),
+        )
 
         # ---- scenario N2: wrong-CA joiner vs TLS cluster ----------------
         wrong_dir = os.path.join(workdir, "wrong_ca")
         wrong_ca, wrong_key = make_ca(wrong_dir, "Lavik-Wrong-CA")
         wrong_crt, wrong_leaf_key = make_leaf(
-            wrong_dir, wrong_ca, wrong_key, "server",
-            san="IP:127.0.0.1,DNS:localhost,URI:lavik://meta/5")
-        wrong_args = H.raft_args() + H.tls_args(wrong_ca, wrong_crt,
-                                                wrong_leaf_key)
+            wrong_dir,
+            wrong_ca,
+            wrong_key,
+            "server",
+            san="IP:127.0.0.1,DNS:localhost,URI:lavik://meta/5",
+        )
+        wrong_args = H.raft_args() + H.tls_args(wrong_ca, wrong_crt, wrong_leaf_key)
         wrong_joiner = H.Node(BINARY, dir_a, 5, args=wrong_args)
         joiners.append(wrong_joiner)
         wrong_joiner.start(bootstrap=False)
-        expect_isolated(leader, wrong_joiner, hist_a, 100,
-                        "N2-wrong-ca", "SSL handshake", member_tls_args(
-                            os.path.join(workdir, "repaired_ca"), main_ca, main_ca_key, 5))
+        expect_isolated(
+            leader,
+            wrong_joiner,
+            hist_a,
+            100,
+            "N2-wrong-ca",
+            "SSL handshake",
+            member_tls_args(
+                os.path.join(workdir, "repaired_ca"), main_ca, main_ca_key, 5
+            ),
+        )
 
         # ---- scenario N1b: TLS joiner vs plaintext cluster --------------
         dir_b = os.path.join(workdir, "plain_cluster")
@@ -321,14 +435,22 @@ def main():
             raise H.Failure(f"plaintext cluster warmup: {reply}")
         hist_b.record(op_id, "warmup")
         tls_joiner_args = member_tls_args(
-            os.path.join(workdir, "main_joiner"), main_ca, main_ca_key, 4)
+            os.path.join(workdir, "main_joiner"), main_ca, main_ca_key, 4
+        )
         tls_joiner = H.Node(BINARY, dir_b, 4, args=tls_joiner_args)
         joiners.append(tls_joiner)
         tls_joiner.start(bootstrap=False)
         # The plaintext leader's client fails against the TLS listener; the
         # transport-failure counter records the bounded handshake failure.
-        expect_isolated(plain_leader, tls_joiner, hist_b, 200,
-                        "N1b-tls-joiner", "rpc error response", H.raft_args())
+        expect_isolated(
+            plain_leader,
+            tls_joiner,
+            hist_b,
+            200,
+            "N1b-tls-joiner",
+            "rpc error response",
+            H.raft_args(),
+        )
 
         # ---- cluster C: nodes hold SAN=127.0.0.1 leaves from ca2 --------
         # N3 and N4 share this cluster: both need a CA the cluster trusts
@@ -345,57 +467,79 @@ def main():
         # ---- scenario N3: expired certificate (best effort) -------------
         try:
             expired_crt, expired_key = make_expired_leaf(
-                workdir, ca2_dir, ca2_crt, ca2_key, "expired", 4)
+                workdir, ca2_dir, ca2_crt, ca2_key, "expired", 4
+            )
         except H.Failure as exc:
             H.log(f"N3-expired: SKIP ({exc})")
         else:
-            expired_args = H.raft_args() + H.tls_args(ca2_crt, expired_crt,
-                                                      expired_key)
+            expired_args = H.raft_args() + H.tls_args(ca2_crt, expired_crt, expired_key)
             expired_joiner = H.Node(BINARY, dir_c, 4, args=expired_args)
             joiners.append(expired_joiner)
             expired_joiner.start(bootstrap=False)
-            expect_isolated(leader_c, expired_joiner, hist_c, 300,
-                            "N3-expired", "SSL handshake", member_tls_args(
-                                os.path.join(workdir, "repaired_expired"), ca2_crt, ca2_key, 4))
+            expect_isolated(
+                leader_c,
+                expired_joiner,
+                hist_c,
+                300,
+                "N3-expired",
+                "SSL handshake",
+                member_tls_args(
+                    os.path.join(workdir, "repaired_expired"), ca2_crt, ca2_key, 4
+                ),
+            )
 
         # ---- scenario N4: trusted CA, wrong SAN --------------------------
         # The joiner's leaf IS signed by the CA the cluster trusts, so the
         # chain verifies; the rejection comes from the client-side peer_name
         # check: the endpoint host is 127.0.0.1 but the cert's SAN only
         # covers 10.9.9.9.
-        badsan_crt, badsan_key = make_leaf(workdir, ca2_crt, ca2_key,
-                                           "badsan",
-                                           san=("IP:10.9.9.9,"
-                                                "URI:lavik://meta/5"))
-        badsan_args = H.raft_args() + H.tls_args(ca2_crt, badsan_crt,
-                                                 badsan_key)
+        badsan_crt, badsan_key = make_leaf(
+            workdir, ca2_crt, ca2_key, "badsan", san=("IP:10.9.9.9,URI:lavik://meta/5")
+        )
+        badsan_args = H.raft_args() + H.tls_args(ca2_crt, badsan_crt, badsan_key)
         badsan_joiner = H.Node(BINARY, dir_c, 5, args=badsan_args)
         joiners.append(badsan_joiner)
         badsan_joiner.start(bootstrap=False)
-        expect_isolated(leader_c, badsan_joiner, hist_c, 400,
-                        "N4-wrong-san", "SSL handshake", member_tls_args(
-                            os.path.join(workdir, "repaired_san"), ca2_crt, ca2_key, 5))
+        expect_isolated(
+            leader_c,
+            badsan_joiner,
+            hist_c,
+            400,
+            "N4-wrong-san",
+            "SSL handshake",
+            member_tls_args(os.path.join(workdir, "repaired_san"), ca2_crt, ca2_key, 5),
+        )
 
         # ---- scenario N5: valid endpoint, wrong member URI binding ------
         wrongid_args = member_tls_args(
-            os.path.join(workdir, "wrong_identity"), ca2_crt, ca2_key, 6,
-            name_prefix="wrong-id", principal_id=99)
+            os.path.join(workdir, "wrong_identity"),
+            ca2_crt,
+            ca2_key,
+            6,
+            name_prefix="wrong-id",
+            principal_id=99,
+        )
         wrongid_joiner = H.Node(BINARY, dir_c, 6, args=wrongid_args)
         joiners.append(wrongid_joiner)
         # The local identity check now fails before ingress. Verify that the
         # mismatched certificate cannot start, then use the corrected identity
         # in a real join to exercise peer authentication as well.
         wrongid_joiner.start(bootstrap=False, wait_ready=False)
-        H.wait_until("wrong local principal fails startup", 10,
-                     lambda: not wrongid_joiner.alive())
+        H.wait_until(
+            "wrong local principal fails startup",
+            10,
+            lambda: not wrongid_joiner.alive(),
+        )
         if wrongid_joiner.proc.returncode == 0:
             raise H.Failure("wrong member certificate was accepted")
         wrongid_joiner.args = member_tls_args(
-            os.path.join(workdir, "repaired_id"), ca2_crt, ca2_key, 6)
+            os.path.join(workdir, "repaired_id"), ca2_crt, ca2_key, 6
+        )
         wrongid_joiner.start(bootstrap=False)
         H.join_and_verify(leader_c, wrongid_joiner)
-        H.wait_until("repaired member retires", 10,
-                     lambda: leader_c.ctl("removesrv 6") == "OK")
+        H.wait_until(
+            "repaired member retires", 10, lambda: leader_c.ctl("removesrv 6") == "OK"
+        )
         wrongid_joiner.terminate()
         H.log("N5: wrong local principal rejected; corrected peer joined and retired")
 
