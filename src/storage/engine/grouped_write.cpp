@@ -68,15 +68,14 @@ Task<absl::StatusOr<HashGroupLocation>>
 StorageEngine::Impl::WriteHashGroupRecordLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const HashGroupSnapshot& snapshot, std::uint64_t sequence,
-    TxShardWrites& tx, ValueType value_type, std::uint64_t batch_txid) {
+    const HashGroupSnapshot& snapshot, HashGroupEncoder encoder,
+    std::uint64_t sequence, TxShardWrites& tx, ValueType value_type,
+    std::uint64_t batch_txid) {
   if (value_type != ValueType::kHash && value_type != ValueType::kSet &&
       value_type != ValueType::kSortedSet) {
     co_return absl::InvalidArgumentError(
         "invalid prefix-group collection type");
   }
-  auto encoder = HashGroupEncoder::Create(snapshot);
-  if (!encoder.ok()) co_return encoder.status();
   // An auxiliary identity adds 32 bytes to the optional ordinary header.
   // Decide key externalization with that framing included, not the ordinary
   // key threshold alone, or a boundary-length key would overrun one page.
@@ -85,19 +84,19 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
                                               true) > kBlockHeaderSlotBytes;
   const std::size_t prefix_bytes = key_external ? key.size() : 0;
   if (!ValidRecordKeySize(key.size()) ||
-      prefix_bytes > kMaxRecordPayloadBytes - encoder->encoded_bytes()) {
+      prefix_bytes > kMaxRecordPayloadBytes - encoder.encoded_bytes()) {
     co_return absl::OutOfRangeError(
         "group snapshot and external key exceed the record payload limit");
   }
   const std::size_t inline_bytes = AlignRecord(
       RecordHeaderBytes(key.size(), key_external, true, false, true) +
-      prefix_bytes + encoder->encoded_bytes());
+      prefix_bytes + encoder.encoded_bytes());
   const bool external = inline_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
                         inline_bytes > options_.buffers_.write_buffer_bytes_;
   ExtentManifest extents;
   std::string payload;
   if (external) {
-    RecordPayloadCursor cursor(*encoder,
+    RecordPayloadCursor cursor(encoder,
                                key_external ? key : std::string_view{});
     auto written = co_await WriteExtentValueLocked(store, {}, {}, &cursor, key);
     if (!written.ok()) co_return written.status();
@@ -105,8 +104,8 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
     payload = EncodeManifest(*extents);
     LAVIK_MAYBE_CRASH_AT("group-extents-durable-before-record");
   } else {
-    payload.resize(encoder->encoded_bytes());
-    RecordPayloadCursor cursor(*encoder);
+    payload.resize(encoder.encoded_bytes());
+    RecordPayloadCursor cursor(encoder);
     auto encoded = cursor.Read(std::as_writable_bytes(std::span(payload)));
     if (encoded.ok()) encoded = cursor.Finish();
     if (!encoded.ok()) co_return encoded;

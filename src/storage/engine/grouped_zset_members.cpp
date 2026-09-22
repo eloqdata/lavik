@@ -81,6 +81,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     struct Change {
       std::optional<double> before_;
       std::optional<double> after_;
+      bool found_before_ = false;
     };
     struct RemovedMember {
       MemoryReservation admission_;
@@ -209,17 +210,15 @@ StorageEngine::Impl::PrepareSortedSetMembers(
         if (!score.ok()) co_return score.status();
         if (!found->second.before_ || *score != *found->second.before_)
           co_return absl::DataLossError("ordered/member-index score mismatch");
+        found->second.found_before_ = true;
       }
     }
-    // Verify exact presence before applying changes; a missing old member
-    // must not silently heal a corrupt index under a new root.
+    // The leaf traversal above already probes exact identities in changes.
+    // Remember presence there instead of rescanning a leaf for each member.
+    // Still reject a missing old member before applying any changes: a new
+    // root must not silently heal a corrupt index.
     for (const auto& [member, change] : changes) {
-      auto& entries =
-          leaves.at(previous->directory().Find(member)->id_).value_.entries_;
-      const auto found = std::find_if(
-          entries.begin(), entries.end(),
-          [&](const auto& entry) { return entry.field_ == member; });
-      if ((found != entries.end()) != change.before_.has_value())
+      if (change.found_before_ != change.before_.has_value())
         co_return absl::DataLossError(
             "ordered/member-index membership mismatch");
     }
