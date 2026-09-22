@@ -32,14 +32,33 @@
 
 namespace lavik::storage {
 
-// Sets use the Hash prefix directory with empty field values. These ordered
-// pages are for Lists and Sorted Sets only: hash-prefix order cannot implement
-// either List rank or Sorted Set (score, binary member) order.
-enum class OrderedCollectionKind : std::uint8_t { kList = 1, kSortedSet = 2 };
+// A Stream append adds only one entry. Keep small logs compact to amortize the
+// grouped transaction/publication cost; large logs need bounded page updates.
+inline constexpr std::size_t kGroupedStreamPromotionBytes = 1024 * 1024;
+
+// Sets use Hash prefix routing. Ordered pages hold List ranks, Sorted Set
+// (score, member) order, or the binary logical record keys of a Stream.
+enum class OrderedCollectionKind : std::uint8_t {
+  kList = 1,
+  kSortedSet = 2,
+  kStream = 3
+};
+
+inline ValueType OrderedValueType(OrderedCollectionKind kind) noexcept {
+  switch (kind) {
+    case OrderedCollectionKind::kList:
+      return ValueType::kList;
+    case OrderedCollectionKind::kSortedSet:
+      return ValueType::kSortedSet;
+    case OrderedCollectionKind::kStream:
+      return ValueType::kStream;
+  }
+  return ValueType::kNone;
+}
 
 struct OrderedCollectionEntry {
   std::string value_;
-  double score_ = 0;  // Lists require positive zero in the durable encoding.
+  double score_ = 0;  // Lists and Streams require positive zero on disk.
   bool operator==(const OrderedCollectionEntry&) const noexcept = default;
 };
 
@@ -60,6 +79,12 @@ struct OrderedCollectionRoot {
   // header explicitly records its presence; ordered-only roots never invent
   // an index during decoding.
   std::optional<GroupedHashRoot> member_index_ = std::nullopt;
+  // Stream pages count internal records, including metadata for empty streams.
+  // The user-visible length is independent of that physical record count.
+  std::optional<std::uint64_t> stream_length_ = std::nullopt;
+  std::uint64_t logical_size() const noexcept {
+    return stream_length_.value_or(item_count_);
+  }
   bool operator==(const OrderedCollectionRoot&) const noexcept = default;
 };
 
@@ -78,6 +103,8 @@ struct OrderedGroupSnapshot {
 
 inline constexpr std::size_t kOrderedGroupHeaderBytes = 64;
 inline constexpr std::size_t kOrderedCollectionRootBytes = 72;
+inline constexpr std::size_t kGroupedStreamRootBytes =
+    kOrderedCollectionRootBytes + 8;
 inline constexpr std::size_t kIndexedSortedSetRootBytes =
     kOrderedCollectionRootBytes + kGroupedHashRootBytes;
 inline constexpr std::size_t kOrderedGroupTargetBytes = 8192;

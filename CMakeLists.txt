@@ -409,6 +409,8 @@ add_library(lavik_module
   src/storage/engine/grouped_hash.cpp
   src/storage/engine/grouped_collection.cpp
   src/storage/engine/grouped_sorted_rewrite.cpp
+  src/storage/engine/grouped_stream.cpp
+  src/storage/engine/stream_records.cpp
   src/storage/engine/ordered_compact_codec.cpp
   src/storage/engine/collection_compact_stream.cpp
   src/storage/engine/grouped_replication_source.cpp
@@ -1329,6 +1331,10 @@ if (BUILD_TESTING)
     endif()
   endif()
 
+  add_executable(lavik_stream_records_test tests/stream_records_test.cpp)
+  target_link_libraries(lavik_stream_records_test PRIVATE lavik::module GTest::gtest_main)
+  add_test(NAME lavik_stream_records COMMAND lavik_stream_records_test)
+
   add_executable(lavik_unit_tests
     tests/buffer_pool_test.cpp
     tests/cluster_authority_test.cpp
@@ -1663,6 +1669,7 @@ endforeach()
     )
 
     add_executable(lavik_grouped_ordered_write_e2e_test
+      tests/grouped_stream_e2e_test.cpp
       tests/grouped_ordered_write_e2e_test.cpp
       tests/grouped_rdb_stream_e2e_test.cpp
       tests/grouped_zset_write_e2e_test.cpp

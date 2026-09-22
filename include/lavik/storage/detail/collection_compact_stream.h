@@ -37,6 +37,8 @@ inline constexpr std::size_t kCollectionStreamPageBytes = 8 * 1024;
 // Aggregate lengths are uint64_t, while the unchanged wire count is uint32_t.
 // No serialized whole-value or whole-page buffer is allocated. Pages must be
 // supplied in logical order, including empty Hash/Set routing pages if desired.
+// Stream pages supply internal logical records; total_count counts those
+// records, while their LXS1 header retains the independent message count.
 class CollectionCompactEncoder {
  public:
   static absl::StatusOr<CollectionCompactEncoder> Create(
@@ -45,6 +47,7 @@ class CollectionCompactEncoder {
 
   // Validates a page and measures only its entries, excluding the single
   // collection header. Add 32 bytes for Hash/Set, or 8 for List/Sorted Set.
+  // Stream header/count fragments are themselves records, with no extra header.
   static absl::StatusOr<std::uint64_t> MeasurePage(const CollectionPage& page);
 
   // Borrows the page; keep it immutable and alive until page_done() and until
@@ -82,6 +85,8 @@ class CollectionCompactEncoder {
 // most one roughly 8 KiB page plus one indivisible large entry is assembled.
 // No allocation is sized from the aggregate count/length. The caller may await
 // admission/storage between TakePage and the next Consume call.
+// Supports Hash, Set, List and Sorted Set; Stream receiving uses its complete
+// LXS1 adapter until logical macro-node boundaries can be reconstructed here.
 class CollectionCompactDecoder {
  public:
   CollectionCompactDecoder(const CollectionCompactDecoder&) = delete;

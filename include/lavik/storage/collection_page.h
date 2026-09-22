@@ -43,6 +43,9 @@ struct CollectionScoredMember {
 // when no entries are returned. List and Sorted Set pages preserve logical
 // order. Individual strings retain Redis' 512 MiB limit; the collection's
 // aggregate size is not represented by, or limited to, a single string.
+// Stream elements_ contain ordered internal logical records (including metadata
+// and PEL), so size() counts records rather than messages. Portable projection
+// removes their routing envelopes and uses the independent LXS1 message count.
 struct CollectionPage {
   // First member deliberately dies last: payload buffers must be freed
   // before their retained-memory allowance is returned. This makes pages

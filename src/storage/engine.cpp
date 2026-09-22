@@ -634,9 +634,11 @@ Task<absl::Status> StorageEngine::ExecuteCompact(
     std::uint8_t db_id, std::string_view key, ValueType value_type,
     bool read_only, const CompactValueCallback& callback, std::uint64_t now_ms,
     ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    CompactAccessOptions access) {
   return impl_->ExecuteCompact(db_id, key, value_type, read_only, callback,
-                               now_ms, replication, mutation_precondition);
+                               now_ms, replication, mutation_precondition,
+                               access);
 }
 
 Task<ExpirationInfo> StorageEngine::GetExpiration(std::uint8_t db_id,
@@ -729,10 +731,11 @@ Task<absl::Status> StorageEngine::ExecuteCompactLocked(
     ValueType value_type, bool read_only, const CompactValueCallback& callback,
     TxShardWrites* tx, std::uint64_t now_ms,
     ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    CompactAccessOptions access) {
   return impl_->ExecuteCompactLocked(db_id, key, digest, value_type, read_only,
                                      callback, tx, now_ms, replication, false,
-                                     mutation_precondition);
+                                     mutation_precondition, access);
 }
 
 Task<ExpirationInfo> StorageEngine::GetExpirationLocked(std::uint8_t db_id,

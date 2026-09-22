@@ -1942,18 +1942,51 @@ class StorageEngine::Impl {
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
 
+  Task<absl::Status> ExecuteGroupedStreamGroupLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, const CompactValueCallback& callback,
+      const StreamGroupAccess& access, TxShardWrites* tx,
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
+
+  struct StreamPageAccess;
+  Task<absl::Status> ExecuteGroupedStreamAckLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, const CompactValueCallback& callback,
+      const StreamAckAccess& access, TxShardWrites* tx,
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
+
+  Task<absl::Status> ExecuteGroupedStreamRange(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, const CompactValueCallback& callback,
+      const StreamRangeAccess& range);
+
+  Task<absl::Status> ExecuteGroupedStreamAppendLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, const CompactValueCallback& callback,
+      std::uint32_t node_max_entries, TxShardWrites* tx,
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
+
   Task<absl::Status> ExecuteCompact(
       std::uint8_t db_id, std::string_view key, ValueType value_type,
       bool read_only, const CompactValueCallback& callback,
       std::uint64_t now_ms, ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition);
+      const MutationPrecondition* mutation_precondition,
+      CompactAccessOptions access = {});
   Task<absl::Status> ExecuteCompactLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ValueType value_type, bool read_only,
       const CompactValueCallback& callback, TxShardWrites* tx = nullptr,
       std::uint64_t now_ms = 0, ReplicationCommandAppend* replication = nullptr,
       bool prepare_unlocked = false,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      CompactAccessOptions access = {});
 
   Task<absl::StatusOr<HashResult>> ExecuteHashLikeLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,

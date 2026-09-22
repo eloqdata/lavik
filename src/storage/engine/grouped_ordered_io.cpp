@@ -69,9 +69,7 @@ StorageEngine::Impl::WriteOrderedGroupRecordLocked(
       .prepare_root_ = {},
       .changed_groups_ = {},
   };
-  const ValueType type = snapshot.kind_ == OrderedCollectionKind::kList
-                             ? ValueType::kList
-                             : ValueType::kSortedSet;
+  const ValueType type = OrderedValueType(snapshot.kind_);
   RecordLocation location;
   auto status = co_await WriteRecordLocked(
       store, db_id, key, payload, RecordKind::kValue, type, 0, digest, tx.txid_,
@@ -225,8 +223,8 @@ StorageEngine::Impl::LoadGroupedOrderedValue(
           "ordered page links disagree with directory");
     }
     if (!result.empty() &&
-        object->ordered_directory().root().kind_ ==
-            OrderedCollectionKind::kSortedSet &&
+        object->ordered_directory().root().kind_ !=
+            OrderedCollectionKind::kList &&
         !OrderedEntryLess(result.back(), page->snapshot_.entries_.front())) {
       co_return absl::DataLossError("Sorted Set page boundary is unordered");
     }

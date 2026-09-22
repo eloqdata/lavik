@@ -24,6 +24,7 @@
 #include <new>
 
 #include "lavik/storage/detail/grouped_hash.h"
+#include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
 namespace {
@@ -90,16 +91,23 @@ absl::Status ValidateEntry(ValueType type, std::uint64_t first,
 
 absl::StatusOr<CollectionCompactEncoder> CollectionCompactEncoder::Create(
     ValueType type, std::uint64_t count, std::uint64_t bytes) {
-  auto valid = ValidateTotals(type, count, bytes);
+  auto valid =
+      type == ValueType::kStream
+          ? (count != 0 && count <= UINT32_MAX && bytes >= 56
+                 ? absl::OkStatus()
+                 : absl::InvalidArgumentError("invalid Stream record totals"))
+          : ValidateTotals(type, count, bytes);
   if (!valid.ok()) return valid;
   CollectionCompactEncoder result;
   result.type_ = type;
   result.total_count_ = count;
   result.total_bytes_ = bytes;
-  result.header_bytes_ = HeaderBytes(type);
+  result.header_bytes_ = type == ValueType::kStream ? 0 : HeaderBytes(type);
   result.supplied_bytes_ = result.header_bytes_;
   char* out = result.header_.data();
-  if (HashWire(type)) {
+  if (type == ValueType::kStream) {
+    result.header_pending_ = false;
+  } else if (HashWire(type)) {
     Put(out, kHashValueMagic, 8);
     Put(out + 8, kStorageFormatVersion, 4);
     Put(out + 12, kHashValueHeaderBytes, 4);
@@ -116,16 +124,24 @@ absl::StatusOr<std::uint64_t> CollectionCompactEncoder::MeasurePage(
     const CollectionPage& page) {
   const auto type = page.value_type_;
   if ((!HashWire(type) && type != ValueType::kList &&
-       type != ValueType::kSortedSet) ||
+       type != ValueType::kSortedSet && type != ValueType::kStream) ||
       (type != ValueType::kHash && !page.fields_.empty()) ||
       (type != ValueType::kSet && type != ValueType::kList &&
-       !page.elements_.empty()) ||
+       type != ValueType::kStream && !page.elements_.empty()) ||
       (type != ValueType::kSortedSet && !page.scored_members_.empty())) {
     return absl::InvalidArgumentError(
         "compact page has inconsistent containers");
   }
   std::uint64_t result = 0;
   for (std::size_t i = 0; i < page.size(); ++i) {
+    if (type == ValueType::kStream) {
+      auto payload = StreamRecordPayload(page.elements_[i]);
+      if (!payload.ok()) return payload.status();
+      if (payload->size() > UINT64_MAX - result)
+        return absl::OutOfRangeError("Stream page size overflow");
+      result += payload->size();
+      continue;
+    }
     const std::uint64_t first =
         type == ValueType::kHash        ? page.fields_[i].field_.size()
         : type == ValueType::kSortedSet ? page.scored_members_[i].member_.size()
@@ -136,7 +152,8 @@ absl::StatusOr<std::uint64_t> CollectionCompactEncoder::MeasurePage(
         type, first, second,
         type == ValueType::kSortedSet ? page.scored_members_[i].score_ : 0);
     if (!valid.ok()) return valid;
-    const auto bytes = EntryFraming(type) + first + second;
+    const auto bytes =
+        (type == ValueType::kStream ? 0 : EntryFraming(type)) + first + second;
     if (bytes > std::numeric_limits<std::uint64_t>::max() - result)
       return absl::OutOfRangeError("compact page byte length overflow");
     result += bytes;
@@ -171,6 +188,9 @@ std::optional<std::string_view> CollectionCompactEncoder::Next() noexcept {
     output = {header_.data(), header_bytes_};
   } else if (page_ == nullptr) {
     return std::nullopt;
+  } else if (type_ == ValueType::kStream) {
+    output = *StreamRecordPayload(page_->elements_[entry_]);
+    if (++entry_ == page_->size()) page_ = nullptr;
   } else {
     const bool hash = HashWire(type_);
     const std::string& first = type_ == ValueType::kHash

@@ -22,26 +22,31 @@
 namespace lavik::storage {
 namespace {
 
-absl::StatusOr<OrderedCollectionMutationPlan> PrepareSortedSetGroups(
-    std::string_view encoded, std::uint64_t count) {
-  auto entries = DecodeOrderedCompactValue(OrderedCollectionKind::kSortedSet,
-                                           encoded, count);
+absl::StatusOr<OrderedCollectionMutationPlan> PrepareOrderedGroups(
+    std::string_view encoded, std::uint64_t count,
+    OrderedCollectionKind collection_kind = OrderedCollectionKind::kSortedSet) {
+  auto entries = DecodeOrderedCompactValue(collection_kind, encoded, count);
   if (!entries.ok()) return entries.status();
-  OrderedGroupSnapshot initial{.kind_ = OrderedCollectionKind::kSortedSet,
+  const auto record_count = entries->size();
+  OrderedGroupSnapshot initial{.kind_ = collection_kind,
                                .incarnation_ = 1,
                                .id_ = 1,
                                .entries_ = std::move(*entries)};
   auto split = SplitOrderedGroup(std::move(initial), 2);
   if (!split.ok()) return split.status();
   return OrderedCollectionMutationPlan{
-      .root_ = {.kind_ = OrderedCollectionKind::kSortedSet,
+      .root_ = {.kind_ = collection_kind,
                 .incarnation_ = 1,
-                .item_count_ = count,
+                .item_count_ = record_count,
                 .first_group_ = split->groups_.front().id_,
                 .last_group_ = split->groups_.back().id_,
                 .next_group_id_ = split->next_group_id_,
                 .group_count_ =
-                    static_cast<std::uint32_t>(split->groups_.size())},
+                    static_cast<std::uint32_t>(split->groups_.size()),
+                .stream_length_ =
+                    collection_kind == OrderedCollectionKind::kStream
+                        ? std::optional(count)
+                        : std::nullopt},
       .changed_ = true,
       .writes_ = std::move(split->groups_)};
 }
@@ -52,7 +57,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompact(
     std::uint8_t db_id, std::string_view key, ValueType value_type,
     bool read_only, const CompactValueCallback& callback, std::uint64_t now_ms,
     ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    CompactAccessOptions access) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
@@ -60,7 +66,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompact(
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
   co_return co_await ExecuteCompactLocked(
       db_id, key, digest, value_type, read_only, callback, nullptr, now_ms,
-      replication, false, mutation_precondition);
+      replication, false, mutation_precondition, access);
 }
 
 Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
@@ -68,12 +74,28 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     ValueType value_type, bool read_only, const CompactValueCallback& callback,
     TxShardWrites* tx, std::uint64_t now_ms,
     ReplicationCommandAppend* replication, bool prepare_unlocked,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    CompactAccessOptions access) {
   assert(db_id < kLogicalDatabaseCount);
   if (value_type != ValueType::kString && value_type != ValueType::kSortedSet &&
       value_type != ValueType::kStream) {
     co_return absl::InvalidArgumentError("unsupported compact value type");
   }
+
+  const unsigned contracts =
+      access.metadata_only_ +
+      access.stream_append_node_max_entries_.has_value() +
+      access.stream_range_.has_value() + access.stream_ack_.has_value() +
+      access.stream_group_.has_value();
+  if (contracts > 1 ||
+      (contracts != 0 && !access.metadata_only_ &&
+       value_type != ValueType::kStream) ||
+      ((access.metadata_only_ || access.stream_range_) && !read_only) ||
+      ((access.stream_append_node_max_entries_ || access.stream_ack_ ||
+        access.stream_group_) &&
+       read_only))
+    co_return absl::InvalidArgumentError(
+        "incompatible compact callback access contracts");
 
   try {
     WorkerStore& store = CurrentStore();
@@ -93,8 +115,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
         found != nullptr && found->value_.kind() == RecordKind::kValue;
     if (now_ms == 0) now_ms = UnixTimeMillis();
     const bool exists = stored_value && !IsExpired(*found, now_ms);
-    if (value_type == ValueType::kSortedSet && !exists && found &&
-        found->value_.grouped()) {
+    if ((value_type == ValueType::kSortedSet ||
+         value_type == ValueType::kStream) &&
+        !exists && found && found->value_.grouped()) {
       // A tentative failed root must not hide behind its uncommitted TTL in
       // legacy callbacks either. Ordinary String reads keep their old path.
       const auto readable = co_await ReadKeyMetadataLocked(db_id, key, digest);
@@ -143,6 +166,51 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       if (!object.ok()) co_return object.status();
       grouped = std::move(*object);
     }
+    if (access.metadata_only_) {
+      if (!read_only)
+        co_return absl::InvalidArgumentError("metadata callback is writable");
+      std::optional<CompactValueView> metadata;
+      if (exists)
+        metadata = CompactValueView{.encoded_ = {},
+                                    .logical_size_ = location.logical_size_,
+                                    .expire_at_ms_ = location.expire_at_ms_};
+      auto update = callback(metadata);
+      if (!update.ok()) co_return update.status();
+      if (update->changed_)
+        co_return absl::InvalidArgumentError("metadata callback mutated");
+      co_return absl::OkStatus();
+    }
+    if (grouped && access.stream_group_) {
+      if (read_only || value_type != ValueType::kStream)
+        co_return absl::InvalidArgumentError("invalid Stream group access");
+      co_return co_await ExecuteGroupedStreamGroupLocked(
+          store, partition, db_id, key, digest, grouped, callback,
+          *access.stream_group_, tx, replication, mutation_precondition);
+    }
+    if (grouped && access.stream_ack_) {
+      if (read_only || value_type != ValueType::kStream)
+        co_return absl::InvalidArgumentError("invalid Stream ACK access");
+      co_return co_await ExecuteGroupedStreamAckLocked(
+          store, partition, db_id, key, digest, grouped, callback,
+          *access.stream_ack_, tx, replication, mutation_precondition);
+    }
+    if (grouped && access.stream_range_) {
+      if (!read_only || value_type != ValueType::kStream)
+        co_return absl::InvalidArgumentError("invalid Stream range access");
+      found = nullptr;
+      unlock.Unlock();
+      co_return co_await ExecuteGroupedStreamRange(store, partition, db_id, key,
+                                                   digest, grouped, callback,
+                                                   *access.stream_range_);
+    }
+    if (grouped && access.stream_append_node_max_entries_) {
+      if (read_only || value_type != ValueType::kStream)
+        co_return absl::InvalidArgumentError("invalid Stream append access");
+      co_return co_await ExecuteGroupedStreamAppendLocked(
+          store, partition, db_id, key, digest, grouped, callback,
+          *access.stream_append_node_max_entries_, tx, replication,
+          mutation_precondition);
+    }
     std::optional<MemoryReservation> callback_admission;
     // Keep the preexisting bounded inline workspace available when the
     // database is already over maxmemory: shrinking commands must still be
@@ -156,13 +224,17 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
         !location.external() && !location.key_external() &&
         location.total_disk_bytes() < kGroupedHashPromotionBytes &&
         location.logical_size_ <= 1024;
-    if (value_type == ValueType::kSortedSet && exists && !bounded_inline) {
+    if ((value_type == ValueType::kSortedSet ||
+         value_type == ValueType::kStream) &&
+        exists && !bounded_inline) {
       GroupedScratchBudget budget;
       if (grouped) {
         if (!grouped->is_ordered() ||
             grouped->ordered_directory().root().kind_ !=
-                OrderedCollectionKind::kSortedSet)
-          co_return absl::DataLossError("invalid Sorted Set callback view");
+                (value_type == ValueType::kStream
+                     ? OrderedCollectionKind::kStream
+                     : OrderedCollectionKind::kSortedSet))
+          co_return absl::DataLossError("invalid ordered callback view");
         for (const auto& page : grouped->ordered_directory().groups()) {
           const HashGroupId id{page.id_, 0};
           const auto* entry = grouped->FindGroup(id);
@@ -238,8 +310,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       auto admitted = budget.Reserve(1);
       if (!admitted.ok()) co_return admitted.status();
       create_admission.emplace(std::move(*admitted));
-      auto plan =
-          PrepareSortedSetGroups(update->encoded_, update->logical_size_);
+      auto plan = PrepareOrderedGroups(update->encoded_, update->logical_size_);
       if (!plan.ok()) co_return plan.status();
       created_groups.emplace(std::move(*plan));
       LAVIK_FAULT_INJECT({
@@ -312,41 +383,60 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
                                          : std::string_view(update->encoded_);
     const std::uint64_t logical_size =
         update->reuse_encoded_ ? location.logical_size_ : update->logical_size_;
-    const bool promote_ordered = encoded.size() >= kGroupedHashPromotionBytes;
-    if (!update->erase_ && value_type == ValueType::kSortedSet &&
+    const bool promote_ordered =
+        encoded.size() >= (value_type == ValueType::kStream
+                               ? kGroupedStreamPromotionBytes
+                               : kGroupedHashPromotionBytes);
+    const auto collection_kind = value_type == ValueType::kStream
+                                     ? OrderedCollectionKind::kStream
+                                     : OrderedCollectionKind::kSortedSet;
+    if (!update->erase_ &&
+        (value_type == ValueType::kSortedSet ||
+         value_type == ValueType::kStream) &&
         (grouped != nullptr || promote_ordered)) {
       if (created_groups)
         co_return co_await CommitGroupedOrderedMutationLocked(
             store, partition, db_id, key, digest, nullptr,
             std::move(*created_groups), expire_at_ms, tx, replication,
             mutation_precondition, &created_members);
+      std::optional<MemoryReservation> stream_promotion_admission;
       OrderedCollectionMutationPlan plan;
       if (grouped == nullptr) {
-        auto created = PrepareSortedSetGroups(encoded, logical_size);
+        if (value_type == ValueType::kStream) {
+          GroupedScratchBudget budget;
+          auto added = budget.AddBytes(encoded.size());
+          if (!added.ok()) co_return added;
+          auto admitted = budget.Reserve(6);
+          if (!admitted.ok()) co_return admitted.status();
+          stream_promotion_admission.emplace(std::move(*admitted));
+        }
+        auto created =
+            PrepareOrderedGroups(encoded, logical_size, collection_kind);
         if (!created.ok()) co_return created.status();
         plan = std::move(*created);
       } else {
-        auto after = DecodeOrderedCompactValue(
-            OrderedCollectionKind::kSortedSet, encoded, logical_size);
+        auto after =
+            DecodeOrderedCompactValue(collection_kind, encoded, logical_size);
         if (!after.ok()) co_return after.status();
         if (!grouped->is_ordered() ||
-            grouped->ordered_directory().root().kind_ !=
-                OrderedCollectionKind::kSortedSet ||
+            grouped->ordered_directory().root().kind_ != collection_kind ||
             !view.has_value()) {
-          co_return absl::DataLossError("invalid grouped Sorted Set view");
+          co_return absl::DataLossError(
+              "invalid grouped ordered callback view");
         }
-        auto before =
-            DecodeOrderedCompactValue(OrderedCollectionKind::kSortedSet,
-                                      view->encoded_, location.logical_size_);
+        auto before = DecodeOrderedCompactValue(collection_kind, view->encoded_,
+                                                location.logical_size_);
         if (!before.ok()) co_return before.status();
         const auto& directory = grouped->ordered_directory();
-        // Existing Redis Sorted Set callbacks still compute a complete logical
+        // Legacy collection callbacks still compute a complete logical
         // result. Route it against old page boundaries so a score moving across
         // the entire set does not rewrite the unaffected intervening pages.
         auto mutation =
             PlanSortedSetRewrite(directory, *before, std::move(*after));
         if (!mutation.ok()) co_return mutation.status();
         plan = std::move(*mutation);
+        if (value_type == ValueType::kStream)
+          plan.root_.stream_length_ = logical_size;
         if (!plan.changed_) {
           // Preserve explicit identical-value/metadata mutation semantics from
           // the callback. A single page suffices; EXPIRE/PERSIST themselves use
@@ -377,11 +467,12 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
         replication, nullptr, true, nullptr, mutation_precondition);
     co_return status;
   } catch (const std::bad_alloc&) {
-    if (value_type != ValueType::kSortedSet) throw;
+    if (value_type != ValueType::kSortedSet && value_type != ValueType::kStream)
+      throw;
     // Callback/planner allocations precede durable mutation. Group writers
     // own the fail-stop handling for any failure after root staging.
     co_return absl::ResourceExhaustedError(
-        "OOM Sorted Set full-image callback allocation");
+        "OOM collection full-image callback allocation");
   }
 }
 

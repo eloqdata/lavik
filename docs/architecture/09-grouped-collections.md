@@ -19,11 +19,12 @@ limitations under the License.
 ## Boundary and availability
 
 Grouped storage is a representation inside the storage engine, not a new
-Redis keyspace or a separate database. Hash, Set, List and Sorted Set support
+Redis keyspace or a separate database. Hash, Set, List, Sorted Set and Stream support
 compact values and complete, independently addressed group snapshots. Writes
 automatically promote compact collections at the encoded-size threshold; the
 grouped representation remains in use until the key is deleted or replaced.
-Streaming collection imports construct grouped graphs directly. Both ordinary
+Streaming collection imports and grouped key transfers construct graphs directly.
+Stream RDB and native receiving retain their full-image adapters. Both ordinary
 and Debug builds use the same read, mutation, recovery and maintenance adapters.
 
 Hash/Set use a persisted-seed prefix directory; List uses an ordered-page
@@ -31,6 +32,11 @@ directory. Newly built Sorted Sets combine ordered `(score, member)` pages
 with a prefix directory mapping each member to its score. Both directories
 belong to one object and share its physical index and transaction lifecycle.
 A prefix directory alone does not supply rank or score/member ordering.
+
+Streams use ordered binary record keys for messages, logical macro-node
+metadata, groups, consumers and individual pending entries. Their externally
+visible length is independent of the internal record count. See
+[Streams](12-streams.md) for their access and logical-format contracts.
 
 ## Identity and ownership
 
@@ -114,9 +120,9 @@ incarnation, group identity, field count, retirement state and a nested batch
 decision when present. Auxiliary records never enter the user-key winner merge
 or Redis key/expiry counts.
 
-The version-1 ordered-root payload has two checked shapes: 72 bytes describe
+The version-1 ordered-root payload has type-checked shapes: 72 bytes describe
 only the ordered graph; 136 bytes append the 64-byte Hash root for an indexed
-Sorted Set. A member-index presence flag must agree with the payload length,
+Sorted Set; an 80-byte Stream root appends its user-visible length. A member-index presence flag must agree with the payload length,
 so a truncated indexed root cannot decode as an ordered-only root.
 Ordered auxiliary identifiers have zero prefix bits and a nonzero opaque page
 number. Member auxiliaries use canonical Hash prefixes (including the unsplit

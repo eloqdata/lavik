@@ -37,7 +37,7 @@ The top-level key indexes are runtime authority. An optional clean-shutdown
 checkpoint serializes them as a one-shot recovery accelerator, but committed
 records remain the durable source of truth and recovery falls back to scanning
 them whenever a checkpoint is absent or invalid. Collections have compact
-complete-value encodings. Hash, Set, List and Sorted Set also have independently
+complete-value encodings. Hash, Set, List, Sorted Set and Stream also have independently
 addressable complete group snapshots, selected through a sparse object side index when the
 top-level index marks a grouped representation. Their serving, transaction,
 recovery and graph-lifecycle boundaries are described in
@@ -46,6 +46,8 @@ automatically at the compact-size threshold, while streaming imports construct
 grouped graphs directly. Hash/Set use prefix routing; List uses ordered pages.
 Newly built Sorted Sets combine ordered pages with a member-to-score prefix
 index under one atomic root; legacy ordered-only roots remain supported.
+[Streams](12-streams.md) use ordered logical records for messages, nodes,
+consumer groups and PEL state, with an independent user-visible message count.
 Explicit full-image callbacks retain aggregate
 materialization limits; grouped key transfers and collection snapshot streams
 instead consume admitted pages.
@@ -221,7 +223,9 @@ restart and RDB export/import. It does not reconstruct those boundaries from
 current settings or accept earlier development layouts without node counts.
 Lavik-owned storage schemas remain at v1 while unreleased; incompatible
 development media is recreated, not migrated. Redis RDB versions follow the
-external Redis format independently.
+external Redis format independently. Grouped Streams
+project their ordered records into the same logical format; the grouped root
+and page identities remain local durable metadata.
 
 The current version-1 format also includes checkpoint metadata and the
 system-state root and manifest. During pre-deployment development this layout

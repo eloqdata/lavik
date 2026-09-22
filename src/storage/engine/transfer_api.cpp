@@ -125,7 +125,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(std::uint8_t db_id,
                 source->key_, source->digest_, object, id.prefix_, true);
             if (!loaded.ok()) co_return loaded.status();
             const auto count = loaded->snapshot_.entries_.size();
-            if (page.value_type_ == ValueType::kList) {
+            if (page.value_type_ == ValueType::kList ||
+                page.value_type_ == ValueType::kStream) {
               page.elements_.reserve(count);
               for (auto& entry : loaded->snapshot_.entries_)
                 page.elements_.push_back(std::move(entry.value_));
@@ -165,7 +166,10 @@ StorageEngine::Impl::ReadValueForTransferLocked(std::uint8_t db_id,
           if (!source->Valid(*engine))
             co_return absl::CancelledError(
                 "collection transfer population changed");
-          const auto total = source->saved_.location_.logical_size_;
+          const auto total =
+              object->is_ordered()
+                  ? object->ordered_directory().root().item_count_
+                  : source->saved_.location_.logical_size_;
           if (source->emitted_ > total ||
               page.size() > total - source->emitted_ ||
               (page.done_ && page.size() != total - source->emitted_))

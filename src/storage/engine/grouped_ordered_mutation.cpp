@@ -60,11 +60,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, nullptr,
         true, nullptr, mutation_precondition);
   }
-  const auto field_count = plan.root_.item_count_;
-  const auto value_type = plan.root_.kind_ == OrderedCollectionKind::kList
-                              ? ValueType::kList
-                              : ValueType::kSortedSet;
-  if (field_count == 0 ||
+  const auto field_count = plan.root_.logical_size();
+  const auto value_type = OrderedValueType(plan.root_.kind_);
+  if ((field_count == 0 && value_type != ValueType::kStream) ||
       field_count > std::numeric_limits<std::uint32_t>::max() ||
       plan.writes_.empty() ||
       (previous && previous->version().root_.value_type() != value_type))

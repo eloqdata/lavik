@@ -96,7 +96,8 @@ bool ValidGroupLocation(const RecordLocation& location) {
          (location.value_type() == ValueType::kHash ||
           location.value_type() == ValueType::kSet ||
           location.value_type() == ValueType::kList ||
-          location.value_type() == ValueType::kSortedSet) &&
+          location.value_type() == ValueType::kSortedSet ||
+          location.value_type() == ValueType::kStream) &&
          !location.grouped() && location.expire_at_ms_ == 0 &&
          location.allocation_epoch() != 0 &&
          location.record_offset() >= kBlockHeaderBytes &&
@@ -162,14 +163,13 @@ absl::StatusOr<std::shared_ptr<const OrderedGroupDirectory>> OwnDirectory(
 absl::Status ValidateRoot(const GroupedObjectVersion& version,
                           const OrderedGroupDirectory& directory) {
   const auto& root = version.root_;
-  const auto type = directory.root().kind_ == OrderedCollectionKind::kList
-                        ? ValueType::kList
-                        : ValueType::kSortedSet;
+  const auto type = OrderedValueType(directory.root().kind_);
   if (!root.grouped() || root.kind() != RecordKind::kValue ||
       root.value_type() != type || root.mutation_sequence_ == 0 ||
       root.mutation_sequence_ < directory.command_sequence() ||
-      root.logical_size_ != directory.root().item_count_ ||
-      root.logical_size_ == 0 || root.allocation_epoch() == 0 ||
+      root.logical_size_ != directory.root().logical_size() ||
+      (root.logical_size_ == 0 && type != ValueType::kStream) ||
+      root.allocation_epoch() == 0 ||
       root.record_offset() < kBlockHeaderBytes ||
       root.record_offset() >= kStorageBlockBytes ||
       root.total_disk_bytes() == 0 ||

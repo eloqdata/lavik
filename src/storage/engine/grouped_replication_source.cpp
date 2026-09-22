@@ -18,6 +18,7 @@
 
 #include "impl.h"
 #include "lavik/storage/detail/collection_compact_stream.h"
+#include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
 
@@ -180,7 +181,8 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
           store, partition, stream->db_id_, stream->key_, stream->digest_,
           object, id.prefix_, true);
       if (!decoded.ok()) co_return decoded.status();
-      if (page.value_type_ == ValueType::kList) {
+      if (page.value_type_ == ValueType::kStream ||
+          page.value_type_ == ValueType::kList) {
         page.elements_.reserve(count);
         for (auto& item : decoded->snapshot_.entries_)
           page.elements_.push_back(std::move(item.value_));
@@ -217,7 +219,9 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
     if (!stream->Valid(*this))
       co_return absl::CancelledError(
           "full-sync population changed during page read");
-    const auto total = stream->saved_.location_.logical_size_;
+    const auto total = object->is_ordered()
+                           ? object->ordered_directory().root().item_count_
+                           : stream->saved_.location_.logical_size_;
     if (stream->emitted_count_ > total ||
         page.size() > total - stream->emitted_count_ ||
         (page.done_ && page.size() != total - stream->emitted_count_))
@@ -325,6 +329,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
                                 location.value_type() == ValueType::kSet
                             ? 32
                             : 8;
+  if (location.value_type() == ValueType::kStream) bytes = 0;
   while (!stream->pages_done_) {
     auto page = co_await NextFullSyncCollectionPage(stream);
     if (!page.ok()) co_return page.status();
@@ -336,7 +341,11 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
     bytes += *measured;
   }
   auto encoder = CollectionCompactEncoder::Create(
-      location.value_type(), location.logical_size_, bytes);
+      location.value_type(),
+      location.value_type() == ValueType::kStream
+          ? stream->saved_.grouped_->ordered_directory().root().item_count_
+          : location.logical_size_,
+      bytes);
   if (!encoder.ok()) co_return encoder.status();
   stream->encoder_.emplace(std::move(*encoder));
   stream->encoded_bytes_ = bytes;

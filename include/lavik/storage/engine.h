@@ -797,6 +797,9 @@ struct CompactValueView {
   std::string_view encoded_;
   std::uint64_t logical_size_ = 0;
   std::uint64_t expire_at_ms_ = 0;
+  // Partial Stream group views retain global length/first-ID for lag estimates.
+  std::optional<std::uint64_t> stream_length_ = std::nullopt;
+  std::optional<std::array<std::uint64_t, 2>> stream_first_id_ = std::nullopt;
 };
 
 struct CompactValueUpdate {
@@ -809,6 +812,46 @@ struct CompactValueUpdate {
   std::uint64_t logical_size_ = 0;
   // nullopt preserves the current deadline (or persistence for a new key).
   std::optional<std::uint64_t> expire_at_ms_;
+};
+
+// Inclusive/exclusive 128-bit ID bounds for a read-only Stream callback. The
+// callback sees matching entries in ascending order, even for reverse scans.
+struct StreamRangeAccess {
+  std::array<std::uint64_t, 2> first_{};
+  std::array<std::uint64_t, 2> last_{UINT64_MAX, UINT64_MAX};
+  std::uint64_t count_ = UINT64_MAX;
+  bool first_exclusive_ = false;
+  bool last_exclusive_ = false;
+  bool reverse_ = false;
+};
+
+// A writable callback may only remove the named pending IDs in this group.
+struct StreamAckAccess {
+  std::string group_;
+  std::vector<std::array<std::uint64_t, 2>> ids_{};
+};
+
+// A writable callback may update only this group's header, named consumers and
+// pending IDs. A new-message window additionally admits its delivered IDs;
+// entry payloads remain immutable. Global length/first-ID accompany the view.
+struct StreamGroupAccess {
+  std::string group_;
+  std::vector<std::string> consumers_{};
+  std::vector<std::array<std::uint64_t, 2>> pending_ids_{};
+  std::vector<std::array<std::uint64_t, 2>> entry_ids_{};
+  std::optional<std::uint64_t> read_new_count_ = std::nullopt;
+};
+
+// Select at most one access contract. Compact values still supply a complete
+// view; grouped Streams supply only the selected logical records. Append sees
+// metadata with empty entry/group arrays and must return exactly one new entry
+// without trimming or changing groups. Metadata-only callbacks cannot write.
+struct CompactAccessOptions {
+  std::optional<std::uint32_t> stream_append_node_max_entries_ = std::nullopt;
+  bool metadata_only_ = false;
+  std::optional<StreamRangeAccess> stream_range_ = std::nullopt;
+  std::optional<StreamAckAccess> stream_ack_ = std::nullopt;
+  std::optional<StreamGroupAccess> stream_group_ = std::nullopt;
 };
 
 using CompactValueCallback = std::function<absl::StatusOr<CompactValueUpdate>(
@@ -1431,7 +1474,8 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key, ValueType value_type,
       bool read_only, const CompactValueCallback& callback,
       std::uint64_t now_ms = 0, ReplicationCommandAppend* replication = nullptr,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      CompactAccessOptions access = {});
   bycorf::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
                                              std::string_view key);
   bycorf::Task<absl::StatusOr<bool>> UpdateExpiration(
@@ -1498,7 +1542,8 @@ class StorageEngine {
       ValueType value_type, bool read_only,
       const CompactValueCallback& callback, TxShardWrites* tx = nullptr,
       std::uint64_t now_ms = 0, ReplicationCommandAppend* replication = nullptr,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      CompactAccessOptions access = {});
   bycorf::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                                    std::string_view key,
                                                    const Digest& digest);

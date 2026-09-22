@@ -23,6 +23,8 @@
 #include <map>
 #include <utility>
 
+#include "lavik/storage/detail/stream_records.h"
+
 namespace lavik::storage {
 namespace {
 
@@ -48,10 +50,15 @@ std::uint64_t Load(std::string_view bytes, std::size_t offset, unsigned width) {
 
 bool ValidKind(OrderedCollectionKind kind) {
   return kind == OrderedCollectionKind::kList ||
-         kind == OrderedCollectionKind::kSortedSet;
+         kind == OrderedCollectionKind::kSortedSet ||
+         kind == OrderedCollectionKind::kStream;
 }
 
 bool ValidRoot(const OrderedCollectionRoot& root) {
+  if ((root.kind_ == OrderedCollectionKind::kStream) !=
+          root.stream_length_.has_value() ||
+      (root.stream_length_ && *root.stream_length_ > UINT32_MAX))
+    return false;
   if (root.member_index_ &&
       (root.kind_ != OrderedCollectionKind::kSortedSet ||
        root.member_index_->incarnation_ != root.incarnation_ ||
@@ -78,9 +85,19 @@ absl::Status ValidateEntries(OrderedCollectionKind kind,
   for (std::size_t i = 0; i < entries.size(); ++i) {
     const auto& entry = entries[i];
     if (entry.value_.size() > kMaxStringBytes || std::isnan(entry.score_) ||
-        (kind == OrderedCollectionKind::kList &&
+        (kind != OrderedCollectionKind::kSortedSet &&
          std::bit_cast<std::uint64_t>(entry.score_) != 0)) {
       return absl::InvalidArgumentError("invalid ordered page entry");
+    }
+    if (kind == OrderedCollectionKind::kStream) {
+      auto key = StreamRecordKey(entry.value_);
+      if (!key.ok()) return key.status();
+      if (i != 0) {
+        auto previous = StreamRecordKey(entries[i - 1].value_);
+        if (!previous.ok() || *previous >= *key)
+          return absl::InvalidArgumentError(
+              "Stream page repeats/unorders a record key");
+      }
     }
     if (kind == OrderedCollectionKind::kSortedSet &&
         (!members.insert(entry.value_).second ||
@@ -169,7 +186,7 @@ absl::StatusOr<std::string> EncodeOrderedCollectionRoot(
   Store(bytes, 12, static_cast<unsigned>(root.kind_), 1);
   // Both shapes are v1. An explicit presence flag, rather than length alone,
   // prevents a truncated indexed root from becoming a valid ordered-only root.
-  Store(bytes, 13, root.member_index_.has_value(), 1);
+  Store(bytes, 13, root.member_index_ ? 1 : root.stream_length_ ? 2 : 0, 1);
   Store(bytes, 16, root.incarnation_, 8);
   Store(bytes, 24, root.item_count_, 8);
   Store(bytes, 32, root.first_group_, 8);
@@ -182,15 +199,22 @@ absl::StatusOr<std::string> EncodeOrderedCollectionRoot(
     if (!members.ok()) return members.status();
     bytes.append(*members);
   }
+  if (root.stream_length_) {
+    bytes.resize(kGroupedStreamRootBytes);
+    Store(bytes, kRootBytes, *root.stream_length_, 8);
+  }
   return bytes;
 }
 
 absl::StatusOr<OrderedCollectionRoot> DecodeOrderedCollectionRoot(
     std::string_view bytes) {
   if ((bytes.size() != kRootBytes &&
-       bytes.size() != kIndexedSortedSetRootBytes) ||
+       bytes.size() != kIndexedSortedSetRootBytes &&
+       bytes.size() != kGroupedStreamRootBytes) ||
       !bytes.starts_with(kRootMagic) || Load(bytes, 8, 4) != 1 ||
-      Load(bytes, 13, 1) != (bytes.size() == kIndexedSortedSetRootBytes) ||
+      Load(bytes, 13, 1) != (bytes.size() == kIndexedSortedSetRootBytes ? 1
+                             : bytes.size() == kGroupedStreamRootBytes  ? 2
+                                                                        : 0) ||
       Load(bytes, 14, 2) != 0 || Load(bytes, 60, 4) != 0) {
     return absl::DataLossError("invalid ordered root encoding");
   }
@@ -208,6 +232,8 @@ absl::StatusOr<OrderedCollectionRoot> DecodeOrderedCollectionRoot(
     if (!members.ok()) return members.status();
     root.member_index_ = *members;
   }
+  if (bytes.size() == kGroupedStreamRootBytes)
+    root.stream_length_ = Load(bytes, kRootBytes, 8);
   if (!ValidRoot(root)) return absl::DataLossError("invalid ordered root");
   return root;
 }
@@ -376,7 +402,8 @@ absl::Status OrderedGroupMetadataDecoder::Read(std::string_view bytes) {
     const auto score_bits = Load(header, 4, 8);
     const auto score = std::bit_cast<double>(score_bits);
     if (length > kMaxStringBytes || std::isnan(score) ||
-        (metadata_.kind_ == OrderedCollectionKind::kList && score_bits != 0) ||
+        (metadata_.kind_ != OrderedCollectionKind::kSortedSet &&
+         score_bits != 0) ||
         (entries_ != 0 && score < metadata_.max_score_))
       return fail("invalid ordered metadata entry length/score");
     if (entries_ == 0) metadata_.min_score_ = score;
@@ -404,8 +431,17 @@ absl::Status ValidateOrderedGroupBoundary(const OrderedGroupSnapshot& left,
       right.entries_.empty()) {
     return absl::DataLossError("inconsistent ordered page neighbours");
   }
-  if (left.kind_ == OrderedCollectionKind::kSortedSet &&
-      !OrderedEntryLess(left.entries_.back(), right.entries_.front())) {
+  if (left.kind_ == OrderedCollectionKind::kStream) {
+    auto last = StreamRecordKey(left.entries_.back().value_);
+    auto first = StreamRecordKey(right.entries_.front().value_);
+    if (!last.ok()) return last.status();
+    if (!first.ok()) return first.status();
+    // Payload bytes must not make two records with the same routing key
+    // appear ordered across a page boundary.
+    if (*last >= *first)
+      return absl::DataLossError("Stream pages overlap or are unordered");
+  } else if (left.kind_ != OrderedCollectionKind::kList &&
+             !OrderedEntryLess(left.entries_.back(), right.entries_.front())) {
     return absl::DataLossError("Sorted Set pages overlap or are unordered");
   }
   return absl::OkStatus();
@@ -740,7 +776,7 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
   }
   valid = ValidateEntries(root.kind_, replacement.entries_);
   if (!valid.ok()) return valid;
-  if (root.kind_ == OrderedCollectionKind::kSortedSet &&
+  if (root.kind_ != OrderedCollectionKind::kList &&
       !replacement.entries_.empty()) {
     if (begin != 0 &&
         !OrderedEntryLess(loaded.at(groups[begin - 1].id_).entries_.back(),

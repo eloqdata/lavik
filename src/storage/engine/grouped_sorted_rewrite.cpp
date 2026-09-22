@@ -54,7 +54,8 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanSortedSetRewrite(
     std::span<const OrderedCollectionEntry> before,
     std::vector<OrderedCollectionEntry> after, std::size_t target_bytes) {
   const auto& root = directory.root();
-  if (root.kind_ != OrderedCollectionKind::kSortedSet ||
+  if ((root.kind_ != OrderedCollectionKind::kSortedSet &&
+       root.kind_ != OrderedCollectionKind::kStream) ||
       before.size() != root.item_count_ || before.empty() ||
       after.size() > std::numeric_limits<std::uint32_t>::max()) {
     return absl::InvalidArgumentError(

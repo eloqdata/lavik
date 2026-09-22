@@ -20,6 +20,8 @@
 #include <cmath>
 #include <limits>
 
+#include "lavik/storage/detail/stream_records.h"
+
 namespace lavik::storage {
 namespace {
 
@@ -64,6 +66,8 @@ absl::StatusOr<std::size_t> AppendOrderedEntrySize(OrderedCollectionKind kind,
 absl::StatusOr<std::string> EncodeOrderedCompactValue(
     OrderedCollectionKind kind,
     std::span<const OrderedCollectionEntry> entries) {
+  if (kind == OrderedCollectionKind::kStream)
+    return EncodeStreamRecords(entries);
   if (!ValidKind(kind) || entries.empty() ||
       entries.size() > std::numeric_limits<std::uint32_t>::max()) {
     return absl::InvalidArgumentError("invalid ordered full-image kind/count");
@@ -96,6 +100,8 @@ absl::StatusOr<std::string> EncodeOrderedCompactValue(
 absl::StatusOr<std::vector<OrderedCollectionEntry>> DecodeOrderedCompactValue(
     OrderedCollectionKind kind, std::string_view encoded,
     std::uint64_t expected_count) {
+  if (kind == OrderedCollectionKind::kStream)
+    return DecodeStreamRecords(encoded, expected_count);
   if (!ValidKind(kind) || expected_count == 0 ||
       expected_count > std::numeric_limits<std::uint32_t>::max() ||
       encoded.size() < 8) {
