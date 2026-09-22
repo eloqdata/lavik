@@ -252,10 +252,15 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     // this is not an exemption for grouped or external full-image callbacks.
     // Growth still passes command/write admission, and multiplicative replies
     // (such as repeated ZRANDMEMBER output) have their own frontend admission.
+    // Stream's 1 MiB promotion threshold is not a scratch exemption: only
+    // the same small inline envelope qualifies. Its byte bound also caps
+    // consumer/PEL metadata, which is absent from the message cardinality.
     // No String operation acquires this collection-only budget.
     const bool bounded_inline =
-        value_type == ValueType::kSortedSet && exists && !grouped &&
-        !location.external() && !location.key_external() &&
+        (value_type == ValueType::kSortedSet ||
+         value_type == ValueType::kStream) &&
+        exists && !grouped && !location.external() &&
+        !location.key_external() &&
         location.total_disk_bytes() < kGroupedHashPromotionBytes &&
         location.logical_size_ <= 1024;
     if ((value_type == ValueType::kSortedSet ||
