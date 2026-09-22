@@ -136,18 +136,20 @@ racing closure is either rejected or remains visible to the drain.
    standalone replica-MOVED shim: a population source transfers data but never
    supplies client-routing authority. The cluster gate also runs at `MULTI`
    queue time so a rejected command aborts the queued transaction. Managed
-   Single uses the same Group authority without redirects. Writes and Single
-   multi-shard reads retain their admission snapshot and key slots for execution
-   checks; synchronous reads borrow the worker's snapshot.
+   Single uses the same Group authority without redirects. Only writes retain
+   their admission snapshot and key slots for execution checks; all reads,
+   including Single multi-shard reads, borrow the worker's snapshot without
+   retaining it.
 5. `ExecuteCommand` and `ExecuteAdmittedCommand` reserve replication publisher
    capacity for source writes before database/key work. Eligible single-key
    writes are moved directly to their owner so admission and mutation share the
    owner-local fast path.
 6. `ExecuteCommandBody` enforces replica write policy and memory admission,
    manages database and replication gates, then calls the relevant local,
-   storage, transaction, blocking, RDB, or administrative handler. Single reads
-   recheck Group authority after DB admission and after a worker hop. In either
-   managed mode, admitted writes re-check their authority against the current
+   storage, transaction, blocking, RDB, or administrative handler. Admitted
+   reads in either managed mode never recheck authority; after DB admission
+   and worker hops they revalidate only the serving-generation population
+   fence. Admitted writes re-check their authority against the current
    `ServingState` after these outer admissions and before the handler runs;
    transactional writes also re-check per shard through a validator hook on
    `tx::Transaction`. Because a handler can still suspend on key/store locks,
@@ -204,15 +206,21 @@ in-memory, remote-owner, or stale-location cases use the complete single-key
 fallback path.
 
 Top-level blocking List and Sorted Set writes and `XREADGROUP` release database
-admission while waiting and reacquire it for each concrete attempt. In cluster
-mode they also re-admit and register a fresh authority in-flight guard for that
-attempt, then release the guard before waiter registration or sleep. Immediate
-EXEC and Lua forms do not wait and stay within their enclosing authority
-window. Read-only `XREAD` and keyless `WAIT` register no mutation guard. The
-waiter registry and readiness events are implemented in the Redis subsystem,
-while storage remains the source of truth checked after wakeup. This
-attempt-scoped ownership lets fencing drain promptly even when a client waits
-without a timeout.
+admission while waiting and reacquire it for each concrete attempt. In
+Meta-managed mode they also re-validate authority on every attempt: the
+admission proof the request carries is re-registered against the current
+publication fingerprints — a few atomic loads when nothing changed — and a
+fresh proof is captured only after a publication invalidated it. The in-flight
+guard is released before waiter registration or sleep. A waiter woken after a
+fence or role change fails this re-admission terminally, so a fenced old owner
+never consumes elements; dormant waiters are not actively answered on
+authority-only changes, and client-facing connection invalidation after
+authority loss is handled separately. Immediate EXEC and Lua forms do not wait
+and stay within their enclosing authority window. Read-only `XREAD` and keyless
+`WAIT` register no mutation guard. The waiter registry and readiness events are
+implemented in the Redis subsystem, while storage remains the source of truth
+checked after wakeup. This attempt-scoped ownership lets fencing drain
+promptly even when a client waits without a timeout.
 
 External data commands capture the replication manager's packed
 serving-generation/open token at dispatch and revalidate it after obtaining

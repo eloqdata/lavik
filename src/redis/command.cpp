@@ -894,52 +894,6 @@ std::string_view UnscopedClusterMutation(const CommandRequest& request) {
   }
 }
 
-// Maps a non-serving admission decision to its wire reply.
-// Returns true when the decision produced a terminal reply; false when it
-// admits local execution. kCloseConnection yields an empty reply with the
-// close flag: the outcome is undeterminable, so nothing is written.
-bool EmitClusterDecision(const cluster::Decision& decision, bool connection_tls,
-                         ReplyBuilder& reply_builder, CommandReply* reply) {
-  switch (decision.kind_) {
-    case cluster::Decision::Kind::kServe:
-    case cluster::Decision::Kind::kServeStaleRead:
-      return false;
-    case cluster::Decision::Kind::kReadOnly:
-      reply->encoded_ = reply_builder.AppendError(
-          "READONLY You can't write against a read only replica.");
-      return true;
-    case cluster::Decision::Kind::kMoved:
-      reply->encoded_ = AppendMovedError(
-          reply_builder, decision.moved_slot_, decision.moved_host_,
-          ClusterDecisionClientPort(decision, connection_tls));
-      return true;
-    case cluster::Decision::Kind::kCrossSlot:
-      reply->encoded_ = AppendCrossSlotError(reply_builder);
-      return true;
-    case cluster::Decision::Kind::kClusterDownUnbound:
-      reply->encoded_ = cluster::GetClientMode() == ClientMode::kSingle
-                            ? reply_builder.AppendError(
-                                  "MASTERDOWN No available primary authority")
-                            : AppendClusterDownUnboundError(reply_builder);
-      return true;
-    case cluster::Decision::Kind::kLoading:
-      // Cluster readiness comes from the published ServingState, not from an
-      // upstream sync, so use Redis's plain loading text rather than the
-      // replication-shaped message of the standalone gate.
-      reply->encoded_ = reply_builder.AppendError(
-          "LOADING Redis is loading the dataset in memory");
-      return true;
-    case cluster::Decision::Kind::kTryAgain:
-      reply->encoded_ =
-          reply_builder.AppendError("TRYAGAIN Failover in progress");
-      return true;
-    case cluster::Decision::Kind::kCloseConnection:
-      reply->close_connection_ = true;
-      return true;
-  }
-  return false;  // unreachable: every Kind is handled above
-}
-
 // Runs the cluster admission gate for one dispatched command. Returns true
 // when the request was answered terminally; otherwise a write carries the
 // guard-issued admission proof used by every owner-side re-check.
@@ -957,10 +911,7 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
                           request.kind_ != CommandKind::kPublish,
       .client_mode_ = cluster::GetClientMode(),
   };
-  const bool retain_proof =
-      is_write || (cluster::GetClientMode() == ClientMode::kSingle &&
-                   request.spec_ != nullptr &&
-                   (request.spec_->flags_ & kCmdMultiShard) != 0);
+  const bool retain_proof = is_write;
   if (!retain_proof) {
     const auto decision = runtime->authority_guard_.DecideNow(view);
     return EmitClusterDecision(decision, request.connection_tls_, reply_builder,
@@ -970,10 +921,10 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
       runtime->authority_guard_.CaptureAndAdmit(view, cluster::LeaseClockNow());
   if (!EmitClusterDecision(admission.decision(), request.connection_tls_,
                            reply_builder, reply)) {
-    // Writes and Single multi-shard reads retain a proof across worker hops
-    // and storage checks. Ordinary Single reads take a fresh synchronous
-    // admission after waits, without allocating a shared proof. The local
-    // admission owns any borrowed MOVED host until its reply is encoded.
+    // Writes retain a proof across worker hops and storage checks. Reads are
+    // admitted once at this gate and afterwards revalidate only the serving
+    // generation population fence, never authority. The local admission owns
+    // any borrowed MOVED host until its reply is encoded.
     request.cluster_authority_admission_ =
         std::make_shared<const cluster::AuthorityAdmission>(
             std::move(admission));
@@ -985,9 +936,10 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
 // Owner-side authority re-check for non-transactional writes, called from
 // ExecuteCommandBody after every
 // suspending admission (publisher admission, DB gate, snapshot/order gates)
-// and before the handler runs. Single reads use CommandServingGenerationError
-// for their separate population/authority check. Returns the redirect/error
-// reply when authority changed; std::nullopt when the write may proceed.
+// and before the handler runs. Reads skip this entirely: admitted once at
+// dispatch, they revalidate only the serving generation population fence via
+// CommandServingGenerationError. Returns the redirect/error reply when
+// authority changed; std::nullopt when the write may proceed.
 std::optional<CommandReply> RecheckClusterWriteAuthority(
     const CommandRequest& request, ReplyBuilder& reply_builder,
     cluster::AuthorityInFlightGuards* in_flights) {
@@ -4251,10 +4203,11 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
                                          ReadLatencyTrace* read_trace = nullptr,
                                          SetLatencyTrace* set_trace = nullptr,
                                          bool recheck_after_dispatch = false) {
-  // ExecuteCommandBody checks reads after acquiring the DB gate. Local reads
-  // reach this entry without another wait; only a dispatched read needs to
-  // repeat the check for changes while its worker hop was queued. The DB gate
-  // continues to pin the population across storage I/O in either case.
+  // ExecuteCommandBody revalidates the population fence after acquiring the
+  // DB gate. Local reads reach this entry without another wait; only a
+  // dispatched read needs to repeat that fence for changes while its worker
+  // hop was queued. The DB gate continues to pin the population across
+  // storage I/O in either case.
   if (recheck_after_dispatch && !ClusterRequestIsWrite(request)) {
     if (const char* error = CommandServingGenerationError(request);
         error != nullptr) {
@@ -11716,8 +11669,49 @@ Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
 //
 // These are lavik-scope (not file-local) because the per-type multi-key
 // executors (set/zset/list/sort/string) inject the same validator into their
-// own transactions. EmitClusterDecision stays file-local above; the functions
-// below call it across the namespace boundary within this translation unit.
+// own transactions, and the blocking wait loop shares EmitClusterDecision.
+
+bool EmitClusterDecision(const cluster::Decision& decision, bool connection_tls,
+                         ReplyBuilder& reply_builder, CommandReply* reply) {
+  switch (decision.kind_) {
+    case cluster::Decision::Kind::kServe:
+    case cluster::Decision::Kind::kServeStaleRead:
+      return false;
+    case cluster::Decision::Kind::kReadOnly:
+      reply->encoded_ = reply_builder.AppendError(
+          "READONLY You can't write against a read only replica.");
+      return true;
+    case cluster::Decision::Kind::kMoved:
+      reply->encoded_ = AppendMovedError(
+          reply_builder, decision.moved_slot_, decision.moved_host_,
+          ClusterDecisionClientPort(decision, connection_tls));
+      return true;
+    case cluster::Decision::Kind::kCrossSlot:
+      reply->encoded_ = AppendCrossSlotError(reply_builder);
+      return true;
+    case cluster::Decision::Kind::kClusterDownUnbound:
+      reply->encoded_ = cluster::GetClientMode() == ClientMode::kSingle
+                            ? reply_builder.AppendError(
+                                  "MASTERDOWN No available primary authority")
+                            : AppendClusterDownUnboundError(reply_builder);
+      return true;
+    case cluster::Decision::Kind::kLoading:
+      // Cluster readiness comes from the published ServingState, not from an
+      // upstream sync, so use Redis's plain loading text rather than the
+      // replication-shaped message of the standalone gate.
+      reply->encoded_ = reply_builder.AppendError(
+          "LOADING Redis is loading the dataset in memory");
+      return true;
+    case cluster::Decision::Kind::kTryAgain:
+      reply->encoded_ =
+          reply_builder.AppendError("TRYAGAIN Failover in progress");
+      return true;
+    case cluster::Decision::Kind::kCloseConnection:
+      reply->close_connection_ = true;
+      return true;
+  }
+  return false;  // unreachable: every Kind is handled above
+}
 
 absl::Status ClusterAuthorityChangedStatus() {
   return absl::FailedPreconditionError("cluster authority changed");
@@ -11863,26 +11857,9 @@ const char* CommandServingGenerationError(
       g_replication == nullptr) {
     return nullptr;
   }
-  if (cluster::MetaManaged() &&
-      cluster::GetClientMode() == ClientMode::kSingle &&
-      !ClusterRequestIsWrite(request)) {
-    const cluster::RequestView view{.slots_ = request.ClusterSlots(),
-                                    .is_write_ = false,
-                                    .connection_readonly_ = true,
-                                    .loading_allowed_ = false,
-                                    .client_mode_ = ClientMode::kSingle};
-    const auto decision =
-        cluster::GetClusterRuntime()->authority_guard_.DecideNow(view);
-    switch (decision.kind_) {
-      case cluster::Decision::Kind::kServe:
-      case cluster::Decision::Kind::kServeStaleRead:
-        break;
-      case cluster::Decision::Kind::kLoading:
-        return "LOADING Redis is loading the dataset in memory";
-      default:
-        return "MASTERDOWN No available primary authority";
-    }
-  }
+  // Reads are admitted for authority exactly once, at dispatch; every managed
+  // client mode shares that contract. Only the population fence is revalidated
+  // here: a queued or blocked request must never observe a replaced dataset.
   const auto read_state = g_replication->dataset_read_state();
   if (read_state == ReplicationManager::DatasetReadState::kLoading) {
     return "LOADING Lavik is loading the dataset from the primary";
@@ -11949,25 +11926,25 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
     if (!request.replication_origin_ &&
         cluster::GetClientMode() == ClientMode::kSingle) {
       // Scope follows command execution shapes, not individual data types.
-      // Later tickets can remove a boundary only after wiring its waits,
-      // participants and durable/catalog effects into Group authority.
+      // Cross-slot multi-key commands and the List/Sorted Set blocking family
+      // share the standalone execution engine and the sole Group's admission,
+      // waiters and drain, so they serve directly. Still deferred: execution
+      // contexts that mutate outside one command's key view (transactions,
+      // scripts, global and catalog operations), stream blocking and keyless
+      // WAIT. Later tickets can remove a boundary only after wiring its
+      // waits, participants and durable/catalog effects into Group authority.
       const auto flags = request.spec_ == nullptr ? 0u : request.spec_->flags_;
       const bool keyless_data =
           (flags & kCmdUsesDbGate) != 0 && (flags & kCmdNoKeys) != 0;
-      bool multiple_keys = false;
-      if ((flags & kCmdMultiShard) != 0 && request.spec_ != nullptr) {
-        const auto keys = DetermineKeys(*request.spec_, request.args_);
-        multiple_keys = !keys.ok() || keys->count() != 1;
-      }
       const bool deferred =
           kind == CommandKind::kMulti || kind == CommandKind::kExec ||
           kind == CommandKind::kWatch || kind == CommandKind::kUnwatch ||
           kind == CommandKind::kDiscard || kind == CommandKind::kScript ||
           kind == CommandKind::kFunction || kind == CommandKind::kSortRo ||
           kind == CommandKind::kKeys || kind == CommandKind::kSave ||
-          kind == CommandKind::kBgSave ||
-          (flags & (kCmdMovableKeys | kCmdMayBlock | kCmdDynamicWrite)) != 0 ||
-          multiple_keys || keyless_data;
+          kind == CommandKind::kBgSave || kind == CommandKind::kXRead ||
+          kind == CommandKind::kXReadGroup || kind == CommandKind::kWait ||
+          (flags & kCmdDynamicWrite) != 0 || keyless_data;
       if (deferred && !script_kill && !function_kill && !function_stats) {
         if (ctx.in_multi_) ctx.multi_dirty_ = true;
         co_return BuiltReply(reply_builder.AppendError(

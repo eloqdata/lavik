@@ -39,6 +39,7 @@
 #include "absl/status/statusor.h"
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/worker.h"
+#include "cluster_gate.h"
 #include "lavik/cluster/authority.h"
 #include "lavik/cluster/runtime.h"
 #include "lavik/metrics.h"
@@ -532,6 +533,12 @@ unsigned ShardForKey(std::string_view key) {
 // can publish between that decision and the storage attempt. Registration on
 // the admitted snapshot closes that race and gives NodeControl a drain token
 // only for the concrete attempt, never for the following dormant wait.
+//
+// A contended wait can iterate many attempts, so each attempt first
+// re-registers the admission the request already carries: when nothing has
+// published, the fingerprint comparison inside RegisterAndRecheck costs a few
+// atomic loads and no allocation. Only a genuine authority change pays for a
+// fresh capture, which then becomes the proof later attempts reuse.
 std::optional<CommandReply> RegisterClusterBlockingWriteAttemptImpl(
     const CommandRequest& request, ReplyBuilder& reply_builder,
     cluster::AuthorityInFlightGuards* guards) {
@@ -542,6 +549,18 @@ std::optional<CommandReply> RegisterClusterBlockingWriteAttemptImpl(
     return std::nullopt;
   }
   cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
+  if (request.cluster_authority_admission_ != nullptr) {
+    const auto& admission = request.cluster_authority_admission_;
+    // The previous attempt's storage work has fully settled before the loop
+    // iterates, so the per-attempt markers are safe to clear for reuse.
+    admission->ResetMutationMarkers();
+    if (runtime->authority_guard_.RegisterAndRecheck(
+            *admission, bycorf::ThisWorker().id_, cluster::LeaseClockNow(),
+            guards) == cluster::RecheckResult::kOk) {
+      return std::nullopt;
+    }
+    guards->clear();
+  }
   const cluster::RequestView view{
       .slots_ = slots,
       .is_write_ = true,
@@ -570,44 +589,18 @@ std::optional<CommandReply> RegisterClusterBlockingWriteAttemptImpl(
     }
 
     CommandReply reply;
-    switch (decision.kind_) {
-      case cluster::Decision::Kind::kReadOnly:
-        reply.encoded_ = reply_builder.AppendError(
-            "READONLY You can't write against a read only replica.");
-        break;
-      case cluster::Decision::Kind::kMoved: {
-        const std::uint16_t port =
-            request.connection_tls_ && decision.moved_tls_port_ != 0
-                ? decision.moved_tls_port_
-                : decision.moved_port_;
-        reply.encoded_ = reply_builder.AppendError(ClusterMovedMessage(
-            decision.moved_slot_, decision.moved_host_, port));
-        break;
-      }
-      case cluster::Decision::Kind::kCrossSlot:
-        reply.encoded_ = reply_builder.AppendError(kClusterCrossSlotMessage);
-        break;
-      case cluster::Decision::Kind::kClusterDownUnbound:
-        reply.encoded_ = reply_builder.AppendError(kClusterDownUnboundMessage);
-        break;
-      case cluster::Decision::Kind::kLoading:
-        reply.encoded_ = reply_builder.AppendError(
-            "LOADING Redis is loading the dataset in memory");
-        break;
-      case cluster::Decision::Kind::kTryAgain:
-        reply.encoded_ =
-            reply_builder.AppendError("TRYAGAIN Failover in progress");
-        break;
-      case cluster::Decision::Kind::kCloseConnection:
-      case cluster::Decision::Kind::kServeStaleRead:
-        // A write view cannot legitimately receive stale-read authority. Keep
-        // that impossible state fail-closed alongside an explicit close.
-        reply.close_connection_ = true;
-        break;
-      case cluster::Decision::Kind::kServe:
-        std::terminate();
+    if (decision.kind_ == cluster::Decision::Kind::kServeStaleRead) {
+      // A write view cannot legitimately receive stale-read authority. Keep
+      // that impossible state fail-closed alongside an explicit close.
+      reply.close_connection_ = true;
+      return reply;
     }
-    return reply;
+    if (EmitClusterDecision(decision, request.connection_tls_, reply_builder,
+                            &reply)) {
+      return reply;
+    }
+    std::terminate();  // unreachable: kServe returns above and every other
+                       // write-view decision is terminal in EmitClusterDecision
   }
 }
 

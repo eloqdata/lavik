@@ -68,13 +68,31 @@ def basic_and_stale(root):
                 ("PUBLISH", "channel", "x"),
             ):
                 rejects(reader, command, "READONLY")
+            # Cross-slot multi-key commands serve through the sole Group and
+            # replicate; Cluster CROSSSLOT does not apply to Single. The keys
+            # provably span both source workers, so the fan-out and per-shard
+            # re-validation are actually exercised.
+            assert len({C.redis_slot(k) % 2 for k in
+                        ("mk-a", "mk-b", "{other}mk")}) == 2
+            assert writer.call("MSET", "mk-a", "v1", "mk-b", "v2",
+                                     "{other}mk", "v3") == "OK"
+            assert writer.call("MGET", "mk-a", "mk-b", "{other}mk") == \
+                ["v1", "v2", "v3"]
+            H.wait_until("Single cross-slot MSET replicated", 20, lambda:
+                         reader.call("MGET", "mk-a", "mk-b", "{other}mk") ==
+                         ["v1", "v2", "v3"])
+            assert writer.call("DEL", "mk-a", "mk-b") == 2
+            assert writer.call("RENAME", "{other}mk", "mk-renamed") == "OK"
+            assert writer.call("MGET", "mk-a", "mk-renamed") == [None, "v3"]
+            assert writer.call("BLPOP", "mk-empty", 1) == []
             for client in (writer, reader):
                 for command in (
-                    ("MGET", "first-slot", "another-slot"),
                     ("MULTI",),
                     ("SELECT", 1),
                     ("DBSIZE",),
                     ("EVAL", "return 1", 0),
+                    ("XREAD", "COUNT", 1, "STREAMS", "mk-s", "0"),
+                    ("WAIT", 1, 0),
                 ):
                     rejects(client, command, "not yet supported")
                 rejects(client, ("REPLICAOF", "NO", "ONE"), "not allowed")

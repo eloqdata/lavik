@@ -1072,6 +1072,16 @@ if (BUILD_TESTING)
       set_tests_properties(meta_integration.gate_managed_single PROPERTIES
         LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
 
+      add_test(
+        NAME meta_integration.gate_managed_single_blocking
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_managed_single_blocking.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+      )
+      set_tests_properties(meta_integration.gate_managed_single_blocking PROPERTIES
+        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+
       # lavik-meta's deterministic failover seams follow the ordinary
       # !NDEBUG policy; LAVIK_ENABLE_TEST_FAULTS instruments only Data.
       # Do not register a Release gate that can only fail its required-hook
