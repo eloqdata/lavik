@@ -21,8 +21,10 @@ limitations under the License.
 Grouped storage is a representation inside the storage engine, not a new
 Redis keyspace or a separate database. Hash, Set, List, Sorted Set and Stream support
 compact values and complete, independently addressed group snapshots. Writes
-automatically promote compact collections at the encoded-size threshold; the
-grouped representation remains in use until the key is deleted or replaced.
+automatically promote compact collections at 16 KiB of encoded size, with an
+8 KiB target per group shared by all five types. Indivisible entries and Hash
+collisions can exceed that target. The grouped representation remains in use
+until the key is deleted or replaced.
 Streaming collection imports and grouped key transfers construct graphs directly.
 Stream RDB and native receiving also ingest logical records page by page. Both
 ordinary and Debug builds use the same read, mutation, recovery and maintenance adapters.

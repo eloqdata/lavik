@@ -27,14 +27,11 @@
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
+#include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped_hash.h"
 #include "lavik/storage/format.h"
 
 namespace lavik::storage {
-
-// A Stream append adds only one entry. Keep small logs compact to amortize the
-// grouped transaction/publication cost; large logs need bounded page updates.
-inline constexpr std::size_t kGroupedStreamPromotionBytes = 1024 * 1024;
 
 // Sets use Hash prefix routing. Ordered pages hold List ranks, Sorted Set
 // (score, member) order, or the binary logical record keys of a Stream.
@@ -107,7 +104,6 @@ inline constexpr std::size_t kGroupedStreamRootBytes =
     kOrderedCollectionRootBytes + 8;
 inline constexpr std::size_t kIndexedSortedSetRootBytes =
     kOrderedCollectionRootBytes + kGroupedHashRootBytes;
-inline constexpr std::size_t kOrderedGroupTargetBytes = 8192;
 
 struct OrderedGroupMetadata {
   OrderedCollectionKind kind_ = OrderedCollectionKind::kList;
@@ -312,7 +308,7 @@ struct OrderedGroupSplit {
 // neighbour's previous link if this returns more than one page.
 absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(
     OrderedGroupSnapshot group, std::uint64_t next_group_id,
-    std::size_t target_bytes = kOrderedGroupTargetBytes);
+    std::size_t target_bytes = kCollectionGroupTargetBytes);
 
 struct LoadedOrderedGroup {
   std::uint64_t sequence_ = 0;
@@ -346,6 +342,6 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
     const OrderedGroupDirectory& directory,
     std::vector<LoadedOrderedGroup> loaded_groups, std::uint64_t rank,
     std::uint64_t erase_count, std::vector<OrderedCollectionEntry> entries,
-    std::size_t target_bytes = kOrderedGroupTargetBytes);
+    std::size_t target_bytes = kCollectionGroupTargetBytes);
 
 }  // namespace lavik::storage

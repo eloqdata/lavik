@@ -252,17 +252,16 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     // this is not an exemption for grouped or external full-image callbacks.
     // Growth still passes command/write admission, and multiplicative replies
     // (such as repeated ZRANDMEMBER output) have their own frontend admission.
-    // Stream's 1 MiB promotion threshold is not a scratch exemption: only
-    // the same small inline envelope qualifies. Its byte bound also caps
-    // consumer/PEL metadata, which is absent from the message cardinality.
+    // The workspace byte bound also caps Stream consumer/PEL metadata,
+    // which is absent from the message cardinality.
     // No String operation acquires this collection-only budget.
     const bool bounded_inline =
         (value_type == ValueType::kSortedSet ||
          value_type == ValueType::kStream) &&
         exists && !grouped && !location.external() &&
         !location.key_external() &&
-        location.total_disk_bytes() < kGroupedHashPromotionBytes &&
-        location.logical_size_ <= 1024;
+        location.total_disk_bytes() < kCompactWorkspaceInputBytes &&
+        location.logical_size_ <= kCompactWorkspaceInputEntries;
     if ((value_type == ValueType::kSortedSet ||
          value_type == ValueType::kStream) &&
         exists && !bounded_inline) {
@@ -337,7 +336,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     std::optional<OrderedCollectionMutationPlan> created_groups;
     SortedSetMemberMutation created_members;
     if (unlocked_create && update->changed_ && !update->erase_ &&
-        update->encoded_.size() >= kGroupedHashPromotionBytes) {
+        update->encoded_.size() >= kCollectionPromotionBytes) {
       GroupedScratchBudget budget;
       auto added = budget.AddBytes(update->encoded_.size());
       if (!added.ok()) co_return added;
@@ -422,10 +421,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
                                          : std::string_view(update->encoded_);
     const std::uint64_t logical_size =
         update->reuse_encoded_ ? location.logical_size_ : update->logical_size_;
-    const bool promote_ordered =
-        encoded.size() >= (value_type == ValueType::kStream
-                               ? kGroupedStreamPromotionBytes
-                               : kGroupedHashPromotionBytes);
+    const bool promote_ordered = encoded.size() >= kCollectionPromotionBytes;
     const auto collection_kind = value_type == ValueType::kStream
                                      ? OrderedCollectionKind::kStream
                                      : OrderedCollectionKind::kSortedSet;

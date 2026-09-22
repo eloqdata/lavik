@@ -194,7 +194,7 @@ bool NeedsGroupedList(std::span<const std::string> elements) {
   std::size_t bytes = kListHeaderBytes;
   for (const auto& element : elements) {
     bytes += sizeof(std::uint32_t) + element.size();
-    if (bytes >= kGroupedHashPromotionBytes) return true;
+    if (bytes >= kCollectionPromotionBytes) return true;
   }
   return false;
 }

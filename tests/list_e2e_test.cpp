@@ -3677,11 +3677,10 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
                     .Command({"XREADGROUP", "GROUP", "g", "c", "COUNT", "1",
                               "STREAMS", "x", ">"})
                     .starts_with("*1\r\n"));
-    // This Stream stays compact but exceeds the bounded inline workspace.
-    // Shrinking it must still admit its full decode, even when it would erase
-    // every message; DEL remains available without materializing the value.
+    // This compact encoding is just below promotion, but the physical
+    // record (including its key/header) exceeds the inline workspace bound.
     EXPECT_EQ(client.Command({"XADD", "large-inline-stream", "1-0", "f",
-                              std::string(32 * 1024, 'v')}),
+                              std::string(16 * 1024 - 90, 'v')}),
               Bulk("1-0"));
     // Keep enough keys in one partition to require direct-bucket growth when
     // the index is rebuilt by the low-memory restart below.

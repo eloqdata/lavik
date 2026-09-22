@@ -28,11 +28,10 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "lavik/storage/collection_page.h"
+#include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
-
-inline constexpr std::size_t kCollectionStreamPageBytes = 8 * 1024;
 
 // Streams the existing compact wire image, not the durable grouped layout.
 // Aggregate lengths are uint64_t, while the unchanged wire count is uint32_t.

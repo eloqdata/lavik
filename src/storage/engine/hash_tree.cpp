@@ -76,7 +76,7 @@ bool NeedsGroupedHash(const HashValue& value) {
   std::uint64_t bytes = kHashValueHeaderBytes;
   for (const auto& entry : value.entries_) {
     bytes += 8 + entry.field_.size() + entry.value_.size();
-    if (bytes >= kGroupedHashPromotionBytes) return true;
+    if (bytes >= kCollectionPromotionBytes) return true;
   }
   return false;
 }

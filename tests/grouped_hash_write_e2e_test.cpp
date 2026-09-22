@@ -272,7 +272,7 @@ TEST(HashReplaceE2e, DifferentRequestSizesPreserveLastDuplicateAfterRecovery) {
 TEST(HashReplaceE2e, PromotionUsesFinalDeduplicatedBytes) {
   PrivateDisk disk;
   constexpr std::size_t boundary =
-      kGroupedHashPromotionBytes - kHashValueHeaderBytes - 9;
+      kCollectionPromotionBytes - kHashValueHeaderBytes - 9;
   {
     Server server(disk);
     Client client(server.port());

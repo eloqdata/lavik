@@ -30,6 +30,6 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanSortedSetRewrite(
     const OrderedGroupDirectory& directory,
     std::span<const OrderedCollectionEntry> before,
     std::vector<OrderedCollectionEntry> after,
-    std::size_t target_bytes = kOrderedGroupTargetBytes);
+    std::size_t target_bytes = kCollectionGroupTargetBytes);
 
 }  // namespace lavik::storage

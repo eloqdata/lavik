@@ -2388,7 +2388,7 @@ class StorageEngine::Impl {
     return tx == nullptr && entry != nullptr && entry->key_complete() &&
            location.kind() == RecordKind::kValue && !location.grouped() &&
            !location.external() && !location.key_external() &&
-           location.total_disk_bytes() < kGroupedHashPromotionBytes &&
+           location.total_disk_bytes() < kCompactWorkspaceInputBytes &&
            !partition.replica_sync_ &&
            !replica_loading_.load(std::memory_order_acquire);
   }

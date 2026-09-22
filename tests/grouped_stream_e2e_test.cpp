@@ -15,6 +15,7 @@
  */
 
 #include "grouped_write_e2e_support.h"
+#include "lavik/storage/detail/collection_limits.h"
 
 namespace {
 using namespace grouped_e2e;
@@ -36,12 +37,61 @@ TEST(GroupedStreamE2e, SmallStreamKeepsCompactStorage) {
   {
     Server server(disk);
     Client client(server.port());
-    PopulateStream(client, "small", 1000, 256);
-    EXPECT_EQ(client.Command({"XLEN", "small"}).text_, "1000");
+    PopulateStream(client, "small", 32, 256);
+    EXPECT_EQ(client.Command({"XLEN", "small"}).text_, "32");
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   EXPECT_TRUE(disk.Auxiliaries("small").empty());
+}
+
+TEST(GroupedStreamE2e, PromotesAtSharedSizeBoundaryAndRecovers) {
+  PrivateDisk disk;
+  // LXS1 with one message, field "f", one logical node and no groups has
+  // 89 bytes of framing. Exercise immediately below, at and above promotion.
+  const std::string below(kCollectionPromotionBytes - 89 - 1, 'v');
+  const std::string at(kCollectionPromotionBytes - 89, 'v');
+  const std::string above(kCollectionPromotionBytes - 89 + 1, 'v');
+  {
+    Server server(disk);
+    Client client(server.port());
+    for (const auto& [key, value] :
+         {std::pair{"below", below}, {"at", at}, {"above", above}}) {
+      ASSERT_EQ(client.Command({"XADD", key, "1-0", "f", value}).text_, "1-0");
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  EXPECT_TRUE(disk.Auxiliaries("below").empty());
+  EXPECT_FALSE(disk.Auxiliaries("at").empty());
+  EXPECT_FALSE(disk.Auxiliaries("above").empty());
+  {
+    Server server(disk, 3);
+    Client client(server.port());
+    for (const auto& [key, value] :
+         {std::pair{"below", below}, {"at", at}, {"above", above}}) {
+      auto range = client.Command({"XRANGE", key, "-", "+"});
+      ASSERT_EQ(range.kind_, '*') << range.text_;
+      ASSERT_EQ(range.items_.size(), 1);
+      ASSERT_EQ(range.items_[0].items_.size(), 2);
+      ASSERT_EQ(range.items_[0].items_[1].items_.size(), 2);
+      EXPECT_EQ(range.items_[0].items_[1].items_[1].text_, value);
+    }
+    ASSERT_EQ(client.Command({"XADD", "below", "2-0", "f", "tail"}).text_,
+              "2-0");
+    // A grouped Stream stays grouped after shrinking below promotion size.
+    ASSERT_EQ(client.Command({"XDEL", "below", "1-0"}).text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  EXPECT_FALSE(disk.Auxiliaries("below").empty());
+  Server recovered(disk);
+  Client client(recovered.port());
+  auto range = client.Command({"XRANGE", "below", "-", "+"});
+  ASSERT_EQ(range.kind_, '*') << range.text_;
+  ASSERT_EQ(range.items_.size(), 1);
+  EXPECT_EQ(range.items_[0].items_[0].text_, "2-0");
+  EXPECT_EQ(range.items_[0].items_[1].items_[1].text_, "tail");
 }
 
 TEST(GroupedStreamE2e, AppendOnlyRewritesBoundedPagesAndRecovers) {

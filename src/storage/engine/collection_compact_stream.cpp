@@ -308,7 +308,7 @@ absl::Status CollectionCompactDecoder::ReadEntryHeader() {
   // Stop before assembling an oversized entry alongside preceding entries.
   // The tiny consumed framing stays in the cursor across the caller's await.
   if (page_.size() != 0 &&
-      entry_bytes_ > kCollectionStreamPageBytes - page_bytes_)
+      entry_bytes_ > kCollectionGroupTargetBytes - page_bytes_)
     ready_ = true;
   return absl::OkStatus();
 }
@@ -368,7 +368,7 @@ absl::Status CollectionCompactDecoder::CompleteEntry() {
   ++parsed_count_;
   page_bytes_ += entry_bytes_;
   stage_ = parsed_count_ == total_count_ ? Stage::kDone : Stage::kEntryHeader;
-  ready_ = stage_ == Stage::kDone || page_bytes_ >= kCollectionStreamPageBytes;
+  ready_ = stage_ == Stage::kDone || page_bytes_ >= kCollectionGroupTargetBytes;
   return absl::OkStatus();
 }
 

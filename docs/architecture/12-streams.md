@@ -21,8 +21,10 @@ limitations under the License.
 The Redis command layer owns Stream ID allocation, range and trim semantics,
 consumer-group delivery, pending-entry ownership, claims and blocking wakeups.
 Storage represents a Stream either as a compact `LXS1` image or as an ordered
-grouped graph under the same user key and Redis type. Writes promote at 1 MiB
-of logical encoding; deleting the key retires its complete incarnation.
+grouped graph under the same user key and Redis type. Writes use the shared
+collection promotion and group-size policy described in
+[Grouped collections](09-grouped-collections.md); deleting the key retires its
+complete incarnation.
 
 A Stream has an ordered sequence of messages, a last-generated ID, an
 entries-added counter and a maximum-deleted ID. Consumer groups independently
