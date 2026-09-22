@@ -103,9 +103,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++-18 \
             -DCMAKE_BUILD_TYPE=Debug \
             -DLAVIK_ENABLE_OPT=OFF \
-            -DLAVIK_STATIC_OPENSSL=ON \
-            -DLAVIK_BUILD_META=ON \
-            -DLAVIK_BUILD_FAULT_SERVER=ON \
+            -DLAVIK_ENABLE_TEST_FAULTS=ON \
             -DBUILD_TESTING=ON
       - name: Build all targets
         run: cmake --build build_ci --parallel "$(nproc)"

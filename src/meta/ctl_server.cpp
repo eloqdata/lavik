@@ -1416,6 +1416,8 @@ bycorf::Task<std::string> HandlePromote(
       .candidate_ = {.node_id_ = node_id,
                      .assignment_id_ = population->assignment_id_,
                      .boot_id_ = population->boot_incarnation_},
+      .domain_ = {},
+      .authorization_ = std::nullopt,
       .operator_recovery_ = true,
   };
   MetaCommand command;
@@ -1427,6 +1429,7 @@ bycorf::Task<std::string> HandlePromote(
     }
     command = SetUncontrolledCandidate{
         .request_id_ = MakeRequestId(),
+        .actor_ = {},
         .group_id_ = group_id,
         .expected_transition_ = {transition.transition_id_,
                                  transition.revision_},
@@ -1443,10 +1446,15 @@ bycorf::Task<std::string> HandlePromote(
     }
     command = BeginUncontrolledFailover{
         .request_id_ = MakeRequestId(),
+        .actor_ = {},
         .group_id_ = group_id,
         .transition_id_ = MakeRequiredId("operator recovery transition"),
         .target_term_ = group->record_.group_term_ + 1,
         .candidate_action_ = action,
+        .trigger_reason_ = MetaAutomaticFailoverReason::kManual,
+        .suspect_duration_ms_ = 0,
+        .preempted_operation_id_ = std::nullopt,
+        .expected_preempted_operation_revision_ = std::nullopt,
         .expected_owner_node_id_ = owner->node_id_,
         .expected_owner_assignment_id_ = owner->assignment_id_,
         .expected_membership_revision_ = group->revision_,

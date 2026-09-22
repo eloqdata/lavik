@@ -15,9 +15,11 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DLAVIK_ENABLE_OPT=ON \
-  -DLAVIK_MARCH=native -DLAVIK_STATIC_OPENSSL=ON \
-  -DLAVIK_BUILD_META=ON \
-  -DBUILD_TESTING=OFF "$@"
-cmake --build build --target lavik lavik-meta lavik-ctl -j"$(nproc)"
-echo "Release build complete: build/lavik, build/lavik-meta, build/lavik-ctl"
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLAVIK_ENABLE_OPT=ON \
+  -DLAVIK_MARCH=native \
+  -DLAVIK_KERNEL_BYPASS=OFF \
+  -DBUILD_TESTING=OFF \
+  "$@"
+echo "Release build configured in build"

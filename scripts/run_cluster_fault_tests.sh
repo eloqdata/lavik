@@ -71,14 +71,14 @@ if [[ ! $duration =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! -f $build_dir/CMakeCache.txt ]]; then
   echo "missing configured build tree: $build_dir" >&2
-  echo "configure with BUILD_TESTING=ON and LAVIK_BUILD_FAULT_SERVER=ON" >&2
+  echo "configure with BUILD_TESTING=ON and LAVIK_ENABLE_TEST_FAULTS=ON" >&2
   exit 2
 fi
 if ! grep -qx 'BUILD_TESTING:BOOL=ON' "$build_dir/CMakeCache.txt" ||
-   ! grep -qx 'LAVIK_BUILD_FAULT_SERVER:BOOL=ON' \
+   ! grep -qx 'LAVIK_ENABLE_TEST_FAULTS:BOOL=ON' \
       "$build_dir/CMakeCache.txt"; then
   echo "cluster fault tiers require BUILD_TESTING=ON and" \
-       "LAVIK_BUILD_FAULT_SERVER=ON" >&2
+       "LAVIK_ENABLE_TEST_FAULTS=ON" >&2
   exit 2
 fi
 
@@ -91,7 +91,7 @@ case "$tier" in
     timeout_seconds=60
     ;;
   integration)
-    targets=(lavik lavik_fault_server lavik_process_support_tests)
+    targets=(lavik lavik_process_support_tests)
     if ctest --test-dir "$build_dir" -N | grep -q lavik_sentinel_e2e; then
       targets+=(lavik_sentinel_e2e_test)
     fi
@@ -107,7 +107,7 @@ case "$tier" in
       "$build_dir/cluster-fault-artifacts"
     ;;
   hardware)
-    cmake --build "$build_dir" --target lavik_fault_server -j"$jobs"
+    cmake --build "$build_dir" --target lavik -j"$jobs"
     label=cluster-hardware
     timeout_seconds=120
     ;;

@@ -160,6 +160,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncValue(
   auto [_, inserted] = capture->second.pinned_values_.emplace(
       id, WorkerStore::FullSyncCapture::PinnedValue{
               .extents_ = extents,
+              .collection_ = nullptr,
               .key_bytes_ = key_prefix,
               .value_bytes_ = extent_bytes - key_prefix,
           });

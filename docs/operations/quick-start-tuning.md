@@ -19,7 +19,8 @@ limitations under the License.
 Build Lavik, then generate a CPU plan for the current machine:
 
 ```bash
-./scripts/build_release.sh
+./scripts/configure_release.sh
+cmake --build build --target lavik --parallel
 ./scripts/plan_startup_tuning.sh > lavik-tuning.env
 cat lavik-tuning.env
 ```

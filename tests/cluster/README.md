@@ -63,10 +63,11 @@ identical execution. The current runner executes exact-model traces. Real
 cluster fixtures can use the process mode as their adapter contract without
 changing the durable exact-model format.
 
-The fault-enabled server is built only with both `BUILD_TESTING=ON` and
-`LAVIK_BUILD_FAULT_SERVER=ON`. It keeps existing crash/write hooks available
-under optimized sanitizer builds and produces `lavik_fault_server`; release
-packaging explicitly disables the option.
+`LAVIK_ENABLE_TEST_FAULTS=ON` requires `BUILD_TESTING=ON` and keeps the
+ordinary `lavik` binary's crash/write hooks available under optimized
+sanitizer builds. Debug builds already enable the hooks through their normal
+assertion policy; release packaging disables tests and therefore cannot enable
+test faults.
 
 ## Verification matrix
 
@@ -162,8 +163,8 @@ Configure a dedicated tree once:
 
 ```bash
 cmake -S . -B build_cluster_fault -DCMAKE_BUILD_TYPE=Debug \
-  -DLAVIK_ENABLE_OPT=OFF -DLAVIK_STATIC_OPENSSL=ON \
-  -DBUILD_TESTING=ON -DLAVIK_BUILD_FAULT_SERVER=ON
+  -DLAVIK_ENABLE_OPT=OFF \
+  -DBUILD_TESTING=ON -DLAVIK_ENABLE_TEST_FAULTS=ON
 ```
 
 Run a bounded tier with `scripts/run_cluster_fault_tests.sh --tier model` or

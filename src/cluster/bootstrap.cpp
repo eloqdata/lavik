@@ -127,10 +127,12 @@ absl::Status Backoff(int cancel_fd, std::chrono::milliseconds delay) {
 }  // namespace
 
 control::ClientServiceCapabilities SupportedClientServiceCapabilities() {
-  return {.supported_modes =
-              control::kSingleServiceMode | control::kClusterServiceMode,
-          .services =
-              control::kDb0GroupAuthority | control::kReplicaPopulationRead};
+  return {
+      .supported_modes =
+          control::kSingleServiceMode | control::kClusterServiceMode,
+      .services = control::kDb0GroupAuthority | control::kReplicaPopulationRead,
+      .installed_mode = std::nullopt,
+      .database_count = 0};
 }
 
 absl::StatusOr<control::ServiceDeclaration> BootstrapClientService(

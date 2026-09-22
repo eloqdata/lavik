@@ -35,19 +35,28 @@ cd lavik
 git submodule update --init bycorf third_party/mimalloc
 git -C bycorf submodule update --init third_party/liburing third_party/abseil
 
-./scripts/build_debug.sh
+./scripts/configure_debug.sh
+cmake --build build_debug --parallel
 ```
 
 The dependency installer uses sudo for apt when needed; pass `--dry-run` to
-preview its commands. Meta's first configuration/build downloads the Go
-toolchain and modules pinned by `raft/go.mod`, so network access is needed
-unless the caches are already populated.
+preview its commands. The first configuration/build downloads the Go toolchain
+and modules pinned by `raft/go.mod` for the always-built Meta targets, so
+network access is needed unless the caches are already populated.
 
 The Debug build enables tests and produces `build_debug/lavik`,
-`build_debug/lavik-meta`, and `build_debug/lavik-ctl`. Run
-`./scripts/build_debug.sh` again after editing to rebuild incrementally.
-For an optimized local build, use `./scripts/build_release.sh`; its output
-is under `build/` and targets the build machine's CPU by default.
+`build_debug/lavik-meta`, and `build_debug/lavik-ctl`. After editing, rebuild
+only the relevant targets, for example
+`cmake --build build_debug --target lavik lavik_unit_tests --parallel`.
+For an optimized local build, run `./scripts/configure_release.sh` and then
+`cmake --build build --parallel`; its output is under `build/` and targets the
+build machine's CPU by default.
+
+Project options belong to the configure command. Both configure scripts
+forward additional CMake arguments, for example
+`./scripts/configure_debug.sh -DLAVIK_KERNEL_BYPASS=ON`; subsequent builds use
+the cached configuration through `cmake --build`. The scripts explicitly reset
+kernel bypass to `OFF` unless it is overridden on that invocation.
 
 ## Run tests
 

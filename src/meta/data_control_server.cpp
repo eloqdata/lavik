@@ -1048,6 +1048,8 @@ BuildCommittedMetaDirectory(const MetaCommittedView& view) {
       .directory = std::move(directory),
       .observation_ttl_ms = 1,
       .session_progress_timeout_ms = 1,
+      .service = {},
+      .rejection_reason = {},
   };
   control::WireMessage probe_message(std::move(probe));
   auto encoded = control::EncodeMessage(probe_message);
@@ -1822,6 +1824,7 @@ control::ServerHello BuildServerHello(
       .observation_ttl_ms = core.options_.observation_ttl_ms_,
       .session_progress_timeout_ms = core.options_.session_progress_timeout_ms_,
       .service = service,
+      .rejection_reason = {},
   };
 }
 

@@ -683,7 +683,8 @@ std::optional<MetaGroupAuthorityView> MetaTopologyStore::AuthorityFor(
   const auto it = groups_.find(std::string(group_id));
   if (it == groups_.end()) return std::nullopt;
   const GroupState& group = it->second;
-  MetaGroupAuthorityView view{.group_term_ = group.record_.group_term_};
+  MetaGroupAuthorityView view{.group_term_ = group.record_.group_term_,
+                              .grant_ = std::nullopt};
   if (group.authority_active_)
     view.grant_ = MetaActiveAuthorityView{group.record_.owner_,
                                           group.activation_action_id_};

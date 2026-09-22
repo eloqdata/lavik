@@ -15,9 +15,10 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cmake -B build_debug -DCMAKE_BUILD_TYPE=Debug -DLAVIK_ENABLE_OPT=OFF \
-  -DLAVIK_STATIC_OPENSSL=ON \
-  -DLAVIK_BUILD_META=ON \
-  -DBUILD_TESTING=ON
-cmake --build build_debug -j"$(nproc)"
-echo "Debug build complete: build_debug/lavik, build_debug/lavik-meta, build_debug/lavik-ctl"
+cmake -S . -B build_debug -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DLAVIK_ENABLE_OPT=OFF \
+  -DLAVIK_KERNEL_BYPASS=OFF \
+  -DBUILD_TESTING=ON \
+  "$@"
+echo "Debug build configured in build_debug"
