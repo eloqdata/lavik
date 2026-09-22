@@ -1547,8 +1547,10 @@ StorageEngine::Impl::WriteExtentValueLocked(
     while (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
       // Extent construction is part of a foreground write. Do not let it
       // bypass the configured storage pool with an unbounded 8 MiB heap
-      // allocation. The caller holds store_state_mutex_; release it so the
-      // flush completion that returns a buffer can make progress.
+      // allocation. Active append streams retain their buffers even after a
+      // flush; seal them before waiting so capacity can actually be returned.
+      // A live transaction generation may reopen its stream afterwards.
+      SealActiveBlocks(store);
       store.store_state_mutex_.Unlock(*store.worker_);
       co_await store.buffers_.WaitForWriteBuffer();
       co_await store.store_state_mutex_.Lock();
@@ -2545,6 +2547,12 @@ acquire_active_stream:
           }
         } else {
           do {
+            // Several live transaction generations can occupy every staging
+            // buffer. Their leases may be held by commits queued behind this
+            // writer, so waiting for generation retirement would deadlock.
+            // Sealing only ends physical append streams; tagged records and
+            // generation leases remain valid, and flush returns their buffers.
+            SealActiveBlocks(store);
             store.store_state_mutex_.Unlock(*store.worker_);
             co_await store.buffers_.WaitForWriteBuffer();
             co_await store.store_state_mutex_.Lock();

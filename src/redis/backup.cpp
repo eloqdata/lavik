@@ -23,7 +23,9 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -38,6 +40,7 @@
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/sync.h"
 #include "bycorf/runtime/worker.h"
+#include "lavik/fault_injection.h"
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
 #include "lavik/rdb.h"
@@ -230,6 +233,24 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
         if (!open_) OpenAllCommandDbGates();
       }
     } gates;
+    LAVIK_FAULT_INJECT(
+        // Keep the real cut closed until the process test observes replica
+        // admission contention and removes its hold file. Bound the hold so a
+        // failed fixture cannot strand shutdown; GateGuard also covers errors.
+        if (const char* hold = std::getenv("LAVIK_BACKUP_CUT_HOLD_FILE");
+            hold != nullptr && std::filesystem::exists(hold)) {
+          spdlog::warn("backup test checkpoint: database gates closed");
+          const auto deadline =
+              std::chrono::steady_clock::now() + std::chrono::seconds(20);
+          while (std::filesystem::exists(hold)) {
+            if (std::chrono::steady_clock::now() >= deadline)
+              co_return absl::DeadlineExceededError(
+                  "backup test cut hold expired");
+            absl::Status waited = co_await bycorf::SleepFor(
+                *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
+            if (!waited.ok()) co_return waited;
+          }
+        });
     while (CommandDbOperationsActive()) {
       absl::Status yielded = co_await bycorf::SleepFor(
           *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));

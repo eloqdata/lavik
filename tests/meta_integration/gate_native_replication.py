@@ -27,6 +27,7 @@ import subprocess
 import struct
 import sys
 import tempfile
+import threading
 import time
 
 import gate_cluster_create as C
@@ -644,6 +645,96 @@ def backpressured_shutdown(root):
             target.resume()
 
 
+def replica_backup_during_exec(root):
+    # Release builds keep the concurrent smoke test; fault-enabled binaries
+    # additionally prove that replay reaches the closed backup gate.
+    deterministic = C.has_fault(C.DATA, b"LAVIK_BACKUP_CUT_HOLD_FILE")
+    hold = root / "backup-cut.hold"
+    faults = {"LAVIK_BACKUP_CUT_HOLD_FILE": str(hold)} if deterministic else {}
+    with pair(root, "replica-backup-exec", target_faults=faults) as (
+            meta, source, target, writer):
+        ready(meta)
+        reader = Client(target, readonly=True)
+        stopped = threading.Event()
+        started = threading.Event()
+
+        def write_transactions():
+            client = Client(source)
+            count = 0
+            try:
+                while not stopped.is_set():
+                    assert client.call("MULTI") == "OK"
+                    assert client.call("INCR", "{backup}counter") == "QUEUED"
+                    assert client.call("COPY", "{backup}counter", "{backup}copy",
+                                       "REPLACE") == "QUEUED"
+                    count += 1
+                    assert client.call("EXEC") == [count, 1]
+                    started.set()
+                assert client.call("WAIT", 1, 10000) == 1
+                return count
+            finally:
+                client.close()
+
+        old_full = Path(source.log_path).read_text().count("selected=FULL")
+        def start_backup():
+            try:
+                assert reader.call("BGSAVE") == "Background saving started"
+                return True
+            except H.Failure as error:
+                # File publication precedes clearing the active-job flag.
+                # Only this definite non-admission can be retried.
+                if str(error) == "ERR Background save already in progress":
+                    return False
+                raise
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                pending = pool.submit(write_transactions)
+                try:
+                    assert started.wait(timeout=10)
+                    dump = Path(target.workdir) / "dump.rdb"
+                    for iteration in range(16):
+                        previous = dump.stat().st_mtime_ns if dump.exists() else 0
+                        completed = Path(target.log_path).read_text().count(
+                            "RDB backup completed:")
+                        if deterministic and iteration == 0:
+                            hold.touch()
+                            # BGSAVE replies only after its cut reopens. Run it
+                            # separately while observing the target checkpoint.
+                            backup = pool.submit(start_backup)
+                            try:
+                                H.wait_until("backup gates closed", 10, lambda:
+                                    "backup test checkpoint: database gates closed" in
+                                    Path(target.log_path).read_text())
+                                H.wait_until("replica EXEC blocked by backup", 10, lambda:
+                                    "backup test checkpoint: replica EXEC waiting for database admission" in
+                                    Path(target.log_path).read_text())
+                                assert not backup.done(), "backup cut reopened before release"
+                            finally:
+                                hold.unlink(missing_ok=True)
+                            assert backup.result(timeout=10)
+                        else:
+                            H.wait_until("replica backup admitted", 10, start_backup)
+                        H.wait_until("replica backup completed", 30, lambda:
+                                     dump.exists() and dump.stat().st_mtime_ns != previous
+                                     and Path(target.log_path).read_text().count(
+                                         "RDB backup completed:") > completed)
+                        assert "lavik_replication_state:online" in reader.call(
+                            "INFO", "replication")
+                finally:
+                    hold.unlink(missing_ok=True)
+                    stopped.set()
+                count = pending.result(timeout=15)
+            assert count > 0
+            assert reader.call("GET", "{backup}counter") == str(count)
+            assert reader.call("GET", "{backup}copy") == str(count)
+            assert Path(source.log_path).read_text().count("selected=FULL") == old_full
+            assert "invalidated native replication continuation" not in Path(
+                target.log_path).read_text()
+        finally:
+            reader.close()
+
+
 def small_receive_window(root):
     def seed(writer):
         # Exercise FULL before steady replay grows the loopback window/MSS
@@ -694,6 +785,7 @@ def main():
                                      dir=os.environ.get("LAVIK_TEST_DATA_DIR")) as directory:
         root = Path(directory)
         replay_and_reconnect(root)
+        replica_backup_during_exec(root)
         dense_collection_full_sync(root)
         full_tail(root)
         backpressured_shutdown(root)
