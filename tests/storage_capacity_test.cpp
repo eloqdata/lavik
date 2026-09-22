@@ -225,6 +225,9 @@ class WriteBufferPressureTestPeer {
     ++pinned->pins_;
     const auto pinned_slot = pinned->staging_slot_;
 
+    // Model a cleaner pass consuming earlier notifications. Only sealing the
+    // already-durable transaction tails may re-arm it before any commit below.
+    impl.tx_cleaner_dirty_.store(false, std::memory_order_release);
     const std::string value(extent ? 9 * 1024 * 1024 : 64, 'p');
     auto pending = storage.Set(0, "pressure-new", value);
     auto handle = std::move(pending).ReleaseHandle();
@@ -253,6 +256,9 @@ class WriteBufferPressureTestPeer {
           "writer waited for buffers retained by live transaction generations");
     if (!pin_preserved)
       co_return absl::DataLossError("pressure seal recycled a pinned buffer");
+    if (!impl.tx_cleaner_dirty_.load(std::memory_order_acquire))
+      co_return absl::FailedPreconditionError(
+          "durable transaction pressure seal did not re-arm cleaning");
 
     // The pressure seal must not revoke leases or lose their tagged data.
     // Appending the commit decisions may itself need another pressure seal.
@@ -620,6 +626,9 @@ class WriteBufferPressureService final : public bycorf::Service {
   }
   void Prepare(unsigned) override {}
   void Stop() noexcept override {}
+  void FinalizeWorker(bycorf::Worker& worker) noexcept override {
+    storage_.FinalizeWorker(worker);
+  }
   absl::Status result_ = absl::UnknownError("pressure test did not run");
 
  private:

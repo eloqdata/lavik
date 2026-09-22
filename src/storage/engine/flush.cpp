@@ -260,6 +260,11 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           // readers still hold its staging memory. Match normal flush
           // completion: the last pin, not the seal, returns that buffer.
           state->in_memory_ = false;
+          // Sealing changes cleaner eligibility even without new disk I/O.
+          // A prior cleaner pass may have consumed the append notification.
+          if (state->kind_ == BlockKind::kTransaction) {
+            tx_cleaner_dirty_.store(true, std::memory_order_release);
+          }
           if (state->pins_ > 0) {
             state->release_pending_ = true;
           } else {
