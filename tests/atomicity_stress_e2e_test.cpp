@@ -26,6 +26,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <charconv>
@@ -36,6 +37,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <latch>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -336,6 +338,11 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
+// Bound the append workload independently of host throughput. A timed loop
+// can exhaust the fixed device with outstanding transaction generations before
+// cleaning catches up, turning the snapshot test into a capacity race. Four
+// writers each perform this many acknowledged mutations while readers contend.
+constexpr std::uint64_t kWritesPerWriter = 2000;
 std::atomic<bool> stop_flag{false};
 std::mutex failure_mutex;
 std::string failure_message;
@@ -357,7 +364,9 @@ void Writer(std::uint16_t port, const char* tag, const char* first,
             const char* second) {
   try {
     RespClient client = Connect(port);
-    for (std::uint64_t i = 1; !stop_flag.load(std::memory_order_acquire); ++i) {
+    for (std::uint64_t i = 1;
+         i <= kWritesPerWriter && !stop_flag.load(std::memory_order_acquire);
+         ++i) {
       const std::string value = std::string(tag) + std::to_string(i);
       const std::string reply =
           client.Command({"MSET", first, value, second, value});
@@ -388,19 +397,20 @@ void CheckSnapshot(const std::vector<std::string>& abc, const char* context) {
   }
 }
 
-void MgetReader(std::uint16_t port) {
+void MgetReader(std::uint16_t port, std::uint64_t& snapshots) {
   try {
     RespClient client = Connect(port);
     while (!stop_flag.load(std::memory_order_acquire)) {
       const std::string reply = client.Command({"MGET", "sa", "sb", "sc"});
       CheckSnapshot(RespClient::ParseFlatArray(reply), "MGET");
+      ++snapshots;
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("mget reader: ") + error.what());
   }
 }
 
-void ExecReader(std::uint16_t port) {
+void ExecReader(std::uint16_t port, std::uint64_t& snapshots) {
   try {
     RespClient client = Connect(port);
     while (!stop_flag.load(std::memory_order_acquire)) {
@@ -413,6 +423,7 @@ void ExecReader(std::uint16_t port) {
       client.Command({"GET", "sc"});
       const std::string reply = client.Command({"EXEC"});
       CheckSnapshot(RespClient::ParseFlatArray(reply), "EXEC");
+      ++snapshots;
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("exec reader: ") + error.what());
@@ -424,7 +435,9 @@ void ExecReader(std::uint16_t port) {
 void PairWriter(std::uint16_t port, const char* tag) {
   try {
     RespClient client = Connect(port);
-    for (std::uint64_t i = 1; !stop_flag.load(std::memory_order_acquire); ++i) {
+    for (std::uint64_t i = 1;
+         i <= kWritesPerWriter && !stop_flag.load(std::memory_order_acquire);
+         ++i) {
       const std::string value = std::string(tag) + std::to_string(i);
       const std::string reply =
           client.Command({"MSET", "ha", value, "hb", value});
@@ -438,16 +451,21 @@ void PairWriter(std::uint16_t port, const char* tag) {
   }
 }
 
-void PairReader(std::uint16_t port) {
+void PairReader(std::uint16_t port, std::uint64_t& snapshots) {
   try {
     RespClient client = Connect(port);
     while (!stop_flag.load(std::memory_order_acquire)) {
       const std::string reply = client.Command({"MGET", "ha", "hb"});
       const auto values = RespClient::ParseFlatArray(reply);
-      if (values.size() == 2 && values[0] != values[1]) {
+      if (values.size() != 2) {
+        ReportFailure("pair MGET: expected 2 values");
+        return;
+      }
+      if (values[0] != values[1]) {
         ReportFailure("torn pair: ha='" + values[0] + "' hb='" + values[1] +
                       "'");
       }
+      ++snapshots;
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("pair reader: ") + error.what());
@@ -488,24 +506,40 @@ int main(int argc, char** argv) {
         }
       }
 
-      std::vector<std::thread> threads;
-      threads.emplace_back(Writer, port, "W1:", "sa", "sb");
-      threads.emplace_back(Writer, port, "W2:", "sb", "sc");
-      threads.emplace_back(MgetReader, port);
-      threads.emplace_back(MgetReader, port);
-      threads.emplace_back(ExecReader, port);
-      threads.emplace_back(PairWriter, port, "P1:");
-      threads.emplace_back(PairWriter, port, "P2:");
-      threads.emplace_back(PairReader, port);
+      // Start all contenders together. Each reader owns one counter; main
+      // inspects those counters only after joining, so they need no atomics.
+      std::latch start(8);
+      std::array<std::uint64_t, 4> snapshots{};
+      std::vector<std::thread> writers, readers;
+      auto launch = [&](auto& threads, auto action) {
+        threads.emplace_back([&, action] {
+          start.count_down();
+          start.wait();
+          action();
+        });
+      };
+      launch(writers, [&] { Writer(port, "W1:", "sa", "sb"); });
+      launch(writers, [&] { Writer(port, "W2:", "sb", "sc"); });
+      launch(writers, [&] { PairWriter(port, "P1:"); });
+      launch(writers, [&] { PairWriter(port, "P2:"); });
+      launch(readers, [&] { MgetReader(port, snapshots[0]); });
+      launch(readers, [&] { MgetReader(port, snapshots[1]); });
+      launch(readers, [&] { ExecReader(port, snapshots[2]); });
+      launch(readers, [&] { PairReader(port, snapshots[3]); });
 
-      std::this_thread::sleep_for(5s);
+      for (auto& writer : writers) writer.join();
       stop_flag.store(true, std::memory_order_release);
-      for (std::thread& thread : threads) {
-        thread.join();
-      }
+      for (auto& reader : readers) reader.join();
       if (!failure_message.empty()) {
         Fail(failure_message);
       }
+      for (auto count : snapshots) {
+        if (count == 0) Fail("a reader did not observe any snapshots");
+      }
+      std::cout << "completed " << 4 * kWritesPerWriter
+                << " writes; reader snapshots=" << snapshots[0] << ','
+                << snapshots[1] << ',' << snapshots[2] << ',' << snapshots[3]
+                << '\n';
 
       RespClient final = Connect(port);
       final_values = RespClient::ParseFlatArray(
