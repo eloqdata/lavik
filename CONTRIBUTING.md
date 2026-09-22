@@ -101,11 +101,11 @@ configuration in its submodule.
 To format all maintained source files immediately:
 
 ```bash
-pre-commit run clang-format --all-files
+pre-commit run --all-files
 ```
 
 To format only selected files, use
-`pre-commit run clang-format --files src/config.cpp` with your file paths.
+`pre-commit run --files src/config.cpp` with your file paths.
 Review the changes before staging them.
 
 ## Commit a change
