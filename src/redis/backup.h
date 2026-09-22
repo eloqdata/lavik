@@ -35,8 +35,9 @@ bool AutomaticRdbBackupsConfigured() noexcept;
 Task<absl::Status> RunRdbBackupScheduler(bycorf::Worker& worker);
 Task<CommandReply> ExecuteRdbBackupCommand(const CommandRequest& request,
                                            ReplyBuilder& reply_builder);
-// Stops policy-driven saves while allowing an explicitly acknowledged
-// BGSAVE SCHEDULE request to drain during orderly shutdown.
+// Stops the policy timer coroutine while allowing an explicitly acknowledged
+// BGSAVE SCHEDULE request to drain during orderly shutdown. A sleeping timer
+// observes the stop request at its next one-second wakeup.
 void StopAutomaticRdbBackups() noexcept;
 void WaitForRdbBackupDrained() noexcept;
 

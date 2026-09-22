@@ -247,7 +247,8 @@ using low-frequency collection of the worker-local change counters; no timer
 coroutine exists when automatic saves are disabled. Successful snapshots
 advance each worker's saved cut, so mutations after the snapshot cut remain
 eligible for a later automatic save. Shutdown disables new policy-driven saves
-and drains an active or explicitly scheduled job before storage flush.
+and lets the background policy timer exit at its next wakeup, while an active
+or explicitly scheduled job drains before storage flush.
 
 ## Session and transaction behavior
 

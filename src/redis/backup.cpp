@@ -718,9 +718,10 @@ Task<absl::Status> RunRdbBackupScheduler(bycorf::Worker& worker) {
     absl::Status slept =
         co_await bycorf::SleepFor(worker, std::chrono::seconds(1));
     if (!slept.ok()) co_return absl::OkStatus();
-    if (g_automatic_backups_stopped.load(std::memory_order_acquire) ||
-        g_save_rules.empty() ||
-        g_backup_active.load(std::memory_order_relaxed) ||
+    if (g_automatic_backups_stopped.load(std::memory_order_acquire)) {
+      co_return absl::OkStatus();
+    }
+    if (g_save_rules.empty() || g_backup_active.load(std::memory_order_relaxed) ||
         std::chrono::steady_clock::now() < g_next_automatic_attempt) {
       continue;
     }
@@ -743,8 +744,10 @@ Task<absl::Status> RunRdbBackupScheduler(bycorf::Worker& worker) {
     // Shutdown and explicit commands can run while the cross-worker
     // collection is suspended. Re-check ownership state before starting work
     // from a decision made against that earlier snapshot.
-    if (g_automatic_backups_stopped.load(std::memory_order_acquire) ||
-        g_backup_active.load(std::memory_order_relaxed)) {
+    if (g_automatic_backups_stopped.load(std::memory_order_acquire)) {
+      co_return absl::OkStatus();
+    }
+    if (g_backup_active.load(std::memory_order_relaxed)) {
       continue;
     }
     bool should_save = false;
