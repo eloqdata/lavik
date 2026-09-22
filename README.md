@@ -105,7 +105,8 @@ The standard io_uring build requires:
 - Linux 6.1 or newer with io_uring enabled (`x86_64` and `aarch64` are the release-package targets)
 - CMake 3.26 or newer (required by the bundled Meta dependency)
 - a C++23 compiler (GCC 13+ or a recent Clang is recommended)
-- GNU Make, Git, and OpenSSL development headers/static libraries
+- Ninja, Git, and OpenSSL development headers/static libraries; GNU Make is
+  additionally required by the optional bypass dependencies
 
 On Ubuntu 24.04, install Git to obtain the source:
 
@@ -123,7 +124,8 @@ cd lavik
 git submodule update --init bycorf third_party/mimalloc
 git -C bycorf submodule update --init third_party/liburing third_party/abseil
 
-./scripts/build_release.sh
+./scripts/configure_release.sh
+cmake --build build --target lavik lavik-meta lavik-ctl --parallel
 sudo install -m 0755 build/lavik build/lavik-meta build/lavik-ctl /usr/local/bin/
 ```
 
@@ -136,8 +138,14 @@ local build, run these additional commands in the same checkout:
 ./scripts/install_build_deps.sh --with-bypass
 git -C bycorf submodule update --init third_party/spdk third_party/dpdk
 git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
-CC=gcc-13 CXX=g++-13 ./scripts/build_release.sh -DLAVIK_KERNEL_BYPASS=ON
+CC=gcc-13 CXX=g++-13 ./scripts/configure_release.sh -DLAVIK_KERNEL_BYPASS=ON
+cmake --build build --target lavik lavik-meta lavik-ctl --parallel
 ```
+
+`LAVIK_KERNEL_BYPASS` is a configure-time option. Pass it to the configure
+script, not to `cmake --build`. Both configure scripts default it to `OFF` on
+every run; pass `-DLAVIK_KERNEL_BYPASS=ON` when configuring either build tree
+to enable the bypass targets and dependencies.
 
 Local release builds use `-march=native`; use the packaging script below for
 portable artifacts. Bypass remains an explicit runtime choice via
@@ -184,7 +192,8 @@ package even when bypass is not selected at startup.
 Prebuilt packages use these CPU targets for portability across supported
 machines. To enable additional CPU optimizations available on your deployment
 machine, [build from source](#build-from-source) there with
-`./scripts/build_release.sh`, which uses `-march=native`. Performance gains
+`./scripts/configure_release.sh`, which uses `-march=native`, followed by
+`cmake --build build --parallel`. Performance gains
 depend on the workload and toolchain; the resulting binaries may not run on
 CPUs with fewer instruction-set features.
 

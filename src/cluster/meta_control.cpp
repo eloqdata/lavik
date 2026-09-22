@@ -293,6 +293,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
         .manifest_entries_ = {},
         .steady_replication_enabled_ = source.steady_replication_enabled,
         .population_transition_expected_ = false,
+        .member_endpoints_ = {},
     };
     for (const auto& member : source.members) {
       const auto& endpoint = desired.nodes[node_indices.at(member.node_id)];

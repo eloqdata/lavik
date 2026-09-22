@@ -117,6 +117,11 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
       .id_ = snapshot.id_,
       .retired_ = snapshot.retired_,
       .batch_txid_ = batch_txid,
+      .prepared_root_ = nullptr,
+      .publication_ = nullptr,
+      .prepare_root_ = {},
+      .changed_groups_ = {},
+      .root_incarnation_ = 0,
   };
   RecordLocation location;
   auto written = co_await WriteRecordLocked(

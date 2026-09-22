@@ -41,7 +41,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(LAVIK_ENABLE_WERROR "Treat warnings as errors" OFF)
 option(LAVIK_ENABLE_OPT "Enable aggressive optimization" ON)
-option(LAVIK_STATIC_OPENSSL "Link OpenSSL statically" ON)
 option(LAVIK_STATIC_CXX_RUNTIME
   "Link the GNU C++ and compiler runtimes statically" ON)
 set(LAVIK_MARCH "native" CACHE STRING
@@ -52,13 +51,13 @@ option(LAVIK_ENABLE_CROSS_CORE_HOP_COUNT "Count cross-core SubmitTaskTo transfer
 option(LAVIK_KERNEL_BYPASS
   "Include DPDK networking and SPDK storage (selected independently at startup)"
   OFF)
-option(LAVIK_BUILD_FAULT_SERVER
-  "Build the non-packageable server variant used by deterministic fault tests"
+option(LAVIK_ENABLE_TEST_FAULTS
+  "Enable deterministic Data fault injection in test builds"
   OFF)
 
-if (LAVIK_BUILD_FAULT_SERVER AND NOT BUILD_TESTING)
+if (LAVIK_ENABLE_TEST_FAULTS AND NOT BUILD_TESTING)
   message(FATAL_ERROR
-    "LAVIK_BUILD_FAULT_SERVER requires BUILD_TESTING=ON")
+    "LAVIK_ENABLE_TEST_FAULTS requires BUILD_TESTING=ON")
 endif()
 
 if (LAVIK_ENABLE_OPT)
@@ -154,20 +153,19 @@ set(BYCORF_BUILD_TESTS ${BUILD_TESTING} CACHE BOOL "" FORCE)
 # Keep the embedded runtime on the same dependency boundary, including when
 # turning bypass off in an existing build directory.
 set(BYCORF_KERNEL_BYPASS ${LAVIK_KERNEL_BYPASS} CACHE BOOL "" FORCE)
-# This must be set before Bycorf's first find_package(OpenSSL). Static release
-# artifacts can then run without libssl.so or libcrypto.so on the target.
-set(OPENSSL_USE_STATIC_LIBS ${LAVIK_STATIC_OPENSSL} CACHE BOOL
+# This must be set before Bycorf's first find_package(OpenSSL). OpenSSL is a
+# deployment boundary: every supported Lavik artifact must run without
+# libssl.so or libcrypto.so on the target.
+set(OPENSSL_USE_STATIC_LIBS TRUE CACHE BOOL
   "Use static OpenSSL libraries" FORCE)
-foreach(open_ssl_cache_var IN ITEMS OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
-  if (LAVIK_STATIC_OPENSSL AND DEFINED ${open_ssl_cache_var} AND
-      NOT "${${open_ssl_cache_var}}" MATCHES "\\${CMAKE_STATIC_LIBRARY_SUFFIX}$")
-    unset(${open_ssl_cache_var} CACHE)
-  elseif (NOT LAVIK_STATIC_OPENSSL AND DEFINED ${open_ssl_cache_var} AND
-          "${${open_ssl_cache_var}}" MATCHES "\\${CMAKE_STATIC_LIBRARY_SUFFIX}$")
-    unset(${open_ssl_cache_var} CACHE)
+find_package(OpenSSL REQUIRED)
+foreach(open_ssl_library IN ITEMS OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
+  if (NOT "${${open_ssl_library}}" MATCHES "\\${CMAKE_STATIC_LIBRARY_SUFFIX}$")
+    message(FATAL_ERROR
+      "Lavik requires static OpenSSL, but ${open_ssl_library} resolved to "
+      "'${${open_ssl_library}}'. Install the OpenSSL static archives.")
   endif()
 endforeach()
-find_package(OpenSSL REQUIRED)
 
 set(LAVIK_BYCORF_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bycorf" CACHE PATH
     "Bycorf checkout to build (allows an isolated runtime worktree)")
@@ -176,6 +174,11 @@ if (EXISTS "${LAVIK_BYCORF_SOURCE_DIR}/CMakeLists.txt")
 else()
   message(FATAL_ERROR "bycorf submodule not found; run git submodule update --init --recursive")
 endif()
+# Root targets consume Abseil through several Bycorf interfaces. Preserve
+# first-party pedantic warnings without reporting GNU extensions inside the
+# pinned third-party headers.
+include_directories(SYSTEM
+  "${LAVIK_BYCORF_SOURCE_DIR}/third_party/abseil")
 target_compile_definitions(bycorf PUBLIC
   BYCORF_ENABLE_SUBMIT_TASK_COUNT=$<BOOL:${LAVIK_ENABLE_CROSS_CORE_HOP_COUNT}>
 )
@@ -217,67 +220,61 @@ target_include_directories(lavik_sync_transport PUBLIC
 target_link_libraries(lavik_sync_transport PUBLIC
   absl::status absl::statusor OpenSSL::SSL OpenSSL::Crypto)
 
-option(LAVIK_BUILD_META
-  "Build the lavik-meta Raft control plane (requires Go 1.26.8)"
-  ON)
-if (LAVIK_BUILD_META)
-  # Shared operator transport stays below lavik_meta_core so the CLI and
-  # operator library have no Raft dependency.
-  add_library(lavik_meta_admin STATIC
-    src/meta/admin_client.cpp
-    src/meta/cluster_create.cpp
-    src/meta/cluster_status.cpp
-    src/meta/failover_admin.cpp
-  )
-  target_include_directories(lavik_meta_admin PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-  )
-  target_link_libraries(lavik_meta_admin PUBLIC
-    lavik_sync_transport
-    absl::status
-    absl::statusor
-    OpenSSL::SSL
-    OpenSSL::Crypto
-  )
-  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(lavik_meta_admin PRIVATE -Wall -Wextra -Wpedantic)
-  endif()
-
-  find_program(LAVIK_GO_EXECUTABLE NAMES go REQUIRED)
-  # go.mod's toolchain directive only upgrades an older launcher. Select the
-  # exact version for configuration, builds and tests even with a newer Go.
-  set(LAVIK_GO_TOOLCHAIN go1.26.8)
-  execute_process(COMMAND ${CMAKE_COMMAND} -E env GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
-      ${LAVIK_GO_EXECUTABLE} env GOVERSION
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft
-    OUTPUT_VARIABLE LAVIK_GO_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE
-    COMMAND_ERROR_IS_FATAL ANY)
-  if (NOT LAVIK_GO_VERSION STREQUAL LAVIK_GO_TOOLCHAIN)
-    message(FATAL_ERROR "Meta requires ${LAVIK_GO_TOOLCHAIN}; found ${LAVIK_GO_VERSION}")
-  endif()
-  file(GLOB_RECURSE LAVIK_RAFT_GO_SOURCES CONFIGURE_DEPENDS
-    ${CMAKE_CURRENT_SOURCE_DIR}/raft/*.go ${CMAKE_CURRENT_SOURCE_DIR}/raft/*.h)
-  set(LAVIK_RAFT_ARCHIVE ${CMAKE_CURRENT_BINARY_DIR}/liblavik_raft.a)
-  set(LAVIK_RAFT_BUILD_TAGS "")
-  if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(LAVIK_RAFT_BUILD_TAGS "-tags=lavik_faults")
-  endif()
-  add_custom_command(OUTPUT ${LAVIK_RAFT_ARCHIVE}
-    COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=1 CC=${CMAKE_C_COMPILER}
-      GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
-      ${LAVIK_GO_EXECUTABLE} build -mod=readonly ${LAVIK_RAFT_BUILD_TAGS} -buildmode=c-archive
-      -o ${LAVIK_RAFT_ARCHIVE} ./bridge
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft
-    DEPENDS ${LAVIK_RAFT_GO_SOURCES} raft/go.mod raft/go.sum
-      include/lavik/meta/raft_bridge.h
-    VERBATIM)
-  add_custom_target(lavik_raft_archive DEPENDS ${LAVIK_RAFT_ARCHIVE})
-  add_library(lavik_raft STATIC IMPORTED GLOBAL)
-  set_target_properties(lavik_raft PROPERTIES IMPORTED_LOCATION ${LAVIK_RAFT_ARCHIVE})
-  add_dependencies(lavik_raft lavik_raft_archive)
-  target_link_libraries(lavik_raft INTERFACE ${CMAKE_DL_LIBS} pthread m)
-
+# Shared operator transport stays below lavik_meta_core so the CLI and
+# operator library have no Raft dependency.
+add_library(lavik_meta_admin STATIC
+  src/meta/admin_client.cpp
+  src/meta/cluster_create.cpp
+  src/meta/cluster_status.cpp
+  src/meta/failover_admin.cpp
+)
+target_include_directories(lavik_meta_admin PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(lavik_meta_admin PUBLIC
+  lavik_sync_transport
+  absl::status
+  absl::statusor
+  OpenSSL::SSL
+  OpenSSL::Crypto
+)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(lavik_meta_admin PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+find_program(LAVIK_GO_EXECUTABLE NAMES go REQUIRED)
+# go.mod's toolchain directive only upgrades an older launcher. Select the
+# exact version for configuration, builds and tests even with a newer Go.
+set(LAVIK_GO_TOOLCHAIN go1.26.8)
+execute_process(COMMAND ${CMAKE_COMMAND} -E env GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
+    ${LAVIK_GO_EXECUTABLE} env GOVERSION
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft
+  OUTPUT_VARIABLE LAVIK_GO_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE
+  COMMAND_ERROR_IS_FATAL ANY)
+if (NOT LAVIK_GO_VERSION STREQUAL LAVIK_GO_TOOLCHAIN)
+  message(FATAL_ERROR "Meta requires ${LAVIK_GO_TOOLCHAIN}; found ${LAVIK_GO_VERSION}")
+endif()
+file(GLOB_RECURSE LAVIK_RAFT_GO_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/raft/*.go ${CMAKE_CURRENT_SOURCE_DIR}/raft/*.h)
+set(LAVIK_RAFT_ARCHIVE ${CMAKE_CURRENT_BINARY_DIR}/liblavik_raft.a)
+set(LAVIK_RAFT_BUILD_TAGS "")
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(LAVIK_RAFT_BUILD_TAGS "-tags=lavik_faults")
+endif()
+add_custom_command(OUTPUT ${LAVIK_RAFT_ARCHIVE}
+  COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=1 CC=${CMAKE_C_COMPILER}
+    GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
+    ${LAVIK_GO_EXECUTABLE} build -mod=readonly ${LAVIK_RAFT_BUILD_TAGS} -buildmode=c-archive
+    -o ${LAVIK_RAFT_ARCHIVE} ./bridge
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft
+  DEPENDS ${LAVIK_RAFT_GO_SOURCES} raft/go.mod raft/go.sum
+    include/lavik/meta/raft_bridge.h
+  VERBATIM)
+add_custom_target(lavik_raft_archive DEPENDS ${LAVIK_RAFT_ARCHIVE})
+add_library(lavik_raft STATIC IMPORTED GLOBAL)
+set_target_properties(lavik_raft PROPERTIES IMPORTED_LOCATION ${LAVIK_RAFT_ARCHIVE})
+add_dependencies(lavik_raft lavik_raft_archive)
+target_link_libraries(lavik_raft INTERFACE ${CMAKE_DL_LIBS} pthread m)
 
 set(LAVIK_LUA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua/src")
 add_library(lavik_lua STATIC
@@ -502,7 +499,7 @@ target_compile_definitions(lavik_module PUBLIC
   LAVIK_ENABLE_READ_LATENCY_TRACE=$<BOOL:${LAVIK_ENABLE_READ_LATENCY_TRACE}>
   LAVIK_ENABLE_SET_LATENCY_TRACE=$<BOOL:${LAVIK_ENABLE_SET_LATENCY_TRACE}>
   LAVIK_ENABLE_CROSS_CORE_HOP_COUNT=$<BOOL:${LAVIK_ENABLE_CROSS_CORE_HOP_COUNT}>
-  LAVIK_ENABLE_TEST_FAULTS=$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>
+  LAVIK_ENABLE_TEST_FAULTS=$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>
 )
 target_link_libraries(lavik_module PUBLIC
   lavik_sync_transport
@@ -522,6 +519,11 @@ target_link_libraries(lavik_module PUBLIC
   lavik_lua
   OpenSSL::Crypto
 )
+# GCC emits a historical parameter-passing ABI note for this source's
+# std::pair<double, double> return. It does not describe a Lavik ABI mismatch.
+set_source_files_properties(src/redis/zset_command.cpp PROPERTIES
+  COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU>:-Wno-psabi>"
+)
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(lavik_module PRIVATE -Wall -Wextra -Wpedantic)
@@ -536,18 +538,6 @@ add_executable(lavik
 )
 target_precompile_headers(lavik REUSE_FROM lavik_module)
 target_link_libraries(lavik PRIVATE lavik::module)
-
-if (LAVIK_BUILD_FAULT_SERVER)
-  # This binary intentionally shares the test-instrumented module with the
-  # ordinary test server in this build tree. The option is rejected unless
-  # BUILD_TESTING is enabled, so packaging cannot accidentally ship it.
-  add_executable(lavik_fault_server
-    app/lavik.cpp
-    app/mimalloc_new_delete.cpp
-  )
-  target_precompile_headers(lavik_fault_server REUSE_FROM lavik_module)
-  target_link_libraries(lavik_fault_server PRIVATE lavik::module)
-endif()
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   if (LAVIK_ENABLE_OPT)
@@ -570,9 +560,6 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         lavik_lease_clock
         lavik_module
         lavik)
-    if (TARGET lavik_fault_server)
-      list(APPEND LAVIK_OPT_TARGETS lavik_fault_server)
-    endif()
     foreach(target IN LISTS LAVIK_OPT_TARGETS)
       target_compile_options(${target} PRIVATE ${LAVIK_OPT_COMPILE_OPTIONS})
     endforeach()
@@ -582,10 +569,6 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   endif()
   if (LAVIK_STATIC_CXX_RUNTIME)
     target_link_options(lavik PRIVATE -static-libstdc++ -static-libgcc)
-    if (TARGET lavik_fault_server)
-      target_link_options(lavik_fault_server PRIVATE
-        -static-libstdc++ -static-libgcc)
-    endif()
   endif()
 endif()
 
@@ -600,112 +583,110 @@ if (UNIX)
   )
 endif()
 
-if (LAVIK_BUILD_META)
-  # Architecture layering: only lavik-meta and Meta tests link the Go Raft
-  # archive. Data and operator targets stay Raft-free. Bycorf owns C++
-  # control-worker ingress; the Go runtime owns consensus, peer transport,
-  # timers, WAL, and snapshot I/O.
-  set(LAVIK_META_CORE_SOURCES
-    src/meta/audit_store.cpp
-    src/meta/automatic_failover_detector.cpp
-    src/meta/automatic_failover_reconciler.cpp
-    src/meta/candidate_plan.cpp
-    src/meta/cluster_create_reconciler.cpp
-    src/meta/commands.cpp
-    src/meta/control_projector.cpp
-    src/meta/coordinator.cpp
-    src/meta/ctl_server.cpp
-    src/meta/sentinel_server.cpp
-    src/meta/data_control_server.cpp
-    src/meta/data_control_runtime_status.cpp
-    src/meta/encoding.cpp
-    src/meta/failover.cpp
-    src/meta/failover_reconciler.cpp
-    src/meta/identity_verifier.cpp
-    src/meta/identity_store.cpp
-    src/meta/membership_reconciler.cpp
-    src/meta/observation_store.cpp
-    src/meta/owner_serviceability.cpp
-    src/meta/operation_store.cpp
-    src/meta/policy_store.cpp
-    src/meta/population_manifest_store.cpp
-    src/meta/proposal_executor.cpp
-    src/meta/state_apply.cpp
-    src/meta/state_machine.cpp
-    src/meta/topology_store.cpp
-    src/meta/value_codec.cpp
-    src/meta/raft.cpp
-  )
-  add_library(lavik_meta_core STATIC ${LAVIK_META_CORE_SOURCES})
-  target_include_directories(lavik_meta_core PUBLIC
-    ${LAVIK_GENERATED_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-  )
-  target_link_libraries(lavik_meta_core PUBLIC
-    lavik_resp_protocol
-    OpenSSL::Crypto
-    lavik_meta_admin
-    lavik::lease_clock
-    lavik::control_transport
-    lavik::control_protocol
-    lavik_raft
-    bycorf::core
-  )
-  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(lavik_meta_core PRIVATE -Wall -Wextra -Wpedantic)
-  endif()
+# Architecture layering: only lavik-meta and Meta tests link the Go Raft
+# archive. Data and operator targets stay Raft-free. Bycorf owns C++
+# control-worker ingress; the Go runtime owns consensus, peer transport,
+# timers, WAL, and snapshot I/O.
+set(LAVIK_META_CORE_SOURCES
+  src/meta/audit_store.cpp
+  src/meta/automatic_failover_detector.cpp
+  src/meta/automatic_failover_reconciler.cpp
+  src/meta/candidate_plan.cpp
+  src/meta/cluster_create_reconciler.cpp
+  src/meta/commands.cpp
+  src/meta/control_projector.cpp
+  src/meta/coordinator.cpp
+  src/meta/ctl_server.cpp
+  src/meta/sentinel_server.cpp
+  src/meta/data_control_server.cpp
+  src/meta/data_control_runtime_status.cpp
+  src/meta/encoding.cpp
+  src/meta/failover.cpp
+  src/meta/failover_reconciler.cpp
+  src/meta/identity_verifier.cpp
+  src/meta/identity_store.cpp
+  src/meta/membership_reconciler.cpp
+  src/meta/observation_store.cpp
+  src/meta/owner_serviceability.cpp
+  src/meta/operation_store.cpp
+  src/meta/policy_store.cpp
+  src/meta/population_manifest_store.cpp
+  src/meta/proposal_executor.cpp
+  src/meta/state_apply.cpp
+  src/meta/state_machine.cpp
+  src/meta/topology_store.cpp
+  src/meta/value_codec.cpp
+  src/meta/raft.cpp
+)
+add_library(lavik_meta_core STATIC ${LAVIK_META_CORE_SOURCES})
+target_include_directories(lavik_meta_core PUBLIC
+  ${LAVIK_GENERATED_INCLUDE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(lavik_meta_core PUBLIC
+  lavik_resp_protocol
+  OpenSSL::Crypto
+  lavik_meta_admin
+  lavik::lease_clock
+  lavik::control_transport
+  lavik::control_protocol
+  lavik_raft
+  bycorf::core
+)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(lavik_meta_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
-  add_executable(lavik-meta
-    app/lavik_meta.cpp
-  )
-  target_include_directories(lavik-meta PRIVATE
-    ${LAVIK_GENERATED_INCLUDE_DIR}
-  )
-  target_link_libraries(lavik-meta PRIVATE
-    lavik_meta_core
-  )
-  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(lavik-meta PRIVATE -Wall -Wextra -Wpedantic)
-  endif()
+add_executable(lavik-meta
+  app/lavik_meta.cpp
+)
+target_include_directories(lavik-meta PRIVATE
+  ${LAVIK_GENERATED_INCLUDE_DIR}
+)
+target_link_libraries(lavik-meta PRIVATE
+  lavik_meta_core
+)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(lavik-meta PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
-  # Direct administration and cluster readiness share one Raft-free CLI over
-  # the Admin transport/operator library, without linking lavik_meta_core.
-  add_executable(lavik-ctl
-    app/lavik_ctl.cpp
-  )
-  target_include_directories(lavik-ctl PRIVATE
-    ${LAVIK_GENERATED_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-  )
-  target_link_libraries(lavik-ctl PRIVATE
-    lavik_meta_admin
-  )
-  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(lavik-ctl PRIVATE -Wall -Wextra -Wpedantic)
-    # These targets are created after the data-plane optimization block, but
-    # ship in the same archive and must honor the same CPU target.
-    if (LAVIK_ENABLE_OPT)
-      foreach(target IN ITEMS lavik_meta_admin lavik_meta_core lavik-meta lavik-ctl)
-        target_compile_options(${target} PRIVATE ${LAVIK_OPT_COMPILE_OPTIONS})
-      endforeach()
-    endif()
+# Direct administration and cluster readiness share one Raft-free CLI over
+# the Admin transport/operator library, without linking lavik_meta_core.
+add_executable(lavik-ctl
+  app/lavik_ctl.cpp
+)
+target_include_directories(lavik-ctl PRIVATE
+  ${LAVIK_GENERATED_INCLUDE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(lavik-ctl PRIVATE
+  lavik_meta_admin
+)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(lavik-ctl PRIVATE -Wall -Wextra -Wpedantic)
+  # These targets are created after the data-plane optimization block, but
+  # ship in the same archive and must honor the same CPU target.
+  if (LAVIK_ENABLE_OPT)
+    foreach(target IN ITEMS lavik_meta_admin lavik_meta_core lavik-meta lavik-ctl)
+      target_compile_options(${target} PRIVATE ${LAVIK_OPT_COMPILE_OPTIONS})
+    endforeach()
   endif()
+endif()
 
-  # Release archives carry all three executables, so Meta and the operator
-  # client must honor the same portable-runtime policy as the data server.
-  if (LAVIK_STATIC_CXX_RUNTIME AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_link_options(lavik-meta PRIVATE -static-libstdc++ -static-libgcc)
-    target_link_options(lavik-ctl PRIVATE -static-libstdc++ -static-libgcc)
-  endif()
+# Release archives carry all three executables, so Meta and the operator
+# client must honor the same portable-runtime policy as the data server.
+if (LAVIK_STATIC_CXX_RUNTIME AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_link_options(lavik-meta PRIVATE -static-libstdc++ -static-libgcc)
+  target_link_options(lavik-ctl PRIVATE -static-libstdc++ -static-libgcc)
+endif()
 
-  # Negative guard for the layering rule above: fail at configure time if
-  # consensus code ever leaks into the data-plane module's link interface.
-  get_target_property(LAVIK_MODULE_IFACE_LIBS lavik_module
-    INTERFACE_LINK_LIBRARIES)
-  if (LAVIK_MODULE_IFACE_LIBS MATCHES "lavik_raft")
-    message(FATAL_ERROR
-      "lavik_module must not link Raft; Raft is meta-plane only")
-  endif()
+# Negative guard for the layering rule above: fail at configure time if
+# consensus code ever leaks into the data-plane module's link interface.
+get_target_property(LAVIK_MODULE_IFACE_LIBS lavik_module
+  INTERFACE_LINK_LIBRARIES)
+if (LAVIK_MODULE_IFACE_LIBS MATCHES "lavik_raft")
+  message(FATAL_ERROR
+    "lavik_module must not link Raft; Raft is meta-plane only")
 endif()
 
 if (BUILD_TESTING)
@@ -749,12 +730,10 @@ if (BUILD_TESTING)
   add_test(NAME lavik_runtime_backends
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_backends_smoke.py $<TARGET_FILE:lavik>)
   set_tests_properties(lavik_runtime_backends PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
-  if(LAVIK_BUILD_META)
-    add_test(NAME lavik_database_modes
-      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/database_modes_smoke.py
-              $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik-ctl>)
-    set_tests_properties(lavik_database_modes PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
-  endif()
+  add_test(NAME lavik_database_modes
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/database_modes_smoke.py
+            $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik-ctl>)
+  set_tests_properties(lavik_database_modes PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
   add_test(NAME lavik_version COMMAND lavik --version)
   set_tests_properties(lavik_version PROPERTIES
     PASS_REGULAR_EXPRESSION "lavik ${LAVIK_VERSION}")
@@ -850,405 +829,399 @@ if (BUILD_TESTING)
       TIMEOUT 15
   )
 
-  if (LAVIK_BUILD_META)
-    # The public operator model is tested without lavik_meta_core so this
-    # target also guards the promised Raft-free client boundary.
-    add_executable(lavik_cluster_status_tests
-      tests/meta_cluster_create_test.cpp
-      tests/meta_cluster_status_test.cpp
-      tests/meta_failover_admin_test.cpp
-    )
-    target_link_libraries(lavik_cluster_status_tests PRIVATE
-      lavik_meta_admin
-      GTest::gtest_main
-    )
-    gtest_discover_tests(lavik_cluster_status_tests
-      TEST_PREFIX cluster_status.
-      PROPERTIES LABELS "meta;operator" TIMEOUT 30)
+  # The public operator model is tested without lavik_meta_core so this
+  # target also guards the promised Raft-free client boundary.
+  add_executable(lavik_cluster_status_tests
+    tests/meta_cluster_create_test.cpp
+    tests/meta_cluster_status_test.cpp
+    tests/meta_failover_admin_test.cpp
+  )
+  target_link_libraries(lavik_cluster_status_tests PRIVATE
+    lavik_meta_admin
+    GTest::gtest_main
+  )
+  gtest_discover_tests(lavik_cluster_status_tests
+    TEST_PREFIX cluster_status.
+    PROPERTIES LABELS "meta;operator" TIMEOUT 30)
 
-    add_test(NAME meta_raft.go
-      COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=1 CC=${CMAKE_C_COMPILER}
-        GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
-        ${LAVIK_GO_EXECUTABLE} test -mod=readonly -race -count=1 ./...)
-    set_tests_properties(meta_raft.go PROPERTIES
-      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft
-      LABELS "meta;raft" TIMEOUT 180 RUN_SERIAL TRUE)
+  add_test(NAME meta_raft.go
+    COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=1 CC=${CMAKE_C_COMPILER}
+      GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
+      ${LAVIK_GO_EXECUTABLE} test -mod=readonly -race -count=1 ./...)
+  set_tests_properties(meta_raft.go PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft
+    LABELS "meta;raft" TIMEOUT 180 RUN_SERIAL TRUE)
 
-    # Meta-plane tests. Links lavik_meta_core (etcd Raft); the data-plane unit
-    # test binary stays Raft-free, while this binary also links the data module
-    # for explicit Meta-projection-to-Data-validation contract tests.
-    add_executable(lavik_meta_tests
-      tests/meta_automatic_failover_detector_test.cpp
-      tests/meta_automatic_failover_reconciler_test.cpp
-      tests/meta_hash_test.cpp
-      tests/meta_cluster_create_reconciler_test.cpp
-      tests/meta_membership_reconciler_test.cpp
-      tests/meta_coordinator_test.cpp
-      tests/meta_candidate_plan_test.cpp
-      tests/meta_control_projector_test.cpp
-      tests/meta_data_control_server_test.cpp
-      tests/meta_failover_transition_apply_test.cpp
-      tests/meta_failover_transition_w2_test.cpp
-      tests/meta_failover_aggregate_revision_test.cpp
-      tests/meta_failover_observation_test.cpp
-      tests/meta_failover_reconciler_test.cpp
-      tests/meta_failover_test.cpp
-      tests/meta_journal_test.cpp
-      tests/meta_model_test.cpp
-      tests/meta_observation_test.cpp
-      tests/meta_owner_serviceability_test.cpp
-      tests/meta_sentinel_server_test.cpp
-      tests/meta_security_test.cpp
-      tests/meta_state_machine_test.cpp
-      tests/meta_stores_test.cpp
+  # Meta-plane tests. Links lavik_meta_core (etcd Raft); the data-plane unit
+  # test binary stays Raft-free, while this binary also links the data module
+  # for explicit Meta-projection-to-Data-validation contract tests.
+  add_executable(lavik_meta_tests
+    tests/meta_automatic_failover_detector_test.cpp
+    tests/meta_automatic_failover_reconciler_test.cpp
+    tests/meta_hash_test.cpp
+    tests/meta_cluster_create_reconciler_test.cpp
+    tests/meta_membership_reconciler_test.cpp
+    tests/meta_coordinator_test.cpp
+    tests/meta_candidate_plan_test.cpp
+    tests/meta_control_projector_test.cpp
+    tests/meta_data_control_server_test.cpp
+    tests/meta_failover_transition_apply_test.cpp
+    tests/meta_failover_transition_w2_test.cpp
+    tests/meta_failover_aggregate_revision_test.cpp
+    tests/meta_failover_observation_test.cpp
+    tests/meta_failover_reconciler_test.cpp
+    tests/meta_failover_test.cpp
+    tests/meta_journal_test.cpp
+    tests/meta_model_test.cpp
+    tests/meta_observation_test.cpp
+    tests/meta_owner_serviceability_test.cpp
+    tests/meta_sentinel_server_test.cpp
+    tests/meta_security_test.cpp
+    tests/meta_state_machine_test.cpp
+    tests/meta_stores_test.cpp
+  )
+  target_link_libraries(lavik_meta_tests PRIVATE
+    lavik_meta_core
+    lavik_module
+    GTest::gtest_main
+  )
+  target_compile_definitions(lavik_meta_tests PRIVATE
+    LAVIK_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  gtest_discover_tests(lavik_meta_tests
+    TEST_PREFIX meta.
+    PROPERTIES
+      LABELS meta
+      TIMEOUT 30
+  )
+
+  # 3-node end-to-end smoke for the meta control plane: membership changes,
+  # replication, crash/restart catch-up, automatic and manual snapshots.
+  find_program(LAVIK_PYTHON3_EXECUTABLE NAMES python3)
+  if (LAVIK_PYTHON3_EXECUTABLE)
+    add_test(
+      NAME meta_integration.smoke_3node
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/smoke_3node.py
+              $<TARGET_FILE:lavik-meta>
+              $<TARGET_FILE:lavik-ctl>
     )
-    target_link_libraries(lavik_meta_tests PRIVATE
-      lavik_meta_core
-      lavik_module
-      GTest::gtest_main
-    )
-    target_compile_definitions(lavik_meta_tests PRIVATE
-      LAVIK_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-    )
-    gtest_discover_tests(lavik_meta_tests
-      TEST_PREFIX meta.
-      PROPERTIES
-        LABELS meta
-        TIMEOUT 30
+    set_tests_properties(meta_integration.smoke_3node PROPERTIES
+      LABELS meta-integration
+      TIMEOUT 120
+      RUN_SERIAL TRUE
     )
 
-    # 3-node end-to-end smoke for the meta control plane: membership changes,
-    # replication, crash/restart catch-up, automatic and manual snapshots.
-    find_program(LAVIK_PYTHON3_EXECUTABLE NAMES python3)
-    if (LAVIK_PYTHON3_EXECUTABLE)
+    add_test(
+      NAME meta_integration.ctl_client
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/ctl_client.py
+              $<TARGET_FILE:lavik-meta>
+              $<TARGET_FILE:lavik-ctl>
+    )
+    set_tests_properties(meta_integration.ctl_client PROPERTIES
+      LABELS meta-integration
+      TIMEOUT 60
+      RUN_SERIAL TRUE
+    )
+
+    add_test(
+      NAME meta_integration.sentinel
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_sentinel.py
+              $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+    )
+    set_tests_properties(meta_integration.sentinel PROPERTIES
+      LABELS meta-integration
+      TIMEOUT 120
+      RUN_SERIAL TRUE
+    )
+
+    # Preparing the large reply commits 2,500 nodes through real Raft.
+    # Keep that setup budget separate from the transport/CLI contract gate;
+    # the slow-reader gate still asserts the production 5-second deadline.
+    add_test(
+      NAME meta_integration.admin_slow_reader
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/ctl_client.py
+              $<TARGET_FILE:lavik-meta>
+              $<TARGET_FILE:lavik-ctl>
+              --case=slow-reader
+    )
+    set_tests_properties(meta_integration.admin_slow_reader PROPERTIES
+      LABELS meta-integration
+      TIMEOUT 180
+      RUN_SERIAL TRUE
+    )
+
+    # Metadata process gates: leader-change safety, WAL/snapshot
+    # recovery matrix, membership-change semantics, transport
+    # connect/cancel/timeout, mTLS, observation lifecycle, and Meta partition
+    # safety.
+    # The backpressure gate enforces a production RSS budget, so sanitizer
+    # allocator quarantine would turn it into a measurement of ASan retention
+    # instead of the bounded live Raft queues it is intended to cover.
+    set(LAVIK_META_INTEGRATION_GATES
+      initial_meta initial_recovery snapshot_vote leader_change recovery membership membership_recovery transport mtls observation_lifecycle
+      partition
+    )
+    if (NOT LAVIK_ASAN_BUILD)
+      list(APPEND LAVIK_META_INTEGRATION_GATES backpressure)
+    endif()
+
+    # Each spins up its own
+    # multi-node lavik-meta clusters; RUN_SERIAL keeps port allocation
+    # and timing margins deterministic.
+    foreach(gate IN LISTS LAVIK_META_INTEGRATION_GATES)
       add_test(
-        NAME meta_integration.smoke_3node
+        NAME meta_integration.gate_${gate}
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/smoke_3node.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_${gate}.py
                 $<TARGET_FILE:lavik-meta>
-                $<TARGET_FILE:lavik-ctl>
       )
-      set_tests_properties(meta_integration.smoke_3node PROPERTIES
-        LABELS meta-integration
-        TIMEOUT 120
-        RUN_SERIAL TRUE
-      )
-
-      add_test(
-        NAME meta_integration.ctl_client
-        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/ctl_client.py
-                $<TARGET_FILE:lavik-meta>
-                $<TARGET_FILE:lavik-ctl>
-      )
-      set_tests_properties(meta_integration.ctl_client PROPERTIES
-        LABELS meta-integration
-        TIMEOUT 60
-        RUN_SERIAL TRUE
-      )
-
-      add_test(
-        NAME meta_integration.sentinel
-        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_sentinel.py
-                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
-      )
-      set_tests_properties(meta_integration.sentinel PROPERTIES
-        LABELS meta-integration
-        TIMEOUT 120
-        RUN_SERIAL TRUE
-      )
-
-      # Preparing the large reply commits 2,500 nodes through real Raft.
-      # Keep that setup budget separate from the transport/CLI contract gate;
-      # the slow-reader gate still asserts the production 5-second deadline.
-      add_test(
-        NAME meta_integration.admin_slow_reader
-        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/ctl_client.py
-                $<TARGET_FILE:lavik-meta>
-                $<TARGET_FILE:lavik-ctl>
-                --case=slow-reader
-      )
-      set_tests_properties(meta_integration.admin_slow_reader PROPERTIES
+      set_tests_properties(meta_integration.gate_${gate} PROPERTIES
         LABELS meta-integration
         TIMEOUT 180
         RUN_SERIAL TRUE
       )
+    endforeach()
+    set_tests_properties(meta_integration.gate_initial_recovery PROPERTIES
+      TIMEOUT 300)
 
-      # Metadata process gates: leader-change safety, WAL/snapshot
-      # recovery matrix, membership-change semantics, transport
-      # connect/cancel/timeout, mTLS, observation lifecycle, and Meta partition
-      # safety.
-      # The backpressure gate enforces a production RSS budget, so sanitizer
-      # allocator quarantine would turn it into a measurement of ASan retention
-      # instead of the bounded live Raft queues it is intended to cover.
-      set(LAVIK_META_INTEGRATION_GATES
-        initial_meta initial_recovery snapshot_vote leader_change recovery membership membership_recovery transport mtls observation_lifecycle
-        partition
-      )
-      if (NOT LAVIK_ASAN_BUILD)
-        list(APPEND LAVIK_META_INTEGRATION_GATES backpressure)
-      endif()
+    # Real-process Meta <-> Data control gate.  It needs both executables,
+    # unlike the Meta-only fault gates above.
+    add_test(
+      NAME meta_integration.gate_data_control
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_data_control.py
+              $<TARGET_FILE:lavik-meta>
+              $<TARGET_FILE:lavik>
+    )
+    set_tests_properties(meta_integration.gate_data_control PROPERTIES
+      LABELS meta-integration
+      TIMEOUT 180
+      RUN_SERIAL TRUE
+    )
 
-      # Each spins up its own
-      # multi-node lavik-meta clusters; RUN_SERIAL keeps port allocation
-      # and timing margins deterministic.
-      foreach(gate IN LISTS LAVIK_META_INTEGRATION_GATES)
-        add_test(
-          NAME meta_integration.gate_${gate}
-          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_${gate}.py
-                  $<TARGET_FILE:lavik-meta>
-        )
-        set_tests_properties(meta_integration.gate_${gate} PROPERTIES
-          LABELS meta-integration
-          TIMEOUT 180
-          RUN_SERIAL TRUE
-        )
-      endforeach()
-      set_tests_properties(meta_integration.gate_initial_recovery PROPERTIES
-        TIMEOUT 300)
-
-      # Real-process Meta <-> Data control gate.  It needs both executables,
-      # unlike the Meta-only fault gates above.
+    # The tracer-bullet test independently verifies the eventual public
+    # Redis surface. Production cluster-create returns at Genesis commit and
+    # deliberately has no redis-cli dependency.
+    find_program(LAVIK_CLUSTER_CREATE_REDIS_CLI NAMES redis-cli)
+    if (LAVIK_CLUSTER_CREATE_REDIS_CLI)
       add_test(
-        NAME meta_integration.gate_data_control
+        NAME meta_integration.gate_cluster_create
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_data_control.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_cluster_create.py
                 $<TARGET_FILE:lavik-meta>
                 $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl>
+                ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
       )
-      set_tests_properties(meta_integration.gate_data_control PROPERTIES
+      set_tests_properties(meta_integration.gate_cluster_create PROPERTIES
         LABELS meta-integration
-        TIMEOUT 180
+        # Multiple independent creation/recovery scenarios each elect Meta
+        # and wait out finite-lease handoff before checking serving readiness.
+        TIMEOUT 600
         RUN_SERIAL TRUE
       )
 
-      # The tracer-bullet test independently verifies the eventual public
-      # Redis surface. Production cluster-create returns at Genesis commit and
-      # deliberately has no redis-cli dependency.
-      find_program(LAVIK_CLUSTER_CREATE_REDIS_CLI NAMES redis-cli)
-      if (LAVIK_CLUSTER_CREATE_REDIS_CLI)
-        add_test(
-          NAME meta_integration.gate_cluster_create
-          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_cluster_create.py
-                  $<TARGET_FILE:lavik-meta>
-                  $<TARGET_FILE:lavik>
-                  $<TARGET_FILE:lavik-ctl>
-                  ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
-        )
-        set_tests_properties(meta_integration.gate_cluster_create PROPERTIES
-          LABELS meta-integration
-          # Multiple independent creation/recovery scenarios each elect Meta
-          # and wait out finite-lease handoff before checking serving readiness.
-          TIMEOUT 600
-          RUN_SERIAL TRUE
-        )
+      add_test(
+        NAME meta_integration.gate_lease_policy
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_lease_policy.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+      )
+      set_tests_properties(meta_integration.gate_lease_policy PROPERTIES
+        LABELS meta-integration TIMEOUT 180 RUN_SERIAL TRUE)
+      add_test(
+        NAME meta_integration.gate_heartbeat_cadence
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_heartbeat_cadence.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+      )
+      set_tests_properties(meta_integration.gate_heartbeat_cadence PROPERTIES
+        LABELS meta-integration TIMEOUT 120 RUN_SERIAL TRUE)
+      add_test(
+        NAME meta_integration.gate_native_replication
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_native_replication.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+      )
+      set_tests_properties(meta_integration.gate_native_replication PROPERTIES
+        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
 
-        set(LAVIK_NATIVE_GATE_SERVER lavik)
-        add_test(
-          NAME meta_integration.gate_lease_policy
-          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_lease_policy.py
-                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
-                  $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
-        )
-        set_tests_properties(meta_integration.gate_lease_policy PROPERTIES
-          LABELS meta-integration TIMEOUT 180 RUN_SERIAL TRUE)
-        add_test(
-          NAME meta_integration.gate_heartbeat_cadence
-          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_heartbeat_cadence.py
-                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
-                  $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
-        )
-        set_tests_properties(meta_integration.gate_heartbeat_cadence PROPERTIES
-          LABELS meta-integration TIMEOUT 120 RUN_SERIAL TRUE)
-        if (TARGET lavik_fault_server)
-          set(LAVIK_NATIVE_GATE_SERVER lavik_fault_server)
-        endif()
-        add_test(
-          NAME meta_integration.gate_native_replication
-          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_native_replication.py
-                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:${LAVIK_NATIVE_GATE_SERVER}>
-                  $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
-        )
-        set_tests_properties(meta_integration.gate_native_replication PROPERTIES
-          LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+      add_test(
+        NAME meta_integration.gate_bootstrap
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_bootstrap.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>)
+      set_tests_properties(meta_integration.gate_bootstrap PROPERTIES
+        LABELS meta-integration TIMEOUT 120 RUN_SERIAL TRUE)
+      add_test(
+        NAME meta_integration.gate_managed_single
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_managed_single.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+      )
+      set_tests_properties(meta_integration.gate_managed_single PROPERTIES
+        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
 
-        add_test(
-          NAME meta_integration.gate_bootstrap
-          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_bootstrap.py
-                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>)
-        set_tests_properties(meta_integration.gate_bootstrap PROPERTIES
-          LABELS meta-integration TIMEOUT 120 RUN_SERIAL TRUE)
-        add_test(
-          NAME meta_integration.gate_managed_single
-          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_managed_single.py
-                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:${LAVIK_NATIVE_GATE_SERVER}>
-                  $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
-        )
-        set_tests_properties(meta_integration.gate_managed_single PROPERTIES
-          LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
-
-        # lavik-meta's deterministic failover seams follow the ordinary
-        # !NDEBUG policy; LAVIK_BUILD_FAULT_SERVER instruments only Data.
-        # Do not register a Release gate that can only fail its required-hook
-        # precondition.
-        if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-          # Failover needs the complete Meta <-> Data <-> Redis surface, so
-          # these cases are deliberately not part of the Meta-only gate loop
-          # above. Keep each failure mode independently addressable and its
-          # process files in a unique child of LAVIK_TEST_DATA_DIR (or /tmp)
-          # on every run. A failed child is retained with its precise path,
-          # while a successful rerun cannot inherit older durable state.
-          # Let the harness read the caller's environment at test runtime.
-          foreach(service_mode IN ITEMS single cluster)
-            foreach(recovery_case IN ITEMS complete donor-failure budget coverage-gap candidate-replace leader-change)
-              add_test(
-                NAME meta_integration.recovery_${service_mode}_${recovery_case}
-                COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_candidate_recovery.py
-                        $<TARGET_FILE:lavik-meta> $<TARGET_FILE:${LAVIK_NATIVE_GATE_SERVER}>
-                        $<TARGET_FILE:lavik-ctl> --mode ${service_mode} --case ${recovery_case})
-              set_tests_properties(meta_integration.recovery_${service_mode}_${recovery_case}
-                PROPERTIES LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
-            endforeach()
-          endforeach()
-          set(LAVIK_FAILOVER_INTEGRATION_CASES
-            controlled
-            full-fallback
-            leader-resume
-            prepared-leader-resume
-            live-leader-demotion
-            candidate-abort
-            lease-fence
-            source-degrade-reselect
-          )
-          # Unix-domain listener paths have a platform limit near 108 bytes.
-          # Process evidence stays in the descriptive per-case directory;
-          # only this unused auxiliary admin listener gets a short build-tree path.
-          set(failover_socket_root "${CMAKE_CURRENT_BINARY_DIR}/fs")
-          file(MAKE_DIRECTORY "${failover_socket_root}")
-          foreach(failover_case IN LISTS LAVIK_FAILOVER_INTEGRATION_CASES)
-            add_test(
-              NAME meta_integration.single_failover_${failover_case}
-              COMMAND ${CMAKE_COMMAND} -E env
-                      "LAVIK_FAILOVER_SOCKET_ROOT=${failover_socket_root}"
-                      ${LAVIK_PYTHON3_EXECUTABLE}
-                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_failover.py
-                      $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>
-                      ${LAVIK_CLUSTER_CREATE_REDIS_CLI} --case=${failover_case}
-                      --mode=single --require-fault-hook)
-            set_tests_properties(meta_integration.single_failover_${failover_case}
-              PROPERTIES LABELS "meta-integration;failover" TIMEOUT 180 RUN_SERIAL TRUE)
-          endforeach()
-          foreach(failover_case IN LISTS LAVIK_FAILOVER_INTEGRATION_CASES)
-            string(REPLACE "-" "_" failover_test_suffix "${failover_case}")
-            set(failover_workdir
-              "${CMAKE_CURRENT_BINARY_DIR}/meta-integration/failover/${failover_case}")
-            file(MAKE_DIRECTORY "${failover_workdir}")
-            add_test(
-              NAME meta_integration.gate_failover_${failover_test_suffix}
-              COMMAND ${CMAKE_COMMAND} -E env
-                      "PYTHONPYCACHEPREFIX=${failover_workdir}/pycache"
-                      "LAVIK_FAILOVER_SOCKET_ROOT=${failover_socket_root}"
-                      ${LAVIK_PYTHON3_EXECUTABLE}
-                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_failover.py
-                      $<TARGET_FILE:lavik-meta>
-                      $<TARGET_FILE:lavik>
-                      $<TARGET_FILE:lavik-ctl>
-                      ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
-                      --case=${failover_case}
-                      --require-fault-hook
-            )
-            set_tests_properties(
-              meta_integration.gate_failover_${failover_test_suffix}
-              PROPERTIES
-              LABELS "meta-integration;failover"
-              TIMEOUT 180
-              RUN_SERIAL TRUE
-            )
-          endforeach()
-        endif()
-      endif()
-
-      # Automatic failover does not invoke redis-cli. Register its real-process
-      # matrix independently so a build without that optional executable still
-      # exercises detection and transition recovery.
+      # lavik-meta's deterministic failover seams follow the ordinary
+      # !NDEBUG policy; LAVIK_ENABLE_TEST_FAULTS instruments only Data.
+      # Do not register a Release gate that can only fail its required-hook
+      # precondition.
       if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-        set(automatic_failover_socket_root "${CMAKE_CURRENT_BINARY_DIR}/afs")
-        file(MAKE_DIRECTORY "${automatic_failover_socket_root}")
-        set(LAVIK_AUTOMATIC_FAILOVER_INTEGRATION_CASES
-          owner-kill
-          owner-pause
-          one-way-partition
-          two-way-partition
-          leader-threshold
-          leader-proposal
-          leader-commit
+        # Failover needs the complete Meta <-> Data <-> Redis surface, so
+        # these cases are deliberately not part of the Meta-only gate loop
+        # above. Keep each failure mode independently addressable and its
+        # process files in a unique child of LAVIK_TEST_DATA_DIR (or /tmp)
+        # on every run. A failed child is retained with its precise path,
+        # while a successful rerun cannot inherit older durable state.
+        # Let the harness read the caller's environment at test runtime.
+        foreach(service_mode IN ITEMS single cluster)
+          foreach(recovery_case IN ITEMS complete donor-failure budget coverage-gap candidate-replace leader-change)
+            add_test(
+              NAME meta_integration.recovery_${service_mode}_${recovery_case}
+              COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_candidate_recovery.py
+                      $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                      $<TARGET_FILE:lavik-ctl> --mode ${service_mode} --case ${recovery_case})
+            set_tests_properties(meta_integration.recovery_${service_mode}_${recovery_case}
+              PROPERTIES LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+          endforeach()
+        endforeach()
+        set(LAVIK_FAILOVER_INTEGRATION_CASES
+          controlled
+          full-fallback
+          leader-resume
+          prepared-leader-resume
+          live-leader-demotion
+          candidate-abort
+          lease-fence
+          source-degrade-reselect
         )
-        foreach(automatic_case IN LISTS
-                LAVIK_AUTOMATIC_FAILOVER_INTEGRATION_CASES)
-          string(REPLACE "-" "_" automatic_test_suffix
-                 "${automatic_case}")
-          set(automatic_workdir
-            "${CMAKE_CURRENT_BINARY_DIR}/meta-integration/automatic-failover/${automatic_case}")
-          file(MAKE_DIRECTORY "${automatic_workdir}")
+        # Unix-domain listener paths have a platform limit near 108 bytes.
+        # Process evidence stays in the descriptive per-case directory;
+        # only this unused auxiliary admin listener gets a short build-tree path.
+        set(failover_socket_root "${CMAKE_CURRENT_BINARY_DIR}/fs")
+        file(MAKE_DIRECTORY "${failover_socket_root}")
+        foreach(failover_case IN LISTS LAVIK_FAILOVER_INTEGRATION_CASES)
           add_test(
-            NAME meta_integration.gate_automatic_failover_${automatic_test_suffix}
+            NAME meta_integration.single_failover_${failover_case}
             COMMAND ${CMAKE_COMMAND} -E env
-                    "PYTHONPYCACHEPREFIX=${automatic_workdir}/pycache"
-                    "LAVIK_FAILOVER_SOCKET_ROOT=${automatic_failover_socket_root}"
+                    "LAVIK_FAILOVER_SOCKET_ROOT=${failover_socket_root}"
                     ${LAVIK_PYTHON3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_automatic_failover.py
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_failover.py
+                    $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>
+                    ${LAVIK_CLUSTER_CREATE_REDIS_CLI} --case=${failover_case}
+                    --mode=single --require-fault-hook)
+          set_tests_properties(meta_integration.single_failover_${failover_case}
+            PROPERTIES LABELS "meta-integration;failover" TIMEOUT 180 RUN_SERIAL TRUE)
+        endforeach()
+        foreach(failover_case IN LISTS LAVIK_FAILOVER_INTEGRATION_CASES)
+          string(REPLACE "-" "_" failover_test_suffix "${failover_case}")
+          set(failover_workdir
+            "${CMAKE_CURRENT_BINARY_DIR}/meta-integration/failover/${failover_case}")
+          file(MAKE_DIRECTORY "${failover_workdir}")
+          add_test(
+            NAME meta_integration.gate_failover_${failover_test_suffix}
+            COMMAND ${CMAKE_COMMAND} -E env
+                    "PYTHONPYCACHEPREFIX=${failover_workdir}/pycache"
+                    "LAVIK_FAILOVER_SOCKET_ROOT=${failover_socket_root}"
+                    ${LAVIK_PYTHON3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_failover.py
                     $<TARGET_FILE:lavik-meta>
                     $<TARGET_FILE:lavik>
                     $<TARGET_FILE:lavik-ctl>
-                    --case=${automatic_case}
+                    ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+                    --case=${failover_case}
                     --require-fault-hook
           )
           set_tests_properties(
-            meta_integration.gate_automatic_failover_${automatic_test_suffix}
+            meta_integration.gate_failover_${failover_test_suffix}
             PROPERTIES
-            LABELS "meta-integration;failover;automatic-failover"
+            LABELS "meta-integration;failover"
             TIMEOUT 180
             RUN_SERIAL TRUE
           )
         endforeach()
-        foreach(recovery_case IN ITEMS startup-barrier startup-stop clean-owner
-                                       clean-replica crash-operator manual-fence
-                                       before-publish after-publish
-                                       before-consume after-consume
-                                       incomplete-full eligible-candidate
-                                       promoted-follower)
-          string(REPLACE "-" "_" recovery_test_suffix "${recovery_case}")
-          add_test(
-            NAME meta_integration.gate_population_recovery_${recovery_test_suffix}
-            COMMAND ${CMAKE_COMMAND} -E env
-                    "LAVIK_FAILOVER_SOCKET_ROOT=${automatic_failover_socket_root}"
-                    ${LAVIK_PYTHON3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_population_recovery.py
-                    $<TARGET_FILE:lavik-meta>
-                    $<TARGET_FILE:lavik>
-                    $<TARGET_FILE:lavik-ctl>
-                    --case=${recovery_case}
-          )
-          set_tests_properties(
-            meta_integration.gate_population_recovery_${recovery_test_suffix}
-            PROPERTIES LABELS "meta-integration;failover;population-recovery"
-                       TIMEOUT 180 RUN_SERIAL TRUE
-          )
-        endforeach()
       endif()
-    else()
-      message(STATUS "python3 not found; meta integration tests are disabled")
     endif()
+
+    # Automatic failover does not invoke redis-cli. Register its real-process
+    # matrix independently so a build without that optional executable still
+    # exercises detection and transition recovery.
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+      set(automatic_failover_socket_root "${CMAKE_CURRENT_BINARY_DIR}/afs")
+      file(MAKE_DIRECTORY "${automatic_failover_socket_root}")
+      set(LAVIK_AUTOMATIC_FAILOVER_INTEGRATION_CASES
+        owner-kill
+        owner-pause
+        one-way-partition
+        two-way-partition
+        leader-threshold
+        leader-proposal
+        leader-commit
+      )
+      foreach(automatic_case IN LISTS
+              LAVIK_AUTOMATIC_FAILOVER_INTEGRATION_CASES)
+        string(REPLACE "-" "_" automatic_test_suffix
+               "${automatic_case}")
+        set(automatic_workdir
+          "${CMAKE_CURRENT_BINARY_DIR}/meta-integration/automatic-failover/${automatic_case}")
+        file(MAKE_DIRECTORY "${automatic_workdir}")
+        add_test(
+          NAME meta_integration.gate_automatic_failover_${automatic_test_suffix}
+          COMMAND ${CMAKE_COMMAND} -E env
+                  "PYTHONPYCACHEPREFIX=${automatic_workdir}/pycache"
+                  "LAVIK_FAILOVER_SOCKET_ROOT=${automatic_failover_socket_root}"
+                  ${LAVIK_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_automatic_failover.py
+                  $<TARGET_FILE:lavik-meta>
+                  $<TARGET_FILE:lavik>
+                  $<TARGET_FILE:lavik-ctl>
+                  --case=${automatic_case}
+                  --require-fault-hook
+        )
+        set_tests_properties(
+          meta_integration.gate_automatic_failover_${automatic_test_suffix}
+          PROPERTIES
+          LABELS "meta-integration;failover;automatic-failover"
+          TIMEOUT 180
+          RUN_SERIAL TRUE
+        )
+      endforeach()
+      foreach(recovery_case IN ITEMS startup-barrier startup-stop clean-owner
+                                     clean-replica crash-operator manual-fence
+                                     before-publish after-publish
+                                     before-consume after-consume
+                                     incomplete-full eligible-candidate
+                                     promoted-follower)
+        string(REPLACE "-" "_" recovery_test_suffix "${recovery_case}")
+        add_test(
+          NAME meta_integration.gate_population_recovery_${recovery_test_suffix}
+          COMMAND ${CMAKE_COMMAND} -E env
+                  "LAVIK_FAILOVER_SOCKET_ROOT=${automatic_failover_socket_root}"
+                  ${LAVIK_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_population_recovery.py
+                  $<TARGET_FILE:lavik-meta>
+                  $<TARGET_FILE:lavik>
+                  $<TARGET_FILE:lavik-ctl>
+                  --case=${recovery_case}
+        )
+        set_tests_properties(
+          meta_integration.gate_population_recovery_${recovery_test_suffix}
+          PROPERTIES LABELS "meta-integration;failover;population-recovery"
+                     TIMEOUT 180 RUN_SERIAL TRUE
+        )
+      endforeach()
+    endif()
+  else()
+    message(STATUS "python3 not found; meta integration tests are disabled")
   endif()
 
   add_executable(lavik_cluster_fault
@@ -1318,7 +1291,7 @@ if (BUILD_TESTING)
     )
     target_compile_definitions(
       lavik_cluster_replication_manager_integration_test PRIVATE
-      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>>
+      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>
     )
     add_test(
       NAME cluster_integration.replication_manager_control_api
@@ -1339,7 +1312,7 @@ if (BUILD_TESTING)
       GTest::gtest
     )
     target_compile_definitions(lavik_cluster_serving_generation_integration_test PRIVATE
-      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>>)
+      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>)
     add_dependencies(lavik_cluster_serving_generation_integration_test lavik)
     find_program(LAVIK_REDIS_SERVER_EXECUTABLE NAMES redis-server)
     if (LAVIK_REDIS_SERVER_EXECUTABLE)
@@ -1458,16 +1431,14 @@ endforeach()
     find_program(LAVIK_REDIS_SERVER_EXECUTABLE redis-server)
     find_program(LAVIK_REDIS_CLI_EXECUTABLE redis-cli)
     if (LAVIK_REDIS_SERVER_EXECUTABLE AND LAVIK_REDIS_CLI_EXECUTABLE)
-      set(LAVIK_FOLLOWER_META_ARGS)
-      if(LAVIK_BUILD_META)
-        list(APPEND LAVIK_FOLLOWER_META_ARGS $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik-ctl>)
-      endif()
+      set(LAVIK_FOLLOWER_META_ARGS
+        $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik-ctl>)
       add_test(NAME lavik_redis_follower
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_follower_smoke.py
                 $<TARGET_FILE:lavik> ${LAVIK_REDIS_SERVER_EXECUTABLE} ${LAVIK_FOLLOWER_META_ARGS})
       set_tests_properties(lavik_redis_follower PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE)
       find_program(LAVIK_REDIS_SHAKE_EXECUTABLE redis-shake)
-      if (LAVIK_BUILD_META AND LAVIK_REDIS_SHAKE_EXECUTABLE)
+      if (LAVIK_REDIS_SHAKE_EXECUTABLE)
         add_test(NAME lavik_redis_scan_reader_e2e
           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_scan_reader_e2e.py
                   $<TARGET_FILE:lavik> ${LAVIK_REDIS_SERVER_EXECUTABLE}
@@ -1575,7 +1546,7 @@ endforeach()
       tests/multikey_e2e_test.cpp
     )
     target_compile_definitions(lavik_multikey_e2e_test PRIVATE
-      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>>)
+      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>)
     add_test(
       NAME lavik_multikey_e2e
       COMMAND lavik_multikey_e2e_test $<TARGET_FILE:lavik>
@@ -1646,7 +1617,7 @@ endforeach()
       PRIVATE lavik::module GTest::gtest
     )
     target_compile_definitions(lavik_grouped_recovery_e2e_test PRIVATE
-      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>>
+      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>
     )
     add_test(
       NAME lavik_grouped_recovery_e2e
@@ -1663,7 +1634,7 @@ endforeach()
       PRIVATE lavik::module GTest::gtest
     )
     target_compile_definitions(lavik_grouped_hash_write_e2e_test PRIVATE
-      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>>
+      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>
     )
     add_test(
       NAME lavik_grouped_hash_write_e2e
@@ -1681,7 +1652,7 @@ endforeach()
       PRIVATE lavik::module GTest::gtest
     )
     target_compile_definitions(lavik_compact_collection_write_e2e_test PRIVATE
-      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>>
+      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>
     )
     add_test(
       NAME lavik_compact_collection_write_e2e
@@ -1702,7 +1673,7 @@ endforeach()
       PRIVATE lavik::module GTest::gtest
     )
     target_compile_definitions(lavik_grouped_ordered_write_e2e_test PRIVATE
-      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>>
+      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>
     )
     add_test(
       NAME lavik_grouped_ordered_write_e2e
@@ -1720,7 +1691,7 @@ endforeach()
     )
     target_compile_definitions(lavik_list_e2e_test PRIVATE
       LAVIK_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_BUILD_FAULT_SERVER}>>
+      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>
     )
     add_test(
       NAME lavik_list_e2e

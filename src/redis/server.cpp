@@ -2379,12 +2379,14 @@ int RunServer(ServerOptions options) {
         .seeds = options.meta_seeds_,
         .node_id = options.node_id_,
         .capabilities = service_capabilities,
+        .tls = std::nullopt,
         .cancel_fd = g_signal_event_fd};
     if (options.tls_replication_) {
       bootstrap.tls =
           net::SyncTlsOptions{.ca_file_ = options.tls_ca_cert_file_,
                               .certificate_file_ = options.tls_cert_file_,
-                              .private_key_file_ = options.tls_key_file_};
+                              .private_key_file_ = options.tls_key_file_,
+                              .server_name_ = {}};
     }
     auto mode = cluster::BootstrapClientService(bootstrap);
     if (!mode.ok()) {

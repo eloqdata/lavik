@@ -361,5 +361,5 @@ those deployment boundaries remain unknown here.
 | Replication manager, cluster failover/follow-owner adapters, protocol, Redis-visible role state, and log boundary | `include/lavik/replication.h`, `include/lavik/replication_command.h`, `src/replication/`, `src/storage/engine/replication_log.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/redis_follower_smoke.py` |
 | Cluster topology, authority, controlled mutation pause, node control, and Meta/Data session | `include/lavik/cluster/`, `src/cluster/`, `src/redis/cluster_gate.h`, `src/redis/command.cpp`, `src/redis/blocking_wait.cpp`, `src/redis/server.cpp` |
 | Memory accounting, slow log, command statistics, and Prometheus service | `include/lavik/memory.h`, `src/memory.cpp`, `include/lavik/metrics.h`, `src/metrics.cpp`, `include/lavik/slowlog.h`, `src/redis/slowlog.cpp` |
-| Build, release, and package commands | `scripts/build_debug.sh`, `scripts/build_release.sh`, `scripts/package_release.sh`, `docs/operations/building-and-packaging.md` |
+| Build, release, and package commands | `scripts/configure_debug.sh`, `scripts/configure_release.sh`, `scripts/package_release.sh`, `docs/operations/building-and-packaging.md` |
 | Lavik process deployment unit or orchestration manifest | Unknown; `deploy/` contains the monitoring stack, not the Lavik process definition |

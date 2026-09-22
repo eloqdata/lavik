@@ -256,8 +256,8 @@ def main():
     root = Path(__file__).resolve().parent.parent
     cache = read_cache(args.build_dir / "CMakeCache.txt")
     bypass = cache["LAVIK_KERNEL_BYPASS"]
-    if bypass not in ("ON", "OFF") or cache["LAVIK_BUILD_META"] != "ON":
-        raise ValueError("Expected a release build with Meta and an explicit bypass variant")
+    if bypass not in ("ON", "OFF"):
+        raise ValueError("Expected a release build with an explicit bypass variant")
     notices = Notices(read(root / "LICENSE"))
     native_notices(notices, root, bypass == "ON")
     go_notices(notices, root, cache["LAVIK_GO_EXECUTABLE"], cache["CMAKE_C_COMPILER"])

@@ -57,20 +57,22 @@ submodules; follow the complete source checkout steps in the
 [README](../../README.md#build-from-source). Other distributions require
 manual installation of equivalent dependencies.
 
-Meta requires the Go toolchain pinned by `raft/go.mod` (currently 1.26.8),
-CGO, and the configured C compiler. The Ubuntu installer includes a Go bootstrap
-compiler; Go automatically downloads the pinned toolchain and checksummed
-modules on first configuration/build. CMake sets `GOTOOLCHAIN` to the exact
-version for configuration, archive builds and tests, including when the local
-Go launcher is newer. CI uses `actions/setup-go` with that same
-module file. No etcd submodule or running etcd service is required. Offline
-builders must prepopulate the Go toolchain/module caches. Set
+Every Lavik configuration includes the Meta targets and requires the Go
+toolchain pinned by `raft/go.mod` (currently 1.26.8), CGO, and the configured C
+compiler. The Ubuntu installer includes a Go bootstrap compiler; Go
+automatically downloads the pinned toolchain and checksummed modules on first
+configuration/build. CMake sets `GOTOOLCHAIN` to the exact version for
+configuration, archive builds and tests, including when the local Go launcher
+is newer. CI uses `actions/setup-go` with that same module file. No etcd
+submodule or running etcd service is required. Offline builders must
+prepopulate the Go toolchain/module caches. Set
 `-DLAVIK_GO_EXECUTABLE=/path/to/go` to select the Go launcher.
 
 Optimized local builds use the current machine's instruction set by default:
 
 ```bash
-./scripts/build_release.sh
+./scripts/configure_release.sh
+cmake --build build --target lavik lavik-meta lavik-ctl --parallel
 ```
 
 Build on the deployment machine to enable CPU optimizations beyond the
@@ -80,8 +82,12 @@ run on CPUs with fewer instruction-set features, so use a shared CPU target
 when building for a fleet of different machines.
 
 Additional arguments are forwarded to CMake, for example
-`./scripts/build_release.sh -DLAVIK_KERNEL_BYPASS=ON` after installing and
-initializing the bypass dependencies below.
+`./scripts/configure_release.sh -DLAVIK_KERNEL_BYPASS=ON` after installing and
+initializing the bypass dependencies below. Build the selected targets with
+`cmake --build build --parallel` after configuration. The configure scripts
+set bypass to `OFF` by default on every run, so pass the `ON` override each time
+you reconfigure a bypass build. `cmake --build` does not accept CMake `-D`
+options.
 
 `LAVIK_KERNEL_BYPASS` defaults to `OFF`: Lavik and `lavik-meta` build
 with kernel networking and io_uring and do not configure or link DPDK, SPDK or
@@ -287,8 +293,8 @@ the same setting; their auxiliary Unix sockets use short build-directory
 paths to stay within the platform's socket-name limit.
 
 The focused large-Hash durability suite uses its own temporary 128 MiB files
-and local child servers. Run it against a Debug build or a build configured
-with `LAVIK_BUILD_FAULT_SERVER=ON` to exercise the crash injections:
+and local child servers. Run it against a Debug build or a test build configured
+with `LAVIK_ENABLE_TEST_FAULTS=ON` to exercise the crash injections:
 
 ```bash
 cmake --build bld-clang18-debug --target lavik lavik_list_e2e_test -j 8
@@ -350,7 +356,7 @@ The current adapter and integration limits are documented in
 
 Use `include/lavik/fault_injection.h` for internal crash, allocation-failure
 and scheduling hooks. Its single build policy enables hooks in Debug or with
-`LAVIK_BUILD_FAULT_SERVER=ON`; ordinary Release builds erase the hook bodies
+`LAVIK_ENABLE_TEST_FAULTS=ON`; ordinary Release builds erase the hook bodies
 and their arguments, including environment lookups and injected suspension
 points. Set fault environment variables before launching the server, not
 concurrently with its workers.
@@ -425,8 +431,8 @@ Cluster fault tests use a dedicated build and bounded tier runner:
 
 ```bash
 cmake -S . -B build_cluster_fault -DCMAKE_BUILD_TYPE=Debug \
-  -DLAVIK_ENABLE_OPT=OFF -DLAVIK_STATIC_OPENSSL=ON \
-  -DBUILD_TESTING=ON -DLAVIK_BUILD_FAULT_SERVER=ON
+  -DLAVIK_ENABLE_OPT=OFF \
+  -DBUILD_TESTING=ON -DLAVIK_ENABLE_TEST_FAULTS=ON
 ./scripts/run_cluster_fault_tests.sh --tier model
 ./scripts/run_cluster_fault_tests.sh --tier integration
 ./scripts/run_cluster_fault_tests.sh --tier soak --duration 600
@@ -449,9 +455,9 @@ gitlink revision from the tested Lavik commit. It does not need a deploy key or
 an extra Actions secret, so fork pull requests can run the same software suite.
 The main checkout does not persist credentials.
 
-Both use Clang 18, Debug, `BUILD_TESTING=ON`, `LAVIK_BUILD_META=ON`,
-`LAVIK_BUILD_FAULT_SERVER=ON`, and `LAVIK_ENABLE_OPT=OFF`. Debug is required
-for the Meta fault gates; the Data fault server alone does not enable them.
+Both use Clang 18, Debug, `BUILD_TESTING=ON`,
+`LAVIK_ENABLE_TEST_FAULTS=ON`, and `LAVIK_ENABLE_OPT=OFF`. Debug is required
+for the Meta fault gates; the Data fault option alone does not enable them.
 Redis, Python, and TCL are installed before configuration so the conditional
 integration targets are present. The jobs fetch the pinned io_uring runtime
 dependencies; SPDK is not part of this build.
@@ -537,9 +543,9 @@ custom dependency distributions require adapting the collector's inputs.
 When adding a native dependency, update the collector's explicit manifest.
 Go modules are discovered automatically with the pinned toolchain and
 `go list -mod=readonly -deps ./bridge`.
-It explicitly configures `LAVIK_BUILD_META=ON`, `BUILD_TESTING=OFF`, and
-`LAVIK_BUILD_FAULT_SERVER=OFF`; CMake also rejects the fault-server option
-whenever `BUILD_TESTING` is off.
+It explicitly configures `BUILD_TESTING=OFF`; CMake also rejects
+`LAVIK_ENABLE_TEST_FAULTS=ON` whenever testing is off. Meta and the operator
+client are unconditional parts of the build graph.
 
 Unlike a local build, a package never selects `native` by default. The `minimal`
 variant uses the compiler's default CPU target on both x86_64 and aarch64,

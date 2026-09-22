@@ -80,7 +80,9 @@ StorageEngine::Impl::PrepareGroupedHashMutation(
         !changed
              .emplace(id,
                       HashGroupSnapshot{.incarnation_ = plan.root_.incarnation_,
-                                        .id_ = id})
+                                        .id_ = id,
+                                        .retired_ = false,
+                                        .value_ = {}})
              .second) {
       return absl::FailedPreconditionError("stale grouped mutation route");
     }
@@ -110,7 +112,8 @@ StorageEngine::Impl::PrepareGroupedHashMutation(
       plan.root_.group_count_ += replacements->size() - 1;
       plan.writes_.push_back({.incarnation_ = plan.root_.incarnation_,
                               .id_ = id,
-                              .retired_ = true});
+                              .retired_ = true,
+                              .value_ = {}});
     }
     for (auto& replacement : *replacements) {
       plan.writes_.push_back(std::move(replacement));

@@ -194,6 +194,8 @@ absl::Status ValidateActiveMetaDirectory(
       .directory = std::move(directory),
       .observation_ttl_ms = 1,
       .session_progress_timeout_ms = 1,
+      .service = {},
+      .rejection_reason = {},
   };
   auto encoded = control::EncodeMessage(control::WireMessage(std::move(probe)));
   if (!encoded.ok() ||

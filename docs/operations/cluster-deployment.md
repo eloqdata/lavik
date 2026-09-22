@@ -65,7 +65,8 @@ regenerated or edited before restarting with this version.
 Build the three cluster binaries and launch a local cluster:
 
 ```bash
-./scripts/build_release.sh
+./scripts/configure_release.sh
+cmake --build build --target lavik lavik-meta lavik-ctl --parallel
 ./scripts/cluster_local_example.sh bootstrap --root /tmp/lavik-cluster
 ```
 
