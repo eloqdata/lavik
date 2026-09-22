@@ -120,10 +120,11 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     if (now_ms == 0) now_ms = UnixTimeMillis();
     const bool exists = stored_value && !IsExpired(*found, now_ms);
     if ((value_type == ValueType::kSortedSet ||
-         value_type == ValueType::kStream) &&
+         value_type == ValueType::kStream ||
+         value_type == ValueType::kString) &&
         !exists && found && found->value_.grouped()) {
       // A tentative failed root must not hide behind its uncommitted TTL in
-      // legacy callbacks either. Ordinary String reads keep their old path.
+      // whole-value callbacks either.
       const auto readable = co_await ReadKeyMetadataLocked(db_id, key, digest);
       if (!readable.ok()) co_return readable.status();
     }
@@ -422,6 +423,12 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     const std::uint64_t logical_size =
         update->reuse_encoded_ ? location.logical_size_ : update->logical_size_;
     const bool promote_ordered = encoded.size() >= kCollectionPromotionBytes;
+    if (!update->erase_ && value_type == ValueType::kString && grouped &&
+        !encoded.empty()) {
+      co_return co_await WriteGroupedStringLocked(
+          store, partition, db_id, key, digest, encoded, expire_at_ms, tx,
+          replication, mutation_precondition, grouped, view->encoded_);
+    }
     const auto collection_kind = value_type == ValueType::kStream
                                      ? OrderedCollectionKind::kStream
                                      : OrderedCollectionKind::kSortedSet;

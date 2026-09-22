@@ -89,31 +89,6 @@ absl::StatusOr<std::uint64_t> ParseExpireAt(std::string_view text, bool seconds,
                                       PastExpirationPolicy::kRejectNonPositive);
 }
 
-std::string_view Range(std::string_view value, std::int64_t start,
-                       std::int64_t stop) {
-  if (start < 0 && stop < 0 && start > stop) return {};
-  const std::uint64_t size = value.size();
-  auto normalize = [size](std::int64_t index) {
-    if (index < 0 && size <= static_cast<std::uint64_t>(INT64_MAX)) {
-      if (index < -static_cast<std::int64_t>(size)) return std::int64_t{0};
-      return static_cast<std::int64_t>(size) + index;
-    }
-    return index;
-  };
-  start = normalize(start);
-  stop = normalize(stop);
-  if (start < 0) start = 0;
-  if (stop < 0) stop = 0;
-  if (value.empty() || start > stop ||
-      static_cast<std::uint64_t>(start) >= value.size()) {
-    return {};
-  }
-  const std::uint64_t end = std::min<std::uint64_t>(
-      static_cast<std::uint64_t>(stop), value.size() - 1);
-  return value.substr(static_cast<std::size_t>(start),
-                      static_cast<std::size_t>(end - start + 1));
-}
-
 constexpr std::uint64_t kMaximumBitmapOffset = storage::kMaxStringBytes * 8 - 1;
 
 absl::StatusOr<std::uint64_t> ParseBitOffset(std::string_view text,
@@ -511,6 +486,22 @@ bycorf::Task<std::string> RunBitmapLocked(
     }
     bit_value = static_cast<int>(parsed);
   }
+  if (request.kind_ == CommandKind::kGetBit ||
+      request.kind_ == CommandKind::kSetBit) {
+    const bool write = request.kind_ == CommandKind::kSetBit;
+    storage::StringSegmentOperation operation{
+        .kind_ = write ? storage::StringSegmentOperation::Kind::kSetBit
+                       : storage::StringSegmentOperation::Kind::kGetBit,
+        .start_ = static_cast<std::int64_t>(bit_offset),
+        .value_ = {},
+        .bit_ = bit_value != 0};
+    auto result = co_await g_storage->ExecuteStringSegmentLocked(
+        db, key, digest, operation, tx, replication ? &*replication : nullptr,
+        mutation_precondition);
+    if (!result.ok()) co_return StorageError(result.status());
+    if (result->changed_) CaptureReplicationCommand(request, args);
+    co_return EncodeInteger(result->bit_ ? 1 : 0);
+  }
   if (request.kind_ == CommandKind::kBitPos) {
     std::int64_t parsed = 0;
     if (!ParseRedisInt64(args[2], &parsed)) {
@@ -531,8 +522,7 @@ bycorf::Task<std::string> RunBitmapLocked(
     bitfield = std::move(*parsed);
   }
 
-  const bool read_only = request.kind_ == CommandKind::kGetBit ||
-                         request.kind_ == CommandKind::kBitCount ||
+  const bool read_only = request.kind_ == CommandKind::kBitCount ||
                          request.kind_ == CommandKind::kBitPos ||
                          (bitfield.has_value() && !bitfield->writes_);
   std::string reply;
@@ -541,28 +531,6 @@ bycorf::Task<std::string> RunBitmapLocked(
     const bool exists = current.has_value();
     const std::string_view old =
         exists ? current->encoded_ : std::string_view{};
-    if (request.kind_ == CommandKind::kGetBit) {
-      reply = EncodeInteger(BitmapBit(old, bit_offset) ? 1 : 0);
-      return storage::CompactValueUpdate{};
-    }
-    if (request.kind_ == CommandKind::kSetBit) {
-      const bool previous = BitmapBit(old, bit_offset);
-      reply = EncodeInteger(previous ? 1 : 0);
-      const std::size_t required =
-          static_cast<std::size_t>((bit_offset >> 3) + 1);
-      if (required <= old.size() && previous == (bit_value != 0)) {
-        return storage::CompactValueUpdate{};
-      }
-      std::string next(old);
-      next.resize(std::max(next.size(), required), '\0');
-      SetBitmapBit(&next, bit_offset, bit_value != 0);
-      return storage::CompactValueUpdate{
-          .changed_ = true,
-          .encoded_ = std::move(next),
-          .logical_size_ = required > old.size() ? required : old.size(),
-          .expire_at_ms_ = std::nullopt,
-      };
-    }
     if (request.kind_ == CommandKind::kBitCount) {
       if (!exists) {
         reply = EncodeInteger(0);
@@ -783,6 +751,21 @@ bycorf::Task<std::string> RunStringLocked(
   if (request.kind_ == CommandKind::kSetRange && first_integer < 0) {
     co_return EncodeError("ERR offset is out of range");
   }
+  if (request.kind_ == CommandKind::kSetRange ||
+      request.kind_ == CommandKind::kAppend) {
+    const bool append = request.kind_ == CommandKind::kAppend;
+    storage::StringSegmentOperation operation{
+        .kind_ = append ? storage::StringSegmentOperation::Kind::kAppend
+                        : storage::StringSegmentOperation::Kind::kWriteRange,
+        .start_ = first_integer,
+        .value_ = args[append ? 2 : 3]};
+    auto result = co_await g_storage->ExecuteStringSegmentLocked(
+        db, key, digest, operation, tx, replication ? &*replication : nullptr,
+        mutation_precondition);
+    if (!result.ok()) co_return StorageError(result.status());
+    if (result->changed_) CaptureReplicationCommand(request, args);
+    co_return EncodeInteger(result->length_);
+  }
   if (request.kind_ == CommandKind::kGetEx) {
     const bool persist =
         args.size() == 3 && RedisEqualsIgnoreCase(args[2], "persist");
@@ -879,38 +862,6 @@ bycorf::Task<std::string> RunStringLocked(
           .logical_size_ = old.size(),
           .expire_at_ms_ = *getex_deadline,
       };
-    }
-
-    if (request.kind_ == CommandKind::kSetRange) {
-      if (args[3].empty()) {
-        reply = EncodeInteger(static_cast<long long>(old.size()));
-        return storage::CompactValueUpdate{};
-      }
-      const std::uint64_t offset = static_cast<std::uint64_t>(first_integer);
-      if (offset > storage::kMaxStringBytes ||
-          args[3].size() > storage::kMaxStringBytes - offset) {
-        return absl::OutOfRangeError(
-            "string exceeds maximum allowed size (proto-max-bulk-len)");
-      }
-      std::string next(old);
-      if (next.size() < offset + args[3].size()) {
-        next.resize(static_cast<std::size_t>(offset + args[3].size()), '\0');
-      }
-      next.replace(static_cast<std::size_t>(offset), args[3].size(), args[3]);
-      reply = EncodeInteger(static_cast<long long>(next.size()));
-      return changed(std::move(next));
-    }
-
-    if (request.kind_ == CommandKind::kAppend) {
-      if (old.size() > storage::kMaxStringBytes ||
-          args[2].size() > storage::kMaxStringBytes - old.size()) {
-        return absl::OutOfRangeError(
-            "string exceeds maximum allowed size (proto-max-bulk-len)");
-      }
-      std::string next(old);
-      next.append(args[2]);
-      reply = EncodeInteger(static_cast<long long>(next.size()));
-      return changed(std::move(next));
     }
 
     if (request.kind_ == CommandKind::kIncrByFloat) {
@@ -1378,14 +1329,16 @@ bycorf::Task<CommandReply> ExecuteStringCommandLocked(
       co_return Built(reply_builder.AppendError(
           "ERR value is not an integer or out of range"));
     }
-    auto current = co_await ReadOptionalStringLocked(request.db_id_,
-                                                     request.args_[1], digest);
-    if (!current.ok()) {
-      co_return Built(reply_builder.AppendRaw(StorageError(current.status())));
+    auto result = co_await g_storage->ExecuteStringSegmentLocked(
+        request.db_id_, request.args_[1], digest,
+        {.kind_ = storage::StringSegmentOperation::Kind::kReadRange,
+         .start_ = start,
+         .stop_ = stop,
+         .value_ = {}});
+    if (!result.ok()) {
+      co_return Built(reply_builder.AppendRaw(StorageError(result.status())));
     }
-    const std::string_view value =
-        current->has_value() ? (**current).encoded_ : std::string_view{};
-    co_return Built(reply_builder.AppendBulkString(Range(value, start, stop)));
+    co_return Built(reply_builder.AppendBulkString(result->value_));
   }
   std::string encoded =
       co_await RunStringLocked(request, digest, tx, mutation_precondition);

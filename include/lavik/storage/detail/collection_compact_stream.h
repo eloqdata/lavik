@@ -34,7 +34,8 @@
 namespace lavik::storage {
 
 // Streams the existing compact wire image, not the durable grouped layout.
-// Aggregate lengths are uint64_t, while the unchanged wire count is uint32_t.
+// Aggregate lengths are uint64_t, while the unchanged collection wire count is
+// uint32_t. String sources emit raw segment bytes; their count is byte length.
 // No serialized whole-value or whole-page buffer is allocated. Pages must be
 // supplied in logical order, including empty Hash/Set routing pages if desired.
 // Stream pages supply internal logical records; total_count counts those
@@ -46,7 +47,8 @@ class CollectionCompactEncoder {
       std::uint64_t total_encoded_bytes);
 
   // Validates a page and measures only its entries, excluding the single
-  // collection header. Add 32 bytes for Hash/Set, or 8 for List/Sorted Set.
+  // collection header. Add 32 bytes for Hash/Set, 8 for List/Sorted Set,
+  // or zero for String.
   // Stream header/count fragments are themselves records, with no extra header.
   static absl::StatusOr<std::uint64_t> MeasurePage(const CollectionPage& page);
 

@@ -41,7 +41,8 @@ struct CollectionScoredMember {
 // Exactly the container selected by value_type_ may contain entries. Hash/Set
 // routing can produce empty pages: consumers must advance next_cursor_ even
 // when no entries are returned. List and Sorted Set pages preserve logical
-// order. Individual strings retain Redis' 512 MiB limit; the collection's
+// order. String replication sources use elements_ for raw byte segments.
+// Individual strings retain Redis' 512 MiB limit; the collection's
 // aggregate size is not represented by, or limited to, a single string.
 // Stream elements_ contain ordered internal logical records (including metadata
 // and PEL), so size() counts records rather than messages. Portable projection

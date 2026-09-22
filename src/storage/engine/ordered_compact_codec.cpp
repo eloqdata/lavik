@@ -68,6 +68,18 @@ absl::StatusOr<std::string> EncodeOrderedCompactValue(
     std::span<const OrderedCollectionEntry> entries) {
   if (kind == OrderedCollectionKind::kStream)
     return EncodeStreamRecords(entries);
+  if (kind == OrderedCollectionKind::kString) {
+    std::size_t size = 0;
+    for (const auto& entry : entries) {
+      if (entry.value_.size() > kMaxStringBytes - size)
+        return absl::OutOfRangeError("String exceeds maximum length");
+      size += entry.value_.size();
+    }
+    std::string result;
+    result.reserve(size);
+    for (const auto& entry : entries) result.append(entry.value_);
+    return result;
+  }
   if (!ValidKind(kind) || entries.empty() ||
       entries.size() > std::numeric_limits<std::uint32_t>::max()) {
     return absl::InvalidArgumentError("invalid ordered full-image kind/count");

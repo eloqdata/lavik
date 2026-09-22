@@ -766,8 +766,8 @@ struct DetachedIndex {
   RecordIndex index_;
   std::uint8_t db_id_ = 0;
   // Sparse collection metadata follows the same detached population. Retain
-  // the complete graph until its records/extents have been subtracted; an
-  // ordinary String-only population allocates no grouped side index here.
+  // the complete graph until its records/extents have been subtracted; a
+  // compact-only population allocates no grouped side index here.
   std::optional<GroupedObjectIndex> grouped_;
 };
 
@@ -1571,7 +1571,7 @@ class StorageEngine::Impl {
       // Views into the worker's fixed, contiguous index arrays. Prepare binds
       // them once; neither the arrays nor their arena move afterwards.
       std::span<RecordIndex> indexes_;
-      // Sparse second-level metadata: ordinary String and compact collection
+      // Sparse second-level metadata: compact String and collection
       // keys never consult this table. Its population follows the top-level
       // index through detach/reset; handles alone do not pin physical data.
       std::span<GroupedObjectIndex> grouped_objects_;
@@ -2006,6 +2006,25 @@ class StorageEngine::Impl {
       std::uint64_t now_ms, ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition,
       CompactAccessOptions access = {});
+  // Validate a tentative grouped decision before consulting its expiry/type.
+  absl::Status ValidateGroupedRead(WorkerStore::PartitionStore& partition,
+                                   std::uint8_t db_id, std::string_view key,
+                                   const RecordIndex::Entry* entry);
+  Task<absl::StatusOr<StringSegmentResult>> ExecuteStringSegmentLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const StringSegmentOperation& operation, TxShardWrites* tx,
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
+  // Full-image callbacks reuse unchanged segments when the size does not
+  // shrink. Replacement/shrinking values receive a fresh incarnation.
+  Task<absl::Status> WriteGroupedStringLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      std::string_view value, std::uint64_t expire_at_ms, TxShardWrites* tx,
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition,
+      GroupedHashObject::Handle previous = nullptr,
+      std::string_view before = {});
   Task<absl::Status> ExecuteCompactLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ValueType value_type, bool read_only,
@@ -3314,7 +3333,8 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<LoadedValue>> LoadExternalValueLocal(
       WorkerStore& store, const RecordLocation& location,
-      ExtentManifest extents, std::size_t key_bytes, ReadLatencyTrace* trace);
+      ExtentManifest extents, std::size_t key_bytes, ReadLatencyTrace* trace,
+      bool grouped_payload = false);
 
   Task<absl::StatusOr<LoadedValue>> LoadValueLocal(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,

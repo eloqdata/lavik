@@ -932,7 +932,8 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
                            static_cast<std::uint64_t>(record.key_bytes_) +
                                record.logical_size_,
                            record.kind_ != RecordKind::kValue ||
-                               record.value_type_ == ValueType::kString);
+                               (record.value_type_ == ValueType::kString &&
+                                !record.grouped_ && !record.auxiliary_group_));
         if (!decoded.ok()) {
           source.defragging_ = false;
           co_return decoded.status();
@@ -971,7 +972,8 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       auto decoded =
           DecodeManifest(payload, extent_bytes,
                          record.kind_ != RecordKind::kValue ||
-                             record.value_type_ == ValueType::kString);
+                             (record.value_type_ == ValueType::kString &&
+                              !record.grouped_ && !record.auxiliary_group_));
       if (!decoded.ok()) {
         source.defragging_ = false;
         co_return decoded.status();

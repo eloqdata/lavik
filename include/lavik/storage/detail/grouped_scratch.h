@@ -42,9 +42,11 @@ class GroupedScratchBudget {
       const RecordLocation& location,
       const std::shared_ptr<const std::vector<ExtentRef>>& extents,
       std::size_t key_bytes) {
-    return AddLayout(location.total_disk_bytes(), location.logical_size_,
-                     location.external(), location.key_external(), extents,
-                     key_bytes);
+    return AddLayout(
+        location.total_disk_bytes(),
+        location.value_type() == ValueType::kString ? 1
+                                                    : location.logical_size_,
+        location.external(), location.key_external(), extents, key_bytes);
   }
 
   // A retained immutable view owns these size fields, not the allocation
@@ -56,9 +58,10 @@ class GroupedScratchBudget {
       const RecordIndexValue& value,
       const std::shared_ptr<const std::vector<ExtentRef>>& extents,
       std::size_t key_bytes) {
-    return AddLayout(value.total_disk_bytes(), value.logical_size(),
-                     value.external(), value.key_external(), extents,
-                     key_bytes);
+    return AddLayout(
+        value.total_disk_bytes(),
+        value.value_type() == ValueType::kString ? 1 : value.logical_size(),
+        value.external(), value.key_external(), extents, key_bytes);
   }
 
   // Includes caller-owned copies of incoming fields/items before making them.

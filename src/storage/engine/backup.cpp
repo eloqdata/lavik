@@ -667,7 +667,8 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
   }
 
   const SavedValue physical = saved->value_;
-  if (physical.grouped_ != nullptr) {
+  if (physical.grouped_ != nullptr &&
+      physical.location_.value_type() != ValueType::kString) {
     // The dirty-map entry remains Inflight until Finish/End. Its immutable
     // view and exact graph pins, not the current key index, own every page
     // read while a filesystem queue may suspend the producer.

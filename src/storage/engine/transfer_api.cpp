@@ -311,7 +311,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       if (*found == nullptr || (*found)->value_.kind() != RecordKind::kValue)
         co_return absl::NotFoundError("key not found");
       const auto location = MaterializeIndexLocation(**found);
-      if (!location.grouped()) {
+      if (!location.grouped() || location.value_type() == ValueType::kString) {
         if (IsExpiredNow(**found))
           co_return absl::NotFoundError("key not found");
         unlock.Unlock();

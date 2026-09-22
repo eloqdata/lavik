@@ -123,6 +123,62 @@ TEST(GroupedCollectionTest, RootAndPageRoundTripBothKinds) {
   }
 }
 
+TEST(GroupedCollectionTest, StringSegmentsValidateLengthsAndDirectPositions) {
+  OrderedGroupSnapshot first{
+      .kind_ = OrderedCollectionKind::kString,
+      .incarnation_ = 17,
+      .id_ = 1,
+      .next_ = 2,
+      .entries_ = {{.value_ = std::string(kStringGroupBytes, 'a')}}};
+  OrderedGroupSnapshot tail{.kind_ = OrderedCollectionKind::kString,
+                            .incarnation_ = 17,
+                            .id_ = 2,
+                            .previous_ = 1,
+                            .entries_ = {{.value_ = "tail"}}};
+  auto root = Root({first, tail}, 3);
+  root.item_count_ = kStringGroupBytes + 4;
+  auto candidates = Candidates({first, tail});
+  candidates[0].item_count_ = kStringGroupBytes;
+  candidates[1].item_count_ = 4;
+  auto directory = OrderedGroupDirectory::Recover(root, 1, candidates, {});
+  ASSERT_TRUE(directory.ok()) << directory.status();
+  EXPECT_EQ(directory->Find(1), &directory->groups()[0]);
+  EXPECT_EQ(directory->Find(2), &directory->groups()[1]);
+  EXPECT_EQ(directory->Find(0), nullptr);
+  EXPECT_EQ(directory->Find(3), nullptr);
+  auto position = directory->FindRank(kStringGroupBytes + 2);
+  ASSERT_TRUE(position.has_value());
+  EXPECT_EQ(position->group_index_, 1);
+  EXPECT_EQ(position->offset_, 2);
+  EXPECT_FALSE(directory->FindRank(root.item_count_).has_value());
+  auto encoded = EncodeOrderedGroup(first);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  EXPECT_EQ(encoded->size(), kOrderedGroupHeaderBytes + kStringGroupBytes);
+  auto decoded = DecodeOrderedGroup(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(decoded->entries_, first.entries_);
+  OrderedGroupMetadataDecoder metadata(encoded->size());
+  for (std::size_t offset = 0; offset < encoded->size(); offset += 13)
+    ASSERT_TRUE(
+        metadata.Read(std::string_view(*encoded).substr(offset, 13)).ok());
+  ASSERT_TRUE(metadata.Finish().ok());
+  EXPECT_EQ(metadata.Finish()->item_count_, kStringGroupBytes);
+  first.entries_[0].value_.pop_back();
+  EXPECT_FALSE(EncodeOrderedGroup(first).ok());
+  candidates[0].item_count_--;
+  candidates[1].item_count_++;
+  EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 1, candidates, {}).ok());
+  tail.entries_.clear();
+  tail.previous_ = 0;
+  tail.retired_ = true;
+  EXPECT_FALSE(EncodeOrderedGroup(tail).ok());
+  auto retired = EncodeOrderedGroup(Page());
+  ASSERT_TRUE(retired.ok());
+  (*retired)[12] = static_cast<char>(OrderedCollectionKind::kString);
+  (*retired)[13] = 1;
+  EXPECT_FALSE(DecodeOrderedGroup(*retired).ok());
+}
+
 TEST(GroupedCollectionTest, BothRootShapesUseV1AndCheckMemberIndexPresence) {
   auto root = Root({Page(1, 3, OrderedCollectionKind::kSortedSet)}, 2);
   root.revision_ = 9;

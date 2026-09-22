@@ -33,9 +33,12 @@ bool HashWire(ValueType type) {
   return type == ValueType::kHash || type == ValueType::kSet;
 }
 
-std::size_t HeaderBytes(ValueType type) { return HashWire(type) ? 32 : 8; }
+std::size_t HeaderBytes(ValueType type) {
+  return type == ValueType::kString ? 0 : HashWire(type) ? 32 : 8;
+}
 
 std::size_t EntryFraming(ValueType type) {
+  if (type == ValueType::kString) return 0;
   if (HashWire(type)) return 8;
   return type == ValueType::kSortedSet ? 12 : 4;
 }
@@ -59,6 +62,10 @@ absl::Status ValidateTotals(ValueType type, std::uint64_t count,
       return absl::InvalidArgumentError("invalid logical Stream wire totals");
     return absl::OkStatus();
   }
+  if (type == ValueType::kString)
+    return count != 0 && count == bytes && bytes <= kMaxStringBytes
+               ? absl::OkStatus()
+               : absl::InvalidArgumentError("invalid String stream size");
   if ((!HashWire(type) && type != ValueType::kList &&
        type != ValueType::kSortedSet) ||
       count == 0 || count > std::numeric_limits<std::uint32_t>::max()) {
@@ -122,7 +129,7 @@ absl::StatusOr<CollectionCompactEncoder> CollectionCompactEncoder::Create(
     Put(out + 12, kHashValueHeaderBytes, 4);
     Put(out + 16, count, 4);
     Put(out + 24, bytes, 8);
-  } else {
+  } else if (type != ValueType::kString) {
     std::memcpy(out, type == ValueType::kList ? "LVL1" : "LZS1", 4);
     Put(out + 4, count, 4);
   }
@@ -132,11 +139,13 @@ absl::StatusOr<CollectionCompactEncoder> CollectionCompactEncoder::Create(
 absl::StatusOr<std::uint64_t> CollectionCompactEncoder::MeasurePage(
     const CollectionPage& page) {
   const auto type = page.value_type_;
-  if ((!HashWire(type) && type != ValueType::kList &&
-       type != ValueType::kSortedSet && type != ValueType::kStream) ||
+  if ((!HashWire(type) && type != ValueType::kString &&
+       type != ValueType::kList && type != ValueType::kSortedSet &&
+       type != ValueType::kStream) ||
       (type != ValueType::kHash && !page.fields_.empty()) ||
-      (type != ValueType::kSet && type != ValueType::kList &&
-       type != ValueType::kStream && !page.elements_.empty()) ||
+      (type != ValueType::kString && type != ValueType::kSet &&
+       type != ValueType::kList && type != ValueType::kStream &&
+       !page.elements_.empty()) ||
       (type != ValueType::kSortedSet && !page.scored_members_.empty())) {
     return absl::InvalidArgumentError(
         "compact page has inconsistent containers");
@@ -179,10 +188,11 @@ absl::Status CollectionCompactEncoder::StartPage(const CollectionPage& page) {
         "compact page type does not match stream");
   auto measured = MeasurePage(page);
   if (!measured.ok()) return measured.status();
-  if (page.size() > total_count_ - supplied_count_ ||
+  const auto count = type_ == ValueType::kString ? *measured : page.size();
+  if (count > total_count_ - supplied_count_ ||
       *measured > total_bytes_ - supplied_bytes_)
     return absl::DataLossError("compact page exceeds declared stream totals");
-  supplied_count_ += page.size();
+  supplied_count_ += count;
   supplied_bytes_ += *measured;
   page_ = page.size() == 0 ? nullptr : &page;
   entry_ = 0;
@@ -204,6 +214,12 @@ std::optional<std::string_view> CollectionCompactEncoder::Next() noexcept {
                                : type_ == ValueType::kSortedSet
                                    ? page_->scored_members_[entry_].member_
                                    : page_->elements_[entry_];
+    if (type_ == ValueType::kString) {
+      output = first;
+      emitted_bytes_ += output.size();
+      if (++entry_ == page_->size()) page_ = nullptr;
+      return output;
+    }
     if (phase_ == 0) {
       if (hash) {
         Put(framing_.data(), first.size(), 4);
@@ -246,6 +262,10 @@ absl::Status CollectionCompactEncoder::Finish() const {
 absl::StatusOr<CollectionCompactDecoder> CollectionCompactDecoder::Create(
     ValueType type, std::uint64_t count, std::uint64_t bytes,
     Admission admission) {
+  // String receivers retain the existing bounded whole-String staging path;
+  // their wire image has no collection framing for this decoder to parse.
+  if (type == ValueType::kString)
+    return absl::InvalidArgumentError("String uses raw stream staging");
   auto valid = ValidateTotals(type, count, bytes);
   if (!valid.ok()) return valid;
   CollectionCompactDecoder result;

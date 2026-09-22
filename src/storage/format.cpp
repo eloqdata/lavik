@@ -281,7 +281,8 @@ constexpr std::uint16_t RecordMetadata(const RecordHeader& header) noexcept {
 bool ValidGroupedRecordHeader(const RecordHeader& header) noexcept {
   const bool hashed = header.value_type_ == ValueType::kHash ||
                       header.value_type_ == ValueType::kSet;
-  const bool ordered = header.value_type_ == ValueType::kList ||
+  const bool ordered = header.value_type_ == ValueType::kString ||
+                       header.value_type_ == ValueType::kList ||
                        header.value_type_ == ValueType::kSortedSet ||
                        header.value_type_ == ValueType::kStream;
   if ((header.grouped_ || header.auxiliary_group_) &&
@@ -307,7 +308,8 @@ bool ValidGroupedRecordHeader(const RecordHeader& header) noexcept {
   // zero-bit hash mask would reject every valid ordered page id. Sorted Set
   // member pages instead use canonical Hash prefixes, a disjoint namespace.
   if (ordered &&
-      (header.value_type_ == ValueType::kList ||
+      (header.value_type_ == ValueType::kString ||
+       header.value_type_ == ValueType::kList ||
        header.value_type_ == ValueType::kStream ||
        (header.group_prefix_bits_ == 0 && header.group_prefix_ != 0)))
     return header.group_prefix_ != 0 && header.group_prefix_bits_ == 0;

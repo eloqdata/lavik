@@ -19,19 +19,20 @@ limitations under the License.
 ## Boundary and availability
 
 Grouped storage is a representation inside the storage engine, not a new
-Redis keyspace or a separate database. Hash, Set, List, Sorted Set and Stream support
+Redis keyspace or a separate database. String, Hash, Set, List, Sorted Set and Stream support
 compact values and complete, independently addressed group snapshots. Writes
 automatically promote compact collections at 16 KiB of encoded size, with an
-8 KiB target per group shared by all five types. Indivisible entries and Hash
+8 KiB target per group shared by all six types. Indivisible entries and Hash
 collisions can exceed that target. The grouped representation remains in use
 until the key is deleted or replaced.
 Streaming collection imports and grouped key transfers construct graphs directly.
 Stream RDB and native receiving also ingest logical records page by page. Both
 ordinary and Debug builds use the same read, mutation, recovery and maintenance adapters.
 
-Hash/Set use a persisted-seed prefix directory; List uses an ordered-page
-directory. Newly built Sorted Sets combine ordered `(score, member)` pages
-with a prefix directory mapping each member to its score. Both directories
+Strings use fixed 8 KiB byte segments; Hash/Set use a persisted-seed prefix
+directory; List uses an ordered-page directory. Newly built Sorted Sets combine
+ordered `(score, member)` pages with a prefix directory mapping each member to
+its score. Both directories
 belong to one object and share its physical index and transaction lifecycle.
 A prefix directory alone does not supply rank or score/member ordering.
 
@@ -39,6 +40,21 @@ Streams use ordered binary record keys for messages, logical macro-node
 metadata, groups, consumers and individual pending entries. Their externally
 visible length is independent of the internal record count. See
 [Streams](12-streams.md) for their access and logical-format contracts.
+
+String writes promote at the same 16 KiB encoded-size threshold as collections.
+Keys larger than 8 KiB retain the legacy String layout: auxiliary records carry
+their parent key, so grouping such values would amplify key storage without a
+bound relative to their payload. These exceptional keys can still use extents.
+Segments have dense, one-based identifiers derived from byte offsets. All but
+the tail contain exactly 8 KiB; extension materializes zero-filled gaps.
+The resident String directory and physical index use direct vector indexing,
+without binary search or hash routing. Physical index pages share unchanged
+entries with snapshot/undo versions. Incremental writes preserve segment IDs;
+whole replacement or shrinking may create a fresh incarnation or a compact value.
+GETRANGE/GETBIT read only intersecting segments; SETRANGE/SETBIT/APPEND replace
+intersecting segments and any changed tail link through the shared grouped
+publication boundary. General whole-value callbacks materialize the String
+and reuse unchanged segments in their after-image.
 
 ## Identity and ownership
 
@@ -123,9 +139,15 @@ decision when present. Auxiliary records never enter the user-key winner merge
 or Redis key/expiry counts.
 
 The version-1 ordered-root payload has type-checked shapes: 72 bytes describe
-only the ordered graph; 136 bytes append the 64-byte Hash root for an indexed
+only the ordered graph, including String segments; 136 bytes append the 64-byte Hash root for an indexed
 Sorted Set; an 80-byte Stream root appends its user-visible length. A member-index presence flag must agree with the payload length,
 so a truncated indexed root cannot decode as an ordered-only root.
+
+String uses a distinct ordered kind whose root and page counts measure bytes.
+Its page payload is a checked 64-byte envelope followed by at most 8 KiB of
+raw bytes, without per-item framing. Recovery checks dense IDs, fixed segment
+lengths, links, and aggregate byte length. String value segments fit ordinary
+records; oversized parent keys retain the existing external-payload rules.
 Ordered auxiliary identifiers have zero prefix bits and a nonzero opaque page
 number. Member auxiliaries use canonical Hash prefixes (including the unsplit
 `{0, 0}` root), a disjoint
@@ -420,6 +442,7 @@ API. Their implementation units remain under `src/storage/engine/`.
 | Sparse object index, group locations and immutable metadata ownership | `include/lavik/storage/detail/grouped_object_index.h`, `src/storage/engine/grouped_object_index.cpp` |
 | Physical reads, incremental publication, extent streaming and commit dependencies | `src/storage/engine/grouped_read.cpp`, `grouped_write.cpp`, `grouped_mutation.cpp`, `write.cpp`; `include/lavik/storage/detail/record_payload_cursor.h`, `grouped_commit.h` |
 | Root-only expiration/persistence publication | `src/storage/engine/grouped_metadata.cpp`, `grouped_object_index.cpp`, `write.cpp` |
+| Fixed String segments and direct byte-range operations | `src/storage/engine/grouped_string.cpp`, `src/redis/string_command.cpp` |
 | Foreground scratch admission and pinned key transfers | `include/lavik/storage/detail/grouped_scratch.h`, `src/storage/engine/transfer_api.cpp`, `grouped_restore.cpp` |
 | Atomic ordinary collection ingestion and command-local compensation | `src/storage/engine/collection_ingest.cpp`, `grouped_restore.cpp`, `write.cpp`; `include/lavik/storage/detail/replica_collection_stage.h` |
 | Admitted snapshot tokens, sequential page reads and whole-key RDB output ownership | `include/lavik/storage/collection_page.h`, `src/storage/engine/backup.cpp`, `include/lavik/rdb_collection.h`, `src/redis/rdb_collection.cpp`, `src/redis/backup.cpp` |
