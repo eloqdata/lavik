@@ -30,8 +30,9 @@ Stream RDB and native receiving also ingest logical records page by page. Both
 ordinary and Debug builds use the same read, mutation, recovery and maintenance
 adapters.
 
-Strings use fixed 8 KiB byte segments; Hash/Set use a persisted-seed prefix
-directory; List uses an ordered-page directory. Newly built Sorted Sets combine
+Grouped Strings use fixed 8 KiB byte segments; Hash/Set use a persisted-seed
+prefix directory; List uses an ordered-page directory. Newly built Sorted Sets
+combine
 ordered `(score, member)` pages with a prefix directory mapping each member to
 its score. Both directories
 belong to one object and share its physical index and transaction lifecycle.
@@ -52,10 +53,12 @@ The resident String directory and physical index use direct vector indexing,
 without binary search or hash routing. Physical index pages share unchanged
 entries with snapshot/undo versions. Incremental writes preserve segment IDs;
 whole replacement or shrinking may create a fresh incarnation or a compact value.
-GETRANGE/GETBIT read only intersecting segments; SETRANGE/SETBIT/APPEND replace
-intersecting segments and any changed tail link through the shared grouped
-publication boundary. General whole-value callbacks materialize the String
-and reuse unchanged segments in their after-image.
+For grouped Strings, GETRANGE/GETBIT read only intersecting segments;
+SETRANGE/SETBIT/APPEND replace intersecting segments and any changed tail link
+through the shared grouped publication boundary. General whole-value callbacks
+materialize grouped Strings and reuse unchanged segments in their after-image.
+Legacy Strings, including those with keys larger than 8 KiB, use whole-value
+reads and writes, with extents where needed.
 
 ## Identity and ownership
 

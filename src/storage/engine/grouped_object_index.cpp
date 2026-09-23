@@ -528,6 +528,9 @@ absl::Status BuildStringPhysical(GroupedHashPhysicalState& output,
   output.string_pages_charge_.Account(
       output.arena_->allocation_domain().owner_shard_, bytes);
   output.string_pages_.resize(pages);
+  // The retained charge now owns the vector bytes. Keeping the admission
+  // through page construction would count them twice against maxmemory.
+  admission.reset();
   output.string_size_ = count;
   if (previous)
     std::copy(previous->string_pages_.begin(), previous->string_pages_.end(),
