@@ -245,6 +245,8 @@ struct RecoveredOrderedGroup {
   std::uint64_t txid_ = 0;
   std::uint64_t batch_txid_ = 0;
   std::uint64_t item_count_ = 0;
+  // Complete encoded page payload, including the ordered-page envelope.
+  std::uint64_t encoded_bytes_ = 0;
   std::uint64_t record_token_ = 0;
   bool retired_ = false;
   // These two doubles are the resident score routing index. They are rebuilt
@@ -300,6 +302,11 @@ class OrderedGroupDirectory {
   const OrderedCollectionRoot& root() const noexcept { return root_; }
   std::uint64_t sequence() const noexcept { return sequence_; }
   std::uint64_t command_sequence() const noexcept { return command_sequence_; }
+  // Only ordered pages count; the Sorted Set member index is additional
+  // physical routing state, not part of the logical compact image.
+  std::uint64_t total_group_bytes() const noexcept {
+    return total_group_bytes_;
+  }
   const RecoveredOrderedGroup* Find(std::uint64_t id) const noexcept;
   const RecoveredOrderedGroup* FindRecord(std::uint64_t id) const noexcept;
   const std::vector<RecoveredOrderedGroup>& groups() const noexcept {
@@ -322,6 +329,7 @@ class OrderedGroupDirectory {
   OrderedCollectionRoot root_;
   std::uint64_t sequence_ = 0;
   std::uint64_t command_sequence_ = 0;
+  std::uint64_t total_group_bytes_ = 0;
   std::vector<RecoveredOrderedGroup> groups_;
   std::vector<RecoveredOrderedGroup> retired_;
   std::vector<std::pair<std::uint64_t, std::size_t>> ids_;

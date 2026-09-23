@@ -455,9 +455,37 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       const auto valid = stream_validator.Finish();
       if (!valid.ok()) co_return valid;
     }
-    if (replication != nullptr) {
-      co_await store.store_state_mutex_.Lock();
-      UnlockGuard metadata_unlock(&store.store_state_mutex_, store.worker_);
+    // Intermediate roots are deliberately grouped so the streaming parser
+    // never needs a full image. After EOF validation, the same transaction
+    // may replace that complete graph with one compact root.
+    co_await store.store_state_mutex_.Lock();
+    UnlockGuard final_unlock(&store.store_state_mutex_, store.worker_);
+    const auto current =
+        partition.grouped_objects_[db_id].CurrentForMutation(key);
+    if (current == nullptr)
+      co_return absl::DataLossError("collection restore lost grouped root");
+    const auto total = current->is_ordered()
+                           ? current->ordered_directory().total_group_bytes()
+                           : current->directory().total_group_bytes();
+    if (total < kCollectionGroupTargetBytes) {
+      const auto location = current->version().root_;
+      auto compact = co_await LoadGroupedValue(store, partition, db_id, key,
+                                               digest, location, nullptr);
+      if (!compact.ok()) co_return compact.status();
+      const auto bytes = compact->value();
+      if (bytes.size() >= kCollectionGroupTargetBytes)
+        co_return absl::InternalError("collection demotion byte bound failed");
+      written = co_await AppendLocked(
+          store, partition, db_id, key, digest,
+          std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                           bytes.size()),
+          RecordKind::kValue, type, expire_at_ms, &writes,
+          location.logical_size_, nullptr, nullptr, replication, nullptr, true,
+          nullptr, mutation_precondition);
+      if (!written.ok()) co_return written;
+      written = SquashReplicaCollectionUndo(store, *state);
+      if (!written.ok()) co_return written;
+    } else if (replication != nullptr) {
       written = co_await UpdateGroupedExpirationLocked(
           store, partition, db_id, key, digest,
           partition.grouped_objects_[db_id].CurrentForMutation(key),

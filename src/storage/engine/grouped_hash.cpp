@@ -370,6 +370,7 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Recover(
       // contents even when the cleaner cleared a committed transaction tag.
       if (candidate.sequence_ == previous.sequence_ &&
           (candidate.field_count_ != previous.field_count_ ||
+           candidate.encoded_bytes_ != previous.encoded_bytes_ ||
            candidate.retired_ != previous.retired_)) {
         return absl::DataLossError("conflicting Hash group relocation copies");
       }
@@ -398,6 +399,10 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Recover(
     auto inserted = directory.groups_.Set(id.prefix_, candidate);
     if (!inserted.ok()) return inserted;
     count += candidate.field_count_;
+    if (candidate.encoded_bytes_ > std::numeric_limits<std::uint64_t>::max() -
+                                       directory.total_group_bytes_)
+      return absl::DataLossError("grouped Hash byte total overflows");
+    directory.total_group_bytes_ += candidate.encoded_bytes_;
   }
   if (count != root.field_count_ ||
       directory.groups_.size() != root.group_count_) {
@@ -456,6 +461,7 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
     const auto current = groups_.find(change.id_.prefix_);
     if (current != groups_.end() && current->second.id_ == change.id_) {
       count -= current->second.field_count_;
+      next.total_group_bytes_ -= current->second.encoded_bytes_;
       coverage -= static_cast<__uint128_t>(1) << (64 - change.id_.bits_);
       const auto erased = next.groups_.Erase(change.id_.prefix_);
       if (!erased.ok()) return erased;
@@ -485,6 +491,10 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
       return absl::DataLossError("group update overlaps a later route");
     }
     count += change.field_count_;
+    if (change.encoded_bytes_ >
+        std::numeric_limits<std::uint64_t>::max() - next.total_group_bytes_)
+      return absl::DataLossError("grouped Hash byte total overflows");
+    next.total_group_bytes_ += change.encoded_bytes_;
     coverage += static_cast<__uint128_t>(1) << (64 - id.bits_);
   }
   if (count != root.field_count_ || next.groups_.size() != root.group_count_ ||

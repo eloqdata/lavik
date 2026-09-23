@@ -1019,11 +1019,13 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
       Check(while_pinned.devices_.front().available_bytes_ <=
                 capacity_baseline.devices_.front().available_bytes_,
             "replica promotion reported pinned retired capacity as available");
+      const auto retired_before = storage_->TxCleanerStats().retired_blocks_;
       ReleasePinnedValue(pin_session, key, *pinned);
-      absl::Status reclaimed = co_await WaitForCapacityIncrease(
-          while_pinned.devices_.front().available_bytes_,
-          "replica-promotion retired capacity did not become reusable");
-      if (!reclaimed.ok()) co_return reclaimed;
+      // ReturnColdBlocks increments this count only after the allocator has
+      // accepted the retired blocks. Net free capacity can stay flat if
+      // another allocation immediately uses them.
+      absl::Status retired = co_await WaitForTxBlockRetirement(retired_before);
+      if (!retired.ok()) co_return retired;
       // Production keeps replica loading enabled after root promotion so tail
       // commands continue to require their per-partition apply context. This
       // storage-only test seeds the next candidate with a direct client-style

@@ -18,6 +18,7 @@
 
 #include "impl.h"
 #include "lavik/storage/detail/grouped_scratch.h"
+#include "lavik/storage/detail/ordered_compact_codec.h"
 
 namespace lavik::storage {
 namespace {
@@ -225,11 +226,15 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   if (!encoder_admission.ok()) co_return encoder_admission.status();
   std::vector<OrderedGroupEncoder> ordered_encoders;
   std::vector<HashGroupEncoder> member_encoders;
+  std::vector<std::uint64_t> ordered_sizes;
+  std::vector<std::uint64_t> member_sizes;
   try {
     // No current-command pages have been staged if preflight allocation fails.
     LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_GROUP_ENCODER_PREPARE_KEY", key);
     ordered_encoders.reserve(plan.writes_.size());
     member_encoders.reserve(member_plan.writes_.size());
+    ordered_sizes.reserve(plan.writes_.size());
+    member_sizes.reserve(member_plan.writes_.size());
     const bool external_key = key.size() > options_.inline_key_max_bytes_ ||
                               RecordHeaderBytes(key.size(), false, true, false,
                                                 true) > kBlockHeaderSlotBytes;
@@ -241,6 +246,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         co_return absl::OutOfRangeError(
             "group snapshot and parent key exceed payload limit");
       }
+      ordered_sizes.push_back(encoder->encoded_bytes());
       ordered_encoders.push_back(std::move(*encoder));
     }
     for (const auto& snapshot : member_plan.writes_) {
@@ -250,11 +256,111 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
           key.size() > kMaxRecordPayloadBytes - encoder->encoded_bytes())
         co_return absl::OutOfRangeError(
             "member snapshot and parent key exceed payload limit");
+      member_sizes.push_back(encoder->encoded_bytes());
       member_encoders.push_back(std::move(*encoder));
     }
   } catch (const std::bad_alloc&) {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("OOM preparing group encoders");
+  }
+  // Ordered page envelopes and per-entry framing dominate the compact
+  // encoding. The Sorted Set member graph is excluded: it repeats members
+  // solely for point lookup and has no counterpart in a compact value.
+  std::optional<std::string> compact_payload;
+  try {
+    if (previous != nullptr && tx->grouped_ingest_batch_ == nullptr) {
+      std::uint64_t total = previous->ordered_directory().total_group_bytes();
+      for (std::size_t i = 0; i < plan.writes_.size(); ++i) {
+        const auto& page = plan.writes_[i];
+        if (const auto* old = previous->ordered_directory().Find(page.id_)) {
+          if (old->encoded_bytes_ > total)
+            co_return absl::DataLossError("invalid ordered byte total");
+          total -= old->encoded_bytes_;
+        }
+        if (!page.retired_) {
+          if (ordered_sizes[i] > UINT64_MAX - total)
+            co_return absl::OutOfRangeError("ordered byte total overflows");
+          total += ordered_sizes[i];
+        }
+      }
+      if (total < kCollectionGroupTargetBytes) {
+        GroupedScratchBudget budget;
+        for (const auto& metadata : previous->ordered_directory().groups()) {
+          const bool replaced = std::any_of(
+              plan.writes_.begin(), plan.writes_.end(),
+              [&](const auto& page) { return page.id_ == metadata.id_; });
+          if (replaced) continue;
+          const HashGroupId id{metadata.id_, 0};
+          const auto* entry = previous->FindGroup(id);
+          if (entry == nullptr)
+            co_return absl::DataLossError("missing ordered page for demotion");
+          const auto added = budget.AddGroup(
+              entry->value_, previous->ExtentsFor(id), key.size());
+          if (!added.ok()) co_return added;
+        }
+        auto added = budget.AddBytes(2 * kCollectionGroupTargetBytes +
+                                     plan.root_.item_count_ *
+                                         sizeof(OrderedCollectionEntry));
+        if (!added.ok()) co_return added;
+        auto scratch = budget.Reserve(2);
+        if (!scratch.ok()) co_return scratch.status();
+        std::map<std::uint64_t, const OrderedGroupSnapshot*> changed_pages;
+        for (const auto& page : plan.writes_)
+          changed_pages.emplace(page.id_, &page);
+        std::vector<OrderedCollectionEntry> compact;
+        compact.reserve(plan.root_.item_count_);
+        std::set<std::uint64_t> visited;
+        std::uint64_t id = plan.root_.first_group_;
+        while (id != 0) {
+          if (!visited.insert(id).second ||
+              visited.size() > plan.root_.group_count_)
+            co_return absl::DataLossError("ordered demotion page cycle");
+          if (const auto changed = changed_pages.find(id);
+              changed != changed_pages.end()) {
+            const auto& page = *changed->second;
+            if (page.retired_)
+              co_return absl::DataLossError("retired demotion page in chain");
+            compact.insert(compact.end(), page.entries_.begin(),
+                           page.entries_.end());
+            id = page.next_;
+          } else {
+            const auto* route = previous->ordered_directory().Find(id);
+            if (route == nullptr)
+              co_return absl::DataLossError("missing demotion page route");
+            auto loaded = co_await LoadOrderedGroupSnapshot(
+                store, partition, db_id, key, digest, previous, id, false);
+            if (!loaded.ok()) co_return loaded.status();
+            for (auto& entry : loaded->snapshot_.entries_)
+              compact.push_back(std::move(entry));
+            id = route->next_;
+          }
+        }
+        if (visited.size() != plan.root_.group_count_ ||
+            (plan.root_.kind_ != OrderedCollectionKind::kString &&
+             compact.size() != plan.root_.item_count_))
+          co_return absl::DataLossError("ordered demotion count mismatch");
+        auto encoded = EncodeOrderedCompactValue(plan.root_.kind_, compact);
+        if (!encoded.ok()) co_return encoded.status();
+        if (encoded->size() >= kCollectionGroupTargetBytes)
+          co_return absl::InternalError("ordered demotion byte bound failed");
+        compact_payload = std::move(*encoded);
+      }
+    }
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM preparing ordered demotion");
+  }
+  if (compact_payload) {
+    if (!SameLogicalView(source_side, side.CurrentForMutation(key)) ||
+        EffectiveRecordDbEpoch(partition, db_id) != db_epoch ||
+        partition.replication_epoch_ != replication_epoch ||
+        store.index_generations_[db_id] != index_generation)
+      co_return absl::AbortedError("grouped source changed before demotion");
+    co_return co_await AppendLocked(
+        store, partition, db_id, key, digest, *compact_payload,
+        RecordKind::kValue, value_type, expire_at_ms,
+        outer_transaction ? tx : nullptr, field_count, nullptr, nullptr,
+        replication, nullptr, true, nullptr, mutation_precondition);
   }
   auto decision = PrepareGroupedDecision(*tx);
   if (!decision.ok()) co_return decision.status();
@@ -357,6 +463,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
            .txid_ = tx->txid_,
            .batch_txid_ = command_batch,
            .field_count_ = group.location_.logical_size_,
+           .encoded_bytes_ = member_sizes[i - plan.writes_.size()],
            .retired_ = group.retired_});
       continue;
     }
@@ -371,6 +478,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
          .txid_ = tx->txid_,
          .batch_txid_ = command_batch,
          .item_count_ = group.location_.logical_size_,
+         .encoded_bytes_ = ordered_sizes[i],
          .record_token_ = page.id_,
          .retired_ = group.retired_,
          .min_score_ = page.entries_.empty() ? 0 : page.entries_.front().score_,

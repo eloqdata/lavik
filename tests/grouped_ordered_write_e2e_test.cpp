@@ -26,6 +26,76 @@
 namespace {
 using namespace grouped_e2e;
 
+TEST(GroupedDemotionE2e, StringListSetSortedSetGeoAndStreamRecoverCompact) {
+  PrivateDisk disk;
+  std::string stream_id;
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(
+        client.Command({"SET", "demote-string", std::string(17000, 's')}).text_,
+        "OK");
+    ASSERT_EQ(
+        client.Command({"SET", "demote-string", std::string(8191, 't')}).text_,
+        "OK");
+
+    ASSERT_EQ(
+        client.Command({"RPUSH", "demote-list", std::string(17000, 'l')}).text_,
+        "1");
+    ASSERT_EQ(client.Command({"LSET", "demote-list", "0", "short"}).text_,
+              "OK");
+
+    const std::string large_member(17000, 'm');
+    ASSERT_EQ(
+        client.Command({"SADD", "demote-set", large_member, "small"}).text_,
+        "2");
+    ASSERT_EQ(client.Command({"SREM", "demote-set", large_member}).text_, "1");
+    const auto dump = client.Command({"DUMP", "demote-set"});
+    ASSERT_EQ(dump.kind_, '$');
+    ASSERT_EQ(
+        client.Command({"RESTORE", "demote-import", "0", dump.text_}).text_,
+        "OK");
+
+    ASSERT_EQ(
+        client.Command({"ZADD", "demote-zset", "1", large_member, "2", "small"})
+            .text_,
+        "2");
+    ASSERT_EQ(client.Command({"ZREM", "demote-zset", large_member}).text_, "1");
+
+    ASSERT_EQ(client
+                  .Command({"GEOADD", "demote-geo", "0", "0", large_member, "1",
+                            "1", "near"})
+                  .text_,
+              "2");
+    ASSERT_EQ(client.Command({"ZREM", "demote-geo", large_member}).text_, "1");
+
+    const auto added = client.Command(
+        {"XADD", "demote-stream", "*", "field", std::string(17000, 'v')});
+    ASSERT_EQ(added.kind_, '$');
+    stream_id = added.text_;
+    ASSERT_EQ(client.Command({"XDEL", "demote-stream", stream_id}).text_, "1");
+    ASSERT_EQ(client.Command({"XLEN", "demote-stream"}).text_, "0");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  for (const auto key :
+       {"demote-string", "demote-list", "demote-set", "demote-import",
+        "demote-zset", "demote-geo", "demote-stream"})
+    EXPECT_EQ(disk.LatestRootGrouped(key), false) << key;
+  Server recovered(disk);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"GET", "demote-string"}).text_,
+            std::string(8191, 't'));
+  EXPECT_EQ(client.Command({"LINDEX", "demote-list", "0"}).text_, "short");
+  const auto members = client.Command({"SMEMBERS", "demote-set"});
+  ASSERT_EQ(members.items_.size(), 1);
+  EXPECT_EQ(members.items_[0].text_, "small");
+  EXPECT_EQ(client.Command({"SCARD", "demote-import"}).text_, "1");
+  EXPECT_EQ(client.Command({"ZSCORE", "demote-zset", "small"}).text_, "2");
+  EXPECT_EQ(client.Command({"ZCARD", "demote-geo"}).text_, "1");
+  EXPECT_EQ(client.Command({"XLEN", "demote-stream"}).text_, "0");
+}
+
 TEST(GroupedStringWriteE2e, FixedSegmentsPointWritesTtlAndRecovery) {
   PrivateDisk disk;
   disk.PreserveOnFailure();
