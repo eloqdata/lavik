@@ -240,8 +240,11 @@ dispatch and again on the owner hop; script key access is additionally
 confined to the slot set the script was admitted with. Invoking a Function
 loaded with the `no-cluster` flag is refused in cluster mode, with Redis's
 exact error text. Top-level blocking writes (List and Sorted Set operations and
-`XREADGROUP`) re-run admission on every attempt after reacquiring the database
-gate. Each concrete storage attempt registers a fresh in-flight authority guard
+`XREADGROUP`) re-validate admission on every attempt after reacquiring the
+database gate. Attempts re-register the admission proof the request already
+carries — a few atomic fingerprint comparisons when nothing has published —
+and capture a fresh proof only after a publication invalidated the old one.
+Each concrete storage attempt registers a fresh in-flight authority guard
 and releases it before entering the waiter registry or sleeping; a dormant
 client therefore cannot delay an authority drain. Read-only `XREAD` and the
 keyless `WAIT` carry no mutation authority and register no such guard.
@@ -249,19 +252,21 @@ Replication replay is exempt from every re-check: applied commands are
 already ordered by the replication stream and carry no client fencing
 semantics.
 
-Ordinary Cluster reads are intentionally not re-checked for authority. A read
-gated at admission may observe data committed before a concurrent fence — the
-same staleness window Redis Cluster clients accept across failover. Single
-reads recheck their Group authority at DB admission and after a worker hop;
-both modes retain population-generation fencing. Writes have no such window:
-the combination of admission, the owner-side choke points, the final storage
-precondition, and per-group tokens guarantees a stale topology causes
-redirection or temporary unavailability, never a second writer.
+Reads in both managed client modes share one contract: authority is checked
+exactly once, at admission, and never re-checked afterwards. A read gated at
+admission may observe data committed before a concurrent fence — the same
+staleness window Redis Cluster clients accept across failover. Population
+replacement is fenced separately: every request revalidates the serving
+generation after queueing, blocking, or database-admission waits, so work
+admitted under a replaced population cannot observe or mutate the new one.
+Writes have no staleness window: the combination of admission, the owner-side
+choke points, the final storage precondition, and per-group tokens guarantees
+a stale topology causes redirection or temporary unavailability, never a
+second writer.
 
-Writes and Single multi-shard reads retain ownership of the admitted snapshot
-across suspension points. Ordinary reads finish each decision while the
-thread-local cache keeps the snapshot alive and carry no per-request shared
-reference afterwards. A Single read's later check uses the current snapshot.
+Writes retain ownership of the admitted snapshot across suspension points.
+Reads finish each decision while the thread-local cache keeps the snapshot
+alive and carry no per-request shared reference afterwards.
 
 Executions register their admitted groups when they pass the re-check and
 unregister at completion, so a fence publisher can observe whether any
@@ -837,14 +842,24 @@ so `EXEC` aborts rather than creating a slotless authority exception.
 `FUNCTION KILL` and `FUNCTION STATS` remain available while loading so an
 executing Function can be stopped or inspected; they do not mutate the catalog.
 
-Managed Single currently admits DB0 single-key storage commands, TTL operations
-and PUBLISH through the common Group gate. Multi-key operations, nonzero DBs,
-transactions, scripts, blocking paths and global data/catalog operations that
-lack complete safe integration return explicit unsupported errors. Diagnostics
-remain separate from data authority. Single returns LOADING for incomplete
-population, READONLY for replica mutations, MASTERDOWN for unavailable Owner
-authority or disabled stale reads, and TRYAGAIN for Controlled Pause. Normal
-role changes do not produce MOVED.
+Managed Single admits DB0 commands through the common Group gate: single-key
+storage commands, TTL operations, PUBLISH, cross-slot multi-key commands
+(MGET/MSET/DEL and the other multi-key families sharing the standalone
+execution engine), and the blocking List and Sorted Set family. The sole
+Group covers the entire dataset, so cross-slot is not a rejection reason in
+Single; Cluster retains CROSSSLOT. Still rejected with explicit unsupported
+errors, each because its execution context is not yet wired into Group
+authority: transactions (MULTI/EXEC/WATCH queue commands into a separate
+execution context), scripts and Functions, keyless global data operations such
+as DBSIZE/SCAN/FLUSHDB, nonzero databases, stream blocking (XREAD/XREADGROUP
+wait on distinct lanes and XREADGROUP mutates consumer-group state), and
+keyless `WAIT`. `COPY ... DB` executes through the same Group authority but
+its cross-DB semantics are not yet verified — documented transition behavior;
+SELECT of a nonzero DB stays rejected meanwhile. Diagnostics remain separate
+from data authority. Single returns LOADING for
+incomplete population, READONLY for replica mutations, MASTERDOWN for
+unavailable Owner authority or disabled stale reads, and TRYAGAIN for
+Controlled Pause. Normal role changes do not produce MOVED.
 
 ## CLUSTER subcommands and discovery surface
 

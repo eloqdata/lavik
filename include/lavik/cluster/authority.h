@@ -189,6 +189,15 @@ class AuthorityAdmission {
   bool final_recheck_failed() const noexcept {
     return final_recheck_failed_.load(std::memory_order_acquire);
   }
+  // Clears the per-attempt linearization markers before a blocking wait loop
+  // reuses this admission for a later attempt. Safe only after the previous
+  // attempt's storage work has fully settled — the markers are written at the
+  // mutation linearization point, which always precedes attempt completion,
+  // and the loop's guard scope enforces that ordering.
+  void ResetMutationMarkers() const noexcept {
+    mutation_started_.store(false, std::memory_order_release);
+    final_recheck_failed_.store(false, std::memory_order_release);
+  }
 
  private:
   friend class AuthorityGuard;

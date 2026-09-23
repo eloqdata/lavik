@@ -91,6 +91,13 @@ absl::Status RecheckClusterRequestAuthority(const CommandRequest& request);
 storage::MutationPrecondition ClusterMutationPrecondition(
     const CommandRequest& request);
 
+// Maps a non-serving admission decision to its wire reply. Returns true when
+// the decision produced a terminal reply; false when it admits local
+// execution (kServe/kServeStaleRead). kCloseConnection yields an empty reply
+// with the close flag: the outcome is undeterminable, so nothing is written.
+bool EmitClusterDecision(const cluster::Decision& decision, bool connection_tls,
+                         ReplyBuilder& reply_builder, CommandReply* reply);
+
 // Replaces an inner handler's reply after a final storage re-check failed.
 // No prior mutation gets a fresh redirect; any prior mutation makes the
 // aggregate outcome indeterminate and closes the connection.

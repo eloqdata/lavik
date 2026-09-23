@@ -41,6 +41,16 @@ A read of a replica's complete local population without a freshness guarantee
 relative to the Owner. It neither requires nor grants Owner write authority;
 temporary replication disconnection does not itself invalidate that population.
 
+**Serving Generation**:
+A Data Node's local epoch identifying its current dataset population. It opens
+when a complete population becomes servable and advances when that population
+is replaced or the node's role changes. Requests capture it at admission and
+revalidate it after queueing, blocking, or database-admission waits, so work
+admitted under a replaced population cannot observe or mutate the new one. It
+is node-local population evidence, not the committed Group Term, and a
+topology-only change does not advance it.
+_Avoid_: topology version, authority version
+
 **Committed State**:
 The deterministic Meta control-plane state replicated by Raft and restored by
 a replacement Meta leader. An in-progress failover must retain enough state
