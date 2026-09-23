@@ -184,6 +184,9 @@ truncate -s 1G "${case_dir}/import.data"
   --dbfilename imported.rdb >"${case_dir}/import.log" 2>&1 &
 import_pid=$!
 wait_ready "${import_port}"
+import_commits=$("${redis_cli}" -p "${import_port}" info stats |
+  awk -F: '/^storage_tx_commits_pending:/ {gsub("\r", "", $2); print $2}')
+[[ ${import_commits} == 0 ]]
 import_dirty=$("${redis_cli}" -p "${import_port}" info persistence |
   awk -F: '/^rdb_changes_since_last_save:/ {gsub("\r", "", $2); print $2}')
 [[ ${import_dirty} == 0 ]]

@@ -397,6 +397,10 @@ at a time. Packed-node decoding first validates and measures its entries
 without allocating their vectors, then admits the decoded node and validation
 scratch. Individual strings, including packed nodes, retain their size bound.
 
+Startup RDB import waits for queued grouped transaction commits to finish
+before marking the imported dataset as saved or admitting clients. This keeps
+asynchronous grouped String restores within the imported persistence baseline.
+
 File import owns an open descriptor and bounded read scratch for checksum
 validation and object decoding. Saved input positions can be reread without
 retaining prior file buffers. The source file remains immutable until import

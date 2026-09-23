@@ -83,7 +83,12 @@ def late_meta(root):
         )
         assert reply.startswith("OK "), reply
         H.wait_until("registered Data starts before Created", 15, data._metrics_ready)
-        assert data.command_head(["PING"]) == "+PONG"
+        # Metrics and Redis listeners start independently after registration.
+        H.wait_until(
+            "registered Data Redis listener starts before Created",
+            15,
+            lambda: data.command_head(["PING"]) == "+PONG",
+        )
         assert data.command_head(["GET", "key"]).startswith("-LOADING")
         assert C.cluster_status(meta)["cluster_state"] == "creating"
         data.terminate()
