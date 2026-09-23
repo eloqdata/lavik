@@ -17,6 +17,7 @@
 #include "lavik/pubsub.h"
 
 #include <sys/socket.h>
+#include <sys/uio.h>
 
 #include <algorithm>
 #include <atomic>
@@ -27,6 +28,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -34,6 +36,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/container/inlined_vector.h"
 #include "bycorf/net/tcp_stream.h"
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/sync.h"
@@ -49,6 +52,9 @@ namespace {
 
 constexpr std::size_t kWorkerPubSubBufferLimit = 128ULL * 1024 * 1024;
 constexpr std::size_t kPubSubQueueLimit = 10'000;
+// Bound one gather write without waiting for more frames or splitting a frame.
+constexpr std::size_t kOutputBatchFrames = 64;
+constexpr std::size_t kOutputBatchBytes = 64 * 1024;
 std::atomic<std::uint64_t> g_resp2_subscribers{0};
 std::atomic<std::uint64_t> g_resp3_subscribers{0};
 
@@ -60,6 +66,11 @@ struct WorkerPubSubRegistry;
 
 struct QueuedFrame {
   std::shared_ptr<const std::string> encoded_;
+  bool exit_ = false;
+};
+
+struct QueuedBatch {
+  absl::InlinedVector<std::shared_ptr<const std::string>, 4> frames_;
   bool exit_ = false;
 };
 
@@ -112,7 +123,8 @@ class PubSubSession : public std::enable_shared_from_this<PubSubSession> {
 
   bool Enqueue(const std::shared_ptr<const std::string>& encoded);
   void EnqueueExit();
-  Task<QueuedFrame> Next();
+  Task<QueuedBatch> NextBatch();
+  void CompleteBatch(const QueuedBatch& batch);
 
   void Close() noexcept {
     if (closed_) return;
@@ -151,6 +163,7 @@ class PubSubSession : public std::enable_shared_from_this<PubSubSession> {
   absl::flat_hash_set<std::string> patterns_;
   std::vector<std::string> pattern_order_;
   std::deque<QueuedFrame> queue_;
+  std::size_t in_flight_frames_ = 0;
   std::size_t pending_bytes_ = 0;
   AsyncNotification output_ready_;
   AsyncNotification reader_done_ready_;
@@ -839,7 +852,7 @@ void PubSubSession::PUnsubscribeAll() {
 bool PubSubSession::Enqueue(const std::shared_ptr<const std::string>& encoded) {
   if (closed_ || exit_enqueued_) return false;
   const std::size_t bytes = encoded->size();
-  if (queue_.size() >= kPubSubQueueLimit ||
+  if (queue_.size() + in_flight_frames_ >= kPubSubQueueLimit ||
       bytes > kWorkerPubSubBufferLimit - std::min(registry_->pending_bytes_,
                                                   kWorkerPubSubBufferLimit)) {
     closed_ = true;
@@ -861,20 +874,45 @@ void PubSubSession::EnqueueExit() {
   output_ready_.NotifyAll(*worker_);
 }
 
-Task<QueuedFrame> PubSubSession::Next() {
+Task<QueuedBatch> PubSubSession::NextBatch() {
   while (queue_.empty() && !closed_) {
     co_await output_ready_.Wait();
   }
-  if (closed_ || queue_.empty()) co_return QueuedFrame{};
-  QueuedFrame frame = std::move(queue_.front());
-  queue_.pop_front();
-  if (frame.encoded_ != nullptr) {
-    assert(pending_bytes_ >= frame.encoded_->size());
-    assert(registry_->pending_bytes_ >= frame.encoded_->size());
-    pending_bytes_ -= frame.encoded_->size();
-    registry_->pending_bytes_ -= frame.encoded_->size();
+  QueuedBatch batch;
+  if (closed_ || queue_.empty()) co_return batch;
+  if (queue_.front().exit_) {
+    queue_.pop_front();
+    batch.exit_ = true;
+    co_return batch;
   }
-  co_return frame;
+
+  std::size_t bytes = 0;
+  while (!queue_.empty() && !queue_.front().exit_ &&
+         batch.frames_.size() < kOutputBatchFrames) {
+    const auto& encoded = queue_.front().encoded_;
+    if (!batch.frames_.empty() && encoded->size() > kOutputBatchBytes - bytes) {
+      break;
+    }
+    bytes += encoded->size();
+    batch.frames_.push_back(std::move(queue_.front().encoded_));
+    queue_.pop_front();
+    if (bytes >= kOutputBatchBytes) break;
+  }
+  // A suspended socket write still owns these frames. Keep their queue and
+  // worker charges until it finishes so producers cannot bypass either bound.
+  in_flight_frames_ += batch.frames_.size();
+  co_return batch;
+}
+
+void PubSubSession::CompleteBatch(const QueuedBatch& batch) {
+  assert(in_flight_frames_ >= batch.frames_.size());
+  in_flight_frames_ -= batch.frames_.size();
+  for (const auto& frame : batch.frames_) {
+    assert(pending_bytes_ >= frame->size());
+    assert(registry_->pending_bytes_ >= frame->size());
+    pending_bytes_ -= frame->size();
+    registry_->pending_bytes_ -= frame->size();
+  }
 }
 
 void PreparePubSub(unsigned worker_count) {
@@ -904,6 +942,7 @@ void UnregisterPubSubSession(const std::shared_ptr<PubSubSession>& session) {
   assert(session->registry_->pending_bytes_ >= session->pending_bytes_);
   session->registry_->pending_bytes_ -= session->pending_bytes_;
   session->pending_bytes_ = 0;
+  assert(session->in_flight_frames_ == 0);
   session->queue_.clear();
 }
 
@@ -1140,12 +1179,24 @@ Task<absl::Status> WaitPubSubReaderDone(
 Task<absl::Status> StreamPubSubMessages(
     TcpStream& stream, const std::shared_ptr<PubSubSession>& session) {
   while (stream.IsOpen()) {
-    QueuedFrame frame = co_await session->Next();
-    if (frame.exit_) co_return absl::OkStatus();
-    if (frame.encoded_ == nullptr) co_return absl::OkStatus();
-    absl::Status written = co_await stream.WriteAll(std::span<const std::byte>(
-        reinterpret_cast<const std::byte*>(frame.encoded_->data()),
-        frame.encoded_->size()));
+    QueuedBatch batch = co_await session->NextBatch();
+    if (batch.exit_ || batch.frames_.empty()) co_return absl::OkStatus();
+    absl::Status written;
+    if (batch.frames_.size() == 1) {
+      const auto& frame = batch.frames_.front();
+      written = co_await stream.WriteAll(std::span<const std::byte>(
+          reinterpret_cast<const std::byte*>(frame->data()), frame->size()));
+    } else {
+      absl::InlinedVector<iovec, 4> buffers;
+      buffers.reserve(batch.frames_.size());
+      for (const auto& frame : batch.frames_) {
+        buffers.push_back(iovec{.iov_base = const_cast<char*>(frame->data()),
+                                .iov_len = frame->size()});
+      }
+      written = co_await stream.WriteAllV(
+          std::span<const iovec>(buffers.data(), buffers.size()));
+    }
+    session->CompleteBatch(batch);
     if (!written.ok()) {
       session->Close();
       co_return written;

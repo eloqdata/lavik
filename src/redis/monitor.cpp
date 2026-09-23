@@ -19,6 +19,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 
 #include <algorithm>
 #include <atomic>
@@ -28,11 +29,13 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "absl/container/inlined_vector.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "bycorf/net/tcp_stream.h"
@@ -53,9 +56,13 @@ namespace {
 // mirror the two-dimensional shape of Lavik's other bounded queues.
 constexpr std::size_t kWorkerMonitorBufferLimit = 128ULL * 1024 * 1024;
 constexpr std::size_t kMonitorQueueLimit = 10'000;
+// Bound one gather write without waiting for more messages or splitting one.
+constexpr std::size_t kOutputBatchFrames = 64;
+constexpr std::size_t kOutputBatchBytes = 64 * 1024;
 constexpr auto kPeerCheckInterval = std::chrono::milliseconds(250);
 
 struct WorkerMonitorRegistry;
+using MonitorBatch = absl::InlinedVector<std::shared_ptr<const std::string>, 4>;
 
 }  // namespace
 
@@ -65,7 +72,8 @@ class MonitorSession {
       : registry_(registry), worker_(worker), fd_(fd) {}
 
   void Enqueue(const std::shared_ptr<const std::string>& message);
-  Task<std::shared_ptr<const std::string>> Next();
+  Task<MonitorBatch> NextBatch();
+  void CompleteBatch(std::span<const std::shared_ptr<const std::string>> batch);
 
   void Close() noexcept {
     if (closed_) return;
@@ -89,6 +97,7 @@ class MonitorSession {
   Worker* worker_ = nullptr;
   int fd_ = -1;
   std::deque<std::shared_ptr<const std::string>> queue_;
+  std::size_t in_flight_frames_ = 0;
   std::size_t pending_bytes_ = 0;
   AsyncNotification ready_;
   bool active_ = true;
@@ -203,7 +212,7 @@ void MonitorSession::Enqueue(
     const std::shared_ptr<const std::string>& message) {
   if (closed_) return;
   if (registry_->pending_bytes_ >= kWorkerMonitorBufferLimit ||
-      queue_.size() >= kMonitorQueueLimit) {
+      queue_.size() + in_flight_frames_ >= kMonitorQueueLimit) {
     closed_ = true;
     ready_.NotifyAll(*worker_);
     // This also breaks a write already parked in io_uring. Cleanup and byte
@@ -217,19 +226,37 @@ void MonitorSession::Enqueue(
   ready_.NotifyAll(*worker_);
 }
 
-Task<std::shared_ptr<const std::string>> MonitorSession::Next() {
+Task<MonitorBatch> MonitorSession::NextBatch() {
   while (queue_.empty() && !closed_) {
     co_await ready_.Wait();
   }
-  if (queue_.empty()) co_return nullptr;
+  MonitorBatch batch;
+  std::size_t bytes = 0;
+  while (!queue_.empty() && batch.size() < kOutputBatchFrames) {
+    const auto& message = queue_.front();
+    if (!batch.empty() && message->size() > kOutputBatchBytes - bytes) {
+      break;
+    }
+    bytes += message->size();
+    batch.push_back(std::move(queue_.front()));
+    queue_.pop_front();
+    if (bytes >= kOutputBatchBytes) break;
+  }
+  // Include the suspended writer's batch in both limits until its write ends.
+  in_flight_frames_ += batch.size();
+  co_return batch;
+}
 
-  std::shared_ptr<const std::string> message = std::move(queue_.front());
-  queue_.pop_front();
-  assert(pending_bytes_ >= message->size());
-  assert(registry_->pending_bytes_ >= message->size());
-  pending_bytes_ -= message->size();
-  registry_->pending_bytes_ -= message->size();
-  co_return message;
+void MonitorSession::CompleteBatch(
+    std::span<const std::shared_ptr<const std::string>> batch) {
+  assert(in_flight_frames_ >= batch.size());
+  in_flight_frames_ -= batch.size();
+  for (const auto& message : batch) {
+    assert(pending_bytes_ >= message->size());
+    assert(registry_->pending_bytes_ >= message->size());
+    pending_bytes_ -= message->size();
+    registry_->pending_bytes_ -= message->size();
+  }
 }
 
 void PrepareMonitor(unsigned worker_count) {
@@ -315,6 +342,7 @@ void UnregisterMonitorSession(const std::shared_ptr<MonitorSession>& session) {
   assert(registry.pending_bytes_ >= session->pending_bytes_);
   registry.pending_bytes_ -= session->pending_bytes_;
   session->pending_bytes_ = 0;
+  assert(session->in_flight_frames_ == 0);
   session->queue_.clear();
   std::erase(registry.sessions_, session);
   const unsigned previous =
@@ -326,10 +354,26 @@ void UnregisterMonitorSession(const std::shared_ptr<MonitorSession>& session) {
 Task<absl::Status> StreamMonitorMessages(
     TcpStream& stream, const std::shared_ptr<MonitorSession>& session) {
   while (stream.IsOpen()) {
-    std::shared_ptr<const std::string> message = co_await session->Next();
-    if (message == nullptr) co_return absl::OkStatus();
-    absl::Status written = co_await stream.WriteAll(std::span<const std::byte>(
-        reinterpret_cast<const std::byte*>(message->data()), message->size()));
+    auto batch = co_await session->NextBatch();
+    if (batch.empty()) co_return absl::OkStatus();
+    absl::Status written;
+    if (batch.size() == 1) {
+      const auto& message = batch.front();
+      written = co_await stream.WriteAll(std::span<const std::byte>(
+          reinterpret_cast<const std::byte*>(message->data()),
+          message->size()));
+    } else {
+      absl::InlinedVector<iovec, 4> buffers;
+      buffers.reserve(batch.size());
+      for (const auto& message : batch) {
+        buffers.push_back(iovec{.iov_base = const_cast<char*>(message->data()),
+                                .iov_len = message->size()});
+      }
+      written = co_await stream.WriteAllV(
+          std::span<const iovec>(buffers.data(), buffers.size()));
+    }
+    session->CompleteBatch(std::span<const std::shared_ptr<const std::string>>(
+        batch.data(), batch.size()));
     if (!written.ok()) {
       session->Close();
       co_return written;
