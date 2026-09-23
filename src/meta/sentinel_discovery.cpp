@@ -72,10 +72,11 @@ const MetaDataControlRuntimeNode* FindRuntimeNode(const MetaDiscoveryCut& cut,
 }
 
 // observed_nodes_ outlives session removal precisely so that "never contacted
-// this leader" is distinguishable from "had a session that is gone". During
-// the post-election grace window the former reads as unknown and sets no
-// down flags; the latter counts as down at any time, because a lost session
-// is positive evidence while a node this leader has never seen proves nothing.
+// this leader" is distinguishable from "had a session that is gone". The
+// latter is positive evidence and counts as down at any time; the former
+// proves nothing, so within the post-election grace window the Owner keeps no
+// down flags and a never-observed member is omitted from the replica listing
+// rather than marked.
 bool EverObserved(const MetaDiscoveryCut& cut, const std::string& node_id) {
   const auto& observed = cut.runtime_.observed_nodes_;
   return std::binary_search(observed.begin(), observed.end(), node_id);
@@ -91,10 +92,14 @@ bool HealthGreen(const MetaDataControlRuntimeNode& node,
          !node.health_->draining;
 }
 
-// The runtime registry's per-group anchors are the term/assignment of the last
-// desired-state projection this node acknowledged applying (they are published
-// only after the node's FullStateApplied), so equality with the committed
-// anchor proves the node carries the current term and membership incarnation.
+// The runtime registry's per-group anchors describe the last desired-state
+// projection this node acknowledged applying (they are published only after
+// the node's FullStateApplied), so full equality with the committed anchor
+// proves the node carries the current projection. Term and assignment alone
+// are insufficient: a committed SetGroupReplicationState advances the
+// manifest revision/digest and the partition replication epoch while both
+// stay unchanged, and a node still holding that superseded projection must
+// not read as a healthy replica.
 bool AnchorCurrent(const MetaDataControlRuntimeNode& node,
                    const MetaCommittedStatusGroup& group,
                    const MetaGroupMember& member) {
@@ -102,9 +107,15 @@ bool AnchorCurrent(const MetaDataControlRuntimeNode& node,
       node.groups_.begin(), node.groups_.end(), [&](const auto& item) {
         return item.group_id_ == group.topology_.group_id_;
       });
+  const MetaGroupRecord& record = group.topology_.record_;
   return projected != node.groups_.end() &&
          projected->group_term_ == group.grant_.group_term_ &&
-         projected->assignment_id_ == member.assignment_id_;
+         projected->assignment_id_ == member.assignment_id_ &&
+         projected->manifest_revision_ ==
+             record.population_manifest_revision_ &&
+         projected->manifest_digest_ == record.population_manifest_digest_ &&
+         projected->partition_replication_epoch_ ==
+             record.partition_replication_epoch_;
 }
 
 // Committed non-owner members whose identity record is still active.
@@ -333,15 +344,23 @@ std::vector<MetaDiscoveryReplica> ListReplicas(
     if (!endpoint.has_value()) continue;
     const MetaDataControlRuntimeNode* runtime =
         FindRuntimeNode(cut, member.node_id_);
-    const bool unknown =
-        cut.observation_grace_active_ && !EverObserved(cut, member.node_id_);
+    // Within the leader's observation grace window a member it has never
+    // observed is omitted entirely: its health and installed projection are
+    // unverified (it may be mid-initial-FULL), and stock client filters only
+    // honor the down flags, so a bare listing would admit an unproven node
+    // into read pools. Omission claims neither health nor failure. Once the
+    // window closes, the continued absence is evidence and the member lists
+    // as s_down,disconnected.
+    if (cut.observation_grace_active_ && !EverObserved(cut, member.node_id_)) {
+      continue;
+    }
     const bool readable = runtime != nullptr && HealthGreen(*runtime, cut) &&
                           AnchorCurrent(*runtime, group, member);
     replicas.push_back(
         MetaDiscoveryReplica{.node_id_ = member.node_id_,
                              .endpoint_ = *endpoint,
-                             .s_down_ = !readable && !unknown,
-                             .disconnected_ = runtime == nullptr && !unknown,
+                             .s_down_ = !readable,
+                             .disconnected_ = runtime == nullptr,
                              .master_down_ = !primary_publishable});
   }
   return replicas;

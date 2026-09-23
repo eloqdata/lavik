@@ -30,8 +30,8 @@ change. Three decisions fix how an answer is shaped when they disagree.
 Health never gates publication; it only sets flags. A Primary address is
 published whenever committed authority stands: the cluster is Created, its
 immutable Client Service Mode is Single, the Group's authority is active, and
-the committed Owner is not retired and advertises a usable `tcp://` client
-endpoint. Detector SUSPECT or session loss adds `s_down`/`disconnected` to
+the committed Owner is not retired and advertises a usable plaintext client
+endpoint (`tcp://`, or the legacy untagged form older registrations carry). Detector SUSPECT or session loss adds `s_down`/`disconnected` to
 that published record instead of removing it, because withdrawing a
 still-authoritative address would send clients rediscovering a service that
 has not moved and would hide the one address that can still serve them. The
@@ -64,11 +64,19 @@ payload extension remains possible without changing this contract. The related
 `slave-repl-offset` field is likewise a documented placeholder constant:
 progress has no scalar form comparable across Compatibility Domains.
 
-One deliberate optimism accompanies the flag rules. Within the leadership
-observation grace after a Meta leader change, a node the new leader has never
-observed is reported as unknown rather than down, so flags do not flap during
-warmup; a node observed and then lost counts as down at any time. Failover
-continuity across that window is accepted and validated separately in #105.
+One deliberate asymmetry accompanies the flag rules during leadership change.
+Within the observation grace after a Meta leader change, absence of
+observation is not failure evidence, but the two roles exploit that
+differently. A never-observed Owner carries no down flags: publication is
+gated on committed authority, and a speculative `s_down` would block all
+discovery toward the one address that may still serve. A never-observed
+replica member is instead omitted from listings: client read pools filter only
+on down flags, so listing an unverified member would admit it into read pools
+while it may still be rebuilding; omission claims neither health nor failure.
+Once the grace expires, a still-unobserved member is listed with `s_down` and
+`disconnected`; a node observed and then lost counts as down at any time.
+Failover continuity across that window is accepted and validated separately in
+#105.
 
 References: [operations discovery publication contract](../operations/meta-control-plane.md#discovery-publication-contract),
 [Redis Sentinel client protocol](https://redis.io/docs/latest/develop/reference/sentinel-clients/).

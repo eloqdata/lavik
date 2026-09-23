@@ -32,6 +32,8 @@ namespace {
 
 constexpr std::int64_t kNowUnixMs = 1'000'000;
 constexpr std::uint32_t kObservationTtlMs = 500;
+constexpr std::uint64_t kManifestRevision = 5;
+constexpr std::uint64_t kPartitionEpoch = 9;
 
 const std::string kOwnerId(kMetaNodeIdBytes, 'a');
 const std::string kReplicaOneId(kMetaNodeIdBytes, 'b');
@@ -54,8 +56,9 @@ MetaNodeRecord NodeRecord(const std::string& node_id,
                         .retired_ = false};
 }
 
-// One live session with green in-TTL health and a projection anchor naming the
-// committed term 7 plus the member's own assignment.
+// One live session with green in-TTL health and a projection anchor matching
+// the committed term 7, the member's own assignment, and the committed
+// manifest revision/digest plus partition replication epoch.
 MetaDataControlRuntimeNode LiveRuntimeNode(const std::string& node_id,
                                            const MetaAssignmentId& assignment) {
   MetaDataControlRuntimeNode node;
@@ -64,6 +67,9 @@ MetaDataControlRuntimeNode LiveRuntimeNode(const std::string& node_id,
       .group_id_ = "g1",
       .assignment_id_ = assignment,
       .group_term_ = 7,
+      .manifest_revision_ = kManifestRevision,
+      .manifest_digest_ = Bytes<32>(0x11),
+      .partition_replication_epoch_ = kPartitionEpoch,
   }};
   node.health_ = cluster::control::HeartbeatHealth{.storage_ready = true,
                                                    .population_ready = true,
@@ -90,6 +96,9 @@ MetaDiscoveryCut MakeCut() {
   group.topology_.group_id_ = "g1";
   group.topology_.record_.owner_ = kOwnerId;
   group.topology_.record_.group_term_ = 7;
+  group.topology_.record_.population_manifest_revision_ = kManifestRevision;
+  group.topology_.record_.population_manifest_digest_ = Bytes<32>(0x11);
+  group.topology_.record_.partition_replication_epoch_ = kPartitionEpoch;
   group.grant_.group_term_ = 7;
   group.grant_.grant_ = MetaActiveAuthorityView{.owner_ = kOwnerId};
   group.topology_.members_ = {
@@ -644,16 +653,18 @@ TEST(MetaSentinelDiscoveryTest, ReplicaReadabilityRequiresSessionHealthAnchor) {
     EXPECT_TRUE(replica.s_down_);
     EXPECT_TRUE(replica.disconnected_);
   }
-  {  // Grace treats a never-observed member as unknown.
+  {  // Within the grace window a never-observed member is omitted entirely
+     // rather than listed on unverified state.
     MetaDiscoveryCut cut = MakeCut();
     cut.observation_grace_active_ = true;
     auto& nodes = cut.runtime_.nodes_;
     nodes.erase(nodes.begin() + 1);
     auto& observed = cut.runtime_.observed_nodes_;
     observed.erase(std::find(observed.begin(), observed.end(), kReplicaOneId));
-    const auto replica = replica_one_flags(std::move(cut));
-    EXPECT_FALSE(replica.s_down_);
-    EXPECT_FALSE(replica.disconnected_);
+    const auto replicas = ReplicasById(std::move(cut));
+    ASSERT_EQ(replicas.size(), 1u);
+    EXPECT_FALSE(replicas.contains(kReplicaOneId));
+    EXPECT_TRUE(replicas.contains(kReplicaTwoId));
   }
   {  // A fenced service marks replicas master_down without inventing a
      // Primary.
@@ -663,6 +674,113 @@ TEST(MetaSentinelDiscoveryTest, ReplicaReadabilityRequiresSessionHealthAnchor) {
     ASSERT_EQ(replicas.size(), 2u);
     EXPECT_TRUE(replicas.at(kReplicaOneId).master_down_);
     EXPECT_FALSE(replicas.at(kReplicaOneId).s_down_);
+  }
+}
+
+// The readability anchor is the complete replication identity, not just the
+// authority term and membership incarnation: SetGroupReplicationState advances
+// the manifest revision/digest and partition replication epoch while those two
+// stay unchanged, and a node still holding the superseded projection must read
+// as s_down.
+TEST(MetaSentinelDiscoveryTest,
+     ReplicaAnchorRequiresCurrentReplicationIdentity) {
+  const auto replica_one = [](MetaDiscoveryCut cut) {
+    const auto replicas = ReplicasById(cut);
+    EXPECT_TRUE(replicas.contains(kReplicaOneId));
+    return replicas.at(kReplicaOneId);
+  };
+  {  // Baseline: every anchor dimension matches, so the replica is readable.
+    EXPECT_FALSE(replica_one(MakeCut()).s_down_);
+    EXPECT_FALSE(replica_one(MakeCut()).disconnected_);
+  }
+  {  // Authority term moved on.
+    MetaDiscoveryCut cut = MakeCut();
+    cut.runtime_.nodes_[1].groups_.front().group_term_ = 6;
+    EXPECT_TRUE(replica_one(std::move(cut)).s_down_);
+  }
+  {  // Stale membership incarnation.
+    MetaDiscoveryCut cut = MakeCut();
+    cut.runtime_.nodes_[1].groups_.front().assignment_id_ = Bytes<16>(0x7f);
+    EXPECT_TRUE(replica_one(std::move(cut)).s_down_);
+  }
+  {  // The committed manifest revision advanced while term and assignment
+     // stayed unchanged.
+    MetaDiscoveryCut cut = MakeCut();
+    cut.committed_.groups_.front()
+        .topology_.record_.population_manifest_revision_ =
+        kManifestRevision + 1;
+    EXPECT_TRUE(replica_one(std::move(cut)).s_down_);
+  }
+  {  // Same revision counter but rotated manifest content.
+    MetaDiscoveryCut cut = MakeCut();
+    cut.committed_.groups_.front()
+        .topology_.record_.population_manifest_digest_ = Bytes<32>(0x22);
+    EXPECT_TRUE(replica_one(std::move(cut)).s_down_);
+  }
+  {  // The committed partition replication epoch advanced.
+    MetaDiscoveryCut cut = MakeCut();
+    cut.committed_.groups_.front()
+        .topology_.record_.partition_replication_epoch_ = kPartitionEpoch + 1;
+    EXPECT_TRUE(replica_one(std::move(cut)).s_down_);
+  }
+  {  // A runtime anchor from a superseded projection fails against the
+     // unchanged committed state.
+    MetaDiscoveryCut cut = MakeCut();
+    cut.runtime_.nodes_[1].groups_.front().manifest_revision_ =
+        kManifestRevision - 1;
+    EXPECT_TRUE(replica_one(std::move(cut)).s_down_);
+  }
+}
+
+// A never-observed member is omitted while the leader's observation grace
+// window is open, listed with down evidence once it closes, and reads clean
+// once green evidence arrives.
+TEST(MetaSentinelDiscoveryTest, GraceOmitsNeverObservedReplicas) {
+  const auto without_replica_one_evidence = [] {
+    MetaDiscoveryCut cut = MakeCut();
+    auto& nodes = cut.runtime_.nodes_;
+    nodes.erase(nodes.begin() + 1);
+    auto& observed = cut.runtime_.observed_nodes_;
+    observed.erase(std::find(observed.begin(), observed.end(), kReplicaOneId));
+    return cut;
+  };
+  {  // Window open: omission, not a flagless listing.
+    MetaDiscoveryCut cut = without_replica_one_evidence();
+    cut.observation_grace_active_ = true;
+    const auto replicas = ReplicasById(cut);
+    ASSERT_EQ(replicas.size(), 1u);
+    EXPECT_FALSE(replicas.contains(kReplicaOneId));
+    EXPECT_TRUE(replicas.contains(kReplicaTwoId));
+  }
+  {  // Window closed: the same absence is down evidence.
+    MetaDiscoveryCut cut = without_replica_one_evidence();
+    const auto replicas = ReplicasById(cut);
+    ASSERT_EQ(replicas.size(), 2u);
+    EXPECT_TRUE(replicas.at(kReplicaOneId).s_down_);
+    EXPECT_TRUE(replicas.at(kReplicaOneId).disconnected_);
+  }
+  {  // Observed-then-gone is evidence even inside the window.
+    MetaDiscoveryCut cut = MakeCut();
+    cut.observation_grace_active_ = true;
+    auto& nodes = cut.runtime_.nodes_;
+    nodes.erase(nodes.begin() + 1);
+    const auto replicas = ReplicasById(cut);
+    ASSERT_EQ(replicas.size(), 2u);
+    EXPECT_TRUE(replicas.at(kReplicaOneId).s_down_);
+    EXPECT_TRUE(replicas.at(kReplicaOneId).disconnected_);
+  }
+  {  // A live session with green in-window health and the current anchor
+     // lists clean again.
+    MetaDiscoveryCut cut = without_replica_one_evidence();
+    cut.runtime_.nodes_.insert(cut.runtime_.nodes_.begin() + 1,
+                               LiveRuntimeNode(kReplicaOneId, Bytes<16>(0x02)));
+    auto& observed = cut.runtime_.observed_nodes_;
+    observed.insert(std::find(observed.begin(), observed.end(), kReplicaTwoId),
+                    kReplicaOneId);
+    const auto replicas = ReplicasById(cut);
+    ASSERT_EQ(replicas.size(), 2u);
+    EXPECT_FALSE(replicas.at(kReplicaOneId).s_down_);
+    EXPECT_FALSE(replicas.at(kReplicaOneId).disconnected_);
   }
 }
 

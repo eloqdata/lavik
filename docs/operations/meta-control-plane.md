@@ -214,9 +214,10 @@ Group ID, matched exactly; every other name is an unknown service.
 
 Publication rules. A Primary address is published only from committed
 authority: the Group's authority is active and its committed Owner is not
-retired and advertises a `tcp://` client endpoint that parses as a numeric IP
-with a nonzero, non-wildcard port. Only `tcp://` endpoints are ever published;
-Raft, Data-control, and Admin endpoints never appear. Health never gates
+retired and advertises a plaintext client endpoint that parses as a numeric IP
+with a nonzero, non-wildcard port. Plaintext means the `tcp://` tag or the
+legacy untagged form; `tls://` endpoints are never published here. Raft,
+Data-control, and Admin endpoints never appear. Health never gates
 publication: an unhealthy but still-authoritative Owner stays published and is
 marked by flags instead. Objective failure is expressed by withdrawing
 publication: once committed authority is gone (for example after an
@@ -279,10 +280,12 @@ stale leadership bracket or anchor are ignored rather than applied. It carries
 always carries `slave`. The committed Owner record is the sole role authority:
 failover commits never rewrite member roles, so every committed, non-retired
 member except the current Owner is listed as a replica, and member removal
-removes it from the list. A replica is
+removes it from the list; the one exception is the leader-change grace below,
+which omits never-yet-observed members outright. A replica is
 reported without `s_down` only while it holds a live authenticated session, a
 TTL-fresh heartbeat with all health bits green, and a node-validated projection
-anchor (Group Term and assignment) matching committed state; otherwise
+anchor (Group Term, assignment, population manifest revision and digest, and
+partition replication epoch) matching committed state; otherwise
 `s_down` is set. `disconnected` marks a missing session, and `master_down`
 marks that the service currently has no publishable Primary. `o_down` is never
 emitted on any record; objective down is the withdrawal described above.
@@ -290,10 +293,16 @@ emitted on any record; objective down is the withdrawal described above.
 Leader-change grace. During the leadership observation grace after a Meta
 leader change (derived as at least the Raft election upper bound plus the
 maximum supported Data reconnect delay, and never shorter than the observation
-TTL), a node the new leader has never observed is reported as unknown rather
-than down, so speculative flags do not appear during warmup. A node the leader
-had already observed and then lost counts as down at any time. Health flags
-are therefore deliberately optimistic inside that window.
+TTL), absence of observation is not treated as failure evidence. A Primary the
+new leader has never observed simply carries no down flags: publication is
+gated on committed authority, and a speculative `s_down` would block all
+discovery toward a still-authoritative address. Replica listings are stricter
+in the same window: a member this leader has never observed is omitted from
+`REPLICAS`/`SLAVES` results, because an unverified member — possibly still in
+its first FULL rebuild — must not be selected into client read pools, and
+omission claims neither health nor failure. A node observed and then lost
+counts as down at any time; once the grace expires, a still-unobserved member
+is listed with `s_down` and `disconnected`.
 
 Known limitations.
 
@@ -304,7 +313,8 @@ Known limitations.
   form comparable across replication Compatibility Domains.
 - `num-other-sentinels` is `0`; the Sentinel peer directory and
   `+switch-master` events arrive with #105.
-- Only `tcp://` addresses are published. TLS-only deployments resolve to null
+- Only plaintext addresses (`tcp://` or the legacy untagged form) are
+  published. TLS-only deployments resolve to null
   until TLS address publication arrives with #109.
 - Only Meta-managed Single deployments are discoverable here; Cluster
   deployments use `CLUSTER SLOTS`/`NODES` on the Data nodes instead.

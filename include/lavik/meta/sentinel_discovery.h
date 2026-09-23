@@ -56,9 +56,11 @@ namespace lavik::meta {
 // One consistent read of every input a discovery answer may use. `committed_`
 // is the compact committed projection; `runtime_` and `diagnostics_` are the
 // volatile leader-local registries; `observation_grace_active_` marks the
-// post-election window in which a node this leader has never observed reads as
-// "unknown" rather than "down": absence of observation is not failure
-// evidence, and flags must not flap during leader warmup.
+// post-election window in which a node this leader has never observed is
+// unverified rather than down: absence of observation is not failure evidence.
+// The Owner keeps its publication and flags then (committed state alone gates
+// the Primary), while an unverified member stays out of the replica listing so
+// read pools cannot select it.
 struct MetaDiscoveryCut {
   MetaCommittedStatusView committed_;
   MetaDataControlRuntimeSnapshot runtime_;
@@ -128,11 +130,16 @@ MetaDiscoveryMasterFlags MasterFlags(const MetaDiscoveryCut& cut,
 // owner identity (record_.owner_) is the sole role authority and is excluded.
 // A replica reads as not s_down only when all three hold: a live session, an
 // all-green heartbeat health report received within the observation TTL, and a
-// projected FDS anchor (group term and the member's own assignment) equal to
-// the committed anchor — the runtime registry's per-group anchors describe the
-// last projection the node acknowledged applying, never a self-report. Members
-// with an unpublishable endpoint are omitted rather than announced with a
-// fabricated address.
+// projected anchor (group term, the member's own assignment, manifest
+// revision/digest, partition replication epoch) equal to the committed anchor
+// — the runtime registry's per-group anchors describe the last projection the
+// node acknowledged applying, never a self-report. Members with an
+// unpublishable endpoint are omitted rather than announced with a fabricated
+// address. So are members the current leader has never observed while its
+// post-election grace window is open: their state is unverified rather than
+// failed, and client read pools must not select an unproven node merely
+// because its entry lacks down flags. Once the window closes, that same
+// absence is evidence and the member lists as s_down,disconnected.
 std::vector<MetaDiscoveryReplica> ListReplicas(
     const MetaDiscoveryCut& cut, const MetaCommittedStatusGroup& group,
     bool primary_publishable);

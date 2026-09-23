@@ -83,7 +83,8 @@ follows the ctl-server precedent, and steady-state queries rebuild nothing.
 Publication is gated by committed authority alone: the lifecycle is Created,
 the immutable client mode is Single, one complete Group exists, its authority
 is active, and the committed Owner is not retired and advertises a usable
-`tcp://` client endpoint—a numeric IP with a nonzero, non-wildcard port. Raft,
+plaintext client endpoint—`tcp://` or the legacy untagged form, a numeric IP
+with a nonzero, non-wildcard port. Raft,
 Data-control, and Admin endpoints are never published. Health never gates
 publication; it only sets flags. A published primary always carries the
 `master` flag, `s_down` reflects a detector SUSPECT/TRIGGERING cut whose
@@ -97,9 +98,14 @@ except the current Owner is listed as a replica — the committed Owner record
 is the sole role authority, since failover commits never rewrite member
 roles; observation truth adds their `s_down`/`disconnected` flags,
 and `master_down` marks the absence of a publishable Primary. Within the
-leadership observation grace after a leader change, a node this leader has
-never observed is unknown rather than down; a node observed and then lost
-counts as down at any time. Discovery replies follow the Redis 7.2 Sentinel
+leadership observation grace after a leader change, absence of observation is
+not failure evidence: a never-observed Owner simply carries no down flags,
+because a speculative `s_down` would block all discovery toward a
+still-authoritative address, while a never-observed replica member is omitted
+from listings outright, because an unverified member must not be selected into
+client read pools. Once the grace expires, a still-unobserved member is listed
+with `s_down` and `disconnected`; a node observed and then lost counts as down
+at any time. Discovery replies follow the Redis 7.2 Sentinel
 field shapes under RESP2 and RESP3; fields Meta cannot observe truthfully are
 omitted or carried as documented constants rather than fabricated.
 

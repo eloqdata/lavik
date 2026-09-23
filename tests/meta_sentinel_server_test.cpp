@@ -61,12 +61,16 @@ TEST(PasswordAuthenticatorTest, IndependentPasswordsAndBinaryInput) {
 // Exercise the public server options through an actual connection, using a
 // smaller output ceiling than the input ceiling to make output rejection
 // observable without changing production CLI defaults. Discovery needs real
-// authority inputs, so the fixture carries a single-node Raft stack; these
-// tests never wait for its election because none of them issues a discovery
-// verb.
+// authority inputs, so the fixture carries a single-node Raft stack; the
+// non-discovery tests never wait for its election because none of them issues
+// a discovery verb.
 class SentinelRuntime {
  public:
-  SentinelRuntime() {
+  // never_leader extends the Raft bootstrap with two unreachable voters on
+  // privileged ports (nothing can answer there), so the node campaigns
+  // forever without quorum: a deterministic non-leader, instead of a
+  // single-voter fixture that wins its election within ~150 ms.
+  explicit SentinelRuntime(bool never_leader = false) {
     const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
     dir_ = lavik::test::TestDataDirectory() /
            ("lavik_sentinel_server_" + std::string(info->name()) + "_" +
@@ -92,8 +96,19 @@ class SentinelRuntime {
     }
     machine_ =
         std::shared_ptr<lavik::meta::MetaStateMachine>(std::move(*machine));
-    auto raft = lavik::meta::MetaRaft::Open(
-        lavik::test::SingleMetaOptions(dir_), *machine_);
+    auto raft_options = lavik::test::SingleMetaOptions(dir_);
+    if (never_leader) {
+      for (std::int32_t id = 2; id <= 3; ++id) {
+        const lavik::meta::MetaMemberIdentity identity{
+            id, "lavik://meta/" + std::to_string(id), "127.0.0.1:1",
+            "127.0.0.1:2"};
+        raft_options.initial_.push_back(
+            std::make_shared<lavik::meta::MetaRaftMember>(
+                id, 0, "127.0.0.1:" + std::to_string(id),
+                identity.EncodeAux()));
+      }
+    }
+    auto raft = lavik::meta::MetaRaft::Open(std::move(raft_options), *machine_);
     if (!raft.ok()) {
       machine_status_ = raft.status();
       return;
@@ -283,42 +298,43 @@ std::string ReadReply(int client, std::size_t size) {
   return reply;
 }
 
-// The five discovery verbs are leader-only: a node that is not a caught-up
-// leader closes the connection without a reply so client seed lists rotate,
-// while management verbs keep their explicit error on any node. On the
-// leader, an uninitialized cluster answers from committed state: empty
-// MASTERS, null address, and the "No such master" error for named verbs.
-TEST(MetaSentinelServerTest, DiscoveryVerbsRequireCaughtUpLeader) {
+// Binds an ephemeral loopback port, releases it, and starts the Sentinel
+// server of this fixture there.
+void StartServerOnEphemeralPort(SentinelRuntime& runtime,
+                                sockaddr_in* address) {
   const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   ASSERT_GE(fd, 0);
-  sockaddr_in address{};
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+  address->sin_family = AF_INET;
+  address->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(address), sizeof(*address)),
             0);
-  socklen_t size = sizeof(address);
-  ASSERT_EQ(::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size), 0);
+  socklen_t size = sizeof(*address);
+  ASSERT_EQ(::getsockname(fd, reinterpret_cast<sockaddr*>(address), &size), 0);
   ::close(fd);
-  SentinelRuntime runtime;
-  ASSERT_TRUE(runtime.initialized_.get_future().get().ok());
-  ASSERT_TRUE(runtime.machine_status_.ok()) << runtime.machine_status_;
   lavik::meta::MetaSentinelServerOptions options;
-  options.address_ = "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+  options.address_ = "127.0.0.1:" + std::to_string(ntohs(address->sin_port));
   auto created = lavik::meta::MetaSentinelServer::Create(
       runtime.runtime_.GetForeignExecutor(0), runtime.DiscoveryDependencies(),
       std::move(options));
   ASSERT_TRUE(created.ok()) << created.status();
   runtime.server_ = *created;
   ASSERT_TRUE(runtime.server_->Start().ok());
+}
 
-  const auto connect = [&] {
+// The five discovery verbs are leader-only: a node that is not a caught-up
+// leader closes the connection without a reply so client seed lists rotate,
+// while management verbs keep their explicit error on any node. On the
+// leader, an uninitialized cluster answers from committed state: empty
+// MASTERS, null address, and the "No such master" error for named verbs.
+TEST(MetaSentinelServerTest, DiscoveryVerbsRequireCaughtUpLeader) {
+  const auto connect = [](const sockaddr_in& address) {
     const int client = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     EXPECT_GE(client, 0);
     const timeval timeout{.tv_sec = 3, .tv_usec = 0};
     EXPECT_EQ(::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                            sizeof(timeout)),
               0);
-    EXPECT_EQ(::connect(client, reinterpret_cast<sockaddr*>(&address),
+    EXPECT_EQ(::connect(client, reinterpret_cast<const sockaddr*>(&address),
                         sizeof(address)),
               0);
     return client;
@@ -331,25 +347,30 @@ TEST(MetaSentinelServerTest, DiscoveryVerbsRequireCaughtUpLeader) {
     EXPECT_EQ(ReadReply(client, expected.size()), expected);
   };
 
-  // The fresh node is still electing: every discovery verb drops silently.
-  ASSERT_FALSE(runtime.raft_->is_leader());
-  for (std::string_view request :
-       {"*3\r\n$8\r\nSENTINEL\r\n$23\r\nGET-MASTER-ADDR-BY-NAME\r\n$"
-        "2\r\ng1\r\n",
-        "*3\r\n$8\r\nSENTINEL\r\n$6\r\nMASTER\r\n$2\r\ng1\r\n",
-        "*2\r\n$8\r\nSENTINEL\r\n$7\r\nMASTERS\r\n",
-        "*3\r\n$8\r\nSENTINEL\r\n$8\r\nREPLICAS\r\n$2\r\ng1\r\n",
-        "*3\r\n$8\r\nSENTINEL\r\n$6\r\nSLAVES\r\n$2\r\ng1\r\n"}) {
-    const int client = connect();
-    send(client, request);
-    char buffer[1];
-    EXPECT_EQ(::recv(client, buffer, sizeof(buffer), 0), 0) << request;
-    ::close(client);
-  }
-  // A management verb answers its explicit refusal without dropping, and a
-  // malformed discovery verb keeps its deterministic arity error.
-  {
-    const int client = connect();
+  {  // Phase 1: a quorumless fixture can never win an election, so the drop
+     // behavior is deterministic rather than racing the election timeout.
+    SentinelRuntime runtime(/*never_leader=*/true);
+    ASSERT_TRUE(runtime.initialized_.get_future().get().ok());
+    ASSERT_TRUE(runtime.machine_status_.ok()) << runtime.machine_status_;
+    sockaddr_in address{};
+    StartServerOnEphemeralPort(runtime, &address);
+    EXPECT_FALSE(runtime.raft_->is_leader());
+    for (std::string_view request :
+         {"*3\r\n$8\r\nSENTINEL\r\n$23\r\nGET-MASTER-ADDR-BY-NAME\r\n$"
+          "2\r\ng1\r\n",
+          "*3\r\n$8\r\nSENTINEL\r\n$6\r\nMASTER\r\n$2\r\ng1\r\n",
+          "*2\r\n$8\r\nSENTINEL\r\n$7\r\nMASTERS\r\n",
+          "*3\r\n$8\r\nSENTINEL\r\n$8\r\nREPLICAS\r\n$2\r\ng1\r\n",
+          "*3\r\n$8\r\nSENTINEL\r\n$6\r\nSLAVES\r\n$2\r\ng1\r\n"}) {
+      const int client = connect(address);
+      send(client, request);
+      char buffer[1];
+      EXPECT_EQ(::recv(client, buffer, sizeof(buffer), 0), 0) << request;
+      ::close(client);
+    }
+    // A management verb answers its explicit refusal without dropping, and a
+    // malformed discovery verb keeps its deterministic arity error.
+    const int client = connect(address);
     send(client, "*3\r\n$8\r\nSENTINEL\r\n$7\r\nMONITOR\r\n$1\r\nx\r\n");
     expect_reply(client, "-ERR SENTINEL subcommand is not supported\r\n");
     send(client, "*3\r\n$8\r\nSENTINEL\r\n$7\r\nMASTERS\r\n$1\r\nx\r\n");
@@ -359,27 +380,36 @@ TEST(MetaSentinelServerTest, DiscoveryVerbsRequireCaughtUpLeader) {
     send(client, "*1\r\n$4\r\nPING\r\n");
     expect_reply(client, "+PONG\r\n");
     ::close(client);
+    runtime.server_->Shutdown();
   }
 
-  ASSERT_TRUE(
-      WaitFor([&] { return runtime.raft_->is_leader_sm_fully_caught_up(); },
-              std::chrono::seconds(15)));
-  const int leader = connect();
-  send(leader, "*2\r\n$8\r\nSENTINEL\r\n$7\r\nMASTERS\r\n");
-  expect_reply(leader, "*0\r\n");
-  send(
-      leader,
-      "*3\r\n$8\r\nSENTINEL\r\n$23\r\nGET-MASTER-ADDR-BY-NAME\r\n$2\r\ng1\r\n");
-  expect_reply(leader, "*-1\r\n");
-  send(leader, "*3\r\n$8\r\nSENTINEL\r\n$6\r\nMASTER\r\n$2\r\ng1\r\n");
-  expect_reply(leader, "-ERR No such master with that name\r\n");
-  send(leader, "*3\r\n$8\r\nSENTINEL\r\n$6\r\nSLAVES\r\n$2\r\ng1\r\n");
-  expect_reply(leader, "-ERR No such master with that name\r\n");
-  // The session survived every discovery answer.
-  send(leader, "*1\r\n$4\r\nPING\r\n");
-  expect_reply(leader, "+PONG\r\n");
-  ::close(leader);
-  runtime.server_->Shutdown();
+  {  // Phase 2: the single-voter fixture elects itself; poll the leader
+     // triplet to a caught-up state before expecting authoritative answers.
+    SentinelRuntime runtime;
+    ASSERT_TRUE(runtime.initialized_.get_future().get().ok());
+    ASSERT_TRUE(runtime.machine_status_.ok()) << runtime.machine_status_;
+    sockaddr_in address{};
+    StartServerOnEphemeralPort(runtime, &address);
+    ASSERT_TRUE(
+        WaitFor([&] { return runtime.raft_->is_leader_sm_fully_caught_up(); },
+                std::chrono::seconds(15)));
+    const int leader = connect(address);
+    send(leader, "*2\r\n$8\r\nSENTINEL\r\n$7\r\nMASTERS\r\n");
+    expect_reply(leader, "*0\r\n");
+    send(leader,
+         "*3\r\n$8\r\nSENTINEL\r\n$23\r\nGET-MASTER-ADDR-BY-NAME\r\n$"
+         "2\r\ng1\r\n");
+    expect_reply(leader, "*-1\r\n");
+    send(leader, "*3\r\n$8\r\nSENTINEL\r\n$6\r\nMASTER\r\n$2\r\ng1\r\n");
+    expect_reply(leader, "-ERR No such master with that name\r\n");
+    send(leader, "*3\r\n$8\r\nSENTINEL\r\n$6\r\nSLAVES\r\n$2\r\ng1\r\n");
+    expect_reply(leader, "-ERR No such master with that name\r\n");
+    // The session survived every discovery answer.
+    send(leader, "*1\r\n$4\r\nPING\r\n");
+    expect_reply(leader, "+PONG\r\n");
+    ::close(leader);
+    runtime.server_->Shutdown();
+  }
 }
 
 }  // namespace
