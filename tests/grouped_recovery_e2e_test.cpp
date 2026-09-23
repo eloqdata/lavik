@@ -953,11 +953,13 @@ TEST(GroupedRecoveryE2e, CommandBatchCrashNeverPublishesWithoutOuterDecision) {
       ChildServer server(image, false, point);
       ASSERT_EQ(server.Command({"HLEN", "hash"}), ":1");
       // EVAL supplies an outer atomic transaction; the command's independent
-      // decision alone must never authorize its data after restart.
+      // decision alone must never authorize its data after restart. The
+      // updated page stays above the compact threshold so the grouped command
+      // decision hook runs.
       EXPECT_THROW(server.Command({"EVAL",
                                    "return redis.call('HSET',KEYS[1],"
-                                   "'field','changed','added','new')",
-                                   "1", "hash"}),
+                                   "'field',ARGV[1],'added','new')",
+                                   "1", "hash", std::string(9 * 1024, 'c')}),
                    std::runtime_error);
       EXPECT_EQ(server.Wait(), 86) << server.Log();
     }
@@ -990,9 +992,9 @@ TEST(GroupedRecoveryE2e, FailedPostRootBatchPoisonsOuterCommit) {
     const auto response = server.Command(
         {"EVAL",
          "redis.call('SET',KEYS[2],'attempted'); "
-         "redis.pcall('HSET',KEYS[1],'field','changed','added','new'); "
+         "redis.pcall('HSET',KEYS[1],'field',ARGV[1],'added','new'); "
          "return 1",
-         "2", "hash", "guard"});
+         "2", "hash", "guard", std::string(9 * 1024, 'c')});
     EXPECT_TRUE(response.starts_with('-')) << response;
     EXPECT_EQ(server.Command({"SET", "hash", "must-fail"}).front(), '-');
     // Failed roots remain installed until restart/rollback, but even metadata
