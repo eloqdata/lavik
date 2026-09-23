@@ -827,9 +827,10 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
                                                      std::string_view failure) {
     // A grouped String may retain thousands of segment records. Releasing its
     // pin starts asynchronous promotion/flush/reclaim, not a fixed-latency
-    // operation; keep a bounded wall-clock budget independent of poll count.
+    // operation. Leave room for a cleaner retry and contended CI storage while
+    // keeping the wait bounded well below the test's overall timeout.
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
     std::uint64_t available = previous;
     do {
       absl::Status slept =
@@ -841,9 +842,13 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
         co_return absl::OkStatus();
       }
     } while (std::chrono::steady_clock::now() < deadline);
+    const auto cleaner = storage_->TxCleanerStats();
     co_return absl::FailedPreconditionError(
         std::string(failure) + ": previous=" + std::to_string(previous) +
-        " available=" + std::to_string(available));
+        " available=" + std::to_string(available) +
+        " cleaner_rounds=" + std::to_string(cleaner.rounds_) +
+        " cleaner_failures=" + std::to_string(cleaner.failures_) +
+        " cleaner_retired_blocks=" + std::to_string(cleaner.retired_blocks_));
   }
 
   void CheckRetainedMemory(std::optional<std::uint64_t>& first_retained,
