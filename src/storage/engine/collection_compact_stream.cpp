@@ -24,6 +24,7 @@
 #include <new>
 
 #include "lavik/storage/detail/grouped_hash.h"
+#include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
 namespace {
@@ -53,6 +54,11 @@ std::uint64_t Get(const char* input, unsigned width) {
 
 absl::Status ValidateTotals(ValueType type, std::uint64_t count,
                             std::uint64_t bytes) {
+  if (type == ValueType::kStream) {
+    if (count > UINT32_MAX || bytes < 8 + 3 * 4)
+      return absl::InvalidArgumentError("invalid logical Stream wire totals");
+    return absl::OkStatus();
+  }
   if ((!HashWire(type) && type != ValueType::kList &&
        type != ValueType::kSortedSet) ||
       count == 0 || count > std::numeric_limits<std::uint32_t>::max()) {
@@ -90,7 +96,12 @@ absl::Status ValidateEntry(ValueType type, std::uint64_t first,
 
 absl::StatusOr<CollectionCompactEncoder> CollectionCompactEncoder::Create(
     ValueType type, std::uint64_t count, std::uint64_t bytes) {
-  auto valid = ValidateTotals(type, count, bytes);
+  auto valid =
+      type == ValueType::kStream
+          ? (count != 0 && count <= UINT32_MAX && bytes >= 56
+                 ? absl::OkStatus()
+                 : absl::InvalidArgumentError("invalid Stream record totals"))
+          : ValidateTotals(type, count, bytes);
   if (!valid.ok()) return valid;
   CollectionCompactEncoder result;
   result.type_ = type;
@@ -99,7 +110,13 @@ absl::StatusOr<CollectionCompactEncoder> CollectionCompactEncoder::Create(
   result.header_bytes_ = HeaderBytes(type);
   result.supplied_bytes_ = result.header_bytes_;
   char* out = result.header_.data();
-  if (HashWire(type)) {
+  if (type == ValueType::kStream) {
+    // Logical routing keys contain only IDs/names, never physical page IDs.
+    // Retaining them lets a receiver reconstruct macro-node boundaries while
+    // consuming one record at a time, even after messages have been flushed.
+    std::memcpy(out, "LSR1", 4);
+    Put(out + 4, count, 4);
+  } else if (HashWire(type)) {
     Put(out, kHashValueMagic, 8);
     Put(out + 8, kStorageFormatVersion, 4);
     Put(out + 12, kHashValueHeaderBytes, 4);
@@ -116,16 +133,25 @@ absl::StatusOr<std::uint64_t> CollectionCompactEncoder::MeasurePage(
     const CollectionPage& page) {
   const auto type = page.value_type_;
   if ((!HashWire(type) && type != ValueType::kList &&
-       type != ValueType::kSortedSet) ||
+       type != ValueType::kSortedSet && type != ValueType::kStream) ||
       (type != ValueType::kHash && !page.fields_.empty()) ||
       (type != ValueType::kSet && type != ValueType::kList &&
-       !page.elements_.empty()) ||
+       type != ValueType::kStream && !page.elements_.empty()) ||
       (type != ValueType::kSortedSet && !page.scored_members_.empty())) {
     return absl::InvalidArgumentError(
         "compact page has inconsistent containers");
   }
   std::uint64_t result = 0;
   for (std::size_t i = 0; i < page.size(); ++i) {
+    if (type == ValueType::kStream) {
+      auto payload = StreamRecordPayload(page.elements_[i]);
+      if (!payload.ok()) return payload.status();
+      const auto bytes = page.elements_[i].size();
+      if (bytes > kMaxStringBytes || bytes > UINT64_MAX - result - 4)
+        return absl::OutOfRangeError("Stream page size overflow");
+      result += bytes + 4;
+      continue;
+    }
     const std::uint64_t first =
         type == ValueType::kHash        ? page.fields_[i].field_.size()
         : type == ValueType::kSortedSet ? page.scored_members_[i].member_.size()
@@ -228,6 +254,7 @@ absl::StatusOr<CollectionCompactDecoder> CollectionCompactDecoder::Create(
   result.total_bytes_ = bytes;
   result.page_.value_type_ = type;
   result.admission_ = std::move(admission);
+  if (type == ValueType::kStream) result.stream_validator_.emplace(count);
   return result;
 }
 
@@ -238,7 +265,12 @@ absl::Status CollectionCompactDecoder::Fail(absl::Status status) {
 
 absl::Status CollectionCompactDecoder::ReadHeader() {
   const char* in = framing_.data();
-  if (HashWire(type_)) {
+  if (type_ == ValueType::kStream) {
+    if (std::memcmp(in, "LSR1", 4) != 0 || Get(in + 4, 4) < 3 ||
+        Get(in + 4, 4) > (total_bytes_ - 8) / 4)
+      return absl::DataLossError("invalid logical Stream wire header");
+    total_count_ = Get(in + 4, 4);
+  } else if (HashWire(type_)) {
     if (Get(in, 8) != kHashValueMagic ||
         Get(in + 8, 4) != kStorageFormatVersion ||
         Get(in + 12, 4) != kHashValueHeaderBytes ||
@@ -275,7 +307,7 @@ absl::Status CollectionCompactDecoder::ReadEntryHeader() {
   // Stop before assembling an oversized entry alongside preceding entries.
   // The tiny consumed framing stays in the cursor across the caller's await.
   if (page_.size() != 0 &&
-      entry_bytes_ > kCollectionStreamPageBytes - page_bytes_)
+      entry_bytes_ > kCollectionGroupTargetBytes - page_bytes_)
     ready_ = true;
   return absl::OkStatus();
 }
@@ -305,6 +337,22 @@ absl::Status CollectionCompactDecoder::CompleteEntry() {
                 : type_ == ValueType::kSortedSet ? grow(page_.scored_members_)
                                                  : grow(page_.elements_);
   if (!status.ok()) return status;
+  if (stream_validator_) {
+    // Validator identity survives TakePage. Keep its admission separate from
+    // the page receipt, which the caller releases after ingesting that page.
+    auto key = StreamRecordKey(first_);
+    if (!key.ok()) return key.status();
+    if (key->size() > (SIZE_MAX - 128) / 4)
+      return absl::ResourceExhaustedError("Stream validator size overflow");
+    const auto needed = key->size() * 4 + 128;
+    if (admission_ && needed > stream_validator_charge_.bytes_) {
+      auto admitted = admission_(needed - stream_validator_charge_.bytes_);
+      if (!admitted.ok()) return admitted;
+      stream_validator_charge_.bytes_ = needed;
+    }
+    auto valid = stream_validator_->Read(first_);
+    if (!valid.ok()) return valid;
+  }
   if (type_ == ValueType::kHash) {
     page_.fields_.push_back({std::move(first_), std::move(second_)});
   } else if (type_ == ValueType::kSortedSet) {
@@ -319,7 +367,7 @@ absl::Status CollectionCompactDecoder::CompleteEntry() {
   ++parsed_count_;
   page_bytes_ += entry_bytes_;
   stage_ = parsed_count_ == total_count_ ? Stage::kDone : Stage::kEntryHeader;
-  ready_ = stage_ == Stage::kDone || page_bytes_ >= kCollectionStreamPageBytes;
+  ready_ = stage_ == Stage::kDone || page_bytes_ >= kCollectionGroupTargetBytes;
   return absl::OkStatus();
 }
 
@@ -409,6 +457,10 @@ absl::Status CollectionCompactDecoder::Finish() {
   if (stage_ != Stage::kDone || parsed_count_ != total_count_ ||
       consumed_bytes_ != total_bytes_)
     return Fail(absl::DataLossError("truncated compact stream at EOF"));
+  if (stream_validator_) {
+    auto valid = stream_validator_->Finish();
+    if (!valid.ok()) return Fail(valid);
+  }
   return absl::OkStatus();
 }
 

@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
 namespace {
@@ -108,7 +109,9 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
   if (db_id >= options_.database_count_ || digest != ComputeDigest(key) ||
       !reader ||
       (type != ValueType::kHash && type != ValueType::kSet &&
-       type != ValueType::kList && type != ValueType::kSortedSet) ||
+       type != ValueType::kList && type != ValueType::kSortedSet &&
+       type != ValueType::kStream) ||
+      (type == ValueType::kStream && !expected_items) ||
       (expected_items &&
        *expected_items > std::numeric_limits<std::uint32_t>::max()))
     co_return absl::InvalidArgumentError("invalid collection restore input");
@@ -151,6 +154,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
                           .value_ = {},
                           .collection_ = state,
                           .memory_charge_ = {}};
+  stage.logical_size_ = expected_items.value_or(0);
   initial_admission.reset();
   if (outer) {
     if (outer->grouped_ingest_batch_ != nullptr)
@@ -360,6 +364,9 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       co_return absl::OkStatus();
     };
 
+    RetainedMemoryCharge stream_validation_charge;
+    stream_validation_charge.Account(CurrentMemoryAccountingShard(), 0);
+    StreamRecordValidator stream_validator(expected_items.value_or(0));
     bool done = false;
     while (!done) {
       auto page = co_await reader();
@@ -368,6 +375,26 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
         co_return absl::DataLossError("collection input changes type");
       auto bytes = CollectionCompactEncoder::MeasurePage(*page);
       if (!bytes.ok()) co_return bytes.status();
+      if (type == ValueType::kStream) {
+        std::size_t largest = stream_validator.RetainedBytes();
+        for (const auto& record : page->elements_) {
+          auto key = StreamRecordKey(record);
+          if (!key.ok()) co_return key.status();
+          largest = std::max(largest, key->size());
+        }
+        if (largest > (SIZE_MAX - 512) / 4)
+          co_return absl::ResourceExhaustedError(
+              "Stream validation size overflow");
+        auto charge = TryReserveMemory(largest * 4 + 512);
+        if (!charge)
+          co_return absl::ResourceExhaustedError("OOM Stream validation keys");
+        for (const auto& record : page->elements_) {
+          auto valid = stream_validator.Read(record);
+          if (!valid.ok()) co_return valid;
+        }
+        stream_validation_charge.Adopt(&*charge,
+                                       stream_validator.RetainedBytes());
+      }
       done = page->done_;
       if (page->size() == 0) continue;
       if (merged.size() != 0 && *bytes > 1024 * 1024 - merged_bytes) {
@@ -401,8 +428,13 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     auto written = co_await flush();
     if (!written.ok()) co_return written;
     if (state->applied_count_ == 0 ||
-        (expected_items && *expected_items != state->applied_count_))
+        (type != ValueType::kStream && expected_items &&
+         *expected_items != state->applied_count_))
       co_return absl::DataLossError("collection EOF cardinality mismatch");
+    if (type == ValueType::kStream) {
+      const auto valid = stream_validator.Finish();
+      if (!valid.ok()) co_return valid;
+    }
     if (replication != nullptr) {
       co_await store.store_state_mutex_.Lock();
       UnlockGuard metadata_unlock(&store.store_state_mutex_, store.worker_);

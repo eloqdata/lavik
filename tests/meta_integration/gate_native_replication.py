@@ -222,6 +222,64 @@ def seed_collections(writer):
     )
 
 
+def grouped_streams(root):
+    key = "{native-stream}log"
+
+    def seed(writer):
+        for number in range(1, 501):
+            assert writer.call("XADD", key, f"{number}-0", "f", "v" * 4096) == f"{number}-0"
+        assert writer.call("XGROUP", "CREATE", key, "g", "0") == "OK"
+        writer.call("XREADGROUP", "GROUP", "g", "a", "COUNT", 100,
+                    "STREAMS", key, ">")
+
+    with pair(root, "grouped-streams", seed=seed,
+              require_seed_before_full=True) as (meta, source, target, writer):
+        ready(meta)
+        reader = Client(target, readonly=True)
+        try:
+            def state(client):
+                return client.call("XINFO", "STREAM", key, "FULL", "COUNT", 0)
+
+            expected = state(writer)
+            H.wait_until("grouped Stream FULL preserves groups and PEL", 30,
+                         lambda: state(reader) == expected)
+            assert writer.call("XADD", key, "501-0", "f", "tail") == "501-0"
+            for _ in range(8):
+                writer.call("XREADGROUP", "GROUP", "g", "b", "COUNT", 3,
+                            "STREAMS", key, ">")
+            assert writer.call("XACK", key, "g", "1-0", "120-0") == 2
+            writer.call("XCLAIM", key, "g", "b", 0, "2-0", "TIME", 123456,
+                        "RETRYCOUNT", 7, "JUSTID")
+            expected = state(writer)
+            H.wait_until("grouped Stream delivery/ACK/claim replay", 30,
+                         lambda: state(reader) == expected)
+            assert reader.call("XLEN", key) == 501
+            # Group creation and deletion must use sparse replay after FULL too.
+            assert writer.call("XGROUP", "CREATE", key, "later", "$") == "OK"
+            assert writer.call("XGROUP", "DESTROY", key, "later") == 1
+            assert writer.call("XDEL", key, "2-0", "2-0", "500-0") == 2
+            writer.call("XAUTOCLAIM", key, "g", "b", 0, "0", "COUNT", 10)
+            assert writer.call("XGROUP", "DELCONSUMER", key, "g", "a") > 0
+            writer.call("XADD", key, "MAXLEN", "~", 450, "LIMIT", 1000,
+                        "502-0", "f", "trimmed")
+            writer.call("XTRIM", key, "MAXLEN", "~", 350, "LIMIT", 1000)
+            expected = state(writer)
+            H.wait_until("grouped delete/consumer/approximate-trim replay", 30,
+                         lambda: state(reader) == expected)
+            writer.call("XADD", "{native-stream}compact", "MAXLEN", "~", 0,
+                        "LIMIT", 1, "1-0", "f", "v")
+            H.wait_until("compact approximate LIMIT replay", 30,
+                         lambda: reader.call("TYPE", "{native-stream}compact") == "stream"
+                         and reader.call("XLEN", "{native-stream}compact") == 0)
+
+            writer.call("XTRIM", key, "MAXLEN", 0)
+            expected = state(writer)
+            H.wait_until("empty grouped Stream keeps replicated PEL", 30,
+                         lambda: state(reader) == expected)
+        finally:
+            reader.close()
+
+
 def replay_and_reconnect(root):
     with pair(root, "replay", seed=seed_collections) as (meta, source, target, writer):
         ready(meta)
@@ -1069,6 +1127,7 @@ def main():
         prefix="lavik-meta-native-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
     ) as directory:
         root = Path(directory)
+        grouped_streams(root)
         replay_and_reconnect(root)
         replica_backup_during_exec(root)
         dense_collection_full_sync(root)

@@ -43,6 +43,7 @@ Task<CommandReply> ExecuteStreamCommandLocked(const CommandRequest& request,
                                               ReplyBuilder& reply_builder);
 Task<std::string> ExecuteStreamReadLocked(
     const CommandRequest& request, std::span<const StreamExecKey> keys,
-    std::vector<storage::TxShardWrites>& tx_writes);
+    std::vector<storage::TxShardWrites>& tx_writes,
+    ReplyChunkSource* chunks = nullptr);
 
 }  // namespace lavik

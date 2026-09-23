@@ -286,7 +286,7 @@ Task<absl::Status> StorageEngine::Impl::ConsumeReplicaCollection(
   if (!complete.ok()) co_return complete;
   complete = co_await flush_batch();
   if (!complete.ok()) co_return complete;
-  if (state->applied_count_ != stage.logical_size_)
+  if (state->applied_count_ != state->decoder_->item_count())
     co_return absl::DataLossError("replica collection cardinality mismatch");
   if (!state->skip_) {
     complete = co_await CommitTxWrites(state->writes_.txid_, {&state->writes_});
@@ -400,10 +400,13 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
 
   const auto kind = stage.value_type_ == ValueType::kList
                         ? OrderedCollectionKind::kList
+                    : stage.value_type_ == ValueType::kStream
+                        ? OrderedCollectionKind::kStream
                         : OrderedCollectionKind::kSortedSet;
   std::vector<OrderedCollectionEntry> entries;
   entries.reserve(page.size());
-  if (kind == OrderedCollectionKind::kList) {
+  if (kind == OrderedCollectionKind::kList ||
+      kind == OrderedCollectionKind::kStream) {
     for (auto& item : page.elements_)
       entries.push_back({.value_ = std::move(item)});
   } else {
@@ -434,7 +437,10 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
         .first_group_ = split->groups_.front().id_,
         .last_group_ = split->groups_.back().id_,
         .next_group_id_ = split->next_group_id_,
-        .group_count_ = static_cast<std::uint32_t>(split->groups_.size())};
+        .group_count_ = static_cast<std::uint32_t>(split->groups_.size()),
+        .stream_length_ = kind == OrderedCollectionKind::kStream
+                              ? std::optional(stage.logical_size_)
+                              : std::nullopt};
     plan.changed_ = true;
     plan.writes_ = std::move(split->groups_);
   } else {

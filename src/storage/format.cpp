@@ -282,14 +282,16 @@ bool ValidGroupedRecordHeader(const RecordHeader& header) noexcept {
   const bool hashed = header.value_type_ == ValueType::kHash ||
                       header.value_type_ == ValueType::kSet;
   const bool ordered = header.value_type_ == ValueType::kList ||
-                       header.value_type_ == ValueType::kSortedSet;
+                       header.value_type_ == ValueType::kSortedSet ||
+                       header.value_type_ == ValueType::kStream;
   if ((header.grouped_ || header.auxiliary_group_) &&
       (header.kind_ != RecordKind::kValue || (!hashed && !ordered) ||
        header.mutation_sequence_ == 0))
     return false;
-  if (header.grouped_ &&
-      (header.auxiliary_group_ || header.logical_size_ == 0 ||
-       (header.external_ && !header.key_external_)))
+  if (header.grouped_ && (header.auxiliary_group_ ||
+                          (header.logical_size_ == 0 &&
+                           header.value_type_ != ValueType::kStream) ||
+                          (header.external_ && !header.key_external_)))
     return false;
   if (!header.auxiliary_group_) {
     return header.group_incarnation_ == 0 && header.group_prefix_ == 0 &&
@@ -306,6 +308,7 @@ bool ValidGroupedRecordHeader(const RecordHeader& header) noexcept {
   // member pages instead use canonical Hash prefixes, a disjoint namespace.
   if (ordered &&
       (header.value_type_ == ValueType::kList ||
+       header.value_type_ == ValueType::kStream ||
        (header.group_prefix_bits_ == 0 && header.group_prefix_ != 0)))
     return header.group_prefix_ != 0 && header.group_prefix_bits_ == 0;
   // Avoid a full-width shift for the root range and the deepest leaf.

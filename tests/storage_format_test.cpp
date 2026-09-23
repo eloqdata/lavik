@@ -306,8 +306,7 @@ TEST(StorageFormatTest, CollectionGroupHeadersKeepTypeAndRoutingSemantics) {
   }
 }
 
-TEST(StorageFormatTest,
-     GroupedRootsAllowCollectionsButRejectStringsAndStreams) {
+TEST(StorageFormatTest, GroupedRootsAllowCollectionsButRejectStrings) {
   using namespace lavik::storage;
   constexpr std::string_view key = "collection-key";
   RecordHeader root{
@@ -329,7 +328,8 @@ TEST(StorageFormatTest,
     root.value_type_ = type;
     const bool collection =
         type == ValueType::kHash || type == ValueType::kSet ||
-        type == ValueType::kList || type == ValueType::kSortedSet;
+        type == ValueType::kList || type == ValueType::kSortedSet ||
+        type == ValueType::kStream;
     EXPECT_EQ(EncodeRecordHeader(root, key, bytes), collection);
     if (collection) {
       RecordHeader decoded;
@@ -338,6 +338,9 @@ TEST(StorageFormatTest,
       EXPECT_TRUE(decoded.grouped_);
       EXPECT_EQ(decoded.value_type_, type);
     }
+    root.logical_size_ = 0;
+    EXPECT_EQ(EncodeRecordHeader(root, key, bytes), type == ValueType::kStream);
+    root.logical_size_ = 99;
   }
   for (const auto type :
        {ValueType::kNone, ValueType::kString, ValueType::kStream}) {

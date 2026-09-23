@@ -1077,7 +1077,8 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
         store.rdb_snapshot_->invalidated_ = true;
         co_return loaded.status();
       }
-      if (page.value_type_ == ValueType::kList) {
+      if (page.value_type_ == ValueType::kList ||
+          page.value_type_ == ValueType::kStream) {
         page.elements_.reserve(loaded->snapshot_.entries_.size());
         for (auto& entry : loaded->snapshot_.entries_)
           page.elements_.push_back(std::move(entry.value_));
@@ -1121,7 +1122,9 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
     if (store.rdb_snapshot_->invalidated_)
       co_return absl::CancelledError(
           "RDB collection stream was cancelled during read");
-    const auto expected = stream.saved_->location_.logical_size_;
+    const auto expected = page.value_type_ == ValueType::kStream
+                              ? object->ordered_directory().root().item_count_
+                              : stream.saved_->location_.logical_size_;
     if (stream.emitted_ > expected ||
         page.size() > expected - stream.emitted_ ||
         (page.done_ && page.size() != expected - stream.emitted_)) {

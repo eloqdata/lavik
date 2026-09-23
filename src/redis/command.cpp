@@ -16,6 +16,7 @@
 
 #include "lavik/command.h"
 
+#include <fcntl.h>
 #include <sys/socket.h>
 
 #include <algorithm>
@@ -29,6 +30,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -71,6 +73,7 @@
 #include "lavik/pubsub.h"
 #include "lavik/random_sample.h"
 #include "lavik/rdb.h"
+#include "lavik/rdb_collection.h"
 #include "lavik/redis_parse.h"
 #include "lavik/replication.h"
 #include "lavik/replication_command.h"
@@ -4150,6 +4153,99 @@ PreparedDumpReply PrepareDumpReply(std::string payload) {
   };
 }
 
+// DUMP needs a byte length before its first bulk frame. Encode a pinned
+// collection into an unlinked scratch file, then send bounded chunks. The file
+// owns the command-position result after EXEC releases intents or deletes keys.
+Task<absl::StatusOr<PreparedDumpReply>> PrepareCollectionDump(
+    std::uint8_t db, std::string_view key,
+    const storage::Digest* locked = nullptr) {
+  const auto digest = locked ? *locked : storage::ComputeDigest(key);
+  tx::TxShard::Guard guard;
+  if (!locked)
+    guard = co_await tx::CurrentTxShard().AcquireKey(
+        db, tx::FingerprintOf(digest), tx::LockMode::kShared);
+  auto value = co_await g_storage->ReadValueForTransferLocked(db, key, digest);
+  guard = {};
+  if (!value.ok()) co_return value.status();
+  if (!value->reader_) {
+    auto payload = rdb::EncodeDump(value->metadata_);
+    if (!payload.ok()) co_return payload.status();
+    co_return PrepareDumpReply(std::move(*payload));
+  }
+  struct State {
+    RetainedMemoryCharge charge_;
+    std::FILE* file_ = nullptr;
+    std::uint64_t bytes_ = 0, remaining_ = 0;
+    ~State() {
+      if (file_) std::fclose(file_);
+    }
+    absl::Status Write(std::string_view fragment) {
+      if (fragment.size() > UINT64_MAX - bytes_)
+        return absl::OutOfRangeError("DUMP length overflow");
+      if (std::fwrite(fragment.data(), 1, fragment.size(), file_) !=
+          fragment.size())
+        return absl::InternalError(
+            absl::StrCat("DUMP scratch write: ", std::strerror(errno)));
+      bytes_ += fragment.size();
+      return absl::OkStatus();
+    }
+    Task<absl::StatusOr<std::string>> Next() {
+      if (!remaining_) co_return std::string{};
+      std::string chunk(std::min<std::uint64_t>(remaining_, 256 * 1024), '\0');
+      if (std::fread(chunk.data(), 1, chunk.size(), file_) != chunk.size())
+        co_return absl::DataLossError("cannot read DUMP scratch file");
+      remaining_ -= chunk.size();
+      if (!remaining_) chunk += "\r\n";
+      co_return chunk;
+    }
+  };
+  auto admission = TryReserveMemory(sizeof(State) + 512 * 1024);
+  if (!admission)
+    co_return absl::ResourceExhaustedError("OOM DUMP output buffer");
+  auto state = std::make_shared<State>();
+  state->charge_.Adopt(&*admission, admission->bytes());
+  state->file_ = std::tmpfile();
+  if (!state->file_)
+    co_return absl::InternalError(
+        absl::StrCat("DUMP scratch file: ", std::strerror(errno)));
+  if (::fcntl(::fileno(state->file_), F_SETFD, FD_CLOEXEC) < 0)
+    co_return absl::InternalError("cannot protect DUMP scratch descriptor");
+  auto encoder = rdb::CollectionFileEncoder::CreateDump(
+      value->metadata_.value_type_, value->metadata_.logical_size_);
+  if (!encoder.ok()) co_return encoder.status();
+  rdb::DumpEncoder checksum;
+  const auto drain = [&]() -> absl::Status {
+    while (auto fragment = encoder->Next()) {
+      auto status = state->Write(*fragment);
+      if (!status.ok()) return status;
+      checksum.Account(*fragment);
+    }
+    return absl::OkStatus();
+  };
+  auto status = drain();
+  if (!status.ok()) co_return status;
+  for (;;) {
+    auto page = co_await value->reader_();
+    if (!page.ok()) co_return page.status();
+    status = encoder->StartPage(*page);
+    if (!status.ok()) co_return status;
+    status = drain();
+    if (!status.ok()) co_return status;
+    if (page->done_) break;
+    co_await bycorf::Yield(*bycorf::ThisWorker().self_);
+  }
+  status = encoder->Finish();
+  if (!status.ok()) co_return status;
+  status = state->Write(checksum.Finish());
+  if (!status.ok()) co_return status;
+  if (::fseeko(state->file_, 0, SEEK_SET) != 0)
+    co_return absl::InternalError("cannot rewind DUMP scratch file");
+  state->remaining_ = state->bytes_;
+  co_return PreparedDumpReply{
+      .header_ = "$" + std::to_string(state->bytes_) + "\r\n",
+      .chunks_ = [state] { return state->Next(); }};
+}
+
 Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
                                          ReplyBuilder& reply_builder,
                                          ReadLatencyTrace* read_trace = nullptr,
@@ -4205,24 +4301,17 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
     }
 
     case CommandKind::kDump: {
-      auto value = co_await g_storage->ReadRawValue(request.db_id_, args[1]);
-      if (!value.ok()) {
+      auto prepared = co_await PrepareCollectionDump(request.db_id_, args[1]);
+      if (!prepared.ok()) {
         reply.encoded_ =
-            value.status().code() == absl::StatusCode::kNotFound
+            absl::IsNotFound(prepared.status())
                 ? reply_builder.AppendNull()
-                : AppendStorageError(reply_builder, value.status());
+                : AppendStorageError(reply_builder, prepared.status());
         co_return reply;
       }
-      auto payload = rdb::EncodeDump(*value);
-      if (!payload.ok()) {
-        reply.encoded_ = reply_builder.AppendError(
-            absl::StrCat("ERR ", payload.status().message()));
-        co_return reply;
-      }
-      PreparedDumpReply prepared = PrepareDumpReply(std::move(*payload));
-      reply.encoded_ = reply_builder.AppendRaw(prepared.header_);
+      reply.encoded_ = reply_builder.AppendRaw(prepared->header_);
       reply.chunks_ =
-          std::make_unique<ReplyChunkSource>(std::move(prepared.chunks_));
+          std::make_unique<ReplyChunkSource>(std::move(prepared->chunks_));
       co_return reply;
     }
 
@@ -5049,22 +5138,13 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
     }
 
     case CommandKind::kDump: {
-      auto value =
-          co_await g_storage->ReadRawValueLocked(db_id, args[1], digest);
-      if (!value.ok()) {
-        co_return value.status().code() == absl::StatusCode::kNotFound
+      auto prepared = co_await PrepareCollectionDump(db_id, args[1], &digest);
+      if (!prepared.ok())
+        co_return absl::IsNotFound(prepared.status())
             ? EncodeSemanticNull(request.resp_version_)
-            : EncodeStorageError(value.status());
-      }
-      auto payload = rdb::EncodeDump(*value);
-      if (!payload.ok()) {
-        co_return EncodeError(absl::StrCat("ERR ", payload.status().message()));
-      }
-      PreparedDumpReply prepared = PrepareDumpReply(std::move(*payload));
-      if (reply_chunks != nullptr) {
-        *reply_chunks = std::move(prepared.chunks_);
-      }
-      co_return std::move(prepared.header_);
+            : EncodeStorageError(prepared.status());
+      if (reply_chunks) *reply_chunks = std::move(prepared->chunks_);
+      co_return std::move(prepared->header_);
     }
 
     case CommandKind::kRestore: {
@@ -5279,6 +5359,8 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
       ReplyBuilder stream_reply_builder(request.resp_version_);
       CommandReply reply = co_await ExecuteStreamCommandLocked(
           request, digest, tx, stream_reply_builder);
+      if (reply.chunks_ && reply_chunks)
+        *reply_chunks = std::move(*reply.chunks_);
       co_return std::string(reply.encoded_);
     }
 
@@ -6399,14 +6481,15 @@ Task<std::string> ExecuteExecSequentialZSetMulti(
 
 Task<std::string> ExecuteExecSequentialStreamRead(
     const CommandRequest& command, const std::vector<ExecKey>& keys,
-    std::vector<storage::TxShardWrites>& tx_writes) {
+    std::vector<storage::TxShardWrites>& tx_writes, ReplyChunkSource* chunks) {
   std::vector<StreamExecKey> stream_keys;
   stream_keys.reserve(keys.size());
   for (const ExecKey& key : keys) {
     stream_keys.push_back(StreamExecKey{
         .digest_ = key.digest_, .owner_ = key.owner_, .arg_ = key.arg_});
   }
-  co_return co_await ExecuteStreamReadLocked(command, stream_keys, tx_writes);
+  co_return co_await ExecuteStreamReadLocked(command, stream_keys, tx_writes,
+                                             chunks);
 }
 
 Task<std::string> ExecuteExecSequentialSort(
@@ -7335,8 +7418,8 @@ Task<std::string> ExecuteExecSequentialListMove(
 Task<std::string> ExecuteExecSequentialCommand(
     ExecSequentialFamily family, const CommandRequest& command,
     const std::vector<ExecKey>& keys,
-    std::vector<storage::TxShardWrites>& tx_writes,
-    bool script_context = false) {
+    std::vector<storage::TxShardWrites>& tx_writes, bool script_context = false,
+    ReplyChunkSource* chunks = nullptr) {
   struct PreparedCaptureCleanup {
     ReplicationCommandCapture* capture;
     ~PreparedCaptureCleanup() {
@@ -7367,7 +7450,7 @@ Task<std::string> ExecuteExecSequentialCommand(
                                                         tx_writes);
     case ExecSequentialFamily::kStreamRead:
       co_return co_await ExecuteExecSequentialStreamRead(command, keys,
-                                                         tx_writes);
+                                                         tx_writes, chunks);
     case ExecSequentialFamily::kSort:
       co_return co_await ExecuteExecSequentialSort(
           command, keys, tx_writes,
@@ -9904,7 +9987,8 @@ Task<CommandReply> ExecuteExecBody(
                   ClassifyExecSequential(cmd.kind_);
               if (sequential != ExecSequentialFamily::kNone) {
                 replies[i] = co_await ExecuteExecSequentialCommand(
-                    sequential, cmd, cmd_keys[i], tx_writes);
+                    sequential, cmd, cmd_keys[i], tx_writes, false,
+                    &reply_chunks[i]);
                 ++i;
                 continue;
               }
@@ -10085,7 +10169,7 @@ Task<CommandReply> ExecuteExecBody(
             ClassifyExecSequential(cmd.kind_);
         if (sequential != ExecSequentialFamily::kNone) {
           replies[i] = co_await ExecuteExecSequentialCommand(
-              sequential, cmd, cmd_keys[i], tx_writes);
+              sequential, cmd, cmd_keys[i], tx_writes, false, &reply_chunks[i]);
           ++i;
           continue;
         }

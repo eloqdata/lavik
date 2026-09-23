@@ -140,6 +140,17 @@ std::string EncodeFunctionDump(std::span<const std::string> libraries);
 absl::StatusOr<std::vector<std::string>> DecodeFunctionDump(
     std::string_view payload);
 
+// Incremental DUMP checksum. Account each value fragment before sending or
+// spooling it; Finish returns the little-endian RDB version and CRC64.
+class DumpEncoder {
+ public:
+  void Account(std::string_view fragment) noexcept;
+  std::string Finish();
+
+ private:
+  std::uint64_t crc_ = 0;
+};
+
 // Stateful checksum encoder for a diskless RDB transfer. Header() must be
 // sent first, every subsequently sent fragment must be passed to Account(),
 // and Finish() returns the EOF opcode plus Redis' little-endian CRC64.

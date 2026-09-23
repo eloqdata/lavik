@@ -1922,6 +1922,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
           record.value_type_ == ValueType::kHash ||
           record.value_type_ == ValueType::kSet ||
           record.value_type_ == ValueType::kSortedSet;
+      const bool streamed_collection =
+          nonempty_collection || record.value_type_ == ValueType::kStream;
       if (partition.replica_value_stage_.has_value() ||
           (record.value_type_ != ValueType::kString &&
            record.value_type_ != ValueType::kList &&
@@ -1935,7 +1937,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
            value_logical_size != record.logical_size_) ||
           value_logical_size > std::numeric_limits<std::uint32_t>::max() ||
           record.logical_size_ == 0 ||
-          (!nonempty_collection && record.logical_size_ > kMaxBitmapBytes) ||
+          (!streamed_collection && record.logical_size_ > kMaxBitmapBytes) ||
           record.chunk_count_ == 0 ||
           record.chunk_count_ !=
               (record.logical_size_ - 1) / kReplicationTransferBytes + 1) {
@@ -1946,14 +1948,14 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
       std::size_t stage_bytes = kReplicaStageBookkeepingAllowance;
       if (record.key_.size() >
               std::numeric_limits<std::size_t>::max() - stage_bytes ||
-          (!nonempty_collection &&
+          (!streamed_collection &&
            record.logical_size_ > std::numeric_limits<std::size_t>::max() -
                                       stage_bytes - record.key_.size())) {
         co_return absl::ResourceExhaustedError(
             "replica large-value staging size overflow");
       }
       stage_bytes += record.key_.size();
-      if (!nonempty_collection)
+      if (!streamed_collection)
         stage_bytes += static_cast<std::size_t>(record.logical_size_);
       auto stage_reservation = TryReserveMemory(stage_bytes);
       if (!stage_reservation.has_value()) {
@@ -1982,7 +1984,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
       // an arbitrary point later in the stream.
       partition.replica_value_stage_->memory_charge_.Adopt(&*stage_reservation,
                                                            stage_bytes);
-      if (nonempty_collection) {
+      if (streamed_collection) {
         const auto started = co_await BeginReplicaCollection(
             store, partition, *partition.replica_value_stage_);
         if (!started.ok()) co_return started;

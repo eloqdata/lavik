@@ -3677,6 +3677,11 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
                     .Command({"XREADGROUP", "GROUP", "g", "c", "COUNT", "1",
                               "STREAMS", "x", ">"})
                     .starts_with("*1\r\n"));
+    // This compact encoding is just below promotion, but the physical
+    // record (including its key/header) exceeds the inline workspace bound.
+    EXPECT_EQ(client.Command({"XADD", "large-inline-stream", "1-0", "f",
+                              std::string(16 * 1024 - 90, 'v')}),
+              Bulk("1-0"));
     // Keep enough keys in one partition to require direct-bucket growth when
     // the index is rebuilt by the low-memory restart below.
     for (int i = 0; i < 16; ++i) {
@@ -3712,8 +3717,16 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
     EXPECT_EQ(client.Command({"SREM", "s", "m"}), ":1");
     EXPECT_EQ(client.Command({"ZREMRANGEBYRANK", "z", "0", "-1"}), ":1");
     EXPECT_EQ(client.Command({"XACK", "x", "g", "1-0"}), ":1");
-    EXPECT_EQ(client.Command({"XTRIM", "x", "MAXLEN", "0"}), ":2");
+    EXPECT_EQ(client.Command({"XDEL", "x", "2-0"}), ":1");
+    EXPECT_EQ(client.Command({"XTRIM", "x", "MAXLEN", "0"}), ":1");
     EXPECT_EQ(client.Command({"XGROUP", "DESTROY", "x", "g"}), ":1");
+    EXPECT_TRUE(client.Command({"XADD", "x", "3-0", "f", "v"})
+                    .starts_with("-OOM command not allowed"));
+    EXPECT_TRUE(
+        client.Command({"XTRIM", "large-inline-stream", "MAXLEN", "0"})
+            .starts_with("-ERR OOM grouped operation scratch admission"));
+    EXPECT_EQ(client.Command({"XLEN", "large-inline-stream"}), ":1");
+    EXPECT_EQ(client.Command({"DEL", "large-inline-stream"}), ":1");
     server.Stop();
   }
 }

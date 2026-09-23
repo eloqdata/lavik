@@ -2316,12 +2316,12 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   if (group != nullptr &&
       (kind != RecordKind::kValue ||
        (value_type != ValueType::kHash && value_type != ValueType::kSet &&
-        value_type != ValueType::kList &&
-        value_type != ValueType::kSortedSet) ||
+        value_type != ValueType::kList && value_type != ValueType::kSortedSet &&
+        value_type != ValueType::kStream) ||
        mutation_sequence == 0 ||
        (auxiliary &&
         (group->incarnation_ == 0 ||
-         ((value_type == ValueType::kList ||
+         ((value_type == ValueType::kList || value_type == ValueType::kStream ||
            (value_type == ValueType::kSortedSet && IsOrderedPageId(group->id_)))
               ? (group->id_.prefix_ == 0 || group->id_.bits_ != 0)
               : !group->id_.valid()) ||
@@ -2330,9 +2330,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
          (group->batch_txid_ != 0 && txid == 0) ||
          (tx == nullptr && !for_defrag))) ||
        (grouped_root &&
-        (logical_size == 0 || group->incarnation_ != 0 ||
-         group->id_ != HashGroupId{} || group->retired_ ||
-         group->batch_txid_ != 0 || group->prepared_root_ == nullptr ||
+        ((logical_size == 0 && value_type != ValueType::kStream) ||
+         group->incarnation_ != 0 || group->id_ != HashGroupId{} ||
+         group->retired_ || group->batch_txid_ != 0 ||
+         group->prepared_root_ == nullptr ||
          group->publication_ == nullptr)))) {
     co_return absl::InvalidArgumentError("invalid grouped record write");
   }

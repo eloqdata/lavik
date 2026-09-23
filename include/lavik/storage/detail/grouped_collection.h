@@ -27,19 +27,35 @@
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
+#include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped_hash.h"
 #include "lavik/storage/format.h"
 
 namespace lavik::storage {
 
-// Sets use the Hash prefix directory with empty field values. These ordered
-// pages are for Lists and Sorted Sets only: hash-prefix order cannot implement
-// either List rank or Sorted Set (score, binary member) order.
-enum class OrderedCollectionKind : std::uint8_t { kList = 1, kSortedSet = 2 };
+// Sets use Hash prefix routing. Ordered pages hold List ranks, Sorted Set
+// (score, member) order, or the binary logical record keys of a Stream.
+enum class OrderedCollectionKind : std::uint8_t {
+  kList = 1,
+  kSortedSet = 2,
+  kStream = 3
+};
+
+inline ValueType OrderedValueType(OrderedCollectionKind kind) noexcept {
+  switch (kind) {
+    case OrderedCollectionKind::kList:
+      return ValueType::kList;
+    case OrderedCollectionKind::kSortedSet:
+      return ValueType::kSortedSet;
+    case OrderedCollectionKind::kStream:
+      return ValueType::kStream;
+  }
+  return ValueType::kNone;
+}
 
 struct OrderedCollectionEntry {
   std::string value_;
-  double score_ = 0;  // Lists require positive zero in the durable encoding.
+  double score_ = 0;  // Lists and Streams require positive zero on disk.
   bool operator==(const OrderedCollectionEntry&) const noexcept = default;
 };
 
@@ -60,6 +76,12 @@ struct OrderedCollectionRoot {
   // header explicitly records its presence; ordered-only roots never invent
   // an index during decoding.
   std::optional<GroupedHashRoot> member_index_ = std::nullopt;
+  // Stream pages count internal records, including metadata for empty streams.
+  // The user-visible length is independent of that physical record count.
+  std::optional<std::uint64_t> stream_length_ = std::nullopt;
+  std::uint64_t logical_size() const noexcept {
+    return stream_length_.value_or(item_count_);
+  }
   bool operator==(const OrderedCollectionRoot&) const noexcept = default;
 };
 
@@ -78,9 +100,10 @@ struct OrderedGroupSnapshot {
 
 inline constexpr std::size_t kOrderedGroupHeaderBytes = 64;
 inline constexpr std::size_t kOrderedCollectionRootBytes = 72;
+inline constexpr std::size_t kGroupedStreamRootBytes =
+    kOrderedCollectionRootBytes + 8;
 inline constexpr std::size_t kIndexedSortedSetRootBytes =
     kOrderedCollectionRootBytes + kGroupedHashRootBytes;
-inline constexpr std::size_t kOrderedGroupTargetBytes = 8192;
 
 struct OrderedGroupMetadata {
   OrderedCollectionKind kind_ = OrderedCollectionKind::kList;
@@ -163,13 +186,22 @@ bool OrderedEntryLess(const OrderedCollectionEntry& left,
 // round trips. Callers validate scores before encoding; decoding rejects NaN.
 std::string EncodeSortedSetMemberScore(double score);
 absl::StatusOr<double> DecodeSortedSetMemberScore(std::string_view bytes);
+// Checks ordering between locally validated entries on opposite sides of a
+// page or splice boundary. Stream identity is its routing key, excluding the
+// payload; Lists impose no value ordering. Invalid boundaries return DataLoss.
+absl::Status ValidateOrderedEntryBoundary(OrderedCollectionKind kind,
+                                          const OrderedCollectionEntry& left,
+                                          const OrderedCollectionEntry& right);
+
+// Checks neighbour identity/links and the logical order of their boundary
+// entries; both snapshots must be live and nonempty.
 absl::Status ValidateOrderedGroupBoundary(const OrderedGroupSnapshot& left,
                                           const OrderedGroupSnapshot& right);
 
 // Only retained metadata belongs in the directory. Physical checksums,
 // enclosing key/DB/replication epochs and page payload checks are the adapter's
 // responsibility. record_token is caller-owned identity, never a pointer on
-// disk. Sorted Set ordering across pages must additionally be checked using
+// disk. Sorted Set and Stream ordering across pages must be checked using
 // ValidateOrderedGroupBoundary when their contents are read or recovered.
 struct RecoveredOrderedGroup {
   std::uint64_t incarnation_ = 0;
@@ -285,7 +317,7 @@ struct OrderedGroupSplit {
 // neighbour's previous link if this returns more than one page.
 absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(
     OrderedGroupSnapshot group, std::uint64_t next_group_id,
-    std::size_t target_bytes = kOrderedGroupTargetBytes);
+    std::size_t target_bytes = kCollectionGroupTargetBytes);
 
 struct LoadedOrderedGroup {
   std::uint64_t sequence_ = 0;
@@ -319,6 +351,6 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
     const OrderedGroupDirectory& directory,
     std::vector<LoadedOrderedGroup> loaded_groups, std::uint64_t rank,
     std::uint64_t erase_count, std::vector<OrderedCollectionEntry> entries,
-    std::size_t target_bytes = kOrderedGroupTargetBytes);
+    std::size_t target_bytes = kCollectionGroupTargetBytes);
 
 }  // namespace lavik::storage

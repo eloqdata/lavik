@@ -27,7 +27,10 @@
 
 #include "absl/strings/str_cat.h"
 #include "lavik/memory.h"
+#include "lavik/storage/detail/stream_records.h"
 #include "lavik/storage/format.h"
+#include "rdb_record_spool.h"
+#include "rdb_stream_encoder.h"
 
 namespace lavik::rdb {
 namespace {
@@ -977,6 +980,94 @@ absl::Status UniquePairs(const Pairs& values) {
   return absl::OkStatus();
 }
 
+absl::StatusOr<std::vector<Entry>> DecodeStreamNode(
+    std::string_view key, std::string_view blob,
+    std::vector<MemoryReservation>* repeated_fields = nullptr) {
+  if (key.size() != 16) return Bad("invalid Stream node key");
+  std::vector<Entry> entries;
+  std::set<Id> ids;
+  Reader key_reader(key);
+  Id master;
+  if (!key_reader.Be64(&master.ms) || !key_reader.Be64(&master.seq))
+    return Bad("invalid Stream node ID");
+  auto listpack = DecodeListpack(blob);
+  if (!listpack.ok()) return listpack.status();
+  std::size_t at = 0;
+  auto integer = [&](std::int64_t* out) {
+    if (at >= listpack->size()) return false;
+    auto value = (*listpack)[at++].Integer();
+    if (!value) return false;
+    *out = *value;
+    return true;
+  };
+  std::int64_t live = 0, deleted = 0, master_fields = 0;
+  if (!integer(&live) || !integer(&deleted) || !integer(&master_fields) ||
+      live < 0 || deleted < 0 || master_fields < 0 ||
+      static_cast<std::uint64_t>(master_fields) > listpack->size() - at)
+    return Bad("invalid Stream listpack header");
+  Strings field_names;
+  for (std::int64_t i = 0; i < master_fields; ++i)
+    field_names.push_back((*listpack)[at++].String());
+  std::int64_t zero = 0;
+  if (!integer(&zero) || zero != 0)
+    return Bad("invalid Stream master terminator");
+  const std::uint64_t records =
+      static_cast<std::uint64_t>(live) + static_cast<std::uint64_t>(deleted);
+  for (std::uint64_t record = 0; record < records; ++record) {
+    std::int64_t flags = 0, ms_delta = 0, seq_delta = 0;
+    Id id;
+    if (!integer(&flags) || !integer(&ms_delta) || !integer(&seq_delta) ||
+        flags < 0 || (flags & ~3) != 0 ||
+        !AddStreamIdDelta(master.ms, ms_delta, &id.ms) ||
+        !AddStreamIdDelta(master.seq, seq_delta, &id.seq))
+      return Bad("invalid Stream entry header");
+    Entry entry{.id = id, .fields = {}};
+    std::int64_t fields = master_fields;
+    const bool same_fields = (flags & 2) != 0;
+    if (same_fields && repeated_fields) {
+      std::size_t bytes = 0;
+      for (const auto& name : field_names) {
+        if (name.size() > SIZE_MAX / 3 - bytes)
+          return absl::ResourceExhaustedError(
+              "Stream field expansion overflow");
+        bytes += name.size();
+      }
+      auto reservation = TryReserveMemory(bytes * 3);
+      if (!reservation)
+        return absl::ResourceExhaustedError("OOM Stream repeated fields");
+      repeated_fields->push_back(std::move(*reservation));
+    }
+    if (!same_fields &&
+        (!integer(&fields) || fields < 0 ||
+         static_cast<std::uint64_t>(fields) > listpack->size() - at))
+      return Bad("invalid Stream field count");
+    for (std::int64_t i = 0; i < fields; ++i) {
+      if (!same_fields) {
+        if (at >= listpack->size()) return Bad("truncated Stream field");
+        entry.fields.push_back((*listpack)[at++].String());
+      } else {
+        entry.fields.push_back(field_names[static_cast<std::size_t>(i)]);
+      }
+      if (at >= listpack->size()) return Bad("truncated Stream value");
+      entry.fields.push_back((*listpack)[at++].String());
+    }
+    std::int64_t lp_count = 0;
+    const std::int64_t expected = same_fields ? fields + 3 : fields * 2 + 4;
+    if (!integer(&lp_count) || lp_count != expected)
+      return Bad("invalid Stream lp-count");
+    if ((flags & 1) == 0) {
+      if (!ids.insert(entry.id).second) return Bad("duplicate Stream ID");
+      entries.push_back(std::move(entry));
+    }
+  }
+  if (at != listpack->size()) return Bad("trailing Stream listpack data");
+  if (entries.size() != static_cast<std::uint64_t>(live))
+    return Bad("Stream node live count mismatch");
+  std::sort(entries.begin(), entries.end(),
+            [](const Entry& a, const Entry& b) { return a.id < b.id; });
+  return entries;
+}
+
 absl::StatusOr<Stream> DecodeStreamRdb(Reader* reader, std::uint8_t type) {
   auto listpack_count = ReadLength(reader);
   if (!listpack_count.ok() || listpack_count->encoded ||
@@ -992,68 +1083,13 @@ absl::StatusOr<Stream> DecodeStreamRdb(Reader* reader, std::uint8_t type) {
     if (!blob.ok()) return blob.status();
     if (key->size() != 16 || !node_keys.insert(*key).second)
       return Bad("invalid Stream node key");
-    Reader key_reader(*key);
-    Id master;
-    if (!key_reader.Be64(&master.ms) || !key_reader.Be64(&master.seq))
-      return Bad("invalid Stream node ID");
-    auto listpack = DecodeListpack(*blob);
-    if (!listpack.ok()) return listpack.status();
-    std::size_t at = 0;
-    auto integer = [&](std::int64_t* out) {
-      if (at >= listpack->size()) return false;
-      auto value = (*listpack)[at++].Integer();
-      if (!value) return false;
-      *out = *value;
-      return true;
-    };
-    std::int64_t live = 0, deleted = 0, master_fields = 0;
-    if (!integer(&live) || !integer(&deleted) || !integer(&master_fields) ||
-        live < 0 || deleted < 0 || master_fields < 0 ||
-        static_cast<std::uint64_t>(master_fields) > listpack->size() - at)
-      return Bad("invalid Stream listpack header");
-    Strings field_names;
-    for (std::int64_t i = 0; i < master_fields; ++i)
-      field_names.push_back((*listpack)[at++].String());
-    std::int64_t zero = 0;
-    if (!integer(&zero) || zero != 0)
-      return Bad("invalid Stream master terminator");
-    const std::uint64_t records =
-        static_cast<std::uint64_t>(live) + static_cast<std::uint64_t>(deleted);
-    for (std::uint64_t record = 0; record < records; ++record) {
-      std::int64_t flags = 0, ms_delta = 0, seq_delta = 0;
-      Id id;
-      if (!integer(&flags) || !integer(&ms_delta) || !integer(&seq_delta) ||
-          flags < 0 || (flags & ~3) != 0 ||
-          !AddStreamIdDelta(master.ms, ms_delta, &id.ms) ||
-          !AddStreamIdDelta(master.seq, seq_delta, &id.seq))
-        return Bad("invalid Stream entry header");
-      Entry entry{.id = id, .fields = {}};
-      std::int64_t fields = master_fields;
-      const bool same_fields = (flags & 2) != 0;
-      if (!same_fields &&
-          (!integer(&fields) || fields < 0 ||
-           static_cast<std::uint64_t>(fields) > listpack->size() - at))
-        return Bad("invalid Stream field count");
-      for (std::int64_t i = 0; i < fields; ++i) {
-        if (!same_fields) {
-          if (at >= listpack->size()) return Bad("truncated Stream field");
-          entry.fields.push_back((*listpack)[at++].String());
-        } else {
-          entry.fields.push_back(field_names[static_cast<std::size_t>(i)]);
-        }
-        if (at >= listpack->size()) return Bad("truncated Stream value");
-        entry.fields.push_back((*listpack)[at++].String());
-      }
-      std::int64_t lp_count = 0;
-      const std::int64_t expected = same_fields ? fields + 3 : fields * 2 + 4;
-      if (!integer(&lp_count) || lp_count != expected)
-        return Bad("invalid Stream lp-count");
-      if ((flags & 1) == 0) {
-        if (!ids.insert(entry.id).second) return Bad("duplicate Stream ID");
-        stream.entries.push_back(std::move(entry));
-      }
+    auto entries = DecodeStreamNode(*key, *blob);
+    if (!entries.ok()) return entries.status();
+    if (!entries->empty()) stream.node_entries.push_back(entries->size());
+    for (auto& entry : *entries) {
+      if (!ids.insert(entry.id).second) return Bad("duplicate Stream ID");
+      stream.entries.push_back(std::move(entry));
     }
-    if (at != listpack->size()) return Bad("trailing Stream listpack data");
   }
   auto length = ReadLength(reader);
   auto last_ms = ReadLength(reader);
@@ -1355,6 +1391,10 @@ storage::ValueType CollectionType(std::uint8_t type) {
     case kZSetZiplist:
     case kZSetListpack:
       return ValueType::kSortedSet;
+    case kStreamListpacks:
+    case kStreamListpacks2:
+    case kStreamListpacks3:
+      return ValueType::kStream;
     default:
       return ValueType::kNone;
   }
@@ -1411,11 +1451,343 @@ absl::StatusOr<double> ReadCollectionScore(Reader* reader, std::uint8_t type) {
   return score;
 }
 
+// The RDB wire orders global PEL rows before owner associations and puts the
+// Stream header after all listpacks. Spool portable logical records, then merge
+// them into the canonical graph order. Memory depends on a listpack/record and
+// a fixed run buffer, not on message or pending cardinality.
+class StreamInput {
+ public:
+  static absl::StatusOr<std::unique_ptr<StreamInput>> Open(Reader* reader,
+                                                           std::uint8_t type) {
+    auto input = std::make_unique<StreamInput>();
+    auto nodes = Number(reader, UINT32_MAX);
+    if (!nodes.ok()) return nodes.status();
+    std::uint64_t live = 0, live_nodes = 0;
+    Id last_entry{};
+    for (std::uint64_t i = 0; i < *nodes; ++i) {
+      auto key = String(reader), blob = String(reader);
+      if (!key.ok()) return key.status();
+      if (!blob.ok()) return blob.status();
+      if (key->value_.size() != 16) return Bad("invalid Stream node key");
+      auto status = input->spool_.Add(std::string(1, '\7') + key->value_, {});
+      if (!status.ok()) return status;
+      PackedMeasurement measured;
+      status = DecodeListpack(blob->value_, &measured).status();
+      if (!status.ok()) return status;
+      if (measured.count > (SIZE_MAX - 4096) / 256 ||
+          measured.strings > (SIZE_MAX - 4096 - measured.count * 256) / 4)
+        return Oom();
+      auto reservation =
+          TryReserveMemory(4096 + measured.count * 256 + measured.strings * 4);
+      if (!reservation) return Oom();
+      std::vector<MemoryReservation> repeated_fields;
+      auto entries =
+          DecodeStreamNode(key->value_, blob->value_, &repeated_fields);
+      if (!entries.ok()) return entries.status();
+      live += entries->size();
+      if (live > UINT32_MAX) return Bad("Stream message count overflow");
+      if (!entries->empty()) {
+        ++live_nodes;
+        std::string count;
+        PutLe32(&count, entries->size());
+        status = input->Add(
+            IdKey(std::string_view("\3", 1), entries->front().id), count);
+        if (!status.ok()) return status;
+        std::string interval;
+        PutBe64(&interval, entries->back().id.ms);
+        PutBe64(&interval, entries->back().id.seq);
+        status = input->spool_.Add(
+            IdKey(std::string_view("\6", 1), entries->front().id), interval);
+        if (!status.ok()) return status;
+        last_entry = std::max(last_entry, entries->back().id);
+      }
+      for (const auto& entry : *entries) {
+        std::string payload;
+        PutLe64(&payload, entry.id.ms);
+        PutLe64(&payload, entry.id.seq);
+        PutLe32(&payload, entry.fields.size());
+        for (const auto& field : entry.fields) {
+          PutLe32(&payload, field.size());
+          payload.append(field);
+        }
+        status =
+            input->Add(IdKey(std::string_view("\1", 1), entry.id), payload);
+        if (!status.ok()) return status;
+      }
+    }
+    auto length = Number(reader, UINT32_MAX), last_ms = Number(reader),
+         last_seq = Number(reader);
+    if (!length.ok()) return length.status();
+    if (!last_ms.ok()) return last_ms.status();
+    if (!last_seq.ok()) return last_seq.status();
+    if (*length != live || last_entry > Id{*last_ms, *last_seq})
+      return Bad("Stream length mismatch");
+    input->length_ = live;
+    Id deleted{};
+    std::uint64_t added = live;
+    if (type >= kStreamListpacks2) {
+      for (unsigned i = 0; i < 5; ++i) {
+        auto value = Number(reader);
+        if (!value.ok()) return value.status();
+        if (i == 2) deleted.ms = *value;
+        if (i == 3) deleted.seq = *value;
+        if (i == 4) added = *value;
+      }
+    }
+    std::string header("LXS1");
+    PutLe64(&header, *last_ms);
+    PutLe64(&header, *last_seq);
+    PutLe64(&header, deleted.ms);
+    PutLe64(&header, deleted.seq);
+    PutLe64(&header, added);
+    PutLe32(&header, live);
+    auto status = input->Add(std::string_view("\0", 1), header);
+    if (!status.ok()) return status;
+    std::string count;
+    PutLe32(&count, live_nodes);
+    status = input->Add(std::string_view("\2", 1), count);
+    if (!status.ok()) return status;
+    auto groups = Number(reader, UINT32_MAX);
+    if (!groups.ok()) return groups.status();
+    count.clear();
+    PutLe32(&count, *groups);
+    status = input->Add(std::string_view("\4", 1), count);
+    if (!status.ok()) return status;
+    for (std::uint64_t gi = 0; gi < *groups; ++gi) {
+      auto name = String(reader);
+      auto ms = Number(reader), seq = Number(reader);
+      if (!name.ok()) return name.status();
+      if (!ms.ok()) return ms.status();
+      if (!seq.ok()) return seq.status();
+      std::uint64_t read = UINT64_MAX;
+      if (type >= kStreamListpacks2) {
+        auto value = Number(reader);
+        if (!value.ok()) return value.status();
+        read = *value;
+      }
+      const auto prefix = GroupPrefix(name->value_);
+      auto pending = Number(reader, UINT32_MAX);
+      if (!pending.ok()) return pending.status();
+      count.clear();
+      PutLe32(&count, *pending);
+      status = input->Add(prefix + '\2', count);
+      if (!status.ok()) return status;
+      for (std::uint64_t pi = 0; pi < *pending; ++pi) {
+        Id id;
+        std::uint64_t delivery = 0;
+        if (!reader->Be64(&id.ms) || !reader->Be64(&id.seq) ||
+            !reader->Le64(&delivery))
+          return Bad("truncated Stream PEL");
+        auto deliveries = Number(reader);
+        if (!deliveries.ok()) return deliveries.status();
+        std::string payload;
+        PutLe64(&payload, id.ms);
+        PutLe64(&payload, id.seq);
+        PutLe64(&payload, delivery);
+        PutLe64(&payload, *deliveries);
+        status = input->Add(IdKey(prefix + '\3', id), payload);
+        if (!status.ok()) return status;
+      }
+      auto consumers = Number(reader, UINT32_MAX);
+      if (!consumers.ok()) return consumers.status();
+      std::string group;
+      PutLe32(&group, name->value_.size());
+      group.append(name->value_);
+      PutLe64(&group, *ms);
+      PutLe64(&group, *seq);
+      PutLe64(&group, read);
+      PutLe32(&group, *consumers);
+      status = input->Add(prefix + '\0', group);
+      if (!status.ok()) return status;
+      for (std::uint64_t ci = 0; ci < *consumers; ++ci) {
+        auto consumer = String(reader);
+        if (!consumer.ok()) return consumer.status();
+        std::uint64_t seen = 0, active = 0;
+        if (!reader->Le64(&seen)) return Bad("truncated Stream consumer");
+        active = seen;
+        if (type >= kStreamListpacks3 && !reader->Le64(&active))
+          return Bad("truncated Stream consumer active time");
+        std::string payload, key(prefix + '\1');
+        PutLe32(&payload, consumer->value_.size());
+        payload.append(consumer->value_);
+        PutLe64(&payload, seen);
+        PutLe64(&payload, active);
+        Name(key, consumer->value_);
+        status = input->Add(key, payload);
+        if (!status.ok()) return status;
+        auto local = Number(reader, *pending);
+        if (!local.ok()) return local.status();
+        for (std::uint64_t pi = 0; pi < *local; ++pi) {
+          Id id;
+          if (!reader->Be64(&id.ms) || !reader->Be64(&id.seq))
+            return Bad("truncated consumer PEL ID");
+          status = input->spool_.Add(IdKey(prefix + '\3', id) + '\1',
+                                     consumer->value_);
+          if (!status.ok()) return status;
+        }
+      }
+    }
+    status = input->spool_.Finish();
+    if (!status.ok()) return status;
+    input->validator_.emplace(live);
+    return input;
+  }
+  std::uint64_t length() const { return length_; }
+  absl::StatusOr<storage::CollectionPage> Next() {
+    if (done_) return Bad("Stream RDB reader already complete");
+    storage::CollectionPage page{.value_type_ = storage::ValueType::kStream};
+    page.retained_charge_.Account(CurrentMemoryAccountingShard(), 0);
+    for (;;) {
+      auto record = spool_.Next();
+      if (!record.ok()) return record.status();
+      if (!*record) {
+        auto status = validator_->Finish();
+        if (!status.ok()) return status;
+        page.done_ = done_ = true;
+        break;
+      }
+      auto& row = **record;
+      if (row.key_.empty()) return Bad("invalid Stream spool record");
+      if (!previous_.empty() && row.key_ <= previous_)
+        return Bad("duplicate Stream RDB identity");
+      if (row.key_.size() > (SIZE_MAX - 1024) / 12) return Oom();
+      const auto state_bytes = row.key_.size() * 12 + 1024;
+      if (state_bytes > state_charge_.bytes()) {
+        auto reservation =
+            TryReserveMemory(state_bytes - state_charge_.bytes());
+        if (!reservation) return Oom();
+        if (state_charge_.bytes() == 0)
+          state_charge_.Account(CurrentMemoryAccountingShard(), 0);
+        state_charge_.Resize(state_bytes);
+      }
+      previous_ = row.key_;
+      if (row.key_[0] == '\7') continue;
+      if (row.key_[0] == '\6') {
+        if (row.key_.size() != 17 || row.value_.size() != 16)
+          return Bad("invalid Stream node interval");
+        const auto first = std::string_view(row.key_).substr(1);
+        if (!previous_node_end_.empty() && first <= previous_node_end_)
+          return Bad("overlapping Stream nodes");
+        previous_node_end_ = row.value_;
+        continue;
+      }
+      const char tag = row.key_.back();
+      row.key_.pop_back();
+      if (tag != '\0') return Bad("dangling Stream consumer PEL");
+      // The final subtype byte before a PEL ID is unambiguous even when
+      // group/consumer names contain NULs or other routing tag bytes.
+      std::size_t group_end = 1;
+      if (row.key_[0] == '\5') {
+        while (group_end < row.key_.size()) {
+          if (row.key_[group_end++] != '\0') continue;
+          if (group_end == row.key_.size())
+            return Bad("invalid Stream group routing name");
+          if (row.key_[group_end++] == '\0') break;
+        }
+      }
+      const bool pending = row.key_[0] == '\5' &&
+                           row.key_.size() == group_end + 17 &&
+                           row.key_[group_end] == '\3';
+      if (pending) {
+        if (row.value_.size() != 32) return Bad("invalid Stream PEL join");
+        auto owner = spool_.Next();
+        if (!owner.ok()) return owner.status();
+        if (!*owner || (**owner).key_ != row.key_ + '\1')
+          return Bad("unowned or duplicate Stream PEL entry");
+        previous_ = (**owner).key_;
+        std::string payload = row.value_.substr(0, 16);
+        PutLe32(&payload, (**owner).value_.size());
+        payload.append((**owner).value_);
+        payload.append(row.value_, 16, 16);
+        row.value_ = std::move(payload);
+      }
+      const auto vector_growth =
+          page.elements_.size() == page.elements_.capacity()
+              ? 2 * page.elements_.capacity() * sizeof(std::string)
+              : 0;
+      auto reservation = TryReserveMemory(
+          row.key_.size() + row.value_.size() * 2 + 512 + vector_growth);
+      if (!reservation) return Oom();
+      std::string encoded = row.key_;
+      encoded.append(row.value_);
+      PutLe32(&encoded, row.key_.size());
+      auto status = validator_->Read(encoded);
+      if (!status.ok()) return status;
+      page.elements_.push_back(std::move(encoded));
+      page.retained_charge_.Resize(page.RetainedBytes());
+      if (page.RetainedBytes() >= 8192) break;
+    }
+    page.next_cursor_ = ++cursor_;
+    return page;
+  }
+
+ private:
+  static absl::Status Oom() {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM RDB Stream decode admission");
+  }
+  static absl::StatusOr<std::uint64_t> Number(
+      Reader* reader, std::uint64_t maximum = UINT64_MAX) {
+    auto value = ReadLength(reader);
+    if (!value.ok()) return value.status();
+    if (value->encoded || value->value > maximum)
+      return Bad("invalid Stream RDB count or ID");
+    return value->value;
+  }
+  static absl::StatusOr<RecordSpool::Record> String(Reader* reader) {
+    Reader measure = *reader;
+    auto bytes = MeasureString(&measure);
+    if (!bytes.ok()) return bytes.status();
+    auto reservation = TryReserveMemory(*bytes * 4 + 512);
+    if (!reservation) return Oom();
+    RecordSpool::Record result{.reservation_ = std::move(reservation)};
+    reader->ResetExpandedAccounting();
+    auto value = ReadString(reader);
+    if (!value.ok()) return value.status();
+    result.value_ = std::move(*value);
+    return result;
+  }
+  static void Name(std::string& key, std::string_view name) {
+    for (char ch : name) {
+      key.push_back(ch);
+      if (ch == '\0') key.push_back('\xff');
+    }
+    key.append("\0\0", 2);
+  }
+  static std::string GroupPrefix(std::string_view name) {
+    std::string key(1, '\5');
+    Name(key, name);
+    return key;
+  }
+  static std::string IdKey(std::string_view prefix, Id id) {
+    std::string key(prefix);
+    PutBe64(&key, id.ms);
+    PutBe64(&key, id.seq);
+    return key;
+  }
+  absl::Status Add(std::string_view key, std::string_view value) {
+    return spool_.Add(std::string(key) + '\0', value);
+  }
+  RetainedMemoryCharge state_charge_;
+  RecordSpool spool_;
+  std::optional<storage::StreamRecordValidator> validator_;
+  std::string previous_, previous_node_end_;
+  std::uint64_t length_ = 0, cursor_ = 0;
+  bool done_ = false;
+};
+
 class CollectionInput {
  public:
   static absl::StatusOr<std::unique_ptr<CollectionInput>> Open(
       Reader* reader, std::uint8_t type) try {
     auto result = std::unique_ptr<CollectionInput>(new CollectionInput(type));
+    if (CollectionType(type) == storage::ValueType::kStream) {
+      auto stream = StreamInput::Open(reader, type);
+      if (!stream.ok()) return stream.status();
+      result->stream_ = std::move(*stream);
+      result->expected_ = result->stream_->length();
+      return result;
+    }
     if (result->plain_ || result->quick_) {
       auto count = ReadLength(reader);
       if (!count.ok()) return count.status();
@@ -1433,6 +1805,11 @@ class CollectionInput {
 
   absl::StatusOr<storage::CollectionPage> Next(Reader* input) try {
     if (done_) return Bad("collection stream is complete");
+    if (stream_) {
+      auto page = stream_->Next();
+      if (page.ok()) done_ = page->done_;
+      return page;
+    }
     if (!owner_) {
       owner_ = CurrentMemoryAccountingShard();
       identities_charge_.Account(*owner_, 0);
@@ -1620,6 +1997,7 @@ class CollectionInput {
     page.retained_charge_.Adopt(&*reservation, page.RetainedBytes());
     return page;
   }
+  std::unique_ptr<StreamInput> stream_;
   RetainedMemoryCharge identities_charge_;
   std::multimap<std::uint64_t, Reader> identities_;
   std::optional<unsigned> owner_;
@@ -1972,31 +2350,32 @@ absl::StatusOr<storage::RawValue> EncodeRaw(LogicalValue logical) {
   return raw;
 }
 
+void EncodeStreamEntryRdb(std::string* out, const Entry& entry) {
+  std::string key;
+  PutBe64(&key, entry.id.ms);
+  PutBe64(&key, entry.id.seq);
+  WriteString(out, key);
+  std::string body;
+  const std::size_t fields = entry.fields.size() / 2;
+  AppendLpInteger(&body, 1);
+  AppendLpInteger(&body, 0);
+  AppendLpInteger(&body, fields);
+  for (std::size_t i = 0; i < fields; ++i)
+    AppendLpString(&body, entry.fields[i * 2]);
+  AppendLpInteger(&body, 0);
+  AppendLpInteger(&body, 2);
+  AppendLpInteger(&body, 0);
+  AppendLpInteger(&body, 0);
+  for (std::size_t i = 0; i < fields; ++i)
+    AppendLpString(&body, entry.fields[i * 2 + 1]);
+  AppendLpInteger(&body, fields + 3);
+  const std::string listpack = FinishListpack(std::move(body), 8 + fields * 2);
+  WriteString(out, listpack);
+}
+
 void EncodeStreamRdb(std::string* out, const Stream& stream) {
   WriteLength(out, stream.entries.size());
-  for (const auto& entry : stream.entries) {
-    std::string key;
-    PutBe64(&key, entry.id.ms);
-    PutBe64(&key, entry.id.seq);
-    WriteString(out, key);
-    std::string body;
-    const std::size_t fields = entry.fields.size() / 2;
-    AppendLpInteger(&body, 1);
-    AppendLpInteger(&body, 0);
-    AppendLpInteger(&body, fields);
-    for (std::size_t i = 0; i < fields; ++i)
-      AppendLpString(&body, entry.fields[i * 2]);
-    AppendLpInteger(&body, 0);
-    AppendLpInteger(&body, 2);
-    AppendLpInteger(&body, 0);
-    AppendLpInteger(&body, 0);
-    for (std::size_t i = 0; i < fields; ++i)
-      AppendLpString(&body, entry.fields[i * 2 + 1]);
-    AppendLpInteger(&body, fields + 3);
-    const std::string listpack =
-        FinishListpack(std::move(body), 8 + fields * 2);
-    WriteString(out, listpack);
-  }
+  for (const auto& entry : stream.entries) EncodeStreamEntryRdb(out, entry);
   WriteLength(out, stream.entries.size());
   WriteLength(out, stream.last.ms);
   WriteLength(out, stream.last.seq);
@@ -2420,6 +2799,17 @@ struct FileWriter::Impl {
   bool finished_ = false;
 };
 
+void DumpEncoder::Account(std::string_view fragment) noexcept {
+  crc_ = UpdateCrc64(crc_, fragment);
+}
+std::string DumpEncoder::Finish() {
+  std::string trailer;
+  PutLe16(&trailer, kVersion);
+  crc_ = UpdateCrc64(crc_, trailer);
+  PutLe64(&trailer, Reflect64(crc_));
+  return trailer;
+}
+
 StreamEncoder::StreamEncoder(unsigned version) {
   const std::string encoded_version = std::to_string(version);
   header_ = absl::StrCat("REDIS", std::string(4 - encoded_version.size(), '0'),
@@ -2751,5 +3141,278 @@ absl::StatusOr<storage::RawValue> DumpReader::ReadRawValue() {
   return EncodeRaw(std::move(*logical));
 }
 absl::Status DumpReader::Rewind() { return impl_->Initialize(); }
+
+absl::Status StreamFileEncoder::OutputBudget(std::size_t bytes) {
+  output_ = std::string{};
+  output_admission_.reset();
+  if (bytes > (SIZE_MAX - 4096) / 8)
+    return absl::ResourceExhaustedError("RDB Stream output size overflow");
+  output_admission_ = TryReserveMemory(bytes * 8 + 4096);
+  if (!output_admission_) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM RDB Stream output record");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status StreamFileEncoder::StartPage(const storage::CollectionPage& page) {
+  if (!status_.ok()) return status_;
+  if (page_ || phase_ != Phase::kRecords || done_)
+    return absl::FailedPreconditionError("RDB Stream page is not drained");
+  for (const auto& row : page.elements_) {
+    auto key = storage::StreamRecordKey(row);
+    if (!key.ok()) return key.status();
+    if (key->size() > (SIZE_MAX - 1024) / 12)
+      return absl::ResourceExhaustedError("RDB Stream validator size overflow");
+    const auto bytes = key->size() * 12 + 1024;
+    if (bytes > state_charge_.bytes()) {
+      auto reservation = TryReserveMemory(bytes - state_charge_.bytes());
+      if (!reservation)
+        return absl::ResourceExhaustedError("OOM RDB Stream validator");
+      if (state_charge_.bytes() == 0)
+        state_charge_.Account(CurrentMemoryAccountingShard(), 0);
+      state_charge_.Resize(bytes);
+    }
+    auto valid = validator_.Read(row);
+    if (!valid.ok()) return valid;
+  }
+  if (page.done_) {
+    auto valid = validator_.Finish();
+    if (!valid.ok()) return valid;
+  }
+  page_ = &page;
+  entry_ = 0;
+  done_ = page.done_;
+  return absl::OkStatus();
+}
+
+std::optional<std::string_view> StreamFileEncoder::Next() noexcept {
+  if (!status_.ok()) return std::nullopt;
+  try {
+    output_ = std::string{};
+    output_admission_.reset();
+    auto next = Advance();
+    if (!next.ok()) {
+      status_ = next.status();
+      return std::nullopt;
+    }
+    return *next;
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    status_ = absl::ResourceExhaustedError("OOM RDB Stream encoding");
+    return std::nullopt;
+  }
+}
+
+absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {
+  auto raw_string = [](Reader& in) -> absl::StatusOr<std::string> {
+    std::uint32_t count = 0;
+    if (!in.Le32(&count) || count > in.remaining())
+      return Bad("invalid Stream string");
+    std::string value(count, '\0');
+    if (!in.Read(count, value.data())) return Bad("truncated Stream string");
+    return value;
+  };
+  auto name_key = [](std::string_view name) {
+    std::string key;
+    for (char ch : name) {
+      key.push_back(ch);
+      if (ch == '\0') key.push_back('\xff');
+    }
+    key.append("\0\0", 2);
+    return key;
+  };
+  for (;;) {
+    if (phase_ == Phase::kConsumerCount) {
+      auto status = consumers_->Finish();
+      if (!status.ok()) return status;
+      status = OutputBudget(32);
+      if (!status.ok()) return status;
+      WriteLength(&output_, consumer_count_);
+      phase_ = Phase::kConsumers;
+      return std::optional<std::string_view>(output_);
+    }
+    if (phase_ == Phase::kConsumers) {
+      auto row = consumers_->Next();
+      if (!row.ok()) return row.status();
+      if (!*row) {
+        if (consumer_count_ != 0)
+          return Bad("incomplete Stream consumer output");
+        consumers_.reset();
+        consumer_prefix_ = std::string{};
+        consumer_admission_.reset();
+        phase_ = Phase::kRecords;
+        continue;
+      }
+      const auto& record = **row;
+      if (record.value_.empty()) return Bad("invalid Stream consumer output");
+      auto status = OutputBudget(record.value_.size());
+      if (!status.ok()) return status;
+      if (record.value_[0] == '\0') {
+        if (consumer_count_ == 0 || record.key_.empty() ||
+            record.key_.back() != '\0')
+          return Bad("invalid Stream consumer count");
+        --consumer_count_;
+        consumer_prefix_ = std::string{};
+        consumer_admission_.reset();
+        consumer_admission_ = TryReserveMemory(record.key_.size() + 64);
+        if (!consumer_admission_)
+          return absl::ResourceExhaustedError("OOM Stream consumer cursor");
+        consumer_prefix_ = record.key_;
+        consumer_prefix_.back() = '\1';
+        auto count = consumers_->CountPrefix(consumer_prefix_);
+        if (!count.ok()) return count.status();
+        output_.assign(record.value_, 1, std::string::npos);
+        WriteLength(&output_, *count);
+      } else {
+        if (record.value_[0] != '\1' || record.value_.size() != 17 ||
+            !record.key_.starts_with(consumer_prefix_) ||
+            consumer_prefix_.empty())
+          return Bad("unowned Stream pending output");
+        output_.assign(record.value_, 1, 16);
+      }
+      return std::optional<std::string_view>(output_);
+    }
+    if (!page_) return std::nullopt;
+    if (entry_ == page_->elements_.size()) {
+      page_ = nullptr;
+      return std::nullopt;
+    }
+    const auto& record = page_->elements_[entry_++];
+    auto key = storage::StreamRecordKey(record),
+         payload = storage::StreamRecordPayload(record);
+    if (!key.ok()) return key.status();
+    if (!payload.ok()) return payload.status();
+    auto status = OutputBudget(record.size());
+    if (!status.ok()) return status;
+    Reader in(*payload);
+    const auto kind = static_cast<unsigned char>((*key)[0]);
+    if (kind == 0) {
+      header_ = *payload;
+      continue;
+    }
+    if (kind == 1) {
+      Entry entry;
+      std::uint32_t fields = 0;
+      if (!in.Le64(&entry.id.ms) || !in.Le64(&entry.id.seq) ||
+          !in.Le32(&fields) || fields % 2)
+        return Bad("invalid Stream output entry");
+      if (fields > in.remaining() / 4)
+        return Bad("invalid Stream output field count");
+      entry.fields.reserve(fields);
+      for (std::uint32_t i = 0; i < fields; ++i) {
+        auto field = raw_string(in);
+        if (!field.ok()) return field.status();
+        entry.fields.push_back(std::move(*field));
+      }
+      if (!in.done()) return Bad("trailing Stream output entry");
+      if (messages_++ == 0) first_id_ = {entry.id.ms, entry.id.seq};
+      EncodeStreamEntryRdb(&output_, entry);
+      return std::optional<std::string_view>(output_);
+    }
+    if (kind == 2 || kind == 3) continue;
+    if (kind == 4) {
+      if (messages_ != expected_ || header_.size() != 48)
+        return Bad("incomplete Stream message output");
+      Reader header(header_);
+      header.Skip(4);
+      std::uint64_t last_ms = 0, last_seq = 0, deleted_ms = 0, deleted_seq = 0,
+                    added = 0;
+      if (!header.Le64(&last_ms) || !header.Le64(&last_seq) ||
+          !header.Le64(&deleted_ms) || !header.Le64(&deleted_seq) ||
+          !header.Le64(&added))
+        return Bad("invalid Stream output header");
+      std::uint32_t groups = 0;
+      if (!in.Le32(&groups)) return Bad("invalid Stream group count");
+      WriteLength(&output_, expected_);
+      WriteLength(&output_, last_ms);
+      WriteLength(&output_, last_seq);
+      WriteLength(&output_, first_id_[0]);
+      WriteLength(&output_, first_id_[1]);
+      WriteLength(&output_, deleted_ms);
+      WriteLength(&output_, deleted_seq);
+      WriteLength(&output_, added);
+      WriteLength(&output_, groups);
+      return std::optional<std::string_view>(output_);
+    }
+    if (kind != 5) return Bad("unknown Stream output record");
+    std::size_t prefix = 1;
+    while (prefix < key->size()) {
+      if ((*key)[prefix++] != '\0') continue;
+      if (prefix == key->size()) return Bad("invalid Stream group key");
+      if ((*key)[prefix++] == '\0') break;
+    }
+    if (prefix == key->size()) return Bad("invalid Stream group subtype");
+    const auto subtype = static_cast<unsigned char>((*key)[prefix]);
+    if (subtype == 0) {
+      if (consumers_) return Bad("previous Stream group not drained");
+      consumers_ = std::make_unique<RecordSpool>();
+      auto name = raw_string(in);
+      if (!name.ok()) return name.status();
+      std::uint64_t ms = 0, seq = 0, read = 0;
+      std::uint32_t count = 0;
+      if (!in.Le64(&ms) || !in.Le64(&seq) || !in.Le64(&read) ||
+          !in.Le32(&count))
+        return Bad("invalid Stream group output");
+      consumer_count_ = count;
+      WriteString(&output_, *name);
+      WriteLength(&output_, ms);
+      WriteLength(&output_, seq);
+      WriteLength(&output_, read);
+      return std::optional<std::string_view>(output_);
+    }
+    if (!consumers_) return Bad("missing Stream output group");
+    if (subtype == 1) {
+      auto name = raw_string(in);
+      if (!name.ok()) return name.status();
+      std::uint64_t seen = 0, active = 0;
+      if (!in.Le64(&seen) || !in.Le64(&active))
+        return Bad("invalid Stream consumer output");
+      output_.push_back('\0');
+      WriteString(&output_, *name);
+      PutLe64(&output_, seen);
+      PutLe64(&output_, active);
+      status = consumers_->Add(name_key(*name) + '\0', output_);
+      if (!status.ok()) return status;
+      output_.clear();
+      continue;
+    }
+    if (subtype == 2) {
+      std::uint32_t count = 0;
+      if (!in.Le32(&count)) return Bad("invalid Stream pending count");
+      pending_ = count;
+      WriteLength(&output_, count);
+      if (pending_ == 0) phase_ = Phase::kConsumerCount;
+      return std::optional<std::string_view>(output_);
+    }
+    if (subtype != 3 || pending_ == 0)
+      return Bad("unexpected Stream pending output");
+    Id id;
+    std::uint64_t delivery = 0, count = 0;
+    if (!in.Le64(&id.ms) || !in.Le64(&id.seq))
+      return Bad("invalid Stream pending ID");
+    auto owner = raw_string(in);
+    if (!owner.ok()) return owner.status();
+    if (!in.Le64(&delivery) || !in.Le64(&count))
+      return Bad("invalid Stream pending state");
+    PutBe64(&output_, id.ms);
+    PutBe64(&output_, id.seq);
+    status = consumers_->Add(name_key(*owner) + '\1' + output_,
+                             std::string(1, '\1') + output_);
+    if (!status.ok()) return status;
+    PutLe64(&output_, delivery);
+    WriteLength(&output_, count);
+    if (--pending_ == 0) phase_ = Phase::kConsumerCount;
+    return std::optional<std::string_view>(output_);
+  }
+}
+
+absl::Status StreamFileEncoder::Finish() const {
+  if (!status_.ok()) return status_;
+  if (!done_ || page_ || phase_ != Phase::kRecords || consumers_ ||
+      messages_ != expected_)
+    return absl::FailedPreconditionError("incomplete RDB Stream output");
+  return absl::OkStatus();
+}
 
 }  // namespace lavik::rdb

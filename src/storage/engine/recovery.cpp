@@ -640,9 +640,12 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               "storage contains current records in a disabled database");
         }
         const bool ordered = record.value_type_ == ValueType::kList ||
-                             record.value_type_ == ValueType::kSortedSet;
+                             record.value_type_ == ValueType::kSortedSet ||
+                             record.value_type_ == ValueType::kStream;
         const auto ordered_kind = record.value_type_ == ValueType::kList
                                       ? OrderedCollectionKind::kList
+                                  : record.value_type_ == ValueType::kStream
+                                      ? OrderedCollectionKind::kStream
                                       : OrderedCollectionKind::kSortedSet;
         std::optional<RecoveredGroupedRoot> grouped_root;
         std::optional<RecoveredHashGroup> auxiliary_group;
@@ -765,7 +768,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               decoded->revision_ = record.mutation_sequence_;
             }
             if (decoded->kind_ != ordered_kind ||
-                decoded->item_count_ != record.logical_size_) {
+                decoded->logical_size() != record.logical_size_) {
               co_return absl::DataLossError(
                   "ordered root disagrees with its record header");
             }
@@ -1381,7 +1384,8 @@ Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroups(
     // Ordered winners were fully checksummed while resolving their links;
     // there is no reason to read their potentially huge bodies twice.
     if ((record.location_.value_type() == ValueType::kList ||
-         record.location_.value_type() == ValueType::kSortedSet) &&
+         record.location_.value_type() == ValueType::kSortedSet ||
+         record.location_.value_type() == ValueType::kStream) &&
         IsOrderedPageId(record.auxiliary_group_->id_))
       continue;
     if (record.extents_ == nullptr) {

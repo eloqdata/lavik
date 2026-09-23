@@ -28,15 +28,17 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "lavik/storage/collection_page.h"
+#include "lavik/storage/detail/collection_limits.h"
+#include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
-
-inline constexpr std::size_t kCollectionStreamPageBytes = 8 * 1024;
 
 // Streams the existing compact wire image, not the durable grouped layout.
 // Aggregate lengths are uint64_t, while the unchanged wire count is uint32_t.
 // No serialized whole-value or whole-page buffer is allocated. Pages must be
 // supplied in logical order, including empty Hash/Set routing pages if desired.
+// Stream pages supply internal logical records; total_count counts those
+// records, while their LXS1 header retains the independent message count.
 class CollectionCompactEncoder {
  public:
   static absl::StatusOr<CollectionCompactEncoder> Create(
@@ -45,6 +47,7 @@ class CollectionCompactEncoder {
 
   // Validates a page and measures only its entries, excluding the single
   // collection header. Add 32 bytes for Hash/Set, or 8 for List/Sorted Set.
+  // Stream header/count fragments are themselves records, with no extra header.
   static absl::StatusOr<std::uint64_t> MeasurePage(const CollectionPage& page);
 
   // Borrows the page; keep it immutable and alive until page_done() and until
@@ -82,6 +85,8 @@ class CollectionCompactEncoder {
 // most one roughly 8 KiB page plus one indivisible large entry is assembled.
 // No allocation is sized from the aggregate count/length. The caller may await
 // admission/storage between TakePage and the next Consume call.
+// Supports compact Hash, Set, List and Sorted Set images, and LSR1 Stream
+// records with incremental validation across page boundaries.
 class CollectionCompactDecoder {
  public:
   CollectionCompactDecoder(const CollectionCompactDecoder&) = delete;
@@ -109,13 +114,16 @@ class CollectionCompactDecoder {
   absl::StatusOr<CollectionPage> TakePage(
       std::size_t* transferred_admission = nullptr);
   std::size_t pending_admitted_bytes() const noexcept {
-    return admission_count_.bytes_;
+    return admission_count_.bytes_ + stream_validator_charge_.bytes_;
   }
 
   // Validates exact bytes/count and no partial header/entry at transport EOF.
   // A final ready page may still be taken after successful Finish. No trailing
   // bytes may subsequently be supplied. A truncated EOF poisons the decoder.
   absl::Status Finish();
+  // Stream wire items include metadata and PEL; the enclosing logical size
+  // counts messages and is independently checked by the record validator.
+  std::uint64_t item_count() const noexcept { return total_count_; }
 
  private:
   CollectionCompactDecoder() = default;
@@ -132,6 +140,8 @@ class CollectionCompactDecoder {
     }
     std::size_t bytes_ = 0;
   };
+  std::optional<StreamRecordValidator> stream_validator_;
+  AdmissionCount stream_validator_charge_;
   enum class Stage { kHeader, kEntryHeader, kFirst, kSecond, kDone };
   absl::Status ReadHeader();
   absl::Status ReadEntryHeader();

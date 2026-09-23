@@ -26,6 +26,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <charconv>
@@ -36,6 +37,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <latch>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -336,6 +338,11 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
+// Bound the append workload independently of host throughput. A timed loop
+// can exhaust the fixed device with outstanding transaction generations before
+// cleaning catches up, turning the snapshot test into a capacity race. Four
+// writers each perform this many acknowledged mutations while readers contend.
+constexpr std::uint64_t kWritesPerWriter = 2000;
 std::atomic<bool> stop_flag{false};
 std::mutex failure_mutex;
 std::string failure_message;
@@ -350,14 +357,50 @@ void ReportFailure(const std::string& message) {
   stop_flag.store(true, std::memory_order_release);
 }
 
+struct StressStart {
+  std::latch readers_connected_{4};
+  std::latch run_{1};
+  std::latch readers_observed_{4};
+};
+
+// Each reader owns one arrival at each checkpoint. Unwinding a failed reader
+// releases its arrivals after ReportFailure sets stop_flag, so neither main
+// nor a writer can hang waiting for a connection or snapshot that will not
+// come.
+class ReaderProgress {
+ public:
+  explicit ReaderProgress(StressStart& start) : start_(start) {}
+  ReaderProgress(const ReaderProgress&) = delete;
+  ReaderProgress& operator=(const ReaderProgress&) = delete;
+  ~ReaderProgress() {
+    Connected();
+    Observed();
+  }
+  void Connected() {
+    if (!std::exchange(connected_, true))
+      start_.readers_connected_.count_down();
+  }
+  void Observed() {
+    if (!std::exchange(observed_, true)) start_.readers_observed_.count_down();
+  }
+
+ private:
+  StressStart& start_;
+  bool connected_ = false;
+  bool observed_ = false;
+};
+
 // W1 atomically writes {a, b}, W2 atomically writes {b, c}; each value is
 // writer-tagged. Any snapshot where b carries W1's tag must show a == b, and
 // any snapshot where b carries W2's tag must show c == b.
 void Writer(std::uint16_t port, const char* tag, const char* first,
-            const char* second) {
+            const char* second, StressStart& start) {
   try {
     RespClient client = Connect(port);
-    for (std::uint64_t i = 1; !stop_flag.load(std::memory_order_acquire); ++i) {
+    start.run_.wait();
+    for (std::uint64_t i = 1;
+         i <= kWritesPerWriter && !stop_flag.load(std::memory_order_acquire);
+         ++i) {
       const std::string value = std::string(tag) + std::to_string(i);
       const std::string reply =
           client.Command({"MSET", first, value, second, value});
@@ -365,6 +408,9 @@ void Writer(std::uint16_t port, const char* tag, const char* first,
         ReportFailure("writer MSET failed: " + reply);
         return;
       }
+      // Keep the write interval open until every connected reader has
+      // actually completed a snapshot, even if that reader is descheduled.
+      if (i == 1) start.readers_observed_.wait();
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("writer: ") + error.what());
@@ -388,21 +434,31 @@ void CheckSnapshot(const std::vector<std::string>& abc, const char* context) {
   }
 }
 
-void MgetReader(std::uint16_t port) {
+void MgetReader(std::uint16_t port, std::uint64_t& snapshots,
+                StressStart& start) {
+  ReaderProgress progress(start);
   try {
     RespClient client = Connect(port);
+    progress.Connected();
+    start.run_.wait();
     while (!stop_flag.load(std::memory_order_acquire)) {
       const std::string reply = client.Command({"MGET", "sa", "sb", "sc"});
       CheckSnapshot(RespClient::ParseFlatArray(reply), "MGET");
+      ++snapshots;
+      progress.Observed();
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("mget reader: ") + error.what());
   }
 }
 
-void ExecReader(std::uint16_t port) {
+void ExecReader(std::uint16_t port, std::uint64_t& snapshots,
+                StressStart& start) {
+  ReaderProgress progress(start);
   try {
     RespClient client = Connect(port);
+    progress.Connected();
+    start.run_.wait();
     while (!stop_flag.load(std::memory_order_acquire)) {
       if (client.Command({"MULTI"}) != "+OK") {
         ReportFailure("exec reader MULTI failed");
@@ -413,6 +469,8 @@ void ExecReader(std::uint16_t port) {
       client.Command({"GET", "sc"});
       const std::string reply = client.Command({"EXEC"});
       CheckSnapshot(RespClient::ParseFlatArray(reply), "EXEC");
+      ++snapshots;
+      progress.Observed();
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("exec reader: ") + error.what());
@@ -421,10 +479,13 @@ void ExecReader(std::uint16_t port) {
 
 // Two writers hammer the same pair with their own tags; every snapshot must
 // show both keys equal.
-void PairWriter(std::uint16_t port, const char* tag) {
+void PairWriter(std::uint16_t port, const char* tag, StressStart& start) {
   try {
     RespClient client = Connect(port);
-    for (std::uint64_t i = 1; !stop_flag.load(std::memory_order_acquire); ++i) {
+    start.run_.wait();
+    for (std::uint64_t i = 1;
+         i <= kWritesPerWriter && !stop_flag.load(std::memory_order_acquire);
+         ++i) {
       const std::string value = std::string(tag) + std::to_string(i);
       const std::string reply =
           client.Command({"MSET", "ha", value, "hb", value});
@@ -432,22 +493,35 @@ void PairWriter(std::uint16_t port, const char* tag) {
         ReportFailure("pair writer MSET failed: " + reply);
         return;
       }
+      // Keep the write interval open until every connected reader has
+      // actually completed a snapshot, even if that reader is descheduled.
+      if (i == 1) start.readers_observed_.wait();
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("pair writer: ") + error.what());
   }
 }
 
-void PairReader(std::uint16_t port) {
+void PairReader(std::uint16_t port, std::uint64_t& snapshots,
+                StressStart& start) {
+  ReaderProgress progress(start);
   try {
     RespClient client = Connect(port);
+    progress.Connected();
+    start.run_.wait();
     while (!stop_flag.load(std::memory_order_acquire)) {
       const std::string reply = client.Command({"MGET", "ha", "hb"});
       const auto values = RespClient::ParseFlatArray(reply);
-      if (values.size() == 2 && values[0] != values[1]) {
+      if (values.size() != 2) {
+        ReportFailure("pair MGET: expected 2 values");
+        return;
+      }
+      if (values[0] != values[1]) {
         ReportFailure("torn pair: ha='" + values[0] + "' hb='" + values[1] +
                       "'");
       }
+      ++snapshots;
+      progress.Observed();
     }
   } catch (const std::exception& error) {
     ReportFailure(std::string("pair reader: ") + error.what());
@@ -478,7 +552,11 @@ int main(int argc, char** argv) {
       ServerProcess server(argv[1], port, data_path, log_path);
       {
         RespClient seed = Connect(port);
-        if (seed.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "1"}) !=
+        // Exercise online cleaning without rotating sparse per-worker 8 MiB
+        // transaction blocks every millisecond. Rotation can otherwise exhaust
+        // this small device before old generations become reclaimable, even
+        // with a bounded number of writes.
+        if (seed.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "100"}) !=
             "+OK") {
           Fail("enabling transaction cleaner failed");
         }
@@ -488,24 +566,35 @@ int main(int argc, char** argv) {
         }
       }
 
-      std::vector<std::thread> threads;
-      threads.emplace_back(Writer, port, "W1:", "sa", "sb");
-      threads.emplace_back(Writer, port, "W2:", "sb", "sc");
-      threads.emplace_back(MgetReader, port);
-      threads.emplace_back(MgetReader, port);
-      threads.emplace_back(ExecReader, port);
-      threads.emplace_back(PairWriter, port, "P1:");
-      threads.emplace_back(PairWriter, port, "P2:");
-      threads.emplace_back(PairReader, port);
+      // Each reader owns one counter; main inspects it only after joining.
+      // Connection readiness and actual snapshot progress are separate gates.
+      StressStart start;
+      std::array<std::uint64_t, 4> snapshots{};
+      std::vector<std::thread> writers, readers;
+      writers.emplace_back([&] { Writer(port, "W1:", "sa", "sb", start); });
+      writers.emplace_back([&] { Writer(port, "W2:", "sb", "sc", start); });
+      writers.emplace_back([&] { PairWriter(port, "P1:", start); });
+      writers.emplace_back([&] { PairWriter(port, "P2:", start); });
+      readers.emplace_back([&] { MgetReader(port, snapshots[0], start); });
+      readers.emplace_back([&] { MgetReader(port, snapshots[1], start); });
+      readers.emplace_back([&] { ExecReader(port, snapshots[2], start); });
+      readers.emplace_back([&] { PairReader(port, snapshots[3], start); });
 
-      std::this_thread::sleep_for(5s);
+      start.readers_connected_.wait();
+      start.run_.count_down();
+      for (auto& writer : writers) writer.join();
       stop_flag.store(true, std::memory_order_release);
-      for (std::thread& thread : threads) {
-        thread.join();
-      }
+      for (auto& reader : readers) reader.join();
       if (!failure_message.empty()) {
         Fail(failure_message);
       }
+      for (auto count : snapshots) {
+        if (count == 0) Fail("a reader did not observe any snapshots");
+      }
+      std::cout << "completed " << 4 * kWritesPerWriter
+                << " writes; reader snapshots=" << snapshots[0] << ','
+                << snapshots[1] << ',' << snapshots[2] << ',' << snapshots[3]
+                << '\n';
 
       RespClient final = Connect(port);
       final_values = RespClient::ParseFlatArray(

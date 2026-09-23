@@ -35,6 +35,7 @@
 #include "absl/status/statusor.h"
 #include "lavik/local_shared_ptr.h"
 #include "lavik/memory.h"
+#include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/hash_codec.h"
 #include "lavik/storage/scan_hash_map.h"
 
@@ -125,9 +126,6 @@ absl::StatusOr<HashGroupMetadata> DecodeHashGroupMetadata(
 absl::StatusOr<std::string> EncodeHashGroup(const HashGroupSnapshot& group);
 absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(std::string_view bytes);
 
-inline constexpr std::size_t kHashGroupTargetBytes = 8 * 1024;
-inline constexpr std::size_t kGroupedHashPromotionBytes = 16 * 1024;
-
 // Splits one complete leaf into complete replacement leaves. The input is
 // scratch, never the published directory. A large indivisible field or a full
 // 64-bit collision may exceed target_bytes; it is never fragmented into a
@@ -136,13 +134,13 @@ inline constexpr std::size_t kGroupedHashPromotionBytes = 16 * 1024;
 // leaf in the SAME atomic batch. Nothing is published by this function.
 absl::StatusOr<std::vector<HashGroupSnapshot>> SplitHashGroup(
     HashGroupSnapshot group, const DigestSeed& seed,
-    std::size_t target_bytes = kHashGroupTargetBytes);
+    std::size_t target_bytes = kCollectionGroupTargetBytes);
 
 // Builds a full Hash promotion as group snapshots. It deliberately has no
 // storage side effects: failure leaves the compact source authoritative.
 absl::StatusOr<std::vector<HashGroupSnapshot>> GroupHashValue(
     HashValue value, std::uint64_t incarnation, const DigestSeed& seed,
-    std::size_t target_bytes = kHashGroupTargetBytes);
+    std::size_t target_bytes = kCollectionGroupTargetBytes);
 
 // Recovery input after physical record/checksum and enclosing key/epoch
 // validation. record_token is caller-owned identity for its compact location,
@@ -438,6 +436,6 @@ absl::StatusOr<HashGroupMutationPlan> PlanHashGroupMutation(
     std::vector<LoadedHashGroup> loaded_groups, HashGroupMutationKind kind,
     std::span<const std::string_view> fields,
     std::span<const std::string_view> values = {},
-    std::size_t target_bytes = kHashGroupTargetBytes);
+    std::size_t target_bytes = kCollectionGroupTargetBytes);
 
 }  // namespace lavik::storage

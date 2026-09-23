@@ -660,7 +660,13 @@ TEST(RdbTest, AcceptsRedis72PackedFixturesAndEmitsVersionEleven) {
         auto page = streaming->ReadCollectionPage();
         ASSERT_TRUE(page.ok()) << page.status();
         EXPECT_EQ(page->value_type_, fixture.type_);
-        count += page->size();
+        count +=
+            fixture.type_ == storage::ValueType::kStream
+                ? std::count_if(page->elements_.begin(), page->elements_.end(),
+                                [](const auto& row) {
+                                  return !row.empty() && row.front() == '\1';
+                                })
+                : page->size();
         if (page->done_) break;
       }
       EXPECT_EQ(count, fixture.size_);
@@ -722,7 +728,13 @@ TEST(RdbTest, AcceptsHistoricalCollectionEncodings) {
         auto page = streaming->ReadCollectionPage();
         ASSERT_TRUE(page.ok()) << page.status();
         EXPECT_EQ(page->value_type_, fixture.type_);
-        count += page->size();
+        count +=
+            fixture.type_ == storage::ValueType::kStream
+                ? std::count_if(page->elements_.begin(), page->elements_.end(),
+                                [](const auto& row) {
+                                  return !row.empty() && row.front() == '\1';
+                                })
+                : page->size();
         if (page->done_) break;
       }
       EXPECT_EQ(count, fixture.size_);

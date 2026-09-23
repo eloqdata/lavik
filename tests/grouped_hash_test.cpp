@@ -376,7 +376,7 @@ TEST(GroupedHashTest, PromotionRoutesEveryFieldToOneBoundedGroup) {
     for (const auto& group : *groups) {
       auto encoded = EncodeHashGroup(group);
       ASSERT_TRUE(encoded.ok()) << encoded.status();
-      EXPECT_LE(encoded->size(), kHashGroupTargetBytes + 48);
+      EXPECT_LE(encoded->size(), kCollectionGroupTargetBytes + 48);
       for (const auto& entry : group.value_.entries_) {
         const auto* selected = directory->Find(entry.field_);
         ASSERT_NE(selected, nullptr);
