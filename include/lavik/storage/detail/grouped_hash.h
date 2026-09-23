@@ -156,6 +156,9 @@ struct RecoveredHashGroup {
   // EXEC transaction commits. Both independent decisions must be present.
   std::uint64_t batch_txid_ = 0;
   std::uint64_t field_count_ = 0;
+  // Complete encoded group payload, including its envelope. Zero is reserved
+  // for callers that build a directory without physical payload metadata.
+  std::uint64_t encoded_bytes_ = 0;
   std::uint64_t record_token_ = 0;
   bool retired_ = false;
 };
@@ -392,6 +395,10 @@ class HashGroupDirectory {
   const GroupedHashRoot& root() const noexcept { return root_; }
   std::uint64_t sequence() const noexcept { return sequence_; }
   std::uint64_t command_sequence() const noexcept { return command_sequence_; }
+  // Sum of active primary group payloads; retirement markers are excluded.
+  std::uint64_t total_group_bytes() const noexcept {
+    return total_group_bytes_;
+  }
   const HashGroupMap<std::uint64_t>& groups() const noexcept { return groups_; }
   const HashGroupMap<HashGroupId>& retired_groups() const noexcept {
     return retired_;
@@ -401,6 +408,7 @@ class HashGroupDirectory {
   GroupedHashRoot root_;
   std::uint64_t sequence_ = 0;
   std::uint64_t command_sequence_ = 0;
+  std::uint64_t total_group_bytes_ = 0;
   HashGroupMap<std::uint64_t> groups_;
   HashGroupMap<HashGroupId> retired_;
 };

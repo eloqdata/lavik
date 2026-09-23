@@ -155,6 +155,7 @@ bool SameMetadata(const RecoveredOrderedGroup& left,
                   const RecoveredOrderedGroup& right) {
   return left.previous_ == right.previous_ && left.next_ == right.next_ &&
          left.item_count_ == right.item_count_ &&
+         left.encoded_bytes_ == right.encoded_bytes_ &&
          left.retired_ == right.retired_ &&
          std::bit_cast<std::uint64_t>(left.min_score_) ==
              std::bit_cast<std::uint64_t>(right.min_score_) &&
@@ -585,6 +586,10 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
       result.ids_.emplace_back(group.id_, result.groups_.size());
     result.groups_.push_back(group);
     count += group.item_count_;
+    if (group.encoded_bytes_ >
+        std::numeric_limits<std::uint64_t>::max() - result.total_group_bytes_)
+      return absl::DataLossError("ordered group byte total overflows");
+    result.total_group_bytes_ += group.encoded_bytes_;
     if (root.kind_ != OrderedCollectionKind::kString)
       result.ends_.push_back(count);
     previous = id;
@@ -659,6 +664,10 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
                                   root.item_count_ - i * kStringGroupBytes) ||
           item.record_token_ == 0 || item.sequence_ == 0 || item.lsn_ == 0)
         return absl::DataLossError("incomplete String segment update");
+      if (item.encoded_bytes_ >
+          std::numeric_limits<std::uint64_t>::max() - result.total_group_bytes_)
+        return absl::DataLossError("String segment byte total overflows");
+      result.total_group_bytes_ += item.encoded_bytes_;
     }
     return result;
   }

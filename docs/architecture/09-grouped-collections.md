@@ -23,8 +23,11 @@ Redis keyspace or a separate database. String, Hash, Set, List, Sorted Set and
 Stream support compact values and complete, independently addressed group snapshots. Writes
 automatically promote compact collections at 16 KiB of encoded size, with an
 8 KiB target per group shared by all six types. Indivisible entries and Hash
-collisions can exceed that target. The grouped representation remains in use
-until the key is deleted or replaced.
+collisions can exceed that target. A complete update returns to compact storage
+when active primary group payloads total less than 8 KiB; deletion and whole
+replacement can also end the grouped incarnation. The payload sum bounds the
+compact encoding size, so the writer selects that representation before
+staging replacement groups.
 Streaming collection imports and grouped key transfers construct graphs directly.
 Stream RDB and native receiving also ingest logical records page by page. Both
 ordinary and Debug builds use the same read, mutation, recovery and maintenance
@@ -66,8 +69,11 @@ space amplification independently of on-disk compatibility.
 The top-level `RecordIndex` still owns each user key, type, expiry and logical
 version. A grouped marker directs collection lookups to that
 partition/database's sparse `ScanHashMap` object index. Its immutable view holds
-a routing directory, one compact `RecordIndex` entry per group, and separately
-owned extent manifests. It does not retain field names or values.
+a routing directory, the active primary group payload total, one compact
+`RecordIndex` entry per group, and separately owned extent manifests. Retired
+markers and the Sorted Set member index do not contribute to the total.
+Recovery rebuilds it from selected checked group payload lengths. The view
+does not retain field names or values.
 
 A root's incarnation distinguishes deletion/recreation from updates. The
 persisted hash seed determines field routing independently of the process's

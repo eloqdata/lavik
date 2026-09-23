@@ -99,6 +99,56 @@ HashDiskLayout InspectHashLayout(const PrivateDisk& disk,
   return result;
 }
 
+TEST(GroupedHashWriteE2e,
+     DemotesBelowStrictGroupPayloadThresholdAfterRecovery) {
+  PrivateDisk disk;
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(
+        client.Command({"HSET", "demote-hash", "f", std::string(17000, 'a')})
+            .text_,
+        "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_EQ(disk.LatestRootGrouped("demote-hash"), true);
+  // One Hash page is 48-byte group envelope, 32-byte compact header,
+  // 8-byte entry framing, one field byte and the value bytes.
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(
+        client.Command({"HSET", "demote-hash", "f", std::string(8103, 'b')})
+            .text_,
+        "0");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_EQ(disk.LatestRootGrouped("demote-hash"), true);
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(
+        client.Command({"HSET", "demote-hash", "f", std::string(8102, 'c')})
+            .text_,
+        "QUEUED");
+    const auto executed = client.Command({"EXEC"});
+    ASSERT_EQ(executed.items_.size(), 1);
+    ASSERT_EQ(executed.items_[0].text_, "0");
+    ASSERT_EQ(client.Command({"HGET", "demote-hash", "f"}).text_,
+              std::string(8102, 'c'));
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_EQ(disk.LatestRootGrouped("demote-hash"), false);
+  Server recovered(disk);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"HGET", "demote-hash", "f"}).text_,
+            std::string(8102, 'c'));
+}
+
 TEST(GroupedHashWriteE2e, BatchedFieldsPreserveOrderAcrossGrowthAndRecovery) {
   PrivateDisk disk;
   std::map<std::string, std::string> expected;
