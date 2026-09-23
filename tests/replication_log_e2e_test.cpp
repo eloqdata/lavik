@@ -1448,7 +1448,7 @@ class ReplicationLogService final : public bycorf::Service {
     constexpr std::uint8_t kDb = 4;
     // This case measures retained command payload/backpressure. A grouped
     // standalone write publishes a bounded after-image ticket instead, so
-    // retain the legacy String layout with an oversized parent key.
+    // retain whole-value String storage with an oversized parent key.
     const std::string key =
         std::string(8193, 'k') + "fullsync-handoff{ordered}";
     const std::uint16_t partition_id = lavik::storage::RedisSlot(key);

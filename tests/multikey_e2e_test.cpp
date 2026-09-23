@@ -1232,7 +1232,7 @@ int main(int argc, char** argv) {
                                  false, 4, {}, "1000");
     RespClient standby_control = ConnectReady(port);
     const std::string standby_payload(7 * 1024 * 1024, 's');
-    // Oversized parent keys deliberately retain the legacy String layout.
+    // Oversized parent keys deliberately use whole-value String storage.
     // This fixture exercises ordinary-stream prefetch, not grouped tx IO.
     const std::string standby_leader =
         std::string(8193, 'k') + "leader{standby}";
