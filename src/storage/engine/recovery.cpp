@@ -649,6 +649,22 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         std::optional<RecoveredHashGroup> auxiliary_group;
         std::optional<RecoveredOrderedGroup> ordered_group;
         if (record.auxiliary_group_) {
+          std::uint64_t group_bytes =
+              record.external_ ? 0 : record.payload_bytes_;
+          if (record.external_) {
+            if (extents == nullptr)
+              co_return absl::DataLossError("group extent manifest is missing");
+            for (const auto& extent : *extents) {
+              if (extent.payload_bytes_ > kMaxRecordPayloadBytes - group_bytes)
+                co_return absl::DataLossError("group payload is too large");
+              group_bytes += extent.payload_bytes_;
+            }
+          }
+          const std::uint64_t key_prefix =
+              record.key_external_ ? record.key_bytes_ : 0;
+          if (group_bytes < key_prefix)
+            co_return absl::DataLossError("group parent key is truncated");
+          group_bytes -= key_prefix;
           // Value-only extents of an obsolete group may already have been
           // reclaimed while other live records retain this source block.
           // Its checked header contains all winner-selection metadata; touch
@@ -662,6 +678,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               .txid_ = record.txid_,
               .batch_txid_ = record.group_batch_txid_,
               .field_count_ = record.logical_size_,
+              .encoded_bytes_ = group_bytes,
               .retired_ = record.group_retired_,
           };
           if (!record.external_) {
@@ -694,6 +711,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                   .txid_ = record.txid_,
                   .batch_txid_ = record.group_batch_txid_,
                   .item_count_ = record.logical_size_,
+                  .encoded_bytes_ = group_bytes,
                   .retired_ = record.group_retired_,
                   .min_score_ = decoded->entries_.empty()
                                     ? 0
@@ -1256,6 +1274,7 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
     const auto& previous = *records[position->second].auxiliary_group_;
     if (candidate.sequence_ == previous.sequence_ &&
         (candidate.field_count_ != previous.field_count_ ||
+         candidate.encoded_bytes_ != previous.encoded_bytes_ ||
          candidate.retired_ != previous.retired_)) {
       co_return absl::DataLossError("conflicting ordered page header copies");
     }
@@ -1278,6 +1297,7 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
         .txid_ = header.txid_,
         .batch_txid_ = header.batch_txid_,
         .item_count_ = header.field_count_,
+        .encoded_bytes_ = header.encoded_bytes_,
         // The standalone ordered codec reserves zero as an invalid token.
         .record_token_ = token + 1,
         .retired_ = header.retired_,

@@ -276,10 +276,12 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   auto encoder_admission = encoder_budget.Reserve(1);
   if (!encoder_admission.ok()) co_return encoder_admission.status();
   std::vector<HashGroupEncoder> encoders;
+  std::vector<std::uint64_t> encoded_sizes;
   try {
     // No current-command pages have been staged if preflight allocation fails.
     LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_GROUP_ENCODER_PREPARE_KEY", key);
     encoders.reserve(plan->writes_.size());
+    encoded_sizes.reserve(plan->writes_.size());
     const bool external_key = key.size() > options_.inline_key_max_bytes_ ||
                               RecordHeaderBytes(key.size(), false, true, false,
                                                 true) > kBlockHeaderSlotBytes;
@@ -291,11 +293,100 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
         co_return absl::OutOfRangeError(
             "group snapshot and parent key exceed payload limit");
       }
+      encoded_sizes.push_back(encoder->encoded_bytes());
       encoders.push_back(std::move(*encoder));
     }
   } catch (const std::bad_alloc&) {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("OOM preparing group encoders");
+  }
+  // Group payloads include a per-group envelope (and a compact Hash header
+  // for each nonempty group). Their sum is therefore an upper bound on the
+  // one-header compact image. Decide before staging any auxiliary record.
+  std::optional<std::string> compact_payload;
+  try {
+    if (previous != nullptr && tx->grouped_ingest_batch_ == nullptr) {
+      std::uint64_t total = previous->directory().total_group_bytes();
+      for (std::size_t i = 0; i < plan->writes_.size(); ++i) {
+        const auto& page = plan->writes_[i];
+        const auto old = previous->directory().groups().find(page.id_.prefix_);
+        if (old != previous->directory().groups().end() &&
+            old->second.id_ == page.id_) {
+          if (old->second.encoded_bytes_ > total)
+            co_return absl::DataLossError("invalid grouped byte total");
+          total -= old->second.encoded_bytes_;
+        }
+        if (!page.retired_) {
+          if (encoded_sizes[i] > UINT64_MAX - total)
+            co_return absl::OutOfRangeError("grouped byte total overflows");
+          total += encoded_sizes[i];
+        }
+      }
+      if (total < kCollectionGroupTargetBytes) {
+        GroupedScratchBudget budget;
+        for (const auto& [prefix, metadata] : previous->directory().groups()) {
+          (void)prefix;
+          const bool replaced = std::any_of(
+              plan->writes_.begin(), plan->writes_.end(),
+              [&](const auto& page) { return page.id_ == metadata.id_; });
+          if (replaced) continue;
+          const auto* entry = previous->FindGroup(metadata.id_);
+          if (entry == nullptr)
+            co_return absl::DataLossError("missing Hash group for demotion");
+          const auto added = budget.AddGroup(
+              entry->value_, previous->ExtentsFor(metadata.id_), key.size());
+          if (!added.ok()) co_return added;
+        }
+        auto added = budget.AddBytes(2 * kCollectionGroupTargetBytes +
+                                     field_count * sizeof(HashEntry));
+        if (!added.ok()) co_return added;
+        auto scratch = budget.Reserve(2);
+        if (!scratch.ok()) co_return scratch.status();
+        HashValue compact;
+        compact.entries_.reserve(field_count);
+        for (const auto& [prefix, metadata] : previous->directory().groups()) {
+          (void)prefix;
+          const bool replaced = std::any_of(
+              plan->writes_.begin(), plan->writes_.end(),
+              [&](const auto& page) { return page.id_ == metadata.id_; });
+          if (replaced) continue;
+          auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id,
+                                                       key, digest, previous,
+                                                       metadata.id_, false);
+          if (!loaded.ok()) co_return loaded.status();
+          for (auto& entry : loaded->snapshot_.value_.entries_)
+            compact.entries_.push_back(std::move(entry));
+        }
+        for (const auto& page : plan->writes_) {
+          if (page.retired_) continue;
+          compact.entries_.insert(compact.entries_.end(),
+                                  page.value_.entries_.begin(),
+                                  page.value_.entries_.end());
+        }
+        if (compact.entries_.size() != field_count)
+          co_return absl::DataLossError("Hash demotion cardinality mismatch");
+        auto encoded = EncodeHashValue(compact);
+        if (!encoded.ok()) co_return encoded.status();
+        if (encoded->size() >= kCollectionGroupTargetBytes)
+          co_return absl::InternalError("Hash demotion byte bound failed");
+        compact_payload = std::move(*encoded);
+      }
+    }
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM preparing Hash demotion");
+  }
+  if (compact_payload) {
+    if (!SameLogicalView(source_side, side.CurrentForMutation(key)) ||
+        EffectiveRecordDbEpoch(partition, db_id) != db_epoch ||
+        partition.replication_epoch_ != replication_epoch ||
+        store.index_generations_[db_id] != index_generation)
+      co_return absl::AbortedError("grouped source changed before demotion");
+    co_return co_await AppendLocked(
+        store, partition, db_id, key, digest, *compact_payload,
+        RecordKind::kValue, value_type, expire_at_ms,
+        outer_transaction ? tx : nullptr, field_count, nullptr, nullptr,
+        replication, nullptr, true, nullptr, mutation_precondition);
   }
   auto decision = PrepareGroupedDecision(*tx);
   if (!decision.ok()) co_return decision.status();
@@ -373,7 +464,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   std::vector<HashGroupId> written_ids;
   candidates.reserve(written.size());
   written_ids.reserve(written.size());
-  for (const auto& group : written) {
+  for (std::size_t i = 0; i < written.size(); ++i) {
+    const auto& group = written[i];
     written_ids.push_back(group.id_);
     candidates.push_back({.incarnation_ = plan->root_.incarnation_,
                           .id_ = group.id_,
@@ -381,6 +473,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
                           .txid_ = tx->txid_,
                           .batch_txid_ = command_batch,
                           .field_count_ = group.location_.logical_size_,
+                          .encoded_bytes_ = encoded_sizes[i],
                           .retired_ = group.retired_});
   }
   GroupedHashObject::PreparedHandle builder;

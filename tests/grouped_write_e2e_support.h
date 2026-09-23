@@ -109,6 +109,44 @@ class PrivateDisk {
     return result;
   }
 
+  // A cleanly stopped fixture has durable root writes in command order.
+  // Auxiliary records from older incarnations may remain on disk after a
+  // demotion, so their mere presence cannot identify the current layout.
+  std::optional<bool> LatestRootGrouped(std::string_view wanted) const {
+    std::ifstream input(path_, std::ios::binary);
+    std::vector<std::byte> bytes(kStorageBlockBytes);
+    std::optional<bool> result;
+    std::uint64_t sequence = 0;
+    while (input.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) {
+      BlockHeader block;
+      if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+                                      bytes.data(), kBlockHeaderBytes),
+                                  &block) ||
+          (block.kind_ != BlockKind::kRecords &&
+           block.kind_ != BlockKind::kTransaction))
+        continue;
+      for (std::size_t offset = kBlockHeaderBytes;
+           offset < block.committed_bytes_;) {
+        RecordHeader record;
+        std::string_view key;
+        if (!DecodeRecordHeader(std::span(bytes).subspan(
+                                    offset, block.committed_bytes_ - offset),
+                                &record, &key)) {
+          offset = (offset / kDirectIoAlignment + 1) * kDirectIoAlignment;
+          continue;
+        }
+        if (!record.auxiliary_group_ && key == wanted &&
+            record.mutation_sequence_ >= sequence) {
+          sequence = record.mutation_sequence_;
+          result = record.grouped_;
+        }
+        Check(record.total_disk_bytes_ != 0, "zero record size");
+        offset += record.total_disk_bytes_;
+      }
+    }
+    return result;
+  }
+
  private:
   std::string path_;
   bool preserve_on_failure_ = false;
