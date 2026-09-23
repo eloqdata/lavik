@@ -18,10 +18,10 @@ limitations under the License.
 
 # Lavik
 
-### Redis-class performance. NVMe-scale capacity.
+### In-memory performance. NVMe-backed capacity. Redis-compatible.
 
-Lavik is built around a simple idea: use high-performance NVMe instead of
-DRAM for the data capacity tier, then optimize every layer of the I/O path
+Lavik is built around a simple idea: use high-performance NVMe storage instead 
+of DRAM for the data capacity tier, then optimize every layer of the I/O path
 until disk-resident workloads reach performance territory once reserved for
 in-memory services.
 
