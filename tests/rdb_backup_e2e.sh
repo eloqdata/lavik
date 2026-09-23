@@ -23,12 +23,25 @@ source_pid=
 import_pid=
 
 cleanup() {
+  local result=$?
+  if ((result != 0)); then
+    echo "RDB backup test failed (exit ${result})" >&2
+    for log in "${case_dir}/source.log" "${case_dir}/import.log"; do
+      if [[ -f ${log} ]]; then
+        echo "--- ${log} ---" >&2
+        tail -n 100 "${log}" >&2
+      fi
+    done
+  fi
   if [[ -n ${source_pid} ]]; then kill -KILL "${source_pid}" 2>/dev/null || true; fi
   if [[ -n ${import_pid} ]]; then kill -KILL "${import_pid}" 2>/dev/null || true; fi
   wait 2>/dev/null || true
   rm -rf "${case_dir}"
 }
 trap cleanup EXIT
+# Assertions normally produce no output under errexit. Report the failing
+# command/line before cleanup removes the private server logs.
+trap 'echo "RDB backup failure at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 wait_ready() {
   local port=$1
@@ -171,6 +184,9 @@ truncate -s 1G "${case_dir}/import.data"
   --dbfilename imported.rdb >"${case_dir}/import.log" 2>&1 &
 import_pid=$!
 wait_ready "${import_port}"
+import_commits=$("${redis_cli}" -p "${import_port}" info stats |
+  awk -F: '/^storage_tx_commits_pending:/ {gsub("\r", "", $2); print $2}')
+[[ ${import_commits} == 0 ]]
 import_dirty=$("${redis_cli}" -p "${import_port}" info persistence |
   awk -F: '/^rdb_changes_since_last_save:/ {gsub("\r", "", $2); print $2}')
 [[ ${import_dirty} == 0 ]]

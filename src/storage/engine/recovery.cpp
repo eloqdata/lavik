@@ -595,10 +595,11 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           const std::uint64_t extent_bytes =
               record.logical_size_ +
               (record.key_external_ ? record.key_bytes_ : 0);
-          auto decoded =
-              DecodeManifest(payload_span, extent_bytes,
-                             record.kind_ != RecordKind::kValue ||
-                                 record.value_type_ == ValueType::kString);
+          auto decoded = DecodeManifest(
+              payload_span, extent_bytes,
+              record.kind_ != RecordKind::kValue ||
+                  (record.value_type_ == ValueType::kString &&
+                   !record.grouped_ && !record.auxiliary_group_));
           if (!decoded.ok()) {
             co_return decoded.status();
           }
@@ -639,14 +640,11 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           co_return absl::FailedPreconditionError(
               "storage contains current records in a disabled database");
         }
-        const bool ordered = record.value_type_ == ValueType::kList ||
+        const bool ordered = record.value_type_ == ValueType::kString ||
+                             record.value_type_ == ValueType::kList ||
                              record.value_type_ == ValueType::kSortedSet ||
                              record.value_type_ == ValueType::kStream;
-        const auto ordered_kind = record.value_type_ == ValueType::kList
-                                      ? OrderedCollectionKind::kList
-                                  : record.value_type_ == ValueType::kStream
-                                      ? OrderedCollectionKind::kStream
-                                      : OrderedCollectionKind::kSortedSet;
+        const auto ordered_kind = OrderedKind(record.value_type_);
         std::optional<RecoveredGroupedRoot> grouped_root;
         std::optional<RecoveredHashGroup> auxiliary_group;
         std::optional<RecoveredOrderedGroup> ordered_group;
@@ -682,7 +680,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                   decoded->incarnation_ != auxiliary_group->incarnation_ ||
                   decoded->id_ != auxiliary_group->id_.prefix_ ||
                   decoded->retired_ != auxiliary_group->retired_ ||
-                  decoded->entries_.size() != auxiliary_group->field_count_) {
+                  OrderedGroupSize(*decoded) != auxiliary_group->field_count_) {
                 co_return absl::DataLossError(
                     "ordered page disagrees with its record identity");
               }
@@ -1383,7 +1381,8 @@ Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroups(
     if (!record.grouped_reachable_ || !record.location_.external()) continue;
     // Ordered winners were fully checksummed while resolving their links;
     // there is no reason to read their potentially huge bodies twice.
-    if ((record.location_.value_type() == ValueType::kList ||
+    if ((record.location_.value_type() == ValueType::kString ||
+         record.location_.value_type() == ValueType::kList ||
          record.location_.value_type() == ValueType::kSortedSet ||
          record.location_.value_type() == ValueType::kStream) &&
         IsOrderedPageId(record.auxiliary_group_->id_))

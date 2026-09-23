@@ -28,6 +28,25 @@
 namespace lavik::storage {
 namespace {
 
+TEST(CollectionCompactStream, StringSegmentsEmitRawBytesWithoutFraming) {
+  CollectionPage first{.value_type_ = ValueType::kString,
+                       .elements_ = {std::string(8192, 'a')}};
+  CollectionPage tail{.value_type_ = ValueType::kString,
+                      .elements_ = {std::string("x\0y", 3)}};
+  auto encoder =
+      CollectionCompactEncoder::Create(ValueType::kString, 8195, 8195);
+  ASSERT_TRUE(encoder.ok());
+  std::string bytes;
+  for (auto* page : {&first, &tail}) {
+    ASSERT_TRUE(encoder->StartPage(*page).ok());
+    while (auto part = encoder->Next()) bytes.append(*part);
+  }
+  EXPECT_TRUE(encoder->Finish().ok());
+  EXPECT_EQ(bytes, first.elements_[0] + tail.elements_[0]);
+  EXPECT_FALSE(
+      CollectionCompactEncoder::Create(ValueType::kString, 8194, 8195).ok());
+}
+
 CollectionPage Page(ValueType type) {
   CollectionPage result{.value_type_ = type};
   if (type == ValueType::kHash) {

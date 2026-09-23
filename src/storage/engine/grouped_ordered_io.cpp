@@ -73,7 +73,7 @@ StorageEngine::Impl::WriteOrderedGroupRecordLocked(
   RecordLocation location;
   auto status = co_await WriteRecordLocked(
       store, db_id, key, payload, RecordKind::kValue, type, 0, digest, tx.txid_,
-      revision, false, true, external, key_external, snapshot.entries_.size(),
+      revision, false, true, external, key_external, OrderedGroupSize(snapshot),
       extents, &location, nullptr, &tx, nullptr, nullptr, nullptr, nullptr,
       &partition, &identity);
   if (!status.ok()) {
@@ -138,7 +138,7 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
       loaded = co_await LoadExternalValueLocal(store, location, extents,
-                                               key.size(), nullptr);
+                                               key.size(), nullptr, true);
     } else if (location.block_owner() == store.worker_->id()) {
       loaded = co_await LoadValueLocal(store, db_id, key, location,
                                        original.replication_epoch_, nullptr,
@@ -212,13 +212,14 @@ StorageEngine::Impl::LoadGroupedOrderedValue(
     co_return absl::DataLossError("missing ordered collection view");
   }
   std::vector<OrderedCollectionEntry> result;
+  std::uint64_t logical_size = 0;
   for (const auto& metadata : object->ordered_directory().groups()) {
     auto page = co_await LoadOrderedGroupSnapshot(
         store, partition, db_id, key, digest, object, metadata.id_, pinned);
     if (!page.ok()) co_return page.status();
     if (page->snapshot_.previous_ != metadata.previous_ ||
         page->snapshot_.next_ != metadata.next_ ||
-        page->snapshot_.entries_.size() != metadata.item_count_) {
+        OrderedGroupSize(page->snapshot_) != metadata.item_count_) {
       co_return absl::DataLossError(
           "ordered page links disagree with directory");
     }
@@ -228,11 +229,12 @@ StorageEngine::Impl::LoadGroupedOrderedValue(
           page->snapshot_.entries_.front());
       if (!boundary.ok()) co_return boundary;
     }
+    logical_size += OrderedGroupSize(page->snapshot_);
     for (auto& entry : page->snapshot_.entries_) {
       result.push_back(std::move(entry));
     }
   }
-  if (result.size() != object->ordered_directory().root().item_count_) {
+  if (logical_size != object->ordered_directory().root().item_count_) {
     co_return absl::DataLossError("ordered collection aggregate mismatch");
   }
   co_return result;

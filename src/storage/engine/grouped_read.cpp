@@ -20,6 +20,19 @@
 
 namespace lavik::storage {
 
+absl::Status StorageEngine::Impl::ValidateGroupedRead(
+    WorkerStore::PartitionStore& partition, std::uint8_t db_id,
+    std::string_view key, const RecordIndex::Entry* entry) {
+  if (!entry || !entry->value_.grouped()) return absl::OkStatus();
+  auto object = partition.grouped_objects_[db_id].Lookup(
+      key, GroupedObjectVersion{
+               .root_ = MaterializeIndexLocation(*entry),
+               .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
+               .replication_epoch_ = partition.replication_epoch_,
+               .index_generation_ = partition.grouped_generations_[db_id]});
+  return object.status();
+}
+
 Task<absl::StatusOr<LoadedHashGroup>>
 StorageEngine::Impl::LoadHashGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,

@@ -998,6 +998,23 @@ Task<absl::Status> RedisService::ImportRdb() {
       "unsupported-skipped={}",
       load_rdb_file_, reader->version(), entry_count, imported, expired,
       skipped_count);
+  // A large String restore can acknowledge its grouped root while the
+  // transaction commit remains queued. Wait before recording the imported
+  // baseline, or that later commit will appear as a post-import dirty write.
+  // No client requests are admitted until startup import finishes.
+  while (true) {
+    if (storage_->RuntimeFailureLatched()) {
+      co_return absl::InternalError("storage failed during RDB import commit");
+    }
+    const auto durability = co_await storage_->DurabilityStats();
+    if (durability.tx_commits_pending_ == 0) break;
+    absl::Status slept = co_await bycorf::SleepFor(
+        *ThisWorker().self_, std::chrono::milliseconds(1));
+    if (!slept.ok()) co_return slept;
+  }
+  if (storage_->RuntimeFailureLatched()) {
+    co_return absl::InternalError("storage failed during RDB import commit");
+  }
   // Startup import establishes the persisted baseline; loading the snapshot
   // itself must not make INFO report unsaved changes.
   for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {

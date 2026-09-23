@@ -368,15 +368,6 @@ Task<std::vector<std::uint64_t>> StorageEngine::Impl::ListTxGenerationsLocal(
   co_return generations;
 }
 
-Task<bool> StorageEngine::Impl::TxGenerationHasRecordsLocal(
-    WorkerStore& store, std::uint64_t generation) {
-  co_await store.store_state_mutex_.Lock();
-  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-  const auto runtime = store.tx_generations_.find(generation);
-  co_return runtime != store.tx_generations_.end() &&
-      runtime->second->has_records_;
-}
-
 Task<absl::Status> StorageEngine::Impl::ForgetTxGenerationLocal(
     WorkerStore& store, std::uint64_t generation) {
   co_await store.store_state_mutex_.Lock();
@@ -525,20 +516,39 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
   std::uint64_t current =
       current_tx_generation_.load(std::memory_order_seq_cst);
   bool current_has_records = false;
+  bool draining_leases = false;
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
-    bool local_has_records = false;
+    auto inspect = [this, owner, current]() -> Task<std::pair<bool, bool>> {
+      auto& store = *stores_[owner];
+      co_await store.store_state_mutex_.Lock();
+      UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+      bool has_records = false;
+      bool leased_closed = false;
+      for (const auto& [generation, state] : store.tx_generations_) {
+        if (generation == current) has_records = state->has_records_;
+        if (generation < current &&
+            state->active_transactions_.load(std::memory_order_acquire) != 0)
+          leased_closed = true;
+      }
+      co_return std::pair{has_records, leased_closed};
+    };
+    std::pair<bool, bool> local;
     if (owner == coordinator) {
-      local_has_records =
-          co_await TxGenerationHasRecordsLocal(*stores_[owner], current);
+      local = co_await inspect();
     } else {
-      local_has_records =
-          co_await bycorf::SubmitTaskTo(owner, [this, owner, current]() {
-            return TxGenerationHasRecordsLocal(*stores_[owner], current);
-          });
+      local = co_await bycorf::SubmitTaskTo(owner, inspect);
     }
-    current_has_records |= local_has_records;
+    current_has_records |= local.first;
+    draining_leases |= local.second;
   }
-  if (current_has_records) {
+  // A short cooldown must not manufacture generations faster than accepted
+  // transactions can commit. Each leased generation needs its own append
+  // streams; enough of them can consume every foreground block and strand
+  // their own commit decisions. Keep at most one closed generation with live
+  // leases, while continuing to clean older settled/pinned generations below.
+  // Pins alone do not inhibit rotation: an old snapshot must not stop newer
+  // generations from being reclaimed. No new lease can join a closed id.
+  if (current_has_records && !draining_leases) {
     if (current == std::numeric_limits<std::uint64_t>::max()) {
       co_return absl::OutOfRangeError("transaction generation exhausted");
     }

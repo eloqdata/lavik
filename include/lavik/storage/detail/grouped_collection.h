@@ -34,23 +34,45 @@
 namespace lavik::storage {
 
 // Sets use Hash prefix routing. Ordered pages hold List ranks, Sorted Set
-// (score, member) order, or the binary logical record keys of a Stream.
+// (score, member) order, Stream logical record keys, or fixed String segments.
+// String counts measure bytes; other kinds count entries/logical records.
 enum class OrderedCollectionKind : std::uint8_t {
   kList = 1,
   kSortedSet = 2,
-  kStream = 3
+  kStream = 3,
+  kString = 4
 };
 
-inline ValueType OrderedValueType(OrderedCollectionKind kind) noexcept {
+inline constexpr std::size_t kStringGroupBytes = kCollectionGroupTargetBytes;
+
+// Auxiliary records carry the complete parent key. Keep oversized keys in
+// whole-value storage so segmentation cannot multiply key storage without
+// bound (e.g. repeating a multi-MiB key once per 8 KiB segment).
+inline constexpr bool ShouldGroupString(std::size_t key_bytes,
+                                        std::size_t value_bytes) noexcept {
+  return key_bytes <= kStringGroupBytes &&
+         value_bytes >= kCollectionPromotionBytes;
+}
+
+constexpr ValueType OrderedValueType(OrderedCollectionKind kind) noexcept {
   switch (kind) {
     case OrderedCollectionKind::kList:
       return ValueType::kList;
     case OrderedCollectionKind::kSortedSet:
       return ValueType::kSortedSet;
+    case OrderedCollectionKind::kString:
+      return ValueType::kString;
     case OrderedCollectionKind::kStream:
       return ValueType::kStream;
   }
   return ValueType::kNone;
+}
+
+constexpr OrderedCollectionKind OrderedKind(ValueType type) noexcept {
+  return type == ValueType::kString   ? OrderedCollectionKind::kString
+         : type == ValueType::kStream ? OrderedCollectionKind::kStream
+         : type == ValueType::kList   ? OrderedCollectionKind::kList
+                                      : OrderedCollectionKind::kSortedSet;
 }
 
 struct OrderedCollectionEntry {
@@ -97,6 +119,16 @@ struct OrderedGroupSnapshot {
   bool retired_ = false;
   std::vector<OrderedCollectionEntry> entries_;
 };
+
+// A live String segment owns one raw byte string. Its logical size is the
+// byte count, which lets the shared directory validate aggregate lengths.
+inline std::size_t OrderedGroupSize(
+    const OrderedGroupSnapshot& group) noexcept {
+  return group.kind_ == OrderedCollectionKind::kString
+             ? (group.entries_.empty() ? 0
+                                       : group.entries_.front().value_.size())
+             : group.entries_.size();
+}
 
 inline constexpr std::size_t kOrderedGroupHeaderBytes = 64;
 inline constexpr std::size_t kOrderedCollectionRootBytes = 72;

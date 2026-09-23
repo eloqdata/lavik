@@ -289,6 +289,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       }
       co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
     }
+    const auto readable = ValidateGroupedRead(partition, db_id, key, found);
+    if (!readable.ok()) co_return readable;
     if (IsExpiredNow(*found)) {
       QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
       if (trace != nullptr) {
@@ -366,6 +368,10 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
     if (found == nullptr || found->value_.kind() == RecordKind::kTombstone) {
       continue;
     }
+    if (found->value_.grouped()) {
+      fallbacks.push_back(i);
+      continue;
+    }
     if (IsExpired(*found, now_ms)) {
       QueueExpiredCandidate(store, partition.id_, db_id, *found, request.key_);
       continue;
@@ -377,8 +383,8 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
     }
 
     const RecordLocation location = MaterializeIndexLocation(*found);
-    if (location.external() || location.block_owner() != store.worker_->id() ||
-        location.in_memory()) {
+    if (location.grouped() || location.external() ||
+        location.block_owner() != store.worker_->id() || location.in_memory()) {
       fallbacks.push_back(i);
       continue;
     }
@@ -618,6 +624,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLengthLocked(
     }
     found = *resolved;
   }
+  const auto readable = ValidateGroupedRead(partition, db_id, key, found);
+  if (!readable.ok()) co_return readable;
   const bool expired = found != nullptr && IsExpiredNow(*found);
   if (found == nullptr || found->value_.kind() != RecordKind::kValue ||
       expired) {
@@ -1485,11 +1493,9 @@ StorageEngine::Impl::FindVerifiedEntry(WorkerStore& store, RecordIndex& index,
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
-StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
-                                            const RecordLocation& location,
-                                            ExtentManifest extents,
-                                            std::size_t key_bytes,
-                                            ReadLatencyTrace* trace) {
+StorageEngine::Impl::LoadExternalValueLocal(
+    WorkerStore& store, const RecordLocation& location, ExtentManifest extents,
+    std::size_t key_bytes, ReadLatencyTrace* trace, bool grouped_payload) {
   if (!location.external() || extents == nullptr) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external value has no valid extent manifest");
@@ -1509,7 +1515,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
                            "external key exceeds extent payload");
   }
   const std::uint64_t value_bytes = extent_bytes - key_prefix;
-  if (location.value_type() == ValueType::kString &&
+  if (location.value_type() == ValueType::kString && !grouped_payload &&
       value_bytes != location.logical_size_) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external string length does not match metadata");
@@ -1711,8 +1717,8 @@ StorageEngine::Impl::LoadValueLocal(
                              "record key does not match location");
     }
     const std::size_t value_bytes = record.payload_bytes_ - key_prefix;
-    if (record.value_type_ == ValueType::kString &&
-        value_bytes != record.logical_size_) {
+    if (record.value_type_ == ValueType::kString && !record.grouped_ &&
+        !record.auxiliary_group_ && value_bytes != record.logical_size_) {
       co_return absl::Status(absl::StatusCode::kInternal,
                              "inline value length does not match metadata");
     }
@@ -1806,8 +1812,8 @@ StorageEngine::Impl::LoadValueLocal(
                            "record key does not match location");
   }
   const std::size_t value_bytes = record.payload_bytes_ - key_prefix;
-  if (record.value_type_ == ValueType::kString &&
-      value_bytes != record.logical_size_) {
+  if (record.value_type_ == ValueType::kString && !record.grouped_ &&
+      !record.auxiliary_group_ && value_bytes != record.logical_size_) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "inline value length does not match metadata");
   }

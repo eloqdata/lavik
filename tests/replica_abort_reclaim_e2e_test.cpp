@@ -825,16 +825,80 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
 
   bycorf::Task<absl::Status> WaitForCapacityIncrease(std::uint64_t previous,
                                                      std::string_view failure) {
-    for (unsigned attempt = 0; attempt < 500; ++attempt) {
+    // A grouped String may retain thousands of segment records. Releasing its
+    // pin starts asynchronous promotion/flush/reclaim, not a fixed-latency
+    // operation. Leave room for a cleaner retry and contended CI storage while
+    // keeping the wait bounded well below the test's overall timeout.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    std::uint64_t available = previous;
+    do {
       absl::Status slept =
-          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(1));
+          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(10));
       if (!slept.ok()) co_return slept;
       const auto metrics = co_await storage_->CollectMetrics();
-      if (metrics.devices_.front().available_bytes_ > previous) {
+      available = metrics.devices_.front().available_bytes_;
+      if (available > previous) {
         co_return absl::OkStatus();
       }
+    } while (std::chrono::steady_clock::now() < deadline);
+    const auto cleaner = storage_->TxCleanerStats();
+    co_return absl::FailedPreconditionError(
+        std::string(failure) + ": previous=" + std::to_string(previous) +
+        " available=" + std::to_string(available) +
+        " cleaner_rounds=" + std::to_string(cleaner.rounds_) +
+        " cleaner_failures=" + std::to_string(cleaner.failures_) +
+        " cleaner_retired_blocks=" + std::to_string(cleaner.retired_blocks_));
+  }
+
+  bycorf::Task<absl::Status> WaitForCleanerRound(std::uint64_t previous) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    do {
+      const auto cleaner = storage_->TxCleanerStats();
+      if (cleaner.rounds_ > previous && !cleaner.running_)
+        co_return absl::OkStatus();
+      absl::Status slept =
+          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(10));
+      if (!slept.ok()) co_return slept;
+    } while (std::chrono::steady_clock::now() < deadline);
+    const auto cleaner = storage_->TxCleanerStats();
+    co_return absl::FailedPreconditionError(
+        "transaction cleaner did not attempt pinned generation: previous=" +
+        std::to_string(previous) +
+        " rounds=" + std::to_string(cleaner.rounds_));
+  }
+
+  bycorf::Task<absl::Status> WaitForCleanerIdle() {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (storage_->TxCleanerStats().running_) {
+      if (std::chrono::steady_clock::now() >= deadline)
+        co_return absl::FailedPreconditionError(
+            "transaction cleaner did not become idle");
+      absl::Status slept =
+          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(10));
+      if (!slept.ok()) co_return slept;
     }
-    co_return absl::FailedPreconditionError(std::string(failure));
+    co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::Status> WaitForTxBlockRetirement(std::uint64_t previous) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    do {
+      const auto cleaner = storage_->TxCleanerStats();
+      if (cleaner.retired_blocks_ > previous) co_return absl::OkStatus();
+      absl::Status slept =
+          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(10));
+      if (!slept.ok()) co_return slept;
+    } while (std::chrono::steady_clock::now() < deadline);
+    const auto cleaner = storage_->TxCleanerStats();
+    co_return absl::FailedPreconditionError(
+        "snapshot-pinned transaction generation did not retire: previous=" +
+        std::to_string(previous) +
+        " retired_blocks=" + std::to_string(cleaner.retired_blocks_) +
+        " failures=" + std::to_string(cleaner.failures_));
   }
 
   void CheckRetainedMemory(std::optional<std::uint64_t>& first_retained,
@@ -854,6 +918,14 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
     std::optional<std::uint64_t> first_retained;
 
     for (unsigned round = 0; round < 2; ++round) {
+      // Keep the old value and aborted candidate in one transaction generation.
+      // A later cleaner round cannot retire that generation while the old
+      // snapshot pins its blocks, so candidate cleanup cannot masquerade as
+      // reclamation caused by releasing the pin.
+      Check(storage_->ConfigureTxCleanerCooldown(0).ok(),
+            "failed to disable transaction cleaner for abort fixture");
+      absl::Status idle = co_await WaitForCleanerIdle();
+      if (!idle.ok()) co_return idle;
       const std::uint64_t pin_session = 900 + round;
       const std::uint64_t replica_session = 910 + round;
       const auto capacity_baseline = co_await storage_->CollectMetrics();
@@ -873,12 +945,25 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
       if (!aborted.ok()) co_return aborted;
       Check(!co_await storage_->Exists(kDb, key),
             "replica abort left the candidate key visible");
+      const auto cleaner_before = storage_->TxCleanerStats();
+      Check(storage_->ConfigureTxCleanerCooldown(1).ok(),
+            "failed to restart transaction cleaner for abort fixture");
+      absl::Status attempted =
+          co_await WaitForCleanerRound(cleaner_before.rounds_);
+      if (!attempted.ok()) co_return attempted;
+      const auto cleaner_while_pinned = storage_->TxCleanerStats();
+      Check(cleaner_while_pinned.retired_blocks_ ==
+                cleaner_before.retired_blocks_,
+            "transaction cleaner retired snapshot-pinned generation");
 
       const auto while_pinned = co_await storage_->CollectMetrics();
       Check(while_pinned.devices_.front().available_bytes_ <=
                 capacity_baseline.devices_.front().available_bytes_,
             "replica abort reported pinned retired capacity as available");
       ReleasePinnedValue(pin_session, key, *pinned);
+      absl::Status retired = co_await WaitForTxBlockRetirement(
+          cleaner_while_pinned.retired_blocks_);
+      if (!retired.ok()) co_return retired;
       absl::Status reclaimed = co_await WaitForCapacityIncrease(
           while_pinned.devices_.front().available_bytes_,
           "replica-abort retired capacity did not become reusable");
@@ -951,6 +1036,10 @@ int Run(const std::string& path, lavik::storage::ValueType large_type,
   options.data_files_ = {path};
   options.buffers_.registered_bytes_ = 64 * kMiB;
   options.replication_publish_queue_bytes_ = 16 * kMiB;
+  // Segmented Strings retire transaction blocks, unlike the old extent-only
+  // fixture. Exercise online reclamation without waiting for its 60 s default.
+  options.tx_cleaner_cooldown_ms_ = 1;
+  options.flush_max_ms_ = 10;
   StorageEngine storage(std::move(options));
   lavik::InitWorkerMetrics(1);
   absl::Status memory = lavik::InitMemoryLimit(

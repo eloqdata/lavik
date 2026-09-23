@@ -94,6 +94,7 @@ absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>> CopyManifest(
 bool ValidGroupLocation(const RecordLocation& location) {
   return location.kind() == RecordKind::kValue &&
          (location.value_type() == ValueType::kHash ||
+          location.value_type() == ValueType::kString ||
           location.value_type() == ValueType::kSet ||
           location.value_type() == ValueType::kList ||
           location.value_type() == ValueType::kSortedSet ||
@@ -495,7 +496,109 @@ void VisitPhysical(const NodeHandle& node,
 struct GroupedHashPhysicalState {
   std::shared_ptr<ScanHashMapEntryArena> arena_;
   NodeHandle root_;
+  struct StringPage {
+    // The owner keeps compact RecordIndex entries alive. Direct pointers are
+    // immutable and used only on the key owner, including destruction.
+    NodeHandle owner_;
+    std::array<const RecordIndex::Entry*, kGroupIndexPageEntries> entries_{};
+  };
+  RetainedMemoryCharge string_pages_charge_;
+  std::vector<LocalSharedPtr<const StringPage>> string_pages_;
+  std::size_t string_size_ = 0;
 };
+
+namespace {
+
+// String positions are dense and stable. A paged vector avoids hashing/trie
+// lookup while sharing untouched 64-entry pages with snapshots and undo views.
+absl::Status BuildStringPhysical(GroupedHashPhysicalState& output,
+                                 const GroupedHashPhysicalState* previous,
+                                 std::span<const HashGroupLocation> changed,
+                                 std::size_t count) {
+  using Page = GroupedHashPhysicalState::StringPage;
+  const auto pages =
+      (count + kGroupIndexPageEntries - 1) / kGroupIndexPageEntries;
+  const auto bytes =
+      AllocatorUsableSizeForRequest(pages * sizeof(LocalSharedPtr<const Page>));
+  auto admission = TryReserveMemory(bytes);
+  if (!admission) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM String index vector");
+  }
+  output.string_pages_charge_.Account(
+      output.arena_->allocation_domain().owner_shard_, bytes);
+  output.string_pages_.resize(pages);
+  // The retained charge now owns the vector bytes. Keeping the admission
+  // through page construction would count them twice against maxmemory.
+  admission.reset();
+  output.string_size_ = count;
+  if (previous)
+    std::copy(previous->string_pages_.begin(), previous->string_pages_.end(),
+              output.string_pages_.begin());
+  std::size_t cursor = 0;
+  while (cursor < changed.size()) {
+    const auto page_id =
+        (changed[cursor].id_.prefix_ - 1) / kGroupIndexPageEntries;
+    if (page_id >= pages || !IsOrderedPageId(changed[cursor].id_))
+      return absl::DataLossError("invalid String index position");
+    auto stop = cursor + 1;
+    while (stop < changed.size() &&
+           (changed[stop].id_.prefix_ - 1) / kGroupIndexPageEntries == page_id)
+      ++stop;
+    std::vector<HashGroupLocation> records;
+    const auto first = page_id * kGroupIndexPageEntries;
+    const auto end = std::min(count, first + kGroupIndexPageEntries);
+    records.reserve(end - first);
+    for (auto position = first; position < end; ++position) {
+      if (cursor < stop && changed[cursor].id_.prefix_ == position + 1) {
+        records.push_back(changed[cursor++]);
+      } else if (previous && position < previous->string_size_) {
+        const auto& page = *previous->string_pages_[page_id];
+        const auto* entry = page.entries_[position % kGroupIndexPageEntries];
+        records.push_back(
+            {.id_ = {position + 1, 0},
+             .location_ =
+                 RecordIndexEntryPolicy::Load(entry->value_, nullptr, 1, 0),
+             .extents_ = ManifestFor(*page.owner_->page_, {position + 1, 0})});
+      } else
+        return absl::DataLossError("missing String index segment");
+    }
+    auto owner = BuildPhysical(records, 0, output.arena_);
+    if (!owner.ok()) return owner.status();
+    auto page = AllocateLocalObject<Page>(output.arena_);
+    if (!page.ok()) return page.status();
+    (*page)->owner_ = std::move(*owner);
+    for (const auto& record : records) {
+      const auto key = GroupKey(record.id_);
+      const std::string_view view(key.data(), key.size());
+      (*page)->entries_[(record.id_.prefix_ - 1) % kGroupIndexPageEntries] =
+          (*page)->owner_->page_->locations_.Find(ComputeDigest(view), view);
+    }
+    output.string_pages_[page_id] = std::move(*page);
+  }
+  return absl::OkStatus();
+}
+
+absl::Status BuildPhysicalState(GroupedHashPhysicalState& output,
+                                const GroupedHashPhysicalState* previous,
+                                std::span<const HashGroupLocation> changed) {
+  if ((!changed.empty() &&
+       changed.front().location_.value_type() == ValueType::kString) ||
+      (previous && previous->string_size_ != 0)) {
+    const auto count =
+        std::max<std::size_t>(previous ? previous->string_size_ : 0,
+                              changed.empty() ? 0 : changed.back().id_.prefix_);
+    return BuildStringPhysical(output, previous, changed, count);
+  }
+  auto root = previous
+                  ? UpdatePhysical(previous->root_, changed, 0, output.arena_)
+                  : BuildPhysical(changed, 0, output.arena_);
+  if (!root.ok()) return root.status();
+  output.root_ = std::move(*root);
+  return absl::OkStatus();
+}
+
+}  // namespace
 
 bool GroupedObjectVersion::Matches(
     const GroupedObjectVersion& other) const noexcept {
@@ -593,12 +696,11 @@ GroupedHashObject::PrepareCreate(GroupedObjectVersion version,
       return absl::DataLossError("group extent aliases a records block");
     }
   }
-  auto physical_root = BuildPhysical(records, 0, arena);
-  if (!physical_root.ok()) return physical_root.status();
   auto physical = AllocateObject<GroupedHashPhysicalState>(arena);
   if (!physical.ok()) return physical.status();
   (*physical)->arena_ = arena;
-  (*physical)->root_ = std::move(*physical_root);
+  const auto built = BuildPhysicalState(**physical, nullptr, records);
+  if (!built.ok()) return built;
   auto owned_directory = OwnDirectory(std::move(directory), arena);
   if (!owned_directory.ok()) return owned_directory.status();
   auto object = AllocateObject<GroupedHashObject>(arena);
@@ -663,12 +765,12 @@ GroupedHashObject::PrepareUpdate(
     return absl::DataLossError(
         "group update omits a split retirement or child");
   }
-  auto updated = UpdatePhysical(expected->physical_->root_, changed, 0, arena);
-  if (!updated.ok()) return updated.status();
   auto physical = AllocateObject<GroupedHashPhysicalState>(arena);
   if (!physical.ok()) return physical.status();
   (*physical)->arena_ = arena;
-  (*physical)->root_ = std::move(*updated);
+  const auto built =
+      BuildPhysicalState(**physical, expected->physical_.get(), changed);
+  if (!built.ok()) return built;
   auto owned_directory = OwnDirectory(std::move(directory), arena);
   if (!owned_directory.ok()) return owned_directory.status();
   auto object = AllocateObject<GroupedHashObject>(arena);
@@ -758,12 +860,11 @@ GroupedHashObject::PrepareCreateOrdered(
       return absl::DataLossError("group extent aliases a records block");
     }
   }
-  auto physical_root = BuildPhysical(records, 0, arena);
-  if (!physical_root.ok()) return physical_root.status();
   auto physical = AllocateObject<GroupedHashPhysicalState>(arena);
   if (!physical.ok()) return physical.status();
   (*physical)->arena_ = arena;
-  (*physical)->root_ = std::move(*physical_root);
+  const auto built = BuildPhysicalState(**physical, nullptr, records);
+  if (!built.ok()) return built;
   auto owned_directory = OwnDirectory(std::move(directory), arena);
   if (!owned_directory.ok()) return owned_directory.status();
   auto object = AllocateObject<GroupedHashObject>(arena);
@@ -843,12 +944,12 @@ GroupedHashObject::PrepareUpdateOrdered(
     return absl::DataLossError(
         "group update omits a split retirement or child");
   }
-  auto updated = UpdatePhysical(expected->physical_->root_, changed, 0, arena);
-  if (!updated.ok()) return updated.status();
   auto physical = AllocateObject<GroupedHashPhysicalState>(arena);
   if (!physical.ok()) return physical.status();
   (*physical)->arena_ = arena;
-  (*physical)->root_ = std::move(*updated);
+  const auto built =
+      BuildPhysicalState(**physical, expected->physical_.get(), changed);
+  if (!built.ok()) return built;
   auto owned_directory = OwnDirectory(std::move(directory), arena);
   if (!owned_directory.ok()) return owned_directory.status();
   auto object = AllocateObject<GroupedHashObject>(arena);
@@ -1005,13 +1106,12 @@ absl::StatusOr<GroupedHashObject::Handle> GroupedHashObject::RelocateGroup(
     if (!owned.ok()) return owned.status();
     changed.extents_ = std::move(*owned);
   }
-  auto updated = UpdatePhysical(expected->physical_->root_,
-                                std::span(&changed, 1), 0, arena);
-  if (!updated.ok()) return updated.status();
   auto physical = AllocateObject<GroupedHashPhysicalState>(arena);
   if (!physical.ok()) return physical.status();
   (*physical)->arena_ = arena;
-  (*physical)->root_ = std::move(*updated);
+  const auto built = BuildPhysicalState(**physical, expected->physical_.get(),
+                                        std::span(&changed, 1));
+  if (!built.ok()) return built;
   auto object = AllocateObject<GroupedHashObject>(arena);
   if (!object.ok()) return object.status();
   (*object)->version_ = expected->version_;
@@ -1042,6 +1142,13 @@ const RecordIndex::Entry* GroupedHashObject::FindGroup(HashGroupId id) const {
 }
 
 const RecordIndex::Entry* GroupedHashObject::FindRecord(HashGroupId id) const {
+  if (physical_->string_size_) {
+    if (!IsOrderedPageId(id) || id.prefix_ > physical_->string_size_)
+      return nullptr;
+    const auto index = id.prefix_ - 1;
+    return physical_->string_pages_[index / kGroupIndexPageEntries]
+        ->entries_[index % kGroupIndexPageEntries];
+  }
   if (!(is_ordered() && IsOrderedPageId(id)) &&
       (!id.valid() || (is_ordered() && !has_member_index())))
     return nullptr;
@@ -1054,6 +1161,13 @@ const RecordIndex::Entry* GroupedHashObject::FindRecord(HashGroupId id) const {
 
 std::shared_ptr<const std::vector<ExtentRef>> GroupedHashObject::ExtentsFor(
     HashGroupId id) const {
+  if (physical_->string_size_) {
+    if (!IsOrderedPageId(id) || id.prefix_ > physical_->string_size_)
+      return nullptr;
+    const auto& page =
+        physical_->string_pages_[(id.prefix_ - 1) / kGroupIndexPageEntries];
+    return ManifestFor(*page->owner_->page_, id);
+  }
   if (!(is_ordered() && IsOrderedPageId(id)) &&
       (!id.valid() || (is_ordered() && !has_member_index())))
     return nullptr;
@@ -1062,6 +1176,7 @@ std::shared_ptr<const std::vector<ExtentRef>> GroupedHashObject::ExtentsFor(
 }
 
 std::size_t GroupedHashObject::record_count() const noexcept {
+  if (physical_->string_size_) return physical_->string_size_;
   return physical_->root_ ? physical_->root_->size_ : 0;
 }
 
@@ -1075,6 +1190,15 @@ bool GroupedHashObject::SameLogicalRoot(
 }
 
 void GroupedHashObject::ForEachRecord(const RecordVisitor& visitor) const {
+  if (physical_->string_size_) {
+    for (std::size_t i = 0; i < physical_->string_size_; ++i) {
+      const auto& page = physical_->string_pages_[i / kGroupIndexPageEntries];
+      const HashGroupId id{i + 1, 0};
+      visitor(id, *page->entries_[i % kGroupIndexPageEntries],
+              ManifestFor(*page->owner_->page_, id), false);
+    }
+    return;
+  }
   VisitPhysical(physical_->root_, visitor);
 }
 

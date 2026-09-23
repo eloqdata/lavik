@@ -49,7 +49,8 @@ std::uint64_t Load(std::string_view bytes, std::size_t offset, unsigned width) {
 }
 
 bool ValidKind(OrderedCollectionKind kind) {
-  return kind == OrderedCollectionKind::kList ||
+  return kind == OrderedCollectionKind::kString ||
+         kind == OrderedCollectionKind::kList ||
          kind == OrderedCollectionKind::kSortedSet ||
          kind == OrderedCollectionKind::kStream;
 }
@@ -58,6 +59,13 @@ bool ValidRoot(const OrderedCollectionRoot& root) {
   if ((root.kind_ == OrderedCollectionKind::kStream) !=
           root.stream_length_.has_value() ||
       (root.stream_length_ && *root.stream_length_ > UINT32_MAX))
+    return false;
+  if (root.kind_ == OrderedCollectionKind::kString &&
+      (root.item_count_ > kMaxStringBytes || root.first_group_ != 1 ||
+       root.group_count_ !=
+           (root.item_count_ + kStringGroupBytes - 1) / kStringGroupBytes ||
+       root.last_group_ != root.group_count_ ||
+       root.next_group_id_ != root.last_group_ + 1))
     return false;
   if (root.member_index_ &&
       (root.kind_ != OrderedCollectionKind::kSortedSet ||
@@ -121,6 +129,16 @@ absl::StatusOr<std::size_t> ValidateGroup(const OrderedGroupSnapshot& group) {
   }
   auto status = ValidateEntries(group.kind_, group.entries_);
   if (!status.ok()) return status;
+  if (group.kind_ == OrderedCollectionKind::kString) {
+    const auto size = OrderedGroupSize(group);
+    if (group.retired_ ||
+        (group.entries_.size() != 1 || size == 0 || size > kStringGroupBytes ||
+         group.previous_ != group.id_ - 1 ||
+         (group.next_ != 0 &&
+          (group.next_ != group.id_ + 1 || size != kStringGroupBytes))))
+      return absl::InvalidArgumentError("invalid fixed String segment");
+    return kOrderedGroupHeaderBytes + size;
+  }
   std::size_t bytes = kOrderedGroupHeaderBytes;
   for (const auto& entry : group.entries_) {
     if (bytes > kMaxRecordPayloadBytes - kEntryHeaderBytes ||
@@ -184,7 +202,7 @@ absl::StatusOr<std::string> EncodeOrderedCollectionRoot(
   bytes.replace(0, kRootMagic.size(), kRootMagic);
   Store(bytes, 8, 1, 4);
   Store(bytes, 12, static_cast<unsigned>(root.kind_), 1);
-  // Both shapes are v1. An explicit presence flag, rather than length alone,
+  // All shapes are v1. An explicit presence flag, rather than length alone,
   // prevents a truncated indexed root from becoming a valid ordered-only root.
   Store(bytes, 13, root.member_index_ ? 1 : root.stream_length_ ? 2 : 0, 1);
   Store(bytes, 16, root.incarnation_, 8);
@@ -254,7 +272,7 @@ absl::StatusOr<OrderedGroupEncoder> OrderedGroupEncoder::Create(
   Store(bytes, 24, group.id_, 8);
   Store(bytes, 32, group.previous_, 8);
   Store(bytes, 40, group.next_, 8);
-  Store(bytes, 48, group.entries_.size(), 4);
+  Store(bytes, 48, OrderedGroupSize(group), 4);
   Store(bytes, 52, *size, 4);
   return encoder;
 }
@@ -267,6 +285,10 @@ std::optional<std::string_view> OrderedGroupEncoder::Next() noexcept {
   }
   if (entry_ == group_->entries_.size()) return std::nullopt;
   const auto& entry = group_->entries_[entry_];
+  if (group_->kind_ == OrderedCollectionKind::kString) {
+    ++entry_;
+    return entry.value_;
+  }
   if (phase_ == 1) {
     phase_ = 2;
     Store(entry_header_, 0, entry.value_.size(), 4);
@@ -306,6 +328,16 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(
       .retired_ = Load(bytes, 13, 1) != 0,
       .entries_ = {}};
   const auto count = Load(bytes, 48, 4);
+  if (group.kind_ == OrderedCollectionKind::kString) {
+    if (count != bytes.size() - kOrderedGroupHeaderBytes)
+      return absl::DataLossError("String segment length mismatch");
+    if (!group.retired_)
+      group.entries_.push_back(
+          {.value_ = std::string(bytes.substr(kOrderedGroupHeaderBytes))});
+    auto valid = ValidateGroup(group);
+    if (!valid.ok()) return absl::DataLossError(valid.status().message());
+    return group;
+  }
   if (count > (bytes.size() - kOrderedGroupHeaderBytes) / kEntryHeaderBytes)
     return absl::DataLossError("ordered page count exceeds its payload");
   group.entries_.reserve(count);
@@ -354,10 +386,20 @@ absl::StatusOr<OrderedGroupMetadata> DecodeOrderedGroupMetadata(
            ? (result.item_count_ != 0 || result.previous_ != 0 ||
               result.next_ != 0 || encoded_bytes != kOrderedGroupHeaderBytes)
            : result.item_count_ == 0) ||
-      result.item_count_ >
-          (encoded_bytes - kOrderedGroupHeaderBytes) / kEntryHeaderBytes) {
+      (result.kind_ != OrderedCollectionKind::kString &&
+       result.item_count_ >
+           (encoded_bytes - kOrderedGroupHeaderBytes) / kEntryHeaderBytes)) {
     return absl::DataLossError("invalid ordered page envelope identity/count");
   }
+  if (result.kind_ == OrderedCollectionKind::kString &&
+      (result.retired_ ||
+       result.item_count_ != encoded_bytes - kOrderedGroupHeaderBytes ||
+       result.item_count_ > kStringGroupBytes ||
+       (!result.retired_ &&
+        (result.previous_ != result.id_ - 1 ||
+         (result.next_ != 0 && (result.next_ != result.id_ + 1 ||
+                                result.item_count_ != kStringGroupBytes))))))
+    return absl::DataLossError("invalid String segment envelope");
   return result;
 }
 
@@ -396,6 +438,10 @@ absl::Status OrderedGroupMetadataDecoder::Read(std::string_view bytes) {
       }
       metadata_ = *metadata;
       envelope_ready_ = true;
+      if (metadata_.kind_ == OrderedCollectionKind::kString) {
+        entries_ = metadata_.item_count_;
+        member_remaining_ = metadata_.item_count_;
+      }
       continue;
     }
     const auto length = Load(header, 0, 4);
@@ -435,7 +481,7 @@ absl::Status ValidateOrderedEntryBoundary(OrderedCollectionKind kind,
     // appear ordered across a page boundary.
     if (*last >= *first)
       return absl::DataLossError("Stream pages overlap or are unordered");
-  } else if (kind != OrderedCollectionKind::kList &&
+  } else if (kind == OrderedCollectionKind::kSortedSet &&
              !OrderedEntryLess(left, right)) {
     return absl::DataLossError("Sorted Set pages overlap or are unordered");
   }
@@ -512,8 +558,10 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
   result.command_sequence_ =
       command_sequence == 0 ? root_sequence : command_sequence;
   result.groups_.reserve(winners.size());
-  result.ends_.reserve(winners.size());
-  result.ids_.reserve(winners.size());
+  if (root.kind_ != OrderedCollectionKind::kString) {
+    result.ends_.reserve(winners.size());
+    result.ids_.reserve(winners.size());
+  }
   std::uint64_t id = root.first_group_;
   std::uint64_t previous = 0;
   std::uint64_t count = 0;
@@ -524,14 +572,21 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
       return absl::DataLossError("broken ordered page chain or count");
     }
     const auto& group = found->second;
+    if (root.kind_ == OrderedCollectionKind::kString &&
+        (group.id_ != result.groups_.size() + 1 ||
+         group.item_count_ != std::min<std::uint64_t>(
+                                  kStringGroupBytes, root.item_count_ - count)))
+      return absl::DataLossError("String segment position/length mismatch");
     if (root.kind_ == OrderedCollectionKind::kSortedSet &&
         !result.groups_.empty() &&
         result.groups_.back().max_score_ > group.min_score_)
       return absl::DataLossError("unordered recovered Sorted Set score bounds");
-    result.ids_.emplace_back(group.id_, result.groups_.size());
+    if (root.kind_ != OrderedCollectionKind::kString)
+      result.ids_.emplace_back(group.id_, result.groups_.size());
     result.groups_.push_back(group);
     count += group.item_count_;
-    result.ends_.push_back(count);
+    if (root.kind_ != OrderedCollectionKind::kString)
+      result.ends_.push_back(count);
     previous = id;
     id = group.next_;
     winners.erase(found);  // Also detects a cycle without a second set.
@@ -546,6 +601,8 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
 
 const RecoveredOrderedGroup* OrderedGroupDirectory::Find(
     std::uint64_t id) const noexcept {
+  if (root_.kind_ == OrderedCollectionKind::kString)
+    return id != 0 && id <= groups_.size() ? &groups_[id - 1] : nullptr;
   const auto found = std::lower_bound(
       ids_.begin(), ids_.end(), id,
       [](const auto& item, auto target) { return item.first < target; });
@@ -571,6 +628,39 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       revision <= sequence_ || command_sequence < command_sequence_ ||
       root.next_group_id_ < root_.next_group_id_) {
     return absl::FailedPreconditionError("stale ordered directory update");
+  }
+  if (root.kind_ == OrderedCollectionKind::kString) {
+    if (!ValidRoot(root) || !member_changes.empty() ||
+        root.item_count_ < root_.item_count_)
+      return absl::DataLossError("invalid String directory update");
+    OrderedGroupDirectory result;
+    result.root_ = root;
+    result.root_.revision_ = revision;
+    result.sequence_ = revision;
+    result.command_sequence_ = command_sequence;
+    result.groups_ = groups_;
+    result.groups_.resize(root.group_count_);
+    for (auto item : changed) {
+      if (item.id_ == 0 || item.id_ > root.group_count_ || item.retired_ ||
+          item.incarnation_ != root.incarnation_ ||
+          item.sequence_ != revision ||
+          result.groups_[item.id_ - 1].sequence_ == revision)
+        return absl::DataLossError("invalid changed String segment");
+      item.txid_ = 0;
+      item.batch_txid_ = 0;
+      result.groups_[item.id_ - 1] = item;
+    }
+    for (std::size_t i = 0; i < result.groups_.size(); ++i) {
+      const auto& item = result.groups_[i];
+      if (item.id_ != i + 1 || item.previous_ != i ||
+          item.next_ != (i + 1 == result.groups_.size() ? 0 : i + 2) ||
+          item.item_count_ != std::min<std::uint64_t>(
+                                  kStringGroupBytes,
+                                  root.item_count_ - i * kStringGroupBytes) ||
+          item.record_token_ == 0 || item.sequence_ == 0 || item.lsn_ == 0)
+        return absl::DataLossError("incomplete String segment update");
+    }
+    return result;
   }
   std::vector<RecoveredOrderedGroup> candidates;
   candidates.reserve(groups_.size() + retired_.size() + changed.size());
@@ -610,6 +700,8 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
 std::optional<OrderedGroupDirectory::Position> OrderedGroupDirectory::FindRank(
     std::uint64_t rank) const noexcept {
   if (rank >= root_.item_count_) return std::nullopt;
+  if (root_.kind_ == OrderedCollectionKind::kString)
+    return Position{rank / kStringGroupBytes, rank % kStringGroupBytes};
   const auto found = std::upper_bound(ends_.begin(), ends_.end(), rank);
   const std::size_t index = found - ends_.begin();
   return Position{index, rank - (index == 0 ? 0 : ends_[index - 1])};

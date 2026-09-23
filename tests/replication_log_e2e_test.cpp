@@ -226,6 +226,12 @@ class ReplicationLogService final : public bycorf::Service {
 
   void Stop() noexcept override {}
 
+  // Snapshot views retain owner-local index pages even on an early test
+  // failure. Match the production service's worker-affine teardown.
+  void FinalizeWorker(bycorf::Worker& worker) noexcept override {
+    storage_->FinalizeWorker(worker);
+  }
+
   const absl::Status& result() const noexcept { return result_; }
 
  private:
@@ -594,9 +600,11 @@ class ReplicationLogService final : public bycorf::Service {
         co_await lavik::ExecuteBitOpCommand(*request, builder);
     const absl::Status restored = lavik::InitMemoryLimit(512 * kMiB, 1);
     if (!restored.ok()) co_return restored;
-    constexpr std::string_view kExpected =
-        "-OOM command not allowed when used memory > 'maxmemory'.\r\n";
-    if (reply.encoded_ != kExpected) {
+    // Grouped input materialization has its own admitted scratch, so it can
+    // reject before the output payload reservation. Both must report OOM and
+    // leave the destination untouched; the diagnostic text is not the API.
+    if (!reply.encoded_.starts_with("-OOM ") ||
+        !reply.encoded_.ends_with("\r\n")) {
       co_return absl::FailedPreconditionError(
           "BITOP payload admission returned '" + std::string(reply.encoded_) +
           "' instead of a Redis OOM error");
@@ -1243,17 +1251,20 @@ class ReplicationLogService final : public bycorf::Service {
                   10 * kMiB,
           "large full-sync override was copied into the batch vector");
     const auto& streamed_record = streamed_override->records_.front();
-    auto first_chunk = co_await storage_->ReadFullSyncValueChunk(
-        kDiskBackedOverrideSession, partition_id, streamed_record.source_id_, 0,
-        lavik::storage::kReplicationTransferBytes);
-    if (!first_chunk.ok()) co_return first_chunk.status();
-    auto last_chunk = co_await storage_->ReadFullSyncValueChunk(
-        kDiskBackedOverrideSession, partition_id, streamed_record.source_id_,
-        9 * kMiB, lavik::storage::kReplicationTransferBytes);
-    if (!last_chunk.ok()) co_return last_chunk.status();
-    Check(first_chunk->size() == 2 * kMiB && last_chunk->size() == kMiB &&
-              first_chunk->front() == 'z' && last_chunk->back() == 'z',
-          "large full-sync override did not stream bounded chunks");
+    // Grouped sources are bounded sequential encoders, not seekable extents.
+    // Read every byte, including a short final chunk, just like native FULL.
+    constexpr std::size_t kChunkBytes = 3 * kMiB;
+    for (std::uint64_t offset = 0; offset < 10 * kMiB;) {
+      auto chunk = co_await storage_->ReadFullSyncValueChunk(
+          kDiskBackedOverrideSession, partition_id, streamed_record.source_id_,
+          offset, kChunkBytes);
+      if (!chunk.ok()) co_return chunk.status();
+      Check(chunk->size() ==
+                    std::min<std::uint64_t>(kChunkBytes, 10 * kMiB - offset) &&
+                chunk->find_first_not_of('z') == std::string::npos,
+            "large full-sync override did not stream bounded chunks");
+      offset += chunk->size();
+    }
     storage_->AcknowledgePartitionFullSyncOverrides(
         kDiskBackedOverrideSession, partition_id, streamed_override->records_);
     storage_->EndPartitionReplication(kDiskBackedOverrideSession, partition_id);
@@ -1435,7 +1446,11 @@ class ReplicationLogService final : public bycorf::Service {
   bycorf::Task<absl::Status> ExercisePartitionHandoff() {
     constexpr std::uint64_t kSession = 404;
     constexpr std::uint8_t kDb = 4;
-    const std::string key = "fullsync-handoff{ordered}";
+    // This case measures retained command payload/backpressure. A grouped
+    // standalone write publishes a bounded after-image ticket instead, so
+    // retain whole-value String storage with an oversized parent key.
+    const std::string key =
+        std::string(8193, 'k') + "fullsync-handoff{ordered}";
     const std::uint16_t partition_id = lavik::storage::RedisSlot(key);
 
     auto fullsync_session = storage_->BeginFullSyncSession(kSession);
@@ -1511,11 +1526,16 @@ class ReplicationLogService final : public bycorf::Service {
     Check(large_queued->size() == 1,
           "large covered-key command did not enter full-sync queue");
     const auto queued_info = storage_->LocalReplicationLogInfo();
-    Check(queued_info.fullsync_session_count_ == 1 &&
-              queued_info.fullsync_publish_queue_bytes_ >= 700 * 1024 &&
-              queued_info.fullsync_publish_queue_capacity_bytes_ == kMiB,
-          "full-sync queue occupancy metrics do not describe the active "
-          "session");
+    Check(
+        queued_info.fullsync_session_count_ == 1 &&
+            queued_info.fullsync_publish_queue_bytes_ >= 700 * 1024 &&
+            queued_info.fullsync_publish_queue_capacity_bytes_ == kMiB,
+        "full-sync queue occupancy metrics do not describe the active "
+        "session: sessions=" +
+            std::to_string(queued_info.fullsync_session_count_) + " bytes=" +
+            std::to_string(queued_info.fullsync_publish_queue_bytes_) +
+            " capacity=" +
+            std::to_string(queued_info.fullsync_publish_queue_capacity_bytes_));
     std::uint16_t unstarted_partition =
         static_cast<std::uint16_t>((partition_id + storage_->worker_count()) %
                                    lavik::storage::kLogicalStorageShards);

@@ -417,6 +417,7 @@ add_library(lavik_module
   src/storage/engine/grouped_write.cpp
   src/storage/engine/grouped_read.cpp
   src/storage/engine/grouped_ordered_io.cpp
+  src/storage/engine/grouped_string.cpp
   src/storage/engine/grouped_list.cpp
   src/storage/engine/grouped_zset.cpp
   src/storage/engine/grouped_zset_members.cpp

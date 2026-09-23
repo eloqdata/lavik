@@ -187,6 +187,8 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
     }
   }
   bool exists = found != nullptr && found->value_.kind() == RecordKind::kValue;
+  const auto readable = ValidateGroupedRead(partition, db_id, key, found);
+  if (!readable.ok()) co_return readable;
   // Expiry metadata is out-of-line and uncommon in the no-TTL workload. Do
   // not read wall time for the ordinary overwrite path; it is irrelevant when
   // the index entry cannot expire.
@@ -1767,6 +1769,20 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   if (!ValidRecordKeySize(key.size())) {
     co_return absl::OutOfRangeError("record key exceeds storage limit");
   }
+  // Ordinary full String writes enter the same grouped publication boundary
+  // as incremental segment writes. Compensation retains its saved layout and
+  // undo receipt; grouped compensation has its own graph restore path.
+  if (!grouped && !replacement_undo && kind == RecordKind::kValue &&
+      value_type == ValueType::kString &&
+      ShouldGroupString(key.size(), value.size())) {
+    assert(!commit_retirements && !committed_sequence);
+    if (logical_size != value.size())
+      co_return absl::InvalidArgumentError(
+          "String length does not match metadata");
+    co_return co_await WriteGroupedStringLocked(
+        store, partition, db_id, key, digest, value, expire_at_ms, tx,
+        replication, mutation_precondition);
+  }
   std::optional<ExplicitWriteRoot> replica_write_root;
   std::optional<std::uint64_t> replica_mutation_sequence;
   if (replica_loading_.load(std::memory_order_acquire)) [[unlikely]] {
@@ -2316,12 +2332,14 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   if (group != nullptr &&
       (kind != RecordKind::kValue ||
        (value_type != ValueType::kHash && value_type != ValueType::kSet &&
-        value_type != ValueType::kList && value_type != ValueType::kSortedSet &&
+        value_type != ValueType::kString && value_type != ValueType::kList &&
+        value_type != ValueType::kSortedSet &&
         value_type != ValueType::kStream) ||
        mutation_sequence == 0 ||
        (auxiliary &&
         (group->incarnation_ == 0 ||
-         ((value_type == ValueType::kList || value_type == ValueType::kStream ||
+         ((value_type == ValueType::kString || value_type == ValueType::kList ||
+           value_type == ValueType::kStream ||
            (value_type == ValueType::kSortedSet && IsOrderedPageId(group->id_)))
               ? (group->id_.prefix_ == 0 || group->id_.bits_ != 0)
               : !group->id_.valid()) ||
@@ -2389,14 +2407,15 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       extent_bytes += ref.payload_bytes_;
     }
     const bool exact_extent_bytes =
-        kind != RecordKind::kValue || value_type == ValueType::kString;
+        kind != RecordKind::kValue ||
+        (value_type == ValueType::kString && !group);
     if (extent_bytes < key_prefix ||
         (exact_extent_bytes && extent_bytes != key_prefix + logical_size)) {
       co_return absl::Status(absl::StatusCode::kInvalidArgument,
                              "external payload length mismatch");
     }
   } else if (kind == RecordKind::kValue && value_type == ValueType::kString &&
-             value.size() != logical_size) {
+             !group && value.size() != logical_size) {
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "inline string length mismatch");
   }
@@ -2438,6 +2457,24 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     co_return absl::InvalidArgumentError(
         "transaction record has no generation lease");
   }
+  // Several acknowledged segment batches can still await their decisions.
+  // Reserve direct-I/O pages for all local generation leases, not just the
+  // current command: flushing a decision consumes the remainder of its page.
+  // Include an extra nested/outer pair for a borrowed cross-worker receipt.
+  // Recompute after waits, when another writer may have acquired a lease.
+  auto append_limit = [&]() -> std::uint64_t {
+    if (!transaction_append || group == nullptr ||
+        value_type != ValueType::kString)
+      return kStorageBlockBytes;
+    const auto runtime = store.tx_generations_.find(tx_generation);
+    const auto leases = runtime == store.tx_generations_.end()
+                            ? 0
+                            : runtime->second->active_transactions_.load(
+                                  std::memory_order_acquire);
+    const auto pages = std::min<std::uint64_t>(
+        leases + 1, kStorageBlockBytes / (2 * kDirectIoAlignment));
+    return kStorageBlockBytes - pages * 2 * kDirectIoAlignment;
+  };
   const BlockKind append_block_kind =
       transaction_append ? BlockKind::kTransaction : BlockKind::kRecords;
   LAVIK_FAULT_INJECT(
@@ -2485,7 +2522,10 @@ acquire_active_stream:
   if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
   while (!active_stream().has_value() ||
          active_stream()->committed_bytes_ + total_disk_bytes >
-             kStorageBlockBytes) {
+             append_limit()) {
+    if (total_disk_bytes + kBlockHeaderBytes > append_limit())
+      co_return absl::ResourceExhaustedError(
+          "transaction decisions occupy segment append capacity");
     // Waiting for a physical block must not hold store_state_mutex_: the
     // allocator, flush completion, and the elected writer may all need this
     // worker's state before the new stream can be published. The gate is per
@@ -2501,13 +2541,17 @@ acquire_active_stream:
       // reached the front. Reuse it instead of allocating a spare block.
       if (active_stream().has_value() &&
           active_stream()->committed_bytes_ + total_disk_bytes <=
-              kStorageBlockBytes) {
+              append_limit()) {
         continue;
       }
     }
     if (active_stream().has_value()) {
       RequestFlush(store, active_stream()->block_id_);
-      active_stream().reset();
+      // Keep a transaction tail appendable until a successor allocation
+      // succeeds. A failed segmented write still needs an outer commit to
+      // retire abandoned auxiliaries. Ordinary streams may seal immediately
+      // so allocation pressure can reclaim their old block as before.
+      if (!transaction_append) active_stream().reset();
     }
     absl::StatusOr<ReservedBlock> allocated{
         absl::UnavailableError("no standby block is available")};
@@ -2523,14 +2567,18 @@ acquire_active_stream:
     if (!allocated.ok()) {
       co_return allocated.status();
     }
-    // Another writer may have installed an active block while this coroutine
-    // had store_state_mutex released. This is now limited to maintenance paths
-    // that deliberately retain store_state_mutex across an atomic rewrite;
-    // ordinary writers for this stream are held behind allocation_mutex.
-    if (active_stream().has_value()) {
+    // Recheck after allocation released the store lock: a maintenance path
+    // may have installed a successor, or another writer consumed the tail.
+    if (active_stream().has_value() &&
+        active_stream()->committed_bytes_ + total_disk_bytes <=
+            append_limit()) {
       absl::Status returned = co_await return_reserved(*allocated);
       if (!returned.ok()) co_return returned;
       continue;
+    }
+    if (active_stream().has_value()) {
+      RequestFlush(store, active_stream()->block_id_);
+      active_stream().reset();
     }
     {
       std::uint16_t write_buffer_id = 0;
@@ -2766,8 +2814,7 @@ acquire_active_stream:
   // this coroutine is suspended. Re-enter allocation before dereferencing the
   // optional or appending to a replacement block that no longer has room.
   if (!active_stream().has_value() ||
-      active_stream()->committed_bytes_ + total_disk_bytes >
-          kStorageBlockBytes) {
+      active_stream()->committed_bytes_ + total_disk_bytes > append_limit()) {
     goto acquire_active_stream;
   }
   const bool has_index_extra = expire_at_ms != 0;

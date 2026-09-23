@@ -160,7 +160,8 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
   constexpr std::size_t kPerEntryBudget =
       sizeof(HashEntry) + sizeof(CollectionField) + 128;
   constexpr std::size_t kPageOverhead = 4096;
-  const auto count = location.logical_size_;
+  const auto count =
+      location.value_type() == ValueType::kString ? 1 : location.logical_size_;
   if (payload_bytes > std::numeric_limits<std::size_t>::max() - kPageOverhead ||
       count > (std::numeric_limits<std::size_t>::max() - payload_bytes -
                kPageOverhead) /
@@ -182,6 +183,7 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
           object, id.prefix_, true);
       if (!decoded.ok()) co_return decoded.status();
       if (page.value_type_ == ValueType::kStream ||
+          page.value_type_ == ValueType::kString ||
           page.value_type_ == ValueType::kList) {
         page.elements_.reserve(count);
         for (auto& item : decoded->snapshot_.entries_)
@@ -222,12 +224,16 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
     const auto total = object->is_ordered()
                            ? object->ordered_directory().root().item_count_
                            : stream->saved_.location_.logical_size_;
+    const auto logical_count =
+        page.value_type_ == ValueType::kString
+            ? (page.elements_.empty() ? 0 : page.elements_.front().size())
+            : page.size();
     if (stream->emitted_count_ > total ||
-        page.size() > total - stream->emitted_count_ ||
-        (page.done_ && page.size() != total - stream->emitted_count_))
+        logical_count > total - stream->emitted_count_ ||
+        (page.done_ && logical_count != total - stream->emitted_count_))
       co_return absl::DataLossError(
           "full-sync collection aggregate count mismatch");
-    stream->emitted_count_ += page.size();
+    stream->emitted_count_ += logical_count;
     stream->pages_done_ = page.done_;
     page.next_cursor_ = ++stream->cursor_;
     const auto retained = page.RetainedBytes();
@@ -325,7 +331,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
     if (!waited.ok()) co_return waited;
   });
   stream->ResetCursor();
-  std::uint64_t bytes = location.value_type() == ValueType::kHash ||
+  std::uint64_t bytes = location.value_type() == ValueType::kString ? 0
+                        : location.value_type() == ValueType::kHash ||
                                 location.value_type() == ValueType::kSet
                             ? 32
                             : 8;

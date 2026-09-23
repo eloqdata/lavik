@@ -958,14 +958,33 @@ struct RawValue {
   ValueType value_type_ = ValueType::kNone;
 };
 
-// One Redis-visible value from an online point-in-time snapshot. Compact
-// values are materialized; grouped collections supply metadata and an opaque
-// worker/session-scoped token instead of copying their complete contents.
+// One Redis-visible value from an online point-in-time snapshot. Strings and
+// compact collections are materialized; grouped non-String collections supply
+// metadata and an opaque worker/session-scoped token instead of copying their
+// complete contents.
 struct RdbSnapshotValue {
   std::uint8_t db_id_ = 0;
   std::string key_;
   RawValue value_;
   std::uint64_t collection_token_ = 0;
+};
+
+// Byte offsets are zero-based. Read ranges use Redis' inclusive, signed bounds;
+// bit operations interpret start_ as a bit offset. Mutations preserve TTL.
+struct StringSegmentOperation {
+  enum class Kind { kReadRange, kWriteRange, kAppend, kGetBit, kSetBit };
+  Kind kind_ = Kind::kReadRange;
+  std::int64_t start_ = 0;
+  std::int64_t stop_ = -1;
+  std::string_view value_;
+  bool bit_ = false;
+};
+
+struct StringSegmentResult {
+  std::string value_;
+  std::uint64_t length_ = 0;
+  bool bit_ = false;
+  bool changed_ = false;
 };
 
 struct RdbSnapshotCursor {
@@ -1120,7 +1139,7 @@ struct TxShardWrites {
   bool collect_undo_ = false;
   // Lazily allocated only when this participant publishes grouped values.
   // Retained views can await the durable decision after command locks are
-  // released; ordinary String transactions allocate no dependency object.
+  // released; compact-only transactions allocate no dependency object.
   std::shared_ptr<GroupedCommitDecision> grouped_decision_;
   // A pull-based collection restore shares one uncommitted command decision
   // across all its page writes. Only its owner may commit this borrowed batch
@@ -1583,6 +1602,14 @@ class StorageEngine {
   bycorf::Task<absl::StatusOr<DiskValue>> GetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ReadLatencyTrace* trace = nullptr);
+
+  // Caller holds the key intent (exclusive for writes). Grouped Strings read
+  // and replace only intersecting fixed-size segments, publishing one root.
+  bycorf::Task<absl::StatusOr<StringSegmentResult>> ExecuteStringSegmentLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const StringSegmentOperation& operation, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   bycorf::Task<std::vector<BatchGetValue>> BatchGetLocked(
       std::uint8_t db_id, std::span<const BatchGetRequest> requests);
   bycorf::Task<absl::StatusOr<std::uint64_t>> StringLengthLocked(

@@ -26,6 +26,227 @@
 namespace {
 using namespace grouped_e2e;
 
+TEST(GroupedStringWriteE2e, FixedSegmentsPointWritesTtlAndRecovery) {
+  PrivateDisk disk;
+  disk.PreserveOnFailure();
+  std::string value(8192 * 70 + 17, 'x');
+  {
+    Server server(disk);
+    server.PreserveOnFailure();
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"SETRANGE", "missing", "9223372036854775807", ""})
+                  .text_,
+              "0");
+    ASSERT_EQ(client.Command({"EXISTS", "missing"}).text_, "0");
+    ASSERT_EQ(client.Command({"SET", "string", value}).text_, "OK");
+    ASSERT_EQ(client.Command({"GET", "string"}).text_, value);
+    ASSERT_EQ(client.Command({"STRLEN", "string"}).text_,
+              std::to_string(value.size()));
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto initial = disk.Auxiliaries("string");
+  ASSERT_EQ(initial.size(), 1);
+  ASSERT_EQ(initial.begin()->second.size(), 71);
+  {
+    Server server(disk, 3);
+    server.PreserveOnFailure();
+    Client client(server.port());
+    ASSERT_EQ(
+        client.Command({"SETRANGE", "string", "9223372036854775807", ""}).text_,
+        std::to_string(value.size()));
+    ASSERT_EQ(client.Command({"SETRANGE", "string", "524287", "AB"}).text_,
+              std::to_string(value.size()));
+    value.replace(524287, 2, "AB");
+    ASSERT_EQ(client.Command({"GETRANGE", "string", "524286", "524289"}).text_,
+              "xABx");
+    ASSERT_EQ(client.Command({"EXPIRE", "string", "3600"}).text_, "1");
+    ASSERT_EQ(client.Command({"PERSIST", "string"}).text_, "1");
+    ASSERT_EQ(client.Command({"GET", "string"}).text_, value);
+    const auto mget = client.Command({"MGET", "string", "missing"});
+    ASSERT_EQ(mget.items_.size(), 2);
+    EXPECT_EQ(mget.items_[0].text_, value);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto updated = disk.Auxiliaries("string");
+  ASSERT_GT(updated.rbegin()->first, initial.rbegin()->first);
+  EXPECT_EQ(updated.rbegin()->second,
+            (std::set<std::pair<std::uint64_t, unsigned>>{{64, 0}, {65, 0}}));
+  {
+    Server server(disk);
+    server.PreserveOnFailure();
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"GET", "string"}).text_, value);
+    ASSERT_EQ(client.Command({"APPEND", "string", ""}).text_,
+              std::to_string(value.size()));
+    ASSERT_EQ(
+        client.Command({"APPEND", "string", std::string(8192, 'z')}).text_,
+        std::to_string(value.size() + 8192));
+    value.append(8192, 'z');
+    ASSERT_EQ(client
+                  .Command({"SETRANGE", "string",
+                            std::to_string(value.size() + 9000), "!"})
+                  .text_,
+              std::to_string(value.size() + 9001));
+    value.append(9000, '\0');
+    value += '!';
+    ASSERT_EQ(client.Command({"SETBIT", "string", "0", "1"}).text_, "0");
+    value[0] = static_cast<char>(static_cast<unsigned char>(value[0]) | 128);
+    ASSERT_EQ(client.Command({"GETBIT", "string", "0"}).text_, "1");
+    ASSERT_EQ(client.Command({"GET", "string"}).text_, value);
+    ASSERT_EQ(client.Command({"GETRANGE", "string", "-4", "-1"}).text_,
+              value.substr(value.size() - 4));
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server server(disk, 3);
+  Client client(server.port());
+  EXPECT_EQ(client.Command({"GET", "string"}).text_, value);
+}
+
+TEST(GroupedStringWriteE2e, TransactionsTransferAndRdbKeepStringSemantics) {
+  PrivateDisk disk;
+  std::string value(8192 * 4, 'v');
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"SET", "str", value}).text_, "OK");
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"APPEND", "str", "tail"}).text_, "QUEUED");
+    ASSERT_EQ(client.Command({"SETRANGE", "str", "8191", "AB"}).text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"EXPIRE", "str", "3600"}).text_, "QUEUED");
+    const auto exec = client.Command({"EXEC"});
+    ASSERT_EQ(exec.items_.size(), 3);
+    EXPECT_EQ(exec.items_[0].text_, std::to_string(value.size() + 4));
+    value += "tail";
+    value.replace(8191, 2, "AB");
+    ASSERT_EQ(client.Command({"GET", "str"}).text_, value);
+    ASSERT_EQ(client.Command({"COPY", "str", "copy"}).text_, "1");
+    ASSERT_EQ(client.Command({"RENAME", "copy", "renamed"}).text_, "OK");
+    ASSERT_EQ(client.Command({"GET", "renamed"}).text_, value);
+    auto dump = client.Command({"DUMP", "str"});
+    ASSERT_EQ(dump.kind_, '$');
+    ASSERT_EQ(client.Command({"RESTORE", "restored", "0", dump.text_}).text_,
+              "OK");
+    ASSERT_EQ(client.Command({"GET", "restored"}).text_, value);
+    ASSERT_EQ(client.Command({"SAVE"}).text_, "OK");
+    auto reader = lavik::rdb::FileReader::Open(disk.path() + ".rdb");
+    ASSERT_TRUE(reader.ok()) << reader.status();
+    std::size_t strings = 0;
+    for (;;) {
+      auto entry = reader->Next();
+      ASSERT_TRUE(entry.ok()) << entry.status();
+      if (!entry->has_value()) break;
+      EXPECT_EQ((**entry).value_.value_type_, ValueType::kString);
+      EXPECT_EQ((**entry).value_.encoded_, value);
+      ++strings;
+    }
+    EXPECT_EQ(strings, 3);
+    ASSERT_EQ(client.Command({"SET", "str", "small", "GET"}).text_, value);
+    ASSERT_EQ(client.Command({"TYPE", "str"}).text_, "string");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server server(disk, 3);
+  Client client(server.port());
+  EXPECT_EQ(client.Command({"GET", "str"}).text_, "small");
+  EXPECT_EQ(client.Command({"GET", "renamed"}).text_, value);
+  EXPECT_EQ(client.Command({"GET", "restored"}).text_, value);
+}
+
+TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
+  // Grouped writes need a transaction stream in addition to ordinary cleaner
+  // output/tombstones. Bound the device to three foreground blocks, then fill
+  // it rather than assuming a byte count implies physical exhaustion.
+  PrivateDisk disk(96ULL * 1024 * 1024);
+  disk.PreserveOnFailure();
+  Server server(disk, 1);
+  server.PreserveOnFailure();
+  Client client(server.port());
+  const std::string value(900 * 1024, 'e');
+  ASSERT_EQ(client.Command({"DEFRAG", "RESUME"}).text_, "OK");
+  for (unsigned i = 0; i < 7; ++i) {
+    ASSERT_EQ(client
+                  .Command({"SET", "{expiry-387}" + std::to_string(i), value,
+                            "PX", "2000"})
+                  .text_,
+              "OK");
+  }
+  bool full = false;
+  for (unsigned i = 0; i < 32; ++i) {
+    const auto reply = client.Command(
+        {"SET", "{expiry-387}fill:" + std::to_string(i), value, "PX", "2000"});
+    if (reply.text_ == "OK") continue;
+    ASSERT_NE(reply.text_.find("out of disk space"), std::string::npos);
+    full = true;
+    break;
+  }
+  ASSERT_TRUE(full);
+  const auto deadline = std::chrono::steady_clock::now() + 15s;
+  Reply reply;
+  do {
+    // Enqueue lazy expiration as well: this is a storage-capacity test, not a
+    // deadline for a complete sweep of all partition/database maps.
+    for (unsigned i = 0; i < 32; ++i) {
+      (void)client.Command({"EXISTS", "{expiry-387}" + std::to_string(i),
+                            "{expiry-387}fill:" + std::to_string(i)});
+    }
+    reply = client.Command({"SET", "replacement", value});
+    if (reply.text_ == "OK") break;
+    ASSERT_NE(reply.text_.find("out of disk space"), std::string::npos);
+    std::this_thread::sleep_for(100ms);
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(reply.text_, "OK")
+      << client.Command({"INFO", "STATS"}).text_
+      << client.Command({"INFO", "KEYSPACE"}).text_ << server.Log();
+  EXPECT_EQ(client.Command({"GET", "replacement"}).text_, value);
+  client.Durable();
+  ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  EXPECT_EQ(server.Log().find("commit append failed"), std::string::npos)
+      << server.Log();
+  Server recovered(disk, 1);
+  Client reader(recovered.port());
+  EXPECT_EQ(reader.Command({"GET", "replacement"}).text_, value);
+  EXPECT_EQ(reader.Command({"EXISTS", "{expiry-387}0"}).text_, "0");
+}
+
+class GroupedStringCrashE2e : public testing::TestWithParam<const char*> {};
+
+TEST_P(GroupedStringCrashE2e, PartialSegmentBatchKeepsPreviousRoot) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires grouped crash hooks";
+#endif
+  PrivateDisk disk;
+  const std::string value(32768, 'x');
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"SET", "str", value}).text_, "OK");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    Server server(disk, 2, GetParam());
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"SETRANGE", "str", "8191", "AB"}).text_,
+              "QUEUED");
+    EXPECT_THROW(client.Command({"EXEC"}), std::runtime_error);
+    EXPECT_EQ(server.Wait(), 86) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"GET", "str"}).text_, value);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    BatchWindows, GroupedStringCrashE2e,
+    testing::Values("group-batch-before-root",
+                    "group-root-staged-before-batch-decision",
+                    "group-batch-durable-before-outer-decision"));
+
 std::vector<std::string> Items(unsigned count = 256) {
   std::vector<std::string> items;
   for (unsigned i = 0; i < count; ++i) {

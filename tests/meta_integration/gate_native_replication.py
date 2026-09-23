@@ -300,6 +300,25 @@ def replay_and_reconnect(root):
             assert reader.call("SCARD", "{native}set") == 2
             assert reader.call("ZRANGE", "{native}zset", 0, -1) == ["a", "b"]
             assert reader.call("STRLEN", "{native}large") == 2 * 1024 * 1024
+            assert reader.call("GET", "{native}large") == "x" * (2 * 1024 * 1024)
+            # Fixed String segments keep byte offsets and TTL across FULL
+            # snapshots and incremental command replay on different workers.
+            writer.call("MULTI")
+            writer.call("SETRANGE", "{native}large", 8191, "AB")
+            writer.call("APPEND", "{native}large", "tail")
+            writer.call("PEXPIRE", "{native}large", 120000)
+            assert writer.call("EXEC") == [
+                2 * 1024 * 1024,
+                2 * 1024 * 1024 + 4,
+                1,
+            ]
+            assert writer.call("WAIT", 1, 5000) == 1
+            assert reader.call("GET", "{native}large") == (
+                "x" * 8191 + "AB" + "x" * (2 * 1024 * 1024 - 8193) + "tail"
+            )
+            assert reader.call("PEXPIRETIME", "{native}large") == writer.call(
+                "PEXPIRETIME", "{native}large"
+            )
             assert reader.call("PEXPIRETIME", "{native}ttl") == writer.call(
                 "PEXPIRETIME", "{native}ttl"
             )

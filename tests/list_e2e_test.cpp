@@ -3015,8 +3015,11 @@ void LargeHashDurabilityE2eTest::CheckGcCrash(std::string_view point) {
 #else
   const std::string value(1024 * 1024, 'g');
   std::vector<std::string> fillers;
+  // Keep fillers in ordinary record blocks so deleting them triggers the
+  // ordinary defrag crash site. Short-key large Strings use tx segments.
   for (unsigned i = 0; i < 5; ++i)
-    fillers.push_back("{large-hash-gc}:filler-" + std::to_string(i));
+    fillers.push_back(std::string(8193, 'k') + "{large-hash-gc}:filler-" +
+                      std::to_string(i));
   {
     ServerProcess server(g_lavik_binary, port_, data_path_, log_path_, 2);
     RespClient client(port_);

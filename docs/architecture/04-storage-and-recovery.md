@@ -37,10 +37,10 @@ The top-level key indexes are runtime authority. An optional clean-shutdown
 checkpoint serializes them as a one-shot recovery accelerator, but committed
 records remain the durable source of truth and recovery falls back to scanning
 them whenever a checkpoint is absent or invalid. Collections have compact
-complete-value encodings. Hash, Set, List, Sorted Set and Stream also have independently
-addressable complete group snapshots, selected through a sparse object side index when the
-top-level index marks a grouped representation. Their serving, transaction,
-recovery and graph-lifecycle boundaries are described in
+complete-value encodings. String, Hash, Set, List, Sorted Set and Stream also have
+independently addressable complete group snapshots, selected through a sparse
+object side index when the top-level index marks a grouped representation.
+Their serving, transaction, recovery and graph-lifecycle boundaries are described in
 [Grouped collections](09-grouped-collections.md). Collection writes promote
 automatically at the compact-size threshold, while streaming imports construct
 grouped graphs directly. Hash/Set use prefix routing; List uses ordered pages.
@@ -234,11 +234,15 @@ compatibility decoder. Older media, including the earlier 104-byte record
 layout, must be reset before this build starts.
 
 Keys that do not fit the configured inline header limit move into the payload.
-Large key/value payloads use a root record containing an extent manifest. Each
-extent reference identifies a dedicated extent block by block ID, allocation
+Large indivisible key/value payloads use a root record containing an extent
+manifest. Each extent reference identifies a dedicated extent block by block ID, allocation
 epoch, byte count, and payload checksum. The extent block header repeats its
 index, length, and checksum so reads and recovery can validate the complete
 root-to-child identity.
+Grouped Strings split their value into fixed 8 KiB ordinary group records;
+their root carries byte length and graph identity. The grouped lifecycle,
+including direct segment indexing and root-only TTL updates, is described in
+[Grouped collections](09-grouped-collections.md).
 
 ## Startup and recovery
 
@@ -864,8 +868,14 @@ substitute for the storage epoch used by recovery.
 
 Transaction cleaning rotates record-bearing generations, seals and flushes
 their blocks, collects committed decisions, and relocates current committed
-tagged winners into ordinary untagged record blocks. A generation is returned
-through the cold-free lifecycle only when it is sealed and durable and has no
+tagged winners into ordinary untagged record blocks. Rotation leaves at most
+one closed generation with outstanding transaction leases; the current
+generation remains open until those accepted transactions settle. This bounds
+the append streams needed by delayed commits rather than allowing a short
+cleaner cooldown to exhaust capacity with unretirable generations. Historical
+snapshot pins alone do not prevent rotation or cleanup of newer generations.
+A generation is returned through the cold-free lifecycle only when it is
+sealed and durable and has no
 active transaction leases, live tagged bytes, or dependency pins. When a
 transaction block is durably retired, its deferred external-key extent debt is
 released through the same asynchronous reclaim path as an ordinary record

@@ -829,8 +829,11 @@ portable `LSR1` length-framed logical records rather than a whole `LXS1` image;
 compatible peers decode those records incrementally with the same ingest
 transaction and complete-sequence validation contract.
 Non-collection targets reserve key plus encoded-value
-staging capacity from their worker-local memory share. Hash, Set, List and
-Sorted Set targets instead decode the same compact wire image incrementally,
+staging capacity from their worker-local memory share. Grouped String sources
+stream raw segment bytes without collection framing; eligible target Strings
+publish their fixed-size grouped graph after the complete raw value arrives.
+Hash, Set, List and Sorted Set targets instead decode the same compact wire
+image incrementally,
 admitting one page at a time and writing complete grouped snapshots under one
 outer transaction. The key-ordering guard spans the entire framed value;
 partial page roots remain hidden behind LOADING and cannot become a promotable

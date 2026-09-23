@@ -2107,6 +2107,23 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
           "replicated logical size exceeds record metadata");
     }
     absl::Status written;
+    if (kind == RecordKind::kValue && value_type == ValueType::kString &&
+        ShouldGroupString(applied.key_.size(), applied.value_.size())) {
+      if (sync->command_sequence_)
+        co_return absl::FailedPreconditionError("nested String snapshot apply");
+      sync->command_sequence_ = applied.mutation_sequence_;
+      struct ResetSequence {
+        WorkerStore::PartitionStore::ReplicaSyncState* sync;
+        ~ResetSequence() { sync->command_sequence_.reset(); }
+      } reset_sequence{sync};
+      written = co_await WriteGroupedStringLocked(
+          store, partition, applied.db_id_, applied.key_, digest,
+          applied.value_, applied.expire_at_ms_, nullptr, nullptr, nullptr);
+      if (!written.ok()) co_return written;
+      partition.mutation_sequence_ =
+          std::max(partition.mutation_sequence_, applied.mutation_sequence_);
+      continue;
+    }
     const ExplicitWriteRoot write_root{
         .index_ = &index,
         .live_key_count_ = &partition.live_key_count_[applied.db_id_],
