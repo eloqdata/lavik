@@ -516,6 +516,24 @@ int main(int argc, char** argv) {
            "local publish count");
     Expect(local_subscriber.ReadPush(), Message("alpha", "hello"),
            "local message");
+    // A pipelined burst queues more than one output batch while the reader
+    // stays idle. Every frame must retain its order across batch boundaries.
+    std::vector<std::string> burst_payloads;
+    burst_payloads.reserve(150);
+    std::vector<std::vector<std::string_view>> burst_commands;
+    burst_commands.reserve(150);
+    for (int index = 0; index < 150; ++index) {
+      burst_payloads.push_back(std::to_string(index));
+      burst_commands.push_back({"PUBLISH", "alpha", burst_payloads.back()});
+    }
+    source_client.SendPipeline(burst_commands);
+    for (int index = 0; index < 150; ++index) {
+      Expect(source_client.ReadPush(), ":1", "burst publish count");
+    }
+    for (const std::string& payload : burst_payloads) {
+      Expect(local_subscriber.ReadPush(), Message("alpha", payload),
+             "ordered burst message");
+    }
     Expect(local_subscriber.Command({"PING", "token"}),
            "*2\r\n$4\r\npong\r\n$5\r\ntoken", "subscribed ping");
     Expect(local_subscriber.Command({"UNSUBSCRIBE", "alpha"}),

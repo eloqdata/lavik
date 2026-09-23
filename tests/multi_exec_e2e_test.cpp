@@ -1614,6 +1614,21 @@ int main(int argc, char** argv) {
              "connection remains non-monitor after EXEC");
       ExpectContains(monitor.ReadPush(), "\"PING\"",
                      "MONITOR post-EXEC connection state");
+
+      // Keep the monitor reader idle while several output batches accumulate.
+      for (int index = 0; index < 150; ++index) {
+        const std::string payload = "monitor-burst-" + std::to_string(index);
+        client.SendCommand({"ECHO", payload});
+      }
+      for (int index = 0; index < 150; ++index) {
+        const std::string payload = "monitor-burst-" + std::to_string(index);
+        Expect(client.ReadPush(), Bulk(payload), "MONITOR burst ECHO reply");
+      }
+      for (int index = 0; index < 150; ++index) {
+        const std::string payload = "monitor-burst-" + std::to_string(index);
+        ExpectContains(monitor.ReadPush(), "\"ECHO\" \"" + payload + "\"",
+                       "MONITOR burst order");
+      }
     }
     // Let the worker-local peer watcher observe the closed monitor socket so
     // graceful shutdown also exercises unregister cleanup.

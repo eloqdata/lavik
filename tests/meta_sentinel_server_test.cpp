@@ -254,6 +254,11 @@ TEST(MetaSentinelServerTest, ShutdownDrainsAcceptWhenWakeSocketCannotBeOpened) {
                     sizeof(reply));
           ASSERT_EQ(std::string(reply, sizeof(reply)), "+PONG\r\n");
 
+          // The test targets the Sentinel accept loop. Stop its unused Raft
+          // fixture before exhausting descriptors so an election/WAL open
+          // cannot fail-stop the child while Shutdown is under test.
+          runtime.raft_->shutdown();
+
           rlimit previous{};
           ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &previous), 0);
           rlimit exhausted = previous;
