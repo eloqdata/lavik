@@ -62,19 +62,24 @@ def import_redis_py(meta_binary):
     candidates.append(
         os.path.join(os.path.dirname(meta_binary), "test_tools", "redis_py")
     )
+    # None stands for the interpreter's own sys.path: CI runs the gates under
+    # a venv python that already carries the pinned redis-py.
+    candidates.append(None)
     for path in candidates:
-        if not os.path.isfile(os.path.join(path, "redis", "__init__.py")):
-            continue
-        sys.path.insert(0, path)
+        if path is not None:
+            if not os.path.isfile(os.path.join(path, "redis", "__init__.py")):
+                continue
+            sys.path.insert(0, path)
         try:
             import redis
             from redis.sentinel import MasterNotFoundError, Sentinel
         except ImportError:
-            sys.path.remove(path)
+            if path is not None:
+                sys.path.remove(path)
             continue
         if redis.__version__ != "8.1.0":
             raise H.Failure(
-                f"redis-py at {path} is version {redis.__version__}, but this "
+                f"redis-py at {path or 'sys.path'} is version {redis.__version__}, but this "
                 "gate is pinned to 8.1.0 (requirements-redis-py.txt)"
             )
         return types.SimpleNamespace(
@@ -83,7 +88,8 @@ def import_redis_py(meta_binary):
     if os.environ.get("LAVIK_REQUIRE_REDIS_PY") == "1":
         raise H.Failure(
             "LAVIK_REQUIRE_REDIS_PY=1 but redis-py is not importable; "
-            f"looked at {candidates}. Run scripts/install_test_redis_py.sh."
+            f"looked at {candidates[:-1]} and the interpreter's own sys.path. "
+            "Run scripts/install_test_redis_py.sh."
         )
     return None
 
