@@ -29,6 +29,9 @@ replacement can also end the grouped incarnation. The payload sum bounds the
 compact encoding size, so the writer selects that representation before
 staging replacement groups.
 Streaming collection imports and grouped key transfers construct graphs directly.
+Intermediate ingest mutations retain grouped roots. Once an import is complete,
+active primary group payloads below 8 KiB are compacted to one root in the
+ingest transaction.
 Stream RDB and native receiving also ingest logical records page by page. Both
 ordinary and Debug builds use the same read, mutation, recovery and maintenance
 adapters.
