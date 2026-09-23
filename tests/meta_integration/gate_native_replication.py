@@ -73,6 +73,7 @@ def pair(
     raft_args=None,
     require_seed_before_full=False,
     client_mode=None,
+    prepare_target=None,
 ):
     client_mode = client_mode or CLIENT_MODE
     directory = root / name
@@ -123,6 +124,8 @@ def pair(
     manifest.write_text("\n".join(lines) + "\n")
     clients = []
     try:
+        if prepare_target is not None:
+            prepare_target(target)
         proxy.start()
         meta.start(initial_cluster_manifest=str(manifest))
         meta.wait_leader()
@@ -227,32 +230,57 @@ def grouped_streams(root):
 
     def seed(writer):
         for number in range(1, 501):
-            assert writer.call("XADD", key, f"{number}-0", "f", "v" * 4096) == f"{number}-0"
+            assert (
+                writer.call("XADD", key, f"{number}-0", "f", "v" * 4096)
+                == f"{number}-0"
+            )
         assert writer.call("XGROUP", "CREATE", key, "g", "0") == "OK"
-        writer.call("XREADGROUP", "GROUP", "g", "a", "COUNT", 100,
-                    "STREAMS", key, ">")
+        writer.call("XREADGROUP", "GROUP", "g", "a", "COUNT", 100, "STREAMS", key, ">")
 
-    with pair(root, "grouped-streams", seed=seed,
-              require_seed_before_full=True) as (meta, source, target, writer):
+    with pair(root, "grouped-streams", seed=seed, require_seed_before_full=True) as (
+        meta,
+        source,
+        target,
+        writer,
+    ):
         ready(meta)
         reader = Client(target, readonly=True)
         try:
+
             def state(client):
                 return client.call("XINFO", "STREAM", key, "FULL", "COUNT", 0)
 
             expected = state(writer)
-            H.wait_until("grouped Stream FULL preserves groups and PEL", 30,
-                         lambda: state(reader) == expected)
+            H.wait_until(
+                "grouped Stream FULL preserves groups and PEL",
+                30,
+                lambda: state(reader) == expected,
+            )
             assert writer.call("XADD", key, "501-0", "f", "tail") == "501-0"
             for _ in range(8):
-                writer.call("XREADGROUP", "GROUP", "g", "b", "COUNT", 3,
-                            "STREAMS", key, ">")
+                writer.call(
+                    "XREADGROUP", "GROUP", "g", "b", "COUNT", 3, "STREAMS", key, ">"
+                )
             assert writer.call("XACK", key, "g", "1-0", "120-0") == 2
-            writer.call("XCLAIM", key, "g", "b", 0, "2-0", "TIME", 123456,
-                        "RETRYCOUNT", 7, "JUSTID")
+            writer.call(
+                "XCLAIM",
+                key,
+                "g",
+                "b",
+                0,
+                "2-0",
+                "TIME",
+                123456,
+                "RETRYCOUNT",
+                7,
+                "JUSTID",
+            )
             expected = state(writer)
-            H.wait_until("grouped Stream delivery/ACK/claim replay", 30,
-                         lambda: state(reader) == expected)
+            H.wait_until(
+                "grouped Stream delivery/ACK/claim replay",
+                30,
+                lambda: state(reader) == expected,
+            )
             assert reader.call("XLEN", key) == 501
             # Group creation and deletion must use sparse replay after FULL too.
             assert writer.call("XGROUP", "CREATE", key, "later", "$") == "OK"
@@ -260,22 +288,42 @@ def grouped_streams(root):
             assert writer.call("XDEL", key, "2-0", "2-0", "500-0") == 2
             writer.call("XAUTOCLAIM", key, "g", "b", 0, "0", "COUNT", 10)
             assert writer.call("XGROUP", "DELCONSUMER", key, "g", "a") > 0
-            writer.call("XADD", key, "MAXLEN", "~", 450, "LIMIT", 1000,
-                        "502-0", "f", "trimmed")
+            writer.call(
+                "XADD", key, "MAXLEN", "~", 450, "LIMIT", 1000, "502-0", "f", "trimmed"
+            )
             writer.call("XTRIM", key, "MAXLEN", "~", 350, "LIMIT", 1000)
             expected = state(writer)
-            H.wait_until("grouped delete/consumer/approximate-trim replay", 30,
-                         lambda: state(reader) == expected)
-            writer.call("XADD", "{native-stream}compact", "MAXLEN", "~", 0,
-                        "LIMIT", 1, "1-0", "f", "v")
-            H.wait_until("compact approximate LIMIT replay", 30,
-                         lambda: reader.call("TYPE", "{native-stream}compact") == "stream"
-                         and reader.call("XLEN", "{native-stream}compact") == 0)
+            H.wait_until(
+                "grouped delete/consumer/approximate-trim replay",
+                30,
+                lambda: state(reader) == expected,
+            )
+            writer.call(
+                "XADD",
+                "{native-stream}compact",
+                "MAXLEN",
+                "~",
+                0,
+                "LIMIT",
+                1,
+                "1-0",
+                "f",
+                "v",
+            )
+            H.wait_until(
+                "compact approximate LIMIT replay",
+                30,
+                lambda: reader.call("TYPE", "{native-stream}compact") == "stream"
+                and reader.call("XLEN", "{native-stream}compact") == 0,
+            )
 
             writer.call("XTRIM", key, "MAXLEN", 0)
             expected = state(writer)
-            H.wait_until("empty grouped Stream keeps replicated PEL", 30,
-                         lambda: state(reader) == expected)
+            H.wait_until(
+                "empty grouped Stream keeps replicated PEL",
+                30,
+                lambda: state(reader) == expected,
+            )
         finally:
             reader.close()
 
@@ -490,9 +538,15 @@ def dense_collection_full_sync(root):
         ready(meta)
         reader = Client(target, readonly=True)
         try:
-            assert reader.call("HLEN", "{dense}hash") == count
-            assert reader.call("SCARD", "{dense}set") == count
-            assert reader.call("ZCARD", "{dense}zset") == count
+            # Cluster readiness proves Owner service, not that the replica's
+            # asynchronous FULL has opened its local population for reads.
+            H.wait_until(
+                "dense FULL is readable on the replica",
+                30,
+                lambda: reader.call("HLEN", "{dense}hash") == count
+                and reader.call("SCARD", "{dense}set") == count
+                and reader.call("ZCARD", "{dense}zset") == count,
+            )
             # Distinct values and scores expose association errors that counts
             # alone, or a fixture with one repeated Hash value, cannot detect.
             assert sorted(reader.call("SMEMBERS", "{dense}set")) == sorted(
@@ -536,13 +590,38 @@ def handoff_order(root):
         )
 
 
+def require_incomplete_population(reader):
+    rejects(reader, ("GET", "{native}seed"), "LOADING")
+    if CLIENT_MODE == "single":
+        for db in (0, 1, 15):
+            assert reader.call("SELECT", db) == "OK"
+            for command in (
+                ("GET", "{native}seed"),
+                ("DBSIZE",),
+                ("KEYS", "*"),
+                ("SCAN", 0),
+                ("RANDOMKEY",),
+            ):
+                rejects(reader, command, "LOADING")
+        assert reader.call("SELECT", 0) == "OK"
+
+
 def cancelled_handoff(root):
+    def seed(writer):
+        writer.call("SET", "{native}seed", "DB0")
+        if CLIENT_MODE == "single":
+            writer.call("SELECT", 15)
+            writer.call("SET", "{native}seed", "DB15")
+            writer.call("SELECT", 0)
+
     with pair(
         root,
         "cancel-handoff",
         target_faults={"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK": "cancel"},
         source_workers=1,
         target_workers=1,
+        seed=seed,
+        require_seed_before_full=True,
     ) as (_, source, target, _writer):
         H.wait_until(
             "outstanding native handoff",
@@ -552,7 +631,7 @@ def cancelled_handoff(root):
         )
         reader = Client(target, readonly=True)
         try:
-            rejects(reader, ("GET", "{native}seed"), "LOADING")
+            require_incomplete_population(reader)
         finally:
             reader.close()
         target.terminate()
@@ -577,7 +656,7 @@ def rejected_full(root, name, source_faults, target_faults, marker):
         )
         reader = Client(target, readonly=True)
         try:
-            rejects(reader, ("GET", "{native}seed"), "LOADING")
+            require_incomplete_population(reader)
             rejects(reader, ("REPLICAOF", "NO", "ONE"), "not allowed")
             # A failed directed rebuild cannot manufacture an autonomous new
             # attempt or publish ONLINE without another Meta authorization.

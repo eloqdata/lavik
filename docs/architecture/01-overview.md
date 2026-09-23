@@ -127,8 +127,8 @@ Meta seeds determine management status. Without seeds, Data starts standalone
 with 16 logical DBs and the existing Redis follower/recovery behavior. With
 seeds, Data first authenticates to Meta and obtains the immutable committed
 Single or Cluster client mode before constructing storage or opening Redis.
-Cluster uses DB0 storage; Single retains the standalone storage layout but
-currently exposes only safe DB0 commands under Group authority. The Topology
+Cluster uses DB0 storage; Single serves 16 isolated logical DBs under one Group
+authority, including cross-DB COPY and database inspection. The Topology
 root owns the mode; Data has no local mode override or durable management
 provenance marker. Configuration migration and supported commands are described
 in the [deployment guide](../operations/cluster-deployment.md).

@@ -38,6 +38,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness as H  # noqa: E402
 from gate_data_control import DataProcess  # noqa: E402
+import single_database_data as D  # noqa: E402
 
 
 CLIENT_MODE = "cluster"
@@ -485,11 +486,16 @@ def read_resp(reader):
     raise H.Failure(f"Data returned unknown RESP prefix {prefix!r}")
 
 
-def redis_call(data, arguments):
+def redis_call(data, arguments, db=0):
     with socket.create_connection(endpoint(data), timeout=3.0) as connection:
         connection.settimeout(3.0)
+        reader = connection.makefile("rb")
+        if db:
+            connection.sendall(encode_resp(["SELECT", str(db)]))
+            if read_resp(reader) != "OK":
+                raise H.Failure("Data rejected SELECT")
         connection.sendall(encode_resp(arguments))
-        return read_resp(connection.makefile("rb"))
+        return read_resp(reader)
 
 
 def redis_error(data, arguments):
@@ -513,13 +519,19 @@ def replication_info_fields(data):
     return fields
 
 
-def readonly_get(data, key):
+def readonly_get(data, key, db=0):
     with socket.create_connection(endpoint(data), timeout=3.0) as connection:
         connection.settimeout(3.0)
-        connection.sendall(encode_resp(["READONLY"]) + encode_resp(["GET", key]))
+        connection.sendall(
+            encode_resp(["READONLY"])
+            + encode_resp(["SELECT", str(db)])
+            + encode_resp(["GET", key])
+        )
         reader = connection.makefile("rb")
         if read_resp(reader) != "OK":
             raise H.Failure("replica rejected READONLY")
+        if read_resp(reader) != "OK":
+            raise H.Failure("replica rejected SELECT")
         return read_resp(reader)
 
 
@@ -918,6 +930,7 @@ class FailoverFixture:
     ):
         self.client_mode = client_mode or CLIENT_MODE
         self.ctl = ctl
+        self.database_deadline = None
         self.scenario = scenario
         os.makedirs(scenario, mode=0o700)
         # AF_UNIX paths cap at roughly 108 bytes. Keep the fixed suffix short
@@ -1215,16 +1228,40 @@ class FailoverFixture:
                 )
         wait_ready(self, "assigned replicas follow Owner and cluster returns to READY")
 
-    def seed_and_wait_for_replicas(self, key, value, replica_ids):
-        if redis_call(self.by_id[OWNER], ["SET", key, value]) != "OK":
+    def seed_and_wait_for_replicas(self, key, value, replica_ids, db=0):
+        if self.client_mode == "single" and self.database_deadline is None:
+            self.database_deadline = D.seed_node(self.by_id[OWNER])
+            for replica_id in replica_ids:
+                H.wait_until(
+                    "multi-DB fixture replicated before failover",
+                    30,
+                    lambda replica_id=replica_id: D.node_matches(
+                        self.by_id[replica_id], self.database_deadline
+                    ),
+                )
+        if redis_call(self.by_id[OWNER], ["SET", key, value], db=db) != "OK":
             raise H.Failure("old Owner rejected the initial write")
         for replica_id in replica_ids:
             H.wait_until(
                 f"{replica_id[:8]} receives the initial write",
                 20,
-                lambda replica_id=replica_id: readonly_get(self.by_id[replica_id], key)
+                lambda replica_id=replica_id: readonly_get(
+                    self.by_id[replica_id], key, db=db
+                )
                 == value,
             )
+
+    def require_single_databases(self, *, dead_data_ids=()):
+        """Verify the pre-failover population on each surviving Group member."""
+        if self.database_deadline is None:
+            return
+        for data in self.data_nodes:
+            if data.node_id not in dead_data_ids:
+                H.wait_until(
+                    "Single databases survive failover and reparent",
+                    30,
+                    lambda data=data: D.node_matches(data, self.database_deadline),
+                )
 
     def submit_failover(self):
         # Reduce the election window before this one-shot mutation. If the
@@ -1553,6 +1590,7 @@ def run_controlled(
             "converged through partial reparent without another FULL"
         )
         fixture.require_expected_processes_alive()
+        fixture.require_single_databases()
         fixture.clean_shutdown()
     except Exception:
         fixture.dump_logs()
@@ -1716,6 +1754,7 @@ def run_full_fallback(
                 )
         wait_ready(fixture, "FULL fallback restores cluster readiness")
         fixture.require_expected_processes_alive()
+        fixture.require_single_databases()
         H.log("trusted Active with missing parent completed FULL and resumed FOLLOW")
         fixture.clean_shutdown()
     except Exception:
@@ -1797,6 +1836,7 @@ def run_leader_resume(
             "structured events=" + ",".join(sorted(events))
         )
         fixture.require_expected_processes_alive(dead_meta_ids=(old_leader.id,))
+        fixture.require_single_databases()
         fixture.clean_shutdown()
     except Exception:
         fixture.dump_logs()
@@ -1954,6 +1994,7 @@ def run_prepared_leader_resume(
                 f"prepared-action resume changed transition/action identity: {events}"
             )
         fixture.require_expected_processes_alive(dead_meta_ids=(old_leader.id,))
+        fixture.require_single_databases()
         H.log(
             f"Meta leader {old_leader.id} observed CandidatePrepared and "
             f"failed; leader {fixture.leader.id} collected it again from "
@@ -2103,6 +2144,7 @@ def run_live_leader_demotion(
             )
 
         fixture.require_expected_processes_alive(dead_meta_ids=(old_leader.id,))
+        fixture.require_single_databases()
         H.log(
             f"Meta leader {old_leader.id} stepped down and drained Data "
             f"sessions while alive; leader {fixture.leader.id} resumed "
@@ -2193,6 +2235,7 @@ def run_candidate_abort(
             "without candidate restart"
         )
         fixture.require_expected_processes_alive(dead_data_ids=(selected_candidate,))
+        fixture.require_single_databases(dead_data_ids=(selected_candidate,))
         fixture.clean_shutdown()
     except Exception:
         fixture.dump_logs()
@@ -2421,6 +2464,7 @@ def run_lease_fence(
             lambda: readonly_get(fixture.by_id[OWNER], key) == post_cutover,
         )
         fixture.require_expected_processes_alive()
+        fixture.require_single_databases()
         H.log(
             "old Owner stayed live behind a Meta-control blackhole, its "
             f"finite lease expired, stale SET was rejected as "
@@ -2557,6 +2601,7 @@ def run_source_degrade_reselect(
             lambda: readonly_get(fixture.by_id[OWNER], key) == post_cutover,
         )
         fixture.require_expected_processes_alive(dead_data_ids=(selected_candidate,))
+        fixture.require_single_databases(dead_data_ids=(selected_candidate,))
         H.log(
             "source control session and exact committed Begin candidate "
             f"{selected_candidate[:8]} failed; recovery degraded, selected "

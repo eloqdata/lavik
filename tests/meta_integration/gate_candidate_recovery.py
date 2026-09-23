@@ -63,6 +63,7 @@ def run(root, meta, data, ctl, mode, case):
         # handshake fail exactly as it would before the donor installs FDS.
         donor2.environment["LAVIK_TEST_RECOVERY_REJECT_FIRST_REQUEST"] = "1"
     keys = [flow_key(flow) for flow in range(2)]
+    databases = dict(zip(keys, (1, 15) if mode == "single" else (0, 0)))
     if case in ("budget", "donor-failure", "leader-change", "candidate-replace"):
         donor1.environment["LAVIK_TEST_RECOVERY_EFFECT_DELAY_MS"] = "3000"
         if case != "donor-failure":
@@ -70,7 +71,10 @@ def run(root, meta, data, ctl, mode, case):
     large = case == "coverage-gap"
 
     def values(node):
-        return [F.readonly_get(node, key).split(":", 1)[0] for key in keys]
+        return [
+            F.readonly_get(node, key, db=databases[key]).split(":", 1)[0]
+            for key in keys
+        ]
 
     dead_data = {F.OWNER}
     dead_meta = set()
@@ -96,7 +100,7 @@ def run(root, meta, data, ctl, mode, case):
             assert reply.startswith("OK "), reply
         for key in keys:
             fixture.seed_and_wait_for_replicas(
-                key, "0", (F.CANDIDATE, F.FOLLOWER, F.SECOND_DONOR)
+                key, "0", (F.CANDIDATE, F.FOLLOWER, F.SECOND_DONOR), db=databases[key]
             )
         baseline = [
             source.metric("lavik_replication_backlog_tail_lsn", f'{{worker="{flow}"}}')
@@ -126,11 +130,14 @@ def run(root, meta, data, ctl, mode, case):
                         F.redis_call(
                             source,
                             ["SET", key, str(i + 1) + ":" + "v" * (4 * 1024 * 1024)],
+                            db=databases[key],
                         )
                         == "OK"
                     )
                 else:
-                    assert F.redis_call(source, ["INCR", key]) == i + 1
+                    assert (
+                        F.redis_call(source, ["INCR", key], db=databases[key]) == i + 1
+                    )
         for node in (candidate, donor1, donor2):
             counts = limits[node.node_id]
             H.wait_until(
@@ -277,7 +284,7 @@ def run(root, meta, data, ctl, mode, case):
                     == full_counts[node.node_id]
                 )
         for key in keys:
-            assert F.redis_call(promoted, ["SET", key, "6"]) == "OK"
+            assert F.redis_call(promoted, ["SET", key, "6"], db=databases[key]) == "OK"
         for node in alive:
             H.wait_until(
                 "post-promotion replay",
@@ -287,6 +294,7 @@ def run(root, meta, data, ctl, mode, case):
         fixture.require_expected_processes_alive(
             dead_data_ids=dead_data, dead_meta_ids=dead_meta
         )
+        fixture.require_single_databases(dead_data_ids=dead_data)
         fixture.clean_shutdown()
         H.log(
             f"{mode}/{case}: real B={baseline}, recovered={recovered}, deadline={deadlines}"

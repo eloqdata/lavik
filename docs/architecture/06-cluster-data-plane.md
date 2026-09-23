@@ -831,9 +831,9 @@ with EXECABORT as in Redis. `EVAL`/`EVALSHA`/`FCALL` are treated as writes for
 admission — a script that only reads still redirects to the primary — while
 their `_RO` variants are treated as reads; declared keys must hash to one
 slot, and `redis.call` access outside the admitted slot set is rejected with
-Redis's non-local-key error. Read-only global commands and process-local
-administration (INFO, CONFIG, DBSIZE, SCAN, SCRIPT cache management, and
-similar) keep node-local semantics and are governed only by readiness.
+Redis's non-local-key error. In Cluster mode, read-only global commands and
+process-local administration (INFO, CONFIG, DBSIZE, SCAN, SCRIPT cache management,
+and similar) keep node-local semantics and are governed only by readiness.
 Cluster nodes reject `FLUSHDB`, `FLUSHALL`, and catalog-changing
 `FUNCTION LOAD`, `DELETE`, `FLUSH`, and `RESTORE`: they mutate durable
 process-wide state but carry no slot from which finite authority can derive a
@@ -842,22 +842,25 @@ so `EXEC` aborts rather than creating a slotless authority exception.
 `FUNCTION KILL` and `FUNCTION STATS` remain available while loading so an
 executing Function can be stopped or inspected; they do not mutate the catalog.
 
-Managed Single admits DB0 commands through the common Group gate: single-key
-storage commands, TTL operations, PUBLISH, cross-slot multi-key commands
+Managed Single admits commands in DB0–15 through the common Group gate:
+single-key storage commands, TTL operations, PUBLISH, cross-slot multi-key commands
 (MGET/MSET/DEL and the other multi-key families sharing the standalone
-execution engine), and the blocking List and Sorted Set family. The sole
-Group covers the entire dataset, so cross-slot is not a rejection reason in
-Single; Cluster retains CROSSSLOT. Still rejected with explicit unsupported
+execution engine), cross-database COPY, and the blocking List and Sorted Set
+family. Each database has an isolated key namespace; COPY's source and target
+database admission and worker participants share one Group authority. SELECT
+changes only the connection's database. The sole Group covers the entire
+dataset, so cross-slot is not a rejection reason in Single; Cluster retains
+CROSSSLOT and DB0. DBSIZE, SCAN, RANDOMKEY and KEYS are data reads under the
+same Group admission and complete-population fence as keyed reads, including
+the ordinary Single replica-read policy. KEYS retains its exclusive database
+gate throughout its streamed reply. Still rejected with explicit unsupported
 errors, each because its execution context is not yet wired into Group
 authority: transactions (MULTI/EXEC/WATCH queue commands into a separate
-execution context), scripts and Functions, keyless global data operations such
-as DBSIZE/SCAN/FLUSHDB, nonzero databases, stream blocking (XREAD/XREADGROUP
+execution context), scripts and Functions, global durable mutations such
+as FLUSHDB/FLUSHALL, stream blocking (XREAD/XREADGROUP
 wait on distinct lanes and XREADGROUP mutates consumer-group state), and
-keyless `WAIT`. `COPY ... DB` executes through the same Group authority but
-its cross-DB semantics are not yet verified — documented transition behavior;
-SELECT of a nonzero DB stays rejected meanwhile. Diagnostics remain separate
-from data authority. Single returns LOADING for
-incomplete population, READONLY for replica mutations, MASTERDOWN for
+keyless `WAIT`. Diagnostics remain separate from data authority. Single returns
+LOADING for incomplete population, READONLY for replica mutations, MASTERDOWN for
 unavailable Owner authority or disabled stale reads, and TRYAGAIN for
 Controlled Pause. Normal role changes do not produce MOVED.
 

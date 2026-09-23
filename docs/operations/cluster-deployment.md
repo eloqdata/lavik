@@ -23,16 +23,45 @@ A managed node waits for Meta creation and registration without opening Redis;
 identity or capability incompatibility fails startup. A cluster's mode cannot
 be changed after creation.
 
-Managed Single has exactly one Group covering every slot. It serves DB0 basic
-single-key commands, collections, TTL and PUBLISH through shared Group authority.
+Managed Single has exactly one Group covering every slot and all 16 logical
+databases. It serves single-key commands, collections, TTL, PUBLISH, cross-slot
+multi-key commands, cross-database COPY, List/Sorted Set blocking commands,
+and DBSIZE/SCAN/RANDOMKEY/KEYS through shared Group authority.
 Complete replicas accept ordinary read connections without READONLY. Configure
 `replica-serve-stale-data yes|no` in the file or through CONFIG GET/SET; the default
 `yes` permits complete stale data during disconnection. `no` returns MASTERDOWN
 for data requests while the replication link is down. Initial FULL and invalid
 populations return LOADING in either setting; replicas always reject mutations.
-Multi-key operations, nonzero DBs, transactions, scripts, blocking operations
-and global data/catalog paths remain explicitly unsupported in managed Single.
-Cluster retains its current routing and READONLY contract.
+Transactions, scripts, Stream blocking, WAIT and global durable data/catalog
+mutations remain explicitly unsupported in managed Single. Cluster retains
+DB0, CROSSSLOT, its COPY DB restriction and its READONLY contract.
+
+On an authorized Single Owner, a connection can select a database and copy into
+another database without changing its own selection:
+
+```text
+SELECT 1
+SET example value PX 60000
+COPY example example DB 15 REPLACE
+SELECT 15
+GET example
+PTTL example
+SCAN 0 MATCH example
+```
+
+The copy retains the source's absolute expiry time. To verify replication,
+connect to a complete replica, issue `SELECT 15`, and poll `GET example` until
+it returns `value`; this is an observation of that key, not a synchronous
+durability guarantee. Each connection selects its database independently.
+DBSIZE retains its existing index-count semantics, which can include expired
+records awaiting cleanup. SCAN is an ordinary cursor traversal, not a snapshot;
+restart it from cursor zero after changing databases or replacing the population.
+
+KEYS holds its database gate until the streamed reply completes or the connection
+closes. A client that continues reading slowly can delay FULL or promotion cuts
+that need every database gate. The existing 30-second watchdog detects stalled
+network progress; it is not a total-duration deadline or failover cancellation.
+Use bounded SCAN requests for routine inspection of large databases.
 
 No seeds means the existing standalone recovery rules also apply to files last
 used by a managed node. There is no detach step or extra persisted management

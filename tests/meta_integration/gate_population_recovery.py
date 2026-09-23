@@ -23,6 +23,7 @@ elections or leases.
 import argparse
 from contextlib import contextmanager
 import os
+from pathlib import Path
 import re
 import signal
 import socket
@@ -35,6 +36,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate_automatic_failover as A  # noqa: E402
 import gate_failover as F  # noqa: E402
 import harness as H  # noqa: E402
+import single_database_data as D  # noqa: E402
+from gate_native_replication import C, Client  # noqa: E402
 from gate_data_control import allocate_data_file  # noqa: E402
 
 CASES = (
@@ -220,7 +223,18 @@ def require_data(data):
         raise H.Failure("activated Owner rejected a write")
 
 
-def wait_replica_cut(owner):
+def wait_replica_cut(owner, fixture, database_deadline):
+    if fixture.client_mode == "single":
+        # WAIT remains a separate managed Single capability. Verify every
+        # seeded DB and both flow populations through the ordinary replica
+        # read surface before clean shutdown certifies this known test cut.
+        peer = F.CANDIDATE if owner.node_id == F.OWNER else F.OWNER
+        H.wait_until(
+            "all Single fixture data applied before shutdown",
+            30,
+            lambda: D.node_matches(fixture.by_id[peer], database_deadline),
+        )
+        return
     # WAIT must follow a write on the same connection: its all-flow watermark
     # covers the earlier seed writes even when source workers apply separately.
     with socket.create_connection(F.endpoint(owner), timeout=15) as connection:
@@ -273,7 +287,10 @@ def require_fenced(fixture, data, term):
         if A.group_status(fixture, time.monotonic() + 5).get("serving_ready"):
             raise H.Failure("unproven population became automatically eligible")
         error = F.redis_error(data, ["SET", "recovery:forbidden", "bad"])
-        if not any(word in error for word in ("LOADING", "CLUSTERDOWN", "TRYAGAIN")):
+        if not any(
+            word in error
+            for word in ("LOADING", "CLUSTERDOWN", "TRYAGAIN", "MASTERDOWN")
+        ):
             raise H.Failure(f"unexpected fenced write result: {error}")
         time.sleep(0.1)
 
@@ -314,11 +331,15 @@ def run(args, workdir):
         os.path.join(workdir, args.case),
         True,
         pause_after_begin_ms=0,
+        client_mode=args.mode,
     )
     owner = fixture.by_id[F.OWNER]
     owner.workers = 2
     replica = fixture.by_id[F.CANDIDATE]
     case = args.case
+    partial_single = case == "incomplete-full" and args.mode == "single"
+    if partial_single:
+        owner.workers = 1
     startup_proxy = None
     if case == "promoted-follower":
         # Two promotions and repeated FULL consume more allocation generations
@@ -330,16 +351,31 @@ def run(args, workdir):
         "recovery_" + case.replace("-", "_proof_") if case.endswith("publish") else None
     )
     try:
-        with crash_at(publish_fault):
+        source_faults = (
+            {"LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "60000"}
+            if partial_single
+            else {}
+        )
+        with crash_at(publish_fault), patch.dict(os.environ, source_faults):
             fixture.start_created(add_follower=False)
         if case in ("clean-replica", "eligible-candidate", "promoted-follower"):
             fixture.add_replica(F.CANDIDATE)
         seed(owner)
+        database_deadline = D.seed_node(owner) if args.mode == "single" else None
+        if partial_single:
+            # The source pauses after slot zero's ACK, proving this DB15 key
+            # was applied before we crash, rather than merely resetting roots.
+            first_key = next(
+                f"partial:{i}"
+                for i in range(100000)
+                if C.redis_slot(f"partial:{i}") == 0
+            )
+            assert F.redis_call(owner, ["SET", first_key, "imported"], db=15) == "OK"
         if case == "promoted-follower":
             # A promoted cluster Owner persists the logical Meta group name.
             # Crash it before it can adopt a successor's wire identity, then
             # require ordinary FOLLOW/FULL after the remaining member takes over.
-            wait_replica_cut(owner)
+            wait_replica_cut(owner, fixture, database_deadline)
             F.wait_candidate_source(fixture, F.OWNER, 1, {F.CANDIDATE})
             operation = fixture.submit_failover()
             F.wait_operation(
@@ -351,7 +387,7 @@ def run(args, workdir):
             )
             wait_serving(fixture, replica, 2)
             F.wait_candidate_source(fixture, F.CANDIDATE, 2, {F.OWNER})
-            wait_replica_cut(replica)
+            wait_replica_cut(replica, fixture, database_deadline)
             wait_durable(replica)
             reply = fixture.leader.put_automatic_uncontrolled_failover_policy(
                 2, suspect_after_ms=5000
@@ -376,10 +412,17 @@ def run(args, workdir):
                 lambda: F.readonly_get(replica, "recovery:after-rejoin") == "verified",
             )
             require_data(owner)
+            if database_deadline is not None:
+                assert D.node_matches(owner, database_deadline)
+                assert D.node_matches(replica, database_deadline)
             fixture.clean_shutdown()
             return
         if case == "incomplete-full":
-            restart(fixture, replica, "system-state-device-root-durable")
+            restart(
+                fixture,
+                replica,
+                None if partial_single else "system-state-device-root-durable",
+            )
             fixture.leader.registernode(
                 replica.node_id,
                 f"lavik://node/{replica.node_id}",
@@ -387,12 +430,27 @@ def run(args, workdir):
                 endpoints=(replica.advertised_endpoint,),
             )
             fixture.leader.assignnode(F.GROUP, replica.node_id, "replica")
-            require_exit_at_fault(replica)
+            if partial_single:
+                H.wait_until(
+                    "DB15 partition acknowledged before FULL crash",
+                    30,
+                    lambda: "paused full sync after acknowledged handoff partition 0 "
+                    in Path(owner.log_path).read_text(),
+                )
+                wait_durable(replica)
+                replica.force_kill()
+            else:
+                require_exit_at_fault(replica)
         if case == "clean-replica":
-            wait_replica_cut(owner)
+            wait_replica_cut(owner, fixture, database_deadline)
             # Shutdown the replica before cutting its source; the restarted
             # candidate must retain the source's two-flow layout, not its own.
             replica.terminate()
+        if case == "eligible-candidate":
+            # This case assumes a complete alternative candidate. Finish its
+            # multi-DB replay before crashing the source mid-transport.
+            wait_replica_cut(owner, fixture, database_deadline)
+            F.wait_candidate_source(fixture, F.OWNER, 1, {F.CANDIDATE})
         short_threshold = case not in ("manual-fence", "eligible-candidate")
         reply = fixture.leader.put_automatic_uncontrolled_failover_policy(
             2, suspect_after_ms=1000 if short_threshold else 600_000
@@ -438,6 +496,41 @@ def run(args, workdir):
             )
             if reply != f"ERR promote {expected}":
                 raise H.Failure(f"unsafe promote was not rejected: {reply}")
+            if partial_single:
+                client = Client(target)
+                try:
+                    for db in (0, 1, 15):
+                        client.call("SELECT", db)
+                        for command in (
+                            ("GET", first_key),
+                            ("DBSIZE",),
+                            ("SCAN", 0),
+                            ("KEYS", "*"),
+                            ("RANDOMKEY",),
+                        ):
+                            try:
+                                client.call(*command)
+                            except H.Failure as error:
+                                assert "LOADING" in str(error), error
+                            else:
+                                raise H.Failure("partial population became readable")
+                finally:
+                    client.close()
+                # Restore a proven source through explicit operator recovery;
+                # the partial replica may serve only after a legal new FULL.
+                restart(fixture, owner)
+                require_fenced(fixture, owner, 2)
+                reply = fixture.leader.put_automatic_uncontrolled_failover_policy(3)
+                if not reply.startswith("OK "):
+                    raise H.Failure(f"could not restore recovery detector: {reply}")
+                promote(fixture, owner)
+                H.wait_until(
+                    "recovered source and replaced replica converge",
+                    60,
+                    lambda: D.node_matches(owner, database_deadline)
+                    and D.node_matches(replica, database_deadline),
+                )
+                assert F.readonly_get(replica, first_key, db=15) == "imported"
             fixture.clean_shutdown()
             return
         eligible = case in (
@@ -480,6 +573,8 @@ def run(args, workdir):
             promote(fixture, target)
         wait_serving(fixture, target, 2)
         require_data(target)
+        if database_deadline is not None:
+            assert D.node_matches(target, database_deadline)
         if case in ("clean-owner", "crash-operator"):
             # A later-term Owner must record its current source domain too.
             # Also exercise the proof alongside the optional index checkpoint;
@@ -493,6 +588,8 @@ def run(args, workdir):
             restart(fixture, target)
             wait_serving(fixture, target, 3)
             require_data(target)
+            if database_deadline is not None:
+                assert D.node_matches(target, database_deadline)
         fixture.clean_shutdown()
     except BaseException:
         fixture.dump_logs()
@@ -510,6 +607,7 @@ def main():
     parser.add_argument("ctl")
     parser.add_argument("workdir", nargs="?")
     parser.add_argument("--case", choices=CASES, required=True)
+    parser.add_argument("--mode", choices=("single", "cluster"), default="cluster")
     args = parser.parse_args()
     for name in ("meta", "data", "ctl"):
         setattr(args, name, os.path.abspath(getattr(args, name)))

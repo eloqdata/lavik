@@ -976,7 +976,7 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
   }
 
   bycorf::Task<absl::Status> ExerciseRepeatedPromotion() {
-    constexpr std::uint8_t kDb = 9;
+    constexpr std::uint8_t kDb = 15;
     const std::string key = "replica-promote-candidate";
     std::optional<std::uint64_t> first_retained;
 
@@ -988,8 +988,22 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
           pin_session, kDb, key, static_cast<char>('c' + round));
       if (!pinned.ok()) co_return pinned.status();
 
+      // FULL replaces all enabled databases, even those with no source
+      // records. Old-only keys exercise reset independently
+      // of the destination database receiving the one imported value below.
+      for (std::uint8_t db = 0; db < lavik::storage::kLogicalDatabaseCount;
+           ++db) {
+        auto old = co_await storage_->Set(db, "old-only", "discard", {});
+        if (!old.ok()) co_return old.status();
+      }
+
       auto reset = co_await ResetFullRoot(replica_session);
       if (!reset.ok()) co_return reset.status();
+      for (std::uint8_t db = 0; db < lavik::storage::kLogicalDatabaseCount;
+           ++db) {
+        Check(!co_await storage_->Exists(db, "old-only"),
+              "FULL reset retained an old key in an unpopulated database");
+      }
       absl::Status applied = co_await ApplyCandidate(
           replica_session, *reset, kDb, key, static_cast<char>('x' + round));
       if (!applied.ok()) co_return applied;

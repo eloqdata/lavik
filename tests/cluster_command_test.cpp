@@ -261,9 +261,10 @@ TEST(ClusterCommandTest, ClientSemanticsAreIndependentOfMetaRuntime) {
   EXPECT_EQ(RunDispatch(context, {"SELECT", "15"}),
             "-ERR SELECT is not allowed in cluster mode\r\n");
   cluster::SetClientMode(lavik::ClientMode::kSingle);
-  EXPECT_EQ(RunDispatch(context, {"SELECT", "15"}),
-            "-ERR nonzero databases are not yet supported in Meta-managed "
-            "Single mode\r\n");
+  EXPECT_EQ(RunDispatch(context, {"SELECT", "15"}), "+OK\r\n");
+  EXPECT_EQ(RunDispatch(context, {"SELECT", "16"}),
+            "-ERR DB index is out of range\r\n");
+  EXPECT_EQ(RunDispatch(context, {"SELECT", "0"}), "+OK\r\n");
   // Selecting Single does not grant external role control on a managed node.
   EXPECT_EQ(RunDispatch(context, {"REPLICAOF", "NO", "ONE"}),
             "-ERR REPLICAOF not allowed in Meta-managed mode.\r\n");

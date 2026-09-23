@@ -241,10 +241,12 @@ generation before registering. Each registration also retains that generation;
 EXEC treats a later generation mismatch as a watched-key modification even if
 the replacement has identical key liveness. Once KEYS has validated and
 committed its streamed reply, a later replacement waits for its exclusive
-database gate rather than disconnecting it mid-reply. Opening a completed
+database gate rather than disconnecting it mid-reply. A slowly draining KEYS
+client can therefore delay population replacement; the stream watchdog bounds
+lack of network progress, not total response duration. Opening a completed
 population publishes the role before the open bit. Trusted replication-origin
-commands bypass this client fence because they are the work that constructs the
-closed population.
+commands bypass this client fence because they are the work that constructs
+the closed population.
 
 Worker zero owns RDB backup scheduling. `SAVE`, `BGSAVE`, and `LASTSAVE`
 requests arriving on other workers submit their control step there, while an
