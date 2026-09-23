@@ -1249,6 +1249,20 @@ if (BUILD_TESTING)
           PROPERTIES LABELS "meta-integration;failover;population-recovery"
                      TIMEOUT 180 RUN_SERIAL TRUE
         )
+        add_test(
+          NAME meta_integration.single_population_recovery_${recovery_test_suffix}
+          COMMAND ${CMAKE_COMMAND} -E env
+                  "LAVIK_FAILOVER_SOCKET_ROOT=${automatic_failover_socket_root}"
+                  ${LAVIK_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_population_recovery.py
+                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>
+                  --case=${recovery_case} --mode=single
+        )
+        set_tests_properties(
+          meta_integration.single_population_recovery_${recovery_test_suffix}
+          PROPERTIES LABELS "meta-integration;failover;population-recovery"
+                     TIMEOUT 180 RUN_SERIAL TRUE
+        )
       endforeach()
     endif()
 

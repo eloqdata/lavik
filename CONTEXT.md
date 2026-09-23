@@ -27,9 +27,10 @@ independent of whether Meta manages the deployment and grants no serving
 authority by itself.
 
 **Single**:
-A Client Service Mode exposing one logical dataset without a same-slot
-restriction on commands' keys. In a Meta-managed deployment, that dataset
-belongs to one Group covering the entire slot space.
+A Client Service Mode exposing one logical dataset with isolated key namespaces
+for its logical databases and no same-slot restriction on commands' keys. In a
+Meta-managed deployment, the entire dataset across all databases belongs to one
+Group covering the entire slot space.
 _Avoid_: Standalone when referring to Meta-managed Single
 
 **Cluster**:

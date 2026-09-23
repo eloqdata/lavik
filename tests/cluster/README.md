@@ -155,7 +155,9 @@ or premature ONLINE. The failover fixture additionally checks exact-once writes
 across replacement FULL and a cut acknowledgement disconnect. A failed directed rebuild remains
 fenced and reports its failure to Meta. The manager integration additionally
 checks that a Meta-managed source exports DB15 when its storage enables 16
-DBs; production managed Single startup stays disabled.
+DBs. Managed Single gates additionally verify client access and isolation across
+all 16 databases, cross-DB COPY, FULL cleanup, and multi-DB recovery through the
+same Meta failover and reparent fixtures.
 
 ## Running and extending
 

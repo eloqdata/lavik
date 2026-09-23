@@ -18,6 +18,7 @@
 
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -408,12 +409,6 @@ CommandReply ExecuteSimpleLocalCommand(const CommandRequest& request,
         // (db.c selectCommand); SELECT 0 stays a successful no-op.
         reply.encoded_ = reply_builder.AppendError(
             "ERR SELECT is not allowed in cluster mode");
-        return reply;
-      }
-      if (cluster::MetaManaged() && db_id != 0) {
-        reply.encoded_ = reply_builder.AppendError(
-            "ERR nonzero databases are not yet supported in Meta-managed "
-            "Single mode");
         return reply;
       }
       if (db_id >= storage::kLogicalDatabaseCount) {
@@ -5456,6 +5451,34 @@ Task<absl::Status> TwoPhaseFinishCallback(void* opaque, const tx::ShardSlice&) {
   co_return co_await g_storage->DiscardTxUndoLocal(txid);
 }
 
+#if LAVIK_FAULTS_ENABLED
+// Hold COPY's key locks at a known hop boundary while a process fixture
+// expires the real Meta lease. Release builds have no extra suspension point.
+Task<absl::Status> PauseCopyHopForTest(const CommandRequest& request,
+                                       std::string_view stage) {
+  if (request.kind_ != CommandKind::kCopy || request.replication_origin_ ||
+      !LAVIK_FAULT_MATCHES("LAVIK_COPY_PAUSE_KEY", request.args_[2]) ||
+      !LAVIK_FAULT_MATCHES("LAVIK_COPY_PAUSE_STAGE", stage)) {
+    co_return absl::OkStatus();
+  }
+  const char* hold = std::getenv("LAVIK_COPY_HOLD_FILE");
+  if (hold == nullptr) co_return absl::OkStatus();
+  spdlog::warn("COPY test checkpoint: {} hop finished", stage);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (::access(hold, F_OK) == 0) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      spdlog::warn("COPY test hold expired");
+      co_return absl::OkStatus();
+    }
+    const auto waited = co_await bycorf::SleepFor(*ThisWorker().self_,
+                                                  std::chrono::milliseconds(1));
+    if (!waited.ok()) co_return absl::OkStatus();
+  }
+  co_return absl::OkStatus();
+}
+#endif
+
 template <typename Context, typename ShouldSkip>
 Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
     tx::Transaction& transaction, const CommandRequest& request,
@@ -5486,6 +5509,7 @@ Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
   }
 
   status = co_await transaction.Execute(read_callback, context, false);
+  LAVIK_FAULT_INJECT((void)co_await PauseCopyHopForTest(request, "read"););
   if (!status.ok() || should_skip(*context)) {
     // The release hop does not mutate; a fence landing after the write
     // decision must not turn lock cleanup into a spurious failure.
@@ -5499,6 +5523,7 @@ Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
   }
 
   status = co_await transaction.Execute(write_callback, context, false);
+  LAVIK_FAULT_INJECT((void)co_await PauseCopyHopForTest(request, "write"););
   context->rollback_ = !status.ok();
   // The finish hop settles (publishes or rolls back) what the write hop did.
   // Validating it against a fresher fence would either block the settlement
@@ -11924,32 +11949,34 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       // Scope follows command execution shapes, not individual data types.
       // Cross-slot multi-key commands and the List/Sorted Set blocking family
       // share the standalone execution engine and the sole Group's admission,
-      // waiters and drain, so they serve directly. Still deferred: execution
+      // waiters and drain across all databases, so they serve directly.
+      // Database inspection uses the same Group read gate and population fence;
+      // KEYS retains its exclusive gate until its streamed response completes.
+      // Still deferred: execution
       // contexts that mutate outside one command's key view (transactions,
       // scripts, global and catalog operations), stream blocking and keyless
       // WAIT. Later tickets can remove a boundary only after wiring its
       // waits, participants and durable/catalog effects into Group authority.
       const auto flags = request.spec_ == nullptr ? 0u : request.spec_->flags_;
-      const bool keyless_data =
-          (flags & kCmdUsesDbGate) != 0 && (flags & kCmdNoKeys) != 0;
+      const bool database_inspection =
+          kind == CommandKind::kDbSize || kind == CommandKind::kScan ||
+          kind == CommandKind::kRandomKey || kind == CommandKind::kKeys;
+      const bool keyless_data = (flags & kCmdUsesDbGate) != 0 &&
+                                (flags & kCmdNoKeys) != 0 &&
+                                !database_inspection;
       const bool deferred =
           kind == CommandKind::kMulti || kind == CommandKind::kExec ||
           kind == CommandKind::kWatch || kind == CommandKind::kUnwatch ||
           kind == CommandKind::kDiscard || kind == CommandKind::kScript ||
           kind == CommandKind::kFunction || kind == CommandKind::kSortRo ||
-          kind == CommandKind::kKeys || kind == CommandKind::kSave ||
-          kind == CommandKind::kBgSave || kind == CommandKind::kXRead ||
-          kind == CommandKind::kXReadGroup || kind == CommandKind::kWait ||
-          (flags & kCmdDynamicWrite) != 0 || keyless_data;
+          kind == CommandKind::kSave || kind == CommandKind::kBgSave ||
+          kind == CommandKind::kXRead || kind == CommandKind::kXReadGroup ||
+          kind == CommandKind::kWait || (flags & kCmdDynamicWrite) != 0 ||
+          keyless_data;
       if (deferred && !script_kill && !function_kill && !function_stats) {
         if (ctx.in_multi_) ctx.multi_dirty_ = true;
         co_return BuiltReply(reply_builder.AppendError(
             "ERR command is not yet supported in Meta-managed Single mode"));
-      }
-      if (request.db_id_ != 0) {
-        co_return BuiltReply(
-            reply_builder.AppendError("ERR nonzero databases are not yet "
-                                      "supported in Meta-managed Single mode"));
       }
     }
   }

@@ -1739,14 +1739,10 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
 // rejects downstream native sessions while an upstream is configured, so this
 // path never has to act as a cascading relay.
 //
-// TODO(replication): this path also bypasses the command layer's database
-// gates (file-static in command.cpp), which KEYS and FLUSHDB close to get an
-// exclusive, still keyspace. On a replica, apply traffic keeps mutating the
-// index between KEYS's counting and emitting passes — the announced *N can
-// disagree with the emitted element count, desynchronizing that client's
-// RESP stream — and FLUSHDB's drain-then-detach exclusivity assumption does
-// not hold either. The redesign should either route apply through the gates
-// or pause application while a gated operation is in flight.
+// FULL storage apply does not acquire command database gates. Its caller must
+// close and drain those gates before import and keep the population unreadable
+// until the unified cut completes. ReplicationManager provides that lifetime
+// fence; ONLINE command replay instead uses the ordinary command gates.
 Task<absl::Status> StorageEngine::Impl::HandoffReplicaPartition(
     std::uint64_t session_id, std::uint16_t partition_id,
     std::uint64_t replication_epoch) {

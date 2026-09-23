@@ -1159,9 +1159,9 @@ and return the node to loading.
 Lavik does not serve Redis PSYNC or REPLCONF. RedisShake ScanReader exports the
 keyspace through ordinary authenticated INFO, SCAN, DUMP, and PTTL commands.
 DUMP payloads use RDB 11, requiring Redis 7.2 or newer at the destination.
-Standalone Single exposes DB0–15; Cluster exposes DB0 and discovery for its
-slot owners. Managed Single serves DB0 but currently rejects global SCAN/export
-until those paths acquire complete Group authority. Meta-managed sources retain
+Single exposes DB0–15; Cluster exposes DB0 and discovery for its slot owners.
+Managed Single database inspection uses the sole Group's read admission and
+complete-population fence. Meta-managed sources retain
 normal readiness and authority admission; export cannot read fenced data.
 
 This is a one-shot keyspace export with keyspace notifications disabled. It
@@ -1285,12 +1285,11 @@ connection metrics.
   Owner directly. It uses native CONTINUE, direct-parent HistorySwitch, or a
   destructive FULL, without a separate Meta rebuild operation. A former
   Owner freezes its source-domain cursor before retiring its old history.
-- Storage record application during replica synchronization bypasses the
-  command layer's database gates. The code records that this breaks the
-  exclusive, still-keyspace assumption used by KEYS's two-pass response and by
-  FLUSHDB drain-then-detach; concurrent apply can therefore make the announced
-  KEYS array length disagree with emitted elements or violate FLUSHDB
-  exclusivity.
+- FULL storage record application relies on ReplicationManager closing and
+  draining all command database gates before import, then keeping the entire
+  population unreadable until the unified cut completes. It does not acquire
+  those gates for each record. ONLINE command replay uses command database
+  gates, preserving KEYS's two-pass response and FLUSHDB's exclusivity.
 - Malformed, gapped, or divergent online command ingress, including frame
   identity/order, fragment reassembly, LRC1 decode, rendezvous, and
   command-apply failures, invalidates the whole continuation domain. Serving
@@ -1329,6 +1328,11 @@ and cancellation, and rejected corrupt or premature FULL completion. The
 cluster-create and failover gates cover TLS, restart, authority withdrawal,
 and recovery. Internal manager integration verifies DB15 export independently
 of Meta management; the storage suite covers reset and disabled-DB recovery.
+Managed Single gates verify all-DB isolation, cross-database COPY, stale reads,
+FULL replacement of old database epochs, and the existing KEYS drain lifecycle.
+The shared failover, Candidate Recovery and population-recovery gates carry
+nonzero-DB values, copied collections and Stream consumer-group state through
+restart, promotion and reparent.
 `tests/cluster/README.md` inventories the model and manager safety checks.
 
 `tests/redis_follower_smoke.py` uses real Redis for startup/command entry,
