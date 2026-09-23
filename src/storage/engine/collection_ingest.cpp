@@ -301,6 +301,26 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     std::vector<RetainedMemoryCharge> input_charges;
     CollectionPage merged{.value_type_ = type};
     std::uint64_t merged_bytes = 0;
+    // A Sorted Set's first page builds both ordered and member directories.
+    // Repeating indexed ZADD for each small ingest batch can touch most member
+    // leaves again on every pass. Both directories need substantially more
+    // admitted scratch than the input bytes. Leave 31 parts of available
+    // retained headroom for page plans, the member index, and other owners;
+    // the hard cap bounds the input retained until the one-time build.
+    constexpr std::uint64_t kSortedSetBuildBytes = 24ULL * 1024 * 1024;
+    constexpr std::uint64_t kOtherBatchBytes = 1024ULL * 1024;
+    std::uint64_t batch_limit = kOtherBatchBytes;
+    if (type == ValueType::kSortedSet) {
+      const auto memory = GetWorkerMemoryStats(store.worker_->id());
+      const auto used = memory.retained_bytes_ +
+                        memory.admission_pending_bytes_ +
+                        memory.fullsync_reserved_bytes_;
+      const auto available = used >= memory.retained_limit_bytes_
+                                 ? 0
+                                 : memory.retained_limit_bytes_ - used;
+      batch_limit =
+          std::clamp(available / 32, kOtherBatchBytes, kSortedSetBuildBytes);
+    }
     bool first_write = true;
     auto flush = [&]() -> Task<absl::Status> {
       if (merged.size() == 0) co_return absl::OkStatus();
@@ -397,7 +417,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       }
       done = page->done_;
       if (page->size() == 0) continue;
-      if (merged.size() != 0 && *bytes > 1024 * 1024 - merged_bytes) {
+      if (merged.size() != 0 && *bytes > batch_limit - merged_bytes) {
         auto written = co_await flush();
         if (!written.ok()) co_return written;
       }
@@ -420,7 +440,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       if (!admitted.ok()) co_return admitted;
       input_charges.push_back(std::move(page->retained_charge_));
       merged_bytes += *bytes;
-      if (merged_bytes >= 1024 * 1024 || done) {
+      if (merged_bytes >= batch_limit || done) {
         auto written = co_await flush();
         if (!written.ok()) co_return written;
       }
