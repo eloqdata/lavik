@@ -827,8 +827,17 @@ int main(int argc, char** argv) {
     sentinel_options.requirepass_ = std::move(options.sentinel_requirepass_);
     sentinel_options.maxclients_ =
         static_cast<std::size_t>(options.sentinel_maxclients_);
+    lavik::meta::MetaSentinelDiscoveryDependencies sentinel_discovery;
+    sentinel_discovery.raft_ = server;
+    sentinel_discovery.state_machine_ = state_machine.get();
+    sentinel_discovery.runtime_status_ = data_control_runtime_status;
+    sentinel_discovery.diagnostics_ = automatic_failover_diagnostics;
+    sentinel_discovery.observation_ttl_ms_ = observation_ttl_ms;
+    sentinel_discovery.leader_observation_grace_ms_ =
+        leader_observation_grace_ms;
     auto created = lavik::meta::MetaSentinelServer::Create(
-        foreign_executor, std::move(sentinel_options));
+        foreign_executor, std::move(sentinel_discovery),
+        std::move(sentinel_options));
     if (!created.ok()) {
       spdlog::critical("Sentinel server create failed: {}",
                        created.status().message());

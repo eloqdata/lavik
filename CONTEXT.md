@@ -36,6 +36,20 @@ _Avoid_: Standalone when referring to Meta-managed Single
 A Client Service Mode exposing slot-based routing and Redis Cluster command
 constraints. It describes the client contract, not a separate HA mechanism.
 
+**Discovery Entry**:
+The independent Sentinel-compatible RESP endpoint served by a Meta process for
+client discovery. Its answers are a projection of Committed State and current
+leader-local Observations; it holds no election state and is never a second
+source of truth for topology or authority.
+_Avoid_: External Sentinel, discovery proxy
+
+**Service Name**:
+The stable identifier a client resolves through the Discovery Entry. It is the
+committed Group ID of the Group being discovered — in a Meta-managed Single
+deployment, the unique complete Group. Owner replacement and Meta restart
+never change it.
+_Avoid_: Master name
+
 **Stale Replica Read**:
 A read of a replica's complete local population without a freshness guarantee
 relative to the Owner. It neither requires nor grants Owner write authority;

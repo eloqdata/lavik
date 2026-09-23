@@ -32,14 +32,9 @@ import unittest
 import harness as H
 import sentinel_compat
 
-BINARY = os.path.abspath(sys.argv.pop(1))
+# Parsed under __main__ so sibling gates can import the RESP client helpers.
+BINARY = None
 DATA_BINARY = None
-if (
-    len(sys.argv) > 1
-    and not sys.argv[1].startswith("-")
-    and os.path.isfile(sys.argv[1])
-):
-    DATA_BINARY = os.path.abspath(sys.argv.pop(1))
 
 
 class RespError(bytes):
@@ -86,7 +81,10 @@ class Client:
                 raise AssertionError("truncated bulk reply")
             return data
         if tag == b"*":
-            return [self.read() for _ in range(int(value))]
+            count = int(value)
+            if count == -1:
+                return None
+            return [self.read() for _ in range(count)]
         if tag == b"%":
             return {self.read(): self.read() for _ in range(int(value))}
         raise AssertionError(f"unexpected reply: {line!r}")
@@ -162,6 +160,12 @@ class SentinelTest(unittest.TestCase):
             node, port = self.node(password=password)
             sentinel_compat.check_port(self, port, password)
             node.terminate()
+            # Discovery exchanges carry committed topology claims, so Lavik
+            # answers them only on a caught-up leader; replay them there.
+            leader, leader_port = self.node(password=password, bootstrap=True)
+            H.wait_until("Meta leader", 5, leader.is_leader)
+            sentinel_compat.check_discovery_port(self, leader_port, password)
+            leader.terminate()
 
     def test_connection_commands_on_leader_and_waiting_follower(self):
         leader, leader_port = self.node(bootstrap=True)
@@ -263,15 +267,42 @@ class SentinelTest(unittest.TestCase):
             ("status",),
             ("clusterhead", 1),
             ("submitop", "x"),
-            ("SENTINEL", "GET-MASTER-ADDR-BY-NAME", "mymaster"),
-            ("SENTINEL", "MASTERS"),
+            ("SENTINEL",),
+            ("SENTINEL", "GARBAGE"),
             ("SENTINEL", "MONITOR", "x"),
             ("SENTINEL", "FAILOVER", "x"),
             ("SENTINEL", "IS-MASTER-DOWN-BY-ADDR", "127.0.0.1", 1, 1, "x"),
         ]:
             with self.subTest(args=args):
                 self.error(client.command(*args), b"ERR")
+        # This node is a waiting joiner and never becomes leader. The five
+        # discovery verbs are leader-only: on a non-authoritative node they
+        # close the connection without any reply, so a client must retry its
+        # next seed rather than trust a stale answer.
         for args in [
+            ("SENTINEL", "GET-MASTER-ADDR-BY-NAME", "mymaster"),
+            ("SENTINEL", "MASTER", "mymaster"),
+            ("SENTINEL", "MASTERS"),
+            ("SENTINEL", "REPLICAS", "mymaster"),
+            ("SENTINEL", "SLAVES", "mymaster"),
+        ]:
+            with self.subTest(args=args):
+                discovery = self.client(port)
+                discovery.sock.sendall(encode(*args))
+                # A reply followed by a close would surface the reply first;
+                # immediate EOF/reset proves the no-reply drop contract.
+                with self.assertRaises((EOFError, ConnectionResetError)):
+                    discovery.read()
+        # Arity is validated before the authority check, so even this
+        # never-leader node answers malformed discovery calls explicitly and
+        # keeps the connection open.
+        for args in [
+            ("SENTINEL", "GET-MASTER-ADDR-BY-NAME"),
+            ("SENTINEL", "GET-MASTER-ADDR-BY-NAME", "a", "b"),
+            ("SENTINEL", "MASTER"),
+            ("SENTINEL", "MASTERS", "extra"),
+            ("SENTINEL", "REPLICAS"),
+            ("SENTINEL", "SLAVES"),
             ("AUTH",),
             ("PING", "a", "b"),
             ("QUIT", "extra"),
@@ -284,6 +315,51 @@ class SentinelTest(unittest.TestCase):
         self.assertEqual(client.command("RESET"), b"RESET")
         self.assertEqual(client.command("PING"), b"PONG")
         node.terminate()
+
+    def test_discovery_null_contract_on_bootstrap_leader(self):
+        leader, leader_port = self.node(bootstrap=True)
+        follower, follower_port = self.node()
+        H.wait_until("Meta leader", 5, leader.is_leader)
+        self.assertFalse(follower.is_leader())
+        client = self.client(leader_port)
+        self.assertEqual(client.command("AUTH", "sentinel-secret"), b"OK")
+        # No cluster was ever created: every service name is unknown. The
+        # null/error matrix matches real Redis 7.2 on a bare Sentinel.
+        self.assertEqual(client.command("SENTINEL", "MASTERS"), [])
+        self.assertIsNone(
+            client.command("SENTINEL", "GET-MASTER-ADDR-BY-NAME", "nosuch")
+        )
+        for subcommand in ("MASTER", "REPLICAS", "SLAVES"):
+            with self.subTest(subcommand=subcommand):
+                self.error(
+                    client.command("SENTINEL", subcommand, "nosuch"),
+                    b"ERR No such master with that name",
+                )
+        hello = client.command("HELLO", 3)
+        self.assertEqual(hello[b"proto"], 3)
+        self.assertEqual(client.command("SENTINEL", "MASTERS"), [])
+        self.assertIsNone(
+            client.command("SENTINEL", "GET-MASTER-ADDR-BY-NAME", "nosuch")
+        )
+        for subcommand in ("MASTER", "REPLICAS", "SLAVES"):
+            with self.subTest(subcommand=subcommand, proto=3):
+                self.error(
+                    client.command("SENTINEL", subcommand, "nosuch"),
+                    b"ERR No such master with that name",
+                )
+        # The follower answers connection commands but drops discovery.
+        follower_client = self.client(follower_port)
+        self.assertEqual(follower_client.command("AUTH", "sentinel-secret"), b"OK")
+        self.assertEqual(follower_client.command("PING"), b"PONG")
+        discovery = self.client(follower_port)
+        discovery.sock.sendall(
+            encode("AUTH", "sentinel-secret") + encode("SENTINEL", "MASTERS")
+        )
+        self.assertEqual(discovery.read(), b"OK")
+        with self.assertRaises((EOFError, ConnectionResetError)):
+            discovery.read()
+        leader.terminate()
+        follower.terminate()
 
     def test_fragmentation_pipeline_malformed_and_input_limit(self):
         node, port = self.node(password="")
@@ -559,4 +635,11 @@ class SentinelTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    BINARY = os.path.abspath(sys.argv.pop(1))
+    if (
+        len(sys.argv) > 1
+        and not sys.argv[1].startswith("-")
+        and os.path.isfile(sys.argv[1])
+    ):
+        DATA_BINARY = os.path.abspath(sys.argv.pop(1))
     unittest.main()

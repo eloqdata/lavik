@@ -59,10 +59,11 @@ independent of an Admin client's connection or wait deadline. It links the
 [Meta Raft runtime](10-meta-raft.md), a Go C archive with pinned etcd Raft/WAL
 modules and independent protocol, disk and peer-connection owners;
 Bycorf owns the separate administrative and Data-node sessions, plus an
-optional Sentinel-compatible RESP endpoint for client authentication and
-connection commands. Sentinel and Data connections authenticate independently
-using shared password-verification code; standalone Data has no Meta
-authentication dependency. The Raft-free
+optional Sentinel-compatible Discovery Entry for client authentication,
+connection commands, and leader-only authoritative topology discovery for
+Meta-managed Single deployments. Sentinel and Data connections authenticate
+independently using shared password-verification code; standalone Data has no
+Meta authentication dependency. The Raft-free
 `lavik-ctl` operator client sends direct administrative commands; its
 `cluster-status` command discovers the current Meta leader and reads one stable
 cluster-readiness cut through that surface; `failover` submits a durable

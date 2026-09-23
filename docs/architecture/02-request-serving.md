@@ -28,7 +28,9 @@ separate modules reached through explicit interfaces.
 
 The RESP parser/reply builder and default-user password verifier form a small
 shared library also used by Meta's Sentinel server. That server owns separate
-sessions and its own command allowlist; sharing these primitives does not
+sessions and its own command allowlist; besides connection commands, the
+allowlist covers the leader-only Sentinel topology discovery verbs, answered
+from Meta committed state. Sharing these primitives does not
 share credentials or expose Data dispatch. Data AUTH, HELLO, and RESET remain
 local connection operations, including in standalone deployments without Meta.
 

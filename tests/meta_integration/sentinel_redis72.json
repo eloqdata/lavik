@@ -508,6 +508,70 @@
         "*12\r\n$6\r\nserver\r\n$8\r\n<server>\r\n$7\r\nversion\r\n$9\r\n<version>\r\n$5\r\nproto\r\n:2\r\n$2\r\nid\r\n:0\r\n$4\r\nmode\r\n$8\r\nsentinel\r\n$7\r\nmodules\r\n*0\r\n",
         "$7\r\npayload\r\n"
       ]
+    },
+    {
+      "name": "authenticated/discovery-unknown-service",
+      "password": "sentinel-secret",
+      "discovery": true,
+      "requests": [
+        ["AUTH", "sentinel-secret"],
+        ["SENTINEL", "GET-MASTER-ADDR-BY-NAME", "nosuch"],
+        ["SENTINEL", "MASTER", "nosuch"],
+        ["SENTINEL", "MASTERS"],
+        ["SENTINEL", "REPLICAS", "nosuch"],
+        ["SENTINEL", "SLAVES", "nosuch"],
+        ["HELLO", "3"],
+        ["SENTINEL", "GET-MASTER-ADDR-BY-NAME", "nosuch"],
+        ["SENTINEL", "MASTER", "nosuch"],
+        ["SENTINEL", "MASTERS"],
+        ["SENTINEL", "REPLICAS", "nosuch"],
+        ["SENTINEL", "SLAVES", "nosuch"]
+      ],
+      "replies": [
+        "+OK\r\n",
+        "*-1\r\n",
+        "-ERR No such master with that name\r\n",
+        "*0\r\n",
+        "-ERR No such master with that name\r\n",
+        "-ERR No such master with that name\r\n",
+        "%6\r\n$6\r\nserver\r\n$8\r\n<server>\r\n$7\r\nversion\r\n$9\r\n<version>\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:0\r\n$4\r\nmode\r\n$8\r\nsentinel\r\n$7\r\nmodules\r\n*0\r\n",
+        "_\r\n",
+        "-ERR No such master with that name\r\n",
+        "*0\r\n",
+        "-ERR No such master with that name\r\n",
+        "-ERR No such master with that name\r\n"
+      ]
+    },
+    {
+      "name": "no-password/discovery-unknown-service",
+      "password": "",
+      "discovery": true,
+      "requests": [
+        ["SENTINEL", "GET-MASTER-ADDR-BY-NAME", "nosuch"],
+        ["SENTINEL", "MASTER", "nosuch"],
+        ["SENTINEL", "MASTERS"],
+        ["SENTINEL", "REPLICAS", "nosuch"],
+        ["SENTINEL", "SLAVES", "nosuch"],
+        ["HELLO", "3"],
+        ["SENTINEL", "GET-MASTER-ADDR-BY-NAME", "nosuch"],
+        ["SENTINEL", "MASTER", "nosuch"],
+        ["SENTINEL", "MASTERS"],
+        ["SENTINEL", "REPLICAS", "nosuch"],
+        ["SENTINEL", "SLAVES", "nosuch"]
+      ],
+      "replies": [
+        "*-1\r\n",
+        "-ERR No such master with that name\r\n",
+        "*0\r\n",
+        "-ERR No such master with that name\r\n",
+        "-ERR No such master with that name\r\n",
+        "%6\r\n$6\r\nserver\r\n$8\r\n<server>\r\n$7\r\nversion\r\n$9\r\n<version>\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:0\r\n$4\r\nmode\r\n$8\r\nsentinel\r\n$7\r\nmodules\r\n*0\r\n",
+        "_\r\n",
+        "-ERR No such master with that name\r\n",
+        "*0\r\n",
+        "-ERR No such master with that name\r\n",
+        "-ERR No such master with that name\r\n"
+      ]
     }
   ]
 }

@@ -94,10 +94,13 @@ run independently of the protocol loop. The former `--raft-io-threads`,
 
 ## Sentinel client endpoint
 
-Meta can expose a dedicated Redis Sentinel-compatible RESP port. It is disabled
-unless `--sentinel-addr` is explicitly supplied. The following starts a waiting
-Meta joiner with a Sentinel endpoint; connection commands work before membership
-or a Data cluster exists. Use the initial-cluster manifest described above when
+Meta can expose a dedicated Redis Sentinel-compatible RESP port, the Discovery
+Entry. It is disabled unless `--sentinel-addr` is explicitly supplied. The
+following starts a waiting Meta joiner with a Sentinel endpoint; connection
+commands work before membership or a Data cluster exists. Topology discovery
+answers come only from the current caught-up Meta leader and only once a
+Meta-managed Single deployment exists; see the discovery publication contract
+below. Use the initial-cluster manifest described above when
 bootstrapping a new Meta cluster.
 
 ```sh
@@ -152,20 +155,32 @@ operator authority. Meta does not forward application AUTH to Data.
 | `PING [message]` | PONG or the supplied message |
 | `CLIENT SETNAME`, `CLIENT SETINFO LIB-NAME/LIB-VER` | Store validated connection-local metadata |
 | `QUIT`, `RESET` | Close after OK, or clear identity metadata and return to RESP2 and the initial authentication state |
-| Sentinel queries, including `GET-MASTER-ADDR-BY-NAME` and `MASTERS` | Explicit unsupported-command error; Primary discovery is not yet available |
-| Data, Pub/Sub, replication, Admin, and Sentinel management/election commands | Rejected, even after successful authentication |
+| `SENTINEL GET-MASTER-ADDR-BY-NAME <service>` | Two-element `[ip, port]` Primary address array, or null while the service is unknown or has no publishable Primary |
+| `SENTINEL MASTER <service>`, `SENTINEL MASTERS` | Field map for one named service, or for every currently publishable service |
+| `SENTINEL REPLICAS <service>`, `SENTINEL SLAVES <service>` | Field-map array of the service's committed non-Owner members |
+| Data, Pub/Sub, replication, Admin, and Sentinel management/election commands (MONITOR, FAILOVER, SET, REMOVE, CKQUORUM, SENTINELS, IS-MASTER-DOWN-BY-ADDR, and similar) | Rejected, even after successful authentication |
 
 When a password is configured, only AUTH, HELLO, QUIT, and RESET execute
 before authentication; registered CLIENT arity errors are checked first, as
-in Redis. New connections start in RESP2. This connection-level
-support is not a claim of complete Sentinel client discovery or failover
-compatibility.
+in Redis. New connections start in RESP2.
+
+The five discovery verbs are answered only by the current caught-up Meta
+leader. A follower, a leader whose state machine has not caught up, or a
+waiting joiner closes the connection without writing a reply, so seed every
+Meta member's Sentinel address and let the client retry through the list;
+there is no redirect. Service names are committed Group IDs (for example
+`group-1`), matched exactly. The null/error contract, field contents, and
+flag semantics are specified in the discovery publication contract below.
 
 The supported AUTH, HELLO, PING and CLIENT connection commands target Redis
 7.2.14 Sentinel. CI compares their complete RESP frames and error messages
 against recorded replies from that reference, including authentication and
 protocol state after failures. Only HELLO's product name, version and connection
 ID are normalized; its field types, order and RESP2/RESP3 framing remain exact.
+Discovery replies follow the same reference: RESP2 carries the flat
+key/value array form and RESP3 the map form, GET-MASTER-ADDR-BY-NAME's null
+uses the negotiated protocol's Redis null encoding, and the unknown-service
+error text is verbatim `No such master with that name`.
 The checked-in reference can also be replayed against a real Redis binary:
 
 ```sh
@@ -189,6 +204,163 @@ and blocked writes have ten-second deadlines. Authenticated idle connections
 remain open. Malformed or oversized input, output overflow, and expired
 deadlines close the affected connection and release its slot. Process shutdown
 also drains idle, partial-request, and blocked-write connections.
+
+### Discovery publication contract
+
+Discovery answers are available only for a Meta-managed Single deployment:
+lifecycle `created`, the immutable `client_mode = "single"`, and exactly one
+complete Group. The Service Name a client asks for is that Group's committed
+Group ID, matched exactly; every other name is an unknown service.
+
+Publication rules. A Primary address is published only from committed
+authority: the Group's authority is active and its committed Owner is not
+retired and advertises a plaintext client endpoint that parses as a numeric IP
+with a nonzero, non-wildcard port. Plaintext means the `tcp://` tag or the
+legacy untagged form; `tls://` endpoints are never published here. Raft,
+Data-control, and Admin endpoints never appear. Health never gates
+publication: an unhealthy but still-authoritative Owner stays published and is
+marked by flags instead. Objective failure is expressed by withdrawing
+publication: once committed authority is gone (for example after an
+uncontrolled fence), the Primary record disappears until a new authority
+commits.
+
+Null and error contract. Answers follow the Redis 7.2.14 Sentinel shapes:
+flat key/value arrays under RESP2, maps under RESP3.
+
+| Query | Publishable Primary exists | Service known, Primary withdrawn | Unknown service name |
+|---|---|---|---|
+| `GET-MASTER-ADDR-BY-NAME` | `[ip, port]` array | null | null |
+| `MASTERS` | one-element array with the field map | empty array (service omitted) | empty array |
+| `MASTER` | field map | `No such master with that name` error | `No such master with that name` error |
+| `REPLICAS` / `SLAVES` | field-map array of committed replicas | same, with `master_down` in each flags field | `No such master with that name` error |
+
+A known service with zero committed replicas returns an empty `REPLICAS` array.
+
+Field provenance. Every entry in a `MASTER`/`MASTERS` reply draws from three
+sources:
+
+| Field | Provenance | Content |
+|---|---|---|
+| `name` | committed truth | the Group ID (the Service Name) |
+| `ip`, `port` | committed truth | the Owner's advertised `tcp://` client endpoint |
+| `runid` | committed truth | the Owner's node ID |
+| `flags` | observation truth | always `master`; may add `s_down` and `disconnected` per the flag rules below; never `o_down` |
+| `config-epoch` | committed truth | the Group Term |
+| `num-slaves` | committed truth | count of committed, non-retired members excluding the Owner |
+| `num-other-sentinels` | documented constant | `0`; there is no Sentinel peer directory yet (tracked as #105) |
+| `role-reported` | documented constant | `master` |
+| `down-after-milliseconds` | documented constant | `30000` |
+| `quorum` | documented constant | `1` |
+| `failover-timeout` | documented constant | `180000` |
+| `parallel-syncs` | documented constant | `1` |
+| `link-pending-commands`, `link-refcount` | documented constant | `0` |
+| `last-ping-sent`, `last-ok-ping-reply`, `last-ping-reply`, `info-refresh`, `role-reported-time` | documented constant | `0` |
+
+A `REPLICAS`/`SLAVES` entry likewise mixes the three sources:
+
+| Field | Provenance | Content |
+|---|---|---|
+| `name` | committed truth | the replica's `ip:port` |
+| `ip`, `port` | committed truth | the replica's advertised `tcp://` client endpoint |
+| `runid` | committed truth | the replica's node ID |
+| `flags` | observation truth | always `slave`; may add `s_down`, `disconnected`, and `master_down` per the flag rules below |
+| `master-host`, `master-port` | committed truth | the committed Owner endpoint; omitted rather than fabricated while no publishable Owner endpoint exists |
+| `role-reported` | documented constant | `slave` |
+| `slave-priority` | documented constant | `100` |
+| `slave-repl-offset` | documented constant | `0`; Lavik exposes no scalar replication offset |
+| `replica-announced` | documented constant | `1` |
+| remaining timestamp/counter fields | documented constant | `0` |
+| `master-link-status`, `master-link-down-time` | omitted | link state is not published on this interface; see known limitations |
+
+Flags semantics. A Primary always carries `master`. It also carries `s_down`
+while the leader's Automatic Failover Detector reports SUSPECT or TRIGGERING
+for the exact committed Owner/assignment/Group Term anchor; diagnostics from a
+stale leadership bracket or anchor are ignored rather than applied. It carries
+`disconnected` while the Owner has no live Data-control session. A replica
+always carries `slave`. The committed Owner record is the sole role authority:
+failover commits never rewrite member roles, so every committed, non-retired
+member except the current Owner is listed as a replica, and member removal
+removes it from the list; the one exception is the leader-change grace below,
+which omits never-yet-observed members outright. A replica is
+reported without `s_down` only while it holds a live authenticated session, a
+TTL-fresh heartbeat with all health bits green, and a node-validated projection
+anchor (Group Term, assignment, population manifest revision and digest, and
+partition replication epoch) matching committed state; otherwise
+`s_down` is set. `disconnected` marks a missing session, and `master_down`
+marks that the service currently has no publishable Primary. `o_down` is never
+emitted on any record; objective down is the withdrawal described above.
+
+Leader-change grace. During the leadership observation grace after a Meta
+leader change (derived as at least the Raft election upper bound plus the
+maximum supported Data reconnect delay, and never shorter than the observation
+TTL), absence of observation is not treated as failure evidence. A Primary the
+new leader has never observed simply carries no down flags: publication is
+gated on committed authority, and a speculative `s_down` would block all
+discovery toward a still-authoritative address. Replica listings are stricter
+in the same window: a member this leader has never observed is omitted from
+`REPLICAS`/`SLAVES` results, because an unverified member — possibly still in
+its first FULL rebuild — must not be selected into client read pools, and
+omission claims neither health nor failure. A node observed and then lost
+counts as down at any time; once the grace expires, a still-unobserved member
+is listed with `s_down` and `disconnected`.
+
+Known limitations.
+
+- Link state is not published on this interface: `master-link-status` and
+  `master-link-down-time` are omitted because Meta has no truthful steady-state
+  observation of a replica's upstream link (see ADR 0024).
+- `slave-repl-offset` is a placeholder constant `0`; progress has no scalar
+  form comparable across replication Compatibility Domains.
+- `num-other-sentinels` is `0`; the Sentinel peer directory and
+  `+switch-master` events arrive with #105.
+- Only plaintext addresses (`tcp://` or the legacy untagged form) are
+  published. TLS-only deployments resolve to null
+  until TLS address publication arrives with #109.
+- Only Meta-managed Single deployments are discoverable here; Cluster
+  deployments use `CLUSTER SLOTS`/`NODES` on the Data nodes instead.
+
+Client examples. Seed every Meta member's Sentinel address; non-leader seeds
+close the connection, and the client retries the next seed. The service name
+is the committed Group ID, such as `group-1`. With redis-py pinned to 8.1.0:
+
+```python
+# pip install redis==8.1.0
+from redis.sentinel import Sentinel
+
+sentinel = Sentinel(
+    [("10.0.0.11", 26379), ("10.0.0.12", 26379), ("10.0.0.13", 26379)],
+    sentinel_kwargs={"password": "sentinel-secret"},  # Meta --sentinel-requirepass
+    password="data-secret",  # Data --requirepass
+)
+
+primary = sentinel.master_for("group-1", socket_timeout=1.0)
+primary.set("example", "value")
+
+replica = sentinel.slave_for("group-1", socket_timeout=1.0)
+print(replica.get("example"))
+```
+
+With go-redis pinned to 9.22.0:
+
+```go
+// go get github.com/redis/go-redis/v9@v9.22.0
+rdb := redis.NewFailoverClient(&redis.FailoverOptions{
+    MasterName:       "group-1",
+    SentinelAddrs:    []string{"10.0.0.11:26379", "10.0.0.12:26379", "10.0.0.13:26379"},
+    SentinelPassword: "sentinel-secret", // Meta --sentinel-requirepass
+    Password:         "data-secret",     // Data --requirepass
+})
+defer rdb.Close()
+if err := rdb.Set(ctx, "example", "value", 0).Err(); err != nil {
+    return err
+}
+```
+
+Both pinned clients negotiate RESP3 toward Sentinel seeds by default and also
+work when restricted to RESP2; the Discovery Entry answers both shapes. Sentinel
+authentication and Data authentication remain the separate credentials
+described above. go-redis's `+switch-master` subscription is inert until #105;
+its failover client re-resolves the Primary on every new Data connection.
 
 ## Send administrative commands
 

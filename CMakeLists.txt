@@ -599,6 +599,7 @@ set(LAVIK_META_CORE_SOURCES
   src/meta/control_projector.cpp
   src/meta/coordinator.cpp
   src/meta/ctl_server.cpp
+  src/meta/sentinel_discovery.cpp
   src/meta/sentinel_server.cpp
   src/meta/data_control_server.cpp
   src/meta/data_control_runtime_status.cpp
@@ -877,6 +878,7 @@ if (BUILD_TESTING)
     tests/meta_model_test.cpp
     tests/meta_observation_test.cpp
     tests/meta_owner_serviceability_test.cpp
+    tests/meta_sentinel_discovery_test.cpp
     tests/meta_sentinel_server_test.cpp
     tests/meta_security_test.cpp
     tests/meta_state_machine_test.cpp
@@ -936,6 +938,22 @@ if (BUILD_TESTING)
     set_tests_properties(meta_integration.sentinel PROPERTIES
       LABELS meta-integration
       TIMEOUT 120
+      RUN_SERIAL TRUE
+    )
+
+    # Sentinel topology discovery acceptance: 3 Meta with Sentinel entries,
+    # one managed Single group, real redis-py 8.1.0 in both RESP versions.
+    # The gate self-probes <build>/test_tools/redis_py and skips when redis-py
+    # is absent unless LAVIK_REQUIRE_REDIS_PY=1 (set by run_ci_tests.sh in CI).
+    add_test(
+      NAME meta_integration.sentinel_discovery
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_sentinel_discovery.py
+              $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>
+    )
+    set_tests_properties(meta_integration.sentinel_discovery PROPERTIES
+      LABELS meta-integration
+      TIMEOUT 300
       RUN_SERIAL TRUE
     )
 

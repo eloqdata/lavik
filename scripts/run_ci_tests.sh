@@ -28,6 +28,17 @@ if [[ ! -d "$LAVIK_TEST_DATA_DIR" || ! -w "$LAVIK_TEST_DATA_DIR" || ! -x "$LAVIK
   exit 1
 fi
 
+# The Sentinel discovery gate (meta_integration.sentinel_discovery) is only
+# meaningful with the pinned redis-py module. CI installs it hash-pinned into
+# the test venv (ci.yml "Install build and test dependencies"), whose python
+# then runs the gates; make the gate mandatory there so a provisioning
+# regression cannot turn the acceptance coverage into a silent skip. Outside
+# CI the gate self-probes <build>/test_tools/redis_py and skips when redis-py
+# is absent.
+if [[ -n "${RUNNER_TEMP:-}" ]]; then
+  export LAVIK_REQUIRE_REDIS_PY=1
+fi
+
 status=0
 run_suite() {
   local name=$1
