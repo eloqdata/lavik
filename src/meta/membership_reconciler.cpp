@@ -66,6 +66,7 @@ void WritePeer(MetaWriter& w, const MetaMembershipPeer& p) {
   w.WriteString(p.principal_);
   w.WriteString(p.data_control_endpoint_);
   w.WriteString(p.ctl_endpoint_);
+  w.WriteString(p.sentinel_endpoint_);
   w.WriteU32(std::bit_cast<std::uint32_t>(p.dc_id_));
   w.WriteU32(std::bit_cast<std::uint32_t>(p.priority_));
   w.WriteBool(p.learner_);
@@ -77,18 +78,21 @@ absl::StatusOr<MetaMembershipPeer> ReadPeer(MetaReader& r) {
   auto principal = r.ReadString(kMaxMetaPrincipalBytes);
   auto data_control = r.ReadString(kMaxMetaEndpointBytes);
   auto ctl = r.ReadString(kMaxMetaEndpointBytes);
+  auto sentinel = r.ReadString(kMaxMetaEndpointBytes);
   auto dc = r.ReadU32();
   auto priority = r.ReadU32();
   auto learner = r.ReadBool("invalid learner");
   auto joining = r.ReadBool("invalid new-joiner");
   if (!id.ok() || !endpoint.ok() || !principal.ok() || !data_control.ok() ||
-      !ctl.ok() || !dc.ok() || !priority.ok() || !learner.ok() || !joining.ok())
+      !ctl.ok() || !sentinel.ok() || !dc.ok() || !priority.ok() ||
+      !learner.ok() || !joining.ok())
     return Conflict("invalid membership peer encoding");
   if (*id == 0 || *id > INT32_MAX ||
       *principal != absl::StrCat("lavik://meta/", *id) ||
       !lavik::ParseNumericEndpoint(*endpoint) ||
       !lavik::ParseNumericEndpoint(*data_control) ||
-      !lavik::ParseNumericEndpoint(*ctl))
+      !lavik::ParseNumericEndpoint(*ctl) ||
+      (!sentinel->empty() && !lavik::ParseNumericEndpoint(*sentinel)))
     return Conflict("invalid membership peer identity");
   return MetaMembershipPeer{*id,
                             std::string(*endpoint),
@@ -98,7 +102,8 @@ absl::StatusOr<MetaMembershipPeer> ReadPeer(MetaReader& r) {
                             std::bit_cast<std::int32_t>(*dc),
                             std::bit_cast<std::int32_t>(*priority),
                             *learner,
-                            *joining};
+                            *joining,
+                            std::string(*sentinel)};
 }
 void WriteBinding(MetaWriter& w, const MetaMemberRecord& p) {
   w.WriteU32(p.server_id_);
@@ -106,6 +111,7 @@ void WriteBinding(MetaWriter& w, const MetaMemberRecord& p) {
   w.WriteString(p.data_control_endpoint_);
   w.WriteOptional(p.ctl_endpoint_,
                   [](auto& out, const auto& s) { out.WriteString(s); });
+  w.WriteString(p.sentinel_endpoint_);
 }
 absl::StatusOr<MetaMemberRecord> ReadBinding(MetaReader& r) {
   auto id = r.ReadU32();
@@ -117,10 +123,12 @@ absl::StatusOr<MetaMemberRecord> ReadBinding(MetaReader& r) {
         if (!s.ok()) return s.status();
         return std::string(*s);
       });
-  if (!id.ok() || !principal.ok() || !data.ok() || !ctl.ok())
+  auto sentinel = r.ReadString(kMaxMetaEndpointBytes);
+  if (!id.ok() || !principal.ok() || !data.ok() || !ctl.ok() || !sentinel.ok())
     return Conflict("invalid membership binding encoding");
-  return MetaMemberRecord{*id, std::string(*principal), std::string(*data),
-                          *ctl, false};
+  return MetaMemberRecord{
+      *id,   std::string(*principal), std::string(*data), *ctl,
+      false, std::string(*sentinel)};
 }
 }  // namespace
 
@@ -138,7 +146,8 @@ absl::StatusOr<std::vector<MetaMembershipPeer>> CaptureMembershipConfig(
     peers.push_back({static_cast<std::uint32_t>(p->get_id()), p->get_endpoint(),
                      identity->principal_, identity->data_control_endpoint_,
                      identity->ctl_endpoint_, p->get_dc_id(), p->get_priority(),
-                     p->is_learner(), p->is_new_joiner()});
+                     p->is_learner(), p->is_new_joiner(),
+                     identity->sentinel_endpoint_});
   }
   std::sort(peers.begin(), peers.end(),
             [](const auto& a, const auto& b) { return a.id_ < b.id_; });
@@ -159,9 +168,9 @@ absl::StatusOr<std::optional<BindMetaMember>> PlanInitialMetaBindings(
                            peer.learner_ || peer.new_joiner_)) {
       return Conflict("initial Meta config contains a non-voter descriptor");
     }
-    const MetaMemberRecord expected{peer.id_, peer.principal_,
-                                    peer.data_control_endpoint_,
-                                    peer.ctl_endpoint_, false};
+    const MetaMemberRecord expected{
+        peer.id_,           peer.principal_, peer.data_control_endpoint_,
+        peer.ctl_endpoint_, false,           peer.sentinel_endpoint_};
     const auto actual = view.identity().FindMetaMember(peer.id_);
     if (actual.has_value()) {
       if (*actual != expected) {
@@ -178,6 +187,7 @@ absl::StatusOr<std::optional<BindMetaMember>> PlanInitialMetaBindings(
     bind.principal_ = peer.principal_;
     bind.data_control_endpoint_ = peer.data_control_endpoint_;
     bind.ctl_endpoint_ = peer.ctl_endpoint_;
+    bind.sentinel_endpoint_ = peer.sentinel_endpoint_;
     return std::optional(std::move(bind));
   }
   if (initial_config) {
@@ -233,6 +243,7 @@ absl::StatusOr<MetaMembershipIntent> DecodeMembershipIntent(
       binding->principal_ != target->principal_ ||
       binding->data_control_endpoint_ != target->data_control_endpoint_ ||
       binding->ctl_endpoint_ != std::optional(target->ctl_endpoint_) ||
+      binding->sentinel_endpoint_ != target->sentinel_endpoint_ ||
       bindings->size() != before->size())
     return Conflict("inconsistent membership intent");
   MetaIdentityStore identities;
@@ -243,7 +254,8 @@ absl::StatusOr<MetaMembershipIntent> DecodeMembershipIntent(
         record.server_id_ != peer.id_ || record.principal_ != peer.principal_)
       return Conflict("membership baseline is not canonical");
     if (record.data_control_endpoint_ != peer.data_control_endpoint_ ||
-        record.ctl_endpoint_ != std::optional(peer.ctl_endpoint_)) {
+        record.ctl_endpoint_ != std::optional(peer.ctl_endpoint_) ||
+        record.sentinel_endpoint_ != peer.sentinel_endpoint_) {
       return Conflict("membership baseline descriptor differs from binding");
     }
     BindMetaMember c;
@@ -251,6 +263,7 @@ absl::StatusOr<MetaMembershipIntent> DecodeMembershipIntent(
     c.principal_ = record.principal_;
     c.data_control_endpoint_ = record.data_control_endpoint_;
     c.ctl_endpoint_ = record.ctl_endpoint_;
+    c.sentinel_endpoint_ = record.sentinel_endpoint_;
     if (!identities.Apply(c).ok()) return Conflict("invalid baseline binding");
     if (identities.FindMetaMember(record.server_id_) != std::optional(record))
       return Conflict("noncanonical baseline binding");
@@ -266,6 +279,7 @@ absl::StatusOr<MetaMembershipIntent> DecodeMembershipIntent(
   c.principal_ = binding->principal_;
   c.data_control_endpoint_ = binding->data_control_endpoint_;
   c.ctl_endpoint_ = binding->ctl_endpoint_;
+  c.sentinel_endpoint_ = binding->sentinel_endpoint_;
   if (!identities.Apply(c).ok()) return Conflict("invalid target binding");
   if (identities.FindMetaMember(binding->server_id_) !=
           std::optional(*binding) ||
@@ -327,6 +341,7 @@ Plan PlanMembershipStep(const MetaCommittedView& view,
       c.principal_ = p.binding_.principal_;
       c.data_control_endpoint_ = p.binding_.data_control_endpoint_;
       c.ctl_endpoint_ = p.binding_.ctl_endpoint_;
+      c.sentinel_endpoint_ = p.binding_.sentinel_endpoint_;
       return Command(std::move(c));
     }
     return Phase(op, "change-config");
@@ -621,7 +636,8 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
                           t.id_, t.dc_id_, t.endpoint_,
                           MetaMemberIdentity{
                               static_cast<int>(t.id_), t.principal_,
-                              t.data_control_endpoint_, t.ctl_endpoint_}
+                              t.data_control_endpoint_, t.ctl_endpoint_,
+                              t.sentinel_endpoint_}
                               .EncodeAux(),
                           t.learner_, t.priority_);
                       result = server->add_srv(peer);

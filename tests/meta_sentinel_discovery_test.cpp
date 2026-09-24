@@ -374,6 +374,153 @@ TEST(MetaSentinelDiscoveryTest, PublicationGatesRetractPrimary) {
   }
 }
 
+TEST(MetaSentinelDiscoveryTest, SwitchNotificationCrossesMasterlessWindow) {
+  auto cut = MakeCut();
+  MetaDiscoveryEvents events;
+  EXPECT_TRUE(events.Observe(cut).empty());
+  auto& group = cut.committed_.groups_.front();
+  group.grant_.grant_.reset();
+  group.grant_.group_term_ = 8;
+  EXPECT_TRUE(events.Observe(cut).empty());
+  group.grant_.grant_ = MetaActiveAuthorityView{.owner_ = kReplicaOneId};
+  group.topology_.record_.owner_ = kReplicaOneId;
+  group.topology_.record_.group_term_ = 8;
+  const auto messages = events.Observe(cut);
+  ASSERT_EQ(messages.size(), 1);
+  EXPECT_EQ(messages[0].channel_, "+switch-master");
+  EXPECT_EQ(messages[0].payload_, "g1 10.0.0.1 7001 10.0.0.2 7002");
+  EXPECT_TRUE(events.Observe(cut).empty());
+  ++group.grant_.group_term_;
+  EXPECT_TRUE(events.Observe(cut).empty());
+  events.Reset();
+  EXPECT_TRUE(events.Observe(cut).empty());
+}
+
+TEST(MetaSentinelDiscoveryTest, ReadableReplicaDoesNotProveSourceAdoption) {
+  auto cut = MakeCut();
+  const auto& group = SoleGroup(cut);
+  EXPECT_FALSE(
+      ReplicaReconfigurationComplete(cut, group, group.topology_.members_[1]));
+}
+
+// A current ReadyToken lineage, received on this live reporter incarnation,
+// is stronger evidence than FDS acknowledgement or a readable population.
+MetaDiscoveryCut SourceProofCut() {
+  auto cut = MakeCut();
+  for (auto& node : cut.runtime_.nodes_) node.leadership_generation_ = 3;
+  cut.runtime_.nodes_[0].boot_id_ = "owner-boot";
+  cut.runtime_.nodes_[1].boot_id_ = "replica-boot";
+  cluster::control::CandidateProgress proof;
+  proof.group_id = "g1";
+  proof.assignment_id = Bytes<16>(0x02);
+  proof.group_term = proof.source_group_term = 7;
+  proof.manifest_revision = kManifestRevision;
+  proof.manifest_digest = Bytes<32>(0x11);
+  proof.partition_replication_epoch = kPartitionEpoch;
+  proof.source_node_id = kOwnerId;
+  proof.source_assignment_id = Bytes<16>(0x01);
+  proof.source_boot_id = "owner-boot";
+  proof.source_history_id =
+      std::string(2 * kMetaReplicationHistoryIdBytes, '0');
+  cut.runtime_.nodes_[1].replica_progress_ = proof;
+  return cut;
+}
+
+TEST(MetaSentinelDiscoveryTest, CompletionRequiresExactFreshSourceLineage) {
+  const auto complete = [](const MetaDiscoveryCut& cut) {
+    const auto& group = SoleGroup(cut);
+    return ReplicaReconfigurationComplete(cut, group,
+                                          group.topology_.members_[1]);
+  };
+  ASSERT_TRUE(complete(SourceProofCut()));
+  for (int dimension = 0; dimension < 11; ++dimension) {
+    auto cut = SourceProofCut();
+    auto& proof = *cut.runtime_.nodes_[1].replica_progress_;
+    switch (dimension) {
+      case 0:
+        --proof.source_group_term;
+        break;
+      case 1:
+        proof.source_boot_id = "old-boot";
+        break;
+      case 2:
+        proof.source_history_id = std::string(32, '1');
+        break;
+      case 3:
+        proof.source_assignment_id = Bytes<16>(0x7f);
+        break;
+      case 4:
+        proof.assignment_id = Bytes<16>(0x7f);
+        break;
+      case 5:
+        --proof.manifest_revision;
+        break;
+      case 6:
+        proof.recovered = true;
+        break;
+      case 7:
+        proof.operator_recovery = true;
+        break;
+      case 8:
+        --cut.runtime_.nodes_[1].leadership_generation_;
+        break;
+      case 9:
+        cut.runtime_.nodes_[1].health_received_unix_ms_ -= 501;
+        break;
+      case 10:
+        cut.runtime_.nodes_[0].health_received_unix_ms_ -= 501;
+        break;
+    }
+    EXPECT_FALSE(complete(cut)) << dimension;
+  }
+}
+
+TEST(MetaSentinelDiscoveryTest,
+     CompletionIsDeduplicatedAndReacquisitionIsBaseline) {
+  auto cut = SourceProofCut();
+  auto& proof = *cut.runtime_.nodes_[1].replica_progress_;
+  --proof.source_group_term;
+  MetaDiscoveryEvents events;
+  EXPECT_TRUE(events.Observe(cut).empty());
+  ++proof.source_group_term;
+  const auto messages = events.Observe(cut);
+  ASSERT_EQ(messages.size(), 1);
+  EXPECT_EQ(messages[0].channel_, "+replica-reconf-done");
+  EXPECT_EQ(messages[0].payload_,
+            "slave 10.0.0.2:7002 10.0.0.2 7002 @ g1 10.0.0.1 7001");
+  EXPECT_TRUE(events.Observe(cut).empty());
+  events.Reset();
+  EXPECT_TRUE(events.Observe(cut).empty());
+  cut.runtime_.nodes_[1].boot_id_ = "replacement-boot";
+  EXPECT_TRUE(events.Observe(cut).empty());
+}
+
+TEST(MetaSentinelDiscoveryTest,
+     PeerDirectoryExcludesSelfRetiredAndStagedMembers) {
+  auto cut = MakeCut();
+  cut.local_meta_id_ = 1;
+  cut.effective_meta_ids_ = {1, 2, 3};
+  for (unsigned id = 1; id <= 4; ++id) {
+    MetaMemberRecord peer;
+    peer.server_id_ = id;
+    peer.sentinel_endpoint_ = "10.0.0." + std::to_string(id) + ":26379";
+    peer.retired_ = id == 3;
+    cut.committed_.meta_members_.push_back(peer);
+  }
+  const auto peers = DiscoverySentinels(cut);
+  ASSERT_EQ(peers.size(), 1);
+  EXPECT_EQ(peers[0].server_id_, 2);
+  ReplyBuilder master;
+  EncodeDiscoveryMasterReply(master, cut, "g1");
+  EXPECT_EQ(
+      FieldInt(EntryFields(DecodeResp(master.View())), "num-other-sentinels"),
+      1);
+  ReplyBuilder directory;
+  EncodeDiscoverySentinelsReply(directory, cut, "g1");
+  EXPECT_TRUE(directory.View().starts_with("*1\r\n"));
+  EXPECT_NE(directory.View().find("10.0.0.2"), std::string_view::npos);
+}
+
 // The complete-Single-Group condition is explicit: the one Group must own a
 // contiguous 0..16383 slot assignment. Any hole or foreign range exposes no
 // service at all — null address, empty MASTERS, and the unknown-service error

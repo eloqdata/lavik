@@ -62,6 +62,9 @@ struct MetaDataControlRuntimeNode {
   std::vector<MetaDataControlRuntimeGroup> groups_;
   std::optional<cluster::control::HeartbeatHealth> health_;
   std::int64_t health_received_unix_ms_ = 0;
+  // Only an accepted, same-session CandidateProgress may prove source adoption.
+  // Cleared with the projection/health or any heartbeat without accepted proof.
+  std::optional<cluster::control::CandidateProgress> replica_progress_;
   std::optional<cluster::control::LeaseDecision> last_lease_decision_;
   // Sequence of the heartbeat whose Ack carried last_lease_decision_. Keeping
   // the pair lets causal consumers bind a written Grant to the exact request
@@ -137,11 +140,15 @@ class MetaDataControlRuntimeStatus {
                      const cluster::control::WireId128& session_id,
                      std::uint64_t validated_committed_high_water);
   // Replaces health and its Meta receive time only for the named current
-  // session; status freshness is evaluated later from this receive time.
-  void RecordHealth(std::string_view node_id,
-                    const cluster::control::WireId128& session_id,
-                    const cluster::control::HeartbeatHealth& health,
-                    std::int64_t received_unix_ms);
+  // session; status freshness is evaluated later from this receive time. The
+  // caller supplies only accepted same-heartbeat source evidence; omission
+  // clears prior evidence, so a fresh health report cannot refresh an old
+  // proof.
+  void RecordHealth(
+      std::string_view node_id, const cluster::control::WireId128& session_id,
+      const cluster::control::HeartbeatHealth& health,
+      std::int64_t received_unix_ms,
+      const cluster::control::CandidateProgress* replica_progress = nullptr);
   // Records a lease decision only after its Ack was written successfully. The
   // heartbeat sequence is atomically bound to that decision in the same
   // runtime update.

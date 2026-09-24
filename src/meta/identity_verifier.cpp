@@ -152,7 +152,8 @@ absl::Status ValidateDataNodePrincipal(std::string_view node_id,
 
 std::string MetaMemberIdentity::EncodeAux() const {
   return absl::StrCat(kAuxPrefix, server_id_, "|", principal_, "|",
-                      data_control_endpoint_, "|", ctl_endpoint_);
+                      data_control_endpoint_, "|", ctl_endpoint_, "|",
+                      sentinel_endpoint_);
 }
 
 absl::StatusOr<MetaMemberIdentity> MetaMemberIdentity::DecodeAux(
@@ -161,7 +162,7 @@ absl::StatusOr<MetaMemberIdentity> MetaMemberIdentity::DecodeAux(
     return absl::InvalidArgumentError("missing LMI1 member identity prefix");
   }
   aux.remove_prefix(kAuxPrefix.size());
-  std::array<std::string_view, 4> fields;
+  std::array<std::string_view, 5> fields;
   for (std::size_t index = 0; index < fields.size() - 1; ++index) {
     const std::size_t separator = aux.find('|');
     if (separator == std::string_view::npos) {
@@ -191,9 +192,14 @@ absl::StatusOr<MetaMemberIdentity> MetaMemberIdentity::DecodeAux(
     return absl::InvalidArgumentError(
         "member endpoints are not canonical numeric endpoints");
   }
+  if (!fields[4].empty()) {
+    const auto sentinel = lavik::ParseConcreteNumericEndpoint(fields[4]);
+    if (!sentinel || lavik::FormatNumericEndpoint(*sentinel) != fields[4])
+      return absl::InvalidArgumentError("invalid Sentinel member endpoint");
+  }
   return MetaMemberIdentity{static_cast<std::int32_t>(*server_id),
                             std::string(principal_text), std::string(fields[2]),
-                            std::string(fields[3])};
+                            std::string(fields[3]), std::string(fields[4])};
 }
 
 absl::Status VerifyRaftPeerIdentity(std::int32_t claimed_server_id,

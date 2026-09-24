@@ -2776,9 +2776,15 @@ bycorf::Task<absl::Status> RunEstablishedSession(
           std::move(*failover_projection), std::move(*owner_projection),
           heartbeat->heartbeat_sequence, confirmed_grant_sequence,
           heartbeat_received_unix_ms, heartbeat_received_steady_ms);
+      const auto* candidate =
+          std::get_if<control::ReplicaCandidate>(&heartbeat->role_information);
       state->core_->options_.runtime_status_->RecordHealth(
           state->node_id_, state->session_id_, heartbeat->health,
-          heartbeat_received_unix_ms);
+          heartbeat_received_unix_ms,
+          observation.status == control::ObservationStatus::kAccepted &&
+                  candidate
+              ? &candidate->progress
+              : nullptr);
       if (observation.status == control::ObservationStatus::kAccepted) {
         state->core_->observations_accepted_.fetch_add(
             1, std::memory_order_relaxed);

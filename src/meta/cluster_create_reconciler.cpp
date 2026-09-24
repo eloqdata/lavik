@@ -155,6 +155,10 @@ absl::Status ValidateMetaSet(const MetaCommittedView& view,
             StripValidatedTcpEndpointScheme(expected.data_control_endpoint_) ||
         peer.ctl_endpoint_ !=
             StripValidatedTcpEndpointScheme(expected.ctl_endpoint_) ||
+        peer.sentinel_endpoint_ != (expected.sentinel_endpoint_.empty()
+                                        ? ""
+                                        : StripValidatedTcpEndpointScheme(
+                                              expected.sentinel_endpoint_)) ||
         peer.dc_id_ != 0 || peer.priority_ != 1 || peer.learner_ ||
         peer.new_joiner_) {
       return absl::FailedPreconditionError(
@@ -164,7 +168,8 @@ absl::Status ValidateMetaSet(const MetaCommittedView& view,
     if (!binding.has_value() || binding->retired_ ||
         binding->principal_ != peer.principal_ ||
         binding->data_control_endpoint_ != peer.data_control_endpoint_ ||
-        binding->ctl_endpoint_ != std::optional(peer.ctl_endpoint_)) {
+        binding->ctl_endpoint_ != std::optional(peer.ctl_endpoint_) ||
+        binding->sentinel_endpoint_ != peer.sentinel_endpoint_) {
       return absl::FailedPreconditionError(
           "creation Meta identity binding differs from config descriptor");
     }

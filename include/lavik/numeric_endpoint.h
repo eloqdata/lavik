@@ -96,6 +96,18 @@ inline std::optional<NumericEndpoint> ParseNumericEndpoint(
                          .port_ = static_cast<std::uint16_t>(port)};
 }
 
+// Parses an advertised/listener route that must name a concrete host, including
+// rejecting IPv4-mapped wildcard addresses. This checks syntax, not
+// reachability.
+inline std::optional<NumericEndpoint> ParseConcreteNumericEndpoint(
+    std::string_view endpoint) {
+  auto parsed = ParseNumericEndpoint(endpoint);
+  if (!parsed || parsed->host_ == "0.0.0.0" || parsed->host_ == "::" ||
+      parsed->host_ == "::ffff:0.0.0.0")
+    return std::nullopt;
+  return parsed;
+}
+
 // Returns the unique host:port spelling for a parsed numeric endpoint. IPv6
 // hosts are bracketed so the address/port boundary remains unambiguous.
 inline std::string FormatNumericEndpoint(const NumericEndpoint& endpoint) {

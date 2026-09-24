@@ -86,6 +86,9 @@ func (seed joinSeed) validate(local Member) error {
 		}
 		seen[m.ID] = true
 		if m.ID == local.ID {
+			if m.Sentinel != "" && local.Sentinel == "" {
+				return errors.New("registered Sentinel endpoint requires a local listener")
+			}
 			found = m.Principal == local.Principal
 		}
 	}
@@ -150,7 +153,7 @@ func (r *Runtime) knownPeer(id uint64) bool {
 	return false
 }
 
-func (s *diskStore) readJoin() error {
+func (s *diskStore) readJoin(local Member) error {
 	data, err := readBounded(filepath.Join(s.dir, "JOIN"), 1<<20)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -165,7 +168,7 @@ func (s *diskStore) readJoin() error {
 	if err := json.Unmarshal(data, &seed); err != nil {
 		return err
 	}
-	if err := seed.validate(s.genesis.Local); err != nil {
+	if err := seed.validate(local); err != nil {
 		return err
 	}
 	s.join = &seed

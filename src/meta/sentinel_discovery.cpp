@@ -170,7 +170,7 @@ void AppendEntryCounter(ReplyBuilder& reply, std::string_view key,
 // Field list and order follow the Redis 7.2 addReplySentinelRedisInstance
 // master shape. Counters this surface cannot observe truthfully are documented
 // constants rather than omitted, because stock clients parse them by name;
-// num-other-sentinels=0 is the truth until the Sentinel directory exists.
+// num-other-sentinels counts the same registered peer set as SENTINELS.
 void AppendMasterEntry(ReplyBuilder& reply, const MetaDiscoveryPrimary& primary,
                        const MetaDiscoveryMasterFlags& flags) {
   reply.AppendMapHeader(20);
@@ -192,7 +192,8 @@ void AppendMasterEntry(ReplyBuilder& reply, const MetaDiscoveryPrimary& primary,
                      static_cast<long long>(primary.group_term_));
   AppendEntryCounter(reply, "num-slaves",
                      static_cast<long long>(primary.replica_count_));
-  AppendEntryCounter(reply, "num-other-sentinels", 0);
+  AppendEntryCounter(reply, "num-other-sentinels",
+                     primary.other_sentinel_count_);
   AppendEntryCounter(reply, "quorum", 1);
   AppendEntryCounter(reply, "failover-timeout", 180000);
   AppendEntryCounter(reply, "parallel-syncs", 1);
@@ -297,7 +298,8 @@ std::optional<MetaDiscoveryPrimary> PublishablePrimary(
       .owner_node_id_ = owner,
       .endpoint_ = *endpoint,
       .group_term_ = group.grant_.group_term_,
-      .replica_count_ = CommittedReplicaCount(cut, group, owner)};
+      .replica_count_ = CommittedReplicaCount(cut, group, owner),
+      .other_sentinel_count_ = DiscoverySentinels(cut).size()};
 }
 
 MetaDiscoveryMasterFlags MasterFlags(const MetaDiscoveryCut& cut,
@@ -429,6 +431,42 @@ void EncodeDiscoveryReplicasReply(ReplyBuilder& reply,
   reply.AppendArrayHeader(replicas.size());
   for (const MetaDiscoveryReplica& replica : replicas) {
     AppendReplicaEntry(reply, cut, *group, replica);
+  }
+}
+
+std::vector<MetaMemberRecord> DiscoverySentinels(const MetaDiscoveryCut& cut) {
+  std::vector<MetaMemberRecord> peers;
+  for (const auto& member : cut.committed_.meta_members_) {
+    if (member.retired_ || member.server_id_ == cut.local_meta_id_ ||
+        member.sentinel_endpoint_.empty() ||
+        std::find(cut.effective_meta_ids_.begin(),
+                  cut.effective_meta_ids_.end(),
+                  member.server_id_) == cut.effective_meta_ids_.end())
+      continue;
+    if (ParseNumericEndpoint(member.sentinel_endpoint_))
+      peers.push_back(member);
+  }
+  return peers;
+}
+
+void EncodeDiscoverySentinelsReply(ReplyBuilder& reply,
+                                   const MetaDiscoveryCut& cut,
+                                   std::string_view name) {
+  const auto* group = DiscoveryServiceGroup(cut);
+  if (group == nullptr || group->topology_.group_id_ != name) {
+    reply.AppendError(kDiscoveryNoSuchMasterError);
+    return;
+  }
+  const auto peers = DiscoverySentinels(cut);
+  reply.AppendArrayHeader(peers.size());
+  for (const auto& peer : peers) {
+    const auto endpoint = *ParseNumericEndpoint(peer.sentinel_endpoint_);
+    reply.AppendMapHeader(5);
+    AppendEntryField(reply, "name", std::to_string(peer.server_id_));
+    AppendEntryField(reply, "runid", std::to_string(peer.server_id_));
+    AppendEntryField(reply, "ip", endpoint.host_);
+    AppendEntryCounter(reply, "port", endpoint.port_);
+    AppendEntryField(reply, "flags", "sentinel");
   }
 }
 

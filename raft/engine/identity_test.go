@@ -73,3 +73,18 @@ func TestJoinGraceEndsAtAppliedConfigurationCut(t *testing.T) {
 		t.Fatal("removed member recovered authority through invitation")
 	}
 }
+
+func TestSentinelInvitationRequiresListenerButAllowsProxy(t *testing.T) {
+	members := testMembers()
+	members[0].Sentinel = "127.0.0.1:26379"
+	seed := joinSeed{Index: 1, Members: members}
+	local := members[0]
+	local.Sentinel = ""
+	if err := seed.validate(local); err == nil {
+		t.Fatal("invitation admitted a registered member without a listener")
+	}
+	local.Sentinel = "127.0.0.1:26380"
+	if err := seed.validate(local); err != nil {
+		t.Fatal("proxy advertisement must not equal listener bind:", err)
+	}
+}

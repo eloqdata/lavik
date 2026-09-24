@@ -39,9 +39,10 @@ constraints. It describes the client contract, not a separate HA mechanism.
 
 **Discovery Entry**:
 The independent Sentinel-compatible RESP endpoint served by a Meta process for
-client discovery. Its answers are a projection of Committed State and current
-leader-local Observations; it holds no election state and is never a second
-source of truth for topology or authority.
+client discovery, identified to clients by its Sentinel address. Its answers
+are a projection of Committed State and current leader-local Observations;
+it holds no election state and is never a second source of truth for topology
+or authority.
 _Avoid_: External Sentinel, discovery proxy
 
 **Service Name**:
@@ -50,6 +51,12 @@ committed Group ID of the Group being discovered — in a Meta-managed Single
 deployment, the unique complete Group. Owner replacement and Meta restart
 never change it.
 _Avoid_: Master name
+
+**Replica Reconfiguration Completion**:
+The observed completion of a Data replica's adoption of the current Owner as
+its replication source, distinct from accepting that target or retaining a
+readable population. It guarantees neither zero replication lag nor continued
+connectivity.
 
 **Stale Replica Read**:
 A read of a replica's complete local population without a freshness guarantee

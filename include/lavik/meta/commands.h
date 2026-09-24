@@ -937,6 +937,8 @@ struct BindMetaMember {
   // schema remains optional so malformed/old development state can be decoded
   // and rejected deliberately; every configured member requires a value.
   std::optional<std::string> ctl_endpoint_;
+  // Empty means this member has no advertised Sentinel entry.
+  std::string sentinel_endpoint_;
   bool operator==(const BindMetaMember&) const = default;
 };
 

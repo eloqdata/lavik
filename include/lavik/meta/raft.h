@@ -119,6 +119,7 @@ struct MetaRaftPeerProgress {
 struct MetaRaftOptions {
   std::int32_t id_ = 0;
   std::string data_dir_, listen_, local_raft_, local_data_, local_admin_;
+  std::string local_sentinel_;
   std::string tls_ca_, tls_cert_, tls_key_;
   std::vector<std::shared_ptr<MetaRaftMember>> initial_;
   std::uint32_t heartbeat_ms_ = 100;
@@ -150,6 +151,11 @@ class MetaRaft : public std::enable_shared_from_this<MetaRaft> {
   bool is_leader_alive() const { return is_leader(); }
   bool is_leader_sm_fully_caught_up() const {
     return is_leader() && caught_up_.load(std::memory_order_acquire);
+  }
+  // Changes on every synchronous authority revocation, including a transient
+  // loss inside one term. Consumers retain it to reject old sessions after ABA.
+  std::uint64_t authority_generation() const {
+    return authority_generation_.load(std::memory_order_acquire);
   }
   std::int32_t get_id() const { return options_.id_; }
   std::int32_t get_leader() const { return leader_id_.load(); }
@@ -201,6 +207,7 @@ class MetaRaft : public std::enable_shared_from_this<MetaRaft> {
   // One CAS binds authority to its revocation generation. An old Go role
   // callback cannot race a caller's resignation and set the leader bit again.
   static constexpr std::uint64_t kStopped = std::uint64_t{1} << 63;
+  std::atomic<std::uint64_t> authority_generation_{0};
   std::atomic<std::uint64_t> authority_{0};  // stop bit, generation, leader bit
   std::atomic<bool> caught_up_{false}, stopping_{false};
   bool relayed_leader_ = false;  // Only the serial Go role callback owns this.

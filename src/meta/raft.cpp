@@ -45,6 +45,7 @@ std::string MemberJson(const MetaRaftMember& member) {
                       ",\"raft\":", Quote(member.get_endpoint()),
                       ",\"data\":", Quote(identity->data_control_endpoint_),
                       ",\"admin\":", Quote(identity->ctl_endpoint_),
+                      ",\"sentinel\":", Quote(identity->sentinel_endpoint_),
                       ",\"principal\":", Quote(identity->principal_), "}");
 }
 
@@ -55,11 +56,18 @@ std::string ConfigJson(const MetaRaftOptions& options) {
     if (member->get_id() == options.id_) advertised = member->get_endpoint();
   }
   // Advertised routes may name a proxy. They are independent of local binds.
+  std::string sentinel = options.local_sentinel_;
+  for (const auto& member : options.initial_) {
+    if (member->get_id() == options.id_) {
+      auto identity = MetaMemberIdentity::DecodeAux(member->get_aux());
+      if (identity.ok()) sentinel = identity->sentinel_endpoint_;
+    }
+  }
   const MetaRaftMember local(
       options.id_, 0, advertised,
       MetaMemberIdentity{options.id_,
                          absl::StrCat("lavik://meta/", options.id_),
-                         options.local_data_, options.local_admin_}
+                         options.local_data_, options.local_admin_, sentinel}
           .EncodeAux());
   std::string initial = "[";
   for (const auto& member : options.initial_) {
@@ -227,6 +235,7 @@ absl::StatusOr<std::shared_ptr<MetaRaft>> MetaRaft::Open(
             ",\"principal\":", Quote(binding.principal_),
             ",\"data\":", Quote(binding.data_control_endpoint_),
             ",\"admin\":", Quote(binding.ctl_endpoint_.value_or("")),
+            ",\"sentinel\":", Quote(binding.sentinel_endpoint_),
             ",\"retired\":", binding.retired_ ? "true" : "false", "}");
       }
       result += ']';
@@ -301,6 +310,8 @@ void MetaRaft::OnRole(std::uint64_t term, std::uint64_t leader, bool is_leader,
   } while (!authority_.compare_exchange_weak(
       current, (current & ~std::uint64_t{1}) | allowed,
       std::memory_order_acq_rel));
+  if (!allowed && (current & 1))
+    authority_generation_.fetch_add(1, std::memory_order_acq_rel);
   const bool previous = std::exchange(relayed_leader_, allowed);
   if ((previous != allowed || (!allowed && previous_term != term)) &&
       options_.role_) {
@@ -369,6 +380,7 @@ bool MetaRaft::RefreshStatus() {
       auto endpoint = reader.Text();
       auto data = reader.Text();
       auto admin = reader.Text();
+      auto sentinel = reader.Text();
       auto principal = reader.Text();
       const auto applied = reader.Integer();
       const auto age = reader.Integer();
@@ -378,7 +390,7 @@ bool MetaRaft::RefreshStatus() {
           id, 0, std::move(endpoint),
           MetaMemberIdentity{static_cast<std::int32_t>(id),
                              std::move(principal), std::move(data),
-                             std::move(admin)}
+                             std::move(admin), std::move(sentinel)}
               .EncodeAux(),
           learner));
       if (id != static_cast<std::uint64_t>(options_.id_))
@@ -515,6 +527,7 @@ void MetaRaft::yield_leadership(bool) {
     if (generation >= (kStopped >> 1)) std::terminate();
   } while (!authority_.compare_exchange_weak(current, generation << 1,
                                              std::memory_order_acq_rel));
+  authority_generation_.fetch_add(1, std::memory_order_acq_rel);
   caught_up_.store(false, std::memory_order_release);
   // The protocol owner sends the ordered follower edge. The synchronous CAS
   // above already stops grants, including while an older callback is in flight.

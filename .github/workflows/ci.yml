@@ -71,6 +71,7 @@ jobs:
           cache-dependency-path: |
             raft/go.sum
             tests/meta_integration/cluster_client_go/go.sum
+            tests/meta_integration/sentinel_client_go/go.sum
 
       - name: Initialize runtime dependencies
         # Public submodules use the exact gitlinks from the tested commit.
@@ -94,7 +95,7 @@ jobs:
           # Large-collection fixtures create private regular files here.
           sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/dev
       - name: Check Go formatting
-        run: test -z "$(gofmt -l raft tests/meta_integration/cluster_client_go)"
+        run: test -z "$(gofmt -l raft tests/meta_integration/cluster_client_go tests/meta_integration/sentinel_client_go)"
       - name: Install Redis integration peers
         run: |
           ./scripts/install_test_redis.sh "$RUNNER_TEMP/redis"

@@ -2122,8 +2122,8 @@ bycorf::Task<std::string> HandleConfigChange(
     AuthenticatedPrincipal principal,
     const std::shared_ptr<MetaMembershipGate>& membership_gate, bool add,
     int server_id, std::string endpoint, std::string data_control_endpoint,
-    std::string ctl_endpoint, const std::string& member_principal,
-    const bool* shutdown) {
+    std::string ctl_endpoint, std::string sentinel_endpoint,
+    const std::string& member_principal, const bool* shutdown) {
   if (*shutdown) co_return "ERR shutting-down";
   if (!server->is_leader() || !server->is_leader_alive() ||
       !server->is_leader_sm_fully_caught_up())
@@ -2140,6 +2140,11 @@ bycorf::Task<std::string> HandleConfigChange(
     endpoint = lavik::FormatNumericEndpoint(*raft);
     data_control_endpoint = lavik::FormatNumericEndpoint(*data);
     ctl_endpoint = lavik::FormatNumericEndpoint(*ctl);
+    if (!sentinel_endpoint.empty()) {
+      auto sentinel = lavik::ParseConcreteNumericEndpoint(sentinel_endpoint);
+      if (!sentinel) co_return "ERR rejected";
+      sentinel_endpoint = lavik::FormatNumericEndpoint(*sentinel);
+    }
   }
   const auto before = state_machine->StoresSnapshot();
   if (before.topology_.ClusterLifecycle().state_ ==
@@ -2159,6 +2164,7 @@ bycorf::Task<std::string> HandleConfigChange(
           intent->target_.principal_ != member_principal ||
           intent->target_.data_control_endpoint_ != data_control_endpoint ||
           intent->target_.ctl_endpoint_ != ctl_endpoint ||
+          intent->target_.sentinel_endpoint_ != sentinel_endpoint ||
           intent->binding_.data_control_endpoint_ != data_control_endpoint ||
           intent->binding_.ctl_endpoint_ != std::optional(ctl_endpoint))))
       co_return "ERR config-changing";
@@ -2202,15 +2208,27 @@ bycorf::Task<std::string> HandleConfigChange(
           .principal_ = member_principal,
           .data_control_endpoint_ = data_control_endpoint,
           .ctl_endpoint_ = ctl_endpoint,
+          .sentinel_endpoint_ = sentinel_endpoint,
       };
       intent.binding_ = {static_cast<std::uint32_t>(server_id),
-                         member_principal, data_control_endpoint, ctl_endpoint,
-                         false};
+                         member_principal,
+                         data_control_endpoint,
+                         ctl_endpoint,
+                         false,
+                         sentinel_endpoint};
       BindMetaMember bind;
       bind.server_id_ = server_id;
       bind.principal_ = member_principal;
       bind.data_control_endpoint_ = data_control_endpoint;
       bind.ctl_endpoint_ = ctl_endpoint;
+      bind.sentinel_endpoint_ = sentinel_endpoint;
+      // A Single discovery deployment cannot admit a voter without an entry.
+      if (before.topology_.ClusterLifecycle().client_mode_ ==
+              ClientMode::kSingle &&
+          std::any_of(config->begin(), config->end(), [&](const auto& p) {
+            return p.sentinel_endpoint_.empty() != sentinel_endpoint.empty();
+          }))
+        co_return "ERR inconsistent-sentinel-coverage";
       auto identity = before.identity_;
       if (!identity.Apply(bind).ok()) co_return "ERR rejected";
     } else {
@@ -2852,7 +2870,7 @@ bycorf::Task<std::string> DispatchCommand(
     if (!membership_enabled) co_return "ERR membership-unavailable";
     const bool add = command == "addsrv";
     if ((!add && tokens.size() != 2u) ||
-        (add && tokens.size() != 5u && tokens.size() != 6u)) {
+        (add && (tokens.size() < 5u || tokens.size() > 7u))) {
       co_return "ERR bad-request";
     }
     int server_id = 0;
@@ -2860,15 +2878,25 @@ bycorf::Task<std::string> DispatchCommand(
       co_return "ERR bad-request";
     }
     std::string member_principal = "lavik://meta/" + std::to_string(server_id);
-    if (add && tokens.size() == 6u) {
-      member_principal = tokens[5];
+    std::string sentinel_endpoint;
+    for (std::size_t i = 5; add && i < tokens.size(); ++i) {
+      if (tokens[i].starts_with("sentinel=")) {
+        if (!sentinel_endpoint.empty()) co_return "ERR bad-request";
+        sentinel_endpoint = tokens[i].substr(9);
+        if (sentinel_endpoint.empty()) co_return "ERR bad-request";
+      } else if (i == 5) {
+        member_principal = tokens[i];
+      } else {
+        co_return "ERR bad-request";
+      }
     }
     co_return co_await HandleConfigChange(
         std::move(server), std::move(state_machine), coordinator,
         std::move(principal), membership_gate, add, server_id,
         add ? tokens[2] : std::string(),
         add ? tokens[3] : std::string(local_data_control_endpoint),
-        add ? tokens[4] : std::string(), member_principal, shutdown);
+        add ? tokens[4] : std::string(), std::move(sentinel_endpoint),
+        member_principal, shutdown);
   }
   if (command == "snapshot") {
     // The Go application executor captures an exact cut. This wait runs on

@@ -31,6 +31,7 @@ type Member struct {
 	Raft      string `json:"raft"`
 	Data      string `json:"data"`
 	Admin     string `json:"admin"`
+	Sentinel  string `json:"sentinel"`
 	Principal string `json:"principal"`
 }
 
@@ -38,7 +39,11 @@ func (m Member) validate() error {
 	if m.ID == 0 || m.ID > 0x7fffffff || m.Principal != fmt.Sprintf("lavik://meta/%d", m.ID) {
 		return errors.New("invalid member identity")
 	}
-	for _, addr := range []string{m.Raft, m.Data, m.Admin} {
+	endpoints := []string{m.Raft, m.Data, m.Admin}
+	if m.Sentinel != "" {
+		endpoints = append(endpoints, m.Sentinel)
+	}
+	for _, addr := range endpoints {
 		host, port, err := net.SplitHostPort(addr)
 		p, parseErr := strconv.ParseUint(port, 10, 16)
 		ip := net.ParseIP(host)

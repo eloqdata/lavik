@@ -10,6 +10,7 @@ type Binding struct {
 	Principal string `json:"principal"`
 	Data      string `json:"data"`
 	Admin     string `json:"admin"`
+	Sentinel  string `json:"sentinel"`
 	Retired   bool   `json:"retired"`
 }
 
@@ -29,7 +30,7 @@ func (r *Runtime) authorizedMember(member Member) bool {
 		return true
 	}
 	if binding, ok := r.bindings[member.ID]; ok {
-		return !binding.Retired && binding.Principal == member.Principal && binding.Data == member.Data && binding.Admin == member.Admin
+		return !binding.Retired && binding.Principal == member.Principal && binding.Data == member.Data && binding.Admin == member.Admin && binding.Sentinel == member.Sentinel
 	}
 	complete := len(r.disk.genesis.Initial) > 0
 	for _, initial := range r.disk.genesis.Initial {

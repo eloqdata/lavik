@@ -158,6 +158,11 @@ grace below its configuration cut; it does not install voters. Ordinary restart
 replays committed identity/configuration state before opening peer ingress.
 Snapshot metadata and the installed identity projection close the same grace
 windows, so partial installation cannot resurrect old voters or retired IDs.
+Member descriptors and identity bindings include the optional immutable Sentinel
+advertisement. A registered local route requires an enabled listener before
+startup or join activation. The bind may differ behind a proxy; a waiting joiner
+may enable its listener before registration, so invitation recovery checks
+availability against current startup configuration rather than its first bind.
 
 Dynamic membership keeps the existing C++ durable workflow. Add commits the
 identity, adds a learner, waits for durable replication and fresh actual

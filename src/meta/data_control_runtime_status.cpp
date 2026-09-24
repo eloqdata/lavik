@@ -59,6 +59,7 @@ void ApplyProjection(MetaDataControlRuntimeNode& node,
   // A replacement invalidates observations and a previous lease until a
   // heartbeat under the new projection is successfully acknowledged.
   node.health_.reset();
+  node.replica_progress_.reset();
   node.last_lease_decision_.reset();
   node.health_received_unix_ms_ = 0;
   node.lease_decision_heartbeat_sequence_ = 0;
@@ -165,12 +166,16 @@ void MetaDataControlRuntimeStatus::MarkValidated(
 void MetaDataControlRuntimeStatus::RecordHealth(
     std::string_view node_id, const cluster::control::WireId128& session_id,
     const cluster::control::HeartbeatHealth& health,
-    std::int64_t received_unix_ms) {
+    std::int64_t received_unix_ms,
+    const cluster::control::CandidateProgress* replica_progress) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto found = nodes_.find(std::string(node_id));
   if (found == nodes_.end() || found->second.session_id_ != session_id) return;
   found->second.health_ = health;
   found->second.health_received_unix_ms_ = received_unix_ms;
+  found->second.replica_progress_ = replica_progress == nullptr
+                                        ? std::nullopt
+                                        : std::optional(*replica_progress);
 }
 
 void MetaDataControlRuntimeStatus::RecordLeaseDecisionWritten(

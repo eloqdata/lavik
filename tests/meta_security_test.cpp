@@ -445,6 +445,25 @@ TEST(MetaIdentitySecurity, MetaMemberBindingSurvivesSnapshotRoundTrip) {
   EXPECT_EQ(restored->FindMetaMember(3), store.FindMetaMember(3));
 }
 
+TEST(MetaIdentitySecurity, SentinelAddressIsDurableAndImmutable) {
+  lavik::meta::MetaIdentityStore store;
+  lavik::meta::BindMetaMember bind;
+  bind.server_id_ = 3;
+  bind.principal_ = "lavik://meta/3";
+  bind.data_control_endpoint_ = "10.0.0.3:7100";
+  bind.ctl_endpoint_ = "10.0.0.3:7200";
+  bind.sentinel_endpoint_ = "10.0.0.3:26379";
+  ASSERT_TRUE(store.Apply(bind).ok());
+  auto restored =
+      lavik::meta::MetaIdentityStore::Deserialize(store.Serialize());
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->FindMetaMember(3)->sentinel_endpoint_, "10.0.0.3:26379");
+  bind.sentinel_endpoint_.clear();
+  EXPECT_FALSE(restored->Apply(bind).ok());
+  bind.sentinel_endpoint_ = "10.0.0.3:26380";
+  EXPECT_FALSE(restored->Apply(bind).ok());
+}
+
 TEST(MetaIdentitySecurity, SoleMemberCtlEndpointCanOnlyBeCompletedOnce) {
   lavik::meta::MetaIdentityStore store;
   lavik::meta::BindMetaMember bind;

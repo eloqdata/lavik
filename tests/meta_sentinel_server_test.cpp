@@ -326,7 +326,7 @@ void StartServerOnEphemeralPort(SentinelRuntime& runtime,
   ASSERT_TRUE(runtime.server_->Start().ok());
 }
 
-// The five discovery verbs are leader-only: a node that is not a caught-up
+// The six discovery verbs are leader-only: a node that is not a caught-up
 // leader closes the connection without a reply so client seed lists rotate,
 // while management verbs keep their explicit error on any node. On the
 // leader, an uninitialized cluster answers from committed state: empty
@@ -415,6 +415,47 @@ TEST(MetaSentinelServerTest, DiscoveryVerbsRequireCaughtUpLeader) {
     ::close(leader);
     runtime.server_->Shutdown();
   }
+}
+
+TEST(MetaSentinelServerTest, ResetCannotEraseAuthorityAcrossEligibilityABA) {
+  SentinelRuntime runtime;
+  ASSERT_TRUE(runtime.initialized_.get_future().get().ok());
+  ASSERT_TRUE(runtime.machine_status_.ok());
+  sockaddr_in address{};
+  StartServerOnEphemeralPort(runtime, &address);
+  ASSERT_TRUE(
+      WaitFor([&] { return runtime.raft_->is_leader_sm_fully_caught_up(); },
+              std::chrono::seconds(15)));
+  runtime.runtime_status_->BeginLeadership(1);
+  ASSERT_TRUE(runtime.runtime_status_->SetLeaderAuthorityEligible(1, true));
+  const int client = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ASSERT_GE(client, 0);
+  const timeval timeout{.tv_sec = 3, .tv_usec = 0};
+  ASSERT_EQ(
+      ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)),
+      0);
+  ASSERT_EQ(
+      ::connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+      0);
+  // RESET may be parsed while the discovery response is still queued. Both
+  // queued and already-written replies must retain the TCP authority lifetime.
+  const std::string pipeline = "SENTINEL MASTERS\r\nRESET\r\n";
+  ASSERT_EQ(::send(client, pipeline.data(), pipeline.size(), MSG_NOSIGNAL),
+            pipeline.size());
+  EXPECT_EQ(ReadReply(client, 12), "*0\r\n+RESET\r\n");
+  // Make both eligibility edges inside one worker turn: polling only the
+  // final boolean would miss revocation, but its revision must still close us.
+  std::promise<void> changed;
+  ASSERT_TRUE(runtime.runtime_.GetForeignExecutor(0).Notify([&]() noexcept {
+    runtime.runtime_status_->SetLeaderAuthorityEligible(1, false);
+    runtime.runtime_status_->SetLeaderAuthorityEligible(1, true);
+    changed.set_value();
+  }));
+  changed.get_future().get();
+  char byte;
+  EXPECT_EQ(::recv(client, &byte, 1, 0), 0);
+  ::close(client);
+  runtime.server_->Shutdown();
 }
 
 }  // namespace

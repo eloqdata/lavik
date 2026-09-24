@@ -40,6 +40,7 @@
 //     comma-separated order real Redis 7.2 uses (s_down first, then role).
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -68,6 +69,11 @@ struct MetaDiscoveryCut {
   std::int64_t now_unix_ms_ = 0;
   std::uint32_t observation_ttl_ms_ = 0;
   bool observation_grace_active_ = false;
+  std::uint64_t authority_generation_ = 0;
+  std::uint64_t raft_term_ = 0;
+  std::uint32_t local_meta_id_ = 0;
+  // Raft's effective committed configuration excludes staged identity binds.
+  std::vector<std::uint32_t> effective_meta_ids_;
 };
 
 // A Primary that passed every committed-state publication gate.
@@ -78,7 +84,15 @@ struct MetaDiscoveryPrimary {
   std::uint64_t group_term_ = 0;
   // Committed non-retired non-owner member count, independent of health.
   std::size_t replica_count_ = 0;
+  std::size_t other_sentinel_count_ = 0;
 };
+
+// Registered peers, not a liveness claim. Both SENTINELS and MASTER counts
+// use this set, excluding the responder and identities not yet in Raft config.
+std::vector<MetaMemberRecord> DiscoverySentinels(const MetaDiscoveryCut& cut);
+void EncodeDiscoverySentinelsReply(ReplyBuilder& reply,
+                                   const MetaDiscoveryCut& cut,
+                                   std::string_view name);
 
 struct MetaDiscoveryMasterFlags {
   bool s_down_ = false;
@@ -92,6 +106,35 @@ struct MetaDiscoveryReplica {
   bool disconnected_ = false;
   // True when the service currently has no publishable Primary.
   bool master_down_ = false;
+};
+
+struct MetaDiscoveryEvent {
+  std::string channel_;
+  std::string payload_;
+};
+
+// Proof of actual source adoption, independent of replica read admission.
+bool ReplicaReconfigurationComplete(const MetaDiscoveryCut& cut,
+                                    const MetaCommittedStatusGroup& group,
+                                    const MetaGroupMember& member);
+
+// Worker-owned, volatile transition observer. Reset at any lost continuity;
+// its first cut is a baseline, never a reconstruction of missed history.
+class MetaDiscoveryEvents {
+ public:
+  std::vector<MetaDiscoveryEvent> Observe(const MetaDiscoveryCut& cut);
+  void Reset();
+
+ private:
+  struct ReplicaState {
+    std::string boot_;
+    MetaAssignmentId assignment_{};
+    bool pending_ = false;
+    bool completed_ = false;
+  };
+  std::optional<MetaDiscoveryPrimary> primary_;
+  std::uint64_t term_ = 0;
+  std::map<std::string, ReplicaState> replicas_;
 };
 
 // The committed state declares at most one discoverable service: the single

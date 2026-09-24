@@ -523,6 +523,7 @@ int main(int argc, char** argv) {
       lavik::FormatNumericEndpoint({.host_ = data_control_endpoint->host_,
                                     .port_ = data_control_endpoint->port_});
   raft_options.local_admin_ = ctl_endpoint_text;
+  raft_options.local_sentinel_ = options.sentinel_addr_;
   raft_options.tls_ca_ = options.tls_ca_;
   raft_options.tls_cert_ = options.tls_cert_;
   raft_options.tls_key_ = options.tls_key_;
@@ -545,6 +546,13 @@ int main(int argc, char** argv) {
       return 1;
     }
     for (const auto& member : manifest->meta_members_) {
+      if (member.server_id_ == static_cast<std::uint32_t>(options.id_) &&
+          !member.sentinel_endpoint_.empty() &&
+          options.sentinel_addr_.empty()) {
+        spdlog::critical(
+            "registered Sentinel endpoint requires --sentinel-addr");
+        return 1;
+      }
       raft_options.initial_.push_back(
           std::make_shared<lavik::meta::MetaRaftMember>(
               member.server_id_, 0,
@@ -554,7 +562,11 @@ int main(int argc, char** argv) {
                   "lavik://meta/" + std::to_string(member.server_id_),
                   StripValidatedTcpEndpointScheme(
                       member.data_control_endpoint_),
-                  StripValidatedTcpEndpointScheme(member.ctl_endpoint_)}
+                  StripValidatedTcpEndpointScheme(member.ctl_endpoint_),
+                  member.sentinel_endpoint_.empty()
+                      ? ""
+                      : StripValidatedTcpEndpointScheme(
+                            member.sentinel_endpoint_)}
                   .EncodeAux()));
     }
   }
@@ -862,6 +874,7 @@ int main(int argc, char** argv) {
     coordinator->RunAsLeader(data_control);
     coordinator->RunAsLeader(automatic_failover_reconciler);
     coordinator->RunAsLeader(failover_reconciler);
+    if (sentinel) coordinator->RunAsLeader(sentinel);
   }
 
   if (exit_code == 0) {

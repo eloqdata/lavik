@@ -166,6 +166,7 @@ class DiscoveryFixture:
                     SENTINEL_PASSWORD,
                 ],
             )
+            node.sentinel_endpoint = f"127.0.0.1:{port}"
             self.metas.append(node)
             self.sentinel_ports[node_id] = port
         seed = self.metas[0].data_control_endpoint
@@ -184,14 +185,16 @@ class DiscoveryFixture:
             lines += [
                 "[[data_nodes]]",
                 f'id = "{node.node_id}"',
-                f'client_endpoint = "{node.advertised_endpoint}"',
+                f'client_endpoint = "{getattr(node, "discovery_endpoint", node.advertised_endpoint)}"',
                 "",
             ]
         lines += [
             "[[groups]]",
             f'id = "{GROUP}"',
             f'primary = "{OWNER}"',
-            f'replicas = ["{REPLICA}"]',
+            "replicas = ["
+            + ", ".join(f'"{n.node_id}"' for n in self.data_nodes[1:])
+            + "]",
             "",
             "[[slot_ranges]]",
             "first = 0",
@@ -520,7 +523,7 @@ def case_reply_contract(fixture):
             b"role-reported": b"master",
             b"config-epoch": term.encode(),
             b"num-slaves": b"1",
-            b"num-other-sentinels": b"0",
+            b"num-other-sentinels": b"2",
             b"quorum": b"1",
             b"failover-timeout": b"180000",
             b"parallel-syncs": b"1",
@@ -780,7 +783,11 @@ def main():
     try:
         fixture.start_created()
         wait_replica_healthy(fixture)
-        for sentinel_proto, data_proto, label in ((None, 3, "resp3"), (2, 2, "resp2")):
+        for sentinel_proto, data_proto, label in (
+            (None, 3, "resp3"),
+            (None, 2, "sentinel3-data2"),
+            (2, 2, "resp2"),
+        ):
             case_discovery_and_readwrite(
                 fixture, redis, sentinel_proto, data_proto, label
             )

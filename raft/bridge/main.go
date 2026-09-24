@@ -282,6 +282,7 @@ func lavik_raft_status(handle C.uint64_t, out *C.LavikRaftBytes) C.int {
 		text(m.Raft)
 		text(m.Data)
 		text(m.Admin)
+		text(m.Sentinel)
 		text(m.Principal)
 		put(s.PeerApplied[m.ID])
 		age, ok := s.PeerAgeMicros[m.ID]

@@ -40,6 +40,8 @@ struct MetaMembershipPeer {
   std::int32_t priority_ = 1;
   bool learner_ = false;
   bool new_joiner_ = false;
+  // Empty means this member has no advertised Sentinel entry.
+  std::string sentinel_endpoint_;
   bool operator==(const MetaMembershipPeer&) const = default;
 };
 

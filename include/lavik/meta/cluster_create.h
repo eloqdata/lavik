@@ -43,6 +43,8 @@ struct ClusterCreateManifestV1 {
     std::string raft_endpoint_;
     std::string data_control_endpoint_;
     std::string ctl_endpoint_;
+    // Empty disables advertisement; otherwise the existing Sentinel entry.
+    std::string sentinel_endpoint_;
     bool operator==(const MetaMember&) const = default;
   };
 
