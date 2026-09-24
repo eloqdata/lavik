@@ -18,6 +18,7 @@ import (
 )
 
 type proposal struct {
+	term   uint64
 	data   []byte
 	key    [16]byte
 	result chan Result
@@ -289,6 +290,12 @@ func controlMessage(kind pb.MessageType) bool {
 // Propose accepts a bounded copy. Its result is buffered and completed exactly
 // once; abandoning the receiver does not block Raft or release its reservation.
 func (r *Runtime) Propose(data []byte) (<-chan Result, error) {
+	return r.ProposeInTerm(data, r.Status().Term)
+}
+
+// ProposeInTerm binds work before crossing the asynchronous proposal queue.
+// The protocol owner rejects it if a later election has replaced that term.
+func (r *Runtime) ProposeInTerm(data []byte, term uint64) (<-chan Result, error) {
 	if !r.admission.enter() {
 		return nil, ErrStopped
 	}
@@ -302,7 +309,7 @@ func (r *Runtime) Propose(data []byte) (<-chan Result, error) {
 			r.proposalBytes.release(uint64(len(data)))
 		}
 	}()
-	p := proposal{data: append([]byte(nil), data...), result: make(chan Result, 1)}
+	p := proposal{term: term, data: append([]byte(nil), data...), result: make(chan Result, 1)}
 	if _, err := rand.Read(p.key[:]); err != nil {
 		return nil, err
 	}
@@ -522,10 +529,9 @@ func (r *Runtime) run() {
 		case op := <-r.memberRequests:
 			if r.memberChange != nil {
 				op.result <- Result{Err: ErrBusy}
-			} else if !r.status.Load().CaughtUp || (op.remove && op.member.ID == r.cfg.Local.ID) {
+			} else if !r.status.Load().CaughtUp || op.term != r.core.status().Term || (op.remove && op.member.ID == r.cfg.Local.ID) {
 				op.result <- Result{Err: ErrNotLeader}
 			} else {
-				op.term = r.core.status().Term
 				r.memberChange = op
 			}
 		case waiter := <-r.snapshotRequests:
@@ -559,7 +565,7 @@ func (r *Runtime) run() {
 			failure = r.consume(m)
 		case p := <-r.proposals:
 			r.proposalBytes.release(uint64(len(p.data)))
-			if !r.status.Load().IsLeader || !r.status.Load().CaughtUp {
+			if !r.status.Load().IsLeader || !r.status.Load().CaughtUp || p.term != r.core.status().Term {
 				p.result <- Result{Err: ErrNotLeader}
 				break
 			}

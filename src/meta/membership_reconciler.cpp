@@ -456,7 +456,7 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
   auto subscribed = subscribe();
   std::string last_cut;
   std::optional<MetaOperationId> last_operation;
-  while (!core->cancelled_) {
+  while (!core->cancelled_ && context->IsCurrent()) {
     // A committed effect may become visible before the local API returns.
     // Finish that bounded entry before discarding its lifetime/join handle.
     if (attempt && !attempt->entered_.load(std::memory_order_acquire)) {
@@ -600,7 +600,7 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
               attempt = std::make_shared<Core::Attempt>();
               const auto server = core->server_;
               const auto machine = core->state_machine_;
-              const auto term = server->get_term();
+              const auto term = context->term();
               const auto id = op->operation_id_;
               const auto revision = op->revision_;
               // Check the retained operation/leadership again at executor
@@ -616,7 +616,7 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
                                                          action] {
                 auto current = machine->FindOperation(id);
                 auto config_now = CaptureMembershipConfig(server->get_config());
-                if (!server->is_leader() || server->get_term() != term ||
+                if (server->leader_term() != static_cast<std::int64_t>(term) ||
                     !current || Terminal(*current) ||
                     current->revision_ != revision || !config_now.ok() ||
                     *config_now != expected) {
@@ -626,7 +626,7 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
                 }
                 try {
                   if (action == MetaMembershipRaftAction::kYieldLeadership) {
-                    server->yield_leadership();
+                    server->yield_leadership(false, term);
                     attempt->replied_ = true;
                   } else {
                     std::shared_ptr<MetaRaftResult> result;
@@ -640,9 +640,9 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
                               t.sentinel_endpoint_}
                               .EncodeAux(),
                           t.learner_, t.priority_);
-                      result = server->add_srv(peer);
+                      result = server->add_srv(peer, term);
                     } else
-                      result = server->remove_srv(intent.target_.id_);
+                      result = server->remove_srv(intent.target_.id_, term);
                     if (result) {
                       decltype(result)::element_type::handler_type2 callback =
                           [attempt](auto& reply, auto&) {

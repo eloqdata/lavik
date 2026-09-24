@@ -41,7 +41,7 @@ MetaAutomaticFailoverStateMachine::Input UnserviceableInput() {
       .anchor_ =
           {
               .group_id_ = "group-a",
-              .leadership_generation_ = 3,
+              .leader_term_ = 3,
               .owner_node_id_ = std::string(40, '1'),
               .owner_assignment_id_ = Bytes<16>(0x21),
               .group_term_ = 5,
@@ -59,13 +59,13 @@ MetaAutomaticFailoverStateMachine::Input UnserviceableInput() {
 }
 
 MetaAutomaticFailoverStatus Diagnostic(
-    std::string group_id, std::uint64_t leadership_generation,
+    std::string group_id, std::uint64_t leader_term,
     MetaAutomaticFailoverState state = MetaAutomaticFailoverState::kHealthy,
     std::uint64_t eligibility_revision = 1) {
   MetaAutomaticFailoverStatus status;
   status.anchor_ = UnserviceableInput().anchor_;
   status.anchor_.group_id_ = std::move(group_id);
-  status.anchor_.leadership_generation_ = leadership_generation;
+  status.anchor_.leader_term_ = leader_term;
   status.anchor_.leader_authority_eligibility_revision_ = eligibility_revision;
   status.state_ = state;
   status.effective_threshold_ms_ = 1'000;
@@ -81,7 +81,7 @@ TEST(MetaAutomaticFailoverDiagnosticsRegistryTest,
                     Diagnostic("group-c", 7)});
 
   auto snapshot = registry.Snapshot();
-  ASSERT_EQ(snapshot.leadership_generation_, 7u);
+  ASSERT_EQ(snapshot.leader_term_, 7u);
   ASSERT_EQ(snapshot.leader_authority_eligibility_revision_, 1u);
   ASSERT_EQ(snapshot.evaluated_applied_index_, 101u);
   ASSERT_EQ(snapshot.statuses_.size(), 3u);
@@ -111,14 +111,14 @@ TEST(MetaAutomaticFailoverDiagnosticsRegistryTest,
 
   registry.BeginLeadership(11);
   auto snapshot = registry.Snapshot();
-  EXPECT_EQ(snapshot.leadership_generation_, 11u);
+  EXPECT_EQ(snapshot.leader_term_, 11u);
   EXPECT_EQ(snapshot.evaluated_applied_index_, 0u);
   EXPECT_TRUE(snapshot.statuses_.empty());
 
   registry.Publish(10, 1, 202, {Diagnostic("stale", 10)});
   registry.EndLeadership(10);
   snapshot = registry.Snapshot();
-  EXPECT_EQ(snapshot.leadership_generation_, 11u);
+  EXPECT_EQ(snapshot.leader_term_, 11u);
   EXPECT_TRUE(snapshot.statuses_.empty());
 
   registry.Publish(11, 1, 203, {Diagnostic("current", 11)});
@@ -128,14 +128,14 @@ TEST(MetaAutomaticFailoverDiagnosticsRegistryTest,
                    {Diagnostic("regressed-revision", 11,
                                MetaAutomaticFailoverState::kHealthy, 0)});
   snapshot = registry.Snapshot();
-  ASSERT_EQ(snapshot.leadership_generation_, 11u);
+  ASSERT_EQ(snapshot.leader_term_, 11u);
   ASSERT_EQ(snapshot.evaluated_applied_index_, 203u);
   ASSERT_EQ(snapshot.statuses_.size(), 1u);
   EXPECT_EQ(snapshot.statuses_[0].anchor_.group_id_, "current");
 
   registry.EndLeadership(11);
   snapshot = registry.Snapshot();
-  EXPECT_EQ(snapshot.leadership_generation_, 0u);
+  EXPECT_EQ(snapshot.leader_term_, 0u);
   EXPECT_EQ(snapshot.evaluated_applied_index_, 0u);
   EXPECT_TRUE(snapshot.statuses_.empty());
 
@@ -145,7 +145,7 @@ TEST(MetaAutomaticFailoverDiagnosticsRegistryTest,
   EXPECT_EQ(registry.Snapshot(), snapshot);
 
   registry.BeginLeadership(12);
-  EXPECT_EQ(registry.Snapshot().leadership_generation_, 12u);
+  EXPECT_EQ(registry.Snapshot().leader_term_, 12u);
 }
 
 TEST(MetaAutomaticFailoverDiagnosticsRegistryTest,
@@ -226,8 +226,7 @@ TEST(MetaAutomaticFailoverDiagnosticsRegistryTest,
           (snapshot.statuses_[0].state_ == MetaAutomaticFailoverState::kHealthy
                ? (snapshot.evaluated_applied_index_ & 1) != 0
                : (snapshot.evaluated_applied_index_ & 1) == 0);
-      if (snapshot.leadership_generation_ != 30 ||
-          (!initial_empty && !published)) {
+      if (snapshot.leader_term_ != 30 || (!initial_empty && !published)) {
         invalid_cut = true;
       }
     }
@@ -383,7 +382,7 @@ TEST(MetaAutomaticFailoverStateMachineTest,
   expect_reset(
       [](auto& anchor) { anchor.owner_assignment_id_ = Bytes<16>(0x22); });
   expect_reset([](auto& anchor) { ++anchor.group_term_; });
-  expect_reset([](auto& anchor) { ++anchor.leadership_generation_; });
+  expect_reset([](auto& anchor) { ++anchor.leader_term_; });
   expect_reset(
       [](auto& anchor) { ++anchor.automatic_failover_policy_version_; });
   expect_reset([](auto& anchor) { ++anchor.authority_lease_policy_version_; });

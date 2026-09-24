@@ -376,7 +376,7 @@ struct MetaDataControlMetricsSnapshot {
   // only as every SessionLoop frame is destroyed, including a task rejected
   // before its coroutine body starts.
   std::uint64_t live_session_tasks_ = 0;
-  // Sessions bound to an accepted leadership generation, including initial
+  // Sessions bound to an accepted Raft leader term, including initial
   // FDS handshakes not yet counted in active_sessions_.
   std::uint64_t live_authority_session_tasks_ = 0;
   // Leader-start membership reconciliation producers. Demotion and shutdown
@@ -402,7 +402,6 @@ struct MetaLeaseEvaluation {
   bool leader_valid_ = false;
   std::uint32_t server_id_ = 0;
   std::uint64_t raft_term_ = 0;
-  std::uint64_t leadership_generation_ = 0;
   std::uint32_t leadership_validity_ms_ = 0;
   std::string node_id_;
   std::string boot_id_;
@@ -456,7 +455,7 @@ class MetaLeaseHandoffGuard {
     cluster::control::WireAuthorityAnchor authority_;
     std::string node_id_;
     std::string data_boot_id_;
-    std::uint64_t leadership_generation_ = 0;
+    std::uint64_t leader_term_ = 0;
     std::int64_t eligible_after_ms_ = 0;
   };
 
@@ -481,7 +480,7 @@ enum class MetaLeaderRuntimeDisposition : std::uint8_t {
 //
 // Callers serialize this volatile state on the Meta control worker. Clock
 // values need only share their own domains; neither epoch is compared with the
-// other. Reset begins a new genuine leadership generation.
+// other. Reset begins a new genuine Raft leader term.
 class MetaLeaderRuntimeGuard {
  public:
   explicit MetaLeaderRuntimeGuard(std::uint32_t leadership_validity_ms)

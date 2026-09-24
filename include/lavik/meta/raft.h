@@ -129,6 +129,7 @@ struct MetaRaftOptions {
   std::uint64_t reserved_log_items_ = 100;
   // Invoked from the Go protocol owner. Must only record an ordered edge and
   // enqueue a bounded Bycorf notification; never wait for the worker.
+  // Leader carries the admitted term; follower carries the retired term.
   std::function<void(bool, std::uint64_t)> role_;
   // Optional fault-injection seam on the application executor. Production
   // leaves it empty; blocking this hook must not block ticks, WAL, or sockets.
@@ -172,13 +173,21 @@ class MetaRaft : public std::enable_shared_from_this<MetaRaft> {
   std::vector<MetaRaftPeerProgress> get_peer_info_all() const;
   bool initial_bindings_pending() const;
 
+  // A nonzero expected_term fences queued work through protocol admission.
+  // Zero captures the current admitted term at this boundary.
   std::shared_ptr<MetaRaftResult> append_entries(
-      const std::vector<std::shared_ptr<MetaRaftBuffer>>& entries);
-  std::shared_ptr<MetaRaftResult> add_srv(const MetaRaftMember& member);
-  std::shared_ptr<MetaRaftResult> remove_srv(std::int32_t id);
+      const std::vector<std::shared_ptr<MetaRaftBuffer>>& entries,
+      std::uint64_t expected_term = 0);
+  // Member operations use the same term fence as append_entries.
+  std::shared_ptr<MetaRaftResult> add_srv(const MetaRaftMember& member,
+                                          std::uint64_t expected_term = 0);
+  std::shared_ptr<MetaRaftResult> remove_srv(std::int32_t id,
+                                             std::uint64_t expected_term = 0);
   // Synchronously retires the admitted leader term; a follower/candidate is
-  // unchanged. The protocol owner then steps down that term asynchronously.
-  void yield_leadership(bool immediate_yield = false);
+  // unchanged. A nonzero expected_term also leaves newer leaders unchanged.
+  // The protocol owner then steps down that term asynchronously.
+  void yield_leadership(bool immediate_yield = false,
+                        std::uint64_t expected_term = 0);
   struct create_snapshot_options {
     bool serialize_commit_ = true;
   };

@@ -426,8 +426,9 @@ TEST(MetaSentinelServerTest, ResetCannotEraseAuthorityAcrossEligibilityABA) {
   ASSERT_TRUE(
       WaitFor([&] { return runtime.raft_->is_leader_sm_fully_caught_up(); },
               std::chrono::seconds(15)));
-  runtime.runtime_status_->BeginLeadership(1);
-  ASSERT_TRUE(runtime.runtime_status_->SetLeaderAuthorityEligible(1, true));
+  const auto term = static_cast<std::uint64_t>(runtime.raft_->leader_term());
+  runtime.runtime_status_->BeginLeadership(term);
+  ASSERT_TRUE(runtime.runtime_status_->SetLeaderAuthorityEligible(term, true));
   const int client = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   ASSERT_GE(client, 0);
   const timeval timeout{.tv_sec = 3, .tv_usec = 0};
@@ -447,8 +448,8 @@ TEST(MetaSentinelServerTest, ResetCannotEraseAuthorityAcrossEligibilityABA) {
   // final boolean would miss revocation, but its revision must still close us.
   std::promise<void> changed;
   ASSERT_TRUE(runtime.runtime_.GetForeignExecutor(0).Notify([&]() noexcept {
-    runtime.runtime_status_->SetLeaderAuthorityEligible(1, false);
-    runtime.runtime_status_->SetLeaderAuthorityEligible(1, true);
+    runtime.runtime_status_->SetLeaderAuthorityEligible(term, false);
+    runtime.runtime_status_->SetLeaderAuthorityEligible(term, true);
     changed.set_value();
   }));
   changed.get_future().get();
@@ -486,6 +487,9 @@ TEST(MetaSentinelServerTest, ResignationRevokesConnectionAndRequiresNewTerm) {
   EXPECT_FALSE(runtime.raft_->is_leader());
   ASSERT_TRUE(WaitFor([&] { return runtime.raft_->leader_term() > term; },
                       std::chrono::seconds(15)));
+  const auto new_term = runtime.raft_->leader_term();
+  runtime.raft_->yield_leadership(false, static_cast<std::uint64_t>(term));
+  EXPECT_EQ(runtime.raft_->leader_term(), new_term);
   char byte;
   EXPECT_EQ(::recv(client, &byte, 1, 0), 0);
   ::close(client);

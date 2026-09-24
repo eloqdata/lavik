@@ -321,7 +321,8 @@ void MetaRaft::OnRole(std::uint64_t term, std::uint64_t leader, bool is_leader,
   const auto previous = std::exchange(relayed_leader_term_, published);
   if (previous != published && options_.role_) {
     try {
-      if (previous >= 0) options_.role_(false, term);
+      if (previous >= 0)
+        options_.role_(false, static_cast<std::uint64_t>(previous));
       if (published >= 0) options_.role_(true, term);
     } catch (...) {
       std::terminate();
@@ -465,15 +466,23 @@ void MetaRaft::OnResult(std::uint64_t ticket, std::uint64_t index, int code,
 }
 
 std::shared_ptr<MetaRaftResult> MetaRaft::append_entries(
-    const std::vector<std::shared_ptr<MetaRaftBuffer>>& entries) {
+    const std::vector<std::shared_ptr<MetaRaftBuffer>>& entries,
+    std::uint64_t expected_term) {
   auto [ticket, result] = NewResult();
   if (!ticket) return result;
   if (entries.size() != 1 || !entries[0]) {
     OnResult(ticket, 0, 3, nullptr, 0);
     return result;
   }
+  const auto current = leader_term();
+  if (current < 0 || (expected_term != 0 &&
+                      expected_term != static_cast<std::uint64_t>(current))) {
+    OnResult(ticket, 0, 2, nullptr, 0);
+    return result;
+  }
   const int code = lavik_raft_propose(handle_, ticket, entries[0]->data_begin(),
-                                      entries[0]->size());
+                                      entries[0]->size(),
+                                      static_cast<std::uint64_t>(current));
   if (code != 0) OnResult(ticket, 0, code, nullptr, 0);
   return result;
 }
@@ -492,10 +501,16 @@ std::uint64_t MetaRaft::create_snapshot(create_snapshot_options) {
   return future.get();
 }
 
-std::shared_ptr<MetaRaftResult> MetaRaft::add_srv(
-    const MetaRaftMember& member) {
+std::shared_ptr<MetaRaftResult> MetaRaft::add_srv(const MetaRaftMember& member,
+                                                  std::uint64_t expected_term) {
   auto [ticket, result] = NewResult();
   if (!ticket) return result;
+  const auto current = leader_term();
+  if (current < 0 || (expected_term != 0 &&
+                      expected_term != static_cast<std::uint64_t>(current))) {
+    OnResult(ticket, 0, 2, nullptr, 0);
+    return result;
+  }
   if (member.get_dc_id() != 0 || member.get_priority() != 1) {
     OnResult(ticket, 0, 3, nullptr, 0);
     return result;
@@ -508,27 +523,37 @@ std::shared_ptr<MetaRaftResult> MetaRaft::add_srv(
     return result;
   }
   const int code = lavik_raft_member(handle_, ticket, data.data(), data.size(),
-                                     0, member.is_learner());
+                                     0, member.is_learner(),
+                                     static_cast<std::uint64_t>(current));
   if (code) OnResult(ticket, 0, code, nullptr, 0);
   return result;
 }
 
-std::shared_ptr<MetaRaftResult> MetaRaft::remove_srv(std::int32_t id) {
+std::shared_ptr<MetaRaftResult> MetaRaft::remove_srv(
+    std::int32_t id, std::uint64_t expected_term) {
   auto [ticket, result] = NewResult();
   if (!ticket) return result;
+  const auto current = leader_term();
+  if (current < 0 || (expected_term != 0 &&
+                      expected_term != static_cast<std::uint64_t>(current))) {
+    OnResult(ticket, 0, 2, nullptr, 0);
+    return result;
+  }
   auto data = absl::StrCat("{\"id\":", id, "}");
-  const int code =
-      lavik_raft_member(handle_, ticket, data.data(), data.size(), 1, 0);
+  const int code = lavik_raft_member(handle_, ticket, data.data(), data.size(),
+                                     1, 0, static_cast<std::uint64_t>(current));
   if (code) OnResult(ticket, 0, code, nullptr, 0);
   return result;
 }
 
-void MetaRaft::yield_leadership(bool) {
+void MetaRaft::yield_leadership(bool, std::uint64_t expected_term) {
   auto current = leader_term_.load(std::memory_order_acquire);
   do {
     // Retire only an admitted leader, never a prospective candidate term
     // concurrently exposed by get_term(). That candidate may still win.
-    if (current < 0) return;
+    if (current < 0 || (expected_term != 0 &&
+                        expected_term != static_cast<std::uint64_t>(current)))
+      return;
   } while (!leader_term_.compare_exchange_weak(current, -(current + 1),
                                                std::memory_order_acq_rel));
   // Only the Raft protocol owner changes role and starts subsequent elections.

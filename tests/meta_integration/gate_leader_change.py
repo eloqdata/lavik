@@ -29,12 +29,11 @@ mesh (bootstrap_meshed_cluster), continuous propose load throughout:
    Both rounds additionally assert the raft_callback_ trail directly (the
    [raft-cb] lines emitted by lavik-meta): the new leader logs
    BecomeLeader at a term above the victim's, timestamped at the moment
-   its committed index observably caught up; the surviving follower logs
-   BecomeFollower at the new term; the victim's pre-kill log shows its own
-   BecomeLeader; and after rejoining, the victim logs BecomeFollower at the
-   post-failover term. (A kill -9'd leader cannot log its own transition
-   out — it is dead — so "old leader becomes follower" is asserted on the
-   surviving follower pre-restart and on the victim post-restart.)
+   its committed index observably caught up; the victim's pre-kill log shows
+   its own BecomeLeader. Surviving and restarted followers must observe the
+   new protocol term through status. BecomeFollower(T) retires an admitted
+   leadership T; observing a higher term while already a follower emits no
+   lifecycle edge, and a killed process cannot emit its own demotion.
 3. Link-fault sanity on the mesh: per-chunk delay, then half-open drop,
    then refuse (RST) on one follower's inbound path, healing between
    rounds. These are asymmetric faults (the follower's outbound traffic
@@ -142,18 +141,14 @@ def assert_election_events(
             f"predates the observable committed catch-up by "
             f"{observed_wall - become_ts:.2f}s (> {EVENT_TS_SLACK_S}s)"
         )
-    # The surviving follower sees the winner's higher term (vote request or
-    # append entries) and steps into it: BecomeFollower at the new term.
+    # A follower learns the higher protocol term without a leadership-lifecycle
+    # edge: BecomeFollower(T) only retires a term this node actually led.
     follower = next(n for n in survivors if n.id != new_leader.id)
-    if not any(
-        term is not None and term >= new_term
-        for _, term in raft_cb_events(follower, "BecomeFollower")
-    ):
-        raise H.Failure(
-            f"{round_name}: surviving follower node "
-            f"{follower.id} log has no BecomeFollower at term "
-            f">= {new_term}"
-        )
+    H.wait_until(
+        f"surviving follower {follower.id} observes term {new_term}",
+        5,
+        lambda: follower.term() >= new_term,
+    )
     # The victim's pre-kill log must show its own election (the process is
     # dead and its log handle closed at this point, so the file holds only
     # pre-kill content).
@@ -167,7 +162,7 @@ def assert_election_events(
     H.log(
         f"{round_name}: [raft-cb] trail verified (node {new_leader.id} "
         f"BecomeLeader term={new_term}, node {follower.id} "
-        f"BecomeFollower, victim node {victim.id} BecomeLeader "
+        f"observed term >= {new_term}, victim node {victim.id} BecomeLeader "
         f"term={victim_term})"
     )
     return new_term
@@ -212,27 +207,19 @@ def leader_kill_round(nodes, history, round_name):
 
 
 def restart_and_catchup(node, nodes, history, min_term):
-    # Line marker before the restart: the post-restart BecomeFollower scan
-    # only trusts lines appended from this boot onward.
-    boot_mark = line_count(node)
     node.start(bootstrap=False)
     H.wait_until(
         f"node {node.id} ctl answers", 15, lambda: node.alive() and node.status()
     )
     history.check(nodes, timeout=30, desc=f"node {node.id} restart catch-up")
-    # The rejoined node's stored term predates the failover, so the first
-    # heartbeat bumps it: BecomeFollower at >= the post-failover term.
-    if not any(
-        term is not None and term >= min_term
-        for _, term in raft_cb_events(node, "BecomeFollower", since_line=boot_mark)
-    ):
-        raise H.Failure(
-            f"node {node.id}: post-restart log has no "
-            f"BecomeFollower at term >= {min_term}"
-        )
+    H.wait_until(
+        f"restarted node {node.id} observes term {min_term}",
+        5,
+        lambda: node.term() >= min_term,
+    )
     H.log(
         f"node {node.id} restarted and caught up (post-restart "
-        f"BecomeFollower term >= {min_term} verified)"
+        f"Raft term >= {min_term} verified)"
     )
 
 

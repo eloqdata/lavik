@@ -30,7 +30,7 @@ The Data executable and operator client remain Raft-free.
 Followers return the committed member directory and leader hint. Only a leader
 with current-term application and fresh quorum evidence may start the publisher
 and Automatic Failover Detector. Demotion revokes that authority immediately,
-then cancels and joins all owners from its leadership generation. Shutdown stops
+then cancels and joins all owners from its Raft leader term. Shutdown stops
 workflow owners and ingress, drains proposals and all Go callback producers,
 waits for accepted foreign notifications, then stops Bycorf. A failed demotion
 notification is fail-stop; no later leader generation may reuse authority whose
@@ -73,7 +73,7 @@ with mutex-consistent snapshots of two thread-safe volatile registries:
 `MetaDataControlRuntimeStatus` for session, health, and projection-anchor
 state, and `MetaAutomaticFailoverDiagnosticsRegistry` for detector state.
 Diagnostics are adopted only under their join-identity contract: the two
-volatile snapshots must name the same leadership generation and
+volatile snapshots must name the same Raft leader term and
 eligibility-continuity revision, and a Group's diagnostic anchor must equal
 the committed owner, assignment, and Group Term; any mismatch is read as no
 diagnostic, exactly as cluster-status resolves the same join. The request path
@@ -121,8 +121,8 @@ The listener bind is independent of the advertised address to permit proxies.
 All election-eligible members must run their registered listener for discovery HA.
 
 Discovery requests and SUBSCRIBE bind their session to the current usable Raft
-leader term (-1 while unavailable),
-Data-control leadership generation and eligibility-continuity revision, and local
+leader term (-1 while unavailable), matching Data-control term and
+readiness-continuity revision, and local
 commit-subscription continuity. Demotion, freshness loss, or a cancelled commit
 subscription closes those sessions, including idle and blocked writers. Returning
 to eligibility cannot revive an old session or queued frame. Connection-only
@@ -566,7 +566,7 @@ an injected monotonic-millisecond cut (production `steady_clock`) to accumulate
 only exact Unserviceable time. A reason change does not clear elapsed time.
 Indeterminate evidence for the same complete anchor freezes and later resumes
 it; Serviceable evidence clears it. A change
-to leadership generation or any revisioned eligibility interruption (including
+to Raft leader term or any revisioned eligibility interruption (including
 false-to-true entirely between detector polls), Owner/assignment, Group term,
 either current Policy version, or threshold discards it. A new or newly
 eligible leader first completes the
@@ -698,7 +698,7 @@ handshake permits. The listener closes excess sockets before starting their
 session coroutine. A follower retains its permit through the bounded redirect
 write. A leader releases it only after the connection has atomically claimed
 the committed node's single post-authentication slot and joined the current
-leadership generation; duplicates are rejected until that exact owner exits.
+Raft leader term; duplicates are rejected until that exact owner exits.
 Consequently anonymous/redirect work is capped at 4096, and projection/FDS
 holders are capped at one per committed node-record slot (validated active at
 claim time) even when a peer stalls or that record retires before session
@@ -807,13 +807,12 @@ host suspend can otherwise preserve an old process's cached leader verdict
 while other members elect a replacement. A leader-scoped Data-control task
 continuously compares that clock with `CLOCK_BOOTTIME`, including when no Data
 session is active; accumulated suspend divergence of at least
-`D` closes the leadership generation's authority sessions and synchronously
-requests immediate Raft resignation. In a multi-member cluster the old
-generation cannot become eligible again. A sole
-member may reopen leadership only after running for another full `D` of active
-time; a further suspend restarts the wait. Live control boundaries, directives,
-result proposals, and grants all pass this barrier. It covers the same-identity
-case whose ordinary `2D` handoff entry matured before suspension.
+`D` closes the current term's authority sessions and synchronously retires its
+leader term before requesting Raft resignation. Even a sole member must win and
+apply a new election term. The new term resets the Data lease handoff guard,
+including for the same identity whose previous `2D` wait matured before suspend.
+Live control boundaries, directives, result proposals, and grants all check their
+captured term against the shared atomic leader term.
 
 Population directives separate the wire recipient from the rebuild target:
 rebuild is delivered to the target, while authorize/revoke is delivered to the
@@ -1104,7 +1103,7 @@ typed commands above.
 The leader builds `clusterstatus` from a compact state-machine view captured
 under the same mutex as committed apply plus Data-control runtime and Automatic
 Failover Detector diagnostic snapshots captured first. The two volatile cuts
-must name the same leadership generation and eligibility-continuity revision;
+must name the same Raft leader term and eligibility-continuity revision;
 the detector cut must also name the compact view's exact applied index. This
 top-level identity covers even an empty detector batch, so a false-to-true
 eligibility ABA cannot splice pre-interruption diagnostics into a later cut.
@@ -1117,7 +1116,7 @@ receipt, while a lease decision becomes observable only after its Ack is
 written, and replaying a cached Ack does not refresh it. Merging requires the
 session, projection, assignment, Group Term, manifest, and population anchors
 to match the committed cut. The result then passes a second
-leader-alive, term, leadership-generation/eligibility/revision, Raft-config,
+leader-alive, term, leader-term/readiness/revision, Raft-config,
 and committed Meta-directory check; a changed bracket returns `cut_changed`
 instead of mixed state. Captures are single-flight across both Admin listeners.
 Completed replies release the capture permit before sending, share a 256 MiB

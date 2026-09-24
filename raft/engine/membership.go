@@ -25,6 +25,12 @@ type memberRequest struct {
 // ChangeMember serializes a single member intent. A requested voter is added
 // as a learner first and promoted only after actual application catches up.
 func (r *Runtime) ChangeMember(member Member, remove, learner bool) (<-chan Result, error) {
+	return r.ChangeMemberInTerm(member, remove, learner, r.Status().Term)
+}
+
+// ChangeMemberInTerm keeps the caller's leadership identity through queueing
+// and learner promotion; a later leader cannot adopt an obsolete request.
+func (r *Runtime) ChangeMemberInTerm(member Member, remove, learner bool, term uint64) (<-chan Result, error) {
 	if !r.admission.enter() {
 		return nil, ErrStopped
 	}
@@ -37,7 +43,7 @@ func (r *Runtime) ChangeMember(member Member, remove, learner bool) (<-chan Resu
 			return nil, err
 		}
 	}
-	request := &memberRequest{member: member, remove: remove, learner: learner, result: make(chan Result, 1)}
+	request := &memberRequest{term: term, member: member, remove: remove, learner: learner, result: make(chan Result, 1)}
 	select {
 	case <-r.stop:
 		return nil, ErrStopped

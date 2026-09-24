@@ -1195,7 +1195,6 @@ absl::Status WriteLeaseGranted(Writer& writer, const LeaseGranted& grant) {
   writer.Fixed(grant.nonce);
   writer.U32(grant.leader_id);
   writer.U64(grant.raft_term);
-  writer.U64(grant.leadership_generation);
   if (absl::Status status =
           WriteIdentity(writer, grant.data_boot_id, "data boot id");
       !status.ok()) {
@@ -1224,9 +1223,6 @@ absl::StatusOr<LeaseGranted> ReadLeaseGranted(Reader& reader) {
   auto raft_term = reader.U64();
   if (!raft_term.ok()) return raft_term.status();
   grant.raft_term = *raft_term;
-  auto generation = reader.U64();
-  if (!generation.ok()) return generation.status();
-  grant.leadership_generation = *generation;
   auto boot_id = ReadIdentity(reader, "data boot id");
   if (!boot_id.ok()) return boot_id.status();
   grant.data_boot_id = std::move(*boot_id);

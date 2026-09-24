@@ -18,7 +18,7 @@ const MetaDataControlRuntimeNode* RuntimeNode(const MetaDiscoveryCut& cut,
 }
 bool Fresh(const MetaDiscoveryCut& cut,
            const MetaDataControlRuntimeNode& node) {
-  return node.leadership_generation_ == cut.runtime_.leadership_generation_ &&
+  return node.leader_term_ == cut.runtime_.leader_term_ &&
          node.health_.has_value() && node.health_->population_ready &&
          node.health_->storage_ready && !node.health_->draining &&
          node.health_received_unix_ms_ <= cut.now_unix_ms_ &&

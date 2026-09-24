@@ -110,11 +110,12 @@ bool detail::IsStableClusterStatusBracket(
          before.leadership_.leader_authority_eligible_ && after.is_leader_ &&
          after.leader_alive_ && after.leadership_.leader_authority_eligible_ &&
          after.term_ == before.term_ &&
+         before.leadership_.leader_term_ == before.term_ &&
+         after.leadership_.leader_term_ == after.term_ &&
          after.config_index_ == before.config_index_ &&
          after.config_server_ids_ == before.config_server_ids_ &&
          after.active_meta_members_ == before.active_meta_members_ &&
-         after.leadership_.leadership_generation_ ==
-             before.leadership_.leadership_generation_ &&
+         after.leadership_.leader_term_ == before.leadership_.leader_term_ &&
          after.leadership_.leader_authority_eligibility_revision_ ==
              before.leadership_.leader_authority_eligibility_revision_;
 }
@@ -123,7 +124,7 @@ bool detail::IsCurrentAutomaticFailoverDiagnostics(
     const MetaDataControlRuntimeSnapshot& runtime,
     const MetaAutomaticFailoverDiagnosticsSnapshot& detector,
     std::uint64_t committed_applied_index) {
-  return detector.leadership_generation_ == runtime.leadership_generation_ &&
+  return detector.leader_term_ == runtime.leader_term_ &&
          detector.leader_authority_eligibility_revision_ ==
              runtime.leader_authority_eligibility_revision_ &&
          detector.evaluated_applied_index_ == committed_applied_index;
@@ -200,8 +201,7 @@ void detail::ApplyClusterRuntimeObservation(
           committed_group->grant_.grant_.has_value() && current_assignment &&
           granted->leader_id == capture.responder_id_ &&
           granted->raft_term == capture.term_ &&
-          granted->leadership_generation ==
-              runtime_node.leadership_generation_ &&
+          granted->raft_term == runtime_node.leader_term_ &&
           granted->data_boot_id == runtime_node.boot_id_ &&
           granted->control_revision == runtime_node.control_revision_ &&
           granted->group_term == committed_group->grant_.group_term_;
@@ -360,7 +360,8 @@ std::string BuildClusterHeadReply(
   // Use one role observation for both fields. A promotion can otherwise land
   // between two is_leader() reads and create a structurally corrupt head that
   // the client must treat as fatal instead of retrying ordinary term churn.
-  const bool responder_is_leader = server->is_leader();
+  const auto admitted_term = server->leader_term();
+  const bool responder_is_leader = admitted_term >= 0;
   const std::int32_t leader_id =
       responder_is_leader ? server->get_id() : server->get_leader();
   if (leader_id <= 0) return "ERR leader_unknown";
@@ -383,11 +384,15 @@ std::string BuildClusterHeadReply(
   head.responder_id_ = static_cast<std::uint32_t>(server->get_id());
   head.role_ = responder_is_leader ? ClusterMetaRole::kLeader
                                    : ClusterMetaRole::kFollower;
-  head.term_ = server->get_term();
+  head.term_ = responder_is_leader ? static_cast<std::uint64_t>(admitted_term)
+                                   : server->get_term();
   if (leader_id > 0) head.leader_id_ = static_cast<std::uint32_t>(leader_id);
   head.config_index_ = config->get_log_idx();
   head.meta_members_ = StatusMembers(members, leader_id);
   auto encoded = EncodeClusterHeadReply(head);
+  if (server->leader_term() != admitted_term ||
+      (!responder_is_leader && server->get_term() != head.term_))
+    return "ERR cut_changed";
   return encoded.ok() ? std::move(*encoded) : "ERR state_corrupt";
 }
 
@@ -398,12 +403,11 @@ std::string BuildClusterStatusReply(
     const std::shared_ptr<MetaAutomaticFailoverDiagnosticsRegistry>&
         automatic_failover_diagnostics,
     std::uint32_t observation_ttl_ms) {
-  const bool before_is_leader = server->is_leader();
-  const bool before_leader_alive = server->is_leader_alive();
-  if (!before_is_leader) return "ERR not_leader";
-  if (!before_leader_alive) return "ERR leader_not_caught_up";
-
-  const std::uint64_t before_term = server->get_term();
+  const auto admitted_term = server->leader_term();
+  if (admitted_term < 0) return "ERR not_leader";
+  const bool before_is_leader = true;
+  const bool before_leader_alive = true;
+  const auto before_term = static_cast<std::uint64_t>(admitted_term);
   const std::shared_ptr<MetaRaftConfig> before_config = server->get_config();
   if (before_config == nullptr) return "ERR leader_not_caught_up";
   const std::uint64_t before_config_index = before_config->get_log_idx();
@@ -415,7 +419,7 @@ std::string BuildClusterStatusReply(
   // FDS and authority anchors still describe that committed cut.
   const MetaDataControlRuntimeSnapshot runtime = runtime_status->Snapshot();
   if (!runtime.leader_authority_eligible_ ||
-      runtime.leadership_generation_ == 0) {
+      runtime.leader_term_ != before_term) {
     return "ERR leader_not_caught_up";
   }
   const MetaAutomaticFailoverDiagnosticsSnapshot detector =
@@ -443,7 +447,7 @@ std::string BuildClusterStatusReply(
       .config_index_ = before_config_index,
       .config_server_ids_ = before_config_ids,
       .active_meta_members_ = active_meta_members,
-      .leadership_ = {.leadership_generation_ = runtime.leadership_generation_,
+      .leadership_ = {.leader_term_ = runtime.leader_term_,
                       .leader_authority_eligible_ =
                           runtime.leader_authority_eligible_,
                       .leader_authority_eligibility_revision_ =
@@ -820,10 +824,11 @@ std::string BuildClusterStatusReply(
   const MetaCommittedStatusView after_view = state_machine->StatusSnapshot();
   const MetaDataControlLeadershipState after_leadership =
       runtime_status->LeadershipState();
+  const auto after_term = server->leader_term();
   detail::MetaClusterStatusBracket after_bracket{
-      .is_leader_ = server->is_leader(),
-      .leader_alive_ = server->is_leader_alive(),
-      .term_ = server->get_term(),
+      .is_leader_ = after_term >= 0,
+      .leader_alive_ = after_term >= 0,
+      .term_ = after_term >= 0 ? static_cast<std::uint64_t>(after_term) : 0,
       .config_index_ = 0,
       .config_server_ids_ = {},
       .active_meta_members_ = {},

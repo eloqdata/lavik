@@ -117,7 +117,7 @@ MetaDiscoveryCut MakeCut() {
       NodeRecord(kReplicaTwoId, {"tcp://10.0.0.3:7003"}),
   };
 
-  cut.runtime_.leadership_generation_ = 3;
+  cut.runtime_.leader_term_ = 3;
   cut.runtime_.leader_authority_eligibility_revision_ = 2;
   cut.runtime_.nodes_ = {
       LiveRuntimeNode(kOwnerId, Bytes<16>(0x01)),
@@ -126,11 +126,11 @@ MetaDiscoveryCut MakeCut() {
   };
   cut.runtime_.observed_nodes_ = {kOwnerId, kReplicaOneId, kReplicaTwoId};
 
-  cut.diagnostics_.leadership_generation_ = 3;
+  cut.diagnostics_.leader_term_ = 3;
   cut.diagnostics_.leader_authority_eligibility_revision_ = 2;
   MetaAutomaticFailoverStatus status;
   status.anchor_.group_id_ = "g1";
-  status.anchor_.leadership_generation_ = 3;
+  status.anchor_.leader_term_ = 3;
   status.anchor_.leader_authority_eligibility_revision_ = 2;
   status.anchor_.owner_node_id_ = kOwnerId;
   status.anchor_.owner_assignment_id_ = Bytes<16>(0x01);
@@ -407,7 +407,7 @@ TEST(MetaSentinelDiscoveryTest, ReadableReplicaDoesNotProveSourceAdoption) {
 // is stronger evidence than FDS acknowledgement or a readable population.
 MetaDiscoveryCut SourceProofCut() {
   auto cut = MakeCut();
-  for (auto& node : cut.runtime_.nodes_) node.leadership_generation_ = 3;
+  for (auto& node : cut.runtime_.nodes_) node.leader_term_ = 3;
   cut.runtime_.nodes_[0].boot_id_ = "owner-boot";
   cut.runtime_.nodes_[1].boot_id_ = "replica-boot";
   cluster::control::CandidateProgress proof;
@@ -462,7 +462,7 @@ TEST(MetaSentinelDiscoveryTest, CompletionRequiresExactFreshSourceLineage) {
         proof.operator_recovery = true;
         break;
       case 8:
-        --cut.runtime_.nodes_[1].leadership_generation_;
+        --cut.runtime_.nodes_[1].leader_term_;
         break;
       case 9:
         cut.runtime_.nodes_[1].health_received_unix_ms_ -= 501;
@@ -671,12 +671,12 @@ TEST(MetaSentinelDiscoveryTest, DiagnosticsRequireSnapshotIdentityAndAnchor) {
   EXPECT_TRUE(s_down(MakeCut()));
   {  // A detector cut from a prior leadership generation never applies.
     MetaDiscoveryCut cut = MakeCut();
-    cut.diagnostics_.leadership_generation_ = 2;
+    cut.diagnostics_.leader_term_ = 2;
     EXPECT_FALSE(s_down(std::move(cut)));
   }
   {  // Zero marks "no active diagnostics bracket" and must never match.
     MetaDiscoveryCut cut = MakeCut();
-    cut.diagnostics_.leadership_generation_ = 0;
+    cut.diagnostics_.leader_term_ = 0;
     EXPECT_FALSE(s_down(std::move(cut)));
   }
   {  // Eligibility interruption inside one generation invalidates the cut.

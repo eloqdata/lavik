@@ -136,7 +136,7 @@ bool RuntimeProjectionIsCurrent(
     const MetaDataControlRuntimeNode& runtime_node) {
   const MetaDataControlRuntimeGroup* runtime_group =
       RuntimeGroupFor(runtime_node, group.group_id_);
-  return runtime_node.leadership_generation_ != 0 &&
+  return runtime_node.leader_term_ != 0 &&
          runtime_node.validated_committed_high_water_ >= view.applied_index() &&
          runtime_node.topology_epoch_ == view.topology().TopologyEpoch() &&
          runtime_group != nullptr &&
@@ -240,7 +240,7 @@ bool HandoffComplete(const MetaDataControlRuntimeNode* runtime_node,
                      bool projection_current,
                      const std::optional<MetaObservedOwnerState>& observed,
                      const MetaOwnerAuthorityAnchor& committed,
-                     std::uint64_t leadership_generation) {
+                     std::uint64_t leader_term) {
   const std::uint64_t* pending_sequence = nullptr;
   if (observed.has_value() && observed->connected_ &&
       observed->authority_handoff_pending_sequence_.has_value() &&
@@ -249,7 +249,7 @@ bool HandoffComplete(const MetaDataControlRuntimeNode* runtime_node,
       runtime_node != nullptr &&
       runtime_node->session_generation_ ==
           observed->identity_.session_generation_ &&
-      runtime_node->leadership_generation_ == leadership_generation &&
+      runtime_node->leader_term_ == leader_term &&
       runtime_node->boot_id_ == Hex(observed->identity_.boot_incarnation_)) {
     pending_sequence = &*observed->authority_handoff_pending_sequence_;
   }
@@ -322,7 +322,7 @@ absl::StatusOr<MetaAutomaticFailoverStateMachine::Input> BuildInput(
       .authority_handoff_complete_ =
           ActiveGrantMatches(group, *grant) &&
           HandoffComplete(runtime_node, projection_current, observed, committed,
-                          runtime.leadership_generation_),
+                          runtime.leader_term_),
       .failover_transition_active_ = group.failover_transition_.has_value(),
       .committed_anchor_ = committed,
       .session_ = std::nullopt,
@@ -334,8 +334,7 @@ absl::StatusOr<MetaAutomaticFailoverStateMachine::Input> BuildInput(
         runtime_node != nullptr &&
         runtime_node->session_generation_ ==
             observed->identity_.session_generation_ &&
-        runtime_node->leadership_generation_ ==
-            runtime.leadership_generation_ &&
+        runtime_node->leader_term_ == runtime.leader_term_ &&
         runtime_node->boot_id_ == Hex(observed->identity_.boot_incarnation_);
     // Keep the cross-source join result, not a second copy of each identity
     // field. A torn or superseded runtime/session join remains explicit and
@@ -393,7 +392,7 @@ absl::StatusOr<MetaAutomaticFailoverStateMachine::Input> BuildInput(
       .anchor_ =
           MetaAutomaticFailoverAnchor{
               .group_id_ = group.group_id_,
-              .leadership_generation_ = runtime.leadership_generation_,
+              .leader_term_ = runtime.leader_term_,
               .leader_authority_eligibility_revision_ =
                   runtime.leader_authority_eligibility_revision_,
               .owner_node_id_ = group.record_.owner_,
@@ -517,7 +516,7 @@ struct MetaAutomaticFailoverReconciler::Core {
   bool running_ = false;
   bool cancelled_ = true;
   bool shutdown_ = false;
-  std::uint64_t leadership_generation_ = 0;
+  std::uint64_t leader_term_ = 0;
   bool last_eligible_ = false;
   std::uint64_t leader_authority_eligibility_revision_ = 0;
   std::optional<std::uint64_t> eligible_since_steady_ms_;
@@ -619,8 +618,7 @@ absl::Status ValidateAutomaticProposal(
   const MetaDataControlRuntimeSnapshot runtime =
       core->options_.data_control_runtime_status_->Snapshot();
   if (!runtime.leader_authority_eligible_ ||
-      runtime.leadership_generation_ !=
-          admission.anchor_.leadership_generation_) {
+      runtime.leader_term_ != admission.anchor_.leader_term_) {
     return absl::FailedPreconditionError(
         "automatic failover leader authority is no longer eligible");
   }
@@ -762,7 +760,7 @@ void MetaAutomaticFailoverReconciler::Start(MetaLeaderContext& context) {
         if (core->running_) std::terminate();
         core->cancelled_ = false;
         core->running_ = true;
-        core->leadership_generation_ = 0;
+        core->leader_term_ = 0;
         core->last_eligible_ = false;
         core->leader_authority_eligibility_revision_ = 0;
         core->eligible_since_steady_ms_.reset();
@@ -790,9 +788,8 @@ void MetaAutomaticFailoverReconciler::Stop(bool permanent) {
           core->waiters_.push_back(waiter);
         } else {
           ClearAdmissions(core);
-          if (core->leadership_generation_ != 0) {
-            core->options_.diagnostics_->EndLeadership(
-                core->leadership_generation_);
+          if (core->leader_term_ != 0) {
+            core->options_.diagnostics_->EndLeadership(core->leader_term_);
           }
           waiter->set_value();
         }
@@ -819,7 +816,7 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
   auto subscribed = subscribe();
   std::string last_error;
 
-  while (!core->cancelled_) {
+  while (!core->cancelled_ && context->IsCurrent()) {
     if (subscribed.subscription_->needs_resync()) subscribed = subscribe();
     // Raft configuration commits advance the status cut without notifying
     // Meta command subscribers. In particular, a new leader's configuration
@@ -830,15 +827,17 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
       subscribed.view_ = context->CommittedView();
     }
     const std::uint64_t now_steady = core->options_.now_steady_ms_();
-    const MetaDataControlRuntimeSnapshot runtime =
+    MetaDataControlRuntimeSnapshot runtime =
         core->options_.data_control_runtime_status_->Snapshot();
+    // Data-control may not have processed this Start yet. Never adopt another
+    // term's observations while the lifecycle mailbox catches up.
+    if (runtime.leader_term_ != context->term()) runtime = {};
 
-    if (runtime.leadership_generation_ != core->leadership_generation_) {
-      if (core->leadership_generation_ != 0) {
-        core->options_.diagnostics_->EndLeadership(
-            core->leadership_generation_);
+    if (runtime.leader_term_ != core->leader_term_) {
+      if (core->leader_term_ != 0) {
+        core->options_.diagnostics_->EndLeadership(core->leader_term_);
       }
-      core->leadership_generation_ = runtime.leadership_generation_;
+      core->leader_term_ = runtime.leader_term_;
       core->last_eligible_ = false;
       core->leader_authority_eligibility_revision_ =
           runtime.leader_authority_eligibility_revision_;
@@ -846,9 +845,8 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
       core->detector_.Clear();
       core->pending_.clear();
       ClearAdmissions(core);
-      if (core->leadership_generation_ != 0) {
-        core->options_.diagnostics_->BeginLeadership(
-            core->leadership_generation_);
+      if (core->leader_term_ != 0) {
+        core->options_.diagnostics_->BeginLeadership(core->leader_term_);
       }
     }
 
@@ -876,9 +874,9 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
         }
       }
       spdlog::info(
-          "automatic failover leadership generation={} eligible={} "
+          "automatic failover Raft leader term={} eligible={} "
           "eligibility_revision={}",
-          runtime.leadership_generation_, runtime.leader_authority_eligible_,
+          runtime.leader_term_, runtime.leader_authority_eligible_,
           runtime.leader_authority_eligibility_revision_);
     }
     const bool warmup_complete =
@@ -926,7 +924,7 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
     const auto lease = subscribed.view_.policy().CurrentAuthorityLease();
     if (subscribed.view_.topology().ClusterLifecycle().state_ ==
             MetaClusterLifecycle::kCreated &&
-        runtime.leadership_generation_ != 0) {
+        runtime.leader_term_ != 0) {
       for (const MetaTopologyGroupView& group :
            subscribed.view_.topology().Groups()) {
         live_groups.insert(group.group_id_);
@@ -1033,10 +1031,9 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
         core->detector_.EraseGroup(status.anchor_.group_id_);
       }
     }
-    if (core->leadership_generation_ != 0) {
+    if (core->leader_term_ != 0) {
       core->options_.diagnostics_->Publish(
-          core->leadership_generation_,
-          runtime.leader_authority_eligibility_revision_,
+          core->leader_term_, runtime.leader_authority_eligibility_revision_,
           subscribed.view_.applied_index(), core->detector_.Snapshot());
     }
 
@@ -1138,10 +1135,10 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
   }
 
   ClearAdmissions(core);
-  if (core->leadership_generation_ != 0) {
-    core->options_.diagnostics_->EndLeadership(core->leadership_generation_);
+  if (core->leader_term_ != 0) {
+    core->options_.diagnostics_->EndLeadership(core->leader_term_);
   }
-  core->leadership_generation_ = 0;
+  core->leader_term_ = 0;
   core->detector_.Clear();
   core->pending_.clear();
   core->running_ = false;

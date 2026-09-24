@@ -168,13 +168,13 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
 
     auto options = test::SingleMetaOptions(dir_);
     options.election_ms_ = 500;
-    options.role_ = [this](bool leader, std::uint64_t) {
+    options.role_ = [this](bool leader, std::uint64_t term) {
       std::lock_guard lock(role_mutex_);
       if (!coordinator_) return;
       if (leader)
-        coordinator_->BecomeLeader();
+        coordinator_->BecomeLeader(term);
       else
-        coordinator_->BecomeFollower();
+        coordinator_->BecomeFollower(term);
     };
     auto raft = MetaRaft::Open(std::move(options), *machine_);
     ASSERT_TRUE(raft.ok()) << raft.status();
@@ -191,7 +191,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     ASSERT_TRUE(WaitUntil([this] { return server_->is_leader(); }, 15s));
     // Harmless if the organic callback already arrived; it closes the tiny
     // fixture-only race between election and callback target attachment.
-    coordinator_->BecomeLeader();
+    coordinator_->BecomeLeader(server_->get_term());
   }
 
   void TearDown() override {
@@ -382,9 +382,9 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
 
   // Warmup starts when the worker observes eligibility, not when the test
   // publishes it. Keep the manual clock fixed until that observation is made.
-  bool WaitForLeadershipWarmup(std::uint64_t generation) const {
-    return WaitForGroupStatus([generation](const auto& status) {
-      return status.anchor_.leadership_generation_ == generation &&
+  bool WaitForLeadershipWarmup() const {
+    return WaitForGroupStatus([this](const auto& status) {
+      return status.anchor_.leader_term_ == CurrentTerm() &&
              status.blocker_ == MetaAutomaticFailoverBlocker::kLeadershipWarmup;
     });
   }
@@ -398,9 +398,19 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
                                       : snapshot.statuses_.front();
   }
 
-  void StartEligibleGeneration(std::uint64_t generation) {
-    data_runtime_->BeginLeadership(generation);
-    data_runtime_->SetLeaderAuthorityEligible(generation, true);
+  std::uint64_t CurrentTerm() const {
+    return static_cast<std::uint64_t>(server_->leader_term());
+  }
+
+  void StartEligibleTerm(bool reelect = false) {
+    if (reelect) {
+      const auto previous = server_->leader_term();
+      server_->yield_leadership();
+      ASSERT_TRUE(
+          WaitUntil([&] { return server_->leader_term() > previous; }, 15s));
+    }
+    data_runtime_->BeginLeadership(CurrentTerm());
+    data_runtime_->SetLeaderAuthorityEligible(CurrentTerm(), true);
   }
 
   absl::Status PublishOwnerHeartbeat(
@@ -442,7 +452,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     data_runtime_->PublishCurrent(
         seed.owner_, std::string(40, '1'), session_id, history,
         /*replication_flow_count=*/1, /*session_generation=*/1,
-        /*leadership_generation=*/1,
+        /*leader_term=*/CurrentTerm(),
         /*validated_committed_high_water=*/view.applied_index(),
         projected->full_state);
 
@@ -548,7 +558,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     data_runtime_->PublishCurrent(
         seed.owner_, std::string(40, '1'), Bytes<16>(0x33), Bytes<20>(0x22),
         /*replication_flow_count=*/1, /*session_generation=*/1,
-        /*leadership_generation=*/1,
+        /*leader_term=*/CurrentTerm(),
         /*validated_committed_high_water=*/view.applied_index(),
         projected->full_state);
     return absl::OkStatus();
@@ -680,8 +690,8 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   SeedCluster();
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids));
-  StartEligibleGeneration(1);
-  ASSERT_TRUE(WaitForLeadershipWarmup(1));
+  StartEligibleTerm();
+  ASSERT_TRUE(WaitForLeadershipWarmup());
 
   const auto before = machine_->last_commit_index();
   ASSERT_TRUE(WaitUntil([&] {
@@ -708,13 +718,13 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   std::atomic<int> generated_ids{0};
   BlockReconcilerExecutor();
   InstallReconciler(CountingIds(generated_ids));
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
 
   // Force the pre-publication window regardless of worker scheduling. Even an
   // unconditional predicate must keep waiting while no Group cut exists.
   EXPECT_FALSE(WaitForGroupStatus([](const auto&) { return true; }, 0ms));
   ReleaseReconcilerExecutor();
-  ASSERT_TRUE(WaitForLeadershipWarmup(1));
+  ASSERT_TRUE(WaitForLeadershipWarmup());
 
   now_steady_ms_.store(10'100, std::memory_order_release);
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
@@ -727,11 +737,11 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   }));
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 0);
 
-  // A new leadership generation discards both the old warmup and its 999 ms
+  // A new elected Raft term discards both the old warmup and its 999 ms
   // suspicion; neither interval is allowed to leak into the new bracket.
   now_steady_ms_.store(20'000, std::memory_order_release);
-  StartEligibleGeneration(2);
-  ASSERT_TRUE(WaitForLeadershipWarmup(2));
+  StartEligibleTerm(/*reelect=*/true);
+  ASSERT_TRUE(WaitForLeadershipWarmup());
   now_steady_ms_.store(20'100, std::memory_order_release);
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
@@ -756,9 +766,9 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   SeedCluster();
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids));
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
 
-  ASSERT_TRUE(WaitForLeadershipWarmup(1));
+  ASSERT_TRUE(WaitForLeadershipWarmup());
   now_steady_ms_.store(10'100, std::memory_order_release);
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
@@ -773,8 +783,8 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   // entirely between two snapshots. A boolean-only status loses this ABA edge
   // and lets the old 999 ms suspicion trigger immediately after recovery.
   BlockReconcilerExecutor();
-  data_runtime_->SetLeaderAuthorityEligible(1, false);
-  data_runtime_->SetLeaderAuthorityEligible(1, true);
+  data_runtime_->SetLeaderAuthorityEligible(CurrentTerm(), false);
+  data_runtime_->SetLeaderAuthorityEligible(CurrentTerm(), true);
   now_steady_ms_.store(11'100, std::memory_order_release);
   ReleaseReconcilerExecutor();
 
@@ -832,17 +842,17 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
           // The detector already reached its edge from an eligible cut.
           // Revoking and restoring eligibility here lands strictly between that
           // cut and Propose's hook; the final boolean alone looks unchanged.
-          data_runtime_->SetLeaderAuthorityEligible(1, false);
-          data_runtime_->SetLeaderAuthorityEligible(1, true);
+          data_runtime_->SetLeaderAuthorityEligible(CurrentTerm(), false);
+          data_runtime_->SetLeaderAuthorityEligible(CurrentTerm(), true);
         }
         return Bytes<16>(static_cast<std::uint8_t>(0x80 + offset));
       },
       /*grace_ms=*/0);
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
 
   ASSERT_TRUE(WaitUntil([&] {
     const auto snapshot = diagnostics_->Snapshot();
-    return snapshot.leadership_generation_ == 1 &&
+    return snapshot.leader_term_ == CurrentTerm() &&
            snapshot.statuses_.size() == 1 &&
            snapshot.statuses_[0].state_ == MetaAutomaticFailoverState::kSuspect;
   }));
@@ -892,7 +902,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
       });
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids, 0x80), /*grace_ms=*/0);
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
   ASSERT_TRUE(WaitUntil([&] {
     const auto snapshot = diagnostics_->Snapshot();
     return snapshot.statuses_.size() == 1 &&
@@ -948,7 +958,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
       });
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids, 0x88), /*grace_ms=*/0);
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
   ASSERT_TRUE(WaitUntil([&] {
     const auto snapshot = diagnostics_->Snapshot();
     return snapshot.statuses_.size() == 1 &&
@@ -1003,7 +1013,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   });
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids, 0x90), /*grace_ms=*/0);
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
   ASSERT_TRUE(WaitUntil([&] {
     const auto snapshot = diagnostics_->Snapshot();
     return snapshot.statuses_.size() == 1 &&
@@ -1061,7 +1071,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTimeoutTest,
   SeedCluster();
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids, 0x90), /*grace_ms=*/0);
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
   ASSERT_TRUE(WaitUntil([&] {
     const auto snapshot = diagnostics_->Snapshot();
     return snapshot.statuses_.size() == 1 &&
@@ -1104,7 +1114,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   const SeedState seed = SeedCluster(/*controlled_request=*/true);
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids, 0xa0), /*grace_ms=*/0);
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
   ASSERT_TRUE(WaitUntil([&] {
     const auto snapshot = diagnostics_->Snapshot();
     return snapshot.statuses_.size() == 1 &&
@@ -1136,7 +1146,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   const SeedState seed = SeedCluster();
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids));
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
   ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
                                     MetaNodeHealthObs{.storage_ready_ = true,
                                                       .population_ready_ = true,
@@ -1148,7 +1158,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                     /*effective_lease_duration_ms=*/250)
                   .ok());
 
-  ASSERT_TRUE(WaitForLeadershipWarmup(1));
+  ASSERT_TRUE(WaitForLeadershipWarmup());
   now_steady_ms_.store(10'100, std::memory_order_release);
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kBlocked &&
@@ -1188,7 +1198,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids), /*grace_ms=*/100,
                     /*observation_ttl_ms=*/30'000);
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
   ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
                                     MetaNodeHealthObs{.storage_ready_ = true,
                                                       .population_ready_ = true,
@@ -1200,7 +1210,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                     /*effective_lease_duration_ms=*/5'000)
                   .ok());
 
-  ASSERT_TRUE(WaitForLeadershipWarmup(1));
+  ASSERT_TRUE(WaitForLeadershipWarmup());
   now_steady_ms_.store(10'100, std::memory_order_release);
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kHealthy;
@@ -1223,7 +1233,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   data_runtime_->PublishCurrent(
       seed.owner_, std::string(40, '1'), Bytes<16>(0x33), Bytes<20>(0x22),
       /*replication_flow_count=*/1, /*session_generation=*/1,
-      /*leadership_generation=*/1,
+      /*leader_term=*/CurrentTerm(),
       /*validated_committed_high_water=*/advanced.applied_index(),
       projected->full_state);
 
@@ -1282,7 +1292,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   lease.content_ = R"({"kind":"authority-lease-v1","duration_ms":6000})";
   ProposeAccepted(lease);
 
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
   ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
                                     MetaNodeHealthObs{.storage_ready_ = true,
                                                       .population_ready_ = true,
@@ -1359,7 +1369,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   data_runtime_->RecordLeaseDecisionWritten(
       seed.owner_, session_id, /*heartbeat_sequence=*/8,
       cluster::control::LeaseGranted{
-          .leadership_generation = replacement_owner.leadership_generation_,
+          .raft_term = replacement_owner.leader_term_,
           .data_boot_id = replacement_owner.boot_id_,
           .control_revision = replacement_owner.control_revision_,
           .group_id = replacement_group.group_id_,
@@ -1406,7 +1416,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 TEST_F(MetaAutomaticFailoverReconcilerTest,
        NewerHandoffMarkerOutranksStaleRuntimeDecisionButDoesNotLatch) {
   const SeedState seed = SeedCluster();
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
   ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
                                     MetaNodeHealthObs{.storage_ready_ = true,
                                                       .population_ready_ = true,
@@ -1481,7 +1491,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   lease.content_ = R"({"kind":"authority-lease-v1","duration_ms":6000})";
   ProposeAccepted(lease);
 
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
   ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
                                     MetaNodeHealthObs{.storage_ready_ = true,
                                                       .population_ready_ = true,
@@ -1508,7 +1518,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   data_runtime_->RecordLeaseDecisionWritten(
       seed.owner_, Bytes<16>(0x33), /*heartbeat_sequence=*/7,
       cluster::control::LeaseGranted{
-          .leadership_generation = owner.leadership_generation_,
+          .raft_term = owner.leader_term_,
           .data_boot_id = owner.boot_id_,
           .control_revision = owner.control_revision_,
           .group_id = group.group_id_,
@@ -1579,7 +1589,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   const SeedState seed = SeedCluster();
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids));
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
   ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
                                     MetaNodeHealthObs{.storage_ready_ = true,
                                                       .population_ready_ = true,
@@ -1590,7 +1600,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                     /*observed_at_steady_ms=*/10'000,
                                     /*effective_lease_duration_ms=*/250)
                   .ok());
-  ASSERT_TRUE(WaitForLeadershipWarmup(1));
+  ASSERT_TRUE(WaitForLeadershipWarmup());
   now_steady_ms_.store(10'100, std::memory_order_release);
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kHealthy;
@@ -1628,7 +1638,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   const SeedState seed = SeedCluster();
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids));
-  StartEligibleGeneration(1);
+  StartEligibleTerm();
   ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
                                     MetaNodeHealthObs{.storage_ready_ = true,
                                                       .population_ready_ = true,
@@ -1640,7 +1650,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                     /*effective_lease_duration_ms=*/250)
                   .ok());
 
-  ASSERT_TRUE(WaitForLeadershipWarmup(1));
+  ASSERT_TRUE(WaitForLeadershipWarmup());
   // Owner freshness shares the detector's monotonic clock. Moving the wall
   // clock backwards while steady time advances by 100 ms cannot age it.
   now_unix_ms_.store(999'000, std::memory_order_release);

@@ -98,8 +98,8 @@ std::string Identity(char value) { return std::string(40, value); }
 TEST(MetaDataControlRuntimeStatusTest,
      PublishesOnlyCurrentSessionAndAckedHeartbeatFacts) {
   MetaDataControlRuntimeStatus status;
-  status.BeginLeadership(/*leadership_generation=*/11);
-  status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, true);
+  status.BeginLeadership(/*leader_term=*/11);
+  status.SetLeaderAuthorityEligible(/*leader_term=*/11, true);
   control::FullDesiredState projection;
   projection.control_revision = 7;
   projection.topology_epoch = 3;
@@ -119,7 +119,7 @@ TEST(MetaDataControlRuntimeStatusTest,
   status.PublishCurrent(Identity('1'), Identity('2'), session, Bytes<20>(0x51),
                         /*replication_flow_count=*/3,
                         /*session_generation=*/10,
-                        /*leadership_generation=*/11,
+                        /*leader_term=*/11,
                         /*validated_committed_high_water=*/7, projection);
   auto snapshot = status.Snapshot();
   ASSERT_EQ(snapshot.nodes_.size(), 1u);
@@ -167,7 +167,7 @@ TEST(MetaDataControlRuntimeStatusTest,
   status.PublishCurrent(Identity('3'), Identity('4'), session, Bytes<20>(0x52),
                         /*replication_flow_count=*/3,
                         /*session_generation=*/12,
-                        /*leadership_generation=*/11,
+                        /*leader_term=*/11,
                         /*validated_committed_high_water=*/7, projection);
   snapshot = status.Snapshot();
   ASSERT_EQ(snapshot.nodes_.size(), 1u);
@@ -176,16 +176,16 @@ TEST(MetaDataControlRuntimeStatusTest,
   ASSERT_EQ(snapshot.nodes_[0].groups_.size(), 1u);
   EXPECT_EQ(snapshot.nodes_[0].groups_[0].assignment_id_, Bytes<16>(0x12));
 
-  status.EndLeadership(/*leadership_generation=*/11);
+  status.EndLeadership(/*leader_term=*/11);
   snapshot = status.Snapshot();
-  EXPECT_EQ(snapshot.leadership_generation_, 0u);
+  EXPECT_EQ(snapshot.leader_term_, 0u);
   EXPECT_FALSE(snapshot.leader_authority_eligible_);
   EXPECT_TRUE(snapshot.nodes_.empty());
   EXPECT_TRUE(snapshot.observed_nodes_.empty());
   status.PublishCurrent(Identity('1'), Identity('2'), session, Bytes<20>(0x53),
                         /*replication_flow_count=*/3,
                         /*session_generation=*/13,
-                        /*leadership_generation=*/11,
+                        /*leader_term=*/11,
                         /*validated_committed_high_water=*/7, projection);
   EXPECT_TRUE(status.Snapshot().nodes_.empty());
 }
@@ -194,7 +194,7 @@ TEST(MetaDataControlRuntimeStatusTest,
      EligibilityRecoversWithinTheSameLeadershipGeneration) {
   MetaDataControlRuntimeStatus status;
   MetaLeaderRuntimeGuard guard(/*leadership_validity_ms=*/250);
-  status.BeginLeadership(/*leadership_generation=*/11);
+  status.BeginLeadership(/*leader_term=*/11);
   EXPECT_EQ(status.Snapshot().leader_authority_eligibility_revision_, 0u);
   guard.Reset(/*now_suspend_clock_ms=*/1'000,
               /*now_active_clock_ms=*/2'000);
@@ -204,7 +204,7 @@ TEST(MetaDataControlRuntimeStatusTest,
     status.PublishCurrent(Identity('1'), Identity('2'), session,
                           Bytes<20>(0x54), /*replication_flow_count=*/3,
                           /*session_generation=*/10,
-                          /*leadership_generation=*/11,
+                          /*leader_term=*/11,
                           /*validated_committed_high_water=*/7, projection);
   };
 
@@ -248,7 +248,7 @@ TEST(MetaDataControlRuntimeStatusTest,
                       /*received_unix_ms=*/100);
   const auto snapshot = status.Snapshot();
   ASSERT_EQ(snapshot.nodes_.size(), 1u);
-  EXPECT_EQ(snapshot.leadership_generation_, 11u);
+  EXPECT_EQ(snapshot.leader_term_, 11u);
   EXPECT_TRUE(snapshot.leader_authority_eligible_);
   EXPECT_EQ(snapshot.nodes_[0].health_received_unix_ms_, 100);
 }
@@ -256,51 +256,47 @@ TEST(MetaDataControlRuntimeStatusTest,
 TEST(MetaDataControlRuntimeStatusTest,
      EligibilityMutationReportsTheCurrentGenerationEffectiveState) {
   MetaDataControlRuntimeStatus status;
-  status.BeginLeadership(/*leadership_generation=*/11);
+  status.BeginLeadership(/*leader_term=*/11);
 
-  EXPECT_FALSE(
-      status.SetLeaderAuthorityEligible(/*leadership_generation=*/10, true));
-  EXPECT_TRUE(
-      status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, true));
-  EXPECT_TRUE(
-      status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, true));
-  EXPECT_FALSE(
-      status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, false));
+  EXPECT_FALSE(status.SetLeaderAuthorityEligible(/*leader_term=*/10, true));
+  EXPECT_TRUE(status.SetLeaderAuthorityEligible(/*leader_term=*/11, true));
+  EXPECT_TRUE(status.SetLeaderAuthorityEligible(/*leader_term=*/11, true));
+  EXPECT_FALSE(status.SetLeaderAuthorityEligible(/*leader_term=*/11, false));
 }
 
 TEST(MetaDataControlRuntimeStatusTest,
      UnregisteredRetriesAreGenerationScopedAndClearedByAdmission) {
   MetaDataControlRuntimeStatus status;
-  status.BeginLeadership(/*leadership_generation=*/11);
-  status.NoteUnregisteredRetry(Identity('2'), /*leadership_generation=*/10);
-  status.NoteUnregisteredRetry(Identity('2'), /*leadership_generation=*/11);
-  status.NoteUnregisteredRetry(Identity('1'), /*leadership_generation=*/11);
+  status.BeginLeadership(/*leader_term=*/11);
+  status.NoteUnregisteredRetry(Identity('2'), /*leader_term=*/10);
+  status.NoteUnregisteredRetry(Identity('2'), /*leader_term=*/11);
+  status.NoteUnregisteredRetry(Identity('1'), /*leader_term=*/11);
 
   auto snapshot = status.Snapshot();
   EXPECT_EQ(snapshot.unregistered_retries_,
             std::vector<std::string>({Identity('1'), Identity('2')}));
 
-  status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, true);
+  status.SetLeaderAuthorityEligible(/*leader_term=*/11, true);
   control::FullDesiredState projection;
   status.PublishCurrent(Identity('1'), Identity('3'), Bytes<16>(0x41),
                         Bytes<20>(0x51), /*replication_flow_count=*/3,
                         /*session_generation=*/1,
-                        /*leadership_generation=*/11,
+                        /*leader_term=*/11,
                         /*validated_committed_high_water=*/1, projection);
   EXPECT_EQ(status.Snapshot().unregistered_retries_,
             std::vector<std::string>({Identity('2')}));
 
-  status.EndLeadership(/*leadership_generation=*/11);
+  status.EndLeadership(/*leader_term=*/11);
   EXPECT_TRUE(status.Snapshot().unregistered_retries_.empty());
 }
 
 TEST(MetaDataControlRuntimeStatusTest, UnregisteredRetryEvidenceIsBounded) {
   MetaDataControlRuntimeStatus status;
-  status.BeginLeadership(/*leadership_generation=*/11);
+  status.BeginLeadership(/*leader_term=*/11);
   for (std::size_t index = 0; index < control::kMaxProjectedNodes + 1;
        ++index) {
     status.NoteUnregisteredRetry("declared-" + std::to_string(index),
-                                 /*leadership_generation=*/11);
+                                 /*leader_term=*/11);
   }
 
   EXPECT_EQ(status.Snapshot().unregistered_retries_.size(),
@@ -599,7 +595,7 @@ TEST(MetaDataControlHandshakeLimitTest,
   bycorf::Connection first;
   bycorf::Connection duplicate;
   MetaDataControlRuntimeStatus status;
-  status.BeginLeadership(/*leadership_generation=*/11);
+  status.BeginLeadership(/*leader_term=*/11);
   status.SetLeaderAuthorityEligible(11, true);
   const auto session = Bytes<16>(0x41);
   control::FullDesiredState projection;
@@ -608,7 +604,7 @@ TEST(MetaDataControlHandshakeLimitTest,
   status.PublishCurrent("node-a", Identity('2'), session, Bytes<20>(0x55),
                         /*replication_flow_count=*/3,
                         /*session_generation=*/10,
-                        /*leadership_generation=*/11,
+                        /*leader_term=*/11,
                         /*validated_committed_high_water=*/7, projection);
   handshake->Release();
   auto next_handshake = limiter.TryAcquire();
@@ -881,7 +877,6 @@ TEST(MetaDataControlLeaseTest, ExactCommittedAnchorGetsBoundedGrant) {
       .leader_valid_ = true,
       .server_id_ = 3,
       .raft_term_ = 12,
-      .leadership_generation_ = 4,
       .leadership_validity_ms_ = 250,
       .node_id_ = Identity('1'),
       .boot_id_ = Identity('2'),
@@ -897,7 +892,6 @@ TEST(MetaDataControlLeaseTest, ExactCommittedAnchorGetsBoundedGrant) {
   EXPECT_EQ(grant->nonce, Challenge().nonce);
   EXPECT_EQ(grant->leader_id, 3u);
   EXPECT_EQ(grant->raft_term, 12u);
-  EXPECT_EQ(grant->leadership_generation, 4u);
   EXPECT_EQ(grant->data_boot_id, Identity('2'));
   EXPECT_EQ(grant->granted_duration_ms, 250u);
 }
@@ -933,7 +927,6 @@ TEST(MetaDataControlLeaseTest,
       .leader_valid_ = true,
       .server_id_ = 3,
       .raft_term_ = 12,
-      .leadership_generation_ = 4,
       .leadership_validity_ms_ = 250,
       .node_id_ = Identity('1'),
       .boot_id_ = Identity('2'),
@@ -974,7 +967,6 @@ TEST(MetaDataControlLeaseTest,
       .leader_valid_ = true,
       .server_id_ = 3,
       .raft_term_ = 12,
-      .leadership_generation_ = 4,
       .leadership_validity_ms_ = 250,
       .node_id_ = Identity('1'),
       .boot_id_ = Identity('2'),
@@ -1018,7 +1010,6 @@ TEST(MetaDataControlLeaseTest, NewBootAndLeaderResetRestartHandoffWait) {
       .leader_valid_ = true,
       .server_id_ = 3,
       .raft_term_ = 12,
-      .leadership_generation_ = 4,
       .leadership_validity_ms_ = 250,
       .node_id_ = Identity('1'),
       .boot_id_ = Identity('2'),
@@ -1043,7 +1034,7 @@ TEST(MetaDataControlLeaseTest, NewBootAndLeaderResetRestartHandoffWait) {
   EXPECT_TRUE(std::holds_alternative<control::LeaseGranted>(
       guard.Enforce(candidate(), evaluation.node_id_, 11'001)));
 
-  ++evaluation.leadership_generation_;
+  ++evaluation.raft_term_;
   EXPECT_TRUE(std::holds_alternative<control::LeaseDenied>(
       guard.Enforce(candidate(), evaluation.node_id_, 11'002)));
   EXPECT_TRUE(std::holds_alternative<control::LeaseGranted>(

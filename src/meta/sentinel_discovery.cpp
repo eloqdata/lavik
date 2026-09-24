@@ -311,9 +311,8 @@ MetaDiscoveryMasterFlags MasterFlags(const MetaDiscoveryCut& cut,
       FindRuntimeNode(cut, primary.owner_node_id_) == nullptr && !unknown;
   const MetaAutomaticFailoverDiagnosticsSnapshot& diagnostics =
       cut.diagnostics_;
-  if (diagnostics.leadership_generation_ != 0 &&
-      diagnostics.leadership_generation_ ==
-          cut.runtime_.leadership_generation_ &&
+  if (diagnostics.leader_term_ != 0 &&
+      diagnostics.leader_term_ == cut.runtime_.leader_term_ &&
       diagnostics.leader_authority_eligibility_revision_ ==
           cut.runtime_.leader_authority_eligibility_revision_) {
     const auto status =

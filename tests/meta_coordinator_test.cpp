@@ -322,8 +322,9 @@ class MetaCoordinatorComponentTest : public ::testing::Test {
 // three callbacks arrive before the worker can infer a final role.
 class BlockingLeadershipReconciler final : public MetaReconciler {
  public:
-  void Start(MetaLeaderContext&) override {
+  void Start(MetaLeaderContext& context) override {
     std::unique_lock<std::mutex> lock(mu_);
+    terms_.push_back(context.term());
     ++starts_;
     events_.push_back("start-" + std::to_string(starts_));
     cv_.notify_all();
@@ -394,6 +395,10 @@ class BlockingLeadershipReconciler final : public MetaReconciler {
     std::lock_guard<std::mutex> lock(mu_);
     return events_;
   }
+  std::vector<std::uint64_t> terms() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return terms_;
+  }
 
  private:
   mutable std::mutex mu_;
@@ -405,6 +410,7 @@ class BlockingLeadershipReconciler final : public MetaReconciler {
   bool release_first_start_ = false;
   bool release_cancel_ = false;
   std::vector<std::string> events_;
+  std::vector<std::uint64_t> terms_;
 };
 
 TEST_F(MetaCoordinatorComponentTest,
@@ -417,9 +423,9 @@ TEST_F(MetaCoordinatorComponentTest,
   // the process bridge before it can attach to the coordinator. The relay and
   // coordinator must retain the ordered edges, not merely the final role.
   MetaLeadershipRelay relay;
-  relay.RecordLeaderEdge();
-  relay.RecordFollowerEdge();
-  relay.RecordLeaderEdge();
+  relay.RecordLeaderEdge(11);
+  relay.RecordFollowerEdge(11);
+  relay.RecordLeaderEdge(12);
   relay.Attach(*coordinator_);
   const bool started = reconciler->WaitForFirstStart(std::chrono::seconds(2));
   EXPECT_TRUE(started);
@@ -461,6 +467,21 @@ TEST_F(MetaCoordinatorComponentTest,
                                       "start-2"}));
   EXPECT_FALSE(
       observations_.CurrentGeneration(old_session.node_id_).has_value());
+  EXPECT_EQ(reconciler->terms(), (std::vector<std::uint64_t>{11, 12}));
+
+  // Queue obsolete notifications, then register a marker. Starting the marker
+  // proves those notifications were processed without cancelling term 12.
+  relay.RecordFollowerEdge(11);
+  relay.RecordLeaderEdge(11);
+  relay.Drain();
+  auto marker = std::make_shared<BlockingLeadershipReconciler>();
+  marker->ReleaseAll();
+  coordinator_->RunAsLeader(marker);
+  EXPECT_TRUE(marker->WaitForFirstStart(std::chrono::seconds(2)));
+  EXPECT_EQ(marker->terms(), (std::vector<std::uint64_t>{12}));
+  EXPECT_EQ(reconciler->events(),
+            (std::vector<std::string>{"start-1", "cancel-enter", "cancel-exit",
+                                      "start-2"}));
   relay.DetachAndStop();
 }
 
@@ -708,13 +729,13 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     options.election_ms_ = knobs.election_ms_low_;
     options.client_timeout_ms_ = knobs.client_req_timeout_ms_;
     options.before_apply_ = [this] { apply_barrier_.Wait(); };
-    options.role_ = [this](bool leader, std::uint64_t) {
+    options.role_ = [this](bool leader, std::uint64_t term) {
       std::lock_guard lock(role_mu_);
       if (forward_target_ == nullptr) return;
       if (leader)
-        forward_target_->BecomeLeader();
+        forward_target_->BecomeLeader(term);
       else
-        forward_target_->BecomeFollower();
+        forward_target_->BecomeFollower(term);
     };
     auto opened = lavik::meta::MetaRaft::Open(std::move(options), *machine_);
     ASSERT_TRUE(opened.ok()) << opened.status();
@@ -1897,7 +1918,7 @@ TEST_F(MetaCoordinatorServerTest, ReconcilerStartCancelRestartIsIdempotent) {
   // BecomeFollower cancels and JOINS the reconciler; BecomeFollower is
   // driven directly here to test reconciler cancellation independently of
   // the single-voter Raft authority quarantine.
-  coordinator_->BecomeFollower();
+  coordinator_->BecomeFollower(server_->get_term());
   ASSERT_TRUE(WaitFor([&] { return reconciler->cancels() == 1; },
                       std::chrono::seconds(10)));
   EXPECT_TRUE(WaitFor(
@@ -1910,7 +1931,10 @@ TEST_F(MetaCoordinatorServerTest, ReconcilerStartCancelRestartIsIdempotent) {
 
   // Re-arm: the reconciler reconciles from the committed view, finds the
   // operation already Running, and proposes nothing.
-  coordinator_->BecomeLeader();
+  const auto old_term = server_->leader_term();
+  server_->yield_leadership();
+  ASSERT_TRUE(WaitFor([&] { return server_->leader_term() > old_term; },
+                      std::chrono::seconds(10)));
   ASSERT_TRUE(WaitFor([&] { return reconciler->reconcile_done() >= 2; },
                       std::chrono::seconds(10)));
   EXPECT_EQ(reconciler->starts(), 2);

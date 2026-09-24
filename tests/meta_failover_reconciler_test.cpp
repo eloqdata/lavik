@@ -2164,7 +2164,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   auto reconciler = std::make_shared<meta::MetaFailoverReconciler>(
       executor, std::move(reconciler_options));
   coordinator->RunAsLeader(reconciler);
-  coordinator->BecomeLeader();
+  coordinator->BecomeLeader(1);
   ASSERT_TRUE(WaitUntil(
       [&] { return clock_calls.load(std::memory_order_acquire) >= 2; },
       std::chrono::seconds(2)));
@@ -2220,7 +2220,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
                   .topology_.FindGroup("g1")
                   ->failover_transition_.has_value());
 
-  coordinator->BecomeFollower();
+  coordinator->BecomeFollower(1);
   ASSERT_TRUE(WaitUntil(
       [&] {
         return !observations.CurrentGeneration(fixture.owner).has_value();
@@ -2476,7 +2476,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   auto reconciler = std::make_shared<meta::MetaFailoverReconciler>(
       executor, std::move(reconciler_options));
   coordinator->RunAsLeader(reconciler);
-  coordinator->BecomeLeader();
+  coordinator->BecomeLeader(1);
   ASSERT_TRUE(WaitUntil(
       [&] { return clock_calls.load(std::memory_order_acquire) >= 2; },
       std::chrono::seconds(2)));
@@ -2545,7 +2545,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   ASSERT_TRUE(operation.has_value());
   EXPECT_EQ(operation->lifecycle_, meta::MetaOperationLifecycle::kCompleted);
 
-  coordinator->BecomeFollower();
+  coordinator->BecomeFollower(1);
   ASSERT_TRUE(WaitUntil(
       [&] {
         return !observations.CurrentGeneration(fixture.owner).has_value();

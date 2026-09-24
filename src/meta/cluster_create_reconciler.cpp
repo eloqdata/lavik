@@ -1296,7 +1296,7 @@ bycorf::Task<absl::Status> MetaClusterCreateReconciler::Run(
     });
   };
   auto subscribed = subscribe();
-  while (!core->cancelled_) {
+  while (!core->cancelled_ && context->IsCurrent()) {
     // CommittedView includes snapshot restoration and WAL replay. There is
     // deliberately no saved process-local task list to reconstruct on boot.
     // Idle polling only reads a notification bit, not the entire metadata

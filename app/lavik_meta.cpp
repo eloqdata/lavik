@@ -616,8 +616,8 @@ int main(int argc, char** argv) {
   auto leadership_relay = std::make_shared<MetaLeadershipRelay>();
   raft_options.role_ = [foreign_executor, leadership_relay](
                            bool leader, std::uint64_t term) {
-    leader ? leadership_relay->RecordLeaderEdge()
-           : leadership_relay->RecordFollowerEdge();
+    leader ? leadership_relay->RecordLeaderEdge(term)
+           : leadership_relay->RecordFollowerEdge(term);
     if (!foreign_executor.Notify([leadership_relay, leader, term]() noexcept {
           spdlog::info("[raft-cb] event={} term={}",
                        leader ? "BecomeLeader" : "BecomeFollower", term);
@@ -920,7 +920,8 @@ int main(int argc, char** argv) {
   // cancels any reconciler still running if it reaches destruction before
   // this queued edge is consumed.
   leadership_relay->DetachAndStop();
-  coordinator->BecomeFollower();
+  if (const auto term = server->leader_term(); term >= 0)
+    coordinator->BecomeFollower(static_cast<std::uint64_t>(term));
   // No new Bycorf ingress or leader work is accepted. Drain queued Raft
   // mutation/snapshot entry before joining its Go executors; result
   // completions can still use the live foreign executor while shutdown

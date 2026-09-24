@@ -76,6 +76,19 @@ withdraw Data authority. Peer application progress is always reported; only
 Cluster Create and learner promotion impose their explicit catch-up barriers.
 Ordinary writes retain durable majority semantics.
 
+Meta modules read one shared atomic leader term: the admitted Raft term, or -1
+while unavailable. Ordered `BecomeLeader(T)` and `BecomeFollower(T)` events
+carry the admitted or retired term through the process relay and coordinator.
+A reconciler context captures T for its entire Start-to-CancelAndWait lifetime;
+old-term cancellation cannot cancel a newer context, and old work never adopts
+a later term merely by reading current leadership. Proposals and membership
+requests retain that expected term through their queues to protocol-owner
+admission. Local copies in Data sessions, runtime observations, and detector
+cuts identify their owner; none independently increments a leadership version.
+Lease grants carry this Raft term without a duplicate leadership generation.
+Data-control readiness may change within a term during membership reconciliation,
+so its readiness-continuity revision remains separate from leader identity.
+
 ## Transport and authority
 
 Each destination has independent control, log, and snapshot TCP connections and

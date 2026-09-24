@@ -162,7 +162,7 @@ struct DeadlineState {
 };
 
 struct SessionCommitSignal {
-  // One signal is shared by every session in a leader generation. The
+  // One signal is shared by every session in a leader term. The
   // coordinator callback publishes the cursor before posting the worker
   // notification; each session compares that cursor with its own validated
   // projection index, so one fast publisher cannot clear another's work.
@@ -1118,7 +1118,6 @@ control::LeaseDecision EvaluateLeaseChallenge(
       .nonce = challenge->nonce,
       .leader_id = evaluation.server_id_,
       .raft_term = evaluation.raft_term_,
-      .leadership_generation = evaluation.leadership_generation_,
       .data_boot_id = evaluation.boot_id_,
       .control_revision = current_index,
       .group_id = challenge->group_id,
@@ -1143,11 +1142,11 @@ control::LeaseDecision MetaLeaseHandoffGuard::Enforce(
       entries_.begin(), entries_.end(), [&](const Entry& candidate) {
         return candidate.authority_.group_id == authority.group_id;
       });
-  const bool same_identity =
-      entry != entries_.end() && entry->authority_ == authority &&
-      entry->node_id_ == node_id &&
-      entry->data_boot_id_ == grant->data_boot_id &&
-      entry->leadership_generation_ == grant->leadership_generation;
+  const bool same_identity = entry != entries_.end() &&
+                             entry->authority_ == authority &&
+                             entry->node_id_ == node_id &&
+                             entry->data_boot_id_ == grant->data_boot_id &&
+                             entry->leader_term_ == grant->raft_term;
   if (!same_identity) {
     if (entry == entries_.end()) {
       // Committed projections contain at most kMaxProjectedGroups. Evicting
@@ -1162,7 +1161,7 @@ control::LeaseDecision MetaLeaseHandoffGuard::Enforce(
     entry->authority_ = authority;
     entry->node_id_ = node_id;
     entry->data_boot_id_ = grant->data_boot_id;
-    entry->leadership_generation_ = grant->leadership_generation;
+    entry->leader_term_ = grant->raft_term;
     const std::int64_t max_time = std::numeric_limits<std::int64_t>::max();
     entry->eligible_after_ms_ =
         quarantine_ms_ > static_cast<std::uint64_t>(max_time) ||
@@ -1317,18 +1316,17 @@ struct MetaDataControlServer::Core {
   bool listening_ = false;
   bool shutdown_ = false;
   bool accept_loop_running_ = false;
-  bool leader_active_ = false;
   bool leader_ready_for_data_ = false;
-  std::uint64_t leadership_generation_ = 0;
+  std::uint64_t leader_term_ = 0;
   MetaLeaderContext* leader_context_ = nullptr;
   std::shared_ptr<SessionCommitSignal> leader_commit_signal_;
   std::shared_ptr<MetaCommitSubscription> leader_commit_subscription_;
   std::vector<bycorf::Connection*> sessions_;
-  std::map<bycorf::Connection*, std::uint64_t> authority_session_generation_;
-  std::map<std::uint64_t, std::size_t> authority_sessions_by_generation_;
-  std::map<std::uint64_t, std::size_t> leader_tasks_by_generation_;
+  std::map<bycorf::Connection*, std::uint64_t> authority_session_terms_;
+  std::map<std::uint64_t, std::size_t> authority_sessions_by_term_;
+  std::map<std::uint64_t, std::size_t> leader_tasks_by_term_;
   std::map<std::uint64_t, std::vector<std::shared_ptr<std::promise<void>>>>
-      generation_drain_waiters_;
+      term_drain_waiters_;
   std::vector<std::shared_ptr<std::promise<void>>> shutdown_drain_waiters_;
   detail::BoundNodeSessionRegistry bound_node_sessions_;
   std::map<std::string, std::uint64_t> next_session_generation_;
@@ -1364,7 +1362,7 @@ struct LiveSessionState {
   MetaReplicationHistoryId replication_history_id_{};
   std::uint32_t replication_flow_count_ = 0;
   std::uint64_t session_generation_ = 0;
-  std::uint64_t leadership_generation_ = 0;
+  std::uint64_t leader_term_ = 0;
 
   std::shared_ptr<const NodeControlBatch> installed_;
   // Highest synchronously published command commit whose semantic node
@@ -1399,11 +1397,10 @@ struct LiveSessionState {
 
 namespace {
 
-bool StillLeader(const MetaDataControlServer::Core& core,
-                 std::uint64_t generation) {
-  return core.leader_active_ && core.leadership_generation_ == generation &&
-         core.leader_context_ != nullptr && core.server_->is_leader() &&
-         core.server_->is_leader_sm_fully_caught_up();
+bool StillLeader(const MetaDataControlServer::Core& core, std::uint64_t term) {
+  return term != 0 && core.leader_term_ == term &&
+         core.leader_context_ != nullptr &&
+         core.server_->leader_term() == static_cast<std::int64_t>(term);
 }
 
 absl::StatusOr<std::shared_ptr<const MetaCommittedView>> CommittedViewAtLeast(
@@ -1427,22 +1424,21 @@ void FulfillWaiters(std::vector<std::shared_ptr<std::promise<void>>> waiters) {
   for (const auto& waiter : waiters) waiter->set_value();
 }
 
-void NotifyGenerationDrained(MetaDataControlServer::Core& core,
-                             std::uint64_t generation) {
-  if (core.authority_sessions_by_generation_.contains(generation) ||
-      core.leader_tasks_by_generation_.contains(generation)) {
+void NotifyTermDrained(MetaDataControlServer::Core& core, std::uint64_t term) {
+  if (core.authority_sessions_by_term_.contains(term) ||
+      core.leader_tasks_by_term_.contains(term)) {
     return;
   }
-  const auto found = core.generation_drain_waiters_.find(generation);
-  if (found == core.generation_drain_waiters_.end()) return;
+  const auto found = core.term_drain_waiters_.find(term);
+  if (found == core.term_drain_waiters_.end()) return;
   auto waiters = std::move(found->second);
-  core.generation_drain_waiters_.erase(found);
+  core.term_drain_waiters_.erase(found);
   FulfillWaiters(std::move(waiters));
 }
 
 void NotifyShutdownDrained(MetaDataControlServer::Core& core) {
   if (!core.shutdown_ || core.accept_loop_running_ || !core.sessions_.empty() ||
-      !core.leader_tasks_by_generation_.empty() ||
+      !core.leader_tasks_by_term_.empty() ||
       core.shutdown_drain_waiters_.empty()) {
     return;
   }
@@ -1453,30 +1449,27 @@ void NotifyShutdownDrained(MetaDataControlServer::Core& core) {
 
 absl::Status BindAuthoritySession(MetaDataControlServer::Core& core,
                                   bycorf::Connection* connection,
-                                  std::uint64_t generation) {
-  if (!core.authority_session_generation_.emplace(connection, generation)
-           .second) {
+                                  std::uint64_t term) {
+  if (!core.authority_session_terms_.emplace(connection, term).second) {
     return absl::AlreadyExistsError(
-        "data-control session already has a leadership generation");
+        "data-control session already has a leader term");
   }
-  ++core.authority_sessions_by_generation_[generation];
+  ++core.authority_sessions_by_term_[term];
   core.live_authority_session_tasks_.fetch_add(1, std::memory_order_relaxed);
   return absl::OkStatus();
 }
 
-void StartLeaderTask(MetaDataControlServer::Core& core,
-                     std::uint64_t generation) {
-  ++core.leader_tasks_by_generation_[generation];
+void StartLeaderTask(MetaDataControlServer::Core& core, std::uint64_t term) {
+  ++core.leader_tasks_by_term_[term];
   core.live_leader_tasks_.fetch_add(1, std::memory_order_relaxed);
 }
 
-void FinishLeaderTask(MetaDataControlServer::Core& core,
-                      std::uint64_t generation) {
-  const auto count = core.leader_tasks_by_generation_.find(generation);
-  if (count == core.leader_tasks_by_generation_.end()) return;
-  if (--count->second == 0) core.leader_tasks_by_generation_.erase(count);
+void FinishLeaderTask(MetaDataControlServer::Core& core, std::uint64_t term) {
+  const auto count = core.leader_tasks_by_term_.find(term);
+  if (count == core.leader_tasks_by_term_.end()) return;
+  if (--count->second == 0) core.leader_tasks_by_term_.erase(count);
   core.live_leader_tasks_.fetch_sub(1, std::memory_order_relaxed);
-  NotifyGenerationDrained(core, generation);
+  NotifyTermDrained(core, term);
   NotifyShutdownDrained(core);
 }
 
@@ -1495,17 +1488,16 @@ void RemoveSessionBindings(MetaDataControlServer::Core& core,
                            bycorf::Connection* connection,
                            std::string_view node_id,
                            const control::WireId128* session_id) {
-  if (const auto authority =
-          core.authority_session_generation_.find(connection);
-      authority != core.authority_session_generation_.end()) {
-    const std::uint64_t generation = authority->second;
-    core.authority_session_generation_.erase(authority);
+  if (const auto authority = core.authority_session_terms_.find(connection);
+      authority != core.authority_session_terms_.end()) {
+    const std::uint64_t term = authority->second;
+    core.authority_session_terms_.erase(authority);
     core.live_authority_session_tasks_.fetch_sub(1, std::memory_order_relaxed);
-    const auto count = core.authority_sessions_by_generation_.find(generation);
-    if (count != core.authority_sessions_by_generation_.end() &&
+    const auto count = core.authority_sessions_by_term_.find(term);
+    if (count != core.authority_sessions_by_term_.end() &&
         --count->second == 0) {
-      core.authority_sessions_by_generation_.erase(count);
-      NotifyGenerationDrained(core, generation);
+      core.authority_sessions_by_term_.erase(count);
+      NotifyTermDrained(core, term);
     }
   }
   if (!node_id.empty()) {
@@ -1530,10 +1522,10 @@ void CloseConnectionNow(bycorf::Worker& worker, bycorf::Connection* connection,
 }
 
 bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
-                              std::uint64_t generation) {
-  if (!StillLeader(core, generation) || !core.leader_ready_for_data_ ||
+                              std::uint64_t term) {
+  if (!StillLeader(core, term) || !core.leader_ready_for_data_ ||
       !core.server_->is_leader_alive()) {
-    return core.options_.runtime_status_->SetLeaderAuthorityEligible(generation,
+    return core.options_.runtime_status_->SetLeaderAuthorityEligible(term,
                                                                      false);
   }
   const MetaLeaderRuntimeDisposition runtime =
@@ -1541,20 +1533,19 @@ bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
                                           ActiveClockMillis());
   if (runtime == MetaLeaderRuntimeDisposition::kQuarantineStarted) {
     spdlog::warn(
-        "Meta data-control detected a suspend gap; quarantining authority "
-        "for {} ms of active runtime",
-        core.options_.leadership_validity_ms_);
+        "Meta data-control detected a suspend gap; retiring leader term {}",
+        term);
     // Raft's cached leader term may itself be stale after suspend.
     // Immediate revocation is synchronous at the C++ boundary, so an older
     // role callback cannot restore grants before the Go owner processes the
     // resignation. Even a sole voter needs a new election term; the Data
     // lease handoff quarantine still applies after reelection.
-    core.server_->yield_leadership(/*immediate_yield=*/true);
+    core.server_->yield_leadership(/*immediate_yield=*/true, term);
     if (core.worker_ != nullptr) {
       std::vector<bycorf::Connection*> sessions;
       for (const auto& [connection, session_generation] :
-           core.authority_session_generation_) {
-        if (session_generation == generation) sessions.push_back(connection);
+           core.authority_session_terms_) {
+        if (session_generation == term) sessions.push_back(connection);
       }
       for (bycorf::Connection* connection : sessions) {
         CloseConnectionNow(
@@ -1565,10 +1556,10 @@ bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
     }
   }
   const bool eligible = runtime == MetaLeaderRuntimeDisposition::kEligible;
-  // Runtime status owns generation matching and fail-closed revision
+  // Runtime status owns term matching and fail-closed revision
   // saturation, so authorization must use the effective stored result rather
   // than the guard's requested value.
-  return core.options_.runtime_status_->SetLeaderAuthorityEligible(generation,
+  return core.options_.runtime_status_->SetLeaderAuthorityEligible(term,
                                                                    eligible);
 }
 
@@ -1718,15 +1709,14 @@ bool ActiveClusterCreateDeclaresNode(const MetaCommittedView& view,
 }
 
 bycorf::Task<absl::Status> ReconcileLocalMetaMember(
-    std::shared_ptr<MetaDataControlServer::Core> core,
-    std::uint64_t generation) {
+    std::shared_ptr<MetaDataControlServer::Core> core, std::uint64_t term) {
   struct CompletionGuard {
     std::shared_ptr<MetaDataControlServer::Core> core_;
-    std::uint64_t generation_;
-    ~CompletionGuard() { FinishLeaderTask(*core_, generation_); }
-  } completion{core, generation};
+    std::uint64_t term_;
+    ~CompletionGuard() { FinishLeaderTask(*core_, term_); }
+  } completion{core, term};
 
-  while (StillLeader(*core, generation)) {
+  while (StillLeader(*core, term)) {
     const std::shared_ptr<MetaRaftConfig> config = core->server_->get_config();
     auto local_identity = LocalConfiguredIdentity(*core, config);
     absl::Status status = local_identity.status();
@@ -1741,23 +1731,22 @@ bycorf::Task<absl::Status> ReconcileLocalMetaMember(
     }
 
     if (status.ok()) {
-      if (StillLeader(*core, generation)) {
+      if (StillLeader(*core, term)) {
         // Membership validity opens the Data listener, but this leader-scoped
         // task deliberately remains alive. An absent Owner produces no session
         // traffic, so Hello/heartbeat checks alone cannot keep the automatic
         // failover detector's authority bracket current across quorum loss or
         // host suspend.
         core->leader_ready_for_data_ = true;
-        (void)AuthoritySessionsAllowed(*core, generation);
+        (void)AuthoritySessionsAllowed(*core, term);
       }
     } else {
       // A config/identity disagreement after an earlier valid cut revokes the
-      // same generation immediately. Session-side probes also consult
+      // same term immediately. Session-side probes also consult
       // leader_ready_for_data_, so they cannot race this failure by restoring
       // eligibility from Raft liveness alone.
       core->leader_ready_for_data_ = false;
-      core->options_.runtime_status_->SetLeaderAuthorityEligible(generation,
-                                                                 false);
+      core->options_.runtime_status_->SetLeaderAuthorityEligible(term, false);
       spdlog::warn("data-control leader membership reconciliation: {}",
                    status.message());
     }
@@ -1817,7 +1806,7 @@ control::ServerHello BuildServerHello(
       .disposition = disposition,
       .negotiated_version = control::kProtocolVersion,
       .meta_server_id = core.options_.server_id_,
-      .raft_term = core.server_->get_term(),
+      .raft_term = accepted ? core.leader_term_ : core.server_->get_term(),
       .session_id = session_id,
       .session_generation = session_generation,
       .leader_id = leader_id,
@@ -1862,12 +1851,12 @@ bycorf::Task<absl::Status> AwaitApplied(
 bycorf::Task<absl::Status> SendFullState(
     const std::shared_ptr<MetaDataControlServer::Core>& core, SessionIo& io,
     std::shared_ptr<const NodeControlBatch> batch, std::string_view node_id,
-    std::uint64_t generation) {
+    std::uint64_t term) {
   if (batch == nullptr)
     co_return absl::InvalidArgumentError("bootstrap batch is empty");
   std::uint64_t validated_index = batch->full_state.control_revision;
   const auto validate = [&]() -> absl::Status {
-    if (!AuthoritySessionsAllowed(*core, generation))
+    if (!AuthoritySessionsAllowed(*core, term))
       return absl::CancelledError("Meta leadership ended during bootstrap");
     const auto high_water = core->coordinator_->CommittedHighWater();
     if (high_water <= validated_index) return absl::OkStatus();
@@ -1945,13 +1934,13 @@ bycorf::Task<absl::Status> ValidateBootstrapApplied(
     const std::shared_ptr<MetaDataControlServer::Core>& core, SessionIo& io,
     const NodeControlBatch& installed, std::string_view node_id,
     std::string_view boot_id, const control::WireId128& session_id,
-    std::uint64_t leadership_generation, SessionCommitSignal& commit_signal,
+    std::uint64_t leader_term, SessionCommitSignal& commit_signal,
     const MetaCommitSubscription& commit_subscription,
     std::uint64_t* validated_committed_high_water,
     std::deque<control::WireMessage>* deferred,
     std::size_t max_deferred_messages,
     std::vector<control::WireAuthorityAnchor>* fenced) {
-  if (!AuthoritySessionsAllowed(*core, leadership_generation)) {
+  if (!AuthoritySessionsAllowed(*core, leader_term)) {
     co_return absl::CancelledError(
         "Meta authority is unavailable during bootstrap validation");
   }
@@ -2086,8 +2075,7 @@ bycorf::Task<absl::Status> FenceSupersededAuthorityLive(
       installed.full_state, latest, state->node_id_,
       state->fenced_authorities_);
   for (const control::WireAuthorityAnchor& anchor : superseded) {
-    if (!AuthoritySessionsAllowed(*state->core_,
-                                  state->leadership_generation_)) {
+    if (!AuthoritySessionsAllowed(*state->core_, state->leader_term_)) {
       co_return absl::CancelledError(
           "Meta authority is unavailable before Fence publication");
     }
@@ -2117,8 +2105,7 @@ bycorf::Task<absl::Status> FenceSupersededAuthorityLive(
       ClearPublisherFence(state);
       co_return acknowledged;
     }
-    if (!AuthoritySessionsAllowed(*state->core_,
-                                  state->leadership_generation_)) {
+    if (!AuthoritySessionsAllowed(*state->core_, state->leader_term_)) {
       co_return absl::CancelledError(
           "Meta authority became unavailable during Fence publication");
     }
@@ -2132,7 +2119,7 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
                           const NodeControlBatch& installed,
                           const NodeControlBatch& replacement,
                           std::uint64_t* publication_high_water) {
-  if (!AuthoritySessionsAllowed(*state->core_, state->leadership_generation_)) {
+  if (!AuthoritySessionsAllowed(*state->core_, state->leader_term_)) {
     co_return absl::CancelledError(
         "Meta authority is unavailable during FullDesiredState publication");
   }
@@ -2353,9 +2340,8 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
 
 bycorf::Task<absl::Status> SessionPublisherBody(
     const std::shared_ptr<LiveSessionState>& state) {
-  while (
-      !state->closing_ &&
-      AuthoritySessionsAllowed(*state->core_, state->leadership_generation_)) {
+  while (!state->closing_ &&
+         AuthoritySessionsAllowed(*state->core_, state->leader_term_)) {
     if (state->commit_signal_->delivery_failed_.load(
             std::memory_order_acquire) ||
         state->commit_subscription_->needs_resync()) {
@@ -2487,11 +2473,11 @@ bycorf::Task<absl::Status> SessionPublisherBody(
     state->core_->options_.runtime_status_->PublishCurrent(
         state->node_id_, state->boot_id_, state->session_id_,
         state->replication_history_id_, state->replication_flow_count_,
-        state->session_generation_, state->leadership_generation_,
+        state->session_generation_, state->leader_term_,
         state->validated_committed_high_water_, state->installed_->full_state);
   }
   co_return absl::CancelledError(
-      "data-control publisher stopped with its leadership generation");
+      "data-control publisher stopped with its leader term");
 }
 
 bycorf::Task<absl::Status> RunSessionPublisher(
@@ -2507,7 +2493,7 @@ bycorf::Task<absl::Status> RunSessionPublisher(
 bycorf::Task<absl::Status> HandleDirectiveResult(
     const std::shared_ptr<MetaDataControlServer::Core>& core, SessionIo& io,
     const control::DirectiveResult& result, std::string_view node_id,
-    const MetaBootIncarnation& boot_id, std::uint64_t leadership_generation,
+    const MetaBootIncarnation& boot_id, std::uint64_t leader_term,
     const control::WireId128& session_id) {
   auto parsed_boot = ParseIdentity<20>(result.recipient_boot_id,
                                        "directive result recipient boot id");
@@ -2571,7 +2557,7 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
     co_return absl::PermissionDeniedError(
         "directive result does not match its recipient or authority anchor");
   }
-  if (!AuthoritySessionsAllowed(*core, leadership_generation)) {
+  if (!AuthoritySessionsAllowed(*core, leader_term)) {
     co_return absl::FailedPreconditionError(
         "Meta authority is unavailable before directive result proposal");
   }
@@ -2635,9 +2621,8 @@ bycorf::Task<absl::Status> RunEstablishedSession(
   ClientTransferSink client_transfer_sink;
   control::LargeObjectReassembler client_reassembler(client_transfer_sink);
 
-  while (
-      !state->closing_ &&
-      AuthoritySessionsAllowed(*state->core_, state->leadership_generation_)) {
+  while (!state->closing_ &&
+         AuthoritySessionsAllowed(*state->core_, state->leader_term_)) {
     absl::StatusOr<control::WireMessage> incoming =
         deferred.empty()
             ? co_await state->io_->Read()
@@ -2646,8 +2631,7 @@ bycorf::Task<absl::Status> RunEstablishedSession(
     if (!incoming.ok()) co_return incoming.status();
     // The read may have spanned host suspend. Recheck before replaying a
     // cached lease Ack or consuming any authority-bearing client message.
-    if (!AuthoritySessionsAllowed(*state->core_,
-                                  state->leadership_generation_)) {
+    if (!AuthoritySessionsAllowed(*state->core_, state->leader_term_)) {
       co_return absl::UnavailableError(
           "Meta authority became unavailable while awaiting session input");
     }
@@ -2795,8 +2779,7 @@ bycorf::Task<absl::Status> RunEstablishedSession(
       }
 
       const bool leader_valid =
-          AuthoritySessionsAllowed(*state->core_,
-                                   state->leadership_generation_) &&
+          AuthoritySessionsAllowed(*state->core_, state->leader_term_) &&
           (ProjectionCurrent(*state) ||
            (state->renewable_committed_high_water_ != 0 &&
             !CommitPending(*state->commit_signal_,
@@ -2811,8 +2794,7 @@ bycorf::Task<absl::Status> RunEstablishedSession(
       const MetaLeaseEvaluation lease_evaluation{
           .leader_valid_ = leader_valid,
           .server_id_ = state->core_->options_.server_id_,
-          .raft_term_ = state->core_->server_->get_term(),
-          .leadership_generation_ = state->leadership_generation_,
+          .raft_term_ = state->leader_term_,
           .leadership_validity_ms_ =
               state->core_->options_.leadership_validity_ms_,
           .node_id_ = state->node_id_,
@@ -2872,7 +2854,7 @@ bycorf::Task<absl::Status> RunEstablishedSession(
             std::get_if<control::DirectiveResult>(&*incoming)) {
       if (absl::Status handled = co_await HandleDirectiveResult(
               state->core_, *state->io_, *result, state->node_id_, boot_id,
-              state->leadership_generation_, state->session_id_);
+              state->leader_term_, state->session_id_);
           !handled.ok()) {
         co_return handled;
       }
@@ -3180,13 +3162,12 @@ void MetaDataControlServer::Shutdown() {
         if (!core->shutdown_) {
           core->shutdown_ = true;
           core->listening_ = false;
-          core->leader_active_ = false;
           core->leader_ready_for_data_ = false;
           core->leader_context_ = nullptr;
           core->leader_commit_subscription_.reset();
           core->leader_commit_signal_.reset();
-          core->options_.runtime_status_->EndLeadership(
-              core->leadership_generation_);
+          core->options_.runtime_status_->EndLeadership(core->leader_term_);
+          core->leader_term_ = 0;
           if (core->accept_loop_running_) {
             // TcpListener::Close does not currently cancel an armed accept.
             // A local connection gives that sole waiter a normal completion;
@@ -3308,19 +3289,15 @@ void MetaDataControlServer::StartOnExecutor(MetaLeaderContext* context) {
             std::shared_ptr<MetaCommitSubscription>(
                 std::move(commit_start.subscription_));
         core->leader_commit_signal_ = std::move(commit_signal);
-        ++core->leadership_generation_;
-        if (core->leadership_generation_ == 0) ++core->leadership_generation_;
-        core->options_.runtime_status_->BeginLeadership(
-            core->leadership_generation_);
+        core->leader_term_ = context->term();
+        core->options_.runtime_status_->BeginLeadership(core->leader_term_);
         core->lease_handoff_guard_->Reset();
         core->leader_runtime_guard_->Reset(cluster::LeaseClockMillis(),
                                            ActiveClockMillis());
         core->leader_context_ = context;
-        core->leader_active_ = true;
         core->leader_ready_for_data_ = false;
-        StartLeaderTask(*core, core->leadership_generation_);
-        worker->Spawn(
-            ReconcileLocalMetaMember(core, core->leadership_generation_));
+        StartLeaderTask(*core, core->leader_term_);
+        worker->Spawn(ReconcileLocalMetaMember(core, core->leader_term_));
       })) {
     // The coordinator has already committed this reconciler's Start edge and
     // will not replay it during the same leader epoch. Returning here would
@@ -3338,20 +3315,19 @@ void MetaDataControlServer::CancelAndWait() {
   auto complete = std::make_shared<std::promise<void>>();
   std::future<void> done = complete->get_future();
   if (!core->foreign_executor_.Notify([core, complete]() noexcept {
-        const std::uint64_t cancelled_generation = core->leadership_generation_;
-        core->leader_active_ = false;
+        const std::uint64_t cancelled_term = core->leader_term_;
         core->leader_ready_for_data_ = false;
         core->leader_context_ = nullptr;
         core->leader_commit_subscription_.reset();
         core->leader_commit_signal_.reset();
-        core->options_.runtime_status_->EndLeadership(cancelled_generation);
-        core->generation_drain_waiters_[cancelled_generation].push_back(
-            complete);
+        core->options_.runtime_status_->EndLeadership(cancelled_term);
+        core->leader_term_ = 0;
+        core->term_drain_waiters_[cancelled_term].push_back(complete);
         if (core->worker_ != nullptr) {
           std::vector<bycorf::Connection*> sessions;
-          for (const auto& [connection, generation] :
-               core->authority_session_generation_) {
-            if (generation == cancelled_generation) {
+          for (const auto& [connection, term] :
+               core->authority_session_terms_) {
+            if (term == cancelled_term) {
               sessions.push_back(connection);
             }
           }
@@ -3360,11 +3336,11 @@ void MetaDataControlServer::CancelAndWait() {
                                absl::CancelledError("Meta leadership changed"));
           }
         }
-        NotifyGenerationDrained(*core, cancelled_generation);
+        NotifyTermDrained(*core, cancelled_term);
       })) {
     // Demotion is an uncancellable authority barrier. Treating allocation or
     // executor rejection as success could let a later leader Start reuse the
-    // old generation and sessions before the handoff quarantine is reset.
+    // old term and sessions before the handoff quarantine is reset.
     if (core->shutdown_complete_.load(std::memory_order_acquire)) return;
     std::terminate();
   }
@@ -3548,9 +3524,8 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
     const auto& view = **captured;
     auto directory = BuildCommittedMetaDirectory(view);
     if (!directory.ok()) co_return finish(directory.status());
-    const bool leader =
-        core->leader_ready_for_data_ &&
-        AuthoritySessionsAllowed(*core, core->leadership_generation_);
+    const bool leader = core->leader_ready_for_data_ &&
+                        AuthoritySessionsAllowed(*core, core->leader_term_);
     control::BootstrapReply reply;
     reply.server = BuildServerHello(*core, std::move(*directory),
                                     CommittedClientService(view), leader);
@@ -3608,8 +3583,8 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   const auto node = view->identity().FindNode(node_id);
   if (!node.has_value() || node->retired_) {
     if (!node.has_value() && ActiveClusterCreateDeclaresNode(*view, node_id)) {
-      core->options_.runtime_status_->NoteUnregisteredRetry(
-          node_id, core->leadership_generation_);
+      core->options_.runtime_status_->NoteUnregisteredRetry(node_id,
+                                                            core->leader_term_);
     }
     co_return finish(absl::PermissionDeniedError(
         "data node is not in the active committed registry"));
@@ -3624,7 +3599,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   const auto committed_service = CommittedClientService(*view);
   const bool accepted_leader =
       core->leader_ready_for_data_ &&
-      AuthoritySessionsAllowed(*core, core->leadership_generation_);
+      AuthoritySessionsAllowed(*core, core->leader_term_);
   if (!accepted_leader) {
     const absl::Status sent = co_await io.Send(
         control::MessagePriority::kReliable,
@@ -3655,7 +3630,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   // every session. Refresh through the shared immutable cache here so both a
   // commit racing the first registry read and a follower snapshot install are
   // represented without retaining a private MetaStores copy per connection.
-  const std::uint64_t leadership_generation = core->leadership_generation_;
+  const std::uint64_t leader_term = core->leader_term_;
   std::shared_ptr<SessionCommitSignal> commit_signal =
       core->leader_commit_signal_;
   std::shared_ptr<MetaCommitSubscription> commit_subscription =
@@ -3703,12 +3678,11 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
     co_return finish(absl::AlreadyExistsError(
         "data node already has a bound control session"));
   }
-  if (absl::Status bound =
-          BindAuthoritySession(*core, connection, leadership_generation);
+  if (absl::Status bound = BindAuthoritySession(*core, connection, leader_term);
       !bound.ok()) {
     co_return finish(bound);
   }
-  // From this point the per-node slot, leadership-generation registry, and
+  // From this point the per-node slot, leader-term registry, and
   // completion guard bound all projection/FDS ownership, so anonymous setup
   // capacity can be reused safely.
   handshake_permit.Release();
@@ -3746,8 +3720,8 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
       !sent.ok()) {
     co_return finish(sent);
   }
-  if (absl::Status sent = co_await SendFullState(core, io, batch, node_id,
-                                                 leadership_generation);
+  if (absl::Status sent =
+          co_await SendFullState(core, io, batch, node_id, leader_term);
       !sent.ok()) {
     co_return finish(sent);
   }
@@ -3757,10 +3731,9 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   }
   std::uint64_t validated_committed_high_water = 0;
   if (absl::Status current = co_await ValidateBootstrapApplied(
-          core, io, *batch, node_id, hello->boot_id, *session_id,
-          leadership_generation, *commit_signal, *commit_subscription,
-          &validated_committed_high_water, &deferred, max_deferred_messages,
-          &fenced_authorities);
+          core, io, *batch, node_id, hello->boot_id, *session_id, leader_term,
+          *commit_signal, *commit_subscription, &validated_committed_high_water,
+          &deferred, max_deferred_messages, &fenced_authorities);
       !current.ok()) {
     co_return finish(current);
   }
@@ -3777,7 +3750,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   live->replication_history_id_ = *replication_history_id;
   live->replication_flow_count_ = hello->replication_flow_count;
   live->session_generation_ = session_generation;
-  live->leadership_generation_ = leadership_generation;
+  live->leader_term_ = leader_term;
   // Transfer the sole retained-projection owner into live session state. The
   // SessionLoop coroutine frame outlives the publisher, so copying here would
   // pin the initial generation after every later replacement.
@@ -3819,7 +3792,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
           });
   core->options_.runtime_status_->PublishCurrent(
       node_id, hello->boot_id, *session_id, *replication_history_id,
-      hello->replication_flow_count, session_generation, leadership_generation,
+      hello->replication_flow_count, session_generation, leader_term,
       live->validated_committed_high_water_, live->installed_->full_state);
   core->accepted_sessions_.fetch_add(1, std::memory_order_relaxed);
   core->active_sessions_.fetch_add(1, std::memory_order_relaxed);

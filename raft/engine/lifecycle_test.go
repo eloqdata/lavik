@@ -139,6 +139,20 @@ func TestResignedSoleVoterRequiresNewElectionTerm(t *testing.T) {
 					t.Fatal("reelection was not preceded by a follower edge")
 				}
 				newTerm := role.Term
+				stale, err := r.ProposeInTerm([]byte("stale term"), oldTerm)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result := <-stale; !errors.Is(result.Err, ErrNotLeader) {
+					t.Fatalf("old-term proposal was admitted: %v", result.Err)
+				}
+				member, err := r.ChangeMemberInTerm(members[0], false, false, oldTerm)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result := <-member; !errors.Is(result.Err, ErrNotLeader) {
+					t.Fatalf("old-term membership request was admitted: %v", result.Err)
+				}
 				r.RequestResign(oldTerm)
 				time.Sleep(120 * time.Millisecond)
 				if r.Status().Term != newTerm || !r.Status().CaughtUp {

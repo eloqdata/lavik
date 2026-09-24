@@ -64,7 +64,7 @@ struct SentinelSession {
   std::size_t subscription_bytes_ = 0;
   bool authority_bound_ = false;
   std::int64_t authority_term_ = -1;
-  std::uint64_t leadership_generation_ = 0;
+  std::uint64_t leader_term_ = 0;
   std::uint64_t eligibility_revision_ = 0, continuity_ = 0;
   bycorf::Connection* connection_ = nullptr;
   std::deque<std::string> output_;
@@ -100,18 +100,18 @@ struct DiscoverySource {
   std::uint64_t cached_state_change_ = 0;
   MetaCommittedStatusView cached_view_;
 
-  // Observation-grace bookkeeping: the window opens when the leader triplet
-  // starts passing and reopens whenever the runtime registry's leadership
-  // generation changes, so a handoff never turns a never-yet-observed node
+  // Observation-grace bookkeeping: the window opens on leader admission
+  // and reopens when the runtime registry attaches the new Raft term,
+  // so a handoff never turns a never-yet-observed node
   // into a false down mark. Both edges reset the same start point.
   bool leader_admitted_ = false;
-  std::uint64_t grace_leadership_generation_ = 0;
+  std::uint64_t grace_leader_term_ = 0;
   std::chrono::steady_clock::time_point authority_since_{};
 };
 
 // Assembles one discovery cut when this node currently holds a caught-up
 // leadership, else nullopt. The Raft leader term brackets the snapshots; the
-// runtime leadership generation anchors the observation-grace window.
+// runtime's captured term anchors the observation-grace window.
 std::optional<MetaDiscoveryCut> AuthoritativeDiscoveryCut(
     DiscoverySource& source) {
   const auto raft_term = source.raft_->leader_term();
@@ -132,12 +132,12 @@ std::optional<MetaDiscoveryCut> AuthoritativeDiscoveryCut(
         cut.effective_meta_ids_.push_back(peer->get_id());
   }
   cut.runtime_ = source.runtime_status_->Snapshot();
-  if (cut.runtime_.leadership_generation_ != 0 &&
-      !cut.runtime_.leader_authority_eligible_)
+  if (cut.runtime_.leader_term_ != 0 &&
+      (cut.runtime_.leader_term_ != static_cast<std::uint64_t>(raft_term) ||
+       !cut.runtime_.leader_authority_eligible_))
     return std::nullopt;
-  if (cut.runtime_.leadership_generation_ !=
-      source.grace_leadership_generation_) {
-    source.grace_leadership_generation_ = cut.runtime_.leadership_generation_;
+  if (cut.runtime_.leader_term_ != source.grace_leader_term_) {
+    source.grace_leader_term_ = cut.runtime_.leader_term_;
     source.authority_since_ = now;
   }
   cut.observation_grace_active_ =
@@ -168,14 +168,14 @@ bool BindAuthority(DiscoverySource& source, SentinelSession& session,
                    const MetaDiscoveryCut& cut) {
   if (session.authority_bound_ &&
       (session.authority_term_ != cut.raft_term_ ||
-       session.leadership_generation_ != cut.runtime_.leadership_generation_ ||
+       session.leader_term_ != cut.runtime_.leader_term_ ||
        session.eligibility_revision_ !=
            cut.runtime_.leader_authority_eligibility_revision_ ||
        session.continuity_ != source.continuity_))
     return false;
   session.authority_bound_ = true;
   session.authority_term_ = cut.raft_term_;
-  session.leadership_generation_ = cut.runtime_.leadership_generation_;
+  session.leader_term_ = cut.runtime_.leader_term_;
   session.eligibility_revision_ =
       cut.runtime_.leader_authority_eligibility_revision_;
   session.continuity_ = source.continuity_;
@@ -188,11 +188,10 @@ bool AuthorityCurrent(const DiscoverySource& source,
   const auto state = source.runtime_status_->LeadershipState();
   return source.raft_->leader_term() == session.authority_term_ &&
          source.continuity_ == session.continuity_ &&
-         state.leadership_generation_ == session.leadership_generation_ &&
+         state.leader_term_ == session.leader_term_ &&
          state.leader_authority_eligibility_revision_ ==
              session.eligibility_revision_ &&
-         (state.leadership_generation_ == 0 ||
-          state.leader_authority_eligible_);
+         (state.leader_term_ == 0 || state.leader_authority_eligible_);
 }
 
 bool ValidAttribute(std::string_view value) {
@@ -666,15 +665,15 @@ struct MetaSentinelServer::Core {
         core->events_.Reset();
       } else {
         const auto term = cut->raft_term_;
-        const auto generation = cut->runtime_.leadership_generation_;
+        const auto runtime_term = cut->runtime_.leader_term_;
         const auto revision =
             cut->runtime_.leader_authority_eligibility_revision_;
         if (term != core->event_term_ ||
-            generation != core->event_generation_ ||
+            runtime_term != core->event_runtime_term_ ||
             revision != core->event_revision_) {
           core->events_.Reset();
           core->event_term_ = term;
-          core->event_generation_ = generation;
+          core->event_runtime_term_ = runtime_term;
           core->event_revision_ = revision;
         }
         // Notifications describe observed committed cuts. They may coalesce;
@@ -734,7 +733,7 @@ struct MetaSentinelServer::Core {
   bool monitor_running_ = false;
   MetaDiscoveryEvents events_;
   std::int64_t event_term_ = -1;
-  std::uint64_t event_generation_ = 0, event_revision_ = 0;
+  std::uint64_t event_runtime_term_ = 0, event_revision_ = 0;
   MetaLeaderContext* context_ = nullptr;
   std::unique_ptr<MetaCommitSubscription> subscription_;
   std::shared_ptr<std::atomic<std::uint64_t>> committed_signal_;

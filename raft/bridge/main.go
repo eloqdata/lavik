@@ -168,7 +168,7 @@ func (i *instance) deliver(ticket C.uint64_t, result <-chan engine.Result) {
 }
 
 //export lavik_raft_propose
-func lavik_raft_propose(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointer, size C.uint64_t) C.int {
+func lavik_raft_propose(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointer, size C.uint64_t, expectedTerm C.uint64_t) C.int {
 	i := lookup(handle)
 	if i == nil {
 		return 1
@@ -181,7 +181,7 @@ func lavik_raft_propose(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointe
 	if i.closed {
 		return 1
 	}
-	result, err := i.runtime.Propose(C.GoBytes(data, C.int(size)))
+	result, err := i.runtime.ProposeInTerm(C.GoBytes(data, C.int(size)), uint64(expectedTerm))
 	if err != nil {
 		return 3
 	}
@@ -211,7 +211,7 @@ func lavik_raft_snapshot(handle C.uint64_t, ticket C.uint64_t) C.int {
 }
 
 //export lavik_raft_member
-func lavik_raft_member(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointer, size C.uint64_t, remove C.int, learner C.int) C.int {
+func lavik_raft_member(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointer, size C.uint64_t, remove C.int, learner C.int, expectedTerm C.uint64_t) C.int {
 	i := lookup(handle)
 	if i == nil {
 		return 1
@@ -228,7 +228,7 @@ func lavik_raft_member(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointer
 	if i.closed {
 		return 1
 	}
-	result, err := i.runtime.ChangeMember(member, remove != 0, learner != 0)
+	result, err := i.runtime.ChangeMemberInTerm(member, remove != 0, learner != 0, uint64(expectedTerm))
 	if err != nil {
 		return 3
 	}

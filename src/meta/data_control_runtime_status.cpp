@@ -68,21 +68,20 @@ void ApplyProjection(MetaDataControlRuntimeNode& node,
 
 }  // namespace
 
-void MetaDataControlRuntimeStatus::BeginLeadership(
-    std::uint64_t leadership_generation) {
+void MetaDataControlRuntimeStatus::BeginLeadership(std::uint64_t leader_term) {
   std::lock_guard<std::mutex> lock(mutex_);
   nodes_.clear();
   unregistered_retries_.clear();
   observed_nodes_.clear();
-  leadership_generation_ = leadership_generation;
+  leader_term_ = leader_term;
   leader_authority_eligible_ = false;
   leader_authority_eligibility_revision_ = 0;
 }
 
 bool MetaDataControlRuntimeStatus::SetLeaderAuthorityEligible(
-    std::uint64_t leadership_generation, bool eligible) {
+    std::uint64_t leader_term, bool eligible) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (leadership_generation_ != leadership_generation) return false;
+  if (leader_term_ != leader_term) return false;
   if (leader_authority_eligible_ == eligible) {
     return leader_authority_eligible_;
   }
@@ -96,30 +95,28 @@ bool MetaDataControlRuntimeStatus::SetLeaderAuthorityEligible(
   return leader_authority_eligible_;
 }
 
-void MetaDataControlRuntimeStatus::EndLeadership(
-    std::uint64_t leadership_generation) {
+void MetaDataControlRuntimeStatus::EndLeadership(std::uint64_t leader_term) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (leadership_generation_ != leadership_generation) return;
+  if (leader_term_ != leader_term) return;
   nodes_.clear();
   unregistered_retries_.clear();
   observed_nodes_.clear();
-  leadership_generation_ = 0;
+  leader_term_ = 0;
   leader_authority_eligible_ = false;
   leader_authority_eligibility_revision_ = 0;
 }
 
 void MetaDataControlRuntimeStatus::NoteUnregisteredRetry(
-    std::string node_id, std::uint64_t leadership_generation) {
+    std::string node_id, std::uint64_t leader_term) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (leadership_generation_ != leadership_generation ||
-      leadership_generation == 0) {
+  if (leader_term_ != leader_term || leader_term == 0) {
     return;
   }
   if (!unregistered_retries_.contains(node_id) &&
       unregistered_retries_.size() >= cluster::control::kMaxProjectedNodes) {
     return;
   }
-  unregistered_retries_[std::move(node_id)] = leadership_generation;
+  unregistered_retries_[std::move(node_id)] = leader_term;
 }
 
 void MetaDataControlRuntimeStatus::PublishCurrent(
@@ -127,12 +124,10 @@ void MetaDataControlRuntimeStatus::PublishCurrent(
     const cluster::control::WireId128& session_id,
     const MetaReplicationHistoryId& replication_history_id,
     std::uint32_t replication_flow_count, std::uint64_t session_generation,
-    std::uint64_t leadership_generation,
-    std::uint64_t validated_committed_high_water,
+    std::uint64_t leader_term, std::uint64_t validated_committed_high_water,
     const cluster::control::FullDesiredState& projection) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (leadership_generation_ != leadership_generation ||
-      !leader_authority_eligible_) {
+  if (leader_term_ != leader_term || !leader_authority_eligible_) {
     return;
   }
   MetaDataControlRuntimeNode node;
@@ -142,7 +137,7 @@ void MetaDataControlRuntimeStatus::PublishCurrent(
   node.replication_history_id_ = replication_history_id;
   node.replication_flow_count_ = replication_flow_count;
   node.session_generation_ = session_generation;
-  node.leadership_generation_ = leadership_generation;
+  node.leader_term_ = leader_term;
   ApplyProjection(node, validated_committed_high_water, projection);
   unregistered_retries_.erase(node.node_id_);
   if (observed_nodes_.contains(node.node_id_) ||
@@ -205,7 +200,7 @@ void MetaDataControlRuntimeStatus::Remove(
 MetaDataControlRuntimeSnapshot MetaDataControlRuntimeStatus::Snapshot() const {
   std::lock_guard<std::mutex> lock(mutex_);
   MetaDataControlRuntimeSnapshot snapshot;
-  snapshot.leadership_generation_ = leadership_generation_;
+  snapshot.leader_term_ = leader_term_;
   snapshot.leader_authority_eligible_ = leader_authority_eligible_;
   snapshot.leader_authority_eligibility_revision_ =
       leader_authority_eligibility_revision_;
@@ -223,7 +218,7 @@ MetaDataControlRuntimeSnapshot MetaDataControlRuntimeStatus::Snapshot() const {
 MetaDataControlLeadershipState MetaDataControlRuntimeStatus::LeadershipState()
     const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return {.leadership_generation_ = leadership_generation_,
+  return {.leader_term_ = leader_term_,
           .leader_authority_eligible_ = leader_authority_eligible_,
           .leader_authority_eligibility_revision_ =
               leader_authority_eligibility_revision_};

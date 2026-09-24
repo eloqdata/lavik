@@ -53,7 +53,8 @@ struct MetaDataControlRuntimeNode {
   // Native source layout from the same authenticated Hello as boot/history.
   std::uint32_t replication_flow_count_ = 0;
   std::uint64_t session_generation_ = 0;
-  std::uint64_t leadership_generation_ = 0;
+  // Captured from MetaLeaderContext; zero means no attached leader work.
+  std::uint64_t leader_term_ = 0;
   std::uint64_t control_revision_ = 0;
   std::uint64_t validated_committed_high_water_ = 0;
   std::uint64_t topology_epoch_ = 0;
@@ -74,11 +75,12 @@ struct MetaDataControlRuntimeNode {
 };
 
 struct MetaDataControlRuntimeSnapshot {
-  std::uint64_t leadership_generation_ = 0;
+  std::uint64_t leader_term_ = 0;
   bool leader_authority_eligible_ = false;
-  // Changes on every observed eligibility edge within one leadership
-  // generation. A reader that misses false -> true between snapshots can still
-  // detect that authority continuity was broken and repeat its warmup.
+  // Readiness can change within a Raft term while membership identity catches
+  // up. This counts readiness edges, never elections or leader identities. A
+  // reader that misses false -> true between snapshots can still detect that
+  // authority continuity was broken and repeat its warmup.
   std::uint64_t leader_authority_eligibility_revision_ = 0;
   // Lexicographically sorted by node_id_; detector/status readers may use
   // binary lookup without rebuilding an index on every poll.
@@ -87,7 +89,7 @@ struct MetaDataControlRuntimeSnapshot {
   // committed the corresponding identity. This distinguishes a reconnecting
   // Data process from a declared node that has never contacted this leader.
   std::vector<std::string> unregistered_retries_;
-  // Nodes that established an accepted session in this leadership generation.
+  // Nodes that established an accepted session in this Raft leader term.
   // Entries outlive session removal so diagnostics can distinguish a missing
   // session from a node this leader has never observed. The registry is
   // bounded by the protocol's maximum projected node count.
@@ -95,7 +97,7 @@ struct MetaDataControlRuntimeSnapshot {
 };
 
 struct MetaDataControlLeadershipState {
-  std::uint64_t leadership_generation_ = 0;
+  std::uint64_t leader_term_ = 0;
   bool leader_authority_eligible_ = false;
   std::uint64_t leader_authority_eligibility_revision_ = 0;
 };
@@ -103,35 +105,33 @@ struct MetaDataControlLeadershipState {
 class MetaDataControlRuntimeStatus {
  public:
   // Starts a new leader-owned observation epoch. Status capture uses this
-  // generation to reject a response assembled across a leadership change and
-  // resets its eligibility-continuity revision.
-  void BeginLeadership(std::uint64_t leadership_generation);
-  // Changes eligibility only for the current generation and returns the
+  // captured Raft term to reject a response assembled across a leadership
+  // change and resets its eligibility-continuity revision.
+  void BeginLeadership(std::uint64_t leader_term);
+  // Changes eligibility only for the current term and returns the
   // effective result. Stale worker notifications and revision exhaustion
   // return false; each accepted edge advances the snapshot's revision so
   // false -> true cannot disappear between detector polls. Becoming
-  // ineligible preserves observations so recovery within the same generation
+  // ineligible preserves observations so recovery within the same term
   // can reuse still-current sessions.
-  bool SetLeaderAuthorityEligible(std::uint64_t leadership_generation,
-                                  bool eligible);
-  // Clears observations only when ending the current generation. A delayed
-  // demotion for an older generation cannot erase a newer leader's state.
-  void EndLeadership(std::uint64_t leadership_generation);
+  bool SetLeaderAuthorityEligible(std::uint64_t leader_term, bool eligible);
+  // Clears observations only when ending the current term. A delayed
+  // demotion for an older term cannot erase a newer leader's state.
+  void EndLeadership(std::uint64_t leader_term);
   // Records an authenticated, active-create-declared node id only in the
-  // current leadership generation. The caller enforces those predicates and
+  // current Raft leader term. The caller enforces those predicates and
   // this store independently caps retained evidence; diagnostics never
   // participate in authorization.
-  void NoteUnregisteredRetry(std::string node_id,
-                             std::uint64_t leadership_generation);
+  void NoteUnregisteredRetry(std::string node_id, std::uint64_t leader_term);
   // Publishes a fully validated Hello/FDS session for the current eligible
-  // leader generation. Replacing a node session atomically discards all
+  // leader term. Replacing a node session atomically discards all
   // heartbeat and lease observations belonging to its predecessor.
   void PublishCurrent(std::string node_id, std::string boot_id,
                       const cluster::control::WireId128& session_id,
                       const MetaReplicationHistoryId& replication_history_id,
                       std::uint32_t replication_flow_count,
                       std::uint64_t session_generation,
-                      std::uint64_t leadership_generation,
+                      std::uint64_t leader_term,
                       std::uint64_t validated_committed_high_water,
                       const cluster::control::FullDesiredState& projection);
   // Advances only the named current session's validated committed high-water;
@@ -169,9 +169,9 @@ class MetaDataControlRuntimeStatus {
 
  private:
   mutable std::mutex mutex_;
-  std::uint64_t leadership_generation_ = 0;
+  std::uint64_t leader_term_ = 0;
   bool leader_authority_eligible_ = false;
-  // Saturation permanently leaves this generation ineligible instead of
+  // Saturation permanently leaves this term ineligible instead of
   // allowing the revision to wrap and make an authority interruption
   // invisible.
   std::uint64_t leader_authority_eligibility_revision_ = 0;
