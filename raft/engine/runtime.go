@@ -69,7 +69,7 @@ type Runtime struct {
 	bulkDone          chan snapshotPrepared
 	memberRequests    chan *memberRequest
 	resignRequests    chan struct{}
-	resignIssued      atomic.Uint64
+	resignTerm        atomic.Uint64
 	joinRequests      chan *joinRequest
 	stop              chan struct{}
 	done              chan struct{}
@@ -77,40 +77,37 @@ type Runtime struct {
 	admission         admissionGate
 	workers           sync.WaitGroup
 	// The following fields belong only to the protocol loop.
-	appendQueue           []*pb.Message
-	applyQueue            []*applyJob
-	waiters               map[[16]byte]chan Result
-	pendingBytes          uint64
-	pendingTasks          int
-	lastRole              Role
-	roleSet               bool
-	heartbeatNonce        [16]byte
-	heartbeatSeq          uint64
-	liveness              map[uint64]*peerLiveness
-	protocolLeader        bool
-	protocolTerm          uint64
-	leaderSince           time.Time
-	epochRevoked          bool
-	applyInProgress       bool
-	snapshotInProgress    bool
-	snapshotWaiter        chan Result
-	snapshotFailures      uint64
-	snapshotAttempt       time.Time
-	memberChange          *memberRequest
-	singleQuarantineUntil time.Time
-	joining               *joinRequest
-	replayTarget          uint64
-	replayDone            chan struct{}
-	replayed              bool
-	checkIdentities       bool
-	bindings              map[uint64]Binding
-	snapshotCandidate     bool
-	voteRejections        uint64
-	voteGrants            uint64
-	bulkQueue             []snapshotWork
-	preparedIncoming      *pb.Message
-	resignApplied         uint64
-	deferredTerm          *pb.Message
+	appendQueue        []*pb.Message
+	applyQueue         []*applyJob
+	waiters            map[[16]byte]chan Result
+	pendingBytes       uint64
+	pendingTasks       int
+	lastRole           Role
+	roleSet            bool
+	heartbeatNonce     [16]byte
+	heartbeatSeq       uint64
+	liveness           map[uint64]*peerLiveness
+	protocolLeader     bool
+	protocolTerm       uint64
+	leaderSince        time.Time
+	applyInProgress    bool
+	snapshotInProgress bool
+	snapshotWaiter     chan Result
+	snapshotFailures   uint64
+	snapshotAttempt    time.Time
+	memberChange       *memberRequest
+	joining            *joinRequest
+	replayTarget       uint64
+	replayDone         chan struct{}
+	replayed           bool
+	checkIdentities    bool
+	bindings           map[uint64]Binding
+	snapshotCandidate  bool
+	voteRejections     uint64
+	voteGrants         uint64
+	bulkQueue          []snapshotWork
+	preparedIncoming   *pb.Message
+	deferredTerm       *pb.Message
 }
 
 // Open recovers local state before starting any timers. Transport must not
@@ -338,7 +335,6 @@ func (r *Runtime) stopAdmission() {
 func (r *Runtime) publish() {
 	s := r.core.status()
 	s.Role = r.authorityRole(s.Role)
-	s.ResignIndex = r.resignApplied
 	s.PeerApplied = map[uint64]uint64{}
 	s.PeerAgeMicros = map[uint64]uint64{}
 	for id, peer := range r.liveness {
@@ -748,7 +744,7 @@ func (r *Runtime) step(m *pb.Message) error {
 	// also lets upstream CheckQuorum demote an expired authority epoch even
 	// if its log socket continues receiving replies after control loss.
 	if s.IsLeader && m.GetType() == pb.MsgAppResp && m.GetTerm() <= s.Term {
-		if r.epochRevoked || !r.peerLive(m.GetFrom(), time.Now()) {
+		if !r.peerLive(m.GetFrom(), time.Now()) {
 			return nil
 		}
 	}

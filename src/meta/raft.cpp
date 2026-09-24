@@ -254,9 +254,9 @@ absl::StatusOr<std::shared_ptr<MetaRaft>> MetaRaft::Open(
     }
   };
   callbacks.role = [](uintptr_t owner, uint64_t term, uint64_t leader,
-                      int is_leader, int caught_up, uint64_t resign_index) {
+                      int is_leader, int caught_up) {
     reinterpret_cast<MetaRaft*>(owner)->OnRole(term, leader, is_leader,
-                                               caught_up, resign_index);
+                                               caught_up);
   };
   callbacks.result = [](uintptr_t owner, uint64_t ticket, uint64_t index,
                         int code, void* data, uint64_t size) {
@@ -296,27 +296,33 @@ absl::StatusOr<std::shared_ptr<MetaRaft>> MetaRaft::Open(
 MetaRaft::~MetaRaft() { shutdown(); }
 
 void MetaRaft::OnRole(std::uint64_t term, std::uint64_t leader, bool is_leader,
-                      bool caught_up, std::uint64_t resign_index) noexcept {
-  const auto previous_term = term_.exchange(term);
+                      bool caught_up) noexcept {
+  if (term >= static_cast<std::uint64_t>(INT64_MAX)) std::terminate();
+  term_.store(term);
   leader_id_.store(leader ? static_cast<std::int32_t>(leader) : -1);
-  caught_up_.store(caught_up, std::memory_order_release);
-  // Revocation precedes the slower ordered relay. Readers cannot keep granting
-  // authority while a snapshot or apply event delays the Bycorf mailbox.
-  auto current = authority_.load(std::memory_order_acquire);
-  bool allowed;
-  do {
-    allowed = is_leader && caught_up && !(current & kStopped) &&
-              (current >> 1) <= resign_index;
-  } while (!authority_.compare_exchange_weak(
-      current, (current & ~std::uint64_t{1}) | allowed,
-      std::memory_order_acq_rel));
-  if (!allowed && (current & 1))
-    authority_generation_.fetch_add(1, std::memory_order_acq_rel);
-  const bool previous = std::exchange(relayed_leader_, allowed);
-  if ((previous != allowed || (!allowed && previous_term != term)) &&
-      options_.role_) {
+  const auto incoming = static_cast<std::int64_t>(term);
+  auto current = leader_term_.load(std::memory_order_acquire);
+  while (current != kStopped) {
+    const auto last = current >= 0 ? current : -(current + 1);
+    auto next = current;
+    if (is_leader && caught_up) {
+      if (incoming > last || (incoming == last && current >= 0))
+        next = incoming;
+    } else if (current >= 0) {
+      // A candidate already has its prospective term. Retire only the term
+      // actually admitted here, so winning that election can still publish.
+      next = -(current + 1);
+    }
+    if (leader_term_.compare_exchange_weak(current, next,
+                                           std::memory_order_acq_rel))
+      break;
+  }
+  const auto published = leader_term();
+  const auto previous = std::exchange(relayed_leader_term_, published);
+  if (previous != published && options_.role_) {
     try {
-      options_.role_(allowed, term);
+      if (previous >= 0) options_.role_(false, term);
+      if (published >= 0) options_.role_(true, term);
     } catch (...) {
       std::terminate();
     }
@@ -325,8 +331,7 @@ void MetaRaft::OnRole(std::uint64_t term, std::uint64_t leader, bool is_leader,
 
 void MetaRaft::shutdown() {
   if (stopping_.exchange(true)) return;
-  authority_.fetch_or(kStopped, std::memory_order_acq_rel);
-  caught_up_.store(false);
+  leader_term_.store(kStopped, std::memory_order_release);
   if (observer_.joinable()) observer_.join();
   if (handle_ != 0) {
     lavik_raft_close(handle_);
@@ -519,19 +524,16 @@ std::shared_ptr<MetaRaftResult> MetaRaft::remove_srv(std::int32_t id) {
 }
 
 void MetaRaft::yield_leadership(bool) {
-  auto current = authority_.load(std::memory_order_acquire);
-  std::uint64_t generation;
+  auto current = leader_term_.load(std::memory_order_acquire);
   do {
-    if (current & kStopped) return;
-    generation = (current >> 1) + 1;
-    if (generation >= (kStopped >> 1)) std::terminate();
-  } while (!authority_.compare_exchange_weak(current, generation << 1,
-                                             std::memory_order_acq_rel));
-  authority_generation_.fetch_add(1, std::memory_order_acq_rel);
-  caught_up_.store(false, std::memory_order_release);
-  // The protocol owner sends the ordered follower edge. The synchronous CAS
-  // above already stops grants, including while an older callback is in flight.
-  lavik_raft_resign(handle_, generation);
+    // Retire only an admitted leader, never a prospective candidate term
+    // concurrently exposed by get_term(). That candidate may still win.
+    if (current < 0) return;
+  } while (!leader_term_.compare_exchange_weak(current, -(current + 1),
+                                               std::memory_order_acq_rel));
+  // Only the Raft protocol owner changes role and starts subsequent elections.
+  // A delayed request is term-scoped and cannot retire a later elected leader.
+  lavik_raft_resign(handle_, static_cast<std::uint64_t>(current));
 }
 
 }  // namespace lavik::meta

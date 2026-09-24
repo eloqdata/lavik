@@ -145,18 +145,15 @@ class MetaRaft : public std::enable_shared_from_this<MetaRaft> {
       MetaRaftOptions options, MetaStateMachine& machine);
   ~MetaRaft();
   void shutdown();
-  bool is_leader() const {
-    return (authority_.load(std::memory_order_acquire) & (kStopped | 1)) == 1;
+  // The usable leader's Raft term, or -1. Once revoked, a term never becomes
+  // usable again; reelection and current-term application are required.
+  std::int64_t leader_term() const {
+    const auto term = leader_term_.load(std::memory_order_acquire);
+    return term >= 0 ? term : -1;
   }
+  bool is_leader() const { return leader_term() >= 0; }
   bool is_leader_alive() const { return is_leader(); }
-  bool is_leader_sm_fully_caught_up() const {
-    return is_leader() && caught_up_.load(std::memory_order_acquire);
-  }
-  // Changes on every synchronous authority revocation, including a transient
-  // loss inside one term. Consumers retain it to reject old sessions after ABA.
-  std::uint64_t authority_generation() const {
-    return authority_generation_.load(std::memory_order_acquire);
-  }
+  bool is_leader_sm_fully_caught_up() const { return is_leader(); }
   std::int32_t get_id() const { return options_.id_; }
   std::int32_t get_leader() const { return leader_id_.load(); }
   std::uint64_t get_term() const { return term_.load(); }
@@ -179,6 +176,8 @@ class MetaRaft : public std::enable_shared_from_this<MetaRaft> {
       const std::vector<std::shared_ptr<MetaRaftBuffer>>& entries);
   std::shared_ptr<MetaRaftResult> add_srv(const MetaRaftMember& member);
   std::shared_ptr<MetaRaftResult> remove_srv(std::int32_t id);
+  // Synchronously retires the admitted leader term; a follower/candidate is
+  // unchanged. The protocol owner then steps down that term asynchronously.
   void yield_leadership(bool immediate_yield = false);
   struct create_snapshot_options {
     bool serialize_commit_ = true;
@@ -196,7 +195,7 @@ class MetaRaft : public std::enable_shared_from_this<MetaRaft> {
   void Observe();
   bool RefreshStatus();
   void OnRole(std::uint64_t term, std::uint64_t leader, bool is_leader,
-              bool caught_up, std::uint64_t resign_index) noexcept;
+              bool caught_up) noexcept;
   void OnResult(std::uint64_t ticket, std::uint64_t index, int code,
                 const void* data, std::uint64_t size);
   std::pair<std::uint64_t, std::shared_ptr<MetaRaftResult>> NewResult();
@@ -204,13 +203,15 @@ class MetaRaft : public std::enable_shared_from_this<MetaRaft> {
   const MetaRaftOptions options_;
   MetaStateMachine& machine_;
   std::uint64_t handle_ = 0;
-  // One CAS binds authority to its revocation generation. An old Go role
-  // callback cannot race a caller's resignation and set the leader bit again.
-  static constexpr std::uint64_t kStopped = std::uint64_t{1} << 63;
-  std::atomic<std::uint64_t> authority_generation_{0};
-  std::atomic<std::uint64_t> authority_{0};  // stop bit, generation, leader bit
-  std::atomic<bool> caught_up_{false}, stopping_{false};
-  bool relayed_leader_ = false;  // Only the serial Go role callback owns this.
+  // T is usable; -(T+1) retires T and all earlier terms. Retaining the revoked
+  // Raft term in this same atomic prevents a late Go callback from undoing a
+  // synchronous resignation. INT64_MIN is terminal shutdown. No independent
+  // leader bit or authority generation participates in publication.
+  static constexpr std::int64_t kStopped = INT64_MIN;
+  std::atomic<std::int64_t> leader_term_{-1};
+  std::atomic<bool> stopping_{false};
+  // Callback-owner edge cache only; never consulted for service admission.
+  std::int64_t relayed_leader_term_ = -1;
   std::atomic<std::int32_t> leader_id_{-1};
   std::atomic<std::uint64_t> term_{0}, committed_{0}, snapshot_{0},
       uncompacted_{0}, first_index_{1}, durable_{0}, rpc_failures_{0},

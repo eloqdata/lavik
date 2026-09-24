@@ -120,7 +120,8 @@ This is a directory, not a liveness vote: unreachable registered peers remain.
 The listener bind is independent of the advertised address to permit proxies.
 All election-eligible members must run their registered listener for discovery HA.
 
-Discovery requests and SUBSCRIBE bind their session to the current Raft term,
+Discovery requests and SUBSCRIBE bind their session to the current usable Raft
+leader term (-1 while unavailable),
 Data-control leadership generation and eligibility-continuity revision, and local
 commit-subscription continuity. Demotion, freshness loss, or a cancelled commit
 subscription closes those sessions, including idle and blocked writers. Returning

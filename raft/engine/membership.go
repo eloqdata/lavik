@@ -53,19 +53,14 @@ func (r *Runtime) ChangeMember(member Member, remove, learner bool) (<-chan Resu
 	}
 }
 
-// Resign immediately withdraws the application's leadership generation. Raft
-// attempts transfer and CheckQuorum retires the old protocol epoch. A sole
-// voter reopens only after a full election interval, retaining the C++ 2D guard.
-func (r *Runtime) Resign() {
-	r.RequestResign(r.resignIssued.Add(1))
-}
+// Resign withdraws the currently observed Raft term. A delayed request cannot
+// resign a leader elected in a later term.
+func (r *Runtime) Resign() { r.RequestResign(r.Status().Term) }
 
-// RequestResign carries a monotonically increasing foreign-owner generation.
-// Callers withdraw local authority before enqueueing it and ignore older role
-// callbacks until the protocol owner acknowledges that generation.
-func (r *Runtime) RequestResign(index uint64) {
-	for current := r.resignIssued.Load(); current < index; current = r.resignIssued.Load() {
-		if r.resignIssued.CompareAndSwap(current, index) {
+// RequestResign carries the actual Raft term, not a second authority epoch.
+func (r *Runtime) RequestResign(term uint64) {
+	for current := r.resignTerm.Load(); current < term; current = r.resignTerm.Load() {
+		if r.resignTerm.CompareAndSwap(current, term) {
 			break
 		}
 	}
@@ -77,17 +72,8 @@ func (r *Runtime) RequestResign(index uint64) {
 }
 
 func (r *Runtime) resign() {
-	r.resignApplied = r.resignIssued.Load()
-	r.epochRevoked = true
-	if len(r.core.conf.GetVoters()) == 1 && r.core.conf.GetVoters()[0] == r.cfg.Local.ID {
-		r.singleQuarantineUntil = time.Now().Add(r.livenessWindow())
-	} else {
-		for _, id := range r.core.conf.GetVoters() {
-			if id != r.cfg.Local.ID {
-				r.core.raw.TransferLeader(id)
-				break
-			}
-		}
+	if r.core.status().Term <= r.resignTerm.Load() {
+		r.stepDown()
 	}
 	r.publish()
 }
@@ -98,7 +84,7 @@ func (r *Runtime) advanceMembership() error {
 		return nil
 	}
 	status := r.core.status()
-	if !status.IsLeader || r.epochRevoked || r.deferredTerm != nil || status.Term != op.term {
+	if !status.IsLeader || r.deferredTerm != nil || status.Term != op.term {
 		op.result <- Result{Err: ErrStopped}
 		r.memberChange = nil
 		return nil
@@ -152,4 +138,27 @@ func (r *Runtime) advanceMembership() error {
 	}
 	op.lastAttempt = time.Now()
 	return r.core.raw.ProposeConfChange(&pb.ConfChange{Type: kind.Enum(), NodeId: new(op.member.ID), Context: data})
+}
+
+// stepDown retires this Raft term, including for a sole voter. RawNode has no
+// public resignation primitive. Use its higher-term, reject-only local event
+// (also used for deferred term observations) to become a follower without
+// granting a vote or manufacturing a quorum. Ready persists the new term before
+// dependent output; normal ticks and elections alone may establish a leader.
+func (r *Runtime) stepDown() {
+	s := r.core.status()
+	if !s.IsLeader {
+		return
+	}
+	term := s.Term + 1
+	if term == 0 {
+		panic("Raft term exhausted")
+	}
+	r.liveness = map[uint64]*peerLiveness{}
+	if r.deferredTerm == nil || r.deferredTerm.GetTerm() < term {
+		r.deferredTerm = &pb.Message{Type: pb.MsgVoteResp.Enum(), From: new(raft.LocalAppendThread), To: new(r.cfg.Local.ID), Term: new(term), Reject: new(true)}
+	}
+	if err := r.advanceDeferredTerm(); err != nil {
+		panic(err)
+	}
 }

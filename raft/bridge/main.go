@@ -100,7 +100,7 @@ func flag(v bool) C.int {
 	return 0
 }
 func (i *instance) role(role engine.Role) {
-	C.call_role(&i.callbacks, i.owner, C.uint64_t(role.Term), C.uint64_t(role.Leader), flag(role.IsLeader), flag(role.CaughtUp), C.uint64_t(role.ResignIndex))
+	C.call_role(&i.callbacks, i.owner, C.uint64_t(role.Term), C.uint64_t(role.Leader), flag(role.IsLeader), flag(role.CaughtUp))
 }
 func (i *instance) fatal(err error) {
 	data := []byte(err.Error())
@@ -238,9 +238,9 @@ func lavik_raft_member(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointer
 }
 
 //export lavik_raft_resign
-func lavik_raft_resign(handle C.uint64_t, index C.uint64_t) {
+func lavik_raft_resign(handle C.uint64_t, term C.uint64_t) {
 	if i := lookup(handle); i != nil {
-		i.runtime.RequestResign(uint64(index))
+		i.runtime.RequestResign(uint64(term))
 	}
 }
 

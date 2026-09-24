@@ -458,4 +458,38 @@ TEST(MetaSentinelServerTest, ResetCannotEraseAuthorityAcrossEligibilityABA) {
   runtime.server_->Shutdown();
 }
 
+TEST(MetaSentinelServerTest, ResignationRevokesConnectionAndRequiresNewTerm) {
+  SentinelRuntime runtime;
+  ASSERT_TRUE(runtime.initialized_.get_future().get().ok());
+  ASSERT_TRUE(runtime.machine_status_.ok());
+  sockaddr_in address{};
+  StartServerOnEphemeralPort(runtime, &address);
+  ASSERT_TRUE(WaitFor([&] { return runtime.raft_->is_leader(); },
+                      std::chrono::seconds(15)));
+  const auto term = runtime.raft_->leader_term();
+  ASSERT_GE(term, 0);
+  const int client = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ASSERT_GE(client, 0);
+  const timeval timeout{.tv_sec = 3, .tv_usec = 0};
+  ASSERT_EQ(
+      ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)),
+      0);
+  ASSERT_EQ(
+      ::connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+      0);
+  const std::string request = "SENTINEL MASTERS\r\n";
+  ASSERT_EQ(::send(client, request.data(), request.size(), MSG_NOSIGNAL),
+            request.size());
+  EXPECT_EQ(ReadReply(client, 4), "*0\r\n");
+  runtime.raft_->yield_leadership();
+  EXPECT_EQ(runtime.raft_->leader_term(), -1);
+  EXPECT_FALSE(runtime.raft_->is_leader());
+  ASSERT_TRUE(WaitFor([&] { return runtime.raft_->leader_term() > term; },
+                      std::chrono::seconds(15)));
+  char byte;
+  EXPECT_EQ(::recv(client, &byte, 1, 0), 0);
+  ::close(client);
+  runtime.server_->Shutdown();
+}
+
 }  // namespace

@@ -104,7 +104,7 @@ func TestShutdownRevokesAuthorityBeforeBlockedWriterJoins(t *testing.T) {
 	}
 }
 
-func TestResignGenerationAcknowledgedBeforeSoleVoterReopens(t *testing.T) {
+func TestResignedSoleVoterRequiresNewElectionTerm(t *testing.T) {
 	members := testMembers()[:1]
 	network := &testNetwork{nodes: map[uint64]*Runtime{}}
 	roles := make(chan Role, 32)
@@ -115,27 +115,39 @@ func TestResignGenerationAcknowledgedBeforeSoleVoterReopens(t *testing.T) {
 	}
 	defer r.Close()
 	eventually(t, "sole voter ready", func() bool { return r.Status().CaughtUp })
-	issued := time.Now()
-	r.RequestResign(7)
+	for len(roles) > 0 {
+		<-roles
+	}
+	oldTerm := r.Status().Term
+	r.RequestResign(oldTerm)
 	deadline := time.After(2 * time.Second)
 	var acknowledged time.Time
 	for {
 		select {
 		case role := <-roles:
-			if role.ResignIndex < 7 {
+			if role.Term < oldTerm {
 				continue
 			}
 			if !role.IsLeader && acknowledged.IsZero() {
 				acknowledged = time.Now()
 			}
-			if role.IsLeader {
-				if acknowledged.IsZero() || time.Since(issued) < 60*time.Millisecond {
-					t.Fatal("sole voter skipped its active-time quarantine")
+			if role.IsLeader && role.CaughtUp {
+				if role.Term <= oldTerm {
+					t.Fatal("resigned leader reopened without a new Raft election term")
+				}
+				if acknowledged.IsZero() {
+					t.Fatal("reelection was not preceded by a follower edge")
+				}
+				newTerm := role.Term
+				r.RequestResign(oldTerm)
+				time.Sleep(120 * time.Millisecond)
+				if r.Status().Term != newTerm || !r.Status().CaughtUp {
+					t.Fatal("late resignation retired a newer elected leader")
 				}
 				return
 			}
 		case <-deadline:
-			t.Fatal("resignation generation never reopened")
+			t.Fatal("resigned voter never reelected")
 		}
 	}
 }

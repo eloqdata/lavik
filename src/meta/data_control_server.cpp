@@ -1544,10 +1544,11 @@ bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
         "Meta data-control detected a suspend gap; quarantining authority "
         "for {} ms of active runtime",
         core.options_.leadership_validity_ms_);
-    // Raft's cached live-leader flag may itself be stale after suspend.
+    // Raft's cached leader term may itself be stale after suspend.
     // Immediate revocation is synchronous at the C++ boundary, so an older
     // role callback cannot restore grants before the Go owner processes the
-    // resignation. A sole voter must still pass its active-time quarantine.
+    // resignation. Even a sole voter needs a new election term; the Data
+    // lease handoff quarantine still applies after reelection.
     core.server_->yield_leadership(/*immediate_yield=*/true);
     if (core.worker_ != nullptr) {
       std::vector<bycorf::Connection*> sessions;

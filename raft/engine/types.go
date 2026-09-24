@@ -101,9 +101,6 @@ type Role struct {
 	Leader   uint64
 	IsLeader bool
 	CaughtUp bool
-	// ResignIndex acknowledges the caller's revocation generation. A foreign
-	// role callback sampled before that request cannot restore its authority.
-	ResignIndex uint64
 }
 
 // Status is an immutable observation, not a linearizable read certificate.

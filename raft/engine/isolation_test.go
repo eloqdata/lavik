@@ -175,6 +175,7 @@ func TestControlPartitionRevokesAuthorityDespiteLiveLogConnections(t *testing.T)
 	nodes := openTestCluster(t, nil, &drop)
 	leader := clusterLeader(t, nodes)
 	appliedProposal(t, leader, "baseline")
+	oldTerm := leader.Status().Term
 	drop.Store(true)
 	deadline := time.Now().Add(600 * time.Millisecond)
 	for time.Now().Before(deadline) && leader.Status().IsLeader {
@@ -197,6 +198,9 @@ func TestControlPartitionRevokesAuthorityDespiteLiveLogConnections(t *testing.T)
 	}
 	drop.Store(false)
 	leader = clusterLeader(t, nodes)
+	if leader.Status().Term <= oldTerm {
+		t.Fatal("quorum recovery revived an old leader term")
+	}
 	appliedProposal(t, leader, "after control reconnect")
 }
 

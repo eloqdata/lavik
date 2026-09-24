@@ -69,8 +69,7 @@ struct MetaDiscoveryCut {
   std::int64_t now_unix_ms_ = 0;
   std::uint32_t observation_ttl_ms_ = 0;
   bool observation_grace_active_ = false;
-  std::uint64_t authority_generation_ = 0;
-  std::uint64_t raft_term_ = 0;
+  std::int64_t raft_term_ = -1;
   std::uint32_t local_meta_id_ = 0;
   // Raft's effective committed configuration excludes staged identity binds.
   std::vector<std::uint32_t> effective_meta_ids_;

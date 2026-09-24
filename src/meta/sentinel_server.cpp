@@ -63,8 +63,8 @@ struct SentinelSession {
   std::set<std::string> subscriptions_;
   std::size_t subscription_bytes_ = 0;
   bool authority_bound_ = false;
-  std::uint64_t authority_term_ = 0, leadership_generation_ = 0;
-  std::uint64_t authority_generation_ = 0;
+  std::int64_t authority_term_ = -1;
+  std::uint64_t leadership_generation_ = 0;
   std::uint64_t eligibility_revision_ = 0, continuity_ = 0;
   bycorf::Connection* connection_ = nullptr;
   std::deque<std::string> output_;
@@ -104,30 +104,26 @@ struct DiscoverySource {
   // starts passing and reopens whenever the runtime registry's leadership
   // generation changes, so a handoff never turns a never-yet-observed node
   // into a false down mark. Both edges reset the same start point.
-  bool leader_triplet_passed_ = false;
+  bool leader_admitted_ = false;
   std::uint64_t grace_leadership_generation_ = 0;
   std::chrono::steady_clock::time_point authority_since_{};
 };
 
 // Assembles one discovery cut when this node currently holds a caught-up
-// leadership, else nullopt. The runtime registry snapshot leads because its
-// leadership generation anchors the observation-grace window.
+// leadership, else nullopt. The Raft leader term brackets the snapshots; the
+// runtime leadership generation anchors the observation-grace window.
 std::optional<MetaDiscoveryCut> AuthoritativeDiscoveryCut(
     DiscoverySource& source) {
-  const auto authority_generation = source.raft_->authority_generation();
-  const auto raft_term = source.raft_->get_term();
-  const bool authoritative = source.raft_->is_leader() &&
-                             source.raft_->is_leader_alive() &&
-                             source.raft_->is_leader_sm_fully_caught_up();
+  const auto raft_term = source.raft_->leader_term();
+  const bool authoritative = raft_term >= 0;
   const auto now = std::chrono::steady_clock::now();
-  if (authoritative && !source.leader_triplet_passed_) {
+  if (authoritative && !source.leader_admitted_) {
     source.authority_since_ = now;
   }
-  source.leader_triplet_passed_ = authoritative;
+  source.leader_admitted_ = authoritative;
   if (!authoritative) return std::nullopt;
 
   MetaDiscoveryCut cut;
-  cut.authority_generation_ = authority_generation;
   cut.raft_term_ = raft_term;
   cut.local_meta_id_ = source.raft_->get_id();
   if (const auto config = source.raft_->get_config()) {
@@ -164,10 +160,7 @@ std::optional<MetaDiscoveryCut> AuthoritativeDiscoveryCut(
   cut.now_unix_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
-  if (!source.raft_->is_leader_sm_fully_caught_up() ||
-      source.raft_->authority_generation() != authority_generation ||
-      source.raft_->get_term() != raft_term)
-    return std::nullopt;
+  if (source.raft_->leader_term() != raft_term) return std::nullopt;
   return cut;
 }
 
@@ -175,7 +168,6 @@ bool BindAuthority(DiscoverySource& source, SentinelSession& session,
                    const MetaDiscoveryCut& cut) {
   if (session.authority_bound_ &&
       (session.authority_term_ != cut.raft_term_ ||
-       session.authority_generation_ != cut.authority_generation_ ||
        session.leadership_generation_ != cut.runtime_.leadership_generation_ ||
        session.eligibility_revision_ !=
            cut.runtime_.leader_authority_eligibility_revision_ ||
@@ -183,7 +175,6 @@ bool BindAuthority(DiscoverySource& source, SentinelSession& session,
     return false;
   session.authority_bound_ = true;
   session.authority_term_ = cut.raft_term_;
-  session.authority_generation_ = cut.authority_generation_;
   session.leadership_generation_ = cut.runtime_.leadership_generation_;
   session.eligibility_revision_ =
       cut.runtime_.leader_authority_eligibility_revision_;
@@ -195,10 +186,7 @@ bool AuthorityCurrent(const DiscoverySource& source,
                       const SentinelSession& session) {
   if (!session.authority_bound_) return true;
   const auto state = source.runtime_status_->LeadershipState();
-  return source.raft_->is_leader_sm_fully_caught_up() &&
-         source.raft_->get_term() == session.authority_term_ &&
-         source.raft_->authority_generation() ==
-             session.authority_generation_ &&
+  return source.raft_->leader_term() == session.authority_term_ &&
          source.continuity_ == session.continuity_ &&
          state.leadership_generation_ == session.leadership_generation_ &&
          state.leader_authority_eligibility_revision_ ==
@@ -677,16 +665,14 @@ struct MetaSentinelServer::Core {
       if (!cut) {
         core->events_.Reset();
       } else {
-        const auto term = core->discovery_.raft_->get_term();
+        const auto term = cut->raft_term_;
         const auto generation = cut->runtime_.leadership_generation_;
         const auto revision =
             cut->runtime_.leader_authority_eligibility_revision_;
-        if (cut->authority_generation_ != core->event_authority_generation_ ||
-            term != core->event_term_ ||
+        if (term != core->event_term_ ||
             generation != core->event_generation_ ||
             revision != core->event_revision_) {
           core->events_.Reset();
-          core->event_authority_generation_ = cut->authority_generation_;
           core->event_term_ = term;
           core->event_generation_ = generation;
           core->event_revision_ = revision;
@@ -747,8 +733,8 @@ struct MetaSentinelServer::Core {
   std::size_t output_bytes_ = 0;
   bool monitor_running_ = false;
   MetaDiscoveryEvents events_;
-  std::uint64_t event_authority_generation_ = 0;
-  std::uint64_t event_term_ = 0, event_generation_ = 0, event_revision_ = 0;
+  std::int64_t event_term_ = -1;
+  std::uint64_t event_generation_ = 0, event_revision_ = 0;
   MetaLeaderContext* context_ = nullptr;
   std::unique_ptr<MetaCommitSubscription> subscription_;
   std::shared_ptr<std::atomic<std::uint64_t>> committed_signal_;
