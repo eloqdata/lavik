@@ -67,18 +67,22 @@ leader, or a waiting joiner closes the connection without a reply, so clients
 reach the leader by retrying their seed list. There is no private redirect.
 
 A discovery answer projects one compact committed view,
-`MetaStateMachine::StatusSnapshot`, cached per serving worker and rebuilt only
-when the state machine's `state_change_index` advances. The view is joined
-with mutex-consistent snapshots of two thread-safe volatile registries:
+`MetaStateMachine::StatusSnapshot`, cached as an immutable shared view per
+serving worker and rebuilt when the applied index advances, including
+`Advance()` entries that change no stores. Each response or event cut retains
+its own share, so replacing the worker cache cannot invalidate a cut still in
+use. The view is joined with mutex-consistent snapshots of two thread-safe
+volatile registries:
 `MetaDataControlRuntimeStatus` for session, health, and projection-anchor
 state, and `MetaAutomaticFailoverDiagnosticsRegistry` for detector state.
 Diagnostics are adopted only under their join-identity contract: the two
 volatile snapshots must name the same Raft leader term and
-eligibility-continuity revision, and a Group's diagnostic anchor must equal
+eligibility-continuity revision, the detector's evaluated applied index must
+equal the committed view's, and a Group's diagnostic anchor must equal
 the committed owner, assignment, and Group Term; any mismatch is read as no
-diagnostic, exactly as cluster-status resolves the same join. The request path
-takes no cross-worker blocking lock—the compact view's brief state lock
-follows the ctl-server precedent, and steady-state queries rebuild nothing.
+diagnostic, exactly as cluster-status resolves the same join. The compact
+view takes a brief state lock only when rebuilt; the volatile registries take
+short snapshot locks, and steady-state queries rebuild nothing.
 
 Publication is gated by committed authority alone: the lifecycle is Created,
 the immutable client mode is Single, one complete Group exists, its authority

@@ -84,9 +84,10 @@ enum class SessionAction { kContinue, kReset, kClose, kDrop };
 
 // Worker-confined discovery inputs and per-worker caches. The dependencies
 // outlive the server by process assembly order; the committed-view cache is
-// rebuilt only when the state machine's change index advances, so a
-// steady-state query costs one atomic load plus the two registries' own
-// mutex-snapshots. Nothing here blocks across workers on the request path.
+// rebuilt when the applied index advances. Each cut owns a share of the
+// immutable view, so a cache refresh cannot invalidate a cut
+// still being encoded or observed. Nothing here blocks across workers on the
+// request path beyond the registries' short snapshot locks.
 struct DiscoverySource {
   std::shared_ptr<MetaRaft> raft_;
   MetaStateMachine* state_machine_ = nullptr;
@@ -96,9 +97,7 @@ struct DiscoverySource {
   std::uint64_t leader_observation_grace_ms_ = 0;
 
   std::uint64_t continuity_ = 0;
-  bool cached_view_valid_ = false;
-  std::uint64_t cached_state_change_ = 0;
-  MetaCommittedStatusView cached_view_;
+  std::shared_ptr<const MetaCommittedStatusView> cached_view_;
 
   // Observation-grace bookkeeping: the window opens on leader admission
   // and reopens when the runtime registry attaches the new Raft term,
@@ -145,16 +144,17 @@ std::optional<MetaDiscoveryCut> AuthoritativeDiscoveryCut(
       std::chrono::milliseconds(source.leader_observation_grace_ms_);
   cut.observation_ttl_ms_ = source.observation_ttl_ms_;
   cut.diagnostics_ = source.diagnostics_->Snapshot();
-  // Read the change index before the locked snapshot so a commit landing in
-  // between leaves the cache key older than the true index; the next query
-  // then rebuilds instead of serving the stale view indefinitely.
-  const std::uint64_t state_change =
-      source.state_machine_->state_change_index();
-  if (!source.cached_view_valid_ ||
-      state_change != source.cached_state_change_) {
-    source.cached_view_ = source.state_machine_->StatusSnapshot();
-    source.cached_state_change_ = state_change;
-    source.cached_view_valid_ = true;
+  // Read the applied index before the locked snapshot. If a commit lands
+  // between them, the snapshot sees it; if one lands afterward, the next cut
+  // refreshes. Advance() can move this index without changing stores, but the
+  // detector joins on this exact index, so a state-change-only key would
+  // leave its otherwise-current diagnostics mismatched indefinitely.
+  const std::uint64_t applied_index =
+      source.state_machine_->last_commit_index();
+  if (!source.cached_view_ ||
+      applied_index != source.cached_view_->applied_index_) {
+    source.cached_view_ = std::make_shared<const MetaCommittedStatusView>(
+        source.state_machine_->StatusSnapshot());
   }
   cut.committed_ = source.cached_view_;
   cut.now_unix_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -680,7 +680,7 @@ struct MetaSentinelServer::Core {
         // the subscription signals lost continuity, not a durable event
         // history.
         if (!core->committed_signal_ ||
-            cut->committed_.applied_index_ >=
+            cut->committed_->applied_index_ >=
                 core->committed_signal_->load(std::memory_order_acquire)) {
           for (const auto& event : core->events_.Observe(*cut)) {
             for (auto [connection, session] : core->live_) {
@@ -696,6 +696,9 @@ struct MetaSentinelServer::Core {
           }
         }
       }
+      // Release this iteration's snapshots before suspending. A cache refresh
+      // in the next iteration then retains old storage only for active reads.
+      cut.reset();
       if (!(co_await bycorf::SleepFor(*core->worker_,
                                       std::chrono::milliseconds(10)))
                .ok())

@@ -50,7 +50,7 @@ std::optional<NumericEndpoint> PublishableClientEndpoint(
 // data_nodes_ is identity-store ordered (sorted by node_id_).
 const MetaNodeRecord* FindNodeRecord(const MetaDiscoveryCut& cut,
                                      const std::string& node_id) {
-  const auto& nodes = cut.committed_.data_nodes_;
+  const auto& nodes = cut.committed_->data_nodes_;
   const auto it =
       std::lower_bound(nodes.begin(), nodes.end(), node_id,
                        [](const MetaNodeRecord& node, const std::string& id) {
@@ -263,14 +263,14 @@ bool CoversFullSlotSpace(const MetaCommittedStatusView& view,
 const MetaCommittedStatusGroup* DiscoveryServiceGroup(
     const MetaDiscoveryCut& cut) {
   const MetaClusterLifecycleState& lifecycle =
-      cut.committed_.cluster_lifecycle_;
+      cut.committed_->cluster_lifecycle_;
   if (lifecycle.state_ != MetaClusterLifecycle::kCreated ||
       lifecycle.client_mode_ != std::optional(ClientMode::kSingle) ||
-      cut.committed_.groups_.size() != 1) {
+      cut.committed_->groups_.size() != 1) {
     return nullptr;
   }
-  const MetaCommittedStatusGroup& group = cut.committed_.groups_.front();
-  if (!CoversFullSlotSpace(cut.committed_, group.topology_.group_id_)) {
+  const MetaCommittedStatusGroup& group = cut.committed_->groups_.front();
+  if (!CoversFullSlotSpace(*cut.committed_, group.topology_.group_id_)) {
     return nullptr;
   }
   return &group;
@@ -314,7 +314,8 @@ MetaDiscoveryMasterFlags MasterFlags(const MetaDiscoveryCut& cut,
   if (diagnostics.leader_term_ != 0 &&
       diagnostics.leader_term_ == cut.runtime_.leader_term_ &&
       diagnostics.leader_authority_eligibility_revision_ ==
-          cut.runtime_.leader_authority_eligibility_revision_) {
+          cut.runtime_.leader_authority_eligibility_revision_ &&
+      diagnostics.evaluated_applied_index_ == cut.committed_->applied_index_) {
     const auto status =
         std::find_if(diagnostics.statuses_.begin(), diagnostics.statuses_.end(),
                      [&](const MetaAutomaticFailoverStatus& item) {
@@ -435,7 +436,7 @@ void EncodeDiscoveryReplicasReply(ReplyBuilder& reply,
 
 std::vector<MetaMemberRecord> DiscoverySentinels(const MetaDiscoveryCut& cut) {
   std::vector<MetaMemberRecord> peers;
-  for (const auto& member : cut.committed_.meta_members_) {
+  for (const auto& member : cut.committed_->meta_members_) {
     if (member.retired_ || member.server_id_ == cut.local_meta_id_ ||
         member.sentinel_endpoint_.empty() ||
         std::find(cut.effective_meta_ids_.begin(),

@@ -41,6 +41,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -55,15 +56,18 @@
 namespace lavik::meta {
 
 // One consistent read of every input a discovery answer may use. `committed_`
-// is the compact committed projection; `runtime_` and `diagnostics_` are the
-// volatile leader-local registries; `observation_grace_active_` marks the
-// post-election window in which a node this leader has never observed is
-// unverified rather than down: absence of observation is not failure evidence.
+// owns a share of the immutable compact committed projection, so a worker can
+// replace its cached view without invalidating an in-flight cut. Callers must
+// set it before passing a cut to discovery functions. `runtime_` and
+// `diagnostics_` are the volatile leader-local registries;
+// `observation_grace_active_` marks the post-election window in which a node
+// this leader has never observed is unverified rather than down: absence of
+// observation is not failure evidence.
 // The Owner keeps its publication and flags then (committed state alone gates
 // the Primary), while an unverified member stays out of the replica listing so
 // read pools cannot select it.
 struct MetaDiscoveryCut {
-  MetaCommittedStatusView committed_;
+  std::shared_ptr<const MetaCommittedStatusView> committed_;
   MetaDataControlRuntimeSnapshot runtime_;
   MetaAutomaticFailoverDiagnosticsSnapshot diagnostics_;
   std::int64_t now_unix_ms_ = 0;
