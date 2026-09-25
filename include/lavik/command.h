@@ -628,6 +628,7 @@ void ConnectionClosed() noexcept;
 
 // CLIENT metadata is worker-local. Replication socket handoff unregisters on
 // the accepting worker and registers the same identity on the owning worker.
+// Returns the connection boundary captured at registration for dispatch checks.
 std::uint64_t RegisterClientConnection(
     std::uint64_t id, int fd, std::string address, bool tls,
     bool replica = false, std::uint64_t replication_session_id = 0);
@@ -637,6 +638,8 @@ bool ClientConnectionRetired(std::uint64_t generation) noexcept;
 // Publishes a new connection boundary and notifies socket-owning workers to
 // close older ordinary/PubSub connections. New connections and established
 // replication/donor sessions are excluded; no callback retains socket pointers.
+// Call on a runtime worker after closing the applicable data admission. Socket
+// cleanup is asynchronous; this does not replace internal mutation drain.
 void RetireClientConnections() noexcept;
 void SetClientReplicationSession(std::uint64_t id,
                                  std::uint64_t replication_session_id) noexcept;

@@ -2707,6 +2707,10 @@ class ReplicationManager::ReplicationGroup {
   // reach it without following this pImpl. Bit zero is serving-open and the
   // remaining bits are a monotonic dataset generation.
   std::atomic<std::uint64_t>* const serving_generation_;
+  // Worker zero remembers population continuity independently of the read
+  // generation: Cluster link loss closes reads but must retain connections
+  // until a later FULL/proof invalidation actually replaces the population.
+  bool client_population_complete_ = false;
   const bool meta_managed_;
   const bool single_client_mode_;
   // The existing discovery cancellation set also covers target-session

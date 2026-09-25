@@ -1154,7 +1154,9 @@ TEST(AuthorityGuardTest,
 }
 
 TEST(AuthorityGuardTest, FinalMutationRecheckTracksAggregateOutcome) {
-  TestAuthorityControl control;
+  static unsigned retired = 0;
+  retired = 0;
+  TestAuthorityControl control([]() noexcept { ++retired; });
   ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), {}).ok());
   const std::array<std::uint16_t, 1> slots{kSlotInA};
   const auto started = control.authority.CaptureAndAdmit(
@@ -1162,6 +1164,9 @@ TEST(AuthorityGuardTest, FinalMutationRecheckTracksAggregateOutcome) {
   const auto rejected = control.authority.CaptureAndAdmit(
       MakeRequest(slots, /*is_write=*/true), lavik::cluster::MonotonicTime{});
 
+  AuthorityInFlightGuards guards;
+  ASSERT_EQ(control.authority.RegisterAndRecheck(started, 0, {}, &guards),
+            RecheckResult::kOk);
   EXPECT_EQ(control.authority.RecheckAtMutation(
                 started, lavik::cluster::MonotonicTime{}),
             RecheckResult::kOk);
@@ -1178,6 +1183,12 @@ TEST(AuthorityGuardTest, FinalMutationRecheckTracksAggregateOutcome) {
             RecheckResult::kReject);
   EXPECT_TRUE(started.mutation_started());
   EXPECT_TRUE(started.final_recheck_failed());
+  EXPECT_EQ(retired, 1U);
+  // TCP retirement does not complete internal mutation work or erase the
+  // uncertain-outcome marker. The original guard still owns the drain.
+  EXPECT_EQ(started.state()->GroupInFlightCount(kGroupA), 1U);
+  guards.clear();
+  EXPECT_EQ(started.state()->GroupInFlightCount(kGroupA), 0U);
 
   EXPECT_EQ(control.authority.RecheckAtMutation(
                 rejected, lavik::cluster::MonotonicTime{}),

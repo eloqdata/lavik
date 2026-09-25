@@ -1939,6 +1939,12 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         co_return absl::InvalidArgumentError(
             "replication handshake must be the first isolated command");
       }
+      // The isolated authenticated native command is the classification
+      // boundary. Leave the ordinary registry before any handshake await;
+      // native admission and its own registry now govern socket lifetime.
+      // Before this command arrives an AUTH-only socket is indistinguishable
+      // from an idle data client on the shared listener.
+      UnregisterClientConnection(ctx.conn_id_);
       absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
       if (!flushed.ok()) co_return flushed;
       ConnectionClosed();
@@ -1947,7 +1953,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       const std::string address =
           peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
       const bool tls = stream.IsTls();
-      UnregisterClientConnection(ctx.conn_id_);
       command_memory.Release();
       co_return co_await replication_->ServeNativeConnection(
           stream, std::move(command.args_), ctx.conn_id_, address, tls);
@@ -2010,6 +2015,10 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
           [[unlikely]] {
         PublishMonitorMessage(std::move(monitor_message));
       }
+      // Flushing an earlier pipelined reply may suspend across a retirement
+      // and regrant; the connection itself must still be current at dispatch.
+      if (ClientConnectionRetired(ctx.retirement_generation_))
+        co_return absl::OkStatus();
       reply = co_await DispatchCommand(ctx, request, ctx.reply_builder_);
     }
     if (ctx.queued_.size() > queued_before) {

@@ -2060,6 +2060,12 @@ auto ReplicationManager::ReplicationGroup::
   }
 
   StoreRole(ReplicationRole::kSyncing, std::memory_order_release);
+  // Promotion has closed read admission without destroying the Ready proof.
+  // KEYS itself can own an exclusive DB gate, so retire client senders before
+  // the preparation runner tries to acquire those gates or join operations.
+  // A replica-to-syncing transition is not a Redis role change; unlike the
+  // native primary entry point it therefore needs this explicit retirement.
+  RetireClientConnections();
   storage_->SetReplicaLoading(true);
   storage_->SetExpirationAuthority(false);
   PublishHeartbeatObservation();
@@ -6049,18 +6055,24 @@ auto ReplicationManager::ReplicationGroup::StoreRole(
   const std::uint64_t current =
       serving_generation_->load(std::memory_order_relaxed);
   const bool was_serving = (current & kServingOpen) != 0;
-  const bool complete_replica =
-      meta_managed_ && single_client_mode_ &&
-      native_dataset_valid_.load(std::memory_order_acquire) &&
+  const bool complete_population =
+      meta_managed_ && native_dataset_valid_.load(std::memory_order_acquire) &&
       !failed_stopped_.load(std::memory_order_acquire) &&
       cluster_rebuild_ != nullptr &&
       cluster_rebuild_->ready_token_.has_value() &&
       cluster_rebuild_->state_.load(std::memory_order_acquire) ==
           ReplicationGroupState::kReady;
+  const bool complete_replica = single_client_mode_ && complete_population;
+  // A validated promotion closes reads before acquiring DB gates, including
+  // gates held by slow streamed replies. Cancellation clears reconfiguration
+  // before calling StoreRole, reopening the retained proof at a new generation.
+  const bool promotion_preparing =
+      cluster_promotion_prepare_ != nullptr && replica_reconfiguration_running_;
   const bool will_serve =
-      next == ReplicationRole::kMaster ||
-      (meta_managed_ && single_client_mode_ ? complete_replica
-                                            : next == ReplicationRole::kOnline);
+      !promotion_preparing && (next == ReplicationRole::kMaster ||
+                               (meta_managed_ && single_client_mode_
+                                    ? complete_replica
+                                    : next == ReplicationRole::kOnline));
   const bool same_population_reconnect = complete_replica &&
                                          previous != ReplicationRole::kMaster &&
                                          next != ReplicationRole::kMaster;
@@ -6070,13 +6082,19 @@ auto ReplicationManager::ReplicationGroup::StoreRole(
     if (generation == 0) generation = 2;
     serving_generation_->store(generation | (will_serve ? kServingOpen : 0),
                                std::memory_order_release);
-    // Authority-only loss has its own connection boundary. Population and
-    // role replacement also retire clients, including subscribers that
-    // reconnected after an earlier authority fence. A complete replica's
-    // transport reconnect deliberately never enters this branch.
-    if (meta_managed_) RetireClientConnections();
     NotifyServingGenerationChanged();
   }
+
+  // Readability can close during a Cluster transport reconnect without
+  // destroying its population. Only actual population loss or a Redis role
+  // change retires clients, including those accepted after an authority fence.
+  const bool role_changed = (previous == ReplicationRole::kMaster) !=
+                            (next == ReplicationRole::kMaster);
+  if (meta_managed_ &&
+      (role_changed || (client_population_complete_ && !complete_population))) {
+    RetireClientConnections();
+  }
+  client_population_complete_ = complete_population;
 
   // Closing publishes the generation fence before the non-serving role.
   // Opening publishes the role first and the open bit last, so no command

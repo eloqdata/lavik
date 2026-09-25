@@ -1351,7 +1351,7 @@ if (BUILD_TESTING)
                 ${sentinel_client_go_dir}/go.sum
         VERBATIM)
       add_custom_target(lavik_sentinel_client_go ALL DEPENDS ${sentinel_client_go_bin})
-      foreach(scenario meta data expiry controlled fault)
+      foreach(scenario meta data expiry controlled fault gap)
         add_test(NAME meta_integration.sentinel_ha_${scenario}
           COMMAND ${CMAKE_COMMAND} -E env
             "LAVIK_SENTINEL_REDIS_PY=${LAVIK_CLUSTER_CLIENT_REDIS_PY}"

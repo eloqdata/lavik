@@ -307,6 +307,19 @@ def uncontrolled_crash_failover(root):
                     raise AssertionError(f"expired waiter replied {reply!r}")
             finally:
                 meta.resume()
+            H.wait_until(
+                "Owner reauthorized before crash",
+                30,
+                lambda: F.redis_call(source, ["SET", "crash-ready", "yes"]) == "OK",
+            )
+            pending = pool.submit(blocked_call, source, "BLPOP", "crash-list", 0)
+            H.wait_until(
+                "new crash waiter registered",
+                10,
+                lambda: "blocked_clients:1\r\n"
+                in F.redis_call(source, ["INFO", "clients"]),
+            )
+            assert not pending.done()
             # Crash the primary with the waiter attached. The connection dies
             # with the process: the waiter terminates honestly, never with a
             # consumed element.
@@ -319,13 +332,14 @@ def uncontrolled_crash_failover(root):
                 raise AssertionError(
                     f"crashed owner's waiter unexpectedly replied {reply!r}"
                 )
+            H.wait_until(
+                "replica promoted and serving writes",
+                60,
+                lambda: F.redis_call(target, ["SET", "promoted-ready", "yes"]) == "OK",
+            )
             promoted = Client(target)
             try:
-                H.wait_until(
-                    "replica promoted and serving writes",
-                    60,
-                    lambda: promoted.call("LPUSH", "crash-list", "elem") == 1,
-                )
+                assert promoted.call("LPUSH", "crash-list", "elem") == 1
                 assert promoted.call("BLPOP", "crash-list", 1) == ["crash-list", "elem"]
             finally:
                 promoted.close()

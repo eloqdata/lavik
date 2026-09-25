@@ -1204,8 +1204,13 @@ report `master`. `INFO replication` adds `lavik_owner_authority` (a current
 keyed read is admitted as Owner) and `lavik_data_readable` (Owner or legal replica
 admission plus a readable population). These instantaneous diagnostics are not
 an authorization token for subsequent requests. Serving population invalidation
-and primary/replica role changes retire ordinary clients; a complete Single
-replica's same-population transport reconnect preserves their connections.
+and primary/replica role changes retire ordinary clients; a complete
+replica's same-population transport reconnect preserves its connections even
+when Cluster read admission temporarily closes with the link.
+Promotion preparation closes serving admission and retires client senders
+before acquiring database gates and joining active database guards. This lets streamed replies release their
+guards through normal disconnect cleanup without making promotion wait for a
+slow client to consume output; storage work still drains before durability cuts.
 
 Sentinel normally queues `REPLICAOF`/`SLAVEOF`, `CONFIG REWRITE`, and `CLIENT
 KILL TYPE normal|pubsub` in one `MULTI`/`EXEC`. Lavik accepts these commands

@@ -64,6 +64,46 @@ def run(fixture, go_binary, directory, scenario):
                 for meta in fixture.metas:
                     meta.proc.send_signal(signal.SIGCONT)
             start = time.monotonic()
+        elif scenario == "gap":
+            old = Client(owner.redis_port)
+            old.command("PING")
+            for proxy in fixture.control_proxies:
+                proxy.isolate(D.OWNER)
+            try:
+                time.sleep(3)
+                HA.assert_closed(old)
+                gap = Client(owner.redis_port)
+                try:
+                    assert gap.command("SUBSCRIBE", channel)[0] == b"subscribe"
+                    expected = [
+                        b"127.0.0.1",
+                        str(fixture.data_proxies[D.REPLICA].listen_port).encode(),
+                    ]
+                    H.wait_until(
+                        "new Owner publishes while old control is isolated",
+                        30,
+                        lambda: fixture.sentinel_command(
+                            "SENTINEL", "GET-MASTER-ADDR-BY-NAME", D.GROUP
+                        )
+                        == expected,
+                    )
+                    # New-Owner readiness alone cannot migrate this subscriber.
+                    assert gap.command("PING") == [b"pong", b""]
+                    for proxy in fixture.control_proxies:
+                        proxy.isolate(None)
+                    start = time.monotonic()
+                    H.wait_until(
+                        "old Owner demoted after healing control",
+                        30,
+                        lambda: owner.command_head(["ROLE"]) == "*5",
+                    )
+                    HA.assert_closed(gap)
+                finally:
+                    gap.close()
+            finally:
+                old.close()
+                for proxy in fixture.control_proxies:
+                    proxy.isolate(None)
         elif scenario == "controlled":
             accepted = subprocess.check_output(
                 [
@@ -127,7 +167,7 @@ def run(fixture, go_binary, directory, scenario):
         publisher.start()
         try:
             pending = dict(subscriptions)
-            deadline = time.monotonic() + 30
+            deadline = start + 30
             while pending and time.monotonic() < deadline:
                 for name, sub in list(pending.items()):
                     try:

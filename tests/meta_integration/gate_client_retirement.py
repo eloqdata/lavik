@@ -12,7 +12,6 @@ import sys
 import tempfile
 
 import gate_failover as F
-import time
 
 from gate_native_replication import C, H, Client, pair, ready, rejects
 
@@ -32,6 +31,7 @@ def expiry(root):
         ready(meta)
         clients = [Client(owner) for _ in range(8)]
         follower = Client(replica)
+        slow = Client(owner)
         fresh = replacement_sub = None
         try:
             for client in clients:
@@ -54,6 +54,14 @@ def expiry(root):
                 10,
                 lambda: "blocked_clients:1\r\n" in writer.call("INFO", "clients"),
             )
+            # A blocked sender must release its request without the reader
+            # consuming the pending reply. Socket EOF alone cannot prove this:
+            # the kernel may retain bytes after the serving coroutine is gone.
+            assert writer.call("SET", "slow-reply", b"x" * (2 * 1024 * 1024)) == "OK"
+            slow_id = slow.call("CLIENT", "ID")
+            slow.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            slow.socket.sendall(C.encode_resp(["GET", "slow-reply"]) * 32)
+            assert select.select([slow.socket], [], [], 10)[0]
             meta.proc.send_signal(signal.SIGSTOP)
             try:
                 for index, client in enumerate(clients):
@@ -61,7 +69,21 @@ def expiry(root):
                 # Losing Owner authority is not losing a legitimate replica's
                 # complete population, and it must not close this old socket.
                 assert follower.call("GET", "{native}seed") == "baseline"
+                replica_info = follower.call("INFO", "replication")
+                assert "role:slave\r\n" in replica_info
+                assert "lavik_owner_authority:0\r\n" in replica_info
+                assert "lavik_data_readable:1\r\n" in replica_info
                 fresh = Client(owner)
+                H.wait_until(
+                    "slow sender cleaned without reading its reply",
+                    5,
+                    lambda: fresh.call("CLIENT", "LIST", "ID", slow_id) == "",
+                )
+                H.wait_until(
+                    "retired blocking waiter released",
+                    5,
+                    lambda: "blocked_clients:0\r\n" in fresh.call("INFO", "clients"),
+                )
                 assert fresh.call("ROLE")[0] == "master"
                 info = fresh.call("INFO", "replication")
                 assert "role:master\r\n" in info
@@ -95,6 +117,7 @@ def expiry(root):
             for client in (fresh, replacement_sub):
                 if client is not None:
                     client.close()
+            slow.close()
             follower.close()
             for client in clients:
                 client.close()

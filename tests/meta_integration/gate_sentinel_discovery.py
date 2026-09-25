@@ -221,7 +221,11 @@ class DiscoveryFixture:
             time.sleep(0.05)
         else:
             raise H.Failure("initial Meta identities did not converge")
-        seed = self.leader.data_control_endpoint
+        seed = getattr(
+            self.leader,
+            "advertised_data_control_endpoint",
+            self.leader.data_control_endpoint,
+        )
         for data in self.data_nodes:
             data.seed = seed
             # wait_ready=True blocks on the metrics-listener/bootstrap barrier
