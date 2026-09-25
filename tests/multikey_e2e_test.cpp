@@ -1231,13 +1231,13 @@ int main(int argc, char** argv) {
     ServerProcess standby_server(argv[1], port, standby_data, log_path, {}, {},
                                  false, 4, {}, "1000");
     RespClient standby_control = ConnectReady(port);
-    const std::string standby_payload(7 * 1024 * 1024, 's');
-    // Oversized parent keys deliberately use whole-value String storage.
-    // This fixture exercises ordinary-stream prefetch, not grouped tx IO.
+    const std::string standby_payload = "s";
+    // Large keys keep these compact Strings in ordinary records. The second
+    // record rolls over the 8 MiB block while standby prefetch is paused.
     const std::string standby_leader =
-        std::string(8193, 'k') + "leader{standby}";
+        std::string(7 * 1024 * 1024, 'k') + "leader{standby}";
     const std::string standby_follower =
-        std::string(8193, 'k') + "follower{standby}";
+        std::string(7 * 1024 * 1024, 'k') + "follower{standby}";
     Expect(standby_control.Command({"SET", standby_leader, standby_payload}),
            "+OK", "create ordinary stream and request its standby");
     const auto standby_marker_deadline = std::chrono::steady_clock::now() + 30s;
@@ -1262,9 +1262,9 @@ int main(int argc, char** argv) {
       Fail("standby prefetch stranded an ordinary rollover");
     }
     Expect(standby_waiter.get(), "+OK", "ordinary standby rollover");
-    Expect(standby_control.Command({"STRLEN", standby_leader}), ":7340032",
+    Expect(standby_control.Command({"STRLEN", standby_leader}), ":1",
            "standby leader value length");
-    Expect(standby_control.Command({"STRLEN", standby_follower}), ":7340032",
+    Expect(standby_control.Command({"STRLEN", standby_follower}), ":1",
            "standby follower value length");
     standby_server.Stop();
 #endif

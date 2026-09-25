@@ -1773,8 +1773,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   // as incremental segment writes. Compensation retains its saved layout and
   // undo receipt; grouped compensation has its own graph restore path.
   if (!grouped && !replacement_undo && kind == RecordKind::kValue &&
-      value_type == ValueType::kString &&
-      ShouldGroupString(key.size(), value.size())) {
+      value_type == ValueType::kString && ShouldGroupString(value.size())) {
     assert(!commit_retirements && !committed_sequence);
     if (logical_size != value.size())
       co_return absl::InvalidArgumentError(
@@ -1808,6 +1807,11 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
        (replica_mutation_sequence.has_value() &&
         *replica_mutation_sequence != grouped->sequence_))) {
     co_return absl::InvalidArgumentError("invalid grouped mutation sequence");
+  }
+  if (kind == RecordKind::kValue && value_type == ValueType::kString &&
+      !grouped && ShouldGroupString(logical_size)) {
+    co_return absl::FailedPreconditionError(
+        "large String must use grouped storage");
   }
   const std::uint64_t mutation_sequence =
       grouped != nullptr                      ? grouped->sequence_

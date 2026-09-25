@@ -239,10 +239,13 @@ manifest. Each extent reference identifies a dedicated extent block by block ID,
 epoch, byte count, and payload checksum. The extent block header repeats its
 index, length, and checksum so reads and recovery can validate the complete
 root-to-child identity.
-Grouped Strings split their value into fixed 8 KiB ordinary group records;
-their root carries byte length and graph identity. The grouped lifecycle,
-including direct segment indexing and root-only TTL updates, is described in
-[Grouped collections](09-grouped-collections.md).
+Strings of at least 16 KiB split their value into fixed 8 KiB group records,
+including when the key is larger than a segment. Smaller Strings retain their
+compact representation. Older whole-value large String records require a fresh
+import; startup rejects them.
+Grouped String roots carry byte length and graph identity. The grouped
+lifecycle, including direct segment indexing and root-only TTL updates, is
+described in [Grouped collections](09-grouped-collections.md).
 
 ## Startup and recovery
 

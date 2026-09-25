@@ -349,8 +349,7 @@ void ExpectEventually(RespClient& client,
   Expect(actual, expected, operation);
 }
 
-// Comfortably past the inline limit of one block minus its header, so each
-// value lands in dedicated extent blocks.
+// A Hash field is indivisible; values larger than a block use extent blocks.
 constexpr std::size_t kExternalBytes = 9ULL * 1024 * 1024;
 constexpr int kExternalKeys = 3;
 
@@ -376,18 +375,16 @@ int main(int argc, char** argv) {
     (void)::unlink(data_path.c_str());
     (void)::unlink(log_path.c_str());
 
-    // A single staging buffer must be recycled between these full blocks.
+    // A single staging buffer must be recycled between these large records.
     // Nonzero prior contents must not escape into the next block's headers,
     // record alignment bytes, or the page tails of periodic partial flushes.
     // Disable checkpoints so the restart validates the actual record stream.
     CreateDataFile(data_path, 256ULL * 1024 * 1024);
     std::vector<std::pair<std::string, std::string>> reused_records;
     for (int i = 0; i < 4; ++i) {
-      const std::string key = "reuse-full-" + std::to_string(i);
-      const std::size_t bytes = lavik::storage::kStorageBlockBytes -
-                                lavik::storage::kBlockHeaderBytes -
-                                lavik::storage::RecordHeaderBytes(key.size());
-      reused_records.emplace_back(key, std::string(bytes, 'F'));
+      const std::string key =
+          std::string(7 * 1024 * 1024, 'K') + "reuse-full-" + std::to_string(i);
+      reused_records.emplace_back(key, "F");
     }
     for (int i = 0; i < 32; ++i) {
       const std::size_t bytes = i < 8 ? i : 4093 + i;
@@ -429,19 +426,19 @@ int main(int argc, char** argv) {
 
     const std::string value(kExternalBytes, 'X');
     const std::string inline_combined_key(6ULL * 1024 * 1024, 'i');
-    const std::string inline_combined_value(1ULL * 1024 * 1024, 'I');
-    const std::string shared_extent_key(6ULL * 1024 * 1024, 's');
-    const std::string shared_extent_value(6ULL * 1024 * 1024, 'S');
+    const std::string inline_combined_value(12ULL * 1024, 'I');
+    const std::string shared_extent_key(9ULL * 1024 * 1024, 's');
+    const std::string shared_extent_value = "S";
 
     // Written under four workers.
     {
       ServerProcess server(argv[1], port, data_path, log_path, 4);
       RespClient client = Connect(port);
       for (int i = 0; i < kExternalKeys; ++i) {
-        Expect(client.Command({"SET", ExternalKey(i), value}), "+OK",
-               "external SET");
-        Expect(client.Command({"STRLEN", ExternalKey(i)}),
-               ":" + std::to_string(kExternalBytes), "external STRLEN");
+        Expect(client.Command({"HSET", ExternalKey(i), "field", value}), ":1",
+               "external HSET");
+        Expect(client.Command({"HSTRLEN", ExternalKey(i), "field"}),
+               ":" + std::to_string(kExternalBytes), "external HSTRLEN");
       }
       Expect(
           client.Command({"SET", inline_combined_key, inline_combined_value}),
@@ -463,13 +460,13 @@ int main(int argc, char** argv) {
       ServerProcess server(argv[1], port, data_path, log_path, 2);
       RespClient client = ConnectReady(port);
       for (int i = 0; i < kExternalKeys; ++i) {
-        Expect(client.Command({"STRLEN", ExternalKey(i)}),
+        Expect(client.Command({"HSTRLEN", ExternalKey(i), "field"}),
                ":" + std::to_string(kExternalBytes),
-               "recovered external STRLEN");
+               "recovered external HSTRLEN");
         const std::int64_t length =
-            client.CommandBulkLength({"GET", ExternalKey(i)}, 'X');
+            client.CommandBulkLength({"HGET", ExternalKey(i), "field"}, 'X');
         if (length != static_cast<std::int64_t>(kExternalBytes)) {
-          Fail("recovered external GET returned " + std::to_string(length));
+          Fail("recovered external HGET returned " + std::to_string(length));
         }
       }
       if (client.CommandBulkLength({"GET", inline_combined_key}, 'I') !=
@@ -483,10 +480,10 @@ int main(int argc, char** argv) {
       // Overwriting retires the extents, which reclaims them through their
       // owning worker.
       for (int i = 0; i < kExternalKeys; ++i) {
-        Expect(client.Command({"SET", ExternalKey(i), "small"}), "+OK",
+        Expect(client.Command({"HSET", ExternalKey(i), "field", "small"}), ":0",
                "external overwrite");
-        Expect(client.Command({"STRLEN", ExternalKey(i)}), ":5",
-               "overwritten STRLEN");
+        Expect(client.Command({"HSTRLEN", ExternalKey(i), "field"}), ":5",
+               "overwritten HSTRLEN");
       }
       Expect(client.Command({"SET", inline_combined_key, "small"}), "+OK",
              "inline combined overwrite");
@@ -503,7 +500,8 @@ int main(int argc, char** argv) {
       RespClient client = ConnectReady(port);
       for (int i = 0; i < kExternalKeys; ++i) {
         const std::string key = ExternalKey(i);
-        ExpectEventually(client, {"STRLEN", key}, ":5", "post-reclaim STRLEN");
+        ExpectEventually(client, {"HSTRLEN", key, "field"}, ":5",
+                         "post-reclaim HSTRLEN");
       }
       ExpectEventually(client, {"STRLEN", inline_combined_key}, ":5",
                        "post-reclaim inline combined STRLEN");

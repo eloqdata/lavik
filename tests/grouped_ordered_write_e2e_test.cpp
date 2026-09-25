@@ -175,6 +175,33 @@ TEST(GroupedStringWriteE2e, FixedSegmentsPointWritesTtlAndRecovery) {
   EXPECT_EQ(client.Command({"GET", "string"}).text_, value);
 }
 
+TEST(GroupedStringWriteE2e, LongKeyUsesSegmentsAndRecovers) {
+  PrivateDisk disk;
+  const std::string key = std::string(8193, 'k') + "{long-string}";
+  std::string value(3 * kStringGroupBytes + 29, 'a');
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"SET", key, value}).text_, "OK");
+    ASSERT_EQ(client.Command({"GETRANGE", key, "8190", "8194"}).text_, "aaaaa");
+    ASSERT_EQ(client.Command({"SETRANGE", key, "8191", "BC"}).text_,
+              std::to_string(value.size()));
+    value.replace(8191, 2, "BC");
+    ASSERT_EQ(client.Command({"GETRANGE", key, "8190", "8194"}).text_, "aBCaa");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // The private disk contains one key. External-key record headers expose an
+  // empty key view until their extents are loaded.
+  EXPECT_EQ(disk.LatestRootGrouped({}), true);
+  const auto groups = disk.Auxiliaries({});
+  ASSERT_FALSE(groups.empty());
+  EXPECT_EQ(groups.rbegin()->second.size(), 2);
+  Server recovered(disk);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"GET", key}).text_, value);
+}
+
 TEST(GroupedStringWriteE2e, TransactionsTransferAndRdbKeepStringSemantics) {
   PrivateDisk disk;
   std::string value(8192 * 4, 'v');

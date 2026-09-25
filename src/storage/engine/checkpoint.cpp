@@ -1811,6 +1811,11 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
         const std::string_view key(key_data, key_bytes);
         const bool external = (flags & kExternal) != 0;
         const bool key_external = (flags & kKeyExternal) != 0;
+        if (kind == RecordKind::kValue && value_type == ValueType::kString &&
+            ShouldGroupString(entry.logical_size_)) {
+          return absl::DataLossError(
+              "unsupported whole-value large String; reimport data");
+        }
         if (external != (extent_count != 0) ||
             !RecordLocation::CanEncodeBlockIdentity(entry_block_id,
                                                     allocation_epoch)) {

@@ -545,6 +545,22 @@ TEST(GroupedRecoveryE2e, RestoresRootAndAuxiliaryWithoutExposingExtraKeys) {
   EXPECT_EQ(server.Command({"HGET", "hash", "field"}), std::string(128, 'v'));
 }
 
+TEST(GroupedRecoveryE2e, RejectsWholeValueLargeStringOnStartup) {
+  RecordImage image;
+  const std::string value(kCollectionPromotionBytes + 1, 'v');
+  image.GroupPayload(
+      "old-string", value,
+      RecordHeader{.value_type_ = ValueType::kString,
+                   .external_ = true,
+                   .logical_size_ = static_cast<std::uint32_t>(value.size()),
+                   .mutation_sequence_ = 1});
+  image.Finish();
+  ChildServer server(image);
+  EXPECT_NE(server.Wait(), 0);
+  EXPECT_NE(server.Log().find("unsupported whole-value large String"),
+            std::string::npos);
+}
+
 TEST(GroupedRecoveryE2e, IgnoresUncommittedAndFutureGroupVersions) {
   RecordImage image;
   auto group = SingleGroup();

@@ -582,6 +582,13 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           ++records;
           continue;
         }
+        if (record.kind_ == RecordKind::kValue &&
+            record.value_type_ == ValueType::kString && !record.grouped_ &&
+            !record.auxiliary_group_ &&
+            ShouldGroupString(record.logical_size_)) {
+          co_return absl::DataLossError(
+              "unsupported whole-value large String; reimport data");
+        }
         const std::byte* payload =
             recovery.buffer_.data_ + record_offset + record.header_bytes_;
         const auto payload_span =
@@ -595,11 +602,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           const std::uint64_t extent_bytes =
               record.logical_size_ +
               (record.key_external_ ? record.key_bytes_ : 0);
-          auto decoded = DecodeManifest(
-              payload_span, extent_bytes,
-              record.kind_ != RecordKind::kValue ||
-                  (record.value_type_ == ValueType::kString &&
-                   !record.grouped_ && !record.auxiliary_group_));
+          auto decoded = DecodeManifest(payload_span, extent_bytes,
+                                        record.kind_ != RecordKind::kValue);
           if (!decoded.ok()) {
             co_return decoded.status();
           }

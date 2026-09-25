@@ -50,9 +50,8 @@ visible length is independent of the internal record count. See
 [Streams](12-streams.md) for their access and logical-format contracts.
 
 String writes promote at the same 16 KiB encoded-size threshold as collections.
-Keys larger than 8 KiB use whole-value String storage: auxiliary records carry
-their parent key, so grouping such values would amplify key storage without a
-bound relative to their payload. These exceptional keys can still use extents.
+Large Strings use segments regardless of key length. Auxiliary records carry
+their parent key, so long keys increase space consumption for each segment.
 Segments have dense, one-based identifiers derived from byte offsets. All but
 the tail contain exactly 8 KiB; extension materializes zero-filled gaps.
 The resident String directory and physical index use direct vector indexing,
@@ -63,9 +62,9 @@ For grouped Strings, GETRANGE/GETBIT read only intersecting segments;
 SETRANGE/SETBIT/APPEND replace intersecting segments and any changed tail link
 through the shared grouped publication boundary. General whole-value callbacks
 materialize grouped Strings and reuse unchanged segments in their after-image.
-Strings below the promotion threshold or with keys larger than 8 KiB use
-whole-value reads and writes, with extents where needed. This cutoff bounds
-space amplification independently of on-disk compatibility.
+Strings below the promotion threshold use compact whole-value reads and writes,
+with extents where needed for long keys. Older whole-value large Strings are
+unsupported on disk; import them again into a fresh data set.
 
 ## Identity and ownership
 
