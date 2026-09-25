@@ -874,23 +874,13 @@ bool IsFunctionCatalogMutation(const CommandRequest& request) {
 }
 
 bool UsesLocalGroupAuthority(const CommandRequest& request) {
-  return IsFunctionCatalogMutation(request) ||
+  return request.kind_ == CommandKind::kFlushDb ||
+         request.kind_ == CommandKind::kFlushAll ||
+         IsFunctionCatalogMutation(request) ||
          (request.kind_ == CommandKind::kFunction &&
           request.args_.size() >= 2 &&
           (CmpCaseInsensitive(request.args_[1], "dump") ||
            CmpCaseInsensitive(request.args_[1], "list")));
-}
-
-// Global keyspace clearing is not yet wired into Group authority.
-std::string_view UnscopedClusterMutation(const CommandRequest& request) {
-  switch (request.kind_) {
-    case CommandKind::kFlushDb:
-      return "FLUSHDB";
-    case CommandKind::kFlushAll:
-      return "FLUSHALL";
-    default:
-      return {};
-  }
 }
 
 // Runs the cluster admission gate for one dispatched command. Returns true
@@ -2923,6 +2913,13 @@ Task<CommandReply> ExecuteFlush(const CommandRequest& request,
       }
     }
 
+    LAVIK_FAULT_INJECT({
+      auto paused = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_FLUSH_BEFORE_DRAIN_HOLD_FILE");
+      if (!paused.ok())
+        co_return BuiltReply(
+            reply_builder.AppendError(absl::StrCat("ERR ", paused.message())));
+    });
     for (const std::uint8_t db_id : dbs) {
       while (DbGateHasActiveOperations(db_id)) {
         absl::Status waited = co_await bycorf::SleepFor(
@@ -2952,34 +2949,44 @@ Task<CommandReply> ExecuteFlush(const CommandRequest& request,
       co_return std::move(*fenced);
     }
 
-    if (request.kind_ == CommandKind::kFlushAll) {
-      detached = co_await g_storage->FlushAllDetach();
-      if (detached.ok()) {
-        for (std::uint8_t db_id = 0; db_id < storage::kLogicalDatabaseCount;
-             ++db_id) {
-          flushed_epochs[db_id] = g_storage->DbEpoch(db_id);
-        }
+    // Prepare every recoverably fallible part of publication before epoch IO.
+    // The closed DB gates stabilize these target epochs until detach finishes.
+    std::optional<storage::PreparedFlushPublication> publication;
+    for (const auto db_id : dbs) {
+      const auto current = g_storage->DbEpoch(db_id);
+      if (current == std::numeric_limits<std::uint64_t>::max()) {
+        co_return BuiltReply(
+            reply_builder.AppendError("ERR database epoch exhausted"));
       }
-    } else {
-      const std::uint8_t db_id = dbs.front();
-      detached = co_await g_storage->FlushDbDetach(db_id);
-      if (detached.ok()) flushed_epochs[db_id] = g_storage->DbEpoch(db_id);
+      flushed_epochs[db_id] = current + 1;
     }
-
-    if (detached.ok() && !request.replication_origin_ &&
-        g_storage->ReplicationLogActive()) {
-      // Cross-flow transactions and DB barriers share one source publication
-      // order. Without this cold-path atomic gate, two concurrent publishers
-      // could enqueue A->B on one flow and B->A on another, making the target
-      // rendezvous cycle forever.
-      if (request.kind_ == CommandKind::kFlushAll) {
-        detached =
-            co_await g_storage->PublishFlushAllReplication(flushed_epochs);
-      } else {
-        const std::uint8_t db_id = dbs.front();
-        detached = co_await g_storage->PublishFlushDbReplication(
-            db_id, flushed_epochs[db_id]);
+    if (!request.replication_origin_ && g_storage->ReplicationLogActive()) {
+      auto prepared = co_await g_storage->PrepareFlushReplication(
+          request.kind_ == CommandKind::kFlushAll
+              ? std::nullopt
+              : std::optional<std::uint8_t>(request.db_id_),
+          flushed_epochs);
+      if (!prepared.ok()) {
+        co_return BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR ", prepared.status().message())));
       }
+      publication.emplace(std::move(*prepared));
+    }
+    const auto precondition = ClusterMutationPrecondition(request);
+    if (request.kind_ == CommandKind::kFlushAll) {
+      detached = co_await g_storage->FlushAllDetach(precondition);
+    } else {
+      detached = co_await g_storage->FlushDbDetach(dbs.front(), precondition);
+    }
+    LAVIK_FAULT_INJECT(if (detached.ok()) {
+      auto paused = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_FLUSH_BEFORE_PUBLICATION_HOLD_FILE");
+      if (!paused.ok())
+        co_return BuiltReply(
+            reply_builder.AppendError(absl::StrCat("ERR ", paused.message())));
+    });
+    if (detached.ok() && publication.has_value()) {
+      co_await g_storage->PublishFlushReplication(std::move(*publication));
     }
   }
   // Publication is ordered and every DB gate is open again. Reclamation is
@@ -2998,6 +3005,13 @@ Task<CommandReply> ExecuteFlush(const CommandRequest& request,
     co_return BuiltReply(
         reply_builder.AppendError(absl::StrCat("ERR ", detached.message())));
   }
+  LAVIK_FAULT_INJECT({
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_BEFORE_REPLY_HOLD_FILE");
+    if (!paused.ok())
+      co_return BuiltReply(
+          reply_builder.AppendError(absl::StrCat("ERR ", paused.message())));
+  });
   co_return reclaimed.ok() ? BuiltReply(reply_builder.AppendSimpleString("OK"))
                            : BuiltReply(reply_builder.AppendError(
                                  absl::StrCat("ERR ", reclaimed.message())));
@@ -11938,7 +11952,6 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
               "KILL or SHUTDOWN NOSAVE."));
   }
   if (cluster::MetaManaged()) {
-    const std::string_view unscoped_mutation = UnscopedClusterMutation(request);
     if (!request.replication_origin_ && ctx.in_multi_ &&
         IsFunctionCatalogMutation(request)) {
       // Catalog-in-EXEC requires a shared admission through the transaction's
@@ -11947,11 +11960,6 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       co_return BuiltReply(reply_builder.AppendError(
           "ERR FUNCTION catalog mutations inside MULTI are not yet supported "
           "in Meta-managed mode"));
-    }
-    if (!unscoped_mutation.empty()) {
-      if (ctx.in_multi_) ctx.multi_dirty_ = true;
-      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
-          "ERR ", unscoped_mutation, " is not allowed in Meta-managed mode")));
     }
     if (!request.replication_origin_ &&
         cluster::GetClientMode() == ClientMode::kSingle) {
@@ -11963,7 +11971,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       // KEYS retains its exclusive gate until its streamed response completes.
       // Still deferred: execution
       // contexts that mutate outside one command's key view (transactions,
-      // scripts and global DB operations), stream blocking and keyless
+      // scripts), stream blocking and keyless
       // WAIT. Later tickets can remove a boundary only after wiring its
       // waits, participants and durable/catalog effects into Group authority.
       const auto flags = request.spec_ == nullptr ? 0u : request.spec_->flags_;
@@ -12317,6 +12325,15 @@ Task<CommandReply> ExecuteCommandBody(
       }
     }
     db_guard.emplace(request.db_id_);
+    LAVIK_FAULT_INJECT(
+        if (!replication_origin && request.kind_ == CommandKind::kGet &&
+            LAVIK_FAULT_MATCHES("LAVIK_DB_OPERATION_HOLD_KEY", args[1])) {
+          auto paused = co_await fault_injection::PauseWhileFileExists(
+              "LAVIK_DB_OPERATION_HOLD_FILE");
+          if (!paused.ok())
+            co_return BuiltReply(reply_builder.AppendError(
+                absl::StrCat("ERR ", paused.message())));
+        });
     if (!CommandWriteAdmissionIsCurrent(request)) {
       co_return BuiltReply(reply_builder.AppendError(
           "TRYAGAIN replication role changed; retry command"));

@@ -1192,13 +1192,45 @@ def assert_redis_topology_and_replication(nodes):
             ["REPLICAOF", "127.0.0.1", "1"],
             "ERR REPLICAOF not allowed in Meta-managed mode.",
         ),
-        (["FLUSHDB"], "ERR FLUSHDB is not allowed in Meta-managed mode"),
-        (["FLUSHALL"], "ERR FLUSHALL is not allowed in Meta-managed mode"),
     ):
         actual = redis_error(by_id[PRIMARY_1], arguments)
         if actual != expected:
             raise H.Failure(
                 f"cluster command policy for {arguments} returned {actual!r}"
+            )
+
+    # Each Group exercises both commands, including the Group whose slots do
+    # not contain zero. Preserve the fixture's ongoing values after checking.
+    for group_id, (primary, replica, _, _) in GROUPS.items():
+        other_group = "group-2" if group_id == "group-1" else "group-1"
+        other_primary, other_replica, _, _ = GROUPS[other_group]
+        for flush in ("FLUSHDB", "FLUSHALL"):
+            assert redis_call(by_id[primary], [flush]) == "OK"
+            assert redis_call(by_id[primary], ["GET", keys[group_id]]) is None
+            assert (
+                redis_call(by_id[other_primary], ["GET", keys[other_group]])
+                == f"ongoing-{other_group}"
+            )
+            H.wait_until(
+                "Group flush reaches its replica",
+                20,
+                lambda: readonly_get(by_id[replica], keys[group_id]) is None,
+            )
+            assert (
+                readonly_get(by_id[other_replica], keys[other_group])
+                == f"ongoing-{other_group}"
+            )
+            assert (
+                redis_call(
+                    by_id[primary], ["SET", keys[group_id], f"ongoing-{group_id}"]
+                )
+                == "OK"
+            )
+            H.wait_until(
+                "post-flush Group write reaches replica",
+                20,
+                lambda: readonly_get(by_id[replica], keys[group_id])
+                == f"ongoing-{group_id}",
             )
 
     with redis_connection(by_id[PRIMARY_1]) as sock:

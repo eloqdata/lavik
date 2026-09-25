@@ -243,12 +243,14 @@ Task<StorageMetricsSnapshot> StorageEngine::CollectMetrics() const {
   return impl_->CollectMetrics();
 }
 
-Task<absl::Status> StorageEngine::FlushDbDetach(std::uint8_t db_id) {
-  return impl_->FlushDbDetach(db_id);
+Task<absl::Status> StorageEngine::FlushDbDetach(
+    std::uint8_t db_id, MutationPrecondition mutation_precondition) {
+  return impl_->FlushDbDetach(db_id, std::move(mutation_precondition));
 }
 
-Task<absl::Status> StorageEngine::FlushAllDetach() {
-  return impl_->FlushAllDetach();
+Task<absl::Status> StorageEngine::FlushAllDetach(
+    MutationPrecondition mutation_precondition) {
+  return impl_->FlushAllDetach(std::move(mutation_precondition));
 }
 
 Task<absl::Status> StorageEngine::FlushDbReclaim(bool wait) {
@@ -259,14 +261,16 @@ std::uint64_t StorageEngine::DbEpoch(std::uint8_t db_id) const noexcept {
   return impl_->DbEpoch(db_id);
 }
 
-Task<absl::Status> StorageEngine::PublishFlushDbReplication(
-    std::uint8_t db_id, std::uint64_t db_epoch) {
-  return impl_->PublishFlushDbReplication(db_id, db_epoch);
+Task<absl::StatusOr<PreparedFlushPublication>>
+StorageEngine::PrepareFlushReplication(
+    std::optional<std::uint8_t> db_id,
+    const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs) {
+  return impl_->PrepareFlushReplication(db_id, db_epochs);
 }
 
-Task<absl::Status> StorageEngine::PublishFlushAllReplication(
-    const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs) {
-  return impl_->PublishFlushAllReplication(db_epochs);
+Task<absl::Status> StorageEngine::PublishFlushReplication(
+    PreparedFlushPublication publication) {
+  return impl_->PublishFlushReplication(std::move(publication));
 }
 
 Task<absl::Status> StorageEngine::ApplyReplicatedFlushDb(

@@ -42,6 +42,12 @@ The named Function libraries shared by all logical databases on a Data Node.
 Its contents belong to the node's replicated dataset, not a per-database
 namespace or a cluster-wide registry shared across Groups.
 
+**Group-scoped Flush**:
+A clearing of one or all logical databases in the receiving Data Node's
+Group, with the same Group boundary in managed Single and Cluster
+([ADR 0027](docs/adr/0027-scope-managed-flush-to-the-local-group.md)).
+_Avoid_: Cluster-wide flush when referring to one Group
+
 **Discovery Entry**:
 The independent Sentinel-compatible RESP endpoint served by a Meta process for
 client discovery, identified to clients by its Sentinel address. Its answers

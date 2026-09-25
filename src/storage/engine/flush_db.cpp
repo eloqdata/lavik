@@ -15,15 +15,17 @@
  */
 
 #include "impl.h"
+#include "lavik/fault_pause.h"
 
 namespace lavik::storage {
 
-Task<absl::Status> StorageEngine::Impl::FlushDbDetach(std::uint8_t db_id) {
+Task<absl::Status> StorageEngine::Impl::FlushDbDetach(
+    std::uint8_t db_id, MutationPrecondition mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   if (bycorf::ThisWorker().id_ != 0) {
     co_return co_await bycorf::SubmitTaskTo(
-        0, [this, db_id]() -> Task<absl::Status> {
-          co_return co_await FlushDbDetach(db_id);
+        0, [this, db_id, mutation_precondition]() -> Task<absl::Status> {
+          co_return co_await FlushDbDetach(db_id, mutation_precondition);
         });
   }
 
@@ -32,14 +34,17 @@ Task<absl::Status> StorageEngine::Impl::FlushDbDetach(std::uint8_t db_id) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "database epoch exhausted");
   }
-  co_return co_await DetachDbEpoch(db_id, current + 1);
+  co_return co_await DetachDbEpoch(db_id, current + 1,
+                                   std::move(mutation_precondition));
 }
 
-Task<absl::Status> StorageEngine::Impl::FlushAllDetach() {
+Task<absl::Status> StorageEngine::Impl::FlushAllDetach(
+    MutationPrecondition mutation_precondition) {
   if (bycorf::ThisWorker().id_ != 0) {
-    co_return co_await bycorf::SubmitTaskTo(0, [this]() -> Task<absl::Status> {
-      co_return co_await FlushAllDetach();
-    });
+    co_return co_await bycorf::SubmitTaskTo(
+        0, [this, mutation_precondition]() -> Task<absl::Status> {
+          co_return co_await FlushAllDetach(mutation_precondition);
+        });
   }
   std::array<std::uint64_t, kLogicalDatabaseCount> next{};
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
@@ -49,7 +54,7 @@ Task<absl::Status> StorageEngine::Impl::FlushAllDetach() {
     }
     next[db_id] = current + 1;
   }
-  co_return co_await DetachDbEpochs(next);
+  co_return co_await DetachDbEpochs(next, std::move(mutation_precondition));
 }
 
 Task<absl::Status> StorageEngine::Impl::ApplyReplicatedFlushDb(
@@ -135,11 +140,12 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicatedFlushAll(
 }
 
 Task<absl::Status> StorageEngine::Impl::DetachDbEpochs(
-    const std::array<std::uint64_t, kLogicalDatabaseCount>& next) {
+    const std::array<std::uint64_t, kLogicalDatabaseCount>& next,
+    MutationPrecondition mutation_precondition) {
   if (bycorf::ThisWorker().id_ != 0) {
     co_return co_await bycorf::SubmitTaskTo(
-        0, [this, next]() -> Task<absl::Status> {
-          co_return co_await DetachDbEpochs(next);
+        0, [this, next, mutation_precondition]() -> Task<absl::Status> {
+          co_return co_await DetachDbEpochs(next, mutation_precondition);
         });
   }
   std::array<bool, kLogicalDatabaseCount> changed{};
@@ -157,7 +163,8 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpochs(
   }
   if (updates.empty()) co_return absl::OkStatus();
 
-  absl::Status persisted = co_await PersistEpochValues(updates);
+  absl::Status persisted =
+      co_await PersistEpochValues(updates, std::move(mutation_precondition));
   if (!persisted.ok()) co_return persisted;
   for (const auto& [index, epoch] : updates) {
     db_epochs_[index].store(epoch, std::memory_order_release);
@@ -184,12 +191,13 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpochs(
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(std::uint8_t db_id,
-                                                      std::uint64_t next) {
+Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(
+    std::uint8_t db_id, std::uint64_t next,
+    MutationPrecondition mutation_precondition) {
   if (bycorf::ThisWorker().id_ != 0) {
     co_return co_await bycorf::SubmitTaskTo(
-        0, [this, db_id, next]() -> Task<absl::Status> {
-          co_return co_await DetachDbEpoch(db_id, next);
+        0, [this, db_id, next, mutation_precondition]() -> Task<absl::Status> {
+          co_return co_await DetachDbEpoch(db_id, next, mutation_precondition);
         });
   }
   const std::uint64_t current = DbEpoch(db_id);
@@ -200,7 +208,8 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(std::uint8_t db_id,
   if (next == current) {
     co_return absl::OkStatus();
   }
-  absl::Status status = co_await PersistEpochValue(db_id, next);
+  absl::Status status =
+      co_await PersistEpochValue(db_id, next, std::move(mutation_precondition));
   if (!status.ok()) {
     co_return status;
   }
@@ -236,24 +245,29 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedAllWorkers(bool wait) {
           co_return co_await ReclaimDetachedAllWorkers(wait);
         });
   }
+  // Start every worker before awaiting any result. A failed reclaimer must
+  // not strand another worker's detached indexes without ever scheduling it.
   for (unsigned target = 0; target < worker_count_; ++target) {
-    auto reclaim = [this, target, wait]() -> Task<absl::Status> {
-      WorkerStore& store = *stores_[target];
-      if (!wait) {
-        EnsureDetachedReclaim(store);
-        co_return absl::OkStatus();
-      }
-      co_return co_await AwaitDetachedReclaim(store);
+    auto start = [this, target]() -> Task<absl::Status> {
+      EnsureDetachedReclaim(*stores_[target]);
+      co_return absl::OkStatus();
+    };
+    if (target == 0)
+      co_await start();
+    else
+      co_await bycorf::SubmitTaskTo(target, start);
+  }
+  if (!wait) co_return absl::OkStatus();
+  for (unsigned target = 0; target < worker_count_; ++target) {
+    auto reclaim = [this, target]() -> Task<absl::Status> {
+      co_return co_await AwaitDetachedReclaim(*stores_[target]);
     };
     absl::Status reclaimed;
-    if (target == 0) {
+    if (target == 0)
       reclaimed = co_await reclaim();
-    } else {
+    else
       reclaimed = co_await bycorf::SubmitTaskTo(target, reclaim);
-    }
-    if (!reclaimed.ok()) {
-      co_return reclaimed;
-    }
+    if (!reclaimed.ok()) co_return reclaimed;
   }
   co_return absl::OkStatus();
 }
@@ -486,6 +500,18 @@ Task<absl::Status> StorageEngine::Impl::RunDetachedReclaim(WorkerStore* store) {
     std::atomic<std::uint32_t>* active_;
     ~SettlementGuard() { active_->fetch_sub(1, std::memory_order_acq_rel); }
   } settlement{&active_settlements_};
+  LAVIK_FAULT_INJECT({
+    // One marker per worker lets the gate observe that all reclaimers started.
+    if (std::getenv("LAVIK_FLUSH_RECLAIM_HOLD_FILE") != nullptr) {
+      spdlog::info("fault reclaim worker[{}] started", store->worker_->id());
+    }
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_RECLAIM_HOLD_FILE");
+    if (!paused.ok()) {
+      store->detached_reclaim_running_ = false;
+      co_return paused;
+    }
+  });
   absl::Status status = co_await ReclaimDetachedIndexes(*store);
   store->detached_reclaim_running_ = false;
   if (!status.ok()) {
@@ -511,6 +537,13 @@ Task<absl::Status> StorageEngine::Impl::AwaitDetachedReclaim(
         (store.write_failed_ || RuntimeFailureLatched())) {
       break;
     }
+    LAVIK_FAULT_INJECT({
+      const char* fail = std::getenv("LAVIK_FLUSH_RECLAIM_WAIT_FAIL_FILE");
+      if (fail != nullptr && ::access(fail, F_OK) == 0) {
+        co_return absl::UnavailableError(
+            "injected detached reclaim wait failure");
+      }
+    });
     absl::Status waited =
         co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
     if (!waited.ok()) {

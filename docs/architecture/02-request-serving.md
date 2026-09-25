@@ -428,6 +428,18 @@ connections. Storage and transaction failures are converted at the command
 boundary; trusted replication replay instead treats command errors as apply
 failures so a flow cannot acknowledge partial work.
 
+Managed FLUSH commands use the receiving node's Group authority without a
+synthetic key or empty-slot bypass. They acquire publisher admission and the
+cross-flow publication order, close the entire target DB set, drain existing
+operations, then register a Group in-flight guard. Preparation allocates the
+history-bound all-flow barrier before storage validates authority at the first
+epoch write. The DB gates and Group guard remain held through commit, detach
+and publication. Later authority changes do not replace successful completion
+with a retryable refusal. After logical commit, gates and ordering/drain guards
+are released before detached-index reclamation; SYNC waits for that retirement
+and ASYNC only starts it. Existing storage errors propagate in both modes,
+without retrying or rolling back completed clearing.
+
 Replication publisher admission occurs before database gates and key locks so
 a slow replica cannot suspend a write while holding state required by
 `FLUSHDB` or a full-sync cut. Memory-growing commands use the sampled memory
