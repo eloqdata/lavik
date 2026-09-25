@@ -52,8 +52,9 @@ def creation_raft_args():
     # The election lower bound D also requires a 2D first-grant quarantine.
     # At D=2s that quarantine outlasts the target's three one-second retries.
     # D=500ms leaves room for heartbeat delivery and hosted-runner scheduling.
-    # Later lease expiry only suspends new admission: already-published
-    # POPULATION sessions survive slow Debug snapshot/TLS work.
+    # Later lease expiry closes new native source admission and retires Data
+    # clients, while already-published POPULATION sessions survive slow Debug
+    # snapshot/TLS work.
     return H.raft_args(
         snapshot_distance=100_000, election_ms_low=500, election_ms_high=1000
     )

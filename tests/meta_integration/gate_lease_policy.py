@@ -244,6 +244,12 @@ def run(root):
             "shorter committed policy invalidates old renewal proof",
             timeout=5,
         )
+        # Revocation retires the old socket; the replacement must receive a
+        # normal admission error and survive until policy renewal restores it.
+        assert select.select([client.socket], [], [], 5)[0]
+        assert client.reader.read(1) == b""
+        client.close()
+        client = Client(data)
         try:
             client.call("SET", "{policy}must-fence", "invalid")
         except H.Failure as error:

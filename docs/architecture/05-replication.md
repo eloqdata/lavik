@@ -307,12 +307,13 @@ The native handler checks both the exact current capability and `now < deadline`
 under the same source mutex that publishes the session, so a late timer cannot
 admit work after expiry.
 
-Lease expiry closes only new admission. It retains current FDS capabilities and
-every population session already published across the mutex boundary, including
-a session that has not reached ONLINE; a later exact lease renewal reopens the
-gate in O(1). A live FDS replacement clears and replays capabilities while an
-unchanged, unexpired gate may remain open. The authenticated FDS supplies the
-number of local `authorize-source` capabilities its directive lane must replay.
+Native source lease expiry closes new source admission. It retains current FDS
+capabilities and every population session already published across the mutex
+boundary, including a session that has not reached ONLINE; a later exact lease
+renewal reopens the gate in O(1). A live FDS replacement clears and replays
+capabilities while an unchanged, unexpired gate may remain open. The authenticated
+FDS supplies the number of local `authorize-source` capabilities its directive
+lane must replay.
 That pending count and every installed capability reserve the current source
 history; a source-valid handshake during the bounded replay gap is denied data
 with `LVLEASESUSPENDED` and uses the target's finite retry path. Each newly
