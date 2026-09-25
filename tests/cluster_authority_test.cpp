@@ -407,6 +407,41 @@ TEST(ClusterAuthoritySnapshotTest,
 }
 
 TEST(ClusterAuthoritySnapshotTest,
+     SameTermReauthorizationReusesAdmissionOnlyWithCurrentLease) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), start, 100ms).ok());
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  const auto write =
+      control.authority.CaptureAndAdmit(MakeRequest(slots, true), start);
+  ASSERT_EQ(write.decision().kind_, Decision::Kind::kServe);
+
+  control.authority.InvalidateAll();
+  EXPECT_EQ(control.authority.Recheck(write, start + 1ms),
+            RecheckResult::kReject);
+  ASSERT_TRUE(
+      control.topology.Install(BuildState(kNodeA), start + 2ms, 100ms).ok());
+  EXPECT_EQ(control.authority.Recheck(write, start + 3ms), RecheckResult::kOk);
+  AuthorityInFlightGuards guards;
+  EXPECT_EQ(
+      control.authority.RegisterAndRecheck(write, 0, start + 3ms, &guards),
+      RecheckResult::kOk);
+  EXPECT_FALSE(guards.empty());
+  guards.clear();
+
+  // A new committed Term is still a permanent boundary for this admission.
+  auto replacement = GroupA();
+  ++replacement.group_term_;
+  ASSERT_TRUE(control.topology
+                  .Install(BuildState(kNodeA, replacement, GroupB(), 2),
+                           start + 4ms, 100ms)
+                  .ok());
+  EXPECT_EQ(control.authority.Recheck(write, start + 5ms),
+            RecheckResult::kReject);
+}
+
+TEST(ClusterAuthoritySnapshotTest,
      SingleKeylessDataAccessStillConsumesAuthority) {
   using namespace std::chrono_literals;
   TestAuthorityControl control;

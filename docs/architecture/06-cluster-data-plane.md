@@ -286,7 +286,7 @@ change and rolls back.
 Ordinary writes retain that registration through their handler. Top-level
 blocking List and Sorted Set writes and `XREADGROUP` instead retain it only
 across one concrete mutation attempt, because time spent waiting for data
-performs no mutation and must not pin the replaced authority generation. Their
+performs no mutation and must not pin the retired authority snapshot. Their
 immediate EXEC and Lua forms never enter the waiter registry and remain inside
 the enclosing transaction or script authority window.
 
@@ -676,13 +676,18 @@ term is therefore distinguishable from replay of fenced authority.
 The bounded worker timer may still be queued briefly after a host resume, so a
 renewal also compares the old deadline with `CLOCK_BOOTTIME` synchronously. If
 the old lease is already due, the renewal path runs that exact expiration
-transition first: it advances the authority generation, retires the stale
+transition first: it revokes the expired lease, retires the stale
 timer, closes new source admission, joins older directive admissions, and
 drains retired requests before considering the replacement grant. A
-same-anchor heartbeat can extend only a lease that never expired, so pre-expiry
-admissions cannot be revived by a delayed timer. The first consumer observing
-expiry marks that epoch terminal with an atomic compare/exchange; a renewer
-that sampled an older clock cannot undo an already-observed expiration.
+same-anchor heartbeat can extend only a lease that never expired. The first
+consumer observing expiry marks that capability terminal with an atomic
+compare/exchange; a renewer that sampled an older clock cannot undo an
+already-observed expiration. After cleanup, a replacement live lease for the
+same committed Group/assignment/Owner/Term may validate a previously captured
+request admission. There is no additional local authority generation: each
+recheck requires current valid authority, while a changed committed identity
+still rejects the old admission. This does not revive closed connections,
+cancelled requests, or requests invalidated by a serving-population change.
 
 Installed Owner lease removal or replacement also retires ordinary Data client
 connections after publishing the closed authority. Normal renewal and unrelated

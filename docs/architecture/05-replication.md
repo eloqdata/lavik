@@ -253,11 +253,15 @@ rejected, as are unauthenticated native and Redis replication exports. These
 restrictions prevent standalone role control or imported data from being
 mistaken for an authorized cluster population.
 
-Managed Single separates transport role from complete-population read permission.
-Worker 0 derives serving generation from the existing Ready proof, native data
-validity and population incarnation. A same-population reconnect preserves that
-generation; destructive FULL, proof invalidation or uncertain apply closes it
-before draining DB operations. FULL cancellation cannot restore an old proof.
+Worker 0 derives the boot-local serving generation from the existing Ready
+proof, native data validity and population incarnation. Both managed client
+modes retain that generation across a same-population incremental reconnect.
+Cluster temporarily closes its open bit while disconnected and reopens it at
+the same generation after CONTINUE; Managed Single permits complete-population
+reads across that interval. Destructive FULL, proof invalidation or uncertain
+apply advances the generation before draining DB operations, including when
+Cluster admission was already closed by a disconnect. FULL cancellation cannot
+restore an old proof.
 Client read checks consume the published generation; no second population
 registry, read lease or blocking cross-worker request lock is introduced.
 `replica-serve-stale-data no` additionally requires an online replication link.
@@ -1040,14 +1044,16 @@ instead enters the current-boot terminal latch; the manager cannot safely
 start another attempt in the same physical indexes.
 
 Role transitions also fence client work with a packed serving generation.
-Closing a population advances the generation and wakes all blocking registries;
+Retiring a population advances the generation and wakes all blocking registries;
 commands revalidate after acquiring ordinary database admission or draining a
 self-managed exclusive database cut, so queued, blocked, scanning, and backup
 requests from the previous population cannot observe or capture the rebuilt
 indexes. A self-gated command that validates first retains its gate through the
 point that makes its result stable, so a later replacement waits instead of
 invalidating an already committed result. Replication-origin apply bypasses
-this client fence while the population is closed.
+this client fence while the population is closed. A transport-only Cluster
+disconnect closes admission without advancing the retained population's
+generation or waking blocked requests merely to invalidate their tokens.
 
 ## Online apply and rendezvous
 

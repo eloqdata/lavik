@@ -6048,7 +6048,7 @@ auto ReplicationManager::ReplicationGroup::StoreRole(
   constexpr std::uint64_t kServingOpen = 1;
   // Worker zero owns the Ready proof and publishes its read permission through
   // the existing generation. A transport reconnect does not replace a complete
-  // Single population; FULL and proof invalidation do, even at the same role.
+  // population; FULL and proof invalidation do, even at the same role.
   assert(bycorf::ThisWorker().self_ == nullptr ||
          bycorf::ThisWorker().id_ == 0);
   const ReplicationRole previous = role_.load(std::memory_order_relaxed);
@@ -6073,23 +6073,32 @@ auto ReplicationManager::ReplicationGroup::StoreRole(
                                (meta_managed_ && single_client_mode_
                                     ? complete_replica
                                     : next == ReplicationRole::kOnline));
-  const bool same_population_reconnect = complete_replica &&
-                                         previous != ReplicationRole::kMaster &&
-                                         next != ReplicationRole::kMaster;
-  if (was_serving &&
-      (!will_serve || (previous != next && !same_population_reconnect))) {
+  const bool role_changed = (previous == ReplicationRole::kMaster) !=
+                            (next == ReplicationRole::kMaster);
+  const bool same_population_reconnect =
+      complete_population && !promotion_preparing &&
+      previous != ReplicationRole::kMaster && next != ReplicationRole::kMaster;
+  // Cluster closes admission while disconnected but retains the generation
+  // for CONTINUE. A later FULL, role change or promotion preparation must
+  // still retire that retained context even while its open bit is clear.
+  if ((was_serving && !same_population_reconnect &&
+       (!will_serve || previous != next)) ||
+      (client_population_complete_ &&
+       (!complete_population || role_changed || promotion_preparing))) {
     std::uint64_t generation = (current & ~kServingOpen) + 2;
     if (generation == 0) generation = 2;
-    serving_generation_->store(generation | (will_serve ? kServingOpen : 0),
-                               std::memory_order_release);
+    serving_generation_->store(
+        generation | (was_serving && will_serve ? kServingOpen : 0),
+        std::memory_order_release);
     NotifyServingGenerationChanged();
+  } else if (was_serving && !will_serve) {
+    serving_generation_->store(current & ~kServingOpen,
+                               std::memory_order_release);
   }
 
   // Readability can close during a Cluster transport reconnect without
   // destroying its population. Only actual population loss or a Redis role
   // change retires clients, including those accepted after an authority fence.
-  const bool role_changed = (previous == ReplicationRole::kMaster) !=
-                            (next == ReplicationRole::kMaster);
   if (meta_managed_ &&
       (role_changed || (client_population_complete_ && !complete_population))) {
     RetireClientConnections();

@@ -427,6 +427,9 @@ def replay_and_reconnect(root):
             assert reader.call("HEXISTS", "{native}hash", "old") == 0
             assert reader.call("HGET", "{native}hash", "tx") == "value"
             assert reader.call("LRANGE", "{native}list", 0, -1) == ["a", "b", "c"]
+            # The retained WATCH must survive CONTINUE on the original socket;
+            # the unrelated counter update must not invalidate its population.
+            assert reader.call("WATCH", "{native}seed") == "OK"
             # Native reconnects retain source history and applied cursors.
             old_full = Path(source.log_path).read_text().count("selected=FULL")
             assert writer.call("CLIENT", "KILL", "TYPE", "replica") > 0
@@ -442,6 +445,9 @@ def replay_and_reconnect(root):
                 lambda: "selected=CONTINUE" in Path(source.log_path).read_text(),
             )
             assert Path(source.log_path).read_text().count("selected=FULL") == old_full
+            assert reader.call("MULTI") == "OK"
+            assert reader.call("GET", "{native}seed") == "QUEUED"
+            assert reader.call("EXEC") == ["baseline"]
             # Real transactions also carry ephemeral PUBLISH under authority.
             subscriber = Client(target, readonly=True)
             try:

@@ -2005,13 +2005,16 @@ class DelayedLeaseExpiryRenewalService final : public bycorf::Service {
 
     // Do not yield: the deadline passes while the timer remains queued.
     std::this_thread::sleep_for(40ms);
+    old_rejected_while_expired_ =
+        control_.guard.Recheck(*old_admission_, LeaseClockNow()) ==
+        RecheckResult::kReject;
     grant.sent_at_ = LeaseClockNow();
     grant.granted_duration_ = 20ms;
     result_ = co_await control_.installer.ApplyLeaseGrantTransition(grant);
     if (result_.ok()) {
-      old_rejected_after_renewal_ =
+      old_admission_valid_after_renewal_ =
           control_.guard.Recheck(*old_admission_, LeaseClockNow()) ==
-          RecheckResult::kReject;
+          RecheckResult::kOk;
       new_admission_serves_ =
           control_.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
               .decision()
@@ -2028,7 +2031,8 @@ class DelayedLeaseExpiryRenewalService final : public bycorf::Service {
   DynamicControl control_;
   bool prepared_ = false;
   bool old_admitted_ = false;
-  bool old_rejected_after_renewal_ = false;
+  bool old_rejected_while_expired_ = false;
+  bool old_admission_valid_after_renewal_ = false;
   bool new_admission_serves_ = false;
   std::optional<AuthorityAdmission> old_admission_;
   std::uint64_t expirations_before_ = 0;
@@ -3003,7 +3007,7 @@ TEST(NodeControlInstallerTest,
 }
 
 TEST(NodeControlInstallerTest,
-     ExpiredLeaseCannotBeRevivedBeforeDelayedTimerRuns) {
+     SameTermLeaseReplacementCleansUpExpiryBeforeReusingAdmission) {
   bycorf::Server server;
   DelayedLeaseExpiryRenewalService service(&server);
   server.AddService(&service);
@@ -3016,7 +3020,8 @@ TEST(NodeControlInstallerTest,
 
   EXPECT_TRUE(service.result_.ok()) << service.result_;
   EXPECT_TRUE(service.old_admitted_);
-  EXPECT_TRUE(service.old_rejected_after_renewal_);
+  EXPECT_TRUE(service.old_rejected_while_expired_);
+  EXPECT_TRUE(service.old_admission_valid_after_renewal_);
   EXPECT_TRUE(service.new_admission_serves_);
   EXPECT_EQ(service.control_.actions.session_clears_, 0);
   EXPECT_TRUE(service.control_.actions.preserve_established_exports_.empty());
