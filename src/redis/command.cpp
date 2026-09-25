@@ -123,7 +123,8 @@ struct ClientConnectionRecord {
   enum class Type { kNormal, kReplica, kPubSub };
 
   std::uint64_t id_ = 0;
-  std::uint64_t retirement_generation_ = 0;
+  // Borrowed only on the owning worker; Serve unregisters before destroying it.
+  ConnectionContext* context_ = nullptr;
   int fd_ = -1;
   std::string address_;
   std::chrono::steady_clock::time_point connected_at_;
@@ -145,10 +146,6 @@ struct ClientConnectionRecord {
 // request processing needs neither a lock nor an atomic lookup.
 std::array<std::vector<ClientConnectionRecord>, storage::kLogicalStorageShards>
     g_worker_clients;
-
-// Only serving transitions write this epoch. Connection registration and
-// command dispatch read it without touching a shared registry or mutex.
-std::atomic<std::uint64_t> g_client_retirement_generation{1};
 
 bool CmpCaseInsensitive(std::string_view a, std::string_view b);
 std::string_view AppendStorageError(ReplyBuilder& reply_builder,
@@ -11190,10 +11187,10 @@ void ConnectionOpened() noexcept { RecordConnectionOpened(); }
 
 void ConnectionClosed() noexcept { RecordConnectionClosed(); }
 
-std::uint64_t RegisterClientConnection(std::uint64_t id, int fd,
-                                       std::string address, bool tls,
-                                       bool replica,
-                                       std::uint64_t replication_session_id) {
+void RegisterClientConnection(std::uint64_t id, int fd, std::string address,
+                              bool tls, bool replica,
+                              std::uint64_t replication_session_id,
+                              ConnectionContext* context) {
   const unsigned worker = bycorf::ThisWorker().id_;
   assert(worker < g_worker_clients.size());
   auto& clients = g_worker_clients[worker];
@@ -11202,11 +11199,9 @@ std::uint64_t RegisterClientConnection(std::uint64_t id, int fd,
                    [id](const auto& client) { return client.id_ == id; });
   assert(existing == clients.end());
   (void)existing;
-  const auto generation =
-      g_client_retirement_generation.load(std::memory_order_acquire);
   clients.push_back(ClientConnectionRecord{
       .id_ = id,
-      .retirement_generation_ = generation,
+      .context_ = context,
       .fd_ = fd,
       .address_ = std::move(address),
       .connected_at_ = std::chrono::steady_clock::now(),
@@ -11223,23 +11218,17 @@ std::uint64_t RegisterClientConnection(std::uint64_t id, int fd,
       .blocked_ = false,
       .closing_ = false,
   });
-  return generation;
-}
-
-bool ClientConnectionRetired(std::uint64_t generation) noexcept {
-  return generation !=
-         g_client_retirement_generation.load(std::memory_order_acquire);
 }
 
 namespace {
-void CloseRetiredClients(void*, std::uint64_t boundary) noexcept {
+void CloseClientConnections(void*, std::uint64_t) noexcept {
   auto& clients = g_worker_clients[bycorf::ThisWorker().id_];
   for (auto& client : clients) {
-    if (client.closing_ || client.retirement_generation_ >= boundary ||
-        client.type_ == ClientConnectionRecord::Type::kReplica ||
+    if (client.type_ == ClientConnectionRecord::Type::kReplica ||
         client.replication_session_id_ != 0)
       continue;
     client.closing_ = true;
+    if (client.context_ != nullptr) client.context_->closing_ = true;
     // shutdown wakes pending reads/writes but does not destroy an in-flight
     // coroutine. Its normal cleanup still owns the registry entry and fd.
     (void)CancelBlockedClientOnCurrentWorker(client.id_);
@@ -11249,21 +11238,17 @@ void CloseRetiredClients(void*, std::uint64_t boundary) noexcept {
 }  // namespace
 
 void RetireClientConnections() noexcept {
-  const std::uint64_t boundary =
-      g_client_retirement_generation.fetch_add(1, std::memory_order_acq_rel) +
-      1;
-  if (boundary == 0) std::terminate();
   const auto& current = bycorf::ThisWorker();
   if (current.self_ == nullptr || current.cross_core_ == nullptr) return;
   for (unsigned worker = 0; worker < g_server_threads; ++worker) {
     if (worker == current.id_) {
-      CloseRetiredClients(nullptr, boundary);
+      CloseClientConnections(nullptr, 0);
     } else {
       bycorf::PostNotification(
           current.cross_core_, worker,
           bycorf::RemoteNotification{.context_ = nullptr,
-                                     .value_ = boundary,
-                                     .run_fn_ = &CloseRetiredClients});
+                                     .value_ = 0,
+                                     .run_fn_ = &CloseClientConnections});
     }
   }
 }

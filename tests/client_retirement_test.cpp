@@ -31,14 +31,15 @@
 #include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
 #include "lavik/command.h"
+#include "lavik/session.h"
 
 namespace lavik {
 namespace {
 using namespace std::chrono_literals;
 
 TEST(ClientRetirementTest,
-     DelayedNotificationPreservesNewAndInternalConnections) {
-  std::array<std::array<int, 2>, 5> sockets;
+     DelayedNotificationClosesReconnectsButPreservesInternalConnections) {
+  std::array<std::array<int, 2>, 6> sockets;
   for (auto& pair : sockets)
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, pair.data()), 0);
   absl::Cleanup close_sockets = [&] {
@@ -49,7 +50,8 @@ TEST(ClientRetirementTest,
   bycorf::Runtime runtime;
   std::array<std::promise<absl::Status>, 2> initialized;
   std::atomic<bool> release{false};
-  std::promise<void> registered, replaced, retired, cleaned;
+  std::promise<void> registered, replaced, retired, accepted, cleaned;
+  ConnectionContext old, reconnect, fresh;
   runtime.Start(
       2,
       [&](unsigned id, bycorf::Worker& worker) {
@@ -71,7 +73,7 @@ TEST(ClientRetirementTest,
   auto data = runtime.GetForeignExecutor(0);
   auto control = runtime.GetForeignExecutor(1);
   ASSERT_TRUE(data.Notify([&]() noexcept {
-    auto old = RegisterClientConnection(1, sockets[0][0], "normal", false);
+    RegisterClientConnection(1, sockets[0][0], "normal", false, false, 0, &old);
     RegisterClientConnection(2, sockets[1][0], "reused", false);
     RegisterClientConnection(3, sockets[2][0], "replica", false, true);
     RegisterClientConnection(4, sockets[3][0], "donor", false, false, 44);
@@ -79,11 +81,10 @@ TEST(ClientRetirementTest,
     // Deliberately hold this test worker so the control notification cannot
     // run until a new connection has reused an old connection's exact fd.
     while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
-    EXPECT_TRUE(ClientConnectionRetired(old));
     UnregisterClientConnection(2);
     EXPECT_EQ(dup2(sockets[4][0], sockets[1][0]), sockets[1][0]);
-    auto fresh = RegisterClientConnection(5, sockets[1][0], "new", false);
-    EXPECT_FALSE(ClientConnectionRetired(fresh));
+    RegisterClientConnection(5, sockets[1][0], "reconnect", false, false, 0,
+                             &reconnect);
     replaced.set_value();
   }));
   ASSERT_EQ(registered.get_future().wait_for(5s), std::future_status::ready);
@@ -98,18 +99,33 @@ TEST(ClientRetirementTest,
   ASSERT_EQ(poll(&closed, 1, 5000), 1);
   char byte;
   EXPECT_EQ(recv(sockets[0][1], &byte, 1, 0), 0);
-  for (unsigned index : {2u, 3u, 4u}) {
-    EXPECT_EQ(recv(sockets[index][1], &byte, 1, MSG_DONTWAIT), -1);
-    EXPECT_EQ(errno, EAGAIN);
-  }
-  // A later role transition must also retire connections established in the
-  // gap; its earlier notification must not have retired them prematurely.
-  ASSERT_TRUE(control.Notify([]() noexcept { RetireClientConnections(); }));
   closed.fd = sockets[4][1];
   ASSERT_EQ(poll(&closed, 1, 5000), 1);
   EXPECT_EQ(recv(sockets[4][1], &byte, 1, 0), 0);
+  for (unsigned index : {2u, 3u}) {
+    EXPECT_EQ(recv(sockets[index][1], &byte, 1, MSG_DONTWAIT), -1);
+    EXPECT_EQ(errno, EAGAIN);
+  }
+  // The sweep closes the reconnect too. A connection registered after the
+  // sweep remains usable until another transition requests cleanup.
   ASSERT_TRUE(data.Notify([&]() noexcept {
-    for (unsigned id : {1u, 3u, 4u, 5u}) UnregisterClientConnection(id);
+    EXPECT_TRUE(old.closing_);
+    EXPECT_TRUE(reconnect.closing_);
+    RegisterClientConnection(6, sockets[5][0], "after-sweep", false, false, 0,
+                             &fresh);
+    EXPECT_FALSE(fresh.closing_);
+    accepted.set_value();
+  }));
+  ASSERT_EQ(accepted.get_future().wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(recv(sockets[5][1], &byte, 1, MSG_DONTWAIT), -1);
+  EXPECT_EQ(errno, EAGAIN);
+  ASSERT_TRUE(control.Notify([]() noexcept { RetireClientConnections(); }));
+  closed.fd = sockets[5][1];
+  ASSERT_EQ(poll(&closed, 1, 5000), 1);
+  EXPECT_EQ(recv(sockets[5][1], &byte, 1, 0), 0);
+  ASSERT_TRUE(data.Notify([&]() noexcept {
+    EXPECT_TRUE(fresh.closing_);
+    for (unsigned id : {1u, 3u, 4u, 5u, 6u}) UnregisterClientConnection(id);
     cleaned.set_value();
   }));
   ASSERT_EQ(cleaned.get_future().wait_for(5s), std::future_status::ready);

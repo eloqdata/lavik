@@ -625,21 +625,18 @@ void SetServerInfo(std::string bind_ip, std::uint16_t port,
 // Connection accounting for INFO's Clients section.
 void ConnectionOpened() noexcept;
 void ConnectionClosed() noexcept;
-
 // CLIENT metadata is worker-local. Replication socket handoff unregisters on
 // the accepting worker and registers the same identity on the owning worker.
-// Returns the connection boundary captured at registration for dispatch checks.
-std::uint64_t RegisterClientConnection(
-    std::uint64_t id, int fd, std::string address, bool tls,
-    bool replica = false, std::uint64_t replication_session_id = 0);
-// Returns whether this ordinary connection belongs to a retired serving
-// boundary. This is lock-free and must be checked after socket-read waits.
-bool ClientConnectionRetired(std::uint64_t generation) noexcept;
-// Publishes a new connection boundary and notifies socket-owning workers to
-// close older ordinary/PubSub connections. New connections and established
-// replication/donor sessions are excluded; no callback retains socket pointers.
-// Call on a runtime worker after closing the applicable data admission. Socket
-// cleanup is asynchronous; this does not replace internal mutation drain.
+// context is borrowed on the owning worker until UnregisterClientConnection.
+void RegisterClientConnection(std::uint64_t id, int fd, std::string address,
+                              bool tls, bool replica = false,
+                              std::uint64_t replication_session_id = 0,
+                              ConnectionContext* context = nullptr);
+// Notifies each socket-owning worker to close all ordinary/PubSub connections
+// present when it handles the notification, including recent reconnects.
+// Established replication/donor sessions are excluded. Call after closing data
+// admission; asynchronous socket cleanup does not replace internal mutation
+// drain.
 void RetireClientConnections() noexcept;
 void SetClientReplicationSession(std::uint64_t id,
                                  std::uint64_t replication_session_id) noexcept;

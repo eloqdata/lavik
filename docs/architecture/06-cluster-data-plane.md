@@ -687,9 +687,9 @@ that sampled an older clock cannot undo an already-observed expiration.
 Installed Owner lease removal or replacement also retires ordinary Data client
 connections after publishing the closed authority. Normal renewal and unrelated
 Group updates preserve them. Socket retirement and internal request drain are
-separate: reactivation retains the existing drain barriers, while a retired
-connection cannot dispatch another buffered command even if its worker receives
-the shutdown notification after reauthorization. Legal replica population reads
+separate: reactivation retains the existing drain barriers. Each worker closes
+all ordinary connections present when it handles the notification, including
+recent reconnects, and marks them to stop buffered dispatch. Legal replica population reads
 are independent of Owner leases; loss of their control session alone does not
 retire their clients.
 

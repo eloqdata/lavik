@@ -42,7 +42,10 @@ conditions, and connection retirement triggers client rediscovery. Renewed
 authority at the same address and within the same boot must not revive a
 connection retired under the previous authority.
 
-New connections accepted after a fence retain ordinary Redis error semantics.
+Each worker closes all ordinary connections present when it processes the
+cleanup notification. A recent reconnect may be closed by that sweep; no
+connection generation or ID cutoff protects it. Connections established after
+the sweep retain ordinary Redis error semantics.
 A data command rejected before mutation returns the applicable admission error;
 that rejection alone does not close the connection. Diagnostic commands remain
 available. These new connections never held the revoked authority and can

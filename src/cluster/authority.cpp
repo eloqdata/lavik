@@ -363,9 +363,8 @@ void AuthorityGuard::PublishAuthorityLocked() {
   // before this increment; that is safe and the increment refreshes it again.
   // Once publication returns, acquire-version readers cannot reuse old state.
   authority_version_.fetch_add(1, std::memory_order_release);
-  // A new connection observes the retirement boundary only after request
-  // authority is closed. Delivery to socket-owning workers may be delayed,
-  // but cannot let an old connection cross a later reauthorization.
+  // Close request authority before asking socket-owning workers to clean up.
+  // Each worker sweeps its current clients, including recent reconnects.
   if (retired) retirement_callback_();
 }
 

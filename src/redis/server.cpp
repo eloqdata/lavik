@@ -1509,8 +1509,8 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
       peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
   ctx.peer_address_ = address;
   const bool tls = stream.IsTls();
-  ctx.retirement_generation_ =
-      RegisterClientConnection(ctx.conn_id_, stream.NativeFd(), address, tls);
+  RegisterClientConnection(ctx.conn_id_, stream.NativeFd(), address, tls, false,
+                           0, &ctx);
   ConnectionOpened();
   absl::Status observed = stream.SetPeerDisconnectCallback(
       [](void* context) noexcept {
@@ -1685,7 +1685,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       ClosePubSubSession(session);
       co_return absl::OkStatus();
     }
-    if (ClientConnectionRetired(ctx.retirement_generation_)) {
+    if (ctx.closing_) {
       ClosePubSubSession(session);
       co_return absl::OkStatus();
     }
@@ -1837,8 +1837,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
   PendingReplyBatch pending_replies;
 
   while (stream.IsOpen()) {
-    if (ClientConnectionRetired(ctx.retirement_generation_))
-      co_return absl::OkStatus();
+    if (ctx.closing_) co_return absl::OkStatus();
     ctx.reply_builder_.Reset();
     if (ShutdownRequested()) [[unlikely]] {
       co_return co_await FlushReplyBatch(stream, &pending_replies);
@@ -1871,8 +1870,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         co_return read_status;
       }
     }
-    if (ClientConnectionRetired(ctx.retirement_generation_))
-      co_return absl::OkStatus();
+    if (ctx.closing_) co_return absl::OkStatus();
     CommandBatch::BufferedCommand buffered = ready.PopFront();
     CommandBufferGuard command_memory(&client_buffers, buffered.input_bytes_);
     RespCommand command = std::move(buffered.command_);
@@ -2015,10 +2013,9 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
           [[unlikely]] {
         PublishMonitorMessage(std::move(monitor_message));
       }
-      // Flushing an earlier pipelined reply may suspend across a retirement
-      // and regrant; the connection itself must still be current at dispatch.
-      if (ClientConnectionRetired(ctx.retirement_generation_))
-        co_return absl::OkStatus();
+      // A worker may start connection cleanup while an earlier pipelined
+      // reply is suspended. Do not dispatch another buffered command.
+      if (ctx.closing_) co_return absl::OkStatus();
       reply = co_await DispatchCommand(ctx, request, ctx.reply_builder_);
     }
     if (ctx.queued_.size() > queued_before) {
