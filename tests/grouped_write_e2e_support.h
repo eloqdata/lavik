@@ -147,6 +147,40 @@ class PrivateDisk {
     return result;
   }
 
+  // External parent keys have no inline bytes for the scanner to compare.
+  // Use this only with fixtures whose entire disk contains the target keys.
+  std::size_t GroupedStringRootCount() const {
+    std::ifstream input(path_, std::ios::binary);
+    std::vector<std::byte> bytes(kStorageBlockBytes);
+    std::size_t count = 0;
+    while (input.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) {
+      BlockHeader block;
+      if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+                                      bytes.data(), kBlockHeaderBytes),
+                                  &block) ||
+          (block.kind_ != BlockKind::kRecords &&
+           block.kind_ != BlockKind::kTransaction))
+        continue;
+      for (std::size_t offset = kBlockHeaderBytes;
+           offset < block.committed_bytes_;) {
+        RecordHeader record;
+        std::string_view key;
+        if (!DecodeRecordHeader(std::span(bytes).subspan(
+                                    offset, block.committed_bytes_ - offset),
+                                &record, &key)) {
+          offset = (offset / kDirectIoAlignment + 1) * kDirectIoAlignment;
+          continue;
+        }
+        if (!record.auxiliary_group_ && record.grouped_ &&
+            record.value_type_ == ValueType::kString)
+          ++count;
+        Check(record.total_disk_bytes_ != 0, "zero record size");
+        offset += record.total_disk_bytes_;
+      }
+    }
+    return count;
+  }
+
  private:
   std::string path_;
   bool preserve_on_failure_ = false;

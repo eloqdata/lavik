@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -1229,15 +1230,11 @@ int main(int argc, char** argv) {
     // instead of also allowing an immediate out-of-space reply.
     CreateDataFile(standby_data, 128ULL * 1024 * 1024);
     ServerProcess standby_server(argv[1], port, standby_data, log_path, {}, {},
-                                 false, 4, {}, "1000");
+                                 false, 4, {}, "5000");
     RespClient standby_control = ConnectReady(port);
-    const std::string standby_payload(7 * 1024 * 1024, 's');
-    // Oversized parent keys deliberately use whole-value String storage.
-    // This fixture exercises ordinary-stream prefetch, not grouped tx IO.
-    const std::string standby_leader =
-        std::string(8193, 'k') + "leader{standby}";
-    const std::string standby_follower =
-        std::string(8193, 'k') + "follower{standby}";
+    // Compact values fill ordinary record blocks without String promotion.
+    const std::string standby_payload(16 * 1024 - 1, 's');
+    const std::string standby_leader = "leader{standby}";
     Expect(standby_control.Command({"SET", standby_leader, standby_payload}),
            "+OK", "create ordinary stream and request its standby");
     const auto standby_marker_deadline = std::chrono::steady_clock::now() + 30s;
@@ -1250,22 +1247,38 @@ int main(int argc, char** argv) {
       if (!standby_marker_seen) std::this_thread::sleep_for(20ms);
     }
     if (!standby_marker_seen) Fail("standby prefetch pause did not engage");
-    auto standby_waiter = std::async(
-        std::launch::async, [port, &standby_payload, &standby_follower] {
-          RespClient client = Connect(port);
-          return client.Command({"SET", standby_follower, standby_payload});
-        });
-    if (standby_waiter.wait_for(200ms) == std::future_status::ready) {
-      Fail("ordinary rollover bypassed an in-flight standby prefetch");
+    std::atomic<unsigned> completed{0};
+    auto standby_waiter = std::async(std::launch::async, [&] {
+      RespClient client = Connect(port);
+      for (unsigned i = 0; i < 600; ++i) {
+        Expect(client.Command({"SET", "fill{standby}:" + std::to_string(i),
+                               standby_payload}),
+               "+OK", "fill ordinary stream");
+        completed.store(i + 1, std::memory_order_release);
+      }
+    });
+    bool rollover_waited = false;
+    const auto rollover_deadline = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < rollover_deadline &&
+           standby_waiter.wait_for(0ms) != std::future_status::ready) {
+      const unsigned before = completed.load(std::memory_order_acquire);
+      std::this_thread::sleep_for(200ms);
+      if (before >= 400 &&
+          completed.load(std::memory_order_acquire) == before) {
+        rollover_waited = true;
+        break;
+      }
     }
-    if (standby_waiter.wait_for(5s) != std::future_status::ready) {
+    if (!rollover_waited)
+      Fail("ordinary rollover bypassed an in-flight standby prefetch");
+    if (standby_waiter.wait_for(10s) != std::future_status::ready) {
       Fail("standby prefetch stranded an ordinary rollover");
     }
-    Expect(standby_waiter.get(), "+OK", "ordinary standby rollover");
-    Expect(standby_control.Command({"STRLEN", standby_leader}), ":7340032",
+    standby_waiter.get();
+    Expect(standby_control.Command({"STRLEN", standby_leader}), ":16383",
            "standby leader value length");
-    Expect(standby_control.Command({"STRLEN", standby_follower}), ":7340032",
-           "standby follower value length");
+    Expect(standby_control.Command({"STRLEN", "fill{standby}:599"}), ":16383",
+           "standby final value length");
     standby_server.Stop();
 #endif
 

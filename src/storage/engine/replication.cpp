@@ -2104,7 +2104,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
     }
     absl::Status written;
     if (kind == RecordKind::kValue && value_type == ValueType::kString &&
-        ShouldGroupString(applied.key_.size(), applied.value_.size())) {
+        ShouldGroupString(applied.value_.size())) {
       if (sync->command_sequence_)
         co_return absl::FailedPreconditionError("nested String snapshot apply");
       sync->command_sequence_ = applied.mutation_sequence_;

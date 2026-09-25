@@ -3014,11 +3014,12 @@ void LargeHashDurabilityE2eTest::CheckGcCrash(std::string_view point) {
   GTEST_SKIP() << "requires Debug or the explicitly test-instrumented module";
 #else
   const std::string value(1024 * 1024, 'g');
+  const std::string filler_value(16 * 1024 - 1, 'f');
   std::vector<std::string> fillers;
-  // Keep fillers in ordinary record blocks so deleting them triggers the
-  // ordinary defrag crash site. Short-key large Strings use tx segments.
-  for (unsigned i = 0; i < 5; ++i)
-    fillers.push_back(std::string(8193, 'k') + "{large-hash-gc}:filler-" +
+  // Fill ordinary record blocks with compact Strings; values at 16 KiB
+  // would promote and move their payloads into transaction generations.
+  for (unsigned i = 0; i < 400; ++i)
+    fillers.push_back(std::string("{large-hash-gc}:filler-") +
                       std::to_string(i));
   {
     ServerProcess server(g_lavik_binary, port_, data_path_, log_path_, 2);
@@ -3027,7 +3028,7 @@ void LargeHashDurabilityE2eTest::CheckGcCrash(std::string_view point) {
     // Same hash slot puts the root beside filler payloads. Group children
     // belong to transaction generations and are relocated by the tx cleaner.
     for (const auto& key : fillers)
-      ASSERT_EQ(client.Command({"SET", key, value}), "+OK");
+      ASSERT_EQ(client.Command({"SET", key, filler_value}), "+OK");
     ASSERT_TRUE(WaitForDurability(client));
     server.Kill();
   }

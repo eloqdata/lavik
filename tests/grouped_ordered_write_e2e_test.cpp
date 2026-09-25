@@ -175,6 +175,41 @@ TEST(GroupedStringWriteE2e, FixedSegmentsPointWritesTtlAndRecovery) {
   EXPECT_EQ(client.Command({"GET", "string"}).text_, value);
 }
 
+TEST(GroupedStringWriteE2e, LongKeysPromoteAndRecover) {
+  PrivateDisk disk;
+  const std::string direct_key(8193, 'd');
+  const std::string append_key(8193, 'a');
+  const std::string value(16 * 1024, 'v');
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"SET", direct_key, value}).text_, "OK");
+    ASSERT_EQ(client.Command({"SET", append_key, value.substr(1)}).text_, "OK");
+    ASSERT_EQ(client.Command({"APPEND", append_key, "!"}).text_,
+              std::to_string(value.size()));
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  EXPECT_GE(disk.GroupedStringRootCount(), 2);
+  {
+    Server server(disk);
+    Client client(server.port());
+    EXPECT_EQ(client.Command({"GET", direct_key}).text_, value);
+    EXPECT_EQ(client.Command({"GETRANGE", append_key, "16383", "-1"}).text_,
+              "!");
+    ASSERT_EQ(client.Command({"SETRANGE", direct_key, "8191", "XY"}).text_,
+              std::to_string(value.size()));
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk);
+  Client client(recovered.port());
+  std::string changed = value;
+  changed.replace(8191, 2, "XY");
+  EXPECT_EQ(client.Command({"GET", direct_key}).text_, changed);
+  EXPECT_EQ(client.Command({"GET", append_key}).text_, value.substr(1) + "!");
+}
+
 TEST(GroupedStringWriteE2e, TransactionsTransferAndRdbKeepStringSemantics) {
   PrivateDisk disk;
   std::string value(8192 * 4, 'v');

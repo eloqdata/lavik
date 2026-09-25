@@ -45,13 +45,10 @@ enum class OrderedCollectionKind : std::uint8_t {
 
 inline constexpr std::size_t kStringGroupBytes = kCollectionGroupTargetBytes;
 
-// Auxiliary records carry the complete parent key. Keep oversized keys in
-// whole-value storage so segmentation cannot multiply key storage without
-// bound (e.g. repeating a multi-MiB key once per 8 KiB segment).
-inline constexpr bool ShouldGroupString(std::size_t key_bytes,
-                                        std::size_t value_bytes) noexcept {
-  return key_bytes <= kStringGroupBytes &&
-         value_bytes >= kCollectionPromotionBytes;
+// String promotion follows the same value-size boundary as other collections.
+// Each segment carries the parent key, so long keys increase grouped disk use.
+inline constexpr bool ShouldGroupString(std::size_t value_bytes) noexcept {
+  return value_bytes >= kCollectionPromotionBytes;
 }
 
 constexpr ValueType OrderedValueType(OrderedCollectionKind kind) noexcept {
