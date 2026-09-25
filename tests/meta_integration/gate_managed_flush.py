@@ -347,6 +347,8 @@ def reclaim(root, option, fail=False):
 
 def controlled_pause(root, mode, boundary):
     name = f"pause-{mode}-{boundary}"
+    before = boundary == "BEFORE_EPOCH"
+    expected = None
     hold = root / f"{name}.hold"
     variable = f"LAVIK_FLUSH_{boundary}_HOLD_FILE"
     fixture = F.FailoverFixture(
@@ -380,7 +382,15 @@ def controlled_pause(root, mode, boundary):
                 assert not pending.done()
                 assert F.redis_call(owner, ["ROLE"])[0] == "master"
                 hold.unlink()
-                assert pending.result(timeout=20) == "OK"
+                try:
+                    assert pending.result(timeout=20) == "OK"
+                except H.Failure as error:
+                    # Pause blocks new registration, not an already registered
+                    # Group guard. Before IO, the retained finite authority can
+                    # still expire; only that pre-cut refusal may preserve old
+                    # data. revoked() tests explicit lease expiry separately.
+                    assert before and str(error).startswith("TRYAGAIN"), error
+                    expected = "old"
             finally:
                 hold.unlink(missing_ok=True)
         begin = F.require_unique_failover_event(
@@ -390,7 +400,7 @@ def controlled_pause(root, mode, boundary):
         F.wait_serving_owner(fixture, selected, fixture.data_nodes, timeout=60)
         successor = Client(fixture.by_id[selected])
         try:
-            assert successor.call("GET", "old") is None
+            assert successor.call("GET", "old") == expected
             assert successor.call("SET", "after-failover", "new") == "OK"
             for node in fixture.data_nodes:
 
@@ -398,7 +408,7 @@ def controlled_pause(root, mode, boundary):
                     client = Client(node, readonly=mode == "cluster")
                     try:
                         return (
-                            client.call("GET", "old") is None
+                            client.call("GET", "old") == expected
                             and client.call("GET", "after-failover") == "new"
                         )
                     finally:
