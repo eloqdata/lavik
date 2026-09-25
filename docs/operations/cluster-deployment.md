@@ -37,7 +37,7 @@ for data requests while the replication link is down. Initial FULL and invalid
 populations return LOADING in either setting; replicas always reject mutations.
 Transactions, scripts/FCALL, Stream blocking and WAIT remain explicitly
 unsupported in managed Single. An uncertain Function
-catalog root commit or failure to publish an already durable mutation fences
+catalog root commit or failure to publish an already durable catalog mutation fences
 the Data process and closes the initiating connection; restart recovery is
 required and a blind retry cannot determine the prior outcome. Cluster retains
 DB0, CROSSSLOT, its COPY DB restriction and its READONLY contract.
