@@ -1066,27 +1066,37 @@ void MetaCoordinator::RunAsLeader(std::shared_ptr<MetaReconciler> reconciler) {
   leadership_cv_.notify_one();
 }
 
-void MetaCoordinator::BecomeLeader() {
+void MetaCoordinator::BecomeLeader(std::uint64_t term) {
   {
     std::lock_guard<std::mutex> lock(leadership_mu_);
     if (stopping_.load(std::memory_order_acquire)) return;
     leadership_events_.push_back(
-        LeadershipEvent{LeadershipEventKind::kBecomeLeader, nullptr});
+        LeadershipEvent{LeadershipEventKind::kBecomeLeader, nullptr, term});
   }
   leadership_cv_.notify_one();
 }
 
-void MetaCoordinator::BecomeFollower() {
+void MetaCoordinator::BecomeFollower(std::uint64_t term) {
   {
     std::lock_guard<std::mutex> lock(leadership_mu_);
     if (stopping_.load(std::memory_order_acquire)) return;
     leadership_events_.push_back(
-        LeadershipEvent{LeadershipEventKind::kBecomeFollower, nullptr});
+        LeadershipEvent{LeadershipEventKind::kBecomeFollower, nullptr, term});
   }
   leadership_cv_.notify_one();
 }
 
 void MetaCoordinator::LeadershipMain() {
+  auto cancel_owners = [this] {
+    applied_leader_ = false;
+    // Reverse registration order joins dependents before their providers.
+    for (auto it = reconcilers_.rbegin(); it != reconcilers_.rend(); ++it) {
+      if (it->started_) {
+        it->reconciler_->CancelAndWait();
+        it->started_ = false;
+      }
+    }
+  };
   std::unique_lock<std::mutex> lock(leadership_mu_);
   for (;;) {
     leadership_cv_.wait(lock, [&] {
@@ -1110,7 +1120,13 @@ void MetaCoordinator::LeadershipMain() {
         entry.reconciler_->Start(leader_context_);
       }
     } else if (event.kind_ == LeadershipEventKind::kBecomeLeader) {
-      if (!applied_leader_) {
+      // A queued Start may arrive after Raft has already retired its term.
+      // Never turn old work into work for whichever leader happens to be live.
+      if (event.term_ > leader_context_.term_ &&
+          (server_ == nullptr ||
+           server_->leader_term() == static_cast<std::int64_t>(event.term_))) {
+        if (applied_leader_) cancel_owners();
+        leader_context_.term_ = event.term_;
         // Soft evidence is scoped to one leadership epoch. Reset before any
         // reconciler starts so it can act only on freshly authenticated data.
         observations_.ResetForLeadershipChange();
@@ -1122,49 +1138,37 @@ void MetaCoordinator::LeadershipMain() {
           }
         }
       }
-    } else {
-      // Every observed follower edge is processed, including a redundant one:
+    } else if (event.term_ == leader_context_.term_) {
+      // Only this term's follower edge may cancel its running reconcilers:
       // it is the invalidation barrier for all leader-local authority.
-      applied_leader_ = false;
-      // Cancel in reverse registration order (stack discipline for
-      // reconcilers that depend on earlier ones).
-      for (auto it = reconcilers_.rbegin(); it != reconcilers_.rend(); ++it) {
-        if (it->started_) {
-          it->reconciler_->CancelAndWait();
-          it->started_ = false;
-        }
-      }
+      cancel_owners();
       observations_.ResetForLeadershipChange();
     }
     lock.lock();
   }
   lock.unlock();
   // Teardown: cancel and join whatever is still running.
-  for (auto it = reconcilers_.rbegin(); it != reconcilers_.rend(); ++it) {
-    if (it->started_) {
-      it->reconciler_->CancelAndWait();
-      it->started_ = false;
-    }
-  }
-  applied_leader_ = false;
+  cancel_owners();
 }
 
-void MetaLeadershipRelay::RecordLeaderEdge() noexcept { Record(Role::kLeader); }
-
-void MetaLeadershipRelay::RecordFollowerEdge() noexcept {
-  Record(Role::kFollower);
+void MetaLeadershipRelay::RecordLeaderEdge(std::uint64_t term) noexcept {
+  Record({Role::kLeader, term});
 }
 
-void MetaLeadershipRelay::Record(Role role) noexcept {
+void MetaLeadershipRelay::RecordFollowerEdge(std::uint64_t term) noexcept {
+  Record({Role::kFollower, term});
+}
+
+void MetaLeadershipRelay::Record(Edge edge) noexcept {
   std::lock_guard<std::mutex> lock(mu_);
   if (stopped_) return;
   // Allocation failure is fail-stop: dropping a role edge could preserve an
   // obsolete authority session, which is less safe than terminating.
-  pending_.push_back(role);
+  pending_.push_back(edge);
 }
 
 void MetaLeadershipRelay::Drain() noexcept {
-  std::deque<Role> batch;
+  std::deque<Edge> batch;
   MetaCoordinator* target = nullptr;
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -1175,7 +1179,7 @@ void MetaLeadershipRelay::Drain() noexcept {
   }
 
   for (;;) {
-    for (Role role : batch) Forward(*target, role);
+    for (Edge edge : batch) Forward(*target, edge);
     batch.clear();
 
     std::lock_guard<std::mutex> lock(mu_);
@@ -1217,16 +1221,17 @@ void MetaLeadershipRelay::DetachAndStop() noexcept {
   target_ = nullptr;
 }
 
-void MetaLeadershipRelay::Forward(MetaCoordinator& coordinator, Role role) {
-  if (role == Role::kLeader) {
-    coordinator.BecomeLeader();
+void MetaLeadershipRelay::Forward(MetaCoordinator& coordinator, Edge edge) {
+  if (edge.role_ == Role::kLeader) {
+    coordinator.BecomeLeader(edge.term_);
   } else {
-    coordinator.BecomeFollower();
+    coordinator.BecomeFollower(edge.term_);
   }
 }
 
 bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
-    MetaCommand command, AuthenticatedPrincipal principal) {
+    MetaCommand command, AuthenticatedPrincipal principal,
+    std::uint64_t expected_leader_term) {
   if (stopping_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kCancelled,
                            "meta: coordinator is stopping");
@@ -1235,9 +1240,13 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                            "meta: no raft server attached");
   }
-  if (!server_->is_leader()) {
+  const auto admitted_term = server_->leader_term();
+  if (admitted_term < 0 ||
+      (expected_leader_term != 0 &&
+       expected_leader_term != static_cast<std::uint64_t>(admitted_term))) {
     co_return NotLeaderStatus();
   }
+  const auto proposal_term = static_cast<std::uint64_t>(admitted_term);
 
   // Counted from here to every exit (normal or frame destruction) so the
   // destructor can drain caller coroutines. Audit headroom follows the Raft
@@ -1367,10 +1376,12 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   waiter->recovery_reservation_ = std::move(recovery_reservation);
   std::vector<std::shared_ptr<MetaRaftBuffer>> logs;
   logs.push_back(*encoded);
-  const absl::Status submitted = proposal_executor_->Submit(
-      [server = server_, logs = std::move(logs), waiter]() mutable {
+  const absl::Status submitted =
+      proposal_executor_->Submit([server = server_, logs = std::move(logs),
+                                  waiter, proposal_term]() mutable {
         try {
-          std::shared_ptr<CmdResult> result = server->append_entries(logs);
+          std::shared_ptr<CmdResult> result =
+              server->append_entries(logs, proposal_term);
           if (result == nullptr) {
             FailProposeDispatch(waiter);
             return;
@@ -1429,7 +1440,13 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
 
 bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaLeaderContext::Propose(
     MetaCommand command) {
-  return coordinator_->Propose(std::move(command), actor_);
+  return coordinator_->Propose(std::move(command), actor_, term_);
+}
+
+bool MetaLeaderContext::IsCurrent() const {
+  return term_ != 0 && (coordinator_->server_ == nullptr ||
+                        coordinator_->server_->leader_term() ==
+                            static_cast<std::int64_t>(term_));
 }
 
 MetaCommittedView MetaLeaderContext::CommittedView() {

@@ -523,6 +523,7 @@ int main(int argc, char** argv) {
       lavik::FormatNumericEndpoint({.host_ = data_control_endpoint->host_,
                                     .port_ = data_control_endpoint->port_});
   raft_options.local_admin_ = ctl_endpoint_text;
+  raft_options.local_sentinel_ = options.sentinel_addr_;
   raft_options.tls_ca_ = options.tls_ca_;
   raft_options.tls_cert_ = options.tls_cert_;
   raft_options.tls_key_ = options.tls_key_;
@@ -545,6 +546,13 @@ int main(int argc, char** argv) {
       return 1;
     }
     for (const auto& member : manifest->meta_members_) {
+      if (member.server_id_ == static_cast<std::uint32_t>(options.id_) &&
+          !member.sentinel_endpoint_.empty() &&
+          options.sentinel_addr_.empty()) {
+        spdlog::critical(
+            "registered Sentinel endpoint requires --sentinel-addr");
+        return 1;
+      }
       raft_options.initial_.push_back(
           std::make_shared<lavik::meta::MetaRaftMember>(
               member.server_id_, 0,
@@ -554,7 +562,11 @@ int main(int argc, char** argv) {
                   "lavik://meta/" + std::to_string(member.server_id_),
                   StripValidatedTcpEndpointScheme(
                       member.data_control_endpoint_),
-                  StripValidatedTcpEndpointScheme(member.ctl_endpoint_)}
+                  StripValidatedTcpEndpointScheme(member.ctl_endpoint_),
+                  member.sentinel_endpoint_.empty()
+                      ? ""
+                      : StripValidatedTcpEndpointScheme(
+                            member.sentinel_endpoint_)}
                   .EncodeAux()));
     }
   }
@@ -604,8 +616,8 @@ int main(int argc, char** argv) {
   auto leadership_relay = std::make_shared<MetaLeadershipRelay>();
   raft_options.role_ = [foreign_executor, leadership_relay](
                            bool leader, std::uint64_t term) {
-    leader ? leadership_relay->RecordLeaderEdge()
-           : leadership_relay->RecordFollowerEdge();
+    leader ? leadership_relay->RecordLeaderEdge(term)
+           : leadership_relay->RecordFollowerEdge(term);
     if (!foreign_executor.Notify([leadership_relay, leader, term]() noexcept {
           spdlog::info("[raft-cb] event={} term={}",
                        leader ? "BecomeLeader" : "BecomeFollower", term);
@@ -862,6 +874,7 @@ int main(int argc, char** argv) {
     coordinator->RunAsLeader(data_control);
     coordinator->RunAsLeader(automatic_failover_reconciler);
     coordinator->RunAsLeader(failover_reconciler);
+    if (sentinel) coordinator->RunAsLeader(sentinel);
   }
 
   if (exit_code == 0) {
@@ -907,7 +920,8 @@ int main(int argc, char** argv) {
   // cancels any reconciler still running if it reaches destruction before
   // this queued edge is consumed.
   leadership_relay->DetachAndStop();
-  coordinator->BecomeFollower();
+  if (const auto term = server->leader_term(); term >= 0)
+    coordinator->BecomeFollower(static_cast<std::uint64_t>(term));
   // No new Bycorf ingress or leader work is accepted. Drain queued Raft
   // mutation/snapshot entry before joining its Go executors; result
   // completions can still use the live foreign executor while shutdown

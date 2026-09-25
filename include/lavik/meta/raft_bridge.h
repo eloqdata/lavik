@@ -29,7 +29,7 @@ typedef struct LavikRaftCallbacks {
   int (*identities)(uintptr_t owner, LavikRaftBytes* result);
   /* Must revoke authority without waiting for another callback or worker. */
   void (*role)(uintptr_t owner, uint64_t term, uint64_t leader, int is_leader,
-               int caught_up, uint64_t resign_index);
+               int caught_up);
   void (*result)(uintptr_t owner, uint64_t ticket, uint64_t index, int code,
                  void* data, uint64_t size);
   void (*fatal)(uintptr_t owner, void* data, uint64_t size);
@@ -38,11 +38,12 @@ typedef struct LavikRaftCallbacks {
 uint64_t lavik_raft_open(void* config, uint64_t size, uintptr_t owner,
                          LavikRaftCallbacks* callbacks, LavikRaftBytes* error);
 int lavik_raft_propose(uint64_t handle, uint64_t ticket, void* data,
-                       uint64_t size);
+                       uint64_t size, uint64_t expected_term);
 int lavik_raft_snapshot(uint64_t handle, uint64_t ticket);
 int lavik_raft_member(uint64_t handle, uint64_t ticket, void* data,
-                      uint64_t size, int remove, int learner);
-void lavik_raft_resign(uint64_t handle, uint64_t resign_index);
+                      uint64_t size, int remove, int learner,
+                      uint64_t expected_term);
+void lavik_raft_resign(uint64_t handle, uint64_t term);
 int lavik_raft_status(uint64_t handle, LavikRaftBytes* output);
 void lavik_raft_close(uint64_t handle);
 

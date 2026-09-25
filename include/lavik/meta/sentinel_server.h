@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,7 @@
 #include "absl/status/statusor.h"
 #include "bycorf/runtime/foreign_executor.h"
 #include "bycorf/runtime/task.h"
+#include "lavik/meta/coordinator.h"
 
 namespace bycorf {
 class TcpStream;
@@ -47,6 +49,8 @@ struct MetaSentinelServerOptions {
   std::size_t maxclients_ = 256;
   std::size_t query_limit_ = 64 * 1024;
   std::size_t reply_limit_ = 64 * 1024;
+  std::size_t total_output_limit_ = 8 * 1024 * 1024;
+  std::size_t subscription_limit_ = 128;
   std::chrono::milliseconds progress_timeout_{10000};
 };
 
@@ -79,7 +83,7 @@ struct MetaSentinelDiscoveryDependencies {
 // without a reply so client seed lists rotate to another Meta member. That
 // silent drop is deliberate: clients must not act on non-authoritative
 // topology, and no private redirect exists on this surface.
-class MetaSentinelServer {
+class MetaSentinelServer : public MetaReconciler {
  public:
   static absl::StatusOr<std::shared_ptr<MetaSentinelServer>> Create(
       bycorf::ForeignExecutor executor,
@@ -94,6 +98,9 @@ class MetaSentinelServer {
   // Stops accepts and joins all sessions before returning; idempotent after
   // drain, including destruction after the runtime has stopped.
   void Shutdown();
+  // Leader callbacks revoke discovery sessions before acknowledging demotion.
+  void Start(MetaLeaderContext& context) override;
+  void CancelAndWait() override;
 
  private:
   struct Core;
@@ -106,7 +113,7 @@ class MetaSentinelServer {
                                                 SessionBorrow borrow);
   CorePtr core_;
   bool started_ = false;
-  bool stopped_ = false;
+  std::atomic<bool> stopped_{false};
 };
 
 }  // namespace lavik::meta

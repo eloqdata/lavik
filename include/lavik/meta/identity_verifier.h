@@ -82,6 +82,7 @@ struct MetaMemberIdentity {
   std::string principal_;
   std::string data_control_endpoint_;
   std::string ctl_endpoint_;
+  std::string sentinel_endpoint_;
 
   std::string EncodeAux() const;
   static absl::StatusOr<MetaMemberIdentity> DecodeAux(std::string_view aux);

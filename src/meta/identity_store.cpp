@@ -127,7 +127,7 @@ absl::StatusOr<std::string> CanonicalMetaDataControlEndpoint(
 
 absl::StatusOr<std::string> CanonicalMetaAdminEndpoint(
     std::string_view encoded) {
-  auto endpoint = lavik::ParseNumericEndpoint(encoded);
+  auto endpoint = lavik::ParseConcreteNumericEndpoint(encoded);
   if (!endpoint.has_value()) {
     return absl::InvalidArgumentError(
         "Meta ctl endpoint must be numeric IPv4:port or [IPv6]:port");
@@ -168,6 +168,7 @@ absl::Status ValidateActiveMetaDirectory(
   directory.reserve(members.size());
   std::set<std::pair<std::string, std::uint16_t>> endpoints;
   std::set<std::string> ctl_endpoints;
+  std::set<std::string> sentinel_endpoints;
   for (const MetaMemberRecord& member : members) {
     if (member.retired_) continue;
     auto endpoint = ParseMetaControlEndpoint(member);
@@ -175,6 +176,11 @@ absl::Status ValidateActiveMetaDirectory(
     if (!endpoints.emplace(endpoint->host, endpoint->port).second) {
       return absl::InvalidArgumentError(
           "active Meta data-control endpoints must be unique");
+    }
+    if (!member.sentinel_endpoint_.empty() &&
+        !sentinel_endpoints.insert(member.sentinel_endpoint_).second) {
+      return absl::InvalidArgumentError(
+          "active Meta Sentinel endpoints must be unique");
     }
     directory.push_back(std::move(*endpoint));
     if (member.ctl_endpoint_.has_value() &&
@@ -348,9 +354,17 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
     }
     canonical_ctl_endpoint = std::move(*parsed);
   }
+  std::string sentinel;
+  if (!cmd.sentinel_endpoint_.empty()) {
+    auto parsed = CanonicalMetaAdminEndpoint(cmd.sentinel_endpoint_);
+    if (!parsed.ok()) return MetaDomainRejectError(parsed.status().message());
+    sentinel = std::move(*parsed);
+  }
   if (const auto existing = meta_members_.find(cmd.server_id_);
       existing != meta_members_.end()) {
     MetaMemberRecord& record = existing->second;
+    if (record.sentinel_endpoint_ != sentinel)
+      return MetaDomainRejectError("meta Sentinel endpoint is immutable");
     if (!record.retired_ && record.principal_ == cmd.principal_ &&
         record.data_control_endpoint_ == *canonical_endpoint) {
       if (record.ctl_endpoint_ == canonical_ctl_endpoint) {
@@ -387,7 +401,8 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
       .principal_ = cmd.principal_,
       .data_control_endpoint_ = std::move(*canonical_endpoint),
       .ctl_endpoint_ = std::move(canonical_ctl_endpoint),
-      .retired_ = false};
+      .retired_ = false,
+      .sentinel_endpoint_ = std::move(sentinel)};
   std::vector<MetaMemberRecord> candidate = MetaMembers();
   candidate.push_back(record);
   if (auto status = ValidateActiveMetaDirectory(candidate); !status.ok()) {
@@ -486,6 +501,7 @@ void MetaIdentityStore::WriteSnapshot(MetaWriter& w) const {
     w.WriteString(record.data_control_endpoint_);
     w.WriteBool(record.ctl_endpoint_.has_value());
     if (record.ctl_endpoint_.has_value()) w.WriteString(*record.ctl_endpoint_);
+    w.WriteString(record.sentinel_endpoint_);
     w.WriteBool(record.retired_);
   }
 }
@@ -598,6 +614,13 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
       }
       ctl_endpoint = std::move(*canonical_ctl);
     }
+    auto sentinel = r.ReadString(kMaxMetaEndpointBytes);
+    if (!sentinel.ok()) return sentinel.status();
+    if (!sentinel->empty()) {
+      auto canonical = CanonicalMetaAdminEndpoint(*sentinel);
+      if (!canonical.ok() || *canonical != *sentinel)
+        return MetaFailStopError("non-canonical Meta Sentinel endpoint");
+    }
     auto retired = r.ReadBool("invalid meta member in snapshot");
     if (!retired.ok()) return retired.status();
     if (*server_id == 0 ||
@@ -629,7 +652,8 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
         .principal_ = std::string(*principal),
         .data_control_endpoint_ = std::move(*canonical_endpoint),
         .ctl_endpoint_ = std::move(ctl_endpoint),
-        .retired_ = *retired};
+        .retired_ = *retired,
+        .sentinel_endpoint_ = std::string(*sentinel)};
     store.meta_server_id_by_principal_.emplace(record.principal_,
                                                record.server_id_);
     store.meta_members_.emplace(record.server_id_, std::move(record));

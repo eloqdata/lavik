@@ -110,11 +110,12 @@ bool detail::IsStableClusterStatusBracket(
          before.leadership_.leader_authority_eligible_ && after.is_leader_ &&
          after.leader_alive_ && after.leadership_.leader_authority_eligible_ &&
          after.term_ == before.term_ &&
+         before.leadership_.leader_term_ == before.term_ &&
+         after.leadership_.leader_term_ == after.term_ &&
          after.config_index_ == before.config_index_ &&
          after.config_server_ids_ == before.config_server_ids_ &&
          after.active_meta_members_ == before.active_meta_members_ &&
-         after.leadership_.leadership_generation_ ==
-             before.leadership_.leadership_generation_ &&
+         after.leadership_.leader_term_ == before.leadership_.leader_term_ &&
          after.leadership_.leader_authority_eligibility_revision_ ==
              before.leadership_.leader_authority_eligibility_revision_;
 }
@@ -123,7 +124,7 @@ bool detail::IsCurrentAutomaticFailoverDiagnostics(
     const MetaDataControlRuntimeSnapshot& runtime,
     const MetaAutomaticFailoverDiagnosticsSnapshot& detector,
     std::uint64_t committed_applied_index) {
-  return detector.leadership_generation_ == runtime.leadership_generation_ &&
+  return detector.leader_term_ == runtime.leader_term_ &&
          detector.leader_authority_eligibility_revision_ ==
              runtime.leader_authority_eligibility_revision_ &&
          detector.evaluated_applied_index_ == committed_applied_index;
@@ -200,8 +201,7 @@ void detail::ApplyClusterRuntimeObservation(
           committed_group->grant_.grant_.has_value() && current_assignment &&
           granted->leader_id == capture.responder_id_ &&
           granted->raft_term == capture.term_ &&
-          granted->leadership_generation ==
-              runtime_node.leadership_generation_ &&
+          granted->raft_term == runtime_node.leader_term_ &&
           granted->data_boot_id == runtime_node.boot_id_ &&
           granted->control_revision == runtime_node.control_revision_ &&
           granted->group_term == committed_group->grant_.group_term_;
@@ -360,7 +360,8 @@ std::string BuildClusterHeadReply(
   // Use one role observation for both fields. A promotion can otherwise land
   // between two is_leader() reads and create a structurally corrupt head that
   // the client must treat as fatal instead of retrying ordinary term churn.
-  const bool responder_is_leader = server->is_leader();
+  const auto admitted_term = server->leader_term();
+  const bool responder_is_leader = admitted_term >= 0;
   const std::int32_t leader_id =
       responder_is_leader ? server->get_id() : server->get_leader();
   if (leader_id <= 0) return "ERR leader_unknown";
@@ -383,11 +384,15 @@ std::string BuildClusterHeadReply(
   head.responder_id_ = static_cast<std::uint32_t>(server->get_id());
   head.role_ = responder_is_leader ? ClusterMetaRole::kLeader
                                    : ClusterMetaRole::kFollower;
-  head.term_ = server->get_term();
+  head.term_ = responder_is_leader ? static_cast<std::uint64_t>(admitted_term)
+                                   : server->get_term();
   if (leader_id > 0) head.leader_id_ = static_cast<std::uint32_t>(leader_id);
   head.config_index_ = config->get_log_idx();
   head.meta_members_ = StatusMembers(members, leader_id);
   auto encoded = EncodeClusterHeadReply(head);
+  if (server->leader_term() != admitted_term ||
+      (!responder_is_leader && server->get_term() != head.term_))
+    return "ERR cut_changed";
   return encoded.ok() ? std::move(*encoded) : "ERR state_corrupt";
 }
 
@@ -398,12 +403,11 @@ std::string BuildClusterStatusReply(
     const std::shared_ptr<MetaAutomaticFailoverDiagnosticsRegistry>&
         automatic_failover_diagnostics,
     std::uint32_t observation_ttl_ms) {
-  const bool before_is_leader = server->is_leader();
-  const bool before_leader_alive = server->is_leader_alive();
-  if (!before_is_leader) return "ERR not_leader";
-  if (!before_leader_alive) return "ERR leader_not_caught_up";
-
-  const std::uint64_t before_term = server->get_term();
+  const auto admitted_term = server->leader_term();
+  if (admitted_term < 0) return "ERR not_leader";
+  const bool before_is_leader = true;
+  const bool before_leader_alive = true;
+  const auto before_term = static_cast<std::uint64_t>(admitted_term);
   const std::shared_ptr<MetaRaftConfig> before_config = server->get_config();
   if (before_config == nullptr) return "ERR leader_not_caught_up";
   const std::uint64_t before_config_index = before_config->get_log_idx();
@@ -415,7 +419,7 @@ std::string BuildClusterStatusReply(
   // FDS and authority anchors still describe that committed cut.
   const MetaDataControlRuntimeSnapshot runtime = runtime_status->Snapshot();
   if (!runtime.leader_authority_eligible_ ||
-      runtime.leadership_generation_ == 0) {
+      runtime.leader_term_ != before_term) {
     return "ERR leader_not_caught_up";
   }
   const MetaAutomaticFailoverDiagnosticsSnapshot detector =
@@ -443,7 +447,7 @@ std::string BuildClusterStatusReply(
       .config_index_ = before_config_index,
       .config_server_ids_ = before_config_ids,
       .active_meta_members_ = active_meta_members,
-      .leadership_ = {.leadership_generation_ = runtime.leadership_generation_,
+      .leadership_ = {.leader_term_ = runtime.leader_term_,
                       .leader_authority_eligible_ =
                           runtime.leader_authority_eligible_,
                       .leader_authority_eligibility_revision_ =
@@ -820,10 +824,11 @@ std::string BuildClusterStatusReply(
   const MetaCommittedStatusView after_view = state_machine->StatusSnapshot();
   const MetaDataControlLeadershipState after_leadership =
       runtime_status->LeadershipState();
+  const auto after_term = server->leader_term();
   detail::MetaClusterStatusBracket after_bracket{
-      .is_leader_ = server->is_leader(),
-      .leader_alive_ = server->is_leader_alive(),
-      .term_ = server->get_term(),
+      .is_leader_ = after_term >= 0,
+      .leader_alive_ = after_term >= 0,
+      .term_ = after_term >= 0 ? static_cast<std::uint64_t>(after_term) : 0,
       .config_index_ = 0,
       .config_server_ids_ = {},
       .active_meta_members_ = {},
@@ -2122,8 +2127,8 @@ bycorf::Task<std::string> HandleConfigChange(
     AuthenticatedPrincipal principal,
     const std::shared_ptr<MetaMembershipGate>& membership_gate, bool add,
     int server_id, std::string endpoint, std::string data_control_endpoint,
-    std::string ctl_endpoint, const std::string& member_principal,
-    const bool* shutdown) {
+    std::string ctl_endpoint, std::string sentinel_endpoint,
+    const std::string& member_principal, const bool* shutdown) {
   if (*shutdown) co_return "ERR shutting-down";
   if (!server->is_leader() || !server->is_leader_alive() ||
       !server->is_leader_sm_fully_caught_up())
@@ -2140,6 +2145,11 @@ bycorf::Task<std::string> HandleConfigChange(
     endpoint = lavik::FormatNumericEndpoint(*raft);
     data_control_endpoint = lavik::FormatNumericEndpoint(*data);
     ctl_endpoint = lavik::FormatNumericEndpoint(*ctl);
+    if (!sentinel_endpoint.empty()) {
+      auto sentinel = lavik::ParseConcreteNumericEndpoint(sentinel_endpoint);
+      if (!sentinel) co_return "ERR rejected";
+      sentinel_endpoint = lavik::FormatNumericEndpoint(*sentinel);
+    }
   }
   const auto before = state_machine->StoresSnapshot();
   if (before.topology_.ClusterLifecycle().state_ ==
@@ -2159,6 +2169,7 @@ bycorf::Task<std::string> HandleConfigChange(
           intent->target_.principal_ != member_principal ||
           intent->target_.data_control_endpoint_ != data_control_endpoint ||
           intent->target_.ctl_endpoint_ != ctl_endpoint ||
+          intent->target_.sentinel_endpoint_ != sentinel_endpoint ||
           intent->binding_.data_control_endpoint_ != data_control_endpoint ||
           intent->binding_.ctl_endpoint_ != std::optional(ctl_endpoint))))
       co_return "ERR config-changing";
@@ -2202,15 +2213,27 @@ bycorf::Task<std::string> HandleConfigChange(
           .principal_ = member_principal,
           .data_control_endpoint_ = data_control_endpoint,
           .ctl_endpoint_ = ctl_endpoint,
+          .sentinel_endpoint_ = sentinel_endpoint,
       };
       intent.binding_ = {static_cast<std::uint32_t>(server_id),
-                         member_principal, data_control_endpoint, ctl_endpoint,
-                         false};
+                         member_principal,
+                         data_control_endpoint,
+                         ctl_endpoint,
+                         false,
+                         sentinel_endpoint};
       BindMetaMember bind;
       bind.server_id_ = server_id;
       bind.principal_ = member_principal;
       bind.data_control_endpoint_ = data_control_endpoint;
       bind.ctl_endpoint_ = ctl_endpoint;
+      bind.sentinel_endpoint_ = sentinel_endpoint;
+      // A Single discovery deployment cannot admit a voter without an entry.
+      if (before.topology_.ClusterLifecycle().client_mode_ ==
+              ClientMode::kSingle &&
+          std::any_of(config->begin(), config->end(), [&](const auto& p) {
+            return p.sentinel_endpoint_.empty() != sentinel_endpoint.empty();
+          }))
+        co_return "ERR inconsistent-sentinel-coverage";
       auto identity = before.identity_;
       if (!identity.Apply(bind).ok()) co_return "ERR rejected";
     } else {
@@ -2852,7 +2875,7 @@ bycorf::Task<std::string> DispatchCommand(
     if (!membership_enabled) co_return "ERR membership-unavailable";
     const bool add = command == "addsrv";
     if ((!add && tokens.size() != 2u) ||
-        (add && tokens.size() != 5u && tokens.size() != 6u)) {
+        (add && (tokens.size() < 5u || tokens.size() > 7u))) {
       co_return "ERR bad-request";
     }
     int server_id = 0;
@@ -2860,15 +2883,25 @@ bycorf::Task<std::string> DispatchCommand(
       co_return "ERR bad-request";
     }
     std::string member_principal = "lavik://meta/" + std::to_string(server_id);
-    if (add && tokens.size() == 6u) {
-      member_principal = tokens[5];
+    std::string sentinel_endpoint;
+    for (std::size_t i = 5; add && i < tokens.size(); ++i) {
+      if (tokens[i].starts_with("sentinel=")) {
+        if (!sentinel_endpoint.empty()) co_return "ERR bad-request";
+        sentinel_endpoint = tokens[i].substr(9);
+        if (sentinel_endpoint.empty()) co_return "ERR bad-request";
+      } else if (i == 5) {
+        member_principal = tokens[i];
+      } else {
+        co_return "ERR bad-request";
+      }
     }
     co_return co_await HandleConfigChange(
         std::move(server), std::move(state_machine), coordinator,
         std::move(principal), membership_gate, add, server_id,
         add ? tokens[2] : std::string(),
         add ? tokens[3] : std::string(local_data_control_endpoint),
-        add ? tokens[4] : std::string(), member_principal, shutdown);
+        add ? tokens[4] : std::string(), std::move(sentinel_endpoint),
+        member_principal, shutdown);
   }
   if (command == "snapshot") {
     // The Go application executor captures an exact cut. This wait runs on

@@ -601,6 +601,7 @@ set(LAVIK_META_CORE_SOURCES
   src/meta/coordinator.cpp
   src/meta/ctl_server.cpp
   src/meta/sentinel_discovery.cpp
+  src/meta/sentinel_events.cpp
   src/meta/sentinel_server.cpp
   src/meta/data_control_server.cpp
   src/meta/data_control_runtime_status.cpp
@@ -1293,6 +1294,29 @@ if (BUILD_TESTING)
       # ctest never builds; keep the driver in the default target set.
       add_custom_target(lavik_cluster_client_go ALL
         DEPENDS ${cluster_client_go_bin})
+      set(sentinel_client_go_dir
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/sentinel_client_go")
+      set(sentinel_client_go_bin "${CMAKE_CURRENT_BINARY_DIR}/sentinel-client-go")
+      add_custom_command(OUTPUT ${sentinel_client_go_bin}
+        COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=0
+          GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
+          ${LAVIK_GO_EXECUTABLE} build -mod=readonly -o ${sentinel_client_go_bin} .
+        WORKING_DIRECTORY ${sentinel_client_go_dir}
+        DEPENDS ${sentinel_client_go_dir}/main.go ${sentinel_client_go_dir}/go.mod
+                ${sentinel_client_go_dir}/go.sum
+        VERBATIM)
+      add_custom_target(lavik_sentinel_client_go ALL DEPENDS ${sentinel_client_go_bin})
+      foreach(scenario meta data)
+        add_test(NAME meta_integration.sentinel_ha_${scenario}
+          COMMAND ${CMAKE_COMMAND} -E env
+            "LAVIK_SENTINEL_REDIS_PY=${LAVIK_CLUSTER_CLIENT_REDIS_PY}"
+            ${LAVIK_PYTHON3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_sentinel_ha.py
+            $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>
+            ${sentinel_client_go_bin} ${scenario})
+        set_tests_properties(meta_integration.sentinel_ha_${scenario} PROPERTIES
+          LABELS "meta-integration;sentinel-client" TIMEOUT 300 RUN_SERIAL TRUE)
+      endforeach()
       set(cluster_client_workdir
         "${CMAKE_CURRENT_BINARY_DIR}/meta-integration/cluster-client")
       file(MAKE_DIRECTORY "${cluster_client_workdir}")

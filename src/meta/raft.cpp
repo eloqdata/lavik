@@ -45,6 +45,7 @@ std::string MemberJson(const MetaRaftMember& member) {
                       ",\"raft\":", Quote(member.get_endpoint()),
                       ",\"data\":", Quote(identity->data_control_endpoint_),
                       ",\"admin\":", Quote(identity->ctl_endpoint_),
+                      ",\"sentinel\":", Quote(identity->sentinel_endpoint_),
                       ",\"principal\":", Quote(identity->principal_), "}");
 }
 
@@ -55,11 +56,18 @@ std::string ConfigJson(const MetaRaftOptions& options) {
     if (member->get_id() == options.id_) advertised = member->get_endpoint();
   }
   // Advertised routes may name a proxy. They are independent of local binds.
+  std::string sentinel = options.local_sentinel_;
+  for (const auto& member : options.initial_) {
+    if (member->get_id() == options.id_) {
+      auto identity = MetaMemberIdentity::DecodeAux(member->get_aux());
+      if (identity.ok()) sentinel = identity->sentinel_endpoint_;
+    }
+  }
   const MetaRaftMember local(
       options.id_, 0, advertised,
       MetaMemberIdentity{options.id_,
                          absl::StrCat("lavik://meta/", options.id_),
-                         options.local_data_, options.local_admin_}
+                         options.local_data_, options.local_admin_, sentinel}
           .EncodeAux());
   std::string initial = "[";
   for (const auto& member : options.initial_) {
@@ -227,6 +235,7 @@ absl::StatusOr<std::shared_ptr<MetaRaft>> MetaRaft::Open(
             ",\"principal\":", Quote(binding.principal_),
             ",\"data\":", Quote(binding.data_control_endpoint_),
             ",\"admin\":", Quote(binding.ctl_endpoint_.value_or("")),
+            ",\"sentinel\":", Quote(binding.sentinel_endpoint_),
             ",\"retired\":", binding.retired_ ? "true" : "false", "}");
       }
       result += ']';
@@ -245,9 +254,9 @@ absl::StatusOr<std::shared_ptr<MetaRaft>> MetaRaft::Open(
     }
   };
   callbacks.role = [](uintptr_t owner, uint64_t term, uint64_t leader,
-                      int is_leader, int caught_up, uint64_t resign_index) {
+                      int is_leader, int caught_up) {
     reinterpret_cast<MetaRaft*>(owner)->OnRole(term, leader, is_leader,
-                                               caught_up, resign_index);
+                                               caught_up);
   };
   callbacks.result = [](uintptr_t owner, uint64_t ticket, uint64_t index,
                         int code, void* data, uint64_t size) {
@@ -287,25 +296,34 @@ absl::StatusOr<std::shared_ptr<MetaRaft>> MetaRaft::Open(
 MetaRaft::~MetaRaft() { shutdown(); }
 
 void MetaRaft::OnRole(std::uint64_t term, std::uint64_t leader, bool is_leader,
-                      bool caught_up, std::uint64_t resign_index) noexcept {
-  const auto previous_term = term_.exchange(term);
+                      bool caught_up) noexcept {
+  if (term >= static_cast<std::uint64_t>(INT64_MAX)) std::terminate();
+  term_.store(term);
   leader_id_.store(leader ? static_cast<std::int32_t>(leader) : -1);
-  caught_up_.store(caught_up, std::memory_order_release);
-  // Revocation precedes the slower ordered relay. Readers cannot keep granting
-  // authority while a snapshot or apply event delays the Bycorf mailbox.
-  auto current = authority_.load(std::memory_order_acquire);
-  bool allowed;
-  do {
-    allowed = is_leader && caught_up && !(current & kStopped) &&
-              (current >> 1) <= resign_index;
-  } while (!authority_.compare_exchange_weak(
-      current, (current & ~std::uint64_t{1}) | allowed,
-      std::memory_order_acq_rel));
-  const bool previous = std::exchange(relayed_leader_, allowed);
-  if ((previous != allowed || (!allowed && previous_term != term)) &&
-      options_.role_) {
+  const auto incoming = static_cast<std::int64_t>(term);
+  auto current = leader_term_.load(std::memory_order_acquire);
+  while (current != kStopped) {
+    const auto last = current >= 0 ? current : -(current + 1);
+    auto next = current;
+    if (is_leader && caught_up) {
+      if (incoming > last || (incoming == last && current >= 0))
+        next = incoming;
+    } else if (current >= 0) {
+      // A candidate already has its prospective term. Retire only the term
+      // actually admitted here, so winning that election can still publish.
+      next = -(current + 1);
+    }
+    if (leader_term_.compare_exchange_weak(current, next,
+                                           std::memory_order_acq_rel))
+      break;
+  }
+  const auto published = leader_term();
+  const auto previous = std::exchange(relayed_leader_term_, published);
+  if (previous != published && options_.role_) {
     try {
-      options_.role_(allowed, term);
+      if (previous >= 0)
+        options_.role_(false, static_cast<std::uint64_t>(previous));
+      if (published >= 0) options_.role_(true, term);
     } catch (...) {
       std::terminate();
     }
@@ -314,8 +332,7 @@ void MetaRaft::OnRole(std::uint64_t term, std::uint64_t leader, bool is_leader,
 
 void MetaRaft::shutdown() {
   if (stopping_.exchange(true)) return;
-  authority_.fetch_or(kStopped, std::memory_order_acq_rel);
-  caught_up_.store(false);
+  leader_term_.store(kStopped, std::memory_order_release);
   if (observer_.joinable()) observer_.join();
   if (handle_ != 0) {
     lavik_raft_close(handle_);
@@ -369,6 +386,7 @@ bool MetaRaft::RefreshStatus() {
       auto endpoint = reader.Text();
       auto data = reader.Text();
       auto admin = reader.Text();
+      auto sentinel = reader.Text();
       auto principal = reader.Text();
       const auto applied = reader.Integer();
       const auto age = reader.Integer();
@@ -378,7 +396,7 @@ bool MetaRaft::RefreshStatus() {
           id, 0, std::move(endpoint),
           MetaMemberIdentity{static_cast<std::int32_t>(id),
                              std::move(principal), std::move(data),
-                             std::move(admin)}
+                             std::move(admin), std::move(sentinel)}
               .EncodeAux(),
           learner));
       if (id != static_cast<std::uint64_t>(options_.id_))
@@ -448,15 +466,23 @@ void MetaRaft::OnResult(std::uint64_t ticket, std::uint64_t index, int code,
 }
 
 std::shared_ptr<MetaRaftResult> MetaRaft::append_entries(
-    const std::vector<std::shared_ptr<MetaRaftBuffer>>& entries) {
+    const std::vector<std::shared_ptr<MetaRaftBuffer>>& entries,
+    std::uint64_t expected_term) {
   auto [ticket, result] = NewResult();
   if (!ticket) return result;
   if (entries.size() != 1 || !entries[0]) {
     OnResult(ticket, 0, 3, nullptr, 0);
     return result;
   }
+  const auto current = leader_term();
+  if (current < 0 || (expected_term != 0 &&
+                      expected_term != static_cast<std::uint64_t>(current))) {
+    OnResult(ticket, 0, 2, nullptr, 0);
+    return result;
+  }
   const int code = lavik_raft_propose(handle_, ticket, entries[0]->data_begin(),
-                                      entries[0]->size());
+                                      entries[0]->size(),
+                                      static_cast<std::uint64_t>(current));
   if (code != 0) OnResult(ticket, 0, code, nullptr, 0);
   return result;
 }
@@ -475,10 +501,16 @@ std::uint64_t MetaRaft::create_snapshot(create_snapshot_options) {
   return future.get();
 }
 
-std::shared_ptr<MetaRaftResult> MetaRaft::add_srv(
-    const MetaRaftMember& member) {
+std::shared_ptr<MetaRaftResult> MetaRaft::add_srv(const MetaRaftMember& member,
+                                                  std::uint64_t expected_term) {
   auto [ticket, result] = NewResult();
   if (!ticket) return result;
+  const auto current = leader_term();
+  if (current < 0 || (expected_term != 0 &&
+                      expected_term != static_cast<std::uint64_t>(current))) {
+    OnResult(ticket, 0, 2, nullptr, 0);
+    return result;
+  }
   if (member.get_dc_id() != 0 || member.get_priority() != 1) {
     OnResult(ticket, 0, 3, nullptr, 0);
     return result;
@@ -491,34 +523,42 @@ std::shared_ptr<MetaRaftResult> MetaRaft::add_srv(
     return result;
   }
   const int code = lavik_raft_member(handle_, ticket, data.data(), data.size(),
-                                     0, member.is_learner());
+                                     0, member.is_learner(),
+                                     static_cast<std::uint64_t>(current));
   if (code) OnResult(ticket, 0, code, nullptr, 0);
   return result;
 }
 
-std::shared_ptr<MetaRaftResult> MetaRaft::remove_srv(std::int32_t id) {
+std::shared_ptr<MetaRaftResult> MetaRaft::remove_srv(
+    std::int32_t id, std::uint64_t expected_term) {
   auto [ticket, result] = NewResult();
   if (!ticket) return result;
+  const auto current = leader_term();
+  if (current < 0 || (expected_term != 0 &&
+                      expected_term != static_cast<std::uint64_t>(current))) {
+    OnResult(ticket, 0, 2, nullptr, 0);
+    return result;
+  }
   auto data = absl::StrCat("{\"id\":", id, "}");
-  const int code =
-      lavik_raft_member(handle_, ticket, data.data(), data.size(), 1, 0);
+  const int code = lavik_raft_member(handle_, ticket, data.data(), data.size(),
+                                     1, 0, static_cast<std::uint64_t>(current));
   if (code) OnResult(ticket, 0, code, nullptr, 0);
   return result;
 }
 
-void MetaRaft::yield_leadership(bool) {
-  auto current = authority_.load(std::memory_order_acquire);
-  std::uint64_t generation;
+void MetaRaft::yield_leadership(bool, std::uint64_t expected_term) {
+  auto current = leader_term_.load(std::memory_order_acquire);
   do {
-    if (current & kStopped) return;
-    generation = (current >> 1) + 1;
-    if (generation >= (kStopped >> 1)) std::terminate();
-  } while (!authority_.compare_exchange_weak(current, generation << 1,
-                                             std::memory_order_acq_rel));
-  caught_up_.store(false, std::memory_order_release);
-  // The protocol owner sends the ordered follower edge. The synchronous CAS
-  // above already stops grants, including while an older callback is in flight.
-  lavik_raft_resign(handle_, generation);
+    // Retire only an admitted leader, never a prospective candidate term
+    // concurrently exposed by get_term(). That candidate may still win.
+    if (current < 0 || (expected_term != 0 &&
+                        expected_term != static_cast<std::uint64_t>(current)))
+      return;
+  } while (!leader_term_.compare_exchange_weak(current, -(current + 1),
+                                               std::memory_order_acq_rel));
+  // Only the Raft protocol owner changes role and starts subsequent elections.
+  // A delayed request is term-scoped and cannot retire a later elected leader.
+  lavik_raft_resign(handle_, static_cast<std::uint64_t>(current));
 }
 
 }  // namespace lavik::meta

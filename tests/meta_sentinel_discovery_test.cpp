@@ -39,6 +39,14 @@ const std::string kOwnerId(kMetaNodeIdBytes, 'a');
 const std::string kReplicaOneId(kMetaNodeIdBytes, 'b');
 const std::string kReplicaTwoId(kMetaNodeIdBytes, 'c');
 
+// Each fixture uniquely owns a view originally allocated as mutable. Tests
+// edit it only between synchronous discovery calls; production cuts never
+// mutate a published view.
+MetaCommittedStatusView& MutableCommitted(MetaDiscoveryCut& cut) {
+  EXPECT_EQ(cut.committed_.use_count(), 1);
+  return *std::const_pointer_cast<MetaCommittedStatusView>(cut.committed_);
+}
+
 template <std::size_t N>
 std::array<std::uint8_t, N> Bytes(std::uint8_t fill) {
   std::array<std::uint8_t, N> out{};
@@ -86,11 +94,13 @@ MetaDataControlRuntimeNode LiveRuntimeNode(const std::string& node_id,
 // runtime registry.
 MetaDiscoveryCut MakeCut() {
   MetaDiscoveryCut cut;
+  cut.committed_ = std::make_shared<MetaCommittedStatusView>();
   cut.now_unix_ms_ = kNowUnixMs;
   cut.observation_ttl_ms_ = kObservationTtlMs;
-  cut.committed_.applied_index_ = 100;
-  cut.committed_.cluster_lifecycle_.state_ = MetaClusterLifecycle::kCreated;
-  cut.committed_.cluster_lifecycle_.client_mode_ = ClientMode::kSingle;
+  MutableCommitted(cut).applied_index_ = 100;
+  MutableCommitted(cut).cluster_lifecycle_.state_ =
+      MetaClusterLifecycle::kCreated;
+  MutableCommitted(cut).cluster_lifecycle_.client_mode_ = ClientMode::kSingle;
 
   MetaCommittedStatusGroup group;
   group.topology_.group_id_ = "g1";
@@ -106,18 +116,18 @@ MetaDiscoveryCut MakeCut() {
       MetaGroupMember{kReplicaOneId, Bytes<16>(0x02), MetaNodeRole::kReplica},
       MetaGroupMember{kReplicaTwoId, Bytes<16>(0x03), MetaNodeRole::kReplica},
   };
-  cut.committed_.groups_.push_back(std::move(group));
-  cut.committed_.slot_ranges_ = {
+  MutableCommitted(cut).groups_.push_back(std::move(group));
+  MutableCommitted(cut).slot_ranges_ = {
       MetaCommittedStatusSlotRange{
           .first_ = 0, .last_ = kMetaSlotCount - 1, .group_id_ = "g1"},
   };
-  cut.committed_.data_nodes_ = {
+  MutableCommitted(cut).data_nodes_ = {
       NodeRecord(kOwnerId, {"tcp://10.0.0.1:7001"}),
       NodeRecord(kReplicaOneId, {"tcp://10.0.0.2:7002"}),
       NodeRecord(kReplicaTwoId, {"tcp://10.0.0.3:7003"}),
   };
 
-  cut.runtime_.leadership_generation_ = 3;
+  cut.runtime_.leader_term_ = 3;
   cut.runtime_.leader_authority_eligibility_revision_ = 2;
   cut.runtime_.nodes_ = {
       LiveRuntimeNode(kOwnerId, Bytes<16>(0x01)),
@@ -126,11 +136,12 @@ MetaDiscoveryCut MakeCut() {
   };
   cut.runtime_.observed_nodes_ = {kOwnerId, kReplicaOneId, kReplicaTwoId};
 
-  cut.diagnostics_.leadership_generation_ = 3;
+  cut.diagnostics_.leader_term_ = 3;
   cut.diagnostics_.leader_authority_eligibility_revision_ = 2;
+  cut.diagnostics_.evaluated_applied_index_ = 100;
   MetaAutomaticFailoverStatus status;
   status.anchor_.group_id_ = "g1";
-  status.anchor_.leadership_generation_ = 3;
+  status.anchor_.leader_term_ = 3;
   status.anchor_.leader_authority_eligibility_revision_ = 2;
   status.anchor_.owner_node_id_ = kOwnerId;
   status.anchor_.owner_assignment_id_ = Bytes<16>(0x01);
@@ -298,13 +309,14 @@ void ExpectRetracted(const MetaDiscoveryCut& cut) {
 TEST(MetaSentinelDiscoveryTest, PublicationGatesRetractPrimary) {
   {  // Fenced: no active authority grant in the current term.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.groups_.front().grant_.grant_.reset();
+    MutableCommitted(cut).groups_.front().grant_.grant_.reset();
     ExpectRetracted(cut);
   }
   {  // Cluster mode exposes no discovery service at all: discovery serves
      // Meta-managed Single deployments only.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.cluster_lifecycle_.client_mode_ = ClientMode::kCluster;
+    MutableCommitted(cut).cluster_lifecycle_.client_mode_ =
+        ClientMode::kCluster;
     EXPECT_EQ(DiscoveryServiceGroup(cut), nullptr);
     ExpectRetracted(cut);
   }
@@ -313,36 +325,39 @@ TEST(MetaSentinelDiscoveryTest, PublicationGatesRetractPrimary) {
          {MetaClusterLifecycle::kUninitialized, MetaClusterLifecycle::kCreating,
           MetaClusterLifecycle::kProvisioningFailed}) {
       MetaDiscoveryCut cut = MakeCut();
-      cut.committed_.cluster_lifecycle_.state_ = state;
+      MutableCommitted(cut).cluster_lifecycle_.state_ = state;
       ExpectRetracted(cut);
     }
   }
   {  // A Single service is exactly one Group; two Groups expose none.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.groups_.push_back(cut.committed_.groups_.front());
-    cut.committed_.groups_.back().topology_.group_id_ = "g2";
+    MutableCommitted(cut).groups_.push_back(
+        MutableCommitted(cut).groups_.front());
+    MutableCommitted(cut).groups_.back().topology_.group_id_ = "g2";
     EXPECT_EQ(DiscoveryServiceGroup(cut), nullptr);
     ExpectRetracted(cut);
   }
   {  // Retired owner.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.data_nodes_.front().retired_ = true;
+    MutableCommitted(cut).data_nodes_.front().retired_ = true;
     ExpectRetracted(cut);
   }
   {  // Owner absent from the identity registry entirely.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.data_nodes_.erase(cut.committed_.data_nodes_.begin());
+    MutableCommitted(cut).data_nodes_.erase(
+        MutableCommitted(cut).data_nodes_.begin());
     ExpectRetracted(cut);
   }
   {  // Owner is not a member of its own Group: the Group is not complete.
     MetaDiscoveryCut cut = MakeCut();
-    auto& members = cut.committed_.groups_.front().topology_.members_;
+    auto& members = MutableCommitted(cut).groups_.front().topology_.members_;
     members.erase(members.begin());
     ExpectRetracted(cut);
   }
   {  // TLS-only client endpoints publish nothing until TLS discovery exists.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.data_nodes_.front().endpoints_ = {"tls://10.0.0.1:7443"};
+    MutableCommitted(cut).data_nodes_.front().endpoints_ = {
+        "tls://10.0.0.1:7443"};
     ExpectRetracted(cut);
   }
   {  // Wildcard and unusable addresses are listen forms, not client routes.
@@ -352,13 +367,13 @@ TEST(MetaSentinelDiscoveryTest, PublicationGatesRetractPrimary) {
           "tcp://localhost:7001", "10.0.0.1:notaport"}) {
       SCOPED_TRACE(endpoint);
       MetaDiscoveryCut cut = MakeCut();
-      cut.committed_.data_nodes_.front().endpoints_ = {endpoint};
+      MutableCommitted(cut).data_nodes_.front().endpoints_ = {endpoint};
       ExpectRetracted(cut);
     }
   }
   {  // Legacy untagged plaintext endpoints remain publishable.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.data_nodes_.front().endpoints_ = {"10.0.0.1:7001"};
+    MutableCommitted(cut).data_nodes_.front().endpoints_ = {"10.0.0.1:7001"};
     const auto primary = PublishablePrimary(cut, SoleGroup(cut));
     ASSERT_TRUE(primary.has_value());
     EXPECT_EQ(primary->endpoint_.host_, "10.0.0.1");
@@ -366,12 +381,159 @@ TEST(MetaSentinelDiscoveryTest, PublicationGatesRetractPrimary) {
   }
   {  // The plaintext address is selected when both transports are registered.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.data_nodes_.front().endpoints_ = {"tcp://10.0.0.1:7001",
-                                                     "tls://10.0.0.1:7443"};
+    MutableCommitted(cut).data_nodes_.front().endpoints_ = {
+        "tcp://10.0.0.1:7001", "tls://10.0.0.1:7443"};
     const auto primary = PublishablePrimary(cut, SoleGroup(cut));
     ASSERT_TRUE(primary.has_value());
     EXPECT_EQ(primary->endpoint_.port_, 7001);
   }
+}
+
+TEST(MetaSentinelDiscoveryTest, SwitchNotificationCrossesMasterlessWindow) {
+  auto cut = MakeCut();
+  MetaDiscoveryEvents events;
+  EXPECT_TRUE(events.Observe(cut).empty());
+  auto& group = MutableCommitted(cut).groups_.front();
+  group.grant_.grant_.reset();
+  group.grant_.group_term_ = 8;
+  EXPECT_TRUE(events.Observe(cut).empty());
+  group.grant_.grant_ = MetaActiveAuthorityView{.owner_ = kReplicaOneId};
+  group.topology_.record_.owner_ = kReplicaOneId;
+  group.topology_.record_.group_term_ = 8;
+  const auto messages = events.Observe(cut);
+  ASSERT_EQ(messages.size(), 1);
+  EXPECT_EQ(messages[0].channel_, "+switch-master");
+  EXPECT_EQ(messages[0].payload_, "g1 10.0.0.1 7001 10.0.0.2 7002");
+  EXPECT_TRUE(events.Observe(cut).empty());
+  ++group.grant_.group_term_;
+  EXPECT_TRUE(events.Observe(cut).empty());
+  events.Reset();
+  EXPECT_TRUE(events.Observe(cut).empty());
+}
+
+TEST(MetaSentinelDiscoveryTest, ReadableReplicaDoesNotProveSourceAdoption) {
+  auto cut = MakeCut();
+  const auto& group = SoleGroup(cut);
+  EXPECT_FALSE(
+      ReplicaReconfigurationComplete(cut, group, group.topology_.members_[1]));
+}
+
+// A current ReadyToken lineage, received on this live reporter incarnation,
+// is stronger evidence than FDS acknowledgement or a readable population.
+MetaDiscoveryCut SourceProofCut() {
+  auto cut = MakeCut();
+  for (auto& node : cut.runtime_.nodes_) node.leader_term_ = 3;
+  cut.runtime_.nodes_[0].boot_id_ = "owner-boot";
+  cut.runtime_.nodes_[1].boot_id_ = "replica-boot";
+  cluster::control::CandidateProgress proof;
+  proof.group_id = "g1";
+  proof.assignment_id = Bytes<16>(0x02);
+  proof.group_term = proof.source_group_term = 7;
+  proof.manifest_revision = kManifestRevision;
+  proof.manifest_digest = Bytes<32>(0x11);
+  proof.partition_replication_epoch = kPartitionEpoch;
+  proof.source_node_id = kOwnerId;
+  proof.source_assignment_id = Bytes<16>(0x01);
+  proof.source_boot_id = "owner-boot";
+  proof.source_history_id =
+      std::string(2 * kMetaReplicationHistoryIdBytes, '0');
+  cut.runtime_.nodes_[1].replica_progress_ = proof;
+  return cut;
+}
+
+TEST(MetaSentinelDiscoveryTest, CompletionRequiresExactFreshSourceLineage) {
+  const auto complete = [](const MetaDiscoveryCut& cut) {
+    const auto& group = SoleGroup(cut);
+    return ReplicaReconfigurationComplete(cut, group,
+                                          group.topology_.members_[1]);
+  };
+  ASSERT_TRUE(complete(SourceProofCut()));
+  for (int dimension = 0; dimension < 11; ++dimension) {
+    auto cut = SourceProofCut();
+    auto& proof = *cut.runtime_.nodes_[1].replica_progress_;
+    switch (dimension) {
+      case 0:
+        --proof.source_group_term;
+        break;
+      case 1:
+        proof.source_boot_id = "old-boot";
+        break;
+      case 2:
+        proof.source_history_id = std::string(32, '1');
+        break;
+      case 3:
+        proof.source_assignment_id = Bytes<16>(0x7f);
+        break;
+      case 4:
+        proof.assignment_id = Bytes<16>(0x7f);
+        break;
+      case 5:
+        --proof.manifest_revision;
+        break;
+      case 6:
+        proof.recovered = true;
+        break;
+      case 7:
+        proof.operator_recovery = true;
+        break;
+      case 8:
+        --cut.runtime_.nodes_[1].leader_term_;
+        break;
+      case 9:
+        cut.runtime_.nodes_[1].health_received_unix_ms_ -= 501;
+        break;
+      case 10:
+        cut.runtime_.nodes_[0].health_received_unix_ms_ -= 501;
+        break;
+    }
+    EXPECT_FALSE(complete(cut)) << dimension;
+  }
+}
+
+TEST(MetaSentinelDiscoveryTest,
+     CompletionIsDeduplicatedAndReacquisitionIsBaseline) {
+  auto cut = SourceProofCut();
+  auto& proof = *cut.runtime_.nodes_[1].replica_progress_;
+  --proof.source_group_term;
+  MetaDiscoveryEvents events;
+  EXPECT_TRUE(events.Observe(cut).empty());
+  ++proof.source_group_term;
+  const auto messages = events.Observe(cut);
+  ASSERT_EQ(messages.size(), 1);
+  EXPECT_EQ(messages[0].channel_, "+replica-reconf-done");
+  EXPECT_EQ(messages[0].payload_,
+            "slave 10.0.0.2:7002 10.0.0.2 7002 @ g1 10.0.0.1 7001");
+  EXPECT_TRUE(events.Observe(cut).empty());
+  events.Reset();
+  EXPECT_TRUE(events.Observe(cut).empty());
+  cut.runtime_.nodes_[1].boot_id_ = "replacement-boot";
+  EXPECT_TRUE(events.Observe(cut).empty());
+}
+
+TEST(MetaSentinelDiscoveryTest,
+     PeerDirectoryExcludesSelfRetiredAndStagedMembers) {
+  auto cut = MakeCut();
+  cut.local_meta_id_ = 1;
+  cut.effective_meta_ids_ = {1, 2, 3};
+  for (unsigned id = 1; id <= 4; ++id) {
+    MetaMemberRecord peer;
+    peer.server_id_ = id;
+    peer.sentinel_endpoint_ = "10.0.0." + std::to_string(id) + ":26379";
+    peer.retired_ = id == 3;
+    MutableCommitted(cut).meta_members_.push_back(peer);
+  }
+  const auto peers = DiscoverySentinels(cut);
+  ASSERT_EQ(peers.size(), 1);
+  EXPECT_EQ(peers[0].server_id_, 2);
+  ReplyBuilder master;
+  EncodeDiscoveryMasterReply(master, cut, "g1");
+  EXPECT_EQ(
+      FieldInt(EntryFields(DecodeResp(master.View())), "num-other-sentinels"),
+      1);
+  ReplyBuilder directory;
+  EncodeDiscoverySentinelsReply(directory, cut, "g1");
+  EXPECT_TRUE(directory.View().starts_with("*1\r\n"));
+  EXPECT_NE(directory.View().find("10.0.0.2"), std::string_view::npos);
 }
 
 // The complete-Single-Group condition is explicit: the one Group must own a
@@ -397,7 +559,7 @@ TEST(MetaSentinelDiscoveryTest, IncompleteSlotCoverageExposesNoService) {
   };
   for (const auto& ranges : broken) {
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.slot_ranges_ = ranges;
+    MutableCommitted(cut).slot_ranges_ = ranges;
     EXPECT_EQ(DiscoveryServiceGroup(cut), nullptr);
     ExpectRetracted(cut);
     ReplyBuilder replicas;
@@ -522,14 +684,19 @@ TEST(MetaSentinelDiscoveryTest, DiagnosticsRequireSnapshotIdentityAndAnchor) {
     return MasterFlags(cut, *primary).s_down_;
   };
   EXPECT_TRUE(s_down(MakeCut()));
+  {  // A detector decision for an older committed view is not current.
+    MetaDiscoveryCut cut = MakeCut();
+    cut.diagnostics_.evaluated_applied_index_ = 99;
+    EXPECT_FALSE(s_down(std::move(cut)));
+  }
   {  // A detector cut from a prior leadership generation never applies.
     MetaDiscoveryCut cut = MakeCut();
-    cut.diagnostics_.leadership_generation_ = 2;
+    cut.diagnostics_.leader_term_ = 2;
     EXPECT_FALSE(s_down(std::move(cut)));
   }
   {  // Zero marks "no active diagnostics bracket" and must never match.
     MetaDiscoveryCut cut = MakeCut();
-    cut.diagnostics_.leadership_generation_ = 0;
+    cut.diagnostics_.leader_term_ = 0;
     EXPECT_FALSE(s_down(std::move(cut)));
   }
   {  // Eligibility interruption inside one generation invalidates the cut.
@@ -669,7 +836,7 @@ TEST(MetaSentinelDiscoveryTest, ReplicaReadabilityRequiresSessionHealthAnchor) {
   {  // A fenced service marks replicas master_down without inventing a
      // Primary.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.groups_.front().grant_.grant_.reset();
+    MutableCommitted(cut).groups_.front().grant_.grant_.reset();
     const auto replicas = ReplicasById(cut, /*primary_publishable=*/false);
     ASSERT_EQ(replicas.size(), 2u);
     EXPECT_TRUE(replicas.at(kReplicaOneId).master_down_);
@@ -706,20 +873,23 @@ TEST(MetaSentinelDiscoveryTest,
   {  // The committed manifest revision advanced while term and assignment
      // stayed unchanged.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.groups_.front()
+    MutableCommitted(cut)
+        .groups_.front()
         .topology_.record_.population_manifest_revision_ =
         kManifestRevision + 1;
     EXPECT_TRUE(replica_one(std::move(cut)).s_down_);
   }
   {  // Same revision counter but rotated manifest content.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.groups_.front()
+    MutableCommitted(cut)
+        .groups_.front()
         .topology_.record_.population_manifest_digest_ = Bytes<32>(0x22);
     EXPECT_TRUE(replica_one(std::move(cut)).s_down_);
   }
   {  // The committed partition replication epoch advanced.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.groups_.front()
+    MutableCommitted(cut)
+        .groups_.front()
         .topology_.record_.partition_replication_epoch_ = kPartitionEpoch + 1;
     EXPECT_TRUE(replica_one(std::move(cut)).s_down_);
   }
@@ -787,7 +957,7 @@ TEST(MetaSentinelDiscoveryTest, GraceOmitsNeverObservedReplicas) {
 TEST(MetaSentinelDiscoveryTest, ReplicaListingReflectsCommittedMembership) {
   {  // A member committed away simply disappears.
     MetaDiscoveryCut cut = MakeCut();
-    auto& members = cut.committed_.groups_.front().topology_.members_;
+    auto& members = MutableCommitted(cut).groups_.front().topology_.members_;
     members.erase(std::find_if(members.begin(), members.end(),
                                [&](const MetaGroupMember& member) {
                                  return member.node_id_ == kReplicaTwoId;
@@ -798,7 +968,7 @@ TEST(MetaSentinelDiscoveryTest, ReplicaListingReflectsCommittedMembership) {
   }
   {  // A retired member is not a replica even while it remains committed.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.data_nodes_[2].retired_ = true;
+    MutableCommitted(cut).data_nodes_[2].retired_ = true;
     const auto replicas = ReplicasById(cut);
     ASSERT_EQ(replicas.size(), 1u);
     EXPECT_FALSE(replicas.contains(kReplicaTwoId));
@@ -806,14 +976,14 @@ TEST(MetaSentinelDiscoveryTest, ReplicaListingReflectsCommittedMembership) {
   {  // A member whose endpoint cannot be published is omitted rather than
      // announced with a fabricated address.
     MetaDiscoveryCut cut = MakeCut();
-    cut.committed_.data_nodes_[2].endpoints_ = {"tcp://0.0.0.0:7003"};
+    MutableCommitted(cut).data_nodes_[2].endpoints_ = {"tcp://0.0.0.0:7003"};
     const auto replicas = ReplicasById(cut);
     ASSERT_EQ(replicas.size(), 1u);
     EXPECT_FALSE(replicas.contains(kReplicaTwoId));
   }
   {  // Zero committed replicas is a truthful empty list, not an error.
     MetaDiscoveryCut cut = MakeCut();
-    auto& members = cut.committed_.groups_.front().topology_.members_;
+    auto& members = MutableCommitted(cut).groups_.front().topology_.members_;
     members.erase(members.begin() + 1, members.end());
     ReplyBuilder reply;
     EncodeDiscoveryReplicasReply(reply, cut, "g1");
@@ -826,7 +996,7 @@ TEST(MetaSentinelDiscoveryTest, ReplicaListingReflectsCommittedMembership) {
      // replaced owner becomes an ordinary member: membership roles are
      // creation-time hints only.
     MetaDiscoveryCut cut = MakeCut();
-    auto& group = cut.committed_.groups_.front();
+    auto& group = MutableCommitted(cut).groups_.front();
     group.topology_.record_.owner_ = kReplicaOneId;
     group.grant_.grant_->owner_ = kReplicaOneId;
     const auto replicas = ReplicasById(cut);
@@ -875,7 +1045,8 @@ TEST(MetaSentinelDiscoveryTest, ReplicaEntryFieldsResp2AndResp3) {
 
   {  // An unresolvable committed owner endpoint omits the pair instead of
      // fabricating one.
-    cut.committed_.data_nodes_.front().endpoints_ = {"tls://10.0.0.1:7443"};
+    MutableCommitted(cut).data_nodes_.front().endpoints_ = {
+        "tls://10.0.0.1:7443"};
     ReplyBuilder reply;
     EncodeDiscoveryReplicasReply(reply, cut, "g1");
     const auto degraded = EntryFields(DecodeResp(reply.View()).items_.front());

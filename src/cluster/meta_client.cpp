@@ -2747,7 +2747,6 @@ struct MetaControlClientService::Impl {
       if (!pending.challenge_.has_value() || grant->leader_id == 0 ||
           grant->leader_id != state->meta_server_id_ ||
           grant->raft_term != state->raft_term_ ||
-          grant->leadership_generation == 0 ||
           grant->data_boot_id != state->boot_id_) {
         co_return absl::InvalidArgumentError(
             "lease grant does not match the accepted leader or local control "

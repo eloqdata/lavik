@@ -21,12 +21,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <deque>
 #include <future>
 #include <limits>
+#include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -56,6 +60,17 @@ struct SentinelSession {
   std::string library_name_;
   std::string library_version_;
   ReplyBuilder reply_{};
+  std::set<std::string> subscriptions_;
+  std::size_t subscription_bytes_ = 0;
+  bool authority_bound_ = false;
+  std::int64_t authority_term_ = -1;
+  std::uint64_t leader_term_ = 0;
+  std::uint64_t eligibility_revision_ = 0, continuity_ = 0;
+  bycorf::Connection* connection_ = nullptr;
+  std::deque<std::string> output_;
+  std::size_t output_bytes_ = 0;
+  bool closing_ = false, writer_done_ = false;
+  bycorf::AsyncNotification output_changed_, writer_finished_;
 };
 
 // kDrop closes the session without writing any reply. It exists solely for
@@ -69,9 +84,10 @@ enum class SessionAction { kContinue, kReset, kClose, kDrop };
 
 // Worker-confined discovery inputs and per-worker caches. The dependencies
 // outlive the server by process assembly order; the committed-view cache is
-// rebuilt only when the state machine's change index advances, so a
-// steady-state query costs one atomic load plus the two registries' own
-// mutex-snapshots. Nothing here blocks across workers on the request path.
+// rebuilt when the applied index advances. Each cut owns a share of the
+// immutable view, so a cache refresh cannot invalidate a cut
+// still being encoded or observed. Nothing here blocks across workers on the
+// request path beyond the registries' short snapshot locks.
 struct DiscoverySource {
   std::shared_ptr<MetaRaft> raft_;
   MetaStateMachine* state_machine_ = nullptr;
@@ -80,39 +96,47 @@ struct DiscoverySource {
   std::uint32_t observation_ttl_ms_ = 0;
   std::uint64_t leader_observation_grace_ms_ = 0;
 
-  bool cached_view_valid_ = false;
-  std::uint64_t cached_state_change_ = 0;
-  MetaCommittedStatusView cached_view_;
+  std::uint64_t continuity_ = 0;
+  std::shared_ptr<const MetaCommittedStatusView> cached_view_;
 
-  // Observation-grace bookkeeping: the window opens when the leader triplet
-  // starts passing and reopens whenever the runtime registry's leadership
-  // generation changes, so a handoff never turns a never-yet-observed node
+  // Observation-grace bookkeeping: the window opens on leader admission
+  // and reopens when the runtime registry attaches the new Raft term,
+  // so a handoff never turns a never-yet-observed node
   // into a false down mark. Both edges reset the same start point.
-  bool leader_triplet_passed_ = false;
-  std::uint64_t grace_leadership_generation_ = 0;
+  bool leader_admitted_ = false;
+  std::uint64_t grace_leader_term_ = 0;
   std::chrono::steady_clock::time_point authority_since_{};
 };
 
 // Assembles one discovery cut when this node currently holds a caught-up
-// leadership, else nullopt. The runtime registry snapshot leads because its
-// leadership generation anchors the observation-grace window.
+// leadership, else nullopt. The Raft leader term brackets the snapshots; the
+// runtime's captured term anchors the observation-grace window.
 std::optional<MetaDiscoveryCut> AuthoritativeDiscoveryCut(
     DiscoverySource& source) {
-  const bool authoritative = source.raft_->is_leader() &&
-                             source.raft_->is_leader_alive() &&
-                             source.raft_->is_leader_sm_fully_caught_up();
+  const auto raft_term = source.raft_->leader_term();
+  const bool authoritative = raft_term >= 0;
   const auto now = std::chrono::steady_clock::now();
-  if (authoritative && !source.leader_triplet_passed_) {
+  if (authoritative && !source.leader_admitted_) {
     source.authority_since_ = now;
   }
-  source.leader_triplet_passed_ = authoritative;
+  source.leader_admitted_ = authoritative;
   if (!authoritative) return std::nullopt;
 
   MetaDiscoveryCut cut;
+  cut.raft_term_ = raft_term;
+  cut.local_meta_id_ = source.raft_->get_id();
+  if (const auto config = source.raft_->get_config()) {
+    for (const auto& peer : config->get_servers())
+      if (peer && !peer->is_new_joiner())
+        cut.effective_meta_ids_.push_back(peer->get_id());
+  }
   cut.runtime_ = source.runtime_status_->Snapshot();
-  if (cut.runtime_.leadership_generation_ !=
-      source.grace_leadership_generation_) {
-    source.grace_leadership_generation_ = cut.runtime_.leadership_generation_;
+  if (cut.runtime_.leader_term_ != 0 &&
+      (cut.runtime_.leader_term_ != static_cast<std::uint64_t>(raft_term) ||
+       !cut.runtime_.leader_authority_eligible_))
+    return std::nullopt;
+  if (cut.runtime_.leader_term_ != source.grace_leader_term_) {
+    source.grace_leader_term_ = cut.runtime_.leader_term_;
     source.authority_since_ = now;
   }
   cut.observation_grace_active_ =
@@ -120,22 +144,54 @@ std::optional<MetaDiscoveryCut> AuthoritativeDiscoveryCut(
       std::chrono::milliseconds(source.leader_observation_grace_ms_);
   cut.observation_ttl_ms_ = source.observation_ttl_ms_;
   cut.diagnostics_ = source.diagnostics_->Snapshot();
-  // Read the change index before the locked snapshot so a commit landing in
-  // between leaves the cache key older than the true index; the next query
-  // then rebuilds instead of serving the stale view indefinitely.
-  const std::uint64_t state_change =
-      source.state_machine_->state_change_index();
-  if (!source.cached_view_valid_ ||
-      state_change != source.cached_state_change_) {
-    source.cached_view_ = source.state_machine_->StatusSnapshot();
-    source.cached_state_change_ = state_change;
-    source.cached_view_valid_ = true;
+  // Read the applied index before the locked snapshot. If a commit lands
+  // between them, the snapshot sees it; if one lands afterward, the next cut
+  // refreshes. Advance() can move this index without changing stores, but the
+  // detector joins on this exact index, so a state-change-only key would
+  // leave its otherwise-current diagnostics mismatched indefinitely.
+  const std::uint64_t applied_index =
+      source.state_machine_->last_commit_index();
+  if (!source.cached_view_ ||
+      applied_index != source.cached_view_->applied_index_) {
+    source.cached_view_ = std::make_shared<const MetaCommittedStatusView>(
+        source.state_machine_->StatusSnapshot());
   }
   cut.committed_ = source.cached_view_;
   cut.now_unix_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
+  if (source.raft_->leader_term() != raft_term) return std::nullopt;
   return cut;
+}
+
+bool BindAuthority(DiscoverySource& source, SentinelSession& session,
+                   const MetaDiscoveryCut& cut) {
+  if (session.authority_bound_ &&
+      (session.authority_term_ != cut.raft_term_ ||
+       session.leader_term_ != cut.runtime_.leader_term_ ||
+       session.eligibility_revision_ !=
+           cut.runtime_.leader_authority_eligibility_revision_ ||
+       session.continuity_ != source.continuity_))
+    return false;
+  session.authority_bound_ = true;
+  session.authority_term_ = cut.raft_term_;
+  session.leader_term_ = cut.runtime_.leader_term_;
+  session.eligibility_revision_ =
+      cut.runtime_.leader_authority_eligibility_revision_;
+  session.continuity_ = source.continuity_;
+  return true;
+}
+
+bool AuthorityCurrent(const DiscoverySource& source,
+                      const SentinelSession& session) {
+  if (!session.authority_bound_) return true;
+  const auto state = source.runtime_status_->LeadershipState();
+  return source.raft_->leader_term() == session.authority_term_ &&
+         source.continuity_ == session.continuity_ &&
+         state.leader_term_ == session.leader_term_ &&
+         state.leader_authority_eligibility_revision_ ==
+             session.eligibility_revision_ &&
+         (state.leader_term_ == 0 || state.leader_authority_eligible_);
 }
 
 bool ValidAttribute(std::string_view value) {
@@ -244,7 +300,7 @@ void ExecuteHello(const PasswordAuthenticator& authenticator,
   reply.AppendArrayHeader(0);
 }
 
-// SENTINEL subcommand dispatch. The five discovery verbs answer from
+// SENTINEL subcommand dispatch. The six discovery verbs answer from
 // committed authority through the pure mapping layer; management and unknown
 // subcommands keep their explicit refusal on every node role because that
 // refusal is a deterministic answer, not a topology claim.
@@ -269,6 +325,7 @@ SessionAction ExecuteSentinelCommand(DiscoverySource& source,
   const bool masters = is("MASTERS");
   const bool replicas = is("REPLICAS");
   const bool slaves = is("SLAVES");
+  const bool sentinels = is("SENTINELS");
   // Arity is validated before any authority check: the answer cannot depend
   // on committed state, so a follower may (and should) report it explicitly.
   if (address && args.size() != 3)
@@ -277,7 +334,8 @@ SessionAction ExecuteSentinelCommand(DiscoverySource& source,
   if (masters && args.size() != 2) return arity_error("masters");
   if (replicas && args.size() != 3) return arity_error("replicas");
   if (slaves && args.size() != 3) return arity_error("slaves");
-  if (!address && !master && !masters && !replicas && !slaves) {
+  if (sentinels && args.size() != 3) return arity_error("sentinels");
+  if (!address && !master && !masters && !replicas && !slaves && !sentinels) {
     reply.AppendError("ERR SENTINEL subcommand is not supported");
     return SessionAction::kContinue;
   }
@@ -285,8 +343,11 @@ SessionAction ExecuteSentinelCommand(DiscoverySource& source,
   if (!cut.has_value()) {
     return SessionAction::kDrop;
   }
+  if (!BindAuthority(source, session, *cut)) return SessionAction::kDrop;
   if (address) {
     EncodeDiscoveryAddressReply(reply, *cut, args[2]);
+  } else if (sentinels) {
+    EncodeDiscoverySentinelsReply(reply, *cut, args[2]);
   } else if (master) {
     EncodeDiscoveryMasterReply(reply, *cut, args[2]);
   } else if (masters) {
@@ -300,13 +361,23 @@ SessionAction ExecuteSentinelCommand(DiscoverySource& source,
 
 SessionAction ExecuteConnectionCommand(
     const PasswordAuthenticator& authenticator, DiscoverySource& discovery,
-    SentinelSession& session, std::span<const std::string> args) {
+    SentinelSession& session, std::span<const std::string> args,
+    const MetaSentinelServerOptions& limits) {
   auto& reply = session.reply_;
   reply.Reset();
+  if (!AuthorityCurrent(discovery, session)) return SessionAction::kDrop;
   if (args.empty()) return SessionAction::kContinue;
   const auto is = [&](std::string_view command) {
     return absl::EqualsIgnoreCase(args[0], command);
   };
+  if (!session.subscriptions_.empty() && reply.version() == RespVersion::k2 &&
+      !is("SUBSCRIBE") && !is("UNSUBSCRIBE") && !is("PING") && !is("RESET") &&
+      !is("QUIT")) {
+    reply.AppendError(
+        "ERR only SUBSCRIBE / UNSUBSCRIBE / PING / QUIT / RESET allowed in "
+        "this context");
+    return SessionAction::kContinue;
+  }
   if (is("HELLO")) {
     ExecuteHello(authenticator, session, args);
   } else if (is("AUTH")) {
@@ -339,6 +410,11 @@ SessionAction ExecuteConnectionCommand(
       reply.AppendError("ERR wrong number of arguments for 'reset' command");
     } else {
       session.authenticated_ = !authenticator.required();
+      session.subscriptions_.clear();
+      session.subscription_bytes_ = 0;
+      // RESET clears protocol state, not this TCP connection's authority
+      // lifetime: queued/in-flight discovery frames retain their revocation
+      // protection even when RESET is pipelined behind them.
       session.name_.clear();
       session.library_name_.clear();
       session.library_version_.clear();
@@ -359,8 +435,53 @@ SessionAction ExecuteConnectionCommand(
         "ERR wrong number of arguments for 'client|setinfo' command");
   } else if (!session.authenticated_) {
     reply.AppendError("NOAUTH Authentication required.");
+  } else if (is("SUBSCRIBE") || is("UNSUBSCRIBE")) {
+    const bool subscribe = is("SUBSCRIBE");
+    if (subscribe && args.size() == 1) {
+      reply.AppendError(
+          "ERR wrong number of arguments for 'subscribe' command");
+      return SessionAction::kContinue;
+    }
+    auto cut = AuthoritativeDiscoveryCut(discovery);
+    if (!cut) return SessionAction::kDrop;
+    if (!BindAuthority(discovery, session, *cut)) return SessionAction::kDrop;
+    std::vector<std::string> channels(args.begin() + 1, args.end());
+    if (!subscribe && channels.empty()) {
+      channels.assign(session.subscriptions_.begin(),
+                      session.subscriptions_.end());
+      if (channels.empty()) {
+        reply.AppendPushHeader(3);
+        reply.AppendBulkString("unsubscribe");
+        reply.AppendNullBulkString();
+        reply.AppendInteger(0);
+        return SessionAction::kContinue;
+      }
+    }
+    for (const auto& channel : channels) {
+      if (subscribe) {
+        if (!session.subscriptions_.contains(channel) &&
+            (session.subscriptions_.size() >= limits.subscription_limit_ ||
+             channel.size() >
+                 limits.query_limit_ - std::min(limits.query_limit_,
+                                                session.subscription_bytes_)))
+          return SessionAction::kDrop;
+        if (session.subscriptions_.insert(channel).second)
+          session.subscription_bytes_ += channel.size();
+      } else if (session.subscriptions_.erase(channel)) {
+        session.subscription_bytes_ -= channel.size();
+      }
+      reply.AppendPushHeader(3);
+      reply.AppendBulkString(subscribe ? "subscribe" : "unsubscribe");
+      reply.AppendBulkString(channel);
+      reply.AppendInteger(session.subscriptions_.size());
+    }
   } else if (is("PING")) {
-    if (args.size() == 1)
+    if (!session.subscriptions_.empty() && reply.version() == RespVersion::k2 &&
+        args.size() <= 2) {
+      reply.AppendArrayHeader(2);
+      reply.AppendBulkString("pong");
+      reply.AppendBulkString(args.size() == 2 ? std::string_view(args[1]) : "");
+    } else if (args.size() == 1)
       reply.AppendSimpleString("PONG");
     else if (args.size() == 2)
       reply.AppendBulkString(args[1]);
@@ -443,11 +564,153 @@ struct MetaSentinelServer::Core {
         .diagnostics_ = std::move(discovery.diagnostics_),
         .observation_ttl_ms_ = discovery.observation_ttl_ms_,
         .leader_observation_grace_ms_ = discovery.leader_observation_grace_ms_,
+        .cached_view_ = {},
     };
   }
 
+  void Close(SentinelSession& session) {
+    session.closing_ = true;
+    if (session.connection_->file_.fd_ >= 0)
+      (void)::shutdown(session.connection_->file_.fd_, SHUT_RDWR);
+    session.output_changed_.NotifyAll(*worker_);
+  }
+  void RevokeDiscovery() {
+    ++discovery_.continuity_;
+    events_.Reset();
+    for (auto [connection, session] : live_) {
+      (void)connection;
+      if (session->authority_bound_) Close(*session);
+    }
+  }
+  bool Enqueue(SentinelSession& session, std::string message) {
+    if (session.closing_ || !AuthorityCurrent(discovery_, session) ||
+        message.size() >
+            options_.reply_limit_ -
+                std::min(options_.reply_limit_, session.output_bytes_) ||
+        message.size() >
+            options_.total_output_limit_ -
+                std::min(options_.total_output_limit_, output_bytes_)) {
+      Close(session);
+      return false;
+    }
+    session.output_bytes_ += message.size();
+    output_bytes_ += message.size();
+    session.output_.push_back(std::move(message));
+    session.output_changed_.NotifyAll(*worker_);
+    return true;
+  }
+  bycorf::Task<absl::Status> WriteSession(bycorf::TcpStream* stream,
+                                          SentinelSession* session) {
+    cluster::control::ControlDeadlineWatchdog deadline(
+        *worker_, [this, session] { Close(*session); });
+    while (!shutdown_) {
+      if (session->output_.empty()) {
+        if (session->closing_) break;
+        co_await session->output_changed_.Wait();
+        continue;
+      }
+      if (!AuthorityCurrent(discovery_, *session)) {
+        Close(*session);
+        break;
+      }
+      // The front string remains alive and charged throughout a suspended
+      // write.
+      const auto& frame = session->output_.front();
+      if (!deadline.Arm(options_.progress_timeout_).ok()) {
+        Close(*session);
+        break;
+      }
+      const auto written = co_await stream->WriteAll(
+          std::as_bytes(std::span(frame.data(), frame.size())));
+      (void)deadline.Disarm();
+      session->output_bytes_ -= frame.size();
+      output_bytes_ -= frame.size();
+      session->output_.pop_front();
+      if (!written.ok()) {
+        Close(*session);
+        break;
+      }
+    }
+    output_bytes_ -= session->output_bytes_;
+    session->output_bytes_ = 0;
+    session->output_.clear();
+    session->writer_done_ = true;
+    session->writer_finished_.NotifyAll(*worker_);
+    co_return absl::OkStatus();
+  }
+  void Subscribe() {
+    auto signal = std::make_shared<std::atomic<std::uint64_t>>(0);
+    auto start =
+        context_->SubscribeCommitted([signal](const MetaCommitEvent& event) {
+          signal->store(event.log_index_, std::memory_order_release);
+        });
+    committed_signal_ = std::move(signal);
+    subscription_ = std::move(start.subscription_);
+  }
+  static bycorf::Task<absl::Status> Monitor(CorePtr core) {
+    while (!core->shutdown_) {
+      for (auto [connection, session] : core->live_) {
+        (void)connection;
+        if (!AuthorityCurrent(core->discovery_, *session))
+          core->Close(*session);
+      }
+      if (core->context_ && core->subscription_ &&
+          core->subscription_->cancelled()) {
+        core->RevokeDiscovery();
+        core->subscription_.reset();
+        core->Subscribe();
+      }
+      auto cut = AuthoritativeDiscoveryCut(core->discovery_);
+      if (!cut) {
+        core->events_.Reset();
+      } else {
+        const auto term = cut->raft_term_;
+        const auto runtime_term = cut->runtime_.leader_term_;
+        const auto revision =
+            cut->runtime_.leader_authority_eligibility_revision_;
+        if (term != core->event_term_ ||
+            runtime_term != core->event_runtime_term_ ||
+            revision != core->event_revision_) {
+          core->events_.Reset();
+          core->event_term_ = term;
+          core->event_runtime_term_ = runtime_term;
+          core->event_revision_ = revision;
+        }
+        // Notifications describe observed committed cuts. They may coalesce;
+        // the subscription signals lost continuity, not a durable event
+        // history.
+        if (!core->committed_signal_ ||
+            cut->committed_->applied_index_ >=
+                core->committed_signal_->load(std::memory_order_acquire)) {
+          for (const auto& event : core->events_.Observe(*cut)) {
+            for (auto [connection, session] : core->live_) {
+              (void)connection;
+              if (!session->subscriptions_.contains(event.channel_)) continue;
+              ReplyBuilder frame(session->reply_.version());
+              frame.AppendPushHeader(3);
+              frame.AppendBulkString("message");
+              frame.AppendBulkString(event.channel_);
+              frame.AppendBulkString(event.payload_);
+              core->Enqueue(*session, std::string(frame.View()));
+            }
+          }
+        }
+      }
+      // Release this iteration's snapshots before suspending. A cache refresh
+      // in the next iteration then retains old storage only for active reads.
+      cut.reset();
+      if (!(co_await bycorf::SleepFor(*core->worker_,
+                                      std::chrono::milliseconds(10)))
+               .ok())
+        break;
+    }
+    core->monitor_running_ = false;
+    core->NotifyDrained();
+    co_return absl::OkStatus();
+  }
   void NotifyDrained() {
-    if (!shutdown_ || accepting_ || !sessions_.empty()) return;
+    if (!shutdown_ || accepting_ || monitor_running_ || !sessions_.empty())
+      return;
     for (auto& waiter : drain_waiters_) waiter->set_value();
     drain_waiters_.clear();
   }
@@ -468,6 +731,16 @@ struct MetaSentinelServer::Core {
   bool shutdown_ = false;
   int wake_fd_ = -1;
   std::vector<bycorf::Connection*> sessions_;
+  std::map<bycorf::Connection*, SentinelSession*> live_;
+  std::size_t output_bytes_ = 0;
+  bool monitor_running_ = false;
+  MetaDiscoveryEvents events_;
+  std::int64_t event_term_ = -1;
+  std::uint64_t event_runtime_term_ = 0, event_revision_ = 0;
+  MetaLeaderContext* context_ = nullptr;
+  std::unique_ptr<MetaCommitSubscription> subscription_;
+  std::shared_ptr<std::atomic<std::uint64_t>> committed_signal_;
+
   std::vector<std::shared_ptr<std::promise<void>>> drain_waiters_;
 };
 
@@ -501,18 +774,20 @@ absl::StatusOr<std::shared_ptr<MetaSentinelServer>> MetaSentinelServer::Create(
     bycorf::ForeignExecutor executor,
     MetaSentinelDiscoveryDependencies discovery,
     MetaSentinelServerOptions options) {
-  auto endpoint = ParseNumericEndpoint(options.address_);
-  if (!endpoint || endpoint->host_ == "0.0.0.0" || endpoint->host_ == "::" ||
-      endpoint->host_ == "::ffff:0.0.0.0") {
+  auto endpoint = ParseConcreteNumericEndpoint(options.address_);
+  if (!endpoint) {
     return absl::InvalidArgumentError(
         "Sentinel address must be a concrete numeric IP and nonzero port");
   }
   if (options.maxclients_ == 0 || options.query_limit_ == 0 ||
-      options.reply_limit_ < 128 || options.progress_timeout_.count() <= 0) {
+      options.reply_limit_ < 128 ||
+      options.total_output_limit_ < options.reply_limit_ ||
+      options.subscription_limit_ == 0 ||
+      options.progress_timeout_.count() <= 0) {
     return absl::InvalidArgumentError("invalid Sentinel resource limits");
   }
   // Discovery is part of the surface contract: without authority inputs the
-  // five verbs could only ever drop connections, so missing dependencies are a
+  // six verbs could only ever drop connections, so missing dependencies are a
   // startup error rather than a silent capability loss.
   if (discovery.raft_ == nullptr || discovery.state_machine_ == nullptr ||
       discovery.runtime_status_ == nullptr ||
@@ -542,12 +817,39 @@ absl::Status MetaSentinelServer::Start() {
         if (status.ok()) {
           core->accepting_ = true;
           worker.Spawn(AcceptLoop(core));
+          core->monitor_running_ = true;
+          worker.Spawn(Core::Monitor(core));
         }
         result->set_value(std::move(status));
       }))
     return absl::UnavailableError("Meta worker is stopping");
   started_ = true;
   return done.get();
+}
+
+void MetaSentinelServer::Start(MetaLeaderContext& context) {
+  if (!core_->executor_.Notify([core = core_, context = &context]() noexcept {
+        if (core->shutdown_) return;
+        core->RevokeDiscovery();
+        core->context_ = context;
+        core->Subscribe();
+      }))
+    std::terminate();
+}
+
+void MetaSentinelServer::CancelAndWait() {
+  if (stopped_) return;
+  auto result = std::make_shared<std::promise<void>>();
+  auto done = result->get_future();
+  if (!core_->executor_.Notify([core = core_, result]() noexcept {
+        core->RevokeDiscovery();
+        core->context_ = nullptr;
+        core->subscription_.reset();
+        core->committed_signal_.reset();
+        result->set_value();
+      }))
+    std::terminate();
+  done.get();
 }
 
 void MetaSentinelServer::Shutdown() {
@@ -557,6 +859,12 @@ void MetaSentinelServer::Shutdown() {
   if (!core_->executor_.Notify([core = core_, result]() noexcept {
         core->drain_waiters_.push_back(result);
         core->shutdown_ = true;
+        core->context_ = nullptr;
+        core->subscription_.reset();
+        for (auto [connection, session] : core->live_) {
+          (void)connection;
+          core->Close(*session);
+        }
         if (core->accepting_) {
           auto wake = OpenAcceptWake(core->endpoint_);
           if (wake.ok()) {
@@ -650,25 +958,27 @@ bycorf::Task<absl::Status> MetaSentinelServer::SessionLoop(
   using cluster::control::ControlDeadlineWatchdog;
   ControlDeadlineWatchdog authentication_deadline(*core->worker_, expire);
   ControlDeadlineWatchdog read_deadline(*core->worker_, expire);
-  ControlDeadlineWatchdog write_deadline(*core->worker_, expire);
+
   const auto timeout = core->options_.progress_timeout_;
-  SentinelSession session{.authenticated_ = !core->authenticator_.required(),
-                          .id_ = ++core->next_connection_id_,
-                          .name_ = {},
-                          .library_name_ = {},
-                          .library_version_ = {}};
+  SentinelSession session{};
+  session.authenticated_ = !core->authenticator_.required();
+  session.id_ = ++core->next_connection_id_;
   if (!session.authenticated_ && !authentication_deadline.Arm(timeout).ok()) {
     (void)stream.Close();
     co_return absl::UnavailableError("Sentinel authentication timer failed");
   }
+  session.connection_ = connection;
+  core->live_.emplace(connection, &session);
+  core->worker_->Spawn(core->WriteSession(&stream, &session));
   RespCommandParser parser(core->options_.query_limit_);
   std::array<std::byte, 4096> buffer;
   std::string pending;
   unsigned commands = 0;
   bool drop = false;
-  while (!drop && !expired && !core->shutdown_) {
+  bool graceful = false;
+  while (!drop && !expired && !core->shutdown_ && !session.closing_) {
     auto read = co_await stream.ReadSome(buffer);
-    if (!read.ok() || *read == 0 || expired) break;
+    if (!read.ok() || *read == 0 || expired || session.closing_) break;
     // The parser can leave a trailing CR unconsumed while awaiting its LF.
     // Preserve only that suffix across reads; consumed bytes belong to the
     // parser. The staging buffer is bounded by one read chunk plus the suffix.
@@ -695,9 +1005,9 @@ bycorf::Task<absl::Status> MetaSentinelServer::SessionLoop(
         drop = true;
       } else {
         const bool was_authenticated = session.authenticated_;
-        const auto action =
-            ExecuteConnectionCommand(core->authenticator_, core->discovery_,
-                                     session, parsed.command_.args_);
+        const auto action = ExecuteConnectionCommand(
+            core->authenticator_, core->discovery_, session,
+            parsed.command_.args_, core->options_);
         drop =
             action == SessionAction::kClose || action == SessionAction::kDrop;
         if (session.authenticated_) {
@@ -710,7 +1020,19 @@ bycorf::Task<absl::Status> MetaSentinelServer::SessionLoop(
         }
         // kDrop is the discovery no-reply contract: the loop exits without
         // entering the write path below.
-        if (action == SessionAction::kDrop) break;
+        if (action == SessionAction::kDrop) {
+          // A pipelined AUTH on a follower may already have a queued reply.
+          // Drain only connection-local replies; a revoked authority session
+          // must discard every pending discovery frame instead.
+          graceful = !session.authority_bound_;
+          break;
+        }
+      }
+      if (session.subscriptions_.size() > core->options_.subscription_limit_ ||
+          session.subscription_bytes_ > core->options_.query_limit_) {
+        core->Close(session);
+        drop = true;
+        break;
       }
       auto reply = session.reply_.View();
       if (reply.size() > core->options_.reply_limit_) {
@@ -718,21 +1040,20 @@ bycorf::Task<absl::Status> MetaSentinelServer::SessionLoop(
         reply = session.reply_.AppendError("ERR Sentinel reply limit exceeded");
         drop = true;
       }
-      if (!write_deadline.Arm(timeout).ok()) {
+      if (!core->Enqueue(session, std::string(reply))) {
         drop = true;
         break;
       }
-      auto written = co_await stream.WriteAll(
-          std::as_bytes(std::span(reply.data(), reply.size())));
-      (void)write_deadline.Disarm();
-      if (!written.ok()) {
-        drop = true;
-        break;
-      }
+      graceful = drop;
       if (++commands % 32 == 0) co_await bycorf::Yield(*core->worker_);
     }
     pending.erase(0, pending.size() - input.size());
   }
+  session.closing_ = true;
+  if (!graceful) core->Close(session);
+  session.output_changed_.NotifyAll(*core->worker_);
+  while (!session.writer_done_) co_await session.writer_finished_.Wait();
+  core->live_.erase(connection);
   (void)stream.Close();
   co_return absl::OkStatus();
 }

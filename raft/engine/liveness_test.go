@@ -47,7 +47,7 @@ func TestHeartbeatFreshness(t *testing.T) {
 			case "old-incoming-connection":
 				link.rx++
 			case "revoked":
-				r.epochRevoked = true
+				r.liveness = map[uint64]*peerLiveness{}
 			}
 			accepted := r.acceptHeartbeat(m)
 			if accepted != (scenario == "fresh") {

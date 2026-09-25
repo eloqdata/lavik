@@ -87,9 +87,6 @@ func (r *Runtime) acceptHeartbeat(m *pb.Message) bool {
 	if len(m.Context) < heartbeatHeader || string(m.Context[:4]) != "LHB1" || !bytes.Equal(m.Context[24:40], r.heartbeatNonce[:]) {
 		return false
 	}
-	if r.epochRevoked {
-		return false
-	}
 	p := r.liveness[m.GetFrom()]
 	if p == nil {
 		return false
@@ -149,36 +146,30 @@ func (r *Runtime) quorumLive(now time.Time) bool {
 	return len(r.core.conf.GetVoters()) > 0 && majority(r.core.conf.GetVoters()) && majority(r.core.conf.GetVotersOutgoing())
 }
 
-// authorityRole makes liveness a separate condition from log replication and
-// durable application. Once expired, an epoch stays revoked until Raft leaves
-// leadership; subsequent delayed traffic cannot resurrect its C++ authority.
+// authorityRole admits a newly elected leader after current-term application
+// and fresh quorum evidence. Once published, losing that evidence steps the
+// actual Raft node down: a healed connection cannot revive the same term.
 func (r *Runtime) authorityRole(role Role) Role {
 	now := time.Now()
-	if !r.singleQuarantineUntil.IsZero() && !now.Before(r.singleQuarantineUntil) {
-		r.singleQuarantineUntil = time.Time{}
-		r.epochRevoked = false
-		r.leaderSince = now
-	}
 	if role.IsLeader && (!r.protocolLeader || r.protocolTerm != role.Term) {
 		r.leaderSince = now
-		r.epochRevoked = false
 		r.liveness = map[uint64]*peerLiveness{}
 	}
 	r.protocolLeader = role.IsLeader
 	r.protocolTerm = role.Term
 	if !role.IsLeader {
-		r.epochRevoked = false
 		return role
 	}
-	if !r.quorumLive(now) {
-		role.CaughtUp = false
-		if now.Sub(r.leaderSince) >= r.livenessWindow() {
-			r.epochRevoked = true
-		}
+	live := r.quorumLive(now)
+	published := r.roleSet && r.lastRole.Term == role.Term && r.lastRole.IsLeader && r.lastRole.CaughtUp
+	if !live && (published || now.Sub(r.leaderSince) >= r.livenessWindow()) ||
+		!r.knownPeer(r.cfg.Local.ID) ||
+		(r.deferredTerm != nil && r.deferredTerm.GetTerm() > role.Term) {
+		r.stepDown()
+		role = r.core.status().Role
+		role.IsLeader, role.CaughtUp = false, false
+		return role
 	}
-	if r.epochRevoked || (r.deferredTerm != nil && r.deferredTerm.GetTerm() > role.Term) || !r.knownPeer(r.cfg.Local.ID) {
-		role.IsLeader = false
-		role.CaughtUp = false
-	}
+	role.CaughtUp = role.CaughtUp && live
 	return role
 }

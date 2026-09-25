@@ -5,6 +5,7 @@ package engine
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -320,5 +321,69 @@ func TestSnapshotCannotOvertakeDurableCommit(t *testing.T) {
 	}
 	if disk.gcCut.Load() != 0 {
 		t.Fatal("invalid publication enabled GC")
+	}
+}
+
+func TestRegisteredSentinelCannotRestartWithoutListener(t *testing.T) {
+	cfg := storageConfig(t)
+	cfg.Local.Sentinel = "127.0.0.1:26379"
+	cfg.Initial[0].Sentinel = cfg.Local.Sentinel
+	disk, _, err := openDisk(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk.wal.Close()
+	cfg.Initial = nil
+	cfg.Local.Sentinel = ""
+	if disk, _, err = openDisk(cfg); err == nil {
+		disk.wal.Close()
+		t.Fatal("disabled a durable Sentinel listener on restart")
+	}
+	// A changed bind behind a stable advertised proxy remains valid.
+	cfg.Local.Sentinel = "127.0.0.1:26380"
+	disk, _, err = openDisk(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk.wal.Close()
+}
+
+func TestWaitingJoinerCanEnableSentinelBeforeRegistrationAndRestart(t *testing.T) {
+	cfg := storageConfig(t)
+	cfg.Initial = nil
+	disk, _, err := openDisk(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk.wal.Close()
+	// The original waiting member had no listener and no registered route.
+	cfg.Local.Sentinel = "127.0.0.1:26379"
+	disk, _, err = openDisk(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := testMembers()
+	members[0].Sentinel = "127.0.0.1:26380" // advertised proxy
+	seed := joinSeed{Index: 1, Members: members}
+	if err = seed.validate(cfg.Local); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = disk.saveJoin(data); err != nil {
+		t.Fatal(err)
+	}
+	disk.wal.Close()
+	disk, _, err = openDisk(cfg)
+	if err != nil {
+		t.Fatal("registered joiner failed restart:", err)
+	}
+	disk.wal.Close()
+	cfg.Local.Sentinel = ""
+	if disk, _, err = openDisk(cfg); err == nil {
+		disk.wal.Close()
+		t.Fatal("registered joiner restarted with disabled listener")
 	}
 }

@@ -326,7 +326,7 @@ void StartServerOnEphemeralPort(SentinelRuntime& runtime,
   ASSERT_TRUE(runtime.server_->Start().ok());
 }
 
-// The five discovery verbs are leader-only: a node that is not a caught-up
+// The six discovery verbs are leader-only: a node that is not a caught-up
 // leader closes the connection without a reply so client seed lists rotate,
 // while management verbs keep their explicit error on any node. On the
 // leader, an uninitialized cluster answers from committed state: empty
@@ -415,6 +415,85 @@ TEST(MetaSentinelServerTest, DiscoveryVerbsRequireCaughtUpLeader) {
     ::close(leader);
     runtime.server_->Shutdown();
   }
+}
+
+TEST(MetaSentinelServerTest, ResetCannotEraseAuthorityAcrossEligibilityABA) {
+  SentinelRuntime runtime;
+  ASSERT_TRUE(runtime.initialized_.get_future().get().ok());
+  ASSERT_TRUE(runtime.machine_status_.ok());
+  sockaddr_in address{};
+  StartServerOnEphemeralPort(runtime, &address);
+  ASSERT_TRUE(
+      WaitFor([&] { return runtime.raft_->is_leader_sm_fully_caught_up(); },
+              std::chrono::seconds(15)));
+  const auto term = static_cast<std::uint64_t>(runtime.raft_->leader_term());
+  runtime.runtime_status_->BeginLeadership(term);
+  ASSERT_TRUE(runtime.runtime_status_->SetLeaderAuthorityEligible(term, true));
+  const int client = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ASSERT_GE(client, 0);
+  const timeval timeout{.tv_sec = 3, .tv_usec = 0};
+  ASSERT_EQ(
+      ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)),
+      0);
+  ASSERT_EQ(
+      ::connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+      0);
+  // RESET may be parsed while the discovery response is still queued. Both
+  // queued and already-written replies must retain the TCP authority lifetime.
+  const std::string pipeline = "SENTINEL MASTERS\r\nRESET\r\n";
+  ASSERT_EQ(::send(client, pipeline.data(), pipeline.size(), MSG_NOSIGNAL),
+            pipeline.size());
+  EXPECT_EQ(ReadReply(client, 12), "*0\r\n+RESET\r\n");
+  // Make both eligibility edges inside one worker turn: polling only the
+  // final boolean would miss revocation, but its revision must still close us.
+  std::promise<void> changed;
+  ASSERT_TRUE(runtime.runtime_.GetForeignExecutor(0).Notify([&]() noexcept {
+    runtime.runtime_status_->SetLeaderAuthorityEligible(term, false);
+    runtime.runtime_status_->SetLeaderAuthorityEligible(term, true);
+    changed.set_value();
+  }));
+  changed.get_future().get();
+  char byte;
+  EXPECT_EQ(::recv(client, &byte, 1, 0), 0);
+  ::close(client);
+  runtime.server_->Shutdown();
+}
+
+TEST(MetaSentinelServerTest, ResignationRevokesConnectionAndRequiresNewTerm) {
+  SentinelRuntime runtime;
+  ASSERT_TRUE(runtime.initialized_.get_future().get().ok());
+  ASSERT_TRUE(runtime.machine_status_.ok());
+  sockaddr_in address{};
+  StartServerOnEphemeralPort(runtime, &address);
+  ASSERT_TRUE(WaitFor([&] { return runtime.raft_->is_leader(); },
+                      std::chrono::seconds(15)));
+  const auto term = runtime.raft_->leader_term();
+  ASSERT_GE(term, 0);
+  const int client = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ASSERT_GE(client, 0);
+  const timeval timeout{.tv_sec = 3, .tv_usec = 0};
+  ASSERT_EQ(
+      ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)),
+      0);
+  ASSERT_EQ(
+      ::connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+      0);
+  const std::string request = "SENTINEL MASTERS\r\n";
+  ASSERT_EQ(::send(client, request.data(), request.size(), MSG_NOSIGNAL),
+            request.size());
+  EXPECT_EQ(ReadReply(client, 4), "*0\r\n");
+  runtime.raft_->yield_leadership();
+  EXPECT_EQ(runtime.raft_->leader_term(), -1);
+  EXPECT_FALSE(runtime.raft_->is_leader());
+  ASSERT_TRUE(WaitFor([&] { return runtime.raft_->leader_term() > term; },
+                      std::chrono::seconds(15)));
+  const auto new_term = runtime.raft_->leader_term();
+  runtime.raft_->yield_leadership(false, static_cast<std::uint64_t>(term));
+  EXPECT_EQ(runtime.raft_->leader_term(), new_term);
+  char byte;
+  EXPECT_EQ(::recv(client, &byte, 1, 0), 0);
+  ::close(client);
+  runtime.server_->Shutdown();
 }
 
 }  // namespace

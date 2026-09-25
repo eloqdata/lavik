@@ -164,6 +164,23 @@ TEST(ClusterCreateManifestTest, RequiresExplicitClientServiceMode) {
 }
 
 TEST(ClusterCreateManifestTest,
+     SentinelAddressSurvivesDurableManifestRoundTrip) {
+  auto input = ReplaceOnce(std::string(kValidManifest),
+                           "ctl_endpoint = \"tcp://127.0.0.1:7201\"",
+                           "ctl_endpoint = \"tcp://127.0.0.1:7201\"\n"
+                           "sentinel_endpoint = \"tcp://127.0.0.1:26379\"");
+  auto manifest = ParseClusterCreateManifest(input);
+  ASSERT_TRUE(manifest.ok()) << manifest.status();
+  auto wire = EncodeClusterCreateRequest(*manifest, OperationId(7));
+  ASSERT_TRUE(wire.ok()) << wire.status();
+  MetaOperationId root{};
+  auto restored = DecodeClusterCreateRequest(*wire, &root);
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->meta_members_[0].sentinel_endpoint_,
+            "tcp://127.0.0.1:26379");
+}
+
+TEST(ClusterCreateManifestTest,
      RecoveryBudgetOverrideSurvivesRequestRoundTrip) {
   const std::string input =
       std::string(kValidManifest) +
@@ -386,6 +403,37 @@ TEST(ClusterCreateManifestTest, RejectsDuplicateMetaIdentityAndEndpoints) {
        }) {
     EXPECT_FALSE(ParseClusterCreateManifest(base + duplicate).ok());
   }
+}
+
+TEST(ClusterCreateManifestTest,
+     SentinelRegistrationRequiresUniqueUsableRoutesAndSingleCoverage) {
+  auto text = AutoManifest(1);
+  text =
+      ReplaceOnce(text, "ctl_endpoint = \"tcp://127.0.0.1:7201\"",
+                  "ctl_endpoint = \"tcp://127.0.0.1:7201\"\nsentinel_endpoint "
+                  "= \"tcp://127.0.0.1:26379\"");
+  ASSERT_TRUE(ParseClusterCreateManifest(text).ok());
+  for (const auto invalid :
+       {"tcp://0.0.0.0:26379", "tcp://127.0.0.1:0", "tls://127.0.0.1:26379"}) {
+    EXPECT_FALSE(ParseClusterCreateManifest(
+                     ReplaceOnce(text, "tcp://127.0.0.1:26379", invalid))
+                     .ok());
+  }
+  const std::string second =
+      "[[meta_members]]\nid = 2\n"
+      "raft_endpoint = \"tcp://127.0.0.1:7102\"\n"
+      "data_control_endpoint = \"tcp://127.0.0.1:7302\"\n"
+      "ctl_endpoint = \"tcp://127.0.0.1:7202\"\n";
+  // Cluster permits optional registration; Single requires full coverage.
+  EXPECT_TRUE(ParseClusterCreateManifest(text + second).ok());
+  EXPECT_FALSE(ParseClusterCreateManifest(
+                   ReplaceOnce(text + second, "client_mode = \"cluster\"",
+                               "client_mode = \"single\""))
+                   .ok());
+  EXPECT_FALSE(
+      ParseClusterCreateManifest(
+          text + second + "sentinel_endpoint = \"tcp://127.0.0.1:26379\"\n")
+          .ok());
 }
 
 TEST(ClusterCreateManifestTest, RejectsLegacyScalarMetaMemberShape) {

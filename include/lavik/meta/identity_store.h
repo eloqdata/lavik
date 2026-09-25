@@ -108,6 +108,8 @@ struct MetaMemberRecord {
   // members always populate it, and changing it requires member replacement.
   std::optional<std::string> ctl_endpoint_;
   bool retired_ = false;
+  // Empty means this member has no advertised Sentinel entry.
+  std::string sentinel_endpoint_;
   bool operator==(const MetaMemberRecord&) const = default;
 };
 

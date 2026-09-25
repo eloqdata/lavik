@@ -69,12 +69,16 @@ def meta_manifest_lines(*metas):
             [
                 "[[meta_members]]",
                 f"id = {meta.id}",
-                f'raft_endpoint = "tcp://{meta.endpoint}"',
+                f'raft_endpoint = "tcp://{getattr(meta, "advertised_raft_endpoint", meta.endpoint)}"',
                 f'data_control_endpoint = "tcp://{data_endpoint}"',
                 f'ctl_endpoint = "tcp://{meta.ctl_endpoint}"',
                 "",
             ]
         )
+        if getattr(meta, "sentinel_endpoint", None):
+            lines.insert(
+                len(lines) - 1, f'sentinel_endpoint = "tcp://{meta.sentinel_endpoint}"'
+            )
     return lines
 
 
@@ -170,6 +174,9 @@ def create_request(meta, node_id, endpoint, group_id, meta_id=None, operation_id
             + getattr(
                 member, "advertised_data_control_endpoint", member.data_control_endpoint
             ),
+            ("tcp://" + member.sentinel_endpoint)
+            if getattr(member, "sentinel_endpoint", "")
+            else "",
             "tcp://" + getattr(member, "advertised_ctl_endpoint", member.ctl_endpoint),
         ):
             encoded = value.encode()

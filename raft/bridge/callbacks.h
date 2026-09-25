@@ -28,8 +28,8 @@ static inline void call_advance(LavikRaftCallbacks* c, uintptr_t owner,
 }
 static inline void call_role(LavikRaftCallbacks* c, uintptr_t owner,
                              uint64_t term, uint64_t leader, int is_leader,
-                             int caught_up, uint64_t resign_index) {
-  c->role(owner, term, leader, is_leader, caught_up, resign_index);
+                             int caught_up) {
+  c->role(owner, term, leader, is_leader, caught_up);
 }
 static inline void call_result(LavikRaftCallbacks* c, uintptr_t owner,
                                uint64_t ticket, uint64_t index, int code,

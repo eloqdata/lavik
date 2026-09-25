@@ -1029,7 +1029,7 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
   };
   auto subscribed = subscribe();
   std::string last_error;
-  while (!core->cancelled_) {
+  while (!core->cancelled_ && context->IsCurrent()) {
     if (subscribed.subscription_->needs_resync()) subscribed = subscribe();
     if (changed->exchange(false, std::memory_order_acq_rel)) {
       subscribed.view_ = context->CommittedView();

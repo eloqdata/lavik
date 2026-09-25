@@ -2297,6 +2297,9 @@ absl::Status WriteCommandBody(MetaWriter& w, const BindMetaMember& cmd) {
   w.WriteString(cmd.data_control_endpoint_);
   w.WriteBool(cmd.ctl_endpoint_.has_value());
   if (cmd.ctl_endpoint_.has_value()) w.WriteString(*cmd.ctl_endpoint_);
+  if (cmd.sentinel_endpoint_.size() > kMaxMetaEndpointBytes)
+    return MetaDomainRejectError("Sentinel endpoint exceeds its cap");
+  w.WriteString(cmd.sentinel_endpoint_);
   return absl::OkStatus();
 }
 
@@ -2317,7 +2320,10 @@ absl::StatusOr<BindMetaMember> ReadBindMetaMemberBody(MetaReader& r) {
     if (!decoded.ok()) return decoded.status();
     ctl_endpoint = std::move(*decoded);
   }
+  auto sentinel = ReadBoundedString(r, kMaxMetaEndpointBytes);
+  if (!sentinel.ok()) return sentinel.status();
   BindMetaMember cmd;
+  cmd.sentinel_endpoint_ = std::move(*sentinel);
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
   cmd.server_id_ = *server_id;

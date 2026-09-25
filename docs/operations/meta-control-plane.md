@@ -128,6 +128,59 @@ The Sentinel listener currently uses plaintext TCP. Meta's Raft/control and
 Admin TLS settings do not enable TLS on this port. Keep it on a trusted network
 until Sentinel TLS is available; the endpoint is not an Admin interface.
 
+### Register every candidate leader
+
+Use the existing Sentinel listener as the discovery address. In each initial
+manifest `[[meta_members]]` entry, add its advertised address:
+
+```toml
+sentinel_endpoint = "tcp://10.0.0.11:26379"
+```
+
+For an added member, the Admin command accepts an optional registration after
+its normal endpoints and optional principal:
+
+```text
+addsrv 4 10.0.0.14:7000 10.0.0.14:7001 10.0.0.14:7002 sentinel=10.0.0.14:26379
+```
+
+Start that process with `--sentinel-addr` and the same independent Sentinel
+password as the other seeds. The listener bind and advertised address may differ
+when a proxy fronts the listener. Registration is fixed for a member; enabling,
+disabling or changing it requires replacing that member. Single deployments
+must register all members or none, and discovery HA requires every possible
+leader to run its registered listener. Registration persists through snapshots
+and restarts; restarting a registered member without its listener is rejected.
+
+`SENTINEL SENTINELS` and `num-other-sentinels` count registered effective peers,
+not reachable processes. A temporarily down peer stays listed until removed.
+redis-py's nonzero `min_other_sentinels` therefore checks directory coverage.
+Configure multiple seeds: redis-py 8.1.0 does not learn additional seeds;
+go-redis 9.22.0 also learns addresses through `SENTINELS`.
+
+### Discovery notifications and reconnection
+
+`SUBSCRIBE +switch-master +replica-reconf-done` subscribes to best-effort refresh
+hints. A Data switch publishes `service old-ip old-port new-ip new-port` only
+when the replacement Primary is committed and publishable. A masterless window
+alone sends no switch, and Meta leader replacement establishes a fresh baseline.
+Replica completion uses Redis's `slave name ip port @ service master-ip master-port`
+payload and means the replica actually adopted the new replication source. It
+does not promise zero lag or a continuously connected replication link.
+
+A Meta leader that loses authority closes its discovery and subscription
+connections, including idle ones. Clients must reconnect through seeds and query
+again; notifications are not replayed. Go's subscription accelerates pool
+migration. Revocation of all surviving old Data sessions is tracked separately in
+[#100](https://github.com/eloqdata/lavik/issues/100).
+
+RESP2 subscribed connections allow SUBSCRIBE/UNSUBSCRIBE, PING, QUIT and RESET;
+RESP3 permits ordinary commands alongside pushes. RESET removes subscriptions
+and resets authentication. Each connection permits 128 distinct channels with
+64 KiB total channel storage. Encoded queued plus in-flight output is limited to
+64 KiB per connection and 8 MiB globally. Slow consumers are disconnected rather
+than blocking other clients or retaining an unbounded queue.
+
 ### Independent Sentinel and Data authentication
 
 A pure standalone Lavik Data process, with no replicas and no Meta, continues
@@ -158,13 +211,15 @@ operator authority. Meta does not forward application AUTH to Data.
 | `SENTINEL GET-MASTER-ADDR-BY-NAME <service>` | Two-element `[ip, port]` Primary address array, or null while the service is unknown or has no publishable Primary |
 | `SENTINEL MASTER <service>`, `SENTINEL MASTERS` | Field map for one named service, or for every currently publishable service |
 | `SENTINEL REPLICAS <service>`, `SENTINEL SLAVES <service>` | Field-map array of the service's committed non-Owner members |
-| Data, Pub/Sub, replication, Admin, and Sentinel management/election commands (MONITOR, FAILOVER, SET, REMOVE, CKQUORUM, SENTINELS, IS-MASTER-DOWN-BY-ADDR, and similar) | Rejected, even after successful authentication |
+| `SENTINEL SENTINELS <service>` | Registered effective peer addresses, excluding this responder |
+| `SUBSCRIBE`, `UNSUBSCRIBE` | Best-effort discovery events; RESP2 arrays or RESP3 pushes |
+| Data, PUBLISH, replication, Admin, and Sentinel management/election commands (MONITOR, FAILOVER, SET, REMOVE, CKQUORUM, IS-MASTER-DOWN-BY-ADDR, and similar) | Rejected, even after successful authentication |
 
 When a password is configured, only AUTH, HELLO, QUIT, and RESET execute
 before authentication; registered CLIENT arity errors are checked first, as
 in Redis. New connections start in RESP2.
 
-The five discovery verbs are answered only by the current caught-up Meta
+The six discovery verbs are answered only by the current caught-up Meta
 leader. A follower, a leader whose state machine has not caught up, or a
 waiting joiner closes the connection without writing a reply, so seed every
 Meta member's Sentinel address and let the client retry through the list;
@@ -247,7 +302,7 @@ sources:
 | `flags` | observation truth | always `master`; may add `s_down` and `disconnected` per the flag rules below; never `o_down` |
 | `config-epoch` | committed truth | the Group Term |
 | `num-slaves` | committed truth | count of committed, non-retired members excluding the Owner |
-| `num-other-sentinels` | documented constant | `0`; there is no Sentinel peer directory yet (tracked as #105) |
+| `num-other-sentinels` | committed directory | Effective registered peers excluding this responder; the same set as `SENTINEL SENTINELS`, independent of reachability |
 | `role-reported` | documented constant | `master` |
 | `down-after-milliseconds` | documented constant | `30000` |
 | `quorum` | documented constant | `1` |
@@ -311,8 +366,6 @@ Known limitations.
   observation of a replica's upstream link (see ADR 0024).
 - `slave-repl-offset` is a placeholder constant `0`; progress has no scalar
   form comparable across replication Compatibility Domains.
-- `num-other-sentinels` is `0`; the Sentinel peer directory and
-  `+switch-master` events arrive with #105.
 - Only plaintext addresses (`tcp://` or the legacy untagged form) are
   published. TLS-only deployments resolve to null
   until TLS address publication arrives with #109.

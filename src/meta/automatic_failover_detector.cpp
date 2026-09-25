@@ -104,11 +104,11 @@ bool IsValidReason(MetaOwnerServiceabilityReason reason) noexcept {
 }
 
 bool IsValidDiagnostic(const MetaAutomaticFailoverStatus& status,
-                       std::uint64_t leadership_generation,
+                       std::uint64_t leader_term,
                        std::uint64_t eligibility_revision) noexcept {
   return !status.anchor_.group_id_.empty() &&
          status.anchor_.group_id_.size() <= kMaxMetaGroupIdBytes &&
-         status.anchor_.leadership_generation_ == leadership_generation &&
+         status.anchor_.leader_term_ == leader_term &&
          status.anchor_.leader_authority_eligibility_revision_ ==
              eligibility_revision &&
          IsValidState(status.state_) && IsValidReason(status.current_reason_) &&
@@ -118,25 +118,25 @@ bool IsValidDiagnostic(const MetaAutomaticFailoverStatus& status,
 }  // namespace
 
 void MetaAutomaticFailoverDiagnosticsRegistry::BeginLeadership(
-    std::uint64_t leadership_generation) {
-  if (leadership_generation == 0) return;
+    std::uint64_t leader_term) {
+  if (leader_term == 0) return;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (leadership_generation <= latest_leadership_generation_) return;
+  if (leader_term <= latest_leader_term_) return;
   statuses_.clear();
   leader_authority_eligibility_revision_ = 0;
   evaluated_applied_index_ = 0;
-  leadership_generation_ = leadership_generation;
-  latest_leadership_generation_ = leadership_generation;
+  leader_term_ = leader_term;
+  latest_leader_term_ = leader_term;
 }
 
 void MetaAutomaticFailoverDiagnosticsRegistry::Publish(
-    std::uint64_t leadership_generation,
+    std::uint64_t leader_term,
     std::uint64_t leader_authority_eligibility_revision,
     std::uint64_t evaluated_applied_index,
     std::vector<MetaAutomaticFailoverStatus> statuses) {
-  if (leadership_generation == 0 || statuses.size() > kMaxMetaGroups) return;
+  if (leader_term == 0 || statuses.size() > kMaxMetaGroups) return;
   for (const MetaAutomaticFailoverStatus& status : statuses) {
-    if (!IsValidDiagnostic(status, leadership_generation,
+    if (!IsValidDiagnostic(status, leader_term,
                            leader_authority_eligibility_revision)) {
       return;
     }
@@ -154,7 +154,7 @@ void MetaAutomaticFailoverDiagnosticsRegistry::Publish(
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
-  if (leadership_generation_ != leadership_generation ||
+  if (leader_term_ != leader_term ||
       leader_authority_eligibility_revision <
           leader_authority_eligibility_revision_ ||
       evaluated_applied_index < evaluated_applied_index_) {
@@ -167,20 +167,20 @@ void MetaAutomaticFailoverDiagnosticsRegistry::Publish(
 }
 
 void MetaAutomaticFailoverDiagnosticsRegistry::EndLeadership(
-    std::uint64_t leadership_generation) {
-  if (leadership_generation == 0) return;
+    std::uint64_t leader_term) {
+  if (leader_term == 0) return;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (leadership_generation_ != leadership_generation) return;
+  if (leader_term_ != leader_term) return;
   statuses_.clear();
   leader_authority_eligibility_revision_ = 0;
   evaluated_applied_index_ = 0;
-  leadership_generation_ = 0;
+  leader_term_ = 0;
 }
 
 MetaAutomaticFailoverDiagnosticsSnapshot
 MetaAutomaticFailoverDiagnosticsRegistry::Snapshot() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return {.leadership_generation_ = leadership_generation_,
+  return {.leader_term_ = leader_term_,
           .leader_authority_eligibility_revision_ =
               leader_authority_eligibility_revision_,
           .evaluated_applied_index_ = evaluated_applied_index_,

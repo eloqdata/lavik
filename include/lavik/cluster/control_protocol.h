@@ -533,7 +533,6 @@ struct LeaseGranted {
   WireId128 nonce{};
   std::uint32_t leader_id = 0;
   std::uint64_t raft_term = 0;
-  std::uint64_t leadership_generation = 0;
   std::string data_boot_id;
   std::uint64_t control_revision = 0;
   std::string group_id;

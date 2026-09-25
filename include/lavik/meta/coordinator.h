@@ -329,6 +329,10 @@ class MetaReconciler;
 // lost fails with NOT_LEADER at the raft layer like any other proposal.
 class MetaLeaderContext {
  public:
+  // Captured Raft term, immutable throughout Start -> CancelAndWait. Current
+  // admission always comes from the shared MetaRaft atomic, not this copy.
+  std::uint64_t term() const { return term_; }
+  bool IsCurrent() const;
   bycorf::Task<absl::StatusOr<MetaApplyResult>> Propose(MetaCommand command);
   MetaCommittedView CommittedView();
   // O(1) applied cursor, including Raft configurations without commit events.
@@ -344,6 +348,7 @@ class MetaLeaderContext {
       : coordinator_(&coordinator), actor_(std::move(actor)) {}
   MetaCoordinator* coordinator_;
   AuthenticatedPrincipal actor_;
+  std::uint64_t term_ = 0;
 };
 
 // A leader-scoped control loop. Start() is called on the coordinator's
@@ -437,8 +442,11 @@ class MetaCoordinator {
   //     The message says so; the caller reconciles against CommittedView()
   //     using the command's idempotency key instead of assuming failure —
   //     safe because every command is replay/idempotency-safe by design.
+  // Zero captures the current leader term; a leader context supplies its own
+  // fixed term. The expected term is checked again by the Raft protocol owner.
   bycorf::Task<absl::StatusOr<MetaApplyResult>> Propose(
-      MetaCommand command, AuthenticatedPrincipal principal);
+      MetaCommand command, AuthenticatedPrincipal principal,
+      std::uint64_t expected_leader_term = 0);
 
   // Registers a ValidateProposal plugin (see the MetaValidateHook contract).
   // Call during assembly, before the coordinator can go leader; not
@@ -482,11 +490,13 @@ class MetaCoordinator {
   // seam relies on transition EVENTS, not state polling; process assembly uses
   // MetaLeadershipRelay below so edges racing coordinator attachment are not
   // lost.
-  void BecomeLeader();
-  void BecomeFollower();
+  // Follower carries the retired leader term, not a later candidate term.
+  void BecomeLeader(std::uint64_t term);
+  void BecomeFollower(std::uint64_t term);
 
  private:
   friend class MetaCommitSubscription;
+  friend class MetaLeaderContext;
   // Coroutine-frame RAII decrement of the proposal in-flight counter
   // (coordinator.cpp).
   class InFlightGuard;
@@ -549,6 +559,7 @@ class MetaCoordinator {
   struct LeadershipEvent {
     LeadershipEventKind kind_;
     std::shared_ptr<MetaReconciler> reconciler_;
+    std::uint64_t term_ = 0;
   };
   std::mutex leadership_mu_;
   std::condition_variable leadership_cv_;
@@ -573,8 +584,8 @@ class MetaCoordinator {
 // through DetachAndStop.
 class MetaLeadershipRelay {
  public:
-  void RecordLeaderEdge() noexcept;
-  void RecordFollowerEdge() noexcept;
+  void RecordLeaderEdge(std::uint64_t term) noexcept;
+  void RecordFollowerEdge(std::uint64_t term) noexcept;
   // Worker-side drain; a pre-attach call leaves the events retained.
   void Drain() noexcept;
   void Attach(MetaCoordinator& coordinator);
@@ -582,12 +593,16 @@ class MetaLeadershipRelay {
 
  private:
   enum class Role : std::uint8_t { kLeader, kFollower };
-  void Record(Role role) noexcept;
-  static void Forward(MetaCoordinator& coordinator, Role role);
+  struct Edge {
+    Role role_;
+    std::uint64_t term_;
+  };
+  void Record(Edge edge) noexcept;
+  static void Forward(MetaCoordinator& coordinator, Edge edge);
 
   std::mutex mu_;
   std::condition_variable cv_;
-  std::deque<Role> pending_;
+  std::deque<Edge> pending_;
   MetaCoordinator* target_ = nullptr;
   bool attached_once_ = false;
   bool draining_ = false;

@@ -30,7 +30,7 @@ The Data executable and operator client remain Raft-free.
 Followers return the committed member directory and leader hint. Only a leader
 with current-term application and fresh quorum evidence may start the publisher
 and Automatic Failover Detector. Demotion revokes that authority immediately,
-then cancels and joins all owners from its leadership generation. Shutdown stops
+then cancels and joins all owners from its Raft leader term. Shutdown stops
 workflow owners and ingress, drains proposals and all Go callback producers,
 waits for accepted foreign notifications, then stops Bycorf. A failed demotion
 notification is fail-stop; no later leader generation may reuse authority whose
@@ -50,9 +50,9 @@ invalid.
 `--sentinel-addr` explicitly enables a separate plaintext RESP client endpoint:
 the Discovery Entry. `MetaSentinelServer` owns its worker-local sessions and a
 closed command allowlist. It supports authentication, RESP2/RESP3 negotiation,
-client identity metadata, health checks, and connection reset/close, plus five
+client identity metadata, health checks, and connection reset/close, plus six
 Sentinel topology discovery verbs: `GET-MASTER-ADDR-BY-NAME`, `MASTER`,
-`MASTERS`, `REPLICAS`, and `SLAVES`. These connection commands have no
+`MASTERS`, `REPLICAS`, `SLAVES`, and `SENTINELS`. These connection commands have no
 dependency on Data-cluster readiness or Meta leadership. Sentinel management
 and election subcommands, Data commands, and Admin commands are explicitly
 rejected on every node without entering either other dispatcher; a rejection
@@ -60,25 +60,29 @@ is a deterministic answer that does not depend on authority state.
 
 Discovery answers serve Meta-managed Single deployments only. The Service Name
 is the committed Group ID, matched exactly; any other name, and any deployment
-whose immutable client mode is Cluster, is an unknown service. The five
+whose immutable client mode is Cluster, is an unknown service. The six
 discovery verbs are answered only while the local node holds Raft leadership
 and its state machine has fully caught up; a follower, a still-catching-up
 leader, or a waiting joiner closes the connection without a reply, so clients
 reach the leader by retrying their seed list. There is no private redirect.
 
 A discovery answer projects one compact committed view,
-`MetaStateMachine::StatusSnapshot`, cached per serving worker and rebuilt only
-when the state machine's `state_change_index` advances. The view is joined
-with mutex-consistent snapshots of two thread-safe volatile registries:
+`MetaStateMachine::StatusSnapshot`, cached as an immutable shared view per
+serving worker and rebuilt when the applied index advances, including
+`Advance()` entries that change no stores. Each response or event cut retains
+its own share, so replacing the worker cache cannot invalidate a cut still in
+use. The view is joined with mutex-consistent snapshots of two thread-safe
+volatile registries:
 `MetaDataControlRuntimeStatus` for session, health, and projection-anchor
 state, and `MetaAutomaticFailoverDiagnosticsRegistry` for detector state.
 Diagnostics are adopted only under their join-identity contract: the two
-volatile snapshots must name the same leadership generation and
-eligibility-continuity revision, and a Group's diagnostic anchor must equal
+volatile snapshots must name the same Raft leader term and
+eligibility-continuity revision, the detector's evaluated applied index must
+equal the committed view's, and a Group's diagnostic anchor must equal
 the committed owner, assignment, and Group Term; any mismatch is read as no
-diagnostic, exactly as cluster-status resolves the same join. The request path
-takes no cross-worker blocking lock—the compact view's brief state lock
-follows the ctl-server precedent, and steady-state queries rebuild nothing.
+diagnostic, exactly as cluster-status resolves the same join. The compact
+view takes a brief state lock only when rebuilt; the volatile registries take
+short snapshot locks, and steady-state queries rebuild nothing.
 
 Publication is gated by committed authority alone: the lifecycle is Created,
 the immutable client mode is Single, one complete Group exists, its authority
@@ -109,6 +113,46 @@ at any time. Discovery replies follow the Redis 7.2 Sentinel
 field shapes under RESP2 and RESP3; fields Meta cannot observe truthfully are
 omitted or carried as documented constants rather than fabricated.
 
+The existing committed Meta member identity carries an optional advertised
+`sentinel_endpoint`. The manifest, membership target/baseline/binding, Raft member
+descriptor, command codec, and snapshot retain it together. It is immutable for
+that member, including absent-to-present changes; replacement changes the address.
+Single-mode admission requires uniform registration coverage when enabled.
+`SENTINELS` and `num-other-sentinels` use the same effective committed Raft members
+with nonempty registrations, excluding self, retired identities, and staged joins.
+This is a directory, not a liveness vote: unreachable registered peers remain.
+The listener bind is independent of the advertised address to permit proxies.
+All election-eligible members must run their registered listener for discovery HA.
+
+Discovery requests and SUBSCRIBE bind their session to the current usable Raft
+leader term (-1 while unavailable), matching Data-control term and
+readiness-continuity revision, and local
+commit-subscription continuity. Demotion, freshness loss, or a cancelled commit
+subscription closes those sessions, including idle and blocked writers. Returning
+to eligibility cannot revive an old session or queued frame. Connection-only
+sessions remain independent of leadership until they first request discovery.
+
+`MetaDiscoveryEvents` observes committed cuts under one continuous authority.
+`+switch-master` reports only a change between publishable Data Primary addresses;
+it retains A through a masterless window and emits A-to-B when B is publishable.
+The first Primary and a new term at the same address produce no switch. Lost
+continuity resets the baseline instead of reconstructing missed history.
+`+replica-reconf-done` requires fresh accepted CandidateProgress from the current
+replica session, matching the committed assignment, manifest, partition epoch,
+and current Owner source id, assignment, term, boot and history. This reuses the
+ReadyToken lineage already carried by heartbeats: applying desired state or
+retaining readable data cannot establish source adoption. Completion promises
+neither zero lag nor continued connectivity. Initial complete observations after
+Meta replacement establish a baseline, and duplicate reports emit nothing.
+
+Subscriptions support RESP2 arrays and RESP3 pushes, per-channel acknowledgement
+counts, duplicate subscriptions, unsubscribe-all, and subscribed PING. RESP2
+subscribed mode restricts commands; RESP3 retains ordinary command access. RESET
+clears subscriptions and authentication; QUIT drains its ordered reply. Events are
+best-effort refresh hints. Clients must rediscover after reconnecting; no durable
+event log or independent Sentinel election exists. Data-session revocation remains
+a separate data-plane boundary even when an event is missed.
+
 The Sentinel password is independent of Data's `requirepass`. Both processes
 use the immutable default-user `PasswordAuthenticator` and the shared RESP
 parser/reply builder, but each connection authenticates locally. Sentinel
@@ -124,8 +168,10 @@ errors.
 
 Sentinel admission counts all accepted sessions, including unauthenticated
 ones. Input, output, and identity storage are bounded independently of Data's
-budgets; a session executes and writes one response before admitting its next
-command. Authentication, partial requests, and blocked writes have finite
+budgets. One worker-owned writer per session serializes command replies and
+subscription messages. Queued and in-flight bytes share per-session and global
+budgets; overflow closes the slow client. Subscription count and channel storage
+are bounded, and no publisher waits on a client socket. Authentication, partial requests, and blocked writes have finite
 lifetimes, while authenticated idle connections can remain open. Each session
 borrows its Bycorf Connection before its coroutine starts and releases it only
 after its local users and deadlines unwind. Startup checks the Sentinel bind
@@ -524,7 +570,7 @@ an injected monotonic-millisecond cut (production `steady_clock`) to accumulate
 only exact Unserviceable time. A reason change does not clear elapsed time.
 Indeterminate evidence for the same complete anchor freezes and later resumes
 it; Serviceable evidence clears it. A change
-to leadership generation or any revisioned eligibility interruption (including
+to Raft leader term or any revisioned eligibility interruption (including
 false-to-true entirely between detector polls), Owner/assignment, Group term,
 either current Policy version, or threshold discards it. A new or newly
 eligible leader first completes the
@@ -656,7 +702,7 @@ handshake permits. The listener closes excess sockets before starting their
 session coroutine. A follower retains its permit through the bounded redirect
 write. A leader releases it only after the connection has atomically claimed
 the committed node's single post-authentication slot and joined the current
-leadership generation; duplicates are rejected until that exact owner exits.
+Raft leader term; duplicates are rejected until that exact owner exits.
 Consequently anonymous/redirect work is capped at 4096, and projection/FDS
 holders are capped at one per committed node-record slot (validated active at
 claim time) even when a peer stalls or that record retires before session
@@ -765,13 +811,12 @@ host suspend can otherwise preserve an old process's cached leader verdict
 while other members elect a replacement. A leader-scoped Data-control task
 continuously compares that clock with `CLOCK_BOOTTIME`, including when no Data
 session is active; accumulated suspend divergence of at least
-`D` closes the leadership generation's authority sessions and synchronously
-requests immediate Raft resignation. In a multi-member cluster the old
-generation cannot become eligible again. A sole
-member may reopen leadership only after running for another full `D` of active
-time; a further suspend restarts the wait. Live control boundaries, directives,
-result proposals, and grants all pass this barrier. It covers the same-identity
-case whose ordinary `2D` handoff entry matured before suspension.
+`D` closes the current term's authority sessions and synchronously retires its
+leader term before requesting Raft resignation. Even a sole member must win and
+apply a new election term. The new term resets the Data lease handoff guard,
+including for the same identity whose previous `2D` wait matured before suspend.
+Live control boundaries, directives, result proposals, and grants all check their
+captured term against the shared atomic leader term.
 
 Population directives separate the wire recipient from the rebuild target:
 rebuild is delivered to the target, while authorize/revoke is delivered to the
@@ -917,11 +962,12 @@ values.
 
 Every configured Meta identity has one canonical concrete numeric Data-control
 endpoint and one canonical concrete numeric Admin endpoint. The C++ `LMI1`
-descriptor carries server id, principal and both endpoints. The bridge carries
+descriptor carries five pipe-separated fields: server id, principal, Data-control,
+Admin, and the optional Sentinel endpoint (an empty final field when absent). The bridge carries
 these decoded fields and the Raft endpoint in committed configuration contexts
 and snapshots. The descriptor
-and committed identity binding must agree exactly. Advertised Data-control and
-Admin addresses may route through an explicit proxy instead of equaling local
+and committed identity binding must agree exactly. Advertised Data-control, Admin and
+Sentinel addresses may route through an explicit proxy instead of equaling local
 binds; restart may likewise rebind a Raft listener behind a transport proxy
 without changing its durable advertised endpoint. Endpoints are immutable and
 unique within their respective directories, and change only through retirement
@@ -1061,7 +1107,7 @@ typed commands above.
 The leader builds `clusterstatus` from a compact state-machine view captured
 under the same mutex as committed apply plus Data-control runtime and Automatic
 Failover Detector diagnostic snapshots captured first. The two volatile cuts
-must name the same leadership generation and eligibility-continuity revision;
+must name the same Raft leader term and eligibility-continuity revision;
 the detector cut must also name the compact view's exact applied index. This
 top-level identity covers even an empty detector batch, so a false-to-true
 eligibility ABA cannot splice pre-interruption diagnostics into a later cut.
@@ -1074,7 +1120,7 @@ receipt, while a lease decision becomes observable only after its Ack is
 written, and replaying a cached Ack does not refresh it. Merging requires the
 session, projection, assignment, Group Term, manifest, and population anchors
 to match the committed cut. The result then passes a second
-leader-alive, term, leadership-generation/eligibility/revision, Raft-config,
+leader-alive, term, leader-term/readiness/revision, Raft-config,
 and committed Meta-directory check; a changed bracket returns `cut_changed`
 instead of mixed state. Captures are single-flight across both Admin listeners.
 Completed replies release the capture permit before sending, share a 256 MiB
@@ -1323,7 +1369,7 @@ audit history rather than replacing it.
 | Asynchronous Raft protocol, WAL, snapshots, authentication and quorum liveness | [Meta Raft runtime](10-meta-raft.md), `raft/engine/`, `include/lavik/meta/raft.h`, `src/meta/raft.cpp`, `src/meta/proposal_executor.cpp` |
 | Meta session transport retirement and Connection-storage lifetime | `src/meta/ctl_server.cpp`, `src/meta/data_control_server.cpp`, `bycorf/include/bycorf/net/connection.h`, `bycorf/src/runtime/worker.cpp` |
 | Foreign-thread typed completion ingress and worker wakeup | `bycorf/include/bycorf/runtime/foreign_executor.h`, `bycorf/src/runtime/foreign_executor.cpp`, `bycorf/include/bycorf/runtime/cross_core.h`, `bycorf/src/runtime/worker.cpp` |
-| Independent Sentinel Discovery Entry, local password verification, leader-only committed-authority discovery projection and flag join, silent-drop non-leader answers, bounded sessions and lifecycle | `include/lavik/meta/sentinel_server.h`, `src/meta/sentinel_server.cpp`, `include/lavik/meta/sentinel_discovery.h`, `src/meta/sentinel_discovery.cpp`, `include/lavik/meta/committed_status_view.h`, `include/lavik/meta/data_control_runtime_status.h`, `include/lavik/meta/automatic_failover_detector.h`, `include/lavik/password_authenticator.h`, `src/redis/password_authenticator.cpp`, `src/redis/resp.cpp`, `app/lavik_meta.cpp`, `tests/meta_sentinel_discovery_test.cpp`, `tests/meta_integration/gate_sentinel.py`, `tests/meta_integration/gate_sentinel_discovery.py` |
+| Independent Sentinel Discovery Entry, local password verification, leader-only committed-authority discovery projection and flag join, silent-drop non-leader answers, bounded sessions and lifecycle | `include/lavik/meta/sentinel_server.h`, `src/meta/sentinel_server.cpp`, `include/lavik/meta/sentinel_discovery.h`, `src/meta/sentinel_discovery.cpp`, `src/meta/sentinel_events.cpp`, `include/lavik/meta/committed_status_view.h`, `include/lavik/meta/data_control_runtime_status.h`, `include/lavik/meta/automatic_failover_detector.h`, `include/lavik/password_authenticator.h`, `src/redis/password_authenticator.cpp`, `src/redis/resp.cpp`, `app/lavik_meta.cpp`, `tests/meta_sentinel_discovery_test.cpp`, `tests/meta_integration/gate_sentinel.py`, `tests/meta_integration/gate_sentinel_discovery.py` |
 | TLS identity, RBAC, Unix peer credentials, Admin transport, cluster status, controlled failover, and initial cluster creation | `include/lavik/meta/identity_verifier.h`, `include/lavik/meta/ctl_server.h`, `include/lavik/meta/admin_client.h`, `include/lavik/meta/cluster_status.h`, `include/lavik/meta/cluster_create.h`, `include/lavik/meta/failover_admin.h`, `app/lavik_meta.cpp`, `app/lavik_ctl.cpp`, `bycorf/src/net/` |
 | Automatic-failover status wire/model plus JSON and text rendering | `include/lavik/meta/cluster_status.h`, `src/meta/cluster_status.cpp`, `tests/meta_cluster_status_test.cpp` |
 | Recovery, partition, membership, failover, and security gates | `tests/meta_*`, `tests/meta_integration/` |

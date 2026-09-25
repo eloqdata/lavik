@@ -41,7 +41,7 @@ namespace lavik::meta {
 // even when false -> true occurs between two detector polls.
 struct MetaAutomaticFailoverAnchor {
   std::string group_id_;
-  std::uint64_t leadership_generation_ = 0;
+  std::uint64_t leader_term_ = 0;
   std::uint64_t leader_authority_eligibility_revision_ = 0;
   std::string owner_node_id_;
   MetaAssignmentId owner_assignment_id_{};
@@ -88,10 +88,10 @@ struct MetaAutomaticFailoverStatus {
 };
 
 struct MetaAutomaticFailoverDiagnosticsSnapshot {
-  std::uint64_t leadership_generation_ = 0;
+  std::uint64_t leader_term_ = 0;
   // Eligibility continuity cut used to produce every status in this batch.
   // This remains meaningful for an empty batch and lets status readers reject
-  // a false -> true ABA within one leadership generation.
+  // a false -> true ABA within one Raft leader term.
   std::uint64_t leader_authority_eligibility_revision_ = 0;
   // Applied index of the one compact committed view used to evaluate every
   // status in this publication. Consumers must equality-check this identity
@@ -105,39 +105,39 @@ struct MetaAutomaticFailoverDiagnosticsSnapshot {
 
 // Thread-safe publication Seam between the leader-owned detector reconciler
 // and cross-thread diagnostic readers such as cluster status. A publication
-// replaces one complete generation cut; invalid batches and stale lifecycle
+// replaces one complete term cut; invalid batches and stale lifecycle
 // callbacks are ignored atomically, so readers see neither partial nor
-// cross-generation detector state. Storage is capped at kMaxMetaGroups.
+// cross-term detector state. Storage is capped at kMaxMetaGroups.
 class MetaAutomaticFailoverDiagnosticsRegistry {
  public:
   // Opens a strictly newer nonzero leadership bracket and clears the prior
-  // cut. Repeating the current generation is an idempotent no-op rather than
-  // erasing already published diagnostics; older or ended generations cannot
+  // cut. Repeating the current term is an idempotent no-op rather than
+  // erasing already published diagnostics; older or ended terms cannot
   // be reopened.
-  void BeginLeadership(std::uint64_t leadership_generation);
-  // Atomically replaces the current generation's complete Group cut. Input
+  void BeginLeadership(std::uint64_t leader_term);
+  // Atomically replaces the current term's complete Group cut. Input
   // order is immaterial; Snapshot always returns Group-id order. An invalid,
   // oversized, duplicate, stale, future, cross-eligibility, or
-  // ended-generation batch is dropped without changing the last valid cut.
-  void Publish(std::uint64_t leadership_generation,
+  // ended-term batch is dropped without changing the last valid cut.
+  void Publish(std::uint64_t leader_term,
                std::uint64_t leader_authority_eligibility_revision,
                std::uint64_t evaluated_applied_index,
                std::vector<MetaAutomaticFailoverStatus> statuses);
   // Closes and clears only the matching current bracket. A delayed teardown
-  // from an older generation cannot erase a newer leader's diagnostics.
-  void EndLeadership(std::uint64_t leadership_generation);
-  // Copies one mutex-consistent cut. Generation zero means that no leadership
+  // from an older term cannot erase a newer leader's diagnostics.
+  void EndLeadership(std::uint64_t leader_term);
+  // Copies one mutex-consistent cut. Term zero means that no leadership
   // bracket is active and therefore statuses is empty.
   MetaAutomaticFailoverDiagnosticsSnapshot Snapshot() const;
 
  private:
   mutable std::mutex mutex_;
-  std::uint64_t leadership_generation_ = 0;
+  std::uint64_t leader_term_ = 0;
   std::uint64_t leader_authority_eligibility_revision_ = 0;
   std::uint64_t evaluated_applied_index_ = 0;
   // Retained after EndLeadership so a delayed Begin for an already ended
-  // generation cannot resurrect diagnostics.
-  std::uint64_t latest_leadership_generation_ = 0;
+  // term cannot resurrect diagnostics.
+  std::uint64_t latest_leader_term_ = 0;
   std::vector<MetaAutomaticFailoverStatus> statuses_;
 };
 
@@ -151,7 +151,7 @@ class MetaAutomaticFailoverStateMachine {
   struct Input {
     MetaAutomaticFailoverAnchor anchor_;
     // Eligibility is repeated explicitly because losing it discards SUSPECT
-    // time even before a formal leadership-generation change.
+    // time even before a formal leader-term change.
     bool leader_authority_eligible_ = false;
     std::uint64_t suspect_after_ms_ = 0;
     MetaOwnerServiceabilityDecision owner_serviceability_;

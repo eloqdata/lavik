@@ -76,6 +76,19 @@ withdraw Data authority. Peer application progress is always reported; only
 Cluster Create and learner promotion impose their explicit catch-up barriers.
 Ordinary writes retain durable majority semantics.
 
+Meta modules read one shared atomic leader term: the admitted Raft term, or -1
+while unavailable. Ordered `BecomeLeader(T)` and `BecomeFollower(T)` events
+carry the admitted or retired term through the process relay and coordinator.
+A reconciler context captures T for its entire Start-to-CancelAndWait lifetime;
+old-term cancellation cannot cancel a newer context, and old work never adopts
+a later term merely by reading current leadership. Proposals and membership
+requests retain that expected term through their queues to protocol-owner
+admission. Local copies in Data sessions, runtime observations, and detector
+cuts identify their owner; none independently increments a leadership version.
+Lease grants carry this Raft term without a duplicate leadership generation.
+Data-control readiness may change within a term during membership reconciliation,
+so its readiness-continuity revision remains separate from leader identity.
+
 ## Transport and authority
 
 Each destination has independent control, log, and snapshot TCP connections and
@@ -99,15 +112,20 @@ Freshness expires from the original send time; receiving a delayed response
 cannot grant a new full interval. Duplicate, old-boot, old-term, expired and
 reconnected-stream replies do not renew authority. Published evidence is also
 invalidated by authorization revocation or connection replacement. Log responses alone cannot
-sustain quorum liveness. Expired authority stays revoked for that leadership
-epoch even if delayed traffic arrives later.
+sustain quorum liveness. Loss of quorum evidence after leader admission retires the Raft term.
+Delayed traffic cannot reopen it; subsequent service requires a new election.
 
 The validity interval is `D = heartbeat interval * election ticks`. The C++
 Data-control suspend detector and finite-lease `2D` handoff quarantine remain
 part of the authority boundary: Go's monotonic clock does not account for host
-suspend. Resignation revokes the C++ role immediately. A generation carried through the
-C ABI fences older role callbacks until the protocol owner acknowledges it. A sole voter may reopen
-only after a full active interval, through the existing Data quarantine.
+suspend. Resignation revokes the C++ leader term immediately. Its single atomic state
+retains the retired Raft term to reject late callbacks; the public leader-term
+query returns -1 while unavailable. The Go protocol owner retires the requested
+term through RawNode and subsequent ticks must elect and apply a new term, even
+for a sole voter. Delayed resignation requests cannot retire a newer term.
+The local higher-term transition uses the same reject-only event and bounded
+persistence reservation as deferred term observations; it grants no vote or
+quorum. The existing Data handoff quarantine still applies.
 
 ## Durable root and recovery
 
@@ -158,6 +176,11 @@ grace below its configuration cut; it does not install voters. Ordinary restart
 replays committed identity/configuration state before opening peer ingress.
 Snapshot metadata and the installed identity projection close the same grace
 windows, so partial installation cannot resurrect old voters or retired IDs.
+Member descriptors and identity bindings include the optional immutable Sentinel
+advertisement. A registered local route requires an enabled listener before
+startup or join activation. The bind may differ behind a proxy; a waiting joiner
+may enable its listener before registration, so invitation recovery checks
+availability against current startup configuration rather than its first bind.
 
 Dynamic membership keeps the existing C++ durable workflow. Add commits the
 identity, adds a learner, waits for durable replication and fresh actual

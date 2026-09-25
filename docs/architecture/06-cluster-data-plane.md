@@ -582,7 +582,7 @@ discarding current FDS capabilities or already-published population sessions.
 Tying the slice to the grant avoids imposing a fixed 25 ms lag on deliberately
 short leases.
 Before issuing the first otherwise-valid lease for each group, boot, authority
-anchor, and leadership generation, Meta waits `2D` on the same suspend-aware
+anchor, and Raft leader term, Meta waits `2D` on the same suspend-aware
 clock: one maximum prior lease plus a second `D` safety margin. This remains
 safe under the deliberately loose assumption that the Meta host's elapsed-time
 clock advances no more than twice as fast as the prior Data host's; scheduling
@@ -610,12 +610,12 @@ window and permanent handoff blocking when the Owner remains unhealthy.
 Raft's peer-liveness timer uses active `CLOCK_MONOTONIC` time, which does not
 advance while a Meta host is suspended. Data control therefore also compares
 that clock with `CLOCK_BOOTTIME`. Once their accumulated divergence reaches
-`D`, it closes the leadership generation's authority sessions and requests an
-immediate Raft resignation. A sole member must run for another full `D` of active monotonic time before authority can be
-eligible; a further suspend extends that wait. All control boundaries, directives,
-results, and lease grants pass this gate. Thus an old multi-member leader
-cannot resume after a replacement election and refresh the same stale identity
-through a handoff entry that had already matured before suspension.
+`D`, it closes the current Raft term's authority sessions and requests an
+immediate resignation. Even a sole member must win and apply a new election
+term; its lease handoff guard starts fresh. All control boundaries, directives,
+results, and grants check the captured term against Meta's shared atomic leader
+term. A suspended leader cannot reuse a matured handoff entry to renew stale
+authority after another leader has replaced it.
 
 Graceful Data shutdown stops new client and control-message admission, then
 immediately cancels replication target and source transports. In particular,

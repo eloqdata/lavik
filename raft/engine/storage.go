@@ -180,9 +180,16 @@ func openDisk(cfg Config) (*diskStore, recovered, error) {
 	if s.genesis.Local.ID != cfg.Local.ID || s.genesis.Local.Principal != cfg.Local.Principal {
 		return nil, rec, errors.New("Meta local identity mismatch")
 	}
+	// Advertised routes may differ behind a proxy. Only a registered route,
+	// not a waiting joiner's first bind, makes the listener mandatory forever.
+	for _, member := range s.genesis.Initial {
+		if member.ID == cfg.Local.ID && member.Sentinel != "" && cfg.Local.Sentinel == "" {
+			return nil, rec, errors.New("registered Sentinel endpoint requires a local listener")
+		}
+	}
 	waldir := filepath.Join(dir, "wal")
 	if !fresh {
-		if err = s.readJoin(); err != nil {
+		if err = s.readJoin(cfg.Local); err != nil {
 			return nil, rec, err
 		}
 		var evidence []byte

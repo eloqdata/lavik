@@ -100,7 +100,7 @@ func flag(v bool) C.int {
 	return 0
 }
 func (i *instance) role(role engine.Role) {
-	C.call_role(&i.callbacks, i.owner, C.uint64_t(role.Term), C.uint64_t(role.Leader), flag(role.IsLeader), flag(role.CaughtUp), C.uint64_t(role.ResignIndex))
+	C.call_role(&i.callbacks, i.owner, C.uint64_t(role.Term), C.uint64_t(role.Leader), flag(role.IsLeader), flag(role.CaughtUp))
 }
 func (i *instance) fatal(err error) {
 	data := []byte(err.Error())
@@ -168,7 +168,7 @@ func (i *instance) deliver(ticket C.uint64_t, result <-chan engine.Result) {
 }
 
 //export lavik_raft_propose
-func lavik_raft_propose(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointer, size C.uint64_t) C.int {
+func lavik_raft_propose(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointer, size C.uint64_t, expectedTerm C.uint64_t) C.int {
 	i := lookup(handle)
 	if i == nil {
 		return 1
@@ -181,7 +181,7 @@ func lavik_raft_propose(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointe
 	if i.closed {
 		return 1
 	}
-	result, err := i.runtime.Propose(C.GoBytes(data, C.int(size)))
+	result, err := i.runtime.ProposeInTerm(C.GoBytes(data, C.int(size)), uint64(expectedTerm))
 	if err != nil {
 		return 3
 	}
@@ -211,7 +211,7 @@ func lavik_raft_snapshot(handle C.uint64_t, ticket C.uint64_t) C.int {
 }
 
 //export lavik_raft_member
-func lavik_raft_member(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointer, size C.uint64_t, remove C.int, learner C.int) C.int {
+func lavik_raft_member(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointer, size C.uint64_t, remove C.int, learner C.int, expectedTerm C.uint64_t) C.int {
 	i := lookup(handle)
 	if i == nil {
 		return 1
@@ -228,7 +228,7 @@ func lavik_raft_member(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointer
 	if i.closed {
 		return 1
 	}
-	result, err := i.runtime.ChangeMember(member, remove != 0, learner != 0)
+	result, err := i.runtime.ChangeMemberInTerm(member, remove != 0, learner != 0, uint64(expectedTerm))
 	if err != nil {
 		return 3
 	}
@@ -238,9 +238,9 @@ func lavik_raft_member(handle C.uint64_t, ticket C.uint64_t, data unsafe.Pointer
 }
 
 //export lavik_raft_resign
-func lavik_raft_resign(handle C.uint64_t, index C.uint64_t) {
+func lavik_raft_resign(handle C.uint64_t, term C.uint64_t) {
 	if i := lookup(handle); i != nil {
-		i.runtime.RequestResign(uint64(index))
+		i.runtime.RequestResign(uint64(term))
 	}
 }
 
@@ -282,6 +282,7 @@ func lavik_raft_status(handle C.uint64_t, out *C.LavikRaftBytes) C.int {
 		text(m.Raft)
 		text(m.Data)
 		text(m.Admin)
+		text(m.Sentinel)
 		text(m.Principal)
 		put(s.PeerApplied[m.ID])
 		age, ok := s.PeerAgeMicros[m.ID]

@@ -146,6 +146,7 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
   std::set<std::string> raft_endpoints;
   std::set<std::string> data_control_endpoints;
   std::set<std::string> ctl_endpoints;
+  std::set<std::string> sentinel_endpoints;
   for (const auto& member : manifest->meta_members_) {
     if (member.server_id_ == 0 ||
         member.server_id_ > static_cast<std::uint32_t>(
@@ -159,6 +160,13 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
       return Invalid(
           "Meta endpoints must be canonical numeric tcp:// endpoints");
     }
+    if (!member.sentinel_endpoint_.empty() &&
+        (!CanonicalEndpoint(member.sentinel_endpoint_) ||
+         !ParseConcreteNumericEndpoint(
+             std::string_view(member.sentinel_endpoint_).substr(6)) ||
+         !sentinel_endpoints.insert(member.sentinel_endpoint_).second)) {
+      return Invalid("invalid or duplicate Meta Sentinel endpoint");
+    }
     if (!meta_ids.insert(member.server_id_).second) {
       return Invalid("duplicate Meta member id");
     }
@@ -171,6 +179,13 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
     if (!ctl_endpoints.insert(member.ctl_endpoint_).second) {
       return Invalid("duplicate Meta ctl endpoint");
     }
+  }
+
+  if (manifest->client_mode_ == ClientMode::kSingle &&
+      !sentinel_endpoints.empty() &&
+      sentinel_endpoints.size() != manifest->meta_members_.size()) {
+    return Invalid(
+        "Single discovery requires Sentinel endpoints on every Meta member");
   }
 
   std::sort(manifest->data_nodes_.begin(), manifest->data_nodes_.end(),
@@ -498,6 +513,7 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
       case Section::kBootstrapPolicy:
         break;
       case Section::kMeta:
+        section_fields.erase("sentinel_endpoint");
         if (section_fields != std::set<std::string>{"ctl_endpoint",
                                                     "data_control_endpoint",
                                                     "id", "raft_endpoint"}) {
@@ -635,6 +651,10 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
           if (!value.ok()) return value.status();
           result.meta_members_.back().data_control_endpoint_ =
               std::move(*value);
+        } else if (item.name == "sentinel_endpoint") {
+          auto value = ParseString(item);
+          if (!value.ok()) return value.status();
+          result.meta_members_.back().sentinel_endpoint_ = std::move(*value);
         } else if (item.name == "ctl_endpoint") {
           auto value = ParseString(item);
           if (!value.ok()) return value.status();
@@ -751,6 +771,9 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
         !status.ok()) {
       return status;
     }
+    if (absl::Status status = writer.String(member.sentinel_endpoint_);
+        !status.ok())
+      return status;
     if (absl::Status status = writer.String(member.ctl_endpoint_);
         !status.ok()) {
       return status;
@@ -843,14 +866,17 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
     auto id = reader.U32();
     auto raft = reader.String();
     auto data_control = reader.String();
+    auto sentinel = reader.String();
     auto ctl = reader.String();
-    if (!id.ok() || !raft.ok() || !data_control.ok() || !ctl.ok()) {
+    if (!id.ok() || !raft.ok() || !data_control.ok() || !ctl.ok() ||
+        !sentinel.ok()) {
       return Invalid("invalid Meta member descriptor");
     }
     member.server_id_ = *id;
     member.raft_endpoint_ = std::move(*raft);
     member.data_control_endpoint_ = std::move(*data_control);
     member.ctl_endpoint_ = std::move(*ctl);
+    member.sentinel_endpoint_ = std::move(*sentinel);
     manifest.meta_members_.push_back(std::move(member));
   }
   auto generated = reader.U16();

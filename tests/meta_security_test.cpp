@@ -255,14 +255,13 @@ TEST(MetaClusterStatusRuntimeTest, HealthLossBeforeAckRemainsEncodable) {
   MetaDataControlRuntimeNode runtime;
   runtime.node_id_ = node_id;
   runtime.boot_id_ = std::string(40, '2');
-  runtime.leadership_generation_ = 11;
+  runtime.leader_term_ = 7;
   runtime.health_ =
       control::HeartbeatHealth{.storage_ready = true, .population_ready = true};
   runtime.health_received_unix_ms_ = 1000;
   runtime.last_lease_decision_ =
       control::LeaseGranted{.leader_id = 1,
                             .raft_term = 7,
-                            .leadership_generation = 11,
                             .data_boot_id = runtime.boot_id_,
                             .control_revision = runtime.control_revision_,
                             .group_id = "group-a",
@@ -328,7 +327,7 @@ TEST(MetaClusterStatusBracketTest, RejectsEveryMixedAuthorityCut) {
   MetaClusterStatusBracket before{
       .is_leader_ = true,
       .leader_alive_ = true,
-      .term_ = 7,
+      .term_ = 5,
       .config_index_ = 11,
       .config_server_ids_ = {1, 2, 3},
       .active_meta_members_ =
@@ -338,11 +337,16 @@ TEST(MetaClusterStatusBracketTest, RejectsEveryMixedAuthorityCut) {
                .data_control_endpoint_ = "127.0.0.1:7001",
                .ctl_endpoint_ = "127.0.0.1:7101"},
           },
-      .leadership_ = {.leadership_generation_ = 5,
+      .leadership_ = {.leader_term_ = 5,
                       .leader_authority_eligible_ = true,
                       .leader_authority_eligibility_revision_ = 9},
   };
   EXPECT_TRUE(IsStableClusterStatusBracket(before, before));
+
+  // A stable old runtime cut is still invalid under a newer Raft term.
+  auto mismatched = before;
+  ++mismatched.term_;
+  EXPECT_FALSE(IsStableClusterStatusBracket(mismatched, mismatched));
 
   auto expect_changed = [&](auto mutate) {
     MetaClusterStatusBracket after = before;
@@ -357,8 +361,7 @@ TEST(MetaClusterStatusBracketTest, RejectsEveryMixedAuthorityCut) {
   expect_changed([](auto& value) {
     value.active_meta_members_.front().ctl_endpoint_ = "127.0.0.1:7199";
   });
-  expect_changed(
-      [](auto& value) { ++value.leadership_.leadership_generation_; });
+  expect_changed([](auto& value) { ++value.leadership_.leader_term_; });
   expect_changed([](auto& value) {
     value.leadership_.leader_authority_eligible_ = false;
   });
@@ -370,12 +373,12 @@ TEST(MetaClusterStatusBracketTest, RejectsEveryMixedAuthorityCut) {
 TEST(MetaClusterStatusBracketTest,
      RejectsDetectorStateFromBeforeAnEligibilityAba) {
   lavik::meta::MetaDataControlRuntimeSnapshot runtime{
-      .leadership_generation_ = 5,
+      .leader_term_ = 5,
       .leader_authority_eligible_ = true,
       .leader_authority_eligibility_revision_ = 3,
   };
   lavik::meta::MetaAutomaticFailoverDiagnosticsSnapshot detector{
-      .leadership_generation_ = 5,
+      .leader_term_ = 5,
       .leader_authority_eligibility_revision_ = 1,
       .evaluated_applied_index_ = 17,
   };
@@ -443,6 +446,25 @@ TEST(MetaIdentitySecurity, MetaMemberBindingSurvivesSnapshotRoundTrip) {
       lavik::meta::MetaIdentityStore::Deserialize(store.Serialize());
   ASSERT_TRUE(restored.ok()) << restored.status();
   EXPECT_EQ(restored->FindMetaMember(3), store.FindMetaMember(3));
+}
+
+TEST(MetaIdentitySecurity, SentinelAddressIsDurableAndImmutable) {
+  lavik::meta::MetaIdentityStore store;
+  lavik::meta::BindMetaMember bind;
+  bind.server_id_ = 3;
+  bind.principal_ = "lavik://meta/3";
+  bind.data_control_endpoint_ = "10.0.0.3:7100";
+  bind.ctl_endpoint_ = "10.0.0.3:7200";
+  bind.sentinel_endpoint_ = "10.0.0.3:26379";
+  ASSERT_TRUE(store.Apply(bind).ok());
+  auto restored =
+      lavik::meta::MetaIdentityStore::Deserialize(store.Serialize());
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->FindMetaMember(3)->sentinel_endpoint_, "10.0.0.3:26379");
+  bind.sentinel_endpoint_.clear();
+  EXPECT_FALSE(restored->Apply(bind).ok());
+  bind.sentinel_endpoint_ = "10.0.0.3:26380";
+  EXPECT_FALSE(restored->Apply(bind).ok());
 }
 
 TEST(MetaIdentitySecurity, SoleMemberCtlEndpointCanOnlyBeCompletedOnce) {

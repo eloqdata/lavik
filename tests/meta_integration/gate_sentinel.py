@@ -80,7 +80,7 @@ class Client:
             if len(data) != size or self.file.read(2) != b"\r\n":
                 raise AssertionError("truncated bulk reply")
             return data
-        if tag == b"*":
+        if tag in (b"*", b">"):
             count = int(value)
             if count == -1:
                 return None
@@ -154,6 +154,48 @@ class SentinelTest(unittest.TestCase):
         self.assertEqual(client.command("AUTH", "sentinel-secret"), b"OK")
         self.assertEqual(client.command("PING"), b"PONG")
         self.assertIn("leader=", node.ctl("status"))
+
+    def test_subscription_protocol_and_reset(self):
+        node, port = self.node(bootstrap=True)
+        H.wait_until("Meta leader", 5, node.is_leader)
+        for protocol in (2, 3):
+            client = self.client(port)
+            client.command("HELLO", protocol, "AUTH", "default", "sentinel-secret")
+            self.assertEqual(
+                client.command("SUBSCRIBE", "+switch-master"),
+                [b"subscribe", b"+switch-master", 1],
+            )
+            self.assertEqual(
+                client.command("SUBSCRIBE", "+switch-master"),
+                [b"subscribe", b"+switch-master", 1],
+            )
+            expected = [b"pong", b"probe"] if protocol == 2 else b"probe"
+            self.assertEqual(client.command("PING", "probe"), expected)
+            self.assertEqual(
+                client.command("UNSUBSCRIBE"), [b"unsubscribe", b"+switch-master", 0]
+            )
+            self.assertEqual(client.command("PING"), b"PONG")
+            client.command("SUBSCRIBE", "+switch-master")
+            self.assertEqual(client.command("RESET"), b"RESET")
+            self.error(client.command("PING"), b"NOAUTH")
+            client.command("AUTH", "sentinel-secret")
+            client.command("HELLO", protocol)
+            self.assertEqual(client.command("UNSUBSCRIBE"), [b"unsubscribe", None, 0])
+            client.command("SUBSCRIBE", "a", "b")
+            self.assertEqual(client.read(), [b"subscribe", b"b", 2])
+            masters = client.command("SENTINEL", "MASTERS")
+            if protocol == 2:
+                self.error(masters, b"ERR")
+            else:
+                self.assertEqual(masters, [])
+            self.assertEqual(client.command("QUIT"), b"OK")
+            with self.assertRaises((EOFError, ConnectionResetError)):
+                client.read()
+        excess = self.client(port)
+        excess.command("AUTH", "sentinel-secret")
+        excess.sock.sendall(encode("SUBSCRIBE", *[str(i) for i in range(129)]))
+        with self.assertRaises((EOFError, ConnectionResetError)):
+            excess.read()
 
     def test_redis72_wire_contract(self):
         for password in ("sentinel-secret", ""):
@@ -259,7 +301,6 @@ class SentinelTest(unittest.TestCase):
             ("EVAL", "return 1", 0),
             ("FCALL", "f", 0),
             ("PUBLISH", "+switch-master", "fake"),
-            ("SUBSCRIBE", "x"),
             ("CONFIG", "SET", "requirepass", "x"),
             ("ACL", "LIST"),
             ("REPLICAOF", "127.0.0.1", 1),
@@ -433,9 +474,13 @@ class SentinelTest(unittest.TestCase):
         node.terminate()
 
     def test_slow_reader_keeps_admin_responsive_and_drains(self):
-        node, port = self.node(password="", maxclients=1)
+        node, port = self.node(password="", maxclients=1, bootstrap=True)
+        H.wait_until("Meta leader", 5, node.is_leader)
         time.sleep(0.05)
         slow = self.client(port)
+        slow.command("HELLO", 3)
+        slow.command("SUBSCRIBE", "+switch-master", "+replica-reconf-done")
+        slow.read()
         slow.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
         stop = threading.Event()
 
