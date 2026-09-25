@@ -41,6 +41,9 @@ struct ConnectionContext {
                                             ConnectionContext&,
                                             std::span<const std::string>,
                                             ReplyBuilder&);
+  // Connection lifetime is distinct from request population/authority proofs.
+  // Once retired, a pipelined command must not acquire a later authority.
+  std::uint64_t retirement_generation_ = 0;
   std::uint8_t selected_db_ = 0;
   bool authenticated_ = true;
   bool authentication_required_ = false;

@@ -53,6 +53,25 @@ counts, blocking state, and replication-session identity. All disconnect paths
 return through one cleanup point which unregisters client, monitor, Pub/Sub, and
 WATCH state.
 
+Meta-managed serving boundaries retire ordinary client connections, including
+idle, blocking and Pub/Sub sessions. Authority loss publishes a connection
+generation after closing admission; role or population replacement publishes
+another boundary. Each worker shuts down only registry entries older than that
+boundary. Delayed notifications inspect current entries, so a reused fd or a
+new connection cannot inherit an old close. Dispatch checks the connection's
+generation before consuming buffered commands, independently of the later
+socket notification. Shutdown wakes blocked I/O and waiters; coroutine cleanup
+retains ownership until in-flight work finishes, without waiting to flush replies.
+Meta control and established native replication/donor sessions retain their own
+lifecycles. Protocol handshakes remain ordinary clients until classified.
+
+New connections after a boundary can diagnose, subscribe and receive ordinary
+admission errors without being disconnected merely for those errors. They can
+survive same-node reauthorization; a subsequent role transition retires them.
+Pub/Sub reconnect/resubscribe is the client's responsibility and does not replay
+lost messages. Moving subscribers away from a fenced old Owner requires its
+role reconfiguration as well as reachable discovery and a serving new Owner.
+
 `RedisService` applies one process-wide `maxclients` limit across its plaintext
 and TLS endpoints before registering an accepted socket or starting TLS. The
 limit and active count belong to the Redis protocol service; other Bycorf TCP

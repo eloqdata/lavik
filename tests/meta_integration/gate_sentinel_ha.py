@@ -608,9 +608,14 @@ def main():
         meta, data, ctl, directory_path / "cluster", third=scenario == "data"
     )
     try:
-        (meta_case if scenario == "meta" else data_case)(
-            fixture, go_binary, directory_path
-        )
+        if scenario in ("expiry", "controlled", "fault"):
+            from gate_sentinel_retirement import run
+
+            run(fixture, go_binary, directory_path, scenario)
+        else:
+            (meta_case if scenario == "meta" else data_case)(
+                fixture, go_binary, directory_path
+            )
         fixture.clean_shutdown()
     except Exception:
         fixture.dump_logs()

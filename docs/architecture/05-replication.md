@@ -1198,6 +1198,15 @@ these process-local compatibility offsets. Sentinel's named Pub/Sub
 connections also appear in `CLIENT LIST` and can be selected by `CLIENT KILL
 TYPE pubsub`.
 
+In Meta-managed mode the standard role remains the actual local replication
+role, independently of finite serving authority: an expired Owner can still
+report `master`. `INFO replication` adds `lavik_owner_authority` (a current
+keyed read is admitted as Owner) and `lavik_data_readable` (Owner or legal replica
+admission plus a readable population). These instantaneous diagnostics are not
+an authorization token for subsequent requests. Serving population invalidation
+and primary/replica role changes retire ordinary clients; a complete Single
+replica's same-population transport reconnect preserves their connections.
+
 Sentinel normally queues `REPLICAOF`/`SLAVEOF`, `CONFIG REWRITE`, and `CLIENT
 KILL TYPE normal|pubsub` in one `MULTI`/`EXEC`. Lavik accepts these commands
 as an isolated management batch, preserves their order and individual replies,

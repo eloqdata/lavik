@@ -1509,7 +1509,8 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
       peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
   ctx.peer_address_ = address;
   const bool tls = stream.IsTls();
-  RegisterClientConnection(ctx.conn_id_, stream.NativeFd(), address, tls);
+  ctx.retirement_generation_ =
+      RegisterClientConnection(ctx.conn_id_, stream.NativeFd(), address, tls);
   ConnectionOpened();
   absl::Status observed = stream.SetPeerDisconnectCallback(
       [](void* context) noexcept {
@@ -1684,6 +1685,10 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       ClosePubSubSession(session);
       co_return absl::OkStatus();
     }
+    if (ClientConnectionRetired(ctx.retirement_generation_)) {
+      ClosePubSubSession(session);
+      co_return absl::OkStatus();
+    }
     CommandBatch::BufferedCommand buffered = ready->PopFront();
     CommandBufferGuard command_memory(client_buffers, buffered.input_bytes_);
     RespCommand command = std::move(buffered.command_);
@@ -1832,6 +1837,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
   PendingReplyBatch pending_replies;
 
   while (stream.IsOpen()) {
+    if (ClientConnectionRetired(ctx.retirement_generation_))
+      co_return absl::OkStatus();
     ctx.reply_builder_.Reset();
     if (ShutdownRequested()) [[unlikely]] {
       co_return co_await FlushReplyBatch(stream, &pending_replies);
@@ -1864,6 +1871,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         co_return read_status;
       }
     }
+    if (ClientConnectionRetired(ctx.retirement_generation_))
+      co_return absl::OkStatus();
     CommandBatch::BufferedCommand buffered = ready.PopFront();
     CommandBufferGuard command_memory(&client_buffers, buffered.input_bytes_);
     RespCommand command = std::move(buffered.command_);
@@ -2507,8 +2516,8 @@ int RunServer(ServerOptions options) {
     std::unique_ptr<cluster::NodeControlActions> control_actions =
         cluster::CreateReplicationNodeControlActions(replication,
                                                      options.tls_replication_);
-    auto runtime =
-        std::make_unique<cluster::ClusterRuntime>(std::move(control_actions));
+    auto runtime = std::make_unique<cluster::ClusterRuntime>(
+        std::move(control_actions), &RetireClientConnections);
     // Announce-address defaults: an explicit announce ip wins; otherwise the
     // first non-wildcard bind address; a wildcard bind stays empty so
     // discovery self entries keep the "use the startup node" convention.

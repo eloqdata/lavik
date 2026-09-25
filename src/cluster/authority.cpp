@@ -306,8 +306,10 @@ bool MutationAdmissionUnchanged(const ServingState& admitted,
 
 }  // namespace
 
-AuthorityGuard::AuthorityGuard(TopologyCache& topology)
-    : topology_(topology),
+AuthorityGuard::AuthorityGuard(TopologyCache& topology,
+                               RetirementCallback retirement_callback)
+    : retirement_callback_(retirement_callback),
+      topology_(topology),
       published_authority_(std::make_shared<const AuthorityState>()),
       cache_identity_(next_authority_cache_identity.fetch_add(
           1, std::memory_order_relaxed)) {}
@@ -341,6 +343,19 @@ const AuthorityGuard::AuthorityState& AuthorityGuard::CurrentAuthority(
 }
 
 void AuthorityGuard::PublishAuthorityLocked() {
+  bool retired = false;
+  if (retirement_callback_ != nullptr) {
+    const auto previous = published_authority_.load(std::memory_order_acquire);
+    for (const auto& [group, lease] : previous->leases_) {
+      const auto next = writer_state_.leases_.find(group);
+      if (next == writer_state_.leases_.end() ||
+          next->second.session_ != lease.session_ ||
+          next->second.anchor_ != lease.anchor_) {
+        retired = true;
+        break;
+      }
+    }
+  }
   auto state = std::make_shared<const AuthorityState>(writer_state_);
   published_authority_.store(std::move(state), std::memory_order_release);
   // This version is only a cache invalidation hint, not part of the lease
@@ -348,6 +363,10 @@ void AuthorityGuard::PublishAuthorityLocked() {
   // before this increment; that is safe and the increment refreshes it again.
   // Once publication returns, acquire-version readers cannot reuse old state.
   authority_version_.fetch_add(1, std::memory_order_release);
+  // A new connection observes the retirement boundary only after request
+  // authority is closed. Delivery to socket-owning workers may be delayed,
+  // but cannot let an old connection cross a later reauthorization.
+  if (retired) retirement_callback_();
 }
 
 std::optional<AuthorityAnchor> AuthorityGuard::LocalPrimaryAnchor(

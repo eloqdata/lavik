@@ -204,7 +204,13 @@ def controlled_pause_and_cutover(root):
                 except H.Failure as error:
                     assert any(
                         token in str(error)
-                        for token in ("TRYAGAIN", "MASTERDOWN", "READONLY", "LOADING")
+                        for token in (
+                            "TRYAGAIN",
+                            "MASTERDOWN",
+                            "READONLY",
+                            "LOADING",
+                            "Data closed its Redis connection",
+                        )
                     ), error
             if successor is None:
                 begin = {}
@@ -241,7 +247,13 @@ def controlled_pause_and_cutover(root):
                 # consumes an element.
                 assert any(
                     token in str(error)
-                    for token in ("MASTERDOWN", "READONLY", "TRYAGAIN", "LOADING")
+                    for token in (
+                        "MASTERDOWN",
+                        "READONLY",
+                        "TRYAGAIN",
+                        "LOADING",
+                        "Data closed its Redis connection",
+                    )
                 ), error
             else:
                 raise AssertionError(f"fenced old owner consumed or replied {reply!r}")
@@ -262,8 +274,8 @@ def controlled_pause_and_cutover(root):
 
 def uncontrolled_crash_failover(root):
     # Acceptance: with an active blocking connection, control loss (lease
-    # expiry) leaves the dormant waiter honestly unanswered, and an
-    # uncontrolled failover after an owner crash terminates the stale waiter
+    # expiry) closes the dormant waiter without a fabricated result, and an
+    # uncontrolled failover after an owner crash retires the stale authority
     # without consuming elements while the new primary serves.
     with pair(root, "single-crash", client_mode="single") as (
         meta,
@@ -280,13 +292,21 @@ def uncontrolled_crash_failover(root):
                 lambda: blocked_blpop_lines(writer.call("CLIENT", "LIST")) >= 1,
             )
             assert not pending.done()
-            # Lease expiry (Meta paused past the finite lease) must not
-            # fabricate a waiter reply: dormant revocation is passive, the
-            # waiter stays blocked and consumes nothing.
+            # The finite lease timer closes idle blocking connections even
+            # with no further client request. A disconnect is not a nil reply
+            # and gives no exactly-once retry guarantee for a mutation.
             meta.pause()
-            time.sleep(3)
-            assert not pending.done()
-            meta.resume()
+            try:
+                try:
+                    reply = pending.result(timeout=10)
+                except H.Failure as error:
+                    assert "Data closed its Redis connection" in str(error), error
+                except (ConnectionResetError, BrokenPipeError):
+                    pass
+                else:
+                    raise AssertionError(f"expired waiter replied {reply!r}")
+            finally:
+                meta.resume()
             # Crash the primary with the waiter attached. The connection dies
             # with the process: the waiter terminates honestly, never with a
             # consumed element.

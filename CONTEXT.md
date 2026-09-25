@@ -92,7 +92,8 @@ _Avoid_: Committee Store, Meta KV store
 
 **Owner**:
 The Group member named by committed topology as its current primary. Being the
-Owner does not by itself grant serving authority.
+Owner or retaining a local primary replication role does not by itself grant
+serving authority.
 _Avoid_: Leader
 
 **Group Term**:

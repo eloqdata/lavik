@@ -6070,6 +6070,11 @@ auto ReplicationManager::ReplicationGroup::StoreRole(
     if (generation == 0) generation = 2;
     serving_generation_->store(generation | (will_serve ? kServingOpen : 0),
                                std::memory_order_release);
+    // Authority-only loss has its own connection boundary. Population and
+    // role replacement also retire clients, including subscribers that
+    // reconnected after an earlier authority fence. A complete replica's
+    // transport reconnect deliberately never enters this branch.
+    if (meta_managed_) RetireClientConnections();
     NotifyServingGenerationChanged();
   }
 

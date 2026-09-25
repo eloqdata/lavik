@@ -664,7 +664,7 @@ reject or finish registration. Fencing, population identity loss, and explicit
 revocation then perform their required source/target cleanup. Session loss also
 retires session-scoped target directives, but preserves the exact live
 level-triggered `FollowOwner` attempt whose own history rotation requires the
-Meta session to reconnect. Ordinary lease expiry instead closes only new source
+Meta session to reconnect. Ordinary lease expiry instead closes new source
 admission and preserves current capabilities plus sessions already published
 by the source. Thus a directive cannot appear behind the cleanup represented by
 `FullStateApplied` or `FenceAck` even when its action adapter suspended after
@@ -683,6 +683,15 @@ same-anchor heartbeat can extend only a lease that never expired, so pre-expiry
 admissions cannot be revived by a delayed timer. The first consumer observing
 expiry marks that epoch terminal with an atomic compare/exchange; a renewer
 that sampled an older clock cannot undo an already-observed expiration.
+
+Installed Owner lease removal or replacement also retires ordinary Data client
+connections after publishing the closed authority. Normal renewal and unrelated
+Group updates preserve them. Socket retirement and internal request drain are
+separate: reactivation retains the existing drain barriers, while a retired
+connection cannot dispatch another buffered command even if its worker receives
+the shutdown notification after reauthorization. Legal replica population reads
+are independent of Owner leases; loss of their control session alone does not
+retire their clients.
 
 Population directives carry a kind-specific bounded `payload`; their mutation
 classification follows kind and has no independently supplied flag. `initialize-empty-population` uses its

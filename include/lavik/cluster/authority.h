@@ -236,7 +236,12 @@ class NodeControlInstaller;
 // authority.
 class AuthorityGuard {
  public:
-  explicit AuthorityGuard(TopologyCache& topology);
+  // Called synchronously after publishing the loss/replacement of an installed
+  // lease. Bootstrap-only binding; the callback must not block or reenter a
+  // control writer. Ordinary renewals and replica-only updates do not call it.
+  using RetirementCallback = void (*)() noexcept;
+  explicit AuthorityGuard(TopologyCache& topology,
+                          RetirementCallback retirement_callback = nullptr);
   AuthorityGuard(const AuthorityGuard&) = delete;
   AuthorityGuard& operator=(const AuthorityGuard&) = delete;
 
@@ -346,6 +351,7 @@ class AuthorityGuard {
   void InvalidateLeases();
   void InvalidateAll();
 
+  RetirementCallback retirement_callback_ = nullptr;
   TopologyCache& topology_;
   // Only control-plane writers acquire this mutex. Request admission and
   // mutation rechecks read immutable, independently versioned snapshots.

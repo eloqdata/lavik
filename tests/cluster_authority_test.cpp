@@ -148,8 +148,9 @@ RequestView MakeRequest(std::span<const std::uint16_t> slots, bool is_write,
 }
 
 struct TestAuthorityControl {
-  TestAuthorityControl()
-      : authority(cache),
+  explicit TestAuthorityControl(
+      AuthorityGuard::RetirementCallback retired = nullptr)
+      : authority(cache, retired),
         installer(cache, authority, actions),
         topology(installer, cache) {}
 
@@ -230,6 +231,29 @@ TEST(ClusterAuthoritySnapshotTest, LocalCatalogReplicaAndMissingMembership) {
   local.granted_ = false;
   EXPECT_EQ(Admit(BuildState(kNodeA, local, GroupB()).get(), request).kind_,
             Decision::Kind::kClusterDownUnbound);
+}
+
+TEST(ClusterAuthoritySnapshotTest,
+     RetiresInstalledAuthorityButNotRenewalOrReplica) {
+  using namespace std::chrono_literals;
+  static unsigned retired;
+  retired = 0;
+  TestAuthorityControl control(+[]() noexcept { ++retired; });
+  const auto start = lavik::cluster::MonotonicTime{};
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), start, 100ms).ok());
+  EXPECT_EQ(retired, 0u);
+  ASSERT_TRUE(
+      control.topology.Install(BuildState(kNodeA), start + 1ms, 100ms).ok());
+  EXPECT_EQ(retired, 0u);
+  ASSERT_TRUE(control.installer.SetStorageReady(false).ok());
+  EXPECT_EQ(retired, 1u);
+  ASSERT_TRUE(control.installer.SetStorageReady(false).ok());
+  EXPECT_EQ(retired, 1u);
+
+  TestAuthorityControl replica(+[]() noexcept { ++retired; });
+  ASSERT_TRUE(replica.topology.Install(BuildState(kNodeR), start, 100ms).ok());
+  ASSERT_TRUE(replica.installer.SetStorageReady(false).ok());
+  EXPECT_EQ(retired, 1u);
 }
 
 TEST(ClusterAuthoritySnapshotTest, SingleClientUsesOneFullGroupAuthority) {

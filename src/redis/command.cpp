@@ -123,6 +123,7 @@ struct ClientConnectionRecord {
   enum class Type { kNormal, kReplica, kPubSub };
 
   std::uint64_t id_ = 0;
+  std::uint64_t retirement_generation_ = 0;
   int fd_ = -1;
   std::string address_;
   std::chrono::steady_clock::time_point connected_at_;
@@ -144,6 +145,10 @@ struct ClientConnectionRecord {
 // request processing needs neither a lock nor an atomic lookup.
 std::array<std::vector<ClientConnectionRecord>, storage::kLogicalStorageShards>
     g_worker_clients;
+
+// Only serving transitions write this epoch. Connection registration and
+// command dispatch read it without touching a shared registry or mutex.
+std::atomic<std::uint64_t> g_client_retirement_generation{1};
 
 bool CmpCaseInsensitive(std::string_view a, std::string_view b);
 std::string_view AppendStorageError(ReplyBuilder& reply_builder,
@@ -4910,6 +4915,47 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
         std::string(replication.role_ == ReplicationRole::kMaster ? "master"
                                                                   : "slave") +
         "\r\n";
+    if (auto* runtime = cluster::GetClusterRuntime(); runtime != nullptr) {
+      // A point-in-time keyed read decision explains a fenced master without
+      // changing Redis's replication role. Never use this diagnostic as a
+      // grant for a later command (and never use a keyless diagnostic gate).
+      bool owner_authority = false;
+      bool readable = false;
+      const auto state = runtime->topology_cache_.Current();
+      const cluster::GroupView* group = nullptr;
+      if (state != nullptr) {
+        for (const auto& candidate : state->Groups()) {
+          if (candidate.primary_node_index_ == state->SelfNodeIndex() ||
+              std::find(candidate.replica_node_indices_.begin(),
+                        candidate.replica_node_indices_.end(),
+                        state->SelfNodeIndex()) !=
+                  candidate.replica_node_indices_.end()) {
+            group = &candidate;
+            break;
+          }
+        }
+      }
+      if (group != nullptr && !group->slot_ranges_.empty()) {
+        const std::uint16_t slot = group->slot_ranges_.front().first_;
+        const cluster::RequestView view{
+            .slots_ = std::span<const std::uint16_t>(&slot, 1),
+            .connection_readonly_ = true,
+            .client_mode_ = cluster::GetClientMode(),
+        };
+        const auto decision = runtime->authority_guard_.DecideNow(view);
+        owner_authority = decision.kind_ == cluster::Decision::Kind::kServe;
+        readable =
+            (owner_authority ||
+             decision.kind_ == cluster::Decision::Kind::kServeStaleRead) &&
+            g_replication != nullptr &&
+            g_replication->dataset_read_state() ==
+                ReplicationManager::DatasetReadState::kReadable;
+      }
+      info += std::string("lavik_owner_authority:") +
+              (owner_authority ? "1\r\n" : "0\r\n");
+      info +=
+          std::string("lavik_data_readable:") + (readable ? "1\r\n" : "0\r\n");
+    }
     info += "lavik_replication_state:" +
             std::string(ReplicationRoleName(replication.role_)) + "\r\n";
     info += std::string("lavik_replication_failed_stopped:") +
@@ -11144,9 +11190,10 @@ void ConnectionOpened() noexcept { RecordConnectionOpened(); }
 
 void ConnectionClosed() noexcept { RecordConnectionClosed(); }
 
-void RegisterClientConnection(std::uint64_t id, int fd, std::string address,
-                              bool tls, bool replica,
-                              std::uint64_t replication_session_id) {
+std::uint64_t RegisterClientConnection(std::uint64_t id, int fd,
+                                       std::string address, bool tls,
+                                       bool replica,
+                                       std::uint64_t replication_session_id) {
   const unsigned worker = bycorf::ThisWorker().id_;
   assert(worker < g_worker_clients.size());
   auto& clients = g_worker_clients[worker];
@@ -11155,8 +11202,11 @@ void RegisterClientConnection(std::uint64_t id, int fd, std::string address,
                    [id](const auto& client) { return client.id_ == id; });
   assert(existing == clients.end());
   (void)existing;
+  const auto generation =
+      g_client_retirement_generation.load(std::memory_order_acquire);
   clients.push_back(ClientConnectionRecord{
       .id_ = id,
+      .retirement_generation_ = generation,
       .fd_ = fd,
       .address_ = std::move(address),
       .connected_at_ = std::chrono::steady_clock::now(),
@@ -11173,6 +11223,49 @@ void RegisterClientConnection(std::uint64_t id, int fd, std::string address,
       .blocked_ = false,
       .closing_ = false,
   });
+  return generation;
+}
+
+bool ClientConnectionRetired(std::uint64_t generation) noexcept {
+  return generation !=
+         g_client_retirement_generation.load(std::memory_order_acquire);
+}
+
+namespace {
+void CloseRetiredClients(void*, std::uint64_t boundary) noexcept {
+  auto& clients = g_worker_clients[bycorf::ThisWorker().id_];
+  for (auto& client : clients) {
+    if (client.closing_ || client.retirement_generation_ >= boundary ||
+        client.type_ == ClientConnectionRecord::Type::kReplica ||
+        client.replication_session_id_ != 0)
+      continue;
+    client.closing_ = true;
+    // shutdown wakes pending reads/writes but does not destroy an in-flight
+    // coroutine. Its normal cleanup still owns the registry entry and fd.
+    (void)CancelBlockedClientOnCurrentWorker(client.id_);
+    (void)::shutdown(client.fd_, SHUT_RDWR);
+  }
+}
+}  // namespace
+
+void RetireClientConnections() noexcept {
+  const std::uint64_t boundary =
+      g_client_retirement_generation.fetch_add(1, std::memory_order_acq_rel) +
+      1;
+  if (boundary == 0) std::terminate();
+  const auto& current = bycorf::ThisWorker();
+  if (current.self_ == nullptr || current.cross_core_ == nullptr) return;
+  for (unsigned worker = 0; worker < g_server_threads; ++worker) {
+    if (worker == current.id_) {
+      CloseRetiredClients(nullptr, boundary);
+    } else {
+      bycorf::PostNotification(
+          current.cross_core_, worker,
+          bycorf::RemoteNotification{.context_ = nullptr,
+                                     .value_ = boundary,
+                                     .run_fn_ = &CloseRetiredClients});
+    }
+  }
 }
 
 void SetClientReplicationSession(

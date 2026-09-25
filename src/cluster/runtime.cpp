@@ -23,9 +23,11 @@ std::unique_ptr<ClusterRuntime> g_cluster_runtime;
 ClientMode g_client_mode = ClientMode::kSingle;
 }  // namespace
 
-ClusterRuntime::ClusterRuntime(std::unique_ptr<NodeControlActions> actions)
+ClusterRuntime::ClusterRuntime(
+    std::unique_ptr<NodeControlActions> actions,
+    AuthorityGuard::RetirementCallback retirement_callback)
     : control_actions_(std::move(actions)),
-      authority_guard_(topology_cache_),
+      authority_guard_(topology_cache_, retirement_callback),
       node_control_installer_(
           topology_cache_, authority_guard_,
           control_actions_ == nullptr

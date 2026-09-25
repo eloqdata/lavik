@@ -38,6 +38,7 @@ owner.
 Usage: gate_cluster_client.py META DATA CTL GO_DRIVER [workdir]
 """
 
+import contextlib
 import json
 import os
 import re
@@ -935,6 +936,16 @@ def scenario_controlled_failover(meta, cells, nodes, written):
     written["group-1"].update(lossless)
 
     hashtags = [group_hashtag("group-1", "load"), group_hashtag("group-2", "load")]
+    connections = contextlib.ExitStack()
+    unaffected = []
+    retired = []
+    for tls in (False, True):
+        for node_id, collection in ((PRIMARY_1, retired), (PRIMARY_2, unaffected)):
+            sock = connections.enter_context(raw_open(nodes[node_id], tls))
+            reader = connections.enter_context(sock.makefile("rb"))
+            sock.sendall(encode_resp(["AUTH", PASSWORD]))
+            assert read_resp(reader) == "OK"
+            collection.append((sock, reader))
     loads = start_loads(cells, hashtags)
     reply = subprocess.run(
         [
@@ -965,6 +976,17 @@ def scenario_controlled_failover(meta, cells, nodes, written):
     )
     wait_group_owner(meta, "group-1", REPLICA_1, 2, "controlled cutover")
     stop_loads(loads, "controlled failover")
+    try:
+        for sock, reader in retired:
+            try:
+                assert sock.recv(1) == b"", "old Owner TCP/TLS connection survived"
+            except ConnectionResetError:
+                pass
+        for sock, reader in unaffected:
+            sock.sendall(encode_resp(["PING"]))
+            assert read_resp(reader) == "PONG", "unrelated Group connection retired"
+    finally:
+        connections.close()
 
     for cell in cells:
         key = group_key("group-1", f"post-fo-{cell.name}")
