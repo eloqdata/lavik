@@ -525,6 +525,9 @@ class FollowOwnerSource {
   bool sent_continue() const noexcept {
     return sent_continue_.load(std::memory_order_acquire);
   }
+  bool cursor_acknowledged() const noexcept {
+    return cursor_acknowledged_.load(std::memory_order_acquire);
+  }
   int error() const noexcept { return error_.load(std::memory_order_acquire); }
 
  private:
@@ -2440,9 +2443,15 @@ class FailoverActionReconcileService final : public bycorf::Service {
             replication_->CaptureServingGeneration();
         if (!continuation_source_->saw_resume_proof() ||
             !continuation_source_->sent_continue() || serving_generation == 0) {
-          co_return TestFailure(
+          co_return TestFailure(absl::StrCat(
               "cancelled replica Candidate did not enter FollowOwner "
-              "CONTINUE from its retained proof");
+              "CONTINUE from its retained proof: resume=",
+              continuation_source_->saw_resume_proof(),
+              " continue=", continuation_source_->sent_continue(),
+              " generation=", serving_generation,
+              " source_error=", continuation_source_->error(),
+              " flows=", continuation_source_->flows(),
+              " ack=", continuation_source_->cursor_acknowledged()));
         }
         const lavik::ClusterPopulationStatus retained =
             co_await CheckedPopulation(*replication_);
@@ -2463,11 +2472,15 @@ class FailoverActionReconcileService final : public bycorf::Service {
             co_await replication_->ReconcileClusterFollowOwner(std::nullopt);
         if (!reconciled.ok()) co_return reconciled;
         const auto disconnected = co_await CheckedPopulation(*replication_);
-        if (replication_->CaptureServingGeneration() != 0 ||
+        const auto disconnected_generation =
+            replication_->CaptureServingGeneration();
+        if (disconnected_generation != 0 ||
             !disconnected.ready_token_.has_value()) {
-          co_return TestFailure(
+          co_return TestFailure(absl::StrCat(
               "disconnected Cluster replica did not close admission while "
-              "retaining its complete population");
+              "retaining its complete population: generation=",
+              disconnected_generation,
+              " ready=", disconnected.ready_token_.has_value()));
         }
 
         // Retire the population while its open bit is already clear, then
@@ -5766,6 +5779,14 @@ void RunFailoverActionDispositionCase(PreparedActionDisposition disposition,
   ASSERT_EQ(::setenv("LAVIK_REPLICATION_SEED_READY_PROMOTION_CANDIDATE",
                      "02020202020202020202020202020202", 1),
             0);
+  const bool resume_follow =
+      disposition ==
+      PreparedActionDisposition::kRemoveWhilePreparingThenResumeFollow;
+  if (resume_follow) {
+    ASSERT_EQ(::setenv("LAVIK_REPLICATION_SEED_CONTINUATION_PROOF",
+                       "02020202020202020202020202020202", 1),
+              0);
+  }
   if (stall_before_durability) {
     ASSERT_EQ(::setenv("LAVIK_REPLICATION_STALL_PROMOTION_ACTION",
                        "02020202020202020202020202020202", 1),
@@ -5804,8 +5825,12 @@ void RunFailoverActionDispositionCase(PreparedActionDisposition disposition,
     bool stall_after_durability_;
     bool fail_after_child_history_;
     bool promotion_barriers_;
+    bool resume_follow_;
     ~SeedReset() {
       (void)::unsetenv("LAVIK_REPLICATION_SEED_READY_PROMOTION_CANDIDATE");
+      if (resume_follow_) {
+        (void)::unsetenv("LAVIK_REPLICATION_SEED_CONTINUATION_PROOF");
+      }
       if (stall_before_durability_) {
         (void)::unsetenv("LAVIK_REPLICATION_STALL_PROMOTION_ACTION");
         (void)::unsetenv(
@@ -5826,7 +5851,7 @@ void RunFailoverActionDispositionCase(PreparedActionDisposition disposition,
       }
     }
   } seed_reset{stall_before_durability, remove_after_durability,
-               fail_after_child_history, stall_promotion};
+               fail_after_child_history, stall_promotion, resume_follow};
   const std::filesystem::path data = directory.path() / "node.data";
   lavik::test::CreateDataFile(data, 128 * kMiB);
 
@@ -5842,6 +5867,9 @@ void RunFailoverActionDispositionCase(PreparedActionDisposition disposition,
 
   lavik::ReplicationOptions options;
   options.meta_managed_ = true;
+  if (resume_follow) {
+    options.client_mode_ = lavik::ClientMode::kCluster;
+  }
   options.node_id_override_ = std::string(40, '9');
   lavik::ReplicationManager replication(&storage, std::move(options),
                                         std::nullopt);
@@ -5849,8 +5877,7 @@ void RunFailoverActionDispositionCase(PreparedActionDisposition disposition,
   EnsureTxRuntime();
 
   std::unique_ptr<FollowOwnerSource> continuation_source;
-  if (disposition ==
-      PreparedActionDisposition::kRemoveWhilePreparingThenResumeFollow) {
+  if (resume_follow) {
     continuation_source = std::make_unique<FollowOwnerSource>(
         std::string(40, 'a'), std::string(40, 'b'), std::string(40, 'c'),
         HexString(std::string(40, 'd')), /*export_ready=*/true, "CONTINUE");

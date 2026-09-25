@@ -1577,6 +1577,20 @@ auto ReplicationManager::ReplicationGroup::
     upstream_history_id_ = directive.parent_history_id_;
     group_id_ = PopulationGroupToken(directive.identity_.group_id_);
     source_worker_count_ = directive.required_applied_next_lsns_.size();
+    if (LAVIK_FAULT_MATCHES("LAVIK_REPLICATION_SEED_CONTINUATION_PROOF",
+                            directive.identity_.attempt_id_)) {
+      // A switched child history can carry an origin proof even at LSN 1.
+      // Seed that otherwise wire-produced proof for the closed-admission
+      // replacement test, whose fake Owner exercises a real CONTINUE flow.
+      upstream_continuation_proof_ = NativeContinuationProof{
+          directive.identity_.target_node_id_,
+          directive.identity_.assignment_id_,
+          directive.identity_.target_boot_id_,
+          directive.parent_history_id_,
+          std::string(40, 'f'),
+          directive.required_applied_next_lsns_,
+      };
+    }
     native_dataset_valid_.store(true, std::memory_order_release);
     PublishHeartbeatObservation();
   }
