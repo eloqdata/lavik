@@ -177,6 +177,61 @@ std::shared_ptr<const ServingState> BuildSingleState(
   return state.ok() ? *state : nullptr;
 }
 
+TEST(ClusterAuthoritySnapshotTest, LocalCatalogUsesMemberGroupLeaseAndDrain) {
+  using namespace std::chrono_literals;
+  TestAuthorityControl control;
+  const auto start = lavik::cluster::MonotonicTime{};
+  // Self owns Group B, which does not include slot zero. Remote readiness
+  // cannot gate a local catalog operation.
+  auto remote = GroupA();
+  remote.storage_ready_ = false;
+  ASSERT_TRUE(control.topology
+                  .Install(BuildState(kNodeB, remote, GroupB()), start, 10ms)
+                  .ok());
+  auto request = MakeRequest({}, true);
+  request.local_group_ = true;
+  auto admission = control.authority.CaptureAndAdmit(request, start);
+  ASSERT_EQ(admission.decision().kind_, Decision::Kind::kServe);
+  ASSERT_EQ(admission.slots().size(), 1u);
+  EXPECT_EQ(admission.slots()[0], 10000);
+  AuthorityInFlightGuards guards;
+  ASSERT_EQ(control.authority.RegisterAndRecheck(admission, 0, start, &guards),
+            RecheckResult::kOk);
+  EXPECT_EQ(control.cache.Current()->GroupInFlightCount(kGroupA), 0u);
+  EXPECT_EQ(control.cache.Current()->GroupInFlightCount(kGroupB), 1u);
+  auto paused = GroupB();
+  paused.mutations_paused_ = true;
+  control.cache.Publish(BuildState(kNodeB, remote, paused, 2));
+  EXPECT_EQ(control.authority.CaptureAndAdmit(request, start).decision().kind_,
+            Decision::Kind::kTryAgain);
+  EXPECT_EQ(control.authority.RecheckAtMutation(admission, start),
+            RecheckResult::kOk);
+  EXPECT_EQ(control.authority.RecheckAtMutation(admission, start + 10ms),
+            RecheckResult::kReject);
+}
+
+TEST(ClusterAuthoritySnapshotTest, LocalCatalogReplicaAndMissingMembership) {
+  auto request = MakeRequest({}, false);
+  request.local_group_ = true;
+  auto remote = GroupB();
+  remote.population_ready_ = false;
+  EXPECT_EQ(Admit(BuildState(kNodeR, GroupA(), remote).get(), request).kind_,
+            Decision::Kind::kServeStaleRead);
+  request.is_write_ = true;
+  EXPECT_EQ(Admit(BuildState(kNodeR).get(), request).kind_,
+            Decision::Kind::kReadOnly);
+  EXPECT_EQ(Admit(BuildState("").get(), request).kind_,
+            Decision::Kind::kClusterDownUnbound);
+  auto local = GroupA();
+  local.storage_ready_ = false;
+  EXPECT_EQ(Admit(BuildState(kNodeR, local, GroupB()).get(), request).kind_,
+            Decision::Kind::kLoading);
+  local = GroupA();
+  local.granted_ = false;
+  EXPECT_EQ(Admit(BuildState(kNodeA, local, GroupB()).get(), request).kind_,
+            Decision::Kind::kClusterDownUnbound);
+}
+
 TEST(ClusterAuthoritySnapshotTest, SingleClientUsesOneFullGroupAuthority) {
   using namespace std::chrono_literals;
   TestAuthorityControl control;

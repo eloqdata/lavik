@@ -67,6 +67,7 @@
 #include "lavik/config.h"
 #include "lavik/expiration.h"
 #include "lavik/fault_injection.h"
+#include "lavik/fault_pause.h"
 #include "lavik/glob.h"
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
@@ -318,7 +319,7 @@ absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
   }
 
   CommandRequest request;
-  request.spec_ = FindCommand(command.args_.front());
+  request.spec_ = FindCommand(std::span<const std::string>(command.args_));
   request.kind_ =
       request.spec_ != nullptr ? request.spec_->kind_ : CommandKind::kUnknown;
   request.db_id_ = db_id;
@@ -861,29 +862,32 @@ std::uint16_t ClusterDecisionClientPort(const cluster::Decision& decision,
   return decision.moved_port_;
 }
 
-// These commands mutate process-wide durable state but carry no key from
-// which the cluster gate can derive an owner, lease, or in-flight drain cell.
-// Cluster mode therefore rejects them: finite authority is always group-scoped
-// and cannot authorize a process-wide mutation.
+bool IsFunctionCatalogMutation(const CommandRequest& request) {
+  if (request.kind_ != CommandKind::kFunction || request.args_.size() < 2) {
+    return false;
+  }
+  const std::string_view subcommand = request.args_[1];
+  return CmpCaseInsensitive(subcommand, "load") ||
+         CmpCaseInsensitive(subcommand, "delete") ||
+         CmpCaseInsensitive(subcommand, "flush") ||
+         CmpCaseInsensitive(subcommand, "restore");
+}
+
+bool UsesLocalGroupAuthority(const CommandRequest& request) {
+  return IsFunctionCatalogMutation(request) ||
+         (request.kind_ == CommandKind::kFunction &&
+          request.args_.size() >= 2 &&
+          (CmpCaseInsensitive(request.args_[1], "dump") ||
+           CmpCaseInsensitive(request.args_[1], "list")));
+}
+
+// Global keyspace clearing is not yet wired into Group authority.
 std::string_view UnscopedClusterMutation(const CommandRequest& request) {
   switch (request.kind_) {
     case CommandKind::kFlushDb:
       return "FLUSHDB";
     case CommandKind::kFlushAll:
       return "FLUSHALL";
-    case CommandKind::kFunction:
-      if (request.args_.size() < 2) return {};
-      if (CmpCaseInsensitive(request.args_[1], "LOAD")) return "FUNCTION LOAD";
-      if (CmpCaseInsensitive(request.args_[1], "DELETE")) {
-        return "FUNCTION DELETE";
-      }
-      if (CmpCaseInsensitive(request.args_[1], "FLUSH")) {
-        return "FUNCTION FLUSH";
-      }
-      if (CmpCaseInsensitive(request.args_[1], "RESTORE")) {
-        return "FUNCTION RESTORE";
-      }
-      return {};
     default:
       return {};
   }
@@ -905,6 +909,7 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
       .loading_allowed_ = LoadingAllowedCommand(request) &&
                           request.kind_ != CommandKind::kPublish,
       .client_mode_ = cluster::GetClientMode(),
+      .local_group_ = UsesLocalGroupAuthority(request),
   };
   const bool retain_proof = is_write;
   if (!retain_proof) {
@@ -940,7 +945,8 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
     cluster::AuthorityInFlightGuards* in_flights) {
   if (!cluster::MetaManaged() || request.replication_origin_ ||
       request.cluster_authority_admission_ == nullptr ||
-      request.ClusterSlots().empty() || !ClusterRequestIsWrite(request)) {
+      request.cluster_authority_admission_->slots().empty() ||
+      !ClusterRequestIsWrite(request)) {
     return std::nullopt;
   }
   cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
@@ -967,6 +973,7 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
         .connection_readonly_ = false,
         .loading_allowed_ = false,
         .client_mode_ = cluster::GetClientMode(),
+        .local_group_ = UsesLocalGroupAuthority(request),
     };
     auto fresh = std::make_shared<const cluster::AuthorityAdmission>(
         runtime->authority_guard_.CaptureAndAdmit(view,
@@ -8002,17 +8009,6 @@ bool ExecCommandMayReplicate(const CommandRequest& request) {
           (kCmdWrite | kCmdMayReplicate | kCmdDynamicWrite)) != 0;
 }
 
-bool IsFunctionCatalogMutation(const CommandRequest& request) {
-  if (request.kind_ != CommandKind::kFunction || request.args_.size() < 2) {
-    return false;
-  }
-  const std::string_view subcommand = request.args_[1];
-  return CmpCaseInsensitive(subcommand, "load") ||
-         CmpCaseInsensitive(subcommand, "delete") ||
-         CmpCaseInsensitive(subcommand, "flush") ||
-         CmpCaseInsensitive(subcommand, "restore");
-}
-
 Task<std::string> ExecuteEvalWithTransaction(
     const CommandRequest& request, tx::Transaction* transaction,
     std::vector<storage::TxShardWrites>* tx_writes,
@@ -8407,6 +8403,16 @@ bool FunctionMutationRejected(const CommandRequest& request) {
 
 Task<absl::Status> ApplyFunctionCatalogTarget(
     std::vector<LuaFunctionLibrary> target, const CommandRequest& request) {
+  // The Function guard can suspend after the command registered its Group
+  // drain. Reuse the captured proof: a pause drains registered work, whereas
+  // an expired or revoked authority must not enter hidden staging.
+  LAVIK_FAULT_INJECT(if (!request.replication_origin_) {
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FUNCTION_CATALOG_BEFORE_STAGE_HOLD_FILE");
+    if (!paused.ok()) co_return paused;
+  });
+  absl::Status authorized = RecheckClusterRequestAuthority(request);
+  if (!authorized.ok()) co_return authorized;
   auto staged =
       co_await GlobalFunctionCatalog().StageCompleteCatalog(std::move(target));
   if (!staged.ok()) co_return staged.status();
@@ -8415,8 +8421,8 @@ Task<absl::Status> ApplyFunctionCatalogTarget(
     co_await GlobalFunctionCatalog().AbortStagedCatalog(&*staged);
     co_return publication.status();
   }
-  auto durable =
-      co_await GlobalFunctionCatalog().MakeStagedCatalogDurable(*staged);
+  auto durable = co_await GlobalFunctionCatalog().MakeStagedCatalogDurable(
+      *staged, ClusterMutationPrecondition(request));
   if (!durable.ok()) {
     co_await GlobalFunctionCatalog().AbortStagedCatalog(&*staged);
     co_return durable.status();
@@ -8435,8 +8441,14 @@ Task<absl::Status> ApplyFunctionCatalogTarget(
   co_return absl::OkStatus();
 }
 
-CommandReply FunctionMutationError(ReplyBuilder& reply_builder,
+CommandReply FunctionMutationError(const CommandRequest& request,
+                                   ReplyBuilder& reply_builder,
                                    const absl::Status& status) {
+  if (IsClusterAuthorityChanged(status)) {
+    return ClusterAuthorityChangedReply(
+        request.cluster_authority_admission_->slots(), request.connection_tls_,
+        reply_builder, true);
+  }
   CommandReply reply = BuiltReply(reply_builder.AppendError(
       absl::StrCat("ERR Error registering functions: ", status.message())));
   // Unknown means the A/B root may or may not have committed; DataLoss means
@@ -8450,6 +8462,14 @@ CommandReply FunctionMutationError(ReplyBuilder& reply_builder,
 Task<CommandReply> ExecuteFunction(const CommandRequest& request,
                                    ReplyBuilder& reply_builder) {
   const std::string_view subcommand = request.args_[1];
+  std::unique_ptr<FunctionCatalogOperationGuard> mutation_guard;
+  if (IsFunctionCatalogMutation(request)) {
+    if (FunctionMutationRejected(request)) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "READONLY You can't write against a read only replica."));
+    }
+    mutation_guard = co_await AcquireFunctionCatalogOperation();
+  }
   if (CmpCaseInsensitive(subcommand, "help") && request.args_.size() == 2) {
     constexpr std::string_view help[] = {
         "FUNCTION <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
@@ -8518,11 +8538,6 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
       co_return BuiltReply(reply_builder.AppendError(
           "ERR wrong number of arguments for 'function|load' command"));
     }
-    if (FunctionMutationRejected(request)) {
-      co_return BuiltReply(reply_builder.AppendError(
-          "READONLY You can't write against a read only replica."));
-    }
-    auto operation = co_await AcquireFunctionCatalogOperation();
     std::vector<LuaFunctionLibrary> target = SnapshotLuaFunctionLibraries();
     const std::optional<std::string> name =
         LuaFunctionLibraryNameFromCode(code);
@@ -8540,7 +8555,7 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
     absl::Status applied =
         co_await ApplyFunctionCatalogTarget(std::move(target), request);
     if (!applied.ok()) {
-      co_return FunctionMutationError(reply_builder, applied);
+      co_return FunctionMutationError(request, reply_builder, applied);
     }
     co_return BuiltReply(
         reply_builder.AppendBulkString(name.value_or(std::string{})));
@@ -8551,11 +8566,6 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
       co_return BuiltReply(reply_builder.AppendError(
           "ERR wrong number of arguments for 'function|delete' command"));
     }
-    if (FunctionMutationRejected(request)) {
-      co_return BuiltReply(reply_builder.AppendError(
-          "READONLY You can't write against a read only replica."));
-    }
-    auto operation = co_await AcquireFunctionCatalogOperation();
     std::vector<LuaFunctionLibrary> target = SnapshotLuaFunctionLibraries();
     const std::size_t erased =
         std::erase_if(target, [&](const LuaFunctionLibrary& library) {
@@ -8567,7 +8577,7 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
     absl::Status applied =
         co_await ApplyFunctionCatalogTarget(std::move(target), request);
     if (!applied.ok()) {
-      co_return FunctionMutationError(reply_builder, applied);
+      co_return FunctionMutationError(request, reply_builder, applied);
     }
     co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
   }
@@ -8580,14 +8590,9 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
       co_return BuiltReply(reply_builder.AppendError(
           "ERR FUNCTION FLUSH only supports SYNC|ASYNC option"));
     }
-    if (FunctionMutationRejected(request)) {
-      co_return BuiltReply(reply_builder.AppendError(
-          "READONLY You can't write against a read only replica."));
-    }
-    auto operation = co_await AcquireFunctionCatalogOperation();
     absl::Status applied = co_await ApplyFunctionCatalogTarget({}, request);
     if (!applied.ok()) {
-      co_return FunctionMutationError(reply_builder, applied);
+      co_return FunctionMutationError(request, reply_builder, applied);
     }
     co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
   }
@@ -8623,11 +8628,6 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
       co_return BuiltReply(reply_builder.AppendError(
           "ERR DUMP payload version or checksum are wrong"));
     }
-    if (FunctionMutationRejected(request)) {
-      co_return BuiltReply(reply_builder.AppendError(
-          "READONLY You can't write against a read only replica."));
-    }
-    auto operation = co_await AcquireFunctionCatalogOperation();
     const std::vector<LuaFunctionLibrary> previous =
         SnapshotLuaFunctionLibraries();
     std::vector<LuaFunctionLibrary> target =
@@ -8656,7 +8656,7 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
     absl::Status applied =
         co_await ApplyFunctionCatalogTarget(std::move(target), request);
     if (!applied.ok()) {
-      co_return FunctionMutationError(reply_builder, applied);
+      co_return FunctionMutationError(request, reply_builder, applied);
     }
     co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
   }
@@ -11763,7 +11763,8 @@ storage::MutationPrecondition ClusterMutationPrecondition(
     const CommandRequest& request) {
   if (!cluster::MetaManaged() || request.replication_origin_ ||
       request.cluster_authority_admission_ == nullptr ||
-      request.ClusterSlots().empty() || !ClusterRequestIsWrite(request)) {
+      request.cluster_authority_admission_->slots().empty() ||
+      !ClusterRequestIsWrite(request)) {
     return {};
   }
   return storage::MutationPrecondition(
@@ -11782,7 +11783,8 @@ CommandReply FinalizeClusterMutationReply(const CommandRequest& request,
     // redirect/LOADING response.
     reply_builder.Reset();
     return ClusterAuthorityChangedReply(admission->slots(),
-                                        request.connection_tls_, reply_builder);
+                                        request.connection_tls_, reply_builder,
+                                        UsesLocalGroupAuthority(request));
   }
   // At least one participant linearized before another failed its final
   // check. Its aggregate outcome cannot be represented as a retryable error.
@@ -11795,7 +11797,8 @@ CommandReply FinalizeClusterMutationReply(const CommandRequest& request,
 
 CommandReply ClusterAuthorityChangedReply(std::span<const std::uint16_t> slots,
                                           bool connection_tls,
-                                          ReplyBuilder& reply_builder) {
+                                          ReplyBuilder& reply_builder,
+                                          bool local_group) {
   CommandReply reply;
   const cluster::RequestView view{
       .slots_ = slots,
@@ -11805,6 +11808,7 @@ CommandReply ClusterAuthorityChangedReply(std::span<const std::uint16_t> slots,
       // snapshot that lost readiness maps to LOADING instead of serving.
       .loading_allowed_ = false,
       .client_mode_ = cluster::GetClientMode(),
+      .local_group_ = local_group,
   };
   cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
   const cluster::AuthorityAdmission fresh =
@@ -11836,7 +11840,7 @@ void InstallClusterShardValidator(tx::Transaction& transaction,
                                   ClusterShardValidatorContext& context) {
   if (!cluster::MetaManaged() || request.replication_origin_ ||
       request.cluster_authority_admission_ == nullptr ||
-      request.ClusterSlots().empty()) {
+      request.cluster_authority_admission_->slots().empty()) {
     return;
   }
   context.admission_ = request.cluster_authority_admission_;
@@ -11846,7 +11850,7 @@ void InstallClusterShardValidator(tx::Transaction& transaction,
 absl::Status RecheckClusterRequestAuthority(const CommandRequest& request) {
   if (!cluster::MetaManaged() || request.replication_origin_ ||
       request.cluster_authority_admission_ == nullptr ||
-      request.ClusterSlots().empty()) {
+      request.cluster_authority_admission_->slots().empty()) {
     return absl::OkStatus();
   }
   if (cluster::GetClusterRuntime()->authority_guard_.Recheck(
@@ -11935,11 +11939,16 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
   }
   if (cluster::MetaManaged()) {
     const std::string_view unscoped_mutation = UnscopedClusterMutation(request);
+    if (!request.replication_origin_ && ctx.in_multi_ &&
+        IsFunctionCatalogMutation(request)) {
+      // Catalog-in-EXEC requires a shared admission through the transaction's
+      // eventual publication. Keep that existing boundary until it is wired.
+      ctx.multi_dirty_ = true;
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR FUNCTION catalog mutations inside MULTI are not yet supported "
+          "in Meta-managed mode"));
+    }
     if (!unscoped_mutation.empty()) {
-      // Meta authority is deliberately finite per group and can never prove a
-      // process-wide durable mutation. Reject that policy before
-      // the transient population LOADING gate so an unassigned/fenced node
-      // cannot make the command appear potentially valid after recovery.
       if (ctx.in_multi_) ctx.multi_dirty_ = true;
       co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
           "ERR ", unscoped_mutation, " is not allowed in Meta-managed mode")));
@@ -11954,24 +11963,25 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       // KEYS retains its exclusive gate until its streamed response completes.
       // Still deferred: execution
       // contexts that mutate outside one command's key view (transactions,
-      // scripts, global and catalog operations), stream blocking and keyless
+      // scripts and global DB operations), stream blocking and keyless
       // WAIT. Later tickets can remove a boundary only after wiring its
       // waits, participants and durable/catalog effects into Group authority.
       const auto flags = request.spec_ == nullptr ? 0u : request.spec_->flags_;
       const bool database_inspection =
           kind == CommandKind::kDbSize || kind == CommandKind::kScan ||
           kind == CommandKind::kRandomKey || kind == CommandKind::kKeys;
-      const bool keyless_data = (flags & kCmdUsesDbGate) != 0 &&
-                                (flags & kCmdNoKeys) != 0 &&
-                                !database_inspection;
+      const bool keyless_data =
+          (flags & kCmdUsesDbGate) != 0 && (flags & kCmdNoKeys) != 0 &&
+          !database_inspection && kind != CommandKind::kFunction;
       const bool deferred =
           kind == CommandKind::kMulti || kind == CommandKind::kExec ||
           kind == CommandKind::kWatch || kind == CommandKind::kUnwatch ||
           kind == CommandKind::kDiscard || kind == CommandKind::kScript ||
-          kind == CommandKind::kFunction || kind == CommandKind::kSortRo ||
+          IsLuaInvocationCommand(request) || kind == CommandKind::kSortRo ||
           kind == CommandKind::kSave || kind == CommandKind::kBgSave ||
           kind == CommandKind::kXRead || kind == CommandKind::kXReadGroup ||
-          kind == CommandKind::kWait || (flags & kCmdDynamicWrite) != 0 ||
+          kind == CommandKind::kWait ||
+          ((flags & kCmdDynamicWrite) != 0 && kind != CommandKind::kFunction) ||
           keyless_data;
       if (deferred && !script_kill && !function_kill && !function_stats) {
         if (ctx.in_multi_) ctx.multi_dirty_ = true;
@@ -12767,7 +12777,7 @@ std::optional<unsigned> SingleKeyWriteOwner(CommandRequest& request) {
   if (request.spec_ == nullptr || g_storage == nullptr) {
     return std::nullopt;
   }
-  // Function-library mutations are process-global. Route every standalone
+  // Function-library mutations are process-global. Route every top-level
   // FUNCTION command through worker zero so mutation and replication order
   // are identical even when clients are accepted by different workers.
   if (request.kind_ == CommandKind::kFunction) return 0;

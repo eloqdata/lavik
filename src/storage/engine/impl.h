@@ -2818,7 +2818,7 @@ class StorageEngine::Impl {
   absl::Status FlushForShutdown();
 
   Task<absl::StatusOr<CatalogDurabilityToken>> CommitFunctionCatalog(
-      std::string_view dump);
+      std::string_view dump, MutationPrecondition mutation_precondition);
   absl::StatusOr<std::optional<RecoveredFunctionCatalog>>
   RecoverFunctionCatalog() const;
   Task<absl::Status> MakeDurable(const DurabilityFrontier& frontier,
@@ -2880,13 +2880,14 @@ class StorageEngine::Impl {
   };
 
   absl::Status LoadSystemState();
-  Task<absl::Status> CommitSystemState(DurableSystemState next,
-                                       std::string_view catalog_dump,
-                                       bool replace_catalog,
-                                       bool shutdown_metadata = false);
+  Task<absl::Status> CommitSystemState(
+      DurableSystemState next, std::string_view catalog_dump,
+      bool replace_catalog, bool shutdown_metadata = false,
+      MutationPrecondition mutation_precondition = {});
   Task<absl::Status> WriteSystemStateRootOnDeviceLocal(
       std::size_t device_index, const SystemStateRoot& root,
-      std::uint8_t target_slot);
+      std::uint8_t target_slot, bool& root_write_started,
+      const MutationPrecondition& mutation_precondition);
   static absl::StatusOr<std::string> EncodePromotionBase(
       const PromotionBase& base);
   static absl::StatusOr<PromotionBase> DecodePromotionBase(

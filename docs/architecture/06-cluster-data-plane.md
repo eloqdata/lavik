@@ -814,7 +814,7 @@ RESP3. Deliberately unsupported administrative mutations use stable Lavik
 | `SELECT` with a nonzero index | `-ERR SELECT is not allowed in cluster mode` |
 | `COPY` with a `DB` option | `-ERR Copying to another database is not allowed in cluster mode` |
 | `REPLICAOF` / `ADDREPLICAOF` | `-ERR REPLICAOF not allowed in cluster mode.` |
-| `FLUSHDB`, `FLUSHALL`, or catalog-changing `FUNCTION` subcommands | `-ERR <command> is not allowed in cluster mode` |
+| `FLUSHDB` or `FLUSHALL` | `-ERR <command> is not allowed in cluster mode` |
 | Unknown `CLUSTER` subcommand or wrong arity | `-ERR Unknown CLUSTER subcommand or wrong number of arguments for '<sub>'` |
 | Execution outcome undeterminable | No reply; the connection is closed |
 
@@ -834,11 +834,14 @@ slot, and `redis.call` access outside the admitted slot set is rejected with
 Redis's non-local-key error. In Cluster mode, read-only global commands and
 process-local administration (INFO, CONFIG, DBSIZE, SCAN, SCRIPT cache management,
 and similar) keep node-local semantics and are governed only by readiness.
-Cluster nodes reject `FLUSHDB`, `FLUSHALL`, and catalog-changing
-`FUNCTION LOAD`, `DELETE`, `FLUSH`, and `RESTORE`: they mutate durable
-process-wide state but carry no slot from which finite authority can derive a
-group lease and drain cell. Queuing one in `MULTI` marks the transaction dirty,
-so `EXEC` aborts rather than creating a slotless authority exception.
+Cluster nodes reject `FLUSHDB` and `FLUSHALL` until their global mutation
+lifecycle is wired into Group authority. `FUNCTION LOAD`, `DELETE`, `FLUSH`,
+and `RESTORE` bind to the receiving node's member Group through the common
+authority gate. They update only that Group's local replicated catalog; other
+Groups are independent. `FUNCTION DUMP` and `LIST` inspect the local catalog,
+including on complete readable replicas without READONLY; replica mutations
+return READONLY. Catalog mutations inside managed `MULTI` remain unsupported:
+queuing one marks the transaction dirty so `EXEC` aborts.
 `FUNCTION KILL` and `FUNCTION STATS` remain available while loading so an
 executing Function can be stopped or inspected; they do not mutate the catalog.
 
@@ -856,10 +859,15 @@ the ordinary Single replica-read policy. KEYS retains its exclusive database
 gate throughout its streamed reply. Still rejected with explicit unsupported
 errors, each because its execution context is not yet wired into Group
 authority: transactions (MULTI/EXEC/WATCH queue commands into a separate
-execution context), scripts and Functions, global durable mutations such
-as FLUSHDB/FLUSHALL, stream blocking (XREAD/XREADGROUP
-wait on distinct lanes and XREADGROUP mutates consumer-group state), and
-keyless `WAIT`. Diagnostics remain separate from data authority. Single returns
+execution context), scripts and Function invocation, global durable mutations
+such as FLUSHDB/FLUSHALL, stream blocking (XREAD/XREADGROUP wait on distinct
+lanes and XREADGROUP mutates consumer-group state), and keyless `WAIT`.
+Function catalog management uses that same sole Group's admission and drain:
+LOAD/DELETE/FLUSH/RESTORE share one mutation lifecycle and final authority
+check at the first durable root write. DUMP/LIST use ordinary Single data-read
+admission. The catalog is shared across DB0–15; its replication and recovery
+are the common [Function catalog](07-function-catalog.md) module.
+Diagnostics remain separate from data authority. Single returns
 LOADING for incomplete population, READONLY for replica mutations, MASTERDOWN for
 unavailable Owner authority or disabled stale reads, and TRYAGAIN for
 Controlled Pause. Normal role changes do not produce MOVED.

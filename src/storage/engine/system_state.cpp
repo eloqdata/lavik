@@ -21,6 +21,7 @@
 #include <limits>
 
 #include "impl.h"
+#include "lavik/fault_pause.h"
 
 namespace lavik::storage {
 namespace {
@@ -486,7 +487,8 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
 
 Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
     std::size_t device_index, const SystemStateRoot& root,
-    std::uint8_t target_slot) {
+    std::uint8_t target_slot, bool& root_write_started,
+    const MutationPrecondition& mutation_precondition) {
   if (device_index >= devices_.size() || target_slot > 1) {
     co_return absl::InvalidArgumentError("invalid system-state root target");
   }
@@ -539,6 +541,21 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
                      std::span<std::byte, kDirectIoAlignment>(
                          buffer.data_, kDirectIoAlignment));
   const StorageDevice& device = devices_[device_index];
+  LAVIK_FAULT_INJECT(if (device_index == 0) {
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FUNCTION_CATALOG_BEFORE_ROOT_HOLD_FILE");
+    if (!paused.ok()) co_return paused;
+  });
+  // Buffer admission and the hop to this device's owner may suspend. This is
+  // the first irreversible root write, not the earlier extent preparation.
+  // The caller serially joins each device, so this flag has one writer at a
+  // time. Never recheck between devices: a partial root set cannot be aborted
+  // as if the catalog were unchanged.
+  if (!root_write_started) {
+    absl::Status authorized = mutation_precondition.Validate();
+    if (!authorized.ok()) co_return authorized;
+    root_write_started = true;
+  }
   auto written = co_await WriteStorageBuffer(
       *store.worker_, store.files_[device.file_index_],
       std::span<const std::byte>(buffer.data_, kDirectIoAlignment),
@@ -549,13 +566,24 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
         ? absl::InternalError("short system-state root write")
         : written.status();
   }
+  LAVIK_FAULT_INJECT(if (device_index == 0) {
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FUNCTION_CATALOG_AFTER_ROOT_WRITE_HOLD_FILE");
+    if (!paused.ok()) co_return paused;
+    const char* fail = std::getenv("LAVIK_SYSTEM_STATE_ROOT_SYNC_FAIL_FILE");
+    if (fail != nullptr && ::access(fail, F_OK) == 0) {
+      co_return absl::UnavailableError(
+          "injected system-state root sync failure");
+    }
+  });
   co_return co_await bycorf::Fdatasync(*store.worker_,
                                        store.files_[device.file_index_]);
 }
 
 Task<absl::Status> StorageEngine::Impl::CommitSystemState(
     DurableSystemState next, std::string_view catalog_dump,
-    bool replace_catalog, bool shutdown_metadata) {
+    bool replace_catalog, bool shutdown_metadata,
+    MutationPrecondition mutation_precondition) {
   // The caller holds system_state_mutex_ on worker zero.
   if (system_state_failure_.has_value()) co_return *system_state_failure_;
   if (system_state_.generation_ == std::numeric_limits<std::uint64_t>::max()) {
@@ -610,20 +638,31 @@ Task<absl::Status> StorageEngine::Impl::CommitSystemState(
   };
   const std::uint8_t slot =
       static_cast<std::uint8_t>((next.generation_ - 1) & 1);
+  bool root_write_started = false;
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
     const bycorf::WorkerId owner = device_allocators_[device_index]->owner_;
     absl::Status committed;
     if (owner == 0) {
-      committed =
-          co_await WriteSystemStateRootOnDeviceLocal(device_index, root, slot);
+      committed = co_await WriteSystemStateRootOnDeviceLocal(
+          device_index, root, slot, root_write_started, mutation_precondition);
     } else {
       committed = co_await bycorf::SubmitTaskTo(
-          owner, [this, device_index, root, slot]() {
-            return WriteSystemStateRootOnDeviceLocal(device_index, root, slot);
+          owner, [this, device_index, root, slot, &root_write_started,
+                  &mutation_precondition]() {
+            return WriteSystemStateRootOnDeviceLocal(device_index, root, slot,
+                                                     root_write_started,
+                                                     mutation_precondition);
           });
     }
     if (!committed.ok()) {
+      if (!root_write_started) {
+        // Only unpublished extents exist. Reclaim them without fencing the
+        // old root; the command can report an honest pre-mutation rejection.
+        SpawnExtentReclaim(store, new_manifest);
+        if (new_catalog != nullptr) SpawnExtentReclaim(store, new_catalog);
+        co_return committed;
+      }
       // Some devices may already expose the new root. Stop the writer and let
       // restart select the highest generation common to every device. Fence
       // all request serving as well: the in-memory catalog may now disagree
@@ -650,7 +689,8 @@ Task<absl::Status> StorageEngine::Impl::CommitSystemState(
 }
 
 Task<absl::StatusOr<CatalogDurabilityToken>>
-StorageEngine::Impl::CommitFunctionCatalog(std::string_view dump) {
+StorageEngine::Impl::CommitFunctionCatalog(
+    std::string_view dump, MutationPrecondition mutation_precondition) {
   if (dump.empty() || dump.size() > kMaxFunctionCatalogBytes) {
     co_return absl::OutOfRangeError(
         "Function catalog dump must be between 1 byte and 1 GiB");
@@ -658,8 +698,10 @@ StorageEngine::Impl::CommitFunctionCatalog(std::string_view dump) {
   if (bycorf::ThisWorker().id_ != 0) {
     std::string owned(dump);
     co_return co_await bycorf::SubmitTaskTo(
-        0, [this, owned = std::move(owned)]() {
-          return CommitFunctionCatalog(owned);
+        0,
+        [this, owned = std::move(owned),
+         mutation_precondition = std::move(mutation_precondition)]() mutable {
+          return CommitFunctionCatalog(owned, std::move(mutation_precondition));
         });
   }
   co_await system_state_mutex_.Lock();
@@ -676,8 +718,8 @@ StorageEngine::Impl::CommitFunctionCatalog(std::string_view dump) {
       .dump_crc64_ = Crc64(AsBytes(dump)),
   };
   if (next.full_sync_session_id_ != 0) next.catalog_ready_ = true;
-  absl::Status committed =
-      co_await CommitSystemState(std::move(next), dump, true);
+  absl::Status committed = co_await CommitSystemState(
+      std::move(next), dump, true, false, std::move(mutation_precondition));
   if (!committed.ok()) co_return committed;
   co_return system_state_.catalog_token_;
 }

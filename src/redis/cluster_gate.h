@@ -85,9 +85,9 @@ CommandReply ClusterValidatorFailureReply(
 // captured admission still holds.
 absl::Status RecheckClusterRequestAuthority(const CommandRequest& request);
 
-// Builds the storage-neutral final check carried to the keyspace publication
-// seam. The returned object owns the admission proof across suspension and is
-// empty for standalone, read, and replication-replay work.
+// Builds the storage-neutral final check carried to keyspace or catalog
+// publication seam. The returned object owns the admission proof across
+// suspension and is empty for standalone, read, and replication-replay work.
 storage::MutationPrecondition ClusterMutationPrecondition(
     const CommandRequest& request);
 
@@ -112,7 +112,8 @@ CommandReply FinalizeClusterMutationReply(const CommandRequest& request,
 // closes instead of inventing an answer.
 CommandReply ClusterAuthorityChangedReply(std::span<const std::uint16_t> slots,
                                           bool connection_tls,
-                                          ReplyBuilder& reply_builder);
+                                          ReplyBuilder& reply_builder,
+                                          bool local_group = false);
 
 // The status the transaction validator and the bare-hop re-checks use to
 // report a fenced admission; distinct enough that callers never confuse it

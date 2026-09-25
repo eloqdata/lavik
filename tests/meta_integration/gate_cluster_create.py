@@ -985,7 +985,7 @@ def encode_resp(arguments):
     return encoded
 
 
-def read_resp(reader):
+def read_resp(reader, decode=True):
     prefix = reader.read(1)
     if not prefix:
         raise H.Failure("Data closed its Redis connection")
@@ -1006,9 +1006,9 @@ def read_resp(reader):
         value = reader.read(size)
         if len(value) != size or reader.read(2) != b"\r\n":
             raise H.Failure("Data returned a truncated Redis bulk reply")
-        return value.decode()
+        return value.decode() if decode else value
     if prefix == b"*":
-        return [read_resp(reader) for _ in range(int(payload))]
+        return [read_resp(reader, decode=decode) for _ in range(int(payload))]
     raise H.Failure(f"Data returned unknown RESP prefix {prefix!r}")
 
 
@@ -1194,22 +1194,6 @@ def assert_redis_topology_and_replication(nodes):
         ),
         (["FLUSHDB"], "ERR FLUSHDB is not allowed in Meta-managed mode"),
         (["FLUSHALL"], "ERR FLUSHALL is not allowed in Meta-managed mode"),
-        (
-            ["FUNCTION", "LOAD", rejected_library],
-            "ERR FUNCTION LOAD is not allowed in Meta-managed mode",
-        ),
-        (
-            ["FUNCTION", "DELETE", "missing-library"],
-            "ERR FUNCTION DELETE is not allowed in Meta-managed mode",
-        ),
-        (
-            ["FUNCTION", "FLUSH"],
-            "ERR FUNCTION FLUSH is not allowed in Meta-managed mode",
-        ),
-        (
-            ["FUNCTION", "RESTORE", "payload"],
-            "ERR FUNCTION RESTORE is not allowed in Meta-managed mode",
-        ),
     ):
         actual = redis_error(by_id[PRIMARY_1], arguments)
         if actual != expected:
@@ -1229,7 +1213,7 @@ def assert_redis_topology_and_replication(nodes):
             raise H.Failure("primary rejected MULTI before policy check")
         function_reply = reader.readline()
         if function_reply != (
-            b"-ERR FUNCTION LOAD is not allowed in Meta-managed mode\r\n"
+            b"-ERR FUNCTION catalog mutations inside MULTI are not yet supported in Meta-managed mode\r\n"
         ):
             raise H.Failure(f"transactional FUNCTION LOAD returned {function_reply!r}")
         exec_reply = reader.readline()
@@ -1241,6 +1225,52 @@ def assert_redis_topology_and_replication(nodes):
             )
     if redis_call(by_id[PRIMARY_1], ["FUNCTION", "LIST"]) != []:
         raise H.Failure("rejected FUNCTION LOAD changed the catalog")
+
+    # Redis Cluster libraries are local to a primary and its replicas. Load
+    # distinct definitions into both Groups so a fixed slot-zero proof or
+    # accidental cross-Group propagation cannot satisfy these assertions.
+    from gate_native_replication import Client
+    from function_catalog_data import library, snapshot, node_snapshot
+
+    expected_catalogs = {}
+    for group_id, (primary, replica, _, _) in GROUPS.items():
+        writer = Client(by_id[primary])
+        reader = Client(by_id[replica])
+        try:
+            empty = snapshot(writer)
+            name = group_id.replace("-", "_")
+            assert writer.call("FUNCTION", "LOAD", library(name, group_id)) == name
+            loaded = snapshot(writer)
+            for catalog_command in (
+                ("FUNCTION", "LOAD", library("forbidden", "no")),
+                ("FUNCTION", "DELETE", name),
+                ("FUNCTION", "FLUSH"),
+                ("FUNCTION", "RESTORE", empty[0], "FLUSH"),
+            ):
+                try:
+                    reader.call(*catalog_command)
+                except H.Failure as error:
+                    assert str(error).startswith("READONLY"), error
+                else:
+                    raise H.Failure("replica accepted a catalog mutation")
+            assert writer.call("FUNCTION", "DELETE", name) == "OK"
+            assert snapshot(writer) == empty
+            assert writer.call("FUNCTION", "RESTORE", loaded[0], "FLUSH") == "OK"
+            assert snapshot(writer) == loaded
+            assert writer.call("FUNCTION", "FLUSH", "ASYNC") == "OK"
+            assert snapshot(writer) == empty
+            assert writer.call("FUNCTION", "RESTORE", loaded[0], "FLUSH") == "OK"
+            expected_catalogs[group_id] = loaded
+            H.wait_until(
+                "local Group catalog replay", 20, lambda: snapshot(reader) == loaded
+            )
+        finally:
+            reader.close()
+            writer.close()
+    assert expected_catalogs["group-1"] != expected_catalogs["group-2"]
+    for group_id, (primary, replica, _, _) in GROUPS.items():
+        for node_id in (primary, replica):
+            assert node_snapshot(by_id[node_id]) == expected_catalogs[group_id]
 
     source_host, source_port = endpoint_tuple(by_id[PRIMARY_1])
     followed_arguments = [

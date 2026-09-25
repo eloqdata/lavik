@@ -31,9 +31,39 @@ namespace {
 // TLS entries must not survive destruction followed by address reuse.
 std::atomic<std::uint64_t> next_authority_cache_identity{1};
 
-// Managed Single has one authority for the entire keyspace. A representative
-// slot lets the existing lease/drain/token machinery check that Group once.
-std::span<const std::uint16_t> AuthoritySlots(const RequestView& request) {
+// Dataset-scoped access needs one Group rather than client hash-slot routing.
+// A representative slot reuses the existing lease/drain/token machinery.
+std::span<const std::uint16_t> AuthoritySlots(const ServingState* state,
+                                              const RequestView& request) {
+  if (request.local_group_) {
+    // Resolve from the same immutable snapshot that admission will retain.
+    // The catalog belongs to the local dataset, never to an arbitrary slot
+    // zero or a remote Group. Existing slot proofs then supply lease/drain.
+    const GroupView* local = nullptr;
+    if (state != nullptr && state->SelfNodeIndex() != kNoNodeIndex) {
+      for (const GroupView& group : state->Groups()) {
+        if (group.primary_node_index_ != state->SelfNodeIndex() &&
+            std::find(group.replica_node_indices_.begin(),
+                      group.replica_node_indices_.end(),
+                      state->SelfNodeIndex()) ==
+                group.replica_node_indices_.end()) {
+          continue;
+        }
+        if (local != nullptr) {
+          local = nullptr;
+          break;
+        }
+        local = &group;
+      }
+    }
+    if (local != nullptr && !local->slot_ranges_.empty()) {
+      return {&local->slot_ranges_.front().first_, 1};
+    }
+    // An unbound sentinel fails through the ordinary admission decision;
+    // returning empty would accidentally grant the diagnostic bypass.
+    static constexpr std::uint16_t unbound = kSlotCount;
+    return {&unbound, 1};
+  }
   if (request.client_mode_ != ClientMode::kSingle) return request.slots_;
   if (!request.slots_.empty()) return request.slots_.first(1);
   // Keyless data still belongs to the one Group; only diagnostics may bypass
@@ -112,7 +142,7 @@ AuthorityAdmission& AuthorityAdmission::operator=(
 
 Decision Admit(const ServingState* state, const RequestView& request) {
   Decision decision;
-  const auto slots = AuthoritySlots(request);
+  const auto slots = AuthoritySlots(state, request);
 
   // Loading gate, first in Redis's order too (processCommand runs its loading
   // check before getNodeByQuery): loading, then first-key unbound, then
@@ -130,7 +160,7 @@ Decision Admit(const ServingState* state, const RequestView& request) {
   }
 
   // No-key commands admit locally; readiness above is the only generic gate.
-  // The Redis adapter rejects persistent global mutations before this point,
+  // The Redis adapter rejects unscoped persistent mutations before this point,
   // because an empty slot set cannot name authority or a drain cell. Callers
   // also report key-extraction failure as empty so malformed commands reach
   // their own argument error, matching Redis getNodeByQuery.
@@ -177,11 +207,12 @@ Decision Admit(const ServingState* state, const RequestView& request) {
     return decision;
   }
 
-  // Single replicas admit ordinary reads and reject writes with READONLY.
-  // Cluster replicas require an explicit READONLY connection; other accesses
+  // Local dataset requests and Single replicas admit ordinary reads and
+  // reject writes with READONLY.
+  // Slot-routed Cluster reads require a READONLY connection; other accesses
   // redirect to the primary. Population/link policy is checked by replication.
   if (self_index != kNoNodeIndex &&
-      (request.client_mode_ == ClientMode::kSingle ||
+      (request.local_group_ || request.client_mode_ == ClientMode::kSingle ||
        (!request.is_write_ && request.connection_readonly_))) {
     for (NodeIndex replica_index : group->replica_node_indices_) {
       if (replica_index == self_index) {
@@ -411,7 +442,7 @@ AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
   std::uint64_t version = 0;
   admission.state_ = CurrentCachedWithVersion(topology_, &version,
                                               &admission.topology_sequence_);
-  const auto slots = AuthoritySlots(request);
+  const auto slots = AuthoritySlots(admission.state_.get(), request);
   admission.slots_.assign(slots.begin(), slots.end());
   admission.single_group_ = request.client_mode_ == ClientMode::kSingle;
   admission.decision_ =
@@ -483,7 +514,7 @@ Decision AuthorityGuard::DecideWithLease(const ServingState* state,
                                          AuthorityAdmission* proof,
                                          LeaseCheck* lease_check) const {
   Decision decision = Admit(state, request);
-  const auto slots = AuthoritySlots(request);
+  const auto slots = AuthoritySlots(state, request);
   if (decision.kind_ != Decision::Kind::kServe || state == nullptr ||
       slots.empty()) {
     return decision;

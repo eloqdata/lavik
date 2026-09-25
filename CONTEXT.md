@@ -37,6 +37,11 @@ _Avoid_: Standalone when referring to Meta-managed Single
 A Client Service Mode exposing slot-based routing and Redis Cluster command
 constraints. It describes the client contract, not a separate HA mechanism.
 
+**Function Catalog**:
+The named Function libraries shared by all logical databases on a Data Node.
+Its contents belong to the node's replicated dataset, not a per-database
+namespace or a cluster-wide registry shared across Groups.
+
 **Discovery Entry**:
 The independent Sentinel-compatible RESP endpoint served by a Meta process for
 client discovery, identified to clients by its Sentinel address. Its answers

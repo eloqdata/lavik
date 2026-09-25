@@ -112,7 +112,7 @@ CommandRequest BuildParsedCommandRequest(RespCommand command,
   // parser invariant in the hottest coroutine frame.
   assert(!command.args_.empty());
   CommandRequest request;
-  request.spec_ = FindCommand(command.args_.front());
+  request.spec_ = FindCommand(std::span<const std::string>(command.args_));
   request.kind_ =
       request.spec_ != nullptr ? request.spec_->kind_ : CommandKind::kUnknown;
   request.db_id_ = db_id;

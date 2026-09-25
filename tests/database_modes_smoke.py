@@ -67,6 +67,13 @@ def mode_source(directory, label, endpoint):
         proxy.start()
         meta.start(bootstrap=True)
         meta.wait_leader()
+        # Election can finish before the bootstrap Meta identity binding.
+        # Cluster creation shares admission with that initial reconciliation.
+        H.wait_until(
+            "bootstrap Meta identity committed",
+            5,
+            lambda: C.cluster_status(meta)["meta_membership_stable"],
+        )
         request = C.create_request(meta, "1" * 40, endpoint, "group")
         reply = meta.ctl(request)
         assert reply.startswith("OK clustercreate"), reply

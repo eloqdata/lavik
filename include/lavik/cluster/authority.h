@@ -65,14 +65,18 @@ struct RequestView {
   bool loading_allowed_ = false;
   // Client slot restrictions are independent of the authority being checked.
   ClientMode client_mode_ = ClientMode::kCluster;
+  // Process-wide dataset operations (Function catalog) use this node's one
+  // member Group, independent of client slot routing. Replicas read locally
+  // without READONLY and reject writes; no Group means no authority.
+  bool local_group_ = false;
 };
 
 struct Decision {
   enum class Kind : std::uint8_t {
-    kServe,               // execute locally
-    kServeStaleRead,      // replica read; Cluster requires READONLY
-    kMoved,               // another node owns the slot; endpoint filled below
-    kReadOnly,            // Single replica rejects writes without redirection
+    kServe,           // execute locally
+    kServeStaleRead,  // replica read; routed Cluster keys require READONLY
+    kMoved,           // another node owns the slot; endpoint filled below
+    kReadOnly,  // local dataset replica rejects writes without redirection
     kClusterDownUnbound,  // first key's slot has no owner
     kCrossSlot,           // keys span multiple slots
     kLoading,             // no ready ServingState / storage not ready

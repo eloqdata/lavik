@@ -1029,8 +1029,9 @@ struct TransferValue {
 // maintenance and replica replay leave it empty. A pointer passed to any
 // Task-returning StorageEngine API must remain alive until that Task completes;
 // transaction initialization instead copies the value into each shard receipt.
-// Validators run synchronously while the owning shard holds its key and store
-// locks, and one shared context may be checked concurrently by several shards;
+// Keyspace validators run synchronously while the owning shard holds its key
+// and store locks; catalog commits validate before their first root write.
+// One shared context may be checked concurrently by several shards;
 // they must be nonblocking, thread-safe, and must not re-enter StorageEngine.
 // The non-default constructor requires both its context and validator to be
 // non-null; use the default constructor to represent no precondition.
@@ -1189,8 +1190,12 @@ class StorageEngine {
 
   // Atomically replaces the node-global Function catalog dump. The body is
   // committed before a mirrored system-state root publishes the generation.
+  // The precondition runs after all preparation, immediately before the first
+  // root write. Once accepted, every root and the caller's runtime/history
+  // publication must finish under its retained admission/drain protection;
+  // later revocation cannot safely cancel that indivisible catalog commit.
   bycorf::Task<absl::StatusOr<CatalogDurabilityToken>> CommitFunctionCatalog(
-      std::string_view dump);
+      std::string_view dump, MutationPrecondition mutation_precondition = {});
   // Returns the catalog selected during startup recovery. Absence means a new
   // storage set that has not committed its first (empty) catalog yet.
   absl::StatusOr<std::optional<RecoveredFunctionCatalog>>
