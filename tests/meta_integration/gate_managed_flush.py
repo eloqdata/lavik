@@ -173,16 +173,23 @@ def revoked(root, mode, command, boundary):
             )
         finally:
             reader.close()
-        # A clean checkpoint after rejection would persist polluted allocator
-        # values too. Exercise this once per command/mode at the storage cut.
-        if boundary == "BEFORE_EPOCH":
-            source.terminate()
-            source.start()
-            H.wait_until(
-                "restart preserves the rejected outcome",
-                30,
-                lambda: F.redis_call(source, ["GET", "{flush}old"]) == expected,
-            )
+    # Pair shutdown checkpoints pending allocator metadata too. Recover these
+    # exact devices without Meta or a donor: a role change must not invalidate
+    # this disk assertion, and a replica rebuild must not hide a polluted epoch.
+    if boundary == "BEFORE_EPOCH":
+        with process(
+            C.DATA,
+            Path(source.workdir),
+            "rejected-recovery",
+            port=source.redis_port,
+            workers=source.workers,
+            extra=("--data-file", str(second)),
+        ):
+            recovered = Client(source)
+            try:
+                assert recovered.call("GET", "{flush}old") == "old"
+            finally:
+                recovered.close()
 
 
 def storage_failure(root, command, kind, device):
