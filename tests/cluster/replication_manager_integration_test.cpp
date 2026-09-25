@@ -53,9 +53,11 @@
 #include "lavik/metrics.h"
 #include "lavik/replication.h"
 #include "lavik/replication_command.h"
+#include "lavik/resp.h"
 #include "lavik/storage/engine.h"
 #include "lavik/tx/tx_shard.h"
 #include "src/replication/native_recovery.h"
+#include "src/replication/replication_internal.h"
 #include "tests/support/process.h"
 
 namespace {
@@ -440,7 +442,8 @@ class StallingNativeSource {
 
 // A steady-state Owner endpoint that can hold the authenticated control
 // handshake before export readiness, or publish one exact source incarnation
-// and then stall its data flow. This keeps the test focused on the target's
+// and then stall FULL or complete the seeded candidate's CONTINUE handshake.
+// This keeps the test focused on the target's
 // desired-state boundary rather than reimplementing native FULL in a fixture.
 class FollowOwnerSource {
  public:
@@ -573,6 +576,35 @@ class FollowOwnerSource {
     std::string request;
     bool replied = false;
     bool control = false;
+    bool online_sent = false;
+    // The seeded candidate in this fixture has exactly one flow at LSN 1.
+    // Use the production frame encoder and wait for its cursor ACK before
+    // declaring ONLINE, so readiness does not depend on thread scheduling.
+    using namespace lavik::replication_internal;
+    std::string cursor_payload;
+    PutU64(cursor_payload, 1);
+    PutU32(cursor_payload, 0);
+    std::string cursor_frame;
+    if (!AppendDataFrameHeader(
+             &cursor_frame, DataFrameKind::kCursor, cursor_payload.size(),
+             static_cast<std::uint32_t>(absl::ComputeCrc32c(cursor_payload)))
+             .ok()) {
+      error_.store(EIO, std::memory_order_release);
+      return;
+    }
+    cursor_frame += cursor_payload;
+    std::string ack_payload;
+    PutU16(ack_payload, 0);
+    PutU64(ack_payload, 1);
+    std::string cursor_ack;
+    if (!AppendDataFrameHeader(
+             &cursor_ack, DataFrameKind::kAck, ack_payload.size(),
+             static_cast<std::uint32_t>(absl::ComputeCrc32c(ack_payload)))
+             .ok()) {
+      error_.store(EIO, std::memory_order_release);
+      return;
+    }
+    cursor_ack += ack_payload;
     while (!stop.stop_requested()) {
       pollfd peer{.fd = connection, .events = POLLIN | POLLRDHUP, .revents = 0};
       const int activity = ::poll(&peer, 1, 50);
@@ -601,13 +633,24 @@ class FollowOwnerSource {
           return;
         }
         request.append(buffer, static_cast<std::size_t>(received));
-        if (!control && (request.find("LVPSYNC") != std::string::npos ||
-                         request.find("LVPARENT") != std::string::npos)) {
+        if (!replied && !control &&
+            (request.find("LVPSYNC") != std::string::npos ||
+             request.find("LVPARENT") != std::string::npos)) {
           control = true;
           controls_.fetch_add(1, std::memory_order_acq_rel);
-        } else if (request.find("LVFLOW") != std::string::npos) {
+        } else if (!replied && request.find("LVFLOW") != std::string::npos) {
+          const auto parsed = lavik::ParseRespCommand(request);
+          if (parsed.state_ == lavik::RespParseState::kNeedMoreData) continue;
+          if (parsed.state_ != lavik::RespParseState::kOk ||
+              (flow_mode_ == "CONTINUE" && (parsed.command_.args_.size() < 6 ||
+                                            parsed.command_.args_[4] != "1" ||
+                                            parsed.command_.args_[5] != "0"))) {
+            error_.store(EPROTO, std::memory_order_release);
+            return;
+          }
           flows_.fetch_add(1, std::memory_order_acq_rel);
-          const std::string response = "+LVFLOW 1 0 " + flow_mode_ + "\r\n";
+          std::string response = "+LVFLOW 1 0 " + flow_mode_ + "\r\n";
+          if (flow_mode_ == "CONTINUE") response += cursor_frame;
           const ssize_t sent = ::send(connection, response.data(),
                                       response.size(), MSG_NOSIGNAL);
           if (sent != static_cast<ssize_t>(response.size())) {
@@ -618,7 +661,25 @@ class FollowOwnerSource {
             sent_continue_.store(true, std::memory_order_release);
           }
           replied = true;
+          request.erase(0, parsed.consumed_);
+        } else if (!control && replied && flow_mode_ == "CONTINUE" &&
+                   request.size() >= cursor_ack.size()) {
+          if (!request.starts_with(cursor_ack)) {
+            error_.store(EPROTO, std::memory_order_release);
+            return;
+          }
+          cursor_acknowledged_.store(true, std::memory_order_release);
         }
+      }
+      if (control && replied && !online_sent &&
+          cursor_acknowledged_.load(std::memory_order_acquire)) {
+        constexpr std::string_view online = "+LVONLINE\r\n";
+        if (::send(connection, online.data(), online.size(), MSG_NOSIGNAL) !=
+            static_cast<ssize_t>(online.size())) {
+          error_.store(errno == 0 ? EIO : errno, std::memory_order_release);
+          return;
+        }
+        online_sent = true;
       }
       if (!control || replied || !export_ready_) continue;
       if (request.find("LVPARENT") != std::string::npos) {
@@ -672,6 +733,7 @@ class FollowOwnerSource {
   std::atomic<bool> saw_follow_scope_{false};
   std::atomic<bool> saw_resume_proof_{false};
   std::atomic<bool> sent_continue_{false};
+  std::atomic<bool> cursor_acknowledged_{false};
   std::atomic<int> error_{0};
 };
 
@@ -2367,14 +2429,17 @@ class FailoverActionReconcileService final : public bycorf::Service {
         const auto follow_deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while ((!continuation_source_->saw_resume_proof() ||
-                !continuation_source_->sent_continue()) &&
+                !continuation_source_->sent_continue() ||
+                replication_->CaptureServingGeneration() == 0) &&
                std::chrono::steady_clock::now() < follow_deadline) {
           absl::Status waited = co_await bycorf::SleepFor(
               *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
           if (!waited.ok()) co_return waited;
         }
+        const auto serving_generation =
+            replication_->CaptureServingGeneration();
         if (!continuation_source_->saw_resume_proof() ||
-            !continuation_source_->sent_continue()) {
+            !continuation_source_->sent_continue() || serving_generation == 0) {
           co_return TestFailure(
               "cancelled replica Candidate did not enter FollowOwner "
               "CONTINUE from its retained proof");
@@ -2397,6 +2462,54 @@ class FailoverActionReconcileService final : public bycorf::Service {
         reconciled =
             co_await replication_->ReconcileClusterFollowOwner(std::nullopt);
         if (!reconciled.ok()) co_return reconciled;
+        const auto disconnected = co_await CheckedPopulation(*replication_);
+        if (replication_->CaptureServingGeneration() != 0 ||
+            !disconnected.ready_token_.has_value()) {
+          co_return TestFailure(
+              "disconnected Cluster replica did not close admission while "
+              "retaining its complete population");
+        }
+
+        // Retire the population while its open bit is already clear, then
+        // install a new complete one. The token captured before disconnect
+        // must not become valid again when that replacement opens serving.
+        reconciled =
+            co_await replication_->ReconcileClusterPopulation(std::nullopt);
+        if (!reconciled.ok()) co_return reconciled;
+        const auto invalidated = co_await CheckedPopulation(*replication_);
+        if (invalidated.ready_token_.has_value()) {
+          co_return TestFailure("population invalidation retained Ready");
+        }
+        const auto local = co_await replication_->ObserveIdentity();
+        lavik::RebuildIdentity replacement_population{
+            .group_id_ = action.group_id_,
+            .assignment_id_ = action.candidate_assignment_id_,
+            .term_ = action.target_term_,
+            .directive_revision_ =
+                retained.ready_token_->identity().directive_revision_ + 1,
+            .authority_id_ = "replacement-authority",
+            .target_node_id_ = local.local_node_id_,
+            .target_boot_id_ = local.boot_id_,
+            .target_history_id_ = local.local_history_id_,
+            .operation_id_ = "replacement-initialization",
+            .directive_id_ = "replacement-initialization",
+            .attempt_id_ = "replacement-attempt",
+            .manifest_revision_ = action.manifest_revision_,
+            .manifest_id_ = action.manifest_id_,
+            .partition_replication_epoch_ = action.partition_replication_epoch_,
+        };
+        auto initialized =
+            co_await replication_->StartEmptyPopulationInitialization(
+                replacement_population, *manifest);
+        if (!initialized.ok()) co_return initialized.status();
+        const auto ready = co_await initialized->Await();
+        if (!ready.ok()) co_return ready;
+        if (replication_->CaptureServingGeneration() == 0 ||
+            replication_->ServingGenerationMatches(serving_generation)) {
+          co_return TestFailure(
+              "replacement revived the pre-disconnect serving token");
+        }
+        co_return absl::OkStatus();
       }
 
       // Before durability mutation, supersession is a local cancellation
@@ -5786,7 +5899,7 @@ TEST(ReplicationManagerIntegrationTest,
 }
 
 TEST(ReplicationManagerIntegrationTest,
-     CancelledReplicaCandidateCanResumeFollowOwnerContinuation) {
+     CancelledReplicaContinuationFencesReplacementAfterDisconnect) {
   RunFailoverActionDispositionCase(
       PreparedActionDisposition::kRemoveWhilePreparingThenResumeFollow,
       "cluster-failover-inflight-cancel-follow");
