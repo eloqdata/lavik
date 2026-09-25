@@ -10381,31 +10381,37 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
         stream, DataFrameKind::kPartitionHandoff, payload);
     if (!sent.ok()) co_return sent;
     session->TouchProgress(flow_id);
-    LAVIK_FAULT_INJECT(if (const char* configured =
-                               std::getenv("LAVIK_REPLICATION_PAUSE_FULLSYNC_"
-                                           "AFTER_HANDOFF_MS");
-                           configured != nullptr &&
-                           !replication_fullsync_handoff_pause_used_.exchange(
-                               true, std::memory_order_acq_rel)) {
-      while (ack_state->status_.ok() &&
-             !ack_state->handoffs_.acknowledged(partition_id)) {
-        co_await ack_state->changed_.Wait();
-      }
-      if (!ack_state->status_.ok()) co_return ack_state->status_;
-      std::uint64_t pause_ms = 0;
-      const std::size_t length = std::strlen(configured);
-      const auto parsed =
-          std::from_chars(configured, configured + length, pause_ms);
-      if (parsed.ec == std::errc{} && parsed.ptr == configured + length &&
-          pause_ms != 0) {
-        spdlog::info(
-            "paused full sync after acknowledged handoff partition {} for "
-            "{} ms",
-            partition_id, pause_ms);
-        sent = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                         std::chrono::milliseconds(pause_ms));
-      }
-    });
+    LAVIK_FAULT_INJECT(
+        if (const char* configured =
+                std::getenv("LAVIK_REPLICATION_PAUSE_FULLSYNC_"
+                            "AFTER_HANDOFF_MS");
+            configured != nullptr &&
+            (std::getenv("LAVIK_REPLICATION_FULLSYNC_PAUSE_ARM_FILE") ==
+                 nullptr ||
+             ::access(std::getenv("LAVIK_REPLICATION_FULLSYNC_PAUSE_ARM_FILE"),
+                      F_OK) == 0) &&
+            !replication_fullsync_handoff_pause_used_.exchange(
+                true, std::memory_order_acq_rel)) {
+          while (ack_state->status_.ok() &&
+                 !ack_state->handoffs_.acknowledged(partition_id)) {
+            co_await ack_state->changed_.Wait();
+          }
+          if (!ack_state->status_.ok()) co_return ack_state->status_;
+          std::uint64_t pause_ms = 0;
+          const std::size_t length = std::strlen(configured);
+          const auto parsed =
+              std::from_chars(configured, configured + length, pause_ms);
+          if (parsed.ec == std::errc{} && parsed.ptr == configured + length &&
+              pause_ms != 0) {
+            spdlog::info(
+                "paused full sync after acknowledged handoff partition {} for "
+                "{} ms",
+                partition_id, pause_ms);
+            sent =
+                co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                          std::chrono::milliseconds(pause_ms));
+          }
+        });
     co_return sent;
   };
 

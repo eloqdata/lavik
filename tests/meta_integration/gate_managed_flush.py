@@ -25,6 +25,7 @@ import gate_failover as F
 from gate_data_control import allocate_data_file
 from function_catalog_data import library, snapshot
 from gate_native_replication import C, H, Client, pair, ready, rejects
+from gate_population_recovery import wait_durable
 
 
 def semantics(root, mode):
@@ -173,14 +174,15 @@ def revoked(root, mode, command, boundary):
         finally:
             reader.close()
         # A clean checkpoint after rejection would persist polluted allocator
-        # values too. Restart verifies that pre-write refusal leaves them intact.
-        source.terminate()
-        source.start()
-        H.wait_until(
-            "restart preserves the committed outcome",
-            30,
-            lambda: F.redis_call(source, ["GET", "{flush}old"]) == expected,
-        )
+        # values too. Exercise this once per command/mode at the storage cut.
+        if boundary == "BEFORE_EPOCH":
+            source.terminate()
+            source.start()
+            H.wait_until(
+                "restart preserves the rejected outcome",
+                30,
+                lambda: F.redis_call(source, ["GET", "{flush}old"]) == expected,
+            )
 
 
 def storage_failure(root, command, kind, device):
@@ -202,8 +204,9 @@ def storage_failure(root, command, kind, device):
     ) as (meta, source, _, writer):
         ready(meta)
         assert writer.call("SET", "{flush}old", "old") == "OK"
-        # Persist ordinary writes before isolating the epoch-write failure.
+        # Keep the catalog alongside the keyspace through fault recovery.
         assert writer.call("FUNCTION", "LOAD", library("kept", "value")) == "kept"
+        wait_durable(source)
         failure.touch()
         try:
             rejects(
@@ -253,6 +256,7 @@ def crash_after_durable_epoch(root, command):
     ) as (meta, source, _, writer):
         ready(meta)
         assert writer.call("SET", "{flush}old", "old") == "OK"
+        wait_durable(source)
         hold.touch()
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             pending = pool.submit(writer.call, command)
@@ -495,10 +499,17 @@ def drain(root, command, revoke=False):
 
 
 def replication_recovery(root, full=False):
+    if full:
+        assert C.has_fault(C.DATA, b"LAVIK_REPLICATION_FULLSYNC_PAUSE_ARM_FILE"), (
+            "armed FULL hook required"
+        )
     name = "full-invalidation" if full else "partial-publication"
     failure = root / f"{name}.fail"
     faults = (
-        {"LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "3000"}
+        {
+            "LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "10000",
+            "LAVIK_REPLICATION_FULLSYNC_PAUSE_ARM_FILE": str(failure),
+        }
         if full
         else {"LAVIK_FLUSH_PUBLISH_FAIL_FILE": str(failure)}
     )
@@ -513,17 +524,21 @@ def replication_recovery(root, full=False):
         client_mode="single",
         source_faults=faults,
         seed=seed,
-        require_seed_before_full=full,
+        require_seed_before_full=False,
     ) as (meta, source, target, writer):
+        ready(meta)
         if full:
+            # Creation's explicit rebuild is a terminal control-plane task.
+            # Exercise reconnect FULL under ordinary Follow Owner instead.
+            failure.touch()
+            target.terminate()
+            target.start()
             H.wait_until(
                 "FULL handed off a partition before flush",
                 30,
                 lambda: "paused full sync after acknowledged handoff partition"
                 in Path(source.log_path).read_text(),
             )
-        else:
-            ready(meta)
         original_history = writer.call("INFO", "replication")
         before_full = Path(source.log_path).read_text().count("selected=FULL")
         if not full:
