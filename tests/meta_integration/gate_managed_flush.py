@@ -505,13 +505,17 @@ def replication_recovery(root, full=False):
         )
     name = "full-invalidation" if full else "partial-publication"
     failure = root / f"{name}.fail"
+    hold = root / f"{name}.hold"
     faults = (
         {
             "LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "10000",
             "LAVIK_REPLICATION_FULLSYNC_PAUSE_ARM_FILE": str(failure),
         }
         if full
-        else {"LAVIK_FLUSH_PUBLISH_FAIL_FILE": str(failure)}
+        else {
+            "LAVIK_FLUSH_PUBLISH_FAIL_FILE": str(failure),
+            "LAVIK_FLUSH_AFTER_FIRST_FLOW_HOLD_FILE": str(hold),
+        }
     )
 
     def seed(writer):
@@ -523,6 +527,7 @@ def replication_recovery(root, full=False):
         name,
         client_mode="single",
         source_faults=faults,
+        target_faults={"LAVIK_FLUSH_OBSERVE_PARTIAL_BARRIER": "1"},
         seed=seed,
         require_seed_before_full=False,
     ) as (meta, source, target, writer):
@@ -544,7 +549,25 @@ def replication_recovery(root, full=False):
         if not full:
             failure.touch()
         try:
-            assert writer.call("FLUSHALL") == "OK"
+            if full:
+                assert writer.call("FLUSHALL") == "OK"
+            else:
+                hold.touch()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(writer.call, "FLUSHALL")
+                    try:
+                        paused_at(source, "LAVIK_FLUSH_AFTER_FIRST_FLOW_HOLD_FILE")
+                        H.wait_until(
+                            "replica has an incomplete control barrier",
+                            15,
+                            lambda: "partial FLUSH barrier received:"
+                            in Path(target.log_path).read_text(),
+                        )
+                        assert F.redis_call(target, ["GET", "old-0"]) == "old"
+                        hold.unlink()
+                        assert pending.result(timeout=15) == "OK"
+                    finally:
+                        hold.unlink(missing_ok=True)
         finally:
             failure.unlink(missing_ok=True)
         for i in range(64):

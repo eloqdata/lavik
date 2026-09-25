@@ -20,6 +20,7 @@
 #include <optional>
 
 #include "impl.h"
+#include "lavik/fault_pause.h"
 #include "lavik/memory.h"
 #include "lavik/replication_command.h"
 
@@ -1283,6 +1284,11 @@ Task<absl::Status> StorageEngine::Impl::PublishFlushReplication(
       co_await publish();
     else
       co_await bycorf::SubmitTaskTo(target, std::move(publish));
+    LAVIK_FAULT_INJECT(if (target == 0) {
+      auto paused = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_FLUSH_AFTER_FIRST_FLOW_HOLD_FILE");
+      if (!paused.ok()) co_return paused;
+    });
   }
   co_return absl::OkStatus();
 }

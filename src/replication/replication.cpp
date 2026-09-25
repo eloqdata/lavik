@@ -8256,6 +8256,16 @@ auto ReplicationManager::ReplicationGroup::ApplyReplicaControl(
     }
   }
 
+  LAVIK_FAULT_INJECT(
+      if (!apply_here &&
+          std::getenv("LAVIK_FLUSH_OBSERVE_PARTIAL_BARRIER") != nullptr) {
+        // Let a process gate prove that cancellation crosses an actual
+        // incomplete receiver rendezvous, not merely a command queued on the
+        // source.
+        spdlog::info("partial FLUSH barrier received: barrier={} flow={}",
+                     barrier_id, flow_id);
+      });
+
   if (apply_here) {
     absl::Status status = absl::OkStatus();
     LAVIK_FAULT_INJECT(status =
