@@ -32,6 +32,19 @@ Callers share one Function operation guard with `FCALL`, catalog reads,
 catalog mutation, RDB installation, and promotion capture. Hidden staging is
 therefore never externally callable.
 
+The catalog is shared across logical databases and belongs to one local
+replicated dataset. Managed Single and Cluster authorize client catalog
+mutations through the node's member Group using the same admission and commit
+path. The authority gate resolves that Group from its captured ServingState;
+its representative slot carries the existing lease, token and drain proof.
+Catalog reads are local on complete readable replicas without READONLY;
+replica mutations return READONLY. Cluster Groups may contain different
+libraries: deployment to multiple primaries requires separate client commands
+and has no cross-Group atomicity. Catalog mutations inside managed MULTI remain
+unsupported until transaction publication carries their Group admission.
+Trusted replication and startup recovery retain their existing population/apply
+fences and never acquire client Owner authority.
+
 Each in-flight EVAL or FCALL owns the worker runtime that created its Lua
 thread. A catalog swap makes that runtime unavailable to new calls, but closes
 it only after its last suspended or running execution releases the thread.
@@ -59,6 +72,18 @@ complete target
   -> publish the original Redis Function command
   -> client reply
 ```
+
+Client mutations retain the common Group in-flight admission through the
+Function guard wait, hidden staging, durable root commit, runtime swap and
+replication publication. The captured authority is rechecked before staging
+and at the first root write, after device-owner dispatch and buffer admission.
+A rejected pre-root check discards the candidate and unpublished extents;
+the previous visible and durable catalog remains authoritative. After the
+first root write starts, the whole mirrored-root commit and reserved
+publication finish under the retained drain protection. Revocation cannot
+cancel one device's root independently or turn an already completed mutation
+into a retryable failure. Controlled Pause blocks new admissions and drains
+registered work under the same authority rules as keyspace mutations.
 
 `FUNCTION FLUSH ASYNC` has the same durable boundary as `SYNC`; ASYNC can only
 affect reclamation after the catalog is no longer visible. A storage failure

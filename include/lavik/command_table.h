@@ -26,7 +26,7 @@
 
 namespace lavik {
 
-// Static command metadata. One CommandSpec per supported command; the table is
+// Static command metadata. The canonical table and request-specific specs are
 // the single source of truth for write/read classification, DB-gate
 // participation, and key positions.
 enum CommandFlag : std::uint32_t {
@@ -80,6 +80,9 @@ struct CommandSpec {
 
 // Case-insensitive lookup; nullptr when the command is unknown.
 const CommandSpec* FindCommand(std::string_view name);
+// Resolve execution metadata for a concrete request. FUNCTION inspection and
+// run controls do not inherit the catalog mutation's write/publisher flags.
+const CommandSpec* FindCommand(std::span<const std::string> args);
 
 // Complete canonical command metadata, used by Redis-compatible COMMAND.
 std::span<const CommandSpec> CommandSpecs() noexcept;

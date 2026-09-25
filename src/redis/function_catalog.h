@@ -69,9 +69,13 @@ class FunctionCatalog {
   bycorf::Task<absl::StatusOr<StagedCatalog>> StageCompleteCatalog(
       std::vector<LuaFunctionLibrary> target);
   // Publishes only the durable dump/root. Runtime visibility is unchanged on
-  // failure, so the staged catalog remains abortable.
+  // failure, so the staged catalog remains abortable. Client mutations pass
+  // their Group precondition for the first root write; startup and trusted
+  // replication replay use their existing lifecycle fences instead.
   bycorf::Task<absl::StatusOr<storage::CatalogDurabilityToken>>
-  MakeStagedCatalogDurable(const StagedCatalog& staged);
+  MakeStagedCatalogDurable(
+      const StagedCatalog& staged,
+      storage::MutationPrecondition mutation_precondition = {});
   // Installs an already durable staged catalog with non-failing worker-local
   // runtime swaps, then replaces the process-global metadata.
   bycorf::Task<absl::Status> CommitStagedCatalog(

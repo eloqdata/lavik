@@ -24,6 +24,7 @@ import tempfile
 import time
 
 import gate_failover as F
+import function_catalog_data as FC
 import harness as H
 
 
@@ -71,10 +72,16 @@ def run(root, meta, data, ctl, mode, case):
     large = case == "coverage-gap"
 
     def values(node):
-        return [
+        result = [
             F.readonly_get(node, key, db=databases[key]).split(":", 1)[0]
             for key in keys
         ]
+        if not large:
+            # Flow zero carries actual catalog replacements. Candidate must
+            # recover the missing definitions from its donor before promotion.
+            code = FC.library_code(node, "recovery_catalog")
+            result[0] = re.search(r"return '(\d+)' end", code)[1]
+        return result
 
     dead_data = {F.OWNER}
     dead_meta = set()
@@ -102,6 +109,20 @@ def run(root, meta, data, ctl, mode, case):
             fixture.seed_and_wait_for_replicas(
                 key, "0", (F.CANDIDATE, F.FOLLOWER, F.SECOND_DONOR), db=databases[key]
             )
+        if not large:
+            assert (
+                F.redis_call(
+                    source, ["FUNCTION", "LOAD", FC.library("recovery_catalog", "0")]
+                )
+                == "recovery_catalog"
+            )
+            for node in (candidate, donor1, donor2):
+                H.wait_until(
+                    "baseline catalog replicated",
+                    20,
+                    lambda node=node: FC.library_code(node, "recovery_catalog")
+                    == FC.library("recovery_catalog", "0"),
+                )
         baseline = [
             source.metric("lavik_replication_backlog_tail_lsn", f'{{worker="{flow}"}}')
             + 1
@@ -122,7 +143,20 @@ def run(root, meta, data, ctl, mode, case):
         staged.replace(cut_file)
         for i in range(5):
             for key in keys:
-                if large:
+                if key == keys[0] and not large:
+                    assert (
+                        F.redis_call(
+                            source,
+                            [
+                                "FUNCTION",
+                                "LOAD",
+                                "REPLACE",
+                                FC.library("recovery_catalog", str(i + 1)),
+                            ],
+                        )
+                        == "recovery_catalog"
+                    )
+                elif large:
                     # Each complete event fits a replica's 8 MiB flow log, but
                     # two canonical effects exceed one retained-history block.
                     # The fifth real apply therefore evicts the missing fourth.
@@ -285,12 +319,35 @@ def run(root, meta, data, ctl, mode, case):
                 )
         for key in keys:
             assert F.redis_call(promoted, ["SET", key, "6"], db=databases[key]) == "OK"
+        if not large:
+            assert (
+                F.redis_call(
+                    promoted,
+                    [
+                        "FUNCTION",
+                        "LOAD",
+                        "REPLACE",
+                        FC.library("recovery_catalog", "6"),
+                    ],
+                )
+                == "recovery_catalog"
+            )
+            # The shared fixture compares the complete catalog on every member.
+            fixture.function_catalog = FC.node_snapshot(promoted)
         for node in alive:
             H.wait_until(
                 "post-promotion replay",
                 30,
                 lambda node=node: values(node) == ["6", "6"],
             )
+        if not large:
+            for node in alive:
+                H.wait_until(
+                    "complete recovered catalog matches",
+                    30,
+                    lambda node=node: FC.node_snapshot(node)
+                    == fixture.function_catalog,
+                )
         fixture.require_expected_processes_alive(
             dead_data_ids=dead_data, dead_meta_ids=dead_meta
         )

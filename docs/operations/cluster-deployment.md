@@ -26,15 +26,27 @@ be changed after creation.
 Managed Single has exactly one Group covering every slot and all 16 logical
 databases. It serves single-key commands, collections, TTL, PUBLISH, cross-slot
 multi-key commands, cross-database COPY, List/Sorted Set blocking commands,
-and DBSIZE/SCAN/RANDOMKEY/KEYS through shared Group authority.
+DBSIZE/SCAN/RANDOMKEY/KEYS, and FUNCTION LOAD/DELETE/FLUSH/RESTORE through
+shared Group authority. Function libraries are shared across DB0–15;
+FUNCTION DUMP/LIST work on the Owner and complete readable replicas.
 Complete replicas accept ordinary read connections without READONLY. Configure
 `replica-serve-stale-data yes|no` in the file or through CONFIG GET/SET; the default
 `yes` permits complete stale data during disconnection. `no` returns MASTERDOWN
 for data requests while the replication link is down. Initial FULL and invalid
 populations return LOADING in either setting; replicas always reject mutations.
-Transactions, scripts, Stream blocking, WAIT and global durable data/catalog
-mutations remain explicitly unsupported in managed Single. Cluster retains
+Transactions, scripts/FCALL, Stream blocking, WAIT and FLUSHDB/FLUSHALL
+remain explicitly unsupported in managed Single. An uncertain Function
+catalog root commit or failure to publish an already durable mutation fences
+the Data process and closes the initiating connection; restart recovery is
+required and a blind retry cannot determine the prior outcome. Cluster retains
 DB0, CROSSSLOT, its COPY DB restriction and its READONLY contract.
+
+In Cluster mode, FUNCTION LOAD/DELETE/FLUSH/RESTORE update the receiving
+primary's catalog and replicate to its own replicas. Other Groups keep their
+own libraries; use separate commands against each primary to deploy across
+the cluster, without an atomic cross-Group update. FUNCTION DUMP/LIST inspect
+the local catalog on a primary or complete readable replica without READONLY.
+Catalog mutations inside managed MULTI remain unsupported.
 
 On an authorized Single Owner, a connection can select a database and copy into
 another database without changing its own selection:

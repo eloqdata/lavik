@@ -468,26 +468,27 @@ def run_plaintext(meta_binary, data_binary, workdir):
         data.start()
         assert_authority_challenge_denied(data, leader)
         assert_keyed_write_fenced(data, "unready assignment")
-        # Meta mode has only finite group authority. Process-wide mutations
-        # have no group proof and remain rejected, while FUNCTION KILL/STATS
-        # must bypass both loading fences so a running function cannot
-        # deadlock a replacement population waiting for it to drain.
-        for command in (
-            ["FLUSHDB"],
-            ["FLUSHALL"],
-            ["FUNCTION", "LOAD", "invalid"],
-            ["FUNCTION", "DELETE", "missing"],
-            ["FUNCTION", "FLUSH"],
-            ["FUNCTION", "RESTORE", "invalid"],
-        ):
-            expected = (
-                f"-ERR {' '.join(command[:2])} is not allowed in Meta-managed mode"
-            )
+        # Global keyspace clearing remains unsupported. Catalog commands use
+        # the local Group and must respect this unready assignment, while
+        # KILL/STATS bypass loading so run control cannot deadlock population.
+        for command in (["FLUSHDB"], ["FLUSHALL"]):
+            expected = f"-ERR {command[0]} is not allowed in Meta-managed mode"
             actual = data.command_head(command)
             if actual != expected:
                 raise H.Failure(
                     f"finite-authority global mutation gate: {actual}, want {expected}"
                 )
+        for command in (
+            ["FUNCTION", "LOAD", "invalid"],
+            ["FUNCTION", "DELETE", "missing"],
+            ["FUNCTION", "FLUSH"],
+            ["FUNCTION", "RESTORE", "invalid"],
+            ["FUNCTION", "DUMP"],
+            ["FUNCTION", "LIST"],
+        ):
+            actual = data.command_head(command)
+            if not actual.startswith(("-LOADING", "-CLUSTERDOWN")):
+                raise H.Failure(f"unready catalog access was not fenced: {actual}")
         stats = data.command_head(["FUNCTION", "STATS"])
         if stats.startswith("-LOADING"):
             raise H.Failure("FUNCTION STATS was hidden by a loading gate")

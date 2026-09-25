@@ -38,6 +38,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness as H  # noqa: E402
 from gate_data_control import DataProcess  # noqa: E402
+import function_catalog_data as FC
 import single_database_data as D  # noqa: E402
 
 
@@ -931,6 +932,7 @@ class FailoverFixture:
         self.client_mode = client_mode or CLIENT_MODE
         self.ctl = ctl
         self.database_deadline = None
+        self.function_catalog = None
         self.scenario = scenario
         os.makedirs(scenario, mode=0o700)
         # AF_UNIX paths cap at roughly 108 bytes. Keep the fixed suffix short
@@ -1231,13 +1233,24 @@ class FailoverFixture:
     def seed_and_wait_for_replicas(self, key, value, replica_ids, db=0):
         if self.client_mode == "single" and self.database_deadline is None:
             self.database_deadline = D.seed_node(self.by_id[OWNER])
+            client = FC.Client(self.by_id[OWNER])
+            try:
+                assert (
+                    client.call("FUNCTION", "LOAD", FC.library("ha_catalog", "kept"))
+                    == "ha_catalog"
+                )
+                self.function_catalog = FC.snapshot(client)
+            finally:
+                client.close()
             for replica_id in replica_ids:
                 H.wait_until(
                     "multi-DB fixture replicated before failover",
                     30,
                     lambda replica_id=replica_id: D.node_matches(
                         self.by_id[replica_id], self.database_deadline
-                    ),
+                    )
+                    and FC.node_snapshot(self.by_id[replica_id])
+                    == self.function_catalog,
                 )
         if redis_call(self.by_id[OWNER], ["SET", key, value], db=db) != "OK":
             raise H.Failure("old Owner rejected the initial write")
@@ -1261,6 +1274,11 @@ class FailoverFixture:
                     "Single databases survive failover and reparent",
                     30,
                     lambda data=data: D.node_matches(data, self.database_deadline),
+                )
+                H.wait_until(
+                    "Function catalog survives failover and reparent",
+                    30,
+                    lambda data=data: FC.node_snapshot(data) == self.function_catalog,
                 )
 
     def submit_failover(self):

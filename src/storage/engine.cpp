@@ -54,8 +54,9 @@ bool StorageEngine::AbandonWorkerStateForProcessExit() noexcept {
 }
 
 Task<absl::StatusOr<CatalogDurabilityToken>>
-StorageEngine::CommitFunctionCatalog(std::string_view dump) {
-  return impl_->CommitFunctionCatalog(dump);
+StorageEngine::CommitFunctionCatalog(
+    std::string_view dump, MutationPrecondition mutation_precondition) {
+  return impl_->CommitFunctionCatalog(dump, std::move(mutation_precondition));
 }
 
 absl::StatusOr<std::optional<RecoveredFunctionCatalog>>

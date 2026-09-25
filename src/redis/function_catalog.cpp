@@ -170,12 +170,15 @@ FunctionCatalog::StageCompleteCatalog(std::vector<LuaFunctionLibrary> target) {
 }
 
 bycorf::Task<absl::StatusOr<storage::CatalogDurabilityToken>>
-FunctionCatalog::MakeStagedCatalogDurable(const StagedCatalog& staged) {
+FunctionCatalog::MakeStagedCatalogDurable(
+    const StagedCatalog& staged,
+    storage::MutationPrecondition mutation_precondition) {
   if (!staged.active_) {
     co_return absl::FailedPreconditionError(
         "Function catalog staging is inactive");
   }
-  co_return co_await storage_->CommitFunctionCatalog(staged.dump_);
+  co_return co_await storage_->CommitFunctionCatalog(
+      staged.dump_, std::move(mutation_precondition));
 }
 
 bycorf::Task<absl::Status> FunctionCatalog::CommitStagedCatalog(

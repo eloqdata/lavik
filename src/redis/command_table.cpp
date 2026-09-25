@@ -441,6 +441,26 @@ const CommandSpec* FindCommand(std::string_view name) {
   return nullptr;
 }
 
+const CommandSpec* FindCommand(std::span<const std::string> args) {
+  if (args.empty()) return nullptr;
+  const CommandSpec* spec = FindCommand(std::string_view(args.front()));
+  if (spec == nullptr || spec->kind_ != CommandKind::kFunction ||
+      args.size() < 2) {
+    return spec;
+  }
+  for (std::string_view read : {"dump", "list", "help", "kill", "stats"}) {
+    if (EqualsIgnoreCase(args[1], read)) {
+      static constexpr CommandSpec inspection{
+          "function", CommandKind::kFunction,
+          2,          0,
+          0,          0,
+          1,          kCmdReadOnly | kCmdUsesDbGate | kCmdNoKeys};
+      return &inspection;
+    }
+  }
+  return spec;
+}
+
 std::span<const CommandSpec> CommandSpecs() noexcept { return kCommandTable; }
 
 std::string_view CommandCanonicalName(CommandKind kind) noexcept {

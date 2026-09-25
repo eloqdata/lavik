@@ -46,7 +46,7 @@ class Client:
         if readonly:
             assert self.call("READONLY") == "OK"
 
-    def call(self, *args):
+    def call(self, *args, decode=True):
         values = [arg if isinstance(arg, bytes) else str(arg).encode() for arg in args]
         self.socket.sendall(
             f"*{len(values)}\r\n".encode()
@@ -54,7 +54,7 @@ class Client:
                 f"${len(value)}\r\n".encode() + value + b"\r\n" for value in values
             )
         )
-        return C.read_resp(self.reader)
+        return C.read_resp(self.reader, decode=decode)
 
     def close(self):
         self.reader.close()
@@ -74,6 +74,7 @@ def pair(
     require_seed_before_full=False,
     client_mode=None,
     prepare_target=None,
+    source_extra_args=(),
 ):
     client_mode = client_mode or CLIENT_MODE
     directory = root / name
@@ -93,6 +94,7 @@ def pair(
         proxy.endpoint,
         workers=source_workers,
         environment={**os.environ, **(source_faults or {})},
+        extra_args=source_extra_args,
     )
     target = DataProcess(
         C.DATA,
