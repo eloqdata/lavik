@@ -16,6 +16,11 @@ limitations under the License.
 
 # Building and packaging
 
+The [release Docker images](../../deploy/docker/README.md) package the published
+`v0.1.0-beta.1` binaries for Linux AMD64 and ARM64. The Dockerfile has standalone
+and cluster targets, with a release-specific primary/follower Compose example
+and a local verification script.
+
 The optional [Lavik Admin service](lavik-admin.md) has a separate Docker
 package containing Node.js, its browser assets, and `lavik-ctl`. It connects
 to existing Meta and Data deployments; its container does not run io_uring.

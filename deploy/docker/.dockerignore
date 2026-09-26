@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!release.sha256
+!fetch-release.sh
+!docker-entrypoint.sh
+!bootstrap-cluster.py
