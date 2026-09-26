@@ -71,7 +71,9 @@ def inspect_database(client):
 
 
 def basic_and_stale(root):
-    with pair(root, "single-read", client_mode="single") as (
+    with pair(
+        root, "single-read", client_mode="single", raft_args=C.creation_raft_args()
+    ) as (
         meta,
         source,
         target,

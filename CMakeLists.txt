@@ -1074,7 +1074,7 @@ if (BUILD_TESTING)
                 $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
       )
       set_tests_properties(meta_integration.gate_native_replication PROPERTIES
-        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+        LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
 
       add_test(
         NAME meta_integration.gate_bootstrap
@@ -1091,7 +1091,7 @@ if (BUILD_TESTING)
                 $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
       )
       set_tests_properties(meta_integration.gate_managed_single PROPERTIES
-        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+        LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
 
       add_test(
         NAME meta_integration.gate_managed_single_blocking
@@ -1110,7 +1110,7 @@ if (BUILD_TESTING)
                 $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
                 $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI})
       set_tests_properties(meta_integration.gate_function_catalog PROPERTIES
-        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+        LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
 
       add_test(
         NAME meta_integration.gate_managed_flush

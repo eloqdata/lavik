@@ -79,11 +79,20 @@ def pair(
     client_mode = client_mode or CLIENT_MODE
     directory = root / name
     directory.mkdir()
+    if raft_args is None:
+        # Meta caps grants at the Raft election lower bound. The 500 ms
+        # cluster-create fixture can legitimately expire a healthy Owner's
+        # lease during slow FULL or hosted-runner scheduling, which now retires
+        # every persistent test client. Keep these unrelated replication
+        # checks on a two-second bound; expiry gates supply short args.
+        raft_args = H.raft_args(
+            snapshot_distance=100_000, election_ms_low=2000, election_ms_high=4000
+        )
     meta = H.Node(
         C.META,
         str(directory),
         1,
-        args=C.creation_raft_args() if raft_args is None else raft_args,
+        args=raft_args,
     )
     proxy = C.DirectiveBarrier(meta.data_control_port, recipients=(C.REPLICA_1,))
     meta.advertised_data_control_endpoint = proxy.endpoint
