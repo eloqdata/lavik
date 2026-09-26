@@ -15,7 +15,11 @@
  */
 
 #include <algorithm>
+#include <coroutine>
+#include <exception>
 #include <limits>
+#include <utility>
+#include <vector>
 
 #include "impl.h"
 
@@ -27,6 +31,101 @@ std::int64_t MonotonicMillis() noexcept {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+// Promotion only mutates the source owner's store. Each submitted task returns
+// to the coordinator before completing this join, so the borrowed generation
+// snapshot and commit-decision map remain alive even when one owner fails.
+struct CleanerOwnerJoin {
+  std::size_t pending_ = 0;
+  std::coroutine_handle<> waiter_{};
+  absl::Status error_;
+  std::exception_ptr exception_;
+
+  void Complete(absl::Status status) {
+    if (!status.ok() && error_.ok()) error_ = std::move(status);
+    Arrive();
+  }
+
+  void CompleteException(std::exception_ptr error) {
+    if (!exception_) exception_ = std::move(error);
+    Arrive();
+  }
+
+  void Arrive() {
+    assert(pending_ != 0);
+    if (--pending_ == 0 && waiter_) {
+      const auto waiter = std::exchange(waiter_, {});
+      bycorf::ThisWorker().self_->Enqueue(waiter);
+    }
+  }
+
+  auto Join() {
+    struct Awaiter {
+      CleanerOwnerJoin* join_;
+      bool await_ready() const noexcept { return join_->pending_ == 0; }
+      void await_suspend(std::coroutine_handle<> waiter) const noexcept {
+        join_->waiter_ = waiter;
+      }
+      void await_resume() const noexcept {}
+    };
+    return Awaiter{this};
+  }
+};
+
+template <typename Step>
+Task<absl::Status> RunCleanerOwnerStep(unsigned owner, Step step,
+                                       CleanerOwnerJoin* join) {
+  absl::Status status;
+  try {
+    if (owner == bycorf::ThisWorker().id_) {
+      status = co_await step();
+    } else {
+      status = co_await bycorf::SubmitTaskTo(owner, std::move(step));
+    }
+  } catch (...) {
+    // A detached task must still settle the join before the coordinator can
+    // release the generation snapshot borrowed by all other owners.
+    join->CompleteException(std::current_exception());
+    co_return absl::OkStatus();
+  }
+  join->Complete(std::move(status));
+  co_return absl::OkStatus();
+}
+
+template <typename StepAt>
+Task<absl::Status> ForEachCleanerOwner(unsigned count, bool parallel,
+                                       StepAt step_at) {
+  if (count == 0) co_return absl::OkStatus();
+  if (!parallel || count == 1) {
+    // Shutdown's checkpoint drain runs while workers are stopping. It must
+    // use awaited tasks because Spawn may discard new detached work then.
+    for (unsigned index = 0; index < count; ++index) {
+      auto [owner, step] = step_at(index);
+      absl::Status status;
+      if (owner == bycorf::ThisWorker().id_) {
+        status = co_await step();
+      } else {
+        status = co_await bycorf::SubmitTaskTo(owner, std::move(step));
+      }
+      if (!status.ok()) co_return status;
+    }
+    co_return absl::OkStatus();
+  }
+  CleanerOwnerJoin join;
+  std::vector<Task<absl::Status>> tasks;
+  tasks.reserve(count);
+  // Construct every coroutine before the first launch. A frame-allocation
+  // failure must not leave already-running owners borrowing a dead join.
+  for (unsigned index = 0; index < count; ++index) {
+    auto [owner, step] = step_at(index);
+    tasks.push_back(RunCleanerOwnerStep(owner, std::move(step), &join));
+  }
+  join.pending_ = count;
+  for (auto& task : tasks) bycorf::ThisWorker().self_->Spawn(std::move(task));
+  co_await join.Join();
+  if (join.exception_) std::rethrow_exception(join.exception_);
+  co_return std::move(join.error_);
 }
 
 }  // namespace
@@ -820,36 +919,46 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
       for (const TxGenerationBlock& block : state.blocks_)
         for (std::uint64_t txid : block.txids_) ++tx_block_count[txid];
 
+    // Commit fences are checked before each owner's promotion. Owners may
+    // relocate concurrently because they have disjoint source streams and
+    // worker-local index state. Keep retirement below this join: a decision
+    // block cannot disappear while another owner's promoted copy is pending.
+    const absl::Status promoted = co_await ForEachCleanerOwner(
+        worker_count_, !shutdown_drain, [&](unsigned owner) {
+          return std::pair{
+              owner,
+              [this, owner, generation, committed, shutdown_drain,
+               &owner_states, &commit_fences]() -> Task<absl::Status> {
+                for (const TxGenerationBlock& block :
+                     owner_states[owner].blocks_) {
+                  if (!block.sealed_and_durable_ || block.active_transaction_)
+                    continue;
+                  for (std::uint64_t txid : block.txids_) {
+                    if (!committed->contains(txid)) continue;
+                    if (const auto fence = commit_fences.find(txid);
+                        fence != commit_fences.end()) {
+                      for (const RelocationDurabilityFence& decision :
+                           fence->second) {
+                        const absl::Status durable =
+                            co_await AwaitRelocationDurable(decision);
+                        if (!durable.ok()) co_return durable;
+                      }
+                    }
+                    // Recovered commit records have no runtime fence: their
+                    // recovery scan already validated the durable record.
+                  }
+                  const absl::Status result = co_await PromoteTxGenerationLocal(
+                      *stores_[owner], generation, committed, shutdown_drain,
+                      block.block_id_);
+                  if (!result.ok()) co_return result;
+                }
+                co_return absl::OkStatus();
+              }};
+        });
+    if (!promoted.ok()) co_return promoted;
     for (unsigned owner = 0; owner < worker_count_; ++owner) {
       for (const TxGenerationBlock& block : owner_states[owner].blocks_) {
         if (!block.sealed_and_durable_ || block.active_transaction_) continue;
-        for (std::uint64_t txid : block.txids_) {
-          if (!committed->contains(txid)) continue;  // Definitely aborted.
-          if (const auto fence = commit_fences.find(txid);
-              fence != commit_fences.end()) {
-            for (const RelocationDurabilityFence& decision : fence->second) {
-              absl::Status durable = co_await AwaitRelocationDurable(decision);
-              if (!durable.ok()) co_return durable;
-            }
-          }
-          // Recovered commit records have no runtime fence: their recovery
-          // scan already validated the durable record.
-        }
-        absl::Status promoted;
-        if (owner == coordinator) {
-          promoted = co_await PromoteTxGenerationLocal(
-              *stores_[owner], generation, committed, shutdown_drain,
-              block.block_id_);
-        } else {
-          promoted = co_await bycorf::SubmitTaskTo(
-              owner, [this, owner, generation, committed, shutdown_drain,
-                      block_id = block.block_id_]() {
-                return PromoteTxGenerationLocal(*stores_[owner], generation,
-                                                committed, shutdown_drain,
-                                                block_id);
-              });
-        }
-        if (!promoted.ok()) co_return promoted;
         bool has_decision_dependencies = false;
         for (std::uint64_t txid : block.commit_txids_)
           has_decision_dependencies |= tx_block_count[txid] > 1;
@@ -913,21 +1022,17 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
     auto frozen_committed =
         std::shared_ptr<const absl::flat_hash_set<std::uint64_t>>(
             std::move(committed));
-    for (unsigned owner = 0; owner < worker_count_; ++owner) {
-      absl::Status promoted;
-      if (owner == coordinator) {
-        promoted = co_await PromoteTxGenerationLocal(
-            *stores_[owner], generation, frozen_committed, shutdown_drain);
-      } else {
-        promoted = co_await bycorf::SubmitTaskTo(
-            owner,
-            [this, owner, generation, frozen_committed, shutdown_drain]() {
-              return PromoteTxGenerationLocal(*stores_[owner], generation,
-                                              frozen_committed, shutdown_drain);
-            });
-      }
-      if (!promoted.ok()) co_return promoted;
-    }
+    const absl::Status generation_promoted = co_await ForEachCleanerOwner(
+        worker_count_, !shutdown_drain, [&](unsigned owner) {
+          return std::pair{owner,
+                           [this, owner, generation, frozen_committed,
+                            shutdown_drain]() -> Task<absl::Status> {
+                             co_return co_await PromoteTxGenerationLocal(
+                                 *stores_[owner], generation, frozen_committed,
+                                 shutdown_drain);
+                           }};
+        });
+    if (!generation_promoted.ok()) co_return generation_promoted;
 
     readiness.active_transactions_ = 0;
     readiness.live_tagged_bytes_ = 0;
