@@ -83,7 +83,11 @@ def stream_revoke(root, mode, partial, empty=False, noack=False):
                     try:
                         result = pending.result(timeout=15)
                     except H.Failure as error:
-                        assert ("closed" if partial else refusal) in str(error), error
+                        # Lease loss retires the old connection, so a request
+                        # that has not yet committed may see either refusal
+                        # or connection close.
+                        expected = ("closed",) if partial else ("closed", refusal)
+                        assert any(token in str(error) for token in expected), error
                     else:
                         raise AssertionError(
                             f"revoked Stream attempt succeeded: {result!r}"
@@ -149,12 +153,18 @@ def catalog_revoke(root, mode, mixed, boundary):
                 refusal = expire(meta, source, mode)
                 hold.unlink()
                 if not mixed and boundary == "AFTER_ROOT_WRITE":
-                    assert pending.result(timeout=15) == ["committed"]
+                    try:
+                        assert pending.result(timeout=15) == ["committed"]
+                    except H.Failure as error:
+                        # The durable catalog result may lose its reply when
+                        # the lease-expiry sweep retires this connection.
+                        assert "closed" in str(error), error
                 else:
                     try:
                         result = pending.result(timeout=15)
                     except H.Failure as error:
-                        assert ("closed" if mixed else refusal) in str(error), error
+                        expected = ("closed",) if mixed else ("closed", refusal)
+                        assert any(token in str(error) for token in expected), error
                     else:
                         raise AssertionError(f"revoked EXEC succeeded: {result!r}")
             finally:
@@ -469,7 +479,13 @@ def stream_cutover(root):
                 except H.Failure as error:
                     assert any(
                         token in str(error)
-                        for token in ("TRYAGAIN", "MASTERDOWN", "READONLY", "LOADING")
+                        for token in (
+                            "TRYAGAIN",
+                            "MASTERDOWN",
+                            "READONLY",
+                            "LOADING",
+                            "closed",
+                        )
                     ), error
                 else:
                     raise AssertionError(f"old population waiter returned {result!r}")

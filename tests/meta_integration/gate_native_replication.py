@@ -926,17 +926,23 @@ def post_cut_reset_reconnect(root):
         # initial cursor. Assert the original contract: recovery preserves data
         # and resumes replication, without requiring a particular handshake.
         ready(meta)
+
+        def readable():
+            # Population replacement retires existing clients. Probe with a
+            # fresh connection until both transport and data path are ready.
+            probe = Client(target, readonly=True)
+            try:
+                return (
+                    "lavik_replication_state:online"
+                    in probe.call("INFO", "replication")
+                    and probe.call("GET", "{native}seed") == "baseline"
+                )
+            finally:
+                probe.close()
+
+        H.wait_until("post-cut reconnect serves preserved data", 30, readable)
         reader = Client(target, readonly=True)
         try:
-            # Transport ONLINE can precede the new population's serving
-            # projection; wait for the actual read path as well.
-            H.wait_until(
-                "post-cut reconnect serves preserved data",
-                30,
-                lambda: "lavik_replication_state:online"
-                in reader.call("INFO", "replication")
-                and reader.call("GET", "{native}seed") == "baseline",
-            )
             assert writer.call("INCR", "post-cut-counter") == 1
             assert writer.call("WAIT", 1, 5000) == 1
             assert reader.call("GET", "post-cut-counter") == "1"
