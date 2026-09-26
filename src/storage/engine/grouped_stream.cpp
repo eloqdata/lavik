@@ -99,8 +99,7 @@ struct StorageEngine::Impl::StreamPageAccess {
       const auto* physical = object_->FindGroup(id);
       if (!physical) co_return absl::DataLossError("missing Stream page");
       GroupedScratchBudget budget;
-      auto added = budget.AddGroup(physical->value_, object_->ExtentsFor(id),
-                                   key_.size());
+      auto added = budget.AddGroup(physical->value_, object_->ExtentsFor(id));
       if (!added.ok()) co_return added;
       auto admitted = budget.Reserve(6);
       if (!admitted.ok()) co_return admitted.status();
@@ -1704,8 +1703,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
         if (!physical)
           co_return absl::DataLossError("missing Stream probe page");
         GroupedScratchBudget budget;
-        auto added = budget.AddGroup(physical->value_, object->ExtentsFor(id),
-                                     key.size());
+        auto added = budget.AddGroup(physical->value_, object->ExtentsFor(id));
         if (!added.ok()) co_return added;
         auto admitted = budget.Reserve(2);
         if (!admitted.ok()) co_return admitted.status();
@@ -1753,8 +1751,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
         if (!physical)
           co_return absl::DataLossError("missing Stream range page");
         GroupedScratchBudget budget;
-        auto added = budget.AddGroup(physical->value_, object->ExtentsFor(id),
-                                     key.size());
+        auto added = budget.AddGroup(physical->value_, object->ExtentsFor(id));
         if (!added.ok()) co_return added;
         // Retained selected entries and the callback's decode/reply copies must
         // stay admitted after this page's temporary decoder has been destroyed.

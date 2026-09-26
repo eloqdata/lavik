@@ -273,6 +273,12 @@ Task<absl::Status> StorageEngine::Impl::CleanIndirectKeys(WorkerStore* store) {
   if (store->active_indirect_key_block_) {
     auto* state =
         FindBlockState(*store, store->active_indirect_key_block_->block_id_);
+    if (state == nullptr) {
+      // An active stream must retain its allocated, owner-local block state.
+      LatchRuntimeFailure(*store);
+      co_return absl::InternalError(
+          "active indirect key block state is missing");
+    }
     const auto used = state->committed_bytes_ - kBlockHeaderBytes;
     if (used != 0 &&
         std::uint64_t{state->live_bytes_} * 1000 < std::uint64_t{used} * 501) {

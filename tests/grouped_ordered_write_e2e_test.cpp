@@ -243,6 +243,8 @@ TEST(IndirectKeyE2e, BoundarySharedSegmentsAndExtentRecoverAcrossWorkers) {
     EXPECT_EQ(client.Command({"GET", inline_key}).text_, "inline");
     EXPECT_EQ(client.Command({"GET", shared_key}).text_, value);
     EXPECT_EQ(client.Command({"GET", extent_key}).text_, extent_value);
+    EXPECT_NE(server.Log().find("(100.0%) swept="), std::string::npos)
+        << server.Log();
     ASSERT_EQ(client.Command({"SETRANGE", shared_key, "8191", "XY"}).text_,
               std::to_string(value.size()));
     ASSERT_EQ(client.Command({"DEL", extent_key}).text_, "1");
@@ -258,6 +260,32 @@ TEST(IndirectKeyE2e, BoundarySharedSegmentsAndExtentRecoverAcrossWorkers) {
   EXPECT_EQ(client.Command({"GET", extent_key}).text_, "again");
   EXPECT_EQ(client.Command({"GET", shared_key}).kind_, '$');
   EXPECT_EQ(client.Command({"EXISTS", shared_key}).text_, "0");
+}
+
+TEST(IndirectKeyE2e, KeyLargerThanExternalGroupReadsAndMutates) {
+  PrivateDisk disk;
+  // Key extents are independent of the smaller, indivisible Hash value.
+  // Page admission must budget the complete value without subtracting the key.
+  const std::string key(10 * 1024 * 1024, 'k');
+  const std::string value(9 * 1024 * 1024, 'v');
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"HSET", key, "field", value}).text_, "1");
+    const auto read = client.Command({"HGET", key, "field"});
+    ASSERT_EQ(read.kind_, '$') << read.text_;
+    EXPECT_EQ(read.text_, value);
+    ASSERT_EQ(client.Command({"HSET", key, "another", "small"}).text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  const auto read = client.Command({"HGET", key, "field"});
+  ASSERT_EQ(read.kind_, '$') << read.text_;
+  EXPECT_EQ(read.text_, value);
+  ASSERT_EQ(client.Command({"HDEL", key, "field"}).text_, "1");
+  EXPECT_EQ(client.Command({"HGET", key, "another"}).text_, "small");
 }
 
 TEST(IndirectKeyE2e, CollectionsTransactionsAndExpiryKeepOriginalNames) {
@@ -346,7 +374,7 @@ TEST(IndirectKeyE2e, DedicatedCleanerRelocatesLiveUuidAfterFlushDb) {
   bool relocated = false;
   for (const auto& [id, metadata] : layout.keys_) {
     if (metadata.first == survivor.size())
-      relocated = layout.copies_.at(id) >= 2;
+      relocated = relocated || layout.copies_.at(id) >= 2;
   }
   EXPECT_TRUE(relocated);
   Server recovered(disk, 3);

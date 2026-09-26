@@ -279,12 +279,12 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
           const auto* entry = grouped->FindGroup(id);
           if (!entry)
             co_return absl::DataLossError("missing Sorted Set callback page");
-          auto admitted = budget.AddGroup(entry->value_,
-                                          grouped->ExtentsFor(id), key.size());
+          auto admitted =
+              budget.AddGroup(entry->value_, grouped->ExtentsFor(id));
           if (!admitted.ok()) co_return admitted;
         }
       } else {
-        auto admitted = budget.AddGroup(found->value_, extents, key.size());
+        auto admitted = budget.AddGroup(found->value_, extents);
         if (!admitted.ok()) co_return admitted;
       }
       // The loader's scratch ends when it returns the encoded read buffer.

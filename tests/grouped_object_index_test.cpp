@@ -44,12 +44,12 @@ absl::StatusOr<HashGroupDirectory> Apply(
 
 RecordLocation GroupLocation(std::uint64_t block, std::uint64_t seq,
                              std::uint32_t count, bool grouped = false,
-                             bool external = false) {
+                             bool external = false, bool key_indirect = false) {
   return RecordLocation(
       block, seq, 17, 0, count,
       RecordLocation::PackedMetadata::Encode(
-          kBlockHeaderBytes, 256, 0, true, external, false, false, false, false,
-          RecordKind::kValue, ValueType::kHash, false, grouped));
+          kBlockHeaderBytes, 256, 0, true, external, key_indirect, false, false,
+          false, RecordKind::kValue, ValueType::kHash, false, grouped));
 }
 
 struct ObjectInput {
@@ -151,14 +151,14 @@ TEST(GroupedScratchBudgetTest, RejectsOverflowAndMissingExtentMetadata) {
       absl::StatusCode::kResourceExhausted);
   GroupedScratchBudget external;
   EXPECT_EQ(
-      external.AddGroup(GroupLocation(1, 1, 1, false, true), nullptr, 1).code(),
+      external.AddGroup(GroupLocation(1, 1, 1, false, true), nullptr).code(),
       absl::StatusCode::kDataLoss);
 }
 
 TEST(GroupedScratchBudgetTest, AdmitsSelectedScratchBeforeAllocation) {
   GroupedMemoryScope memory;
   GroupedScratchBudget selected;
-  ASSERT_TRUE(selected.AddGroup(GroupLocation(1, 1, 3), nullptr, 1).ok());
+  ASSERT_TRUE(selected.AddGroup(GroupLocation(1, 1, 3), nullptr).ok());
   {
     auto admitted = selected.Reserve(4);
     ASSERT_TRUE(admitted.ok()) << admitted.status();
@@ -187,8 +187,8 @@ TEST(GroupedScratchBudgetTest, RetainedIndexMetadataNeedsNoLiveBlock) {
               {.block_id_ = 999998, .payload_bytes_ = 9000},
               {.block_id_ = 999997, .payload_bytes_ = 3000}});
     GroupedScratchBudget runtime_budget, retained_budget;
-    ASSERT_TRUE(runtime_budget.AddGroup(location, extents, 1).ok());
-    ASSERT_TRUE(retained_budget.AddGroup(compact, extents, 1).ok());
+    ASSERT_TRUE(runtime_budget.AddGroup(location, extents).ok());
+    ASSERT_TRUE(retained_budget.AddGroup(compact, extents).ok());
     auto runtime = runtime_budget.Reserve(1);
     auto retained = retained_budget.Reserve(1);
     ASSERT_TRUE(runtime.ok()) << runtime.status();
@@ -196,6 +196,26 @@ TEST(GroupedScratchBudgetTest, RetainedIndexMetadataNeedsNoLiveBlock) {
     EXPECT_EQ(runtime->bytes(), retained->bytes());
     EXPECT_EQ(retained->bytes(), 4096 + (external ? 12000 : 256) + 3 * 256);
   }
+}
+
+TEST(GroupedScratchBudgetTest, IndirectKeysDoNotReduceValueExtentAdmission) {
+  GroupedMemoryScope memory;
+  const auto location = GroupLocation(1, 1, 1, false, true, true);
+  const RecordIndexValue retained(location);
+  constexpr std::size_t kValueBytes = 9 * 1024 * 1024;
+  auto extents = std::make_shared<const std::vector<ExtentRef>>(
+      std::initializer_list<ExtentRef>{
+          {.block_id_ = 2, .payload_bytes_ = 8 * 1024 * 1024},
+          {.block_id_ = 3, .payload_bytes_ = 1024 * 1024}});
+  GroupedScratchBudget runtime_budget, retained_budget;
+  ASSERT_TRUE(runtime_budget.AddGroup(location, extents).ok());
+  ASSERT_TRUE(retained_budget.AddGroup(retained, extents).ok());
+  auto runtime = runtime_budget.Reserve(1);
+  auto compact = retained_budget.Reserve(1);
+  ASSERT_TRUE(runtime.ok()) << runtime.status();
+  ASSERT_TRUE(compact.ok()) << compact.status();
+  EXPECT_GE(runtime->bytes(), kValueBytes);
+  EXPECT_GE(compact->bytes(), kValueBytes);
 }
 
 TEST(GroupedObjectIndexTest, PublishOomPreservesExistingKeyAndCanBeRetried) {

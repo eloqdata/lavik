@@ -58,8 +58,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
       const auto* entry = current->FindGroup(id);
       if (!entry)
         return absl::DataLossError("missing member-index source page");
-      return budget.AddGroup(entry->value_, current->ExtentsFor(id),
-                             key.size());
+      return budget.AddGroup(entry->value_, current->ExtentsFor(id));
     };
     GroupedScratchBudget metadata_budget;
     absl::Status status;

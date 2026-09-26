@@ -250,10 +250,6 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
               for (const ExtentRef& ref : *extents) {
                 value_bytes += ref.payload_bytes_;
               }
-              if (location.key_indirect()) {
-                value_bytes -=
-                    std::min<std::uint64_t>(value_bytes, key->size());
-              }
             }
             if (location.grouped() ||
                 (location.external() &&
@@ -386,10 +382,6 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
   if (location.external()) {
     value_bytes = 0;
     for (const ExtentRef& ref : *extents) value_bytes += ref.payload_bytes_;
-    if (location.key_indirect()) {
-      value_bytes -=
-          std::min<std::uint64_t>(value_bytes, requested.key_.size());
-    }
   }
   if (location.grouped() ||
       (location.external() && value_bytes > kReplicationTransferBytes)) {
@@ -1554,8 +1546,10 @@ StorageEngine::Impl::ResetReplicaPartitions(
   }
   // The persisted candidate partition epochs exclude the old population.
   // Candidate writes also carry local_db_epochs (current + 1), which promotion
-  // alone persists; recovery's earlier DB-epoch filter therefore excludes an
-  // interrupted partial candidate before it decodes or follows its extents.
+  // alone persists. Recovery resolves indirect keys before applying database
+  // and replication epoch filters. Allocated stale records retain their UUID
+  // dependencies until their blocks retire; the scan bitmap excludes retired
+  // blocks. Value extents are read only after epoch and winner selection.
   absl::Status persisted = co_await PersistEpochValues(epoch_updates);
   if (!persisted.ok()) co_return persisted;
 

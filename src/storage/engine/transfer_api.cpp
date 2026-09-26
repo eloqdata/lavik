@@ -59,8 +59,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           if (!physical)
             co_return absl::DataLossError("missing Stream range page");
           GroupedScratchBudget budget;
-          auto status = budget.AddGroup(
-              physical->value_, object->ExtentsFor(id), source.key_.size());
+          auto status =
+              budget.AddGroup(physical->value_, object->ExtentsFor(id));
           if (!status.ok()) co_return status;
           auto admission = budget.Reserve(1);
           if (!admission.ok()) co_return admission.status();
@@ -184,8 +184,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(
             co_return absl::DataLossError(
                 "collection transfer page is missing");
           GroupedScratchBudget budget;
-          const auto included = budget.AddGroup(
-              physical->value_, object->ExtentsFor(id), source->key_.size());
+          const auto included =
+              budget.AddGroup(physical->value_, object->ExtentsFor(id));
           if (!included.ok()) co_return included;
           auto admission = budget.Reserve(1);
           if (!admission.ok()) co_return admission.status();

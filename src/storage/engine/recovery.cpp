@@ -457,6 +457,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
 
       const bool key_or_extent = block.kind_ == BlockKind::kIndirectKeys ||
                                  block.kind_ == BlockKind::kPayloadExtent;
+      // Each allocated block reports progress in the pass that consumes it.
+      // Free or unused blocks are counted only in the second pass above.
       if (indirect_key_pass != key_or_extent) continue;
       const std::uint16_t block_owner = RecoveredBlockOwner(block, block_id);
       batches->at(block_owner)
@@ -476,7 +478,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       buffered_bytes += sizeof(RecoveryBlock);
 
       if (block.kind_ == BlockKind::kPayloadExtent) {
-        if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
+        ReportRecoveryProgress(0, /*allocated=*/true);
         if (buffered_bytes >= batch_target_bytes) {
           absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
           if (!applied.ok()) {
@@ -940,8 +942,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             absl::StatusCode::kInternal,
             "block committed boundary does not match records");
       }
-      if (!indirect_key_pass)
-        ReportRecoveryProgress(records, /*allocated=*/true);
+      ReportRecoveryProgress(records, /*allocated=*/true);
       if (buffered_bytes >= batch_target_bytes) {
         absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
         if (!applied.ok()) {
