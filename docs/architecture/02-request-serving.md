@@ -278,10 +278,17 @@ the closed population.
 Worker zero owns RDB backup scheduling. `SAVE`, `BGSAVE`, and `LASTSAVE`
 requests arriving on other workers submit their control step there, while an
 active backup fans snapshot capture and scanning back out to every data worker.
-`BGSAVE SCHEDULE` retains at most one immutable follow-up request context,
-replacing it with the latest acknowledged request so its serving-generation
-fence remains current, and starts it after the active job retires. Configured
-`save <seconds> <changes>` policies are alternatives whose time and change
+SAVE keeps ordinary clients suspended until the RDB finishes; workers continue
+servicing control and replication tasks. BGSAVE releases database gates after
+snapshot capture and reports completion through LASTSAVE and INFO persistence.
+Concurrent RDB saves are rejected, including BGSAVE SCHEDULE, following Redis
+7.2.14. BGSAVE in EXEC schedules one immutable request context behind the
+transaction's completion, so its snapshot includes later transaction writes.
+SAVE is forbidden in MULTI, and SAVE/BGSAVE are forbidden in Lua and Functions.
+A captured backup retains the existing lifecycle across authority and role
+changes; destructive population replacement invalidates any snapshot whose
+indexes it replaces. Failed exports do not publish a partial RDB.
+Configured `save <seconds> <changes>` policies are alternatives whose time and change
 thresholds must both hold. If at least one policy exists, a one-second
 worker-zero coroutine evaluates them using low-frequency collection of the
 worker-local change counters; no timer coroutine exists when automatic saves
@@ -360,9 +367,17 @@ checks the connection's pre-script replication watermark immediately, and
 returns zero after any write in the current invocation because that write's
 replication envelope cannot publish until Lua returns and commits.
 For the same deterministic-replication reason, `SORT` over a Set with a
-constant `BY` pattern forces alphabetic ordering in scripts. Pattern-derived
-`BY`/`GET` keys remain rejected because they are absent from the declared-key
-transaction and cannot be locked after it has started.
+constant `BY` pattern forces alphabetic ordering in scripts. SORT_RO uses the
+same ordering and can read BY/GET pattern keys included in the outer script's
+declared key set. Other derived keys remain rejected: the held transaction
+cannot acquire additional locks without risking a dependency cycle.
+For EXEC containing SORT_RO pattern reads, the command layer instead owns an
+exclusive database cut across the whole transaction and quiesces expiration.
+This allows patterns to observe earlier transaction writes without extending
+its static key lock set. The cut trades concurrent database access for atomic
+execution of this uncommon dynamic-key case; ordinary sorting and scripts
+retain their keyed paths. Cluster SORT_RO follows Redis 7.2.14 and rejects
+wildcard BY and every GET option, including GET #.
 Write effects, blocking notifications, durable transaction receipts, and
 replication effects remain attached to the outer invocation rather than
 becoming independent commands.

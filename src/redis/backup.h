@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -30,14 +32,23 @@ void InitRdbBackup(storage::StorageEngine* storage, std::string target_path,
 // True after initialization only when at least one automatic save policy was
 // configured. Callers use this to avoid creating an idle timer coroutine.
 bool AutomaticRdbBackupsConfigured() noexcept;
-// Runs the worker-zero-owned automatic/scheduled save coordinator. It checks
-// configured save policies once per second; writes never touch shared state.
+// Runs the worker-zero-owned automatic save coordinator. It checks
+// configured save policies once per second using worker-local change counters.
 Task<absl::Status> RunRdbBackupScheduler(bycorf::Worker& worker);
-Task<CommandReply> ExecuteRdbBackupCommand(const CommandRequest& request,
-                                           ReplyBuilder& reply_builder);
-// Stops the policy timer coroutine while allowing an explicitly acknowledged
-// BGSAVE SCHEDULE request to drain during orderly shutdown. A sleeping timer
-// observes the stop request at its next one-second wakeup.
+// EXEC supplies a completion token: its BGSAVE is scheduled only after the
+// entire transaction releases its database/key holds, including later writes.
+Task<CommandReply> ExecuteRdbBackupCommand(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    std::shared_ptr<std::atomic<bool>> exec_finished = {});
+// Cooperative client admission barrier for synchronous SAVE. Control-plane
+// and replication coroutines keep running while ordinary clients wait.
+bool SynchronousRdbSaveActive() noexcept;
+Task<absl::Status> WaitForSynchronousRdbSave();
+// Collect a consistent Redis persistence view on the backup coordinator.
+Task<std::string> RdbPersistenceInfo();
+// Stops the policy timer; an active save or an EXEC-scheduled save still
+// drains during orderly shutdown. A sleeping timer observes the stop request
+// at its next one-second wakeup.
 void StopAutomaticRdbBackups() noexcept;
 void WaitForRdbBackupDrained() noexcept;
 

@@ -15,6 +15,7 @@
  */
 
 #include "absl/cleanup/cleanup.h"
+#include "lavik/fault_pause.h"
 #include "replication_internal.h"
 
 #if LAVIK_FAULTS_ENABLED
@@ -10848,6 +10849,16 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       }
     }
     command_gate_reopen.active_ = true;
+    LAVIK_FAULT_INJECT({
+      // Let process tests put a publisher waiter behind this real final cut.
+      // Its reservation must not prevent the fence below from making progress.
+      auto held = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_FULL_SOURCE_CUT_HOLD_FILE");
+      if (!held.ok()) {
+        cleanup();
+        co_return held;
+      }
+    });
     while (CommandDbOperationsActive()) {
       if (session->cancelled()) {
         cleanup();

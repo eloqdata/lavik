@@ -384,6 +384,9 @@ struct alignas(std::max_align_t) CommandRequest {
   // Source-side EXEC captures PUBLISH for ordered replication and delays its
   // local delivery until that publication commits.
   std::uint8_t defer_pubsub_delivery_ : 1 = false;
+  // EXEC with dynamic SORT_RO pattern reads owns an exclusive database cut.
+  // Nested handlers may read derived keys without extending a held lock set.
+  std::uint8_t exclusive_db_access_ : 1 = false;
   // Captured when a client write chooses its source-publication path. A DB
   // gate that reopens under a different role must reject the stale request
   // before mutation, including when writable replicas are enabled. Its valid

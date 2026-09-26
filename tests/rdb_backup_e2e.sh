@@ -221,21 +221,18 @@ values=$("${redis_cli}" -p "${import_port}" --scan --pattern 'key:*' |
 [[ $("${redis_cli}" -p "${import_port}" function list libraryname rdb_library |
   grep -c rdb_get) -ge 1 ]]
 
-# A second request made after BGSAVE's global cut must schedule exactly one
-# successor while the first job continues scanning this deliberately large
-# dataset. Repeated SCHEDULE requests coalesce into that same successor.
+# Redis 7.2.14 rejects SCHEDULE while an RDB save is active; it only
+# schedules behind a different child type (such as an AOF rewrite).
 completed_before=$(grep -c "RDB backup completed:" "${case_dir}/import.log" || true)
 [[ $("${redis_cli}" -p "${import_port}" bgsave) == "Background saving started" ]]
 [[ $("${redis_cli}" -p "${import_port}" bgsave schedule) == \
-  "Background saving scheduled" ]]
-[[ $("${redis_cli}" -p "${import_port}" bgsave schedule) == \
-  "Background saving scheduled" ]]
+  "ERR Background save already in progress" ]]
 for _ in $(seq 1 6000); do
   completed_now=$(grep -c "RDB backup completed:" "${case_dir}/import.log" || true)
-  if ((completed_now >= completed_before + 2)); then break; fi
+  if ((completed_now >= completed_before + 1)); then break; fi
   sleep 0.01
 done
-((completed_now == completed_before + 2))
+((completed_now == completed_before + 1))
 [[ $("${redis_cli}" -p "${import_port}" bgsave not-a-mode 2>&1) == \
   "ERR syntax error" ]]
 

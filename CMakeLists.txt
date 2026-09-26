@@ -1112,6 +1112,31 @@ if (BUILD_TESTING)
       set_tests_properties(meta_integration.gate_managed_composite PROPERTIES
         LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
 
+      find_program(LAVIK_REDIS_SERVER_EXECUTABLE NAMES redis-server)
+      if (LAVIK_REDIS_SERVER_EXECUTABLE)
+        add_test(
+          NAME meta_integration.gate_managed_sort
+          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_managed_sort_save.py
+                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                  $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+                  ${LAVIK_REDIS_SERVER_EXECUTABLE})
+        set_tests_properties(meta_integration.gate_managed_sort PROPERTIES
+          LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+        if (LAVIK_ENABLE_TEST_FAULTS)
+          add_test(
+            NAME meta_integration.gate_managed_save
+            COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_managed_sort_save.py
+                    $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                    $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+                    ${LAVIK_REDIS_SERVER_EXECUTABLE} --save)
+          set_tests_properties(meta_integration.gate_managed_save PROPERTIES
+            LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
+        endif()
+
+      endif()
+
       if (LAVIK_ENABLE_TEST_FAULTS)
         foreach(scenario IN ITEMS stream catalog lifecycle partial)
           add_test(
