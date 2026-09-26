@@ -358,6 +358,8 @@ constexpr CommandSpec kCommandTable[] = {
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
     {"replicaof", CommandKind::kReplicaOf, 3, 3, 0, 0, 1,
      kCmdNoKeys | kCmdGlobal | kCmdAdmin},
+    {"lavik.replicaof", CommandKind::kLavikReplicaOf, 3, 3, 0, 0, 1,
+     kCmdNoKeys | kCmdGlobal | kCmdAdmin},
     {"slaveof", CommandKind::kReplicaOf, 3, 3, 0, 0, 1,
      kCmdNoKeys | kCmdGlobal | kCmdAdmin},
     {"addreplicaof", CommandKind::kAddReplicaOf, 3, 3, 0, 0, 1,

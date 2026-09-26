@@ -2212,7 +2212,14 @@ class ReplicationManager::ReplicationGroup {
   // that SetUpstream acquired and restores permanent expiration authority.
   void ActivatePreparedPromotion();
 
-  Task<absl::Status> SetUpstream(std::optional<ReplicaOfConfig> upstream);
+  Task<absl::Status> SetUpstream(std::optional<ReplicaOfConfig> upstream,
+                                 bool native = false);
+
+  Task<absl::Status> ProbeNativeUpstream(const ReplicaOfConfig& upstream);
+
+  Task<absl::Status> ProbeNativeUpstreamConnection(
+      const ReplicaOfConfig& upstream,
+      const std::shared_ptr<TimedSocketContext>& transport);
 
   Task<absl::Status> AddUpstream(ReplicaOfConfig upstream);
 

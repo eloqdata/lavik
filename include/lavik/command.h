@@ -336,6 +336,7 @@ enum class CommandKind {
   kUnwatch,
   kClient,
   kReplicaOf,
+  kLavikReplicaOf,
   kAddReplicaOf,
   kConfig,
   kInfo,
