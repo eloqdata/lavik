@@ -981,10 +981,8 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     // or remote writer finishes, so borrowing avoids allocating/copying every
     // payload, including records the index will reject as already obsolete.
     const std::string_view key = disk_key;
-    const std::size_t key_prefix = 0;
-    const std::string_view value(
-        reinterpret_cast<const char*>(payload_data + key_prefix),
-        record.payload_bytes_ - key_prefix);
+    const std::string_view value(reinterpret_cast<const char*>(payload_data),
+                                 record.payload_bytes_);
     absl::StatusOr<std::optional<RelocationDurabilityFence>> relocated(
         std::optional<RelocationDurabilityFence>{});
     if (key_owner == store.worker_->id()) {

@@ -894,9 +894,9 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     const RecordLocation applied = MaterializeIndexLocation(*current);
     std::string loaded_key;
     if (!current->key_complete()) [[unlikely]] {
-      auto key = co_await LoadOutOfIndexKey(
-          store, MaterializeIndexLocation(*current), ExtentsFor(store, current),
-          current->logical_key_size());
+      auto key =
+          co_await LoadOutOfIndexKey(store, MaterializeIndexLocation(*current),
+                                     current->logical_key_size());
       if (!key.ok()) {
         LatchRuntimeFailure(store);
         co_return key.status();
@@ -1157,9 +1157,8 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     const auto applied = MaterializeIndexLocation(*current);
     std::string external_key;
     if (!current->key_complete()) {
-      auto loaded =
-          co_await LoadOutOfIndexKey(store, applied, ExtentsFor(store, current),
-                                     current->logical_key_size());
+      auto loaded = co_await LoadOutOfIndexKey(store, applied,
+                                               current->logical_key_size());
       if (!loaded.ok()) co_return loaded.status();
       external_key = std::move(*loaded);
     }

@@ -325,9 +325,9 @@ Task<absl::Status> StorageEngine::Impl::ClearGroupedUndoSlots(
     if (current->value_.grouped()) continue;
     std::string external_key;
     if (!current->key_complete()) {
-      auto key = co_await LoadOutOfIndexKey(
-          store, MaterializeIndexLocation(*current), ExtentsFor(store, current),
-          current->logical_key_size());
+      auto key =
+          co_await LoadOutOfIndexKey(store, MaterializeIndexLocation(*current),
+                                     current->logical_key_size());
       if (!key.ok()) co_return key.status();
       external_key = std::move(*key);
     }

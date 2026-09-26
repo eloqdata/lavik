@@ -90,8 +90,8 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
     auto extents = object->ExtentsFor(id);
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
-      loaded = co_await LoadExternalValueLocal(store, location, extents,
-                                               key.size(), nullptr);
+      loaded =
+          co_await LoadExternalValueLocal(store, location, extents, nullptr);
     } else if (location.block_owner() == store.worker_->id()) {
       loaded = co_await LoadValueLocal(store, db_id, key, location,
                                        original.replication_epoch_, nullptr,

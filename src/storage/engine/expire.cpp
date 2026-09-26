@@ -434,7 +434,8 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
       grouped = std::move(*view);
       // Prepare the complete graph before detaching either index, without
       // allocating disk space or decoding values. This includes split-parent
-      // retirement records and preserves external parent-key extent debt.
+      // retirement records. Their source blocks retain UUID dependencies
+      // until physical retirement.
       // Admission failure leaves the expired key indexed for a later retry.
       auto retired = CollectGroupedRetirements(grouped, nullptr);
       if (!retired.ok()) co_return retired.status();
@@ -592,7 +593,6 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
         auto& index = partition.indexes_[db_id];
         struct ExternalExpired {
           std::uintptr_t entry_address_ = 0;
-          ExtentManifest extents_;
           RecordLocation location_{};
           std::uint32_t hash_ = 0;
           std::uint32_t key_bytes_ = 0;
@@ -607,7 +607,6 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
                   external_expired.push_back(ExternalExpired{
                       .entry_address_ =
                           reinterpret_cast<std::uintptr_t>(&entry),
-                      .extents_ = ExtentsFor(*store, &entry),
                       .location_ = MaterializeIndexLocation(entry),
                       .hash_ =
                           RecordIndex::AddressHash(entry.external_key_digest()),
@@ -618,7 +617,6 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
             });
         for (const ExternalExpired& candidate : external_expired) {
           auto key = co_await LoadOutOfIndexKey(*store, candidate.location_,
-                                                candidate.extents_,
                                                 candidate.key_bytes_);
           if (!key.ok()) {
             co_return key.status();

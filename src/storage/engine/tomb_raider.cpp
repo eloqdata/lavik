@@ -659,7 +659,6 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
   struct Candidate {
     Digest digest_{};
     std::string key_;
-    ExtentManifest extents_;
     RecordLocation location_{};
     std::uint32_t key_bytes_ = 0;
     std::uint8_t db_id_ = 0;
@@ -697,7 +696,6 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
                                                 : entry.external_key_digest(),
                 .key_ = entry.key_complete() ? std::string(entry.key())
                                              : std::string{},
-                .extents_ = ExtentManifest{},
                 .location_ = MaterializeIndexLocation(entry),
                 .key_bytes_ = entry.logical_key_size(),
                 .db_id_ = db_id,
@@ -717,8 +715,8 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
       break;  // forfeit the rest; totals below still publish
     }
     if (candidate.key_.empty() && candidate.key_bytes_ != 0) [[unlikely]] {
-      auto key = co_await LoadOutOfIndexKey(
-          store, candidate.location_, candidate.extents_, candidate.key_bytes_);
+      auto key = co_await LoadOutOfIndexKey(store, candidate.location_,
+                                            candidate.key_bytes_);
       if (!key.ok()) {
         co_return key.status();
       }

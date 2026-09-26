@@ -68,11 +68,7 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
 
 Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
     WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-    std::span<std::byte> destination, std::size_t payload_offset,
-    OrderedGroupMetadataDecoder* ordered) {
-  if (payload_offset > ref.payload_bytes_) {
-    co_return absl::DataLossError("recovered extent slice is out of bounds");
-  }
+    std::span<std::byte> destination, OrderedGroupMetadataDecoder* ordered) {
   const std::size_t read_bytes =
       AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
   auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
@@ -85,7 +81,7 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
                                          io, lease.registered(), block_offset);
   if (!read.ok()) co_return read.status();
   if (*read != read_bytes) {
-    co_return absl::InternalError("short recovered key extent read");
+    co_return absl::InternalError("short recovered extent read");
   }
   BlockHeader header{};
   if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
@@ -97,50 +93,41 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
       header.extent_index_ != extent_index ||
       header.extent_payload_bytes_ != ref.payload_bytes_ ||
       header.extent_payload_checksum_ != ref.payload_checksum_) {
-    co_return absl::InternalError(
-        "recovered key extent does not match manifest");
+    co_return absl::InternalError("recovered extent does not match manifest");
   }
   const auto payload = std::span<const std::byte>(io.data_ + kBlockHeaderBytes,
                                                   ref.payload_bytes_);
   if (Crc32c(payload) != ref.payload_checksum_) {
-    co_return absl::InternalError("recovered key extent checksum mismatch");
+    co_return absl::InternalError("recovered extent checksum mismatch");
   }
   if (ordered != nullptr) {
     // The caller awaits each extent before proceeding. Even an SPDK owner hop
     // has exclusive access to this bounded, non-affine decoder until return;
     // no borrowed I/O span or worker-owned metadata survives this call.
     auto status = ordered->Read(std::string_view(
-        reinterpret_cast<const char*>(payload.data() + payload_offset),
-        payload.size() - payload_offset));
+        reinterpret_cast<const char*>(payload.data()), payload.size()));
     if (!status.ok()) co_return status;
   }
   if (!destination.empty()) {
-    std::memcpy(destination.data(), payload.data() + payload_offset,
-                std::min(payload.size() - payload_offset, destination.size()));
+    std::memcpy(destination.data(), payload.data(),
+                std::min(payload.size(), destination.size()));
   }
   co_return absl::OkStatus();
 }
 
-Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadRecoveryPayloadSlice(
-    WorkerStore& store, ExtentManifest extents, std::size_t offset,
-    std::size_t bytes, OrderedGroupMetadataDecoder* ordered) {
+Task<absl::StatusOr<std::string>>
+StorageEngine::Impl::LoadRecoveryPayloadPrefix(
+    WorkerStore& store, ExtentManifest extents, std::size_t bytes,
+    OrderedGroupMetadataDecoder* ordered) {
   if (extents == nullptr || bytes > kMaxRecordPayloadBytes) {
-    co_return absl::DataLossError("recovered payload slice has no manifest");
+    co_return absl::DataLossError("recovered payload prefix has no manifest");
   }
   std::string result(bytes, '\0');
   std::size_t copied = 0;
   for (std::size_t index = 0; index < extents->size(); ++index) {
     const ExtentRef ref = extents->at(index);
-    std::size_t slice_offset = offset;
-    std::size_t count = 0;
-    if (offset >= ref.payload_bytes_) {
-      offset -= ref.payload_bytes_;
-      slice_offset = ref.payload_bytes_;
-    } else {
-      count =
-          std::min<std::size_t>(bytes - copied, ref.payload_bytes_ - offset);
-      offset = 0;
-    }
+    const std::size_t count =
+        std::min<std::size_t>(bytes - copied, ref.payload_bytes_);
     // The envelope is small, but every extent still crosses checksum and
     // identity validation before this graph can become recovery authority.
     // Empty destinations validate the remaining payload without retaining it.
@@ -157,27 +144,26 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadRecoveryPayloadSlice(
       if (owner != store.worker_->id()) {
         read = co_await bycorf::SubmitTaskTo(
             owner,
-            [this, owner, ref, index, destination, slice_offset,
+            [this, owner, ref, index, destination,
              ordered]() -> Task<absl::Status> {
               co_return co_await ReadRecoveryExtentInto(
                   *stores_[owner], ref, static_cast<std::uint32_t>(index),
-                  destination, slice_offset, ordered);
+                  destination, ordered);
             });
       } else {
         read = co_await ReadRecoveryExtentInto(
             store, ref, static_cast<std::uint32_t>(index), destination,
-            slice_offset, ordered);
+            ordered);
       }
     } else {
       read = co_await ReadRecoveryExtentInto(
-          store, ref, static_cast<std::uint32_t>(index), destination,
-          slice_offset, ordered);
+          store, ref, static_cast<std::uint32_t>(index), destination, ordered);
     }
     if (!read.ok()) co_return read;
     copied += count;
   }
   if (copied != bytes) {
-    co_return absl::DataLossError("recovered payload slice is truncated");
+    co_return absl::DataLossError("recovered payload prefix is truncated");
   }
   co_return result;
 }
@@ -759,10 +745,6 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               group_bytes += extent.payload_bytes_;
             }
           }
-          const std::uint64_t key_prefix = 0;
-          if (group_bytes < key_prefix)
-            co_return absl::DataLossError("group parent key is truncated");
-          group_bytes -= key_prefix;
           // Value-only extents of an obsolete group may already have been
           // reclaimed while other live records retain this source block.
           // Its checked header contains all winner-selection metadata; touch
@@ -780,13 +762,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               .retired_ = record.group_retired_,
           };
           if (!record.external_) {
-            const std::size_t key_prefix = 0;
-            if (record.payload_bytes_ < key_prefix) {
-              co_return absl::DataLossError("recovered group key is truncated");
-            }
             const std::string_view encoded(
-                reinterpret_cast<const char*>(payload) + key_prefix,
-                record.payload_bytes_ - key_prefix);
+                reinterpret_cast<const char*>(payload), record.payload_bytes_);
             if (ordered && IsOrderedPageId(auxiliary_group->id_)) {
               auto decoded = DecodeOrderedGroup(encoded);
               if (!decoded.ok()) co_return decoded.status();
@@ -832,7 +809,6 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           }
         }
         if (record.grouped_) {
-          const std::size_t key_prefix = 0;
           std::size_t encoded_bytes = record.payload_bytes_;
           std::string metadata_bytes;
           std::string_view encoded;
@@ -845,33 +821,21 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               }
               encoded_bytes += ref.payload_bytes_;
             }
-            if (encoded_bytes < key_prefix) {
-              co_return absl::DataLossError("recovered group key is truncated");
-            }
-            encoded_bytes -= key_prefix;
-            // Root size is fixed by its payload version. External roots carry
-            // large parent keys, whose source-dependent extent lifetime
-            // protects reads of older root versions before the top-level merge
-            // is complete.
-            const std::size_t metadata_size = encoded_bytes;
-            if (metadata_size > (ordered ? kIndexedSortedSetRootBytes
+            // Root size is bounded by its payload format, independently of
+            // the parent key stored in the record header or a KeyRecord.
+            if (encoded_bytes > (ordered ? kIndexedSortedSetRootBytes
                                          : kGroupedHashRootBytes)) {
               co_return absl::DataLossError(
                   "recovered grouped root is too large");
             }
-            auto loaded = co_await LoadRecoveryPayloadSlice(
-                store, extents, key_prefix, metadata_size);
+            auto loaded = co_await LoadRecoveryPayloadPrefix(store, extents,
+                                                             encoded_bytes);
             if (!loaded.ok()) co_return loaded.status();
             metadata_bytes = std::move(*loaded);
             encoded = metadata_bytes;
           } else {
-            if (encoded_bytes < key_prefix) {
-              co_return absl::DataLossError("recovered group key is truncated");
-            }
-            encoded_bytes -= key_prefix;
-            encoded = std::string_view(
-                reinterpret_cast<const char*>(payload) + key_prefix,
-                encoded_bytes);
+            encoded = std::string_view(reinterpret_cast<const char*>(payload),
+                                       encoded_bytes);
           }
           if (ordered) {
             auto decoded = DecodeOrderedCollectionRoot(encoded);
@@ -1409,18 +1373,14 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
           co_return absl::DataLossError("ordered page payload is too large");
         bytes += extent.payload_bytes_;
       }
-      const std::size_t key_bytes = 0;
-      if (bytes < key_bytes)
-        co_return absl::DataLossError("ordered page parent key is truncated");
       // Only the highest committed revision of each stable id reaches IO.
       // Superseded value-only extents may already be recycled. The selected
       // page is checked completely. Stream framing and scores into bounded
       // state while the same checksum pass skips member payloads; only the
       // routing envelope and two score bounds survive, even for huge members.
-      OrderedGroupMetadataDecoder decoder(bytes - key_bytes);
-      auto prefix =
-          co_await LoadRecoveryPayloadSlice(store, physical.extents_, key_bytes,
-                                            kOrderedGroupHeaderBytes, &decoder);
+      OrderedGroupMetadataDecoder decoder(bytes);
+      auto prefix = co_await LoadRecoveryPayloadPrefix(
+          store, physical.extents_, kOrderedGroupHeaderBytes, &decoder);
       if (!prefix.ok()) co_return prefix.status();
       auto metadata = decoder.Finish();
       if (!metadata.ok()) co_return metadata.status();
@@ -1515,16 +1475,11 @@ Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroups(
       }
       encoded_bytes += ref.payload_bytes_;
     }
-    const std::size_t key_prefix = 0;
-    if (encoded_bytes < key_prefix) {
-      co_return absl::DataLossError("live recovered group key is truncated");
-    }
-    encoded_bytes -= key_prefix;
     // This retains only a bounded envelope, but checks every byte of every
     // selected extent. Unreachable groups never reach this read: a freed or
     // reused obsolete extent cannot make an otherwise valid startup fail.
-    auto prefix = co_await LoadRecoveryPayloadSlice(
-        store, record.extents_, key_prefix, kHashGroupHeaderBytes);
+    auto prefix = co_await LoadRecoveryPayloadPrefix(store, record.extents_,
+                                                     kHashGroupHeaderBytes);
     if (!prefix.ok()) co_return prefix.status();
     auto decoded = DecodeHashGroupMetadata(*prefix, encoded_bytes);
     if (!decoded.ok()) co_return decoded.status();

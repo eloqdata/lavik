@@ -971,7 +971,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         if (entry->key_complete()) {
           key.assign(entry->key());
         } else {
-          auto loaded = co_await LoadOutOfIndexKey(store, location, extents,
+          auto loaded = co_await LoadOutOfIndexKey(store, location,
                                                    entry->logical_key_size());
           if (!loaded.ok()) co_return loaded.status();
           key = std::move(*loaded);

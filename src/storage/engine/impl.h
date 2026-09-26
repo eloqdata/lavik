@@ -1496,7 +1496,6 @@ class StorageEngine::Impl {
       struct PinnedValue {
         ExtentManifest extents_;
         std::shared_ptr<FullSyncCollection> collection_;
-        std::size_t key_bytes_ = 0;
         std::uint64_t value_bytes_ = 0;
       };
       // Native grouped-source map capacity survives individual source ACKs.
@@ -2640,7 +2639,6 @@ class StorageEngine::Impl {
   struct ScanPartitionState {
     struct ExternalCandidate {
       std::uintptr_t entry_address_ = 0;
-      ExtentManifest extents_;
       RecordLocation location_{};
       std::uint32_t hash_ = 0;
       std::uint32_t key_bytes_ = 0;
@@ -3290,31 +3288,23 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<std::string>> LoadOutOfIndexKey(
       WorkerStore& store, const RecordLocation& location,
-      ExtentManifest extents, std::size_t key_bytes);
+      std::size_t key_bytes);
   Task<absl::StatusOr<std::string>> LoadExternalKeyForRecovery(
       WorkerStore& store, ExtentManifest extents, std::size_t key_bytes);
   Task<absl::Status> ReadRecoveryExtentInto(
       WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-      std::span<std::byte> destination, std::size_t payload_offset = 0,
+      std::span<std::byte> destination,
       OrderedGroupMetadataDecoder* ordered = nullptr);
-  // Read a bounded slice while validating every extent in the manifest. Used
+  // Read a bounded prefix while validating every extent in the manifest. Used
   // for group envelopes so an indivisible large field does not become a large
   // recovery allocation merely to reconstruct resident routing metadata.
-  // Optional ordered decoding observes all bytes after offset during that same
-  // pass, not just the returned slice. Its caller-owned state outlives the
+  // Optional ordered decoding observes all payload bytes during that same
+  // pass, not just the returned prefix. Its caller-owned state outlives the
   // task.
-  Task<absl::StatusOr<std::string>> LoadRecoveryPayloadSlice(
-      WorkerStore& store, ExtentManifest extents, std::size_t offset,
-      std::size_t bytes, OrderedGroupMetadataDecoder* ordered = nullptr);
+  Task<absl::StatusOr<std::string>> LoadRecoveryPayloadPrefix(
+      WorkerStore& store, ExtentManifest extents, std::size_t bytes,
+      OrderedGroupMetadataDecoder* ordered = nullptr);
 
-  Task<absl::StatusOr<bool>> VerifyExternalKey(WorkerStore& store,
-                                               const RecordIndex::Entry& entry,
-                                               std::string_view key);
-  Task<absl::StatusOr<bool>> VerifyExternalKeyExtents(WorkerStore& store,
-                                                      ExtentManifest extents,
-                                                      std::string_view key);
-  Task<absl::StatusOr<bool>> VerifyInlineRecordKey(
-      WorkerStore& store, const RecordLocation& location, std::string_view key);
   Task<absl::StatusOr<RecordIndex::Entry*>> FindVerifiedEntry(
       WorkerStore& store, RecordIndex& index, const Digest& digest,
       std::string_view key);
@@ -3354,7 +3344,7 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<LoadedValue>> LoadExternalValueLocal(
       WorkerStore& store, const RecordLocation& location,
-      ExtentManifest extents, std::size_t key_bytes, ReadLatencyTrace* trace,
+      ExtentManifest extents, ReadLatencyTrace* trace,
       bool grouped_payload = false);
 
   Task<absl::StatusOr<LoadedValue>> LoadValueLocal(
@@ -3561,7 +3551,7 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<std::uint64_t>> PinFullSyncValue(
       WorkerStore& store, std::uint64_t session_id,
       WorkerStore::PartitionStore& partition, RecordLocation location,
-      ExtentManifest extents, std::size_t key_bytes);
+      ExtentManifest extents);
 
   Task<absl::StatusOr<ReservedBlock>> AcquireWriteBlock(WorkerStore& store,
                                                         bool for_defrag,

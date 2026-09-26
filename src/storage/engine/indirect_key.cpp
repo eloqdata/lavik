@@ -51,7 +51,7 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadIndirectKey(
         absl::InternalError("unread key record");
     if (location.external()) {
       loaded =
-          co_await LoadExternalValueLocal(store, location, extents, 0, nullptr);
+          co_await LoadExternalValueLocal(store, location, extents, nullptr);
     } else if (location.block_owner() == owner) {
       loaded = co_await LoadValueLocal(
           store, 0, IndirectKeyIdBytes(handle->id_), location, 1, nullptr, 1);
