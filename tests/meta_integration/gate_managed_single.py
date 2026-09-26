@@ -71,9 +71,10 @@ def inspect_database(client):
 
 
 def basic_and_stale(root):
-    with pair(
-        root, "single-read", client_mode="single", raft_args=C.creation_raft_args()
-    ) as (
+    # Keep pair's ordinary lease bound while checking persistent DB clients.
+    # The short cluster-create bound can expire during healthy CI scheduling;
+    # the intentional control-loss phase below waits for the actual fence.
+    with pair(root, "single-read", client_mode="single") as (
         meta,
         source,
         target,
@@ -163,7 +164,13 @@ def basic_and_stale(root):
             assert (
                 reader.call("CONFIG", "SET", "replica-serve-stale-data", "no") == "OK"
             )
-            time.sleep(2)
+            H.wait_until(
+                "Owner lease expires after control loss",
+                10,
+                lambda: F.redis_error(source, ["GET", "count"]).startswith(
+                    "MASTERDOWN"
+                ),
+            )
             assert reader.call("GET", "count") == "2"
             # Owner loss retires the old TCP session; diagnostics/admission
             # errors remain available on a new connection.

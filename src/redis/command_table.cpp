@@ -383,7 +383,8 @@ constexpr CommandSpec kCommandTable[] = {
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
     {"save", CommandKind::kSave, 1, 1, 0, 0, 1,
      kCmdNoKeys | kCmdGlobal | kCmdAdmin},
-    {"bgsave", CommandKind::kBgSave, 1, 2, 0, 0, 1,
+    // Redis reports syntax errors for surplus BGSAVE options in the handler.
+    {"bgsave", CommandKind::kBgSave, 1, 0, 0, 0, 1,
      kCmdNoKeys | kCmdGlobal | kCmdAdmin},
     {"lastsave", CommandKind::kLastSave, 1, 1, 0, 0, 1,
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},

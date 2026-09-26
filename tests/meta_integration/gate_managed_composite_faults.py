@@ -23,6 +23,7 @@ import tempfile
 import time
 
 import gate_failover as F
+from gate_client_retirement import require_closed
 from gate_native_replication import C, H, Client, pair, ready
 
 
@@ -42,6 +43,18 @@ def reached(source, variable):
         "execution reached held boundary",
         10,
         lambda: f"fault pause reached: {variable}" in Path(source.log_path).read_text(),
+    )
+
+
+def wait_retired_clients_drained(source):
+    # EOF precedes coroutine cleanup. Keep Meta paused until the retired
+    # request finishes so a same-Term renewal cannot authorize its held work.
+    # The fresh INFO probe must be the only remaining ordinary connection.
+    H.wait_until(
+        "retired request drained before renewal",
+        20,
+        lambda: "connected_clients:1"
+        in F.redis_call(source, ["INFO", "clients"]).splitlines(),
     )
 
 
@@ -78,16 +91,21 @@ def stream_revoke(root, mode, partial, empty=False, noack=False):
                 )
                 try:
                     reached(source, variable)
-                    refusal = expire(meta, source, mode)
-                    hold.unlink()
+                    expire(meta, source, mode)
+                    # Authority loss retires every pre-existing client, even
+                    # before the first durable effect. Verify retirement while
+                    # execution is held; inspect the exact effects after drain.
+                    H.wait_until("held Stream client retired", 10, pending.done)
                     try:
-                        result = pending.result(timeout=15)
+                        result = pending.result()
                     except H.Failure as error:
-                        assert ("closed" if partial else refusal) in str(error), error
+                        assert "Data closed its Redis connection" in str(error), error
                     else:
                         raise AssertionError(
                             f"revoked Stream attempt succeeded: {result!r}"
                         )
+                    hold.unlink()
+                    wait_retired_clients_drained(source)
                 finally:
                     hold.unlink(missing_ok=True)
                     meta.resume()
@@ -146,17 +164,20 @@ def catalog_revoke(root, mode, mixed, boundary):
             pending = pool.submit(writer.call, "EXEC")
             try:
                 reached(source, variable)
-                refusal = expire(meta, source, mode)
-                hold.unlink()
-                if not mixed and boundary == "AFTER_ROOT_WRITE":
-                    assert pending.result(timeout=15) == ["committed"]
+                expire(meta, source, mode)
+                # A committed catalog effect does not preserve its client's
+                # socket across authority loss. Keep the hold until retirement
+                # is observed; the fresh source/replica checks below distinguish
+                # the pre-root refusal from the committed post-root prefix.
+                H.wait_until("held catalog client retired", 10, pending.done)
+                try:
+                    result = pending.result()
+                except H.Failure as error:
+                    assert "Data closed its Redis connection" in str(error), error
                 else:
-                    try:
-                        result = pending.result(timeout=15)
-                    except H.Failure as error:
-                        assert ("closed" if mixed else refusal) in str(error), error
-                    else:
-                        raise AssertionError(f"revoked EXEC succeeded: {result!r}")
+                    raise AssertionError(f"revoked EXEC succeeded: {result!r}")
+                hold.unlink()
+                wait_retired_clients_drained(source)
             finally:
                 hold.unlink(missing_ok=True)
                 meta.resume()
@@ -469,10 +490,18 @@ def stream_cutover(root):
                 except H.Failure as error:
                     assert any(
                         token in str(error)
-                        for token in ("TRYAGAIN", "MASTERDOWN", "READONLY", "LOADING")
+                        for token in (
+                            "TRYAGAIN",
+                            "MASTERDOWN",
+                            "READONLY",
+                            "LOADING",
+                            "Data closed its Redis connection",
+                        )
                     ), error
                 else:
                     raise AssertionError(f"old population waiter returned {result!r}")
+            for client in sleepers:
+                require_closed(client, "old Stream waiter after cutover", timeout=5)
             current = Client(fixture.by_id[begin["candidate"]])
             clients.append(current)
             assert current.call("XADD", "cutover", "1-0", "v", "new") == "1-0"
@@ -569,6 +598,7 @@ def delete_partial_run(root):
                         raise AssertionError(
                             "partial deletion returned a certain outcome"
                         )
+                    wait_retired_clients_drained(source)
                 finally:
                     hold.unlink(missing_ok=True)
                     meta.resume()

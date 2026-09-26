@@ -34,6 +34,7 @@
 #include "absl/strings/str_cat.h"
 #include "blocking_wait.h"
 #include "cluster_gate.h"
+#include "lavik/cluster/runtime.h"
 #include "lavik/redis_parse.h"
 #include "lavik/resp.h"
 #include "lavik/storage/engine.h"
@@ -122,8 +123,16 @@ absl::StatusOr<SortOptions> ParseSortOptions(const CommandRequest& request) {
     } else if (EqualCi(args[i], "by") && i + 1 < args.size()) {
       options.by_ = args[++i];
       options.dont_sort_ = options.by_->find('*') == std::string_view::npos;
+      if (read_only && cluster::IsClusterClientMode() && !options.dont_sort_) {
+        return absl::InvalidArgumentError(
+            "BY option of SORT denied in Cluster mode.");
+      }
     } else if (EqualCi(args[i], "get") && i + 1 < args.size()) {
       options.gets_.push_back(args[++i]);
+      if (read_only && cluster::IsClusterClientMode()) {
+        return absl::InvalidArgumentError(
+            "GET option of SORT denied in Cluster mode.");
+      }
     } else if (!read_only && EqualCi(args[i], "store") && i + 1 < args.size()) {
       options.store_arg_ = ++i;
     } else {
@@ -643,6 +652,15 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
   }
 }
 
+bool SortReadsPatternKeys(const CommandRequest& request) {
+  auto options = ParseSortOptions(request);
+  if (!options.ok()) return false;
+  return (options->by_.has_value() && !options->dont_sort_) ||
+         std::any_of(options->gets_.begin(), options->gets_.end(), [](auto p) {
+           return p.find('*') != std::string_view::npos;
+         });
+}
+
 Task<std::string> ExecuteSortCommandLocked(
     const CommandRequest& request, std::span<const SortExecKey> exec_keys,
     std::vector<storage::TxShardWrites>& tx_writes,
@@ -655,8 +673,11 @@ Task<std::string> ExecuteSortCommandLocked(
   std::vector<LockedKey> keys;
   keys.reserve(exec_keys.size());
   for (const SortExecKey& key : exec_keys) {
-    if (key.arg_ >= request.args_.size()) continue;
-    AddLockedKey(&keys, request.args_[key.arg_], tx::LockMode::kShared);
+    if (key.arg_ == 0) {
+      AddLockedKey(&keys, key.name_, tx::LockMode::kShared);
+    } else if (key.arg_ < request.args_.size()) {
+      AddLockedKey(&keys, request.args_[key.arg_], tx::LockMode::kShared);
+    }
   }
   if (options->store_arg_.has_value()) {
     AddLockedKey(&keys, request.args_[*options->store_arg_],
@@ -670,8 +691,13 @@ Task<std::string> ExecuteSortCommandLocked(
   for (const std::string& pattern_key :
        CollectPatternKeys(*options, source->elements_)) {
     if (FindLockedKey(keys, pattern_key) == nullptr) {
-      co_return EncodeError(
-          "ERR SORT BY/GET pattern keys are not supported inside MULTI");
+      if (request.kind_ == CommandKind::kSortRo &&
+          request.exclusive_db_access_) {
+        AddLockedKey(&keys, pattern_key, tx::LockMode::kShared);
+      } else {
+        co_return EncodeError(
+            "ERR SORT BY/GET pattern keys are not supported inside MULTI");
+      }
     }
   }
   auto product = co_await BuildSortProduct(

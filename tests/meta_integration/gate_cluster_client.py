@@ -1088,7 +1088,16 @@ def main():
         meta_workdir,
         1,
         args=(
-            H.raft_args(snapshot_distance=100_000) + H.tls_args(ca, meta_cert, meta_key)
+            # A grant is capped by the Raft election lower bound. The default
+            # 300 ms process-test bound can retire the unrelated Group's idle
+            # clients during healthy TLS/load scheduling. Match the 1 s lease
+            # policy; its 2D first-grant quarantine still fits native retries.
+            H.raft_args(
+                snapshot_distance=100_000,
+                election_ms_low=1000,
+                election_ms_high=2000,
+            )
+            + H.tls_args(ca, meta_cert, meta_key)
         ),
     )
     nodes = {}
