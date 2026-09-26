@@ -903,14 +903,15 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   for (unsigned i = 0; i < worker_count; ++i) {
     stores_.push_back(std::make_unique<WorkerStore>());
     WorkerStore& store = *stores_.back();
-    // WriteRecordLocked reserves a new page together with any bucket growth
-    // before it mutates the durable staging block. The arena must not reserve
-    // the same bytes again after that point.
+    // Record and UUID insertion reserve a new page together with any bucket
+    // growth before mutating durable staging. The arena must not reserve the
+    // same bytes again after that point.
     store.record_index_entry_arena_ = std::make_shared<ScanHashMapEntryArena>(
         ScanHashMapEntryArena::kMaximumPageId,
         /*externally_admitted=*/true,
         /*externally_accounted=*/false,
         /*owner_shard=*/i + 1);
+    store.indirect_keys_.SetEntryArena(store.record_index_entry_arena_);
     const std::size_t partition_count =
         (kLogicalStorageShards + worker_count - 1 - i) / worker_count;
     const std::size_t index_count = partition_count * options_.database_count_;
@@ -1500,34 +1501,48 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       RecoveryWorkerBatchTargetBytes(worker_count_);
   std::vector<std::vector<RecoveryLiveReference>> live_by_owner(worker_count_);
   std::size_t buffered_bytes = 0;
-  for (const auto& [id, handle] : store.indirect_keys_) {
-    const auto& location = handle->location_;
-    live_by_owner[location.block_owner()].push_back(
-        RecoveryLiveReference{.block_id_ = location.block_id(),
-                              .allocation_epoch_ = location.allocation_epoch(),
-                              .bytes_ = location.total_disk_bytes(),
-                              .expected_owner_ = location.block_owner()});
-    buffered_bytes += sizeof(RecoveryLiveReference);
-    if (handle->extents_ != nullptr) {
-      for (std::size_t i = 0; i < handle->extents_->size(); ++i) {
-        const auto& extent = handle->extents_->at(i);
-        const auto owner = BlockOwner(extent.block_id_);
-        if (owner >= worker_count_) {
-          status = absl::DataLossError("indirect key extent has no owner");
-          Fail(status);
-          co_return status;
-        }
-        live_by_owner[owner].push_back(RecoveryLiveReference{
-            .block_id_ = extent.block_id_,
-            .allocation_epoch_ = extent.allocation_epoch_,
-            .bytes_ = extent.payload_bytes_,
-            .expected_owner_ = owner,
-            .extent_ = true,
-            .extent_payload_bytes_ = extent.payload_bytes_,
-            .extent_index_ = static_cast<std::uint32_t>(i),
-            .extent_payload_checksum_ = extent.payload_checksum_});
-        buffered_bytes += sizeof(RecoveryLiveReference);
-      }
+  // The registry is immutable between the recovery and accounting barriers;
+  // lookups do not advance rehash. A stable cursor visits each UUID exactly
+  // once while allowing bounded batches to suspend for foreign block owners.
+  ScanHashMap<IndirectKeyHandle>::StableScanCursor indirect_key_cursor;
+  bool indirect_keys_done = false;
+  while (!indirect_keys_done) {
+    indirect_keys_done = store.indirect_keys_.ScanStableWhile(
+        &indirect_key_cursor, [&](const auto& entry) {
+          const auto& handle = entry.value_;
+          const auto& location = handle->location_;
+          live_by_owner[location.block_owner()].push_back(RecoveryLiveReference{
+              .block_id_ = location.block_id(),
+              .allocation_epoch_ = location.allocation_epoch(),
+              .bytes_ = location.total_disk_bytes(),
+              .expected_owner_ = location.block_owner()});
+          buffered_bytes += sizeof(RecoveryLiveReference);
+          if (handle->extents_ != nullptr) {
+            for (std::size_t i = 0; i < handle->extents_->size(); ++i) {
+              const auto& extent = handle->extents_->at(i);
+              const auto owner = BlockOwner(extent.block_id_);
+              if (owner >= worker_count_) {
+                status =
+                    absl::DataLossError("indirect key extent has no owner");
+                return false;
+              }
+              live_by_owner[owner].push_back(RecoveryLiveReference{
+                  .block_id_ = extent.block_id_,
+                  .allocation_epoch_ = extent.allocation_epoch_,
+                  .bytes_ = extent.payload_bytes_,
+                  .expected_owner_ = owner,
+                  .extent_ = true,
+                  .extent_payload_bytes_ = extent.payload_bytes_,
+                  .extent_index_ = static_cast<std::uint32_t>(i),
+                  .extent_payload_checksum_ = extent.payload_checksum_});
+              buffered_bytes += sizeof(RecoveryLiveReference);
+            }
+          }
+          return buffered_bytes < batch_target_bytes;
+        });
+    if (!status.ok()) {
+      Fail(status);
+      co_return status;
     }
     if (buffered_bytes >= batch_target_bytes) {
       status =
@@ -1911,7 +1926,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
   store.recovery_external_keys_.clear();
   store.recovery_external_keys_.rehash(0);
-  for (auto& [id, handle] : store.indirect_keys_) handle->recovery_key_.reset();
+  store.indirect_keys_.ForEach(
+      [](auto& entry) { entry.value_->recovery_key_.reset(); });
   worker.SpawnRoot(PeriodicFlush(&store));
   worker.SpawnBackground(ActiveExpiration(&store));
   if (options_.expiration_authority_) {

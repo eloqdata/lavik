@@ -1646,7 +1646,7 @@ class StorageEngine::Impl {
     std::uint64_t next_lsn_ = 0;
     RegisteredBufferPool buffers_;
     std::vector<FixedFile> files_;
-    // Every primary index owned by this worker shares one handle namespace.
+    // Primary indexes and the UUID registry share one worker handle namespace.
     // Declaring the arena before partitions and detached populations makes it
     // outlive every map during reverse-order WorkerStore destruction.
     std::shared_ptr<ScanHashMapEntryArena> record_index_entry_arena_;
@@ -1722,7 +1722,9 @@ class StorageEngine::Impl {
     // stream buffer or populate these maps.
     std::optional<ActiveBlock> active_indirect_key_block_;
     AsyncMutex indirect_key_allocation_mutex_;
-    absl::flat_hash_map<IndirectKeyId, IndirectKeyHandle> indirect_keys_;
+    // UUIDs are complete 16-byte binary keys under ComputeDigest, independent
+    // of the original-key digest used by the candidate map below.
+    ScanHashMap<IndirectKeyHandle> indirect_keys_;
     absl::flat_hash_map<Digest, std::vector<IndirectKeyId>, DigestHash>
         indirect_key_candidates_;
     absl::flat_hash_map<std::pair<std::uint64_t, std::uint64_t>,
@@ -3677,6 +3679,10 @@ class StorageEngine::Impl {
       WorkerStore& store, std::string_view key, const Digest& digest,
       TxShardWrites* tx, bool for_defrag, bool unlock_writer_while_waiting);
   Task<absl::StatusOr<IndirectKeyHandle>> FindIndirectKey(IndirectKeyId id);
+  // Admit and install a new identity without suspending. Foreground callers
+  // do this before writing its KeyRecord; recovery uses the same memory gate.
+  absl::Status InsertIndirectKey(WorkerStore& store,
+                                 const IndirectKeyHandle& handle);
   Task<absl::StatusOr<std::string>> LoadIndirectKey(IndirectKeyHandle handle);
   Task<absl::Status> WriteIndirectKey(WorkerStore& store,
                                       IndirectKeyHandle handle,

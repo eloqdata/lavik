@@ -235,9 +235,12 @@ layout, must be reset before this build starts.
 Keys of at most 2 KiB stay complete in the index and record header. Longer
 keys use a stable 16-byte UUID in every root, auxiliary and tombstone header;
 the indirect-key flag identifies this representation. A
-worker-owned UUID registry resolves the immutable original bytes. Runtime
-lookup still hashes the original key and verifies complete bytes on a digest
-collision. Small-key requests never consult this registry.
+worker-owned UUID registry resolves the immutable original bytes. It uses
+`ScanHashMap` and shares the worker's index entry arena and memory admission;
+registry insertion is admitted before writing a new KeyRecord. Periodic
+maintenance advances incremental rehash and shrinking even without long-key
+traffic. Runtime lookup still hashes the original key and verifies complete
+bytes on a digest collision. Small-key requests never consult this registry.
 
 Dedicated `kIndirectKeys` blocks pack UUID-to-original-key records through a
 separate, lazily opened append stream. KeyRecords use whole-value storage;

@@ -262,6 +262,58 @@ TEST(IndirectKeyE2e, BoundarySharedSegmentsAndExtentRecoverAcrossWorkers) {
   EXPECT_EQ(client.Command({"EXISTS", shared_key}).text_, "0");
 }
 
+TEST(IndirectKeyE2e, RegistryGrowthAndRecoveryPreserveUuidIdentity) {
+  PrivateDisk disk;
+  // One logical slot forces several expansions of the same UUID registry,
+  // while changing worker counts exercises recovery's foreign-owner lookups.
+  std::vector<std::string> keys;
+  for (unsigned i = 0; i < 257; ++i) {
+    keys.push_back("{uuid-registry}:" + std::to_string(i));
+    keys.back().resize(2049, 'k');
+  }
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    for (std::size_t i = 0; i < keys.size(); ++i)
+      ASSERT_EQ(client.Command({"SET", keys[i], std::to_string(i)}).text_,
+                "OK");
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      ASSERT_EQ(client.Command({"GET", keys[i]}).text_, std::to_string(i));
+      ASSERT_EQ(client.Command({"SET", keys[i], "updated"}).text_, "OK");
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // Rehash and updates must keep resolving the original UUID, without writing
+  // duplicate KeyRecords for already-known original bytes.
+  EXPECT_EQ(disk.IndirectKeyLayout().keys_.size(), keys.size());
+  {
+    Server server(disk, 3);
+    Client client(server.port());
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      ASSERT_EQ(client.Command({"GET", keys[i]}).text_, "updated");
+      if (i % 2 == 0) ASSERT_EQ(client.Command({"DEL", keys[i]}).text_, "1");
+    }
+    client.Durable();
+  }
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      if (i % 2 == 0) {
+        ASSERT_EQ(client.Command({"EXISTS", keys[i]}).text_, "0");
+        ASSERT_EQ(client.Command({"SET", keys[i], "recreated"}).text_, "OK");
+        ASSERT_EQ(client.Command({"GET", keys[i]}).text_, "recreated");
+      } else {
+        ASSERT_EQ(client.Command({"GET", keys[i]}).text_, "updated");
+      }
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  EXPECT_EQ(disk.IndirectKeyLayout().keys_.size(), keys.size());
+}
+
 TEST(IndirectKeyE2e, KeyLargerThanExternalGroupReadsAndMutates) {
   PrivateDisk disk;
   // Key extents are independent of the smaller, indivisible Hash value.

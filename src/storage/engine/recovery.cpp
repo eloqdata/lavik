@@ -635,9 +635,11 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           const unsigned owner = (id[0] & 0x3fff) % worker_count_;
           auto install = [this, owner, handle]() -> absl::Status {
             auto& target = *stores_[owner];
-            auto [it, added] =
-                target.indirect_keys_.try_emplace(handle->id_, handle);
-            if (added) {
+            const auto key = IndirectKeyIdBytes(handle->id_);
+            auto* entry = target.indirect_keys_.Find(ComputeDigest(key), key);
+            if (entry == nullptr) {
+              auto inserted = InsertIndirectKey(target, handle);
+              if (!inserted.ok()) return inserted;
               target.indirect_key_candidates_[handle->digest_].push_back(
                   handle->id_);
               if (!target.indirect_key_gc_queue_)
@@ -645,14 +647,15 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                     std::make_unique<std::deque<IndirectKeyId>>();
               target.indirect_key_gc_queue_->push_back(handle->id_);
             } else {
-              if (*it->second->recovery_key_ != *handle->recovery_key_ ||
-                  it->second->location_.logical_size_ !=
+              auto& existing = entry->value_;
+              if (*existing->recovery_key_ != *handle->recovery_key_ ||
+                  existing->location_.logical_size_ !=
                       handle->location_.logical_size_)
                 return absl::DataLossError(
                     "inconsistent copies of indirect key");
-              const auto copies = it->second->physical_copies_ + 1;
-              if (it->second->lsn_ < handle->lsn_) it->second = handle;
-              it->second->physical_copies_ = copies;
+              const auto copies = existing->physical_copies_ + 1;
+              if (existing->lsn_ < handle->lsn_) existing = handle;
+              existing->physical_copies_ = copies;
             }
             return absl::OkStatus();
           };

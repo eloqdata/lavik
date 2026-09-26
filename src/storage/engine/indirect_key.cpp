@@ -22,13 +22,38 @@ Task<absl::StatusOr<IndirectKeyHandle>> StorageEngine::Impl::FindIndirectKey(
     IndirectKeyId id) {
   const auto owner = static_cast<unsigned>((id[0] & 0x3fff) % worker_count_);
   auto find = [this, owner, id]() -> absl::StatusOr<IndirectKeyHandle> {
-    auto it = stores_[owner]->indirect_keys_.find(id);
-    if (it == stores_[owner]->indirect_keys_.end())
+    const auto bytes = IndirectKeyIdBytes(id);
+    // Recovery may be suspended mid-registry scan on this worker. Read-only
+    // resolution must preserve its cursor; periodic maintenance drives rehash.
+    const auto* entry = std::as_const(stores_[owner]->indirect_keys_)
+                            .Find(ComputeDigest(bytes), bytes);
+    if (entry == nullptr)
       return absl::DataLossError("record references a missing indirect key");
-    return it->second;
+    return entry->value_;
   };
   if (owner == bycorf::ThisWorker().id_) co_return find();
   co_return co_await bycorf::SubmitTo(owner, std::move(find));
+}
+
+absl::Status StorageEngine::Impl::InsertIndirectKey(
+    WorkerStore& store, const IndirectKeyHandle& handle) {
+  const auto key = IndirectKeyIdBytes(handle->id_);
+  const auto digest = ComputeDigest(key);
+  auto& index = store.indirect_keys_;
+  if (!index.CanAllocateEntry(key, true, false))
+    return absl::ResourceExhaustedError(
+        "indirect key index capacity exhausted");
+  // The shared arena accounts actual bytes but relies on its caller to admit
+  // allocation. No suspension may separate this check from insertion.
+  auto admission = TryReserveMemory(
+      index.RequiredAllocationBytes(digest, key, true, false, true));
+  if (!admission) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM indirect key index admission");
+  }
+  if (index.InsertNew(digest, key, handle) == nullptr)
+    return absl::ResourceExhaustedError("indirect key index allocation failed");
+  return absl::OkStatus();
 }
 
 Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadIndirectKey(
@@ -124,23 +149,25 @@ Task<absl::StatusOr<IndirectKeyHandle>> StorageEngine::Impl::EnsureIndirectKey(
   if (tx != nullptr) {
     for (const auto& cached : tx->indirect_keys_) {
       if (cached.key_ != key) continue;
-      auto found = store.indirect_keys_.find(cached.id_);
-      if (found != store.indirect_keys_.end() && !found->second->retired_)
-        co_return found->second;
+      const auto bytes = IndirectKeyIdBytes(cached.id_);
+      const auto* found =
+          store.indirect_keys_.Find(ComputeDigest(bytes), bytes);
+      if (found != nullptr && !found->value_->retired_) co_return found->value_;
     }
   }
   auto candidates = store.indirect_key_candidates_.find(digest);
-  // Copy identities before I/O: a different long key may rehash the registry.
+  // Copy identities before I/O: another write may mutate the candidate map.
   std::vector<IndirectKeyId> ids =
       candidates == store.indirect_key_candidates_.end()
           ? std::vector<IndirectKeyId>{}
           : candidates->second;
   for (auto id : ids) {
-    auto found = store.indirect_keys_.find(id);
-    if (found == store.indirect_keys_.end() || found->second->retired_ ||
-        found->second->location_.logical_size_ != key.size())
+    const auto bytes = IndirectKeyIdBytes(id);
+    const auto* found = store.indirect_keys_.Find(ComputeDigest(bytes), bytes);
+    if (found == nullptr || found->value_->retired_ ||
+        found->value_->location_.logical_size_ != key.size())
       continue;
-    auto handle = found->second;
+    auto handle = found->value_;
     auto actual = co_await LoadIndirectKey(handle);
     if (!actual.ok()) co_return actual.status();
     if (*actual != key) continue;
@@ -163,12 +190,28 @@ Task<absl::StatusOr<IndirectKeyHandle>> StorageEngine::Impl::EnsureIndirectKey(
     auto* bytes = reinterpret_cast<unsigned char*>(handle->id_.data());
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  } while (store.indirect_keys_.contains(handle->id_));
+  } while (
+      store.indirect_keys_.Find(ComputeDigest(IndirectKeyIdBytes(handle->id_)),
+                                IndirectKeyIdBytes(handle->id_)) != nullptr);
   handle->digest_ = digest;
+  // Reserve the identity before any KeyRecord reaches staging. The caller's
+  // handle pins this unpublished entry through I/O; original-key candidates
+  // and the cleaner see it only after the durability fence succeeds.
+  auto inserted = InsertIndirectKey(store, handle);
+  if (!inserted.ok()) co_return inserted;
   auto written =
       co_await WriteIndirectKey(store, handle, key, for_defrag, true);
-  if (!written.ok()) co_return written;
-  store.indirect_keys_.emplace(handle->id_, handle);
+  if (!written.ok()) {
+    if (handle->physical_copies_ == 0) {
+      const auto bytes = IndirectKeyIdBytes(handle->id_);
+      store.indirect_keys_.Erase(ComputeDigest(bytes), bytes);
+    } else {
+      // A failed durability fence can leave a physical KeyRecord. Retain its
+      // identity and stop writes rather than dropping its retirement metadata.
+      LatchRuntimeFailure(store);
+    }
+    co_return written;
+  }
   if (!store.indirect_key_gc_queue_)
     store.indirect_key_gc_queue_ =
         std::make_unique<std::deque<IndirectKeyId>>();
@@ -193,17 +236,17 @@ Task<absl::Status> StorageEngine::Impl::ReleaseIndirectKeyReferences(
     const unsigned owner = (id[0] & 0x3fff) % worker_count_;
     auto release = [this, owner, id]() -> absl::Status {
       auto& registry = *stores_[owner];
-      auto found = registry.indirect_keys_.find(id);
-      if (found == registry.indirect_keys_.end() ||
-          found->second->physical_copies_ == 0)
+      const auto bytes = IndirectKeyIdBytes(id);
+      auto* found = registry.indirect_keys_.Find(ComputeDigest(bytes), bytes);
+      if (found == nullptr || found->value_->physical_copies_ == 0)
         return absl::DataLossError("indirect key copy accounting underflow");
-      auto& handle = found->second;
+      auto& handle = found->value_;
       if (--handle->physical_copies_ == 0) {
         if (!handle->retired_)
           return absl::DataLossError("live UUID lost its last physical copy");
         if (handle->extents_ != nullptr)
           SpawnExtentReclaim(registry, handle->extents_);
-        registry.indirect_keys_.erase(found);
+        registry.indirect_keys_.Erase(found);
       }
       return absl::OkStatus();
     };
@@ -218,6 +261,11 @@ Task<absl::Status> StorageEngine::Impl::ReleaseIndirectKeyReferences(
 }
 
 void StorageEngine::Impl::RequestIndirectKeyCleaning(WorkerStore& store) {
+  // The GC queue can empty before a shrink finishes. Periodic flush keeps
+  // advancing a bounded number of buckets even without long-key traffic.
+  for (unsigned step = 0; step < 64 && store.indirect_keys_.Maintain();
+       ++step) {
+  }
   if ((!store.indirect_key_gc_queue_ ||
        store.indirect_key_gc_queue_->empty()) ||
       store.indirect_key_cleaner_running_ ||
@@ -241,19 +289,20 @@ Task<absl::Status> StorageEngine::Impl::CleanIndirectKeys(WorkerStore* store) {
       UnlockGuard unlock(&store->store_state_mutex_, store->worker_);
       auto id = store->indirect_key_gc_queue_->front();
       store->indirect_key_gc_queue_->pop_front();
-      auto found = store->indirect_keys_.find(id);
-      if (found == store->indirect_keys_.end()) continue;
-      if (found->second.use_count() != 1) {
+      const auto bytes = IndirectKeyIdBytes(id);
+      auto* found = store->indirect_keys_.Find(ComputeDigest(bytes), bytes);
+      if (found == nullptr) continue;
+      if (found->value_.use_count() != 1) {
         store->indirect_key_gc_queue_->push_back(id);
         continue;
       }
       // No allocated user record or in-flight operation can name this UUID.
       // Its own extents remain dependent on every physical KeyRecord copy;
       // recovery can still parse those stale copies until their bits clear.
-      retired = RetiredRecordOf(found->second->location_);
-      found->second->retired_ = true;
+      retired = RetiredRecordOf(found->value_->location_);
+      found->value_->retired_ = true;
       auto candidates =
-          store->indirect_key_candidates_.find(found->second->digest_);
+          store->indirect_key_candidates_.find(found->value_->digest_);
       if (candidates != store->indirect_key_candidates_.end()) {
         std::erase(candidates->second, id);
         if (candidates->second.empty())
@@ -294,10 +343,10 @@ Task<absl::Status> StorageEngine::Impl::RelocateIndirectKey(
   auto& store = CurrentStore();
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-  auto found = store.indirect_keys_.find(id);
-  if (found == store.indirect_keys_.end() || found->second->retired_)
-    co_return absl::OkStatus();
-  auto handle = found->second;
+  const auto bytes = IndirectKeyIdBytes(id);
+  const auto* found = store.indirect_keys_.Find(ComputeDigest(bytes), bytes);
+  if (found == nullptr || found->value_->retired_) co_return absl::OkStatus();
+  auto handle = found->value_;
   const auto source = handle->location_;
   if (source.block_id() != block_id || source.record_offset() != offset)
     co_return absl::OkStatus();
