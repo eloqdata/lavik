@@ -269,8 +269,12 @@ reconstructs block dependencies before reclaiming orphans. Shutdown checkpoints
 are declined while indirect-key state remains, so startup follows this complete
 cold-recovery path.
 
-Grouped Strings split their value into fixed 8 KiB ordinary group records;
-their root carries byte length and graph identity. The grouped lifecycle,
+User Strings of at least 16 KiB split their value into fixed 8 KiB group records,
+regardless of key length; smaller Strings retain their compact representation.
+Older whole-value large String records require a fresh import: cold recovery,
+checkpoint recovery and user reads reject that layout. Dedicated KeyRecords
+retain their whole-value representation independently of this user-value rule.
+Grouped String roots carry byte length and graph identity. The grouped lifecycle,
 including direct segment indexing and root-only TTL updates, is described in
 [Grouped collections](09-grouped-collections.md).
 

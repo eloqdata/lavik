@@ -46,7 +46,7 @@ enum class OrderedCollectionKind : std::uint8_t {
 inline constexpr std::size_t kStringGroupBytes = kCollectionGroupTargetBytes;
 
 // String promotion follows the same value-size boundary as other collections.
-// Each segment carries the parent key, so long keys increase grouped disk use.
+// Long parent keys are shared through UUIDs, independently of segment size.
 inline constexpr bool ShouldGroupString(std::size_t value_bytes) noexcept {
   return value_bytes >= kCollectionPromotionBytes;
 }

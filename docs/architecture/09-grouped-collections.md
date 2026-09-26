@@ -64,8 +64,10 @@ For grouped Strings, GETRANGE/GETBIT read only intersecting segments;
 SETRANGE/SETBIT/APPEND replace intersecting segments and any changed tail link
 through the shared grouped publication boundary. General whole-value callbacks
 materialize grouped Strings and reuse unchanged segments in their after-image.
-Strings below the promotion threshold use whole-value reads and writes, with
-extents where needed.
+Strings below the promotion threshold use compact whole-value reads and writes.
+Older whole-value large user Strings are unsupported on disk; import them again
+into a fresh data set. This restriction does not apply to the dedicated
+KeyRecords that store original key bytes.
 
 ## Identity and ownership
 
