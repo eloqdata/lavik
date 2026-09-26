@@ -534,6 +534,9 @@ struct ReplicationDirective {
   // commands, or unitless counts as named by the kind.
   enum class Kind : std::uint8_t {
     kSetUpstream,
+    // Explicit standalone native Lavik upstream; Redis REPLICAOF never
+    // infers this protocol from the endpoint.
+    kSetNativeUpstream,
     kAddUpstream,
     kBacklogBytes,
     kBacklogBackpressure,

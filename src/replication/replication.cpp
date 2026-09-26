@@ -1053,7 +1053,8 @@ ReplicationManager::ReplicationGroup::ReplicationGroup(
     StoreRole(ReplicationRole::kConnecting, std::memory_order_relaxed);
     role_epoch_.store(1, std::memory_order_relaxed);
   }
-  // Every external upstream uses the Redis PSYNC connection path.
+  // The startup replicaof option uses Redis PSYNC. Runtime LAVIK.REPLICAOF
+  // selects native replication explicitly after construction.
   initial_redis_connection_pending_ = upstream_.has_value();
   PublishUpstreamSnapshot();
   auto initial = std::make_shared<HeartbeatSnapshot>();
@@ -6923,7 +6924,7 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
     {
       AssertStateOwner();
       if (active_replica_session_ != session) {
-        // Explicit REPLICAOF reconfiguration moved this attempt to its own
+        // Explicit upstream reconfiguration moved this attempt to its own
         // node-level teardown. It owns abort and any failure latch; this
         // coordinator must neither race a second abort nor start a new
         // attempt until that transition commits.
@@ -12305,6 +12306,9 @@ Task<absl::Status> ReplicationManager::ApplyDirective(
   switch (directive.kind_) {
     case ReplicationDirective::Kind::kSetUpstream:
       co_return co_await group_->SetUpstream(std::move(directive.upstream_));
+    case ReplicationDirective::Kind::kSetNativeUpstream:
+      co_return co_await group_->SetUpstream(std::move(directive.upstream_),
+                                             true);
     case ReplicationDirective::Kind::kAddUpstream:
       if (!directive.upstream_.has_value()) {
         co_return absl::InvalidArgumentError(

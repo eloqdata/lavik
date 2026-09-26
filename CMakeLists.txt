@@ -1601,6 +1601,13 @@ endforeach()
     set_tests_properties(lavik_native_ack_e2e PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
     find_program(LAVIK_REDIS_SERVER_EXECUTABLE redis-server)
     find_program(LAVIK_REDIS_CLI_EXECUTABLE redis-cli)
+    if (LAVIK_REDIS_CLI_EXECUTABLE)
+      add_test(NAME lavik_native_replicaof_e2e
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/native_replicaof_e2e.sh
+                $<TARGET_FILE:lavik> ${LAVIK_REDIS_CLI_EXECUTABLE})
+      set_tests_properties(lavik_native_replicaof_e2e
+        PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+    endif()
     if (LAVIK_REDIS_SERVER_EXECUTABLE AND LAVIK_REDIS_CLI_EXECUTABLE)
       set(LAVIK_FOLLOWER_META_ARGS
         $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik-ctl>)
