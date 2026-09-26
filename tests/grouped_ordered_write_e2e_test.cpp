@@ -876,19 +876,20 @@ class GroupedFullDiskExpirationE2e
     : public ::testing::TestWithParam<std::tuple<ValueType, bool>> {};
 
 TEST_P(GroupedFullDiskExpirationE2e, ReclaimsGraphAndRecovers) {
-  const auto [type, external_key] = GetParam();
+  const auto [type, indirect_key] = GetParam();
   // Inline groups occupy the only foreground block on the minimum device.
-  // Oversized groups instead consume two extents each; external parent keys
-  // make those extents depend on retirement of their transaction record block.
+  // Oversized groups instead consume two value extents each; their indirect
+  // parent keys share one additional dedicated key block. UUID dependencies
+  // survive until the referencing transaction record block retires.
   // Indexed Sorted Sets persist the member in two graphs. Keep inline bytes
-  // per key unchanged, and give the external case its six extra extent blocks;
+  // per key unchanged, and give that case its six extra extent blocks;
   // the final 1 MiB/9 MiB SET below must still prove the device is actually
   // full.
   const bool indexed = type == ValueType::kSortedSet;
-  PrivateDisk disk((external_key ? (indexed ? 176ULL : 128ULL) : 80ULL) * 1024 *
+  PrivateDisk disk((indirect_key ? (indexed ? 184ULL : 136ULL) : 80ULL) * 1024 *
                    1024);
   const std::string member(
-      external_key ? 9 * 1024 * 1024 : (indexed ? 512 : 1024) * 1024, 'v');
+      indirect_key ? 9 * 1024 * 1024 : (indexed ? 512 : 1024) * 1024, 'v');
   absl::StatusOr<std::string> compact;
   if (type == ValueType::kHash || type == ValueType::kSet) {
     HashValue value;
@@ -909,13 +910,13 @@ TEST_P(GroupedFullDiskExpirationE2e, ReclaimsGraphAndRecovers) {
                                               .value_type_ = type});
   ASSERT_TRUE(dump.ok()) << dump.status();
   std::vector<std::string> expired_keys;
-  const auto key_count = external_key ? 3 : 7;
+  const auto key_count = indirect_key ? 3 : 7;
   for (int i = 0; i < key_count; ++i) {
     auto key = "expiring:" + std::to_string(i);
-    if (external_key) key.resize(32 * 1024, 'k');
+    if (indirect_key) key.resize(32 * 1024, 'k');
     expired_keys.push_back(std::move(key));
   }
-  const std::string replacement = external_key ? member : "space reclaimed";
+  const std::string replacement = indirect_key ? member : "space reclaimed";
   {
     Server server(disk, 1);
     Client client(server.port());
@@ -940,7 +941,7 @@ TEST_P(GroupedFullDiskExpirationE2e, ReclaimsGraphAndRecovers) {
     ASSERT_EQ(
         client
             .Command({"SET", "cannot-fit",
-                      external_key ? member : std::string(1024 * 1024, 'v')})
+                      indirect_key ? member : std::string(1024 * 1024, 'v')})
             .text_,
         "QUEUED");
     const auto exhausted = client.Command({"EXEC"});
@@ -1012,12 +1013,12 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<GroupedFullDiskExpirationE2e::ParamType>&
            info) {
       const auto type = std::get<0>(info.param);
-      const auto external = std::get<1>(info.param);
+      const auto indirect = std::get<1>(info.param);
       std::string name = type == ValueType::kHash   ? "Hash"
                          : type == ValueType::kSet  ? "Set"
                          : type == ValueType::kList ? "List"
                                                     : "SortedSet";
-      return name + (external ? "External" : "Inline");
+      return name + (indirect ? "Indirect" : "Inline");
     });
 
 TEST(GroupedOrderedWriteE2e, SortedSetRemovalPopAndStoreCommandSurface) {

@@ -474,10 +474,11 @@ std::uint64_t CopyCommittedHeaderToUnusedAllocatedBlock(
 }
 
 // These fixtures target ordinary-block defrag, including its PAUSE contract.
-// Oversized parent keys keep large Strings in that layout; short-key grouped
-// String expiration/reclamation is covered by the grouped write suite.
+// Keep both keys and values below their indirect/grouped thresholds so all
+// capacity belongs to ordinary record blocks. Grouped String reclamation is
+// covered by the grouped write suite.
 std::string OrdinaryKey(std::string_view suffix) {
-  return std::string(8193, 'k') + std::string(suffix);
+  return "ordinary:" + std::string(suffix);
 }
 
 }  // namespace
@@ -512,7 +513,7 @@ int main(int argc, char** argv) {
 
   try {
     const std::uint16_t port = FindFreePort();
-    const std::string value(900 * 1024, 'v');
+    const std::string value(15 * 1024, 'v');
     CreateDataFile(data_path, 96ULL * 1024 * 1024);
 
     {
@@ -522,7 +523,7 @@ int main(int argc, char** argv) {
 
       unsigned inserted = 0;
       bool observed_full = false;
-      for (unsigned i = 0; i < 32; ++i) {
+      for (unsigned i = 0; i < 4096; ++i) {
         const std::string key = OrdinaryKey("old-" + std::to_string(i));
         const std::string response = client.Command({"SET", key, value});
         if (response == "+OK") {
@@ -583,7 +584,9 @@ int main(int argc, char** argv) {
       {
         ServerProcess server(argv[1], port, {expiry_full_path}, log_path);
         RespClient client = Connect(port);
-        constexpr unsigned kExpiringKeys = 7;
+        // Expiring records occupy roughly 6 MiB of the 8 MiB block, leaving
+        // its live ratio below the defrag threshold once those keys expire.
+        constexpr unsigned kExpiringKeys = 400;
         for (unsigned i = 0; i < kExpiringKeys; ++i) {
           // Keep the keys in one low-numbered partition so the assertion
           // measures retirement and reclaim, not a complete partition sweep.
@@ -593,7 +596,7 @@ int main(int argc, char** argv) {
                  "full-device expiring SET");
         }
         bool observed_full = false;
-        for (unsigned i = 0; i < 64; ++i) {
+        for (unsigned i = 0; i < 1024; ++i) {
           const std::string key = OrdinaryKey("full-live-" + std::to_string(i));
           const std::string response = client.Command({"SET", key, value});
           if (response == "+OK") continue;
@@ -705,9 +708,10 @@ int main(int argc, char** argv) {
                            log_path);
       RespClient client = Connect(port);
       Expect(client.Command({"PING"}), "+PONG", "unequal-device PING");
+      const std::string large_value(900 * 1024, 'v');
       for (unsigned i = 0; i < 20; ++i) {
         const std::string key = "unequal-" + std::to_string(i);
-        Expect(client.Command({"SET", key, value}), "+OK",
+        Expect(client.Command({"SET", key, large_value}), "+OK",
                "unequal-device SET");
       }
       Expect(client.Command({"DBSIZE"}), ":20", "unequal-device DBSIZE");
