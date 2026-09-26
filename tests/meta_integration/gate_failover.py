@@ -499,9 +499,9 @@ def redis_call(data, arguments, db=0):
         return read_resp(reader)
 
 
-def redis_error(data, arguments):
-    with socket.create_connection(endpoint(data), timeout=3.0) as connection:
-        connection.settimeout(3.0)
+def redis_error(data, arguments, *, timeout=3.0):
+    with socket.create_connection(endpoint(data), timeout=timeout) as connection:
+        connection.settimeout(timeout)
         connection.sendall(encode_resp(arguments))
         line = connection.makefile("rb").readline()
     if not line.startswith(b"-") or not line.endswith(b"\r\n"):

@@ -420,10 +420,15 @@ def controlled_pause(root, mode, boundary):
             try:
                 paused_at(owner, variable)
                 fixture.submit_failover()
+                # A probe dispatched before Pause can wait behind the held
+                # FLUSH's publication order. Keep each probe short so polling
+                # does not extend the drain past the source's lease/observation
+                # window; a fresh request will observe the admission barrier.
                 H.wait_until(
                     "Controlled Pause blocks new FLUSH",
                     15,
-                    lambda: F.redis_error(owner, ["FLUSHDB"]).startswith("TRYAGAIN"),
+                    lambda: F.redis_error(owner, ["FLUSHDB"], timeout=0.1)
+                    == "TRYAGAIN Failover in progress",
                 )
                 # Controlled Pause preserves the registered operation, but
                 # the Owner can lose its finite lease during the pause. That
@@ -459,6 +464,7 @@ def controlled_pause(root, mode, boundary):
         )
         selected = begin["candidate"]
         F.wait_serving_owner(fixture, selected, fixture.data_nodes, timeout=60)
+        F.parse_failover_log(fixture.metas)
         successor = Client(fixture.by_id[selected])
         try:
             assert successor.call("GET", "old") == expected
