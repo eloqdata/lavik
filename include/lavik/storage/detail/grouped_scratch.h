@@ -36,6 +36,7 @@ namespace lavik::storage {
 // Callers select the pages first: a point read must not reserve the unrelated
 // value bytes of the entire collection. Page readers separately check the
 // decoded count against this physical envelope before allocating entries.
+// Remote page loaders separately admit their owned parent-key copy.
 class GroupedScratchBudget {
  public:
   absl::Status AddGroup(

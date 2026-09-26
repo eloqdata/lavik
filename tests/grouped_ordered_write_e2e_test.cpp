@@ -288,6 +288,79 @@ TEST(IndirectKeyE2e, KeyLargerThanExternalGroupReadsAndMutates) {
   EXPECT_EQ(client.Command({"HGET", key, "another"}).text_, "small");
 }
 
+TEST(IndirectKeyE2e, RemoteGroupedReadsAdmitParentKeyCopies) {
+  PrivateDisk disk;
+  disk.PreserveOnFailure();
+  auto make_key = [](unsigned owner, char type) {
+    std::string key;
+    for (unsigned tag = 0;; ++tag) {
+      key = "{key-copy-" + std::to_string(tag) + "}";
+      if (RedisSlot(key) % 3 == owner) break;
+    }
+    key += type;
+    key.resize(16 * 1024 * 1024, 'k');
+    return key;
+  };
+  const std::array hash_keys{make_key(0, 'h'), make_key(1, 'h')};
+  const std::array list_keys{make_key(0, 'l'), make_key(1, 'l')};
+  const std::string value(20000, 'v');
+  {
+    // One writer packs these small grouped pages into one physical block.
+    // After recovery with three workers, at least one of the two logical key
+    // owners must read remotely, for both the Hash and ordered loaders.
+    Server server(disk, 1, {}, {}, false, 2, "1G", {}, "128M");
+    Client client(server.port());
+    for (const auto& key : hash_keys)
+      ASSERT_EQ(client.Command({"HSET", key, "field", value}).text_, "1");
+    for (const auto& key : list_keys)
+      ASSERT_EQ(client.Command({"RPUSH", key, value}).text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    // Each logical owner retains two 16 MiB side-index keys. Its 48 MiB
+    // retained-memory quota fits the pages, but not another complete key copy.
+    // Client request buffers have a separate budget so they cannot mask this
+    // storage admission check.
+    Server limited(disk, 3, {}, {}, false, 2, "160M", {}, "128M");
+    limited.PreserveOnFailure();
+    Client client(limited.port());
+    unsigned rejected_hash = 0;
+    unsigned rejected_list = 0;
+    for (unsigned i = 0; i < hash_keys.size(); ++i) {
+      EXPECT_EQ(client.Command({"HLEN", hash_keys[i]}).text_, "1");
+      EXPECT_EQ(client.Command({"LLEN", list_keys[i]}).text_, "1");
+      const auto hash = client.Command({"HGET", hash_keys[i], "field"});
+      const auto list = client.Command({"LINDEX", list_keys[i], "0"});
+      for (const auto* reply : {&hash, &list}) {
+        if (reply->kind_ == '-') {
+          EXPECT_EQ(reply->text_, "OOM grouped parent key copy admission");
+        } else {
+          ASSERT_EQ(reply->kind_, '$') << reply->text_;
+          EXPECT_EQ(reply->text_, value);
+        }
+      }
+      rejected_hash += hash.kind_ == '-';
+      rejected_list += list.kind_ == '-';
+    }
+    EXPECT_GT(rejected_hash, 0);
+    EXPECT_GT(rejected_list, 0);
+    EXPECT_NE(client.Command({"INFO", "MEMORY"})
+                  .text_.find("memory_admission_pending:0\r\n"),
+              std::string::npos);
+    ASSERT_EQ(limited.Wait(true), 0) << limited.Log();
+  }
+  Server recovered(disk, 3, {}, {}, false, 2, "1G", {}, "128M");
+  Client client(recovered.port());
+  for (const auto& key : hash_keys)
+    EXPECT_EQ(client.Command({"HGET", key, "field"}).text_, value);
+  for (const auto& key : list_keys)
+    EXPECT_EQ(client.Command({"LINDEX", key, "0"}).text_, value);
+  EXPECT_NE(client.Command({"INFO", "MEMORY"})
+                .text_.find("memory_admission_pending:0\r\n"),
+            std::string::npos);
+}
+
 TEST(IndirectKeyE2e, CollectionsTransactionsAndExpiryKeepOriginalNames) {
   PrivateDisk disk;
   const std::string prefix(4096, 'k');

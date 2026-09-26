@@ -141,6 +141,15 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
                                        original.db_epoch_);
     } else {
       const unsigned owner = location.block_owner();
+      // Page scratch excludes the parent key. Admit the remote reader's copy
+      // here for every caller, and retain admission through the awaited read.
+      auto key_admission =
+          TryReserveMemory(AllocatorUsableSizeForRequest(key.size() + 1));
+      if (!key_admission) {
+        RecordMemoryRejection();
+        co_return absl::ResourceExhaustedError(
+            "OOM grouped parent key copy admission");
+      }
       loaded = co_await bycorf::SubmitTaskTo(
           owner,
           [this, owner, db_id, owned_key = std::string(key), location,
