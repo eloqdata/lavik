@@ -65,7 +65,7 @@ HashDiskLayout InspectHashLayout(const PrivateDisk& disk,
       }
       if (stored_key == key && record.grouped_ && !record.auxiliary_group_ &&
           record.mutation_sequence_ >= root_sequence) {
-        Check(!record.external_ && !record.key_external_,
+        Check(!record.external_ && !record.key_indirect_,
               "fixture root must be inline");
         auto root = DecodeGroupedHashRoot(std::string_view(
             reinterpret_cast<const char*>(bytes.data() + offset +

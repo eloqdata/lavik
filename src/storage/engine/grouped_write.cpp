@@ -76,28 +76,23 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
     co_return absl::InvalidArgumentError(
         "invalid prefix-group collection type");
   }
-  // An auxiliary identity adds 32 bytes to the optional ordinary header.
-  // Decide key externalization with that framing included, not the ordinary
-  // key threshold alone, or a boundary-length key would overrun one page.
-  const bool key_external = key.size() > options_.inline_key_max_bytes_ ||
-                            RecordHeaderBytes(key.size(), false, true, false,
-                                              true) > kBlockHeaderSlotBytes;
-  const std::size_t prefix_bytes = key_external ? key.size() : 0;
+  // The fixed inline threshold leaves room for the auxiliary identity in
+  // the bounded record header; long parent keys contribute only their UUID.
+  const bool key_indirect = key.size() > kInlineKeyMaxBytes;
   if (!ValidRecordKeySize(key.size()) ||
-      prefix_bytes > kMaxRecordPayloadBytes - encoder.encoded_bytes()) {
+      encoder.encoded_bytes() > kMaxRecordPayloadBytes) {
     co_return absl::OutOfRangeError(
-        "group snapshot and external key exceed the record payload limit");
+        "group snapshot exceeds the record payload limit");
   }
   const std::size_t inline_bytes = AlignRecord(
-      RecordHeaderBytes(key.size(), key_external, true, false, true) +
-      prefix_bytes + encoder.encoded_bytes());
+      RecordHeaderBytes(key.size(), key_indirect, true, false, true) +
+      encoder.encoded_bytes());
   const bool external = inline_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
                         inline_bytes > options_.buffers_.write_buffer_bytes_;
   ExtentManifest extents;
   std::string payload;
   if (external) {
-    RecordPayloadCursor cursor(encoder,
-                               key_external ? key : std::string_view{});
+    RecordPayloadCursor cursor(encoder, std::string_view{});
     auto written = co_await WriteExtentValueLocked(store, {}, {}, &cursor, key);
     if (!written.ok()) co_return written.status();
     extents = std::move(*written);
@@ -125,7 +120,7 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
   RecordLocation location;
   auto written = co_await WriteRecordLocked(
       store, db_id, key, payload, RecordKind::kValue, value_type, 0, digest,
-      tx.txid_, sequence, false, true, external, key_external,
+      tx.txid_, sequence, false, true, external, key_indirect,
       snapshot.value_.entries_.size(), extents, &location, nullptr, &tx,
       nullptr, nullptr, nullptr, nullptr, &partition, &identity);
   if (!written.ok()) {

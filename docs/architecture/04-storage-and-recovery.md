@@ -177,9 +177,8 @@ The alternating header slots record block identity, writer topology,
 allocation epoch, committed boundary, record count, maximum physical LSN,
 header sequence, kind, and kind-specific metadata. Slot selection prefers the
 higher allocation epoch and then the higher header sequence. Current block
-kinds are ordinary records, payload extents, transaction generations,
-and checkpoint index chunks; on-disk enum value 3 remains deliberately
-unassigned.
+kinds are ordinary records, payload extents, indirect-key records (kind 3),
+transaction generations, and checkpoint index chunks.
 
 Records are 8-byte aligned and carry their database and value type, key
 representation, logical and physical sizes, transaction ID, database and
@@ -197,7 +196,7 @@ restart would reject.
 The version-1 record wire layout has a 72-byte base header at explicit byte
 offsets. A nonzero transaction ID and expiration timestamp each add one aligned
 8-byte extension, so ordinary fixed metadata is 72, 80, or 88 bytes. The base packs
-record kind, database, value type, external-payload state, external-key state,
+record kind, database, value type, external-payload state, indirect-key state,
 grouped-root and auxiliary-group markers, and extension presence into one
 16-bit word. An auxiliary group carries an additional 32-byte checked
 identity containing its object incarnation, routing identity, retirement bit
@@ -233,12 +232,43 @@ directly replaces earlier layouts that also used version 1; there is no
 compatibility decoder. Older media, including the earlier 104-byte record
 layout, must be reset before this build starts.
 
-Keys that do not fit the configured inline header limit move into the payload.
-Large indivisible key/value payloads use a root record containing an extent
-manifest. Each extent reference identifies a dedicated extent block by block ID, allocation
-epoch, byte count, and payload checksum. The extent block header repeats its
-index, length, and checksum so reads and recovery can validate the complete
-root-to-child identity.
+Keys of at most 2 KiB stay complete in the index and record header. Longer
+keys use a stable 16-byte UUID in every root, auxiliary and tombstone header;
+the indirect-key flag identifies this representation. A
+worker-owned UUID registry resolves the immutable original bytes. Runtime
+lookup still hashes the original key and verifies complete bytes on a digest
+collision. Small-key requests never consult this registry.
+
+Dedicated `kIndirectKeys` blocks pack UUID-to-original-key records through a
+separate, lazily opened append stream. KeyRecords use whole-value storage;
+keys exceeding a block's available payload (8 MiB less headers) use ordinary
+payload extents. KeyRecords are never grouped. The UUID includes its logical
+slot and remains stable when its physical record moves or worker count changes.
+A KeyRecord is durable before a referencing user record can enter staging.
+
+Indivisible values and oversized KeyRecords use a record containing an extent
+manifest. Each reference identifies a dedicated extent block by block ID,
+allocation epoch, byte count, and payload checksum. The extent header repeats
+its index, length, and checksum. User value manifests contain only value bytes;
+they never repeat the original long key.
+
+Every allocated user-record block retains its UUID references, including
+obsolete versions, expired values and aborted transaction prepares. Removing
+user visibility does not release those recovery dependencies: they leave only
+after the block's allocation bit is durably cleared. Once no physical user
+record or in-flight operation references a UUID, its KeyRecord becomes dead.
+The UUID registry tracks all remaining physical KeyRecord copies; shared key
+extents are reclaimed only after the last such copy's block is retired.
+
+KeyRecord cleaning has a separate relocation routine and shares device permits,
+allocation reserves and durability fences with other storage maintenance. It
+updates one UUID-to-location entry after the new copy is durable. Ordinary
+record defrag never interprets KeyRecords as user entries. Recovery first
+rebuilds the UUID registry and extent owners, then scans user records and
+reconstructs block dependencies before reclaiming orphans. Shutdown checkpoints
+are declined while indirect-key state remains, so startup follows this complete
+cold-recovery path.
+
 Grouped Strings split their value into fixed 8 KiB ordinary group records;
 their root carries byte length and graph identity. The grouped lifecycle,
 including direct segment indexing and root-only TTL updates, is described in
@@ -249,7 +279,7 @@ including direct segment indexing and root-only TTL updates, is described in
 ### Preparation
 
 `Prepare` runs before Bycorf workers start. It validates the worker count,
-inline-key limit, flush alignment, per-device defrag concurrency, configured
+flush alignment, per-device defrag concurrency, configured
 paths, capacities, and membership. A fresh regular file must be an 8 MiB
 multiple. A raw device uses its complete 8 MiB blocks and ignores a shorter
 tail. With the current fixed metadata and eight-block per-device defrag reserve,
@@ -418,7 +448,7 @@ The command's database admission remains held through publication. This applies 
 SADD/SREM, ordinary single-key List writes, and ZADD/ZINCRBY/ZREM. Successful
 no-ops and transitions to empty or grouped values also validate before returning
 or publishing. Multi-key operations, transactions, Stream writes,
-native candidate/loading paths and compact external keys/values retain
+native candidate/loading paths and compact external values and indirect keys retain
 their separate locking contracts. Ordinary online replay can use the same
 guarded single-key paths. Ordinary String GET does not acquire the store-state
 mutex; String SET still acquires it for append-state mutation.
@@ -590,7 +620,7 @@ locks. It classifies index entries in one coroutine and issues ordinary-size
 local inline records in waves paced by the fixed read-buffer pool; oversized
 records use aligned overflow leases. One completion barrier covers every I/O in
 a wave, and all leases are returned before relocation retries or the next wave
-can suspend. Staged, remote, external, external-key, and stale-validation cases
+can suspend. Staged, remote, external, indirect-key, and stale-validation cases
 fall back to the complete `GetLocked` state machine, preserving the ordinary
 identity and relocation checks without one coroutine per key.
 
@@ -739,8 +769,8 @@ than overwriting newer state.
 Every relocation produces a destination durability fence. The source bitmap
 bit is not cleared until all fences from the current and any earlier partial
 pass have crossed durable destination headers, the source has no live bytes,
-and its pins drain. Dependent external-key extents are reclaimed only after the
-source retirement is durable. Per-device permits and the protected reserve
+and its pins drain. UUID dependencies are released only after source
+retirement is durable. Per-device permits and the protected reserve
 bound maintenance concurrency and prevent one device from consuming another's
 recovery capacity.
 
@@ -793,8 +823,7 @@ unshielded expired value can be removed only from memory and physical live-byte
 accounting; its on-disk deadline still makes it expired at ordinary recovery
 time, and the freed blocks can restore write capacity. For grouped values,
 the root and side view leave the indexes together and the complete auxiliary
-graph is retired; external-key extents remain dependencies of their source
-record blocks. A shielding value cannot use this escape valve because an
+graph is retired; UUIDs remain dependencies of their source record blocks. A shielding value cannot use this escape valve because an
 older durable value could reappear.
 
 Tomb Raider is a separate, optional cleanup loop launched at worker startup
@@ -853,7 +882,7 @@ Abort performs the same write drain, detaches the partial attempt, and drains
 that queue before it allows a later attempt to reuse runtime index capacity.
 Detached-index completion covers index destruction and record-block live-byte
 settlement. Value extents continue through the existing asynchronous retirement
-path, and external-key extents remain a `retired-unreclaimed` dependency until
+path, and UUIDs remain a `retired-unreclaimed` dependency until
 the parent record block's allocation bit is durably clear; allocator capacity
 excludes both forms of debt until they actually reach the cold-free state.
 
@@ -877,9 +906,8 @@ snapshot pins alone do not prevent rotation or cleanup of newer generations.
 A generation is returned through the cold-free lifecycle only when it is
 sealed and durable and has no
 active transaction leases, live tagged bytes, or dependency pins. When a
-transaction block is durably retired, its deferred external-key extent debt is
-released through the same asynchronous reclaim path as an ordinary record
-block. Standalone grouped writes can coordinate this lifecycle under foreground
+transaction block is durably retired, its UUID references are released through
+the same ownership lifecycle as an ordinary record block. Standalone grouped writes can coordinate this lifecycle under foreground
 space pressure before acquiring a new generation lease; borrowed transaction
 writers never wait for their own generation to retire. Online cleaning yields
 to shutdown at block boundaries after already-published relocations become

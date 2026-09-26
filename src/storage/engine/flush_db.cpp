@@ -369,15 +369,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
         delta.tagged_bytes_ += entry.value_.total_disk_bytes();
       }
       if (manifest) {
-        // External parent-key bytes are needed to decode surviving source
-        // records during a cold scan, even after their logical population is
-        // detached. Keep their entire manifest dependent on source retirement.
-        // Value-only children can enter the ordinary pinned extent reclaim.
-        if (entry.value_.key_external()) [[unlikely]] {
-          delta.dependent_extents_.push_back(manifest);
-        } else {
-          dead_extents.push_back(manifest);
-        }
+        dead_extents.push_back(manifest);
       }
     };
     detached.index_.ForEach([&](const RecordIndex::Entry& entry) {

@@ -1014,7 +1014,7 @@ TEST(GroupedObjectIndexTest, RetiredMarkerCanKeepAnExternalParentKey) {
   ASSERT_TRUE(object.ok()) << object.status();
   const auto* retained = (*object)->FindRecord({0, 0});
   ASSERT_NE(retained, nullptr);
-  EXPECT_TRUE(retained->value_.key_external());
+  EXPECT_TRUE(retained->value_.key_indirect());
   EXPECT_TRUE(retained->value_.external());
   ASSERT_NE((*object)->ExtentsFor({0, 0}), nullptr);
   EXPECT_EQ((*object)->ExtentsFor({0, 0})->at(0).block_id_, 20);

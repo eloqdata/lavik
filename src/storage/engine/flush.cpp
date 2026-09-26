@@ -142,6 +142,7 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
       UnlockGuard guard(&store->store_state_mutex_, store->worker_);
       FlushActiveBlock(*store);
     }
+    RequestIndirectKeyCleaning(*store);
     status = co_await MaybeRunTxCleaner();
     if (!status.ok()) {
       // Cleaner races (pins, foreground replacement) and allocation pressure
@@ -281,6 +282,9 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       if (store->active_block_.has_value() &&
           store->active_block_->block_id_ == block_id) {
         store->active_block_->committed_bytes_ = padded;
+      } else if (store->active_indirect_key_block_ &&
+                 store->active_indirect_key_block_->block_id_ == block_id) {
+        store->active_indirect_key_block_->committed_bytes_ = padded;
       } else {
         for (auto& [generation, active] : store->active_tx_blocks_) {
           (void)generation;
@@ -585,6 +589,9 @@ bool StorageEngine::Impl::IsActiveBlock(const WorkerStore& store,
       store.active_block_->block_id_ == block_id) {
     return true;
   }
+  if (store.active_indirect_key_block_ &&
+      store.active_indirect_key_block_->block_id_ == block_id)
+    return true;
   for (const auto& [generation, active] : store.active_tx_blocks_) {
     (void)generation;
     if (active.has_value() && active->block_id_ == block_id) return true;

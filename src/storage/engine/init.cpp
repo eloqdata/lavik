@@ -262,12 +262,6 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "storage worker count exceeds logical storage shards");
   }
-  if (options_.inline_key_max_bytes_ == 0 ||
-      options_.inline_key_max_bytes_ > MaxInlineKeyBytes()) {
-    return absl::Status(absl::StatusCode::kInvalidArgument,
-                        "inline key limit must be between 1 and " +
-                            std::to_string(MaxInlineKeyBytes()) + " bytes");
-  }
   if (options_.defrag_max_active_per_device_ == 0 ||
       options_.defrag_max_active_per_device_ > kDefragReserveBlocksPerDevice) {
     return absl::Status(
@@ -975,6 +969,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   metadata_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
   checkpoint_retired_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
+  indirect_key_recovery_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
   recovery_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
   recovery_accounting_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
@@ -1338,6 +1334,17 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   absl::flat_hash_set<std::uint64_t> committed_txids;
+  // UUIDs and extent owners must exist before any data record is decoded.
+  // Each pass retains bounded batches; the barrier also covers foreign owners.
+  status = co_await ScanAssignedBlocks(store, &batches, &zero_blocks,
+                                       &committed_txids, true);
+  if (status.ok()) status = co_await ApplyRecoveryBatches(store, &batches);
+  if (!status.ok()) {
+    Fail(status);
+    co_return status;
+  }
+  status = co_await indirect_key_recovery_barrier_->Wait(worker);
+  if (!status.ok()) co_return status;
   status = co_await ScanAssignedBlocks(store, &batches, &zero_blocks,
                                        &committed_txids);
   if (!status.ok()) {
@@ -1493,6 +1500,45 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       RecoveryWorkerBatchTargetBytes(worker_count_);
   std::vector<std::vector<RecoveryLiveReference>> live_by_owner(worker_count_);
   std::size_t buffered_bytes = 0;
+  for (const auto& [id, handle] : store.indirect_keys_) {
+    const auto& location = handle->location_;
+    live_by_owner[location.block_owner()].push_back(
+        RecoveryLiveReference{.block_id_ = location.block_id(),
+                              .allocation_epoch_ = location.allocation_epoch(),
+                              .bytes_ = location.total_disk_bytes(),
+                              .expected_owner_ = location.block_owner()});
+    buffered_bytes += sizeof(RecoveryLiveReference);
+    if (handle->extents_ != nullptr) {
+      for (std::size_t i = 0; i < handle->extents_->size(); ++i) {
+        const auto& extent = handle->extents_->at(i);
+        const auto owner = BlockOwner(extent.block_id_);
+        if (owner >= worker_count_) {
+          status = absl::DataLossError("indirect key extent has no owner");
+          Fail(status);
+          co_return status;
+        }
+        live_by_owner[owner].push_back(RecoveryLiveReference{
+            .block_id_ = extent.block_id_,
+            .allocation_epoch_ = extent.allocation_epoch_,
+            .bytes_ = extent.payload_bytes_,
+            .expected_owner_ = owner,
+            .extent_ = true,
+            .extent_payload_bytes_ = extent.payload_bytes_,
+            .extent_index_ = static_cast<std::uint32_t>(i),
+            .extent_payload_checksum_ = extent.payload_checksum_});
+        buffered_bytes += sizeof(RecoveryLiveReference);
+      }
+    }
+    if (buffered_bytes >= batch_target_bytes) {
+      status =
+          co_await ApplyRecoveryLiveReferenceBatches(store, &live_by_owner);
+      if (!status.ok()) {
+        Fail(status);
+        co_return status;
+      }
+      buffered_bytes = 0;
+    }
+  }
   // System-state blobs are not represented by key-index checkpoint entries,
   // so charge them on both checkpoint and cold-scan recovery paths.
   if (worker.id() == 0) {
@@ -1837,7 +1883,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         }
         const RecordLocation dropped = MaterializeIndexLocation(*current);
         value_extents = ExtentsFor(store, current);
-        retired = RetiredRecordOf(dropped, DependentExtentsFor(store, current));
+        retired = RetiredRecordOf(dropped, ExtentManifest{});
         --partition.live_key_count_[expired.db_id_];
         --store.live_key_count_[expired.db_id_];
         --partition.expiring_key_count_[expired.db_id_];
@@ -1850,7 +1896,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
           RemoveFullSyncCoverageEntry(partition, expired.db_id_,
                                       logical_key_bytes);
         }
-        if (!dropped.external() || dropped.key_external()) {
+        if (!dropped.external()) {
           value_extents.reset();
         }
       }
@@ -1865,6 +1911,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
   store.recovery_external_keys_.clear();
   store.recovery_external_keys_.rehash(0);
+  for (auto& [id, handle] : store.indirect_keys_) handle->recovery_key_.reset();
   worker.SpawnRoot(PeriodicFlush(&store));
   worker.SpawnBackground(ActiveExpiration(&store));
   if (options_.expiration_authority_) {
@@ -1960,6 +2007,7 @@ void StorageEngine::Impl::Fail(const absl::Status& status) {
   checkpoint_index_validated_barrier_->Abort(status);
   metadata_barrier_->Abort(status);
   checkpoint_retired_barrier_->Abort(status);
+  indirect_key_recovery_barrier_->Abort(status);
   recovery_barrier_->Abort(status);
   recovery_accounting_barrier_->Abort(status);
   free_list_barrier_->Abort(status);
@@ -2178,7 +2226,7 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
   // Join it locally before freezing append streams; doing this through the
   // global QuiesceExpiration helper would make workers submit to and wait on
   // themselves while every periodic flush owns the same shutdown barrier.
-  while (store->expiry_cycle_running_) {
+  while (store->expiry_cycle_running_ || store->indirect_key_cleaner_running_) {
     absl::Status status = co_await bycorf::SleepFor(
         *store->worker_, std::chrono::milliseconds(1));
     if (!status.ok()) co_return status;

@@ -211,6 +211,15 @@ Digest ComputeDigest(std::string_view key, const DigestSeed& seed) noexcept;
 std::uint16_t RedisSlot(std::string_view key) noexcept;
 std::uint32_t StorageShardForKey(std::string_view key) noexcept;
 
+// Long key identities are immutable across physical relocation. The low 14
+// bits encode the Redis slot so the registry remains worker-local after a
+// worker-count change; the remaining bits are random UUID entropy.
+using IndirectKeyId = std::array<std::uint64_t, 2>;
+inline constexpr std::size_t kInlineKeyMaxBytes = 2048;
+inline std::string_view IndirectKeyIdBytes(const IndirectKeyId& id) noexcept {
+  return {reinterpret_cast<const char*>(id.data()), sizeof(id)};
+}
+
 enum class RecordKind : std::uint8_t {
   kValue = 1,
   kTombstone = 2,
@@ -223,8 +232,9 @@ enum class RecordKind : std::uint8_t {
 enum class BlockKind : std::uint8_t {
   kRecords = 1,
   kPayloadExtent = 2,
-  // Value 3 was used by an unreleased runtime-backlog experiment. It remains
-  // unassigned so the on-disk enum values do not move.
+  // Packed UUID -> original key records. A separate append/cleaning stream
+  // keeps their lifetime independent of user records and transaction GC.
+  kIndirectKeys = 3,
   // Short-lived transaction generation: tagged keyed records and their
   // TxCommit decisions share this block class until the cleaner promotes the
   // committed winners to ordinary kRecords blocks with txid zero.
@@ -344,7 +354,9 @@ struct RecordHeader {
   std::uint8_t db_id_ = 0;
   ValueType value_type_ = ValueType::kNone;
   bool external_ = false;
-  bool key_external_ = false;
+  // A 16-byte UUID replaces the complete key in this header. Value extents
+  // remain independent; the UUID resolves through dedicated KeyRecord blocks.
+  bool key_indirect_ = false;
   // A root and its independently indexed groups preserve the parent Redis
   // collection type, but are not interchangeable compact values. Group
   // identity lives outside the payload so recovery and GC can identify an
@@ -366,13 +378,12 @@ struct RecordHeader {
   // transaction and its own batch decision. Zero denotes a single-decision
   // group or a GC-promoted unconditional record.
   std::uint64_t group_batch_txid_ = 0;
+  IndirectKeyId key_id_{};
   std::uint32_t key_bytes_ = 0;
   // Redis-visible bytes/cardinality.
   std::uint32_t logical_size_ = 0;
-  // Physical payload following this header. For an out-of-index key, an
-  // inline payload is key || value; an external payload is one manifest for
-  // the same logical concatenation. Small keys remain in the header and an
-  // external payload then contains only the value.
+  // Physical value bytes or a value-only extent manifest. Indirect keys use
+  // a UUID in the header; the original key lives in a kIndirectKeys block.
   std::uint32_t payload_bytes_ = 0;
   // Derived from header_bytes_ and payload_bytes_; not stored durably.
   std::uint32_t total_disk_bytes_ = 0;
@@ -468,13 +479,13 @@ constexpr std::size_t RecordFixedHeaderBytes(
 }
 
 constexpr std::size_t RecordHeaderBytes(std::size_t key_bytes,
-                                        bool key_external = false,
+                                        bool key_indirect = false,
                                         bool has_txid = false,
                                         bool has_expiry = false,
                                         bool auxiliary_group = false) noexcept {
   return AlignRecord(
       RecordFixedHeaderBytes(has_txid, has_expiry, auxiliary_group) +
-      (key_external ? 0 : key_bytes));
+      (key_indirect ? sizeof(IndirectKeyId) : key_bytes));
 }
 
 constexpr std::size_t MaxKeyBytes() noexcept { return kMaxStringBytes; }
@@ -484,14 +495,14 @@ constexpr bool ValidRecordKeySize(std::size_t bytes) noexcept {
   return bytes <= MaxKeyBytes();
 }
 
+// Even the largest optional header leaves ample room for the fixed inline
+// threshold. This is a format invariant, independent of server configuration.
 constexpr std::size_t MaxInlineKeyBytes() noexcept {
-  // The configured limit must remain valid for a transaction record carrying
-  // an expiration, even though ordinary records could use the extension space
-  // for a slightly larger inline key.
-  return kMaxRecordHeaderBytes - kMaxRecordFixedHeaderBytes;
+  return kInlineKeyMaxBytes;
 }
-
-inline constexpr std::size_t kDefaultInlineKeyBytes = MaxInlineKeyBytes();
+inline constexpr std::size_t kDefaultInlineKeyBytes = kInlineKeyMaxBytes;
+static_assert(RecordHeaderBytes(kInlineKeyMaxBytes, false, true, true, true) <=
+              kMaxRecordHeaderBytes);
 
 constexpr std::size_t ExtentManifestBytes(std::size_t logical_bytes) noexcept {
   return sizeof(ExtentManifestHeader) +
@@ -500,7 +511,7 @@ constexpr std::size_t ExtentManifestBytes(std::size_t logical_bytes) noexcept {
 }
 
 static_assert(RecordHeaderBytes(kMaxStringBytes, true) ==
-              kRecordHeaderBaseBytes);
+              kRecordHeaderBaseBytes + sizeof(IndirectKeyId));
 
 std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept;
 // Redis-compatible CRC64 used for the Function dump durability token.

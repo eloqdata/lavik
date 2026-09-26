@@ -147,7 +147,7 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
         co_return absl::DataLossError("full-sync page extent size overflow");
       payload_bytes += ref.payload_bytes_;
     }
-    const auto prefix = location.key_external() ? stream->key_.size() : 0;
+    const auto prefix = std::size_t{0};
     if (prefix > payload_bytes)
       co_return absl::DataLossError("full-sync page key exceeds payload");
     payload_bytes -= prefix;

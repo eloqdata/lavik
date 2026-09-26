@@ -288,7 +288,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryBatches(
 Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
     WorkerStore& store, std::vector<RecoveryBatch>* batches,
     std::vector<std::uint64_t>* zero_blocks,
-    absl::flat_hash_set<std::uint64_t>* committed_txids) {
+    absl::flat_hash_set<std::uint64_t>* committed_txids,
+    bool indirect_key_pass) {
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
   if (!acquired.ok()) {
     co_return acquired.status();
@@ -390,7 +391,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       const unsigned bitmap_bit = local_block % 8;
       if ((std::to_integer<unsigned>(allocator.scan_bitmap_[bitmap_byte]) &
            (1U << bitmap_bit)) == 0) {
-        ReportRecoveryProgress(0, /*allocated=*/false);
+        if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/false);
         continue;
       }
       const std::uint32_t file_id = device.file_index_;
@@ -409,8 +410,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       std::span<const std::byte, kBlockHeaderBytes> block_bytes(
           header_buffer.data_, kBlockHeaderBytes);
       if (IsZero(block_bytes)) {
-        zero_blocks->push_back(block_id);
-        ReportRecoveryProgress(0, /*allocated=*/true);
+        if (!indirect_key_pass) zero_blocks->push_back(block_id);
+        if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
         continue;
       }
 
@@ -421,15 +422,15 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         // this means no header ever committed here. Nothing in it was
         // durable, and the free slot cannot hold a header from an earlier
         // life, so the block is unused rather than corrupt.
-        zero_blocks->push_back(block_id);
-        ReportRecoveryProgress(0, /*allocated=*/true);
+        if (!indirect_key_pass) zero_blocks->push_back(block_id);
+        if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
         continue;
       }
       if (block.block_id_ != block_id) {
         // The bitmap records activation, not a committed write. A valid
         // header naming another physical block is stale media contents. Do
         // not recover it and do not rewrite the allocation bitmap.
-        ReportRecoveryProgress(0, /*allocated=*/true);
+        if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
         continue;
       }
       if (!RecordLocation::CanEncodeBlockIdentity(block_id,
@@ -449,11 +450,14 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         // The selected generation was already loaded through its bitmap;
         // every selected or stale checkpoint block becomes ordinary free space
         // once this startup completes.
-        zero_blocks->push_back(block_id);
-        ReportRecoveryProgress(0, /*allocated=*/true);
+        if (!indirect_key_pass) zero_blocks->push_back(block_id);
+        if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
         continue;
       }
 
+      const bool key_or_extent = block.kind_ == BlockKind::kIndirectKeys ||
+                                 block.kind_ == BlockKind::kPayloadExtent;
+      if (indirect_key_pass != key_or_extent) continue;
       const std::uint16_t block_owner = RecoveredBlockOwner(block, block_id);
       batches->at(block_owner)
           .blocks_.push_back(RecoveryBlock{ActiveBlock{
@@ -472,7 +476,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       buffered_bytes += sizeof(RecoveryBlock);
 
       if (block.kind_ == BlockKind::kPayloadExtent) {
-        ReportRecoveryProgress(0, /*allocated=*/true);
+        if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
         if (buffered_bytes >= batch_target_bytes) {
           absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
           if (!applied.ok()) {
@@ -485,7 +489,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
 
       if (block.kind_ == BlockKind::kRecords &&
           checkpoint_active_.load(std::memory_order_acquire)) {
-        ReportRecoveryProgress(0, /*allocated=*/true);
+        if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
         if (buffered_bytes >= batch_target_bytes) {
           absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
           if (!applied.ok()) co_return applied;
@@ -577,11 +581,6 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           }
           continue;
         }
-        if (record.db_epoch_ != DbEpoch(record.db_id_)) {
-          record_offset += record.total_disk_bytes_;
-          ++records;
-          continue;
-        }
         const std::byte* payload =
             recovery.buffer_.data_ + record_offset + record.header_bytes_;
         const auto payload_span =
@@ -592,9 +591,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         }
         ExtentManifest extents;
         if (record.external_) {
-          const std::uint64_t extent_bytes =
-              record.logical_size_ +
-              (record.key_external_ ? record.key_bytes_ : 0);
+          const std::uint64_t extent_bytes = record.logical_size_;
           auto decoded = DecodeManifest(
               payload_span, extent_bytes,
               record.kind_ != RecordKind::kValue ||
@@ -605,31 +602,131 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           }
           extents = std::move(*decoded);
         }
-        std::string loaded_key;
-        if (record.key_external_) [[unlikely]] {
+        if (block.kind_ == BlockKind::kIndirectKeys) {
+          if (record.kind_ != RecordKind::kValue ||
+              record.value_type_ != ValueType::kString ||
+              record.key_indirect_ || record.grouped_ ||
+              record.auxiliary_group_ || record.txid_ != 0 ||
+              record.expire_at_ms_ != 0 || record.db_id_ != 0 ||
+              record.db_epoch_ != 1 || record.replication_epoch_ != 1 ||
+              key.size() != sizeof(IndirectKeyId) ||
+              record.logical_size_ <= kInlineKeyMaxBytes)
+            co_return absl::DataLossError("invalid indirect key record");
+          IndirectKeyId id;
+          std::memcpy(id.data(), key.data(), sizeof(id));
+          std::string original;
           if (record.external_) {
-            auto external_key = co_await LoadExternalKeyForRecovery(
-                store, extents, record.key_bytes_);
-            if (!external_key.ok()) {
-              co_return external_key.status();
-            }
-            loaded_key = std::move(*external_key);
-            key = loaded_key;
+            auto loaded = co_await LoadExternalKeyForRecovery(
+                store, extents, record.logical_size_);
+            if (!loaded.ok()) co_return loaded.status();
+            original = std::move(*loaded);
           } else {
-            if (record.payload_bytes_ < record.key_bytes_) {
-              co_return absl::Status(absl::StatusCode::kInternal,
-                                     "inline external key is truncated");
-            }
-            key = std::string_view(reinterpret_cast<const char*>(payload),
-                                   record.key_bytes_);
+            if (record.payload_bytes_ != record.logical_size_)
+              co_return absl::DataLossError(
+                  "indirect key payload length mismatch");
+            original.assign(reinterpret_cast<const char*>(payload),
+                            record.payload_bytes_);
           }
+          if ((id[0] & 0x3fff) != RedisSlot(original))
+            co_return absl::DataLossError("indirect key UUID slot mismatch");
+          auto handle = std::make_shared<IndirectKey>();
+          handle->id_ = id;
+          handle->digest_ = ComputeDigest(original);
+          handle->recovery_key_ =
+              std::make_shared<const std::string>(std::move(original));
+          handle->extents_ = extents;
+          handle->lsn_ = record.lsn_;
+          handle->physical_copies_ = 1;
+          handle->location_ = RecordLocation(
+              block_id, record.mutation_sequence_, record.allocation_epoch_, 0,
+              record.logical_size_,
+              RecordLocation::PackedMetadata::Encode(
+                  record_offset, record.total_disk_bytes_, block_owner, false,
+                  record.external_, false, false, false, false,
+                  RecordKind::kValue, ValueType::kString, false, false));
+          const unsigned owner = (id[0] & 0x3fff) % worker_count_;
+          auto install = [this, owner, handle]() -> absl::Status {
+            auto& target = *stores_[owner];
+            auto [it, added] =
+                target.indirect_keys_.try_emplace(handle->id_, handle);
+            if (added) {
+              target.indirect_key_candidates_[handle->digest_].push_back(
+                  handle->id_);
+              if (!target.indirect_key_gc_queue_)
+                target.indirect_key_gc_queue_ =
+                    std::make_unique<std::deque<IndirectKeyId>>();
+              target.indirect_key_gc_queue_->push_back(handle->id_);
+            } else {
+              if (*it->second->recovery_key_ != *handle->recovery_key_ ||
+                  it->second->location_.logical_size_ !=
+                      handle->location_.logical_size_)
+                return absl::DataLossError(
+                    "inconsistent copies of indirect key");
+              const auto copies = it->second->physical_copies_ + 1;
+              if (it->second->lsn_ < handle->lsn_) it->second = handle;
+              it->second->physical_copies_ = copies;
+            }
+            return absl::OkStatus();
+          };
+          absl::Status installed;
+          if (owner == store.worker_->id())
+            installed = install();
+          else
+            installed = co_await bycorf::SubmitTo(owner, std::move(install));
+          if (!installed.ok()) co_return installed;
+          auto note = [this, block_owner, block_id,
+                       epoch = block.allocation_epoch_, id, record_offset] {
+            stores_[block_owner]
+                ->indirect_key_records_[{block_id, epoch}]
+                .emplace_back(id, record_offset);
+            return true;
+          };
+          if (block_owner == store.worker_->id())
+            note();
+          else
+            co_await bycorf::SubmitTo(block_owner, std::move(note));
+          record_offset += record.total_disk_bytes_;
+          ++records;
+          continue;
         }
-        const std::uint16_t partition_id = RedisSlot(key);
+        std::shared_ptr<const std::string> loaded_key;
+        Digest indirect_digest{};
+        if (record.key_indirect_) [[unlikely]] {
+          auto handle = co_await FindIndirectKey(record.key_id_);
+          if (!handle.ok()) co_return handle.status();
+          loaded_key = (*handle)->recovery_key_;
+          indirect_digest = (*handle)->digest_;
+          if (loaded_key == nullptr || loaded_key->size() != record.key_bytes_)
+            co_return absl::DataLossError("indirect key length mismatch");
+          key = *loaded_key;
+          auto retain = [this, block_owner, block_id,
+                         epoch = block.allocation_epoch_, record_offset,
+                         ref = *handle] {
+            stores_[block_owner]
+                ->indirect_key_references_[{block_id, epoch}]
+                .emplace(record_offset, ref);
+            return true;
+          };
+          if (block_owner == store.worker_->id())
+            retain();
+          else
+            co_await bycorf::SubmitTo(block_owner, std::move(retain));
+        }
+        if (record.db_epoch_ != DbEpoch(record.db_id_)) {
+          record_offset += record.total_disk_bytes_;
+          ++records;
+          continue;
+        }
+        const std::uint16_t partition_id =
+            record.key_indirect_
+                ? static_cast<std::uint16_t>(record.key_id_[0] & 0x3fff)
+                : RedisSlot(key);
         if (partition_id % block.layout_worker_count_ != block.writer_id_) {
           co_return absl::Status(absl::StatusCode::kInternal,
                                  "invalid or corrupt committed record header");
         }
-        const Digest digest = ComputeDigest(key);
+        const Digest digest =
+            record.key_indirect_ ? indirect_digest : ComputeDigest(key);
         if (record.replication_epoch_ !=
             epoch_values_[kLogicalDatabaseCount + partition_id]) {
           record_offset += record.total_disk_bytes_;
@@ -660,8 +757,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               group_bytes += extent.payload_bytes_;
             }
           }
-          const std::uint64_t key_prefix =
-              record.key_external_ ? record.key_bytes_ : 0;
+          const std::uint64_t key_prefix = 0;
           if (group_bytes < key_prefix)
             co_return absl::DataLossError("group parent key is truncated");
           group_bytes -= key_prefix;
@@ -682,8 +778,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               .retired_ = record.group_retired_,
           };
           if (!record.external_) {
-            const std::size_t key_prefix =
-                record.key_external_ ? record.key_bytes_ : 0;
+            const std::size_t key_prefix = 0;
             if (record.payload_bytes_ < key_prefix) {
               co_return absl::DataLossError("recovered group key is truncated");
             }
@@ -735,8 +830,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           }
         }
         if (record.grouped_) {
-          const std::size_t key_prefix =
-              record.key_external_ ? record.key_bytes_ : 0;
+          const std::size_t key_prefix = 0;
           std::size_t encoded_bytes = record.payload_bytes_;
           std::string metadata_bytes;
           std::string_view encoded;
@@ -805,9 +899,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         }
         RecoveryRecord recovered{
             .digest_ = digest,
-            .key_ = record.key_external_ && record.external_
-                        ? std::move(loaded_key)
-                        : std::string(key),
+            .key_ = record.key_indirect_ ? std::string{} : std::string(key),
+            .indirect_key_ = std::move(loaded_key),
             .db_id_ = record.db_id_,
             .txid_ = record.txid_,
             .lsn_ = record.lsn_,
@@ -818,7 +911,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 static_cast<std::uint32_t>(record.logical_size_),
                 RecordLocation::PackedMetadata::Encode(
                     record_offset, record.total_disk_bytes_, block_owner, false,
-                    record.external_, record.key_external_, false, false,
+                    record.external_, record.key_indirect_, false, false,
                     record.txid_ != 0, record.kind_, record.value_type_,
                     record.expire_at_ms_ != 0, record.grouped_)),
             .extents_ = extents,
@@ -847,7 +940,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             absl::StatusCode::kInternal,
             "block committed boundary does not match records");
       }
-      ReportRecoveryProgress(records, /*allocated=*/true);
+      if (!indirect_key_pass)
+        ReportRecoveryProgress(records, /*allocated=*/true);
       if (buffered_bytes >= batch_target_bytes) {
         absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
         if (!applied.ok()) {
@@ -934,10 +1028,10 @@ absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
 
 absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
     WorkerStore& store, const RecoveryRecord& recovered) {
-  auto& partition = PartitionForKey(store, recovered.key_);
+  auto& partition = PartitionForKey(store, recovered.key());
   const RecoveryRecordView view{
       .digest_ = recovered.digest_,
-      .key_ = recovered.key_,
+      .key_ = recovered.key(),
       .db_id_ = recovered.db_id_,
       .txid_ = recovered.txid_,
       .lsn_ = recovered.lsn_,
@@ -1056,7 +1150,7 @@ absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
         winner_entry = *replaced;
       } else {
         winner_entry = index.InsertNew(recovered.digest_, recovered.key_,
-                                       winner, !winner.key_external());
+                                       winner, !winner.key_indirect());
         if (winner_entry == nullptr) {
           return absl::ResourceExhaustedError(
               "recovery index entry capacity exhausted");
@@ -1084,7 +1178,7 @@ absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
       } else if (found != nullptr || !recovered.checkpoint_snapshot_) {
         store.external_manifests_.erase(winner_entry);
       }
-      if (winner.key_external()) [[unlikely]] {
+      if (winner.key_indirect()) [[unlikely]] {
         store.recovery_external_keys_.insert_or_assign(winner_entry,
                                                        recovered.key_);
       } else if (found != nullptr || !recovered.checkpoint_snapshot_) {
@@ -1124,11 +1218,14 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
   // Group candidates by logical key once. Recovery memory is proportional to
   // scanned auxiliary metadata, never to retained field/value bodies; a root
   // examines only its own candidates rather than rescanning all large keys.
-  std::sort(records.begin(), records.end(),
-            [](const RecoveryRecord& left, const RecoveryRecord& right) {
-              return std::tie(left.db_id_, left.key_) <
-                     std::tie(right.db_id_, right.key_);
-            });
+  std::sort(
+      records.begin(), records.end(),
+      [](const RecoveryRecord& left, const RecoveryRecord& right) {
+        if (left.db_id_ != right.db_id_) return left.db_id_ < right.db_id_;
+        if (left.indirect_key_ && left.indirect_key_ == right.indirect_key_)
+          return false;
+        return left.key() < right.key();
+      });
   for (const auto& [entry, root] : store.recovery_grouped_roots_) {
     const RecordLocation location = MaterializeIndexLocation(*entry);
     if (!location.grouped()) {
@@ -1169,8 +1266,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     const auto lower = std::lower_bound(
         records.begin(), records.end(), std::pair(*root_db, key),
         [](const RecoveryRecord& record, const auto& target) {
-          return std::pair(record.db_id_, std::string_view(record.key_)) <
-                 target;
+          return std::pair(record.db_id_, record.key()) < target;
         });
     const GroupedObjectVersion version{
         .root_ = location,
@@ -1181,7 +1277,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     if (const auto* ordered = std::get_if<OrderedCollectionRoot>(&root)) {
       auto end = lower;
       while (end != records.end() && end->db_id_ == *root_db &&
-             end->key_ == key)
+             end->key() == key)
         ++end;
       auto object = co_await RecoverOrderedObject(
           store, *ordered, version,
@@ -1194,7 +1290,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     }
     std::vector<RecoveredHashGroup> candidates;
     for (auto it = lower;
-         it != records.end() && it->db_id_ == *root_db && it->key_ == key;
+         it != records.end() && it->db_id_ == *root_db && it->key() == key;
          ++it) {
       auto candidate = *it->auxiliary_group_;
       candidate.record_token_ =
@@ -1312,8 +1408,7 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
           co_return absl::DataLossError("ordered page payload is too large");
         bytes += extent.payload_bytes_;
       }
-      const std::size_t key_bytes =
-          physical.location_.key_external() ? physical.key_.size() : 0;
+      const std::size_t key_bytes = 0;
       if (bytes < key_bytes)
         co_return absl::DataLossError("ordered page parent key is truncated");
       // Only the highest committed revision of each stable id reaches IO.
@@ -1419,8 +1514,7 @@ Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroups(
       }
       encoded_bytes += ref.payload_bytes_;
     }
-    const std::size_t key_prefix =
-        record.location_.key_external() ? record.key_.size() : 0;
+    const std::size_t key_prefix = 0;
     if (encoded_bytes < key_prefix) {
       co_return absl::DataLossError("live recovered group key is truncated");
     }

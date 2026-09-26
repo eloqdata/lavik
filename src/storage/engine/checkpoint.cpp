@@ -37,7 +37,7 @@ enum class CheckpointChunkKind : std::uint32_t {
 
 enum CheckpointEntryFlag : std::uint8_t {
   kExternal = 1U << 0,
-  kKeyExternal = 1U << 1,
+  kKeyIndirect = 1U << 1,
   kShielding = 1U << 2,
   kUnclaimed = 1U << 3,
   kHasExpiry = 1U << 4,
@@ -162,7 +162,7 @@ static_assert(MaxKeyBytes() <= kCheckpointKeyBytesMask);
 static_assert(kMaxStringExtents <= kCheckpointExtentCountMask);
 static_assert(kLogicalStorageShards <= kCheckpointPartitionMask + 1);
 static_assert(kCheckpointFlagsShift + 5 <= 64);
-static_assert((kExternal | kKeyExternal | kShielding | kUnclaimed |
+static_assert((kExternal | kKeyIndirect | kShielding | kUnclaimed |
                kHasExpiry) == kCheckpointFlagsMask);
 
 constexpr std::uint64_t EncodeCheckpointLocationMetadata(
@@ -840,6 +840,13 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointRoot(
 
 Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
     WorkerStore& store, std::uint64_t generation) {
+  // The checkpoint format has no UUID registry or stale-record dependency
+  // graph. Preserve cold recovery until both can be represented together.
+  if (!store.indirect_keys_.empty() ||
+      !store.indirect_key_references_.empty() ||
+      !store.indirect_key_records_.empty())
+    co_return absl::FailedPreconditionError(
+        "shutdown checkpoint does not encode indirect keys");
   CheckpointShardResult& result = checkpoint_shards_[store.worker_->id()];
   result = {};
   std::array<CheckpointWriteSlot, 2> write_slots;
@@ -993,7 +1000,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         }
         std::uint8_t flags = 0;
         if (location.external()) flags |= kExternal;
-        if (location.key_external()) flags |= kKeyExternal;
+        if (location.key_indirect()) flags |= kKeyIndirect;
         if (location.shielding()) flags |= kShielding;
         if (location.unclaimed()) flags |= kUnclaimed;
         if (has_expiry) flags |= kHasExpiry;
@@ -1774,7 +1781,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
         if ((entry.location_metadata_ & ~kCheckpointLocationMetadataMask) !=
                 0 ||
             db_id >= options_.database_count_ || block_owner >= worker_count_ ||
-            (flags & ~(kExternal | kKeyExternal | kShielding | kUnclaimed |
+            (flags & ~(kExternal | kKeyIndirect | kShielding | kUnclaimed |
                        kHasExpiry)) != 0 ||
             (kind != RecordKind::kValue && kind != RecordKind::kTombstone) ||
             (kind == RecordKind::kTombstone &&
@@ -1810,7 +1817,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
             reinterpret_cast<const char*>(entry_cursor + fixed_bytes);
         const std::string_view key(key_data, key_bytes);
         const bool external = (flags & kExternal) != 0;
-        const bool key_external = (flags & kKeyExternal) != 0;
+        const bool key_indirect = (flags & kKeyIndirect) != 0;
         if (external != (extent_count != 0) ||
             !RecordLocation::CanEncodeBlockIdentity(entry_block_id,
                                                     allocation_epoch)) {
@@ -1830,11 +1837,11 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
             expire_at_ms, entry.logical_size_,
             RecordLocation::PackedMetadata::Encode(
                 record_offset, total_disk_bytes, block_owner, false, external,
-                key_external, (flags & kShielding) != 0,
+                key_indirect, (flags & kShielding) != 0,
                 (flags & kUnclaimed) != 0, false, kind, value_type));
         auto& partition = PartitionFor(store, partition_id);
         RecordIndex::Entry* installed = partition.indexes_[db_id].InsertNew(
-            entry.digest_, key, location, !key_external);
+            entry.digest_, key, location, !key_indirect);
         if (installed == nullptr) {
           return absl::ResourceExhaustedError(
               "checkpoint index entry capacity exhausted");
@@ -1850,7 +1857,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
           store.external_manifests_.insert_or_assign(installed,
                                                      std::move(extents));
         }
-        if (location.key_external()) [[unlikely]] {
+        if (location.key_indirect()) [[unlikely]] {
           // The complete key is needed through expiry and any fallback merge;
           // steady-state external-key reads use the durable record.
           store.recovery_external_keys_.insert_or_assign(installed, key);

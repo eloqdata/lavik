@@ -260,7 +260,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
         (value_type == ValueType::kSortedSet ||
          value_type == ValueType::kStream) &&
         exists && !grouped && !location.external() &&
-        !location.key_external() &&
+        !location.key_indirect() &&
         location.total_disk_bytes() < kCompactWorkspaceInputBytes &&
         location.logical_size_ <= kCompactWorkspaceInputEntries;
     if ((value_type == ValueType::kSortedSet ||

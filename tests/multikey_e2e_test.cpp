@@ -804,13 +804,14 @@ int main(int argc, char** argv) {
     Expect(client.Command({"KEYS", "lit\\?eral"}), "*0",
            "KEYS escaped question mark");
 
-    // Large key names: the total far exceeds one 64 KiB stream chunk, so
-    // the reply must arrive complete across several bounded chunks.
+    // Many inline names exceed one 64 KiB stream chunk. Keeping each name
+    // below the fixed 2 KiB indirect-key threshold also leaves this fixture
+    // eligible for its later positive shutdown-checkpoint checks.
     {
       std::vector<std::string> long_names;
-      for (int i = 0; i < 48; ++i) {
+      for (int i = 0; i < 96; ++i) {
         std::string name = "longname:" + std::to_string(i) + ":";
-        name.append(3500, 'x');
+        name.append(1900, 'x');
         Expect(client.Command({"SET", name, "v"}), "+OK", "long name SET");
         long_names.push_back(std::move(name));
       }

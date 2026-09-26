@@ -433,6 +433,7 @@ add_library(lavik_module
   src/storage/engine/grouped_lifecycle.cpp
   src/storage/engine/grouped_object_index.cpp
   src/storage/engine/hash_tree.cpp
+  src/storage/engine/indirect_key.cpp
   src/storage/engine/init.cpp
   src/storage/engine/list_api.cpp
   src/storage/engine/list_tree.cpp

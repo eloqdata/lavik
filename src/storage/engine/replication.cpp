@@ -123,7 +123,7 @@ Task<absl::Status> StorageEngine::Impl::ReleaseFullSyncExtents(
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncValue(
     WorkerStore& store, std::uint64_t session_id,
     WorkerStore::PartitionStore& partition, RecordLocation location,
-    ExtentManifest extents, std::size_t key_bytes) {
+    ExtentManifest extents, std::size_t) {
   if (!location.external() || extents == nullptr) {
     co_return absl::InvalidArgumentError(
         "only external full-sync values can be pinned");
@@ -135,7 +135,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncValue(
     }
     extent_bytes += ref.payload_bytes_;
   }
-  const std::size_t key_prefix = location.key_external() ? key_bytes : 0;
+  const std::size_t key_prefix = 0;
   if (extent_bytes < key_prefix) {
     co_return absl::InternalError("full-sync extent manifest is truncated");
   }
@@ -224,7 +224,7 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
           QueueExpiredCandidate(store, partition.id_, db_id, *current, *key);
         } else if (!TryConsumeFullSyncCoverageCredit(
                        store, session_id, capture->second,
-                       coverage_key.size() <= options_.inline_key_max_bytes_
+                       coverage_key.size() <= kInlineKeyMaxBytes
                            ? coverage_key.size()
                            : sizeof(Digest),
                        /*allocates_arena_entry=*/true)) {
@@ -234,7 +234,7 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
           const auto phase = capture->second.key_phases_.InsertOrAssign(
               digest, coverage_key,
               WorkerStore::FullSyncCapture::KeyPhase::kBaselineInflight,
-              coverage_key.size() <= options_.inline_key_max_bytes_);
+              coverage_key.size() <= kInlineKeyMaxBytes);
           if (phase.rejected_) {
             InvalidateFullSyncSession(store, session_id);
             status = absl::ResourceExhaustedError(
@@ -250,7 +250,7 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
               for (const ExtentRef& ref : *extents) {
                 value_bytes += ref.payload_bytes_;
               }
-              if (location.key_external()) {
+              if (location.key_indirect()) {
                 value_bytes -=
                     std::min<std::uint64_t>(value_bytes, key->size());
               }
@@ -386,7 +386,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
   if (location.external()) {
     value_bytes = 0;
     for (const ExtentRef& ref : *extents) value_bytes += ref.payload_bytes_;
-    if (location.key_external()) {
+    if (location.key_indirect()) {
       value_bytes -=
           std::min<std::uint64_t>(value_bytes, requested.key_.size());
     }
@@ -498,10 +498,6 @@ bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
                 for (const ExtentRef& ref : *extents) {
                   value_bytes += ref.payload_bytes_;
                 }
-                value_bytes -=
-                    std::min(value_bytes, entry.value_.key_external()
-                                              ? entry.logical_key_size()
-                                              : std::size_t{0});
               }
               state->result_.value_bytes_.push_back(value_bytes);
               add_bytes(value_bytes);
@@ -513,9 +509,6 @@ bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
                   value_bytes += ref.payload_bytes_;
                 }
               }
-              value_bytes -= std::min<std::size_t>(
-                  value_bytes,
-                  entry.value_.key_external() ? entry.logical_key_size() : 0);
               state->external_.push_back(ScanPartitionState::ExternalCandidate{
                   .entry_address_ = reinterpret_cast<std::uintptr_t>(&entry),
                   .extents_ = std::move(extents),
@@ -590,7 +583,7 @@ std::uint64_t StorageEngine::Impl::FullSyncCoverageEntryBytes(
   // the digest retained by the coverage map. The factor of two matches the
   // worst case where key identity is present in both owners during replacement.
   const std::uint64_t retained_key_bytes =
-      logical_key_bytes <= options_.inline_key_max_bytes_
+      logical_key_bytes <= kInlineKeyMaxBytes
           ? static_cast<std::uint64_t>(logical_key_bytes)
           : sizeof(Digest);
   assert(retained_key_bytes <= (std::numeric_limits<std::uint64_t>::max() -
@@ -1213,7 +1206,7 @@ void StorageEngine::Impl::AcknowledgePartitionFullSyncOverrides(
       const auto restored = capture->second.key_phases_.InsertOrAssign(
           ComputeDigest(acknowledged.key_), acknowledged.key_,
           WorkerStore::FullSyncCapture::KeyPhase::kTailingWithOverrideCredit,
-          acknowledged.key_.size() <= options_.inline_key_max_bytes_);
+          acknowledged.key_.size() <= kInlineKeyMaxBytes);
       if (restored.rejected_) {
         InvalidateFullSyncSession(store, session_id);
         return;
@@ -1493,24 +1486,13 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     const std::uint8_t db_id = old.db_id_;
     const std::string& key = old.key_;
     const Digest digest = ComputeDigest(key);
-    const bool key_external = key.size() > options_.inline_key_max_bytes_;
-    const bool external =
-        AlignRecord(RecordHeaderBytes(key.size(), key_external) +
-                    (key_external ? key.size() : 0)) >
-        kStorageBlockBytes - kBlockHeaderBytes;
+    const bool key_indirect = key.size() > kInlineKeyMaxBytes;
+    const bool external = false;
     ExtentManifest extents;
     std::string manifest;
-    if (external) [[unlikely]] {
-      auto written = co_await WriteExtentValueLocked(store, key);
-      if (!written.ok()) {
-        co_return written.status();
-      }
-      extents = std::move(*written);
-      manifest = EncodeManifest(*extents);
-    }
     absl::Status tombstone = co_await WriteRecordLocked(
         store, db_id, key, manifest, RecordKind::kTombstone, ValueType::kNone,
-        0, digest, 0, 0, false, false, external, key_external, 0, extents,
+        0, digest, 0, 0, false, false, external, key_indirect, 0, extents,
         nullptr, nullptr, nullptr);
     if (!tombstone.ok()) {
       if (extents != nullptr) [[unlikely]] {
@@ -2128,20 +2110,16 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
         .replication_epoch_ = sync->replication_epoch_,
         .db_epoch_ = sync->local_db_epochs_[applied.db_id_],
     };
-    const bool key_external =
-        applied.key_.size() > options_.inline_key_max_bytes_;
+    const bool key_indirect = applied.key_.size() > kInlineKeyMaxBytes;
     const std::uint64_t logical_payload_bytes =
-        static_cast<std::uint64_t>(applied.value_.size()) +
-        (key_external ? applied.key_.size() : 0);
+        static_cast<std::uint64_t>(applied.value_.size());
     const std::size_t inline_bytes =
-        AlignRecord(RecordHeaderBytes(applied.key_.size(), key_external, false,
+        AlignRecord(RecordHeaderBytes(applied.key_.size(), key_indirect, false,
                                       applied.expire_at_ms_ != 0) +
                     static_cast<std::size_t>(logical_payload_bytes));
     if (inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) [[unlikely]] {
-      auto extents = co_await WriteExtentValueLocked(
-          store,
-          key_external ? std::string_view(applied.key_) : std::string_view{},
-          applied.value_);
+      auto extents = co_await WriteExtentValueLocked(store, std::string_view{},
+                                                     applied.value_);
       if (!extents.ok()) {
         co_return extents.status();
       }
@@ -2149,7 +2127,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
       written = co_await WriteRecordLocked(
           store, applied.db_id_, applied.key_, manifest, kind, value_type,
           applied.expire_at_ms_, digest, /*txid=*/0, applied.mutation_sequence_,
-          false, true, true, key_external, applied.logical_size_, *extents,
+          false, true, true, key_indirect, applied.logical_size_, *extents,
           nullptr, nullptr, nullptr, nullptr, nullptr, &write_root);
       if (!written.ok()) {
         SpawnExtentReclaim(store, *extents);
@@ -2159,7 +2137,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
           store, applied.db_id_, applied.key_, applied.value_, kind, value_type,
           kind == RecordKind::kValue ? applied.expire_at_ms_ : 0, digest,
           /*txid=*/0, applied.mutation_sequence_, false, true, false,
-          key_external, applied.logical_size_, nullptr, nullptr, nullptr,
+          key_indirect, applied.logical_size_, nullptr, nullptr, nullptr,
           nullptr, nullptr, nullptr, &write_root);
     }
     if (!written.ok()) {

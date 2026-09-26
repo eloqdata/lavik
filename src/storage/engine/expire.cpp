@@ -415,8 +415,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
 
   const RecordLocation dropped = MaterializeIndexLocation(*current);
   const ExtentManifest dropped_extents = ExtentsFor(store, current);
-  const ExtentManifest dropped_dependent_extents =
-      DependentExtentsFor(store, current);
+  const ExtentManifest dropped_dependent_extents = ExtentManifest{};
   GroupedHashObject::Handle grouped;
   std::vector<RetiredRecord> grouped_retirements;
   if (dropped.grouped()) {
@@ -495,7 +494,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   if (erased) {
     RemoveFullSyncCoverageEntry(partition, candidate.db_id_, logical_key_bytes);
   }
-  if (dropped.external() && !dropped.key_external()) {
+  if (dropped.external()) {
     SpawnExtentReclaim(store, dropped_extents);
   }
   absl::Status dead = co_await MarkRecordDead(

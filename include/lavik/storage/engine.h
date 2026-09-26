@@ -79,9 +79,6 @@ struct StorageEngineOptions {
   // Runtime CONFIG changes wake any publisher waiting under the old policy.
   bool replication_backlog_backpressure_ = true;
   bool expiration_authority_ = true;
-  // Keys at or below this size stay complete in the in-memory index. Larger
-  // keys are stored in disk extents and verified on demand.
-  std::size_t inline_key_max_bytes_ = kDefaultInlineKeyBytes;
   // Full-disk sweep retiring tombstones no surviving record needs. Zero
   // disables it.
   std::uint32_t tomb_raider_interval_ms_ = 86'400'000;
@@ -1068,6 +1065,13 @@ class MutationPrecondition {
 struct GroupedCommitDecision;
 
 struct TxShardWrites {
+  // Command-lifetime cache only. It avoids rereading a large immutable key
+  // for every auxiliary segment; no original long key stays in the registry.
+  struct IndirectKeyCache {
+    std::string key_;
+    IndirectKeyId id_{};
+  };
+  std::vector<IndirectKeyCache> indirect_keys_;
   std::uint64_t txid_ = 0;  // input: stamped into every record written
   // All shards of one transaction share the same generation and lease. The
   // opaque lease keeps that generation open until the last shard receipt is
@@ -1113,9 +1117,8 @@ struct TxShardWrites {
     // superseded predecessors, they must never be restored by undo.
     bool aborted_auxiliary_ = false;
     std::shared_ptr<const std::vector<ExtentRef>> dependent_extents_;
-    // Value-only extents can be reclaimed as soon as the transaction commit
-    // is durable. External-key extents stay dependent on the stale records
-    // block because recovery may still need them to identify that record.
+    // Value extents follow transaction durability and read pins. Original
+    // long-key payloads have a separate UUID/KeyRecord lifetime.
     std::shared_ptr<const std::vector<ExtentRef>> immediate_extents_;
     // Keeps admitted grouped-retirement metadata charged until the final
     // commit-fence copy is released; ordinary retirements leave this empty.

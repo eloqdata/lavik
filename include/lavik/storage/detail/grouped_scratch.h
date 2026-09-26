@@ -46,7 +46,7 @@ class GroupedScratchBudget {
         location.total_disk_bytes(),
         location.value_type() == ValueType::kString ? 1
                                                     : location.logical_size_,
-        location.external(), location.key_external(), extents, key_bytes);
+        location.external(), location.key_indirect(), extents, key_bytes);
   }
 
   // A retained immutable view owns these size fields, not the allocation
@@ -61,7 +61,7 @@ class GroupedScratchBudget {
     return AddLayout(
         value.total_disk_bytes(),
         value.value_type() == ValueType::kString ? 1 : value.logical_size(),
-        value.external(), value.key_external(), extents, key_bytes);
+        value.external(), value.key_indirect(), extents, key_bytes);
   }
 
   // Includes caller-owned copies of incoming fields/items before making them.
@@ -88,7 +88,7 @@ class GroupedScratchBudget {
  private:
   absl::Status AddLayout(
       std::uint64_t payload, std::uint32_t count, bool external,
-      bool key_external,
+      bool key_indirect,
       const std::shared_ptr<const std::vector<ExtentRef>>& extents,
       std::size_t key_bytes) {
     if (external) {
@@ -101,7 +101,7 @@ class GroupedScratchBudget {
           return absl::DataLossError("grouped scratch extent size overflow");
         payload += extent.payload_bytes_;
       }
-      if (key_external) {
+      if (key_indirect) {
         if (key_bytes > payload)
           return absl::DataLossError("grouped scratch key exceeds payload");
         payload -= key_bytes;

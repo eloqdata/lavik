@@ -591,32 +591,17 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
         const auto payload =
             std::span<const std::byte>(payload_data, record.payload_bytes_);
         std::string loaded_key;
-        if (record.key_external_) [[unlikely]] {
-          if (record.external_) {
-            auto manifest =
-                DecodeManifest(payload,
-                               static_cast<std::uint64_t>(record.key_bytes_) +
-                                   record.logical_size_,
-                               record.value_type_ == ValueType::kString);
-            if (!manifest.ok()) {
-              co_return manifest.status();
-            }
-            auto external_key =
-                co_await LoadExternalKey(store, *manifest, record.key_bytes_);
-            if (!external_key.ok()) {
-              co_return external_key.status();
-            }
-            loaded_key = std::move(*external_key);
-            disk_key = loaded_key;
-          } else {
-            if (record.payload_bytes_ < record.key_bytes_) {
-              co_return absl::Status(absl::StatusCode::kInternal,
-                                     "inline external key is truncated");
-            }
-            disk_key = std::string_view(
-                reinterpret_cast<const char*>(payload_data), record.key_bytes_);
-          }
+        if (record.key_indirect_) [[unlikely]] {
+          auto handle = co_await FindIndirectKey(record.key_id_);
+          if (!handle.ok()) co_return handle.status();
+          auto original = co_await LoadIndirectKey(std::move(*handle));
+          if (!original.ok()) co_return original.status();
+          loaded_key = std::move(*original);
+          if (loaded_key.size() != record.key_bytes_)
+            co_return absl::DataLossError("indirect key length mismatch");
+          disk_key = loaded_key;
         }
+
         const unsigned key_owner = OwnerForKey(disk_key);
         pending[key_owner].push_back(TombClaim{
             .mutation_sequence_ = record.mutation_sequence_,
@@ -712,7 +697,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
                                                 : entry.external_key_digest(),
                 .key_ = entry.key_complete() ? std::string(entry.key())
                                              : std::string{},
-                .extents_ = DependentExtentsFor(store, &entry),
+                .extents_ = ExtentManifest{},
                 .location_ = MaterializeIndexLocation(entry),
                 .key_bytes_ = entry.logical_key_size(),
                 .db_id_ = db_id,
@@ -757,8 +742,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
       continue;  // rewritten or claimed since collection
     }
     const RecordLocation dropped = MaterializeIndexLocation(*entry);
-    const ExtentManifest dropped_dependent_extents =
-        DependentExtentsFor(store, entry);
+    const ExtentManifest dropped_dependent_extents = ExtentManifest{};
     // No watcher or replica cares: erasing a tombstone changes nothing a
     // reader can observe. A staged physical record retains only address bits;
     // flush completion rejects them after Erase removes the live bucket slot.

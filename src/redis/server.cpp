@@ -2350,7 +2350,6 @@ int RunServer(ServerOptions options) {
       "client_query_buffer_limit={} "
       "flush_max_ms={} "
       "flush_size_bytes={} "
-      "inline_key_max_bytes={} "
       "defrag_max_active_per_device={} defrag_sleep_ms={} "
       "defrag_record_sleep_us={} defrag_paused={} shutdown_checkpoint={} "
       "replication_backlog_backpressure={}",
@@ -2366,10 +2365,9 @@ int RunServer(ServerOptions options) {
       options.replication_publish_queue_bytes_, options.max_memory_bytes_,
       FormatClientBufferLimit(options.maxmemory_clients_),
       options.client_query_buffer_limit_bytes_, options.flush_max_ms_,
-      options.flush_size_bytes_, options.inline_key_max_bytes_,
-      options.defrag_max_active_per_device_, options.defrag_sleep_ms_,
-      options.defrag_record_sleep_us_, options.defrag_paused_,
-      options.shutdown_checkpoint_,
+      options.flush_size_bytes_, options.defrag_max_active_per_device_,
+      options.defrag_sleep_ms_, options.defrag_record_sleep_us_,
+      options.defrag_paused_, options.shutdown_checkpoint_,
       options.replication_options_.backlog_backpressure_);
 
   const absl::Status memory_status =
@@ -2433,7 +2431,6 @@ int RunServer(ServerOptions options) {
       options.replication_publish_queue_bytes_;
   storage_options.replication_backlog_backpressure_ =
       options.replication_options_.backlog_backpressure_;
-  storage_options.inline_key_max_bytes_ = options.inline_key_max_bytes_;
   // A node configured with an upstream must not create local
   // expiration mutation sequences. It still hides expired values by their
   // absolute deadline and applies the primary's replicated tombstone.

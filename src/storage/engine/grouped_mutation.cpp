@@ -282,14 +282,10 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_GROUP_ENCODER_PREPARE_KEY", key);
     encoders.reserve(plan->writes_.size());
     encoded_sizes.reserve(plan->writes_.size());
-    const bool external_key = key.size() > options_.inline_key_max_bytes_ ||
-                              RecordHeaderBytes(key.size(), false, true, false,
-                                                true) > kBlockHeaderSlotBytes;
     for (const auto& snapshot : plan->writes_) {
       auto encoder = HashGroupEncoder::Create(snapshot);
       if (!encoder.ok()) co_return encoder.status();
-      if (external_key &&
-          key.size() > kMaxRecordPayloadBytes - encoder->encoded_bytes()) {
+      if (encoder->encoded_bytes() > kMaxRecordPayloadBytes) {
         co_return absl::OutOfRangeError(
             "group snapshot and parent key exceed payload limit");
       }
@@ -418,15 +414,11 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
             .record_offset_ = location.record_offset(),
             .tx_tagged_ = location.tx_tagged(),
             .aborted_auxiliary_ = true,
-            .dependent_extents_ =
-                location.key_external() ? record.extents_ : nullptr,
-            .immediate_extents_ =
-                location.key_external() ? nullptr : record.extents_});
+            .dependent_extents_ = nullptr,
+            .immediate_extents_ = record.extents_});
       } else {
-        auto retired = RetiredRecordOf(
-            location, location.key_external() ? record.extents_ : nullptr);
-        retired.immediate_extents_ =
-            location.key_external() ? nullptr : record.extents_;
+        auto retired = RetiredRecordOf(location, nullptr);
+        retired.immediate_extents_ = record.extents_;
         const auto dead = co_await MarkRecordDead(retired);
         if (!dead.ok()) {
           store.write_failed_ = true;

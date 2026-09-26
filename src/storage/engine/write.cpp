@@ -1022,8 +1022,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     }
     // Mirror the append-time counter math in reverse.
     const ExtentManifest applied_extents = ExtentsFor(store, current);
-    const ExtentManifest applied_dependent_extents =
-        DependentExtentsFor(store, current);
+    const ExtentManifest applied_dependent_extents = ExtentManifest{};
     const bool applied_live = applied.kind() == RecordKind::kValue;
     const bool restored_live = entry.previous_->kind() == RecordKind::kValue;
     if (applied_live != restored_live) {
@@ -1075,8 +1074,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     } else {
       store.external_manifests_.erase(current);
     }
-    if (applied.external() && !applied.key_external() &&
-        applied_extents != nullptr) {
+    if (applied.external() && applied_extents != nullptr) {
       SpawnExtentReclaim(store, ExtentsNotReferencedBy(
                                     applied_extents, entry.previous_extents_));
     }
@@ -1168,10 +1166,8 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     const auto key = current->key_complete() ? current->key()
                                              : std::string_view(external_key);
     auto& partition = PartitionForKey(store, key);
-    auto root_retirement = RetiredRecordOf(
-        applied,
-        applied.key_external() ? DependentExtentsFor(store, current) : nullptr);
-    if (applied.external() && !applied.key_external())
+    auto root_retirement = RetiredRecordOf(applied, nullptr);
+    if (applied.external())
       root_retirement.immediate_extents_ = ExtentsFor(store, current);
     auto grouped =
         partition.grouped_objects_[entry->db_id_].CurrentForMutation(key);
@@ -1829,17 +1825,16 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     }
   }
   absl::Status status = absl::OkStatus();
-  const bool key_external = key.size() > options_.inline_key_max_bytes_;
+  const bool key_indirect = key.size() > kInlineKeyMaxBytes;
   const std::uint64_t logical_payload_bytes =
-      static_cast<std::uint64_t>(value.size()) +
-      (key_external ? key.size() : 0);
+      static_cast<std::uint64_t>(value.size());
   const std::size_t inline_bytes =
-      AlignRecord(RecordHeaderBytes(key.size(), key_external, tx != nullptr,
+      AlignRecord(RecordHeaderBytes(key.size(), key_indirect, tx != nullptr,
                                     expire_at_ms != 0) +
                   static_cast<std::size_t>(logical_payload_bytes));
   if (inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) [[unlikely]] {
-    auto extents = co_await WriteExtentValueLocked(
-        store, key_external ? key : std::string_view{}, value);
+    auto extents =
+        co_await WriteExtentValueLocked(store, std::string_view{}, value);
     if (!extents.ok()) {
       co_return extents.status();
     }
@@ -1849,7 +1844,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     const std::string manifest = EncodeManifest(**extents);
     status = co_await WriteRecordLocked(
         store, db_id, key, manifest, kind, value_type, expire_at_ms, digest,
-        /*txid=*/0, mutation_sequence, false, true, true, key_external,
+        /*txid=*/0, mutation_sequence, false, true, true, key_indirect,
         logical_size, *extents, nullptr, nullptr, tx,
         std::move(commit_retirements), trace,
         replica_write_root.has_value() ? &*replica_write_root : nullptr,
@@ -1862,7 +1857,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   } else {
     status = co_await WriteRecordLocked(
         store, db_id, key, value, kind, value_type, expire_at_ms, digest,
-        /*txid=*/0, mutation_sequence, false, true, false, key_external,
+        /*txid=*/0, mutation_sequence, false, true, false, key_indirect,
         logical_size, nullptr, nullptr, nullptr, tx,
         std::move(commit_retirements), trace,
         replica_write_root.has_value() ? &*replica_write_root : nullptr,
@@ -2300,7 +2295,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     std::string_view value, RecordKind kind, ValueType value_type,
     std::uint64_t expire_at_ms, const Digest& digest, std::uint64_t txid,
     std::uint64_t mutation_sequence, bool for_defrag,
-    bool unlock_writer_while_waiting, bool external, bool key_external,
+    bool unlock_writer_while_waiting, bool external, bool key_indirect,
     std::uint64_t logical_size,
     std::shared_ptr<const std::vector<ExtentRef>> extents,
     RecordLocation* written_location, const RelocationSource* relocation,
@@ -2309,7 +2304,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     SetLatencyTrace* trace, const ExplicitWriteRoot* explicit_root,
     TxUndoLog* replacement_undo, WorkerStore::PartitionStore* known_partition,
     const GroupRecordWrite* group, bool mark_watched,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    bool indirect_key_record) {
   if (store.write_failed_ || RuntimeFailureLatched() ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
@@ -2380,18 +2376,16 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
        (value_type != ValueType::kNone || expire_at_ms != 0 ||
         logical_size != 0 || (!external && !value.empty()))) ||
       (external && (extents == nullptr || extents->empty() ||
-                    (kind == RecordKind::kTombstone && !key_external))) ||
-      (key_external && key.empty())) {
+                    kind == RecordKind::kTombstone)) ||
+      (key_indirect && key.empty())) {
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "invalid value type or expiration metadata");
   }
   const bool invalid_logical_size =
       (value_type == ValueType::kString && logical_size > kMaxBitmapBytes) ||
       logical_size > std::numeric_limits<std::uint32_t>::max();
-  const std::uint64_t key_prefix = key_external ? key.size() : 0;
   if (!ValidRecordKeySize(key.size()) || invalid_logical_size ||
-      value.size() > kMaxRecordPayloadBytes ||
-      key_prefix > kMaxRecordPayloadBytes - value.size()) {
+      value.size() > kMaxRecordPayloadBytes) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "record key and value exceed storage limits");
   }
@@ -2408,8 +2402,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     const bool exact_extent_bytes =
         kind != RecordKind::kValue ||
         (value_type == ValueType::kString && !group);
-    if (extent_bytes < key_prefix ||
-        (exact_extent_bytes && extent_bytes != key_prefix + logical_size)) {
+    if (exact_extent_bytes && extent_bytes != logical_size) {
       co_return absl::Status(absl::StatusCode::kInvalidArgument,
                              "external payload length mismatch");
     }
@@ -2419,9 +2412,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
                            "inline string length mismatch");
   }
   const std::size_t record_header_bytes = RecordHeaderBytes(
-      key.size(), key_external, txid != 0, expire_at_ms != 0, auxiliary);
-  const std::size_t payload_bytes =
-      value.size() + (key_external && !external ? key.size() : 0);
+      key.size(), key_indirect, txid != 0, expire_at_ms != 0, auxiliary);
+  const std::size_t payload_bytes = value.size();
   const std::size_t total_disk_bytes =
       AlignRecord(record_header_bytes + payload_bytes);
   if (total_disk_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
@@ -2438,11 +2430,12 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   // wherever their coordinator runs, and recovery reads them independently
   // of any partition's epochs.
   WorkerStore::PartitionStore* partition_ptr =
-      kind == RecordKind::kTxCommit
+      (kind == RecordKind::kTxCommit || indirect_key_record)
           ? nullptr
           : (known_partition != nullptr ? known_partition
                                         : &PartitionForKey(store, key));
-  assert(known_partition == nullptr || known_partition->id_ == RedisSlot(key));
+  assert(known_partition == nullptr || key_indirect ||
+         known_partition->id_ == RedisSlot(key));
   RecordIndex* index_ptr =
       auxiliary ? nullptr
       : explicit_root != nullptr
@@ -2475,7 +2468,9 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     return kStorageBlockBytes - pages * 2 * kDirectIoAlignment;
   };
   const BlockKind append_block_kind =
-      transaction_append ? BlockKind::kTransaction : BlockKind::kRecords;
+      indirect_key_record  ? BlockKind::kIndirectKeys
+      : transaction_append ? BlockKind::kTransaction
+                           : BlockKind::kRecords;
   LAVIK_FAULT_INJECT(
       if (!for_defrag && !key.empty() &&
           LAVIK_FAULT_MATCHES("LAVIK_RECORD_WRITE_PAUSE_KEY", key)) {
@@ -2493,10 +2488,13 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   // generation and rehash active_tx_blocks_ while block allocation is in
   // flight. Re-resolve the entry on every use; active_block_ itself is stable.
   auto active_stream = [&]() -> std::optional<ActiveBlock>& {
+    if (indirect_key_record) return store.active_indirect_key_block_;
     return transaction_append ? store.active_tx_blocks_[tx_generation]
                               : store.active_block_;
   };
-  AsyncMutex* allocation_mutex = &store.active_block_allocation_mutex_;
+  AsyncMutex* allocation_mutex = indirect_key_record
+                                     ? &store.indirect_key_allocation_mutex_
+                                     : &store.active_block_allocation_mutex_;
   if (transaction_append) {
     auto& gate = store.active_tx_block_allocation_mutexes_[tx_generation];
     if (gate == nullptr) gate = std::make_unique<AsyncMutex>();
@@ -2516,6 +2514,17 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     }
     co_return returned;
   };
+  IndirectKeyHandle indirect_key;
+  if (key_indirect) {
+    auto resolved = co_await EnsureIndirectKey(
+        store, key, digest, tx, for_defrag, unlock_writer_while_waiting);
+    if (!resolved.ok()) co_return resolved.status();
+    indirect_key = std::move(*resolved);
+  }
+  // The UUID was bound to the original key's slot when created. Checking its
+  // slot avoids rehashing a multi-megabyte key for every auxiliary segment.
+  assert(known_partition == nullptr || !indirect_key ||
+         known_partition->id_ == (indirect_key->id_[0] & 0x3fff));
   std::unique_ptr<GroupedRetirementPins> grouped_dependency_pins;
 acquire_active_stream:
   if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
@@ -2554,7 +2563,8 @@ acquire_active_stream:
     }
     absl::StatusOr<ReservedBlock> allocated{
         absl::UnavailableError("no standby block is available")};
-    if (!transaction_append && store.standby_block_.has_value()) {
+    if (!transaction_append && !indirect_key_record &&
+        store.standby_block_.has_value()) {
       allocated = *store.standby_block_;
       store.standby_block_.reset();
       if (trace != nullptr) trace->standby_block_ = true;
@@ -2657,7 +2667,7 @@ acquire_active_stream:
           .kind_ = append_block_kind,
           .tx_generation_ = tx_generation,
       };
-      if (!transaction_append) {
+      if (!transaction_append && !indirect_key_record) {
         store.standby_prefetch_for_block_.reset();
       }
       BlockState& state =
@@ -2691,7 +2701,7 @@ acquire_active_stream:
       // The header region stays zero in staging until a flush encodes it
       // into the slot it is about to write. Encoding it here, or on every
       // append, would race the flush that is reading the same page.
-      if (!transaction_append) {
+      if (!transaction_append && !indirect_key_record) {
         // Replenish immediately after installation. All later records use the
         // active block without testing an occupancy threshold; rollover either
         // consumes this successor or waits behind its stateful allocation
@@ -2821,7 +2831,7 @@ acquire_active_stream:
       index_ptr != nullptr && (previous_entry == nullptr ||
                                previous_entry->has_extra() != has_index_extra);
   if (needs_index_allocation &&
-      !index_ptr->CanAllocateEntry(key, !key_external, has_index_extra)) {
+      !index_ptr->CanAllocateEntry(key, !key_indirect, has_index_extra)) {
     // The handle's 21-bit page ID is a hard per-worker capacity boundary.
     // Check it after every suspension and before mutating the staging buffer,
     // so exhaustion is reported without leaving a durable record whose index
@@ -2843,7 +2853,7 @@ acquire_active_stream:
   std::optional<MemoryReservation> index_memory_reservation;
   if (needs_index_allocation) {
     const std::size_t allocation_bytes = index_ptr->RequiredAllocationBytes(
-        digest, key, !key_external, has_index_extra, previous_entry == nullptr);
+        digest, key, !key_indirect, has_index_extra, previous_entry == nullptr);
     if (allocation_bytes != 0) {
       index_memory_reservation = TryReserveMemory(allocation_bytes);
       if (!index_memory_reservation.has_value()) {
@@ -2860,10 +2870,9 @@ acquire_active_stream:
           : std::optional<RecordLocation>(
                 MaterializeIndexLocation(*previous_entry));
   const ExtentManifest previous_extents = ExtentsFor(store, previous_entry);
-  const ExtentManifest retired_value_extents = ExtentsNotReferencedBy(
-      previous_extents, external && !key_external ? extents : nullptr);
-  const ExtentManifest previous_dependent_extents =
-      DependentExtentsFor(store, previous_entry);
+  const ExtentManifest retired_value_extents =
+      ExtentsNotReferencedBy(previous_extents, external ? extents : nullptr);
+  const ExtentManifest previous_dependent_extents = ExtentManifest{};
   ActiveBlock updated = *active_stream();
   const std::uint32_t record_offset = updated.committed_bytes_;
   updated.committed_bytes_ += static_cast<std::uint32_t>(total_disk_bytes);
@@ -2897,7 +2906,7 @@ acquire_active_stream:
         expire_at_ms, static_cast<std::uint32_t>(logical_size),
         RecordLocation::PackedMetadata::Encode(
             record_offset, static_cast<std::uint32_t>(total_disk_bytes),
-            writer_id, true, external, key_external, false, false, txid != 0,
+            writer_id, true, external, key_indirect, false, false, txid != 0,
             kind, value_type, expire_at_ms != 0, true));
     const auto prepared = group->prepare_root_(GroupedObjectVersion{
         .root_ = provisional,
@@ -3016,6 +3025,22 @@ acquire_active_stream:
     absl::Status admissible = effective_precondition->Validate();
     if (!admissible.ok()) co_return admissible;
   }
+  // Admit exceptional reference-directory allocations before publishing any
+  // staging bytes. Ordinary keys do not touch these maps. A later encoding
+  // failure stops the writer; conservative dependencies remain until the
+  // containing allocation is retired.
+  if (indirect_key) {
+    store
+        .indirect_key_references_[{updated.block_id_,
+                                   updated.allocation_epoch_}]
+        .emplace(record_offset, indirect_key);
+  }
+  if (indirect_key_record) {
+    IndirectKeyId id;
+    std::memcpy(id.data(), key.data(), sizeof(id));
+    store.indirect_key_records_[{updated.block_id_, updated.allocation_epoch_}]
+        .emplace_back(id, record_offset);
+  }
   // WATCH invalidation belongs to the same linearization cut as publication:
   // rejected authority checks must not invalidate it, while an observer must
   // never see the new index value before the watch fingerprint changes.
@@ -3035,7 +3060,7 @@ acquire_active_stream:
       .db_id_ = db_id,
       .value_type_ = value_type,
       .external_ = external,
-      .key_external_ = key_external,
+      .key_indirect_ = key_indirect,
       .grouped_ = grouped_root,
       .auxiliary_group_ = auxiliary,
       .group_retired_ = auxiliary && group->retired_,
@@ -3043,6 +3068,7 @@ acquire_active_stream:
       .group_prefix_ = auxiliary ? group->id_.prefix_ : 0,
       .group_prefix_bits_ = auxiliary ? group->id_.bits_ : std::uint8_t{0},
       .group_batch_txid_ = auxiliary ? group->batch_txid_ : 0,
+      .key_id_ = indirect_key ? indirect_key->id_ : IndirectKeyId{},
       .key_bytes_ = static_cast<std::uint32_t>(key.size()),
       .logical_size_ = static_cast<std::uint32_t>(logical_size),
       .payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
@@ -3058,7 +3084,8 @@ acquire_active_stream:
       // fresh read here could adopt it mid-append — turning a record
       // recovery must drop into one it must keep.
       .db_epoch_ =
-          explicit_root != nullptr
+          indirect_key_record ? 1
+          : explicit_root != nullptr
               ? explicit_root->db_epoch_
               : (relocation != nullptr
                      ? relocation->db_epoch_
@@ -3076,17 +3103,13 @@ acquire_active_stream:
                                      record_header_bytes);
   std::byte* payload_output =
       staging.data_ + record_offset + record_header_bytes;
-  if (key_external && !external) [[unlikely]] {
-    std::memcpy(payload_output, key.data(), key.size());
-    payload_output += key.size();
-  }
   if (!value.empty()) {
     std::memcpy(payload_output, value.data(), value.size());
   }
   assert(relocation == nullptr ||
          !relocation->verified_payload_checksum_.has_value() ||
          (kind == RecordKind::kValue && value_type == ValueType::kString &&
-          !external && !key_external && !auxiliary && !grouped_root));
+          !external && !key_indirect && !auxiliary && !grouped_root));
   record.payload_checksum_ =
       relocation != nullptr &&
               relocation->verified_payload_checksum_.has_value()
@@ -3123,7 +3146,7 @@ acquire_active_stream:
       // against now instead, since their successors' deadlines are unknown.
       RecordLocation::PackedMetadata::Encode(
           record_offset, static_cast<std::uint32_t>(total_disk_bytes),
-          writer_id, true, external, key_external,
+          writer_id, true, external, key_indirect,
           previous.has_value() &&
               (relocation != nullptr
                    ? previous->shielding()
@@ -3205,7 +3228,7 @@ acquire_active_stream:
       inserted_entry = *replaced;
     } else {
       inserted_entry =
-          index_ptr->InsertNew(digest, key, location, !key_external);
+          index_ptr->InsertNew(digest, key, location, !key_indirect);
       if (inserted_entry == nullptr) {
         LatchRuntimeFailure(store);
         co_return absl::ResourceExhaustedError(
@@ -3275,8 +3298,7 @@ acquire_active_stream:
       .entry_address_ = reinterpret_cast<std::uintptr_t>(inserted_entry),
       .retired_extents_ = (!for_defrag || defer_defrag_retirement) &&
                                   !route_to_commit && previous.has_value() &&
-                                  previous->external() &&
-                                  !previous->key_external()
+                                  previous->external()
                               ? retired_value_extents
                               : nullptr,
       .retired_record_ =
@@ -3325,10 +3347,8 @@ acquire_active_stream:
         .record_offset_ = previous->record_offset(),
         .tx_tagged_ = previous->tx_tagged(),
         .dependency_pinned_ = dependency_pinned,
-        .dependent_extents_ =
-            previous->key_external() ? previous_dependent_extents : nullptr,
-        .immediate_extents_ =
-            previous->key_external() ? nullptr : retired_value_extents,
+        .dependent_extents_ = previous_dependent_extents,
+        .immediate_extents_ = retired_value_extents,
     });
   }
   if (tx != nullptr) {
@@ -3352,7 +3372,7 @@ acquire_active_stream:
       });
     }
   }
-  if (!auxiliary && was_live != is_live) {
+  if (!auxiliary && !indirect_key_record && was_live != is_live) {
     if (is_live) {
       if (explicit_root != nullptr) {
         ++*explicit_root->live_key_count_;
@@ -3375,7 +3395,7 @@ acquire_active_stream:
       }
     }
   }
-  if (!auxiliary && was_expiring != is_expiring) {
+  if (!auxiliary && !indirect_key_record && was_expiring != is_expiring) {
     if (is_expiring) {
       if (explicit_root != nullptr) {
         ++*explicit_root->expiring_key_count_;
@@ -3447,6 +3467,7 @@ void StorageEngine::Impl::SealActiveBlocks(WorkerStore& store) {
     active.reset();
   };
   seal(store.active_block_);
+  seal(store.active_indirect_key_block_);
   for (auto& [generation, active] : store.active_tx_blocks_) {
     (void)generation;
     seal(active);
@@ -3460,6 +3481,7 @@ void StorageEngine::Impl::FlushActiveBlock(WorkerStore& store) {
     }
   };
   flush(store.active_block_);
+  flush(store.active_indirect_key_block_);
   for (const auto& [generation, active] : store.active_tx_blocks_) {
     (void)generation;
     flush(active);

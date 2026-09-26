@@ -27,6 +27,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -145,6 +146,57 @@ class PrivateDisk {
       }
     }
     return result;
+  }
+
+  struct KeyLayout {
+    std::map<IndirectKeyId, std::pair<std::size_t, bool>> keys_;
+    std::map<IndirectKeyId, std::size_t> references_;
+    std::map<IndirectKeyId, std::size_t> copies_;
+    std::map<std::size_t, bool> inline_keys_;
+    std::size_t largest_indirect_record_ = 0;
+  };
+  // Inspect a quiescent first-generation image. Stale physical copies are
+  // deduplicated by UUID; the test keeps defrag paused while collecting it.
+  KeyLayout IndirectKeyLayout() const {
+    KeyLayout layout;
+    std::ifstream input(path_, std::ios::binary);
+    std::vector<std::byte> bytes(kStorageBlockBytes);
+    while (input.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) {
+      BlockHeader block;
+      if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+                                      bytes.data(), kBlockHeaderBytes),
+                                  &block) ||
+          (block.kind_ != BlockKind::kRecords &&
+           block.kind_ != BlockKind::kTransaction &&
+           block.kind_ != BlockKind::kIndirectKeys))
+        continue;
+      for (std::size_t offset = kBlockHeaderBytes;
+           offset < block.committed_bytes_;) {
+        RecordHeader record;
+        std::string_view key;
+        if (!DecodeRecordHeader(std::span(bytes).subspan(
+                                    offset, block.committed_bytes_ - offset),
+                                &record, &key)) {
+          offset = (offset / kDirectIoAlignment + 1) * kDirectIoAlignment;
+          continue;
+        }
+        if (block.kind_ == BlockKind::kIndirectKeys) {
+          Check(key.size() == sizeof(IndirectKeyId), "invalid key UUID size");
+          IndirectKeyId id;
+          std::memcpy(id.data(), key.data(), sizeof(id));
+          layout.keys_[id] = {record.logical_size_, record.external_};
+          ++layout.copies_[id];
+        } else if (record.key_indirect_) {
+          ++layout.references_[record.key_id_];
+          layout.largest_indirect_record_ = std::max<std::size_t>(
+              layout.largest_indirect_record_, record.total_disk_bytes_);
+        } else if (record.kind_ != RecordKind::kTxCommit) {
+          layout.inline_keys_[key.size()] = true;
+        }
+        offset += record.total_disk_bytes_;
+      }
+    }
+    return layout;
   }
 
   // External parent keys have no inline bytes for the scanner to compare.
