@@ -1688,16 +1688,25 @@ endforeach()
           PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
         if (TARGET lavik_import_client_go)
           set(import_cases single-single single-cluster cluster-single cluster-cluster type-commands)
-          if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR LAVIK_ENABLE_TEST_FAULTS)
+          set(import_fault_cases)
+          if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR LAVIK_ENABLE_TEST_FAULTS
+              OR "Debug" IN_LIST CMAKE_CONFIGURATION_TYPES)
             foreach(import_mode single cluster)
               foreach(import_phase full incremental)
                 foreach(import_fault tool connection failover)
-                  list(APPEND import_cases "${import_mode}-${import_phase}-${import_fault}")
+                  list(APPEND import_fault_cases "${import_mode}-${import_phase}-${import_fault}")
                 endforeach()
               endforeach()
             endforeach()
           endif()
-          foreach(import_case IN LISTS import_cases)
+          foreach(import_case IN LISTS import_cases import_fault_cases)
+            set(import_test_configurations)
+            # Debug supplies fault injection in multi-config builds even when
+            # the explicit option is off; other configurations cannot run it.
+            if (CMAKE_CONFIGURATION_TYPES AND NOT LAVIK_ENABLE_TEST_FAULTS
+                AND import_case IN_LIST import_fault_cases)
+              set(import_test_configurations CONFIGURATIONS Debug)
+            endif()
             add_test(NAME lavik_redis_sync_reader_${import_case}
               COMMAND ${CMAKE_COMMAND} -E env
                 "PYTHONPATH=${LAVIK_CLUSTER_CLIENT_REDIS_PY}"
@@ -1706,7 +1715,8 @@ endforeach()
                 ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_sync_reader_e2e.py
                 $<TARGET_FILE:lavik> ${LAVIK_REDIS_SERVER_EXECUTABLE}
                 ${LAVIK_REDIS_SHAKE_EXECUTABLE} $<TARGET_FILE:lavik-meta>
-                $<TARGET_FILE:lavik-ctl> ${LAVIK_REDIS_CLI_EXECUTABLE} ${import_case})
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_REDIS_CLI_EXECUTABLE} ${import_case}
+              ${import_test_configurations})
             set_tests_properties(lavik_redis_sync_reader_${import_case}
               PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE LABELS "meta-integration;redis-import")
           endforeach()
