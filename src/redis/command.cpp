@@ -4801,6 +4801,7 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
   }
   if (wants("persistence")) {
     info += "# Persistence\r\n";
+    info += co_await RdbPersistenceInfo();
     info += "rdb_changes_since_last_save:" +
             std::to_string(runtime_metrics->rdb_changes_since_last_save_) +
             "\r\n\r\n";
@@ -7837,6 +7838,16 @@ Task<std::string> ExecuteLuaRedisCall(
     }
   }
 
+  if (command.kind_ == CommandKind::kSortRo) {
+    // SORT's derived reads must use the outer script's already-held keys;
+    // acquiring new locks here could deadlock against another transaction.
+    std::vector<SortExecKey> sort_keys;
+    for (const auto& key : declared_keys) sort_keys.push_back({.name_ = key});
+    std::vector<storage::TxShardWrites> no_writes;
+    co_return co_await ExecuteSortCommandLocked(
+        command, sort_keys, no_writes, /*deterministic_set_order=*/true);
+  }
+
   const bool routed_multi = (flags & (kCmdMultiShard | kCmdMovableKeys)) != 0 ||
                             command_keys.size() != 1;
   const ExecSequentialFamily sequential = ClassifyExecSequential(command.kind_);
@@ -9392,7 +9403,8 @@ Task<CommandReply> ExecuteExecBody(
     ConnectionContext& ctx, ReplyBuilder& reply_builder,
     std::optional<std::uint64_t> write_admission_role_epoch,
     const ReplicationPublisherAdmission* publisher_admission = nullptr,
-    bool* publisher_admission_released = nullptr) {
+    bool* publisher_admission_released = nullptr,
+    ReplicationTransactionOrderGuard* preacquired_order = nullptr) {
   const RespVersion exec_reply_version = ctx.resp_version();
   std::vector<CommandRequest> queued = std::move(ctx.queued_);
   const bool dirty = ctx.multi_dirty_;
@@ -9465,9 +9477,12 @@ Task<CommandReply> ExecuteExecBody(
                     return !command.replication_origin_ &&
                            ExecCommandMayReplicate(command);
                   });
-  ReplicationTransactionOrderGuard replication_order_guard;
+  ReplicationTransactionOrderGuard local_replication_order;
+  auto& replication_order_guard = preacquired_order != nullptr
+                                      ? *preacquired_order
+                                      : local_replication_order;
   if (source_replicable && g_storage != nullptr &&
-      g_storage->ReplicationLogActive()) {
+      g_storage->ReplicationLogActive() && !replication_order_guard.active()) {
     absl::Status entered =
         co_await BeginReplicationTransactionOrder(&replication_order_guard);
     if (!entered.ok()) {
@@ -9488,7 +9503,8 @@ Task<CommandReply> ExecuteExecBody(
   }
   SnapshotTransactionOperationGuard snapshot_transaction_guard;
   if (source_write && g_replication != nullptr && g_storage != nullptr &&
-      g_storage->ReplicationLogActive()) {
+      g_storage->ReplicationLogActive() &&
+      !queued.front().exclusive_db_access_) {
     absl::Status entered =
         co_await BeginSnapshotTransaction(&snapshot_transaction_guard);
     if (!entered.ok()) {
@@ -9750,6 +9766,18 @@ Task<CommandReply> ExecuteExecBody(
     return FinalizeClusterMutationReply(queued.front(), reply_builder,
                                         std::move(reply));
   };
+  struct ExecBackupCompletion {
+    std::shared_ptr<std::atomic<bool>> done;
+    ~ExecBackupCompletion() {
+      if (done) done->store(true, std::memory_order_release);
+    }
+  } backup_completion;
+  if (std::any_of(queued.begin(), queued.end(), [](const auto& command) {
+        return command.kind_ == CommandKind::kBgSave ||
+               command.kind_ == CommandKind::kLastSave;
+      })) {
+    backup_completion.done = std::make_shared<std::atomic<bool>>(false);
+  }
   auto run_keyless = [&](const CommandRequest& cmd) -> Task<std::string> {
     if (IsLuaInvocationCommand(cmd)) {
       std::vector<CapturedReplicationCommand> effects;
@@ -9789,6 +9817,10 @@ Task<CommandReply> ExecuteExecBody(
       // an aggregate EXEC reply.
       local = BuiltReply(local_builder.AppendError(
           "ERR MONITOR isn't allowed for DENY BLOCKING client"));
+    } else if (cmd.kind_ == CommandKind::kBgSave ||
+               cmd.kind_ == CommandKind::kLastSave) {
+      local = co_await ExecuteRdbBackupCommand(cmd, local_builder,
+                                               backup_completion.done);
     } else if (cmd.kind_ == CommandKind::kInfo) {
       local = co_await ExecuteInfo(cmd, local_builder);
     } else if (cmd.kind_ == CommandKind::kRole) {
@@ -9819,7 +9851,8 @@ Task<CommandReply> ExecuteExecBody(
   };
 
   MultiDbOperationGuard db_guard;
-  while (!db_guard.TryAcquire(gate_dbs)) {
+  while (!queued.front().exclusive_db_access_ &&
+         !db_guard.TryAcquire(gate_dbs)) {
     if (!ctx.strict_replication_apply_) {
       co_await DropWatches(ctx);
       co_return finalize_exec_reply(BuiltReply(
@@ -10650,6 +10683,67 @@ Task<CommandReply> ExecuteExecBody(
 
 Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
                                ReplyBuilder& reply_builder) {
+  // Pattern keys can depend on earlier writes in EXEC, so they cannot be
+  // discovered before taking the transaction's static lock set. Isolate this
+  // uncommon read-only SORT case with the existing database cut. Take the
+  // publisher order first, but never drain while holding it: an admitted
+  // command may itself need that order to finish. Retry the entire cut until
+  // it is empty. FULL's snapshot cut can wait for these gates without this
+  // EXEC waiting back on its snapshot-transaction gate.
+  struct PatternCut {
+    bool active = false;
+    bool expiration = false;
+    ~PatternCut() {
+      if (expiration) g_storage->ResumeExpiration();
+      if (active) OpenAllCommandDbGates();
+    }
+  } pattern_cut;
+  ReplicationTransactionOrderGuard pattern_order;
+  const bool needs_pattern_cut = std::any_of(
+      ctx.queued_.begin(), ctx.queued_.end(), [](const auto& command) {
+        return command.kind_ == CommandKind::kSortRo &&
+               SortReadsPatternKeys(command);
+      });
+  auto acquire_pattern_cut =
+      [&](ReplicationPublisherAdmission* admission = nullptr,
+          std::size_t logical_bytes = 0) -> Task<absl::Status> {
+    if (!needs_pattern_cut || ctx.multi_dirty_) co_return absl::OkStatus();
+    for (;;) {
+      auto status = co_await BeginReplicationTransactionOrder(&pattern_order);
+      if (!status.ok()) co_return status;
+      if (CloseAllCommandDbGates()) {
+        if (!CommandDbOperationsActive()) {
+          pattern_cut.active = true;
+          break;
+        }
+        OpenAllCommandDbGates();
+      }
+      pattern_order.Release();
+      // FULL may own these gates while fencing its publisher. Return reserved
+      // capacity before waiting, including on a busy cut, so that fence can
+      // always make progress. Retry admission before taking order again.
+      if (admission != nullptr) {
+        auto released =
+            co_await ReleaseReplicationPublisherAdmission(*admission);
+        *admission = {};
+        if (!released.ok()) co_return released;
+      }
+      auto waited = co_await bycorf::SleepFor(*ThisWorker().self_,
+                                              std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+      if (admission != nullptr) {
+        auto renewed =
+            co_await AcquireReplicationPublisherAdmission(logical_bytes);
+        if (!renewed.ok()) co_return renewed.status();
+        *admission = std::move(*renewed);
+      }
+    }
+    auto status = co_await g_storage->QuiesceExpiration();
+    if (!status.ok()) co_return status;
+    pattern_cut.expiration = true;
+    for (auto& command : ctx.queued_) command.exclusive_db_access_ = true;
+    co_return absl::OkStatus();
+  };
   std::optional<std::uint64_t> write_admission_role_epoch;
   if (g_replication != nullptr &&
       std::any_of(ctx.queued_.begin(), ctx.queued_.end(),
@@ -10679,8 +10773,15 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
   source_replicable = source_replicable && g_storage != nullptr &&
                       g_storage->ReplicationLogActive();
   if (!source_replicable) [[likely]] {
-    co_return co_await ExecuteExecBody(ctx, reply_builder,
-                                       write_admission_role_epoch);
+    auto cut = co_await acquire_pattern_cut();
+    if (!cut.ok()) {
+      ctx.ResetMulti();
+      co_await DropWatches(ctx);
+      co_return BuiltReply(AppendStorageError(reply_builder, cut));
+    }
+    co_return co_await ExecuteExecBody(
+        ctx, reply_builder, write_admission_role_epoch, nullptr, nullptr,
+        needs_pattern_cut ? &pattern_order : nullptr);
   }
   if (ReplicationEventExceedsBacklog(event_bytes)) {
     ctx.ResetMulti();
@@ -10700,11 +10801,20 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
         absl::StrCat("ERR replication publisher admission failed: ",
                      admission.status().message())));
   }
+  // Match ordinary EXEC: reserve publisher capacity before taking publication
+  // order. A transaction holding that capacity may already be waiting for it.
+  auto cut = co_await acquire_pattern_cut(&*admission, logical_bytes);
+  if (!cut.ok()) {
+    (void)co_await ReleaseReplicationPublisherAdmission(*admission);
+    ctx.ResetMulti();
+    co_await DropWatches(ctx);
+    co_return BuiltReply(AppendStorageError(reply_builder, cut));
+  }
   ActivePublisherAdmissionGuard active_admission(&*admission);
   bool admission_released = false;
-  CommandReply reply =
-      co_await ExecuteExecBody(ctx, reply_builder, write_admission_role_epoch,
-                               &*admission, &admission_released);
+  CommandReply reply = co_await ExecuteExecBody(
+      ctx, reply_builder, write_admission_role_epoch, &*admission,
+      &admission_released, needs_pattern_cut ? &pattern_order : nullptr);
   if (!admission_released) {
     absl::Status released =
         co_await ReleaseReplicationPublisherAdmission(*admission);
@@ -12178,8 +12288,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
           !database_inspection && kind != CommandKind::kFunction &&
           !IsLuaInvocationCommand(request);
       const bool deferred =
-          kind == CommandKind::kSortRo || kind == CommandKind::kSave ||
-          kind == CommandKind::kBgSave || kind == CommandKind::kWait ||
+          kind == CommandKind::kWait ||
           ((flags & kCmdDynamicWrite) != 0 && kind != CommandKind::kFunction &&
            !IsLuaInvocationCommand(request)) ||
           keyless_data;
@@ -12290,7 +12399,13 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       ctx.queued_.push_back(std::move(request));
       co_return BuiltReply(reply_builder.AppendSimpleString("QUEUED"));
     }
-    if ((spec.flags_ & kCmdGlobal) != 0) {
+    if (kind == CommandKind::kSave) {
+      ctx.multi_dirty_ = true;
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR Command not allowed inside a transaction"));
+    }
+    if ((spec.flags_ & kCmdGlobal) != 0 && kind != CommandKind::kBgSave &&
+        kind != CommandKind::kLastSave) {
       ctx.multi_dirty_ = true;
       co_return BuiltReply(
           reply_builder.AppendError("ERR " + std::string(spec.name_) +
@@ -12414,6 +12529,11 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
         g_replication != nullptr ? g_replication->CaptureServingGeneration()
                                  : 0;
     request.serving_generation_valid_ = true;
+  }
+  if (!request.replication_origin_ && SynchronousRdbSaveActive()) {
+    auto waited = co_await WaitForSynchronousRdbSave();
+    if (!waited.ok())
+      co_return BuiltReply(AppendStorageError(reply_builder, waited));
   }
   const CommandKind kind = request.kind_;
   const bool may_advance_replication_watermark = [&] {

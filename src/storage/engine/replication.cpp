@@ -1536,6 +1536,18 @@ StorageEngine::Impl::ResetReplicaPartitions(
 
   co_await store.store_state_mutex_.Lock();
   UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
+  // The RDB scan walks these indexes after releasing its capture gates.
+  // Replacing them resets mutation sequences, so their old cut can no longer
+  // distinguish pre-cut values from the candidate population. Fail the export
+  // before detaching any index; its coordinator retains the prior RDB file.
+  if (store.rdb_snapshot_.has_value()) {
+    store.rdb_snapshot_->invalidated_ = true;
+    for (auto& partition : store.partitions_) {
+      if (partition.rdb_snapshot_.has_value()) {
+        partition.rdb_snapshot_->accepting_ = false;
+      }
+    }
+  }
   std::vector<ReplicaPartitionEpoch> result;
   result.reserve(resets.size());
   for (std::size_t index = 0; index < resets.size(); ++index) {

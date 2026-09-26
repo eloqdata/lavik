@@ -470,7 +470,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckArity("ping", 3, false);
   CheckArity("bgsave", 1, true);
   CheckArity("bgsave", 2, true);  // handler accepts only SCHEDULE
-  CheckArity("bgsave", 3, false);
+  CheckArity("bgsave", 3, true);  // handler returns Redis syntax error
   CheckArity("echo", 2, true);
   CheckArity("echo", 1, false);
   CheckArity("select", 2, true);

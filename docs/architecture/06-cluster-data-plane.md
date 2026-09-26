@@ -889,8 +889,14 @@ gate throughout its streamed reply. MULTI/EXEC/WATCH, SCRIPT, Lua and Function
 invocation reuse standalone execution under Group authority. XREAD and
 XREADGROUP support blocking and immediate reads on their existing wait lanes;
 XREADGROUP includes consumer metadata writes even for empty replies and NOACK.
-Standalone's unsupported inner commands remain unsupported. Top-level WAIT,
-SORT_RO, SAVE and BGSAVE remain deferred in managed Single.
+Standalone's unsupported inner commands remain unsupported. Top-level WAIT
+remains deferred in managed Single. SORT_RO, SAVE and BGSAVE use their shared
+Redis 7.2.14 command paths in both managed modes. Single sorting uses the
+selected DB and ordinary complete-replica read admission; Cluster sorting
+retains DB0 and slot routing, including Redis 7.2.14's BY/GET restrictions.
+RDB exports cover the receiving node's dataset, including every Single DB or
+the local Cluster Group's DB0, and can be consumed by Redis. They carry no
+Meta authority and do not constitute a managed Group restore procedure.
 Function catalog management uses that same sole Group's admission and drain:
 LOAD/DELETE/FLUSH/RESTORE share one mutation lifecycle and final authority
 check at the first durable root write. DUMP/LIST use ordinary Single data-read

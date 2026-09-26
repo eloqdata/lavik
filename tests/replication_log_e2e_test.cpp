@@ -2987,9 +2987,20 @@ class ReplicationLogService final : public bycorf::Service {
     for (unsigned index = 0; index < reset.db_epochs_.size(); ++index) {
       reset.db_epochs_[index] = storage_->DbEpoch(index);
     }
+    // A FULL replacement resets index/sequence identity. An RDB reader from
+    // the preceding population must fail instead of scanning the new root.
+    constexpr std::uint64_t rdb_session = 154;
+    status = storage_->BeginRdbSnapshot(rdb_session, 1);
+    if (!status.ok()) co_return status;
     auto epochs = co_await storage_->ResetReplicaPartitions(
         session, std::span(&reset, 1));
     if (!epochs.ok()) co_return epochs.status();
+    auto old_snapshot =
+        co_await storage_->ReadRdbSnapshotBatch(rdb_session, {}, 1, 4096);
+    Check(absl::IsFailedPrecondition(old_snapshot.status()),
+          "FULL replacement must invalidate the preceding RDB population");
+    status = co_await storage_->EndRdbSnapshot(rdb_session);
+    if (!status.ok()) co_return status;
     status = co_await storage_->HandoffReplicaPartition(
         session, partition, epochs->front().replication_epoch_);
     if (!status.ok()) co_return status;
