@@ -1,0 +1,36 @@
+# Copyright (C) 2026 EloqData Inc.
+# SPDX-License-Identifier: Apache-2.0
+# Addresses match compose.yaml. These are Docker-network endpoints, not host IPs.
+schema_version = 1
+slot_strategy = "contiguous-even"
+
+[[meta_members]]
+id = 1
+raft_endpoint = "tcp://172.30.92.11:7100"
+data_control_endpoint = "tcp://172.30.92.11:7300"
+ctl_endpoint = "tcp://172.30.92.11:7200"
+
+[[meta_members]]
+id = 2
+raft_endpoint = "tcp://172.30.92.12:7100"
+data_control_endpoint = "tcp://172.30.92.12:7300"
+ctl_endpoint = "tcp://172.30.92.12:7200"
+
+[[meta_members]]
+id = 3
+raft_endpoint = "tcp://172.30.92.13:7100"
+data_control_endpoint = "tcp://172.30.92.13:7300"
+ctl_endpoint = "tcp://172.30.92.13:7200"
+
+[[data_nodes]]
+id = "1111111111111111111111111111111111111111"
+client_endpoint = "tcp://172.30.92.21:6379"
+
+[[data_nodes]]
+id = "2222222222222222222222222222222222222222"
+client_endpoint = "tcp://172.30.92.22:6379"
+
+[[groups]]
+id = "group-1"
+primary = "1111111111111111111111111111111111111111"
+replicas = ["2222222222222222222222222222222222222222"]

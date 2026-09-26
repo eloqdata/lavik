@@ -36,11 +36,11 @@ repos:
       - id: ruff-check
         name: ruff check
         args: [--fix, --select, E4,E9,F]
-        files: '^(admin/|scripts/|tests/).*\.py$'
+        files: '^(admin/|deploy/|scripts/|tests/).*\.py$'
         exclude: '^(third_party/|bycorf/)'
       - id: ruff-format
         name: ruff format
-        files: '^(admin/|scripts/|tests/).*\.py$'
+        files: '^(admin/|deploy/|scripts/|tests/).*\.py$'
         exclude: '^(third_party/|bycorf/)'
 
   - repo: https://github.com/pre-commit/mirrors-prettier

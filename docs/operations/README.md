@@ -28,6 +28,7 @@ or safety boundaries.
 | [Quick startup tuning](quick-start-tuning.md) | Generate a CPU plan for the current host and start Lavik |
 | [Cluster deployment](cluster-deployment.md) | Launch the local Meta-managed cluster example |
 | [Building and packaging](building-and-packaging.md) | Building locally, producing release artifacts, or changing package contents |
+| [Release Docker images](../../deploy/docker/README.md) | Building/running the published beta as a standalone server or a primary/follower Compose cluster |
 | [SPDK storage](spdk-storage.md) | Run release packages on dedicated NVMe with kernel TCP, VFIO, and hugepages |
 | [TLS and password authentication](tls-and-auth.md) | Configure Redis listeners, external replication credentials, and the Data-side TLS identity |
 | [Multi-device storage](multi-device-storage.md) | Provisioning storage paths, expanding a storage set, or diagnosing membership and capacity constraints |

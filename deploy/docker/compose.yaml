@@ -1,0 +1,168 @@
+# Copyright (C) 2026 EloqData Inc.
+# SPDX-License-Identifier: Apache-2.0
+name: lavik-beta
+
+x-server: &server
+  image: eloqdata/lavik:0.1.0-beta.1-cluster
+  # The Docker default seccomp profile blocks io_uring. No privileged mode needed.
+  security_opt: [seccomp=unconfined]
+  restart: unless-stopped
+  stop_grace_period: 60s
+
+x-meta: &meta
+  <<: *server
+  environment:
+    LAVIK_META_MANIFEST: /etc/lavik/cluster.toml
+  healthcheck:
+    test:
+      [
+        CMD,
+        lavik-ctl,
+        --socket,
+        /data/meta/meta-admin.sock,
+        --timeout-ms,
+        "1000",
+        status,
+      ]
+    interval: 3s
+    timeout: 3s
+    retries: 30
+
+x-data: &data
+  <<: *server
+  environment:
+    LAVIK_THREADS: ${LAVIK_THREADS:-2}
+    LAVIK_DATA_SIZE: ${LAVIK_DATA_SIZE:-1G}
+  healthcheck:
+    test: [CMD-SHELL, 'test "$$(redis-cli --raw PING)" = PONG']
+    interval: 3s
+    timeout: 3s
+    retries: 30
+
+services:
+  meta-1:
+    <<: *meta
+    command:
+      [
+        lavik-meta,
+        --id,
+        "1",
+        --addr,
+        "172.30.92.11:7100",
+        --ctl-addr,
+        "172.30.92.11:7200",
+        --data-control-addr,
+        "172.30.92.11:7300",
+      ]
+    volumes:
+      - meta-1:/data
+      - ./cluster.toml:/etc/lavik/cluster.toml:ro
+    networks:
+      cluster: { ipv4_address: 172.30.92.11 }
+  meta-2:
+    <<: *meta
+    command:
+      [
+        lavik-meta,
+        --id,
+        "2",
+        --addr,
+        "172.30.92.12:7100",
+        --ctl-addr,
+        "172.30.92.12:7200",
+        --data-control-addr,
+        "172.30.92.12:7300",
+      ]
+    volumes:
+      - meta-2:/data
+      - ./cluster.toml:/etc/lavik/cluster.toml:ro
+    networks:
+      cluster: { ipv4_address: 172.30.92.12 }
+  meta-3:
+    <<: *meta
+    command:
+      [
+        lavik-meta,
+        --id,
+        "3",
+        --addr,
+        "172.30.92.13:7100",
+        --ctl-addr,
+        "172.30.92.13:7200",
+        --data-control-addr,
+        "172.30.92.13:7300",
+      ]
+    volumes:
+      - meta-3:/data
+      - ./cluster.toml:/etc/lavik/cluster.toml:ro
+    networks:
+      cluster: { ipv4_address: 172.30.92.13 }
+  primary:
+    <<: *data
+    command:
+      [
+        lavik,
+        --cluster-enabled,
+        --cluster-node-id,
+        "1111111111111111111111111111111111111111",
+        --cluster-announce-ip,
+        "172.30.92.21",
+        --cluster-meta-seed,
+        "172.30.92.11:7300",
+        --cluster-meta-seed,
+        "172.30.92.12:7300",
+        --cluster-meta-seed,
+        "172.30.92.13:7300",
+      ]
+    ports: ["127.0.0.1:${LAVIK_PRIMARY_PORT:-6379}:6379"]
+    volumes: [primary:/data]
+    networks:
+      cluster: { ipv4_address: 172.30.92.21 }
+  follower:
+    <<: *data
+    command:
+      [
+        lavik,
+        --cluster-enabled,
+        --cluster-node-id,
+        "2222222222222222222222222222222222222222",
+        --cluster-announce-ip,
+        "172.30.92.22",
+        --cluster-meta-seed,
+        "172.30.92.11:7300",
+        --cluster-meta-seed,
+        "172.30.92.12:7300",
+        --cluster-meta-seed,
+        "172.30.92.13:7300",
+      ]
+    ports: ["127.0.0.1:${LAVIK_FOLLOWER_PORT:-6380}:6379"]
+    volumes: [follower:/data]
+    networks:
+      cluster: { ipv4_address: 172.30.92.22 }
+  bootstrap:
+    image: eloqdata/lavik:0.1.0-beta.1-cluster
+    # Lifecycle state belongs to Meta; avoid an unused anonymous data volume.
+    tmpfs: [/data]
+    command: [bootstrap-cluster, "172.30.92.11:7200", /etc/lavik/cluster.toml]
+    restart: "no"
+    depends_on:
+      meta-1: { condition: service_healthy }
+      meta-2: { condition: service_healthy }
+      meta-3: { condition: service_healthy }
+      primary: { condition: service_healthy }
+      follower: { condition: service_healthy }
+    volumes:
+      - ./cluster.toml:/etc/lavik/cluster.toml:ro
+    networks: [cluster]
+
+volumes:
+  meta-1:
+  meta-2:
+  meta-3:
+  primary:
+  follower:
+
+networks:
+  cluster:
+    ipam:
+      config: [{ subnet: 172.30.92.0/24 }]
