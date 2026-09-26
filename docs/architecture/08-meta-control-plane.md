@@ -1270,10 +1270,13 @@ domain-separated `cluster-create-v1` child operation. Its primary first gets
 the existing source-less empty-population directive. After that exact success
 receipt commits, the child installs one `authorize-source` directive per
 replica as a dedicated durable phase. Only after every exact authorization
-success receipt commits does the next durable phase retain those directives
+success receipt commits, and Meta has written a current lease grant to the
+primary session, does the next durable phase retain those directives
 byte-for-byte, including their original revisions, and add the matching
-`rebuild` directives under a later revision. The projector independently
-checks the retained authorization's exact receipt before sending a rebuild.
+`rebuild` directives under a later revision. This wait lets Meta's finite
+lease handoff quarantine finish before the replica dials the source. The
+projector independently checks the retained authorization's exact receipt
+before sending a rebuild.
 Source authority therefore remains logically current throughout target
 initialization, including Meta replay between the two phases. Data clears the
 runtime capabilities at each local execution update, but the selected task replay count
