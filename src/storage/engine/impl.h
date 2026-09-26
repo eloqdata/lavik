@@ -454,6 +454,7 @@ struct RecoveryLiveReference {
   std::uint64_t block_id_ = 0;
   std::uint64_t allocation_epoch_ = 0;
   std::uint64_t txid_ = 0;
+  std::uint64_t batch_txid_ = 0;
   // Total bytes charged for live references. Shared extents can contribute
   // the same physical payload more than once, so this may exceed the block's
   // committed payload size after checkpoint aggregation.
@@ -560,11 +561,17 @@ struct TxGenerationBlock {
   std::uint64_t allocation_epoch_ = 0;
   std::uint64_t generation_ = 0;
   std::uint64_t live_tagged_bytes_ = 0;
+  std::vector<std::uint64_t> txids_;
+  std::vector<std::uint64_t> commit_txids_;
+  bool active_transaction_ = false;
+  bool sealed_and_durable_ = false;
 };
 
 struct TxGenerationLocalState {
   std::vector<TxGenerationBlock> blocks_;
   std::vector<std::uint64_t> committed_txids_;
+  std::vector<std::pair<std::uint64_t, RelocationDurabilityFence>>
+      commit_fences_;
   std::uint64_t active_transactions_ = 0;
   std::uint64_t live_tagged_bytes_ = 0;
   std::uint64_t dependency_pins_ = 0;
@@ -1359,6 +1366,8 @@ class StorageEngine::Impl {
                                  std::memory_order_relaxed);
     tx_cleaner_cooldown_ms_.store(options_.tx_cleaner_cooldown_ms_,
                                   std::memory_order_relaxed);
+    tx_backlog_limit_bytes_.store(options_.tx_backlog_limit_bytes_,
+                                  std::memory_order_relaxed);
     const auto cleaner_now =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
@@ -1376,6 +1385,10 @@ class StorageEngine::Impl {
   struct TxGenerationRuntime {
     std::atomic<std::uint64_t> active_transactions_{0};
     absl::flat_hash_set<std::uint64_t> committed_txids_;
+    // A commit is visible in committed_txids_ as soon as it is appended.
+    // Per-block promotion awaits this fence before treating it as durable.
+    absl::flat_hash_map<std::uint64_t, RelocationDurabilityFence>
+        commit_fences_;
     bool has_records_ = false;
   };
 
@@ -1806,10 +1819,18 @@ class StorageEngine::Impl {
       std::uint64_t generation_ = 0;
       std::uint64_t live_tagged_bytes_ = 0;
       std::uint32_t dependency_pins_ = 0;
+      std::int64_t last_append_ms_ = 0;
+      bool counted_backlog_ = false;
+      std::uint32_t backlog_bytes_ = 0;
+      // Weak leases identify only transactions that wrote this block. Keeping
+      // a strong lease here would itself prevent a block from settling.
+      absl::flat_hash_map<std::uint64_t, std::weak_ptr<void>> txids_;
+      absl::flat_hash_set<std::uint64_t> commit_txids_;
     };
     // Sparse because only transaction blocks need generation/accounting
     // beyond the dense BlockState. Recovery rebuilds it from block headers.
     absl::flat_hash_map<std::uint64_t, TxBlockRuntime> tx_blocks_;
+    std::atomic<std::uint64_t> tx_backlog_bytes_{0};
     // Generation metadata is worker-affine just like tx_blocks_. Foreground
     // transaction admission and commit registration touch only the current
     // worker's map; cleaner coordination reads it through owner tasks. The
@@ -2315,7 +2336,7 @@ class StorageEngine::Impl {
   }
 
   TxCleanerTotals TxCleanerStats() const noexcept {
-    return TxCleanerTotals{
+    TxCleanerTotals totals{
         .rounds_ = tx_cleaner_rounds_.load(std::memory_order_acquire),
         .failures_ = tx_cleaner_failures_.load(std::memory_order_acquire),
         .retired_generations_ =
@@ -2323,13 +2344,27 @@ class StorageEngine::Impl {
         .retired_blocks_ =
             tx_cleaner_retired_blocks_.load(std::memory_order_acquire),
         .cooldown_ms_ = tx_cleaner_cooldown_ms_.load(std::memory_order_acquire),
+        .backlog_limit_bytes_ =
+            tx_backlog_limit_bytes_.load(std::memory_order_acquire),
+        .backlog_waits_ = tx_backlog_waits_.load(std::memory_order_acquire),
         .running_ = tx_cleaner_running_.load(std::memory_order_acquire),
     };
+    for (const auto& store : stores_)
+      totals.max_worker_backlog_bytes_ =
+          std::max(totals.max_worker_backlog_bytes_,
+                   store->tx_backlog_bytes_.load(std::memory_order_acquire));
+    return totals;
   }
   std::uint32_t TxCleanerCooldownMs() const noexcept {
     return tx_cleaner_cooldown_ms_.load(std::memory_order_acquire);
   }
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
+  std::uint64_t TxBacklogLimitBytes() const noexcept {
+    return tx_backlog_limit_bytes_.load(std::memory_order_acquire);
+  }
+  absl::Status ConfigureTxBacklogLimit(std::uint64_t bytes);
+  bool TxBacklogAtLimit() const noexcept;
+  Task<absl::Status> WaitForTxBacklog();
   void InitializeTxWrites(std::uint64_t txid, std::span<TxShardWrites> writes,
                           MutationPrecondition mutation_precondition);
   void RegisterRecoveredTxGeneration(WorkerStore& store,
@@ -3360,6 +3395,11 @@ class StorageEngine::Impl {
   Task<absl::Status> ReadExtentInto(WorkerStore& store, ExtentRef ref,
                                     std::uint32_t extent_index,
                                     std::byte* destination);
+  struct ExtentReadJoin;
+  Task<absl::Status> ReadExtentParallel(ExtentRef ref,
+                                        std::uint32_t extent_index,
+                                        std::byte* destination,
+                                        ExtentReadJoin* join);
   Task<absl::Status> ReadExtentSlice(WorkerStore& store, ExtentRef ref,
                                      std::uint32_t extent_index,
                                      std::size_t source_offset,
@@ -3471,7 +3511,10 @@ class StorageEngine::Impl {
   void NoteTxRecordLocal(WorkerStore& store, std::uint64_t block_id,
                          std::uint64_t allocation_epoch,
                          std::uint64_t generation, std::uint64_t txid,
-                         std::uint32_t bytes, bool commit);
+                         std::uint32_t bytes, bool commit,
+                         const TxShardWrites* receipt = nullptr,
+                         std::uint32_t record_end = 0,
+                         std::uint64_t dependency_txid = 0);
 
   void DropTaggedRecordLocal(WorkerStore& store, std::uint64_t block_id,
                              std::uint64_t allocation_epoch,
@@ -3817,6 +3860,9 @@ class StorageEngine::Impl {
   Task<absl::Status> BeforeGroupedTransaction(WorkerStore& store,
                                               std::uint64_t append_bytes);
   Task<absl::Status> MaybeRunTxCleaner(bool force = false);
+  // Called with the owning worker's store-state mutex held by periodic flush.
+  void SealIdleTxBlocksLocal(WorkerStore& store);
+  void NoteTxBlockSealedLocal(WorkerStore& store, std::uint64_t block_id);
   Task<absl::Status> RunTxCleaner(bool shutdown_drain = false);
 
   // Shutdown has stopped new transaction admission and drained commit chains.
@@ -3834,7 +3880,10 @@ class StorageEngine::Impl {
   Task<absl::Status> PromoteTxGenerationLocal(
       WorkerStore& store, std::uint64_t generation,
       std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed,
-      bool shutdown_drain);
+      bool shutdown_drain,
+      std::optional<std::uint64_t> only_block = std::nullopt);
+  Task<absl::Status> RetireTxBlockLocal(WorkerStore& store,
+                                        const TxGenerationBlock& block);
   Task<absl::Status> RetireTxGenerationLocal(WorkerStore& store,
                                              std::uint64_t generation);
 
@@ -4129,7 +4178,12 @@ class StorageEngine::Impl {
   std::atomic<std::uint64_t> space_reclaim_generation_{0};
   std::atomic<std::uint64_t> current_tx_generation_{1};
   std::atomic<std::uint32_t> tx_cleaner_cooldown_ms_{60'000};
+  std::atomic<std::uint64_t> tx_backlog_limit_bytes_{kStorageBlockBytes};
   std::atomic<std::int64_t> tx_cleaner_next_run_ms_{0};
+  // One pressure-driven retry per process; waiters do not each launch a
+  // cross-worker cleaner round while an old transaction is still open.
+  std::atomic<std::int64_t> tx_backlog_retry_ms_{0};
+  std::atomic<std::uint64_t> tx_backlog_waits_{0};
   std::atomic<bool> tx_cleaner_dirty_{true};
   std::atomic<bool> tx_cleaner_running_{false};
   std::atomic<std::uint64_t> tx_cleaner_rounds_{0};

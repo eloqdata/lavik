@@ -76,12 +76,11 @@ void StorageEngine::Impl::RegisterRecoveredTxGeneration(
   tx_cleaner_dirty_.store(true, std::memory_order_release);
 }
 
-void StorageEngine::Impl::NoteTxRecordLocal(WorkerStore& store,
-                                            std::uint64_t block_id,
-                                            std::uint64_t allocation_epoch,
-                                            std::uint64_t generation,
-                                            std::uint64_t txid,
-                                            std::uint32_t bytes, bool commit) {
+void StorageEngine::Impl::NoteTxRecordLocal(
+    WorkerStore& store, std::uint64_t block_id, std::uint64_t allocation_epoch,
+    std::uint64_t generation, std::uint64_t txid, std::uint32_t bytes,
+    bool commit, const TxShardWrites* receipt, std::uint32_t record_end,
+    std::uint64_t dependency_txid) {
   assert(generation != 0 && txid != 0 && bytes != 0);
   WorkerStore::TxBlockRuntime& block = store.tx_blocks_[block_id];
   if (block.allocation_epoch_ != allocation_epoch ||
@@ -89,17 +88,42 @@ void StorageEngine::Impl::NoteTxRecordLocal(WorkerStore& store,
     block = WorkerStore::TxBlockRuntime{
         .allocation_epoch_ = allocation_epoch,
         .generation_ = generation,
+        .txids_ = {},
+        .commit_txids_ = {},
     };
   }
   if (!commit) {
     block.live_tagged_bytes_ += bytes;
+  } else {
+    block.commit_txids_.insert(txid);
   }
+  block.txids_.insert_or_assign(
+      txid, receipt != nullptr ? std::weak_ptr<void>(receipt->generation_lease_)
+                               : std::weak_ptr<void>{});
+  if (dependency_txid != 0)
+    block.txids_.insert_or_assign(
+        dependency_txid, receipt != nullptr
+                             ? std::weak_ptr<void>(receipt->generation_lease_)
+                             : std::weak_ptr<void>{});
+  block.last_append_ms_ = MonotonicMillis();
   auto& generation_state = store.tx_generations_[generation];
   if (generation_state == nullptr) {
     generation_state = std::make_shared<TxGenerationRuntime>();
   }
   generation_state->has_records_ = true;
-  if (commit) generation_state->committed_txids_.insert(txid);
+  if (commit) {
+    generation_state->committed_txids_.insert(txid);
+    if (record_end != 0) {
+      generation_state->commit_fences_.insert_or_assign(
+          txid,
+          RelocationDurabilityFence{
+              .block_id_ = block_id,
+              .allocation_epoch_ = allocation_epoch,
+              .block_owner_ = static_cast<std::uint16_t>(store.worker_->id()),
+              .committed_bytes_ = record_end,
+          });
+    }
+  }
   tx_cleaner_dirty_.store(true, std::memory_order_release);
 }
 
@@ -152,6 +176,102 @@ absl::Status StorageEngine::Impl::ConfigureTxCleanerCooldown(
   tx_cleaner_next_run_ms_.store(0, std::memory_order_release);
   tx_cleaner_dirty_.store(true, std::memory_order_release);
   return absl::OkStatus();
+}
+
+absl::Status StorageEngine::Impl::ConfigureTxBacklogLimit(std::uint64_t bytes) {
+  if (bytes < kStorageBlockBytes) {
+    return absl::InvalidArgumentError(
+        "transaction backlog limit must be at least 8 MiB");
+  }
+  tx_backlog_limit_bytes_.store(bytes, std::memory_order_release);
+  return absl::OkStatus();
+}
+
+void StorageEngine::Impl::NoteTxBlockSealedLocal(WorkerStore& store,
+                                                 std::uint64_t block_id) {
+  const auto found = store.tx_blocks_.find(block_id);
+  if (found == store.tx_blocks_.end() || found->second.counted_backlog_) return;
+  const BlockState* state = FindBlockState(store, block_id);
+  if (state == nullptr ||
+      state->allocation_epoch_ != found->second.allocation_epoch_ ||
+      state->committed_bytes_ < kBlockHeaderBytes)
+    return;
+  // Charge the occupied Tx-record bytes, not the entire 8 MiB allocation.
+  // Sparse blocks sealed after idleness therefore consume only their actual
+  // backlog budget, while their physical allocation remains tracked by the
+  // block allocator.
+  found->second.backlog_bytes_ = state->committed_bytes_ - kBlockHeaderBytes;
+  found->second.counted_backlog_ = true;
+  auto& generation = store.tx_generations_[found->second.generation_];
+  if (generation == nullptr)
+    generation = std::make_shared<TxGenerationRuntime>();
+  generation->has_records_ = true;
+  store.tx_backlog_bytes_.fetch_add(found->second.backlog_bytes_,
+                                    std::memory_order_release);
+  tx_cleaner_dirty_.store(true, std::memory_order_release);
+}
+
+bool StorageEngine::Impl::TxBacklogAtLimit() const noexcept {
+  if (tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
+    return false;
+  const std::uint64_t limit =
+      tx_backlog_limit_bytes_.load(std::memory_order_acquire);
+  for (const auto& store : stores_)
+    if (store->tx_backlog_bytes_.load(std::memory_order_acquire) > limit)
+      return true;
+  return false;
+}
+
+Task<absl::Status> StorageEngine::Impl::WaitForTxBacklog() {
+  // This is an admission gate, never a per-append limit. The caller has no
+  // generation lease; a transaction admitted below the threshold can finish
+  // even if its own blocks take the worker far above it.
+  bool counted_wait = false;
+  for (;;) {
+    if (shutdown_flush_requested_.load(std::memory_order_acquire))
+      co_return absl::UnavailableError("storage is shutting down");
+    if (!TxBacklogAtLimit()) co_return absl::OkStatus();
+    if (!counted_wait) {
+      tx_backlog_waits_.fetch_add(1, std::memory_order_relaxed);
+      counted_wait = true;
+    }
+    const std::int64_t now = MonotonicMillis();
+    std::int64_t next = tx_backlog_retry_ms_.load(std::memory_order_acquire);
+    if (now >= next && tx_backlog_retry_ms_.compare_exchange_strong(
+                           next, now + 50, std::memory_order_acq_rel,
+                           std::memory_order_acquire)) {
+      const absl::Status cleaned = co_await MaybeRunTxCleaner(true);
+      if (!cleaned.ok() && !absl::IsFailedPrecondition(cleaned) &&
+          !absl::IsAborted(cleaned) && !absl::IsResourceExhausted(cleaned))
+        co_return cleaned;
+    }
+    const absl::Status waited = co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(2));
+    if (!waited.ok()) co_return waited;
+  }
+}
+
+void StorageEngine::Impl::SealIdleTxBlocksLocal(WorkerStore& store) {
+  if (tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0) return;
+  constexpr std::int64_t kIdleSealMs = 60'000;
+  const std::int64_t now = MonotonicMillis();
+  for (auto& [generation, active] : store.active_tx_blocks_) {
+    (void)generation;
+    if (!active.has_value()) continue;
+    const auto found = store.tx_blocks_.find(active->block_id_);
+    if (found == store.tx_blocks_.end() ||
+        found->second.allocation_epoch_ != active->allocation_epoch_ ||
+        found->second.last_append_ms_ == 0 ||
+        now - found->second.last_append_ms_ < kIdleSealMs)
+      continue;
+    RequestFlush(store, active->block_id_);
+    NoteTxBlockSealedLocal(store, active->block_id_);
+    active.reset();
+    // The timer closes only this physical stream. A live transaction keeps
+    // its generation lease and may append a commit in a successor block.
+    tx_cleaner_dirty_.store(true, std::memory_order_release);
+    tx_cleaner_next_run_ms_.store(0, std::memory_order_release);
+  }
 }
 
 Task<absl::Status> StorageEngine::Impl::BeforeGroupedTransaction(
@@ -310,6 +430,7 @@ StorageEngine::Impl::InspectTxGenerationLocal(WorkerStore& store,
         active->second.has_value()) {
       const ActiveBlock block = *active->second;
       RequestFlush(store, block.block_id_);
+      NoteTxBlockSealedLocal(store, block.block_id_);
       active->second.reset();
       fence = RelocationDurabilityFence{
           .block_id_ = block.block_id_,
@@ -333,6 +454,8 @@ StorageEngine::Impl::InspectTxGenerationLocal(WorkerStore& store,
         runtime->second->active_transactions_.load(std::memory_order_acquire);
     result.committed_txids_.assign(runtime->second->committed_txids_.begin(),
                                    runtime->second->committed_txids_.end());
+    result.commit_fences_.assign(runtime->second->commit_fences_.begin(),
+                                 runtime->second->commit_fences_.end());
   }
   for (const auto& [block_id, tx_block] : store.tx_blocks_) {
     if (tx_block.generation_ != generation) continue;
@@ -346,12 +469,23 @@ StorageEngine::Impl::InspectTxGenerationLocal(WorkerStore& store,
     result.sealed_and_durable_ &= durable;
     result.live_tagged_bytes_ += tx_block.live_tagged_bytes_;
     result.dependency_pins_ += tx_block.dependency_pins_;
-    result.blocks_.push_back(TxGenerationBlock{
+    TxGenerationBlock block{
         .block_id_ = block_id,
         .allocation_epoch_ = tx_block.allocation_epoch_,
         .generation_ = generation,
         .live_tagged_bytes_ = tx_block.live_tagged_bytes_,
-    });
+        .txids_ = {},
+        .commit_txids_ = {},
+        .sealed_and_durable_ = durable,
+    };
+    block.txids_.reserve(tx_block.txids_.size());
+    for (const auto& [txid, lease] : tx_block.txids_) {
+      block.txids_.push_back(txid);
+      block.active_transaction_ |= !lease.expired();
+    }
+    block.commit_txids_.assign(tx_block.commit_txids_.begin(),
+                               tx_block.commit_txids_.end());
+    result.blocks_.push_back(std::move(block));
   }
   co_return result;
 }
@@ -392,10 +526,11 @@ Task<absl::Status> StorageEngine::Impl::ForgetTxGenerationLocal(
 Task<absl::Status> StorageEngine::Impl::PromoteTxGenerationLocal(
     WorkerStore& store, std::uint64_t generation,
     std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed,
-    bool shutdown_drain) {
+    bool shutdown_drain, std::optional<std::uint64_t> only_block) {
   auto inspected = co_await InspectTxGenerationLocal(store, generation, false);
   if (!inspected.ok()) co_return inspected.status();
   for (const TxGenerationBlock& block : inspected->blocks_) {
+    if (only_block.has_value() && block.block_id_ != *only_block) continue;
     // Previous block relocations have reached their durability fences. Keep
     // all generation decisions/source allocations intact when an online round
     // yields to shutdown; the explicit checkpoint drain may finish the round.
@@ -445,9 +580,59 @@ Task<absl::Status> StorageEngine::Impl::PromoteTxGenerationLocal(
   co_return absl::OkStatus();
 }
 
+Task<absl::Status> StorageEngine::Impl::RetireTxBlockLocal(
+    WorkerStore& store, const TxGenerationBlock& block) {
+  std::uint32_t retired_backlog_bytes = 0;
+  {
+    co_await store.store_state_mutex_.Lock();
+    UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+    const auto found = store.tx_blocks_.find(block.block_id_);
+    BlockState* state = FindBlockState(store, block.block_id_);
+    if (found == store.tx_blocks_.end() || state == nullptr ||
+        found->second.allocation_epoch_ != block.allocation_epoch_ ||
+        found->second.generation_ != block.generation_ ||
+        state->allocation_epoch_ != block.allocation_epoch_ ||
+        state->kind_ != BlockKind::kTransaction || state->in_memory_ ||
+        state->flush_queued_ || state->flush_in_progress_ ||
+        state->defragging_ || state->freeing_ || state->pins_ != 0 ||
+        found->second.live_tagged_bytes_ != 0 ||
+        found->second.dependency_pins_ != 0 ||
+        !found->second.counted_backlog_ ||
+        IsActiveBlock(store, block.block_id_)) {
+      co_return absl::FailedPreconditionError(
+          "transaction block changed before retirement");
+    }
+    retired_backlog_bytes = found->second.backlog_bytes_;
+    state->freeing_ = true;
+    DestroyBlockState(store, block.block_id_);
+  }
+  absl::Status returned =
+      co_await ReturnColdBlocks(std::vector<std::uint64_t>{block.block_id_});
+  if (returned.ok()) {
+    store.tx_backlog_bytes_.fetch_sub(retired_backlog_bytes,
+                                      std::memory_order_release);
+    // UUID and extent dependencies remain live until the source allocation
+    // bit is durably cleared, even after its tagged winners have moved.
+    store.indirect_key_references_.erase(
+        {block.block_id_, block.allocation_epoch_});
+    auto deferred =
+        store.deferred_dependent_extent_reclaims_.find(block.block_id_);
+    if (deferred != store.deferred_dependent_extent_reclaims_.end()) {
+      std::vector<ExtentManifest> manifests = std::move(deferred->second);
+      store.deferred_dependent_extent_reclaims_.erase(deferred);
+      for (const ExtentManifest& manifest : manifests)
+        SpawnExtentReclaim(store, manifest);
+    }
+    tx_cleaner_retired_blocks_.fetch_add(1, std::memory_order_relaxed);
+    space_reclaim_generation_.fetch_add(1, std::memory_order_release);
+  }
+  co_return returned;
+}
+
 Task<absl::Status> StorageEngine::Impl::RetireTxGenerationLocal(
     WorkerStore& store, std::uint64_t generation) {
   std::vector<std::uint64_t> released;
+  std::uint64_t retired_backlog_bytes = 0;
   absl::flat_hash_map<std::uint64_t, std::uint64_t> retired_epochs;
   {
     co_await store.store_state_mutex_.Lock();
@@ -461,11 +646,12 @@ Task<absl::Status> StorageEngine::Impl::RetireTxGenerationLocal(
           state->flush_queued_ || state->flush_in_progress_ ||
           state->defragging_ || state->freeing_ || state->pins_ != 0 ||
           tx_block.live_tagged_bytes_ != 0 || tx_block.dependency_pins_ != 0 ||
-          IsActiveBlock(store, block_id)) {
+          !tx_block.counted_backlog_ || IsActiveBlock(store, block_id)) {
         co_return absl::FailedPreconditionError(
             "transaction generation changed before retirement");
       }
       released.push_back(block_id);
+      retired_backlog_bytes += tx_block.backlog_bytes_;
       retired_epochs.emplace(block_id, state->allocation_epoch_);
     }
     for (std::uint64_t block_id : released) {
@@ -484,6 +670,8 @@ Task<absl::Status> StorageEngine::Impl::RetireTxGenerationLocal(
   const std::size_t released_count = released.size();
   absl::Status returned = co_await ReturnColdBlocks(std::move(released));
   if (returned.ok()) {
+    store.tx_backlog_bytes_.fetch_sub(retired_backlog_bytes,
+                                      std::memory_order_release);
     // UUIDs and deferred manifests remain recovery dependencies until the
     // transaction block's allocation bit is durably clear. Ordinary record
     // blocks release the same debt in ReleaseEmptyBlock; transaction
@@ -587,6 +775,12 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
   std::sort(generations.begin(), generations.end());
   generations.erase(std::unique(generations.begin(), generations.end()),
                     generations.end());
+  // A full or idle-sealed block in the current generation can settle even
+  // while another transaction keeps that generation open.
+  if (current_has_records && closed_before == current &&
+      std::find(generations.begin(), generations.end(), closed_before) ==
+          generations.end())
+    generations.push_back(closed_before);
 
   for (std::uint64_t generation : generations) {
     if (!shutdown_drain &&
@@ -594,6 +788,10 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
       co_return absl::CancelledError(
           "online transaction cleaner yielding to shutdown");
     auto committed = std::make_shared<absl::flat_hash_set<std::uint64_t>>();
+    absl::flat_hash_map<std::uint64_t, std::vector<RelocationDurabilityFence>>
+        commit_fences;
+    std::vector<TxGenerationLocalState> owner_states;
+    owner_states.reserve(worker_count_);
     std::uint64_t active_transactions = 0;
     for (unsigned owner = 0; owner < worker_count_; ++owner) {
       absl::StatusOr<TxGenerationLocalState> local;
@@ -610,7 +808,76 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
       active_transactions += local->active_transactions_;
       committed->insert(local->committed_txids_.begin(),
                         local->committed_txids_.end());
+      for (const auto& [txid, fence] : local->commit_fences_)
+        commit_fences[txid].push_back(fence);
+      owner_states.push_back(std::move(*local));
     }
+    // A decision block remains allocated until every physical tagged block
+    // for its txid is gone. Otherwise recovery could lose the only commit
+    // evidence while another worker still has that transaction's data.
+    absl::flat_hash_map<std::uint64_t, std::size_t> tx_block_count;
+    for (const auto& state : owner_states)
+      for (const TxGenerationBlock& block : state.blocks_)
+        for (std::uint64_t txid : block.txids_) ++tx_block_count[txid];
+
+    for (unsigned owner = 0; owner < worker_count_; ++owner) {
+      for (const TxGenerationBlock& block : owner_states[owner].blocks_) {
+        if (!block.sealed_and_durable_ || block.active_transaction_) continue;
+        for (std::uint64_t txid : block.txids_) {
+          if (!committed->contains(txid)) continue;  // Definitely aborted.
+          if (const auto fence = commit_fences.find(txid);
+              fence != commit_fences.end()) {
+            for (const RelocationDurabilityFence& decision : fence->second) {
+              absl::Status durable = co_await AwaitRelocationDurable(decision);
+              if (!durable.ok()) co_return durable;
+            }
+          }
+          // Recovered commit records have no runtime fence: their recovery
+          // scan already validated the durable record.
+        }
+        absl::Status promoted;
+        if (owner == coordinator) {
+          promoted = co_await PromoteTxGenerationLocal(
+              *stores_[owner], generation, committed, shutdown_drain,
+              block.block_id_);
+        } else {
+          promoted = co_await bycorf::SubmitTaskTo(
+              owner, [this, owner, generation, committed, shutdown_drain,
+                      block_id = block.block_id_]() {
+                return PromoteTxGenerationLocal(*stores_[owner], generation,
+                                                committed, shutdown_drain,
+                                                block_id);
+              });
+        }
+        if (!promoted.ok()) co_return promoted;
+        bool has_decision_dependencies = false;
+        for (std::uint64_t txid : block.commit_txids_)
+          has_decision_dependencies |= tx_block_count[txid] > 1;
+        if (has_decision_dependencies) continue;
+
+        absl::Status retired;
+        if (owner == coordinator) {
+          retired = co_await RetireTxBlockLocal(*stores_[owner], block);
+        } else {
+          retired =
+              co_await bycorf::SubmitTaskTo(owner, [this, owner, block]() {
+                return RetireTxBlockLocal(*stores_[owner], block);
+              });
+        }
+        if (absl::IsFailedPrecondition(retired)) {
+          tx_cleaner_dirty_.store(true, std::memory_order_release);
+          continue;  // Pins or a concurrent relocation still own this block.
+        }
+        if (!retired.ok()) co_return retired;
+        for (std::uint64_t txid : block.txids_) {
+          assert(tx_block_count[txid] != 0);
+          --tx_block_count[txid];
+        }
+        tx_cleaner_dirty_.store(true, std::memory_order_release);
+      }
+    }
+
+    if (generation >= closed_before) continue;
     if (active_transactions != 0) {
       tx_cleaner_dirty_.store(true, std::memory_order_release);
       continue;

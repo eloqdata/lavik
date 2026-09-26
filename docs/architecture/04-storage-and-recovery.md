@@ -638,9 +638,11 @@ taking the reader's key lock; a stale physical read aborts and follows the
 current same-sequence relocation, while a true logical mutation becomes a
 normal miss.
 
-External values read and validate every extent on its current owner and
-assemble the logical value. A move-only `ReadBufferLease` may cross to the
-connection worker; destruction returns a registered slot to its storage owner.
+External values read and validate every extent on its current owner in bounded
+parallel waves, then assemble the logical value. Every read in a wave finishes
+before its shared output buffer can be released, including on error. A move-only
+`ReadBufferLease` may cross to the connection worker; destruction returns a
+registered slot to its storage owner.
 
 ### Flush and durability
 
@@ -916,23 +918,28 @@ logical partition epoch and Meta's committed group-level partition replication
 epoch. The latter two fence control-plane population identity; neither can
 substitute for the storage epoch used by recovery.
 
-Transaction cleaning rotates record-bearing generations, seals and flushes
-their blocks, collects committed decisions, and relocates current committed
-tagged winners into ordinary untagged record blocks. Rotation leaves at most
-one closed generation with outstanding transaction leases; the current
-generation remains open until those accepted transactions settle. This bounds
-the append streams needed by delayed commits rather than allowing a short
-cleaner cooldown to exhaust capacity with unretirable generations. Historical
-snapshot pins alone do not prevent rotation or cleanup of newer generations.
-A generation is returned through the cold-free lifecycle only when it is
-sealed and durable and has no
-active transaction leases, live tagged bytes, or dependency pins. When a
-transaction block is durably retired, its UUID references are released through
-the same ownership lifecycle as an ordinary record block. Standalone grouped writes can coordinate this lifecycle under foreground
-space pressure before acquiring a new generation lease; borrowed transaction
-writers never wait for their own generation to retire. Online cleaning yields
-to shutdown at block boundaries after already-published relocations become
-durable, retaining the incomplete generation's decisions and source allocations.
+Transaction cleaning seals a Tx block when its append stream rolls over or
+has received no append for one minute. Once the block is durable and every
+transaction represented in it has settled, the cleaner can relocate its
+current committed winners into ordinary untagged blocks and discard aborted
+or obsolete versions. It awaits each relevant commit decision's durability
+before promotion. A block carrying a commit decision remains allocated until
+all physical Tx blocks depending on that decision, including grouped batch
+dependencies on other workers, have retired. Destination durability, source
+pins, and the allocation bitmap retirement still order its cold-free return;
+UUID and extent dependencies follow the same source-block lifetime.
+
+Client writes that may open a storage transaction wait before taking key
+intents when any worker exceeds its configured sealed, unreclaimed Tx-record
+byte budget. The default and minimum are 8 MiB per worker. This is a soft admission
+threshold: an accepted transaction keeps writing and may cross it, while
+commit decisions and cleaner relocation remain able to progress. The active
+append block does not count as backlog. Rotation still leaves at most one
+closed generation with outstanding leases, avoiding unbounded append streams
+for delayed commits; whole-generation cleanup retires any blocks that remain
+after all leases settle. Historical snapshot pins alone do not prevent newer
+generations from rotating. Online cleaning yields to shutdown at block
+boundaries after already-published relocations become durable.
 When a shutdown checkpoint is enabled, worker 0 ignores the online cooldown
 and completes this lifecycle to a fixed point after commit and flush drain;
 failure skips the checkpoint rather than weakening cold recovery.

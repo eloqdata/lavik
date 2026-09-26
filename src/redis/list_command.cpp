@@ -614,6 +614,11 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     single_shard &= ShardForKey(args[arg]) == first_owner;
     keys.push_back(args[arg]);
   }
+  if (move) {
+    absl::Status admitted = co_await g_storage->WaitForTxBacklog();
+    if (!admitted.ok())
+      co_return BuiltReply(AppendStorageError(reply_builder, admitted));
+  }
   struct SnapshotAttemptGuard {
     bool snapshot_active_ = false;
     bool order_active_ = false;

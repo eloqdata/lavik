@@ -2586,7 +2586,15 @@ acquire_active_stream:
     }
     if (active_stream().has_value()) {
       RequestFlush(store, active_stream()->block_id_);
+      if (transaction_append)
+        NoteTxBlockSealedLocal(store, active_stream()->block_id_);
       active_stream().reset();
+      if (transaction_append) {
+        // A full Tx block can be considered for promotion as soon as its
+        // writers settle; do not wait for the periodic rotation cooldown.
+        tx_cleaner_dirty_.store(true, std::memory_order_release);
+        tx_cleaner_next_run_ms_.store(0, std::memory_order_release);
+      }
     }
     {
       std::uint16_t write_buffer_id = 0;
@@ -2687,6 +2695,8 @@ acquire_active_stream:
             block_id, WorkerStore::TxBlockRuntime{
                           .allocation_epoch_ = allocated->allocation_epoch_,
                           .generation_ = tx_generation,
+                          .txids_ = {},
+                          .commit_txids_ = {},
                       });
       }
       state.staging_slot_ = AcquireStagingSlot(store);
@@ -3163,9 +3173,14 @@ acquire_active_stream:
           kind == RecordKind::kTxCommit ? RecordKind::kValue : kind, value_type,
           expire_at_ms != 0, grouped_root));
   if (transaction_append) {
-    NoteTxRecordLocal(store, updated.block_id_, updated.allocation_epoch_,
-                      tx_generation, txid, location.total_disk_bytes(),
-                      kind == RecordKind::kTxCommit);
+    NoteTxRecordLocal(
+        store, updated.block_id_, updated.allocation_epoch_, tx_generation,
+        txid, location.total_disk_bytes(), kind == RecordKind::kTxCommit, tx,
+        kind == RecordKind::kTxCommit
+            ? static_cast<std::uint32_t>(location.record_offset() +
+                                         location.total_disk_bytes())
+            : 0,
+        group != nullptr ? group->batch_txid_ : 0);
   }
   const bool was_live =
       previous.has_value() && previous->kind() == RecordKind::kValue;
@@ -3416,6 +3431,8 @@ acquire_active_stream:
   staging_state->max_lsn_ = updated.max_lsn_;
   state.live_bytes_ += location.total_disk_bytes();
   state.flush_queued_ = updated.committed_bytes_ == kStorageBlockBytes;
+  if (transaction_append && state.flush_queued_)
+    NoteTxBlockSealedLocal(store, updated.block_id_);
   // A superseded record stays in its block's live_bytes until this record's
   // flush completes (the RecordIdentity above carries it there): the old copy
   // is the key's only durable version until then, and retiring it now lets
@@ -3469,6 +3486,7 @@ void StorageEngine::Impl::SealActiveBlocks(WorkerStore& store) {
   seal(store.active_indirect_key_block_);
   for (auto& [generation, active] : store.active_tx_blocks_) {
     (void)generation;
+    if (active.has_value()) NoteTxBlockSealedLocal(store, active->block_id_);
     seal(active);
   }
 }

@@ -941,7 +941,10 @@ absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
           block.block_id_, WorkerStore::TxBlockRuntime{
                                .allocation_epoch_ = block.allocation_epoch_,
                                .generation_ = block.tx_generation_,
+                               .txids_ = {},
+                               .commit_txids_ = {},
                            });
+      NoteTxBlockSealedLocal(store, block.block_id_);
     }
     if (block.kind_ == BlockKind::kPayloadExtent) {
       store.recovered_extents_[block.block_id_] = ExtentIdentity{
