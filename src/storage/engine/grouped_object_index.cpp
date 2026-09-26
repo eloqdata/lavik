@@ -618,7 +618,7 @@ bool GroupedObjectVersion::Matches(
          a.expire_at_ms_ == b.expire_at_ms_ &&
          a.logical_size_ == b.logical_size_ && a.kind() == b.kind() &&
          a.value_type() == b.value_type() && a.grouped() == b.grouped() &&
-         a.external() == b.external() && a.key_external() == b.key_external();
+         a.external() == b.external() && a.key_indirect() == b.key_indirect();
 }
 
 absl::StatusOr<GroupedHashObject::Handle> GroupedHashObject::Create(

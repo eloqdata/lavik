@@ -448,6 +448,7 @@ Task<absl::Status> StorageEngine::Impl::PromoteTxGenerationLocal(
 Task<absl::Status> StorageEngine::Impl::RetireTxGenerationLocal(
     WorkerStore& store, std::uint64_t generation) {
   std::vector<std::uint64_t> released;
+  absl::flat_hash_map<std::uint64_t, std::uint64_t> retired_epochs;
   {
     co_await store.store_state_mutex_.Lock();
     UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
@@ -465,6 +466,7 @@ Task<absl::Status> StorageEngine::Impl::RetireTxGenerationLocal(
             "transaction generation changed before retirement");
       }
       released.push_back(block_id);
+      retired_epochs.emplace(block_id, state->allocation_epoch_);
     }
     for (std::uint64_t block_id : released) {
       BlockState* state = FindBlockState(store, block_id);
@@ -482,11 +484,14 @@ Task<absl::Status> StorageEngine::Impl::RetireTxGenerationLocal(
   const std::size_t released_count = released.size();
   absl::Status returned = co_await ReturnColdBlocks(std::move(released));
   if (returned.ok()) {
-    // External-key extents remain recovery dependencies until the transaction
-    // block's allocation bit is durably clear. Ordinary record blocks release
-    // the same debt in ReleaseEmptyBlock; transaction generations retire by a
-    // separate path and must perform the matching handoff here.
+    // UUIDs and deferred manifests remain recovery dependencies until the
+    // transaction block's allocation bit is durably clear. Ordinary record
+    // blocks release the same debt in ReleaseEmptyBlock; transaction
+    // generations retire by a separate path and must perform the matching
+    // handoff here.
     for (const std::uint64_t block_id : retired_blocks) {
+      store.indirect_key_references_.erase(
+          {block_id, retired_epochs.at(block_id)});
       auto deferred = store.deferred_dependent_extent_reclaims_.find(block_id);
       if (deferred == store.deferred_dependent_extent_reclaims_.end()) {
         continue;

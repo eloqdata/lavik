@@ -49,10 +49,11 @@ metadata, groups, consumers and individual pending entries. Their externally
 visible length is independent of the internal record count. See
 [Streams](12-streams.md) for their access and logical-format contracts.
 
-String writes promote at the same 16 KiB encoded-size threshold as collections.
-Keys larger than 8 KiB use whole-value String storage: auxiliary records carry
-their parent key, so grouping such values would amplify key storage without a
-bound relative to their payload. These exceptional keys can still use extents.
+String writes promote at the same 16 KiB encoded-size threshold as collections,
+regardless of key length. Parent keys of at most 2 KiB are inline; longer keys
+share one immutable KeyRecord through a UUID in each root and auxiliary header.
+Segment payloads never contain copies of the parent key. See
+[storage formats and lifetime](04-storage-and-recovery.md) for UUID ownership.
 Segments have dense, one-based identifiers derived from byte offsets. All but
 the tail contain exactly 8 KiB; extension materializes zero-filled gaps.
 The resident String directory and physical index use direct vector indexing,
@@ -63,9 +64,9 @@ For grouped Strings, GETRANGE/GETBIT read only intersecting segments;
 SETRANGE/SETBIT/APPEND replace intersecting segments and any changed tail link
 through the shared grouped publication boundary. General whole-value callbacks
 materialize grouped Strings and reuse unchanged segments in their after-image.
-Strings below the promotion threshold or with keys larger than 8 KiB use
-whole-value reads and writes, with extents where needed. This cutoff bounds
-space amplification independently of on-disk compatibility.
+Strings below the promotion threshold use compact whole-value reads and writes.
+Dedicated KeyRecords store original key bytes whole regardless of this
+user-value promotion threshold.
 
 ## Identity and ownership
 
@@ -163,7 +164,7 @@ String root and page counts measure bytes. Its page payload is a checked
 64-byte envelope followed by at most 8 KiB of
 raw bytes, without per-item framing. Recovery checks dense IDs, fixed segment
 lengths, links, and aggregate byte length. String value segments fit ordinary
-records; oversized parent keys retain the existing external-payload rules.
+records even when the parent key is large, because its UUID has fixed size.
 Ordered auxiliary identifiers have zero prefix bits and a nonzero opaque page
 number. Member auxiliaries use canonical Hash prefixes (including the unsplit
 `{0, 0}` root), a disjoint
@@ -340,9 +341,8 @@ transaction adjudication and root selection, recovery reconstructs each
 winning incarnation, including retained parent markers, and checks routing
 coverage and aggregate counts. Only reachable external group payloads are
 validated: an obsolete inline-key group's value extents may already have been
-reclaimed while its records block is still scannable. External parent-key
-extents instead remain source-block dependencies because classification still
-requires the full key. Every live group, root and extent joins physical-owner
+reclaimed while its records block is still scannable. UUID references remain
+source-block dependencies so classification can still resolve the original key. Every live group, root and extent joins physical-owner
 accounting before orphan reclamation.
 
 For indexed Sorted Sets, reconstruction requires both complete directories

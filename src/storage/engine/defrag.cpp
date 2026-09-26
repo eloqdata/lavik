@@ -26,7 +26,7 @@ bool CheckPayloadOnKeyOwner(const RecordHeader& record) noexcept {
   // whether the record is still current need no payload bytes. Extent/key
   // manifests and transaction/group records retain the eager validation path.
   return record.kind_ == RecordKind::kValue &&
-         record.value_type_ == ValueType::kString && !record.key_external_ &&
+         record.value_type_ == ValueType::kString && !record.key_indirect_ &&
          !record.external_ && !record.grouped_ && !record.auxiliary_group_ &&
          record.txid_ == 0;
 }
@@ -148,8 +148,10 @@ void StorageEngine::Impl::MaybeQueueDefrag(WorkerStore& store,
   BlockState* state = FindBlockState(store, block_id);
   if (state == nullptr || !state->allocated_ || state->defrag_queued_ ||
       state->defragging_ || state->pins_ != 0 || state->in_memory_ ||
-      state->kind_ != BlockKind::kRecords || state->flush_queued_ ||
-      state->flush_in_progress_ || IsActiveBlock(store, block_id) ||
+      (state->kind_ != BlockKind::kRecords &&
+       state->kind_ != BlockKind::kIndirectKeys) ||
+      state->flush_queued_ || state->flush_in_progress_ ||
+      IsActiveBlock(store, block_id) ||
       state->committed_bytes_ <= kBlockHeaderBytes) {
     return;
   }
@@ -479,7 +481,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
         key_store, record.db_id_, key, value, record.kind_, record.value_type_,
         0, digest, clear_txid ? 0 : record.txid_, record.mutation_sequence_,
         /*for_defrag=*/true, /*unlock_writer_while_waiting=*/false,
-        record.external_, record.key_external_, record.logical_size_, extents,
+        record.external_, record.key_indirect_, record.logical_size_, extents,
         &relocated, &source, nullptr, nullptr, nullptr, nullptr, nullptr,
         &partition, &descriptor);
     if (!written.ok()) co_return written;
@@ -595,7 +597,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       record.expire_at_ms_, digest, clear_txid ? 0 : record.txid_,
       record.mutation_sequence_, /*for_defrag=*/true,
       /*unlock_writer_while_waiting=*/false, record.external_,
-      record.key_external_, record.logical_size_,
+      record.key_indirect_, record.logical_size_,
       ExtentsFor(key_store, current), &relocated, &source, nullptr, nullptr,
       nullptr, nullptr, nullptr, &partition,
       record.grouped_ ? &grouped_descriptor : nullptr);
@@ -736,9 +738,14 @@ Task<absl::Status> StorageEngine::Impl::CleanBlockLocked(
   // reading 8 MiB and CRC-checking every record in it. FLUSHDB empties whole
   // blocks at once, which is where this dominates.
   if (source.live_bytes_ != 0) {
-    absl::Status salvaged = co_await SalvageBlockRecords(
-        store, block_id, source, source_file_id, source_block_offset);
+    absl::Status salvaged;
+    if (source.kind_ == BlockKind::kIndirectKeys)
+      salvaged = co_await SalvageIndirectKeys(store, block_id);
+    else
+      salvaged = co_await SalvageBlockRecords(
+          store, block_id, source, source_file_id, source_block_offset);
     if (!salvaged.ok()) {
+      source.defragging_ = false;
       co_return salvaged;
     }
   }
@@ -925,36 +932,15 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       continue;
     }
     std::string loaded_key;
-    if (record.key_external_) [[unlikely]] {
-      if (record.external_) {
-        auto decoded =
-            DecodeManifest(payload,
-                           static_cast<std::uint64_t>(record.key_bytes_) +
-                               record.logical_size_,
-                           record.kind_ != RecordKind::kValue ||
-                               (record.value_type_ == ValueType::kString &&
-                                !record.grouped_ && !record.auxiliary_group_));
-        if (!decoded.ok()) {
-          source.defragging_ = false;
-          co_return decoded.status();
-        }
-        auto external_key =
-            co_await LoadExternalKey(store, *decoded, record.key_bytes_);
-        if (!external_key.ok()) {
-          source.defragging_ = false;
-          co_return external_key.status();
-        }
-        loaded_key = std::move(*external_key);
-        disk_key = loaded_key;
-      } else {
-        if (record.payload_bytes_ < record.key_bytes_) {
-          source.defragging_ = false;
-          co_return absl::Status(absl::StatusCode::kInternal,
-                                 "inline external key is truncated");
-        }
-        disk_key = std::string_view(reinterpret_cast<const char*>(payload_data),
-                                    record.key_bytes_);
-      }
+    if (record.key_indirect_) [[unlikely]] {
+      auto handle = co_await FindIndirectKey(record.key_id_);
+      if (!handle.ok()) co_return handle.status();
+      auto original = co_await LoadIndirectKey(std::move(*handle));
+      if (!original.ok()) co_return original.status();
+      loaded_key = std::move(*original);
+      if (loaded_key.size() != record.key_bytes_)
+        co_return absl::DataLossError("indirect key length mismatch");
+      disk_key = loaded_key;
     }
 
     RecordLocation source_location(
@@ -962,13 +948,12 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
         record.expire_at_ms_, static_cast<std::uint32_t>(record.logical_size_),
         RecordLocation::PackedMetadata::Encode(
             record_offset, record.total_disk_bytes_, store.worker_->id(), false,
-            record.external_, record.key_external_, false, false,
+            record.external_, record.key_indirect_, false, false,
             record.txid_ != 0 && record.kind_ != RecordKind::kTxCommit,
             record.kind_, record.value_type_, record.expire_at_ms_ != 0,
             record.grouped_));
     if (record.external_) {
-      const std::uint64_t extent_bytes =
-          record.logical_size_ + (record.key_external_ ? record.key_bytes_ : 0);
+      const std::uint64_t extent_bytes = record.logical_size_;
       auto decoded =
           DecodeManifest(payload, extent_bytes,
                          record.kind_ != RecordKind::kValue ||
@@ -996,11 +981,8 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     // or remote writer finishes, so borrowing avoids allocating/copying every
     // payload, including records the index will reject as already obsolete.
     const std::string_view key = disk_key;
-    const std::size_t key_prefix =
-        record.key_external_ && !record.external_ ? record.key_bytes_ : 0;
-    const std::string_view value(
-        reinterpret_cast<const char*>(payload_data + key_prefix),
-        record.payload_bytes_ - key_prefix);
+    const std::string_view value(reinterpret_cast<const char*>(payload_data),
+                                 record.payload_bytes_);
     absl::StatusOr<std::optional<RelocationDurabilityFence>> relocated(
         std::optional<RelocationDurabilityFence>{});
     if (key_owner == store.worker_->id()) {
@@ -1074,6 +1056,7 @@ Task<absl::Status> StorageEngine::Impl::ReleaseEmptyBlock(
   // worker cannot allocate it while its old owner still names it. A bitmap
   // write failure fail-stops the allocator, so this block cannot be reused
   // in the ambiguous state.
+  const auto allocation_epoch = source.allocation_epoch_;
   DestroyBlockState(store, block_id);
   absl::Status returned = co_await ReturnColdBlocks({block_id});
   if (returned.ok()) {
@@ -1081,6 +1064,13 @@ Task<absl::Status> StorageEngine::Impl::ReleaseEmptyBlock(
     // records are still on disk — the exact window the relocation durability
     // fence exists to protect. Crash-safety tests arm this point.
     LAVIK_MAYBE_CRASH_AT("defrag-source-retired");
+    // Dropping these handles is safe only after the allocation bit is durable.
+    auto released = co_await ReleaseIndirectKeyReferences(store, block_id,
+                                                          allocation_epoch);
+    if (!released.ok()) {
+      LatchRuntimeFailure(store);
+      co_return released;
+    }
     auto deferred = store.deferred_dependent_extent_reclaims_.find(block_id);
     if (deferred != store.deferred_dependent_extent_reclaims_.end()) {
       std::vector<ExtentManifest> manifests = std::move(deferred->second);

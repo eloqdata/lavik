@@ -67,8 +67,8 @@ struct RecordLocationCore {
     static constexpr unsigned kOwnerShift = kLengthShift + kLengthBits;
     static constexpr unsigned kInMemoryShift = kOwnerShift + kOwnerBits;
     static constexpr unsigned kExternalShift = kInMemoryShift + 1;
-    static constexpr unsigned kKeyExternalShift = kExternalShift + 1;
-    static constexpr unsigned kShieldingShift = kKeyExternalShift + 1;
+    static constexpr unsigned kKeyIndirectShift = kExternalShift + 1;
+    static constexpr unsigned kShieldingShift = kKeyIndirectShift + 1;
     static constexpr unsigned kUnclaimedShift = kShieldingShift + 1;
     static constexpr unsigned kTxTaggedShift = kUnclaimedShift + 1;
     static constexpr unsigned kTypeCodeShift = kTxTaggedShift + 1;
@@ -92,7 +92,7 @@ struct RecordLocationCore {
     static PackedMetadata Encode(std::uint32_t record_offset,
                                  std::uint32_t total_disk_bytes,
                                  std::uint16_t block_owner, bool in_memory,
-                                 bool external, bool key_external,
+                                 bool external, bool key_indirect,
                                  bool shielding, bool unclaimed, bool tx_tagged,
                                  RecordKind kind, ValueType value_type,
                                  bool has_expiry = false,
@@ -119,7 +119,7 @@ struct RecordLocationCore {
           (static_cast<std::uint64_t>(type_code) << kTypeCodeShift);
       SetBit(&bits, kInMemoryShift, in_memory);
       SetBit(&bits, kExternalShift, external);
-      SetBit(&bits, kKeyExternalShift, key_external);
+      SetBit(&bits, kKeyIndirectShift, key_indirect);
       SetBit(&bits, kShieldingShift, shielding);
       SetBit(&bits, kUnclaimedShift, unclaimed);
       SetBit(&bits, kTxTaggedShift, tx_tagged);
@@ -140,7 +140,7 @@ struct RecordLocationCore {
     }
     bool in_memory() const noexcept { return Bit(kInMemoryShift); }
     bool external() const noexcept { return Bit(kExternalShift); }
-    bool key_external() const noexcept { return Bit(kKeyExternalShift); }
+    bool key_indirect() const noexcept { return Bit(kKeyIndirectShift); }
     bool shielding() const noexcept { return Bit(kShieldingShift); }
     bool unclaimed() const noexcept { return Bit(kUnclaimedShift); }
     bool tx_tagged() const noexcept { return Bit(kTxTaggedShift); }
@@ -248,7 +248,7 @@ struct RecordLocationCore {
   std::uint16_t block_owner() const noexcept { return metadata_.block_owner(); }
   bool in_memory() const noexcept { return metadata_.in_memory(); }
   bool external() const noexcept { return metadata_.external(); }
-  bool key_external() const noexcept { return metadata_.key_external(); }
+  bool key_indirect() const noexcept { return metadata_.key_indirect(); }
   // True while an older, still-unexpired value of this key may survive on
   // disk. Erasing this entry then would un-suppress that copy: recovery
   // picks the newest surviving record, so the key would resurrect with the
@@ -344,8 +344,8 @@ class RecordIndexValue {
   static constexpr unsigned kLengthShift = kOffsetShift + kOffsetBits;
   static constexpr unsigned kInMemoryShift = kLengthShift + kLengthBits;
   static constexpr unsigned kExternalShift = kInMemoryShift + 1;
-  static constexpr unsigned kKeyExternalShift = kExternalShift + 1;
-  static constexpr unsigned kShieldingShift = kKeyExternalShift + 1;
+  static constexpr unsigned kKeyIndirectShift = kExternalShift + 1;
+  static constexpr unsigned kShieldingShift = kKeyIndirectShift + 1;
   static constexpr unsigned kUnclaimedShift = kShieldingShift + 1;
   static constexpr unsigned kTxTaggedShift = kUnclaimedShift + 1;
   static constexpr unsigned kTypeCodeShift = kTxTaggedShift + 1;
@@ -410,7 +410,7 @@ class RecordIndexValue {
   }
   bool in_memory() const noexcept { return Bit(kInMemoryShift); }
   bool external() const noexcept { return Bit(kExternalShift); }
-  bool key_external() const noexcept { return Bit(kKeyExternalShift); }
+  bool key_indirect() const noexcept { return Bit(kKeyIndirectShift); }
   bool shielding() const noexcept { return Bit(kShieldingShift); }
   bool unclaimed() const noexcept { return Bit(kUnclaimedShift); }
   bool tx_tagged() const noexcept { return Bit(kTxTaggedShift); }
@@ -437,7 +437,7 @@ class RecordIndexValue {
     static_assert(kLengthShift - kOffsetShift == Runtime::kLengthShift);
     static_assert(kInMemoryShift + 1 == Runtime::kInMemoryShift);
     static_assert(kExternalShift + 1 == Runtime::kExternalShift);
-    static_assert(kKeyExternalShift + 1 == Runtime::kKeyExternalShift);
+    static_assert(kKeyIndirectShift + 1 == Runtime::kKeyIndirectShift);
     static_assert(kShieldingShift + 1 == Runtime::kShieldingShift);
     static_assert(kUnclaimedShift + 1 == Runtime::kUnclaimedShift);
     static_assert(kTxTaggedShift + 1 == Runtime::kTxTaggedShift);
@@ -490,7 +490,7 @@ class RecordIndexValue {
          << kTypeCodeShift);
     SetBit(&bits, kInMemoryShift, value.in_memory());
     SetBit(&bits, kExternalShift, value.external());
-    SetBit(&bits, kKeyExternalShift, value.key_external());
+    SetBit(&bits, kKeyIndirectShift, value.key_indirect());
     SetBit(&bits, kShieldingShift, value.shielding());
     SetBit(&bits, kUnclaimedShift, value.unclaimed());
     SetBit(&bits, kTxTaggedShift, value.tx_tagged());

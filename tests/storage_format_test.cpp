@@ -73,11 +73,12 @@ lavik::storage::RecordHeader GroupRecordHeader(std::string_view key,
       .db_id_ = 3,
       .value_type_ = ValueType::kHash,
       .external_ = external,
-      .key_external_ = external_key,
+      .key_indirect_ = external_key,
       .auxiliary_group_ = true,
       .group_incarnation_ = 17,
       .group_prefix_ = std::uint64_t{1} << 63,
       .group_prefix_bits_ = 1,
+      .key_id_ = external_key ? IndirectKeyId{123, 456} : IndirectKeyId{},
       .key_bytes_ = static_cast<std::uint32_t>(key.size()),
       .logical_size_ = 1,
       .payload_bytes_ = payload_bytes,
@@ -108,7 +109,8 @@ TEST(StorageFormatTest, GroupIdentitySurvivesInlineAndExtentHeaderRoundTrips) {
         EXPECT_TRUE(decoded.auxiliary_group_);
         EXPECT_FALSE(decoded.grouped_);
         EXPECT_EQ(decoded.external_, external);
-        EXPECT_EQ(decoded.key_external_, external_key);
+        EXPECT_EQ(decoded.key_indirect_, external_key);
+        EXPECT_EQ(decoded.key_id_, header.key_id_);
         EXPECT_EQ(decoded.group_incarnation_, 17);
         EXPECT_EQ(decoded.group_prefix_, std::uint64_t{1} << 63);
         EXPECT_EQ(decoded.group_prefix_bits_, 1);
@@ -692,7 +694,7 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
       &decoded_record, &decoded_key));
 }
 
-TEST(StorageFormatTest, EncodesOutOfIndexKeyWithoutHeaderBytes) {
+TEST(StorageFormatTest, EncodesIndirectKeyUuidWithoutRepeatingOriginal) {
   using namespace lavik::storage;
 
   const std::string key(8192, 'k');
@@ -704,12 +706,13 @@ TEST(StorageFormatTest, EncodesOutOfIndexKeyWithoutHeaderBytes) {
       .db_id_ = 2,
       .value_type_ = ValueType::kNone,
       .external_ = false,
-      .key_external_ = true,
+      .key_indirect_ = true,
+      .key_id_ = {123, 456},
       .key_bytes_ = static_cast<std::uint32_t>(key.size()),
       .logical_size_ = 0,
-      .payload_bytes_ = static_cast<std::uint32_t>(key.size()),
+      .payload_bytes_ = 0,
       .total_disk_bytes_ =
-          static_cast<std::uint32_t>(AlignRecord(header_bytes + key.size())),
+          static_cast<std::uint32_t>(AlignRecord(header_bytes)),
       .replication_epoch_ = 3,
       .db_epoch_ = 4,
       .mutation_sequence_ = 5,
@@ -724,11 +727,21 @@ TEST(StorageFormatTest, EncodesOutOfIndexKeyWithoutHeaderBytes) {
   ASSERT_TRUE(
       DecodeRecordHeader(std::span<const std::byte>(page.data(), header_bytes),
                          &decoded, &decoded_key));
-  EXPECT_TRUE(decoded.key_external_);
+  EXPECT_TRUE(decoded.key_indirect_);
   EXPECT_TRUE(decoded_key.empty());
   EXPECT_EQ(decoded.key_bytes_, key.size());
-  EXPECT_EQ(decoded.header_bytes_, kRecordHeaderBaseBytes);
-  EXPECT_EQ(decoded.payload_bytes_, key.size());
+  EXPECT_EQ(decoded.header_bytes_,
+            kRecordHeaderBaseBytes + sizeof(IndirectKeyId));
+  EXPECT_EQ(decoded.key_id_, record.key_id_);
+  EXPECT_EQ(decoded.payload_bytes_, 0);
+  // UUID identity is checksummed just like an inline key.
+  auto corrupt = page;
+  corrupt[kRecordHeaderBaseBytes] ^= std::byte{1};
+  EXPECT_FALSE(DecodeRecordHeader(std::span(corrupt).first(header_bytes),
+                                  &decoded, &decoded_key));
+  record.key_id_ = {};
+  EXPECT_FALSE(
+      EncodeRecordHeader(record, key, std::span(page).first(header_bytes)));
 }
 
 TEST(StorageFormatTest, UsesSparseRecordHeaderExtensions) {

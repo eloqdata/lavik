@@ -171,6 +171,11 @@ exit-time scan. The shortcut is also never armed when checkpoint publication
 or the shutdown flush fails, and it cannot be used by an embedding that intends
 to reuse the storage engine in the same process.
 
+Indirect-key registries and their stale-record dependencies are not encoded by
+the checkpoint schema. A shard retaining any such state declines checkpoint
+publication; the authoritative KeyRecord and user-record blocks remain durable
+and startup rebuilds them through the storage engine's two-pass cold recovery.
+
 ## Startup consumption and fallback
 
 Preparation compares root copies from every device. A usable root must be

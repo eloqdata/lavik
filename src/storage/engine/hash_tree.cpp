@@ -359,8 +359,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       if (entry == nullptr)
         co_return absl::DataLossError("grouped scan has no physical page");
       GroupedScratchBudget budget;
-      const auto included = budget.AddGroup(
-          entry->value_, grouped->ExtentsFor(route->id_), key.size());
+      const auto included =
+          budget.AddGroup(entry->value_, grouped->ExtentsFor(route->id_));
       if (!included.ok()) co_return included;
       // Matching strings move into the reply; no second payload copy is made.
       // The physical read buffer has its own independent admission.
@@ -457,7 +457,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         if (entry == nullptr)
           co_return absl::DataLossError("missing Hash scratch page");
         const auto added =
-            budget.AddGroup(entry->value_, grouped->ExtentsFor(id), key.size());
+            budget.AddGroup(entry->value_, grouped->ExtentsFor(id));
         if (!added.ok()) co_return added;
       }
       for (const auto field : operation.fields_) {

@@ -123,7 +123,7 @@ Task<absl::Status> StorageEngine::Impl::ReleaseFullSyncExtents(
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncValue(
     WorkerStore& store, std::uint64_t session_id,
     WorkerStore::PartitionStore& partition, RecordLocation location,
-    ExtentManifest extents, std::size_t key_bytes) {
+    ExtentManifest extents) {
   if (!location.external() || extents == nullptr) {
     co_return absl::InvalidArgumentError(
         "only external full-sync values can be pinned");
@@ -134,10 +134,6 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncValue(
       co_return absl::InternalError("invalid full-sync extent manifest");
     }
     extent_bytes += ref.payload_bytes_;
-  }
-  const std::size_t key_prefix = location.key_external() ? key_bytes : 0;
-  if (extent_bytes < key_prefix) {
-    co_return absl::InternalError("full-sync extent manifest is truncated");
   }
   absl::Status pinned = co_await PinFullSyncExtents(extents);
   if (!pinned.ok()) co_return pinned;
@@ -161,8 +157,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncValue(
       id, WorkerStore::FullSyncCapture::PinnedValue{
               .extents_ = extents,
               .collection_ = nullptr,
-              .key_bytes_ = key_prefix,
-              .value_bytes_ = extent_bytes - key_prefix,
+              .value_bytes_ = extent_bytes,
           });
   if (!inserted) {
     InvalidateFullSyncSession(store, session_id);
@@ -224,7 +219,7 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
           QueueExpiredCandidate(store, partition.id_, db_id, *current, *key);
         } else if (!TryConsumeFullSyncCoverageCredit(
                        store, session_id, capture->second,
-                       coverage_key.size() <= options_.inline_key_max_bytes_
+                       coverage_key.size() <= kInlineKeyMaxBytes
                            ? coverage_key.size()
                            : sizeof(Digest),
                        /*allocates_arena_entry=*/true)) {
@@ -234,7 +229,7 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
           const auto phase = capture->second.key_phases_.InsertOrAssign(
               digest, coverage_key,
               WorkerStore::FullSyncCapture::KeyPhase::kBaselineInflight,
-              coverage_key.size() <= options_.inline_key_max_bytes_);
+              coverage_key.size() <= kInlineKeyMaxBytes);
           if (phase.rejected_) {
             InvalidateFullSyncSession(store, session_id);
             status = absl::ResourceExhaustedError(
@@ -250,10 +245,6 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
               for (const ExtentRef& ref : *extents) {
                 value_bytes += ref.payload_bytes_;
               }
-              if (location.key_external()) {
-                value_bytes -=
-                    std::min<std::uint64_t>(value_bytes, key->size());
-              }
             }
             if (location.grouped() ||
                 (location.external() &&
@@ -264,9 +255,8 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
                     store, session_id, partition, db_id, *key, digest, location,
                     extents, &value_bytes);
               } else {
-                source_id =
-                    co_await PinFullSyncValue(store, session_id, partition,
-                                              location, extents, key->size());
+                source_id = co_await PinFullSyncValue(
+                    store, session_id, partition, location, extents);
               }
               if (!source_id.ok()) {
                 status = source_id.status();
@@ -386,10 +376,6 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
   if (location.external()) {
     value_bytes = 0;
     for (const ExtentRef& ref : *extents) value_bytes += ref.payload_bytes_;
-    if (location.key_external()) {
-      value_bytes -=
-          std::min<std::uint64_t>(value_bytes, requested.key_.size());
-    }
   }
   if (location.grouped() ||
       (location.external() && value_bytes > kReplicationTransferBytes)) {
@@ -399,9 +385,8 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
           store, session_id, partition, requested.db_id_, requested.key_,
           digest, location, extents, &value_bytes);
     } else {
-      source_id =
-          co_await PinFullSyncValue(store, session_id, partition, location,
-                                    extents, requested.key_.size());
+      source_id = co_await PinFullSyncValue(store, session_id, partition,
+                                            location, extents);
     }
     if (!source_id.ok()) co_return source_id.status();
     key_lock.Reset();
@@ -498,10 +483,6 @@ bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
                 for (const ExtentRef& ref : *extents) {
                   value_bytes += ref.payload_bytes_;
                 }
-                value_bytes -=
-                    std::min(value_bytes, entry.value_.key_external()
-                                              ? entry.logical_key_size()
-                                              : std::size_t{0});
               }
               state->result_.value_bytes_.push_back(value_bytes);
               add_bytes(value_bytes);
@@ -513,12 +494,8 @@ bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
                   value_bytes += ref.payload_bytes_;
                 }
               }
-              value_bytes -= std::min<std::size_t>(
-                  value_bytes,
-                  entry.value_.key_external() ? entry.logical_key_size() : 0);
               state->external_.push_back(ScanPartitionState::ExternalCandidate{
                   .entry_address_ = reinterpret_cast<std::uintptr_t>(&entry),
-                  .extents_ = std::move(extents),
                   .location_ = MaterializeIndexLocation(entry),
                   .hash_ =
                       RecordIndex::AddressHash(entry.external_key_digest()),
@@ -548,12 +525,11 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ResumeScanPartition(
 
   while (true) {
     for (std::size_t index = 0; index < state.external_.size(); ++index) {
-      // Keep the metadata needed after the read in the coroutine frame, while
-      // transferring the manifest to the child that materializes the key.
+      // Keep the candidate identity across the key read so a concurrent
+      // mutation cannot make us publish stale scan metadata.
       ScanPartitionState::ExternalCandidate candidate =
           std::move(state.external_[index]);
       auto key = co_await LoadOutOfIndexKey(CurrentStore(), candidate.location_,
-                                            std::move(candidate.extents_),
                                             candidate.key_bytes_);
       if (!key.ok()) {
         co_return key.status();
@@ -590,7 +566,7 @@ std::uint64_t StorageEngine::Impl::FullSyncCoverageEntryBytes(
   // the digest retained by the coverage map. The factor of two matches the
   // worst case where key identity is present in both owners during replacement.
   const std::uint64_t retained_key_bytes =
-      logical_key_bytes <= options_.inline_key_max_bytes_
+      logical_key_bytes <= kInlineKeyMaxBytes
           ? static_cast<std::uint64_t>(logical_key_bytes)
           : sizeof(Digest);
   assert(retained_key_bytes <= (std::numeric_limits<std::uint64_t>::max() -
@@ -1092,11 +1068,10 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::ReadFullSyncValueChunk(
                                                    offset, max_bytes);
   }
   const ExtentManifest extents = pinned->second.extents_;
-  const std::size_t key_bytes = pinned->second.key_bytes_;
   const std::size_t count = static_cast<std::size_t>(
       std::min<std::uint64_t>(max_bytes, pinned->second.value_bytes_ - offset));
   std::string result(count, '\0');
-  std::uint64_t absolute = key_bytes + offset;
+  std::uint64_t absolute = offset;
   std::size_t written = 0;
   std::uint64_t extent_start = 0;
   for (std::size_t index = 0; index < extents->size() && written < count;
@@ -1213,7 +1188,7 @@ void StorageEngine::Impl::AcknowledgePartitionFullSyncOverrides(
       const auto restored = capture->second.key_phases_.InsertOrAssign(
           ComputeDigest(acknowledged.key_), acknowledged.key_,
           WorkerStore::FullSyncCapture::KeyPhase::kTailingWithOverrideCredit,
-          acknowledged.key_.size() <= options_.inline_key_max_bytes_);
+          acknowledged.key_.size() <= kInlineKeyMaxBytes);
       if (restored.rejected_) {
         InvalidateFullSyncSession(store, session_id);
         return;
@@ -1457,7 +1432,6 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
     struct ExternalKey {
       RecordLocation location_;
-      ExtentManifest extents_;
       std::uint32_t key_bytes_ = 0;
     };
     std::vector<ExternalKey> external_keys;
@@ -1468,14 +1442,13 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
       } else [[unlikely]] {
         external_keys.push_back(ExternalKey{
             .location_ = MaterializeIndexLocation(entry),
-            .extents_ = ExtentsFor(store, &entry),
             .key_bytes_ = entry.logical_key_size(),
         });
       }
     });
     for (const ExternalKey& external : external_keys) {
-      auto key = co_await LoadOutOfIndexKey(
-          store, external.location_, external.extents_, external.key_bytes_);
+      auto key = co_await LoadOutOfIndexKey(store, external.location_,
+                                            external.key_bytes_);
       if (!key.ok()) {
         co_return key.status();
       }
@@ -1493,31 +1466,13 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     const std::uint8_t db_id = old.db_id_;
     const std::string& key = old.key_;
     const Digest digest = ComputeDigest(key);
-    const bool key_external = key.size() > options_.inline_key_max_bytes_;
-    const bool external =
-        AlignRecord(RecordHeaderBytes(key.size(), key_external) +
-                    (key_external ? key.size() : 0)) >
-        kStorageBlockBytes - kBlockHeaderBytes;
-    ExtentManifest extents;
-    std::string manifest;
-    if (external) [[unlikely]] {
-      auto written = co_await WriteExtentValueLocked(store, key);
-      if (!written.ok()) {
-        co_return written.status();
-      }
-      extents = std::move(*written);
-      manifest = EncodeManifest(*extents);
-    }
+    const bool key_indirect = key.size() > kInlineKeyMaxBytes;
     absl::Status tombstone = co_await WriteRecordLocked(
-        store, db_id, key, manifest, RecordKind::kTombstone, ValueType::kNone,
-        0, digest, 0, 0, false, false, external, key_external, 0, extents,
-        nullptr, nullptr, nullptr);
-    if (!tombstone.ok()) {
-      if (extents != nullptr) [[unlikely]] {
-        SpawnExtentReclaim(store, extents);
-      }
-      co_return tombstone;
-    }
+        store, db_id, key, {}, RecordKind::kTombstone, ValueType::kNone, 0,
+        digest, 0, 0, /*for_defrag=*/false,
+        /*unlock_writer_while_waiting=*/false, /*external=*/false, key_indirect,
+        0);
+    if (!tombstone.ok()) co_return tombstone;
   }
   co_return next_epoch;
 }
@@ -1572,8 +1527,10 @@ StorageEngine::Impl::ResetReplicaPartitions(
   }
   // The persisted candidate partition epochs exclude the old population.
   // Candidate writes also carry local_db_epochs (current + 1), which promotion
-  // alone persists; recovery's earlier DB-epoch filter therefore excludes an
-  // interrupted partial candidate before it decodes or follows its extents.
+  // alone persists. Recovery resolves indirect keys before applying database
+  // and replication epoch filters. Allocated stale records retain their UUID
+  // dependencies until their blocks retire; the scan bitmap excludes retired
+  // blocks. Value extents are read only after epoch and winner selection.
   absl::Status persisted = co_await PersistEpochValues(epoch_updates);
   if (!persisted.ok()) co_return persisted;
 
@@ -2104,7 +2061,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
     }
     absl::Status written;
     if (kind == RecordKind::kValue && value_type == ValueType::kString &&
-        ShouldGroupString(applied.key_.size(), applied.value_.size())) {
+        ShouldGroupString(applied.value_.size())) {
       if (sync->command_sequence_)
         co_return absl::FailedPreconditionError("nested String snapshot apply");
       sync->command_sequence_ = applied.mutation_sequence_;
@@ -2128,20 +2085,16 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
         .replication_epoch_ = sync->replication_epoch_,
         .db_epoch_ = sync->local_db_epochs_[applied.db_id_],
     };
-    const bool key_external =
-        applied.key_.size() > options_.inline_key_max_bytes_;
+    const bool key_indirect = applied.key_.size() > kInlineKeyMaxBytes;
     const std::uint64_t logical_payload_bytes =
-        static_cast<std::uint64_t>(applied.value_.size()) +
-        (key_external ? applied.key_.size() : 0);
+        static_cast<std::uint64_t>(applied.value_.size());
     const std::size_t inline_bytes =
-        AlignRecord(RecordHeaderBytes(applied.key_.size(), key_external, false,
+        AlignRecord(RecordHeaderBytes(applied.key_.size(), key_indirect, false,
                                       applied.expire_at_ms_ != 0) +
                     static_cast<std::size_t>(logical_payload_bytes));
     if (inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) [[unlikely]] {
-      auto extents = co_await WriteExtentValueLocked(
-          store,
-          key_external ? std::string_view(applied.key_) : std::string_view{},
-          applied.value_);
+      auto extents = co_await WriteExtentValueLocked(store, std::string_view{},
+                                                     applied.value_);
       if (!extents.ok()) {
         co_return extents.status();
       }
@@ -2149,7 +2102,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
       written = co_await WriteRecordLocked(
           store, applied.db_id_, applied.key_, manifest, kind, value_type,
           applied.expire_at_ms_, digest, /*txid=*/0, applied.mutation_sequence_,
-          false, true, true, key_external, applied.logical_size_, *extents,
+          false, true, true, key_indirect, applied.logical_size_, *extents,
           nullptr, nullptr, nullptr, nullptr, nullptr, &write_root);
       if (!written.ok()) {
         SpawnExtentReclaim(store, *extents);
@@ -2159,7 +2112,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
           store, applied.db_id_, applied.key_, applied.value_, kind, value_type,
           kind == RecordKind::kValue ? applied.expire_at_ms_ : 0, digest,
           /*txid=*/0, applied.mutation_sequence_, false, true, false,
-          key_external, applied.logical_size_, nullptr, nullptr, nullptr,
+          key_indirect, applied.logical_size_, nullptr, nullptr, nullptr,
           nullptr, nullptr, nullptr, &write_root);
     }
     if (!written.ok()) {

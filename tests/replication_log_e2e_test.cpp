@@ -1446,9 +1446,8 @@ class ReplicationLogService final : public bycorf::Service {
   bycorf::Task<absl::Status> ExercisePartitionHandoff() {
     constexpr std::uint64_t kSession = 404;
     constexpr std::uint8_t kDb = 4;
-    // This case measures retained command payload/backpressure. A grouped
-    // standalone write publishes a bounded after-image ticket instead, so
-    // retain whole-value String storage with an oversized parent key.
+    // This case measures retained command payload/backpressure. Queue-pressure
+    // writes keep values compact so their command bytes remain in the FIFO.
     const std::string key =
         std::string(8193, 'k') + "fullsync-handoff{ordered}";
     const std::uint16_t partition_id = lavik::storage::RedisSlot(key);
@@ -1516,15 +1515,15 @@ class ReplicationLogService final : public bycorf::Service {
     absl::Status queue_capacity =
         co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
     if (!queue_capacity.ok()) co_return queue_capacity;
-    std::vector<std::string> large_args{"SET", key,
-                                        std::string(700 * 1024, 'q')};
-    written =
-        co_await ExecuteClientCommand(kDb, std::move(large_args), "+OK\r\n");
-    if (!written.ok()) co_return written;
-    auto large_queued = storage_->PeekFullSyncPublishItems(kSession, 1);
+    for (unsigned i = 0; i < 32; ++i) {
+      std::vector<std::string> args{"SET", key, std::string(15 * 1024, 'q')};
+      written = co_await ExecuteClientCommand(kDb, std::move(args), "+OK\r\n");
+      if (!written.ok()) co_return written;
+    }
+    auto large_queued = storage_->PeekFullSyncPublishItems(kSession, 32);
     if (!large_queued.ok()) co_return large_queued.status();
-    Check(large_queued->size() == 1,
-          "large covered-key command did not enter full-sync queue");
+    Check(large_queued->size() == 32,
+          "compact commands did not enter full-sync queue");
     const auto queued_info = storage_->LocalReplicationLogInfo();
     Check(
         queued_info.fullsync_session_count_ == 1 &&
@@ -1574,8 +1573,8 @@ class ReplicationLogService final : public bycorf::Service {
     }
     Check(!admission_finished,
           "full-sync queue capacity did not backpressure the next writer");
-    storage_->AcknowledgeFullSyncPublishItem(kSession,
-                                             large_queued->front().id_);
+    for (const auto& item : *large_queued)
+      storage_->AcknowledgeFullSyncPublishItem(kSession, item.id_);
     while (!admission_finished) co_await bycorf::Yield(*worker_);
     if (!admission_status.ok()) co_return admission_status;
     Check(storage_->LocalReplicationLogInfo().fullsync_backpressure_waits_ > 0,
@@ -1584,14 +1583,14 @@ class ReplicationLogService final : public bycorf::Service {
     // Once an oversized request reaches the head of admission it must exclude
     // later small requests. Otherwise sustained small writes can keep the
     // queue nonempty and starve a large key forever.
-    std::vector<std::string> refill_args{"SET", key,
-                                         std::string(700 * 1024, 'r')};
-    written =
-        co_await ExecuteClientCommand(kDb, std::move(refill_args), "+OK\r\n");
-    if (!written.ok()) co_return written;
-    auto refill = storage_->PeekFullSyncPublishItems(kSession, 1);
+    for (unsigned i = 0; i < 32; ++i) {
+      std::vector<std::string> args{"SET", key, std::string(15 * 1024, 'r')};
+      written = co_await ExecuteClientCommand(kDb, std::move(args), "+OK\r\n");
+      if (!written.ok()) co_return written;
+    }
+    auto refill = storage_->PeekFullSyncPublishItems(kSession, 32);
     if (!refill.ok()) co_return refill.status();
-    Check(refill->size() == 1, "failed to refill full-sync publish queue");
+    Check(refill->size() == 32, "failed to refill full-sync publish queue");
 
     bool oversized_finished = false;
     bool small_finished = false;
@@ -1626,7 +1625,8 @@ class ReplicationLogService final : public bycorf::Service {
     }
     Check(!oversized_finished && !small_finished,
           "publisher waiters bypassed occupied queue capacity");
-    storage_->AcknowledgeFullSyncPublishItem(kSession, refill->front().id_);
+    for (const auto& item : *refill)
+      storage_->AcknowledgeFullSyncPublishItem(kSession, item.id_);
     while (!oversized_finished) co_await bycorf::Yield(*worker_);
     if (!oversized_status.ok()) co_return oversized_status;
     Check(!small_finished,
@@ -1658,14 +1658,14 @@ class ReplicationLogService final : public bycorf::Service {
     storage_->AcknowledgeFullSyncPublishItem(kSession,
                                              expiring_command->front().id_);
 
-    std::vector<std::string> expiry_filler_args{"SET", key,
-                                                std::string(700 * 1024, 'e')};
-    written = co_await ExecuteClientCommand(kDb, std::move(expiry_filler_args),
-                                            "+OK\r\n");
-    if (!written.ok()) co_return written;
-    auto expiry_filler = storage_->PeekFullSyncPublishItems(kSession, 1);
+    for (unsigned i = 0; i < 32; ++i) {
+      std::vector<std::string> args{"SET", key, std::string(15 * 1024, 'e')};
+      written = co_await ExecuteClientCommand(kDb, std::move(args), "+OK\r\n");
+      if (!written.ok()) co_return written;
+    }
+    auto expiry_filler = storage_->PeekFullSyncPublishItems(kSession, 32);
     if (!expiry_filler.ok()) co_return expiry_filler.status();
-    Check(expiry_filler->size() == 1,
+    Check(expiry_filler->size() == 32,
           "failed to fill the full-sync queue for active expiration");
     const std::size_t full_queue_bytes =
         storage_->LocalReplicationLogInfo().fullsync_publish_queue_bytes_;
@@ -1693,8 +1693,8 @@ class ReplicationLogService final : public bycorf::Service {
                 full_queue_bytes,
         "active expiration bypassed full-sync replacement admission");
 
-    storage_->AcknowledgeFullSyncPublishItem(kSession,
-                                             expiry_filler->front().id_);
+    for (const auto& item : *expiry_filler)
+      storage_->AcknowledgeFullSyncPublishItem(kSession, item.id_);
     storage_->ResumeExpiration();
     std::optional<lavik::storage::FullSyncPublishItem> expired_replacement;
     for (unsigned attempt = 0; attempt < 200; ++attempt) {

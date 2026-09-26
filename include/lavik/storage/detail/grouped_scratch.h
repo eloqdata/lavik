@@ -36,17 +36,17 @@ namespace lavik::storage {
 // Callers select the pages first: a point read must not reserve the unrelated
 // value bytes of the entire collection. Page readers separately check the
 // decoded count against this physical envelope before allocating entries.
+// Remote page loaders separately admit their owned parent-key copy.
 class GroupedScratchBudget {
  public:
   absl::Status AddGroup(
       const RecordLocation& location,
-      const std::shared_ptr<const std::vector<ExtentRef>>& extents,
-      std::size_t key_bytes) {
-    return AddLayout(
-        location.total_disk_bytes(),
-        location.value_type() == ValueType::kString ? 1
-                                                    : location.logical_size_,
-        location.external(), location.key_external(), extents, key_bytes);
+      const std::shared_ptr<const std::vector<ExtentRef>>& extents) {
+    return AddLayout(location.total_disk_bytes(),
+                     location.value_type() == ValueType::kString
+                         ? 1
+                         : location.logical_size_,
+                     location.external(), extents);
   }
 
   // A retained immutable view owns these size fields, not the allocation
@@ -56,12 +56,11 @@ class GroupedScratchBudget {
   // before reading. GC relocation does not change the decoded page size.
   absl::Status AddGroup(
       const RecordIndexValue& value,
-      const std::shared_ptr<const std::vector<ExtentRef>>& extents,
-      std::size_t key_bytes) {
+      const std::shared_ptr<const std::vector<ExtentRef>>& extents) {
     return AddLayout(
         value.total_disk_bytes(),
         value.value_type() == ValueType::kString ? 1 : value.logical_size(),
-        value.external(), value.key_external(), extents, key_bytes);
+        value.external(), extents);
   }
 
   // Includes caller-owned copies of incoming fields/items before making them.
@@ -88,23 +87,18 @@ class GroupedScratchBudget {
  private:
   absl::Status AddLayout(
       std::uint64_t payload, std::uint32_t count, bool external,
-      bool key_external,
-      const std::shared_ptr<const std::vector<ExtentRef>>& extents,
-      std::size_t key_bytes) {
+      const std::shared_ptr<const std::vector<ExtentRef>>& extents) {
     if (external) {
       if (extents == nullptr)
         return absl::DataLossError(
             "grouped scratch extent manifest is missing");
+      // Extents contain only page bytes; parent keys live in headers or
+      // separate KeyRecords and cannot reduce the decode reservation.
       payload = 0;
       for (const auto& extent : *extents) {
         if (extent.payload_bytes_ > kMaxRecordPayloadBytes - payload)
           return absl::DataLossError("grouped scratch extent size overflow");
         payload += extent.payload_bytes_;
-      }
-      if (key_external) {
-        if (key_bytes > payload)
-          return absl::DataLossError("grouped scratch key exceeds payload");
-        payload -= key_bytes;
       }
     }
     // Covers vector growth, SSO strings, decoder duplicate validation and

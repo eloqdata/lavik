@@ -90,14 +90,23 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
     auto extents = object->ExtentsFor(id);
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
-      loaded = co_await LoadExternalValueLocal(store, location, extents,
-                                               key.size(), nullptr);
+      loaded =
+          co_await LoadExternalValueLocal(store, location, extents, nullptr);
     } else if (location.block_owner() == store.worker_->id()) {
       loaded = co_await LoadValueLocal(store, db_id, key, location,
                                        original.replication_epoch_, nullptr,
                                        original.db_epoch_);
     } else {
       const unsigned owner = location.block_owner();
+      // Page scratch excludes the parent key. Admit the remote reader's copy
+      // here for every caller, and retain admission through the awaited read.
+      auto key_admission =
+          TryReserveMemory(AllocatorUsableSizeForRequest(key.size() + 1));
+      if (!key_admission) {
+        RecordMemoryRejection();
+        co_return absl::ResourceExhaustedError(
+            "OOM grouped parent key copy admission");
+      }
       loaded = co_await bycorf::SubmitTaskTo(
           owner,
           [this, owner, db_id, owned_key = std::string(key), location,
@@ -225,7 +234,7 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
     const auto* entry = snapshot->FindGroup(id);
     if (entry == nullptr)
       return absl::DataLossError("missing grouped materialization page");
-    return budget.AddGroup(entry->value_, snapshot->ExtentsFor(id), key.size());
+    return budget.AddGroup(entry->value_, snapshot->ExtentsFor(id));
   };
   if (snapshot->is_ordered()) {
     for (const auto& metadata : snapshot->ordered_directory().groups()) {

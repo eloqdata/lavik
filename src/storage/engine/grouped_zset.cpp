@@ -763,8 +763,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       const auto* entry = current->FindGroup({metadata[i].id_, 0});
       if (!entry)
         return absl::DataLossError("missing Sorted Set physical page");
-      return budget->AddGroup(
-          entry->value_, current->ExtentsFor({metadata[i].id_, 0}), key.size());
+      return budget->AddGroup(entry->value_,
+                              current->ExtentsFor({metadata[i].id_, 0}));
     };
     // Each scan page owns its admission until its decoded strings disappear.
     // Returning just LoadedOrderedGroup would release this reservation too
@@ -988,8 +988,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         if (!physical)
           co_return absl::DataLossError("missing member prefix page");
         GroupedScratchBudget budget;
-        auto checked = budget.AddGroup(physical->value_,
-                                       current->ExtentsFor(id), key.size());
+        auto checked =
+            budget.AddGroup(physical->value_, current->ExtentsFor(id));
         if (!checked.ok()) co_return checked;
         auto admission = budget.Reserve(2);
         if (!admission.ok()) co_return admission.status();

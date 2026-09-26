@@ -64,9 +64,7 @@ absl::Status StorageEngine::Impl::SquashReplicaCollectionUndo(
   };
   append(*applied, original.applied_grouped_retirements_);
   append(*applied, latest.applied_grouped_retirements_);
-  auto intermediate = RetiredRecordOf(
-      *latest.previous_,
-      latest.previous_->key_external() ? latest.previous_extents_ : nullptr);
+  auto intermediate = RetiredRecordOf(*latest.previous_, nullptr);
   applied->push_back(intermediate);
   append(*pins, original.previous_grouped_retirements_);
   append(*pins, latest.previous_grouped_retirements_);

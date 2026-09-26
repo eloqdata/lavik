@@ -109,6 +109,24 @@ class UnlockGuard {
 
 using ExtentManifest = std::shared_ptr<const std::vector<ExtentRef>>;
 
+// Metadata is changed only on the UUID's logical owner. Physical record blocks
+// hold shared references until their allocation bits are durably cleared, even
+// after DEL/expiry or rollback removes their records from the user index.
+struct IndirectKey {
+  IndirectKeyId id_{};
+  Digest digest_{};
+  RecordLocation location_{};
+  ExtentManifest extents_;
+  std::uint64_t lsn_ = 0;
+  // Startup only, immutable through the scan/accounting barriers. Auxiliary
+  // candidates share these bytes instead of amplifying one huge parent key
+  // by the number of segments. Cleared before serving requests.
+  std::shared_ptr<const std::string> recovery_key_;
+  std::size_t physical_copies_ = 0;
+  bool retired_ = false;
+};
+using IndirectKeyHandle = std::shared_ptr<IndirectKey>;
+
 #if LAVIK_FAULTS_ENABLED
 // Deterministic write-fault injection for rollback tests: a tagged write of
 // the key named in LAVIK_FAIL_TX_WRITE fails instead of appending.
@@ -362,6 +380,11 @@ using RecoveredGroupedRoot =
 struct RecoveryRecord {
   Digest digest_{};
   std::string key_;
+  std::shared_ptr<const std::string> indirect_key_;
+  std::string_view key() const noexcept {
+    return indirect_key_ ? std::string_view(*indirect_key_)
+                         : std::string_view(key_);
+  }
   std::uint8_t db_id_ = 0;
   // Multi-key transaction tag. Tagged records are parked until every
   // worker's scan has contributed its kTxCommit sightings, then applied only
@@ -1473,7 +1496,6 @@ class StorageEngine::Impl {
       struct PinnedValue {
         ExtentManifest extents_;
         std::shared_ptr<FullSyncCollection> collection_;
-        std::size_t key_bytes_ = 0;
         std::uint64_t value_bytes_ = 0;
       };
       // Native grouped-source map capacity survives individual source ACKs.
@@ -1624,7 +1646,7 @@ class StorageEngine::Impl {
     std::uint64_t next_lsn_ = 0;
     RegisteredBufferPool buffers_;
     std::vector<FixedFile> files_;
-    // Every primary index owned by this worker shares one handle namespace.
+    // Primary indexes and the UUID registry share one worker handle namespace.
     // Declaring the arena before partitions and detached populations makes it
     // outlive every map during reverse-order WorkerStore destruction.
     std::shared_ptr<ScanHashMapEntryArena> record_index_entry_arena_;
@@ -1696,6 +1718,23 @@ class StorageEngine::Impl {
     std::shared_ptr<lavik::ReplicationHistory> replication_history_;
     ReplicationLogRuntime replication_log_;
     std::optional<ActiveBlock> active_block_;
+    // Allocated lazily: workers serving only short keys never acquire a key
+    // stream buffer or populate these maps.
+    std::optional<ActiveBlock> active_indirect_key_block_;
+    AsyncMutex indirect_key_allocation_mutex_;
+    // UUIDs are complete 16-byte binary keys under ComputeDigest, independent
+    // of the original-key digest used by the candidate map below.
+    ScanHashMap<IndirectKeyHandle> indirect_keys_;
+    absl::flat_hash_map<Digest, std::vector<IndirectKeyId>, DigestHash>
+        indirect_key_candidates_;
+    absl::flat_hash_map<std::pair<std::uint64_t, std::uint64_t>,
+                        absl::flat_hash_map<std::uint32_t, IndirectKeyHandle>>
+        indirect_key_references_;
+    absl::flat_hash_map<std::pair<std::uint64_t, std::uint64_t>,
+                        std::vector<std::pair<IndirectKeyId, std::uint32_t>>>
+        indirect_key_records_;
+    std::unique_ptr<std::deque<IndirectKeyId>> indirect_key_gc_queue_;
+    bool indirect_key_cleaner_running_ = false;
     // The ordinary stream prefetches only an ID; its 8 MiB staging buffer is
     // still acquired at rollover. The pending bit covers the complete task,
     // including returning a stale reservation, so shutdown can wait for the
@@ -1729,7 +1768,7 @@ class StorageEngine::Impl {
     // passes, so they meet here instead of in every BlockState. Cleared once
     // the live-reference pass has run.
     absl::flat_hash_map<std::uint64_t, ExtentIdentity> recovered_extents_;
-    // Recovery-only exact identities for external-key entries. Runtime index
+    // Recovery-only exact identities for indirect-key entries. Runtime index
     // entries deliberately omit the full key, but recovery already had to
     // materialize it for routing, so retain it until every version is merged.
     absl::flat_hash_map<const RecordIndex::Entry*, std::string>
@@ -1778,9 +1817,8 @@ class StorageEngine::Impl {
     // any worker without touching the map that owns the entry.
     absl::flat_hash_map<std::uint64_t, std::shared_ptr<TxGenerationRuntime>>
         tx_generations_;
-    // A retired root record's shared key/value extents remain needed by
-    // recovery until the whole records block is durably removed from the
-    // allocation bitmap.
+    // Deferred manifests carried by retirement receipts are released after
+    // source bitmap retirement. UUID dependencies use the separate maps above.
     absl::flat_hash_map<std::uint64_t, std::vector<ExtentManifest>>
         deferred_dependent_extent_reclaims_;
     // Index 0 is the "no staging buffer" sentinel. A deque keeps references
@@ -2406,7 +2444,7 @@ class StorageEngine::Impl {
     (void)store;
     return tx == nullptr && entry != nullptr && entry->key_complete() &&
            location.kind() == RecordKind::kValue && !location.grouped() &&
-           !location.external() && !location.key_external() &&
+           !location.external() && !location.key_indirect() &&
            location.total_disk_bytes() < kCompactWorkspaceInputBytes &&
            !partition.replica_sync_ &&
            !replica_loading_.load(std::memory_order_acquire);
@@ -2609,7 +2647,6 @@ class StorageEngine::Impl {
   struct ScanPartitionState {
     struct ExternalCandidate {
       std::uintptr_t entry_address_ = 0;
-      ExtentManifest extents_;
       RecordLocation location_{};
       std::uint32_t hash_ = 0;
       std::uint32_t key_bytes_ = 0;
@@ -3239,7 +3276,8 @@ class StorageEngine::Impl {
   Task<absl::Status> ScanAssignedBlocks(
       WorkerStore& store, std::vector<RecoveryBatch>* batches,
       std::vector<std::uint64_t>* zero_blocks,
-      absl::flat_hash_set<std::uint64_t>* committed_txids);
+      absl::flat_hash_set<std::uint64_t>* committed_txids,
+      bool indirect_key_pass = false);
   Task<absl::Status> ApplyRecoveryBatches(WorkerStore& store,
                                           std::vector<RecoveryBatch>* batches);
   Task<absl::Status> ApplyRecoveryLiveReferenceBatches(
@@ -3271,50 +3309,24 @@ class StorageEngine::Impl {
                                                     : found->second;
   }
 
-  static ExtentManifest DependentExtentsFor(const WorkerStore& store,
-                                            const RecordIndex::Entry* entry) {
-    if (entry == nullptr || !entry->value_.key_external()) [[likely]] {
-      return {};
-    }
-    return entry->value_.external() ? ExtentsFor(store, entry)
-                                    : ExtentManifest{};
-  }
-
-  Task<absl::StatusOr<std::string>> LoadExternalKey(WorkerStore& store,
-                                                    ExtentManifest extents,
-                                                    std::size_t key_bytes);
   Task<absl::StatusOr<std::string>> LoadOutOfIndexKey(
-      WorkerStore& store, const RecordLocation& location,
-      ExtentManifest extents, std::size_t key_bytes);
-  Task<absl::StatusOr<std::string>> LoadInlineRecordKeyLocal(
       WorkerStore& store, const RecordLocation& location,
       std::size_t key_bytes);
   Task<absl::StatusOr<std::string>> LoadExternalKeyForRecovery(
       WorkerStore& store, ExtentManifest extents, std::size_t key_bytes);
   Task<absl::Status> ReadRecoveryExtentInto(
       WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-      std::span<std::byte> destination, std::size_t payload_offset = 0,
+      std::span<std::byte> destination,
       OrderedGroupMetadataDecoder* ordered = nullptr);
-  // Read a bounded slice while validating every extent in the manifest. Used
+  // Read a bounded prefix while validating every extent in the manifest. Used
   // for group envelopes so an indivisible large field does not become a large
   // recovery allocation merely to reconstruct resident routing metadata.
-  // Optional ordered decoding observes all bytes after offset during that same
-  // pass, not just the returned slice. Its caller-owned state outlives the
+  // Optional ordered decoding observes all payload bytes during that same
+  // pass, not just the returned prefix. Its caller-owned state outlives the
   // task.
-  Task<absl::StatusOr<std::string>> LoadRecoveryPayloadSlice(
-      WorkerStore& store, ExtentManifest extents, std::size_t offset,
-      std::size_t bytes, OrderedGroupMetadataDecoder* ordered = nullptr);
-
-  Task<absl::StatusOr<bool>> VerifyExternalKey(WorkerStore& store,
-                                               const RecordIndex::Entry& entry,
-                                               std::string_view key);
-  Task<absl::StatusOr<bool>> VerifyExternalKeyExtents(WorkerStore& store,
-                                                      ExtentManifest extents,
-                                                      std::string_view key);
-  Task<absl::StatusOr<bool>> VerifyInlineRecordKey(
-      WorkerStore& store, const RecordLocation& location, std::string_view key);
-  Task<absl::StatusOr<bool>> VerifyInlineRecordKeyLocal(
-      WorkerStore& store, const RecordLocation& location, std::string_view key);
+  Task<absl::StatusOr<std::string>> LoadRecoveryPayloadPrefix(
+      WorkerStore& store, ExtentManifest extents, std::size_t bytes,
+      OrderedGroupMetadataDecoder* ordered = nullptr);
 
   Task<absl::StatusOr<RecordIndex::Entry*>> FindVerifiedEntry(
       WorkerStore& store, RecordIndex& index, const Digest& digest,
@@ -3355,7 +3367,7 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<LoadedValue>> LoadExternalValueLocal(
       WorkerStore& store, const RecordLocation& location,
-      ExtentManifest extents, std::size_t key_bytes, ReadLatencyTrace* trace,
+      ExtentManifest extents, ReadLatencyTrace* trace,
       bool grouped_payload = false);
 
   Task<absl::StatusOr<LoadedValue>> LoadValueLocal(
@@ -3562,7 +3574,7 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<std::uint64_t>> PinFullSyncValue(
       WorkerStore& store, std::uint64_t session_id,
       WorkerStore::PartitionStore& partition, RecordLocation location,
-      ExtentManifest extents, std::size_t key_bytes);
+      ExtentManifest extents);
 
   Task<absl::StatusOr<ReservedBlock>> AcquireWriteBlock(WorkerStore& store,
                                                         bool for_defrag,
@@ -3670,7 +3682,7 @@ class StorageEngine::Impl {
       std::uint64_t expire_at_ms, const Digest& digest, std::uint64_t txid,
       std::uint64_t mutation_sequence, bool for_defrag,
       bool unlock_writer_while_waiting = true, bool external = false,
-      bool key_external = false,
+      bool key_indirect = false,
       std::uint64_t logical_size = std::numeric_limits<std::uint64_t>::max(),
       std::shared_ptr<const std::vector<ExtentRef>> extents = nullptr,
       RecordLocation* written_location = nullptr,
@@ -3681,7 +3693,32 @@ class StorageEngine::Impl {
       TxUndoLog* replacement_undo = nullptr,
       WorkerStore::PartitionStore* known_partition = nullptr,
       const GroupRecordWrite* group = nullptr, bool mark_watched = false,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      bool indirect_key_record = false);
+
+  Task<absl::StatusOr<IndirectKeyHandle>> EnsureIndirectKey(
+      WorkerStore& store, std::string_view key, const Digest& digest,
+      TxShardWrites* tx, bool for_defrag, bool unlock_writer_while_waiting);
+  Task<absl::StatusOr<IndirectKeyHandle>> FindIndirectKey(IndirectKeyId id);
+  // Admit and install a new identity without suspending. Foreground callers
+  // do this before writing its KeyRecord; recovery uses the same memory gate.
+  absl::Status InsertIndirectKey(WorkerStore& store,
+                                 const IndirectKeyHandle& handle);
+  Task<absl::StatusOr<std::string>> LoadIndirectKey(IndirectKeyHandle handle);
+  Task<absl::Status> WriteIndirectKey(WorkerStore& store,
+                                      IndirectKeyHandle handle,
+                                      std::string_view key, bool for_defrag,
+                                      bool unlock_writer_while_waiting);
+  void RequestIndirectKeyCleaning(WorkerStore& store);
+  Task<absl::Status> CleanIndirectKeys(WorkerStore* store);
+  Task<absl::Status> ReleaseIndirectKeyReferences(
+      WorkerStore& store, std::uint64_t block_id,
+      std::uint64_t allocation_epoch);
+  Task<absl::Status> SalvageIndirectKeys(WorkerStore& store,
+                                         std::uint64_t block_id);
+  Task<absl::Status> RelocateIndirectKey(IndirectKeyId id,
+                                         std::uint64_t block_id,
+                                         std::uint32_t offset);
 
   absl::StatusOr<RecordIndex::Entry*> ReplaceIndexLocation(
       WorkerStore& store, RecordIndex& index, RecordIndex::Entry* entry,
@@ -4023,6 +4060,7 @@ class StorageEngine::Impl {
   std::unique_ptr<CoroutineBarrier> checkpoint_index_validated_barrier_;
   std::unique_ptr<CoroutineBarrier> metadata_barrier_;
   std::unique_ptr<CoroutineBarrier> checkpoint_retired_barrier_;
+  std::unique_ptr<CoroutineBarrier> indirect_key_recovery_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_accounting_barrier_;
   std::unique_ptr<CoroutineBarrier> free_list_barrier_;

@@ -260,7 +260,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
         (value_type == ValueType::kSortedSet ||
          value_type == ValueType::kStream) &&
         exists && !grouped && !location.external() &&
-        !location.key_external() &&
+        !location.key_indirect() &&
         location.total_disk_bytes() < kCompactWorkspaceInputBytes &&
         location.logical_size_ <= kCompactWorkspaceInputEntries;
     if ((value_type == ValueType::kSortedSet ||
@@ -279,12 +279,12 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
           const auto* entry = grouped->FindGroup(id);
           if (!entry)
             co_return absl::DataLossError("missing Sorted Set callback page");
-          auto admitted = budget.AddGroup(entry->value_,
-                                          grouped->ExtentsFor(id), key.size());
+          auto admitted =
+              budget.AddGroup(entry->value_, grouped->ExtentsFor(id));
           if (!admitted.ok()) co_return admitted;
         }
       } else {
-        auto admitted = budget.AddGroup(found->value_, extents, key.size());
+        auto admitted = budget.AddGroup(found->value_, extents);
         if (!admitted.ok()) co_return admitted;
       }
       // The loader's scratch ends when it returns the encoded read buffer.

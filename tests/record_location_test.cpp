@@ -52,7 +52,7 @@ TEST(RecordLocationTest, PackedMetadataRoundTripsMaximumValues) {
   EXPECT_EQ(packed.block_owner(), owner);
   EXPECT_TRUE(packed.in_memory());
   EXPECT_TRUE(packed.external());
-  EXPECT_TRUE(packed.key_external());
+  EXPECT_TRUE(packed.key_indirect());
   EXPECT_TRUE(packed.shielding());
   EXPECT_TRUE(packed.unclaimed());
   EXPECT_TRUE(packed.tx_tagged());
@@ -99,12 +99,12 @@ TEST(RecordLocationTest, GroupedRepresentationSurvivesIndexAndExpiryChanges) {
   RecordIndex index;
   const auto digest = ComputeDigest("grouped-hash");
   for (bool external : {false, true}) {
-    for (bool key_external : {false, true}) {
+    for (bool key_indirect : {false, true}) {
       for (std::uint64_t expiry : {0ULL, 123456789ULL, 0ULL}) {
         const RecordLocation location(
             17, 91, 83, expiry, 1200,
             RecordLocation::PackedMetadata::Encode(
-                kBlockHeaderBytes, 256, 7, true, external, key_external, true,
+                kBlockHeaderBytes, 256, 7, true, external, key_indirect, true,
                 false, true, RecordKind::kValue, ValueType::kHash, false,
                 true));
         auto* entry = index.Find(digest, "grouped-hash");
@@ -124,7 +124,7 @@ TEST(RecordLocationTest, GroupedRepresentationSurvivesIndexAndExpiryChanges) {
         EXPECT_TRUE(restored.grouped());
         EXPECT_EQ(restored.value_type(), ValueType::kHash);
         EXPECT_EQ(restored.external(), external);
-        EXPECT_EQ(restored.key_external(), key_external);
+        EXPECT_EQ(restored.key_indirect(), key_indirect);
         EXPECT_EQ(restored.expire_at_ms_, expiry);
         EXPECT_EQ(restored.mutation_sequence_, 91);
         EXPECT_EQ(restored.block_id(), 17);
@@ -202,7 +202,7 @@ TEST(RecordLocationTest, CompactIndexValueMaterializesCompleteBlockIdentity) {
   EXPECT_EQ(restored.expire_at_ms_, expiry);
   EXPECT_TRUE(restored.in_memory());
   EXPECT_TRUE(restored.external());
-  EXPECT_TRUE(restored.key_external());
+  EXPECT_TRUE(restored.key_indirect());
   EXPECT_TRUE(restored.shielding());
   EXPECT_TRUE(restored.unclaimed());
   EXPECT_TRUE(restored.tx_tagged());

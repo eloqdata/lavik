@@ -136,14 +136,9 @@ StorageEngine::Impl::CollectGroupedRetirements(
       return;
     }
     RetiredRecord retired = RetiredRecordOf(old_location);
-    // The checked outer header supplies group identity/retirement state,
-    // so a stale value-only payload is not needed for winner selection.
-    // An external parent key remains necessary to classify that record
-    // until its source block disappears.
-    if (old_location.key_external())
-      retired.dependent_extents_ = std::move(*extents);
-    else
-      retired.immediate_extents_ = std::move(*extents);
+    // Group identity and UUID are in the checked header. Stale value bytes
+    // are unnecessary for recovery's winner selection.
+    retired.immediate_extents_ = std::move(*extents);
     result.push_back(std::move(retired));
   };
   if (touched) {
@@ -330,9 +325,9 @@ Task<absl::Status> StorageEngine::Impl::ClearGroupedUndoSlots(
     if (current->value_.grouped()) continue;
     std::string external_key;
     if (!current->key_complete()) {
-      auto key = co_await LoadOutOfIndexKey(
-          store, MaterializeIndexLocation(*current), ExtentsFor(store, current),
-          current->logical_key_size());
+      auto key =
+          co_await LoadOutOfIndexKey(store, MaterializeIndexLocation(*current),
+                                     current->logical_key_size());
       if (!key.ok()) co_return key.status();
       external_key = std::move(*key);
     }

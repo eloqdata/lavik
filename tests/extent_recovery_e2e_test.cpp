@@ -349,8 +349,8 @@ void ExpectEventually(RespClient& client,
   Expect(actual, expected, operation);
 }
 
-// Comfortably past the inline limit of one block minus its header, so each
-// value lands in dedicated extent blocks.
+// Large Strings exercise many grouped segments while the parent UUID is
+// shared. The separate 9 MiB key below exercises KeyRecord payload extents.
 constexpr std::size_t kExternalBytes = 9ULL * 1024 * 1024;
 constexpr int kExternalKeys = 3;
 
@@ -430,7 +430,7 @@ int main(int argc, char** argv) {
     const std::string value(kExternalBytes, 'X');
     const std::string inline_combined_key(6ULL * 1024 * 1024, 'i');
     const std::string inline_combined_value(1ULL * 1024 * 1024, 'I');
-    const std::string shared_extent_key(6ULL * 1024 * 1024, 's');
+    const std::string shared_extent_key(9ULL * 1024 * 1024, 's');
     const std::string shared_extent_value(6ULL * 1024 * 1024, 'S');
 
     // Written under four workers.
@@ -480,8 +480,8 @@ int main(int argc, char** argv) {
           static_cast<std::int64_t>(shared_extent_value.size())) {
         Fail("recovered shared extent GET returned the wrong value");
       }
-      // Overwriting retires the extents, which reclaims them through their
-      // owning worker.
+      // Overwriting retires value groups. The original key and its extents
+      // stay reachable through the UUID while any old or new record needs it.
       for (int i = 0; i < kExternalKeys; ++i) {
         Expect(client.Command({"SET", ExternalKey(i), "small"}), "+OK",
                "external overwrite");
@@ -496,8 +496,8 @@ int main(int argc, char** argv) {
     }
 
     // Restart after overwrite at a third worker count. Old roots may remain
-    // in partially live record blocks, so a shared key/value extent chain
-    // must survive until the root block is durably retired.
+    // in partially live record blocks. UUIDs and their KeyRecord extents
+    // survive until every referencing allocation is durably retired.
     {
       ServerProcess server(argv[1], port, data_path, log_path, 3);
       RespClient client = ConnectReady(port);

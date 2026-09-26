@@ -28,25 +28,21 @@ StorageEngine::Impl::WriteOrderedGroupRecordLocked(
   // every extent is durable; only then may the manifest enter the root batch.
   // In particular a single large List item is never split into a read-time
   // operation log, nor copied into another equally large serialization buffer.
-  const bool key_external = key.size() > options_.inline_key_max_bytes_ ||
-                            RecordHeaderBytes(key.size(), false, true, false,
-                                              true) > kBlockHeaderSlotBytes;
-  const std::size_t prefix_bytes = key_external ? key.size() : 0;
+  const bool key_indirect = key.size() > kInlineKeyMaxBytes;
   if (!ValidRecordKeySize(key.size()) ||
-      prefix_bytes > kMaxRecordPayloadBytes - encoder.encoded_bytes()) {
+      encoder.encoded_bytes() > kMaxRecordPayloadBytes) {
     co_return absl::OutOfRangeError(
-        "ordered page and external key exceed record payload limit");
+        "ordered page exceeds record payload limit");
   }
   const std::size_t inline_bytes = AlignRecord(
-      RecordHeaderBytes(key.size(), key_external, true, false, true) +
-      prefix_bytes + encoder.encoded_bytes());
+      RecordHeaderBytes(key.size(), key_indirect, true, false, true) +
+      encoder.encoded_bytes());
   const bool external = inline_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
                         inline_bytes > options_.buffers_.write_buffer_bytes_;
   ExtentManifest extents;
   std::string payload;
   if (external) {
-    RecordPayloadCursor cursor(encoder,
-                               key_external ? key : std::string_view{});
+    RecordPayloadCursor cursor(encoder, std::string_view{});
     auto written = co_await WriteExtentValueLocked(store, {}, {}, &cursor, key);
     if (!written.ok()) co_return written.status();
     extents = std::move(*written);
@@ -73,7 +69,7 @@ StorageEngine::Impl::WriteOrderedGroupRecordLocked(
   RecordLocation location;
   auto status = co_await WriteRecordLocked(
       store, db_id, key, payload, RecordKind::kValue, type, 0, digest, tx.txid_,
-      revision, false, true, external, key_external, OrderedGroupSize(snapshot),
+      revision, false, true, external, key_indirect, OrderedGroupSize(snapshot),
       extents, &location, nullptr, &tx, nullptr, nullptr, nullptr, nullptr,
       &partition, &identity);
   if (!status.ok()) {
@@ -138,13 +134,22 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
       loaded = co_await LoadExternalValueLocal(store, location, extents,
-                                               key.size(), nullptr, true);
+                                               nullptr, true);
     } else if (location.block_owner() == store.worker_->id()) {
       loaded = co_await LoadValueLocal(store, db_id, key, location,
                                        original.replication_epoch_, nullptr,
                                        original.db_epoch_);
     } else {
       const unsigned owner = location.block_owner();
+      // Page scratch excludes the parent key. Admit the remote reader's copy
+      // here for every caller, and retain admission through the awaited read.
+      auto key_admission =
+          TryReserveMemory(AllocatorUsableSizeForRequest(key.size() + 1));
+      if (!key_admission) {
+        RecordMemoryRejection();
+        co_return absl::ResourceExhaustedError(
+            "OOM grouped parent key copy admission");
+      }
       loaded = co_await bycorf::SubmitTaskTo(
           owner,
           [this, owner, db_id, owned_key = std::string(key), location,

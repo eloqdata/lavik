@@ -207,7 +207,7 @@ constexpr unsigned kRecordKindShift = 0;
 constexpr unsigned kRecordDbShift = 2;
 constexpr unsigned kRecordTypeShift = 6;
 constexpr unsigned kRecordExternalShift = 9;
-constexpr unsigned kRecordKeyExternalShift = 10;
+constexpr unsigned kRecordKeyIndirectShift = 10;
 constexpr unsigned kRecordHasTxidShift = 11;
 constexpr unsigned kRecordHasExpiryShift = 12;
 constexpr unsigned kRecordGroupedShift = 13;
@@ -268,8 +268,8 @@ constexpr std::uint16_t RecordMetadata(const RecordHeader& header) noexcept {
       (static_cast<std::uint16_t>(header.db_id_) << kRecordDbShift) |
       (static_cast<std::uint16_t>(header.value_type_) << kRecordTypeShift) |
       (static_cast<std::uint16_t>(header.external_) << kRecordExternalShift) |
-      (static_cast<std::uint16_t>(header.key_external_)
-       << kRecordKeyExternalShift) |
+      (static_cast<std::uint16_t>(header.key_indirect_)
+       << kRecordKeyIndirectShift) |
       (static_cast<std::uint16_t>(header.txid_ != 0) << kRecordHasTxidShift) |
       (static_cast<std::uint16_t>(header.expire_at_ms_ != 0)
        << kRecordHasExpiryShift) |
@@ -292,7 +292,7 @@ bool ValidGroupedRecordHeader(const RecordHeader& header) noexcept {
   if (header.grouped_ && (header.auxiliary_group_ ||
                           (header.logical_size_ == 0 &&
                            header.value_type_ != ValueType::kStream) ||
-                          (header.external_ && !header.key_external_)))
+                          header.external_))
     return false;
   if (!header.auxiliary_group_) {
     return header.group_incarnation_ == 0 && header.group_prefix_ == 0 &&
@@ -593,17 +593,20 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
   }
   if ((decoded.kind_ != BlockKind::kRecords &&
        decoded.kind_ != BlockKind::kPayloadExtent &&
+       decoded.kind_ != BlockKind::kIndirectKeys &&
        decoded.kind_ != BlockKind::kTransaction &&
        decoded.kind_ != BlockKind::kCheckpointIndex) ||
       decoded.reserved_ != std::array<std::uint8_t, 3>{}) {
     return false;
   }
   if (decoded.kind_ == BlockKind::kRecords ||
+      decoded.kind_ == BlockKind::kIndirectKeys ||
       decoded.kind_ == BlockKind::kTransaction) {
     if (decoded.extent_index_ != 0 || decoded.extent_payload_bytes_ != 0 ||
         decoded.extent_payload_checksum_ != 0 ||
         decoded.reserved_runtime_ != std::array<std::uint64_t, 3>{} ||
-        (decoded.kind_ == BlockKind::kRecords && decoded.tx_generation_ != 0) ||
+        (decoded.kind_ != BlockKind::kTransaction &&
+         decoded.tx_generation_ != 0) ||
         (decoded.kind_ == BlockKind::kTransaction &&
          decoded.tx_generation_ == 0)) {
       return false;
@@ -645,13 +648,14 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
   const std::size_t fixed_header_bytes =
       RecordFixedHeaderBytes(has_txid, has_expiry, header.auxiliary_group_);
   const std::size_t header_bytes =
-      RecordHeaderBytes(key.size(), header.key_external_, has_txid, has_expiry,
+      RecordHeaderBytes(key.size(), header.key_indirect_, has_txid, has_expiry,
                         header.auxiliary_group_);
   const std::size_t total_disk_bytes =
       AlignRecord(header_bytes + header.payload_bytes_);
   if (!ValidGroupedRecordHeader(header) || !ValidRecordKeySize(key.size()) ||
       key.size() != header.key_bytes_ ||
-      (header.key_external_ && key.empty()) ||
+      (!header.key_indirect_ && key.size() > kInlineKeyMaxBytes) ||
+      (header.key_indirect_ && key.empty()) ||
       header.db_id_ >= kLogicalDatabaseCount ||
       (header.kind_ != RecordKind::kValue &&
        header.kind_ != RecordKind::kTombstone &&
@@ -662,16 +666,13 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
        header.value_type_ == ValueType::kNone) ||
       (header.kind_ == RecordKind::kTombstone &&
        (header.logical_size_ != 0 || header.expire_at_ms_ != 0 ||
-        header.value_type_ != ValueType::kNone ||
-        (!header.key_external_ &&
-         (header.payload_bytes_ != 0 || header.external_)) ||
-        (header.key_external_ && !header.external_ &&
-         header.payload_bytes_ != header.key_bytes_))) ||
+        header.value_type_ != ValueType::kNone || header.payload_bytes_ != 0 ||
+        header.external_)) ||
       (header.kind_ == RecordKind::kTxCommit &&
        (header.logical_size_ != 0 || header.payload_bytes_ != 0 ||
         header.external_ || header.expire_at_ms_ != 0 ||
         header.value_type_ != ValueType::kNone || header.txid_ == 0 ||
-        header.key_bytes_ != 0 || header.key_external_)) ||
+        header.key_bytes_ != 0 || header.key_indirect_)) ||
       header.replication_epoch_ == 0 || header.db_epoch_ == 0 ||
       header.header_bytes_ != header_bytes ||
       header.total_disk_bytes_ != total_disk_bytes ||
@@ -720,7 +721,12 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
   }
   assert(optional_offset == fixed_header_bytes);
   std::size_t encoded_bytes = fixed_header_bytes;
-  if (!header.key_external_) {
+  if (header.key_indirect_) {
+    if (header.key_id_ == IndirectKeyId{}) return false;
+    std::memcpy(output.data() + fixed_header_bytes, header.key_id_.data(),
+                sizeof(IndirectKeyId));
+    encoded_bytes += sizeof(IndirectKeyId);
+  } else {
     std::memcpy(output.data() + fixed_header_bytes, key.data(), key.size());
     encoded_bytes += key.size();
   }
@@ -751,8 +757,8 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
   const bool has_expiry = RecordMetadataBit(metadata, kRecordHasExpiryShift);
   const bool auxiliary_group =
       RecordMetadataBit(metadata, kRecordAuxiliaryGroupShift);
-  const bool key_external =
-      RecordMetadataBit(metadata, kRecordKeyExternalShift);
+  const bool key_indirect =
+      RecordMetadataBit(metadata, kRecordKeyIndirectShift);
   const std::uint32_t key_bytes =
       LoadRecordField<std::uint32_t>(input, kRecordKeyBytesOffset);
   const std::uint32_t payload_bytes =
@@ -760,9 +766,10 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
   const std::size_t fixed_header_bytes =
       RecordFixedHeaderBytes(has_txid, has_expiry, auxiliary_group);
   const std::size_t header_bytes = RecordHeaderBytes(
-      key_bytes, key_external, has_txid, has_expiry, auxiliary_group);
-  if (!ValidRecordKeySize(key_bytes) || header_bytes > kMaxRecordHeaderBytes ||
-      header_bytes > input.size()) {
+      key_bytes, key_indirect, has_txid, has_expiry, auxiliary_group);
+  if (!ValidRecordKeySize(key_bytes) ||
+      (!key_indirect && key_bytes > kInlineKeyMaxBytes) ||
+      header_bytes > kMaxRecordHeaderBytes || header_bytes > input.size()) {
     return false;
   }
   const std::size_t total_disk_bytes =
@@ -780,7 +787,7 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
       .value_type_ = static_cast<ValueType>((metadata >> kRecordTypeShift) &
                                             kRecordTypeMask),
       .external_ = RecordMetadataBit(metadata, kRecordExternalShift),
-      .key_external_ = key_external,
+      .key_indirect_ = key_indirect,
       .grouped_ = RecordMetadataBit(metadata, kRecordGroupedShift),
       .auxiliary_group_ = auxiliary_group,
       .key_bytes_ = key_bytes,
@@ -829,6 +836,11 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
     optional_offset += kRecordAuxiliaryGroupIdentityBytes;
   }
   assert(optional_offset == fixed_header_bytes);
+  if (decoded.key_indirect_) {
+    std::memcpy(decoded.key_id_.data(), input.data() + fixed_header_bytes,
+                sizeof(IndirectKeyId));
+    if (decoded.key_id_ == IndirectKeyId{}) return false;
+  }
 
   if (!ValidGroupedRecordHeader(decoded) || (has_txid && decoded.txid_ == 0) ||
       (has_expiry && decoded.expire_at_ms_ == 0) ||
@@ -844,7 +856,7 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
        decoded.value_type_ == ValueType::kString &&
        decoded.logical_size_ > kMaxBitmapBytes) ||
       decoded.replication_epoch_ == 0 || decoded.db_epoch_ == 0 ||
-      (decoded.key_external_ && decoded.key_bytes_ == 0)) {
+      (decoded.key_indirect_ && decoded.key_bytes_ == 0)) {
     return false;
   }
   if (decoded.kind_ != RecordKind::kValue &&
@@ -853,15 +865,12 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
     return false;
   }
   if (decoded.kind_ == RecordKind::kTombstone &&
-      ((!decoded.key_external_ &&
-        (decoded.payload_bytes_ != 0 || decoded.external_)) ||
-       (decoded.key_external_ && !decoded.external_ &&
-        decoded.payload_bytes_ != decoded.key_bytes_))) {
+      (decoded.payload_bytes_ != 0 || decoded.external_)) {
     return false;
   }
   if (decoded.kind_ == RecordKind::kTxCommit &&
       (decoded.txid_ == 0 || decoded.key_bytes_ != 0 ||
-       decoded.key_external_)) {
+       decoded.key_indirect_)) {
     return false;
   }
   if (RecordHeaderChecksum(input.first(header_bytes)) !=
@@ -869,7 +878,7 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
     return false;
   }
   *header = decoded;
-  if (decoded.key_external_) {
+  if (decoded.key_indirect_) {
     *key = {};
   } else {
     *key = std::string_view(

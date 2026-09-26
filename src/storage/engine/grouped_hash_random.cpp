@@ -107,8 +107,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
       const auto* record = object->FindGroup(id);
       return record == nullptr
                  ? absl::DataLossError("random sample page is missing")
-                 : budget->AddGroup(record->value_, object->ExtentsFor(id),
-                                    key.size());
+                 : budget->AddGroup(record->value_, object->ExtentsFor(id));
     };
     std::optional<MemoryReservation> write_scratch;
     if (pop) {

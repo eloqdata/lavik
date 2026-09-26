@@ -336,10 +336,6 @@ int main(int argc, char** argv) {
                  "opening listeners");
   app.add_flag("--load-rdb-replace", options.load_rdb_replace_,
                "Erase all configured data files before importing --load-rdb");
-  app.add_option("--inline-key-max-bytes", options.inline_key_max_bytes_,
-                 "Largest key retained complete in the in-memory index")
-      ->check(CLI::Range(std::size_t{1}, lavik::storage::MaxInlineKeyBytes()))
-      ->capture_default_str();
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {

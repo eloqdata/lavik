@@ -175,6 +175,365 @@ TEST(GroupedStringWriteE2e, FixedSegmentsPointWritesTtlAndRecovery) {
   EXPECT_EQ(client.Command({"GET", "string"}).text_, value);
 }
 
+TEST(GroupedStringWriteE2e, LongKeysPromoteAndRecover) {
+  PrivateDisk disk;
+  const std::string direct_key(8193, 'd');
+  const std::string append_key(8193, 'a');
+  const std::string value(16 * 1024, 'v');
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"SET", direct_key, value}).text_, "OK");
+    ASSERT_EQ(client.Command({"SET", append_key, value.substr(1)}).text_, "OK");
+    ASSERT_EQ(client.Command({"APPEND", append_key, "!"}).text_,
+              std::to_string(value.size()));
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  EXPECT_GE(disk.GroupedStringRootCount(), 2);
+  {
+    Server server(disk);
+    Client client(server.port());
+    EXPECT_EQ(client.Command({"GET", direct_key}).text_, value);
+    EXPECT_EQ(client.Command({"GETRANGE", append_key, "16383", "-1"}).text_,
+              "!");
+    ASSERT_EQ(client.Command({"SETRANGE", direct_key, "8191", "XY"}).text_,
+              std::to_string(value.size()));
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk);
+  Client client(recovered.port());
+  std::string changed = value;
+  changed.replace(8191, 2, "XY");
+  EXPECT_EQ(client.Command({"GET", direct_key}).text_, changed);
+  EXPECT_EQ(client.Command({"GET", append_key}).text_, value.substr(1) + "!");
+}
+
+TEST(IndirectKeyE2e, BoundarySharedSegmentsAndExtentRecoverAcrossWorkers) {
+  PrivateDisk disk;
+  const std::string inline_key(2048, 'i');
+  const std::string shared_key(2049, 's');
+  const std::string extent_key(8 * 1024 * 1024, 'e');
+  const std::string value(256 * 1024, 'v');
+  const std::string extent_value(64 * 1024, 'e');
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"SET", inline_key, "inline"}).text_, "OK");
+    ASSERT_EQ(client.Command({"SET", shared_key, value}).text_, "OK");
+    ASSERT_EQ(client.Command({"SET", extent_key, extent_value}).text_, "OK");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto layout = disk.IndirectKeyLayout();
+  ASSERT_EQ(layout.keys_.size(), 2);
+  EXPECT_TRUE(layout.inline_keys_.contains(2048));
+  EXPECT_FALSE(layout.inline_keys_.contains(2049));
+  EXPECT_LE(layout.largest_indirect_record_, 16 * 1024);
+  for (const auto& [id, metadata] : layout.keys_) {
+    EXPECT_EQ(metadata.second, metadata.first == extent_key.size());
+    EXPECT_TRUE(layout.references_.contains(id));
+    if (metadata.first == shared_key.size())
+      EXPECT_GE(layout.references_.at(id), 33);
+  }
+  {
+    Server server(disk, 3);
+    Client client(server.port());
+    EXPECT_EQ(client.Command({"GET", inline_key}).text_, "inline");
+    EXPECT_EQ(client.Command({"GET", shared_key}).text_, value);
+    EXPECT_EQ(client.Command({"GET", extent_key}).text_, extent_value);
+    EXPECT_NE(server.Log().find("(100.0%) swept="), std::string::npos)
+        << server.Log();
+    ASSERT_EQ(client.Command({"SETRANGE", shared_key, "8191", "XY"}).text_,
+              std::to_string(value.size()));
+    ASSERT_EQ(client.Command({"DEL", extent_key}).text_, "1");
+    ASSERT_EQ(client.Command({"SET", extent_key, "again"}).text_, "OK");
+    ASSERT_EQ(client.Command({"PEXPIRE", shared_key, "1"}).text_, "1");
+    std::this_thread::sleep_for(10ms);
+    EXPECT_EQ(client.Command({"EXISTS", shared_key}).text_, "0");
+    client.Durable();
+    // Scope exit kills the process after the explicit durability frontier.
+  }
+  Server recovered(disk, 1);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"GET", extent_key}).text_, "again");
+  EXPECT_EQ(client.Command({"GET", shared_key}).kind_, '$');
+  EXPECT_EQ(client.Command({"EXISTS", shared_key}).text_, "0");
+}
+
+TEST(IndirectKeyE2e, RegistryGrowthAndRecoveryPreserveUuidIdentity) {
+  PrivateDisk disk;
+  // One logical slot forces several expansions of the same UUID registry,
+  // while changing worker counts exercises recovery's foreign-owner lookups.
+  std::vector<std::string> keys;
+  for (unsigned i = 0; i < 257; ++i) {
+    keys.push_back("{uuid-registry}:" + std::to_string(i));
+    keys.back().resize(2049, 'k');
+  }
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    for (std::size_t i = 0; i < keys.size(); ++i)
+      ASSERT_EQ(client.Command({"SET", keys[i], std::to_string(i)}).text_,
+                "OK");
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      ASSERT_EQ(client.Command({"GET", keys[i]}).text_, std::to_string(i));
+      ASSERT_EQ(client.Command({"SET", keys[i], "updated"}).text_, "OK");
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // Rehash and updates must keep resolving the original UUID, without writing
+  // duplicate KeyRecords for already-known original bytes.
+  EXPECT_EQ(disk.IndirectKeyLayout().keys_.size(), keys.size());
+  {
+    Server server(disk, 3);
+    Client client(server.port());
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      ASSERT_EQ(client.Command({"GET", keys[i]}).text_, "updated");
+      if (i % 2 == 0) ASSERT_EQ(client.Command({"DEL", keys[i]}).text_, "1");
+    }
+    client.Durable();
+  }
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      if (i % 2 == 0) {
+        ASSERT_EQ(client.Command({"EXISTS", keys[i]}).text_, "0");
+        ASSERT_EQ(client.Command({"SET", keys[i], "recreated"}).text_, "OK");
+        ASSERT_EQ(client.Command({"GET", keys[i]}).text_, "recreated");
+      } else {
+        ASSERT_EQ(client.Command({"GET", keys[i]}).text_, "updated");
+      }
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  EXPECT_EQ(disk.IndirectKeyLayout().keys_.size(), keys.size());
+}
+
+TEST(IndirectKeyE2e, KeyLargerThanExternalGroupReadsAndMutates) {
+  PrivateDisk disk;
+  // Key extents are independent of the smaller, indivisible Hash value.
+  // Page admission must budget the complete value without subtracting the key.
+  const std::string key(10 * 1024 * 1024, 'k');
+  const std::string value(9 * 1024 * 1024, 'v');
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"HSET", key, "field", value}).text_, "1");
+    const auto read = client.Command({"HGET", key, "field"});
+    ASSERT_EQ(read.kind_, '$') << read.text_;
+    EXPECT_EQ(read.text_, value);
+    ASSERT_EQ(client.Command({"HSET", key, "another", "small"}).text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  const auto read = client.Command({"HGET", key, "field"});
+  ASSERT_EQ(read.kind_, '$') << read.text_;
+  EXPECT_EQ(read.text_, value);
+  ASSERT_EQ(client.Command({"HDEL", key, "field"}).text_, "1");
+  EXPECT_EQ(client.Command({"HGET", key, "another"}).text_, "small");
+}
+
+TEST(IndirectKeyE2e, RemoteGroupedReadsAdmitParentKeyCopies) {
+  PrivateDisk disk;
+  disk.PreserveOnFailure();
+  auto make_key = [](unsigned owner, char type) {
+    std::string key;
+    for (unsigned tag = 0;; ++tag) {
+      key = "{key-copy-" + std::to_string(tag) + "}";
+      if (RedisSlot(key) % 3 == owner) break;
+    }
+    key += type;
+    key.resize(16 * 1024 * 1024, 'k');
+    return key;
+  };
+  const std::array hash_keys{make_key(0, 'h'), make_key(1, 'h')};
+  const std::array list_keys{make_key(0, 'l'), make_key(1, 'l')};
+  const std::string value(20000, 'v');
+  {
+    // One writer packs these small grouped pages into one physical block.
+    // After recovery with three workers, at least one of the two logical key
+    // owners must read remotely, for both the Hash and ordered loaders.
+    Server server(disk, 1, {}, {}, false, 2, "1G", {}, "128M");
+    Client client(server.port());
+    for (const auto& key : hash_keys)
+      ASSERT_EQ(client.Command({"HSET", key, "field", value}).text_, "1");
+    for (const auto& key : list_keys)
+      ASSERT_EQ(client.Command({"RPUSH", key, value}).text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    // Each logical owner retains two 16 MiB side-index keys. Its 48 MiB
+    // retained-memory quota fits the pages, but not another complete key copy.
+    // Client request buffers have a separate budget so they cannot mask this
+    // storage admission check.
+    Server limited(disk, 3, {}, {}, false, 2, "160M", {}, "128M");
+    limited.PreserveOnFailure();
+    Client client(limited.port());
+    unsigned rejected_hash = 0;
+    unsigned rejected_list = 0;
+    for (unsigned i = 0; i < hash_keys.size(); ++i) {
+      EXPECT_EQ(client.Command({"HLEN", hash_keys[i]}).text_, "1");
+      EXPECT_EQ(client.Command({"LLEN", list_keys[i]}).text_, "1");
+      const auto hash = client.Command({"HGET", hash_keys[i], "field"});
+      const auto list = client.Command({"LINDEX", list_keys[i], "0"});
+      for (const auto* reply : {&hash, &list}) {
+        if (reply->kind_ == '-') {
+          EXPECT_EQ(reply->text_, "OOM grouped parent key copy admission");
+        } else {
+          ASSERT_EQ(reply->kind_, '$') << reply->text_;
+          EXPECT_EQ(reply->text_, value);
+        }
+      }
+      rejected_hash += hash.kind_ == '-';
+      rejected_list += list.kind_ == '-';
+    }
+    EXPECT_GT(rejected_hash, 0);
+    EXPECT_GT(rejected_list, 0);
+    EXPECT_NE(client.Command({"INFO", "MEMORY"})
+                  .text_.find("memory_admission_pending:0\r\n"),
+              std::string::npos);
+    ASSERT_EQ(limited.Wait(true), 0) << limited.Log();
+  }
+  Server recovered(disk, 3, {}, {}, false, 2, "1G", {}, "128M");
+  Client client(recovered.port());
+  for (const auto& key : hash_keys)
+    EXPECT_EQ(client.Command({"HGET", key, "field"}).text_, value);
+  for (const auto& key : list_keys)
+    EXPECT_EQ(client.Command({"LINDEX", key, "0"}).text_, value);
+  EXPECT_NE(client.Command({"INFO", "MEMORY"})
+                .text_.find("memory_admission_pending:0\r\n"),
+            std::string::npos);
+}
+
+TEST(IndirectKeyE2e, CollectionsTransactionsAndExpiryKeepOriginalNames) {
+  PrivateDisk disk;
+  const std::string prefix(4096, 'k');
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    EXPECT_EQ(client
+                  .Command({"HSET", prefix + "h", "a",
+                            std::string(9 * 1024 * 1024, 'h')})
+                  .text_,
+              "QUEUED");
+    EXPECT_EQ(
+        client.Command({"RPUSH", prefix + "l", std::string(20000, 'l')}).text_,
+        "QUEUED");
+    EXPECT_EQ(
+        client.Command({"SADD", prefix + "s", std::string(20000, 's')}).text_,
+        "QUEUED");
+    EXPECT_EQ(
+        client.Command({"ZADD", prefix + "z", "1", std::string(20000, 'z')})
+            .text_,
+        "QUEUED");
+    EXPECT_EQ(client
+                  .Command({"XADD", prefix + "x", "1-0", "a",
+                            std::string(20000, 'x')})
+                  .text_,
+              "QUEUED");
+    const auto result = client.Command({"EXEC"});
+    ASSERT_EQ(result.items_.size(), 5);
+    for (const auto& item : result.items_) EXPECT_NE(item.kind_, '-');
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"HGET", prefix + "h", "a"}).text_,
+            std::string(9 * 1024 * 1024, 'h'));
+  EXPECT_EQ(client.Command({"LINDEX", prefix + "l", "0"}).text_,
+            std::string(20000, 'l'));
+  EXPECT_EQ(client.Command({"SISMEMBER", prefix + "s", std::string(20000, 's')})
+                .text_,
+            "1");
+  EXPECT_EQ(
+      client.Command({"ZSCORE", prefix + "z", std::string(20000, 'z')}).text_,
+      "1");
+  EXPECT_EQ(client.Command({"XLEN", prefix + "x"}).text_, "1");
+  for (const auto suffix : {"h", "l", "s", "z", "x"}) {
+    EXPECT_EQ(client.Command({"EXPIRE", prefix + suffix, "3600"}).text_, "1");
+    EXPECT_EQ(client.Command({"DEL", prefix + suffix}).text_, "1");
+  }
+}
+
+TEST(IndirectKeyE2e, DedicatedCleanerRelocatesLiveUuidAfterFlushDb) {
+  PrivateDisk disk;
+  const std::string survivor(9001, 's');
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"SELECT", "1"}).text_, "OK");
+    ASSERT_EQ(client.Command({"SET", survivor, "survives"}).text_, "OK");
+    ASSERT_EQ(client.Command({"SELECT", "0"}).text_, "OK");
+    for (int i = 0; i < 32; ++i) {
+      const std::string key = std::string(8193, 'd') + std::to_string(i);
+      ASSERT_EQ(client.Command({"SET", key, "discard"}).text_, "OK");
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    // Recovery seals both streams and changes their physical/logical owners.
+    // The surviving DB-1 root cannot leave the ordinary source block active.
+    Server server(disk, 3);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"FLUSHDB"}).text_, "OK");
+    ASSERT_EQ(client.Command({"CONFIG", "SET", "defrag-paused", "no"}).text_,
+              "OK");
+    std::this_thread::sleep_for(1500ms);
+    ASSERT_EQ(client.Command({"SELECT", "1"}).text_, "OK");
+    EXPECT_EQ(client.Command({"GET", survivor}).text_, "survives");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto layout = disk.IndirectKeyLayout();
+  bool relocated = false;
+  for (const auto& [id, metadata] : layout.keys_) {
+    if (metadata.first == survivor.size())
+      relocated = relocated || layout.copies_.at(id) >= 2;
+  }
+  EXPECT_TRUE(relocated);
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"DBSIZE"}).text_, "0");
+  ASSERT_EQ(client.Command({"SELECT", "1"}).text_, "OK");
+  EXPECT_EQ(client.Command({"GET", survivor}).text_, "survives");
+}
+
+TEST(IndirectKeyE2e, RepeatedFlushReclaimsLargeKeyExtents) {
+  PrivateDisk disk(32 * kStorageBlockBytes);
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"CONFIG", "SET", "defrag-paused", "no"}).text_,
+              "OK");
+    for (int i = 0; i < 12; ++i) {
+      const std::string key(9 * 1024 * 1024, static_cast<char>('a' + i));
+      ASSERT_EQ(client.Command({"SET", key, "value"}).text_, "OK")
+          << "round " << i;
+      client.Durable();
+      ASSERT_EQ(client.Command({"FLUSHDB"}).text_, "OK");
+      std::this_thread::sleep_for(300ms);
+    }
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"DBSIZE"}).text_, "0");
+  EXPECT_EQ(
+      client.Command({"SET", std::string(9 * 1024 * 1024, 'z'), "after"}).text_,
+      "OK");
+}
+
 TEST(GroupedStringWriteE2e, TransactionsTransferAndRdbKeepStringSemantics) {
   PrivateDisk disk;
   std::string value(8192 * 4, 'v');
@@ -670,19 +1029,20 @@ class GroupedFullDiskExpirationE2e
     : public ::testing::TestWithParam<std::tuple<ValueType, bool>> {};
 
 TEST_P(GroupedFullDiskExpirationE2e, ReclaimsGraphAndRecovers) {
-  const auto [type, external_key] = GetParam();
+  const auto [type, indirect_key] = GetParam();
   // Inline groups occupy the only foreground block on the minimum device.
-  // Oversized groups instead consume two extents each; external parent keys
-  // make those extents depend on retirement of their transaction record block.
+  // Oversized groups instead consume two value extents each; their indirect
+  // parent keys share one additional dedicated key block. UUID dependencies
+  // survive until the referencing transaction record block retires.
   // Indexed Sorted Sets persist the member in two graphs. Keep inline bytes
-  // per key unchanged, and give the external case its six extra extent blocks;
+  // per key unchanged, and give that case its six extra extent blocks;
   // the final 1 MiB/9 MiB SET below must still prove the device is actually
   // full.
   const bool indexed = type == ValueType::kSortedSet;
-  PrivateDisk disk((external_key ? (indexed ? 176ULL : 128ULL) : 80ULL) * 1024 *
+  PrivateDisk disk((indirect_key ? (indexed ? 184ULL : 136ULL) : 80ULL) * 1024 *
                    1024);
   const std::string member(
-      external_key ? 9 * 1024 * 1024 : (indexed ? 512 : 1024) * 1024, 'v');
+      indirect_key ? 9 * 1024 * 1024 : (indexed ? 512 : 1024) * 1024, 'v');
   absl::StatusOr<std::string> compact;
   if (type == ValueType::kHash || type == ValueType::kSet) {
     HashValue value;
@@ -703,13 +1063,13 @@ TEST_P(GroupedFullDiskExpirationE2e, ReclaimsGraphAndRecovers) {
                                               .value_type_ = type});
   ASSERT_TRUE(dump.ok()) << dump.status();
   std::vector<std::string> expired_keys;
-  const auto key_count = external_key ? 3 : 7;
+  const auto key_count = indirect_key ? 3 : 7;
   for (int i = 0; i < key_count; ++i) {
     auto key = "expiring:" + std::to_string(i);
-    if (external_key) key.resize(32 * 1024, 'k');
+    if (indirect_key) key.resize(32 * 1024, 'k');
     expired_keys.push_back(std::move(key));
   }
-  const std::string replacement = external_key ? member : "space reclaimed";
+  const std::string replacement = indirect_key ? member : "space reclaimed";
   {
     Server server(disk, 1);
     Client client(server.port());
@@ -734,7 +1094,7 @@ TEST_P(GroupedFullDiskExpirationE2e, ReclaimsGraphAndRecovers) {
     ASSERT_EQ(
         client
             .Command({"SET", "cannot-fit",
-                      external_key ? member : std::string(1024 * 1024, 'v')})
+                      indirect_key ? member : std::string(1024 * 1024, 'v')})
             .text_,
         "QUEUED");
     const auto exhausted = client.Command({"EXEC"});
@@ -806,12 +1166,12 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<GroupedFullDiskExpirationE2e::ParamType>&
            info) {
       const auto type = std::get<0>(info.param);
-      const auto external = std::get<1>(info.param);
+      const auto indirect = std::get<1>(info.param);
       std::string name = type == ValueType::kHash   ? "Hash"
                          : type == ValueType::kSet  ? "Set"
                          : type == ValueType::kList ? "List"
                                                     : "SortedSet";
-      return name + (external ? "External" : "Inline");
+      return name + (indirect ? "Indirect" : "Inline");
     });
 
 TEST(GroupedOrderedWriteE2e, SortedSetRemovalPopAndStoreCommandSurface) {
