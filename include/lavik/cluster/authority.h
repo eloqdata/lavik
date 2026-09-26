@@ -271,6 +271,12 @@ class AuthorityGuard {
   RecheckResult Recheck(const AuthorityAdmission& admission,
                         MonotonicTime now) const;
 
+  // Checks a registered composite operation before another execution hop.
+  // A refusal belongs to its shared outcome even when no storage callback
+  // runs (e.g. Lua catches the command error); success does not mark a write.
+  RecheckResult RecheckForExecution(const AuthorityAdmission& admission,
+                                    MonotonicTime now) const;
+
   // Final non-suspending check at the storage publication seam. On success it
   // records that this shared admission has begun a mutation; on rejection it
   // records the failure so aggregate commands never return a falsely certain

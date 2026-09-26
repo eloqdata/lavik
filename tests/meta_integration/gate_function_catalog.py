@@ -45,7 +45,7 @@ def mutations(root):
                 ("FCALL", "readonly_value", 0),
                 ("FCALL_RO", "readonly_value", 0),
             ):
-                rejects(writer, command, "not yet supported")
+                assert writer.call(*command) == "ok"
             assert writer.call("FUNCTION", "FLUSH") == "OK"
             empty = snapshot(writer)
             assert empty[1] == []

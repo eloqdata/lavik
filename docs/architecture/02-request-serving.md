@@ -243,7 +243,13 @@ and stay within their enclosing authority window. Read-only `XREAD` and keyless
 `WAIT` register no mutation guard. The waiter registry and readiness events are
 implemented in the Redis subsystem, while storage remains the source of truth
 checked after wakeup. This attempt-scoped ownership lets fencing drain
-promptly even when a client waits without a timeout.
+promptly even when a client waits without a timeout. Top-level XREADGROUP also
+reserves replication publisher capacity per attempt, before taking DB/key
+holds, and releases it before sleeping, including retries at a closed DB gate.
+A dormant consumer cannot retain a FULL snapshot's UNSTARTED partition guard.
+Its refreshed authority proof also
+reaches the outer reply finalizer, so partial cross-worker refusal disconnects
+instead of reporting a retryable error.
 
 External data commands capture the replication manager's packed
 serving-generation/open token at dispatch and revalidate it after obtaining

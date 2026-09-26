@@ -623,6 +623,15 @@ RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,
              : RecheckResult::kReject;
 }
 
+RecheckResult AuthorityGuard::RecheckForExecution(
+    const AuthorityAdmission& admission, MonotonicTime now) const {
+  const RecheckResult result = Recheck(admission, now);
+  if (result != RecheckResult::kOk) {
+    admission.final_recheck_failed_.store(true, std::memory_order_release);
+  }
+  return result;
+}
+
 RecheckResult AuthorityGuard::RecheckAtMutation(
     const AuthorityAdmission& admission, MonotonicTime now) const {
   const RecheckResult result = Recheck(admission, now);

@@ -1104,6 +1104,29 @@ if (BUILD_TESTING)
         LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
 
       add_test(
+        NAME meta_integration.gate_managed_composite
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_managed_composite.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI})
+      set_tests_properties(meta_integration.gate_managed_composite PROPERTIES
+        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+
+      if (LAVIK_ENABLE_TEST_FAULTS)
+        foreach(scenario IN ITEMS stream catalog lifecycle partial)
+          add_test(
+            NAME meta_integration.gate_managed_composite_${scenario}_faults
+            COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_managed_composite_faults.py
+                    $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                    $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+                    ${scenario})
+          set_tests_properties(meta_integration.gate_managed_composite_${scenario}_faults
+            PROPERTIES LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+        endforeach()
+      endif()
+
+      add_test(
         NAME meta_integration.gate_function_catalog
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_function_catalog.py

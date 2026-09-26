@@ -539,6 +539,13 @@ Task<absl::Status> ReleaseConnectionWatches(ConnectionContext& ctx);
 void InitStorage(storage::StorageEngine* engine,
                  ReplicationManager* replication = nullptr);
 
+// Reserves replication capacity before a top-level blocking write attempt
+// takes DB/key holds and releases it once all owner hops settle. The callback
+// must not wait for data or escape those hops. EXEC/Lua children instead use
+// their enclosing publisher admission and must call their attempt directly.
+Task<absl::Status> RunReplicationAdmittedAttempt(
+    const CommandRequest& request, std::function<Task<absl::Status>()> attempt);
+
 // Builds an owned command for the current worker's replication journal. The
 // storage mutation consumes it at the same ordering point that assigns the
 // partition mutation sequence. Returns null for replayed commands or while

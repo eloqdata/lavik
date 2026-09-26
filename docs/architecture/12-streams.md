@@ -103,6 +103,21 @@ inspection metadata remains admitted command state. Individual records and
 explicitly selected mutation/inspection windows must fit admission. Unlimited
 inspection metadata is not a constant-space operation.
 
+Managed Single supports the same DB0–15 and cross-worker Stream execution as
+standalone; Cluster requires DB0 and one slot across all supplied Stream keys.
+Read-only XREAD checks authority at entry and serving generation after waits.
+XREADGROUP registers authority for each concrete attempt, including empty
+consumer creation, NOACK cursor updates and history PEL redelivery. Publisher
+capacity, DB admission and mutation guards end before waiter sleep. EXEC
+performs an immediate attempt under its outer locks, authority and replication
+capture; Lua/Function retain the same outer context and reject explicit BLOCK.
+
+The empty check is repeated after wait registration, retaining the initial
+`$` cursor so the registration gap cannot lose a message. Serving-generation
+replacement and role changes wake stale waiters to terminate safely. FLUSH is
+a database epoch change: XREAD can await subsequent additions, while
+XREADGROUP observes the removed group as NOGROUP.
+
 ## Replication and transfer
 
 Grouped native snapshots use the portable `LSR1` logical-record stream: a

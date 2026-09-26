@@ -232,8 +232,12 @@ closes the connection without fabricating a retryable result. This finalizer
 also covers errors swallowed inside Lua and the single-shard EXEC fast path.
 
 `EXEC` re-evaluates the union of its queued commands' slots at execution
-time: spanning slots fails the whole transaction with CROSSSLOT, and a write
-transaction whose slot moved redirects or refuses as a whole. Its
+time: in Cluster, spanning slots fails the whole transaction with CROSSSLOT,
+and a write transaction whose slot moved redirects or refuses as a whole.
+Watched-only keys do not join that union; each WATCH validates its own keys.
+Single uses its sole Group across databases, slots and workers. A pure catalog
+transaction registers local Group authority without adding a synthetic slot
+to the business-key union. Its
 single-shard fast path, which never builds a `tx::Transaction`, re-checks
 after taking the key guard. Lua `redis.call` writes re-check before
 dispatch and again on the owner hop; script key access is additionally
@@ -863,8 +867,10 @@ and `RESTORE` bind to the receiving node's member Group through the common
 authority gate. They update only that Group's local replicated catalog; other
 Groups are independent. `FUNCTION DUMP` and `LIST` inspect the local catalog,
 including on complete readable replicas without READONLY; replica mutations
-return READONLY. Catalog mutations inside managed `MULTI` remain unsupported:
-queuing one marks the transaction dirty so `EXEC` aborts.
+return READONLY. Catalog mutations inside `MULTI` share EXEC's registered
+Group proof and replication publication. Their durable roots commit in command
+order; a later failure settles the committed prefix, and an unpublishable
+catalog fences serving until recovery.
 `FUNCTION KILL` and `FUNCTION STATS` remain available while loading so an
 executing Function can be stopped or inspected; they do not mutate the catalog.
 
@@ -879,11 +885,12 @@ dataset, so cross-slot is not a rejection reason in Single; Cluster retains
 CROSSSLOT and DB0. DBSIZE, SCAN, RANDOMKEY and KEYS are data reads under the
 same Group admission and complete-population fence as keyed reads, including
 the ordinary Single replica-read policy. KEYS retains its exclusive database
-gate throughout its streamed reply. Still rejected with explicit unsupported
-errors, each because its execution context is not yet wired into Group
-authority: transactions (MULTI/EXEC/WATCH queue commands into a separate
-execution context), scripts and Function invocation, stream blocking (XREAD/XREADGROUP wait on distinct
-lanes and XREADGROUP mutates consumer-group state), and keyless `WAIT`.
+gate throughout its streamed reply. MULTI/EXEC/WATCH, SCRIPT, Lua and Function
+invocation reuse standalone execution under Group authority. XREAD and
+XREADGROUP support blocking and immediate reads on their existing wait lanes;
+XREADGROUP includes consumer metadata writes even for empty replies and NOACK.
+Standalone's unsupported inner commands remain unsupported. Top-level WAIT,
+SORT_RO, SAVE and BGSAVE remain deferred in managed Single.
 Function catalog management uses that same sole Group's admission and drain:
 LOAD/DELETE/FLUSH/RESTORE share one mutation lifecycle and final authority
 check at the first durable root write. DUMP/LIST use ordinary Single data-read
