@@ -890,8 +890,11 @@ invocation reuse standalone execution under Group authority. XREAD and
 XREADGROUP support blocking and immediate reads on their existing wait lanes;
 XREADGROUP includes consumer metadata writes even for empty replies and NOACK.
 Standalone's unsupported inner commands remain unsupported. Top-level WAIT
-remains deferred in managed Single. SORT_RO, SAVE and BGSAVE use their shared
-Redis 7.2.14 command paths in both managed modes. Single sorting uses the
+uses the common native replication history of the sole Group, across DB0–15.
+It observes replication without holding mutation admission; replicas reject
+it, and serving-boundary retirement cancels outstanding waits. SORT_RO, SAVE,
+and BGSAVE use their shared Redis 7.2.14 command paths in both managed modes.
+Single sorting uses the
 selected DB and ordinary complete-replica read admission; Cluster sorting
 retains DB0 and slot routing, including Redis 7.2.14's BY/GET restrictions.
 RDB exports cover the receiving node's dataset, including every Single DB or
