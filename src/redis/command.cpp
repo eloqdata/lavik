@@ -3328,6 +3328,13 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request,
         "BUSY another operation is holding the database"));
   }
   auto state = std::make_shared<KeysStreamState>(db);
+  LAVIK_FAULT_INJECT({
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_KEYS_AFTER_DB_CLOSE_HOLD_FILE");
+    if (!paused.ok())
+      co_return BuiltReply(
+          reply_builder.AppendError(absl::StrCat("ERR ", paused.message())));
+  });
   state->pattern_ = request.args_[1];
   state->now_ms_ = RedisUnixTimeMillis();
   // Drain in-flight commands, then freeze expiration writes: from here to the

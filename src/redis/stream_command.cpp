@@ -1695,18 +1695,12 @@ Task<CommandReply> ExecuteRead(
     attempt_request.blocking_wake_cascade_ = attempt_cascade;
     std::vector<std::pair<std::string, ReadOneResult>> found;
     std::optional<CommandReply> attempt_reply;
+    bool db_gate_closed = false;
     auto attempt = [&]() -> Task<absl::Status> {
       const bool owns_attempt_gate = locked_keys.empty();
-      while (owns_attempt_gate && !TryBeginCommandDbOperation(request.db_id_)) {
-        if (block && block_ms != 0 &&
-            std::chrono::steady_clock::now() - started >=
-                std::chrono::milliseconds(block_ms)) {
-          attempt_reply = Built(builder.AppendNullArray());
-          co_return absl::OkStatus();
-        }
-        absl::Status slept = co_await bycorf::SleepFor(
-            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-        if (!slept.ok()) co_return slept;
+      if (owns_attempt_gate && !TryBeginCommandDbOperation(request.db_id_)) {
+        db_gate_closed = true;
+        co_return absl::OkStatus();
       }
       AttemptDbGuard db_guard(request.db_id_, owns_attempt_gate);
       if (group_read && owns_attempt_gate &&
@@ -1816,6 +1810,19 @@ Task<CommandReply> ExecuteRead(
     }
     if (!attempted.ok()) co_return Built(StorageError(builder, attempted));
     if (attempt_reply.has_value()) co_return std::move(*attempt_reply);
+    if (db_gate_closed) {
+      // The attempt wrapper has released its publisher reservation. Keeping
+      // it across a DB-gate wait can block FULL on an UNSTARTED partition.
+      // No keys were examined, so retain cursors and the original deadline.
+      if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+        co_return Built(builder.AppendNullArray());
+      }
+      cascade_completion.Finish();
+      absl::Status slept = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!slept.ok()) co_return Built(StorageError(builder, slept));
+      continue;
+    }
     initialized_dollars = true;
     if (!found.empty()) {
       if (builder.version() == RespVersion::k3)

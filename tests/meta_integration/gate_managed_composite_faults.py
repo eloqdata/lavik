@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 
 import gate_failover as F
 from gate_native_replication import C, H, Client, pair, ready
@@ -282,6 +283,111 @@ def full_with_idle_consumer(root):
             reader.close()
 
 
+def full_with_db_gate_waiters(root, mode):
+    # Use an already captured partition so publisher reservations are visible
+    # as FULL queue credit. Waiting for the DB gate must release that credit;
+    # the final FULL cut legitimately waits for KEYS to reopen the gate.
+    key = next(f"gate-{i}" for i in range(1000000) if C.redis_slot(f"gate-{i}") == 0)
+    hold = root / f"db-gate-{mode}.hold"
+    variable = "LAVIK_KEYS_AFTER_DB_CLOSE_HOLD_FILE"
+
+    def seed(client):
+        assert client.call("XGROUP", "CREATE", key, "g", 0, "MKSTREAM") == "OK"
+
+    with pair(
+        root,
+        f"db-gate-{mode}",
+        client_mode=mode,
+        source_workers=1,
+        seed=seed,
+        require_seed_before_full=True,
+        source_faults={
+            "LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "5000",
+            variable: str(hold),
+        },
+    ) as (_, source, target, writer):
+        H.wait_until(
+            "FULL paused after capturing waiter partition",
+            15,
+            lambda: "paused full sync after acknowledged handoff partition 0"
+            in Path(source.log_path).read_text(),
+        )
+        scanner, timed = Client(source), Client(source)
+        waiters = [Client(source), Client(source)]
+        reader = Client(target, readonly=mode == "cluster")
+        try:
+            blocked_id = waiters[1].call("CLIENT", "ID")
+            hold.touch()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                scanning = pool.submit(scanner.call, "KEYS", "*")
+                try:
+                    reached(source, variable)
+                    for command in ("XREAD", "XREADGROUP"):
+                        group = (
+                            ("GROUP", "g", "timed") if command == "XREADGROUP" else ()
+                        )
+                        cursor = ">" if group else "$"
+                        assert (
+                            timed.call(
+                                command, *group, "BLOCK", 20, "STREAMS", key, cursor
+                            )
+                            == []
+                        )
+                    pending = [
+                        pool.submit(
+                            client.call,
+                            "XREADGROUP",
+                            "GROUP",
+                            "g",
+                            f"wait-{index}",
+                            *(("BLOCK", 0) if index else ()),
+                            "STREAMS",
+                            key,
+                            ">",
+                        )
+                        for index, client in enumerate(waiters)
+                    ]
+                    # Allow both requests to reach the closed gate while FULL
+                    # is paused; their calls must stay pending without credit.
+                    time.sleep(0.1)
+                    assert all(not future.done() for future in pending)
+                    H.wait_until(
+                        "publisher reservations drain during DB gate wait",
+                        5,
+                        lambda: 'lavik_fullsync_publish_queue_admitted_bytes{worker="0"} 0\n'
+                        in source.metrics(),
+                    )
+                    assert not scanning.done()
+                    assert all(not future.done() for future in pending)
+                finally:
+                    hold.unlink(missing_ok=True)
+                assert key in scanning.result(timeout=10)
+                assert pending[0].result(timeout=10) == []
+                H.wait_until(
+                    "consumer enters normal Stream wait after DB gate opens",
+                    10,
+                    lambda: " flags=b "
+                    in writer.call("CLIENT", "LIST", "ID", blocked_id),
+                )
+                assert writer.call("CLIENT", "UNBLOCK", blocked_id, "ERROR") == 1
+                try:
+                    pending[1].result(timeout=10)
+                except H.Failure as error:
+                    assert "UNBLOCKED" in str(error), error
+                else:
+                    raise AssertionError("consumer ignored CLIENT UNBLOCK ERROR")
+                H.wait_until(
+                    "FULL and consumer metadata replay after DB gate opens",
+                    15,
+                    lambda: len(reader.call("XINFO", "CONSUMERS", key, "g")) == 2,
+                )
+
+        finally:
+            hold.unlink(missing_ok=True)
+            for client in (scanner, timed, reader, *waiters):
+                client.close()
+
+
 def stream_cutover(root):
     fixture = F.FailoverFixture(
         C.META,
@@ -502,9 +608,16 @@ def main():
             delete_partial_run(root)
             H.log("PASS")
             return
+        if scenario == "db-gate":
+            for mode in ("single", "cluster"):
+                full_with_db_gate_waiters(root, mode)
+            H.log("PASS")
+            return
         if scenario == "lifecycle":
             wait_registration_race(root)
             full_with_idle_consumer(root)
+            for mode in ("single", "cluster"):
+                full_with_db_gate_waiters(root, mode)
             stream_cutover(root)
             H.log("PASS")
             return
