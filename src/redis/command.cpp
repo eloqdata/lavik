@@ -9263,14 +9263,37 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
                                const CommandRequest& request,
                                ReplyBuilder& reply_builder, bool allow_blocking,
                                bool unresolved_write) {
-  std::uint64_t required = 0;
-  std::uint64_t timeout_ms = 0;
-  if (!ParseUint64(request.args_[1], &required) ||
-      !ParseUint64(request.args_[2], &timeout_ms)) {
+  // Redis rejects WAIT on a replica before inspecting either integer argument.
+  if (g_replication != nullptr && g_replication->is_replica()) {
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR WAIT cannot be used with replica instances. Please also note that "
+        "since Redis 4.0 if a replica is configured to be writable (which is "
+        "not the default) writes to replicas are just local and are not "
+        "propagated."));
+  }
+  std::int64_t required = 0;
+  std::int64_t timeout = 0;
+  if (!ParseRedisInt64(request.args_[1], &required)) {
     co_return BuiltReply(reply_builder.AppendError(
         "ERR value is not an integer or out of range"));
   }
-  if (g_replication == nullptr || g_replication->is_replica()) {
+  if (!ParseRedisInt64(request.args_[2], &timeout)) {
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR timeout is not an integer or out of range"));
+  }
+  if (timeout < 0) {
+    co_return BuiltReply(reply_builder.AppendError("ERR timeout is negative"));
+  }
+  const auto timeout_ms = static_cast<std::uint64_t>(timeout);
+  // Redis validates the absolute Unix-millisecond deadline even when WAIT
+  // can return immediately. Keep the wire error for a deadline beyond int64.
+  if (timeout_ms >
+      static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) -
+          RedisUnixTimeMillis()) {
+    co_return BuiltReply(
+        reply_builder.AppendError("ERR timeout is out of range"));
+  }
+  if (g_replication == nullptr) {
     co_return BuiltReply(reply_builder.AppendInteger(0));
   }
   if (unresolved_write) {
@@ -9291,6 +9314,11 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
   std::unique_ptr<BlockingWaitHandle> blocking_wait;
 
   for (;;) {
+    if (ctx.closing_ || ctx.wait_peer_disconnected_ ||
+        g_replication->is_replica()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR WAIT interrupted: client connection or primary role ended"));
+    }
     std::uint64_t acknowledged = 0;
     if (ctx.native_replication_watermark_dirty_) {
       if (allow_blocking) {
@@ -9329,6 +9357,14 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
       acknowledged = co_await g_replication->CountOnlineNativeReplicas();
     }
 
+    // Capture/count may suspend before a waiter exists. A peer disconnect or
+    // connection retirement can therefore miss the registry; persistent
+    // flags close that window, including an infinite WAIT with no downstream.
+    if (ctx.closing_ || ctx.wait_peer_disconnected_ ||
+        g_replication->is_replica()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR WAIT interrupted: client connection or primary role ended"));
+    }
     if (blocking_wait != nullptr) {
       switch (BlockingWaitState(*blocking_wait)) {
         case BlockingWakeReason::kUnblockedError:
@@ -9348,7 +9384,8 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
       }
     }
 
-    if (acknowledged >= required || !allow_blocking ||
+    if (required <= 0 || acknowledged >= static_cast<std::uint64_t>(required) ||
+        !allow_blocking ||
         (deadline.has_value() &&
          std::chrono::steady_clock::now() >= *deadline)) {
       co_return BuiltReply(reply_builder.AppendInteger(
@@ -9358,6 +9395,17 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
     }
 
     if (blocking_wait == nullptr) {
+      LAVIK_FAULT_INJECT({
+        auto paused = co_await fault_injection::PauseWhileFileExists(
+            "LAVIK_WAIT_BEFORE_REGISTER_HOLD_FILE");
+        if (!paused.ok())
+          co_return BuiltReply(reply_builder.AppendError(
+              absl::StrCat("ERR ", paused.message())));
+      });
+      if (ctx.closing_ || ctx.wait_peer_disconnected_) {
+        co_return BuiltReply(reply_builder.AppendError(
+            "ERR WAIT interrupted: client connection closed"));
+      }
       auto registered =
           co_await RegisterClientBlockingWait(ctx.conn_id_, deadline);
       if (!registered.ok()) {
@@ -12167,8 +12215,9 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
     if (!request.replication_origin_ &&
         cluster::GetClientMode() == ClientMode::kSingle) {
       // Composite execution shares standalone's locks and effects, with one
-      // Group proof retained through publication. Keep unrelated deferred
-      // command families explicit rather than widening their support here.
+      // Group proof retained through publication. WAIT observes the common
+      // Group replication history without holding mutation admission while
+      // replicas catch up. Keep unrelated deferred command families explicit.
       const auto flags = request.spec_ == nullptr ? 0u : request.spec_->flags_;
       const bool database_inspection =
           kind == CommandKind::kDbSize || kind == CommandKind::kScan ||
@@ -12179,7 +12228,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
           !IsLuaInvocationCommand(request);
       const bool deferred =
           kind == CommandKind::kSortRo || kind == CommandKind::kSave ||
-          kind == CommandKind::kBgSave || kind == CommandKind::kWait ||
+          kind == CommandKind::kBgSave ||
           ((flags & kCmdDynamicWrite) != 0 && kind != CommandKind::kFunction &&
            !IsLuaInvocationCommand(request)) ||
           keyless_data;

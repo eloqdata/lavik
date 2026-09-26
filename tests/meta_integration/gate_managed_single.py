@@ -145,8 +145,6 @@ def basic_and_stale(root):
             assert writer.call("MGET", "mk-a", "mk-renamed") == [None, "v3"]
             assert writer.call("BLPOP", "mk-empty", 1) == []
             for client in (writer, reader):
-                for command in (("WAIT", 1, 0),):
-                    rejects(client, command, "not yet supported")
                 rejects(client, ("REPLICAOF", "NO", "ONE"), "not allowed")
             fulls = Path(source.log_path).read_text().count("selected=FULL")
             assert writer.call("CLIENT", "KILL", "TYPE", "replica") > 0

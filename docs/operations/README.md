@@ -26,6 +26,7 @@ or safety boundaries.
 | Runbook | Use it when |
 |---|---|
 | [Quick startup tuning](quick-start-tuning.md) | Generate a CPU plan for the current host and start Lavik |
+| [Redis import](redis-import.md) | Migrate Redis/Redis Cluster through RedisShake into an isolated Meta-managed target, verify and cut over, or rebuild after interruption |
 | [Cluster deployment](cluster-deployment.md) | Launch the local Meta-managed cluster example |
 | [Building and packaging](building-and-packaging.md) | Building locally, producing release artifacts, or changing package contents |
 | [Release Docker images](../../deploy/docker/README.md) | Building/running the published beta as a standalone server or a primary/follower Compose cluster |

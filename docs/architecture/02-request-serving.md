@@ -301,7 +301,9 @@ before storage flush.
   ACK cursors cross that history-local vector. Repeated waits without another
   write reuse the cut. A blocking `WAIT` uses the keyless client-wait registry
   so deadlines, disconnect cancellation, and `CLIENT UNBLOCK` share the same
-  lifecycle as collection waits. Inside `EXEC`, `WAIT` performs only an
+  lifecycle as collection waits. A persistent connection-close flag also
+  covers disconnect or serving retirement during asynchronous fence capture,
+  before registration exists. Replicas reject `WAIT`. Inside `EXEC`, `WAIT` performs only an
   immediate check; blocking on an envelope that cannot publish until the
   transaction commits would deadlock the transaction with itself.
 - `MULTI` queues structurally validated `CommandRequest` objects with their
