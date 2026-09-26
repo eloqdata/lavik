@@ -9314,7 +9314,8 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
   std::unique_ptr<BlockingWaitHandle> blocking_wait;
 
   for (;;) {
-    if (ctx.closing_ || g_replication->is_replica()) {
+    if (ctx.closing_ || ctx.wait_peer_disconnected_ ||
+        g_replication->is_replica()) {
       co_return BuiltReply(reply_builder.AppendError(
           "ERR WAIT interrupted: client connection or primary role ended"));
     }
@@ -9356,10 +9357,11 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
       acknowledged = co_await g_replication->CountOnlineNativeReplicas();
     }
 
-    // Capture/count may suspend before a waiter exists. Connection retirement
-    // can therefore miss the registry; the connection's persistent terminal
-    // flag closes that window, including an infinite WAIT with no downstream.
-    if (ctx.closing_ || g_replication->is_replica()) {
+    // Capture/count may suspend before a waiter exists. A peer disconnect or
+    // connection retirement can therefore miss the registry; persistent
+    // flags close that window, including an infinite WAIT with no downstream.
+    if (ctx.closing_ || ctx.wait_peer_disconnected_ ||
+        g_replication->is_replica()) {
       co_return BuiltReply(reply_builder.AppendError(
           "ERR WAIT interrupted: client connection or primary role ended"));
     }
@@ -9400,7 +9402,7 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
           co_return BuiltReply(reply_builder.AppendError(
               absl::StrCat("ERR ", paused.message())));
       });
-      if (ctx.closing_) {
+      if (ctx.closing_ || ctx.wait_peer_disconnected_) {
         co_return BuiltReply(reply_builder.AppendError(
             "ERR WAIT interrupted: client connection closed"));
       }
