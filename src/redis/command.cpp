@@ -589,11 +589,13 @@ Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
 }
 
 Task<CommandReply> ExecuteReplicaOf(const CommandRequest& request,
-                                    ReplyBuilder& reply_builder) {
+                                    ReplyBuilder& reply_builder,
+                                    bool native = false) {
   // Meta owns role changes, regardless of the configured client semantics.
   if (cluster::MetaManaged()) {
     co_return BuiltReply(reply_builder.AppendError(
-        "ERR REPLICAOF not allowed in Meta-managed mode."));
+        native ? "ERR LAVIK.REPLICAOF not allowed in Meta-managed mode."
+               : "ERR REPLICAOF not allowed in Meta-managed mode."));
   }
   auto parsed = ParseReplicaOfRequest(request.args_);
   if (!parsed.ok()) {
@@ -610,7 +612,8 @@ Task<CommandReply> ExecuteReplicaOf(const CommandRequest& request,
   }
   absl::Status configured =
       co_await g_replication->ApplyDirective(ReplicationDirective{
-          .kind_ = ReplicationDirective::Kind::kSetUpstream,
+          .kind_ = native ? ReplicationDirective::Kind::kSetNativeUpstream
+                          : ReplicationDirective::Kind::kSetUpstream,
           .upstream_ = std::move(upstream),
       });
   if (!configured.ok()) {
@@ -782,6 +785,7 @@ bool LoadingAllowedCommand(const CommandRequest& request) {
     case CommandKind::kSelect:
     case CommandKind::kClient:
     case CommandKind::kReplicaOf:
+    case CommandKind::kLavikReplicaOf:
     case CommandKind::kAddReplicaOf:
     case CommandKind::kConfig:
     case CommandKind::kInfo:
@@ -1524,6 +1528,14 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       co_return BuiltReply(reply_builder.AppendError(
           "ERR CONFIG REWRITE cannot persist multiple Redis Cluster "
           "upstreams"));
+    }
+    if (replication.upstream_.has_value() &&
+        g_replication->redirects_clients_to_upstream()) {
+      // Startup replicaof always selects Redis PSYNC. Persisting this native
+      // upstream under that spelling would silently change protocols after
+      // restart, so reject the rewrite until native startup is supported.
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR CONFIG REWRITE cannot persist a LAVIK.REPLICAOF upstream"));
     }
     const bool redis_upstream = !replication.redis_sources_.empty();
     const absl::Status rewritten = RewriteRedisConfigFile(
@@ -12518,6 +12530,9 @@ Task<CommandReply> ExecuteCommandBody(
 
     case CommandKind::kReplicaOf:
       co_return co_await ExecuteReplicaOf(request, reply_builder);
+
+    case CommandKind::kLavikReplicaOf:
+      co_return co_await ExecuteReplicaOf(request, reply_builder, true);
 
     case CommandKind::kAddReplicaOf:
       co_return co_await ExecuteAddReplicaOf(request, reply_builder);

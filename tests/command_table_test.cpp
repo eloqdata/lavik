@@ -273,6 +273,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("FLUSHALL", CommandKind::kFlushAll);
   CheckKind("CONFIG", CommandKind::kConfig);
   CheckKind("REPLICAOF", CommandKind::kReplicaOf);
+  CheckKind("LAVIK.REPLICAOF", CommandKind::kLavikReplicaOf);
   CheckKind("SLAVEOF", CommandKind::kReplicaOf);
   CheckKind("ROLE", CommandKind::kRole);
   CheckKind("WAIT", CommandKind::kWait);
@@ -329,6 +330,11 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckArity("slaveof", 3, true);
   CheckArity("slaveof", 4, false);
   EXPECT_EQ(CommandCanonicalName(CommandKind::kReplicaOf), "replicaof");
+  EXPECT_EQ(CommandCanonicalName(CommandKind::kLavikReplicaOf),
+            "lavik.replicaof");
+  CheckArity("lavik.replicaof", 2, false);
+  CheckArity("lavik.replicaof", 3, true);
+  CheckArity("lavik.replicaof", 4, false);
   for (std::size_t value = 0;
        value < static_cast<std::size_t>(CommandKind::kUnknown); ++value) {
     EXPECT_NE(CommandCanonicalName(static_cast<CommandKind>(value)), "unknown");

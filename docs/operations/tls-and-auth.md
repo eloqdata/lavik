@@ -83,6 +83,24 @@ to an upstream which requires client certificates.
 `tls-replication yes` requires `tls-ca-cert-file`; only the `default`
 replication user is supported.
 
+## Following a standalone Lavik source
+
+On a Lavik node without Meta management, use `LAVIK.REPLICAOF <host> <port>`
+to follow another standalone Lavik node through the native `LVPSYNC`/`LVFLOW`
+protocol. The source must be a writable primary; a Lavik replica rejects
+another replica's attempt to attach. `LAVIK.REPLICAOF NO ONE` detaches and
+promotes through the same durability boundary as `REPLICAOF NO ONE`. Standard
+`REPLICAOF` continues to select Redis PSYNC, including when given a Lavik
+endpoint, and does not fall back to native replication.
+
+Set `masterauth` (and `masteruser default`) when the source requires a Redis
+password. For TLS, use the source's TLS port with `tls-replication yes` and a
+trusted `tls-ca-cert-file`; the same outgoing replication credentials and TLS
+identity apply to the native control and flow connections. The native command
+is runtime-only; startup `replicaof` remains a Redis PSYNC setting.
+`CONFIG REWRITE` rejects a native upstream rather than saving it as a Redis
+`replicaof` directive.
+
 ## Meta-managed TLS
 
 Meta-managed nodes establish native Lavik replication through Follow Owner,

@@ -173,17 +173,21 @@ admitted commands have drained, so their reserved events can still publish;
 only then is that history disabled. The transition replaces the desired
 upstream, disables local expiration authority, and starts consumption
 asynchronously.
-External subscription uses Redis or Redis Cluster's replication protocol. Every
-startup spelling and `ADDREPLICAOF` uses this same handshake, with no product
-identity probe or native fallback. The prepared connection is retained across
+Standard `REPLICAOF`, every startup spelling, and `ADDREPLICAOF` use Redis or
+Redis Cluster's replication protocol, with no product identity probe or native
+fallback. The prepared connection is retained across
 the role transition and consumed directly; reconnect uses normal AUTH/PSYNC
 with the saved replid/offset. A failed runtime handshake leaves the old
 subscription intact. Preparation has a ten-second deadline; a Redis background
 save that delays FULLRESYNC beyond it can require a runtime retry. Startup
 handshake failures retry while keeping the node
-fenced and recovered data intact. Lavik does not implement incoming PSYNC, so
-Lavik peers cannot establish an external subscription. Meta native relationships
-use Follow Owner instead.
+fenced and recovered data intact. `LAVIK.REPLICAOF host port` instead selects
+the native `LVPSYNC`/`LVFLOW` coordinator for a non-Meta source. It authenticates
+and probes the Lavik endpoint before changing roles, so an unreachable,
+non-Lavik, or already-replicating source leaves the current role and data intact.
+After admission it uses the native full/continue and reconnect paths. A native
+replica rejects downstream attachment; cascading is not supported. Meta native
+relationships continue to use Follow Owner instead.
 
 The retained non-Meta `REPLICAOF NO ONE` implementation uses the role-transition path
 and the same private prepare/activate kernel used by Meta-managed promotion.
@@ -217,7 +221,8 @@ the master write gate directly.
 Native cascading is not supported, so a candidate has no ordinary downstream
 session during promotion. Meta-managed replicas can adopt the promoted Owner's
 direct child through authenticated parent replay and `HistorySwitch`. External
-`REPLICAOF` cannot establish Lavik native relationships. Issuing `REPLICAOF NO ONE` while a
+`REPLICAOF` cannot establish Lavik native relationships; standalone
+`LAVIK.REPLICAOF` can. Issuing `REPLICAOF NO ONE` while a
 full sync is incomplete does not resurrect the invalidated population; the
 node remains fenced rather than exposing the pre-sync state.
 
@@ -1227,11 +1232,12 @@ unrelated work between the management commands; the role transition itself
 provides the storage admission boundary.
 
 `CONFIG REWRITE` preserves unmanaged directives and atomically replaces the
-configured upstream mode plus `replica-priority` through a synced temporary
-file, rename, and directory sync. It rejects a node with multiple Redis Cluster
-upstreams because that topology cannot be represented by one Redis config
-directive. These command and status shapes do not imply external Sentinel
-HA support: a new native upstream still requires Meta authorization.
+configured Redis upstream mode plus `replica-priority` through a synced
+temporary file, rename, and directory sync. It rejects multiple Redis Cluster
+upstreams and a native `LAVIK.REPLICAOF` upstream because neither can be
+represented by a startup config directive. These command and status shapes do
+not imply external Sentinel HA support. Meta-managed native source changes
+still require Meta authorization.
 
 ## Configuration and observability
 
@@ -1241,11 +1247,12 @@ HA support: a new native upstream still requires Meta authorization.
 | `replica-serve-stale-data` | Managed Single complete replicas remain readable during link loss by default (`yes`); file configuration and CONFIG GET/SET accept `yes` or `no` |
 | Cluster control adapter | Node-controller-only source rebuild and source-less first-population admission/completion handles, population status, and source authorize/revoke APIs; Meta transport remains outside `ReplicationManager` |
 | `replicaof host port` / `REPLICAOF` | Non-Meta Redis/Redis Cluster subscription with PSYNC handshake before changing roles; Lavik native upstreams are rejected |
+| `LAVIK.REPLICAOF host port` | Explicit non-Meta native Lavik subscription through LVPSYNC/LVFLOW; preflight rejects replicas and non-Lavik sources without changing roles |
 | `redis-replicaof host port` / `--redis-replicaof` | Explicit non-Meta startup Redis PSYNC source; uses the same handshake |
 | `ADDREPLICAOF host port` | Standalone runtime addition of a disjoint master with matching slot layout; rejected in cluster-managed mode |
 | `replica-read-only` | Startup write policy; `REPLICAOF NO ONE` is writable regardless |
 | `replica-priority` | Startup/runtime Sentinel election priority, default 100; zero is ineligible and lower nonzero values are preferred |
-| `CONFIG REWRITE` | Atomically persists the current single upstream mode and `replica-priority`; unavailable without a config file or with multiple Redis Cluster sources |
+| `CONFIG REWRITE` | Atomically persists a single Redis upstream mode and `replica-priority`; unavailable without a config file, with multiple Redis Cluster sources, or while following a native Lavik source |
 | `tls-replication`, `masteruser`, `masterauth` | Outgoing control and every data connection; only the `default` user is supported |
 | `repl-backlog-size` | Startup/CLI/runtime global backlog, default 1 GiB; at least one 8 MiB block per worker |
 | `replication-backlog-backpressure` | Startup/CLI/runtime retained-history policy, default `yes`; `no` prefers primary write availability by forcing lagging consumers to full-sync at capacity |
