@@ -10687,9 +10687,10 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
   // discovered before taking the transaction's static lock set. Isolate this
   // uncommon read-only SORT case with the existing database cut. Take the
   // publisher order first, but never drain while holding it: an admitted
-  // command may itself need that order to finish. Retry the entire cut until
-  // it is empty. FULL's snapshot cut can wait for these gates without this
-  // EXEC waiting back on its snapshot-transaction gate.
+  // command may itself need that order to finish. Retry the entire cut for
+  // a bounded interval, then refuse before child effects. FULL can wait for
+  // these gates without this EXEC waiting back on its snapshot-transaction
+  // gate.
   struct PatternCut {
     bool active = false;
     bool expiration = false;
@@ -10708,17 +10709,31 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
       [&](ReplicationPublisherAdmission* admission = nullptr,
           std::size_t logical_bytes = 0) -> Task<absl::Status> {
     if (!needs_pattern_cut || ctx.multi_dirty_) co_return absl::OkStatus();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
     for (;;) {
-      auto status = co_await BeginReplicationTransactionOrder(&pattern_order);
-      if (!status.ok()) co_return status;
-      if (CloseAllCommandDbGates()) {
-        if (!CommandDbOperationsActive()) {
-          pattern_cut.active = true;
-          break;
-        }
-        OpenAllCommandDbGates();
+      // Bound cut contention, not publisher-capacity or disk I/O waits.
+      // Recheck after every awaited reservation renewal, before child effects.
+      if (std::chrono::steady_clock::now() >= deadline) {
+        co_return absl::DeadlineExceededError(
+            "SORT_RO transaction could not acquire database cut; retry "
+            "transaction");
       }
-      pattern_order.Release();
+      // Do not close admission on unrelated clients while already known busy.
+      // A second count check after closing covers arrivals racing this probe.
+      // Never queue for order: that wait would evade the cut deadline.
+      if (!CommandDbOperationsActive() &&
+          TryBeginReplicationTransactionOrder()) {
+        pattern_order.Activate();
+        if (CloseAllCommandDbGates()) {
+          if (!CommandDbOperationsActive()) {
+            pattern_cut.active = true;
+            break;
+          }
+          OpenAllCommandDbGates();
+        }
+        pattern_order.Release();
+      }
       // FULL may own these gates while fencing its publisher. Return reserved
       // capacity before waiting, including on a busy cut, so that fence can
       // always make progress. Retry admission before taking order again.
@@ -10777,7 +10792,10 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
     if (!cut.ok()) {
       ctx.ResetMulti();
       co_await DropWatches(ctx);
-      co_return BuiltReply(AppendStorageError(reply_builder, cut));
+      co_return BuiltReply(
+          absl::IsDeadlineExceeded(cut)
+              ? AppendTryAgainError(reply_builder, cut.message())
+              : AppendStorageError(reply_builder, cut));
     }
     co_return co_await ExecuteExecBody(
         ctx, reply_builder, write_admission_role_epoch, nullptr, nullptr,
@@ -10808,7 +10826,9 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
     (void)co_await ReleaseReplicationPublisherAdmission(*admission);
     ctx.ResetMulti();
     co_await DropWatches(ctx);
-    co_return BuiltReply(AppendStorageError(reply_builder, cut));
+    co_return BuiltReply(absl::IsDeadlineExceeded(cut)
+                             ? AppendTryAgainError(reply_builder, cut.message())
+                             : AppendStorageError(reply_builder, cut));
   }
   ActivePublisherAdmissionGuard active_admission(&*admission);
   bool admission_released = false;

@@ -341,6 +341,81 @@ def saving(root, mode):
         assert persistence(writer)["rdb_last_bgsave_status"] == "ok"
 
 
+def pattern_exec_busy_cut(root):
+    # A held DB operation models overlapping traffic that never leaves an
+    # empty global cut. EXEC must refuse before effects instead of retrying
+    # forever or repeatedly closing gates on unrelated transactions.
+    hold = root / "pattern-busy.hold"
+    with pair(
+        root,
+        "pattern-busy",
+        client_mode="single",
+        source_faults={
+            "LAVIK_DB_OPERATION_HOLD_KEY": "held-read",
+            "LAVIK_DB_OPERATION_HOLD_FILE": str(hold),
+        },
+    ) as (meta, source, target, writer):
+        ready(meta)
+        assert writer.call("RPUSH", "ids", "2", "1") == 2
+        assert writer.call("MSET", "weight_1", 1, "weight_2", 2) == "OK"
+        blocked = Client(source)
+        probe = Client(source)
+        try:
+            assert blocked.call("SELECT", 15) == "OK"
+            hold.touch()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                held = pool.submit(blocked.call, "GET", "held-read")
+                try:
+                    reached(source, "LAVIK_DB_OPERATION_HOLD_FILE")
+                    for write in (False, True):
+                        assert writer.call("WATCH", "watched") == "OK"
+                        assert writer.call("MULTI") == "OK"
+                        if write:
+                            assert writer.call("SET", "no-effect", "value") == "QUEUED"
+                        assert (
+                            writer.call("SORT_RO", "ids", "BY", "weight_*") == "QUEUED"
+                        )
+                        pending = pool.submit(outcome, writer, ("EXEC",))
+                        # Even while the pattern cut is busy, unrelated EXECs
+                        # retain admission and complete without TRYAGAIN.
+                        for _ in range(50):
+                            assert probe.call("MULTI") == "OK"
+                            assert probe.call("SET", "progress", "ok") == "QUEUED"
+                            assert probe.call("EXEC") == ["OK"]
+                            assert (
+                                probe.call("COPY", "progress", "copy", "REPLACE") == 1
+                            )
+                        assert pending.result(timeout=8) == (
+                            "error",
+                            "TRYAGAIN SORT_RO transaction could not acquire database cut; retry transaction",
+                        )
+                        assert writer.call("GET", "no-effect") is None
+                        assert probe.call("INCR", "watched") == (2 if write else 1)
+                        assert writer.call("MULTI") == "OK"
+                        assert writer.call("GET", "no-effect") == "QUEUED"
+                        assert writer.call("EXEC") == [None]
+                finally:
+                    hold.unlink(missing_ok=True)
+                assert held.result(timeout=10) is None
+            assert writer.call("MULTI") == "OK"
+            assert writer.call("SET", "no-effect", "value") == "QUEUED"
+            assert writer.call("SORT_RO", "ids", "BY", "weight_*") == "QUEUED"
+            assert writer.call("EXEC") == ["OK", ["1", "2"]]
+            reader = Client(target)
+            try:
+                H.wait_until(
+                    "retry publishes after busy cut",
+                    30,
+                    lambda: reader.call("GET", "no-effect") == "value",
+                )
+            finally:
+                reader.close()
+        finally:
+            hold.unlink(missing_ok=True)
+            blocked.close()
+            probe.close()
+
+
 def pattern_exec_pressure(root):
     # FULL publisher credit is deliberately smaller than the combined requests.
     # A pattern EXEC must reserve credit before closing DB/order admission.
@@ -657,6 +732,7 @@ def main():
         prefix="sort-save-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
     ) as directory:
         if "--save" in sys.argv:
+            pattern_exec_busy_cut(Path(directory))
             pattern_exec_pressure(Path(directory))
             pattern_exec_full_cut(Path(directory))
         for mode in ("single", "cluster"):

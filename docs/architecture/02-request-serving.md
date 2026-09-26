@@ -376,8 +376,12 @@ exclusive database cut across the whole transaction and quiesces expiration.
 This allows patterns to observe earlier transaction writes without extending
 its static key lock set. The cut trades concurrent database access for atomic
 execution of this uncommon dynamic-key case; ordinary sorting and scripts
-retain their keyed paths. Cluster SORT_RO follows Redis 7.2.14 and rejects
-wildcard BY and every GET option, including GET #.
+retain their keyed paths. Under sustained contention, pattern EXEC can return
+TRYAGAIN before any child effects after a five-second cut-acquisition window;
+this bounds admission retries, not publisher-capacity or disk I/O waits.
+Unsuccessful attempts release publication order and reserved capacity so FULL
+and already admitted commands can progress. Cluster SORT_RO follows Redis
+7.2.14 and rejects wildcard BY and every GET option, including GET #.
 Write effects, blocking notifications, durable transaction receipts, and
 replication effects remain attached to the outer invocation rather than
 becoming independent commands.
