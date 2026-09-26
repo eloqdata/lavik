@@ -181,9 +181,11 @@ with the saved replid/offset. A failed runtime handshake leaves the old
 subscription intact. Preparation has a ten-second deadline; a Redis background
 save that delays FULLRESYNC beyond it can require a runtime retry. Startup
 handshake failures retry while keeping the node
-fenced and recovered data intact. Lavik does not implement incoming PSYNC, so
-Lavik peers cannot establish an external subscription. Meta native relationships
-use Follow Owner instead.
+fenced and recovered data intact. The Redis-protocol follower requests a
+length-delimited RDB and does not advertise EOF capability. Lavik's Redis PSYNC
+export requires EOF capability, so `REPLICAOF` pointed at another Lavik node
+fails this handshake; native Lavik relationships use Follow Owner and
+`LVPSYNC`/`LVFLOW` instead.
 
 The retained non-Meta `REPLICAOF NO ONE` implementation uses the role-transition path
 and the same private prepare/activate kernel used by Meta-managed promotion.
@@ -1143,11 +1145,12 @@ is documented under [current limitations](#invariants-failures-and-current-limit
 
 ### Following Redis
 
-A Redis follower authenticates, sends PING, advertises its listening port and
-PSYNC2 capability, and requests either its process-local replid/offset or a
-fresh full synchronization. FULLRESYNC receives a length-delimited RDB into a
-temporary file. Import is serialized, closes and drains command database
-gates, resets the source-owned slots, validates ownership, and restores values.
+Lavik's Redis-protocol follower authenticates, sends PING, advertises its
+listening port and PSYNC2 capability, and requests either its process-local
+replid/offset or a fresh full synchronization. FULLRESYNC receives a
+length-delimited RDB into a temporary file. Import is serialized, closes and
+drains command database gates, resets the source-owned slots, validates
+ownership, and restores values.
 Collection input is prevalidated and then consumed as admitted pages on the
 key owner, with one atomic ingest decision per complete key rather than a
 whole-object compact buffer. Packed collections and quicklist nodes are
