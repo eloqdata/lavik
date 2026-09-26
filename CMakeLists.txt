@@ -1111,6 +1111,29 @@ if (BUILD_TESTING)
       set_tests_properties(meta_integration.gate_function_catalog PROPERTIES
         LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
 
+      add_test(
+        NAME meta_integration.gate_managed_flush
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_managed_flush.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+                semantics)
+      set_tests_properties(meta_integration.gate_managed_flush PROPERTIES
+        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+      if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR LAVIK_ENABLE_TEST_FAULTS)
+        foreach(scenario authority storage reclaim drain replication)
+          add_test(
+            NAME meta_integration.gate_managed_flush_${scenario}
+            COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_managed_flush.py
+                    $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                    $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+                    ${scenario})
+          set_tests_properties(meta_integration.gate_managed_flush_${scenario} PROPERTIES
+            LABELS meta-integration TIMEOUT 900 RUN_SERIAL TRUE)
+        endforeach()
+      endif()
+
       # lavik-meta's deterministic failover seams follow the ordinary
       # !NDEBUG policy; LAVIK_ENABLE_TEST_FAULTS instruments only Data.
       # Do not register a Release gate that can only fail its required-hook

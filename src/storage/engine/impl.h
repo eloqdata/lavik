@@ -2564,17 +2564,20 @@ class StorageEngine::Impl {
     return DbEpoch(db_id);
   }
 
-  Task<absl::Status> FlushDbDetach(std::uint8_t db_id);
-  Task<absl::Status> FlushAllDetach();
+  Task<absl::Status> FlushDbDetach(
+      std::uint8_t db_id, MutationPrecondition mutation_precondition = {});
+  Task<absl::Status> FlushAllDetach(
+      MutationPrecondition mutation_precondition = {});
 
   Task<absl::Status> FlushDbReclaim(bool wait) {
     return ReclaimDetachedAllWorkers(wait);
   }
 
-  Task<absl::Status> PublishFlushDbReplication(std::uint8_t db_id,
-                                               std::uint64_t db_epoch);
-  Task<absl::Status> PublishFlushAllReplication(
+  Task<absl::StatusOr<PreparedFlushPublication>> PrepareFlushReplication(
+      std::optional<std::uint8_t> db_id,
       const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs);
+  Task<absl::Status> PublishFlushReplication(
+      PreparedFlushPublication publication);
 
   Task<absl::Status> ApplyReplicatedFlushDb(std::uint8_t db_id,
                                             std::uint64_t source_db_epoch);
@@ -2589,9 +2592,12 @@ class StorageEngine::Impl {
   // The epoch has to reach the device before any index is detached. Crashing in
   // the other order leaves records on disk whose epoch still matches, and
   // recovery would resurrect the whole flushed database.
-  Task<absl::Status> DetachDbEpoch(std::uint8_t db_id, std::uint64_t next);
+  Task<absl::Status> DetachDbEpoch(
+      std::uint8_t db_id, std::uint64_t next,
+      MutationPrecondition mutation_precondition = {});
   Task<absl::Status> DetachDbEpochs(
-      const std::array<std::uint64_t, kLogicalDatabaseCount>& next);
+      const std::array<std::uint64_t, kLogicalDatabaseCount>& next,
+      MutationPrecondition mutation_precondition = {});
 
   // Retires what DetachDbEpoch took out of service. Runs with the gate open and
   // ordinary traffic flowing. `wait` is the difference between FLUSHDB SYNC and
@@ -3105,19 +3111,34 @@ class StorageEngine::Impl {
 
   Task<absl::Status> ReturnColdBlocks(std::vector<std::uint64_t> block_ids);
 
+  // Device tasks are joined serially, so this commit state has one owner at
+  // a time. A successful first check makes later device writes non-cancellable.
+  struct EpochMutation {
+    MutationPrecondition precondition_;
+    bool started_ = false;
+
+    absl::Status BeginWrite() {
+      if (started_) return absl::OkStatus();
+      absl::Status status = precondition_.Validate();
+      if (status.ok()) started_ = true;
+      return status;
+    }
+  };
+
   Task<absl::Status> PersistEpochValueOnDeviceLocal(std::size_t device_index,
                                                     std::size_t value_index,
-                                                    std::uint64_t epoch);
-
+                                                    std::uint64_t epoch,
+                                                    EpochMutation& mutation);
   Task<absl::Status> PersistEpochValuesOnDeviceLocal(
       std::size_t device_index,
-      std::span<const std::pair<std::size_t, std::uint64_t>> values);
-
-  Task<absl::Status> PersistEpochValue(std::size_t value_index,
-                                       std::uint64_t epoch);
-
+      std::span<const std::pair<std::size_t, std::uint64_t>> values,
+      EpochMutation& mutation);
+  Task<absl::Status> PersistEpochValue(
+      std::size_t value_index, std::uint64_t epoch,
+      MutationPrecondition mutation_precondition = {});
   Task<absl::Status> PersistEpochValues(
-      std::span<const std::pair<std::size_t, std::uint64_t>> values);
+      std::span<const std::pair<std::size_t, std::uint64_t>> values,
+      MutationPrecondition mutation_precondition = {});
 
   Task<absl::Status> PersistCheckpointRootOnDeviceLocal(
       std::size_t device_index, const CheckpointRoot& root);

@@ -49,6 +49,24 @@ authoritative for mutation ordering and durability. Replication-origin
 commands re-enter those paths with client role checks bypassed and publication
 disabled.
 
+FLUSH publishes one control barrier to every source flow, carrying the selected
+DB epoch or the complete 16-DB epoch vector. The command reserves publisher
+capacity and holds the common cross-flow publication order across its DB cut.
+Barrier identity, target-epoch validation and each worker's history-bound
+payload are prepared before the first irreversible epoch write. Publication
+consumes those values after durable detach; the receiver applies the clear
+only when all flows rendezvous at the same history-local barrier. Epoch changes
+also invalidate any active FULL capture, which restarts from the new epochs.
+
+As with ordinary asynchronous writes, local FLUSH success does not wait for
+replica ACKs. A failed enqueue invalidates the existing history; normal session
+cancellation aborts incomplete barriers and the replacement history requires
+FULL. No FLUSH-specific process fence is added, and a prepared old-history
+event cannot enter a new history. A control-plane rebuild explicitly bound to
+the discarded history still needs its corresponding task update. SYNC changes
+local reclamation waiting only; it does not strengthen replication durability
+or provide an atomic clear across Groups.
+
 The source backlog is deliberately not durable. It is process-local memory
 used for connected downstreams and bounded reconnects. Target records,
 Function catalog, full-sync invalidation, population eligibility, and

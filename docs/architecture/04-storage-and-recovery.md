@@ -838,7 +838,22 @@ the affected per-partition indexes. Recovery therefore rejects the old
 population even if the process stops before online reclamation finishes. The
 database is observably empty after detach; SYNC waits for detached-index
 retirement, while ASYNC ensures the same background reclaimer runs without
-waiting for it.
+waiting for it. Reclamation is started on every worker before SYNC awaits any
+worker, and runs after command gates, publication order and Group drain are
+released. A wait or retirement error propagates without repeating the committed
+flush or completed retirement. Neither SYNC nor ASYNC promises that every
+obsolete disk extent is immediately reusable.
+
+Managed command callers pass a mutation precondition down to device epoch
+persistence. After the device owner acquires its allocator lock and IO buffer,
+the first write validates that precondition before changing pending metadata.
+The serial device loop shares one commit-start flag: later devices and detach
+cannot cancel an already started commit on authority revocation. Standalone,
+trusted replay and internal recovery omit the precondition. Short writes and
+write/synchronization failures propagate and latch the existing storage fault;
+FLUSH adds no retry or online repair. Recovery takes the maximum valid epoch
+across devices, including a partial device-set commit, so an IO error does not
+prove that the old keyspace survives. The A/B page format is unchanged.
 
 Native FULL rebuild uses the analogous partition-epoch boundary for all 16,384
 physical partitions, even when the desired cluster manifest is sparse. Each

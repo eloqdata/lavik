@@ -20,6 +20,7 @@
 #include <optional>
 
 #include "impl.h"
+#include "lavik/fault_pause.h"
 #include "lavik/memory.h"
 #include "lavik/replication_command.h"
 
@@ -1192,11 +1193,16 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::PublishFlushDbReplication(
-    std::uint8_t db_id, std::uint64_t db_epoch) {
-  if (db_id >= kLogicalDatabaseCount || db_epoch == 0) {
-    co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                           "invalid FLUSHDB replication barrier");
+Task<absl::StatusOr<PreparedFlushPublication>>
+StorageEngine::Impl::PrepareFlushReplication(
+    std::optional<std::uint8_t> db_id,
+    const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs) {
+  if ((db_id.has_value() &&
+       (*db_id >= kLogicalDatabaseCount || db_epochs[*db_id] == 0)) ||
+      (!db_id.has_value() &&
+       std::any_of(db_epochs.begin(), db_epochs.end(),
+                   [](std::uint64_t epoch) { return epoch == 0; }))) {
+    co_return absl::InvalidArgumentError("invalid FLUSH replication barrier");
   }
   const std::uint64_t barrier_id =
       next_replication_control_id_.fetch_add(1, std::memory_order_relaxed);
@@ -1207,77 +1213,82 @@ Task<absl::Status> StorageEngine::Impl::PublishFlushDbReplication(
     co_return absl::OutOfRangeError(
         "replication control barrier identity exhausted");
   }
-  for (unsigned target = 0; target < worker_count_; ++target) {
-    auto publish = [this, db_id, db_epoch, barrier_id]() -> Task<absl::Status> {
-      if (ReplicationLogActive()) {
-        (void)TryEnqueueReplicationCommand(ReplicationCommandAppend{
-            .kind_ = ReplicationEventKind::kControl,
-            .db_id_ = db_id,
-            // Control events do not belong to a partition. Zero is the
-            // canonical transport placeholder; receivers key the barrier by
-            // its explicit history-local identity carried in the payload.
-            .partition_id_ = 0,
-            .partition_sequence_ = barrier_id,
-            .args_ = {"FLUSHDB", std::to_string(barrier_id),
-                      std::to_string(db_epoch)},
-        });
-      }
-      co_return absl::OkStatus();
-    };
-    absl::Status published;
-    if (target == bycorf::ThisWorker().id_) {
-      published = co_await publish();
-    } else {
-      published = co_await bycorf::SubmitTaskTo(target, publish);
+  try {
+    std::vector<std::string> args{db_id ? "FLUSHDB" : "FLUSHALL",
+                                  std::to_string(barrier_id)};
+    if (db_id)
+      args.push_back(std::to_string(db_epochs[*db_id]));
+    else
+      for (const auto epoch : db_epochs) args.push_back(std::to_string(epoch));
+    PreparedFlushPublication publication;
+    publication.flows_.reserve(worker_count_);
+    for (unsigned target = 0; target < worker_count_; ++target) {
+      auto capture = [this]() -> Task<std::uint64_t> {
+        co_return CurrentStore().replication_log_.log_epoch_;
+      };
+      std::uint64_t epoch;
+      if (target == bycorf::ThisWorker().id_)
+        epoch = co_await capture();
+      else
+        epoch = co_await bycorf::SubmitTaskTo(target, capture);
+      publication.flows_.push_back({
+          .log_epoch_ = epoch,
+          .command_ =
+              {
+                  .kind_ = ReplicationEventKind::kControl,
+                  .db_id_ = db_id.value_or(0),
+                  // Control barriers are history-local, not partition
+                  // mutations.
+                  .partition_id_ = 0,
+                  .partition_sequence_ = barrier_id,
+                  .args_ = args,
+              },
+      });
     }
-    if (!published.ok()) co_return published;
+    co_return publication;
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError(
+        "FLUSH publication allocation failed");
+  } catch (const std::length_error&) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("FLUSH publication is too large");
   }
-  co_return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::PublishFlushAllReplication(
-    const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs) {
-  if (std::any_of(db_epochs.begin(), db_epochs.end(),
-                  [](std::uint64_t epoch) { return epoch == 0; })) {
-    co_return absl::InvalidArgumentError(
-        "invalid FLUSHALL replication barrier");
-  }
-  const std::uint64_t barrier_id =
-      next_replication_control_id_.fetch_add(1, std::memory_order_relaxed);
-  if (barrier_id == 0 ||
-      barrier_id == std::numeric_limits<std::uint64_t>::max()) {
-    next_replication_control_id_.store(
-        std::numeric_limits<std::uint64_t>::max(), std::memory_order_relaxed);
-    co_return absl::OutOfRangeError(
-        "replication control barrier identity exhausted");
-  }
-  std::vector<std::string> args;
-  args.reserve(2 + kLogicalDatabaseCount);
-  args.emplace_back("FLUSHALL");
-  args.push_back(std::to_string(barrier_id));
-  for (const std::uint64_t epoch : db_epochs) {
-    args.push_back(std::to_string(epoch));
-  }
+Task<absl::Status> StorageEngine::Impl::PublishFlushReplication(
+    PreparedFlushPublication publication) {
+  assert(publication.flows_.size() == worker_count_);
   for (unsigned target = 0; target < worker_count_; ++target) {
-    auto publish = [this, barrier_id, args]() mutable -> Task<absl::Status> {
-      if (ReplicationLogActive()) {
-        (void)TryEnqueueReplicationCommand(ReplicationCommandAppend{
-            .kind_ = ReplicationEventKind::kControl,
-            .db_id_ = 0,
-            .partition_id_ = 0,
-            .partition_sequence_ = barrier_id,
-            .args_ = std::move(args),
-        });
+    auto publish = [this, target,
+                    flow = std::move(publication.flows_[target])]() mutable
+        -> Task<absl::Status> {
+      auto& log = CurrentStore().replication_log_;
+      // Never put an old-history barrier into a replacement history. Failed
+      // enqueue already invalidates the flow, as for ordinary writes; its
+      // sessions are cancelled and rebuilt by the replication manager.
+      LAVIK_FAULT_INJECT(if (target == 1) {
+        const char* fail = std::getenv("LAVIK_FLUSH_PUBLISH_FAIL_FILE");
+        if (fail != nullptr && ::access(fail, F_OK) == 0) {
+          // A prefix of flows already received the barrier. Exercise ordinary
+          // history invalidation and session/barrier cancellation from here.
+          log.state_ = ReplicationLogState::kInvalid;
+        }
+      });
+      if (log.log_epoch_ == flow.log_epoch_ && ReplicationLogActive()) {
+        (void)TryEnqueueReplicationCommand(std::move(flow.command_));
       }
       co_return absl::OkStatus();
     };
-    absl::Status published;
-    if (target == bycorf::ThisWorker().id_) {
-      published = co_await publish();
-    } else {
-      published = co_await bycorf::SubmitTaskTo(target, std::move(publish));
-    }
-    if (!published.ok()) co_return published;
+    if (target == bycorf::ThisWorker().id_)
+      co_await publish();
+    else
+      co_await bycorf::SubmitTaskTo(target, std::move(publish));
+    LAVIK_FAULT_INJECT(if (target == 0) {
+      auto paused = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_FLUSH_AFTER_FIRST_FLOW_HOLD_FILE");
+      if (!paused.ok()) co_return paused;
+    });
   }
   co_return absl::OkStatus();
 }

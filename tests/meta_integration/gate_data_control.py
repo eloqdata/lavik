@@ -468,16 +468,12 @@ def run_plaintext(meta_binary, data_binary, workdir):
         data.start()
         assert_authority_challenge_denied(data, leader)
         assert_keyed_write_fenced(data, "unready assignment")
-        # Global keyspace clearing remains unsupported. Catalog commands use
-        # the local Group and must respect this unready assignment, while
-        # KILL/STATS bypass loading so run control cannot deadlock population.
+        # Keyspace and catalog mutations bind to the local Group and respect
+        # this unready assignment. KILL/STATS remain loading diagnostics.
         for command in (["FLUSHDB"], ["FLUSHALL"]):
-            expected = f"-ERR {command[0]} is not allowed in Meta-managed mode"
             actual = data.command_head(command)
-            if actual != expected:
-                raise H.Failure(
-                    f"finite-authority global mutation gate: {actual}, want {expected}"
-                )
+            if not actual.startswith(("-LOADING", "-CLUSTERDOWN")):
+                raise H.Failure(f"unready Group accepted {command}: {actual}")
         for command in (
             ["FUNCTION", "LOAD", "invalid"],
             ["FUNCTION", "DELETE", "missing"],

@@ -632,6 +632,23 @@ struct PreparedReplicationCommandPublication {
       PreparedReplicationCommandPublication&&) noexcept = default;
 };
 
+// A history-bound FLUSH barrier prepared before the first epoch write. Each
+// worker receives its own payload; publication consumes the value once.
+struct PreparedFlushPublication {
+  struct Flow {
+    std::uint64_t log_epoch_ = 0;
+    ReplicationCommandAppend command_;
+  };
+  std::vector<Flow> flows_;
+
+  PreparedFlushPublication() = default;
+  PreparedFlushPublication(const PreparedFlushPublication&) = delete;
+  PreparedFlushPublication& operator=(const PreparedFlushPublication&) = delete;
+  PreparedFlushPublication(PreparedFlushPublication&&) noexcept = default;
+  PreparedFlushPublication& operator=(PreparedFlushPublication&&) noexcept =
+      default;
+};
+
 // Optional owner-local scope for publisher admission. A simple keyed command
 // supplies its exact logical destination so full-sync sessions that have not
 // started that (partition, DB) do not backpressure an unrelated write. Complex
@@ -1298,12 +1315,17 @@ class StorageEngine {
   // taking its indexes out of service. The command layer must prevent
   // concurrent operations in that DB while this coroutine runs, and may allow
   // them again as soon as it returns: the DB is observably empty from here on.
+  // The precondition is checked after device admission, immediately before the
+  // first epoch write. Later revocation cannot cancel a partially written epoch
+  // set. IO failures still propagate and do not imply that nothing was cleared.
   // Cost is bounded by the partition count, not by the number of keys.
-  bycorf::Task<absl::Status> FlushDbDetach(std::uint8_t db_id);
+  bycorf::Task<absl::Status> FlushDbDetach(
+      std::uint8_t db_id, MutationPrecondition mutation_precondition = {});
   // Advances all 16 DB epochs in one metadata-page update and detaches every
   // database under one per-worker store critical section. The caller holds
   // all command DB gates.
-  bycorf::Task<absl::Status> FlushAllDetach();
+  bycorf::Task<absl::Status> FlushAllDetach(
+      MutationPrecondition mutation_precondition = {});
 
   // Retires what FlushDbDetach took out of service, subtracting it from the
   // block accounting and freeing it. Safe to run with the DB open and serving.
@@ -1311,15 +1333,18 @@ class StorageEngine {
   // either way, and only the caller's completion differs.
   bycorf::Task<absl::Status> FlushDbReclaim(bool wait);
   std::uint64_t DbEpoch(std::uint8_t db_id) const noexcept;
-  // Broadcasts one DB-epoch control barrier to every active source-worker
-  // flow. The caller keeps the DB gate closed until this completes.
-  bycorf::Task<absl::Status> PublishFlushDbReplication(std::uint8_t db_id,
-                                                       std::uint64_t db_epoch);
-  // Broadcasts one control barrier carrying the complete database-epoch
-  // vector. It is one logical event on every source flow, not sixteen
-  // independent FLUSHDB barriers.
-  bycorf::Task<absl::Status> PublishFlushAllReplication(
+  // Prepares the history-local identity and all flow payloads before detach.
+  // A missing db_id denotes FLUSHALL. Callers hold publisher admission, the
+  // cross-flow publication order and all target DB gates through publication.
+  bycorf::Task<absl::StatusOr<PreparedFlushPublication>>
+  PrepareFlushReplication(
+      std::optional<std::uint8_t> db_id,
       const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs);
+  // Consumes the prepared all-flow barrier. Lost history follows ordinary
+  // asynchronous writes: session cancellation/reset and FULL recovery, without
+  // turning an already committed local flush into a client storage failure.
+  bycorf::Task<absl::Status> PublishFlushReplication(
+      PreparedFlushPublication publication);
   // Replica-side application after the receiver has collected this barrier
   // from every source flow.
   bycorf::Task<absl::Status> ApplyReplicatedFlushDb(std::uint8_t db_id,

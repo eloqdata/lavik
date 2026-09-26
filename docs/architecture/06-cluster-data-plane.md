@@ -814,7 +814,7 @@ RESP3. Deliberately unsupported administrative mutations use stable Lavik
 | `SELECT` with a nonzero index | `-ERR SELECT is not allowed in cluster mode` |
 | `COPY` with a `DB` option | `-ERR Copying to another database is not allowed in cluster mode` |
 | `REPLICAOF` / `ADDREPLICAOF` | `-ERR REPLICAOF not allowed in cluster mode.` |
-| `FLUSHDB` or `FLUSHALL` | `-ERR <command> is not allowed in cluster mode` |
+| `FLUSHDB` or `FLUSHALL` | Clears DB0 in the receiving node's Group under Group write authority |
 | Unknown `CLUSTER` subcommand or wrong arity | `-ERR Unknown CLUSTER subcommand or wrong number of arguments for '<sub>'` |
 | Execution outcome undeterminable | No reply; the connection is closed |
 
@@ -834,8 +834,17 @@ slot, and `redis.call` access outside the admitted slot set is rejected with
 Redis's non-local-key error. In Cluster mode, read-only global commands and
 process-local administration (INFO, CONFIG, DBSIZE, SCAN, SCRIPT cache management,
 and similar) keep node-local semantics and are governed only by readiness.
-Cluster nodes reject `FLUSHDB` and `FLUSHALL` until their global mutation
-lifecycle is wired into Group authority. `FUNCTION LOAD`, `DELETE`, `FLUSH`,
+`FLUSHDB` and `FLUSHALL` bind to the receiving node's Group through the same
+local-Group admission, role/population checks and in-flight drain. Cluster
+clears only that Group's DB0; Single clears the selected DB or all DB0–15.
+Neither command affects another Group or the Function catalog. After closing
+and draining every target DB gate, FLUSH registers its Group guard and checks
+the captured authority on the first device owner, after allocator and buffer
+waits and immediately before the first epoch write. A rejected check leaves
+epochs and indexes unchanged. Once that write begins, the command retains its
+drain through all device writes, detach and replication publication; later
+revocation cannot recast a completed flush as a retryable authority rejection.
+Storage failures keep their existing error and fault-latch behavior. `FUNCTION LOAD`, `DELETE`, `FLUSH`,
 and `RESTORE` bind to the receiving node's member Group through the common
 authority gate. They update only that Group's local replicated catalog; other
 Groups are independent. `FUNCTION DUMP` and `LIST` inspect the local catalog,
@@ -859,8 +868,7 @@ the ordinary Single replica-read policy. KEYS retains its exclusive database
 gate throughout its streamed reply. Still rejected with explicit unsupported
 errors, each because its execution context is not yet wired into Group
 authority: transactions (MULTI/EXEC/WATCH queue commands into a separate
-execution context), scripts and Function invocation, global durable mutations
-such as FLUSHDB/FLUSHALL, stream blocking (XREAD/XREADGROUP wait on distinct
+execution context), scripts and Function invocation, stream blocking (XREAD/XREADGROUP wait on distinct
 lanes and XREADGROUP mutates consumer-group state), and keyless `WAIT`.
 Function catalog management uses that same sole Group's admission and drain:
 LOAD/DELETE/FLUSH/RESTORE share one mutation lifecycle and final authority

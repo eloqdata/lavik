@@ -26,7 +26,8 @@ be changed after creation.
 Managed Single has exactly one Group covering every slot and all 16 logical
 databases. It serves single-key commands, collections, TTL, PUBLISH, cross-slot
 multi-key commands, cross-database COPY, List/Sorted Set blocking commands,
-DBSIZE/SCAN/RANDOMKEY/KEYS, and FUNCTION LOAD/DELETE/FLUSH/RESTORE through
+DBSIZE/SCAN/RANDOMKEY/KEYS, FLUSHDB/FLUSHALL, and FUNCTION
+LOAD/DELETE/FLUSH/RESTORE through
 shared Group authority. Function libraries are shared across DB0–15;
 FUNCTION DUMP/LIST work on the Owner and complete readable replicas.
 Complete replicas accept ordinary read connections without READONLY. Configure
@@ -34,9 +35,9 @@ Complete replicas accept ordinary read connections without READONLY. Configure
 `yes` permits complete stale data during disconnection. `no` returns MASTERDOWN
 for data requests while the replication link is down. Initial FULL and invalid
 populations return LOADING in either setting; replicas always reject mutations.
-Transactions, scripts/FCALL, Stream blocking, WAIT and FLUSHDB/FLUSHALL
-remain explicitly unsupported in managed Single. An uncertain Function
-catalog root commit or failure to publish an already durable mutation fences
+Transactions, scripts/FCALL, Stream blocking and WAIT remain explicitly
+unsupported in managed Single. An uncertain Function
+catalog root commit or failure to publish an already durable catalog mutation fences
 the Data process and closes the initiating connection; restart recovery is
 required and a blind retry cannot determine the prior outcome. Cluster retains
 DB0, CROSSSLOT, its COPY DB restriction and its READONLY contract.
@@ -47,6 +48,22 @@ own libraries; use separate commands against each primary to deploy across
 the cluster, without an atomic cross-Group update. FUNCTION DUMP/LIST inspect
 the local catalog on a primary or complete readable replica without READONLY.
 Catalog mutations inside managed MULTI remain unsupported.
+
+Both modes accept `FLUSHDB [SYNC|ASYNC]` and `FLUSHALL [SYNC|ASYNC]`, defaulting
+to SYNC. Single clears the selected database or all DB0–15. Cluster clears only
+DB0 in the receiving primary's Group; clearing all Groups requires a command
+against each Group and has no cross-Group atomicity. Function libraries are
+preserved. Replicas return READONLY; an unready population, expired authority
+or Controlled Pause uses the ordinary mode-specific admission error.
+
+SYNC waits for local detached-index retirement, **not for replica ACKs** or
+all disk extents to become reusable. ASYNC returns after the durable epoch
+commit and detach while retirement proceeds. Both use ordinary asynchronous
+replication and retain its failover loss window. Storage IO errors propagate
+and retain existing storage fault protection; an error does not mean that
+clearing was guaranteed not to happen. A later reclamation error does not roll
+back the logical clear. Invalid replication history uses session cancellation
+and FULL recovery, without a FLUSH-specific serving fence.
 
 On an authorized Single Owner, a connection can select a database and copy into
 another database without changing its own selection:

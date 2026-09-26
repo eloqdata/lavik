@@ -15,8 +15,22 @@
  */
 
 #include "impl.h"
+#include "lavik/fault_pause.h"
 
 namespace lavik::storage {
+
+#if LAVIK_FAULTS_ENABLED
+namespace {
+// Armed after fixture startup so unrelated recovery epoch writes remain real.
+bool EpochIoFails(std::string_view kind, std::size_t device_index) {
+  const char* file = std::getenv("LAVIK_EPOCH_IO_FAIL_FILE");
+  return file != nullptr && ::access(file, F_OK) == 0 &&
+         fault_injection::MatchesNth("LAVIK_EPOCH_IO_FAIL_KIND", kind,
+                                     "LAVIK_EPOCH_IO_FAIL_DEVICE",
+                                     device_index + 1);
+}
+}  // namespace
+#endif
 
 std::size_t StorageEngine::Impl::DeviceIndexForBlock(
     std::uint64_t block_id) const noexcept {
@@ -386,7 +400,8 @@ Task<absl::Status> StorageEngine::Impl::ReturnColdBlocks(
 }
 
 Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
-    std::size_t device_index, std::size_t value_index, std::uint64_t epoch) {
+    std::size_t device_index, std::size_t value_index, std::uint64_t epoch,
+    EpochMutation& mutation) {
   DeviceAllocator& allocator = *device_allocators_[device_index];
   assert(bycorf::ThisWorker().id_ == allocator.owner_);
   if (epoch_metadata_failed_.load(std::memory_order_acquire)) {
@@ -427,6 +442,15 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
   buffer.size_ = kDirectIoAlignment;
+  LAVIK_FAULT_INJECT(if (!mutation.started_) {
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_BEFORE_EPOCH_HOLD_FILE");
+    if (!paused.ok()) co_return paused;
+  });
+  // The allocator lock and buffer admission can suspend. Validate only after
+  // those waits, before changing pending metadata or issuing any epoch write.
+  absl::Status authorized = mutation.BeginWrite();
+  if (!authorized.ok()) co_return authorized;
   allocator.epoch_values_[value_index] = desired;
   const MetadataPageState current = allocator.epoch_pages_[page_index];
   const std::uint8_t next_slot = current.active_slot_ == 0 ? 1 : 0;
@@ -442,10 +466,19 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
           payload_bytes),
       output);
   const StorageDevice& device = devices_[device_index];
-  auto written = co_await WriteStorageBuffer(
-      *store.worker_, store.files_[device.file_index_], output,
-      lease.registered(), buffer,
-      MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
+  auto write = [&]() -> Task<absl::StatusOr<std::size_t>> {
+    LAVIK_FAULT_INJECT(
+        if (EpochIoFails("write", device_index)) {
+          co_return absl::UnavailableError("injected epoch write failure");
+        } if (EpochIoFails("short", device_index)) {
+          co_return kDirectIoAlignment / 2;
+        });
+    co_return co_await WriteStorageBuffer(
+        *store.worker_, store.files_[device.file_index_], output,
+        lease.registered(), buffer,
+        MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
+  };
+  auto written = co_await write();
   if (!written.ok() || *written != kDirectIoAlignment) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
     LatchRuntimeFailure();
@@ -454,13 +487,29 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
                        "short write of device epoch metadata")
         : written.status();
   }
-  absl::Status synced = co_await bycorf::Fdatasync(
-      *store.worker_, store.files_[device.file_index_]);
+  LAVIK_FAULT_INJECT(if (device_index == 0) {
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_AFTER_EPOCH_WRITE_HOLD_FILE");
+    if (!paused.ok()) co_return paused;
+  });
+  auto sync = [&]() -> Task<absl::Status> {
+    LAVIK_FAULT_INJECT(if (EpochIoFails("sync", device_index)) {
+      co_return absl::UnavailableError("injected epoch sync failure");
+    });
+    co_return co_await bycorf::Fdatasync(*store.worker_,
+                                         store.files_[device.file_index_]);
+  };
+  absl::Status synced = co_await sync();
   if (!synced.ok()) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
     LatchRuntimeFailure();
     co_return synced;
   }
+  LAVIK_FAULT_INJECT(if (device_index == 0) {
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_AFTER_EPOCH_SYNC_HOLD_FILE");
+    if (!paused.ok()) co_return paused;
+  });
   allocator.epoch_pages_[page_index] = MetadataPageState{
       .generation_ = next_generation,
       .active_slot_ = next_slot,
@@ -476,7 +525,8 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
 
 Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
     std::size_t device_index,
-    std::span<const std::pair<std::size_t, std::uint64_t>> values) {
+    std::span<const std::pair<std::size_t, std::uint64_t>> values,
+    EpochMutation& mutation) {
   DeviceAllocator& allocator = *device_allocators_[device_index];
   assert(bycorf::ThisWorker().id_ == allocator.owner_);
   if (values.empty()) co_return absl::OkStatus();
@@ -505,7 +555,6 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
   for (const auto& [value_index, epoch] : values) {
     const std::uint64_t desired =
         std::max(epoch, allocator.epoch_values_[value_index]);
-    allocator.epoch_values_[value_index] = desired;
     if (allocator.durable_epoch_values_[value_index] < desired) {
       const std::size_t byte_offset = value_index * sizeof(std::uint64_t);
       dirty_pages[byte_offset / kMetadataPagePayloadBytes] = true;
@@ -524,6 +573,19 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
   buffer.size_ = kDirectIoAlignment;
   std::vector<MetadataPageState> next_states = allocator.epoch_pages_;
   const StorageDevice& device = devices_[device_index];
+  LAVIK_FAULT_INJECT(if (!mutation.started_) {
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_BEFORE_EPOCH_HOLD_FILE");
+    if (!paused.ok()) co_return paused;
+  });
+  // The allocator lock and buffer admission can suspend. Validate only after
+  // those waits, before changing pending metadata or issuing any epoch write.
+  absl::Status authorized = mutation.BeginWrite();
+  if (!authorized.ok()) co_return authorized;
+  for (const auto& [value_index, epoch] : values) {
+    allocator.epoch_values_[value_index] =
+        std::max(epoch, allocator.epoch_values_[value_index]);
+  }
   for (std::size_t page_index = 0; page_index < dirty_pages.size();
        ++page_index) {
     if (!dirty_pages[page_index]) continue;
@@ -543,10 +605,19 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
                 page_byte_offset,
             payload_bytes),
         output);
-    auto written = co_await WriteStorageBuffer(
-        *store.worker_, store.files_[device.file_index_], output,
-        lease.registered(), buffer,
-        MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
+    auto write = [&]() -> Task<absl::StatusOr<std::size_t>> {
+      LAVIK_FAULT_INJECT(
+          if (EpochIoFails("write", device_index)) {
+            co_return absl::UnavailableError("injected epoch write failure");
+          } if (EpochIoFails("short", device_index)) {
+            co_return kDirectIoAlignment / 2;
+          });
+      co_return co_await WriteStorageBuffer(
+          *store.worker_, store.files_[device.file_index_], output,
+          lease.registered(), buffer,
+          MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
+    };
+    auto written = co_await write();
     if (!written.ok() || *written != kDirectIoAlignment) {
       epoch_metadata_failed_.store(true, std::memory_order_release);
       LatchRuntimeFailure();
@@ -561,13 +632,29 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
     };
   }
 
-  absl::Status synced = co_await bycorf::Fdatasync(
-      *store.worker_, store.files_[device.file_index_]);
+  LAVIK_FAULT_INJECT(if (device_index == 0) {
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_AFTER_EPOCH_WRITE_HOLD_FILE");
+    if (!paused.ok()) co_return paused;
+  });
+  auto sync = [&]() -> Task<absl::Status> {
+    LAVIK_FAULT_INJECT(if (EpochIoFails("sync", device_index)) {
+      co_return absl::UnavailableError("injected epoch sync failure");
+    });
+    co_return co_await bycorf::Fdatasync(*store.worker_,
+                                         store.files_[device.file_index_]);
+  };
+  absl::Status synced = co_await sync();
   if (!synced.ok()) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
     LatchRuntimeFailure();
     co_return synced;
   }
+  LAVIK_FAULT_INJECT(if (device_index == 0) {
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_AFTER_EPOCH_SYNC_HOLD_FILE");
+    if (!paused.ok()) co_return paused;
+  });
   for (std::size_t page_index = 0; page_index < dirty_pages.size();
        ++page_index) {
     if (!dirty_pages[page_index]) continue;
@@ -586,24 +673,27 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
 }
 
 Task<absl::Status> StorageEngine::Impl::PersistEpochValue(
-    std::size_t value_index, std::uint64_t epoch) {
+    std::size_t value_index, std::uint64_t epoch,
+    MutationPrecondition mutation_precondition) {
   if (value_index >= kEpochValueCount) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "epoch metadata index is out of range");
   }
+  EpochMutation mutation{std::move(mutation_precondition)};
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
     const bycorf::WorkerId owner = device_allocators_[device_index]->owner_;
     absl::Status persisted;
     if (owner == bycorf::ThisWorker().id_) {
-      persisted = co_await PersistEpochValueOnDeviceLocal(device_index,
-                                                          value_index, epoch);
+      persisted = co_await PersistEpochValueOnDeviceLocal(
+          device_index, value_index, epoch, mutation);
     } else {
       persisted = co_await bycorf::SubmitTaskTo(
           owner,
-          [this, device_index, value_index, epoch]() -> Task<absl::Status> {
+          [this, device_index, value_index, epoch,
+           &mutation]() -> Task<absl::Status> {
             co_return co_await PersistEpochValueOnDeviceLocal(
-                device_index, value_index, epoch);
+                device_index, value_index, epoch, mutation);
           });
     }
     if (!persisted.ok()) {
@@ -614,29 +704,31 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValue(
 }
 
 Task<absl::Status> StorageEngine::Impl::PersistEpochValues(
-    std::span<const std::pair<std::size_t, std::uint64_t>> values) {
+    std::span<const std::pair<std::size_t, std::uint64_t>> values,
+    MutationPrecondition mutation_precondition) {
   for (const auto& [value_index, epoch] : values) {
     if (value_index >= kEpochValueCount || epoch == 0) {
       co_return absl::Status(absl::StatusCode::kOutOfRange,
                              "epoch metadata update is out of range");
     }
   }
+  EpochMutation mutation{std::move(mutation_precondition)};
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
     const bycorf::WorkerId owner = device_allocators_[device_index]->owner_;
     absl::Status persisted;
     if (owner == bycorf::ThisWorker().id_) {
-      persisted =
-          co_await PersistEpochValuesOnDeviceLocal(device_index, values);
+      persisted = co_await PersistEpochValuesOnDeviceLocal(device_index, values,
+                                                           mutation);
     } else {
       std::vector<std::pair<std::size_t, std::uint64_t>> copied(values.begin(),
                                                                 values.end());
       persisted = co_await bycorf::SubmitTaskTo(
           owner,
-          [this, device_index,
+          [this, device_index, &mutation,
            copied = std::move(copied)]() -> Task<absl::Status> {
-            co_return co_await PersistEpochValuesOnDeviceLocal(device_index,
-                                                               copied);
+            co_return co_await PersistEpochValuesOnDeviceLocal(
+                device_index, copied, mutation);
           });
     }
     if (!persisted.ok()) co_return persisted;
