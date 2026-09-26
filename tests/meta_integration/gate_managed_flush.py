@@ -102,6 +102,18 @@ def paused_at(source, variable):
     )
 
 
+def wait_retired_clients_drained(source):
+    # EOF and CLIENT LIST both hide a closing connection before its request
+    # coroutine returns. connected_clients is decremented only at cleanup;
+    # the fresh INFO connection must be the sole remaining ordinary client.
+    H.wait_until(
+        "retired FLUSH finished before renewal",
+        20,
+        lambda: "connected_clients:1"
+        in F.redis_call(source, ["INFO", "clients"]).splitlines(),
+    )
+
+
 def revoked(root, mode, command, boundary):
     name = f"revoke-{mode}-{command}-{boundary}"
     hold = root / f"{name}.hold"
@@ -171,6 +183,10 @@ def revoked(root, mode, command, boundary):
                             assert "closed its Redis connection" in str(failure), (
                                 failure
                             )
+                    # EOF precedes coroutine cleanup. Keep Meta paused until
+                    # the server has finished, otherwise a same-Term renewal
+                    # can authorize a still-pending pre-cut FLUSH.
+                    wait_retired_clients_drained(source)
                 finally:
                     hold.unlink(missing_ok=True)
                     meta.resume()
@@ -514,11 +530,6 @@ def drain(root, command, revoke=False):
                             lambda: "MASTERDOWN"
                             in F.redis_error(source, ["SET", "probe", "x"]),
                         )
-                        hold.unlink()
-                        try:
-                            assert old.result(timeout=10) == "value"
-                        except H.Failure as error:
-                            assert "closed its Redis connection" in str(error), error
                         try:
                             pending.result(timeout=10)
                         except H.Failure as error:
@@ -527,6 +538,15 @@ def drain(root, command, revoke=False):
                             ), error
                         else:
                             raise AssertionError("revoked draining flush succeeded")
+                        # Retirement wakes the client before the server's
+                        # drain finishes. The held GET keeps this FLUSH alive
+                        # even though its caller has already received EOF.
+                        hold.unlink()
+                        try:
+                            assert old.result(timeout=10) == "value"
+                        except H.Failure as error:
+                            assert "closed its Redis connection" in str(error), error
+                        wait_retired_clients_drained(source)
                     else:
                         # With DB0 busy, FLUSHALL must already have closed DB15.
                         assert new_writer.call("SELECT", 15) == "OK"
@@ -555,7 +575,11 @@ def drain(root, command, revoke=False):
                 def preserved():
                     recovered = Client(source)
                     try:
-                        return recovered.call("GET", "old") == "value"
+                        value = recovered.call("GET", "old")
+                        assert value == "value", (
+                            f"revoked FLUSH changed old data: {value!r}"
+                        )
+                        return True
                     finally:
                         recovered.close()
 

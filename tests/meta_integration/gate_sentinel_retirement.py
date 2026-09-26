@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Original stock pools and subscription objects survive Data retirement."""
 
+import concurrent.futures
 import subprocess
 import signal
 import threading
@@ -131,7 +132,6 @@ def run(fixture, go_binary, directory, scenario):
                 30,
                 lambda: owner.command_head(["ROLE"]) == "*5",
             )
-        HA.recover(clients, "after " + scenario, start)
         # Receivers keep the exact pre-fault objects. Repeated NEW publications
         # cover the permitted resubscription gap; old buffered messages cannot
         # satisfy this assertion. Only the library reconnects/resubscribes.
@@ -166,10 +166,17 @@ def run(fixture, go_binary, directory, scenario):
         publisher = threading.Thread(target=publish)
         publisher.start()
         try:
-            pending = dict(subscriptions)
             deadline = start + 30
-            while pending and time.monotonic() < deadline:
-                for name, sub in list(pending.items()):
+
+            def recover_original(name, client, sub):
+                # Each stock client has its own discovery/retry delays. Give
+                # all of them the same recovery window, rather than spending
+                # one client's budget waiting for another. Keep a Go driver's
+                # pool and Pub/Sub calls on this one thread: its JSON pipe is
+                # sequential and cannot multiplex concurrent requests.
+                HA.recover([(name, client)], "after " + scenario, start)
+                last_error = None
+                while time.monotonic() < deadline:
                     try:
                         message = (
                             sub.call(op="receive")
@@ -181,14 +188,36 @@ def run(fixture, go_binary, directory, scenario):
                             if isinstance(message, dict)
                             else message
                         )
-                        if value in (payload, payload.encode()):
-                            del pending[name]
+                        if (
+                            value in (payload, payload.encode())
+                            and time.monotonic() < deadline
+                        ):
                             H.log(f"{scenario}: original {name} subscription recovered")
-                    except Exception:
-                        pass
-            if pending or errors:
+                            return
+                    except Exception as error:
+                        last_error = error
                 raise H.Failure(
-                    f"original subscriptions failed: {list(pending)}, {errors}"
+                    f"{name}: original subscription exceeded 30s recovery budget; "
+                    f"last error={last_error!r}"
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(clients)
+            ) as pool:
+                by_name = dict(subscriptions)
+                pending = {
+                    pool.submit(recover_original, name, client, by_name[name]): name
+                    for name, client in clients
+                }
+                failures = []
+                for future in concurrent.futures.as_completed(pending):
+                    try:
+                        future.result()
+                    except Exception as error:
+                        failures.append(f"{pending[future]}: {error}")
+            if failures or errors:
+                raise H.Failure(
+                    f"original clients/subscriptions failed: {failures}, {errors}"
                 )
         finally:
             stop.set()
