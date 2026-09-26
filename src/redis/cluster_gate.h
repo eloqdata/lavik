@@ -55,6 +55,10 @@ class MutationPrecondition;
 struct ClusterShardValidatorContext {
   std::shared_ptr<const cluster::AuthorityAdmission> admission_;
   std::atomic<bool> tripped_{false};
+  // EXEC and Lua settle their shared mutation receipts before answering a
+  // rejected hop. Other multi-shard commands retain their conservative
+  // disconnect contract even if no storage mutation was recorded.
+  bool composite_outcome_ = false;
 };
 
 // tx::ShardValidator implementation: re-checks the captured topology and

@@ -32,6 +32,7 @@
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/worker.h"
 #include "cluster_gate.h"
+#include "lavik/fault_pause.h"
 #include "lavik/memory.h"
 #include "lavik/resp.h"
 #include "lavik/storage/detail/stream_records.h"
@@ -1692,102 +1693,129 @@ Task<CommandReply> ExecuteRead(
       }
     } cascade_completion{attempt_cascade};
     attempt_request.blocking_wake_cascade_ = attempt_cascade;
-    const bool owns_attempt_gate = locked_keys.empty();
-    while (owns_attempt_gate && !TryBeginCommandDbOperation(request.db_id_)) {
-      if (block && block_ms != 0 &&
-          std::chrono::steady_clock::now() - started >=
-              std::chrono::milliseconds(block_ms)) {
-        co_return Built(builder.AppendNullArray());
-      }
-      absl::Status slept = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!slept.ok()) co_return Built(StorageError(builder, slept));
-    }
-    AttemptDbGuard db_guard(request.db_id_, owns_attempt_gate);
-    if (group_read && owns_attempt_gate &&
-        !CommandWriteAdmissionIsCurrent(request)) {
-      co_return Built(builder.AppendError(
-          "TRYAGAIN replication role changed; retry command"));
-    }
-    if (const char* error = CommandServingGenerationError(request);
-        error != nullptr) [[unlikely]] {
-      co_return Built(builder.AppendError(error));
-    }
-    // A top-level XREADGROUP can remain dormant indefinitely but mutates
-    // consumer/PENDING state on each concrete read attempt. Its assignment
-    // guard covers only those owner hops, not waiter registration or sleep
-    // below. EXEC/Lua locked execution already retains its enclosing
-    // transaction/script authority window and must not re-admit one child
-    // against a newer projection midway through that atomic operation.
-    cluster::AuthorityInFlightGuards attempt_authority;
-    if (group_read && owns_attempt_gate) {
-      if (std::optional<CommandReply> fenced =
-              RegisterClusterBlockingWriteAttempt(attempt_request, builder,
-                                                  &attempt_authority);
-          fenced.has_value()) {
-        co_return std::move(*fenced);
-      }
-    }
     std::vector<std::pair<std::string, ReadOneResult>> found;
-    for (std::size_t k = 0; k < key_count; ++k) {
-      std::string key = a[first_key + k];
-      const StreamExecKey* locked_key = nullptr;
-      if (!locked_keys.empty()) {
-        for (const StreamExecKey& candidate : locked_keys) {
-          if (candidate.arg_ == first_key + k) {
-            locked_key = &candidate;
-            break;
+    std::optional<CommandReply> attempt_reply;
+    auto attempt = [&]() -> Task<absl::Status> {
+      const bool owns_attempt_gate = locked_keys.empty();
+      while (owns_attempt_gate && !TryBeginCommandDbOperation(request.db_id_)) {
+        if (block && block_ms != 0 &&
+            std::chrono::steady_clock::now() - started >=
+                std::chrono::milliseconds(block_ms)) {
+          attempt_reply = Built(builder.AppendNullArray());
+          co_return absl::OkStatus();
+        }
+        absl::Status slept = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
+        if (!slept.ok()) co_return slept;
+      }
+      AttemptDbGuard db_guard(request.db_id_, owns_attempt_gate);
+      if (group_read && owns_attempt_gate &&
+          !CommandWriteAdmissionIsCurrent(request)) {
+        attempt_reply = Built(builder.AppendError(
+            "TRYAGAIN replication role changed; retry command"));
+        co_return absl::OkStatus();
+      }
+      if (const char* error = CommandServingGenerationError(request);
+          error != nullptr) [[unlikely]] {
+        attempt_reply = Built(builder.AppendError(error));
+        co_return absl::OkStatus();
+      }
+      // A top-level XREADGROUP can remain dormant indefinitely but mutates
+      // consumer/PENDING state on each concrete read attempt. Its assignment
+      // guard covers only those owner hops, not waiter registration or sleep
+      // below. EXEC/Lua locked execution already retains its enclosing
+      // transaction/script authority window and must not re-admit one child
+      // against a newer projection midway through that atomic operation.
+      cluster::AuthorityInFlightGuards attempt_authority;
+      if (group_read && owns_attempt_gate) {
+        attempt_reply = RegisterClusterBlockingWriteAttempt(
+            attempt_request, builder, &attempt_authority);
+        // Re-admission may replace the proof. The outer finalizer must observe
+        // this attempt's mutation/failed-check markers, including partial hops.
+        request.cluster_authority_admission_ =
+            attempt_request.cluster_authority_admission_;
+        if (attempt_reply.has_value()) co_return absl::OkStatus();
+        LAVIK_FAULT_INJECT({
+          auto paused = co_await fault_injection::PauseWhileFileExists(
+              "LAVIK_STREAM_AFTER_AUTHORITY_HOLD_FILE");
+          if (!paused.ok()) co_return paused;
+        });
+      }
+      for (std::size_t k = 0; k < key_count; ++k) {
+        std::string key = a[first_key + k];
+        const StreamExecKey* locked_key = nullptr;
+        if (!locked_keys.empty()) {
+          for (const StreamExecKey& candidate : locked_keys) {
+            if (candidate.arg_ == first_key + k) {
+              locked_key = &candidate;
+              break;
+            }
+          }
+          if (locked_key == nullptr) {
+            co_return absl::InternalError("Stream key is missing");
           }
         }
-        if (locked_key == nullptr) {
-          co_return Built(builder.AppendError("ERR Stream key is missing"));
+        const unsigned owner = locked_key == nullptr
+                                   ? g_storage->OwnerForKey(key)
+                                   : locked_key->owner_;
+        const bool initialize = dollar[k] && !initialized_dollars;
+        // The local/remote owner branches are exhaustive. Avoid allocating an
+        // error message that is overwritten once for every stream key.
+        absl::StatusOr<ReadOneResult> one;
+        const std::optional<storage::Digest> locked_digest =
+            locked_key == nullptr
+                ? std::optional<storage::Digest>{}
+                : std::optional<storage::Digest>{locked_key->digest_};
+        storage::TxShardWrites* local_tx =
+            locked_key == nullptr || tx_writes == nullptr
+                ? nullptr
+                : &(*tx_writes)[owner];
+        if (owner == bycorf::ThisWorker().id_) {
+          one = co_await ReadOneLocal(
+              request.db_id_, key, cursors[k], initialize, group_read,
+              group_name, consumer_name, new_messages[k], noack, count,
+              locked_digest ? &*locked_digest : nullptr, local_tx,
+              &attempt_request);
+        } else {
+          one = co_await bycorf::SubmitTaskTo(
+              owner,
+              [db = request.db_id_, key = std::move(key), cursor = cursors[k],
+               initialize, group_read, group_name, consumer_name,
+               is_new = new_messages[k], noack, count, locked_digest, local_tx,
+               request_ptr = &attempt_request]() mutable
+                  -> Task<absl::StatusOr<ReadOneResult>> {
+                co_return co_await ReadOneLocal(
+                    db, std::move(key), cursor, initialize, group_read,
+                    std::move(group_name), std::move(consumer_name), is_new,
+                    noack, count, locked_digest ? &*locked_digest : nullptr,
+                    local_tx, request_ptr);
+              });
+        }
+        if (!one.ok()) co_return one.status();
+        LAVIK_FAULT_INJECT(if (group_read && owns_attempt_gate && k == 0) {
+          auto paused = co_await fault_injection::PauseWhileFileExists(
+              "LAVIK_STREAM_AFTER_FIRST_KEY_HOLD_FILE");
+          if (!paused.ok()) co_return paused;
+        });
+        cursors[k] = one->cursor_;
+        if (!one->entries_.empty() ||
+            (one->stream_ && one->stream_->remaining_) ||
+            (group_read && !new_messages[k])) {
+          found.emplace_back(a[first_key + k], std::move(*one));
         }
       }
-      const unsigned owner = locked_key == nullptr ? g_storage->OwnerForKey(key)
-                                                   : locked_key->owner_;
-      const bool initialize = dollar[k] && !initialized_dollars;
-      // The local/remote owner branches are exhaustive. Avoid allocating an
-      // error message that is overwritten once for every stream key.
-      absl::StatusOr<ReadOneResult> one;
-      const std::optional<storage::Digest> locked_digest =
-          locked_key == nullptr
-              ? std::optional<storage::Digest>{}
-              : std::optional<storage::Digest>{locked_key->digest_};
-      storage::TxShardWrites* local_tx =
-          locked_key == nullptr || tx_writes == nullptr ? nullptr
-                                                        : &(*tx_writes)[owner];
-      if (owner == bycorf::ThisWorker().id_) {
-        one = co_await ReadOneLocal(request.db_id_, key, cursors[k], initialize,
-                                    group_read, group_name, consumer_name,
-                                    new_messages[k], noack, count,
-                                    locked_digest ? &*locked_digest : nullptr,
-                                    local_tx, &attempt_request);
-      } else {
-        one = co_await bycorf::SubmitTaskTo(
-            owner,
-            [db = request.db_id_, key = std::move(key), cursor = cursors[k],
-             initialize, group_read, group_name, consumer_name,
-             is_new = new_messages[k], noack, count, locked_digest, local_tx,
-             request_ptr = &attempt_request]() mutable
-                -> Task<absl::StatusOr<ReadOneResult>> {
-              co_return co_await ReadOneLocal(
-                  db, std::move(key), cursor, initialize, group_read,
-                  std::move(group_name), std::move(consumer_name), is_new,
-                  noack, count, locked_digest ? &*locked_digest : nullptr,
-                  local_tx, request_ptr);
-            });
-      }
-      if (!one.ok()) co_return Built(StorageError(builder, one.status()));
-      cursors[k] = one->cursor_;
-      if (!one->entries_.empty() ||
-          (one->stream_ && one->stream_->remaining_) ||
-          (group_read && !new_messages[k])) {
-        found.emplace_back(a[first_key + k], std::move(*one));
-      }
+      // DB and authority guards end here, before publisher release and sleep.
+      co_return absl::OkStatus();
+    };
+    absl::Status attempted;
+    if (group_read && locked_keys.empty()) {
+      attempted =
+          co_await RunReplicationAdmittedAttempt(attempt_request, attempt);
+    } else {
+      attempted = co_await attempt();
     }
-    // The awaited owner hops above contain every mutation from this attempt.
-    // Release before the code can register or enter a dormant wait.
-    attempt_authority.clear();
+    if (!attempted.ok()) co_return Built(StorageError(builder, attempted));
+    if (attempt_reply.has_value()) co_return std::move(*attempt_reply);
     initialized_dollars = true;
     if (!found.empty()) {
       if (builder.version() == RespVersion::k3)
@@ -1852,9 +1880,13 @@ Task<CommandReply> ExecuteRead(
     if (block_ms != 0 && std::chrono::steady_clock::now() - started >=
                              std::chrono::milliseconds(block_ms))
       co_return Built(builder.AppendNullArray());
-    db_guard.Release();
     cascade_completion.Finish();
     if (!wait_handle) {
+      LAVIK_FAULT_INJECT({
+        auto paused = co_await fault_injection::PauseWhileFileExists(
+            "LAVIK_STREAM_BEFORE_WAIT_REGISTRATION_HOLD_FILE");
+        if (!paused.ok()) co_return Built(StorageError(builder, paused));
+      });
       const std::string lane =
           group_read
               ? "xreadgroup:" + group_name

@@ -40,8 +40,13 @@ its representative slot carries the existing lease, token and drain proof.
 Catalog reads are local on complete readable replicas without READONLY;
 replica mutations return READONLY. Cluster Groups may contain different
 libraries: deployment to multiple primaries requires separate client commands
-and has no cross-Group atomicity. Catalog mutations inside managed MULTI remain
-unsupported until transaction publication carries their Group admission.
+and has no cross-Group atomicity. Catalog mutations inside managed MULTI use
+EXEC's shared admission through publication. A keyless catalog EXEC resolves
+the local Group; a mixed EXEC uses the Group of its queued business keys. The
+catalog's representative slot does not participate in Cluster CROSSSLOT checks.
+Each durable catalog root is an irreversible command effect, even if a later
+child fails. EXEC settles the successful prefix before answering or closing;
+if that history cannot publish, serving is fenced until recovery.
 Trusted replication and startup recovery retain their existing population/apply
 fences and never acquire client Owner authority.
 

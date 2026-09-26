@@ -1183,9 +1183,9 @@ def assert_redis_topology_and_replication(nodes):
     if not crossslot.startswith("CROSSSLOT"):
         raise H.Failure(f"cross-Group MGET returned {crossslot!r}")
 
-    rejected_library = (
-        "#!lua name=cluster_rejected\n"
-        "redis.register_function('cluster_rejected_value', "
+    transaction_library = (
+        "#!lua name=cluster_transaction\n"
+        "redis.register_function('cluster_transaction_value', "
         "function(keys, args) return 1 end)"
     )
     for arguments, expected in (
@@ -1204,26 +1204,21 @@ def assert_redis_topology_and_replication(nodes):
         sock.settimeout(3.0)
         sock.sendall(
             encode_resp(["MULTI"])
-            + encode_resp(["FUNCTION", "LOAD", rejected_library])
+            + encode_resp(["FUNCTION", "LOAD", transaction_library])
             + encode_resp(["EXEC"])
         )
         reader = sock.makefile("rb")
         if read_resp(reader) != "OK":
             raise H.Failure("primary rejected MULTI before policy check")
-        function_reply = reader.readline()
-        if function_reply != (
-            b"-ERR FUNCTION catalog mutations inside MULTI are not yet supported in Meta-managed mode\r\n"
-        ):
-            raise H.Failure(f"transactional FUNCTION LOAD returned {function_reply!r}")
-        exec_reply = reader.readline()
-        if exec_reply != (
-            b"-EXECABORT Transaction discarded because of previous errors.\r\n"
-        ):
-            raise H.Failure(
-                f"rejected FUNCTION LOAD did not abort EXEC: {exec_reply!r}"
-            )
-    if redis_call(by_id[PRIMARY_1], ["FUNCTION", "LIST"]) != []:
-        raise H.Failure("rejected FUNCTION LOAD changed the catalog")
+        if read_resp(reader) != "QUEUED":
+            raise H.Failure("transactional FUNCTION LOAD was not queued")
+        if read_resp(reader) != ["cluster_transaction"]:
+            raise H.Failure("transactional FUNCTION LOAD did not commit")
+    if (
+        redis_call(by_id[PRIMARY_1], ["FUNCTION", "DELETE", "cluster_transaction"])
+        != "OK"
+    ):
+        raise H.Failure("transactional Function catalog cleanup failed")
 
     # Redis Cluster libraries are local to a primary and its replicas. Load
     # distinct definitions into both Groups so a fixed slot-zero proof or

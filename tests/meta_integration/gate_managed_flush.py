@@ -66,13 +66,10 @@ def semantics(root, mode):
                 assert writer.call("FLUSHALL") == "OK"
             finally:
                 target.resume()
-            if mode == "cluster":
-                for command in ("FLUSHDB", "FLUSHALL"):
-                    assert writer.call("MULTI") == "OK"
-                    rejects(writer, (command,), "not allowed in transactions")
-                    rejects(writer, ("EXEC",), "EXECABORT")
-            else:
-                rejects(writer, ("MULTI",), "not yet supported")
+            for command in ("FLUSHDB", "FLUSHALL"):
+                assert writer.call("MULTI") == "OK"
+                rejects(writer, (command,), "not allowed in transactions")
+                rejects(writer, ("EXEC",), "EXECABORT")
             for db in range(count):
                 assert writer.call("SELECT", db) == "OK"
                 assert writer.call("DBSIZE") == 0

@@ -7519,6 +7519,10 @@ struct ExecRunContext {
   std::size_t begin_ = 0;
   std::size_t end_ = 0;
   std::vector<std::vector<std::optional<std::string>>> mget_;
+  // One prepared DEL effect per command/key slot. Each owner moves only its
+  // own key's arguments after mutation, without allocating in that interval.
+  std::vector<std::vector<std::vector<std::string>>> delete_effects_;
+  std::vector<bool> preparation_failed_;
   std::unique_ptr<std::atomic<long long>[]> counters_;
   std::mutex error_mutex_;
   std::vector<absl::Status> errors_;
@@ -7528,6 +7532,8 @@ struct ExecRunContext {
 // Single-key commands already wrote their slots on the owning shard.
 void AssembleRunReplies(ExecRunContext& run) {
   for (std::size_t i = run.begin_; i < run.end_; ++i) {
+    const auto& capture = (*run.queued_)[i].replication_capture_;
+    if (capture != nullptr) capture->ReleaseUnusedPreparation();
     const std::size_t local = i - run.begin_;
     if (!run.errors_[local].ok()) {
       (*run.replies_)[i] = EncodeStorageError(run.errors_[local]);
@@ -7578,7 +7584,43 @@ void InitExecRun(ExecRunContext& run, const std::vector<CommandRequest>& queued,
   run.counters_ = std::make_unique<std::atomic<long long>[]>(count);
   run.errors_.assign(count, absl::OkStatus());
   run.mget_.resize(count);
+  run.delete_effects_.resize(count);
+  run.preparation_failed_.assign(count, false);
   for (std::size_t i = begin; i < end; ++i) {
+    const CommandRequest& command = queued[i];
+    if ((command.kind_ == CommandKind::kDel ||
+         command.kind_ == CommandKind::kUnlink) &&
+        command.replication_capture_ != nullptr) {
+      // A later key/worker can refuse after earlier keys were deleted. The
+      // aggregate reply is then an error, but those successful effects still
+      // belong to the outer transaction's replication envelope.
+      command.replication_capture_->MarkHandled();
+      auto& effects = run.delete_effects_[i - begin];
+      absl::Status prepared;
+      try {
+        effects.resize(cmd_keys[i].size());
+        std::size_t bytes = 0;
+        for (const ExecKey& key : cmd_keys[i]) {
+          auto& args = effects[key.slot_];
+          args = {"DEL", command.args_[key.arg_]};
+          bytes = SaturatingAdd(bytes, args.capacity() * sizeof(std::string));
+          for (const auto& arg : args) {
+            bytes = SaturatingAdd(bytes, arg.capacity() + 1);
+          }
+        }
+        prepared = command.replication_capture_->ReserveAdditionalCommands(
+            effects.size(), bytes);
+      } catch (const std::bad_alloc&) {
+        prepared = absl::ResourceExhaustedError("OOM preparing DEL effects");
+      } catch (const std::length_error&) {
+        prepared = absl::ResourceExhaustedError("OOM preparing DEL effects");
+      }
+      if (!prepared.ok()) {
+        effects.clear();
+        run.preparation_failed_[i - begin] = true;
+        run.errors_[i - begin] = std::move(prepared);
+      }
+    }
     if (queued[i].kind_ == CommandKind::kMGet) {
       run.mget_[i - begin].assign(cmd_keys[i].size(), std::nullopt);
     }
@@ -7621,7 +7663,7 @@ std::string NormalizeEvalSha(std::string_view sha) {
 void CollectLuaReplicationEffects(
     const CommandRequest& command, std::string_view reply,
     std::vector<CapturedReplicationCommand>* effects) {
-  if (command.spec_ == nullptr || reply.empty() || reply.front() == '-' ||
+  if (command.spec_ == nullptr ||
       (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) == 0) {
     return;
   }
@@ -7629,7 +7671,10 @@ void CollectLuaReplicationEffects(
   if (command.replication_capture_ != nullptr) {
     captured = command.replication_capture_->Take();
   }
+  // A child can fail after an earlier Stream/key has committed. Handled
+  // captures describe actual effects, regardless of redis.call/pcall's reply.
   if (!captured.handled_) {
+    if (reply.empty() || reply.front() == '-') return;
     effects->push_back(
         CapturedReplicationCommand{command.db_id_, command.args_});
     return;
@@ -7664,6 +7709,8 @@ Task<std::string> ExecuteLuaRedisCall(
   CommandRequest command = std::move(*built);
   command.resp_version_ = lua_execution->resp_version();
   command.replication_origin_ = eval_request.replication_origin_;
+  command.cluster_authority_admission_ =
+      eval_request.cluster_authority_admission_;
   command.blocking_notification_capture_ = notifications;
   command.blocking_wake_cascade_ = eval_request.blocking_wake_cascade_;
   command.replication_capture_ = std::make_shared<ReplicationCommandCapture>();
@@ -7839,6 +7886,7 @@ Task<std::string> ExecuteLuaRedisCall(
     absl::Status dispatched = co_await transaction->Execute(
         &ExecRunShardCallback, &run, /*release=*/false);
     if (!dispatched.ok()) {
+      CollectLuaReplicationEffects(command, "-", effects);
       if (IsClusterAuthorityChanged(dispatched)) {
         co_return EncodeError(
             "ERR Script attempted to access a non local key in a cluster "
@@ -7848,6 +7896,7 @@ Task<std::string> ExecuteLuaRedisCall(
     }
     AssembleRunReplies(run);
     if (reply_chunks.front()) {
+      CollectLuaReplicationEffects(command, "-", effects);
       co_return EncodeError(
           "ERR streamed command replies are not allowed from script");
     }
@@ -7894,6 +7943,7 @@ Task<std::string> ExecuteLuaRedisCall(
         co_return absl::OkStatus();
       });
   if (!dispatched.ok()) {
+    CollectLuaReplicationEffects(command, "-", effects);
     if (IsClusterAuthorityChanged(dispatched)) {
       co_return EncodeError(
           "ERR Script attempted to access a non local key in a cluster node");
@@ -7901,6 +7951,7 @@ Task<std::string> ExecuteLuaRedisCall(
     co_return EncodeStorageError(dispatched);
   }
   if (chunks) {
+    CollectLuaReplicationEffects(command, "-", effects);
     co_return EncodeError(
         "ERR streamed command replies are not allowed from script");
   }
@@ -8859,6 +8910,7 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
     const auto& args = cmd.args_;
     const auto& keys = (*ctx->cmd_keys_)[i];
     const std::size_t local = i - ctx->begin_;
+    if (ctx->preparation_failed_[local]) continue;
     auto record_error = [&](absl::Status status) {
       std::lock_guard<std::mutex> lock(ctx->error_mutex_);
       if (ctx->errors_[local].ok()) {
@@ -8913,6 +8965,17 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
         }
         case CommandKind::kDel:
         case CommandKind::kUnlink: {
+          LAVIK_FAULT_INJECT(
+              if (LAVIK_FAULT_MATCHES("LAVIK_EXEC_DELETE_HOLD_KEY",
+                                      args[key.arg_])) {
+                auto paused = co_await fault_injection::PauseWhileFileExists(
+                    "LAVIK_EXEC_DELETE_HOLD_FILE");
+                if (!paused.ok()) {
+                  record_error(paused);
+                  command_failed = true;
+                  break;
+                }
+              });
           auto deleted = co_await g_storage->DeleteLocked(
               cmd.db_id_, args[key.arg_], key.digest_, tx);
           if (!deleted.ok()) {
@@ -8920,6 +8983,15 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
             command_failed = true;
           } else if (*deleted) {
             ctx->counters_[local].fetch_add(1, std::memory_order_relaxed);
+            if (cmd.replication_capture_ != nullptr) {
+              CaptureReplicationCommand(
+                  cmd, std::move(ctx->delete_effects_[local][key.slot_]));
+            }
+            LAVIK_FAULT_INJECT(
+                if (LAVIK_FAULT_MATCHES("LAVIK_EXEC_DELETE_DONE_KEY",
+                                        args[key.arg_])) {
+                  spdlog::info("EXEC deletion committed before held peer");
+                });
           }
           break;
         }
@@ -9527,17 +9599,13 @@ Task<CommandReply> ExecuteExecBody(
     }
   }
 
-  // Cluster mode: the whole transaction must touch one slot that this node
-  // still owns. Queue time gated each command against the snapshot it was
-  // admitted under; EXEC re-evaluates the union against the current cache
-  // because Meta may have moved the slot between queue and EXEC. The wire
-  // behavior is the documented Redis semantics (no local redis-server was
-  // available to verify against): a transaction whose queued keys span slots
-  // fails as a whole with CROSSSLOT, and a slot now owned elsewhere redirects
-  // the whole EXEC with MOVED.
+  // EXEC validates queued business keys, excluding watched-only keys and
+  // catalog authority's representative slot. A catalog-only transaction uses
+  // the receiving Group; a mixed transaction uses its routed key Group.
   std::vector<std::uint16_t> exec_cluster_slots;
   std::shared_ptr<const cluster::AuthorityAdmission> exec_admission;
   cluster::AuthorityInFlightGuards exec_in_flights;
+  bool exec_local_group = false;
   if (cluster::MetaManaged() && !ctx.strict_replication_apply_) {
     for (std::size_t i = 0; i < queued.size(); ++i) {
       const CommandRequest& cmd = queued[i];
@@ -9575,7 +9643,12 @@ Task<CommandReply> ExecuteExecBody(
       co_await DropWatches(ctx);
       co_return BuiltReply(AppendCrossSlotError(reply_builder));
     }
-    if (!exec_cluster_slots.empty() && has_cluster_mutation) {
+    exec_local_group =
+        exec_cluster_slots.empty() &&
+        std::any_of(queued.begin(), queued.end(), IsFunctionCatalogMutation);
+    if (has_cluster_mutation &&
+        (!exec_cluster_slots.empty() || exec_local_group ||
+         cluster::GetClientMode() == ClientMode::kSingle)) {
       cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
       const cluster::RequestView view{
           .slots_ = exec_cluster_slots,
@@ -9585,6 +9658,7 @@ Task<CommandReply> ExecuteExecBody(
           // answer LOADING rather than serve the write.
           .loading_allowed_ = false,
           .client_mode_ = cluster::GetClientMode(),
+          .local_group_ = exec_local_group,
       };
       for (;;) {
         auto candidate = std::make_shared<const cluster::AuthorityAdmission>(
@@ -9640,8 +9714,32 @@ Task<CommandReply> ExecuteExecBody(
   std::optional<std::uint8_t> select_db;
   bool close_after_exec = false;
   bool captured_replication_published = false;
+  bool catalog_committed = false;
+  bool execution_authority_failed = false;
   auto finalize_exec_reply = [&](CommandReply reply) {
+    // A catalog root cannot roll back with the keyed transaction. Any exit
+    // that cannot settle its captured history must stop serving until recovery.
+    if (source_replicable && catalog_committed &&
+        !captured_replication_published) {
+      g_storage->FenceRequestServingUntilRestart();
+      close_after_exec = true;
+    }
     reply.close_connection_ = reply.close_connection_ || close_after_exec;
+    // The first child may be catalog-local even when EXEC has business keys;
+    // reconcile refusals using the whole transaction's routing scope.
+    if (exec_admission != nullptr && (execution_authority_failed ||
+                                      exec_admission->final_recheck_failed())) {
+      if (exec_admission->mutation_started()) {
+        reply.encoded_ = {};
+        reply.chunks_.reset();
+        reply.close_connection_ = true;
+        return reply;
+      }
+      reply_builder.Reset();
+      return ClusterAuthorityChangedReply(exec_admission->slots(),
+                                          queued.front().connection_tls_,
+                                          reply_builder, exec_local_group);
+    }
     return FinalizeClusterMutationReply(queued.front(), reply_builder,
                                         std::move(reply));
   };
@@ -9662,6 +9760,10 @@ Task<CommandReply> ExecuteExecBody(
       ReplyBuilder local_builder(ctx.resp_version());
       CommandReply local = co_await ExecuteFunction(cmd, local_builder);
       close_after_exec = close_after_exec || local.close_connection_;
+      catalog_committed =
+          catalog_committed ||
+          (IsFunctionCatalogMutation(cmd) && !local.encoded_.empty() &&
+           local.encoded_.front() != '-');
       co_return std::string(local.encoded_);
     }
     ReplyBuilder local_builder(ctx.resp_version());
@@ -9993,8 +10095,9 @@ Task<CommandReply> ExecuteExecBody(
               // Choke point 2 for the single-shard fast path (which never
               // builds a tx::Transaction): re-check the complete EXEC proof
               // after the key guard and before the first mutation.
-              if (cluster::GetClusterRuntime()->authority_guard_.Recheck(
-                      *exec_admission, cluster::LeaseClockNow()) !=
+              if (cluster::GetClusterRuntime()
+                      ->authority_guard_.RecheckForExecution(
+                          *exec_admission, cluster::LeaseClockNow()) !=
                   cluster::RecheckResult::kOk) {
                 co_return ClusterAuthorityChangedStatus();
               }
@@ -10006,6 +10109,12 @@ Task<CommandReply> ExecuteExecBody(
             }
             std::size_t i = 0;
             while (i < queued.size()) {
+              if (close_after_exec) {
+                for (std::size_t j = i; j < queued.size(); ++j) {
+                  replies[j] = EncodeError("ERR EXEC interrupted");
+                }
+                break;
+              }
               CommandRequest& cmd = queued[i];
               cmd.resp_version_ = ctx.resp_version();
               if (!key_errors[i].empty()) {
@@ -10117,6 +10226,7 @@ Task<CommandReply> ExecuteExecBody(
       ClusterShardValidatorContext cluster_validator;
       if (exec_admission != nullptr) {
         cluster_validator.admission_ = exec_admission;
+        cluster_validator.composite_outcome_ = true;
         txn.SetShardValidator(&ValidateClusterShardAuthority,
                               &cluster_validator);
       }
@@ -10180,6 +10290,12 @@ Task<CommandReply> ExecuteExecBody(
       // in the serial order.
       std::size_t i = 0;
       while (i < queued.size()) {
+        if (close_after_exec) {
+          for (std::size_t j = i; j < queued.size(); ++j) {
+            replies[j] = EncodeError("ERR EXEC interrupted");
+          }
+          break;
+        }
         CommandRequest& cmd = queued[i];
         cmd.resp_version_ = ctx.resp_version();
         if (!key_errors[i].empty()) {
@@ -10222,14 +10338,14 @@ Task<CommandReply> ExecuteExecBody(
                                                 /*release=*/false);
         if (!hop.ok()) {
           if (IsClusterAuthorityChanged(hop)) {
-            // A fence raced EXEC mid-flight: earlier runs may already have
-            // committed, so the outcome is undeterminable. The Redis contract
-            // for that is to close the connection without an error reply.
-            (void)co_await txn.Release();
-            co_await DropWatches(ctx);
-            CommandReply reply;
-            reply.close_connection_ = true;
-            co_return reply;
+            // Stop executing new work, but settle the successful prefix:
+            // in particular a Function root may already be durable. Mark all
+            // unexecuted children so replication cannot replay them later.
+            execution_authority_failed = true;
+            for (std::size_t j = i; j < queued.size(); ++j) {
+              replies[j] = EncodeStorageError(hop);
+            }
+            break;
           }
           for (std::size_t j = i; j < end; ++j) {
             replies[j] = EncodeStorageError(hop);
@@ -10301,7 +10417,9 @@ Task<CommandReply> ExecuteExecBody(
     }
     for (std::size_t i = 0; i < queued.size(); ++i) {
       queued[i].resp_version_ = ctx.resp_version();
-      if (!key_errors[i].empty()) {
+      if (close_after_exec) {
+        replies[i] = EncodeError("ERR EXEC interrupted");
+      } else if (!key_errors[i].empty()) {
         replies[i] = key_errors[i];
       } else {
         replies[i] = co_await run_keyless(queued[i]);
@@ -10310,10 +10428,10 @@ Task<CommandReply> ExecuteExecBody(
   }
   db_guard.Release();
 
-  // A transaction with PUBLISH but no durable write has no storage shard on
-  // which to place the ordinary transaction envelope. Publish its captured
-  // effects once through the first channel's source flow instead. Read-only
-  // children and SUBSCRIBE/UNSUBSCRIBE remain local connection state.
+  // Keyless catalog and PUBLISH transactions have no keyed storage envelope.
+  // Publish their captured effects through catalog flow zero or the first
+  // channel's source flow. Read-only children and SUBSCRIBE/UNSUBSCRIBE remain
+  // local connection state.
   if (source_replicable && (!has_write || dbs.empty()) &&
       g_storage != nullptr) {
     std::vector<CapturedReplicationCommand> commands;
@@ -10345,14 +10463,14 @@ Task<CommandReply> ExecuteExecBody(
             return item.args_.size() > 1 &&
                    CmpCaseInsensitive(item.args_.front(), "publish");
           });
-      const auto* active_admission = g_active_replication_publisher_admission;
+      const auto* active_admission = publisher_admission;
       if ((!catalog_mutation && publish == commands.end()) ||
           active_admission == nullptr) {
         CommandReply reply = BuiltReply(reply_builder.AppendError(
             "ERR admitted EXEC replication token is missing"));
         reply.close_connection_ = true;
         co_await DropWatches(ctx);
-        co_return reply;
+        co_return finalize_exec_reply(std::move(reply));
       }
       const std::uint16_t partition_id =
           catalog_mutation ? 0 : storage::RedisSlot(publish->args_[1]);
@@ -10387,7 +10505,7 @@ Task<CommandReply> ExecuteExecBody(
             "ERR admitted EXEC replication token is missing"));
         reply.close_connection_ = true;
         co_await DropWatches(ctx);
-        co_return reply;
+        co_return finalize_exec_reply(std::move(reply));
       }
       storage::ReplicationPublisherAdmission storage_admission = token->token_;
       const storage::ReplicationEventKind event_kind =
@@ -10409,7 +10527,12 @@ Task<CommandReply> ExecuteExecBody(
                         true, std::memory_order_acq_rel)) {
                   return ClusterAuthorityChangedStatus();
                 });
-            if (exec_admission != nullptr &&
+            // Catalog roots have already crossed the irreversible mutation
+            // boundary. Finish their reserved publication under EXEC's retained
+            // drain guard even after revocation; ephemeral-only publication is
+            // still a new effect and must pass its first mutation check.
+            if (event_kind != storage::ReplicationEventKind::kCatalogMutation &&
+                exec_admission != nullptr &&
                 cluster::GetClusterRuntime()
                         ->authority_guard_.RecheckAtMutation(
                             *exec_admission, cluster::LeaseClockNow()) !=
@@ -10428,7 +10551,7 @@ Task<CommandReply> ExecuteExecBody(
         CommandReply reply = BuiltReply(reply_builder.AppendError(absl::StrCat(
             "ERR EXEC replication failed: ", published.message())));
         reply.close_connection_ = true;
-        co_return reply;
+        co_return finalize_exec_reply(std::move(reply));
       }
       captured_replication_published = true;
     }
@@ -10475,7 +10598,7 @@ Task<CommandReply> ExecuteExecBody(
     CommandReply reply = BuiltReply(
         reply_builder.AppendError(absl::StrCat("ERR ", notified.message())));
     reply.close_connection_ = close_after_exec;
-    co_return reply;
+    co_return finalize_exec_reply(std::move(reply));
   }
   co_await DropWatches(ctx);
   if (ctx.strict_replication_apply_) {
@@ -10515,7 +10638,7 @@ Task<CommandReply> ExecuteExecBody(
         [state]() { return NextExecReplyChunk(state); });
   }
   reply.selected_db_ = select_db;
-  co_return reply;
+  co_return finalize_exec_reply(std::move(reply));
 }
 
 Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
@@ -11917,11 +12040,14 @@ CommandReply ClusterAuthorityChangedReply(std::span<const std::uint16_t> slots,
 
 absl::Status ValidateClusterShardAuthority(void* opaque, unsigned /*shard*/) {
   auto* context = static_cast<ClusterShardValidatorContext*>(opaque);
-  if (context->admission_ != nullptr &&
-      cluster::GetClusterRuntime()->authority_guard_.Recheck(
-          *context->admission_, cluster::LeaseClockNow()) ==
-          cluster::RecheckResult::kOk) {
-    return absl::OkStatus();
+  if (context->admission_ != nullptr) {
+    const auto& guard = cluster::GetClusterRuntime()->authority_guard_;
+    const auto now = cluster::LeaseClockNow();
+    const auto result =
+        context->composite_outcome_
+            ? guard.RecheckForExecution(*context->admission_, now)
+            : guard.Recheck(*context->admission_, now);
+    if (result == cluster::RecheckResult::kOk) return absl::OkStatus();
   }
   context->tripped_.store(true, std::memory_order_relaxed);
   return ClusterAuthorityChangedStatus();
@@ -11936,6 +12062,7 @@ void InstallClusterShardValidator(tx::Transaction& transaction,
     return;
   }
   context.admission_ = request.cluster_authority_admission_;
+  context.composite_outcome_ = IsLuaInvocationCommand(request);
   transaction.SetShardValidator(&ValidateClusterShardAuthority, &context);
 }
 
@@ -11945,7 +12072,7 @@ absl::Status RecheckClusterRequestAuthority(const CommandRequest& request) {
       request.cluster_authority_admission_->slots().empty()) {
     return absl::OkStatus();
   }
-  if (cluster::GetClusterRuntime()->authority_guard_.Recheck(
+  if (cluster::GetClusterRuntime()->authority_guard_.RecheckForExecution(
           *request.cluster_authority_admission_, cluster::LeaseClockNow()) ==
       cluster::RecheckResult::kOk) {
     return absl::OkStatus();
@@ -12030,44 +12157,24 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
               "KILL or SHUTDOWN NOSAVE."));
   }
   if (cluster::MetaManaged()) {
-    if (!request.replication_origin_ && ctx.in_multi_ &&
-        IsFunctionCatalogMutation(request)) {
-      // Catalog-in-EXEC requires a shared admission through the transaction's
-      // eventual publication. Keep that existing boundary until it is wired.
-      ctx.multi_dirty_ = true;
-      co_return BuiltReply(reply_builder.AppendError(
-          "ERR FUNCTION catalog mutations inside MULTI are not yet supported "
-          "in Meta-managed mode"));
-    }
     if (!request.replication_origin_ &&
         cluster::GetClientMode() == ClientMode::kSingle) {
-      // Scope follows command execution shapes, not individual data types.
-      // Cross-slot multi-key commands and the List/Sorted Set blocking family
-      // share the standalone execution engine and the sole Group's admission,
-      // waiters and drain across all databases, so they serve directly.
-      // Database inspection uses the same Group read gate and population fence;
-      // KEYS retains its exclusive gate until its streamed response completes.
-      // Still deferred: execution
-      // contexts that mutate outside one command's key view (transactions,
-      // scripts), stream blocking and keyless
-      // WAIT. Later tickets can remove a boundary only after wiring its
-      // waits, participants and durable/catalog effects into Group authority.
+      // Composite execution shares standalone's locks and effects, with one
+      // Group proof retained through publication. Keep unrelated deferred
+      // command families explicit rather than widening their support here.
       const auto flags = request.spec_ == nullptr ? 0u : request.spec_->flags_;
       const bool database_inspection =
           kind == CommandKind::kDbSize || kind == CommandKind::kScan ||
           kind == CommandKind::kRandomKey || kind == CommandKind::kKeys;
       const bool keyless_data =
           (flags & kCmdUsesDbGate) != 0 && (flags & kCmdNoKeys) != 0 &&
-          !database_inspection && kind != CommandKind::kFunction;
+          !database_inspection && kind != CommandKind::kFunction &&
+          !IsLuaInvocationCommand(request);
       const bool deferred =
-          kind == CommandKind::kMulti || kind == CommandKind::kExec ||
-          kind == CommandKind::kWatch || kind == CommandKind::kUnwatch ||
-          kind == CommandKind::kDiscard || kind == CommandKind::kScript ||
-          IsLuaInvocationCommand(request) || kind == CommandKind::kSortRo ||
-          kind == CommandKind::kSave || kind == CommandKind::kBgSave ||
-          kind == CommandKind::kXRead || kind == CommandKind::kXReadGroup ||
-          kind == CommandKind::kWait ||
-          ((flags & kCmdDynamicWrite) != 0 && kind != CommandKind::kFunction) ||
+          kind == CommandKind::kSortRo || kind == CommandKind::kSave ||
+          kind == CommandKind::kBgSave || kind == CommandKind::kWait ||
+          ((flags & kCmdDynamicWrite) != 0 && kind != CommandKind::kFunction &&
+           !IsLuaInvocationCommand(request)) ||
           keyless_data;
       if (deferred && !script_kill && !function_kill && !function_stats) {
         if (ctx.in_multi_) ctx.multi_dirty_ = true;
@@ -12991,7 +13098,9 @@ Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
   // Keep this wrapper non-coroutine. Reads, standalone requests, and
   // replica-applied writes need neither publisher admission nor final storage
   // outcome reconciliation, so they avoid a second coroutine frame.
-  if (!source_write) [[likely]] {
+  // Stream group reads reserve per concrete attempt, before acquiring their
+  // DB/key holds. Dormant waiters must not retain FULL UNSTARTED guards.
+  if (!source_write || request.kind_ == CommandKind::kXReadGroup) [[likely]] {
     if (request.cluster_authority_admission_ != nullptr &&
         ClusterRequestIsWrite(request) && !request.replication_origin_) {
       return ExecuteClusterFinalizedCommand(request, reply_builder, client_id,
@@ -13004,6 +13113,26 @@ Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
 }
 
 }  // namespace
+
+Task<absl::Status> RunReplicationAdmittedAttempt(
+    const CommandRequest& request,
+    std::function<Task<absl::Status>()> attempt) {
+  if (request.replication_origin_ || g_storage == nullptr ||
+      !g_storage->ReplicationLogActive()) {
+    co_return co_await attempt();
+  }
+  if (ReplicationEventExceedsBacklog(ReplicationEventAdmissionBytes(request))) {
+    co_return absl::ResourceExhaustedError(
+        "replication event exceeds repl-backlog-size or the 1 GiB event limit");
+  }
+  auto admission = co_await AcquireReplicationPublisherAdmission(
+      RequestArgumentBytes(request), &request);
+  if (!admission.ok()) co_return admission.status();
+  absl::Status result = co_await attempt();
+  absl::Status released =
+      co_await ReleaseReplicationPublisherAdmission(*admission);
+  co_return released.ok() ? result : released;
+}
 
 bool CommandWriteAdmissionIsCurrent(const CommandRequest& request) noexcept {
   return !request.write_admission_role_epoch_valid_ ||
