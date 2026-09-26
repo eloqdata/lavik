@@ -753,6 +753,9 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
 
   std::uint64_t txid = 0;
   if (write) {
+    absl::Status admitted = co_await g_storage->WaitForTxBacklog();
+    if (!admitted.ok())
+      co_return BuiltReply(AppendStorageError(reply_builder, admitted));
     txid = storage::StorageEngine::AllocateWriteTxid();
     context.tx_writes_.resize(g_storage->worker_count());
     g_storage->InitializeTxWrites(txid, context.tx_writes_,

@@ -1311,6 +1311,8 @@ constexpr std::string_view kTombRaiderSleepConfig = "tomb-raider-sleep-ms";
 constexpr std::string_view kTombRaiderDailyTimeConfig =
     "tomb-raider-daily-time";
 constexpr std::string_view kTxCleanerCooldownConfig = "tx-cleaner-cooldown-ms";
+constexpr std::string_view kTxBacklogLimitConfig =
+    "tx-backlog-limit-mb-per-worker";
 constexpr std::string_view kActiveExpirationIntervalConfig =
     "active-expiration-interval-ms";
 constexpr std::string_view kActiveExpirationMapStepsConfig =
@@ -1353,6 +1355,7 @@ enum class RuntimeConfigKey : std::uint8_t {
   kTombRaiderSleep,
   kTombRaiderDailyTime,
   kTxCleanerCooldown,
+  kTxBacklogLimit,
   kActiveExpirationInterval,
   kActiveExpirationMapSteps,
   kActiveExpirationDeletes,
@@ -1409,6 +1412,8 @@ constexpr std::array kRuntimeConfigs{
                             RuntimeConfigKey::kTombRaiderDailyTime},
     RuntimeConfigDescriptor{kTxCleanerCooldownConfig,
                             RuntimeConfigKey::kTxCleanerCooldown},
+    RuntimeConfigDescriptor{kTxBacklogLimitConfig,
+                            RuntimeConfigKey::kTxBacklogLimit},
     RuntimeConfigDescriptor{kActiveExpirationIntervalConfig,
                             RuntimeConfigKey::kActiveExpirationInterval},
     RuntimeConfigDescriptor{kActiveExpirationMapStepsConfig,
@@ -1600,6 +1605,9 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
           return FormatDailySecond(tomb_raider->daily_second_);
         case RuntimeConfigKey::kTxCleanerCooldown:
           return std::to_string(g_storage->TxCleanerCooldownMs());
+        case RuntimeConfigKey::kTxBacklogLimit:
+          return std::to_string(g_storage->TxBacklogLimitBytes() /
+                                (1024ULL * 1024));
         case RuntimeConfigKey::kActiveExpirationInterval:
         case RuntimeConfigKey::kActiveExpirationMapSteps:
         case RuntimeConfigKey::kActiveExpirationDeletes:
@@ -1879,6 +1887,15 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
             "value is not an integer or out of range");
       } else {
         configured = g_storage->ConfigureTxCleanerCooldown(value);
+      }
+    } else if (config->key_ == RuntimeConfigKey::kTxBacklogLimit) {
+      constexpr std::uint64_t kMiB = 1024ULL * 1024;
+      if (!ParseUint64(args[3], &value) || value < 8 ||
+          value > std::numeric_limits<std::uint64_t>::max() / kMiB) {
+        configured = absl::InvalidArgumentError(
+            "value must be at least 8 MiB and fit in 64 bits");
+      } else {
+        configured = g_storage->ConfigureTxBacklogLimit(value * kMiB);
       }
     } else if (config->key_ == RuntimeConfigKey::kShutdownCheckpoint) {
       const std::optional<bool> enabled = ParseConfigYesNo(args[3]);
@@ -4855,6 +4872,12 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
     info +=
         "tx_cleaner_cooldown_ms:" + std::to_string(tx_cleaner.cooldown_ms_) +
         "\r\n";
+    info += "tx_backlog_limit_bytes_per_worker:" +
+            std::to_string(tx_cleaner.backlog_limit_bytes_) + "\r\n";
+    info += "tx_backlog_max_worker_bytes:" +
+            std::to_string(tx_cleaner.max_worker_backlog_bytes_) + "\r\n";
+    info += "tx_backlog_waits:" + std::to_string(tx_cleaner.backlog_waits_) +
+            "\r\n";
     info += std::string("tx_cleaner_running:") +
             (tx_cleaner.running_ ? "1\r\n\r\n" : "0\r\n\r\n");
     info += "tx_commit_batches:" + std::to_string(tx_commit_batches.batches_) +
@@ -5556,7 +5579,9 @@ Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
     Context* context, TwoPhaseCallback read_callback,
     TwoPhaseCallback write_callback, TwoPhaseCallback single_shard_callback,
     ShouldSkip should_skip) {
-  absl::Status status = co_await transaction.Schedule();
+  absl::Status status = co_await g_storage->WaitForTxBacklog();
+  if (!status.ok()) co_return TwoPhaseResult{std::move(status)};
+  status = co_await transaction.Schedule();
   if (!status.ok()) co_return TwoPhaseResult{std::move(status)};
 
   const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
@@ -6233,6 +6258,13 @@ Task<CommandReply> ExecuteMultiKey(
   }
 
   const bool write = (request.spec_->flags_ & kCmdWrite) != 0;
+  if (write && keys->count() > 1) {
+    absl::Status admitted = co_await g_storage->WaitForTxBacklog();
+    if (!admitted.ok()) {
+      if (replication_order != nullptr) replication_order->Release();
+      co_return BuiltReply(AppendStorageError(reply_builder, admitted));
+    }
+  }
   tx::Transaction txn;
   for (std::size_t i = keys->first_; i <= keys->last_; i += keys->step_) {
     txn.AddKey(ShardForKey(args[i]), request.db_id_,
@@ -8283,6 +8315,11 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
   ClusterShardValidatorContext cluster_validator;
 
   if (key_count != 0) {
+    if (!read_only) {
+      absl::Status admitted = co_await g_storage->WaitForTxBacklog();
+      if (!admitted.ok())
+        co_return BuiltReply(AppendStorageError(reply_builder, admitted));
+    }
     transaction.emplace();
     for (std::size_t i = 0; i < key_count; ++i) {
       const std::string& key = declared_keys[i];
@@ -9863,13 +9900,21 @@ Task<CommandReply> ExecuteExecBody(
   }
 
   if (!dbs.empty()) {
+    const auto write_request =
+        std::find_if(queued.begin(), queued.end(), ExecCommandMayWrite);
+    if (write_request != queued.end()) {
+      absl::Status admitted = co_await g_storage->WaitForTxBacklog();
+      if (!admitted.ok()) {
+        co_await DropWatches(ctx);
+        co_return finalize_exec_reply(
+            BuiltReply(AppendStorageError(reply_builder, admitted)));
+      }
+    }
     // One write id for the whole EXEC: every record any of its commands
     // writes carries it, and one commit record at the end covers them all.
     // Read-only transactions collect no fences and append no commit.
     const std::uint64_t exec_txid = storage::StorageEngine::AllocateWriteTxid();
     std::vector<storage::TxShardWrites> tx_writes(g_storage->worker_count());
-    const auto write_request =
-        std::find_if(queued.begin(), queued.end(), ExecCommandMayWrite);
     g_storage->InitializeTxWrites(
         exec_txid, tx_writes,
         write_request == queued.end()
@@ -13094,10 +13139,9 @@ Task<CommandReply> ExecuteClusterFinalizedCommand(
                                          std::move(reply));
 }
 
-Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
-                                          ReplyBuilder& reply_builder,
-                                          std::uint64_t client_id,
-                                          ConnectionContext* connection) {
+Task<CommandReply> ExecutePostTxBacklogAdmission(
+    CommandRequest& request, ReplyBuilder& reply_builder,
+    std::uint64_t client_id, ConnectionContext* connection) {
   const bool source_write =
       !request.replication_origin_ && request.spec_ != nullptr &&
       (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
@@ -13117,6 +13161,36 @@ Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
   }
   return ExecuteAdmittedWriteCommand(request, reply_builder, client_id,
                                      connection);
+}
+
+Task<CommandReply> WaitForTxBacklogAndExecute(CommandRequest& request,
+                                              ReplyBuilder& reply_builder,
+                                              std::uint64_t client_id,
+                                              ConnectionContext* connection) {
+  absl::Status admitted = co_await g_storage->WaitForTxBacklog();
+  if (!admitted.ok())
+    co_return BuiltReply(AppendStorageError(reply_builder, admitted));
+  co_return co_await ExecutePostTxBacklogAdmission(request, reply_builder,
+                                                   client_id, connection);
+}
+
+Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
+                                          ReplyBuilder& reply_builder,
+                                          std::uint64_t client_id,
+                                          ConnectionContext* connection) {
+  // A standalone grouped write can create its storage transaction only after
+  // acquiring a key intent. Wait at this outer boundary so an old snapshot
+  // needing that key is never held up by the writer waiting for Tx cleanup.
+  if (!request.replication_origin_ && request.spec_ != nullptr &&
+      (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
+      request.kind_ != CommandKind::kFlushDb &&
+      request.kind_ != CommandKind::kFlushAll && g_storage != nullptr &&
+      g_storage->TxBacklogAtLimit()) {
+    return WaitForTxBacklogAndExecute(request, reply_builder, client_id,
+                                      connection);
+  }
+  return ExecutePostTxBacklogAdmission(request, reply_builder, client_id,
+                                       connection);
 }
 
 }  // namespace

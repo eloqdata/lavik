@@ -141,6 +141,7 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
       co_await store->store_state_mutex_.Lock();
       UnlockGuard guard(&store->store_state_mutex_, store->worker_);
       FlushActiveBlock(*store);
+      SealIdleTxBlocksLocal(*store);
     }
     RequestIndirectKeyCleaning(*store);
     status = co_await MaybeRunTxCleaner();

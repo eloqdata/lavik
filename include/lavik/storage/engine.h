@@ -71,6 +71,9 @@ struct StorageEngineOptions {
   // Minimum delay between transaction-generation rotations/cleaning rounds.
   // Zero disables the cleaner; it can be changed at runtime through CONFIG.
   std::uint32_t tx_cleaner_cooldown_ms_ = 60'000;
+  // Soft admission threshold for occupied bytes in sealed, unreclaimed
+  // transaction blocks on each worker. An admitted transaction may exceed it.
+  std::uint64_t tx_backlog_limit_bytes_ = kStorageBlockBytes;
   std::size_t flush_size_bytes_ = 128 * 1024;
   // Bounded, per-worker staging memory for commands waiting to enter the
   // shared in-memory replication backlog.
@@ -246,6 +249,9 @@ struct TxCleanerTotals {
   std::uint64_t retired_generations_ = 0;
   std::uint64_t retired_blocks_ = 0;
   std::uint32_t cooldown_ms_ = 0;
+  std::uint64_t backlog_limit_bytes_ = 0;
+  std::uint64_t max_worker_backlog_bytes_ = 0;
+  std::uint64_t backlog_waits_ = 0;
   bool running_ = false;
 };
 
@@ -1872,6 +1878,16 @@ class StorageEngine {
   TxCleanerTotals TxCleanerStats() const noexcept;
   std::uint32_t TxCleanerCooldownMs() const noexcept;
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
+  // Runtime soft limit for occupied bytes in sealed, unreclaimed Tx blocks on
+  // each worker. Values below 8 MiB are rejected.
+  std::uint64_t TxBacklogLimitBytes() const noexcept;
+  absl::Status ConfigureTxBacklogLimit(std::uint64_t bytes);
+  // Returns whether any worker's sealed Tx-record backlog exceeds the
+  // current new-transaction admission threshold.
+  bool TxBacklogAtLimit() const noexcept;
+  // Wait before beginning a new storage transaction, without holding a key
+  // intent or generation lease. Existing transactions never wait here.
+  bycorf::Task<absl::Status> WaitForTxBacklog();
   bycorf::Task<StorageDurabilityStats> DurabilityStats() const;
   bycorf::Task<StorageMetricsSnapshot> CollectMetrics() const;
 

@@ -981,6 +981,17 @@ int main(int argc, char** argv) {
     Expect(client.Command({"CONFIG", "GET", "tx-cleaner-cooldown-ms"}),
            "*2\r\n" + Bulk("tx-cleaner-cooldown-ms") + "\r\n" + Bulk("20"),
            "read tx cleaner cooldown");
+    Expect(
+        client.Command({"CONFIG", "GET", "tx-backlog-limit-mb-per-worker"}),
+        "*2\r\n" + Bulk("tx-backlog-limit-mb-per-worker") + "\r\n" + Bulk("8"),
+        "default transaction backlog admission threshold");
+    const std::string too_small = client.Command(
+        {"CONFIG", "SET", "tx-backlog-limit-mb-per-worker", "7"});
+    if (!too_small.starts_with("-ERR"))
+      Fail("accepted transaction backlog threshold below one block");
+    Expect(client.Command(
+               {"CONFIG", "SET", "tx-backlog-limit-mb-per-worker", "8"}),
+           "+OK", "set minimum transaction backlog threshold");
     const std::uint64_t cleaner_baseline = TxCleanerRetiredGenerations(client);
     Expect(
         client.Command({"MSET", "cleaner-a", "after-a", "cleaner-b", "after-b",
@@ -1120,6 +1131,38 @@ int main(int argc, char** argv) {
     Expect(generation_recovery.Command(
                {"EXISTS", "cleaner-flush-a", "cleaner-flush-b"}),
            ":0", "FLUSHDB values after transaction generation retirement");
+    // One admitted transaction can cross the 8 MiB backlog threshold. Its
+    // sealed blocks must become reclaimable after commit; the next transaction
+    // waits before taking any key intent, even though its tail is still open.
+    Expect(generation_recovery.Command(
+               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "60000"}),
+           "+OK", "hold periodic cleaning during backlog admission fixture");
+    const std::uint64_t block_baseline =
+        InfoStat(generation_recovery, "tx_cleaner_retired_blocks:");
+    const std::uint64_t wait_baseline =
+        InfoStat(generation_recovery, "tx_backlog_waits:");
+    std::string large_value(1024 * 1024, 'q');
+    std::vector<std::string> pressure_keys;
+    std::vector<std::string_view> pressure_args{"MSET"};
+    pressure_keys.reserve(18);
+    pressure_args.reserve(37);
+    for (unsigned i = 0; i < 18; ++i) {
+      pressure_keys.push_back("{tx-pressure}" + std::to_string(i));
+      pressure_args.push_back(pressure_keys.back());
+      pressure_args.push_back(large_value);
+    }
+    Expect(generation_recovery.Command(pressure_args), "+OK",
+           "single transaction may exceed the backlog threshold");
+    Expect(generation_recovery.Command({"MSET", "{tx-pressure}next", "next",
+                                        "{tx-pressure}last", "last"}),
+           "+OK", "new transaction waits for sealed block cleanup");
+    if (InfoStat(generation_recovery, "tx_backlog_waits:") <= wait_baseline)
+      Fail("new transaction skipped the exceeded backlog admission threshold");
+    if (!WaitForCleanerStat(generation_recovery,
+                            "tx_cleaner_retired_blocks:", block_baseline))
+      Fail("sealed committed transaction block was not reclaimed");
+    Expect(generation_recovery.Command({"GET", pressure_keys.front()}),
+           Bulk(large_value), "large transaction survives block promotion");
     generation_recovery_server.Stop();
 
 #if LAVIK_TEST_FAULTS_AVAILABLE
@@ -1129,6 +1172,8 @@ int main(int argc, char** argv) {
     ServerProcess rollback_server(argv[1], port, data_path, log_path,
                                   "cleaner-undo-d");
     RespClient rollback = ConnectReady(port);
+    Expect(rollback.Command({"GET", pressure_keys.front()}), Bulk(large_value),
+           "large transaction remains readable after restart");
     Expect(rollback.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "enable tx cleaner during rollback");
     for (std::string_view key : {"cleaner-undo-a", "cleaner-undo-b",

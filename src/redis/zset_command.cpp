@@ -3205,6 +3205,8 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
   context.single_shard_ = transaction.single_shard();
   std::uint64_t txid = 0;
   if (context.store_) {
+    absl::Status admitted = co_await g_storage->WaitForTxBacklog();
+    if (!admitted.ok()) co_return Built(StorageError(builder, admitted));
     txid = storage::StorageEngine::AllocateWriteTxid();
     context.writes_.resize(g_storage->worker_count());
     g_storage->InitializeTxWrites(txid, context.writes_,
