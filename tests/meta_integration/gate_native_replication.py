@@ -342,17 +342,32 @@ def grouped_streams(root):
 def replay_and_reconnect(root):
     with pair(root, "replay", seed=seed_collections) as (meta, source, target, writer):
         ready(meta)
+
+        # Created replaces the initial population directive with Follow Owner.
+        # Meta readiness can precede that ingress reconnect; observe the live
+        # data plane before retaining the client used by the WATCH regression.
+        def flows_ready():
+            probe = Client(target, readonly=True)
+            try:
+                info = dict(
+                    line.split(":", 1)
+                    for line in probe.call("INFO", "replication").splitlines()
+                    if ":" in line
+                )
+                # The source has two data shards and the target has three.
+                # Their extra Meta workers must never become replication flows.
+                return (
+                    info.get("master_link_status") == "up"
+                    and info.get("lavik_source_workers") == "2"
+                    and info.get("lavik_connected_flows") == "2"
+                    and probe.call("GET", "{native}seed") == "baseline"
+                )
+            finally:
+                probe.close()
+
+        H.wait_until("two source data flows online and seed readable", 30, flows_ready)
         reader = Client(target, readonly=True)
         try:
-            # The source has two data shards and the target has three. Their
-            # extra Meta workers must never become replication flows.
-            info = dict(
-                line.split(":", 1)
-                for line in reader.call("INFO", "replication").splitlines()
-                if ":" in line
-            )
-            assert info.get("lavik_source_workers") == "2", info
-            assert info.get("lavik_connected_flows") == "2", info
             assert reader.call("GET", "{native}seed") == "baseline"
             assert reader.call("HGET", "{native}hash", "keep") == "value"
             assert reader.call("LRANGE", "{native}list", 0, -1) == ["a", "b"]
