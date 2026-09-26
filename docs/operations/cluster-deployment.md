@@ -86,11 +86,25 @@ DBSIZE retains its existing index-count semantics, which can include expired
 records awaiting cleanup. SCAN is an ordinary cursor traversal, not a snapshot;
 restart it from cursor zero after changing databases or replacing the population.
 
-KEYS holds its database gate until the streamed reply completes or the connection
-closes. A client that continues reading slowly can delay FULL or promotion cuts
-that need every database gate. The existing 30-second watchdog detects stalled
-network progress; it is not a total-duration deadline or failover cancellation.
-Use bounded SCAN requests for routine inspection of large databases.
+Owner authority loss and serving role/population changes close existing Data
+client connections, including idle pools, blocking commands and subscriptions.
+Reconnect for diagnostics. `ROLE` and the standard `INFO replication` role still
+report the local replication role: `master` does not prove permission to serve.
+Use `lavik_owner_authority` and `lavik_data_readable` to explain current admission;
+only the actual data request determines whether it can proceed.
+
+A new connection can receive MASTERDOWN/LOADING/READONLY without being closed
+merely for that error. New SUBSCRIBE/PSUBSCRIBE also remain allowed while fenced.
+Original Sentinel-aware client pools and Pub/Sub objects can rediscover and
+resubscribe, but an isolated old Owner must undergo role reconfiguration before
+subscribers attached there are guaranteed to migrate. Discovery must be reachable
+and the new Owner must serve. Messages during the gap are lost, not replayed.
+
+Retirement does not wait for slow clients to consume pending replies. A missing
+reply does not prove a write failed, and reconnecting does not make blind retries
+safe; use application-level idempotency where needed. Streaming KEYS retains its
+database gate until reply completion or disconnect; bounded SCAN requests remain
+preferable for routine inspection of large databases.
 
 No seeds means the existing standalone recovery rules also apply to files last
 used by a managed node. There is no detach step or extra persisted management

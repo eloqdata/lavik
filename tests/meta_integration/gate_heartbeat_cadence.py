@@ -17,6 +17,7 @@
 
 import os
 from pathlib import Path
+import select
 import socket
 import struct
 import sys
@@ -139,6 +140,12 @@ def run(root):
             "late Acks must expire authority",
             timeout=3,
         )
+        # The lease boundary retires the old socket. A new diagnostic socket
+        # must still receive the ordinary admission error while fenced.
+        assert select.select([client.socket], [], [], 5)[0]
+        assert client.reader.read(1) == b""
+        client.close()
+        client = Client(data)
         try:
             client.call("SET", "{cadence}must-fence", "invalid")
         except H.Failure as error:

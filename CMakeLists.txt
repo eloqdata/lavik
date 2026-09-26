@@ -1074,7 +1074,7 @@ if (BUILD_TESTING)
                 $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
       )
       set_tests_properties(meta_integration.gate_native_replication PROPERTIES
-        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+        LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
 
       add_test(
         NAME meta_integration.gate_bootstrap
@@ -1091,7 +1091,7 @@ if (BUILD_TESTING)
                 $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
       )
       set_tests_properties(meta_integration.gate_managed_single PROPERTIES
-        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+        LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
 
       add_test(
         NAME meta_integration.gate_managed_single_blocking
@@ -1110,7 +1110,7 @@ if (BUILD_TESTING)
                 $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
                 $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI})
       set_tests_properties(meta_integration.gate_function_catalog PROPERTIES
-        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+        LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
 
       add_test(
         NAME meta_integration.gate_managed_flush
@@ -1134,6 +1134,18 @@ if (BUILD_TESTING)
             LABELS meta-integration TIMEOUT 900 RUN_SERIAL TRUE)
         endforeach()
       endif()
+
+      foreach(retirement_case IN ITEMS expiry controlled)
+        add_test(
+          NAME meta_integration.client_retirement_${retirement_case}
+          COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_client_retirement.py
+                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                  $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+                  ${retirement_case})
+        set_tests_properties(meta_integration.client_retirement_${retirement_case}
+          PROPERTIES LABELS meta-integration TIMEOUT 180 RUN_SERIAL TRUE)
+      endforeach()
 
       # lavik-meta's deterministic failover seams follow the ordinary
       # !NDEBUG policy; LAVIK_ENABLE_TEST_FAULTS instruments only Data.
@@ -1339,7 +1351,7 @@ if (BUILD_TESTING)
                 ${sentinel_client_go_dir}/go.sum
         VERBATIM)
       add_custom_target(lavik_sentinel_client_go ALL DEPENDS ${sentinel_client_go_bin})
-      foreach(scenario meta data)
+      foreach(scenario meta data expiry controlled fault gap)
         add_test(NAME meta_integration.sentinel_ha_${scenario}
           COMMAND ${CMAKE_COMMAND} -E env
             "LAVIK_SENTINEL_REDIS_PY=${LAVIK_CLUSTER_CLIENT_REDIS_PY}"
@@ -1489,6 +1501,7 @@ if (BUILD_TESTING)
 
   add_executable(lavik_unit_tests
     tests/buffer_pool_test.cpp
+    tests/client_retirement_test.cpp
     tests/cluster_authority_test.cpp
     tests/cluster_command_test.cpp
     tests/cluster_topology_test.cpp

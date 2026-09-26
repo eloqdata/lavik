@@ -53,6 +53,27 @@ counts, blocking state, and replication-session identity. All disconnect paths
 return through one cleanup point which unregisters client, monitor, Pub/Sub, and
 WATCH state.
 
+Meta-managed serving boundaries retire ordinary client connections, including
+idle, blocking and Pub/Sub sessions. After authority admission closes, each
+worker is notified to shut down all ordinary connections registered when it
+handles the notification. Role or population replacement requests another
+sweep. Recent reconnects may also be closed; no per-connection generation or
+CLIENT ID cutoff is maintained. Workers inspect their current registry rather
+than retaining old file descriptors. A local closing marker prevents further
+buffered commands from dispatching once that worker starts cleanup. Shutdown
+wakes blocked I/O and waiters; coroutine cleanup retains ownership until
+in-flight work finishes, without waiting to flush replies.
+Meta control and established native replication/donor sessions retain their own
+lifecycles. Protocol handshakes remain ordinary clients until classified.
+
+Connections established after a worker finishes its sweep can diagnose,
+subscribe and receive ordinary
+admission errors without being disconnected merely for those errors. They can
+survive same-node reauthorization; a subsequent role transition retires them.
+Pub/Sub reconnect/resubscribe is the client's responsibility and does not replay
+lost messages. Moving subscribers away from a fenced old Owner requires its
+role reconfiguration as well as reachable discovery and a serving new Owner.
+
 `RedisService` applies one process-wide `maxclients` limit across its plaintext
 and TLS endpoints before registering an accepted socket or starting TLS. The
 limit and active count belong to the Redis protocol service; other Bycorf TCP

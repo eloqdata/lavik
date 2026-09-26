@@ -15,6 +15,7 @@ import queue
 import select
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -102,8 +103,77 @@ class DataProxy(H.Proxy):
         super()._pump(src, dst, pair)
 
 
+class ControlProxy(DataProxy):
+    """Selectively isolate a Data identity on the real control transport."""
+
+    def __init__(self, node):
+        super().__init__(f"control-{node.id}", node.data_control_port)
+        self.isolated = None
+        self.identities = {}
+
+    def isolate(self, node_id):
+        with self._lock:
+            self.isolated = node_id
+            pairs = [
+                p for p, identity in self.identities.items() if identity == node_id
+            ]
+        for pair in pairs:
+            self._cut_pair(pair)
+
+    def _on_accept(self, conn):
+        threading.Thread(target=self._route, args=(conn,), daemon=True).start()
+
+    def _route(self, conn):
+        upstream = None
+        try:
+            conn.settimeout(3)
+
+            def exact(size):
+                data = b""
+                while len(data) < size:
+                    chunk = conn.recv(size - len(data))
+                    if not chunk:
+                        raise OSError("control hello ended")
+                    data += chunk
+                return data
+
+            header = exact(28)
+            magic, version = struct.unpack_from(">IH", header)
+            size = struct.unpack_from(">I", header, 12)[0]
+            if magic != 0x4C564350 or version != 1 or not 44 <= size <= 1048576:
+                raise OSError("invalid control hello")
+            payload = exact(size)
+            identity = payload[4:44].decode()
+            upstream = socket.create_connection(self.target, timeout=3)
+            pair = (conn, upstream)
+            with self._lock:
+                if identity == self.isolated:
+                    return
+                self._pairs.add(pair)
+                self.identities[pair] = identity
+            upstream.sendall(header + payload)
+            conn.settimeout(None)
+            upstream.settimeout(None)
+            for src, dst in ((conn, upstream), (upstream, conn)):
+                threading.Thread(
+                    target=self._pump, args=(src, dst, pair), daemon=True
+                ).start()
+            conn = upstream = None
+        except OSError:
+            pass
+        finally:
+            for sock in (conn, upstream):
+                if sock is not None:
+                    self._close_sock(sock)
+
+    def _cut_pair(self, pair):
+        super()._cut_pair(pair)
+        with self._lock:
+            self.identities.pop(pair, None)
+
+
 class Fixture(D.DiscoveryFixture):
-    def __init__(self, meta, data, ctl, directory, third=False):
+    def __init__(self, meta, data, ctl, directory, third=False, control_fault=False):
         super().__init__(meta, data, ctl, directory)
         if third:
             node = DataProcess(
@@ -111,6 +181,14 @@ class Fixture(D.DiscoveryFixture):
             )
             self.data_nodes.append(node)
             self.by_id[node.node_id] = node
+        self.control_proxies = (
+            [ControlProxy(node) for node in self.metas] if control_fault else []
+        )
+        for node, proxy in zip(self.metas, self.control_proxies):
+            node.advertised_data_control_endpoint = proxy.endpoint
+        if self.control_proxies:
+            for node in self.data_nodes:
+                node.seed = self.control_proxies[0].endpoint
         self.raft_proxies = [RaftProxy(node) for node in self.metas]
         for node, proxy in zip(self.metas, self.raft_proxies):
             node.advertised_raft_endpoint = proxy.endpoint
@@ -119,12 +197,16 @@ class Fixture(D.DiscoveryFixture):
             proxy = DataProxy(f"data-{node.node_id[:4]}", node.redis_port)
             node.discovery_endpoint = "tcp://" + proxy.endpoint
             self.data_proxies[node.node_id] = proxy
-        for proxy in self.raft_proxies + list(self.data_proxies.values()):
+        for proxy in (
+            self.raft_proxies + self.control_proxies + list(self.data_proxies.values())
+        ):
             proxy.start()
 
     def force_kill(self):
         super().force_kill()
-        for proxy in self.raft_proxies + list(self.data_proxies.values()):
+        for proxy in (
+            self.raft_proxies + self.control_proxies + list(self.data_proxies.values())
+        ):
             proxy.close()
 
     def cut_data_connections(self):
@@ -219,6 +301,10 @@ def recover(clients, description, start=None):
                 value = client.get("sentinel-ha-" + name)
                 if value not in (description, description.encode()):
                     raise H.Failure(f"{name}: wrong value {value!r}")
+                if time.monotonic() - start > 30:
+                    raise H.Failure(
+                        f"{name}: successful command exceeded 30s recovery budget"
+                    )
                 del pending[name]
                 H.log(
                     f"{description}: {name} recovered at {time.monotonic() - start:.3f}s; errors={errors.get(name, [])}"
@@ -605,12 +691,22 @@ def main():
     H.set_tag(f"sentinel-ha-{scenario}")
     C.META, C.DATA, C.CTL = meta, data, ctl
     fixture = Fixture(
-        meta, data, ctl, directory_path / "cluster", third=scenario == "data"
+        meta,
+        data,
+        ctl,
+        directory_path / "cluster",
+        third=scenario == "data",
+        control_fault=scenario == "gap",
     )
     try:
-        (meta_case if scenario == "meta" else data_case)(
-            fixture, go_binary, directory_path
-        )
+        if scenario in ("expiry", "controlled", "fault", "gap"):
+            from gate_sentinel_retirement import run
+
+            run(fixture, go_binary, directory_path, scenario)
+        else:
+            (meta_case if scenario == "meta" else data_case)(
+                fixture, go_binary, directory_path
+            )
         fixture.clean_shutdown()
     except Exception:
         fixture.dump_logs()

@@ -23,7 +23,7 @@
 // the storage publication cut after intervening suspension.
 //
 // Admit() and AuthorityUnchanged() remain pure routing/test helpers over
-// committed ServingState values; they do not carry a lease generation,
+// committed ServingState values; they do not carry a live lease,
 // deadline, or in-flight registration and therefore are not safe substitutes
 // for AuthorityGuard on a request path. Wire mapping
 // (MOVED/CLUSTERDOWN/CROSSSLOT/LOADING text) lives in the Redis layer.
@@ -166,7 +166,7 @@ struct AuthorityAnchor {
 
 // Captures both the routing verdict and everything needed for the mandatory
 // side-effect recheck. Callers do not reconstruct an admission from a bare
-// ServingState; that would omit the lease generation and deadline proof.
+// ServingState; that would omit the current lease and deadline proof.
 class AuthorityAdmission {
  public:
   AuthorityAdmission() = default;
@@ -208,7 +208,6 @@ class AuthorityAdmission {
   Decision decision_;
   std::shared_ptr<const ServingState> state_;
   absl::InlinedVector<std::uint16_t, 4> slots_;
-  std::uint64_t gate_generation_ = 0;
   // Retain the capability, never a sampled deadline: renewal and revocation
   // change this object without publishing a replacement authority snapshot.
   std::shared_ptr<LeaseDeadline> lease_;
@@ -236,11 +235,16 @@ class NodeControlInstaller;
 // authority.
 class AuthorityGuard {
  public:
-  explicit AuthorityGuard(TopologyCache& topology);
+  // Called synchronously after publishing the loss/replacement of an installed
+  // lease. Bootstrap-only binding; the callback must not block or reenter a
+  // control writer. Ordinary renewals and replica-only updates do not call it.
+  using RetirementCallback = void (*)() noexcept;
+  explicit AuthorityGuard(TopologyCache& topology,
+                          RetirementCallback retirement_callback = nullptr);
   AuthorityGuard(const AuthorityGuard&) = delete;
   AuthorityGuard& operator=(const AuthorityGuard&) = delete;
 
-  // Captures a coherent serving verdict and lease generation at `now`.
+  // Captures a coherent serving verdict and finite lease proof at `now`.
   // Meta-managed local-primary requests fail closed when no exact unexpired
   // lease exists. A mutating request must retain the returned record and pass
   // it through RegisterAndRecheck while holding the resulting guards across
@@ -300,7 +304,6 @@ class AuthorityGuard {
   struct AuthorityState {
     std::optional<SessionIdentity> session_;
     absl::flat_hash_map<std::string, Lease> leases_;
-    std::uint64_t generation_ = 1;
   };
 
   struct LeaseCheck {
@@ -346,6 +349,7 @@ class AuthorityGuard {
   void InvalidateLeases();
   void InvalidateAll();
 
+  RetirementCallback retirement_callback_ = nullptr;
   TopologyCache& topology_;
   // Only control-plane writers acquire this mutex. Request admission and
   // mutation rechecks read immutable, independently versioned snapshots.

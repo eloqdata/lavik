@@ -625,12 +625,19 @@ void SetServerInfo(std::string bind_ip, std::uint16_t port,
 // Connection accounting for INFO's Clients section.
 void ConnectionOpened() noexcept;
 void ConnectionClosed() noexcept;
-
 // CLIENT metadata is worker-local. Replication socket handoff unregisters on
 // the accepting worker and registers the same identity on the owning worker.
+// context is borrowed on the owning worker until UnregisterClientConnection.
 void RegisterClientConnection(std::uint64_t id, int fd, std::string address,
                               bool tls, bool replica = false,
-                              std::uint64_t replication_session_id = 0);
+                              std::uint64_t replication_session_id = 0,
+                              ConnectionContext* context = nullptr);
+// Notifies each socket-owning worker to close all ordinary/PubSub connections
+// present when it handles the notification, including recent reconnects.
+// Established replication/donor sessions are excluded. Call after closing data
+// admission; asynchronous socket cleanup does not replace internal mutation
+// drain.
+void RetireClientConnections() noexcept;
 void SetClientReplicationSession(std::uint64_t id,
                                  std::uint64_t replication_session_id) noexcept;
 void SetClientName(std::uint64_t id, std::string name) noexcept;

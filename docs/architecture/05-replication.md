@@ -253,11 +253,15 @@ rejected, as are unauthenticated native and Redis replication exports. These
 restrictions prevent standalone role control or imported data from being
 mistaken for an authorized cluster population.
 
-Managed Single separates transport role from complete-population read permission.
-Worker 0 derives serving generation from the existing Ready proof, native data
-validity and population incarnation. A same-population reconnect preserves that
-generation; destructive FULL, proof invalidation or uncertain apply closes it
-before draining DB operations. FULL cancellation cannot restore an old proof.
+Worker 0 derives the boot-local serving generation from the existing Ready
+proof, native data validity and population incarnation. Both managed client
+modes retain that generation across a same-population incremental reconnect.
+Cluster temporarily closes its open bit while disconnected and reopens it at
+the same generation after CONTINUE; Managed Single permits complete-population
+reads across that interval. Destructive FULL, proof invalidation or uncertain
+apply advances the generation before draining DB operations, including when
+Cluster admission was already closed by a disconnect. FULL cancellation cannot
+restore an old proof.
 Client read checks consume the published generation; no second population
 registry, read lease or blocking cross-worker request lock is introduced.
 `replica-serve-stale-data no` additionally requires an online replication link.
@@ -307,12 +311,13 @@ The native handler checks both the exact current capability and `now < deadline`
 under the same source mutex that publishes the session, so a late timer cannot
 admit work after expiry.
 
-Lease expiry closes only new admission. It retains current FDS capabilities and
-every population session already published across the mutex boundary, including
-a session that has not reached ONLINE; a later exact lease renewal reopens the
-gate in O(1). A live FDS replacement clears and replays capabilities while an
-unchanged, unexpired gate may remain open. The authenticated FDS supplies the
-number of local `authorize-source` capabilities its directive lane must replay.
+Native source lease expiry closes new source admission. It retains current FDS
+capabilities and every population session already published across the mutex
+boundary, including a session that has not reached ONLINE; a later exact lease
+renewal reopens the gate in O(1). A live FDS replacement clears and replays
+capabilities while an unchanged, unexpired gate may remain open. The authenticated
+FDS supplies the number of local `authorize-source` capabilities its directive
+lane must replay.
 That pending count and every installed capability reserve the current source
 history; a source-valid handshake during the bounded replay gap is denied data
 with `LVLEASESUSPENDED` and uses the target's finite retry path. Each newly
@@ -1039,14 +1044,16 @@ instead enters the current-boot terminal latch; the manager cannot safely
 start another attempt in the same physical indexes.
 
 Role transitions also fence client work with a packed serving generation.
-Closing a population advances the generation and wakes all blocking registries;
+Retiring a population advances the generation and wakes all blocking registries;
 commands revalidate after acquiring ordinary database admission or draining a
 self-managed exclusive database cut, so queued, blocked, scanning, and backup
 requests from the previous population cannot observe or capture the rebuilt
 indexes. A self-gated command that validates first retains its gate through the
 point that makes its result stable, so a later replacement waits instead of
 invalidating an already committed result. Replication-origin apply bypasses
-this client fence while the population is closed.
+this client fence while the population is closed. A transport-only Cluster
+disconnect closes admission without advancing the retained population's
+generation or waking blocked requests merely to invalidate their tokens.
 
 ## Online apply and rendezvous
 
@@ -1197,6 +1204,20 @@ offsets, and `slave_priority`. Native and Redis link progress are mapped onto
 these process-local compatibility offsets. Sentinel's named Pub/Sub
 connections also appear in `CLIENT LIST` and can be selected by `CLIENT KILL
 TYPE pubsub`.
+
+In Meta-managed mode the standard role remains the actual local replication
+role, independently of finite serving authority: an expired Owner can still
+report `master`. `INFO replication` adds `lavik_owner_authority` (a current
+keyed read is admitted as Owner) and `lavik_data_readable` (Owner or legal replica
+admission plus a readable population). These instantaneous diagnostics are not
+an authorization token for subsequent requests. Serving population invalidation
+and primary/replica role changes retire ordinary clients; a complete
+replica's same-population transport reconnect preserves its connections even
+when Cluster read admission temporarily closes with the link.
+Promotion preparation closes serving admission and retires client senders
+before acquiring database gates and joining active database guards. This lets streamed replies release their
+guards through normal disconnect cleanup without making promotion wait for a
+slow client to consume output; storage work still drains before durability cuts.
 
 Sentinel normally queues `REPLICAOF`/`SLAVEOF`, `CONFIG REWRITE`, and `CLIENT
 KILL TYPE normal|pubsub` in one `MULTI`/`EXEC`. Lavik accepts these commands

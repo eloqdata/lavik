@@ -41,6 +41,8 @@ struct ConnectionContext {
                                             ConnectionContext&,
                                             std::span<const std::string>,
                                             ReplyBuilder&);
+  // Worker-local shutdown marker: buffered commands stop once cleanup starts.
+  bool closing_ = false;
   std::uint8_t selected_db_ = 0;
   bool authenticated_ = true;
   bool authentication_required_ = false;

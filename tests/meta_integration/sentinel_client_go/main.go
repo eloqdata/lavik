@@ -59,6 +59,12 @@ func main() {
 		},
 	})
 	defer client.Close()
+	var subscription *redis.PubSub
+	defer func() {
+		if subscription != nil {
+			subscription.Close()
+		}
+	}()
 	scanner := bufio.NewScanner(os.Stdin)
 	encoder := json.NewEncoder(os.Stdout)
 	for scanner.Scan() {
@@ -74,6 +80,25 @@ func main() {
 			value, err = client.Set(ctx, req.Key, req.Value, 0).Result()
 		case "get":
 			value, err = client.Get(ctx, req.Key).Result()
+		case "subscribe":
+			if subscription != nil {
+				err = fmt.Errorf("subscription already exists")
+				break
+			}
+			subscription = client.Subscribe(ctx, req.Key)
+			_, err = subscription.Receive(ctx)
+		case "receive":
+			if subscription == nil {
+				err = fmt.Errorf("no subscription")
+				break
+			}
+			var message *redis.Message
+			message, err = subscription.ReceiveMessage(ctx)
+			if err == nil {
+				value = message.Payload
+			}
+		case "publish":
+			value, err = client.Publish(ctx, req.Key, req.Value).Result()
 		case "stats":
 			stats.mu.Lock()
 			value = map[string]any{"dialed": clone(stats.dialed), "closed": clone(stats.closed)}

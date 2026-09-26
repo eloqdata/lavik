@@ -71,7 +71,9 @@ def inspect_database(client):
 
 
 def basic_and_stale(root):
-    with pair(root, "single-read", client_mode="single") as (
+    with pair(
+        root, "single-read", client_mode="single", raft_args=C.creation_raft_args()
+    ) as (
         meta,
         source,
         target,
@@ -168,6 +170,10 @@ def basic_and_stale(root):
             )
             time.sleep(2)
             assert reader.call("GET", "count") == "2"
+            # Owner loss retires the old TCP session; diagnostics/admission
+            # errors remain available on a new connection.
+            writer.close()
+            writer = Client(source)
             rejects(writer, ("GET", "count"), "MASTERDOWN")
             rejects(writer, ("SET", "count", "bad"), "MASTERDOWN")
             for command in (("DBSIZE",), ("SCAN", 0), ("KEYS", "*"), ("RANDOMKEY",)):
@@ -202,6 +208,7 @@ def basic_and_stale(root):
         finally:
             meta.resume()
             reader.close()
+            writer.close()
 
     # A clean complete former replica may start without Meta through the
     # existing standalone recovery path. No management provenance is written.
@@ -402,11 +409,14 @@ def copy_fenced_after_wait(root):
                 try:
                     response = pending.result(timeout=15)
                 except H.Failure as error:
-                    assert "MASTERDOWN" in str(error), error
+                    assert "closed its Redis connection" in str(error), error
                 else:
                     raise AssertionError(f"COPY wrote after lease expiry: {response}")
             finally:
                 meta.resume()
+        writer.close()
+        writer = Client(source)
+        writer.call("SELECT", 1)
         H.wait_until(
             "Owner regains authority", 20, lambda: writer.call("GET", "xa") == "source"
         )
@@ -422,6 +432,7 @@ def copy_fenced_after_wait(root):
             )
         finally:
             reader.close()
+            writer.close()
 
 
 def copy_hop_fencing(root, stage, fail_ingestion=False):
@@ -472,23 +483,23 @@ def copy_hop_fencing(root, stage, fail_ingestion=False):
                     lambda: "MASTERDOWN"
                     in F.redis_error(source, ["GET", "lease-probe"]),
                 )
-                assert not pending.done()
+                # Retirement may finish the client future while COPY still
+                # owns its internal guards at the deterministic hold point.
                 hold.unlink()
                 try:
                     result = pending.result(timeout=15)
                 except H.Failure as error:
-                    if stage == "read":
-                        assert "closed its Redis connection" in str(error), error
-                    else:
-                        assert fail_ingestion and "closed" not in str(error), error
+                    assert "closed its Redis connection" in str(error), error
                 else:
-                    assert stage == "write" and not fail_ingestion and result == 1
+                    raise AssertionError(
+                        f"retired COPY returned a fabricated result: {result}"
+                    )
                 assert "COPY test hold expired" not in Path(source.log_path).read_text()
             finally:
                 hold.unlink(missing_ok=True)
                 meta.resume()
-        # Reconnect even on success: the read-hop fence deliberately closes
-        # the cross-worker command's connection instead of promising a retry.
+        # The missing reply does not identify the mutation outcome: inspect
+        # the settled storage state after reauthorization, without retrying COPY.
         inspector = Client(source)
         reader = Client(target)
         try:
@@ -618,20 +629,17 @@ def keys_holds_population_until_disconnect(root):
                 30,
                 lambda: "event=candidate-selected" in meta.log_tail(lines=2000),
             )
-            # An already committed KEYS reply keeps its DB gate. Observe a
-            # bounded wait, then release it explicitly rather than waiting for
-            # the no-progress watchdog or making the test depend on its timer.
-            time.sleep(1)
-            assert inspector.call("ROLE")[0] == "slave"
-            slow.socket.shutdown(socket.SHUT_RDWR)
-            slow.close()
-            slow = None
-            inspector.call("SELECT", 15)
+            # No more reads from slow: promotion must retire the sender and
+            # release its database gate without waiting for network flush.
             H.wait_until(
-                "promotion proceeds once KEYS releases its gate",
-                60,
-                lambda: inspector.call("SET", "after-keys", "ready") == "OK",
+                "promotion retires the slow KEYS connection before drain",
+                20,
+                lambda: F.redis_call(target, ["SET", "after-keys", "ready"], db=15)
+                == "OK",
             )
+            inspector.close()
+            inspector = Client(target)
+            inspector.call("SELECT", 15)
             assert inspector.call("GET", "after-keys") == "ready"
         finally:
             if slow is not None:

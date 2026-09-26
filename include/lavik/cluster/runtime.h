@@ -34,7 +34,8 @@ namespace lavik::cluster {
 
 struct ClusterRuntime {
   explicit ClusterRuntime(
-      std::unique_ptr<NodeControlActions> actions = nullptr);
+      std::unique_ptr<NodeControlActions> actions = nullptr,
+      AuthorityGuard::RetirementCallback retirement_callback = nullptr);
 
   // Sole owner of NodeControlInstaller. Data workers submit readiness changes
   // here; request admission continues to read immutable published snapshots.

@@ -79,11 +79,20 @@ def pair(
     client_mode = client_mode or CLIENT_MODE
     directory = root / name
     directory.mkdir()
+    if raft_args is None:
+        # Meta caps grants at the Raft election lower bound. The 500 ms
+        # cluster-create fixture can legitimately expire a healthy Owner's
+        # lease during slow FULL or hosted-runner scheduling, which now retires
+        # every persistent test client. Keep these unrelated replication
+        # checks on a two-second bound; expiry gates supply short args.
+        raft_args = H.raft_args(
+            snapshot_distance=100_000, election_ms_low=2000, election_ms_high=4000
+        )
     meta = H.Node(
         C.META,
         str(directory),
         1,
-        args=C.creation_raft_args() if raft_args is None else raft_args,
+        args=raft_args,
     )
     proxy = C.DirectiveBarrier(meta.data_control_port, recipients=(C.REPLICA_1,))
     meta.advertised_data_control_endpoint = proxy.endpoint
@@ -333,17 +342,32 @@ def grouped_streams(root):
 def replay_and_reconnect(root):
     with pair(root, "replay", seed=seed_collections) as (meta, source, target, writer):
         ready(meta)
+
+        # Created replaces the initial population directive with Follow Owner.
+        # Meta readiness can precede that ingress reconnect; observe the live
+        # data plane before retaining the client used by the WATCH regression.
+        def flows_ready():
+            probe = Client(target, readonly=True)
+            try:
+                info = dict(
+                    line.split(":", 1)
+                    for line in probe.call("INFO", "replication").splitlines()
+                    if ":" in line
+                )
+                # The source has two data shards and the target has three.
+                # Their extra Meta workers must never become replication flows.
+                return (
+                    info.get("master_link_status") == "up"
+                    and info.get("lavik_source_workers") == "2"
+                    and info.get("lavik_connected_flows") == "2"
+                    and probe.call("GET", "{native}seed") == "baseline"
+                )
+            finally:
+                probe.close()
+
+        H.wait_until("two source data flows online and seed readable", 30, flows_ready)
         reader = Client(target, readonly=True)
         try:
-            # The source has two data shards and the target has three. Their
-            # extra Meta workers must never become replication flows.
-            info = dict(
-                line.split(":", 1)
-                for line in reader.call("INFO", "replication").splitlines()
-                if ":" in line
-            )
-            assert info.get("lavik_source_workers") == "2", info
-            assert info.get("lavik_connected_flows") == "2", info
             assert reader.call("GET", "{native}seed") == "baseline"
             assert reader.call("HGET", "{native}hash", "keep") == "value"
             assert reader.call("LRANGE", "{native}list", 0, -1) == ["a", "b"]
@@ -427,6 +451,9 @@ def replay_and_reconnect(root):
             assert reader.call("HEXISTS", "{native}hash", "old") == 0
             assert reader.call("HGET", "{native}hash", "tx") == "value"
             assert reader.call("LRANGE", "{native}list", 0, -1) == ["a", "b", "c"]
+            # The retained WATCH must survive CONTINUE on the original socket;
+            # the unrelated counter update must not invalidate its population.
+            assert reader.call("WATCH", "{native}seed") == "OK"
             # Native reconnects retain source history and applied cursors.
             old_full = Path(source.log_path).read_text().count("selected=FULL")
             assert writer.call("CLIENT", "KILL", "TYPE", "replica") > 0
@@ -442,6 +469,9 @@ def replay_and_reconnect(root):
                 lambda: "selected=CONTINUE" in Path(source.log_path).read_text(),
             )
             assert Path(source.log_path).read_text().count("selected=FULL") == old_full
+            assert reader.call("MULTI") == "OK"
+            assert reader.call("GET", "{native}seed") == "QUEUED"
+            assert reader.call("EXEC") == ["baseline"]
             # Real transactions also carry ephemeral PUBLISH under authority.
             subscriber = Client(target, readonly=True)
             try:

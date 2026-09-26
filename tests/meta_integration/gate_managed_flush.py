@@ -102,6 +102,18 @@ def paused_at(source, variable):
     )
 
 
+def wait_retired_clients_drained(source):
+    # EOF and CLIENT LIST both hide a closing connection before its request
+    # coroutine returns. connected_clients is decremented only at cleanup;
+    # the fresh INFO connection must be the sole remaining ordinary client.
+    H.wait_until(
+        "retired FLUSH finished before renewal",
+        20,
+        lambda: "connected_clients:1"
+        in F.redis_call(source, ["INFO", "clients"]).splitlines(),
+    )
+
+
 def revoked(root, mode, command, boundary):
     name = f"revoke-{mode}-{command}-{boundary}"
     hold = root / f"{name}.hold"
@@ -138,39 +150,69 @@ def revoked(root, mode, command, boundary):
                         lambda: error
                         in F.redis_error(source, ["SET", "lease-probe", "x"]),
                     )
-                    assert not pending.done()
+                    # Lease expiry retires the held client's socket before
+                    # the fault hold is released, so a lost reply may already
+                    # have completed this future with EOF.
+                    if pending.done():
+                        try:
+                            reply = pending.result()
+                        except H.Failure as failure:
+                            assert "closed its Redis connection" in str(failure), (
+                                failure
+                            )
+                        else:
+                            raise AssertionError(
+                                f"held FLUSH replied before release: {reply!r}"
+                            )
                     hold.unlink()
                     if before:
                         try:
                             pending.result(timeout=20)
                         except H.Failure as failure:
-                            assert error in str(failure), failure
+                            assert error in str(failure) or (
+                                "closed its Redis connection" in str(failure)
+                            ), failure
                         else:
                             raise AssertionError(
                                 "write-before-authority rejection reported success"
                             )
                     else:
-                        assert pending.result(timeout=20) == "OK"
+                        try:
+                            assert pending.result(timeout=20) == "OK"
+                        except H.Failure as failure:
+                            assert "closed its Redis connection" in str(failure), (
+                                failure
+                            )
+                    # EOF precedes coroutine cleanup. Keep Meta paused until
+                    # the server has finished, otherwise a same-Term renewal
+                    # can authorize a still-pending pre-cut FLUSH.
+                    wait_retired_clients_drained(source)
                 finally:
                     hold.unlink(missing_ok=True)
                     meta.resume()
             expected = "old" if before else None
-            H.wait_until(
-                "Owner authority restored and outcome visible",
-                30,
-                lambda: writer.call("GET", "{flush}old") == expected,
-            )
-            H.wait_until(
-                "flush outcome replayed",
-                30,
-                lambda: reader.call("GET", "{flush}old") == expected,
-            )
-            assert writer.call("SET", "{flush}new", "after") == "OK"
-            H.wait_until(
-                "post-flush write replayed",
-                30,
-                lambda: reader.call("GET", "{flush}new") == "after",
-            )
+            # The result of a disconnected FLUSH is uncertain to that client;
+            # verify the committed outcome and new writes after reconnecting.
+            recovered = Client(source)
+            try:
+                H.wait_until(
+                    "Owner authority restored and outcome visible",
+                    30,
+                    lambda: recovered.call("GET", "{flush}old") == expected,
+                )
+                H.wait_until(
+                    "flush outcome replayed",
+                    30,
+                    lambda: reader.call("GET", "{flush}old") == expected,
+                )
+                assert recovered.call("SET", "{flush}new", "after") == "OK"
+                H.wait_until(
+                    "post-flush write replayed",
+                    30,
+                    lambda: reader.call("GET", "{flush}new") == "after",
+                )
+            finally:
+                recovered.close()
         finally:
             reader.close()
     # Pair shutdown checkpoints pending allocator metadata too. Recover these
@@ -386,18 +428,33 @@ def controlled_pause(root, mode, boundary):
                     15,
                     lambda: F.redis_error(owner, ["FLUSHDB"]).startswith("TRYAGAIN"),
                 )
-                assert not pending.done()
+                # Controlled Pause preserves the registered operation, but
+                # the Owner can lose its finite lease during the pause. That
+                # loss retires the held client's socket before the fault hold
+                # is released.
+                if pending.done():
+                    try:
+                        reply = pending.result()
+                    except H.Failure as error:
+                        assert "closed its Redis connection" in str(error), error
+                    else:
+                        raise AssertionError(
+                            f"held FLUSH replied before release: {reply!r}"
+                        )
                 assert F.redis_call(owner, ["ROLE"])[0] == "master"
                 hold.unlink()
                 try:
                     assert pending.result(timeout=20) == "OK"
                 except H.Failure as error:
-                    # Pause blocks new registration, not an already registered
-                    # Group guard. Before IO, the retained finite authority can
-                    # still expire; only that pre-cut refusal may preserve old
-                    # data. revoked() tests explicit lease expiry separately.
-                    assert before and str(error).startswith("TRYAGAIN"), error
-                    expected = "old"
+                    # A pre-cut refusal preserves the old data. Once the
+                    # socket is retired the reply is uncertain, so check the
+                    # boundary's durable result through the successor below.
+                    if str(error).startswith("TRYAGAIN"):
+                        assert before, error
+                    else:
+                        assert "closed its Redis connection" in str(error), error
+                    if before:
+                        expected = "old"
             finally:
                 hold.unlink(missing_ok=True)
         begin = F.require_unique_failover_event(
@@ -473,14 +530,23 @@ def drain(root, command, revoke=False):
                             lambda: "MASTERDOWN"
                             in F.redis_error(source, ["SET", "probe", "x"]),
                         )
-                        hold.unlink()
-                        assert old.result(timeout=10) == "value"
                         try:
                             pending.result(timeout=10)
                         except H.Failure as error:
-                            assert "MASTERDOWN" in str(error), error
+                            assert "MASTERDOWN" in str(error) or (
+                                "closed its Redis connection" in str(error)
+                            ), error
                         else:
                             raise AssertionError("revoked draining flush succeeded")
+                        # Retirement wakes the client before the server's
+                        # drain finishes. The held GET keeps this FLUSH alive
+                        # even though its caller has already received EOF.
+                        hold.unlink()
+                        try:
+                            assert old.result(timeout=10) == "value"
+                        except H.Failure as error:
+                            assert "closed its Redis connection" in str(error), error
+                        wait_retired_clients_drained(source)
                     else:
                         # With DB0 busy, FLUSHALL must already have closed DB15.
                         assert new_writer.call("SELECT", 15) == "OK"
@@ -503,11 +569,21 @@ def drain(root, command, revoke=False):
                     flush_hold.unlink(missing_ok=True)
                     meta.resume()
             if revoke:
-                H.wait_until(
-                    "rejected flush preserved data",
-                    30,
-                    lambda: writer.call("GET", "old") == "value",
-                )
+                # A connection opened before the renewed grant may itself be
+                # swept. Retry with a fresh socket so the assertion observes
+                # the durable state after authority returns.
+                def preserved():
+                    recovered = Client(source)
+                    try:
+                        value = recovered.call("GET", "old")
+                        assert value == "value", (
+                            f"revoked FLUSH changed old data: {value!r}"
+                        )
+                        return True
+                    finally:
+                        recovered.close()
+
+                H.wait_until("rejected flush preserved data", 30, preserved)
         finally:
             hold.unlink(missing_ok=True)
             flush_hold.unlink(missing_ok=True)
@@ -589,19 +665,25 @@ def replication_recovery(root, full=False):
             failure.unlink(missing_ok=True)
         for i in range(64):
             assert writer.call("SET", f"new-{i}", "new") == "OK"
-        reader = Client(target)
-        try:
 
-            def matches():
+        def matches():
+            reader = Client(target)
+            try:
                 return all(
                     reader.call("GET", f"old-{i}") is None
                     and reader.call("GET", f"new-{i}") == "new"
                     for i in range(64)
                 )
+            finally:
+                reader.close()
 
-            H.wait_until(
-                "replacement FULL is readable with post-flush writes", 90, matches
-            )
+        H.wait_until("replacement FULL is readable with post-flush writes", 90, matches)
+        # Recovery may retire the original source socket. Subsequent checks
+        # use a new socket and still assert the same history and all-flow
+        # barrier.
+        recovered = Client(source)
+        reader = Client(target)
+        try:
             assert (
                 Path(source.log_path).read_text().count("selected=FULL") > before_full
             )
@@ -614,12 +696,12 @@ def replication_recovery(root, full=False):
                         if line.startswith("master_replid:")
                     )
 
-                assert history(writer.call("INFO", "replication")) != history(
+                assert history(recovered.call("INFO", "replication")) != history(
                     original_history
                 )
             # A later all-flow barrier must not wait forever on the cancelled one.
-            assert writer.call("FLUSHDB") == "OK"
-            assert writer.call("SET", "after-recovery", "ok") == "OK"
+            assert recovered.call("FLUSHDB") == "OK"
+            assert recovered.call("SET", "after-recovery", "ok") == "OK"
             H.wait_until(
                 "barrier after recovery completes",
                 30,
@@ -627,6 +709,7 @@ def replication_recovery(root, full=False):
             )
         finally:
             reader.close()
+            recovered.close()
 
 
 def main():

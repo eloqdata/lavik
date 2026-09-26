@@ -725,7 +725,7 @@ class NodeControlInstaller {
       std::uint64_t timer_generation,
       std::shared_ptr<const LeaseTimerLifetime> lifetime);
   // Completes one exact due schedule before any replacement grant is installed.
-  // It invalidates the old lease generation synchronously, retires the timer,
+  // It revokes the old lease synchronously, retires the timer,
   // closes new source admission, joins directive admission, and drains the
   // assignment. Current source capabilities and published exports remain for a
   // stronger fence, session-loss, or population-identity transition to retire.

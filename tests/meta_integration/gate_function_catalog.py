@@ -134,17 +134,37 @@ def revoked_at_commit(
                         lambda: authority_error
                         in F.redis_error(source, ["GET", "lease-probe"]),
                     )
-                    assert not pending.done()
+                    # Losing the Owner lease retires the pending client's
+                    # connection even while its catalog mutation is held.
+                    # The reply may therefore be lost before the hold lifts.
+                    if pending.done():
+                        try:
+                            result = pending.result()
+                        except H.Failure as error:
+                            assert "Data closed its Redis connection" in str(error), (
+                                error
+                            )
+                        else:
+                            raise AssertionError(
+                                f"held catalog reported success before release: {result!r}"
+                            )
                     hold.unlink()
                     if boundary == "AFTER_ROOT_WRITE" and not ambiguous:
-                        assert pending.result(timeout=15) == "stable"
+                        try:
+                            assert pending.result(timeout=15) == "stable"
+                        except H.Failure as error:
+                            assert "Data closed its Redis connection" in str(error), (
+                                error
+                            )
                     else:
                         try:
                             result = pending.result(timeout=15)
                         except H.Failure as error:
                             assert (
                                 "ambiguous" if ambiguous else authority_error
-                            ) in str(error), error
+                            ) in str(
+                                error
+                            ) or "Data closed its Redis connection" in str(error), error
                         else:
                             raise AssertionError(
                                 f"revoked catalog reported success: {result!r}"
@@ -152,11 +172,15 @@ def revoked_at_commit(
                     if ambiguous:
                         # The original connection must close and every other
                         # client must be fenced, even if the root reached disk.
+                        # Lease expiry can mask the latched storage error with
+                        # an authority error until the Owner is restored.
                         assert writer.reader.read(1) == b""
-                        assert "LOADING" in F.redis_error(source, ["FUNCTION", "LIST"])
-                        assert "LOADING" in F.redis_error(
-                            source, ["SET", "unsafe", "write"]
-                        )
+                        for command in (
+                            ["FUNCTION", "LIST"],
+                            ["SET", "unsafe", "write"],
+                        ):
+                            error = F.redis_error(source, command)
+                            assert "LOADING" in error or authority_error in error, error
                         assert snapshot(reader) == original
                         # A latched storage failure deliberately cannot cleanly
                         # flush/shut down; recovery starts from this crash cut.
@@ -171,7 +195,9 @@ def revoked_at_commit(
                     20,
                     lambda: F.redis_call(source, ["GET", "lease-probe"]) is None,
                 )
-                current = snapshot(writer)
+                # The original writer was retired at lease expiry; inspect
+                # the committed outcome through a fresh connection.
+                current = node_snapshot(source)
                 if boundary == "AFTER_ROOT_WRITE":
                     assert current != original
                 else:

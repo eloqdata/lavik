@@ -80,8 +80,9 @@ when a complete population becomes servable and advances when that population
 is replaced or the node's role changes. Requests capture it at admission and
 revalidate it after queueing, blocking, or database-admission waits, so work
 admitted under a replaced population cannot observe or mutate the new one. It
-is node-local population evidence, not the committed Group Term, and a
-topology-only change does not advance it.
+is boot-local population evidence, not the committed Group Term or a serving
+grant. A topology-only change or incremental reconnect of the same complete
+population does not advance it.
 _Avoid_: topology version, authority version
 
 **Committed State**:
@@ -92,7 +93,8 @@ _Avoid_: Committee Store, Meta KV store
 
 **Owner**:
 The Group member named by committed topology as its current primary. Being the
-Owner does not by itself grant serving authority.
+Owner or retaining a local primary replication role does not by itself grant
+serving authority.
 _Avoid_: Leader
 
 **Group Term**:

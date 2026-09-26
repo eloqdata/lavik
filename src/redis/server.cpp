@@ -1509,7 +1509,8 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
       peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
   ctx.peer_address_ = address;
   const bool tls = stream.IsTls();
-  RegisterClientConnection(ctx.conn_id_, stream.NativeFd(), address, tls);
+  RegisterClientConnection(ctx.conn_id_, stream.NativeFd(), address, tls, false,
+                           0, &ctx);
   ConnectionOpened();
   absl::Status observed = stream.SetPeerDisconnectCallback(
       [](void* context) noexcept {
@@ -1684,6 +1685,10 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       ClosePubSubSession(session);
       co_return absl::OkStatus();
     }
+    if (ctx.closing_) {
+      ClosePubSubSession(session);
+      co_return absl::OkStatus();
+    }
     CommandBatch::BufferedCommand buffered = ready->PopFront();
     CommandBufferGuard command_memory(client_buffers, buffered.input_bytes_);
     RespCommand command = std::move(buffered.command_);
@@ -1832,6 +1837,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
   PendingReplyBatch pending_replies;
 
   while (stream.IsOpen()) {
+    if (ctx.closing_) co_return absl::OkStatus();
     ctx.reply_builder_.Reset();
     if (ShutdownRequested()) [[unlikely]] {
       co_return co_await FlushReplyBatch(stream, &pending_replies);
@@ -1864,6 +1870,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         co_return read_status;
       }
     }
+    if (ctx.closing_) co_return absl::OkStatus();
     CommandBatch::BufferedCommand buffered = ready.PopFront();
     CommandBufferGuard command_memory(&client_buffers, buffered.input_bytes_);
     RespCommand command = std::move(buffered.command_);
@@ -1930,6 +1937,12 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         co_return absl::InvalidArgumentError(
             "replication handshake must be the first isolated command");
       }
+      // The isolated authenticated native command is the classification
+      // boundary. Leave the ordinary registry before any handshake await;
+      // native admission and its own registry now govern socket lifetime.
+      // Before this command arrives an AUTH-only socket is indistinguishable
+      // from an idle data client on the shared listener.
+      UnregisterClientConnection(ctx.conn_id_);
       absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
       if (!flushed.ok()) co_return flushed;
       ConnectionClosed();
@@ -1938,7 +1951,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       const std::string address =
           peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
       const bool tls = stream.IsTls();
-      UnregisterClientConnection(ctx.conn_id_);
       command_memory.Release();
       co_return co_await replication_->ServeNativeConnection(
           stream, std::move(command.args_), ctx.conn_id_, address, tls);
@@ -2001,6 +2013,9 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
           [[unlikely]] {
         PublishMonitorMessage(std::move(monitor_message));
       }
+      // A worker may start connection cleanup while an earlier pipelined
+      // reply is suspended. Do not dispatch another buffered command.
+      if (ctx.closing_) co_return absl::OkStatus();
       reply = co_await DispatchCommand(ctx, request, ctx.reply_builder_);
     }
     if (ctx.queued_.size() > queued_before) {
@@ -2507,8 +2522,8 @@ int RunServer(ServerOptions options) {
     std::unique_ptr<cluster::NodeControlActions> control_actions =
         cluster::CreateReplicationNodeControlActions(replication,
                                                      options.tls_replication_);
-    auto runtime =
-        std::make_unique<cluster::ClusterRuntime>(std::move(control_actions));
+    auto runtime = std::make_unique<cluster::ClusterRuntime>(
+        std::move(control_actions), &RetireClientConnections);
     // Announce-address defaults: an explicit announce ip wins; otherwise the
     // first non-wildcard bind address; a wildcard bind stays empty so
     // discovery self entries keep the "use the startup node" convention.
