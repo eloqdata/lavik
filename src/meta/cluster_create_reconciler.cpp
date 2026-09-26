@@ -24,6 +24,7 @@
 #include <future>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 #include "absl/strings/escaping.h"
@@ -226,6 +227,26 @@ bool ProjectionMatches(const MetaDataControlRuntimeNode& runtime,
              group.record_.population_manifest_digest_ &&
          projected.partition_replication_epoch_ ==
              group.record_.partition_replication_epoch_;
+}
+
+bool SourceLeaseAcknowledged(const MetaDataControlRuntimeNode& runtime,
+                             const MetaTopologyGroupView& group,
+                             const MetaGroupAuthorityView& authority,
+                             const MetaGroupMember& owner) {
+  if (!authority.grant_ || authority.grant_->owner_ != runtime.node_id_ ||
+      !runtime.health_ || !runtime.health_->storage_ready ||
+      !runtime.health_->population_ready || runtime.health_->draining ||
+      !runtime.last_lease_decision_)
+    return false;
+  const auto* granted = std::get_if<cluster::control::LeaseGranted>(
+      &*runtime.last_lease_decision_);
+  return granted && granted->granted_duration_ms != 0 &&
+         granted->raft_term == runtime.leader_term_ &&
+         granted->data_boot_id == runtime.boot_id_ &&
+         granted->control_revision == runtime.control_revision_ &&
+         granted->group_id == group.group_id_ &&
+         granted->assignment_id == owner.assignment_id_ &&
+         granted->group_term == authority.group_term_;
 }
 
 const ClusterCreateManifestV1::DataNode* FindData(
@@ -752,6 +773,18 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
       }
     }
     if (!all_succeeded) return std::nullopt;
+    // The source has initialized its empty population, but Meta's finite
+    // authority handoff quarantine can still deny the first lease challenges.
+    // A rebuild issued here consumes its bounded pre-mutation retry budget
+    // before the source can admit it. Wait for a grant written to this same
+    // source session before publishing target work. The target retains its
+    // bounded retry for the Ack-in-flight interval.
+    if (primary_runtime == runtime.nodes_.end() ||
+        !ProjectionMatches(*primary_runtime, *group, *grant,
+                           view.applied_index()) ||
+        !SourceLeaseAcknowledged(*primary_runtime, *group, *grant,
+                                 *primary_member))
+      return std::nullopt;
 
     // Keep each acknowledged authorization byte-identical so the operation
     // store retains its original directive revision. The subsequent FDS can
