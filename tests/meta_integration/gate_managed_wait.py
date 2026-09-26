@@ -84,6 +84,23 @@ def acknowledged(root, mode):
                 "ERR timeout is out of range",
             )
             assert writer.call("WAIT", 2, 20) == 1
+            # A peer write-half-close cancels WAIT, but complete commands
+            # already buffered after it must still receive their replies.
+            pipelined = Client(source)
+            try:
+                pipelined.socket.sendall(
+                    C.encode_resp(["WAIT", "2", "0"])
+                    + C.encode_resp(["PING"])
+                )
+                pipelined.socket.shutdown(socket.SHUT_WR)
+                try:
+                    C.read_resp(pipelined.reader)
+                    raise AssertionError("disconnected WAIT succeeded")
+                except H.Failure as failure:
+                    assert "WAIT interrupted" in str(failure), failure
+                assert C.read_resp(pipelined.reader) == "PONG"
+            finally:
+                pipelined.close()
             target.pause()
             try:
                 assert writer.call("SET", keys[0], "not-acknowledged") == "OK"
