@@ -594,6 +594,7 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
   if ((decoded.kind_ != BlockKind::kRecords &&
        decoded.kind_ != BlockKind::kPayloadExtent &&
        decoded.kind_ != BlockKind::kIndirectKeys &&
+       decoded.kind_ != BlockKind::kRedisExportBacklog &&
        decoded.kind_ != BlockKind::kTransaction &&
        decoded.kind_ != BlockKind::kCheckpointIndex) ||
       decoded.reserved_ != std::array<std::uint8_t, 3>{}) {
@@ -601,6 +602,7 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
   }
   if (decoded.kind_ == BlockKind::kRecords ||
       decoded.kind_ == BlockKind::kIndirectKeys ||
+      decoded.kind_ == BlockKind::kRedisExportBacklog ||
       decoded.kind_ == BlockKind::kTransaction) {
     if (decoded.extent_index_ != 0 || decoded.extent_payload_bytes_ != 0 ||
         decoded.extent_payload_checksum_ != 0 ||

@@ -809,6 +809,12 @@ class ReplicationManager {
   bycorf::Task<absl::Status> ServeNativeConnection(
       bycorf::TcpStream& stream, std::vector<std::string> args,
       std::uint64_t client_id, std::string client_address, bool tls);
+  // Owns one authenticated Redis PSYNC socket from FULLRESYNC through its
+  // ongoing command stream. Redis EOF capability is required for diskless RDB.
+  bycorf::Task<absl::Status> ServeRedisExportConnection(
+      bycorf::TcpStream& stream, std::vector<std::string> args,
+      std::uint64_t client_id, std::string client_address, bool tls,
+      bool eof_capable);
 
   // Captures all source commands already queued on every worker. A missing
   // value means no native replication history is currently active; callers

@@ -287,6 +287,35 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::FenceReplicationLog() {
   return impl_->FenceReplicationLog();
 }
 
+Task<absl::Status> StorageEngine::StartRedisExportDiskBacklog(
+    std::uint64_t session_id, std::size_t capacity_bytes) {
+  return impl_->StartRedisExportDiskBacklog(session_id, capacity_bytes);
+}
+
+Task<absl::Status> StorageEngine::AppendRedisExportDiskBytes(
+    std::uint64_t session_id, std::string_view bytes) {
+  return impl_->AppendRedisExportDiskBytes(session_id, bytes);
+}
+
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::StopRedisExportDiskBacklog(
+    std::uint64_t session_id) {
+  return impl_->StopRedisExportDiskBacklog(session_id);
+}
+
+Task<absl::StatusOr<ReplicationLogBatch>>
+StorageEngine::ReadRedisExportDiskBacklog(std::uint64_t session_id,
+                                          ReplicationLogCursor next,
+                                          std::size_t max_bytes,
+                                          std::size_t max_frames) {
+  return impl_->ReadRedisExportDiskBacklog(session_id, next, max_bytes,
+                                           max_frames);
+}
+
+Task<absl::Status> StorageEngine::ReleaseRedisExportDiskBacklog(
+    std::uint64_t session_id) {
+  return impl_->ReleaseRedisExportDiskBacklog(session_id);
+}
+
 absl::StatusOr<FullSyncSessionStart> StorageEngine::BeginFullSyncSession(
     std::uint64_t session_id) {
   return impl_->BeginFullSyncSession(session_id);

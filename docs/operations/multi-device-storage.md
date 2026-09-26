@@ -49,6 +49,15 @@ that last block during startup. Catalog commits use ordinary foreground
 capacity; when it is exhausted, the Function mutation fails without changing
 the current catalog.
 
+When a standalone Redis replica requests a full `PSYNC`, Lavik temporarily
+uses these same data devices for commands written while the RDB is sent. The
+export may consume up to `repl-backlog-size` of disk blocks; each device keeps
+its eight-block defrag reserve plus two blocks for foreground writes ahead of
+export allocation. A full temporary backlog or device ends that Redis sync,
+not ordinary writes. The blocks are released after catch-up or on disconnect,
+and startup reclaims any left by a crash. Ordinary native replication does not
+write its backlog to the data devices.
+
 ## Add devices without clearing existing data
 
 Device addition is an offline operation. The safe sequence is:

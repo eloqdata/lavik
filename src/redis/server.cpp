@@ -1830,6 +1830,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
   std::size_t multi_input_bytes = 0;
   std::optional<absl::Status> deferred_read_error;
   PendingReplyBatch pending_replies;
+  bool redis_replica_eof = false;
 
   while (stream.IsOpen()) {
     ctx.reply_builder_.Reset();
@@ -1923,6 +1924,49 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
           stream, encoded, !ready.empty(), &pending_replies);
       if (!written.ok()) co_return written;
       continue;
+    }
+
+    if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "REPLCONF")) {
+      if (args.size() < 3 || (args.size() & 1U) == 0) {
+        const std::string_view encoded = ctx.reply_builder_.AppendError(
+            "ERR wrong number of arguments for 'replconf' command");
+        absl::Status written = co_await WriteOrBatchReply(
+            stream, encoded, !ready.empty(), &pending_replies);
+        if (!written.ok()) co_return written;
+        continue;
+      }
+      for (std::size_t index = 1; index + 1 < args.size(); index += 2) {
+        if (absl::EqualsIgnoreCase(args[index], "capa") &&
+            absl::EqualsIgnoreCase(args[index + 1], "eof")) {
+          redis_replica_eof = true;
+        }
+      }
+      const std::string_view encoded =
+          ctx.reply_builder_.AppendSimpleString("OK");
+      absl::Status written = co_await WriteOrBatchReply(
+          stream, encoded, !ready.empty(), &pending_replies);
+      if (!written.ok()) co_return written;
+      continue;
+    }
+
+    if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "PSYNC")) {
+      if (!ready.empty() || !input.View().empty() || !parser.idle()) {
+        co_return absl::InvalidArgumentError(
+            "PSYNC handshake must be an isolated command");
+      }
+      absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
+      if (!flushed.ok()) co_return flushed;
+      ConnectionClosed();
+      ctx.counted_as_client_ = false;
+      auto peer_address = stream.PeerAddress();
+      const std::string address =
+          peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
+      const bool tls = stream.IsTls();
+      UnregisterClientConnection(ctx.conn_id_);
+      command_memory.Release();
+      co_return co_await replication_->ServeRedisExportConnection(
+          stream, std::move(command.args_), ctx.conn_id_, address, tls,
+          redis_replica_eof);
     }
 
     if (ReplicationManager::IsNativeHandshake(command.args_)) {

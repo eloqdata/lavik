@@ -181,9 +181,11 @@ with the saved replid/offset. A failed runtime handshake leaves the old
 subscription intact. Preparation has a ten-second deadline; a Redis background
 save that delays FULLRESYNC beyond it can require a runtime retry. Startup
 handshake failures retry while keeping the node
-fenced and recovered data intact. Lavik does not implement incoming PSYNC, so
-Lavik peers cannot establish an external subscription. Meta native relationships
-use Follow Owner instead.
+fenced and recovered data intact. The Redis-protocol follower requests a
+length-delimited RDB and does not advertise EOF capability. Lavik's Redis PSYNC
+export requires EOF capability, so `REPLICAOF` pointed at another Lavik node
+fails this handshake; native Lavik relationships use Follow Owner and
+`LVPSYNC`/`LVFLOW` instead.
 
 The retained non-Meta `REPLICAOF NO ONE` implementation uses the role-transition path
 and the same private prepare/activate kernel used by Meta-managed promotion.
@@ -763,6 +765,16 @@ ID, and disables all worker logs. Draining preserves events and fences already
 reserved by admitted commands. A later downstream must full-sync and re-enables
 a fresh history before its snapshot cut.
 
+A standalone Redis `PSYNC` export uses that worker-local memory history for
+publisher ordering and for the live tail. While its RDB is being sent, the
+connection-owning worker merges completed source events into one temporary
+command stream on the configured data devices. The disk stream has its own
+`repl-backlog-size` ceiling and never replaces or changes the native log.
+Only this full-sync session allocates export blocks; it does not index or
+defragment them. Exhausting the disk allowance or device space fails the Redis
+export while foreground writes and native history continue. An interrupted
+process discards these blocks during recovery.
+
 A connected native downstream advertises its first unacknowledged LSN as a
 coverage claim. By default, the publisher waits at the hard backlog limit until
 ACK progress makes a complete event reclaimable; publisher staging then fills
@@ -1133,11 +1145,12 @@ is documented under [current limitations](#invariants-failures-and-current-limit
 
 ### Following Redis
 
-A Redis follower authenticates, sends PING, advertises its listening port and
-PSYNC2 capability, and requests either its process-local replid/offset or a
-fresh full synchronization. FULLRESYNC receives a length-delimited RDB into a
-temporary file. Import is serialized, closes and drains command database
-gates, resets the source-owned slots, validates ownership, and restores values.
+Lavik's Redis-protocol follower authenticates, sends PING, advertises its
+listening port and PSYNC2 capability, and requests either its process-local
+replid/offset or a fresh full synchronization. FULLRESYNC receives a
+length-delimited RDB into a temporary file. Import is serialized, closes and
+drains command database gates, resets the source-owned slots, validates
+ownership, and restores values.
 Collection input is prevalidated and then consumed as admitted pages on the
 key owner, with one atomic ingest decision per complete key rather than a
 whole-object compact buffer. Packed collections and quicklist nodes are
@@ -1172,10 +1185,32 @@ topology's master count, every source dataset is valid, and the topology is not
 faulted. Two consecutive incompatible topology observations fault the topology
 and return the node to loading.
 
+### Redis PSYNC export
+
+In standalone source mode, Lavik accepts one authenticated Redis replica with
+`REPLCONF capa eof` and `PSYNC`. It always starts a new `FULLRESYNC`; Redis
+partial-resynchronization history and offsets are not retained across a
+disconnect or restart. A short command-admission gate establishes an RDB
+snapshot cut and fences each source worker's publisher FIFO. RDB readers use
+the storage snapshot's before-write images and physical pins, so a later write
+cannot replace a key that the snapshot has not scanned yet. A failed capture
+invalidates this full sync instead of emitting a mixed image.
+
+The connection owner reads the per-worker streams, preserving each flow's
+order. Independent keys on different workers may interleave; transaction
+envelopes wait for every participant and database-wide controls wait for every
+worker before the owner writes a single Redis-compatible command to the disk
+stream. The RDB queue holds only bounded encoded fragments. After RDB EOF,
+another short gate and publisher fence fix the disk stream's end cursors.
+The owner drains and releases the temporary disk blocks, then resumes merging
+the worker-local memory logs on the same Redis socket. Its retention cursors
+advance only after socket writes; the configured backlog policy backpressures
+a slow consumer by default or disconnects it on a revoked coverage gap.
+
 ### ScanReader export
 
-Lavik does not serve Redis PSYNC or REPLCONF. RedisShake ScanReader exports the
-keyspace through ordinary authenticated INFO, SCAN, DUMP, and PTTL commands.
+RedisShake ScanReader also exports the keyspace through ordinary authenticated
+INFO, SCAN, DUMP, and PTTL commands.
 DUMP payloads use RDB 11, requiring Redis 7.2 or newer at the destination.
 Single exposes DB0–15; Cluster exposes DB0 and discovery for its slot owners.
 Managed Single database inspection uses the sole Group's read admission and
@@ -1362,6 +1397,11 @@ and incomplete slot coverage, same-generation full completion, incremental
 replay, partial reconnect, replica membership changes, and master failover.
 `tests/redis_scan_reader_e2e.py` runs RedisShake against authenticated Single
 (DB0 and DB15) and a two-Group Meta-managed Cluster, including values and TTLs.
+`tests/redis_export_e2e.sh` runs a real Redis replica through RDB overlap,
+temporary disk backlog replay, online commands, transactions, Functions,
+database selection, ACKs, and detach. Its fault modes verify restart reclamation
+of a sealed temporary block and primary availability when the export disk
+allowance fills.
 
 Configuration and command tests cover the startup support matrix, removed
 names, overrides, reporting, and independent client semantics and authority.
@@ -1378,6 +1418,7 @@ There is no focused malformed-LRC1 decoder matrix.
 | Single-group rebuild identity, safe-source authorization, logical/local epoch mapping, manifest/reset proof, readiness, clean recovery, and fail-stop contract | `include/lavik/replication_group.h`, `src/replication/replication_group.cpp`, `src/replication/population_recovery.h` |
 | Callable cluster directive/status/source-authorization, failover prepare/activation, source pause, and follow-owner adapters; native control/data protocol, duplex online flow, role lifecycle, Function full sync, and reconnect behavior | `include/lavik/replication.h`, `src/replication/replication.cpp` |
 | Redis AUTH/PSYNC consumption, RDB import, ordered replay, and slot topology coordination under the shared group owner | `src/replication/redis_replication.cpp`, `src/replication/replication_internal.h` |
+| Redis PSYNC source, RDB snapshot queue, worker-stream merge, and disk-to-memory handoff | `src/replication/redis_export.cpp`, `src/storage/engine/redis_export_backlog.cpp`, `src/redis/server.cpp` |
 | Lock-free live target Applied frontier and coherent cross-flow snapshots | `src/replication/replica_applied_frontier.h`, `src/replication/replica_applied_frontier.cpp` |
 | Canonical command format and deterministic expiration effects | `include/lavik/replication_command.h`, `src/replication/command.cpp` |
 | REPLICAOF/Sentinel commands, serving-generation fencing, blocking-wait invalidation, MSET publication admission/order, Function and PUBLISH capture, transaction/control capture, and trusted replay | `include/lavik/command.h`, `src/redis/command.cpp`, `src/redis/blocking_wait.cpp`, `src/redis/command_table.cpp` |
@@ -1393,4 +1434,4 @@ There is no focused malformed-LRC1 decoder matrix.
 | Manifest-filtered full-sync scanning, replacements, handoff, target reset/apply/promotion/abort, detached-index reclaim, cascade and DB-gate limitations | `src/storage/engine/replication.cpp`, `src/storage/engine/write.cpp` |
 | Frame layout, event kinds, fragmentation, and checksums | `include/lavik/storage/format.h`, `src/storage/format.cpp` |
 | Startup/runtime replication configuration, cluster fail-closed admission, and atomic CONFIG REWRITE | `app/lavik.cpp`, `include/lavik/server.h`, `src/config.cpp`, `src/redis/command.cpp`, `src/redis/server.cpp` |
-| Native, group-model, cluster-startup/manager/generation/failure/protocol-guard/failover/follow-owner, log, MSET, Pub/Sub, Redis PSYNC/ScanReader, RDB, format, and configuration verification | `tests/replication_group_test.cpp`, `tests/cluster/cluster_invariants.cpp`, `tests/cluster/fault_harness_test.cpp`, `tests/cluster/population_integration_test.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/cluster/serving_generation_integration_test.cpp`, `tests/meta_integration/gate_native_replication.py`, `tests/replication_log_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/redis_follower_smoke.py`, `tests/redis_cluster_psync_e2e.sh`, `tests/redis_scan_reader_e2e.py`, `tests/multi_exec_e2e_test.cpp`, `tests/rdb_test.cpp`, `tests/replication_command_test.cpp`, `tests/storage_format_test.cpp`, `tests/config_test.cpp` |
+| Native, group-model, cluster-startup/manager/generation/failure/protocol-guard/failover/follow-owner, log, MSET, Pub/Sub, Redis PSYNC/ScanReader, RDB, format, and configuration verification | `tests/replication_group_test.cpp`, `tests/cluster/cluster_invariants.cpp`, `tests/cluster/fault_harness_test.cpp`, `tests/cluster/population_integration_test.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/cluster/serving_generation_integration_test.cpp`, `tests/meta_integration/gate_native_replication.py`, `tests/replication_log_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/redis_follower_smoke.py`, `tests/redis_cluster_psync_e2e.sh`, `tests/redis_export_e2e.sh`, `tests/redis_scan_reader_e2e.py`, `tests/multi_exec_e2e_test.cpp`, `tests/rdb_test.cpp`, `tests/replication_command_test.cpp`, `tests/storage_format_test.cpp`, `tests/config_test.cpp` |
