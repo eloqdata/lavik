@@ -1467,19 +1467,12 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     const std::string& key = old.key_;
     const Digest digest = ComputeDigest(key);
     const bool key_indirect = key.size() > kInlineKeyMaxBytes;
-    const bool external = false;
-    ExtentManifest extents;
-    std::string manifest;
     absl::Status tombstone = co_await WriteRecordLocked(
-        store, db_id, key, manifest, RecordKind::kTombstone, ValueType::kNone,
-        0, digest, 0, 0, false, false, external, key_indirect, 0, extents,
-        nullptr, nullptr, nullptr);
-    if (!tombstone.ok()) {
-      if (extents != nullptr) [[unlikely]] {
-        SpawnExtentReclaim(store, extents);
-      }
-      co_return tombstone;
-    }
+        store, db_id, key, {}, RecordKind::kTombstone, ValueType::kNone, 0,
+        digest, 0, 0, /*for_defrag=*/false,
+        /*unlock_writer_while_waiting=*/false, /*external=*/false, key_indirect,
+        0);
+    if (!tombstone.ok()) co_return tombstone;
   }
   co_return next_epoch;
 }
