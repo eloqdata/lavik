@@ -894,9 +894,9 @@ uses the common native replication history of the sole Group, across DB0–15.
 It observes replication without holding mutation admission; replicas reject
 it, and serving-boundary retirement cancels outstanding waits. SORT_RO, SAVE,
 and BGSAVE use their shared Redis 7.2.14 command paths in both managed modes.
-Single sorting uses the
-selected DB and ordinary complete-replica read admission; Cluster sorting
-retains DB0 and slot routing, including Redis 7.2.14's BY/GET restrictions.
+Single sorting uses the selected DB and ordinary complete-replica read
+admission. Cluster sorting retains DB0 and slot routing, including Redis
+7.2.14's BY/GET restrictions.
 RDB exports cover the receiving node's dataset, including every Single DB or
 the local Cluster Group's DB0, and can be consumed by Redis. They carry no
 Meta authority and do not constitute a managed Group restore procedure.

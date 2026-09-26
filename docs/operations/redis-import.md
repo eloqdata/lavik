@@ -51,6 +51,10 @@ path has separate scope and validation in
    including credentials. Keep source Cluster topology stable. Use a new
    private working directory for each attempt, with enough capacity for RDB
    and AOF spool files. Place configuration containing passwords under mode 0600.
+   For non-loopback endpoints, route every source and target connection,
+   including discovered Cluster nodes, through peer-authenticated encrypted
+   tunnels. RedisShake v4.6.2 defaults to plaintext and does not verify server
+   certificates even when its TLS option is enabled.
 4. Start the pinned binary with a configuration like this. Substitute addresses,
    passwords and absolute paths; set each `cluster` flag independently.
 
