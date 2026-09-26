@@ -235,6 +235,22 @@ absl::Status StorageEngine::ConfigureTxCleanerCooldown(
   return impl_->ConfigureTxCleanerCooldown(cooldown_ms);
 }
 
+std::uint64_t StorageEngine::TxBacklogLimitBytes() const noexcept {
+  return impl_->TxBacklogLimitBytes();
+}
+
+absl::Status StorageEngine::ConfigureTxBacklogLimit(std::uint64_t bytes) {
+  return impl_->ConfigureTxBacklogLimit(bytes);
+}
+
+bool StorageEngine::TxBacklogAtLimit() const noexcept {
+  return impl_->TxBacklogAtLimit();
+}
+
+Task<absl::Status> StorageEngine::WaitForTxBacklog() {
+  co_return co_await impl_->WaitForTxBacklog();
+}
+
 Task<StorageDurabilityStats> StorageEngine::DurabilityStats() const {
   return impl_->DurabilityStats();
 }

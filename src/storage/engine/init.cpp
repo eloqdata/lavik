@@ -262,6 +262,10 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "storage worker count exceeds logical storage shards");
   }
+  if (options_.tx_backlog_limit_bytes_ < kStorageBlockBytes) {
+    return absl::InvalidArgumentError(
+        "transaction backlog limit must be at least 8 MiB");
+  }
   if (options_.defrag_max_active_per_device_ == 0 ||
       options_.defrag_max_active_per_device_ > kDefragReserveBlocksPerDevice) {
     return absl::Status(
@@ -1050,10 +1054,10 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryLiveReferenceBatches(
           const auto tx_block =
               owner_store.tx_blocks_.find(reference.block_id_);
           if (tx_block != owner_store.tx_blocks_.end()) {
-            NoteTxRecordLocal(owner_store, reference.block_id_,
-                              reference.allocation_epoch_,
-                              tx_block->second.generation_, reference.txid_,
-                              reference.bytes_, false);
+            NoteTxRecordLocal(
+                owner_store, reference.block_id_, reference.allocation_epoch_,
+                tx_block->second.generation_, reference.txid_, reference.bytes_,
+                false, nullptr, 0, reference.batch_txid_);
           }
         }
       }
@@ -1713,6 +1717,11 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         .block_id_ = location.block_id(),
         .allocation_epoch_ = location.allocation_epoch(),
         .txid_ = recovered.txid_,
+        .batch_txid_ = recovered.auxiliary_group_.has_value()
+                           ? recovered.auxiliary_group_->batch_txid_
+                       : recovered.ordered_group_.has_value()
+                           ? recovered.ordered_group_->batch_txid_
+                           : 0,
         .bytes_ = location.total_disk_bytes(),
         .expected_owner_ = location.block_owner(),
     });
