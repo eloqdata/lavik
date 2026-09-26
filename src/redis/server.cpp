@@ -1514,7 +1514,11 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
   ConnectionOpened();
   absl::Status observed = stream.SetPeerDisconnectCallback(
       [](void* context) noexcept {
-        const auto* connection = static_cast<const ConnectionContext*>(context);
+        auto* connection = static_cast<ConnectionContext*>(context);
+        // A command may be suspended before registering its blocking waiter.
+        // Preserve disconnect beyond the one-shot registry cancellation so it
+        // cannot subsequently begin an infinite wait on a dead connection.
+        connection->closing_ = true;
         (void)CancelBlockedClientOnCurrentWorker(connection->conn_id_);
       },
       &ctx);

@@ -889,8 +889,11 @@ gate throughout its streamed reply. MULTI/EXEC/WATCH, SCRIPT, Lua and Function
 invocation reuse standalone execution under Group authority. XREAD and
 XREADGROUP support blocking and immediate reads on their existing wait lanes;
 XREADGROUP includes consumer metadata writes even for empty replies and NOACK.
-Standalone's unsupported inner commands remain unsupported. Top-level WAIT,
-SORT_RO, SAVE and BGSAVE remain deferred in managed Single.
+Standalone's unsupported inner commands remain unsupported. Top-level SORT_RO,
+SAVE and BGSAVE remain deferred in managed Single.
+`WAIT` uses the common native replication history of the sole Group, across
+DB0–15. It observes replication without holding mutation admission; replicas
+reject it, and serving-boundary retirement cancels outstanding waits.
 Function catalog management uses that same sole Group's admission and drain:
 LOAD/DELETE/FLUSH/RESTORE share one mutation lifecycle and final authority
 check at the first durable root write. DUMP/LIST use ordinary Single data-read

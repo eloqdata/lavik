@@ -32,7 +32,11 @@ namespace {
 constexpr std::string_view kMagic = "LRC1";
 constexpr std::uint8_t kVersion = 1;
 constexpr std::size_t kFixedHeaderBytes = 8;
-constexpr std::size_t kMaxArgumentCount = 1024;
+// Redis variadic writes routinely exceed 1024 arguments. Use the complete
+// LRC1 count field; the length table and event byte budget still bound
+// decoding.
+constexpr std::size_t kMaxArgumentCount =
+    std::numeric_limits<std::uint16_t>::max();
 constexpr std::size_t kMaxArgumentBytes =
     static_cast<std::size_t>(kMaxNativeReplicationEventBytes);
 constexpr std::string_view kTransactionMagic = "LTX1";
@@ -213,8 +217,7 @@ ReplicationCommandPayloadSource::Create(
   if (db_id >= storage::kLogicalDatabaseCount) {
     return Malformed("replication command database is out of range");
   }
-  if (args.empty() || args.size() > kMaxArgumentCount ||
-      args.size() > std::numeric_limits<std::uint16_t>::max()) {
+  if (args.empty() || args.size() > kMaxArgumentCount) {
     return Malformed("replication command argument count is out of range");
   }
 

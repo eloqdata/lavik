@@ -1093,6 +1093,16 @@ if (BUILD_TESTING)
       set_tests_properties(meta_integration.gate_managed_single PROPERTIES
         LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
 
+      add_test(NAME meta_integration.gate_managed_wait
+        COMMAND ${CMAKE_COMMAND} -E env
+                LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>
+                ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_managed_wait.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI})
+      set_tests_properties(meta_integration.gate_managed_wait PROPERTIES
+        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+
       add_test(
         NAME meta_integration.gate_managed_single_blocking
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
@@ -1362,6 +1372,17 @@ if (BUILD_TESTING)
       # ctest never builds; keep the driver in the default target set.
       add_custom_target(lavik_cluster_client_go ALL
         DEPENDS ${cluster_client_go_bin})
+      set(import_client_go_bin "${CMAKE_CURRENT_BINARY_DIR}/import-client-go")
+      add_custom_command(OUTPUT ${import_client_go_bin}
+        COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=0
+          GOTOOLCHAIN=${LAVIK_GO_TOOLCHAIN}
+          ${LAVIK_GO_EXECUTABLE} build -mod=readonly
+          -o ${import_client_go_bin} ./import-check
+        WORKING_DIRECTORY ${cluster_client_go_dir}
+        DEPENDS ${cluster_client_go_dir}/import-check/main.go
+                ${cluster_client_go_dir}/go.mod ${cluster_client_go_dir}/go.sum
+        VERBATIM)
+      add_custom_target(lavik_import_client_go ALL DEPENDS ${import_client_go_bin})
       set(sentinel_client_go_dir
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/sentinel_client_go")
       set(sentinel_client_go_bin "${CMAKE_CURRENT_BINARY_DIR}/sentinel-client-go")
@@ -1640,6 +1661,31 @@ endforeach()
                   $<TARGET_FILE:lavik-ctl>)
         set_tests_properties(lavik_redis_scan_reader_e2e
           PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+        if (TARGET lavik_import_client_go)
+          set(import_cases single-single single-cluster cluster-single cluster-cluster type-commands)
+          if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR LAVIK_ENABLE_TEST_FAULTS)
+            foreach(import_mode single cluster)
+              foreach(import_phase full incremental)
+                foreach(import_fault tool connection failover)
+                  list(APPEND import_cases "${import_mode}-${import_phase}-${import_fault}")
+                endforeach()
+              endforeach()
+            endforeach()
+          endif()
+          foreach(import_case IN LISTS import_cases)
+            add_test(NAME lavik_redis_sync_reader_${import_case}
+              COMMAND ${CMAKE_COMMAND} -E env
+                "PYTHONPATH=${LAVIK_CLUSTER_CLIENT_REDIS_PY}"
+                "LAVIK_IMPORT_GO_CLIENT=${import_client_go_bin}"
+                LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>
+                ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_sync_reader_e2e.py
+                $<TARGET_FILE:lavik> ${LAVIK_REDIS_SERVER_EXECUTABLE}
+                ${LAVIK_REDIS_SHAKE_EXECUTABLE} $<TARGET_FILE:lavik-meta>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_REDIS_CLI_EXECUTABLE} ${import_case})
+            set_tests_properties(lavik_redis_sync_reader_${import_case}
+              PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE LABELS "meta-integration;redis-import")
+          endforeach()
+        endif()
       endif()
       add_test(
         NAME lavik_redis_cluster_psync_e2e
