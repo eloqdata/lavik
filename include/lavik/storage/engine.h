@@ -1453,6 +1453,23 @@ class StorageEngine {
   bycorf::Task<absl::StatusOr<std::uint64_t>> FenceReplicationLog();
   bycorf::Task<absl::StatusOr<ReplicationLogBatch>> ReadReplicationLog(
       ReplicationLogCursor next, std::size_t max_bytes, std::size_t max_frames);
+  // The Redis connection owner stores one already-merged command stream in
+  // temporary data-device blocks while sending RDB. This stream is unrelated
+  // to the worker-local replication LSNs and is discarded on restart.
+  bycorf::Task<absl::Status> StartRedisExportDiskBacklog(
+      std::uint64_t session_id, std::size_t capacity_bytes);
+  // Append one complete, Redis-compatible RESP command or atomic envelope.
+  bycorf::Task<absl::Status> AppendRedisExportDiskBytes(
+      std::uint64_t session_id, std::string_view bytes);
+  // Stop appends and return the exclusive end cursor for draining the blocks.
+  bycorf::Task<absl::StatusOr<std::uint64_t>> StopRedisExportDiskBacklog(
+      std::uint64_t session_id);
+  bycorf::Task<absl::StatusOr<ReplicationLogBatch>> ReadRedisExportDiskBacklog(
+      std::uint64_t session_id, ReplicationLogCursor next,
+      std::size_t max_bytes, std::size_t max_frames);
+  // Idempotent after Stop; also aborts an active capture on a failed export.
+  bycorf::Task<absl::Status> ReleaseRedisExportDiskBacklog(
+      std::uint64_t session_id);
   // Pins history needed by one ONLINE/downstream session. The cursor is the
   // first LSN not yet acknowledged by that session. At capacity, the runtime
   // policy either waits for the slowest retained cursor or revokes lagging

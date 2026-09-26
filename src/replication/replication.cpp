@@ -11896,6 +11896,8 @@ auto ReplicationManager::ReplicationGroup::RemoveMasterSession(
 auto ReplicationManager::ReplicationGroup::DrainSourceEgress()
     -> Task<absl::Status> {
   assert(bycorf::ThisWorker().id_ == 0);
+  const int redis_fd = redis_export_fd_.load(std::memory_order_acquire);
+  if (redis_fd >= 0) (void)::shutdown(redis_fd, SHUT_RDWR);
   // Demotion has already made the role non-master. Process shutdown closes
   // every registered source socket before request drain so retained history
   // cannot deadlock an admitted publisher; this coroutine performs the
@@ -11927,6 +11929,7 @@ auto ReplicationManager::ReplicationGroup::DrainSourceEgress()
     });
   };
   while (active_master_controls_.load(std::memory_order_acquire) != 0 ||
+         redis_export_active_.load(std::memory_order_acquire) ||
          idle_history_monitor_running_ || history_reset_running_ ||
          source_flows_active()) {
     absl::Status waited = co_await bycorf::SleepFor(
@@ -12000,6 +12003,7 @@ auto ReplicationManager::ReplicationGroup::MasterHistoryHasConsumersLocked()
           cluster_rebuild_->ready_token_.has_value()) ||
          !master_sessions_.empty() || !retired_master_sessions_.empty() ||
          source_authorizations_.RetainsSourceHistory() ||
+         redis_export_active_.load(std::memory_order_acquire) ||
          active_master_controls_.load(std::memory_order_acquire) != 0;
 }
 
@@ -12550,6 +12554,14 @@ Task<absl::Status> ReplicationManager::ServeNativeConnection(
   }
   co_return co_await group_->ServeNativeConnection(
       stream, std::move(args), client_id, std::move(client_address), tls);
+}
+
+Task<absl::Status> ReplicationManager::ServeRedisExportConnection(
+    TcpStream& stream, std::vector<std::string> args, std::uint64_t client_id,
+    std::string client_address, bool tls, bool eof_capable) {
+  co_return co_await group_->ServeRedisExportConnection(
+      stream, std::move(args), client_id, std::move(client_address), tls,
+      eof_capable);
 }
 
 Task<absl::StatusOr<std::optional<NativeReplicationWatermark>>>

@@ -606,6 +606,16 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
   EXPECT_EQ(decoded_header.kind_, BlockKind::kCheckpointIndex);
   EXPECT_EQ(decoded_header.tx_generation_, 23);
+  BlockHeader export_header = header;
+  export_header.kind_ = BlockKind::kRedisExportBacklog;
+  export_header.record_count_ = 2;
+  export_header.committed_bytes_ = kBlockHeaderBytes + 256;
+  EncodeBlockHeader(export_header, block_page);
+  ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
+  EXPECT_EQ(decoded_header.kind_, BlockKind::kRedisExportBacklog);
+  export_header.tx_generation_ = 17;
+  EncodeBlockHeader(export_header, block_page);
+  EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_header));
   BlockHeader records_with_generation = header;
   records_with_generation.tx_generation_ = 17;
   EncodeBlockHeader(records_with_generation, block_page);

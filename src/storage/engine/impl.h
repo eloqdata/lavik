@@ -1033,6 +1033,9 @@ struct ReservedBlock {
 enum class AllocationPurpose : std::uint8_t {
   kForeground,
   kDefrag,
+  // Export-only history may fail without stalling foreground writes or taking
+  // blocks protected for defragmentation.
+  kRedisExportBacklog,
   // Shutdown recovery proof and checkpoint metadata may allocate after writes
   // have been frozen, but it never waits for reclamation or consumes the
   // reserve that guarantees defrag can make progress.
@@ -1451,6 +1454,40 @@ class StorageEngine::Impl {
       // restart together with the replication history id.
     };
 
+    // The connection owner stores one already-merged Redis command stream.
+    // Source workers retain their native in-memory logs only until this spool
+    // has consumed each event. These blocks are never part of defrag/indexes.
+    struct RedisExportDiskBacklog {
+      struct Block {
+        std::uint64_t id_ = 0;
+        std::uint64_t allocation_epoch_ = 0;
+        std::uint64_t first_lsn_ = 0;
+        std::uint64_t last_lsn_ = 0;
+        std::uint32_t committed_bytes_ = kBlockHeaderBytes;
+        std::uint32_t frame_count_ = 0;
+        bool sealed_ = false;
+      };
+      AsyncMutex mutex_;
+      std::uint64_t session_id_ = 0;
+      std::uint64_t start_lsn_ = 0;
+      std::uint64_t end_lsn_ = 0;
+      std::uint64_t next_stream_lsn_ = 1;
+      std::uint64_t active_event_lsn_ = 0;
+      std::uint32_t next_fragment_index_ = 0;
+      std::size_t max_blocks_ = 0;
+      std::vector<Block> blocks_;
+      std::byte* active_buffer_ = nullptr;
+      RetainedMemoryCharge active_buffer_charge_;
+      bool capturing_ = false;
+      std::optional<absl::Status> failure_;
+
+      ~RedisExportDiskBacklog() {
+        if (active_buffer_ != nullptr) {
+          bycorf::FreeStorageBuffer(active_buffer_, kDirectIoAlignment);
+        }
+      }
+    };
+
     struct FullSyncCapture {
       enum class Phase : std::uint8_t {
         kCapturing,
@@ -1717,6 +1754,7 @@ class StorageEngine::Impl {
     std::array<std::size_t, kLogicalDatabaseCount> live_key_count_{};
     std::shared_ptr<lavik::ReplicationHistory> replication_history_;
     ReplicationLogRuntime replication_log_;
+    RedisExportDiskBacklog redis_export_disk_backlog_;
     std::optional<ActiveBlock> active_block_;
     // Allocated lazily: workers serving only short keys never acquire a key
     // stream buffer or populate these maps.
@@ -2745,6 +2783,20 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<std::uint64_t>> FenceReplicationLog();
   Task<absl::StatusOr<ReplicationLogBatch>> ReadReplicationLog(
       ReplicationLogCursor next, std::size_t max_bytes, std::size_t max_frames);
+  Task<absl::Status> StartRedisExportDiskBacklog(std::uint64_t session_id,
+                                                 std::size_t capacity_bytes);
+  Task<absl::Status> AppendRedisExportDiskBytes(std::uint64_t session_id,
+                                                std::string_view bytes);
+  Task<absl::StatusOr<std::uint64_t>> StopRedisExportDiskBacklog(
+      std::uint64_t session_id);
+  Task<absl::StatusOr<ReplicationLogBatch>> ReadRedisExportDiskBacklog(
+      std::uint64_t session_id, ReplicationLogCursor next,
+      std::size_t max_bytes, std::size_t max_frames);
+  Task<absl::Status> ReleaseRedisExportDiskBacklog(std::uint64_t session_id);
+  Task<absl::Status> AppendRedisExportDiskFrame(
+      WorkerStore& store, const ReplicationFrameHeader& source,
+      std::span<const std::byte> payload);
+  Task<absl::Status> SealRedisExportDiskBlock(WorkerStore& store);
   absl::Status RetainReplicationLog(std::uint64_t session_id,
                                     std::uint64_t keep_from_lsn);
   void ReleaseReplicationLogRetention(std::uint64_t session_id);

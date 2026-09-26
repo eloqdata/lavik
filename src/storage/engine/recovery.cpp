@@ -431,6 +431,15 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 block.allocation_epoch_ + 1);
       AtomicMax(&recovery_max_lsn_, block.max_lsn_);
 
+      if (block.kind_ == BlockKind::kRedisExportBacklog) {
+        // Redis export history has no recovery identity. A restarted source
+        // must start a new FULLRESYNC, so no command in this block is replayed.
+        // Recovery scans every allocated block twice: release and count this
+        // runtime-only block only in the final pass.
+        if (!indirect_key_pass) zero_blocks->push_back(block_id);
+        if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
+        continue;
+      }
       if (block.kind_ == BlockKind::kCheckpointIndex) {
         // Checkpoint blocks are acceleration state, not record ownership.
         // The selected generation was already loaded through its bitmap;

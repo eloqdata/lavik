@@ -2285,6 +2285,11 @@ class ReplicationManager::ReplicationGroup {
                                            std::uint64_t client_id,
                                            std::string client_address,
                                            bool tls);
+  Task<absl::Status> ServeRedisExportConnection(TcpStream& stream,
+                                                std::vector<std::string> args,
+                                                std::uint64_t client_id,
+                                                std::string client_address,
+                                                bool tls, bool eof_capable);
 
  private:
   static void AssertStateOwner() noexcept;
@@ -2899,6 +2904,10 @@ class ReplicationManager::ReplicationGroup {
   // of the worker-affine source session registry. Process shutdown cancels it
   // before request drain so transport teardown releases backlog retention.
   SocketSet source_sockets_;
+  // One Redis socket owns the temporary disk stream. Source retirement joins
+  // this handler before disabling the worker-local logs it reads.
+  std::atomic<bool> redis_export_active_{false};
+  std::atomic<int> redis_export_fd_{-1};
   bycorf::AsyncMutex redis_fullsync_mutex_;  // worker 0 only
   std::atomic<std::uint64_t> next_master_session_id_{1};
   std::atomic<unsigned> active_master_controls_{0};
