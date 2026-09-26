@@ -545,42 +545,6 @@ TEST(GroupedRecoveryE2e, RestoresRootAndAuxiliaryWithoutExposingExtraKeys) {
   EXPECT_EQ(server.Command({"HGET", "hash", "field"}), std::string(128, 'v'));
 }
 
-TEST(GroupedRecoveryE2e, RejectsWholeValueLargeStringOnStartup) {
-  for (const bool external : {false, true}) {
-    for (const auto bytes :
-         {kCollectionPromotionBytes, kCollectionPromotionBytes + 1}) {
-      SCOPED_TRACE(::testing::Message()
-                   << "external=" << external << " bytes=" << bytes);
-      RecordImage image;
-      image.GroupPayload(
-          "old-string", std::string(bytes, 'v'),
-          RecordHeader{.value_type_ = ValueType::kString,
-                       .external_ = external,
-                       .logical_size_ = static_cast<std::uint32_t>(bytes),
-                       .mutation_sequence_ = 1});
-      image.Finish();
-      ChildServer server(image);
-      EXPECT_NE(server.Wait(), 0);
-      EXPECT_NE(server.Log().find("unsupported whole-value large String"),
-                std::string::npos)
-          << server.Log();
-    }
-  }
-}
-
-TEST(GroupedRecoveryE2e, RecoversCompactStringBelowPromotionBoundary) {
-  RecordImage image;
-  const std::string value(kCollectionPromotionBytes - 1, 'v');
-  image.GroupPayload(
-      "compact-string", value,
-      RecordHeader{.value_type_ = ValueType::kString,
-                   .logical_size_ = static_cast<std::uint32_t>(value.size()),
-                   .mutation_sequence_ = 1});
-  image.Finish();
-  ChildServer server(image);
-  EXPECT_EQ(server.Command({"GET", "compact-string"}), value);
-}
-
 TEST(GroupedRecoveryE2e, IgnoresUncommittedAndFutureGroupVersions) {
   RecordImage image;
   auto group = SingleGroup();

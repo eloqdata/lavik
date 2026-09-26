@@ -901,11 +901,6 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store,
                                         digest, location,
                                         std::move(grouped_snapshot));
   }
-  if (location.kind() == RecordKind::kValue &&
-      location.value_type() == ValueType::kString &&
-      ShouldGroupString(location.logical_size_)) {
-    co_return absl::DataLossError("unsupported whole-value large String");
-  }
   // The caller already resolved the key's partition for the index lookup.
   // Reuse it across retries instead of recomputing the Redis slot.
   const std::uint64_t replication_epoch = partition.replication_epoch_;

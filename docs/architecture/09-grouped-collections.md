@@ -65,9 +65,8 @@ SETRANGE/SETBIT/APPEND replace intersecting segments and any changed tail link
 through the shared grouped publication boundary. General whole-value callbacks
 materialize grouped Strings and reuse unchanged segments in their after-image.
 Strings below the promotion threshold use compact whole-value reads and writes.
-Older whole-value large user Strings are unsupported on disk; import them again
-into a fresh data set. This restriction does not apply to the dedicated
-KeyRecords that store original key bytes.
+Dedicated KeyRecords store original key bytes whole regardless of this
+user-value promotion threshold.
 
 ## Identity and ownership
 

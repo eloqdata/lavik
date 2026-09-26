@@ -581,16 +581,6 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           }
           continue;
         }
-        // KeyRecords deliberately keep original key bytes whole. The removed
-        // whole-value large String layout is invalid only for user records.
-        if (block.kind_ != BlockKind::kIndirectKeys &&
-            record.kind_ == RecordKind::kValue &&
-            record.value_type_ == ValueType::kString && !record.grouped_ &&
-            !record.auxiliary_group_ &&
-            ShouldGroupString(record.logical_size_)) {
-          co_return absl::DataLossError(
-              "unsupported whole-value large String; reimport data");
-        }
         const std::byte* payload =
             recovery.buffer_.data_ + record_offset + record.header_bytes_;
         const auto payload_span =
