@@ -883,6 +883,35 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
     co_return absl::OkStatus();
   }
 
+  bycorf::Task<absl::Status> QuiesceTxCleanerForCapacityBaseline() {
+    // A prior fixture round can leave unpinned blocks awaiting a generation
+    // rotation. The first cleaner pass may only seal that generation, so
+    // require two passes without retirement before sampling global capacity.
+    unsigned quiet_rounds = 0;
+    for (unsigned attempt = 0; attempt < 16; ++attempt) {
+      const auto before = storage_->TxCleanerStats();
+      absl::Status configured = storage_->ConfigureTxCleanerCooldown(1);
+      if (!configured.ok()) co_return configured;
+      absl::Status waited = co_await WaitForCleanerRound(before.rounds_);
+      if (!waited.ok()) co_return waited;
+      const auto after = storage_->TxCleanerStats();
+      if (after.failures_ != before.failures_) {
+        co_return absl::FailedPreconditionError(
+            "transaction cleaner failed while settling capacity baseline");
+      }
+      quiet_rounds = after.retired_blocks_ == before.retired_blocks_
+                         ? quiet_rounds + 1
+                         : 0;
+      if (quiet_rounds == 2) {
+        configured = storage_->ConfigureTxCleanerCooldown(0);
+        if (!configured.ok()) co_return configured;
+        co_return co_await WaitForCleanerIdle();
+      }
+    }
+    co_return absl::FailedPreconditionError(
+        "transaction cleaner did not settle capacity baseline");
+  }
+
   bycorf::Task<absl::Status> WaitForTxBlockRetirement(std::uint64_t previous) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -981,6 +1010,8 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
     std::optional<std::uint64_t> first_retained;
 
     for (unsigned round = 0; round < 2; ++round) {
+      absl::Status settled = co_await QuiesceTxCleanerForCapacityBaseline();
+      if (!settled.ok()) co_return settled;
       const std::uint64_t pin_session = 950 + round;
       const std::uint64_t replica_session = 960 + round;
       const auto capacity_baseline = co_await storage_->CollectMetrics();
@@ -1015,16 +1046,27 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
       Check(co_await storage_->Exists(kDb, key),
             "replica promotion did not publish the candidate key");
 
+      const auto cleaner_before = storage_->TxCleanerStats();
+      Check(storage_->ConfigureTxCleanerCooldown(1).ok(),
+            "failed to restart transaction cleaner for promotion fixture");
+      absl::Status attempted =
+          co_await WaitForCleanerRound(cleaner_before.rounds_);
+      if (!attempted.ok()) co_return attempted;
+      const auto cleaner_while_pinned = storage_->TxCleanerStats();
+      Check(
+          cleaner_while_pinned.retired_blocks_ ==
+              cleaner_before.retired_blocks_,
+          "transaction cleaner retired promotion's snapshot-pinned generation");
       const auto while_pinned = co_await storage_->CollectMetrics();
       Check(while_pinned.devices_.front().available_bytes_ <=
                 capacity_baseline.devices_.front().available_bytes_,
             "replica promotion reported pinned retired capacity as available");
-      const auto retired_before = storage_->TxCleanerStats().retired_blocks_;
       ReleasePinnedValue(pin_session, key, *pinned);
       // ReturnColdBlocks increments this count only after the allocator has
       // accepted the retired blocks. Net free capacity can stay flat if
       // another allocation immediately uses them.
-      absl::Status retired = co_await WaitForTxBlockRetirement(retired_before);
+      absl::Status retired = co_await WaitForTxBlockRetirement(
+          cleaner_while_pinned.retired_blocks_);
       if (!retired.ok()) co_return retired;
       // Production keeps replica loading enabled after root promotion so tail
       // commands continue to require their per-partition apply context. This
