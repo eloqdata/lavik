@@ -268,6 +268,8 @@ TEST(ClusterCommandTest, ClientSemanticsAreIndependentOfMetaRuntime) {
   // Selecting Single does not grant external role control on a managed node.
   EXPECT_EQ(RunDispatch(context, {"REPLICAOF", "NO", "ONE"}),
             "-ERR REPLICAOF not allowed in Meta-managed mode.\r\n");
+  EXPECT_EQ(RunDispatch(context, {"LAVIK.REPLICAOF", "NO", "ONE"}),
+            "-ERR LAVIK.REPLICAOF not allowed in Meta-managed mode.\r\n");
 }
 
 TEST(ClusterCommandTest, KeySlotWorksWithoutClusterState) {

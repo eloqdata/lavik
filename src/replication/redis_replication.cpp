@@ -293,12 +293,64 @@ Task<absl::StatusOr<std::string>> ReadRedisBulkReply(TcpStream& stream) {
 
 }  // namespace replication_internal
 
+auto ReplicationManager::ReplicationGroup::ProbeNativeUpstreamConnection(
+    const ReplicaOfConfig& upstream,
+    const std::shared_ptr<TimedSocketContext>& transport)
+    -> Task<absl::Status> {
+  auto connected = co_await ConnectTcp(
+      upstream.host_, upstream.port_, tls_context_, &transport->sockets_, true);
+  if (!connected.ok()) co_return connected.status();
+  TcpStream stream = std::move(*connected);
+  struct CloseGuard {
+    TcpStream* stream_;
+    ~CloseGuard() { stream_->Close().IgnoreError(); }
+  } close_guard{&stream};
+  ScopedSocketSetMembership membership(&transport->sockets_, stream.NativeFd());
+  absl::Status status =
+      co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
+  if (!status.ok()) co_return status;
+  // The anonymous native handshake is a protocol probe: the source replies
+  // with its identity and immediately retires the temporary session. In
+  // particular, a replica rejects it before this node changes roles, since
+  // standalone native cascading is not supported.
+  const std::vector<std::string> hello{
+      "LVPSYNC", std::string(kProtocolVersion), "?", "?", "?", "?", "?", "?"};
+  const std::string encoded_hello = EncodeRespCommand(hello);
+  status = co_await WriteText(stream, encoded_hello);
+  if (!status.ok()) co_return status;
+  auto response = co_await ReadLine(stream);
+  if (!response.ok()) co_return response.status();
+  if (response->starts_with("+LVFULLRESYNC ")) co_return absl::OkStatus();
+  co_return absl::FailedPreconditionError(
+      absl::StrCat("upstream rejected Lavik protocol probe: ", *response));
+}
+
+auto ReplicationManager::ReplicationGroup::ProbeNativeUpstream(
+    const ReplicaOfConfig& upstream) -> Task<absl::Status> {
+  auto transport = std::make_shared<TimedSocketContext>(&outbound_sockets_);
+  const auto epoch = role_epoch_.load(std::memory_order_relaxed);
+  bycorf::ThisWorker().self_->Spawn(WatchTimedSockets(transport, [this, epoch] {
+    return !replication_shutdown_requested_ &&
+           role_epoch_.load(std::memory_order_relaxed) == epoch;
+  }));
+  absl::Status result =
+      co_await ProbeNativeUpstreamConnection(upstream, transport);
+  transport->finished_ = true;
+  while (!transport->watcher_finished_) {
+    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                            std::chrono::milliseconds(1));
+    if (!waited.ok()) co_return waited;
+  }
+  co_return result;
+}
+
 auto ReplicationManager::ReplicationGroup::SetUpstream(
-    std::optional<ReplicaOfConfig> upstream) -> Task<absl::Status> {
+    std::optional<ReplicaOfConfig> upstream, bool native)
+    -> Task<absl::Status> {
   if (bycorf::ThisWorker().id_ != 0) {
     co_return co_await bycorf::SubmitTaskTo(
-        0, [this, upstream = std::move(upstream)]() mutable {
-          return SetUpstream(std::move(upstream));
+        0, [this, upstream = std::move(upstream), native]() mutable {
+          return SetUpstream(std::move(upstream), native);
         });
   }
   if (meta_managed_) {
@@ -328,11 +380,16 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
   const auto observed_epoch = role_epoch_.load(std::memory_order_acquire);
   std::optional<UpstreamDiscovery> discovery;
   if (upstream.has_value()) {
-    auto prepared = co_await PrepareRedisUpstream(*upstream);
-    // Authenticate and obtain a valid PSYNC response before retiring a
-    // healthy subscription or closing local admission.
-    if (!prepared.ok()) co_return prepared.status();
-    discovery = std::move(*prepared);
+    if (native) {
+      absl::Status probed = co_await ProbeNativeUpstream(*upstream);
+      if (!probed.ok()) co_return probed;
+    } else {
+      auto prepared = co_await PrepareRedisUpstream(*upstream);
+      // Authenticate and obtain a valid PSYNC response before retiring a
+      // healthy subscription or closing local admission.
+      if (!prepared.ok()) co_return prepared.status();
+      discovery = std::move(*prepared);
+    }
     if (replication_shutdown_requested_ ||
         role_epoch_.load(std::memory_order_acquire) != observed_epoch) {
       co_return absl::CancelledError(
@@ -555,8 +612,7 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
     redis_cluster_ = false;
     redis_topology_fault_ = false;
     redis_topology_monitor_started_ = false;
-    initial_redis_connection_pending_ =
-        upstream.has_value() && !discovery.has_value();
+    initial_redis_connection_pending_ = false;
     replica_session_id_ = 0;
     source_worker_count_ = 0;
     upstream_node_id_.reset();
@@ -571,7 +627,7 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
     } else {
       next_epoch = role_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
     }
-    const bool redis = discovery.has_value();
+    const bool redis = !native && discovery.has_value();
     redis_psync_.store(redis, std::memory_order_release);
     if (redis) {
       auto source = std::make_shared<RedisSource>();
