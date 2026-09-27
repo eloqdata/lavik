@@ -267,7 +267,8 @@ def changing_endpoint(lavik, redis, root, managed_port=None):
         )
         source.call("SET", "redis-value", "redis")
         # The connection that passes PSYNC is the consumer, not a probe. Any
-        # second connection reaches Lavik, whose ordinary handshake rejects it.
+        # second connection reaches Lavik. Its EOF-only exporter rejects the
+        # external Redis follower, which does not negotiate diskless EOF.
         proxy = Forwarder(lambda count: source_port if count == 1 else native_port)
         try:
             with process(lavik, root / "changed-online", "online") as (target, _, log):
@@ -282,7 +283,7 @@ def changing_endpoint(lavik, redis, root, managed_port=None):
                 H.wait_until(
                     "reconnect handshake rejects unsupported endpoint",
                     15,
-                    lambda: "Redis replication handshake failed" in log.read_text(),
+                    lambda: "requires REPLCONF capa eof" in log.read_text(),
                 )
                 assert "role:slave" in target.call("INFO", "replication")
                 reject(target, ("SET", "unfenced", "wrong"), "READONLY")
