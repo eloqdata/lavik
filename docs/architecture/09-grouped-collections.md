@@ -91,7 +91,10 @@ the next unused page identifier. Page identifiers are not reused inside an
 incarnation. Rank metadata locates a page without keeping item values resident.
 Splits and removals publish changed neighbour links and retained retirement
 records together. Sorted Set directories also retain per-page minimum and
-maximum scores, but no member boundaries. Recovery checks the complete chain,
+maximum scores, but no member boundaries. Stream directories retain bounded
+per-page maximum routing keys and a fixed header with their logical version;
+unknown or ambiguous long-name boundaries fall back to checked page reads.
+These runtime-only bounds do not change the durable page format. Recovery checks the complete chain,
 rank totals, numeric score boundaries and every live extent checksum while
 retaining only routing metadata. Full-page decoding validates local item
 ordering; Sorted Set materialization also checks

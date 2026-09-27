@@ -62,10 +62,15 @@ An append or delivery wakes blocked readers only after successful publication.
 
 ## Access and mutation
 
-The ordered directory retains page identities, links and counts, without
-message, consumer or PEL payloads. Record lookup binary-searches page boundaries
-through admitted page reads. Request-local page ownership stays on the key's
-worker; loaders revalidate logical identity and retry physical relocation.
+The ordered directory retains page identities, links, counts, and bounded
+per-page maximum routing keys, without message, consumer or PEL payloads.
+The fixed Stream header is also cached with its immutable logical version.
+Writes publish routing bounds from changed pages; recovery restores them from
+checked inline pages, and an owner-worker read can learn a missing bound from
+an external or older page. Binary search compares resident bounds and reads a
+page only when a bound is unavailable or its capped prefix cannot decide the
+comparison. Request-local page ownership stays on the key's worker; loaders
+revalidate logical identity and retry physical relocation.
 
 | Operation | Storage access |
 |---|---|

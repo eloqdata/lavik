@@ -20,6 +20,75 @@
 namespace lavik::storage {
 namespace {
 
+TEST(StreamPageMaxKeyTest, ExactIdsAndLongNamesPreserveOrdering) {
+  StreamPageMaxKey boundary;
+  EXPECT_FALSE(boundary.LessThan("\1"));
+  const std::string id = std::string("\1", 1) + std::string(16, '\x7f');
+  boundary.Set(id);
+  EXPECT_EQ(boundary.LessThan(id), false);
+  EXPECT_EQ(boundary.LessThan(id + '\1'), true);
+  EXPECT_EQ(boundary.LessThan(std::string("\1", 1) + std::string(16, '\x7e')),
+            false);
+
+  const std::string long_name = std::string("\5", 1) + std::string(80, 'n');
+  boundary.Set(long_name);
+  EXPECT_EQ(boundary.LessThan(id), false);
+  EXPECT_EQ(boundary.LessThan(std::string("\6", 1)), true);
+  EXPECT_FALSE(boundary.LessThan(long_name));
+  EXPECT_EQ(
+      boundary.LessThan(long_name.substr(0, StreamPageMaxKey::kPrefixBytes)),
+      false);
+}
+
+TEST(StreamDirectoryTest, RetainsUnchangedHeaderAndInvalidatesReplacement) {
+  OrderedCollectionRoot root{.kind_ = OrderedCollectionKind::kStream,
+                             .incarnation_ = 17,
+                             .item_count_ = 2,
+                             .first_group_ = 1,
+                             .last_group_ = 2,
+                             .next_group_id_ = 3,
+                             .group_count_ = 2,
+                             .revision_ = 1,
+                             .stream_length_ = 1};
+  std::vector<RecoveredOrderedGroup> pages{{.incarnation_ = 17,
+                                            .id_ = 1,
+                                            .next_ = 2,
+                                            .sequence_ = 1,
+                                            .lsn_ = 1,
+                                            .item_count_ = 1,
+                                            .record_token_ = 1},
+                                           {.incarnation_ = 17,
+                                            .id_ = 2,
+                                            .previous_ = 1,
+                                            .sequence_ = 1,
+                                            .lsn_ = 2,
+                                            .item_count_ = 1,
+                                            .record_token_ = 2}};
+  auto directory = OrderedGroupDirectory::Recover(root, 1, pages, {});
+  ASSERT_TRUE(directory.ok()) << directory.status();
+  std::string header(48, '\0');
+  header.replace(0, 4, "LXS1");
+  header[44] = 1;
+  ASSERT_TRUE(directory->RememberStreamHeader(header).ok());
+  const std::string id = std::string("\1", 1) + std::string(16, '\x7f');
+  ASSERT_TRUE(directory->RememberStreamPageMaxKey(1, id).ok());
+
+  root.revision_ = 2;
+  auto unchanged = directory->Apply(root, 2, {}, 2);
+  ASSERT_TRUE(unchanged.ok()) << unchanged.status();
+  EXPECT_EQ(unchanged->stream_header(), header);
+  EXPECT_EQ(unchanged->groups()[1].stream_max_key_.LessThan(id), false);
+
+  auto replacement = pages[0];
+  replacement.sequence_ = 3;
+  replacement.lsn_ = 3;
+  root.revision_ = 3;
+  auto changed = unchanged->Apply(root, 3, std::span(&replacement, 1), 3);
+  ASSERT_TRUE(changed.ok()) << changed.status();
+  EXPECT_TRUE(changed->stream_header().empty());
+  EXPECT_EQ(changed->groups()[1].stream_max_key_.LessThan(id), false);
+}
+
 RecordLocation OrderedLocation(std::uint64_t block, std::uint64_t sequence,
                                std::uint32_t count, ValueType type,
                                bool root = false, std::uint64_t expiry = 0) {

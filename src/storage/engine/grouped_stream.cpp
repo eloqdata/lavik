@@ -107,6 +107,18 @@ struct StorageEngine::Impl::StreamPageAccess {
       auto page = co_await engine_.LoadOrderedGroupSnapshot(
           store_, partition_, db_id_, key_, digest_, object_, id.prefix_);
       if (!page.ok()) co_return page.status();
+      auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
+      if (!max_key.ok()) co_return max_key.status();
+      auto remembered = object_->ordered_directory().RememberStreamPageMaxKey(
+          index, *max_key);
+      if (!remembered.ok()) co_return remembered;
+      if (index == 0) {
+        auto header =
+            StreamRecordPayload(page->snapshot_.entries_.front().value_);
+        if (!header.ok()) co_return header.status();
+        remembered = object_->ordered_directory().RememberStreamHeader(*header);
+        if (!remembered.ok()) co_return remembered;
+      }
       pages_.emplace(index, std::move(*page));
       co_return absl::OkStatus();
     } catch (const std::bad_alloc&) {
@@ -120,12 +132,18 @@ struct StorageEngine::Impl::StreamPageAccess {
       std::size_t first = 0, last = size;
       while (first < last) {
         const auto middle = first + (last - first) / 2;
-        auto status = co_await Load(middle);
-        if (!status.ok()) co_return status;
-        auto bound =
-            StreamRecordKey(pages_.at(middle).snapshot_.entries_.back().value_);
-        if (!bound.ok()) co_return bound.status();
-        if (*bound < wanted)
+        auto less = object_->ordered_directory()
+                        .groups()[middle]
+                        .stream_max_key_.LessThan(wanted);
+        if (!less) {
+          auto status = co_await Load(middle);
+          if (!status.ok()) co_return status;
+          auto bound = StreamRecordKey(
+              pages_.at(middle).snapshot_.entries_.back().value_);
+          if (!bound.ok()) co_return bound.status();
+          less = *bound < wanted;
+        }
+        if (*less)
           first = middle + 1;
         else
           last = middle;
@@ -1708,14 +1726,32 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
         auto admitted = budget.Reserve(2);
         if (!admitted.ok()) co_return admitted.status();
         probe_charge.emplace(std::move(*admitted));
-        co_return co_await LoadOrderedGroupSnapshot(
+        auto page = co_await LoadOrderedGroupSnapshot(
             store, partition, db_id, key, digest, object, groups[index].id_);
+        if (!page.ok()) co_return page.status();
+        auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
+        if (!max_key.ok()) co_return max_key.status();
+        auto remembered = object->ordered_directory().RememberStreamPageMaxKey(
+            index, *max_key);
+        if (!remembered.ok()) co_return remembered;
+        if (index == 0) {
+          auto payload =
+              StreamRecordPayload(page->snapshot_.entries_.front().value_);
+          if (!payload.ok()) co_return payload.status();
+          remembered =
+              object->ordered_directory().RememberStreamHeader(*payload);
+          if (!remembered.ok()) co_return remembered;
+        }
+        co_return std::move(page);
       } catch (const std::bad_alloc&) {
         RecordMemoryRejection();
         co_return absl::ResourceExhaustedError("OOM grouped Stream probe");
       }
     };
-    {
+    if (auto cached = object->ordered_directory().stream_header();
+        !cached.empty()) {
+      header.assign(cached);
+    } else {
       auto first = co_await load(0);
       if (!first.ok()) co_return first.status();
       auto payload =
@@ -1730,11 +1766,15 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
     if (range.count_ != 0 && low <= high) {
       while (first < last) {
         const auto middle = first + (last - first) / 2;
-        auto page = co_await load(middle);
-        if (!page.ok()) co_return page.status();
-        auto bound = StreamRecordKey(page->snapshot_.entries_.back().value_);
-        if (!bound.ok()) co_return bound.status();
-        if (*bound < wanted)
+        auto less = groups[middle].stream_max_key_.LessThan(wanted);
+        if (!less) {
+          auto page = co_await load(middle);
+          if (!page.ok()) co_return page.status();
+          auto bound = StreamRecordKey(page->snapshot_.entries_.back().value_);
+          if (!bound.ok()) co_return bound.status();
+          less = *bound < wanted;
+        }
+        if (*less)
           first = middle + 1;
         else
           last = middle;
