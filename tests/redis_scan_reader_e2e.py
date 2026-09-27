@@ -103,7 +103,7 @@ def standalone(lavik, redis, shake, root):
         db0 = seed(source, "db0")
         source.call("SELECT", 15)
         db15 = seed(source, "db15")
-        S.reject(source, ("PSYNC", "?", "-1"), "unknown command")
+        S.reject(source, ("PSYNC", "?", "-1"), "requires REPLCONF capa eof")
         scan(shake, root / "single-scan", source_port, target_port)
         verify(target, db0)
         target.call("SELECT", 15)
@@ -166,7 +166,7 @@ def managed_cluster(lavik, redis, shake, meta_binary, ctl, root):
                 cleanup.callback(client.close)
                 tag = C.key_in_range(f"scan-{i}", i * 8192, (i + 1) * 8192 - 1)
                 prefixes.append(seed(client, tag))
-                S.reject(client, ("PSYNC", "?", "-1"), "unknown command")
+                S.reject(client, ("PSYNC", "?", "-1"), "requires REPLCONF capa eof")
             with S.process(redis, root / "cluster-target", "target", redis=True) as (
                 target,
                 port,

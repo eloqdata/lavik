@@ -358,7 +358,7 @@ def exercise(lavik, redis, root):
         process(lavik, root / "target", "target") as (target, _, target_log),
     ):
         assert target.call("SET", "retained", "original") == "OK"
-        reject(native, ("PSYNC", "?", "-1"), "unknown command")
+        reject(native, ("PSYNC", "?", "-1"), "requires REPLCONF capa eof")
         reject(target, ("REPLICAOF", "127.0.0.1", native_port), "ERR")
         reject(target, ("SLAVEOF", "127.0.0.1", native_port), "ERR")
         assert target.call("GET", "retained") == "original"

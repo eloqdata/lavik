@@ -336,7 +336,7 @@ cleanup as another durable phase.
 | OpenSSL | TLS server/client contexts; release builds can link it statically |
 | Redis/Valkey clients | RESP2 by default; `HELLO 2`/`HELLO 3` selects connection-level reply semantics, including RESP3 maps, sets, booleans, doubles, nulls, and push frames where handlers expose them |
 | Redis follower | Non-Meta nodes consume one Redis server or disjoint masters of one Redis Cluster using AUTH, PSYNC/RDB and ordered replay; external REPLICAOF rejects Lavik peers, whose relationships are Meta-controlled |
-| Keyspace export | RedisShake ScanReader uses ordinary authenticated scan/read commands, including Cluster discovery; Lavik does not serve Redis PSYNC |
+| Keyspace export | RedisShake SyncReader consumes full RDB and incremental PSYNC from one currently authorized Primary, with shared backlog backpressure and bounded temporary disk staging; ScanReader provides one-shot export through ordinary authenticated scan/read commands, including Cluster discovery |
 | Local storage | Existing files, raw block devices, or `spdk://` namespaces supplied through repeated `--data-file` options |
 | RDB files | Startup import and Redis-compatible `SAVE`/`BGSAVE` output through filesystem paths |
 | Prometheus/Grafana | Plaintext HTTP `/metrics`; optional Compose deployment under `deploy/monitoring/` |

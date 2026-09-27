@@ -235,7 +235,11 @@ Compatibility boundaries verified by the same gate:
 
 ## Exporting with RedisShake ScanReader
 
-Lavik no longer serves PSYNC export; `redis-export-backpressure` is removed.
+For full plus incremental PSYNC export from the current Primary, use the
+[emergency export runbook](redis-export.md). Its retention follows
+`replication-backlog-backpressure`; there is no separate
+`redis-export-backpressure` option.
+
 Use RedisShake ScanReader for one-shot keyspace export to Redis 7.2 or newer
 (the destination must accept Lavik's RDB 11 DUMP payloads). A tested RedisShake
 v4.6.2 configuration is:
