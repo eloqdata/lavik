@@ -1483,6 +1483,9 @@ class StorageEngine {
   bycorf::Task<absl::Status> TrimReplicationLog(std::uint64_t keep_from_lsn);
   bycorf::Task<absl::Status> DisableReplicationLog();
   ReplicationLogInfo LocalReplicationLogInfo() const;
+  // Worker-local: true only when this consumer pins the block whose retention
+  // currently prevents the publisher from reclaiming capacity.
+  bool ReplicationRetentionBlocksPublication(std::uint64_t session_id) const;
   bool ReplicationLogActive() const noexcept;
   // Worker-local high-water admission acquired before a source write enters
   // command/transaction gates. The log and each full-sync session already

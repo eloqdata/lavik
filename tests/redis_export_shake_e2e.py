@@ -173,7 +173,7 @@ def run(root, mode):
             I.H.wait_until(
                 "tool exit releases export",
                 15,
-                lambda: src.info("replication")["redis_export_session_id"] == 0,
+                lambda: src.info("replication")["redis_export_active"] == 0,
             )
             assert src.set("{export}:after-tool-exit", "writable")
             src.close()

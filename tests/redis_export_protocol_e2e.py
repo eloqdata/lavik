@@ -104,18 +104,35 @@ def run(root, binary):
                 data += exported.sock.recv(65536)
             assert b"first-increment" in data
 
-            # Stop reading, fill the socket then the retained memory log. A
-            # policy flip must wake the publisher without consumer cooperation.
-            def writes():
+            # Changing policy with intact coverage preserves this connection.
+            assert src.config_set("replication-backlog-backpressure", "no")
+            assert src.config_set("replication-backlog-backpressure", "yes")
+
+            def writes(marker):
                 writer = redis.Redis(port=port, socket_timeout=30)
                 try:
                     for i in range(40):
                         writer.set("overwrite", bytes([i]) * (1024 * 1024))
+                    writer.set("writes-finished", marker)
                 finally:
                     writer.close()
 
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(writes)
+                # Default retention must also recover through ordinary reader
+                # progress, without changing policy or dropping the session.
+                future = pool.submit(writes, "resumed-with-retention")
+                time.sleep(2)
+                assert not future.done(), "slow exporter did not backpressure writes"
+                data = b""
+                while b"resumed-with-retention" not in data:
+                    part = exported.sock.recv(1024 * 1024)
+                    assert part, "retained export disconnected during recovery"
+                    data = data[-128:] + part
+                future.result(timeout=20)
+
+                # Fill the socket and log again. A policy flip must wake the
+                # publisher without any consumer cooperation.
+                future = pool.submit(writes, "released-by-policy")
                 time.sleep(2)
                 assert not future.done(), "slow exporter did not backpressure writes"
                 assert src.config_set("replication-backlog-backpressure", "no")
@@ -131,7 +148,7 @@ def run(root, binary):
         S.H.wait_until(
             "export joined",
             15,
-            lambda: src.info("replication")["redis_export_session_id"] == 0,
+            lambda: src.info("replication")["redis_export_active"] == 0,
         )
         assert src.set("after-cancel", "writable")
         again = Export(port)

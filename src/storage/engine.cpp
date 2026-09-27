@@ -445,6 +445,11 @@ Task<absl::Status> StorageEngine::DisableReplicationLog() {
   return impl_->DisableReplicationLog();
 }
 
+bool StorageEngine::ReplicationRetentionBlocksPublication(
+    std::uint64_t session_id) const {
+  return impl_->ReplicationRetentionBlocksPublication(session_id);
+}
+
 ReplicationLogInfo StorageEngine::LocalReplicationLogInfo() const {
   return impl_->LocalReplicationLogInfo();
 }

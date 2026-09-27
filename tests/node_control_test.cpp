@@ -1691,8 +1691,9 @@ TEST(LeaseDeadlineTest, ConcurrentRevocationCannotBeLostByRenewal) {
 // without publishing topology or waiting for the expiry timer to catch up.
 class AtomicLeaseCacheService final : public bycorf::Service {
  public:
-  AtomicLeaseCacheService(bycorf::Server* server, bool revoke)
-      : server_(server), revoke_(revoke) {}
+  AtomicLeaseCacheService(bycorf::Server* server, bool revoke,
+                          bool refresh = false)
+      : server_(server), revoke_(revoke), refresh_(refresh) {}
   void Prepare(unsigned) override {}
   void Stop() noexcept override {}
 
@@ -1714,6 +1715,19 @@ class AtomicLeaseCacheService final : public bycorf::Service {
           .granted_duration_ = 5s,
       };
       result_ = co_await control_.installer.ApplyLeaseGrantTransition(grant);
+      if (result_.ok() && refresh_) {
+        const auto original = control_.actions.source_lease_;
+        result_ = control_.installer.InstallFullState(
+            WithLease(FullState(MakeState()), 5s), Basis(11));
+        if (result_.ok()) {
+          grant.projection_ = Basis(11);
+          grant.sent_at_ = LeaseClockNow();
+          result_ =
+              co_await control_.installer.ApplyLeaseGrantTransition(grant);
+          EXPECT_EQ(original, control_.actions.source_lease_);
+          EXPECT_TRUE(original->valid_at(LeaseClockNow().time_since_epoch()));
+        }
+      }
     }
     if (result_.ok()) {
       const std::array<std::uint16_t, 1> slots{12};
@@ -1753,6 +1767,7 @@ class AtomicLeaseCacheService final : public bycorf::Service {
 
   bycorf::Server* server_;
   bool revoke_;
+  bool refresh_;
   DynamicControl control_;
   absl::Status result_ =
       absl::UnknownError("atomic lease cache test did not run");
@@ -1772,6 +1787,20 @@ TEST(NodeControlInstallerTest, CachedAdmissionObservesAtomicLeaseChanges) {
     server.WaitUntilStopped();
     EXPECT_TRUE(service.result_.ok()) << service.result_;
   }
+}
+
+TEST(NodeControlInstallerTest,
+     ProjectionRefreshPreservesSharedLeaseCapability) {
+  bycorf::Server server;
+  AtomicLeaseCacheService service(&server, false, true);
+  server.AddService(&service);
+  bycorf::ServerOptions options;
+  options.thread_count_ = 1;
+  options.pin_workers_ = false;
+  options.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(options).ok());
+  server.WaitUntilStopped();
+  EXPECT_TRUE(service.result_.ok()) << service.result_;
 }
 
 class LeaseExpiryService final : public bycorf::Service {
@@ -2648,37 +2677,6 @@ TEST(NodeControlInstallerTest,
             RecheckResult::kOk);
   EXPECT_EQ(control.guard.Recheck(before, MonotonicTime{} + 9s),
             RecheckResult::kReject);
-}
-
-TEST(NodeControlInstallerTest, ReinstallingSharedLeasePreservesLiveCapability) {
-  DynamicControl control;
-  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
-  ASSERT_TRUE(
-      control.installer.InstallFullState(FullState(MakeState()), Basis(10))
-          .ok());
-  const auto anchor = Anchor(*control.cache.Current());
-  auto lease = std::make_shared<LeaseDeadline>(5s);
-  ASSERT_TRUE(control.guard
-                  .RenewLease(Session(1), anchor, MonotonicTime{} + 5s,
-                              MonotonicTime{}, lease)
-                  .ok());
-  ASSERT_TRUE(control.guard
-                  .RenewLease(Session(1), anchor, MonotonicTime{} + 10s,
-                              MonotonicTime{} + 1s, lease)
-                  .ok());
-  EXPECT_TRUE(lease->valid_at(9s));
-  constexpr std::array<std::uint16_t, 1> slots{12};
-  EXPECT_EQ(
-      control.guard.CaptureAndAdmit(WriteRequest(slots), MonotonicTime{} + 9s)
-          .decision()
-          .kind_,
-      Decision::Kind::kServe);
-  lease->Revoke();
-  EXPECT_FALSE(control.guard
-                   .RenewLease(Session(1), anchor, MonotonicTime{} + 15s,
-                               MonotonicTime{} + 9s, lease)
-                   .ok());
-  EXPECT_FALSE(lease->valid_at(9s));
 }
 
 TEST(NodeControlInstallerTest,

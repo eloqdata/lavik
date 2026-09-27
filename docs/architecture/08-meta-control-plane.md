@@ -805,6 +805,10 @@ self-fences its in-memory authority without waiting for disconnect detection,
 an Automatic Failover Detector decision, or another Meta message. Renewal
 synchronously expires an already-due lease before considering a replacement,
 so a late Ack cannot revive authority across the deadline.
+An unexpired renewal for the same authority session and anchor retains the
+shared lease capability across projection refreshes. Existing source exports
+therefore observe the renewed deadline through Controlled Pause; an expired or
+revoked capability is never reused for replacement authority.
 
 Raft's peer-response expiry uses active `CLOCK_MONOTONIC` time, so a Meta
 host suspend can otherwise preserve an old process's cached leader verdict

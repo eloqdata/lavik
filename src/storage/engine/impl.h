@@ -2804,6 +2804,7 @@ class StorageEngine::Impl {
   Task<absl::Status> TrimReplicationLog(std::uint64_t keep_from_lsn);
   Task<absl::Status> DisableReplicationLog();
   ReplicationLogInfo LocalReplicationLogInfo() const;
+  bool ReplicationRetentionBlocksPublication(std::uint64_t session_id) const;
   bool ReplicationLogActive() const noexcept;
   Task<absl::StatusOr<ReplicationPublisherAdmission>>
   AcquireReplicationPublisherAdmission(

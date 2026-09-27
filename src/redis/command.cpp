@@ -5012,6 +5012,7 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             "\r\n";
     info += "master_replid2:0000000000000000000000000000000000000000\r\n";
     const auto& exported = replication.redis_export_;
+    info += "redis_export_active:" + std::to_string(exported.active_) + "\r\n";
     info += "redis_export_session_id:" + std::to_string(exported.session_id_) +
             "\r\n";
     info += "redis_export_group_id:" + exported.group_id_ + "\r\n";

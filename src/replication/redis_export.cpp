@@ -984,6 +984,7 @@ auto ReplicationManager::ReplicationGroup::ServeRedisExportConnection(
   context->worker_ = bycorf::ThisWorker().id_;
   context->id_ = session_id;
   context->disk_capacity_ = redis_export_disk_backlog_size();
+  context->progress_.active_ = true;
   context->progress_.session_id_ = session_id;
   context->progress_.disk_capacity_ = context->disk_capacity_;
   context->progress_.phase_ = "admission";
@@ -1147,8 +1148,8 @@ auto ReplicationManager::ReplicationGroup::RunRedisExportSession(
       "+FULLRESYNC ", context->history_, " 1\r\n$EOF:", eof_token, "\r\n");
   status = co_await WriteText(stream, full_resync_header);
   if (status.ok()) {
-    // RDB v10 is accepted by Redis 7.0 and later. Lavik's value opcodes
-    // do not require the v11 metadata additions used by backup files.
+    // Use the diskless RDB v10 envelope. Object opcodes, including Stream
+    // listpacks v3, follow the tested Redis 7.2.14 compatibility baseline.
     rdb::StreamEncoder encoder(10);
     status = co_await WriteText(stream, encoder.Header());
     if (status.ok()) {
@@ -1509,23 +1510,26 @@ auto ReplicationManager::ReplicationGroup::MonitorRedisExport(
 
 auto ReplicationManager::ReplicationGroup::RedisExportStatus() const
     -> Task<RedisExportProgress> {
+  RedisExportProgress unavailable;
+  unavailable.active_ = redis_export_active_.load(std::memory_order_acquire);
+  unavailable.phase_ = unavailable.active_ ? "cancelling" : "inactive";
   auto context = redis_export_context_.load(std::memory_order_acquire);
   if (!context || !context->admitted_.load(std::memory_order_acquire) ||
       !RedisExportValid(*context))
-    co_return RedisExportProgress{};
+    co_return unavailable;
   std::vector<std::uint64_t> source;
   for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
     auto fence = co_await bycorf::SubmitTaskTo(worker, [this, context] {
       return storage_->FenceReplicationLog(
           [context] { return context->cancelled_.load(); });
     });
-    if (!fence.ok()) co_return RedisExportProgress{};
+    if (!fence.ok()) co_return unavailable;
     source.push_back(*fence);
   }
   auto result = co_await bycorf::SubmitTo(
       context->worker_, [context] { return context->progress_; });
   if (!RedisExportValid(*context) || redis_export_context_.load() != context)
-    co_return RedisExportProgress{};
+    co_return unavailable;
   result.source_next_lsns_ = std::move(source);
   co_return result;
 }
@@ -1536,8 +1540,8 @@ auto ReplicationManager::ReplicationGroup::RelieveRedisExportBackpressure()
   if (!context) co_return absl::OkStatus();
   bool blocked = false;
   for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
-    blocked |= co_await bycorf::SubmitTo(worker, [this] {
-      return storage_->LocalReplicationLogInfo().capacity_backpressured_;
+    blocked |= co_await bycorf::SubmitTo(worker, [this, context] {
+      return storage_->ReplicationRetentionBlocksPublication(context->id_);
     });
   }
   if (blocked) {

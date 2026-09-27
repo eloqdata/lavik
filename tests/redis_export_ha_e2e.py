@@ -57,7 +57,7 @@ def expired(root, mode, ack):
             N.H.wait_until(
                 "export resources released after lease expiry",
                 15,
-                lambda: src.info("replication")["redis_export_session_id"] == 0,
+                lambda: src.info("replication")["redis_export_active"] == 0,
             )
         finally:
             export.close()
@@ -145,7 +145,7 @@ def controlled(root, mode, slow=False):
             N.H.wait_until(
                 "old export joined in pause",
                 10,
-                lambda: src.info("replication")["redis_export_session_id"] == 0,
+                lambda: src.info("replication")["redis_export_active"] == 0,
             )
             # Paused but still authorized Primary accepts a new FULLRESYNC.
             export = P.Export(owner.redis_port)
@@ -174,8 +174,92 @@ def controlled(root, mode, slow=False):
         pool.shutdown(wait=True)
 
 
+def shake_failover(root, mode, uncontrolled):
+    import redis_export_shake_e2e as E
+
+    E.I.PASSWORD = ""
+    fixture = F.FailoverFixture(
+        N.C.META,
+        N.C.DATA,
+        N.C.CTL,
+        str(root / f"shake-{mode}-{uncontrolled}"),
+        True,
+        pause_after_begin_ms=1000,
+        data_workers=2,
+        client_mode=mode,
+    )
+    shakes = []
+    try:
+        fixture.start_created()
+        fixture.seed_and_wait_for_replicas(
+            "{export}:failover", "complete", (F.CANDIDATE, F.FOLLOWER)
+        )
+        owner = fixture.by_id[F.OWNER]
+        with E.S.process(
+            E.I.REDIS, root / f"old-target-{uncontrolled}", "redis", redis=True
+        ) as (_, dest, _):
+            src = redis.Redis(port=owner.redis_port, socket_timeout=5)
+            shake = E.Shake(root / f"old-shake-{uncontrolled}", owner.redis_port, dest)
+            shakes.append(shake)
+            E.drain(src, shake, owner.redis_port)
+            E.compare(src, redis.Redis(port=dest))
+            if uncontrolled:
+                assert fixture.leader.put_automatic_uncontrolled_failover_policy(
+                    2, suspect_after_ms=1000
+                ).startswith("OK")
+                owner.force_kill()
+            else:
+                fixture.submit_failover()
+            N.H.wait_until(
+                "RedisShake reports revoked source failure",
+                30,
+                lambda: shake.proc.poll() is not None,
+            )
+            assert shake.proc.returncode != 0
+
+            def successor_ready():
+                status = fixture.cluster_status(time.monotonic() + 5)
+                return any(
+                    g.get("owner_node_id") != F.OWNER and g.get("serving_ready")
+                    for g in status["groups"]
+                )
+
+            N.H.wait_until("successor serves after export failure", 90, successor_ready)
+            status = fixture.cluster_status(time.monotonic() + 5)
+            successor_id = next(
+                g["owner_node_id"] for g in status["groups"] if g.get("serving_ready")
+            )
+            successor = fixture.by_id[successor_id]
+            src.close()
+        # Discard the entire failed target, including its catalog. A new tool
+        # and empty Redis prove this is a fresh FULL rather than continuation.
+        with E.S.process(
+            E.I.REDIS, root / f"new-target-{uncontrolled}", "redis", redis=True
+        ) as (_, dest, _):
+            src = redis.Redis(port=successor.redis_port, socket_timeout=5)
+            shake = E.Shake(
+                root / f"new-shake-{uncontrolled}", successor.redis_port, dest
+            )
+            shakes.append(shake)
+            E.drain(src, shake, successor.redis_port)
+            E.compare(src, redis.Redis(port=dest))
+            assert src.get("{export}:failover") == b"complete"
+            src.close()
+    except BaseException:
+        fixture.dump_logs()
+        for shake in shakes:
+            print((shake.root / "process.log").read_text(), file=sys.stderr)
+        raise
+    finally:
+        for shake in shakes:
+            shake.close()
+        fixture.force_kill()
+
+
 if __name__ == "__main__":
-    N.C.DATA, N.C.META, N.C.CTL, mode = sys.argv[1:]
+    import redis_export_shake_e2e as E
+
+    N.C.DATA, N.C.META, N.C.CTL, E.I.REDIS, E.I.SHAKE, mode = sys.argv[1:]
     with tempfile.TemporaryDirectory(
         prefix="ex-ha-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
     ) as temp:
@@ -184,4 +268,6 @@ if __name__ == "__main__":
             expired(root, mode, ack)
         controlled(root, mode)
         controlled(root, mode, slow=True)
+        for uncontrolled in (False, True):
+            shake_failover(root, mode, uncontrolled)
     print("PASS export HA", mode)

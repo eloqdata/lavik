@@ -175,6 +175,7 @@ struct ReplicationIdentity {
 // this exact source history; offset counts Redis command bytes, not native
 // LSNs.
 struct RedisExportProgress {
+  bool active_ = false;
   std::uint64_t session_id_ = 0;
   std::string group_id_, node_id_, boot_id_;
   std::uint64_t term_ = 0, generation_ = 0;

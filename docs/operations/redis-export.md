@@ -88,6 +88,9 @@ Only one PSYNC exporter is allowed per source. Each new connection performs
 FULLRESYNC. The source sends RDB, waits for the initial ACK, replays disk staging,
 then sends the live memory tail. `redis_export_phase` progresses through
 `admission`, `rdb`, `waiting-ack`, `disk-replay`, and `online`.
+Cancellation withdraws the session identity immediately. Wait for
+`redis_export_active:0` before opening a replacement connection; this confirms
+the previous session has joined and released its slot and temporary resources.
 
 ## Stop writes, verify, cut over
 

@@ -1705,9 +1705,10 @@ endforeach()
             add_test(NAME lavik_redis_export_ha_${export_mode}
               COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_export_ha_e2e.py
                       $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-meta>
-                      $<TARGET_FILE:lavik-ctl> ${export_mode})
+                      $<TARGET_FILE:lavik-ctl> ${LAVIK_REDIS_SERVER_EXECUTABLE}
+                      ${LAVIK_REDIS_SHAKE_EXECUTABLE} ${export_mode})
             set_tests_properties(lavik_redis_export_ha_${export_mode}
-              PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE
+              PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE
               ENVIRONMENT "PYTHONPATH=${LAVIK_CLUSTER_CLIENT_REDIS_PY}")
           endforeach()
         endif()
@@ -1798,6 +1799,12 @@ endforeach()
                   full
         )
         set_tests_properties(lavik_redis_export_disk_full_e2e
+          PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+        add_test(NAME lavik_redis_export_device_full_e2e
+          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_export_e2e.sh
+                  $<TARGET_FILE:lavik> ${LAVIK_REDIS_SERVER_EXECUTABLE}
+                  ${LAVIK_REDIS_CLI_EXECUTABLE} device)
+        set_tests_properties(lavik_redis_export_device_full_e2e
           PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
       endif()
       add_test(

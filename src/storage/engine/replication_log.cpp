@@ -1900,6 +1900,15 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
   co_return absl::OkStatus();
 }
 
+bool StorageEngine::Impl::ReplicationRetentionBlocksPublication(
+    std::uint64_t session_id) const {
+  const auto& log = CurrentStore().replication_log_;
+  const auto retained = log.retained_lsn_by_session_.find(session_id);
+  return log.capacity_backpressured_ && !log.blocks_.empty() &&
+         retained != log.retained_lsn_by_session_.end() &&
+         retained->second <= log.blocks_.front().last_lsn_;
+}
+
 ReplicationLogInfo StorageEngine::Impl::LocalReplicationLogInfo() const {
   const WorkerStore& store = CurrentStore();
   const auto& log = store.replication_log_;

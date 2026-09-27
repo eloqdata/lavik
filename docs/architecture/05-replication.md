@@ -1265,13 +1265,16 @@ XGROUP/XCLAIM/XACK commands; private native payloads are never a Redis wire
 format. RedisShake does not make imported transactions atomically visible to
 other clients, so the target remains isolated until cutover.
 
-`INFO replication` reports `redis_export_session_id`, `redis_export_history_id`,
+`INFO replication` reports `redis_export_active`, `redis_export_session_id`, `redis_export_history_id`,
 `redis_export_phase`, source and sent next-LSN vectors, and
 `redis_export_offset`. Source positions cross a publisher fence; sent positions
 advance only after complete command writes, and never claim live catchup before
 disk replay finishes. Redis offset counts disk replay, live commands and PING
 bytes independently of native LSNs. A changed/invalid session invalidates its
-completion evidence. The [export runbook](../operations/redis-export.md) combines
+completion evidence. During cancellation, identity evidence is withdrawn before
+the session finishes joining; `redis_export_active` remains set until all cleanup
+completes and the single connection slot is available again.
+The [export runbook](../operations/redis-export.md) combines
 these cuts with RedisShake received/sent offsets, drained writer replies and
 full target validation.
 

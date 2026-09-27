@@ -20,10 +20,12 @@ redis_server=$2
 redis_cli=$3
 test_mode=${4:-normal}
 disk_quota=1gb
+data_capacity=256M
 case ${test_mode} in
   normal) crash_point=; disk_one_block=; scan_pause_ms=800 ;;
   crash) crash_point=redis_export_backlog_stopped; disk_one_block=; scan_pause_ms=800 ;;
   full) crash_point=; disk_one_block=; scan_pause_ms=5000; disk_quota=8mb ;;
+  device) crash_point=; disk_one_block=; scan_pause_ms=10000 ;;
   *) echo "unknown test mode: ${test_mode}" >&2; exit 2 ;;
 esac
 case_template=${LAVIK_TEST_DATA_DIR:-/tmp}/lavik-redis-export-e2e-XXXXXX
@@ -61,7 +63,7 @@ PY
 lavik_port=${ports[0]}
 redis_port=${ports[1]}
 
-fallocate -l 256M "${case_dir}/lavik.data"
+fallocate -l "${data_capacity}" "${case_dir}/lavik.data"
 LAVIK_RDB_SCAN_PAUSE_MS="${scan_pause_ms}" \
 LAVIK_CRASH_POINT="${crash_point}" \
 LAVIK_TEST_REDIS_EXPORT_ONE_BLOCK="${disk_one_block}" \
@@ -113,17 +115,28 @@ if [[ ${test_mode} == normal ]]; then
     "${redis_cli}" -p "${lavik_port}" -x set disk-spanning-b >/dev/null
 fi
 
-if [[ ${test_mode} == full ]]; then
+if [[ ${test_mode} == full || ${test_mode} == device ]]; then
+  failure_message="Redis export disk backlog capacity exhausted"
+  if [[ ${test_mode} == device ]]; then
+    failure_message="Redis export backlog device space is exhausted"
+  fi
   python3 -c 'import sys; sys.stdout.write("x" * 5000000)' | \
     "${redis_cli}" -p "${lavik_port}" -x set disk-full-a >/dev/null
   python3 -c 'import sys; sys.stdout.write("y" * 5000000)' | \
     "${redis_cli}" -p "${lavik_port}" -x set disk-full-b >/dev/null
+  if [[ ${test_mode} == device ]]; then
+    for _ in {1..40}; do
+      python3 -c 'import sys; sys.stdout.write("z" * 5000000)' | \
+        "${redis_cli}" -p "${lavik_port}" -x set device-overwrite >/dev/null
+      grep -q "${failure_message}" "${case_dir}/lavik.log" && break
+    done
+  fi
   for _ in {1..600}; do
-    grep -q 'Redis export disk backlog capacity exhausted' \
+    grep -q "${failure_message}" \
       "${case_dir}/lavik.log" && break
     sleep 0.01
   done
-  grep -q 'Redis export disk backlog capacity exhausted' \
+  grep -q "${failure_message}" \
     "${case_dir}/lavik.log"
   [[ $(timeout 5 "${redis_cli}" -p "${lavik_port}" set after-disk-full okay) == OK ]]
   [[ $("${redis_cli}" -p "${lavik_port}" get after-disk-full) == okay ]]

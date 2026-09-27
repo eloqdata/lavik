@@ -1936,11 +1936,36 @@ class ReplicationLogService final : public bycorf::Service {
       co_return absl::OkStatus();
     };
 
+    status = storage_->RetainReplicationLog(81, 2);
+    if (!status.ok()) co_return status;
     worker_->Spawn(append(2));
     co_await bycorf::Yield(*worker_);
     Check(!append_finished &&
               storage_->LocalReplicationLogInfo().capacity_backpressured_,
           "default backlog policy did not wait for replica ACK");
+    Check(storage_->ReplicationRetentionBlocksPublication(80) &&
+              !storage_->ReplicationRetentionBlocksPublication(81),
+          "capacity pressure was attributed to a caught-up consumer");
+    auto readable =
+        co_await storage_->ReadReplicationLog({.lsn_ = 1}, 8 * kMiB, 1);
+    Check(readable.ok() && !readable->frames_.empty(),
+          "consumer could not read committed history behind blocked publisher");
+    bool cancel_fence = false, fence_done = false;
+    absl::Status fence_status;
+    auto fence = [&]() -> bycorf::Task<absl::Status> {
+      auto result =
+          co_await storage_->FenceReplicationLog([&] { return cancel_fence; });
+      fence_status = result.status();
+      fence_done = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(fence());
+    co_await bycorf::Yield(*worker_);
+    cancel_fence = true;
+    while (!fence_done) co_await bycorf::Yield(*worker_);
+    Check(absl::IsCancelled(fence_status) && !append_finished,
+          "cancelled fence changed another consumer's retention");
+    storage_->ReleaseReplicationLogRetention(81);
     status = storage_->RetainReplicationLog(80, 2);
     if (!status.ok()) co_return status;
     while (!append_finished) co_await bycorf::Yield(*worker_);
