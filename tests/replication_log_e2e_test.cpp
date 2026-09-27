@@ -679,6 +679,30 @@ class ReplicationLogService final : public bycorf::Service {
               }),
           "canonical tail command was not enqueued");
 
+    // The unresolved head holds the ordered publisher fence. Cancelling an
+    // observer must return without resolving that transaction or releasing a
+    // different consumer's history pin.
+    status = storage_->RetainReplicationLog(80, 1);
+    if (!status.ok()) co_return status;
+    bool cancel_fence = false, fence_done = false;
+    absl::Status fence_status;
+    auto fence = [&]() -> bycorf::Task<absl::Status> {
+      auto result =
+          co_await storage_->FenceReplicationLog([&] { return cancel_fence; });
+      fence_status = result.status();
+      fence_done = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(fence());
+    co_await bycorf::Yield(*worker_);
+    Check(!fence_done, "publisher fence bypassed unresolved transaction");
+    cancel_fence = true;
+    while (!fence_done) co_await bycorf::Yield(*worker_);
+    Check(absl::IsCancelled(fence_status) &&
+              storage_->LocalReplicationLogInfo().retained_cursor_count_ == 1,
+          "cancelled fence changed another consumer's retention");
+    storage_->ReleaseReplicationLogRetention(80);
+
     std::vector<std::string> final_command{"SET", "canonical-head",
                                            std::string(2 * kMiB, 'c')};
     const auto final_bytes =
@@ -1950,21 +1974,6 @@ class ReplicationLogService final : public bycorf::Service {
         co_await storage_->ReadReplicationLog({.lsn_ = 1}, 8 * kMiB, 1);
     Check(readable.ok() && !readable->frames_.empty(),
           "consumer could not read committed history behind blocked publisher");
-    bool cancel_fence = false, fence_done = false;
-    absl::Status fence_status;
-    auto fence = [&]() -> bycorf::Task<absl::Status> {
-      auto result =
-          co_await storage_->FenceReplicationLog([&] { return cancel_fence; });
-      fence_status = result.status();
-      fence_done = true;
-      co_return absl::OkStatus();
-    };
-    worker_->Spawn(fence());
-    co_await bycorf::Yield(*worker_);
-    cancel_fence = true;
-    while (!fence_done) co_await bycorf::Yield(*worker_);
-    Check(absl::IsCancelled(fence_status) && !append_finished,
-          "cancelled fence changed another consumer's retention");
     storage_->ReleaseReplicationLogRetention(81);
     status = storage_->RetainReplicationLog(80, 2);
     if (!status.ok()) co_return status;
