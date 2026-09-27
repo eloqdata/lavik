@@ -194,6 +194,18 @@ std::optional<bool> StreamPageMaxKey::LessThan(
   return std::nullopt;
 }
 
+std::optional<bool> StreamPageMaxKey::LessThanOrEqual(
+    std::string_view key) const noexcept {
+  if (size_ == 0) return std::nullopt;
+  const std::string_view prefix(prefix_.data(), size_);
+  if (exact_) return prefix <= key;
+  const auto common = std::min(prefix.size(), key.size());
+  const int compared = prefix.substr(0, common).compare(key.substr(0, common));
+  if (compared != 0) return compared < 0;
+  if (key.size() <= prefix.size()) return false;
+  return std::nullopt;
+}
+
 bool OrderedEntryLess(const OrderedCollectionEntry& left,
                       const OrderedCollectionEntry& right) noexcept {
   return left.score_ < right.score_ ||
@@ -838,6 +850,15 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     }
   }
   return rebuilt;
+}
+
+std::uint64_t OrderedGroupDirectory::CountBefore(
+    std::size_t index) const noexcept {
+  if (index == 0) return 0;
+  if (index >= groups_.size()) return root_.item_count_;
+  if (root_.kind_ == OrderedCollectionKind::kString)
+    return index * kStringGroupBytes;
+  return ends_[index - 1];
 }
 
 std::optional<OrderedGroupDirectory::Position> OrderedGroupDirectory::FindRank(

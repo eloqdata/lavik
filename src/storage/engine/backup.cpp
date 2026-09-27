@@ -68,10 +68,39 @@ std::optional<MemoryReservation> ReserveSnapshotMapInsert(
 // child's omitted physical allocation epoch. A successful pin later verifies
 // precisely these identities, and unpin never needs a fresh allocation.
 template <typename SnapshotValue, typename Materialize>
-absl::Status PrepareSnapshotBlockPins(SnapshotValue* value,
-                                      Materialize materialize) {
+absl::Status PrepareSnapshotBlockPins(
+    SnapshotValue* value, Materialize materialize,
+    std::optional<std::pair<std::size_t, std::size_t>> ordered_pages =
+        std::nullopt) {
   using BlockPin = typename SnapshotValue::BlockPin;
   using BlockPins = typename SnapshotValue::BlockPins;
+  if (ordered_pages &&
+      (value->grouped_ == nullptr || !value->grouped_->is_ordered() ||
+       ordered_pages->first > ordered_pages->second ||
+       ordered_pages->second >
+           value->grouped_->ordered_directory().groups().size()))
+    return absl::InvalidArgumentError("invalid ordered range pin bounds");
+  // The range reader can touch only these pages. Visiting every physical
+  // record would make a one-message XRANGE scale with the entire Stream.
+  auto visit_records = [&](auto&& visit) -> absl::Status {
+    if (value->grouped_ == nullptr) return absl::OkStatus();
+    if (!ordered_pages) {
+      value->grouped_->ForEachRecord(
+          [&](HashGroupId, const RecordIndex::Entry& entry,
+              const std::shared_ptr<const std::vector<ExtentRef>>& extents,
+              bool) { visit(entry, extents); });
+      return absl::OkStatus();
+    }
+    const auto& groups = value->grouped_->ordered_directory().groups();
+    for (std::size_t i = ordered_pages->first; i < ordered_pages->second; ++i) {
+      const HashGroupId id{groups[i].id_, 0};
+      const auto* entry = value->grouped_->FindGroup(id);
+      if (entry == nullptr)
+        return absl::DataLossError("missing ordered range pin page");
+      visit(*entry, value->grouped_->ExtentsFor(id));
+    }
+    return absl::OkStatus();
+  };
   std::size_t count = 1;
   bool overflow = false;
   auto add_count = [&](std::size_t added) {
@@ -81,15 +110,13 @@ absl::Status PrepareSnapshotBlockPins(SnapshotValue* value,
       count += added;
   };
   if (value->extents_ != nullptr) add_count(value->extents_->size());
-  if (value->grouped_ != nullptr) {
-    value->grouped_->ForEachRecord(
-        [&](HashGroupId, const RecordIndex::Entry&,
-            const std::shared_ptr<const std::vector<ExtentRef>>& extents,
-            bool) {
-          add_count(1);
-          if (extents != nullptr) add_count(extents->size());
-        });
-  }
+  auto visited = visit_records(
+      [&](const RecordIndex::Entry&,
+          const std::shared_ptr<const std::vector<ExtentRef>>& extents) {
+        add_count(1);
+        if (extents != nullptr) add_count(extents->size());
+      });
+  if (!visited.ok()) return visited;
   constexpr std::size_t overhead = sizeof(BlockPins) + 4 * sizeof(void*);
   if (overflow || count > (std::numeric_limits<std::size_t>::max() - overhead) /
                               sizeof(BlockPin)) {
@@ -115,15 +142,13 @@ absl::Status PrepareSnapshotBlockPins(SnapshotValue* value,
   };
   add_record(value->location_);
   add_extents(value->extents_);
-  if (value->grouped_ != nullptr) {
-    value->grouped_->ForEachRecord(
-        [&](HashGroupId, const RecordIndex::Entry& entry,
-            const std::shared_ptr<const std::vector<ExtentRef>>& extents,
-            bool) {
-          add_record(materialize(entry));
-          add_extents(extents);
-        });
-  }
+  visited = visit_records(
+      [&](const RecordIndex::Entry& entry,
+          const std::shared_ptr<const std::vector<ExtentRef>>& extents) {
+        add_record(materialize(entry));
+        add_extents(extents);
+      });
+  if (!visited.ok()) return visited;
   auto& blocks = pins->blocks_;
   std::sort(blocks.begin(), blocks.end(),
             [](const BlockPin& a, const BlockPin& b) {
@@ -158,6 +183,17 @@ absl::Status StorageEngine::Impl::PrepareGroupedSnapshotPins(
                                   [this](const RecordIndex::Entry& entry) {
                                     return MaterializeIndexLocation(entry);
                                   });
+}
+
+absl::Status StorageEngine::Impl::PrepareOrderedRangeSnapshotPins(
+    WorkerStore::PartitionStore::RdbSnapshotValue* value,
+    std::size_t first_page, std::size_t end_page) {
+  return PrepareSnapshotBlockPins(
+      value,
+      [this](const RecordIndex::Entry& entry) {
+        return MaterializeIndexLocation(entry);
+      },
+      std::pair{first_page, end_page});
 }
 
 absl::Status StorageEngine::Impl::BeginRdbSnapshot(

@@ -140,8 +140,9 @@ directories, index pages, manifests, publication reservations, retirement
 receipts and snapshot pin lists participate in memory admission and accounting.
 Admission failures before root publication preserve the previous logical view.
 A handle retains metadata only: physical coordinates and allocation epochs are
-captured before suspension, and snapshot readers additionally pin the complete
-captured graph.
+captured before suspension. Whole-object snapshot readers pin the complete
+captured graph; Stream range readers pin the root and their selected page
+interval before emitting a reply.
 
 View population generations are scoped to one partition and logical database.
 Detaching that population advances its generation; resetting another partition

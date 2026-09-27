@@ -1239,9 +1239,9 @@ struct StreamRangeReplyState {
   }
 };
 
-// The reader pins the command-position graph across EXEC, replacement,
-// deletion and defrag. Storage counts matching records from directory ranks
-// and reads only boundary pages before the RESP array header is emitted.
+// The reader pins the command-position root and selected pages across EXEC,
+// replacement, deletion and defrag. Storage counts matching records from
+// directory ranks and reads boundary pages before the RESP array header.
 Task<absl::StatusOr<std::shared_ptr<StreamRangeReplyState>>>
 PrepareStreamRangeReply(std::uint8_t db, std::string_view key,
                         const storage::Digest* locked_digest,

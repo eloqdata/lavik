@@ -23,10 +23,13 @@ namespace {
 TEST(StreamPageMaxKeyTest, ExactIdsAndLongNamesPreserveOrdering) {
   StreamPageMaxKey boundary;
   EXPECT_FALSE(boundary.LessThan("\1"));
+  EXPECT_FALSE(boundary.LessThanOrEqual("\1"));
   const std::string id = std::string("\1", 1) + std::string(16, '\x7f');
   boundary.Set(id);
   EXPECT_EQ(boundary.LessThan(id), false);
+  EXPECT_EQ(boundary.LessThanOrEqual(id), true);
   EXPECT_EQ(boundary.LessThan(id + '\1'), true);
+  EXPECT_EQ(boundary.LessThanOrEqual(id + '\1'), true);
   EXPECT_EQ(boundary.LessThan(std::string("\1", 1) + std::string(16, '\x7e')),
             false);
 
@@ -35,6 +38,7 @@ TEST(StreamPageMaxKeyTest, ExactIdsAndLongNamesPreserveOrdering) {
   EXPECT_EQ(boundary.LessThan(id), false);
   EXPECT_EQ(boundary.LessThan(std::string("\6", 1)), true);
   EXPECT_FALSE(boundary.LessThan(long_name));
+  EXPECT_FALSE(boundary.LessThanOrEqual(long_name));
   EXPECT_EQ(
       boundary.LessThan(long_name.substr(0, StreamPageMaxKey::kPrefixBytes)),
       false);
@@ -66,6 +70,9 @@ TEST(StreamDirectoryTest, RetainsUnchangedHeaderAndInvalidatesReplacement) {
                                             .record_token_ = 2}};
   auto directory = OrderedGroupDirectory::Recover(root, 1, pages, {});
   ASSERT_TRUE(directory.ok()) << directory.status();
+  EXPECT_EQ(directory->CountBefore(0), 0);
+  EXPECT_EQ(directory->CountBefore(1), 1);
+  EXPECT_EQ(directory->CountBefore(2), 2);
   std::string header(48, '\0');
   header.replace(0, 4, "LXS1");
   header[44] = 1;

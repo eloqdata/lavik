@@ -244,6 +244,7 @@ struct StreamPageMaxKey {
 
   void Set(std::string_view key) noexcept;
   std::optional<bool> LessThan(std::string_view key) const noexcept;
+  std::optional<bool> LessThanOrEqual(std::string_view key) const noexcept;
 };
 
 struct RecoveredOrderedGroup {
@@ -304,6 +305,9 @@ class OrderedGroupDirectory {
     std::uint64_t offset_;
   };
   std::optional<Position> FindRank(std::uint64_t rank) const noexcept;
+  // Number of records in pages preceding index; index may equal
+  // groups().size().
+  std::uint64_t CountBefore(std::size_t index) const noexcept;
   // Sorted Set only; score must not be NaN. Return the first page whose maximum
   // is >= score (or > score when exclusive), and the first page whose minimum
   // is > score (or >= score when exclusive), respectively. groups().size()
