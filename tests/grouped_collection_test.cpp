@@ -501,6 +501,24 @@ TEST(GroupedCollectionTest, SparseSameTopologyUpdateMatchesFullRecovery) {
   EXPECT_FALSE(original->Apply(root, 2, std::span(&changed, 1), 2).ok());
 }
 
+TEST(GroupedCollectionTest, PageLookupHandlesContiguousAndSparseIds) {
+  auto first = Page(7, 2);
+  auto second = Page(8, 2);
+  auto third = Page(12, 2);
+  first.next_ = 8;
+  second.previous_ = 7;
+  second.next_ = 12;
+  third.previous_ = 8;
+  const std::vector pages{first, second, third};
+  auto directory =
+      OrderedGroupDirectory::Recover(Root(pages, 13), 1, Candidates(pages), {});
+  ASSERT_TRUE(directory.ok()) << directory.status();
+  EXPECT_EQ(directory->Find(7), &directory->groups()[0]);
+  EXPECT_EQ(directory->Find(8), &directory->groups()[1]);
+  EXPECT_EQ(directory->Find(12), &directory->groups()[2]);
+  EXPECT_EQ(directory->Find(9), nullptr);
+}
+
 TEST(GroupedCollectionTest,
      DirectoryRejectsMissingCyclesDisconnectedAndWrongCounts) {
   auto split = SplitOrderedGroup(Page(1, 8), 2, 84);
