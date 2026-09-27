@@ -697,7 +697,8 @@ client write
 ```
 
 Canonical commands use the LRC1 command-body encoding: explicit logical database,
-argument count and lengths, then argument bytes. Large arguments stream into
+a 16-bit argument count (up to 65,535), argument lengths, then argument bytes.
+The complete-event byte budget also bounds large batches. Large arguments stream into
 the backlog without another complete flattened allocation. The native v1
 transport wraps each fragment in a versioned little-endian header containing
 magic, header and payload lengths, kind, and payload CRC32C. One logical event
@@ -811,6 +812,27 @@ the manager assigns a new history ID, cancels downstream sessions, clears all
 worker logs, and requires full sync. An already-admitted head item may drain
 above the current waterline to preserve forward progress; new admissions remain
 blocked until occupancy falls below it.
+
+## RedisShake import into managed targets
+
+RedisShake's SyncReader consumes a Redis snapshot and its ongoing replication
+stream. Its RedisWriter sends ordinary RESTORE/type commands and incremental
+writes to Meta-managed Single or Cluster endpoints. These commands use the
+same Owner authority, mutation lifecycle, Function catalog, FLUSH barriers and
+native publication as application requests. Import does not change the target's
+role or introduce an external-replication bypass. Cluster routing maps keys to
+target slots independently of source node count; keyless broadcast and source
+catalog reconciliation remain the tool's responsibility.
+
+Migration keeps business clients off the target until every source tail and
+writer reply is drained and the target population and required native replicas
+have been checked. WAIT observes one local Group's all-worker fence, including
+Single's logical databases; it is neither a cross-Group snapshot nor a consensus
+commit. Tool/connection loss or target failover leaves ambiguous write outcomes.
+A fresh baseline on an isolated empty target is the recovery boundary, not
+blind replay of a possibly committed non-idempotent suffix. See the
+[import runbook](../operations/redis-import.md) for pinned versions, object
+compatibility, TTL semantics, verification and rerun steps.
 
 ## Full-sync lifecycle
 

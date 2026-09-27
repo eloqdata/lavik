@@ -264,6 +264,28 @@ TEST(ReplicationCommandTest, TransactionEnvelopeRoundTripsCanonicalBitmap) {
   EXPECT_FALSE(lavik::DecodeReplicationTransactionEnvelope(noncanonical).ok());
 }
 
+TEST(ReplicationCommandTest, AcceptsFullWireArgumentCount) {
+  constexpr auto count = std::numeric_limits<std::uint16_t>::max();
+  std::vector<std::string_view> args(count, "x");
+  auto source = lavik::ReplicationCommandPayloadSource::Create(15, args);
+  ASSERT_TRUE(source.ok()) << source.status();
+  EXPECT_EQ(source->size(), 8U + 5U * count);
+
+  // Independent wire construction also covers the receiver limit: every
+  // argument has one payload byte and a little-endian uint32 length.
+  std::string encoded("LRC1\x01\x0f\xff\xff", 8);
+  for (std::size_t i = 0; i < count; ++i) encoded.append("\x01\0\0\0", 4);
+  encoded.append(count, 'x');
+  auto decoded = lavik::DecodeReplicationCommand(encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(decoded->db_id_, 15);
+  EXPECT_EQ(decoded->args_, std::vector<std::string>(count, "x"));
+  args.push_back("overflow");
+  EXPECT_FALSE(lavik::ReplicationCommandPayloadSource::Create(0, args).ok());
+  encoded.resize(8);
+  EXPECT_FALSE(lavik::DecodeReplicationCommand(encoded).ok());
+}
+
 TEST(ReplicationCommandTest, EnforcesCompleteEncodingLimit) {
   const std::string one_mebibyte(1024 * 1024, 'x');
   std::vector<std::string_view> args(1024, one_mebibyte);
