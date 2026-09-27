@@ -147,6 +147,12 @@ def run(root, mode):
             for db in databases:
                 compare(client(port, db), client(dest, db))
             I.seed(src, b"{export}:online:")
+            for db in databases:
+                c = client(port, db)
+                c.set(f"db-{db}", f"online-{db}")
+                c.close()
+            if mode != "cluster":
+                assert src.copy("db-0", "copied-from-db0", destination_db=15)
             src.delete(b"{export}:rdb:delete")
             src.rename(b"{export}:rdb:rename", b"{export}:renamed")
             src.function_load(I.library("online"), replace=True)
@@ -156,11 +162,13 @@ def run(root, mode):
                 tx.delete("{export}:rdb:binary\x00\xff")
                 tx.execute()
             drain(src, shake, port)
-            compare(src, dst)
+            for db in databases:
+                compare(client(port, db), client(dest, db))
             src.flushdb()
             src.set("{export}:after-flush", "retained")
             drain(src, shake, port)
-            compare(src, dst)
+            for db in databases:
+                compare(client(port, db), client(dest, db))
             src.flushall()
             drain(src, shake, port)
             for db in databases:
