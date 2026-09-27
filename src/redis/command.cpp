@@ -1344,6 +1344,7 @@ enum class RuntimeConfigKey : std::uint8_t {
   kSnapshotReadConcurrency,
   kSnapshotBatchSize,
   kReplicationBacklogSize,
+  kRedisExportDiskBacklogSize,
   kReplicationBacklogBackpressure,
   kReplicationPublishQueue,
   kReplicaPriority,
@@ -1386,6 +1387,8 @@ constexpr std::array kRuntimeConfigs{
                             RuntimeConfigKey::kSnapshotReadConcurrency},
     RuntimeConfigDescriptor{kSnapshotBatchSizeConfig,
                             RuntimeConfigKey::kSnapshotBatchSize},
+    RuntimeConfigDescriptor{"redis-export-disk-backlog-size",
+                            RuntimeConfigKey::kRedisExportDiskBacklogSize},
     RuntimeConfigDescriptor{kReplicationBacklogSizeConfig,
                             RuntimeConfigKey::kReplicationBacklogSize},
     RuntimeConfigDescriptor{kReplicationBacklogBackpressureConfig,
@@ -1554,6 +1557,7 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       if ((config.key_ == RuntimeConfigKey::kSnapshotReadConcurrency ||
            config.key_ == RuntimeConfigKey::kSnapshotBatchSize ||
            config.key_ == RuntimeConfigKey::kReplicationBacklogSize ||
+           config.key_ == RuntimeConfigKey::kRedisExportDiskBacklogSize ||
            config.key_ == RuntimeConfigKey::kReplicationBacklogBackpressure ||
            config.key_ == RuntimeConfigKey::kReplicationPublishQueue ||
            config.key_ == RuntimeConfigKey::kReplicaPriority ||
@@ -1573,6 +1577,9 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
           return std::to_string(g_replication->snapshot_read_concurrency());
         case RuntimeConfigKey::kSnapshotBatchSize:
           return std::to_string(g_replication->snapshot_batch_size());
+        case RuntimeConfigKey::kRedisExportDiskBacklogSize:
+          return std::to_string(
+              g_replication->redis_export_disk_backlog_size());
         case RuntimeConfigKey::kReplicationBacklogSize:
           return std::to_string(g_replication->backlog_size_bytes());
         case RuntimeConfigKey::kReplicationBacklogBackpressure:
@@ -1700,7 +1707,8 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
                 .value_ = value,
             });
       }
-    } else if (config->key_ == RuntimeConfigKey::kReplicationBacklogSize) {
+    } else if (config->key_ == RuntimeConfigKey::kReplicationBacklogSize ||
+               config->key_ == RuntimeConfigKey::kRedisExportDiskBacklogSize) {
       if (g_replication == nullptr) {
         configured =
             absl::FailedPreconditionError("replication backend is unavailable");
@@ -1711,7 +1719,11 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
         } else {
           configured =
               co_await g_replication->ApplyDirective(ReplicationDirective{
-                  .kind_ = ReplicationDirective::Kind::kBacklogBytes,
+                  .kind_ = config->key_ ==
+                                   RuntimeConfigKey::kRedisExportDiskBacklogSize
+                               ? ReplicationDirective::Kind::
+                                     kRedisExportDiskBacklogBytes
+                               : ReplicationDirective::Kind::kBacklogBytes,
                   .upstream_ = std::nullopt,
                   .value_ = *bytes,
               });
@@ -4730,6 +4742,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
   auto wants = [&](std::string_view name) { return all || section == name; };
   ReplicationStatus replication;
   if (g_replication != nullptr) replication = co_await g_replication->Observe();
+  if (g_replication != nullptr && wants("replication"))
+    replication.redis_export_ = co_await g_replication->ObserveRedisExport();
 
   std::optional<WorkerMetricsSnapshot> runtime_metrics;
   if (wants("clients") || wants("stats") || wants("persistence") ||
@@ -4997,6 +5011,32 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
                  : replication.local_history_id_) +
             "\r\n";
     info += "master_replid2:0000000000000000000000000000000000000000\r\n";
+    const auto& exported = replication.redis_export_;
+    info += "redis_export_session_id:" + std::to_string(exported.session_id_) +
+            "\r\n";
+    info += "redis_export_group_id:" + exported.group_id_ + "\r\n";
+    info += "redis_export_node_id:" + exported.node_id_ + "\r\n";
+    info += "redis_export_boot_id:" + exported.boot_id_ + "\r\n";
+    info += "redis_export_term:" + std::to_string(exported.term_) + "\r\n";
+    info += "redis_export_generation:" + std::to_string(exported.generation_) +
+            "\r\n";
+    info += "redis_export_disk_capacity:" +
+            std::to_string(exported.disk_capacity_) + "\r\n";
+    info += "redis_export_history_id:" + exported.history_id_ + "\r\n";
+    info += "redis_export_phase:" + exported.phase_ + "\r\n";
+    info += "redis_export_offset:" + std::to_string(exported.offset_) + "\r\n";
+    auto export_vector = [](const std::vector<std::uint64_t>& values) {
+      std::string result;
+      for (auto value : values) {
+        if (!result.empty()) result += ',';
+        result += std::to_string(value);
+      }
+      return result;
+    };
+    info += "redis_export_source_next_lsns:" +
+            export_vector(exported.source_next_lsns_) + "\r\n";
+    info += "redis_export_sent_next_lsns:" +
+            export_vector(exported.sent_next_lsns_) + "\r\n";
     info += "master_repl_offset:" +
             std::to_string(replication.role_ == ReplicationRole::kMaster
                                ? replication.master_repl_offset_

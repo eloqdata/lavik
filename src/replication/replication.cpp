@@ -1023,6 +1023,10 @@ ReplicationManager::ReplicationGroup::ReplicationGroup(
     }
     retained_reset_revisions_.resize(storage_->worker_count());
   }
+  redis_export_disk_backlog_size_.store(
+      options.redis_export_disk_backlog_size_ / storage::kStorageBlockBytes *
+          storage::kStorageBlockBytes,
+      std::memory_order_relaxed);
   backlog_backpressure_.store(options.backlog_backpressure_,
                               std::memory_order_relaxed);
   publish_queue_bytes_per_worker_.store(options.publish_queue_bytes_per_worker_,
@@ -4355,6 +4359,7 @@ auto ReplicationManager::ReplicationGroup::RevokeClusterExpirationAuthority()
     // capability until a stronger fence/session/population transition.
     source_authorizations_.SuspendLeaseAdmission();
   }
+  CancelRedisExport();
   storage_->SetExpirationAuthority(false);
   absl::Status drained = co_await storage_->QuiesceExpiration();
   if (!drained.ok()) co_return drained;
@@ -5336,6 +5341,7 @@ auto ReplicationManager::ReplicationGroup::CancelClusterRebuildForShutdown()
 
 auto ReplicationManager::ReplicationGroup::RequestShutdown() noexcept -> void {
   replication_shutdown_requested_.store(true, std::memory_order_release);
+  CancelRedisExport();
   // These transport-only sets cover connecting/TLS sockets too. Closing
   // them wakes the owner coordinator, which cancels barriers and joins its
   // flows. Main never reads the mutable session registry or partially
@@ -6230,6 +6236,23 @@ auto ReplicationManager::ReplicationGroup::BacklogCapacityForFlow(
   const std::size_t blocks =
       total_blocks / workers + (flow_id < total_blocks % workers ? 1 : 0);
   return blocks * storage::kStorageBlockBytes;
+}
+
+auto ReplicationManager::ReplicationGroup::SetRedisExportDiskBacklogSize(
+    std::size_t bytes) -> Task<absl::Status> {
+  if (bytes < storage::kStorageBlockBytes) {
+    co_return absl::InvalidArgumentError(
+        "redis-export-disk-backlog-size must be at least 8 MiB");
+  }
+  redis_export_disk_backlog_size_.store(
+      bytes / storage::kStorageBlockBytes * storage::kStorageBlockBytes,
+      std::memory_order_release);
+  co_return absl::OkStatus();
+}
+
+std::size_t ReplicationManager::redis_export_disk_backlog_size()
+    const noexcept {
+  return group_->redis_export_disk_backlog_size();
 }
 
 auto ReplicationManager::ReplicationGroup::SetBacklogSizeBytes(
@@ -11954,6 +11977,9 @@ auto ReplicationManager::ReplicationGroup::RemoveMasterSession(
 auto ReplicationManager::ReplicationGroup::DrainSourceEgress()
     -> Task<absl::Status> {
   assert(bycorf::ThisWorker().id_ == 0);
+  CancelRedisExport();
+  const int redis_fd = redis_export_fd_.load(std::memory_order_acquire);
+  if (redis_fd >= 0) (void)::shutdown(redis_fd, SHUT_RDWR);
   // Demotion has already made the role non-master. Process shutdown closes
   // every registered source socket before request drain so retained history
   // cannot deadlock an admitted publisher; this coroutine performs the
@@ -11985,6 +12011,7 @@ auto ReplicationManager::ReplicationGroup::DrainSourceEgress()
     });
   };
   while (active_master_controls_.load(std::memory_order_acquire) != 0 ||
+         redis_export_active_.load(std::memory_order_acquire) ||
          idle_history_monitor_running_ || history_reset_running_ ||
          source_flows_active()) {
     absl::Status waited = co_await bycorf::SleepFor(
@@ -12058,6 +12085,7 @@ auto ReplicationManager::ReplicationGroup::MasterHistoryHasConsumersLocked()
           cluster_rebuild_->ready_token_.has_value()) ||
          !master_sessions_.empty() || !retired_master_sessions_.empty() ||
          source_authorizations_.RetainsSourceHistory() ||
+         redis_export_active_.load(std::memory_order_acquire) ||
          active_master_controls_.load(std::memory_order_acquire) != 0;
 }
 
@@ -12326,6 +12354,9 @@ Task<absl::Status> ReplicationManager::ApplyDirective(
             "add-upstream directive has no endpoint");
       }
       co_return co_await group_->AddUpstream(std::move(*directive.upstream_));
+    case ReplicationDirective::Kind::kRedisExportDiskBacklogBytes:
+      co_return co_await group_->SetRedisExportDiskBacklogSize(
+          directive.value_);
     case ReplicationDirective::Kind::kBacklogBytes:
       co_return co_await group_->SetBacklogSizeBytes(directive.value_);
     case ReplicationDirective::Kind::kBacklogBackpressure:
@@ -12611,6 +12642,14 @@ Task<absl::Status> ReplicationManager::ServeNativeConnection(
   }
   co_return co_await group_->ServeNativeConnection(
       stream, std::move(args), client_id, std::move(client_address), tls);
+}
+
+Task<absl::Status> ReplicationManager::ServeRedisExportConnection(
+    TcpStream& stream, std::vector<std::string> args, std::uint64_t client_id,
+    std::string client_address, bool tls, bool eof_capable) {
+  co_return co_await group_->ServeRedisExportConnection(
+      stream, std::move(args), client_id, std::move(client_address), tls,
+      eof_capable);
 }
 
 Task<absl::StatusOr<std::optional<NativeReplicationWatermark>>>

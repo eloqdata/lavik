@@ -727,7 +727,7 @@ absl::Status AuthorityGuard::RenewLease(
     }
     // Healthy renewal preserves admitted work; readers of a replaced
     // capability fall back to the current lease for the same authority.
-    if (shared_lease != nullptr) {
+    if (shared_lease != nullptr && shared_lease != existing->second.deadline_) {
       existing->second.deadline_->Revoke();
       existing->second.deadline_ = std::move(shared_lease);
       PublishAuthorityLocked();

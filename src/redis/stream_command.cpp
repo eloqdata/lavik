@@ -3377,4 +3377,57 @@ Task<std::string> ExecuteStreamReadLocked(
   co_return encoded;
 }
 
+// Translate the canonical group delta rather than reading the live Stream:
+// a concurrent mutation may already have changed that live state. Redis can
+// apply PEL ownership/count/time with XCLAIM and group position with SETID.
+absl::StatusOr<std::vector<std::vector<std::string>>> RedisExportStreamGroup(
+    std::span<const std::string> args) {
+  using Commands = std::vector<std::vector<std::string>>;
+  if (args.size() < 2 || !EqualCi(args[0], "xgroup") ||
+      !EqualCi(args[1], kRestoreGroupSubcommand)) {
+    return Commands{std::vector<std::string>(args.begin(), args.end())};
+  }
+  if (args.size() < 5)
+    return absl::InvalidArgumentError("invalid export Stream group");
+  const auto& key = args[2];
+  const auto& name = args[3];
+  if (args[4] == "0" && args.size() == 5)
+    return Commands{{"XGROUP", "DESTROY", key, name}};
+  if (args.size() != 6)
+    return absl::InvalidArgumentError("invalid export Stream group payload");
+  GroupDelta delta;
+  Commands result;
+  if (args[4] == "2") {
+    auto decoded = DecodeGroupDelta(args[5]);
+    if (!decoded.ok()) return decoded.status();
+    delta = std::move(*decoded);
+  } else if (args[4] == "1") {
+    auto decoded = DecodeGroupState(args[5]);
+    if (!decoded.ok()) return decoded.status();
+    delta.upserts_ = std::move(*decoded);
+    result.push_back({"XGROUP", "DESTROY", key, name});
+    result.push_back({"XGROUP", "CREATE", key, name,
+                      FormatId(delta.upserts_.last_id_), "MKSTREAM"});
+  } else {
+    return absl::InvalidArgumentError("invalid export Stream group operation");
+  }
+  if (delta.upserts_.name_ != name)
+    return absl::InvalidArgumentError("export Stream group identity mismatch");
+  for (const auto& consumer : delta.removed_consumers_)
+    result.push_back({"XGROUP", "DELCONSUMER", key, name, consumer});
+  for (const auto id : delta.removed_pending_)
+    result.push_back({"XACK", key, name, FormatId(id)});
+  for (const auto& consumer : delta.upserts_.consumers_)
+    result.push_back({"XGROUP", "CREATECONSUMER", key, name, consumer.name_});
+  for (const auto& pending : delta.upserts_.pending_)
+    result.push_back({"XCLAIM", key, name, pending.consumer_, "0",
+                      FormatId(pending.id_), "TIME",
+                      std::to_string(pending.delivery_ms_), "RETRYCOUNT",
+                      std::to_string(pending.deliveries_), "FORCE", "JUSTID"});
+  result.push_back({"XGROUP", "SETID", key, name,
+                    FormatId(delta.upserts_.last_id_), "ENTRIESREAD",
+                    std::to_string(delta.upserts_.entries_read_)});
+  return result;
+}
+
 }  // namespace lavik

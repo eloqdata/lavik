@@ -467,6 +467,10 @@ class NodeControlActions {
   // work here because its source sessions were joined by async revocation and
   // NodeControlInstaller owns the replaced snapshot's request counters.
   virtual absl::Status DrainAssignment(const AuthorityAnchor& anchor) = 0;
+  // Shed optional external consumers only if they block an admitted mutation.
+  virtual bycorf::Task<absl::Status> RelieveExportBackpressure() {
+    co_return absl::OkStatus();
+  }
 };
 
 class NullNodeControlActions final : public NodeControlActions {

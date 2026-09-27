@@ -70,6 +70,7 @@ def process(
     port=None,
     password=None,
     workers=2,
+    max_memory="1G",
 ):
     port = port or H.free_port()
     directory.mkdir(exist_ok=True)
@@ -113,7 +114,7 @@ def process(
             "--recv-buffers-per-worker",
             "0",
             "--max-memory",
-            "1G",
+            max_memory,
             "--registered-buffer-mb-per-worker",
             "64",
             "--data-file",

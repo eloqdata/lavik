@@ -271,6 +271,12 @@ int main(int argc, char** argv) {
                  "Replication publisher staging budget in MiB per worker")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
+  app.add_option("--redis-export-disk-backlog-size",
+                 options.replication_options_.redis_export_disk_backlog_size_,
+                 "Temporary Redis export disk quota (sampled per session)")
+      ->capture_default_str()
+      ->transform(CLI::AsSizeValue(false))
+      ->check(CLI::PositiveNumber);
   app.add_option("--repl-backlog-size",
                  options.replication_options_.backlog_size_bytes_,
                  "Global lazy in-memory replication backlog quota")

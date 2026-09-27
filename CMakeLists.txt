@@ -442,6 +442,7 @@ add_library(lavik_module
   src/storage/engine/recovery.cpp
   src/storage/engine/replication.cpp
   src/storage/engine/replication_log.cpp
+  src/storage/engine/redis_export_backlog.cpp
   src/storage/engine/system_state.cpp
   src/storage/engine/tomb_raider.cpp
   src/storage/engine/tx_cleaner.cpp
@@ -458,6 +459,7 @@ add_library(lavik_module
   src/replication/native_recovery.cpp
   src/replication/native_reparent.cpp
   src/replication/replication.cpp
+  src/replication/redis_export.cpp
   src/replication/redis_replication.cpp
   src/redis/rdb.cpp
   src/redis/rdb_collection.cpp
@@ -1688,6 +1690,33 @@ endforeach()
       set_tests_properties(lavik_redis_follower PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE)
       find_program(LAVIK_REDIS_SHAKE_EXECUTABLE redis-shake)
       if (LAVIK_REDIS_SHAKE_EXECUTABLE)
+        foreach(export_mode standalone single cluster)
+          add_test(NAME lavik_redis_export_shake_${export_mode}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_export_shake_e2e.py
+                    $<TARGET_FILE:lavik> ${LAVIK_REDIS_SERVER_EXECUTABLE}
+                    ${LAVIK_REDIS_SHAKE_EXECUTABLE} $<TARGET_FILE:lavik-meta>
+                    $<TARGET_FILE:lavik-ctl> ${export_mode})
+          set_tests_properties(lavik_redis_export_shake_${export_mode}
+            PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE
+            ENVIRONMENT "PYTHONPATH=${LAVIK_CLUSTER_CLIENT_REDIS_PY}")
+        endforeach()
+        if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR LAVIK_ENABLE_TEST_FAULTS)
+          foreach(export_mode single cluster)
+            add_test(NAME lavik_redis_export_ha_${export_mode}
+              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_export_ha_e2e.py
+                      $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-meta>
+                      $<TARGET_FILE:lavik-ctl> ${export_mode})
+            set_tests_properties(lavik_redis_export_ha_${export_mode}
+              PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE
+              ENVIRONMENT "PYTHONPATH=${LAVIK_CLUSTER_CLIENT_REDIS_PY}")
+          endforeach()
+        endif()
+        add_test(NAME lavik_redis_export_protocol
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_export_protocol_e2e.py
+                  $<TARGET_FILE:lavik>)
+        set_tests_properties(lavik_redis_export_protocol
+          PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE
+          ENVIRONMENT "PYTHONPATH=${LAVIK_CLUSTER_CLIENT_REDIS_PY}")
         add_test(NAME lavik_redis_scan_reader_e2e
           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_scan_reader_e2e.py
                   $<TARGET_FILE:lavik> ${LAVIK_REDIS_SERVER_EXECUTABLE}
@@ -1740,6 +1769,37 @@ endforeach()
       )
       set_tests_properties(lavik_redis_cluster_psync_e2e
         PROPERTIES TIMEOUT 120)
+      add_test(
+        NAME lavik_redis_export_e2e
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_export_e2e.sh
+                $<TARGET_FILE:lavik>
+                ${LAVIK_REDIS_SERVER_EXECUTABLE}
+                ${LAVIK_REDIS_CLI_EXECUTABLE}
+      )
+      set_tests_properties(lavik_redis_export_e2e
+        PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+      if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR LAVIK_ENABLE_TEST_FAULTS)
+        add_test(
+          NAME lavik_redis_export_restart_e2e
+          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_export_e2e.sh
+                  $<TARGET_FILE:lavik>
+                  ${LAVIK_REDIS_SERVER_EXECUTABLE}
+                  ${LAVIK_REDIS_CLI_EXECUTABLE}
+                  crash
+        )
+        set_tests_properties(lavik_redis_export_restart_e2e
+          PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+        add_test(
+          NAME lavik_redis_export_disk_full_e2e
+          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_export_e2e.sh
+                  $<TARGET_FILE:lavik>
+                  ${LAVIK_REDIS_SERVER_EXECUTABLE}
+                  ${LAVIK_REDIS_CLI_EXECUTABLE}
+                  full
+        )
+        set_tests_properties(lavik_redis_export_disk_full_e2e
+          PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+      endif()
       add_test(
         NAME lavik_rdb_backup_e2e
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rdb_backup_e2e.sh

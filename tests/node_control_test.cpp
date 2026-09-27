@@ -2650,6 +2650,37 @@ TEST(NodeControlInstallerTest,
             RecheckResult::kReject);
 }
 
+TEST(NodeControlInstallerTest, ReinstallingSharedLeasePreservesLiveCapability) {
+  DynamicControl control;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+  ASSERT_TRUE(
+      control.installer.InstallFullState(FullState(MakeState()), Basis(10))
+          .ok());
+  const auto anchor = Anchor(*control.cache.Current());
+  auto lease = std::make_shared<LeaseDeadline>(5s);
+  ASSERT_TRUE(control.guard
+                  .RenewLease(Session(1), anchor, MonotonicTime{} + 5s,
+                              MonotonicTime{}, lease)
+                  .ok());
+  ASSERT_TRUE(control.guard
+                  .RenewLease(Session(1), anchor, MonotonicTime{} + 10s,
+                              MonotonicTime{} + 1s, lease)
+                  .ok());
+  EXPECT_TRUE(lease->valid_at(9s));
+  constexpr std::array<std::uint16_t, 1> slots{12};
+  EXPECT_EQ(
+      control.guard.CaptureAndAdmit(WriteRequest(slots), MonotonicTime{} + 9s)
+          .decision()
+          .kind_,
+      Decision::Kind::kServe);
+  lease->Revoke();
+  EXPECT_FALSE(control.guard
+                   .RenewLease(Session(1), anchor, MonotonicTime{} + 15s,
+                               MonotonicTime{} + 9s, lease)
+                   .ok());
+  EXPECT_FALSE(lease->valid_at(9s));
+}
+
 TEST(NodeControlInstallerTest,
      PopulationProofLossInvalidatesLeaseAndRevokesOnlyOnTransition) {
   DynamicControl control;

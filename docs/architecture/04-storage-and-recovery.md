@@ -178,7 +178,11 @@ allocation epoch, committed boundary, record count, maximum physical LSN,
 header sequence, kind, and kind-specific metadata. Slot selection prefers the
 higher allocation epoch and then the higher header sequence. Current block
 kinds are ordinary records, payload extents, indirect-key records (kind 3),
-transaction generations, and checkpoint index chunks.
+transaction generations, checkpoint index chunks, and temporary Redis export
+backlog blocks. Export blocks use on-disk kind 6 and contain replication frames,
+not indexed records.
+They belong to the active Redis full-sync session only; recovery returns every
+such allocated block to free space without replaying its contents.
 
 Records are 8-byte aligned and carry their database and value type, key
 representation, logical and physical sizes, transaction ID, database and
@@ -380,7 +384,9 @@ Recovery proceeds as follows:
 2. An all-zero or wholly invalid header on an allocated block is a permitted
    activation false positive and becomes reusable. A valid header whose
    embedded block ID does not match its physical location is stale media and
-   is ignored without rewriting the bitmap.
+   is ignored without rewriting the bitmap. A valid temporary Redis export
+   block is also reclaimed immediately; a new process has no matching PSYNC
+   session or continuation cursor.
 3. A valid extent header contributes extent identity. With a validated
    checkpoint, an ordinary record block contributes only its header because
    the checkpoint already supplies its winning index entries. Without one,
@@ -1080,6 +1086,7 @@ current source code are authoritative for present storage behavior.
 | Aligned buffer ownership, registered-I/O fallback, oversized reads, and cross-worker lease return | `include/lavik/storage/buffer_pool.h`, `src/storage/buffer_pool.cpp` |
 | Storage-path probing, device-set validation and expansion, controller/qpair affinity, metadata load, worker initialization and native-thread finalization, recovery barriers, and shutdown flush | `src/storage/engine/init.cpp`, `src/storage/engine/device_affinity.h`, `src/storage/engine/impl.h` |
 | Device-owner allocation, bitmap activation and cold-free retirement, epoch mirroring, reserves, and allocator fail-stop behavior | `src/storage/engine/alloc.cpp` |
+| Temporary Redis export block allocation, framed command stream, readback, release, and restart discard | `src/storage/engine/redis_export_backlog.cpp`, `src/storage/engine/recovery.cpp` |
 | Parallel scans, block reassignment, epoch filtering, transaction decision collection, winner selection, and recovery accounting | `src/storage/engine/recovery.cpp`, `src/storage/engine/init.cpp` |
 | Append streams, mutation precondition, extent construction, WATCH/index publication, replacement accounting, transaction fences, commit batching and backpressure, commit decisions, caller wait policy, and rollback | `include/lavik/storage/engine.h`, `src/storage/engine/write.cpp`, `src/storage/engine/hash_tree.cpp`, `src/redis/command.cpp`, `src/redis/list_command.cpp`, `src/redis/sort_command.cpp` |
 | Worker-sharded retained-memory admission and ownership, detached-index reclaim, client-buffer quotas, full-sync reservations, and RDB snapshot admission failure | `include/lavik/memory.h`, `src/memory.cpp`, `include/lavik/storage/scan_hash_map.h`, `src/storage/engine/replication.cpp`, `src/storage/engine/backup.cpp` |

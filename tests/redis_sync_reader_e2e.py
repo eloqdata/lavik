@@ -188,6 +188,7 @@ class Shake:
         source_cluster,
         mode,
         bulk=512 * 1024 * 1024,
+        try_diskless=False,
     ):
         root.mkdir()
         self.root = root
@@ -201,6 +202,7 @@ cluster = {str(source_cluster).lower()}
 prefer_replica = false
 sync_rdb = true
 sync_aof = true
+try_diskless = {str(try_diskless).lower()}
 
 [redis_writer]
 address = "127.0.0.1:{target_port}"
