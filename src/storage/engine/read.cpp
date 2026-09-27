@@ -1071,7 +1071,12 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentParallel(
     ExtentReadJoin* join) {
   const unsigned owner = BlockOwner(ref.block_id_);
   absl::Status read;
-  if (owner == bycorf::ThisWorker().id_) {
+  // The manifest check precedes task scheduling. The block can be recycled
+  // before this task runs, so validate the freshly observed owner before
+  // either indexing stores_ or routing to another worker.
+  if (owner >= worker_count_) {
+    read = absl::AbortedError("stale or missing external extent");
+  } else if (owner == bycorf::ThisWorker().id_) {
     read = co_await ReadExtentInto(*stores_[owner], ref, extent_index,
                                    destination);
   } else {
@@ -1285,7 +1290,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
   std::size_t checked_bytes = 0;
   for (const ExtentRef& ref : *extents) {
     if (BlockOwner(ref.block_id_) >= worker_count_) {
-      co_return absl::InternalError("stale or missing external extent");
+      co_return absl::AbortedError("stale or missing external extent");
     }
     if (ref.payload_bytes_ > value_bytes - checked_bytes)
       co_return absl::InternalError(

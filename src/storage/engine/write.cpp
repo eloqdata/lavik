@@ -2442,18 +2442,25 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         "transaction record has no writer lease");
   }
   // Several acknowledged segment batches can still await their decisions.
-  // Reserve direct-I/O pages for outstanding transaction leases, not just the
-  // current command: flushing a decision consumes the remainder of its page.
-  // Include an extra nested/outer pair for a borrowed cross-worker receipt.
-  // Recompute after waits, when another writer may have acquired a lease.
+  // Keep some aligned space for those decisions, including an extra
+  // nested/outer pair for a borrowed cross-worker receipt. The process-wide
+  // lease count is only a pressure hint for this worker's stream: bound the
+  // reserve and yield it to a record that physically fits the block. Further
+  // decisions can roll over to another Tx block. Recompute after waits.
   auto append_limit = [&]() -> std::uint64_t {
     if (!transaction_append || group == nullptr ||
         value_type != ValueType::kString)
       return kStorageBlockBytes;
+    constexpr std::uint64_t kDecisionPairBytes = 2 * kDirectIoAlignment;
+    constexpr std::uint64_t kMaxDecisionReserveBytes = kStorageBlockBytes / 8;
+    const std::uint64_t spare_bytes =
+        kStorageBlockBytes - kBlockHeaderBytes - total_disk_bytes;
+    const std::uint64_t max_pairs =
+        std::min(kMaxDecisionReserveBytes, spare_bytes) / kDecisionPairBytes;
     const auto leases = active_tx_leases_.load(std::memory_order_acquire);
-    const auto pages = std::min<std::uint64_t>(
-        leases + 1, kStorageBlockBytes / (2 * kDirectIoAlignment));
-    return kStorageBlockBytes - pages * 2 * kDirectIoAlignment;
+    const std::uint64_t pairs =
+        max_pairs == 0 ? 0 : std::min(leases, max_pairs - 1) + 1;
+    return kStorageBlockBytes - pairs * kDecisionPairBytes;
   };
   const BlockKind append_block_kind =
       indirect_key_record  ? BlockKind::kIndirectKeys
@@ -2513,9 +2520,6 @@ acquire_active_stream:
   while (!active_stream().has_value() ||
          active_stream()->committed_bytes_ + total_disk_bytes >
              append_limit()) {
-    if (total_disk_bytes + kBlockHeaderBytes > append_limit())
-      co_return absl::ResourceExhaustedError(
-          "transaction decisions occupy segment append capacity");
     // Waiting for a physical block must not hold store_state_mutex_: the
     // allocator, flush completion, and the elected writer may all need this
     // worker's state before the new stream can be published. The gate is per
