@@ -3445,6 +3445,7 @@ acquire_active_stream:
     RequestFlush(store, updated.block_id_);
     if (active_stream().has_value() &&
         active_stream()->block_id_ == updated.block_id_) {
+      if (transaction_append) NoteTxBlockSealedLocal(store, updated.block_id_);
       active_stream().reset();
     }
   }

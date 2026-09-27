@@ -630,9 +630,14 @@ Task<absl::Status> StorageEngine::Impl::RetireTxBlockLocal(
   }
   const absl::Status returned =
       co_await ReturnColdBlocks(std::vector<std::uint64_t>{block.block_id_});
+  co_await store.store_state_mutex_.Lock();
+  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  // DestroyBlockState already removed the runtime Tx entry. An allocator
+  // failure fail-stops reuse of this block, so its backlog charge must still
+  // be removed even though dependent references remain until cold retirement.
+  store.tx_backlog_bytes_.fetch_sub(retired_backlog_bytes,
+                                    std::memory_order_release);
   if (returned.ok()) {
-    store.tx_backlog_bytes_.fetch_sub(retired_backlog_bytes,
-                                      std::memory_order_release);
     // UUID and extent dependencies stay live until the source allocation bit
     // is durably clear, even after the tagged winners have moved.
     store.indirect_key_references_.erase(
