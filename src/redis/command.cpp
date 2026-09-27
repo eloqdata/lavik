@@ -5631,9 +5631,7 @@ Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
     Context* context, TwoPhaseCallback read_callback,
     TwoPhaseCallback write_callback, TwoPhaseCallback single_shard_callback,
     ShouldSkip should_skip) {
-  absl::Status status = co_await g_storage->WaitForTxBacklog();
-  if (!status.ok()) co_return TwoPhaseResult{std::move(status)};
-  status = co_await transaction.Schedule();
+  absl::Status status = co_await transaction.Schedule();
   if (!status.ok()) co_return TwoPhaseResult{std::move(status)};
 
   const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
@@ -6310,13 +6308,6 @@ Task<CommandReply> ExecuteMultiKey(
   }
 
   const bool write = (request.spec_->flags_ & kCmdWrite) != 0;
-  if (write && keys->count() > 1) {
-    absl::Status admitted = co_await g_storage->WaitForTxBacklog();
-    if (!admitted.ok()) {
-      if (replication_order != nullptr) replication_order->Release();
-      co_return BuiltReply(AppendStorageError(reply_builder, admitted));
-    }
-  }
   tx::Transaction txn;
   for (std::size_t i = keys->first_; i <= keys->last_; i += keys->step_) {
     txn.AddKey(ShardForKey(args[i]), request.db_id_,
@@ -8377,11 +8368,6 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
   ClusterShardValidatorContext cluster_validator;
 
   if (key_count != 0) {
-    if (!read_only) {
-      absl::Status admitted = co_await g_storage->WaitForTxBacklog();
-      if (!admitted.ok())
-        co_return BuiltReply(AppendStorageError(reply_builder, admitted));
-    }
     transaction.emplace();
     for (std::size_t i = 0; i < key_count; ++i) {
       const std::string& key = declared_keys[i];
@@ -13422,10 +13408,11 @@ Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
                                           ReplyBuilder& reply_builder,
                                           std::uint64_t client_id,
                                           ConnectionContext* connection) {
-  // A standalone grouped write can create its storage transaction only after
-  // acquiring a key intent. Wait at this outer boundary so an old snapshot
-  // needing that key is never held up by the writer waiting for Tx cleanup.
-  if (!request.replication_origin_ && request.spec_ != nullptr &&
+  // Admit each direct write, including replica replay, before it can acquire
+  // key intents or start a storage transaction. This is a soft backlog gate:
+  // after admission, the command may finish even if the threshold is crossed.
+  // EXEC and a blocking List wake have their own transaction boundaries.
+  if (request.spec_ != nullptr &&
       (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
       request.kind_ != CommandKind::kFlushDb &&
       request.kind_ != CommandKind::kFlushAll && g_storage != nullptr &&

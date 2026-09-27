@@ -919,6 +919,14 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
       }
     } cascade_completion{attempt_cascade};
 
+    // A blocked List move may resume long after its command-level admission.
+    // Recheck before taking a database gate or key intent for this attempt.
+    if (waiter && (request.kind_ == CommandKind::kBLMove ||
+                   request.kind_ == CommandKind::kBRPopLPush)) {
+      const absl::Status admitted = co_await g_storage->WaitForTxBacklog();
+      if (!admitted.ok()) co_return status_reply(admitted);
+    }
+
     while (!TryBeginCommandDbOperation(request.db_id_)) {
       if (deadline && std::chrono::steady_clock::now() >= *deadline) {
         co_return timeout_reply();
