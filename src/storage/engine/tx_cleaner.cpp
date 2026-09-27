@@ -134,14 +134,8 @@ void StorageEngine::Impl::InitializeTxWrites(
     std::uint64_t txid, std::span<TxShardWrites> writes,
     MutationPrecondition precondition) {
   if (writes.empty()) return;
-  auto* token = new std::uint8_t{0};
-  active_tx_leases_.fetch_add(1, std::memory_order_release);
-  auto lease = std::shared_ptr<void>(token, [this](void* token) {
+  auto lease = std::shared_ptr<void>(new std::uint8_t{0}, [this](void* token) {
     delete static_cast<std::uint8_t*>(token);
-    const std::uint64_t previous =
-        active_tx_leases_.fetch_sub(1, std::memory_order_acq_rel);
-    assert(previous != 0);
-    (void)previous;
     tx_cleaner_dirty_.store(true, std::memory_order_release);
   });
   for (TxShardWrites& shard : writes) {

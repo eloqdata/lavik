@@ -2441,27 +2441,17 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     co_return absl::InvalidArgumentError(
         "transaction record has no writer lease");
   }
-  // Several acknowledged segment batches can still await their decisions.
-  // Keep some aligned space for those decisions, including an extra
-  // nested/outer pair for a borrowed cross-worker receipt. The process-wide
-  // lease count is only a pressure hint for this worker's stream: bound the
-  // reserve and yield it to a record that physically fits the block. Further
-  // decisions can roll over to another Tx block. Recompute after waits.
-  auto append_limit = [&]() -> std::uint64_t {
-    if (!transaction_append || group == nullptr ||
-        value_type != ValueType::kString)
-      return kStorageBlockBytes;
-    constexpr std::uint64_t kDecisionPairBytes = 2 * kDirectIoAlignment;
-    constexpr std::uint64_t kMaxDecisionReserveBytes = kStorageBlockBytes / 8;
-    const std::uint64_t spare_bytes =
-        kStorageBlockBytes - kBlockHeaderBytes - total_disk_bytes;
-    const std::uint64_t max_pairs =
-        std::min(kMaxDecisionReserveBytes, spare_bytes) / kDecisionPairBytes;
-    const auto leases = active_tx_leases_.load(std::memory_order_acquire);
-    const std::uint64_t pairs =
-        max_pairs == 0 ? 0 : std::min(leases, max_pairs - 1) + 1;
-    return kStorageBlockBytes - pairs * kDecisionPairBytes;
-  };
+  // Grouped Strings can append many small segments before their decisions.
+  // Keep a small aligned tail for the current and a borrowed decision. This
+  // is soft headroom: a record that physically fits may consume it, and later
+  // decisions can roll over to another Tx block.
+  constexpr std::uint64_t kDecisionReserveBytes = 4 * kDirectIoAlignment;
+  const std::uint64_t spare_bytes =
+      kStorageBlockBytes - kBlockHeaderBytes - total_disk_bytes;
+  const std::uint64_t append_limit =
+      transaction_append && group != nullptr && value_type == ValueType::kString
+          ? kStorageBlockBytes - std::min(kDecisionReserveBytes, spare_bytes)
+          : kStorageBlockBytes;
   const BlockKind append_block_kind =
       indirect_key_record  ? BlockKind::kIndirectKeys
       : transaction_append ? BlockKind::kTransaction
@@ -2518,8 +2508,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
 acquire_active_stream:
   if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
   while (!active_stream().has_value() ||
-         active_stream()->committed_bytes_ + total_disk_bytes >
-             append_limit()) {
+         active_stream()->committed_bytes_ + total_disk_bytes > append_limit) {
     // Waiting for a physical block must not hold store_state_mutex_: the
     // allocator, flush completion, and the elected writer may all need this
     // worker's state before the new stream can be published. The gate is per
@@ -2535,7 +2524,7 @@ acquire_active_stream:
       // reached the front. Reuse it instead of allocating a spare block.
       if (active_stream().has_value() &&
           active_stream()->committed_bytes_ + total_disk_bytes <=
-              append_limit()) {
+              append_limit) {
         continue;
       }
     }
@@ -2565,8 +2554,7 @@ acquire_active_stream:
     // Recheck after allocation released the store lock: a maintenance path
     // may have installed a successor, or another writer consumed the tail.
     if (active_stream().has_value() &&
-        active_stream()->committed_bytes_ + total_disk_bytes <=
-            append_limit()) {
+        active_stream()->committed_bytes_ + total_disk_bytes <= append_limit) {
       absl::Status returned = co_await return_reserved(*allocated);
       if (!returned.ok()) co_return returned;
       continue;
@@ -2816,7 +2804,7 @@ acquire_active_stream:
   // this coroutine is suspended. Re-enter allocation before dereferencing the
   // optional or appending to a replacement block that no longer has room.
   if (!active_stream().has_value() ||
-      active_stream()->committed_bytes_ + total_disk_bytes > append_limit()) {
+      active_stream()->committed_bytes_ + total_disk_bytes > append_limit) {
     goto acquire_active_stream;
   }
   const bool has_index_extra = expire_at_ms != 0;

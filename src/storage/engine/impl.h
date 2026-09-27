@@ -4199,9 +4199,6 @@ class StorageEngine::Impl {
   std::atomic<std::uint64_t> tx_cleaner_rounds_{0};
   std::atomic<std::uint64_t> tx_cleaner_failures_{0};
   std::atomic<std::uint64_t> tx_cleaner_retired_blocks_{0};
-  // Upper bound for receipts that can still need space in any worker's one
-  // transaction stream. A single atomic avoids cross-worker registration.
-  std::atomic<std::uint64_t> active_tx_leases_{0};
   std::atomic<bool> shutdown_flush_requested_{false};
   std::atomic<unsigned> shutdown_flush_completed_{0};
   std::atomic<bool> shutdown_flush_failed_{false};
