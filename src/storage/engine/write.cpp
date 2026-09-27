@@ -2676,7 +2676,7 @@ acquire_active_stream:
             block_id, WorkerStore::TxBlockRuntime{
                           .allocation_epoch_ = allocated->allocation_epoch_,
                           .txids_ = {},
-                          .commit_txids_ = {},
+                          .commit_ends_ = {},
                       });
       }
       state.staging_slot_ = AcquireStagingSlot(store);

@@ -560,7 +560,9 @@ struct TxCleanerBlock {
   std::uint64_t live_tagged_bytes_ = 0;
   std::uint32_t dependency_pins_ = 0;
   std::vector<std::uint64_t> txids_;
-  std::vector<std::uint64_t> commit_txids_;
+  // Runtime commits store their exact append boundary; recovered decisions
+  // use zero because their selected block header was already validated.
+  std::vector<std::pair<std::uint64_t, std::uint32_t>> commit_decisions_;
   bool active_transaction_ = false;
   bool sealed_and_durable_ = false;
   bool pending_relocation_ = false;
@@ -568,9 +570,6 @@ struct TxCleanerBlock {
 
 struct TxCleanerLocalState {
   std::vector<TxCleanerBlock> blocks_;
-  std::vector<std::uint64_t> committed_txids_;
-  std::vector<std::pair<std::uint64_t, RelocationDurabilityFence>>
-      commit_fences_;
 };
 
 // The index state a defrag relocation observed when it validated its source
@@ -1841,17 +1840,14 @@ class StorageEngine::Impl {
       // Weak leases identify only transactions that wrote this block. Keeping
       // a strong lease here would itself prevent a block from settling.
       absl::flat_hash_map<std::uint64_t, std::weak_ptr<void>> txids_;
-      absl::flat_hash_set<std::uint64_t> commit_txids_;
+      // The commit record is written once by its coordinator. Its block owns
+      // the decision and the append boundary needed for a durability wait.
+      absl::flat_hash_map<std::uint64_t, std::uint32_t> commit_ends_;
     };
     // Sparse because only transaction blocks need record/dependency accounting
     // beyond the dense BlockState. Recovery rebuilds it from Tx records.
     absl::flat_hash_map<std::uint64_t, TxBlockRuntime> tx_blocks_;
     std::atomic<std::uint64_t> tx_backlog_bytes_{0};
-    // The decision belongs to the worker that appended kTxCommit. The cleaner
-    // reads these maps through owner tasks after candidate leases settle.
-    absl::flat_hash_set<std::uint64_t> committed_txids_;
-    absl::flat_hash_map<std::uint64_t, RelocationDurabilityFence>
-        commit_fences_;
     // Deferred manifests carried by retirement receipts are released after
     // source bitmap retirement. UUID dependencies use the separate maps above.
     absl::flat_hash_map<std::uint64_t, std::vector<ExtentManifest>>

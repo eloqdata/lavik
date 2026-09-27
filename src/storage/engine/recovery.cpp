@@ -948,7 +948,7 @@ absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
           block.block_id_, WorkerStore::TxBlockRuntime{
                                .allocation_epoch_ = block.allocation_epoch_,
                                .txids_ = {},
-                               .commit_txids_ = {},
+                               .commit_ends_ = {},
                            });
       NoteTxBlockSealedLocal(store, block.block_id_);
     }
