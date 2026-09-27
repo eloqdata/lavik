@@ -43,6 +43,9 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       std::string first_, last_;
       std::size_t first_page_ = 0, end_page_ = 0;
       std::uint64_t range_count_ = 0;
+      std::optional<LoadedOrderedGroup> probe_page_;
+      std::optional<MemoryReservation> probe_reservation_;
+      std::size_t probe_index_ = 0;
 
       // Resident maximum keys identify the candidate page. Unknown external
       // boundaries are learned lazily; only the candidate page needs a full
@@ -53,8 +56,10 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         const auto& directory = object->ordered_directory();
         const auto& groups = directory.groups();
         std::size_t lo = 0, hi = groups.size();
-        auto load =
-            [&](std::size_t index) -> Task<absl::StatusOr<LoadedOrderedGroup>> {
+        auto load = [&](std::size_t index)
+            -> Task<absl::StatusOr<const LoadedOrderedGroup*>> {
+          if (source.probe_page_ && source.probe_index_ == index)
+            co_return &*source.probe_page_;
           const HashGroupId id{groups[index].id_, 0};
           const auto* physical = object->FindGroup(id);
           if (!physical)
@@ -74,7 +79,12 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           if (!max_key.ok()) co_return max_key.status();
           auto remembered = directory.RememberStreamPageMaxKey(index, *max_key);
           if (!remembered.ok()) co_return remembered;
-          co_return std::move(*page);
+          // Retain one admitted probe. Exact-ID ranges use the same page for
+          // both bounds and the eventual reply.
+          source.probe_page_.emplace(std::move(*page));
+          source.probe_reservation_.emplace(std::move(*admission));
+          source.probe_index_ = index;
+          co_return &*source.probe_page_;
         };
         while (lo < hi) {
           const auto mid = lo + (hi - lo) / 2;
@@ -84,7 +94,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
             auto page = co_await load(mid);
             if (!page.ok()) co_return page.status();
             auto max_key =
-                StreamRecordKey(page->snapshot_.entries_.back().value_);
+                StreamRecordKey((*page)->snapshot_.entries_.back().value_);
             if (!max_key.ok()) co_return max_key.status();
             less = upper ? *max_key <= key : *max_key < key;
           }
@@ -98,7 +108,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         auto page = co_await load(lo);
         if (!page.ok()) co_return page.status();
         std::size_t at = 0;
-        for (const auto& entry : page->snapshot_.entries_) {
+        for (const auto& entry : (*page)->snapshot_.entries_) {
           auto entry_key = StreamRecordKey(entry.value_);
           if (!entry_key.ok()) co_return entry_key.status();
           if (upper ? *entry_key > key : *entry_key >= key) break;
@@ -211,10 +221,20 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           CollectionPage page{.value_type_ =
                                   source->saved_.location_.value_type()};
           if (object->is_ordered()) {
-            auto loaded = co_await engine->LoadOrderedGroupSnapshot(
-                *source->store_, *source->partition_, source->db_id_,
-                source->key_, source->digest_, object, id.prefix_, true);
-            if (!loaded.ok()) co_return loaded.status();
+            std::optional<LoadedOrderedGroup> loaded;
+            if (source->range_ && source->probe_page_ &&
+                source->probe_page_->snapshot_.id_ == id.prefix_) {
+              loaded.emplace(std::move(*source->probe_page_));
+              source->probe_page_.reset();
+              // The page/output reservation above now covers these bytes.
+              source->probe_reservation_.reset();
+            } else {
+              auto from_disk = co_await engine->LoadOrderedGroupSnapshot(
+                  *source->store_, *source->partition_, source->db_id_,
+                  source->key_, source->digest_, object, id.prefix_, true);
+              if (!from_disk.ok()) co_return from_disk.status();
+              loaded.emplace(std::move(*from_disk));
+            }
             const auto count = loaded->snapshot_.entries_.size();
             if (page.value_type_ == ValueType::kList ||
                 page.value_type_ == ValueType::kStream) {

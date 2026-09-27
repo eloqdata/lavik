@@ -640,6 +640,14 @@ const RecoveredOrderedGroup* OrderedGroupDirectory::Find(
     std::uint64_t id) const noexcept {
   if (root_.kind_ == OrderedCollectionKind::kString)
     return id != 0 && id <= groups_.size() ? &groups_[id - 1] : nullptr;
+  // Append-heavy Streams and Lists usually keep a contiguous run of page
+  // identities even after trimming its front. Check that run before the
+  // general id index; arbitrary insertions still use the binary search.
+  if (id >= root_.first_group_) {
+    const auto offset = id - root_.first_group_;
+    if (offset < groups_.size() && groups_[offset].id_ == id)
+      return &groups_[offset];
+  }
   const auto found = std::lower_bound(
       ids_.begin(), ids_.end(), id,
       [](const auto& item, auto target) { return item.first < target; });
