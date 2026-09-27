@@ -96,12 +96,16 @@ the previous session has joined and released its slot and temporary resources.
 
 1. Stop all application mutations and scheduled writers to the exported scope.
    Keep target business traffic disabled.
-2. Record source `redis_export_session_id`, `redis_export_history_id` and
-   `redis_export_source_next_lsns` from INFO replication. This vector crosses
+2. Record the full source identity from INFO replication:
+   `redis_export_session_id`, `redis_export_history_id`, `redis_export_group_id`,
+   `redis_export_node_id`, `redis_export_boot_id`, `redis_export_term` and
+   `redis_export_generation`, together with `redis_export_source_next_lsns`.
+   This vector crosses
    every source publisher fence and covers committed events before the sample.
 3. Wait for phase `online` and each `redis_export_sent_next_lsns` entry to cover
    the corresponding recorded source position. Record `redis_export_offset`.
-   Restart verification if the session/history changes or becomes inactive.
+   Restart verification if any recorded identity field changes or becomes
+   inactive, including while checking the tool or validating destination data.
 4. At RedisShake `/status`, require the reader's `aof_received_offset` and
    `aof_sent_offset` to cover that Redis byte offset. Require every writer's
    `unanswered_entries` and `unanswered_bytes` to reach zero. The tool's

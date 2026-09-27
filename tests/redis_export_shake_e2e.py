@@ -72,13 +72,26 @@ def drain(src, shake, source_port):
         lambda: src.info("replication")["redis_export_session_id"] != 0,
     )
     cut = src.info("replication")
-    identity = cut["redis_export_session_id"]
-    assert identity
+    identity_fields = (
+        "session_id",
+        "history_id",
+        "group_id",
+        "node_id",
+        "boot_id",
+        "term",
+        "generation",
+    )
+
+    def identity(info):
+        return tuple(info[f"redis_export_{field}"] for field in identity_fields)
+
+    session = identity(cut)
+    assert cut["redis_export_session_id"]
     source_cut = positions(cut, "redis_export_source_next_lsns")
 
     def covered():
         info = src.info("replication")
-        assert info["redis_export_session_id"] == identity, info
+        assert identity(info) == session, info
         sent = positions(info, "redis_export_sent_next_lsns")
         return (
             info["redis_export_phase"] == "online"
@@ -87,12 +100,15 @@ def drain(src, shake, source_port):
         )
 
     I.H.wait_until("all source flow positions sent", 45, covered)
-    offset = src.info("replication")["redis_export_offset"]
+    sent = src.info("replication")
+    assert identity(sent) == session, sent
+    offset = sent["redis_export_offset"]
     I.H.wait_until(
         "RedisShake received/sent offset and writer replies",
         45,
         lambda: I.drained(shake, {f"127.0.0.1:{source_port}": offset}),
     )
+    assert identity(src.info("replication")) == session
 
 
 def compare(src, dst):
