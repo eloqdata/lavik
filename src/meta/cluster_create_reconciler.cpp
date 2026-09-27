@@ -32,6 +32,7 @@
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/worker.h"
 #include "lavik/cluster/control_protocol.h"
+#include "lavik/cluster/lease_clock.h"
 #include "lavik/fault_injection.h"
 #include "lavik/meta/cluster_create.h"
 #include "lavik/meta/hash.h"
@@ -240,8 +241,17 @@ bool SourceLeaseAcknowledged(const MetaDataControlRuntimeNode& runtime,
     return false;
   const auto* granted = std::get_if<cluster::control::LeaseGranted>(
       &*runtime.last_lease_decision_);
-  return granted && granted->granted_duration_ms != 0 &&
-         granted->raft_term == runtime.leader_term_ &&
+  // The last written Ack remains in the runtime snapshot after its finite
+  // lease expires. The heartbeat reached Meta before Data could receive its
+  // Ack, so aging from that receive time conservatively bounds Data's lease.
+  const auto now_lease_ms = cluster::LeaseClockMillis();
+  const bool grant_fresh =
+      granted && runtime.lease_decision_heartbeat_received_lease_ms_ > 0 &&
+      runtime.lease_decision_heartbeat_received_lease_ms_ <= now_lease_ms &&
+      static_cast<std::uint64_t>(
+          now_lease_ms - runtime.lease_decision_heartbeat_received_lease_ms_) <
+          granted->granted_duration_ms;
+  return grant_fresh && granted->raft_term == runtime.leader_term_ &&
          granted->data_boot_id == runtime.boot_id_ &&
          granted->control_revision == runtime.control_revision_ &&
          granted->group_id == group.group_id_ &&
@@ -779,7 +789,8 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
     // before the source can admit it. Wait for a grant written to this same
     // source session before publishing target work. The target retains its
     // bounded retry for the Ack-in-flight interval.
-    if (primary_runtime == runtime.nodes_.end() ||
+    if (!runtime.leader_authority_eligible_ ||
+        primary_runtime == runtime.nodes_.end() ||
         !ProjectionMatches(*primary_runtime, *group, *grant,
                            view.applied_index()) ||
         !SourceLeaseAcknowledged(*primary_runtime, *group, *grant,

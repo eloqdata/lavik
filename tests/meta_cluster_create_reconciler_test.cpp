@@ -18,6 +18,7 @@
 #include <variant>
 
 #include "gtest/gtest.h"
+#include "lavik/cluster/lease_clock.h"
 #include "lavik/meta/cluster_create.h"
 #include "lavik/meta/cluster_create_reconciler.h"
 #include "lavik/meta/control_projector.h"
@@ -176,7 +177,9 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
             .group_id = group->group_id_,
             .assignment_id = member->assignment_id_,
             .group_term = grant->group_term_,
-            .granted_duration_ms = 2000};
+            .granted_duration_ms = 60'000};
+        node.lease_decision_heartbeat_received_lease_ms_ =
+            cluster::LeaseClockMillis();
       }
       node.groups_.push_back({group->group_id_, member->assignment_id_,
                               group->record_.group_term_,
@@ -519,6 +522,14 @@ TEST_F(ClusterCreateV1RecoveryTest,
   EXPECT_FALSE(waiting->has_value());
 
   source.last_lease_decision_ = grant;
+  source.lease_decision_heartbeat_received_lease_ms_ =
+      cluster::LeaseClockMillis() - 60'001;
+  waiting = Plan();
+  ASSERT_TRUE(waiting.ok()) << waiting.status();
+  EXPECT_FALSE(waiting->has_value());
+
+  source.lease_decision_heartbeat_received_lease_ms_ =
+      cluster::LeaseClockMillis();
   std::get<cluster::control::LeaseGranted>(*source.last_lease_decision_)
       .data_boot_id = std::string(40, 'f');
   waiting = Plan();
@@ -526,6 +537,12 @@ TEST_F(ClusterCreateV1RecoveryTest,
   EXPECT_FALSE(waiting->has_value());
 
   source.last_lease_decision_ = grant;
+  runtime_.leader_authority_eligible_ = false;
+  waiting = Plan();
+  ASSERT_TRUE(waiting.ok()) << waiting.status();
+  EXPECT_FALSE(waiting->has_value());
+
+  runtime_.leader_authority_eligible_ = true;
   ApplyPlanned();
   const auto rebuilt = GroupOperation("group-a");
   ASSERT_EQ(rebuilt.current_directives_.size(), 2);

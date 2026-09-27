@@ -149,12 +149,22 @@ TEST(MetaDataControlRuntimeStatusTest,
   status.RecordLeaseDecisionWritten(Identity('1'), session,
                                     /*heartbeat_sequence=*/17,
                                     control::LeaseDecision(denied),
+                                    /*heartbeat_received_lease_ms=*/100,
                                     /*written_unix_ms=*/101);
   snapshot = status.Snapshot();
   ASSERT_TRUE(snapshot.nodes_[0].health_.has_value());
   EXPECT_TRUE(snapshot.nodes_[0].last_lease_decision_.has_value());
   EXPECT_EQ(snapshot.nodes_[0].lease_decision_heartbeat_sequence_, 17u);
+  EXPECT_EQ(snapshot.nodes_[0].lease_decision_heartbeat_received_lease_ms_,
+            100);
   EXPECT_EQ(snapshot.nodes_[0].lease_decision_written_unix_ms_, 101);
+  status.RecordHealth(
+      Identity('1'), session,
+      {.storage_ready = true, .population_ready = true, .draining = false},
+      /*received_unix_ms=*/150);
+  EXPECT_EQ(
+      status.Snapshot().nodes_[0].lease_decision_heartbeat_received_lease_ms_,
+      100);
 
   const auto stale_session = Bytes<16>(0x42);
   status.Remove(Identity('1'), &stale_session);
