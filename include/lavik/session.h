@@ -48,6 +48,9 @@ struct ConnectionContext {
   bool wait_peer_disconnected_ = false;
   std::uint8_t selected_db_ = 0;
   bool authenticated_ = true;
+  // Negotiated by REPLCONF and cleared with all other connection state on
+  // RESET.
+  bool redis_replica_eof_ = false;
   bool authentication_required_ = false;
   bool counted_as_client_ = true;
   // Redis Cluster replica reads are opt-in per connection. READONLY enables

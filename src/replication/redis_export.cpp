@@ -38,7 +38,14 @@ Task<absl::Status> ConsumeRedisExportAcks(
     }
     const auto& args = wire->command_.args_;
     std::uint64_t offset = 0;
-    if (args.size() != 3 || !EqualCaseInsensitive(args[0], "REPLCONF") ||
+    // Redis replicas with AOF can append a durability ACK. Validate its wire
+    // form, but only the ordinary ACK advances export consumption.
+    std::uint64_t fsynced_offset = 0;
+    const bool valid_fack = args.size() == 5 &&
+                            EqualCaseInsensitive(args[3], "FACK") &&
+                            ParseUnsigned(args[4], &fsynced_offset);
+    if ((args.size() != 3 && !valid_fack) ||
+        !EqualCaseInsensitive(args[0], "REPLCONF") ||
         !EqualCaseInsensitive(args[1], "ACK") ||
         !ParseUnsigned(args[2], &offset)) {
       status = absl::InvalidArgumentError(

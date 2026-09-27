@@ -28,13 +28,38 @@ Keep the destination empty and isolated from business traffic throughout import.
 RedisShake does not guarantee transaction atomic visibility while writing the
 destination. An interrupted attempt must not be reused as a baseline.
 
-Check source authentication and independent resource limits:
+Protect both source and target connections before supplying credentials. The
+pinned [RedisShake TLS implementation](https://github.com/tair-opensource/RedisShake/blob/f20f28e6f2679e71a213904d2c74ceb521e19551/internal/client/redis.go#L85-L104)
+disables server-certificate verification, including when CA/client certificates
+are configured. Its `tls = true` option alone does not authenticate the peer.
+Across an untrusted network, use an authenticated encrypted tunnel for both
+links, or a separately validated client that verifies server certificates.
+
+The examples below use SSH forwards bound to loopback on the migration host.
+First verify both SSH host keys through your trusted provisioning channel.
+Keep these commands running in separate terminals; each SSH endpoint must be
+the Redis/Lavik host so the final plaintext hop stays on that host's loopback:
 
 ```sh
-redis-cli -h SOURCE -a "$SOURCE_PASSWORD" CONFIG GET repl-backlog-size
-redis-cli -h SOURCE -a "$SOURCE_PASSWORD" CONFIG GET redis-export-disk-backlog-size
-redis-cli -h SOURCE -a "$SOURCE_PASSWORD" CONFIG GET replication-backlog-backpressure
-redis-cli -h SOURCE -a "$SOURCE_PASSWORD" CONFIG SET redis-export-disk-backlog-size 1gb
+ssh -N -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes \
+  -L 127.0.0.1:16379:127.0.0.1:6379 operator@SOURCE_HOST
+ssh -N -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes \
+  -L 127.0.0.1:26379:127.0.0.1:6379 operator@TARGET_HOST
+```
+
+Route RedisShake and every `redis-cli` invocation through these same forwards.
+If using another transport, protect the entire route, including the tunnel's
+last hop. On a failed export after failover, recreate the source forward to the
+new authorized Primary before starting a fresh attempt.
+
+Check source authentication and independent resource limits. Supply the password
+through `REDISCLI_AUTH` rather than exposing it in process arguments:
+
+```sh
+REDISCLI_AUTH="$SOURCE_PASSWORD" redis-cli -h 127.0.0.1 -p 16379 CONFIG GET repl-backlog-size
+REDISCLI_AUTH="$SOURCE_PASSWORD" redis-cli -h 127.0.0.1 -p 16379 CONFIG GET redis-export-disk-backlog-size
+REDISCLI_AUTH="$SOURCE_PASSWORD" redis-cli -h 127.0.0.1 -p 16379 CONFIG GET replication-backlog-backpressure
+REDISCLI_AUTH="$SOURCE_PASSWORD" redis-cli -h 127.0.0.1 -p 16379 CONFIG SET redis-export-disk-backlog-size 1gb
 ```
 
 `repl-backlog-size` limits memory history. `redis-export-disk-backlog-size`
@@ -54,11 +79,13 @@ always fails the export and frees its retention rather than waiting indefinitely
 
 ## Run
 
-Write `export.toml`, setting real endpoints, credentials and spool paths:
+Write `export.toml` with permissions `0600`, setting credentials and spool paths.
+The loopback endpoints below require the active authenticated tunnels above:
 
 ```toml
 [sync_reader]
-address = "SOURCE:6379"
+address = "127.0.0.1:16379"
+tls = false # Local SSH forward; the network route is authenticated and encrypted.
 password = "SOURCE_PASSWORD"
 cluster = false
 prefer_replica = false
@@ -67,7 +94,8 @@ sync_aof = true
 try_diskless = true
 
 [redis_writer]
-address = "TARGET:6379"
+address = "127.0.0.1:26379"
+tls = false # Local SSH forward to the isolated destination.
 password = "TARGET_PASSWORD"
 cluster = false
 
@@ -81,7 +109,7 @@ rdb_restore_command_behavior = "panic"
 ```sh
 redis-shake export.toml
 curl -s http://127.0.0.1:18080/status
-redis-cli -h SOURCE -a "$SOURCE_PASSWORD" INFO replication
+REDISCLI_AUTH="$SOURCE_PASSWORD" redis-cli -h 127.0.0.1 -p 16379 INFO replication
 ```
 
 Only one PSYNC exporter is allowed per source. Each new connection performs

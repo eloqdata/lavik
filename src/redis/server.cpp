@@ -1839,7 +1839,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
   std::size_t multi_input_bytes = 0;
   std::optional<absl::Status> deferred_read_error;
   PendingReplyBatch pending_replies;
-  bool redis_replica_eof = false;
 
   while (stream.IsOpen()) {
     if (ctx.closing_) co_return absl::OkStatus();
@@ -1937,6 +1936,20 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       continue;
     }
 
+    // A handshake changes socket ownership and cannot execute ahead of queued
+    // transaction commands. Treat rejection as a queue-time error for EXEC.
+    if (ctx.in_multi_ && !args.empty() &&
+        (absl::EqualsIgnoreCase(args.front(), "REPLCONF") ||
+         absl::EqualsIgnoreCase(args.front(), "PSYNC"))) {
+      ctx.multi_dirty_ = true;
+      const std::string_view encoded = ctx.reply_builder_.AppendError(
+          "ERR replication handshake not allowed inside MULTI");
+      absl::Status written = co_await WriteOrBatchReply(
+          stream, encoded, !ready.empty(), &pending_replies);
+      if (!written.ok()) co_return written;
+      continue;
+    }
+
     if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "REPLCONF")) {
       if (args.size() < 3 || (args.size() & 1U) == 0) {
         const std::string_view encoded = ctx.reply_builder_.AppendError(
@@ -1949,7 +1962,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       for (std::size_t index = 1; index + 1 < args.size(); index += 2) {
         if (absl::EqualsIgnoreCase(args[index], "capa") &&
             absl::EqualsIgnoreCase(args[index + 1], "eof")) {
-          redis_replica_eof = true;
+          ctx.redis_replica_eof_ = true;
         }
       }
       const std::string_view encoded =
@@ -1977,7 +1990,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       command_memory.Release();
       co_return co_await replication_->ServeRedisExportConnection(
           stream, std::move(command.args_), ctx.conn_id_, address, tls,
-          redis_replica_eof);
+          ctx.redis_replica_eof_);
     }
 
     if (ReplicationManager::IsNativeHandshake(command.args_)) {

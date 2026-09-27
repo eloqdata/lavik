@@ -12468,6 +12468,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
         co_await DropWatches(ctx);
         ctx.selected_db_ = 0;
         ctx.authenticated_ = !ctx.authentication_required_;
+        ctx.redis_replica_eof_ = false;
         ctx.cluster_readonly_ = false;
         ctx.SetRespVersion(RespVersion::k2);
         SetClientRespVersion(ctx.conn_id_, RespVersion::k2);
@@ -12599,6 +12600,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       co_await DropWatches(ctx);
       ctx.selected_db_ = 0;
       ctx.authenticated_ = !ctx.authentication_required_;
+      ctx.redis_replica_eof_ = false;
       ctx.cluster_readonly_ = false;
       ctx.SetRespVersion(RespVersion::k2);
       SetClientRespVersion(ctx.conn_id_, RespVersion::k2);

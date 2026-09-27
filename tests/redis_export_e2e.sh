@@ -20,9 +20,10 @@ redis_server=$2
 redis_cli=$3
 test_mode=${4:-normal}
 disk_quota=1gb
+appendonly=no
 data_capacity=256M
 case ${test_mode} in
-  normal) crash_point=; disk_one_block=; scan_pause_ms=800 ;;
+  normal) crash_point=; disk_one_block=; scan_pause_ms=800; appendonly=yes ;;
   crash) crash_point=redis_export_backlog_stopped; disk_one_block=; scan_pause_ms=800 ;;
   full) crash_point=; disk_one_block=; scan_pause_ms=5000; disk_quota=8mb ;;
   device) crash_point=; disk_one_block=; scan_pause_ms=10000 ;;
@@ -72,7 +73,10 @@ LAVIK_TEST_REDIS_EXPORT_ONE_BLOCK="${disk_one_block}" \
   --data-file "${case_dir}/lavik.data" --redis-export-disk-backlog-size "${disk_quota}" \
   >"${case_dir}/lavik.log" 2>&1 &
 lavik_pid=$!
-"${redis_server}" --port "${redis_port}" --save '' --appendonly no \
+# The normal transfer exercises FACK from an AOF-enabled Redis 7.2 replica.
+# Fault cases leave AOF disabled: Redis can defer SIGTERM during the initial
+# AOF rewrite, leaving crash-fixture cleanup waiting for an ignored signal.
+"${redis_server}" --port "${redis_port}" --save '' --appendonly "${appendonly}" \
   --dir "${case_dir}" --daemonize no >"${case_dir}/redis.log" 2>&1 &
 redis_pid=$!
 

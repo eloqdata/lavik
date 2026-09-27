@@ -1223,7 +1223,8 @@ and return the node to loading.
 ### Redis PSYNC export
 
 A currently servable Primary accepts one authenticated Redis replica with
-`REPLCONF capa eof` and `PSYNC`. It always starts a new `FULLRESYNC`; Redis
+`REPLCONF capa eof` and `PSYNC`. Handshakes are rejected inside MULTI; RESET
+clears negotiated EOF capability. It always starts a new `FULLRESYNC`; Redis
 partial-resynchronization history and offsets are not retained across a
 disconnect or restart. A short command-admission gate establishes an RDB
 snapshot cut and fences each source worker's publisher FIFO. Managed Single
@@ -1249,7 +1250,9 @@ worker before the owner writes a single Redis-compatible command to the disk
 stream. The RDB queue holds only bounded encoded fragments. After RDB EOF,
 another short gate and publisher fence fix the disk stream's end cursors.
 A nonzero FULLRESYNC initial offset and an initial ACK after EOF separate the
-RDB from incremental bytes without depending on TCP packet boundaries. The
+RDB from incremental bytes without depending on TCP packet boundaries. ACKs
+may include Redis's optional FACK durability offset; it is validated but does
+not advance export consumption. The
 consumer drains the queue again after acquiring all-producer completion.
 The owner drains and releases the temporary disk blocks, then resumes merging
 the worker-local memory logs on the same Redis socket. Its retention cursors
