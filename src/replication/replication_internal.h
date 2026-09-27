@@ -2953,7 +2953,6 @@ class ReplicationManager::ReplicationGroup {
   // this handler before disabling the worker-local logs it reads.
   std::atomic<std::size_t> redis_export_disk_backlog_size_{1ULL << 30};
   std::atomic<bool> redis_export_active_{false};
-  std::atomic<int> redis_export_fd_{-1};
   std::atomic<std::shared_ptr<RedisExportContext>> redis_export_context_;
   bycorf::AsyncMutex redis_fullsync_mutex_;  // worker 0 only
   std::atomic<std::uint64_t> next_master_session_id_{1};

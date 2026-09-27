@@ -14,6 +14,7 @@
 
 import os
 import concurrent.futures
+import socket
 import time
 from pathlib import Path
 import sys
@@ -31,6 +32,17 @@ def closed(export):
         pass
 
 
+def rejected(port):
+    with socket.create_connection(("127.0.0.1", port), 5) as probe:
+        probe.settimeout(5)
+        with probe.makefile("rb") as reader:
+            probe.sendall(P.wire("REPLCONF", "capa", "eof"))
+            assert reader.readline() == b"+OK\r\n"
+            probe.sendall(P.wire("PSYNC", "?", "-1"))
+            reply = reader.readline()
+            assert not reply or reply.startswith(b"-"), reply
+
+
 def expired(root, mode, ack):
     with N.pair(
         root,
@@ -45,6 +57,7 @@ def expired(root, mode, ack):
     ):
         N.ready(meta)
         src = redis.Redis(port=source.redis_port, socket_timeout=5)
+        rejected(target.redis_port)
         history = src.info("replication")["master_replid"]
         export = P.Export(source.redis_port)
         try:
@@ -57,6 +70,12 @@ def expired(root, mode, ack):
             N.H.wait_until(
                 "export resources released after lease expiry",
                 15,
+                lambda: src.info("replication")["redis_export_active"] == 0,
+            )
+            rejected(source.redis_port)
+            N.H.wait_until(
+                "rejected admission releases export slot",
+                5,
                 lambda: src.info("replication")["redis_export_active"] == 0,
             )
         finally:

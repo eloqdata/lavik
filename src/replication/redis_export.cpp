@@ -944,15 +944,10 @@ auto ReplicationManager::ReplicationGroup::ServeRedisExportConnection(
         ? absl::AlreadyExistsError("a Redis PSYNC export is already active")
         : sent;
   }
-  redis_export_fd_.store(stream.NativeFd(), std::memory_order_release);
   struct ActiveGuard {
     std::atomic<bool>* active_;
-    std::atomic<int>* fd_;
-    ~ActiveGuard() {
-      fd_->store(-1, std::memory_order_release);
-      active_->store(false, std::memory_order_release);
-    }
-  } active_guard{&redis_export_active_, &redis_export_fd_};
+    ~ActiveGuard() { active_->store(false, std::memory_order_release); }
+  } active_guard{&redis_export_active_};
   // CAS-before-check pairs with DrainSourceEgress's active observation. If
   // shutdown won first, this handler exits before any await/history setup;
   // otherwise the barrier sees active=true and joins the whole export.
@@ -961,12 +956,10 @@ auto ReplicationManager::ReplicationGroup::ServeRedisExportConnection(
         "Redis replication export stopped for process shutdown");
   }
   if (is_replica() || is_loading()) {
-    absl::Status sent = co_await WriteText(
-        stream,
-        "-LOADING node has no valid Redis replication source state\r\n");
-    co_return sent.ok() ? absl::FailedPreconditionError(
-                              "node lost valid source state during PSYNC setup")
-                        : sent;
+    // Active is visible to source drain, but no owner monitor exists yet.
+    // Do not wait on a refusal write after that drain has revoked the source.
+    co_return absl::FailedPreconditionError(
+        "node lost valid source state during PSYNC setup");
   }
   absl::Status configured = ConfigureConnectedFd(stream.NativeFd());
   if (!configured.ok()) co_return configured;
@@ -989,21 +982,21 @@ auto ReplicationManager::ReplicationGroup::ServeRedisExportConnection(
   context->progress_.disk_capacity_ = context->disk_capacity_;
   context->progress_.phase_ = "admission";
   redis_export_context_.store(context, std::memory_order_release);
+  // Start on the connection worker before admission.
+  // Other workers cancel this exact context; they must never cache its fd,
+  // which may be reused after the connection coroutine returns.
+  bycorf::ThisWorker().self_->Spawn(MonitorRedisExport(&stream, context));
   absl::Status status = co_await PrepareRedisExport(context);
   if (status.ok()) {
     context->admitted_.store(true, std::memory_order_release);
-    bycorf::ThisWorker().self_->Spawn(MonitorRedisExport(&stream, context));
     status = co_await RunRedisExportSession(stream, context);
-    context->cancelled_.store(true, std::memory_order_release);
-    while (!context->monitor_done_) {
-      (void)co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                      std::chrono::milliseconds(1));
-    }
   }
-  if (!context->admitted_.load(std::memory_order_acquire)) {
-    (void)co_await WriteText(
-        stream,
-        "-ERR Redis export requires current serving Primary authority\r\n");
+  // Failed authority admission closes the handshake. A refusal write must not
+  // hold source drain open, including revocation before context publication.
+  context->cancelled_.store(true, std::memory_order_release);
+  while (!context->monitor_done_) {
+    (void)co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                    std::chrono::milliseconds(1));
   }
   // Every inner early-return and cancellation releases only this session's
   // claims. Do not retire or reset the shared native history here.
@@ -1458,7 +1451,19 @@ void ReplicationManager::ReplicationGroup::CancelRedisExport() noexcept {
 auto ReplicationManager::ReplicationGroup::MonitorRedisExport(
     TcpStream* stream, std::shared_ptr<RedisExportContext> context)
     -> Task<absl::Status> {
-  while (RedisExportValid(*context)) {
+  // Admission initializes identity on worker 0. Do not read those fields
+  // until its release publication; cancellation needs only immutable id and
+  // worker-owned socket/snapshot state while admission is still pending.
+  while (!context->admitted_.load(std::memory_order_acquire) &&
+         !context->cancelled_.load(std::memory_order_acquire) &&
+         !replication_shutdown_requested_.load(std::memory_order_acquire) &&
+         !is_replica() && !is_loading()) {
+    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                            std::chrono::milliseconds(1));
+    if (!waited.ok()) break;
+  }
+  while (context->admitted_.load(std::memory_order_acquire) &&
+         RedisExportValid(*context)) {
     {
       const bool current = co_await bycorf::SubmitTo(0, [this, context] {
         if (history_id_ != context->history_) return false;
@@ -1487,13 +1492,7 @@ auto ReplicationManager::ReplicationGroup::MonitorRedisExport(
                                             std::chrono::milliseconds(5));
     if (!waited.ok()) break;
   }
-  spdlog::info(
-      "Redis export {} revoked: cancelled={} role_epoch={}/{} generation={}/{} "
-      "lease_valid={}",
-      context->id_, context->cancelled_.load(), context->role_epoch_,
-      role_epoch_.load(), context->generation_, serving_generation_->load(),
-      !context->lease_ || context->lease_->valid_at(
-                              cluster::LeaseClockNow().time_since_epoch()));
+  spdlog::info("Redis export {} cancelled", context->id_);
   context->cancelled_.store(true, std::memory_order_release);
   (void)::shutdown(stream->NativeFd(), SHUT_RDWR);
   if (context->abort_snapshot_) context->abort_snapshot_();

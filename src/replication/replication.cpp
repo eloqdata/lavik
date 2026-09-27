@@ -11978,8 +11978,6 @@ auto ReplicationManager::ReplicationGroup::DrainSourceEgress()
     -> Task<absl::Status> {
   assert(bycorf::ThisWorker().id_ == 0);
   CancelRedisExport();
-  const int redis_fd = redis_export_fd_.load(std::memory_order_acquire);
-  if (redis_fd >= 0) (void)::shutdown(redis_fd, SHUT_RDWR);
   // Demotion has already made the role non-master. Process shutdown closes
   // every registered source socket before request drain so retained history
   // cannot deadlock an admitted publisher; this coroutine performs the
