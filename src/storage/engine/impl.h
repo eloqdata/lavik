@@ -3568,6 +3568,11 @@ class StorageEngine::Impl {
   // identities from a potentially stale retained metadata view.
   absl::Status PrepareGroupedSnapshotPins(
       WorkerStore::PartitionStore::RdbSnapshotValue* value);
+  // A Stream range retains only pages its reader can reach; the root itself
+  // is always pinned by the common helper.
+  absl::Status PrepareOrderedRangeSnapshotPins(
+      WorkerStore::PartitionStore::RdbSnapshotValue* value,
+      std::size_t first_page, std::size_t end_page);
   Task<absl::Status> ReleaseRdbSnapshotValue(
       WorkerStore::PartitionStore::RdbSnapshotValue* value);
   Task<absl::StatusOr<std::optional<storage::RdbSnapshotValue>>>

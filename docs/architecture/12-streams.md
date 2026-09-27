@@ -62,10 +62,15 @@ An append or delivery wakes blocked readers only after successful publication.
 
 ## Access and mutation
 
-The ordered directory retains page identities, links and counts, without
-message, consumer or PEL payloads. Record lookup binary-searches page boundaries
-through admitted page reads. Request-local page ownership stays on the key's
-worker; loaders revalidate logical identity and retry physical relocation.
+The ordered directory retains page identities, links, counts, and bounded
+per-page maximum routing keys, without message, consumer or PEL payloads.
+The fixed Stream header is also cached with its immutable logical version.
+Writes publish routing bounds from changed pages; recovery restores them from
+checked inline pages, and an owner-worker read can learn a missing bound from
+an external or older page. Binary search compares resident bounds and reads a
+page only when a bound is unavailable or its capped prefix cannot decide the
+comparison. Request-local page ownership stays on the key's worker; loaders
+revalidate logical identity and retry physical relocation.
 
 | Operation | Storage access |
 |---|---|
@@ -90,12 +95,15 @@ as deletions. Storage validates the allowed mutation scope before publication.
 
 Sparse plans retain changed pages and necessary neighbours. Entire removed
 ranges use directory retirement metadata rather than copying their contents.
-Directory reconstruction and graph pin metadata still scale with page count;
+Directory reconstruction still scales with page count; a range reply's pin
+metadata scales with its selected page interval. Whole-object export pins the
+complete graph;
 a command changing many PEL rows retains its admitted mutation metadata until
 atomic publication. Consumer-filtered PEL operations scan the group's ID index,
 which has no separate persistent owner index.
 
-Range, XREAD and XREADGROUP replies pin the command-position graph and generate
+Range, XREAD and XREADGROUP replies pin the command-position root and selected
+pages, then generate
 message fields one page at a time as the network drains. EXEC retains that
 snapshot even if a later command replaces or deletes the key. XINFO FULL uses
 this same reader for its message array; its requested group/consumer/PEL

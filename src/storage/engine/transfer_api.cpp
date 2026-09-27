@@ -43,18 +43,24 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       std::string first_, last_;
       std::size_t first_page_ = 0, end_page_ = 0;
       std::uint64_t range_count_ = 0;
+      std::optional<LoadedOrderedGroup> probe_page_;
+      std::optional<MemoryReservation> probe_reservation_;
+      std::size_t probe_index_ = 0;
 
-      // Locate a logical rank with O(log pages) admitted probes. Interior page
-      // cardinalities come from the immutable directory, not payload scans.
+      // Resident maximum keys identify the candidate page. Unknown external
+      // boundaries are learned lazily; only the candidate page needs a full
+      // decode to locate the record within it.
       static Task<absl::StatusOr<std::pair<std::size_t, std::uint64_t>>> Bound(
           Impl* engine, Source& source, std::string_view key, bool upper) {
         const auto object = source.saved_.grouped_;
-        const auto& groups = object->ordered_directory().groups();
+        const auto& directory = object->ordered_directory();
+        const auto& groups = directory.groups();
         std::size_t lo = 0, hi = groups.size();
-        std::size_t index = groups.size(), offset = 0;
-        while (lo < hi) {
-          const auto mid = lo + (hi - lo) / 2;
-          const HashGroupId id{groups[mid].id_, 0};
+        auto load = [&](std::size_t index)
+            -> Task<absl::StatusOr<const LoadedOrderedGroup*>> {
+          if (source.probe_page_ && source.probe_index_ == index)
+            co_return &*source.probe_page_;
+          const HashGroupId id{groups[index].id_, 0};
           const auto* physical = object->FindGroup(id);
           if (!physical)
             co_return absl::DataLossError("missing Stream range page");
@@ -66,26 +72,49 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           if (!admission.ok()) co_return admission.status();
           auto page = co_await engine->LoadOrderedGroupSnapshot(
               *source.store_, *source.partition_, source.db_id_, source.key_,
-              source.digest_, object, id.prefix_, true);
+              source.digest_, object, id.prefix_);
           if (!page.ok()) co_return page.status();
-          const auto& entries = page->snapshot_.entries_;
-          std::size_t at = 0;
-          for (; at < entries.size(); ++at) {
-            auto entry_key = StreamRecordKey(entries[at].value_);
-            if (!entry_key.ok()) co_return entry_key.status();
-            if (upper ? *entry_key > key : *entry_key >= key) break;
+          auto max_key =
+              StreamRecordKey(page->snapshot_.entries_.back().value_);
+          if (!max_key.ok()) co_return max_key.status();
+          auto remembered = directory.RememberStreamPageMaxKey(index, *max_key);
+          if (!remembered.ok()) co_return remembered;
+          // Retain one admitted probe. Exact-ID ranges use the same page for
+          // both bounds and the eventual reply.
+          source.probe_page_.emplace(std::move(*page));
+          source.probe_reservation_.emplace(std::move(*admission));
+          source.probe_index_ = index;
+          co_return &*source.probe_page_;
+        };
+        while (lo < hi) {
+          const auto mid = lo + (hi - lo) / 2;
+          auto less = upper ? groups[mid].stream_max_key_.LessThanOrEqual(key)
+                            : groups[mid].stream_max_key_.LessThan(key);
+          if (!less) {
+            auto page = co_await load(mid);
+            if (!page.ok()) co_return page.status();
+            auto max_key =
+                StreamRecordKey((*page)->snapshot_.entries_.back().value_);
+            if (!max_key.ok()) co_return max_key.status();
+            less = upper ? *max_key <= key : *max_key < key;
           }
-          if (at == entries.size())
+          if (*less)
             lo = mid + 1;
-          else {
+          else
             hi = mid;
-            index = mid;
-            offset = at;
-          }
         }
-        std::uint64_t rank = offset;
-        for (std::size_t i = 0; i < index; ++i) rank += groups[i].item_count_;
-        co_return std::pair{index, rank};
+        if (lo == groups.size())
+          co_return std::pair{lo, directory.root().item_count_};
+        auto page = co_await load(lo);
+        if (!page.ok()) co_return page.status();
+        std::size_t at = 0;
+        for (const auto& entry : (*page)->snapshot_.entries_) {
+          auto entry_key = StreamRecordKey(entry.value_);
+          if (!entry_key.ok()) co_return entry_key.status();
+          if (upper ? *entry_key > key : *entry_key >= key) break;
+          ++at;
+        }
+        co_return std::pair{lo, directory.CountBefore(lo) + at};
       }
       bool done_ = false;
       bool reading_ = false;
@@ -192,10 +221,20 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           CollectionPage page{.value_type_ =
                                   source->saved_.location_.value_type()};
           if (object->is_ordered()) {
-            auto loaded = co_await engine->LoadOrderedGroupSnapshot(
-                *source->store_, *source->partition_, source->db_id_,
-                source->key_, source->digest_, object, id.prefix_, true);
-            if (!loaded.ok()) co_return loaded.status();
+            std::optional<LoadedOrderedGroup> loaded;
+            if (source->range_ && source->probe_page_ &&
+                source->probe_page_->snapshot_.id_ == id.prefix_) {
+              loaded.emplace(std::move(*source->probe_page_));
+              source->probe_page_.reset();
+              // The page/output reservation above now covers these bytes.
+              source->probe_reservation_.reset();
+            } else {
+              auto from_disk = co_await engine->LoadOrderedGroupSnapshot(
+                  *source->store_, *source->partition_, source->db_id_,
+                  source->key_, source->digest_, object, id.prefix_, true);
+              if (!from_disk.ok()) co_return from_disk.status();
+              loaded.emplace(std::move(*from_disk));
+            }
             const auto count = loaded->snapshot_.entries_.size();
             if (page.value_type_ == ValueType::kList ||
                 page.value_type_ == ValueType::kStream) {
@@ -370,29 +409,12 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       source->saved_.extents_ = ExtentsFor(store, *found);
       source->saved_.grouped_ = std::move(*object);
       source->charge_.Adopt(&*admission, budget);
-      auto prepared = PrepareGroupedSnapshotPins(&source->saved_);
-      if (!prepared.ok()) co_return prepared;
-      unlock.Unlock();
-      const auto pinned = co_await PinRdbSnapshotValue(&source->saved_);
-      if (!pinned.ok()) {
-        if (pinned.code() == absl::StatusCode::kAborted &&
-            !shutdown_flush_requested_) {
-          // GC may need this same owner to finish relocating the block. Release
-          // the failed snapshot and yield so neither GC nor pin cleanup
-          // starves.
-          source.reset();
-          co_await bycorf::Yield(*store.worker_);
-          continue;
-        }
-        co_return pinned;
-      }
-      if (!source->Valid(*this))
-        co_return absl::CancelledError(
-            "collection transfer population changed");
-      if (!source->saved_.grouped_->is_ordered())
-        source->hash_cursor_ =
-            source->saved_.grouped_->directory().groups().begin();
+      // An ordinary collection transfer can stream every page, so it pins the
+      // complete graph. Stream range reads establish their page interval
+      // first, then pin exactly that interval plus the root. Boundary probes
+      // use relocating reads until the selected physical identities are held.
       if (source->range_) {
+        unlock.Unlock();
         const auto& range = *source->range_;
         const auto make_key = [](const std::array<std::uint64_t, 2>& id) {
           std::string key(1, '\1');
@@ -423,6 +445,33 @@ StorageEngine::Impl::ReadValueForTransferLocked(
                                             range.selected_ids_.size());
         }
       }
+      auto prepared = source->range_
+                          ? PrepareOrderedRangeSnapshotPins(
+                                &source->saved_, source->first_page_,
+                                source->range_count_ ? source->end_page_
+                                                     : source->first_page_)
+                          : PrepareGroupedSnapshotPins(&source->saved_);
+      if (!prepared.ok()) co_return prepared;
+      unlock.Unlock();
+      const auto pinned = co_await PinRdbSnapshotValue(&source->saved_);
+      if (!pinned.ok()) {
+        if (pinned.code() == absl::StatusCode::kAborted &&
+            !shutdown_flush_requested_) {
+          // GC may need this same owner to finish relocating the block. Release
+          // the failed snapshot and yield so neither GC nor pin cleanup
+          // starves.
+          source.reset();
+          co_await bycorf::Yield(*store.worker_);
+          continue;
+        }
+        co_return pinned;
+      }
+      if (!source->Valid(*this))
+        co_return absl::CancelledError(
+            "collection transfer population changed");
+      if (!source->saved_.grouped_->is_ordered())
+        source->hash_cursor_ =
+            source->saved_.grouped_->directory().groups().begin();
       TransferValue result;
       result.metadata_.logical_size_ =
           source->range_ ? source->range_count_ : location.logical_size_;

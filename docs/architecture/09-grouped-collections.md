@@ -91,7 +91,10 @@ the next unused page identifier. Page identifiers are not reused inside an
 incarnation. Rank metadata locates a page without keeping item values resident.
 Splits and removals publish changed neighbour links and retained retirement
 records together. Sorted Set directories also retain per-page minimum and
-maximum scores, but no member boundaries. Recovery checks the complete chain,
+maximum scores, but no member boundaries. Stream directories retain bounded
+per-page maximum routing keys and a fixed header with their logical version;
+unknown or ambiguous long-name boundaries fall back to checked page reads.
+These runtime-only bounds do not change the durable page format. Recovery checks the complete chain,
 rank totals, numeric score boundaries and every live extent checksum while
 retaining only routing metadata. Full-page decoding validates local item
 ordering; Sorted Set materialization also checks
@@ -128,7 +131,8 @@ tombstone/graph retirement path.
 
 Views share unchanged physical index pages across mutations. Hash routing
 nodes are persistent; the ordered rank directory owns admitted metadata
-vectors and reconstructs them for page-content or topology changes. Routing
+vectors. Local page replacements copy the vectors and update aggregate ranks;
+topology changes rebuild and validate the complete chain. Routing
 and physical-index node references, including final destruction, remain on
 the key owner. Cross-worker readers exchange physical identities or stream
 handles that route metadata access and cleanup back to that owner. Retained
@@ -136,8 +140,9 @@ directories, index pages, manifests, publication reservations, retirement
 receipts and snapshot pin lists participate in memory admission and accounting.
 Admission failures before root publication preserve the previous logical view.
 A handle retains metadata only: physical coordinates and allocation epochs are
-captured before suspension, and snapshot readers additionally pin the complete
-captured graph.
+captured before suspension. Whole-object snapshot readers pin the complete
+captured graph; Stream range readers pin the root and their selected page
+interval before emitting a reply.
 
 View population generations are scoped to one partition and logical database.
 Detaching that population advances its generation; resetting another partition

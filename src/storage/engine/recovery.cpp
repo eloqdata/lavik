@@ -17,6 +17,7 @@
 #include <tuple>
 
 #include "impl.h"
+#include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
 
@@ -806,6 +807,12 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                                     ? 0
                                     : decoded->entries_.back().score_,
               };
+              if (ordered_kind == OrderedCollectionKind::kStream &&
+                  !decoded->retired_) {
+                auto max_key = StreamRecordKey(decoded->entries_.back().value_);
+                if (!max_key.ok()) co_return max_key.status();
+                ordered_group->stream_max_key_.Set(*max_key);
+              }
             } else {
               auto decoded = DecodeHashGroup(encoded);
               if (!decoded.ok()) co_return decoded.status();
@@ -1415,6 +1422,7 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
       candidate.next_ = physical.ordered_group_->next_;
       candidate.min_score_ = physical.ordered_group_->min_score_;
       candidate.max_score_ = physical.ordered_group_->max_score_;
+      candidate.stream_max_key_ = physical.ordered_group_->stream_max_key_;
     }
     candidates.push_back(candidate);
   }

@@ -232,6 +232,23 @@ absl::Status ValidateOrderedGroupBoundary(const OrderedGroupSnapshot& left,
 // responsibility. record_token is caller-owned identity, never a pointer on
 // disk. Sorted Set and Stream ordering across pages must be checked using
 // ValidateOrderedGroupBoundary when their contents are read or recovered.
+// Stream routing keys are runtime-only metadata. The bounded prefix covers
+// message IDs exactly while arbitrarily long group/consumer names fall back
+// to a page read when their prefixes do not decide an ordering comparison.
+struct StreamPageMaxKey {
+  // A message or macro-node ID is one kind byte plus two complete uint64s.
+  static constexpr std::size_t kPrefixBytes = 17;
+  std::array<char, kPrefixBytes> prefix_{};
+  std::uint8_t size_ = 0;
+  bool exact_ = false;
+
+  void Set(std::string_view key) noexcept;
+  // A missing or truncated prefix returns nullopt when the page payload is
+  // needed to settle the comparison.
+  std::optional<bool> LessThan(std::string_view key) const noexcept;
+  std::optional<bool> LessThanOrEqual(std::string_view key) const noexcept;
+};
+
 struct RecoveredOrderedGroup {
   std::uint64_t incarnation_ = 0;
   std::uint64_t id_ = 0;
@@ -252,6 +269,9 @@ struct RecoveredOrderedGroup {
   // retained, so equal-score runs still require pagewise member comparisons.
   double min_score_ = 0;
   double max_score_ = 0;
+  // Populated from checked Stream pages, never from the durable page header.
+  // A fixed allocation makes retained-directory admission cover the cache.
+  mutable StreamPageMaxKey stream_max_key_{};
 };
 
 class OrderedGroupDirectory {
@@ -287,6 +307,9 @@ class OrderedGroupDirectory {
     std::uint64_t offset_;
   };
   std::optional<Position> FindRank(std::uint64_t rank) const noexcept;
+  // Number of records in pages preceding index; index may equal
+  // groups().size().
+  std::uint64_t CountBefore(std::size_t index) const noexcept;
   // Sorted Set only; score must not be NaN. Return the first page whose maximum
   // is >= score (or > score when exclusive), and the first page whose minimum
   // is > score (or >= score when exclusive), respectively. groups().size()
@@ -312,6 +335,17 @@ class OrderedGroupDirectory {
   const std::vector<RecoveredOrderedGroup>& retired_groups() const noexcept {
     return retired_;
   }
+  // Only the key-owning worker may learn missing boundaries from decoded
+  // pages. The page's immutable logical version is shared by pinned readers;
+  // no allocation or worker-spanning lock occurs after publication.
+  absl::Status RememberStreamPageMaxKey(std::size_t index,
+                                        std::string_view key) const;
+  std::string_view stream_header() const noexcept {
+    return has_stream_header_
+               ? std::string_view(stream_header_.data(), stream_header_.size())
+               : std::string_view{};
+  }
+  absl::Status RememberStreamHeader(std::string_view header) const;
   // Exact owned vector allocation bytes after recovery. The enclosing side
   // object must reserve/account these before publishing a retained directory;
   // this side-effect-free codec does not own a worker memory budget.
@@ -331,6 +365,8 @@ class OrderedGroupDirectory {
   std::vector<RecoveredOrderedGroup> retired_;
   std::vector<std::pair<std::uint64_t, std::size_t>> ids_;
   std::vector<std::uint64_t> ends_;
+  mutable std::array<char, 48> stream_header_{};
+  mutable bool has_stream_header_ = false;
   // The inline directory shares owner-local AVL nodes; those nodes account
   // their own allocations and must not be charged again by RetainedBytes().
   std::optional<HashGroupDirectory> members_;

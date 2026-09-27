@@ -19,6 +19,7 @@
 #include "impl.h"
 #include "lavik/storage/detail/grouped_scratch.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
+#include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
 namespace {
@@ -459,22 +460,27 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       continue;
     }
     const auto& page = plan.writes_[i];
-    candidates.push_back(
-        {.incarnation_ = plan.root_.incarnation_,
-         .id_ = page.id_,
-         .previous_ = page.previous_,
-         .next_ = page.next_,
-         .sequence_ = revision,
-         .lsn_ = revision,
-         .txid_ = tx->txid_,
-         .batch_txid_ = command_batch,
-         .item_count_ = group.location_.logical_size_,
-         .encoded_bytes_ = ordered_sizes[i],
-         .record_token_ = page.id_,
-         .retired_ = group.retired_,
-         .min_score_ = page.entries_.empty() ? 0 : page.entries_.front().score_,
-         .max_score_ =
-             page.entries_.empty() ? 0 : page.entries_.back().score_});
+    RecoveredOrderedGroup candidate{
+        .incarnation_ = plan.root_.incarnation_,
+        .id_ = page.id_,
+        .previous_ = page.previous_,
+        .next_ = page.next_,
+        .sequence_ = revision,
+        .lsn_ = revision,
+        .txid_ = tx->txid_,
+        .batch_txid_ = command_batch,
+        .item_count_ = group.location_.logical_size_,
+        .encoded_bytes_ = ordered_sizes[i],
+        .record_token_ = page.id_,
+        .retired_ = group.retired_,
+        .min_score_ = page.entries_.empty() ? 0 : page.entries_.front().score_,
+        .max_score_ = page.entries_.empty() ? 0 : page.entries_.back().score_};
+    if (plan.root_.kind_ == OrderedCollectionKind::kStream && !page.retired_) {
+      auto max_key = StreamRecordKey(page.entries_.back().value_);
+      if (!max_key.ok()) co_return max_key.status();
+      candidate.stream_max_key_.Set(*max_key);
+    }
+    candidates.push_back(std::move(candidate));
   }
   GroupedHashObject::PreparedHandle builder;
   GroupRecordWrite root_write{
@@ -514,6 +520,16 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
                                                               command_batch},
                            sequence, std::move(members));
         if (!directory.ok()) return directory.status();
+        if (plan.root_.kind_ == OrderedCollectionKind::kStream) {
+          for (const auto& page : plan.writes_) {
+            if (page.id_ != plan.root_.first_group_ || page.retired_) continue;
+            auto header = StreamRecordPayload(page.entries_.front().value_);
+            if (!header.ok()) return header.status();
+            auto remembered = directory->RememberStreamHeader(*header);
+            if (!remembered.ok()) return remembered;
+            break;
+          }
+        }
         auto prepared =
             previous ? GroupedHashObject::PrepareUpdateOrdered(
                            current, version, std::move(*directory), written)
