@@ -285,7 +285,6 @@ class RecordImage {
           .header_sequence_ = 1,
           .layout_worker_count_ = 1,
           .kind_ = tagged ? BlockKind::kTransaction : BlockKind::kRecords,
-          .tx_generation_ = tagged ? 1U : 0U,
       };
     }
     record.key_bytes_ = key.size();
@@ -1251,7 +1250,7 @@ TEST(GroupedRecoveryE2e, FailedOverwriteReleasesTaggedRootOnItsPhysicalOwner) {
     ASSERT_EQ(server.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "1"}),
               "+OK");
     EXPECT_EQ(server.Wait(true), 0) << server.Log();
-    EXPECT_EQ(server.Log().find("transaction generations did not quiesce"),
+    EXPECT_EQ(server.Log().find("transaction blocks did not quiesce"),
               std::string::npos)
         << server.Log();
   }

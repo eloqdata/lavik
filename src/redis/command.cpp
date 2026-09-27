@@ -4892,8 +4892,6 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
     info += "tx_cleaner_rounds:" + std::to_string(tx_cleaner.rounds_) + "\r\n";
     info +=
         "tx_cleaner_failures:" + std::to_string(tx_cleaner.failures_) + "\r\n";
-    info += "tx_cleaner_retired_generations:" +
-            std::to_string(tx_cleaner.retired_generations_) + "\r\n";
     info += "tx_cleaner_retired_blocks:" +
             std::to_string(tx_cleaner.retired_blocks_) + "\r\n";
     info +=

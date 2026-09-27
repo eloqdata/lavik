@@ -927,7 +927,7 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       }
       // Commit decisions are not key-index locations, so they have no packed
       // runtime type state to construct. Keep them in place until every
-      // tagged winner in the generation has a durable untagged copy.
+      // tagged winner needing this decision has a durable untagged copy.
       record_offset += record.total_disk_bytes_;
       continue;
     }
@@ -971,7 +971,7 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
           !committed_txids->contains(record.group_batch_txid_)))) {
       // No complete durable decision: never turn this record into an
       // unconditional txid-zero recovery winner. Rollback/accounting will make
-      // it dead; if it is still charged, the generation remains unreclaimable.
+      // it dead; if it is still charged, the Tx block remains unreclaimable.
       record_offset += record.total_disk_bytes_;
       continue;
     }

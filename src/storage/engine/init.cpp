@@ -1054,10 +1054,10 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryLiveReferenceBatches(
           const auto tx_block =
               owner_store.tx_blocks_.find(reference.block_id_);
           if (tx_block != owner_store.tx_blocks_.end()) {
-            NoteTxRecordLocal(
-                owner_store, reference.block_id_, reference.allocation_epoch_,
-                tx_block->second.generation_, reference.txid_, reference.bytes_,
-                false, nullptr, 0, reference.batch_txid_);
+            NoteTxRecordLocal(owner_store, reference.block_id_,
+                              reference.allocation_epoch_, reference.txid_,
+                              reference.bytes_, false, nullptr, 0,
+                              reference.batch_txid_);
           }
         }
       }

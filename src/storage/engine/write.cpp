@@ -569,7 +569,7 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   // durable: recovery treats "commit without data" as impossible, and
   // "data without commit" as an aborted transaction.
   auto retirements = std::make_unique<std::vector<RetiredRecord>>();
-  TxShardWrites* generation_receipt = nullptr;
+  TxShardWrites* commit_receipt = nullptr;
   for (TxShardWrites* shard : shards) {
     if (shard == nullptr) {
       continue;
@@ -580,12 +580,7 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
       co_return absl::FailedPreconditionError(
           "grouped transaction was abandoned");
     }
-    if (generation_receipt == nullptr) {
-      generation_receipt = shard;
-    } else if (shard->generation_ != generation_receipt->generation_) {
-      co_return absl::InvalidArgumentError(
-          "transaction shards span multiple generations");
-    }
+    if (commit_receipt == nullptr) commit_receipt = shard;
     for (const TxShardWrites::Fence& fence : shard->fences_) {
       absl::Status durable =
           co_await AwaitRelocationDurable(RelocationDurabilityFence{
@@ -629,7 +624,7 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
       store, 0, {}, {}, RecordKind::kTxCommit, ValueType::kNone, 0,
       ComputeDigest({}), txid, 0, false, true, false, false,
       std::numeric_limits<std::uint64_t>::max(), nullptr, &commit_location,
-      nullptr, generation_receipt, std::move(retirements));
+      nullptr, commit_receipt, std::move(retirements));
   if (!written.ok()) {
     co_return written;
   }
@@ -1546,7 +1541,7 @@ StorageEngine::Impl::WriteExtentValueLocked(
       // bypass the configured storage pool with an unbounded 8 MiB heap
       // allocation. Active append streams retain their buffers even after a
       // flush; seal them before waiting so capacity can actually be returned.
-      // A live transaction generation may reopen its stream afterwards.
+      // A live transaction may open a new Tx stream after this seal.
       SealActiveBlocks(store);
       store.store_state_mutex_.Unlock(*store.worker_);
       co_await store.buffers_.WaitForWriteBuffer();
@@ -2368,7 +2363,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   if ((txid != 0 && (tx == nullptr || for_defrag)) ||
       (kind == RecordKind::kTxCommit && txid == 0)) {
     co_return absl::InvalidArgumentError(
-        "tagged records require a live transaction generation");
+        "tagged records require a live transaction receipt");
   }
   if ((kind == RecordKind::kValue && value_type == ValueType::kNone) ||
       (kind == RecordKind::kTombstone &&
@@ -2442,14 +2437,12 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
           : (partition_ptr == nullptr ? nullptr
                                       : &partition_ptr->indexes_[db_id]);
   const bool transaction_append = txid != 0;
-  const std::uint64_t tx_generation =
-      transaction_append && tx != nullptr ? tx->generation_ : 0;
-  if (transaction_append && tx_generation == 0) {
+  if (transaction_append && (tx == nullptr || !tx->transaction_lease_)) {
     co_return absl::InvalidArgumentError(
-        "transaction record has no generation lease");
+        "transaction record has no writer lease");
   }
   // Several acknowledged segment batches can still await their decisions.
-  // Reserve direct-I/O pages for all local generation leases, not just the
+  // Reserve direct-I/O pages for outstanding transaction leases, not just the
   // current command: flushing a decision consumes the remainder of its page.
   // Include an extra nested/outer pair for a borrowed cross-worker receipt.
   // Recompute after waits, when another writer may have acquired a lease.
@@ -2457,11 +2450,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     if (!transaction_append || group == nullptr ||
         value_type != ValueType::kString)
       return kStorageBlockBytes;
-    const auto runtime = store.tx_generations_.find(tx_generation);
-    const auto leases = runtime == store.tx_generations_.end()
-                            ? 0
-                            : runtime->second->active_transactions_.load(
-                                  std::memory_order_acquire);
+    const auto leases = active_tx_leases_.load(std::memory_order_acquire);
     const auto pages = std::min<std::uint64_t>(
         leases + 1, kStorageBlockBytes / (2 * kDirectIoAlignment));
     return kStorageBlockBytes - pages * 2 * kDirectIoAlignment;
@@ -2482,23 +2471,17 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         co_await store.store_state_mutex_.Lock();
         if (!paused.ok()) co_return paused;
       });
-  // Never keep a flat_hash_map value reference across an await that can
-  // release store_state_mutex_. Another transaction may install a different
-  // generation and rehash active_tx_blocks_ while block allocation is in
-  // flight. Re-resolve the entry on every use; active_block_ itself is stable.
+  // Re-resolve the active stream after allocation waits; another writer may
+  // have installed a successor while store_state_mutex_ was released.
   auto active_stream = [&]() -> std::optional<ActiveBlock>& {
     if (indirect_key_record) return store.active_indirect_key_block_;
-    return transaction_append ? store.active_tx_blocks_[tx_generation]
-                              : store.active_block_;
+    return transaction_append ? store.active_tx_block_ : store.active_block_;
   };
   AsyncMutex* allocation_mutex = indirect_key_record
                                      ? &store.indirect_key_allocation_mutex_
                                      : &store.active_block_allocation_mutex_;
-  if (transaction_append) {
-    auto& gate = store.active_tx_block_allocation_mutexes_[tx_generation];
-    if (gate == nullptr) gate = std::make_unique<AsyncMutex>();
-    allocation_mutex = gate.get();
-  }
+  if (transaction_append)
+    allocation_mutex = &store.active_tx_block_allocation_mutex_;
   // Return paths normally run on the allocator owner. Never make unrelated
   // appends wait on that cross-core hop: the per-stream allocation gate keeps
   // other allocators out while store_state_mutex_ is released, and every
@@ -2536,7 +2519,7 @@ acquire_active_stream:
     // Waiting for a physical block must not hold store_state_mutex_: the
     // allocator, flush completion, and the elected writer may all need this
     // worker's state before the new stream can be published. The gate is per
-    // append stream, so unrelated transaction generations remain concurrent.
+    // append stream, so ordinary and transaction allocation remain concurrent.
     std::optional<UnlockGuard> allocation_unlock;
     if (unlock_writer_while_waiting) {
       store.store_state_mutex_.Unlock(*store.worker_);
@@ -2591,7 +2574,7 @@ acquire_active_stream:
       active_stream().reset();
       if (transaction_append) {
         // A full Tx block can be considered for promotion as soon as its
-        // writers settle; do not wait for the periodic rotation cooldown.
+        // writers settle; do not wait for the periodic cleaner cooldown.
         tx_cleaner_dirty_.store(true, std::memory_order_release);
         tx_cleaner_next_run_ms_.store(0, std::memory_order_release);
       }
@@ -2612,11 +2595,10 @@ acquire_active_stream:
           }
         } else {
           do {
-            // Several live transaction generations can occupy every staging
-            // buffer. Their leases may be held by commits queued behind this
-            // writer, so waiting for generation retirement would deadlock.
-            // Sealing only ends physical append streams; tagged records and
-            // generation leases remain valid, and flush returns their buffers.
+            // Active append streams can occupy every staging buffer.
+            // Transactions waiting to commit may still need a buffer, so seal
+            // the streams before waiting. Tagged records and transaction leases
+            // survive the seal, and flush returns their buffers.
             SealActiveBlocks(store);
             store.store_state_mutex_.Unlock(*store.worker_);
             co_await store.buffers_.WaitForWriteBuffer();
@@ -2672,7 +2654,6 @@ acquire_active_stream:
           .heap_buffer_ = heap_buffer,
           .heap_buffer_size_ = options_.buffers_.write_buffer_bytes_,
           .kind_ = append_block_kind,
-          .tx_generation_ = tx_generation,
       };
       if (!transaction_append && !indirect_key_record) {
         store.standby_prefetch_for_block_.reset();
@@ -2694,7 +2675,6 @@ acquire_active_stream:
         store.tx_blocks_.insert_or_assign(
             block_id, WorkerStore::TxBlockRuntime{
                           .allocation_epoch_ = allocated->allocation_epoch_,
-                          .generation_ = tx_generation,
                           .txids_ = {},
                           .commit_txids_ = {},
                       });
@@ -3174,8 +3154,8 @@ acquire_active_stream:
           expire_at_ms != 0, grouped_root));
   if (transaction_append) {
     NoteTxRecordLocal(
-        store, updated.block_id_, updated.allocation_epoch_, tx_generation,
-        txid, location.total_disk_bytes(), kind == RecordKind::kTxCommit, tx,
+        store, updated.block_id_, updated.allocation_epoch_, txid,
+        location.total_disk_bytes(), kind == RecordKind::kTxCommit, tx,
         kind == RecordKind::kTxCommit
             ? static_cast<std::uint32_t>(location.record_offset() +
                                          location.total_disk_bytes())
@@ -3484,11 +3464,9 @@ void StorageEngine::Impl::SealActiveBlocks(WorkerStore& store) {
   };
   seal(store.active_block_);
   seal(store.active_indirect_key_block_);
-  for (auto& [generation, active] : store.active_tx_blocks_) {
-    (void)generation;
-    if (active.has_value()) NoteTxBlockSealedLocal(store, active->block_id_);
-    seal(active);
-  }
+  if (store.active_tx_block_)
+    NoteTxBlockSealedLocal(store, store.active_tx_block_->block_id_);
+  seal(store.active_tx_block_);
 }
 
 void StorageEngine::Impl::FlushActiveBlock(WorkerStore& store) {
@@ -3499,10 +3477,7 @@ void StorageEngine::Impl::FlushActiveBlock(WorkerStore& store) {
   };
   flush(store.active_block_);
   flush(store.active_indirect_key_block_);
-  for (const auto& [generation, active] : store.active_tx_blocks_) {
-    (void)generation;
-    flush(active);
-  }
+  flush(store.active_tx_block_);
 }
 
 void StorageEngine::Impl::SealDeadActiveBlock(WorkerStore& store) {

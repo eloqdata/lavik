@@ -924,7 +924,7 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
     } while (std::chrono::steady_clock::now() < deadline);
     const auto cleaner = storage_->TxCleanerStats();
     co_return absl::FailedPreconditionError(
-        "snapshot-pinned transaction generation did not retire: previous=" +
+        "snapshot-pinned transaction block did not retire: previous=" +
         std::to_string(previous) +
         " retired_blocks=" + std::to_string(cleaner.retired_blocks_) +
         " failures=" + std::to_string(cleaner.failures_));
@@ -947,8 +947,8 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
     std::optional<std::uint64_t> first_retained;
 
     for (unsigned round = 0; round < 2; ++round) {
-      // Keep the old value and aborted candidate in one transaction generation.
-      // A later cleaner round cannot retire that generation while the old
+      // Keep the old value and aborted candidate in one transaction block.
+      // A later cleaner round cannot retire that block while the old
       // snapshot pins its blocks, so candidate cleanup cannot masquerade as
       // reclamation caused by releasing the pin.
       Check(storage_->ConfigureTxCleanerCooldown(0).ok(),

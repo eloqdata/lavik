@@ -350,7 +350,7 @@ class CheckpointWriteSlot {
             static_cast<std::uint32_t>(state_->payload_bytes_),
         .extent_payload_checksum_ = Crc32c(payload),
         .reserved_runtime_ = {},
-        .tx_generation_ = generation,
+        .checkpoint_generation_ = generation,
     };
     std::fill_n(data, kBlockHeaderBytes, std::byte{0});
     EncodeBlockHeader(header, std::span<std::byte, kBlockHeaderSlotBytes>(
@@ -497,7 +497,7 @@ absl::StatusOr<CheckpointChunkHeader> ValidateCheckpointChunk(
       reread.block_id_ != block_id ||
       reread.allocation_epoch_ != block.allocation_epoch_ ||
       reread.kind_ != BlockKind::kCheckpointIndex ||
-      reread.tx_generation_ != generation ||
+      reread.checkpoint_generation_ != generation ||
       reread.layout_worker_count_ != worker_count ||
       reread.extent_index_ != block.extent_index_ ||
       reread.extent_payload_bytes_ != block.extent_payload_bytes_ ||
@@ -661,7 +661,7 @@ class CheckpointPrefetchSlot {
                                   &header) ||
           header.block_id_ != block_id_ ||
           header.kind_ != BlockKind::kCheckpointIndex ||
-          header.tx_generation_ != generation_ ||
+          header.checkpoint_generation_ != generation_ ||
           header.layout_worker_count_ != worker_count_) {
         // The discovery bitmap can retain blocks from an interrupted
         // generation. Do not spend a full-block read on a non-matching header.

@@ -263,7 +263,7 @@ struct RecordLocationCore {
   // any overwrite resets it, exempting concurrently-touched keys.
   bool unclaimed() const noexcept { return metadata_.unclaimed(); }
   // The on-disk record carries a nonzero transaction id. Retirement uses the
-  // bit to remove its bytes from transaction-generation accounting; the
+  // bit to remove its bytes from transaction-block accounting; the
   // 32-byte index core deliberately does not retain the full txid.
   bool tx_tagged() const noexcept { return metadata_.tx_tagged(); }
   bool has_expiry() const noexcept { return metadata_.has_expiry(); }

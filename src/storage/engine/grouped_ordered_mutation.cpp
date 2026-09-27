@@ -149,8 +149,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   if (outer_transaction) {
     batch.txid_ = tx::TxRuntime::Get()->next_txid_.fetch_add(
         1, std::memory_order_relaxed);
-    batch.generation_ = tx->generation_;
-    batch.generation_lease_ = tx->generation_lease_;
+    batch.transaction_lease_ = tx->transaction_lease_;
     if (tx->grouped_ingest_batch_ == nullptr) {
       // The child commit may live on another worker from the outer decision.
       // A distinct decision forces its own durable fence without marking the

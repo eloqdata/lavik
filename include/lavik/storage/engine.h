@@ -68,7 +68,7 @@ struct StorageEngineOptions {
   bool shutdown_checkpoint_ = false;
   // Maximum partial-block age before periodic flushing requests submission.
   std::uint32_t flush_max_ms_ = 100;
-  // Minimum delay between transaction-generation rotations/cleaning rounds.
+  // Minimum delay between transaction cleaner rounds.
   // Zero disables the cleaner; it can be changed at runtime through CONFIG.
   std::uint32_t tx_cleaner_cooldown_ms_ = 60'000;
   // Soft admission threshold for occupied bytes in sealed, unreclaimed
@@ -246,7 +246,6 @@ struct TombRaiderTotals {
 struct TxCleanerTotals {
   std::uint64_t rounds_ = 0;
   std::uint64_t failures_ = 0;
-  std::uint64_t retired_generations_ = 0;
   std::uint64_t retired_blocks_ = 0;
   std::uint32_t cooldown_ms_ = 0;
   std::uint64_t backlog_limit_bytes_ = 0;
@@ -1096,11 +1095,9 @@ struct TxShardWrites {
   };
   std::vector<IndirectKeyCache> indirect_keys_;
   std::uint64_t txid_ = 0;  // input: stamped into every record written
-  // All shards of one transaction share the same generation and lease. The
-  // opaque lease keeps that generation open until the last shard receipt is
-  // destroyed after commit or rollback processing.
-  std::uint64_t generation_ = 0;
-  std::shared_ptr<void> generation_lease_;
+  // All shards share one lease. A Tx block may be cleaned only after the last
+  // receipt is destroyed, so no participant can append another record.
+  std::shared_ptr<void> transaction_lease_;
   // Client transactions carry the same final mutation check on every shard.
   // It is deliberately not consulted for the later durability-only commit
   // record: each keyspace publication already linearized under this check.
@@ -1813,7 +1810,7 @@ class StorageEngine {
   static std::uint64_t AllocateWriteTxid() noexcept;
 
   // Binds every shard receipt of one storage transaction to the current
-  // transaction generation and holds one shared generation lease.
+  // transaction and gives every shard one shared lease.
   void InitializeTxWrites(
       std::uint64_t txid, std::span<TxShardWrites> writes,
       MutationPrecondition mutation_precondition = MutationPrecondition{});
@@ -1909,7 +1906,7 @@ class StorageEngine {
   // current new-transaction admission threshold.
   bool TxBacklogAtLimit() const noexcept;
   // Wait before beginning a new storage transaction, without holding a key
-  // intent or generation lease. Existing transactions never wait here.
+  // intent or transaction lease. Existing transactions never wait here.
   bycorf::Task<absl::Status> WaitForTxBacklog();
   bycorf::Task<StorageDurabilityStats> DurabilityStats() const;
   bycorf::Task<StorageMetricsSnapshot> CollectMetrics() const;
@@ -1921,7 +1918,6 @@ class StorageEngine {
 
  private:
   friend class ExpirationAuthorityTestPeer;
-  friend class WriteBufferPressureTestPeer;
   class Impl;
   std::unique_ptr<Impl> impl_;
 };

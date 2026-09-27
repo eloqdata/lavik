@@ -582,21 +582,21 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
 
   BlockHeader transaction_header = header;
   transaction_header.kind_ = BlockKind::kTransaction;
-  transaction_header.tx_generation_ = 17;
+  transaction_header.checkpoint_generation_ = 0;
   transaction_header.record_count_ = 3;
   transaction_header.committed_bytes_ = kBlockHeaderBytes + 3 * 120;
   EncodeBlockHeader(transaction_header, block_page);
   ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
   EXPECT_EQ(decoded_header.kind_, BlockKind::kTransaction);
-  EXPECT_EQ(decoded_header.tx_generation_, 17);
+  EXPECT_EQ(decoded_header.checkpoint_generation_, 0);
 
-  transaction_header.tx_generation_ = 0;
+  transaction_header.checkpoint_generation_ = 17;
   EncodeBlockHeader(transaction_header, block_page);
   EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_header));
 
   BlockHeader checkpoint_header = header;
   checkpoint_header.kind_ = BlockKind::kCheckpointIndex;
-  checkpoint_header.tx_generation_ = 23;
+  checkpoint_header.checkpoint_generation_ = 23;
   checkpoint_header.extent_index_ = 2;
   checkpoint_header.extent_payload_bytes_ = 4096;
   checkpoint_header.extent_payload_checksum_ = 0x87654321U;
@@ -605,7 +605,7 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   EncodeBlockHeader(checkpoint_header, block_page);
   ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
   EXPECT_EQ(decoded_header.kind_, BlockKind::kCheckpointIndex);
-  EXPECT_EQ(decoded_header.tx_generation_, 23);
+  EXPECT_EQ(decoded_header.checkpoint_generation_, 23);
   BlockHeader export_header = header;
   export_header.kind_ = BlockKind::kRedisExportBacklog;
   export_header.record_count_ = 2;
@@ -613,11 +613,11 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   EncodeBlockHeader(export_header, block_page);
   ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
   EXPECT_EQ(decoded_header.kind_, BlockKind::kRedisExportBacklog);
-  export_header.tx_generation_ = 17;
+  export_header.checkpoint_generation_ = 17;
   EncodeBlockHeader(export_header, block_page);
   EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_header));
   BlockHeader records_with_generation = header;
-  records_with_generation.tx_generation_ = 17;
+  records_with_generation.checkpoint_generation_ = 17;
   EncodeBlockHeader(records_with_generation, block_page);
   EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_header));
 

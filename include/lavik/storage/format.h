@@ -235,7 +235,7 @@ enum class BlockKind : std::uint8_t {
   // Packed UUID -> original key records. A separate append/cleaning stream
   // keeps their lifetime independent of user records and transaction GC.
   kIndirectKeys = 3,
-  // Short-lived transaction generation: tagged keyed records and their
+  // Short-lived transaction block: tagged keyed records and their
   // TxCommit decisions share this block class until the cleaner promotes the
   // committed winners to ordinary kRecords blocks with txid zero.
   kTransaction = 4,
@@ -308,9 +308,8 @@ struct BlockHeader {
   std::uint32_t extent_payload_bytes_ = 0;
   std::uint32_t extent_payload_checksum_ = 0;
   std::array<std::uint64_t, 3> reserved_runtime_{};
-  // Nonzero for kTransaction and kCheckpointIndex. For checkpoint blocks it
-  // identifies the metadata generation that may make them live.
-  std::uint64_t tx_generation_ = 0;
+  // Only checkpoint blocks carry a metadata generation here.
+  std::uint64_t checkpoint_generation_ = 0;
 };
 
 // A logical replication event may span multiple frames and blocks. Every

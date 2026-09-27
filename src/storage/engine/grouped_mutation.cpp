@@ -164,7 +164,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
         for (const auto& entry : page.value_.entries_)
           append_bytes += entry.field_.size() + entry.value_.size() + 64;
     }
-    // No generation lease may be held while asking the cleaner to make room.
+    // No transaction lease may be held while asking the cleaner to make room.
     // The population checks below also cover GC during this unlocked wait.
     store.store_state_mutex_.Unlock(*store.worker_);
     absl::Status space;
@@ -219,8 +219,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   if (outer_transaction) {
     batch.txid_ = tx::TxRuntime::Get()->next_txid_.fetch_add(
         1, std::memory_order_relaxed);
-    batch.generation_ = tx->generation_;
-    batch.generation_lease_ = tx->generation_lease_;
+    batch.transaction_lease_ = tx->transaction_lease_;
     if (tx->grouped_ingest_batch_ == nullptr) {
       // The child commit may live on another worker from the outer decision.
       // A distinct decision forces its own durable fence without marking the

@@ -65,6 +65,11 @@ class RespClient {
   }
 
   std::string Command(const std::vector<std::string_view>& args) {
+    last_command_ = args.empty() ? "empty" : std::string(args.front());
+    if (args.size() > 1) {
+      last_command_ += " ";
+      last_command_ += args[1];
+    }
     std::string request = "*" + std::to_string(args.size()) + "\r\n";
     for (std::string_view arg : args) {
       request += "$" + std::to_string(arg.size()) + "\r\n";
@@ -177,7 +182,8 @@ class RespClient {
       const ssize_t received = ::recv(fd_, output, size, 0);
       if (received < 0) {
         if (errno == EINTR) continue;
-        Fail("recv failed: " + std::string(std::strerror(errno)));
+        Fail("recv failed for " + last_command_ + ": " +
+             std::string(std::strerror(errno)));
       }
       if (received == 0) Fail("server closed the connection");
       output += received;
@@ -198,6 +204,7 @@ class RespClient {
   }
 
   int fd_ = -1;
+  std::string last_command_;
 };
 
 std::uint16_t FindFreePort() {
@@ -446,8 +453,8 @@ std::uint64_t InfoStat(RespClient& client, std::string_view marker) {
   return InfoUnsigned(client, "STATS", marker);
 }
 
-std::uint64_t TxCleanerRetiredGenerations(RespClient& client) {
-  return InfoStat(client, "tx_cleaner_retired_generations:");
+std::uint64_t TxCleanerRetiredBlocks(RespClient& client) {
+  return InfoStat(client, "tx_cleaner_retired_blocks:");
 }
 
 bool WaitForCleanerStat(RespClient& client, std::string_view marker,
@@ -472,9 +479,8 @@ bool WaitForInfoStat(RespClient& client, std::string_view marker,
   return false;
 }
 
-bool WaitForCleanerRetirement(RespClient& client, std::uint64_t baseline) {
-  return WaitForCleanerStat(client,
-                            "tx_cleaner_retired_generations:", baseline);
+bool WaitForCleanerBlockRetirement(RespClient& client, std::uint64_t baseline) {
+  return WaitForCleanerStat(client, "tx_cleaner_retired_blocks:", baseline);
 }
 
 }  // namespace
@@ -973,7 +979,7 @@ int main(int argc, char** argv) {
       }
     }
 
-    // Transaction generations are rotated and cleaned by whichever periodic
+    // Transaction blocks are sealed and cleaned by whichever periodic
     // worker wins the process-wide guard. Wait for an observed retirement so
     // this verifies the cleaner itself rather than merely sleeping.
     Expect(client.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
@@ -992,13 +998,13 @@ int main(int argc, char** argv) {
     Expect(client.Command(
                {"CONFIG", "SET", "tx-backlog-limit-mb-per-worker", "8"}),
            "+OK", "set minimum transaction backlog threshold");
-    const std::uint64_t cleaner_baseline = TxCleanerRetiredGenerations(client);
+    const std::uint64_t cleaner_baseline = TxCleanerRetiredBlocks(client);
     Expect(
         client.Command({"MSET", "cleaner-a", "after-a", "cleaner-b", "after-b",
                         "cleaner-c", "after-c", "cleaner-d", "after-d"}),
         "+OK", "tx cleaner seed");
-    if (!WaitForCleanerRetirement(client, cleaner_baseline)) {
-      Fail("transaction cleaner did not retire a generation");
+    if (!WaitForCleanerBlockRetirement(client, cleaner_baseline)) {
+      Fail("transaction cleaner did not retire a transaction block");
     }
     Expect(client.Command(
                {"MGET", "cleaner-d", "cleaner-a", "cleaner-c", "cleaner-b"}),
@@ -1010,7 +1016,7 @@ int main(int argc, char** argv) {
                            "{disk-batch}d", "batch-d"}),
            "+OK", "same-shard disk batch seed");
 
-    // Leave one committed tagged generation for the shutdown-only cleaner.
+    // Leave one committed tagged block for the shutdown-only cleaner.
     // Its promoted ordinary records are appended after the first storage
     // freeze, so loading them from the checkpoint after restart specifically
     // exercises the required second seal-and-drain round.
@@ -1087,60 +1093,59 @@ int main(int argc, char** argv) {
            "+OK", "disable tx cleaner before recovery fixture");
     Expect(recovered.Command({"MSET", "cleaner-recovery-a", "disk-a",
                               "cleaner-recovery-b", "disk-b"}),
-           "+OK", "persist a closed generation for recovery");
+           "+OK", "persist a sealed transaction block for recovery");
     recovered_server.Stop();
 
-    ServerProcess generation_recovery_server(argv[1], port, data_path,
-                                             log_path);
-    RespClient generation_recovery = ConnectReady(port);
+    ServerProcess block_recovery_server(argv[1], port, data_path, log_path);
+    RespClient block_recovery = ConnectReady(port);
     const std::uint64_t recovered_cleaner_baseline =
-        TxCleanerRetiredGenerations(generation_recovery);
-    Expect(generation_recovery.Command(
+        TxCleanerRetiredBlocks(block_recovery);
+    Expect(block_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
-           "+OK", "enable tx cleaner after generation recovery");
-    if (!WaitForCleanerRetirement(generation_recovery,
-                                  recovered_cleaner_baseline)) {
-      Fail("recovered transaction generation was not retired");
+           "+OK", "enable tx cleaner after block recovery");
+    if (!WaitForCleanerBlockRetirement(block_recovery,
+                                       recovered_cleaner_baseline)) {
+      Fail("recovered transaction block was not retired");
     }
-    Expect(generation_recovery.Command(
+    Expect(block_recovery.Command(
                {"MGET", "cleaner-recovery-a", "cleaner-recovery-b"}),
            "*2\r\n" + Bulk("disk-a") + "\r\n" + Bulk("disk-b"),
-           "recovered generation values after retirement");
+           "recovered transaction values after retirement");
 
     // FLUSHDB invalidates tagged winners by advancing the database epoch.
     // The cleaner must not promote them into the new epoch; detached-index
     // reclaim instead drops their tagged-byte accounting so the complete
-    // transaction generation can still be retired.
-    Expect(generation_recovery.Command(
+    // transaction block can still be retired.
+    Expect(block_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
            "+OK", "disable tx cleaner before FLUSHDB fixture");
-    Expect(generation_recovery.Command({"MSET", "cleaner-flush-a", "old-a",
-                                        "cleaner-flush-b", "old-b"}),
+    Expect(block_recovery.Command({"MSET", "cleaner-flush-a", "old-a",
+                                   "cleaner-flush-b", "old-b"}),
            "+OK", "persist tagged values before FLUSHDB");
-    Expect(generation_recovery.Command({"FLUSHDB", "SYNC"}), "+OK",
-           "flush tagged transaction generation");
+    Expect(block_recovery.Command({"FLUSHDB", "SYNC"}), "+OK",
+           "flush tagged transaction block");
     const std::uint64_t flushed_cleaner_baseline =
-        TxCleanerRetiredGenerations(generation_recovery);
-    Expect(generation_recovery.Command(
+        TxCleanerRetiredBlocks(block_recovery);
+    Expect(block_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "enable tx cleaner after FLUSHDB");
-    if (!WaitForCleanerRetirement(generation_recovery,
-                                  flushed_cleaner_baseline)) {
-      Fail("FLUSHDB-invalidated transaction generation was not retired");
+    if (!WaitForCleanerBlockRetirement(block_recovery,
+                                       flushed_cleaner_baseline)) {
+      Fail("FLUSHDB-invalidated transaction block was not retired");
     }
-    Expect(generation_recovery.Command(
+    Expect(block_recovery.Command(
                {"EXISTS", "cleaner-flush-a", "cleaner-flush-b"}),
-           ":0", "FLUSHDB values after transaction generation retirement");
+           ":0", "FLUSHDB values after transaction block retirement");
     // One admitted transaction can cross the 8 MiB backlog threshold. Its
     // sealed blocks must become reclaimable after commit; the next transaction
     // waits before taking any key intent, even though its tail is still open.
-    Expect(generation_recovery.Command(
+    Expect(block_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "60000"}),
            "+OK", "hold periodic cleaning during backlog admission fixture");
     const std::uint64_t block_baseline =
-        InfoStat(generation_recovery, "tx_cleaner_retired_blocks:");
+        InfoStat(block_recovery, "tx_cleaner_retired_blocks:");
     const std::uint64_t wait_baseline =
-        InfoStat(generation_recovery, "tx_backlog_waits:");
+        InfoStat(block_recovery, "tx_backlog_waits:");
     std::string large_value(1024 * 1024, 'q');
     std::vector<std::string> pressure_keys;
     std::vector<std::string_view> pressure_args{"MSET"};
@@ -1151,22 +1156,22 @@ int main(int argc, char** argv) {
       pressure_args.push_back(pressure_keys.back());
       pressure_args.push_back(large_value);
     }
-    Expect(generation_recovery.Command(pressure_args), "+OK",
+    Expect(block_recovery.Command(pressure_args), "+OK",
            "single transaction may exceed the backlog threshold");
-    Expect(generation_recovery.Command({"MSET", "{tx-pressure}next", "next",
-                                        "{tx-pressure}last", "last"}),
+    Expect(block_recovery.Command({"MSET", "{tx-pressure}next", "next",
+                                   "{tx-pressure}last", "last"}),
            "+OK", "new transaction waits for sealed block cleanup");
-    if (InfoStat(generation_recovery, "tx_backlog_waits:") <= wait_baseline)
+    if (InfoStat(block_recovery, "tx_backlog_waits:") <= wait_baseline)
       Fail("new transaction skipped the exceeded backlog admission threshold");
-    if (!WaitForCleanerStat(generation_recovery,
+    if (!WaitForCleanerStat(block_recovery,
                             "tx_cleaner_retired_blocks:", block_baseline))
       Fail("sealed committed transaction block was not reclaimed");
-    Expect(generation_recovery.Command({"GET", pressure_keys.front()}),
+    Expect(block_recovery.Command({"GET", pressure_keys.front()}),
            Bulk(large_value), "large transaction survives block promotion");
-    generation_recovery_server.Stop();
+    block_recovery_server.Stop();
 
 #if LAVIK_TEST_FAULTS_AVAILABLE
-    // A failed transaction keeps its generation lease through rollback. Once
+    // A failed transaction keeps its transaction lease through rollback. Once
     // UNDO has restored every old value, dependency pins drop and the same
     // cleaner can retire the aborted tagged records safely.
     ServerProcess rollback_server(argv[1], port, data_path, log_path,
@@ -1182,7 +1187,7 @@ int main(int argc, char** argv) {
              "tx cleaner rollback seed");
     }
     const std::uint64_t rollback_cleaner_baseline =
-        TxCleanerRetiredGenerations(rollback);
+        TxCleanerRetiredBlocks(rollback);
     const std::string failed = rollback.Command(
         {"MSET", "cleaner-undo-a", "new-a", "cleaner-undo-b", "new-b",
          "cleaner-undo-c", "new-c", "cleaner-undo-d", "new-d"});
@@ -1196,8 +1201,10 @@ int main(int argc, char** argv) {
            "UNDO values while tx cleaner is enabled");
     Expect(rollback.Command({"EXPIRE", "cleaner-undo-a", "600", "NX"}), ":0",
            "UNDO restores TTL representation");
-    if (!WaitForCleanerRetirement(rollback, rollback_cleaner_baseline)) {
-      Fail("transaction cleaner did not retire the rolled-back generation");
+    if (!WaitForCleanerBlockRetirement(rollback, rollback_cleaner_baseline)) {
+      Fail(
+          "transaction cleaner did not retire the rolled-back transaction "
+          "block");
     }
     rollback_server.Stop();
 
@@ -1215,11 +1222,11 @@ int main(int argc, char** argv) {
     rollback_recovered_server.Stop();
 
 #if LAVIK_TEST_FAULTS_AVAILABLE
-    // The first transaction holds the generation's allocation gate while the
-    // test hook suspends physical allocation. A same-worker peer in that
-    // generation must remain queued: completing early would mean rollover
-    // fanned out into a second allocation. Both writes must resume once the
-    // elected allocator publishes the shared stream.
+    // The first transaction holds the transaction stream's allocation gate
+    // while the test hook suspends physical allocation. A same-worker peer in
+    // that second append must remain queued: completing early would mean
+    // rollover fanned out into a second allocation. Both writes must resume
+    // once the elected allocator publishes the shared stream.
     ServerProcess allocation_server(argv[1], port, data_path, log_path, {},
                                     "1000");
     RespClient allocation_control = ConnectReady(port);
@@ -1330,14 +1337,13 @@ int main(int argc, char** argv) {
 
     // A retryable cleaner failure is observable but must not terminate the
     // periodic flush coroutine or report a shutdown drain as complete. The
-    // same process must run a later round and retire the generation.
+    // same process must run a later round and retire the transaction block.
     ServerProcess retry_server(argv[1], port, data_path, log_path, {}, {},
                                true);
     RespClient retry = ConnectReady(port);
     const std::uint64_t failure_baseline =
         InfoStat(retry, "tx_cleaner_failures:");
-    const std::uint64_t retry_retired_baseline =
-        TxCleanerRetiredGenerations(retry);
+    const std::uint64_t retry_retired_baseline = TxCleanerRetiredBlocks(retry);
     Expect(retry.Command({"MSET", "cleaner-retry-a{tx}", "durable-a",
                           "cleaner-retry-b{tx}", "durable-b"}),
            "+OK", "seed retryable cleaner failure");
@@ -1347,7 +1353,7 @@ int main(int argc, char** argv) {
                             10s)) {
       Fail("injected cleaner failure was not recorded");
     }
-    if (!WaitForCleanerRetirement(retry, retry_retired_baseline)) {
+    if (!WaitForCleanerBlockRetirement(retry, retry_retired_baseline)) {
       Fail("periodic flush stopped after a retryable cleaner failure");
     }
     Expect(

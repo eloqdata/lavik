@@ -84,10 +84,9 @@ Storage separates three ownership domains:
   owners, so metadata and allocation I/O never route to a worker that cannot
   open the namespace.
 
-Every worker has an ordinary append stream and may have one append stream for
-each live transaction generation. Physical streams are per worker, not per
-logical partition, so active 8 MiB staging buffers scale with workers and live
-transaction generations rather than with 16,384 slots. A worker also owns the
+Every worker has one ordinary and one transaction append stream. Physical
+streams are per worker, not per logical partition, so active 8 MiB staging
+buffers scale with workers rather than with 16,384 slots. A worker also owns the
 `BlockState` objects assigned to it, including committed and live byte counts,
 pins, staging identity, flush state, and defrag state. The runtime owner and
 allocation epoch form immutable identity after publication and are the only
@@ -100,9 +99,9 @@ Append-stream creation and rollover are single-flight within each stream. A
 writer may release owner-local store state while physical allocation waits,
 but it revalidates the current stream before publication and returns any
 unused reservation to the device allocator. This prevents duplicate stream
-publication without serializing independent transaction generations. Staging
-buffers remain tied to active streams, and shutdown or generation retirement
-waits for outstanding allocation work before destroying its state.
+publication without serializing ordinary and transaction appends against each
+other. Staging buffers remain tied to active streams, and shutdown waits for
+outstanding allocation work before destroying its state.
 
 Logical key locks come from the transaction subsystem. Storage's pre-locked
 interfaces require the caller to run on the key owner with the correct shared
@@ -178,7 +177,7 @@ allocation epoch, committed boundary, record count, maximum physical LSN,
 header sequence, kind, and kind-specific metadata. Slot selection prefers the
 higher allocation epoch and then the higher header sequence. Current block
 kinds are ordinary records, payload extents, indirect-key records (kind 3),
-transaction generations, checkpoint index chunks, and temporary Redis export
+transaction records, checkpoint index chunks, and temporary Redis export
 backlog blocks. Export blocks use on-disk kind 6 and contain replication frames,
 not indexed records.
 They belong to the active Redis full-sync session only; recovery returns every
@@ -441,7 +440,7 @@ state, before engine-wide storage objects are released.
 
 Logical mutations funnel through `AppendLocked`. The partition's mutation
 sequence advances, external payloads are prepared if required, and a record is
-prepared for the current worker's ordinary or transaction-generation staging
+prepared for the current worker's ordinary or transaction staging
 block. Client writes may carry a transport-neutral `MutationPrecondition`;
 after every potentially suspending lock, read, snapshot, extent, and block-
 allocation step, `WriteRecordLocked` validates it synchronously immediately
@@ -581,7 +580,7 @@ Standalone replacements do not immediately retire the old durable record.
 The old version remains live in physical accounting until the replacement's
 flush completes, ensuring recovery always has at least one durable copy.
 
-Multi-key durable writes use transaction-generation blocks. Each participant's
+Multi-key durable writes use transaction blocks. Each participant's
 tagged records become durable first. `CommitTxWrites` waits for all participant
 durability fences, then appends a keyless `kTxCommit` and requests its flush.
 Recovery keeps tagged records only when that decision exists. Superseded
@@ -601,9 +600,8 @@ and commit-record append. Even an awaited `CommitTxWrites` only requests the
 commit-record flush; it is not a synchronous crash-durability fence.
 
 Staging-buffer pressure seals physical append streams before a writer waits
-for capacity. This does not retire transaction generations: live leases and
-tagged records survive, and later writes or commit decisions may open another
-block in the same generation. Flush completion returns sealed buffers after
+for capacity. Live transaction leases and tagged records survive a pressure seal; later
+writes or commit decisions may open another transaction block. Flush completion returns sealed buffers after
 their last reader pin drains, including tails that were already durable.
 Capacity therefore does not depend on completing transactions that themselves
 need a staging buffer to commit.
@@ -873,7 +871,7 @@ rebuild adapter uses that same native FULL path; cluster startup also avoids
 the pre-directive race by never launching Tomb Raider while authority is
 withheld.
 
-### Database and transaction-generation cleanup
+### Database and transaction cleanup
 
 `FLUSHDB` and `FLUSHALL` advance monotonic database epochs. Storage persists the
 new epoch values to every device before publishing them in memory and detaching
@@ -924,28 +922,33 @@ logical partition epoch and Meta's committed group-level partition replication
 epoch. The latter two fence control-plane population identity; neither can
 substitute for the storage epoch used by recovery.
 
-Transaction cleaning seals a Tx block when its append stream rolls over or
-has received no append for one minute. Once the block is durable and every
-transaction represented in it has settled, the cleaner can relocate its
+Transaction cleaning seals a Tx block when its append stream rolls over, has
+received no append for one minute, or contains no active writer at a cleaner
+round. Once the block is durable and every transaction represented in it has
+settled, the cleaner can relocate its
 current committed winners into ordinary untagged blocks and discard aborted
 or obsolete versions. It awaits each relevant commit decision's durability
 before promotion. A block carrying a commit decision remains allocated until
-all physical Tx blocks depending on that decision, including grouped batch
-dependencies on other workers, have retired. Destination durability, source
-pins, and the allocation bitmap retirement still order its cold-free return;
+every Tx block naming that transaction or grouped batch has no live tagged
+winner, dependency pin, or unpaid relocation fence. Durable ordinary copies
+can survive a crash without the old decision even while their Tx source blocks
+remain allocated. Destination durability, source pins, and the allocation
+bitmap retirement still order its cold-free return;
 UUID and extent dependencies follow the same source-block lifetime.
 
 Client writes that may open a storage transaction wait before taking key
 intents when any worker exceeds its configured sealed, unreclaimed Tx-record
-byte budget. The default and minimum are 8 MiB per worker. This is a soft admission
-threshold: an accepted transaction keeps writing and may cross it, while
+byte budget. The default and minimum are 8 MiB per worker. This is a soft
+admission threshold: an accepted transaction keeps writing and may cross it, while
 commit decisions and cleaner relocation remain able to progress. The active
-append block does not count as backlog. Rotation still leaves at most one
-closed generation with outstanding leases, avoiding unbounded append streams
-for delayed commits; whole-generation cleanup retires any blocks that remain
-after all leases settle. Historical snapshot pins alone do not prevent newer
-generations from rotating. Online cleaning yields to shutdown at block
-boundaries after already-published relocations become durable.
+append block does not count as backlog. Each worker keeps one transaction
+append stream. Transaction receipts hold a shared lease until the transaction
+can no longer append. The cleaner first observes released leases, then takes
+a second worker-wide snapshot of block membership and commit decisions. That
+ordering makes the membership of eligible transactions complete even when
+workers append concurrently. A final snapshot after promotion confirms that
+no live tagged winner still needs each decision. Online cleaning yields to
+shutdown at block boundaries after already-published relocations become durable.
 When a shutdown checkpoint is enabled, worker 0 ignores the online cooldown
 and completes this lifecycle to a fixed point after commit and flush drain;
 failure skips the checkpoint rather than weakening cold recovery.
@@ -1018,7 +1021,7 @@ Current test evidence includes:
 | `tests/flushdb_reclaim_e2e_test.cpp` | Full-device FLUSHDB reclaim, paused-defrag exhaustion and resume, expiry escape valve, stale activated-header handling, and a crash after durable defrag source retirement |
 | `tests/ttl_e2e_test.cpp` | TTL mutation, disk-resident rewrite, expired/live restart behavior, and extent-backed values |
 | `tests/tomb_raider_e2e_test.cpp` | Runtime scheduling, retain/reap behavior for buried persistent or expired values, user OFF completion semantics, and bounded internal replica quiescence |
-| `tests/multikey_e2e_test.cpp`, `tests/tx_cleaner_test.cpp` | Bounded disk MGET waves, commit batching and fence merging, transaction-generation rotation, recovery, FLUSHDB invalidation, rollback, retry, and exact retirement readiness |
+| `tests/multikey_e2e_test.cpp` | Bounded disk MGET waves, commit batching and fence merging, transaction-block retirement, recovery, FLUSHDB invalidation, rollback, and retry |
 | `tests/atomicity_stress_e2e_test.cpp` | Overlapping multi-key serializability and recovery after a graceful durability drain |
 | `tests/list_e2e_test.cpp` | Function-catalog body/root/runtime crash windows, multi-device torn-root fallback, and shielded expired-winner behavior under an injected recovery clock rollback |
 | `tests/buffer_pool_test.cpp` | Reuse of a waiting storage write-buffer acquisition |
@@ -1103,6 +1106,6 @@ current source code are authoritative for present storage behavior.
 | Lazy and active expiration, permanent and finite authority capabilities, nestable quiescence, durable tombstones, and the full-device escape valve | `include/lavik/storage/engine.h`, `src/storage/engine/expire.cpp`, `src/cluster/node_control.cpp`, `src/replication/replication.cpp` |
 | Tombstone and shielding mark/sweep/reap lifecycle, startup authority check, internal replica quiescence, and runtime role limitation | `include/lavik/storage/engine.h`, `src/storage/engine/tomb_raider.cpp`, `src/storage/engine/init.cpp`, `src/replication/replication.cpp` |
 | Durable database and replica-partition epoch advance, bounded index detach, replica reset/promotion/abort, and detached-index reclaim | `src/storage/engine/flush_db.cpp`, `src/storage/engine/replication.cpp` |
-| Transaction-generation rotation, promotion, readiness, and cold retirement | `src/storage/engine/tx_cleaner.cpp`, `include/lavik/storage/tx_cleaner.h` |
+| Transaction-block promotion, commit-decision lifetime, and cold retirement | `src/storage/engine/tx_cleaner.cpp` |
 | Device, durability, recovery, storage-I/O, Defrag, Tomb Raider, and transaction-cleaner observability | `include/lavik/storage/engine.h`, `src/storage/engine/metrics.cpp`, `src/storage/engine/recovery.cpp`, `src/metrics.cpp` |
-| Format, capacity, catalog recovery, crash-window, expiration, reclamation, transaction-cleaner, and buffer-pool verification | `tests/storage_format_test.cpp`, `tests/storage_capacity_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/extent_recovery_e2e_test.cpp`, `tests/flushdb_reclaim_e2e_test.cpp`, `tests/ttl_e2e_test.cpp`, `tests/tomb_raider_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/atomicity_stress_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/tx_cleaner_test.cpp`, `tests/buffer_pool_test.cpp` |
+| Format, capacity, catalog recovery, crash-window, expiration, reclamation, transaction-cleaner, and buffer-pool verification | `tests/storage_format_test.cpp`, `tests/storage_capacity_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/extent_recovery_e2e_test.cpp`, `tests/flushdb_reclaim_e2e_test.cpp`, `tests/ttl_e2e_test.cpp`, `tests/tomb_raider_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/atomicity_stress_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/buffer_pool_test.cpp` |

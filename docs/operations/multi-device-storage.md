@@ -169,10 +169,9 @@ then set and persist the allocation bit before publishing the ID as ready.
 
 ## Worker write affinity
 
-Each worker has one ordinary active append block and may have one transaction
-append block for each live transaction generation. The ordinary stream retains
-at most one prefetched standby ID; transaction streams allocate per generation
-on demand and do not reserve standby capacity.
+Each worker has one ordinary and one transaction active append block. The
+ordinary stream retains at most one prefetched standby ID; the transaction
+stream allocates on demand and does not reserve standby capacity.
 
 - Every device protects its last eight allocatable blocks for defrag. Device
   weight is its remaining foreground data-block count after that reserve.
