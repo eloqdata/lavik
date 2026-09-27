@@ -2441,17 +2441,6 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     co_return absl::InvalidArgumentError(
         "transaction record has no writer lease");
   }
-  // Grouped Strings can append many small segments before their decisions.
-  // Keep a small aligned tail for the current and a borrowed decision. This
-  // is soft headroom: a record that physically fits may consume it, and later
-  // decisions can roll over to another Tx block.
-  constexpr std::uint64_t kDecisionReserveBytes = 4 * kDirectIoAlignment;
-  const std::uint64_t spare_bytes =
-      kStorageBlockBytes - kBlockHeaderBytes - total_disk_bytes;
-  const std::uint64_t append_limit =
-      transaction_append && group != nullptr && value_type == ValueType::kString
-          ? kStorageBlockBytes - std::min(kDecisionReserveBytes, spare_bytes)
-          : kStorageBlockBytes;
   const BlockKind append_block_kind =
       indirect_key_record  ? BlockKind::kIndirectKeys
       : transaction_append ? BlockKind::kTransaction
@@ -2508,7 +2497,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
 acquire_active_stream:
   if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
   while (!active_stream().has_value() ||
-         active_stream()->committed_bytes_ + total_disk_bytes > append_limit) {
+         active_stream()->committed_bytes_ + total_disk_bytes >
+             kStorageBlockBytes) {
     // Waiting for a physical block must not hold store_state_mutex_: the
     // allocator, flush completion, and the elected writer may all need this
     // worker's state before the new stream can be published. The gate is per
@@ -2524,7 +2514,7 @@ acquire_active_stream:
       // reached the front. Reuse it instead of allocating a spare block.
       if (active_stream().has_value() &&
           active_stream()->committed_bytes_ + total_disk_bytes <=
-              append_limit) {
+              kStorageBlockBytes) {
         continue;
       }
     }
@@ -2554,7 +2544,8 @@ acquire_active_stream:
     // Recheck after allocation released the store lock: a maintenance path
     // may have installed a successor, or another writer consumed the tail.
     if (active_stream().has_value() &&
-        active_stream()->committed_bytes_ + total_disk_bytes <= append_limit) {
+        active_stream()->committed_bytes_ + total_disk_bytes <=
+            kStorageBlockBytes) {
       absl::Status returned = co_await return_reserved(*allocated);
       if (!returned.ok()) co_return returned;
       continue;
@@ -2804,7 +2795,8 @@ acquire_active_stream:
   // this coroutine is suspended. Re-enter allocation before dereferencing the
   // optional or appending to a replacement block that no longer has room.
   if (!active_stream().has_value() ||
-      active_stream()->committed_bytes_ + total_disk_bytes > append_limit) {
+      active_stream()->committed_bytes_ + total_disk_bytes >
+          kStorageBlockBytes) {
     goto acquire_active_stream;
   }
   const bool has_index_extra = expire_at_ms != 0;
