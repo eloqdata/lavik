@@ -243,6 +243,8 @@ struct StreamPageMaxKey {
   bool exact_ = false;
 
   void Set(std::string_view key) noexcept;
+  // A missing or truncated prefix returns nullopt when the page payload is
+  // needed to settle the comparison.
   std::optional<bool> LessThan(std::string_view key) const noexcept;
   std::optional<bool> LessThanOrEqual(std::string_view key) const noexcept;
 };
