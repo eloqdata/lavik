@@ -46,4 +46,9 @@ Task<std::string> ExecuteStreamReadLocked(
     std::vector<storage::TxShardWrites>& tx_writes,
     ReplyChunkSource* chunks = nullptr);
 
+// Expand a native Stream group replacement/delta into ordinary Redis commands.
+// Non-private commands pass through; malformed private payloads fail closed.
+absl::StatusOr<std::vector<std::vector<std::string>>> RedisExportStreamGroup(
+    std::span<const std::string> args);
+
 }  // namespace lavik

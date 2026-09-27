@@ -953,7 +953,8 @@ std::vector<std::string> BuildReplicationTransactionEnvelope(
 
 }  // namespace
 
-Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::FenceReplicationLog() {
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::FenceReplicationLog(
+    std::function<bool()> cancelled) {
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
   if (log.state_ != ReplicationLogState::kActive) {
@@ -963,6 +964,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::FenceReplicationLog() {
   constexpr std::size_t kFenceStagingBytes =
       kReplicationPublisherItemMetadataBytes;
   for (;;) {
+    if (cancelled && cancelled())
+      co_return absl::CancelledError("publisher fence cancelled");
     const std::size_t capacity =
         replication_publish_queue_bytes_.load(std::memory_order_acquire);
     if (PublisherHasCapacity(kFenceStagingBytes, capacity,
@@ -970,7 +973,13 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::FenceReplicationLog() {
                              log.publisher_admitted_bytes_)) {
       break;
     }
-    co_await log.publisher_capacity_ready_.Wait();
+    if (cancelled) {
+      auto waited = co_await bycorf::SleepFor(*store.worker_,
+                                              std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    } else {
+      co_await log.publisher_capacity_ready_.Wait();
+    }
     if (log.state_ != ReplicationLogState::kActive) {
       co_return InvalidState(
           "replication log stopped while waiting for publisher fence space");
@@ -1017,7 +1026,15 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::FenceReplicationLog() {
     store.worker_->Spawn(DrainReplicationPublishQueue(&store));
   }
   while (!fence->complete_) {
-    co_await fence->ready_.Wait();
+    if (cancelled) {
+      if (cancelled())
+        co_return absl::CancelledError("publisher fence cancelled");
+      auto waited = co_await bycorf::SleepFor(*store.worker_,
+                                              std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    } else {
+      co_await fence->ready_.Wait();
+    }
   }
   if (!fence->status_.ok()) co_return fence->status_;
   co_return fence->next_lsn_;
@@ -1668,8 +1685,10 @@ StorageEngine::Impl::ReadReplicationLog(ReplicationLogCursor next,
                                         std::size_t max_frames) {
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
-  co_await log.mutex_.Lock();
-  UnlockGuard unlock(&log.mutex_, store.worker_);
+  // This worker-local copy-out never suspends. A publisher may hold its
+  // coroutine mutex while waiting for a consumer pin to advance; acquiring
+  // that mutex here would prevent the consumer from relieving backpressure.
+  // next_lsn_ is the commit boundary: never expose an unfinished event.
   if (log.state_ != ReplicationLogState::kActive) {
     co_return InvalidState("replication log is not active");
   }
@@ -1720,6 +1739,10 @@ StorageEngine::Impl::ReadReplicationLog(ReplicationLogCursor next,
         log.state_ = ReplicationLogState::kInvalid;
         co_return absl::Status(absl::StatusCode::kInternal,
                                "invalid replication frame in backlog");
+      }
+      if (header.lsn_ > tail_lsn) {
+        batch.at_tail_ = true;
+        co_return batch;
       }
       const ReplicationLogCursor frame_cursor = FrameCursor(header);
       if (CursorBefore(frame_cursor, batch.next_)) {
@@ -1875,6 +1898,15 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
     if (!waited.ok()) co_return waited;
   }
   co_return absl::OkStatus();
+}
+
+bool StorageEngine::Impl::ReplicationRetentionBlocksPublication(
+    std::uint64_t session_id) const {
+  const auto& log = CurrentStore().replication_log_;
+  const auto retained = log.retained_lsn_by_session_.find(session_id);
+  return log.capacity_backpressured_ && !log.blocks_.empty() &&
+         retained != log.retained_lsn_by_session_.end() &&
+         retained->second <= log.blocks_.front().last_lsn_;
 }
 
 ReplicationLogInfo StorageEngine::Impl::LocalReplicationLogInfo() const {

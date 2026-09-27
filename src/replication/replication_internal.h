@@ -1906,6 +1906,25 @@ struct RedisSource {
   bool coordinator_started_ = false;
 };
 
+// Immutable identity plus connection-worker-owned progress and tasks. Only
+// cancellation crosses workers; the registry publishes shared lifetime.
+struct RedisExportContext {
+  unsigned worker_ = 0;
+  std::uint64_t id_ = 0;
+  std::uint64_t generation_ = 0;
+  std::uint64_t role_epoch_ = 0;
+  std::uint64_t term_ = 0;
+  std::size_t disk_capacity_ = 0;
+  std::optional<RebuildIdentity> population_;
+  std::string history_;
+  std::shared_ptr<LeaseDeadline> lease_;
+  std::atomic<bool> cancelled_{false};
+  std::atomic<bool> admitted_{false};
+  bool monitor_done_ = false;
+  std::function<void()> abort_snapshot_;
+  RedisExportProgress progress_;
+};
+
 struct UpstreamDiscovery {
   std::shared_ptr<PreparedRedisConnection> prepared_;
   bool redis_cluster_ = false;
@@ -1919,6 +1938,8 @@ using namespace replication_internal;
 
 class ReplicationManager::ReplicationGroup {
  public:
+  Task<RedisExportProgress> RedisExportStatus() const;
+  Task<absl::Status> RelieveRedisExportBackpressure();
   ReplicationGroup(storage::StorageEngine* storage,
                    std::optional<ReplicaOfConfig> initial_upstream,
                    const ReplicationOptions& options,
@@ -2278,6 +2299,10 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> SetBacklogSizeBytes(std::size_t bytes);
 
   std::size_t backlog_size_bytes() const noexcept;
+  Task<absl::Status> SetRedisExportDiskBacklogSize(std::size_t bytes);
+  std::size_t redis_export_disk_backlog_size() const noexcept {
+    return redis_export_disk_backlog_size_.load(std::memory_order_acquire);
+  }
 
   Task<absl::Status> SetBacklogBackpressure(bool enabled);
 
@@ -2292,6 +2317,11 @@ class ReplicationManager::ReplicationGroup {
                                            std::uint64_t client_id,
                                            std::string client_address,
                                            bool tls);
+  Task<absl::Status> ServeRedisExportConnection(TcpStream& stream,
+                                                std::vector<std::string> args,
+                                                std::uint64_t client_id,
+                                                std::string client_address,
+                                                bool tls, bool eof_capable);
 
  private:
   static void AssertStateOwner() noexcept;
@@ -2709,6 +2739,15 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> EnsureReplicationHistoryReady();
 
+  Task<absl::Status> PrepareRedisExport(
+      std::shared_ptr<RedisExportContext> context);
+  bool RedisExportValid(const RedisExportContext& context) const;
+  Task<absl::Status> MonitorRedisExport(
+      TcpStream* stream, std::shared_ptr<RedisExportContext> context);
+  Task<absl::Status> RunRedisExportSession(
+      TcpStream& stream, std::shared_ptr<RedisExportContext> context);
+  void CancelRedisExport() noexcept;
+
   storage::StorageEngine* storage_;
   // The packed atomic is owned by the enclosing manager so external commands
   // reach it without following this pImpl. Bit zero is serving-open and the
@@ -2910,6 +2949,11 @@ class ReplicationManager::ReplicationGroup {
   // of the worker-affine source session registry. Process shutdown cancels it
   // before request drain so transport teardown releases backlog retention.
   SocketSet source_sockets_;
+  // One Redis socket owns the temporary disk stream. Source retirement joins
+  // this handler before disabling the worker-local logs it reads.
+  std::atomic<std::size_t> redis_export_disk_backlog_size_{1ULL << 30};
+  std::atomic<bool> redis_export_active_{false};
+  std::atomic<std::shared_ptr<RedisExportContext>> redis_export_context_;
   bycorf::AsyncMutex redis_fullsync_mutex_;  // worker 0 only
   std::atomic<std::uint64_t> next_master_session_id_{1};
   std::atomic<unsigned> active_master_controls_{0};

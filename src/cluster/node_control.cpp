@@ -871,6 +871,8 @@ bycorf::Task<absl::Status> NodeControlInstaller::WaitForPendingDrains(
                      [this](const AuthorityAnchor& anchor) {
                        return DrainPending(anchor.group_id_);
                      })) {
+    auto relieved = co_await actions_.RelieveExportBackpressure();
+    if (!relieved.ok()) co_return relieved;
     bycorf::Worker* worker = bycorf::ThisWorker().self_;
     if (worker == nullptr) {
       co_return absl::FailedPreconditionError(
@@ -1521,8 +1523,19 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
     if (!initial.ok()) co_return initial.status();
   }
 
-  const auto lease =
-      std::make_shared<LeaseDeadline>(deadline.time_since_epoch());
+  auto lease = std::make_shared<LeaseDeadline>(deadline.time_since_epoch());
+  if (const auto existing =
+          lease_expiry_schedules_.find(message.anchor_.group_id_);
+      existing != lease_expiry_schedules_.end() && existing->second->active_ &&
+      existing->second->session_ == message.session_ &&
+      existing->second->anchor_ == message.anchor_ &&
+      existing->second->lease_->valid_at(now.time_since_epoch())) {
+    // A projection-only refresh (including Controlled Pause) preserves the
+    // authority epoch. Keep the capability shared by in-flight exports and
+    // requests; the final authority installation renews its deadline. Expired
+    // epochs were drained above and can never enter this path.
+    lease = existing->second->lease_;
+  }
   // A failed initial installation must close every consumer, including TTL
   // installed before request authority, before asynchronous cleanup can wait.
   auto revoke_on_failure = absl::MakeCleanup([lease] { lease->Revoke(); });

@@ -122,6 +122,8 @@ struct ReplicationOptions {
   // source writes at the backlog limit. Operators may disable this at runtime
   // to prefer primary availability and force lagging consumers to full-sync.
   bool backlog_backpressure_ = true;
+  // Independent disposable disk quota, sampled once per Redis export session.
+  std::size_t redis_export_disk_backlog_size_ = 1ULL * 1024 * 1024 * 1024;
   // Bounded source publisher staging memory on each worker. A single larger
   // command may exceed this waterline only while it is the exclusive item.
   std::size_t publish_queue_bytes_per_worker_ = 16ULL * 1024 * 1024;
@@ -169,6 +171,22 @@ struct ReplicationIdentity {
   std::string local_history_id_;
 };
 
+// A session-scoped progress cut. Cursor vectors are next-LSN positions in
+// this exact source history; offset counts Redis command bytes, not native
+// LSNs.
+struct RedisExportProgress {
+  bool active_ = false;
+  std::uint64_t session_id_ = 0;
+  std::string group_id_, node_id_, boot_id_;
+  std::uint64_t term_ = 0, generation_ = 0;
+  std::size_t disk_capacity_ = 0;
+  std::string history_id_;
+  std::string phase_ = "inactive";
+  std::uint64_t offset_ = 1;
+  std::vector<std::uint64_t> source_next_lsns_;
+  std::vector<std::uint64_t> sent_next_lsns_;
+};
+
 struct ReplicationStatus {
   ReplicationRole role_ = ReplicationRole::kMaster;
   std::optional<ReplicaOfConfig> upstream_;
@@ -187,6 +205,7 @@ struct ReplicationStatus {
   std::vector<RedisSourceStatus> redis_sources_;
   std::uint64_t replica_repl_offset_ = 0;
   std::uint64_t master_repl_offset_ = 0;
+  RedisExportProgress redis_export_;
   std::uint64_t master_link_down_since_seconds_ = 0;
   std::uint64_t master_last_io_seconds_ago_ = 0;
   unsigned replica_priority_ = 100;
@@ -539,6 +558,7 @@ struct ReplicationDirective {
     kSetNativeUpstream,
     kAddUpstream,
     kBacklogBytes,
+    kRedisExportDiskBacklogBytes,
     kBacklogBackpressure,
     kPublishQueueBytes,
     kSnapshotReadConcurrency,
@@ -573,6 +593,11 @@ class ReplicationManager {
   // worker while another worker updates the native session registry.
   bycorf::Task<absl::Status> ApplyDirective(ReplicationDirective directive);
   bycorf::Task<ReplicationStatus> Observe() const;
+  // Fence committed publishers and sample the current export session.
+  bycorf::Task<RedisExportProgress> ObserveRedisExport() const;
+  // Called while control-plane mutation drain is pending. A slow external
+  // consumer may not prevent HA from draining already admitted work.
+  bycorf::Task<absl::Status> RelieveRedisExportBackpressure();
 
   // Copies the current node, boot, and local history identities without
   // collecting replication progress or downstream session status.
@@ -802,6 +827,8 @@ class ReplicationManager {
   std::size_t snapshot_batch_size() const noexcept;
 
   std::size_t backlog_size_bytes() const noexcept;
+  // Configured disk budget for the next Redis export, independent of memory.
+  std::size_t redis_export_disk_backlog_size() const noexcept;
   bool backlog_backpressure() const noexcept;
   std::size_t publish_queue_bytes_per_worker() const noexcept;
   unsigned replica_priority() const noexcept;
@@ -812,6 +839,12 @@ class ReplicationManager {
   bycorf::Task<absl::Status> ServeNativeConnection(
       bycorf::TcpStream& stream, std::vector<std::string> args,
       std::uint64_t client_id, std::string client_address, bool tls);
+  // Owns one authenticated Redis PSYNC socket from FULLRESYNC through its
+  // ongoing command stream. Redis EOF capability is required for diskless RDB.
+  bycorf::Task<absl::Status> ServeRedisExportConnection(
+      bycorf::TcpStream& stream, std::vector<std::string> args,
+      std::uint64_t client_id, std::string client_address, bool tls,
+      bool eof_capable);
 
   // Captures all source commands already queued on every worker. A missing
   // value means no native replication history is currently active; callers

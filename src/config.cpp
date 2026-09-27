@@ -652,6 +652,18 @@ absl::Status ApplyRedisConfigDirective(
     options->storage_read_buffer_bytes_ = kilobytes * kKiB;
     return absl::OkStatus();
   }
+  if (name == "redis-export-disk-backlog-size") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    auto bytes = ParseMemorySize(directive[1]);
+    if (!bytes.ok()) return bytes.status();
+    constexpr std::size_t block = 8ULL * 1024 * 1024;
+    if (*bytes < block)
+      return absl::InvalidArgumentError(
+          "redis-export-disk-backlog-size must be at least 8 MiB");
+    options->replication_options_.redis_export_disk_backlog_size_ =
+        *bytes / block * block;
+    return absl::OkStatus();
+  }
   if (name == "repl-backlog-size") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     auto bytes = ParseMemorySize(directive[1]);
@@ -672,6 +684,10 @@ absl::Status ApplyRedisConfigDirective(
 }
 
 absl::Status ValidateServerOptions(const ServerOptions& options) {
+  if (options.replication_options_.redis_export_disk_backlog_size_ <
+      8ULL * 1024 * 1024)
+    return absl::InvalidArgumentError(
+        "redis-export-disk-backlog-size must be at least 8 MiB");
   if (options.shard_count_ == 0 ||
       options.shard_count_ > std::numeric_limits<bycorf::WorkerId>::max() - 1) {
     return absl::InvalidArgumentError("shards exceeds runtime worker capacity");

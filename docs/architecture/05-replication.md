@@ -181,12 +181,15 @@ with the saved replid/offset. A failed runtime handshake leaves the old
 subscription intact. Preparation has a ten-second deadline; a Redis background
 save that delays FULLRESYNC beyond it can require a runtime retry. Startup
 handshake failures retry while keeping the node
-fenced and recovered data intact. `LAVIK.REPLICAOF host port` instead selects
-the native `LVPSYNC`/`LVFLOW` coordinator for a non-Meta source. It authenticates
-and probes the Lavik endpoint before changing roles, so an unreachable,
-non-Lavik, or already-replicating source leaves the current role and data intact.
-After admission it uses the native full/continue and reconnect paths. A native
-replica rejects downstream attachment; cascading is not supported. Meta native
+fenced and recovered data intact. The Redis-protocol follower requests a
+length-delimited RDB and does not advertise EOF capability. Lavik's Redis PSYNC
+export requires EOF capability, so `REPLICAOF` pointed at another Lavik node
+fails this handshake. `LAVIK.REPLICAOF host port` instead selects the native
+`LVPSYNC`/`LVFLOW` coordinator for a non-Meta source. It authenticates and probes
+the Lavik endpoint before changing roles, so an unreachable, non-Lavik, or
+already-replicating source leaves the current role and data intact. After
+admission it uses the native full/continue and reconnect paths. A native replica
+rejects downstream attachment; cascading is not supported. Meta native
 relationships continue to use Follow Owner instead.
 
 The retained non-Meta `REPLICAOF NO ONE` implementation uses the role-transition path
@@ -774,6 +777,16 @@ ID, and disables all worker logs. Draining preserves events and fences already
 reserved by admitted commands. A later downstream must full-sync and re-enables
 a fresh history before its snapshot cut.
 
+A Redis `PSYNC` export uses that worker-local memory history for
+publisher ordering and for the live tail. While its RDB is being sent, the
+connection-owning worker merges completed source events into one temporary
+command stream on the configured data devices. The disk stream has its own
+`redis-export-disk-backlog-size` ceiling and never replaces or changes the native log.
+Only this full-sync session allocates export blocks; it does not index or
+defragment them. Exhausting the disk allowance or device space fails the Redis
+export while foreground writes and native history continue. An interrupted
+process discards these blocks during recovery.
+
 A connected native downstream advertises its first unacknowledged LSN as a
 coverage claim. By default, the publisher waits at the hard backlog limit until
 ACK progress makes a complete event reclaimable; publisher staging then fills
@@ -1167,11 +1180,12 @@ is documented under [current limitations](#invariants-failures-and-current-limit
 
 ### Following Redis
 
-A Redis follower authenticates, sends PING, advertises its listening port and
-PSYNC2 capability, and requests either its process-local replid/offset or a
-fresh full synchronization. FULLRESYNC receives a length-delimited RDB into a
-temporary file. Import is serialized, closes and drains command database
-gates, resets the source-owned slots, validates ownership, and restores values.
+Lavik's Redis-protocol follower authenticates, sends PING, advertises its
+listening port and PSYNC2 capability, and requests either its process-local
+replid/offset or a fresh full synchronization. FULLRESYNC receives a
+length-delimited RDB into a temporary file. Import is serialized, closes and
+drains command database gates, resets the source-owned slots, validates
+ownership, and restores values.
 Collection input is prevalidated and then consumed as admitted pages on the
 key owner, with one atomic ingest decision per complete key rather than a
 whole-object compact buffer. Packed collections and quicklist nodes are
@@ -1206,10 +1220,71 @@ topology's master count, every source dataset is valid, and the topology is not
 faulted. Two consecutive incompatible topology observations fault the topology
 and return the node to loading.
 
+### Redis PSYNC export
+
+A currently servable Primary accepts one authenticated Redis replica with
+`REPLCONF capa eof` and `PSYNC`. Handshakes are rejected inside MULTI; RESET
+clears negotiated EOF capability. It always starts a new `FULLRESYNC`; Redis
+partial-resynchronization history and offsets are not retained across a
+disconnect or restart. A short command-admission gate establishes an RDB
+snapshot cut and fences each source worker's publisher FIFO. Managed Single
+exports DB0–15; managed Cluster exports its local Group's DB0. Managed admission
+requires a Ready population and current Owner lease, and consumes its existing
+history. Standalone shares the native history lifecycle. The session binds
+history, serving generation, role epoch and, in managed mode, population and
+Owner term/lease. Each suspended admission boundary rechecks that binding.
+Controlled Pause alone preserves eligible sessions and admission. Authority
+loss (including same-boot lease expiry), population replacement and shutdown
+cancel the transport, release only this session's retention, and join its
+snapshot, disk and ACK tasks before releasing the single-session slot. A
+controlled drain cancels an exporter if its retention obstructs publication;
+failover never waits for RedisShake catchup. RDB readers use
+the storage snapshot's before-write images and physical pins, so a later write
+cannot replace a key that the snapshot has not scanned yet. A failed capture
+invalidates this full sync instead of emitting a mixed image.
+
+The connection owner reads the per-worker streams, preserving each flow's
+order. Independent keys on different workers may interleave; transaction
+envelopes wait for every participant and database-wide controls wait for every
+worker before the owner writes a single Redis-compatible command to the disk
+stream. The RDB queue holds only bounded encoded fragments. After RDB EOF,
+another short gate and publisher fence fix the disk stream's end cursors.
+A nonzero FULLRESYNC initial offset and an initial ACK after EOF separate the
+RDB from incremental bytes without depending on TCP packet boundaries. ACKs
+may include Redis's optional FACK durability offset; it is validated but does
+not advance export consumption. The
+consumer drains the queue again after acquiring all-producer completion.
+The owner drains and releases the temporary disk blocks, then resumes merging
+the worker-local memory logs on the same Redis socket. Its retention cursors
+advance only after socket writes; the configured backlog policy backpressures
+a slow consumer by default or disconnects it on a revoked coverage gap.
+`replication-backlog-backpressure` applies to native and Redis retention alike;
+runtime changes use the same worker update and publisher wakeup path. Disk
+quota or device exhaustion always cancels this export and releases its pins.
+The disk quota defaults to 1 GiB, floors to whole 8 MiB blocks, and is sampled
+at session start; CONFIG SET affects subsequent sessions. Staging remains
+charged to retained memory. Stream group deltas are translated to Redis
+XGROUP/XCLAIM/XACK commands; private native payloads are never a Redis wire
+format. RedisShake does not make imported transactions atomically visible to
+other clients, so the target remains isolated until cutover.
+
+`INFO replication` reports `redis_export_active`, `redis_export_session_id`, `redis_export_history_id`,
+`redis_export_phase`, source and sent next-LSN vectors, and
+`redis_export_offset`. Source positions cross a publisher fence; sent positions
+advance only after complete command writes, and never claim live catchup before
+disk replay finishes. Redis offset counts disk replay, live commands and PING
+bytes independently of native LSNs. A changed/invalid session invalidates its
+completion evidence. During cancellation, identity evidence is withdrawn before
+the session finishes joining; `redis_export_active` remains set until all cleanup
+completes and the single connection slot is available again.
+The [export runbook](../operations/redis-export.md) combines
+these cuts with RedisShake received/sent offsets, drained writer replies and
+full target validation.
+
 ### ScanReader export
 
-Lavik does not serve Redis PSYNC or REPLCONF. RedisShake ScanReader exports the
-keyspace through ordinary authenticated INFO, SCAN, DUMP, and PTTL commands.
+RedisShake ScanReader also exports the keyspace through ordinary authenticated
+INFO, SCAN, DUMP, and PTTL commands.
 DUMP payloads use RDB 11, requiring Redis 7.2 or newer at the destination.
 Single exposes DB0–15; Cluster exposes DB0 and discovery for its slot owners.
 Managed Single database inspection uses the sole Group's read admission and
@@ -1276,7 +1351,8 @@ still require Meta authorization.
 | `replica-priority` | Startup/runtime Sentinel election priority, default 100; zero is ineligible and lower nonzero values are preferred |
 | `CONFIG REWRITE` | Atomically persists a single Redis upstream mode and `replica-priority`; unavailable without a config file, with multiple Redis Cluster sources, or while following a native Lavik source |
 | `tls-replication`, `masteruser`, `masterauth` | Outgoing control and every data connection; only the `default` user is supported |
-| `repl-backlog-size` | Startup/CLI/runtime global backlog, default 1 GiB; at least one 8 MiB block per worker |
+| `repl-backlog-size` | Startup/CLI/runtime global memory backlog, default 1 GiB; at least one 8 MiB block per worker |
+| `redis-export-disk-backlog-size` | Startup/CLI/runtime temporary export disk quota, default 1 GiB; minimum 8 MiB, rounded down to blocks, sampled per session |
 | `replication-backlog-backpressure` | Startup/CLI/runtime retained-history policy, default `yes`; `no` prefers primary write availability by forcing lagging consumers to full-sync at capacity |
 | `replication-publish-queue-mb-per-worker` | Startup/CLI/runtime staging waterline, default 16 MiB per active worker log and per active full-sync session |
 | `replication-snapshot-batch-size` | Startup/CLI/runtime scan scheduling batch, default 64 |
@@ -1412,6 +1488,11 @@ and incomplete slot coverage, same-generation full completion, incremental
 replay, partial reconnect, replica membership changes, and master failover.
 `tests/redis_scan_reader_e2e.py` runs RedisShake against authenticated Single
 (DB0 and DB15) and a two-Group Meta-managed Cluster, including values and TTLs.
+`tests/redis_export_e2e.sh` runs a real Redis replica through RDB overlap,
+temporary disk backlog replay, online commands, transactions, Functions,
+database selection, ACKs, and detach. Its fault modes verify restart reclamation
+of a sealed temporary block and primary availability when the export disk
+allowance fills.
 
 Configuration and command tests cover the startup support matrix, removed
 names, overrides, reporting, and independent client semantics and authority.
@@ -1428,6 +1509,7 @@ There is no focused malformed-LRC1 decoder matrix.
 | Single-group rebuild identity, safe-source authorization, logical/local epoch mapping, manifest/reset proof, readiness, clean recovery, and fail-stop contract | `include/lavik/replication_group.h`, `src/replication/replication_group.cpp`, `src/replication/population_recovery.h` |
 | Callable cluster directive/status/source-authorization, failover prepare/activation, source pause, and follow-owner adapters; native control/data protocol, duplex online flow, role lifecycle, Function full sync, and reconnect behavior | `include/lavik/replication.h`, `src/replication/replication.cpp` |
 | Redis AUTH/PSYNC consumption, RDB import, ordered replay, and slot topology coordination under the shared group owner | `src/replication/redis_replication.cpp`, `src/replication/replication_internal.h` |
+| Redis PSYNC source, RDB snapshot queue, worker-stream merge, and disk-to-memory handoff | `src/replication/redis_export.cpp`, `src/storage/engine/redis_export_backlog.cpp`, `src/redis/server.cpp` |
 | Lock-free live target Applied frontier and coherent cross-flow snapshots | `src/replication/replica_applied_frontier.h`, `src/replication/replica_applied_frontier.cpp` |
 | Canonical command format and deterministic expiration effects | `include/lavik/replication_command.h`, `src/replication/command.cpp` |
 | REPLICAOF/Sentinel commands, serving-generation fencing, blocking-wait invalidation, MSET publication admission/order, Function and PUBLISH capture, transaction/control capture, and trusted replay | `include/lavik/command.h`, `src/redis/command.cpp`, `src/redis/blocking_wait.cpp`, `src/redis/command_table.cpp` |
@@ -1443,4 +1525,4 @@ There is no focused malformed-LRC1 decoder matrix.
 | Manifest-filtered full-sync scanning, replacements, handoff, target reset/apply/promotion/abort, detached-index reclaim, cascade and DB-gate limitations | `src/storage/engine/replication.cpp`, `src/storage/engine/write.cpp` |
 | Frame layout, event kinds, fragmentation, and checksums | `include/lavik/storage/format.h`, `src/storage/format.cpp` |
 | Startup/runtime replication configuration, cluster fail-closed admission, and atomic CONFIG REWRITE | `app/lavik.cpp`, `include/lavik/server.h`, `src/config.cpp`, `src/redis/command.cpp`, `src/redis/server.cpp` |
-| Native, group-model, cluster-startup/manager/generation/failure/protocol-guard/failover/follow-owner, log, MSET, Pub/Sub, Redis PSYNC/ScanReader, RDB, format, and configuration verification | `tests/replication_group_test.cpp`, `tests/cluster/cluster_invariants.cpp`, `tests/cluster/fault_harness_test.cpp`, `tests/cluster/population_integration_test.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/cluster/serving_generation_integration_test.cpp`, `tests/meta_integration/gate_native_replication.py`, `tests/replication_log_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/redis_follower_smoke.py`, `tests/redis_cluster_psync_e2e.sh`, `tests/redis_scan_reader_e2e.py`, `tests/multi_exec_e2e_test.cpp`, `tests/rdb_test.cpp`, `tests/replication_command_test.cpp`, `tests/storage_format_test.cpp`, `tests/config_test.cpp` |
+| Native, group-model, cluster-startup/manager/generation/failure/protocol-guard/failover/follow-owner, log, MSET, Pub/Sub, Redis PSYNC/ScanReader, RDB, format, and configuration verification | `tests/replication_group_test.cpp`, `tests/cluster/cluster_invariants.cpp`, `tests/cluster/fault_harness_test.cpp`, `tests/cluster/population_integration_test.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/cluster/serving_generation_integration_test.cpp`, `tests/meta_integration/gate_native_replication.py`, `tests/replication_log_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/redis_follower_smoke.py`, `tests/redis_cluster_psync_e2e.sh`, `tests/redis_export_e2e.sh`, `tests/redis_scan_reader_e2e.py`, `tests/multi_exec_e2e_test.cpp`, `tests/rdb_test.cpp`, `tests/replication_command_test.cpp`, `tests/storage_format_test.cpp`, `tests/config_test.cpp` |

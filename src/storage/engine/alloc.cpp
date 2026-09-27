@@ -244,9 +244,14 @@ StorageEngine::Impl::AllocateFromDeviceLocal(std::size_t device_index,
   if (allocator.failed_.has_value()) {
     co_return *allocator.failed_;
   }
-  const std::size_t reserve = purpose == AllocationPurpose::kDefrag
-                                  ? 0
-                                  : DefragReserveForDevice(device_index);
+  // Redis export history is disposable. Keep two more free blocks per device
+  // for ordinary writes; a full export aborts instead of consuming the last
+  // foreground headroom or parking a foreground allocator behind its own log.
+  const std::size_t reserve =
+      purpose == AllocationPurpose::kDefrag
+          ? 0
+          : DefragReserveForDevice(device_index) +
+                (purpose == AllocationPurpose::kRedisExportBacklog ? 2 : 0);
   if (allocator.ready_blocks_.size() <= reserve) {
     absl::Status refill =
         co_await RefillReadyBlocksLocal(device_index, allocator);
@@ -813,11 +818,14 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
     // defrag from inside DefragOne would deadlock when the reserve is truly
     // exhausted, so only foreground allocation waits for reclaim progress.
     if (purpose == AllocationPurpose::kDefrag ||
+        purpose == AllocationPurpose::kRedisExportBacklog ||
         purpose == AllocationPurpose::kShutdownMetadata) {
-      co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                             purpose == AllocationPurpose::kDefrag
-                                 ? "defrag reserve is exhausted"
-                                 : "shutdown metadata space is exhausted");
+      co_return absl::Status(
+          absl::StatusCode::kResourceExhausted,
+          purpose == AllocationPurpose::kDefrag ? "defrag reserve is exhausted"
+          : purpose == AllocationPurpose::kRedisExportBacklog
+              ? "Redis export backlog device space is exhausted"
+              : "shutdown metadata space is exhausted");
     }
     const std::uint64_t generation_after =
         space_reclaim_generation_.load(std::memory_order_acquire);

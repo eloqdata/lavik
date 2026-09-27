@@ -650,7 +650,7 @@ int main(int argc, char** argv) {
 
     ExpectContains(replica_client.Command(
                        {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
-                   "Redis replication handshake failed",
+                   "diskless PSYNC requires REPLCONF capa eof",
                    "reject native upstream");
 
     replica.Stop();

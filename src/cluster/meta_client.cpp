@@ -539,6 +539,10 @@ class ReplicationNodeControlActions final : public NodeControlActions {
     co_return co_await completion.Await();
   }
 
+  bycorf::Task<absl::Status> RelieveExportBackpressure() override {
+    return replication_.RelieveRedisExportBackpressure();
+  }
+
   absl::Status DrainAssignment(const AuthorityAnchor&) override {
     // NodeControlInstaller owns the replaced ServingState counters. Source
     // sessions were already joined by RevokeSourceAuthorizationsAndWait().

@@ -164,6 +164,9 @@ class SourceAuthorizationLedger {
       std::chrono::nanoseconds now_since_boot) const noexcept {
     return lease_ != nullptr && lease_->valid_at(now_since_boot);
   }
+  // Redis export holds the same revocable capability, without joining the
+  // native member/POPULATION authorization set.
+  std::shared_ptr<LeaseDeadline> lease() const noexcept { return lease_; }
   void SuspendLeaseAdmission() noexcept { lease_.reset(); }
 
   // An authorize-source command and its sibling rebuild command deliberately

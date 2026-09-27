@@ -243,6 +243,9 @@ enum class BlockKind : std::uint8_t {
   // the checkpoint bitmap naming them are durable. These blocks are recovery
   // accelerators, never authoritative user data.
   kCheckpointIndex = 5,
+  // A Redis RDB export may spill its post-snapshot command stream to data
+  // blocks. This is runtime-only state: recovery always reclaims these blocks.
+  kRedisExportBacklog = 6,
 };
 
 enum class ReplicationEventKind : std::uint8_t {

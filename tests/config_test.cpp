@@ -872,3 +872,22 @@ TEST(RedisConfigTest, ValidatesClusterAnnouncePortResolution) {
 }
 
 }  // namespace
+
+TEST(RedisConfigTest, RedisExportDiskBudgetIsIndependentAndBounded) {
+  ServerOptions options;
+  const auto memory_budget = options.replication_options_.backlog_size_bytes_;
+  EXPECT_EQ(options.replication_options_.redis_export_disk_backlog_size_,
+            1ULL << 30);
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"redis-export-disk-backlog-size", "25mb"}, &options)
+                  .ok());
+  EXPECT_EQ(options.replication_options_.backlog_size_bytes_, memory_budget);
+  EXPECT_EQ(options.replication_options_.redis_export_disk_backlog_size_,
+            24ULL << 20);
+  EXPECT_FALSE(ApplyRedisConfigDirective(
+                   {"redis-export-disk-backlog-size", "0"}, &options)
+                   .ok());
+  EXPECT_FALSE(ApplyRedisConfigDirective(
+                   {"redis-export-disk-backlog-size", "1mb"}, &options)
+                   .ok());
+}
