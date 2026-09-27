@@ -63,6 +63,7 @@ void ApplyProjection(MetaDataControlRuntimeNode& node,
   node.last_lease_decision_.reset();
   node.health_received_unix_ms_ = 0;
   node.lease_decision_heartbeat_sequence_ = 0;
+  node.lease_decision_heartbeat_received_lease_ms_ = 0;
   node.lease_decision_written_unix_ms_ = 0;
 }
 
@@ -177,12 +178,14 @@ void MetaDataControlRuntimeStatus::RecordLeaseDecisionWritten(
     std::string_view node_id, const cluster::control::WireId128& session_id,
     std::uint64_t heartbeat_sequence,
     const cluster::control::LeaseDecision& written_decision,
-    std::int64_t written_unix_ms) {
+    std::int64_t heartbeat_received_lease_ms, std::int64_t written_unix_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto found = nodes_.find(std::string(node_id));
   if (found == nodes_.end() || found->second.session_id_ != session_id) return;
   found->second.last_lease_decision_ = written_decision;
   found->second.lease_decision_heartbeat_sequence_ = heartbeat_sequence;
+  found->second.lease_decision_heartbeat_received_lease_ms_ =
+      heartbeat_received_lease_ms;
   found->second.lease_decision_written_unix_ms_ = written_unix_ms;
 }
 

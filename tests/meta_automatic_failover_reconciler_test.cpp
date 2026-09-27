@@ -1323,6 +1323,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   ASSERT_TRUE(RecordOwnerLeaseDecision(seed, 7, handoff_pending).ok());
   data_runtime_->RecordLeaseDecisionWritten(
       seed.owner_, session_id, /*heartbeat_sequence=*/7, handoff_pending,
+      /*heartbeat_received_lease_ms=*/1'012'000,
       /*written_unix_ms=*/1'012'000);
 
   std::atomic<int> generated_ids{0};
@@ -1377,6 +1378,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
           .group_term = replacement_group.group_term_,
           .granted_duration_ms = 250,
       },
+      /*heartbeat_received_lease_ms=*/1'012'100,
       /*written_unix_ms=*/1'012'100);
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.blocker_ != MetaAutomaticFailoverBlocker::kAuthorityHandoff;
@@ -1439,6 +1441,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   };
   data_runtime_->RecordLeaseDecisionWritten(
       seed.owner_, Bytes<16>(0x33), /*heartbeat_sequence=*/1, node_not_ready,
+      /*heartbeat_received_lease_ms=*/1'000'000,
       /*written_unix_ms=*/1'000'000);
   const cluster::control::LeaseDenied handoff_pending{
       .reason = cluster::control::LeaseDenialReason::kAuthorityHandoffPending,
@@ -1470,6 +1473,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   ASSERT_TRUE(RecordOwnerLeaseDecisionWritten(seed, 3, node_not_ready).ok());
   data_runtime_->RecordLeaseDecisionWritten(
       seed.owner_, Bytes<16>(0x33), /*heartbeat_sequence=*/3, node_not_ready,
+      /*heartbeat_received_lease_ms=*/1'000'020,
       /*written_unix_ms=*/1'000'020);
 
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
@@ -1526,6 +1530,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
           .group_term = group.group_term_,
           .granted_duration_ms = 6'000,
       },
+      /*heartbeat_received_lease_ms=*/1'012'000,
       /*written_unix_ms=*/1'012'000);
 
   ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed,

@@ -2752,6 +2752,8 @@ bycorf::Task<absl::Status> RunEstablishedSession(
       const MetaCommittedView& latest_view = **cached_view;
       MetaStoresFacts facts(latest_view.stores());
       const std::int64_t heartbeat_received_unix_ms = NowUnixMillis();
+      const std::int64_t heartbeat_received_lease_ms =
+          cluster::LeaseClockMillis();
       const std::uint64_t heartbeat_received_steady_ms =
           static_cast<std::uint64_t>(ActiveClockMillis());
       MetaHeartbeatObservationResult observation = IngestHeartbeatObservations(
@@ -2846,7 +2848,8 @@ bycorf::Task<absl::Status> RunEstablishedSession(
       }
       state->core_->options_.runtime_status_->RecordLeaseDecisionWritten(
           state->node_id_, state->session_id_, cached_ack->heartbeat_sequence,
-          cached_ack->lease_decision, NowUnixMillis());
+          cached_ack->lease_decision, heartbeat_received_lease_ms,
+          NowUnixMillis());
       continue;
     }
 

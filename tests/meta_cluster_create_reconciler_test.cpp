@@ -15,8 +15,10 @@
  */
 
 #include <limits>
+#include <variant>
 
 #include "gtest/gtest.h"
+#include "lavik/cluster/lease_clock.h"
 #include "lavik/meta/cluster_create.h"
 #include "lavik/meta/cluster_create_reconciler.h"
 #include "lavik/meta/control_projector.h"
@@ -129,6 +131,7 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
   }
 
   void PublishRuntime() {
+    runtime_.leader_term_ = 1;
     runtime_.leader_authority_eligible_ = true;
     for (std::size_t index = 0; index < manifest_.data_nodes_.size(); ++index) {
       const auto& declaration = manifest_.data_nodes_[index];
@@ -160,8 +163,24 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
       node.replication_history_id_.fill(static_cast<std::uint8_t>(10 + index));
       node.replication_flow_count_ = index == 0 ? 3 : 2;
       node.control_revision_ = index_;
+      node.leader_term_ = runtime_.leader_term_;
       node.validated_committed_high_water_ =
           std::numeric_limits<std::uint64_t>::max();
+      node.health_ = cluster::control::HeartbeatHealth{
+          .storage_ready = true, .population_ready = true};
+      if (declaration.node_id_ == group_declaration->primary_node_id_) {
+        node.last_lease_decision_ = cluster::control::LeaseGranted{
+            .leader_id = 1,
+            .raft_term = node.leader_term_,
+            .data_boot_id = node.boot_id_,
+            .control_revision = node.control_revision_,
+            .group_id = group->group_id_,
+            .assignment_id = member->assignment_id_,
+            .group_term = grant->group_term_,
+            .granted_duration_ms = 60'000};
+        node.lease_decision_heartbeat_received_lease_ms_ =
+            cluster::LeaseClockMillis();
+      }
       node.groups_.push_back({group->group_id_, member->assignment_id_,
                               group->record_.group_term_,
                               group->record_.population_manifest_revision_,
@@ -485,6 +504,49 @@ TEST_F(ClusterCreateV1RecoveryTest,
   ApplyPlanned();  // group-b: submit only after group-a completes
   EXPECT_EQ(GroupOperation("group-b").lifecycle_,
             MetaOperationLifecycle::kSubmitted);
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       WaitsForCurrentSourceLeaseBeforeReplicaRebuild) {
+  StartFirstAuthorizationBatch();
+  const auto child = GroupOperation("group-a");
+  ASSERT_EQ(child.current_directives_.size(), 1);
+  CommitResult(child, child.current_directives_.front(),
+               MetaDirectiveResultStatus::kSucceeded);
+
+  auto& source = runtime_.nodes_.front();
+  const auto grant = *source.last_lease_decision_;
+  source.last_lease_decision_ = cluster::control::LeaseDenied{};
+  auto waiting = Plan();
+  ASSERT_TRUE(waiting.ok()) << waiting.status();
+  EXPECT_FALSE(waiting->has_value());
+
+  source.last_lease_decision_ = grant;
+  source.lease_decision_heartbeat_received_lease_ms_ =
+      cluster::LeaseClockMillis() - 60'001;
+  waiting = Plan();
+  ASSERT_TRUE(waiting.ok()) << waiting.status();
+  EXPECT_FALSE(waiting->has_value());
+
+  source.lease_decision_heartbeat_received_lease_ms_ =
+      cluster::LeaseClockMillis();
+  std::get<cluster::control::LeaseGranted>(*source.last_lease_decision_)
+      .data_boot_id = std::string(40, 'f');
+  waiting = Plan();
+  ASSERT_TRUE(waiting.ok()) << waiting.status();
+  EXPECT_FALSE(waiting->has_value());
+
+  source.last_lease_decision_ = grant;
+  runtime_.leader_authority_eligible_ = false;
+  waiting = Plan();
+  ASSERT_TRUE(waiting.ok()) << waiting.status();
+  EXPECT_FALSE(waiting->has_value());
+
+  runtime_.leader_authority_eligible_ = true;
+  ApplyPlanned();
+  const auto rebuilt = GroupOperation("group-a");
+  ASSERT_EQ(rebuilt.current_directives_.size(), 2);
+  EXPECT_EQ(rebuilt.current_directives_[1].spec_.kind_, kMetaDirectiveRebuild);
 }
 
 TEST_F(ClusterCreateV1RecoveryTest,

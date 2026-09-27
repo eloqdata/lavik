@@ -67,10 +67,13 @@ struct MetaDataControlRuntimeNode {
   // Cleared with the projection/health or any heartbeat without accepted proof.
   std::optional<cluster::control::CandidateProgress> replica_progress_;
   std::optional<cluster::control::LeaseDecision> last_lease_decision_;
-  // Sequence of the heartbeat whose Ack carried last_lease_decision_. Keeping
-  // the pair lets causal consumers bind a written Grant to the exact request
-  // receive time without introducing a second clock sample.
+  // Sequence of the heartbeat whose Ack carried last_lease_decision_. The
+  // receive and write times belong to that exact heartbeat, even if a later
+  // health observation replaces health_received_unix_ms_.
   std::uint64_t lease_decision_heartbeat_sequence_ = 0;
+  // Meta received this heartbeat before Data could receive its Ack. Aging a
+  // grant from this suspend-aware clock cannot outlive Data's lease duration.
+  std::int64_t lease_decision_heartbeat_received_lease_ms_ = 0;
   std::int64_t lease_decision_written_unix_ms_ = 0;
 };
 
@@ -149,14 +152,14 @@ class MetaDataControlRuntimeStatus {
       const cluster::control::HeartbeatHealth& health,
       std::int64_t received_unix_ms,
       const cluster::control::CandidateProgress* replica_progress = nullptr);
-  // Records a lease decision only after its Ack was written successfully. The
-  // heartbeat sequence is atomically bound to that decision in the same
-  // runtime update.
+  // Records a lease decision only after its Ack was written successfully.
+  // Its heartbeat sequence and suspend-aware request receive time are
+  // atomically bound to that decision; later health cannot extend an old Grant.
   void RecordLeaseDecisionWritten(
       std::string_view node_id, const cluster::control::WireId128& session_id,
       std::uint64_t heartbeat_sequence,
       const cluster::control::LeaseDecision& written_decision,
-      std::int64_t written_unix_ms);
+      std::int64_t heartbeat_received_lease_ms, std::int64_t written_unix_ms);
   // Removes only the matching session. A null session_id is a no-op: a
   // rejected handshake never owned a runtime incarnation and must not erase
   // an incumbent. Leadership teardown clears all nodes through EndLeadership.
