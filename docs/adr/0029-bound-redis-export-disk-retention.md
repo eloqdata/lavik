@@ -18,8 +18,9 @@ limitations under the License.
 
 ## Status
 
-Accepted for [#122](https://github.com/eloqdata/lavik/issues/122); implementation
-and end-to-end acceptance remain incomplete.
+Accepted for [#122](https://github.com/eloqdata/lavik/issues/122). The shared
+PSYNC exporter implements this decision; the operational contract and
+completion checks are in the [export runbook](../operations/redis-export.md).
 
 ## Decision
 

@@ -74,12 +74,12 @@ def expired(root, mode, ack):
             src.close()
 
 
-def controlled(root, mode, slow=False):
+def controlled(root, mode, slow=False, abort=False):
     fixture = F.FailoverFixture(
         N.C.META,
         N.C.DATA,
         N.C.CTL,
-        str(root / f"controlled-{mode}-{slow}"),
+        str(root / f"controlled-{mode}-{slow}-{abort}"),
         True,
         pause_after_begin_ms=8000,
         data_workers=2,
@@ -128,7 +128,7 @@ def controlled(root, mode, slow=False):
             writing = pool.submit(writes)
             time.sleep(2)
             assert not writing.done(), "exporter did not apply backpressure"
-        fixture.submit_failover()
+        operation = fixture.submit_failover()
         assert fixture.wait_post_begin_pause()
         N.H.wait_until(
             "controlled write pause",
@@ -136,6 +136,37 @@ def controlled(root, mode, slow=False):
             lambda: F.redis_error(owner, ["SET", "pause", "x"], timeout=0.1)
             == "TRYAGAIN Failover in progress",
         )
+        if abort:
+            begin = F.require_unique_failover_event(
+                fixture.metas, "begin", "controlled", loss="none"
+            )
+            fixture.by_id[begin["candidate"]].force_kill()
+            F.wait_operation(
+                fixture,
+                operation,
+                "OK aborted controlled failover candidate became unavailable",
+                "cancelled pause restores original Owner",
+            )
+
+            def resumed():
+                try:
+                    return src.set("{export}:abort", "resumed")
+                except redis.ResponseError:
+                    return False
+
+            N.H.wait_until(
+                "writes resume after cancelled pause",
+                15,
+                resumed,
+            )
+            assert src.info("replication")["redis_export_session_id"] == session
+            data = b""
+            while b"resumed" not in data:
+                part = export.sock.recv(65536)
+                assert part, "cancelled pause disconnected the valid export"
+                data += part
+            src.close()
+            return
         if slow:
             writing.result(timeout=30)
         else:
@@ -267,6 +298,7 @@ if __name__ == "__main__":
         for ack in ("rdb", False, True):
             expired(root, mode, ack)
         controlled(root, mode)
+        controlled(root, mode, abort=True)
         controlled(root, mode, slow=True)
         for uncontrolled in (False, True):
             shake_failover(root, mode, uncontrolled)
