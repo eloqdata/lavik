@@ -1649,7 +1649,9 @@ endforeach()
     set_tests_properties(lavik_native_ack_e2e PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
     find_program(LAVIK_REDIS_SERVER_EXECUTABLE redis-server)
     find_program(LAVIK_REDIS_CLI_EXECUTABLE redis-cli)
-    if (LAVIK_REDIS_CLI_EXECUTABLE)
+    # Lavik's io_uring runtime is Linux-only, and this test provisions its
+    # backing files with the Linux fallocate utility.
+    if (LAVIK_REDIS_CLI_EXECUTABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
       add_test(NAME lavik_native_replicaof_e2e
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/native_replicaof_e2e.sh
                 $<TARGET_FILE:lavik> ${LAVIK_REDIS_CLI_EXECUTABLE})

@@ -59,7 +59,9 @@ Redis password authentication.
 `AUTH <password>` or `AUTH default <password>`. Other commands return `NOAUTH`
 until authentication succeeds. This implementation intentionally does not add
 the Redis ACL command/file model; put `requirepass` in the main configuration
-file when the password must survive a restart.
+file when the password must survive a restart. An authenticated client can run
+administrative commands, including `REPLICAOF` and `LAVIK.REPLICAOF`; restrict
+client access to trusted operators when exposing these commands.
 
 ## Following Redis over TLS
 
@@ -96,8 +98,11 @@ endpoint, and does not fall back to native replication.
 Set `masterauth` (and `masteruser default`) when the source requires a Redis
 password. For TLS, use the source's TLS port with `tls-replication yes` and a
 trusted `tls-ca-cert-file`; the same outgoing replication credentials and TLS
-identity apply to the native control and flow connections. The native command
-is runtime-only; startup `replicaof` remains a Redis PSYNC setting.
+identity apply to the native control and flow connections. When `masterauth`
+is set without `tls-replication yes`, the native `AUTH` exchange sends it over
+plaintext, as with Redis `REPLICAOF`. Enable TLS when credentials or replicated
+data cross an untrusted network. The native command is runtime-only; startup
+`replicaof` remains a Redis PSYNC setting.
 `CONFIG REWRITE` rejects a native upstream rather than saving it as a Redis
 `replicaof` directive.
 
