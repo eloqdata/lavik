@@ -623,12 +623,14 @@ struct StorageEngine::Impl::StreamPageAccess {
         co_return plan;
       }
       const std::set<std::uint64_t> retired_set(retired.begin(), retired.end());
-      for (std::size_t i = 0; i < groups.size(); ++i) {
-        if (!retired_set.contains(groups[i].id_) &&
-            (retired_set.contains(groups[i].previous_) ||
-             retired_set.contains(groups[i].next_))) {
-          auto status = co_await Load(i);
-          if (!status.ok()) co_return status;
+      if (!retired_set.empty()) {
+        for (std::size_t i = 0; i < groups.size(); ++i) {
+          if (!retired_set.contains(groups[i].id_) &&
+              (retired_set.contains(groups[i].previous_) ||
+               retired_set.contains(groups[i].next_))) {
+            auto status = co_await Load(i);
+            if (!status.ok()) co_return status;
+          }
         }
       }
       for (auto& change : changes) {

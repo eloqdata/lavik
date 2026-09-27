@@ -131,7 +131,8 @@ tombstone/graph retirement path.
 
 Views share unchanged physical index pages across mutations. Hash routing
 nodes are persistent; the ordered rank directory owns admitted metadata
-vectors and reconstructs them for page-content or topology changes. Routing
+vectors. Local page replacements copy the vectors and update aggregate ranks;
+topology changes rebuild and validate the complete chain. Routing
 and physical-index node references, including final destruction, remain on
 the key owner. Cross-worker readers exchange physical identities or stream
 handles that route metadata access and cleanup back to that owner. Retained

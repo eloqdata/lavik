@@ -459,6 +459,48 @@ TEST(GroupedCollectionTest,
   EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 2, candidates, {}).ok());
 }
 
+TEST(GroupedCollectionTest, SparseSameTopologyUpdateMatchesFullRecovery) {
+  std::vector<OrderedGroupSnapshot> pages;
+  for (std::uint64_t id = 1; id <= 128; ++id) {
+    auto page = Page(id, 2);
+    page.previous_ = id == 1 ? 0 : id - 1;
+    page.next_ = id == 128 ? 0 : id + 1;
+    pages.push_back(std::move(page));
+  }
+  auto root = Root(pages, 129);
+  root.revision_ = 1;
+  auto records = Candidates(pages);
+  auto original = OrderedGroupDirectory::Recover(root, 1, records, {});
+  ASSERT_TRUE(original.ok()) << original.status();
+
+  auto changed = records[63];
+  changed.sequence_ = changed.lsn_ = 2;
+  changed.item_count_ = 4;
+  root.item_count_ += 2;
+  root.revision_ = 2;
+  auto updated = original->Apply(root, 2, std::span(&changed, 1), 2);
+  ASSERT_TRUE(updated.ok()) << updated.status();
+  records.push_back(changed);
+  auto recovered = OrderedGroupDirectory::Recover(root, 2, records, {});
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  ASSERT_EQ(updated->groups().size(), recovered->groups().size());
+  for (std::size_t i = 0; i < updated->groups().size(); ++i)
+    EXPECT_EQ(updated->groups()[i].item_count_,
+              recovered->groups()[i].item_count_);
+  for (std::uint64_t rank = 0; rank < root.item_count_; ++rank) {
+    const auto fast = updated->FindRank(rank);
+    const auto complete = recovered->FindRank(rank);
+    ASSERT_TRUE(fast && complete);
+    EXPECT_EQ(fast->group_index_, complete->group_index_);
+    EXPECT_EQ(fast->offset_, complete->offset_);
+  }
+  EXPECT_EQ(original->root().item_count_, 256);
+
+  changed.min_score_ = 1;
+  changed.max_score_ = 0;
+  EXPECT_FALSE(original->Apply(root, 2, std::span(&changed, 1), 2).ok());
+}
+
 TEST(GroupedCollectionTest,
      DirectoryRejectsMissingCyclesDisconnectedAndWrongCounts) {
   auto split = SplitOrderedGroup(Page(1, 8), 2, 84);

@@ -720,25 +720,14 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     }
     return result;
   }
-  std::vector<RecoveredOrderedGroup> candidates;
-  candidates.reserve(groups_.size() + retired_.size() + changed.size());
-  // These previous candidates are already adjudicated by this root. Their
-  // original transaction ids are not re-decided by a later command's batch.
-  auto append = [&](RecoveredOrderedGroup item) {
-    item.txid_ = 0;
-    item.batch_txid_ = 0;
-    candidates.push_back(item);
-  };
-  for (const auto& item : groups_) append(item);
-  for (const auto& item : retired_) append(item);
-  absl::flat_hash_set<std::uint64_t> ids;
+  absl::flat_hash_set<std::uint64_t> changed_ids;
+  changed_ids.reserve(changed.size());
   for (const auto& item : changed) {
-    if (item.sequence_ != revision || !ids.insert(item.id_).second ||
+    if (item.incarnation_ != root.incarnation_ || item.sequence_ != revision ||
+        !changed_ids.insert(item.id_).second ||
         (FindRecord(item.id_) != nullptr && FindRecord(item.id_)->retired_ &&
-         !item.retired_)) {
+         !item.retired_))
       return absl::DataLossError("invalid ordered changed page identity");
-    }
-    append(item);
   }
   auto members = members_;
   if (root.member_index_.has_value() != members.has_value())
@@ -751,6 +740,88 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
   } else if (!member_changes.empty()) {
     return absl::DataLossError("member writes without a new member revision");
   }
+  if (members && members->root() != *root.member_index_)
+    return absl::DataLossError("Sorted Set member directory/root mismatch");
+
+  // Most writes replace a few pages without changing their order or links.
+  // Rebuild rank totals in one pass instead of allocating and adjudicating a
+  // map entry for every unchanged page. Structural edits still use Recover's
+  // complete-chain validation below.
+  bool same_topology = root.group_count_ == groups_.size() &&
+                       root.first_group_ == root_.first_group_ &&
+                       root.last_group_ == root_.last_group_ &&
+                       root.next_group_id_ == root_.next_group_id_;
+  if (same_topology) {
+    for (const auto& item : changed) {
+      const auto* previous = Find(item.id_);
+      if (previous == nullptr || item.retired_ ||
+          item.previous_ != previous->previous_ ||
+          item.next_ != previous->next_) {
+        same_topology = false;
+        break;
+      }
+    }
+  }
+  if (same_topology) {
+    if (!ValidRoot(root) || (root.revision_ != 0 && root.revision_ != revision))
+      return absl::DataLossError("invalid ordered same-topology root");
+    OrderedGroupDirectory result;
+    result.root_ = root;
+    result.root_.revision_ = revision;
+    result.sequence_ = revision;
+    result.command_sequence_ = command_sequence;
+    result.groups_ = groups_;
+    result.retired_ = retired_;
+    result.ids_ = ids_;
+    result.ends_ = ends_;
+    result.members_ = std::move(members);
+    if (root.kind_ == OrderedCollectionKind::kStream && has_stream_header_) {
+      result.stream_header_ = stream_header_;
+      result.has_stream_header_ = !changed_ids.contains(root.first_group_);
+    }
+    for (auto item : changed) {
+      const auto found = std::lower_bound(
+          result.ids_.begin(), result.ids_.end(), item.id_,
+          [](const auto& entry, auto id) { return entry.first < id; });
+      if (found == result.ids_.end() || found->first != item.id_)
+        return absl::DataLossError("missing ordered same-topology page");
+      item.txid_ = 0;
+      item.batch_txid_ = 0;
+      result.groups_[found->second] = item;
+    }
+    std::uint64_t count = 0;
+    for (std::size_t i = 0; i < result.groups_.size(); ++i) {
+      const auto& item = result.groups_[i];
+      if (item.item_count_ == 0 ||
+          item.item_count_ > root.item_count_ - count ||
+          item.record_token_ == 0 || item.sequence_ == 0 || item.lsn_ == 0 ||
+          std::isnan(item.min_score_) || std::isnan(item.max_score_) ||
+          item.min_score_ > item.max_score_ ||
+          (root.kind_ == OrderedCollectionKind::kSortedSet && i != 0 &&
+           result.groups_[i - 1].max_score_ > item.min_score_) ||
+          item.encoded_bytes_ > std::numeric_limits<std::uint64_t>::max() -
+                                    result.total_group_bytes_)
+        return absl::DataLossError("invalid ordered same-topology page");
+      count += item.item_count_;
+      result.total_group_bytes_ += item.encoded_bytes_;
+      result.ends_[i] = count;
+    }
+    if (count != root.item_count_)
+      return absl::DataLossError("ordered same-topology count mismatch");
+    return result;
+  }
+  std::vector<RecoveredOrderedGroup> candidates;
+  candidates.reserve(groups_.size() + retired_.size() + changed.size());
+  // These previous candidates are already adjudicated by this root. Their
+  // original transaction ids are not re-decided by a later command's batch.
+  auto append = [&](RecoveredOrderedGroup item) {
+    item.txid_ = 0;
+    item.batch_txid_ = 0;
+    candidates.push_back(item);
+  };
+  for (const auto& item : groups_) append(item);
+  for (const auto& item : retired_) append(item);
+  for (const auto& item : changed) append(item);
   auto rebuilt = Recover(root, revision, candidates, {}, command_sequence,
                          std::move(members));
   if (!rebuilt.ok()) return rebuilt.status();
