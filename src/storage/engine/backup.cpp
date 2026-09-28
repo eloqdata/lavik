@@ -226,10 +226,9 @@ Task<absl::Status> StorageEngine::Impl::PinRdbSnapshotValue(
       co_await block_store.store_state_mutex_.Lock();
       UnlockGuard unlock(&block_store.store_state_mutex_, block_store.worker_);
       BlockState* state = FindBlockState(block_store, pin.block_id_);
-      // Defrag may have claimed this block while the snapshot holds the key
-      // lock. Pinning it is safe until freeing starts: defrag waits for pins
-      // before releasing the source, and rejecting it here would make the
-      // snapshot retry while defrag waits for that same key lock.
+      // Defrag keeps source bytes intact and waits for pins before freeing.
+      // Rejecting a block merely because defrag claimed it can make snapshot
+      // retries spin without yielding to the worker running defrag.
       if (state == nullptr || !state->allocated_ || state->freeing_ ||
           state->allocation_epoch_ != pin.allocation_epoch_ ||
           (pin.extent_ && state->kind_ != BlockKind::kPayloadExtent) ||

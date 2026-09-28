@@ -580,33 +580,39 @@ Task<absl::Status> StorageEngine::Impl::PromoteTxBlockLocal(
 
 Task<absl::Status> StorageEngine::Impl::RetireTxBlockLocal(
     WorkerStore& store, const TxCleanerBlock& block) {
+  assert(block.sealed_and_durable_ && !block.active_transaction_);
   std::uint32_t retired_backlog_bytes = 0;
   {
     co_await store.store_state_mutex_.Lock();
     UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
     const auto found = store.tx_blocks_.find(block.block_id_);
     BlockState* state = FindBlockState(store, block.block_id_);
-    bool active_transaction = false;
-    if (found != store.tx_blocks_.end())
-      for (const auto& [txid, lease] : found->second.txids_) {
-        (void)txid;
-        active_transaction |= !lease.expired();
-      }
     if (found == store.tx_blocks_.end() || state == nullptr ||
         found->second.allocation_epoch_ != block.allocation_epoch_ ||
-        state->allocation_epoch_ != block.allocation_epoch_ ||
-        state->kind_ != BlockKind::kTransaction || state->in_memory_ ||
-        state->flush_queued_ || state->flush_in_progress_ ||
-        state->defragging_ || state->freeing_ || state->pins_ != 0 ||
-        found->second.live_tagged_bytes_ != 0 ||
-        found->second.dependency_pins_ != 0 || active_transaction ||
-        !found->second.counted_backlog_ ||
-        store.pending_relocation_fences_.contains(block.block_id_) ||
-        IsActiveBlock(store, block.block_id_))
+        state->allocation_epoch_ != block.allocation_epoch_)
       co_return absl::FailedPreconditionError(
           "transaction block changed before retirement");
+
+    // eligible() selected a sealed, durable block whose leases had ended.
+    // It cannot reopen or gain writers, and an expired lease cannot revive.
+    // Only this cleaner promotes/retires Tx blocks; all promotions have joined.
+    assert(state->kind_ == BlockKind::kTransaction);
+    assert(found->second.counted_backlog_);
+    assert(!state->defragging_ && !state->freeing_);
+
+    // Reads and undo dependencies can still acquire references after
+    // inspection.
+    if (state->pins_ != 0 || found->second.live_tagged_bytes_ != 0 ||
+        found->second.dependency_pins_ != 0)
+      co_return absl::FailedPreconditionError(
+          "transaction block is still referenced");
+    // A failed promotion may have moved winners without making them durable.
+    if (store.pending_relocation_fences_.contains(block.block_id_))
+      co_return absl::FailedPreconditionError(
+          "transaction block has pending relocation durability");
+
     retired_backlog_bytes = found->second.backlog_bytes_;
-    state->freeing_ = true;
+    // No suspension between the final checks and retiring the runtime block.
     DestroyBlockState(store, block.block_id_);
   }
   const absl::Status returned =
