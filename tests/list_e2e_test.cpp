@@ -626,37 +626,6 @@ bool WaitForDurability(RespClient& client) {
   return false;
 }
 
-std::uint64_t TxCleanerRetiredGenerations(RespClient& client) {
-  constexpr std::string_view marker = "tx_cleaner_retired_generations:";
-  const std::string info = client.Command({"INFO", "STATS"});
-  const std::size_t begin = info.find(marker);
-  if (begin == std::string::npos) {
-    throw std::runtime_error("tx cleaner INFO field is missing");
-  }
-  const std::size_t value_begin = begin + marker.size();
-  const std::size_t value_end = info.find("\r\n", value_begin);
-  if (value_end == std::string::npos) {
-    throw std::runtime_error("malformed tx cleaner INFO field");
-  }
-  std::uint64_t retired = 0;
-  const char* first = info.data() + value_begin;
-  const char* last = info.data() + value_end;
-  const auto [parsed, error] = std::from_chars(first, last, retired);
-  if (error != std::errc{} || parsed != last) {
-    throw std::runtime_error("invalid tx cleaner INFO counter");
-  }
-  return retired;
-}
-
-bool WaitForTxCleanerRetirement(RespClient& client, std::uint64_t baseline) {
-  const auto deadline = std::chrono::steady_clock::now() + 30s;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (TxCleanerRetiredGenerations(client) > baseline) return true;
-    std::this_thread::sleep_for(10ms);
-  }
-  return false;
-}
-
 class ServerProcess {
  public:
   ServerProcess(
@@ -3017,7 +2986,7 @@ void LargeHashDurabilityE2eTest::CheckGcCrash(std::string_view point) {
   const std::string filler_value(16 * 1024 - 1, 'f');
   std::vector<std::string> fillers;
   // Fill ordinary record blocks with compact Strings; values at 16 KiB
-  // would promote and move their payloads into transaction generations.
+  // would promote and move their payloads into transaction blocks.
   for (unsigned i = 0; i < 400; ++i)
     fillers.push_back(std::string("{large-hash-gc}:filler-") +
                       std::to_string(i));
@@ -3026,7 +2995,7 @@ void LargeHashDurabilityE2eTest::CheckGcCrash(std::string_view point) {
     RespClient client(port_);
     ASSERT_EQ(client.Command(WriteCommand(value)), ":10");
     // Same hash slot puts the root beside filler payloads. Group children
-    // belong to transaction generations and are relocated by the tx cleaner.
+    // belong to transaction blocks and are relocated by the tx cleaner.
     for (const auto& key : fillers)
       ASSERT_EQ(client.Command({"SET", key, filler_value}), "+OK");
     ASSERT_TRUE(WaitForDurability(client));

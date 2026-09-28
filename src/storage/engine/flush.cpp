@@ -141,6 +141,7 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
       co_await store->store_state_mutex_.Lock();
       UnlockGuard guard(&store->store_state_mutex_, store->worker_);
       FlushActiveBlock(*store);
+      SealIdleTxBlocksLocal(*store);
     }
     RequestIndirectKeyCleaning(*store);
     status = co_await MaybeRunTxCleaner();
@@ -286,13 +287,9 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
                  store->active_indirect_key_block_->block_id_ == block_id) {
         store->active_indirect_key_block_->committed_bytes_ = padded;
       } else {
-        for (auto& [generation, active] : store->active_tx_blocks_) {
-          (void)generation;
-          if (active.has_value() && active->block_id_ == block_id) {
-            active->committed_bytes_ = padded;
-            break;
-          }
-        }
+        if (store->active_tx_block_ &&
+            store->active_tx_block_->block_id_ == block_id)
+          store->active_tx_block_->committed_bytes_ = padded;
       }
       ++staging_state.header_sequence_;
       const std::uint8_t slot = HeaderSlot(staging_state.header_sequence_);
@@ -312,9 +309,6 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           .checksum_ = 0,
           .layout_worker_count_ = state->layout_worker_count_,
           .kind_ = state->kind_,
-          .tx_generation_ = state->kind_ == BlockKind::kTransaction
-                                ? store->tx_blocks_.at(block_id).generation_
-                                : 0,
       };
       EncodeBlockHeader(header, std::span<std::byte, kBlockHeaderSlotBytes>(
                                     buffer.data_ + slot * kBlockHeaderSlotBytes,
@@ -592,10 +586,8 @@ bool StorageEngine::Impl::IsActiveBlock(const WorkerStore& store,
   if (store.active_indirect_key_block_ &&
       store.active_indirect_key_block_->block_id_ == block_id)
     return true;
-  for (const auto& [generation, active] : store.active_tx_blocks_) {
-    (void)generation;
-    if (active.has_value() && active->block_id_ == block_id) return true;
-  }
+  if (store.active_tx_block_ && store.active_tx_block_->block_id_ == block_id)
+    return true;
   return false;
 }
 

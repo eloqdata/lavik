@@ -262,8 +262,10 @@ Task<absl::Status> StorageEngine::Impl::PinRdbSnapshotValue(
       co_await block_store.store_state_mutex_.Lock();
       UnlockGuard unlock(&block_store.store_state_mutex_, block_store.worker_);
       BlockState* state = FindBlockState(block_store, pin.block_id_);
+      // Defrag keeps source bytes intact and waits for pins before freeing.
+      // Rejecting a block merely because defrag claimed it can make snapshot
+      // retries spin without yielding to the worker running defrag.
       if (state == nullptr || !state->allocated_ || state->freeing_ ||
-          state->defragging_ ||
           state->allocation_epoch_ != pin.allocation_epoch_ ||
           (pin.extent_ && state->kind_ != BlockKind::kPayloadExtent) ||
           (!pin.extent_ && state->kind_ == BlockKind::kPayloadExtent) ||

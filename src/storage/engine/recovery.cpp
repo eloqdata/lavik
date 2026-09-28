@@ -467,7 +467,6 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               .record_count_ = block.record_count_,
               .max_lsn_ = block.max_lsn_,
               .kind_ = block.kind_,
-              .tx_generation_ = block.tx_generation_,
               .extent_index_ = block.extent_index_,
               .extent_payload_checksum_ = block.extent_payload_checksum_,
           }});
@@ -952,12 +951,13 @@ absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
     state.allocated_ = true;
     state.kind_ = block.kind_;
     if (block.kind_ == BlockKind::kTransaction) {
-      RegisterRecoveredTxGeneration(store, block.tx_generation_);
       store.tx_blocks_.insert_or_assign(
           block.block_id_, WorkerStore::TxBlockRuntime{
                                .allocation_epoch_ = block.allocation_epoch_,
-                               .generation_ = block.tx_generation_,
+                               .txids_ = {},
+                               .commit_ends_ = {},
                            });
+      NoteTxBlockSealedLocal(store, block.block_id_);
     }
     if (block.kind_ == BlockKind::kPayloadExtent) {
       store.recovered_extents_[block.block_id_] = ExtentIdentity{
@@ -1003,8 +1003,7 @@ absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
         continue;
       }
       NoteTxRecordLocal(store, commit.block_id_, state->allocation_epoch_,
-                        tx_block->second.generation_, commit.txid_,
-                        commit.bytes_, true);
+                        commit.txid_, commit.bytes_, true);
     }
   }
   return absl::OkStatus();

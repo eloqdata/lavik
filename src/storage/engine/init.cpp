@@ -1051,9 +1051,9 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryLiveReferenceBatches(
               owner_store.tx_blocks_.find(reference.block_id_);
           if (tx_block != owner_store.tx_blocks_.end()) {
             NoteTxRecordLocal(owner_store, reference.block_id_,
-                              reference.allocation_epoch_,
-                              tx_block->second.generation_, reference.txid_,
-                              reference.bytes_, false);
+                              reference.allocation_epoch_, reference.txid_,
+                              reference.bytes_, false, nullptr, 0,
+                              reference.batch_txid_);
           }
         }
       }
@@ -1713,6 +1713,11 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         .block_id_ = location.block_id(),
         .allocation_epoch_ = location.allocation_epoch(),
         .txid_ = recovered.txid_,
+        .batch_txid_ = recovered.auxiliary_group_.has_value()
+                           ? recovered.auxiliary_group_->batch_txid_
+                       : recovered.ordered_group_.has_value()
+                           ? recovered.ordered_group_->batch_txid_
+                           : 0,
         .bytes_ = location.total_disk_bytes(),
         .expected_owner_ = location.block_owner(),
     });
@@ -2288,6 +2293,12 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
   co_await store->active_block_allocation_mutex_.Lock();
   UnlockGuard allocation_guard(&store->active_block_allocation_mutex_,
                                store->worker_);
+  // Both append streams can install a block after their allocator wait.
+  // Join both allocation gates before sealing so neither can publish a new
+  // stream outside the shutdown flush.
+  co_await store->active_tx_block_allocation_mutex_.Lock();
+  UnlockGuard tx_allocation_guard(&store->active_tx_block_allocation_mutex_,
+                                  store->worker_);
   std::optional<ReservedBlock> standby;
   co_await store->store_state_mutex_.Lock();
   {

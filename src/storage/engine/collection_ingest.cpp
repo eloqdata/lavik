@@ -22,12 +22,12 @@ namespace {
 
 using IngestPhysical = std::tuple<std::uint64_t, std::uint64_t, std::uint32_t>;
 
-// The generation lease is intentionally opaque. Extending its owner with an
+// The transaction lease is intentionally opaque. Extending its owner with an
 // admitted journal charge keeps merged outer receipts accounted until their
 // actual commit/abort owner releases them, without retaining the ingest itself.
 struct IngestReceiptLease {
   RetainedMemoryCharge charge_;
-  std::shared_ptr<void> generation_;
+  std::shared_ptr<void> transaction_;
 };
 
 template <typename T>
@@ -171,8 +171,8 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     }
   } else {
     // The key intent is held, but no transaction lease or store mutex is held
-    // yet. Ingest batches later borrow this accumulator and must not attempt
-    // to clean their own still-uncommitted generation between input pages.
+    // yet. Ingest batches later borrow this accumulator and must not wait for
+    // reclamation while their own transaction is still open.
     co_await store.store_state_mutex_.Lock();
     const auto predecessor = co_await AwaitGroupedDependencyLocked(
         store, partition.grouped_objects_[db_id].CurrentForMutation(key), 0);
@@ -212,13 +212,12 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       store,        writes, outer, previous_collect_undo, state->undo_charge_,
       receipt_owner};
   writes.collect_undo_ = true;
-  receipt_owner->generation_ = writes.generation_lease_;
-  writes.generation_lease_ = receipt_owner;
+  receipt_owner->transaction_ = writes.transaction_lease_;
+  writes.transaction_lease_ = receipt_owner;
   TxShardWrites batch;
   batch.txid_ =
       tx::TxRuntime::Get()->next_txid_.fetch_add(1, std::memory_order_relaxed);
-  batch.generation_ = writes.generation_;
-  batch.generation_lease_ = writes.generation_lease_;
+  batch.transaction_lease_ = writes.transaction_lease_;
   const auto batch_decision = PrepareGroupedDecision(batch);
   if (!batch_decision.ok()) {
     return_accumulator.completed_ = true;

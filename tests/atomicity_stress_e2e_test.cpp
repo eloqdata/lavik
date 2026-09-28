@@ -339,7 +339,7 @@ std::string ReadFile(const std::string& path) {
 }
 
 // Bound the append workload independently of host throughput. A timed loop
-// can exhaust the fixed device with outstanding transaction generations before
+// can exhaust the fixed device with outstanding transaction blocks before
 // cleaning catches up, turning the snapshot test into a capacity race. Four
 // writers each perform this many acknowledged mutations while readers contend.
 constexpr std::uint64_t kWritesPerWriter = 2000;

@@ -70,7 +70,6 @@
 #include "lavik/storage/detail/replica_collection_stage.h"
 #include "lavik/storage/format.h"
 #include "lavik/storage/scan_hash_map.h"
-#include "lavik/storage/tx_cleaner.h"
 #include "lavik/tx/tx_shard.h"
 #include "spdlog/spdlog.h"
 
@@ -253,7 +252,6 @@ struct ActiveBlock {
   std::byte* heap_buffer_ = nullptr;
   std::size_t heap_buffer_size_ = 0;
   BlockKind kind_ = BlockKind::kRecords;
-  std::uint64_t tx_generation_ = 0;
   std::uint32_t extent_index_ = 0;
   std::uint32_t extent_payload_checksum_ = 0;
 };
@@ -454,6 +452,7 @@ struct RecoveryLiveReference {
   std::uint64_t block_id_ = 0;
   std::uint64_t allocation_epoch_ = 0;
   std::uint64_t txid_ = 0;
+  std::uint64_t batch_txid_ = 0;
   // Total bytes charged for live references. Shared extents can contribute
   // the same physical payload more than once, so this may exceed the block's
   // committed payload size after checkpoint aggregation.
@@ -555,21 +554,21 @@ struct StagedRetiredRecord {
 
 static_assert(sizeof(StagedRetiredRecord) == 48);
 
-struct TxGenerationBlock {
+struct TxCleanerBlock {
   std::uint64_t block_id_ = 0;
   std::uint64_t allocation_epoch_ = 0;
-  std::uint64_t generation_ = 0;
   std::uint64_t live_tagged_bytes_ = 0;
+  std::uint32_t dependency_pins_ = 0;
+  std::vector<std::uint64_t> txids_;
+  // Runtime commits store their exact append boundary; recovered decisions
+  // use zero because their selected block header was already validated.
+  std::vector<std::pair<std::uint64_t, std::uint32_t>> commit_decisions_;
+  bool active_transaction_ = false;
+  bool sealed_and_durable_ = false;
+  bool pending_relocation_ = false;
 };
 
-struct TxGenerationLocalState {
-  std::vector<TxGenerationBlock> blocks_;
-  std::vector<std::uint64_t> committed_txids_;
-  std::uint64_t active_transactions_ = 0;
-  std::uint64_t live_tagged_bytes_ = 0;
-  std::uint64_t dependency_pins_ = 0;
-  bool sealed_and_durable_ = true;
-};
+using TxCleanerLocalState = std::vector<TxCleanerBlock>;
 
 // The index state a defrag relocation observed when it validated its source
 // record. WriteRecordLocked can release the store-state lock while it waits
@@ -1376,12 +1375,6 @@ class StorageEngine::Impl {
 
  public:
   struct FullSyncCollection;
-  struct TxGenerationRuntime {
-    std::atomic<std::uint64_t> active_transactions_{0};
-    absl::flat_hash_set<std::uint64_t> committed_txids_;
-    bool has_records_ = false;
-  };
-
   struct WorkerStore {
     struct PendingTxCommit {
       std::uint64_t txid_ = 0;
@@ -1785,16 +1778,10 @@ class StorageEngine::Impl {
     // after taking both locks. This prevents one rollover from fanning out
     // into many physical allocations without serializing ordinary appends.
     AsyncMutex active_block_allocation_mutex_;
-    // Usually current and draining generations only. An old transaction may
-    // finish after rotation, so append streams are keyed by generation.
-    absl::flat_hash_map<std::uint64_t, std::optional<ActiveBlock>>
-        active_tx_blocks_;
-    // Transaction generations can allocate independently, but writers within
-    // one generation single-flight rollover. The mutex objects are indirect
-    // so active_tx_blocks_ rehash cannot invalidate a suspended waiter's gate;
-    // retirement erases a gate only after that generation has no live lease.
-    absl::flat_hash_map<std::uint64_t, std::unique_ptr<AsyncMutex>>
-        active_tx_block_allocation_mutexes_;
+    // One Tx append stream per worker. Transaction leases stay with the
+    // receipts and block records, so sealing this stream never ends a writer.
+    std::optional<ActiveBlock> active_tx_block_;
+    AsyncMutex active_tx_block_allocation_mutex_;
     // Owner-local MPSC is unnecessary: commands and the drain coroutine both
     // run on this worker. Keeping receipts here replaces one detached
     // coroutine frame per transaction with one bounded-size batch runner.
@@ -1841,20 +1828,22 @@ class StorageEngine::Impl {
         pending_relocation_fences_;
     struct TxBlockRuntime {
       std::uint64_t allocation_epoch_ = 0;
-      std::uint64_t generation_ = 0;
       std::uint64_t live_tagged_bytes_ = 0;
       std::uint32_t dependency_pins_ = 0;
+      std::int64_t last_append_ms_ = 0;
+      bool counted_backlog_ = false;
+      std::uint32_t backlog_bytes_ = 0;
+      // Weak leases identify only transactions that wrote this block. Keeping
+      // a strong lease here would itself prevent a block from settling.
+      absl::flat_hash_map<std::uint64_t, std::weak_ptr<void>> txids_;
+      // The commit record is written once by its coordinator. Its block owns
+      // the decision and the append boundary needed for a durability wait.
+      absl::flat_hash_map<std::uint64_t, std::uint32_t> commit_ends_;
     };
-    // Sparse because only transaction blocks need generation/accounting
-    // beyond the dense BlockState. Recovery rebuilds it from block headers.
+    // Sparse because only transaction blocks need record/dependency accounting
+    // beyond the dense BlockState. Recovery rebuilds it from Tx records.
     absl::flat_hash_map<std::uint64_t, TxBlockRuntime> tx_blocks_;
-    // Generation metadata is worker-affine just like tx_blocks_. Foreground
-    // transaction admission and commit registration touch only the current
-    // worker's map; cleaner coordination reads it through owner tasks. The
-    // shared runtime lets the last receipt decrement its atomic lease count on
-    // any worker without touching the map that owns the entry.
-    absl::flat_hash_map<std::uint64_t, std::shared_ptr<TxGenerationRuntime>>
-        tx_generations_;
+    std::atomic<std::uint64_t> tx_backlog_bytes_{0};
     // Deferred manifests carried by retirement receipts are released after
     // source bitmap retirement. UUID dependencies use the separate maps above.
     absl::flat_hash_map<std::uint64_t, std::vector<ExtentManifest>>
@@ -2353,25 +2342,32 @@ class StorageEngine::Impl {
   }
 
   TxCleanerTotals TxCleanerStats() const noexcept {
-    return TxCleanerTotals{
+    TxCleanerTotals totals{
         .rounds_ = tx_cleaner_rounds_.load(std::memory_order_acquire),
         .failures_ = tx_cleaner_failures_.load(std::memory_order_acquire),
-        .retired_generations_ =
-            tx_cleaner_retired_generations_.load(std::memory_order_acquire),
         .retired_blocks_ =
             tx_cleaner_retired_blocks_.load(std::memory_order_acquire),
         .cooldown_ms_ = tx_cleaner_cooldown_ms_.load(std::memory_order_acquire),
         .running_ = tx_cleaner_running_.load(std::memory_order_acquire),
     };
+    for (const auto& store : stores_) {
+      const auto backlog =
+          store->tx_backlog_bytes_.load(std::memory_order_acquire);
+      totals.tx_backlog_bytes_total_ += backlog;
+      totals.tx_backlog_bytes_max_ =
+          std::max(totals.tx_backlog_bytes_max_, backlog);
+    }
+    return totals;
   }
   std::uint32_t TxCleanerCooldownMs() const noexcept {
     return tx_cleaner_cooldown_ms_.load(std::memory_order_acquire);
   }
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
+  bool TxBacklogAtLimit() const noexcept;
+  Task<absl::Status> WaitForTxBacklog();
+  Task<bool> HasLiveBacklogTxLeaseLocal(WorkerStore& store);
   void InitializeTxWrites(std::uint64_t txid, std::span<TxShardWrites> writes,
                           MutationPrecondition mutation_precondition);
-  void RegisterRecoveredTxGeneration(WorkerStore& store,
-                                     std::uint64_t generation);
 
   Task<StorageDurabilityStats> DurabilityStats() const;
 
@@ -2414,8 +2410,9 @@ class StorageEngine::Impl {
   Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                           const Digest& digest);
 
-  Task<absl::Status> CommitTxWrites(std::uint64_t txid,
-                                    std::vector<TxShardWrites*> shards);
+  Task<absl::Status> CommitTxWrites(
+      std::uint64_t txid, std::vector<TxShardWrites*> shards,
+      RelocationDurabilityFence* deferred_decision = nullptr);
 
   static constexpr std::size_t kTxCommitQueueHighWatermark = 4096;
 
@@ -2960,7 +2957,6 @@ class StorageEngine::Impl {
 
  private:
   friend class ExpirationAuthorityTestPeer;
-  friend class WriteBufferPressureTestPeer;
 
   struct DurableSystemState {
     std::uint64_t generation_ = 0;
@@ -3414,6 +3410,9 @@ class StorageEngine::Impl {
   Task<absl::Status> ReadExtentInto(WorkerStore& store, ExtentRef ref,
                                     std::uint32_t extent_index,
                                     std::byte* destination);
+  Task<absl::Status> ReadExtentOnOwner(ExtentRef ref,
+                                       std::uint32_t extent_index,
+                                       std::byte* destination);
   Task<absl::Status> ReadExtentSlice(WorkerStore& store, ExtentRef ref,
                                      std::uint32_t extent_index,
                                      std::size_t source_offset,
@@ -3523,9 +3522,11 @@ class StorageEngine::Impl {
   }
 
   void NoteTxRecordLocal(WorkerStore& store, std::uint64_t block_id,
-                         std::uint64_t allocation_epoch,
-                         std::uint64_t generation, std::uint64_t txid,
-                         std::uint32_t bytes, bool commit);
+                         std::uint64_t allocation_epoch, std::uint64_t txid,
+                         std::uint32_t bytes, bool commit,
+                         const TxShardWrites* receipt = nullptr,
+                         std::uint32_t record_end = 0,
+                         std::uint64_t dependency_txid = 0);
 
   void DropTaggedRecordLocal(WorkerStore& store, std::uint64_t block_id,
                              std::uint64_t allocation_epoch,
@@ -3705,7 +3706,7 @@ class StorageEngine::Impl {
       std::uint64_t successor_txid);
 
   // Writes one unpublished complete group snapshot. The receipt prevents its
-  // transaction generation from retiring; the caller must either publish it
+  // transaction block from retiring; the caller must either publish it
   // with the root's decision or reclaim it when that batch is abandoned.
   // Pass an unconsumed encoder from the batch's complete preflight. Its exact
   // snapshot must stay alive, unmoved and immutable through the awaited write.
@@ -3869,33 +3870,30 @@ class StorageEngine::Impl {
 
   Task<absl::Status> PeriodicFlush(WorkerStore* store);
 
-  // Called before acquiring a standalone grouped transaction's generation
-  // lease, with no store mutex held. A borrowed EXEC lease must never wait for
-  // its own generation to become reclaimable. The estimate is only a pressure
+  // Called before acquiring a standalone grouped transaction's lease, with no
+  // store mutex held. A borrowed EXEC lease must never wait for its own
+  // transaction to become reclaimable. The estimate is only a pressure
   // signal, not a reservation or a second disk-capacity admission policy.
   Task<absl::Status> BeforeGroupedTransaction(WorkerStore& store,
                                               std::uint64_t append_bytes);
   Task<absl::Status> MaybeRunTxCleaner(bool force = false);
+  // Called with the owning worker's store-state mutex held by periodic flush.
+  void SealIdleTxBlocksLocal(WorkerStore& store);
+  void NoteTxBlockSealedLocal(WorkerStore& store, std::uint64_t block_id);
   Task<absl::Status> RunTxCleaner(bool shutdown_drain = false);
 
   // Shutdown has stopped new transaction admission and drained commit chains.
-  // Force generation promotion regardless of the online cooldown so a
+  // Force Tx-block promotion regardless of the online cooldown so a
   // checkpoint never needs to encode transaction-tagged winners.
   Task<absl::Status> DrainTxCleanerForShutdown();
-  Task<absl::StatusOr<TxGenerationLocalState>> InspectTxGenerationLocal(
-      WorkerStore& store, std::uint64_t generation, bool seal);
-
-  Task<std::vector<std::uint64_t>> ListTxGenerationsLocal(
-      WorkerStore& store, std::uint64_t closed_before);
-
-  Task<absl::Status> ForgetTxGenerationLocal(WorkerStore& store,
-                                             std::uint64_t generation);
-  Task<absl::Status> PromoteTxGenerationLocal(
-      WorkerStore& store, std::uint64_t generation,
+  Task<absl::StatusOr<TxCleanerLocalState>> InspectTxBlocksLocal(
+      WorkerStore& store, bool seal);
+  Task<absl::Status> PromoteTxBlockLocal(
+      WorkerStore& store, const TxCleanerBlock& block,
       std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed,
       bool shutdown_drain);
-  Task<absl::Status> RetireTxGenerationLocal(WorkerStore& store,
-                                             std::uint64_t generation);
+  Task<absl::Status> RetireTxBlockLocal(WorkerStore& store,
+                                        const TxCleanerBlock& block);
 
   // Spawn an asynchronous extent reclaim, counted from before the spawn so
   // the block allocator's full-device check always sees it in flight.
@@ -4186,14 +4184,14 @@ class StorageEngine::Impl {
   // allocator must not report the device full while one may still free space.
   std::atomic<unsigned> active_extent_reclaims_{0};
   std::atomic<std::uint64_t> space_reclaim_generation_{0};
-  std::atomic<std::uint64_t> current_tx_generation_{1};
   std::atomic<std::uint32_t> tx_cleaner_cooldown_ms_{60'000};
+  // A single pressure-driven cleaner attempt serves all admission waiters.
+  std::atomic<std::int64_t> tx_backlog_retry_ms_{0};
   std::atomic<std::int64_t> tx_cleaner_next_run_ms_{0};
   std::atomic<bool> tx_cleaner_dirty_{true};
   std::atomic<bool> tx_cleaner_running_{false};
   std::atomic<std::uint64_t> tx_cleaner_rounds_{0};
   std::atomic<std::uint64_t> tx_cleaner_failures_{0};
-  std::atomic<std::uint64_t> tx_cleaner_retired_generations_{0};
   std::atomic<std::uint64_t> tx_cleaner_retired_blocks_{0};
   std::atomic<bool> shutdown_flush_requested_{false};
   std::atomic<unsigned> shutdown_flush_completed_{0};

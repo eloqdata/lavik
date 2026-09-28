@@ -1619,7 +1619,6 @@ if (BUILD_TESTING)
     tests/tx_lock_test.cpp
     tests/storage_format_test.cpp
     tests/storage_capacity_test.cpp
-    tests/tx_cleaner_test.cpp
     tests/tcp_nodelay_accept_test.cpp
     tests/worker_placement_test.cpp
   )

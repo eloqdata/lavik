@@ -2313,7 +2313,7 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
   }
   // A stream can own an uncommitted grouped root and a cross-frame key hold.
   // Settle it before draining: a post-root writer failure makes drain fail,
-  // but must not strand its undo journal, dependency pins or generation lease.
+  // but must not strand its undo journal, dependency pins or transaction lease.
   for (unsigned target = 0; target < worker_count_; ++target) {
     auto cancel = [this, target, session_id]() -> Task<absl::Status> {
       auto& store = *stores_[target];

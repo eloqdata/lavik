@@ -150,6 +150,10 @@ worker-local coordinator. Successful common multi-key, keyed write-capable Lua,
 and EXEC paths settle their undo state, then transfer their `TxShardWrites`
 receipts to the current worker's commit queue. At most one drain coroutine runs
 per worker, replacing a detached coroutine per accepted transaction.
+The command layer waits for the storage Tx backlog before taking key intents
+for a new write transaction. That gate does not apply to a transaction already
+holding its receipt: its participants continue through writes and commit, even
+if the backlog crosses the admission threshold while they run.
 
 Multi-step commands inside EXEC or Lua have a command-local undo boundary
 within the outer storage transaction. MSET and MSETNX complete their write
@@ -171,8 +175,10 @@ backlog, it merges durability fences that name the same block owner, block ID,
 and allocation epoch, retaining the largest required committed boundary. It
 requests all unique flush frontiers before awaiting them so different storage
 owners can progress in parallel. Each transaction still waits only for its own
-tagged-record fences before appending its own `kTxCommit` decision; one receipt
-on an otherwise idle queue stays on the direct low-latency path.
+tagged-record fences before appending its own `kTxCommit` decision. A batch
+appends all ready decisions before requesting their shared flush; grouped
+decision publication waits for that flush. One receipt on an otherwise idle
+queue stays on the direct low-latency path.
 
 The queue high watermark is 4096 receipts per worker. Enqueueing always
 transfers an accepted receipt, but returns a backpressure indication at or above

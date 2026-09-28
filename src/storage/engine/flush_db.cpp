@@ -416,7 +416,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
             return;
           }
           // Retired parent markers are physical live records too. Omitting
-          // them leaks both block live bytes and transaction-generation tags.
+          // them leaks both block live bytes and transaction tags.
           accumulate_record(entry, manifest);
         });
       });
@@ -436,7 +436,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
       assert(delta.bytes_ <= kStorageBlockBytes);
       // The storage format keeps tagged records in transaction blocks and
       // untagged records in ordinary blocks. Preserve that distinction while
-      // batching detached entries: transaction-generation accounting must
+      // batching detached entries: transaction-block accounting must
       // lose the same bytes as the block's ordinary live-byte accounting.
       if (delta.tagged_bytes_ != 0 && delta.tagged_bytes_ != delta.bytes_)
           [[unlikely]] {

@@ -253,12 +253,12 @@ page readers independently recheck the decision after storage waits.
 An incremental successor from another transaction waits for its predecessor's
 durable decision before inheriting untouched groups. Same-transaction commands
 can reuse their view. This causal dependency is separate from the physical
-pins that keep prior transaction generations recoverable until retirement.
+pins that keep prior transaction blocks allocated until retirement.
 
-Before acquiring a standalone transaction's generation lease, grouped writes
-sample foreground space and coordinate old-generation cleaning under pressure.
+Before acquiring a standalone transaction's append lease, grouped writes
+sample foreground space and coordinate transaction-block cleaning under pressure.
 The predecessor decision is durable before that cleaning can run. Borrowed
-EXEC/Lua transactions do not wait for their own still-active generation to
+EXEC/Lua transactions do not wait for their own still-active blocks to
 retire. This pressure signal bypasses the periodic cooldown, not explicit
 cleaner disabling or the allocator's authoritative capacity checks.
 

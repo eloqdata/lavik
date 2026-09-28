@@ -20,7 +20,7 @@ namespace lavik::storage {
 
 absl::StatusOr<std::shared_ptr<GroupedCommitDecision>>
 StorageEngine::Impl::PrepareGroupedDecision(TxShardWrites& tx) {
-  if (tx.txid_ == 0 || tx.generation_ == 0 || tx.generation_lease_ == nullptr) {
+  if (tx.txid_ == 0 || tx.transaction_lease_ == nullptr) {
     return absl::InvalidArgumentError(
         "grouped mutation has no transaction lease");
   }

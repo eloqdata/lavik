@@ -884,9 +884,8 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
   }
 
   bycorf::Task<absl::Status> QuiesceTxCleanerForCapacityBaseline() {
-    // A prior fixture round can leave unpinned blocks awaiting a generation
-    // rotation. The first cleaner pass may only seal that generation, so
-    // require two passes without retirement before sampling global capacity.
+    // A prior fixture round can leave blocks awaiting sealing or retirement.
+    // Require two passes without retirement before sampling global capacity.
     unsigned quiet_rounds = 0;
     for (unsigned attempt = 0; attempt < 16; ++attempt) {
       const auto before = storage_->TxCleanerStats();
@@ -924,7 +923,7 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
     } while (std::chrono::steady_clock::now() < deadline);
     const auto cleaner = storage_->TxCleanerStats();
     co_return absl::FailedPreconditionError(
-        "snapshot-pinned transaction generation did not retire: previous=" +
+        "snapshot-pinned transaction block did not retire: previous=" +
         std::to_string(previous) +
         " retired_blocks=" + std::to_string(cleaner.retired_blocks_) +
         " failures=" + std::to_string(cleaner.failures_));
@@ -947,10 +946,8 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
     std::optional<std::uint64_t> first_retained;
 
     for (unsigned round = 0; round < 2; ++round) {
-      // Keep the old value and aborted candidate in one transaction generation.
-      // A later cleaner round cannot retire that generation while the old
-      // snapshot pins its blocks, so candidate cleanup cannot masquerade as
-      // reclamation caused by releasing the pin.
+      // Keep the old snapshot pinned across candidate abort and a cleaner
+      // round, then verify that releasing it makes its blocks reusable.
       Check(storage_->ConfigureTxCleanerCooldown(0).ok(),
             "failed to disable transaction cleaner for abort fixture");
       absl::Status idle = co_await WaitForCleanerIdle();
@@ -980,10 +977,9 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
       absl::Status attempted =
           co_await WaitForCleanerRound(cleaner_before.rounds_);
       if (!attempted.ok()) co_return attempted;
+      // Other, unpinned Tx blocks may retire during this round. The pinned
+      // blocks must become reclaimable only after releasing the old capture.
       const auto cleaner_while_pinned = storage_->TxCleanerStats();
-      Check(cleaner_while_pinned.retired_blocks_ ==
-                cleaner_before.retired_blocks_,
-            "transaction cleaner retired snapshot-pinned generation");
 
       const auto while_pinned = co_await storage_->CollectMetrics();
       Check(while_pinned.devices_.front().available_bytes_ <=
@@ -1052,11 +1048,9 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
       absl::Status attempted =
           co_await WaitForCleanerRound(cleaner_before.rounds_);
       if (!attempted.ok()) co_return attempted;
+      // Other, unpinned Tx blocks may retire during this round. The pinned
+      // blocks must become reclaimable only after releasing the old capture.
       const auto cleaner_while_pinned = storage_->TxCleanerStats();
-      Check(
-          cleaner_while_pinned.retired_blocks_ ==
-              cleaner_before.retired_blocks_,
-          "transaction cleaner retired promotion's snapshot-pinned generation");
       const auto while_pinned = co_await storage_->CollectMetrics();
       Check(while_pinned.devices_.front().available_bytes_ <=
                 capacity_baseline.devices_.front().available_bytes_,

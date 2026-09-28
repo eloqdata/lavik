@@ -40,7 +40,7 @@ active stream (including an otherwise empty header), seals and flushes its
 records, drains storage maintenance, and reaches a shutdown barrier. Worker 0
 then runs transaction cleaning to a fixed point regardless of the online
 cleaner cooldown: committed transaction-tagged winners are relocated to
-durable ordinary records and the old transaction generations are retired.
+durable ordinary records and the transaction blocks are retired.
 That work can create new staged records, so all workers perform a second
 seal/drain round and meet a second barrier. A final locked check rejects the
 checkpoint if expiration, flush work, or a runtime storage failure appeared
