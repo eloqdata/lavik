@@ -245,7 +245,10 @@ struct TxCleanerTotals {
   std::uint64_t failures_ = 0;
   std::uint64_t retired_blocks_ = 0;
   std::uint32_t cooldown_ms_ = 0;
-  std::uint64_t max_worker_backlog_bytes_ = 0;
+  // Occupied Tx-record bytes in sealed, unreclaimed blocks across workers.
+  std::uint64_t tx_backlog_bytes_total_ = 0;
+  // Largest such backlog on one worker; admission is assessed per worker.
+  std::uint64_t tx_backlog_bytes_max_ = 0;
   bool running_ = false;
 };
 
@@ -1893,10 +1896,11 @@ class StorageEngine {
   TxCleanerTotals TxCleanerStats() const noexcept;
   std::uint32_t TxCleanerCooldownMs() const noexcept;
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
-  // Suspend admission of a new write transaction when a worker has about
-  // 16 MiB of sealed Tx records. Call before taking key intents; an already
-  // admitted transaction must remain free to append and commit.
+  // Report whether any worker has about 16 MiB of sealed Tx records.
   bool TxBacklogAtLimit() const noexcept;
+  // Call before taking key intents. Wait only while sealed backlog retains a
+  // live transaction; already admitted transactions must be able to commit,
+  // and read-only pins must not block new write transactions.
   bycorf::Task<absl::Status> WaitForTxBacklog();
   bycorf::Task<StorageDurabilityStats> DurabilityStats() const;
   bycorf::Task<StorageMetricsSnapshot> CollectMetrics() const;

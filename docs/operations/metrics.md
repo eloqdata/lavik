@@ -150,12 +150,12 @@ process restarts legitimately increment it.
 
 ## Storage metrics
 
-`INFO STATS` reports `tx_backlog_max_worker_bytes`, the largest amount of
-occupied record bytes in sealed Tx blocks on any worker, alongside the
-transaction cleaner counters. A high value with no retired-block progress can
-indicate an outstanding transaction or a pinned source block. The active Tx
-append block and extent blocks are not included in this metric; all allocated
-blocks still consume device capacity.
+`INFO STATS` reports `tx_backlog_bytes_total`, the total occupied record bytes
+in sealed Tx blocks across workers, and `tx_backlog_bytes_max`, the largest
+single-worker amount used by new-transaction admission. A high value with no
+retired-block progress can indicate an outstanding transaction or a pinned
+source block. The active Tx append block and extent blocks are excluded from
+both values; all allocated blocks still consume device capacity.
 
 The active defrag tuning values are exported alongside the work gauges so
 latency graphs can be correlated with runtime A/B changes:

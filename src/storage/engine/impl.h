@@ -568,9 +568,7 @@ struct TxCleanerBlock {
   bool pending_relocation_ = false;
 };
 
-struct TxCleanerLocalState {
-  std::vector<TxCleanerBlock> blocks_;
-};
+using TxCleanerLocalState = std::vector<TxCleanerBlock>;
 
 // The index state a defrag relocation observed when it validated its source
 // record. WriteRecordLocked can release the store-state lock while it waits
@@ -2352,10 +2350,13 @@ class StorageEngine::Impl {
         .cooldown_ms_ = tx_cleaner_cooldown_ms_.load(std::memory_order_acquire),
         .running_ = tx_cleaner_running_.load(std::memory_order_acquire),
     };
-    for (const auto& store : stores_)
-      totals.max_worker_backlog_bytes_ =
-          std::max(totals.max_worker_backlog_bytes_,
-                   store->tx_backlog_bytes_.load(std::memory_order_acquire));
+    for (const auto& store : stores_) {
+      const auto backlog =
+          store->tx_backlog_bytes_.load(std::memory_order_acquire);
+      totals.tx_backlog_bytes_total_ += backlog;
+      totals.tx_backlog_bytes_max_ =
+          std::max(totals.tx_backlog_bytes_max_, backlog);
+    }
     return totals;
   }
   std::uint32_t TxCleanerCooldownMs() const noexcept {
@@ -2364,6 +2365,7 @@ class StorageEngine::Impl {
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
   bool TxBacklogAtLimit() const noexcept;
   Task<absl::Status> WaitForTxBacklog();
+  Task<bool> HasLiveBacklogTxLeaseLocal(WorkerStore& store);
   void InitializeTxWrites(std::uint64_t txid, std::span<TxShardWrites> writes,
                           MutationPrecondition mutation_precondition);
 

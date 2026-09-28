@@ -4880,8 +4880,10 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
     info +=
         "tx_cleaner_cooldown_ms:" + std::to_string(tx_cleaner.cooldown_ms_) +
         "\r\n";
-    info += "tx_backlog_max_worker_bytes:" +
-            std::to_string(tx_cleaner.max_worker_backlog_bytes_) + "\r\n";
+    info += "tx_backlog_bytes_total:" +
+            std::to_string(tx_cleaner.tx_backlog_bytes_total_) + "\r\n";
+    info += "tx_backlog_bytes_max:" +
+            std::to_string(tx_cleaner.tx_backlog_bytes_max_) + "\r\n";
     info += std::string("tx_cleaner_running:") +
             (tx_cleaner.running_ ? "1\r\n\r\n" : "0\r\n\r\n");
     info += "tx_commit_batches:" + std::to_string(tx_commit_batches.batches_) +

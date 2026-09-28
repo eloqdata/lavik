@@ -27,6 +27,9 @@ namespace lavik::storage {
 
 namespace {
 
+constexpr std::uint64_t kTxBacklogAdmissionBytes =
+    2 * (kStorageBlockBytes - kBlockHeaderBytes);
+
 std::int64_t MonotonicMillis() noexcept {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -252,18 +255,32 @@ bool StorageEngine::Impl::TxBacklogAtLimit() const noexcept {
     return false;
   // Two substantially filled sealed Tx blocks are the admission boundary.
   // Charge only their occupied records, not free blocks elsewhere on a device.
-  constexpr std::uint64_t kAdmissionBytes =
-      2 * (kStorageBlockBytes - kBlockHeaderBytes);
   for (const auto& store : stores_)
     if (store->tx_backlog_bytes_.load(std::memory_order_acquire) >=
-        kAdmissionBytes)
+        kTxBacklogAdmissionBytes)
       return true;
   return false;
 }
 
+Task<bool> StorageEngine::Impl::HasLiveBacklogTxLeaseLocal(WorkerStore& store) {
+  co_await store.store_state_mutex_.Lock();
+  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  for (const auto& [block_id, block] : store.tx_blocks_) {
+    (void)block_id;
+    if (!block.counted_backlog_) continue;
+    for (const auto& [txid, lease] : block.txids_) {
+      (void)txid;
+      if (!lease.expired()) co_return true;
+    }
+  }
+  co_return false;
+}
+
 Task<absl::Status> StorageEngine::Impl::WaitForTxBacklog() {
-  // Only a new transaction waits here. Its predecessors keep writing and
-  // committing so the cleaner can eventually retire their sealed blocks.
+  // A new transaction waits while sealed pressure still belongs to a live
+  // transaction. Once all leases are released, an old snapshot or full-sync
+  // reader may keep those blocks allocated. Waiting for that reader can
+  // deadlock its own next command, so make one cleanup attempt and admit.
   for (;;) {
     if (shutdown_flush_requested_.load(std::memory_order_acquire))
       co_return absl::UnavailableError("storage is shutting down");
@@ -278,6 +295,26 @@ Task<absl::Status> StorageEngine::Impl::WaitForTxBacklog() {
           !absl::IsAborted(cleaned) && !absl::IsResourceExhausted(cleaned))
         co_return cleaned;
     }
+    if (!TxBacklogAtLimit()) co_return absl::OkStatus();
+    bool live_transaction = false;
+    for (unsigned owner = 0; owner < worker_count_; ++owner) {
+      if (stores_[owner]->tx_backlog_bytes_.load(std::memory_order_acquire) <
+          kTxBacklogAdmissionBytes)
+        continue;
+      bool live;
+      if (owner == bycorf::ThisWorker().id_) {
+        live = co_await HasLiveBacklogTxLeaseLocal(*stores_[owner]);
+      } else {
+        live = co_await bycorf::SubmitTaskTo(owner, [this, owner]() {
+          return HasLiveBacklogTxLeaseLocal(*stores_[owner]);
+        });
+      }
+      if (live) {
+        live_transaction = true;
+        break;
+      }
+    }
+    if (!live_transaction) co_return absl::OkStatus();
     const absl::Status waited = co_await bycorf::SleepFor(
         *bycorf::ThisWorker().self_, std::chrono::milliseconds(2));
     if (!waited.ok()) co_return waited;
@@ -449,7 +486,7 @@ StorageEngine::Impl::InspectTxBlocksLocal(WorkerStore& store, bool seal) {
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   TxCleanerLocalState result;
-  result.blocks_.reserve(store.tx_blocks_.size());
+  result.reserve(store.tx_blocks_.size());
   for (const auto& [block_id, tx_block] : store.tx_blocks_) {
     const BlockState* state = FindBlockState(store, block_id);
     const bool durable =
@@ -476,7 +513,7 @@ StorageEngine::Impl::InspectTxBlocksLocal(WorkerStore& store, bool seal) {
     }
     block.commit_decisions_.assign(tx_block.commit_ends_.begin(),
                                    tx_block.commit_ends_.end());
-    result.blocks_.push_back(std::move(block));
+    result.push_back(std::move(block));
   }
   co_return result;
 }
@@ -623,7 +660,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     auto local = co_await inspect_owner(owner, true);
     if (!local.ok()) co_return local.status();
-    for (const TxCleanerBlock& block : local->blocks_)
+    for (const TxCleanerBlock& block : *local)
       if (!block.active_transaction_)
         settled_txids.insert(block.txids_.begin(), block.txids_.end());
   }
@@ -636,7 +673,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     auto local = co_await inspect_owner(owner, false);
     if (!local.ok()) co_return local.status();
-    for (const TxCleanerBlock& block : local->blocks_)
+    for (const TxCleanerBlock& block : *local)
       for (const auto& [txid, record_end] : block.commit_decisions_) {
         committed->insert(txid);
         if (record_end != 0)
@@ -665,7 +702,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
             owner,
             [this, owner, committed, shutdown_drain, &owner_states,
              &commit_fences, &eligible]() -> Task<absl::Status> {
-              for (const TxCleanerBlock& block : owner_states[owner].blocks_) {
+              for (const TxCleanerBlock& block : owner_states[owner]) {
                 if (!eligible(block)) continue;
                 for (std::uint64_t txid : block.txids_) {
                   if (!committed->contains(txid)) continue;
@@ -704,13 +741,13 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     auto current = co_await inspect_owner(owner, false);
     if (!current.ok()) co_return current.status();
-    for (const TxCleanerBlock& block : current->blocks_)
+    for (const TxCleanerBlock& block : *current)
       if (block.live_tagged_bytes_ != 0 || block.dependency_pins_ != 0 ||
           block.pending_relocation_)
         decisions_needed.insert(block.txids_.begin(), block.txids_.end());
   }
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
-    for (const TxCleanerBlock& block : owner_states[owner].blocks_) {
+    for (const TxCleanerBlock& block : owner_states[owner]) {
       if (!eligible(block)) continue;
       bool has_decision_dependencies = false;
       for (const auto& [txid, record_end] : block.commit_decisions_) {
@@ -785,7 +822,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCleanerForShutdown() {
           });
         }
         if (!state.ok()) co_return state.status();
-        if (!state->blocks_.empty())
+        if (!state->empty())
           co_return absl::FailedPreconditionError(
               "transaction blocks remain at shutdown checkpoint");
       }

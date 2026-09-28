@@ -1115,8 +1115,8 @@ int main(int argc, char** argv) {
                {"EXISTS", "cleaner-flush-a", "cleaner-flush-b"}),
            ":0", "FLUSHDB values remain invalidated");
     // One admitted transaction may cross the new-transaction backlog limit.
-    // It must finish its own writes and commit before the next transaction
-    // waits for the cleaner to retire its sealed blocks.
+    // It must finish its own writes and commit; after its lease ends, the
+    // next transaction may start while cleanup of sealed blocks is pending.
     Expect(block_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "60000"}),
            "+OK", "hold periodic cleaning during large transaction fixture");
@@ -1134,18 +1134,16 @@ int main(int argc, char** argv) {
     }
     Expect(block_recovery.Command(pressure_args), "+OK",
            "single transaction spans transaction blocks");
-    if (InfoStat(block_recovery, "tx_backlog_max_worker_bytes:") <=
-        16ULL * 1024 * 1024)
+    const auto backlog_max = InfoStat(block_recovery, "tx_backlog_bytes_max:");
+    const auto backlog_total =
+        InfoStat(block_recovery, "tx_backlog_bytes_total:");
+    if (backlog_max <= 16ULL * 1024 * 1024)
       Fail("large transaction did not build a sealed Tx backlog");
+    if (backlog_total < backlog_max)
+      Fail("total Tx backlog was smaller than the maximum worker backlog");
     Expect(block_recovery.Command({"MSET", "{tx-pressure}next", "next",
                                    "{tx-pressure}last", "last"}),
-           "+OK", "new transaction admitted after Tx block cleanup");
-    if (InfoStat(block_recovery, "tx_backlog_max_worker_bytes:") >=
-        16ULL * 1024 * 1024)
-      Fail("new transaction started with a sealed Tx backlog above 16 MiB");
-    if (InfoStat(block_recovery, "tx_cleaner_retired_blocks:") <=
-        block_baseline)
-      Fail("new transaction bypassed the sealed Tx backlog gate");
+           "+OK", "new transaction admitted after prior lease ended");
     Expect(block_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "resume periodic cleaning after the next transaction");
