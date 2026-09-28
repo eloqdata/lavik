@@ -35,51 +35,6 @@ std::int64_t MonotonicMillis() noexcept {
       .count();
 }
 
-// Promotion only mutates the source owner's store. Each submitted task returns
-// to the coordinator before completing this join, so the borrowed block
-// snapshot and commit-decision map remain alive even when one owner fails.
-struct CleanerOwnerJoin {
-  std::size_t pending_ = 0;
-  bycorf::AsyncNotification finished_;
-  absl::Status error_;
-  std::exception_ptr exception_;
-
-  void Complete(absl::Status status) {
-    if (!status.ok() && error_.ok()) error_ = std::move(status);
-    Arrive();
-  }
-
-  void CompleteException(std::exception_ptr error) {
-    if (!exception_) exception_ = std::move(error);
-    Arrive();
-  }
-
-  void Arrive() {
-    assert(pending_ != 0);
-    if (--pending_ == 0) finished_.NotifyAll(*bycorf::ThisWorker().self_);
-  }
-};
-
-template <typename Step>
-Task<absl::Status> RunCleanerOwnerStep(unsigned owner, Step step,
-                                       CleanerOwnerJoin* join) {
-  absl::Status status;
-  try {
-    if (owner == bycorf::ThisWorker().id_) {
-      status = co_await step();
-    } else {
-      status = co_await bycorf::SubmitTaskTo(owner, std::move(step));
-    }
-  } catch (...) {
-    // A detached task must still settle the join before the coordinator can
-    // release the block snapshot borrowed by all other owners.
-    join->CompleteException(std::current_exception());
-    co_return absl::OkStatus();
-  }
-  join->Complete(std::move(status));
-  co_return absl::OkStatus();
-}
-
 template <typename StepAt>
 Task<absl::Status> ForEachCleanerOwner(unsigned count, bool parallel,
                                        StepAt step_at) {
@@ -99,22 +54,42 @@ Task<absl::Status> ForEachCleanerOwner(unsigned count, bool parallel,
     }
     co_return absl::OkStatus();
   }
-  CleanerOwnerJoin join;
+  // All completions return to the coordinator. Keep this state and the
+  // borrowed block snapshots alive until every owner finishes, even on error.
+  unsigned pending = count;
+  bycorf::AsyncNotification finished;
+  absl::Status error;
+  std::exception_ptr exception;
+  auto run_step = [&](unsigned owner, auto step) -> Task<absl::Status> {
+    try {
+      absl::Status status;
+      if (owner == bycorf::ThisWorker().id_) {
+        status = co_await step();
+      } else {
+        status = co_await bycorf::SubmitTaskTo(owner, std::move(step));
+      }
+      if (!status.ok() && error.ok()) error = std::move(status);
+    } catch (...) {
+      if (!exception) exception = std::current_exception();
+    }
+    assert(pending != 0);
+    if (--pending == 0) finished.NotifyAll(*bycorf::ThisWorker().self_);
+    co_return absl::OkStatus();
+  };
   std::vector<Task<absl::Status>> tasks;
   tasks.reserve(count);
   // Construct every coroutine before the first launch. A frame-allocation
-  // failure must not leave already-running owners borrowing a dead join.
+  // failure must not leave running owners borrowing destroyed local state.
   for (unsigned index = 0; index < count; ++index) {
     auto [owner, step] = step_at(index);
-    tasks.push_back(RunCleanerOwnerStep(owner, std::move(step), &join));
+    tasks.push_back(run_step(owner, std::move(step)));
   }
-  join.pending_ = count;
   for (auto& task : tasks) bycorf::ThisWorker().self_->Spawn(std::move(task));
   // Notifications are not latched. Check the count on the coordinator, where
   // completions also run, so none can arrive between this check and Wait().
-  while (join.pending_ != 0) co_await join.finished_.Wait();
-  if (join.exception_) std::rethrow_exception(join.exception_);
-  co_return std::move(join.error_);
+  while (pending != 0) co_await finished.Wait();
+  if (exception) std::rethrow_exception(exception);
+  co_return error;
 }
 
 }  // namespace
