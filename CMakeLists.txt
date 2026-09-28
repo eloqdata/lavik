@@ -908,8 +908,8 @@ if (BUILD_TESTING)
     add_library(lavik_slow_dns_shim SHARED tests/slow_dns_shim.cpp)
     target_link_libraries(lavik_slow_dns_shim PRIVATE ${CMAKE_DL_LIBS})
     add_executable(lavik_async_dns_tests tests/async_dns_test.cpp)
-    target_include_directories(lavik_async_dns_tests PRIVATE include)
-    target_link_libraries(lavik_async_dns_tests PRIVATE GTest::gtest_main)
+    target_include_directories(lavik_async_dns_tests PRIVATE include src/replication)
+    target_link_libraries(lavik_async_dns_tests PRIVATE lavik::module GTest::gtest_main)
     add_test(NAME async_dns.nonblocking
       COMMAND ${CMAKE_COMMAND} -E env "LD_PRELOAD=$<TARGET_FILE:lavik_slow_dns_shim>"
         $<TARGET_FILE:lavik_async_dns_tests>)

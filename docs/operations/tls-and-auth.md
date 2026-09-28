@@ -218,8 +218,9 @@ use an application certificate without operator authority, and exercise actual
 replica reads. Given a configured build with its pinned client dependencies:
 
 ```bash
-# Set TMPDIR to your local scratch disk; all fixture data is created below it.
-export TMPDIR=/mnt/local_nvme/lavik-sentinel-tests
+# Set TMPDIR to a local scratch directory; all fixture data is created below it.
+# BUILD is the configured CMake build directory.
+export TMPDIR=/path/to/scratch/lavik-sentinel-tests
 mkdir -p "$TMPDIR"
 ctest --test-dir "$BUILD" --output-on-failure -R '^meta_integration.sentinel_tls_'
 ```

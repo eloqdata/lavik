@@ -171,7 +171,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
          !ValidClientHostname(endpoint.host)) ||
         (endpoint.port == 0 && endpoint.tls_port == 0)) {
       return Invalid(absl::StrCat("node ", endpoint.node_id,
-                                  " has no canonical numeric client endpoint"));
+                                  " has no valid client endpoint"));
     }
     const NodeIndex index = static_cast<NodeIndex>(nodes.size());
     if (!node_indices.emplace(endpoint.node_id, index).second) {

@@ -13,6 +13,11 @@ extern "C" int getaddrinfo(const char* host, const char* service,
       int (*)(const char*, const char*, const addrinfo*, addrinfo**);
   const auto resolve =
       reinterpret_cast<Resolver>(dlsym(RTLD_NEXT, "getaddrinfo"));
+  if (host && std::strcmp(host, "slow.localhost") == 0 &&
+      !(hints && (hints->ai_flags & AI_NUMERICHOST))) {
+    usleep(1000000);
+    return resolve("127.0.0.1", service, hints, result);
+  }
   if (host && std::strcmp(host, "slow.lavik.invalid") == 0 &&
       !(hints && (hints->ai_flags & AI_NUMERICHOST))) {
     usleep(500000);

@@ -486,12 +486,15 @@ ResolveRecoveryAddress(std::string_view host, std::uint16_t port,
                        SocketSet* sockets) {
   if (host.empty() || host.size() > 255)
     co_return absl::InvalidArgumentError("invalid recovery donor host");
-  auto resolved = AsyncDnsQuery::Start(host, port);
-  if (!resolved)
-    co_return absl::ResourceExhaustedError("DNS work bound reached");
-  while (!resolved->done_.load(std::memory_order_acquire)) {
+  std::shared_ptr<RecoveryResolvedAddress> resolved;
+  for (;;) {
     if (sockets->cancelled())
       co_return absl::CancelledError("recovery donor resolution cancelled");
+    // Resolver capacity is backpressure, not a replication failure: one
+    // excess flow must not cancel every sibling and restart the same burst.
+    // Waiting shares the session's cancellation and recovery deadline.
+    if (!resolved) resolved = AsyncDnsQuery::Start(host, port);
+    if (resolved && resolved->done_.load(std::memory_order_acquire)) break;
     auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
                                             std::chrono::milliseconds(1));
     if (!waited.ok()) co_return waited;

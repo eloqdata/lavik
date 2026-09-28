@@ -474,6 +474,8 @@ including ordinary follow, use the same bounded asynchronous DNS facility as
 Recovery. Resolver jobs own only their inputs and results; cancellation releases
 the worker and socket without waiting for libc DNS. The shared in-flight cap
 bounds uninterruptible resolver jobs without a cross-worker blocking mutex.
+Replication waits asynchronously for resolver capacity under the same session
+cancellation and recovery deadline.
 Application and native replication share the advertised routes; there is no
 separate internal address view.
 

@@ -598,13 +598,16 @@ int main(int argc, char** argv) {
       return 1;
     }
     for (const auto& member : manifest->meta_members_) {
-      if (member.server_id_ == static_cast<std::uint32_t>(options.id_) &&
+      if (const auto endpoint =
+              lavik::ParseClientEndpoint(member.sentinel_endpoint_);
+          member.server_id_ == static_cast<std::uint32_t>(options.id_) &&
           !member.sentinel_endpoint_.empty() &&
-          (lavik::ParseClientEndpoint(member.sentinel_endpoint_)->tls_
-               ? options.sentinel_extra_.tls_address_.empty()
-               : options.sentinel_addr_.empty())) {
+          (endpoint->tls_ ? options.sentinel_extra_.tls_address_.empty()
+                          : options.sentinel_addr_.empty())) {
         spdlog::critical(
-            "registered Sentinel endpoint requires --sentinel-addr");
+            "registered Sentinel endpoint {} requires {}",
+            member.sentinel_endpoint_,
+            endpoint->tls_ ? "--sentinel-tls-addr" : "--sentinel-addr");
         return 1;
       }
       raft_options.initial_.push_back(
