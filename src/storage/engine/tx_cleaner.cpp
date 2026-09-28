@@ -15,7 +15,6 @@
  */
 
 #include <algorithm>
-#include <coroutine>
 #include <exception>
 #include <limits>
 #include <utility>
@@ -41,7 +40,7 @@ std::int64_t MonotonicMillis() noexcept {
 // snapshot and commit-decision map remain alive even when one owner fails.
 struct CleanerOwnerJoin {
   std::size_t pending_ = 0;
-  std::coroutine_handle<> waiter_{};
+  bycorf::AsyncNotification finished_;
   absl::Status error_;
   std::exception_ptr exception_;
 
@@ -57,22 +56,7 @@ struct CleanerOwnerJoin {
 
   void Arrive() {
     assert(pending_ != 0);
-    if (--pending_ == 0 && waiter_) {
-      const auto waiter = std::exchange(waiter_, {});
-      bycorf::ThisWorker().self_->Enqueue(waiter);
-    }
-  }
-
-  auto Join() {
-    struct Awaiter {
-      CleanerOwnerJoin* join_;
-      bool await_ready() const noexcept { return join_->pending_ == 0; }
-      void await_suspend(std::coroutine_handle<> waiter) const noexcept {
-        join_->waiter_ = waiter;
-      }
-      void await_resume() const noexcept {}
-    };
-    return Awaiter{this};
+    if (--pending_ == 0) finished_.NotifyAll(*bycorf::ThisWorker().self_);
   }
 };
 
@@ -126,7 +110,9 @@ Task<absl::Status> ForEachCleanerOwner(unsigned count, bool parallel,
   }
   join.pending_ = count;
   for (auto& task : tasks) bycorf::ThisWorker().self_->Spawn(std::move(task));
-  co_await join.Join();
+  // Notifications are not latched. Check the count on the coordinator, where
+  // completions also run, so none can arrive between this check and Wait().
+  while (join.pending_ != 0) co_await join.finished_.Wait();
   if (join.exception_) std::rethrow_exception(join.exception_);
   co_return std::move(join.error_);
 }
