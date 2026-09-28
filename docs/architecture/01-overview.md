@@ -105,8 +105,12 @@ operator --> lavik-ctl cluster-status / failover / getop
 
 [Lavik Admin](11-admin.md) is an optional operator service outside the Data
 and Meta processes. Its browser and `lavik-ctl` fleet entry share a persistent
-multi-cluster catalog and request history. It reuses the Meta operator client
-for authority-bearing operations and reads Data directly for bounded metrics,
+multi-cluster catalog, prepared-host inventory, SSH deployment plans, and request
+history. It establishes passwordless SSH using a workspace-owned key, checks
+existing Linux hosts, installs pinned GitHub releases, and starts their
+services before initializing clusters through the Meta operator client.
+Connected clusters use a local client and direct Data reads; deployed clusters
+use their own release's client and bounded Data requests over SSH for metrics,
 key inspection, and command execution. Cluster state remains in each
 deployment's Meta Raft store; the fleet catalog supplies connection discovery.
 

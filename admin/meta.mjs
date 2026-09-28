@@ -73,11 +73,16 @@ export class Meta {
     else if (discovery) args.push("--allow-plaintext-admin");
     return args;
   }
-  async exec(args) {
+  /** Use a deployment's own CLI when present; only explicitly read-only calls may fail over SSH. */
+  async exec(args, cluster, read = false) {
     if (this.inflight >= 32)
       throw new AdminError("Management service is busy; retry shortly", 503);
     this.inflight++;
     try {
+      if (cluster && this.deployments) {
+        const result = await this.deployments.ctl(cluster, args, read);
+        if (result) return result;
+      }
       return await new Promise((resolve) => {
         // No shell: values from a DBA can never become process arguments outside
         // this explicit argv. A killed mutation remains uncertain, never retried.
@@ -100,11 +105,11 @@ export class Meta {
   async status(cluster) {
     let last;
     for (const seed of JSON.parse(cluster.seeds)) {
-      const result = await this.exec([
-        "cluster-status",
-        ...this.options(cluster, seed, true),
-        "--json",
-      ]);
+      const result = await this.exec(
+        ["cluster-status", ...this.options(cluster, seed, true), "--json"],
+        cluster,
+        true,
+      );
       try {
         const status = JSON.parse(result.stdout);
         if (status.capture) return status;
@@ -124,10 +129,14 @@ export class Meta {
     return leader.replace(/^(tcp|tls):\/\//, "");
   }
   async command(cluster, args, leader) {
-    const result = await this.exec([
-      ...this.options(cluster, leader || (await this.leader(cluster))),
-      ...args,
-    ]);
+    const result = await this.exec(
+      [
+        ...this.options(cluster, leader || (await this.leader(cluster))),
+        ...args,
+      ],
+      cluster,
+      ["getop", "getnode", "getgroup", "listops", "status"].includes(args[0]),
+    );
     if (result.code !== 0 || !result.stdout.startsWith("OK")) {
       const error = new AdminError(
         result.stdout || result.stderr || "Meta connection failed",
@@ -139,6 +148,7 @@ export class Meta {
     return result.stdout;
   }
   async nodes(cluster, status) {
+    const deployment = await this.deployments?.plan(cluster.id);
     const leader = await this.leader(cluster);
     const nodes = [];
     // Bound fan-out for large fleets; do not spawn a process per node at once.
@@ -155,7 +165,16 @@ export class Meta {
               const address = /(?:^| )endpoints=([^ ]+)/
                 .exec(reply)?.[1]
                 ?.split(",")[0];
-              return { ...node, endpoint: address || null };
+              const planned = deployment?.nodes.find(
+                (n) => n.id === node.node_id,
+              );
+              const host = planned && deployment.hosts[planned.host].address;
+              const fallback =
+                planned &&
+                `tcp://${host.includes(":") ? `[${host}]` : host}:${
+                  planned.port
+                }`;
+              return { ...node, endpoint: address || fallback || null };
             } catch (error) {
               return { ...node, endpoint: null, error: error.message };
             }

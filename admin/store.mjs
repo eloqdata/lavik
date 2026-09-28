@@ -32,6 +32,10 @@ export class Store {
       this.worker.postMessage({ id, sql, params, mode });
     });
   }
+  /** Admit related catalog and deployment intent in one worker-owned transaction. */
+  batch(statements) {
+    return this.query(statements, [], "batch");
+  }
   async close() {
     try {
       await this.query("", [], "close");
@@ -45,7 +49,7 @@ if (!isMainThread) {
   const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(workerData, { timeout: 0 });
   const version = db.prepare("PRAGMA user_version").get().user_version;
-  if (version !== 0 && version !== 1)
+  if (![0, 1, 2, 3].includes(version))
     throw new Error(`Unsupported fleet database version: ${version}`);
   db.exec(`
     PRAGMA journal_mode=WAL;
@@ -67,13 +71,36 @@ if (!isMainThread) {
       id INTEGER PRIMARY KEY, created_at TEXT NOT NULL,
       action TEXT NOT NULL, cluster_id TEXT, detail TEXT NOT NULL
     ) STRICT;
-    PRAGMA user_version=1;
+    CREATE TABLE IF NOT EXISTS deployments (
+      cluster_id TEXT PRIMARY KEY REFERENCES clusters(id), plan TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS hosts (
+      id TEXT PRIMARY KEY, connection TEXT NOT NULL, verified_at TEXT NOT NULL
+    ) STRICT;
+    PRAGMA user_version=3;
   `);
   parentPort.on("message", ({ id, sql, params, mode }) => {
     try {
       let value;
       if (mode === "close") db.close();
-      else {
+      else if (mode === "batch") {
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          for (const item of sql) {
+            const result = db.prepare(item.sql).run(...item.params);
+            if (
+              item.expectedChanges !== undefined &&
+              result.changes !== item.expectedChanges
+            )
+              throw new Error("Deployment changed; review the follower again");
+          }
+          db.exec("COMMIT");
+        } catch (error) {
+          db.exec("ROLLBACK");
+          throw error;
+        }
+        value = { committed: true };
+      } else {
         const statement = db.prepare(sql);
         value =
           mode === "run"

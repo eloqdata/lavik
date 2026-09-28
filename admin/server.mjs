@@ -15,6 +15,9 @@ import { fileURLToPath } from "node:url";
 import { Store } from "./store.mjs";
 import { Meta, AdminError } from "./meta.mjs";
 import { Fleet } from "./fleet.mjs";
+import { Deployments } from "./deploy.mjs";
+import { Hosts } from "./hosts.mjs";
+import { Releases } from "./releases.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const equals = (a, b) => {
@@ -66,10 +69,7 @@ export async function start(options = {}) {
     throw new Error("Admin access token must contain at least 20 characters");
   const port = options.port ?? Number(process.env.LAVIK_ADMIN_PORT || 4173);
   const host = options.host || process.env.LAVIK_ADMIN_BIND || "127.0.0.1";
-  const origins = new Set([
-    process.env.LAVIK_ADMIN_ORIGIN || `http://localhost:${port}`,
-    `http://127.0.0.1:${port}`,
-  ]);
+  const origins = new Set();
   const profilesPath = options.profilesFile || process.env.LAVIK_ADMIN_PROFILES;
   const profiles = profilesPath
     ? JSON.parse(await readFile(profilesPath, "utf8"))
@@ -97,11 +97,19 @@ export async function start(options = {}) {
   const meta =
     options.meta || new Meta(process.env.LAVIK_CTL || "lavik-ctl", profiles);
   const store = options.store || new Store(join(directory, "fleet.sqlite"));
+  const hosts = new Hosts(store, directory);
   const fleet = new Fleet(store, meta);
+  const deployments = new Deployments(fleet, {
+    hosts,
+    releases: new Releases(fetch, join(directory, "releases")),
+    ...options.deploymentOptions,
+  });
+  fleet.deployments = deployments;
+  meta.deployments = deployments;
   const sessions = new Map();
   const loginAttempts = new Map();
   const cli = net.createServer((socket) => {
-    socket.setTimeout(30000, () => socket.destroy());
+    socket.setTimeout(600000, () => socket.destroy());
     let line = "",
       received = false;
     socket.on("error", () => {});
@@ -119,6 +127,31 @@ export async function start(options = {}) {
         if (extra.length) throw new AdminError("Too many arguments");
         let value;
         if (verb === "fleet-list" && !id) value = await fleet.clusters();
+        else if (verb === "fleet-hosts" && !id) value = await hosts.list();
+        else if (verb === "fleet-releases" && !a)
+          value = await deployments.releases.list(Number(id || 1));
+        else if (verb === "fleet-plan" && id && !a) {
+          let input;
+          try {
+            input = JSON.parse(Buffer.from(id, "base64url").toString());
+          } catch {
+            throw new AdminError(
+              "fleet-plan requires base64url-encoded setup JSON",
+            );
+          }
+          value = await deployments.preview(input);
+        } else if (verb === "fleet-deploy" && id && a && !b)
+          value = await deployments.create({ token: id, confirm: a });
+        else if (verb === "fleet-follower-plan" && id && a && !b)
+          value = await deployments.previewFollower(
+            id,
+            JSON.parse(Buffer.from(a, "base64url").toString()),
+          );
+        else if (verb === "fleet-follower-deploy" && id && a && !b)
+          value = await deployments.createFollower(id, {
+            token: a,
+            confirm: id,
+          });
         else if (verb === "fleet-add" && id && a && !c)
           value = await fleet.add({
             id,
@@ -186,6 +219,9 @@ export async function start(options = {}) {
         const file = {
           "/": "index.html",
           "/app.js": "app.js",
+          "/setup.js": "setup.js",
+          "/hosts.js": "hosts.js",
+          "/placement.js": "placement.js",
           "/style.css": "style.css",
         }[url.pathname];
         if (!file) throw new AdminError("Not found", 404);
@@ -270,6 +306,53 @@ export async function start(options = {}) {
       }
       const parts = url.pathname.split("/").filter(Boolean);
       const [_, resource, id, subresource] = parts;
+      if (resource === "hosts") {
+        if (!id && request.method === "GET") send(200, await hosts.list());
+        else if (id === "prepare" && request.method === "POST")
+          send(200, await hosts.prepare(await body(request)));
+        else if (id && subresource === "verify" && request.method === "POST")
+          send(200, await hosts.verify(id));
+        else throw new AdminError("Not found", 404);
+        return;
+      }
+      if (resource === "releases" && request.method === "GET") {
+        send(
+          200,
+          await deployments.releases.list(
+            Number(url.searchParams.get("page") || 1),
+          ),
+        );
+        return;
+      }
+      if (resource === "setup" && request.method === "POST") {
+        const input = await body(request);
+        if (id === "preview") send(200, await deployments.preview(input));
+        else if (id === "deploy") send(200, await deployments.create(input));
+        else throw new AdminError("Not found", 404);
+        return;
+      }
+      if (
+        resource === "clusters" &&
+        subresource === "deployment" &&
+        request.method === "GET"
+      ) {
+        send(200, await deployments.plan(id));
+        return;
+      }
+      if (
+        resource === "clusters" &&
+        request.method === "POST" &&
+        ["follower-preview", "follower-deploy"].includes(subresource)
+      ) {
+        const input = await body(request);
+        send(
+          200,
+          subresource === "follower-preview"
+            ? await deployments.previewFollower(id, input)
+            : await deployments.createFollower(id, input),
+        );
+        return;
+      }
       if (resource !== "clusters") throw new AdminError("Not found", 404);
       let value;
       if (!id && request.method === "GET") value = await fleet.clusters();
@@ -323,6 +406,13 @@ export async function start(options = {}) {
     await store.close();
     throw error;
   });
+  // Port zero selects an ephemeral listener. Validate the actual origin, not
+  // the requested port, so browser login remains protected and usable in tests.
+  const listeningPort = server.address().port;
+  origins.add(
+    process.env.LAVIK_ADMIN_ORIGIN || `http://localhost:${listeningPort}`,
+  );
+  origins.add(`http://127.0.0.1:${listeningPort}`);
   try {
     await fleet.start();
   } catch (error) {
@@ -364,6 +454,12 @@ if (
       app.server.address().port
     }\nAccess token: ${app.tokenPath}\nlavik-ctl socket: ${app.socketPath}`,
   );
+  if (process.env.LAVIK_ADMIN_SHOW_TOKEN === "1")
+    console.log(
+      `Open http://localhost:${app.server.address().port}\nSign-in token: ${(
+        await readFile(app.tokenPath, "utf8")
+      ).trim()}`,
+    );
   let stopping = false;
   for (const signal of ["SIGTERM", "SIGINT"])
     process.on(signal, async () => {
