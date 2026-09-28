@@ -987,17 +987,6 @@ int main(int argc, char** argv) {
     Expect(client.Command({"CONFIG", "GET", "tx-cleaner-cooldown-ms"}),
            "*2\r\n" + Bulk("tx-cleaner-cooldown-ms") + "\r\n" + Bulk("20"),
            "read tx cleaner cooldown");
-    Expect(
-        client.Command({"CONFIG", "GET", "tx-backlog-limit-mb-per-worker"}),
-        "*2\r\n" + Bulk("tx-backlog-limit-mb-per-worker") + "\r\n" + Bulk("8"),
-        "default transaction backlog admission threshold");
-    const std::string too_small = client.Command(
-        {"CONFIG", "SET", "tx-backlog-limit-mb-per-worker", "7"});
-    if (!too_small.starts_with("-ERR"))
-      Fail("accepted transaction backlog threshold below one block");
-    Expect(client.Command(
-               {"CONFIG", "SET", "tx-backlog-limit-mb-per-worker", "8"}),
-           "+OK", "set minimum transaction backlog threshold");
     const std::uint64_t cleaner_baseline = TxCleanerRetiredBlocks(client);
     Expect(
         client.Command({"MSET", "cleaner-a", "after-a", "cleaner-b", "after-b",
@@ -1136,16 +1125,13 @@ int main(int argc, char** argv) {
     Expect(block_recovery.Command(
                {"EXISTS", "cleaner-flush-a", "cleaner-flush-b"}),
            ":0", "FLUSHDB values after transaction block retirement");
-    // One admitted transaction can cross the 8 MiB backlog threshold. Its
-    // sealed blocks must become reclaimable after commit; the next transaction
-    // waits before taking any key intent, even though its tail is still open.
+    // A large transaction may span multiple Tx blocks. Once committed, its
+    // sealed blocks must become reclaimable while later writes continue.
     Expect(block_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "60000"}),
-           "+OK", "hold periodic cleaning during backlog admission fixture");
+           "+OK", "hold periodic cleaning during large transaction fixture");
     const std::uint64_t block_baseline =
         InfoStat(block_recovery, "tx_cleaner_retired_blocks:");
-    const std::uint64_t wait_baseline =
-        InfoStat(block_recovery, "tx_backlog_waits:");
     std::string large_value(1024 * 1024, 'q');
     std::vector<std::string> pressure_keys;
     std::vector<std::string_view> pressure_args{"MSET"};
@@ -1157,12 +1143,13 @@ int main(int argc, char** argv) {
       pressure_args.push_back(large_value);
     }
     Expect(block_recovery.Command(pressure_args), "+OK",
-           "single transaction may exceed the backlog threshold");
+           "single transaction spans transaction blocks");
     Expect(block_recovery.Command({"MSET", "{tx-pressure}next", "next",
                                    "{tx-pressure}last", "last"}),
-           "+OK", "new transaction waits for sealed block cleanup");
-    if (InfoStat(block_recovery, "tx_backlog_waits:") <= wait_baseline)
-      Fail("new transaction skipped the exceeded backlog admission threshold");
+           "+OK", "new transaction continues before sealed block cleanup");
+    Expect(block_recovery.Command(
+               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+           "+OK", "resume periodic cleaning after the next transaction");
     if (!WaitForCleanerStat(block_recovery,
                             "tx_cleaner_retired_blocks:", block_baseline))
       Fail("sealed committed transaction block was not reclaimed");

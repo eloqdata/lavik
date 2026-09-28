@@ -262,10 +262,6 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "storage worker count exceeds logical storage shards");
   }
-  if (options_.tx_backlog_limit_bytes_ < kStorageBlockBytes) {
-    return absl::InvalidArgumentError(
-        "transaction backlog limit must be at least 8 MiB");
-  }
   if (options_.defrag_max_active_per_device_ == 0 ||
       options_.defrag_max_active_per_device_ > kDefragReserveBlocksPerDevice) {
     return absl::Status(

@@ -228,15 +228,6 @@ absl::Status StorageEngine::Impl::ConfigureTxCleanerCooldown(
   return absl::OkStatus();
 }
 
-absl::Status StorageEngine::Impl::ConfigureTxBacklogLimit(std::uint64_t bytes) {
-  if (bytes < kStorageBlockBytes) {
-    return absl::InvalidArgumentError(
-        "transaction backlog limit must be at least 8 MiB");
-  }
-  tx_backlog_limit_bytes_.store(bytes, std::memory_order_release);
-  return absl::OkStatus();
-}
-
 void StorageEngine::Impl::NoteTxBlockSealedLocal(WorkerStore& store,
                                                  std::uint64_t block_id) {
   const auto found = store.tx_blocks_.find(block_id);
@@ -246,55 +237,14 @@ void StorageEngine::Impl::NoteTxBlockSealedLocal(WorkerStore& store,
       state->allocation_epoch_ != found->second.allocation_epoch_ ||
       state->committed_bytes_ < kBlockHeaderBytes)
     return;
-  // Charge the occupied Tx-record bytes, not the entire 8 MiB allocation.
-  // Sparse blocks sealed after idleness therefore consume only their actual
-  // backlog budget, while their physical allocation remains tracked by the
-  // block allocator.
+  // Report occupied Tx-record bytes rather than full block capacity, so an
+  // idle, sparsely filled block does not inflate the backlog metric. Physical
+  // space is accounted for separately by the block allocator.
   found->second.backlog_bytes_ = state->committed_bytes_ - kBlockHeaderBytes;
   found->second.counted_backlog_ = true;
   store.tx_backlog_bytes_.fetch_add(found->second.backlog_bytes_,
                                     std::memory_order_release);
   tx_cleaner_dirty_.store(true, std::memory_order_release);
-}
-
-bool StorageEngine::Impl::TxBacklogAtLimit() const noexcept {
-  if (tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
-    return false;
-  const std::uint64_t limit =
-      tx_backlog_limit_bytes_.load(std::memory_order_acquire);
-  for (const auto& store : stores_)
-    if (store->tx_backlog_bytes_.load(std::memory_order_acquire) > limit)
-      return true;
-  return false;
-}
-
-Task<absl::Status> StorageEngine::Impl::WaitForTxBacklog() {
-  // This is an admission gate, never a per-append limit. The caller has no
-  // transaction lease; a transaction admitted below the threshold can finish
-  // even if its own blocks take the worker far above it.
-  bool counted_wait = false;
-  for (;;) {
-    if (shutdown_flush_requested_.load(std::memory_order_acquire))
-      co_return absl::UnavailableError("storage is shutting down");
-    if (!TxBacklogAtLimit()) co_return absl::OkStatus();
-    if (!counted_wait) {
-      tx_backlog_waits_.fetch_add(1, std::memory_order_relaxed);
-      counted_wait = true;
-    }
-    const std::int64_t now = MonotonicMillis();
-    std::int64_t next = tx_backlog_retry_ms_.load(std::memory_order_acquire);
-    if (now >= next && tx_backlog_retry_ms_.compare_exchange_strong(
-                           next, now + 50, std::memory_order_acq_rel,
-                           std::memory_order_acquire)) {
-      const absl::Status cleaned = co_await MaybeRunTxCleaner(true);
-      if (!cleaned.ok() && !absl::IsFailedPrecondition(cleaned) &&
-          !absl::IsAborted(cleaned) && !absl::IsResourceExhausted(cleaned))
-        co_return cleaned;
-    }
-    const absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(2));
-    if (!waited.ok()) co_return waited;
-  }
 }
 
 void StorageEngine::Impl::SealIdleTxBlocksLocal(WorkerStore& store) {

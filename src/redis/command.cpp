@@ -1315,8 +1315,6 @@ constexpr std::string_view kTombRaiderSleepConfig = "tomb-raider-sleep-ms";
 constexpr std::string_view kTombRaiderDailyTimeConfig =
     "tomb-raider-daily-time";
 constexpr std::string_view kTxCleanerCooldownConfig = "tx-cleaner-cooldown-ms";
-constexpr std::string_view kTxBacklogLimitConfig =
-    "tx-backlog-limit-mb-per-worker";
 constexpr std::string_view kActiveExpirationIntervalConfig =
     "active-expiration-interval-ms";
 constexpr std::string_view kActiveExpirationMapStepsConfig =
@@ -1360,7 +1358,6 @@ enum class RuntimeConfigKey : std::uint8_t {
   kTombRaiderSleep,
   kTombRaiderDailyTime,
   kTxCleanerCooldown,
-  kTxBacklogLimit,
   kActiveExpirationInterval,
   kActiveExpirationMapSteps,
   kActiveExpirationDeletes,
@@ -1419,8 +1416,6 @@ constexpr std::array kRuntimeConfigs{
                             RuntimeConfigKey::kTombRaiderDailyTime},
     RuntimeConfigDescriptor{kTxCleanerCooldownConfig,
                             RuntimeConfigKey::kTxCleanerCooldown},
-    RuntimeConfigDescriptor{kTxBacklogLimitConfig,
-                            RuntimeConfigKey::kTxBacklogLimit},
     RuntimeConfigDescriptor{kActiveExpirationIntervalConfig,
                             RuntimeConfigKey::kActiveExpirationInterval},
     RuntimeConfigDescriptor{kActiveExpirationMapStepsConfig,
@@ -1624,9 +1619,6 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
           return FormatDailySecond(tomb_raider->daily_second_);
         case RuntimeConfigKey::kTxCleanerCooldown:
           return std::to_string(g_storage->TxCleanerCooldownMs());
-        case RuntimeConfigKey::kTxBacklogLimit:
-          return std::to_string(g_storage->TxBacklogLimitBytes() /
-                                (1024ULL * 1024));
         case RuntimeConfigKey::kActiveExpirationInterval:
         case RuntimeConfigKey::kActiveExpirationMapSteps:
         case RuntimeConfigKey::kActiveExpirationDeletes:
@@ -1911,15 +1903,6 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
             "value is not an integer or out of range");
       } else {
         configured = g_storage->ConfigureTxCleanerCooldown(value);
-      }
-    } else if (config->key_ == RuntimeConfigKey::kTxBacklogLimit) {
-      constexpr std::uint64_t kMiB = 1024ULL * 1024;
-      if (!ParseUint64(args[3], &value) || value < 8 ||
-          value > std::numeric_limits<std::uint64_t>::max() / kMiB) {
-        configured = absl::InvalidArgumentError(
-            "value must be at least 8 MiB and fit in 64 bits");
-      } else {
-        configured = g_storage->ConfigureTxBacklogLimit(value * kMiB);
       }
     } else if (config->key_ == RuntimeConfigKey::kShutdownCheckpoint) {
       const std::optional<bool> enabled = ParseConfigYesNo(args[3]);
@@ -4897,12 +4880,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
     info +=
         "tx_cleaner_cooldown_ms:" + std::to_string(tx_cleaner.cooldown_ms_) +
         "\r\n";
-    info += "tx_backlog_limit_bytes_per_worker:" +
-            std::to_string(tx_cleaner.backlog_limit_bytes_) + "\r\n";
     info += "tx_backlog_max_worker_bytes:" +
             std::to_string(tx_cleaner.max_worker_backlog_bytes_) + "\r\n";
-    info += "tx_backlog_waits:" + std::to_string(tx_cleaner.backlog_waits_) +
-            "\r\n";
     info += std::string("tx_cleaner_running:") +
             (tx_cleaner.running_ ? "1\r\n\r\n" : "0\r\n\r\n");
     info += "tx_commit_batches:" + std::to_string(tx_commit_batches.batches_) +
@@ -10020,14 +9999,6 @@ Task<CommandReply> ExecuteExecBody(
   if (!dbs.empty()) {
     const auto write_request =
         std::find_if(queued.begin(), queued.end(), ExecCommandMayWrite);
-    if (write_request != queued.end()) {
-      absl::Status admitted = co_await g_storage->WaitForTxBacklog();
-      if (!admitted.ok()) {
-        co_await DropWatches(ctx);
-        co_return finalize_exec_reply(
-            BuiltReply(AppendStorageError(reply_builder, admitted)));
-      }
-    }
     // One write id for the whole EXEC: every record any of its commands
     // writes carries it, and one commit record at the end covers them all.
     // Read-only transactions collect no fences and append no commit.
@@ -13369,9 +13340,10 @@ Task<CommandReply> ExecuteClusterFinalizedCommand(
                                          std::move(reply));
 }
 
-Task<CommandReply> ExecutePostTxBacklogAdmission(
-    CommandRequest& request, ReplyBuilder& reply_builder,
-    std::uint64_t client_id, ConnectionContext* connection) {
+Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
+                                          ReplyBuilder& reply_builder,
+                                          std::uint64_t client_id,
+                                          ConnectionContext* connection) {
   const bool source_write =
       !request.replication_origin_ && request.spec_ != nullptr &&
       (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
@@ -13391,37 +13363,6 @@ Task<CommandReply> ExecutePostTxBacklogAdmission(
   }
   return ExecuteAdmittedWriteCommand(request, reply_builder, client_id,
                                      connection);
-}
-
-Task<CommandReply> WaitForTxBacklogAndExecute(CommandRequest& request,
-                                              ReplyBuilder& reply_builder,
-                                              std::uint64_t client_id,
-                                              ConnectionContext* connection) {
-  absl::Status admitted = co_await g_storage->WaitForTxBacklog();
-  if (!admitted.ok())
-    co_return BuiltReply(AppendStorageError(reply_builder, admitted));
-  co_return co_await ExecutePostTxBacklogAdmission(request, reply_builder,
-                                                   client_id, connection);
-}
-
-Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
-                                          ReplyBuilder& reply_builder,
-                                          std::uint64_t client_id,
-                                          ConnectionContext* connection) {
-  // Admit each direct write, including replica replay, before it can acquire
-  // key intents or start a storage transaction. This is a soft backlog gate:
-  // after admission, the command may finish even if the threshold is crossed.
-  // EXEC and a blocking List wake have their own transaction boundaries.
-  if (request.spec_ != nullptr &&
-      (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
-      request.kind_ != CommandKind::kFlushDb &&
-      request.kind_ != CommandKind::kFlushAll && g_storage != nullptr &&
-      g_storage->TxBacklogAtLimit()) {
-    return WaitForTxBacklogAndExecute(request, reply_builder, client_id,
-                                      connection);
-  }
-  return ExecutePostTxBacklogAdmission(request, reply_builder, client_id,
-                                       connection);
 }
 
 }  // namespace

@@ -936,17 +936,13 @@ remain allocated. Destination durability, source pins, and the allocation
 bitmap retirement still order its cold-free return;
 UUID and extent dependencies follow the same source-block lifetime.
 
-Direct write commands, including replica replay, wait before taking key
-intents when any worker exceeds its configured sealed, unreclaimed Tx-record
-byte budget. EXEC waits before starting its shared storage transaction, and a
-blocking List move checks again on each wake. The default and minimum are 8 MiB
-per worker. This is a soft admission threshold: an accepted transaction keeps
-writing and may cross it, while commit decisions and cleaner relocation remain
-able to progress. The active append block does not count as backlog. Each
-worker keeps one transaction append stream. Transaction receipts hold a shared
-lease until the transaction can no longer append. The cleaner first observes
-released leases, then takes
-a second worker-wide snapshot of block membership and commit decisions. That
+Each worker keeps one transaction append stream. The active append block does
+not count toward the reported sealed Tx-record backlog. Writes continue while
+the cleaner retires old blocks; physical allocation and grouped write space
+checks handle capacity pressure. Transaction receipts hold a shared lease until
+the transaction can no longer append. The cleaner first observes released
+leases, then takes a second worker-wide snapshot of block membership and
+commit decisions. That
 ordering makes the membership of eligible transactions complete even when
 workers append concurrently. A final snapshot after promotion confirms that
 no live tagged winner still needs each decision. Online cleaning yields to

@@ -150,14 +150,12 @@ process restarts legitimately increment it.
 
 ## Storage metrics
 
-`CONFIG GET/SET tx-backlog-limit-mb-per-worker` controls the soft admission
-threshold for bytes occupied by records in sealed Tx blocks. The default and
-minimum are 8 MiB. An admitted transaction can exceed it; a new client write
-waits while any worker remains above it. `INFO STATS` reports `tx_backlog_limit_bytes_per_worker`,
-`tx_backlog_max_worker_bytes`, and `tx_backlog_waits` alongside the transaction
-cleaner counters. A high maximum with no retired-block progress can indicate
-an outstanding transaction or a pinned source block. Extent blocks are not
-charged to this threshold and still consume device capacity.
+`INFO STATS` reports `tx_backlog_max_worker_bytes`, the largest amount of
+occupied record bytes in sealed Tx blocks on any worker, alongside the
+transaction cleaner counters. A high value with no retired-block progress can
+indicate an outstanding transaction or a pinned source block. The active Tx
+append block and extent blocks are not included in this metric; all allocated
+blocks still consume device capacity.
 
 The active defrag tuning values are exported alongside the work gauges so
 latency graphs can be correlated with runtime A/B changes:

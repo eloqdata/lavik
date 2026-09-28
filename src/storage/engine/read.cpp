@@ -117,36 +117,6 @@ absl::Status BatchReadError(int error) {
 
 }  // namespace
 
-// An external value owns one output buffer, but its extent reads use disjoint
-// slices. Join every submitted read before releasing that buffer, including
-// after an error, so no remote worker can write into a returned lease.
-struct StorageEngine::Impl::ExtentReadJoin {
-  std::size_t pending_ = 0;
-  std::coroutine_handle<> waiter_{};
-  absl::Status error_;
-
-  void Complete(absl::Status status) {
-    if (!status.ok() && error_.ok()) error_ = std::move(status);
-    assert(pending_ != 0);
-    if (--pending_ == 0 && waiter_) {
-      auto waiter = std::exchange(waiter_, {});
-      bycorf::ThisWorker().self_->Enqueue(waiter);
-    }
-  }
-
-  auto Join() {
-    struct Awaiter {
-      ExtentReadJoin* join_;
-      bool await_ready() const noexcept { return join_->pending_ == 0; }
-      void await_suspend(std::coroutine_handle<> waiter) const noexcept {
-        join_->waiter_ = waiter;
-      }
-      void await_resume() const noexcept {}
-    };
-    return Awaiter{this};
-  }
-};
-
 Task<absl::StatusOr<std::optional<std::string>>>
 StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
   assert(db_id < kLogicalDatabaseCount);
@@ -1066,27 +1036,20 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentInto(
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::ReadExtentParallel(
-    ExtentRef ref, std::uint32_t extent_index, std::byte* destination,
-    ExtentReadJoin* join) {
+Task<absl::Status> StorageEngine::Impl::ReadExtentOnOwner(
+    ExtentRef ref, std::uint32_t extent_index, std::byte* destination) {
   const unsigned owner = BlockOwner(ref.block_id_);
-  absl::Status read;
-  // The manifest check precedes task scheduling. The block can be recycled
-  // before this task runs, so validate the freshly observed owner before
-  // either indexing stores_ or routing to another worker.
-  if (owner >= worker_count_) {
-    read = absl::AbortedError("stale or missing external extent");
-  } else if (owner == bycorf::ThisWorker().id_) {
-    read = co_await ReadExtentInto(*stores_[owner], ref, extent_index,
-                                   destination);
-  } else {
-    read = co_await bycorf::SubmitTaskTo(owner, [this, owner, ref, extent_index,
-                                                 destination]() {
-      return ReadExtentInto(*stores_[owner], ref, extent_index, destination);
-    });
-  }
-  join->Complete(read);
-  co_return read;
+  // The block may be recycled after manifest validation. Recheck its owner
+  // before routing, and let ReadExtentInto validate the allocation epoch.
+  if (owner >= worker_count_)
+    co_return absl::AbortedError("stale or missing external extent");
+  if (owner == bycorf::ThisWorker().id_)
+    co_return co_await ReadExtentInto(*stores_[owner], ref, extent_index,
+                                      destination);
+  co_return co_await bycorf::SubmitTaskTo(
+      owner, [this, owner, ref, extent_index, destination]() {
+        return ReadExtentInto(*stores_[owner], ref, extent_index, destination);
+      });
 }
 
 Task<absl::Status> StorageEngine::Impl::ReadExtentSlice(
@@ -1284,9 +1247,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
   if (trace != nullptr) {
     trace->io_submit_ns_ = ReadTraceNowNanos();
   }
-  // Validate the complete manifest before any task gets a pointer into the
-  // output buffer. Once a wave starts, every task must finish before its
-  // shared output lease can leave this frame.
+  // Validate the complete manifest before reading into the output buffer.
   std::size_t checked_bytes = 0;
   for (const ExtentRef& ref : *extents) {
     if (BlockOwner(ref.block_id_) >= worker_count_) {
@@ -1300,25 +1261,14 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
   if (checked_bytes != value_bytes)
     co_return absl::InternalError(
         "external value length does not match manifest");
-  // Bound temporary read buffers per request. Extents can be 8 MiB each, so
-  // unbounded fanout would multiply memory use under high connection counts.
-  constexpr std::size_t kExtentReadWave = 4;
   std::size_t output_offset = 0;
-  for (std::size_t first = 0; first < extents->size();) {
-    const std::size_t last =
-        first + std::min(kExtentReadWave, extents->size() - first);
-    ExtentReadJoin join;
-    join.pending_ = last - first;
-    for (std::size_t index = first; index < last; ++index) {
-      const ExtentRef& ref = extents->at(index);
-      std::byte* target = destination.data_ + output_offset;
-      store.worker_->Spawn(ReadExtentParallel(
-          ref, static_cast<std::uint32_t>(index), target, &join));
-      output_offset += ref.payload_bytes_;
-    }
-    co_await join.Join();
-    if (!join.error_.ok()) co_return join.error_;
-    first = last;
+  for (std::size_t index = 0; index < extents->size(); ++index) {
+    const ExtentRef& ref = extents->at(index);
+    const absl::Status read =
+        co_await ReadExtentOnOwner(ref, static_cast<std::uint32_t>(index),
+                                   destination.data_ + output_offset);
+    if (!read.ok()) co_return read;
+    output_offset += ref.payload_bytes_;
   }
   if (output_offset != value_bytes) {
     co_return absl::Status(absl::StatusCode::kInternal,

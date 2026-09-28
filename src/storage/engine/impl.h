@@ -1363,8 +1363,6 @@ class StorageEngine::Impl {
                                  std::memory_order_relaxed);
     tx_cleaner_cooldown_ms_.store(options_.tx_cleaner_cooldown_ms_,
                                   std::memory_order_relaxed);
-    tx_backlog_limit_bytes_.store(options_.tx_backlog_limit_bytes_,
-                                  std::memory_order_relaxed);
     const auto cleaner_now =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
@@ -2352,9 +2350,6 @@ class StorageEngine::Impl {
         .retired_blocks_ =
             tx_cleaner_retired_blocks_.load(std::memory_order_acquire),
         .cooldown_ms_ = tx_cleaner_cooldown_ms_.load(std::memory_order_acquire),
-        .backlog_limit_bytes_ =
-            tx_backlog_limit_bytes_.load(std::memory_order_acquire),
-        .backlog_waits_ = tx_backlog_waits_.load(std::memory_order_acquire),
         .running_ = tx_cleaner_running_.load(std::memory_order_acquire),
     };
     for (const auto& store : stores_)
@@ -2367,12 +2362,6 @@ class StorageEngine::Impl {
     return tx_cleaner_cooldown_ms_.load(std::memory_order_acquire);
   }
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
-  std::uint64_t TxBacklogLimitBytes() const noexcept {
-    return tx_backlog_limit_bytes_.load(std::memory_order_acquire);
-  }
-  absl::Status ConfigureTxBacklogLimit(std::uint64_t bytes);
-  bool TxBacklogAtLimit() const noexcept;
-  Task<absl::Status> WaitForTxBacklog();
   void InitializeTxWrites(std::uint64_t txid, std::span<TxShardWrites> writes,
                           MutationPrecondition mutation_precondition);
 
@@ -3416,11 +3405,9 @@ class StorageEngine::Impl {
   Task<absl::Status> ReadExtentInto(WorkerStore& store, ExtentRef ref,
                                     std::uint32_t extent_index,
                                     std::byte* destination);
-  struct ExtentReadJoin;
-  Task<absl::Status> ReadExtentParallel(ExtentRef ref,
-                                        std::uint32_t extent_index,
-                                        std::byte* destination,
-                                        ExtentReadJoin* join);
+  Task<absl::Status> ReadExtentOnOwner(ExtentRef ref,
+                                       std::uint32_t extent_index,
+                                       std::byte* destination);
   Task<absl::Status> ReadExtentSlice(WorkerStore& store, ExtentRef ref,
                                      std::uint32_t extent_index,
                                      std::size_t source_offset,
@@ -4188,12 +4175,7 @@ class StorageEngine::Impl {
   std::atomic<unsigned> active_extent_reclaims_{0};
   std::atomic<std::uint64_t> space_reclaim_generation_{0};
   std::atomic<std::uint32_t> tx_cleaner_cooldown_ms_{60'000};
-  std::atomic<std::uint64_t> tx_backlog_limit_bytes_{kStorageBlockBytes};
   std::atomic<std::int64_t> tx_cleaner_next_run_ms_{0};
-  // One pressure-driven retry per process; waiters do not each launch a
-  // cross-worker cleaner round while an old transaction is still open.
-  std::atomic<std::int64_t> tx_backlog_retry_ms_{0};
-  std::atomic<std::uint64_t> tx_backlog_waits_{0};
   std::atomic<bool> tx_cleaner_dirty_{true};
   std::atomic<bool> tx_cleaner_running_{false};
   std::atomic<std::uint64_t> tx_cleaner_rounds_{0};
