@@ -2362,6 +2362,8 @@ class StorageEngine::Impl {
     return tx_cleaner_cooldown_ms_.load(std::memory_order_acquire);
   }
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
+  bool TxBacklogAtLimit() const noexcept;
+  Task<absl::Status> WaitForTxBacklog();
   void InitializeTxWrites(std::uint64_t txid, std::span<TxShardWrites> writes,
                           MutationPrecondition mutation_precondition);
 
@@ -2406,8 +2408,9 @@ class StorageEngine::Impl {
   Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                           const Digest& digest);
 
-  Task<absl::Status> CommitTxWrites(std::uint64_t txid,
-                                    std::vector<TxShardWrites*> shards);
+  Task<absl::Status> CommitTxWrites(
+      std::uint64_t txid, std::vector<TxShardWrites*> shards,
+      RelocationDurabilityFence* deferred_decision = nullptr);
 
   static constexpr std::size_t kTxCommitQueueHighWatermark = 4096;
 
@@ -4175,6 +4178,8 @@ class StorageEngine::Impl {
   std::atomic<unsigned> active_extent_reclaims_{0};
   std::atomic<std::uint64_t> space_reclaim_generation_{0};
   std::atomic<std::uint32_t> tx_cleaner_cooldown_ms_{60'000};
+  // A single pressure-driven cleaner attempt serves all admission waiters.
+  std::atomic<std::int64_t> tx_backlog_retry_ms_{0};
   std::atomic<std::int64_t> tx_cleaner_next_run_ms_{0};
   std::atomic<bool> tx_cleaner_dirty_{true};
   std::atomic<bool> tx_cleaner_running_{false};

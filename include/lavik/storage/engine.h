@@ -1893,6 +1893,11 @@ class StorageEngine {
   TxCleanerTotals TxCleanerStats() const noexcept;
   std::uint32_t TxCleanerCooldownMs() const noexcept;
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
+  // Suspend admission of a new write transaction when a worker has about
+  // 16 MiB of sealed Tx records. Call before taking key intents; an already
+  // admitted transaction must remain free to append and commit.
+  bool TxBacklogAtLimit() const noexcept;
+  bycorf::Task<absl::Status> WaitForTxBacklog();
   bycorf::Task<StorageDurabilityStats> DurabilityStats() const;
   bycorf::Task<StorageMetricsSnapshot> CollectMetrics() const;
 

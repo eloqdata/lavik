@@ -979,22 +979,17 @@ int main(int argc, char** argv) {
       }
     }
 
-    // Transaction blocks are sealed and cleaned by whichever periodic
-    // worker wins the process-wide guard. Wait for an observed retirement so
-    // this verifies the cleaner itself rather than merely sleeping.
+    // A sparse active Tx block stays open for subsequent writes. Cleaner
+    // retirement is checked below after a transaction rolls blocks over.
     Expect(client.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "enable tx cleaner");
     Expect(client.Command({"CONFIG", "GET", "tx-cleaner-cooldown-ms"}),
            "*2\r\n" + Bulk("tx-cleaner-cooldown-ms") + "\r\n" + Bulk("20"),
            "read tx cleaner cooldown");
-    const std::uint64_t cleaner_baseline = TxCleanerRetiredBlocks(client);
     Expect(
         client.Command({"MSET", "cleaner-a", "after-a", "cleaner-b", "after-b",
                         "cleaner-c", "after-c", "cleaner-d", "after-d"}),
         "+OK", "tx cleaner seed");
-    if (!WaitForCleanerBlockRetirement(client, cleaner_baseline)) {
-      Fail("transaction cleaner did not retire a transaction block");
-    }
     Expect(client.Command(
                {"MGET", "cleaner-d", "cleaner-a", "cleaner-c", "cleaner-b"}),
            "*4\r\n" + Bulk("after-d") + "\r\n" + Bulk("after-a") + "\r\n" +
@@ -1113,20 +1108,15 @@ int main(int argc, char** argv) {
            "+OK", "persist tagged values before FLUSHDB");
     Expect(block_recovery.Command({"FLUSHDB", "SYNC"}), "+OK",
            "flush tagged transaction block");
-    const std::uint64_t flushed_cleaner_baseline =
-        TxCleanerRetiredBlocks(block_recovery);
     Expect(block_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "enable tx cleaner after FLUSHDB");
-    if (!WaitForCleanerBlockRetirement(block_recovery,
-                                       flushed_cleaner_baseline)) {
-      Fail("FLUSHDB-invalidated transaction block was not retired");
-    }
     Expect(block_recovery.Command(
                {"EXISTS", "cleaner-flush-a", "cleaner-flush-b"}),
-           ":0", "FLUSHDB values after transaction block retirement");
-    // A large transaction may span multiple Tx blocks. Once committed, its
-    // sealed blocks must become reclaimable while later writes continue.
+           ":0", "FLUSHDB values remain invalidated");
+    // One admitted transaction may cross the new-transaction backlog limit.
+    // It must finish its own writes and commit before the next transaction
+    // waits for the cleaner to retire its sealed blocks.
     Expect(block_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "60000"}),
            "+OK", "hold periodic cleaning during large transaction fixture");
@@ -1135,18 +1125,27 @@ int main(int argc, char** argv) {
     std::string large_value(1024 * 1024, 'q');
     std::vector<std::string> pressure_keys;
     std::vector<std::string_view> pressure_args{"MSET"};
-    pressure_keys.reserve(18);
-    pressure_args.reserve(37);
-    for (unsigned i = 0; i < 18; ++i) {
+    pressure_keys.reserve(24);
+    pressure_args.reserve(49);
+    for (unsigned i = 0; i < 24; ++i) {
       pressure_keys.push_back("{tx-pressure}" + std::to_string(i));
       pressure_args.push_back(pressure_keys.back());
       pressure_args.push_back(large_value);
     }
     Expect(block_recovery.Command(pressure_args), "+OK",
            "single transaction spans transaction blocks");
+    if (InfoStat(block_recovery, "tx_backlog_max_worker_bytes:") <=
+        16ULL * 1024 * 1024)
+      Fail("large transaction did not build a sealed Tx backlog");
     Expect(block_recovery.Command({"MSET", "{tx-pressure}next", "next",
                                    "{tx-pressure}last", "last"}),
-           "+OK", "new transaction continues before sealed block cleanup");
+           "+OK", "new transaction admitted after Tx block cleanup");
+    if (InfoStat(block_recovery, "tx_backlog_max_worker_bytes:") >=
+        16ULL * 1024 * 1024)
+      Fail("new transaction started with a sealed Tx backlog above 16 MiB");
+    if (InfoStat(block_recovery, "tx_cleaner_retired_blocks:") <=
+        block_baseline)
+      Fail("new transaction bypassed the sealed Tx backlog gate");
     Expect(block_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "resume periodic cleaning after the next transaction");

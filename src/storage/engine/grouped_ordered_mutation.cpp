@@ -94,8 +94,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
                              ? 2
                              : 1);
     }
-    // A borrowed outer transaction must never wait on its own generation.
-    // Only standalone admission coordinates reclaim before taking its lease.
+    // An outer transaction must be able to finish even under capacity
+    // pressure. Only a new standalone transaction can wait for reclamation
+    // before taking its lease.
     store.store_state_mutex_.Unlock(*store.worker_);
     absl::Status space;
     try {

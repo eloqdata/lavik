@@ -9951,6 +9951,16 @@ Task<CommandReply> ExecuteExecBody(
     co_return std::string(local.encoded_);
   };
 
+  // EXEC is one transaction regardless of its queued command count. Admit it
+  // before taking a database gate or key intent; its lease can then finish.
+  if (std::any_of(queued.begin(), queued.end(), ExecCommandMayWrite)) {
+    const absl::Status admitted = co_await g_storage->WaitForTxBacklog();
+    if (!admitted.ok()) {
+      co_await DropWatches(ctx);
+      co_return finalize_exec_reply(
+          BuiltReply(AppendStorageError(reply_builder, admitted)));
+    }
+  }
   MultiDbOperationGuard db_guard;
   while (!queued.front().exclusive_db_access_ &&
          !db_guard.TryAcquire(gate_dbs)) {
@@ -13340,10 +13350,9 @@ Task<CommandReply> ExecuteClusterFinalizedCommand(
                                          std::move(reply));
 }
 
-Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
-                                          ReplyBuilder& reply_builder,
-                                          std::uint64_t client_id,
-                                          ConnectionContext* connection) {
+Task<CommandReply> ExecutePostTxBacklogAdmission(
+    CommandRequest& request, ReplyBuilder& reply_builder,
+    std::uint64_t client_id, ConnectionContext* connection) {
   const bool source_write =
       !request.replication_origin_ && request.spec_ != nullptr &&
       (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
@@ -13363,6 +13372,35 @@ Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
   }
   return ExecuteAdmittedWriteCommand(request, reply_builder, client_id,
                                      connection);
+}
+
+Task<CommandReply> WaitForTxBacklogAndExecute(CommandRequest& request,
+                                              ReplyBuilder& reply_builder,
+                                              std::uint64_t client_id,
+                                              ConnectionContext* connection) {
+  const absl::Status admitted = co_await g_storage->WaitForTxBacklog();
+  if (!admitted.ok())
+    co_return BuiltReply(AppendStorageError(reply_builder, admitted));
+  co_return co_await ExecutePostTxBacklogAdmission(request, reply_builder,
+                                                   client_id, connection);
+}
+
+Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
+                                          ReplyBuilder& reply_builder,
+                                          std::uint64_t client_id,
+                                          ConnectionContext* connection) {
+  // Admission runs before the command can take key intents. Once admitted,
+  // all of its writes and its commit may cross the backlog threshold.
+  if (request.spec_ != nullptr &&
+      (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
+      request.kind_ != CommandKind::kFlushDb &&
+      request.kind_ != CommandKind::kFlushAll && g_storage != nullptr &&
+      g_storage->TxBacklogAtLimit()) {
+    return WaitForTxBacklogAndExecute(request, reply_builder, client_id,
+                                      connection);
+  }
+  return ExecutePostTxBacklogAdmission(request, reply_builder, client_id,
+                                       connection);
 }
 
 }  // namespace

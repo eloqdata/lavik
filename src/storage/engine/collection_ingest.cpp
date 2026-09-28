@@ -171,8 +171,8 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     }
   } else {
     // The key intent is held, but no transaction lease or store mutex is held
-    // yet. Ingest batches later borrow this accumulator and must not attempt
-    // to clean their own still-uncommitted generation between input pages.
+    // yet. Ingest batches later borrow this accumulator and must not wait for
+    // reclamation while their own transaction is still open.
     co_await store.store_state_mutex_.Lock();
     const auto predecessor = co_await AwaitGroupedDependencyLocked(
         store, partition.grouped_objects_[db_id].CurrentForMutation(key), 0);

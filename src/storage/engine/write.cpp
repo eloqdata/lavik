@@ -552,7 +552,8 @@ Task<absl::Status> StorageEngine::Impl::MarkRecordDead(
 }
 
 Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
-    std::uint64_t txid, std::vector<TxShardWrites*> shards) {
+    std::uint64_t txid, std::vector<TxShardWrites*> shards,
+    RelocationDurabilityFence* deferred_decision) {
   struct FailUncommittedDependencies {
     const std::vector<TxShardWrites*>& shards_;
     bool completed_ = false;
@@ -637,6 +638,21 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   // instead of waiting out the periodic flush: until it lands, a crash
   // drops the whole (acknowledged but never durability-promised)
   // transaction.
+  if (deferred_decision != nullptr) {
+    // The queued batch retains every receipt and publishes grouped decisions
+    // only after requesting and awaiting the shared flush below. Delaying that
+    // request lets several small commit records occupy one direct-I/O page.
+    *deferred_decision = RelocationDurabilityFence{
+        .block_id_ = commit_location.block_id(),
+        .allocation_epoch_ = commit_location.allocation_epoch(),
+        .block_owner_ = commit_location.block_owner(),
+        .committed_bytes_ =
+            static_cast<std::uint32_t>(commit_location.record_offset() +
+                                       commit_location.total_disk_bytes()),
+    };
+    dependency_guard.completed_ = true;
+    co_return absl::OkStatus();
+  }
   RequestFlush(store, commit_location.block_id());
   const bool grouped =
       std::any_of(shards.begin(), shards.end(), [](auto* shard) {
@@ -826,6 +842,16 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
       }
     }
 
+    // Commit records in this queue already share a durability owner. Append
+    // the batch before requesting its decision flush so direct-I/O alignment
+    // does not charge a full page to each small record.
+    const bool defer_decisions = batch.size() > 1;
+    std::vector<RelocationDurabilityFence> decision_fences;
+    std::vector<WorkerStore::PendingTxCommit*> deferred_pending;
+    if (defer_decisions) {
+      decision_fences.reserve(batch.size());
+      deferred_pending.reserve(batch.size());
+    }
     for (WorkerStore::PendingTxCommit& pending : batch) {
       if (batch_status.ok()) {
         std::vector<TxShardWrites*> shards;
@@ -835,11 +861,16 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
           }
         }
         if (!shards.empty()) {
+          RelocationDurabilityFence decision;
           absl::Status committed =
-              co_await CommitTxWrites(pending.txid_, std::move(shards));
+              co_await CommitTxWrites(pending.txid_, std::move(shards),
+                                      defer_decisions ? &decision : nullptr);
           if (!committed.ok()) {
             spdlog::warn("transaction {} commit append failed: {}",
                          pending.txid_, committed.message());
+          } else if (defer_decisions) {
+            decision_fences.push_back(decision);
+            deferred_pending.push_back(&pending);
           }
         }
       } else {
@@ -851,8 +882,36 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
           }
         }
       }
-      NoteTxCommitFinished();
     }
+    if (!decision_fences.empty()) {
+      co_await store->store_state_mutex_.Lock();
+      UnlockGuard unlock(&store->store_state_mutex_, store->worker_);
+      for (const RelocationDurabilityFence& decision : decision_fences)
+        RequestFlush(*store, decision.block_id_);
+      unlock.Unlock();
+      absl::Status decisions_durable = absl::OkStatus();
+      for (const RelocationDurabilityFence& decision : decision_fences) {
+        decisions_durable = co_await AwaitRelocationDurable(decision);
+        if (!decisions_durable.ok()) break;
+      }
+      for (auto* pending : deferred_pending) {
+        for (TxShardWrites& shard : pending->writes_) {
+          if (!shard.grouped_decision_) continue;
+          if (decisions_durable.ok()) {
+            shard.grouped_decision_->state_.store(
+                GroupedCommitDecision::State::kDurable,
+                std::memory_order_release);
+          } else {
+            shard.grouped_decision_->FailPending();
+          }
+        }
+      }
+      if (!decisions_durable.ok())
+        spdlog::warn("transaction batch decision flush failed: {}",
+                     decisions_durable.message());
+    }
+    for (std::size_t index = 0; index < batch.size(); ++index)
+      NoteTxCommitFinished();
   }
   store->tx_commit_runner_ = false;
   co_return absl::OkStatus();
@@ -2463,10 +2522,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     if (indirect_key_record) return store.active_indirect_key_block_;
     return transaction_append ? store.active_tx_block_ : store.active_block_;
   };
-  // A segmented String can fill a Tx block before its enclosing EXEC writes
-  // the decision for already staged children. Keep two direct-I/O pages for
-  // the nested and outer decisions when the record fits. A larger record may
-  // still use the full block; the margin must never make it unappendable.
+  // A grouped String may commit a nested batch before its outer transaction.
+  // Their durability waits each finish a direct-I/O page, so keep two pages
+  // in the current block when a segment fits elsewhere. Larger records still
+  // use the full block rather than becoming unappendable.
   const std::uint64_t append_limit =
       transaction_append && group != nullptr && value_type == ValueType::kString
           ? std::max<std::uint64_t>(kStorageBlockBytes - 2 * kDirectIoAlignment,

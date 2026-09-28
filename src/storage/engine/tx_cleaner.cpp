@@ -247,6 +247,43 @@ void StorageEngine::Impl::NoteTxBlockSealedLocal(WorkerStore& store,
   tx_cleaner_dirty_.store(true, std::memory_order_release);
 }
 
+bool StorageEngine::Impl::TxBacklogAtLimit() const noexcept {
+  if (tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
+    return false;
+  // Two substantially filled sealed Tx blocks are the admission boundary.
+  // Charge only their occupied records, not free blocks elsewhere on a device.
+  constexpr std::uint64_t kAdmissionBytes =
+      2 * (kStorageBlockBytes - kBlockHeaderBytes);
+  for (const auto& store : stores_)
+    if (store->tx_backlog_bytes_.load(std::memory_order_acquire) >=
+        kAdmissionBytes)
+      return true;
+  return false;
+}
+
+Task<absl::Status> StorageEngine::Impl::WaitForTxBacklog() {
+  // Only a new transaction waits here. Its predecessors keep writing and
+  // committing so the cleaner can eventually retire their sealed blocks.
+  for (;;) {
+    if (shutdown_flush_requested_.load(std::memory_order_acquire))
+      co_return absl::UnavailableError("storage is shutting down");
+    if (!TxBacklogAtLimit()) co_return absl::OkStatus();
+    const std::int64_t now = MonotonicMillis();
+    std::int64_t next = tx_backlog_retry_ms_.load(std::memory_order_acquire);
+    if (now >= next && tx_backlog_retry_ms_.compare_exchange_strong(
+                           next, now + 50, std::memory_order_acq_rel,
+                           std::memory_order_acquire)) {
+      const absl::Status cleaned = co_await MaybeRunTxCleaner(true);
+      if (!cleaned.ok() && !absl::IsFailedPrecondition(cleaned) &&
+          !absl::IsAborted(cleaned) && !absl::IsResourceExhausted(cleaned))
+        co_return cleaned;
+    }
+    const absl::Status waited = co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(2));
+    if (!waited.ok()) co_return waited;
+  }
+}
+
 void StorageEngine::Impl::SealIdleTxBlocksLocal(WorkerStore& store) {
   if (tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0) return;
   constexpr std::int64_t kIdleSealMs = 60'000;
@@ -275,86 +312,47 @@ Task<absl::Status> StorageEngine::Impl::BeforeGroupedTransaction(
   // lease would leave that transaction preventing reclamation.
   if (tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
     co_return absl::OkStatus();  // Preserve explicit maintenance disabling.
-  constexpr std::uint64_t payload = kStorageBlockBytes - kBlockHeaderBytes;
-  const auto needed = append_bytes / payload + (append_bytes % payload != 0);
-  const auto deadline = MonotonicMillis() + 1000;
-  unsigned rounds = 0;
   try {
-    for (;;) {
-      if (shutdown_flush_requested_.load(std::memory_order_acquire))
-        co_return absl::UnavailableError("storage is shutting down");
-      // Observe only on this stream's owner, without suspension. Small
-      // successors can reuse the current Tx stream's staging capacity even
-      // when every free foreground block is occupied. Forcing a rotation in
-      // that case would discard usable space and require a fresh tx block:
-      // a snapshot may retain the old extents until it obtains the key intent
-      // this very writer holds. This is not append admission; WriteRecord
-      // still validates the stream and remaining bytes after its own waits.
-      if (store.active_tx_block_) {
-        const auto& stream = *store.active_tx_block_;
-        const auto* state = FindBlockState(store, stream.block_id_);
-        if (state != nullptr && state->allocated_ && state->in_memory_ &&
-            !state->freeing_ && !state->release_pending_ &&
-            state->allocation_epoch_ == stream.allocation_epoch_ &&
-            state->kind_ == BlockKind::kTransaction) {
-          const auto used =
-              std::max(stream.committed_bytes_, state->committed_bytes_);
-          // An in-flight flush owns only its captured prefix, so still-open
-          // staging bytes remain reusable; the writer rechecks after waiting.
-          if (used <= kStorageBlockBytes &&
-              append_bytes <= kStorageBlockBytes - used)
-            co_return absl::OkStatus();
-        }
+    if (shutdown_flush_requested_.load(std::memory_order_acquire))
+      co_return absl::UnavailableError("storage is shutting down");
+    // Observe only on this stream's owner, without suspension. Small
+    // successors can reuse the current Tx stream's staging capacity even
+    // when every free foreground block is occupied. Forcing a rotation in
+    // that case would discard usable space and require a fresh tx block:
+    // a snapshot may retain the old extents until it obtains the key intent
+    // this very writer holds. This is not append admission; WriteRecord
+    // still validates the stream and remaining bytes after its own waits.
+    if (store.active_tx_block_) {
+      const auto& stream = *store.active_tx_block_;
+      const auto* state = FindBlockState(store, stream.block_id_);
+      if (state != nullptr && state->allocated_ && state->in_memory_ &&
+          !state->freeing_ && !state->release_pending_ &&
+          state->allocation_epoch_ == stream.allocation_epoch_ &&
+          state->kind_ == BlockKind::kTransaction) {
+        const auto used =
+            std::max(stream.committed_bytes_, state->committed_bytes_);
+        // An in-flight flush owns only its captured prefix, so still-open
+        // staging bytes remain reusable; the writer rechecks after waiting.
+        if (used <= kStorageBlockBytes &&
+            append_bytes <= kStorageBlockBytes - used)
+          co_return absl::OkStatus();
       }
-      std::uint64_t free = 0;
-      std::uint64_t capacity = 0;
-      for (std::size_t index = 0; index < devices_.size(); ++index) {
-        if (bycorf::SpdkStorageEnabled()) {
-          if (std::find(store.home_devices_.begin(), store.home_devices_.end(),
-                        index) == store.home_devices_.end())
-            continue;
-        }
-        const auto available = co_await bycorf::SubmitTo(
-            device_allocators_[index]->owner_, [this, index] {
-              const auto& allocator = *device_allocators_[index];
-              const auto& device = devices_[index];
-              const auto pristine =
-                  allocator.next_pristine_ < device.capacity_blocks_
-                      ? device.capacity_blocks_ - allocator.next_pristine_
-                      : 0;
-              return pristine + allocator.ready_blocks_.size() +
-                     allocator.cold_free_.size();
-            });
-        const auto reserve = DefragReserveForDevice(index);
-        free += available > reserve ? available - reserve : 0;
-        capacity += ForegroundBlocksForDevice(index);
-      }
-      // Include staging/fragmentation headroom, but do not reject a write
-      // based on this approximate snapshot. The allocator remains
-      // authoritative.
-      if (free > std::max(needed + 2, capacity / 8)) co_return absl::OkStatus();
-      if (MonotonicMillis() >= deadline || rounds == 4)
-        co_return absl::OkStatus();
-      if (!tx_cleaner_running_.load(std::memory_order_acquire)) {
-        const auto cleaned = co_await MaybeRunTxCleaner(true);
-        if (!cleaned.ok()) {
-          // Maintenance admission/pin races are not evidence that the user's
-          // append cannot fit. The elected coordinator has rearmed dirty
-          // state; let the ordinary allocator make the final capacity choice.
-          // Corruption and I/O errors must not become a successful write.
-          if (!store.write_failed_ &&
-              !epoch_metadata_failed_.load(std::memory_order_acquire) &&
-              (absl::IsResourceExhausted(cleaned) || absl::IsAborted(cleaned) ||
-               absl::IsFailedPrecondition(cleaned)))
-            co_return absl::OkStatus();
-          co_return cleaned;
-        }
-        ++rounds;
-      }
-      const auto waited = co_await bycorf::SleepFor(
-          *store.worker_, std::chrono::milliseconds(1));
-      if (!waited.ok()) co_return waited;
     }
+    // Try to reclaim sealed predecessors before the append path needs a new
+    // block. This is a maintenance attempt, not admission: allocation itself
+    // decides whether a successor exists after other writers run.
+    if (!tx_cleaner_running_.load(std::memory_order_acquire)) {
+      const auto cleaned = co_await MaybeRunTxCleaner(true);
+      if (!cleaned.ok()) {
+        if (!store.write_failed_ &&
+            !epoch_metadata_failed_.load(std::memory_order_acquire) &&
+            (absl::IsResourceExhausted(cleaned) || absl::IsAborted(cleaned) ||
+             absl::IsFailedPrecondition(cleaned)))
+          co_return absl::OkStatus();
+        co_return cleaned;
+      }
+    }
+    co_return absl::OkStatus();
   } catch (const std::bad_alloc&) {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError(
@@ -424,10 +422,12 @@ StorageEngine::Impl::InspectTxBlocksLocal(WorkerStore& store, bool seal) {
           active_writers |= !lease.expired();
         }
     }
-    // A settled tail must be sealed or a sparse transaction would wait for
-    // the one-minute idle timer before it could be promoted. Keep a live
-    // writer's stream open across cleaner rounds.
-    if (seal && store.active_tx_block_ && !active_writers) {
+    // A cleaner round must not discard usable space in the current append
+    // block. Rollovers seal it normally; this path handles a nearly full tail
+    // whose writers have settled but cannot allocate a successor yet.
+    if (seal && store.active_tx_block_ && !active_writers &&
+        store.active_tx_block_->committed_bytes_ >=
+            kStorageBlockBytes - 2 * kDirectIoAlignment) {
       const ActiveBlock block = *store.active_tx_block_;
       RequestFlush(store, block.block_id_);
       NoteTxBlockSealedLocal(store, block.block_id_);

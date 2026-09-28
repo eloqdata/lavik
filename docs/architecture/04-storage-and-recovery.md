@@ -591,8 +591,10 @@ receipts to a worker-local commit coordinator instead of spawning one coroutine
 per transaction. One runner per worker drains at most 256 receipts at a time.
 With a backlog it merges fences for the same block incarnation up to the
 greatest required committed boundary and requests those unique frontiers in
-parallel; each transaction still awaits only its own fences before appending
-its own commit decision. A singleton batch retains the direct path. The queue
+parallel. Each transaction awaits its own data fences before appending its
+commit decision. A multi-transaction batch appends its decisions before
+requesting their shared flush, then waits for durability before publishing
+grouped decisions. A singleton batch retains the direct path. The queue
 high watermark is 4096 receipts: crossing it makes the command wait for queue
 capacity before replying, but not for commit durability. Direct callers such
 as SORT STORE and list-move operations still wait through tagged-record fences
@@ -923,9 +925,9 @@ epoch. The latter two fence control-plane population identity; neither can
 substitute for the storage epoch used by recovery.
 
 Transaction cleaning seals a Tx block when its append stream rolls over, has
-received no append for one minute, or contains no active writer at a cleaner
-round. Once the block is durable and every transaction represented in it has
-settled, the cleaner can relocate its
+received no append for one minute, or has a nearly full tail with no active
+writer at a cleaner round. Once the block is durable and every transaction
+represented in it has settled, the cleaner can relocate its
 current committed winners into ordinary untagged blocks and discard aborted
 or obsolete versions. It awaits each relevant commit decision's durability
 before promotion. A block carrying a commit decision remains allocated until
@@ -937,13 +939,19 @@ bitmap retirement still order its cold-free return;
 UUID and extent dependencies follow the same source-block lifetime.
 
 Each worker keeps one transaction append stream. The active append block does
-not count toward the reported sealed Tx-record backlog. Writes continue while
-the cleaner retires old blocks; physical allocation and grouped write space
-checks handle capacity pressure. Transaction receipts hold a shared lease until
-the transaction can no longer append. The cleaner first observes released
-leases, then takes a second worker-wide snapshot of block membership and
-commit decisions. That
-ordering makes the membership of eligible transactions complete even when
+not count toward the reported sealed Tx-record backlog. New write transactions
+wait before taking key intents when one worker has about 16 MiB of sealed Tx
+records. Already admitted transactions continue to append and commit across
+block rollovers so their Tx blocks can become reclaimable. The admission
+threshold is independent of the device's remaining free-block count. Writes
+continue while the cleaner retires old blocks; standalone grouped writes
+attempt cleanup before acquiring a transaction lease when the current stream
+cannot hold the planned append. The allocator decides whether a successor
+block is available.
+Transaction receipts hold a shared lease until the transaction can no longer
+append. The cleaner first observes released leases, then takes a second
+worker-wide snapshot of block membership and commit decisions. That ordering
+makes the membership of eligible transactions complete even when
 workers append concurrently. A final snapshot after promotion confirms that
 no live tagged winner still needs each decision. Online cleaning yields to
 shutdown at block boundaries after already-published relocations become durable.
