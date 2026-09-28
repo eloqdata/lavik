@@ -47,6 +47,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "bycorf/runtime/runtime.h"
+#include "lavik/client_endpoint.h"
 #include "lavik/cluster/meta_client.h"
 #include "lavik/meta/automatic_failover_reconciler.h"
 #include "lavik/meta/cluster_create.h"
@@ -97,6 +98,7 @@ struct CliOptions {
   std::string data_control_addr_;
   std::string data_dir_;
   std::string sentinel_addr_;
+  lavik::meta::MetaSentinelServerOptions sentinel_extra_;
   std::string sentinel_requirepass_;
   int sentinel_maxclients_ = 256;
   bool sentinel_options_supplied_ = false;
@@ -134,6 +136,12 @@ void PrintUsage(const char* program) {
       "[--initial-cluster-manifest FILE]\n"
       "          [--sentinel-addr ip:port] [--sentinel-requirepass PASSWORD] "
       "[--sentinel-maxclients N]\n"
+      "          [--sentinel-tls-addr ip:port] [--sentinel-tls-cert F "
+      "--sentinel-tls-key F --sentinel-tls-ca F]\n"
+      "          [--sentinel-tls-auth-clients no|optional|yes] "
+      "[--sentinel-data-transport plaintext|tls]\n"
+      "          [--sentinel-resolve-hostnames yes|no] "
+      "[--sentinel-announce-hostnames yes|no]\n"
       "          [--tls-ca F --tls-cert F --tls-key F]\n"
       "          [--ctl-allow-uid N] [--ctl-tls-ca F --ctl-tls-cert F "
       "--ctl-tls-key F]\n"
@@ -228,6 +236,37 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
     } else if (name == "--sentinel-addr") {
       options.sentinel_addr_ = std::string(value);
       options.sentinel_options_supplied_ = true;
+    } else if (name == "--sentinel-tls-addr" || name == "--sentinel-tls-cert" ||
+               name == "--sentinel-tls-key" || name == "--sentinel-tls-ca" ||
+               name == "--sentinel-tls-auth-clients") {
+      auto& extra = options.sentinel_extra_;
+      if (name == "--sentinel-tls-addr")
+        extra.tls_address_ = value;
+      else if (name == "--sentinel-tls-cert")
+        extra.tls_cert_file_ = value;
+      else if (name == "--sentinel-tls-key")
+        extra.tls_key_file_ = value;
+      else if (name == "--sentinel-tls-ca")
+        extra.tls_ca_cert_file_ = value;
+      else
+        extra.tls_auth_clients_ = value;
+      options.sentinel_options_supplied_ = true;
+    } else if (name == "--sentinel-data-transport") {
+      if (value != "plaintext" && value != "tls")
+        return absl::InvalidArgumentError(
+            "sentinel-data-transport must be plaintext or tls");
+      options.sentinel_extra_.data_tls_ = value == "tls";
+      options.sentinel_options_supplied_ = true;
+    } else if (name == "--sentinel-resolve-hostnames" ||
+               name == "--sentinel-announce-hostnames") {
+      if (value != "yes" && value != "no")
+        return absl::InvalidArgumentError(
+            "Sentinel hostname option must be yes or no");
+      if (name == "--sentinel-resolve-hostnames")
+        options.sentinel_extra_.resolve_hostnames_ = value == "yes";
+      else
+        options.sentinel_extra_.announce_hostnames_ = value == "yes";
+      options.sentinel_options_supplied_ = true;
     } else if (name == "--sentinel-requirepass") {
       options.sentinel_requirepass_ = std::string(value);
       options.sentinel_options_supplied_ = true;
@@ -311,20 +350,25 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
                         "--data-dir is required");
   }
   if (options.sentinel_options_supplied_) {
-    const auto sentinel = lavik::ParseNumericEndpoint(options.sentinel_addr_);
-    if (!sentinel || sentinel->host_ == "0.0.0.0" || sentinel->host_ == "::" ||
-        sentinel->host_ == "::ffff:0.0.0.0") {
-      return absl::InvalidArgumentError(
-          "--sentinel-addr must be a concrete numeric IP and nonzero port");
-    }
-    for (const auto& address :
-         {options.raft_addr_, options.data_control_addr_, options.ctl_addr_}) {
-      const auto other = lavik::ParseNumericEndpoint(address);
-      if (other && other->port_ == sentinel->port_ &&
-          (other->host_ == sentinel->host_ || other->host_ == "0.0.0.0" ||
-           other->host_ == "::")) {
+    if (options.sentinel_addr_.empty() &&
+        options.sentinel_extra_.tls_address_.empty())
+      return absl::InvalidArgumentError("Sentinel options require a listener");
+    for (const auto& bind :
+         {options.sentinel_addr_, options.sentinel_extra_.tls_address_}) {
+      if (bind.empty()) continue;
+      const auto sentinel = lavik::ParseConcreteNumericEndpoint(bind);
+      if (!sentinel)
         return absl::InvalidArgumentError(
-            "Sentinel address conflicts with another Meta listener");
+            "Sentinel bind must be a concrete numeric IP and nonzero port");
+      for (const auto& address :
+           {options.raft_addr_, options.data_control_addr_,
+            options.ctl_addr_}) {
+        const auto other = lavik::ParseNumericEndpoint(address);
+        if (other && other->port_ == sentinel->port_ &&
+            (other->host_ == sentinel->host_ || other->host_ == "0.0.0.0" ||
+             other->host_ == "::"))
+          return absl::InvalidArgumentError(
+              "Sentinel address conflicts with another Meta listener");
       }
     }
   }
@@ -441,7 +485,9 @@ absl::StatusOr<std::string> ReadInitialClusterManifest(
 std::string StripValidatedTcpEndpointScheme(
     std::string_view manifest_endpoint) {
   constexpr std::string_view kTcpPrefix = "tcp://";
-  return std::string(manifest_endpoint.substr(kTcpPrefix.size()));
+  return std::string(manifest_endpoint.starts_with(kTcpPrefix)
+                         ? manifest_endpoint.substr(kTcpPrefix.size())
+                         : manifest_endpoint);
 }
 
 }  // namespace
@@ -523,7 +569,13 @@ int main(int argc, char** argv) {
       lavik::FormatNumericEndpoint({.host_ = data_control_endpoint->host_,
                                     .port_ = data_control_endpoint->port_});
   raft_options.local_admin_ = ctl_endpoint_text;
-  raft_options.local_sentinel_ = options.sentinel_addr_;
+  raft_options.sentinel_transports_ =
+      (options.sentinel_addr_.empty() ? 0 : 1) |
+      (options.sentinel_extra_.tls_address_.empty() ? 0 : 2);
+  raft_options.local_sentinel_ =
+      options.sentinel_extra_.tls_address_.empty()
+          ? options.sentinel_addr_
+          : "tls://" + options.sentinel_extra_.tls_address_;
   raft_options.tls_ca_ = options.tls_ca_;
   raft_options.tls_cert_ = options.tls_cert_;
   raft_options.tls_key_ = options.tls_key_;
@@ -548,7 +600,9 @@ int main(int argc, char** argv) {
     for (const auto& member : manifest->meta_members_) {
       if (member.server_id_ == static_cast<std::uint32_t>(options.id_) &&
           !member.sentinel_endpoint_.empty() &&
-          options.sentinel_addr_.empty()) {
+          (lavik::ParseClientEndpoint(member.sentinel_endpoint_)->tls_
+               ? options.sentinel_extra_.tls_address_.empty()
+               : options.sentinel_addr_.empty())) {
         spdlog::critical(
             "registered Sentinel endpoint requires --sentinel-addr");
         return 1;
@@ -833,8 +887,9 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (exit_code == 0 && !options.sentinel_addr_.empty()) {
-    lavik::meta::MetaSentinelServerOptions sentinel_options;
+  if (exit_code == 0 && (!options.sentinel_addr_.empty() ||
+                         !options.sentinel_extra_.tls_address_.empty())) {
+    auto sentinel_options = options.sentinel_extra_;
     sentinel_options.address_ = options.sentinel_addr_;
     sentinel_options.requirepass_ = std::move(options.sentinel_requirepass_);
     sentinel_options.maxclients_ =
@@ -884,11 +939,15 @@ int main(int argc, char** argv) {
       ctl_display += options.ctl_addr_;
     }
     spdlog::info(
-        "node {} up: raft={} data-control={} ctl={} sentinel={} data-dir={} "
+        "node {} up: raft={} data-control={} ctl={} sentinel-tcp={} "
+        "sentinel-tls={} data-dir={} "
         "backend=etcd/raft tls={}",
         options.id_, options.raft_addr_, options.data_control_addr_,
         ctl_display,
         options.sentinel_addr_.empty() ? "disabled" : options.sentinel_addr_,
+        options.sentinel_extra_.tls_address_.empty()
+            ? "disabled"
+            : options.sentinel_extra_.tls_address_,
         options.data_dir_, !options.tls_ca_.empty());
     while (g_shutdown_requested == 0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));

@@ -23,26 +23,35 @@
 namespace lavik::meta {
 namespace {
 
-// Selects the one client endpoint a Sentinel answer may publish. Only the
-// plaintext tcp:// (or legacy untagged) address qualifies: TLS discovery is
-// not part of this surface, and a wildcard bind is a listen address, never a
-// routable client address. ParseNumericEndpoint already rejects non-numeric
-// hosts and zero ports; the wildcard strings are its inet_ntop-normalized
-// spellings of the unspecified addresses.
-std::optional<NumericEndpoint> PublishableClientEndpoint(
-    const std::vector<std::string>& endpoints) {
-  for (const std::string& raw : endpoints) {
-    std::string_view text(raw);
-    if (text.starts_with("tls://")) continue;
-    constexpr std::string_view kTcpTag = "tcp://";
-    if (text.starts_with(kTcpTag)) text.remove_prefix(kTcpTag.size());
-    std::optional<NumericEndpoint> endpoint = ParseNumericEndpoint(text);
-    if (!endpoint.has_value()) continue;
-    if (endpoint->host_ == "0.0.0.0" || endpoint->host_ == "::" ||
-        endpoint->host_ == "::ffff:0.0.0.0") {
-      continue;
+// The original hostname remains in committed state. Resolution only supplies
+// the local IP view, shared by replies and events from this same cut.
+std::optional<ClientEndpoint> PublishedEndpoint(const MetaDiscoveryCut& cut,
+                                                std::string_view raw) {
+  auto endpoint = ParseClientEndpoint(raw);
+  if (!endpoint) return std::nullopt;
+  endpoint->declared_host_ = endpoint->host_;
+  if (endpoint->hostname_) {
+    if (!cut.publication_.resolve_hostnames_) return std::nullopt;
+    // Redis resolves a declared name even when it announces that name. Keep
+    // unresolved declarations out of either projection; the cache may retain
+    // an earlier success through a transient lookup failure.
+    const auto& resolved = cut.publication_.resolved_hosts_;
+    if (!resolved) return std::nullopt;
+    const auto it = resolved->find(endpoint->host_);
+    if (it == resolved->end()) return std::nullopt;
+    if (!cut.publication_.announce_hostnames_) {
+      endpoint->host_ = it->second;
+      endpoint->hostname_ = false;
     }
-    return endpoint;
+  }
+  return endpoint;
+}
+
+std::optional<ClientEndpoint> PublishableClientEndpoint(
+    const MetaDiscoveryCut& cut, const std::vector<std::string>& endpoints) {
+  for (const std::string& raw : endpoints) {
+    auto endpoint = PublishedEndpoint(cut, raw);
+    if (endpoint && endpoint->tls_ == cut.publication_.tls_) return endpoint;
   }
   return std::nullopt;
 }
@@ -208,16 +217,16 @@ void AppendReplicaEntry(ReplyBuilder& reply, const MetaDiscoveryCut& cut,
   // master-host/master-port carry the committed owner's endpoint. When it
   // cannot be resolved to a publishable address the pair is omitted; a
   // placeholder address would route replica clients nowhere real.
-  std::optional<NumericEndpoint> owner_endpoint;
+  std::optional<ClientEndpoint> owner_endpoint;
   if (!group.topology_.record_.owner_.empty()) {
     if (const MetaNodeRecord* owner =
             FindNodeRecord(cut, group.topology_.record_.owner_);
         owner != nullptr) {
-      owner_endpoint = PublishableClientEndpoint(owner->endpoints_);
+      owner_endpoint = PublishableClientEndpoint(cut, owner->endpoints_);
     }
   }
   reply.AppendMapHeader(owner_endpoint.has_value() ? 19 : 17);
-  AppendEntryField(reply, "name", FormatNumericEndpoint(replica.endpoint_));
+  AppendEntryField(reply, "name", FormatClientEndpoint(replica.endpoint_));
   AppendEntryField(reply, "ip", replica.endpoint_.host_);
   AppendEntryCounter(reply, "port", replica.endpoint_.port_);
   AppendEntryField(reply, "runid", replica.node_id_);
@@ -290,8 +299,8 @@ std::optional<MetaDiscoveryPrimary> PublishablePrimary(
   if (member == group.topology_.members_.end()) return std::nullopt;
   const MetaNodeRecord* record = FindNodeRecord(cut, owner);
   if (record == nullptr || record->retired_) return std::nullopt;
-  std::optional<NumericEndpoint> endpoint =
-      PublishableClientEndpoint(record->endpoints_);
+  std::optional<ClientEndpoint> endpoint =
+      PublishableClientEndpoint(cut, record->endpoints_);
   if (!endpoint.has_value()) return std::nullopt;
   return MetaDiscoveryPrimary{
       .group_id_ = group.topology_.group_id_,
@@ -341,8 +350,8 @@ std::vector<MetaDiscoveryReplica> ListReplicas(
     if (member.node_id_ == owner) continue;
     const MetaNodeRecord* record = FindNodeRecord(cut, member.node_id_);
     if (record == nullptr || record->retired_) continue;
-    std::optional<NumericEndpoint> endpoint =
-        PublishableClientEndpoint(record->endpoints_);
+    std::optional<ClientEndpoint> endpoint =
+        PublishableClientEndpoint(cut, record->endpoints_);
     if (!endpoint.has_value()) continue;
     const MetaDataControlRuntimeNode* runtime =
         FindRuntimeNode(cut, member.node_id_);
@@ -443,7 +452,7 @@ std::vector<MetaMemberRecord> DiscoverySentinels(const MetaDiscoveryCut& cut) {
                   cut.effective_meta_ids_.end(),
                   member.server_id_) == cut.effective_meta_ids_.end())
       continue;
-    if (ParseNumericEndpoint(member.sentinel_endpoint_))
+    if (PublishedEndpoint(cut, member.sentinel_endpoint_))
       peers.push_back(member);
   }
   return peers;
@@ -460,7 +469,7 @@ void EncodeDiscoverySentinelsReply(ReplyBuilder& reply,
   const auto peers = DiscoverySentinels(cut);
   reply.AppendArrayHeader(peers.size());
   for (const auto& peer : peers) {
-    const auto endpoint = *ParseNumericEndpoint(peer.sentinel_endpoint_);
+    const auto endpoint = *PublishedEndpoint(cut, peer.sentinel_endpoint_);
     reply.AppendMapHeader(5);
     AppendEntryField(reply, "name", std::to_string(peer.server_id_));
     AppendEntryField(reply, "runid", std::to_string(peer.server_id_));

@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "absl/strings/str_cat.h"
+#include "lavik/client_endpoint.h"
 #include "lavik/meta/commands.h"
 #include "lavik/meta/encoding.h"
 #include "lavik/numeric_endpoint.h"
@@ -193,8 +194,8 @@ absl::StatusOr<MetaMemberIdentity> MetaMemberIdentity::DecodeAux(
         "member endpoints are not canonical numeric endpoints");
   }
   if (!fields[4].empty()) {
-    const auto sentinel = lavik::ParseConcreteNumericEndpoint(fields[4]);
-    if (!sentinel || lavik::FormatNumericEndpoint(*sentinel) != fields[4])
+    const auto sentinel = lavik::ParseClientEndpoint(fields[4]);
+    if (!sentinel || lavik::FormatClientEndpoint(*sentinel, true) != fields[4])
       return absl::InvalidArgumentError("invalid Sentinel member endpoint");
   }
   return MetaMemberIdentity{static_cast<std::int32_t>(*server_id),

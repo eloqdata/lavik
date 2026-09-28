@@ -26,6 +26,7 @@
 #include "absl/strings/str_cat.h"
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/worker.h"
+#include "lavik/client_endpoint.h"
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/fault_injection.h"
 #include "lavik/meta/identity_verifier.h"
@@ -92,7 +93,7 @@ absl::StatusOr<MetaMembershipPeer> ReadPeer(MetaReader& r) {
       !lavik::ParseNumericEndpoint(*endpoint) ||
       !lavik::ParseNumericEndpoint(*data_control) ||
       !lavik::ParseNumericEndpoint(*ctl) ||
-      (!sentinel->empty() && !lavik::ParseNumericEndpoint(*sentinel)))
+      (!sentinel->empty() && !lavik::ParseClientEndpoint(*sentinel)))
     return Conflict("invalid membership peer identity");
   return MetaMembershipPeer{*id,
                             std::string(*endpoint),

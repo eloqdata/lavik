@@ -47,8 +47,8 @@ membership descriptor own the advertised routes, which may name explicit
 proxies rather than these local binds. Wildcard Admin binds and port zero are
 invalid.
 
-`--sentinel-addr` explicitly enables a separate plaintext RESP client endpoint:
-the Discovery Entry. `MetaSentinelServer` owns its worker-local sessions and a
+`--sentinel-addr` and `--sentinel-tls-addr` enable independent plaintext and TLS
+RESP listeners for the Discovery Entry, individually or together. `MetaSentinelServer` owns its worker-local sessions and a
 closed command allowlist. It supports authentication, RESP2/RESP3 negotiation,
 client identity metadata, health checks, and connection reset/close, plus six
 Sentinel topology discovery verbs: `GET-MASTER-ADDR-BY-NAME`, `MASTER`,
@@ -84,11 +84,13 @@ diagnostic, exactly as cluster-status resolves the same join. The compact
 view takes a brief state lock only when rebuilt; the volatile registries take
 short snapshot locks, and steady-state queries rebuild nothing.
 
-Publication is gated by committed authority alone: the lifecycle is Created,
+Publication requires committed authority: the lifecycle is Created,
 the immutable client mode is Single, one complete Group exists, its authority
 is active, and the committed Owner is not retired and advertises a usable
-plaintext client endpoint—`tcp://` or the legacy untagged form, a numeric IP
-with a nonzero, non-wildcard port. Raft,
+client endpoint selected by local `--sentinel-data-transport` policy (plaintext
+by default). The query transport never selects the returned Data port. A TLS
+profile withdraws a Primary or omits a replica without a TLS endpoint; it does
+not change membership or promotion eligibility. Raft,
 Data-control, and Admin endpoints are never published. Health never gates
 publication; it only sets flags. A published primary always carries the
 `master` flag, `s_down` reflects a detector SUSPECT/TRIGGERING cut whose
@@ -117,9 +119,21 @@ The existing committed Meta member identity carries an optional advertised
 `sentinel_endpoint`. The manifest, membership target/baseline/binding, Raft member
 descriptor, command codec, and snapshot retain it together. It is immutable for
 that member, including absent-to-present changes; replacement changes the address.
-Single-mode admission requires uniform registration coverage when enabled.
+Sentinel registrations retain transport tags and DNS hostnames; legacy untagged
+numeric TCP registrations retain their bytes during recovery, including pending
+membership baselines. Single-mode admission requires uniform registration
+coverage when enabled. Local publication policy is not committed: deployment
+must give all Meta instances identical Data transport and hostname policies,
+and every Sentinel seed/peer must work with one client connection configuration.
+`--sentinel-resolve-hostnames` permits registered DNS names. By default publication
+uses numeric addresses from a bounded asynchronous resolver cache; explicit
+`--sentinel-announce-hostnames` preserves names. Both switches default to `no`.
+Parsing, Raft apply and recovery never resolve DNS. A local failed lookup retains
+a prior successful answer, or withdraws an unresolved address. DNS-only changes
+do not produce Owner switch events, and no DNS convergence deadline is promised.
+Queries, replica upstream fields and event payloads use the same projection.
 `SENTINELS` and `num-other-sentinels` use the same effective committed Raft members
-with nonempty registrations, excluding self, retired identities, and staged joins.
+with publishable registrations, excluding self, retired identities, and staged joins.
 This is a directory, not a liveness vote: unreachable registered peers remain.
 The listener bind is independent of the advertised address to permit proxies.
 All election-eligible members must run their registered listener for discovery HA.
@@ -166,8 +180,15 @@ contract, with independent product identity. QUIT/RESET are explicit Lavik
 extensions; unsupported commands and local resource limits retain fail-closed
 errors.
 
-Sentinel admission counts all accepted sessions, including unauthenticated
-ones. Input, output, and identity storage are bounded independently of Data's
+Sentinel uses its own startup-loaded Bycorf TLS context, separate from Admin
+identity verification. `--sentinel-tls-auth-clients` defaults to `yes` and accepts
+`no`, `optional`, or `yes`; Data defaults are unchanged. A validated certificate
+does not bypass AUTH. Sentinel admission counts all accepted sessions, including
+TLS handshakes and unauthenticated ones. Both listeners share session budgets;
+TLS rejection before handshake closes the socket without plaintext RESP.
+Handshake deadlines, cancellation and shutdown use the session's existing
+worker-owned socket lifetime. All binds succeed before accepts start, with
+rollback on any failure. Input, output, and identity storage are bounded independently of Data's
 budgets. One worker-owned writer per session serializes command replies and
 subscription messages. Queued and in-flight bytes share per-session and global
 budgets; overflow closes the slow client. Subscription count and channel storage
@@ -1186,7 +1207,7 @@ complete initial Meta vector—id plus canonical numeric Raft, Data-control, and
 Admin endpoints—one or more canonical Data identities with advertised
 `client_endpoint` (`tcp://`) and/or `tls_endpoint` (`tls://`), and one or more
 Groups with exactly one primary and optional replicas. Every Data node has
-at least one numeric listener; dual listeners share a host and use distinct
+at least one advertised IP or hostname endpoint; dual listeners share a host and use distinct
 ports, and no two declarations share a Data socket address. Registration
 preserves the transport tags through the durable identity store and projection
 into separate TCP/TLS ports. TLS replication selects the advertised TLS port

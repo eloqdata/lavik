@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -40,8 +41,8 @@ func (m Member) validate() error {
 		return errors.New("invalid member identity")
 	}
 	endpoints := []string{m.Raft, m.Data, m.Admin}
-	if m.Sentinel != "" {
-		endpoints = append(endpoints, m.Sentinel)
+	if m.Sentinel != "" && !validSentinelEndpoint(m.Sentinel) {
+		return fmt.Errorf("invalid Sentinel endpoint %q", m.Sentinel)
 	}
 	for _, addr := range endpoints {
 		host, port, err := net.SplitHostPort(addr)
@@ -54,22 +55,82 @@ func (m Member) validate() error {
 	return nil
 }
 
+// Sentinel addresses are application routes. Keep their transport and DNS name;
+// unlike control endpoints, they may refer to a TLS proxy or a stable hostname.
+func validSentinelEndpoint(address string) bool {
+	if len(address) > 256 {
+		return false
+	}
+	if strings.HasPrefix(address, "tcp://") {
+		address = strings.TrimPrefix(address, "tcp://")
+	} else if strings.HasPrefix(address, "tls://") {
+		address = strings.TrimPrefix(address, "tls://")
+	}
+	host, port, err := net.SplitHostPort(address)
+	p, perr := strconv.ParseUint(port, 10, 16)
+	if err != nil || perr != nil || p == 0 || host == "" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return !ip.IsUnspecified()
+	}
+	if len(host) > 253 {
+		return false
+	}
+	host = strings.TrimSuffix(host, ".")
+	hasLetter := false
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			letter := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+			hasLetter = hasLetter || letter
+			if !letter && !(c >= '0' && c <= '9') && c != '-' {
+				return false
+			}
+		}
+	}
+	return hasLetter
+}
+
+// A proxy changes host/port but cannot change the required listener transport.
+// Zero infers the legacy one-listener configuration for in-process callers.
+func supportsSentinelRoute(route, local string, transports uint8) bool {
+	if route == "" {
+		return true
+	}
+	if transports == 0 && local != "" {
+		transports = 1
+		if strings.HasPrefix(local, "tls://") {
+			transports = 2
+		}
+	}
+	required := uint8(1)
+	if strings.HasPrefix(route, "tls://") {
+		required = 2
+	}
+	return transports&required != 0
+}
+
 // Config is immutable after Open. Initial is used only on a pristine directory;
 // an empty Initial creates a waiting joiner, never a single-node cluster.
 type Config struct {
-	Local            Member        `json:"local"`
-	Initial          []Member      `json:"initial"`
-	Dir              string        `json:"dir"`
-	Listen           string        `json:"listen"`
-	TLSCA            string        `json:"tls_ca"`
-	TLSCert          string        `json:"tls_cert"`
-	TLSKey           string        `json:"tls_key"`
-	Heartbeat        time.Duration `json:"-"`
-	ElectionTicks    int           `json:"election_ticks"`
-	QueueCapacity    int           `json:"queue_capacity"`
-	MaxPendingBytes  uint64        `json:"max_pending_bytes"`
-	SnapshotDistance uint64        `json:"snapshot_distance"`
-	ReservedLogItems uint64        `json:"reserved_log_items"`
+	// Startup-only capabilities, separate from the immutable advertised route.
+	SentinelTransports uint8         `json:"sentinel_transports"`
+	Local              Member        `json:"local"`
+	Initial            []Member      `json:"initial"`
+	Dir                string        `json:"dir"`
+	Listen             string        `json:"listen"`
+	TLSCA              string        `json:"tls_ca"`
+	TLSCert            string        `json:"tls_cert"`
+	TLSKey             string        `json:"tls_key"`
+	Heartbeat          time.Duration `json:"-"`
+	ElectionTicks      int           `json:"election_ticks"`
+	QueueCapacity      int           `json:"queue_capacity"`
+	MaxPendingBytes    uint64        `json:"max_pending_bytes"`
+	SnapshotDistance   uint64        `json:"snapshot_distance"`
+	ReservedLogItems   uint64        `json:"reserved_log_items"`
 	// Tests install the hook before any executor starts and change its
 	// behavior through their own atomic barrier, never by racing the owner.
 	beforeSave func() error

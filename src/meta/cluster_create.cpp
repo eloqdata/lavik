@@ -33,6 +33,7 @@
 
 #include "absl/status/status.h"
 #include "lavik/CLI11.hpp"
+#include "lavik/client_endpoint.h"
 #include "lavik/meta/cluster_status.h"
 #include "lavik/numeric_endpoint.h"
 #include "openssl/rand.h"
@@ -157,13 +158,12 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
     if (!CanonicalEndpoint(member.raft_endpoint_) ||
         !CanonicalEndpoint(member.data_control_endpoint_) ||
         !CanonicalEndpoint(member.ctl_endpoint_)) {
-      return Invalid(
-          "Meta endpoints must be canonical numeric tcp:// endpoints");
+      return Invalid("Meta endpoints must be canonical tcp:// endpoints");
     }
     if (!member.sentinel_endpoint_.empty() &&
-        (!CanonicalEndpoint(member.sentinel_endpoint_) ||
-         !ParseConcreteNumericEndpoint(
-             std::string_view(member.sentinel_endpoint_).substr(6)) ||
+        (!CanonicalClientEndpoint(member.sentinel_endpoint_) ||
+         *CanonicalClientEndpoint(member.sentinel_endpoint_) !=
+             member.sentinel_endpoint_ ||
          !sentinel_endpoints.insert(member.sentinel_endpoint_).second)) {
       return Invalid("invalid or duplicate Meta Sentinel endpoint");
     }
@@ -178,6 +178,19 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
     }
     if (!ctl_endpoints.insert(member.ctl_endpoint_).second) {
       return Invalid("duplicate Meta ctl endpoint");
+    }
+  }
+
+  for (const auto& member : manifest->meta_members_) {
+    if (member.sentinel_endpoint_.empty()) continue;
+    for (const auto& peer : manifest->meta_members_) {
+      for (const auto* management :
+           {&peer.raft_endpoint_, &peer.data_control_endpoint_,
+            &peer.ctl_endpoint_}) {
+        if (SameClientSocket(member.sentinel_endpoint_, *management))
+          return Invalid(
+              "Sentinel endpoint conflicts with Meta management endpoint");
+      }
     }
   }
 
@@ -202,20 +215,21 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
       return Invalid("Data node requires a client_endpoint or tls_endpoint");
     }
     if (!node.client_endpoint_.empty() &&
-        !CanonicalEndpoint(node.client_endpoint_)) {
-      return Invalid(
-          "client endpoint must be a canonical numeric tcp:// endpoint");
+        (!node.client_endpoint_.starts_with("tcp://") ||
+         !CanonicalClientEndpoint(node.client_endpoint_) ||
+         *CanonicalClientEndpoint(node.client_endpoint_) !=
+             node.client_endpoint_)) {
+      return Invalid("client endpoint must be a canonical tcp:// endpoint");
     }
     if (!node.tls_endpoint_.empty() &&
-        !CanonicalEndpoint(node.tls_endpoint_, "tls://")) {
-      return Invalid(
-          "TLS endpoint must be a canonical numeric tls:// endpoint");
+        (!node.tls_endpoint_.starts_with("tls://") ||
+         !CanonicalClientEndpoint(node.tls_endpoint_) ||
+         *CanonicalClientEndpoint(node.tls_endpoint_) != node.tls_endpoint_)) {
+      return Invalid("TLS endpoint must be a canonical tls:// endpoint");
     }
     if (!node.client_endpoint_.empty() && !node.tls_endpoint_.empty() &&
-        ParseNumericEndpoint(std::string_view(node.client_endpoint_).substr(6))
-                ->host_ !=
-            ParseNumericEndpoint(std::string_view(node.tls_endpoint_).substr(6))
-                ->host_) {
+        ParseClientEndpoint(node.client_endpoint_)->host_ !=
+            ParseClientEndpoint(node.tls_endpoint_)->host_) {
       return Invalid("Data TCP and TLS endpoints must use the same host");
     }
     if (!node_ids.insert(node.node_id_).second) {
@@ -224,6 +238,16 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
     // A listener cannot serve two nodes or both transports. Compare socket
     // addresses without the scheme so conflicts fail before Genesis commits.
     for (const auto* endpoint : {&node.client_endpoint_, &node.tls_endpoint_}) {
+      if (!endpoint->empty()) {
+        for (const auto& member : manifest->meta_members_) {
+          for (const auto* reserved :
+               {&member.raft_endpoint_, &member.data_control_endpoint_,
+                &member.ctl_endpoint_, &member.sentinel_endpoint_}) {
+            if (SameClientSocket(*endpoint, *reserved))
+              return Invalid("Data endpoint conflicts with Meta endpoint");
+          }
+        }
+      }
       if (!endpoint->empty() && !endpoints.insert(endpoint->substr(6)).second) {
         return Invalid("duplicate Data listener endpoint");
       }

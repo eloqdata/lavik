@@ -125,7 +125,7 @@ class DataProcess:
 
     @property
     def advertised_endpoint(self):
-        return f"tcp://127.0.0.1:{self.redis_port}"
+        return f"tcp://{os.environ.get('LAVIK_TEST_DATA_HOST', '127.0.0.1')}:{self.redis_port}"
 
     def start(self, wait_ready=True):
         os.makedirs(self.workdir, exist_ok=True)

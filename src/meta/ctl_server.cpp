@@ -46,6 +46,7 @@
 #include "bycorf/net/tcp_stream.h"
 #include "bycorf/net/tls.h"
 #include "bycorf/runtime/worker.h"
+#include "lavik/client_endpoint.h"
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/cluster/control_transport.h"
 #include "lavik/meta/automatic_failover_detector.h"
@@ -2146,9 +2147,9 @@ bycorf::Task<std::string> HandleConfigChange(
     data_control_endpoint = lavik::FormatNumericEndpoint(*data);
     ctl_endpoint = lavik::FormatNumericEndpoint(*ctl);
     if (!sentinel_endpoint.empty()) {
-      auto sentinel = lavik::ParseConcreteNumericEndpoint(sentinel_endpoint);
+      auto sentinel = lavik::ParseClientEndpoint(sentinel_endpoint);
       if (!sentinel) co_return "ERR rejected";
-      sentinel_endpoint = lavik::FormatNumericEndpoint(*sentinel);
+      sentinel_endpoint = lavik::FormatClientEndpoint(*sentinel, true);
     }
   }
   const auto before = state_machine->StoresSnapshot();
@@ -2234,6 +2235,20 @@ bycorf::Task<std::string> HandleConfigChange(
             return p.sentinel_endpoint_.empty() != sentinel_endpoint.empty();
           }))
         co_return "ERR inconsistent-sentinel-coverage";
+      // IdentityStore knows control/Admin routes; the captured membership also
+      // knows Raft routes. Reject declared socket collisions without DNS.
+      if (SameClientSocket(sentinel_endpoint, endpoint))
+        co_return "ERR rejected";
+      for (const auto& member : *config) {
+        if (SameClientSocket(sentinel_endpoint, member.endpoint_) ||
+            SameClientSocket(member.sentinel_endpoint_, endpoint))
+          co_return "ERR rejected";
+      }
+      for (const auto& node : before.identity_.Nodes()) {
+        if (node.retired_) continue;
+        for (const auto& route : node.endpoints_)
+          if (SameClientSocket(route, endpoint)) co_return "ERR rejected";
+      }
       auto identity = before.identity_;
       if (!identity.Apply(bind).ok()) co_return "ERR rejected";
     } else {

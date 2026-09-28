@@ -25,7 +25,7 @@ bool Fresh(const MetaDiscoveryCut& cut,
          cut.now_unix_ms_ - node.health_received_unix_ms_ <=
              cut.observation_ttl_ms_;
 }
-std::string Address(const NumericEndpoint& endpoint) {
+std::string Address(const ClientEndpoint& endpoint) {
   return absl::StrCat(endpoint.host_, " ", endpoint.port_);
 }
 }  // namespace
@@ -86,7 +86,9 @@ std::vector<MetaDiscoveryEvent> MetaDiscoveryEvents::Observe(
   const bool target_changed =
       primary_ && (primary_->owner_node_id_ != primary->owner_node_id_ ||
                    term_ != primary->group_term_);
-  if (primary_ && Address(primary_->endpoint_) != Address(primary->endpoint_)) {
+  if (primary_ && (primary_->endpoint_.declared_host_ !=
+                       primary->endpoint_.declared_host_ ||
+                   primary_->endpoint_.port_ != primary->endpoint_.port_)) {
     events.push_back(
         {"+switch-master",
          absl::StrCat(primary->group_id_, " ", Address(primary_->endpoint_),
@@ -129,7 +131,7 @@ std::vector<MetaDiscoveryEvent> MetaDiscoveryEvents::Observe(
       if (replica != list.end() && !replica->s_down_) {
         events.push_back(
             {"+replica-reconf-done",
-             absl::StrCat("slave ", FormatNumericEndpoint(replica->endpoint_),
+             absl::StrCat("slave ", FormatClientEndpoint(replica->endpoint_),
                           " ", Address(replica->endpoint_), " @ ",
                           primary->group_id_, " ",
                           Address(primary->endpoint_))});

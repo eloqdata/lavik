@@ -973,6 +973,33 @@ class MetaCoordinatorServerTest : public ::testing::Test {
   MetaCoordinator* forward_target_ = nullptr;
 };
 
+TEST_F(MetaCoordinatorServerTest, ApplicationRoutesRejectKnownRaftSocket) {
+  StartServer();
+  MakeCoordinator();
+  WaitLeader();
+  const auto config = server_->get_config();
+  ASSERT_TRUE(config);
+  ASSERT_FALSE(config->get_servers().empty());
+  const auto route = "tls://" + config->get_servers().front()->get_endpoint();
+  auto registration = MakeRegister(0x11);
+  registration.endpoints_ = {route};
+  EXPECT_EQ(ProposeSync(registration).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  registration.endpoints_ = {"tls://data.example:6380"};
+  auto accepted = ProposeSync(registration);
+  ASSERT_TRUE(accepted.ok()) << accepted.status();
+  ASSERT_EQ(accepted->verdict_, MetaAuditVerdict::kAccepted);
+  lavik::meta::UpdateNode update;
+  update.request_id_ = MakeRequestId(0x12);
+  update.node_id_ = registration.node_id_;
+  update.expected_revision_ = 1;
+  update.endpoints_ = {route};
+  EXPECT_EQ(ProposeSync(update).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(machine_->FindNode(registration.node_id_)->endpoints_,
+            registration.endpoints_);
+}
+
 TEST_F(MetaCoordinatorServerTest, ProposeInjectsActorAndReturnsAuditVerdict) {
   StartServer();
   MakeCoordinator();

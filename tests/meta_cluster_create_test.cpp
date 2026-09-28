@@ -132,6 +132,20 @@ TEST(ClusterCreateManifestTest, NormalizesMultipleGroupsAndAllocatesSlots) {
   EXPECT_EQ(manifest->authority_lease_duration_ms_, 5000u);
 }
 
+TEST(ClusterCreateManifestTest, PreservesTlsSentinelAndDataHostnames) {
+  auto text = ReplaceOnce(std::string(kValidManifest),
+                          "ctl_endpoint = \"tcp://127.0.0.1:7201\"",
+                          "ctl_endpoint = \"tcp://127.0.0.1:7201\"\n"
+                          "sentinel_endpoint = \"tls://meta.example:26379\"");
+  text = ReplaceOnce(text, "tcp://127.0.0.1:6379", "tcp://data.example:6379");
+  auto manifest = ParseClusterCreateManifest(text);
+  ASSERT_TRUE(manifest.ok()) << manifest.status();
+  EXPECT_EQ(manifest->meta_members_[0].sentinel_endpoint_,
+            "tls://meta.example:26379");
+  EXPECT_EQ(manifest->data_nodes_[0].client_endpoint_,
+            "tcp://data.example:6379");
+}
+
 TEST(ClusterCreateManifestTest, RequiresExplicitClientServiceMode) {
   EXPECT_FALSE(
       ParseClusterCreateManifest(ReplaceOnce(std::string(kValidManifest),
@@ -413,8 +427,8 @@ TEST(ClusterCreateManifestTest,
                   "ctl_endpoint = \"tcp://127.0.0.1:7201\"\nsentinel_endpoint "
                   "= \"tcp://127.0.0.1:26379\"");
   ASSERT_TRUE(ParseClusterCreateManifest(text).ok());
-  for (const auto invalid :
-       {"tcp://0.0.0.0:26379", "tcp://127.0.0.1:0", "tls://127.0.0.1:26379"}) {
+  for (const auto invalid : {"tcp://0.0.0.0:26379", "tcp://127.0.0.1:0",
+                             "tls://127.0.0.1:7201", "tls://bad..name:26379"}) {
     EXPECT_FALSE(ParseClusterCreateManifest(
                      ReplaceOnce(text, "tcp://127.0.0.1:26379", invalid))
                      .ok());
@@ -468,7 +482,7 @@ TEST(ClusterCreateManifestTest,
                   "id = \"0123456789abcdef0123456789abcdef01234567\""),
       ReplaceOnce(std::string(kValidManifest),
                   "client_endpoint = \"tcp://127.0.0.1:6380\"",
-                  "client_endpoint = \"tcp://localhost:6380\""),
+                  "client_endpoint = \"tcp://bad..host:6380\""),
       std::string(kValidManifest) +
           "\n[[slot_ranges]]\nfirst = 0\nlast = 16383\n"
           "group = \"group-1\"\n",

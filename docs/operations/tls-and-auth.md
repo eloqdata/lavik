@@ -119,3 +119,120 @@ For deployment instructions, see the repository's
 [Meta control-plane guide](https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-control-plane.md).
 
 Metrics endpoints remain plaintext.
+
+## Meta Sentinel discovery
+
+Configure Sentinel independently from Data and Admin. `--sentinel-requirepass`
+is the discovery password; Data uses `--requirepass`, with `--masterauth` on
+all potential replicas. Only the `default` username is supported. Successful
+mTLS still requires AUTH (or HELLO AUTH), including after reconnect.
+
+Each Meta can use `--sentinel-addr 127.0.0.1:26379`,
+`--sentinel-tls-addr 127.0.0.1:26380`, or both. TLS additionally requires
+`--sentinel-tls-cert meta.pem --sentinel-tls-key meta.key` and, when client
+certificates are verified, `--sentinel-tls-ca ca.pem`.
+`--sentinel-tls-auth-clients no|optional|yes` defaults to `yes`, like Redis
+Sentinel. This does not change Data's existing default. Keep Admin mTLS enabled
+with its independent `--ctl-tls-ca/cert/key` settings; application certificates
+must contain no `lavik://operator/...` identity. Certificates are loaded at
+startup, and rotation requires restart.
+
+Set `--sentinel-data-transport tls` on every Meta to announce registered Data
+TLS endpoints; the default is `plaintext`. This setting does not depend on
+whether discovery arrived on a TLS connection. Missing TLS registration
+withdraws the Primary or omits that replica without plaintext fallback and
+without restricting Meta election. Add the TLS endpoint through the existing
+Data identity update lifecycle. Each Meta still registers just one
+`sentinel_endpoint`, changed only by member replacement. All advertised peers
+must accept the same client transport and credentials.
+
+For DNS names, set `--sentinel-resolve-hostnames yes`. Add
+`--sentinel-announce-hostnames yes` to retain names in replies and events;
+otherwise clients receive a locally resolved IP (certificates then need that
+IP SAN). Failed DNS does not block workers; an earlier successful result may
+remain cached. No DNS update convergence deadline is guaranteed. Register
+`tls://data.example:6380` and `tls://sentinel.example:26380` in the existing
+manifest/identity fields. Names and tags survive snapshots and restarts.
+Raft, Data-control and Admin continue requiring numeric addresses. Advertised
+endpoints retain the existing 256-byte limit, including scheme and port.
+
+A TCP proxy can expose ports different from the bind ports: register its public
+TLS addresses in the same manifest fields. Native replication uses those same
+Data routes. End-to-end certificate SANs must match the advertised IP/name.
+Do not split internal and external address views or assume a TLS query selects
+a Data TLS port. Keep the local publication options identical on all Meta nodes.
+
+A Python application can use separate credentials while retaining ordinary
+Sentinel connection pools (set `protocol` to 2 or 3 for Data):
+
+```python
+from redis.sentinel import Sentinel
+
+tls = dict(ssl=True, ssl_ca_certs="ca.pem", ssl_certfile="application.pem",
+           ssl_keyfile="application.key", ssl_check_hostname=True)
+sentinel = Sentinel([("sentinel.example", 26380)],
+                    sentinel_kwargs=dict(password="sentinel-secret", **tls),
+                    socket_timeout=2)
+primary = sentinel.master_for("single-discovery", password="data-secret",
+                              protocol=3, **tls)
+replica = sentinel.slave_for("single-discovery", password="data-secret",
+                            protocol=3, **tls)
+primary.set("example", "value")
+print(primary.get("example"))
+# Replica reads are asynchronous; wait for the expected value when needed.
+print(replica.get("example"))
+```
+
+For Go, load the CA and application certificate into one TLS configuration and
+pass it to the standard failover client. Leave `ServerName` empty so each dial
+verifies its actual destination. The same configuration serves both connections:
+
+```go
+pair, err := tls.LoadX509KeyPair("application.pem", "application.key")
+if err != nil { panic(err) }
+pem, err := os.ReadFile("ca.pem")
+if err != nil { panic(err) }
+roots := x509.NewCertPool()
+if !roots.AppendCertsFromPEM(pem) { panic("invalid CA") }
+client := redis.NewFailoverClient(&redis.FailoverOptions{
+    MasterName: "single-discovery",
+    SentinelAddrs: []string{"sentinel.example:26380"},
+    SentinelPassword: "sentinel-secret", Password: "data-secret", Protocol: 3,
+    TLSConfig: &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{pair},
+                           MinVersion: tls.VersionTLS12},
+})
+defer client.Close()
+if err := client.Set(context.Background(), "example", "value", 0).Err(); err != nil {
+    panic(err)
+}
+```
+
+The Go snippet uses `context`, `crypto/tls`, `crypto/x509`, `os` and
+`github.com/redis/go-redis/v9`. For a fully plaintext deployment, omit both
+clients' TLS settings and register TCP ports; independent passwords still apply.
+For mapped TLS deployment, replace the seeds and registered Data ports with
+proxy-facing ports without changing client dialing or certificate verification.
+
+The executable acceptance examples generate certificates, enable Admin mTLS,
+use an application certificate without operator authority, and exercise actual
+replica reads. Given a configured build with its pinned client dependencies:
+
+```bash
+# Set TMPDIR to your local scratch disk; all fixture data is created below it.
+export TMPDIR=/mnt/local_nvme/lavik-sentinel-tests
+mkdir -p "$TMPDIR"
+ctest --test-dir "$BUILD" --output-on-failure -R '^meta_integration.sentinel_tls_'
+```
+
+| Reference/client | Pinned version | Acceptance modes |
+|---|---|---|
+| Redis Sentinel behavior | 7.2.14 | Local publication policy, no fallback, mTLS plus AUTH |
+| redis-py | 8.1.0 | Data RESP2/3, direct and mapped plaintext/TLS |
+| go-redis | 9.22.0 | Data RESP2/3 and explicit Sentinel RESP2/3, same modes |
+
+Go uses one TLSConfig for Sentinel and Data, leaves ServerName empty to verify
+the actual destination, and wraps `redis.NewDialer` only to count connections.
+Python supplies independent Sentinel/Data credentials and TLS settings.
+Upgrade all participating Meta and Data processes before enabling hostname or
+TLS Sentinel registration. New binaries read old untagged numeric registrations;
+after enabling new registrations, mixed old binaries or rollback are unsupported.

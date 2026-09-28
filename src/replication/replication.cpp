@@ -25,8 +25,6 @@
 namespace lavik {
 namespace replication_internal {
 
-std::atomic<unsigned> recovery_resolvers_in_flight{0};
-
 #if LAVIK_FAULTS_ENABLED
 // Test-only event boundary control. The harness atomically publishes this tiny
 // file after real FULL has completed, using observed flow cursors. Production
@@ -488,39 +486,9 @@ ResolveRecoveryAddress(std::string_view host, std::uint16_t port,
                        SocketSet* sockets) {
   if (host.empty() || host.size() > 255)
     co_return absl::InvalidArgumentError("invalid recovery donor host");
-  auto resolved = std::make_shared<RecoveryResolvedAddress>();
-  resolved->host_ = host;
-  resolved->service_ = std::to_string(port);
-  resolved->hints_.ai_family = AF_UNSPEC;
-  resolved->hints_.ai_socktype = SOCK_STREAM;
-  resolved->hints_.ai_protocol = IPPROTO_TCP;
-  resolved->hints_.ai_flags = AI_NUMERICHOST;
-  resolved->result_ =
-      ::getaddrinfo(resolved->host_.c_str(), resolved->service_.c_str(),
-                    &resolved->hints_, &resolved->addresses_);
-  if (resolved->result_ == 0) co_return resolved;
-  unsigned active =
-      recovery_resolvers_in_flight.load(std::memory_order_relaxed);
-  do {
-    if (active >= 32)
-      co_return absl::ResourceExhaustedError(
-          "recovery resolver work bound reached");
-  } while (!recovery_resolvers_in_flight.compare_exchange_weak(
-      active, active + 1, std::memory_order_relaxed));
-  resolved->hints_.ai_flags = 0;
-  try {
-    std::thread([resolved] {
-      resolved->result_ =
-          ::getaddrinfo(resolved->host_.c_str(), resolved->service_.c_str(),
-                        &resolved->hints_, &resolved->addresses_);
-      resolved->done_.store(true, std::memory_order_release);
-      recovery_resolvers_in_flight.fetch_sub(1, std::memory_order_relaxed);
-    }).detach();
-  } catch (const std::system_error&) {
-    recovery_resolvers_in_flight.fetch_sub(1, std::memory_order_relaxed);
-    co_return absl::ResourceExhaustedError(
-        "cannot start recovery donor resolver");
-  }
+  auto resolved = AsyncDnsQuery::Start(host, port);
+  if (!resolved)
+    co_return absl::ResourceExhaustedError("DNS work bound reached");
   while (!resolved->done_.load(std::memory_order_acquire)) {
     if (sockets->cancelled())
       co_return absl::CancelledError("recovery donor resolution cancelled");
@@ -7373,7 +7341,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
   auto partial = co_await TryPartialReparent(session);
   if (!partial.ok()) co_return partial;
   auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
-                                       tls_context_, &session->sockets_);
+                                       tls_context_, &session->sockets_, true);
   if (!connected.ok()) co_return connected.status();
   TcpStream control = std::move(*connected);
   const int control_fd = control.NativeFd();
@@ -7959,8 +7927,8 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
       ReplicationConnectionKind::kFlow);
   absl::StatusOr<std::string> response;
   for (;;) {
-    auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
-                                         tls_context_, &session->sockets_);
+    auto connected = co_await ConnectTcp(
+        upstream.host_, upstream.port_, tls_context_, &session->sockets_, true);
     if (!connected.ok()) {
       session->Cancel();
       co_return connected.status();

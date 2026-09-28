@@ -24,16 +24,17 @@
 // registries; it never reads MetaObservationStore here.
 //
 // Core invariants:
-//   - Publication is gated on committed state only: lifecycle Created, client
+//   - Authority gates come from committed state: lifecycle Created, client
 //     mode Single, exactly one committed Group, an active authority grant, and
-//     a non-retired Owner with a publishable plaintext client endpoint.
-//     Observation health never gates publication; it only sets flags.
+//     a non-retired Owner with an endpoint selected by local publication
+//     policy. Observation health never gates publication; it only sets flags.
 //   - o_down is never emitted. Objective withdrawal of a Primary is expressed
 //     by retracting publication (null address / omitted entry), because a
 //     fenced or replaced Owner must never be announced as a master again.
-//   - Only tcp:// (or legacy untagged) numeric client endpoints with a nonzero
-//     port and a non-wildcard host are published. TLS-only deployments yield
-//     null until TLS discovery is designed; Admin/Raft/Data-control endpoints
+//   - Local policy selects plaintext or TLS independently of the query socket.
+//     Missing selected endpoints withdraw publication without affecting
+//     authority. Hostnames require explicit opt-in; IP projection uses an
+//     asynchronous local resolver snapshot. Admin/Raft/Data-control endpoints
 //     never appear here.
 //   - Sentinel flags stay parseable by stock redis-py 8.1.0 / go-redis: the
 //     tokens master/slave/s_down/disconnected/master_down in the same
@@ -47,13 +48,21 @@
 #include <string_view>
 #include <vector>
 
+#include "lavik/client_endpoint.h"
 #include "lavik/meta/automatic_failover_detector.h"
 #include "lavik/meta/committed_status_view.h"
 #include "lavik/meta/data_control_runtime_status.h"
-#include "lavik/numeric_endpoint.h"
 #include "lavik/resp.h"
 
 namespace lavik::meta {
+
+// Process-local selection; it never changes committed authority or eligibility.
+struct MetaDiscoveryPublication {
+  bool tls_ = false;
+  bool resolve_hostnames_ = false;
+  bool announce_hostnames_ = false;
+  std::shared_ptr<const std::map<std::string, std::string>> resolved_hosts_;
+};
 
 // One consistent read of every input a discovery answer may use. `committed_`
 // owns a share of the immutable compact committed projection, so a worker can
@@ -67,6 +76,7 @@ namespace lavik::meta {
 // the Primary), while an unverified member stays out of the replica listing so
 // read pools cannot select it.
 struct MetaDiscoveryCut {
+  MetaDiscoveryPublication publication_;
   std::shared_ptr<const MetaCommittedStatusView> committed_;
   MetaDataControlRuntimeSnapshot runtime_;
   MetaAutomaticFailoverDiagnosticsSnapshot diagnostics_;
@@ -83,7 +93,7 @@ struct MetaDiscoveryCut {
 struct MetaDiscoveryPrimary {
   std::string group_id_;
   std::string owner_node_id_;  // also the published runid
-  NumericEndpoint endpoint_;   // plaintext client endpoint
+  ClientEndpoint endpoint_;    // selected application route
   std::uint64_t group_term_ = 0;
   // Committed non-retired non-owner member count, independent of health.
   std::size_t replica_count_ = 0;
@@ -104,7 +114,7 @@ struct MetaDiscoveryMasterFlags {
 
 struct MetaDiscoveryReplica {
   std::string node_id_;
-  NumericEndpoint endpoint_;
+  ClientEndpoint endpoint_;
   bool s_down_ = false;
   bool disconnected_ = false;
   // True when the service currently has no publishable Primary.
@@ -153,8 +163,8 @@ const MetaCommittedStatusGroup* DiscoveryServiceGroup(
 // Applies the committed publication gates to one service Group. `group` must
 // come from DiscoveryServiceGroup so the lifecycle/mode/unique-Group conditions
 // hold. Fenced authority, an owner that is not a current member, a retired
-// owner, or an owner without a publishable plaintext endpoint all retract
-// publication instead of emitting a down-marked master.
+// owner, or an owner without a publishable endpoint for the selected transport
+// all retract publication instead of emitting a down-marked master.
 std::optional<MetaDiscoveryPrimary> PublishablePrimary(
     const MetaDiscoveryCut& cut, const MetaCommittedStatusGroup& group);
 

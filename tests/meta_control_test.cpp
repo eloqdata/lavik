@@ -347,9 +347,11 @@ TEST(MetaControlMapperTest, RejectsMissingLocalNodeAndZeroAppliedIndex) {
             absl::StatusCode::kInvalidArgument);
 }
 
-TEST(MetaControlMapperTest, RejectsNonNumericOrNonCanonicalNodeHosts) {
+TEST(MetaControlMapperTest, RejectsMalformedNodeHosts) {
   auto desired = DesiredState();
   desired.nodes[0].host = "data.example";
+  EXPECT_TRUE(cluster::PrepareMetaFullState(desired, kNode1, 1).ok());
+  desired.nodes[0].host = "data..example";
   EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
             absl::StatusCode::kInvalidArgument);
 

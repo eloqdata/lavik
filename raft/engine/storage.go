@@ -183,13 +183,13 @@ func openDisk(cfg Config) (*diskStore, recovered, error) {
 	// Advertised routes may differ behind a proxy. Only a registered route,
 	// not a waiting joiner's first bind, makes the listener mandatory forever.
 	for _, member := range s.genesis.Initial {
-		if member.ID == cfg.Local.ID && member.Sentinel != "" && cfg.Local.Sentinel == "" {
+		if member.ID == cfg.Local.ID && !supportsSentinelRoute(member.Sentinel, cfg.Local.Sentinel, cfg.SentinelTransports) {
 			return nil, rec, errors.New("registered Sentinel endpoint requires a local listener")
 		}
 	}
 	waldir := filepath.Join(dir, "wal")
 	if !fresh {
-		if err = s.readJoin(cfg.Local); err != nil {
+		if err = s.readJoin(cfg.Local, cfg.SentinelTransports); err != nil {
 			return nil, rec, err
 		}
 		var evidence []byte

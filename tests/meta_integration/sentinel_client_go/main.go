@@ -10,6 +10,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -41,14 +43,42 @@ func main() {
 	group := flag.String("group", "single-discovery", "service name")
 	password := flag.String("password", "sentinel-secret", "Sentinel password")
 	protocol := flag.Int("protocol", 3, "Data RESP version; Sentinel retains library default")
+	replicaOnly := flag.Bool("replica", false, "Read from discovered replicas")
+	dataPassword := flag.String("data-password", "", "Data password")
+	ca := flag.String("tls-ca", "", "TLS CA for both Sentinel and Data")
+	cert := flag.String("tls-cert", "", "Application client certificate")
+	key := flag.String("tls-key", "", "Application private key")
 	flag.Parse()
+	var tlsConfig *tls.Config
+	if *ca != "" {
+		pem, err := os.ReadFile(*ca)
+		if err != nil {
+			panic(err)
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(pem) {
+			panic("invalid CA")
+		}
+		tlsConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+		if *cert != "" {
+			pair, err := tls.LoadX509KeyPair(*cert, *key)
+			if err != nil {
+				panic(err)
+			}
+			tlsConfig.Certificates = []tls.Certificate{pair}
+		}
+	}
+	// Leave ServerName empty: the standard dialer verifies the actual target.
+	dial := redis.NewDialer(&redis.Options{TLSConfig: tlsConfig, DialTimeout: time.Second})
+	sentinel := redis.NewSentinelClient(&redis.Options{Addr: strings.Split(*seeds, ",")[0], Password: *password, Protocol: *protocol, TLSConfig: tlsConfig, DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second})
+	defer sentinel.Close()
 	stats := &counters{dialed: map[string]int{}, closed: map[string]int{}}
 	client := redis.NewFailoverClient(&redis.FailoverOptions{
 		MasterName: *group, SentinelAddrs: strings.Split(*seeds, ","), SentinelPassword: *password,
-		Protocol: *protocol, DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second,
+		ReplicaOnly: *replicaOnly, Password: *dataPassword, TLSConfig: tlsConfig, Protocol: *protocol, DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second,
 		ContextTimeoutEnabled: true, MaxRetries: -1, PoolSize: 4,
 		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			c, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+			c, err := dial(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
@@ -76,8 +106,14 @@ func main() {
 		var value any
 		var err error
 		switch req.Op {
+		case "sentinel-address":
+			value, err = sentinel.GetMasterAddrByName(ctx, *group).Result()
+		case "sentinel-ping":
+			value, err = sentinel.Ping(ctx).Result()
 		case "set":
 			value, err = client.Set(ctx, req.Key, req.Value, 0).Result()
+		case "role":
+			value, err = client.Do(ctx, "ROLE").Result()
 		case "get":
 			value, err = client.Get(ctx, req.Key).Result()
 		case "subscribe":

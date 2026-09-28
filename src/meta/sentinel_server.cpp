@@ -39,8 +39,10 @@
 #include "absl/strings/match.h"
 #include "bycorf/net/tcp_listener.h"
 #include "bycorf/net/tcp_stream.h"
+#include "bycorf/net/tls.h"
 #include "bycorf/runtime/sync.h"
 #include "bycorf/runtime/worker.h"
+#include "lavik/async_dns.h"
 #include "lavik/cluster/control_transport.h"
 #include "lavik/meta/raft.h"
 #include "lavik/meta/sentinel_discovery.h"
@@ -89,6 +91,8 @@ enum class SessionAction { kContinue, kReset, kClose, kDrop };
 // still being encoded or observed. Nothing here blocks across workers on the
 // request path beyond the registries' short snapshot locks.
 struct DiscoverySource {
+  MetaDiscoveryPublication publication_;
+  ClientDnsCache dns_;
   std::shared_ptr<MetaRaft> raft_;
   MetaStateMachine* state_machine_ = nullptr;
   std::shared_ptr<MetaDataControlRuntimeStatus> runtime_status_;
@@ -123,6 +127,7 @@ std::optional<MetaDiscoveryCut> AuthoritativeDiscoveryCut(
   if (!authoritative) return std::nullopt;
 
   MetaDiscoveryCut cut;
+  cut.publication_ = source.publication_;
   cut.raft_term_ = raft_term;
   cut.local_meta_id_ = source.raft_->get_id();
   if (const auto config = source.raft_->get_config()) {
@@ -157,6 +162,23 @@ std::optional<MetaDiscoveryCut> AuthoritativeDiscoveryCut(
         source.state_machine_->StatusSnapshot());
   }
   cut.committed_ = source.cached_view_;
+  if (source.publication_.resolve_hostnames_) {
+    std::set<std::string> hosts;
+    auto add = [&](std::string_view raw) {
+      auto endpoint = ParseClientEndpoint(raw);
+      if (endpoint && endpoint->hostname_) hosts.insert(endpoint->host_);
+    };
+    // Tombstones must not consume resolver capacity after a member retires.
+    for (const auto& node : cut.committed_->data_nodes_) {
+      if (node.retired_) continue;
+      for (const auto& endpoint : node.endpoints_) add(endpoint);
+    }
+    for (const auto& member : cut.committed_->meta_members_) {
+      if (!member.retired_) add(member.sentinel_endpoint_);
+    }
+    cut.publication_.resolved_hosts_ = source.dns_.Refresh(hosts);
+  }
+
   cut.now_unix_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
@@ -550,14 +572,23 @@ absl::StatusOr<int> OpenAcceptWake(const NumericEndpoint& endpoint) {
 struct MetaSentinelServer::Core {
   Core(bycorf::ForeignExecutor executor,
        MetaSentinelDiscoveryDependencies discovery,
-       MetaSentinelServerOptions options, NumericEndpoint endpoint)
+       MetaSentinelServerOptions options)
       : executor_(executor),
         authenticator_(options.requirepass_),
-        options_(std::move(options)),
-        endpoint_(std::move(endpoint)) {
+        options_(std::move(options)) {
+    for (const auto& entry : {std::pair{options_.address_, false},
+                              std::pair{options_.tls_address_, true}}) {
+      if (entry.first.empty()) continue;
+      auto listener = std::make_unique<Listener>();
+      listener->endpoint_ = *ParseConcreteNumericEndpoint(entry.first);
+      listener->tls_ = entry.second;
+      listeners_.push_back(std::move(listener));
+    }
     // Only the immutable digest is needed after construction.
     options_.requirepass_.clear();
     discovery_ = DiscoverySource{
+        .publication_ = {},
+        .dns_ = {},
         .raft_ = std::move(discovery.raft_),
         .state_machine_ = discovery.state_machine_,
         .runtime_status_ = std::move(discovery.runtime_status_),
@@ -566,6 +597,9 @@ struct MetaSentinelServer::Core {
         .leader_observation_grace_ms_ = discovery.leader_observation_grace_ms_,
         .cached_view_ = {},
     };
+    discovery_.publication_.tls_ = options_.data_tls_;
+    discovery_.publication_.resolve_hostnames_ = options_.resolve_hostnames_;
+    discovery_.publication_.announce_hostnames_ = options_.announce_hostnames_;
   }
 
   void Close(SentinelSession& session) {
@@ -709,7 +743,10 @@ struct MetaSentinelServer::Core {
     co_return absl::OkStatus();
   }
   void NotifyDrained() {
-    if (!shutdown_ || accepting_ || monitor_running_ || !sessions_.empty())
+    if (!shutdown_ ||
+        std::any_of(listeners_.begin(), listeners_.end(),
+                    [](const auto& l) { return l->accepting_; }) ||
+        monitor_running_ || !sessions_.empty())
       return;
     for (auto& waiter : drain_waiters_) waiter->set_value();
     drain_waiters_.clear();
@@ -718,18 +755,23 @@ struct MetaSentinelServer::Core {
   bycorf::ForeignExecutor executor_;
   const PasswordAuthenticator authenticator_;
   MetaSentinelServerOptions options_;
-  NumericEndpoint endpoint_;
+  struct Listener {
+    NumericEndpoint endpoint_;
+    bycorf::TcpListener listener_;
+    bool tls_ = false;
+    bool accepting_ = false;
+    int wake_fd_ = -1;
+  };
+  std::vector<std::unique_ptr<Listener>> listeners_;
+  std::shared_ptr<bycorf::TlsContext> tls_context_;
   // Discovery inputs are read and the caches written only on the Meta worker.
   DiscoverySource discovery_;
   // All mutable state below is confined to the Meta worker. The main thread
   // observes bind/drain completion through one-shot promises, never a shared
   // request-path lock or a concurrently traversed session registry.
   bycorf::Worker* worker_ = nullptr;
-  bycorf::TcpListener listener_;
   std::uint64_t next_connection_id_ = 0;
-  bool accepting_ = false;
   bool shutdown_ = false;
-  int wake_fd_ = -1;
   std::vector<bycorf::Connection*> sessions_;
   std::map<bycorf::Connection*, SentinelSession*> live_;
   std::size_t output_bytes_ = 0;
@@ -774,11 +816,28 @@ absl::StatusOr<std::shared_ptr<MetaSentinelServer>> MetaSentinelServer::Create(
     bycorf::ForeignExecutor executor,
     MetaSentinelDiscoveryDependencies discovery,
     MetaSentinelServerOptions options) {
-  auto endpoint = ParseConcreteNumericEndpoint(options.address_);
-  if (!endpoint) {
+  if (options.address_.empty() && options.tls_address_.empty())
     return absl::InvalidArgumentError(
-        "Sentinel address must be a concrete numeric IP and nonzero port");
+        "Sentinel needs a plaintext or TLS listener");
+  for (const auto& address : {options.address_, options.tls_address_}) {
+    if (!address.empty() && !ParseConcreteNumericEndpoint(address))
+      return absl::InvalidArgumentError(
+          "Sentinel bind must be a concrete numeric IP and nonzero port");
   }
+  if (!options.address_.empty() &&
+      SameClientSocket(options.address_, options.tls_address_))
+    return absl::InvalidArgumentError(
+        "Sentinel plaintext and TLS listeners conflict");
+  if (options.tls_auth_clients_ != "no" &&
+      options.tls_auth_clients_ != "optional" &&
+      options.tls_auth_clients_ != "yes")
+    return absl::InvalidArgumentError(
+        "Sentinel tls-auth-clients must be no, optional or yes");
+  if (options.tls_address_.empty() &&
+      (!options.tls_cert_file_.empty() || !options.tls_key_file_.empty() ||
+       !options.tls_ca_cert_file_.empty()))
+    return absl::InvalidArgumentError(
+        "Sentinel TLS credentials require a TLS listener");
   if (options.maxclients_ == 0 || options.query_limit_ == 0 ||
       options.reply_limit_ < 128 ||
       options.total_output_limit_ < options.reply_limit_ ||
@@ -796,9 +855,28 @@ absl::StatusOr<std::shared_ptr<MetaSentinelServer>> MetaSentinelServer::Create(
     return absl::InvalidArgumentError(
         "Sentinel discovery dependencies must be valid");
   }
-  return std::shared_ptr<MetaSentinelServer>(new MetaSentinelServer(
-      std::make_shared<Core>(executor, std::move(discovery), std::move(options),
-                             std::move(*endpoint))));
+  auto core = std::make_shared<Core>(executor, std::move(discovery),
+                                     std::move(options));
+  if (!core->options_.tls_address_.empty()) {
+    const auto& o = core->options_;
+    if (o.tls_cert_file_.empty() || o.tls_key_file_.empty() ||
+        (o.tls_auth_clients_ != "no" && o.tls_ca_cert_file_.empty()))
+      return absl::InvalidArgumentError(
+          "incomplete Sentinel TLS configuration");
+    auto context = bycorf::TlsContext::CreateServer(
+        {.cert_file_ = o.tls_cert_file_,
+         .key_file_ = o.tls_key_file_,
+         .ca_cert_file_ = o.tls_ca_cert_file_,
+         .client_auth_ = o.tls_auth_clients_ == "yes"
+                             ? bycorf::TlsClientAuth::kRequired
+                         : o.tls_auth_clients_ == "optional"
+                             ? bycorf::TlsClientAuth::kOptional
+                             : bycorf::TlsClientAuth::kNo});
+    if (!context.ok()) return context.status();
+    core->tls_context_ = *context;
+  }
+  return std::shared_ptr<MetaSentinelServer>(
+      new MetaSentinelServer(std::move(core)));
 }
 
 MetaSentinelServer::MetaSentinelServer(CorePtr core) : core_(std::move(core)) {}
@@ -812,13 +890,23 @@ absl::Status MetaSentinelServer::Start() {
   if (!core_->executor_.Notify([core = core_, result]() noexcept {
         auto& worker = *bycorf::ThisWorker().self_;
         core->worker_ = &worker;
-        auto status = core->listener_.Bind(&worker, core->endpoint_.host_,
-                                           core->endpoint_.port_, 128, false);
+        absl::Status status;
+        for (auto& listener : core->listeners_) {
+          status =
+              listener->listener_.Bind(&worker, listener->endpoint_.host_,
+                                       listener->endpoint_.port_, 128, false);
+          if (!status.ok()) break;
+        }
         if (status.ok()) {
-          core->accepting_ = true;
-          worker.Spawn(AcceptLoop(core));
+          for (std::size_t i = 0; i < core->listeners_.size(); ++i) {
+            core->listeners_[i]->accepting_ = true;
+            worker.Spawn(AcceptLoop(core, i));
+          }
           core->monitor_running_ = true;
           worker.Spawn(Core::Monitor(core));
+        } else {
+          for (auto& listener : core->listeners_)
+            (void)listener->listener_.Close();
         }
         result->set_value(std::move(status));
       }))
@@ -865,21 +953,18 @@ void MetaSentinelServer::Shutdown() {
           (void)connection;
           core->Close(*session);
         }
-        if (core->accepting_) {
-          auto wake = OpenAcceptWake(core->endpoint_);
-          if (wake.ok()) {
-            core->wake_fd_ = *wake;
-          } else {
-            // Socket exhaustion must not make shutdown fatal. Shutting down
-            // the existing Linux TCP listener wakes its armed io_uring accept
-            // without allocating an fd. Close also prevents completion from
-            // rearming accept. Keep the listener object and accepting_ alive
-            // until AcceptLoop consumes the completion and reports its exit.
-            (void)::shutdown(core->listener_.NativeFd(), SHUT_RDWR);
-            (void)core->listener_.Close();
-          }
-        } else {
-          (void)core->listener_.Close();
+        for (auto& listener : core->listeners_) {
+          if (listener->accepting_) {
+            auto wake = OpenAcceptWake(listener->endpoint_);
+            if (wake.ok())
+              listener->wake_fd_ = *wake;
+            else {
+              // FD exhaustion cannot strand an armed accept during shutdown.
+              (void)::shutdown(listener->listener_.NativeFd(), SHUT_RDWR);
+              (void)listener->listener_.Close();
+            }
+          } else
+            (void)listener->listener_.Close();
         }
         // BeginClose may resume a session later; its frame-owned borrow keeps
         // the connection alive until all body-local watchdogs have unwound.
@@ -898,9 +983,11 @@ void MetaSentinelServer::Shutdown() {
   stopped_ = true;
 }
 
-bycorf::Task<absl::Status> MetaSentinelServer::AcceptLoop(CorePtr core) {
+bycorf::Task<absl::Status> MetaSentinelServer::AcceptLoop(
+    CorePtr core, std::size_t listener_index) {
+  auto& listener = *core->listeners_[listener_index];
   while (!core->shutdown_) {
-    auto accepted = co_await core->listener_.Accept();
+    auto accepted = co_await listener.listener_.Accept();
     if (!accepted.ok()) {
       if (core->shutdown_) break;
       const auto slept = co_await bycorf::SleepFor(
@@ -911,7 +998,7 @@ bycorf::Task<absl::Status> MetaSentinelServer::AcceptLoop(CorePtr core) {
     auto* connection = *accepted;
     if (core->shutdown_ ||
         core->sessions_.size() >= core->options_.maxclients_) {
-      if (!core->shutdown_) {
+      if (!core->shutdown_ && !listener.tls_) {
         constexpr std::string_view error =
             "-ERR max number of clients reached\r\n";
         // Rejected sockets must not allocate waiting writers or session tasks.
@@ -929,23 +1016,24 @@ bycorf::Task<absl::Status> MetaSentinelServer::AcceptLoop(CorePtr core) {
         (void)stream.Close();
       } else {
         core->worker_->Spawn(SessionLoop(core, std::move(stream),
-                                         SessionBorrow(core, connection)));
+                                         SessionBorrow(core, connection),
+                                         listener.tls_));
       }
     }
     co_await bycorf::Yield(*core->worker_);
   }
-  if (core->wake_fd_ >= 0) {
-    (void)::close(core->wake_fd_);
-    core->wake_fd_ = -1;
+  if (listener.wake_fd_ >= 0) {
+    (void)::close(listener.wake_fd_);
+    listener.wake_fd_ = -1;
   }
-  (void)core->listener_.Close();
-  core->accepting_ = false;
+  (void)listener.listener_.Close();
+  listener.accepting_ = false;
   core->NotifyDrained();
   co_return absl::OkStatus();
 }
 
 bycorf::Task<absl::Status> MetaSentinelServer::SessionLoop(
-    CorePtr core, bycorf::TcpStream stream, SessionBorrow borrow) {
+    CorePtr core, bycorf::TcpStream stream, SessionBorrow borrow, bool tls) {
   // Parameter destruction follows body locals, even if Spawn discards the
   // unstarted frame. That ordering is the connection-storage lifetime barrier.
   auto* connection = borrow.connection();
@@ -960,6 +1048,19 @@ bycorf::Task<absl::Status> MetaSentinelServer::SessionLoop(
   ControlDeadlineWatchdog read_deadline(*core->worker_, expire);
 
   const auto timeout = core->options_.progress_timeout_;
+  if (tls) {
+    if (!authentication_deadline.Arm(timeout).ok()) {
+      (void)stream.Close();
+      co_return absl::UnavailableError("Sentinel TLS timer failed");
+    }
+    const auto status = co_await stream.StartTls(core->tls_context_, true);
+    (void)authentication_deadline.Disarm();
+    if (!status.ok() || expired || core->shutdown_) {
+      (void)stream.Close();
+      co_return status;
+    }
+  }
+
   SentinelSession session{};
   session.authenticated_ = !core->authenticator_.required();
   session.id_ = ++core->next_connection_id_;

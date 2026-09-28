@@ -120,6 +120,8 @@ struct MetaRaftOptions {
   std::int32_t id_ = 0;
   std::string data_dir_, listen_, local_raft_, local_data_, local_admin_;
   std::string local_sentinel_;
+  // Startup-only listener capabilities: bit 0 TCP, bit 1 TLS; never durable.
+  std::uint8_t sentinel_transports_ = 0;
   std::string tls_ca_, tls_cert_, tls_key_;
   std::vector<std::shared_ptr<MetaRaftMember>> initial_;
   std::uint32_t heartbeat_ms_ = 100;

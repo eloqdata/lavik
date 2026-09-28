@@ -56,7 +56,7 @@ func (r *Runtime) startJoin(request *joinRequest) error {
 		request.result <- ErrBusy
 		return nil
 	}
-	if err := request.seed.validate(r.cfg.Local); err != nil {
+	if err := request.seed.validate(r.cfg.Local, r.cfg.SentinelTransports); err != nil {
 		request.result <- err
 		return nil
 	}
@@ -71,7 +71,11 @@ func (r *Runtime) startJoin(request *joinRequest) error {
 	return nil
 }
 
-func (seed joinSeed) validate(local Member) error {
+func (seed joinSeed) validate(local Member, transports ...uint8) error {
+	var available uint8
+	if len(transports) != 0 {
+		available = transports[0]
+	}
 	if seed.Index == 0 || len(seed.Members) == 0 || len(seed.Members) > 1024 {
 		return errors.New("invalid join invitation")
 	}
@@ -86,8 +90,8 @@ func (seed joinSeed) validate(local Member) error {
 		}
 		seen[m.ID] = true
 		if m.ID == local.ID {
-			if m.Sentinel != "" && local.Sentinel == "" {
-				return errors.New("registered Sentinel endpoint requires a local listener")
+			if !supportsSentinelRoute(m.Sentinel, local.Sentinel, available) {
+				return errors.New("registered Sentinel transport requires a matching local listener")
 			}
 			found = m.Principal == local.Principal
 		}
@@ -153,7 +157,7 @@ func (r *Runtime) knownPeer(id uint64) bool {
 	return false
 }
 
-func (s *diskStore) readJoin(local Member) error {
+func (s *diskStore) readJoin(local Member, transports uint8) error {
 	data, err := readBounded(filepath.Join(s.dir, "JOIN"), 1<<20)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -168,7 +172,7 @@ func (s *diskStore) readJoin(local Member) error {
 	if err := json.Unmarshal(data, &seed); err != nil {
 		return err
 	}
-	if err := seed.validate(local); err != nil {
+	if err := seed.validate(local, transports); err != nil {
 		return err
 	}
 	s.join = &seed
