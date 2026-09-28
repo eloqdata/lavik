@@ -16,7 +16,7 @@ RUN cmake -S /src -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 
 FROM node:24.15.0-bookworm-slim AS node
 FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client \
       libstdc++6 && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home lavik \
     && mkdir -p /data && chown lavik:lavik /data

@@ -358,8 +358,9 @@ Useful references:
 - [Documentation index](docs/README.md)
 - [Architecture](docs/architecture/README.md)
 - [Operations](docs/operations/README.md)
-- [Lavik Admin](docs/operations/lavik-admin.md): browser and CLI fleet management,
-  topology, replica resizing, key browsing, and cluster operations
+- [Lavik Admin](docs/operations/lavik-admin.md): bundled browser and CLI workspace
+  for SSH cluster setup, version selection, multi-cluster monitoring, follower
+  resizing, and key browsing
 - [Prometheus metrics](docs/operations/metrics.md)
 - [Network IRQ affinity tuning](docs/operations/irq-affinity-tuning.md)
 - [Performance reports](perf_reports/README.md)

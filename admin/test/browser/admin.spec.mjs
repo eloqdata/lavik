@@ -301,7 +301,7 @@ test("connect and initialize an already-running fresh deployment", async ({
     "Requires the optional fresh gamma fixture",
   );
   await page
-    .getByRole("button", { name: "Connect cluster", exact: false })
+    .getByRole("button", { name: "Connect existing cluster", exact: true })
     .first()
     .click();
   await page.getByLabel("Cluster name", { exact: true }).fill("gamma");

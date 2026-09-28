@@ -137,6 +137,7 @@ export class Fleet {
         status,
         nodes,
         observed_at: now(),
+        deployment: this.deployments ? await this.deployments.plan(id) : null,
       };
       this.views.set(id, { value, time: Date.now() });
       return value;
@@ -153,6 +154,8 @@ export class Fleet {
     if (!node?.endpoint)
       throw new AdminError("Node has no reachable client endpoint", 503);
     try {
+      const remote = await this.deployments?.data(cluster, node.endpoint, args);
+      if (remote) return remote.value;
       return await command(node.endpoint, args, this.meta.profile(cluster));
     } catch (error) {
       // Follow only redirects within the authenticated Meta topology. Never
@@ -163,8 +166,15 @@ export class Fleet {
         nodes.find(
           (item) => item.endpoint?.replace(/^(tcp|tls):\/\//, "") === moved[1],
         );
-      if (owner && owner.node_id !== nodeId)
+      if (owner && owner.node_id !== nodeId) {
+        const remote = await this.deployments?.data(
+          cluster,
+          owner.endpoint,
+          args,
+        );
+        if (remote) return remote.value;
         return command(owner.endpoint, args, this.meta.profile(cluster));
+      }
       throw error;
     }
   }
@@ -265,6 +275,12 @@ export class Fleet {
   }
   async enqueue(id, kind, input, requestId) {
     const cluster = await this.cluster(id);
+    const deployment = await this.deployments?.plan(id);
+    if (deployment && deployment.modern === false && kind !== "create")
+      throw new AdminError(
+        "This release predates Admin's safe membership and failover APIs. Choose a current release for these operations.",
+        409,
+      );
     if (!["failover", "replica-add", "replica-remove", "create"].includes(kind))
       throw new AdminError("Unsupported operation");
     const jobId = requestId || randomBytes(16).toString("hex");
@@ -413,6 +429,9 @@ export class Fleet {
     );
   }
   async execute(job) {
+    if (job.kind === "deploy") return this.deployments.run(job);
+    if (job.kind === "deploy-follower")
+      return this.deployments.runFollower(job);
     const cluster = await this.cluster(job.cluster_id);
     const input = JSON.parse(job.input);
     if (Date.now() > input.deadline) {
@@ -430,15 +449,18 @@ export class Fleet {
     await this.update(job, "running", "submitting");
     try {
       if (job.kind === "failover") {
-        const result = await this.meta.exec([
-          "failover",
-          input.group,
-          ...this.meta.options(cluster, leader, true),
-          "--operation-id",
-          job.id,
-          "--deadline-unix-ms",
-          String(input.deadline),
-        ]);
+        const result = await this.meta.exec(
+          [
+            "failover",
+            input.group,
+            ...this.meta.options(cluster, leader, true),
+            "--operation-id",
+            job.id,
+            "--deadline-unix-ms",
+            String(input.deadline),
+          ],
+          cluster,
+        );
         if (result.code !== 0) {
           await this.update(
             job,
@@ -453,13 +475,16 @@ export class Fleet {
         try {
           const manifest = join(directory, "cluster.toml");
           await writeFile(manifest, input.manifest, { mode: 0o600 });
-          const result = await this.meta.exec([
-            "cluster-create",
-            "--manifest",
-            manifest,
-            ...this.meta.options(cluster, leader, true),
-            "--yes",
-          ]);
+          const result = await this.meta.exec(
+            [
+              "cluster-create",
+              "--manifest",
+              manifest,
+              ...this.meta.options(cluster, leader, true),
+              "--yes",
+            ],
+            cluster,
+          );
           const operation = /operation=([0-9a-f]{32})/.exec(result.stdout)?.[1];
           if (operation)
             await this.store.query(
@@ -568,6 +593,8 @@ export class Fleet {
     }
   }
   async observe(job) {
+    if (job.kind === "deploy") return this.deployments.observe(job);
+    if (job.kind === "deploy-follower") return;
     const cluster = await this.cluster(job.cluster_id);
     const status = await this.meta.status(cluster);
     const input = JSON.parse(job.input);
@@ -656,6 +683,7 @@ export class Fleet {
         "Only an idle uncertain operation can be resumed",
         409,
       );
+    if (job.kind.startsWith("deploy")) return this.deployments.resume(job);
     if (job.kind === "create")
       throw new AdminError(
         "Creation recovery is owned by Meta; inspect the root operation and cluster lifecycle",

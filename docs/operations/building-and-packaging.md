@@ -21,9 +21,10 @@ The [release Docker images](../../deploy/docker/README.md) package the published
 and cluster targets, with a release-specific primary/follower Compose example
 and a local verification script.
 
-The optional [Lavik Admin service](lavik-admin.md) has a separate Docker
-package containing Node.js, its browser assets, and `lavik-ctl`. It connects
-to existing Meta and Data deployments; its container does not run io_uring.
+The optional [Lavik Admin service](lavik-admin.md) is included in all release
+archives, including nightly, and has a separate Docker package. It can deploy
+new clusters over SSH or connect to existing Meta and Data. Its own process
+does not run io_uring.
 
 ## Kernel requirements
 
@@ -537,8 +538,8 @@ portable path when that system binary is unavailable.
 
 The packaging script builds `lavik`, `lavik-meta`, and `lavik-ctl` in Release
 mode, statically links OpenSSL plus the GNU C++/compiler runtimes, strips staged
-copies, verifies each executable's linkage and `--help`, and writes a
-versioned archive and `.tar.gz.sha256` file under `dist/`. The checksum uses a
+copies, verifies each executable's linkage and `--help`, stages Lavik Admin
+with its launcher and Node runtime, and writes a versioned archive and `.tar.gz.sha256` file under `dist/`. The checksum uses a
 relative archive name so `sha256sum --check *.sha256` works after downloading.
 The archive carries `LICENSE` (the shared Apache-2.0 text) and
 `THIRD_PARTY_NOTICES`, which includes the project's `NOTICE`, upstream
@@ -612,8 +613,8 @@ CC=gcc-13 CXX=g++-13 LAVIK_PACKAGE_KERNEL_BYPASS=ON ./scripts/package_release.sh
 ```
 
 This produces a `lavik-<version>-linux-<arch>.tar.gz` archive containing
-the same three applications. Without this environment variable the default is
-`OFF`, producing `lavik-<version>-linux-<arch>-minimal.tar.gz`. The script sets
+the same three applications plus Lavik Admin. Without this environment
+variable the default is `OFF`, producing `lavik-<version>-linux-<arch>-minimal.tar.gz`. The script sets
 the CMake option explicitly to prevent a previous build directory's setting
 from leaking into the package. A standard
 binary still starts with kernel TCP and io_uring; select `--network=dpdk`
@@ -646,9 +647,11 @@ push to `main` or a `v*` tag and can also be started with `workflow_dispatch`.
 It builds on
 native `ubuntu-24.04` (x86_64) and `ubuntu-24.04-arm` (aarch64) runners using
 GCC 13, producing four packages: both variants for both architectures.
-Each job checks the license files and all three executables after extracting
-the archive, runs kernel/io_uring SET/GET and recovery smoke checks on disposable
-files, and uploads the archive and checksum as an Actions artifact for 30 days.
+Each job checks the license files, all three executables, and the packaged
+Admin launcher after extracting the archive. It runs Admin regression tests,
+an authenticated launcher smoke test, and kernel/io_uring SET/GET and recovery
+checks on disposable files, then uploads the archive and checksum as an
+Actions artifact for 30 days.
 CI calls `scripts/package_release.sh` directly with the selected variant and
 `LAVIK_PACKAGE_VERSION=nightly` for branch builds or `LAVIK_PACKAGE_TAG` for
 version tags; tar creation, license inclusion, executable
@@ -674,6 +677,25 @@ asset upload; GitHub keeps the newest pending run. Manual builds on other
 branches upload Actions artifacts without updating nightly. The publication
 jobs alone have `contents: write`; they use the workflow's `GITHUB_TOKEN`.
 No scheduled build is needed: a push to main triggers the replacement.
+
+### Bundled Lavik Admin
+
+`scripts/package_admin.sh` stages an explicit list of runtime modules, browser
+assets, the fixed SSH helper, `lavik-admin`, and `LAVIK-ADMIN.md` into each
+release directory. It downloads Node.js 24.15.0 for the native Linux
+architecture from nodejs.org, verifies the architecture-specific SHA-256 pinned
+in the script, and includes its complete upstream license in both
+`runtime/LICENSE` and `THIRD_PARTY_NOTICES`. Updating Node requires updating
+both architecture digests together. Packaging needs `curl`, `ca-certificates`,
+and `xz-utils`; the Ubuntu build-dependency installer includes them.
+
+There is no runtime npm dependency, build-time frontend compilation, or
+workspace/key inclusion. Admin state lives outside the archive. Run
+`./lavik-admin` after extraction; Linux uses `runtime/bin/node`, while macOS
+requires a separately installed Node.js 24.15+ and uses SSH to execute the
+selected release's Linux client on the cluster hosts. Local OpenSSH (`ssh` and
+`scp`) and remote Python 3 are required for deployment. No native macOS Data
+or Meta binary is implied by the portable Admin launcher.
 
 ### Tagged releases
 

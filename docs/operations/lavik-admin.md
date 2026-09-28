@@ -20,10 +20,140 @@ Lavik Admin offers a browser workspace and `lavik-ctl` fleet commands backed
 by the same persistent catalog. Each connected Meta deployment retains its
 own authoritative cluster state and operation journal.
 
-Run `lavik`, `lavik-meta`, and `lavik-ctl` from the same updated checkout.
-Admin uses the Meta endpoint and operation-summary commands included here,
-and repeated replica resizing needs the Data removal/rejoin fixes. Updating
-the Admin image alone does not update separately deployed Meta or Data nodes.
+For a first hands-on run on macOS, follow
+[Lavik Admin 101: Docker hosts to a running cluster](lavik-admin-mac-101.md).
+It includes exact SSH preparation, form values, node mapping, and client ports.
+
+## Start from a release
+
+Extract any future nightly or tagged Linux release archive and run:
+
+```sh
+./lavik-admin
+```
+
+Open <http://localhost:4173> and sign in with the token printed in the terminal.
+Linux archives include Node.js and require no npm installation. On macOS,
+install Node.js 24.15+ and use the same launcher; Data, Meta, and their release's
+`lavik-ctl` run on the Linux hosts over SSH. Admin itself needs local OpenSSH
+(`ssh` and `scp`). Previously published archives are not modified retroactively.
+The archive includes a standalone `LAVIK-ADMIN.md` quick start.
+
+The workspace defaults to `~/.local/share/lavik-admin` (or
+`$XDG_DATA_HOME/lavik-admin`). Set `LAVIK_ADMIN_DATA` to use a different private
+directory and `LAVIK_ADMIN_PORT` to change the default 4173. Keep Admin running
+while using its browser or fleet CLI. You can close it without stopping clusters.
+
+## Prepare SSH hosts and create a cluster
+
+Use existing Linux AMD64 or ARM64 hosts with Python 3, glibc 2.39+, Linux 6.1+,
+and io_uring enabled. Ubuntu 24.04 satisfies the userspace requirement. The
+Admin computer needs HTTPS access to GitHub; hosts receive verified binaries
+over SSH and do not need to download releases themselves.
+
+Choose **Create cluster** and follow three stages:
+
+1. **Prepare hosts.** Paste one `SSH_HOST[:PORT]` per line, optionally followed
+   by its private cluster IP. Set the SSH user and choose **Password** or
+   **Private key / SSH agent**. A private-key path refers to the computer
+   running Admin; encrypted keys accept a temporary passphrase. Click
+   **Prepare hosts** to install Admin's public key and verify fresh key-only
+   access. Use separate batches for different logins. Existing authorized keys
+   remain intact. First connections trust and save the server's host key;
+   changed keys are rejected. Passwords/passphrases are never saved or logged.
+   Select prepared hosts and click **Continue to node placement**; saved hosts
+   are rechecked and can be reused across clusters without the initial login.
+2. **Node placement.** Name the cluster, choose `nightly` or a published GitHub
+   release, and set numeric private cluster IPs for the selected hosts. These
+   addresses must be bound on the hosts and reachable between them; they may
+   differ from the SSH address behind Docker port mappings. Defaults give three
+   Meta voters, one primary, and two followers. The table explicitly maps every
+   voter/primary/follower to a host; each row has a selector. A host may run
+   both Meta and Data. Use separate hosts for redundancy. Changing node counts
+   or the selected host count resets placement to even spreading.
+   **Tune advanced settings** exposes workers, file size, storage directory,
+   base ports and client mode. **Service lifecycle** is shown directly in Node
+   placement: choose systemd for persistent hosts or development processes for
+   Docker labs. Initial setup supports up to 64 Data nodes and 1, 3, or 5
+   Meta voters.
+3. **Review & deploy.** **Check hosts & review** checks Python, kernel/libc,
+   io_uring, service management, storage, and ports. Resolve reported issues,
+   inspect placement and ports, type the cluster name, and choose **Deploy
+   cluster**. **Operations** tracks installation, initialization, and readiness.
+   The dashboard provides metrics, key browsing, commands, topology, and slow
+   logs. Repeat setup for additional independent clusters in this workspace.
+
+The version field lists releases and accepts exact tags. Discovery uses the
+public `github.com/eloqdata/lavik/releases` page and checksummed minimal
+packages, with a short metadata cache; it does not use the rate-limited REST
+API. GitHub page/asset access is still required.
+
+For ordinary Docker lab containers, select **Node placement → Service
+lifecycle → Development processes (no automatic restart)** and run **Check
+hosts & review** again. If checks report that systemd is unavailable,
+**Use development processes & recheck** makes that selection and runs a fresh
+review. The lifecycle changes only when you choose it. These containers do not run systemd; enabling lingering
+cannot fix that. Process mode does not restart nodes after crashes or reboot.
+
+Default supervision uses systemd user services. On hosts running systemd, an
+administrator must enable lingering once for the selected SSH user, then reconnect:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+Admin does not change sudo or SSH server authentication policy. Password
+onboarding requires that the host already allows that user's password login;
+use an existing private key otherwise. Key-only login must work without MFA
+or an interactive shell prompt. Use the local browser or a configured HTTPS
+reverse proxy when entering credentials. The protected workspace owns
+`ssh/identity/id_ed25519` and `ssh/known_hosts`; back them up with the catalog.
+Prepare-host SSH connections go directly to the entered hostname and port.
+**Admin SSH access verified** means Admin can log in using its workspace key.
+A plain terminal `ssh USER@HOST` may still prompt for a password because it
+uses your usual SSH identities. For a manual login, select Admin's key with
+`ssh -i /PATH/TO/ADMIN_WORKSPACE/ssh/identity/id_ed25519 -p PORT USER@HOST`.
+The workspace is the running Admin process's `LAVIK_ADMIN_DATA` value, or
+`~/.local/share/lavik-admin` by default; the lab's password-file directory
+alone does not select the Admin workspace.
+
+Base ports default to 6379 (Data), 7100 (Meta Raft), 7200 (Meta Admin), and
+7300 (Data control). Each host IP's first Data node uses the Data base port;
+additional Data nodes on that IP increment it. Thus one Data node per host uses
+6379 on every host, even with custom placement or a different host-list order.
+Meta's three port ranges increment by voter index. Open reviewed ports between
+hosts. Existing deployment plans retain their original ports.
+Multiple clusters on the same hosts need nonoverlapping ports and names.
+
+Provisioning uses minimal packages, kernel networking, io_uring, and plaintext
+cluster traffic on the private network. SSH protects management access; it
+does not automatically configure cluster TLS, firewall rules, cloud machines,
+or OS packages. Use the connection-profile flow below for existing TLS clusters.
+Admin data tools for SSH deployments reach private Data addresses through SSH;
+your Mac does not need direct access to Docker's Linux bridge IPs. External
+clients still need their own route or explicit published ports.
+
+Admin installs under `~/.local/share/lavik/clusters/NAME` on each host by default.
+Each directory carries ownership metadata, the pinned binaries, original
+manifest, and per-node state. Existing unowned directories and conflicting
+configuration are refused; existing data files are never overwritten or resized.
+Systemd units are named `lavik-NAME-meta-1.service`, `lavik-NAME-data-1.service`,
+and so on. Inspect a service on its host with:
+
+```sh
+systemctl --user status lavik-NAME-data-1.service
+journalctl --user -u lavik-NAME-data-1.service
+```
+
+The **Development processes** lifecycle option supports lab containers without
+systemd. It writes `console.log` and process identities in each node directory
+but does not restart processes after a crash or reboot. Use systemd for ongoing
+host deployments.
+
+Released clients run with their matching Meta/Data binaries. Older releases
+such as `v0.1.0-beta.1` can be created and inspected; their older APIs do not
+support Admin's safe follower resizing and controlled failover. Those controls
+are disabled. Select a current release for the full management workflow.
 
 ## Run in Docker
 
@@ -45,9 +175,12 @@ docker compose -f admin/compose.yaml exec admin cat /data/lavik-admin/token
 Open <http://localhost:4173> and sign in with the printed token. The Compose
 service binds to the local host only and runs as an unprivileged user. Its
 named volume preserves connections, requests, and the token across container
-replacement. It does not start or provision Data or Meta nodes.
+replacement. It does not run Data or Meta locally. To use SSH deployment from this
+container, use **Prepare hosts** with a login password, or mount a bootstrap
+private key/agent socket for its unprivileged user. Paths refer to the
+container's filesystem; its persistent workspace retains the managed SSH key. Never mount the Docker socket for host provisioning.
 
-Choose **Connect cluster**, enter a name and one or more numeric Meta Admin
+Choose **Connect existing cluster**, enter a name and one or more numeric Meta Admin
 addresses, and select a connection profile. These are the `--ctl-addr`
 endpoints, not the Data client or Meta Raft ports. Every advertised Meta and
 Data endpoint must be reachable from inside Admin. A loopback address names
@@ -75,6 +208,42 @@ lavik-ctl --socket /private/path/admin/admin.sock fleet-list
 lavik-ctl --socket /private/path/admin/admin.sock fleet-status production
 lavik-ctl --socket /private/path/admin/admin.sock fleet-operations production
 ```
+
+For release users, `./lavik-admin ctl` uses the same socket and also runs on
+macOS. Run `./lavik-admin ctl fleet-hosts` to list hosts prepared in the UI.
+To reuse them in a deployment, save `setup.json` with their returned IDs:
+
+```json
+{
+  "id": "production",
+  "release": "nightly",
+  "hosts": [
+    {"hostId": "PREPARED_HOST_ID_1", "address": "10.0.0.11"},
+    {"hostId": "PREPARED_HOST_ID_2", "address": "10.0.0.12"},
+    {"hostId": "PREPARED_HOST_ID_3", "address": "10.0.0.13"}
+  ]
+}
+```
+
+Unspecified settings use the wizard defaults. Existing automation may still
+supply full SSH host settings (`host`, `user`, optional `port`, `identityFile`,
+`knownHostsFile`) after establishing passwordless access and host trust itself.
+Then review and submit:
+
+```sh
+./lavik-admin ctl fleet-releases
+./lavik-admin ctl fleet-plan ./setup.json
+./lavik-admin ctl fleet-deploy REVIEW_TOKEN production
+./lavik-admin ctl fleet-operations production
+```
+
+`fleet-plan` checks hosts without installing files and returns a 15-minute
+review token. A restart expires previews; accepted operations and plans remain
+durable. Native `lavik-ctl` accepts the same commands, with base64url-encoded
+JSON as the `fleet-plan` argument instead of a filename. The launcher helper
+performs that encoding. Use `fleet-follower-plan NAME ./follower.json` with
+`{"group":"group-1","host":{"host":"10.0.0.14","user":"ubuntu"},"dataPort":6379}`
+and then `fleet-follower-deploy NAME REVIEW_TOKEN` for a new follower.
 
 Fleet replies are `OK` followed by JSON; failures are `ERR` followed by JSON.
 The catalog is server-owned. Both interfaces immediately see additions from
@@ -135,9 +304,9 @@ access token grants operator access to all registered clusters; there is no
 per-user RBAC. Rotate the token file and restart Admin to invalidate sessions.
 Do not mount a Docker socket into the production Admin container.
 
-## Create and resize clusters
+## Initialize existing deployments and resize followers
 
-To initialize a new cluster, first start its Meta members and Data nodes using
+To initialize processes started outside Admin, first start its Meta members and Data nodes using
 the same manifest and fresh Data files as described in the
 [cluster deployment guide](cluster-deployment.md). Connect the Meta endpoint,
 choose **Initialize cluster**, paste the manifest, and confirm the cluster
@@ -146,7 +315,17 @@ the listed Data populations and is available only for an uninitialized Meta
 deployment. Different manifests can define different numbers of groups,
 replicas, and Meta members.
 
-To add a replica, start a Data process with a fresh file, its stable
+For a cluster deployed by Admin, choose **Topology → Add replica → Deploy on
+a host**. Select a prepared host (or prepare a new host), continue to placement,
+choose an unused Data port, check prerequisites, and confirm.
+The new follower inherits the cluster's exact release, workers, file size, and
+service lifecycle. A host already in the cluster keeps its saved SSH user and
+cluster IP. Selecting its prepared inventory entry can replace legacy login
+paths with Admin’s managed key after host checks succeed.
+Admin waits for native population/projection/health convergence before marking
+addition complete.
+
+To attach an already-running replica, start a Data process with a fresh file, its stable
 40-character node ID, and the cluster's Meta seeds. In **Topology**, choose
 **Add replica** for an existing group and enter the ID and tagged client
 endpoint. The CLI equivalent is:
@@ -168,7 +347,9 @@ lavik-ctl --socket /private/path/admin/admin.sock \
 ```
 
 Removal checks the reviewed membership revision and rejects the current
-Owner or an active failover. It retains the host and data files. Completion
+Owner or an active failover. It retains the process, host, and data files.
+After completion, stop and disable an unused provisioned service separately
+with `systemctl --user disable --now lavik-NAME-NODE.service` on its host. Completion
 means the node is unassigned and remaining group members have converged; the
 removed node is not counted in readiness. A later re-add creates a new
 membership incarnation and synchronizes the population again.
@@ -208,8 +389,12 @@ possibly committed mutation. **Retry original request**, or
 `fleet-resume NAME OPERATION_ID`, preserves the original identity, deadline,
 and removal revision. An expired deadline or changed membership requires a
 new reviewed request.
-Creation requests are observed through their retained Meta root and cannot be
-resubmitted with the generic retry control.
+Cluster creation is observed through its retained Meta root. For SSH setup,
+**Retry original request** can continue interrupted installation/service startup
+using the same owned paths and node IDs. After the creation checkpoint it only
+observes Meta; it never resubmits an uncertain Genesis. Diagnose Meta startup
+failures through the per-node service logs. No automatic rollback deletes host
+files or stops services when a deployment is interrupted.
 
 An idle uncertain replica request can be abandoned with **Abandon request**
 or `fleet-abandon NAME OPERATION_ID`. This terminalizes its generic Meta
@@ -218,6 +403,14 @@ an assignment or restore a removed replica. Creation and controlled failover
 remain Meta-owned and must be diagnosed through their normal workflows.
 
 Keep the Admin persistent volume as well as every cluster's Meta/Data state.
+The `releases/` cache retains verified archives by digest, so a follower can
+use the original nightly after its GitHub assets have moved. Do not delete
+archives still referenced by deployments. Only used host architectures are
+necessarily cached; adding a different architecture after a nightly moves
+requires the original checksummed archive in the cache. Loss of that archive
+must fail safely rather than deploy a different binary. Include the managed
+`ssh/` identity and trust store in workspace backups. Legacy plans referencing
+external SSH files also need protected backups of those files.
 For a consistent simple backup, stop Admin, copy its complete private data
 directory including SQLite sidecar files, then restart it. Restore the directory
 with its original permissions. Do not edit the database directly or run two
@@ -225,6 +418,32 @@ Admin instances against one directory. Stopping Admin does not stop Data or
 Meta; an already committed membership change continues converging there.
 
 ## Local Mac verification with Docker
+
+The SSH provisioning test runs Admin natively on the Mac and creates three
+isolated Ubuntu SSH containers. It tests password/private-key/encrypted-key
+onboarding, preserved authorized keys, credential-free persistence, and changed
+host-key rejection. It downloads official nightly and beta binaries,
+creates two independent clusters, checks data/metrics, provisions and removes
+a follower, changes primary, checks shared CLI state, restarts Admin, and can
+complete a third deployment in Chromium. Only its own temporary containers,
+network, keys, and workspace are removed on exit.
+
+```sh
+docker build -f admin/test/ssh/Dockerfile -t lavik-admin-ssh-test:local .
+(cd admin && npm ci && npx playwright install chromium)
+node --test admin/test/*.test.mjs
+python3 admin/test/remote_test.py
+LAVIK_ADMIN_TEST_BROWSER=1 node admin/test/ssh-smoke.mjs
+```
+
+`LAVIK_ADMIN_TEST_RELEASE_CACHE` optionally retains downloads across runs.
+`LAVIK_ADMIN_KEEP_TEST=1` retains the isolated fixture for diagnosis. Containers
+use development-process supervision; remote helper tests cover the generated
+systemd service and pristine-versus-recovered Meta startup contract. Docker
+verification does not claim a full host reboot/systemd integration test.
+
+The source-build suite below additionally exercises direct, non-SSH connections.
+
 
 The test toolchain runs ARM64 Linux on Docker Desktop and compiles current
 source. Its isolated container needs `seccomp=unconfined` for Linux io_uring;

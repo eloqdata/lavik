@@ -46,7 +46,7 @@ fi
 
 packages=(
   build-essential gcc-13 g++-13 cmake ninja-build git
-  pkg-config python3 libssl-dev golang-go
+  pkg-config python3 libssl-dev golang-go curl ca-certificates xz-utils
 )
 if "$with_bypass"; then
   packages+=(

@@ -110,6 +110,16 @@ jobs:
             test -s "$package_dir/$notice"
           done
           test ! -e "$package_dir/OPENSSL-LICENSE.txt"
+          test -x "$package_dir/lavik-admin"
+          test -x "$package_dir/runtime/bin/node"
+          test -s "$package_dir/runtime/LICENSE"
+          test -s "$package_dir/admin/server.mjs"
+          test -s "$package_dir/admin/public/setup.js"
+          "$package_dir/lavik-admin" --help
+          "$package_dir/runtime/bin/node" --check "$package_dir/admin/server.mjs"
+          "$package_dir/runtime/bin/node" --test ../admin/test/*.test.mjs
+          python3 ../admin/test/remote_test.py
+          "$package_dir/runtime/bin/node" ../admin/test/package-smoke.mjs "$package_dir"
           grep -Fq 'Upstream-Name: OpenSSL' "$package_dir/THIRD_PARTY_NOTICES"
           grep -Fq 'go.etcd.io/raft/v3@' "$package_dir/THIRD_PARTY_NOTICES"
           if [[ "$LAVIK_PACKAGE_KERNEL_BYPASS" == ON ]]; then
@@ -197,7 +207,9 @@ jobs:
           cat > notes.md <<'EOF'
           Automated Ubuntu 24.04 / GCC 13 build of main.
 
-          All packages include lavik, lavik-meta, lavik-ctl, LICENSE and notices.
+          All packages include lavik, lavik-meta, lavik-ctl, Lavik Admin,
+          its Node.js runtime, LICENSE and notices. Run ./lavik-admin and open
+          http://localhost:4173 to deploy and manage clusters over SSH.
           - Standard: DPDK/SPDK included; x86-64-v2 or ARMv8-A+CRC32 required.
           - Minimal: kernel TCP/io_uring only; compiler-default CPU target.
 
@@ -268,7 +280,9 @@ jobs:
           cat > notes.md <<'EOF'
           Ubuntu 24.04 / GCC 13 release build.
 
-          All packages include lavik, lavik-meta, lavik-ctl, LICENSE and notices.
+          All packages include lavik, lavik-meta, lavik-ctl, Lavik Admin,
+          its Node.js runtime, LICENSE and notices. Run ./lavik-admin and open
+          http://localhost:4173 to deploy and manage clusters over SSH.
           - Standard: DPDK/SPDK included; x86-64-v2 or ARMv8-A+CRC32 required.
           - Minimal: kernel TCP/io_uring only; compiler-default CPU target.
 

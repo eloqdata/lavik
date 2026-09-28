@@ -159,6 +159,7 @@ python3 "$REPO_ROOT/scripts/package_notices.py" \
   --build-dir "$BUILD_DIR" --output "$STAGE_DIR/THIRD_PARTY_NOTICES"
 printf '%s\n' "$VERSION" >"$STAGE_DIR/VERSION"
 printf '%s\n' "$REVISION" >"$STAGE_DIR/REVISION"
+bash "$REPO_ROOT/scripts/package_admin.sh" "$STAGE_DIR"
 
 cmake -E make_directory "$OUTPUT_DIR"
 tar -C "$BUILD_DIR" -czf "$ARCHIVE" "$PACKAGE_NAME"

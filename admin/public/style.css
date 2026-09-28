@@ -867,3 +867,17 @@ dialog textarea {
     grid-template-columns:1fr;
   }
 }
+/* Setup drafts live outside the polling dashboard and remain usable on phones. */
+.setup-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.setup-grid input, .setup-grid select { width: 100%; box-sizing: border-box; }
+.setup-host { border: 1px solid #dfe5ed; border-radius: 10px; padding: 20px; margin: 18px 0; }
+.setup-form details { margin: 24px 0; }
+.setup-form summary { cursor: pointer; font-weight: 600; padding: 12px 0; }
+.setup-form pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f3f6fa; padding: 14px; border-radius: 8px; }
+.setup-steps { display: flex; gap: 24px; list-style: none; padding: 0; margin: 0 0 24px; color: #596579; }
+.setup-steps .active { color: #17684b; font-weight: 600; }
+@media (max-width: 700px) { .setup-grid { grid-template-columns: 1fr; } .setup-steps { gap: 12px; font-size: 12px; } }
+
+.prepared-host { display: flex; flex-direction: row; align-items: center; gap: 12px; padding: 12px 0; }
+.prepared-host input { width: auto; }
+.prepared-host small { display: block; margin-top: 4px; }

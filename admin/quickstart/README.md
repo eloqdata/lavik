@@ -76,7 +76,7 @@ together in `compose.yaml`, `start.sh`, and `cluster.toml` before first startup.
 
 ## 3. Initialize the cluster in the UI
 
-1. Click **Connect cluster**.
+1. Click **Connect existing cluster**.
 2. Enter cluster name **demo**.
 3. Enter Meta seeds **172.29.91.11:7200,172.29.91.12:7200,172.29.91.13:7200**.
 4. Select the **default** profile and click **Connect cluster**.

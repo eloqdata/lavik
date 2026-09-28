@@ -40,7 +40,8 @@ or safety boundaries.
 | [Meta control plane](meta-control-plane.md) | Creating the first multi-Group cluster, running and diagnosing controlled failover, starting plaintext or mTLS Meta clusters, changing membership, replacing binaries, handling snapshot/WAL incidents, and exporting audit or operation archives |
 | [Network IRQ affinity tuning](irq-affinity-tuning.md) | Measuring or changing host IRQ placement for latency tuning |
 | [Monitoring stack](../../deploy/monitoring/README.md) | Running the repository's Prometheus and Grafana deployment |
-| [Lavik Admin](lavik-admin.md) | Running the browser/CLI fleet workspace, connecting clusters, resizing replicas, and verifying it locally with Docker |
+| [Lavik Admin](lavik-admin.md) | Starting the bundled Admin, preparing SSH hosts, deploying releases, managing multiple clusters, resizing followers, and Docker verification |
+| [Lavik Admin 101 on Mac](lavik-admin-mac-101.md) | Start empty Docker SSH hosts, prepare passwordless access in Admin, choose Meta/primary/follower placement, and deploy from the browser |
 | [Three-node Admin quick start](../../admin/quickstart/README.md) | Starting one primary, two replicas, three Meta voters, and Admin in Docker, then initializing the cluster in the browser |
 
 ## Maintenance

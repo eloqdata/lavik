@@ -1,4 +1,5 @@
 // Copyright (C) 2026 EloqData Inc. Licensed under the Apache License, Version 2.0.
+import { setup } from "./setup.js";
 const $ = (selector) => document.querySelector(selector);
 const escape = (value) =>
   String(value ?? "").replace(
@@ -171,6 +172,20 @@ function navigate(page, cluster) {
   state.generation++;
   state.forceRefresh = true;
   shell();
+  if (page === "setup" || page === "setup-follower") {
+    void setup(
+      $("#content"),
+      api,
+      async (id) => {
+        state.clusters = await api("/clusters");
+        navigate("operations", id);
+      },
+      page === "setup-follower"
+        ? { cluster: state.cluster, group: state.setupGroup }
+        : {},
+    );
+    return;
+  }
   $("#content").innerHTML =
     '<div class="spinner">Connecting to your cluster…</div>';
   refresh(true).catch((error) => showError(error));
@@ -193,7 +208,8 @@ function heading(title, subtitle, actions = "") {
   )}</p></div><div class="actions">${actions}</div></div>`;
 }
 async function refresh(force = false) {
-  if (state.page === "login" || refresh.busy) return;
+  if (["login", "setup", "setup-follower"].includes(state.page) || refresh.busy)
+    return;
   force ||= state.forceRefresh;
   state.forceRefresh = false;
   refresh.busy = true;
@@ -218,6 +234,11 @@ async function refresh(force = false) {
       return;
     }
     const clusterId = state.cluster;
+    if (state.page === "operations") {
+      const operations = await api(`/clusters/${clusterId}/operations`);
+      if (generation === state.generation) renderOperations(operations);
+      return;
+    }
     const view = await api(`/clusters/${clusterId}${force ? "?fresh=1" : ""}`);
     if (generation !== state.generation) return;
     state.views[clusterId] = view;
@@ -262,7 +283,7 @@ function renderFleet() {
   $("#content").innerHTML = `${heading(
     "Your clusters",
     "One place to monitor, explore, and manage your Lavik fleet.",
-    '<button class="primary" id="connect">＋ Connect cluster</button>',
+    '<button id="connect">Connect existing cluster</button><button class="primary" id="setup-new">＋ Create cluster</button>',
   )}<div class="stats">${stat(
     "Connected clusters",
     state.clusters.length,
@@ -307,17 +328,23 @@ function renderFleet() {
           .join("")}</div>`
       : `<div class="panel">${empty(
           "Your workspace is ready",
-          "Connect a Lavik Meta endpoint to see cluster health, topology, data, and operations.",
-          '<button class="primary" id="connect-empty">Connect your first cluster</button>',
+          "Start with your Linux hosts. Choose a release and let Admin install and initialize your first cluster.",
+          '<button class="primary" id="setup-empty">Create your first cluster</button>',
         )}</div>`
   }<div class="banner">Connections registered from <code>lavik-ctl</code> appear here automatically. Cluster changes use the same Meta state and operation IDs.</div>`;
   $("#connect").onclick = connectDialog;
+  $("#setup-new").onclick = () => navigate("setup");
+  if ($("#setup-empty")) $("#setup-empty").onclick = () => navigate("setup");
   if ($("#connect-empty")) $("#connect-empty").onclick = connectDialog;
   document
     .querySelectorAll("[data-open]")
     .forEach(
       (button) =>
-        (button.onclick = () => navigate("dashboard", button.dataset.open)),
+        (button.onclick = () =>
+          navigate(
+            state.errors[button.dataset.open] ? "operations" : "dashboard",
+            button.dataset.open,
+          )),
     );
 }
 function readiness(view) {
@@ -447,13 +474,16 @@ function nodeBox(node, owner, group) {
   }</footer></div>`;
 }
 function renderTopology(view) {
+  const legacy = view.deployment?.modern === false;
   $("#content").innerHTML = `${heading(
     "Cluster topology",
     "Primary groups, replicas, and slot ownership.",
     '<button id="refresh-topology">↻ Refresh</button>',
-  )}${readiness(
-    view,
-  )}<div class="banner">Add already-running nodes as replicas or remove replicas to adjust redundancy. Adding primary groups and redistributing key slots requires a data-migration workflow and is not available yet.</div>${
+  )}${readiness(view)}${
+    legacy
+      ? '<div class="banner warn">This release supports setup, data tools, and monitoring. Follower changes and controlled failover need a newer Lavik release with safe membership APIs.</div>'
+      : ""
+  }<div class="banner">Add followers on your hosts or attach already-running nodes; remove followers to adjust redundancy. Adding primary groups and redistributing key slots requires a data-migration workflow and is not available yet.</div>${
     view.status.groups.length
       ? view.status.groups
           .map((g) => {
@@ -505,6 +535,12 @@ function renderTopology(view) {
         )}</td></tr>`,
     ),
   )}</section>`;
+  if (legacy)
+    document
+      .querySelectorAll("[data-add], [data-remove], [data-failover]")
+      .forEach((button) => {
+        button.disabled = true;
+      });
   $("#refresh-topology").onclick = () => refresh(true).catch(showError);
   if ($("#initialize")) $("#initialize").onclick = createDialog;
   document
@@ -1034,6 +1070,26 @@ function operationDialog(kind, input, title, description) {
   );
 }
 function replicaDialog(group) {
+  if (state.views[state.cluster]?.deployment) {
+    dialog(
+      "Add a follower",
+      "Deploy a new follower over SSH, or attach a node you already started.",
+      '<button type="button" class="primary" id="provision-follower">Deploy on a host</button>',
+      async () => {
+        setTimeout(() => runningReplicaDialog(group), 0);
+      },
+      "Use an already-running node",
+    );
+    $("#provision-follower").onclick = () => {
+      $("#dialog").close();
+      state.setupGroup = group;
+      navigate("setup-follower");
+    };
+    return;
+  }
+  runningReplicaDialog(group);
+}
+function runningReplicaDialog(group) {
   let retained = null;
   dialog(
     "Add a replica",

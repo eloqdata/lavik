@@ -19,7 +19,11 @@ test("HTTP and CLI share durable catalog, enforce login and reject cross-origin 
     const token = (await readFile(app.tokenPath, "utf8")).trim();
     const login = await fetch(base + "/api/login", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Lavik-Admin": "1" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Lavik-Admin": "1",
+        Origin: base,
+      },
       body: JSON.stringify({ token }),
     });
     assert.equal(login.status, 200);
@@ -100,3 +104,184 @@ test("an unsupported durable schema fails startup and releases its socket", asyn
     await rm(directory, { recursive: true });
   }
 });
+
+test("CLI-reviewed setup deploys through HTTP into the same catalog and operation journal", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "lavik-shared-setup-"));
+  const app = await start({
+    directory,
+    port: 0,
+    meta: new Meta("/nonexistent"),
+    deploymentOptions: {
+      ssh: {
+        async call() {
+          return { ok: true, errors: [], arch: "aarch64" };
+        },
+      },
+      releases: {
+        async resolve() {
+          return {
+            tag: "nightly",
+            assets: { aarch64: { sha256: "a".repeat(64) } },
+          };
+        },
+      },
+    },
+  });
+  app.fleet.tick = async () => {};
+  const cli = (command) =>
+    new Promise((resolve, reject) => {
+      const socket = net.connect(app.socketPath);
+      let reply = "";
+      socket.on("connect", () => socket.write(command + "\n"));
+      socket.on("data", (chunk) => {
+        reply += chunk;
+      });
+      socket.on("end", () => {
+        try {
+          assert.match(reply, /^OK /);
+          resolve(JSON.parse(reply.slice(3)));
+        } catch (error) {
+          reject(error);
+        }
+      });
+      socket.on("error", reject);
+    });
+  try {
+    const base = `http://127.0.0.1:${app.server.address().port}`;
+    const input = {
+      id: "shared",
+      hosts: [{ host: "127.0.0.1", user: "ubuntu" }],
+    };
+    assert.equal(
+      (
+        await fetch(base + "/api/setup/preview", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Lavik-Admin": "1" },
+          body: JSON.stringify(input),
+        })
+      ).status,
+      401,
+    );
+    const preview = await cli(
+      "fleet-plan " + Buffer.from(JSON.stringify(input)).toString("base64url"),
+    );
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Lavik-Admin": "1",
+      Origin: base,
+    };
+    const login = await fetch(base + "/api/login", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        token: (await readFile(app.tokenPath, "utf8")).trim(),
+      }),
+    });
+    headers.Cookie = login.headers.get("set-cookie").split(";")[0];
+    await app.store.query(
+      "INSERT INTO hosts VALUES(?,?,?)",
+      [
+        "host-one",
+        JSON.stringify({
+          id: "host-one",
+          host: "example.com",
+          user: "ubuntu",
+          port: 22,
+          identityFile: "/private/admin-key",
+          knownHostsFile: "/private/admin-trust",
+        }),
+        new Date().toISOString(),
+      ],
+      "run",
+    );
+    assert.equal((await cli("fleet-hosts"))[0].id, "host-one");
+    const fromInventory = await fetch(base + "/api/setup/preview", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        id: "from-inventory",
+        hosts: [{ hostId: "host-one", address: "10.0.0.1" }],
+      }),
+    });
+    const inventoryPreview = await fromInventory.json();
+    assert.equal(fromInventory.status, 200, JSON.stringify(inventoryPreview));
+    assert.equal(inventoryPreview.hosts[0].identityFile, "/private/admin-key");
+    assert.equal(inventoryPreview.hosts[0].address, "10.0.0.1");
+    const crossOriginPrepare = await fetch(base + "/api/hosts/prepare", {
+      method: "POST",
+      headers: { ...headers, Origin: "https://attacker.invalid" },
+      body: "{}",
+    });
+    assert.equal(crossOriginPrepare.status, 403);
+    const deployed = await fetch(base + "/api/setup/deploy", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ token: preview.token, confirm: "shared" }),
+    });
+    assert.equal(deployed.status, 200);
+    const job = await deployed.json();
+    assert.equal((await cli("fleet-list"))[0].id, "shared");
+    assert.equal((await cli("fleet-operations shared")).jobs[0].id, job.id);
+    const retained = await (
+      await fetch(base + "/api/clusters/shared/deployment", { headers })
+    ).json();
+    assert.equal(retained.release.assets.aarch64.sha256, "a".repeat(64));
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+for (const version of [1, 2])
+  test(`version-${version} catalogs retain clusters and history when host storage is added`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "lavik-catalog-migration-"));
+    let app;
+    try {
+      app = await start({ directory, port: 0, meta: new Meta("/nonexistent") });
+      await app.fleet.add({ id: "retained", seeds: ["127.0.0.1:7200"] });
+      await app.close();
+      app = null;
+      const old = new DatabaseSync(join(directory, "fleet.sqlite"));
+      old.exec(
+        `${
+          version === 1 ? "DROP TABLE deployments;" : ""
+        } DROP TABLE hosts; PRAGMA user_version=${version}`,
+      );
+      old
+        .prepare("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?)")
+        .run(
+          "saved-job",
+          "retained",
+          "replica-add",
+          "{}",
+          "completed",
+          "completed",
+          "history",
+          null,
+          "2026-01-01",
+          "2026-01-01",
+        );
+      old.close();
+      app = await start({ directory, port: 0, meta: new Meta("/nonexistent") });
+      assert.equal((await app.fleet.clusters())[0].id, "retained");
+      assert.equal(
+        (
+          await app.store.query(
+            "SELECT detail FROM jobs WHERE id='saved-job'",
+            [],
+            "get",
+          )
+        ).detail,
+        "history",
+      );
+      assert.deepEqual(await app.store.query("SELECT * FROM deployments"), []);
+      assert.deepEqual(await app.store.query("SELECT * FROM hosts"), []);
+      assert.equal(
+        (await app.store.query("PRAGMA user_version", [], "get")).user_version,
+        3,
+      );
+    } finally {
+      if (app) await app.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });

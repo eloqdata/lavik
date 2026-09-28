@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+bundle=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+admin_dir="$bundle/admin"
+if [[ -f "$bundle/server.mjs" ]]; then
+  admin_dir=$bundle
+  bundle=$(cd "$bundle/.." && pwd)
+fi
+case "${1:-}" in
+  --help|-h)
+    cat <<'EOF'
+Usage: ./lavik-admin [ctl FLEET_COMMAND [ARGUMENT...]]
+
+Open http://localhost:4173 and sign in with the token printed at startup.
+Use Create cluster to prepare passwordless SSH and deploy to existing Linux hosts.
+Data and Meta run on those hosts; closing Admin does not stop a cluster.
+
+Environment:
+  LAVIK_ADMIN_DATA   Persistent private workspace (default ~/.local/share/lavik-admin)
+  LAVIK_ADMIN_PORT   Local HTTP port (default 4173)
+  LAVIK_ADMIN_BIND   Listen address (default 127.0.0.1)
+  LAVIK_CTL         Optional local lavik-ctl for manually connected clusters
+
+Linux uses the bundled Node runtime. macOS requires Node.js 24.15+ and SSH.
+The ctl helper speaks the same private socket protocol as lavik-ctl:
+  ./lavik-admin ctl fleet-hosts
+  ./lavik-admin ctl fleet-list
+  ./lavik-admin ctl fleet-plan ./setup.json
+  ./lavik-admin ctl fleet-deploy REVIEW_TOKEN CLUSTER_NAME
+EOF
+    exit 0 ;;
+  --version)
+    printf 'Lavik Admin '
+    if [[ -f "$bundle/VERSION" ]]; then cat "$bundle/VERSION"; else echo '(source checkout)'; fi
+    exit 0 ;;
+esac
+if [[ $(uname -s) == Linux && -x "$bundle/runtime/bin/node" ]]; then
+  node_bin="$bundle/runtime/bin/node"
+else
+  node_bin=$(command -v node || true)
+  [[ -n $node_bin ]] || { echo 'Install Node.js 24.15+ to run Lavik Admin on this platform.' >&2; exit 1; }
+fi
+"$node_bin" -e 'const [major,minor] = process.versions.node.split(".").map(Number); if(major < 24 || (major === 24 && minor < 15)) { console.error("Lavik Admin needs Node.js 24.15+"); process.exit(1); }'
+export LAVIK_ADMIN_DATA=${LAVIK_ADMIN_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/lavik-admin}
+export LAVIK_CTL=${LAVIK_CTL:-$bundle/lavik-ctl}
+if [[ ${1:-} == ctl ]]; then
+  shift
+  exec "$node_bin" "$admin_dir/cli.mjs" "$@"
+fi
+[[ $# == 0 ]] || { echo 'Use --help for launcher options.' >&2; exit 1; }
+export LAVIK_ADMIN_SHOW_TOKEN=1
+exec "$node_bin" "$admin_dir/server.mjs"
