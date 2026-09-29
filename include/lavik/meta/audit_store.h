@@ -57,8 +57,10 @@
 // encoding.h; decode failures are MetaFailureClass::kFailStop. Decoding checks
 // field bounds and strictly increasing indexes above the prune floor.
 
+#include <atomic>
 #include <cstdint>
-#include <map>
+#include <deque>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -101,6 +103,12 @@ class MetaAuditStore {
       std::uint32_t window_capacity = kMaxMetaAuditWindowRecords)
       : window_capacity_(window_capacity) {}
 
+  // Copies retain an independent committed cut while sharing record pages.
+  MetaAuditStore(const MetaAuditStore& other);
+  MetaAuditStore& operator=(const MetaAuditStore& other);
+  MetaAuditStore(MetaAuditStore&& other) noexcept;
+  MetaAuditStore& operator=(MetaAuditStore&& other) noexcept;
+
   // Appends the record for its log_index_. Idempotent no-op when the index is
   // already present with identical content. Returns kDomainReject when a field
   // exceeds its cap. FAILS STOP on: same index with different content, an
@@ -114,7 +122,7 @@ class MetaAuditStore {
   MetaAuditPolicy policy() const { return policy_; }
 
   std::optional<MetaAuditRecord> Find(std::uint64_t log_index) const;
-  std::size_t size() const { return window_.size(); }
+  std::size_t size() const { return record_count_; }
   std::uint32_t capacity() const { return window_capacity_; }
 
   // Full-window state gated by the coordinator's Propose layer: privileged
@@ -122,7 +130,7 @@ class MetaAuditStore {
   // records.
   bool NeedsExport() const {
     return policy_ == MetaAuditPolicy::kStrictExport &&
-           window_.size() >= window_capacity_;
+           record_count_ >= window_capacity_;
   }
 
   std::uint64_t dropped_total() const { return dropped_total_; }
@@ -155,9 +163,28 @@ class MetaAuditStore {
 
  private:
   void WriteSnapshot(MetaWriter& writer) const;
+  const MetaAuditRecord* FindRecord(std::uint64_t log_index) const;
+  void AppendUnchecked(const MetaAuditRecord& record);
+  void DropFront();
+  void Swap(MetaAuditStore& other) noexcept;
+  using Records = std::deque<MetaAuditRecord>;
+  struct Page {
+    Page() = default;
+    explicit Page(const Records& records) : records_(records) {}
+    Records records_;
+    // Publishing a copy seals a page forever. A refcount returning to one
+    // does not synchronize with former readers on other threads.
+    std::atomic<bool> sealed_{false};
+  };
+  Records& WritablePage(std::size_t index);
+  // Only the first/last page can change: audit records append monotonically
+  // and pruning removes a prefix. Published pages detach before mutation, so a
+  // retained committed view never observes later apply or snapshot changes.
+  static constexpr std::size_t kRecordsPerPage = 128;
+  std::vector<std::shared_ptr<Page>> pages_;
+  std::size_t record_count_ = 0;
   std::uint32_t window_capacity_;
   MetaAuditPolicy policy_ = MetaAuditPolicy::kBoundedRotate;
-  std::map<std::uint64_t, MetaAuditRecord> window_;  // keyed by log index
   std::uint64_t pruned_floor_ = 0;  // highest pruned log index (0 = none)
   // Automatic bounded-rotate loss is distinct from an operator-confirmed
   // prune. These fields let status/export surface an archival gap.

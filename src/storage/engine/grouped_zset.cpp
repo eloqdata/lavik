@@ -484,6 +484,10 @@ absl::StatusOr<MemoryReservation> ReserveInputs(
   const auto count = operation.kind_ == SortedSetOperationKind::kAdd
                          ? operation.entries_.size()
                          : operation.members_.size();
+  // Empty member inputs construct no map entries. In particular, do not
+  // deny range removal's bounded compact workspace at maxmemory just for
+  // the scratch budget's fixed overhead.
+  if (count == 0) return MemoryReservation{};
   if (count > std::numeric_limits<std::size_t>::max() / 512)
     return absl::ResourceExhaustedError("Sorted Set input size overflow");
   GroupedScratchBudget budget;
@@ -633,24 +637,30 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
     std::optional<MemoryReservation> compact_admission;
     auto callback = [&](std::optional<CompactValueView> value)
         -> absl::StatusOr<CompactValueUpdate> {
-      GroupedScratchBudget budget;
-      auto status = budget.AddBytes(value ? value->encoded_.size() : 0);
-      if (!status.ok()) return status;
-      for (const auto& entry : operation.entries_) {
-        status = budget.AddBytes(entry.member_.size() + 256);
+      // ExecuteCompactLocked owns decode/re-encode admission, including the
+      // bounded inline workspace that lets shrinking commands run at
+      // maxmemory. Range removal adds no input members or retained reply;
+      // larger/indirect/external values still pass that layer's admission.
+      if (operation.kind_ != SortedSetOperationKind::kRemoveRange) {
+        GroupedScratchBudget budget;
+        auto status = budget.AddBytes(value ? value->encoded_.size() : 0);
         if (!status.ok()) return status;
+        for (const auto& entry : operation.entries_) {
+          status = budget.AddBytes(entry.member_.size() + 256);
+          if (!status.ok()) return status;
+        }
+        if (value) {
+          if (value->logical_size_ >
+              std::numeric_limits<std::size_t>::max() / 256)
+            return absl::ResourceExhaustedError(
+                "Sorted Set compact count overflow");
+          status = budget.AddBytes(value->logical_size_ * 256);
+          if (!status.ok()) return status;
+        }
+        auto admission = budget.Reserve(4);
+        if (!admission.ok()) return admission.status();
+        compact_admission.emplace(std::move(*admission));
       }
-      if (value) {
-        if (value->logical_size_ >
-            std::numeric_limits<std::size_t>::max() / 256)
-          return absl::ResourceExhaustedError(
-              "Sorted Set compact count overflow");
-        status = budget.AddBytes(value->logical_size_ * 256);
-        if (!status.ok()) return status;
-      }
-      auto admission = budget.Reserve(4);
-      if (!admission.ok()) return admission.status();
-      compact_admission.emplace(std::move(*admission));
       std::vector<OrderedCollectionEntry> entries;
       if (value) {
         auto decoded =
@@ -754,7 +764,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
           found->second.before_ = found->second.after_ = entry.score_;
         }
       }
-      status = ApplyInputs(operation, &members, &result);
+      auto status = ApplyInputs(operation, &members, &result);
       if (!status.ok()) return status;
       if (ReadOnly(operation) || result.changed_ == 0)
         return CompactValueUpdate{};

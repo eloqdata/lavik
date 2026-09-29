@@ -26,6 +26,8 @@
 
 #include <cstdint>
 #include <string>
+#include <thread>
+#include <utility>
 
 #include "absl/status/status.h"
 #include "gtest/gtest.h"
@@ -276,6 +278,145 @@ TEST(MetaAuditStore, SerializationRoundTripPreservesWindow) {
   ASSERT_TRUE(restored->Append(MakeAuditRecord(4)).ok());
   ASSERT_TRUE(store.Append(MakeAuditRecord(4)).ok());
   EXPECT_EQ(restored->Serialize(), store.Serialize());
+}
+
+TEST(MetaAuditStore, CopiesRetainIndependentWindowsAcrossRotationAndPruning) {
+  MetaAuditStore live(513);
+  for (std::uint64_t i = 1; i <= 513; ++i)
+    ASSERT_TRUE(live.Append(MakeAuditRecord(i * 3)).ok());
+  const MetaAuditStore original = live;
+  const auto original_bytes = original.Serialize();
+  ASSERT_TRUE(original_bytes.ok());
+  for (std::uint64_t i = 514; i <= 900; ++i)
+    ASSERT_TRUE(live.Append(MakeAuditRecord(i * 3)).ok());
+  EXPECT_EQ(live.size(), 513);
+  EXPECT_EQ(live.dropped_total(), 387);
+  EXPECT_EQ(live.dropped_through(), 387 * 3);
+  EXPECT_FALSE(live.Find(387 * 3));
+  EXPECT_TRUE(live.Find(388 * 3));
+  EXPECT_EQ(original.Serialize(), original_bytes);
+
+  auto branch = live;
+  const auto live_bytes = live.Serialize();
+  ASSERT_TRUE(branch.PruneThrough(700 * 3).ok());
+  EXPECT_EQ(branch.size(), 200);
+  EXPECT_FALSE(branch.Find(700 * 3));
+  EXPECT_EQ(branch.Find(701 * 3), MakeAuditRecord(701 * 3));
+  EXPECT_FALSE(branch.Find(701 * 3 + 1));
+  EXPECT_EQ(live.Serialize(), live_bytes);
+  EXPECT_EQ(original.Serialize(), original_bytes);
+  ASSERT_TRUE(branch.Append(MakeAuditRecord(901 * 3, "branch")).ok());
+  ASSERT_TRUE(live.Append(MakeAuditRecord(901 * 3, "live")).ok());
+  EXPECT_NE(branch.Find(901 * 3), live.Find(901 * 3));
+  ASSERT_TRUE(branch.PruneThrough(901 * 3).ok());
+  EXPECT_EQ(branch.size(), 0);
+  ASSERT_TRUE(branch.Append(MakeAuditRecord(902 * 3)).ok());
+  EXPECT_EQ(branch.size(), 1);
+  EXPECT_EQ(original.Serialize(), original_bytes);
+}
+
+TEST(MetaAuditStore, RetainedCopyCanBeReadWhileOriginalChanges) {
+  MetaAuditStore live(513);
+  for (std::uint64_t i = 1; i <= 513; ++i)
+    ASSERT_TRUE(live.Append(MakeAuditRecord(i)).ok());
+  const auto retained = live;
+  const auto expected = retained.Serialize();
+  ASSERT_TRUE(expected.ok());
+  std::thread reader([&] {
+    for (int i = 0; i < 30; ++i) EXPECT_EQ(retained.Serialize(), expected);
+  });
+  for (std::uint64_t i = 514; i <= 1100; ++i)
+    EXPECT_TRUE(live.Append(MakeAuditRecord(i)).ok());
+  EXPECT_TRUE(live.PruneThrough(1000).ok());
+  reader.join();
+  EXPECT_EQ(retained.Serialize(), expected);
+}
+
+TEST(MetaAuditStore, ConcurrentCopiesOfConstStoreRemainIndependent) {
+  const auto source = [] {
+    MetaAuditStore store;
+    for (std::uint64_t i = 1; i <= 513; ++i)
+      EXPECT_TRUE(store.Append(MakeAuditRecord(i)).ok());
+    return store;
+  }();
+  const auto expected = source.Serialize();
+  ASSERT_TRUE(expected.ok());
+  const auto copy_and_mutate = [&] {
+    for (int i = 0; i < 10; ++i) {
+      auto copy = source;
+      EXPECT_TRUE(copy.PruneThrough(200).ok());
+      EXPECT_TRUE(copy.Append(MakeAuditRecord(514)).ok());
+      EXPECT_EQ(copy.size(), 314u);
+      EXPECT_EQ(source.Serialize(), expected);
+    }
+  };
+  std::thread first(copy_and_mutate);
+  std::thread second(copy_and_mutate);
+  first.join();
+  second.join();
+  EXPECT_EQ(source.Serialize(), expected);
+}
+
+TEST(MetaAuditStore, MultiPageSnapshotKeepsCanonicalFlatEncoding) {
+  MetaAuditStore store(513);
+  for (std::uint64_t i = 1; i <= 600; ++i)
+    ASSERT_TRUE(store.Append(MakeAuditRecord(i * 2)).ok());
+  ASSERT_TRUE(store.PruneThrough(200 * 2).ok());
+  // Construct the established wire layout independently of page traversal.
+  lavik::meta::MetaWriter expected;
+  expected.WriteU16(lavik::meta::kMetaFormatVersion);
+  expected.WriteU64(400);
+  expected.WriteU8(static_cast<std::uint8_t>(MetaAuditPolicy::kBoundedRotate));
+  expected.WriteU64(87);
+  expected.WriteU64(174);
+  expected.WriteCount(400);
+  for (std::uint64_t i = 201; i <= 600; ++i) {
+    const auto r = MakeAuditRecord(i * 2);
+    expected.WriteU64(r.log_index_);
+    expected.WriteString(r.actor_principal_);
+    expected.WriteString(r.command_summary_);
+    expected.WriteU8(static_cast<std::uint8_t>(r.verdict_));
+    expected.WriteString(r.verdict_detail_);
+    expected.WriteString(r.readable_time_);
+  }
+  const auto bytes = expected.TakeBuffer();
+  const auto actual = store.Serialize();
+  ASSERT_TRUE(actual.ok());
+  EXPECT_EQ(*actual, bytes);
+  EXPECT_EQ(store.SerializedSize(), bytes.size());
+  auto restored = MetaAuditStore::Deserialize(bytes, 513);
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->Serialize(), actual);
+  auto exported = restored->ExportThrough(257 * 2);
+  ASSERT_TRUE(exported.ok());
+  auto records = lavik::meta::DecodeMetaAuditExport(*exported);
+  ASSERT_TRUE(records.ok());
+  ASSERT_EQ(records->records_.size(), 57);
+  EXPECT_EQ(records->records_.front(), MakeAuditRecord(201 * 2));
+  EXPECT_EQ(records->records_.back(), MakeAuditRecord(257 * 2));
+}
+
+TEST(MetaAuditStore, MoveAndCopyAssignmentPreserveWindowAndMetadata) {
+  MetaAuditStore source(129);
+  for (std::uint64_t i = 1; i <= 150; ++i)
+    ASSERT_TRUE(source.Append(MakeAuditRecord(i)).ok());
+  ASSERT_TRUE(source.PruneThrough(30).ok());
+  ASSERT_TRUE(source.SetPolicy(MetaAuditPolicy::kStrictExport).ok());
+  const auto expected = source.Serialize();
+  MetaAuditStore copied;
+  copied = source;
+  MetaAuditStore moved(std::move(source));
+  EXPECT_EQ(source.size(), 0);
+  EXPECT_FALSE(source.Find(150));
+  EXPECT_EQ(moved.Serialize(), expected);
+  MetaAuditStore assigned;
+  ASSERT_TRUE(assigned.Append(MakeAuditRecord(1)).ok());
+  assigned = std::move(moved);
+  EXPECT_EQ(moved.size(), 0);
+  EXPECT_EQ(assigned.Serialize(), expected);
+  ASSERT_TRUE(assigned.Append(MakeAuditRecord(151)).ok());
+  EXPECT_EQ(copied.Serialize(), expected);
+  EXPECT_FALSE(copied.Find(151));
 }
 
 TEST(MetaAuditStore, DeserializeRejectsMalformedEncoding) {
