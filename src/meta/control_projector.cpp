@@ -33,6 +33,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "lavik/client_endpoint.h"
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/meta/commands.h"
 #include "lavik/meta/policy_store.h"
@@ -89,14 +90,12 @@ absl::StatusOr<TaggedDataEndpoint> ParseDataEndpoint(std::string_view encoded) {
   constexpr std::string_view kTlsPrefix = "tls://";
   if (encoded.starts_with(kTcpPrefix)) {
     result.kind = DataEndpointKind::kTcp;
-    encoded.remove_prefix(kTcpPrefix.size());
   } else if (encoded.starts_with(kTlsPrefix)) {
     result.kind = DataEndpointKind::kTls;
-    encoded.remove_prefix(kTlsPrefix.size());
   }
-  auto endpoint = ParseNumericHostPort(encoded, "data endpoint");
-  if (!endpoint.ok()) return endpoint.status();
-  result.endpoint = std::move(*endpoint);
+  auto endpoint = lavik::ParseClientEndpoint(encoded);
+  if (!endpoint) return Invalid("invalid Data client endpoint");
+  result.endpoint = HostPort{endpoint->host_, endpoint->port_};
   return result;
 }
 

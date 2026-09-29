@@ -904,6 +904,18 @@ if (BUILD_TESTING)
       TIMEOUT 30
   )
 
+  if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(lavik_slow_dns_shim SHARED tests/slow_dns_shim.cpp)
+    target_link_libraries(lavik_slow_dns_shim PRIVATE ${CMAKE_DL_LIBS})
+    add_executable(lavik_async_dns_tests tests/async_dns_test.cpp)
+    target_include_directories(lavik_async_dns_tests PRIVATE include src/replication)
+    target_link_libraries(lavik_async_dns_tests PRIVATE lavik::module GTest::gtest_main)
+    add_test(NAME async_dns.nonblocking
+      COMMAND ${CMAKE_COMMAND} -E env "LD_PRELOAD=$<TARGET_FILE:lavik_slow_dns_shim>"
+        $<TARGET_FILE:lavik_async_dns_tests>)
+    set_tests_properties(async_dns.nonblocking PROPERTIES TIMEOUT 15)
+  endif()
+
   # 3-node end-to-end smoke for the meta control plane: membership changes,
   # replication, crash/restart catch-up, automatic and manual snapshots.
   find_program(LAVIK_PYTHON3_EXECUTABLE NAMES python3)
@@ -1231,6 +1243,20 @@ if (BUILD_TESTING)
               PROPERTIES LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
           endforeach()
         endforeach()
+        add_test(NAME meta_integration.hostname_recovery
+          COMMAND ${CMAKE_COMMAND} -E env "LAVIK_TEST_DATA_HOST=localhost"
+            ${LAVIK_PYTHON3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_candidate_recovery.py
+            $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>
+            --mode single --case complete)
+        add_test(NAME meta_integration.hostname_partial
+          COMMAND ${CMAKE_COMMAND} -E env "LAVIK_TEST_DATA_HOST=localhost"
+            ${LAVIK_PYTHON3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_failover.py
+            $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>
+            ${LAVIK_CLUSTER_CREATE_REDIS_CLI} --case controlled --mode single --require-fault-hook)
+        set_tests_properties(meta_integration.hostname_recovery meta_integration.hostname_partial
+          PROPERTIES LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
         set(LAVIK_FAILOVER_INTEGRATION_CASES
           controlled
           full-fallback
@@ -1422,6 +1448,17 @@ if (BUILD_TESTING)
                 ${sentinel_client_go_dir}/go.sum
         VERBATIM)
       add_custom_target(lavik_sentinel_client_go ALL DEPENDS ${sentinel_client_go_bin})
+      foreach(mode direct mapped hostname plaintext plaintext-direct handshake)
+        add_test(NAME meta_integration.sentinel_tls_${mode}
+          COMMAND ${CMAKE_COMMAND} -E env
+            "LAVIK_SENTINEL_REDIS_PY=${LAVIK_CLUSTER_CLIENT_REDIS_PY}"
+            ${LAVIK_PYTHON3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_sentinel_tls.py
+            $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>
+            ${sentinel_client_go_bin} ${mode})
+        set_tests_properties(meta_integration.sentinel_tls_${mode} PROPERTIES
+          LABELS "meta-integration;sentinel-client" TIMEOUT 480 RUN_SERIAL TRUE)
+      endforeach()
       foreach(scenario meta data expiry controlled fault gap)
         add_test(NAME meta_integration.sentinel_ha_${scenario}
           COMMAND ${CMAKE_COMMAND} -E env

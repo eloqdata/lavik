@@ -306,6 +306,31 @@ void ExpectRetracted(const MetaDiscoveryCut& cut) {
   EXPECT_EQ(master.View(), "-ERR No such master with that name\r\n");
 }
 
+TEST(MetaSentinelDiscoveryTest,
+     TlsPublicationDoesNotFallBackOrChangeAuthority) {
+  auto cut = MakeCut();
+  cut.publication_.tls_ = true;
+  EXPECT_FALSE(PublishablePrimary(cut, SoleGroup(cut)));
+  EXPECT_TRUE(SoleGroup(cut).grant_.grant_.has_value());
+  MutableCommitted(cut).data_nodes_[0].endpoints_.push_back(
+      "tls://10.0.0.1:7443");
+  auto primary = PublishablePrimary(cut, SoleGroup(cut));
+  ASSERT_TRUE(primary);
+  EXPECT_EQ(primary->endpoint_.port_, 7443);
+  MutableCommitted(cut).data_nodes_[0].endpoints_ = {
+      "tls://owner.example:7443"};
+  EXPECT_FALSE(PublishablePrimary(cut, SoleGroup(cut)));
+  cut.publication_.resolve_hostnames_ = true;
+  cut.publication_.announce_hostnames_ = true;
+  EXPECT_FALSE(PublishablePrimary(cut, SoleGroup(cut)));
+  cut.publication_.resolved_hosts_ =
+      std::make_shared<const std::map<std::string, std::string>>(
+          std::map<std::string, std::string>{{"owner.example", "10.0.0.1"}});
+  primary = PublishablePrimary(cut, SoleGroup(cut));
+  ASSERT_TRUE(primary);
+  EXPECT_EQ(primary->endpoint_.host_, "owner.example");
+}
+
 TEST(MetaSentinelDiscoveryTest, PublicationGatesRetractPrimary) {
   {  // Fenced: no active authority grant in the current term.
     MetaDiscoveryCut cut = MakeCut();
@@ -387,6 +412,48 @@ TEST(MetaSentinelDiscoveryTest, PublicationGatesRetractPrimary) {
     ASSERT_TRUE(primary.has_value());
     EXPECT_EQ(primary->endpoint_.port_, 7001);
   }
+}
+
+TEST(MetaSentinelDiscoveryTest,
+     DnsProjectionKeepsEventsAndReplicaUpstreamsConsistent) {
+  auto cut = MakeCut();
+  cut.publication_.tls_ = true;
+  cut.publication_.resolve_hostnames_ = true;
+  auto& nodes = MutableCommitted(cut).data_nodes_;
+  nodes[0].endpoints_ = {"tls://owner.example:7443"};
+  nodes[1].endpoints_ = {"tls://replica.example:7444"};
+  MetaDiscoveryEvents events;
+  EXPECT_TRUE(events.Observe(cut).empty());
+  EXPECT_FALSE(PublishablePrimary(cut, SoleGroup(cut)));
+  cut.publication_.resolved_hosts_ =
+      std::make_shared<const std::map<std::string, std::string>>(
+          std::map<std::string, std::string>{{"owner.example", "10.1.1.1"},
+                                             {"replica.example", "10.1.1.2"}});
+  EXPECT_TRUE(events.Observe(cut).empty());
+  ReplyBuilder reply;
+  EncodeDiscoveryReplicasReply(reply, cut, "g1");
+  auto list = DecodeResp(reply.View());
+  ASSERT_EQ(list.items_.size(), 1u);  // The other replica has no TLS endpoint.
+  auto fields = EntryFields(list.items_.front());
+  EXPECT_EQ(FieldText(fields, "ip"), "10.1.1.2");
+  EXPECT_EQ(FieldText(fields, "master-host"), "10.1.1.1");
+  EXPECT_EQ(FieldInt(fields, "master-port"), 7443);
+  cut.publication_.resolved_hosts_ =
+      std::make_shared<const std::map<std::string, std::string>>(
+          std::map<std::string, std::string>{{"owner.example", "10.2.1.1"},
+                                             {"replica.example", "10.2.1.2"}});
+  EXPECT_TRUE(events.Observe(cut).empty());  // DNS is not an Owner transition.
+  auto& group = MutableCommitted(cut).groups_.front();
+  group.topology_.record_.owner_ = kReplicaOneId;
+  group.grant_.grant_->owner_ = kReplicaOneId;
+  ++group.grant_.group_term_;
+  const auto messages = events.Observe(cut);
+  ASSERT_EQ(messages.size(), 1u);
+  EXPECT_EQ(messages[0].payload_, "g1 10.2.1.1 7443 10.2.1.2 7444");
+  cut.publication_.announce_hostnames_ = true;
+  const auto primary = PublishablePrimary(cut, SoleGroup(cut));
+  ASSERT_TRUE(primary);
+  EXPECT_EQ(primary->endpoint_.host_, "replica.example");
 }
 
 TEST(MetaSentinelDiscoveryTest, SwitchNotificationCrossesMasterlessWindow) {

@@ -31,6 +31,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "lavik/client_endpoint.h"
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/cluster/control_types.h"
 #include "lavik/cluster/topology.h"
@@ -166,10 +167,11 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
   for (const control::WireDataEndpoint& endpoint : desired.nodes) {
     const std::optional<NodeId> id = NodeId::Parse(endpoint.node_id);
     if (!id.has_value()) return Invalid("data node id is not canonical");
-    if (!IsCanonicalNumericHost(endpoint.host) ||
+    if ((!IsCanonicalNumericHost(endpoint.host) &&
+         !ValidClientHostname(endpoint.host)) ||
         (endpoint.port == 0 && endpoint.tls_port == 0)) {
       return Invalid(absl::StrCat("node ", endpoint.node_id,
-                                  " has no canonical numeric client endpoint"));
+                                  " has no valid client endpoint"));
     }
     const NodeIndex index = static_cast<NodeIndex>(nodes.size());
     if (!node_indices.emplace(endpoint.node_id, index).second) {

@@ -812,12 +812,21 @@ TEST(MetaControlProjector,
 TEST(MetaControlProjector,
      DurableStoreRejectsAmbiguousOrUndialableDataEndpoints) {
   const Fixture fixture = CompleteFixture();
+  MetaStores named = fixture.stores;
+  ASSERT_TRUE(ReplaceEndpoints(named, 1, {"tls://data.example:17000"}).ok());
+  const auto projection = MetaControlProjector::ProjectNode(
+      MetaCommittedView(std::move(named), 102), fixture.target);
+  ASSERT_TRUE(projection.ok()) << projection.status();
+  EXPECT_TRUE(
+      std::ranges::any_of(projection->full_state.nodes, [](const auto& node) {
+        return node.host == "data.example" && node.tls_port == 17000;
+      }));
   const std::vector<std::vector<std::string>> invalid_endpoints = {
       {},
       {"10.0.0.1:7000", "10.0.0.1:17000", "10.0.0.1:27000"},
       {"tcp://10.0.0.1:7000", "tcp://10.0.0.1:7001"},
       {"tls://10.0.0.1:0"},
-      {"tls://data.example:17000"},
+      {"tls://data..example:17000"},
       {"tcp://2001:db8::1:7000"},
       {"tcp://10.0.0.1:7000", "tls://10.0.0.2:17000"},
       {"tcp://10.0.0.1:7000", "10.0.0.1:17000"},

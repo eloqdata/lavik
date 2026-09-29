@@ -49,8 +49,14 @@ def encode(*args):
 
 
 class Client:
-    def __init__(self, port, host="127.0.0.1"):
+    def __init__(self, port, host="127.0.0.1", ssl_context=None):
         self.sock = socket.create_connection((host, port), timeout=3)
+        if ssl_context is not None:
+            try:
+                self.sock = ssl_context.wrap_socket(self.sock, server_hostname=host)
+            except BaseException:
+                self.sock.close()
+                raise
         self.file = self.sock.makefile("rb")
 
     def close(self):
@@ -568,7 +574,8 @@ class SentinelTest(unittest.TestCase):
         H.wait_until(
             "default Sentinel disabled",
             3,
-            lambda: "sentinel=disabled" in Path(node.log_path).read_text(),
+            lambda: "sentinel-tcp=disabled sentinel-tls=disabled"
+            in Path(node.log_path).read_text(),
         )
         node.terminate()
         with socket.socket() as occupied:

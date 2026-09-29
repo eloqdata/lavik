@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "lavik/client_endpoint.h"
 #include "lavik/meta/automatic_failover_detector.h"
 #include "lavik/meta/commands.h"
 #include "lavik/meta/ctl_server.h"
@@ -467,6 +468,34 @@ TEST(MetaIdentitySecurity, SentinelAddressIsDurableAndImmutable) {
   EXPECT_FALSE(restored->Apply(bind).ok());
 }
 
+TEST(MetaIdentitySecurity,
+     TaggedSentinelSurvivesRecoveryAndRejectsControlCollision) {
+  for (const auto* address : {"10.0.0.3:26379", "tls://sentinel.example:26379",
+                              "tcp://[2001:db8::3]:26379"}) {
+    lavik::meta::MetaIdentityStore store;
+    lavik::meta::BindMetaMember bind;
+    bind.server_id_ = 3;
+    bind.principal_ = "lavik://meta/3";
+    bind.data_control_endpoint_ = "10.0.0.3:7100";
+    bind.ctl_endpoint_ = "10.0.0.3:7200";
+    bind.sentinel_endpoint_ = address;
+    ASSERT_TRUE(store.Apply(bind).ok());
+    auto restored =
+        lavik::meta::MetaIdentityStore::Deserialize(store.Serialize());
+    ASSERT_TRUE(restored.ok()) << restored.status();
+    EXPECT_EQ(restored->Serialize(), store.Serialize());
+    EXPECT_TRUE(restored->Apply(bind).ok());
+    EXPECT_EQ(restored->FindMetaMember(3)->sentinel_endpoint_, address);
+  }
+  lavik::meta::MetaIdentityStore store;
+  lavik::meta::BindMetaMember bind;
+  bind.server_id_ = 3;
+  bind.principal_ = "lavik://meta/3";
+  bind.data_control_endpoint_ = "10.0.0.3:7100";
+  bind.sentinel_endpoint_ = "tls://10.0.0.3:7100";
+  EXPECT_FALSE(store.Apply(bind).ok());
+}
+
 TEST(MetaIdentitySecurity, SoleMemberCtlEndpointCanOnlyBeCompletedOnce) {
   lavik::meta::MetaIdentityStore store;
   lavik::meta::BindMetaMember bind;
@@ -487,3 +516,21 @@ TEST(MetaIdentitySecurity, SoleMemberCtlEndpointCanOnlyBeCompletedOnce) {
 }
 
 }  // namespace
+
+TEST(ClientEndpoint, ConcreteRoutesAndDeterministicNormalization) {
+  EXPECT_FALSE(
+      lavik::ParseClientEndpoint("tls://" + std::string(250, 'a') + ":26379"));
+  for (const auto* text : {"127.0.0.1:26379", "tcp://[2001:db8::1]:80",
+                           "tls://data.example:443", "tls://localhost:6380"}) {
+    const auto endpoint = lavik::ParseClientEndpoint(text);
+    ASSERT_TRUE(endpoint.has_value()) << text;
+    EXPECT_EQ(lavik::FormatClientEndpoint(*endpoint, true), text);
+  }
+  EXPECT_EQ(lavik::CanonicalClientEndpoint("tls://DATA.Example:443"),
+            "tls://data.example:443");
+  for (const auto* text :
+       {"0.0.0.0:1", "[::]:1", "[::ffff:0.0.0.0]:1", "tls://foo..:1",
+        "tls://foo..bar:1", "tls://foo:0", "tls://foo:65536",
+        "tcp://tls://foo:1", "https://foo:1", "123.456:1"})
+    EXPECT_FALSE(lavik::ParseClientEndpoint(text)) << text;
+}

@@ -77,6 +77,8 @@ std::string ConfigJson(const MetaRaftOptions& options) {
   initial += ']';
   return absl::StrCat(
       "{\"local\":", MemberJson(local), ",\"initial\":", initial,
+      ",\"sentinel_transports\":",
+      static_cast<unsigned>(options.sentinel_transports_),
       ",\"dir\":", Quote(options.data_dir_),
       ",\"listen\":", Quote(options.listen_),
       ",\"tls_ca\":", Quote(options.tls_ca_),

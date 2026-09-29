@@ -33,6 +33,7 @@
 #include <utility>
 #include <variant>
 
+#include "lavik/client_endpoint.h"
 #include "lavik/meta/raft.h"
 #include "lavik/meta/state_machine.h"
 #include "spdlog/spdlog.h"
@@ -1247,6 +1248,30 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
     co_return NotLeaderStatus();
   }
   const auto proposal_term = static_cast<std::uint64_t>(admitted_term);
+  // Application registrations cannot alias a known Raft socket. The identity
+  // store enforces its own control/Admin directory during deterministic apply;
+  // Raft's captured effective configuration is available only at admission.
+  std::vector<std::string_view> application_routes;
+  if (const auto* registration = std::get_if<RegisterNode>(&command)) {
+    for (const auto& route : registration->endpoints_)
+      application_routes.push_back(route);
+  } else if (const auto* update = std::get_if<UpdateNode>(&command)) {
+    for (const auto& route : update->endpoints_)
+      application_routes.push_back(route);
+  } else if (const auto* binding = std::get_if<BindMetaMember>(&command)) {
+    application_routes.push_back(binding->sentinel_endpoint_);
+  }
+  if (!application_routes.empty()) {
+    if (const auto config = server_->get_config()) {
+      for (const auto& member : config->get_servers()) {
+        for (const auto route : application_routes) {
+          if (SameClientSocket(route, member->get_endpoint()))
+            co_return absl::InvalidArgumentError(
+                "application endpoint conflicts with Raft endpoint");
+        }
+      }
+    }
+  }
 
   // Counted from here to every exit (normal or frame destruction) so the
   // destructor can drain caller coroutines. Audit headroom follows the Raft

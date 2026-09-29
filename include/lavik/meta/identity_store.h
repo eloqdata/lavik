@@ -31,7 +31,7 @@
 //     rejection.
 //   - Retired is terminal for both registries: no command reactivates a Data
 //     node or Meta member, and UpdateNode on a retired Data node is rejected.
-//   - Active Data-node client endpoints are one or two numeric addresses on
+//   - Active Data-node client endpoints are one or two IP/hostname addresses on
 //     one host. Tagged tcp:// and tls:// forms cannot be mixed with the legacy
 //     positional form, and a tagged transport cannot appear twice.
 //   - Active Meta-member Data-control endpoints are numeric, unique after IP

@@ -216,7 +216,7 @@ class Fixture(D.DiscoveryFixture):
 
 
 class GoClient:
-    def __init__(self, binary, addresses, protocol, log):
+    def __init__(self, binary, addresses, protocol, log, extra_args=()):
         self.proc = subprocess.Popen(
             [
                 binary,
@@ -224,6 +224,7 @@ class GoClient:
                 ",".join(f"{h}:{p}" for h, p in addresses),
                 "--protocol",
                 str(protocol),
+                *extra_args,
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -272,6 +273,8 @@ def make_clients(fixture, go_binary, directory, learned=False):
             min_other_sentinels=2,
             sentinel_kwargs={
                 "password": D.SENTINEL_PASSWORD,
+                "protocol": protocol,
+                **getattr(fixture, "client_tls_kwargs", {}),
                 "socket_timeout": 1,
                 "socket_connect_timeout": 1,
             },
@@ -279,12 +282,22 @@ def make_clients(fixture, go_binary, directory, learned=False):
             socket_connect_timeout=1,
         )
         clients.append(
-            (f"python-{protocol}", sentinel.master_for(D.GROUP, protocol=protocol))
+            (
+                f"python-{protocol}",
+                sentinel.master_for(
+                    D.GROUP,
+                    protocol=protocol,
+                    password=getattr(fixture, "data_password", None),
+                    **getattr(fixture, "client_tls_kwargs", {}),
+                ),
+            )
         )
         resources.append(sentinel)
         log = open(directory / f"go-{protocol}.log", "w")
         go_seeds = fixture.sentinel_addresses()[:1] if learned else seeds
-        go = GoClient(go_binary, go_seeds, protocol, log)
+        go = GoClient(
+            go_binary, go_seeds, protocol, log, getattr(fixture, "go_args", ())
+        )
         clients.append((f"go-{protocol}", go))
         resources.append(log)
     return clients, resources

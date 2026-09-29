@@ -20,6 +20,7 @@
 #include <set>
 
 #include "absl/strings/str_cat.h"
+#include "lavik/client_endpoint.h"
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/meta/identity_verifier.h"
 #include "lavik/numeric_endpoint.h"
@@ -62,16 +63,14 @@ absl::StatusOr<ParsedDataEndpoint> ParseDataEndpoint(std::string_view encoded) {
   ParsedDataEndpoint result;
   if (encoded.starts_with("tcp://")) {
     result.kind_ = DataEndpointKind::kTcp;
-    encoded.remove_prefix(6);
   } else if (encoded.starts_with("tls://")) {
     result.kind_ = DataEndpointKind::kTls;
-    encoded.remove_prefix(6);
   }
 
-  auto endpoint = lavik::ParseNumericEndpoint(encoded);
+  auto endpoint = lavik::ParseClientEndpoint(encoded);
   if (!endpoint.has_value()) {
     return absl::InvalidArgumentError(
-        "Data endpoint must be numeric IPv4:port or [IPv6]:port");
+        "Data endpoint must be a concrete IP or hostname with a nonzero port");
   }
   result.host_ = std::move(endpoint->host_);
   result.port_ = endpoint->port_;
@@ -104,8 +103,7 @@ absl::Status ValidateDataEndpoints(
                   [&](const ParsedDataEndpoint& endpoint) {
                     return endpoint.host_ != endpoints.front().host_;
                   })) {
-    return absl::InvalidArgumentError(
-        "Data endpoints must use one numeric host");
+    return absl::InvalidArgumentError("Data endpoints must use one host");
   }
   if (has_explicit && endpoints.size() == 2 &&
       endpoints[0].kind_ == endpoints[1].kind_) {
@@ -159,6 +157,23 @@ absl::StatusOr<control::WireMetaEndpoint> ParseMetaControlEndpoint(
   };
 }
 
+absl::Status ValidateDataRoutesAgainstMeta(
+    const std::vector<std::string>& routes,
+    const std::vector<MetaMemberRecord>& members) {
+  for (const auto& member : members) {
+    if (member.retired_) continue;
+    for (const auto& endpoint : routes) {
+      if (SameClientSocket(endpoint, member.data_control_endpoint_) ||
+          (member.ctl_endpoint_ &&
+           SameClientSocket(endpoint, *member.ctl_endpoint_)) ||
+          SameClientSocket(endpoint, member.sentinel_endpoint_))
+        return absl::InvalidArgumentError(
+            "Data endpoint conflicts with Meta endpoint");
+    }
+  }
+  return absl::OkStatus();
+}
+
 // ServerHello is intentionally a single frame. Keep that wire invariant in
 // the durable state transition as well as at publication time, otherwise one
 // legal Raft entry could permanently make every Data connection fail closed.
@@ -178,7 +193,10 @@ absl::Status ValidateActiveMetaDirectory(
           "active Meta data-control endpoints must be unique");
     }
     if (!member.sentinel_endpoint_.empty() &&
-        !sentinel_endpoints.insert(member.sentinel_endpoint_).second) {
+        !sentinel_endpoints
+             .insert(FormatClientEndpoint(
+                 *ParseClientEndpoint(member.sentinel_endpoint_)))
+             .second) {
       return absl::InvalidArgumentError(
           "active Meta Sentinel endpoints must be unique");
     }
@@ -187,6 +205,21 @@ absl::Status ValidateActiveMetaDirectory(
         !ctl_endpoints.insert(*member.ctl_endpoint_).second) {
       return absl::InvalidArgumentError(
           "active Meta ctl endpoints must be unique");
+    }
+  }
+  // Only compare declared sockets: DNS aliases are deployment knowledge, never
+  // a committed fact. Legacy untagged addresses retain their durable bytes.
+  for (const auto& member : members) {
+    if (member.retired_ || member.sentinel_endpoint_.empty()) continue;
+    for (const auto& peer : members) {
+      if (peer.retired_) continue;
+      if (SameClientSocket(member.sentinel_endpoint_,
+                           peer.data_control_endpoint_) ||
+          (peer.ctl_endpoint_ &&
+           SameClientSocket(member.sentinel_endpoint_, *peer.ctl_endpoint_))) {
+        return absl::InvalidArgumentError(
+            "Sentinel endpoint conflicts with Meta management endpoint");
+      }
     }
   }
   control::ServerHello probe{
@@ -221,6 +254,10 @@ absl::Status MetaIdentityStore::Apply(const RegisterNode& cmd) {
   if (auto st = ValidateDataEndpoints(cmd.endpoints_); !st.ok()) {
     return MetaDomainRejectError(st.message());
   }
+  if (auto status =
+          ValidateDataRoutesAgainstMeta(cmd.endpoints_, MetaMembers());
+      !status.ok())
+    return MetaDomainRejectError(status.message());
   if (auto st = ValidateDataNodePrincipal(cmd.node_id_, cmd.principal_);
       !st.ok()) {
     return st;
@@ -267,6 +304,10 @@ absl::Status MetaIdentityStore::Apply(const UpdateNode& cmd) {
   if (auto st = ValidateDataEndpoints(cmd.endpoints_); !st.ok()) {
     return MetaDomainRejectError(st.message());
   }
+  if (auto status =
+          ValidateDataRoutesAgainstMeta(cmd.endpoints_, MetaMembers());
+      !status.ok())
+    return MetaDomainRejectError(status.message());
   const auto it = nodes_.find(cmd.node_id_);
   if (it == nodes_.end()) {
     return MetaDomainRejectError(
@@ -356,8 +397,8 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
   }
   std::string sentinel;
   if (!cmd.sentinel_endpoint_.empty()) {
-    auto parsed = CanonicalMetaAdminEndpoint(cmd.sentinel_endpoint_);
-    if (!parsed.ok()) return MetaDomainRejectError(parsed.status().message());
+    auto parsed = CanonicalClientEndpoint(cmd.sentinel_endpoint_);
+    if (!parsed) return MetaDomainRejectError("invalid Sentinel endpoint");
     sentinel = std::move(*parsed);
   }
   if (const auto existing = meta_members_.find(cmd.server_id_);
@@ -407,6 +448,17 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
   candidate.push_back(record);
   if (auto status = ValidateActiveMetaDirectory(candidate); !status.ok()) {
     return MetaDomainRejectError(status.message());
+  }
+  for (const auto& [id, node] : nodes_) {
+    if (node.retired_) continue;
+    for (const auto& endpoint : node.endpoints_) {
+      if (SameClientSocket(endpoint, record.data_control_endpoint_) ||
+          (record.ctl_endpoint_ &&
+           SameClientSocket(endpoint, *record.ctl_endpoint_)) ||
+          SameClientSocket(endpoint, record.sentinel_endpoint_))
+        return MetaDomainRejectError(
+            "Meta endpoint conflicts with Data endpoint");
+    }
   }
   meta_members_.emplace(cmd.server_id_, record);
   meta_server_id_by_principal_.emplace(cmd.principal_, cmd.server_id_);
@@ -617,8 +669,8 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
     auto sentinel = r.ReadString(kMaxMetaEndpointBytes);
     if (!sentinel.ok()) return sentinel.status();
     if (!sentinel->empty()) {
-      auto canonical = CanonicalMetaAdminEndpoint(*sentinel);
-      if (!canonical.ok() || *canonical != *sentinel)
+      auto canonical = CanonicalClientEndpoint(*sentinel);
+      if (!canonical || *canonical != *sentinel)
         return MetaFailStopError("non-canonical Meta Sentinel endpoint");
     }
     auto retired = r.ReadBool("invalid meta member in snapshot");

@@ -77,9 +77,10 @@ def meta_manifest_lines(*metas):
             ]
         )
         if getattr(meta, "sentinel_endpoint", None):
-            lines.insert(
-                len(lines) - 1, f'sentinel_endpoint = "tcp://{meta.sentinel_endpoint}"'
-            )
+            endpoint = meta.sentinel_endpoint
+            if "://" not in endpoint:
+                endpoint = "tcp://" + endpoint
+            lines.insert(len(lines) - 1, f'sentinel_endpoint = "{endpoint}"')
     return lines
 
 

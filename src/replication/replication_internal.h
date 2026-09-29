@@ -72,6 +72,7 @@
 #include "bycorf/runtime/sync.h"
 #include "bycorf/runtime/worker.h"
 #include "full_sync_handoff.h"
+#include "lavik/async_dns.h"
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/cluster/lease_clock.h"
 #include "lavik/command.h"
@@ -622,18 +623,7 @@ absl::Status ConfigureConnectedFd(int fd);
 // gives it detached ownership of only bounded resolver inputs/results, never
 // the group or a coroutine. A process-wide cap prevents repeated replacements
 // from accumulating resolver work; the candidate can leave at its cutoff.
-struct RecoveryResolvedAddress {
-  ~RecoveryResolvedAddress() {
-    if (addresses_ != nullptr) ::freeaddrinfo(addresses_);
-  }
-  std::string host_;
-  std::string service_;
-  addrinfo hints_{};
-  addrinfo* addresses_ = nullptr;
-  int result_ = EAI_AGAIN;
-  std::atomic<bool> done_{false};
-};
-extern std::atomic<unsigned> recovery_resolvers_in_flight;
+using RecoveryResolvedAddress = AsyncDnsQuery;
 
 Task<absl::StatusOr<std::shared_ptr<RecoveryResolvedAddress>>>
 ResolveRecoveryAddress(std::string_view host, std::uint16_t port,

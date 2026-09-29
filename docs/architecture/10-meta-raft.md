@@ -177,7 +177,10 @@ replays committed identity/configuration state before opening peer ingress.
 Snapshot metadata and the installed identity projection close the same grace
 windows, so partial installation cannot resurrect old voters or retired IDs.
 Member descriptors and identity bindings include the optional immutable Sentinel
-advertisement. A registered local route requires an enabled listener before
+advertisement, including TLS transport tags and hostnames. These are application
+routes, while Raft, Data-control and Admin retain numeric-only addresses.
+Snapshot and pending-invitation recovery preserve legacy untagged address bytes.
+A registered local route requires an enabled listener before
 startup or join activation. The bind may differ behind a proxy; a waiting joiner
 may enable its listener before registration, so invitation recovery checks
 availability against current startup configuration rather than its first bind.

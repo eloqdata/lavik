@@ -125,11 +125,13 @@ std::string AuthorityLeasePolicyContent(
                       manifest.authority_lease_duration_ms_, "}");
 }
 
-// ClusterCreateManifestV1 is normalized before persistence; comparisons below
-// adapt its validated tcp:// endpoints to the scheme-free runtime models.
+// Keep the historical scheme-free TCP representation at the runtime boundary.
+// Application TLS routes retain their tag; losing it would change transport.
 std::string StripValidatedTcpEndpointScheme(std::string_view endpoint) {
   constexpr std::string_view kTcpPrefix = "tcp://";
-  return std::string(endpoint.substr(kTcpPrefix.size()));
+  return std::string(endpoint.starts_with(kTcpPrefix)
+                         ? endpoint.substr(kTcpPrefix.size())
+                         : endpoint);
 }
 
 absl::Status ValidateMetaSet(const MetaCommittedView& view,

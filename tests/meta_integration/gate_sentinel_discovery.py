@@ -188,6 +188,10 @@ class DiscoveryFixture:
                 f'client_endpoint = "{getattr(node, "discovery_endpoint", node.advertised_endpoint)}"',
                 "",
             ]
+            if getattr(node, "discovery_tls_endpoint", None):
+                lines.insert(
+                    len(lines) - 1, f'tls_endpoint = "{node.discovery_tls_endpoint}"'
+                )
         lines += [
             "[[groups]]",
             f'id = "{GROUP}"',
@@ -238,9 +242,7 @@ class DiscoveryFixture:
                 "cluster-create",
                 "--manifest",
                 self.manifest,
-                "--addr",
-                self.leader.ctl_endpoint,
-                "--allow-plaintext-admin",
+                *self.admin_connection(self.leader),
                 "--yes",
                 "--timeout-ms",
                 "120000",
@@ -248,7 +250,12 @@ class DiscoveryFixture:
         )
         if "Cluster create accepted:" not in created:
             raise H.Failure(f"cluster-create was not accepted: {created!r}")
-        C.wait_cluster_ready(self.leader, "managed Single cluster reaches READY", 150)
+        C.wait_cluster_ready(
+            self.leader,
+            "managed Single cluster reaches READY",
+            150,
+            admin=self.admin_connection(self.leader),
+        )
 
     def rediscover_leader(self):
         for meta in [self.leader] + [m for m in self.metas if m is not self.leader]:
@@ -257,13 +264,20 @@ class DiscoveryFixture:
                 return meta
         raise H.Failure("no Meta seed currently reports itself as leader")
 
+    def admin_connection(self, meta):
+        return [
+            "--socket",
+            meta.ctl_path,
+            *getattr(self, "admin_tls_args", ["--allow-plaintext-admin"]),
+        ]
+
     def cluster_status(self):
         last = H.Failure("no Meta seed answered cluster-status")
         for meta in [self.leader] + [m for m in self.metas if m is not self.leader]:
             if not meta.alive():
                 continue
             try:
-                return C.cluster_status(meta)
+                return C.cluster_status(meta, admin=self.admin_connection(meta))
             except H.Failure as error:
                 last = error
         raise last
@@ -302,12 +316,19 @@ class DiscoveryFixture:
         ordered = [self.leader] + [m for m in self.metas if m is not self.leader]
         if not leader_first:
             ordered.reverse()
-        return [("127.0.0.1", self.sentinel_ports[meta.id]) for meta in ordered]
+        return [
+            (getattr(self, "discovery_host", "127.0.0.1"), self.sentinel_ports[meta.id])
+            for meta in ordered
+        ]
 
     def sentinel_command(self, *args, proto=2):
         """One authenticated shot against the current leader's entry."""
         self.rediscover_leader()
-        client = Client(self.sentinel_ports[self.leader.id])
+        client = Client(
+            self.sentinel_ports[self.leader.id],
+            host=getattr(self, "discovery_host", "127.0.0.1"),
+            ssl_context=getattr(self, "ssl_context", None),
+        )
         try:
             if client.command("AUTH", SENTINEL_PASSWORD) != b"OK":
                 raise H.Failure("Sentinel entry rejected its password")
@@ -334,7 +355,12 @@ class DiscoveryFixture:
                 f"Data node {data.node_id[:8]} applies the lease Policy FDS",
                 timeout=30,
             )
-        C.wait_cluster_ready(self.leader, "fast Policy projection reaches READY", 60)
+        C.wait_cluster_ready(
+            self.leader,
+            "fast Policy projection reaches READY",
+            60,
+            admin=self.admin_connection(self.leader),
+        )
         threshold = self.leader.put_automatic_uncontrolled_failover_policy(
             2, suspect_after_ms=suspect_after_ms
         )

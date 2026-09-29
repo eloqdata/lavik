@@ -45,6 +45,12 @@ class MetaAutomaticFailoverDiagnosticsRegistry;
 // is implied.
 struct MetaSentinelServerOptions {
   std::string address_;
+  std::string tls_address_;
+  std::string tls_cert_file_, tls_key_file_, tls_ca_cert_file_;
+  std::string tls_auth_clients_ = "yes";
+  bool data_tls_ = false;
+  bool resolve_hostnames_ = false;
+  bool announce_hostnames_ = false;
   std::string requirepass_;
   std::size_t maxclients_ = 256;
   std::size_t query_limit_ = 64 * 1024;
@@ -107,10 +113,11 @@ class MetaSentinelServer : public MetaReconciler {
   class SessionBorrow;
   using CorePtr = std::shared_ptr<Core>;
   explicit MetaSentinelServer(CorePtr core);
-  static bycorf::Task<absl::Status> AcceptLoop(CorePtr core);
+  static bycorf::Task<absl::Status> AcceptLoop(CorePtr core,
+                                               std::size_t listener_index);
   static bycorf::Task<absl::Status> SessionLoop(CorePtr core,
                                                 bycorf::TcpStream stream,
-                                                SessionBorrow borrow);
+                                                SessionBorrow borrow, bool tls);
   CorePtr core_;
   bool started_ = false;
   std::atomic<bool> stopped_{false};

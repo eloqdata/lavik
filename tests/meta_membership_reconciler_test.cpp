@@ -29,11 +29,20 @@ class MembershipRecoveryTest : public testing::Test {
         .principal_ = "lavik://meta/" + std::to_string(id),
         .data_control_endpoint_ = "127.0.0.1:" + std::to_string(7300 + id),
         .ctl_endpoint_ = "127.0.0.1:" + std::to_string(7200 + id),
+        .sentinel_endpoint_ =
+            sentinel_routes_ ? (id == 1 ? "127.0.0.1:26379"
+                                        : "tls://meta" + std::to_string(id) +
+                                              ".example:26379")
+                             : "",
     };
   }
   MetaMemberRecord Binding(unsigned id) {
-    return {id, Peer(id).principal_, "127.0.0.1:" + std::to_string(7300 + id),
-            "127.0.0.1:" + std::to_string(7200 + id), false};
+    return {id,
+            Peer(id).principal_,
+            "127.0.0.1:" + std::to_string(7300 + id),
+            "127.0.0.1:" + std::to_string(7200 + id),
+            false,
+            Peer(id).sentinel_endpoint_};
   }
   void Apply(MetaCommand c) {
     auto result =
@@ -53,6 +62,7 @@ class MembershipRecoveryTest : public testing::Test {
     c.principal_ = b.principal_;
     c.data_control_endpoint_ = b.data_control_endpoint_;
     c.ctl_endpoint_ = b.ctl_endpoint_;
+    c.sentinel_endpoint_ = b.sentinel_endpoint_;
     Apply(c);
   }
   void Start(bool add) {
@@ -106,12 +116,41 @@ class MembershipRecoveryTest : public testing::Test {
     }
     FAIL() << "did not complete";
   }
+  bool sentinel_routes_ = false;
   MetaStores stores_;
   std::uint64_t index_ = 0;
   MetaOperationId id_{};
   MetaMembershipIntent intent_;
   std::vector<MetaMembershipPeer> config_;
 };
+
+TEST_F(MembershipRecoveryTest, TaggedSentinelJoinRecoversEveryCheckpoint) {
+  sentinel_routes_ = true;
+  Start(true);
+  AdvanceToRaft();
+  CommitConfig();
+  Finish();
+  EXPECT_EQ(stores_.identity_.FindMetaMember(1)->sentinel_endpoint_,
+            "127.0.0.1:26379");
+  EXPECT_EQ(stores_.identity_.FindMetaMember(3)->sentinel_endpoint_,
+            "tls://meta3.example:26379");
+  const auto encoded = EncodeMembershipIntent(intent_);
+  ASSERT_TRUE(encoded.ok());
+  EXPECT_EQ(*DecodeMembershipIntent(*encoded), intent_);
+}
+
+TEST_F(MembershipRecoveryTest,
+       TaggedSentinelRetirementRecoversEveryCheckpoint) {
+  sentinel_routes_ = true;
+  Start(false);
+  AdvanceToRaft();
+  CommitConfig();
+  Finish();
+  const auto member = stores_.identity_.FindMetaMember(2);
+  ASSERT_TRUE(member);
+  EXPECT_TRUE(member->retired_);
+  EXPECT_EQ(member->sentinel_endpoint_, "tls://meta2.example:26379");
+}
 
 TEST_F(MembershipRecoveryTest,
        InitialConfigBindingsResumeInIdOrderWithoutMembershipOperation) {

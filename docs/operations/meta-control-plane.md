@@ -124,9 +124,13 @@ password is configured, while `AUTH default password` succeeds and other
 usernames fail, following Redis 7.2 Sentinel. Data's existing AUTH behavior is
 preserved independently.
 
-The Sentinel listener currently uses plaintext TCP. Meta's Raft/control and
-Admin TLS settings do not enable TLS on this port. Keep it on a trusted network
-until Sentinel TLS is available; the endpoint is not an Admin interface.
+Use `--sentinel-tls-addr` for an independent TLS listener, or combine it with
+`--sentinel-addr`. Supply Sentinel's own `--sentinel-tls-cert`,
+`--sentinel-tls-key`, and `--sentinel-tls-ca`; Admin/Raft credentials are not
+inherited. Client certificate verification defaults to `yes`, and successful
+mTLS still requires the configured Sentinel password. See
+[TLS and authentication](tls-and-auth.md#meta-sentinel-discovery) for transport
+selection, hostname publication, mapped routes, and executable acceptance examples.
 
 ### Register every candidate leader
 
@@ -171,8 +175,8 @@ does not promise zero lag or a continuously connected replication link.
 A Meta leader that loses authority closes its discovery and subscription
 connections, including idle ones. Clients must reconnect through seeds and query
 again; notifications are not replayed. Go's subscription accelerates pool
-migration. Revocation of all surviving old Data sessions is tracked separately in
-[#100](https://github.com/eloqdata/lavik/issues/100).
+migration. The Data serving-boundary mechanism also revokes surviving old Data sessions
+after authority loss, causing clients to reconnect and authenticate.
 
 RESP2 subscribed connections allow SUBSCRIBE/UNSUBSCRIBE, PING, QUIT and RESET;
 RESP3 permits ordinary commands alongside pushes. RESET removes subscriptions
