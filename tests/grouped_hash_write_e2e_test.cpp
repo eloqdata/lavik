@@ -583,7 +583,85 @@ TEST(GroupedHashWriteE2e, PromotionAndPointUpdateOnlyRewriteOneGroup) {
             std::string(128, 'u'));
   EXPECT_EQ(client.Command({"HGET", "hash", "field1"}).text_,
             std::string(128, 'v'));
+  EXPECT_EQ(client.Command({"HGET", "hash", "absent"}).text_, "-1");
+  EXPECT_EQ(client.Command({"HEXISTS", "hash", "field1"}).text_, "1");
+  EXPECT_EQ(client.Command({"HEXISTS", "hash", "absent"}).text_, "0");
+  EXPECT_EQ(client.Command({"HSTRLEN", "hash", "field1"}).text_, "128");
   EXPECT_EQ(client.Command({"HLEN", "hash"}).text_, "256");
+  for (const auto& field : {"field1", "absent"}) {
+    const auto reply = client.Command({"HMGET", "hash", field});
+    ASSERT_EQ(reply.items_.size(), 1);
+    EXPECT_EQ(reply.items_[0].text_, field == std::string_view("field1")
+                                         ? std::string(128, 'v')
+                                         : "-1");
+  }
+  EXPECT_EQ(client.Command({"HSET", "hash", "empty", ""}).text_, "1");
+  EXPECT_EQ(client.Command({"HGET", "hash", "empty"}).text_, "");
+  EXPECT_EQ(client.Command({"HEXISTS", "hash", "empty"}).text_, "1");
+  EXPECT_EQ(client.Command({"HSTRLEN", "hash", "empty"}).text_, "0");
+  EXPECT_EQ(client.Command({"HSTRLEN", "hash", "absent"}).text_, "0");
+}
+
+TEST(GroupedHashWriteE2e,
+     MultiFieldReadsPreserveOrderAndDuplicatesAfterRecovery) {
+  PrivateDisk disk;
+  const std::string binary_field("f\0x", 3);
+  const std::string binary_value("v\0x", 3);
+  const std::string large_value(200000, 'L');
+  const std::string member_prefix(128, 'm');
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(HashCommand("hash")).text_, "256");
+    ASSERT_EQ(client
+                  .Command({"HSET", "hash", "empty", "", binary_field,
+                            binary_value, "large", large_value})
+                  .text_,
+              "3");
+    std::vector<std::string> add{"SADD", "set", "", binary_field};
+    for (unsigned i = 0; i < 256; ++i)
+      add.push_back(member_prefix + std::to_string(i));
+    ASSERT_EQ(client.Command(add).text_, "258");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_GT(InspectHashLayout(disk, "hash").root_.group_count_, 1);
+  ASSERT_GT(InspectHashLayout(disk, "set").root_.group_count_, 1);
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  std::vector<std::string> query{"HMGET", "hash",       "large",
+                                 "empty", binary_field, "absent",
+                                 "large", binary_field, "empty"};
+  std::vector<std::string> expected{
+      large_value, "", binary_value, "-1", large_value, binary_value, ""};
+  // Reverse command order crosses every group and includes many requests in
+  // the same group; duplicate operands must occupy independent result slots.
+  for (int i = 255; i >= 0; --i) {
+    query.push_back("field" + std::to_string(i));
+    expected.emplace_back(128, 'v');
+    if (i % 5 == 0) {
+      query.push_back("field" + std::to_string(i));
+      expected.emplace_back(128, 'v');
+    }
+  }
+  auto reply = client.Command(query);
+  ASSERT_EQ(reply.items_.size(), expected.size());
+  for (std::size_t i = 0; i < expected.size(); ++i)
+    EXPECT_EQ(reply.items_[i].text_, expected[i]) << i;
+  reply = client.Command({"HMGET", "hash", "absent", "missing", "absent"});
+  ASSERT_EQ(reply.items_.size(), 3);
+  for (const auto& item : reply.items_) EXPECT_EQ(item.text_, "-1");
+
+  query = {"SMISMEMBER", "set", "absent", "", binary_field, "", "absent"};
+  expected = {"0", "1", "1", "1", "0"};
+  for (int i = 255; i >= 0; --i) {
+    query.push_back(member_prefix + std::to_string(i));
+    expected.push_back("1");
+  }
+  reply = client.Command(query);
+  ASSERT_EQ(reply.items_.size(), expected.size());
+  for (std::size_t i = 0; i < expected.size(); ++i)
+    EXPECT_EQ(reply.items_[i].text_, expected[i]) << i;
 }
 
 TEST(GroupedHashWriteE2e, ConditionalIncrementDeleteAndNewIncarnation) {
@@ -698,6 +776,12 @@ TEST(GroupedHashWriteE2e, SetUsesSameGroupedLifecycleWithSetType) {
   EXPECT_EQ(client.Command({"SCARD", "set"}).text_, "256");
   EXPECT_EQ(client.Command({"SISMEMBER", "set", prefix + "0"}).text_, "0");
   EXPECT_EQ(client.Command({"SISMEMBER", "set", "new"}).text_, "1");
+  EXPECT_EQ(client.Command({"SISMEMBER", "set", prefix + "255"}).text_, "1");
+  for (const auto& member : {prefix + "0", prefix + "255"}) {
+    const auto reply = client.Command({"SMISMEMBER", "set", member});
+    ASSERT_EQ(reply.items_.size(), 1);
+    EXPECT_EQ(reply.items_[0].text_, member == prefix + "0" ? "0" : "1");
+  }
 }
 
 // Child servers inherit only this scoped fault setting; the target never sees

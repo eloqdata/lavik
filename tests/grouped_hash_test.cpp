@@ -25,6 +25,9 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "lavik/memory.h"
+#include "lavik/storage/detail/hash_read.h"
+#include "lavik/storage/engine.h"
 
 namespace lavik::storage {
 namespace {
@@ -326,6 +329,248 @@ TEST(GroupedHashTest, CompleteSnapshotsAreBinarySafeAndNotMutationLogs) {
     broken[offset] ^= 0x7f;
     EXPECT_FALSE(DecodeHashGroup(broken).ok()) << offset;
   }
+}
+
+TEST(GroupedHashTest, PointLookupDistinguishesMissingEmptyAndBinaryValues) {
+  auto value = Value(3);
+  value.entries_[0].field_ = std::string("f\0x", 3);
+  value.entries_[0].value_ = std::string("v\0x", 3);
+  value.entries_[1].value_.clear();
+  auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = value});
+  ASSERT_TRUE(encoded.ok());
+  for (const auto& expected : value.entries_) {
+    auto found = FindHashGroupField(*encoded, 3, expected.field_);
+    ASSERT_TRUE(found.ok()) << found.status();
+    ASSERT_TRUE(found->has_value());
+    EXPECT_EQ(**found, expected.value_);
+    EXPECT_GE((**found).data(), encoded->data());
+    EXPECT_LE((**found).data() + (**found).size(),
+              encoded->data() + encoded->size());
+  }
+  auto missing = FindHashGroupField(*encoded, 3, "absent");
+  ASSERT_TRUE(missing.ok());
+  EXPECT_FALSE(missing->has_value());
+
+  auto empty = EncodeHashGroup({.incarnation_ = 17});
+  ASSERT_TRUE(empty.ok());
+  missing = FindHashGroupField(*empty, 0, "absent");
+  ASSERT_TRUE(missing.ok());
+  EXPECT_FALSE(missing->has_value());
+}
+
+TEST(GroupedHashTest, PointLookupRejectsCorruptionAfterMatch) {
+  auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = Value(2)});
+  ASSERT_TRUE(encoded.ok());
+  // Preserve a valid outer envelope while corrupting the unchecked inner
+  // encoding, as a loader-success/lookup-failure boundary would see it.
+  auto check = [](const std::string& bytes) {
+    auto metadata = DecodeHashGroupMetadata(bytes, bytes.size());
+    EXPECT_TRUE(metadata.ok());
+    if (!metadata.ok()) return metadata.status();
+    return FindHashGroupField(bytes, metadata->field_count_, "field-0")
+        .status();
+  };
+  auto broken = *encoded;
+  broken.replace(broken.find("field-1"), 7, "field-0");
+  auto status = check(broken);
+  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
+  EXPECT_EQ(status.message(), "duplicate Hash field in group");
+
+  broken = *encoded;
+  // The first match is intact; the second entry claims an impossible length.
+  const auto second_header = broken.find("field-1") - 8;
+  broken.replace(second_header, 4, 4, '\xff');
+  status = check(broken);
+  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
+  EXPECT_EQ(status.message(), "Hash entry is truncated");
+
+  broken = *encoded;
+  broken[kHashGroupHeaderBytes] ^= 1;
+  status = check(broken);
+  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
+  EXPECT_EQ(status.message(), "invalid Hash value header");
+
+  broken = *encoded;
+  broken[kHashGroupHeaderBytes + 16] = 1;
+  status = check(broken);
+  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
+  EXPECT_EQ(status.message(), "Hash group inner count disagrees with envelope");
+
+  broken = *encoded + "x";
+  const auto compact_bytes = broken.size() - kHashGroupHeaderBytes;
+  for (std::size_t i = 0; i < 4; ++i)
+    broken[36 + i] = static_cast<char>(compact_bytes >> (8 * i));
+  for (std::size_t i = 0; i < 8; ++i)
+    broken[kHashGroupHeaderBytes + 24 + i] =
+        static_cast<char>(compact_bytes >> (8 * i));
+  status = check(broken);
+  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
+  EXPECT_EQ(status.message(), "Hash value has trailing bytes");
+}
+
+TEST(GroupedHashTest,
+     PointLookupLeavesUnrelatedDuplicateValidationToFullDecode) {
+  auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = Value(3)});
+  ASSERT_TRUE(encoded.ok());
+  encoded->replace(encoded->find("field-2"), 7, "field-1");
+  auto found = FindHashGroupField(*encoded, 3, "field-0");
+  ASSERT_TRUE(found.ok());
+  ASSERT_TRUE(found->has_value());
+  EXPECT_EQ(**found, std::string(128, 'a'));
+  EXPECT_FALSE(DecodeHashGroup(*encoded).ok());
+}
+
+TEST(GroupedHashTest,
+     MultiLookupMatchesRepeatedOperandsAndChecksUnselectedTail) {
+  auto value = Value(3);
+  value.entries_[0].value_.clear();
+  auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = value});
+  ASSERT_TRUE(encoded.ok());
+  std::array<HashFieldLookup, 4> requests{{
+      {.field_ = "absent", .result_index_ = 1},
+      {.field_ = "field-0", .result_index_ = 3},
+      {.field_ = "field-1", .result_index_ = 2},
+      {.field_ = "field-1", .result_index_ = 0},
+  }};
+  ASSERT_TRUE(FindHashGroupFields(*encoded, 3, requests).ok());
+  EXPECT_FALSE(requests[0].value_);
+  ASSERT_TRUE(requests[1].value_);
+  EXPECT_TRUE(requests[1].value_->empty());
+  ASSERT_TRUE(requests[2].value_);
+  EXPECT_EQ(*requests[2].value_, std::string(128, 'b'));
+  EXPECT_EQ(requests[2].value_, requests[3].value_);
+
+  auto broken = *encoded;
+  broken.replace(broken.find("field-2"), 7, "field-1");
+  EXPECT_EQ(FindHashGroupFields(broken, 3, requests).message(),
+            "duplicate Hash field in group");
+  broken = *encoded;
+  broken.replace(broken.find("field-2") - 8, 4, 4, '\xff');
+  auto status = FindHashGroupFields(broken, 3, requests);
+  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
+  EXPECT_EQ(status.message(), "Hash entry is truncated");
+  broken = *encoded;
+  broken[kHashGroupHeaderBytes + 16] = 2;
+  EXPECT_EQ(FindHashGroupFields(broken, 3, requests).message(),
+            "Hash group inner count disagrees with envelope");
+
+  auto empty = EncodeHashGroup({.incarnation_ = 17});
+  ASSERT_TRUE(empty.ok());
+  ASSERT_TRUE(FindHashGroupFields(*empty, 0, requests).ok());
+  for (const auto& request : requests) EXPECT_FALSE(request.value_);
+}
+
+class HashLookupMemoryTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    previous_shard_ = CurrentMemoryAccountingShard();
+    ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+    BindMemoryAccountingShard(0);
+  }
+  void TearDown() override {
+    EXPECT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+    BindMemoryAccountingShard(previous_shard_ == 0 ? kMaxMemoryWorkers
+                                                   : previous_shard_ - 1);
+  }
+  unsigned previous_shard_ = 0;
+};
+
+TEST_F(HashLookupMemoryTest, OwnsValueAndReleasesChargeAfterMove) {
+  for (std::size_t size : {0, 3, 4096}) {
+    std::string source(size, 'v');
+    const auto before = GetWorkerMemoryStats(0);
+    {
+      HashResult result;
+      ASSERT_TRUE(RetainHashLookupValue(result, source).ok());
+      ASSERT_EQ(result.values_.size(), 1);
+      ASSERT_TRUE(result.values_[0].has_value());
+      source.assign(size, 'x');
+      EXPECT_EQ(*result.values_[0], std::string(size, 'v'));
+      const auto charge = result.retained_charge_.bytes();
+      EXPECT_GE(charge, sizeof(HashResult) + size);
+      EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
+                before.retained_bytes_ + charge);
+      EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
+                before.admission_pending_bytes_);
+      HashResult moved = std::move(result);
+      EXPECT_EQ(result.retained_charge_.bytes(), 0);
+      EXPECT_EQ(moved.retained_charge_.bytes(), charge);
+    }
+    EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, before.retained_bytes_);
+  }
+}
+
+TEST_F(HashLookupMemoryTest,
+       MissingValueOwnsSlotAndAdmissionFailureDoesNotAllocate) {
+  const auto before = GetWorkerMemoryStats(0);
+  {
+    HashResult result;
+    ASSERT_TRUE(RetainHashLookupValue(result, std::nullopt).ok());
+    ASSERT_EQ(result.values_.size(), 1);
+    EXPECT_FALSE(result.values_[0].has_value());
+    EXPECT_GT(result.retained_charge_.bytes(), sizeof(HashResult));
+  }
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, before.retained_bytes_);
+  ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
+  for (auto matched : {std::optional<std::string_view>{},
+                       std::optional<std::string_view>{"value"}}) {
+    HashResult result;
+    auto status = RetainHashLookupValue(result, matched);
+    EXPECT_EQ(status.code(), absl::StatusCode::kResourceExhausted);
+    EXPECT_EQ(result.values_.capacity(), 0);
+    EXPECT_EQ(result.retained_charge_.bytes(), 0);
+    EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
+              before.admission_pending_bytes_);
+  }
+}
+
+TEST_F(HashLookupMemoryTest,
+       MultiLookupRetainsOrderAndReleasesPartialOutputOnOom) {
+  const auto before = GetWorkerMemoryStats(0);
+  {
+    HashResult result;
+    // The caller admits the output slots once, then each page adds only the
+    // strings copied by RetainHashGroupValues.
+    auto slots = TryReserveMemory(sizeof(HashResult) +
+                                  5 * sizeof(std::optional<std::string>));
+    ASSERT_TRUE(slots);
+    result.values_.resize(5);
+    result.retained_charge_.Adopt(
+        &*slots, sizeof(HashResult) +
+                     result.values_.capacity() * sizeof(result.values_[0]));
+    std::string source(4096, 'v');
+    std::array<HashFieldLookup, 4> page{{
+        {.result_index_ = 2, .value_ = source},
+        {.result_index_ = 0, .value_ = std::string_view{}},
+        {.result_index_ = 3, .value_ = source},
+        {.result_index_ = 1, .value_ = std::nullopt},
+    }};
+    ASSERT_TRUE(RetainHashGroupValues(result, page).ok());
+    source.assign(4096, 'x');
+    ASSERT_TRUE(result.values_[0]);
+    EXPECT_TRUE(result.values_[0]->empty());
+    EXPECT_FALSE(result.values_[1]);
+    EXPECT_EQ(result.values_[2], std::string(4096, 'v'));
+    EXPECT_EQ(result.values_[2], result.values_[3]);
+    EXPECT_FALSE(result.values_[4]);
+    const auto charge = result.retained_charge_.bytes();
+    EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
+              before.retained_bytes_ + charge);
+    EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
+              before.admission_pending_bytes_);
+
+    ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
+    std::array<HashFieldLookup, 1> next{{
+        {.result_index_ = 4, .value_ = source},
+    }};
+    EXPECT_EQ(RetainHashGroupValues(result, next).code(),
+              absl::StatusCode::kResourceExhausted);
+    EXPECT_FALSE(result.values_[4]);
+    EXPECT_EQ(result.retained_charge_.bytes(), charge);
+    EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
+              before.admission_pending_bytes_);
+  }
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, before.retained_bytes_);
 }
 
 TEST(GroupedHashTest, EmptyLeafAndRetiredLeafAreDifferentStates) {

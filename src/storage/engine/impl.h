@@ -2196,6 +2196,14 @@ class StorageEngine::Impl {
                                                        std::string_view key);
   Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadataLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
+  // Multi-field reads retain only requested output and one encoded group at a
+  // time; the request views and immutable directory outlive the awaited call.
+  Task<absl::StatusOr<HashResult>> ReadGroupedHashFields(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object,
+      std::span<const std::string_view> fields);
+
   Task<absl::StatusOr<HashResult>> ExecuteGroupedHashRandomLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -3042,6 +3050,14 @@ class StorageEngine::Impl {
     }
   };
 
+  // Owns the page lease while a grouped reader inspects its checked envelope.
+  // Views into loaded_.value() must not outlive this object.
+  struct LoadedHashGroupPayload {
+    LoadedValue loaded_;
+    std::uint64_t sequence_ = 0;
+    std::uint32_t field_count_ = 0;
+  };
+
   std::size_t DirectGetValueLimit() const noexcept;
 
   absl::StatusOr<DiskValue> EncodeDiskValue(LoadedValue loaded);
@@ -3391,6 +3407,10 @@ class StorageEngine::Impl {
 
   // The optional snapshot view must already own physical pins. Ordinary
   // reads instead retry GC relocation against the same logical root version.
+  Task<absl::StatusOr<LoadedHashGroupPayload>> LoadHashGroupPayload(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, HashGroupId id, bool pinned = false);
   Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,

@@ -272,8 +272,14 @@ replacement may demote to a compact record. The append funnel retires the old
 graph after publication while preserving transaction/snapshot ownership. This
 does not change the durable format or the incremental HSET/HMSET path.
 
-Hash/Set point operations load each affected prefix group once. Their writes
-replace only changed complete groups and any split-parent retirement records.
+Hash/Set point operations load each affected prefix group once. Point reads
+scan encoded entries and retain only requested values. Multi-field reads group
+request positions by routing leaf, fill result slots in command order, and
+release each page before loading the next; repeated operands retain repeated results.
+These reads validate all entry framing and duplicate occurrences of requested
+fields; full decodes additionally validate every field's uniqueness
+and route. Point writes decode complete affected groups before replacing only
+changed groups and any split-parent retirement records.
 HSCAN/SSCAN consume one routing leaf per call and use field digests under the
 persisted seed as cursors. COUNT is a hint; equal-digest fields remain in one
 response, and empty routing leaves still advance the cursor. Deleting earlier
