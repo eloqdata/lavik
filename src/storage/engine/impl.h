@@ -3853,6 +3853,12 @@ class StorageEngine::Impl {
     bool indirect_key_record_ = false;
   };
 
+  // Validate grouped metadata after resolving the logical-size sentinel and
+  // the transaction receipt's effective txid.
+  static bool ValidGroupedWrite(const RecordWriteRequest& request,
+                                std::uint64_t logical_size,
+                                std::uint64_t txid) noexcept;
+
   // Keep owning handles in the callee so success, failure and cancellation
   // retain the same release/transfer boundary as the awaited write. Tracing
   // stays last and is absent from non-tracing builds.

@@ -2385,6 +2385,41 @@ void StorageEngine::Impl::PublishCommittedFullSyncEffects(
   shard->fullsync_effects_.clear();
 }
 
+bool StorageEngine::Impl::ValidGroupedWrite(const RecordWriteRequest& request,
+                                            std::uint64_t logical_size,
+                                            std::uint64_t txid) noexcept {
+  if (request.group_ == nullptr) return true;
+  if (request.kind_ != RecordKind::kValue ||
+      request.value_type_ < ValueType::kString ||
+      request.value_type_ > ValueType::kStream ||
+      request.mutation_sequence_ == 0) {
+    return false;
+  }
+
+  const GroupRecordWrite& group = *request.group_;
+  if (group.auxiliary_) {
+    // Ordered page ids are opaque identities, not hash prefixes. Sorted Set
+    // uses both namespaces: ordered score pages and hashed member pages.
+    const bool ordered_page = request.value_type_ == ValueType::kString ||
+                              request.value_type_ == ValueType::kList ||
+                              request.value_type_ == ValueType::kStream ||
+                              (request.value_type_ == ValueType::kSortedSet &&
+                               IsOrderedPageId(group.id_));
+    const bool valid_id =
+        ordered_page ? IsOrderedPageId(group.id_) : group.id_.valid();
+    return group.incarnation_ != 0 && valid_id && request.expire_at_ms_ == 0 &&
+           request.explicit_root_ == nullptr &&
+           (!group.retired_ || logical_size == 0) &&
+           (group.batch_txid_ == 0 || txid != 0) &&
+           (request.tx_ != nullptr || request.for_defrag_);
+  }
+
+  return (logical_size != 0 || request.value_type_ == ValueType::kStream) &&
+         group.incarnation_ == 0 && group.id_ == HashGroupId{} &&
+         !group.retired_ && group.batch_txid_ == 0 &&
+         group.prepared_root_ != nullptr && group.publication_ != nullptr;
+}
+
 Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     WorkerStore& store, const RecordWriteRequest& request,
     std::shared_ptr<const std::vector<ExtentRef>> extents,
@@ -2412,42 +2447,14 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
                              "injected transaction write fault");
     }
   }
+  if (request.group_ != nullptr &&
+      !ValidGroupedWrite(request, logical_size, txid)) {
+    co_return absl::InvalidArgumentError("invalid grouped record write");
+  }
   const bool auxiliary =
       request.group_ != nullptr && request.group_->auxiliary_;
   const bool grouped_root =
       request.group_ != nullptr && !request.group_->auxiliary_;
-  if (request.group_ != nullptr &&
-      (request.kind_ != RecordKind::kValue ||
-       (request.value_type_ != ValueType::kHash &&
-        request.value_type_ != ValueType::kSet &&
-        request.value_type_ != ValueType::kString &&
-        request.value_type_ != ValueType::kList &&
-        request.value_type_ != ValueType::kSortedSet &&
-        request.value_type_ != ValueType::kStream) ||
-       request.mutation_sequence_ == 0 ||
-       (auxiliary &&
-        (request.group_->incarnation_ == 0 ||
-         ((request.value_type_ == ValueType::kString ||
-           request.value_type_ == ValueType::kList ||
-           request.value_type_ == ValueType::kStream ||
-           (request.value_type_ == ValueType::kSortedSet &&
-            IsOrderedPageId(request.group_->id_)))
-              ? (request.group_->id_.prefix_ == 0 ||
-                 request.group_->id_.bits_ != 0)
-              : !request.group_->id_.valid()) ||
-         request.expire_at_ms_ != 0 || request.explicit_root_ != nullptr ||
-         (request.group_->retired_ && logical_size != 0) ||
-         (request.group_->batch_txid_ != 0 && txid == 0) ||
-         (request.tx_ == nullptr && !request.for_defrag_))) ||
-       (grouped_root &&
-        ((logical_size == 0 && request.value_type_ != ValueType::kStream) ||
-         request.group_->incarnation_ != 0 ||
-         request.group_->id_ != HashGroupId{} || request.group_->retired_ ||
-         request.group_->batch_txid_ != 0 ||
-         request.group_->prepared_root_ == nullptr ||
-         request.group_->publication_ == nullptr)))) {
-    co_return absl::InvalidArgumentError("invalid grouped record write");
-  }
   struct FailIncompleteGroupedRoot {
     WorkerStore& store_;
     TxShardWrites* tx_;
