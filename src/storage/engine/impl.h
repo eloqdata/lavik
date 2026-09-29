@@ -414,6 +414,48 @@ struct RecoveryRecord {
   bool checkpoint_snapshot_ = false;
 };
 
+// Cold recovery retains every physical auxiliary candidate until the root
+// selects its reachable version. Keep only fields used by that decision and
+// the later live-byte pass: RecoveryRecord also carries root metadata and
+// routing fields, so retaining it for millions of superseded groups can OOM
+// a node whose steady-state index fits in memory.
+struct RecoveryAuxiliaryRecord {
+  // WorkerStore's recovery_aux_keys_ owns this string until all candidates
+  // have been consumed. A raw pointer keeps three candidates per deque block.
+  const std::string* key_ = nullptr;
+  std::string_view key() const noexcept { return *key_; }
+  std::uint8_t db_id_ = 0;
+  RecordLocation location_{};
+  // One-based index into WorkerStore::recovery_aux_extents_; zero is inline.
+  std::uint32_t extent_token_ = 0;
+  RecoveredHashGroup auxiliary_group_;
+  // Hash candidates never need ordered-page metadata. Allocate it only for
+  // inline ordered pages instead of reserving its size in every candidate.
+  std::unique_ptr<RecoveredOrderedGroup> ordered_group_;
+  bool grouped_reachable_ = false;
+};
+
+// Three candidates must fit in one 512-byte deque block. Crossing that
+// boundary raises cold-recovery resident memory sharply on large histories.
+static_assert(sizeof(RecoveryAuxiliaryRecord) <= 168);
+
+using RecoveryAuxiliaryRecords = std::deque<RecoveryAuxiliaryRecord>;
+
+// A selected group has already been checked against its physical payload.
+// Only its location, manifest, and transaction identity survive until the
+// bounded live-byte pass; the full candidate header would duplicate the
+// published grouped directory for every live page.
+struct RecoveryLiveGroup {
+  RecordLocation location_{};
+  ExtentManifest extents_;
+  std::uint64_t txid_ = 0;
+  std::uint64_t batch_txid_ = 0;
+};
+// Retain both transaction identities: batch decisions keep transaction blocks
+// live independently of the logical group transaction.
+static_assert(sizeof(RecoveryLiveGroup) <= 72);
+using RecoveryLiveGroups = std::deque<RecoveryLiveGroup>;
+
 // Non-owning counterpart used while a validated checkpoint buffer remains
 // pinned. The caller owns both key bytes and the manifest for the duration of
 // ApplyRecoveredRecord; the final index and manifest map take the copies they
@@ -1810,10 +1852,32 @@ class StorageEngine::Impl {
     // txid-tagged records parked by ApplyRecovery until the committed-txid set
     // is complete (after the recovery barrier).
     std::vector<RecoveryRecord> recovery_tx_records_;
+    // Group auxiliary versions repeatedly name the same user key. Intern
+    // those names while cold recovery retains physical candidates; views
+    // point into their shared values and are cleared after the candidates.
+    absl::flat_hash_map<std::string_view, std::shared_ptr<const std::string>>
+        recovery_aux_keys_;
+    // External manifests are uncommon relative to physical auxiliary
+    // versions. Retain their shared ownership out of line so every candidate
+    // does not reserve a shared_ptr-sized slot.
+    std::vector<ExtentManifest> recovery_aux_extents_;
+    const ExtentManifest& AuxiliaryExtents(
+        const RecoveryAuxiliaryRecord& record) const {
+      static const ExtentManifest empty;
+      return record.extent_token_ == 0
+                 ? empty
+                 : recovery_aux_extents_.at(record.extent_token_ - 1);
+    }
     // Root and auxiliary scans can arrive in any physical order. Resolve
     // their graph only after the shared transaction decision barrier and
     // top-level winner selection, before live-byte accounting frees orphans.
-    std::vector<RecoveryRecord> recovery_hash_groups_;
+    // A deque avoids a full-copy capacity growth while millions of physical
+    // versions accumulate. Recovery sorts it only after scanning finishes.
+    RecoveryAuxiliaryRecords recovery_hash_groups_;
+    // Once a grouped root has selected and validated its physical winners,
+    // discard its candidate headers. Keep only compact physical-accounting
+    // records until the later live-byte pass.
+    RecoveryLiveGroups recovery_live_groups_;
     absl::flat_hash_map<const RecordIndex::Entry*, RecoveredGroupedRoot>
         recovery_grouped_roots_;
     // Undo journals of in-flight multi-key writes on this shard, keyed by
@@ -3360,10 +3424,12 @@ class StorageEngine::Impl {
   Task<absl::Status> RecoverGroupedObjects(WorkerStore& store);
   Task<absl::StatusOr<GroupedHashObject::Handle>> RecoverOrderedObject(
       WorkerStore& store, const OrderedCollectionRoot& root,
-      GroupedObjectVersion version, std::span<RecoveryRecord> candidates);
+      GroupedObjectVersion version, RecoveryAuxiliaryRecords::iterator first,
+      RecoveryAuxiliaryRecords::iterator last);
   // Validate only root-selected external groups. Obsolete value-only extents
   // can already be gone while their containing records block remains live.
-  Task<absl::Status> ValidateRecoveredGroups(WorkerStore& store);
+  Task<absl::Status> ValidateRecoveredGroup(
+      WorkerStore& store, const RecoveryAuxiliaryRecord& record);
 
   static ExtentManifest ExtentsFor(const WorkerStore& store,
                                    const RecordIndex::Entry* entry) {
@@ -3983,7 +4049,8 @@ class StorageEngine::Impl {
       WorkerStore& store, std::uint64_t block_id, BlockState& source,
       std::uint32_t source_file_id, std::uint64_t source_block_offset,
       std::shared_ptr<const absl::flat_hash_set<std::uint64_t>>
-          committed_txids = nullptr);
+          committed_txids = nullptr,
+      bool stop_on_shutdown = false);
 
   // Drains readers and hands the block back to the allocator. The caller must
   // have observed live_bytes == 0 under store_state_mutex and set `freeing`,

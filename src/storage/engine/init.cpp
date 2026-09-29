@@ -1403,7 +1403,6 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   // can their auxiliary graphs be adjudicated against every durable commit.
   // Do this before expiration or orphan reclamation can retire any graph.
   status = co_await RecoverGroupedObjects(store);
-  if (status.ok()) status = co_await ValidateRecoveredGroups(store);
   if (!status.ok()) {
     Fail(status);
     co_return status;
@@ -1700,8 +1699,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   // an uncommitted prepare nor a superseded incarnation contributes bytes.
   // Flush per extent as well as per group, keeping a single oversized Hash
   // from defeating the worker's bounded recovery-batch memory target.
-  for (const RecoveryRecord& recovered : store.recovery_hash_groups_) {
-    if (!recovered.grouped_reachable_) continue;
+  for (const RecoveryLiveGroup& recovered : store.recovery_live_groups_) {
     const RecordLocation& location = recovered.location_;
     if (location.block_owner() >= worker_count_) {
       status =
@@ -1713,18 +1711,15 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         .block_id_ = location.block_id(),
         .allocation_epoch_ = location.allocation_epoch(),
         .txid_ = recovered.txid_,
-        .batch_txid_ = recovered.auxiliary_group_.has_value()
-                           ? recovered.auxiliary_group_->batch_txid_
-                       : recovered.ordered_group_.has_value()
-                           ? recovered.ordered_group_->batch_txid_
-                           : 0,
+        .batch_txid_ = recovered.batch_txid_,
         .bytes_ = location.total_disk_bytes(),
         .expected_owner_ = location.block_owner(),
     });
     buffered_bytes += sizeof(RecoveryLiveReference);
-    if (recovered.extents_ != nullptr) {
-      for (std::size_t index = 0; index < recovered.extents_->size(); ++index) {
-        const ExtentRef& extent = recovered.extents_->at(index);
+    const ExtentManifest& extents = recovered.extents_;
+    if (extents != nullptr) {
+      for (std::size_t index = 0; index < extents->size(); ++index) {
+        const ExtentRef& extent = extents->at(index);
         const std::uint16_t owner = BlockOwner(extent.block_id_);
         if (owner >= worker_count_) {
           status = absl::DataLossError("Hash group has an unscanned extent");
@@ -1764,7 +1759,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     }
   }
   store.recovery_hash_groups_.clear();
-  store.recovery_hash_groups_.shrink_to_fit();
+  store.recovery_live_groups_.clear();
   status = co_await ApplyRecoveryLiveReferenceBatches(store, &live_by_owner);
   if (!status.ok()) {
     Fail(status);

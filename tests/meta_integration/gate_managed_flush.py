@@ -255,11 +255,18 @@ def storage_failure(root, command, kind, device):
         wait_durable(source)
         failure.touch()
         try:
-            rejects(
-                writer,
-                (command,),
-                "short write" if kind == "short" else f"epoch {kind} failure",
-            )
+            expected = "short write" if kind == "short" else f"epoch {kind} failure"
+            try:
+                reply = writer.call(command)
+            except H.Failure as error:
+                # The runtime failure fence can retire the existing client
+                # before its command error is delivered. The fresh-client
+                # LOADING check below still proves that serving was fenced.
+                assert expected in str(error) or str(error) == (
+                    "Data closed its Redis connection"
+                ), error
+            else:
+                raise AssertionError(f"{command} unexpectedly returned {reply}")
             assert "LOADING" in F.redis_error(source, ["SET", "unsafe", "x"])
             # The armed fault remains present. Returning promptly is evidence
             # that this command did not add retry-until-success behavior.

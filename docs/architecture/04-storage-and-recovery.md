@@ -956,8 +956,10 @@ worker-wide snapshot of block membership and commit decisions. That ordering
 makes the membership of eligible transactions complete even when
 workers append concurrently. A final snapshot after promotion confirms that
 no live tagged winner still needs each decision. Online cleaning yields to
-shutdown at block boundaries after already-published relocations become durable.
-When a shutdown checkpoint is enabled, worker 0 ignores the online cooldown
+shutdown between record relocations, retaining the source allocation and any
+outstanding destination durability fences. The shutdown flush makes staged
+copies durable before publishing its clean-shutdown proof. When a shutdown
+checkpoint is enabled, worker 0 ignores the online cooldown
 and completes this lifecycle to a fixed point after commit and flush drain;
 failure skips the checkpoint rather than weakening cold recovery.
 

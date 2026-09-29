@@ -132,10 +132,6 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     MetaOperationId controlled_operation_id_ = Bytes<16>(0x31);
   };
 
-  // Ordinary fixture writes need the normal completion budget under parallel
-  // load. Only the explicit proposal-timeout test shortens it.
-  virtual std::uint64_t ProposeTimeoutMs() const { return 5'000; }
-
   void SetUp() override {
     const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
     dir_ = test::TestDataDirectory() /
@@ -181,7 +177,8 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     server_ = std::move(*raft);
     MetaCoordinatorOptions coordinator_options;
     coordinator_options.foreign_executor_ = executor_;
-    coordinator_options.propose_timeout_ms_ = ProposeTimeoutMs();
+    // SeedCluster uses real Raft proposals, including in the timeout test.
+    coordinator_options.propose_timeout_ms_ = 5'000;
     coordinator_options.proposal_executor_ = &proposal_executor_;
     {
       std::lock_guard lock(role_mutex_);
@@ -682,7 +679,20 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
 class MetaAutomaticFailoverReconcilerTimeoutTest
     : public MetaAutomaticFailoverReconcilerTest {
  protected:
-  std::uint64_t ProposeTimeoutMs() const override { return 100; }
+  void ArmShortProposalTimeout() {
+    // SeedCluster uses real Raft proposals and needs the ordinary deadline
+    // under CI scheduling pressure. Recreate the idle coordinator only after
+    // seeding, before installing the reconciler under test.
+    std::lock_guard lock(role_mutex_);
+    coordinator_.reset();
+    MetaCoordinatorOptions options;
+    options.foreign_executor_ = executor_;
+    options.propose_timeout_ms_ = 100;
+    options.proposal_executor_ = &proposal_executor_;
+    coordinator_ = std::make_unique<MetaCoordinator>(server_, *machine_,
+                                                     observations_, options);
+    coordinator_->BecomeLeader(server_->get_term());
+  }
 };
 
 TEST_F(MetaAutomaticFailoverReconcilerTest,
@@ -1069,6 +1079,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 TEST_F(MetaAutomaticFailoverReconcilerTimeoutTest,
        UncertainRetryBackoffStartsAfterProposalReturns) {
   SeedCluster();
+  ArmShortProposalTimeout();
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids, 0x90), /*grace_ms=*/0);
   StartEligibleTerm();

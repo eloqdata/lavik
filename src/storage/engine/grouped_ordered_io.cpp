@@ -112,11 +112,12 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
         co_return absl::NotFoundError("ordered root changed during read");
       }
       auto current = partition.grouped_objects_[db_id].Lookup(
-          key, GroupedObjectVersion{
-                   .root_ = MaterializeIndexLocation(**resolved),
-                   .db_epoch_ = original.db_epoch_,
-                   .replication_epoch_ = original.replication_epoch_,
-                   .index_generation_ = original.index_generation_});
+          digest, key,
+          GroupedObjectVersion{
+              .root_ = MaterializeIndexLocation(**resolved),
+              .db_epoch_ = original.db_epoch_,
+              .replication_epoch_ = original.replication_epoch_,
+              .index_generation_ = original.index_generation_});
       if (!current.ok()) co_return current.status();
       if (*current == nullptr || !(*current)->is_ordered() ||
           (*current)->ordered_directory().root() != root) {
@@ -141,22 +142,15 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
                                        original.db_epoch_);
     } else {
       const unsigned owner = location.block_owner();
-      // Page scratch excludes the parent key. Admit the remote reader's copy
-      // here for every caller, and retain admission through the awaited read.
-      auto key_admission =
-          TryReserveMemory(AllocatorUsableSizeForRequest(key.size() + 1));
-      if (!key_admission) {
-        RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
-            "OOM grouped parent key copy admission");
-      }
+      // The caller keeps key alive across this awaited hop. Borrowing it avoids
+      // copying a multi-megabyte parent once for every small ordered page.
       loaded = co_await bycorf::SubmitTaskTo(
           owner,
-          [this, owner, db_id, owned_key = std::string(key), location,
+          [this, owner, db_id, key, location,
            epoch = original.replication_epoch_,
            db_epoch =
                original.db_epoch_]() -> Task<absl::StatusOr<LoadedValue>> {
-            co_return co_await LoadValueLocal(*stores_[owner], db_id, owned_key,
+            co_return co_await LoadValueLocal(*stores_[owner], db_id, key,
                                               location, epoch, nullptr,
                                               db_epoch);
           });

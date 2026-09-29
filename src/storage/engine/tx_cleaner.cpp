@@ -514,8 +514,9 @@ Task<absl::Status> StorageEngine::Impl::PromoteTxBlockLocal(
 
   absl::Status promoted = absl::OkStatus();
   if (has_live_records)
-    promoted = co_await SalvageBlockRecords(store, block.block_id_, *source,
-                                            file_id, offset, committed);
+    promoted =
+        co_await SalvageBlockRecords(store, block.block_id_, *source, file_id,
+                                     offset, committed, !shutdown_drain);
   std::vector<RelocationDurabilityFence> fences;
   co_await store.store_state_mutex_.Lock();
   if (const auto owed = store.pending_relocation_fences_.find(block.block_id_);
