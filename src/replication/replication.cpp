@@ -8944,6 +8944,10 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlowData(
   auto state = std::make_shared<ReplicaHandoffState>();
   absl::Status result = co_await ReceiveReplicaFlowData(
       stream, session, flow_id, state, ack_ranges);
+  // Preserve the failure that initiated teardown. Joining outstanding handoffs
+  // can report cancellation after stopping_ is set; that secondary error must
+  // not hide a corrupt frame (or an earlier handoff failure).
+  if (!result.ok() && state->status_.ok()) state->status_ = result;
   // No task may retain the stream or mutate this attempt after its owning
   // flow returns to the coordinator's abort/reparent cleanup.
   state->stopping_ = true;

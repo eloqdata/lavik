@@ -1041,6 +1041,7 @@ TEST_P(GroupedFullDiskExpirationE2e, ReclaimsGraphAndRecovers) {
   const bool indexed = type == ValueType::kSortedSet;
   PrivateDisk disk((indirect_key ? (indexed ? 184ULL : 136ULL) : 80ULL) * 1024 *
                    1024);
+  disk.PreserveOnFailure();
   const std::string member(
       indirect_key ? 9 * 1024 * 1024 : (indexed ? 512 : 1024) * 1024, 'v');
   absl::StatusOr<std::string> compact;
@@ -1072,6 +1073,7 @@ TEST_P(GroupedFullDiskExpirationE2e, ReclaimsGraphAndRecovers) {
   const std::string replacement = indirect_key ? member : "space reclaimed";
   {
     Server server(disk, 1);
+    server.PreserveOnFailure();
     Client client(server.port());
     ASSERT_EQ(
         client.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}).text_,
@@ -1149,6 +1151,7 @@ TEST_P(GroupedFullDiskExpirationE2e, ReclaimsGraphAndRecovers) {
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   Server recovered(disk, 2);
+  recovered.PreserveOnFailure();
   Client client(recovered.port());
   EXPECT_EQ(client.Command({"DBSIZE"}).text_, "1");
   for (const auto& key : expired_keys)

@@ -283,7 +283,12 @@ class Client {
       Check(n > 0, "send failed");
       remaining.remove_prefix(n);
     }
-    return Read();
+    try {
+      return Read();
+    } catch (const std::runtime_error& error) {
+      throw std::runtime_error((args.empty() ? "command" : args.front()) +
+                               ": " + error.what());
+    }
   }
   void Durable() {
     const auto until = std::chrono::steady_clock::now() + 20s;
@@ -303,7 +308,15 @@ class Client {
     for (std::size_t offset = 0; offset < size;) {
       const auto n = ::recv(fd_, bytes.data() + offset, size - offset, 0);
       if (n < 0 && errno == EINTR) continue;
-      Check(n > 0, "response ended early");
+      if (n < 0) {
+        const int error = errno;
+        throw std::runtime_error(
+            std::string(error == EAGAIN || error == EWOULDBLOCK
+                            ? "response timed out: "
+                            : "receiving response failed: ") +
+            std::strerror(error) + " (errno=" + std::to_string(error) + ")");
+      }
+      Check(n != 0, "connection closed before response completed");
       offset += n;
     }
     return bytes;
