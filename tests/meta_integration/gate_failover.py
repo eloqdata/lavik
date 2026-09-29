@@ -605,6 +605,8 @@ class ContinuousSetProbe:
         self._failure = None
         self._attempts = 0
         self._successes = []
+        self._fence_disconnects_allowed = False
+        self._fence_disconnects = 0
 
     def start(self):
         self._thread = threading.Thread(
@@ -622,6 +624,21 @@ class ContinuousSetProbe:
                     ["SET", self.key, f"{self.writer}-{sequence}"]
                 )
             except Exception as error:  # noqa: BLE001 - first gap is evidence
+                # The cluster gate deliberately closes an uncertain command
+                # instead of inventing a rejection after authority changes.
+                # Count those attempts without calling them successful. All
+                # other transport failures remain fatal to this probe.
+                with self._lock:
+                    expected_fence = (
+                        self._fence_disconnects_allowed
+                        and str(error) == "Data command SET returned no RESP line"
+                    )
+                    if expected_fence:
+                        self._fence_disconnects += 1
+                        self._attempts += 1
+                if expected_fence:
+                    self._stop.wait(0.02)
+                    continue
                 self._record_failure(f"SET transport failed: {error}")
                 break
             completed_ns = time.monotonic_ns()
@@ -644,6 +661,14 @@ class ContinuousSetProbe:
             failure = self._failure
         if failure is not None:
             raise H.Failure(f"{self.writer} write probe failed: {failure}")
+
+    def allow_fence_disconnects(self):
+        with self._lock:
+            self._fence_disconnects_allowed = True
+
+    def fence_disconnects(self):
+        with self._lock:
+            return self._fence_disconnects
 
     def successes(self):
         with self._lock:
@@ -2311,6 +2336,9 @@ def run_lease_fence(
         operation_id = fixture.submit_failover()
         if not fixture.wait_post_authorize_pause():
             raise H.Failure("lease-fence requires the deterministic post-Authorize cut")
+        old_write_probe.allow_fence_disconnects()
+        for probe in replica_write_probes.values():
+            probe.allow_fence_disconnects()
         begin = require_unique_failover_event(
             fixture.metas, "begin", "controlled", loss="none"
         )
@@ -2413,6 +2441,7 @@ def run_lease_fence(
             f"successor={successor} "
             f"old_successes={len(old_successes)} "
             f"new_successes={len(new_successes)} "
+            f"fence_disconnects={old_write_probe.fence_disconnects() + sum(probe.fence_disconnects() for probe in replica_write_probes.values())} "
             f"non_overlap_gap_ms={handoff_gap_ms:.3f}"
         )
 
