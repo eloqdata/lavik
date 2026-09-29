@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <mimalloc.h>
+
 #include <tuple>
 
 #include "impl.h"
@@ -970,12 +972,46 @@ absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
     // appending to one would otherwise dereference an absent in-memory copy.
   }
 
-  for (const RecoveryRecord& recovered : batch.records_) {
+  for (RecoveryRecord& recovered : batch.records_) {
     if (recovered.auxiliary_group_.has_value()) {
       // Auxiliaries are not user-key versions. Keep committed and prepared
       // candidates separate from the root index until the global decision
       // barrier can adjudicate the entire graph together.
-      store.recovery_hash_groups_.push_back(recovered);
+      const auto found = store.recovery_aux_keys_.find(recovered.key());
+      const std::string* key = nullptr;
+      if (found == store.recovery_aux_keys_.end()) {
+        std::shared_ptr<const std::string> owned =
+            recovered.indirect_key_ ? std::move(recovered.indirect_key_)
+                                    : std::make_shared<const std::string>(
+                                          std::move(recovered.key_));
+        key = owned.get();
+        store.recovery_aux_keys_.emplace(std::string_view(*key),
+                                         std::move(owned));
+      } else {
+        key = found->second.get();
+      }
+      std::uint32_t extent_token = 0;
+      if (recovered.extents_) {
+        if (store.recovery_aux_extents_.size() >=
+            std::numeric_limits<std::uint32_t>::max()) {
+          return absl::ResourceExhaustedError(
+              "too many external grouped recovery candidates");
+        }
+        store.recovery_aux_extents_.push_back(std::move(recovered.extents_));
+        extent_token =
+            static_cast<std::uint32_t>(store.recovery_aux_extents_.size());
+      }
+      store.recovery_hash_groups_.push_back(RecoveryAuxiliaryRecord{
+          .key_ = key,
+          .db_id_ = recovered.db_id_,
+          .location_ = recovered.location_,
+          .extent_token_ = extent_token,
+          .auxiliary_group_ = std::move(*recovered.auxiliary_group_),
+          .ordered_group_ = recovered.ordered_group_
+                                ? std::make_unique<RecoveredOrderedGroup>(
+                                      std::move(*recovered.ordered_group_))
+                                : nullptr,
+      });
       continue;
     }
     if (recovered.txid_ != 0) {
@@ -1201,14 +1237,22 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
   // Group candidates by logical key once. Recovery memory is proportional to
   // scanned auxiliary metadata, never to retained field/value bodies; a root
   // examines only its own candidates rather than rescanning all large keys.
-  std::sort(
-      records.begin(), records.end(),
-      [](const RecoveryRecord& left, const RecoveryRecord& right) {
-        if (left.db_id_ != right.db_id_) return left.db_id_ < right.db_id_;
-        if (left.indirect_key_ && left.indirect_key_ == right.indirect_key_)
-          return false;
-        return left.key() < right.key();
-      });
+  std::sort(records.begin(), records.end(),
+            [](const RecoveryAuxiliaryRecord& left,
+               const RecoveryAuxiliaryRecord& right) {
+              if (left.db_id_ != right.db_id_)
+                return left.db_id_ < right.db_id_;
+              if (left.key_ == right.key_) return false;
+              return left.key() < right.key();
+            });
+  struct RootToRecover {
+    const RecordIndex::Entry* entry_;
+    const RecoveredGroupedRoot* root_;
+    std::string_view key_;
+    std::uint8_t db_id_;
+  };
+  std::vector<RootToRecover> roots;
+  roots.reserve(store.recovery_grouped_roots_.size());
   for (const auto& [entry, root] : store.recovery_grouped_roots_) {
     const RecordLocation location = MaterializeIndexLocation(*entry);
     if (!location.grouped()) {
@@ -1246,54 +1290,113 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       co_return absl::DataLossError(
           "grouped recovery root is not a key winner");
     }
-    const auto lower = std::lower_bound(
-        records.begin(), records.end(), std::pair(*root_db, key),
-        [](const RecoveryRecord& record, const auto& target) {
-          return std::pair(record.db_id_, record.key()) < target;
-        });
+    roots.push_back({entry, &root, key, *root_db});
+  }
+  std::sort(roots.begin(), roots.end(),
+            [](const RootToRecover& left, const RootToRecover& right) {
+              return std::pair(left.db_id_, left.key_) <
+                     std::pair(right.db_id_, right.key_);
+            });
+  // The sorted roots let us release every superseded physical version as
+  // soon as its logical key has been rebuilt. The old full-history deque must
+  // not coexist with the complete in-memory grouped-object graph.
+  std::size_t released_since_collect = 0;
+  auto collect_released = [&] {
+    // A deque frees 512-byte blocks here, but mimalloc can keep the vacant
+    // pages committed while later graph allocations use other size classes.
+    // Purge them on this worker periodically so cold recovery's resident peak
+    // reflects live metadata rather than the entire prior candidate table.
+    if (released_since_collect >= 250'000) {
+      mi_collect(true);
+      released_since_collect = 0;
+    }
+  };
+  for (const RootToRecover& selected_root : roots) {
+    const auto [entry, root, key, root_db] = selected_root;
+    while (!records.empty() &&
+           std::pair(records.front().db_id_, records.front().key()) <
+               std::pair(root_db, key)) {
+      if (records.front().extent_token_ != 0) {
+        store.recovery_aux_extents_[records.front().extent_token_ - 1].reset();
+      }
+      records.pop_front();
+      ++released_since_collect;
+      collect_released();
+    }
+    const auto lower = records.begin();
+    auto end = lower;
+    while (end != records.end() && end->db_id_ == root_db && end->key() == key)
+      ++end;
+    const std::size_t candidate_count = end - lower;
+    auto retain_selected = [&]() -> Task<absl::Status> {
+      for (std::size_t i = 0; i < candidate_count; ++i) {
+        RecoveryAuxiliaryRecord& physical = records.front();
+        if (physical.grouped_reachable_) {
+          auto checked = co_await ValidateRecoveredGroup(store, physical);
+          if (!checked.ok()) co_return checked;
+          ExtentManifest extents;
+          if (physical.extent_token_ != 0) {
+            extents = std::move(
+                store.recovery_aux_extents_.at(physical.extent_token_ - 1));
+          }
+          store.recovery_live_groups_.push_back(RecoveryLiveGroup{
+              .location_ = physical.location_,
+              .extents_ = std::move(extents),
+              .txid_ = physical.auxiliary_group_.txid_,
+              .batch_txid_ = physical.auxiliary_group_.batch_txid_,
+          });
+        }
+        if (physical.extent_token_ != 0) {
+          // The selected manifest moved to its compact accounting record;
+          // unselected manifests have no owner and can be freed now.
+          store.recovery_aux_extents_[physical.extent_token_ - 1].reset();
+        }
+        records.pop_front();
+      }
+      released_since_collect += candidate_count;
+      collect_released();
+      co_return absl::OkStatus();
+    };
+    auto& partition = PartitionForKey(store, key);
+    const RecordLocation location = MaterializeIndexLocation(*entry);
     const GroupedObjectVersion version{
         .root_ = location,
-        .db_epoch_ = DbEpoch(*root_db),
+        .db_epoch_ = DbEpoch(root_db),
         .replication_epoch_ = partition.replication_epoch_,
-        .index_generation_ = partition.grouped_generations_[*root_db],
+        .index_generation_ = partition.grouped_generations_[root_db],
     };
-    if (const auto* ordered = std::get_if<OrderedCollectionRoot>(&root)) {
-      auto end = lower;
-      while (end != records.end() && end->db_id_ == *root_db &&
-             end->key() == key)
-        ++end;
-      auto object = co_await RecoverOrderedObject(
-          store, *ordered, version,
-          std::span(records).subspan(lower - records.begin(), end - lower));
+    if (const auto* ordered = std::get_if<OrderedCollectionRoot>(root)) {
+      auto object =
+          co_await RecoverOrderedObject(store, *ordered, version, lower, end);
       if (!object.ok()) co_return object.status();
-      auto published = partition.grouped_objects_[*root_db].Publish(
+      auto published = partition.grouped_objects_[root_db].Publish(
           key, nullptr, std::move(*object));
       if (!published.ok()) co_return published;
+      auto retained = co_await retain_selected();
+      if (!retained.ok()) co_return retained;
       continue;
     }
     std::vector<RecoveredHashGroup> candidates;
-    for (auto it = lower;
-         it != records.end() && it->db_id_ == *root_db && it->key() == key;
-         ++it) {
-      auto candidate = *it->auxiliary_group_;
+    for (auto it = lower; it != end; ++it) {
+      auto candidate = it->auxiliary_group_;
       candidate.record_token_ =
           static_cast<std::uint64_t>(it - records.begin());
       candidates.push_back(candidate);
     }
     auto directory = HashGroupDirectory::Recover(
-        std::get<GroupedHashRoot>(root), location.mutation_sequence_,
+        std::get<GroupedHashRoot>(*root), location.mutation_sequence_,
         candidates, recovery_committed_txids_);
     if (!directory.ok()) co_return directory.status();
     std::vector<HashGroupLocation> locations;
     locations.reserve(directory->groups().size() +
                       directory->retired_groups().size());
     auto append_location = [&](const RecoveredHashGroup& selected) {
-      RecoveryRecord& physical = records.at(selected.record_token_);
+      RecoveryAuxiliaryRecord& physical = records.at(selected.record_token_);
       physical.grouped_reachable_ = true;
       locations.push_back(HashGroupLocation{
           .id_ = selected.id_,
           .location_ = physical.location_,
-          .extents_ = physical.extents_,
+          .extents_ = store.AuxiliaryExtents(physical),
           .retired_ = selected.retired_,
       });
     };
@@ -1310,26 +1413,34 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
         GroupedHashObject::Create(version, std::move(*directory), locations,
                                   store.record_index_entry_arena_);
     if (!object.ok()) co_return object.status();
-    auto published = partition.grouped_objects_[*root_db].Publish(
+    auto published = partition.grouped_objects_[root_db].Publish(
         key, nullptr, std::move(*object));
     if (!published.ok()) co_return published;
+    auto retained = co_await retain_selected();
+    if (!retained.ok()) co_return retained;
   }
+  records.clear();
+  store.recovery_aux_keys_.clear();
+  store.recovery_aux_keys_.rehash(0);
+  store.recovery_aux_extents_.clear();
+  store.recovery_aux_extents_.shrink_to_fit();
+  mi_collect(true);
   store.recovery_grouped_roots_.clear();
   store.recovery_grouped_roots_.rehash(0);
   co_return absl::OkStatus();
 }
 
 Task<absl::StatusOr<GroupedHashObject::Handle>>
-StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
-                                          const OrderedCollectionRoot& root,
-                                          GroupedObjectVersion version,
-                                          std::span<RecoveryRecord> records) {
+StorageEngine::Impl::RecoverOrderedObject(
+    WorkerStore& store, const OrderedCollectionRoot& root,
+    GroupedObjectVersion version, RecoveryAuxiliaryRecords::iterator first,
+    RecoveryAuxiliaryRecords::iterator last) {
   const auto revision =
       root.revision_ == 0 ? version.root_.mutation_sequence_ : root.revision_;
   std::map<std::uint64_t, std::size_t> winners;
   std::vector<RecoveredHashGroup> member_candidates;
-  for (std::size_t i = 0; i < records.size(); ++i) {
-    const auto& candidate = *records[i].auxiliary_group_;
+  for (std::size_t i = 0; i < static_cast<std::size_t>(last - first); ++i) {
+    const auto& candidate = first[i].auxiliary_group_;
     if (candidate.incarnation_ != root.incarnation_ ||
         candidate.sequence_ > revision ||
         (candidate.txid_ != 0 &&
@@ -1337,7 +1448,7 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
         (candidate.batch_txid_ != 0 &&
          !recovery_committed_txids_.contains(candidate.batch_txid_)))
       continue;
-    if (records[i].location_.value_type() != version.root_.value_type()) {
+    if (first[i].location_.value_type() != version.root_.value_type()) {
       co_return absl::DataLossError("ordered candidate has a different type");
     }
     if (!IsOrderedPageId(candidate.id_)) {
@@ -1350,7 +1461,7 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
     }
     auto [position, inserted] = winners.emplace(candidate.id_.prefix_, i);
     if (inserted) continue;
-    const auto& previous = *records[position->second].auxiliary_group_;
+    const auto& previous = first[position->second].auxiliary_group_;
     if (candidate.sequence_ == previous.sequence_ &&
         (candidate.field_count_ != previous.field_count_ ||
          candidate.encoded_bytes_ != previous.encoded_bytes_ ||
@@ -1366,8 +1477,8 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
   std::vector<RecoveredOrderedGroup> candidates;
   candidates.reserve(winners.size());
   for (const auto& [id, token] : winners) {
-    auto& physical = records[token];
-    const auto& header = *physical.auxiliary_group_;
+    auto& physical = first[token];
+    const auto& header = physical.auxiliary_group_;
     RecoveredOrderedGroup candidate{
         .incarnation_ = header.incarnation_,
         .id_ = id,
@@ -1382,11 +1493,12 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
         .retired_ = header.retired_,
     };
     if (physical.location_.external()) {
-      if (physical.extents_ == nullptr) {
+      const ExtentManifest& extents = store.AuxiliaryExtents(physical);
+      if (extents == nullptr) {
         co_return absl::DataLossError("ordered page has no extent manifest");
       }
       std::size_t bytes = 0;
-      for (const auto& extent : *physical.extents_) {
+      for (const auto& extent : *extents) {
         if (bytes > kMaxRecordPayloadBytes - extent.payload_bytes_)
           co_return absl::DataLossError("ordered page payload is too large");
         bytes += extent.payload_bytes_;
@@ -1398,7 +1510,7 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
       // routing envelope and two score bounds survive, even for huge members.
       OrderedGroupMetadataDecoder decoder(bytes);
       auto prefix = co_await LoadRecoveryPayloadPrefix(
-          store, physical.extents_, kOrderedGroupHeaderBytes, &decoder);
+          store, extents, kOrderedGroupHeaderBytes, &decoder);
       if (!prefix.ok()) co_return prefix.status();
       auto metadata = decoder.Finish();
       if (!metadata.ok()) co_return metadata.status();
@@ -1415,7 +1527,7 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
       candidate.min_score_ = metadata->min_score_;
       candidate.max_score_ = metadata->max_score_;
     } else {
-      if (!physical.ordered_group_.has_value())
+      if (!physical.ordered_group_)
         co_return absl::DataLossError("ordered inline page has no metadata");
       candidate.previous_ = physical.ordered_group_->previous_;
       candidate.next_ = physical.ordered_group_->next_;
@@ -1440,12 +1552,12 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
   std::vector<HashGroupLocation> locations;
   locations.reserve(candidates.size());
   const auto append = [&](const RecoveredOrderedGroup& candidate) {
-    auto& physical = records[candidate.record_token_ - 1];
+    auto& physical = first[candidate.record_token_ - 1];
     physical.grouped_reachable_ = true;
     locations.push_back(HashGroupLocation{
         .id_ = {.prefix_ = candidate.id_, .bits_ = 0},
         .location_ = physical.location_,
-        .extents_ = physical.extents_,
+        .extents_ = store.AuxiliaryExtents(physical),
         .retired_ = candidate.retired_,
     });
   };
@@ -1453,11 +1565,11 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
   for (const auto& candidate : directory->retired_groups()) append(candidate);
   if (const auto* member_directory = directory->member_directory()) {
     auto append_member = [&](const RecoveredHashGroup& candidate) {
-      auto& physical = records[candidate.record_token_];
+      auto& physical = first[candidate.record_token_];
       physical.grouped_reachable_ = true;
       locations.push_back({.id_ = candidate.id_,
                            .location_ = physical.location_,
-                           .extents_ = physical.extents_,
+                           .extents_ = store.AuxiliaryExtents(physical),
                            .retired_ = candidate.retired_});
     };
     for (const auto& [prefix, member] : member_directory->groups())
@@ -1470,46 +1582,45 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
                                              store.record_index_entry_arena_);
 }
 
-Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroups(
-    WorkerStore& store) {
-  for (const RecoveryRecord& record : store.recovery_hash_groups_) {
-    if (!record.grouped_reachable_ || !record.location_.external()) continue;
-    // Ordered winners were fully checksummed while resolving their links;
-    // there is no reason to read their potentially huge bodies twice.
-    if ((record.location_.value_type() == ValueType::kString ||
-         record.location_.value_type() == ValueType::kList ||
-         record.location_.value_type() == ValueType::kSortedSet ||
-         record.location_.value_type() == ValueType::kStream) &&
-        IsOrderedPageId(record.auxiliary_group_->id_))
-      continue;
-    if (record.extents_ == nullptr) {
+Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroup(
+    WorkerStore& store, const RecoveryAuxiliaryRecord& record) {
+  if (!record.location_.external()) co_return absl::OkStatus();
+  // Ordered winners were fully checksummed while resolving their links;
+  // there is no reason to read their potentially huge bodies twice.
+  if ((record.location_.value_type() == ValueType::kString ||
+       record.location_.value_type() == ValueType::kList ||
+       record.location_.value_type() == ValueType::kSortedSet ||
+       record.location_.value_type() == ValueType::kStream) &&
+      IsOrderedPageId(record.auxiliary_group_.id_))
+    co_return absl::OkStatus();
+  const ExtentManifest& extents = store.AuxiliaryExtents(record);
+  if (extents == nullptr) {
+    co_return absl::DataLossError(
+        "live recovered group has no extent manifest");
+  }
+  std::size_t encoded_bytes = 0;
+  for (const ExtentRef& ref : *extents) {
+    if (encoded_bytes > kMaxRecordPayloadBytes - ref.payload_bytes_) {
       co_return absl::DataLossError(
-          "live recovered group has no extent manifest");
+          "live recovered group payload is too large");
     }
-    std::size_t encoded_bytes = 0;
-    for (const ExtentRef& ref : *record.extents_) {
-      if (encoded_bytes > kMaxRecordPayloadBytes - ref.payload_bytes_) {
-        co_return absl::DataLossError(
-            "live recovered group payload is too large");
-      }
-      encoded_bytes += ref.payload_bytes_;
-    }
-    // This retains only a bounded envelope, but checks every byte of every
-    // selected extent. Unreachable groups never reach this read: a freed or
-    // reused obsolete extent cannot make an otherwise valid startup fail.
-    auto prefix = co_await LoadRecoveryPayloadPrefix(store, record.extents_,
-                                                     kHashGroupHeaderBytes);
-    if (!prefix.ok()) co_return prefix.status();
-    auto decoded = DecodeHashGroupMetadata(*prefix, encoded_bytes);
-    if (!decoded.ok()) co_return decoded.status();
-    const RecoveredHashGroup& expected = *record.auxiliary_group_;
-    if (decoded->incarnation_ != expected.incarnation_ ||
-        decoded->id_ != expected.id_ ||
-        decoded->field_count_ != expected.field_count_ ||
-        decoded->retired_ != expected.retired_) {
-      co_return absl::DataLossError(
-          "live Hash group envelope disagrees with its record identity");
-    }
+    encoded_bytes += ref.payload_bytes_;
+  }
+  // This retains only a bounded envelope, but checks every byte of every
+  // selected extent. Unreachable groups never reach this read: a freed or
+  // reused obsolete extent cannot make an otherwise valid startup fail.
+  auto prefix =
+      co_await LoadRecoveryPayloadPrefix(store, extents, kHashGroupHeaderBytes);
+  if (!prefix.ok()) co_return prefix.status();
+  auto decoded = DecodeHashGroupMetadata(*prefix, encoded_bytes);
+  if (!decoded.ok()) co_return decoded.status();
+  const RecoveredHashGroup& expected = record.auxiliary_group_;
+  if (decoded->incarnation_ != expected.incarnation_ ||
+      decoded->id_ != expected.id_ ||
+      decoded->field_count_ != expected.field_count_ ||
+      decoded->retired_ != expected.retired_) {
+    co_return absl::DataLossError(
+        "live Hash group envelope disagrees with its record identity");
   }
   co_return absl::OkStatus();
 }
