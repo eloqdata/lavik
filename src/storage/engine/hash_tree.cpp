@@ -27,6 +27,7 @@
 #include "lavik/random_sample.h"
 #include "lavik/redis_parse.h"
 #include "lavik/storage/detail/grouped_scratch.h"
+#include "lavik/storage/detail/hash_read.h"
 
 namespace lavik::storage {
 
@@ -146,6 +147,65 @@ absl::StatusOr<HashResult> ReadCompactHashResult(std::string_view payload,
 }
 
 }  // namespace
+
+absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
+    std::string_view payload, std::uint32_t field_count,
+    std::string_view field) {
+  // DecodeHashGroupMetadata already checked the empty-group representation
+  // and the minimum payload length. Only the inner encoding remains unchecked.
+  if (field_count == 0) return std::nullopt;
+  auto reader = HashValueReader::Open(payload.substr(kHashGroupHeaderBytes));
+  if (!reader.ok()) return absl::DataLossError(reader.status().message());
+  if (reader->size() != field_count)
+    return absl::DataLossError(
+        "Hash group inner count disagrees with envelope");
+
+  std::optional<std::string_view> matched;
+  // Consume even the entries after a match: Next checks trailing bytes on the
+  // last entry, and a later occurrence of the requested field is corruption.
+  // Find(field) already checked the requested field's route using the persisted
+  // seed. Unrelated fields need neither copying nor digest reconstruction.
+  for (std::size_t i = 0; i < reader->size(); ++i) {
+    auto entry = reader->Next();
+    if (!entry.ok()) return absl::DataLossError(entry.status().message());
+    if (entry->field_ != field) continue;
+    if (matched.has_value())
+      return absl::DataLossError("duplicate Hash field in group");
+    matched = entry->value_;
+  }
+  return matched;
+}
+
+absl::Status RetainHashLookupValue(HashResult& result,
+                                   std::optional<std::string_view> matched) {
+  assert(result.values_.capacity() == 0 &&
+         result.retained_charge_.bytes() == 0);
+  std::size_t retained =
+      sizeof(HashResult) + sizeof(std::optional<std::string>);
+  if (matched)
+    retained += std::max(matched->size(), std::string{}.capacity()) + 1;
+  auto reservation = TryReserveMemory(retained);
+  if (!reservation) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM Hash output retention");
+  }
+  // Reserve before copying out of the page lease, then check actual capacities
+  // before transferring admission to the result. Match other Hash results'
+  // conservative SSO accounting; a missing field still owns one vector slot.
+  if (matched)
+    result.values_.emplace_back(std::in_place, *matched);
+  else
+    result.values_.emplace_back(std::nullopt);
+  retained = sizeof(HashResult) +
+             result.values_.capacity() * sizeof(result.values_[0]);
+  if (matched) retained += result.values_[0]->capacity() + 1;
+  if (retained > reservation->bytes()) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM Hash output retention");
+  }
+  result.retained_charge_.Adopt(&*reservation, retained);
+  return absl::OkStatus();
+}
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -339,6 +399,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
 
     if (grouped != nullptr && operation.fields_.size() == 1 &&
         (operation.kind_ == HashOperationKind::kGet ||
+         operation.kind_ == HashOperationKind::kGetMany ||
          operation.kind_ == HashOperationKind::kExists ||
          operation.kind_ == HashOperationKind::kStringLength)) {
       const std::string_view field = operation.fields_.front();
@@ -354,65 +415,20 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       const auto bytes = loaded->loaded_.value();
       const std::string_view payload(
           reinterpret_cast<const char*>(bytes.data()), bytes.size());
-      std::optional<std::string_view> matched;
-      if (loaded->field_count_ == 0) {
-        if (payload.size() != kHashGroupHeaderBytes)
-          co_return absl::DataLossError("nonempty Hash group has zero fields");
-      } else {
-        if (payload.size() == kHashGroupHeaderBytes)
-          co_return absl::DataLossError("Hash group payload is missing");
-        auto reader =
-            HashValueReader::Open(payload.substr(kHashGroupHeaderBytes));
-        if (!reader.ok())
-          co_return absl::DataLossError(reader.status().message());
-        if (reader->size() != loaded->field_count_)
-          co_return absl::DataLossError(
-              "Hash group inner count disagrees with envelope");
-        // The physical record checksum and envelope were verified by the
-        // loader. Walk the encoded entries to check framing and find the one
-        // field, without copying or hashing every unrelated field and value.
-        // Complete duplicate and route validation remains on full decodes.
-        for (std::size_t i = 0; i < reader->size(); ++i) {
-          auto entry = reader->Next();
-          if (!entry.ok())
-            co_return absl::DataLossError(entry.status().message());
-          if (entry->field_ != field) continue;
-          if (matched.has_value())
-            co_return absl::DataLossError("duplicate Hash field in group");
-          if (!route->id_.contains(
-                  ComputeDigest(entry->field_,
-                                grouped->directory().root().seed_)
-                      .value_))
-            co_return absl::DataLossError("Hash field outside its group route");
-          matched = entry->value_;
+      auto matched = FindHashGroupField(payload, loaded->field_count_, field);
+      if (!matched.ok()) co_return matched.status();
+      switch (operation.kind_) {
+        case HashOperationKind::kExists:
+          result.integer_ = matched->has_value();
+          break;
+        case HashOperationKind::kStringLength:
+          result.integer_ = *matched ? (**matched).size() : 0;
+          break;
+        default: {
+          auto status = RetainHashLookupValue(result, *matched);
+          if (!status.ok()) co_return status;
+          break;
         }
-      }
-      if (operation.kind_ == HashOperationKind::kExists) {
-        result.integer_ = matched.has_value();
-      } else if (operation.kind_ == HashOperationKind::kStringLength) {
-        result.integer_ = matched ? matched->size() : 0;
-      } else {
-        std::size_t retained =
-            sizeof(HashResult) + sizeof(std::optional<std::string>);
-        if (matched)
-          retained += std::max(matched->size(), std::string{}.capacity()) + 1;
-        auto reservation = TryReserveMemory(retained);
-        if (!reservation) {
-          RecordMemoryRejection();
-          co_return absl::ResourceExhaustedError("OOM Hash output retention");
-        }
-        if (matched)
-          result.values_.emplace_back(std::in_place, *matched);
-        else
-          result.values_.emplace_back(std::nullopt);
-        retained = sizeof(HashResult) +
-                   result.values_.capacity() * sizeof(result.values_[0]);
-        if (matched) retained += result.values_[0]->capacity() + 1;
-        if (retained > reservation->bytes()) {
-          RecordMemoryRejection();
-          co_return absl::ResourceExhaustedError("OOM Hash output retention");
-        }
-        result.retained_charge_.Adopt(&*reservation, retained);
       }
       co_return result;
     }

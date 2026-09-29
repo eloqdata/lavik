@@ -588,6 +588,18 @@ TEST(GroupedHashWriteE2e, PromotionAndPointUpdateOnlyRewriteOneGroup) {
   EXPECT_EQ(client.Command({"HEXISTS", "hash", "absent"}).text_, "0");
   EXPECT_EQ(client.Command({"HSTRLEN", "hash", "field1"}).text_, "128");
   EXPECT_EQ(client.Command({"HLEN", "hash"}).text_, "256");
+  for (const auto& field : {"field1", "absent"}) {
+    const auto reply = client.Command({"HMGET", "hash", field});
+    ASSERT_EQ(reply.items_.size(), 1);
+    EXPECT_EQ(reply.items_[0].text_, field == std::string_view("field1")
+                                         ? std::string(128, 'v')
+                                         : "-1");
+  }
+  EXPECT_EQ(client.Command({"HSET", "hash", "empty", ""}).text_, "1");
+  EXPECT_EQ(client.Command({"HGET", "hash", "empty"}).text_, "");
+  EXPECT_EQ(client.Command({"HEXISTS", "hash", "empty"}).text_, "1");
+  EXPECT_EQ(client.Command({"HSTRLEN", "hash", "empty"}).text_, "0");
+  EXPECT_EQ(client.Command({"HSTRLEN", "hash", "absent"}).text_, "0");
 }
 
 TEST(GroupedHashWriteE2e, ConditionalIncrementDeleteAndNewIncarnation) {
@@ -703,6 +715,11 @@ TEST(GroupedHashWriteE2e, SetUsesSameGroupedLifecycleWithSetType) {
   EXPECT_EQ(client.Command({"SISMEMBER", "set", prefix + "0"}).text_, "0");
   EXPECT_EQ(client.Command({"SISMEMBER", "set", "new"}).text_, "1");
   EXPECT_EQ(client.Command({"SISMEMBER", "set", prefix + "255"}).text_, "1");
+  for (const auto& member : {prefix + "0", prefix + "255"}) {
+    const auto reply = client.Command({"SMISMEMBER", "set", member});
+    ASSERT_EQ(reply.items_.size(), 1);
+    EXPECT_EQ(reply.items_[0].text_, member == prefix + "0" ? "0" : "1");
+  }
 }
 
 // Child servers inherit only this scoped fault setting; the target never sees
