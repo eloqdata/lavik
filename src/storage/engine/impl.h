@@ -3631,6 +3631,7 @@ class StorageEngine::Impl {
                          bool shutdown_metadata = false);
 
   struct GroupMutationWrite;
+  // Keep tracing last and omit its argument entirely in non-tracing builds.
   Task<absl::Status> AppendLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -3640,10 +3641,14 @@ class StorageEngine::Impl {
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
       std::uint64_t* committed_sequence = nullptr,
       ReplicationCommandAppend* replication = nullptr,
-      SetLatencyTrace* trace = nullptr, bool capture_fullsync = true,
-      TxUndoLog* replacement_undo = nullptr,
+      bool capture_fullsync = true, TxUndoLog* replacement_undo = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr,
-      GroupMutationWrite* grouped = nullptr);
+      GroupMutationWrite* grouped = nullptr
+#if LAVIK_ENABLE_TRACE
+      ,
+      SetLatencyTrace* trace = nullptr
+#endif
+  );
 
   Task<absl::Status> CaptureRdbSnapshotBeforeWriteLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,

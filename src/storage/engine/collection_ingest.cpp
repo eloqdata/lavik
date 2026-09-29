@@ -479,8 +479,8 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
           std::string_view(reinterpret_cast<const char*>(bytes.data()),
                            bytes.size()),
           RecordKind::kValue, type, expire_at_ms, &writes,
-          location.logical_size_, nullptr, nullptr, replication, nullptr, true,
-          nullptr, mutation_precondition);
+          location.logical_size_, nullptr, nullptr, replication, true, nullptr,
+          mutation_precondition);
       if (!written.ok()) co_return written;
       written = SquashReplicaCollectionUndo(store, *state);
       if (!written.ok()) co_return written;

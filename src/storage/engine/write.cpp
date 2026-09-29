@@ -235,7 +235,12 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
       store, partition, db_id, key, digest, value, RecordKind::kValue,
       ValueType::kString, expire_at_ms, tx,
       std::numeric_limits<std::uint64_t>::max(), nullptr, nullptr, replication,
-      trace, true, nullptr, mutation_precondition);
+      true, nullptr, mutation_precondition
+#if LAVIK_ENABLE_TRACE
+      ,
+      /*grouped=*/nullptr, trace
+#endif
+  );
   if (trace != nullptr) trace->append_done_ns_ = SetTraceNowNanos();
   if (!status.ok()) co_return status;
   result.applied_ = true;
@@ -306,8 +311,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   if (expire_at_ms != 0 && expire_at_ms <= now_ms) {
     absl::Status status = co_await AppendLocked(
         store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
-        ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, nullptr,
-        true, nullptr, mutation_precondition);
+        ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, true,
+        nullptr, mutation_precondition);
     if (!status.ok()) co_return status;
     co_return true;
   }
@@ -338,7 +343,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, digest, value, RecordKind::kValue,
       previous.value_type(), expire_at_ms, tx, previous.logical_size_, nullptr,
-      nullptr, replication, nullptr, true, nullptr, mutation_precondition);
+      nullptr, replication, true, nullptr, mutation_precondition);
   if (!status.ok()) {
     co_return status;
   }
@@ -382,8 +387,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
   const bool expired = IsExpiredNow(*found);
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
-      ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, nullptr, true,
-      nullptr, mutation_precondition);
+      ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, true, nullptr,
+      mutation_precondition);
   if (!status.ok()) co_return status;
   co_return !expired;
 }
@@ -407,7 +412,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRawValueLocked(
   co_return co_await AppendLocked(
       store, partition, db_id, key, digest, value.encoded_, RecordKind::kValue,
       value.value_type_, value.expire_at_ms_, tx, value.logical_size_, nullptr,
-      nullptr, replication, nullptr, true, nullptr, mutation_precondition);
+      nullptr, replication, true, nullptr, mutation_precondition);
 }
 
 Task<absl::StatusOr<RestoreRawResult>> StorageEngine::Impl::RestoreRawValue(
@@ -1039,7 +1044,6 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
           /*commit_retirements=*/nullptr,
           /*committed_sequence=*/nullptr,
           /*replication=*/nullptr,
-          /*trace=*/nullptr,
           /*capture_fullsync=*/true, &undo, &bypass_mutation_precondition);
       if (!appended.ok()) {
         LatchRuntimeFailure(store);
@@ -1063,7 +1067,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
           RecordKind::kTombstone, ValueType::kNone, 0,
           /*tx=*/nullptr, /*logical_size=*/0,
           /*commit_retirements=*/nullptr, /*committed_sequence=*/nullptr,
-          /*replication=*/nullptr, /*trace=*/nullptr,
+          /*replication=*/nullptr,
           /*capture_fullsync=*/false, &undo);
       if (!tombstone.ok()) {
         LatchRuntimeFailure(store);
@@ -1812,10 +1816,14 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     std::uint64_t expire_at_ms, TxShardWrites* tx, std::uint64_t logical_size,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
     std::uint64_t* committed_sequence, ReplicationCommandAppend* replication,
-    [[maybe_unused]] SetLatencyTrace* trace, bool capture_fullsync,
-    TxUndoLog* replacement_undo,
+    bool capture_fullsync, TxUndoLog* replacement_undo,
     const MutationPrecondition* mutation_precondition,
-    GroupMutationWrite* grouped) {
+    GroupMutationWrite* grouped
+#if LAVIK_ENABLE_TRACE
+    ,
+    SetLatencyTrace* trace
+#endif
+) {
   if (RuntimeFailureLatched()) {
     co_return absl::FailedPreconditionError(
         "storage writer is stopped after an IO failure");
