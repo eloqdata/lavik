@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -53,6 +54,42 @@ class MetaCommittedFacts;
 struct NodeControlBatch;
 
 namespace detail {
+
+// Worker-confined result ownership, including the front item while its Raft
+// proposal is in flight. The server's shared byte counter must outlive every
+// queue. Admission never waits; the caller closes an overloaded session so
+// Data can replay its unacknowledged immutable results after reconnecting.
+class PendingDirectiveResults {
+ public:
+  static constexpr std::size_t kMaxCount = 16;
+  static constexpr std::size_t kMaxBytes = 1024 * 1024;
+  static constexpr std::size_t kMaxSharedBytes = 16 * kMaxBytes;
+
+  explicit PendingDirectiveResults(std::size_t& shared_bytes)
+      : shared_bytes_(shared_bytes) {}
+  ~PendingDirectiveResults();
+  PendingDirectiveResults(const PendingDirectiveResults&) = delete;
+  PendingDirectiveResults& operator=(const PendingDirectiveResults&) = delete;
+
+  // Rejection leaves both the argument and budget unchanged. Accounts string
+  // capacities, not just wire lengths; item count bounds container overhead.
+  bool TryPush(cluster::control::DirectiveResult&& result);
+  const cluster::control::DirectiveResult& front() const;
+  bool empty() const noexcept { return entries_.empty(); }
+  // Pop only after the handler has finished borrowing front(). Clear only
+  // after the consumer is joined, or from that consumer after its last await.
+  void Pop();
+  void Clear() noexcept;
+
+ private:
+  struct Entry {
+    cluster::control::DirectiveResult result;
+    std::size_t bytes;
+  };
+  std::size_t& shared_bytes_;
+  std::size_t bytes_ = 0;
+  std::deque<Entry> entries_;
+};
 
 // Worker-local admission gate for sockets that have not yet authenticated and
 // supplied a valid ClientHello. A permit is move-only and releases itself on

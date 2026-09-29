@@ -886,6 +886,20 @@ immutable history and an exact retry still resolves to its original commit
 index after the authority later advances. Terminal receipts are pruned only
 through an explicit replicated command after the retry-retention window.
 
+Each established Data-control session owns one serial result consumer, separate
+from its sole reader and projection publisher. Result submission and Raft
+completion do not block that reader's heartbeats or FenceAck/FullStateApplied
+responses. Pending results, including the in-flight front item, have both a
+per-session count/capacity bound and a server-wide retained-byte budget. Full
+queues close the session without waiting for capacity; Data retains and replays
+unacknowledged results on reconnect. The consumer validates each result against
+fresh committed state and acknowledges only the exact durable receipt. On
+disconnect, demotion, or shutdown, the session discards unsubmitted results and
+drains its accepted proposal to completion or the coordinator's bounded timeout.
+It joins the consumer before releasing transport or term-owned state. A retired
+session cannot send a result acknowledgement; an uncertain append may still
+commit and is reconciled through the same immutable receipt on replay.
+
 Generic operation evidence has no wire type, observation cache, phase-command
 field, or durable summary. Optional progress has explicit business semantics.
 

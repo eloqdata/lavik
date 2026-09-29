@@ -1079,6 +1079,15 @@ if (BUILD_TESTING)
       set_tests_properties(meta_integration.gate_heartbeat_cadence PROPERTIES
         LABELS meta-integration TIMEOUT 120 RUN_SERIAL TRUE)
       add_test(
+        NAME meta_integration.gate_directive_results
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_directive_results.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+      )
+      set_tests_properties(meta_integration.gate_directive_results PROPERTIES
+        LABELS meta-integration TIMEOUT 180 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+      add_test(
         NAME meta_integration.gate_native_replication
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_native_replication.py

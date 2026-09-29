@@ -55,6 +55,76 @@ class MetaDataControlServerTestPeer {
 namespace {
 
 namespace control = lavik::cluster::control;
+using lavik::meta::detail::PendingDirectiveResults;
+
+TEST(MetaDirectiveResultQueueTest, BoundsCountIncludingBorrowedFront) {
+  std::size_t shared_bytes = 0;
+  PendingDirectiveResults queue(shared_bytes);
+  control::DirectiveResult first;
+  first.result = "first";
+  ASSERT_TRUE(queue.TryPush(std::move(first)));
+  const auto* borrowed = &queue.front();
+  for (std::size_t i = 1; i < PendingDirectiveResults::kMaxCount; ++i) {
+    ASSERT_TRUE(queue.TryPush(control::DirectiveResult{}));
+  }
+  EXPECT_EQ(&queue.front(), borrowed);
+  EXPECT_EQ(borrowed->result, "first");
+  const auto charged = shared_bytes;
+  EXPECT_FALSE(queue.TryPush(control::DirectiveResult{}));
+  EXPECT_EQ(shared_bytes, charged);
+  queue.Pop();
+  EXPECT_TRUE(queue.TryPush(control::DirectiveResult{}));
+  queue.Clear();
+  EXPECT_EQ(shared_bytes, 0u);
+  EXPECT_TRUE(queue.empty());
+}
+
+TEST(MetaDirectiveResultQueueTest, BoundsRetainedCapacityAndReturnsBudget) {
+  std::size_t shared_bytes = 0;
+  {
+    PendingDirectiveResults queue(shared_bytes);
+    control::DirectiveResult large;
+    large.result.reserve(PendingDirectiveResults::kMaxBytes / 2);
+    ASSERT_TRUE(queue.TryPush(std::move(large)));
+    const auto charged = shared_bytes;
+    EXPECT_GT(charged, PendingDirectiveResults::kMaxBytes / 2);
+    control::DirectiveResult next;
+    next.result.reserve(PendingDirectiveResults::kMaxBytes / 2);
+    EXPECT_FALSE(queue.TryPush(std::move(next)));
+    EXPECT_EQ(shared_bytes, charged);
+    EXPECT_GE(next.result.capacity(), PendingDirectiveResults::kMaxBytes / 2);
+  }
+  EXPECT_EQ(shared_bytes, 0u);
+}
+
+TEST(MetaDirectiveResultQueueTest, BoundsAggregateAcrossSessions) {
+  std::size_t shared_bytes = 0;
+  std::vector<std::unique_ptr<PendingDirectiveResults>> sessions;
+  auto large_result = [] {
+    control::DirectiveResult result;
+    result.result.resize(PendingDirectiveResults::kMaxBytes / 2);
+    return result;
+  };
+  bool rejected = false;
+  for (unsigned i = 0; i < 40; ++i) {
+    auto queue = std::make_unique<PendingDirectiveResults>(shared_bytes);
+    if (!queue->TryPush(large_result())) {
+      rejected = true;
+      break;
+    }
+    sessions.push_back(std::move(queue));
+  }
+  ASSERT_TRUE(rejected);
+  EXPECT_LE(shared_bytes, PendingDirectiveResults::kMaxSharedBytes);
+  PendingDirectiveResults replacement(shared_bytes);
+  EXPECT_FALSE(replacement.TryPush(large_result()));
+  sessions.front().reset();
+  EXPECT_TRUE(replacement.TryPush(large_result()));
+  replacement.Clear();
+  sessions.clear();
+  EXPECT_EQ(shared_bytes, 0u);
+}
+
 using lavik::meta::BuildCommittedMetaDirectory;
 using lavik::meta::EvaluateLeaseChallenge;
 using lavik::meta::EvaluateReplacementDisposition;
