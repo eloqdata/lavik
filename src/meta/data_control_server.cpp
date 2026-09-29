@@ -56,6 +56,7 @@
 #include "bycorf/runtime/worker.h"
 #include "lavik/cluster/control_transport.h"
 #include "lavik/cluster/lease_clock.h"
+#include "lavik/fault_pause.h"
 #include "lavik/meta/cluster_create.h"
 #include "lavik/meta/control_projector.h"
 #include "lavik/meta/hash.h"
@@ -1329,6 +1330,7 @@ struct MetaDataControlServer::Core {
       term_drain_waiters_;
   std::vector<std::shared_ptr<std::promise<void>>> shutdown_drain_waiters_;
   detail::BoundNodeSessionRegistry bound_node_sessions_;
+  std::size_t pending_directive_result_bytes_ = 0;
   std::map<std::string, std::uint64_t> next_session_generation_;
 };
 
@@ -1344,13 +1346,16 @@ MetaDataControlServer::LifecycleHarnessForTest(
       new MetaDataControlServer(std::move(core)));
 }
 
-// Worker-local coordination shared by the established session's sole reader
-// and commit publisher. These tasks may produce writes concurrently, but
-// SessionIo funnels every frame through one
-// ControlSessionWriter. Only SessionLoop reads and resolves the single pending
-// publisher acknowledgement.
+// Worker-local coordination shared by the established session's sole reader,
+// commit publisher, and serial directive-result consumer. SessionIo funnels
+// their concurrent writes through one ControlSessionWriter. Only SessionLoop
+// reads and resolves the single pending publisher acknowledgement.
 struct LiveSessionState {
+  explicit LiveSessionState(std::shared_ptr<MetaDataControlServer::Core> core)
+      : core_(std::move(core)),
+        directive_results_(core_->pending_directive_result_bytes_) {}
   std::shared_ptr<MetaDataControlServer::Core> core_;
+  detail::PendingDirectiveResults directive_results_;
   bycorf::Worker* worker_ = nullptr;
   bycorf::Connection* connection_ = nullptr;
   SessionIo* io_ = nullptr;
@@ -1390,6 +1395,7 @@ struct LiveSessionState {
   std::optional<absl::Status> terminal_error_;
   std::size_t active_tasks_ = 0;
   bool publisher_running_ = false;
+  bool directive_results_running_ = false;
   bool projection_superseded_ = false;
   bool closing_ = false;
   bycorf::AsyncNotification tasks_changed_;
@@ -2491,10 +2497,17 @@ bycorf::Task<absl::Status> RunSessionPublisher(
 }
 
 bycorf::Task<absl::Status> HandleDirectiveResult(
-    const std::shared_ptr<MetaDataControlServer::Core>& core, SessionIo& io,
-    const control::DirectiveResult& result, std::string_view node_id,
-    const MetaBootIncarnation& boot_id, std::uint64_t leader_term,
-    const control::WireId128& session_id) {
+    const std::shared_ptr<LiveSessionState>& state,
+    const control::DirectiveResult& result,
+    const MetaBootIncarnation& boot_id) {
+  const auto& core = state->core_;
+  auto& io = *state->io_;
+  const auto& node_id = state->node_id_;
+  const auto leader_term = state->leader_term_;
+  const auto& session_id = state->session_id_;
+  if (state->closing_ || !AuthoritySessionsAllowed(*core, leader_term)) {
+    co_return absl::CancelledError("directive result session is retired");
+  }
   auto parsed_boot = ParseIdentity<20>(result.recipient_boot_id,
                                        "directive result recipient boot id");
   if (!parsed_boot.ok() || *parsed_boot != boot_id ||
@@ -2588,9 +2601,23 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
       .status_ = status,
       .result_ = result.result,
   };
+  LAVIK_FAULT_INJECT({
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_TEST_META_DIRECTIVE_RESULT_HOLD_FILE");
+    if (!paused.ok()) co_return paused;
+    if (state->closing_ || !AuthoritySessionsAllowed(*core, leader_term)) {
+      co_return absl::CancelledError("directive result session is retired");
+    }
+  });
   MetaLeaderContext* context = core->leader_context_;
   auto proposed = co_await context->Propose(MetaCommand(std::move(command)));
   if (!proposed.ok()) co_return proposed.status();
+  // Closing cannot cancel an accepted append: its exact receipt may become
+  // durable even after an uncertain outcome. Drain the proposal, but never
+  // acknowledge it through a retired session or a different leader term.
+  if (state->closing_ || !AuthoritySessionsAllowed(*core, leader_term)) {
+    co_return absl::CancelledError("directive result session is retired");
+  }
 
   view = core->coordinator_->CommittedView();
   const auto receipt = view.operation().FindTerminalReceipt(key);
@@ -2608,6 +2635,30 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
   core->directive_results_committed_.fetch_add(1, std::memory_order_relaxed);
   co_return co_await io.Send(control::MessagePriority::kReliable,
                              control::WireMessage(ResultAck(result, *receipt)));
+}
+
+bycorf::Task<absl::Status> RunDirectiveResults(
+    std::shared_ptr<LiveSessionState> state, MetaBootIncarnation boot_id) {
+  absl::Status status;
+  try {
+    while (!state->closing_ && !state->directive_results_.empty()) {
+      status = co_await HandleDirectiveResult(
+          state, state->directive_results_.front(), boot_id);
+      state->directive_results_.Pop();
+      if (!status.ok()) break;
+    }
+  } catch (const std::exception& error) {
+    status = absl::InternalError(
+        absl::StrCat("directive result task failed: ", error.what()));
+  } catch (...) {
+    status = absl::InternalError("directive result task failed");
+  }
+  // Unsubmitted items are replayed by Data. Only this consumer removes items,
+  // so deque insertion in the reader cannot invalidate an awaited front().
+  state->directive_results_.Clear();
+  FinishLiveSessionTask(state, &state->directive_results_running_);
+  if (!status.ok() && !state->closing_) FailLiveSession(state, status);
+  co_return status;
 }
 
 bycorf::Task<absl::Status> RunEstablishedSession(
@@ -2853,13 +2904,18 @@ bycorf::Task<absl::Status> RunEstablishedSession(
       continue;
     }
 
-    if (const auto* result =
-            std::get_if<control::DirectiveResult>(&*incoming)) {
-      if (absl::Status handled = co_await HandleDirectiveResult(
-              state->core_, *state->io_, *result, state->node_id_, boot_id,
-              state->leader_term_, state->session_id_);
-          !handled.ok()) {
-        co_return handled;
+    if (auto* result = std::get_if<control::DirectiveResult>(&*incoming)) {
+      if (!state->directive_results_.TryPush(std::move(*result))) {
+        co_return absl::ResourceExhaustedError(
+            "pending directive results exceed session or server budget");
+      }
+      if (!state->directive_results_running_) {
+        // Allocate the coroutine frame before accounting the task. Spawn is
+        // worker-local; no task can consume the item until this reader yields.
+        auto task = RunDirectiveResults(state, boot_id);
+        state->directive_results_running_ = true;
+        ++state->active_tasks_;
+        state->worker_->Spawn(std::move(task));
       }
       continue;
     }
@@ -2953,6 +3009,46 @@ detail::PendingHandshakeLimiter::TryAcquire() {
 void detail::PendingHandshakeLimiter::Release() noexcept {
   if (pending_ == 0) std::terminate();
   --pending_;
+}
+
+detail::PendingDirectiveResults::~PendingDirectiveResults() { Clear(); }
+
+bool detail::PendingDirectiveResults::TryPush(
+    control::DirectiveResult&& result) {
+  if (entries_.size() >= kMaxCount ||
+      result.recipient_boot_id.capacity() > kMaxBytes ||
+      result.result.capacity() > kMaxBytes) {
+    return false;
+  }
+  const std::size_t bytes = sizeof(Entry) +
+                            result.recipient_boot_id.capacity() + 1 +
+                            result.result.capacity() + 1;
+  if (bytes > kMaxBytes - bytes_ || bytes > kMaxSharedBytes - shared_bytes_) {
+    return false;
+  }
+  // Charge only after successful allocation. A failed admission must not
+  // leak budget and prevent healthy replacement sessions from making progress.
+  entries_.push_back(Entry{std::move(result), bytes});
+  bytes_ += bytes;
+  shared_bytes_ += bytes;
+  return true;
+}
+
+const control::DirectiveResult& detail::PendingDirectiveResults::front() const {
+  return entries_.front().result;
+}
+
+void detail::PendingDirectiveResults::Pop() {
+  const auto bytes = entries_.front().bytes;
+  entries_.pop_front();
+  bytes_ -= bytes;
+  shared_bytes_ -= bytes;
+}
+
+void detail::PendingDirectiveResults::Clear() noexcept {
+  entries_.clear();
+  shared_bytes_ -= bytes_;
+  bytes_ = 0;
 }
 
 detail::RetainedProjectionLimiter::Permit::Permit(Permit&& other) noexcept
@@ -3740,8 +3836,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
       !current.ok()) {
     co_return finish(current);
   }
-  auto live = std::make_shared<LiveSessionState>();
-  live->core_ = core;
+  auto live = std::make_shared<LiveSessionState>(core);
   live->worker_ = core->worker_;
   live->connection_ = connection;
   live->io_ = &io;
@@ -3807,9 +3902,17 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   live->publisher_running_ = true;
   ++live->active_tasks_;
   live->worker_->Spawn(RunSessionPublisher(live));
-  absl::Status session_status =
-      co_await RunEstablishedSession(live, *boot_id, *replication_history_id,
-                                     session_generation, std::move(deferred));
+  absl::Status session_status;
+  try {
+    session_status =
+        co_await RunEstablishedSession(live, *boot_id, *replication_history_id,
+                                       session_generation, std::move(deferred));
+  } catch (const std::exception& error) {
+    session_status = absl::InternalError(
+        absl::StrCat("data-control reader failed: ", error.what()));
+  } catch (...) {
+    session_status = absl::InternalError("data-control reader failed");
+  }
 
   live->closing_ = true;
   if (!live->terminal_error_.has_value() && !session_status.ok()) {
@@ -3821,6 +3924,9 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   while (live->active_tasks_ != 0) {
     co_await live->tasks_changed_.Wait();
   }
+  live->directive_results_.Clear();
+  if (live->terminal_error_.has_value())
+    session_status = *live->terminal_error_;
   const bool protocol_error =
       session_status.code() == absl::StatusCode::kInvalidArgument ||
       session_status.code() == absl::StatusCode::kFailedPrecondition ||
