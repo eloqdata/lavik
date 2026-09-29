@@ -574,7 +574,8 @@ class SentinelTest(unittest.TestCase):
         H.wait_until(
             "default Sentinel disabled",
             3,
-            lambda: "sentinel=disabled" in Path(node.log_path).read_text(),
+            lambda: "sentinel-tcp=disabled sentinel-tls=disabled"
+            in Path(node.log_path).read_text(),
         )
         node.terminate()
         with socket.socket() as occupied:
