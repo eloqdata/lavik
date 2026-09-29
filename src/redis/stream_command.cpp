@@ -1334,7 +1334,7 @@ Task<CommandReply> ExecuteStreamRangeReply(const CommandRequest& request,
     }
     auto reply = Built(builder.AppendArrayHeader((*state)->remaining_));
     if ((*state)->remaining_ != 0)
-      reply.chunks_ = std::make_unique<ReplyChunkSource>(
+      reply.continuation_ = std::make_unique<ReplyContinuation>(
           [state = std::move(*state)] { return state->Next(); });
     co_return reply;
   } catch (const std::bad_alloc&) {
@@ -1877,7 +1877,7 @@ Task<CommandReply> ExecuteRead(
         state->found_ = std::move(found);
         state->version_ = builder.version();
         auto reply = Built(builder.View());
-        reply.chunks_ = std::make_unique<ReplyChunkSource>(
+        reply.continuation_ = std::make_unique<ReplyContinuation>(
             [state] { return state->Next(); });
         co_return reply;
       }
@@ -3235,7 +3235,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           state->entries_ = std::move(info_entries);
           state->suffix_ = builder.View().substr(prefix_size);
           auto reply = Built(builder.View().substr(0, prefix_size));
-          reply.chunks_ = std::make_unique<ReplyChunkSource>(
+          reply.continuation_ = std::make_unique<ReplyContinuation>(
               [state] { return state->Next(); });
           co_return reply;
         }
@@ -3359,14 +3359,14 @@ Task<std::string> ExecuteStreamReadLocked(
   ReplyBuilder builder(request.resp_version_);
   CommandReply reply = co_await ExecuteRead(request, builder, keys, &tx_writes);
   std::string encoded(reply.encoded_);
-  if (reply.chunks_) {
+  if (reply.continuation_) {
     if (chunks)
-      *chunks = std::move(*reply.chunks_);
+      *chunks = std::move(reply.continuation_->source_);
     else {
       // Lua consumes an owned RESP value inside the script. Network/EXEC
       // consumers preserve the lazy snapshot instead.
       for (;;) {
-        auto chunk = co_await (*reply.chunks_)();
+        auto chunk = co_await reply.continuation_->source_();
         if (!chunk.ok())
           co_return std::string(StorageError(builder, chunk.status()));
         if (chunk->empty()) break;

@@ -621,11 +621,15 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   RecordLocation commit_location;
+  const RecordWriteRequest record_write{
+      .digest_ = ComputeDigest({}),
+      .txid_ = txid,
+      .written_location_ = &commit_location,
+      .tx_ = commit_receipt,
+      .kind_ = RecordKind::kTxCommit,
+  };
   absl::Status written = co_await WriteRecordLocked(
-      store, 0, {}, {}, RecordKind::kTxCommit, ValueType::kNone, 0,
-      ComputeDigest({}), txid, 0, false, true, false, false,
-      std::numeric_limits<std::uint64_t>::max(), nullptr, &commit_location,
-      nullptr, commit_receipt, std::move(retirements));
+      store, record_write, nullptr, std::move(retirements));
   if (!written.ok()) {
     co_return written;
   }
@@ -1805,7 +1809,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     std::uint64_t expire_at_ms, TxShardWrites* tx, std::uint64_t logical_size,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
     std::uint64_t* committed_sequence, ReplicationCommandAppend* replication,
-    SetLatencyTrace* trace, bool capture_fullsync, TxUndoLog* replacement_undo,
+    [[maybe_unused]] SetLatencyTrace* trace, bool capture_fullsync,
+    TxUndoLog* replacement_undo,
     const MutationPrecondition* mutation_precondition,
     GroupMutationWrite* grouped) {
   if (RuntimeFailureLatched()) {
@@ -1895,28 +1900,65 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
       LAVIK_MAYBE_CRASH_AT("hash-extents-durable-before-root");
     }
     const std::string manifest = EncodeManifest(**extents);
-    status = co_await WriteRecordLocked(
-        store, db_id, key, manifest, kind, value_type, expire_at_ms, digest,
-        /*txid=*/0, mutation_sequence, false, true, true, key_indirect,
-        logical_size, *extents, nullptr, nullptr, tx,
-        std::move(commit_retirements), trace,
-        replica_write_root.has_value() ? &*replica_write_root : nullptr,
-        replacement_undo, &partition,
-        grouped != nullptr ? grouped->root_ : nullptr,
-        /*mark_watched=*/true, mutation_precondition);
+    const RecordWriteRequest record_write{
+        .key_ = key,
+        .value_ = manifest,
+        .digest_ = digest,
+        .expire_at_ms_ = expire_at_ms,
+        .mutation_sequence_ = mutation_sequence,
+        .logical_size_ = logical_size,
+        .tx_ = tx,
+        .explicit_root_ =
+            replica_write_root.has_value() ? &*replica_write_root : nullptr,
+        .replacement_undo_ = replacement_undo,
+        .known_partition_ = &partition,
+        .group_ = grouped != nullptr ? grouped->root_ : nullptr,
+        .mutation_precondition_ = mutation_precondition,
+        .db_id_ = db_id,
+        .kind_ = kind,
+        .value_type_ = value_type,
+        .external_ = true,
+        .key_indirect_ = key_indirect,
+        .mark_watched_ = true,
+    };
+    status = co_await WriteRecordLocked(store, record_write, *extents,
+                                        std::move(commit_retirements)
+#if LAVIK_ENABLE_TRACE
+                                            ,
+                                        trace
+#endif
+    );
     if (!status.ok()) {
       store.worker_->Spawn(ReclaimExtents(&store, *extents));
     }
   } else {
-    status = co_await WriteRecordLocked(
-        store, db_id, key, value, kind, value_type, expire_at_ms, digest,
-        /*txid=*/0, mutation_sequence, false, true, false, key_indirect,
-        logical_size, nullptr, nullptr, nullptr, tx,
-        std::move(commit_retirements), trace,
-        replica_write_root.has_value() ? &*replica_write_root : nullptr,
-        replacement_undo, &partition,
-        grouped != nullptr ? grouped->root_ : nullptr,
-        /*mark_watched=*/true, mutation_precondition);
+    const RecordWriteRequest record_write{
+        .key_ = key,
+        .value_ = value,
+        .digest_ = digest,
+        .expire_at_ms_ = expire_at_ms,
+        .mutation_sequence_ = mutation_sequence,
+        .logical_size_ = logical_size,
+        .tx_ = tx,
+        .explicit_root_ =
+            replica_write_root.has_value() ? &*replica_write_root : nullptr,
+        .replacement_undo_ = replacement_undo,
+        .known_partition_ = &partition,
+        .group_ = grouped != nullptr ? grouped->root_ : nullptr,
+        .mutation_precondition_ = mutation_precondition,
+        .db_id_ = db_id,
+        .kind_ = kind,
+        .value_type_ = value_type,
+        .key_indirect_ = key_indirect,
+        .mark_watched_ = true,
+    };
+    status = co_await WriteRecordLocked(store, record_write, nullptr,
+                                        std::move(commit_retirements)
+#if LAVIK_ENABLE_TRACE
+                                            ,
+                                        trace
+#endif
+    );
   }
   if (status.ok() && committed_sequence != nullptr) {
     *committed_sequence = mutation_sequence;
@@ -2344,63 +2386,66 @@ void StorageEngine::Impl::PublishCommittedFullSyncEffects(
 }
 
 Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
-    WorkerStore& store, std::uint8_t db_id, std::string_view key,
-    std::string_view value, RecordKind kind, ValueType value_type,
-    std::uint64_t expire_at_ms, const Digest& digest, std::uint64_t txid,
-    std::uint64_t mutation_sequence, bool for_defrag,
-    bool unlock_writer_while_waiting, bool external, bool key_indirect,
-    std::uint64_t logical_size,
+    WorkerStore& store, const RecordWriteRequest& request,
     std::shared_ptr<const std::vector<ExtentRef>> extents,
-    RecordLocation* written_location, const RelocationSource* relocation,
-    TxShardWrites* tx,
-    std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
-    SetLatencyTrace* trace, const ExplicitWriteRoot* explicit_root,
-    TxUndoLog* replacement_undo, WorkerStore::PartitionStore* known_partition,
-    const GroupRecordWrite* group, bool mark_watched,
-    const MutationPrecondition* mutation_precondition,
-    bool indirect_key_record) {
+    std::unique_ptr<std::vector<RetiredRecord>> commit_retirements
+#if LAVIK_ENABLE_TRACE
+    ,
+    SetLatencyTrace* trace
+#endif
+) {
+  std::uint64_t logical_size = request.logical_size_;
+  std::uint64_t txid = request.txid_;
   if (store.write_failed_ || RuntimeFailureLatched() ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                            "storage writer is stopped after an IO failure");
   }
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
-    logical_size = value.size();
+    logical_size = request.value_.size();
   }
-  if (tx != nullptr) {
-    assert(tx->txid_ != 0);
-    txid = tx->txid_;
-    if (LAVIK_MAYBE_FAIL_TX_WRITE(key)) {
+  if (request.tx_ != nullptr) {
+    assert(request.tx_->txid_ != 0);
+    txid = request.tx_->txid_;
+    if (LAVIK_MAYBE_FAIL_TX_WRITE(request.key_)) {
       co_return absl::Status(absl::StatusCode::kInternal,
                              "injected transaction write fault");
     }
   }
-  const bool auxiliary = group != nullptr && group->auxiliary_;
-  const bool grouped_root = group != nullptr && !group->auxiliary_;
-  if (group != nullptr &&
-      (kind != RecordKind::kValue ||
-       (value_type != ValueType::kHash && value_type != ValueType::kSet &&
-        value_type != ValueType::kString && value_type != ValueType::kList &&
-        value_type != ValueType::kSortedSet &&
-        value_type != ValueType::kStream) ||
-       mutation_sequence == 0 ||
+  const bool auxiliary =
+      request.group_ != nullptr && request.group_->auxiliary_;
+  const bool grouped_root =
+      request.group_ != nullptr && !request.group_->auxiliary_;
+  if (request.group_ != nullptr &&
+      (request.kind_ != RecordKind::kValue ||
+       (request.value_type_ != ValueType::kHash &&
+        request.value_type_ != ValueType::kSet &&
+        request.value_type_ != ValueType::kString &&
+        request.value_type_ != ValueType::kList &&
+        request.value_type_ != ValueType::kSortedSet &&
+        request.value_type_ != ValueType::kStream) ||
+       request.mutation_sequence_ == 0 ||
        (auxiliary &&
-        (group->incarnation_ == 0 ||
-         ((value_type == ValueType::kString || value_type == ValueType::kList ||
-           value_type == ValueType::kStream ||
-           (value_type == ValueType::kSortedSet && IsOrderedPageId(group->id_)))
-              ? (group->id_.prefix_ == 0 || group->id_.bits_ != 0)
-              : !group->id_.valid()) ||
-         expire_at_ms != 0 || explicit_root != nullptr ||
-         (group->retired_ && logical_size != 0) ||
-         (group->batch_txid_ != 0 && txid == 0) ||
-         (tx == nullptr && !for_defrag))) ||
+        (request.group_->incarnation_ == 0 ||
+         ((request.value_type_ == ValueType::kString ||
+           request.value_type_ == ValueType::kList ||
+           request.value_type_ == ValueType::kStream ||
+           (request.value_type_ == ValueType::kSortedSet &&
+            IsOrderedPageId(request.group_->id_)))
+              ? (request.group_->id_.prefix_ == 0 ||
+                 request.group_->id_.bits_ != 0)
+              : !request.group_->id_.valid()) ||
+         request.expire_at_ms_ != 0 || request.explicit_root_ != nullptr ||
+         (request.group_->retired_ && logical_size != 0) ||
+         (request.group_->batch_txid_ != 0 && txid == 0) ||
+         (request.tx_ == nullptr && !request.for_defrag_))) ||
        (grouped_root &&
-        ((logical_size == 0 && value_type != ValueType::kStream) ||
-         group->incarnation_ != 0 || group->id_ != HashGroupId{} ||
-         group->retired_ || group->batch_txid_ != 0 ||
-         group->prepared_root_ == nullptr ||
-         group->publication_ == nullptr)))) {
+        ((logical_size == 0 && request.value_type_ != ValueType::kStream) ||
+         request.group_->incarnation_ != 0 ||
+         request.group_->id_ != HashGroupId{} || request.group_->retired_ ||
+         request.group_->batch_txid_ != 0 ||
+         request.group_->prepared_root_ == nullptr ||
+         request.group_->publication_ == nullptr)))) {
     co_return absl::InvalidArgumentError("invalid grouped record write");
   }
   struct FailIncompleteGroupedRoot {
@@ -2418,31 +2463,34 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         tx_->grouped_decision_->FailPending();
       }
     }
-  } grouped_root_guard{store, tx};
-  if ((txid != 0 && (tx == nullptr || for_defrag)) ||
-      (kind == RecordKind::kTxCommit && txid == 0)) {
+  } grouped_root_guard{store, request.tx_};
+  if ((txid != 0 && (request.tx_ == nullptr || request.for_defrag_)) ||
+      (request.kind_ == RecordKind::kTxCommit && txid == 0)) {
     co_return absl::InvalidArgumentError(
         "tagged records require a live transaction receipt");
   }
-  if ((kind == RecordKind::kValue && value_type == ValueType::kNone) ||
-      (kind == RecordKind::kTombstone &&
-       (value_type != ValueType::kNone || expire_at_ms != 0 ||
-        logical_size != 0 || (!external && !value.empty()))) ||
-      (external && (extents == nullptr || extents->empty() ||
-                    kind == RecordKind::kTombstone)) ||
-      (key_indirect && key.empty())) {
+  if ((request.kind_ == RecordKind::kValue &&
+       request.value_type_ == ValueType::kNone) ||
+      (request.kind_ == RecordKind::kTombstone &&
+       (request.value_type_ != ValueType::kNone || request.expire_at_ms_ != 0 ||
+        logical_size != 0 ||
+        (!request.external_ && !request.value_.empty()))) ||
+      (request.external_ && (extents == nullptr || extents->empty() ||
+                             request.kind_ == RecordKind::kTombstone)) ||
+      (request.key_indirect_ && request.key_.empty())) {
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "invalid value type or expiration metadata");
   }
   const bool invalid_logical_size =
-      (value_type == ValueType::kString && logical_size > kMaxBitmapBytes) ||
+      (request.value_type_ == ValueType::kString &&
+       logical_size > kMaxBitmapBytes) ||
       logical_size > std::numeric_limits<std::uint32_t>::max();
-  if (!ValidRecordKeySize(key.size()) || invalid_logical_size ||
-      value.size() > kMaxRecordPayloadBytes) {
+  if (!ValidRecordKeySize(request.key_.size()) || invalid_logical_size ||
+      request.value_.size() > kMaxRecordPayloadBytes) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "record key and value exceed storage limits");
   }
-  if (external) {
+  if (request.external_) {
     std::uint64_t extent_bytes = 0;
     for (const ExtentRef& ref : *extents) {
       if (ref.payload_bytes_ == 0 ||
@@ -2453,20 +2501,22 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       extent_bytes += ref.payload_bytes_;
     }
     const bool exact_extent_bytes =
-        kind != RecordKind::kValue ||
-        (value_type == ValueType::kString && !group);
+        request.kind_ != RecordKind::kValue ||
+        (request.value_type_ == ValueType::kString && !request.group_);
     if (exact_extent_bytes && extent_bytes != logical_size) {
       co_return absl::Status(absl::StatusCode::kInvalidArgument,
                              "external payload length mismatch");
     }
-  } else if (kind == RecordKind::kValue && value_type == ValueType::kString &&
-             !group && value.size() != logical_size) {
+  } else if (request.kind_ == RecordKind::kValue &&
+             request.value_type_ == ValueType::kString && !request.group_ &&
+             request.value_.size() != logical_size) {
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "inline string length mismatch");
   }
-  const std::size_t record_header_bytes = RecordHeaderBytes(
-      key.size(), key_indirect, txid != 0, expire_at_ms != 0, auxiliary);
-  const std::size_t payload_bytes = value.size();
+  const std::size_t record_header_bytes =
+      RecordHeaderBytes(request.key_.size(), request.key_indirect_, txid != 0,
+                        request.expire_at_ms_ != 0, auxiliary);
+  const std::size_t payload_bytes = request.value_.size();
   const std::size_t total_disk_bytes =
       AlignRecord(record_header_bytes + payload_bytes);
   if (total_disk_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
@@ -2483,30 +2533,33 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   // wherever their coordinator runs, and recovery reads them independently
   // of any partition's epochs.
   WorkerStore::PartitionStore* partition_ptr =
-      (kind == RecordKind::kTxCommit || indirect_key_record)
+      (request.kind_ == RecordKind::kTxCommit || request.indirect_key_record_)
           ? nullptr
-          : (known_partition != nullptr ? known_partition
-                                        : &PartitionForKey(store, key));
-  assert(known_partition == nullptr || key_indirect ||
-         known_partition->id_ == RedisSlot(key));
+          : (request.known_partition_ != nullptr
+                 ? request.known_partition_
+                 : &PartitionForKey(store, request.key_));
+  assert(request.known_partition_ == nullptr || request.key_indirect_ ||
+         request.known_partition_->id_ == RedisSlot(request.key_));
   RecordIndex* index_ptr =
       auxiliary ? nullptr
-      : explicit_root != nullptr
-          ? explicit_root->index_
-          : (partition_ptr == nullptr ? nullptr
-                                      : &partition_ptr->indexes_[db_id]);
+      : request.explicit_root_ != nullptr
+          ? request.explicit_root_->index_
+          : (partition_ptr == nullptr
+                 ? nullptr
+                 : &partition_ptr->indexes_[request.db_id_]);
   const bool transaction_append = txid != 0;
-  if (transaction_append && (tx == nullptr || !tx->transaction_lease_)) {
+  if (transaction_append &&
+      (request.tx_ == nullptr || !request.tx_->transaction_lease_)) {
     co_return absl::InvalidArgumentError(
         "transaction record has no writer lease");
   }
   const BlockKind append_block_kind =
-      indirect_key_record  ? BlockKind::kIndirectKeys
-      : transaction_append ? BlockKind::kTransaction
-                           : BlockKind::kRecords;
+      request.indirect_key_record_ ? BlockKind::kIndirectKeys
+      : transaction_append         ? BlockKind::kTransaction
+                                   : BlockKind::kRecords;
   LAVIK_FAULT_INJECT(
-      if (!for_defrag && !key.empty() &&
-          LAVIK_FAULT_MATCHES("LAVIK_RECORD_WRITE_PAUSE_KEY", key)) {
+      if (!request.for_defrag_ && !request.key_.empty() &&
+          LAVIK_FAULT_MATCHES("LAVIK_RECORD_WRITE_PAUSE_KEY", request.key_)) {
         // A deterministic publication-order race: let GC publish the previous
         // value while this foreground append has not acquired its final stream.
         spdlog::info("record write publication pause armed");
@@ -2519,7 +2572,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   // Re-resolve the active stream after allocation waits; another writer may
   // have installed a successor while store_state_mutex_ was released.
   auto active_stream = [&]() -> std::optional<ActiveBlock>& {
-    if (indirect_key_record) return store.active_indirect_key_block_;
+    if (request.indirect_key_record_) return store.active_indirect_key_block_;
     return transaction_append ? store.active_tx_block_ : store.active_block_;
   };
   // A grouped String may commit a nested batch before its outer transaction.
@@ -2527,11 +2580,12 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   // in the current block when a segment fits elsewhere. Larger records still
   // use the full block rather than becoming unappendable.
   const std::uint64_t append_limit =
-      transaction_append && group != nullptr && value_type == ValueType::kString
+      transaction_append && request.group_ != nullptr &&
+              request.value_type_ == ValueType::kString
           ? std::max<std::uint64_t>(kStorageBlockBytes - 2 * kDirectIoAlignment,
                                     kBlockHeaderBytes + total_disk_bytes)
           : kStorageBlockBytes;
-  AsyncMutex* allocation_mutex = indirect_key_record
+  AsyncMutex* allocation_mutex = request.indirect_key_record_
                                      ? &store.indirect_key_allocation_mutex_
                                      : &store.active_block_allocation_mutex_;
   if (transaction_append)
@@ -2541,29 +2595,32 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   // other allocators out while store_state_mutex_ is released, and every
   // caller revalidates the active stream after this helper resumes.
   auto return_reserved = [&](ReservedBlock block) -> Task<absl::Status> {
-    if (unlock_writer_while_waiting) {
+    if (request.unlock_writer_while_waiting_) {
       store.store_state_mutex_.Unlock(*store.worker_);
     }
     absl::Status returned = co_await ReturnReservedBlock(block);
-    if (unlock_writer_while_waiting) {
+    if (request.unlock_writer_while_waiting_) {
       co_await store.store_state_mutex_.Lock();
     }
     co_return returned;
   };
   IndirectKeyHandle indirect_key;
-  if (key_indirect) {
+  if (request.key_indirect_) {
     auto resolved = co_await EnsureIndirectKey(
-        store, key, digest, tx, for_defrag, unlock_writer_while_waiting);
+        store, request.key_, request.digest_, request.tx_, request.for_defrag_,
+        request.unlock_writer_while_waiting_);
     if (!resolved.ok()) co_return resolved.status();
     indirect_key = std::move(*resolved);
   }
   // The UUID was bound to the original key's slot when created. Checking its
   // slot avoids rehashing a multi-megabyte key for every auxiliary segment.
-  assert(known_partition == nullptr || !indirect_key ||
-         known_partition->id_ == (indirect_key->id_[0] & 0x3fff));
+  assert(request.known_partition_ == nullptr || !indirect_key ||
+         request.known_partition_->id_ == (indirect_key->id_[0] & 0x3fff));
   std::unique_ptr<GroupedRetirementPins> grouped_dependency_pins;
 acquire_active_stream:
+#if LAVIK_ENABLE_TRACE
   if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
+#endif
   while (!active_stream().has_value() ||
          active_stream()->committed_bytes_ + total_disk_bytes > append_limit) {
     // Waiting for a physical block must not hold store_state_mutex_: the
@@ -2571,7 +2628,7 @@ acquire_active_stream:
     // worker's state before the new stream can be published. The gate is per
     // append stream, so ordinary and transaction allocation remain concurrent.
     std::optional<UnlockGuard> allocation_unlock;
-    if (unlock_writer_while_waiting) {
+    if (request.unlock_writer_while_waiting_) {
       store.store_state_mutex_.Unlock(*store.worker_);
       co_await allocation_mutex->Lock();
       allocation_unlock.emplace(allocation_mutex, store.worker_);
@@ -2595,15 +2652,19 @@ acquire_active_stream:
     }
     absl::StatusOr<ReservedBlock> allocated{
         absl::UnavailableError("no standby block is available")};
-    if (!transaction_append && !indirect_key_record &&
+    if (!transaction_append && !request.indirect_key_record_ &&
         store.standby_block_.has_value()) {
       allocated = *store.standby_block_;
       store.standby_block_.reset();
+#if LAVIK_ENABLE_TRACE
       if (trace != nullptr) trace->standby_block_ = true;
+#endif
     } else {
+#if LAVIK_ENABLE_TRACE
       if (trace != nullptr) trace->allocated_block_ = true;
-      allocated = co_await AcquireWriteBlock(store, for_defrag,
-                                             unlock_writer_while_waiting);
+#endif
+      allocated = co_await AcquireWriteBlock(
+          store, request.for_defrag_, request.unlock_writer_while_waiting_);
     }
     if (!allocated.ok()) {
       co_return allocated.status();
@@ -2632,7 +2693,7 @@ acquire_active_stream:
       std::uint16_t write_buffer_id = 0;
       std::byte* heap_buffer = nullptr;
       if (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
-        if (for_defrag || !unlock_writer_while_waiting) {
+        if (request.for_defrag_ || !request.unlock_writer_while_waiting_) {
           // Maintenance paths that deliberately keep store_state_mutex_
           // across an atomic rewrite cannot wait for a flush that needs the
           // same lock. Their concurrency is separately bounded.
@@ -2704,7 +2765,7 @@ acquire_active_stream:
           .heap_buffer_size_ = options_.buffers_.write_buffer_bytes_,
           .kind_ = append_block_kind,
       };
-      if (!transaction_append && !indirect_key_record) {
+      if (!transaction_append && !request.indirect_key_record_) {
         store.standby_prefetch_for_block_.reset();
       }
       BlockState& state =
@@ -2739,7 +2800,7 @@ acquire_active_stream:
       // The header region stays zero in staging until a flush encodes it
       // into the slot it is about to write. Encoding it here, or on every
       // append, would race the flush that is reading the same page.
-      if (!transaction_append && !indirect_key_record) {
+      if (!transaction_append && !request.indirect_key_record_) {
         // Replenish immediately after installation. All later records use the
         // active block without testing an occupancy threshold; rollover either
         // consumes this successor or waits behind its stateful allocation
@@ -2748,7 +2809,9 @@ acquire_active_stream:
       }
     }
   }
+#if LAVIK_ENABLE_TRACE
   if (trace != nullptr) trace->block_ready_ns_ = SetTraceNowNanos();
+#endif
 
   // Block allocation may have released the store-state lock. A client write
   // can replace this key, or FLUSHDB/replica reset can replace its index,
@@ -2756,82 +2819,95 @@ acquire_active_stream:
   // after the append stream is locked again and an active block is available.
   RecordIndex::Entry* previous_entry = nullptr;
   if (index_ptr != nullptr) {
-    previous_entry = index_ptr->Find(digest, key);
+    previous_entry = index_ptr->Find(request.digest_, request.key_);
     if (previous_entry != nullptr && !previous_entry->key_complete())
         [[unlikely]] {
-      auto resolved =
-          co_await FindVerifiedEntry(store, *index_ptr, digest, key);
+      auto resolved = co_await FindVerifiedEntry(store, *index_ptr,
+                                                 request.digest_, request.key_);
       if (!resolved.ok()) {
         co_return resolved.status();
       }
       previous_entry = *resolved;
     }
   }
-  if (!auxiliary && relocation != nullptr && partition_ptr != nullptr &&
-      (EffectiveRecordDbEpoch(*partition_ptr, db_id) != relocation->db_epoch_ ||
-       partition_ptr->replication_epoch_ != relocation->replication_epoch_ ||
-       store.index_generations_[db_id] != relocation->index_generation_ ||
+  if (!auxiliary && request.relocation_ != nullptr &&
+      partition_ptr != nullptr &&
+      (EffectiveRecordDbEpoch(*partition_ptr, request.db_id_) !=
+           request.relocation_->db_epoch_ ||
+       partition_ptr->replication_epoch_ !=
+           request.relocation_->replication_epoch_ ||
+       store.index_generations_[request.db_id_] !=
+           request.relocation_->index_generation_ ||
        previous_entry == nullptr ||
-       !relocation->Matches(MaterializeIndexLocation(*previous_entry)))) {
+       !request.relocation_->Matches(
+           MaterializeIndexLocation(*previous_entry)))) {
     co_return absl::Status(absl::StatusCode::kAborted,
                            "relocation source changed while waiting");
   }
-  if (explicit_root != nullptr && explicit_root->reject_older_sequence_ &&
+  if (request.explicit_root_ != nullptr &&
+      request.explicit_root_->reject_older_sequence_ &&
       previous_entry != nullptr &&
-      (previous_entry->value_.mutation_sequence_ > mutation_sequence ||
-       (!explicit_root->allow_equal_sequence_ &&
-        previous_entry->value_.mutation_sequence_ == mutation_sequence))) {
+      (previous_entry->value_.mutation_sequence_ > request.mutation_sequence_ ||
+       (!request.explicit_root_->allow_equal_sequence_ &&
+        previous_entry->value_.mutation_sequence_ ==
+            request.mutation_sequence_))) {
     co_return absl::OkStatus();
   }
-  if (!auxiliary && !for_defrag && partition_ptr != nullptr &&
+  if (!auxiliary && !request.for_defrag_ && partition_ptr != nullptr &&
       partition_ptr->rdb_snapshot_.has_value()) [[unlikely]] {
     // The capture stores only physical metadata and pins. It may release the
     // store mutex while pinning a block owned by another worker, so resolve
     // the current entry again before the ordinary overwrite bookkeeping.
-    (void)co_await CaptureRdbSnapshotBeforeWriteLocked(store, *partition_ptr,
-                                                       db_id, key, digest);
-    previous_entry =
-        index_ptr != nullptr ? index_ptr->Find(digest, key) : nullptr;
+    (void)co_await CaptureRdbSnapshotBeforeWriteLocked(
+        store, *partition_ptr, request.db_id_, request.key_, request.digest_);
+    previous_entry = index_ptr != nullptr
+                         ? index_ptr->Find(request.digest_, request.key_)
+                         : nullptr;
     if (previous_entry != nullptr && !previous_entry->key_complete())
         [[unlikely]] {
-      auto resolved =
-          co_await FindVerifiedEntry(store, *index_ptr, digest, key);
+      auto resolved = co_await FindVerifiedEntry(store, *index_ptr,
+                                                 request.digest_, request.key_);
       if (!resolved.ok()) co_return resolved.status();
       previous_entry = *resolved;
     }
-    if (explicit_root != nullptr && explicit_root->reject_older_sequence_ &&
+    if (request.explicit_root_ != nullptr &&
+        request.explicit_root_->reject_older_sequence_ &&
         previous_entry != nullptr &&
-        (previous_entry->value_.mutation_sequence_ > mutation_sequence ||
-         (!explicit_root->allow_equal_sequence_ &&
-          previous_entry->value_.mutation_sequence_ == mutation_sequence))) {
+        (previous_entry->value_.mutation_sequence_ >
+             request.mutation_sequence_ ||
+         (!request.explicit_root_->allow_equal_sequence_ &&
+          previous_entry->value_.mutation_sequence_ ==
+              request.mutation_sequence_))) {
       co_return absl::OkStatus();
     }
   }
-  if (!for_defrag && previous_entry != nullptr &&
+  if (!request.for_defrag_ && previous_entry != nullptr &&
       previous_entry->value_.grouped()) {
-    auto old_view = partition_ptr->grouped_objects_[db_id].Lookup(
-        key,
+    auto old_view = partition_ptr->grouped_objects_[request.db_id_].Lookup(
+        request.key_,
         GroupedObjectVersion{
             .root_ = MaterializeIndexLocation(*previous_entry),
-            .db_epoch_ = EffectiveRecordDbEpoch(*partition_ptr, db_id),
+            .db_epoch_ = EffectiveRecordDbEpoch(*partition_ptr, request.db_id_),
             .replication_epoch_ = partition_ptr->replication_epoch_,
-            .index_generation_ = partition_ptr->grouped_generations_[db_id],
+            .index_generation_ =
+                partition_ptr->grouped_generations_[request.db_id_],
         },
-        /*allow_failed=*/replacement_undo != nullptr);
+        /*allow_failed=*/request.replacement_undo_ != nullptr);
     if (!old_view.ok()) co_return old_view.status();
     auto pinned = co_await PrepinGroupedRetirementsLocked(
         store, *old_view,
-        grouped_root && group->root_incarnation_ == (*old_view)->incarnation()
-            ? std::optional(group->changed_groups_)
+        grouped_root &&
+                request.group_->root_incarnation_ == (*old_view)->incarnation()
+            ? std::optional(request.group_->changed_groups_)
             : std::nullopt,
-        tx != nullptr, &grouped_dependency_pins);
+        request.tx_ != nullptr, &grouped_dependency_pins);
     if (!pinned.ok()) {
       if (absl::IsAborted(pinned)) goto acquire_active_stream;
       co_return pinned;
     }
     LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES("LAVIK_GROUP_ROOT_PIN_PAUSE_KEY",
-                                               key) &&
-                           tx != nullptr) {
+                                               request.key_) &&
+                           request.tx_ != nullptr) {
       static std::atomic<bool> root_pin_pause_claimed{false};
       if (!root_pin_pause_claimed.exchange(true, std::memory_order_relaxed)) {
         const RecordLocation root = (*old_view)->version().root_;
@@ -2852,7 +2928,8 @@ acquire_active_stream:
         if (!paused.ok()) co_return paused;
       }
     });
-    auto resolved = co_await FindVerifiedEntry(store, *index_ptr, digest, key);
+    auto resolved = co_await FindVerifiedEntry(store, *index_ptr,
+                                               request.digest_, request.key_);
     if (!resolved.ok()) co_return resolved.status();
     previous_entry = *resolved;
   }
@@ -2864,12 +2941,13 @@ acquire_active_stream:
       active_stream()->committed_bytes_ + total_disk_bytes > append_limit) {
     goto acquire_active_stream;
   }
-  const bool has_index_extra = expire_at_ms != 0;
+  const bool has_index_extra = request.expire_at_ms_ != 0;
   const bool needs_index_allocation =
       index_ptr != nullptr && (previous_entry == nullptr ||
                                previous_entry->has_extra() != has_index_extra);
   if (needs_index_allocation &&
-      !index_ptr->CanAllocateEntry(key, !key_indirect, has_index_extra)) {
+      !index_ptr->CanAllocateEntry(request.key_, !request.key_indirect_,
+                                   has_index_extra)) {
     // The handle's 21-bit page ID is a hard per-worker capacity boundary.
     // Check it after every suspension and before mutating the staging buffer,
     // so exhaustion is reported without leaving a durable record whose index
@@ -2877,7 +2955,7 @@ acquire_active_stream:
     co_return absl::ResourceExhaustedError(
         "record index entry page capacity exhausted");
   }
-  if (!auxiliary && tx != nullptr && tx->collect_undo_) {
+  if (!auxiliary && request.tx_ != nullptr && request.tx_->collect_undo_) {
     const auto undo = store.tx_undo_.find(txid);
     if (undo != store.tx_undo_.end() &&
         !undo->second.CanTrack(previous_entry)) {
@@ -2891,7 +2969,8 @@ acquire_active_stream:
   std::optional<MemoryReservation> index_memory_reservation;
   if (needs_index_allocation) {
     const std::size_t allocation_bytes = index_ptr->RequiredAllocationBytes(
-        digest, key, !key_indirect, has_index_extra, previous_entry == nullptr);
+        request.digest_, request.key_, !request.key_indirect_, has_index_extra,
+        previous_entry == nullptr);
     if (allocation_bytes != 0) {
       index_memory_reservation = TryReserveMemory(allocation_bytes);
       if (!index_memory_reservation.has_value()) {
@@ -2908,8 +2987,8 @@ acquire_active_stream:
           : std::optional<RecordLocation>(
                 MaterializeIndexLocation(*previous_entry));
   const ExtentManifest previous_extents = ExtentsFor(store, previous_entry);
-  const ExtentManifest retired_value_extents =
-      ExtentsNotReferencedBy(previous_extents, external ? extents : nullptr);
+  const ExtentManifest retired_value_extents = ExtentsNotReferencedBy(
+      previous_extents, request.external_ ? extents : nullptr);
   const ExtentManifest previous_dependent_extents = ExtentManifest{};
   ActiveBlock updated = *active_stream();
   const std::uint32_t record_offset = updated.committed_bytes_;
@@ -2938,23 +3017,27 @@ acquire_active_stream:
     co_return absl::Status(absl::StatusCode::kInternal,
                            "invalid active staging block");
   }
-  if (grouped_root && group->prepare_root_) {
+  if (grouped_root && request.group_->prepare_root_) {
     const RecordLocation provisional(
-        updated.block_id_, mutation_sequence, updated.allocation_epoch_,
-        expire_at_ms, static_cast<std::uint32_t>(logical_size),
+        updated.block_id_, request.mutation_sequence_,
+        updated.allocation_epoch_, request.expire_at_ms_,
+        static_cast<std::uint32_t>(logical_size),
         RecordLocation::PackedMetadata::Encode(
             record_offset, static_cast<std::uint32_t>(total_disk_bytes),
-            writer_id, true, external, key_indirect, false, false, txid != 0,
-            kind, value_type, expire_at_ms != 0, true));
-    const auto prepared = group->prepare_root_(GroupedObjectVersion{
+            writer_id, true, request.external_, request.key_indirect_, false,
+            false, txid != 0, request.kind_, request.value_type_,
+            request.expire_at_ms_ != 0, true));
+    const auto prepared = request.group_->prepare_root_(GroupedObjectVersion{
         .root_ = provisional,
-        .db_epoch_ = explicit_root != nullptr
-                         ? explicit_root->db_epoch_
-                         : EffectiveRecordDbEpoch(*partition_ptr, db_id),
-        .replication_epoch_ = explicit_root != nullptr
-                                  ? explicit_root->replication_epoch_
+        .db_epoch_ =
+            request.explicit_root_ != nullptr
+                ? request.explicit_root_->db_epoch_
+                : EffectiveRecordDbEpoch(*partition_ptr, request.db_id_),
+        .replication_epoch_ = request.explicit_root_ != nullptr
+                                  ? request.explicit_root_->replication_epoch_
                                   : partition_ptr->replication_epoch_,
-        .index_generation_ = partition_ptr->grouped_generations_[db_id],
+        .index_generation_ =
+            partition_ptr->grouped_generations_[request.db_id_],
     });
     if (!prepared.ok()) co_return prepared;
   }
@@ -2962,23 +3045,25 @@ acquire_active_stream:
   std::shared_ptr<std::vector<RetiredRecord>> grouped_retirements;
   std::shared_ptr<std::vector<RetiredRecord>> grouped_abort_retirements;
   GroupedHashObject::Handle replacement_grouped =
-      grouped_root ? GroupedHashObject::Handle(*group->prepared_root_)
+      grouped_root ? GroupedHashObject::Handle(*request.group_->prepared_root_)
                    : nullptr;
-  auto touched_groups =
-      grouped_root ? std::optional(group->changed_groups_) : std::nullopt;
-  if (!for_defrag && previous && previous->grouped()) {
-    auto old_view = partition_ptr->grouped_objects_[db_id].Lookup(
-        key,
+  auto touched_groups = grouped_root
+                            ? std::optional(request.group_->changed_groups_)
+                            : std::nullopt;
+  if (!request.for_defrag_ && previous && previous->grouped()) {
+    auto old_view = partition_ptr->grouped_objects_[request.db_id_].Lookup(
+        request.key_,
         GroupedObjectVersion{
             .root_ = *previous,
-            .db_epoch_ = EffectiveRecordDbEpoch(*partition_ptr, db_id),
+            .db_epoch_ = EffectiveRecordDbEpoch(*partition_ptr, request.db_id_),
             .replication_epoch_ = partition_ptr->replication_epoch_,
-            .index_generation_ = partition_ptr->grouped_generations_[db_id],
+            .index_generation_ =
+                partition_ptr->grouped_generations_[request.db_id_],
         },
-        /*allow_failed=*/replacement_undo != nullptr);
+        /*allow_failed=*/request.replacement_undo_ != nullptr);
     if (!old_view.ok()) co_return old_view.status();
     previous_grouped = std::move(*old_view);
-    if (tx != nullptr && previous->tx_tagged() &&
+    if (request.tx_ != nullptr && previous->tx_tagged() &&
         (grouped_dependency_pins == nullptr ||
          !grouped_dependency_pins->Contains(RetiredRecordOf(*previous)))) {
       // The physical root can move independently of every unchanged child,
@@ -2986,10 +3071,10 @@ acquire_active_stream:
       // protocol instead of borrowing the new block's transaction identity.
       goto acquire_active_stream;
     }
-    if (tx != nullptr) {
+    if (request.tx_ != nullptr) {
       // Replacing a grouped graph also needs a shared failure decision: the
       // top-level root may be compact, but its old graph is still atomic.
-      auto decision = PrepareGroupedDecision(*tx);
+      auto decision = PrepareGroupedDecision(*request.tx_);
       if (!decision.ok()) co_return decision.status();
     }
     if (replacement_grouped != nullptr &&
@@ -3011,8 +3096,8 @@ acquire_active_stream:
       grouped_retirements =
           std::make_shared<std::vector<RetiredRecord>>(std::move(*retired));
   }
-  if (!for_defrag && tx != nullptr && tx->collect_undo_ &&
-      replacement_grouped != nullptr) {
+  if (!request.for_defrag_ && request.tx_ != nullptr &&
+      request.tx_->collect_undo_ && replacement_grouped != nullptr) {
     auto discarded = CollectGroupedRetirements(
         replacement_grouped, previous_grouped, touched_groups);
     if (!discarded.ok()) co_return discarded.status();
@@ -3023,9 +3108,9 @@ acquire_active_stream:
   if (grouped_retirements != nullptr) {
     // Capacity is admitted before the first staged byte. All later routing
     // consists only of moves/copies into these preallocated receipt vectors.
-    if (tx != nullptr) {
-      tx->retirements_.reserve(tx->retirements_.size() +
-                               grouped_retirements->size() + 1);
+    if (request.tx_ != nullptr) {
+      request.tx_->retirements_.reserve(request.tx_->retirements_.size() +
+                                        grouped_retirements->size() + 1);
     } else {
       if (commit_retirements == nullptr)
         commit_retirements = std::make_unique<std::vector<RetiredRecord>>();
@@ -3047,16 +3132,17 @@ acquire_active_stream:
   updated.max_lsn_ = std::max(updated.max_lsn_, lsn);
   LAVIK_FAULT_INJECT(
       if (!auxiliary &&
-          LAVIK_FAULT_MATCHES("LAVIK_RECORD_WRITE_PAUSE_KEY", key)) {
+          LAVIK_FAULT_MATCHES("LAVIK_RECORD_WRITE_PAUSE_KEY", request.key_)) {
         spdlog::info("record publication test type={} lsn={}",
-                     static_cast<unsigned>(value_type), lsn);
+                     static_cast<unsigned>(request.value_type_), lsn);
       });
   // This is the last no-await cut before the staging buffer and key index can
   // change. An explicit empty precondition is meaningful: rollback uses it to
   // bypass the stale admission inherited from its TxShardWrites receipt.
-  const MutationPrecondition* effective_precondition = mutation_precondition;
-  if (effective_precondition == nullptr && tx != nullptr) {
-    effective_precondition = &tx->mutation_precondition_;
+  const MutationPrecondition* effective_precondition =
+      request.mutation_precondition_;
+  if (effective_precondition == nullptr && request.tx_ != nullptr) {
+    effective_precondition = &request.tx_->mutation_precondition_;
   }
   if (index_ptr != nullptr && effective_precondition != nullptr &&
       static_cast<bool>(*effective_precondition)) {
@@ -3073,17 +3159,18 @@ acquire_active_stream:
                                    updated.allocation_epoch_}]
         .emplace(record_offset, indirect_key);
   }
-  if (indirect_key_record) {
+  if (request.indirect_key_record_) {
     IndirectKeyId id;
-    std::memcpy(id.data(), key.data(), sizeof(id));
+    std::memcpy(id.data(), request.key_.data(), sizeof(id));
     store.indirect_key_records_[{updated.block_id_, updated.allocation_epoch_}]
         .emplace_back(id, record_offset);
   }
   // WATCH invalidation belongs to the same linearization cut as publication:
   // rejected authority checks must not invalidate it, while an observer must
   // never see the new index value before the watch fingerprint changes.
-  if (index_ptr != nullptr && mark_watched) {
-    tx::CurrentTxShard().MarkWatched(db_id, tx::FingerprintOf(digest));
+  if (index_ptr != nullptr && request.mark_watched_) {
+    tx::CurrentTxShard().MarkWatched(request.db_id_,
+                                     tx::FingerprintOf(request.digest_));
   }
   // The encoder overwrites the complete header and the copies below overwrite
   // the complete payload. Preserve deterministic on-disk padding without
@@ -3094,44 +3181,45 @@ acquire_active_stream:
               total_disk_bytes - encoded_record_bytes, std::byte{0});
   RecordHeader record{
       .header_bytes_ = static_cast<std::uint16_t>(record_header_bytes),
-      .kind_ = kind,
-      .db_id_ = db_id,
-      .value_type_ = value_type,
-      .external_ = external,
-      .key_indirect_ = key_indirect,
+      .kind_ = request.kind_,
+      .db_id_ = request.db_id_,
+      .value_type_ = request.value_type_,
+      .external_ = request.external_,
+      .key_indirect_ = request.key_indirect_,
       .grouped_ = grouped_root,
       .auxiliary_group_ = auxiliary,
-      .group_retired_ = auxiliary && group->retired_,
-      .group_incarnation_ = auxiliary ? group->incarnation_ : 0,
-      .group_prefix_ = auxiliary ? group->id_.prefix_ : 0,
-      .group_prefix_bits_ = auxiliary ? group->id_.bits_ : std::uint8_t{0},
-      .group_batch_txid_ = auxiliary ? group->batch_txid_ : 0,
+      .group_retired_ = auxiliary && request.group_->retired_,
+      .group_incarnation_ = auxiliary ? request.group_->incarnation_ : 0,
+      .group_prefix_ = auxiliary ? request.group_->id_.prefix_ : 0,
+      .group_prefix_bits_ =
+          auxiliary ? request.group_->id_.bits_ : std::uint8_t{0},
+      .group_batch_txid_ = auxiliary ? request.group_->batch_txid_ : 0,
       .key_id_ = indirect_key ? indirect_key->id_ : IndirectKeyId{},
-      .key_bytes_ = static_cast<std::uint32_t>(key.size()),
+      .key_bytes_ = static_cast<std::uint32_t>(request.key_.size()),
       .logical_size_ = static_cast<std::uint32_t>(logical_size),
       .payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
       .total_disk_bytes_ = static_cast<std::uint32_t>(total_disk_bytes),
       .txid_ = txid,
       .replication_epoch_ =
-          explicit_root != nullptr
-              ? explicit_root->replication_epoch_
+          request.explicit_root_ != nullptr
+              ? request.explicit_root_->replication_epoch_
               : (partition_ptr == nullptr ? 1
                                           : partition_ptr->replication_epoch_),
       // A relocation stamps the epoch its source was validated under, not a
       // fresh read: worker 0 publishes a FLUSHDB epoch concurrently, and a
       // fresh read here could adopt it mid-append — turning a record
       // recovery must drop into one it must keep.
-      .db_epoch_ =
-          indirect_key_record ? 1
-          : explicit_root != nullptr
-              ? explicit_root->db_epoch_
-              : (relocation != nullptr
-                     ? relocation->db_epoch_
-                     : (partition_ptr != nullptr
-                            ? EffectiveRecordDbEpoch(*partition_ptr, db_id)
-                            : DbEpoch(db_id))),
-      .mutation_sequence_ = mutation_sequence,
-      .expire_at_ms_ = expire_at_ms,
+      .db_epoch_ = request.indirect_key_record_ ? 1
+                   : request.explicit_root_ != nullptr
+                       ? request.explicit_root_->db_epoch_
+                       : (request.relocation_ != nullptr
+                              ? request.relocation_->db_epoch_
+                              : (partition_ptr != nullptr
+                                     ? EffectiveRecordDbEpoch(*partition_ptr,
+                                                              request.db_id_)
+                                     : DbEpoch(request.db_id_))),
+      .mutation_sequence_ = request.mutation_sequence_,
+      .expire_at_ms_ = request.expire_at_ms_,
       .lsn_ = lsn,
       .allocation_epoch_ = updated.allocation_epoch_,
       .payload_checksum_ = 0,
@@ -3141,25 +3229,28 @@ acquire_active_stream:
                                      record_header_bytes);
   std::byte* payload_output =
       staging.data_ + record_offset + record_header_bytes;
-  if (!value.empty()) {
-    std::memcpy(payload_output, value.data(), value.size());
+  if (!request.value_.empty()) {
+    std::memcpy(payload_output, request.value_.data(), request.value_.size());
   }
-  assert(relocation == nullptr ||
-         !relocation->verified_payload_checksum_.has_value() ||
-         (kind == RecordKind::kValue && value_type == ValueType::kString &&
-          !external && !key_indirect && !auxiliary && !grouped_root));
+  assert(request.relocation_ == nullptr ||
+         !request.relocation_->verified_payload_checksum_.has_value() ||
+         (request.kind_ == RecordKind::kValue &&
+          request.value_type_ == ValueType::kString && !request.external_ &&
+          !request.key_indirect_ && !auxiliary && !grouped_root));
   record.payload_checksum_ =
-      relocation != nullptr &&
-              relocation->verified_payload_checksum_.has_value()
-          ? *relocation->verified_payload_checksum_
+      request.relocation_ != nullptr &&
+              request.relocation_->verified_payload_checksum_.has_value()
+          ? *request.relocation_->verified_payload_checksum_
           : Crc32c(std::span<const std::byte>(
                 staging.data_ + record_offset + record_header_bytes,
                 payload_bytes));
-  if (!EncodeRecordHeader(record, key, record_output)) {
+  if (!EncodeRecordHeader(record, request.key_, record_output)) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "record checksum encoding failed");
   }
+#if LAVIK_ENABLE_TRACE
   if (trace != nullptr) trace->encode_done_ns_ = SetTraceNowNanos();
+#endif
 
   // The staging slot already holds this block's buffer; it is fixed for the
   // life of the allocation, so only the flush counters need syncing below.
@@ -3172,8 +3263,8 @@ acquire_active_stream:
   }
 
   const RecordLocation location(
-      updated.block_id_, mutation_sequence, updated.allocation_epoch_,
-      expire_at_ms, static_cast<std::uint32_t>(logical_size),
+      updated.block_id_, request.mutation_sequence_, updated.allocation_epoch_,
+      request.expire_at_ms_, static_cast<std::uint32_t>(logical_size),
       // A relocation rewrites the same logical version, so it carries the
       // bit unchanged. A real overwrite shields what its predecessor was
       // shielding, plus the buried value itself — but only if that value
@@ -3184,66 +3275,73 @@ acquire_active_stream:
       // against now instead, since their successors' deadlines are unknown.
       RecordLocation::PackedMetadata::Encode(
           record_offset, static_cast<std::uint32_t>(total_disk_bytes),
-          writer_id, true, external, key_indirect,
+          writer_id, true, request.external_, request.key_indirect_,
           previous.has_value() &&
-              (relocation != nullptr
+              (request.relocation_ != nullptr
                    ? previous->shielding()
                    : (previous->shielding() ||
                       (previous->kind() == RecordKind::kValue &&
                        (previous->expire_at_ms_ == 0 ||
                         previous->expire_at_ms_ >
-                            std::max(expire_at_ms, UnixTimeMillis()))))),
-          false, txid != 0 && kind != RecordKind::kTxCommit,
+                            std::max(request.expire_at_ms_,
+                                     UnixTimeMillis()))))),
+          false, txid != 0 && request.kind_ != RecordKind::kTxCommit,
           // Commit records never enter the key index. Their temporary
           // RecordLocation is used only to request the destination block's
           // flush, so encode the packed, index-only type state as its empty
           // default rather than spending one of the remaining reserve
           // bits.
-          kind == RecordKind::kTxCommit ? RecordKind::kValue : kind, value_type,
-          expire_at_ms != 0, grouped_root));
+          request.kind_ == RecordKind::kTxCommit ? RecordKind::kValue
+                                                 : request.kind_,
+          request.value_type_, request.expire_at_ms_ != 0, grouped_root));
   if (transaction_append) {
     NoteTxRecordLocal(
         store, updated.block_id_, updated.allocation_epoch_, txid,
-        location.total_disk_bytes(), kind == RecordKind::kTxCommit, tx,
-        kind == RecordKind::kTxCommit
+        location.total_disk_bytes(), request.kind_ == RecordKind::kTxCommit,
+        request.tx_,
+        request.kind_ == RecordKind::kTxCommit
             ? static_cast<std::uint32_t>(location.record_offset() +
                                          location.total_disk_bytes())
             : 0,
-        group != nullptr ? group->batch_txid_ : 0);
+        request.group_ != nullptr ? request.group_->batch_txid_ : 0);
   }
   const bool was_live =
       previous.has_value() && previous->kind() == RecordKind::kValue;
-  const bool is_live = kind == RecordKind::kValue;
+  const bool is_live = request.kind_ == RecordKind::kValue;
   const bool was_expiring = was_live && previous->expire_at_ms_ != 0;
-  const bool is_expiring = is_live && expire_at_ms != 0;
+  const bool is_expiring = is_live && request.expire_at_ms_ != 0;
   if (grouped_root) {
     GroupedObjectVersion version{
         .root_ = location,
         .db_epoch_ = record.db_epoch_,
         .replication_epoch_ = record.replication_epoch_,
-        .index_generation_ = partition_ptr->grouped_generations_[db_id],
-        .decision_ = tx != nullptr ? tx->grouped_decision_ : nullptr,
+        .index_generation_ =
+            partition_ptr->grouped_generations_[request.db_id_],
+        .decision_ =
+            request.tx_ != nullptr ? request.tx_->grouped_decision_ : nullptr,
     };
     absl::Status finalized;
-    if (for_defrag) {
-      auto current = partition_ptr->grouped_objects_[db_id].Lookup(
-          key,
+    if (request.for_defrag_) {
+      auto current = partition_ptr->grouped_objects_[request.db_id_].Lookup(
+          request.key_,
           GroupedObjectVersion{
               .root_ = *previous,
               .db_epoch_ = record.db_epoch_,
               .replication_epoch_ = record.replication_epoch_,
-              .index_generation_ = partition_ptr->grouped_generations_[db_id],
+              .index_generation_ =
+                  partition_ptr->grouped_generations_[request.db_id_],
           });
       if (current.ok()) version.decision_ = (*current)->version().decision_;
-      finalized = current.ok() ? GroupedHashObject::FinalizeRootRelocation(
-                                     *group->prepared_root_, *current, version)
-                               : current.status();
+      finalized = current.ok()
+                      ? GroupedHashObject::FinalizeRootRelocation(
+                            *request.group_->prepared_root_, *current, version)
+                      : current.status();
       if (finalized.ok()) {
-        finalized = group->publication_->RefreshExpected(*current);
+        finalized = request.group_->publication_->RefreshExpected(*current);
       }
     } else {
-      finalized =
-          GroupedHashObject::FinalizeRoot(*group->prepared_root_, version);
+      finalized = GroupedHashObject::FinalizeRoot(
+          *request.group_->prepared_root_, version);
     }
     if (!finalized.ok()) {
       // This can only be an internal contract violation after the validated
@@ -3255,58 +3353,63 @@ acquire_active_stream:
   RecordIndex::Entry* inserted_entry = nullptr;
   if (index_ptr != nullptr) {
     if (previous_entry != nullptr) {
-      TxUndoLog* current_tx_undo = replacement_undo;
-      if (current_tx_undo == nullptr && tx != nullptr && tx->collect_undo_) {
+      TxUndoLog* current_tx_undo = request.replacement_undo_;
+      if (current_tx_undo == nullptr && request.tx_ != nullptr &&
+          request.tx_->collect_undo_) {
         if (auto found = store.tx_undo_.find(txid);
             found != store.tx_undo_.end()) {
           current_tx_undo = &found->second;
         }
       }
-      auto replaced = ReplaceIndexLocation(store, *index_ptr, previous_entry,
-                                           digest, location, current_tx_undo);
+      auto replaced =
+          ReplaceIndexLocation(store, *index_ptr, previous_entry,
+                               request.digest_, location, current_tx_undo);
       if (!replaced.ok()) {
         LatchRuntimeFailure(store);
         co_return replaced.status();
       }
       inserted_entry = *replaced;
     } else {
-      inserted_entry =
-          index_ptr->InsertNew(digest, key, location, !key_indirect);
+      inserted_entry = index_ptr->InsertNew(request.digest_, request.key_,
+                                            location, !request.key_indirect_);
       if (inserted_entry == nullptr) {
         LatchRuntimeFailure(store);
         co_return absl::ResourceExhaustedError(
             "record index entry capacity exhausted");
       }
       assert(partition_ptr != nullptr);
-      AddFullSyncCoverageEntry(*partition_ptr, db_id, key.size());
+      AddFullSyncCoverageEntry(*partition_ptr, request.db_id_,
+                               request.key_.size());
     }
-    if (external) {
+    if (request.external_) {
       store.external_manifests_.insert_or_assign(inserted_entry, extents);
     } else {
       store.external_manifests_.erase(inserted_entry);
     }
   }
   if (grouped_root) {
-    auto published = group->publication_->Commit(*group->prepared_root_);
+    auto published =
+        request.group_->publication_->Commit(*request.group_->prepared_root_);
     if (!published.ok()) {
       store.write_failed_ = true;
       co_return published;
     }
   } else if (previous_grouped != nullptr) {
     const bool retain_undo_slot =
-        (tx != nullptr && tx->collect_undo_) || replacement_undo != nullptr;
+        (request.tx_ != nullptr && request.tx_->collect_undo_) ||
+        request.replacement_undo_ != nullptr;
     auto removed =
         retain_undo_slot
-            ? partition_ptr->grouped_objects_[db_id].ClearKeepingSlot(
-                  key, previous_grouped)
-            : partition_ptr->grouped_objects_[db_id].Erase(key,
-                                                           previous_grouped);
+            ? partition_ptr->grouped_objects_[request.db_id_].ClearKeepingSlot(
+                  request.key_, previous_grouped)
+            : partition_ptr->grouped_objects_[request.db_id_].Erase(
+                  request.key_, previous_grouped);
     if (!removed.ok()) {
       store.write_failed_ = true;
       co_return removed;
     }
   }
-  const bool route_to_commit = tx != nullptr && previous.has_value();
+  const bool route_to_commit = request.tx_ != nullptr && previous.has_value();
   const bool dependency_pinned =
       route_to_commit &&
       (previous_grouped != nullptr
@@ -3314,13 +3417,13 @@ acquire_active_stream:
               grouped_dependency_pins->Take(RetiredRecordOf(*previous)))
            : PinTxDependencyLocal(store, *previous));
   const bool defer_defrag_retirement =
-      for_defrag && commit_retirements != nullptr;
+      request.for_defrag_ && commit_retirements != nullptr;
   if (grouped_retirements != nullptr) {
     for (auto& child : *grouped_retirements) {
       child.dependency_pinned_ = grouped_dependency_pins != nullptr &&
                                  grouped_dependency_pins->Take(child);
-      if (tx != nullptr) {
-        tx->retirements_.push_back(TxShardWrites::Retired{
+      if (request.tx_ != nullptr) {
+        request.tx_->retirements_.push_back(TxShardWrites::Retired{
             .block_id_ = child.block_id_,
             .allocation_epoch_ = child.allocation_epoch_,
             .total_disk_bytes_ = child.total_disk_bytes_,
@@ -3339,26 +3442,28 @@ acquire_active_stream:
   }
   store.staged_records_[updated.block_id_].push_back(RecordIdentity{
       .entry_address_ = reinterpret_cast<std::uintptr_t>(inserted_entry),
-      .retired_extents_ = (!for_defrag || defer_defrag_retirement) &&
+      .retired_extents_ = (!request.for_defrag_ || defer_defrag_retirement) &&
                                   !route_to_commit && previous.has_value() &&
                                   previous->external()
                               ? retired_value_extents
                               : nullptr,
       .retired_record_ =
-          (!for_defrag || defer_defrag_retirement) && !route_to_commit &&
-                  previous.has_value()
+          (!request.for_defrag_ || defer_defrag_retirement) &&
+                  !route_to_commit && previous.has_value()
               ? StagedRetiredRecordOf(*previous, previous_dependent_extents)
               : StagedRetiredRecord{},
       .tx_retirements_ = std::move(commit_retirements),
-      .index_generation_ = store.index_generations_[db_id],
-      .entry_hash_ =
-          inserted_entry == nullptr ? 0 : RecordIndex::AddressHash(digest),
+      .index_generation_ = store.index_generations_[request.db_id_],
+      .entry_hash_ = inserted_entry == nullptr
+                         ? 0
+                         : RecordIndex::AddressHash(request.digest_),
       .partition_id_ =
           partition_ptr == nullptr ? std::uint16_t{0} : partition_ptr->id_,
-      .db_id_ = db_id,
-      .entry_tag_ = RecordIndex::AddressTag(digest),
+      .db_id_ = request.db_id_,
+      .entry_tag_ = RecordIndex::AddressTag(request.digest_),
   });
-  if (tx != nullptr && tx->collect_undo_ && inserted_entry != nullptr) {
+  if (request.tx_ != nullptr && request.tx_->collect_undo_ &&
+      inserted_entry != nullptr) {
     TxUndoLog& undo = store.tx_undo_[txid];
     const std::optional<std::uint32_t> entry_handle =
         undo.Track(inserted_entry);
@@ -3374,7 +3479,7 @@ acquire_active_stream:
         .previous_dependency_pinned_ = dependency_pinned,
         .previous_grouped_retirements_ = grouped_retirements,
         .applied_grouped_retirements_ = grouped_abort_retirements,
-        .db_id_ = db_id,
+        .db_id_ = request.db_id_,
     });
   }
   if (route_to_commit) {
@@ -3382,7 +3487,7 @@ acquire_active_stream:
     // commit record is durable — recovery drops uncommitted replacements and
     // must still find the old copy — so its retirement travels with the
     // transaction instead of this record's flush.
-    tx->retirements_.push_back(TxShardWrites::Retired{
+    request.tx_->retirements_.push_back(TxShardWrites::Retired{
         .block_id_ = previous->block_id(),
         .allocation_epoch_ = previous->allocation_epoch(),
         .total_disk_bytes_ = previous->total_disk_bytes(),
@@ -3394,11 +3499,11 @@ acquire_active_stream:
         .immediate_extents_ = retired_value_extents,
     });
   }
-  if (tx != nullptr) {
+  if (request.tx_ != nullptr) {
     const std::uint32_t staged_end =
         static_cast<std::uint32_t>(record_offset + total_disk_bytes);
     bool merged = false;
-    for (TxShardWrites::Fence& fence : tx->fences_) {
+    for (TxShardWrites::Fence& fence : request.tx_->fences_) {
       if (fence.block_id_ == updated.block_id_ &&
           fence.allocation_epoch_ == updated.allocation_epoch_) {
         fence.committed_bytes_ = std::max(fence.committed_bytes_, staged_end);
@@ -3407,7 +3512,7 @@ acquire_active_stream:
       }
     }
     if (!merged) {
-      tx->fences_.push_back(TxShardWrites::Fence{
+      request.tx_->fences_.push_back(TxShardWrites::Fence{
           .block_id_ = updated.block_id_,
           .allocation_epoch_ = updated.allocation_epoch_,
           .committed_bytes_ = staged_end,
@@ -3415,41 +3520,42 @@ acquire_active_stream:
       });
     }
   }
-  if (!auxiliary && !indirect_key_record && was_live != is_live) {
+  if (!auxiliary && !request.indirect_key_record_ && was_live != is_live) {
     if (is_live) {
-      if (explicit_root != nullptr) {
-        ++*explicit_root->live_key_count_;
-        if (explicit_root->store_live_key_count_ != nullptr) {
-          ++*explicit_root->store_live_key_count_;
+      if (request.explicit_root_ != nullptr) {
+        ++*request.explicit_root_->live_key_count_;
+        if (request.explicit_root_->store_live_key_count_ != nullptr) {
+          ++*request.explicit_root_->store_live_key_count_;
         }
       } else {
-        ++partition_ptr->live_key_count_[db_id];
-        ++store.live_key_count_[db_id];
+        ++partition_ptr->live_key_count_[request.db_id_];
+        ++store.live_key_count_[request.db_id_];
       }
     } else {
-      if (explicit_root != nullptr) {
-        --*explicit_root->live_key_count_;
-        if (explicit_root->store_live_key_count_ != nullptr) {
-          --*explicit_root->store_live_key_count_;
+      if (request.explicit_root_ != nullptr) {
+        --*request.explicit_root_->live_key_count_;
+        if (request.explicit_root_->store_live_key_count_ != nullptr) {
+          --*request.explicit_root_->store_live_key_count_;
         }
       } else {
-        --partition_ptr->live_key_count_[db_id];
-        --store.live_key_count_[db_id];
+        --partition_ptr->live_key_count_[request.db_id_];
+        --store.live_key_count_[request.db_id_];
       }
     }
   }
-  if (!auxiliary && !indirect_key_record && was_expiring != is_expiring) {
+  if (!auxiliary && !request.indirect_key_record_ &&
+      was_expiring != is_expiring) {
     if (is_expiring) {
-      if (explicit_root != nullptr) {
-        ++*explicit_root->expiring_key_count_;
+      if (request.explicit_root_ != nullptr) {
+        ++*request.explicit_root_->expiring_key_count_;
       } else {
-        ++partition_ptr->expiring_key_count_[db_id];
+        ++partition_ptr->expiring_key_count_[request.db_id_];
       }
     } else {
-      if (explicit_root != nullptr) {
-        --*explicit_root->expiring_key_count_;
+      if (request.explicit_root_ != nullptr) {
+        --*request.explicit_root_->expiring_key_count_;
       } else {
-        --partition_ptr->expiring_key_count_[db_id];
+        --partition_ptr->expiring_key_count_[request.db_id_];
       }
     }
   }
@@ -3470,7 +3576,7 @@ acquire_active_stream:
   // Defrag relocations keep the inline retirement: their source blocks are
   // protected by RelocationDurabilityFence, and the defrag pass needs the
   // decrement to observe the block emptying within the same pass.
-  if (for_defrag && !defer_defrag_retirement && previous.has_value()) {
+  if (request.for_defrag_ && !defer_defrag_retirement && previous.has_value()) {
     // The local retirement cannot suspend. Match flush settlement's direct
     // owner-local path instead of allocating a child coroutine for every
     // relocated record; foreign block owners still use the existing handoff.
@@ -3486,7 +3592,7 @@ acquire_active_stream:
       co_return dead;
     }
   }
-  if (!for_defrag && previous.has_value() && previous->external()) {
+  if (!request.for_defrag_ && previous.has_value() && previous->external()) {
     RequestFlush(store, updated.block_id_);
     if (active_stream().has_value() &&
         active_stream()->block_id_ == updated.block_id_) {
@@ -3494,10 +3600,12 @@ acquire_active_stream:
       active_stream().reset();
     }
   }
-  if (written_location != nullptr) {
-    *written_location = location;
+  if (request.written_location_ != nullptr) {
+    *request.written_location_ = location;
   }
+#if LAVIK_ENABLE_TRACE
   if (trace != nullptr) trace->index_done_ns_ = SetTraceNowNanos();
+#endif
   grouped_root_guard.completed_ = true;
   co_return absl::OkStatus();
 }

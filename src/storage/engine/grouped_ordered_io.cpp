@@ -67,11 +67,23 @@ StorageEngine::Impl::WriteOrderedGroupRecordLocked(
   };
   const ValueType type = OrderedValueType(snapshot.kind_);
   RecordLocation location;
-  auto status = co_await WriteRecordLocked(
-      store, db_id, key, payload, RecordKind::kValue, type, 0, digest, tx.txid_,
-      revision, false, true, external, key_indirect, OrderedGroupSize(snapshot),
-      extents, &location, nullptr, &tx, nullptr, nullptr, nullptr, nullptr,
-      &partition, &identity);
+  const RecordWriteRequest record_write{
+      .key_ = key,
+      .value_ = payload,
+      .digest_ = digest,
+      .txid_ = tx.txid_,
+      .mutation_sequence_ = revision,
+      .logical_size_ = OrderedGroupSize(snapshot),
+      .written_location_ = &location,
+      .tx_ = &tx,
+      .known_partition_ = &partition,
+      .group_ = &identity,
+      .db_id_ = db_id,
+      .value_type_ = type,
+      .external_ = external,
+      .key_indirect_ = key_indirect,
+  };
+  auto status = co_await WriteRecordLocked(store, record_write, extents);
   if (!status.ok()) {
     if (extents != nullptr) SpawnExtentReclaim(store, extents);
     co_return status;

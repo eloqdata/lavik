@@ -3822,25 +3822,49 @@ class StorageEngine::Impl {
       const OrderedGroupSnapshot& snapshot, OrderedGroupEncoder encoder,
       std::uint64_t revision, TxShardWrites& tx, std::uint64_t batch_txid = 0);
 
+  // Caller-owned metadata borrowed for the entire awaited write. The request
+  // must stay alive, unmoved and immutable until WriteRecordLocked completes;
+  // its views and pointees retain their existing lifetime contracts. Own the
+  // digest so keyless records can initialize it from a temporary safely.
+  struct RecordWriteRequest {
+    std::string_view key_{};
+    std::string_view value_{};
+    Digest digest_{};
+    std::uint64_t expire_at_ms_ = 0;
+    std::uint64_t txid_ = 0;
+    std::uint64_t mutation_sequence_ = 0;
+    std::uint64_t logical_size_ = std::numeric_limits<std::uint64_t>::max();
+    RecordLocation* written_location_ = nullptr;
+    const RelocationSource* relocation_ = nullptr;
+    TxShardWrites* tx_ = nullptr;
+    const ExplicitWriteRoot* explicit_root_ = nullptr;
+    TxUndoLog* replacement_undo_ = nullptr;
+    WorkerStore::PartitionStore* known_partition_ = nullptr;
+    const GroupRecordWrite* group_ = nullptr;
+    const MutationPrecondition* mutation_precondition_ = nullptr;
+    std::uint8_t db_id_ = 0;
+    RecordKind kind_ = RecordKind::kValue;
+    ValueType value_type_ = ValueType::kNone;
+    bool for_defrag_ = false;
+    bool unlock_writer_while_waiting_ = true;
+    bool external_ = false;
+    bool key_indirect_ = false;
+    bool mark_watched_ = false;
+    bool indirect_key_record_ = false;
+  };
+
+  // Keep owning handles in the callee so success, failure and cancellation
+  // retain the same release/transfer boundary as the awaited write. Tracing
+  // stays last and is absent from non-tracing builds.
   Task<absl::Status> WriteRecordLocked(
-      WorkerStore& store, std::uint8_t db_id, std::string_view key,
-      std::string_view value, RecordKind kind, ValueType value_type,
-      std::uint64_t expire_at_ms, const Digest& digest, std::uint64_t txid,
-      std::uint64_t mutation_sequence, bool for_defrag,
-      bool unlock_writer_while_waiting = true, bool external = false,
-      bool key_indirect = false,
-      std::uint64_t logical_size = std::numeric_limits<std::uint64_t>::max(),
+      WorkerStore& store, const RecordWriteRequest& request,
       std::shared_ptr<const std::vector<ExtentRef>> extents = nullptr,
-      RecordLocation* written_location = nullptr,
-      const RelocationSource* relocation = nullptr, TxShardWrites* tx = nullptr,
-      std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
-      SetLatencyTrace* trace = nullptr,
-      const ExplicitWriteRoot* explicit_root = nullptr,
-      TxUndoLog* replacement_undo = nullptr,
-      WorkerStore::PartitionStore* known_partition = nullptr,
-      const GroupRecordWrite* group = nullptr, bool mark_watched = false,
-      const MutationPrecondition* mutation_precondition = nullptr,
-      bool indirect_key_record = false);
+      std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr
+#if LAVIK_ENABLE_TRACE
+      ,
+      SetLatencyTrace* trace = nullptr
+#endif
+  );
 
   Task<absl::StatusOr<IndirectKeyHandle>> EnsureIndirectKey(
       WorkerStore& store, std::string_view key, const Digest& digest,

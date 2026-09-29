@@ -490,13 +490,27 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
     // buffer while a foreground allocator owns that gate and waits for a
     // buffer: joining its queue would prevent either side from completing.
     // Retain the store lock and use the defrag reserve/heap-buffer fallback.
-    absl::Status written = co_await WriteRecordLocked(
-        key_store, record.db_id_, key, value, record.kind_, record.value_type_,
-        0, digest, clear_txid ? 0 : record.txid_, record.mutation_sequence_,
-        /*for_defrag=*/true, /*unlock_writer_while_waiting=*/false,
-        record.external_, record.key_indirect_, record.logical_size_, extents,
-        &relocated, &source, nullptr, nullptr, nullptr, nullptr, nullptr,
-        &partition, &descriptor);
+    const RecordWriteRequest record_write{
+        .key_ = key,
+        .value_ = value,
+        .digest_ = digest,
+        .txid_ = clear_txid ? 0 : record.txid_,
+        .mutation_sequence_ = record.mutation_sequence_,
+        .logical_size_ = record.logical_size_,
+        .written_location_ = &relocated,
+        .relocation_ = &source,
+        .known_partition_ = &partition,
+        .group_ = &descriptor,
+        .db_id_ = record.db_id_,
+        .kind_ = record.kind_,
+        .value_type_ = record.value_type_,
+        .for_defrag_ = true,
+        .unlock_writer_while_waiting_ = false,
+        .external_ = record.external_,
+        .key_indirect_ = record.key_indirect_,
+    };
+    absl::Status written =
+        co_await WriteRecordLocked(key_store, record_write, extents);
     if (!written.ok()) co_return written;
     // Physical allocation can suspend owner serialization. Re-resolve the
     // incarnation and exact group address afterward; a client update, another
@@ -605,15 +619,28 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   // while holding the foreground-allocation gate. Relocation must therefore
   // keep the store writer locked and allocate from the defrag reserve instead
   // of waiting behind that gate, which would deadlock both sides.
+  const RecordWriteRequest record_write{
+      .key_ = key,
+      .value_ = value,
+      .digest_ = digest,
+      .expire_at_ms_ = record.expire_at_ms_,
+      .txid_ = clear_txid ? 0 : record.txid_,
+      .mutation_sequence_ = record.mutation_sequence_,
+      .logical_size_ = record.logical_size_,
+      .written_location_ = &relocated,
+      .relocation_ = &source,
+      .known_partition_ = &partition,
+      .group_ = record.grouped_ ? &grouped_descriptor : nullptr,
+      .db_id_ = record.db_id_,
+      .kind_ = record.kind_,
+      .value_type_ = record.value_type_,
+      .for_defrag_ = true,
+      .unlock_writer_while_waiting_ = false,
+      .external_ = record.external_,
+      .key_indirect_ = record.key_indirect_,
+  };
   absl::Status written = co_await WriteRecordLocked(
-      key_store, record.db_id_, key, value, record.kind_, record.value_type_,
-      record.expire_at_ms_, digest, clear_txid ? 0 : record.txid_,
-      record.mutation_sequence_, /*for_defrag=*/true,
-      /*unlock_writer_while_waiting=*/false, record.external_,
-      record.key_indirect_, record.logical_size_,
-      ExtentsFor(key_store, current), &relocated, &source, nullptr, nullptr,
-      nullptr, nullptr, nullptr, &partition,
-      record.grouped_ ? &grouped_descriptor : nullptr);
+      key_store, record_write, ExtentsFor(key_store, current));
   if (written.code() == absl::StatusCode::kAborted) {
     // A client write replaced this key, or FLUSHDB/replica reset replaced the
     // index, while relocation waited for a block. Nothing was written; the
