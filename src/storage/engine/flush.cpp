@@ -19,15 +19,12 @@
 namespace lavik::storage {
 
 Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
-  struct WakeOnExit {
-    WorkerStore* store_;
-    ~WakeOnExit() { store_->durability_progress_.NotifyAll(*store_->worker_); }
-  } wake_on_exit{store};
   const auto interval = std::chrono::milliseconds(options_.flush_max_ms_);
   while (!store->worker_->stop_requested()) {
     absl::Status status = co_await bycorf::SleepFor(*store->worker_, interval);
     if (!status.ok()) {
       CompleteShutdownFlush(status);
+      store->durability_progress_.NotifyAll(*store->worker_);
       co_return status;
     }
     if (store->worker_->stop_requested()) {
@@ -142,6 +139,7 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
         if (!barrier.ok() && status.ok()) status = barrier;
       }
       CompleteShutdownFlush(status);
+      store->durability_progress_.NotifyAll(*store->worker_);
       co_return status;
     }
 
@@ -165,6 +163,7 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
                    store->worker_->id(), status.message());
     }
   }
+  store->durability_progress_.NotifyAll(*store->worker_);
   co_return absl::OkStatus();
 }
 
@@ -191,16 +190,20 @@ void StorageEngine::Impl::RequestFlush(WorkerStore& store,
 Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
   struct FlushRunGuard {
     Impl* engine_ = nullptr;
-    WorkerStore* store_ = nullptr;
     ~FlushRunGuard() {
-      // Covers I/O failure, canceled shutdown, invalidated/reused blocks and
-      // an empty queue. Never leave a fence asleep when its flusher exits.
-      store_->durability_progress_.NotifyAll(*store_->worker_);
       engine_->space_reclaim_generation_.fetch_add(1,
                                                    std::memory_order_release);
       engine_->active_flushes_.fetch_sub(1, std::memory_order_acq_rel);
     }
-  } flush_run_guard{this, store};
+  } flush_run_guard{this};
+  // Notify on executing return paths, not from a frame destructor: forced
+  // runtime teardown can destroy waiter frames before the flusher frame.
+  // At that point no coroutine may be scheduled again. Ordinary completion,
+  // failure and cancellation all wake while the worker is still executing.
+  const auto finish = [store](absl::Status status) {
+    store->durability_progress_.NotifyAll(*store->worker_);
+    return status;
+  };
 
   struct PendingFlush {
     std::uint64_t block_id_ = 0;
@@ -230,7 +233,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
 
       if (store->flush_queue_.empty()) {
         store->flush_running_ = false;
-        co_return absl::OkStatus();
+        co_return finish(absl::OkStatus());
       }
 
       const std::uint64_t block_id = store->flush_queue_.front();
@@ -264,8 +267,8 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         state->flush_queued_ = false;
         LatchRuntimeFailure(*store);
         store->flush_running_ = false;
-        co_return absl::Status(absl::StatusCode::kInternal,
-                               "invalid pending flush staging buffer");
+        co_return finish(
+            absl::InternalError("invalid pending flush staging buffer"));
       }
       if (padded == staging_state.durable_bytes_) {
         // Nothing new since the last flush. Rewriting the header would only
@@ -370,7 +373,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           if (end != pause_text && *end == '\0' && pause_ms != 0) {
             absl::Status paused = co_await bycorf::SleepFor(
                 *store->worker_, std::chrono::milliseconds(pause_ms));
-            if (!paused.ok()) co_return paused;
+            if (!paused.ok()) co_return finish(paused);
           }
         });
     // The first flush of a block starts at the unused header slot, which is
@@ -392,8 +395,8 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       }
       LatchRuntimeFailure(*store);
       store->flush_running_ = false;
-      co_return absl::Status(absl::StatusCode::kInternal,
-                             "invalid pending flush staging buffer");
+      co_return finish(
+          absl::InternalError("invalid pending flush staging buffer"));
     }
 
     for (std::size_t write_offset = write_begin; write_offset < write_bytes;) {
@@ -416,10 +419,9 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         LatchRuntimeFailure(*store);
         store->flush_running_ = false;
         if (!written.ok()) {
-          co_return written.status();
+          co_return finish(written.status());
         }
-        co_return absl::Status(absl::StatusCode::kInternal,
-                               "short block flush write");
+        co_return finish(absl::InternalError("short block flush write"));
       }
       write_offset += chunk_bytes;
     }
@@ -436,7 +438,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       }
       LatchRuntimeFailure(*store);
       store->flush_running_ = false;
-      co_return status;
+      co_return finish(status);
     };
 
     auto synced =
@@ -472,14 +474,14 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     BlockState* state = FindBlockState(*store, pending->block_id_);
     if (state == nullptr) {
       store->flush_running_ = false;
-      co_return absl::OkStatus();
+      co_return finish(absl::OkStatus());
     }
     if (!state->allocated_ || state->flush_in_progress_ == false ||
         state->allocation_epoch_ != pending->allocation_epoch_) {
       state->flush_in_progress_ = false;
       state->flush_queued_ = false;
       store->flush_running_ = false;
-      co_return absl::OkStatus();
+      co_return finish(absl::OkStatus());
     }
 
     // Every staged record in this snapshot is durable now (data pages and
