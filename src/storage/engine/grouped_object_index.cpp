@@ -434,6 +434,7 @@ const GroupIndexPage* FindPage(const NodeHandle& root, HashGroupId id) {
 
 std::shared_ptr<const std::vector<ExtentRef>> ManifestFor(
     const GroupIndexPage& page, HashGroupId id) {
+  if (page.extents_.empty()) return nullptr;
   const auto bytes = GroupKey(id);
   const std::string_view key(bytes.data(), bytes.size());
   const auto* entry = page.extents_.Find(ComputeDigest(key), key);
@@ -446,28 +447,34 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
   if (changed.empty()) return node;
   if (!node) return BuildPhysical(changed, arena);
   if (node->page_) {
-    std::map<HashGroupId, HashGroupLocation> records;
     const auto& page = *node->page_;
+    // Both inputs have unique, sorted full identities. Merge directly rather
+    // than allocating a map node for every unchanged location on each write.
+    // Replaced locations need no old lookup or manifest reference at all.
+    std::vector<HashGroupLocation> merged;
+    merged.reserve(page.ids_.size() + changed.size());
+    std::size_t next = 0;
     for (std::size_t i = 0; i < page.ids_.size(); ++i) {
       const auto id = page.ids_[i];
+      while (next < changed.size() && changed[next].id_ < id)
+        merged.push_back(changed[next++]);
+      if (next < changed.size() && changed[next].id_ == id) {
+        merged.push_back(changed[next++]);
+        continue;
+      }
       const auto bytes = GroupKey(id);
       const std::string_view key(bytes.data(), bytes.size());
       const auto* entry = page.locations_.Find(ComputeDigest(key), key);
       // Epoch/owner remain the physical block's authority. A compact entry
       // is copied byte-for-byte through this temporary location; these two
       // fields do not enter the compact destination RecordIndex.
-      records.emplace(
-          id, HashGroupLocation{.id_ = id,
-                                .location_ = RecordIndexEntryPolicy::Load(
-                                    entry->value_, nullptr, 1, 0),
-                                .extents_ = ManifestFor(page, id),
-                                .retired_ = ((page.retired_ >> i) & 1) != 0});
+      merged.push_back({.id_ = id,
+                        .location_ = RecordIndexEntryPolicy::Load(
+                            entry->value_, nullptr, 1, 0),
+                        .extents_ = ManifestFor(page, id),
+                        .retired_ = ((page.retired_ >> i) & 1) != 0});
     }
-    for (const auto& record : changed)
-      records.insert_or_assign(record.id_, record);
-    std::vector<HashGroupLocation> merged;
-    merged.reserve(records.size());
-    for (auto& [id, record] : records) merged.push_back(std::move(record));
+    merged.insert(merged.end(), changed.begin() + next, changed.end());
     return BuildPhysical(merged, arena);
   }
   auto replacement = AllocateLocalObject<GroupIndexNode>(arena);
