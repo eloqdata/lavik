@@ -1363,6 +1363,11 @@ conditions. The CLI has no `redis-cli` dependency and its exit 0 confirms only
 the atomic Genesis commit; current Data-plane usability remains the READY
 status contract.
 
+Committed views share bounded, immutable audit-record pages. Appending,
+rotation, or pruning copies only a modified published page; older views keep their exact
+records and policy/drop/prune metadata. The state-machine lock still captures
+the aggregate cut, and snapshot/export encoding remains a flat log-index order.
+
 Every privileged committed command creates a deterministic audit record keyed
 by Raft log index. Records include the injected actor, proposal time, command
 summary, and verdict. Exports carry complete records and drop watermarks.

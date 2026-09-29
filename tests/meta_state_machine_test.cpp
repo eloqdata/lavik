@@ -851,6 +851,35 @@ TEST_F(MetaStateMachineTest, SnapshotInstallValidatesBeforeReplacingState) {
             (*leader)->StoresSnapshot().audit_.Serialize());
 }
 
+TEST_F(MetaStateMachineTest, RetainedStoresSurviveApplyAndSnapshotInstall) {
+  auto machine = Open();
+  ASSERT_TRUE(machine.ok());
+  Commit(**machine, 1, MakeRegister(0x11));
+  const auto first = (*machine)->StoresSnapshot();
+  const auto first_audit = first.audit_.Serialize();
+  Commit(**machine, 2, MakeRegister(0x22));
+  const auto second = (*machine)->StoresSnapshot();
+  const auto second_audit = second.audit_.Serialize();
+
+  auto replacement = Open();
+  ASSERT_TRUE(replacement.ok());
+  Commit(**replacement, 1, MakeRegister(0x33));
+  Commit(**replacement, 2, MakeRegister(0x44));
+  Commit(**replacement, 3, MakeCreateGroup("replacement", 1));
+  const auto image = (*replacement)->Capture(3);
+  ASSERT_TRUE(image.ok());
+  ASSERT_TRUE((*machine)->Install(3, *image).ok());
+  Commit(**machine, 4, MakeRegister(0x55));
+  EXPECT_EQ(first.audit_.Serialize(), first_audit);
+  EXPECT_EQ(first.audit_.size(), 1u);
+  EXPECT_EQ(first.identity_.NodeCount(), 1u);
+  EXPECT_EQ(second.audit_.Serialize(), second_audit);
+  EXPECT_EQ(second.audit_.size(), 2u);
+  EXPECT_EQ(second.identity_.NodeCount(), 2u);
+  EXPECT_FALSE(second.audit_.Find(3));
+  EXPECT_EQ((*machine)->StoresSnapshot().audit_.size(), 4u);
+}
+
 TEST_F(MetaStateMachineTest, CapturedImageRemainsOwnedWhileLiveStateAdvances) {
   auto machine = Open();
   ASSERT_TRUE(machine.ok());
