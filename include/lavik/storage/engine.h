@@ -1784,6 +1784,8 @@ class StorageEngine {
   // per-shard TxShardWrites. May run in the background for asynchronous client
   // acknowledgement. A grouped decision that another mutation inherits is
   // not inheritable until its own durability fence completes.
+  // Rejects non-null shard receipts whose ID differs from the supplied
+  // nonzero txid; the commit record derives its ID from a matching receipt.
   bycorf::Task<absl::Status> CommitTxWrites(std::uint64_t txid,
                                             std::vector<TxShardWrites*> shards);
   // Rejects an already-known failed grouped transaction before its coordinator

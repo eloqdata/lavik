@@ -399,6 +399,12 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
                                        const RecordHeader& record,
                                        const RecordLocation& source_location,
                                        bool clear_txid) {
+  // Only the transaction cleaner, after verifying durable commit decisions,
+  // may remove a source tag. Ordinary GC has no live receipt to preserve it.
+  if (!clear_txid && record.txid_ != 0) {
+    co_return absl::InvalidArgumentError(
+        "tagged records require a live transaction receipt");
+  }
   WorkerStore& key_store = *stores_[key_owner];
   co_await key_store.store_state_mutex_.Lock();
   UnlockGuard write_unlock(&key_store.store_state_mutex_, key_store.worker_);
@@ -494,7 +500,6 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
         .key_ = key,
         .value_ = value,
         .digest_ = digest,
-        .txid_ = clear_txid ? 0 : record.txid_,
         .mutation_sequence_ = record.mutation_sequence_,
         .logical_size_ = record.logical_size_,
         .written_location_ = &relocated,
@@ -624,7 +629,6 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       .value_ = value,
       .digest_ = digest,
       .expire_at_ms_ = record.expire_at_ms_,
-      .txid_ = clear_txid ? 0 : record.txid_,
       .mutation_sequence_ = record.mutation_sequence_,
       .logical_size_ = record.logical_size_,
       .written_location_ = &relocated,

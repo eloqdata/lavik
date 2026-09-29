@@ -3831,11 +3831,11 @@ class StorageEngine::Impl {
     std::string_view value_{};
     Digest digest_{};
     std::uint64_t expire_at_ms_ = 0;
-    std::uint64_t txid_ = 0;
     std::uint64_t mutation_sequence_ = 0;
     std::uint64_t logical_size_ = std::numeric_limits<std::uint64_t>::max();
     RecordLocation* written_location_ = nullptr;
     const RelocationSource* relocation_ = nullptr;
+    // Tagged writes take their transaction ID only from this live receipt.
     TxShardWrites* tx_ = nullptr;
     const ExplicitWriteRoot* explicit_root_ = nullptr;
     TxUndoLog* replacement_undo_ = nullptr;
@@ -3845,13 +3845,16 @@ class StorageEngine::Impl {
     std::uint8_t db_id_ = 0;
     RecordKind kind_ = RecordKind::kValue;
     ValueType value_type_ = ValueType::kNone;
-    bool for_defrag_ = false;
-    bool unlock_writer_while_waiting_ = true;
-    bool external_ = false;
-    bool key_indirect_ = false;
-    bool mark_watched_ = false;
-    bool indirect_key_record_ = false;
+    // The request lives in the caller's coroutine frame. Pack these local
+    // flags into one byte rather than adding another aligned word to it.
+    bool for_defrag_ : 1 = false;
+    bool unlock_writer_while_waiting_ : 1 = true;
+    bool external_ : 1 = false;
+    bool key_indirect_ : 1 = false;
+    bool mark_watched_ : 1 = false;
+    bool indirect_key_record_ : 1 = false;
   };
+  static_assert(sizeof(RecordWriteRequest) == 136);
 
   // Validate grouped metadata after resolving the logical-size sentinel and
   // the transaction receipt's effective txid.

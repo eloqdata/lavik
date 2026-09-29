@@ -71,7 +71,6 @@ StorageEngine::Impl::WriteOrderedGroupRecordLocked(
       .key_ = key,
       .value_ = payload,
       .digest_ = digest,
-      .txid_ = tx.txid_,
       .mutation_sequence_ = revision,
       .logical_size_ = OrderedGroupSize(snapshot),
       .written_location_ = &location,

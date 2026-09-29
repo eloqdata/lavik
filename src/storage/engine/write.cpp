@@ -575,6 +575,10 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
     if (shard == nullptr) {
       continue;
     }
+    if (txid == 0 || shard->txid_ != txid) {
+      co_return absl::InvalidArgumentError(
+          "transaction receipt ID does not match commit");
+    }
     if (shard->grouped_decision_ != nullptr &&
         shard->grouped_decision_->state_.load(std::memory_order_acquire) ==
             GroupedCommitDecision::State::kFailed) {
@@ -623,7 +627,6 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   RecordLocation commit_location;
   const RecordWriteRequest record_write{
       .digest_ = ComputeDigest({}),
-      .txid_ = txid,
       .written_location_ = &commit_location,
       .tx_ = commit_receipt,
       .kind_ = RecordKind::kTxCommit,
@@ -2430,7 +2433,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
 #endif
 ) {
   std::uint64_t logical_size = request.logical_size_;
-  std::uint64_t txid = request.txid_;
+  std::uint64_t txid = 0;
   if (store.write_failed_ || RuntimeFailureLatched() ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
@@ -2471,7 +2474,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       }
     }
   } grouped_root_guard{store, request.tx_};
-  if ((txid != 0 && (request.tx_ == nullptr || request.for_defrag_)) ||
+  if ((txid != 0 && request.for_defrag_) ||
       (request.kind_ == RecordKind::kTxCommit && txid == 0)) {
     co_return absl::InvalidArgumentError(
         "tagged records require a live transaction receipt");

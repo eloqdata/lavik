@@ -122,7 +122,6 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
       .key_ = key,
       .value_ = payload,
       .digest_ = digest,
-      .txid_ = tx.txid_,
       .mutation_sequence_ = sequence,
       .logical_size_ = snapshot.value_.entries_.size(),
       .written_location_ = &location,
