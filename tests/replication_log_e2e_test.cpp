@@ -490,7 +490,7 @@ class ReplicationLogService final : public bycorf::Service {
       const auto bytes = reply.disk_value_.network_bytes();
       actual.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     }
-    if (reply.chunks_ || actual != expected_reply) {
+    if (reply.continuation_ || actual != expected_reply) {
       co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                              "client replication command returned '" + actual +
                                  "' instead of '" +
