@@ -673,8 +673,14 @@ def cancelled_handoff(root):
         )
 
 
-def rejected_full(root, name, source_faults, target_faults, marker):
-    with pair(root, name, source_faults=source_faults, target_faults=target_faults) as (
+def rejected_full(root, name, source_faults, target_faults, marker, **pair_options):
+    with pair(
+        root,
+        name,
+        source_faults=source_faults,
+        target_faults=target_faults,
+        **pair_options,
+    ) as (
         meta,
         source,
         target,
@@ -703,6 +709,29 @@ def rejected_full(root, name, source_faults, target_faults, marker):
             )
         finally:
             reader.close()
+
+
+def checksum_rejection(root):
+    def seed(writer):
+        # Partition 1 carries the corrupt record before the next reset batch,
+        # which must join the deliberately held partition-0 handoff.
+        key = "{checksum-18743}:seed"
+        assert writer.call("CLUSTER", "KEYSLOT", key) == 1
+        assert writer.call("SET", key, "baseline") == "OK"
+
+    rejected_full(
+        root,
+        "checksum",
+        {"LAVIK_REPLICATION_CORRUPT_FULLSYNC_RECORD_FRAME_ONCE": "1"},
+        # Keep a handoff pending on the receiving flow until CRC rejection
+        # cancels it. Cleanup must preserve the corruption diagnosis.
+        {"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK": "cancel"},
+        "replication frame CRC32C mismatch",
+        source_workers=1,
+        target_workers=1,
+        seed=seed,
+        require_seed_before_full=True,
+    )
 
 
 def full_tail(root):
@@ -1300,13 +1329,7 @@ def main():
             )
             divergent_tail(root, 0)
             divergent_tail(root, 1)
-            rejected_full(
-                root,
-                "checksum",
-                {"LAVIK_REPLICATION_CORRUPT_FULLSYNC_RECORD_FRAME_ONCE": "1"},
-                {},
-                "replication frame CRC32C mismatch",
-            )
+            checksum_rejection(root)
             rejected_full(
                 root,
                 "early-online",
