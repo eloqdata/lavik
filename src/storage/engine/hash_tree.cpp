@@ -286,90 +286,84 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
     std::span<const std::string_view> fields) {
   // Keep multi-field planning in its own coroutine so single-field reads do
   // not pay for the plan's allocations or coroutine-frame storage.
-  try {
-    constexpr auto max_size = std::numeric_limits<std::size_t>::max();
-    if (fields.size() > max_size / sizeof(HashFieldLookup) ||
-        fields.size() > (max_size - sizeof(HashResult)) /
-                            sizeof(std::optional<std::string>)) {
-      RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "OOM Hash lookup plan is too large");
-    }
-    auto scratch = TryReserveMemory(fields.size() * sizeof(HashFieldLookup));
-    if (!scratch) {
-      RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError("OOM Hash lookup plan");
-    }
-    std::vector<HashFieldLookup> requests;
-    requests.reserve(fields.size());
-    if (requests.capacity() > scratch->bytes() / sizeof(HashFieldLookup)) {
-      RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError("OOM Hash lookup plan");
-    }
-    for (std::size_t i = 0; i < fields.size(); ++i) {
-      const auto* route = object->directory().Find(fields[i]);
-      if (route == nullptr)
-        co_return absl::DataLossError("missing Hash field route");
-      requests.push_back({.group_ = route->id_,
-                          .field_ = fields[i],
-                          .result_index_ = i,
-                          .value_ = std::nullopt});
-    }
-    std::sort(requests.begin(), requests.end(),
-              [](const auto& left, const auto& right) {
-                if (left.group_ != right.group_)
-                  return left.group_ < right.group_;
-                return left.field_ < right.field_;
-              });
-
-    auto output =
-        TryReserveMemory(sizeof(HashResult) +
-                         fields.size() * sizeof(std::optional<std::string>));
-    if (!output) {
-      RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError("OOM Hash output retention");
-    }
-    HashResult result;
-    result.key_exists_ = true;
-    result.length_ = object->directory().root().field_count_;
-    result.values_.resize(fields.size());
-    const auto retained = sizeof(HashResult) +
-                          result.values_.capacity() * sizeof(result.values_[0]);
-    if (retained > output->bytes()) {
-      RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError("OOM Hash output retention");
-    }
-    result.retained_charge_.Adopt(&*output, retained);
-    for (std::size_t begin = 0; begin < requests.size();) {
-      auto end = begin + 1;
-      while (end < requests.size() &&
-             requests[end].group_ == requests[begin].group_)
-        ++end;
-      auto loaded = co_await LoadHashGroupPayload(
-          store, partition, db_id, key, digest, object, requests[begin].group_);
-      if (!loaded.ok()) co_return loaded.status();
-      const auto bytes = loaded->loaded_.value();
-      const std::string_view payload(
-          reinterpret_cast<const char*>(bytes.data()), bytes.size());
-      auto page_requests = std::span(requests).subspan(begin, end - begin);
-      auto status =
-          FindHashGroupFields(payload, loaded->field_count_, page_requests);
-      if (!status.ok()) co_return status;
-      status = RetainHashGroupValues(result, page_requests);
-      if (!status.ok()) co_return status;
-      // Only owned output survives this page lease. Clear the borrowed matches
-      // before loading another group, including on the buffer-reuse path.
-      for (auto& request : page_requests) request.value_.reset();
-      begin = end;
-    }
-    co_return result;
-  } catch (const std::bad_alloc&) {
+  constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+  // Admission failures are command errors; allocator failure after admission
+  // follows the runtime's fatal allocation policy. Check container limits
+  // explicitly instead of relying on length_error from reserve/resize.
+  if (fields.size() > std::vector<HashFieldLookup>{}.max_size() ||
+      fields.size() > std::vector<std::optional<std::string>>{}.max_size() ||
+      fields.size() > (max_size - sizeof(HashResult)) /
+                          sizeof(std::optional<std::string>)) {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM Hash lookup preparation");
-  } catch (const std::length_error&) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM Hash lookup is too large");
+    co_return absl::ResourceExhaustedError("OOM Hash lookup plan is too large");
   }
+  auto scratch = TryReserveMemory(fields.size() * sizeof(HashFieldLookup));
+  if (!scratch) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM Hash lookup plan");
+  }
+  std::vector<HashFieldLookup> requests;
+  requests.reserve(fields.size());
+  if (requests.capacity() > scratch->bytes() / sizeof(HashFieldLookup)) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM Hash lookup plan");
+  }
+  for (std::size_t i = 0; i < fields.size(); ++i) {
+    const auto* route = object->directory().Find(fields[i]);
+    if (route == nullptr)
+      co_return absl::DataLossError("missing Hash field route");
+    requests.push_back({.group_ = route->id_,
+                        .field_ = fields[i],
+                        .result_index_ = i,
+                        .value_ = std::nullopt});
+  }
+  std::sort(requests.begin(), requests.end(),
+            [](const auto& left, const auto& right) {
+              if (left.group_ != right.group_)
+                return left.group_ < right.group_;
+              return left.field_ < right.field_;
+            });
+
+  auto output = TryReserveMemory(
+      sizeof(HashResult) + fields.size() * sizeof(std::optional<std::string>));
+  if (!output) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM Hash output retention");
+  }
+  HashResult result;
+  result.key_exists_ = true;
+  result.length_ = object->directory().root().field_count_;
+  result.values_.resize(fields.size());
+  const auto retained = sizeof(HashResult) +
+                        result.values_.capacity() * sizeof(result.values_[0]);
+  if (retained > output->bytes()) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM Hash output retention");
+  }
+  result.retained_charge_.Adopt(&*output, retained);
+  for (std::size_t begin = 0; begin < requests.size();) {
+    auto end = begin + 1;
+    while (end < requests.size() &&
+           requests[end].group_ == requests[begin].group_)
+      ++end;
+    auto loaded = co_await LoadHashGroupPayload(
+        store, partition, db_id, key, digest, object, requests[begin].group_);
+    if (!loaded.ok()) co_return loaded.status();
+    const auto bytes = loaded->loaded_.value();
+    const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
+                                   bytes.size());
+    auto page_requests = std::span(requests).subspan(begin, end - begin);
+    auto status =
+        FindHashGroupFields(payload, loaded->field_count_, page_requests);
+    if (!status.ok()) co_return status;
+    status = RetainHashGroupValues(result, page_requests);
+    if (!status.ok()) co_return status;
+    // Only owned output survives this page lease. Clear the borrowed matches
+    // before loading another group, including on the buffer-reuse path.
+    for (auto& request : page_requests) request.value_.reset();
+    begin = end;
+  }
+  co_return result;
 }
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLocked(
