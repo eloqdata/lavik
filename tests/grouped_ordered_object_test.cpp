@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <set>
+
 #include "gtest/gtest.h"
 #include "lavik/storage/detail/grouped_object_index.h"
 
@@ -162,6 +164,106 @@ OrderedInput OrderedFixture(ValueType type = ValueType::kList) {
          .retired_ = candidate.retired_});
   }
   return input;
+}
+
+TEST(GroupedOrderedObjectTest,
+     PhysicalIndexPreservesViewsWhenNewIdsDivergeBeforeSharedPrefix) {
+  // More than one physical leaf, with a long common identity prefix. The
+  // synthetic chains cover insertions on both sides of that old prefix;
+  // page ids are opaque and their chain order is independent of numeric order.
+  for (const std::uint64_t base : {0ULL, 1ULL << 40}) {
+    constexpr std::uint32_t count = 130;
+    constexpr auto type = ValueType::kList;
+    OrderedCollectionRoot root{.kind_ = OrderedCollectionKind::kList,
+                               .incarnation_ = 17,
+                               .item_count_ = count,
+                               .first_group_ = base + 1,
+                               .last_group_ = base + count,
+                               .next_group_id_ = base + count + 1,
+                               .group_count_ = count,
+                               .revision_ = 3};
+    std::vector<RecoveredOrderedGroup> records;
+    std::vector<HashGroupLocation> locations;
+    for (std::uint64_t i = 1; i <= count; ++i) {
+      records.push_back({.incarnation_ = 17,
+                         .id_ = base + i,
+                         .previous_ = i == 1 ? 0 : base + i - 1,
+                         .next_ = i == count ? 0 : base + i + 1,
+                         .sequence_ = 3,
+                         .lsn_ = i,
+                         .item_count_ = 1,
+                         .record_token_ = i});
+      locations.push_back(
+          {.id_ = {base + i, 0}, .location_ = OrderedLocation(i, 3, 1, type)});
+    }
+    auto directory = OrderedGroupDirectory::Recover(root, 3, records, {}, 7);
+    ASSERT_TRUE(directory.ok()) << directory.status();
+    GroupedObjectVersion version{
+        .root_ = OrderedLocation(999, 7, count, type, true),
+        .db_epoch_ = 1,
+        .replication_epoch_ = 2,
+        .index_generation_ = 3};
+    auto old = GroupedHashObject::CreateOrdered(version, *directory, locations);
+    ASSERT_TRUE(old.ok()) << old.status();
+    const std::uint64_t added_id = base == 0 ? 1ULL << 40 : 1;
+    auto tail = records.back();
+    tail.next_ = added_id;
+    tail.sequence_ = 4;
+    tail.lsn_ = 200;
+    tail.record_token_ = 200;
+    const std::array<RecoveredOrderedGroup, 2> changed{
+        tail, RecoveredOrderedGroup{.incarnation_ = 17,
+                                    .id_ = added_id,
+                                    .previous_ = root.last_group_,
+                                    .sequence_ = 4,
+                                    .lsn_ = 201,
+                                    .item_count_ = 1,
+                                    .record_token_ = 201}};
+    root.last_group_ = added_id;
+    root.next_group_id_ = std::max(root.next_group_id_, added_id + 1);
+    ++root.group_count_;
+    ++root.item_count_;
+    root.revision_ = 4;
+    auto next_directory = directory->Apply(root, 4, changed, 8);
+    ASSERT_TRUE(next_directory.ok()) << next_directory.status();
+    const std::array<HashGroupLocation, 2> replacements{
+        HashGroupLocation{.id_ = {base + count, 0},
+                          .location_ = OrderedLocation(200, 4, 1, type)},
+        HashGroupLocation{.id_ = {added_id, 0},
+                          .location_ = OrderedLocation(201, 4, 1, type)}};
+    version.root_ = OrderedLocation(1000, 8, count + 1, type, true);
+    auto next = GroupedHashObject::PrepareUpdateOrdered(
+        *old, version, *next_directory, replacements);
+    ASSERT_TRUE(next.ok()) << next.status();
+    for (std::uint64_t i = 1; i <= count; ++i) {
+      SCOPED_TRACE(i);
+      ASSERT_NE((*old)->FindRecord({base + i, 0}), nullptr);
+      EXPECT_EQ((*old)->FindRecord({base + i, 0})->value_.block_id(), i);
+      ASSERT_NE((*next)->FindRecord({base + i, 0}), nullptr);
+      EXPECT_EQ((*next)->FindRecord({base + i, 0})->value_.block_id(),
+                i == count ? 200 : i);
+    }
+    EXPECT_EQ((*old)->FindRecord({added_id, 0}), nullptr);
+    ASSERT_NE((*next)->FindRecord({added_id, 0}), nullptr);
+    EXPECT_EQ((*next)->FindRecord({added_id, 0})->value_.block_id(), 201);
+    EXPECT_EQ((*next)->FindRecord({added_id, 1}), nullptr);
+    EXPECT_EQ((*next)->FindRecord({base + count + 1000, 0}), nullptr);
+    // Relocation after prefix expansion must update only the new view, and
+    // traversal must still visit each old and newly inserted identity once.
+    auto moved = GroupedHashObject::RelocateGroup(
+        *next, {base + 65, 0}, locations[64].location_,
+        OrderedLocation(300, 3, 1, type));
+    ASSERT_TRUE(moved.ok()) << moved.status();
+    EXPECT_EQ((*moved)->FindRecord({base + 65, 0})->value_.block_id(), 300);
+    EXPECT_EQ((*next)->FindRecord({base + 65, 0})->value_.block_id(), 65);
+    std::set<HashGroupId> visited;
+    (*moved)->ForEachRecord(
+        [&](HashGroupId id, const auto&, const auto&, bool retired) {
+          EXPECT_FALSE(retired);
+          EXPECT_TRUE(visited.insert(id).second);
+        });
+    EXPECT_EQ(visited.size(), count + 1);
+  }
 }
 
 TEST(GroupedOrderedObjectTest, StringVectorSharesUntouchedPagesAndOldViews) {
