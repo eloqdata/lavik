@@ -20,6 +20,7 @@
 
 #include "impl.h"
 #include "lavik/glob.h"
+#include "lavik/random_sample.h"
 #include "lavik/storage/detail/grouped_scratch.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
 
@@ -39,11 +40,13 @@ using Members = absl::flat_hash_map<std::string_view, MemberState>;
 bool ReadOnly(const SortedSetOperation& operation) {
   return operation.kind_ != SortedSetOperationKind::kAdd &&
          operation.kind_ != SortedSetOperationKind::kRemove &&
-         operation.kind_ != SortedSetOperationKind::kPop;
+         operation.kind_ != SortedSetOperationKind::kPop &&
+         operation.kind_ != SortedSetOperationKind::kRemoveRange;
 }
 
 bool ScanRead(const SortedSetOperation& operation) {
   return operation.kind_ == SortedSetOperationKind::kRange ||
+         operation.kind_ == SortedSetOperationKind::kRemoveRange ||
          operation.kind_ == SortedSetOperationKind::kRank ||
          operation.kind_ == SortedSetOperationKind::kCount;
 }
@@ -116,6 +119,55 @@ absl::Status AppendOutput(SortedSetMember member, SortedSetResult* result) {
   output.push_back(std::move(member));
   return absl::OkStatus();
 }
+
+// Keep routing metadata and reply ownership admitted separately. Sorting draws
+// by rank coalesces page reads; the output slot preserves replacement draw
+// order.
+struct RandomSelection {
+  std::optional<MemoryReservation> admission_;
+  std::vector<std::pair<std::uint64_t, std::size_t>> draws_;
+
+  absl::Status Prepare(std::uint64_t population, std::int64_t count,
+                       bool compact, SortedSetResult* result) {
+    if (population == 0 || count == 0) return absl::OkStatus();
+    const auto requested = count < 0
+                               ? static_cast<std::uint64_t>(-count)
+                               : std::min<std::uint64_t>(count, population);
+    // Covers temporary ranks, Floyd's hash set (or <=3x subtract vector),
+    // and the rank-to-output routing pairs, including container overhead.
+    if (requested > std::numeric_limits<std::size_t>::max() / 128)
+      return absl::ResourceExhaustedError("Sorted Set random count overflow");
+    admission_ = TryReserveMemory(requested * 128);
+    if (!admission_) {
+      RecordMemoryRejection();
+      return absl::ResourceExhaustedError(
+          "OOM Sorted Set random rank admission");
+    }
+    draws_.reserve(requested);
+    if (count < 0) {
+      for (std::size_t i = 0; i < requested; ++i)
+        draws_.emplace_back(RandomRank(population, RandomSampleGenerator()), i);
+    } else {
+      auto ranks = SampleUniqueRandomRanks(population, requested, compact,
+                                           RandomSampleGenerator());
+      for (std::size_t i = 0; i < ranks.size(); ++i)
+        draws_.emplace_back(ranks[i], i);
+    }
+    std::sort(draws_.begin(), draws_.end());
+    if (requested > result->members_.max_size())
+      return absl::ResourceExhaustedError("Sorted Set random reply overflow");
+    auto output = TryReserveMemory(requested * sizeof(SortedSetMember));
+    if (!output) {
+      RecordMemoryRejection();
+      return absl::ResourceExhaustedError(
+          "OOM Sorted Set random reply admission");
+    }
+    result->members_.resize(requested);
+    result->retained_charge_.Adopt(
+        &*output, result->members_.capacity() * sizeof(SortedSetMember));
+    return absl::OkStatus();
+  }
+};
 
 // Pages are score ordered, whereas SCAN cursors are digest prefixes. The first
 // pass keeps only COUNT integer prefixes (not members) to find the examination
@@ -195,7 +247,8 @@ struct ReadCursor {
         RankSlice(operation.first_, operation.last_, result->length_);
     first_ = range.first;
     end_ = range.second;
-    done_ = operation.kind_ == SortedSetOperationKind::kRange &&
+    done_ = (operation.kind_ == SortedSetOperationKind::kRange ||
+             operation.kind_ == SortedSetOperationKind::kRemoveRange) &&
             ((operation.range_mode_ == SortedSetRangeMode::kRank &&
               first_ == end_) ||
              (operation.limit_ &&
@@ -302,6 +355,9 @@ absl::Status ReadCompact(std::span<const OrderedCollectionEntry> entries,
 }
 
 absl::Status Validate(const SortedSetOperation& operation) {
+  if (operation.kind_ == SortedSetOperationKind::kRandom &&
+      operation.count_ == std::numeric_limits<std::int64_t>::min())
+    return absl::InvalidArgumentError("Sorted Set random count out of range");
   if (operation.kind_ == SortedSetOperationKind::kScan &&
       operation.scan_count_ == 0)
     return absl::InvalidArgumentError("Sorted Set scan COUNT must be positive");
@@ -618,6 +674,43 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
         ScanBoundary::Sort(&result);
         return CompactValueUpdate{};
       }
+      if (operation.kind_ == SortedSetOperationKind::kRandom) {
+        RandomSelection selection;
+        auto status =
+            selection.Prepare(entries.size(), operation.count_, true, &result);
+        if (!status.ok()) return status;
+        for (const auto [rank, slot] : selection.draws_) {
+          auto copied = CopyOutput(entries[rank]);
+          if (!copied.ok()) return copied.status();
+          result.members_[slot] = std::move(*copied);
+        }
+        return CompactValueUpdate{};
+      }
+      if (operation.kind_ == SortedSetOperationKind::kRemoveRange) {
+        const auto [first, end] =
+            RankSlice(operation.first_, operation.last_, entries.size());
+        std::size_t rank = 0;
+        result.changed_ = std::erase_if(entries, [&](const auto& entry) {
+          const auto at = rank++;
+          return operation.range_mode_ == SortedSetRangeMode::kRank
+                     ? at >= first && at < end
+                     : Matches(entry, operation);
+        });
+        result.length_ = entries.size();
+        if (result.changed_ == 0) return CompactValueUpdate{};
+        if (entries.empty()) {
+          CompactValueUpdate erased;
+          erased.changed_ = erased.erase_ = true;
+          return erased;
+        }
+        auto encoded = EncodeOrderedCompactValue(
+            OrderedCollectionKind::kSortedSet, entries);
+        if (!encoded.ok()) return encoded.status();
+        return CompactValueUpdate{.changed_ = true,
+                                  .encoded_ = std::move(*encoded),
+                                  .logical_size_ = entries.size(),
+                                  .expire_at_ms_ = std::nullopt};
+      }
       if (operation.kind_ == SortedSetOperationKind::kPop) {
         const auto count =
             std::min<std::uint64_t>(operation.pop_count_, entries.size());
@@ -799,6 +892,65 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (!page.ok()) co_return page.status();
       co_return ScanPage{std::move(*admission), std::move(*page)};
     };
+    auto remove_selected = [&]() -> Task<absl::Status> {
+      const auto count = result.members_.size();
+      if (count == 0) co_return absl::OkStatus();
+      if (count >
+          std::numeric_limits<std::size_t>::max() / sizeof(std::string_view))
+        co_return absl::ResourceExhaustedError(
+            "Sorted Set selected removal count overflow");
+      auto admission = TryReserveMemory(count * sizeof(std::string_view));
+      if (!admission) {
+        RecordMemoryRejection();
+        co_return absl::ResourceExhaustedError(
+            "OOM Sorted Set selected removal input admission");
+      }
+      std::vector<std::string_view> removed;
+      removed.reserve(count);
+      for (const auto& member : result.members_)
+        removed.push_back(member.member_);
+      // Selection and deletion share the caller's exclusive key intent. The
+      // same immutable logical view is revalidated by every page load and the
+      // common writer; all reply allocation finishes before any mutation.
+      auto deleted = co_await ExecuteGroupedSortedSetLocked(
+          store, partition, db_id, key, digest,
+          SortedSetOperation{.kind_ = SortedSetOperationKind::kRemove,
+                             .members_ = removed},
+          object, tx, replication, mutation_precondition, prepared);
+      if (!deleted.ok()) co_return deleted.status();
+      result.changed_ = deleted->changed_;
+      result.length_ = deleted->length_;
+      co_return absl::OkStatus();
+    };
+    if (operation.kind_ == SortedSetOperationKind::kRandom) {
+      RandomSelection selection;
+      auto selected =
+          selection.Prepare(result.length_, operation.count_, false, &result);
+      if (!selected.ok()) co_return selected;
+      std::size_t draw = 0;
+      while (draw < selection.draws_.size()) {
+        const auto position = directory.FindRank(selection.draws_[draw].first);
+        if (!position)
+          co_return absl::DataLossError("Sorted Set random rank missing");
+        const auto i = position->group_index_;
+        auto page = co_await read_page(i);
+        if (!page.ok()) co_return page.status();
+        const auto& entries = page->page_.snapshot_.entries_;
+        do {
+          const auto [rank, slot] = selection.draws_[draw];
+          const auto at = directory.FindRank(rank);
+          if (!at || at->group_index_ != i) break;
+          if (at->offset_ >= entries.size())
+            co_return absl::DataLossError(
+                "Sorted Set random page cardinality mismatch");
+          auto copied = CopyOutput(entries[at->offset_]);
+          if (!copied.ok()) co_return copied.status();
+          result.members_[slot] = std::move(*copied);
+          ++draw;
+        } while (draw < selection.draws_.size());
+      }
+      co_return result;
+    }
     if (operation.kind_ == SortedSetOperationKind::kScan) {
       ScanBoundary boundary;
       auto prepared = boundary.Prepare(operation, result.length_);
@@ -843,30 +995,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       }
       if (result.members_.size() != count)
         co_return absl::DataLossError("Sorted Set pop cardinality mismatch");
-      if (count >
-          std::numeric_limits<std::size_t>::max() / sizeof(std::string_view))
-        co_return absl::ResourceExhaustedError("Sorted Set pop count overflow");
-      auto admission = TryReserveMemory(count * sizeof(std::string_view));
-      if (!admission) {
-        RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
-            "OOM Sorted Set pop input admission");
-      }
-      std::vector<std::string_view> removed;
-      removed.reserve(count);
-      for (const auto& member : result.members_)
-        removed.push_back(member.member_);
-      // Selection and deletion share the caller's exclusive key intent. The
-      // same immutable logical view is revalidated by every page load and the
-      // common writer; all reply allocation finishes before any mutation.
-      auto deleted = co_await ExecuteGroupedSortedSetLocked(
-          store, partition, db_id, key, digest,
-          SortedSetOperation{.kind_ = SortedSetOperationKind::kRemove,
-                             .members_ = removed},
-          object, tx, replication, mutation_precondition, prepared);
-      if (!deleted.ok()) co_return deleted.status();
-      result.changed_ = deleted->changed_;
-      result.length_ = deleted->length_;
+      auto deleted = co_await remove_selected();
+      if (!deleted.ok()) co_return deleted;
       co_return result;
     }
     if (ScanRead(operation)) {
@@ -918,7 +1048,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         co_return result;
       }
       std::size_t first_page = 0, end_page = metadata.size();
-      if (operation.kind_ == SortedSetOperationKind::kRange &&
+      if ((operation.kind_ == SortedSetOperationKind::kRange ||
+           operation.kind_ == SortedSetOperationKind::kRemoveRange) &&
           operation.range_mode_ == SortedSetRangeMode::kRank) {
         const auto begin_rank =
             operation.reverse_ ? result.length_ - cursor.end_ : cursor.first_;
@@ -953,6 +1084,13 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           if (!visited.ok()) co_return visited;
         }
         if (!reverse) rank += entries.size();
+      }
+      if (operation.kind_ == SortedSetOperationKind::kRemoveRange) {
+        auto deleted = co_await remove_selected();
+        if (!deleted.ok()) co_return deleted;
+        // Names are needed only through selection and atomic writer
+        // preparation.
+        result.members_.clear();
       }
       co_return result;
     }

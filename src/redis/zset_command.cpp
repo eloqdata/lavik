@@ -30,7 +30,6 @@
 #include <numbers>
 #include <numeric>
 #include <optional>
-#include <random>
 
 #include "absl/strings/str_cat.h"
 #include "blocking_wait.h"
@@ -40,7 +39,6 @@
 #include "lavik/command_table.h"
 #include "lavik/glob.h"
 #include "lavik/memory.h"
-#include "lavik/random_sample.h"
 #include "lavik/redis_parse.h"
 #include "lavik/resp.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
@@ -189,10 +187,6 @@ std::string FormatDouble(double value) {
 
 void AppendScore(ReplyBuilder& builder, double score) {
   builder.AppendDoubleText(FormatDouble(score));
-}
-
-void AppendScore(ReplyBuilder& builder, std::string_view score) {
-  builder.AppendDoubleText(score);
 }
 
 void AppendMemberScore(ReplyBuilder& builder, std::string_view member,
@@ -408,26 +402,6 @@ bool BelowMax(std::string_view value, LexBound bound) {
 
 storage::CompactValueUpdate NoChange() { return {}; }
 
-absl::StatusOr<storage::CompactValueUpdate> ChangedSorted(ZSet set) {
-  if (set.empty())
-    return storage::CompactValueUpdate{.changed_ = true,
-                                       .erase_ = true,
-                                       .encoded_ = {},
-                                       .logical_size_ = 0,
-                                       .expire_at_ms_ = std::nullopt};
-  auto encoded = Encode(set);
-  if (!encoded.ok()) return encoded.status();
-  return storage::CompactValueUpdate{.changed_ = true,
-                                     .encoded_ = std::move(*encoded),
-                                     .logical_size_ = set.size(),
-                                     .expire_at_ms_ = std::nullopt};
-}
-
-absl::StatusOr<storage::CompactValueUpdate> Changed(ZSet set) {
-  Sort(&set);
-  return ChangedSorted(std::move(set));
-}
-
 std::string_view StorageError(ReplyBuilder& builder,
                               const absl::Status& status) {
   if (status.code() == absl::StatusCode::kResourceExhausted &&
@@ -466,7 +440,8 @@ Task<absl::StatusOr<storage::SortedSetResult>> RunSortedSet(
   const bool read_only =
       operation.kind_ != storage::SortedSetOperationKind::kAdd &&
       operation.kind_ != storage::SortedSetOperationKind::kRemove &&
-      operation.kind_ != storage::SortedSetOperationKind::kPop;
+      operation.kind_ != storage::SortedSetOperationKind::kPop &&
+      operation.kind_ != storage::SortedSetOperationKind::kRemoveRange;
   auto replication = tx == nullptr && !read_only
                          ? PrepareReplicationCommand(request)
                          : std::nullopt;
@@ -1217,10 +1192,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         builder.AppendInteger(ch ? result->changed_ : result->added_));
   }
 
-  if (request.kind_ == CommandKind::kGeoDist ||
-      request.kind_ == CommandKind::kGeoHash ||
-      request.kind_ == CommandKind::kGeoPos ||
-      request.kind_ == CommandKind::kGeoRadius ||
+  if (request.kind_ == CommandKind::kGeoRadius ||
       request.kind_ == CommandKind::kGeoRadiusRo ||
       request.kind_ == CommandKind::kGeoRadiusByMember ||
       request.kind_ == CommandKind::kGeoRadiusByMemberRo ||
@@ -1369,41 +1341,6 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
       auto decoded = Decode(value);
       if (!decoded.ok()) return decoded.status();
       const ZSet& set = *decoded;
-      if (request.kind_ == CommandKind::kGeoHash ||
-          request.kind_ == CommandKind::kGeoPos) {
-        for (std::size_t i = 2; i < a.size(); ++i) {
-          const Element* element = Find(set, a[i]);
-          if (!element) {
-            results.push_back(std::nullopt);
-          } else {
-            const auto hash = DecodeGeoScore(element->score_);
-            if (!hash) {
-              results.push_back(std::nullopt);
-            } else {
-              const auto [lon, lat] = GeoDecode(*hash);
-              results.push_back(GeoResult{a[i], lon, lat, 0, *hash});
-            }
-          }
-        }
-        return NoChange();
-      }
-      if (request.kind_ == CommandKind::kGeoDist) {
-        const Element* first = Find(set, a[2]);
-        const Element* second = Find(set, a[3]);
-        if (!first || !second) return NoChange();
-        const auto first_hash = DecodeGeoScore(first->score_);
-        const auto second_hash = DecodeGeoScore(second->score_);
-        if (!first_hash || !second_hash) return NoChange();
-        auto [lon1, lat1] = GeoDecode(*first_hash);
-        auto [lon2, lat2] = GeoDecode(*second_hash);
-        results.push_back(
-            GeoResult{.member_ = {},
-                      .lon_ = 0,
-                      .lat_ = 0,
-                      .distance_m_ = GeoDistance(lon1, lat1, lon2, lat2),
-                      .hash_ = 0});
-        return NoChange();
-      }
       if (center_by_member) {
         const Element* center = Find(set, center_member);
         if (!center) {
@@ -1458,33 +1395,13 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           builder.AppendError("ERR could not decode requested zset member"));
     }
 
-    if (request.kind_ == CommandKind::kGeoDist) {
-      if (a.size() == 5) {
-        auto unit = UnitMeters(a[4]);
-        if (!unit.ok()) co_return Built(StorageError(builder, unit.status()));
-        unit_meters = *unit;
-      }
-      co_return Built(results.empty()
-                          ? builder.AppendNull()
-                          : builder.AppendBulkString(FormatGeoDistance(
-                                results[0]->distance_m_ / unit_meters)));
-    }
     builder.AppendArrayHeader(results.size());
     for (const auto& result : results) {
       if (!result) {
-        if (request.kind_ == CommandKind::kGeoPos)
-          builder.AppendNullArray();
-        else
-          builder.AppendNull();
+        builder.AppendNull();
         continue;
       }
-      if (request.kind_ == CommandKind::kGeoHash) {
-        builder.AppendBulkString(GeoHashString(result->lon_, result->lat_));
-      } else if (request.kind_ == CommandKind::kGeoPos) {
-        builder.AppendArrayHeader(2);
-        builder.AppendDoubleText(FormatGeoCoordinate(result->lon_));
-        builder.AppendDoubleText(FormatGeoCoordinate(result->lat_));
-      } else if (!with_coord && !with_dist && !with_hash) {
+      if (!with_coord && !with_dist && !with_hash) {
         builder.AppendBulkString(result->member_);
       } else {
         builder.AppendArrayHeader(1 + with_dist + with_hash + with_coord);
@@ -1506,16 +1423,25 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   if (request.kind_ == CommandKind::kZCard ||
       request.kind_ == CommandKind::kZScore ||
       request.kind_ == CommandKind::kZMScore ||
+      request.kind_ == CommandKind::kGeoPos ||
+      request.kind_ == CommandKind::kGeoHash ||
+      request.kind_ == CommandKind::kGeoDist ||
       request.kind_ == CommandKind::kZRem) {
+    // GEO point reads need only the requested member scores. Use the grouped
+    // member index under one shared key intent (also for GEODIST's pair),
+    // rather than materializing and charging a complete ZSet image. The
+    // optional distance unit is not a member name.
+    const auto member_end =
+        request.kind_ == CommandKind::kGeoDist ? 4 : a.size();
     auto member_admission =
-        TryReserveMemory((a.size() - 2) * sizeof(std::string_view));
+        TryReserveMemory((member_end - 2) * sizeof(std::string_view));
     if (!member_admission) {
       RecordMemoryRejection();
       co_return Built(builder.AppendError("OOM Sorted Set input admission"));
     }
     std::vector<std::string_view> members;
-    members.reserve(a.size() - 2);
-    for (std::size_t i = 2; i < a.size(); ++i) members.push_back(a[i]);
+    members.reserve(member_end - 2);
+    for (std::size_t i = 2; i < member_end; ++i) members.push_back(a[i]);
     storage::SortedSetOperation operation{
         .kind_ = request.kind_ == CommandKind::kZCard
                      ? storage::SortedSetOperationKind::kLength
@@ -1531,6 +1457,48 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
       co_return Built(builder.AppendInteger(result->length_));
     if (request.kind_ == CommandKind::kZRem)
       co_return Built(builder.AppendInteger(result->changed_));
+    if (request.kind_ == CommandKind::kGeoDist) {
+      double unit_meters = 1;
+      if (a.size() == 5) {
+        auto unit = UnitMeters(a[4]);
+        if (!unit.ok()) co_return Built(StorageError(builder, unit.status()));
+        unit_meters = *unit;
+      }
+      const auto first_hash = result->scores_[0]
+                                  ? DecodeGeoScore(*result->scores_[0])
+                                  : std::nullopt;
+      const auto second_hash = result->scores_[1]
+                                   ? DecodeGeoScore(*result->scores_[1])
+                                   : std::nullopt;
+      if (!first_hash || !second_hash) co_return Built(builder.AppendNull());
+      const auto [lon1, lat1] = GeoDecode(*first_hash);
+      const auto [lon2, lat2] = GeoDecode(*second_hash);
+      co_return Built(builder.AppendBulkString(FormatGeoDistance(
+          GeoDistance(lon1, lat1, lon2, lat2) / unit_meters)));
+    }
+    if (request.kind_ == CommandKind::kGeoPos ||
+        request.kind_ == CommandKind::kGeoHash) {
+      builder.AppendArrayHeader(result->scores_.size());
+      for (const auto score : result->scores_) {
+        const auto hash = score ? DecodeGeoScore(*score) : std::nullopt;
+        if (!hash) {
+          if (request.kind_ == CommandKind::kGeoPos)
+            builder.AppendNullArray();
+          else
+            builder.AppendNull();
+          continue;
+        }
+        const auto [lon, lat] = GeoDecode(*hash);
+        if (request.kind_ == CommandKind::kGeoHash) {
+          builder.AppendBulkString(GeoHashString(lon, lat));
+        } else {
+          builder.AppendArrayHeader(2);
+          builder.AppendDoubleText(FormatGeoCoordinate(lon));
+          builder.AppendDoubleText(FormatGeoCoordinate(lat));
+        }
+      }
+      co_return Built(builder.View());
+    }
     if (request.kind_ == CommandKind::kZMScore)
       builder.AppendArrayHeader(result->scores_.size());
     for (const auto score : result->scores_) {
@@ -1594,20 +1562,22 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     co_return Built(builder.View());
   }
 
-  const bool range_read = IsRangeCommand(request.kind_) &&
-                          request.kind_ != CommandKind::kZRemRangeByRank &&
-                          request.kind_ != CommandKind::kZRemRangeByScore &&
-                          request.kind_ != CommandKind::kZRemRangeByLex;
-  if (range_read || request.kind_ == CommandKind::kZRank ||
+  const bool range_remove = request.kind_ == CommandKind::kZRemRangeByRank ||
+                            request.kind_ == CommandKind::kZRemRangeByScore ||
+                            request.kind_ == CommandKind::kZRemRangeByLex;
+  const bool range_read = IsRangeCommand(request.kind_) && !range_remove;
+  if (range_read || range_remove || request.kind_ == CommandKind::kZRank ||
       request.kind_ == CommandKind::kZRevRank ||
       request.kind_ == CommandKind::kZCount ||
       request.kind_ == CommandKind::kZLexCount) {
     storage::SortedSetOperation operation;
     bool with_scores = false;
     std::array<std::string_view, 1> wanted{a[2]};
-    if (range_read) {
+    if (range_read || range_remove) {
       auto normalized = ValidateRangeSyntax(request, &operation, &with_scores);
       if (!normalized.ok()) co_return Built(StorageError(builder, normalized));
+      if (range_remove)
+        operation.kind_ = storage::SortedSetOperationKind::kRemoveRange;
     } else if (request.kind_ == CommandKind::kZRank ||
                request.kind_ == CommandKind::kZRevRank) {
       operation.kind_ = storage::SortedSetOperationKind::kRank;
@@ -1634,6 +1604,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     }
     auto result = co_await RunSortedSet(request, digest, tx, operation);
     if (!result.ok()) co_return Built(StorageError(builder, result.status()));
+    if (range_remove) co_return Built(builder.AppendInteger(result->changed_));
     if (operation.kind_ == storage::SortedSetOperationKind::kCount)
       co_return Built(builder.AppendInteger(result->count_));
     if (operation.kind_ == storage::SortedSetOperationKind::kRank) {
@@ -1659,486 +1630,32 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     co_return Built(builder.View());
   }
 
-  bool read_only = true;
-  switch (request.kind_) {
-    case CommandKind::kZPopMax:
-    case CommandKind::kZPopMin:
-    case CommandKind::kZRem:
-    case CommandKind::kZRemRangeByLex:
-    case CommandKind::kZRemRangeByRank:
-    case CommandKind::kZRemRangeByScore:
-      read_only = false;
-      break;
-    default:
-      break;
-  }
-
-  long long integer = 0;
-  std::optional<std::string> scalar;
-  // Callback output outlives the engine's full-image scratch reservation.
-  // Keep repeated random replies charged until ReplyBuilder has copied them.
-  RetainedMemoryCharge random_reply_charge;
-  std::vector<std::optional<std::string>> output;
-  std::uint64_t next_cursor = 0;
-  const bool reply_with_scores = std::any_of(
-      a.begin() + std::min<std::size_t>(2, a.size()), a.end(),
-      [](std::string_view arg) { return EqualCi(arg, "withscores"); });
-  if ((request.kind_ == CommandKind::kZRank ||
-       request.kind_ == CommandKind::kZRevRank) &&
-      a.size() == 4 && !EqualCi(a[3], "withscore")) {
-    co_return Built(builder.AppendError("ERR syntax error"));
-  }
-  auto callback = [&](std::optional<storage::CompactValueView> value)
-      -> absl::StatusOr<storage::CompactValueUpdate> {
-    auto decoded = Decode(value);
-    if (!decoded.ok()) return decoded.status();
-    ZSet set = std::move(*decoded);
-
-    switch (request.kind_) {
-      case CommandKind::kZCard:
-        integer = set.size();
-        return NoChange();
-      case CommandKind::kZScore:
-      case CommandKind::kZMScore: {
-        const std::size_t first = request.kind_ == CommandKind::kZScore ? 2 : 2;
-        for (std::size_t i = first; i < a.size(); ++i) {
-          const Element* element = Find(set, a[i]);
-          output.push_back(element
-                               ? std::optional(FormatDouble(element->score_))
-                               : std::nullopt);
-        }
-        return NoChange();
-      }
-      case CommandKind::kZRank:
-      case CommandKind::kZRevRank: {
-        const bool reverse = request.kind_ == CommandKind::kZRevRank;
-        auto found =
-            std::find_if(set.begin(), set.end(),
-                         [&](const Element& e) { return e.member_ == a[2]; });
-        if (found != set.end()) {
-          const std::size_t rank = found - set.begin();
-          integer = reverse ? set.size() - rank - 1 : rank;
-          scalar = FormatDouble(found->score_);
-        } else {
-          scalar.reset();
-          integer = -1;
-        }
-        return NoChange();
-      }
-      case CommandKind::kZCount: {
-        auto min = ParseScoreBound(a[2]);
-        auto max = ParseScoreBound(a[3]);
-        if (!min.ok()) return min.status();
-        if (!max.ok()) return max.status();
-        for (const auto& e : set)
-          if (AboveMin(e.score_, *min) && BelowMax(e.score_, *max)) ++integer;
-        return NoChange();
-      }
-      case CommandKind::kZLexCount: {
-        auto min = ParseLexBound(a[2]);
-        auto max = ParseLexBound(a[3]);
-        if (!min.ok()) return min.status();
-        if (!max.ok()) return max.status();
-        for (const auto& e : set)
-          if (AboveMin(e.member_, *min) && BelowMax(e.member_, *max)) ++integer;
-        return NoChange();
-      }
-      case CommandKind::kZRem: {
-        const std::size_t old = set.size();
-        for (std::size_t i = 2; i < a.size(); ++i) {
-          std::erase_if(set,
-                        [&](const Element& e) { return e.member_ == a[i]; });
-        }
-        integer = old - set.size();
-        return integer == 0
-                   ? absl::StatusOr<storage::CompactValueUpdate>(NoChange())
-                   : Changed(std::move(set));
-      }
-      case CommandKind::kZPopMin:
-      case CommandKind::kZPopMax: {
-        std::int64_t parsed_count = 1;
-        if (a.size() == 3 &&
-            (!ParseInt(a[2], &parsed_count) || parsed_count < 0))
-          return absl::InvalidArgumentError(
-              "value is out of range, must be positive");
-        std::uint64_t count = static_cast<std::uint64_t>(parsed_count);
-        const bool maximum = request.kind_ == CommandKind::kZPopMax;
-        count = std::min<std::uint64_t>(count, set.size());
-        for (std::uint64_t i = 0; i < count; ++i) {
-          std::size_t at = maximum ? set.size() - 1 : 0;
-          output.push_back(set[at].member_);
-          output.push_back(FormatDouble(set[at].score_));
-          set.erase(set.begin() + at);
-        }
-        return count == 0
-                   ? absl::StatusOr<storage::CompactValueUpdate>(NoChange())
-                   : Changed(std::move(set));
-      }
-      case CommandKind::kZRandMember: {
-        std::int64_t count = 1;
-        bool count_given = a.size() >= 3;
-        if (count_given && !ParseInt(a[2], &count))
-          return absl::InvalidArgumentError(
-              "value is not an integer or out of range");
-        const bool with_scores = a.size() == 4 && EqualCi(a[3], "withscores");
-        if (a.size() == 4 && !with_scores)
-          return absl::InvalidArgumentError("syntax error");
-        if (count == std::numeric_limits<std::int64_t>::min())
-          return absl::InvalidArgumentError("value is out of range");
-        if (count < 0 && with_scores &&
-            static_cast<std::uint64_t>(-count) >
-                static_cast<std::uint64_t>(
-                    std::numeric_limits<std::int64_t>::max()) /
-                    2) {
-          return absl::InvalidArgumentError("value is out of range");
-        }
-        if (set.empty()) return NoChange();
-        const std::uint64_t requested =
-            count < 0 ? static_cast<std::uint64_t>(-count)
-                      : std::min<std::uint64_t>(count, set.size());
-        constexpr auto limit = std::numeric_limits<std::size_t>::max();
-        constexpr auto slot_bytes = sizeof(decltype(output)::value_type);
-        const std::uint64_t multiplier = with_scores ? 2 : 1;
-        if (requested > limit / sizeof(std::uint64_t) ||
-            requested > output.max_size() / multiplier ||
-            requested > limit / (multiplier * slot_bytes * 2))
-          return absl::ResourceExhaustedError(
-              "OOM Sorted Set random reply size overflow");
-        const auto index_bytes = requested * sizeof(std::uint64_t);
-        auto index_admission = TryReserveMemory(index_bytes);
-        if (!index_admission) {
-          RecordMemoryRejection();
-          return absl::ResourceExhaustedError(
-              "OOM Sorted Set random rank admission");
-        }
-        // Draw first, then admit the actual chosen strings. A single huge
-        // member must not charge every small draw as if it selected that item.
-        std::vector<std::uint64_t> indexes;
-        if (count >= 0) {
-          indexes = SampleUniqueRandomRanks(set.size(), requested, true,
-                                            RandomSampleGenerator());
-        } else {
-          indexes.reserve(requested);
-          for (std::uint64_t i = 0; i < requested; ++i)
-            indexes.push_back(RandomRank(set.size(), RandomSampleGenerator()));
-        }
-        const auto slots = requested * multiplier;
-        std::size_t output_bytes = slots * slot_bytes * 2;
-        for (const auto at : indexes) {
-          // Include SSO capacity and the bounded score text, even when no
-          // separate heap allocation happens for those strings.
-          const auto bytes = std::max<std::size_t>(set[at].member_.size() + 1,
-                                                   sizeof(std::string)) +
-                             (with_scores ? 64 : 0);
-          if (bytes > limit - output_bytes)
-            return absl::ResourceExhaustedError(
-                "OOM Sorted Set random reply size overflow");
-          output_bytes += bytes;
-        }
-        auto output_admission = TryReserveMemory(output_bytes);
-        if (!output_admission) {
-          RecordMemoryRejection();
-          return absl::ResourceExhaustedError(
-              "OOM Sorted Set random reply admission");
-        }
-        output.reserve(slots);
-        random_reply_charge.Adopt(&*output_admission, output_bytes);
-        for (std::uint64_t at : indexes) {
-          output.push_back(set[at].member_);
-          if (with_scores) output.push_back(FormatDouble(set[at].score_));
-        }
-        integer = count_given ? 1 : 0;
-        return NoChange();
-      }
-      case CommandKind::kZScan: {
-        std::uint64_t cursor = 0, count = 10;
-        std::string_view pattern = "*";
-        if (!ParseInt(a[2], &cursor))
-          return absl::InvalidArgumentError("invalid cursor");
-        for (std::size_t i = 3; i < a.size();) {
-          if (EqualCi(a[i], "match") && i + 1 < a.size()) {
-            pattern = a[i + 1];
-            i += 2;
-          } else if (EqualCi(a[i], "count") && i + 1 < a.size() &&
-                     ParseInt(a[i + 1], &count) && count != 0) {
-            i += 2;
-          } else
-            return absl::InvalidArgumentError("syntax error");
-        }
-        struct ScanElement {
-          const Element* element_ = nullptr;
-          std::uint64_t prefix_ = 0;
-        };
-        std::vector<ScanElement> scan;
-        scan.reserve(set.size());
-        for (const Element& element : set) {
-          scan.push_back(ScanElement{
-              .element_ = &element,
-              .prefix_ = storage::ScanCursorPrefix(
-                  storage::ComputeDigest(element.member_)),
-          });
-        }
-        std::sort(scan.begin(), scan.end(),
-                  [](const auto& left, const auto& right) {
-                    return left.prefix_ < right.prefix_ ||
-                           (left.prefix_ == right.prefix_ &&
-                            left.element_->member_ < right.element_->member_);
-                  });
-        const auto begin_it = std::lower_bound(
-            scan.begin(), scan.end(), cursor,
-            [](const ScanElement& element, std::uint64_t wanted) {
-              return element.prefix_ < wanted;
-            });
-        const std::size_t begin = begin_it - scan.begin();
-        const std::size_t examined = static_cast<std::size_t>(
-            std::min<std::uint64_t>(count, scan.size() - begin));
-        std::size_t end = begin + examined;
-        while (end < scan.size() && end != begin &&
-               scan[end].prefix_ == scan[end - 1].prefix_) {
-          ++end;
-        }
-        for (std::size_t at = begin; at < end; ++at) {
-          const Element& element = *scan[at].element_;
-          if (pattern == "*" || RedisGlobMatch(pattern, element.member_)) {
-            output.push_back(element.member_);
-            output.push_back(FormatDouble(element.score_));
-          }
-        }
-        next_cursor = end == scan.size() ? 0 : scan[end].prefix_;
-        return NoChange();
-      }
-      default:
-        break;
-    }
-
-    // Range and range-removal family.
-    RangeOptions options;
-    std::string_view min_text = a[2], max_text = a[3];
-    if (request.kind_ == CommandKind::kZRevRange ||
-        request.kind_ == CommandKind::kZRevRangeByLex ||
-        request.kind_ == CommandKind::kZRevRangeByScore)
-      options.reverse_ = true;
-    if (request.kind_ == CommandKind::kZRangeByScore ||
-        request.kind_ == CommandKind::kZRevRangeByScore ||
-        request.kind_ == CommandKind::kZRemRangeByScore)
-      options.mode_ = RangeOptions::Mode::kScore;
-    if (request.kind_ == CommandKind::kZRangeByLex ||
-        request.kind_ == CommandKind::kZRevRangeByLex ||
-        request.kind_ == CommandKind::kZRemRangeByLex)
-      options.mode_ = RangeOptions::Mode::kLex;
-    std::size_t option_index = 4;
-    if (request.kind_ == CommandKind::kZRange) {
-      while (option_index < a.size()) {
-        if (EqualCi(a[option_index], "byscore"))
-          options.mode_ = RangeOptions::Mode::kScore;
-        else if (EqualCi(a[option_index], "bylex"))
-          options.mode_ = RangeOptions::Mode::kLex;
-        else if (EqualCi(a[option_index], "rev"))
-          options.reverse_ = true;
-        else if (EqualCi(a[option_index], "withscores"))
-          options.with_scores_ = true;
-        else if (EqualCi(a[option_index], "limit")) {
-          absl::Status parsed = ParseRangeLimit(a, option_index, &options);
-          if (!parsed.ok()) return parsed;
-          option_index += 3;
-          continue;
-        } else
-          return absl::InvalidArgumentError("syntax error");
-        ++option_index;
-      }
-      if (options.limit_ && options.mode_ == RangeOptions::Mode::kRank)
-        return absl::InvalidArgumentError(
-            "syntax error, LIMIT is only supported in combination with "
-            "either BYSCORE or BYLEX");
-      if (options.with_scores_ && options.mode_ == RangeOptions::Mode::kLex)
-        return absl::InvalidArgumentError(
-            "syntax error, WITHSCORES not supported in combination with "
-            "BYLEX");
-    } else if (request.kind_ == CommandKind::kZRangeByScore ||
-               request.kind_ == CommandKind::kZRevRangeByScore ||
-               request.kind_ == CommandKind::kZRangeByLex ||
-               request.kind_ == CommandKind::kZRevRangeByLex) {
-      while (option_index < a.size()) {
-        if (EqualCi(a[option_index], "withscores")) {
-          if (request.kind_ == CommandKind::kZRangeByLex ||
-              request.kind_ == CommandKind::kZRevRangeByLex)
-            return absl::InvalidArgumentError(
-                "syntax error, WITHSCORES not supported in combination with "
-                "BYLEX");
-          options.with_scores_ = true;
-          ++option_index;
-        } else if (EqualCi(a[option_index], "limit")) {
-          absl::Status parsed = ParseRangeLimit(a, option_index, &options);
-          if (!parsed.ok()) return parsed;
-          option_index += 3;
-        } else
-          return absl::InvalidArgumentError("syntax error");
-      }
-    } else if ((request.kind_ == CommandKind::kZRevRange) && a.size() == 5) {
-      if (!EqualCi(a[4], "withscores"))
-        return absl::InvalidArgumentError("syntax error");
-      options.with_scores_ = true;
-    }
-    if (options.reverse_ && options.mode_ != RangeOptions::Mode::kRank)
-      std::swap(min_text, max_text);
-
-    std::vector<std::size_t> selected;
-    if (options.mode_ == RangeOptions::Mode::kRank) {
-      std::int64_t start = 0, stop = 0;
-      if (!ParseInt(min_text, &start) || !ParseInt(max_text, &stop))
-        return absl::InvalidArgumentError(
-            "value is not an integer or out of range");
-      auto [begin, end] = RankSlice(start, stop, set.size());
-      for (std::size_t i = begin; i < end; ++i)
-        selected.push_back(options.reverse_ ? set.size() - 1 - i : i);
-    } else if (options.mode_ == RangeOptions::Mode::kScore) {
-      auto min = ParseScoreBound(min_text), max = ParseScoreBound(max_text);
-      if (!min.ok()) return min.status();
-      if (!max.ok()) return max.status();
-      for (std::size_t i = 0; i < set.size(); ++i)
-        if (AboveMin(set[i].score_, *min) && BelowMax(set[i].score_, *max))
-          selected.push_back(i);
-      if (options.reverse_) std::reverse(selected.begin(), selected.end());
-    } else {
-      auto min = ParseLexBound(min_text), max = ParseLexBound(max_text);
-      if (!min.ok()) return min.status();
-      if (!max.ok()) return max.status();
-      std::vector<std::size_t> lex(set.size());
-      std::iota(lex.begin(), lex.end(), 0);
-      std::sort(lex.begin(), lex.end(), [&](std::size_t x, std::size_t y) {
-        return set[x].member_ < set[y].member_;
-      });
-      for (std::size_t i : lex)
-        if (AboveMin(set[i].member_, *min) && BelowMax(set[i].member_, *max))
-          selected.push_back(i);
-      if (options.reverse_) std::reverse(selected.begin(), selected.end());
-    }
-    if (options.limit_) {
-      const std::size_t offset =
-          options.offset_ < 0
-              ? selected.size()
-              : std::min<std::uint64_t>(options.offset_, selected.size());
-      const std::size_t count =
-          options.count_ < 0 ? selected.size() - offset
-                             : std::min<std::uint64_t>(
-                                   options.count_, selected.size() - offset);
-      selected = std::vector<std::size_t>(selected.begin() + offset,
-                                          selected.begin() + offset + count);
-    }
-    const bool remove = request.kind_ == CommandKind::kZRemRangeByRank ||
-                        request.kind_ == CommandKind::kZRemRangeByScore ||
-                        request.kind_ == CommandKind::kZRemRangeByLex;
-    if (remove) {
-      integer = selected.size();
-      std::sort(selected.rbegin(), selected.rend());
-      for (std::size_t i : selected) set.erase(set.begin() + i);
-      return integer == 0
-                 ? absl::StatusOr<storage::CompactValueUpdate>(NoChange())
-                 : Changed(std::move(set));
-    }
-    for (std::size_t i : selected) {
-      output.push_back(set[i].member_);
-      if (options.with_scores_) output.push_back(FormatDouble(set[i].score_));
-    }
-    return NoChange();
-  };
-
-  absl::Status status =
-      co_await RunCompact(request, digest, tx, read_only, callback);
-  if (!status.ok()) co_return Built(StorageError(builder, status));
-
-  switch (request.kind_) {
-    case CommandKind::kZCard:
-    case CommandKind::kZCount:
-    case CommandKind::kZLexCount:
-    case CommandKind::kZRem:
-    case CommandKind::kZRemRangeByLex:
-    case CommandKind::kZRemRangeByRank:
-    case CommandKind::kZRemRangeByScore:
-      co_return Built(builder.AppendInteger(integer));
-    case CommandKind::kZScore:
-      co_return Built(output.empty() || !output[0].has_value()
-                          ? builder.AppendNull()
-                          : builder.AppendDoubleText(*output[0]));
-    case CommandKind::kZMScore:
-      builder.AppendArrayHeader(output.size());
-      for (const auto& item : output) {
-        if (item)
-          AppendScore(builder, *item);
-        else
-          builder.AppendNull();
-      }
-      co_return Built(builder.View());
-    case CommandKind::kZRank:
-    case CommandKind::kZRevRank:
-      if (integer < 0) {
-        co_return Built(a.size() == 4 ? builder.AppendNullArray()
-                                      : builder.AppendNull());
-      }
-      if (a.size() == 4 && EqualCi(a[3], "withscore")) {
-        builder.AppendArrayHeader(2);
-        builder.AppendInteger(integer);
-        AppendScore(builder, *scalar);
-        co_return Built(builder.View());
-      }
-      co_return Built(builder.AppendInteger(integer));
-    case CommandKind::kZRandMember:
-      if (a.size() == 2)
-        co_return Built(output.empty() ? builder.AppendNull()
-                                       : builder.AppendBulkString(*output[0]));
-      if (reply_with_scores) {
-        const std::size_t pairs = output.size() / 2;
-        builder.AppendArrayHeader(
-            builder.version() == RespVersion::k3 ? pairs : output.size());
-        for (std::size_t i = 0; i < pairs; ++i) {
-          if (builder.version() == RespVersion::k3)
-            builder.AppendArrayHeader(2);
-          builder.AppendBulkString(*output[i * 2]);
-          AppendScore(builder, *output[i * 2 + 1]);
-        }
-        co_return Built(builder.View());
-      }
-      break;
-    case CommandKind::kZScan:
-      builder.AppendArrayHeader(2);
-      builder.AppendBulkString(std::to_string(next_cursor));
-      builder.AppendArrayHeader(output.size());
-      for (const auto& item : output) builder.AppendBulkString(*item);
-      co_return Built(builder.View());
-    case CommandKind::kZPopMin:
-    case CommandKind::kZPopMax: {
-      const std::size_t pairs = output.size() / 2;
-      const bool nested = builder.version() == RespVersion::k3 && a.size() == 3;
-      builder.AppendArrayHeader(nested ? pairs : output.size());
-      for (std::size_t i = 0; i < pairs; ++i) {
-        if (nested) builder.AppendArrayHeader(2);
-        builder.AppendBulkString(*output[i * 2]);
-        AppendScore(builder, *output[i * 2 + 1]);
-      }
-      co_return Built(builder.View());
-    }
-    default:
-      break;
-  }
-  if (reply_with_scores) {
-    const std::size_t pairs = output.size() / 2;
-    builder.AppendArrayHeader(
-        builder.version() == RespVersion::k3 ? pairs : output.size());
-    for (std::size_t i = 0; i < pairs; ++i) {
-      if (builder.version() == RespVersion::k3) builder.AppendArrayHeader(2);
-      builder.AppendBulkString(*output[i * 2]);
-      AppendScore(builder, *output[i * 2 + 1]);
+  if (request.kind_ == CommandKind::kZRandMember) {
+    std::int64_t count = 1;
+    if (a.size() >= 3) ParseInt(a[2], &count);  // Validated above.
+    auto result = co_await RunSortedSet(
+        request, digest, tx,
+        storage::SortedSetOperation{
+            .kind_ = storage::SortedSetOperationKind::kRandom,
+            .count_ = count});
+    if (!result.ok()) co_return Built(StorageError(builder, result.status()));
+    if (a.size() == 2)
+      co_return Built(
+          result->members_.empty()
+              ? builder.AppendNull()
+              : builder.AppendBulkString(result->members_.front().member_));
+    const bool with_scores = a.size() == 4;
+    const bool nested = with_scores && builder.version() == RespVersion::k3;
+    builder.AppendArrayHeader(result->members_.size() *
+                              (with_scores && !nested ? 2 : 1));
+    for (const auto& member : result->members_) {
+      if (nested) builder.AppendArrayHeader(2);
+      builder.AppendBulkString(member.member_);
+      if (with_scores) AppendScore(builder, member.score_);
     }
     co_return Built(builder.View());
   }
-  builder.AppendArrayHeader(output.size());
-  for (auto& item : output) {
-    if (item)
-      builder.AppendBulkString(*item);
-    else
-      builder.AppendNull();
-  }
-  co_return Built(builder.View());
+  co_return Built(builder.AppendError("ERR unsupported Sorted Set operation"));
 }
 
 enum class MultiAggregate { kDifference, kIntersection, kUnion };

@@ -342,10 +342,18 @@ Repeated input members and conditional updates are evaluated in request order
 before any physical write. Endpoint pops share the typed sparse mutation path across
 single-key, multi-key and blocking commands. ZSCAN uses two pagewise passes and
 a bounded digest-prefix selection heap, retaining whole collision buckets and
-the requested output rather than all members. Range-removal, random and other GEO commands retain
-the full-logical-value callback with aggregate memory admission and
-destination-buffer limits. Their physical rewrite planner still restricts
-writes to changed pages and structural neighbours.
+the requested output rather than all members. GEO point reads (`GEOPOS`,
+`GEOHASH`, `GEODIST`) share the member-score lookup; all requested scores are
+read under one key intent, including both endpoints of a distance query.
+Range removal selects members pagewise under an exclusive key intent and
+publishes one sparse mutation after selection and admission complete. Scratch
+includes the selected members and affected pages; an oversized removal may
+still be rejected before any logical change. Ordinary random reads draw ranks
+before loading selected ordered pages and preserve duplicate draw order.
+Large negative-count streamed random replies retain their admitted snapshot.
+GEO area searches retain the full-logical-value callback with aggregate memory
+admission and destination-buffer limits. Their physical rewrite planner still
+restricts writes to changed pages and structural neighbours.
 
 ## Recovery, reclamation and snapshots
 
