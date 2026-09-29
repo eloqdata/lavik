@@ -155,8 +155,9 @@ absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
   // and the minimum payload length. Only the inner encoding remains unchecked.
   if (field_count == 0) return std::nullopt;
   auto reader = HashValueReader::Open(payload.substr(kHashGroupHeaderBytes));
-  if (!reader.ok()) return absl::DataLossError(reader.status().message());
-  if (reader->size() != field_count)
+  if (!reader.ok()) [[unlikely]]
+    return absl::DataLossError(reader.status().message());
+  if (reader->size() != field_count) [[unlikely]]
     return absl::DataLossError(
         "Hash group inner count disagrees with envelope");
 
@@ -167,9 +168,10 @@ absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
   // seed. Unrelated fields need neither copying nor digest reconstruction.
   for (std::size_t i = 0; i < reader->size(); ++i) {
     auto entry = reader->Next();
-    if (!entry.ok()) return absl::DataLossError(entry.status().message());
+    if (!entry.ok()) [[unlikely]]
+      return absl::DataLossError(entry.status().message());
     if (entry->field_ != field) continue;
-    if (matched.has_value())
+    if (matched.has_value()) [[unlikely]]
       return absl::DataLossError("duplicate Hash field in group");
     matched = entry->value_;
   }
@@ -182,13 +184,15 @@ absl::Status FindHashGroupFields(std::string_view payload,
   for (auto& request : requests) request.value_.reset();
   if (field_count == 0) return absl::OkStatus();
   auto reader = HashValueReader::Open(payload.substr(kHashGroupHeaderBytes));
-  if (!reader.ok()) return absl::DataLossError(reader.status().message());
-  if (reader->size() != field_count)
+  if (!reader.ok()) [[unlikely]]
+    return absl::DataLossError(reader.status().message());
+  if (reader->size() != field_count) [[unlikely]]
     return absl::DataLossError(
         "Hash group inner count disagrees with envelope");
   for (std::size_t i = 0; i < reader->size(); ++i) {
     auto entry = reader->Next();
-    if (!entry.ok()) return absl::DataLossError(entry.status().message());
+    if (!entry.ok()) [[unlikely]]
+      return absl::DataLossError(entry.status().message());
     // Binary search avoids hashing every unrelated encoded field. The sorted
     // request views also keep duplicate operands adjacent without owning names.
     auto match = std::lower_bound(
@@ -197,7 +201,7 @@ absl::Status FindHashGroupFields(std::string_view payload,
           return request.field_ < field;
         });
     if (match == requests.end() || match->field_ != entry->field_) continue;
-    if (match->value_)
+    if (match->value_) [[unlikely]]
       return absl::DataLossError("duplicate Hash field in group");
     for (; match != requests.end() && match->field_ == entry->field_; ++match)
       match->value_ = entry->value_;
@@ -212,7 +216,8 @@ absl::Status RetainHashGroupValues(HashResult& result,
     if (!request.value_) continue;
     const auto bytes =
         std::max(request.value_->size(), std::string{}.capacity()) + 1;
-    if (bytes > std::numeric_limits<std::size_t>::max() - retained) {
+    if (bytes > std::numeric_limits<std::size_t>::max() - retained)
+        [[unlikely]] {
       RecordMemoryRejection();
       return absl::ResourceExhaustedError("OOM Hash output is too large");
     }
@@ -220,12 +225,12 @@ absl::Status RetainHashGroupValues(HashResult& result,
   }
   if (retained == 0) return absl::OkStatus();
   if (retained > std::numeric_limits<std::size_t>::max() -
-                     result.retained_charge_.bytes()) {
+                     result.retained_charge_.bytes()) [[unlikely]] {
     RecordMemoryRejection();
     return absl::ResourceExhaustedError("OOM Hash output is too large");
   }
   auto reservation = TryReserveMemory(retained);
-  if (!reservation) {
+  if (!reservation) [[unlikely]] {
     RecordMemoryRejection();
     return absl::ResourceExhaustedError("OOM Hash output retention");
   }
@@ -236,7 +241,7 @@ absl::Status RetainHashGroupValues(HashResult& result,
     assert(!value);
     value.emplace(*request.value_);
     const auto bytes = value->capacity() + 1;
-    if (bytes > reservation->bytes() - retained) {
+    if (bytes > reservation->bytes() - retained) [[unlikely]] {
       RecordMemoryRejection();
       return absl::ResourceExhaustedError("OOM Hash output retention");
     }
@@ -257,7 +262,7 @@ absl::Status RetainHashLookupValue(HashResult& result,
   if (matched)
     retained += std::max(matched->size(), std::string{}.capacity()) + 1;
   auto reservation = TryReserveMemory(retained);
-  if (!reservation) {
+  if (!reservation) [[unlikely]] {
     RecordMemoryRejection();
     return absl::ResourceExhaustedError("OOM Hash output retention");
   }
@@ -271,7 +276,7 @@ absl::Status RetainHashLookupValue(HashResult& result,
   retained = sizeof(HashResult) +
              result.values_.capacity() * sizeof(result.values_[0]);
   if (matched) retained += result.values_[0]->capacity() + 1;
-  if (retained > reservation->bytes()) {
+  if (retained > reservation->bytes()) [[unlikely]] {
     RecordMemoryRejection();
     return absl::ResourceExhaustedError("OOM Hash output retention");
   }
@@ -293,24 +298,25 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
   if (fields.size() > std::vector<HashFieldLookup>{}.max_size() ||
       fields.size() > std::vector<std::optional<std::string>>{}.max_size() ||
       fields.size() > (max_size - sizeof(HashResult)) /
-                          sizeof(std::optional<std::string>)) {
+                          sizeof(std::optional<std::string>)) [[unlikely]] {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("OOM Hash lookup plan is too large");
   }
   auto scratch = TryReserveMemory(fields.size() * sizeof(HashFieldLookup));
-  if (!scratch) {
+  if (!scratch) [[unlikely]] {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("OOM Hash lookup plan");
   }
   std::vector<HashFieldLookup> requests;
   requests.reserve(fields.size());
-  if (requests.capacity() > scratch->bytes() / sizeof(HashFieldLookup)) {
+  if (requests.capacity() > scratch->bytes() / sizeof(HashFieldLookup))
+      [[unlikely]] {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("OOM Hash lookup plan");
   }
   for (std::size_t i = 0; i < fields.size(); ++i) {
     const auto* route = object->directory().Find(fields[i]);
-    if (route == nullptr)
+    if (route == nullptr) [[unlikely]]
       co_return absl::DataLossError("missing Hash field route");
     requests.push_back({.group_ = route->id_,
                         .field_ = fields[i],
@@ -326,7 +332,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
 
   auto output = TryReserveMemory(
       sizeof(HashResult) + fields.size() * sizeof(std::optional<std::string>));
-  if (!output) {
+  if (!output) [[unlikely]] {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("OOM Hash output retention");
   }
@@ -336,7 +342,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
   result.values_.resize(fields.size());
   const auto retained = sizeof(HashResult) +
                         result.values_.capacity() * sizeof(result.values_[0]);
-  if (retained > output->bytes()) {
+  if (retained > output->bytes()) [[unlikely]] {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("OOM Hash output retention");
   }
@@ -348,16 +354,19 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
       ++end;
     auto loaded = co_await LoadHashGroupPayload(
         store, partition, db_id, key, digest, object, requests[begin].group_);
-    if (!loaded.ok()) co_return loaded.status();
+    if (!loaded.ok()) [[unlikely]]
+      co_return loaded.status();
     const auto bytes = loaded->loaded_.value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
                                    bytes.size());
     auto page_requests = std::span(requests).subspan(begin, end - begin);
     auto status =
         FindHashGroupFields(payload, loaded->field_count_, page_requests);
-    if (!status.ok()) co_return status;
+    if (!status.ok()) [[unlikely]]
+      co_return status;
     status = RetainHashGroupValues(result, page_requests);
-    if (!status.ok()) co_return status;
+    if (!status.ok()) [[unlikely]]
+      co_return status;
     // Only owned output survives this page lease. Clear the borrowed matches
     // before loading another group, including on the buffer-reuse path.
     for (auto& request : page_requests) request.value_.reset();
@@ -563,11 +572,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
          operation.kind_ == HashOperationKind::kStringLength)) {
       const std::string_view field = operation.fields_.front();
       const auto* route = grouped->directory().Find(field);
-      if (route == nullptr)
+      if (route == nullptr) [[unlikely]]
         co_return absl::DataLossError("missing Hash field route");
       auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
                                                   digest, grouped, route->id_);
-      if (!loaded.ok()) {
+      if (!loaded.ok()) [[unlikely]] {
         if (read_epoch_changed()) co_return HashResult{};
         co_return loaded.status();
       }
@@ -575,7 +584,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       const std::string_view payload(
           reinterpret_cast<const char*>(bytes.data()), bytes.size());
       auto matched = FindHashGroupField(payload, loaded->field_count_, field);
-      if (!matched.ok()) co_return matched.status();
+      if (!matched.ok()) [[unlikely]]
+        co_return matched.status();
       switch (operation.kind_) {
         case HashOperationKind::kExists:
           result.integer_ = matched->has_value();
@@ -585,7 +595,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
           break;
         default: {
           auto status = RetainHashLookupValue(result, *matched);
-          if (!status.ok()) co_return status;
+          if (!status.ok()) [[unlikely]]
+            co_return status;
           break;
         }
       }
@@ -595,7 +606,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (grouped != nullptr && operation.kind_ == HashOperationKind::kGetMany) {
       auto values = co_await ReadGroupedHashFields(
           store, partition, db_id, key, digest, grouped, operation.fields_);
-      if (!values.ok() && read_epoch_changed()) co_return HashResult{};
+      if (!values.ok() && read_epoch_changed()) [[unlikely]]
+        co_return HashResult{};
       co_return values;
     }
 
