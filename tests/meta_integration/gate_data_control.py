@@ -45,6 +45,7 @@ Usage: gate_data_control.py /path/to/lavik-meta /path/to/lavik [workdir]
 """
 
 import os
+import errno
 import re
 import signal
 import socket
@@ -437,6 +438,45 @@ def assert_keyed_write_fenced(data, label):
         raise H.Failure(f"{label}: keyed write was not fenced: {reply}")
 
 
+class TcpConnectBlackhole:
+    """Fill a private loopback listen queue so new TCP SYNs go unanswered."""
+
+    def __init__(self, port):
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.filler = None
+        try:
+            self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            # SIGKILL can return before the kernel releases io_uring's final
+            # socket references. Wait only for that private listener to retire.
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    self.listener.bind(("127.0.0.1", port))
+                    break
+                except OSError as exc:
+                    if exc.errno != errno.EADDRINUSE or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            self.listener.listen(0)
+            self.filler = socket.create_connection(("127.0.0.1", port), 1)
+            try:
+                peer = socket.create_connection(("127.0.0.1", port), 0.1)
+            except TimeoutError:
+                pass
+            else:
+                peer.close()
+                raise H.Failure("private TCP blackhole did not block connect")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.filler is not None:
+            self.filler.close()
+        self.listener.close()
+
+
 def run_plaintext(meta_binary, data_binary, workdir):
     scenario = os.path.join(workdir, "plaintext")
     os.makedirs(scenario, exist_ok=True)
@@ -444,6 +484,7 @@ def run_plaintext(meta_binary, data_binary, workdir):
         meta_binary, scenario, 3, args=H.raft_args(snapshot_distance=100000)
     )
     data = None
+    blackhole = None
     try:
         leader = H.bootstrap_cluster(nodes)
         commit_service_mode(leader, nodes)
@@ -501,7 +542,13 @@ def run_plaintext(meta_binary, data_binary, workdir):
         H.log("plaintext: assigned authority challenge/denial verified")
 
         old_leader = leader
+        # Hold this private Data process until the dead endpoint really drops
+        # SYNs. Otherwise a lucky ECONNREFUSED between kill and bind would evade
+        # the connect-timeout regression on the old implementation.
+        data.proc.send_signal(signal.SIGSTOP)
         old_leader.kill9()
+        blackhole = TcpConnectBlackhole(old_leader.data_control_port)
+        data.proc.send_signal(signal.SIGCONT)
         data.wait_metric(
             "lavik_cluster_control_connected",
             lambda value: value == 0,
@@ -511,11 +558,12 @@ def run_plaintext(meta_binary, data_binary, workdir):
         assert_keyed_write_fenced(data, "lost authority session")
         survivors = [node for node in nodes if node.id != old_leader.id]
         leader = H.find_leader(survivors, timeout=15)
+        reconnect_started = time.monotonic()
         data.wait_metric(
             "lavik_cluster_control_full_states_applied_total",
             lambda value: value > first_fds,
-            "Data node installs a fresh FDS after Meta leader change",
-            timeout=25,
+            "Data installs FDS despite the blackholed old-leader endpoint",
+            timeout=5,
         )
         data.wait_metric(
             "lavik_cluster_control_connected",
@@ -523,6 +571,12 @@ def run_plaintext(meta_binary, data_binary, workdir):
             "Data node reconnects to replacement Meta leader",
             timeout=10,
         )
+        H.log(
+            "plaintext: blackholed old-leader reconnect, FDS and accepted "
+            f"session in {time.monotonic() - reconnect_started:.3f}s after election"
+        )
+        blackhole.close()
+        blackhole = None
         current_reconnects = data.metric("lavik_cluster_control_reconnects_total")
         if current_reconnects <= redirected_reconnects:
             raise H.Failure("leader death did not advance reconnect attempts")
@@ -577,6 +631,8 @@ def run_plaintext(meta_binary, data_binary, workdir):
                     print(f"<Data metrics unavailable: {exc}>", file=sys.stderr)
         raise
     finally:
+        if blackhole is not None:
+            blackhole.close()
         if data is not None:
             data.force_kill()
         for node in nodes:

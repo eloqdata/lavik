@@ -617,6 +617,14 @@ for a manual uncontrolled Begin. Demotion cancels and joins detector timers,
 pending proposals, and validation admissions; a replacement leader never
 inherits SUSPECT time.
 
+Data reconnect tries numeric Meta endpoints in preference order with at most
+three concurrent TCP connections, staggered by 100 ms. It cancels and joins
+losing attempts before passing the selected, storage-pinned connection to the
+sole TLS/identity/ServerHello and control-session path. No parallel attempt
+installs control state or executes directives. TCP reachability is not session
+success: authentication, redirects, projection installation and heartbeat/lease
+validation remain required, and their deadlines remain session-local.
+
 `MetaControlProjector` reads one atomic committed view. Initial connection and
 reconnection receive a complete `FullDesiredState` containing cluster discovery,
 Group state, referenced manifests, resolved lease duration, and the recipient's
