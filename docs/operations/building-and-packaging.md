@@ -113,6 +113,9 @@ and `libcrypto.a`).
 For a different local CPU target, configure CMake directly with
 `-DLAVIK_MARCH=<target>`. An empty value disables the explicit `-march` flag.
 
+Tracing is controlled by `LAVIK_ENABLE_TRACE`, which defaults to `OFF`. Enable it with
+`./scripts/configure_release.sh -DLAVIK_ENABLE_TRACE=ON`, then rebuild `lavik`.
+
 Use `-DLAVIK_BYCORF_SOURCE_DIR=/absolute/path/to/bycorf-worktree` to build and
 test a separate Bycorf checkout without replacing the repository's submodule.
 The default remains the pinned `bycorf/` checkout. Record both revisions when

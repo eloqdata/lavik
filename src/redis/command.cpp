@@ -3409,7 +3409,7 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request,
   }
 
   CommandReply reply = BuiltReply(reply_builder.AppendArrayHeader(matches));
-  reply.chunks_ = std::make_unique<ReplyChunkSource>(
+  reply.continuation_ = std::make_unique<ReplyContinuation>(
       [state]() { return NextKeysChunk(state); });
   co_return reply;
 }
@@ -3749,12 +3749,12 @@ Task<CommandReply> ExecuteNegativeRandomStream(
     std::uint64_t reply_elements = state->remaining_;
     if (state->options_.with_values_) reply_elements *= 2;
     LAVIK_FAULT_INJECT(MaybeFailRandomStreamBuild(request, "before-source"););
-    auto chunks = std::make_unique<ReplyChunkSource>(
+    auto chunks = std::make_unique<ReplyContinuation>(
         [state]() { return NextNegativeRandomChunk(state); });
     CommandReply reply =
         BuiltReply(reply_builder.AppendArrayHeader(reply_elements));
     LAVIK_FAULT_INJECT(MaybeFailRandomStreamBuild(request, "after-header"););
-    reply.chunks_ = std::move(chunks);
+    reply.continuation_ = std::move(chunks);
     co_return reply;
   } catch (const std::bad_alloc&) {
     RecordMemoryRejection();
@@ -4312,8 +4312,8 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
         co_return reply;
       }
       reply.encoded_ = reply_builder.AppendRaw(prepared->header_);
-      reply.chunks_ =
-          std::make_unique<ReplyChunkSource>(std::move(prepared->chunks_));
+      reply.continuation_ =
+          std::make_unique<ReplyContinuation>(std::move(prepared->chunks_));
       co_return reply;
     }
 
@@ -5434,8 +5434,8 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
       ReplyBuilder stream_reply_builder(request.resp_version_);
       CommandReply reply = co_await ExecuteStreamCommandLocked(
           request, digest, tx, stream_reply_builder);
-      if (reply.chunks_ && reply_chunks)
-        *reply_chunks = std::move(*reply.chunks_);
+      if (reply.continuation_ && reply_chunks)
+        *reply_chunks = std::move(reply.continuation_->source_);
       co_return std::string(reply.encoded_);
     }
 
@@ -6416,14 +6416,21 @@ Task<CommandReply> ExecuteMultiKey(
     case CommandKind::kMSet:
       co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
     case CommandKind::kMGet: {
-      reply_builder.AppendArrayHeader(ctx.frames_.size());
-      for (const auto& frame : ctx.frames_) {
-        if (frame.has_value())
-          reply_builder.AppendRaw(*frame);
-        else
-          reply_builder.AppendNull();
+      CommandReply reply =
+          BuiltReply(reply_builder.AppendArrayHeader(ctx.frames_.size()));
+      std::vector<std::string> fragments;
+      fragments.reserve(ctx.frames_.size());
+      for (auto& frame : ctx.frames_) {
+        fragments.push_back(frame.has_value() ? std::move(*frame)
+                            : request.resp_version_ == RespVersion::k3
+                                ? "_\r\n"
+                                : "$-1\r\n");
       }
-      co_return BuiltReply(reply_builder.View());
+      // Shards already own complete bulk frames. Transfer their ownership
+      // instead of copying the entire result into the connection builder.
+      reply.continuation_ =
+          std::make_unique<ReplyContinuation>(std::move(fragments));
+      co_return reply;
     }
     default:
       co_return BuiltReply(reply_builder.AppendInteger(
@@ -9312,7 +9319,7 @@ Task<CommandReply> ExecuteSentinelManagementExec(
     } else {
       local = co_await ExecuteClient(ctx, command, local_builder);
     }
-    if (local.disk_value_.valid() || local.chunks_) {
+    if (local.disk_value_.valid() || local.continuation_) {
       replies.push_back(
           EncodeError("ERR management command produced a streamed reply"));
     } else {
@@ -9320,9 +9327,10 @@ Task<CommandReply> ExecuteSentinelManagementExec(
     }
   }
 
-  reply_builder.AppendArrayHeader(replies.size());
-  for (const std::string& reply : replies) reply_builder.AppendRaw(reply);
-  co_return BuiltReply(reply_builder.View());
+  CommandReply reply =
+      BuiltReply(reply_builder.AppendArrayHeader(replies.size()));
+  reply.continuation_ = std::make_unique<ReplyContinuation>(std::move(replies));
+  co_return reply;
 }
 
 Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
@@ -9857,7 +9865,7 @@ Task<CommandReply> ExecuteExecBody(
                                       exec_admission->final_recheck_failed())) {
       if (exec_admission->mutation_started()) {
         reply.encoded_ = {};
-        reply.chunks_.reset();
+        reply.continuation_.reset();
         reply.close_connection_ = true;
         return reply;
       }
@@ -10770,7 +10778,10 @@ Task<CommandReply> ExecuteExecBody(
   const RespVersion connection_version = ctx.resp_version();
   reply_builder.SetVersion(exec_reply_version);
   reply_builder.AppendArrayHeader(replies.size());
-  if (!streamed) {
+  // Replay consumes an encoded result internally. Socket replies can retain
+  // each child frame without a second aggregate-sized allocation/copy.
+  const bool fragmented = !streamed && !ctx.strict_replication_apply_;
+  if (!streamed && !fragmented) {
     for (const std::string& reply : replies) {
       reply_builder.AppendRaw(reply);
     }
@@ -10783,11 +10794,14 @@ Task<CommandReply> ExecuteExecBody(
   // transaction returns here.
   SetClientRespVersion(ctx.conn_id_, connection_version);
   SetClientName(ctx.conn_id_, ctx.client_name_);
-  if (streamed) {
+  if (fragmented) {
+    reply.continuation_ =
+        std::make_unique<ReplyContinuation>(std::move(replies));
+  } else if (streamed) {
     auto state = std::make_shared<ExecReplyStreamState>();
     state->replies_ = std::move(replies);
     state->chunks_ = std::move(reply_chunks);
-    reply.chunks_ = std::make_unique<ReplyChunkSource>(
+    reply.continuation_ = std::make_unique<ReplyContinuation>(
         [state]() { return NextExecReplyChunk(state); });
   }
   reply.selected_db_ = select_db;
@@ -12255,7 +12269,7 @@ CommandReply FinalizeClusterMutationReply(const CommandRequest& request,
   // check. Its aggregate outcome cannot be represented as a retryable error.
   reply.encoded_ = {};
   reply.disk_value_ = storage::DiskValue{};
-  reply.chunks_.reset();
+  reply.continuation_.reset();
   reply.close_connection_ = true;
   return reply;
 }
@@ -13155,7 +13169,7 @@ Task<CommandReply> ExecuteCommandBody(
         const unsigned target =
             routed ? request.RoutedPartitionId() % g_storage->worker_count()
                    : ShardForKey(args[1]);
-#if LAVIK_ENABLE_READ_LATENCY_TRACE
+#if LAVIK_ENABLE_TRACE
         if (request.kind_ == CommandKind::kGet) {
           ReadLatencyTrace trace;
           trace.request_start_ns_ = ReadTraceNowNanos();
@@ -13181,8 +13195,6 @@ Task<CommandReply> ExecuteCommandBody(
           reply.read_trace_ = trace;
           co_return reply;
         }
-#endif
-#if LAVIK_ENABLE_SET_LATENCY_TRACE
         if (request.kind_ == CommandKind::kSet) {
           // A source SET is already on the key owner by the time it gets
           // here, so remote_ reads false. Read route-out as unmeasured, not
@@ -13739,7 +13751,7 @@ Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
 
   ReplyBuilder reply_builder;
   CommandReply reply = co_await ExecuteCommand(*request, reply_builder);
-  if (reply.disk_value_.valid() || reply.chunks_) {
+  if (reply.disk_value_.valid() || reply.continuation_) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "replication write produced a streamed reply");
   }
@@ -13788,7 +13800,7 @@ Task<absl::Status> ApplyRedisReplicatedCommand(
 
   ReplyBuilder reply_builder;
   CommandReply reply = co_await ExecuteCommand(*request, reply_builder);
-  if (reply.disk_value_.valid() || reply.chunks_) {
+  if (reply.disk_value_.valid() || reply.continuation_) {
     co_return absl::InternalError(
         "Redis replication write produced a streamed reply");
   }
@@ -13843,7 +13855,7 @@ Task<absl::Status> ApplyRedisReplicatedTransaction(
 
   ReplyBuilder reply_builder;
   CommandReply reply = co_await ExecuteExec(context, reply_builder);
-  if (reply.disk_value_.valid() || reply.chunks_) {
+  if (reply.disk_value_.valid() || reply.continuation_) {
     co_return absl::InternalError(
         "Redis replicated transaction produced a streamed reply");
   }

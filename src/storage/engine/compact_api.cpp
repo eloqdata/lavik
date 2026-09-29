@@ -506,7 +506,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
         store, partition, db_id, key, digest,
         update->erase_ ? std::string_view{} : encoded, kind, published_type,
         expire_at_ms, tx, update->erase_ ? 0 : logical_size, nullptr, nullptr,
-        replication, nullptr, true, nullptr, mutation_precondition);
+        replication, true, nullptr, mutation_precondition);
     co_return status;
   } catch (const std::bad_alloc&) {
     if (value_type != ValueType::kSortedSet && value_type != ValueType::kStream)

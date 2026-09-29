@@ -20,13 +20,13 @@
 #include <cstddef>
 #include <cstdint>
 
-#ifndef LAVIK_ENABLE_READ_LATENCY_TRACE
-#define LAVIK_ENABLE_READ_LATENCY_TRACE 0
+#ifndef LAVIK_ENABLE_TRACE
+#define LAVIK_ENABLE_TRACE 0
 #endif
 
 namespace lavik {
 
-#if !LAVIK_ENABLE_READ_LATENCY_TRACE
+#if !LAVIK_ENABLE_TRACE
 namespace detail {
 
 // Disabled trace fields preserve source compatibility for instrumentation
@@ -44,7 +44,7 @@ struct DisabledReadTraceField {
 }  // namespace detail
 #endif
 
-#if LAVIK_ENABLE_READ_LATENCY_TRACE
+#if LAVIK_ENABLE_TRACE
 inline std::uint64_t ReadTraceNowNanos() noexcept {
   return static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -56,7 +56,7 @@ inline constexpr std::uint64_t ReadTraceNowNanos() noexcept { return 0; }
 #endif
 
 struct ReadLatencyTrace {
-#if LAVIK_ENABLE_READ_LATENCY_TRACE
+#if LAVIK_ENABLE_TRACE
   std::uint64_t request_start_ns_ = 0;
   std::uint64_t owner_start_ns_ = 0;
   std::uint64_t lookup_done_ns_ = 0;
@@ -96,7 +96,7 @@ struct ReadLatencyTrace {
 #endif
 };
 
-#if !LAVIK_ENABLE_READ_LATENCY_TRACE
+#if !LAVIK_ENABLE_TRACE
 static_assert(sizeof(ReadLatencyTrace) == 1);
 #endif
 

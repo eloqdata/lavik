@@ -45,8 +45,7 @@ option(LAVIK_STATIC_CXX_RUNTIME
   "Link the GNU C++ and compiler runtimes statically" ON)
 set(LAVIK_MARCH "native" CACHE STRING
   "Value passed to -march for optimized local builds (empty disables it)")
-option(LAVIK_ENABLE_READ_LATENCY_TRACE "Enable detailed GET latency tracing" OFF)
-option(LAVIK_ENABLE_SET_LATENCY_TRACE "Enable detailed SET latency tracing" OFF)
+option(LAVIK_ENABLE_TRACE "Enable detailed GET and SET latency tracing" OFF)
 option(LAVIK_ENABLE_CROSS_CORE_HOP_COUNT "Count cross-core SubmitTaskTo transfers (test builds only)" OFF)
 option(LAVIK_KERNEL_BYPASS
   "Include DPDK networking and SPDK storage (selected independently at startup)"
@@ -502,8 +501,7 @@ target_compile_features(lavik_module PUBLIC cxx_std_23)
 target_compile_definitions(lavik_module PUBLIC
   $<$<BOOL:${LAVIK_KERNEL_BYPASS}>:LAVIK_KERNEL_BYPASS=1>
   LAVIK_ASAN_BUILD=$<BOOL:${LAVIK_ASAN_BUILD}>
-  LAVIK_ENABLE_READ_LATENCY_TRACE=$<BOOL:${LAVIK_ENABLE_READ_LATENCY_TRACE}>
-  LAVIK_ENABLE_SET_LATENCY_TRACE=$<BOOL:${LAVIK_ENABLE_SET_LATENCY_TRACE}>
+  LAVIK_ENABLE_TRACE=$<BOOL:${LAVIK_ENABLE_TRACE}>
   LAVIK_ENABLE_CROSS_CORE_HOP_COUNT=$<BOOL:${LAVIK_ENABLE_CROSS_CORE_HOP_COUNT}>
   LAVIK_ENABLE_TEST_FAULTS=$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>
 )
@@ -2013,6 +2011,14 @@ endforeach()
               $<TARGET_FILE:lavik>
     )
     set_tests_properties(lavik_defrag_payload_e2e PROPERTIES TIMEOUT 240)
+
+    add_test(
+      NAME lavik_reply_fragments_e2e
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/reply_fragments_e2e.py
+              $<TARGET_FILE:lavik>
+    )
+    set_tests_properties(lavik_reply_fragments_e2e PROPERTIES TIMEOUT 120)
 
     add_executable(lavik_grouped_recovery_e2e_test
       tests/grouped_recovery_e2e_test.cpp

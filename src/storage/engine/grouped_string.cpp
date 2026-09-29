@@ -58,7 +58,7 @@ Task<absl::Status> StorageEngine::Impl::WriteGroupedStringLocked(
       co_return co_await AppendLocked(
           store, partition, db_id, key, digest, value, RecordKind::kValue,
           ValueType::kString, expire_at_ms, tx, value.size(), nullptr, nullptr,
-          replication, nullptr, true, nullptr, mutation_precondition);
+          replication, true, nullptr, mutation_precondition);
     }
     if (previous && (before.size() != previous->version().root_.logical_size_ ||
                      value.size() < before.size()))
@@ -246,7 +246,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
         const auto status = co_await AppendLocked(
             store, partition, db_id, key, digest, bytes, RecordKind::kValue,
             ValueType::kString, exists ? location.expire_at_ms_ : 0, tx,
-            bytes.size(), nullptr, nullptr, replication, nullptr, true, nullptr,
+            bytes.size(), nullptr, nullptr, replication, true, nullptr,
             mutation_precondition);
         if (!status.ok()) co_return status;
       }

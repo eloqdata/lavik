@@ -481,21 +481,31 @@ absl::StatusOr<ReplicaOfRequest> ParseReplicaOfRequest(
 // Lets unbounded replies (KEYS) reach the socket in bounded memory.
 using ReplyChunkSource = std::function<Task<absl::StatusOr<std::string>>()>;
 
+// Owns independently encoded fragments until the socket has consumed them.
+// Fragments follow CommandReply::encoded_; an optional lazy source follows the
+// fragments. Keeping this state indirect leaves ordinary replies compact.
+struct ReplyContinuation {
+  explicit ReplyContinuation(ReplyChunkSource source)
+      : source_(std::move(source)) {}
+  explicit ReplyContinuation(std::vector<std::string> fragments)
+      : fragments_(std::move(fragments)) {}
+
+  std::vector<std::string> fragments_;
+  ReplyChunkSource source_;
+};
+
 struct CommandReply {
   // Points into the connection's ReplyBuilder and remains valid until the
   // current socket write completes. DiskValue keeps the specialized
   // direct-from-read-buffer GET path.
-  // TODO: Add TcpStream::WriteVAll so composite replies can send independently
-  // produced fragments without flattening them into ReplyBuilder.
   std::string_view encoded_;
   // DiskValue's lease already has an exact empty state; wrapping it in
   // optional duplicates that state and enlarges every command result.
   storage::DiskValue disk_value_;
-  // Streaming replies are rare and already own heap-backed continuation
-  // state. Keep only a pointer in every ordinary command result so GET/SET do
-  // not move std::function's three-word empty representation through each
-  // coroutine frame; the pointed-to source is drained after `encoded`.
-  std::unique_ptr<ReplyChunkSource> chunks_;
+  // Composite and streamed replies own their fragments/continuation here.
+  // The connection sends encoded_ first and retains this state across every
+  // partial write. Single-buffer and direct GET replies need no allocation.
+  std::unique_ptr<ReplyContinuation> continuation_;
   bool close_connection_ = false;
   bool start_monitoring_ = false;
   ReadLatencyTrace read_trace_;
@@ -507,7 +517,7 @@ struct CommandReply {
 // common representation at 72 bytes so adding rare reply state cannot silently
 // restore the former larger coroutine frames. Diagnostic builds deliberately
 // carry stage timestamps; this size contract applies only with tracing off.
-#if !LAVIK_ENABLE_READ_LATENCY_TRACE && !LAVIK_ENABLE_SET_LATENCY_TRACE
+#if !LAVIK_ENABLE_TRACE
 static_assert(sizeof(CommandReply) == 72);
 #endif
 

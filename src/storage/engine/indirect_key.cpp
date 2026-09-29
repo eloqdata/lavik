@@ -117,12 +117,19 @@ Task<absl::Status> StorageEngine::Impl::WriteIndirectKey(
   }
   std::string manifest = external ? EncodeManifest(*extents) : std::string{};
   RecordLocation location;
-  auto written = co_await WriteRecordLocked(
-      store, 0, IndirectKeyIdBytes(handle->id_),
-      external ? std::string_view(manifest) : key, RecordKind::kValue,
-      ValueType::kString, 0, {}, 0, 1, for_defrag, unlock_writer_while_waiting,
-      external, false, key_bytes, extents, &location, nullptr, nullptr, nullptr,
-      nullptr, nullptr, nullptr, nullptr, nullptr, false, nullptr, true);
+  const RecordWriteRequest record_write{
+      .key_ = IndirectKeyIdBytes(handle->id_),
+      .value_ = external ? std::string_view(manifest) : key,
+      .mutation_sequence_ = 1,
+      .logical_size_ = key_bytes,
+      .written_location_ = &location,
+      .value_type_ = ValueType::kString,
+      .for_defrag_ = for_defrag,
+      .unlock_writer_while_waiting_ = unlock_writer_while_waiting,
+      .external_ = external,
+      .indirect_key_record_ = true,
+  };
+  auto written = co_await WriteRecordLocked(store, record_write, extents);
   if (!written.ok()) co_return written;
   ++handle->physical_copies_;
   // A data record must never become durable before its UUID's original key.

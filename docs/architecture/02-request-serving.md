@@ -181,8 +181,10 @@ racing closure is either rejected or remains visible to the drain.
    that preparation and immediately before invalidating WATCH or changing the
    staging buffer/index; rollback, background maintenance, and replica replay
    do not depend on client authority.
-7. The service writes a normal encoded reply, a direct storage-backed value, or
-   bounded chunks. Small pipeline replies are coalesced up to 64 KiB.
+7. The service writes a normal encoded reply, a direct storage-backed value,
+   owned composite fragments, or bounded chunks. Composite MGET and finite
+   client EXEC replies retain independently encoded frames through bounded
+   vectored writes. Small contiguous pipeline replies are coalesced up to 64 KiB.
 
 ## Command metadata and routing
 
@@ -324,8 +326,9 @@ before storage flush.
   They bypass client role checks where appropriate and cannot publish another
   replication event.
 - The reply builder is connection-owned and valid only until the current
-  socket write. Direct disk replies keep their read lease; unbounded replies
-  use a chunk source. A 30-second no-progress watchdog closes a connection that
+  socket write. Direct disk replies keep their read lease; composite replies
+  own their fragments until all writes finish, and unbounded replies use a
+  chunk source. A 30-second no-progress watchdog closes a connection that
   stalls while a streamed reply holds a database gate.
   Negative-count random replies retain a charged, immutable command-time
   snapshot (including inside `EXEC`), without retaining DB/key locks during

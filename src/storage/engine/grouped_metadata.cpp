@@ -135,7 +135,7 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
       store, partition, db_id, key, digest, *payload, RecordKind::kValue,
       previous->version().root_.value_type(), expire_at_ms, tx,
       previous->version().root_.logical_size_, nullptr, nullptr, replication,
-      nullptr, true, nullptr, mutation_precondition, &mutation);
+      true, nullptr, mutation_precondition, &mutation);
   if (!appended.ok()) {
     if (store.write_failed_) (*decision)->FailPending();
     co_return appended;

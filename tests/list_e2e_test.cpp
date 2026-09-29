@@ -5140,6 +5140,60 @@ TEST(CollectionE2eTest, StringCommandsRecover) {
         client.Command({"BITOP", "OR", "bitmap-bad", bitmap_a, "not-string"}),
         "-WRONGTYPE Operation against a key holding the wrong kind of value");
 
+    // Exercise vector-width tails and zero extension with binary data. Reuse
+    // the destination as a source and repeat it in the operand list: reads
+    // must use the pre-write value even when the computation is vectorized.
+    const std::vector<std::string> fold_keys = {
+        KeyForWorker("bitmap-fold-a", 0, 2),
+        KeyForWorker("bitmap-fold-b", 1, 2), "bitmap-fold-c"};
+    for (const std::size_t size :
+         {0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 4097}) {
+      for (const bool uneven : {false, true}) {
+        std::vector<std::string> sources(3);
+        sources[0].resize(size);
+        sources[1].resize(uneven ? size / 2 : size);
+        sources[2].resize(uneven ? size + 7 : size);
+        for (std::size_t i = 0; i < sources.size(); ++i) {
+          for (std::size_t j = 0; j < sources[i].size(); ++j) {
+            sources[i][j] = static_cast<char>((j * 71 + i * 103) & 0xff);
+          }
+        }
+        for (const std::string operation : {"AND", "OR", "XOR", "NOT"}) {
+          SCOPED_TRACE(operation + " size=" + std::to_string(size) +
+                       " uneven=" + std::to_string(uneven));
+          for (std::size_t i = 0; i < sources.size(); ++i) {
+            ASSERT_EQ(client.Command({"SET", fold_keys[i], sources[i]}), "+OK");
+          }
+          std::vector<std::string_view> args = {"BITOP", operation,
+                                                fold_keys[0], fold_keys[0]};
+          if (operation != "NOT") {
+            args.insert(args.end(), {fold_keys[1], fold_keys[0], fold_keys[2]});
+          }
+          const std::size_t length =
+              operation == "NOT" ? size : sources[2].size();
+          std::string expected(length, '\0');
+          for (std::size_t byte = 0; byte < length; ++byte) {
+            unsigned char value = operation == "AND" ? 0xff : 0;
+            if (operation == "NOT") {
+              value = ~static_cast<unsigned char>(sources[0][byte]);
+            } else {
+              for (const std::size_t i : {0, 1, 0, 2}) {
+                const unsigned char operand =
+                    byte < sources[i].size() ? sources[i][byte] : 0;
+                if (operation == "AND") value &= operand;
+                if (operation == "OR") value |= operand;
+                if (operation == "XOR") value ^= operand;
+              }
+            }
+            expected[byte] = static_cast<char>(value);
+          }
+          ASSERT_EQ(client.Command(args), ":" + std::to_string(length));
+          EXPECT_EQ(client.Command({"GET", fold_keys[0]}),
+                    length == 0 ? "$-1" : Bulk(expected));
+        }
+      }
+    }
+
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
     EXPECT_EQ(client.Command({"APPEND", "exec-string", "a"}), "+QUEUED");
     EXPECT_EQ(client.Command({"INCRBY", "exec-number", "4"}), "+QUEUED");

@@ -490,7 +490,7 @@ class ReplicationLogService final : public bycorf::Service {
       const auto bytes = reply.disk_value_.network_bytes();
       actual.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     }
-    if (reply.chunks_ || actual != expected_reply) {
+    if (reply.continuation_ || actual != expected_reply) {
       co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                              "client replication command returned '" + actual +
                                  "' instead of '" +
@@ -1206,6 +1206,14 @@ class ReplicationLogService final : public bycorf::Service {
     absl::Status discarded =
         co_await storage_->DiscardTxUndoLocal(committed_tx.txid_);
     if (!discarded.ok()) co_return discarded;
+    // A mismatched coordinator ID must not commit these staged writes or
+    // prevent their actual transaction from making its durability decision.
+    std::vector<lavik::storage::TxShardWrites*> mismatched_shards{
+        &committed_tx};
+    absl::Status mismatched = co_await storage_->CommitTxWrites(
+        StorageEngine::AllocateWriteTxid(), std::move(mismatched_shards));
+    Check(absl::IsInvalidArgument(mismatched),
+          "commit accepted a receipt from a different transaction");
     std::vector<lavik::storage::TxShardWrites*> committed_shards{&committed_tx};
     absl::Status durable = co_await storage_->CommitTxWrites(
         committed_tx.txid_, std::move(committed_shards));

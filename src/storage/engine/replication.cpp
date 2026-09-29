@@ -1467,11 +1467,16 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     const std::string& key = old.key_;
     const Digest digest = ComputeDigest(key);
     const bool key_indirect = key.size() > kInlineKeyMaxBytes;
-    absl::Status tombstone = co_await WriteRecordLocked(
-        store, db_id, key, {}, RecordKind::kTombstone, ValueType::kNone, 0,
-        digest, 0, 0, /*for_defrag=*/false,
-        /*unlock_writer_while_waiting=*/false, /*external=*/false, key_indirect,
-        0);
+    const RecordWriteRequest record_write{
+        .key_ = key,
+        .digest_ = digest,
+        .logical_size_ = 0,
+        .db_id_ = db_id,
+        .kind_ = RecordKind::kTombstone,
+        .unlock_writer_while_waiting_ = false,
+        .key_indirect_ = key_indirect,
+    };
+    absl::Status tombstone = co_await WriteRecordLocked(store, record_write);
     if (!tombstone.ok()) co_return tombstone;
   }
   co_return next_epoch;
@@ -2111,21 +2116,40 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
         co_return extents.status();
       }
       const std::string manifest = EncodeManifest(**extents);
-      written = co_await WriteRecordLocked(
-          store, applied.db_id_, applied.key_, manifest, kind, value_type,
-          applied.expire_at_ms_, digest, /*txid=*/0, applied.mutation_sequence_,
-          false, true, true, key_indirect, applied.logical_size_, *extents,
-          nullptr, nullptr, nullptr, nullptr, nullptr, &write_root);
+      const RecordWriteRequest record_write{
+          .key_ = applied.key_,
+          .value_ = manifest,
+          .digest_ = digest,
+          .expire_at_ms_ = applied.expire_at_ms_,
+          .mutation_sequence_ = applied.mutation_sequence_,
+          .logical_size_ = applied.logical_size_,
+          .explicit_root_ = &write_root,
+          .db_id_ = applied.db_id_,
+          .kind_ = kind,
+          .value_type_ = value_type,
+          .external_ = true,
+          .key_indirect_ = key_indirect,
+      };
+      written = co_await WriteRecordLocked(store, record_write, *extents);
       if (!written.ok()) {
         SpawnExtentReclaim(store, *extents);
       }
     } else {
-      written = co_await WriteRecordLocked(
-          store, applied.db_id_, applied.key_, applied.value_, kind, value_type,
-          kind == RecordKind::kValue ? applied.expire_at_ms_ : 0, digest,
-          /*txid=*/0, applied.mutation_sequence_, false, true, false,
-          key_indirect, applied.logical_size_, nullptr, nullptr, nullptr,
-          nullptr, nullptr, nullptr, &write_root);
+      const RecordWriteRequest record_write{
+          .key_ = applied.key_,
+          .value_ = applied.value_,
+          .digest_ = digest,
+          .expire_at_ms_ =
+              kind == RecordKind::kValue ? applied.expire_at_ms_ : 0,
+          .mutation_sequence_ = applied.mutation_sequence_,
+          .logical_size_ = applied.logical_size_,
+          .explicit_root_ = &write_root,
+          .db_id_ = applied.db_id_,
+          .kind_ = kind,
+          .value_type_ = value_type,
+          .key_indirect_ = key_indirect,
+      };
+      written = co_await WriteRecordLocked(store, record_write);
     }
     if (!written.ok()) {
       co_return written;

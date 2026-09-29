@@ -57,10 +57,10 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     // The adapter already owns store_state_mutex_; DeleteLocked would try to
     // acquire it again. The tombstone append owns the same graph-retirement
     // and transaction/replication bookkeeping as the ordinary delete path.
-    co_return co_await AppendLocked(
-        store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
-        ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, nullptr,
-        true, nullptr, mutation_precondition);
+    co_return co_await AppendLocked(store, partition, db_id, key, digest, {},
+                                    RecordKind::kTombstone, ValueType::kNone, 0,
+                                    tx, 0, nullptr, nullptr, replication, true,
+                                    nullptr, mutation_precondition);
   }
   const auto field_count = plan.root_.logical_size();
   const auto value_type = OrderedValueType(plan.root_.kind_);
@@ -356,7 +356,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, *compact_payload,
         RecordKind::kValue, value_type, expire_at_ms,
         outer_transaction ? tx : nullptr, field_count, nullptr, nullptr,
-        replication, nullptr, true, nullptr, mutation_precondition);
+        replication, true, nullptr, mutation_precondition);
   }
   auto decision = PrepareGroupedDecision(*tx);
   if (!decision.ok()) co_return decision.status();
@@ -555,7 +555,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   const auto appended = co_await AppendLocked(
       store, partition, db_id, key, digest, *root_payload, RecordKind::kValue,
       value_type, expire_at_ms, tx, field_count, nullptr, nullptr, replication,
-      nullptr, true, nullptr, mutation_precondition, &mutation);
+      true, nullptr, mutation_precondition, &mutation);
   if (!appended.ok()) {
     if (store.write_failed_) {
       // A root may already be staged/published on a fail-stopped path. Its

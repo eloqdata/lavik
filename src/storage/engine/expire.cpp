@@ -394,7 +394,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
     durable = co_await AppendLocked(
         store, partition, candidate.db_id_, candidate.key_, candidate.digest_,
         {}, RecordKind::kTombstone, ValueType::kNone, 0, nullptr, 0, nullptr,
-        nullptr, nullptr, nullptr, true, nullptr, &expiration_precondition);
+        nullptr, nullptr, true, nullptr, &expiration_precondition);
 #if LAVIK_FAULTS_ENABLED
   }
 #endif

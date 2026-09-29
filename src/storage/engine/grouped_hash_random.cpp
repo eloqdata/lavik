@@ -226,10 +226,10 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
           object->version().root_.expire_at_ms_, tx, replication,
           mutation_precondition);
     } else {
-      status = co_await AppendLocked(
-          store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
-          ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, nullptr,
-          true, nullptr, mutation_precondition);
+      status = co_await AppendLocked(store, partition, db_id, key, digest, {},
+                                     RecordKind::kTombstone, ValueType::kNone,
+                                     0, tx, 0, nullptr, nullptr, replication,
+                                     true, nullptr, mutation_precondition);
     }
     if (!status.ok()) co_return status;
     co_return result;

@@ -20,13 +20,13 @@
 #include <cstddef>
 #include <cstdint>
 
-#ifndef LAVIK_ENABLE_SET_LATENCY_TRACE
-#define LAVIK_ENABLE_SET_LATENCY_TRACE 0
+#ifndef LAVIK_ENABLE_TRACE
+#define LAVIK_ENABLE_TRACE 0
 #endif
 
 namespace lavik {
 
-#if !LAVIK_ENABLE_SET_LATENCY_TRACE
+#if !LAVIK_ENABLE_TRACE
 namespace detail {
 
 template <typename T, std::size_t Tag>
@@ -40,7 +40,7 @@ struct DisabledSetTraceField {
 }  // namespace detail
 #endif
 
-#if LAVIK_ENABLE_SET_LATENCY_TRACE
+#if LAVIK_ENABLE_TRACE
 inline std::uint64_t SetTraceNowNanos() noexcept {
   return static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -52,7 +52,7 @@ inline constexpr std::uint64_t SetTraceNowNanos() noexcept { return 0; }
 #endif
 
 struct SetLatencyTrace {
-#if LAVIK_ENABLE_SET_LATENCY_TRACE
+#if LAVIK_ENABLE_TRACE
   std::uint64_t request_start_ns_ = 0;
   std::uint64_t owner_start_ns_ = 0;
   std::uint64_t key_lock_start_ns_ = 0;
@@ -104,7 +104,7 @@ struct SetLatencyTrace {
 #endif
 };
 
-#if !LAVIK_ENABLE_SET_LATENCY_TRACE
+#if !LAVIK_ENABLE_TRACE
 static_assert(sizeof(SetLatencyTrace) == 1);
 #endif
 

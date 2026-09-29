@@ -22,6 +22,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -59,6 +60,7 @@
 #include "bycorf/runtime/sync.h"
 #include "client_limit.h"
 #include "function_catalog.h"
+#include "latency_trace.h"
 #include "lavik/cluster/bootstrap.h"
 #include "lavik/cluster/meta_client.h"
 #include "lavik/cluster/runtime.h"
@@ -86,17 +88,6 @@ namespace lavik {
 using namespace bycorf;
 
 namespace {
-
-#if BYCORF_ENABLE_CROSS_CORE_LATENCY_TRACE
-constexpr std::uint64_t kReadLatencyReportIntervalNs = 45'000'000'000ULL;
-#else
-constexpr std::uint64_t kReadLatencyReportIntervalNs = 10'000'000'000ULL;
-#endif
-
-constexpr std::array<std::uint64_t, 28> kLatencyBucketUpperUs{
-    1,    2,    3,    4,    5,    8,     10,    15,   20,  30,
-    40,   50,   75,   100,  150,  200,   300,   500,  750, 1000,
-    1500, 2000, 3000, 5000, 8000, 10000, 20000, 50000};
 
 // Client sockets must never consume the descriptors needed by listeners,
 // io_uring, storage, replication, metrics, logging, and transient maintenance
@@ -156,316 +147,6 @@ absl::StatusOr<std::uint64_t> MaxClientsAllowedByFileLimit(
   if (limit.rlim_cur <= kMaxClientsFileDescriptorReserve) return 0;
   return std::min<std::uint64_t>(
       requested, limit.rlim_cur - kMaxClientsFileDescriptorReserve);
-}
-
-struct LatencyDistribution {
-  std::uint64_t sum_ns_ = 0;
-  std::array<std::uint64_t, kLatencyBucketUpperUs.size()> buckets_{};
-
-  void Add(std::uint64_t ns) noexcept {
-    sum_ns_ += ns;
-    const std::uint64_t us = (ns + 999) / 1000;
-    const auto it = std::lower_bound(kLatencyBucketUpperUs.begin(),
-                                     kLatencyBucketUpperUs.end(), us);
-    const std::size_t index =
-        it == kLatencyBucketUpperUs.end()
-            ? kLatencyBucketUpperUs.size() - 1
-            : static_cast<std::size_t>(it - kLatencyBucketUpperUs.begin());
-    ++buckets_[index];
-  }
-
-  double AverageUs(std::uint64_t count) const noexcept {
-    return count == 0 ? 0.0
-                      : static_cast<double>(sum_ns_) /
-                            (1000.0 * static_cast<double>(count));
-  }
-
-  std::uint64_t PercentileUpperUs(std::uint64_t count,
-                                  double percentile) const noexcept {
-    if (count == 0) {
-      return 0;
-    }
-    const std::uint64_t target = static_cast<std::uint64_t>(
-        static_cast<double>(count) * percentile + 0.999999);
-    std::uint64_t cumulative = 0;
-    for (std::size_t i = 0; i < buckets_.size(); ++i) {
-      cumulative += buckets_[i];
-      if (cumulative >= target) {
-        return kLatencyBucketUpperUs[i];
-      }
-    }
-    return kLatencyBucketUpperUs.back();
-  }
-};
-
-struct ReadLatencyStats {
-  std::uint64_t count_ = 0;
-  std::uint64_t remote_ = 0;
-  std::uint64_t hits_ = 0;
-  std::uint64_t disk_reads_ = 0;
-  std::uint64_t heap_buffers_ = 0;
-  std::uint64_t next_report_ns_ = 0;
-  LatencyDistribution total_;
-  LatencyDistribution non_network_;
-  LatencyDistribution route_out_;
-  LatencyDistribution lookup_;
-  LatencyDistribution buffer_;
-  LatencyDistribution io_;
-  LatencyDistribution decode_;
-  LatencyDistribution route_back_;
-  LatencyDistribution send_;
-};
-
-std::uint64_t Elapsed(std::uint64_t end, std::uint64_t start) noexcept {
-  return end >= start && start != 0 ? end - start : 0;
-}
-
-void RecordReadLatency(const ReadLatencyTrace& trace) {
-  static thread_local ReadLatencyStats stats;
-  if (trace.request_start_ns_ == 0 || trace.send_complete_ns_ == 0) {
-    return;
-  }
-  ++stats.count_;
-  stats.remote_ += trace.remote_;
-  stats.hits_ += trace.hit_;
-  stats.disk_reads_ += trace.disk_read_;
-  stats.heap_buffers_ += trace.heap_read_buffer_;
-  stats.total_.Add(Elapsed(trace.send_complete_ns_, trace.request_start_ns_));
-  stats.non_network_.Add(
-      Elapsed(trace.send_start_ns_, trace.request_start_ns_));
-  stats.route_out_.Add(Elapsed(trace.owner_start_ns_, trace.request_start_ns_));
-  stats.lookup_.Add(Elapsed(trace.lookup_done_ns_, trace.owner_start_ns_));
-  stats.buffer_.Add(
-      Elapsed(trace.buffer_acquired_ns_, trace.buffer_acquire_start_ns_));
-  stats.io_.Add(Elapsed(trace.io_complete_ns_, trace.io_submit_ns_));
-  stats.decode_.Add(Elapsed(trace.decode_done_ns_, trace.io_complete_ns_));
-  stats.route_back_.Add(Elapsed(trace.origin_resume_ns_, trace.owner_done_ns_));
-  stats.send_.Add(Elapsed(trace.send_complete_ns_, trace.send_start_ns_));
-
-  const std::uint64_t now = trace.send_complete_ns_;
-  if (stats.next_report_ns_ == 0) {
-    // Keep worker reports out of the same logger critical section. Synchronous
-    // bursts from every worker otherwise become an artificial tail-latency
-    // event in the trace build itself.
-    stats.next_report_ns_ =
-        now + kReadLatencyReportIntervalNs + 100'000'000ULL * ThisWorker().id_;
-    return;
-  }
-  if (now < stats.next_report_ns_) {
-    return;
-  }
-
-  const auto avg = [&](const LatencyDistribution& value) {
-    return value.AverageUs(stats.count_);
-  };
-  const auto p999 = [&](const LatencyDistribution& value) {
-    return value.PercentileUpperUs(stats.count_, 0.999);
-  };
-  const auto p9999 = [&](const LatencyDistribution& value) {
-    return value.PercentileUpperUs(stats.count_, 0.9999);
-  };
-  const auto wake_stats = ThisWorker().self_->TakeWakeStats();
-  const auto scheduler_stats = ThisWorker().self_->TakeSchedulerStats();
-  spdlog::info(
-      "read-latency worker={} n={} remote={:.1f}% hit={:.1f}% disk={:.1f}% "
-      "heap-buffer={:.1f}% avg-us total={:.1f} route-out={:.1f} lookup={:.1f} "
-      "buffer={:.1f} io={:.1f} decode={:.1f} route-back={:.1f} send={:.1f} "
-      "p99.9-us total<={} route-out<={} lookup<={} buffer<={} io<={} "
-      "decode<={} route-back<={} send<={} wake-sent={}/{}",
-      ThisWorker().id_, stats.count_,
-      100.0 * static_cast<double>(stats.remote_) / stats.count_,
-      100.0 * static_cast<double>(stats.hits_) / stats.count_,
-      100.0 * static_cast<double>(stats.disk_reads_) / stats.count_,
-      100.0 * static_cast<double>(stats.heap_buffers_) / stats.count_,
-      avg(stats.total_), avg(stats.route_out_), avg(stats.lookup_),
-      avg(stats.buffer_), avg(stats.io_), avg(stats.decode_),
-      avg(stats.route_back_), avg(stats.send_), p999(stats.total_),
-      p999(stats.route_out_), p999(stats.lookup_), p999(stats.buffer_),
-      p999(stats.io_), p999(stats.decode_), p999(stats.route_back_),
-      p999(stats.send_), wake_stats.sent_, wake_stats.checks_);
-  const auto cycles_to_us = [&](std::uint64_t cycles) {
-    return scheduler_stats.cycles_per_second_ == 0.0
-               ? 0.0
-               : static_cast<double>(cycles) * 1'000'000.0 /
-                     scheduler_stats.cycles_per_second_;
-  };
-  const std::uint64_t scheduled_cycles =
-      scheduler_stats.foreground_cycles_ + scheduler_stats.background_cycles_;
-  spdlog::info(
-      "scheduler worker={} rounds={} avg-round-us={:.2f} max-round-us={:.2f} "
-      "fg-resumes={} fg-us={:.1f} max-fg-us={:.1f} fg-overruns={} "
-      "bg-resumes={} bg-us={:.1f} max-bg-us={:.1f} bg-overruns={} "
-      "bg-share={:.1f}% spdk-polls={} empty={:.1f}% completions={} "
-      "max-batch={} avg-poll-us={:.3f} max-poll-us={:.1f}",
-      ThisWorker().id_, scheduler_stats.rounds_,
-      scheduler_stats.rounds_ == 0
-          ? 0.0
-          : cycles_to_us(scheduler_stats.round_cycles_) /
-                static_cast<double>(scheduler_stats.rounds_),
-      cycles_to_us(scheduler_stats.max_round_cycles_),
-      scheduler_stats.foreground_resumes_,
-      cycles_to_us(scheduler_stats.foreground_cycles_),
-      cycles_to_us(scheduler_stats.max_foreground_cycles_),
-      scheduler_stats.foreground_overruns_, scheduler_stats.background_resumes_,
-      cycles_to_us(scheduler_stats.background_cycles_),
-      cycles_to_us(scheduler_stats.max_background_cycles_),
-      scheduler_stats.background_overruns_,
-      scheduled_cycles == 0
-          ? 0.0
-          : 100.0 * static_cast<double>(scheduler_stats.background_cycles_) /
-                static_cast<double>(scheduled_cycles),
-      scheduler_stats.storage_poll_calls_,
-      scheduler_stats.storage_poll_calls_ == 0
-          ? 0.0
-          : 100.0 * static_cast<double>(scheduler_stats.storage_poll_empty_) /
-                static_cast<double>(scheduler_stats.storage_poll_calls_),
-      scheduler_stats.storage_completions_,
-      scheduler_stats.storage_max_completions_,
-      scheduler_stats.storage_poll_calls_ == 0
-          ? 0.0
-          : cycles_to_us(scheduler_stats.storage_poll_cycles_) /
-                static_cast<double>(scheduler_stats.storage_poll_calls_),
-      cycles_to_us(scheduler_stats.storage_max_poll_cycles_));
-  spdlog::info(
-      "read-latency-p99.99 worker={} n={} non-network-us<={} total-us<={} "
-      "storage-io-us<={} route-out-us<={} lookup-us<={} buffer-us<={} "
-      "decode-us<={} route-back-us<={} send-us<={}",
-      ThisWorker().id_, stats.count_, p9999(stats.non_network_),
-      p9999(stats.total_), p9999(stats.io_), p9999(stats.route_out_),
-      p9999(stats.lookup_), p9999(stats.buffer_), p9999(stats.decode_),
-      p9999(stats.route_back_), p9999(stats.send_));
-#if BYCORF_ENABLE_CROSS_CORE_LATENCY_TRACE
-  const auto cross_core_stats = ThisWorker().self_->TakeCrossCoreLatencyStats();
-  const auto log_cross_core = [&](std::string_view name,
-                                  const Worker::LatencySampleStats& value) {
-    spdlog::info(
-        "cross-core-latency worker={} kind={} n={} avg-us={:.2f} "
-        "p99.9-us<={} p99.99-us<={} max-us={:.2f}",
-        ThisWorker().id_, name, value.count_, value.AverageUs(),
-        value.PercentileUpperUs(0.999), value.PercentileUpperUs(0.9999),
-        static_cast<double>(value.max_ns_) / 1000.0);
-  };
-  log_cross_core("wake-batch", cross_core_stats.wake_batch_wait_);
-  log_cross_core("parked-wake-batch", cross_core_stats.parked_wake_batch_wait_);
-  log_cross_core("request-queue", cross_core_stats.request_queue_);
-  log_cross_core("reply-queue", cross_core_stats.reply_queue_);
-#endif
-  stats = ReadLatencyStats{};
-  stats.next_report_ns_ =
-      now + kReadLatencyReportIntervalNs + 100'000'000ULL * ThisWorker().id_;
-}
-
-struct SetLatencyStats {
-  std::uint64_t count_ = 0;
-  std::uint64_t remote_ = 0;
-  std::uint64_t replication_ = 0;
-  std::uint64_t allocated_blocks_ = 0;
-  std::uint64_t standby_blocks_ = 0;
-  std::uint64_t next_report_ns_ = 0;
-  LatencyDistribution total_;
-  LatencyDistribution non_network_;
-  LatencyDistribution route_out_;
-  LatencyDistribution owner_;
-  LatencyDistribution key_lock_;
-  LatencyDistribution store_lock_;
-  LatencyDistribution lookup_;
-  LatencyDistribution append_;
-  LatencyDistribution block_;
-  LatencyDistribution encode_;
-  LatencyDistribution index_;
-  LatencyDistribution replication_publish_;
-  LatencyDistribution route_back_;
-  LatencyDistribution send_;
-};
-
-void RecordSetLatency(const SetLatencyTrace& trace) {
-  static thread_local SetLatencyStats stats;
-  if (trace.request_start_ns_ == 0 || trace.send_complete_ns_ == 0) return;
-  ++stats.count_;
-  stats.remote_ += trace.remote_;
-  stats.replication_ += trace.replication_;
-  stats.allocated_blocks_ += trace.allocated_block_;
-  stats.standby_blocks_ += trace.standby_block_;
-  stats.total_.Add(Elapsed(trace.send_complete_ns_, trace.request_start_ns_));
-  stats.non_network_.Add(
-      Elapsed(trace.send_start_ns_, trace.request_start_ns_));
-  stats.route_out_.Add(Elapsed(trace.owner_start_ns_, trace.request_start_ns_));
-  stats.owner_.Add(Elapsed(trace.owner_done_ns_, trace.owner_start_ns_));
-  stats.key_lock_.Add(
-      Elapsed(trace.key_lock_acquired_ns_, trace.key_lock_start_ns_));
-  stats.store_lock_.Add(
-      Elapsed(trace.store_lock_acquired_ns_, trace.store_lock_start_ns_));
-  stats.lookup_.Add(
-      Elapsed(trace.lookup_done_ns_, trace.store_lock_acquired_ns_));
-  stats.append_.Add(Elapsed(trace.append_done_ns_, trace.append_start_ns_));
-  stats.block_.Add(Elapsed(trace.block_ready_ns_, trace.block_wait_start_ns_));
-  stats.encode_.Add(Elapsed(trace.encode_done_ns_, trace.block_ready_ns_));
-  stats.index_.Add(Elapsed(trace.index_done_ns_, trace.encode_done_ns_));
-  stats.replication_publish_.Add(
-      Elapsed(trace.replication_done_ns_, trace.append_done_ns_));
-  stats.route_back_.Add(Elapsed(trace.origin_resume_ns_, trace.owner_done_ns_));
-  stats.send_.Add(Elapsed(trace.send_complete_ns_, trace.send_start_ns_));
-
-  const std::uint64_t now = trace.send_complete_ns_;
-  if (stats.next_report_ns_ == 0) {
-    stats.next_report_ns_ =
-        now + 10'000'000'000ULL + 100'000'000ULL * ThisWorker().id_;
-    return;
-  }
-  if (now < stats.next_report_ns_) return;
-
-  const auto avg = [&](const LatencyDistribution& value) {
-    return value.AverageUs(stats.count_);
-  };
-  const auto percentile = [&](const LatencyDistribution& value,
-                              double requested) {
-    return value.PercentileUpperUs(stats.count_, requested);
-  };
-  spdlog::info(
-      "set-latency worker={} n={} remote={:.1f}% replication={:.1f}% "
-      "block-alloc={:.3f}% standby-hit={:.3f}% avg-us total={:.1f} "
-      "non-network={:.1f} "
-      "route-out={:.1f} owner={:.1f} key-lock={:.1f} store-lock={:.1f} "
-      "lookup={:.1f} append={:.1f} block={:.1f} encode={:.1f} index={:.1f} "
-      "repl-publish={:.1f} route-back={:.1f} send={:.1f}",
-      ThisWorker().id_, stats.count_,
-      100.0 * static_cast<double>(stats.remote_) / stats.count_,
-      100.0 * static_cast<double>(stats.replication_) / stats.count_,
-      100.0 * static_cast<double>(stats.allocated_blocks_) / stats.count_,
-      100.0 * static_cast<double>(stats.standby_blocks_) / stats.count_,
-      avg(stats.total_), avg(stats.non_network_), avg(stats.route_out_),
-      avg(stats.owner_), avg(stats.key_lock_), avg(stats.store_lock_),
-      avg(stats.lookup_), avg(stats.append_), avg(stats.block_),
-      avg(stats.encode_), avg(stats.index_), avg(stats.replication_publish_),
-      avg(stats.route_back_), avg(stats.send_));
-  const auto log_percentile = [&](std::string_view label, double requested) {
-    spdlog::info(
-        "set-latency-{} worker={} n={} total-us<={} non-network-us<={} "
-        "route-out-us<={} owner-us<={} key-lock-us<={} store-lock-us<={} "
-        "lookup-us<={} append-us<={} block-us<={} encode-us<={} "
-        "index-us<={} repl-publish-us<={} route-back-us<={} send-us<={}",
-        label, ThisWorker().id_, stats.count_,
-        percentile(stats.total_, requested),
-        percentile(stats.non_network_, requested),
-        percentile(stats.route_out_, requested),
-        percentile(stats.owner_, requested),
-        percentile(stats.key_lock_, requested),
-        percentile(stats.store_lock_, requested),
-        percentile(stats.lookup_, requested),
-        percentile(stats.append_, requested),
-        percentile(stats.block_, requested),
-        percentile(stats.encode_, requested),
-        percentile(stats.index_, requested),
-        percentile(stats.replication_publish_, requested),
-        percentile(stats.route_back_, requested),
-        percentile(stats.send_, requested));
-  };
-  log_percentile("p99", 0.99);
-  log_percentile("p99.9", 0.999);
-  log_percentile("p99.99", 0.9999);
-  stats = SetLatencyStats{};
-  stats.next_report_ns_ =
-      now + 10'000'000'000ULL + 100'000'000ULL * ThisWorker().id_;
 }
 
 std::atomic<bool> g_shutdown_requested = false;
@@ -668,8 +349,99 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
   }
 }
 
+std::string_view ExecuteAuth(const PasswordAuthenticator& authenticator,
+                             ConnectionContext& ctx,
+                             std::span<const std::string> args) {
+  std::shared_ptr<const std::string> monitor_message;
+  if (HasMonitorSessions()) [[unlikely]] {
+    if (args.size() == 2 || args.size() == 3) {
+      monitor_message =
+          PrepareMonitorMessage(ctx.selected_db_, ctx.peer_address_, args);
+    }
+  }
+  std::string_view encoded;
+  if (args.size() != 2 && args.size() != 3) {
+    encoded = ctx.reply_builder_.AppendError(
+        "ERR wrong number of arguments for 'auth' command");
+  } else if (!authenticator.required()) {
+    encoded = ctx.reply_builder_.AppendError(
+        "ERR AUTH called without any password configured for the default "
+        "user. Are you sure your configuration is correct?");
+  } else {
+    const std::string_view username =
+        args.size() == 2 ? std::string_view("default") : args[1];
+    const std::string_view password = args.back();
+    if (authenticator.Authenticate(username, password)) {
+      ctx.authenticated_ = true;
+      encoded = ctx.reply_builder_.AppendSimpleString("OK");
+    } else {
+      encoded = ctx.reply_builder_.AppendError(
+          "WRONGPASS invalid username-password pair or user is "
+          "disabled.");
+    }
+  }
+  if (monitor_message != nullptr) [[unlikely]] {
+    PublishMonitorMessage(std::move(monitor_message));
+  }
+  return encoded;
+}
+
+enum class ReplicationHandshake {
+  kNone,
+  kRedisConfig,
+  kRedisSync,
+  kNative,
+};
+
+// These transport commands deliberately remain outside CommandSpecs(), which
+// also defines the ordinary execution and Redis COMMAND surface. Only a miss
+// in that table needs this second classification.
+ReplicationHandshake ClassifyReplicationHandshake(
+    std::span<const std::string> args) {
+  if (args.empty()) return ReplicationHandshake::kNone;
+  if (absl::EqualsIgnoreCase(args.front(), "REPLCONF")) {
+    return ReplicationHandshake::kRedisConfig;
+  }
+  if (absl::EqualsIgnoreCase(args.front(), "PSYNC")) {
+    return ReplicationHandshake::kRedisSync;
+  }
+  return ReplicationManager::IsNativeHandshake(args)
+             ? ReplicationHandshake::kNative
+             : ReplicationHandshake::kNone;
+}
+
+// A reply keeps the socket in ordinary command mode; no reply means the
+// recognized handshake is ready for transport handoff. Native handshakes keep
+// their existing admission rules in the replication manager.
+std::optional<std::string_view> PrepareReplicationHandshake(
+    ReplicationHandshake kind, ConnectionContext& ctx,
+    std::span<const std::string> args) {
+  assert(kind != ReplicationHandshake::kNone);
+  if (kind != ReplicationHandshake::kNative && ctx.in_multi_) {
+    // Redis handshakes cannot overtake queued transaction commands. Mark the
+    // queue dirty so EXEC observes this as a queue-time error.
+    ctx.multi_dirty_ = true;
+    return ctx.reply_builder_.AppendError(
+        "ERR replication handshake not allowed inside MULTI");
+  }
+  if (kind != ReplicationHandshake::kRedisConfig) return std::nullopt;
+  if (args.size() < 3 || (args.size() & 1U) == 0) {
+    return ctx.reply_builder_.AppendError(
+        "ERR wrong number of arguments for 'replconf' command");
+  }
+  for (std::size_t index = 1; index + 1 < args.size(); index += 2) {
+    if (absl::EqualsIgnoreCase(args[index], "capa") &&
+        absl::EqualsIgnoreCase(args[index + 1], "eof")) {
+      ctx.redis_replica_eof_ = true;
+    }
+  }
+  return ctx.reply_builder_.AppendSimpleString("OK");
+}
+
 class RequestInputBuffer;
 class CommandBatch;
+class CommandBufferGuard;
+struct PendingReplyBatch;
 
 class RedisService final : public TcpService, public ClientLimit {
  public:
@@ -720,6 +492,11 @@ class RedisService final : public TcpService, public ClientLimit {
 
  private:
   Task<absl::Status> Serve(TcpStream& stream, ConnectionContext& ctx);
+  // Terminal handoff: the caller's parser/buffers must outlive this await.
+  Task<absl::Status> HandoffReplicationConnection(
+      TcpStream& stream, ConnectionContext& ctx, std::vector<std::string>& args,
+      ReplicationHandshake kind, bool isolated, PendingReplyBatch& pending,
+      CommandBufferGuard& command_memory);
   Task<absl::Status> ReadSubscribedCommands(
       TcpStream& stream, ConnectionContext& ctx, RequestInputBuffer* input,
       RespCommandParser* parser, CommandBatch* ready,
@@ -1314,10 +1091,8 @@ struct PendingReplyBatch {
   std::string bytes_;
   // Empty diagnostic vectors still occupy the connection coroutine frame and
   // participate in every batch's lifetime; omit them when tracing is off.
-#if LAVIK_ENABLE_READ_LATENCY_TRACE
+#if LAVIK_ENABLE_TRACE
   std::vector<ReadLatencyTrace> read_traces_;
-#endif
-#if LAVIK_ENABLE_SET_LATENCY_TRACE
   std::vector<SetLatencyTrace> set_traces_;
 #endif
 
@@ -1327,12 +1102,10 @@ struct PendingReplyBatch {
               [[maybe_unused]] ReadLatencyTrace read_trace = {},
               [[maybe_unused]] SetLatencyTrace set_trace = {}) {
     bytes_.append(bytes);
-#if LAVIK_ENABLE_READ_LATENCY_TRACE
+#if LAVIK_ENABLE_TRACE
     if (read_trace.request_start_ns_ != 0) {
       read_traces_.push_back(std::move(read_trace));
     }
-#endif
-#if LAVIK_ENABLE_SET_LATENCY_TRACE
     if (set_trace.request_start_ns_ != 0) {
       set_traces_.push_back(std::move(set_trace));
     }
@@ -1340,7 +1113,7 @@ struct PendingReplyBatch {
   }
 };
 
-#if !LAVIK_ENABLE_READ_LATENCY_TRACE && !LAVIK_ENABLE_SET_LATENCY_TRACE
+#if !LAVIK_ENABLE_TRACE
 static_assert(sizeof(PendingReplyBatch) == sizeof(std::string));
 #endif
 
@@ -1348,12 +1121,10 @@ Task<absl::Status> FlushReplyBatch(TcpStream& stream,
                                    PendingReplyBatch* batch) {
   if (batch->empty()) co_return absl::OkStatus();
 
-#if LAVIK_ENABLE_READ_LATENCY_TRACE
+#if LAVIK_ENABLE_TRACE
   for (ReadLatencyTrace& trace : batch->read_traces_) {
     trace.send_start_ns_ = ReadTraceNowNanos();
   }
-#endif
-#if LAVIK_ENABLE_SET_LATENCY_TRACE
   for (SetLatencyTrace& trace : batch->set_traces_) {
     trace.send_start_ns_ = SetTraceNowNanos();
   }
@@ -1361,23 +1132,19 @@ Task<absl::Status> FlushReplyBatch(TcpStream& stream,
   absl::Status status = co_await stream.WriteAll(std::span<const std::byte>(
       reinterpret_cast<const std::byte*>(batch->bytes_.data()),
       batch->bytes_.size()));
-#if LAVIK_ENABLE_READ_LATENCY_TRACE
+#if LAVIK_ENABLE_TRACE
   for (ReadLatencyTrace& trace : batch->read_traces_) {
     trace.send_complete_ns_ = ReadTraceNowNanos();
-    RecordReadLatency(trace);
+    trace::RecordReadLatency(trace);
   }
-#endif
-#if LAVIK_ENABLE_SET_LATENCY_TRACE
   for (SetLatencyTrace& trace : batch->set_traces_) {
     trace.send_complete_ns_ = SetTraceNowNanos();
-    RecordSetLatency(trace);
+    trace::RecordSetLatency(trace);
   }
 #endif
   batch->bytes_.clear();
-#if LAVIK_ENABLE_READ_LATENCY_TRACE
+#if LAVIK_ENABLE_TRACE
   batch->read_traces_.clear();
-#endif
-#if LAVIK_ENABLE_SET_LATENCY_TRACE
   batch->set_traces_.clear();
 #endif
   co_return status;
@@ -1407,22 +1174,26 @@ Task<absl::Status> WriteOrBatchReply(TcpStream& stream,
     }
   }
 
+#if LAVIK_ENABLE_TRACE
   if (read_trace.request_start_ns_ != 0) {
     read_trace.send_start_ns_ = ReadTraceNowNanos();
   }
   if (set_trace.request_start_ns_ != 0) {
     set_trace.send_start_ns_ = SetTraceNowNanos();
   }
+#endif
   absl::Status status = co_await stream.WriteAll(std::span<const std::byte>(
       reinterpret_cast<const std::byte*>(encoded.data()), encoded.size()));
+#if LAVIK_ENABLE_TRACE
   if (read_trace.request_start_ns_ != 0) {
     read_trace.send_complete_ns_ = ReadTraceNowNanos();
-    RecordReadLatency(read_trace);
+    trace::RecordReadLatency(read_trace);
   }
   if (set_trace.request_start_ns_ != 0) {
     set_trace.send_complete_ns_ = SetTraceNowNanos();
-    RecordSetLatency(set_trace);
+    trace::RecordSetLatency(set_trace);
   }
+#endif
   co_return status;
 }
 
@@ -1628,6 +1399,73 @@ Task<absl::Status> BreakStalledStream(StreamStallRef state, int fd) {
   co_return absl::OkStatus();
 }
 
+// The reply owns every fragment and the builder owns the header until this
+// await finishes. Bound both iovec count and bytes per write so large replies
+// remain below transport limits and the watchdog observes partial progress.
+Task<absl::Status> WriteReplyContinuation(TcpStream& stream,
+                                          std::string_view header,
+                                          ReplyContinuation& continuation,
+                                          StreamStallRef stall) {
+  constexpr std::size_t kMaximumBuffers = 64;
+  constexpr std::size_t kWriteSegmentBytes = 256 * 1024;
+  std::array<iovec, kMaximumBuffers> buffers;
+  std::size_t index = 0;
+  std::size_t offset = 0;
+  while (index <= continuation.fragments_.size()) {
+    std::size_t count = 0;
+    std::size_t bytes = 0;
+    while (index <= continuation.fragments_.size() && count < buffers.size() &&
+           bytes < kWriteSegmentBytes) {
+      const std::string_view fragment =
+          index == 0 ? header : continuation.fragments_[index - 1];
+      const std::size_t length =
+          std::min(fragment.size() - offset, kWriteSegmentBytes - bytes);
+      if (length != 0) {
+        buffers[count++] =
+            iovec{.iov_base = const_cast<char*>(fragment.data() + offset),
+                  .iov_len = length};
+        bytes += length;
+        offset += length;
+      }
+      if (offset == fragment.size()) {
+        ++index;
+        offset = 0;
+      }
+    }
+    if (count == 0) break;
+    absl::Status status;
+    if (count == 1) {
+      status = co_await stream.WriteAll(std::span<const std::byte>(
+          static_cast<const std::byte*>(buffers[0].iov_base),
+          buffers[0].iov_len));
+    } else {
+      status = co_await stream.WriteAllV(
+          std::span<const iovec>(buffers.data(), count));
+    }
+    if (!status.ok()) co_return status;
+    if (stall) stall->last_progress_ = std::chrono::steady_clock::now();
+  }
+  continuation.fragments_.clear();
+
+  // Lazy producers may retain a database gate. Keep their original production
+  // order and send each chunk before asking for the next one.
+  while (continuation.source_) {
+    auto chunk = co_await continuation.source_();
+    if (!chunk.ok()) co_return chunk.status();
+    if (chunk->empty()) break;
+    std::span<const std::byte> remaining(
+        reinterpret_cast<const std::byte*>(chunk->data()), chunk->size());
+    while (!remaining.empty()) {
+      const std::size_t length = std::min(kWriteSegmentBytes, remaining.size());
+      absl::Status status = co_await stream.WriteAll(remaining.first(length));
+      if (!status.ok()) co_return status;
+      remaining = remaining.subspan(length);
+      if (stall) stall->last_progress_ = std::chrono::steady_clock::now();
+    }
+  }
+  co_return absl::OkStatus();
+}
+
 Task<absl::Status> RedisService::ReadSubscribedCommands(
     TcpStream& stream, ConnectionContext& ctx, RequestInputBuffer* input,
     RespCommandParser* parser, CommandBatch* ready,
@@ -1652,8 +1490,13 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     if (!reply.encoded_.empty()) {
       EnqueuePubSubReply(session, std::string(reply.encoded_));
     }
-    while (reply.chunks_) {
-      auto chunk = co_await (*reply.chunks_)();
+    if (reply.continuation_) {
+      for (auto& fragment : reply.continuation_->fragments_) {
+        if (!fragment.empty()) EnqueuePubSubReply(session, std::move(fragment));
+      }
+    }
+    while (reply.continuation_ && reply.continuation_->source_) {
+      auto chunk = co_await reply.continuation_->source_();
       if (!chunk.ok()) co_return chunk.status();
       if (chunk->empty()) break;
       EnqueuePubSubReply(session, std::move(*chunk));
@@ -1829,6 +1672,43 @@ Task<absl::Status> RedisService::ServeSubscribed(
   co_return joined;
 }
 
+Task<absl::Status> RedisService::HandoffReplicationConnection(
+    TcpStream& stream, ConnectionContext& ctx, std::vector<std::string>& args,
+    ReplicationHandshake kind, bool isolated, PendingReplyBatch& pending,
+    CommandBufferGuard& command_memory) {
+  assert(kind == ReplicationHandshake::kRedisSync ||
+         kind == ReplicationHandshake::kNative);
+  const bool native = kind == ReplicationHandshake::kNative;
+  // The replication reader receives only the socket, not bytes already read
+  // into the command parser or input queue. Reject those bytes before handoff.
+  if (!isolated) {
+    co_return absl::InvalidArgumentError(
+        native ? "replication handshake must be the first isolated command"
+               : "PSYNC handshake must be an isolated command");
+  }
+  // Native classification leaves the ordinary registry before any await so
+  // client sweeps cannot retire it. Redis export keeps its existing ordering:
+  // prior replies flush while it is still registered as an ordinary client.
+  if (native) UnregisterClientConnection(ctx.conn_id_);
+  absl::Status flushed = co_await FlushReplyBatch(stream, &pending);
+  if (!flushed.ok()) co_return flushed;
+  ConnectionClosed();
+  ctx.counted_as_client_ = false;
+  auto peer_address = stream.PeerAddress();
+  const std::string address =
+      peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
+  const bool tls = stream.IsTls();
+  if (!native) UnregisterClientConnection(ctx.conn_id_);
+  command_memory.Release();
+  if (native) {
+    co_return co_await replication_->ServeNativeConnection(
+        stream, std::move(args), ctx.conn_id_, address, tls);
+  }
+  co_return co_await replication_->ServeRedisExportConnection(
+      stream, std::move(args), ctx.conn_id_, address, tls,
+      ctx.redis_replica_eof_);
+}
+
 Task<absl::Status> RedisService::Serve(TcpStream& stream,
                                        ConnectionContext& ctx) {
   RequestInputBuffer input;
@@ -1879,48 +1759,17 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     CommandBufferGuard command_memory(&client_buffers, buffered.input_bytes_);
     RespCommand command = std::move(buffered.command_);
 
-    const auto& args = command.args_;
-    if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "HELLO") &&
-        !ctx.in_multi_) {
-      const std::string_view encoded = ExecuteHello(
-          authenticator_, replication_, ctx, args, ctx.reply_builder_);
-      absl::Status written = co_await WriteOrBatchReply(
-          stream, encoded, !ready.empty(), &pending_replies);
-      if (!written.ok()) co_return written;
-      continue;
-    }
-    if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "AUTH")) {
-      std::shared_ptr<const std::string> monitor_message;
-      if (HasMonitorSessions()) [[unlikely]] {
-        if (args.size() == 2 || args.size() == 3) {
-          monitor_message =
-              PrepareMonitorMessage(ctx.selected_db_, ctx.peer_address_, args);
-        }
-      }
-      std::string_view encoded;
-      if (args.size() != 2 && args.size() != 3) {
-        encoded = ctx.reply_builder_.AppendError(
-            "ERR wrong number of arguments for 'auth' command");
-      } else if (!authenticator_.required()) {
-        encoded = ctx.reply_builder_.AppendError(
-            "ERR AUTH called without any password configured for the default "
-            "user. Are you sure your configuration is correct?");
-      } else {
-        const std::string_view username =
-            args.size() == 2 ? std::string_view("default") : args[1];
-        const std::string_view password = args.back();
-        if (authenticator_.Authenticate(username, password)) {
-          ctx.authenticated_ = true;
-          encoded = ctx.reply_builder_.AppendSimpleString("OK");
-        } else {
-          encoded = ctx.reply_builder_.AppendError(
-              "WRONGPASS invalid username-password pair or user is "
-              "disabled.");
-        }
-      }
-      if (monitor_message != nullptr) [[unlikely]] {
-        PublishMonitorMessage(std::move(monitor_message));
-      }
+    // Classify once for both connection control and ordinary dispatch. Known
+    // data commands never enter the replication-handshake name checks.
+    CommandRequest request =
+        BuildParsedCommandRequest(std::move(command), ctx.selected_db_);
+    if (request.kind_ == CommandKind::kAuth ||
+        (request.kind_ == CommandKind::kHello && !ctx.in_multi_)) {
+      const std::string_view encoded =
+          request.kind_ == CommandKind::kAuth
+              ? ExecuteAuth(authenticator_, ctx, request.args_)
+              : ExecuteHello(authenticator_, replication_, ctx, request.args_,
+                             ctx.reply_builder_);
       absl::Status written = co_await WriteOrBatchReply(
           stream, encoded, !ready.empty(), &pending_replies);
       if (!written.ok()) co_return written;
@@ -1936,85 +1785,23 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       continue;
     }
 
-    // A handshake changes socket ownership and cannot execute ahead of queued
-    // transaction commands. Treat rejection as a queue-time error for EXEC.
-    if (ctx.in_multi_ && !args.empty() &&
-        (absl::EqualsIgnoreCase(args.front(), "REPLCONF") ||
-         absl::EqualsIgnoreCase(args.front(), "PSYNC"))) {
-      ctx.multi_dirty_ = true;
-      const std::string_view encoded = ctx.reply_builder_.AppendError(
-          "ERR replication handshake not allowed inside MULTI");
-      absl::Status written = co_await WriteOrBatchReply(
-          stream, encoded, !ready.empty(), &pending_replies);
-      if (!written.ok()) co_return written;
-      continue;
-    }
-
-    if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "REPLCONF")) {
-      if (args.size() < 3 || (args.size() & 1U) == 0) {
-        const std::string_view encoded = ctx.reply_builder_.AppendError(
-            "ERR wrong number of arguments for 'replconf' command");
-        absl::Status written = co_await WriteOrBatchReply(
-            stream, encoded, !ready.empty(), &pending_replies);
-        if (!written.ok()) co_return written;
-        continue;
-      }
-      for (std::size_t index = 1; index + 1 < args.size(); index += 2) {
-        if (absl::EqualsIgnoreCase(args[index], "capa") &&
-            absl::EqualsIgnoreCase(args[index + 1], "eof")) {
-          ctx.redis_replica_eof_ = true;
+    if (request.kind_ == CommandKind::kUnknown) [[unlikely]] {
+      const ReplicationHandshake handshake =
+          ClassifyReplicationHandshake(request.args_);
+      if (handshake != ReplicationHandshake::kNone) {
+        if (auto encoded =
+                PrepareReplicationHandshake(handshake, ctx, request.args_)) {
+          absl::Status written = co_await WriteOrBatchReply(
+              stream, *encoded, !ready.empty(), &pending_replies);
+          if (!written.ok()) co_return written;
+          continue;
         }
+        const bool isolated =
+            ready.empty() && input.View().empty() && parser.idle();
+        co_return co_await HandoffReplicationConnection(
+            stream, ctx, request.args_, handshake, isolated, pending_replies,
+            command_memory);
       }
-      const std::string_view encoded =
-          ctx.reply_builder_.AppendSimpleString("OK");
-      absl::Status written = co_await WriteOrBatchReply(
-          stream, encoded, !ready.empty(), &pending_replies);
-      if (!written.ok()) co_return written;
-      continue;
-    }
-
-    if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "PSYNC")) {
-      if (!ready.empty() || !input.View().empty() || !parser.idle()) {
-        co_return absl::InvalidArgumentError(
-            "PSYNC handshake must be an isolated command");
-      }
-      absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
-      if (!flushed.ok()) co_return flushed;
-      ConnectionClosed();
-      ctx.counted_as_client_ = false;
-      auto peer_address = stream.PeerAddress();
-      const std::string address =
-          peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
-      const bool tls = stream.IsTls();
-      UnregisterClientConnection(ctx.conn_id_);
-      command_memory.Release();
-      co_return co_await replication_->ServeRedisExportConnection(
-          stream, std::move(command.args_), ctx.conn_id_, address, tls,
-          ctx.redis_replica_eof_);
-    }
-
-    if (ReplicationManager::IsNativeHandshake(command.args_)) {
-      if (!ready.empty() || !input.View().empty() || !parser.idle()) {
-        co_return absl::InvalidArgumentError(
-            "replication handshake must be the first isolated command");
-      }
-      // The isolated authenticated native command is the classification
-      // boundary. Leave the ordinary registry before any handshake await;
-      // native admission and its own registry now govern socket lifetime.
-      // Before this command arrives an AUTH-only socket is indistinguishable
-      // from an idle data client on the shared listener.
-      UnregisterClientConnection(ctx.conn_id_);
-      absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
-      if (!flushed.ok()) co_return flushed;
-      ConnectionClosed();
-      ctx.counted_as_client_ = false;
-      auto peer_address = stream.PeerAddress();
-      const std::string address =
-          peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
-      const bool tls = stream.IsTls();
-      command_memory.Release();
-      co_return co_await replication_->ServeNativeConnection(
-          stream, std::move(command.args_), ctx.conn_id_, address, tls);
     }
 
     if (!TryBeginRequest()) [[unlikely]] {
@@ -2031,8 +1818,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     }
     RequestGuard request_guard(this);
 
-    CommandRequest request =
-        BuildParsedCommandRequest(std::move(command), ctx.selected_db_);
     // Cluster MOVED/discovery replies select the TLS port for connections
     // that arrived over TLS (Redis getNodeClientPort semantics).
     request.connection_tls_ = stream.IsTls();
@@ -2107,7 +1892,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         }
       }
     } retire_stall;
-    if (reply.chunks_) {
+    if (reply.continuation_ && reply.continuation_->source_) {
       stall = StreamStallRef::Make();
       stall->last_progress_ = std::chrono::steady_clock::now();
       retire_stall.state_ = stall;
@@ -2123,29 +1908,32 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         write_status = co_await FlushReplyBatch(stream, &pending_replies);
       }
       if (write_status.ok()) {
+#if LAVIK_ENABLE_TRACE
         if (reply.read_trace_.request_start_ns_ != 0) {
           reply.read_trace_.send_start_ns_ = ReadTraceNowNanos();
         }
         if (reply.set_trace_.request_start_ns_ != 0) {
           reply.set_trace_.send_start_ns_ = SetTraceNowNanos();
         }
+#endif
         write_status =
             co_await stream.WriteAll(reply.disk_value_.network_bytes());
       }
-    } else if (reply.chunks_) {
+    } else if (reply.continuation_) {
       if (!pending_replies.empty()) {
         write_status = co_await FlushReplyBatch(stream, &pending_replies);
       }
       if (write_status.ok()) {
+#if LAVIK_ENABLE_TRACE
         if (reply.read_trace_.request_start_ns_ != 0) {
           reply.read_trace_.send_start_ns_ = ReadTraceNowNanos();
         }
         if (reply.set_trace_.request_start_ns_ != 0) {
           reply.set_trace_.send_start_ns_ = SetTraceNowNanos();
         }
-        write_status = co_await stream.WriteAll(std::span<const std::byte>(
-            reinterpret_cast<const std::byte*>(reply.encoded_.data()),
-            reply.encoded_.size()));
+#endif
+        write_status = co_await WriteReplyContinuation(
+            stream, reply.encoded_, *reply.continuation_, stall);
       }
     } else {
       write_status = co_await WriteOrBatchReply(
@@ -2153,44 +1941,16 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
           std::exchange(reply.read_trace_, {}),
           std::exchange(reply.set_trace_, {}));
     }
-    // Streamed continuation (KEYS): drain bounded chunks onto the socket.
-    // The reply header already committed the element count, so a chunk
-    // failure can only end the connection.
-    while (write_status.ok() && reply.chunks_) {
-      if (stall) {
-        stall->last_progress_ = std::chrono::steady_clock::now();
-      }
-      auto chunk = co_await (*reply.chunks_)();
-      if (!chunk.ok()) {
-        co_return chunk.status();
-      }
-      if (chunk->empty()) {
-        break;
-      }
-      // Write in bounded segments and stamp progress after each one: the
-      // watchdog then judges liveness per segment, so a client draining a
-      // large chunk at a modest rate is never mistaken for a stalled one.
-      constexpr std::size_t kWriteSegmentBytes = 256 * 1024;
-      std::span<const std::byte> remaining(
-          reinterpret_cast<const std::byte*>(chunk->data()), chunk->size());
-      while (write_status.ok() && !remaining.empty()) {
-        const std::size_t segment =
-            std::min(kWriteSegmentBytes, remaining.size());
-        write_status = co_await stream.WriteAll(remaining.first(segment));
-        remaining = remaining.subspan(segment);
-        if (stall) {
-          stall->last_progress_ = std::chrono::steady_clock::now();
-        }
-      }
-    }
+#if LAVIK_ENABLE_TRACE
     if (reply.read_trace_.request_start_ns_ != 0) {
       reply.read_trace_.send_complete_ns_ = ReadTraceNowNanos();
-      RecordReadLatency(reply.read_trace_);
+      trace::RecordReadLatency(reply.read_trace_);
     }
     if (reply.set_trace_.request_start_ns_ != 0) {
       reply.set_trace_.send_complete_ns_ = SetTraceNowNanos();
-      RecordSetLatency(reply.set_trace_);
+      trace::RecordSetLatency(reply.set_trace_);
     }
+#endif
     if (!write_status.ok()) [[unlikely]] {
       co_return write_status;
     }

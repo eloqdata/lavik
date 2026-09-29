@@ -118,6 +118,91 @@ def check_handshake_state(port, src):
         wait_export_idle(src)
 
 
+def check_handshake_dispatch(port, src):
+    # Known commands from every data family share the ordinary dispatch path,
+    # including when interleaved with connection-level capability negotiation.
+    commands = (
+        (("rEpLcOnF", "CaPa", "EoF"), b"+OK\r\n"),
+        (("sEt", "dispatch-string", "v"), b"+OK\r\n"),
+        (("hSeT", "dispatch-hash", "f", "v"), b":1\r\n"),
+        (("rPuSh", "dispatch-list", "v"), b":1\r\n"),
+        (("sAdD", "dispatch-set", "v"), b":1\r\n"),
+        (("zAdD", "dispatch-zset", "1", "v"), b":1\r\n"),
+        (("xAdD", "dispatch-stream", "1-0", "f", "v"), b"$3\r\n1-0\r\n"),
+        (("PiNg",), b"+PONG\r\n"),
+    )
+    with socket.create_connection(("127.0.0.1", port), 5) as sock:
+        with sock.makefile("rb") as file:
+            sock.sendall(b"".join(wire(*args) for args, _ in commands))
+            expected = b"".join(reply for _, reply in commands)
+            assert file.read(len(expected)) == expected
+            for name in ("PSYNCX", "REPLCONFX", "LVPSYNCX"):
+                sock.sendall(wire(name))
+                assert b"unknown command" in file.readline()
+            sock.sendall(wire("replconf"))
+            assert b"wrong number of arguments" in file.readline()
+            sock.sendall(wire("PING"))
+            assert file.readline() == b"+PONG\r\n"
+
+    # A preceding ordinary reply must flush before the terminal handoff emits
+    # its own error. No EOF capability was negotiated on this fresh socket.
+    with socket.create_connection(("127.0.0.1", port), 5) as sock:
+        with sock.makefile("rb") as file:
+            sock.sendall(wire("PING") + wire("pSyNc", "?", "-1"))
+            assert file.readline() == b"+PONG\r\n"
+            assert b"requires REPLCONF capa eof" in file.readline()
+    wait_export_idle(src)
+
+    # Cover a complete queued command and parser-owned partial input at the
+    # socket ownership boundary.
+    for name in ("pSyNc", "lVpSyNc", "lVfLoW", "lVrEcOvEr", "lVpArEnT"):
+        for trailing in (wire("PING"), b"*2\r\n$4\r\nPING\r\n"):
+            with socket.create_connection(("127.0.0.1", port), 5) as sock:
+                sock.sendall(wire(name, "?", "-1") + trailing)
+                assert sock.recv(1) == b"", (name, trailing)
+    assert src.ping()
+
+
+def check_authenticated_dispatch(root, binary):
+    with S.process(
+        binary,
+        root / "dispatch-auth",
+        "lavik",
+        workers=1,
+        extra=("--requirepass", "dispatch-secret"),
+        password="dispatch-secret",
+    ) as (_, port, _):
+        client = S.Client(port)
+        try:
+            for args in (
+                ("HSET", "unauthenticated", "f", "v"),
+                ("REPLCONF", "capa", "eof"),
+                ("PSYNC", "?", "-1"),
+                ("LVPSYNC",),
+                ("unknown-command",),
+            ):
+                S.reject(client, args, "NOAUTH")
+            S.reject(client, ("AUTH", "bad-password"), "WRONGPASS")
+            assert client.call("aUtH", "dispatch-secret") == "OK"
+            assert client.call("hSeT", "authenticated", "f", "v") == 1
+            assert client.call("RESET") == "RESET"
+            hello = client.call("hElLo", 3, "AUTH", "default", "dispatch-secret")
+            assert hello["proto"] == 3
+            assert client.call("HGET", "authenticated", "f") == "v"
+            client.call("HELLO", 2)
+            assert client.call("MULTI") == "OK"
+            assert client.call("AUTH", "dispatch-secret") == "OK"
+            assert client.call("HELLO", 2) == "QUEUED"
+            assert client.call("PING") == "QUEUED"
+            hello, pong = client.call("EXEC")
+            assert dict(zip(hello[::2], hello[1::2]))["proto"] == 2
+            assert pong == "PONG"
+            assert client.call("RESET") == "RESET"
+            S.reject(client, ("HGET", "authenticated", "f"), "NOAUTH")
+        finally:
+            client.close()
+
+
 def check_invalid_acks(port, src):
     for args in (
         ("PING", "ACK", 1, "FACK", 0),
@@ -138,6 +223,7 @@ def check_invalid_acks(port, src):
 
 
 def run(root, binary):
+    check_authenticated_dispatch(root, binary)
     os.environ["LAVIK_REDIS_EXPORT_FINAL_QUEUE_RACE"] = "1"
     with S.process(
         binary,
@@ -153,6 +239,7 @@ def run(root, binary):
     ) as (_, port, _):
         src = redis.Redis(port=port, socket_timeout=5)
         check_handshake_state(port, src)
+        check_handshake_dispatch(port, src)
         check_invalid_acks(port, src)
         src.set("last-fragment", "present")
         src.config_set("redis-export-disk-backlog-size", "8mb")

@@ -118,11 +118,22 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
       .root_incarnation_ = 0,
   };
   RecordLocation location;
-  auto written = co_await WriteRecordLocked(
-      store, db_id, key, payload, RecordKind::kValue, value_type, 0, digest,
-      tx.txid_, sequence, false, true, external, key_indirect,
-      snapshot.value_.entries_.size(), extents, &location, nullptr, &tx,
-      nullptr, nullptr, nullptr, nullptr, &partition, &identity);
+  const RecordWriteRequest record_write{
+      .key_ = key,
+      .value_ = payload,
+      .digest_ = digest,
+      .mutation_sequence_ = sequence,
+      .logical_size_ = snapshot.value_.entries_.size(),
+      .written_location_ = &location,
+      .tx_ = &tx,
+      .known_partition_ = &partition,
+      .group_ = &identity,
+      .db_id_ = db_id,
+      .value_type_ = value_type,
+      .external_ = external,
+      .key_indirect_ = key_indirect,
+  };
+  auto written = co_await WriteRecordLocked(store, record_write, extents);
   if (!written.ok()) {
     if (extents != nullptr) SpawnExtentReclaim(store, extents);
     co_return written;

@@ -1341,7 +1341,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         store, partition, db_id, key, digest, payload, kind, published_type,
         kind == RecordKind::kValue ? expire_at_ms : 0, tx,
         kind == RecordKind::kValue ? compact.entries_.size() : 0, nullptr,
-        nullptr, replication, nullptr, true, nullptr, mutation_precondition);
+        nullptr, replication, true, nullptr, mutation_precondition);
     if (!written.ok()) co_return written;
     co_return result;
   } catch (const std::bad_alloc&) {

@@ -381,7 +381,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
         store, partition, db_id, key, digest, *compact_payload,
         RecordKind::kValue, value_type, expire_at_ms,
         outer_transaction ? tx : nullptr, field_count, nullptr, nullptr,
-        replication, nullptr, true, nullptr, mutation_precondition);
+        replication, true, nullptr, mutation_precondition);
   }
   auto decision = PrepareGroupedDecision(*tx);
   if (!decision.ok()) co_return decision.status();
@@ -520,7 +520,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   const auto appended = co_await AppendLocked(
       store, partition, db_id, key, digest, *root_payload, RecordKind::kValue,
       value_type, expire_at_ms, tx, field_count, nullptr, nullptr, replication,
-      nullptr, true, nullptr, mutation_precondition, &mutation);
+      true, nullptr, mutation_precondition, &mutation);
   if (!appended.ok()) {
     if (store.write_failed_) {
       // A root may already be staged/published on a fail-stopped path. Its
