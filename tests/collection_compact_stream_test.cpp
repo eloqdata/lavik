@@ -22,11 +22,48 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "lavik/storage/detail/collection_ingest_budget.h"
 #include "lavik/storage/detail/hash_codec.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
 
 namespace lavik::storage {
 namespace {
+
+TEST(CollectionIngestBudget, SmallFieldsNeedMoreMetadataForEqualPayload) {
+  constexpr std::size_t bytes = 100 * 1024 * 1024;
+  auto small =
+      CollectionIngestBuildBytes(ValueType::kHash, 0, 0, bytes, bytes / 128);
+  auto large =
+      CollectionIngestBuildBytes(ValueType::kHash, 0, 0, bytes, bytes / 1024);
+  ASSERT_TRUE(small.ok());
+  ASSERT_TRUE(large.ok());
+  EXPECT_GT(*small, *large);
+}
+
+TEST(CollectionIngestBudget, LargeStringsMoveButSortedSetMembersAreCopied) {
+  constexpr std::size_t bytes = 256 * 1024 * 1024;
+  auto hash = CollectionIngestBuildBytes(ValueType::kHash, 0, 0, bytes, 4);
+  auto sorted =
+      CollectionIngestBuildBytes(ValueType::kSortedSet, 0, 0, bytes, 4);
+  ASSERT_TRUE(hash.ok());
+  ASSERT_TRUE(sorted.ok());
+  EXPECT_LT(*hash, bytes);
+  EXPECT_GT(*sorted, bytes);
+  auto old =
+      CollectionIngestBuildBytes(ValueType::kHash, 0, 0, bytes, 4, bytes, 4);
+  ASSERT_TRUE(old.ok());
+  EXPECT_GT(*old, *hash + bytes);
+}
+
+TEST(CollectionIngestBudget, RejectsOverflowInsteadOfWrappingAdmission) {
+  EXPECT_FALSE(
+      CollectionIngestBuildBytes(ValueType::kHash, SIZE_MAX, 1, 1, 1).ok());
+  EXPECT_FALSE(
+      CollectionIngestBuildBytes(ValueType::kSet, 0, SIZE_MAX, 1, 1).ok());
+  EXPECT_FALSE(
+      CollectionIngestBuildBytes(ValueType::kSortedSet, 0, 0, 1, SIZE_MAX / 2)
+          .ok());
+}
 
 TEST(CollectionCompactStream, StringSegmentsEmitRawBytesWithoutFraming) {
   CollectionPage first{.value_type_ = ValueType::kString,

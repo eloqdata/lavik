@@ -25,6 +25,7 @@
 #include <variant>
 #include <vector>
 
+#include "absl/container/node_hash_map.h"
 #include "absl/strings/str_cat.h"
 #include "lavik/memory.h"
 #include "lavik/storage/detail/stream_records.h"
@@ -1887,9 +1888,7 @@ class CollectionInput {
   }
   absl::Status Remember(std::string_view member, Reader origin) {
     const auto digest = storage::ComputeDigest(member).value_;
-    const auto range = identities_.equal_range(digest);
-    for (auto it = range.first; it != range.second; ++it) {
-      Reader original = it->second;
+    auto equal = [&](Reader original) -> absl::StatusOr<bool> {
       Reader measure = original;
       auto size = MeasureString(&measure);
       if (!size.ok()) return size.status();
@@ -1898,14 +1897,33 @@ class CollectionInput {
       original.ResetExpandedAccounting();
       auto old = ReadString(&original);
       if (!old.ok()) return old.status();
-      if (*old == member) return Bad("duplicate collection member or field");
+      return *old == member;
+    };
+    const auto first = identities_.find(digest);
+    if (first != identities_.end()) {
+      auto same = equal(first->second);
+      if (!same.ok()) return same.status();
+      if (*same) return Bad("duplicate collection member or field");
+      // Digest collisions remain exact checks against the original immutable
+      // RDB input. The secondary tree stays empty for distinct digests, so a
+      // large collection does not pay an ordered lookup for every field.
+      const auto range = collided_identities_.equal_range(digest);
+      for (auto it = range.first; it != range.second; ++it) {
+        same = equal(it->second);
+        if (!same.ok()) return same.status();
+        if (*same) return Bad("duplicate collection member or field");
+      }
     }
     // Keep only digest+borrowed input position, not another copy of every
-    // member. A collision re-decodes the original string before comparison.
+    // member. The budget covers a primary hash node/slot or a collision node,
+    // including capacity growth of the hash table.
     constexpr std::size_t node_budget = sizeof(Reader) + 8 * sizeof(void*) + 32;
     auto reservation = TryReserveMemory(node_budget);
     if (!reservation) return Oom();
-    identities_.emplace(digest, origin);
+    if (first == identities_.end())
+      identities_.emplace(digest, origin);
+    else
+      collided_identities_.emplace(digest, origin);
     identities_charge_.Resize(identities_charge_.bytes() + node_budget);
     return absl::OkStatus();
   }
@@ -1999,7 +2017,8 @@ class CollectionInput {
   }
   std::unique_ptr<StreamInput> stream_;
   RetainedMemoryCharge identities_charge_;
-  std::multimap<std::uint64_t, Reader> identities_;
+  absl::node_hash_map<std::uint64_t, Reader> identities_;
+  std::multimap<std::uint64_t, Reader> collided_identities_;
   std::optional<unsigned> owner_;
   std::uint8_t type_;
   bool plain_;

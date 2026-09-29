@@ -366,11 +366,16 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
     HashValue after;
     std::vector<HashGroupId> touched;
     if (previous) {
+      // Each import batch may contain thousands of fields for the same group.
+      // A linear search through the groups already loaded makes large Hash/Set
+      // RESTORE batches quadratic even though the routing directory is
+      // resident. This set is scoped to the bounded ingest batch; keep touched
+      // in its original order for the grouped writer below.
+      absl::flat_hash_set<std::pair<std::uint64_t, std::uint8_t>> seen;
       for (const auto& field : incoming.entries_) {
         const auto* route = previous->directory().Find(field.field_);
         if (!route) co_return absl::DataLossError("replica Hash route missing");
-        if (std::find(touched.begin(), touched.end(), route->id_) !=
-            touched.end())
+        if (!seen.emplace(route->id_.prefix_, route->id_.bits_).second)
           continue;
         touched.push_back(route->id_);
         auto group = co_await LoadHashGroupSnapshot(

@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/storage/detail/collection_ingest_budget.h"
 #include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
@@ -48,8 +49,11 @@ absl::Status ReserveIngestVector(std::vector<T>& values, std::size_t required,
     RecordMemoryRejection();
     return absl::ResourceExhaustedError("OOM collection ingest metadata");
   }
+  const auto old_bytes = values.capacity() * sizeof(T);
   values.reserve(capacity);
-  charge.Resize(charge.bytes() + bytes);
+  // Admission covers the reallocation peak; retained accounting owns only
+  // the replacement buffer after reserve has freed the old allocation.
+  charge.Resize(charge.bytes() - old_bytes + values.capacity() * sizeof(T));
   return absl::OkStatus();
 }
 
@@ -300,26 +304,82 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     std::vector<RetainedMemoryCharge> input_charges;
     CollectionPage merged{.value_type_ = type};
     std::uint64_t merged_bytes = 0;
-    // A Sorted Set's first page builds both ordered and member directories.
-    // Repeating indexed ZADD for each small ingest batch can touch most member
-    // leaves again on every pass. Both directories need substantially more
-    // admitted scratch than the input bytes. Leave 31 parts of available
-    // retained headroom for page plans, the member index, and other owners;
-    // the hard cap bounds the input retained until the one-time build.
-    constexpr std::uint64_t kSortedSetBuildBytes = 24ULL * 1024 * 1024;
-    constexpr std::uint64_t kOtherBatchBytes = 1024ULL * 1024;
-    std::uint64_t batch_limit = kOtherBatchBytes;
-    if (type == ValueType::kSortedSet) {
-      const auto memory = GetWorkerMemoryStats(store.worker_->id());
-      const auto used = memory.retained_bytes_ +
-                        memory.admission_pending_bytes_ +
-                        memory.fullsync_reserved_bytes_;
-      const auto available = used >= memory.retained_limit_bytes_
-                                 ? 0
-                                 : memory.retained_limit_bytes_ - used;
-      batch_limit =
-          std::clamp(available / 32, kOtherBatchBytes, kSortedSetBuildBytes);
-    }
+    // Recheck admission for each decoded page. Input strings and vector
+    // capacities are already charged; reserve space for the build that would
+    // follow this merge, not a fixed fraction of startup headroom. The probe
+    // is a batching decision, not a transferable reservation: each downstream
+    // allocator still admits its own work after coroutine suspension.
+    auto can_merge = [&](const CollectionPage& page, std::uint64_t bytes) {
+      const auto current =
+          partition.grouped_objects_[db_id].CurrentForMutation(key);
+      std::uint64_t previous_bytes = 0;
+      std::uint64_t previous_items = 0;
+      std::size_t directory_bytes = 0;
+      if (state->applied_count_ != 0 && current) {
+        // Hash/Set batches may route to every existing leaf. ZSet updates may
+        // touch both graphs. Budget the old population conservatively; List
+        // and Stream append only load their last two groups.
+        if (!current->is_ordered()) {
+          previous_bytes = current->directory().total_group_bytes();
+          previous_items = current->directory().root().field_count_;
+        } else {
+          const auto& directory = current->ordered_directory();
+          // Even an append touching just two tail pages rebuilds the ordered
+          // directory. Its new owner is admitted while the old owner remains
+          // live; directory construction also retains a candidate vector.
+          directory_bytes =
+              SaturatingIngestMultiply(directory.RetainedBytes(), 2);
+          if (type == ValueType::kSortedSet) {
+            previous_bytes = directory.total_group_bytes();
+            previous_items = directory.root().item_count_;
+          } else {
+            const auto& groups = directory.groups();
+            for (std::size_t i = groups.size() > 2 ? groups.size() - 2 : 0;
+                 i < groups.size(); ++i) {
+              previous_bytes += groups[i].encoded_bytes_;
+              previous_items += groups[i].item_count_;
+            }
+          }
+        }
+      }
+      const auto count = merged.size() + page.size();
+      const auto headroom = CollectionIngestBuildBytes(
+          type, merged_bytes, merged.size(), bytes, page.size(), previous_bytes,
+          previous_items);
+      if (!headroom.ok()) return false;
+      // A growing destination and charge vector temporarily own both old and
+      // new buffers. Their old capacities are in merge_charge already.
+      auto vector_growth = [&](const auto& values, std::size_t required) {
+        using Item = typename std::decay_t<decltype(values)>::value_type;
+        if (required <= values.capacity()) return std::size_t{0};
+        return SaturatingIngestMultiply(
+            std::max(required, SaturatingIngestMultiply(values.capacity(), 2)),
+            sizeof(Item));
+      };
+      std::size_t growth = 0;
+      if (type == ValueType::kHash)
+        growth = vector_growth(merged.fields_, count);
+      else if (type == ValueType::kSortedSet)
+        growth = vector_growth(merged.scored_members_, count);
+      else
+        growth = vector_growth(merged.elements_, count);
+      growth = SaturatingIngestAdd(
+          growth, vector_growth(input_charges, input_charges.size() + 1));
+      // Root publication reserves both predecessor retirement and rollback
+      // of the replacement. Match CollectGroupedRetirements' receipt width;
+      // these allowances coexist with the directory and input batch. REPLACE
+      // also owns the original graph before its first imported page.
+      const auto retirement_records =
+          SaturatingIngestAdd(count, current ? current->record_count() : 0);
+      constexpr auto retirement_width =
+          4 * sizeof(RetiredRecord) + sizeof(TxShardWrites::Retired);
+      const auto retirement_bytes =
+          SaturatingIngestMultiply(retirement_records, 2 * retirement_width);
+      const auto required =
+          SaturatingIngestAdd(SaturatingIngestAdd(*headroom, directory_bytes),
+                              SaturatingIngestAdd(growth, retirement_bytes));
+      return required != SIZE_MAX && TryReserveMemory(required).has_value();
+    };
     bool first_write = true;
     auto flush = [&]() -> Task<absl::Status> {
       if (merged.size() == 0) co_return absl::OkStatus();
@@ -416,9 +476,11 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       }
       done = page->done_;
       if (page->size() == 0) continue;
-      if (merged.size() != 0 && *bytes > batch_limit - merged_bytes) {
+      bool fits = can_merge(*page, *bytes);
+      if (!fits && merged.size() != 0) {
         auto written = co_await flush();
         if (!written.ok()) co_return written;
+        fits = can_merge(*page, *bytes);
       }
       auto append = [&](auto& destination, auto& source) {
         auto admitted = ReserveIngestVector(
@@ -439,7 +501,10 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       if (!admitted.ok()) co_return admitted;
       input_charges.push_back(std::move(page->retained_charge_));
       merged_bytes += *bytes;
-      if (merged_bytes >= batch_limit || done) {
+      // A page can contain one indivisible large element. Do not keep growing
+      // a batch that fails the probe; let the writer's concrete admission
+      // decide whether that one page can be processed, or return OOM.
+      if (!fits || done) {
         auto written = co_await flush();
         if (!written.ok()) co_return written;
       }
