@@ -642,6 +642,12 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
 
 Task<absl::Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
     WorkerStore& store, const RelocationDurabilityFence& fence) {
+  // Grouped commits also use this fence. A fixed millisecond poll adds that
+  // delay even when a small flush finishes in tens of microseconds, and
+  // serial replay pays it again for each data/decision boundary. Check early
+  // after requesting the flush, then back off to the existing polling rate
+  // for slow I/O. The durable-byte/epoch and failure checks remain the gate.
+  auto poll_delay = std::chrono::microseconds(50);
   while (true) {
     co_await store.store_state_mutex_.Lock();
     bool durable = false;
@@ -676,11 +682,11 @@ Task<absl::Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
     if (durable) {
       co_return absl::OkStatus();
     }
-    absl::Status waited =
-        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
+    absl::Status waited = co_await bycorf::SleepFor(*store.worker_, poll_delay);
     if (!waited.ok()) {
       co_return waited;
     }
+    poll_delay = std::min(poll_delay * 2, std::chrono::microseconds(1000));
   }
 }
 
