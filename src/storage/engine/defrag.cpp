@@ -676,11 +676,14 @@ Task<absl::Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
     if (durable) {
       co_return absl::OkStatus();
     }
-    absl::Status waited =
-        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
-    if (!waited.ok()) {
-      co_return waited;
-    }
+    if (store.worker_->stop_requested())
+      co_return absl::CancelledError("worker stopped before durability fence");
+    // Unlock only enqueues another coroutine; it does not run it inline.
+    // No suspension separates the predicate above from registering this
+    // owner-local wait, so a flush cannot notify in between and get lost.
+    // A wake may describe another block or an older snapshot of this block:
+    // always recheck the full fence and failure state before returning.
+    co_await store.durability_progress_.Wait();
   }
 }
 

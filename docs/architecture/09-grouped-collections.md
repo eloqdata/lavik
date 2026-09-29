@@ -129,8 +129,10 @@ independent transaction can publish it, and snapshot/undo views retain their
 own historical root expiry. Immediate expiration uses the ordinary
 tombstone/graph retirement path.
 
-Views share unchanged physical index pages across mutations. Hash routing
-nodes are persistent; the ordered rank directory owns admitted metadata
+Views share unchanged physical index pages across mutations. The physical
+identity trie skips common prefix bits and retains complete identities in its
+leaves; inserting outside a skipped prefix adds a branch without changing
+pinned older views. Hash routing nodes are persistent; the ordered rank directory owns admitted metadata
 vectors. Local page replacements copy the vectors and update aggregate ranks;
 topology changes rebuild and validate the complete chain. Routing
 and physical-index node references, including final destruction, remain on

@@ -312,10 +312,19 @@ absl::Status ValidateLocation(const HashGroupLocation& group,
 // Index pages cap the cost of one copy-on-write mutation. The trie uses the
 // complete 72-bit group identity, not a potentially colliding runtime digest;
 // a path has a hard bound and lookup never walks earlier object versions.
+// Skip common identity bits: sequential ordered-page ids otherwise create
+// dozens of unary ancestors which every small mutation must allocate/copy.
 constexpr std::size_t kGroupIndexPageEntries = 64;
 bool IdentityBit(HashGroupId id, unsigned depth) {
   return depth < 64 ? ((id.prefix_ >> (63 - depth)) & 1)
                     : ((id.bits_ >> (71 - depth)) & 1);
+}
+
+unsigned CommonIdentityBits(HashGroupId left, HashGroupId right) {
+  const auto prefixes = left.prefix_ ^ right.prefix_;
+  if (prefixes != 0) return std::countl_zero(prefixes);
+  return 64 +
+         std::countl_zero(static_cast<std::uint8_t>(left.bits_ ^ right.bits_));
 }
 
 struct GroupIndexPage {
@@ -333,27 +342,35 @@ struct GroupIndexNode {
   LocalSharedPtr<const GroupIndexPage> page_;
   LocalSharedPtr<const GroupIndexNode> children_[2];
   std::size_t size_ = 0;
+  HashGroupId representative_;
+  unsigned branch_depth_ = 0;
 };
 
 using NodeHandle = LocalSharedPtr<const GroupIndexNode>;
 
 absl::StatusOr<NodeHandle> BuildPhysical(
-    std::span<const HashGroupLocation> records, unsigned depth,
+    std::span<const HashGroupLocation> records,
     const std::shared_ptr<ScanHashMapEntryArena>& arena) {
   if (records.empty()) return NodeHandle{};
   auto node = AllocateLocalObject<GroupIndexNode>(arena);
   if (!node.ok()) return node.status();
   (*node)->size_ = records.size();
+  (*node)->representative_ = records.front().id_;
   if (records.size() > kGroupIndexPageEntries) {
+    // Records are sorted by the full identity. Their extremes bound the
+    // common prefix, including the eight prefix-length bits of Hash ids.
+    const auto depth =
+        CommonIdentityBits(records.front().id_, records.back().id_);
     if (depth == 72)
       return absl::DataLossError("duplicate physical group identity");
+    (*node)->branch_depth_ = depth;
     auto middle = std::partition_point(
         records.begin(), records.end(),
         [depth](const auto& group) { return !IdentityBit(group.id_, depth); });
     const auto n = static_cast<std::size_t>(middle - records.begin());
     for (unsigned branch = 0; branch != 2; ++branch) {
-      auto child = BuildPhysical(branch ? records.subspan(n) : records.first(n),
-                                 depth + 1, arena);
+      auto child =
+          BuildPhysical(branch ? records.subspan(n) : records.first(n), arena);
       if (!child.ok()) return child.status();
       (*node)->children_[branch] = std::move(*child);
     }
@@ -410,14 +427,14 @@ const GroupIndexPage* FindPage(const NodeHandle& root, HashGroupId id) {
   // The immutable root keeps the whole path alive during this non-suspending
   // lookup; walking borrowed pointers need not touch even the local counts.
   const auto* node = root.get();
-  unsigned depth = 0;
   while (node && !node->page_)
-    node = node->children_[IdentityBit(id, depth++)].get();
+    node = node->children_[IdentityBit(id, node->branch_depth_)].get();
   return node ? node->page_.get() : nullptr;
 }
 
 std::shared_ptr<const std::vector<ExtentRef>> ManifestFor(
     const GroupIndexPage& page, HashGroupId id) {
+  if (page.extents_.empty()) return nullptr;
   const auto bytes = GroupKey(id);
   const std::string_view key(bytes.data(), bytes.size());
   const auto* entry = page.extents_.Find(ComputeDigest(key), key);
@@ -426,44 +443,64 @@ std::shared_ptr<const std::vector<ExtentRef>> ManifestFor(
 
 absl::StatusOr<NodeHandle> UpdatePhysical(
     const NodeHandle& node, std::span<const HashGroupLocation> changed,
-    unsigned depth, const std::shared_ptr<ScanHashMapEntryArena>& arena) {
+    const std::shared_ptr<ScanHashMapEntryArena>& arena) {
   if (changed.empty()) return node;
-  if (!node) return BuildPhysical(changed, depth, arena);
+  if (!node) return BuildPhysical(changed, arena);
   if (node->page_) {
-    std::map<HashGroupId, HashGroupLocation> records;
     const auto& page = *node->page_;
+    // Both inputs have unique, sorted full identities. Merge directly rather
+    // than allocating a map node for every unchanged location on each write.
+    // Replaced locations need no old lookup or manifest reference at all.
+    std::vector<HashGroupLocation> merged;
+    merged.reserve(page.ids_.size() + changed.size());
+    std::size_t next = 0;
     for (std::size_t i = 0; i < page.ids_.size(); ++i) {
       const auto id = page.ids_[i];
+      while (next < changed.size() && changed[next].id_ < id)
+        merged.push_back(changed[next++]);
+      if (next < changed.size() && changed[next].id_ == id) {
+        merged.push_back(changed[next++]);
+        continue;
+      }
       const auto bytes = GroupKey(id);
       const std::string_view key(bytes.data(), bytes.size());
       const auto* entry = page.locations_.Find(ComputeDigest(key), key);
       // Epoch/owner remain the physical block's authority. A compact entry
       // is copied byte-for-byte through this temporary location; these two
       // fields do not enter the compact destination RecordIndex.
-      records.emplace(
-          id, HashGroupLocation{.id_ = id,
-                                .location_ = RecordIndexEntryPolicy::Load(
-                                    entry->value_, nullptr, 1, 0),
-                                .extents_ = ManifestFor(page, id),
-                                .retired_ = ((page.retired_ >> i) & 1) != 0});
+      merged.push_back({.id_ = id,
+                        .location_ = RecordIndexEntryPolicy::Load(
+                            entry->value_, nullptr, 1, 0),
+                        .extents_ = ManifestFor(page, id),
+                        .retired_ = ((page.retired_ >> i) & 1) != 0});
     }
-    for (const auto& record : changed)
-      records.insert_or_assign(record.id_, record);
-    std::vector<HashGroupLocation> merged;
-    merged.reserve(records.size());
-    for (auto& [id, record] : records) merged.push_back(std::move(record));
-    return BuildPhysical(merged, depth, arena);
+    merged.insert(merged.end(), changed.begin() + next, changed.end());
+    return BuildPhysical(merged, arena);
   }
   auto replacement = AllocateLocalObject<GroupIndexNode>(arena);
   if (!replacement.ok()) return replacement.status();
+  // An insertion can diverge inside a skipped prefix. Wrap the existing
+  // subtree at that earlier bit, sharing it unchanged on its old branch;
+  // descend into its children only when reaching its actual branch bit.
+  const auto depth =
+      std::min({node->branch_depth_,
+                CommonIdentityBits(node->representative_, changed.front().id_),
+                CommonIdentityBits(node->representative_, changed.back().id_)});
+  (*replacement)->representative_ = node->representative_;
+  (*replacement)->branch_depth_ = depth;
   const auto middle = std::partition_point(
       changed.begin(), changed.end(),
       [depth](const auto& group) { return !IdentityBit(group.id_, depth); });
   const auto n = static_cast<std::size_t>(middle - changed.begin());
   for (unsigned branch = 0; branch != 2; ++branch) {
-    auto child = UpdatePhysical(node->children_[branch],
-                                branch ? changed.subspan(n) : changed.first(n),
-                                depth + 1, arena);
+    const auto& previous =
+        depth == node->branch_depth_
+            ? node->children_[branch]
+            : (branch == IdentityBit(node->representative_, depth)
+                   ? node
+                   : NodeHandle{});
+    auto child = UpdatePhysical(
+        previous, branch ? changed.subspan(n) : changed.first(n), arena);
     if (!child.ok()) return child.status();
     (*replacement)->children_[branch] = std::move(*child);
     if ((*replacement)->children_[branch]) {
@@ -563,7 +600,7 @@ absl::Status BuildStringPhysical(GroupedHashPhysicalState& output,
       } else
         return absl::DataLossError("missing String index segment");
     }
-    auto owner = BuildPhysical(records, 0, output.arena_);
+    auto owner = BuildPhysical(records, output.arena_);
     if (!owner.ok()) return owner.status();
     auto page = AllocateLocalObject<Page>(output.arena_);
     if (!page.ok()) return page.status();
@@ -590,9 +627,8 @@ absl::Status BuildPhysicalState(GroupedHashPhysicalState& output,
                               changed.empty() ? 0 : changed.back().id_.prefix_);
     return BuildStringPhysical(output, previous, changed, count);
   }
-  auto root = previous
-                  ? UpdatePhysical(previous->root_, changed, 0, output.arena_)
-                  : BuildPhysical(changed, 0, output.arena_);
+  auto root = previous ? UpdatePhysical(previous->root_, changed, output.arena_)
+                       : BuildPhysical(changed, output.arena_);
   if (!root.ok()) return root.status();
   output.root_ = std::move(*root);
   return absl::OkStatus();

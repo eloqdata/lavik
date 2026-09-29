@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <future>
+
 #include "grouped_write_e2e_support.h"
 #include "lavik/storage/detail/collection_limits.h"
 
@@ -43,6 +45,57 @@ TEST(GroupedStreamE2e, SmallStreamKeepsCompactStorage) {
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   EXPECT_TRUE(disk.Auxiliaries("small").empty());
+}
+
+TEST(GroupedStreamE2e, ConcurrentDurabilityWaitersRecheckPartialFlushes) {
+  PrivateDisk disk;
+  disk.PreserveOnFailure();
+  constexpr unsigned kStreams = 8;
+  constexpr unsigned kEntries = 64;
+  {
+    // Pause the first immutable flush snapshot while other keys append to
+    // the shared transaction stream. Its completion must wake every waiter,
+    // but only fences covered by that snapshot may finish. Later tails must
+    // request another flush and remain wakeable through clean shutdown.
+    Server server(disk, 3, {}, {}, false, 2, "1G", {}, {}, 100);
+    server.PreserveOnFailure();
+    std::vector<std::future<void>> writers;
+    for (unsigned stream = 0; stream < kStreams; ++stream) {
+      writers.push_back(std::async(std::launch::async, [&, stream] {
+        Client client(server.port());
+        const auto key = "flush-stream-" + std::to_string(stream);
+        for (unsigned entry = 1; entry <= kEntries; ++entry) {
+          const auto id = std::to_string(entry) + "-0";
+          const std::string value(entry == 1 ? 17000 : 512, 'a' + stream);
+          const auto reply = client.Command({"XADD", key, id, "f", value});
+          Check(reply.kind_ == '$' && reply.text_ == id,
+                "concurrent Stream append did not complete");
+        }
+        client.Durable();
+      }));
+    }
+    for (auto& writer : writers) writer.get();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  recovered.PreserveOnFailure();
+  Client client(recovered.port());
+  for (unsigned stream = 0; stream < kStreams; ++stream) {
+    const auto key = "flush-stream-" + std::to_string(stream);
+    const auto entries = client.Command({"XRANGE", key, "-", "+"});
+    ASSERT_EQ(entries.kind_, '*') << entries.text_;
+    ASSERT_EQ(entries.items_.size(), kEntries) << key;
+    for (unsigned entry = 1; entry <= kEntries; ++entry) {
+      const auto& record = entries.items_[entry - 1];
+      ASSERT_EQ(record.items_.size(), 2);
+      EXPECT_EQ(record.items_[0].text_, std::to_string(entry) + "-0");
+      ASSERT_EQ(record.items_[1].items_.size(), 2);
+      EXPECT_EQ(record.items_[1].items_[0].text_, "f");
+      EXPECT_EQ(record.items_[1].items_[1].text_,
+                std::string(entry == 1 ? 17000 : 512, 'a' + stream));
+    }
+  }
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
 TEST(GroupedStreamE2e, PromotesAtSharedSizeBoundaryAndRecovers) {
