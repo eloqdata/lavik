@@ -1920,6 +1920,9 @@ class StorageEngine::Impl {
     // block accounting. Release it across block allocation and long I/O;
     // callers that do so must revalidate any state observed before the wait.
     AsyncMutex store_state_mutex_;
+    // Owner-local completion hint. A wake never proves durability: waiters
+    // recheck their block/epoch/byte boundary under store_state_mutex_.
+    AsyncNotification durability_progress_;
     std::deque<std::uint64_t> flush_queue_;
     std::deque<std::uint64_t> defrag_queue_;
     std::vector<std::size_t> home_devices_;
@@ -3013,7 +3016,33 @@ class StorageEngine::Impl {
     // Publish the monitor notification last. Its acquire load then proves the
     // immediate request/replication fence was already visible before worker
     // zero begins the asynchronous NodeControl barrier.
-    runtime_failure_latched_.store(true, std::memory_order_release);
+    const bool already_failed =
+        runtime_failure_latched_.exchange(true, std::memory_order_acq_rel);
+    const auto& current = bycorf::ThisWorker();
+    if (!already_failed && current.cross_core_ != nullptr) {
+      // Failure can originate on a different data/control worker. Keep each
+      // notification on its owner, just like the normal flush completion.
+      // Offline callers have no queued durability waits; PeriodicFlush also
+      // observes the latch for calls originating outside the runtime.
+      for (unsigned owner = 0; owner < worker_count_; ++owner) {
+        bycorf::PostNotification(
+            current.cross_core_, owner,
+            bycorf::RemoteNotification{
+                .context_ = this,
+                .value_ = owner,
+                .run_fn_ =
+                    [](void* context, std::uint64_t owner) noexcept {
+                      auto& engine = *static_cast<Impl*>(context);
+                      if (owner < engine.stores_.size() &&
+                          engine.stores_[owner]) {
+                        auto& store = *engine.stores_[owner];
+                        if (store.worker_ != nullptr)
+                          store.durability_progress_.NotifyAll(*store.worker_);
+                      }
+                    },
+            });
+      }
+    }
   }
   bool RuntimeFailureLatched() const noexcept {
     return runtime_failure_latched_.load(std::memory_order_acquire);

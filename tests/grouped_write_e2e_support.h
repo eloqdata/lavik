@@ -344,7 +344,8 @@ class Server {
          std::string_view crash = {}, std::string_view fail_aux = {},
          bool pause_handoff = false, unsigned fail_aux_nth = 2,
          std::string_view max_memory = "1G", std::string_view load_rdb = {},
-         std::string_view max_memory_clients = {}) {
+         std::string_view max_memory_clients = {},
+         unsigned flush_pause_ms = 0) {
     const int socket = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     Check(socket >= 0, "port socket failed");
     sockaddr_in address{.sin_family = AF_INET,
@@ -366,6 +367,10 @@ class Server {
       ::unsetenv("LAVIK_CRASH_POINT");
       ::unsetenv("LAVIK_FAIL_GROUP_AUX_KEY");
       ::unsetenv("LAVIK_FAIL_GROUP_BATCH_KEY");
+      ::unsetenv("LAVIK_FLUSH_SNAPSHOT_PAUSE_MS");
+      if (flush_pause_ms != 0)
+        ::setenv("LAVIK_FLUSH_SNAPSHOT_PAUSE_MS",
+                 std::to_string(flush_pause_ms).c_str(), 1);
       if (pause_handoff) {
         ::setenv("LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS", "6000",
                  1);

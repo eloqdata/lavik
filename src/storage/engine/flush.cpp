@@ -19,6 +19,10 @@
 namespace lavik::storage {
 
 Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
+  struct WakeOnExit {
+    WorkerStore* store_;
+    ~WakeOnExit() { store_->durability_progress_.NotifyAll(*store_->worker_); }
+  } wake_on_exit{store};
   const auto interval = std::chrono::milliseconds(options_.flush_max_ms_);
   while (!store->worker_->stop_requested()) {
     absl::Status status = co_await bycorf::SleepFor(*store->worker_, interval);
@@ -29,6 +33,10 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
     if (store->worker_->stop_requested()) {
       break;
     }
+    // The process failure latch can also be set by a non-runtime caller.
+    // Normal progress is notified by I/O completion, without a timer wait.
+    if (store->write_failed_ || RuntimeFailureLatched())
+      store->durability_progress_.NotifyAll(*store->worker_);
 
     if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
       status = co_await FlushWorkerForShutdown(store);
@@ -183,12 +191,16 @@ void StorageEngine::Impl::RequestFlush(WorkerStore& store,
 Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
   struct FlushRunGuard {
     Impl* engine_ = nullptr;
+    WorkerStore* store_ = nullptr;
     ~FlushRunGuard() {
+      // Covers I/O failure, canceled shutdown, invalidated/reused blocks and
+      // an empty queue. Never leave a fence asleep when its flusher exits.
+      store_->durability_progress_.NotifyAll(*store_->worker_);
       engine_->space_reclaim_generation_.fetch_add(1,
                                                    std::memory_order_release);
       engine_->active_flushes_.fetch_sub(1, std::memory_order_acq_rel);
     }
-  } flush_run_guard{this};
+  } flush_run_guard{this, store};
 
   struct PendingFlush {
     std::uint64_t block_id_ = 0;
@@ -540,6 +552,11 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     }
     state->flush_in_progress_ = false;
     state->flush_queued_ = false;
+
+    // Publish progress only after both the data and header are durable and
+    // the staging boundary has advanced. A partial snapshot wakes waiters
+    // to request its remaining tail; it never satisfies that tail's fence.
+    store->durability_progress_.NotifyAll(*store->worker_);
 
     // RequestFlush coalesces requests while an earlier snapshot is in
     // flight. If rollover or shutdown sealed the block during that write,

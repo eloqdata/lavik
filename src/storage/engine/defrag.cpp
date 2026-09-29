@@ -642,12 +642,6 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
 
 Task<absl::Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
     WorkerStore& store, const RelocationDurabilityFence& fence) {
-  // Grouped commits also use this fence. A fixed millisecond poll adds that
-  // delay even when a small flush finishes in tens of microseconds, and
-  // serial replay pays it again for each data/decision boundary. Check early
-  // after requesting the flush, then back off to the existing polling rate
-  // for slow I/O. The durable-byte/epoch and failure checks remain the gate.
-  auto poll_delay = std::chrono::microseconds(50);
   while (true) {
     co_await store.store_state_mutex_.Lock();
     bool durable = false;
@@ -682,11 +676,14 @@ Task<absl::Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
     if (durable) {
       co_return absl::OkStatus();
     }
-    absl::Status waited = co_await bycorf::SleepFor(*store.worker_, poll_delay);
-    if (!waited.ok()) {
-      co_return waited;
-    }
-    poll_delay = std::min(poll_delay * 2, std::chrono::microseconds(1000));
+    if (store.worker_->stop_requested())
+      co_return absl::CancelledError("worker stopped before durability fence");
+    // Unlock only enqueues another coroutine; it does not run it inline.
+    // No suspension separates the predicate above from registering this
+    // owner-local wait, so a flush cannot notify in between and get lost.
+    // A wake may describe another block or an older snapshot of this block:
+    // always recheck the full fence and failure state before returning.
+    co_await store.durability_progress_.Wait();
   }
 }
 
