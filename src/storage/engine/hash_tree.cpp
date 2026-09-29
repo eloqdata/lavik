@@ -337,6 +337,86 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       }
     });
 
+    if (grouped != nullptr && operation.fields_.size() == 1 &&
+        (operation.kind_ == HashOperationKind::kGet ||
+         operation.kind_ == HashOperationKind::kExists ||
+         operation.kind_ == HashOperationKind::kStringLength)) {
+      const std::string_view field = operation.fields_.front();
+      const auto* route = grouped->directory().Find(field);
+      if (route == nullptr)
+        co_return absl::DataLossError("missing Hash field route");
+      auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
+                                                  digest, grouped, route->id_);
+      if (!loaded.ok()) {
+        if (read_epoch_changed()) co_return HashResult{};
+        co_return loaded.status();
+      }
+      const auto bytes = loaded->loaded_.value();
+      const std::string_view payload(
+          reinterpret_cast<const char*>(bytes.data()), bytes.size());
+      std::optional<std::string_view> matched;
+      if (loaded->field_count_ == 0) {
+        if (payload.size() != kHashGroupHeaderBytes)
+          co_return absl::DataLossError("nonempty Hash group has zero fields");
+      } else {
+        if (payload.size() == kHashGroupHeaderBytes)
+          co_return absl::DataLossError("Hash group payload is missing");
+        auto reader =
+            HashValueReader::Open(payload.substr(kHashGroupHeaderBytes));
+        if (!reader.ok())
+          co_return absl::DataLossError(reader.status().message());
+        if (reader->size() != loaded->field_count_)
+          co_return absl::DataLossError(
+              "Hash group inner count disagrees with envelope");
+        // The physical record checksum and envelope were verified by the
+        // loader. Walk the encoded entries to check framing and find the one
+        // field, without copying or hashing every unrelated field and value.
+        // Complete duplicate and route validation remains on full decodes.
+        for (std::size_t i = 0; i < reader->size(); ++i) {
+          auto entry = reader->Next();
+          if (!entry.ok())
+            co_return absl::DataLossError(entry.status().message());
+          if (entry->field_ != field) continue;
+          if (matched.has_value())
+            co_return absl::DataLossError("duplicate Hash field in group");
+          if (!route->id_.contains(
+                  ComputeDigest(entry->field_,
+                                grouped->directory().root().seed_)
+                      .value_))
+            co_return absl::DataLossError("Hash field outside its group route");
+          matched = entry->value_;
+        }
+      }
+      if (operation.kind_ == HashOperationKind::kExists) {
+        result.integer_ = matched.has_value();
+      } else if (operation.kind_ == HashOperationKind::kStringLength) {
+        result.integer_ = matched ? matched->size() : 0;
+      } else {
+        std::size_t retained =
+            sizeof(HashResult) + sizeof(std::optional<std::string>);
+        if (matched)
+          retained += std::max(matched->size(), std::string{}.capacity()) + 1;
+        auto reservation = TryReserveMemory(retained);
+        if (!reservation) {
+          RecordMemoryRejection();
+          co_return absl::ResourceExhaustedError("OOM Hash output retention");
+        }
+        if (matched)
+          result.values_.emplace_back(std::in_place, *matched);
+        else
+          result.values_.emplace_back(std::nullopt);
+        retained = sizeof(HashResult) +
+                   result.values_.capacity() * sizeof(result.values_[0]);
+        if (matched) retained += result.values_[0]->capacity() + 1;
+        if (retained > reservation->bytes()) {
+          RecordMemoryRejection();
+          co_return absl::ResourceExhaustedError("OOM Hash output retention");
+        }
+        result.retained_charge_.Adopt(&*reservation, retained);
+      }
+      co_return result;
+    }
+
     if (grouped != nullptr &&
         (operation.kind_ == HashOperationKind::kRandomFields ||
          operation.kind_ == HashOperationKind::kPopRandom)) {

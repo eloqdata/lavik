@@ -3042,6 +3042,14 @@ class StorageEngine::Impl {
     }
   };
 
+  // Owns the page lease while a grouped reader inspects its checked envelope.
+  // Views into loaded_.value() must not outlive this object.
+  struct LoadedHashGroupPayload {
+    LoadedValue loaded_;
+    std::uint64_t sequence_ = 0;
+    std::uint32_t field_count_ = 0;
+  };
+
   std::size_t DirectGetValueLimit() const noexcept;
 
   absl::StatusOr<DiskValue> EncodeDiskValue(LoadedValue loaded);
@@ -3391,6 +3399,10 @@ class StorageEngine::Impl {
 
   // The optional snapshot view must already own physical pins. Ordinary
   // reads instead retry GC relocation against the same logical root version.
+  Task<absl::StatusOr<LoadedHashGroupPayload>> LoadHashGroupPayload(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, HashGroupId id, bool pinned = false);
   Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,

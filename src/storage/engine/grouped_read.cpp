@@ -33,8 +33,8 @@ absl::Status StorageEngine::Impl::ValidateGroupedRead(
   return object.status();
 }
 
-Task<absl::StatusOr<LoadedHashGroup>>
-StorageEngine::Impl::LoadHashGroupSnapshot(
+Task<absl::StatusOr<StorageEngine::Impl::LoadedHashGroupPayload>>
+StorageEngine::Impl::LoadHashGroupPayload(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedHashObject::Handle object, HashGroupId id, bool pinned) {
@@ -132,23 +132,15 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
       const auto envelope = DecodeHashGroupMetadata(payload, payload.size());
       if (!envelope.ok()) co_return envelope.status();
       // Streaming readers admit a page from its captured physical metadata.
-      // Reject corrupt counts before the full decoder allocates its vectors.
+      // Reject corrupt counts before any decoder allocates its vectors.
       if (envelope->incarnation_ != incarnation || envelope->id_ != id ||
           envelope->retired_ ||
           envelope->field_count_ != location.logical_size_) {
         co_return absl::DataLossError("Hash group physical identity mismatch");
       }
-      auto decoded = DecodeHashGroup(payload);
-      if (!decoded.ok()) co_return decoded.status();
-      for (const auto& field : decoded->value_.entries_) {
-        if (!id.contains(
-                ComputeDigest(field.field_, object->directory().root().seed_)
-                    .value_)) {
-          co_return absl::DataLossError("Hash field outside its group route");
-        }
-      }
-      co_return LoadedHashGroup{.sequence_ = location.mutation_sequence_,
-                                .snapshot_ = std::move(*decoded)};
+      co_return LoadedHashGroupPayload{.loaded_ = std::move(*loaded),
+                                       .sequence_ = location.mutation_sequence_,
+                                       .field_count_ = envelope->field_count_};
     }
     if (pinned || loaded.status().code() != absl::StatusCode::kAborted) {
       co_return loaded.status();
@@ -183,6 +175,30 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
     }
     object = std::move(*current);
   }
+}
+
+Task<absl::StatusOr<LoadedHashGroup>>
+StorageEngine::Impl::LoadHashGroupSnapshot(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedHashObject::Handle object, HashGroupId id, bool pinned) {
+  auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
+                                              digest, object, id, pinned);
+  if (!loaded.ok()) co_return loaded.status();
+  const auto bytes = loaded->loaded_.value();
+  const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
+                                 bytes.size());
+  auto decoded = DecodeHashGroup(payload);
+  if (!decoded.ok()) co_return decoded.status();
+  for (const auto& field : decoded->value_.entries_) {
+    if (!id.contains(
+            ComputeDigest(field.field_, object->directory().root().seed_)
+                .value_)) {
+      co_return absl::DataLossError("Hash field outside its group route");
+    }
+  }
+  co_return LoadedHashGroup{.sequence_ = loaded->sequence_,
+                            .snapshot_ = std::move(*decoded)};
 }
 
 Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(

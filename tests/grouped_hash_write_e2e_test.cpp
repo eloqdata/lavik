@@ -583,6 +583,10 @@ TEST(GroupedHashWriteE2e, PromotionAndPointUpdateOnlyRewriteOneGroup) {
             std::string(128, 'u'));
   EXPECT_EQ(client.Command({"HGET", "hash", "field1"}).text_,
             std::string(128, 'v'));
+  EXPECT_EQ(client.Command({"HGET", "hash", "absent"}).text_, "-1");
+  EXPECT_EQ(client.Command({"HEXISTS", "hash", "field1"}).text_, "1");
+  EXPECT_EQ(client.Command({"HEXISTS", "hash", "absent"}).text_, "0");
+  EXPECT_EQ(client.Command({"HSTRLEN", "hash", "field1"}).text_, "128");
   EXPECT_EQ(client.Command({"HLEN", "hash"}).text_, "256");
 }
 
@@ -698,6 +702,7 @@ TEST(GroupedHashWriteE2e, SetUsesSameGroupedLifecycleWithSetType) {
   EXPECT_EQ(client.Command({"SCARD", "set"}).text_, "256");
   EXPECT_EQ(client.Command({"SISMEMBER", "set", prefix + "0"}).text_, "0");
   EXPECT_EQ(client.Command({"SISMEMBER", "set", "new"}).text_, "1");
+  EXPECT_EQ(client.Command({"SISMEMBER", "set", prefix + "255"}).text_, "1");
 }
 
 // Child servers inherit only this scoped fault setting; the target never sees
