@@ -64,6 +64,7 @@
 #include "lavik/meta/proposal_executor.h"
 #include "lavik/meta/raft.h"
 #include "lavik/meta/sentinel_server.h"
+#include "lavik/meta/shutdown_signals.h"
 #include "lavik/meta/state_machine.h"
 #include "lavik/numeric_endpoint.h"
 #include "lavik/version.h"
@@ -432,17 +433,6 @@ void ShutdownSignalHandler(int signal) {
   g_shutdown_requested = 1;
 }
 
-absl::Status InstallShutdownSignalHandlers() {
-  struct sigaction action{};
-  sigemptyset(&action.sa_mask);
-  action.sa_handler = ShutdownSignalHandler;
-  if (::sigaction(SIGINT, &action, nullptr) != 0 ||
-      ::sigaction(SIGTERM, &action, nullptr) != 0) {
-    return absl::Status(absl::StatusCode::kInternal, "sigaction setup failed");
-  }
-  return absl::OkStatus();
-}
-
 // Polls an asynchronously-published bind status: kUnavailable means the
 // worker has not reported yet; anything else is final.
 absl::Status WaitForBound(
@@ -554,7 +544,8 @@ int main(int argc, char** argv) {
                       "] %Y-%m-%dT%H:%M:%S.%e [%^%l%$] %v");
   spdlog::set_level(spdlog::level::info);
 
-  const absl::Status signals = InstallShutdownSignalHandlers();
+  const absl::Status signals =
+      lavik::meta::InstallShutdownSignalHandlers(ShutdownSignalHandler);
   if (!signals.ok()) {
     spdlog::critical("signal setup failed: {}", signals.message());
     return 1;

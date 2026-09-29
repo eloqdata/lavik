@@ -858,6 +858,15 @@ if (BUILD_TESTING)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/raft
     LABELS "meta;raft" TIMEOUT 180 RUN_SERIAL TRUE)
 
+  # Signal delivery is tested in isolated child processes without a Go runtime
+  # or a Raft cluster; the production installer is shared with lavik-meta.
+  add_executable(lavik_meta_shutdown_signal_tests tests/meta_shutdown_signal_test.cpp)
+  target_include_directories(lavik_meta_shutdown_signal_tests PRIVATE include)
+  target_compile_features(lavik_meta_shutdown_signal_tests PRIVATE cxx_std_23)
+  target_link_libraries(lavik_meta_shutdown_signal_tests PRIVATE absl::status GTest::gtest_main)
+  gtest_discover_tests(lavik_meta_shutdown_signal_tests
+    TEST_PREFIX meta_signal. PROPERTIES LABELS meta TIMEOUT 15)
+
   # Meta-plane tests. Links lavik_meta_core (etcd Raft); the data-plane unit
   # test binary stays Raft-free, while this binary also links the data module
   # for explicit Meta-projection-to-Data-validation contract tests.

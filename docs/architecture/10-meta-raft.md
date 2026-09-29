@@ -25,6 +25,10 @@ buffers cross a versioned C ABI; no Go pointer is retained by C++. The C++
 semantics. Bycorf continues to own Admin, Sentinel, and Data sessions. The Data executable
 and `lavik-ctl` do not link Go or Raft.
 
+Native SIGINT/SIGTERM handlers use the receiving thread's alternate signal
+stack, as required by the embedded Go runtime. They only latch a shutdown
+request; normal execution owns cancellation and draining.
+
 One Go event loop exclusively owns `RawNode`, its memory log, configuration,
 proposal reservations, and quorum proofs. It does not perform filesystem I/O,
 wait for sockets, call a C++ state getter, or acquire an application/storage
