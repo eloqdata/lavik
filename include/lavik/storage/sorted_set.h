@@ -37,6 +37,8 @@ enum class SortedSetOperationKind : std::uint8_t {
   kCount,
   kPop,
   kScan,
+  kRandom,
+  kRemoveRange,
 };
 
 enum class SortedSetRangeMode : std::uint8_t { kRank, kScore, kLex };
@@ -59,7 +61,10 @@ struct ScoredMemberView {
 // duplicate members in request order, including conditional/increment rules;
 // kScores returns one optional score per requested member, preserving
 // duplicates; kRank requires exactly one requested member, and kCount uses
-// score/lex bounds.
+// score/lex bounds. kRandom uses count_: nonnegative counts select unique
+// members, negative counts select with replacement in draw order. kRemoveRange
+// uses the range bounds and atomically removes the selected members; it returns
+// changed_ without returning their contents to the caller.
 struct SortedSetOperation {
   SortedSetOperationKind kind_ = SortedSetOperationKind::kLength;
   std::span<const ScoredMemberView> entries_{};

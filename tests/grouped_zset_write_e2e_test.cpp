@@ -237,6 +237,10 @@ TEST(GroupedSortedSetWriteE2e, ScoreBoundsSkipUnrelatedPagesAfterRecovery) {
   EXPECT_EQ(
       client.Command({"ZREM", "routed", "240" + std::string(128, 'm')}).text_,
       "1");
+  EXPECT_EQ(client.Command({"ZREMRANGEBYSCORE", "routed", "250", "255"}).text_,
+            "6");
+  EXPECT_EQ(client.Command({"ZREMRANGEBYRANK", "routed", "-1", "-1"}).text_,
+            "1");
   // Negative control: the fault must be armed, not merely skipped by Release.
   const auto first = client.Command({"ZRANGE", "routed", "0", "0"});
   EXPECT_EQ(first.kind_, '-');
@@ -638,7 +642,7 @@ TEST(GroupedSortedSetWriteE2e, ScanCursorsAndAllPopEntryPointsRecover) {
       client.Command({"ZSCAN", "wrong", "0"}).text_.starts_with("WRONGTYPE"));
 }
 
-TEST(GroupedSortedSetWriteE2e, LegacyFullImageAndRandomReplyOomAreAtomic) {
+TEST(GroupedSortedSetWriteE2e, FullImageAndRandomReplyOomAreAtomic) {
   PrivateDisk disk;
   const std::string payload(4 * 1024 * 1024, 'O');
   auto member = [&](unsigned i) { return std::to_string(i) + payload; };
@@ -655,7 +659,7 @@ TEST(GroupedSortedSetWriteE2e, LegacyFullImageAndRandomReplyOomAreAtomic) {
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   {
-    // The legacy loader alone could admit this 16 MiB value. The decoded
+    // The full-image adapter alone could admit this 16 MiB value. The decoded
     // callback/planner copies must also fit, while bounded score/card reads
     // and ordinary String commands remain usable on the same worker budget.
     Server server(disk, 2, {}, {}, false, 2, "128M", {}, "128M");
@@ -666,11 +670,24 @@ TEST(GroupedSortedSetWriteE2e, LegacyFullImageAndRandomReplyOomAreAtomic) {
       EXPECT_TRUE(reply.text_.starts_with("OOM "))
           << command.front() << ": " << reply.text_;
     };
-    for (const auto* operation : {"ZREMRANGEBYRANK", "ZREMRANGEBYSCORE"})
-      expect_oom({operation, "large", "0", "0"});
-    expect_oom({"ZREMRANGEBYLEX", "large", "-", "+"});
-    expect_oom({"ZRANDMEMBER", "large"});
-    expect_oom({"GEOPOS", "large", member(0)});
+    const auto random = client.Command({"ZRANDMEMBER", "large"});
+    ASSERT_EQ(random.kind_, '$') << random.text_;
+    ASSERT_EQ(random.text_.size(), payload.size() + 1);
+    EXPECT_GE(random.text_[0], '0');
+    EXPECT_LE(random.text_[0], '3');
+    EXPECT_EQ(random.text_.substr(1), payload);
+    // GEO point reads must fit the same budget as ZSCORE. Neither a 4 MiB
+    // requested member nor unrelated pages justify a full-image reservation.
+    const auto position = client.Command({"GEOPOS", "large", member(0)});
+    ASSERT_EQ(position.kind_, '*') << position.text_;
+    ASSERT_EQ(position.items_.size(), 1);
+    ASSERT_EQ(position.items_[0].items_.size(), 2);
+    const auto hash = client.Command({"GEOHASH", "large", member(0)});
+    ASSERT_EQ(hash.items_.size(), 1) << hash.text_;
+    EXPECT_EQ(hash.items_[0].text_.size(), 11);
+    const auto distance =
+        client.Command({"GEODIST", "large", member(0), member(1), "km"});
+    EXPECT_EQ(distance.kind_, '$') << distance.text_;
     expect_oom({"GEOSEARCH", "large", "FROMLONLAT", "0", "0", "BYRADIUS", "1",
                 "km", "COUNT", "1"});
     EXPECT_EQ(client.Command({"ZCARD", "large"}).text_, "4");
@@ -692,7 +709,10 @@ TEST(GroupedSortedSetWriteE2e, LegacyFullImageAndRandomReplyOomAreAtomic) {
       EXPECT_EQ(repeated.items_[2 * i + 1].text_, "1");
     }
     ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
-    ASSERT_EQ(client.Command({"ZREMRANGEBYRANK", "large", "0", "0"}).text_,
+    ASSERT_EQ(client
+                  .Command({"GEOSEARCH", "large", "FROMLONLAT", "0", "0",
+                            "BYRADIUS", "1", "km", "COUNT", "1"})
+                  .text_,
               "QUEUED");
     ASSERT_EQ(client.Command({"SET", "after-oom", "ok"}).text_, "QUEUED");
     auto executed = client.Command({"EXEC"});
@@ -711,6 +731,325 @@ TEST(GroupedSortedSetWriteE2e, LegacyFullImageAndRandomReplyOomAreAtomic) {
     EXPECT_EQ(client.Command({"ZSCORE", "large", member(i)}).text_,
               std::to_string(i));
   EXPECT_EQ(client.Command({"GET", "after-oom"}).text_, "ok");
+}
+
+TEST(GroupedSortedSetWriteE2e, RangeRemovalFitsSelectedPagesAndRecovers) {
+  PrivateDisk disk;
+  const std::string payload(1024 * 1024, 'r');
+  auto member = [&](unsigned i) { return std::to_string(i) + payload; };
+  {
+    Server server(disk);
+    Client client(server.port());
+    for (unsigned i = 0; i < 16; ++i)
+      ASSERT_EQ(
+          client.Command({"ZADD", "remove-range", std::to_string(i), member(i)})
+              .text_,
+          "1");
+    ASSERT_EQ(client.Command({"EXPIRE", "remove-range", "3600"}).text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    // The old 6x full-image reservation exceeds this per-worker budget. Only
+    // matching members and neighbouring rewrite pages should be admitted.
+    Server server(disk, 2, {}, {}, false, 2, "128M", {}, "128M");
+    Client client(server.port());
+    EXPECT_EQ(
+        client.Command({"ZREMRANGEBYRANK", "remove-range", "0", "0"}).text_,
+        "1");
+    EXPECT_EQ(
+        client.Command({"ZREMRANGEBYSCORE", "remove-range", "(0", "1"}).text_,
+        "1");
+    EXPECT_EQ(client
+                  .Command({"ZREMRANGEBYLEX", "remove-range", "[" + member(2),
+                            "[" + member(2)})
+                  .text_,
+              "1");
+    EXPECT_EQ(client.Command({"ZCARD", "remove-range"}).text_, "13");
+    EXPECT_GT(std::stoi(client.Command({"TTL", "remove-range"}).text_), 0);
+    EXPECT_NE(client.Command({"INFO", "MEMORY"})
+                  .text_.find("memory_admission_pending:0\r\n"),
+              std::string::npos);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  for (unsigned i = 0; i < 16; ++i)
+    EXPECT_EQ(client.Command({"ZSCORE", "remove-range", member(i)}).text_,
+              i < 3 ? "-1" : std::to_string(i));
+  EXPECT_EQ(client.Command({"ZCARD", "remove-range"}).text_, "13");
+  EXPECT_EQ(client.Command({"ZREMRANGEBYSCORE", "remove-range", "-inf", "+inf"})
+                .text_,
+            "13");
+  EXPECT_EQ(client.Command({"EXISTS", "remove-range"}).text_, "0");
+}
+
+TEST(GroupedSortedSetWriteE2e,
+     FailedRangeRemovalPreservesExecPrefixAndRecovery) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires auxiliary-write failure injection";
+#endif
+  PrivateDisk disk;
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed("range{undo}")).text_, "256");
+    ASSERT_EQ(client.Command({"EXPIRE", "range{undo}", "3600"}).text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const std::string first = "0" + std::string(128, 'm');
+  for (const std::vector<std::string> command :
+       {std::vector<std::string>{"ZREMRANGEBYRANK", "range{undo}", "0", "0"},
+        std::vector<std::string>{"ZREMRANGEBYSCORE", "range{undo}", "0", "0"},
+        std::vector<std::string>{"ZREMRANGEBYLEX", "range{undo}", "[" + first,
+                                 "[" + first}}) {
+    // Reject a staged auxiliary write, then commit another command in EXEC.
+    // Both indexes and TTL must retain the old value through cold recovery.
+    Server server(disk, 3, {}, "range{undo}", false, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"SET", "before{undo}", "prefix"}).text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command(command).text_, "QUEUED");
+    ASSERT_EQ(client.Command({"SET", "after{undo}", "suffix"}).text_, "QUEUED");
+    auto result = client.Command({"EXEC"});
+    ASSERT_EQ(result.items_.size(), 3);
+    EXPECT_EQ(result.items_[0].text_, "OK");
+    EXPECT_TRUE(result.items_[1].text_.starts_with("OOM"))
+        << result.items_[1].text_;
+    EXPECT_EQ(result.items_[2].text_, "OK");
+    EXPECT_EQ(client.Command({"ZCARD", "range{undo}"}).text_, "256");
+    EXPECT_EQ(client.Command({"ZSCORE", "range{undo}", first}).text_, "0");
+    const auto range = client.Command({"ZRANGE", "range{undo}", "0", "0"});
+    ASSERT_EQ(range.items_.size(), 1);
+    EXPECT_EQ(range.items_[0].text_, first);
+    EXPECT_GT(std::stoi(client.Command({"TTL", "range{undo}"}).text_), 0);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 4);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"ZCARD", "range{undo}"}).text_, "256");
+  EXPECT_EQ(client.Command({"ZSCORE", "range{undo}", first}).text_, "0");
+  EXPECT_EQ(client.Command({"GET", "before{undo}"}).text_, "prefix");
+  EXPECT_EQ(client.Command({"GET", "after{undo}"}).text_, "suffix");
+  EXPECT_EQ(client.Command({"ZREMRANGEBYRANK", "range{undo}", "0", "0"}).text_,
+            "1");
+}
+
+TEST(GroupedSortedSetWriteE2e, RandomAndRangeRemovalPreserveSemantics) {
+  PrivateDisk disk;
+  Server server(disk, 2);
+  Client client(server.port());
+  // Include binary and empty members, ties, and mixed lexical/score order.
+  const std::string binary("b\0x", 3);
+  for (const std::string key : {"compact", "grouped"}) {
+    const std::string padding = key == "grouped" ? std::string(1024, 'p') : "";
+    const std::vector<std::string> names{"", "a" + padding, binary + padding,
+                                         "c" + padding, "d" + padding};
+    auto seed = [&] {
+      ASSERT_EQ(client.Command({"DEL", key}).kind_, ':');
+      ASSERT_EQ(client
+                    .Command({"ZADD", key, "3", names[0], "1", names[1], "1",
+                              names[2], "0", names[3], "2", names[4]})
+                    .text_,
+                "5");
+    };
+    seed();
+    auto all = client.Command({"ZRANDMEMBER", key, "100", "WITHSCORES"});
+    ASSERT_EQ(all.items_.size(), 10);
+    std::map<std::string, std::string> expected{{names[0], "3"},
+                                                {names[1], "1"},
+                                                {names[2], "1"},
+                                                {names[3], "0"},
+                                                {names[4], "2"}};
+    std::set<std::string> unique;
+    for (std::size_t i = 0; i < all.items_.size(); i += 2) {
+      EXPECT_TRUE(expected.contains(all.items_[i].text_));
+      EXPECT_EQ(expected[all.items_[i].text_], all.items_[i + 1].text_);
+      EXPECT_TRUE(unique.insert(all.items_[i].text_).second);
+    }
+    auto repeated = client.Command({"ZRANDMEMBER", key, "-32", "WITHSCORES"});
+    ASSERT_EQ(repeated.items_.size(), 64);
+    for (std::size_t i = 0; i < repeated.items_.size(); i += 2) {
+      EXPECT_TRUE(expected.contains(repeated.items_[i].text_));
+      EXPECT_EQ(expected[repeated.items_[i].text_],
+                repeated.items_[i + 1].text_);
+    }
+    EXPECT_TRUE(client.Command({"ZRANDMEMBER", key, "0"}).items_.empty());
+    EXPECT_EQ(client.Command({"ZREMRANGEBYRANK", key, "3", "1"}).text_, "0");
+    EXPECT_EQ(client.Command({"ZREMRANGEBYRANK", key, "-2", "-1"}).text_, "2");
+    EXPECT_EQ(client.Command({"ZREMRANGEBYSCORE", key, "(0", "1"}).text_, "2");
+    EXPECT_EQ(client.Command({"ZREMRANGEBYLEX", key, "-", "+"}).text_, "1");
+    EXPECT_EQ(client.Command({"EXISTS", key}).text_, "0");
+    seed();
+    EXPECT_EQ(
+        client.Command({"ZREMRANGEBYLEX", key, "(" + names[1], "[" + names[3]})
+            .text_,
+        "2");
+    EXPECT_EQ(client.Command({"ZCARD", key}).text_, "3");
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"ZREMRANGEBYSCORE", key, "1", "2"}).text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"ZRANDMEMBER", key, "10"}).text_, "QUEUED");
+    const auto exec = client.Command({"EXEC"});
+    ASSERT_EQ(exec.items_.size(), 2);
+    EXPECT_EQ(exec.items_[0].text_, "2");
+    ASSERT_EQ(exec.items_[1].items_.size(), 1);
+    EXPECT_EQ(exec.items_[1].items_[0].text_, "");
+    EXPECT_EQ(client
+                  .Command({"EVAL",
+                            "redis.call('ZADD',KEYS[1],5,'lua'); return "
+                            "redis.call('ZREMRANGEBYRANK',KEYS[1],0,-1)",
+                            "1", key})
+                  .text_,
+              "2");
+  }
+  EXPECT_EQ(client.Command({"ZRANDMEMBER", "absent"}).text_, "-1");
+  EXPECT_TRUE(client.Command({"ZRANDMEMBER", "absent", "2"}).items_.empty());
+  EXPECT_EQ(client.Command({"SET", "wrong", "value"}).text_, "OK");
+  for (const auto* cmd : {"ZREMRANGEBYRANK", "ZREMRANGEBYSCORE"}) {
+    EXPECT_EQ(client.Command({cmd, "absent", "0", "1"}).text_, "0");
+    EXPECT_TRUE(client.Command({cmd, "wrong", "0", "1"})
+                    .text_.starts_with("WRONGTYPE"));
+  }
+  EXPECT_TRUE(client.Command({"ZRANDMEMBER", "wrong", "0"})
+                  .text_.starts_with("WRONGTYPE"));
+  EXPECT_EQ(client.Command({"ZREMRANGEBYLEX", "absent", "-", "+"}).text_, "0");
+  EXPECT_TRUE(client.Command({"ZREMRANGEBYLEX", "wrong", "-", "+"})
+                  .text_.starts_with("WRONGTYPE"));
+  ASSERT_EQ(client.Command(ZSetSeed("sample-pages")).text_, "256");
+  auto sample =
+      client.Command({"ZRANDMEMBER", "sample-pages", "7", "WITHSCORES"});
+  ASSERT_EQ(sample.items_.size(), 14);
+  std::set<std::string> sampled;
+  for (std::size_t i = 0; i < sample.items_.size(); i += 2) {
+    const auto score = std::stoi(sample.items_[i + 1].text_);
+    EXPECT_GE(score, 0);
+    EXPECT_LT(score, 256);
+    EXPECT_EQ(sample.items_[i].text_,
+              std::to_string(score) + std::string(128, 'm'));
+    EXPECT_TRUE(sampled.insert(sample.items_[i].text_).second);
+  }
+}
+
+TEST(GroupedSortedSetWriteE2e, GeoPointReadsPreserveRepliesAndExecVisibility) {
+  PrivateDisk disk;
+  const std::string binary_member("binary\0member", 13);
+  for (const unsigned workers : {2u, 3u}) {
+    Server server(disk, workers);
+    Client client(server.port());
+    if (workers == 2) {
+      ASSERT_EQ(client
+                    .Command({"GEOADD", "geo", "13.361389", "38.115556",
+                              "Palermo", "15.087269", "37.502669", "Catania",
+                              "13.361389", "38.115556", binary_member,
+                              "15.087269", "37.502669", ""})
+                    .text_,
+                "4");
+      ASSERT_EQ(client.Command({"EXPIRE", "geo", "3600"}).text_, "1");
+      ASSERT_EQ(client
+                    .Command({"ZADD", "invalid-geo", "inf", "invalid", "-1",
+                              "wrapped"})
+                    .text_,
+                "2");
+      ASSERT_EQ(client.Command({"SET", "wrong-geo", "value"}).text_, "OK");
+    }
+    auto positions = client.Command(
+        {"GEOPOS", "geo", "Palermo", "missing", binary_member, ""});
+    ASSERT_EQ(positions.items_.size(), 4);
+    ASSERT_EQ(positions.items_[0].items_.size(), 2);
+    EXPECT_EQ(positions.items_[0].items_[0].text_, "13.36138933897018433");
+    EXPECT_EQ(positions.items_[0].items_[1].text_, "38.11555639549629859");
+    EXPECT_EQ(positions.items_[1].kind_, '*');
+    EXPECT_EQ(positions.items_[1].text_, "-1");
+    ASSERT_EQ(positions.items_[2].items_.size(), 2);
+    ASSERT_EQ(positions.items_[3].items_.size(), 2);
+    EXPECT_EQ(positions.items_[2].items_[0].text_,
+              positions.items_[0].items_[0].text_);
+    EXPECT_EQ(positions.items_[3].items_[0].text_, "15.08726745843887329");
+    auto hashes = client.Command(
+        {"GEOHASH", "geo", "Palermo", "missing", "Palermo", "Catania"});
+    ASSERT_EQ(hashes.items_.size(), 4);
+    EXPECT_EQ(hashes.items_[0].text_, "sqc8b49rny0");
+    EXPECT_EQ(hashes.items_[1].kind_, '$');
+    EXPECT_EQ(hashes.items_[1].text_, "-1");
+    EXPECT_EQ(hashes.items_[2].text_, hashes.items_[0].text_);
+    EXPECT_EQ(hashes.items_[3].text_, "sqdtr74hyu0");
+    EXPECT_EQ(
+        client.Command({"GEODIST", "geo", "Palermo", "Catania", "km"}).text_,
+        "166.2742");
+    EXPECT_EQ(client.Command({"GEODIST", "geo", "Palermo", "Palermo"}).text_,
+              "0.0000");
+    for (const auto* operation : {"GEOPOS", "GEOHASH"}) {
+      EXPECT_TRUE(client.Command({operation, "geo"}).items_.empty());
+      auto missing = client.Command({operation, "absent-geo", "member"});
+      ASSERT_EQ(missing.items_.size(), 1);
+      EXPECT_EQ(missing.items_[0].text_, "-1");
+      auto invalid =
+          client.Command({operation, "invalid-geo", "invalid", "wrapped"});
+      ASSERT_EQ(invalid.items_.size(), 2);
+      EXPECT_EQ(invalid.items_[0].text_, "-1");
+      EXPECT_NE(invalid.items_[1].text_, "-1");
+      EXPECT_TRUE(client.Command({operation, "wrong-geo"})
+                      .text_.starts_with("WRONGTYPE"));
+    }
+    EXPECT_EQ(client.Command({"GEODIST", "geo", "Palermo", "missing"}).text_,
+              "-1");
+    EXPECT_EQ(
+        client.Command({"GEODIST", "invalid-geo", "invalid", "wrapped"}).text_,
+        "-1");
+    EXPECT_TRUE(client.Command({"GEODIST", "geo", "Palermo", "Catania", "bad"})
+                    .text_.starts_with("ERR "));
+    EXPECT_TRUE(client.Command({"GEODIST", "wrong-geo", "a", "b", "km"})
+                    .text_.starts_with("WRONGTYPE"));
+    // Syntax validation runs before storage access, including for wrong types.
+    EXPECT_TRUE(client.Command({"GEODIST", "wrong-geo", "a", "b", "bad"})
+                    .text_.starts_with("ERR "));
+    EXPECT_GT(std::stoi(client.Command({"TTL", "geo"}).text_), 0);
+
+    // Reads inside EXEC must see the preceding staged grouped mutation; two
+    // separate point requests would also lose GEODIST's single-read boundary.
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client
+                  .Command({"GEOADD", "geo-exec", "13.361389", "38.115556",
+                            "Palermo", "15.087269", "37.502669", "Catania"})
+                  .text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"GEOPOS", "geo-exec", "Palermo"}).text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"GEOHASH", "geo-exec", "Catania"}).text_,
+              "QUEUED");
+    ASSERT_EQ(
+        client.Command({"GEODIST", "geo-exec", "Palermo", "Catania", "km"})
+            .text_,
+        "QUEUED");
+    auto executed = client.Command({"EXEC"});
+    ASSERT_EQ(executed.items_.size(), 4);
+    ASSERT_EQ(executed.items_[1].items_.size(), 1);
+    ASSERT_EQ(executed.items_[1].items_[0].items_.size(), 2);
+    EXPECT_EQ(executed.items_[1].items_[0].items_[0].text_,
+              "13.36138933897018433");
+    ASSERT_EQ(executed.items_[2].items_.size(), 1);
+    EXPECT_EQ(executed.items_[2].items_[0].text_, "sqdtr74hyu0");
+    EXPECT_EQ(executed.items_[3].text_, "166.2742");
+    EXPECT_EQ(
+        client
+            .Command({"EVAL",
+                      "redis.call('GEOADD',KEYS[1],13.361389,38.115556,'a',"
+                      "15.087269,37.502669,'b'); "
+                      "return redis.call('GEODIST',KEYS[1],'a','b','km')",
+                      "1", "geo-lua"})
+            .text_,
+        "166.2742");
+    EXPECT_NE(client.Command({"INFO", "MEMORY"})
+                  .text_.find("memory_admission_pending:0\r\n"),
+              std::string::npos);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
 }
 
 TEST(GroupedSortedSetWriteE2e,

@@ -41,9 +41,11 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
     const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
-  const bool read_only = operation.kind_ != SortedSetOperationKind::kAdd &&
-                         operation.kind_ != SortedSetOperationKind::kRemove &&
-                         operation.kind_ != SortedSetOperationKind::kPop;
+  const bool read_only =
+      operation.kind_ != SortedSetOperationKind::kAdd &&
+      operation.kind_ != SortedSetOperationKind::kRemove &&
+      operation.kind_ != SortedSetOperationKind::kPop &&
+      operation.kind_ != SortedSetOperationKind::kRemoveRange;
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
