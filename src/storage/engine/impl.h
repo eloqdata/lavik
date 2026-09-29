@@ -2196,6 +2196,14 @@ class StorageEngine::Impl {
                                                        std::string_view key);
   Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadataLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
+  // Multi-field reads retain only requested output and one encoded group at a
+  // time; the request views and immutable directory outlive the awaited call.
+  Task<absl::StatusOr<HashResult>> ReadGroupedHashFields(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object,
+      std::span<const std::string_view> fields);
+
   Task<absl::StatusOr<HashResult>> ExecuteGroupedHashRandomLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,

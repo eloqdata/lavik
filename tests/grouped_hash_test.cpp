@@ -420,6 +420,46 @@ TEST(GroupedHashTest,
   EXPECT_FALSE(DecodeHashGroup(*encoded).ok());
 }
 
+TEST(GroupedHashTest,
+     MultiLookupMatchesRepeatedOperandsAndChecksUnselectedTail) {
+  auto value = Value(3);
+  value.entries_[0].value_.clear();
+  auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = value});
+  ASSERT_TRUE(encoded.ok());
+  std::array<HashFieldLookup, 4> requests{{
+      {.field_ = "absent", .result_index_ = 1},
+      {.field_ = "field-0", .result_index_ = 3},
+      {.field_ = "field-1", .result_index_ = 2},
+      {.field_ = "field-1", .result_index_ = 0},
+  }};
+  ASSERT_TRUE(FindHashGroupFields(*encoded, 3, requests).ok());
+  EXPECT_FALSE(requests[0].value_);
+  ASSERT_TRUE(requests[1].value_);
+  EXPECT_TRUE(requests[1].value_->empty());
+  ASSERT_TRUE(requests[2].value_);
+  EXPECT_EQ(*requests[2].value_, std::string(128, 'b'));
+  EXPECT_EQ(requests[2].value_, requests[3].value_);
+
+  auto broken = *encoded;
+  broken.replace(broken.find("field-2"), 7, "field-1");
+  EXPECT_EQ(FindHashGroupFields(broken, 3, requests).message(),
+            "duplicate Hash field in group");
+  broken = *encoded;
+  broken.replace(broken.find("field-2") - 8, 4, 4, '\xff');
+  auto status = FindHashGroupFields(broken, 3, requests);
+  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
+  EXPECT_EQ(status.message(), "Hash entry is truncated");
+  broken = *encoded;
+  broken[kHashGroupHeaderBytes + 16] = 2;
+  EXPECT_EQ(FindHashGroupFields(broken, 3, requests).message(),
+            "Hash group inner count disagrees with envelope");
+
+  auto empty = EncodeHashGroup({.incarnation_ = 17});
+  ASSERT_TRUE(empty.ok());
+  ASSERT_TRUE(FindHashGroupFields(*empty, 0, requests).ok());
+  for (const auto& request : requests) EXPECT_FALSE(request.value_);
+}
+
 class HashLookupMemoryTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -482,6 +522,55 @@ TEST_F(HashLookupMemoryTest,
     EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
               before.admission_pending_bytes_);
   }
+}
+
+TEST_F(HashLookupMemoryTest,
+       MultiLookupRetainsOrderAndReleasesPartialOutputOnOom) {
+  const auto before = GetWorkerMemoryStats(0);
+  {
+    HashResult result;
+    // The caller admits the output slots once, then each page adds only the
+    // strings copied by RetainHashGroupValues.
+    auto slots = TryReserveMemory(sizeof(HashResult) +
+                                  5 * sizeof(std::optional<std::string>));
+    ASSERT_TRUE(slots);
+    result.values_.resize(5);
+    result.retained_charge_.Adopt(
+        &*slots, sizeof(HashResult) +
+                     result.values_.capacity() * sizeof(result.values_[0]));
+    std::string source(4096, 'v');
+    std::array<HashFieldLookup, 4> page{{
+        {.result_index_ = 2, .value_ = source},
+        {.result_index_ = 0, .value_ = std::string_view{}},
+        {.result_index_ = 3, .value_ = source},
+        {.result_index_ = 1, .value_ = std::nullopt},
+    }};
+    ASSERT_TRUE(RetainHashGroupValues(result, page).ok());
+    source.assign(4096, 'x');
+    ASSERT_TRUE(result.values_[0]);
+    EXPECT_TRUE(result.values_[0]->empty());
+    EXPECT_FALSE(result.values_[1]);
+    EXPECT_EQ(result.values_[2], std::string(4096, 'v'));
+    EXPECT_EQ(result.values_[2], result.values_[3]);
+    EXPECT_FALSE(result.values_[4]);
+    const auto charge = result.retained_charge_.bytes();
+    EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
+              before.retained_bytes_ + charge);
+    EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
+              before.admission_pending_bytes_);
+
+    ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
+    std::array<HashFieldLookup, 1> next{{
+        {.result_index_ = 4, .value_ = source},
+    }};
+    EXPECT_EQ(RetainHashGroupValues(result, next).code(),
+              absl::StatusCode::kResourceExhausted);
+    EXPECT_FALSE(result.values_[4]);
+    EXPECT_EQ(result.retained_charge_.bytes(), charge);
+    EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
+              before.admission_pending_bytes_);
+  }
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, before.retained_bytes_);
 }
 
 TEST(GroupedHashTest, EmptyLeafAndRetiredLeafAreDifferentStates) {

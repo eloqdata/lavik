@@ -18,9 +18,11 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string_view>
 
 #include "absl/status/statusor.h"
+#include "lavik/storage/detail/grouped_hash.h"
 
 namespace lavik::storage {
 
@@ -35,6 +37,29 @@ struct HashResult;
 absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
     std::string_view payload, std::uint32_t field_count,
     std::string_view field);
+
+// One request position; repeated fields retain separate positions. The plan is
+// sorted by group then field, while result_index preserves the command order.
+// field borrows the request; value borrows only the currently loaded page.
+struct HashFieldLookup {
+  HashGroupId group_;
+  std::string_view field_;
+  std::size_t result_index_ = 0;
+  std::optional<std::string_view> value_;
+};
+
+// Same checked-envelope contract as FindHashGroupField. Requests must belong
+// to one group and be sorted by field; resets their values before scanning.
+// Validates the entire encoding, including duplicate requested fields on disk.
+absl::Status FindHashGroupFields(std::string_view payload,
+                                 std::uint32_t field_count,
+                                 std::span<HashFieldLookup> requests);
+
+// Copies this page's matches to their distinct, empty slots in a pre-sized,
+// charged result. Admits all copies (including repeated operands) before any
+// allocation, and grows the existing charge. Discard result on failure.
+absl::Status RetainHashGroupValues(HashResult& result,
+                                   std::span<const HashFieldLookup> requests);
 
 // Copies one validated lookup value (or a missing-field slot) into a result
 // with no vector storage or retained charge. Reserves output memory before
