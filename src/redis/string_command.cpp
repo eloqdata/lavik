@@ -1167,33 +1167,63 @@ absl::StatusOr<BitOp> ParseBitOp(const CommandRequest& request) {
   return operation;
 }
 
+template <BitOp operation>
+void ApplyBitOp(char* __restrict__ output, const char* __restrict__ input,
+                std::size_t count) {
+  // ComputeBitOp owns a fresh output string, disjoint from every source even
+  // when Redis source keys repeat or include the destination key. Each pass
+  // has one contiguous range and one operation so it can be vectorized.
+  for (std::size_t byte = 0; byte < count; ++byte) {
+    if constexpr (operation == BitOp::kAnd)
+      output[byte] &= input[byte];
+    else if constexpr (operation == BitOp::kOr)
+      output[byte] |= input[byte];
+    else if constexpr (operation == BitOp::kXor)
+      output[byte] ^= input[byte];
+    else
+      output[byte] = static_cast<char>(~input[byte]);
+  }
+}
+
+template <BitOp operation>
+void FoldBitOp(char* output, const std::vector<std::string>& inputs,
+               std::size_t length) {
+  for (std::size_t i = 4; i < inputs.size(); ++i) {
+    ApplyBitOp<operation>(output, inputs[i].data(),
+                          std::min(length, inputs[i].size()));
+  }
+}
+
 std::string ComputeBitOp(BitOp operation,
                          const std::vector<std::string>& inputs) {
   std::size_t maximum = 0;
-  for (std::size_t i = 3; i < inputs.size(); ++i)
+  std::size_t minimum = inputs[3].size();
+  for (std::size_t i = 3; i < inputs.size(); ++i) {
     maximum = std::max(maximum, inputs[i].size());
+    minimum = std::min(minimum, inputs[i].size());
+  }
   std::string output(maximum, '\0');
-  for (std::size_t byte = 0; byte < maximum; ++byte) {
-    unsigned char result = byte < inputs[3].size()
-                               ? static_cast<unsigned char>(inputs[3][byte])
-                               : 0;
-    if (operation == BitOp::kNot) {
-      result = static_cast<unsigned char>(~result);
-    } else {
-      for (std::size_t input = 4; input < inputs.size(); ++input) {
-        const unsigned char value =
-            byte < inputs[input].size()
-                ? static_cast<unsigned char>(inputs[input][byte])
-                : 0;
-        if (operation == BitOp::kAnd)
-          result &= value;
-        else if (operation == BitOp::kOr)
-          result |= value;
-        else
-          result ^= value;
-      }
-    }
-    output[byte] = static_cast<char>(result);
+  if (output.empty()) return output;
+  // Redis zero-extends short sources. AND therefore needs only their common
+  // prefix; OR/XOR leave the zero-padded tail unchanged for each short source.
+  const std::size_t prefix =
+      operation == BitOp::kAnd ? minimum : inputs[3].size();
+  if (operation != BitOp::kNot) {
+    std::copy_n(inputs[3].data(), prefix, output.data());
+  }
+  switch (operation) {
+    case BitOp::kAnd:
+      if (minimum != 0) FoldBitOp<BitOp::kAnd>(output.data(), inputs, minimum);
+      break;
+    case BitOp::kOr:
+      FoldBitOp<BitOp::kOr>(output.data(), inputs, maximum);
+      break;
+    case BitOp::kXor:
+      FoldBitOp<BitOp::kXor>(output.data(), inputs, maximum);
+      break;
+    case BitOp::kNot:
+      ApplyBitOp<BitOp::kNot>(output.data(), inputs[3].data(), maximum);
+      break;
   }
   return output;
 }
