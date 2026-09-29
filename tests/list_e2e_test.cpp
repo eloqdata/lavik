@@ -3636,6 +3636,7 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
   ASSERT_EQ(::close(fd), 0);
 
   const std::uint16_t port = FindFreePort();
+  const std::string large_inline_zset_key(128, 'k');
   {
     ServerProcess server(g_lavik_binary, port, data_path, log_path, 2);
     RespClient client(port);
@@ -3643,6 +3644,15 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
     EXPECT_EQ(client.Command({"HSET", "h", "f", "v"}), ":1");
     EXPECT_EQ(client.Command({"SADD", "s", "m"}), ":1");
     EXPECT_EQ(client.Command({"ZADD", "z", "1", "m"}), ":1");
+    for (const auto* key : {"z-rank", "z-score", "z-lex"}) {
+      EXPECT_EQ(client.Command({"ZADD", key, "1", "a", "1", "b", "1", "c"}),
+                ":3");
+    }
+    // The encoding stays below promotion, but its physical record exceeds
+    // the bounded workspace once the key/header is included.
+    EXPECT_EQ(client.Command({"ZADD", large_inline_zset_key, "1",
+                              std::string(16 * 1024 - 90, 'm')}),
+              ":1");
     EXPECT_EQ(client.Command({"XADD", "x", "1-0", "f", "v"}), Bulk("1-0"));
     EXPECT_EQ(client.Command({"XADD", "x", "2-0", "f", "v"}), Bulk("2-0"));
     EXPECT_EQ(client.Command({"XGROUP", "CREATE", "x", "g", "0"}), "+OK");
@@ -3689,6 +3699,30 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
     EXPECT_EQ(client.Command({"HDEL", "h", "f"}), ":1");
     EXPECT_EQ(client.Command({"SREM", "s", "m"}), ":1");
     EXPECT_EQ(client.Command({"ZREMRANGEBYRANK", "z", "0", "-1"}), ":1");
+    EXPECT_EQ(client.Command({"ZREMRANGEBYRANK", "z-rank", "1", "1"}), ":1");
+    EXPECT_EQ(client.Command({"ZREMRANGEBYRANK", "z-rank", "9", "9"}), ":0");
+    EXPECT_EQ(client.Command({"ZCARD", "z-rank"}), ":2");
+    EXPECT_EQ(client.Command({"ZREMRANGEBYSCORE", "z-score", "2", "3"}), ":0");
+    EXPECT_EQ(client.Command({"ZREMRANGEBYSCORE", "z-score", "1", "1"}), ":3");
+    EXPECT_EQ(client.Command({"ZREMRANGEBYLEX", "z-lex", "[b", "[b"}), ":1");
+    EXPECT_EQ(client.Command({"ZREMRANGEBYLEX", "z-lex", "[x", "+"}), ":0");
+    EXPECT_EQ(client.Command({"ZCARD", "z-lex"}), ":2");
+    EXPECT_EQ(client.Command({"ZREMRANGEBYRANK", "z-missing", "0", "-1"}),
+              ":0");
+    EXPECT_EQ(client.Command({"ZREMRANGEBYSCORE", "z-missing", "-inf", "+inf"}),
+              ":0");
+    EXPECT_EQ(client.Command({"ZREMRANGEBYLEX", "z-missing", "-", "+"}), ":0");
+    EXPECT_TRUE(
+        client.Command({"ZREMRANGEBYRANK", large_inline_zset_key, "0", "-1"})
+            .starts_with("-OOM grouped operation scratch admission"));
+    EXPECT_TRUE(client
+                    .Command({"ZREMRANGEBYSCORE", large_inline_zset_key, "-inf",
+                              "+inf"})
+                    .starts_with("-OOM grouped operation scratch admission"));
+    EXPECT_TRUE(
+        client.Command({"ZREMRANGEBYLEX", large_inline_zset_key, "-", "+"})
+            .starts_with("-OOM grouped operation scratch admission"));
+    EXPECT_EQ(client.Command({"ZCARD", large_inline_zset_key}), ":1");
     EXPECT_EQ(client.Command({"XACK", "x", "g", "1-0"}), ":1");
     EXPECT_EQ(client.Command({"XDEL", "x", "2-0"}), ":1");
     EXPECT_EQ(client.Command({"XTRIM", "x", "MAXLEN", "0"}), ":1");
@@ -3700,6 +3734,18 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
             .starts_with("-ERR OOM grouped operation scratch admission"));
     EXPECT_EQ(client.Command({"XLEN", "large-inline-stream"}), ":1");
     EXPECT_EQ(client.Command({"DEL", "large-inline-stream"}), ":1");
+    ASSERT_TRUE(WaitForDurability(client));
+    server.Stop();
+  }
+  {
+    ServerProcess server(g_lavik_binary, port, data_path, log_path, 2);
+    RespClient client(port);
+    EXPECT_EQ(client.Command({"EXISTS", "z", "z-score", "z-missing"}), ":0");
+    for (const auto* key : {"z-rank", "z-lex"}) {
+      EXPECT_EQ(client.Command({"ZRANGE", key, "0", "-1"}),
+                BulkArray({"a", "c"}));
+    }
+    EXPECT_EQ(client.Command({"ZCARD", large_inline_zset_key}), ":1");
     server.Stop();
   }
 }
