@@ -1228,7 +1228,14 @@ absl::StatusOr<GroupedObjectIndex::Handle> GroupedObjectIndex::Lookup(
     std::string_view key, const GroupedObjectVersion& version,
     bool allow_failed) const {
   if (!version.root_.grouped()) return Handle{};
-  const auto* entry = objects_.Find(ComputeDigest(key), key);
+  return Lookup(ComputeDigest(key), key, version, allow_failed);
+}
+
+absl::StatusOr<GroupedObjectIndex::Handle> GroupedObjectIndex::Lookup(
+    const Digest& digest, std::string_view key,
+    const GroupedObjectVersion& version, bool allow_failed) const {
+  if (!version.root_.grouped()) return Handle{};
+  const auto* entry = objects_.Find(digest, key);
   if (entry == nullptr || !entry->value_ ||
       !entry->value_->version().Matches(version)) {
     return absl::DataLossError("grouped root has no matching object directory");
@@ -1309,10 +1316,16 @@ GroupedObjectIndex::PreparePublish(std::string_view key,
 absl::Status GroupedObjectIndex::Publish(std::string_view key,
                                          const Handle& expected,
                                          Handle replacement) {
+  return Publish(ComputeDigest(key), key, expected, std::move(replacement));
+}
+
+absl::Status GroupedObjectIndex::Publish(const Digest& digest,
+                                         std::string_view key,
+                                         const Handle& expected,
+                                         Handle replacement) {
   if (replacement == nullptr || key.size() > kMaxStringBytes) {
     return absl::InvalidArgumentError("invalid grouped object publication");
   }
-  const Digest digest = ComputeDigest(key);
   auto* entry = objects_.Find(digest, key);
   if ((entry == nullptr ? Handle{} : entry->value_) != expected) {
     return absl::AbortedError("grouped object changed before publication");

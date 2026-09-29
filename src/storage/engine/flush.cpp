@@ -145,7 +145,9 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
     }
     RequestIndirectKeyCleaning(*store);
     status = co_await MaybeRunTxCleaner();
-    if (!status.ok()) {
+    if (!status.ok() &&
+        !(absl::IsCancelled(status) &&
+          shutdown_flush_requested_.load(std::memory_order_acquire))) {
       // Cleaner races (pins, foreground replacement) and allocation pressure
       // are retryable background-maintenance failures. They must never stop
       // this worker's periodic flush loop or masquerade as completion of a

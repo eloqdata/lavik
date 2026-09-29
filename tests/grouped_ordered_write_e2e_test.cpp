@@ -340,7 +340,7 @@ TEST(IndirectKeyE2e, KeyLargerThanExternalGroupReadsAndMutates) {
   EXPECT_EQ(client.Command({"HGET", key, "another"}).text_, "small");
 }
 
-TEST(IndirectKeyE2e, RemoteGroupedReadsAdmitParentKeyCopies) {
+TEST(IndirectKeyE2e, RemoteGroupedReadsRespectParentKeyOwnership) {
   PrivateDisk disk;
   disk.PreserveOnFailure();
   auto make_key = [](unsigned owner, char type) {
@@ -372,31 +372,30 @@ TEST(IndirectKeyE2e, RemoteGroupedReadsAdmitParentKeyCopies) {
   {
     // Each logical owner retains two 16 MiB side-index keys. Its 48 MiB
     // retained-memory quota fits the pages, but not another complete key copy.
-    // Client request buffers have a separate budget so they cannot mask this
-    // storage admission check.
+    // Hash remote reads still own a key copy and must reject that allocation.
+    // Ordered remote reads borrow the caller's key across the awaited hop, so
+    // they must succeed with only page scratch. Client request buffers have a
+    // separate budget so they cannot mask this storage admission check.
     Server limited(disk, 3, {}, {}, false, 2, "160M", {}, "128M");
     limited.PreserveOnFailure();
     Client client(limited.port());
     unsigned rejected_hash = 0;
-    unsigned rejected_list = 0;
     for (unsigned i = 0; i < hash_keys.size(); ++i) {
       EXPECT_EQ(client.Command({"HLEN", hash_keys[i]}).text_, "1");
       EXPECT_EQ(client.Command({"LLEN", list_keys[i]}).text_, "1");
       const auto hash = client.Command({"HGET", hash_keys[i], "field"});
       const auto list = client.Command({"LINDEX", list_keys[i], "0"});
-      for (const auto* reply : {&hash, &list}) {
-        if (reply->kind_ == '-') {
-          EXPECT_EQ(reply->text_, "OOM grouped parent key copy admission");
-        } else {
-          ASSERT_EQ(reply->kind_, '$') << reply->text_;
-          EXPECT_EQ(reply->text_, value);
-        }
+      if (hash.kind_ == '-') {
+        EXPECT_EQ(hash.text_, "OOM grouped parent key copy admission");
+      } else {
+        ASSERT_EQ(hash.kind_, '$') << hash.text_;
+        EXPECT_EQ(hash.text_, value);
       }
+      ASSERT_EQ(list.kind_, '$') << list.text_;
+      EXPECT_EQ(list.text_, value);
       rejected_hash += hash.kind_ == '-';
-      rejected_list += list.kind_ == '-';
     }
     EXPECT_GT(rejected_hash, 0);
-    EXPECT_GT(rejected_list, 0);
     EXPECT_NE(client.Command({"INFO", "MEMORY"})
                   .text_.find("memory_admission_pending:0\r\n"),
               std::string::npos);

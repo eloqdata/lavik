@@ -406,9 +406,21 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   // Cold recovery rejects current records in disabled DBs. Obsolete records
   // can still occupy old blocks and must not index a nonexistent runtime DB.
   if (record.db_id_ >= options_.database_count_) co_return std::nullopt;
-  auto& partition = PartitionForKey(key_store, key);
+  auto& partition = record.key_indirect_
+                        ? PartitionFor(key_store, record.key_id_[0] & 0x3fff)
+                        : PartitionForKey(key_store, key);
   auto& index = partition.indexes_[record.db_id_];
-  const Digest digest = ComputeDigest(key);
+  Digest digest;
+  if (record.key_indirect_) {
+    // UUID identity and its original-key digest survive physical relocation.
+    // Rehashing a multi-megabyte key for every small group dominates GC and
+    // the shutdown that joins it, especially in unoptimized builds.
+    auto handle = co_await FindIndirectKey(record.key_id_);
+    if (!handle.ok()) co_return handle.status();
+    digest = (*handle)->digest_;
+  } else {
+    digest = ComputeDigest(key);
+  }
   if (record.auxiliary_group_) {
     const HashGroupId id{.prefix_ = record.group_prefix_,
                          .bits_ = record.group_prefix_bits_};
@@ -430,13 +442,14 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
         co_return GroupedHashObject::Handle{};
       }
       auto found = partition.grouped_objects_[record.db_id_].Lookup(
-          key, GroupedObjectVersion{
-                   .root_ = MaterializeIndexLocation(*root),
-                   .db_epoch_ = record.db_epoch_,
-                   .replication_epoch_ = partition.replication_epoch_,
-                   .index_generation_ =
-                       partition.grouped_generations_[record.db_id_],
-               });
+          digest, key,
+          GroupedObjectVersion{
+              .root_ = MaterializeIndexLocation(*root),
+              .db_epoch_ = record.db_epoch_,
+              .replication_epoch_ = partition.replication_epoch_,
+              .index_generation_ =
+                  partition.grouped_generations_[record.db_id_],
+          });
       if (!found.ok()) co_return found.status();
       if ((*found)->incarnation() != record.group_incarnation_) {
         co_return GroupedHashObject::Handle{};
@@ -508,7 +521,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       co_return replacement.status();
     }
     absl::Status published = partition.grouped_objects_[record.db_id_].Publish(
-        key, *object, std::move(*replacement));
+        digest, key, *object, std::move(*replacement));
     if (!published.ok()) {
       absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(relocated));
       if (!dead.ok()) co_return dead;
@@ -788,7 +801,8 @@ Task<absl::Status> StorageEngine::Impl::CleanBlockLocked(
 Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     WorkerStore& store, std::uint64_t block_id, BlockState& source,
     std::uint32_t source_file_id, std::uint64_t source_block_offset,
-    std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed_txids) {
+    std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed_txids,
+    bool stop_on_shutdown) {
   struct DefragBuffer {
     RegisteredBufferPool* pool_ = nullptr;
     std::uint16_t buffer_id_ = 0;
@@ -856,6 +870,16 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
   } fence_debt{&store, block_id, &durability_fences};
   std::uint32_t record_offset = kBlockHeaderBytes;
   while (record_offset < source.committed_bytes_) {
+    if (stop_on_shutdown &&
+        shutdown_flush_requested_.load(std::memory_order_acquire)) {
+      // Online Tx promotion runs inside PeriodicFlush. Finish the current
+      // relocation, then give that coroutine back to the shutdown drain rather
+      // than walking a whole block of long keys. FenceDebt retains any copies
+      // already made, and the source allocation remains live until they are
+      // durable. Explicit checkpoint promotion must still finish the block.
+      co_return absl::CancelledError(
+          "online transaction cleaner yielding to shutdown");
+    }
     // live_bytes is updated on this worker between salvage resumptions. Zero
     // proves that no index entry names any record in the source block.
     if (source.live_bytes_ == 0) {
@@ -975,7 +999,11 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       record_offset += record.total_disk_bytes_;
       continue;
     }
-    const unsigned key_owner = OwnerForKey(disk_key);
+    // The UUID embeds the validated Redis slot; do not rescan the original
+    // long key to route each auxiliary record to the same owner.
+    const unsigned key_owner =
+        record.key_indirect_ ? (record.key_id_[0] & 0x3fff) % worker_count_
+                             : OwnerForKey(disk_key);
     // Relocation is awaited before advancing this scan. Both the immutable
     // block buffer and loaded_key remain owned by this frame until the local
     // or remote writer finishes, so borrowing avoids allocating/copying every

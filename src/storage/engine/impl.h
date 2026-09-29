@@ -4049,7 +4049,8 @@ class StorageEngine::Impl {
       WorkerStore& store, std::uint64_t block_id, BlockState& source,
       std::uint32_t source_file_id, std::uint64_t source_block_offset,
       std::shared_ptr<const absl::flat_hash_set<std::uint64_t>>
-          committed_txids = nullptr);
+          committed_txids = nullptr,
+      bool stop_on_shutdown = false);
 
   // Drains readers and hands the block back to the allocator. The caller must
   // have observed live_bytes == 0 under store_state_mutex and set `freeing`,

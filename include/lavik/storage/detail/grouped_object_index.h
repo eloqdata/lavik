@@ -247,6 +247,11 @@ class GroupedObjectIndex {
   absl::StatusOr<Handle> Lookup(std::string_view key,
                                 const GroupedObjectVersion& version,
                                 bool allow_failed = false) const;
+  // Reuse ComputeDigest(key) across page reads/relocations of one long key.
+  // Full-key equality and version validation are unchanged.
+  absl::StatusOr<Handle> Lookup(const Digest& digest, std::string_view key,
+                                const GroupedObjectVersion& version,
+                                bool allow_failed = false) const;
   // Mutation/lifecycle preparation only, under owner serialization. Returns
   // the full-key side entry without asserting a top-level physical version;
   // the caller must validate logical identity/population before using it.
@@ -261,6 +266,9 @@ class GroupedObjectIndex {
   // but rejects a stale writer, including erase/recreate with the same key.
   absl::Status Publish(std::string_view key, const Handle& expected,
                        Handle replacement);
+  // digest must be ComputeDigest(key); preserves the same compare-and-publish.
+  absl::Status Publish(const Digest& digest, std::string_view key,
+                       const Handle& expected, Handle replacement);
   absl::Status Erase(std::string_view key, const Handle& expected);
 
   // A journaled grouped-to-compact write keeps its already admitted slot so

@@ -68,6 +68,16 @@ class RespClient {
     }
   }
 
+  void SetTimeout(int seconds) {
+    timeval timeout{.tv_sec = seconds, .tv_usec = 0};
+    if (::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) !=
+            0 ||
+        ::setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) !=
+            0) {
+      Fail("failed to set client socket timeout");
+    }
+  }
+
   std::string Command(const std::vector<std::string_view>& args) {
     Send(args);
     return ReadLine();
@@ -113,7 +123,16 @@ class RespClient {
   }
 
  private:
+  [[noreturn]] void Fail(std::string message) const {
+    ::Fail(operation_.empty() ? std::move(message)
+                              : operation_ + ": " + message);
+  }
+
   void Send(const std::vector<std::string_view>& args) {
+    operation_ = std::string(args.front());
+    if (args.size() > 1) {
+      operation_ += " key_bytes=" + std::to_string(args[1].size());
+    }
     std::string request = "*" + std::to_string(args.size()) + "\r\n";
     for (std::string_view arg : args) {
       request += "$" + std::to_string(arg.size()) + "\r\n";
@@ -164,6 +183,7 @@ class RespClient {
   }
 
   int fd_ = -1;
+  std::string operation_;
 };
 
 std::uint16_t FindFreePort() {
@@ -228,11 +248,18 @@ RespClient Connect(std::uint16_t port) {
 }
 
 RespClient ConnectReady(std::uint16_t port) {
-  const auto deadline = std::chrono::steady_clock::now() + 30s;
+  // Recovery and allocator collection can take longer on the arm64 CI host.
+  // Bound each readiness probe separately so a connection accepted before
+  // startup finishes cannot consume the entire readiness deadline.
+  const auto deadline = std::chrono::steady_clock::now() + 120s;
   while (std::chrono::steady_clock::now() < deadline) {
     try {
       RespClient client = Connect(port);
-      if (client.Command({"PING"}) == "+PONG") return client;
+      client.SetTimeout(2);
+      if (client.Command({"PING"}) == "+PONG") {
+        client.SetTimeout(60);
+        return client;
+      }
     } catch (const std::exception&) {
       // Rapid same-port restarts can complete a loopback handshake against
       // the previous process generation. Reconnect until the command path
@@ -240,7 +267,7 @@ RespClient ConnectReady(std::uint16_t port) {
     }
     std::this_thread::sleep_for(10ms);
   }
-  Fail("timed out waiting for Lavik readiness");
+  Fail("timed out waiting for Lavik readiness after 120 seconds");
 }
 
 class ServerProcess {
@@ -303,7 +330,10 @@ class ServerProcess {
     if (::kill(pid_, SIGINT) != 0 && errno != ESRCH) {
       Fail("failed to signal Lavik");
     }
-    const auto deadline = std::chrono::steady_clock::now() + 60s;
+    // This test checks durability across restarts, not a 60-second shutdown
+    // limit. Give a contended CI file backend time to drain, while retaining
+    // a finite bound that still reports a stuck shutdown.
+    const auto deadline = std::chrono::steady_clock::now() + 120s;
     while (std::chrono::steady_clock::now() < deadline) {
       int status = 0;
       const pid_t waited = ::waitpid(pid_, &status, WNOHANG);
@@ -319,7 +349,7 @@ class ServerProcess {
       }
       std::this_thread::sleep_for(10ms);
     }
-    Fail("Lavik did not stop after SIGINT");
+    Fail("Lavik did not stop within 120 seconds after SIGINT");
   }
 
  private:
