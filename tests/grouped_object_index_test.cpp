@@ -142,6 +142,58 @@ class GroupedMemoryScope {
   unsigned shard_;
 };
 
+TEST(GroupedObjectIndexTest, CompressedPathsRetainAllHashPrefixLengthBits) {
+  GroupedMemoryScope memory;
+  // Repeatedly split the zero-prefixed child all the way to 64 bits. Its
+  // retired ancestors and live leaf share the same uint64 prefix; more than
+  // one physical leaf is needed to retain their distinct length bytes.
+  GroupedHashRoot root{
+      .incarnation_ = 1, .field_count_ = 65, .group_count_ = 65};
+  std::vector<RecoveredHashGroup> candidates;
+  std::vector<HashGroupLocation> locations;
+  auto add = [&](HashGroupId id, bool retired) {
+    const auto block = locations.size() + 1;
+    const unsigned count = retired ? 0 : 1;
+    candidates.push_back({.incarnation_ = 1,
+                          .id_ = id,
+                          .sequence_ = 5,
+                          .lsn_ = block,
+                          .field_count_ = count,
+                          .record_token_ = block,
+                          .retired_ = retired});
+    locations.push_back({.id_ = id,
+                         .location_ = GroupLocation(block, 5, count),
+                         .retired_ = retired});
+  };
+  for (unsigned bits = 0; bits < 64; ++bits)
+    add({0, static_cast<std::uint8_t>(bits)}, true);
+  add({0, 64}, false);
+  for (unsigned bits = 1; bits <= 64; ++bits)
+    add({1ULL << (64 - bits), static_cast<std::uint8_t>(bits)}, false);
+  auto directory = Recover(root, 5, candidates, {});
+  ASSERT_TRUE(directory.ok()) << directory.status();
+  GroupedObjectVersion version{.root_ = GroupLocation(999999, 5, 65, true),
+                               .db_epoch_ = 1,
+                               .replication_epoch_ = 2,
+                               .index_generation_ = 3};
+  auto old = GroupedHashObject::Create(version, *directory, locations);
+  ASSERT_TRUE(old.ok()) << old.status();
+  for (const auto& location : locations) {
+    ASSERT_NE((*old)->FindRecord(location.id_), nullptr);
+    EXPECT_EQ((*old)->FindRecord(location.id_)->value_.block_id(),
+              location.location_.block_id());
+    EXPECT_EQ((*old)->FindGroup(location.id_) == nullptr, location.retired_);
+  }
+  auto moved = GroupedHashObject::RelocateGroup(
+      *old, {0, 7}, locations[7].location_, GroupLocation(200, 5, 0));
+  ASSERT_TRUE(moved.ok()) << moved.status();
+  EXPECT_EQ((*moved)->FindRecord({0, 7})->value_.block_id(), 200);
+  EXPECT_EQ((*old)->FindRecord({0, 7})->value_.block_id(), 8);
+  EXPECT_EQ((*moved)->FindRecord({0, 6})->value_.block_id(), 7);
+  EXPECT_EQ((*moved)->FindRecord({0, 64})->value_.block_id(), 65);
+  EXPECT_EQ((*moved)->record_count(), locations.size());
+}
+
 TEST(GroupedScratchBudgetTest, RejectsOverflowAndMissingExtentMetadata) {
   GroupedScratchBudget overflow;
   EXPECT_EQ(overflow.AddBytes(std::numeric_limits<std::size_t>::max()).code(),
