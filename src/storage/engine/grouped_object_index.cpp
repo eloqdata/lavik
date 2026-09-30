@@ -328,10 +328,13 @@ unsigned CommonIdentityBits(HashGroupId left, HashGroupId right) {
 }
 
 struct GroupIndexPage {
-  RetainedMemoryCharge ids_charge_;
+  // The immutable page admits two packed arrays once. Replacing one group
+  // copies coordinates in bulk without rebuilding per-entry hash buckets,
+  // key tails or arena allocations. Extent manifests remain separately owned.
+  RetainedMemoryCharge arrays_charge_;
   std::vector<HashGroupId> ids_;
   std::uint64_t retired_ = 0;
-  RecordIndex locations_;
+  std::vector<GroupedRecordIndexEntry> locations_;
   ScanHashMap<std::shared_ptr<const std::vector<ExtentRef>>> extents_;
 };
 
@@ -378,41 +381,28 @@ absl::StatusOr<NodeHandle> BuildPhysical(
   }
   auto page = AllocateLocalObject<GroupIndexPage>(arena);
   if (!page.ok()) return page.status();
-  const auto ids_bytes =
-      AllocatorUsableSizeForRequest(records.size() * sizeof(HashGroupId));
-  auto ids_reservation = TryReserveMemory(ids_bytes);
-  if (!ids_reservation) {
+  const auto arrays_bytes =
+      AllocatorUsableSizeForRequest(records.size() * sizeof(HashGroupId)) +
+      AllocatorUsableSizeForRequest(records.size() *
+                                    sizeof(GroupedRecordIndexEntry));
+  auto arrays_reservation = TryReserveMemory(arrays_bytes);
+  if (!arrays_reservation) {
     RecordMemoryRejection();
     return absl::ResourceExhaustedError("OOM group page exceeds maxmemory");
   }
-  (*page)->ids_charge_.Account(arena->allocation_domain().owner_shard_,
-                               ids_bytes);
+  (*page)->arrays_charge_.Account(arena->allocation_domain().owner_shard_,
+                                  arrays_bytes);
   (*page)->ids_.reserve(records.size());
-  ids_reservation.reset();
-  (*page)->locations_.SetEntryArena(arena);
+  arrays_reservation.reset();
+  (*page)->locations_.reserve(records.size());
   (*page)->extents_.SetEntryArena(arena);
   for (const auto& record : records) {
-    const auto bytes = GroupKey(record.id_);
-    const std::string_view key(bytes.data(), bytes.size());
-    const auto digest = ComputeDigest(key);
-    auto& index = (*page)->locations_;
-    if (!index.CanAllocateEntry(key, true, false)) {
-      return absl::ResourceExhaustedError("group location capacity exhausted");
-    }
-    auto reservation = TryReserveMemory(
-        index.RequiredAllocationBytes(digest, key, true, false, true));
-    if (!reservation) {
-      RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM group locations exceed maxmemory");
-    }
-    if (index.InsertNew(digest, key, record.location_) == nullptr) {
-      return absl::ResourceExhaustedError("group location allocation failed");
-    }
-    reservation.reset();
+    (*page)->locations_.push_back({RecordIndexValue(record.location_)});
     if (record.retired_) (*page)->retired_ |= 1ULL << (*page)->ids_.size();
     (*page)->ids_.push_back(record.id_);
     if (record.extents_) {
+      const auto bytes = GroupKey(record.id_);
+      const std::string_view key(bytes.data(), bytes.size());
       // Build callers own copies already admitted by CopyManifest, including
       // unchanged manifests shared from an old immutable page.
       const auto inserted = Insert((*page)->extents_, key, record.extents_);
@@ -462,12 +452,10 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
         merged.push_back(changed[next++]);
         continue;
       }
-      const auto bytes = GroupKey(id);
-      const std::string_view key(bytes.data(), bytes.size());
-      const auto* entry = page.locations_.Find(ComputeDigest(key), key);
+      const auto* entry = &page.locations_[i];
       // Epoch/owner remain the physical block's authority. A compact entry
       // is copied byte-for-byte through this temporary location; these two
-      // fields do not enter the compact destination RecordIndex.
+      // fields do not enter the compact physical index.
       merged.push_back({.id_ = id,
                         .location_ = RecordIndexEntryPolicy::Load(
                             entry->value_, nullptr, 1, 0),
@@ -521,10 +509,8 @@ void VisitPhysical(const NodeHandle& node,
   const auto& page = *node->page_;
   for (std::size_t i = 0; i < page.ids_.size(); ++i) {
     const auto id = page.ids_[i];
-    const auto bytes = GroupKey(id);
-    const std::string_view key(bytes.data(), bytes.size());
-    visitor(id, *page.locations_.Find(ComputeDigest(key), key),
-            ManifestFor(page, id), ((page.retired_ >> i) & 1) != 0);
+    visitor(id, page.locations_[i], ManifestFor(page, id),
+            ((page.retired_ >> i) & 1) != 0);
   }
 }
 
@@ -534,10 +520,11 @@ struct GroupedHashPhysicalState {
   std::shared_ptr<ScanHashMapEntryArena> arena_;
   NodeHandle root_;
   struct StringPage {
-    // The owner keeps compact RecordIndex entries alive. Direct pointers are
+    // The owner keeps compact physical index entries alive. Direct pointers are
     // immutable and used only on the key owner, including destruction.
     NodeHandle owner_;
-    std::array<const RecordIndex::Entry*, kGroupIndexPageEntries> entries_{};
+    std::array<const GroupedRecordIndexEntry*, kGroupIndexPageEntries>
+        entries_{};
   };
   RetainedMemoryCharge string_pages_charge_;
   std::vector<LocalSharedPtr<const StringPage>> string_pages_;
@@ -605,11 +592,9 @@ absl::Status BuildStringPhysical(GroupedHashPhysicalState& output,
     auto page = AllocateLocalObject<Page>(output.arena_);
     if (!page.ok()) return page.status();
     (*page)->owner_ = std::move(*owner);
-    for (const auto& record : records) {
-      const auto key = GroupKey(record.id_);
-      const std::string_view view(key.data(), key.size());
-      (*page)->entries_[(record.id_.prefix_ - 1) % kGroupIndexPageEntries] =
-          (*page)->owner_->page_->locations_.Find(ComputeDigest(view), view);
+    for (std::size_t i = 0; i < records.size(); ++i) {
+      (*page)->entries_[(records[i].id_.prefix_ - 1) % kGroupIndexPageEntries] =
+          &(*page)->owner_->page_->locations_[i];
     }
     output.string_pages_[page_id] = std::move(*page);
   }
@@ -1157,14 +1142,15 @@ absl::StatusOr<GroupedHashObject::Handle> GroupedHashObject::RelocateGroup(
   return Handle(std::move(*object));
 }
 
-const RecordIndex::Entry* GroupedHashObject::FindGroup(
+const GroupedRecordIndexEntry* GroupedHashObject::FindGroup(
     std::string_view field) const {
   if (is_ordered() && !has_member_index()) return nullptr;
   const auto* route = directory().Find(field);
   return route == nullptr ? nullptr : FindRecord(route->id_);
 }
 
-const RecordIndex::Entry* GroupedHashObject::FindGroup(HashGroupId id) const {
+const GroupedRecordIndexEntry* GroupedHashObject::FindGroup(
+    HashGroupId id) const {
   if (is_ordered() && IsOrderedPageId(id)) {
     return id.bits_ == 0 && ordered_directory_->Find(id.prefix_) != nullptr
                ? FindRecord(id)
@@ -1177,7 +1163,8 @@ const RecordIndex::Entry* GroupedHashObject::FindGroup(HashGroupId id) const {
   return FindRecord(id);
 }
 
-const RecordIndex::Entry* GroupedHashObject::FindRecord(HashGroupId id) const {
+const GroupedRecordIndexEntry* GroupedHashObject::FindRecord(
+    HashGroupId id) const {
   if (physical_->string_size_) {
     if (!IsOrderedPageId(id) || id.prefix_ > physical_->string_size_)
       return nullptr;
@@ -1190,9 +1177,9 @@ const RecordIndex::Entry* GroupedHashObject::FindRecord(HashGroupId id) const {
     return nullptr;
   const auto* page = FindPage(physical_->root_, id);
   if (!page) return nullptr;
-  const auto bytes = GroupKey(id);
-  const std::string_view key(bytes.data(), bytes.size());
-  return page->locations_.Find(ComputeDigest(key), key);
+  const auto found = std::lower_bound(page->ids_.begin(), page->ids_.end(), id);
+  if (found == page->ids_.end() || *found != id) return nullptr;
+  return &page->locations_[found - page->ids_.begin()];
 }
 
 std::shared_ptr<const std::vector<ExtentRef>> GroupedHashObject::ExtentsFor(

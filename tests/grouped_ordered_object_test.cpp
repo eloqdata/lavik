@@ -331,7 +331,7 @@ TEST(GroupedOrderedObjectTest, StringVectorSharesUntouchedPagesAndOldViews) {
   EXPECT_EQ((*relocated)->FindRecord({65, 0})->value_.block_id(), 1002);
   std::size_t visited = 0;
   (*relocated)
-      ->ForEachRecord([&](HashGroupId id, const RecordIndex::Entry& entry,
+      ->ForEachRecord([&](HashGroupId id, const GroupedRecordIndexEntry& entry,
                           const auto& extents, bool retired) {
         EXPECT_EQ(&entry, (*relocated)->FindRecord(id));
         EXPECT_FALSE(extents);
@@ -363,7 +363,8 @@ TEST(GroupedOrderedObjectTest, BothKindsRetainRetiredPhysicalRecordsAndRanks) {
     EXPECT_EQ(position->group_index_, 1);
     EXPECT_EQ(position->offset_, 0);
     std::size_t active = 0, retired = 0;
-    (*object)->ForEachRecord([&](HashGroupId, const RecordIndex::Entry& entry,
+    (*object)->ForEachRecord([&](HashGroupId,
+                                 const GroupedRecordIndexEntry& entry,
                                  const auto&, bool marker) {
       EXPECT_EQ(entry.value_.value_type(), type);
       marker ? ++retired : ++active;

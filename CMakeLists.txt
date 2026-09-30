@@ -1676,6 +1676,7 @@ if (BUILD_TESTING)
     tests/replica_applied_frontier_test.cpp
     tests/full_sync_handoff_test.cpp
     tests/ring_buffer_test.cpp
+    tests/tx_block_leases_test.cpp
     tests/tx_lock_test.cpp
     tests/storage_format_test.cpp
     tests/storage_capacity_test.cpp

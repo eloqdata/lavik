@@ -467,7 +467,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
     if (*object == nullptr) {
       co_return std::optional<RelocationDurabilityFence>{};
     }
-    const RecordIndex::Entry* group = (*object)->FindRecord(id);
+    const GroupedRecordIndexEntry* group = (*object)->FindRecord(id);
     if (group == nullptr ||
         !MaterializeIndexLocation(*group).SamePhysicalRecord(source_location)) {
       co_return std::optional<RelocationDurabilityFence>{};

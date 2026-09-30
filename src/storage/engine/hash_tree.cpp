@@ -21,6 +21,8 @@
 #include <set>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/hash/hash.h"
 #include "impl.h"
 #include "lavik/glob.h"
 #include "lavik/memory.h"
@@ -32,6 +34,35 @@
 namespace lavik::storage {
 
 namespace {
+
+// Positions survive vector reallocation, including moves of SSO field names.
+// Resolve them through the vector object instead of retaining string_views or
+// duplicating every field/member. Fields and positions must remain unchanged
+// until this command-local index is destroyed; values may be replaced.
+struct FieldPositionHash {
+  using is_transparent = void;
+  const std::vector<HashEntry>* entries;
+  std::size_t operator()(std::string_view field) const {
+    return absl::Hash<std::string_view>{}(field);
+  }
+  std::size_t operator()(std::size_t position) const {
+    return (*this)((*entries)[position].field_);
+  }
+};
+
+struct FieldPositionEqual {
+  using is_transparent = void;
+  const std::vector<HashEntry>* entries;
+  bool operator()(std::size_t left, std::size_t right) const {
+    return (*entries)[left].field_ == (*entries)[right].field_;
+  }
+  bool operator()(std::size_t left, std::string_view right) const {
+    return (*entries)[left].field_ == right;
+  }
+  bool operator()(std::string_view left, std::size_t right) const {
+    return left == (*entries)[right].field_;
+  }
+};
 
 bool DigestLess(const Digest& left, const Digest& right) {
   return left.value_ < right.value_;
@@ -690,7 +721,29 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     // Point writes keep the selected leaves until planning finishes; other
     // materializing operations keep the entire decoded value. Admit that
     // peak before any leaf allocations, including copies made by the planner.
+    const bool edit_leaves =
+        unlocked_grouped_write &&
+        (operation.kind_ == HashOperationKind::kSet ||
+         operation.kind_ == HashOperationKind::kSetIfAbsent ||
+         operation.kind_ == HashOperationKind::kDelete);
+    if (edit_leaves && operation.kind_ != HashOperationKind::kDelete &&
+        operation.fields_.size() != operation.values_.size())
+      co_return absl::InvalidArgumentError("Hash field/value mismatch");
     std::set<HashGroupId> selected;
+    std::optional<MemoryReservation> operand_scratch;
+    std::map<HashGroupId, std::vector<HashEntryView>> leaf_edits;
+    if (edit_leaves) {
+      GroupedScratchBudget budget;
+      if (operation.fields_.size() > SIZE_MAX / 256)
+        co_return absl::ResourceExhaustedError("Hash operand index overflow");
+      // Routing vectors, mutation views, map slots and growth rounding, even
+      // for empty operands. Request strings themselves remain client-owned.
+      auto added = budget.AddBytes(operation.fields_.size() * 256);
+      if (!added.ok()) co_return added;
+      auto admitted = budget.Reserve(1);
+      if (!admitted.ok()) co_return admitted.status();
+      operand_scratch.emplace(std::move(*admitted));
+    }
     std::optional<MemoryReservation> grouped_scratch;
     if (replace || unlocked_create) {
       // Bound owned field copies, sorting and encoding before allocating them.
@@ -716,11 +769,17 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     } else if (grouped != nullptr) {
       GroupedScratchBudget budget;
       if (IsPointOperation(operation.kind_)) {
-        for (const auto field : operation.fields_) {
+        for (std::size_t i = 0; i < operation.fields_.size(); ++i) {
+          const auto field = operation.fields_[i];
           const auto* route = grouped->directory().Find(field);
           if (route == nullptr)
             co_return absl::DataLossError("missing Hash field route");
           selected.insert(route->id_);
+          if (edit_leaves)
+            leaf_edits[route->id_].push_back(
+                {field, operation.kind_ == HashOperationKind::kDelete
+                            ? std::string_view{}
+                            : operation.values_[i]});
         }
       } else {
         for (const auto& [prefix, metadata] : grouped->directory().groups())
@@ -747,7 +806,49 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       grouped_scratch.emplace(std::move(*admitted));
     }
     HashValue compact;
-    if (grouped != nullptr) {
+    std::optional<HashGroupMutationPlan> grouped_plan;
+    std::uint64_t edited_length = location.logical_size_;
+    if (edit_leaves) {
+      grouped_plan.emplace();
+      auto& plan = *grouped_plan;
+      plan.root_ = grouped->directory().root();
+      plan.expected_sequence_ = grouped->directory().sequence();
+      const auto kind = operation.kind_ == HashOperationKind::kDelete
+                            ? HashGroupEditKind::kDelete
+                        : operation.kind_ == HashOperationKind::kSet
+                            ? HashGroupEditKind::kSet
+                            : HashGroupEditKind::kSetIfAbsent;
+      for (const auto& [id, edits] : leaf_edits) {
+        co_await bycorf::Yield(*store.worker_);
+        auto loaded = co_await LoadHashGroupPayload(store, partition, db_id,
+                                                    key, digest, grouped, id);
+        if (!loaded.ok()) co_return loaded.status();
+        const auto bytes = loaded->loaded_.value();
+        auto edited = ApplyHashGroupEdits(
+            {reinterpret_cast<const char*>(bytes.data()), bytes.size()},
+            plan.root_.seed_, kind, edits);
+        if (!edited.ok()) co_return edited.status();
+        if (!edited->changed_) continue;
+        result.changed_ = plan.changed_ = true;
+        edited_length += edited->added_;
+        edited_length -= edited->removed_;
+        result.integer_ += kind == HashGroupEditKind::kDelete ? edited->removed_
+                                                              : edited->added_;
+        if (edited->leaves_.size() > 1) {
+          const auto extra = edited->leaves_.size() - 1;
+          if (extra > UINT32_MAX - plan.root_.group_count_)
+            co_return absl::OutOfRangeError("Hash directory size overflow");
+          plan.root_.group_count_ += extra;
+          plan.writes_.push_back({.incarnation_ = plan.root_.incarnation_,
+                                  .id_ = id,
+                                  .retired_ = true,
+                                  .value_ = {}});
+        }
+        for (auto& leaf : edited->leaves_)
+          plan.writes_.push_back(std::move(leaf));
+      }
+      plan.root_.field_count_ = edited_length;
+    } else if (grouped != nullptr) {
       if (IsPointOperation(operation.kind_)) {
         // Loading a requested leaf once is enough even when HMGET/HSET mentions
         // several fields routed to that same leaf. Unrelated large field values
@@ -947,46 +1048,51 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
                         .value_ = std::string(operation.values_[position])});
         }
         // Identical replacements still write and invalidate WATCH. Comparing
-        // old values would defeat the explicit read-free replacement contract.
+        // old values would defeat the explicit read-free replacement
+        // contract.
         result.changed_ = true;
         break;
       }
       case HashOperationKind::kSet:
       case HashOperationKind::kSetIfAbsent: {
+        if (edit_leaves) break;
         if (operation.fields_.size() != operation.values_.size())
           co_return absl::InvalidArgumentError("Hash field/value mismatch");
         const bool indexed = operation.fields_.size() > 1;
         std::optional<MemoryReservation> lookup_scratch;
-        absl::flat_hash_map<std::string, std::size_t> field_positions;
+        absl::flat_hash_set<std::size_t, FieldPositionHash, FieldPositionEqual>
+            field_positions(0, FieldPositionHash{&compact.entries_},
+                            FieldPositionEqual{&compact.entries_});
         if (indexed) {
           // Selected groups share one vector, so scanning it for every input
-          // field makes a growing batch quadratic. Own the index keys: appends
-          // can move even SSO fields, and unlocked creation can suspend. Store
-          // positions rather than pointers, and destroy the index before the
-          // planner sorts/moves entries. Single-field writes need only a scan.
+          // field makes a growing batch quadratic. Index positions, and
+          // destroy the index before the planner sorts/moves entries.
+          // Unlocked creation may suspend but retains exclusive ownership of
+          // this vector. Single-field writes need only a scan.
           GroupedScratchBudget budget;
-          auto admit_field = [&](std::string_view field) -> absl::Status {
-            // Bound the copied key plus sparse hash slots/control bytes. Count
-            // every input, including duplicates, to admit the peak up front.
-            auto added = budget.AddBytes(256);
-            if (!added.ok()) return added;
-            return budget.AddBytes(field.size());
-          };
-          for (const auto& entry : compact.entries_) {
-            auto added = admit_field(entry.field_);
-            if (!added.ok()) co_return added;
-          }
-          for (const auto field : operation.fields_) {
-            auto added = admit_field(field);
-            if (!added.ok()) co_return added;
-          }
+          // Sparse slots/control bytes and allocation rounding, without
+          // copies of field bytes. Count duplicates to admit the peak up
+          // front. Growth rounding and load factor need fewer than four slots
+          // per entry; fixed small-table padding is in GroupedScratchBudget.
+          constexpr auto kPositionBytes =
+              4 * (sizeof(std::size_t) + sizeof(std::uint8_t));
+          constexpr auto kMaxPositions =
+              std::numeric_limits<std::size_t>::max() / kPositionBytes;
+          if (compact.entries_.size() > kMaxPositions ||
+              operation.fields_.size() >
+                  kMaxPositions - compact.entries_.size())
+            co_return absl::ResourceExhaustedError("field index size overflow");
+          auto added = budget.AddBytes(
+              (compact.entries_.size() + operation.fields_.size()) *
+              kPositionBytes);
+          if (!added.ok()) co_return added;
           auto admitted = budget.Reserve(1);
           if (!admitted.ok()) co_return admitted.status();
           lookup_scratch.emplace(std::move(*admitted));
           field_positions.reserve(compact.entries_.size() +
                                   operation.fields_.size());
           for (std::size_t i = 0; i < compact.entries_.size(); ++i)
-            field_positions.emplace(compact.entries_[i].field_, i);
+            field_positions.insert(i);
         }
         for (std::size_t i = 0; i < operation.fields_.size(); ++i) {
           if (unlocked_create && i != 0 && i % 256 == 0)
@@ -1000,7 +1106,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
           if (indexed) {
             auto position = field_positions.find(operation.fields_[i]);
             if (position != field_positions.end())
-              current = &compact.entries_[position->second];
+              current = &compact.entries_[*position];
           } else {
             current = lookup(operation.fields_[i]);
           }
@@ -1013,13 +1119,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
             }
           } else {
             mark_group_changed(operation.fields_[i]);
-            if (indexed)
-              field_positions.emplace(operation.fields_[i],
-                                      compact.entries_.size());
             compact.entries_.push_back(
                 HashEntry{.digest_ = ComputeDigest(operation.fields_[i]),
                           .field_ = std::string(operation.fields_[i]),
                           .value_ = std::string(operation.values_[i])});
+            if (indexed) field_positions.insert(compact.entries_.size() - 1);
             ++result.integer_;
             result.changed_ = true;
           }
@@ -1027,6 +1131,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         break;
       }
       case HashOperationKind::kDelete:
+        if (edit_leaves) break;
         for (std::string_view field : operation.fields_) {
           auto entry = find_entry(field);
           if (entry != compact.entries_.end()) {
@@ -1084,10 +1189,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       case HashOperationKind::kKeys:
       case HashOperationKind::kValues: {
         // These results can outlive this command-local decoded snapshot. Move
-        // its strings into the result at this terminal read-only return, never
-        // borrow their storage. Admission must cover the transferred capacity,
-        // not just the size that a freshly copied string would allocate.
-        // Grouped scratch remains reserved through the ownership handoff.
+        // its strings into the result at this terminal read-only return,
+        // never borrow their storage. Admission must cover the transferred
+        // capacity, not just the size that a freshly copied string would
+        // allocate. Grouped scratch remains reserved through the ownership
+        // handoff.
         const auto width =
             operation.kind_ == HashOperationKind::kGetAll ? 2 : 1;
         std::size_t retained = sizeof(HashResult);
@@ -1169,7 +1275,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       }
       case HashOperationKind::kScan: {
         // HSCAN cursors encode a digest prefix, so only this path requires
-        // digest order. Full reads preserve the stored order and avoid sorting.
+        // digest order. Full reads preserve the stored order and avoid
+        // sorting.
         std::sort(compact.entries_.begin(), compact.entries_.end(), EntryLess);
         const auto begin_it = std::lower_bound(
             compact.entries_.begin(), compact.entries_.end(), operation.cursor_,
@@ -1208,14 +1315,14 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         co_return result;
     }
 
-    result.length_ = grouped == nullptr
+    result.length_ = edit_leaves ? edited_length
+                     : grouped == nullptr
                          ? compact.entries_.size()
                          : location.logical_size_ - selected_field_count +
                                compact.entries_.size();
     result.key_exists_ = result.length_ != 0;
-    std::optional<HashGroupMutationPlan> grouped_plan;
     if (unlocked_grouped_write) {
-      if (result.changed_ && result.key_exists_) {
+      if (!grouped_plan && result.changed_ && result.key_exists_) {
         const std::vector<HashGroupId> changed(changed_groups.begin(),
                                                changed_groups.end());
         auto prepared =

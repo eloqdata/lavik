@@ -1898,7 +1898,8 @@ class StorageEngine {
   TxCleanerTotals TxCleanerStats() const noexcept;
   std::uint32_t TxCleanerCooldownMs() const noexcept;
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
-  // Report whether any worker has about 16 MiB of sealed Tx records.
+  // Report whether a worker has about 16 MiB of sealed Tx records whose
+  // writer leases have not yet been proved to have all expired.
   bool TxBacklogAtLimit() const noexcept;
   // Call before taking key intents. Wait only while sealed backlog retains a
   // live transaction; already admitted transactions must be able to commit,

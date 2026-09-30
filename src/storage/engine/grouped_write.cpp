@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
+#include "grouped_dependency_test_hook.h"
 #include "impl.h"
 
 namespace lavik::storage {
 
 absl::StatusOr<std::shared_ptr<GroupedCommitDecision>>
-StorageEngine::Impl::PrepareGroupedDecision(TxShardWrites& tx) {
+StorageEngine::Impl::PrepareGroupedDecision(TxShardWrites& tx,
+                                            bool local_completion) {
   if (tx.txid_ == 0 || tx.transaction_lease_ == nullptr) {
     return absl::InvalidArgumentError(
         "grouped mutation has no transaction lease");
@@ -37,7 +39,9 @@ StorageEngine::Impl::PrepareGroupedDecision(TxShardWrites& tx) {
           .owner_shard_ = CurrentMemoryAccountingShard(),
           .externally_admitted_ = true,
       }),
-      tx.txid_);
+      tx.txid_,
+      local_completion ? CurrentStore().worker_->id()
+                       : GroupedCommitDecision::kRemoteCompletion);
   return tx.grouped_decision_;
 }
 
@@ -56,7 +60,23 @@ Task<absl::Status> StorageEngine::Impl::AwaitGroupedDependencyLocked(
       co_return absl::FailedPreconditionError(
           "prior grouped transaction did not commit");
     }
+    if (store.worker_->stop_requested())
+      co_return absl::CancelledError("worker stopped before grouped commit");
     store.store_state_mutex_.Unlock(*store.worker_);
+    if (decision->completion_owner_ == store.worker_->id()) {
+      // No suspension separates the state check from waiter registration:
+      // Unlock only enqueues another coroutine. The local commit queue wakes
+      // after publishing either outcome, including a failed commit. Flushes
+      // can also wake us before the decision, so always recheck its state.
+#if LAVIK_FAULTS_ENABLED
+      co_await GroupedDependencyTestWaiter(store.durability_progress_,
+                                           decision->txid_);
+#else
+      co_await store.durability_progress_.Wait();
+#endif
+      co_await store.store_state_mutex_.Lock();
+      continue;
+    }
     const auto waited = co_await bycorf::SleepFor(
         *store.worker_, std::chrono::microseconds(50));
     co_await store.store_state_mutex_.Lock();
@@ -123,7 +143,7 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
       .value_ = payload,
       .digest_ = digest,
       .mutation_sequence_ = sequence,
-      .logical_size_ = snapshot.value_.entries_.size(),
+      .logical_size_ = snapshot.field_count(),
       .written_location_ = &location,
       .tx_ = &tx,
       .known_partition_ = &partition,

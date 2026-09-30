@@ -18,6 +18,7 @@
 #include <new>
 
 #include "absl/strings/str_cat.h"
+#include "grouped_dependency_test_hook.h"
 #include "impl.h"
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
@@ -627,6 +628,11 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   // all-or-nothing promise: dying here must abort the whole transaction.
   LAVIK_MAYBE_CRASH_AT("tx-commit-append");
   WorkerStore& store = CurrentStore();
+  LAVIK_FAULT_INJECT({
+    const auto gated = co_await PauseGroupedDecisionForTest(
+        *store.worker_, store.durability_progress_, shards, true);
+    if (!gated.ok()) co_return gated;
+  });
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   RecordLocation commit_location;
@@ -681,12 +687,18 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
                                        commit_location.total_disk_bytes()),
     });
     if (!durable.ok()) co_return durable;
+    LAVIK_FAULT_INJECT({
+      const auto gated = co_await PauseGroupedDecisionForTest(
+          *store.worker_, store.durability_progress_, shards, false);
+      if (!gated.ok()) co_return gated;
+    });
     for (auto* shard : shards) {
       if (shard != nullptr && shard->grouped_decision_ != nullptr) {
         shard->grouped_decision_->state_.store(
             GroupedCommitDecision::State::kDurable, std::memory_order_release);
       }
     }
+    store.durability_progress_.NotifyAll(*store.worker_);
   }
   dependency_guard.completed_ = true;
   co_return absl::OkStatus();
@@ -922,6 +934,10 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
         spdlog::warn("transaction batch decision flush failed: {}",
                      decisions_durable.message());
     }
+    // Local grouped successors wait for the decision, not merely its last
+    // data/header flush. Wake after outcome publication, also when a failed
+    // CommitTxWrites poisoned the decision while unwinding its guard.
+    store->durability_progress_.NotifyAll(*store->worker_);
     for (std::size_t index = 0; index < batch.size(); ++index)
       NoteTxCommitFinished();
   }

@@ -68,6 +68,7 @@
 #include "lavik/storage/detail/record_index.h"
 #include "lavik/storage/detail/record_payload_cursor.h"
 #include "lavik/storage/detail/replica_collection_stage.h"
+#include "lavik/storage/detail/tx_block_leases.h"
 #include "lavik/storage/format.h"
 #include "lavik/storage/scan_hash_map.h"
 #include "lavik/tx/tx_shard.h"
@@ -355,8 +356,9 @@ static_assert(alignof(BlockState) == 32);
 // acquire owner load observes the epoch initialized before publication; live-
 // byte accounting prevents either field from changing while the entry is
 // current.
+template <typename Entry>
 inline RecordLocation MaterializePublishedIndexLocation(
-    const RecordIndex::Entry& entry, const BlockState& state) noexcept {
+    const Entry& entry, const BlockState& state) noexcept {
   const std::uint16_t owner = state.owner_.load(std::memory_order_acquire);
   const std::uint64_t allocation_epoch = state.allocation_epoch_;
   assert(owner < kMaxMemoryWorkers);
@@ -1899,7 +1901,7 @@ class StorageEngine::Impl {
       std::uint32_t backlog_bytes_ = 0;
       // Weak leases identify only transactions that wrote this block. Keeping
       // a strong lease here would itself prevent a block from settling.
-      absl::flat_hash_map<std::uint64_t, std::weak_ptr<void>> txids_;
+      TxBlockLeases txids_;
       // The commit record is written once by its coordinator. Its block owns
       // the decision and the append boundary needed for a durability wait.
       absl::flat_hash_map<std::uint64_t, std::uint32_t> commit_ends_;
@@ -1908,6 +1910,17 @@ class StorageEngine::Impl {
     // beyond the dense BlockState. Recovery rebuilds it from Tx records.
     absl::flat_hash_map<std::uint64_t, TxBlockRuntime> tx_blocks_;
     std::atomic<std::uint64_t> tx_backlog_bytes_{0};
+    // Only the owner, under store_state_mutex_, can prove all sealed-block
+    // leases expired. Expiration is monotonic until membership changes. A new
+    // seal or an append to a counted block invalidates that proof before
+    // publishing the additional backlog. Readers may then skip owner RPCs
+    // while snapshots pin already-settled blocks; no data is cached here.
+    std::atomic<bool> tx_backlog_may_have_writers_{true};
+    // A positive admission probe first revisits this block. Validate its
+    // allocation identity before trusting it: retirement/reuse must not make
+    // a new transaction wait on an unrelated allocation's lease. Owner-only.
+    std::optional<std::pair<std::uint64_t, std::uint64_t>>
+        tx_backlog_writer_block_;
     // Deferred manifests carried by retirement receipts are released after
     // source bitmap retirement. UUID dependencies use the separate maps above.
     absl::flat_hash_map<std::uint64_t, std::vector<ExtentManifest>>
@@ -3415,8 +3428,8 @@ class StorageEngine::Impl {
   // and retirement cannot reset that state until the index stops referencing
   // it. The returned value then owns the epoch snapshot and is safe to carry
   // across suspension even if a later relocation replaces the index entry.
-  RecordLocation MaterializeIndexLocation(
-      const RecordIndex::Entry& entry) const noexcept {
+  template <typename Entry>
+  RecordLocation MaterializeIndexLocation(const Entry& entry) const noexcept {
     const std::uint64_t block_id = entry.value_.block_id();
     const BlockState& state = const_cast<Impl*>(this)->BlockStateAt(block_id);
     RecordLocation location = MaterializePublishedIndexLocation(entry, state);
@@ -3816,8 +3829,10 @@ class StorageEngine::Impl {
     GroupRecordWrite* root_ = nullptr;
   };
 
+  // local_completion requires commit/failure to finish on this worker. Only
+  // standalone grouped receipts have that guarantee, not borrowed EXEC/Lua.
   absl::StatusOr<std::shared_ptr<GroupedCommitDecision>> PrepareGroupedDecision(
-      TxShardWrites& tx);
+      TxShardWrites& tx, bool local_completion = false);
   // Retains the existing store mutex contract: releases it only while
   // awaiting a prior independent transaction's durable commit, then restores
   // ownership on every return. Caller revalidates key/population afterward.

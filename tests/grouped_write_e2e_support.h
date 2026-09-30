@@ -344,8 +344,8 @@ class Server {
          std::string_view crash = {}, std::string_view fail_aux = {},
          bool pause_handoff = false, unsigned fail_aux_nth = 2,
          std::string_view max_memory = "1G", std::string_view load_rdb = {},
-         std::string_view max_memory_clients = {},
-         unsigned flush_pause_ms = 0) {
+         std::string_view max_memory_clients = {}, unsigned flush_pause_ms = 0,
+         unsigned flush_max_ms = 20) {
     const int socket = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     Check(socket >= 0, "port socket failed");
     sockaddr_in address{.sin_family = AF_INET,
@@ -401,7 +401,7 @@ class Server {
                                     "--max-memory",
                                     std::string(max_memory),
                                     "--flush-max-ms",
-                                    "20",
+                                    std::to_string(flush_max_ms),
                                     "--logtostderr",
                                     "--data-file",
                                     disk.path(),

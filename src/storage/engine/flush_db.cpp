@@ -372,7 +372,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
     // released as a unit, so they are collected per record rather than
     // folded into the per-block totals.
     std::vector<std::shared_ptr<const std::vector<ExtentRef>>> dead_extents;
-    const auto accumulate_record = [&](const RecordIndex::Entry& entry,
+    const auto accumulate_record = [&](const auto& entry,
                                        const ExtentManifest& manifest) {
       const RecordLocation location = MaterializeIndexLocation(entry);
       BlockDelta& delta = dead_by_block[std::pair(location.block_id(),
@@ -408,7 +408,8 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
           // a null reservation contributes metadata capacity, not a graph.
           return;
         }
-        object->ForEachRecord([&](HashGroupId, const RecordIndex::Entry& entry,
+        object->ForEachRecord([&](HashGroupId,
+                                  const GroupedRecordIndexEntry& entry,
                                   const ExtentManifest& manifest, bool) {
           if (entry.value_.external() != static_cast<bool>(manifest)) {
             grouped_status = absl::InternalError(

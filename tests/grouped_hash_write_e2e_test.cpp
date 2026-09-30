@@ -15,6 +15,7 @@
  */
 
 #include <cerrno>
+#include <future>
 #include <memory>
 #include <optional>
 
@@ -37,6 +38,72 @@ struct HashDiskLayout {
   GroupedHashRoot root_;
   bool empty_tail_ = false;
 };
+
+TEST(GroupedHashWriteE2e, ConcurrentLocalAndExecWritesRecover) {
+  PrivateDisk disk;
+  disk.PreserveOnFailure();
+  constexpr unsigned kWriters = 8;
+  constexpr unsigned kUpdates = 64;
+  const std::string large_member(17000, 'm');
+  {
+    // Stress shared commit batches and EXEC coordinators on different workers.
+    // The gated tests below separately establish dependency-wait ordering.
+    Server server(disk, 3, {}, {}, false, 2, "1G", {}, {}, 100);
+    server.PreserveOnFailure();
+    std::vector<std::future<void>> writers;
+    for (unsigned writer = 0; writer < kWriters; ++writer) {
+      writers.push_back(std::async(std::launch::async, [&, writer] {
+        Client client(server.port());
+        const auto hash = "wake-hash-" + std::to_string(writer);
+        const auto set = "wake-set-" + std::to_string(writer);
+        Check(client.Command(HashCommand(hash)).text_ == "256", "seed Hash");
+        Check(client.Command({"SADD", set, large_member}).text_ == "1",
+              "seed Set");
+        for (unsigned i = 0; i < kUpdates; ++i) {
+          const auto value = std::to_string(i);
+          if (i % 8 == 0) {
+            Check(client.Command({"MULTI"}).text_ == "OK", "begin EXEC");
+            Check(client.Command({"HSET", hash, "counter", "exec-" + value})
+                          .text_ == "QUEUED",
+                  "queue Hash update");
+            Check(client.Command({"SADD", set, "exec-" + value}).text_ ==
+                      "QUEUED",
+                  "queue Set update");
+            Check(client.Command({"EXEC"}).kind_ == '*', "finish EXEC");
+          }
+          Check(client.Command({"HSET", hash, "counter", value}).kind_ == ':',
+                "standalone Hash successor");
+          Check(client.Command({"SADD", set, value}).kind_ == ':',
+                "standalone Set successor");
+          if (i % 8 == 0)
+            Check(client.Command({"SREM", set, "exec-" + value}).text_ == "1",
+                  "remove EXEC member");
+          if (i != 0)
+            Check(client.Command({"SREM", set, std::to_string(i - 1)}).text_ ==
+                      "1",
+                  "Set removal successor");
+        }
+        client.Durable();
+      }));
+    }
+    for (auto& writer : writers) writer.get();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  for (unsigned writer = 0; writer < kWriters; ++writer) {
+    const auto hash = "wake-hash-" + std::to_string(writer);
+    const auto set = "wake-set-" + std::to_string(writer);
+    EXPECT_EQ(client.Command({"HLEN", hash}).text_, "257");
+    EXPECT_EQ(client.Command({"HGET", hash, "counter"}).text_,
+              std::to_string(kUpdates - 1));
+    EXPECT_EQ(client.Command({"SCARD", set}).text_, "2");
+    EXPECT_EQ(client.Command({"SISMEMBER", set, large_member}).text_, "1");
+    EXPECT_EQ(
+        client.Command({"SISMEMBER", set, std::to_string(kUpdates - 1)}).text_,
+        "1");
+  }
+}
 
 HashDiskLayout InspectHashLayout(const PrivateDisk& disk,
                                  std::string_view key) {
@@ -784,6 +851,39 @@ TEST(GroupedHashWriteE2e, SetUsesSameGroupedLifecycleWithSetType) {
   }
 }
 
+TEST(GroupedHashWriteE2e, BatchedMembersSurviveGrowthAndDuplicateLookup) {
+  PrivateDisk disk;
+  std::vector<std::string> members;
+  for (unsigned i = 0; i < 1024; ++i)
+    members.push_back(i % 2 == 0 ? "s" + std::to_string(i)
+                                 : std::string(1024, 'm') + std::to_string(i));
+  {
+    Server server(disk);
+    Client client(server.port());
+    for (unsigned batch = 0; batch < 2; ++batch) {
+      std::vector<std::string> args{"SADD", "position-set"};
+      const unsigned begin = batch * 512;
+      for (unsigned i = begin; i < begin + 512; ++i) args.push_back(members[i]);
+      // Resolve early SSO and heap members after the vector has grown. The
+      // second batch also indexes members decoded from the existing groups.
+      args.insert(args.end(),
+                  {members[0], members[1], members[begin], members[begin + 1]});
+      ASSERT_EQ(client.Command(args).text_, "512");
+      EXPECT_EQ(client.Command(args).text_, "0");
+    }
+    EXPECT_EQ(client.Command({"SCARD", "position-set"}).text_, "1024");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  std::vector<std::string> args{"SMISMEMBER", "position-set"};
+  args.insert(args.end(), members.begin(), members.end());
+  const auto reply = client.Command(args);
+  ASSERT_EQ(reply.items_.size(), members.size());
+  for (const auto& item : reply.items_) EXPECT_EQ(item.text_, "1");
+}
+
 // Child servers inherit only this scoped fault setting; the target never sees
 // it, and restoring the parent environment also covers fixture exceptions.
 class ScopedSourceFault {
@@ -804,6 +904,127 @@ class ScopedSourceFault {
   const char* variable_;
   std::optional<std::string> old_;
 };
+
+// Files control the child worker without blocking it. Log markers are emitted
+// only after AsyncNotification has registered the actual successor coroutine.
+class DependencyGate {
+ public:
+  explicit DependencyGate(const PrivateDisk& disk)
+      : base_(disk.path() + ".dependency"),
+        fault_("LAVIK_GROUPED_DEPENDENCY_GATE", base_.c_str()) {}
+  ~DependencyGate() {
+    for (const auto* suffix : {"arm", "fail", "notify", "release"})
+      ::unlink((base_ + "." + suffix).c_str());
+  }
+  void Signal(std::string_view suffix) const {
+    std::ofstream file(base_ + "." + std::string(suffix));
+    Check(file.good(), "create dependency gate signal");
+  }
+  bool WaitForLog(const Server& server, std::string_view marker) const {
+    const auto until = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < until) {
+      if (server.Log().find(marker) != std::string::npos) return true;
+      if (!server.Running()) return false;
+      std::this_thread::sleep_for(1ms);
+    }
+    return false;
+  }
+
+ private:
+  std::string base_;
+  ScopedSourceFault fault_;
+};
+
+void CheckLocalDependencyWakeup(bool hash, bool fail) {
+  SCOPED_TRACE(hash ? "Hash" : "Set");
+  PrivateDisk disk;
+  disk.PreserveOnFailure();
+  DependencyGate gate(disk);
+  // Destroy the server before the future on ANY assertion/exception path.
+  // Killing the child releases the socket, so a missed wake cannot hang the
+  // test in std::async's joining destructor (nor wait for the gate timeout).
+  std::future<Reply> successor;
+  // Even an idle periodic flush notifies on exit. Put its interval beyond the
+  // bounded test lifetime so it cannot rescue a missing terminal notification.
+  // CommitTxWrites still explicitly requests all data and decision flushes.
+  Server server(disk, 2, {}, {}, false, 2, "1G", {}, {}, 0, 3'600'000);
+  server.PreserveOnFailure();
+  Client client(server.port());
+  const std::string key = "dependency";
+  const std::string large_member(17000, 'm');
+  ASSERT_EQ(
+      client
+          .Command(hash ? HashCommand(key)
+                        : std::vector<std::string>{"SADD", key, large_member})
+          .kind_,
+      ':');
+  client.Durable();
+  if (fail) gate.Signal("fail");
+  gate.Signal("arm");
+  const auto predecessor =
+      hash ? std::vector<std::string>{"HSET", key, "counter", "predecessor"}
+           : std::vector<std::string>{"SADD", key, "predecessor"};
+  ASSERT_EQ(client.Command(predecessor).text_, "1");
+  ASSERT_TRUE(gate.WaitForLog(server, "grouped dependency decision held txid="))
+      << server.Log();
+  const auto log = server.Log();
+  const std::string prefix = "grouped dependency decision held txid=";
+  const auto start = log.find(prefix) + prefix.size();
+  const auto txid =
+      log.substr(start, log.find_first_not_of("0123456789", start) - start);
+  const auto registered = "grouped dependency waiter registered txid=" + txid;
+  successor = std::async(std::launch::async, [hash, key, port = server.port()] {
+    Client next(port);
+    return next.Command(
+        hash ? std::vector<std::string>{"HSET", key, "counter", "successor"}
+             : std::vector<std::string>{"SADD", key, "successor"});
+  });
+  ASSERT_TRUE(gate.WaitForLog(server, registered + " probed=false"))
+      << server.Log();
+  EXPECT_EQ(successor.wait_for(0s), std::future_status::timeout);
+  gate.Signal("notify");
+  // A real wake while kPending must run the loop and register again. Waiting
+  // for this marker, rather than sleeping, proves the early wake was handled.
+  ASSERT_TRUE(gate.WaitForLog(server, registered + " probed=true"))
+      << server.Log();
+  EXPECT_EQ(successor.wait_for(0s), std::future_status::timeout);
+  gate.Signal("release");
+  ASSERT_EQ(successor.wait_for(5s), std::future_status::ready) << server.Log();
+  const auto reply = successor.get();
+  if (fail) {
+    EXPECT_EQ(reply.kind_, '-');
+    EXPECT_NE(reply.text_.find("prior grouped transaction did not commit"),
+              std::string::npos)
+        << reply.text_;
+    EXPECT_NE(server.Log().find("injected grouped commit failure"),
+              std::string::npos);
+  } else {
+    EXPECT_EQ(reply.kind_, ':');
+    EXPECT_EQ(reply.text_, hash ? "0" : "1");
+    client.Durable();
+    EXPECT_EQ(
+        client
+            .Command(
+                hash ? std::vector<std::string>{"HGET", key, "counter"}
+                     : std::vector<std::string>{"SISMEMBER", key, "successor"})
+            .text_,
+        hash ? "successor" : "1");
+  }
+}
+
+TEST(GroupedHashWriteE2e, LocalSuccessorWaitsUntilCommitDecision) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires grouped dependency gate";
+#endif
+  for (const bool hash : {true, false}) CheckLocalDependencyWakeup(hash, false);
+}
+
+TEST(GroupedHashWriteE2e, LocalSuccessorWakesOnCommitFailure) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires grouped dependency gate";
+#endif
+  for (const bool hash : {true, false}) CheckLocalDependencyWakeup(hash, true);
+}
 
 TEST(HashReplaceE2e, ColdReplacementDoesNotLoadOldPayload) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE

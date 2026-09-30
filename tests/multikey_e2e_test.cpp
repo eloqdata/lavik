@@ -285,7 +285,8 @@ class ServerProcess {
                 std::string_view order_hold_ms = {},
                 std::string_view standby_pause_ms = {},
                 std::string_view fail_replication_transaction_containing = {},
-                bool shutdown_checkpoint = false) {
+                bool shutdown_checkpoint = false,
+                std::string_view record_pause_key = {}) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
@@ -299,6 +300,10 @@ class ServerProcess {
       if (!fail_tx_write.empty()) {
         (void)::setenv("LAVIK_FAIL_TX_WRITE",
                        std::string(fail_tx_write).c_str(), 1);
+      }
+      if (!record_pause_key.empty()) {
+        (void)::setenv("LAVIK_RECORD_WRITE_PAUSE_KEY",
+                       std::string(record_pause_key).c_str(), 1);
       }
       if (!tx_active_pause_ms.empty()) {
         (void)::setenv("LAVIK_TX_ACTIVE_BLOCK_PAUSE_MS",
@@ -1080,7 +1085,9 @@ int main(int argc, char** argv) {
            "+OK", "persist a sealed transaction block for recovery");
     recovered_server.Stop();
 
-    ServerProcess block_recovery_server(argv[1], port, data_path, log_path);
+    ServerProcess block_recovery_server(argv[1], port, data_path, log_path, {},
+                                        {}, false, 4, {}, {}, {}, false,
+                                        "{tx-pressure}paused");
     RespClient block_recovery = ConnectReady(port);
     const std::uint64_t recovered_cleaner_baseline =
         TxCleanerRetiredBlocks(block_recovery);
@@ -1144,6 +1151,36 @@ int main(int argc, char** argv) {
     Expect(block_recovery.Command({"MSET", "{tx-pressure}next", "next",
                                    "{tx-pressure}last", "last"}),
            "+OK", "new transaction admitted after prior lease ended");
+#if LAVIK_TEST_FAULTS_AVAILABLE
+    // The previous admission observed expired leases. A later seal must
+    // invalidate that proof: hold a new transaction after it fills two blocks,
+    // then verify an unrelated transaction waits before taking key intents.
+    const auto pause_count = CountOccurrences(
+        ReadFile(log_path), "record write publication pause armed");
+    auto active_pressure = std::async(std::launch::async, [&] {
+      RespClient client = Connect(port);
+      auto args = pressure_args;
+      args.push_back("{tx-pressure}paused");
+      args.push_back("finish");
+      return client.Command(args);
+    });
+    if (!WaitForLogMarkerCount(log_path, "record write publication pause armed",
+                               pause_count + 1))
+      Fail("new transaction did not reach its publication pause");
+    auto blocked_pressure = std::async(std::launch::async, [port] {
+      RespClient client = Connect(port);
+      return client.Command(
+          {"MSET", "pressure-unrelated-a", "a", "pressure-unrelated-b", "b"});
+    });
+    if (blocked_pressure.wait_for(200ms) == std::future_status::ready)
+      Fail("new sealed blocks did not restore transaction backpressure");
+    if (active_pressure.wait_for(10s) != std::future_status::ready ||
+        blocked_pressure.wait_for(10s) != std::future_status::ready)
+      Fail("transaction backpressure did not release after commit");
+    Expect(active_pressure.get(), "+OK", "transaction crossing backlog limit");
+    Expect(blocked_pressure.get(), "+OK",
+           "transaction admitted after new lease ended");
+#endif
     Expect(block_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "resume periodic cleaning after the next transaction");
@@ -1159,32 +1196,39 @@ int main(int argc, char** argv) {
     // UNDO has restored every old value, dependency pins drop and the same
     // cleaner can retire the aborted tagged records safely.
     ServerProcess rollback_server(argv[1], port, data_path, log_path,
-                                  "cleaner-undo-d");
+                                  "cleaner-undo-d{tx-undo}");
     RespClient rollback = ConnectReady(port);
     Expect(rollback.Command({"GET", pressure_keys.front()}), Bulk(large_value),
            "large transaction remains readable after restart");
     Expect(rollback.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "enable tx cleaner during rollback");
-    for (std::string_view key : {"cleaner-undo-a", "cleaner-undo-b",
-                                 "cleaner-undo-c", "cleaner-undo-d"}) {
+    for (std::string_view key :
+         {"cleaner-undo-a{tx-undo}", "cleaner-undo-b{tx-undo}",
+          "cleaner-undo-c{tx-undo}", "cleaner-undo-d{tx-undo}"}) {
       Expect(rollback.Command({"SET", key, "old", "EX", "600"}), "+OK",
              "tx cleaner rollback seed");
     }
     const std::uint64_t rollback_cleaner_baseline =
         TxCleanerRetiredBlocks(rollback);
+    // Keep the failed writes on one owner and roll over its Tx stream before
+    // the fourth-key fault. Small writes stay in an active block for up to a
+    // minute; counting unrelated recovered blocks would hide that lifecycle.
+    const std::string rollback_value(3 * 1024 * 1024, 'u');
     const std::string failed = rollback.Command(
-        {"MSET", "cleaner-undo-a", "new-a", "cleaner-undo-b", "new-b",
-         "cleaner-undo-c", "new-c", "cleaner-undo-d", "new-d"});
+        {"MSET", "cleaner-undo-a{tx-undo}", rollback_value,
+         "cleaner-undo-b{tx-undo}", rollback_value, "cleaner-undo-c{tx-undo}",
+         rollback_value, "cleaner-undo-d{tx-undo}", rollback_value});
     if (!failed.starts_with("-ERR injected transaction write fault")) {
       Fail("fault-injected MSET unexpectedly returned: " + failed);
     }
-    Expect(rollback.Command({"MGET", "cleaner-undo-a", "cleaner-undo-b",
-                             "cleaner-undo-c", "cleaner-undo-d"}),
+    Expect(rollback.Command(
+               {"MGET", "cleaner-undo-a{tx-undo}", "cleaner-undo-b{tx-undo}",
+                "cleaner-undo-c{tx-undo}", "cleaner-undo-d{tx-undo}"}),
            "*4\r\n" + Bulk("old") + "\r\n" + Bulk("old") + "\r\n" +
                Bulk("old") + "\r\n" + Bulk("old"),
            "UNDO values while tx cleaner is enabled");
-    Expect(rollback.Command({"EXPIRE", "cleaner-undo-a", "600", "NX"}), ":0",
-           "UNDO restores TTL representation");
+    Expect(rollback.Command({"EXPIRE", "cleaner-undo-a{tx-undo}", "600", "NX"}),
+           ":0", "UNDO restores TTL representation");
     if (!WaitForCleanerBlockRetirement(rollback, rollback_cleaner_baseline)) {
       Fail(
           "transaction cleaner did not retire the rolled-back transaction "
@@ -1194,15 +1238,15 @@ int main(int argc, char** argv) {
 
     ServerProcess rollback_recovered_server(argv[1], port, data_path, log_path);
     RespClient rollback_recovered = ConnectReady(port);
-    Expect(
-        rollback_recovered.Command({"MGET", "cleaner-undo-a", "cleaner-undo-b",
-                                    "cleaner-undo-c", "cleaner-undo-d"}),
-        "*4\r\n" + Bulk("old") + "\r\n" + Bulk("old") + "\r\n" + Bulk("old") +
-            "\r\n" + Bulk("old"),
-        "UNDO values after cleaner restart");
-    Expect(
-        rollback_recovered.Command({"EXPIRE", "cleaner-undo-a", "600", "NX"}),
-        ":0", "UNDO TTL survives recovery");
+    Expect(rollback_recovered.Command(
+               {"MGET", "cleaner-undo-a{tx-undo}", "cleaner-undo-b{tx-undo}",
+                "cleaner-undo-c{tx-undo}", "cleaner-undo-d{tx-undo}"}),
+           "*4\r\n" + Bulk("old") + "\r\n" + Bulk("old") + "\r\n" +
+               Bulk("old") + "\r\n" + Bulk("old"),
+           "UNDO values after cleaner restart");
+    Expect(rollback_recovered.Command(
+               {"EXPIRE", "cleaner-undo-a{tx-undo}", "600", "NX"}),
+           ":0", "UNDO TTL survives recovery");
     rollback_recovered_server.Stop();
 
 #if LAVIK_TEST_FAULTS_AVAILABLE
@@ -1325,12 +1369,20 @@ int main(int argc, char** argv) {
     ServerProcess retry_server(argv[1], port, data_path, log_path, {}, {},
                                true);
     RespClient retry = ConnectReady(port);
+    Expect(retry.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
+           "+OK", "hold cleanup until the retry fixture seals its own block");
     const std::uint64_t failure_baseline =
         InfoStat(retry, "tx_cleaner_failures:");
     const std::uint64_t retry_retired_baseline = TxCleanerRetiredBlocks(retry);
     Expect(retry.Command({"MSET", "cleaner-retry-a{tx}", "durable-a",
                           "cleaner-retry-b{tx}", "durable-b"}),
            "+OK", "seed retryable cleaner failure");
+    // Seal this fixture's stream rather than depending on a recovered block
+    // from an earlier test. The fault is then exercised by periodic cleanup.
+    const std::string retry_fill(5 * 1024 * 1024, 'r');
+    Expect(retry.Command({"MSET", "cleaner-retry-fill-a{tx}", retry_fill,
+                          "cleaner-retry-fill-b{tx}", retry_fill}),
+           "+OK", "seal the retry fixture transaction stream");
     Expect(retry.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "enable retryable cleaner fixture");
     if (!WaitForCleanerStat(retry, "tx_cleaner_failures:", failure_baseline,

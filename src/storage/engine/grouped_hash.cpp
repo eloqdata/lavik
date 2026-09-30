@@ -20,6 +20,8 @@
 #include <limits>
 #include <utility>
 
+#include "absl/container/flat_hash_map.h"
+
 namespace lavik::storage {
 namespace {
 
@@ -157,9 +159,17 @@ absl::StatusOr<GroupedHashRoot> DecodeGroupedHashRoot(std::string_view bytes) {
 
 absl::StatusOr<HashGroupEncoder> HashGroupEncoder::Create(
     const HashGroupSnapshot& group) {
-  auto valid = ValidateFields(group, nullptr);
-  if (!valid.ok()) return valid;
-  auto size = PayloadBytes(group.value_);
+  if (group.prepared_ &&
+      (group.incarnation_ == 0 || group.retired_ ||
+       group.id_ != group.prepared_->id() || !group.value_.entries_.empty()))
+    return absl::InvalidArgumentError("invalid prepared Hash group");
+  if (!group.prepared_) {
+    auto valid = ValidateFields(group, nullptr);
+    if (!valid.ok()) return valid;
+  }
+  auto size = group.prepared_
+                  ? absl::StatusOr<std::size_t>(group.prepared_->bytes().size())
+                  : PayloadBytes(group.value_);
   if (!size.ok()) return size.status();
   HashGroupEncoder cursor;
   cursor.group_ = &group;
@@ -170,7 +180,7 @@ absl::StatusOr<HashGroupEncoder> HashGroupEncoder::Create(
   Store(bytes, 12, kGroupHeaderBytes, 4);
   Store(bytes, 16, group.incarnation_, 8);
   Store(bytes, 24, group.id_.prefix_, 8);
-  Store(bytes, 32, group.value_.entries_.size(), 4);
+  Store(bytes, 32, group.field_count(), 4);
   Store(bytes, 36, *size, 4);
   Store(bytes, 40, group.id_.bits_, 1);
   Store(bytes, 41, group.retired_, 1);
@@ -186,6 +196,18 @@ absl::StatusOr<HashGroupEncoder> HashGroupEncoder::Create(
 
 std::optional<std::string_view> HashGroupEncoder::Next() noexcept {
   if (group_ == nullptr) return std::nullopt;
+  if (group_->prepared_) {
+    if (phase_ == 0) {
+      phase_ = 1;
+      return std::string_view(header_.data(), kGroupHeaderBytes);
+    }
+    if (phase_ == 1) {
+      phase_ = 2;
+      if (!group_->prepared_->bytes().empty())
+        return group_->prepared_->bytes();
+    }
+    return std::nullopt;
+  }
   if (phase_ == 0) {
     phase_ = 1;
     return std::string_view(header_.data(), group_->value_.entries_.empty()
@@ -276,9 +298,135 @@ absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(std::string_view bytes) {
   return group;
 }
 
+absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
+    std::string_view payload, const DigestSeed& seed, HashGroupEditKind kind,
+    std::span<const HashEntryView> edits) {
+  auto metadata = DecodeHashGroupMetadata(payload, payload.size());
+  if (!metadata.ok()) return metadata.status();
+  if (metadata->retired_)
+    return absl::DataLossError("cannot edit a retired Hash leaf");
+  struct Entry {
+    HashEntryView view;
+    bool removed = false;
+  };
+  // Reuse the persisted-seed digest required for route validation instead of
+  // hashing every field a second time for the temporary lookup table. Compare
+  // complete bytes on collisions; the digest is never a field identity.
+  struct FieldKey {
+    std::string_view field;
+    std::uint64_t hash;
+    bool operator==(const FieldKey&) const = default;
+  };
+  struct FieldHash {
+    std::size_t operator()(const FieldKey& key) const { return key.hash; }
+  };
+  std::vector<Entry> entries;
+  absl::flat_hash_map<FieldKey, std::size_t, FieldHash> positions;
+  if (edits.size() > UINT32_MAX - metadata->field_count_)
+    return absl::OutOfRangeError("Hash edit cardinality overflow");
+  entries.reserve(metadata->field_count_ + edits.size());
+  positions.reserve(metadata->field_count_ + edits.size());
+  if (metadata->field_count_ != 0) {
+    auto reader = HashValueReader::Open(payload.substr(kGroupHeaderBytes));
+    if (!reader.ok()) return absl::DataLossError(reader.status().message());
+    if (reader->size() != metadata->field_count_)
+      return absl::DataLossError(
+          "Hash group inner count disagrees with envelope");
+    for (std::size_t i = 0; i < reader->size(); ++i) {
+      auto entry = reader->Next();
+      if (!entry.ok()) return absl::DataLossError(entry.status().message());
+      const auto hash = ComputeDigest(entry->field_, seed).value_;
+      if (!metadata->id_.contains(hash))
+        return absl::DataLossError("Hash field outside its group route");
+      if (!positions.emplace(FieldKey{entry->field_, hash}, entries.size())
+               .second)
+        return absl::DataLossError("duplicate field in Hash group");
+      entries.push_back({*entry});
+    }
+  }
+  HashGroupEdit result;
+  for (const auto& edit : edits) {
+    auto size = AppendHashEntrySize(kCompactHeaderBytes, edit.field_.size(),
+                                    edit.value_.size(), kHashGroupPayloadLimit);
+    if (!size.ok()) return size.status();
+    const FieldKey key{edit.field_, ComputeDigest(edit.field_, seed).value_};
+    if (!metadata->id_.contains(key.hash))
+      return absl::InvalidArgumentError("Hash edit outside its group route");
+    const auto found = positions.find(key);
+    if (kind == HashGroupEditKind::kDelete) {
+      if (found != positions.end()) {
+        entries[found->second].removed = true;
+        positions.erase(found);
+        ++result.removed_;
+        result.changed_ = true;
+      }
+    } else if (found == positions.end()) {
+      positions.emplace(key, entries.size());
+      entries.push_back({edit});
+      ++result.added_;
+      result.changed_ = true;
+    } else if (kind == HashGroupEditKind::kSet &&
+               entries[found->second].view.value_ != edit.value_) {
+      entries[found->second].view.value_ = edit.value_;
+      result.changed_ = true;
+    }
+  }
+  if (!result.changed_) return result;
+  const auto count = positions.size();
+  std::uint64_t bytes = count == 0 ? 0 : kCompactHeaderBytes;
+  for (const auto& entry : entries)
+    if (!entry.removed)
+      bytes += 8 + entry.view.field_.size() + entry.view.value_.size();
+  HashGroupSnapshot replacement{.incarnation_ = metadata->incarnation_,
+                                .id_ = metadata->id_,
+                                .value_ = {}};
+  if (bytes <= kCollectionGroupTargetBytes) {
+    // All views still borrow the read lease or immutable request. Copy each
+    // surviving byte once, then discard the index and lease before publication.
+    std::string encoded(bytes, '\0');
+    if (count != 0) {
+      Store(encoded, 0, kHashValueMagic, 8);
+      Store(encoded, 8, kStorageFormatVersion, 4);
+      Store(encoded, 12, kCompactHeaderBytes, 4);
+      Store(encoded, 16, count, 4);
+      Store(encoded, 24, bytes, 8);
+      std::size_t offset = kCompactHeaderBytes;
+      for (const auto& entry : entries) {
+        if (entry.removed) continue;
+        const auto& view = entry.view;
+        Store(encoded, offset, view.field_.size(), 4);
+        Store(encoded, offset + 4, view.value_.size(), 4);
+        offset += 8;
+        encoded.replace(offset, view.field_.size(), view.field_);
+        offset += view.field_.size();
+        encoded.replace(offset, view.value_.size(), view.value_);
+        offset += view.value_.size();
+      }
+    }
+    replacement.prepared_ =
+        PreparedHashGroupPayload(std::move(encoded), count, metadata->id_);
+    result.leaves_.push_back(std::move(replacement));
+  } else {
+    // Never construct a full serialized copy of an indivisible large value.
+    // The normal splitter and extent encoder retain their existing bounds.
+    replacement.value_.entries_.reserve(count);
+    for (const auto& entry : entries) {
+      if (entry.removed) continue;
+      replacement.value_.entries_.push_back(
+          {.digest_ = ComputeDigest(entry.view.field_),
+           .field_ = std::string(entry.view.field_),
+           .value_ = std::string(entry.view.value_)});
+    }
+    auto leaves = SplitHashGroup(std::move(replacement), seed);
+    if (!leaves.ok()) return leaves.status();
+    result.leaves_ = std::move(*leaves);
+  }
+  return result;
+}
+
 absl::StatusOr<std::vector<HashGroupSnapshot>> SplitHashGroup(
     HashGroupSnapshot group, const DigestSeed& seed, std::size_t target_bytes) {
-  if (target_bytes < kCompactHeaderBytes || group.retired_) {
+  if (target_bytes < kCompactHeaderBytes || group.retired_ || group.prepared_) {
     return absl::InvalidArgumentError("invalid Hash group split request");
   }
   auto valid = ValidateFields(group, &seed);
