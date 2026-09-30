@@ -555,6 +555,8 @@ TEST(GroupedStreamE2e, AggregateAbove512MiBKeepsHotPathsAndRecoveryBounded) {
 
 TEST(GroupedStreamE2e, LargeRepliesKeepSnapshotsAndDeletedHistory) {
   PrivateDisk disk(2ULL * 1024 * 1024 * 1024);
+  // Keep this budget tight: RESTORE must leave headroom for the destination's
+  // first side-index arena span while coalescing the large decoded messages.
   Server server(disk, 2, {}, {}, false, 2, "256M", {}, "128M");
   server.PreserveOnFailure();
   Client client(server.port());

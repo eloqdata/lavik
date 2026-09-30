@@ -248,6 +248,12 @@ class GroupedObjectIndex {
   absl::StatusOr<Publication> PreparePublish(std::string_view key,
                                              const Handle& expected);
 
+  // Owner-local headroom needed by PreparePublish at the current arena/table
+  // state. This probe does not reserve capacity across suspension; publication
+  // still performs its own admission before allocating.
+  std::size_t PublicationAllocationBytes(const Digest& digest,
+                                         std::string_view key) const noexcept;
+
   // A non-grouped root bypasses this table. A grouped root with a missing or
   // mismatched view is corruption/stale state, never an empty Hash fallback.
   // Failed transaction views are rejected by default. allow_failed is only

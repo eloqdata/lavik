@@ -999,9 +999,14 @@ TEST(GroupedObjectIndexTest,
       input.version_, input.directory_, input.locations_);
   ASSERT_TRUE(builder.ok());
   GroupedObjectIndex index;
+  const auto digest = ComputeDigest("cancel");
+  EXPECT_GE(index.PublicationAllocationBytes(digest, "cancel"),
+            ScanHashMapEntryArena::kSmallSpanAdmissionBytes);
+  EXPECT_TRUE(index.empty());  // Probing must not prepare a placeholder.
   {
     auto canceled = index.PreparePublish("cancel", nullptr);
     ASSERT_TRUE(canceled.ok());
+    EXPECT_EQ(index.PublicationAllocationBytes(digest, "cancel"), 0);
     EXPECT_FALSE(index.Lookup("cancel", input.version_).ok());
   }
   EXPECT_TRUE(index.empty());

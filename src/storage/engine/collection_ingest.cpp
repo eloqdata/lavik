@@ -382,9 +382,16 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
           4 * sizeof(RetiredRecord) + sizeof(TxShardWrites::Retired);
       const auto retirement_bytes =
           SaturatingIngestMultiply(retirement_records, 2 * retirement_width);
-      const auto required =
-          SaturatingIngestAdd(SaturatingIngestAdd(*headroom, directory_bytes),
-                              SaturatingIngestAdd(growth, retirement_bytes));
+      // A fresh side-table entry may allocate an entire arena span. Preserve
+      // that concrete publication cost while growing the input batch; a few
+      // metadata structs do not account for a cold worker's first span.
+      const auto publication_bytes =
+          partition.grouped_objects_[db_id].PublicationAllocationBytes(digest,
+                                                                       key);
+      const auto required = SaturatingIngestAdd(
+          SaturatingIngestAdd(*headroom, directory_bytes),
+          SaturatingIngestAdd(SaturatingIngestAdd(growth, retirement_bytes),
+                              publication_bytes));
       return required != SIZE_MAX && TryReserveMemory(required).has_value();
     };
     bool first_write = true;
