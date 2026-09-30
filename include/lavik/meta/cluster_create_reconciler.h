@@ -62,7 +62,8 @@ absl::Status ValidateClusterCreateMetaSet(
     const MetaClusterCreateRaftView& raft);
 
 // Plans at most one committed effect from an atomic recovered view. A missing
-// command means wait for Data; incompatible state requires operator recovery,
+// command means no admitted Group can advance; independent children make
+// bounded concurrent progress. Incompatible state requires operator recovery,
 // never another destructive initialization. No I/O or in-memory phase cursor.
 absl::StatusOr<std::optional<MetaCommand>> PlanClusterCreateStep(
     const MetaCommittedView& view, const MetaOperationRecord& operation,

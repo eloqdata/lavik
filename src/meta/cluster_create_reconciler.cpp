@@ -1195,49 +1195,97 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
     return Advance(operation, kRootPhaseInitializeGroups);
   }
 
+  // Count retained, unfinished children rather than process-local tasks: the
+  // same admission bound survives uncertain proposals and leader recovery.
+  // A waiting child consumes a slot, but does not block other admitted work.
+  constexpr std::size_t kMaxActiveGroups = 4;
+  std::vector<std::optional<MetaOperationRecord>> children;
+  children.reserve(manifest->groups_.size());
+  std::size_t active = 0;
+  std::size_t completed = 0;
+  std::optional<std::string> failure;
   for (const auto& declaration : manifest->groups_) {
-    const MetaOperationId child_id = detail::ClusterCreateV1GroupOperationId(
+    const auto child_id = detail::ClusterCreateV1GroupOperationId(
         operation.operation_id_, declaration.group_id_);
-    const auto child = stores.operation_.FindOperation(child_id);
-    if (!child.has_value()) {
-      if (stores.operation_.OperationKnown(child_id))
-        return Conflict(
-            absl::StrCat("creation Group operation was archived: group=",
-                         declaration.group_id_));
-      const auto group = stores.topology_.FindGroup(declaration.group_id_);
-      const auto grant = stores.topology_.AuthorityFor(declaration.group_id_);
-      const auto primary = std::find_if(
-          runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& node) {
-            return node.node_id_ == declaration.primary_node_id_;
-          });
-      if (!runtime.leader_authority_eligible_ ||
-          primary == runtime.nodes_.end() ||
-          !ProjectionMatches(*primary, *group, *grant, view.applied_index()))
-        return std::nullopt;
-      if (!cluster::control::IsCanonicalIdentity160(primary->boot_id_))
-        return Conflict(absl::StrCat("group=", declaration.group_id_,
-                                     " node=", declaration.primary_node_id_,
-                                     " boot identity is malformed"));
-      SubmitOperation submit;
-      submit.operation_id_ = child_id;
-      submit.kind_ = kMetaClusterCreateV1GroupOperationKind;
-      submit.intent_ =
-          absl::StrCat("cluster-create-v1-group ", Hex(operation.operation_id_),
-                       " ", absl::BytesToHexString(declaration.group_id_), " ",
-                       primary->boot_id_);
-      submit.intent_hash_ = MetaSha256(submit.intent_);
-      submit.replication_history_id_ = primary->replication_history_id_;
-      return Emit(std::move(submit));
+    auto child = stores.operation_.FindOperation(child_id);
+    if (!child && stores.operation_.OperationKnown(child_id))
+      return Conflict(
+          absl::StrCat("creation Group operation was archived: group=",
+                       declaration.group_id_));
+    if (child) {
+      if (child->lifecycle_ == MetaOperationLifecycle::kAborted) {
+        if (!failure) failure = child->terminal_result_;
+      } else if (child->lifecycle_ == MetaOperationLifecycle::kCompleted) {
+        ++completed;
+      } else {
+        ++active;
+      }
     }
-    if (child->lifecycle_ == MetaOperationLifecycle::kCompleted) continue;
-    if (child->lifecycle_ == MetaOperationLifecycle::kAborted)
-      return Abort(operation, absl::StrCat("group=", declaration.group_id_, " ",
-                                           child->terminal_result_));
-    auto next = PlanV1GroupStep(view, operation, *child, *manifest, declaration,
-                                runtime);
-    if (!next.ok() || next->has_value()) return next;
-    return std::nullopt;
+    children.push_back(std::move(child));
   }
+
+  std::optional<MetaCommand> runnable;
+  for (std::size_t index = 0; index < children.size(); ++index) {
+    const auto& child = children[index];
+    if (!child || IsTerminal(child->lifecycle_)) continue;
+    auto next = PlanV1GroupStep(view, operation, *child, *manifest,
+                                manifest->groups_[index], runtime);
+    if (!next.ok()) return next;
+    if (failure) {
+      // Root abort stops reconciliation. First retire every unfinished sibling
+      // using the existing durable failure phase, fence, then abort. Retain the
+      // original cause verbatim so a recovered scan cannot replace it with the
+      // identity of a cancelled sibling. Completed children are left intact.
+      if (!child->kind_phase_blob_.starts_with(kGroupFailurePrefix))
+        return Advance(*child, absl::StrCat(kGroupFailurePrefix, *failure));
+      return next;
+    }
+    if (!next->has_value()) continue;
+    // Detect failures across all active children before issuing more work. A
+    // later Group's failure must not hide behind an earlier runnable child.
+    const auto* transition = std::get_if<TransitionOperationPhase>(&**next);
+    if (std::holds_alternative<FenceGroup>(**next) ||
+        std::holds_alternative<AbortOperation>(**next) ||
+        (transition &&
+         transition->kind_phase_blob_.starts_with(kGroupFailurePrefix)))
+      return next;
+    if (!runnable) runnable = std::move(**next);
+  }
+  if (failure) return Abort(operation, *failure);
+  if (runnable) return runnable;
+  // Each child has finitely many forward-only phases. Canonical selection of
+  // runnable children cannot starve a later child behind a receipt/lease wait;
+  // finishing an admitted child also frees capacity before admitting more.
+  if (active >= kMaxActiveGroups) return std::nullopt;
+  for (std::size_t index = 0; index < children.size(); ++index) {
+    if (children[index]) continue;
+    const auto& declaration = manifest->groups_[index];
+    const auto group = stores.topology_.FindGroup(declaration.group_id_);
+    const auto grant = stores.topology_.AuthorityFor(declaration.group_id_);
+    const auto primary = std::find_if(
+        runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& node) {
+          return node.node_id_ == declaration.primary_node_id_;
+        });
+    if (!runtime.leader_authority_eligible_ ||
+        primary == runtime.nodes_.end() ||
+        !ProjectionMatches(*primary, *group, *grant, view.applied_index()))
+      continue;
+    if (!cluster::control::IsCanonicalIdentity160(primary->boot_id_))
+      return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                   " node=", declaration.primary_node_id_,
+                                   " boot identity is malformed"));
+    SubmitOperation submit;
+    submit.operation_id_ = detail::ClusterCreateV1GroupOperationId(
+        operation.operation_id_, declaration.group_id_);
+    submit.kind_ = kMetaClusterCreateV1GroupOperationKind;
+    submit.intent_ = absl::StrCat(
+        "cluster-create-v1-group ", Hex(operation.operation_id_), " ",
+        absl::BytesToHexString(declaration.group_id_), " ", primary->boot_id_);
+    submit.intent_hash_ = MetaSha256(submit.intent_);
+    submit.replication_history_id_ = primary->replication_history_id_;
+    return Emit(std::move(submit));
+  }
+  if (completed != children.size()) return std::nullopt;
   return Complete(operation);
 }
 
