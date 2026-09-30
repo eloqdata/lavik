@@ -450,18 +450,26 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
     const auto& directory = previous->ordered_directory();
     std::vector<LoadedOrderedGroup> loaded;
     const auto count = directory.groups().size();
-    for (std::size_t i = count > 1 ? count - 2 : 0; i < count; ++i) {
+    // Ordinary RDB ingestion may deliver reverse-score batches. Its caller
+    // sorts and routes only nonoverlapping batches here; preserve the native
+    // snapshot append contract and let the shared splice validate boundaries.
+    const bool prepend =
+        !native_snapshot && kind == OrderedCollectionKind::kSortedSet &&
+        entries.back().score_ < directory.groups().front().min_score_;
+    const auto begin = prepend ? 0 : count > 1 ? count - 2 : 0;
+    const auto end = prepend ? std::min<std::size_t>(2, count) : count;
+    for (std::size_t i = begin; i < end; ++i) {
       auto old = co_await LoadOrderedGroupSnapshot(
           store, partition, stage.db_id_, stage.key_, digest, previous,
           directory.groups()[i].id_);
       if (!old.ok()) co_return old.status();
       loaded.push_back(std::move(*old));
     }
-    auto appended = PlanOrderedCollectionSplice(directory, std::move(loaded),
-                                                directory.root().item_count_, 0,
-                                                std::move(entries));
-    if (!appended.ok()) co_return appended.status();
-    plan = std::move(*appended);
+    auto spliced = PlanOrderedCollectionSplice(
+        directory, std::move(loaded),
+        prepend ? 0 : directory.root().item_count_, 0, std::move(entries));
+    if (!spliced.ok()) co_return spliced.status();
+    plan = std::move(*spliced);
   }
   const auto written = co_await CommitGroupedOrderedMutationLocked(
       store, partition, stage.db_id_, stage.key_, digest, previous,

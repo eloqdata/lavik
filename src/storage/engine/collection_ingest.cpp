@@ -388,7 +388,33 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
           std::numeric_limits<std::uint32_t>::max() - state->applied_count_)
         co_return absl::DataLossError("collection cardinality overflow");
       absl::Status written;
+      bool splice_sorted = false;
       if (type == ValueType::kSortedSet && state->applied_count_ != 0) {
+        const auto current =
+            partition.grouped_objects_[db_id].CurrentForMutation(key);
+        if (current && current->has_member_index()) {
+          // RDB input need not be ordered. A batch strictly outside the staged
+          // score range can use a head/tail splice after sorting; overlapping
+          // scores (including ties) still use the general planner.
+          // The shared writer checks exact member identities against the
+          // member index before staging either graph, even for this splice.
+          const auto& groups = current->ordered_directory().groups();
+          const auto minimum = groups.front().min_score_;
+          const auto maximum = groups.back().max_score_;
+          splice_sorted = std::all_of(merged.scored_members_.begin(),
+                                      merged.scored_members_.end(),
+                                      [maximum](const auto& entry) {
+                                        return entry.score_ > maximum;
+                                      }) ||
+                          std::all_of(merged.scored_members_.begin(),
+                                      merged.scored_members_.end(),
+                                      [minimum](const auto& entry) {
+                                        return entry.score_ < minimum;
+                                      });
+        }
+      }
+      if (type == ValueType::kSortedSet && state->applied_count_ != 0 &&
+          !splice_sorted) {
         std::vector<ScoredMemberView> entries;
         auto admitted = ReserveIngestVector(entries, count, merge_charge);
         if (!admitted.ok()) co_return admitted;
@@ -407,13 +433,23 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
         written = added.ok() ? SquashReplicaCollectionUndo(store, *state)
                              : added.status();
       } else {
-        if (type == ValueType::kSortedSet)
-          std::sort(merged.scored_members_.begin(),
-                    merged.scored_members_.end(),
-                    [](const auto& left, const auto& right) {
-                      return std::tie(left.score_, left.member_) <
-                             std::tie(right.score_, right.member_);
-                    });
+        if (type == ValueType::kSortedSet) {
+          const auto less = [](const auto& left, const auto& right) {
+            return std::tie(left.score_, left.member_) <
+                   std::tie(right.score_, right.member_);
+          };
+          // Both forward and reverse score/member order occur in RDB input.
+          // Normalize either monotone case in linear time, retaining the full
+          // sort for arbitrary input and the writer's duplicate validation.
+          if (std::is_sorted(merged.scored_members_.rbegin(),
+                             merged.scored_members_.rend(), less))
+            std::reverse(merged.scored_members_.begin(),
+                         merged.scored_members_.end());
+          else if (!std::is_sorted(merged.scored_members_.begin(),
+                                   merged.scored_members_.end(), less))
+            std::sort(merged.scored_members_.begin(),
+                      merged.scored_members_.end(), less);
+        }
         written = co_await WriteReplicaCollectionPage(store, partition, stage,
                                                       std::move(merged));
       }
