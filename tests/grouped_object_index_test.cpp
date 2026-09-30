@@ -192,6 +192,22 @@ TEST(GroupedObjectIndexTest, CompressedPathsRetainAllHashPrefixLengthBits) {
   EXPECT_EQ((*moved)->FindRecord({0, 6})->value_.block_id(), 7);
   EXPECT_EQ((*moved)->FindRecord({0, 64})->value_.block_id(), 65);
   EXPECT_EQ((*moved)->record_count(), locations.size());
+  // A copied physical page must preserve all its other coordinates and
+  // retirement bits, including ancestors with the same uint64 prefix.
+  for (const auto& location : locations) {
+    const auto* entry = (*moved)->FindRecord(location.id_);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->value_.block_id(), location.id_ == HashGroupId(0, 7)
+                                            ? 200
+                                            : location.location_.block_id());
+    EXPECT_EQ(entry->value_.mutation_sequence_,
+              location.location_.mutation_sequence_);
+    EXPECT_EQ(entry->value_.logical_size(), location.location_.logical_size_);
+  }
+  (*moved)->ForEachRecord(
+      [&](HashGroupId id, const auto&, const auto&, bool retired) {
+        EXPECT_EQ(retired, id.prefix_ == 0 && id.bits_ < 64);
+      });
 }
 
 TEST(GroupedScratchBudgetTest, RejectsOverflowAndMissingExtentMetadata) {
@@ -883,8 +899,18 @@ TEST(GroupedObjectIndexTest,
   std::size_t shared_entries = 0;
   std::size_t shared_routes = 0;
   for (const auto& location : input.locations_) {
-    shared_entries +=
-        (*old)->FindRecord(location.id_) == (*next)->FindRecord(location.id_);
+    const auto* before = (*old)->FindRecord(location.id_);
+    const auto* after = (*next)->FindRecord(location.id_);
+    ASSERT_NE(before, nullptr);
+    ASSERT_NE(after, nullptr);
+    shared_entries += before == after;
+    EXPECT_EQ(after->value_.block_id(),
+              location.id_ == changed_id ? 500000 : before->value_.block_id());
+    EXPECT_EQ(
+        after->value_.mutation_sequence_,
+        location.id_ == changed_id ? 6 : before->value_.mutation_sequence_);
+    EXPECT_EQ(after->value_.logical_size(), before->value_.logical_size());
+    EXPECT_EQ(after->value_.record_offset(), before->value_.record_offset());
     shared_routes += &(*old)->directory().groups().at(location.id_.prefix_) ==
                      &(*next)->directory().groups().at(location.id_.prefix_);
   }

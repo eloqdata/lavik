@@ -294,6 +294,16 @@ class HashGroupMap {
     }
     return end();
   }
+  // Exact metadata lookup without constructing the ancestor stack needed by
+  // an iterator. The returned pointer borrows this immutable tree version.
+  const RecoveredHashGroup* Get(Key key) const noexcept {
+    const auto* node = root_.get();
+    while (node) {
+      if (key == node->entry_.first) return &node->entry_.second;
+      node = key < node->entry_.first ? node->left_.get() : node->right_.get();
+    }
+    return nullptr;
+  }
   const RecoveredHashGroup& at(Key key) const {
     const auto it = find(key);
     if (it == end()) throw std::out_of_range("group directory key");

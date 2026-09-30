@@ -425,6 +425,72 @@ TEST(GroupedHashTest, ReplayCommandSequenceIsIndependentOfGroupRevision) {
   EXPECT_FALSE(HashGroupDirectory::Recover(root, 7, candidates, {}).ok());
 }
 
+TEST(GroupedHashTest,
+     DirectoryReplacementAndSplitPreserveSnapshotsAndCoverage) {
+  auto root = Root(10, 4);
+  root.revision_ = 1;
+  std::vector<RecoveredHashGroup> records;
+  for (std::uint64_t i = 0; i < 4; ++i)
+    records.push_back({.incarnation_ = root.incarnation_,
+                       .id_ = {i << 62, 2},
+                       .sequence_ = 1,
+                       .field_count_ = i + 1,
+                       .encoded_bytes_ = 128 + i});
+  auto original = HashGroupDirectory::Recover(root, 1, records, {});
+  ASSERT_TRUE(original.ok()) << original.status();
+  const auto old_bytes = original->total_group_bytes();
+  auto update = records[0];
+  update.sequence_ = 2;
+  update.field_count_ = 2;
+  update.encoded_bytes_ += 32;
+  auto parent = records[1];
+  parent.sequence_ = 2;
+  parent.field_count_ = 0;
+  parent.encoded_bytes_ = 0;
+  parent.retired_ = true;
+  auto left = records[1];
+  left.id_.bits_ = 3;
+  left.sequence_ = 2;
+  left.field_count_ = 1;
+  left.encoded_bytes_ = 80;
+  auto right = left;
+  right.id_.prefix_ |= std::uint64_t{1} << 61;
+  // Interleave a metadata replacement with an actual routing change. Inputs
+  // are deliberately unsorted; both update forms share one atomic directory.
+  std::vector<RecoveredHashGroup> changes{right, update, parent, left};
+  auto next_root = root;
+  next_root.revision_ = 2;
+  next_root.field_count_ = 11;
+  next_root.group_count_ = 5;
+  auto next = original->Apply(next_root, 2, changes);
+  ASSERT_TRUE(next.ok()) << next.status();
+  EXPECT_EQ(next->groups().size(), 5);
+  EXPECT_EQ(next->groups().at(0).field_count_, 2);
+  EXPECT_EQ(next->groups().at(left.id_.prefix_).id_, left.id_);
+  EXPECT_EQ(next->groups().at(right.id_.prefix_).id_, right.id_);
+  EXPECT_EQ(next->total_group_bytes(), old_bytes + 32 - 129 + 160);
+  EXPECT_EQ(original->groups().size(), 4);
+  EXPECT_EQ(original->groups().at(0).field_count_, 1);
+  EXPECT_EQ(original->groups().at(parent.id_.prefix_).id_, parent.id_);
+  EXPECT_EQ(original->total_group_bytes(), old_bytes);
+  // Duplicate updates, omitted retirements and bad aggregate metadata must
+  // still fail without changing the old immutable snapshot.
+  changes.push_back(update);
+  EXPECT_FALSE(original->Apply(next_root, 2, changes).ok());
+  changes.pop_back();
+  changes.erase(changes.begin() + 2);
+  EXPECT_FALSE(original->Apply(next_root, 2, changes).ok());
+  next_root = root;
+  next_root.revision_ = 2;
+  EXPECT_FALSE(original->Apply(next_root, 2, std::span(&update, 1)).ok());
+  next_root.field_count_ = 11;
+  auto replaced = original->Apply(next_root, 2, std::span(&update, 1));
+  ASSERT_TRUE(replaced.ok()) << replaced.status();
+  EXPECT_EQ(replaced->groups().size(), 4);
+  EXPECT_EQ(replaced->total_group_bytes(), old_bytes + 32);
+  EXPECT_EQ(original->total_group_bytes(), old_bytes);
+}
+
 TEST(GroupedHashTest, CompleteSnapshotsAreBinarySafeAndNotMutationLogs) {
   HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(3)};
   group.value_.entries_[0].field_ = std::string("a\0b", 3);

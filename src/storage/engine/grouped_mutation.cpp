@@ -16,6 +16,7 @@
 
 #include <charconv>
 
+#include "absl/container/inlined_vector.h"
 #include "impl.h"
 #include "lavik/storage/detail/grouped_scratch.h"
 
@@ -276,8 +277,11 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   }
   auto encoder_admission = encoder_budget.Reserve(1);
   if (!encoder_admission.ok()) co_return encoder_admission.status();
-  std::vector<HashGroupEncoder> encoders;
-  std::vector<std::uint64_t> encoded_sizes;
+  // Point writes normally produce one page. Keep its preflight and publication
+  // metadata inside this coroutine frame; multi-page commands retain the same
+  // admitted spill capacity and lifetime through all asynchronous writes.
+  absl::InlinedVector<HashGroupEncoder, 1> encoders;
+  absl::InlinedVector<std::uint64_t, 1> encoded_sizes;
   try {
     // No current-command pages have been staged if preflight allocation fails.
     LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_GROUP_ENCODER_PREPARE_KEY", key);
@@ -306,12 +310,11 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
       std::uint64_t total = previous->directory().total_group_bytes();
       for (std::size_t i = 0; i < plan->writes_.size(); ++i) {
         const auto& page = plan->writes_[i];
-        const auto old = previous->directory().groups().find(page.id_.prefix_);
-        if (old != previous->directory().groups().end() &&
-            old->second.id_ == page.id_) {
-          if (old->second.encoded_bytes_ > total)
+        const auto* old = previous->directory().groups().Get(page.id_.prefix_);
+        if (old != nullptr && old->id_ == page.id_) {
+          if (old->encoded_bytes_ > total)
             co_return absl::DataLossError("invalid grouped byte total");
-          total -= old->second.encoded_bytes_;
+          total -= old->encoded_bytes_;
         }
         if (!page.retired_) {
           if (encoded_sizes[i] > UINT64_MAX - total)
@@ -406,7 +409,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   if (!reserved.ok()) co_return reserved.status();
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
-  std::vector<HashGroupLocation> written;
+  absl::InlinedVector<HashGroupLocation, 1> written;
   written.reserve(plan->writes_.size());
   // A failed batch in an outer transaction retains its staged bytes until the
   // outer commit retires them. Its existing fence must not point at a block we
@@ -461,8 +464,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     }
     written.push_back(std::move(*group));
   }
-  std::vector<RecoveredHashGroup> candidates;
-  std::vector<HashGroupId> written_ids;
+  absl::InlinedVector<RecoveredHashGroup, 1> candidates;
+  absl::InlinedVector<HashGroupId, 1> written_ids;
   candidates.reserve(written.size());
   written_ids.reserve(written.size());
   for (std::size_t i = 0; i < written.size(); ++i) {

@@ -17,10 +17,12 @@
 #include "lavik/storage/detail/grouped_hash.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <utility>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/inlined_vector.h"
 
 namespace lavik::storage {
 namespace {
@@ -397,9 +399,16 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
         Store(encoded, offset, view.field_.size(), 4);
         Store(encoded, offset + 4, view.value_.size(), 4);
         offset += 8;
-        encoded.replace(offset, view.field_.size(), view.field_);
+        // The destination was sized once above and cannot alias these views
+        // of the read lease/request. Copy bytes directly; Set values are empty
+        // and need no string mutation (or a zero-length copy from nullptr).
+        if (!view.field_.empty())
+          std::memcpy(encoded.data() + offset, view.field_.data(),
+                      view.field_.size());
         offset += view.field_.size();
-        encoded.replace(offset, view.value_.size(), view.value_);
+        if (!view.value_.empty())
+          std::memcpy(encoded.data() + offset, view.value_.data(),
+                      view.value_.size());
         offset += view.value_.size();
       }
     }
@@ -585,7 +594,7 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Recover(
       continue;
     }
     if (candidate.field_count_ > root.field_count_ - count ||
-        directory.groups_.find(id.prefix_) != directory.groups_.end()) {
+        directory.groups_.Get(id.prefix_) != nullptr) {
       return absl::DataLossError("overlapping Hash groups or invalid count");
     }
     auto inserted = directory.groups_.Set(id.prefix_, candidate);
@@ -635,28 +644,43 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
   next.root_ = root;
   next.sequence_ = root.revision_;
   next.command_sequence_ = sequence;
-  std::map<HashGroupId, const RecoveredHashGroup*> writes;
+  // Most point writes replace one route. A sorted pointer list preserves
+  // duplicate detection and prefix order without allocating a map node per
+  // changed group; larger batches spill under the existing scratch admission.
+  absl::InlinedVector<const RecoveredHashGroup*, 4> writes;
+  writes.reserve(changes.size());
+  for (const auto& change : changes) writes.push_back(&change);
+  std::sort(writes.begin(), writes.end(),
+            [](const auto* a, const auto* b) { return a->id_ < b->id_; });
+  std::optional<HashGroupId> previous;
   std::uint64_t count = root_.field_count_;
   // Hash-prefix leaves partition a 64-bit domain. A wider scratch accumulator
   // verifies total coverage after local replacements, without scanning every
   // unchanged route. Pairwise overlap checks below make equal coverage imply
   // there are no gaps either.
   __uint128_t coverage = static_cast<__uint128_t>(1) << 64;
-  for (const auto& change : changes) {
+  for (const auto* changed : writes) {
+    const auto& change = *changed;
     if (!change.id_.valid() || change.incarnation_ != root.incarnation_ ||
         change.sequence_ != root.revision_ ||
         change.field_count_ > std::numeric_limits<std::uint32_t>::max() ||
         (change.retired_ && change.field_count_ != 0) ||
-        !writes.emplace(change.id_, &change).second) {
+        previous == change.id_) {
       return absl::DataLossError("invalid grouped directory mutation record");
     }
-    const auto current = groups_.find(change.id_.prefix_);
-    if (current != groups_.end() && current->second.id_ == change.id_) {
-      count -= current->second.field_count_;
-      next.total_group_bytes_ -= current->second.encoded_bytes_;
+    previous = change.id_;
+    const auto* current = groups_.Get(change.id_.prefix_);
+    if (current != nullptr && current->id_ == change.id_) {
+      count -= current->field_count_;
+      next.total_group_bytes_ -= current->encoded_bytes_;
       coverage -= static_cast<__uint128_t>(1) << (64 - change.id_.bits_);
-      const auto erased = next.groups_.Erase(change.id_.prefix_);
-      if (!erased.ok()) return erased;
+      // An unchanged prefix identity only replaces metadata. Erasing it first
+      // would copy/rebalance an immutable AVL path that Set immediately copies
+      // again. Splits still remove their retired parent before adding children.
+      if (change.retired_) {
+        const auto erased = next.groups_.Erase(change.id_.prefix_);
+        if (!erased.ok()) return erased;
+      }
     } else if (change.retired_) {
       return absl::DataLossError("retiring a non-current Hash group");
     }
@@ -665,22 +689,27 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
       if (!retired.ok()) return retired;
     }
   }
-  for (const auto& [id, changed] : writes) {
+  for (const auto* changed : writes) {
     const auto& change = *changed;
+    const auto id = change.id_;
     if (change.retired_) continue;
-    if (next.retired_.find(id) != next.retired_.end()) {
+    if (next.retired_.Get(id) != nullptr) {
       return absl::DataLossError("resurrecting a retired Hash group");
     }
     const auto* floor = next.groups_.Floor(id.prefix_);
-    if (floor && floor->id_.last() >= id.prefix_) {
+    const bool replaces_route = floor && floor->id_ == id;
+    if (floor && !replaces_route && floor->id_.last() >= id.prefix_) {
       return absl::DataLossError("group update overlaps an earlier route");
     }
     const auto inserted = next.groups_.Set(id.prefix_, change);
     if (!inserted.ok()) return inserted;
-    auto after = next.groups_.find(id.prefix_);
-    ++after;
-    if (after != next.groups_.end() && after->first <= id.last()) {
-      return absl::DataLossError("group update overlaps a later route");
+    // Replacing the exact interval cannot change either neighbour boundary.
+    if (!replaces_route) {
+      auto after = next.groups_.find(id.prefix_);
+      ++after;
+      if (after != next.groups_.end() && after->first <= id.last()) {
+        return absl::DataLossError("group update overlaps a later route");
+      }
     }
     count += change.field_count_;
     if (change.encoded_bytes_ >
