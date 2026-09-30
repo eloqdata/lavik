@@ -50,6 +50,7 @@
 #include "bycorf/runtime/sync.h"
 #include "bycorf/runtime/worker.h"
 #include "lavik/cluster/control_transport.h"
+#include "lavik/cluster/meta_connector.h"
 #include "lavik/cluster/meta_control.h"
 #include "lavik/cluster/node_control.h"
 #include "lavik/cluster/topology.h"
@@ -63,7 +64,6 @@ namespace {
 
 using namespace std::chrono_literals;
 
-constexpr auto kConnectTimeout = 10s;
 constexpr auto kHandshakeTimeout = 10s;
 constexpr auto kMaximumSessionProgressTimeout = 10s;
 constexpr auto kDeadlinePollInterval = 25ms;
@@ -2877,11 +2877,7 @@ struct MetaControlClientService::Impl {
 
   bycorf::Task<detail::MetaSessionRunResult> RunSession(
       bycorf::Worker& worker, const MetaControlEndpoint& endpoint,
-      bool* valid_heartbeat_ack) {
-    auto connected = co_await bycorf::ConnectTcp(
-        worker, endpoint.host_, endpoint.port_, kConnectTimeout);
-    if (!connected.ok()) co_return connected.status();
-    bycorf::TcpStream stream = std::move(*connected);
+      bool* valid_heartbeat_ack, bycorf::TcpStream& stream) {
     // Watchdogs can close the transport while cleanup awaits data workers.
     // Keep its storage alive through every session user, and close on early
     // handshake/redirect returns as well as the established-session path.
@@ -3434,17 +3430,25 @@ bycorf::Task<absl::Status> MetaControlClientService::Run(
   while (!impl_->stopping_.load(std::memory_order_acquire) &&
          !worker.stop_requested()) {
     bool valid_ack = false;
-    const std::vector<MetaControlEndpoint> candidates =
+    std::vector<MetaControlEndpoint> candidates =
         impl_->directory_.Candidates();
-    for (const MetaControlEndpoint& endpoint : candidates) {
+    while (!candidates.empty()) {
       if (impl_->stopping_.load(std::memory_order_acquire) ||
           worker.stop_requested()) {
         break;
       }
-      if (attempted) RecordClusterControlReconnect();
-      attempted = true;
-      const detail::MetaSessionRunResult session =
-          co_await impl_->RunSession(worker, endpoint, &valid_ack);
+      auto connected = co_await detail::ConnectMetaEndpoint(
+          worker, candidates, impl_->stopping_, &attempted);
+      if (!connected.ok()) {
+        if (!absl::IsCancelled(connected.status()))
+          spdlog::warn("Meta control connect attempts ended: {}",
+                       connected.status().message());
+        break;
+      }
+      const MetaControlEndpoint endpoint = candidates[(*connected)->index_];
+      candidates.erase(candidates.begin() + (*connected)->index_);
+      const detail::MetaSessionRunResult session = co_await impl_->RunSession(
+          worker, endpoint, &valid_ack, (*connected)->stream_);
       const absl::Status& reported = session.report_status();
       if (impl_->service_incompatible_) {
         run_status = reported;

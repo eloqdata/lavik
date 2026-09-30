@@ -387,6 +387,7 @@ add_library(lavik_module
   src/cluster/bootstrap.cpp
   src/cluster/authority.cpp
   src/cluster/meta_client.cpp
+  src/cluster/meta_connector.cpp
   src/cluster/meta_control.cpp
   src/cluster/node_control.cpp
   src/cluster/runtime.cpp
@@ -1622,6 +1623,11 @@ if (BUILD_TESTING)
   add_executable(lavik_stream_records_test tests/stream_records_test.cpp)
   target_link_libraries(lavik_stream_records_test PRIVATE lavik::module GTest::gtest_main)
   add_test(NAME lavik_stream_records COMMAND lavik_stream_records_test)
+
+  add_executable(lavik_meta_connector_tests tests/meta_connector_test.cpp)
+  target_link_libraries(lavik_meta_connector_tests PRIVATE lavik::module GTest::gtest_main)
+  add_test(NAME meta_connector COMMAND lavik_meta_connector_tests)
+  set_tests_properties(meta_connector PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
 
   add_executable(lavik_unit_tests
     tests/buffer_pool_test.cpp
