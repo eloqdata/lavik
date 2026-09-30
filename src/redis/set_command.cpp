@@ -581,6 +581,8 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
         co_return replaced;
       }
       if (!context->tx_writes_.empty()) {
+        g_storage->PublishCommittedFullSyncEffects(
+            &context->tx_writes_[bycorf::ThisWorker().id_]);
         co_return co_await g_storage->DiscardTxUndoLocal(
             context->tx_writes_.front().txid_);
       }
@@ -629,6 +631,10 @@ Task<absl::Status> SetFinishShardCallback(void* opaque, const tx::ShardSlice&) {
   if (context->rollback_) {
     co_return co_await g_storage->RollbackTxLocal(txid);
   }
+  // Finish FULL publication on each participant before releasing its locks,
+  // just as the single-shard aggregate and move callbacks do below.
+  g_storage->PublishCommittedFullSyncEffects(
+      &context->tx_writes_[bycorf::ThisWorker().id_]);
   co_return co_await g_storage->DiscardTxUndoLocal(txid);
 }
 
@@ -793,6 +799,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
         if (!restored.ok()) co_return restored;
         co_return written;
       }
+      g_storage->PublishCommittedFullSyncEffects(
+          &ctx->tx_writes_[bycorf::ThisWorker().id_]);
       co_return co_await g_storage->DiscardTxUndoLocal(
           ctx->tx_writes_.front().txid_);
     };

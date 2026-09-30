@@ -2451,9 +2451,12 @@ Task<absl::Status> MultiReadShard(void* opaque, const tx::ShardSlice& slice) {
       }
       co_return replaced;
     }
-    if (!context->writes_.empty())
+    if (!context->writes_.empty()) {
+      g_storage->PublishCommittedFullSyncEffects(
+          &context->writes_[bycorf::ThisWorker().id_]);
       co_return co_await g_storage->DiscardTxUndoLocal(
           context->writes_.front().txid_);
+    }
   }
   co_return absl::OkStatus();
 }
@@ -2473,6 +2476,8 @@ Task<absl::Status> MultiFinishShard(void* opaque, const tx::ShardSlice&) {
   if (context->writes_.empty()) co_return absl::OkStatus();
   const std::uint64_t txid = context->writes_.front().txid_;
   if (context->rollback_) co_return co_await g_storage->RollbackTxLocal(txid);
+  g_storage->PublishCommittedFullSyncEffects(
+      &context->writes_[bycorf::ThisWorker().id_]);
   co_return co_await g_storage->DiscardTxUndoLocal(txid);
 }
 

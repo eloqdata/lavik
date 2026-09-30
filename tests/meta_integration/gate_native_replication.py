@@ -24,6 +24,7 @@ from contextlib import contextmanager
 import os
 import concurrent.futures
 from pathlib import Path
+import re
 import struct
 import sys
 import tempfile
@@ -939,6 +940,161 @@ def full_tail_type_reuse(root):
         assert "WRONGTYPE" not in Path(target.log_path).read_text()
 
 
+def full_tail_collection_transactions(root, cross_worker=False):
+    tag = next(
+        f"full-collections-{i}"
+        for i in range(100000)
+        if C.redis_slot(f"full-collections-{i}") == 0
+    )
+    prefix = "{" + tag + "}"
+    cases = []
+    for grouped in (False, True):
+        # A large member also exercises grouped transaction receipts. All
+        # effects happen after the baseline handoff, so a later source scan
+        # cannot conceal missing publication from a command family.
+        value = "v" * 16384 if grouped else "a"
+        stem = prefix + ("grouped-" if grouped else "compact-")
+        for command in ("LMOVE", "RPOPLPUSH", "BLMOVE", "BRPOPLPUSH"):
+            src, dst = stem + command, stem + command + "-dst"
+            args = [command, src, dst]
+            if command in ("LMOVE", "BLMOVE"):
+                args += ["RIGHT", "LEFT"]
+            if command in ("BLMOVE", "BRPOPLPUSH"):
+                args += ["0.01"]
+            cases.append(
+                (
+                    ["RPUSH", src, "b", value],
+                    args,
+                    value,
+                    [["LRANGE", src, 0, -1], ["LRANGE", dst, 0, -1]],
+                )
+            )
+        src, dst = stem + "set", stem + "set-dst"
+        cases.append(
+            (
+                ["SADD", src, "b", value],
+                ["SMOVE", src, dst, value],
+                1,
+                [["SMEMBERS", src], ["SMEMBERS", dst]],
+            )
+        )
+        src, dst = stem + "union", stem + "union-dst"
+        cases.append(
+            (
+                ["SADD", src, "b", value],
+                ["SUNIONSTORE", dst, src],
+                2,
+                [["SMEMBERS", dst]],
+            )
+        )
+        src, dst = stem + "zset", stem + "zset-dst"
+        cases.append(
+            (
+                ["ZADD", src, 1, "b", 2, value],
+                ["ZUNIONSTORE", dst, 1, src],
+                2,
+                [["ZRANGE", dst, 0, -1, "WITHSCORES"]],
+            )
+        )
+        src, dst = stem + "sort", stem + "sort-dst"
+        cases.append(
+            (
+                ["RPUSH", src, "b", value],
+                ["SORT", src, "ALPHA", "STORE", dst],
+                2,
+                [["LRANGE", dst, 0, -1]],
+            )
+        )
+
+    cases_by_slot = {0: cases}
+    if cross_worker:
+        other_tag = next(
+            f"full-collections-{i}"
+            for i in range(100000)
+            if C.redis_slot(f"full-collections-{i}") == 1
+        )
+        prefixes = [prefix, "{" + other_tag + "}"]
+        cases_by_slot = {}
+        # Either source flow may reach the pause first. Seed both layouts,
+        # then mutate the one whose source baseline is known to be handed off.
+        # Destinations live on the other worker, exercising owner-local finish
+        # callbacks under managed Single's cross-slot command admission.
+        for slot in (0, 1):
+
+            def remap(args):
+                return [
+                    prefixes[1 - slot if arg.endswith("-dst") else slot]
+                    + arg[len(prefix) :]
+                    if isinstance(arg, str) and arg.startswith(prefix)
+                    else arg
+                    for arg in args
+                ]
+
+            cases_by_slot[slot] = [
+                (
+                    remap(initial),
+                    remap(command),
+                    result,
+                    [remap(read) for read in reads],
+                )
+                for initial, command, result, reads in cases
+            ]
+        cases = [case for layout in cases_by_slot.values() for case in layout]
+
+    def seed(writer):
+        for initial, _, _, _ in cases:
+            assert writer.call(*initial) == 2
+
+    with pair(
+        root,
+        "full-tail-collection-transactions" + ("-cross-worker" if cross_worker else ""),
+        source_faults={"LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "5000"},
+        seed=seed,
+        require_seed_before_full=True,
+        source_workers=2 if cross_worker else 1,
+        target_workers=3 if cross_worker else 2,
+        client_mode="single" if cross_worker else "cluster",
+        raft_args=H.raft_args(
+            snapshot_distance=100000, election_ms_low=5000, election_ms_high=10000
+        ),
+    ) as (meta, source, target, writer):
+        H.wait_until(
+            "collection baseline handed off",
+            30,
+            lambda: re.search(
+                r"paused full sync after acknowledged handoff partition ([01]) ",
+                Path(source.log_path).read_text(),
+            ),
+        )
+        handed_off = int(
+            re.search(
+                r"paused full sync after acknowledged handoff partition ([01]) ",
+                Path(source.log_path).read_text(),
+            ).group(1)
+        )
+        expected = []
+        for _, command, result, reads in cases_by_slot[handed_off]:
+            assert writer.call(*command) == result
+            for read in reads:
+                value = writer.call(*read)
+                expected.append(
+                    (read, sorted(value) if read[0] == "SMEMBERS" else value)
+                )
+        ready(meta)
+        reader = Client(target, readonly=True)
+        try:
+            for read, value in expected:
+                actual = reader.call(*read)
+                if read[0] == "SMEMBERS":
+                    actual = sorted(actual)
+                assert actual == value, (read, actual, value)
+        finally:
+            reader.close()
+        assert Path(source.log_path).read_text().count("selected=FULL") == (
+            2 if cross_worker else 1
+        )
+
+
 def post_cut_reset_reconnect(root):
     with pair(
         root,
@@ -1303,6 +1459,8 @@ def main():
             full_tail_expiration_effects(root)
             small_receive_window(root)
             full_tail_type_reuse(root)
+            full_tail_collection_transactions(root)
+            full_tail_collection_transactions(root, cross_worker=True)
             target_queue_shutdown(root)
             handoff_order(root)
             cancelled_handoff(root)

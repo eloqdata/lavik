@@ -246,6 +246,10 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
       (void)co_await g_storage->RollbackTxLocal(txid);
       co_return SingleShardListOutcome(std::move(committed));
     }
+    // FULL consumes participant after-images before its final cut; the
+    // ordinary replication envelope alone covers only the live backlog.
+    // Publish while the source/destination key locks still protect this result.
+    g_storage->PublishCommittedFullSyncEffects(&writes);
     (void)co_await g_storage->DiscardTxUndoLocal(txid);
     if (replication != nullptr) {
       replication->SetCommandArgs(
@@ -295,6 +299,7 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     (void)co_await g_storage->RollbackTxLocal(txid);
     co_return SingleShardListOutcome(std::move(committed));
   }
+  g_storage->PublishCommittedFullSyncEffects(&writes);
   (void)co_await g_storage->DiscardTxUndoLocal(txid);
   if (replication != nullptr) {
     replication->SetCommandArgs(
@@ -873,7 +878,10 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   } else {
     for (const unsigned owner : {source_owner, destination_owner}) {
       (void)co_await bycorf::SubmitTaskTo(
-          owner, [txid] { return g_storage->DiscardTxUndoLocal(txid); });
+          owner, [txid, write = &writes[owner]] {
+            g_storage->PublishCommittedFullSyncEffects(write);
+            return g_storage->DiscardTxUndoLocal(txid);
+          });
     }
   }
   absl::Status released = co_await release();

@@ -628,9 +628,11 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
         (void)co_await ReleaseSortTransaction(&transaction);
         co_return Built(AppendSortError(reply_builder, status));
       }
-      status = co_await SubmitTaskTo(destination->owner_, [txid] {
-        return g_storage->DiscardTxUndoLocal(txid);
-      });
+      status = co_await SubmitTaskTo(
+          destination->owner_, [txid, write = &writes[destination->owner_]] {
+            g_storage->PublishCommittedFullSyncEffects(write);
+            return g_storage->DiscardTxUndoLocal(txid);
+          });
       if (!status.ok()) {
         (void)co_await ReleaseSortTransaction(&transaction);
         co_return Built(AppendSortError(reply_builder, status));
