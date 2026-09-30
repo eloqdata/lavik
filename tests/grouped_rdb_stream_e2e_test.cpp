@@ -452,6 +452,109 @@ TEST(GroupedRdbStreamE2e, RestoreStreamsFourTypesInsideAndOutsideExec) {
   ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
+TEST(GroupedRdbStreamE2e, ZsetRestoreBatchesPreserveOrderAndRollback) {
+  // At two workers and 128 MiB, the ingest planner cannot admit all these
+  // entries in one batch. Cover head/tail splices, overlapping score ranges and
+  // equal-score ties through the real memory gate, including cold recovery.
+  constexpr unsigned count = 49152;
+  auto member = [](unsigned i) {
+    auto value = std::to_string(i);
+    return std::string(8 - value.size(), '0') + value;
+  };
+  auto dump = [&](unsigned mode, bool duplicate) {
+    auto encoder = lavik::rdb::CollectionFileEncoder::CreateDump(
+        ValueType::kSortedSet, count + unsigned(duplicate));
+    Check(encoder.ok(), "create Sorted Set dump");
+    std::string payload;
+    auto drain = [&] {
+      while (auto fragment = encoder->Next()) payload.append(*fragment);
+    };
+    drain();
+    lavik::storage::CollectionPage page{
+        .value_type_ = ValueType::kSortedSet, .next_cursor_ = 1, .done_ = true};
+    for (unsigned i = 0; i < count; ++i) {
+      const auto score = mode == 0   ? i
+                         : mode == 1 ? count - 1 - i
+                         : mode == 2 ? 0
+                                     : 2 * (i % (count / 2)) + i / (count / 2);
+      page.scored_members_.push_back({member(i), double(score)});
+    }
+    // A higher score still must not allow an earlier member to reappear in a
+    // later append. Failure must retain the previous key and enclosing EXEC.
+    if (duplicate) page.scored_members_.push_back({member(0), double(count)});
+    Check(encoder->StartPage(page).ok(), "encode Sorted Set page");
+    drain();
+    Check(encoder->Finish().ok(), "finish Sorted Set dump");
+    lavik::rdb::DumpEncoder checksum;
+    checksum.Account(payload);
+    payload += checksum.Finish();
+    return payload;
+  };
+  auto verify = [&](Client& client, unsigned mode) {
+    const auto key = "batch-sorted-" + std::to_string(mode);
+    ASSERT_EQ(client.Command({"ZCARD", key}).text_, std::to_string(count));
+    for (unsigned first = 0; first < count; first += 1024) {
+      auto range = client.Command({"ZRANGE", key, std::to_string(first),
+                                   std::to_string(first + 1023), "WITHSCORES"});
+      ASSERT_EQ(range.items_.size(), 2048);
+      for (unsigned i = 0; i < 1024; ++i) {
+        const auto rank = first + i;
+        EXPECT_EQ(range.items_[2 * i].text_,
+                  member(mode == 1   ? count - 1 - rank
+                         : mode == 3 ? rank / 2 + (rank % 2) * (count / 2)
+                                     : rank));
+        EXPECT_EQ(range.items_[2 * i + 1].text_,
+                  std::to_string(mode == 2 ? 0 : rank));
+      }
+    }
+    // Also read the member graph, independently of ordered range iteration.
+    for (unsigned i : {0u, count / 2, count - 1}) {
+      EXPECT_EQ(client.Command({"ZSCORE", key, member(i)}).text_,
+                std::to_string(mode == 0   ? i
+                               : mode == 1 ? count - 1 - i
+                               : mode == 2
+                                   ? 0
+                                   : 2 * (i % (count / 2)) + i / (count / 2)));
+    }
+  };
+  PrivateDisk disk;
+  {
+    Server server(disk, 2, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    for (unsigned mode = 0; mode < 4; ++mode) {
+      SCOPED_TRACE(mode);
+      const auto key = "batch-sorted-" + std::to_string(mode);
+      ASSERT_EQ(client.Command({"RESTORE", key, "0", dump(mode, false)}).text_,
+                "OK");
+      verify(client, mode);
+    }
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"SET", "guard", "prefix"}).text_, "QUEUED");
+    ASSERT_EQ(client
+                  .Command({"RESTORE", "batch-sorted-0", "0", dump(0, true),
+                            "REPLACE"})
+                  .text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"SET", "guard", "suffix"}).text_, "QUEUED");
+    const auto executed = client.Command({"EXEC"});
+    ASSERT_EQ(executed.items_.size(), 3);
+    EXPECT_EQ(executed.items_[0].text_, "OK");
+    EXPECT_EQ(executed.items_[1].kind_, '-');
+    EXPECT_EQ(executed.items_[1].text_, "ERR Bad data format");
+    EXPECT_EQ(executed.items_[2].text_, "OK");
+    verify(client, 0);
+    EXPECT_EQ(client.Command({"GET", "guard"}).text_, "suffix");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  for (unsigned mode = 0; mode < 4; ++mode) verify(client, mode);
+  EXPECT_EQ(client.Command({"GET", "guard"}).text_, "suffix");
+  ASSERT_EQ(client.Command({"FLUSHDB", "SYNC"}).text_, "OK");
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
 TEST(GroupedRdbStreamE2e, StartupImportStreamsPagesAndSortsUnorderedZsetInput) {
   PrivateDisk disk;
   const std::string input = disk.path() + ".input.rdb";

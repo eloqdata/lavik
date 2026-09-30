@@ -65,6 +65,54 @@ TEST(CollectionIngestBudget, RejectsOverflowInsteadOfWrappingAdmission) {
           .ok());
 }
 
+TEST(CollectionIngestBudget, FreshSortedSetBoundsCoverBothPageBuilders) {
+  for (unsigned mode = 0; mode < 4; ++mode) {
+    const unsigned count = mode == 0 ? 1 : mode == 3 ? 2 : 1000;
+    const DigestSeed seed{};
+    CollectionPage page{.value_type_ = ValueType::kSortedSet};
+    HashValue members;
+    OrderedGroupSnapshot ordered{.kind_ = OrderedCollectionKind::kSortedSet,
+                                 .incarnation_ = 1,
+                                 .id_ = 1};
+    for (unsigned candidate = 0; page.size() < count; ++candidate) {
+      const auto size = mode == 0   ? 20000
+                        : mode == 1 ? 0
+                        : mode == 2 ? (candidate % 7) * 2000
+                                    : 5000;
+      auto member = std::string(size, 'm') + std::to_string(candidate);
+      const auto digest = ComputeDigest(member, seed);
+      // Force empty siblings across eight prefix levels. A member-count-only
+      // bound misses that topology; the split-tree bound must include it.
+      if (mode == 3 && (digest.value_ >> 56) != 0) continue;
+      const double score = page.size();
+      page.scored_members_.push_back({member, score});
+      ordered.entries_.push_back({member, score});
+      members.entries_.push_back(
+          {digest, member, EncodeSortedSetMemberScore(score)});
+    }
+    auto bytes = CollectionCompactEncoder::MeasurePage(page);
+    ASSERT_TRUE(bytes.ok());
+    const auto bound = BoundInitialSortedSetIngestGroups(*bytes, count);
+    auto score_pages = SplitOrderedGroup(std::move(ordered), 2);
+    auto member_pages = GroupHashValue(std::move(members), 1, seed);
+    ASSERT_TRUE(score_pages.ok()) << score_pages.status();
+    ASSERT_TRUE(member_pages.ok()) << member_pages.status();
+    EXPECT_LE(score_pages->groups_.size(), bound.ordered_) << mode;
+    EXPECT_LE(member_pages->size(), bound.members_) << mode;
+    if (mode == 0) {
+      EXPECT_EQ(bound.ordered_, 1);
+      EXPECT_EQ(bound.members_, 1);
+    }
+    if (mode == 3) {
+      EXPECT_GE(std::count_if(member_pages->begin(), member_pages->end(),
+                              [](const auto& group) {
+                                return group.value_.entries_.empty();
+                              }),
+                8);
+    }
+  }
+}
+
 TEST(CollectionCompactStream, StringSegmentsEmitRawBytesWithoutFraming) {
   CollectionPage first{.value_type_ = ValueType::kString,
                        .elements_ = {std::string(8192, 'a')}};

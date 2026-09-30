@@ -293,40 +293,84 @@ absl::StatusOr<std::vector<HashGroupSnapshot>> SplitHashGroup(
                             entry.value_.size(), kHashGroupPayloadLimit);
     if (!size.ok()) return size.status();
   }
-  std::vector<HashGroupSnapshot> pending;
+  const auto bytes = PayloadBytes(group.value_);
+  if ((bytes.ok() && *bytes <= target_bytes) ||
+      group.value_.entries_.size() <= 1 || group.id_.bits_ == 64) {
+    if (!bytes.ok()) return bytes.status();
+    std::vector<HashGroupSnapshot> leaves;
+    leaves.push_back(std::move(group));
+    return leaves;
+  }
+  // Keep strings in the input until their final leaf is known. Repartitioning
+  // compact routing references avoids rehashing and moving both strings at
+  // every prefix level. Entry digests remain process-local; routing uses the
+  // persisted seed and never overwrites those digests. Hash leaf order has no
+  // semantic meaning; prefix identities and the empty siblings are unchanged.
+  // Input + final entries + references fit within the existing split-vector
+  // scratch allowance, without another retained copy of member payloads.
+  struct Route {
+    std::uint64_t hash_;
+    std::size_t index_;
+  };
+  struct Range {
+    HashGroupId id_;
+    std::size_t first_;
+    std::size_t last_;
+    std::uint64_t entry_bytes_;
+  };
+  if (group.value_.entries_.size() > std::numeric_limits<std::uint32_t>::max())
+    return absl::OutOfRangeError("Hash group contains too many fields");
+  std::vector<Route> routes;
+  routes.reserve(group.value_.entries_.size());
+  std::uint64_t entry_bytes = 0;
+  for (const auto& entry : group.value_.entries_) {
+    routes.push_back({ComputeDigest(entry.field_, seed).value_, routes.size()});
+    entry_bytes += 8 + entry.field_.size() + entry.value_.size();
+  }
+  // A uint32 entry count and individually checked physical payload sizes
+  // bound this sum below uint64_t, even when the whole value spans records.
+  std::vector<Range> pending;
+  pending.reserve(65);
+  pending.push_back({group.id_, 0, routes.size(), entry_bytes});
   std::vector<HashGroupSnapshot> leaves;
-  pending.push_back(std::move(group));
   while (!pending.empty()) {
-    HashGroupSnapshot current = std::move(pending.back());
+    const auto current = pending.back();
     pending.pop_back();
-    auto bytes = PayloadBytes(current.value_);
-    if ((bytes.ok() && *bytes <= target_bytes) ||
-        current.value_.entries_.size() <= 1 || current.id_.bits_ == 64) {
-      if (!bytes.ok()) return bytes.status();
-      leaves.push_back(std::move(current));
+    const auto count = current.last_ - current.first_;
+    const auto payload_bytes =
+        count == 0 ? 0 : kCompactHeaderBytes + current.entry_bytes_;
+    if ((payload_bytes <= target_bytes &&
+         payload_bytes <= kHashGroupPayloadLimit) ||
+        count <= 1 || current.id_.bits_ == 64) {
+      if (payload_bytes > kHashGroupPayloadLimit)
+        return absl::OutOfRangeError("Hash group payload exceeds record limit");
+      HashGroupSnapshot leaf{
+          .incarnation_ = group.incarnation_, .id_ = current.id_, .value_ = {}};
+      leaf.value_.entries_.reserve(count);
+      for (auto i = current.first_; i < current.last_; ++i)
+        leaf.value_.entries_.push_back(
+            std::move(group.value_.entries_[routes[i].index_]));
+      leaves.push_back(std::move(leaf));
       continue;
     }
     const auto child_bits = static_cast<std::uint8_t>(current.id_.bits_ + 1);
     const std::uint64_t branch_bit = std::uint64_t{1} << (64 - child_bits);
-    HashGroupSnapshot left{
-        .incarnation_ = current.incarnation_,
-        .id_ = {.prefix_ = current.id_.prefix_, .bits_ = child_bits},
-        .value_ = {},
-    };
-    HashGroupSnapshot right{
-        .incarnation_ = current.incarnation_,
-        .id_ = {.prefix_ = current.id_.prefix_ | branch_bit,
-                .bits_ = child_bits},
-        .value_ = {},
-    };
-    for (auto& entry : current.value_.entries_) {
-      auto& destination =
-          (ComputeDigest(entry.field_, seed).value_ & branch_bit) ? right.value_
-                                                                  : left.value_;
-      destination.entries_.push_back(std::move(entry));
-    }
-    pending.push_back(std::move(right));
-    pending.push_back(std::move(left));
+    std::uint64_t left_bytes = 0;
+    const auto middle = std::partition(
+        routes.begin() + current.first_, routes.begin() + current.last_,
+        [&](const Route& route) {
+          if (route.hash_ & branch_bit) return false;
+          const auto& entry = group.value_.entries_[route.index_];
+          left_bytes += 8 + entry.field_.size() + entry.value_.size();
+          return true;
+        });
+    const auto split = static_cast<std::size_t>(middle - routes.begin());
+    pending.push_back({{current.id_.prefix_ | branch_bit, child_bits},
+                       split,
+                       current.last_,
+                       current.entry_bytes_ - left_bytes});
+    pending.push_back(
+        {{current.id_.prefix_, child_bits}, current.first_, split, left_bytes});
   }
   return leaves;
 }
