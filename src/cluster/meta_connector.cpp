@@ -69,14 +69,8 @@ bycorf::Task<absl::Status> Dial(bycorf::Worker& worker,
       &*attempt.cancellation_);
   if (connected.ok()) {
     if (!state.closing_ && state.winner_ == nullptr) {
-      try {
-        state.winner_ = std::make_unique<ConnectedMetaEndpoint>(
-            index, std::move(*connected));
-      } catch (const std::bad_alloc&) {
-        (void)connected->Close();
-        state.last_error_ =
-            absl::ResourceExhaustedError("Meta connect allocation");
-      }
+      state.winner_ =
+          std::make_unique<ConnectedMetaEndpoint>(index, std::move(*connected));
     } else {
       (void)connected->Close();
     }
@@ -109,13 +103,7 @@ ConnectMetaEndpoint(bycorf::Worker& worker,
         if (attempt.active_) continue;
         attempt.cancellation_.emplace();
         attempt.active_ = true;
-        try {
-          worker.Spawn(Dial(worker, candidates[next], next, state, attempt));
-        } catch (const std::bad_alloc&) {
-          attempt.active_ = false;
-          result = absl::ResourceExhaustedError("Meta connect task allocation");
-          break;
-        }
+        worker.Spawn(Dial(worker, candidates[next], next, state, attempt));
         if (attempted != nullptr) {
           if (*attempted) RecordClusterControlReconnect();
           *attempted = true;
@@ -124,7 +112,6 @@ ConnectMetaEndpoint(bycorf::Worker& worker,
         launch_at = now + kStagger;
         break;
       }
-      if (!result.ok()) break;
     }
     // Only active reconnection pays for this bounded stop/stagger polling.
     // Established sessions have no dial coordinator or per-ACK fan-out.
