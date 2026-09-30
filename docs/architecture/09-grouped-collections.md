@@ -56,7 +56,7 @@ Segment payloads never contain copies of the parent key. See
 [storage formats and lifetime](04-storage-and-recovery.md) for UUID ownership.
 Segments have dense, one-based identifiers derived from byte offsets. All but
 the tail contain exactly 8 KiB; extension materializes zero-filled gaps.
-The resident String directory and physical index use direct vector indexing,
+The resident String directory and physical index use direct positional indexing,
 without binary search or hash routing. Physical index pages share unchanged
 entries with snapshot/undo versions. Incremental writes preserve segment IDs;
 whole replacement or shrinking may create a fresh incarnation or a compact value.
@@ -132,9 +132,12 @@ tombstone/graph retirement path.
 Views share unchanged physical index pages across mutations. The physical
 identity trie skips common prefix bits and retains complete identities in its
 leaves; inserting outside a skipped prefix adds a branch without changing
-pinned older views. Hash routing nodes are persistent; the ordered rank directory owns admitted metadata
-vectors. Local page replacements copy the vectors and update aggregate ranks;
-topology changes rebuild and validate the complete chain. Routing
+pinned older views. Hash routing nodes are persistent; ordered directories share
+owner-local metadata chunks across immutable views. Each allocation admits and
+accounts its own lifetime, independently of the number of views retaining it.
+Local page replacements detach changed chunks and update only rank intervals
+whose counts change; unchanged identities, retirement records and ranks remain
+shared. Topology changes rebuild and validate the complete chain. Routing
 and physical-index node references, including final destruction, remain on
 the key owner. Cross-worker readers exchange physical identities or stream
 handles that route metadata access and cleanup back to that owner. Retained
@@ -313,8 +316,11 @@ working state before compensation and propagate compensation failure rather
 than disguising it as an ordinary admission rejection.
 
 List length uses root metadata. Indexed/range reads load the corresponding
-rank pages; push, pop and indexed replacement load the affected interval and
-its immediate link neighbours. Pivot and position searches consume one page at
+rank pages. Read-only operations retain shared key intent and an immutable
+routing view, release worker store state before page I/O, and validate the
+population and physical record lifetime in the page loader. Push, pop and
+indexed replacement load the affected interval and its immediate link neighbours;
+an equal-sized indexed replacement only needs its target page. Pivot and position searches consume one page at
 a time and retain only the result; insertion reloads the located interval.
 Value removals, trimming and within-list moves retain the needed logical
 contents before forming a replacement interval. Only changed snapshots enter

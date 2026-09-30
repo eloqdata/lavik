@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 
 #include "gtest/gtest.h"
 #include "lavik/storage/detail/collection_compact_stream.h"
@@ -31,7 +32,8 @@ void String(std::string& s, std::string_view v) {
   Put(s, v.size(), 4);
   s.append(v);
 }
-std::string Stream(unsigned entries, bool group = true) {
+std::string Stream(unsigned entries, bool group = true,
+                   unsigned value_bytes = 120) {
   std::string s("LXS1");
   Put(s, entries, 8);
   Put(s, 0, 8);
@@ -43,7 +45,7 @@ std::string Stream(unsigned entries, bool group = true) {
     Put(s, 0, 8);
     Put(s, 2, 4);
     String(s, "f");
-    String(s, std::string(120, 'x'));
+    String(s, std::string(value_bytes, 'x'));
   }
   Put(s, entries ? 1 : 0, 4);
   if (entries) Put(s, entries, 4);
@@ -337,6 +339,117 @@ TEST(StreamRecords, SpliceBoundsRejectDuplicateIdsWithDifferentPayloads) {
   EXPECT_TRUE(
       PlanOrderedCollectionSplice(*directory, loaded, 0, 2, {(*records)[2]})
           .ok());
+}
+
+TEST(StreamRecords, DisjointIntervalsSplitAndRetireWithoutChangingGaps) {
+  auto records = DecodeStreamRecords(Stream(48, false), 48);
+  auto large = DecodeStreamRecords(Stream(48, false, 10000), 48);
+  ASSERT_TRUE(records.ok());
+  ASSERT_TRUE(large.ok());
+  const auto id = [](std::size_t index) { return 100 + (index * 7) % 24; };
+  std::vector<LoadedOrderedGroup> original;
+  std::vector<RecoveredOrderedGroup> metadata;
+  for (std::size_t i = 0; i < 24; ++i) {
+    original.push_back({.sequence_ = 1,
+                        .snapshot_ = {.kind_ = OrderedCollectionKind::kStream,
+                                      .incarnation_ = 1,
+                                      .id_ = id(i),
+                                      .previous_ = i == 0 ? 0 : id(i - 1),
+                                      .next_ = i == 23 ? 0 : id(i + 1),
+                                      .entries_ = {(*records)[2 * i + 1],
+                                                   (*records)[2 * i + 2]}}});
+    metadata.push_back({.incarnation_ = 1,
+                        .id_ = id(i),
+                        .previous_ = i == 0 ? 0 : id(i - 1),
+                        .next_ = i == 23 ? 0 : id(i + 1),
+                        .sequence_ = 1,
+                        .lsn_ = i + 1,
+                        .item_count_ = 2,
+                        .record_token_ = i + 1});
+  }
+  OrderedCollectionRoot root{.kind_ = OrderedCollectionKind::kStream,
+                             .incarnation_ = 1,
+                             .item_count_ = 48,
+                             .first_group_ = id(0),
+                             .last_group_ = id(23),
+                             .next_group_id_ = 124,
+                             .group_count_ = 24,
+                             .revision_ = 1,
+                             .stream_length_ = 48};
+  auto directory = OrderedGroupDirectory::Recover(root, 1, metadata, {});
+  ASSERT_TRUE(directory.ok()) << directory.status();
+  for (std::size_t i = 0; i < 24; ++i)
+    EXPECT_EQ(directory->FindIndex(id(i)), i);
+  EXPECT_FALSE(directory->FindIndex(99));
+  EXPECT_FALSE(directory->FindIndex(124));
+  for (const std::vector<std::size_t> retired_indices :
+       {std::vector<std::size_t>{10, 11}, {0, 1, 22, 23}, {}}) {
+    std::set<std::size_t> selected;
+    std::vector<std::uint64_t> retired;
+    auto select = [&](std::size_t i) {
+      selected.insert(i);
+      if (i != 0) selected.insert(i - 1);
+      if (i != 23) selected.insert(i + 1);
+    };
+    for (const auto i : retired_indices) {
+      retired.push_back(id(i));
+      select(i);
+    }
+    std::vector<StreamRecordChange> changes;
+    for (const auto i : {2U, 20U}) {
+      select(i);
+      const auto& replacement = (*large)[2 * i + 1].value_;
+      changes.push_back({.page_id_ = id(i),
+                         .key_ = std::string(*StreamRecordKey(replacement)),
+                         .record_ = replacement});
+    }
+    std::vector<LoadedOrderedGroup> loaded;
+    for (const auto i : selected) {
+      if (std::find(retired_indices.begin(), retired_indices.end(), i) ==
+          retired_indices.end())
+        loaded.push_back(original[i]);
+    }
+    auto plan = PlanStreamRecordChanges(*directory, std::move(loaded),
+                                        std::move(changes),
+                                        48 - retired.size() * 2, retired);
+    ASSERT_TRUE(plan.ok()) << plan.status();
+    EXPECT_EQ(plan->root_.group_count_, 26 - retired.size());
+    EXPECT_EQ(plan->root_.item_count_, 48 - retired.size() * 2);
+    std::map<std::uint64_t, OrderedGroupSnapshot> pages;
+    std::vector<OrderedCollectionEntry> expected;
+    for (std::size_t i = 0; i < original.size(); ++i) {
+      pages.emplace(id(i), original[i].snapshot_);
+      if (std::find(retired_indices.begin(), retired_indices.end(), i) !=
+          retired_indices.end())
+        continue;
+      expected.push_back(i == 2 || i == 20 ? (*large)[2 * i + 1]
+                                           : (*records)[2 * i + 1]);
+      expected.push_back((*records)[2 * i + 2]);
+    }
+    for (auto& page : plan->writes_) {
+      EXPECT_NE(page.id_, id(7));  // The gap must keep its original page.
+      if (page.retired_)
+        pages.erase(page.id_);
+      else
+        pages[page.id_] = std::move(page);
+    }
+    std::vector<OrderedCollectionEntry> actual;
+    std::uint64_t previous = 0;
+    std::size_t visited = 0;
+    for (auto current = plan->root_.first_group_; current != 0;) {
+      ASSERT_LT(visited++, pages.size());
+      ASSERT_TRUE(pages.contains(current));
+      const auto& page = pages.at(current);
+      EXPECT_EQ(page.previous_, previous);
+      actual.insert(actual.end(), page.entries_.begin(), page.entries_.end());
+      previous = current;
+      current = page.next_;
+    }
+    EXPECT_EQ(previous, plan->root_.last_group_);
+    EXPECT_EQ(visited, plan->root_.group_count_);
+    EXPECT_EQ(actual, expected);
+    EXPECT_EQ(directory->root().group_count_, 24);
+  }
 }
 
 TEST(StreamRecords, BulkInsertionSplitsAndPreservesLogicalImage) {

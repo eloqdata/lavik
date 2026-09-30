@@ -496,6 +496,38 @@ TEST(GroupedCollectionTest, SparseSameTopologyUpdateMatchesFullRecovery) {
   }
   EXPECT_EQ(original->root().item_count_, 256);
 
+  // Only the changed metadata chunk detaches; a pinned predecessor retains
+  // its own counts even when the new view redistributes records across pages.
+  EXPECT_EQ(&updated->groups()[0], &original->groups()[0]);
+  EXPECT_NE(&updated->groups()[63], &original->groups()[63]);
+  EXPECT_EQ(original->groups()[63].item_count_, 2);
+  auto second = records[95];
+  second.sequence_ = second.lsn_ = 2;
+  second.item_count_ = 1;
+  changed.item_count_ = 3;
+  root.item_count_ = 256;
+  const std::array redistributed{second, changed};  // Deliberately unordered.
+  auto balanced = original->Apply(root, 2, redistributed, 2);
+  ASSERT_TRUE(balanced.ok()) << balanced.status();
+  for (std::size_t i = 0; i <= pages.size(); ++i) {
+    const auto expected = 2 * i + (i > 63 && i <= 95 ? 1 : 0);
+    EXPECT_EQ(balanced->CountBefore(i), expected) << i;
+    EXPECT_EQ(original->CountBefore(i), 2 * i) << i;
+  }
+  EXPECT_EQ(&balanced->groups()[127], &original->groups()[127]);
+  EXPECT_NE(&balanced->groups()[95], &original->groups()[95]);
+  auto overflow = changed;
+  overflow.item_count_ = UINT64_MAX;
+  EXPECT_FALSE(original->Apply(root, 2, std::span(&overflow, 1), 2).ok());
+  struct ResetMemory {
+    ~ResetMemory() { (void)InitMemoryLimit(1024ULL * 1024 * 1024, 1); }
+  } reset_memory;
+  ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
+  EXPECT_EQ(original->Apply(root, 2, redistributed, 2).status().code(),
+            absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(original->groups()[63].item_count_, 2);
+  ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+
   changed.min_score_ = 1;
   changed.max_score_ = 0;
   EXPECT_FALSE(original->Apply(root, 2, std::span(&changed, 1), 2).ok());
@@ -597,6 +629,51 @@ TEST(GroupedCollectionTest,
   }
 }
 
+TEST(GroupedCollectionTest, SameSizeListReplacementNeedsOnlyItsOwnPage) {
+  std::vector<OrderedGroupSnapshot> pages{Page(1, 2), Page(2, 2), Page(3, 2)};
+  for (std::size_t i = 0; i < pages.size(); ++i) {
+    pages[i].previous_ = i;
+    pages[i].next_ = i == 2 ? 0 : i + 2;
+  }
+  auto directory =
+      OrderedGroupDirectory::Recover(Root(pages, 4), 1, Candidates(pages), {});
+  ASSERT_TRUE(directory.ok()) << directory.status();
+  for (const auto rank : {0U, 2U, 3U, 5U}) {
+    const auto index = rank / 2;
+    auto plan = PlanOrderedCollectionSplice(*directory, Loaded({pages[index]}),
+                                            rank, 1, {{.value_ = "change"}});
+    ASSERT_TRUE(plan.ok()) << plan.status();
+    ASSERT_EQ(plan->writes_.size(), 1);
+    EXPECT_TRUE(plan->changed_);
+    EXPECT_EQ(plan->root_.item_count_, 6);
+    EXPECT_EQ(plan->root_.group_count_, 3);
+    EXPECT_EQ(plan->root_.revision_, 0);
+    const auto& page = plan->writes_.front();
+    EXPECT_EQ(page.id_, pages[index].id_);
+    EXPECT_EQ(page.previous_, pages[index].previous_);
+    EXPECT_EQ(page.next_, pages[index].next_);
+    EXPECT_EQ(page.entries_[rank % 2].value_, "change");
+    EXPECT_EQ(page.entries_[1 - rank % 2], pages[index].entries_[1 - rank % 2]);
+  }
+  // Growth still requires neighbours for splitting; stale pages must never
+  // pass through the shortcut even when the replacement has the same size.
+  EXPECT_EQ(PlanOrderedCollectionSplice(*directory, Loaded({pages[1]}), 2, 1,
+                                        {{.value_ = "longer!"}})
+                .status()
+                .code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(PlanOrderedCollectionSplice(*directory, Loaded({pages[1]}, 2), 2, 1,
+                                        {{.value_ = "change"}})
+                .status()
+                .code(),
+            absl::StatusCode::kAborted);
+  // LSET of identical bytes remains a mutation for WATCH and replication.
+  auto identical = PlanOrderedCollectionSplice(*directory, Loaded({pages[1]}),
+                                               2, 1, {pages[1].entries_[0]});
+  ASSERT_TRUE(identical.ok()) << identical.status();
+  EXPECT_TRUE(identical->changed_);
+}
+
 TEST(GroupedCollectionTest, SpliceRejectsStaleMissingDuplicateAndInvalidInput) {
   auto split = SplitOrderedGroup(Page(1, 8), 2, 104);
   ASSERT_TRUE(split.ok());
@@ -694,6 +771,32 @@ TEST(GroupedCollectionTest,
       EXPECT_TRUE(
           OrderedGroupDirectory::Recover(plan->root_, 2, records, {81}).ok());
   }
+}
+
+TEST(GroupedCollectionTest, RecoveryFindsRetiredPagesFromUnorderedCandidates) {
+  std::vector<OrderedGroupSnapshot> pages{Page()};
+  auto root = Root(pages, 82);
+  auto candidates = Candidates(pages);
+  for (std::uint64_t id = 2; id < 82; ++id)
+    candidates.push_back({.incarnation_ = root.incarnation_,
+                          .id_ = id,
+                          .sequence_ = 1,
+                          .lsn_ = 1,
+                          .record_token_ = id,
+                          .retired_ = true});
+  std::reverse(candidates.begin(), candidates.end());
+  auto recovered = OrderedGroupDirectory::Recover(root, 1, candidates, {});
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  EXPECT_EQ(recovered->groups().size(), 1);
+  EXPECT_EQ(recovered->retired_groups().size(), 80);
+  for (std::uint64_t id = 2; id < 82; ++id) {
+    EXPECT_EQ(recovered->Find(id), nullptr);
+    const auto* retired = recovered->FindRecord(id);
+    ASSERT_NE(retired, nullptr) << id;
+    EXPECT_TRUE(retired->retired_);
+    EXPECT_EQ(retired->record_token_, id);
+  }
+  EXPECT_EQ(recovered->FindRecord(82), nullptr);
 }
 
 TEST(GroupedCollectionTest, RetirementEvidenceCannotDisappearBeforeOlderPage) {

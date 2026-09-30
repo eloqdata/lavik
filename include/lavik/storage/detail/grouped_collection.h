@@ -29,6 +29,7 @@
 #include "absl/status/statusor.h"
 #include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped_hash.h"
+#include "lavik/storage/detail/grouped_metadata_array.h"
 #include "lavik/storage/format.h"
 
 namespace lavik::storage {
@@ -327,12 +328,16 @@ class OrderedGroupDirectory {
   std::uint64_t total_group_bytes() const noexcept {
     return total_group_bytes_;
   }
+  // Return an active page's position in logical chain order. This uses the
+  // identity index; page identifiers need not increase along the chain.
+  std::optional<std::size_t> FindIndex(std::uint64_t id) const noexcept;
   const RecoveredOrderedGroup* Find(std::uint64_t id) const noexcept;
   const RecoveredOrderedGroup* FindRecord(std::uint64_t id) const noexcept;
-  const std::vector<RecoveredOrderedGroup>& groups() const noexcept {
+  const GroupedMetadataArray<RecoveredOrderedGroup>& groups() const noexcept {
     return groups_;
   }
-  const std::vector<RecoveredOrderedGroup>& retired_groups() const noexcept {
+  const GroupedMetadataArray<RecoveredOrderedGroup>& retired_groups()
+      const noexcept {
     return retired_;
   }
   // Only the key-owning worker may learn missing boundaries from decoded
@@ -346,14 +351,11 @@ class OrderedGroupDirectory {
                : std::string_view{};
   }
   absl::Status RememberStreamHeader(std::string_view header) const;
-  // Exact owned vector allocation bytes after recovery. The enclosing side
-  // object must reserve/account these before publishing a retained directory;
-  // this side-effect-free codec does not own a worker memory budget.
+  // Conservative complete-view footprint, including shared chunks. Each
+  // allocation accounts itself; callers use this only for scratch planning.
   std::size_t RetainedBytes() const noexcept {
-    return groups_.capacity() * sizeof(RecoveredOrderedGroup) +
-           retired_.capacity() * sizeof(RecoveredOrderedGroup) +
-           ids_.capacity() * sizeof(std::pair<std::uint64_t, std::size_t>) +
-           ends_.capacity() * sizeof(std::uint64_t);
+    return groups_.RetainedBytes() + retired_.RetainedBytes() +
+           ids_.RetainedBytes() + ends_.RetainedBytes();
   }
 
  private:
@@ -361,10 +363,10 @@ class OrderedGroupDirectory {
   std::uint64_t sequence_ = 0;
   std::uint64_t command_sequence_ = 0;
   std::uint64_t total_group_bytes_ = 0;
-  std::vector<RecoveredOrderedGroup> groups_;
-  std::vector<RecoveredOrderedGroup> retired_;
-  std::vector<std::pair<std::uint64_t, std::size_t>> ids_;
-  std::vector<std::uint64_t> ends_;
+  GroupedMetadataArray<RecoveredOrderedGroup> groups_;
+  GroupedMetadataArray<RecoveredOrderedGroup> retired_;
+  GroupedMetadataArray<std::pair<std::uint64_t, std::size_t>, 256> ids_;
+  GroupedMetadataArray<std::uint64_t, 256> ends_;
   mutable std::array<char, 48> stream_header_{};
   mutable bool has_stream_header_ = false;
   // The inline directory shares owner-local AVL nodes; those nodes account
@@ -409,10 +411,12 @@ struct OrderedCollectionMutationPlan {
 // storage primitive for List push/pop/insert/remove and Sorted Set insertion,
 // deletion or score repositioning. The caller supplies all intersected pages
 // plus their immediate neighbours; only changed complete pages are returned.
+// Replacing one List item with the same byte length at the default page target
+// needs only its containing page, because its size and links stay unchanged.
 // Noncontiguous List removals or a Sorted Set reposition may be expressed as
-// one enclosing splice, preserving intervening entries. This first adapter
-// intentionally has no resident per-member Sorted Set index: finding a member
-// can require scanning pages. A range read uses FindRank and follows pages.
+// one enclosing splice, preserving intervening entries. This primitive does
+// not resolve members outside its loaded pages. A range read uses FindRank
+// and follows pages.
 // The Sorted Set caller must establish member uniqueness outside the loaded
 // splice region; this primitive cannot verify unloaded member contents.
 //

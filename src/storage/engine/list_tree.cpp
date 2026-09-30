@@ -332,6 +332,35 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
               "OOM allocating grouped List operation");
         }
       }
+      if (read_only) {
+        // The caller's shared key intent protects the logical List. The
+        // retained directory and page loader validate epochs and relocation;
+        // holding worker state across disk I/O would serialize unrelated reads.
+        found = nullptr;
+        unlock.Unlock();
+        LAVIK_FAULT_INJECT({
+          if (const char* configured =
+                  std::getenv("LAVIK_GROUPED_LIST_READ_GATE");
+              configured != nullptr) {
+            const std::string base(configured);
+            // Consume one arm so a second read can prove that the worker state
+            // lock is available while this coroutine remains suspended.
+            if (::unlink((base + ".arm").c_str()) == 0) {
+              spdlog::info("grouped List read gate armed");
+              const auto until =
+                  std::chrono::steady_clock::now() + std::chrono::seconds(20);
+              while (::access((base + ".release").c_str(), F_OK) != 0) {
+                if (std::chrono::steady_clock::now() >= until)
+                  co_return absl::DeadlineExceededError(
+                      "grouped List read gate timed out");
+                const auto waited = co_await bycorf::SleepFor(
+                    *store.worker_, std::chrono::milliseconds(1));
+                if (!waited.ok()) co_return waited;
+              }
+            }
+          }
+        });
+      }
       co_return co_await ExecuteGroupedListLocked(
           store, partition, db_id, key, digest, operation, std::move(*object),
           tx, replication, mutation_precondition);

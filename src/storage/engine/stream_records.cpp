@@ -483,55 +483,87 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanStreamRecordChanges(
   plan.root_.revision_ = 0;
   plan.root_.item_count_ = count;
   plan.root_.stream_length_ = stream_length;
+  const auto& groups = directory.groups();
+  std::set<std::size_t> selected;
+  for (const auto id : touched) {
+    const auto index = directory.FindIndex(id);
+    if (!index) return absl::DataLossError("missing touched Stream page");
+    selected.insert(*index);
+    if (*index != 0) selected.insert(*index - 1);
+    if (*index + 1 != groups.size()) selected.insert(*index + 1);
+  }
+  // Only selected intervals can change links. Keep gaps in their original
+  // chain instead of rebuilding and looking up every unchanged page. Boundary
+  // neighbours are included even for whole-page retirement without payloads.
   std::vector<std::uint64_t> chain;
+  chain.reserve(selected.size());
   std::map<std::uint64_t, OrderedGroupSnapshot> replacements;
-  for (const auto& old : directory.groups()) {
-    if (!touched.contains(old.id_)) {
-      chain.push_back(old.id_);
-      continue;
+  std::uint64_t page_count = groups.size();
+  for (auto it = selected.begin(); it != selected.end();) {
+    const auto begin = *it++;
+    auto end = begin + 1;
+    while (it != selected.end() && *it == end) {
+      ++it;
+      ++end;
     }
-    auto page = retired.contains(old.id_)
-                    ? OrderedGroupSnapshot{.kind_ = root.kind_,
-                                           .incarnation_ = root.incarnation_,
-                                           .id_ = old.id_,
-                                           .entries_ = {}}
-                    : std::move(pages.at(old.id_));
-    if (page.entries_.empty()) {
-      plan.writes_.push_back({.kind_ = root.kind_,
-                              .incarnation_ = root.incarnation_,
-                              .id_ = old.id_,
-                              .retired_ = true,
-                              .entries_ = {}});
-      continue;
+    chain.clear();
+    for (std::size_t index = begin; index < end; ++index) {
+      const auto& old = groups[index];
+      if (!touched.contains(old.id_)) {
+        chain.push_back(old.id_);
+        continue;
+      }
+      auto page = retired.contains(old.id_)
+                      ? OrderedGroupSnapshot{.kind_ = root.kind_,
+                                             .incarnation_ = root.incarnation_,
+                                             .id_ = old.id_,
+                                             .entries_ = {}}
+                      : std::move(pages.at(old.id_));
+      if (page.entries_.empty()) {
+        plan.writes_.push_back({.kind_ = root.kind_,
+                                .incarnation_ = root.incarnation_,
+                                .id_ = old.id_,
+                                .retired_ = true,
+                                .entries_ = {}});
+        continue;
+      }
+      auto split =
+          SplitOrderedGroup(std::move(page), plan.root_.next_group_id_);
+      if (!split.ok()) return split.status();
+      plan.root_.next_group_id_ = split->next_group_id_;
+      for (auto& part : split->groups_) {
+        chain.push_back(part.id_);
+        replacements.emplace(part.id_, std::move(part));
+      }
     }
-    auto split = SplitOrderedGroup(std::move(page), plan.root_.next_group_id_);
-    if (!split.ok()) return split.status();
-    plan.root_.next_group_id_ = split->next_group_id_;
-    for (auto& part : split->groups_) {
-      chain.push_back(part.id_);
-      replacements.emplace(part.id_, std::move(part));
+    // A partial interval retains an untouched neighbour. A complete Stream
+    // retains at least its header records, even after deleting every message.
+    if (chain.empty()) return absl::DataLossError("empty Stream interval");
+    page_count = page_count - (end - begin) + chain.size();
+    for (std::size_t i = 0; i < chain.size(); ++i) {
+      const auto id = chain[i];
+      const auto previous = i == 0 ? groups[begin].previous_ : chain[i - 1];
+      const auto next =
+          i + 1 == chain.size() ? groups[end - 1].next_ : chain[i + 1];
+      auto found = replacements.find(id);
+      if (found == replacements.end()) {
+        const auto* old = directory.Find(id);
+        if (old->previous_ == previous && old->next_ == next) continue;
+        auto source = pages.find(id);
+        if (source == pages.end())
+          return absl::InvalidArgumentError("missing changed Stream neighbour");
+        found = replacements.emplace(id, std::move(source->second)).first;
+      }
+      found->second.previous_ = previous;
+      found->second.next_ = next;
     }
+    if (begin == 0) plan.root_.first_group_ = chain.front();
+    if (end == groups.size()) plan.root_.last_group_ = chain.back();
   }
-  for (std::size_t i = 0; i < chain.size(); ++i) {
-    const auto id = chain[i];
-    const auto previous = i == 0 ? 0 : chain[i - 1];
-    const auto next = i + 1 == chain.size() ? 0 : chain[i + 1];
-    auto found = replacements.find(id);
-    if (found == replacements.end()) {
-      const auto* old = directory.Find(id);
-      if (old->previous_ == previous && old->next_ == next) continue;
-      auto source = pages.find(id);
-      if (source == pages.end())
-        return absl::InvalidArgumentError("missing changed Stream neighbour");
-      found = replacements.emplace(id, std::move(source->second)).first;
-    }
-    found->second.previous_ = previous;
-    found->second.next_ = next;
-  }
+  if (page_count > UINT32_MAX)
+    return absl::OutOfRangeError("Stream page count overflow");
   for (auto& [id, page] : replacements) plan.writes_.push_back(std::move(page));
-  plan.root_.first_group_ = chain.front();
-  plan.root_.last_group_ = chain.back();
-  plan.root_.group_count_ = chain.size();
+  plan.root_.group_count_ = page_count;
   return plan;
 }
 

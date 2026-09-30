@@ -387,7 +387,8 @@ TEST(GroupedOrderedObjectTest, MemberIndexSharesPhysicalLifecycleAndOldViews) {
   auto members = HashGroupDirectory::Recover(*root.member_index_, 7,
                                              std::span(&member, 1), {});
   ASSERT_TRUE(members.ok()) << members.status();
-  std::vector<RecoveredOrderedGroup> pages = input.directory_.groups();
+  std::vector<RecoveredOrderedGroup> pages(input.directory_.groups().begin(),
+                                           input.directory_.groups().end());
   for (const auto& page : input.directory_.retired_groups())
     pages.push_back(page);
   EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 3, pages, {}, 7).ok());

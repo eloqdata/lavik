@@ -23,6 +23,9 @@
 #include <map>
 #include <utility>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/inlined_vector.h"
+#include "absl/numeric/int128.h"
 #include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
@@ -544,7 +547,12 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
   if (!ValidRoot(root) || root_sequence == 0 ||
       (root.revision_ != 0 && root.revision_ != root_sequence))
     return absl::DataLossError("invalid ordered root recovery identity");
-  std::map<std::uint64_t, RecoveredOrderedGroup> winners;
+  // Recovery needs identity lookup, not tree order. Borrow candidate metadata
+  // while selecting winners instead of allocating/copying one full record per
+  // map node. The input span stays alive until selected records are copied into
+  // the owned directory; no borrowed pointer escapes this call.
+  absl::flat_hash_map<std::uint64_t, const RecoveredOrderedGroup*> winners;
+  winners.reserve(std::min<std::size_t>(candidates.size(), root.group_count_));
   for (const auto& candidate : candidates) {
     if (candidate.incarnation_ != root.incarnation_ ||
         candidate.sequence_ > root_sequence ||
@@ -562,24 +570,27 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
         candidate.min_score_ > candidate.max_score_) {
       return absl::DataLossError("invalid recovered ordered page");
     }
-    auto [it, inserted] = winners.emplace(candidate.id_, candidate);
+    auto [it, inserted] = winners.try_emplace(candidate.id_, &candidate);
     if (inserted) continue;
     auto& winner = it->second;
-    if (candidate.sequence_ == winner.sequence_ &&
-        !SameMetadata(candidate, winner)) {
+    if (candidate.sequence_ == winner->sequence_ &&
+        !SameMetadata(candidate, *winner)) {
       return absl::DataLossError("conflicting ordered page relocation");
     }
-    if (candidate.sequence_ > winner.sequence_ ||
-        (candidate.sequence_ == winner.sequence_ &&
-         candidate.lsn_ > winner.lsn_))
-      winner = candidate;
+    if (candidate.sequence_ > winner->sequence_ ||
+        (candidate.sequence_ == winner->sequence_ &&
+         candidate.lsn_ > winner->lsn_))
+      winner = &candidate;
   }
   OrderedGroupDirectory result;
+  std::vector<RecoveredOrderedGroup> groups, retired;
+  std::vector<std::pair<std::uint64_t, std::size_t>> ids;
+  std::vector<std::uint64_t> ends;
   result.members_ = std::move(members);
   for (auto it = winners.begin(); it != winners.end();) {
-    if (it->second.retired_) {
-      result.retired_.push_back(it->second);
-      it = winners.erase(it);
+    if (it->second->retired_) {
+      retired.push_back(*it->second);
+      winners.erase(it++);
     } else
       ++it;
   }
@@ -590,40 +601,38 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
   result.sequence_ = root_sequence;
   result.command_sequence_ =
       command_sequence == 0 ? root_sequence : command_sequence;
-  result.groups_.reserve(winners.size());
+  groups.reserve(winners.size());
   if (root.kind_ != OrderedCollectionKind::kString) {
-    result.ends_.reserve(winners.size());
-    result.ids_.reserve(winners.size());
+    ends.reserve(winners.size());
+    ids.reserve(winners.size());
   }
   std::uint64_t id = root.first_group_;
   std::uint64_t previous = 0;
   std::uint64_t count = 0;
   while (id != 0) {
     auto found = winners.find(id);
-    if (found == winners.end() || found->second.previous_ != previous ||
-        found->second.item_count_ > root.item_count_ - count) {
+    if (found == winners.end() || found->second->previous_ != previous ||
+        found->second->item_count_ > root.item_count_ - count) {
       return absl::DataLossError("broken ordered page chain or count");
     }
-    const auto& group = found->second;
+    const auto& group = *found->second;
     if (root.kind_ == OrderedCollectionKind::kString &&
-        (group.id_ != result.groups_.size() + 1 ||
+        (group.id_ != groups.size() + 1 ||
          group.item_count_ != std::min<std::uint64_t>(
                                   kStringGroupBytes, root.item_count_ - count)))
       return absl::DataLossError("String segment position/length mismatch");
-    if (root.kind_ == OrderedCollectionKind::kSortedSet &&
-        !result.groups_.empty() &&
-        result.groups_.back().max_score_ > group.min_score_)
+    if (root.kind_ == OrderedCollectionKind::kSortedSet && !groups.empty() &&
+        groups.back().max_score_ > group.min_score_)
       return absl::DataLossError("unordered recovered Sorted Set score bounds");
     if (root.kind_ != OrderedCollectionKind::kString)
-      result.ids_.emplace_back(group.id_, result.groups_.size());
-    result.groups_.push_back(group);
+      ids.emplace_back(group.id_, groups.size());
+    groups.push_back(group);
     count += group.item_count_;
     if (group.encoded_bytes_ >
         std::numeric_limits<std::uint64_t>::max() - result.total_group_bytes_)
       return absl::DataLossError("ordered group byte total overflows");
     result.total_group_bytes_ += group.encoded_bytes_;
-    if (root.kind_ != OrderedCollectionKind::kString)
-      result.ends_.push_back(count);
+    if (root.kind_ != OrderedCollectionKind::kString) ends.push_back(count);
     previous = id;
     id = group.next_;
     winners.erase(found);  // Also detects a cycle without a second set.
@@ -632,27 +641,48 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
       count != root.item_count_)
     return absl::DataLossError(
         "disconnected ordered pages or aggregate mismatch");
-  std::sort(result.ids_.begin(), result.ids_.end());
+  std::sort(ids.begin(), ids.end());
+  std::sort(retired.begin(), retired.end(),
+            [](const auto& a, const auto& b) { return a.id_ < b.id_; });
+  auto group_array = decltype(result.groups_)::From(groups);
+  if (!group_array.ok()) return group_array.status();
+  auto retired_array = decltype(result.retired_)::From(retired);
+  if (!retired_array.ok()) return retired_array.status();
+  auto id_array = decltype(result.ids_)::From(ids);
+  if (!id_array.ok()) return id_array.status();
+  auto end_array = decltype(result.ends_)::From(ends);
+  if (!end_array.ok()) return end_array.status();
+  result.groups_ = std::move(*group_array);
+  result.retired_ = std::move(*retired_array);
+  result.ids_ = std::move(*id_array);
+  result.ends_ = std::move(*end_array);
   return result;
 }
 
-const RecoveredOrderedGroup* OrderedGroupDirectory::Find(
+std::optional<std::size_t> OrderedGroupDirectory::FindIndex(
     std::uint64_t id) const noexcept {
   if (root_.kind_ == OrderedCollectionKind::kString)
-    return id != 0 && id <= groups_.size() ? &groups_[id - 1] : nullptr;
+    return id != 0 && id <= groups_.size() ? std::optional<std::size_t>(id - 1)
+                                           : std::nullopt;
   // Append-heavy Streams and Lists usually keep a contiguous run of page
   // identities even after trimming its front. Check that run before the
   // general id index; arbitrary insertions still use the binary search.
   if (id >= root_.first_group_) {
     const auto offset = id - root_.first_group_;
-    if (offset < groups_.size() && groups_[offset].id_ == id)
-      return &groups_[offset];
+    if (offset < groups_.size() && groups_[offset].id_ == id) return offset;
   }
   const auto found = std::lower_bound(
       ids_.begin(), ids_.end(), id,
       [](const auto& item, auto target) { return item.first < target; });
-  return found != ids_.end() && found->first == id ? &groups_[found->second]
-                                                   : nullptr;
+  return found != ids_.end() && found->first == id
+             ? std::optional<std::size_t>(found->second)
+             : std::nullopt;
+}
+
+const RecoveredOrderedGroup* OrderedGroupDirectory::Find(
+    std::uint64_t id) const noexcept {
+  const auto index = FindIndex(id);
+  return index ? &groups_[*index] : nullptr;
 }
 
 const RecoveredOrderedGroup* OrderedGroupDirectory::FindRecord(
@@ -712,22 +742,22 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     result.root_.revision_ = revision;
     result.sequence_ = revision;
     result.command_sequence_ = command_sequence;
-    result.groups_ = groups_;
-    result.groups_.resize(root.group_count_);
+    std::vector<RecoveredOrderedGroup> groups(groups_.begin(), groups_.end());
+    groups.resize(root.group_count_);
     for (auto item : changed) {
       if (item.id_ == 0 || item.id_ > root.group_count_ || item.retired_ ||
           item.incarnation_ != root.incarnation_ ||
           item.sequence_ != revision ||
-          result.groups_[item.id_ - 1].sequence_ == revision)
+          groups[item.id_ - 1].sequence_ == revision)
         return absl::DataLossError("invalid changed String segment");
       item.txid_ = 0;
       item.batch_txid_ = 0;
-      result.groups_[item.id_ - 1] = item;
+      groups[item.id_ - 1] = item;
     }
-    for (std::size_t i = 0; i < result.groups_.size(); ++i) {
-      const auto& item = result.groups_[i];
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+      const auto& item = groups[i];
       if (item.id_ != i + 1 || item.previous_ != i ||
-          item.next_ != (i + 1 == result.groups_.size() ? 0 : i + 2) ||
+          item.next_ != (i + 1 == groups.size() ? 0 : i + 2) ||
           item.item_count_ != std::min<std::uint64_t>(
                                   kStringGroupBytes,
                                   root.item_count_ - i * kStringGroupBytes) ||
@@ -738,6 +768,9 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
         return absl::DataLossError("String segment byte total overflows");
       result.total_group_bytes_ += item.encoded_bytes_;
     }
+    auto array = decltype(result.groups_)::From(groups);
+    if (!array.ok()) return array.status();
+    result.groups_ = std::move(*array);
     return result;
   }
   absl::flat_hash_set<std::uint64_t> changed_ids;
@@ -764,9 +797,8 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     return absl::DataLossError("Sorted Set member directory/root mismatch");
 
   // Most writes replace a few pages without changing their order or links.
-  // Rebuild rank totals in one pass instead of allocating and adjudicating a
-  // map entry for every unchanged page. Structural edits still use Recover's
-  // complete-chain validation below.
+  // Share unchanged metadata and detach only changed chunks. Structural edits
+  // still use Recover's complete-chain validation below.
   bool same_topology = root.group_count_ == groups_.size() &&
                        root.first_group_ == root_.first_group_ &&
                        root.last_group_ == root_.last_group_ &&
@@ -799,35 +831,75 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       result.stream_header_ = stream_header_;
       result.has_stream_header_ = !changed_ids.contains(root.first_group_);
     }
+    absl::InlinedVector<std::pair<std::size_t, absl::int128>, 4> count_changes;
+    count_changes.reserve(changed.size());
+    absl::int128 count = root_.item_count_;
+    absl::int128 bytes = total_group_bytes_;
     for (auto item : changed) {
       const auto found = std::lower_bound(
-          result.ids_.begin(), result.ids_.end(), item.id_,
+          ids_.begin(), ids_.end(), item.id_,
           [](const auto& entry, auto id) { return entry.first < id; });
-      if (found == result.ids_.end() || found->first != item.id_)
+      if (found == ids_.end() || found->first != item.id_)
         return absl::DataLossError("missing ordered same-topology page");
+      if (item.item_count_ == 0 || item.record_token_ == 0 || item.lsn_ == 0 ||
+          std::isnan(item.min_score_) || std::isnan(item.max_score_) ||
+          item.min_score_ > item.max_score_)
+        return absl::DataLossError("invalid ordered same-topology page");
+      const auto index = found->second;
+      const auto& old = groups_[index];
+      const auto delta = absl::int128(item.item_count_) - old.item_count_;
+      count += delta;
+      bytes += absl::int128(item.encoded_bytes_) - old.encoded_bytes_;
+      count_changes.emplace_back(index, delta);
       item.txid_ = 0;
       item.batch_txid_ = 0;
-      result.groups_[found->second] = item;
+      auto status = result.groups_.Set(index, item);
+      if (!status.ok()) return status;
     }
-    std::uint64_t count = 0;
-    for (std::size_t i = 0; i < result.groups_.size(); ++i) {
-      const auto& item = result.groups_[i];
-      if (item.item_count_ == 0 ||
-          item.item_count_ > root.item_count_ - count ||
-          item.record_token_ == 0 || item.sequence_ == 0 || item.lsn_ == 0 ||
-          std::isnan(item.min_score_) || std::isnan(item.max_score_) ||
-          item.min_score_ > item.max_score_ ||
-          (root.kind_ == OrderedCollectionKind::kSortedSet && i != 0 &&
-           result.groups_[i - 1].max_score_ > item.min_score_) ||
-          item.encoded_bytes_ > std::numeric_limits<std::uint64_t>::max() -
-                                    result.total_group_bytes_)
-        return absl::DataLossError("invalid ordered same-topology page");
-      count += item.item_count_;
-      result.total_group_bytes_ += item.encoded_bytes_;
-      result.ends_[i] = count;
+    if (count != root.item_count_ || bytes < 0 || bytes > UINT64_MAX)
+      return absl::DataLossError("ordered same-topology aggregate mismatch");
+    result.total_group_bytes_ = static_cast<std::uint64_t>(bytes);
+    // Unchanged pages were validated in the previous immutable view. Only
+    // boundaries beside changed pages can introduce a new score inversion.
+    std::sort(count_changes.begin(), count_changes.end());
+    for (const auto& [index, delta] : count_changes) {
+      if (root.kind_ == OrderedCollectionKind::kSortedSet &&
+          ((index != 0 && result.groups_[index - 1].max_score_ >
+                              result.groups_[index].min_score_) ||
+           (index + 1 != groups_.size() &&
+            result.groups_[index].max_score_ >
+                result.groups_[index + 1].min_score_)))
+        return absl::DataLossError("unordered updated Sorted Set score bounds");
     }
-    if (count != root.item_count_)
-      return absl::DataLossError("ordered same-topology count mismatch");
+    // Count-neutral replacements share all rank metadata. A redistribution
+    // updates only the affected interval, stopping once the net delta is zero.
+    absl::int128 delta = 0;
+    std::size_t cursor = 0;
+    for (std::size_t n = 0; n < count_changes.size(); ++n) {
+      const auto [index, change] = count_changes[n];
+      if (delta != 0) {
+        for (; cursor < index; ++cursor) {
+          const auto value = absl::int128(ends_[cursor]) + delta;
+          if (value < 0 || value > root.item_count_)
+            return absl::DataLossError("invalid ordered updated rank");
+          auto status =
+              result.ends_.Set(cursor, static_cast<std::uint64_t>(value));
+          if (!status.ok()) return status;
+        }
+      }
+      delta += change;
+      cursor = index;
+    }
+    if (delta != 0) {
+      for (; cursor < ends_.size(); ++cursor) {
+        const auto value = absl::int128(ends_[cursor]) + delta;
+        if (value < 0 || value > root.item_count_)
+          return absl::DataLossError("invalid ordered updated rank");
+        auto status =
+            result.ends_.Set(cursor, static_cast<std::uint64_t>(value));
+        if (!status.ok()) return status;
+      }
+    }
     return result;
   }
   std::vector<RecoveredOrderedGroup> candidates;
@@ -988,12 +1060,11 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
   const std::size_t required_end = end == groups.size() ? end : end + 1;
   std::map<std::uint64_t, OrderedGroupSnapshot> loaded;
   for (auto& candidate : loaded_groups) {
-    auto found =
-        std::find_if(groups.begin(), groups.end(), [&](const auto& current) {
-          return current.id_ == candidate.snapshot_.id_;
-        });
     const auto& page = candidate.snapshot_;
-    if (found == groups.end() || candidate.sequence_ != found->sequence_ ||
+    // Validate only the loaded pages against the directory's identity index;
+    // a small splice must not scan every page of a large collection.
+    const auto* found = directory.Find(page.id_);
+    if (found == nullptr || candidate.sequence_ != found->sequence_ ||
         page.incarnation_ != root.incarnation_ || page.kind_ != root.kind_ ||
         page.retired_ || page.previous_ != found->previous_ ||
         page.next_ != found->next_ ||
@@ -1004,6 +1075,21 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
     if (!page_valid.ok()) return page_valid.status();
     if (!loaded.emplace(page.id_, std::move(candidate.snapshot_)).second)
       return absl::InvalidArgumentError("ordered splice repeats a loaded page");
+  }
+  // An equal-sized List replacement preserves the encoded page size, count
+  // and both links. Its neighbours cannot participate in a split or removal,
+  // and List values impose no cross-page ordering constraint.
+  if (root.kind_ == OrderedCollectionKind::kList && erase_count == 1 &&
+      entries.size() == 1 && target_bytes == kCollectionGroupTargetBytes) {
+    const auto found = loaded.find(groups[begin].id_);
+    if (found != loaded.end() &&
+        found->second.entries_[first->offset_].value_.size() ==
+            entries.front().value_.size()) {
+      found->second.entries_[first->offset_] = std::move(entries.front());
+      plan.changed_ = true;
+      plan.writes_.push_back(std::move(found->second));
+      return plan;
+    }
   }
   for (std::size_t i = required_begin; i < required_end; ++i) {
     if (!loaded.contains(groups[i].id_))

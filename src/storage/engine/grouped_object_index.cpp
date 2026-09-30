@@ -140,22 +140,15 @@ struct OwnedDirectory {
 };
 
 struct OwnedOrderedDirectory {
-  RetainedMemoryCharge charge_;
   OrderedGroupDirectory directory_;
 };
 
 absl::StatusOr<std::shared_ptr<const OrderedGroupDirectory>> OwnDirectory(
     OrderedGroupDirectory directory,
     const std::shared_ptr<ScanHashMapEntryArena>& arena) {
-  auto reservation = TryReserveMemory(directory.RetainedBytes());
-  if (!reservation) {
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM ordered directory exceeds maxmemory");
-  }
+  // Shared metadata chunks carry their own charge until their last view dies.
   auto owner = AllocateObject<OwnedOrderedDirectory>(arena);
   if (!owner.ok()) return owner.status();
-  (*owner)->charge_.Adopt(&*reservation, directory.RetainedBytes());
   (*owner)->directory_ = std::move(directory);
   const auto* view = &(*owner)->directory_;
   return std::shared_ptr<const OrderedGroupDirectory>(std::move(*owner), view);
