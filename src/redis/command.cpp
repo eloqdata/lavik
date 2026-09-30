@@ -5539,7 +5539,7 @@ struct MultiKeyContext {
   // Set by the coordinator between the execute and finish hops of a tagged
   // multi-shard write: any shard failed, so every shard must undo.
   bool rollback_ = false;
-  bool publish_fullsync_on_success_ = false;
+  bool finish_on_success_ = false;
 };
 
 // Second hop of a tagged multi-shard write, riding the releasing round: the
@@ -5549,13 +5549,8 @@ struct MultiKeyContext {
 Task<absl::Status> MultiKeyFinishCallback(void* context,
                                           const tx::ShardSlice&) {
   auto* ctx = static_cast<MultiKeyContext*>(context);
-  const std::uint64_t txid = ctx->tx_writes_.front().txid_;
-  if (ctx->rollback_) {
-    co_return co_await g_storage->RollbackTxLocal(txid);
-  }
-  storage::TxShardWrites& shard = ctx->tx_writes_[bycorf::ThisWorker().id_];
-  g_storage->PublishCommittedFullSyncEffects(&shard);
-  co_return co_await g_storage->DiscardTxUndoLocal(txid);
+  co_return co_await g_storage->FinishTxLocal(
+      ctx->tx_writes_[bycorf::ThisWorker().id_], ctx->rollback_);
 }
 
 using TwoPhaseCallback = Task<absl::Status> (*)(void*, const tx::ShardSlice&);
@@ -5571,11 +5566,8 @@ struct TwoPhaseResult {
 template <typename Context>
 Task<absl::Status> TwoPhaseFinishCallback(void* opaque, const tx::ShardSlice&) {
   auto* context = static_cast<Context*>(opaque);
-  const std::uint64_t txid = context->writes_.front().txid_;
-  if (context->rollback_) co_return co_await g_storage->RollbackTxLocal(txid);
-  storage::TxShardWrites& shard = context->writes_[bycorf::ThisWorker().id_];
-  g_storage->PublishCommittedFullSyncEffects(&shard);
-  co_return co_await g_storage->DiscardTxUndoLocal(txid);
+  co_return co_await g_storage->FinishTxLocal(
+      context->writes_[bycorf::ThisWorker().id_], context->rollback_);
 }
 
 #if LAVIK_FAULTS_ENABLED
@@ -5749,14 +5741,11 @@ Task<absl::Status> RenameSingleShardCallback(void* opaque,
     }
   }
   writes.collect_undo_ = false;
-  if (written.ok()) {
-    g_storage->PublishCommittedFullSyncEffects(&writes);
-  }
   // Keep each await in its own statement. GCC 13 can reuse the coroutine-frame
   // slot incorrectly when both arms of a conditional expression suspend.
   absl::Status finished;
   if (written.ok()) {
-    finished = co_await g_storage->DiscardTxUndoLocal(writes.txid_);
+    finished = co_await g_storage->FinishTxLocal(writes);
   } else {
     finished = co_await g_storage->RollbackTxLocal(writes.txid_, &writes);
   }
@@ -5767,12 +5756,11 @@ Task<absl::Status> ReleaseHeldKeys(void*, const tx::ShardSlice&) {
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> PublishFullSyncEffectsCallback(void* opaque,
-                                                  const tx::ShardSlice&) {
+Task<absl::Status> FinishTxParticipantsCallback(void* opaque,
+                                                const tx::ShardSlice&) {
   auto* writes = static_cast<std::vector<storage::TxShardWrites>*>(opaque);
-  g_storage->PublishCommittedFullSyncEffects(
-      &(*writes)[bycorf::ThisWorker().id_]);
-  co_return absl::OkStatus();
+  co_return co_await g_storage->FinishTxLocal(
+      (*writes)[bycorf::ThisWorker().id_]);
 }
 
 void NotifyRenamedValue(const CommandRequest& request, std::uint8_t db_id,
@@ -5963,12 +5951,9 @@ Task<absl::Status> CopySingleShardCallback(void* opaque,
   }
   storage::TxShardWrites& writes = context->writes_[bycorf::ThisWorker().id_];
   writes.collect_undo_ = false;
-  if (status.ok()) {
-    g_storage->PublishCommittedFullSyncEffects(&writes);
-  }
   absl::Status finished;
   if (status.ok()) {
-    finished = co_await g_storage->DiscardTxUndoLocal(writes.txid_);
+    finished = co_await g_storage->FinishTxLocal(writes);
   } else {
     finished = co_await g_storage->RollbackTxLocal(writes.txid_, &writes);
   }
@@ -6111,12 +6096,9 @@ Task<absl::Status> MSetNxSingleShardCallback(void* opaque,
   absl::Status written = co_await MSetNxWriteLocal(context);
   storage::TxShardWrites& writes = context->writes_[bycorf::ThisWorker().id_];
   writes.collect_undo_ = false;
-  if (written.ok()) {
-    g_storage->PublishCommittedFullSyncEffects(&writes);
-  }
   absl::Status finished;
   if (written.ok()) {
-    finished = co_await g_storage->DiscardTxUndoLocal(writes.txid_);
+    finished = co_await g_storage->FinishTxLocal(writes);
   } else {
     finished = co_await g_storage->RollbackTxLocal(writes.txid_, &writes);
   }
@@ -6260,9 +6242,9 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
       }
     }
   }
-  if (ctx->publish_fullsync_on_success_ && !ctx->tx_writes_.empty()) {
-    g_storage->PublishCommittedFullSyncEffects(
-        &ctx->tx_writes_[ThisWorker().id_]);
+  if (ctx->finish_on_success_ && !ctx->tx_writes_.empty()) {
+    co_return co_await g_storage->FinishTxLocal(
+        ctx->tx_writes_[ThisWorker().id_]);
   }
   co_return absl::OkStatus();
 }
@@ -6351,7 +6333,7 @@ Task<CommandReply> ExecuteMultiKey(
   // one hop (Execute requires release there), and reads have nothing to
   // undo.
   const bool two_hop = write_txid != 0 && !txn.single_shard();
-  ctx.publish_fullsync_on_success_ = write_txid != 0 && txn.single_shard();
+  ctx.finish_on_success_ = write_txid != 0 && txn.single_shard();
   absl::Status status =
       co_await txn.Execute(&MultiKeyShardCallback, &ctx, !two_hop);
   if (two_hop) {
@@ -6378,28 +6360,10 @@ Task<CommandReply> ExecuteMultiKey(
   }
   bool tx_commit_has_capacity = true;
   if (write_txid != 0) {
-    // The two-hop path already discarded these journals in its finish hop;
-    // the single-shard path has no finish hop. Settle both uniformly before
-    // handing the receipts to the detached commit chain. Each shard erases
-    // only its own journal.
-    std::vector<unsigned> undo_owners;
-    for (unsigned owner = 0; owner < ctx.tx_writes_.size(); ++owner) {
-      storage::TxShardWrites& shard = ctx.tx_writes_[owner];
-      if (!shard.collect_undo_) continue;
-      shard.collect_undo_ = false;
-      if (!shard.fences_.empty() || !shard.retirements_.empty()) {
-        undo_owners.push_back(owner);
-      }
-    }
-    absl::Status discarded = co_await ForEachParticipantParallel(
-        undo_owners.size(), [&undo_owners, write_txid](std::size_t index) {
-          return std::pair{undo_owners[index], [txid = write_txid] {
-                             return g_storage->DiscardTxUndoLocal(txid);
-                           }};
-        });
-    if (!discarded.ok()) {
-      co_return BuiltReply(AppendStorageError(reply_builder, discarded));
-    }
+    // Both the single-shard callback and the multi-shard finish hop settled
+    // their journals before releasing locks. The async coordinator receives
+    // only the durable-write receipts, with undo collection disarmed.
+    for (auto& shard : ctx.tx_writes_) shard.collect_undo_ = false;
     if (replication != nullptr) {
       replication->SetFinalExpirations(ctx.tx_writes_);
     }
@@ -8419,7 +8383,7 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
         co_return BuiltReply(AppendStorageError(reply_builder, valid));
       }
       absl::Status published = co_await transaction->Execute(
-          &PublishFullSyncEffectsCallback, &tx_writes, /*release=*/false);
+          &FinishTxParticipantsCallback, &tx_writes, /*release=*/false);
       if (!published.ok()) {
         (void)co_await transaction->Release();
         co_return BuiltReply(reply_builder.AppendError(
@@ -10314,9 +10278,8 @@ Task<CommandReply> ExecuteExecBody(
             const auto valid =
                 storage::StorageEngine::ValidateTxCommit(tx_writes);
             if (!valid.ok()) co_return valid;
-            g_storage->PublishCommittedFullSyncEffects(
-                &tx_writes[bycorf::ThisWorker().id_]);
-            co_return absl::OkStatus();
+            co_return co_await g_storage->FinishTxLocal(
+                tx_writes[bycorf::ThisWorker().id_]);
           });
       if (!status.ok()) {
         co_await DropWatches(ctx);
@@ -10527,7 +10490,7 @@ Task<CommandReply> ExecuteExecBody(
             BuiltReply(AppendStorageError(reply_builder, valid)));
       }
       absl::Status published =
-          co_await txn.Execute(&PublishFullSyncEffectsCallback, &tx_writes,
+          co_await txn.Execute(&FinishTxParticipantsCallback, &tx_writes,
                                /*release=*/false);
       if (!published.ok()) {
         (void)co_await txn.Release();

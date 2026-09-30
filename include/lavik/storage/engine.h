@@ -1803,8 +1803,15 @@ class StorageEngine {
   [[nodiscard]] bool EnqueueTxCommit(std::uint64_t txid,
                                      std::vector<TxShardWrites> writes);
   bycorf::Task<absl::Status> WaitForTxCommitCapacity();
-  // Must run on the owning worker before participant locks are released.
-  void PublishCommittedFullSyncEffects(TxShardWrites* shard);
+  // Settles a complete transaction's participant on its owning worker while
+  // its key locks are still held. Success publishes FULL after-images before
+  // discarding undo; rollback restores the journal without publishing them.
+  // This is logical settlement, not a durability fence: async commit callers
+  // must settle before transferring receipts to the commit coordinator.
+  // Command-local undo inside EXEC/Lua must use the lower-level undo APIs;
+  // the outer transaction is not ready to publish at those checkpoints.
+  bycorf::Task<absl::Status> FinishTxLocal(TxShardWrites& shard,
+                                           bool rollback = false);
 
   // Allocates a transaction id for tagging a multi-key write. Never zero.
   static std::uint64_t AllocateWriteTxid() noexcept;

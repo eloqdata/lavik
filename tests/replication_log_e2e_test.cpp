@@ -1189,7 +1189,8 @@ class ReplicationLogService final : public bycorf::Service {
       if (!before_commit.ok()) co_return before_commit.status();
       Check(before_commit->records_.empty(),
             "transaction participant leaked before the commit decision");
-      storage_->PublishCommittedFullSyncEffects(&committed_tx);
+      auto finished = co_await storage_->FinishTxLocal(committed_tx);
+      if (!finished.ok()) co_return finished;
       key_lock.Reset();
     }
     auto committed_effect_result =
@@ -1204,9 +1205,6 @@ class ReplicationLogService final : public bycorf::Service {
           "committed transaction effect was not published");
     storage_->AcknowledgePartitionFullSyncOverrides(kTxSession, tx_partition,
                                                     committed_effect.records_);
-    absl::Status discarded =
-        co_await storage_->DiscardTxUndoLocal(committed_tx.txid_);
-    if (!discarded.ok()) co_return discarded;
     // A mismatched coordinator ID must not commit these staged writes or
     // prevent their actual transaction from making its durability decision.
     std::vector<lavik::storage::TxShardWrites*> mismatched_shards{
@@ -1235,7 +1233,7 @@ class ReplicationLogService final : public bycorf::Service {
           kDb, rollback_key, rollback_digest, "aborted", {}, &rolled_back_tx);
       if (!staged.ok()) co_return staged.status();
       absl::Status rolled =
-          co_await storage_->RollbackTxLocal(rolled_back_tx.txid_);
+          co_await storage_->FinishTxLocal(rolled_back_tx, /*rollback=*/true);
       if (!rolled.ok()) co_return rolled;
       key_lock.Reset();
     }
@@ -1783,7 +1781,13 @@ class ReplicationLogService final : public bycorf::Service {
     absl::Status pending_completed = storage_->CompletePartitionDbReplication(
         kPendingTxSession, partition_id, kDb);
     if (!pending_completed.ok()) co_return pending_completed;
-    storage_->PublishCommittedFullSyncEffects(&pending_tx);
+    {
+      auto key_lock = co_await lavik::tx::CurrentTxShard().AcquireKey(
+          kDb, lavik::tx::FingerprintOf(pending_digest),
+          lavik::tx::LockMode::kExclusive);
+      auto finished = co_await storage_->FinishTxLocal(pending_tx);
+      if (!finished.ok()) co_return finished;
+    }
     auto late_commit_result = co_await storage_->ReadPartitionFullSyncOverrides(
         kPendingTxSession, partition_id, 16);
     if (!late_commit_result.ok()) co_return late_commit_result.status();
@@ -3342,6 +3346,25 @@ class ReplicationLogService final : public bycorf::Service {
          ":2\r\n",
          {"dst"}},
         {{"RPUSH", "src", "a", "b"}, {"DEL", "src", "dst"}, ":1\r\n", {"src"}},
+        {{"RPUSH", "src", "a", "b"},
+         {"RENAME", "src", "dst"},
+         "+OK\r\n",
+         {"src", "dst"}},
+        {{"RPUSH", "src", "a", "b"}, {"COPY", "src", "dst"}, ":1\r\n", {"dst"}},
+        {{"RPUSH", "src", "a", "b"},
+         {"MSET", "src", "x", "dst", "y"},
+         "+OK\r\n",
+         {"src", "dst"}},
+        {{"RPUSH", "src", "a", "b"},
+         {"MSETNX", "dst", "x", "extra", "y"},
+         ":1\r\n",
+         {"dst", "extra"}},
+        {{"RPUSH", "src", "a", "b"},
+         {"EVAL",
+          "return redis.call('LMOVE', KEYS[1], KEYS[2], 'LEFT', 'RIGHT')", "2",
+          "src", "dst"},
+         "$1\r\na\r\n",
+         {"src", "dst"}},
     };
     unsigned failures = 0;
     std::uint64_t session = 1700;
@@ -3351,7 +3374,8 @@ class ReplicationLogService final : public bycorf::Service {
         const std::string prefix = "{full-tx-" + std::to_string(session) + "}";
         for (auto* args : {&test.seed, &test.command, &test.changed}) {
           for (auto& arg : *args)
-            if (arg == "src" || arg == "dst") arg = prefix + arg;
+            if (arg == "src" || arg == "dst" || arg == "extra")
+              arg = prefix + arg;
         }
         auto status =
             co_await ExecuteClientCommand(0, std::move(test.seed), ":2\r\n");

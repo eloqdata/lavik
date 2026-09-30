@@ -877,8 +877,14 @@ Task<absl::Status> StorageEngine::WaitForTxCommitCapacity() {
   return impl_->WaitForTxCommitCapacity();
 }
 
-void StorageEngine::PublishCommittedFullSyncEffects(TxShardWrites* shard) {
-  impl_->PublishCommittedFullSyncEffects(shard);
+Task<absl::Status> StorageEngine::FinishTxLocal(TxShardWrites& shard,
+                                                bool rollback) {
+  if (rollback) return impl_->RollbackTxLocal(shard.txid_);
+  // FULL consumes participant after-images before its final cut. Publishing
+  // in CommitTxWrites would be too late for async commits and could run on
+  // the coordinator instead of this participant's owner.
+  impl_->PublishCommittedFullSyncEffects(&shard);
+  return impl_->DiscardTxUndoLocal(shard.txid_);
 }
 
 std::uint64_t StorageEngine::AllocateWriteTxid() noexcept {

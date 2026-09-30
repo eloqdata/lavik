@@ -1316,6 +1316,9 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
 
 Task<absl::Status> StorageEngine::Impl::DiscardTxUndoLocal(std::uint64_t txid) {
   WorkerStore& store = CurrentStore();
+  // The journal is owner-local. A completed participant with no journal has
+  // nothing to settle, including EXEC/Lua whose command checkpoints cleared it.
+  if (!store.tx_undo_.contains(txid)) co_return absl::OkStatus();
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   if (auto found = store.tx_undo_.find(txid); found != store.tx_undo_.end()) {

@@ -2442,8 +2442,8 @@ Task<absl::Status> MultiReadShard(void* opaque, const tx::ShardSlice& slice) {
     if (!replaced.ok()) {
       ClearMultiPayloads(context);
       if (!context->writes_.empty()) {
-        const auto rolled_back =
-            co_await g_storage->RollbackTxLocal(context->writes_.front().txid_);
+        const auto rolled_back = co_await g_storage->FinishTxLocal(
+            context->writes_[bycorf::ThisWorker().id_], /*rollback=*/true);
         if (!rolled_back.ok()) {
           context->rollback_failed_ = true;
           co_return rolled_back;
@@ -2452,10 +2452,8 @@ Task<absl::Status> MultiReadShard(void* opaque, const tx::ShardSlice& slice) {
       co_return replaced;
     }
     if (!context->writes_.empty()) {
-      g_storage->PublishCommittedFullSyncEffects(
-          &context->writes_[bycorf::ThisWorker().id_]);
-      co_return co_await g_storage->DiscardTxUndoLocal(
-          context->writes_.front().txid_);
+      co_return co_await g_storage->FinishTxLocal(
+          context->writes_[bycorf::ThisWorker().id_]);
     }
   }
   co_return absl::OkStatus();
@@ -2474,11 +2472,8 @@ Task<absl::Status> MultiWriteShard(void* opaque, const tx::ShardSlice& slice) {
 Task<absl::Status> MultiFinishShard(void* opaque, const tx::ShardSlice&) {
   auto* context = static_cast<MultiContext*>(opaque);
   if (context->writes_.empty()) co_return absl::OkStatus();
-  const std::uint64_t txid = context->writes_.front().txid_;
-  if (context->rollback_) co_return co_await g_storage->RollbackTxLocal(txid);
-  g_storage->PublishCommittedFullSyncEffects(
-      &context->writes_[bycorf::ThisWorker().id_]);
-  co_return co_await g_storage->DiscardTxUndoLocal(txid);
+  co_return co_await g_storage->FinishTxLocal(
+      context->writes_[bycorf::ThisWorker().id_], context->rollback_);
 }
 
 Task<absl::Status> CommitMulti(std::uint64_t txid,

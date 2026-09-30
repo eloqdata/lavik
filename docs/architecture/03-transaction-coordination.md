@@ -148,7 +148,12 @@ Transaction scheduling ends when the command has completed its logical hops
 and released its locks; crash-atomic storage completion has a separate
 worker-local coordinator. Successful common multi-key, keyed write-capable Lua,
 and EXEC paths settle their undo state, then transfer their `TxShardWrites`
-receipts to the current worker's commit queue. At most one drain coroutine runs
+receipts to the current worker's commit queue. Participant settlement uses the
+storage engine's common owner-local finish boundary while key locks are still
+held: success publishes FULL after-images and discards undo, while failure
+rolls back without publishing the attempted effects. This logical boundary is
+separate from the later durability decision.
+At most one drain coroutine runs
 per worker, replacing a detached coroutine per accepted transaction.
 The command layer waits for the storage Tx backlog before taking key intents
 for a new write transaction. That gate does not apply to a transaction already
