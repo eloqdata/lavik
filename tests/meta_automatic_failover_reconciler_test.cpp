@@ -42,6 +42,7 @@
 #include "lavik/meta/data_control_runtime_status.h"
 #include "lavik/meta/data_control_server.h"
 #include "lavik/meta/failover.h"
+#include "lavik/meta/failover_reconciler.h"
 #include "lavik/meta/hash.h"
 #include "lavik/meta/observation_store.h"
 #include "lavik/meta/proposal_executor.h"
@@ -334,6 +335,39 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
       ProposeAccepted(submit);
     }
     return state;
+  }
+
+  void AddOwnerGroup(unsigned index) {
+    const std::string name = "g" + std::to_string(index);
+    RegisterNode node;
+    node.node_id_ = Node(index);
+    node.principal_ = "lavik://node/" + node.node_id_;
+    node.endpoints_ = {"10.0.0." + std::to_string(index) + ":7000"};
+    node.role_ = MetaNodeRole::kPrimary;
+    ProposeAccepted(node);
+    CreateGroup group;
+    group.group_id_ = name;
+    group.new_topology_epoch_ =
+        machine_->StoresSnapshot().topology_.TopologyEpoch() + 1;
+    ProposeAccepted(group);
+    AssignNodeToGroup assign;
+    assign.group_id_ = name;
+    assign.node_id_ = node.node_id_;
+    assign.assignment_id_ = Bytes<16>(static_cast<std::uint8_t>(0x20 + index));
+    assign.role_ = MetaNodeRole::kPrimary;
+    assign.expected_revision_ = 1;
+    assign.new_topology_epoch_ = group.new_topology_epoch_ + 1;
+    ProposeAccepted(assign);
+    BeginGroupTerm term;
+    term.group_id_ = name;
+    term.new_term_ = 1;
+    ProposeAccepted(term);
+    ActivateAuthority activate;
+    activate.group_id_ = name;
+    activate.expected_term_ = 1;
+    activate.new_owner_ = node.node_id_;
+    activate.new_topology_epoch_ = assign.new_topology_epoch_ + 1;
+    ProposeAccepted(activate);
   }
 
   void InstallReconciler(std::function<absl::StatusOr<MetaRequestId>()> next_id,
@@ -694,6 +728,198 @@ class MetaAutomaticFailoverReconcilerTimeoutTest
     coordinator_->BecomeLeader(server_->get_term());
   }
 };
+
+TEST_F(MetaAutomaticFailoverReconcilerTest,
+       IndependentGroupsFillBoundedProposalWindowBeforeEarlierAppendReturns) {
+  SeedCluster();
+  for (unsigned index = 2; index <= 6; ++index) AddOwnerGroup(index);
+  std::atomic<int> attempts{0};
+  coordinator_->AddValidateHook(
+      [&attempts](const MetaCommand& command, const MetaCommittedView&,
+                  const MetaObservationStore&, std::int64_t) {
+        if (std::holds_alternative<BeginUncontrolledFailover>(command))
+          attempts.fetch_add(1, std::memory_order_release);
+        return absl::OkStatus();
+      });
+  std::atomic<int> generated_ids{0};
+  InstallReconciler(CountingIds(generated_ids), /*grace_ms=*/0);
+  StartEligibleTerm();
+  ASSERT_TRUE(WaitUntil([&] {
+    const auto snapshot = diagnostics_->Snapshot();
+    return snapshot.statuses_.size() == 6 &&
+           std::ranges::all_of(snapshot.statuses_, [](const auto& status) {
+             return status.state_ == MetaAutomaticFailoverState::kSuspect;
+           });
+  }));
+  BlockProposalExecutor();
+  now_steady_ms_.store(11'000, std::memory_order_release);
+  EXPECT_TRUE(WaitUntil([&] { return attempts.load() == 4; }, 2s));
+  EXPECT_EQ(attempts.load(), 4);
+  // A further worker turn must neither exceed the bound nor duplicate a Group.
+  executor_.WaitUntilIdle();
+  EXPECT_EQ(attempts.load(), 4);
+  ReleaseProposalExecutor();
+  ASSERT_TRUE(WaitUntil([&] {
+    const auto stores = machine_->StoresSnapshot();
+    for (const auto& group : stores.topology_.Groups())
+      if (!group.failover_transition_) return false;
+    return true;
+  }));
+  EXPECT_EQ(attempts.load(), 6);
+  EXPECT_EQ(generated_ids.load(), 12);
+}
+
+TEST_F(MetaAutomaticFailoverReconcilerTest,
+       ShutdownJoinsAllDispatchedGroupProposals) {
+  SeedCluster();
+  for (unsigned index = 2; index <= 6; ++index) AddOwnerGroup(index);
+  std::atomic<int> attempts{0};
+  coordinator_->AddValidateHook(
+      [&attempts](const MetaCommand& command, const MetaCommittedView&,
+                  const MetaObservationStore&, std::int64_t) {
+        if (std::holds_alternative<BeginUncontrolledFailover>(command))
+          ++attempts;
+        return absl::OkStatus();
+      });
+  std::atomic<int> ids{0};
+  InstallReconciler(CountingIds(ids), 0);
+  StartEligibleTerm();
+  ASSERT_TRUE(WaitUntil([&] {
+    const auto snapshot = diagnostics_->Snapshot();
+    return snapshot.statuses_.size() == 6 &&
+           std::ranges::all_of(snapshot.statuses_, [](const auto& status) {
+             return status.state_ == MetaAutomaticFailoverState::kSuspect;
+           });
+  }));
+  BlockProposalExecutor();
+  now_steady_ms_.store(11'000);
+  EXPECT_TRUE(WaitUntil([&] { return attempts.load() == 4; }, 2s));
+  auto stopped =
+      std::async(std::launch::async, [this] { reconciler_->Shutdown(); });
+  EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
+  ReleaseProposalExecutor();
+  ASSERT_EQ(stopped.wait_for(5s), std::future_status::ready);
+  stopped.get();
+  EXPECT_EQ(attempts.load(), 4);  // the queued fifth/sixth Groups never launch
+  EXPECT_TRUE(diagnostics_->Snapshot().statuses_.empty());
+}
+
+TEST_F(MetaAutomaticFailoverReconcilerTimeoutTest,
+       ConcurrentTimeoutsRetainEachGroupIdentityAndReconcileLateCommits) {
+  SeedCluster();
+  for (unsigned index = 2; index <= 4; ++index) AddOwnerGroup(index);
+  ArmShortProposalTimeout();
+  std::atomic<int> attempts{0};
+  coordinator_->AddValidateHook(
+      [&attempts](const MetaCommand& command, const MetaCommittedView&,
+                  const MetaObservationStore&, std::int64_t) {
+        if (std::holds_alternative<BeginUncontrolledFailover>(command))
+          ++attempts;
+        return absl::OkStatus();
+      });
+  std::atomic<int> ids{0};
+  InstallReconciler(CountingIds(ids), 0);
+  StartEligibleTerm();
+  ASSERT_TRUE(WaitUntil([&] {
+    const auto snapshot = diagnostics_->Snapshot();
+    return snapshot.statuses_.size() == 4 &&
+           std::ranges::all_of(snapshot.statuses_, [](const auto& status) {
+             return status.state_ == MetaAutomaticFailoverState::kSuspect;
+           });
+  }));
+  BlockProposalExecutor();
+  now_steady_ms_.store(11'000);
+  EXPECT_TRUE(WaitUntil([&] { return attempts.load() == 4; }, 2s));
+  std::this_thread::sleep_for(250ms);  // all four local deadlines expire
+  EXPECT_EQ(attempts.load(), 4);
+  now_steady_ms_.store(
+      11'100);  // enable exact retries while originals are queued
+  EXPECT_TRUE(WaitUntil([&] { return attempts.load() == 8; }, 2s));
+  EXPECT_EQ(ids.load(), 8);  // two ids per Group, none minted for retries
+  ReleaseProposalExecutor();
+  ASSERT_TRUE(WaitUntil([&] {
+    const auto stores = machine_->StoresSnapshot();
+    return std::ranges::all_of(stores.topology_.Groups(),
+                               [](const auto& group) {
+                                 return group.failover_transition_.has_value();
+                               });
+  }));
+  reconciler_->Shutdown();
+  const auto stores = machine_->StoresSnapshot();
+  for (unsigned index = 1; index <= 4; ++index) {
+    const auto group = stores.topology_.FindGroup("g" + std::to_string(index));
+    ASSERT_TRUE(group && group->failover_transition_);
+    EXPECT_EQ(group->failover_transition_->transition_id_,
+              Bytes<16>(static_cast<std::uint8_t>(0x70 + 2 * index - 1)));
+    EXPECT_EQ(group->record_.group_term_, 2);
+  }
+}
+
+// Reuse the real Raft/runtime fixture without installing the detector. Expired
+// controlled requests exercise the ordinary transition executor's dispatch and
+// join paths, independently of automatic Begin admission.
+TEST_F(MetaAutomaticFailoverReconcilerTest,
+       ControlledExecutorBoundsGroupsAndJoinsDuringDemotion) {
+  SeedCluster();
+  for (unsigned index = 2; index <= 6; ++index) AddOwnerGroup(index);
+  for (unsigned index = 1; index <= 6; ++index) {
+    auto intent =
+        EncodeFailoverOperationIntent({.group_id_ = "g" + std::to_string(index),
+                                       .absolute_deadline_unix_ms_ = 1});
+    ASSERT_TRUE(intent.ok());
+    SubmitOperation submit;
+    submit.operation_id_ = Bytes<16>(static_cast<std::uint8_t>(0x40 + index));
+    submit.kind_ = std::string(kFailoverOperationKind);
+    submit.intent_ = *intent;
+    submit.intent_hash_ = MetaSha256(*intent);
+    ProposeAccepted(submit);
+  }
+  std::atomic<int> attempts{0};
+  coordinator_->AddValidateHook(
+      [&attempts](const MetaCommand& command, const MetaCommittedView&,
+                  const MetaObservationStore&, std::int64_t) {
+        if (std::holds_alternative<AbortControlledFailover>(command))
+          ++attempts;
+        return absl::OkStatus();
+      });
+  BlockProposalExecutor();
+  std::atomic<int> ids{0};
+  MetaFailoverReconcilerOptions options;
+  options.poll_interval_ = 5ms;
+  options.now_unix_ms_ = [] { return 1000; };
+  options.next_id_ = CountingIds(ids);
+  auto reconciler =
+      std::make_shared<MetaFailoverReconciler>(executor_, options);
+  coordinator_->RunAsLeader(reconciler);
+  EXPECT_TRUE(WaitUntil([&] { return attempts.load() == 4; }, 2s));
+  EXPECT_EQ(ids.load(), 4);
+  auto cancelled =
+      std::async(std::launch::async, [&] { reconciler->CancelAndWait(); });
+  EXPECT_EQ(cancelled.wait_for(50ms), std::future_status::timeout);
+  ReleaseProposalExecutor();
+  ASSERT_EQ(cancelled.wait_for(5s), std::future_status::ready);
+  cancelled.get();
+  EXPECT_EQ(attempts.load(), 4);
+  EXPECT_EQ(ids.load(), 4);
+  // Elect a new Raft term after the join. Same-term leader events are ignored
+  // by the coordinator; a real next tenure must rediscover the remaining
+  // requests without keeping old window slots.
+  StartEligibleTerm(/*reelect=*/true);
+  ASSERT_TRUE(WaitUntil([&] {
+    const auto stores = machine_->StoresSnapshot();
+    for (unsigned index = 1; index <= 6; ++index) {
+      const auto operation = stores.operation_.FindOperation(
+          Bytes<16>(static_cast<std::uint8_t>(0x40 + index)));
+      if (!operation ||
+          operation->lifecycle_ != MetaOperationLifecycle::kAborted)
+        return false;
+    }
+    return true;
+  }));
+  EXPECT_EQ(attempts.load(), 6);
+  EXPECT_EQ(ids.load(), 6);
+  reconciler->Shutdown();
+}
 
 TEST_F(MetaAutomaticFailoverReconcilerTest,
        DiagnosticsCatchUpAfterConfigurationOnlyCommit) {

@@ -39,6 +39,7 @@
 #include "absl/status/status.h"
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/worker.h"
+#include "group_proposal_window.h"
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/cluster/lease_clock.h"
 #include "lavik/fault_injection.h"
@@ -721,6 +722,8 @@ absl::StatusOr<std::optional<MetaCommand>> PlanSubmittedControlled(
     const MetaFailoverPlannerContext& context) {
   auto intent = DecodeFailoverOperationIntent(operation.intent_);
   if (!intent.ok()) return intent.status();
+  if (context.group_in_flight_ && context.group_in_flight_(intent->group_id_))
+    return std::nullopt;
   if (static_cast<std::uint64_t>(context.now_unix_ms_) >=
       intent->absolute_deadline_unix_ms_) {
     return AbortControlled(operation, intent->group_id_, std::nullopt,
@@ -827,7 +830,9 @@ absl::StatusOr<std::optional<MetaCommand>> PlanFailoverStep(
   }
 
   for (const MetaTopologyGroupView& group : view.topology().Groups()) {
-    if (!group.failover_transition_.has_value()) continue;
+    if (!group.failover_transition_.has_value() ||
+        (context.group_in_flight_ && context.group_in_flight_(group.group_id_)))
+      continue;
     auto planned =
         group.failover_transition_->mode_ == MetaFailoverMode::kControlled
             ? PlanControlledTransition(view, group, *group.failover_transition_,
@@ -1029,7 +1034,34 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
   };
   auto subscribed = subscribe();
   std::string last_error;
+  detail::GroupProposalWindow proposals;
+  std::map<std::string, std::chrono::steady_clock::time_point, std::less<>>
+      retry_after;
   while (!core->cancelled_ && context->IsCurrent()) {
+    for (auto& completion : proposals.TakeCompleted()) {
+      // Completion only requests a fresh view. Apply/CAS facts decide what is
+      // still needed, including when a timed-out command committed meanwhile.
+      changed->store(true, std::memory_order_release);
+      const auto& applied = *completion->result_;
+      if (applied.ok() && applied->verdict_ == MetaAuditVerdict::kAccepted)
+        continue;
+      // Keep the old retry pacing per Group. A fast local rejection must not
+      // spin or prevent an independent Group from filling the free slot.
+      retry_after[completion->group_] =
+          std::chrono::steady_clock::now() + core->options_.poll_interval_;
+      const std::string detail = applied.ok()
+                                     ? applied->detail_
+                                     : std::string(applied.status().message());
+      if (last_error != detail) {
+        spdlog::warn("failover proposal deferred group={}: {}",
+                     completion->group_, detail);
+        last_error = detail;
+      }
+    }
+    const auto retry_now = std::chrono::steady_clock::now();
+    std::erase_if(retry_after, [retry_now](const auto& entry) {
+      return retry_now >= entry.second;
+    });
     if (subscribed.subscription_->needs_resync()) subscribed = subscribe();
     if (changed->exchange(false, std::memory_order_acq_rel)) {
       subscribed.view_ = context->CommittedView();
@@ -1207,19 +1239,29 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
       });
     }
     const std::int64_t now = core->options_.now_unix_ms_();
+    if (proposals.Full()) {
+      const auto waited =
+          co_await proposals.Wait(core->options_.poll_interval_);
+      if (!waited.ok()) break;
+      continue;
+    }
     auto planned = PlanFailoverStep(
         subscribed.view_, context->Observations(),
         {.now_unix_ms_ = now,
          .leadership_started_unix_ms_ = leadership_started_unix_ms,
          .observation_grace_ms_ = core->options_.observation_grace_ms_,
          .next_id_ = core->options_.next_id_,
-         .authority_excluded_ = [core](std::string_view group,
-                                       std::uint64_t term) {
-           std::lock_guard lock(core->recovery_mutex_);
-           return core->recovery_active_ &&
-                  core->authority_guard_->ObserveFence(
-                      group, term, core->options_.now_lease_clock_ms_());
-         }});
+         .authority_excluded_ =
+             [core](std::string_view group, std::uint64_t term) {
+               std::lock_guard lock(core->recovery_mutex_);
+               return core->recovery_active_ &&
+                      core->authority_guard_->ObserveFence(
+                          group, term, core->options_.now_lease_clock_ms_());
+             },
+         .group_in_flight_ =
+             [&proposals, &retry_after](std::string_view group) {
+               return proposals.Contains(group) || retry_after.contains(group);
+             }});
     if (!planned.ok()) {
       if (last_error != planned.status().message()) {
         spdlog::warn("failover reconciliation blocked: {}",
@@ -1241,32 +1283,27 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
         }
         start->recovery_deadline_unix_ms_ = it->second.deadline_unix_ms_;
       }
-      const auto applied = co_await context->Propose(std::move(**planned));
-      if (core->cancelled_) break;
-      // A timeout, rejection, or accepted reply is never interpreted as
-      // committed truth. Every outcome forces a fresh aggregate read; exact
-      // transition/operation revisions then decide the next level-triggered
-      // step, including after a reply is lost but the entry committed.
-      changed->store(true, std::memory_order_release);
-      if (applied.ok() && applied->verdict_ == MetaAuditVerdict::kAccepted) {
-        continue;
-      }
-      const std::string detail = applied.ok()
-                                     ? applied->detail_
-                                     : std::string(applied.status().message());
-      if (last_error != detail) {
-        spdlog::warn("failover proposal deferred: {}", detail);
-        last_error = detail;
-      }
+      const std::string group = std::visit(
+          [](const auto& command) -> std::string {
+            if constexpr (requires { command.group_id_; }) {
+              return command.group_id_;
+            } else {
+              // The failover planner emits only typed per-Group mutations.
+              std::terminate();
+            }
+          },
+          **planned);
+      proposals.Start(*context, group, std::move(**planned));
+      continue;
     } else {
       last_error.clear();
     }
 
-    const auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                                 core->options_.poll_interval_);
+    const auto slept = co_await proposals.Wait(core->options_.poll_interval_);
     if (!slept.ok()) break;
   }
 
+  co_await proposals.Drain();
   core->running_ = false;
   for (const auto& waiter : core->waiters_) waiter->set_value();
   core->waiters_.clear();

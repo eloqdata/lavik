@@ -72,6 +72,9 @@ struct MetaFailoverPlannerContext {
   // Absent means no exclusion evidence. This gates only the first recovery
   // start; a committed cutoff already records the prior exclusion decision.
   std::function<bool(std::string_view, std::uint64_t)> authority_excluded_;
+  // Worker-local admission filter. An unresolved proposal owns its Group;
+  // the planner skips it before consuming ids or planning another transition.
+  std::function<bool(std::string_view)> group_in_flight_;
 };
 
 // Derives at most one typed failover mutation from one committed view and the

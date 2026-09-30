@@ -541,6 +541,46 @@ void BeginUncontrolled(Fixture& fixture,
 }
 
 TEST(MetaFailoverReconcilerPlannerTest,
+     OccupiedGroupDoesNotReplanSubmittedOrActiveTransition) {
+  Fixture fixture;
+  fixture.SubmitControlled(10'000);
+  fixture.ReportOwner(1'000);
+  fixture.ReportCandidate(1'000);
+  std::uint8_t next = 0x80;
+  bool occupied = true;
+  auto plan = [&] {
+    return meta::PlanFailoverStep(
+        meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
+        fixture.observations,
+        {.now_unix_ms_ = 1'001,
+         .leadership_started_unix_ms_ = 900,
+         .observation_grace_ms_ = 100,
+         .next_id_ = [&]() -> absl::StatusOr<meta::MetaRequestId> {
+           return Bytes<16>(next++);
+         },
+         .group_in_flight_ =
+             [&](std::string_view group) {
+               EXPECT_EQ(group, "g1");
+               return occupied;
+             }});
+  };
+  auto waiting = plan();
+  ASSERT_TRUE(waiting.ok());
+  EXPECT_FALSE(waiting->has_value());
+  EXPECT_EQ(next, 0x80);
+  occupied = false;
+  auto begin = plan();
+  ASSERT_TRUE(begin.ok() && begin->has_value());
+  fixture.Accept(**begin);
+  const auto after_begin = next;
+  occupied = true;
+  waiting = plan();
+  ASSERT_TRUE(waiting.ok());
+  EXPECT_FALSE(waiting->has_value());
+  EXPECT_EQ(next, after_begin);
+}
+
+TEST(MetaFailoverReconcilerPlannerTest,
      RecoveryStartsAfterExclusionAndPrepareWaitsForDrain) {
   Fixture fixture;
   BeginUncontrolled(fixture);
