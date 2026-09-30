@@ -42,6 +42,57 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     // prefix.
     LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_GROUP_MEMBER_PREPARE_KEY", key);
 
+    if (!previous) {
+      // A fresh graph has no before/after changes to reconcile. Copy the
+      // admitted ordered members directly and let GroupHashValue perform the
+      // exact duplicate check before either index is published. This avoids
+      // a second per-member map and its metadata reservation during RESTORE.
+      GroupedScratchBudget incoming;
+      std::size_t count = 0;
+      for (const auto& page : ordered.writes_) {
+        if (page.entries_.size() > ordered.root_.item_count_ - count)
+          co_return absl::DataLossError(
+              "member-index promotion count mismatch");
+        count += page.entries_.size();
+        for (const auto& entry : page.entries_) {
+          auto status = incoming.AddBytes(entry.value_.size() + 256);
+          if (!status.ok()) co_return status;
+        }
+      }
+      if (count != ordered.root_.item_count_)
+        co_return absl::DataLossError("member-index promotion count mismatch");
+      auto scratch = incoming.Reserve(1);
+      if (!scratch.ok()) co_return scratch.status();
+      result.scratch_ = std::move(*scratch);
+      auto& plan = result.plan_;
+      plan.root_ = {.incarnation_ = ordered.root_.incarnation_,
+                    .seed_ = CurrentDigestSeed(),
+                    .field_count_ = ordered.root_.item_count_,
+                    .revision_ = ordered.root_.revision_};
+      HashValue value;
+      value.entries_.reserve(count);
+      for (const auto& page : ordered.writes_) {
+        for (const auto& entry : page.entries_) {
+          if (unlocked && !value.entries_.empty() &&
+              value.entries_.size() % 256 == 0)
+            co_await bycorf::Yield(*store.worker_);
+          value.entries_.push_back(
+              {.digest_ = ComputeDigest(entry.value_),
+               .field_ = entry.value_,
+               .value_ = EncodeSortedSetMemberScore(entry.score_)});
+        }
+      }
+      auto groups = GroupHashValue(std::move(value), plan.root_.incarnation_,
+                                   plan.root_.seed_);
+      if (!groups.ok()) co_return groups.status();
+      if (groups->size() > std::numeric_limits<std::uint32_t>::max())
+        co_return absl::OutOfRangeError("too many member-index groups");
+      plan.root_.group_count_ = groups->size();
+      plan.writes_ = std::move(*groups);
+      plan.changed_ = true;
+      co_return result;
+    }
+
     auto add_group = [&](GroupedScratchBudget& budget,
                          HashGroupId id) -> absl::Status {
       // Prior IO may have allowed physical relocation. Never use an old
@@ -150,34 +201,6 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     if (!scratch.ok()) co_return scratch.status();
     result.scratch_ = std::move(*scratch);
     auto& plan = result.plan_;
-    if (!previous) {
-      plan.root_ = {.incarnation_ = ordered.root_.incarnation_,
-                    .seed_ = CurrentDigestSeed(),
-                    .field_count_ = ordered.root_.item_count_,
-                    .revision_ = ordered.root_.revision_};
-      HashValue value;
-      value.entries_.reserve(changes.size());
-      for (const auto& [member, change] : changes) {
-        if (unlocked && !value.entries_.empty() &&
-            value.entries_.size() % 256 == 0)
-          co_await bycorf::Yield(*store.worker_);
-        value.entries_.push_back(
-            {.digest_ = ComputeDigest(member),
-             .field_ = std::string(member),
-             .value_ = EncodeSortedSetMemberScore(*change.after_)});
-      }
-      if (value.entries_.size() != plan.root_.field_count_)
-        co_return absl::DataLossError("member-index promotion count mismatch");
-      auto groups = GroupHashValue(std::move(value), plan.root_.incarnation_,
-                                   plan.root_.seed_);
-      if (!groups.ok()) co_return groups.status();
-      if (groups->size() > std::numeric_limits<std::uint32_t>::max())
-        co_return absl::OutOfRangeError("too many member-index groups");
-      plan.root_.group_count_ = groups->size();
-      plan.writes_ = std::move(*groups);
-      plan.changed_ = true;
-      co_return result;
-    }
     plan.root_ = previous->directory().root();
     if (changes.empty()) co_return result;
 

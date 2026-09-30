@@ -626,6 +626,8 @@ TEST(GroupedHashTest, PromotionRoutesEveryFieldToOneBoundedGroup) {
         const auto* selected = directory->Find(entry.field_);
         ASSERT_NE(selected, nullptr);
         EXPECT_EQ(selected->id_, group.id_);
+        // The persisted routing seed differs from the process lookup seed.
+        EXPECT_EQ(entry.digest_, ComputeDigest(entry.field_));
         EXPECT_TRUE(all.emplace(entry.field_, entry.value_).second);
       }
     }
@@ -787,6 +789,22 @@ TEST(GroupedHashTest, LargeLogicalValueRoundTripsBeyondRecordLimit) {
     EXPECT_EQ(entry.value_.find_first_not_of(static_cast<char>('a' + i)),
               std::string::npos);
   }
+  // A caller's target above the record limit must still split the logical
+  // value into valid physical leaves, rather than reject the whole value.
+  std::string().swap(*encoded);
+  auto groups = GroupHashValue(std::move(*decoded), 17, Seed(), SIZE_MAX);
+  ASSERT_TRUE(groups.ok()) << groups.status();
+  ASSERT_GT(groups->size(), 1);
+  std::size_t count = 0;
+  for (const auto& group : *groups) {
+    std::size_t bytes =
+        group.value_.entries_.empty() ? 0 : kHashValueHeaderBytes;
+    for (const auto& entry : group.value_.entries_)
+      bytes += 8 + entry.field_.size() + entry.value_.size();
+    EXPECT_LE(bytes, kHashGroupPayloadLimit);
+    count += group.value_.entries_.size();
+  }
+  EXPECT_EQ(count, 3);
 }
 
 TEST(GroupedHashTest, RejectsFieldsOutsideTheLeafBeingUpdated) {

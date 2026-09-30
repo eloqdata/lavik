@@ -456,7 +456,7 @@ TEST(GroupedRdbStreamE2e, ZsetRestoreBatchesPreserveOrderAndRollback) {
   // At two workers and 128 MiB, the ingest planner cannot admit all these
   // entries in one batch. Cover head/tail splices, overlapping score ranges and
   // equal-score ties through the real memory gate, including cold recovery.
-  constexpr unsigned count = 32768;
+  constexpr unsigned count = 49152;
   auto member = [](unsigned i) {
     auto value = std::to_string(i);
     return std::string(8 - value.size(), '0') + value;
@@ -522,6 +522,7 @@ TEST(GroupedRdbStreamE2e, ZsetRestoreBatchesPreserveOrderAndRollback) {
     Server server(disk, 2, {}, {}, false, 2, "128M");
     Client client(server.port());
     for (unsigned mode = 0; mode < 4; ++mode) {
+      SCOPED_TRACE(mode);
       const auto key = "batch-sorted-" + std::to_string(mode);
       ASSERT_EQ(client.Command({"RESTORE", key, "0", dump(mode, false)}).text_,
                 "OK");

@@ -369,8 +369,15 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       // of the replacement. Match CollectGroupedRetirements' receipt width;
       // these allowances coexist with the directory and input batch. REPLACE
       // also owns the original graph before its first imported page.
-      const auto retirement_records =
-          SaturatingIngestAdd(count, current ? current->record_count() : 0);
+      auto new_records = count;
+      if (type == ValueType::kSortedSet && state->applied_count_ == 0) {
+        const auto groups = BoundInitialSortedSetIngestGroups(
+            SaturatingIngestAdd(merged_bytes, bytes), count);
+        new_records = std::min(
+            count, SaturatingIngestAdd(groups.ordered_, groups.members_));
+      }
+      const auto retirement_records = SaturatingIngestAdd(
+          new_records, current ? current->record_count() : 0);
       constexpr auto retirement_width =
           4 * sizeof(RetiredRecord) + sizeof(TxShardWrites::Retired);
       const auto retirement_bytes =
