@@ -1406,7 +1406,11 @@ def run_multi_group_case(
     # Hold target rebuilds after source initialization so snapshots contain
     # real data. The advertised proxy also captures reconnects and redirects.
     proxy = (
-        DirectiveBarrier(meta.data_control_port, recipients=(REPLICA_1, REPLICA_2))
+        DirectiveBarrier(
+            meta.data_control_port,
+            recipients=(REPLICA_1, REPLICA_2),
+            hold_timeout=60,
+        )
         if worker_counts is not None
         else None
     )
@@ -1599,7 +1603,15 @@ def run_multi_group_case(
                     creator.stdin.write(input_text)
                     creator.stdin.flush()
                 by_id = {node.node_id: node for node in nodes}
-                for group_id, (primary_id, replica_id, first, last) in GROUPS.items():
+                independent_started = time.monotonic()
+                # Both independent children must reach rebuild before either
+                # is released. A serial planner stalls here behind group-1.
+                for replica_id in (REPLICA_1, REPLICA_2):
+                    held, _ = proxy.recipients[replica_id]
+                    H.wait_until("independent target rebuild held", 15, held.is_set)
+                for group_id, (primary_id, replica_id, first, last) in reversed(
+                    list(GROUPS.items())
+                ):
                     held, release = proxy.recipients[replica_id]
                     H.wait_until(f"{group_id} target rebuild held", 30, held.is_set)
                     primary = by_id[primary_id]
@@ -1627,6 +1639,27 @@ def run_multi_group_case(
                             raise H.Failure("snapshot seed write failed")
                     snapshot_values[replica_id] = values
                     release.set()
+                    if replica_id == REPLICA_2:
+
+                        def second_population_ready():
+                            status = cluster_status(meta)
+                            by_node = {
+                                node["node_id"]: node for node in status["data_nodes"]
+                            }
+                            if by_node.get(REPLICA_1, {}).get("population_current"):
+                                raise H.Failure("first rebuild escaped its barrier")
+                            return by_node.get(REPLICA_2, {}).get("population_current")
+
+                        H.wait_until(
+                            "second replica ready while first rebuild remains held",
+                            10,
+                            second_population_ready,
+                        )
+                        H.log(
+                            "independent group-2 population ready after "
+                            f"{time.monotonic() - independent_started:.3f}s "
+                            "while group-1 rebuild remains held"
+                        )
                 created, stderr = creator.communicate(timeout=120)
                 if creator.returncode != 0:
                     raise H.Failure(
@@ -1918,9 +1951,12 @@ def run_group_id_probe_case(workdir):
 class DirectiveBarrier(H.Proxy):
     """Hold one complete control frame without changing its bytes/identity."""
 
-    def __init__(self, target_port, result=False, recipients=()):
+    def __init__(self, target_port, result=False, recipients=(), hold_timeout=20):
         super().__init__("result" if result else "directive", target_port)
         self.result = result
+        # The independent-Group cut holds one stream across the other Group's
+        # full initialization, including slower Debug CI runs.
+        self.hold_timeout = hold_timeout
         self.blocked = threading.Event()
         self.release = threading.Event()
         self.recipients = {
@@ -1978,7 +2014,7 @@ class DirectiveBarrier(H.Proxy):
                             continue
                         blocked, release = events
                     blocked.set()
-                    if not release.wait(20):
+                    if not release.wait(self.hold_timeout):
                         raise OSError("test barrier timed out")
                     dst.sendall(header + payload)
                     return super()._pump(src, dst, pair)

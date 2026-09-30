@@ -94,6 +94,7 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
         {0, 8191, "group-a"},
         {8192, 16'383, "group-b"},
     };
+    ConfigureGroups();
     root_.fill(8);
     auto intent = EncodeClusterCreateRequest(manifest_, root_);
     ASSERT_TRUE(intent.ok()) << intent.status();
@@ -112,6 +113,7 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
   }
 
   virtual void ConfigureDataEndpoints() {}
+  virtual void ConfigureGroups() {}
 
   void AdvanceToProjectionWait() {
     for (int step = 0; step < 100; ++step) {
@@ -159,7 +161,7 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
       ASSERT_NE(member, group->members_.end());
       MetaDataControlRuntimeNode node;
       node.node_id_ = declaration.node_id_;
-      node.boot_id_ = std::string(40, static_cast<char>('5' + index));
+      node.boot_id_ = std::string(40, "0123456789abcdef"[(5 + index) % 16]);
       node.replication_history_id_.fill(static_cast<std::uint8_t>(10 + index));
       node.replication_flow_count_ = index == 0 ? 3 : 2;
       node.control_revision_ = index_;
@@ -438,6 +440,8 @@ TEST_F(ClusterCreateV1RecoveryTest,
                MetaDirectiveResultStatus::kSucceeded);
   const auto primary = runtime_.nodes_.front();
   runtime_.nodes_.erase(runtime_.nodes_.begin());
+  ApplyPlanned();  // independent group-b: submit
+  ApplyPlanned();  // independent group-b: initialize primary
   auto waiting = Plan();
   ASSERT_TRUE(waiting.ok()) << waiting.status();
   EXPECT_FALSE(waiting->has_value());
@@ -501,7 +505,7 @@ TEST_F(ClusterCreateV1RecoveryTest,
   ApplyPlanned();  // group-a: completed
   EXPECT_EQ(GroupOperation("group-a").lifecycle_,
             MetaOperationLifecycle::kCompleted);
-  ApplyPlanned();  // group-b: submit only after group-a completes
+  ApplyPlanned();  // group-b: submit when group-a no longer has runnable work
   EXPECT_EQ(GroupOperation("group-b").lifecycle_,
             MetaOperationLifecycle::kSubmitted);
 }
@@ -517,6 +521,8 @@ TEST_F(ClusterCreateV1RecoveryTest,
   auto& source = runtime_.nodes_.front();
   const auto grant = *source.last_lease_decision_;
   source.last_lease_decision_ = cluster::control::LeaseDenied{};
+  ApplyPlanned();  // independent group-b: submit
+  ApplyPlanned();  // independent group-b: initialize primary
   auto waiting = Plan();
   ASSERT_TRUE(waiting.ok()) << waiting.status();
   EXPECT_FALSE(waiting->has_value());
@@ -547,6 +553,228 @@ TEST_F(ClusterCreateV1RecoveryTest,
   const auto rebuilt = GroupOperation("group-a");
   ASSERT_EQ(rebuilt.current_directives_.size(), 2);
   EXPECT_EQ(rebuilt.current_directives_[1].spec_.kind_, kMetaDirectiveRebuild);
+}
+
+TEST_F(ClusterCreateV1RecoveryTest, SlowReplicaDoesNotBlockIndependentGroup) {
+  StartFirstReplicaBatch();
+  const auto stalled = GroupOperation("group-a");
+  auto next = Plan();
+  ASSERT_TRUE(next.ok() && next->has_value()) << next.status();
+  ASSERT_TRUE(std::holds_alternative<SubmitOperation>(**next));
+  Apply(std::move(**next));  // group-b starts while group-a awaits its replica
+  ApplyPlanned();            // initialize group-b primary
+  auto child = GroupOperation("group-b");
+  ASSERT_EQ(child.current_directives_.size(), 1);
+  CommitResult(child, child.current_directives_.front(),
+               MetaDirectiveResultStatus::kSucceeded);
+  ApplyPlanned();  // authorize group-b source
+  child = GroupOperation("group-b");
+  CommitResult(child, child.current_directives_.front(),
+               MetaDirectiveResultStatus::kSucceeded);
+  ApplyPlanned();  // rebuild group-b replica
+  child = GroupOperation("group-b");
+  ASSERT_EQ(child.current_directives_.size(), 2);
+  CommitResult(child, child.current_directives_[1],
+               MetaDirectiveResultStatus::kSucceeded);
+  ApplyPlanned();  // ready group-b
+  ApplyPlanned();  // complete group-b
+  EXPECT_EQ(GroupOperation("group-b").lifecycle_,
+            MetaOperationLifecycle::kCompleted);
+  EXPECT_EQ(GroupOperation("group-a").revision_, stalled.revision_);
+  EXPECT_EQ(GroupOperation("group-a").current_directives_,
+            stalled.current_directives_);
+  next = Plan();
+  ASSERT_TRUE(next.ok()) << next.status();
+  EXPECT_FALSE(next->has_value());  // root still waits for group-a
+  CommitResult(stalled, stalled.current_directives_[1],
+               MetaDirectiveResultStatus::kSucceeded);
+  ApplyPlanned();
+  ApplyPlanned();
+  ApplyPlanned();
+  EXPECT_EQ(stores_.operation_.FindOperation(root_)->lifecycle_,
+            MetaOperationLifecycle::kCompleted);
+}
+
+TEST_F(ClusterCreateV1RecoveryTest, MissingFirstPrimaryDoesNotBlockAdmission) {
+  AdvanceToProjectionWait();
+  PublishRuntime();
+  ApplyPlanned();
+  runtime_.nodes_.erase(runtime_.nodes_.begin());
+  ApplyPlanned();
+  EXPECT_EQ(GroupOperation("group-b").lifecycle_,
+            MetaOperationLifecycle::kSubmitted);
+  EXPECT_FALSE(stores_.operation_.FindOperation(
+      detail::ClusterCreateV1GroupOperationId(root_, "group-a")));
+}
+
+TEST_F(ClusterCreateV1RecoveryTest, LaterFailurePreemptsEarlierRunnableChild) {
+  StartFirstReplicaBatch();
+  ApplyPlanned();  // group-b submit
+  ApplyPlanned();  // group-b initialize
+  const auto first = GroupOperation("group-a");
+  const auto second = GroupOperation("group-b");
+  CommitResult(first, first.current_directives_[1],
+               MetaDirectiveResultStatus::kSucceeded);
+  CommitResult(second, second.current_directives_.front(),
+               MetaDirectiveResultStatus::kFailed);
+  const auto next = Plan();
+  ASSERT_TRUE(next.ok() && next->has_value()) << next.status();
+  ASSERT_TRUE(std::holds_alternative<FenceGroup>(**next));
+  EXPECT_EQ(std::get<FenceGroup>(**next).group_id_, "group-b");
+  Apply(**next);
+  ApplyPlanned();  // abort group-b
+  runtime_ = {};
+  ApplyPlanned();  // invalidate unfinished group-a
+  ApplyPlanned();  // fence group-a
+  ApplyPlanned();  // abort group-a
+  ApplyPlanned();  // abort root
+  EXPECT_EQ(stores_.topology_.ClusterLifecycle().state_,
+            MetaClusterLifecycle::kProvisioningFailed);
+  EXPECT_EQ(GroupOperation("group-a").lifecycle_,
+            MetaOperationLifecycle::kAborted);
+}
+
+class ClusterCreateSiblingFailureTest
+    : public ClusterCreateV1RecoveryTest,
+      public testing::WithParamInterface<int> {};
+
+TEST_P(ClusterCreateSiblingFailureTest, RetiresAllStartedWorkBeforeRootAbort) {
+  AdvanceToProjectionWait();
+  PublishRuntime();
+  ApplyPlanned();                       // root: initialize-groups
+  ApplyPlanned();                       // group-a: submit
+  if (GetParam() >= 1) ApplyPlanned();  // primary initialization
+  if (GetParam() >= 2) {
+    const auto child = GroupOperation("group-a");
+    CommitResult(child, child.current_directives_.front(),
+                 MetaDirectiveResultStatus::kSucceeded);
+    ApplyPlanned();  // source authorization
+  }
+  if (GetParam() >= 3) {
+    const auto child = GroupOperation("group-a");
+    CommitResult(child, child.current_directives_.front(),
+                 MetaDirectiveResultStatus::kSucceeded);
+    ApplyPlanned();  // replica rebuild
+  }
+  // For the submitted cut, inject a second child with the same durable intent
+  // the planner would use. It must clean up even before any directive exists.
+  SubmitOperation submit;
+  submit.operation_id_ =
+      detail::ClusterCreateV1GroupOperationId(root_, "group-b");
+  submit.kind_ = kMetaClusterCreateV1GroupOperationKind;
+  submit.intent_ = GroupOperation("group-a").intent_;
+  submit.intent_.replace(submit.intent_.find("67726f75702d61"), 14,
+                         "67726f75702d62");
+  submit.intent_.replace(submit.intent_.size() - 40, 40,
+                         runtime_.nodes_[2].boot_id_);
+  submit.intent_hash_ = MetaSha256(submit.intent_);
+  submit.replication_history_id_ = runtime_.nodes_[2].replication_history_id_;
+  Apply(submit);
+  // A committed abort is the recovery boundary after the failing Group's
+  // fence. Drive the sibling cleanup with no volatile runtime evidence.
+  FenceGroup fence;
+  fence.group_id_ = "group-b";
+  fence.expected_term_ = 1;
+  fence.new_term_ = 2;
+  Apply(fence);
+  AbortOperation abort;
+  abort.operation_id_ = submit.operation_id_;
+  abort.expected_revision_ = GroupOperation("group-b").revision_;
+  abort.reason_ = "group=group-b primary initialization: failed";
+  Apply(abort);
+  const auto original = GroupOperation("group-a");
+  std::optional<CommitDirectiveResult> late;
+  for (const auto& directive : original.current_directives_) {
+    if (directive.spec_.kind_ != kMetaDirectiveAuthorizeSource)
+      late =
+          ResultFor(original, directive, MetaDirectiveResultStatus::kSucceeded);
+  }
+  runtime_ = {};
+  ApplyPlanned();  // retire sibling directives, retain original cause
+  EXPECT_TRUE(GroupOperation("group-a").current_directives_.empty());
+  EXPECT_EQ(GroupOperation("group-a").terminal_receipts_,
+            original.terminal_receipts_);
+  if (late) {
+    const auto result = ApplyCommitted(stores_, ++index_, *late,
+                                       "lavik://operator/test", "now");
+    EXPECT_EQ(result.verdict_, MetaAuditVerdict::kRejected);
+  }
+  ApplyPlanned();  // fence sibling
+  EXPECT_FALSE(stores_.topology_.AuthorityFor("group-a")->grant_);
+  ApplyPlanned();  // abort sibling
+  EXPECT_EQ(GroupOperation("group-a").lifecycle_,
+            MetaOperationLifecycle::kAborted);
+  EXPECT_FALSE(stores_.operation_.FindOperation(root_)->lifecycle_ ==
+               MetaOperationLifecycle::kAborted);
+  ApplyPlanned();  // now abort root
+  EXPECT_EQ(stores_.operation_.FindOperation(root_)->terminal_result_,
+            abort.reason_);
+  EXPECT_EQ(stores_.topology_.ClusterLifecycle().state_,
+            MetaClusterLifecycle::kProvisioningFailed);
+}
+
+INSTANTIATE_TEST_SUITE_P(AllActivePhases, ClusterCreateSiblingFailureTest,
+                         testing::Values(0, 1, 2, 3));
+
+class ClusterCreateManyGroupsTest : public ClusterCreateV1RecoveryTest {
+ protected:
+  void ConfigureGroups() override {
+    manifest_.data_nodes_.clear();
+    manifest_.groups_.clear();
+    manifest_.slot_ranges_.clear();
+    for (int index = 0; index < 6; ++index) {
+      const std::string node(40, static_cast<char>('1' + index));
+      const std::string group = "group-" + std::to_string(index);
+      manifest_.data_nodes_.push_back(
+          {node, "tcp://127.0.0.1:" + std::to_string(6371 + index)});
+      manifest_.groups_.push_back({group, node, {}});
+      manifest_.slot_ranges_.push_back(
+          {static_cast<std::uint16_t>(index * 2048),
+           static_cast<std::uint16_t>(index == 5 ? 16383
+                                                 : (index + 1) * 2048 - 1),
+           group});
+    }
+  }
+};
+
+TEST_F(ClusterCreateManyGroupsTest, BoundsActiveWorkAndReusesFreedCapacity) {
+  AdvanceToProjectionWait();
+  PublishRuntime();
+  ApplyPlanned();
+  for (int index = 0; index < 4; ++index) {
+    ApplyPlanned();  // submit
+    ApplyPlanned();  // initialize
+  }
+  auto next = Plan();
+  ASSERT_TRUE(next.ok()) << next.status();
+  EXPECT_FALSE(next->has_value());
+  EXPECT_FALSE(stores_.operation_.OperationKnown(
+      detail::ClusterCreateV1GroupOperationId(root_, "group-4")));
+  // Three stalled children keep their slots. The fourth slot lets all later
+  // children finish, across serialization/recovery after every command.
+  for (int index = 3; index < 6; ++index) {
+    const auto child = GroupOperation("group-" + std::to_string(index));
+    ASSERT_EQ(child.current_directives_.size(), 1);
+    CommitResult(child, child.current_directives_.front(),
+                 MetaDirectiveResultStatus::kSucceeded);
+    ApplyPlanned();
+    ApplyPlanned();
+    if (index < 5) {
+      ApplyPlanned();
+      ApplyPlanned();
+    }
+  }
+  for (int index = 0; index < 3; ++index) {
+    const auto child = GroupOperation("group-" + std::to_string(index));
+    EXPECT_EQ(child.kind_phase_blob_, "initializing-empty-population");
+    CommitResult(child, child.current_directives_.front(),
+                 MetaDirectiveResultStatus::kSucceeded);
+    ApplyPlanned();
+    ApplyPlanned();
+  }
+  ApplyPlanned();
+  EXPECT_EQ(stores_.operation_.FindOperation(root_)->lifecycle_,
+            MetaOperationLifecycle::kCompleted);
 }
 
 TEST_F(ClusterCreateV1RecoveryTest,
@@ -689,6 +917,8 @@ TEST_F(ClusterCreateV1RecoveryTest,
     node.session_id_.fill(99);
     ++node.session_generation_;
   }
+  ApplyPlanned();  // independent group-b: submit
+  ApplyPlanned();  // independent group-b: initialize primary
   next = Plan();
   ASSERT_TRUE(next.ok()) << next.status();
   EXPECT_FALSE(next->has_value());

@@ -1333,15 +1333,23 @@ completion means the existing replication manager has activated the population
 and established its native replication session; subsequent heartbeats supply
 the population-current READY evidence.
 
-Group children execute in canonical Group order. Exact directive identities,
-attempts, boots, histories, assignments, terms, grants, manifests,
-partition epochs, and source flow layouts make reconnect replay safe without
+Group children progress independently, with at most four unfinished children
+admitted at once. Waiting for one Group's receipt, source lease, or session
+projection does not prevent another admitted Group from advancing. Each
+proposal still carries one existing Meta command; admission and progress are
+reconstructed from committed child state after leadership changes. Exact
+directive identities, attempts, boots, histories, assignments, terms, grants,
+manifests, partition epochs, and source flow layouts make reconnect replay safe without
 minting another attempt. Primary and replica worker counts may differ: flow
 identity follows the source and native replication maps those flows onto the
 target's workers.
-A deterministic failure fences only that Group before aborting its child and
-then the root; already completed Groups are not rolled back. While population
-work is unfinished, a current Data session with a different target boot or
+A deterministic failure takes precedence over new work and fences the failing
+Group before aborting its child. Before aborting the root, the reconciler
+durably removes directives from every other unfinished child, fences those
+Groups, and aborts those children with the retained original cause. Already
+completed Groups are not rolled back, and unstarted children are not admitted.
+This cleanup resumes from committed state without requiring Data responses.
+While population work is unfinished, a current Data session with a different target boot or
 source boot/history invalidates the attempt. The reconciler durably removes
 its directives and records the reason before fencing and aborting, so Meta
 recovery does not depend on retaining the detecting session. Committed success
