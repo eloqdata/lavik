@@ -40,6 +40,7 @@
 #include "absl/status/status.h"
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/worker.h"
+#include "group_proposal_window.h"
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/fault_injection.h"
 #include "lavik/meta/failover.h"
@@ -815,8 +816,79 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
   };
   auto subscribed = subscribe();
   std::string last_error;
+  detail::GroupProposalWindow proposals;
 
   while (!core->cancelled_ && context->IsCurrent()) {
+    // Consume results before reconciling pending identities against the new
+    // committed view. Active slots are immutable and owned independently of
+    // pending/admission cleanup on an eligibility or topology change.
+    for (auto& completion : proposals.TakeCompleted()) {
+      const auto& sent =
+          std::get<BeginUncontrolledFailover>(completion->command_);
+      auto ready = core->pending_.find(completion->group_);
+      if (ready == core->pending_.end() ||
+          ready->second.command_.transition_id_ != sent.transition_id_)
+        continue;
+      Core::Pending& pending = ready->second;
+      const auto& applied = *completion->result_;
+      const std::uint64_t propose_returned_steady =
+          core->options_.now_steady_ms_();
+      changed->store(true, std::memory_order_release);
+
+      if (applied.ok()) {
+        if (applied->verdict_ == MetaAuditVerdict::kAccepted) {
+          spdlog::info(
+              "automatic failover Begin accepted group={} transition={} "
+              "commit_index={}",
+              ready->first, Hex(pending.command_.transition_id_),
+              applied->log_index_);
+          // Propose returns only after this state machine has applied the
+          // command. The forced view refresh below reconciles the accepted
+          // transition even if its subscription callback has not yet arrived.
+          continue;
+        }
+        spdlog::warn(
+            "automatic failover Begin domain-rejected group={} transition={} "
+            "detail={}",
+            ready->first, Hex(pending.command_.transition_id_),
+            applied->detail_);
+        RemoveAdmission(core, pending.command_.transition_id_);
+        core->detector_.EraseGroup(ready->first);
+        core->pending_.erase(ready);
+        continue;
+      }
+
+      const bool definite = DefiniteNonAppend(applied.status());
+      if (definite) {
+        spdlog::warn(
+            "automatic failover Begin suppressed before append group={} "
+            "transition={} detail={}",
+            ready->first, Hex(pending.command_.transition_id_),
+            applied.status().message());
+        RemoveAdmission(core, pending.command_.transition_id_);
+        core->detector_.EraseGroup(ready->first);
+        core->pending_.erase(ready);
+        continue;
+      }
+
+      if (applied.status().code() == absl::StatusCode::kDeadlineExceeded ||
+          applied.status().code() == absl::StatusCode::kCancelled ||
+          applied.status().code() == absl::StatusCode::kInternal) {
+        pending.uncertain_append_ = true;
+      }
+      const std::uint64_t delay = kRetryBackoffMs[std::min(
+          pending.backoff_index_, kRetryBackoffMs.size() - 1)];
+      ++pending.backoff_index_;
+      pending.next_attempt_steady_ms_ =
+          AddDelay(propose_returned_steady, delay)
+              .value_or(std::numeric_limits<std::uint64_t>::max());
+      ArmAdmission(core, pending);
+      spdlog::warn(
+          "automatic failover Begin retry scheduled group={} transition={} "
+          "delay_ms={} uncertain={} detail={}",
+          ready->first, Hex(pending.command_.transition_id_), delay,
+          pending.uncertain_append_, applied.status().message());
+    }
     if (subscribed.subscription_->needs_resync()) subscribed = subscribe();
     // Raft configuration commits advance the status cut without notifying
     // Meta command subscribers. In particular, a new leader's configuration
@@ -866,7 +938,7 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
       // Definite non-appends must reacquire warmup/debounce; uncertain appends
       // retain their stable identity and reconcile against durable state.
       for (auto it = core->pending_.begin(); it != core->pending_.end();) {
-        if (!it->second.uncertain_append_) {
+        if (!it->second.uncertain_append_ && !proposals.Contains(it->first)) {
           RemoveAdmission(core, it->second.command_.transition_id_);
           it = core->pending_.erase(it);
         } else {
@@ -888,6 +960,10 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
     // new edge. A matching transition is definitive even when the proposal
     // reply was lost.
     for (auto it = core->pending_.begin(); it != core->pending_.end();) {
+      if (proposals.Contains(it->first)) {
+        ++it;
+        continue;
+      }
       std::uint64_t committed_index = 0;
       if (CommandTransitionCommitted(subscribed.view_, it->second,
                                      &committed_index)) {
@@ -928,7 +1004,9 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
       for (const MetaTopologyGroupView& group :
            subscribed.view_.topology().Groups()) {
         live_groups.insert(group.group_id_);
-        if (core->pending_.contains(group.group_id_)) continue;
+        if (core->pending_.contains(group.group_id_) ||
+            proposals.Contains(group.group_id_))
+          continue;
         if (!automatic.has_value() || !lease.has_value()) {
           if (last_error !=
               "automatic failover requires both current global Policies") {
@@ -1038,7 +1116,8 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
     }
 
     auto ready = std::ranges::find_if(core->pending_, [&](const auto& entry) {
-      return runtime.leader_authority_eligible_ &&
+      return !proposals.Full() && !proposals.Contains(entry.first) &&
+             runtime.leader_authority_eligible_ &&
              now_steady >= entry.second.next_attempt_steady_ms_;
     });
     if (ready != core->pending_.end() && !core->cancelled_) {
@@ -1065,74 +1144,17 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
           "attempt={}",
           ready->first, Hex(pending.command_.transition_id_),
           pending.backoff_index_ + 1);
-      const auto applied =
-          co_await context->Propose(MetaCommand{pending.command_});
-      const std::uint64_t propose_returned_steady =
-          core->options_.now_steady_ms_();
-      if (core->cancelled_) break;
-      changed->store(true, std::memory_order_release);
-
-      if (applied.ok()) {
-        if (applied->verdict_ == MetaAuditVerdict::kAccepted) {
-          spdlog::info(
-              "automatic failover Begin accepted group={} transition={} "
-              "commit_index={}",
-              ready->first, Hex(pending.command_.transition_id_),
-              applied->log_index_);
-          // Propose returns only after this state machine has applied the
-          // command. Refresh immediately so the next iteration reconciles the
-          // accepted transition even if its subscription callback has not yet
-          // reached this worker.
-          subscribed.view_ = context->CommittedView();
-          continue;
-        }
-        spdlog::warn(
-            "automatic failover Begin domain-rejected group={} transition={} "
-            "detail={}",
-            ready->first, Hex(pending.command_.transition_id_),
-            applied->detail_);
-        RemoveAdmission(core, pending.command_.transition_id_);
-        core->detector_.EraseGroup(ready->first);
-        core->pending_.erase(ready);
-        continue;
-      }
-
-      const bool definite = DefiniteNonAppend(applied.status());
-      if (definite) {
-        spdlog::warn(
-            "automatic failover Begin suppressed before append group={} "
-            "transition={} detail={}",
-            ready->first, Hex(pending.command_.transition_id_),
-            applied.status().message());
-        RemoveAdmission(core, pending.command_.transition_id_);
-        core->detector_.EraseGroup(ready->first);
-        core->pending_.erase(ready);
-        continue;
-      }
-
-      if (applied.status().code() == absl::StatusCode::kDeadlineExceeded ||
-          applied.status().code() == absl::StatusCode::kCancelled ||
-          applied.status().code() == absl::StatusCode::kInternal) {
-        pending.uncertain_append_ = true;
-      }
-      const std::uint64_t delay = kRetryBackoffMs[std::min(
-          pending.backoff_index_, kRetryBackoffMs.size() - 1)];
-      ++pending.backoff_index_;
-      pending.next_attempt_steady_ms_ =
-          AddDelay(propose_returned_steady, delay)
-              .value_or(std::numeric_limits<std::uint64_t>::max());
-      ArmAdmission(core, pending);
-      spdlog::warn(
-          "automatic failover Begin retry scheduled group={} transition={} "
-          "delay_ms={} uncertain={} detail={}",
-          ready->first, Hex(pending.command_.transition_id_), delay,
-          pending.uncertain_append_, applied.status().message());
+      proposals.Start(*context, ready->first, MetaCommand{pending.command_});
+      continue;  // fill available slots before waiting for any completion
     }
 
-    const auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                                 core->options_.poll_interval_);
+    const auto slept = co_await proposals.Wait(core->options_.poll_interval_);
     if (!slept.ok()) break;
   }
+
+  // Keep the context/admissions alive until every accepted local proposal
+  // task returns; a later leader reconstructs any committed Begin from Raft.
+  co_await proposals.Drain();
 
   ClearAdmissions(core);
   if (core->leader_term_ != 0) {

@@ -1339,6 +1339,7 @@ if (BUILD_TESTING)
       set(automatic_failover_socket_root "${CMAKE_CURRENT_BINARY_DIR}/afs")
       file(MAKE_DIRECTORY "${automatic_failover_socket_root}")
       set(LAVIK_AUTOMATIC_FAILOVER_INTEGRATION_CASES
+        multi-group
         owner-kill
         owner-pause
         one-way-partition

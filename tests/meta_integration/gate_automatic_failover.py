@@ -33,6 +33,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness as H  # noqa: E402
 import gate_failover as F  # noqa: E402
+import gate_cluster_create as C  # noqa: E402
 
 
 PAUSE_BEFORE_PROPOSE = "LAVIK_TEST_PAUSE_AUTOMATIC_BEFORE_PROPOSE_MS"
@@ -231,6 +232,111 @@ def run_owner_loss(meta, data, ctl, workdir, mode, require_fault_hook):
         raise
     finally:
         fixture.force_kill()
+
+
+def run_multi_group(meta_binary, data_binary, ctl, workdir):
+    """Lose two independent Owners and track both fences and serving cutovers."""
+    C.CTL = ctl
+    meta_dir = os.path.join(workdir, "meta")
+    os.makedirs(meta_dir)
+    meta = H.Node(meta_binary, meta_dir, 1, args=C.creation_raft_args())
+    nodes = [
+        C.DataProcess(
+            data_binary,
+            os.path.join(workdir, node_id[:8]),
+            node_id,
+            meta.data_control_endpoint,
+        )
+        for node_id in (C.PRIMARY_1, C.REPLICA_1, C.PRIMARY_2, C.REPLICA_2)
+    ]
+    by_id = {node.node_id: node for node in nodes}
+    manifest = os.path.join(workdir, "cluster.toml")
+    C.write_multi_manifest(manifest, nodes, False, meta)
+    keys = {}
+    try:
+        meta.start(initial_cluster_manifest=manifest)
+        meta.wait_leader()
+        for node in nodes:
+            node.start()
+        C.command(
+            os.environ.copy(),
+            [
+                ctl,
+                "cluster-create",
+                "--manifest",
+                manifest,
+                "--socket",
+                meta.ctl_path,
+                "--yes",
+            ],
+        )
+        C.wait_cluster_ready(meta, "both Groups created", 40)
+        reply = meta.put_automatic_uncontrolled_failover_policy(
+            2, suspect_after_ms=1000
+        )
+        if re.fullmatch(r"OK [1-9][0-9]*", reply) is None:
+            raise H.Failure(f"automatic Policy update failed: {reply}")
+        H.wait_until(
+            "both Owners healthy",
+            40,
+            lambda: all(
+                group["automatic_failover_state"] == "healthy"
+                and int(group["effective_threshold_ms"]) == 1000
+                for group in C.cluster_status(meta)["groups"]
+            ),
+        )
+        for group_id, (owner, replica, first, last) in C.GROUPS.items():
+            key = C.key_in_range("multi-failover-" + group_id, first, last)
+            keys[group_id] = key
+            if C.redis_call(by_id[owner], ["SET", key, group_id]) != "OK":
+                raise H.Failure("failed to seed Group")
+            H.wait_until(
+                "Group replica caught up",
+                20,
+                lambda: C.readonly_get(by_id[replica], key) == group_id,
+            )
+        started = time.monotonic()
+        by_id[C.PRIMARY_1].force_kill()
+        by_id[C.PRIMARY_2].force_kill()
+        fenced, serving = {}, {}
+
+        def both_recovered():
+            for group in C.cluster_status(meta)["groups"]:
+                name = group["group_id"]
+                elapsed = time.monotonic() - started
+                if group["term"] == "2":
+                    fenced.setdefault(name, elapsed)
+                if (
+                    group["term"] == "2"
+                    and group["serving_ready"]
+                    and group["owner_node_id"] == C.GROUPS[name][1]
+                ):
+                    serving.setdefault(name, elapsed)
+            return len(serving) == 2
+
+        H.wait_until(
+            "both Groups recover after simultaneous Owner loss", 100, both_recovered
+        )
+        for group_id, (_, replica, _, _) in C.GROUPS.items():
+            if C.redis_call(by_id[replica], ["GET", keys[group_id]]) != group_id:
+                raise H.Failure("successor lost pre-fault data")
+            if C.redis_call(by_id[replica], ["SET", keys[group_id], "after"]) != "OK":
+                raise H.Failure("successor rejected writes")
+            H.log(
+                f"{group_id}: fence={fenced[group_id]:.3f}s serving={serving[group_id]:.3f}s"
+            )
+        for node in nodes:
+            node.terminate()
+        meta.terminate()
+    except Exception:
+        H.dump_node_logs([meta])
+        for node in nodes:
+            print(node.log_tail(), file=sys.stderr)
+        raise
+    finally:
+        for node in nodes:
+            node.force_kill()
+        meta.force_kill()
 
 
 def assert_non_overlapping_writes(old_probe, replica_probes, successor):
@@ -486,6 +592,7 @@ def parse_args():
         "--case",
         choices=(
             "owner-kill",
+            "multi-group",
             "owner-pause",
             "one-way-partition",
             "two-way-partition",
@@ -511,7 +618,9 @@ def main():
     started = time.monotonic()
     try:
         common = (binaries["meta"], binaries["data"], binaries["ctl"], workdir)
-        if args.case in ("owner-kill", "owner-pause"):
+        if args.case == "multi-group":
+            run_multi_group(*common)
+        elif args.case in ("owner-kill", "owner-pause"):
             run_owner_loss(*common, args.case, args.require_fault_hook)
         elif args.case == "one-way-partition":
             run_partition(*common, "downstream", args.require_fault_hook)

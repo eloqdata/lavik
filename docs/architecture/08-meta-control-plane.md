@@ -463,11 +463,15 @@ Leader event can restart anything. Promotion still waits for Raft to catch
 the state machine up.
 
 `MetaFailoverReconciler` is a leader-scoped, level-triggered driver. It starts
-from the complete committed view on every eligible leadership epoch, wakes on
-commits, and periodically re-evaluates observation TTLs. Each pass derives at
-most one of the eight typed commands; proposal completion is only a wakeup, not
-workflow state. Demotion or shutdown cancels and joins local planning/proposal
-work while leaving the committed transition for the next leader. A leadership
+from the complete committed view on every eligible leadership epoch, consumes
+committed updates, and periodically re-evaluates observation TTLs. It overlaps
+at most four local proposal waits for distinct Groups, with one unresolved
+local proposal per Group. Each planner pass derives one existing typed command
+and skips occupied Groups before allocating action identities. Proposal
+completion wakes planning; only a fresh committed view establishes progress.
+Rejected proposals retain per-Group retry pacing. Demotion or shutdown stops
+admission and joins every local proposal task before releasing the leader
+context, leaving committed transitions for the next leader. A leadership
 warmup equal to the observation grace prevents a new leader from treating
 not-yet-reported boots as failures. The process derives that grace as at least
 the Raft election upper bound plus the maximum supported Data reconnect delay,
@@ -603,7 +607,11 @@ never changes readiness or serving authority by itself.
 At the threshold, only while the current classification is exact
 Unserviceable, the detector enters `TRIGGERING`, creates stable request and
 transition identities, and proposes the existing candidate-less automatic
-`BeginUncontrolledFailover`. Its proposal hook rechecks the current Policy,
+`BeginUncontrolledFailover`. The detector has its own four-slot proposal window
+across distinct Groups. Pending command identities and validation admissions
+survive a local wait; each result is reconciled before that Group can retry.
+The detector continues evaluating other Groups while proposals wait. Its
+proposal hook rechecks the current Policy,
 leadership, complete authority anchor, current observations, exact reason, and
 threshold immediately before a first append. A definite pre-append or domain
 rejection discards that attempt. Once admitted for append, later health or
@@ -611,6 +619,10 @@ Policy arrival does not retract the decision; log order and the command's
 committed authority CAS resolve the race. Once append outcome is uncertain,
 retries use the identical command and bounded backoff; committed-state CAS
 either installs that transition once or rejects it after the anchor changes.
+The window bounds local waits, not unresolved Raft appends after a caller
+timeout; those retain the coordinator's existing admission reservations.
+Automatic preemption and the ordinary transition executor can still race for
+one Group, with typed transition/operation CAS resolving their log order.
 The ordinary
 `MetaFailoverReconciler` then owns the committed transition exactly as it does
 for a manual uncontrolled Begin. Demotion cancels and joins detector timers,
