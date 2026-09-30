@@ -1320,6 +1320,12 @@ absl::Status GroupedObjectIndex::Publication::RefreshExpected(
   return absl::OkStatus();
 }
 
+std::size_t GroupedObjectIndex::PublicationAllocationBytes(
+    const Digest& digest, std::string_view key) const noexcept {
+  if (objects_.Find(digest, key) != nullptr) return 0;
+  return objects_.RequiredAllocationBytes(digest, key, true, false, true);
+}
+
 absl::StatusOr<GroupedObjectIndex::Publication>
 GroupedObjectIndex::PreparePublish(std::string_view key,
                                    const Handle& expected) {
