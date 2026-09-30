@@ -86,7 +86,7 @@ absl::Status PrepareSnapshotBlockPins(
     if (value->grouped_ == nullptr) return absl::OkStatus();
     if (!ordered_pages) {
       value->grouped_->ForEachRecord(
-          [&](HashGroupId, const RecordIndex::Entry& entry,
+          [&](HashGroupId, const auto& entry,
               const std::shared_ptr<const std::vector<ExtentRef>>& extents,
               bool) { visit(entry, extents); });
       return absl::OkStatus();
@@ -111,7 +111,7 @@ absl::Status PrepareSnapshotBlockPins(
   };
   if (value->extents_ != nullptr) add_count(value->extents_->size());
   auto visited = visit_records(
-      [&](const RecordIndex::Entry&,
+      [&](const auto&,
           const std::shared_ptr<const std::vector<ExtentRef>>& extents) {
         add_count(1);
         if (extents != nullptr) add_count(extents->size());
@@ -143,7 +143,7 @@ absl::Status PrepareSnapshotBlockPins(
   add_record(value->location_);
   add_extents(value->extents_);
   visited = visit_records(
-      [&](const RecordIndex::Entry& entry,
+      [&](const auto& entry,
           const std::shared_ptr<const std::vector<ExtentRef>>& extents) {
         add_record(materialize(entry));
         add_extents(extents);
@@ -179,10 +179,9 @@ absl::Status PrepareSnapshotBlockPins(
 
 absl::Status StorageEngine::Impl::PrepareGroupedSnapshotPins(
     WorkerStore::PartitionStore::RdbSnapshotValue* value) {
-  return PrepareSnapshotBlockPins(value,
-                                  [this](const RecordIndex::Entry& entry) {
-                                    return MaterializeIndexLocation(entry);
-                                  });
+  return PrepareSnapshotBlockPins(value, [this](const auto& entry) {
+    return MaterializeIndexLocation(entry);
+  });
 }
 
 absl::Status StorageEngine::Impl::PrepareOrderedRangeSnapshotPins(
@@ -190,9 +189,7 @@ absl::Status StorageEngine::Impl::PrepareOrderedRangeSnapshotPins(
     std::size_t first_page, std::size_t end_page) {
   return PrepareSnapshotBlockPins(
       value,
-      [this](const RecordIndex::Entry& entry) {
-        return MaterializeIndexLocation(entry);
-      },
+      [this](const auto& entry) { return MaterializeIndexLocation(entry); },
       std::pair{first_page, end_page});
 }
 
@@ -450,10 +447,9 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
       }
       old.grouped_ = std::move(*grouped);
     }
-    auto prepared =
-        PrepareSnapshotBlockPins(&old, [this](const RecordIndex::Entry& entry) {
-          return MaterializeIndexLocation(entry);
-        });
+    auto prepared = PrepareSnapshotBlockPins(&old, [this](const auto& entry) {
+      return MaterializeIndexLocation(entry);
+    });
     if (!prepared.ok()) {
       store.rdb_snapshot_->invalidated_ = true;
       --capture->capture_admissions_;
@@ -648,8 +644,8 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
         }
         candidate.grouped_ = std::move(*grouped);
       }
-      auto prepared = PrepareSnapshotBlockPins(
-          &candidate, [this](const RecordIndex::Entry& entry) {
+      auto prepared =
+          PrepareSnapshotBlockPins(&candidate, [this](const auto& entry) {
             return MaterializeIndexLocation(entry);
           });
       if (!prepared.ok()) {

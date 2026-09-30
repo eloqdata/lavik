@@ -358,7 +358,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         outer_transaction ? tx : nullptr, field_count, nullptr, nullptr,
         replication, true, nullptr, mutation_precondition);
   }
-  auto decision = PrepareGroupedDecision(*tx);
+  auto decision = PrepareGroupedDecision(*tx, !outer_transaction);
   if (!decision.ok()) co_return decision.status();
   if (outer_transaction) {
     // Auxiliary records retain the outer transaction tag AND this command's

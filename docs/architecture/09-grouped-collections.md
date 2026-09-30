@@ -74,7 +74,7 @@ The top-level `RecordIndex` still owns each user key, type, expiry and logical
 version. A grouped marker directs collection lookups to that
 partition/database's sparse `ScanHashMap` object index. Its immutable view holds
 a routing directory, the active primary group payload total, one compact
-`RecordIndex` entry per group, and separately owned extent manifests. Retired
+physical index entry per group, and separately owned extent manifests. Retired
 markers and the Sorted Set member index do not contribute to the total.
 Recovery rebuilds it from selected checked group payload lengths. The view
 does not retain field names or values.
@@ -280,8 +280,12 @@ request positions by routing leaf, fill result slots in command order, and
 release each page before loading the next; repeated operands retain repeated results.
 These reads validate all entry framing and duplicate occurrences of requested
 fields; full decodes additionally validate every field's uniqueness
-and route. Point writes decode complete affected groups before replacing only
-changed groups and any split-parent retirement records.
+and route. Hash/Set field updates and removals validate complete affected
+leaves using borrowed entry views, then own only changed replacement pages.
+Small replacements retain checked encoded bytes until publication; splits and
+oversized entries use owned fields and the bounded-state encoder. Other point
+writes decode affected groups. All paths replace only changed groups and any
+split-parent retirement records, without retaining user payloads in the index.
 HSCAN/SSCAN consume one routing leaf per call and use field digests under the
 persisted seed as cursors. COUNT is a hint; equal-digest fields remain in one
 response, and empty routing leaves still advance the cursor. Deleting earlier

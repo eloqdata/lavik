@@ -59,6 +59,132 @@ HashValue Value(std::size_t count, std::size_t length = 128) {
   return value;
 }
 
+TEST(HashGroupEdits, OrderedDuplicatesOwnTheirBytesAndKeepWireFormat) {
+  HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(8, 64)};
+  auto payload = EncodeHashGroup(group);
+  ASSERT_TRUE(payload.ok());
+  std::vector<HashEntryView> edits{{"field-0", "first"},
+                                   {"new", "a"},
+                                   {"field-0", "last"},
+                                   {"new", "b"},
+                                   {"", "empty field"}};
+  auto result =
+      ApplyHashGroupEdits(*payload, Seed(), HashGroupEditKind::kSet, edits);
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(result->added_, 2);
+  ASSERT_EQ(result->leaves_.size(), 1);
+  auto& leaf = result->leaves_[0];
+  ASSERT_TRUE(leaf.prepared_);
+  EXPECT_EQ(leaf.field_count(), 10);
+  payload->assign(payload->size(), '!');
+  edits.clear();
+  auto encoded = EncodeHashGroup(leaf);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded = DecodeHashGroup(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  std::map<std::string, std::string> actual;
+  for (const auto& entry : decoded->value_.entries_)
+    actual.emplace(entry.field_, entry.value_);
+  EXPECT_EQ(actual.size(), 10);
+  EXPECT_EQ(actual["field-0"], "last");
+  EXPECT_EQ(actual["new"], "b");
+  EXPECT_EQ(actual[""], "empty field");
+  EXPECT_EQ(*encoded, *EncodeHashGroup(*decoded));
+  leaf.id_ = {0, 1};
+  EXPECT_FALSE(HashGroupEncoder::Create(leaf).ok());
+}
+
+TEST(HashGroupEdits, NxNoopsRepeatedRemovalAndEmptyLeaf) {
+  HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(1)};
+  auto payload = EncodeHashGroup(group);
+  ASSERT_TRUE(payload.ok());
+  const std::array<HashEntryView, 3> edits{
+      {{"field-0", "changed"}, {"new", "first"}, {"new", "last"}}};
+  auto result = ApplyHashGroupEdits(*payload, Seed(),
+                                    HashGroupEditKind::kSetIfAbsent, edits);
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(result->added_, 1);
+  auto encoded = EncodeHashGroup(result->leaves_[0]);
+  ASSERT_TRUE(encoded.ok());
+  auto decoded = DecodeHashGroup(*encoded);
+  ASSERT_TRUE(decoded.ok());
+  EXPECT_EQ(decoded->value_.entries_[0].value_, std::string(128, 'a'));
+  EXPECT_EQ(decoded->value_.entries_[1].value_, "first");
+  auto noop = ApplyHashGroupEdits(*encoded, Seed(),
+                                  HashGroupEditKind::kSetIfAbsent, edits);
+  ASSERT_TRUE(noop.ok());
+  EXPECT_FALSE(noop->changed_);
+  EXPECT_TRUE(noop->leaves_.empty());
+  const std::array<HashEntryView, 4> removals{
+      {{"new", ""}, {"new", ""}, {"absent", ""}, {"field-0", ""}}};
+  auto removed = ApplyHashGroupEdits(*encoded, Seed(),
+                                     HashGroupEditKind::kDelete, removals);
+  ASSERT_TRUE(removed.ok()) << removed.status();
+  EXPECT_EQ(removed->removed_, 2);
+  ASSERT_EQ(removed->leaves_.size(), 1);
+  EXPECT_EQ(removed->leaves_[0].field_count(), 0);
+  auto empty = EncodeHashGroup(removed->leaves_[0]);
+  ASSERT_TRUE(empty.ok());
+  EXPECT_EQ(empty->size(), kHashGroupHeaderBytes);
+  EXPECT_TRUE(DecodeHashGroup(*empty).ok());
+}
+
+TEST(HashGroupEdits, SplitsAndOversizedValuesKeepOwnedStreamingPath) {
+  HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(64, 64)};
+  auto payload = EncodeHashGroup(group);
+  ASSERT_TRUE(payload.ok());
+  std::string large(100000, 'x');
+  const std::array<HashEntryView, 1> edits{{{"large", large}}};
+  auto result =
+      ApplyHashGroupEdits(*payload, Seed(), HashGroupEditKind::kSet, edits);
+  ASSERT_TRUE(result.ok()) << result.status();
+  ASSERT_GT(result->leaves_.size(), 1);
+  std::size_t count = 0;
+  bool found = false;
+  for (const auto& leaf : result->leaves_) {
+    EXPECT_FALSE(leaf.prepared_);
+    auto encoded = EncodeHashGroup(leaf);
+    ASSERT_TRUE(encoded.ok());
+    auto decoded = DecodeHashGroup(*encoded);
+    ASSERT_TRUE(decoded.ok());
+    for (const auto& entry : decoded->value_.entries_) {
+      ++count;
+      EXPECT_TRUE(
+          leaf.id_.contains(ComputeDigest(entry.field_, Seed()).value_));
+      if (entry.field_ == "large") {
+        found = true;
+        EXPECT_EQ(entry.value_, large);
+      }
+    }
+  }
+  EXPECT_TRUE(found);
+  EXPECT_EQ(count, 65);
+}
+
+TEST(HashGroupEdits, RejectsCorruptionBeforeApplyingEvenANoop) {
+  HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(2, 32)};
+  auto payload = EncodeHashGroup(group);
+  ASSERT_TRUE(payload.ok());
+  const std::array<HashEntryView, 1> edits{{{"missing", ""}}};
+  auto reject = [&](std::string bytes) {
+    auto result =
+        ApplyHashGroupEdits(bytes, Seed(), HashGroupEditKind::kDelete, edits);
+    EXPECT_EQ(result.status().code(), absl::StatusCode::kDataLoss);
+  };
+  auto truncated = *payload;
+  truncated.pop_back();
+  reject(truncated);
+  auto duplicate = *payload;
+  duplicate.replace(duplicate.find("field-1"), 7, "field-0");
+  reject(duplicate);
+  auto count = *payload;
+  count[kHashGroupHeaderBytes + 16] = 1;
+  reject(count);
+  auto route = *payload;
+  route[40] = 64;  // Canonical prefix zero; these fields do not hash to zero.
+  reject(route);
+}
+
 GroupedHashRoot Root(std::uint64_t count, std::uint32_t groups = 1) {
   return {.incarnation_ = 17,
           .seed_ = Seed(),

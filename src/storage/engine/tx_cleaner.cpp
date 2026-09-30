@@ -128,15 +128,17 @@ void StorageEngine::Impl::NoteTxRecordLocal(
   } else {
     block.commit_ends_.insert_or_assign(txid, record_end);
   }
-  block.txids_.insert_or_assign(
-      txid, receipt != nullptr
-                ? std::weak_ptr<void>(receipt->transaction_lease_)
-                : std::weak_ptr<void>{});
+  if (block.counted_backlog_)
+    store.tx_backlog_may_have_writers_.store(true, std::memory_order_release);
+  block.txids_.Record(txid,
+                      receipt != nullptr
+                          ? std::weak_ptr<void>(receipt->transaction_lease_)
+                          : std::weak_ptr<void>{});
   if (dependency_txid != 0)
-    block.txids_.insert_or_assign(
-        dependency_txid, receipt != nullptr
-                             ? std::weak_ptr<void>(receipt->transaction_lease_)
-                             : std::weak_ptr<void>{});
+    block.txids_.Record(dependency_txid,
+                        receipt != nullptr
+                            ? std::weak_ptr<void>(receipt->transaction_lease_)
+                            : std::weak_ptr<void>{});
   block.last_append_ms_ = MonotonicMillis();
   tx_cleaner_dirty_.store(true, std::memory_order_release);
 }
@@ -206,6 +208,7 @@ void StorageEngine::Impl::NoteTxBlockSealedLocal(WorkerStore& store,
   // space is accounted for separately by the block allocator.
   found->second.backlog_bytes_ = state->committed_bytes_ - kBlockHeaderBytes;
   found->second.counted_backlog_ = true;
+  store.tx_backlog_may_have_writers_.store(true, std::memory_order_release);
   store.tx_backlog_bytes_.fetch_add(found->second.backlog_bytes_,
                                     std::memory_order_release);
   tx_cleaner_dirty_.store(true, std::memory_order_release);
@@ -218,7 +221,8 @@ bool StorageEngine::Impl::TxBacklogAtLimit() const noexcept {
   // Charge only their occupied records, not free blocks elsewhere on a device.
   for (const auto& store : stores_)
     if (store->tx_backlog_bytes_.load(std::memory_order_acquire) >=
-        kTxBacklogAdmissionBytes)
+            kTxBacklogAdmissionBytes &&
+        store->tx_backlog_may_have_writers_.load(std::memory_order_acquire))
       return true;
   return false;
 }
@@ -226,14 +230,28 @@ bool StorageEngine::Impl::TxBacklogAtLimit() const noexcept {
 Task<bool> StorageEngine::Impl::HasLiveBacklogTxLeaseLocal(WorkerStore& store) {
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-  for (const auto& [block_id, block] : store.tx_blocks_) {
-    (void)block_id;
+  if (!store.tx_backlog_may_have_writers_.load(std::memory_order_acquire))
+    co_return false;
+  // Thousands of admission waiters must not each walk historical txids while
+  // the same writer is active. A weak witness and per-block settled proofs
+  // reduce repeated probes without timers, strong pins or an admission bypass.
+  if (store.tx_backlog_writer_block_) {
+    const auto [block_id, epoch] = *store.tx_backlog_writer_block_;
+    const auto found = store.tx_blocks_.find(block_id);
+    if (found != store.tx_blocks_.end() &&
+        found->second.allocation_epoch_ == epoch &&
+        found->second.counted_backlog_ && found->second.txids_.HasLiveWriter())
+      co_return true;
+  }
+  for (auto& [block_id, block] : store.tx_blocks_) {
     if (!block.counted_backlog_) continue;
-    for (const auto& [txid, lease] : block.txids_) {
-      (void)txid;
-      if (!lease.expired()) co_return true;
+    if (block.txids_.HasLiveWriter()) {
+      store.tx_backlog_writer_block_ = {block_id, block.allocation_epoch_};
+      co_return true;
     }
   }
+  store.tx_backlog_writer_block_.reset();
+  store.tx_backlog_may_have_writers_.store(false, std::memory_order_release);
   co_return false;
 }
 
@@ -260,7 +278,9 @@ Task<absl::Status> StorageEngine::Impl::WaitForTxBacklog() {
     bool live_transaction = false;
     for (unsigned owner = 0; owner < worker_count_; ++owner) {
       if (stores_[owner]->tx_backlog_bytes_.load(std::memory_order_acquire) <
-          kTxBacklogAdmissionBytes)
+              kTxBacklogAdmissionBytes ||
+          !stores_[owner]->tx_backlog_may_have_writers_.load(
+              std::memory_order_acquire))
         continue;
       bool live;
       if (owner == bycorf::ThisWorker().id_) {
@@ -415,10 +435,7 @@ StorageEngine::Impl::InspectTxBlocksLocal(WorkerStore& store, bool seal) {
       const auto found =
           store.tx_blocks_.find(store.active_tx_block_->block_id_);
       if (found != store.tx_blocks_.end())
-        for (const auto& [txid, lease] : found->second.txids_) {
-          (void)txid;
-          active_writers |= !lease.expired();
-        }
+        active_writers = found->second.txids_.HasLiveWriter();
     }
     // A cleaner round must not discard usable space in the current append
     // block. Rollovers seal it normally; this path handles a nearly full tail
@@ -448,7 +465,7 @@ StorageEngine::Impl::InspectTxBlocksLocal(WorkerStore& store, bool seal) {
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   TxCleanerLocalState result;
   result.reserve(store.tx_blocks_.size());
-  for (const auto& [block_id, tx_block] : store.tx_blocks_) {
+  for (auto& [block_id, tx_block] : store.tx_blocks_) {
     const BlockState* state = FindBlockState(store, block_id);
     const bool durable =
         state != nullptr && state->allocated_ &&
@@ -467,10 +484,11 @@ StorageEngine::Impl::InspectTxBlocksLocal(WorkerStore& store, bool seal) {
         .pending_relocation_ =
             store.pending_relocation_fences_.contains(block_id),
     };
-    block.txids_.reserve(tx_block.txids_.size());
-    for (const auto& [txid, lease] : tx_block.txids_) {
+    block.active_transaction_ = tx_block.txids_.HasLiveWriter();
+    block.txids_.reserve(tx_block.txids_.entries().size());
+    for (const auto& [txid, lease] : tx_block.txids_.entries()) {
+      (void)lease;
       block.txids_.push_back(txid);
-      block.active_transaction_ |= !lease.expired();
     }
     block.commit_decisions_.assign(tx_block.commit_ends_.begin(),
                                    tx_block.commit_ends_.end());
@@ -492,10 +510,7 @@ Task<absl::Status> StorageEngine::Impl::PromoteTxBlockLocal(
   const auto tx_block = store.tx_blocks_.find(block.block_id_);
   bool active_transaction = false;
   if (tx_block != store.tx_blocks_.end())
-    for (const auto& [txid, lease] : tx_block->second.txids_) {
-      (void)txid;
-      active_transaction |= !lease.expired();
-    }
+    active_transaction = tx_block->second.txids_.HasLiveWriter();
   if (source == nullptr || tx_block == store.tx_blocks_.end() ||
       source->allocation_epoch_ != block.allocation_epoch_ ||
       tx_block->second.allocation_epoch_ != block.allocation_epoch_ ||

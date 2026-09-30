@@ -18,17 +18,25 @@
 
 #include <atomic>
 #include <cstdint>
+#include <limits>
 
 namespace lavik::storage {
 
 // An incremental successor inherits untouched groups from this decision.
 // The successor must not become independently durable before this decision
 // does. Same-transaction commands can reuse the view without waiting.
-// State crosses worker owners; no worker-local notification is shared here.
+// State can cross worker owners. A standalone command's decision completes
+// on its key owner and can use that owner's durability notification; borrowed
+// transactions may complete elsewhere and retain the cross-worker wait path.
 struct GroupedCommitDecision {
   enum class State : std::uint8_t { kPending, kDurable, kFailed };
-  explicit GroupedCommitDecision(std::uint64_t txid) : txid_(txid) {}
+  static constexpr std::uint16_t kRemoteCompletion =
+      std::numeric_limits<std::uint16_t>::max();
+  explicit GroupedCommitDecision(
+      std::uint64_t txid, std::uint16_t completion_owner = kRemoteCompletion)
+      : txid_(txid), completion_owner_(completion_owner) {}
   const std::uint64_t txid_;
+  const std::uint16_t completion_owner_;
   std::atomic<State> state_{State::kPending};
 
   void FailPending() noexcept {

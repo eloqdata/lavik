@@ -160,9 +160,11 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     for (const auto& entry : after_image.entries_)
       append_bytes += entry.field_.size() + entry.value_.size() + 64;
     if (prepared != nullptr) {
-      for (const auto& page : prepared->writes_)
+      for (const auto& page : prepared->writes_) {
+        if (page.prepared_) append_bytes += page.prepared_->bytes().size() + 64;
         for (const auto& entry : page.value_.entries_)
           append_bytes += entry.field_.size() + entry.value_.size() + 64;
+      }
     }
     // No transaction lease may be held while asking the cleaner to make room.
     // The population checks below also cover GC during this unlocked wait.
@@ -354,9 +356,17 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
         }
         for (const auto& page : plan->writes_) {
           if (page.retired_) continue;
-          compact.entries_.insert(compact.entries_.end(),
-                                  page.value_.entries_.begin(),
-                                  page.value_.entries_.end());
+          if (page.prepared_) {
+            if (page.field_count() == 0) continue;
+            auto decoded = DecodeHashValue(page.prepared_->bytes());
+            if (!decoded.ok()) co_return decoded.status();
+            for (auto& entry : decoded->entries_)
+              compact.entries_.push_back(std::move(entry));
+          } else {
+            compact.entries_.insert(compact.entries_.end(),
+                                    page.value_.entries_.begin(),
+                                    page.value_.entries_.end());
+          }
         }
         if (compact.entries_.size() != field_count)
           co_return absl::DataLossError("Hash demotion cardinality mismatch");
@@ -383,7 +393,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
         outer_transaction ? tx : nullptr, field_count, nullptr, nullptr,
         replication, true, nullptr, mutation_precondition);
   }
-  auto decision = PrepareGroupedDecision(*tx);
+  auto decision = PrepareGroupedDecision(*tx, !outer_transaction);
   if (!decision.ok()) co_return decision.status();
   if (outer_transaction) {
     // Auxiliary records retain the outer transaction tag AND this command's

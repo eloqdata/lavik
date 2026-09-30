@@ -55,8 +55,17 @@ struct HashGroupLocation {
 
 struct GroupedHashPhysicalState;
 
+// An auxiliary has no independent key or expiry. Keep only its compact
+// physical coordinates; the owning page supplies the sorted group identity.
+// This is deliberately distinct from a ScanHashMap entry with a variable key
+// tail. Returned pointers borrow the immutable object view.
+struct GroupedRecordIndexEntry {
+  RecordIndexValue value_;
+  const std::uint64_t* optional_extra() const noexcept { return nullptr; }
+};
+
 // Resident metadata only: field names and values are never retained here.
-// There is one compact RecordIndex entry per group, not per field. The
+// There is one compact physical index entry per group, not per field. The
 // prefix directory selects that entry; the physical owner supplies the
 // allocation epoch when materializing its compact location, as for top-level
 // RecordIndex entries. The adapter must validate payload identity/checksums
@@ -93,7 +102,7 @@ class GroupedHashObject {
       HashGroupDirectory directory,
       std::span<const HashGroupLocation> changed_locations);
 
-  // Ordered collections share the same bounded physical RecordIndex pages.
+  // Ordered collections share the same bounded physical index pages.
   // For indexed Sorted Sets, locations include BOTH the ordered graph and
   // member-prefix graph; either incomplete graph rejects publication.
   static absl::StatusOr<Handle> CreateOrdered(
@@ -165,9 +174,9 @@ class GroupedHashObject {
     return version_.root_.mutation_sequence_;
   }
   bool SameLogicalRoot(const GroupedHashObject& other) const noexcept;
-  const RecordIndex::Entry* FindGroup(std::string_view field) const;
-  const RecordIndex::Entry* FindGroup(HashGroupId id) const;
-  const RecordIndex::Entry* FindRecord(HashGroupId id) const;
+  const GroupedRecordIndexEntry* FindGroup(std::string_view field) const;
+  const GroupedRecordIndexEntry* FindGroup(HashGroupId id) const;
+  const GroupedRecordIndexEntry* FindRecord(HashGroupId id) const;
   // The manifest's retained charge follows this handle even after the object
   // and its side-index entry have been reclaimed.
   std::shared_ptr<const std::vector<ExtentRef>> ExtentsFor(
@@ -180,7 +189,7 @@ class GroupedHashObject {
   }
   std::size_t record_count() const noexcept;
   using RecordVisitor = std::function<void(
-      HashGroupId, const RecordIndex::Entry&,
+      HashGroupId, const GroupedRecordIndexEntry&,
       const std::shared_ptr<const std::vector<ExtentRef>>&, bool)>;
   // Includes active leaves AND retired parent markers in both identity spaces.
   // The callback borrows compact entries and must materialize block epoch/owner

@@ -71,12 +71,60 @@ struct GroupedHashRoot {
   bool operator==(const GroupedHashRoot&) const noexcept = default;
 };
 
+enum class HashGroupEditKind { kSet, kSetIfAbsent, kDelete };
+struct HashGroupEdit;
+
+// Command-owned, fully checked compact bytes for a small replacement leaf.
+// Only ApplyHashGroupEdits can construct this certificate. No borrowed request
+// or read-buffer data survives it; it is never retained in the resident index.
+class PreparedHashGroupPayload {
+ public:
+  std::string_view bytes() const noexcept { return bytes_; }
+  std::uint32_t count() const noexcept { return count_; }
+  HashGroupId id() const noexcept { return id_; }
+
+ private:
+  friend absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
+      std::string_view, const DigestSeed&, HashGroupEditKind,
+      std::span<const HashEntryView>);
+  PreparedHashGroupPayload(std::string bytes, std::uint32_t count,
+                           HashGroupId id)
+      : bytes_(std::move(bytes)), count_(count), id_(id) {}
+  std::string bytes_;
+  std::uint32_t count_;
+  HashGroupId id_;
+};
+
 struct HashGroupSnapshot {
   std::uint64_t incarnation_ = 0;
   HashGroupId id_{};
   bool retired_ = false;
   HashValue value_;
+  // Mutually exclusive with value_; the encoder checks this invariant.
+  std::optional<PreparedHashGroupPayload> prepared_;
+  std::size_t field_count() const noexcept {
+    return prepared_ ? prepared_->count() : value_.entries_.size();
+  }
 };
+
+struct HashGroupEdit {
+  bool changed_ = false;
+  std::uint64_t added_ = 0;
+  std::uint64_t removed_ = 0;
+  // Empty for no-ops. A split returns complete leaves; the caller publishes a
+  // retirement marker for the original leaf in the same command decision.
+  std::vector<HashGroupSnapshot> leaves_;
+};
+
+// Apply ordered operands to one encoded leaf, checking all old fields for
+// uniqueness and routing. HSET uses last-value-wins, NX uses first-value-wins,
+// and repeated removals count once. Inputs need only survive this call. Small
+// replacements copy views directly into checked bytes; splits and oversized
+// entries retain the bounded-state owned encoder path. Caller admits page and
+// operand scratch before calling; this function performs no storage writes.
+absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
+    std::string_view payload, const DigestSeed& seed, HashGroupEditKind kind,
+    std::span<const HashEntryView> edits);
 
 inline constexpr std::size_t kGroupedHashRootBytes = 64;
 inline constexpr std::size_t kHashGroupHeaderBytes = 48;
@@ -84,7 +132,7 @@ inline constexpr std::size_t kHashGroupPayloadLimit =
     kMaxRecordPayloadBytes - kHashGroupHeaderBytes;
 
 // A bounded-state serializer for inline records and extent writers. Create
-// validates the complete snapshot before any bytes can be emitted. The caller
+// validates owned fields or consumes the checked prepared payload. The caller
 // owns the snapshot and must keep it alive and immutable until serialization
 // ends. Field/value spans borrow the original strings; no full-size encoded
 // copy is needed by a consumer that fills one extent at a time.
