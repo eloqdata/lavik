@@ -15,6 +15,7 @@
  */
 
 #include "absl/cleanup/cleanup.h"
+#include "absl/strings/cord.h"
 #include "lavik/fault_pause.h"
 #include "replication_internal.h"
 
@@ -910,6 +911,11 @@ std::uint64_t SteadyNanos() noexcept {
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now().time_since_epoch())
           .count());
+}
+
+bool IsFullAdmissionBusy(const absl::Status& status) {
+  return status.code() == absl::StatusCode::kResourceExhausted &&
+         status.message() == kFullAdmissionBusyStatus;
 }
 
 bool IsLeaseAdmissionSuspended(const absl::Status& status) {
@@ -6894,6 +6900,7 @@ auto ReplicationManager::ReplicationGroup::LatchReplicationFailure(
 }
 
 auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
+  auto full_busy_delay = kNativeReconnectDelay;
   while (true) {
     ReplicaOfConfig upstream;
     std::uint64_t role_epoch = 0;
@@ -6952,6 +6959,7 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
                        stopped.message());
     }
     bool lease_admission_retry = false;
+    bool full_admission_retry = false;
     {
       AssertStateOwner();
       // Only the explicit source lease-gate response is retryable. Pointer
@@ -6978,9 +6986,20 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
       if (lease_admission_retry) {
         ++cluster_context->lease_admission_pre_mutation_retries_;
       }
+      full_admission_retry =
+          IsFullAdmissionBusy(connected) && stopped.ok() &&
+          !fail_stop.has_value() && session->cluster_follow_ != nullptr &&
+          cluster_follow_owner_ == session->cluster_follow_ &&
+          active_replica_session_ == session && session->session_id_ == 0 &&
+          session->active_flows_.load(std::memory_order_acquire) == 0 &&
+          session->connected_flows_.load(std::memory_order_acquire) == 0 &&
+          !session->destructive_root_started_.load(std::memory_order_acquire) &&
+          !replication_shutdown_requested_ && !cluster_control_stopping_ &&
+          upstream_.has_value() && *upstream_ == upstream &&
+          role_epoch_.load(std::memory_order_relaxed) == role_epoch;
     }
     const bool partial_root_must_abort =
-        !lease_admission_retry &&
+        !lease_admission_retry && !full_admission_retry &&
         (cluster_context == nullptr || !cluster_ready);
     if (stopped.ok() && !fail_stop.has_value() && partial_root_must_abort &&
         session->session_id_ != 0) {
@@ -6993,7 +7012,8 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
     }
 
     const bool cluster_attempt_must_retire =
-        !lease_admission_retry && cluster_context != nullptr &&
+        !lease_admission_retry && !full_admission_retry &&
+        cluster_context != nullptr &&
         (!cluster_ready || cluster_proof_invalidated || fail_stop.has_value());
     if (cluster_context != nullptr && fail_stop.has_value()) {
       absl::Status latched =
@@ -7037,7 +7057,7 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
       const bool current_follow =
           session->cluster_follow_ != nullptr &&
           cluster_follow_owner_ == session->cluster_follow_;
-      retry = lease_admission_retry ||
+      retry = lease_admission_retry || full_admission_retry ||
               (!replication_shutdown_requested_ && upstream_.has_value() &&
                role_epoch_.load(std::memory_order_relaxed) == role_epoch &&
                !fail_stop.has_value() &&
@@ -7068,9 +7088,27 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
                  upstream.port_, connected.message());
     // The pre-mutation FULL path has a three-retry budget; preserve its
     // lease-renewal window while ordinary following reconnects promptly.
-    absl::Status slept = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_,
-        lease_admission_retry ? kReconnectDelay : kNativeReconnectDelay);
+    const auto delay =
+        full_admission_retry
+            ? full_busy_delay
+            : std::chrono::duration_cast<std::chrono::milliseconds>(
+                  lease_admission_retry ? kReconnectDelay
+                                        : kNativeReconnectDelay);
+    full_busy_delay =
+        full_admission_retry
+            ? std::min(full_busy_delay * 2, std::chrono::milliseconds(1000))
+            : kNativeReconnectDelay;
+    absl::Status slept;
+    const auto retry_at = std::chrono::steady_clock::now() + delay;
+    // A busy owner never queues a source task. The target retries its exact
+    // desired relationship with a bounded delay, interruptible by replacement.
+    while (std::chrono::steady_clock::now() < retry_at &&
+           !replication_shutdown_requested_ && upstream_.has_value() &&
+           role_epoch_.load(std::memory_order_relaxed) == role_epoch) {
+      slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                        std::chrono::milliseconds(10));
+      if (!slept.ok()) break;
+    }
     if (!slept.ok()) {
       coordinator_started_ = false;
       co_return slept;
@@ -7468,16 +7506,19 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
   unsigned source_workers = 0;
   const bool scoped_cluster_handshake = session->cluster_follow_ != nullptr ||
                                         session->cluster_rebuild_ != nullptr;
+  const bool full_busy = words.size() == 8 && words[0] == "-LVFULLBUSY" &&
+                         session->cluster_follow_ != nullptr;
   const bool source_group_valid =
       scoped_cluster_handshake
           ? words.size() == 8 && IsPopulationGroupToken(words[3])
           : words.size() == 8 && IsReplicationId(words[3]);
-  if (words.size() != 8 || words[0] != "+LVFULLRESYNC" ||
-      !ParseUnsigned(words[1], &session_id) || session_id == 0 ||
+  if (words.size() != 8 || (!full_busy && words[0] != "+LVFULLRESYNC") ||
+      !ParseUnsigned(words[1], &session_id) ||
+      (full_busy ? session_id != 0 : session_id == 0) ||
       !IsReplicationId(words[2]) || !source_group_valid ||
       !IsReplicationId(words[4]) || !IsReplicationId(words[5]) ||
       !ParseUnsigned(words[6], &source_workers) || source_workers == 0 ||
-      !IsReplicationId(words[7])) {
+      (full_busy ? words[7] != "?" : !IsReplicationId(words[7]))) {
     if (session->cluster_follow_ == nullptr &&
         session->cluster_rebuild_ != nullptr) {
       (void)co_await InvalidateReplicaContinuation(session, false);
@@ -7516,6 +7557,11 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
           "native source node/group/boot/history/flow layout does not "
           "match the cluster rebuild directive");
     }
+  }
+  if (full_busy) {
+    session->sockets_.Remove(control_fd);
+    control.Close().IgnoreError();
+    co_return absl::ResourceExhaustedError(kFullAdmissionBusyStatus);
   }
   bool local_population_matches_response =
       resume_proof_advertised && requested_group == words[3] &&
@@ -7989,17 +8035,36 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
   const bool valid_size = response_words.size() == 4 || ack_ranges;
   const bool fullsync = valid_size && response_words[3] == "FULL";
   const bool continue_mode = valid_size && response_words[3] == "CONTINUE";
+  const bool retry_full =
+      valid_size && response_words[3] == "RETRYFULL" &&
+      session->cluster_follow_ != nullptr &&
+      session->cluster_rebuild_ != nullptr &&
+      session->cluster_rebuild_->state_.load(std::memory_order_acquire) ==
+          ReplicationGroupState::kReady &&
+      !session->destructive_root_started_.load(std::memory_order_acquire);
   if (!response.ok() || !valid_size || response_words[0] != "+LVFLOW" ||
       !ParseUnsigned(response_words[1], &response_session_id) ||
       response_session_id != session->session_id_ ||
       !ParseUnsigned(response_words[2], &response_flow_id) ||
-      response_flow_id != flow_id || (!fullsync && !continue_mode)) {
+      response_flow_id != flow_id ||
+      (!fullsync && !continue_mode && !retry_full)) {
     session->sockets_.Remove(fd);
     stream.Close().IgnoreError();
     session->Cancel();
     co_return response.ok()
         ? absl::InvalidArgumentError("invalid LVFLOW response")
         : response.status();
+  }
+  if (retry_full) {
+    // Any flow may observe the collective miss first. Set the next control
+    // request before cancelling siblings, so cancellation cannot lose it.
+    session->cluster_follow_->force_full_.store(true,
+                                                std::memory_order_release);
+    session->sockets_.Remove(fd);
+    stream.Close().IgnoreError();
+    session->Cancel();
+    co_return absl::UnavailableError(
+        "steady Owner requires fresh FULL admission");
   }
   absl::Status selected = session->SelectFlowMode(flow_id, fullsync);
   if (!selected.ok()) {
@@ -11354,6 +11419,14 @@ auto ReplicationManager::ReplicationGroup::ServeOwnedNativeConnection(
       const absl::Status sent = co_await WriteText(stream, reply);
       if (!sent.ok()) co_return sent;
     }
+    if (IsFullAdmissionBusy(result)) {
+      const auto reply = result.GetPayload(kFullAdmissionReplyPayload);
+      if (reply.has_value()) {
+        const std::string wire_reply(*reply);
+        const absl::Status sent = co_await WriteText(stream, wire_reply);
+        if (!sent.ok()) co_return sent;
+      }
+    }
     co_return result;
   }
   co_return co_await ServeMasterFlow(stream, std::move(args));
@@ -11687,7 +11760,19 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
     session->allow_initial_cursor_ = allow_initial_cursor;
     if (!protocol_probe && !allow_continue) {
       absl::Status admitted = AdmitMasterFullSessionLocked(session);
-      if (!admitted.ok()) co_return admitted;
+      if (!admitted.ok()) {
+        if (IsFullAdmissionBusy(admitted)) {
+          // Carry the validated source scope out of the registry gate. No
+          // socket I/O, source session or capture is retained by a busy reply.
+          admitted.SetPayload(
+              kFullAdmissionReplyPayload,
+              absl::Cord(absl::StrCat("-LVFULLBUSY 0 ", node_id_, " ",
+                                      source_group_id, " ", boot_id_, " ",
+                                      source_history_id, " ",
+                                      storage_->worker_count(), " ?\r\n")));
+        }
+        co_return admitted;
+      }
     }
     if (!session->SetControl(stream.NativeFd())) {
       co_return absl::InternalError("failed to register control connection");
@@ -11914,6 +11999,19 @@ auto ReplicationManager::ReplicationGroup::ServeMasterFlow(
         "replication session ended before flow mode selection");
   }
   const bool selected_continue_mode = *session_continue_mode;
+  if (!selected_continue_mode && session->allow_continue_ &&
+      session->steady_export_.has_value()) {
+    // Coverage was lost after control admitted a possible continuation. The
+    // target still owns its trusted root: force a new control admission before
+    // either side starts FULL, even if this source's quota is currently free.
+    const std::string reply =
+        absl::StrCat("+LVFLOW ", session_id, " ", flow_id, " RETRYFULL",
+                     ack_ranges ? " ACKRANGE\r\n" : "\r\n");
+    absl::Status sent = co_await WriteText(stream, reply);
+    session->ClearFlow(flow_id, stream.NativeFd());
+    if (!sent.ok()) session->Cancel();
+    co_return sent;
+  }
   if (!selected_continue_mode) {
     // Coverage can disappear after the optimistic control classification.
     // Admit the same session before any FULL response or source capture.
@@ -11974,6 +12072,16 @@ auto ReplicationManager::ReplicationGroup::AdmitMasterFullSessionLocked(
     const std::shared_ptr<MasterSession>& session) -> absl::Status {
   PruneFullSessionsLocked();
   if (session->full_active()) return absl::OkStatus();
+  // This rollout limits automatic FollowOwner FULL only. Explicit rebuilds
+  // use the same lifecycle ledger and join the quota in the next change.
+  if (session->steady_export_.has_value() &&
+      std::any_of(
+          full_sessions_.begin(), full_sessions_.end(),
+          [](const auto& full) { return full->steady_export_.has_value(); })) {
+    spdlog::info("native FULL admission busy for group {} target {}",
+                 session->steady_export_->group_id_, session->node_id_);
+    return absl::ResourceExhaustedError(kFullAdmissionBusyStatus);
+  }
   absl::Status admitted = session->AdmitFull();
   if (admitted.ok()) full_sessions_.push_back(session);
   return admitted;

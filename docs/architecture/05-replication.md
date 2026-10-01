@@ -143,14 +143,28 @@ it does not block an operating-system worker thread.
 Each native target session owns one FULL lifecycle shared by its control
 connection and every source flow. Control admits a known FULL before its
 successful response can authorize destructive target replacement; a late
-coverage fallback enters the same admission boundary before replying FULL or
-starting capture. Admission is unlimited. The lifecycle completes only after
+coverage miss in steady following returns `RETRYFULL`, causing a fresh control
+admission before either peer starts FULL. The current source admits one
+Meta-managed automatic FollowOwner FULL target session per Group. Other targets
+receive a source-scoped `LVFULLBUSY` response before withdrawing trusted
+population evidence or starting capture. They retain their exact desired
+relationship and retry with a cancellable exponential delay capped at one
+second. Explicit population rebuilds share the lifecycle but are not yet subject
+to this quota. CONTINUE, direct-parent partial recovery and established ONLINE
+sessions do not consume a slot. The lifecycle completes only after
 all flows acknowledge the target's complete cut and promotion; an ONLINE
 session no longer owns FULL work. On cancellation, control retirement and FULL
 drain are distinct: the exact session remains active until its control setup
 and all source flows, capture queues and ACK readers have exited. The
 `lavik_full_sync_sessions` field in `INFO replication` includes this retired
-but undrained work.
+but undrained work. Replaying the same desired state or reconnecting to a new
+Meta Leader does not reset this source-owned accounting; authority or history
+replacement still cancels and drains exports through the existing fences.
+
+This quota limits load rather than protecting the last Candidate. The only
+remaining Candidate may enter FULL, and repeated failures can exhaust the
+candidate set. It introduces no durable Meta queue, storage-backend interface,
+or limits on Redis PSYNC or slot migration.
 
 ## Roles and lifecycle
 
