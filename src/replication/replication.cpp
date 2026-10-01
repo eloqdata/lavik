@@ -1195,6 +1195,24 @@ auto ReplicationManager::ReplicationGroup::CancelPendingClusterRebuild(
   AssertStateOwner();
   auto pending = std::move(pending_cluster_rebuild_);
   if (pending == nullptr) co_return absl::OkStatus();
+  // A fence may enter before a replacement Start. Own the same transition
+  // gate while joining so a new coordinator cannot appear inside that join.
+  // Start also calls this helper while already owning the gate.
+  const bool previous_reconfiguration = replica_reconfiguration_running_;
+  replica_reconfiguration_running_ = true;
+  auto finish_cancel = absl::MakeCleanup([this, previous_reconfiguration] {
+    replica_reconfiguration_running_ = previous_reconfiguration;
+  });
+  LAVIK_FAULT_INJECT(
+      const char* hold = std::getenv("LAVIK_REBUILD_CANCEL_HOLD_FILE");
+      if (hold != nullptr && ::access(hold, F_OK) == 0) {
+        auto signalled = SignalFaultBarrier("LAVIK_REBUILD_CANCEL_ACK_FILE",
+                                            "rebuild cancel barrier");
+        if (!signalled.ok()) co_return signalled;
+        auto paused = co_await fault_injection::PauseWhileFileExists(
+            "LAVIK_REBUILD_CANCEL_HOLD_FILE");
+        if (!paused.ok()) co_return paused;
+      });
   pending->state_.store(ReplicationGroupState::kNotReady,
                         std::memory_order_release);
   // Move/join the exact session before resolving its handle. Neither this

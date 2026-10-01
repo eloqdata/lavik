@@ -1213,11 +1213,14 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
       replication_->StorageReady(worker);
       result_ = co_await Exercise(worker);
     }
-    if (!transition_hold_.empty()) std::filesystem::remove(transition_hold_);
+    if (!transition_hold_.empty()) {
+      std::filesystem::remove(transition_hold_);
+      std::filesystem::remove(transition_hold_.string() + ".cancel");
+    }
+    replication_->RequestShutdown();
     while (tasks_running_ != 0) {
       (co_await bycorf::SleepFor(worker, 1ms)).IgnoreError();
     }
-    replication_->RequestShutdown();
     const absl::Status quiesced = co_await replication_->QuiesceForShutdown();
     if (result_.ok() && !quiesced.ok()) result_ = quiesced;
     worker.RequestStop();
@@ -1339,6 +1342,45 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
               upstream, replacement, *manifest);
           if (stale.ok())
             co_return TestFailure("fenced replacement was resurrected");
+
+          // Reverse the interleaving: cancellation owns the old coordinator
+          // while a newer start tries to publish. It must reject, not revive
+          // the coordinator that the fence is still joining.
+          const auto before = source_->accepted();
+          auto pending = co_await replication_->StartClusterRebuildDirective(
+              upstream, newer, *manifest);
+          if (!pending.ok()) co_return pending.status();
+          auto reached = co_await WaitForPeerCount(
+              worker, *source_, false, before + 1, "replacement did not dial");
+          if (!reached.ok()) co_return reached;
+          {
+            std::ofstream hold(transition_hold_.string() + ".cancel");
+          }
+          fence_.reset();
+          ++tasks_running_;
+          worker.Spawn(FenceReplacement());
+          const auto cancel_deadline = std::chrono::steady_clock::now() + 5s;
+          while (!std::filesystem::exists(transition_hold_.string() +
+                                          ".cancel.ack")) {
+            if (std::chrono::steady_clock::now() >= cancel_deadline)
+              co_return TestFailure("fence did not reach cancellation barrier");
+            (co_await bycorf::SleepFor(worker, 1ms)).IgnoreError();
+          }
+          ++newer.identity_.directive_revision_;
+          newer.identity_.attempt_id_ = "start-during-fence";
+          auto raced = co_await replication_->StartClusterRebuildDirective(
+              upstream, newer, *manifest);
+          if (raced.ok())
+            co_return TestFailure(
+                "start entered cancellation-owned transition");
+          std::filesystem::remove(transition_hold_.string() + ".cancel");
+          while (tasks_running_ != 0) {
+            (co_await bycorf::SleepFor(worker, 1ms)).IgnoreError();
+          }
+          if (!fence_->ok()) co_return *fence_;
+          if ((co_await pending->Await()).code() !=
+              absl::StatusCode::kCancelled)
+            co_return TestFailure("reverse fence left pending request alive");
         }
       }
     }
@@ -5824,6 +5866,8 @@ void RunTargetLeaseAdmissionRetryCase(unsigned suspended_responses,
     ~FaultReset() {
       ::unsetenv("LAVIK_REBUILD_START_HOLD_FILE");
       ::unsetenv("LAVIK_REBUILD_START_ACK_FILE");
+      ::unsetenv("LAVIK_REBUILD_CANCEL_HOLD_FILE");
+      ::unsetenv("LAVIK_REBUILD_CANCEL_ACK_FILE");
     }
   } fault_reset;
   if (concurrent_start) {
@@ -5831,6 +5875,10 @@ void RunTargetLeaseAdmissionRetryCase(unsigned suspended_responses,
     ::setenv("LAVIK_REBUILD_START_HOLD_FILE", transition_hold.c_str(), 1);
     ::setenv("LAVIK_REBUILD_START_ACK_FILE",
              (transition_hold.string() + ".ack").c_str(), 1);
+    ::setenv("LAVIK_REBUILD_CANCEL_HOLD_FILE",
+             (transition_hold.string() + ".cancel").c_str(), 1);
+    ::setenv("LAVIK_REBUILD_CANCEL_ACK_FILE",
+             (transition_hold.string() + ".cancel.ack").c_str(), 1);
   }
   std::string busy_reply;
   if (full_busy) {
