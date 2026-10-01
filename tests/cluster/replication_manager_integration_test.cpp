@@ -213,7 +213,8 @@ class StallingNativeSource {
  public:
   StallingNativeSource(std::string expected_target_node_id,
                        std::uint16_t target_port,
-                       unsigned lease_suspended_responses = 0)
+                       unsigned lease_suspended_responses = 0,
+                       std::string busy_reply = {})
       : expected_client_identity_(RespBulk("?" + expected_target_node_id + ":" +
                                            std::to_string(target_port))),
         expected_population_target_(RespBulk(expected_target_node_id)),
@@ -223,7 +224,8 @@ class StallingNativeSource {
                         std::string(40, 'e') + " " + std::string(40, 'b') +
                         " " + std::string(40, 'c') + " 1 " +
                         std::string(40, 'f') + "\r\n"),
-        lease_suspended_responses_(lease_suspended_responses) {
+        lease_suspended_responses_(lease_suspended_responses),
+        busy_reply_(std::move(busy_reply)) {
     listener_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listener_ < 0) {
       error_.store(errno == 0 ? EIO : errno, std::memory_order_release);
@@ -319,7 +321,9 @@ class StallingNativeSource {
       const unsigned accepted =
           accepted_.fetch_add(1, std::memory_order_acq_rel) + 1;
       if (accepted <= lease_suspended_responses_) {
-        constexpr std::string_view kSuspended = "-LVLEASESUSPENDED\r\n";
+        const std::string_view kSuspended = busy_reply_.empty()
+                                                ? "-LVLEASESUSPENDED\r\n"
+                                                : std::string_view(busy_reply_);
         const ssize_t sent = ::send(connection, kSuspended.data(),
                                     kSuspended.size(), MSG_NOSIGNAL);
         if (sent != static_cast<ssize_t>(kSuspended.size())) {
@@ -429,6 +433,7 @@ class StallingNativeSource {
   const std::string expected_population_epoch_;
   const std::string first_response_;
   const unsigned lease_suspended_responses_ = 0;
+  const std::string busy_reply_;
   std::jthread thread_;
   std::atomic<int> connection_{-1};
   std::atomic<unsigned> accepted_{0};
@@ -1179,12 +1184,16 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
                                    lavik::ReplicationManager* replication,
                                    StallingNativeSource* source,
                                    unsigned expected_connections,
-                                   absl::StatusCode expected_terminal)
+                                   absl::StatusCode expected_terminal,
+                                   bool full_busy = false,
+                                   bool cancel_busy = false)
       : storage_(storage),
         replication_(replication),
         source_(source),
         expected_connections_(expected_connections),
-        expected_terminal_(expected_terminal) {}
+        expected_terminal_(expected_terminal),
+        full_busy_(full_busy),
+        cancel_busy_(cancel_busy) {}
 
   void Prepare(unsigned thread_count) override {
     if (thread_count != 1) {
@@ -1221,11 +1230,53 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
     auto manifest = lavik::PopulationManifest::Create({{42, 9}, {16'383, 11}});
     if (!manifest.ok()) co_return manifest.status();
     lavik::RebuildDirective directive = TargetDirective(initial, *manifest);
+    std::optional<lavik::ReadyToken> previous_ready;
+    if (full_busy_) {
+      auto seed = directive.identity_;
+      seed.source_node_id_.clear();
+      seed.source_assignment_id_.clear();
+      seed.source_boot_id_.clear();
+      seed.source_history_id_.clear();
+      seed.target_history_id_ =
+          (co_await replication_->ObserveIdentity()).local_history_id_;
+      seed.operation_id_ = "seed-operation";
+      seed.attempt_id_ = "seed-attempt";
+      auto initialized =
+          co_await replication_->StartEmptyPopulationInitialization(seed,
+                                                                    *manifest);
+      if (!initialized.ok()) co_return initialized.status();
+      const auto ready = co_await initialized->Await();
+      if (!ready.ok()) co_return ready;
+      previous_ready = (co_await CheckedPopulation(*replication_)).ready_token_;
+      ++directive.identity_.directive_revision_;
+    }
     const lavik::ReplicaOfConfig upstream{"127.0.0.1", source_->port()};
     const auto started_at = std::chrono::steady_clock::now();
     auto started = co_await replication_->StartClusterRebuildDirective(
         upstream, directive, *manifest);
     if (!started.ok()) co_return started.status();
+    if (full_busy_) {
+      auto reached = co_await WaitForPeerCount(
+          worker, *source_, false, 2, "explicit FULL busy was not retried");
+      if (!reached.ok()) co_return reached;
+      const auto waiting = co_await CheckedPopulation(*replication_);
+      if (!waiting.ready_token_.has_value() ||
+          waiting.ready_token_->identity() != previous_ready->identity() ||
+          storage_->ReplicaRecoveryFenced() || started->result().has_value()) {
+        co_return TestFailure(
+            "explicit busy withdrew trusted evidence or completed early");
+      }
+      auto replay = co_await replication_->StartClusterRebuildDirective(
+          upstream, directive, *manifest);
+      if (!replay.ok() || replay->result().has_value())
+        co_return TestFailure(
+            "exact busy directive replay did not retain its attempt");
+      if (cancel_busy_) {
+        const auto cancelled =
+            co_await replication_->CancelInProgressClusterPopulation(false);
+        if (!cancelled.ok()) co_return cancelled;
+      }
+    }
     const absl::Status terminal = co_await started->Await();
     const auto elapsed = std::chrono::steady_clock::now() - started_at;
     if (terminal.code() != expected_terminal_) {
@@ -1237,8 +1288,8 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
         worker, *source_, false, expected_connections_,
         "target did not perform the expected bounded lease retries");
     if (!reached.ok()) co_return reached;
-    const auto minimum =
-        std::chrono::milliseconds(800 * (expected_connections_ - 1));
+    const auto minimum = std::chrono::milliseconds((full_busy_ ? 80 : 800) *
+                                                   (expected_connections_ - 1));
     if (elapsed < minimum) {
       co_return TestFailure("lease admission retries did not use fixed delay");
     }
@@ -1251,8 +1302,18 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
     }
     const lavik::ClusterPopulationStatus population =
         co_await CheckedPopulation(*replication_);
-    if (population.state_ != lavik::ReplicationGroupState::kNotReady ||
-        population.ready_token_.has_value()) {
+    if (full_busy_) {
+      if (!population.ready_token_.has_value() ||
+          population.ready_token_->identity() != previous_ready->identity() ||
+          storage_->ReplicaRecoveryFenced())
+        co_return TestFailure(
+            "pre-admission failure retired the previous Ready root");
+      auto stale = co_await replication_->StartClusterRebuildDirective(
+          upstream, directive, *manifest);
+      if (stale.ok())
+        co_return TestFailure("retired admission attempt was resurrected");
+    } else if (population.state_ != lavik::ReplicationGroupState::kNotReady ||
+               population.ready_token_.has_value()) {
       co_return TestFailure("terminal retry outcome retained a rebuild proof");
     }
     co_return absl::OkStatus();
@@ -1263,6 +1324,8 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
   StallingNativeSource* source_ = nullptr;
   unsigned expected_connections_ = 0;
   absl::StatusCode expected_terminal_ = absl::StatusCode::kUnknown;
+  bool full_busy_ = false;
+  bool cancel_busy_ = false;
   absl::Status result_ = absl::OkStatus();
 };
 
@@ -5251,6 +5314,21 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
     if (!established_reply->starts_with("+LVFULLRESYNC ")) {
       co_return TestFailure("valid lease did not admit the population source");
     }
+    auto explicit_competitor = OpenPeer(worker);
+    if (!explicit_competitor.ok()) co_return explicit_competitor.status();
+    RequestResult explicit_result;
+    worker.Spawn(RunNativeRequest(explicit_competitor->stream_,
+                                  population_control_args(), 109,
+                                  &explicit_result));
+    auto explicit_reply = co_await ReadPeerLine(
+        worker, explicit_competitor->peer_fd_, "competing explicit FULL");
+    if (!explicit_reply.ok()) co_return explicit_reply.status();
+    const bool explicit_rejected =
+        explicit_reply->starts_with("-LVFULLBUSY 0 ");
+    (void)::shutdown(explicit_competitor->peer_fd_, SHUT_RDWR);
+    waited = co_await WaitDone(worker, explicit_result,
+                               "explicit competitor cleanup");
+    if (!waited.ok()) co_return waited;
     // A later FDS may retain this exact authorization while adding the target
     // rebuild directive. The target can already have received LVFULLRESYNC but
     // not yet published every flow/ONLINE marker when the source installs that
@@ -5324,6 +5402,8 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
     waited = co_await WaitDone(worker, established_result,
                                "strong population source cleanup");
     if (!waited.ok()) co_return waited;
+    if (!explicit_rejected)
+      co_return TestFailure("source admitted concurrent explicit FULL");
 
     lavik::DesiredClusterUpstream desired{
         .group_id_ = identity.group_id_,
@@ -5445,6 +5525,24 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
         busy_reply->starts_with("-LVFULLBUSY 0 ") &&
         (co_await replication_->Observe()).full_sync_sessions_ == 1;
 
+    enabled = co_await replication_->EnableClusterRebuildSourceAdmissionUntil(
+        (lavik::cluster::LeaseClockNow() + 5s).time_since_epoch());
+    if (!enabled.ok()) co_return enabled;
+    authorized = co_await replication_->AuthorizeClusterRebuildSource(
+        source_authorization);
+    if (!authorized.ok()) co_return authorized;
+    auto mixed = OpenPeer(worker);
+    if (!mixed.ok()) co_return mixed.status();
+    RequestResult mixed_control;
+    worker.Spawn(RunNativeRequest(mixed->stream_, population_control_args(),
+                                  110, &mixed_control));
+    auto mixed_reply = co_await ReadPeerLine(
+        worker, mixed->peer_fd_, "explicit FULL against FollowOwner");
+    if (!mixed_reply.ok()) co_return mixed_reply.status();
+    const bool shared_quota =
+        mixed_reply->starts_with("-LVFULLBUSY 0 ") &&
+        (co_await replication_->Observe()).full_sync_sessions_ == 1;
+
     auto miss = OpenPeer(worker);
     if (!miss.ok()) co_return miss.status();
     RequestResult miss_control;
@@ -5552,7 +5650,10 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
     waited = co_await WaitDone(worker, miss_flow_result,
                                "coverage-miss flow cleanup");
     if (!waited.ok()) co_return waited;
-    if (!competing_full_rejected || !miss_requires_admission) {
+    waited =
+        co_await WaitDone(worker, mixed_control, "mixed FULL control cleanup");
+    if (!waited.ok()) co_return waited;
+    if (!shared_quota || !competing_full_rejected || !miss_requires_admission) {
       co_return TestFailure(
           "source admitted competing FULL sessions or bypassed fresh "
           "admission");
@@ -5639,15 +5740,24 @@ TEST(ReplicationManagerIntegrationTest,
 void RunTargetLeaseAdmissionRetryCase(unsigned suspended_responses,
                                       unsigned expected_connections,
                                       absl::StatusCode expected_terminal,
-                                      std::string_view directory_name) {
+                                      std::string_view directory_name,
+                                      bool full_busy = false,
+                                      bool cancel_busy = false) {
   const std::string expected_node_id(40, '9');
   constexpr std::uint16_t kReplicationPort = 6380;
   lavik::test::TempDirectory directory{std::string(directory_name)};
   const std::filesystem::path data = directory.path() / "node.data";
   lavik::test::CreateDataFile(data, 128 * kMiB);
 
+  std::string busy_reply;
+  if (full_busy) {
+    std::string group;
+    for (unsigned i = 0; i < 40; ++i) group += "64";
+    busy_reply = "-LVFULLBUSY 0 " + std::string(40, 'a') + " " + group + " " +
+                 std::string(40, 'b') + " " + std::string(40, 'c') + " 1 ?\r\n";
+  }
   StallingNativeSource source(expected_node_id, kReplicationPort,
-                              suspended_responses);
+                              suspended_responses, busy_reply);
   ASSERT_NE(source.port(), 0);
   ASSERT_EQ(source.error(), 0) << std::strerror(source.error());
   lavik::storage::StorageEngineOptions storage_options;
@@ -5670,7 +5780,8 @@ void RunTargetLeaseAdmissionRetryCase(unsigned suspended_responses,
   EnsureTxRuntime();
 
   TargetLeaseAdmissionRetryService service(
-      &storage, &replication, &source, expected_connections, expected_terminal);
+      &storage, &replication, &source, expected_connections, expected_terminal,
+      full_busy, cancel_busy);
   bycorf::Server server;
   server.AddService(&service);
   bycorf::ServerOptions runtime;
@@ -5695,6 +5806,18 @@ TEST(ReplicationManagerIntegrationTest,
   RunTargetLeaseAdmissionRetryCase(
       /*suspended_responses=*/4, /*expected_connections=*/4,
       absl::StatusCode::kUnavailable, "target-lease-marker-retry-limit");
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     PopulationTargetFullBusyPreservesReadyBeyondLeaseRetryBudget) {
+  RunTargetLeaseAdmissionRetryCase(4, 5, absl::StatusCode::kFailedPrecondition,
+                                   "target-full-busy", true);
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     PopulationTargetFullBusyCancellationPreservesReady) {
+  RunTargetLeaseAdmissionRetryCase(100, 2, absl::StatusCode::kCancelled,
+                                   "target-full-busy-cancel", true, true);
 }
 
 TEST(ReplicationManagerIntegrationTest,

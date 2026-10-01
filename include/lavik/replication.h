@@ -620,7 +620,9 @@ class ReplicationManager {
   // exact attempt's boot-local completion. Admission is not a terminal result:
   // callers that acknowledge a directive must Await() the returned handle.
   // Exact replay shares the original completion, while supersession resolves
-  // the older handle only after cancellation/join/abort has finished.
+  // the older handle only after cancellation/join/abort has finished. Source
+  // FULL admission precedes destructive authorization; busy requests preserve
+  // any trusted old population and retry within this same completion handle.
   bycorf::Task<absl::StatusOr<ClusterRebuildCompletion>>
   StartClusterRebuildDirective(ReplicaOfConfig upstream,
                                RebuildDirective directive,
@@ -767,8 +769,10 @@ class ReplicationManager {
 
   // Transport loss cannot leave an unobserved destructive directive running.
   // A completed Ready population is retained. The caller may additionally
-  // preserve the exact live level-triggered FollowOwner attempt whose history
-  // rotation caused a Meta-session replacement; strong fences pass false.
+  // preserve the exact live level-triggered FollowOwner attempt and an
+  // explicit request still waiting for source admission (no destructive
+  // capability yet). Replacement FDS revalidates that request; strong fences
+  // pass false and cancel both.
   bycorf::Task<absl::Status> CancelInProgressClusterPopulation(
       bool preserve_current_follow_attempt);
 

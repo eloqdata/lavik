@@ -439,7 +439,9 @@ class NodeControlActions {
   // directive loses its result channel, but an exact live level-triggered
   // FollowOwner attempt remains valid. FollowOwner FULL rotates local history
   // and therefore causes this same control-session replacement before it can
-  // become Ready. Fences pass false and retain no such exception.
+  // become Ready. A pre-mutation explicit request waiting for source FULL
+  // admission also survives until replacement FDS revalidates its scope.
+  // Fences pass false and retain no such exception.
   virtual bycorf::Task<absl::Status> CancelInProgressPopulation(
       bool preserve_current_follow_attempt);
   // Graceful process shutdown must resolve even an attempt whose directive

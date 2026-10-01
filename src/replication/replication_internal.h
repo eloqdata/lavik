@@ -902,8 +902,9 @@ struct ReplicaTransactionOwner {
 // state communicates its lifecycle to flow workers; only worker zero reads
 // or publishes ReadyToken and changes the manager's current attempt.
 struct ClusterRebuildContext {
-  ClusterRebuildContext(RebuildDirective directive, PopulationManifest manifest,
-                        DestructiveResetAuthorization authorization)
+  ClusterRebuildContext(
+      RebuildDirective directive, PopulationManifest manifest,
+      std::optional<DestructiveResetAuthorization> authorization = std::nullopt)
       : directive_(std::move(directive)),
         manifest_(std::move(manifest)),
         authorization_(std::move(authorization)),
@@ -932,7 +933,9 @@ struct ClusterRebuildContext {
 
   const RebuildDirective directive_;
   std::optional<PopulationManifest> manifest_;
-  const std::optional<DestructiveResetAuthorization> authorization_;
+  // Installed only by worker zero after source FULL admission, before any
+  // flow task receives this context. Busy waiting never grants reset authority.
+  std::optional<DestructiveResetAuthorization> authorization_;
   std::atomic<ReplicationGroupState> state_{ReplicationGroupState::kRebuilding};
   std::optional<ReadyToken> ready_token_;
   // Worker zero retains this count across fresh transport sessions for the
@@ -1989,6 +1992,10 @@ class ReplicationManager::ReplicationGroup {
                                RebuildDirective directive,
                                PopulationManifest manifest);
 
+  absl::Status AdmitPendingClusterRebuild(
+      const std::shared_ptr<ReplicaSession>& session);
+  Task<absl::Status> CancelPendingClusterRebuild(std::string_view reason);
+
   Task<absl::Status> ApplyClusterRebuildDirective(ReplicaOfConfig upstream,
                                                   RebuildDirective directive,
                                                   PopulationManifest manifest);
@@ -2835,6 +2842,10 @@ class ReplicationManager::ReplicationGroup {
   std::optional<storage::PromotionBase> pending_promotion_;
   std::shared_ptr<ReplicaSession> active_replica_session_;
   std::shared_ptr<ClusterRebuildContext> cluster_rebuild_;
+  // Worker-zero request state is separate from the currently trusted root.
+  // Retain the last request after cancellation to reject stale exact replay.
+  std::shared_ptr<ClusterRebuildContext> pending_cluster_rebuild_;
+  std::shared_ptr<ClusterRebuildContext> last_cluster_rebuild_request_;
   std::optional<detail::RecoveredPopulation> recovered_population_;
   bool recovered_population_fenced_ = false;
   std::uint64_t owner_source_term_ = 0;

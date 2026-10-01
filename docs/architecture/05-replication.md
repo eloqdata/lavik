@@ -146,12 +146,13 @@ successful response can authorize destructive target replacement; a late
 coverage miss in steady following returns the existing protocol-v1 `FULL` mode
 without starting source capture. The target's mode barrier requests fresh
 control admission before either peer starts FULL. The current source admits one
-Meta-managed automatic FollowOwner FULL target session per Group. Other targets
+Meta-managed native FULL target session per Group, shared by automatic
+FollowOwner and explicit population rebuilds. Other targets
 receive a source-scoped `LVFULLBUSY` response before withdrawing trusted
 population evidence or starting capture. They retain their exact desired
 relationship and retry with a cancellable exponential delay capped at one
-second. Explicit population rebuilds share the lifecycle but are not yet subject
-to this quota. CONTINUE, direct-parent partial recovery and established ONLINE
+second. Explicit rebuilds retain the exact directive and completion handle
+while waiting; they do not consume the finite lease-suspension retry budget. CONTINUE, direct-parent partial recovery and established ONLINE
 sessions do not consume a slot. The lifecycle completes only after
 all flows acknowledge the target's complete cut and promotion; an ONLINE
 session no longer owns FULL work. On cancellation, control retirement and FULL
@@ -165,7 +166,11 @@ replacement still cancels and drains exports through the existing fences.
 This quota limits load rather than protecting the last Candidate. The only
 remaining Candidate may enter FULL, and repeated failures can exhaust the
 candidate set. It introduces no durable Meta queue, storage-backend interface,
-or limits on Redis PSYNC or slot migration.
+or limits on Redis PSYNC or slot migration. Protocol-v1 FULL/CONTINUE modes are
+unchanged; `LVFULLBUSY` adds a scoped control error. Targets must support this
+admission contract before enabling a limiting source: older explicit targets
+withdraw their proof before connecting and treat busy as a terminal protocol
+error. Upgrade targets first when mixing these revisions.
 
 ## Roles and lifecycle
 
@@ -326,8 +331,9 @@ directive still names the same local assignment, term, manifest, and partition
 replication epoch. Removing
 that directive or changing the population identity closes serving, joins the
 native session, aborts partial storage, and retires the proof before
-`FullStateApplied`. Control-session loss performs the same barrier for an
-in-progress attempt but retains an already completed matching `ReadyToken`, so
+`FullStateApplied`. Control-session loss performs the same barrier for a
+destructive attempt; it retains a pre-admission request until the next FDS
+revalidates it, and retains an already completed matching `ReadyToken`, so
 a transient reconnect does not itself force a full rebuild.
 An ordinary steady FollowOwner FULL has no rebuild directive. Its exact live
 follow relationship, replica session, and rebuild context instead own the
@@ -609,9 +615,17 @@ immutable stable cut for every declared source flow, and storage finalization
 before publishing a boot-scoped ready token. A sparse manifest never permits a
 sparse physical reset.
 
-`StartClusterRebuildDirective()` consumes this contract in production. It
-calls `BeginRebuild`, retains the resulting destructive-reset capability, and
-revalidates that capability immediately before each storage reset batch. The
+`StartClusterRebuildDirective()` retains a pending immutable directive separately
+from the trusted population. It closes serving and joins old ingress while
+preserving a completed root, Ready proof and applied frontier. Only a successful,
+identity-validated source control response grants FULL admission: worker zero
+then withdraws the old proof, calls `BeginRebuild`, and installs the resulting
+destructive-reset capability before publishing any flow tasks. Each storage
+reset batch revalidates that capability. Busy waiting grants no capability and
+never promotes an unready node to Candidate. Malformed replies, wrong source
+scope and permission failures remain terminal, distinct from FULL busy and the
+bounded source-lease retry. A cancelled pending request is retained as an
+accepted-version watermark so stale exact replay cannot resurrect it. The
 native flows feed reset epochs and manifest handoffs into the same
 `ReplicationGroup`. After the all-flow cut rendezvous, flow zero records the
 complete cut vector and Function-catalog proof before storage promotion. Only
@@ -625,8 +639,12 @@ cancellation/join, proof invalidation, or abort enters a group-identity-bound
 current-boot failure latch: the process remains LOADING and accepts no later
 attempt until restart.
 
-Meta control-session replacement cancels an in-progress population directive
-because that session owned its terminal result channel. It preserves an exact
+Meta control-session replacement cancels a destructive in-progress population
+directive because that session owned its terminal result channel. An explicit
+request still waiting for source admission is preserved until the replacement
+FDS revalidates its exact population scope; a committed fence, directive
+revocation or shutdown cancels and joins it without retiring a still-valid old
+root. Session replacement also preserves an exact
 active steady `FollowOwner` FULL, which is level-triggered by the installed FDS
 rather than a session-scoped directive. The FULL itself rotates the target's
 local replication history and therefore forces the Meta client to reconnect;
