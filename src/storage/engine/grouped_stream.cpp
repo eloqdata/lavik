@@ -607,8 +607,8 @@ struct StorageEngine::Impl::StreamPageAccess {
       if (!added.ok()) co_return added;
       auto admitted = budget.Reserve(1);
       if (!admitted.ok()) co_return admitted.status();
-      // The returned plan owns directory-sized state through publication.
-      // Keep its admission with this command's cache, beyond this coroutine.
+      // Keep the existing conservative routing admission through publication.
+      // Sparse plans allocate only affected intervals inside this bound.
       reservations_.push_back(std::move(*admitted));
       if (changes.empty() && retired.empty()) {
         // A Changed callback can intentionally publish identical metadata
@@ -623,14 +623,15 @@ struct StorageEngine::Impl::StreamPageAccess {
         co_return plan;
       }
       const std::set<std::uint64_t> retired_set(retired.begin(), retired.end());
-      if (!retired_set.empty()) {
-        for (std::size_t i = 0; i < groups.size(); ++i) {
-          if (!retired_set.contains(groups[i].id_) &&
-              (retired_set.contains(groups[i].previous_) ||
-               retired_set.contains(groups[i].next_))) {
-            auto status = co_await Load(i);
-            if (!status.ok()) co_return status;
-          }
+      for (const auto id : retired_set) {
+        const auto index = directory.FindIndex(id);
+        if (!index)
+          co_return absl::DataLossError("missing retired Stream page");
+        for (auto adjacent = *index == 0 ? 0 : *index - 1;
+             adjacent < std::min(*index + 2, groups.size()); ++adjacent) {
+          if (retired_set.contains(groups[adjacent].id_)) continue;
+          auto status = co_await Load(adjacent);
+          if (!status.ok()) co_return status;
         }
       }
       for (auto& change : changes) {

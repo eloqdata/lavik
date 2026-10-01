@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <future>
 #include <tuple>
 
 #include "grouped_write_e2e_support.h"
@@ -25,6 +26,94 @@
 
 namespace {
 using namespace grouped_e2e;
+
+// A one-shot child-process gate makes lock ownership observable independently
+// of disk latency and scheduling. Environment and signal files are scoped to
+// this fixture, including early assertion failures.
+class ListReadGate {
+ public:
+  explicit ListReadGate(const PrivateDisk& disk)
+      : base_(disk.path() + ".read") {
+    if (const auto* old = std::getenv(kVariable)) old_ = old;
+    ::setenv(kVariable, base_.c_str(), 1);
+  }
+  ~ListReadGate() {
+    if (old_)
+      ::setenv(kVariable, old_->c_str(), 1);
+    else
+      ::unsetenv(kVariable);
+    for (const auto* suffix : {"arm", "release"})
+      ::unlink((base_ + "." + suffix).c_str());
+  }
+  void Signal(std::string_view suffix) const {
+    std::ofstream file(base_ + "." + std::string(suffix));
+    Check(file.good(), "create List read gate signal");
+  }
+  bool WaitForReader(const Server& server) const {
+    const auto until = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < until) {
+      if (server.Log().find("grouped List read gate armed") !=
+          std::string::npos)
+        return true;
+      if (!server.Running()) return false;
+      std::this_thread::sleep_for(1ms);
+    }
+    return false;
+  }
+
+ private:
+  static constexpr const char* kVariable = "LAVIK_GROUPED_LIST_READ_GATE";
+  std::string base_;
+  std::optional<std::string> old_;
+};
+
+TEST(GroupedListWriteE2e, SuspendedReadersReleaseWorkerState) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires grouped List read gate";
+#endif
+  const std::string value(17000, 'v');
+  for (const auto& command :
+       std::vector<std::vector<std::string>>{{"LINDEX", "list", "0"},
+                                             {"LRANGE", "list", "0", "0"},
+                                             {"LPOS", "list", value}}) {
+    SCOPED_TRACE(command.front());
+    PrivateDisk disk;
+    ListReadGate gate(disk);
+    // Destroy the server before async futures even on assertion failure, so
+    // a held socket cannot hang std::async's joining destructor.
+    std::future<Reply> held, concurrent;
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"RPUSH", "list", value}).text_, "1");
+    client.Durable();
+    gate.Signal("arm");
+    held = std::async(std::launch::async, [port = server.port(), command] {
+      Client reader(port);
+      return reader.Command(command);
+    });
+    ASSERT_TRUE(gate.WaitForReader(server)) << server.Log();
+    concurrent = std::async(std::launch::async, [port = server.port(), value] {
+      Client other(port);
+      Check(other.Command({"LINDEX", "list", "0"}).text_ == value,
+            "concurrent read changed value");
+      return other.Command({"SET", "unrelated", "written"});
+    });
+    ASSERT_EQ(concurrent.wait_for(5s), std::future_status::ready)
+        << server.Log();
+    EXPECT_EQ(concurrent.get().text_, "OK");
+    EXPECT_EQ(held.wait_for(0s), std::future_status::timeout);
+    gate.Signal("release");
+    ASSERT_EQ(held.wait_for(5s), std::future_status::ready) << server.Log();
+    const auto reply = held.get();
+    if (command.front() == "LRANGE") {
+      ASSERT_EQ(reply.items_.size(), 1);
+      EXPECT_EQ(reply.items_[0].text_, value);
+    } else {
+      EXPECT_EQ(reply.text_, command.front() == "LPOS" ? "0" : value);
+    }
+    EXPECT_EQ(client.Command({"GET", "unrelated"}).text_, "written");
+  }
+}
 
 TEST(GroupedDemotionE2e, StringListSetSortedSetGeoAndStreamRecoverCompact) {
   PrivateDisk disk;

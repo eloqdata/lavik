@@ -1280,10 +1280,10 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (i + 1 != metadata.size()) selected.insert(i + 1);
     }
     GroupedScratchBudget budget;
-    if (metadata.size() > std::numeric_limits<std::size_t>::max() / 128)
+    if (selected.size() > std::numeric_limits<std::size_t>::max() / 128)
       co_return absl::ResourceExhaustedError(
           "Sorted Set page metadata overflow");
-    status = budget.AddBytes(metadata.size() * 128);
+    status = budget.AddBytes(selected.size() * 128);
     if (!status.ok()) co_return status;
     for (const auto i : selected) {
       status = add_page_budget(&budget, i);
@@ -1321,54 +1321,72 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       std::size_t write_;
     };
     std::vector<Route> route;
-    route.reserve(metadata.size());
+    route.reserve(selected.size());
     auto next_id = directory.root().next_group_id_;
-    // Only routing identities scale with group count. Unmodified page payloads
-    // never enter this planner, and erased ids retain explicit marker records.
-    for (std::size_t i = 0; i < metadata.size(); ++i) {
-      if (!modified.contains(i)) {
-        route.push_back({metadata[i].id_, i, kNoPage});
-        continue;
+    std::uint64_t page_count = metadata.size();
+    // Every modified page has its immediate neighbours in selected. Process
+    // contiguous selected intervals independently: gaps contain only unchanged
+    // links, so neither their routing entries nor payloads need rebuilding.
+    for (auto selected_it = selected.begin(); selected_it != selected.end();) {
+      const auto begin = *selected_it++;
+      auto end = begin + 1;
+      while (selected_it != selected.end() && *selected_it == end) {
+        ++selected_it;
+        ++end;
       }
-      auto page = std::move(loaded.at(i));
-      if (page.entries_.empty()) {
-        page.retired_ = true;
-        page.previous_ = page.next_ = 0;
-        plan.writes_.push_back(std::move(page));
-        continue;
+      route.clear();
+      for (std::size_t i = begin; i < end; ++i) {
+        if (!modified.contains(i)) {
+          route.push_back({metadata[i].id_, i, kNoPage});
+          continue;
+        }
+        auto page = std::move(loaded.at(i));
+        if (page.entries_.empty()) {
+          page.retired_ = true;
+          page.previous_ = page.next_ = 0;
+          plan.writes_.push_back(std::move(page));
+          continue;
+        }
+        std::sort(page.entries_.begin(), page.entries_.end(), OrderedEntryLess);
+        auto split = SplitOrderedGroup(std::move(page), next_id);
+        if (!split.ok()) co_return split.status();
+        next_id = split->next_group_id_;
+        for (auto& part : split->groups_) {
+          route.push_back({part.id_, i, plan.writes_.size()});
+          plan.writes_.push_back(std::move(part));
+        }
       }
-      std::sort(page.entries_.begin(), page.entries_.end(), OrderedEntryLess);
-      auto split = SplitOrderedGroup(std::move(page), next_id);
-      if (!split.ok()) co_return split.status();
-      next_id = split->next_group_id_;
-      for (auto& part : split->groups_) {
-        route.push_back({part.id_, i, plan.writes_.size()});
-        plan.writes_.push_back(std::move(part));
+      // A non-global interval includes an unchanged boundary neighbour. The
+      // global empty result was handled above by deleting the complete key.
+      if (route.empty())
+        co_return absl::DataLossError("empty Sorted Set selected interval");
+      page_count = page_count - (end - begin) + route.size();
+      for (std::size_t i = 0; i < route.size(); ++i) {
+        auto& at = route[i];
+        const auto previous =
+            i == 0 ? metadata[begin].previous_ : route[i - 1].id_;
+        const auto following =
+            i + 1 == route.size() ? metadata[end - 1].next_ : route[i + 1].id_;
+        if (at.write_ == kNoPage) {
+          const auto& old = metadata[at.source_];
+          if (old.previous_ == previous && old.next_ == following) continue;
+          const auto neighbor = loaded.find(at.source_);
+          if (neighbor == loaded.end())
+            co_return absl::DataLossError(
+                "Sorted Set changed link lacks admitted neighbour");
+          at.write_ = plan.writes_.size();
+          plan.writes_.push_back(std::move(neighbor->second));
+        }
+        plan.writes_[at.write_].previous_ = previous;
+        plan.writes_[at.write_].next_ = following;
       }
+      if (begin == 0) plan.root_.first_group_ = route.front().id_;
+      if (end == metadata.size()) plan.root_.last_group_ = route.back().id_;
     }
-    if (route.empty() ||
-        route.size() > std::numeric_limits<std::uint32_t>::max())
+    if (page_count == 0 ||
+        page_count > std::numeric_limits<std::uint32_t>::max())
       co_return absl::DataLossError("invalid Sorted Set resulting page count");
-    for (std::size_t i = 0; i < route.size(); ++i) {
-      auto& at = route[i];
-      const auto previous = i == 0 ? 0 : route[i - 1].id_;
-      const auto following = i + 1 == route.size() ? 0 : route[i + 1].id_;
-      if (at.write_ == kNoPage) {
-        const auto& old = metadata[at.source_];
-        if (old.previous_ == previous && old.next_ == following) continue;
-        const auto neighbor = loaded.find(at.source_);
-        if (neighbor == loaded.end())
-          co_return absl::DataLossError(
-              "Sorted Set changed link lacks admitted neighbour");
-        at.write_ = plan.writes_.size();
-        plan.writes_.push_back(std::move(neighbor->second));
-      }
-      plan.writes_[at.write_].previous_ = previous;
-      plan.writes_[at.write_].next_ = following;
-    }
-    plan.root_.first_group_ = route.front().id_;
-    plan.root_.last_group_ = route.back().id_;
-    plan.root_.group_count_ = route.size();
+    plan.root_.group_count_ = page_count;
     plan.root_.next_group_id_ = next_id;
     if (prepared != nullptr) {
       prepared->pages_ = std::move(*working_admission);

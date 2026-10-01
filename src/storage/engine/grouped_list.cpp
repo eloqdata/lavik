@@ -305,7 +305,29 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     };
     std::vector<LoadedOrderedGroup> loaded;
     loaded.reserve(end_page - begin_page);
-    for (std::size_t i = begin_page; i < end_page; ++i) {
+    std::optional<LoadedOrderedGroup> set_page;
+    bool same_size_set = false;
+    if (operation.kind_ == ListOperationKind::kSet) {
+      if (prepared != nullptr) co_await bycorf::Yield(*store.worker_);
+      auto page = co_await LoadOrderedGroupSnapshot(
+          store, partition, db_id, key, digest, object,
+          directory.groups()[first->group_index_].id_);
+      if (!page.ok()) co_return page.status();
+      if (first->offset_ >= page->snapshot_.entries_.size())
+        co_return absl::DataLossError("List replacement rank exceeds page");
+      same_size_set = page->snapshot_.entries_[first->offset_].value_.size() ==
+                      operation.value_.size();
+      set_page.emplace(std::move(*page));
+      // The splice planner verifies that an equal-sized replacement preserves
+      // the complete page and links. Retain the conservative page admission,
+      // but avoid reading neighbours whose contents cannot affect this write.
+      if (same_size_set) loaded.push_back(std::move(*set_page));
+    }
+    for (std::size_t i = begin_page; !same_size_set && i < end_page; ++i) {
+      if (set_page && i == first->group_index_) {
+        loaded.push_back(std::move(*set_page));
+        continue;
+      }
       if (prepared != nullptr) co_await bycorf::Yield(*store.worker_);
       auto page = co_await LoadOrderedGroupSnapshot(store, partition, db_id,
                                                     key, digest, object,
