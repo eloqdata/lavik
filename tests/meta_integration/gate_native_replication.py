@@ -338,6 +338,11 @@ def follow_full_limit(root):
             "LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "10000",
             "LAVIK_REPLICATION_FULLSYNC_PAUSE_ARM_FILE": str(arm),
         }
+        continue_key = "quota-continue-{foo}"
+        healthy.environment = {
+            **os.environ,
+            "LAVIK_REPLICATION_CANCEL_PEER_FLOW_AFTER_COMMAND_APPLY_ONCE": continue_key,
+        }
         writer = None
         try:
             fixture.start_created()
@@ -360,8 +365,6 @@ def follow_full_limit(root):
                 lambda: "connected_slaves:1\r\n"
                 in C.redis_call(source, ["INFO", "replication"]),
             )
-            healthy_connections = writer.call("CLIENT", "LIST", "TYPE", "replica")
-            connection_id = healthy_connections.splitlines()[0].split()[0].split("=")[1]
             arm.touch()
             source_log_start = len(Path(source.log_path).read_text())
             first.start()
@@ -390,7 +393,15 @@ def follow_full_limit(root):
             continue_before = (
                 Path(source.log_path).read_text().count("selected=CONTINUE")
             )
-            assert writer.call("CLIENT", "KILL", "ID", connection_id) == 1
+            # Trigger the healthy target's own existing cancellation seam. A
+            # cached source CLIENT id can retire during unrelated reconnects.
+            assert writer.call("SET", continue_key, "reconnect") == "OK"
+            H.wait_until(
+                "healthy follower cancels its own native session",
+                5,
+                lambda: "injected peer-flow session cancellation after command apply"
+                in Path(healthy.log_path).read_text(),
+            )
             H.wait_until(
                 "healthy follower continues beside FULL",
                 5,
@@ -415,7 +426,11 @@ def follow_full_limit(root):
             H.wait_until(
                 "waiting follower admitted after source work drains",
                 60,
-                lambda: C.readonly_get(second, "quota-{foo}") == "before-full",
+                lambda: "durably activated population"
+                in Path(second.log_path).read_text()[second_log_start:]
+                and "master_link_status:up\r\n"
+                in C.redis_call(second, ["INFO", "replication"])
+                and C.readonly_get(second, "quota-{foo}") == "before-full",
             )
             H.wait_until(
                 "FULL quota released while completed exports remain ONLINE",
@@ -431,7 +446,14 @@ def follow_full_limit(root):
                     20,
                     lambda: C.readonly_get(first, "quota-{foo}") == "before-full",
                 )
-            C.redis_call(source, ["SET", "quota-{foo}", "after-full"])
+            # Readable retained data and source slot release do not establish
+            # a new causal serving lease after Meta replacement.
+            H.wait_until(
+                "source serving authority after control replacement",
+                20,
+                lambda: C.redis_call(source, ["SET", "quota-{foo}", "after-full"])
+                == "OK",
+            )
             H.wait_until(
                 "healthy and rebuilt followers receive tail",
                 20,
