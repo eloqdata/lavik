@@ -2844,6 +2844,9 @@ class ReplicationManager::ReplicationGroup {
   std::shared_ptr<ClusterRebuildContext> cluster_rebuild_;
   // Worker-zero request state is separate from the currently trusted root.
   // Retain the last request after cancellation to reject stale exact replay.
+  // A start owns teardown before it can publish pending request identity.
+  // Strong fences and replacement desired state join this publication edge.
+  bool cluster_rebuild_starting_ = false;
   std::shared_ptr<ClusterRebuildContext> pending_cluster_rebuild_;
   std::shared_ptr<ClusterRebuildContext> last_cluster_rebuild_request_;
   std::optional<detail::RecoveredPopulation> recovered_population_;

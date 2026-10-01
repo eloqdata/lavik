@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -1186,14 +1187,16 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
                                    unsigned expected_connections,
                                    absl::StatusCode expected_terminal,
                                    bool full_busy = false,
-                                   bool cancel_busy = false)
+                                   bool cancel_busy = false,
+                                   std::filesystem::path transition_hold = {})
       : storage_(storage),
         replication_(replication),
         source_(source),
         expected_connections_(expected_connections),
         expected_terminal_(expected_terminal),
         full_busy_(full_busy),
-        cancel_busy_(cancel_busy) {}
+        cancel_busy_(cancel_busy),
+        transition_hold_(std::move(transition_hold)) {}
 
   void Prepare(unsigned thread_count) override {
     if (thread_count != 1) {
@@ -1210,6 +1213,10 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
       replication_->StorageReady(worker);
       result_ = co_await Exercise(worker);
     }
+    if (!transition_hold_.empty()) std::filesystem::remove(transition_hold_);
+    while (tasks_running_ != 0) {
+      (co_await bycorf::SleepFor(worker, 1ms)).IgnoreError();
+    }
     replication_->RequestShutdown();
     const absl::Status quiesced = co_await replication_->QuiesceForShutdown();
     if (result_.ok() && !quiesced.ok()) result_ = quiesced;
@@ -1221,6 +1228,20 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
+  bycorf::Task<absl::Status> StartReplacement(
+      lavik::ReplicaOfConfig upstream, lavik::RebuildDirective directive,
+      lavik::PopulationManifest manifest) {
+    replacement_.emplace(co_await replication_->StartClusterRebuildDirective(
+        std::move(upstream), std::move(directive), std::move(manifest)));
+    --tasks_running_;
+    co_return absl::OkStatus();
+  }
+  bycorf::Task<absl::Status> FenceReplacement() {
+    fence_.emplace(
+        co_await replication_->CancelInProgressClusterPopulation(false));
+    --tasks_running_;
+    co_return absl::OkStatus();
+  }
   bycorf::Task<absl::Status> Exercise(bycorf::Worker& worker) {
     if (source_->port() == 0 || source_->error() != 0) {
       co_return TestFailure("scripted native source failed to start");
@@ -1272,9 +1293,53 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
         co_return TestFailure(
             "exact busy directive replay did not retain its attempt");
       if (cancel_busy_) {
-        const auto cancelled =
-            co_await replication_->CancelInProgressClusterPopulation(false);
-        if (!cancelled.ok()) co_return cancelled;
+        if (transition_hold_.empty()) {
+          const auto cancelled =
+              co_await replication_->CancelInProgressClusterPopulation(false);
+          if (!cancelled.ok()) co_return cancelled;
+        } else {
+          // Hold a superseding start across its teardown suspension. A second
+          // start must be excluded, and a strong fence must join publication.
+          {
+            std::ofstream hold(transition_hold_);
+          }
+          auto replacement = directive;
+          ++replacement.identity_.directive_revision_;
+          replacement.identity_.attempt_id_ = "replacement-attempt";
+          ++tasks_running_;
+          worker.Spawn(StartReplacement(upstream, replacement, *manifest));
+          const auto deadline = std::chrono::steady_clock::now() + 5s;
+          while (!std::filesystem::exists(transition_hold_.string() + ".ack")) {
+            if (std::chrono::steady_clock::now() >= deadline)
+              co_return TestFailure("replacement did not reach start barrier");
+            (co_await bycorf::SleepFor(worker, 1ms)).IgnoreError();
+          }
+          auto newer = replacement;
+          ++newer.identity_.directive_revision_;
+          newer.identity_.attempt_id_ = "overlapping-attempt";
+          auto overlap = co_await replication_->StartClusterRebuildDirective(
+              upstream, newer, *manifest);
+          if (overlap.ok())
+            co_return TestFailure("concurrent rebuild starts overlapped");
+          ++tasks_running_;
+          worker.Spawn(FenceReplacement());
+          (co_await bycorf::SleepFor(worker, 20ms)).IgnoreError();
+          if (fence_.has_value())
+            co_return TestFailure("strong fence escaped unpublished rebuild");
+          std::filesystem::remove(transition_hold_);
+          while (tasks_running_ != 0) {
+            (co_await bycorf::SleepFor(worker, 1ms)).IgnoreError();
+          }
+          if (!replacement_->ok()) co_return replacement_->status();
+          if (!fence_->ok()) co_return *fence_;
+          if ((co_await (**replacement_).Await()).code() !=
+              absl::StatusCode::kCancelled)
+            co_return TestFailure("strong fence left replacement alive");
+          auto stale = co_await replication_->StartClusterRebuildDirective(
+              upstream, replacement, *manifest);
+          if (stale.ok())
+            co_return TestFailure("fenced replacement was resurrected");
+        }
       }
     }
     const absl::Status terminal = co_await started->Await();
@@ -1324,6 +1389,10 @@ class TargetLeaseAdmissionRetryService final : public bycorf::Service {
   StallingNativeSource* source_ = nullptr;
   unsigned expected_connections_ = 0;
   absl::StatusCode expected_terminal_ = absl::StatusCode::kUnknown;
+  std::filesystem::path transition_hold_;
+  unsigned tasks_running_ = 0;
+  std::optional<absl::StatusOr<lavik::ClusterRebuildCompletion>> replacement_;
+  std::optional<absl::Status> fence_;
   bool full_busy_ = false;
   bool cancel_busy_ = false;
   absl::Status result_ = absl::OkStatus();
@@ -5742,13 +5811,27 @@ void RunTargetLeaseAdmissionRetryCase(unsigned suspended_responses,
                                       absl::StatusCode expected_terminal,
                                       std::string_view directory_name,
                                       bool full_busy = false,
-                                      bool cancel_busy = false) {
+                                      bool cancel_busy = false,
+                                      bool concurrent_start = false) {
   const std::string expected_node_id(40, '9');
   constexpr std::uint16_t kReplicationPort = 6380;
   lavik::test::TempDirectory directory{std::string(directory_name)};
   const std::filesystem::path data = directory.path() / "node.data";
   lavik::test::CreateDataFile(data, 128 * kMiB);
 
+  std::filesystem::path transition_hold;
+  struct FaultReset {
+    ~FaultReset() {
+      ::unsetenv("LAVIK_REBUILD_START_HOLD_FILE");
+      ::unsetenv("LAVIK_REBUILD_START_ACK_FILE");
+    }
+  } fault_reset;
+  if (concurrent_start) {
+    transition_hold = directory.path() / "transition.hold";
+    ::setenv("LAVIK_REBUILD_START_HOLD_FILE", transition_hold.c_str(), 1);
+    ::setenv("LAVIK_REBUILD_START_ACK_FILE",
+             (transition_hold.string() + ".ack").c_str(), 1);
+  }
   std::string busy_reply;
   if (full_busy) {
     std::string group;
@@ -5781,7 +5864,7 @@ void RunTargetLeaseAdmissionRetryCase(unsigned suspended_responses,
 
   TargetLeaseAdmissionRetryService service(
       &storage, &replication, &source, expected_connections, expected_terminal,
-      full_busy, cancel_busy);
+      full_busy, cancel_busy, transition_hold);
   bycorf::Server server;
   server.AddService(&service);
   bycorf::ServerOptions runtime;
@@ -5818,6 +5901,12 @@ TEST(ReplicationManagerIntegrationTest,
      PopulationTargetFullBusyCancellationPreservesReady) {
   RunTargetLeaseAdmissionRetryCase(100, 2, absl::StatusCode::kCancelled,
                                    "target-full-busy-cancel", true, true);
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     PopulationFenceJoinsUnpublishedBusyReplacement) {
+  RunTargetLeaseAdmissionRetryCase(100, 2, absl::StatusCode::kCancelled,
+                                   "target-full-busy-race", true, true, true);
 }
 
 TEST(ReplicationManagerIntegrationTest,

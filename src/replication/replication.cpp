@@ -1140,10 +1140,27 @@ auto ReplicationManager::ReplicationGroup::StartClusterRebuildDirective(
   absl::Status validated = cluster_group_->ValidateRebuild(directive, manifest);
   if (!validated.ok()) co_return validated;
 
+  // Own the transition before cancellation can suspend. Concurrent starts
+  // must not publish a newer request while this caller joins the old one.
+  replica_reconfiguration_running_ = true;
+  cluster_rebuild_starting_ = true;
+  auto finish_start = absl::MakeCleanup([this] {
+    cluster_rebuild_starting_ = false;
+    replica_reconfiguration_running_ = false;
+  });
+  LAVIK_FAULT_INJECT(
+      const char* hold = std::getenv("LAVIK_REBUILD_START_HOLD_FILE");
+      if (hold != nullptr && ::access(hold, F_OK) == 0) {
+        auto signalled = SignalFaultBarrier("LAVIK_REBUILD_START_ACK_FILE",
+                                            "rebuild start barrier");
+        if (!signalled.ok()) co_return signalled;
+        auto paused = co_await fault_injection::PauseWhileFileExists(
+            "LAVIK_REBUILD_START_HOLD_FILE");
+        if (!paused.ok()) co_return paused;
+      });
   auto cancelled =
       co_await CancelPendingClusterRebuild("rebuild admission superseded");
   if (!cancelled.ok()) co_return cancelled;
-  replica_reconfiguration_running_ = true;
   StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
   storage_->SetExpirationAuthority(false);
   // Stop old apply work while preserving its completed population and frontier.
@@ -4622,6 +4639,17 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFollowOwner(
         "follow-owner reconciliation stopped for process shutdown");
   }
 
+  // A pending explicit start may still be joining old ingress. Let it publish
+  // before replacing the relationship so it cannot appear after this FDS.
+  while (cluster_rebuild_starting_) {
+    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                            std::chrono::milliseconds(1));
+    if (!waited.ok()) co_return waited;
+  }
+  if (cluster_control_stopping_)
+    co_return absl::CancelledError(
+        "follow reconciliation stopped during start");
+
   std::shared_ptr<ClusterFollowOwnerContext> next;
   if (desired.has_value()) {
     auto normalized = NormalizeClusterFollowOwner(std::move(*desired));
@@ -4778,13 +4806,15 @@ auto ReplicationManager::ReplicationGroup::RetireClusterPopulation(
         "population reconciliation requires Meta-managed population mode");
   }
 
-  // Automatic teardown owns the same session/root cleanup. Joining it first
-  // prevents two coroutines from aborting one in-place candidate.
+  // Join teardown and any start that has not yet published its request. A
+  // strong fence must observe/cancel that request before acknowledging; the
+  // older Ready root alone cannot prove that no new admission is in flight.
   for (;;) {
     bool teardown_running = false;
     {
       AssertStateOwner();
-      teardown_running = replica_session_teardown_running_;
+      teardown_running =
+          replica_session_teardown_running_ || cluster_rebuild_starting_;
     }
     if (!teardown_running) break;
     absl::Status waited = co_await bycorf::SleepFor(
@@ -7338,6 +7368,19 @@ auto ReplicationManager::ReplicationGroup::TryPartialReparent(
 auto ReplicationManager::ReplicationGroup::RunReplicaSession(
     const ReplicaOfConfig& upstream, std::uint64_t role_epoch,
     const std::shared_ptr<ReplicaSession>& session) -> Task<absl::Status> {
+  LAVIK_FAULT_INJECT(
+      const char* hold = std::getenv("LAVIK_TEST_NATIVE_ADMISSION_HOLD_FILE");
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      while (hold != nullptr && ::access(hold, F_OK) == 0) {
+        if (session->cancelled() || replication_shutdown_requested_)
+          co_return absl::CancelledError("native admission fault cancelled");
+        if (std::chrono::steady_clock::now() >= deadline)
+          co_return absl::DeadlineExceededError("native admission fault held");
+        auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                                std::chrono::milliseconds(1));
+        if (!waited.ok()) co_return waited;
+      });
   auto partial = co_await TryPartialReparent(session);
   if (!partial.ok()) co_return partial;
   auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
