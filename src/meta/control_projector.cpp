@@ -460,12 +460,22 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
             (node_id == mixed || node_id == source.record_.owner_)) {
           for (const auto& operation : stores.operation_.LiveOperationsView()) {
             for (const auto& current : operation.current_directives_) {
-              if (current.spec_.group_id_ == source.group_id_ &&
+              if (current.spec_.group_id_ != source.group_id_) continue;
+              // Install source FollowOwner before its authorize receipt lets
+              // either target dial. Enabling it only alongside target rebuilds
+              // races the first export with source relationship replacement.
+              const bool preparing_source =
+                  node_id == source.record_.owner_ &&
+                  current.spec_.recipient_node_id_ == node_id &&
+                  current.spec_.target_node_id_ == mixed &&
+                  current.spec_.kind_ == kMetaDirectiveAuthorizeSource;
+              const bool ready_target =
+                  node_id == mixed &&
                   current.spec_.recipient_node_id_ == mixed &&
                   current.spec_.kind_ == kMetaDirectiveRebuild &&
-                  ClusterCreateDirectiveReady(operation, current)) {
+                  ClusterCreateDirectiveReady(operation, current);
+              if (preparing_source || ready_target)
                 projected.steady_replication_enabled = true;
-              }
             }
           }
         });
