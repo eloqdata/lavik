@@ -2004,7 +2004,9 @@ def main():
             full_completion_reconnect(root)
             follow_full_limit(root)
             explicit_full_limit(root)
-            mixed_full_limit(root)
+            # Meta's test hooks follow its own Debug build policy.
+            if C.has_fault(C.META, b"LAVIK_TEST_MIXED_FULL_FOLLOW_NODE"):
+                mixed_full_limit(root)
             full_tail_publish_before_reset(root)
             full_tail_expiration_effects(root)
             small_receive_window(root)

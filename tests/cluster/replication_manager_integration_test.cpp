@@ -5953,6 +5953,9 @@ TEST(ReplicationManagerIntegrationTest,
 
 TEST(ReplicationManagerIntegrationTest,
      PopulationFenceJoinsUnpublishedBusyReplacement) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires rebuild transition barriers";
+#endif
   RunTargetLeaseAdmissionRetryCase(100, 2, absl::StatusCode::kCancelled,
                                    "target-full-busy-race", true, true, true);
 }
