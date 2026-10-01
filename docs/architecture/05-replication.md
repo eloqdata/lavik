@@ -143,8 +143,9 @@ it does not block an operating-system worker thread.
 Each native target session owns one FULL lifecycle shared by its control
 connection and every source flow. Control admits a known FULL before its
 successful response can authorize destructive target replacement; a late
-coverage miss in steady following returns `RETRYFULL`, causing a fresh control
-admission before either peer starts FULL. The current source admits one
+coverage miss in steady following returns the existing protocol-v1 `FULL` mode
+without starting source capture. The target's mode barrier requests fresh
+control admission before either peer starts FULL. The current source admits one
 Meta-managed automatic FollowOwner FULL target session per Group. Other targets
 receive a source-scoped `LVFULLBUSY` response before withdrawing trusted
 population evidence or starting capture. They retain their exact desired

@@ -5471,7 +5471,7 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
                                            "coverage-miss flow response");
     if (!miss_mode.ok()) co_return miss_mode.status();
     const bool miss_requires_admission =
-        miss_mode->ends_with(" RETRYFULL") &&
+        miss_mode->ends_with(" FULL") &&
         (co_await replication_->Observe()).full_sync_sessions_ == 1;
 
     reconciled = co_await replication_->ReconcileClusterFollowOwner(desired);

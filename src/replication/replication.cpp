@@ -8035,36 +8035,17 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
   const bool valid_size = response_words.size() == 4 || ack_ranges;
   const bool fullsync = valid_size && response_words[3] == "FULL";
   const bool continue_mode = valid_size && response_words[3] == "CONTINUE";
-  const bool retry_full =
-      valid_size && response_words[3] == "RETRYFULL" &&
-      session->cluster_follow_ != nullptr &&
-      session->cluster_rebuild_ != nullptr &&
-      session->cluster_rebuild_->state_.load(std::memory_order_acquire) ==
-          ReplicationGroupState::kReady &&
-      !session->destructive_root_started_.load(std::memory_order_acquire);
   if (!response.ok() || !valid_size || response_words[0] != "+LVFLOW" ||
       !ParseUnsigned(response_words[1], &response_session_id) ||
       response_session_id != session->session_id_ ||
       !ParseUnsigned(response_words[2], &response_flow_id) ||
-      response_flow_id != flow_id ||
-      (!fullsync && !continue_mode && !retry_full)) {
+      response_flow_id != flow_id || (!fullsync && !continue_mode)) {
     session->sockets_.Remove(fd);
     stream.Close().IgnoreError();
     session->Cancel();
     co_return response.ok()
         ? absl::InvalidArgumentError("invalid LVFLOW response")
         : response.status();
-  }
-  if (retry_full) {
-    // Any flow may observe the collective miss first. Set the next control
-    // request before cancelling siblings, so cancellation cannot lose it.
-    session->cluster_follow_->force_full_.store(true,
-                                                std::memory_order_release);
-    session->sockets_.Remove(fd);
-    stream.Close().IgnoreError();
-    session->Cancel();
-    co_return absl::UnavailableError(
-        "steady Owner requires fresh FULL admission");
   }
   absl::Status selected = session->SelectFlowMode(flow_id, fullsync);
   if (!selected.ok()) {
@@ -12002,10 +11983,12 @@ auto ReplicationManager::ReplicationGroup::ServeMasterFlow(
   if (!selected_continue_mode && session->allow_continue_ &&
       session->steady_export_.has_value()) {
     // Coverage was lost after control admitted a possible continuation. The
-    // target still owns its trusted root: force a new control admission before
-    // either side starts FULL, even if this source's quota is currently free.
+    // target still owns its trusted root: its existing v1 FULL mode barrier
+    // requests fresh control admission before mutation. Return only that mode;
+    // no capture or publisher starts here, even if the quota is currently free.
+    // Keeping FULL (rather than a new mode) also lets older v1 followers retry.
     const std::string reply =
-        absl::StrCat("+LVFLOW ", session_id, " ", flow_id, " RETRYFULL",
+        absl::StrCat("+LVFLOW ", session_id, " ", flow_id, " FULL",
                      ack_ranges ? " ACKRANGE\r\n" : "\r\n");
     absl::Status sent = co_await WriteText(stream, reply);
     session->ClearFlow(flow_id, stream.NativeFd());
