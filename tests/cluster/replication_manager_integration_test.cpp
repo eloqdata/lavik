@@ -5334,6 +5334,31 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
       };
     };
 
+    // Closing control before any flow connects must retire its FULL owner
+    // promptly, rather than waiting for the ten-minute flow-stall timeout.
+    auto abandoned = OpenPeer(worker);
+    if (!abandoned.ok()) co_return abandoned.status();
+    RequestResult abandoned_control;
+    worker.Spawn(RunNativeRequest(
+        abandoned->stream_,
+        control_args(std::string(40, '1'), "target-assignment-1",
+                     std::string(40, '5'), std::string(40, '3'), false),
+        100, &abandoned_control));
+    auto abandoned_reply = co_await ReadPeerLine(
+        worker, abandoned->peer_fd_, "abandoned FULL control response");
+    if (!abandoned_reply.ok()) co_return abandoned_reply.status();
+    if (!abandoned_reply->starts_with("+LVFULLRESYNC ") ||
+        (co_await replication_->Observe()).full_sync_sessions_ != 1) {
+      co_return TestFailure("control did not own FULL before flow startup");
+    }
+    (void)::shutdown(abandoned->peer_fd_, SHUT_RDWR);
+    waited = co_await WaitDone(worker, abandoned_control,
+                               "abandoned FULL control cleanup");
+    if (!waited.ok()) co_return waited;
+    if ((co_await replication_->Observe()).full_sync_sessions_ != 0) {
+      co_return TestFailure("abandoned control retained FULL after drain");
+    }
+
     auto first = OpenPeer(worker);
     auto second = OpenPeer(worker);
     if (!first.ok()) co_return first.status();
