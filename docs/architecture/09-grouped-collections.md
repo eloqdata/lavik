@@ -124,8 +124,8 @@ payloads. The incarnation and value revision remain unchanged; the new root
 advances command order and changes expiry while sharing the exact routing
 directory and physical index pages. An object's current command sequence comes
 from its root version, so a shared directory can retain an earlier command
-sequence. Such a root inherits the preceding durable decision before an
-independent transaction can publish it, and snapshot/undo views retain their
+sequence. Such a root retains a dependency on the preceding decision before an
+independent transaction can commit it, and snapshot/undo views retain their
 own historical root expiry. Immediate expiration uses the ordinary
 tombstone/graph retirement path.
 
@@ -154,6 +154,20 @@ Detaching that population advances its generation; resetting another partition
 or promoting an already-built candidate does not invalidate its retained
 views. The broader worker index generation remains an independent guard for
 ordinary suspended storage operations.
+
+Owner-local standalone predecessors enter the commit queue before releasing
+key locks. Successors may stage changed pages and publish readable in-memory
+roots while those decisions are pending. Receipts retain the predecessor
+failure decisions, so the background commit waits for predecessor durability
+before appending the successor decision. A shared commit batch flushes its
+appended predecessor frontier before processing a dependent successor,
+including across block rollover. Failed ancestors prevent descendant commits;
+recovery cannot accept a root inheriting pages from an uncommitted ancestor.
+Borrowed EXEC/Lua predecessors whose coordinator is not known to be the local
+queue retain the foreground dependency wait. Standalone compact demotion also
+retains that boundary because it appends an untagged complete value without a
+queued receipt. Ordinary compact SET/GET and
+pending-buffer reads do not acquire grouped predecessor dependencies.
 
 ## Durable graph and publication
 

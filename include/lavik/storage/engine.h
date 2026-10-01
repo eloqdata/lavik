@@ -1083,6 +1083,7 @@ class MutationPrecondition {
 // coordinator owns one per shard; each shard writes only its own entry, so
 // no synchronization is needed.
 struct GroupedCommitDecision;
+struct GroupedCommitDependency;
 
 struct TxShardWrites {
   // Command-lifetime cache only. It avoids rereading a large immutable key
@@ -1163,6 +1164,12 @@ struct TxShardWrites {
   // Retained views can await the durable decision after command locks are
   // released; compact-only transactions allocate no dependency object.
   std::shared_ptr<GroupedCommitDecision> grouped_decision_;
+  // Pending owner-local predecessors already belong to that owner's commit
+  // queue. Retain their decisions instead of holding the key until disk I/O
+  // completes. The common one-key case adds no allocation; additional unique
+  // predecessors use admitted, shared links across command-batch receipts.
+  std::shared_ptr<GroupedCommitDecision> grouped_predecessor_;
+  std::shared_ptr<GroupedCommitDependency> grouped_dependencies_;
   // A pull-based collection restore shares one uncommitted command decision
   // across all its page writes. Only its owner may commit this borrowed batch
   // at complete EOF; ordinary grouped commands leave the pointer null.

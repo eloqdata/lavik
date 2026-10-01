@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "grouped_dependency_guard.h"
 #include "impl.h"
 
 namespace lavik::storage {
@@ -59,11 +60,12 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
                            : MutationPrecondition{});
     tx = &standalone;
   }
-  // No auxiliary is rewritten, but a new independent root cannot inherit
-  // pages whose preceding transaction is still undecided. A shared outer
-  // transaction is already one causal decision and never waits on itself.
+  // No auxiliary is rewritten, but this root still inherits the preceding
+  // graph's commit dependency. Owner-local writes defer that dependency to
+  // commit; a shared outer transaction is one decision and never awaits itself.
+  GroupedDependencyGuard dependency_guard(*tx, outer_transaction);
   const auto dependency =
-      co_await AwaitGroupedDependencyLocked(store, previous, tx->txid_);
+      co_await PrepareGroupedDependencyLocked(store, previous, tx);
   if (!dependency.ok()) co_return dependency;
   if (EffectiveRecordDbEpoch(partition, db_id) != db_epoch ||
       partition.replication_epoch_ != replication_epoch ||
@@ -95,7 +97,7 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
     payload = EncodeGroupedHashRoot(previous->directory().root());
   }
   if (!payload.ok()) co_return payload.status();
-  auto decision = PrepareGroupedDecision(*tx);
+  auto decision = PrepareGroupedDecision(*tx, !outer_transaction);
   if (!decision.ok()) co_return decision.status();
   auto reserved = side.PreparePublish(key, side.CurrentForMutation(key));
   if (!reserved.ok()) co_return reserved.status();
@@ -137,9 +139,13 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
       previous->version().root_.logical_size_, nullptr, nullptr, replication,
       true, nullptr, mutation_precondition, &mutation);
   if (!appended.ok()) {
-    if (store.write_failed_) (*decision)->FailPending();
+    if (store.write_failed_) {
+      dependency_guard.Keep();
+      (*decision)->FailPending();
+    }
     co_return appended;
   }
+  dependency_guard.Keep();
   if (!outer_transaction) {
     struct HandoffGuard {
       WorkerStore* store_;

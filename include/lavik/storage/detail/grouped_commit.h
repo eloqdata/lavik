@@ -19,6 +19,8 @@
 #include <atomic>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <utility>
 
 namespace lavik::storage {
 
@@ -44,6 +46,24 @@ struct GroupedCommitDecision {
     state_.compare_exchange_strong(pending, State::kFailed,
                                    std::memory_order_release,
                                    std::memory_order_relaxed);
+  }
+};
+
+// Extra predecessors for one receipt. Published links are immutable. Each
+// allocation carries its retained-memory charge through the shared allocator.
+struct GroupedCommitDependency {
+  std::shared_ptr<GroupedCommitDecision> decision_;
+  std::shared_ptr<GroupedCommitDependency> next_;
+
+  ~GroupedCommitDependency() {
+    // A very large multi-key command must not recurse once per predecessor
+    // while destroying its receipt. Only detach links with exclusive ownership;
+    // a command batch may still share the remaining immutable suffix.
+    while (next_ && next_.use_count() == 1) {
+      auto following = std::move(next_->next_);
+      next_.reset();
+      next_ = std::move(following);
+    }
   }
 };
 

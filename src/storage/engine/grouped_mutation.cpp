@@ -17,6 +17,7 @@
 #include <charconv>
 
 #include "absl/container/inlined_vector.h"
+#include "grouped_dependency_guard.h"
 #include "impl.h"
 #include "lavik/storage/detail/grouped_scratch.h"
 
@@ -155,7 +156,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   TxShardWrites standalone;
   if (!tx) {
     const auto predecessor =
-        co_await AwaitGroupedDependencyLocked(store, source_side, 0);
+        co_await PrepareGroupedDependencyLocked(store, source_side, nullptr);
     if (!predecessor.ok()) co_return predecessor;
     std::uint64_t append_bytes = kBlockHeaderSlotBytes;
     for (const auto& entry : after_image.entries_)
@@ -189,8 +190,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
                            : MutationPrecondition{});
     tx = &standalone;
   }
+  GroupedDependencyGuard dependency_guard(*tx, outer_transaction);
   const auto dependency =
-      co_await AwaitGroupedDependencyLocked(store, source_side, tx->txid_);
+      co_await PrepareGroupedDependencyLocked(store, source_side, tx);
   if (!dependency.ok()) co_return dependency;
   if (EffectiveRecordDbEpoch(partition, db_id) != db_epoch ||
       partition.replication_epoch_ != replication_epoch ||
@@ -198,8 +200,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
       !SameLogicalView(source_side, side.CurrentForMutation(key))) {
     co_return absl::AbortedError("grouped population changed before mutation");
   }
-  // Waiting for the predecessor decision releases the store lock. GC may
-  // publish another physical view of this same logical root in that window;
+  // Admission and cross-coordinator dependency waits release the store lock.
+  // GC may publish another physical view of this same logical root meanwhile;
   // the publication reservation compares handle identity, not just C/R.
   // Refresh only after the population/logical checks, while the lock is held.
   source_side = side.CurrentForMutation(key);
@@ -385,16 +387,26 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     co_return absl::ResourceExhaustedError("OOM preparing Hash demotion");
   }
   if (compact_payload) {
+    // Standalone demotion appends an ordinary untagged complete value and
+    // hands no transaction receipt to the queue. Keep its prior dependency
+    // boundary until that path has its own commit/failure handoff.
+    if (!outer_transaction) {
+      const auto durable =
+          co_await AwaitGroupedDependencyLocked(store, source_side, tx->txid_);
+      if (!durable.ok()) co_return durable;
+    }
     if (!SameLogicalView(source_side, side.CurrentForMutation(key)) ||
         EffectiveRecordDbEpoch(partition, db_id) != db_epoch ||
         partition.replication_epoch_ != replication_epoch ||
         store.index_generations_[db_id] != index_generation)
       co_return absl::AbortedError("grouped source changed before demotion");
-    co_return co_await AppendLocked(
+    const auto demoted = co_await AppendLocked(
         store, partition, db_id, key, digest, *compact_payload,
         RecordKind::kValue, value_type, expire_at_ms,
         outer_transaction ? tx : nullptr, field_count, nullptr, nullptr,
         replication, true, nullptr, mutation_precondition);
+    if (demoted.ok() || store.write_failed_) dependency_guard.Keep();
+    co_return demoted;
   }
   auto decision = PrepareGroupedDecision(*tx, !outer_transaction);
   if (!decision.ok()) co_return decision.status();
@@ -539,12 +551,14 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
       // A root may already be staged/published on a fail-stopped path. Its
       // graph must remain intact until shutdown; it is no longer an orphan
       // batch that ordinary command-local cleanup may retire.
+      dependency_guard.Keep();
       (*decision)->FailPending();
       co_return appended;
     }
     const auto abandoned = co_await abandon();
     co_return abandoned.ok() ? appended : abandoned;
   }
+  dependency_guard.Keep();
   LAVIK_MAYBE_CRASH_AT("group-root-staged-before-batch-decision");
   if (tx->grouped_ingest_batch_ != nullptr) co_return absl::OkStatus();
   // WriteRecord's staged-root guard ends when it returns. Publication is
@@ -570,6 +584,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
       // coordinator's later commit causally depend on the complete auxiliary
       // batch. The normal outer decision remains the root's publication gate.
       batch.fences_ = tx->fences_;
+      batch.grouped_predecessor_ = tx->grouped_predecessor_;
+      batch.grouped_dependencies_ = tx->grouped_dependencies_;
       const bool inject_batch_failure =
           LAVIK_FAULT_MATCHES("LAVIK_FAIL_GROUP_BATCH_KEY", key);
       store.store_state_mutex_.Unlock(*store.worker_);
