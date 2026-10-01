@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "../src/redis/list_command.h"
 #include "../src/redis/set_command.h"
@@ -1188,7 +1189,8 @@ class ReplicationLogService final : public bycorf::Service {
       if (!before_commit.ok()) co_return before_commit.status();
       Check(before_commit->records_.empty(),
             "transaction participant leaked before the commit decision");
-      storage_->PublishCommittedFullSyncEffects(&committed_tx);
+      auto finished = co_await storage_->FinishTxLocal(committed_tx);
+      if (!finished.ok()) co_return finished;
       key_lock.Reset();
     }
     auto committed_effect_result =
@@ -1203,9 +1205,6 @@ class ReplicationLogService final : public bycorf::Service {
           "committed transaction effect was not published");
     storage_->AcknowledgePartitionFullSyncOverrides(kTxSession, tx_partition,
                                                     committed_effect.records_);
-    absl::Status discarded =
-        co_await storage_->DiscardTxUndoLocal(committed_tx.txid_);
-    if (!discarded.ok()) co_return discarded;
     // A mismatched coordinator ID must not commit these staged writes or
     // prevent their actual transaction from making its durability decision.
     std::vector<lavik::storage::TxShardWrites*> mismatched_shards{
@@ -1234,7 +1233,7 @@ class ReplicationLogService final : public bycorf::Service {
           kDb, rollback_key, rollback_digest, "aborted", {}, &rolled_back_tx);
       if (!staged.ok()) co_return staged.status();
       absl::Status rolled =
-          co_await storage_->RollbackTxLocal(rolled_back_tx.txid_);
+          co_await storage_->FinishTxLocal(rolled_back_tx, /*rollback=*/true);
       if (!rolled.ok()) co_return rolled;
       key_lock.Reset();
     }
@@ -1782,7 +1781,13 @@ class ReplicationLogService final : public bycorf::Service {
     absl::Status pending_completed = storage_->CompletePartitionDbReplication(
         kPendingTxSession, partition_id, kDb);
     if (!pending_completed.ok()) co_return pending_completed;
-    storage_->PublishCommittedFullSyncEffects(&pending_tx);
+    {
+      auto key_lock = co_await lavik::tx::CurrentTxShard().AcquireKey(
+          kDb, lavik::tx::FingerprintOf(pending_digest),
+          lavik::tx::LockMode::kExclusive);
+      auto finished = co_await storage_->FinishTxLocal(pending_tx);
+      if (!finished.ok()) co_return finished;
+    }
     auto late_commit_result = co_await storage_->ReadPartitionFullSyncOverrides(
         kPendingTxSession, partition_id, 16);
     if (!late_commit_result.ok()) co_return late_commit_result.status();
@@ -3256,6 +3261,182 @@ class ReplicationLogService final : public bycorf::Service {
     co_return status;
   }
 
+  bycorf::Task<absl::Status> ExerciseBlockingInitialAttemptAdmission() {
+    constexpr std::uint8_t db = 6;
+    std::vector<std::string> seed{"RPUSH", "blocking-cut-source", "value"};
+    auto status = co_await ExecuteClientCommand(db, std::move(seed), ":1\r\n");
+    if (!status.ok()) co_return status;
+    Check(lavik::CloseAllCommandDbGates(), "could not acquire blocking cut");
+    bool started = false;
+    bool finished = false;
+    absl::Status reply = absl::UnknownError("blocking move did not run");
+    auto move = [&]() -> bycorf::Task<absl::Status> {
+      started = true;
+      std::vector<std::string> args{"BLMOVE",
+                                    "blocking-cut-source",
+                                    "blocking-cut-destination",
+                                    "LEFT",
+                                    "RIGHT",
+                                    "0.01"};
+      reply =
+          co_await ExecuteClientCommand(db, std::move(args), "$5\r\nvalue\r\n");
+      finished = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(move());
+    // FULL's final cut closes this gate without removing the source value.
+    // An initial command must check that value even when admission exceeds
+    // its empty-list timeout; timeout does not prove that a list was empty.
+    status = co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(50));
+    const bool waited = started && !finished;
+    lavik::OpenAllCommandDbGates();
+    while (!finished) co_await bycorf::Yield(*worker_);
+    if (!status.ok()) co_return status;
+    if (!reply.ok()) co_return reply;
+    Check(waited, "blocking command timed out before its initial attempt");
+    std::cout << "Blocking initial attempt waits for database admission PASS\n";
+    co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::Status> ExerciseTransactionalFullSyncPublication() {
+    struct Case {
+      std::vector<std::string> seed;
+      std::vector<std::string> command;
+      std::string reply;
+      std::vector<std::string> changed;
+    };
+    // All mutations use a transaction receipt, but their FULL effects must
+    // become visible before the participant key locks are released. The
+    // ordinary backlog alone cannot cover an in-progress FULL population.
+    std::vector<Case> cases{
+        {{"RPUSH", "src", "a", "b"},
+         {"LMOVE", "src", "dst", "LEFT", "RIGHT"},
+         "$1\r\na\r\n",
+         {"src", "dst"}},
+        {{"RPUSH", "src", "a", "b"},
+         {"LMOVE", "src", "src", "LEFT", "RIGHT"},
+         "$1\r\na\r\n",
+         {"src"}},
+        {{"RPUSH", "src", "a", "b"},
+         {"RPOPLPUSH", "src", "dst"},
+         "$1\r\nb\r\n",
+         {"src", "dst"}},
+        {{"RPUSH", "src", "a", "b"},
+         {"BLMOVE", "src", "dst", "LEFT", "RIGHT", "0.01"},
+         "$1\r\na\r\n",
+         {"src", "dst"}},
+        {{"RPUSH", "src", "a", "b"},
+         {"BRPOPLPUSH", "src", "dst", "0.01"},
+         "$1\r\nb\r\n",
+         {"src", "dst"}},
+        {{"SADD", "src", "a", "b"},
+         {"SMOVE", "src", "dst", "a"},
+         ":1\r\n",
+         {"src", "dst"}},
+        {{"SADD", "src", "a", "b"},
+         {"SUNIONSTORE", "dst", "src"},
+         ":2\r\n",
+         {"dst"}},
+        {{"ZADD", "src", "1", "a", "2", "b"},
+         {"ZUNIONSTORE", "dst", "1", "src"},
+         ":2\r\n",
+         {"dst"}},
+        {{"RPUSH", "src", "2", "1"},
+         {"SORT", "src", "STORE", "dst"},
+         ":2\r\n",
+         {"dst"}},
+        {{"RPUSH", "src", "a", "b"}, {"DEL", "src", "dst"}, ":1\r\n", {"src"}},
+        {{"RPUSH", "src", "a", "b"},
+         {"RENAME", "src", "dst"},
+         "+OK\r\n",
+         {"src", "dst"}},
+        {{"RPUSH", "src", "a", "b"}, {"COPY", "src", "dst"}, ":1\r\n", {"dst"}},
+        {{"RPUSH", "src", "a", "b"},
+         {"MSET", "src", "x", "dst", "y"},
+         "+OK\r\n",
+         {"src", "dst"}},
+        {{"RPUSH", "src", "a", "b"},
+         {"MSETNX", "dst", "x", "extra", "y"},
+         ":1\r\n",
+         {"dst", "extra"}},
+        {{"RPUSH", "src", "a", "b"},
+         {"EVAL",
+          "return redis.call('LMOVE', KEYS[1], KEYS[2], 'LEFT', 'RIGHT')", "2",
+          "src", "dst"},
+         "$1\r\na\r\n",
+         {"src", "dst"}},
+    };
+    unsigned failures = 0;
+    std::uint64_t session = 1700;
+    for (bool tailing : {false, true}) {
+      for (auto test : cases) {
+        ++session;
+        const std::string prefix = "{full-tx-" + std::to_string(session) + "}";
+        for (auto* args : {&test.seed, &test.command, &test.changed}) {
+          for (auto& arg : *args)
+            if (arg == "src" || arg == "dst" || arg == "extra")
+              arg = prefix + arg;
+        }
+        auto status =
+            co_await ExecuteClientCommand(0, std::move(test.seed), ":2\r\n");
+        if (!status.ok()) co_return status;
+        status = co_await storage_->EnableReplicationLog(session, 8 * kMiB);
+        if (!status.ok()) co_return status;
+        auto begun = storage_->BeginFullSyncSession(session);
+        if (!begun.ok()) co_return begun.status();
+        const auto partition = lavik::storage::RedisSlot(prefix);
+        auto start = storage_->BeginPartitionReplication(session, partition, 1);
+        if (!start.ok()) co_return start.status();
+        status = storage_->BeginPartitionDbReplication(session, partition, 0);
+        if (!status.ok()) co_return status;
+        std::uint64_t cursor = 0;
+        do {
+          auto baseline = co_await storage_->SnapshotPartition(
+              session, partition, 0, cursor, 32, 2);
+          if (!baseline.ok()) co_return baseline.status();
+          storage_->AcknowledgePartitionSnapshotRecords(session, partition,
+                                                        baseline->records_);
+          cursor = baseline->cursor_;
+        } while (cursor != 0);
+        if (tailing) {
+          status =
+              storage_->CompletePartitionDbReplication(session, partition, 0);
+          if (!status.ok()) co_return status;
+        }
+        const auto name = test.command.front();
+        status = co_await ExecuteClientCommand(0, std::move(test.command),
+                                               test.reply);
+        if (!status.ok()) co_return status;
+        auto queued = storage_->PeekFullSyncPublishItems(session, 32);
+        if (!queued.ok()) co_return queued.status();
+        auto overrides = co_await storage_->ReadPartitionFullSyncOverrides(
+            session, partition, 32);
+        if (!overrides.ok()) co_return overrides.status();
+        std::unordered_set<std::string> observed;
+        for (const auto& item : *queued) {
+          if (item.record_) observed.insert(item.record_->key_);
+          storage_->AcknowledgeFullSyncPublishItem(session, item.id_);
+        }
+        for (const auto& record : overrides->records_)
+          observed.insert(record.key_);
+        for (const auto& key : test.changed) {
+          if (!observed.contains(key)) {
+            ++failures;
+            std::cerr << "FULL missing " << name << " effect for " << key
+                      << " tailing=" << tailing << '\n';
+          }
+        }
+        storage_->EndPartitionReplication(session, partition);
+        storage_->EndFullSyncSession(session);
+        status = co_await storage_->DisableReplicationLog();
+        if (!status.ok()) co_return status;
+      }
+    }
+    Check(failures == 0, "transactional writes lost FULL after-images");
+    std::cout << "Transactional FULL publication PASS\n";
+    co_return absl::OkStatus();
+  }
+
   bycorf::Task<absl::Status> ExerciseReplicaBackupAdmission() {
     auto seeded = co_await storage_->Set(6, "backup-copy-source", "value", {});
     if (!seeded.ok()) co_return seeded.status();
@@ -3322,7 +3503,11 @@ class ReplicationLogService final : public bycorf::Service {
   }
 
   bycorf::Task<absl::Status> Exercise() {
-    absl::Status status = co_await ExerciseReplicaBackupAdmission();
+    absl::Status status = co_await ExerciseTransactionalFullSyncPublication();
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseBlockingInitialAttemptAdmission();
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseReplicaBackupAdmission();
     if (!status.ok()) co_return status;
     status = co_await ExerciseScannedKeyStorageChangeOrder();
     if (!status.ok()) co_return status;

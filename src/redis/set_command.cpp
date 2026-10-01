@@ -574,15 +574,15 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
       if (!replaced.ok()) {
         ReleaseSetWorkingSet(context);
         if (!context->tx_writes_.empty()) {
-          auto restored = co_await g_storage->RollbackTxLocal(
-              context->tx_writes_.front().txid_);
+          auto restored = co_await g_storage->FinishTxLocal(
+              context->tx_writes_[bycorf::ThisWorker().id_], /*rollback=*/true);
           if (!restored.ok()) co_return restored;
         }
         co_return replaced;
       }
       if (!context->tx_writes_.empty()) {
-        co_return co_await g_storage->DiscardTxUndoLocal(
-            context->tx_writes_.front().txid_);
+        co_return co_await g_storage->FinishTxLocal(
+            context->tx_writes_[bycorf::ThisWorker().id_]);
       }
     }
     co_return absl::OkStatus();
@@ -625,11 +625,8 @@ Task<absl::Status> SetWriteShardCallback(void* opaque,
 Task<absl::Status> SetFinishShardCallback(void* opaque, const tx::ShardSlice&) {
   auto* context = static_cast<SetMultiContext*>(opaque);
   if (context->tx_writes_.empty()) co_return absl::OkStatus();
-  const std::uint64_t txid = context->tx_writes_.front().txid_;
-  if (context->rollback_) {
-    co_return co_await g_storage->RollbackTxLocal(txid);
-  }
-  co_return co_await g_storage->DiscardTxUndoLocal(txid);
+  co_return co_await g_storage->FinishTxLocal(
+      context->tx_writes_[bycorf::ThisWorker().id_], context->rollback_);
 }
 
 Task<absl::Status> RunSetTxCommit(std::uint64_t txid,
@@ -788,13 +785,13 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
       absl::Status written = co_await SetWriteShardCallback(opaque, slice);
       if (!written.ok()) {
         ReleaseSetWorkingSet(ctx);
-        auto restored =
-            co_await g_storage->RollbackTxLocal(ctx->tx_writes_.front().txid_);
+        auto restored = co_await g_storage->FinishTxLocal(
+            ctx->tx_writes_[bycorf::ThisWorker().id_], /*rollback=*/true);
         if (!restored.ok()) co_return restored;
         co_return written;
       }
-      co_return co_await g_storage->DiscardTxUndoLocal(
-          ctx->tx_writes_.front().txid_);
+      co_return co_await g_storage->FinishTxLocal(
+          ctx->tx_writes_[bycorf::ThisWorker().id_]);
     };
     status = co_await transaction.Execute(single_move, &context, true);
   } else {

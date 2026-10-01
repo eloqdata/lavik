@@ -600,9 +600,10 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
         request, *destination, product->stored_values_,
         &writes[destination->owner_]);
     if (!replaced.ok()) {
-      (void)co_await SubmitTaskTo(destination->owner_, [txid] {
-        return g_storage->RollbackTxLocal(txid);
-      });
+      (void)co_await SubmitTaskTo(
+          destination->owner_, [write = &writes[destination->owner_]] {
+            return g_storage->FinishTxLocal(*write, /*rollback=*/true);
+          });
       (void)co_await ReleaseSortTransaction(&transaction);
       if (IsClusterAuthorityChanged(replaced.status())) {
         // Rollback removed any staged destination record. The outer reply
@@ -622,15 +623,17 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
       }
       status = co_await g_storage->CommitTxWrites(txid, std::move(changed));
       if (!status.ok()) {
-        (void)co_await SubmitTaskTo(destination->owner_, [txid] {
-          return g_storage->RollbackTxLocal(txid);
-        });
+        (void)co_await SubmitTaskTo(
+            destination->owner_, [write = &writes[destination->owner_]] {
+              return g_storage->FinishTxLocal(*write, /*rollback=*/true);
+            });
         (void)co_await ReleaseSortTransaction(&transaction);
         co_return Built(AppendSortError(reply_builder, status));
       }
-      status = co_await SubmitTaskTo(destination->owner_, [txid] {
-        return g_storage->DiscardTxUndoLocal(txid);
-      });
+      status = co_await SubmitTaskTo(destination->owner_,
+                                     [write = &writes[destination->owner_]] {
+                                       return g_storage->FinishTxLocal(*write);
+                                     });
       if (!status.ok()) {
         (void)co_await ReleaseSortTransaction(&transaction);
         co_return Built(AppendSortError(reply_builder, status));

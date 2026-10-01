@@ -928,7 +928,10 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
     }
 
     while (!TryBeginCommandDbOperation(request.db_id_)) {
-      if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+      // A FULL/backup cut can delay the first key lookup without making the
+      // key unavailable. Only a registered waiter has observed an empty key;
+      // its timeout may end this admission wait without another attempt.
+      if (waiter && deadline && std::chrono::steady_clock::now() >= *deadline) {
         co_return timeout_reply();
       }
       absl::Status slept = co_await bycorf::SleepFor(

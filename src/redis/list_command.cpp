@@ -243,10 +243,10 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     absl::Status committed =
         co_await g_storage->CommitTxWrites(txid, std::move(write_refs));
     if (!committed.ok()) {
-      (void)co_await g_storage->RollbackTxLocal(txid);
+      (void)co_await g_storage->FinishTxLocal(writes, /*rollback=*/true);
       co_return SingleShardListOutcome(std::move(committed));
     }
-    (void)co_await g_storage->DiscardTxUndoLocal(txid);
+    (void)co_await g_storage->FinishTxLocal(writes);
     if (replication != nullptr) {
       replication->SetCommandArgs(
           EncodeListMoveEffects(db_id, source, destination, source_left,
@@ -283,7 +283,7 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
   auto pushed = co_await g_storage->ExecuteListLocked(
       db_id, destination, storage::ComputeDigest(destination), push, &writes);
   if (!pushed.ok()) {
-    (void)co_await g_storage->RollbackTxLocal(txid);
+    (void)co_await g_storage->FinishTxLocal(writes, /*rollback=*/true);
     co_return SingleShardListOutcome(pushed.status());
   }
   // The source and destination records form one logical Redis move.
@@ -292,10 +292,10 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
   absl::Status committed =
       co_await g_storage->CommitTxWrites(txid, std::move(write_refs));
   if (!committed.ok()) {
-    (void)co_await g_storage->RollbackTxLocal(txid);
+    (void)co_await g_storage->FinishTxLocal(writes, /*rollback=*/true);
     co_return SingleShardListOutcome(std::move(committed));
   }
-  (void)co_await g_storage->DiscardTxUndoLocal(txid);
+  (void)co_await g_storage->FinishTxLocal(writes);
   if (replication != nullptr) {
     replication->SetCommandArgs(
         EncodeListMoveEffects(db_id, source, destination, source_left,
@@ -851,8 +851,9 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       });
   if (!pushed.ok()) {
     for (const unsigned owner : {source_owner, destination_owner}) {
-      (void)co_await bycorf::SubmitTaskTo(
-          owner, [txid] { return g_storage->RollbackTxLocal(txid); });
+      (void)co_await bycorf::SubmitTaskTo(owner, [write = &writes[owner]] {
+        return g_storage->FinishTxLocal(*write, /*rollback=*/true);
+      });
     }
     (void)co_await release();
     co_return BuiltReply(AppendStorageError(reply_builder, pushed.status()));
@@ -865,16 +866,11 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   writes[source_owner].dataset_changes_ = 1;
   for (auto& write : writes) write_ptrs.push_back(&write);
   status = co_await g_storage->CommitTxWrites(txid, std::move(write_ptrs));
-  if (!status.ok()) {
-    for (const unsigned owner : {source_owner, destination_owner}) {
-      (void)co_await bycorf::SubmitTaskTo(
-          owner, [txid] { return g_storage->RollbackTxLocal(txid); });
-    }
-  } else {
-    for (const unsigned owner : {source_owner, destination_owner}) {
-      (void)co_await bycorf::SubmitTaskTo(
-          owner, [txid] { return g_storage->DiscardTxUndoLocal(txid); });
-    }
+  for (const unsigned owner : {source_owner, destination_owner}) {
+    (void)co_await bycorf::SubmitTaskTo(
+        owner, [write = &writes[owner], rollback = !status.ok()] {
+          return g_storage->FinishTxLocal(*write, rollback);
+        });
   }
   absl::Status released = co_await release();
   if (!status.ok()) {
