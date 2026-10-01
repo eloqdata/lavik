@@ -22,6 +22,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/hash/hash.h"
 #include "impl.h"
 #include "lavik/glob.h"
@@ -731,18 +732,27 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       co_return absl::InvalidArgumentError("Hash field/value mismatch");
     std::set<HashGroupId> selected;
     std::optional<MemoryReservation> operand_scratch;
-    std::map<HashGroupId, std::vector<HashEntryView>> leaf_edits;
+    struct RoutedEdit {
+      HashGroupId id_;
+      HashEntryView view_;
+      std::size_t ordinal_;
+    };
+    // A single-field write needs no heap-allocated routing index. For batches,
+    // sort borrowed views by leaf and original position: duplicates retain
+    // command order, and one reusable page list replaces a vector per leaf.
+    absl::InlinedVector<RoutedEdit, 1> leaf_edits;
     if (edit_leaves) {
       GroupedScratchBudget budget;
       if (operation.fields_.size() > SIZE_MAX / 256)
         co_return absl::ResourceExhaustedError("Hash operand index overflow");
-      // Routing vectors, mutation views, map slots and growth rounding, even
-      // for empty operands. Request strings themselves remain client-owned.
+      // Routing and per-page views, including growth rounding and empty
+      // operands. Request strings themselves remain client-owned.
       auto added = budget.AddBytes(operation.fields_.size() * 256);
       if (!added.ok()) co_return added;
       auto admitted = budget.Reserve(1);
       if (!admitted.ok()) co_return admitted.status();
       operand_scratch.emplace(std::move(*admitted));
+      leaf_edits.reserve(operation.fields_.size());
     }
     std::optional<MemoryReservation> grouped_scratch;
     if (replace || unlocked_create) {
@@ -774,24 +784,50 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
           const auto* route = grouped->directory().Find(field);
           if (route == nullptr)
             co_return absl::DataLossError("missing Hash field route");
-          selected.insert(route->id_);
-          if (edit_leaves)
-            leaf_edits[route->id_].push_back(
-                {field, operation.kind_ == HashOperationKind::kDelete
-                            ? std::string_view{}
-                            : operation.values_[i]});
+          if (edit_leaves) {
+            leaf_edits.push_back(
+                {route->id_,
+                 {field, operation.kind_ == HashOperationKind::kDelete
+                             ? std::string_view{}
+                             : operation.values_[i]},
+                 i});
+          } else {
+            selected.insert(route->id_);
+          }
         }
       } else {
         for (const auto& [prefix, metadata] : grouped->directory().groups())
           selected.insert(metadata.id_);
       }
-      for (const auto id : selected) {
+      const auto add_group = [&](HashGroupId id) -> absl::Status {
         const auto* entry = grouped->FindGroup(id);
         if (entry == nullptr)
-          co_return absl::DataLossError("missing Hash scratch page");
-        const auto added =
-            budget.AddGroup(entry->value_, grouped->ExtentsFor(id));
-        if (!added.ok()) co_return added;
+          return absl::DataLossError("missing Hash scratch page");
+        // Inline records cannot own a manifest. Avoid a second physical-index
+        // traversal merely to obtain the null handle used by admission.
+        return budget.AddGroup(entry->value_, entry->value_.external()
+                                                  ? grouped->ExtentsFor(id)
+                                                  : ExtentManifest{});
+      };
+      if (edit_leaves) {
+        if (leaf_edits.size() > 1)
+          std::sort(leaf_edits.begin(), leaf_edits.end(),
+                    [](const auto& a, const auto& b) {
+                      return a.id_ != b.id_ ? a.id_ < b.id_
+                                            : a.ordinal_ < b.ordinal_;
+                    });
+        std::optional<HashGroupId> previous;
+        for (const auto& edit : leaf_edits) {
+          if (previous == edit.id_) continue;
+          const auto added = add_group(edit.id_);
+          if (!added.ok()) co_return added;
+          previous = edit.id_;
+        }
+      } else {
+        for (const auto id : selected) {
+          const auto added = add_group(id);
+          if (!added.ok()) co_return added;
+        }
       }
       for (const auto field : operation.fields_) {
         const auto added = budget.AddBytes(field.size());
@@ -818,8 +854,16 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
                         : operation.kind_ == HashOperationKind::kSet
                             ? HashGroupEditKind::kSet
                             : HashGroupEditKind::kSetIfAbsent;
-      for (const auto& [id, edits] : leaf_edits) {
-        co_await bycorf::Yield(*store.worker_);
+      absl::InlinedVector<HashEntryView, 1> edits;
+      for (std::size_t begin = 0; begin < leaf_edits.size();) {
+        // Yield between pages for batch fairness, without scheduling an extra
+        // turn before every single-field write. Actual IO still suspends.
+        if (begin != 0) co_await bycorf::Yield(*store.worker_);
+        const auto id = leaf_edits[begin].id_;
+        edits.clear();
+        do {
+          edits.push_back(leaf_edits[begin++].view_);
+        } while (begin < leaf_edits.size() && leaf_edits[begin].id_ == id);
         auto loaded = co_await LoadHashGroupPayload(store, partition, db_id,
                                                     key, digest, grouped, id);
         if (!loaded.ok()) co_return loaded.status();

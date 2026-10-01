@@ -438,6 +438,49 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
   if (!node) return BuildPhysical(changed, arena);
   if (node->page_) {
     const auto& page = *node->page_;
+    // A point replacement keeps the page's identities and cardinality. Copy
+    // the admitted compact arrays directly instead of expanding every old
+    // coordinate into a temporary RecordLocation and compacting it again.
+    // Pages with manifests retain the general ownership-preserving merge.
+    if (changed.size() == 1 && page.extents_.empty() &&
+        !changed.front().extents_ && !changed.front().location_.external()) {
+      const auto found = std::lower_bound(page.ids_.begin(), page.ids_.end(),
+                                          changed.front().id_);
+      if (found != page.ids_.end() && *found == changed.front().id_) {
+        auto replacement = AllocateLocalObject<GroupIndexNode>(arena);
+        if (!replacement.ok()) return replacement.status();
+        auto copied = AllocateLocalObject<GroupIndexPage>(arena);
+        if (!copied.ok()) return copied.status();
+        const auto arrays_bytes =
+            AllocatorUsableSizeForRequest(page.ids_.size() *
+                                          sizeof(HashGroupId)) +
+            AllocatorUsableSizeForRequest(page.locations_.size() *
+                                          sizeof(GroupedRecordIndexEntry));
+        auto reservation = TryReserveMemory(arrays_bytes);
+        if (!reservation) {
+          RecordMemoryRejection();
+          return absl::ResourceExhaustedError(
+              "OOM group page exceeds maxmemory");
+        }
+        (*copied)->arrays_charge_.Account(
+            arena->allocation_domain().owner_shard_, arrays_bytes);
+        reservation.reset();
+        (*copied)->ids_ = page.ids_;
+        (*copied)->locations_ = page.locations_;
+        (*copied)->extents_.SetEntryArena(arena);
+        const auto index = static_cast<std::size_t>(found - page.ids_.begin());
+        (*copied)->locations_[index] = {
+            RecordIndexValue(changed.front().location_)};
+        const auto mask = std::uint64_t{1} << index;
+        (*copied)->retired_ = changed.front().retired_ ? page.retired_ | mask
+                                                       : page.retired_ & ~mask;
+        (*replacement)->size_ = node->size_;
+        (*replacement)->representative_ = node->representative_;
+        (*replacement)->branch_depth_ = node->branch_depth_;
+        (*replacement)->page_ = std::move(*copied);
+        return NodeHandle(std::move(*replacement));
+      }
+    }
     // Both inputs have unique, sorted full identities. Merge directly rather
     // than allocating a map node for every unchanged location on each write.
     // Replaced locations need no old lookup or manifest reference at all.
@@ -1157,9 +1200,8 @@ const GroupedRecordIndexEntry* GroupedHashObject::FindGroup(
                : nullptr;
   }
   if (is_ordered() && !has_member_index()) return nullptr;
-  const auto route = directory().groups().find(id.prefix_);
-  if (route == directory().groups().end() || route->second.id_ != id)
-    return nullptr;
+  const auto* route = directory().groups().Get(id.prefix_);
+  if (route == nullptr || route->id_ != id) return nullptr;
   return FindRecord(id);
 }
 

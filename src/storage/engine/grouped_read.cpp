@@ -87,7 +87,11 @@ StorageEngine::Impl::LoadHashGroupPayload(
     // hold graph pins; an ordinary reader captures current identity here and
     // retries against a refreshed view if GC moves it during IO.
     const RecordLocation location = MaterializeIndexLocation(*entry);
-    auto extents = object->ExtentsFor(id);
+    // The captured record says whether a manifest exists; inline pages need
+    // no second physical-index lookup. External reads retain the owned handle
+    // across suspension exactly as before.
+    auto extents =
+        location.external() ? object->ExtentsFor(id) : ExtentManifest{};
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
       loaded =
