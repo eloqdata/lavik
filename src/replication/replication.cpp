@@ -1203,6 +1203,13 @@ auto ReplicationManager::ReplicationGroup::CancelPendingClusterRebuild(
   auto finish_cancel = absl::MakeCleanup([this, previous_reconfiguration] {
     replica_reconfiguration_running_ = previous_reconfiguration;
   });
+  pending->state_.store(ReplicationGroupState::kNotReady,
+                        std::memory_order_release);
+  // Move/join the exact session before resolving its handle. Neither this
+  // cancellation nor a late coordinator result may invalidate the older root.
+  auto stopped = co_await StopClusterFollowIngress(nullptr);
+  // Pause only after ingress is joined; a test suspension must not expose
+  // a live session whose pending ownership has already been withdrawn.
   LAVIK_FAULT_INJECT(
       const char* hold = std::getenv("LAVIK_REBUILD_CANCEL_HOLD_FILE");
       if (hold != nullptr && ::access(hold, F_OK) == 0) {
@@ -1213,11 +1220,6 @@ auto ReplicationManager::ReplicationGroup::CancelPendingClusterRebuild(
             "LAVIK_REBUILD_CANCEL_HOLD_FILE");
         if (!paused.ok()) co_return paused;
       });
-  pending->state_.store(ReplicationGroupState::kNotReady,
-                        std::memory_order_release);
-  // Move/join the exact session before resolving its handle. Neither this
-  // cancellation nor a late coordinator result may invalidate the older root.
-  auto stopped = co_await StopClusterFollowIngress(nullptr);
   pending->completion_->Resolve(stopped.ok() ? absl::CancelledError(reason)
                                              : stopped);
   if (!stopped.ok()) LatchReplicationFailure(std::string(stopped.message()));
