@@ -231,6 +231,30 @@ def revoked(root, mode, command, boundary):
                 recovered.close()
 
 
+def wait_storage_fenced(source):
+    # The request gate closes before the asynchronous authority-retirement
+    # sweep. That sweep also closes recent reconnects, so EOF is not evidence
+    # that a fresh request escaped the fence. Require an explicit LOADING
+    # reply after reconnecting; a successful or unexpected reply is fatal.
+    def rejected():
+        assert source.alive(), "storage-fenced Data exited before the probe"
+        client = Client(source)
+        client.socket.settimeout(1)
+        try:
+            try:
+                reply = client.call("SET", "unsafe", "x")
+            except H.Failure as error:
+                if str(error) == "Data closed its Redis connection":
+                    return False
+                assert str(error).startswith("LOADING "), error
+                return True
+            raise AssertionError(f"storage-fenced SET unexpectedly returned {reply!r}")
+        finally:
+            client.close()
+
+    H.wait_until("storage fence rejects a fresh write with LOADING", 10, rejected)
+
+
 def storage_failure(root, command, kind, device):
     name = f"io-{command}-{kind}-{device}"
     failure = root / f"{name}.fail"
@@ -260,14 +284,14 @@ def storage_failure(root, command, kind, device):
                 reply = writer.call(command)
             except H.Failure as error:
                 # The runtime failure fence can retire the existing client
-                # before its command error is delivered. The fresh-client
-                # LOADING check below still proves that serving was fenced.
+                # before its command error is delivered. The reconnecting
+                # probe below still requires an explicit LOADING response.
                 assert expected in str(error) or str(error) == (
                     "Data closed its Redis connection"
                 ), error
             else:
                 raise AssertionError(f"{command} unexpectedly returned {reply}")
-            assert "LOADING" in F.redis_error(source, ["SET", "unsafe", "x"])
+            wait_storage_fenced(source)
             # The armed fault remains present. Returning promptly is evidence
             # that this command did not add retry-until-success behavior.
             source.force_kill()
@@ -287,6 +311,9 @@ def storage_failure(root, command, kind, device):
                 # Device 1's new epoch is known durable. Epoch recovery selects
                 # the maximum, unlike Function catalog common-root recovery.
                 assert recovered.call("GET", "{flush}old") is None
+            # A disconnected probe is ambiguous to the client, but every
+            # attempt must have been fenced without mutating storage.
+            assert recovered.call("GET", "unsafe") is None
             # First-device sync/write outcomes can be uncertain; no assertion
             # that an error means the flush did not happen.
             assert recovered.call("SET", "recovered", "usable") == "OK"
