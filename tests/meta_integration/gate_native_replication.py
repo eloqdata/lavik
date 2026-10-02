@@ -472,6 +472,286 @@ def follow_full_limit(root):
             fixture.force_kill()
 
 
+def explicit_full_limit(root):
+    import gate_failover as F
+
+    for cancel in (False, True):
+        name = "explicit-full-cancel" if cancel else "explicit-full-leader"
+        fixture = F.FailoverFixture(
+            C.META,
+            C.DATA,
+            C.CTL,
+            str(root / name),
+            False,
+            data_workers=2,
+            client_mode=CLIENT_MODE,
+        )
+        # Keep the deliberate election plus lease quarantine inside the
+        # separate three-second lease retry budget. Busy itself is unbounded.
+        for meta in fixture.metas:
+            meta.args = H.raft_args(
+                snapshot_distance=100_000, election_ms_low=700, election_ms_high=1400
+            )
+        source, first, second = fixture.data_nodes
+        hold = root / (name + ".hold")
+        hold.touch()
+        source.environment = {
+            **os.environ,
+            "LAVIK_FULL_AFTER_PROMOTION_ACK_HOLD_FILE": str(hold),
+        }
+        try:
+            F.write_manifest(
+                fixture.manifest,
+                fixture.metas,
+                fixture.data_nodes,
+                client_mode=CLIENT_MODE,
+                automatic_uncontrolled_failover_suspect_after_ms=600_000,
+            )
+            for meta in fixture.metas:
+                meta.start(initial_cluster_manifest=fixture.manifest, wait_ready=False)
+            fixture.leader = H.find_leader(fixture.metas, timeout=20)
+            for node in fixture.data_nodes:
+                node.seed = fixture.leader.data_control_endpoint
+                node.start()
+            H.wait_until(
+                "Meta membership stable before creation",
+                15,
+                lambda: fixture.cluster_status(time.monotonic() + 2).get(
+                    "meta_membership_stable"
+                ),
+            )
+            C.command(
+                os.environ.copy(),
+                [
+                    C.CTL,
+                    "cluster-create",
+                    "--manifest",
+                    fixture.manifest,
+                    "--addr",
+                    fixture.leader.ctl_endpoint,
+                    "--allow-plaintext-admin",
+                    "--yes",
+                ],
+            )
+            H.wait_until(
+                "explicit winner holds source slot after target promotion",
+                30,
+                lambda: "paused after promotion acknowledgement"
+                in Path(source.log_path).read_text(),
+            )
+            H.wait_until(
+                "explicit loser retries busy beyond lease retry budget",
+                15,
+                lambda: any(
+                    Path(n.log_path).read_text().count("native FULL admission is busy")
+                    >= 4
+                    for n in (first, second)
+                ),
+            )
+            waiting = next(
+                n
+                for n in (first, second)
+                if "native FULL admission is busy" in Path(n.log_path).read_text()
+            )
+            assert (
+                "durably invalidated system state"
+                not in Path(waiting.log_path).read_text()
+            )
+            assert "lavik_full_sync_sessions:1\r\n" in C.redis_call(
+                source, ["INFO", "replication"]
+            )
+            if cancel:
+                reply = fixture.leader.fencegroup(F.GROUP, 1)
+                assert reply.startswith("OK "), reply
+                H.wait_until(
+                    "waiting directive revoked by committed fence",
+                    10,
+                    lambda: any(
+                        g.get("term") == "2"
+                        for g in fixture.cluster_status(time.monotonic() + 2).get(
+                            "groups", []
+                        )
+                    ),
+                )
+            else:
+                fixture.leader.force_kill()
+                H.wait_until(
+                    "replacement Meta leader",
+                    10,
+                    lambda: fixture.rediscover_leader(time.monotonic() + 1),
+                )
+                # Source authority replacement may cancel the admitted export.
+                # Its held drain must remain accounted until explicitly released.
+                assert "lavik_full_sync_sessions:1\r\n" in C.redis_call(
+                    source, ["INFO", "replication"]
+                )
+            hold.unlink()
+            if cancel:
+                time.sleep(2)
+                assert (
+                    "durably invalidated system state"
+                    not in Path(waiting.log_path).read_text()
+                )
+                H.wait_until(
+                    "cancelled explicit FULL releases its source slot",
+                    30,
+                    lambda: "lavik_full_sync_sessions:0\r\n"
+                    in C.redis_call(source, ["INFO", "replication"]),
+                )
+            else:
+                F.wait_ready(
+                    fixture, "both explicit rebuilds finish their original operation"
+                )
+                H.wait_until(
+                    "explicit quota released with live replicas",
+                    30,
+                    lambda: "lavik_full_sync_sessions:0\r\n"
+                    in C.redis_call(source, ["INFO", "replication"]),
+                )
+                C.redis_call(source, ["SET", "quota-{foo}", "explicit-ready"])
+                H.wait_until(
+                    "both explicit targets read tail",
+                    20,
+                    lambda: all(
+                        C.readonly_get(n, "quota-{foo}") == "explicit-ready"
+                        for n in (first, second)
+                    ),
+                )
+        except BaseException:
+            fixture.dump_logs()
+            raise
+        finally:
+            hold.unlink(missing_ok=True)
+            fixture.force_kill()
+
+
+def mixed_full_limit(root):
+    import gate_failover as F
+
+    # Real Meta and Data processes; only the projection synthesizes a mixed
+    # request set. Genesis itself normally schedules these entrypoints apart.
+    for follow_first in (True, False):
+        name = "mixed-follow-first" if follow_first else "mixed-explicit-first"
+        fixture = F.FailoverFixture(
+            C.META,
+            C.DATA,
+            C.CTL,
+            str(root / name),
+            False,
+            data_workers=2,
+            client_mode=CLIENT_MODE,
+        )
+        source, follow, explicit = fixture.data_nodes
+        first, waiting = (follow, explicit) if follow_first else (explicit, follow)
+        source_hold = root / (name + ".source")
+        target_hold = root / (name + ".target")
+        source_hold.touch()
+        target_hold.touch()
+        source.environment = {
+            **os.environ,
+            "LAVIK_FULL_AFTER_PROMOTION_ACK_HOLD_FILE": str(source_hold),
+        }
+        waiting.environment = {
+            **os.environ,
+            "LAVIK_TEST_NATIVE_ADMISSION_HOLD_FILE": str(target_hold),
+        }
+        try:
+            F.write_manifest(
+                fixture.manifest,
+                fixture.metas,
+                fixture.data_nodes,
+                client_mode=CLIENT_MODE,
+                automatic_uncontrolled_failover_suspect_after_ms=600_000,
+            )
+            os.environ["LAVIK_TEST_MIXED_FULL_FOLLOW_NODE"] = F.CANDIDATE
+            try:
+                for meta in fixture.metas:
+                    meta.start(
+                        initial_cluster_manifest=fixture.manifest, wait_ready=False
+                    )
+            finally:
+                os.environ.pop("LAVIK_TEST_MIXED_FULL_FOLLOW_NODE", None)
+            fixture.leader = H.find_leader(fixture.metas, timeout=20)
+            for node in fixture.data_nodes:
+                node.seed = fixture.leader.data_control_endpoint
+                node.start()
+            H.wait_until(
+                "mixed fixture Meta membership stable",
+                15,
+                lambda: fixture.cluster_status(time.monotonic() + 2).get(
+                    "meta_membership_stable"
+                ),
+            )
+            C.command(
+                os.environ.copy(),
+                [
+                    C.CTL,
+                    "cluster-create",
+                    "--manifest",
+                    fixture.manifest,
+                    "--addr",
+                    fixture.leader.ctl_endpoint,
+                    "--allow-plaintext-admin",
+                    "--yes",
+                ],
+            )
+            H.wait_until(
+                "mixed winner holds admitted FULL",
+                30,
+                lambda: "paused after promotion acknowledgement"
+                in Path(source.log_path).read_text(),
+            )
+            assert (
+                "durably invalidated system state" in Path(first.log_path).read_text()
+            )
+            target_hold.unlink()
+            H.wait_until(
+                "other native entrypoint retries shared busy slot",
+                15,
+                lambda: Path(waiting.log_path)
+                .read_text()
+                .count("native FULL admission is busy")
+                >= 3,
+            )
+            assert (
+                "durably invalidated system state"
+                not in Path(waiting.log_path).read_text()
+            )
+            assert "lavik_full_sync_sessions:1\r\n" in C.redis_call(
+                source, ["INFO", "replication"]
+            )
+            source_hold.unlink()
+            H.wait_until(
+                "both mixed native sessions finish",
+                30,
+                lambda: "lavik_full_sync_sessions:0\r\n"
+                in C.redis_call(source, ["INFO", "replication"])
+                and all(
+                    "master_link_status:up\r\n"
+                    in C.redis_call(node, ["INFO", "replication"])
+                    for node in (follow, explicit)
+                ),
+            )
+            # The hidden explicit receipt deliberately keeps the Meta operation
+            # in Replicate. Read actual Data population and incremental flow.
+            C.redis_call(source, ["SET", "quota-{foo}", name])
+            H.wait_until(
+                "mixed followers receive incremental data",
+                20,
+                lambda: all(
+                    C.readonly_get(node, "quota-{foo}") == name
+                    for node in (follow, explicit)
+                ),
+            )
+        except BaseException:
+            fixture.dump_logs()
+            raise
+        finally:
+            target_hold.unlink(missing_ok=True)
+            source_hold.unlink(missing_ok=True)
+            fixture.force_kill()
+
+
 def rejects(client, args, text):
     try:
         reply = client.call(*args)
@@ -1726,6 +2006,10 @@ def main():
             full_session_lifecycle(root)
             full_completion_reconnect(root)
             follow_full_limit(root)
+            explicit_full_limit(root)
+            # Meta's test hooks follow its own Debug build policy.
+            if C.has_fault(C.META, b"LAVIK_TEST_MIXED_FULL_FOLLOW_NODE"):
+                mixed_full_limit(root)
             full_tail_publish_before_reset(root)
             full_tail_expiration_effects(root)
             small_receive_window(root)

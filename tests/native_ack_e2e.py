@@ -60,7 +60,7 @@ def read_frame(reader):
 
 
 @contextmanager
-def online_peer(port, ranges):
+def online_peer(port):
     with ExitStack() as stack:
 
         def connection():
@@ -92,12 +92,11 @@ def online_peer(port, ranges):
         flow, reader = connection()
         flow.sendall(
             F.encode_resp(
-                ["LVFLOW", "1", words[1], "0", "1", "0", words[7]]
-                + (["ACKRANGE"] if ranges else [])
+                ["LVFLOW", "1", words[1], "0", "1", "0", words[7], "ACKRANGE"]
             )
         )
         assert reader.readline().decode().strip() == (
-            f"+LVFLOW {words[1]} 0 FULL" + (" ACKRANGE" if ranges else "")
+            f"+LVFLOW {words[1]} 0 FULL ACKRANGE"
         )
         while True:
             kind, payload = read_frame(reader)
@@ -111,7 +110,7 @@ def online_peer(port, ranges):
                 sequence, partition = struct.unpack_from("<QH", payload)
             elif kind == 7:  # FULL cut.
                 partition, sequence = 65535, struct.unpack_from("<Q", payload)[0]
-            elif kind == 5:  # ONLINE cursor uses the original ACK format.
+            elif kind == 5:  # ONLINE cursor uses a single ACK.
                 partition, sequence = 0, struct.unpack_from("<Q", payload)[0]
             else:
                 raise AssertionError(f"unexpected idle FULL frame {kind}")
@@ -140,8 +139,6 @@ def publish(client, flow_reader, count=16):
 def main():
     cases = (
         "valid",
-        "legacy",
-        "unnegotiated",
         "reversed",
         "wrong-start",
         "unsent",
@@ -161,21 +158,9 @@ def main():
                 port,
                 _,
             ):
-                with online_peer(port, case not in ("legacy", "unnegotiated")) as (
-                    flow,
-                    reader,
-                ):
+                with online_peer(port) as (flow, reader):
                     lsns = publish(client, reader, 128 if case == "valid" else 16)
                     first, last = lsns[0], lsns[-1]
-                    if case == "legacy":
-                        flow.sendall(
-                            b"".join(
-                                frame(3, struct.pack("<HQ", 0, lsn)) for lsn in lsns
-                            )
-                        )
-                        assert client.call("WAIT", 1, 2000) == 1
-                        print(f"PASS: {case}", flush=True)
-                        continue
                     if case == "reversed":
                         first, last = last, first
                     elif case == "wrong-start":

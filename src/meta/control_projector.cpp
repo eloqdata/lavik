@@ -35,6 +35,7 @@
 #include "absl/strings/str_cat.h"
 #include "lavik/client_endpoint.h"
 #include "lavik/cluster/control_protocol.h"
+#include "lavik/fault_injection.h"
 #include "lavik/meta/commands.h"
 #include "lavik/meta/policy_store.h"
 #include "lavik/meta/population_manifest_store.h"
@@ -450,6 +451,35 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
         stores.topology_.ClusterLifecycle().state_ ==
         MetaClusterLifecycle::kCreated;
 
+    LAVIK_FAULT_INJECT(
+        // Genesis normally separates explicit population from FollowOwner.
+        // The process fixture projects one ready-to-run rebuild as Follow so
+        // both real Data entrypoints can contend without changing Raft state.
+        const char* mixed = std::getenv("LAVIK_TEST_MIXED_FULL_FOLLOW_NODE");
+        if (mixed != nullptr && *mixed != '\0' &&
+            (node_id == mixed || node_id == source.record_.owner_)) {
+          for (const auto& operation : stores.operation_.LiveOperationsView()) {
+            for (const auto& current : operation.current_directives_) {
+              if (current.spec_.group_id_ != source.group_id_) continue;
+              // Install source FollowOwner before its authorize receipt lets
+              // either target dial. Enabling it only alongside target rebuilds
+              // races the first export with source relationship replacement.
+              const bool preparing_source =
+                  node_id == source.record_.owner_ &&
+                  current.spec_.recipient_node_id_ == node_id &&
+                  current.spec_.target_node_id_ == mixed &&
+                  current.spec_.kind_ == kMetaDirectiveAuthorizeSource;
+              const bool ready_target =
+                  node_id == mixed &&
+                  current.spec_.recipient_node_id_ == mixed &&
+                  current.spec_.kind_ == kMetaDirectiveRebuild &&
+                  ClusterCreateDirectiveReady(operation, current);
+              if (preparing_source || ready_target)
+                projected.steady_replication_enabled = true;
+            }
+          }
+        });
+
     for (const MetaGroupMember& member : source.members_) {
       if (!active_nodes.contains(member.node_id_)) {
         return Inconsistent(absl::StrCat("group ", source.group_id_,
@@ -553,6 +583,10 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
     for (const MetaCurrentDirective& current : operation.current_directives_) {
       if (current.spec_.recipient_node_id_ != node_id) continue;
       if (!ClusterCreateDirectiveReady(operation, current)) continue;
+      if (current.spec_.kind_ == kMetaDirectiveRebuild &&
+          LAVIK_FAULT_MATCHES("LAVIK_TEST_MIXED_FULL_FOLLOW_NODE", node_id)) {
+        continue;
+      }
       if (const absl::Status anchor =
               ValidateCommittedDirectiveAnchor(stores, current.spec_);
           !anchor.ok()) {

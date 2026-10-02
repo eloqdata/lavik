@@ -401,10 +401,7 @@ Task<absl::StatusOr<std::string>> ReadExact(TcpStream& stream,
 Task<absl::StatusOr<std::pair<DataFrameKind, std::string>>> ReadDataFrame(
     TcpStream& stream);
 
-// Optional progress distinguishes an unsupported-handshake EOF from a
-// truncated reply, which must never trigger capability fallback.
-Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream,
-                                           bool* received_any = nullptr);
+Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream);
 
 Task<absl::StatusOr<std::string>> ReadRedisBulkReply(TcpStream& stream);
 
@@ -902,8 +899,9 @@ struct ReplicaTransactionOwner {
 // state communicates its lifecycle to flow workers; only worker zero reads
 // or publishes ReadyToken and changes the manager's current attempt.
 struct ClusterRebuildContext {
-  ClusterRebuildContext(RebuildDirective directive, PopulationManifest manifest,
-                        DestructiveResetAuthorization authorization)
+  ClusterRebuildContext(
+      RebuildDirective directive, PopulationManifest manifest,
+      std::optional<DestructiveResetAuthorization> authorization = std::nullopt)
       : directive_(std::move(directive)),
         manifest_(std::move(manifest)),
         authorization_(std::move(authorization)),
@@ -932,7 +930,9 @@ struct ClusterRebuildContext {
 
   const RebuildDirective directive_;
   std::optional<PopulationManifest> manifest_;
-  const std::optional<DestructiveResetAuthorization> authorization_;
+  // Installed only by worker zero after source FULL admission, before any
+  // flow task receives this context. Busy waiting never grants reset authority.
+  std::optional<DestructiveResetAuthorization> authorization_;
   std::atomic<ReplicationGroupState> state_{ReplicationGroupState::kRebuilding};
   std::optional<ReadyToken> ready_token_;
   // Worker zero retains this count across fresh transport sessions for the
@@ -1989,6 +1989,10 @@ class ReplicationManager::ReplicationGroup {
                                RebuildDirective directive,
                                PopulationManifest manifest);
 
+  absl::Status AdmitPendingClusterRebuild(
+      const std::shared_ptr<ReplicaSession>& session);
+  Task<absl::Status> CancelPendingClusterRebuild(std::string_view reason);
+
   Task<absl::Status> ApplyClusterRebuildDirective(ReplicaOfConfig upstream,
                                                   RebuildDirective directive,
                                                   PopulationManifest manifest);
@@ -2543,8 +2547,6 @@ class ReplicationManager::ReplicationGroup {
   };
 
   struct ReplicaOnlineApplyState {
-    // Immutable negotiation result, owned by this flow worker.
-    bool ack_ranges_ = false;
     std::deque<ReplicaOnlineCommand> commands_;
     std::deque<ReplicaOnlineCompletion> completions_;
     bycorf::AsyncNotification command_ready_;
@@ -2589,7 +2591,7 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> RunReplicaOnlineFlowData(
       TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
       unsigned flow_id, std::uint64_t first_expected_lsn,
-      std::pair<DataFrameKind, std::string> first_frame, bool ack_ranges);
+      std::pair<DataFrameKind, std::string> first_frame);
 
   struct ReplicaHandoffState {
     // Flow-local lifetime extends until every handoff task has joined. The
@@ -2619,7 +2621,7 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> RunReplicaFlowData(
       TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
-      unsigned flow_id, bool ack_ranges);
+      unsigned flow_id);
 
   Task<absl::Status> WaitReplicaHandoffs(
       const std::shared_ptr<ReplicaSession>& session,
@@ -2629,8 +2631,7 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> ReceiveReplicaFlowData(
       TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
-      unsigned flow_id, const std::shared_ptr<ReplicaHandoffState>& state,
-      bool ack_ranges);
+      unsigned flow_id, const std::shared_ptr<ReplicaHandoffState>& state);
 
   bool ShouldInjectFlowDrop(unsigned flow_id);
 
@@ -2698,7 +2699,7 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> RunMasterFlowData(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
-      unsigned flow_id, bool ack_ranges);
+      unsigned flow_id);
 
   Task<absl::StatusOr<std::uint64_t>> RunMasterFullSync(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
@@ -2706,11 +2707,9 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> EnterMasterFlowBacklog(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
-      unsigned flow_id, std::uint64_t next_lsn, std::uint32_t fragment_index,
-      bool ack_ranges);
+      unsigned flow_id, std::uint64_t next_lsn, std::uint32_t fragment_index);
 
   struct MasterBacklogDuplexState {
-    bool ack_ranges_ = false;
     std::deque<std::uint64_t> expected_acks_;
     bycorf::AsyncNotification expected_ack_ready_;
     bycorf::AsyncNotification receiver_done_ready_;
@@ -2736,7 +2735,7 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> RunMasterFlowBacklog(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
-      unsigned flow_id, storage::ReplicationLogCursor cursor, bool ack_ranges);
+      unsigned flow_id, storage::ReplicationLogCursor cursor);
 
   Task<absl::Status> RunAdoptedConnection(Connection* connection,
                                           std::vector<std::string> args,
@@ -2835,6 +2834,13 @@ class ReplicationManager::ReplicationGroup {
   std::optional<storage::PromotionBase> pending_promotion_;
   std::shared_ptr<ReplicaSession> active_replica_session_;
   std::shared_ptr<ClusterRebuildContext> cluster_rebuild_;
+  // Worker-zero request state is separate from the currently trusted root.
+  // Retain the last request after cancellation to reject stale exact replay.
+  // A start owns teardown before it can publish pending request identity.
+  // Strong fences and replacement desired state join this publication edge.
+  bool cluster_rebuild_starting_ = false;
+  std::shared_ptr<ClusterRebuildContext> pending_cluster_rebuild_;
+  std::shared_ptr<ClusterRebuildContext> last_cluster_rebuild_request_;
   std::optional<detail::RecoveredPopulation> recovered_population_;
   bool recovered_population_fenced_ = false;
   std::uint64_t owner_source_term_ = 0;

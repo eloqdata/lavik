@@ -582,9 +582,7 @@ bool HasCommaFlag(std::string_view flags, std::string_view wanted) {
   return false;
 }
 
-Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream,
-                                           bool* received_any) {
-  if (received_any != nullptr) *received_any = false;
+Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream) {
   std::string pending;
   std::array<std::byte, 1> input{};
   while (pending.size() <= 64 * 1024) {
@@ -598,7 +596,6 @@ Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream,
     if (*read == 0) {
       co_return absl::UnavailableError("replication peer closed connection");
     }
-    if (received_any != nullptr) *received_any = true;
     pending.append(reinterpret_cast<const char*>(input.data()), *read);
   }
   co_return absl::ResourceExhaustedError(
@@ -1104,224 +1101,171 @@ auto ReplicationManager::ReplicationGroup::StartClusterRebuildDirective(
         "cluster rebuild admission stopped during prior teardown");
   }
 
+  AssertStateOwner();
+  if (replica_reconfiguration_running_ ||
+      cluster_promotion_prepare_ != nullptr ||
+      failed_stopped_.load(std::memory_order_relaxed)) {
+    co_return absl::FailedPreconditionError(
+        "another population transition or failure fence is active");
+  }
+  const auto accepted = pending_cluster_rebuild_ != nullptr
+                            ? pending_cluster_rebuild_
+                            : cluster_rebuild_;
+  if (accepted != nullptr && accepted->directive_ == directive) {
+    const auto state = accepted->state_.load(std::memory_order_acquire);
+    if ((state != ReplicationGroupState::kRebuilding &&
+         (state != ReplicationGroupState::kReady ||
+          !accepted->ready_token_.has_value())) ||
+        upstream_ != std::optional<ReplicaOfConfig>(upstream)) {
+      co_return absl::FailedPreconditionError(
+          "rebuild replay conflicts with its accepted lifecycle or endpoint");
+    }
+    co_return accepted->completion_;
+  }
+  if (last_cluster_rebuild_request_ != nullptr) {
+    const auto& last = last_cluster_rebuild_request_->directive_.identity_;
+    const auto& next = directive.identity_;
+    if (next.term_ < last.term_ ||
+        (next.term_ == last.term_ &&
+         next.directive_revision_ <= last.directive_revision_) ||
+        (next.operation_id_ == last.operation_id_ &&
+         next.attempt_id_ == last.attempt_id_)) {
+      co_return absl::FailedPreconditionError(
+          "stale or retired rebuild admission request");
+    }
+  }
   absl::Status validated = cluster_group_->ValidateRebuild(directive, manifest);
+  if (!validated.ok()) co_return validated;
 
-  std::shared_ptr<ClusterRebuildContext> previous_context;
-  bool superseding = false;
-  {
-    AssertStateOwner();
-    if (cluster_promotion_prepare_ != nullptr) {
-      co_return absl::FailedPreconditionError(
-          "a prepared promotion must be retired before another rebuild");
-    }
-    if (failed_stopped_.load(std::memory_order_relaxed)) {
-      co_return absl::FailedPreconditionError(absl::StrCat(
-          "replication is failed-stopped until restart: ", failure_reason_));
-    }
-    const bool same_directive = cluster_rebuild_ != nullptr &&
-                                cluster_rebuild_->directive_ == directive;
-    if (same_directive) {
-      if (replica_reconfiguration_running_) {
-        co_return absl::FailedPreconditionError(
-            "another cluster population transition is active");
-      }
-      const ReplicationGroupState population_state =
-          cluster_rebuild_->state_.load(std::memory_order_relaxed);
-      const bool retryable =
-          population_state == ReplicationGroupState::kRebuilding ||
-          (population_state == ReplicationGroupState::kReady &&
-           cluster_rebuild_->ready_token_.has_value());
-      // ReplicationGroup rejects BeginRebuild once this directive is READY.
-      // The manager is the control replay seam, so the exact active or
-      // completed directive returns its existing result without another
-      // destructive rebuild.
-      if (!retryable) {
-        co_return absl::FailedPreconditionError(
-            "cluster rebuild proof is invalidated; a fresh attempt "
-            "identity is required");
-      }
-      if (upstream_ != std::optional<ReplicaOfConfig>(upstream)) {
-        co_return absl::FailedPreconditionError(
-            "cluster rebuild retry conflicts with its accepted source "
-            "endpoint");
-      }
-      co_return cluster_rebuild_->completion_;
-    }
-    if (!validated.ok()) co_return validated;
-    if (replica_reconfiguration_running_) {
-      co_return absl::FailedPreconditionError(
-          "another cluster population transition is active");
-    }
-    if (cluster_rebuild_ != nullptr) {
-      previous_context = cluster_rebuild_;
-      superseding = true;
-    } else if (active_replica_session_ != nullptr || upstream_.has_value()) {
-      co_return absl::FailedPreconditionError(
-          "replication teardown must complete before a cluster rebuild");
-    }
-  }
-
-  // The candidate is already fully validated, so closing admission cannot
-  // turn a malformed or stale directive into a denial of service against a
-  // healthy population. From here on, any uncertain teardown is fail-stop.
-  native_dataset_valid_.store(false, std::memory_order_release);
+  // Own the transition before cancellation can suspend. Concurrent starts
+  // must not publish a newer request while this caller joins the old one.
+  replica_reconfiguration_running_ = true;
+  cluster_rebuild_starting_ = true;
+  auto finish_start = absl::MakeCleanup([this] {
+    cluster_rebuild_starting_ = false;
+    replica_reconfiguration_running_ = false;
+  });
+  LAVIK_FAULT_INJECT(
+      const char* hold = std::getenv("LAVIK_REBUILD_START_HOLD_FILE");
+      if (hold != nullptr && ::access(hold, F_OK) == 0) {
+        auto signalled = SignalFaultBarrier("LAVIK_REBUILD_START_ACK_FILE",
+                                            "rebuild start barrier");
+        if (!signalled.ok()) co_return signalled;
+        auto paused = co_await fault_injection::PauseWhileFileExists(
+            "LAVIK_REBUILD_START_HOLD_FILE");
+        if (!paused.ok()) co_return paused;
+      });
+  auto cancelled =
+      co_await CancelPendingClusterRebuild("rebuild admission superseded");
+  if (!cancelled.ok()) co_return cancelled;
   StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
-  storage_->SetReplicaLoading(true);
   storage_->SetExpirationAuthority(false);
-
-  std::shared_ptr<ReplicaSession> previous_session;
-  {
-    AssertStateOwner();
-    if (replica_reconfiguration_running_ ||
-        cluster_rebuild_ != previous_context ||
-        failed_stopped_.load(std::memory_order_relaxed)) {
-      co_return absl::AbortedError(
-          "cluster rebuild state changed before directive transition");
-    }
-    replica_reconfiguration_running_ = true;
-    if (superseding) {
-      // Status and serving become invalid synchronously. The strong source
-      // retirement below clears capabilities under master_mutex_ before it
-      // joins old flow work, so LVPSYNC classification and publication see
-      // one ordered transition rather than racing a worker-local clear.
-      previous_context->ready_token_.reset();
-      previous_context->state_.store(ReplicationGroupState::kNotReady,
-                                     std::memory_order_release);
-      previous_session = std::move(active_replica_session_);
-      SetDesiredUpstream(std::nullopt);
-      applied_frontier_.reset();
-      upstream_node_id_.reset();
-      upstream_history_id_.reset();
-      replica_session_id_ = 0;
-      source_worker_count_ = 0;
-      role_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    }
+  // Stop old apply work while preserving its completed population and frontier.
+  // The new request owns no destructive authorization until LVPSYNC succeeds.
+  const auto previous_follow = std::move(cluster_follow_owner_);
+  auto stopped = co_await StopClusterFollowIngress(previous_follow);
+  if (stopped.ok())
+    stopped = co_await RevokeClusterRebuildSourceAuthorizations();
+  if (!stopped.ok()) {
+    LatchReplicationFailure(absl::StrCat(
+        "rebuild admission could not join prior work: ", stopped.message()));
+    co_return stopped;
   }
-  PublishHeartbeatObservation();
-  // Cancellation is synchronous and must precede the first await below.
-  // Otherwise the old control coroutine could publish ONLINE after serving
-  // was closed but before its sockets were revoked.
-  if (previous_session != nullptr) previous_session->Cancel();
-
-  if (superseding) {
-    // A cluster node owns one population. Revoke every downstream export,
-    // then cancel/join its one upstream session and abort any candidate root
-    // before replacing the attempt capability in ReplicationGroup.
-    absl::Status revoked = co_await RevokeClusterRebuildSourceAuthorizations();
-    if (!revoked.ok()) {
-      const std::string reason =
-          absl::StrCat("cluster source revocation outcome is uncertain: ",
-                       revoked.message());
-      (void)cluster_group_->FailStop(previous_context->directive_.identity_);
-      LatchReplicationFailure(reason);
-      co_return revoked;
-    }
-    if (previous_session != nullptr) {
-      absl::Status stopped =
-          co_await CancelAndWaitForReplicaFlows(previous_session);
-      std::optional<std::string> fail_stop = previous_session->FailStopReason();
-      if (!stopped.ok() && !fail_stop.has_value()) {
-        fail_stop =
-            absl::StrCat("replica cancellation/join outcome is uncertain: ",
-                         stopped.message());
-      }
-      if (stopped.ok() && !fail_stop.has_value() &&
-          previous_session->session_id_ != 0) {
-        absl::Status discarded =
-            co_await storage_->AbortReplicaRoot(previous_session->session_id_);
-        if (!discarded.ok()) {
-          fail_stop = absl::StrCat("replica abort outcome is uncertain: ",
-                                   discarded.message());
-        }
-      }
-      if (fail_stop.has_value()) {
-        (void)cluster_group_->FailStop(previous_context->directive_.identity_);
-        LatchReplicationFailure(*fail_stop);
-        co_return absl::FailedPreconditionError(absl::StrCat(
-            "replication is failed-stopped until restart: ", *fail_stop));
-      }
-    }
-
-    absl::Status retired =
-        cluster_group_->InvalidateProof(previous_context->directive_.identity_);
-    if (!retired.ok()) {
-      const std::string reason = absl::StrCat(
-          "superseded cluster proof could not be retired: ", retired.message());
-      (void)cluster_group_->FailStop(previous_context->directive_.identity_);
-      LatchReplicationFailure(reason);
-      co_return absl::FailedPreconditionError(reason);
-    }
-
-    // The old coordinator owns the control connection rather than a
-    // separately joinable task. Cancellation closes that socket; wait until
-    // it observes the moved session and exits before starting its successor.
-    while (coordinator_started_) {
-      absl::Status waited = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!waited.ok()) {
-        const std::string reason = absl::StrCat(
-            "superseded replication coordinator could not be joined: ",
-            waited.message());
-        LatchReplicationFailure(reason);
-        co_return waited;
-      }
-    }
-    previous_context->completion_->Resolve(absl::CancelledError(
-        "cluster rebuild attempt was superseded after cleanup"));
-    if (cluster_control_stopping_) {
-      AssertStateOwner();
-      replica_reconfiguration_running_ = false;
-      if (cluster_rebuild_ == previous_context) {
-        cluster_rebuild_.reset();
-        SetDesiredUpstream(std::nullopt);
-        upstream_node_id_.reset();
-        upstream_history_id_.reset();
-        PublishHeartbeatObservation();
-      }
-      co_return absl::CancelledError(
-          "cluster rebuild supersession stopped for process shutdown");
-    }
+  replica_reconfiguration_running_ = false;
+  if (cluster_control_stopping_ || replication_shutdown_requested_) {
+    co_return absl::CancelledError(
+        "rebuild admission stopped during prior teardown");
   }
-
-  auto authorization = cluster_group_->BeginRebuild(directive, manifest);
-  if (!authorization.ok()) {
-    const std::string reason =
-        absl::StrCat("validated cluster directive could not begin: ",
-                     authorization.status().message());
-    LatchReplicationFailure(reason);
-    co_return absl::FailedPreconditionError(reason);
-  }
-  auto context = std::make_shared<ClusterRebuildContext>(
-      std::move(directive), std::move(manifest), std::move(*authorization));
-  bool installed = false;
-  {
-    AssertStateOwner();
-    installed = replica_reconfiguration_running_ &&
-                cluster_rebuild_ == previous_context &&
-                active_replica_session_ == nullptr && !upstream_.has_value() &&
-                !failed_stopped_.load(std::memory_order_relaxed);
-    if (installed) {
-      cluster_rebuild_ = context;
-      SetDesiredUpstream(std::move(upstream));
-      applied_frontier_.reset();
-      upstream_node_id_.reset();
-      upstream_history_id_.reset();
-      native_dataset_valid_.store(false, std::memory_order_release);
-      role_epoch_.fetch_add(1, std::memory_order_acq_rel);
-      replica_reconfiguration_running_ = false;
-    }
-  }
-  if (!installed) {
-    const std::string reason =
-        "cluster rebuild state changed while installing the directive";
-    (void)cluster_group_->FailStop(context->directive_.identity_);
-    LatchReplicationFailure(reason);
-    co_return absl::AbortedError(reason);
-  }
-
+  auto context = std::make_shared<ClusterRebuildContext>(std::move(directive),
+                                                         std::move(manifest));
+  pending_cluster_rebuild_ = context;
+  last_cluster_rebuild_request_ = context;
+  SetDesiredUpstream(std::move(upstream));
+  role_epoch_.fetch_add(1, std::memory_order_acq_rel);
   PublishHeartbeatObservation();
   StartCoordinator();
   co_return context->completion_;
+}
+
+auto ReplicationManager::ReplicationGroup::CancelPendingClusterRebuild(
+    std::string_view reason) -> Task<absl::Status> {
+  AssertStateOwner();
+  auto pending = std::move(pending_cluster_rebuild_);
+  if (pending == nullptr) co_return absl::OkStatus();
+  // A fence may enter before a replacement Start. Own the same transition
+  // gate while joining so a new coordinator cannot appear inside that join.
+  // Start also calls this helper while already owning the gate.
+  const bool previous_reconfiguration = replica_reconfiguration_running_;
+  replica_reconfiguration_running_ = true;
+  auto finish_cancel = absl::MakeCleanup([this, previous_reconfiguration] {
+    replica_reconfiguration_running_ = previous_reconfiguration;
+  });
+  pending->state_.store(ReplicationGroupState::kNotReady,
+                        std::memory_order_release);
+  // Move/join the exact session before resolving its handle. Neither this
+  // cancellation nor a late coordinator result may invalidate the older root.
+  auto stopped = co_await StopClusterFollowIngress(nullptr);
+  // Pause only after ingress is joined; a test suspension must not expose
+  // a live session whose pending ownership has already been withdrawn.
+  LAVIK_FAULT_INJECT(
+      const char* hold = std::getenv("LAVIK_REBUILD_CANCEL_HOLD_FILE");
+      if (hold != nullptr && ::access(hold, F_OK) == 0) {
+        auto signalled = SignalFaultBarrier("LAVIK_REBUILD_CANCEL_ACK_FILE",
+                                            "rebuild cancel barrier");
+        if (!signalled.ok()) co_return signalled;
+        auto paused = co_await fault_injection::PauseWhileFileExists(
+            "LAVIK_REBUILD_CANCEL_HOLD_FILE");
+        if (!paused.ok()) co_return paused;
+      });
+  pending->completion_->Resolve(stopped.ok() ? absl::CancelledError(reason)
+                                             : stopped);
+  if (!stopped.ok()) LatchReplicationFailure(std::string(stopped.message()));
+  PublishHeartbeatObservation();
+  co_return stopped;
+}
+
+auto ReplicationManager::ReplicationGroup::AdmitPendingClusterRebuild(
+    const std::shared_ptr<ReplicaSession>& session) -> absl::Status {
+  AssertStateOwner();
+  auto context = session->cluster_rebuild_;
+  if (context == nullptr || pending_cluster_rebuild_ != context ||
+      active_replica_session_ != session || session->cancelled() ||
+      cluster_control_stopping_ || replication_shutdown_requested_) {
+    return absl::CancelledError(
+        "rebuild admission was replaced before source acceptance");
+  }
+  auto validated =
+      cluster_group_->ValidateRebuild(context->directive_, *context->manifest_);
+  if (!validated.ok()) return validated;
+  // Source identity and the shared FULL slot are now established. Withdraw
+  // the old proof immediately before issuing the new reset capability.
+  if (cluster_rebuild_ != nullptr) {
+    auto retired =
+        cluster_group_->InvalidateProof(cluster_rebuild_->directive_.identity_);
+    if (!retired.ok()) return retired;
+    cluster_rebuild_->state_.store(ReplicationGroupState::kNotReady,
+                                   std::memory_order_release);
+    cluster_rebuild_->ready_token_.reset();
+  }
+  auto authorization =
+      cluster_group_->BeginRebuild(context->directive_, *context->manifest_);
+  if (!authorization.ok()) {
+    LatchReplicationFailure(std::string(authorization.status().message()));
+    return authorization.status();
+  }
+  context->authorization_ = std::move(*authorization);
+  cluster_rebuild_ = context;
+  pending_cluster_rebuild_.reset();
+  native_dataset_valid_.store(false, std::memory_order_release);
+  // Admission replaces the retained population even when the role is already
+  // syncing. Retire its client tokens and connections before destructive work.
+  StoreRole(ReplicationRole::kSyncing, std::memory_order_release);
+  storage_->SetReplicaLoading(true);
+  applied_frontier_.reset();
+  upstream_node_id_.reset();
+  upstream_history_id_.reset();
+  PublishHeartbeatObservation();
+  return absl::OkStatus();
 }
 
 auto ReplicationManager::ReplicationGroup::ApplyClusterRebuildDirective(
@@ -4715,6 +4659,17 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFollowOwner(
         "follow-owner reconciliation stopped for process shutdown");
   }
 
+  // A pending explicit start may still be joining old ingress. Let it publish
+  // before replacing the relationship so it cannot appear after this FDS.
+  while (cluster_rebuild_starting_) {
+    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                            std::chrono::milliseconds(1));
+    if (!waited.ok()) co_return waited;
+  }
+  if (cluster_control_stopping_)
+    co_return absl::CancelledError(
+        "follow reconciliation stopped during start");
+
   std::shared_ptr<ClusterFollowOwnerContext> next;
   if (desired.has_value()) {
     auto normalized = NormalizeClusterFollowOwner(std::move(*desired));
@@ -4738,6 +4693,10 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFollowOwner(
       co_return absl::OkStatus();
     }
   }
+
+  auto cancelled = co_await CancelPendingClusterRebuild(
+      "explicit rebuild replaced by follow relationship");
+  if (!cancelled.ok()) co_return cancelled;
 
   const std::shared_ptr<ClusterFollowOwnerContext> previous =
       std::move(cluster_follow_owner_);
@@ -4867,13 +4826,15 @@ auto ReplicationManager::ReplicationGroup::RetireClusterPopulation(
         "population reconciliation requires Meta-managed population mode");
   }
 
-  // Automatic teardown owns the same session/root cleanup. Joining it first
-  // prevents two coroutines from aborting one in-place candidate.
+  // Join teardown and any start that has not yet published its request. A
+  // strong fence must observe/cancel that request before acknowledging; the
+  // older Ready root alone cannot prove that no new admission is in flight.
   for (;;) {
     bool teardown_running = false;
     {
       AssertStateOwner();
-      teardown_running = replica_session_teardown_running_;
+      teardown_running =
+          replica_session_teardown_running_ || cluster_rebuild_starting_;
     }
     if (!teardown_running) break;
     absl::Status waited = co_await bycorf::SleepFor(
@@ -4899,6 +4860,25 @@ auto ReplicationManager::ReplicationGroup::RetireClusterPopulation(
       absl::Status waited = co_await bycorf::SleepFor(
           *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
+    }
+  }
+
+  if (pending_cluster_rebuild_ != nullptr) {
+    const auto& identity = pending_cluster_rebuild_->directive_.identity_;
+    const bool still_desired =
+        desired.has_value() && desired->population_transition_expected_ &&
+        desired->group_id_ == identity.group_id_ &&
+        desired->assignment_id_ == identity.assignment_id_ &&
+        desired->term_ == identity.term_ &&
+        desired->manifest_revision_ == identity.manifest_revision_ &&
+        desired->manifest_id_ == identity.manifest_id_ &&
+        desired->partition_replication_epoch_ ==
+            identity.partition_replication_epoch_;
+    // A lost Meta transport fences serving, but is not a directive revocation.
+    // Exact pending admission survives until the replacement FDS checks scope.
+    if (!still_desired && !preserve_current_follow_attempt) {
+      auto cancelled = co_await CancelPendingClusterRebuild(reason);
+      if (!cancelled.ok()) co_return cancelled;
     }
   }
 
@@ -5449,7 +5429,9 @@ auto ReplicationManager::ReplicationGroup::CapturePopulationStatus() const
         failed_stopped_.load(std::memory_order_relaxed)
             ? ReplicationGroupState::kFailedStopped
         : cluster_rebuild_ == nullptr
-            ? ReplicationGroupState::kNotReady
+            ? (pending_cluster_rebuild_ != nullptr
+                   ? ReplicationGroupState::kRebuilding
+                   : ReplicationGroupState::kNotReady)
             : cluster_rebuild_->state_.load(std::memory_order_relaxed);
     if (result.state_ == ReplicationGroupState::kReady &&
         cluster_rebuild_ != nullptr &&
@@ -6372,7 +6354,7 @@ auto ReplicationManager::ReplicationGroup::ServeNativeConnection(
   std::uint64_t replication_session_id = 0;
   if (EqualCaseInsensitive(args.front(), "LVFLOW")) {
     unsigned flow_id = 0;
-    if ((args.size() != 7 && !(args.size() == 8 && args[7] == "ACKRANGE")) ||
+    if (args.size() != 8 || args[7] != "ACKRANGE" ||
         !ParseUnsigned(args[2], &replication_session_id) ||
         replication_session_id == 0 || !ParseUnsigned(args[3], &flow_id)) {
       co_return absl::InvalidArgumentError("invalid LVFLOW handshake");
@@ -6875,6 +6857,13 @@ auto ReplicationManager::ReplicationGroup::LatchReplicationFailure(
     }
     latched_reason = failure_reason_;
   }
+  if (pending_cluster_rebuild_ != nullptr) {
+    pending_cluster_rebuild_->state_.store(
+        ReplicationGroupState::kFailedStopped, std::memory_order_release);
+    pending_cluster_rebuild_->completion_->Resolve(
+        absl::InternalError(latched_reason));
+    pending_cluster_rebuild_.reset();
+  }
   PublishHeartbeatObservation();
   if (completion != nullptr) {
     completion->Resolve(absl::InternalError(
@@ -6915,8 +6904,11 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
       upstream = *upstream_;
       role_epoch = role_epoch_.load(std::memory_order_relaxed);
       session = std::make_shared<ReplicaSession>(&outbound_sockets_);
-      session->cluster_rebuild_ = cluster_rebuild_;
-      if (cluster_follow_owner_ != nullptr &&
+      session->cluster_rebuild_ = pending_cluster_rebuild_ != nullptr
+                                      ? pending_cluster_rebuild_
+                                      : cluster_rebuild_;
+      if (pending_cluster_rebuild_ == nullptr &&
+          cluster_follow_owner_ != nullptr &&
           cluster_follow_owner_->desired_.local_node_id_ !=
               cluster_follow_owner_->desired_.owner_node_id_) {
         session->cluster_follow_ = cluster_follow_owner_;
@@ -6958,11 +6950,15 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
           absl::StrCat("replica cancellation/join outcome is uncertain: ",
                        stopped.message());
     }
+    const bool pending_admission =
+        pending_cluster_rebuild_ == cluster_context &&
+        cluster_context != nullptr;
     bool lease_admission_retry = false;
     bool full_admission_retry = false;
     {
       AssertStateOwner();
-      // Only the explicit source lease-gate response is retryable. Pointer
+      // Lease suspension has its own finite retry budget; FULL busy below
+      // retries only a still-current pre-mutation request. Pointer
       // identity proves the immutable rebuild directive/FDS attempt is still
       // current; role/upstream equality closes replacement races. Requiring
       // no published source session, no flow, and no BeginReplicaFullSync
@@ -6971,8 +6967,9 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
           IsLeaseAdmissionSuspended(connected) && stopped.ok() &&
           !fail_stop.has_value() && cluster_context != nullptr &&
           cluster_state == ReplicationGroupState::kRebuilding &&
-          cluster_group_->state() == ReplicationGroupState::kRebuilding &&
-          cluster_rebuild_ == cluster_context &&
+          (pending_admission ||
+           (cluster_group_->state() == ReplicationGroupState::kRebuilding &&
+            cluster_rebuild_ == cluster_context)) &&
           active_replica_session_ == session &&
           session->cluster_follow_ == nullptr && session->session_id_ == 0 &&
           session->active_flows_.load(std::memory_order_acquire) == 0 &&
@@ -6988,8 +6985,10 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
       }
       full_admission_retry =
           IsFullAdmissionBusy(connected) && stopped.ok() &&
-          !fail_stop.has_value() && session->cluster_follow_ != nullptr &&
-          cluster_follow_owner_ == session->cluster_follow_ &&
+          !fail_stop.has_value() &&
+          (pending_admission ||
+           (session->cluster_follow_ != nullptr &&
+            cluster_follow_owner_ == session->cluster_follow_)) &&
           active_replica_session_ == session && session->session_id_ == 0 &&
           session->active_flows_.load(std::memory_order_acquire) == 0 &&
           session->connected_flows_.load(std::memory_order_acquire) == 0 &&
@@ -7024,7 +7023,7 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
             *fail_stop,
             "; cluster failure latch rejected: ", latched.message());
       }
-    } else if (cluster_attempt_must_retire) {
+    } else if (cluster_attempt_must_retire && !pending_admission) {
       absl::Status invalidated = cluster_group_->InvalidateProof(
           cluster_context->directive_.identity_);
       if (!invalidated.ok()) {
@@ -7042,6 +7041,13 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
         active_replica_session_.reset();
         replica_session_id_ = 0;
         source_worker_count_ = 0;
+      }
+      if (cluster_attempt_must_retire && pending_admission) {
+        pending_cluster_rebuild_.reset();
+        cluster_context->state_.store(ReplicationGroupState::kNotReady,
+                                      std::memory_order_release);
+        SetDesiredUpstream(std::nullopt);
+        PublishHeartbeatObservation();
       }
       if (cluster_attempt_must_retire && cluster_rebuild_ == cluster_context) {
         cluster_rebuild_.reset();
@@ -7382,6 +7388,19 @@ auto ReplicationManager::ReplicationGroup::TryPartialReparent(
 auto ReplicationManager::ReplicationGroup::RunReplicaSession(
     const ReplicaOfConfig& upstream, std::uint64_t role_epoch,
     const std::shared_ptr<ReplicaSession>& session) -> Task<absl::Status> {
+  LAVIK_FAULT_INJECT(
+      const char* hold = std::getenv("LAVIK_TEST_NATIVE_ADMISSION_HOLD_FILE");
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      while (hold != nullptr && ::access(hold, F_OK) == 0) {
+        if (session->cancelled() || replication_shutdown_requested_)
+          co_return absl::CancelledError("native admission fault cancelled");
+        if (std::chrono::steady_clock::now() >= deadline)
+          co_return absl::DeadlineExceededError("native admission fault held");
+        auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                                std::chrono::milliseconds(1));
+        if (!waited.ok()) co_return waited;
+      });
   auto partial = co_await TryPartialReparent(session);
   if (!partial.ok()) co_return partial;
   auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
@@ -7417,6 +7436,8 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
     // matching history and backlog cursor, advertising them could create a
     // transient ONLINE state over an incomplete replacement.
     const bool replacement_required =
+        (pending_cluster_rebuild_ != nullptr &&
+         pending_cluster_rebuild_ == session->cluster_rebuild_) ||
         storage_->ReplicaRecoveryFenced() ||
         !native_dataset_valid_.load(std::memory_order_acquire) ||
         (session->cluster_follow_ != nullptr &&
@@ -7507,7 +7528,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
   const bool scoped_cluster_handshake = session->cluster_follow_ != nullptr ||
                                         session->cluster_rebuild_ != nullptr;
   const bool full_busy = words.size() == 8 && words[0] == "-LVFULLBUSY" &&
-                         session->cluster_follow_ != nullptr;
+                         scoped_cluster_handshake;
   const bool source_group_valid =
       scoped_cluster_handshake
           ? words.size() == 8 && IsPopulationGroupToken(words[3])
@@ -7520,7 +7541,8 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
       !ParseUnsigned(words[6], &source_workers) || source_workers == 0 ||
       (full_busy ? words[7] != "?" : !IsReplicationId(words[7]))) {
     if (session->cluster_follow_ == nullptr &&
-        session->cluster_rebuild_ != nullptr) {
+        session->cluster_rebuild_ != nullptr &&
+        pending_cluster_rebuild_ != session->cluster_rebuild_) {
       (void)co_await InvalidateReplicaContinuation(session, false);
     }
     session->sockets_.Remove(control_fd);
@@ -7550,7 +7572,8 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
         words[4] != directive.identity_.source_boot_id_ ||
         words[5] != directive.identity_.source_history_id_ ||
         source_workers != directive.flow_count_) {
-      (void)co_await InvalidateReplicaContinuation(session, false);
+      if (pending_cluster_rebuild_ != session->cluster_rebuild_)
+        (void)co_await InvalidateReplicaContinuation(session, false);
       session->sockets_.Remove(control_fd);
       control.Close().IgnoreError();
       co_return absl::FailedPreconditionError(
@@ -7562,6 +7585,15 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
     session->sockets_.Remove(control_fd);
     control.Close().IgnoreError();
     co_return absl::ResourceExhaustedError(kFullAdmissionBusyStatus);
+  }
+  if (pending_cluster_rebuild_ != nullptr &&
+      pending_cluster_rebuild_ == session->cluster_rebuild_) {
+    auto admitted = AdmitPendingClusterRebuild(session);
+    if (!admitted.ok()) {
+      session->sockets_.Remove(control_fd);
+      control.Close().IgnoreError();
+      co_return admitted;
+    }
   }
   bool local_population_matches_response =
       resume_proof_advertised && requested_group == words[3] &&
@@ -7973,66 +8005,42 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
                                      std::to_string(cursor.fragment_index_),
                                      session->flow_capability_,
                                      "ACKRANGE"};
-  TcpStream stream;
-  int fd = -1;
   ReplicationConnectionMetricGuard connection_metric(
       ReplicationConnectionKind::kFlow);
-  absl::StatusOr<std::string> response;
-  for (;;) {
-    auto connected = co_await ConnectTcp(
-        upstream.host_, upstream.port_, tls_context_, &session->sockets_, true);
-    if (!connected.ok()) {
-      session->Cancel();
-      co_return connected.status();
-    }
-    stream = std::move(*connected);
-    fd = stream.NativeFd();
-    absl::Status configured = stream.SetReadAhead(false);
-    if (configured.ok()) {
-      configured =
-          co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
-    }
-    if (!configured.ok()) {
-      session->sockets_.Remove(fd);
-      stream.Close().IgnoreError();
-      session->Cancel();
-      co_return configured;
-    }
-    const std::string encoded_flow = EncodeRespCommand(flow_args);
-    absl::Status sent = co_await WriteText(stream, encoded_flow);
-    if (!sent.ok()) {
-      session->sockets_.Remove(fd);
-      stream.Close().IgnoreError();
-      session->Cancel();
-      co_return sent;
-    }
-    bool received_any = false;
-    response = co_await ReadLine(stream, &received_any);
-    // A v1 source without ACK ranges closes an eight-argument request before
-    // binding the flow. Retry its original handshake once on a fresh socket,
-    // with the same TLS, authentication, session capability and resume cursor.
-    // Authentication failures and malformed successful replies never retry.
-    const bool peer_closed =
-        response.status() ==
-            absl::UnavailableError("replication peer closed connection") ||
-        response.status() ==
-            absl::UnavailableError("TLS peer closed without close_notify");
-    if (flow_args.size() == 8 && !session->cancelled() && !received_any &&
-        peer_closed) {
-      session->sockets_.Remove(fd);
-      stream.Close().IgnoreError();
-      flow_args.pop_back();
-      continue;
-    }
-    break;
+  auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
+                                       tls_context_, &session->sockets_, true);
+  if (!connected.ok()) {
+    session->Cancel();
+    co_return connected.status();
   }
+  TcpStream stream = std::move(*connected);
+  const int fd = stream.NativeFd();
+  absl::Status configured = stream.SetReadAhead(false);
+  if (configured.ok()) {
+    configured =
+        co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
+  }
+  if (!configured.ok()) {
+    session->sockets_.Remove(fd);
+    stream.Close().IgnoreError();
+    session->Cancel();
+    co_return configured;
+  }
+  const std::string encoded_flow = EncodeRespCommand(flow_args);
+  absl::Status sent = co_await WriteText(stream, encoded_flow);
+  if (!sent.ok()) {
+    session->sockets_.Remove(fd);
+    stream.Close().IgnoreError();
+    session->Cancel();
+    co_return sent;
+  }
+  auto response = co_await ReadLine(stream);
   std::uint64_t response_session_id = 0;
   unsigned response_flow_id = 0;
   const std::vector<std::string_view> response_words =
       response.ok() ? SplitWords(*response) : std::vector<std::string_view>{};
-  const bool ack_ranges = flow_args.size() == 8 && response_words.size() == 5 &&
-                          response_words[4] == "ACKRANGE";
-  const bool valid_size = response_words.size() == 4 || ack_ranges;
+  const bool valid_size =
+      response_words.size() == 5 && response_words[4] == "ACKRANGE";
   const bool fullsync = valid_size && response_words[3] == "FULL";
   const bool continue_mode = valid_size && response_words[3] == "CONTINUE";
   if (!response.ok() || !valid_size || response_words[0] != "+LVFLOW" ||
@@ -8082,7 +8090,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
   }
   session->connected_flows_.fetch_add(1, std::memory_order_acq_rel);
   absl::Status data_status =
-      co_await RunReplicaFlowData(stream, session, flow_id, ack_ranges);
+      co_await RunReplicaFlowData(stream, session, flow_id);
   if (!data_status.ok()) {
     spdlog::warn("replication target flow {} ended: {}", flow_id,
                  data_status.message());
@@ -8537,10 +8545,8 @@ auto ReplicationManager::ReplicationGroup::AckReplicaOnlineCommands(
   // earlier ACKs behind an incomplete transaction: sparse traffic and WAIT
   // retain immediate progress without timers or locks.
   std::string frames;
-  absl::Status reserved = ReserveReplicationString(
-      &frames, state->ack_ranges_
-                   ? kDataFrameHeaderBytes + 16
-                   : kBacklogBatchFrames * (kDataFrameHeaderBytes + 10));
+  absl::Status reserved =
+      ReserveReplicationString(&frames, kDataFrameHeaderBytes + 16);
   if (!reserved.ok()) co_return reserved;
   std::string payload;
   payload.reserve(16);
@@ -8589,14 +8595,6 @@ auto ReplicationManager::ReplicationGroup::AckReplicaOnlineCommands(
         co_return absl::UnavailableError(
             "injected replication flow disconnect after command apply");
       }
-      if (!state->ack_ranges_) {
-        payload.clear();
-        PutU16(payload, 0);
-        PutU64(payload, pending.lsn_);
-        absl::Status appended =
-            AppendDataFrame(&frames, DataFrameKind::kAck, payload);
-        if (!appended.ok()) co_return appended;
-      }
       if (count == 0) first_lsn = pending.lsn_;
       last_lsn = pending.lsn_;
       ++count;
@@ -8604,25 +8602,22 @@ auto ReplicationManager::ReplicationGroup::AckReplicaOnlineCommands(
       // completion is ready. No event is acknowledged before its apply proof.
       if (state->completions_.empty() ||
           state->completions_.front().transaction_ != nullptr ||
-          (state->ack_ranges_ &&
-           (last_lsn == std::numeric_limits<std::uint64_t>::max() ||
-            state->completions_.front().lsn_ != last_lsn + 1)))
+          last_lsn == std::numeric_limits<std::uint64_t>::max() ||
+          state->completions_.front().lsn_ != last_lsn + 1)
         break;
     } while (count < kBacklogBatchFrames);
-    if (state->ack_ranges_) {
-      payload.clear();
-      const auto kind =
-          count == 1 ? DataFrameKind::kAck : DataFrameKind::kAckRange;
-      if (count == 1) {
-        PutU16(payload, 0);
-        PutU64(payload, first_lsn);
-      } else {
-        PutU64(payload, first_lsn);
-        PutU64(payload, last_lsn);
-      }
-      absl::Status appended = AppendDataFrame(&frames, kind, payload);
-      if (!appended.ok()) co_return appended;
+    payload.clear();
+    const auto kind =
+        count == 1 ? DataFrameKind::kAck : DataFrameKind::kAckRange;
+    if (count == 1) {
+      PutU16(payload, 0);
+      PutU64(payload, first_lsn);
+    } else {
+      PutU64(payload, first_lsn);
+      PutU64(payload, last_lsn);
     }
+    absl::Status appended = AppendDataFrame(&frames, kind, payload);
+    if (!appended.ok()) co_return appended;
     absl::Status acknowledged = co_await WriteText(stream, frames);
     if (!acknowledged.ok()) co_return acknowledged;
   }
@@ -8667,10 +8662,8 @@ auto ReplicationManager::ReplicationGroup::TrackReplicaOnlineAcks(
 auto ReplicationManager::ReplicationGroup::RunReplicaOnlineFlowData(
     TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
     unsigned flow_id, std::uint64_t first_expected_lsn,
-    std::pair<DataFrameKind, std::string> first_frame, bool ack_ranges)
-    -> Task<absl::Status> {
+    std::pair<DataFrameKind, std::string> first_frame) -> Task<absl::Status> {
   auto state = std::make_shared<ReplicaOnlineApplyState>();
-  state->ack_ranges_ = ack_ranges;
   bycorf::ThisWorker().self_->Spawn(
       TrackReplicaOnlineStage(stream, session, flow_id, state));
   bycorf::ThisWorker().self_->Spawn(
@@ -8960,10 +8953,10 @@ auto ReplicationManager::ReplicationGroup::TrackReplicaHandoff(
 
 auto ReplicationManager::ReplicationGroup::RunReplicaFlowData(
     TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
-    unsigned flow_id, bool ack_ranges) -> Task<absl::Status> {
+    unsigned flow_id) -> Task<absl::Status> {
   auto state = std::make_shared<ReplicaHandoffState>();
-  absl::Status result = co_await ReceiveReplicaFlowData(
-      stream, session, flow_id, state, ack_ranges);
+  absl::Status result =
+      co_await ReceiveReplicaFlowData(stream, session, flow_id, state);
   // Preserve the failure that initiated teardown. Joining outstanding handoffs
   // can report cancellation after stopping_ is set; that secondary error must
   // not hide a corrupt frame (or an earlier handoff failure).
@@ -9006,8 +8999,8 @@ auto ReplicationManager::ReplicationGroup::WaitReplicaHandoffs(
 
 auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
     TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
-    unsigned flow_id, const std::shared_ptr<ReplicaHandoffState>& state,
-    bool ack_ranges) -> Task<absl::Status> {
+    unsigned flow_id, const std::shared_ptr<ReplicaHandoffState>& state)
+    -> Task<absl::Status> {
   absl::flat_hash_map<std::uint16_t, std::uint64_t> epochs;
   std::uint64_t expected_fullsync_sequence = 1;
   std::optional<std::uint64_t> online_next_lsn;
@@ -9462,8 +9455,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
             "replication command arrived without an ONLINE cursor");
       }
       co_return co_await RunReplicaOnlineFlowData(
-          stream, session, flow_id, *online_next_lsn, std::move(*frame),
-          ack_ranges);
+          stream, session, flow_id, *online_next_lsn, std::move(*frame));
     } else if (frame->first == DataFrameKind::kCursor) {
       DataReader reader(frame->second);
       std::uint64_t lsn = 0;
@@ -9924,7 +9916,7 @@ auto ReplicationManager::ReplicationGroup::SendFullSyncRequest(
 
 auto ReplicationManager::ReplicationGroup::RunMasterFlowData(
     TcpStream& stream, const std::shared_ptr<MasterSession>& session,
-    unsigned flow_id, bool ack_ranges) -> Task<absl::Status> {
+    unsigned flow_id) -> Task<absl::Status> {
   auto state =
       std::make_shared<FullSyncAckState>(flow_id, storage_->worker_count());
   bycorf::ThisWorker().self_->Spawn(
@@ -9954,7 +9946,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowData(
     }
   });
   co_return co_await EnterMasterFlowBacklog(stream, session, flow_id, *cursor,
-                                            0, ack_ranges);
+                                            0);
 }
 
 auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
@@ -11052,8 +11044,8 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
 
 auto ReplicationManager::ReplicationGroup::EnterMasterFlowBacklog(
     TcpStream& stream, const std::shared_ptr<MasterSession>& session,
-    unsigned flow_id, std::uint64_t next_lsn, std::uint32_t fragment_index,
-    bool ack_ranges) -> Task<absl::Status> {
+    unsigned flow_id, std::uint64_t next_lsn, std::uint32_t fragment_index)
+    -> Task<absl::Status> {
   storage::ReplicationLogCursor cursor{.lsn_ = next_lsn,
                                        .fragment_index_ = fragment_index};
   absl::Status retained =
@@ -11083,8 +11075,7 @@ auto ReplicationManager::ReplicationGroup::EnterMasterFlowBacklog(
   bycorf::ThisWorker().self_->Spawn(
       MonitorBacklogStall(session, flow_id, stream.NativeFd(),
                           session->ProgressGeneration(flow_id)));
-  co_return co_await RunMasterFlowBacklog(stream, session, flow_id, cursor,
-                                          ack_ranges);
+  co_return co_await RunMasterFlowBacklog(stream, session, flow_id, cursor);
 }
 
 auto ReplicationManager::ReplicationGroup::ReceiveMasterFlowBacklogAcks(
@@ -11115,7 +11106,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveMasterFlowBacklogAcks(
             "malformed replication command ACK");
       }
       last_lsn = first_lsn;
-    } else if (ack->first == DataFrameKind::kAckRange && duplex->ack_ranges_) {
+    } else if (ack->first == DataFrameKind::kAckRange) {
       if (!ack_reader.U64(&first_lsn) || !ack_reader.U64(&last_lsn) ||
           last_lsn < first_lsn || last_lsn - first_lsn >= kBacklogBatchFrames) {
         co_return absl::InvalidArgumentError("malformed replication ACK range");
@@ -11198,10 +11189,9 @@ auto ReplicationManager::ReplicationGroup::MonitorBacklogStall(
 
 auto ReplicationManager::ReplicationGroup::RunMasterFlowBacklog(
     TcpStream& stream, const std::shared_ptr<MasterSession>& session,
-    unsigned flow_id, storage::ReplicationLogCursor cursor, bool ack_ranges)
+    unsigned flow_id, storage::ReplicationLogCursor cursor)
     -> Task<absl::Status> {
   auto duplex = std::make_shared<MasterBacklogDuplexState>();
-  duplex->ack_ranges_ = ack_ranges;
   bycorf::ThisWorker().self_->Spawn(
       TrackMasterFlowBacklogAcks(stream, session, flow_id, duplex));
   absl::Status sender_status = absl::OkStatus();
@@ -11923,10 +11913,9 @@ auto ReplicationManager::ReplicationGroup::ServeMasterFlow(
   unsigned flow_id = 0;
   std::uint64_t next_lsn = 0;
   std::uint32_t fragment_index = 0;
-  const bool ack_ranges = args.size() == 8 && args[7] == "ACKRANGE";
-  if ((args.size() != 7 && !ack_ranges) || args[1] != kProtocolVersion ||
-      !ParseUnsigned(args[2], &session_id) || session_id == 0 ||
-      !ParseUnsigned(args[3], &flow_id) ||
+  if (args.size() != 8 || args[7] != "ACKRANGE" ||
+      args[1] != kProtocolVersion || !ParseUnsigned(args[2], &session_id) ||
+      session_id == 0 || !ParseUnsigned(args[3], &flow_id) ||
       flow_id != bycorf::ThisWorker().id_ ||
       !ParseUnsigned(args[4], &next_lsn) || next_lsn == 0 ||
       !ParseUnsigned(args[5], &fragment_index) || !IsReplicationId(args[6])) {
@@ -11983,13 +11972,11 @@ auto ReplicationManager::ReplicationGroup::ServeMasterFlow(
   if (!selected_continue_mode && session->allow_continue_ &&
       session->steady_export_.has_value()) {
     // Coverage was lost after control admitted a possible continuation. The
-    // target still owns its trusted root: its existing v1 FULL mode barrier
+    // target still owns its trusted root: its FULL mode barrier
     // requests fresh control admission before mutation. Return only that mode;
     // no capture or publisher starts here, even if the quota is currently free.
-    // Keeping FULL (rather than a new mode) also lets older v1 followers retry.
-    const std::string reply =
-        absl::StrCat("+LVFLOW ", session_id, " ", flow_id, " FULL",
-                     ack_ranges ? " ACKRANGE\r\n" : "\r\n");
+    const std::string reply = absl::StrCat("+LVFLOW ", session_id, " ", flow_id,
+                                           " FULL ACKRANGE\r\n");
     absl::Status sent = co_await WriteText(stream, reply);
     session->ClearFlow(flow_id, stream.NativeFd());
     if (!sent.ok()) session->Cancel();
@@ -12007,10 +11994,9 @@ auto ReplicationManager::ReplicationGroup::ServeMasterFlow(
       co_return admitted;
     }
   }
-  const std::string flow_reply =
-      absl::StrCat("+LVFLOW ", session_id, " ", flow_id, " ",
-                   selected_continue_mode ? "CONTINUE" : "FULL",
-                   ack_ranges ? " ACKRANGE\r\n" : "\r\n");
+  const std::string flow_reply = absl::StrCat(
+      "+LVFLOW ", session_id, " ", flow_id, " ",
+      selected_continue_mode ? "CONTINUE" : "FULL", " ACKRANGE\r\n");
   absl::Status sent = co_await WriteText(stream, flow_reply);
   if (!sent.ok()) {
     session->ClearFlow(flow_id, stream.NativeFd());
@@ -12024,9 +12010,9 @@ auto ReplicationManager::ReplicationGroup::ServeMasterFlow(
   absl::Status waited;
   if (selected_continue_mode) {
     waited = co_await EnterMasterFlowBacklog(stream, session, flow_id, next_lsn,
-                                             fragment_index, ack_ranges);
+                                             fragment_index);
   } else {
-    waited = co_await RunMasterFlowData(stream, session, flow_id, ack_ranges);
+    waited = co_await RunMasterFlowData(stream, session, flow_id);
   }
   if (!waited.ok()) {
     spdlog::warn("replication source flow {} ended: {}", flow_id,
@@ -12055,14 +12041,15 @@ auto ReplicationManager::ReplicationGroup::AdmitMasterFullSessionLocked(
     const std::shared_ptr<MasterSession>& session) -> absl::Status {
   PruneFullSessionsLocked();
   if (session->full_active()) return absl::OkStatus();
-  // This rollout limits automatic FollowOwner FULL only. Explicit rebuilds
-  // use the same lifecycle ledger and join the quota in the next change.
-  if (session->steady_export_.has_value() &&
-      std::any_of(
-          full_sessions_.begin(), full_sessions_.end(),
-          [](const auto& full) { return full->steady_export_.has_value(); })) {
+  // All Meta-native entry points share this ledger.
+  if (session->population_export_ != nullptr &&
+      std::any_of(full_sessions_.begin(), full_sessions_.end(),
+                  [](const auto& full) {
+                    return full->population_export_ != nullptr;
+                  })) {
     spdlog::info("native FULL admission busy for group {} target {}",
-                 session->steady_export_->group_id_, session->node_id_);
+                 session->population_export_->directive_.identity_.group_id_,
+                 session->node_id_);
     return absl::ResourceExhaustedError(kFullAdmissionBusyStatus);
   }
   absl::Status admitted = session->AdmitFull();
