@@ -1771,6 +1771,37 @@ struct MasterSession {
     return online_.load(std::memory_order_acquire) && !cancelled();
   }
 
+  // Admission is serialized by the group's coroutine-aware registry gate.
+  // Control classification and late all-flow fallback share this exact owner;
+  // neither a reconnect nor another flow acquires a second FULL lifecycle.
+  absl::Status AdmitFull() {
+    if (cancelled()) return absl::CancelledError("FULL session was retired");
+    full_admitted_.store(true, std::memory_order_release);
+    return absl::OkStatus();
+  }
+
+  // Ready flow cursors acknowledge the target's complete all-flow cut and
+  // promotion. Snapshot completion or one flow's ACK is insufficient. Called
+  // under the registry gate; cancellation racing this cut can only delay
+  // release until drain, never release a different session.
+  void CompleteFull() {
+    if (all_flows_ready()) {
+      full_completed_.store(true, std::memory_order_release);
+    }
+  }
+
+  bool full_active() const noexcept {
+    if (!full_admitted_.load(std::memory_order_acquire) ||
+        full_completed_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    // Removal from master_sessions_ only retires control ownership. Capture,
+    // publisher queues and ACK readers may still live on the flow workers.
+    // ClearFlow runs after their cleanup; MarkControlComplete closes the last
+    // possible control-side setup. Both belong to this session incarnation.
+    return !cancelled() || control_active() || connected_flows() != 0;
+  }
+
   void Cancel() {
     if (cancelled_.exchange(true, std::memory_order_acq_rel)) return;
     {
@@ -1814,6 +1845,14 @@ struct MasterSession {
   // without conflating it with a one-shot population rebuild export.
   const std::optional<ClusterSteadyExport> steady_export_;
 
+  // Only the control worker accesses the reader state. Its task observes a
+  // disconnect even before the first flow arrives; RemoveMasterSession joins
+  // it before the control stream can be destroyed.
+  bool control_reader_started_ = false;
+  bool control_reader_done_ = false;
+  absl::Status control_reader_status_;
+  bycorf::AsyncNotification control_closed_;
+
  private:
   mutable std::mutex mutex_;
   int control_fd_ = -1;
@@ -1834,6 +1873,8 @@ struct MasterSession {
   std::atomic<bool> control_active_{true};
   std::atomic<bool> ever_online_{false};
   std::atomic<bool> online_{false};
+  std::atomic<bool> full_admitted_{false};
+  std::atomic<bool> full_completed_{false};
   std::atomic<bool> cancelled_{false};
 };
 
@@ -2711,6 +2752,15 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> RemoveMasterSession(
       const std::shared_ptr<MasterSession>& session);
 
+  // Called with master_mutex_ held, before a successful control/FULL flow
+  // response can authorize destructive work on the target. Default admission
+  // is unlimited; the session remains the owner through success or drain.
+  absl::Status AdmitMasterFullSessionLocked(
+      const std::shared_ptr<MasterSession>& session);
+  void PruneFullSessionsLocked();
+  Task<absl::Status> WatchMasterControl(TcpStream& stream,
+                                        std::shared_ptr<MasterSession> session);
+
   Task<absl::Status> DrainSourceEgress();
 
   Task<absl::Status> DisableSourceHistory();
@@ -2955,6 +3005,10 @@ class ReplicationManager::ReplicationGroup {
   absl::flat_hash_map<std::uint64_t, std::shared_ptr<MasterSession>>
       master_sessions_;
   std::vector<std::shared_ptr<MasterSession>> retired_master_sessions_;
+  // FULL ownership outlives transport registry retirement, including history
+  // reset and role drain. Guarded by master_mutex_; terminal entries are
+  // reclaimed on admission, completion and the existing retirement sweep.
+  std::vector<std::shared_ptr<MasterSession>> full_sessions_;
   absl::flat_hash_map<std::string, DisconnectedReplicaLease>
       disconnected_replica_leases_;
   bool idle_history_monitor_running_ = false;  // worker 0 only

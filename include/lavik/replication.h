@@ -194,6 +194,9 @@ struct ReplicationStatus {
   std::uint64_t session_id_ = 0;
   unsigned source_worker_count_ = 0;
   unsigned connected_flows_ = 0;
+  // Source-side whole-session FULL work, including cancelled sessions whose
+  // flows have not drained. Successful ONLINE sessions do not count.
+  unsigned full_sync_sessions_ = 0;
   std::string local_node_id_;
   std::string group_id_;
   std::string boot_id_;

@@ -204,6 +204,118 @@ def ready(meta):
     C.wait_cluster_ready(meta, "native population and authority ready", 90)
 
 
+def full_session_lifecycle(root):
+    # A session owns one FULL across unequal source/target worker layouts.
+    # Source work can outlive its control connection, while a completed FULL
+    # must stop counting even though all ONLINE connections remain open.
+    for cancel in (False, True):
+        with pair(
+            root,
+            "full-lifecycle-cancel" if cancel else "full-lifecycle-complete",
+            source_faults={"LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "5000"},
+        ) as (meta, source, target, writer):
+            H.wait_until(
+                "FULL source work paused",
+                30,
+                lambda: "paused full sync after acknowledged handoff partition"
+                in Path(source.log_path).read_text(),
+            )
+            assert "lavik_full_sync_sessions:1\r\n" in writer.call(
+                "INFO", "replication"
+            )
+            if cancel:
+                target.force_kill()
+                H.wait_until(
+                    "FULL control retired before source flow drained",
+                    3,
+                    lambda: "connected_slaves:0\r\n"
+                    in writer.call("INFO", "replication"),
+                )
+                assert "lavik_full_sync_sessions:1\r\n" in writer.call(
+                    "INFO", "replication"
+                )
+            else:
+                ready(meta)
+            H.wait_until(
+                "FULL work released",
+                30,
+                lambda: "lavik_full_sync_sessions:0\r\n"
+                in writer.call("INFO", "replication"),
+            )
+            if not cancel:
+                assert ",state=online," in writer.call("INFO", "replication")
+                reader = Client(target, readonly=True)
+                try:
+                    assert reader.call("GET", "{native}seed") == "baseline"
+                finally:
+                    reader.close()
+
+
+def full_completion_reconnect(root):
+    hold = root / "promotion-ack.hold"
+
+    def seed(writer):
+        # Both flows need a non-initial continuation cursor even if the first
+        # control connection closes before it supplies an ORIGIN capability.
+        for key in ("cut-counter-{foo}", "cut-counter-{user1000}"):
+            writer.call("SET", key, "baseline")
+
+    try:
+        with pair(
+            root,
+            "full-cut-reconnect",
+            source_faults={"LAVIK_FULL_AFTER_PROMOTION_ACK_HOLD_FILE": str(hold)},
+            seed=seed,
+        ) as (meta, source, target, writer):
+            ready(meta)
+            H.wait_until(
+                "initial population is ONLINE",
+                30,
+                lambda: ",state=online," in writer.call("INFO", "replication"),
+            )
+            # Exercise steady following after genesis has removed its explicit
+            # directives. Their retirement intentionally joins old exports.
+            hold.touch()
+            target.force_kill()
+            target.environment = {
+                **os.environ,
+                "LAVIK_REPLICATION_DROP_AFTER_FULLSYNC_CUT": "1",
+            }
+            target.start()
+            H.wait_until(
+                "old FULL holds acknowledged promotion during cancellation",
+                30,
+                lambda: "paused after promotion acknowledgement"
+                in Path(source.log_path).read_text(),
+            )
+            H.wait_until(
+                "replacement CONTINUE is ONLINE beside old FULL drain",
+                30,
+                lambda: ",state=online," in writer.call("INFO", "replication"),
+            )
+            assert "lavik_full_sync_sessions:1\r\n" in writer.call(
+                "INFO", "replication"
+            )
+            hold.unlink()
+            H.wait_until(
+                "late old-session completion releases only old FULL",
+                30,
+                lambda: "lavik_full_sync_sessions:0\r\n"
+                in writer.call("INFO", "replication"),
+            )
+            info = writer.call("INFO", "replication")
+            assert "connected_slaves:1\r\n" in info and ",state=online," in info
+            ready(meta)
+            writer.call("SET", "{native}seed", "after-old-drain")
+            H.wait_until(
+                "replacement still applies after old callback",
+                20,
+                lambda: C.readonly_get(target, "{native}seed") == "after-old-drain",
+            )
+    finally:
+        hold.unlink(missing_ok=True)
+
+
 def rejects(client, args, text):
     try:
         reply = client.call(*args)
@@ -1455,6 +1567,8 @@ def main():
         full_tail(root)
         backpressured_shutdown(root)
         if C.has_fault(C.DATA, b"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK"):
+            full_session_lifecycle(root)
+            full_completion_reconnect(root)
             full_tail_publish_before_reset(root)
             full_tail_expiration_effects(root)
             small_receive_window(root)

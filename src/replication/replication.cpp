@@ -6011,6 +6011,9 @@ auto ReplicationManager::ReplicationGroup::status() const
     bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
     result.local_history_id_ = history_id_;
     result.downstream_replicas_.reserve(master_sessions_.size());
+    for (const auto& session : full_sessions_) {
+      if (session->full_active()) ++result.full_sync_sessions_;
+    }
     for (const auto& [session_id, session] : master_sessions_) {
       (void)session_id;
       if (session->node_id_.empty() || session->host_.empty() ||
@@ -9890,6 +9893,20 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowData(
   if (!state->status_.ok()) co_return state->status_;
   if (!cursor.ok()) co_return cursor.status();
   state.reset();
+  LAVIK_FAULT_INJECT({
+    const char* hold = std::getenv("LAVIK_FULL_AFTER_PROMOTION_ACK_HOLD_FILE");
+    if (flow_id == 0 && hold != nullptr && ::access(hold, F_OK) == 0) {
+      spdlog::info("FULL session {} paused after promotion acknowledgement",
+                   session->id_);
+      // Deliberately retain the joined FULL flow across cancellation so the
+      // process gate can observe old-session drain beside a new CONTINUE.
+      while (::access(hold, F_OK) == 0 && !replication_shutdown_requested_) {
+        auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                                std::chrono::milliseconds(10));
+        if (!waited.ok()) co_return waited;
+      }
+    }
+  });
   co_return co_await EnterMasterFlowBacklog(stream, session, flow_id, *cursor,
                                             0, ack_ranges);
 }
@@ -11668,6 +11685,10 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
         allow_continue, std::move(*applied), std::move(authorized_population),
         std::move(authorized_follow));
     session->allow_initial_cursor_ = allow_initial_cursor;
+    if (!protocol_probe && !allow_continue) {
+      absl::Status admitted = AdmitMasterFullSessionLocked(session);
+      if (!admitted.ok()) co_return admitted;
+    }
     if (!session->SetControl(stream.NativeFd())) {
       co_return absl::InternalError("failed to register control connection");
     }
@@ -11726,6 +11747,8 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
 
   const auto started = std::chrono::steady_clock::now();
   std::vector<std::uint64_t> observed_progress(session->worker_count());
+  session->control_reader_started_ = true;
+  bycorf::ThisWorker().self_->Spawn(WatchMasterControl(stream, session));
   std::vector<std::chrono::steady_clock::time_point> stall_deadlines(
       session->worker_count(), started + kFullSyncStallTimeout);
   for (unsigned flow = 0; flow < session->worker_count(); ++flow) {
@@ -11811,6 +11834,8 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
   {
     co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
     bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
+    session->CompleteFull();
+    PruneFullSessionsLocked();
     const auto lease = disconnected_replica_leases_.find(session->node_id_);
     if (lease != disconnected_replica_leases_.end() &&
         lease->second.session_id_ < session->id_) {
@@ -11819,7 +11844,9 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
   }
   spdlog::info("accepted replication session {} with {} data flows", session_id,
                session->worker_count());
-  absl::Status waited = co_await WaitForClose(stream);
+  while (!session->control_reader_done_)
+    co_await session->control_closed_.Wait();
+  absl::Status waited = session->control_reader_status_;
   (void)co_await RemoveMasterSession(session);
   co_return waited;
 }
@@ -11887,6 +11914,18 @@ auto ReplicationManager::ReplicationGroup::ServeMasterFlow(
         "replication session ended before flow mode selection");
   }
   const bool selected_continue_mode = *session_continue_mode;
+  if (!selected_continue_mode) {
+    // Coverage can disappear after the optimistic control classification.
+    // Admit the same session before any FULL response or source capture.
+    co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+    bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
+    absl::Status admitted = AdmitMasterFullSessionLocked(session);
+    if (!admitted.ok()) {
+      session->Cancel();
+      session->ClearFlow(flow_id, stream.NativeFd());
+      co_return admitted;
+    }
+  }
   const std::string flow_reply =
       absl::StrCat("+LVFLOW ", session_id, " ", flow_id, " ",
                    selected_continue_mode ? "CONTINUE" : "FULL",
@@ -11931,6 +11970,30 @@ auto ReplicationManager::ReplicationGroup::ServeMasterFlow(
   co_return waited;
 }
 
+auto ReplicationManager::ReplicationGroup::AdmitMasterFullSessionLocked(
+    const std::shared_ptr<MasterSession>& session) -> absl::Status {
+  PruneFullSessionsLocked();
+  if (session->full_active()) return absl::OkStatus();
+  absl::Status admitted = session->AdmitFull();
+  if (admitted.ok()) full_sessions_.push_back(session);
+  return admitted;
+}
+
+auto ReplicationManager::ReplicationGroup::PruneFullSessionsLocked() -> void {
+  std::erase_if(full_sessions_,
+                [](const auto& full) { return !full->full_active(); });
+}
+
+auto ReplicationManager::ReplicationGroup::WatchMasterControl(
+    TcpStream& stream, std::shared_ptr<MasterSession> session)
+    -> Task<absl::Status> {
+  session->control_reader_status_ = co_await WaitForClose(stream);
+  session->Cancel();
+  session->control_reader_done_ = true;
+  session->control_closed_.NotifyAll(*bycorf::ThisWorker().self_);
+  co_return absl::OkStatus();
+}
+
 auto ReplicationManager::ReplicationGroup::RemoveMasterSession(
     const std::shared_ptr<MasterSession>& session) -> Task<absl::Status> {
   {
@@ -11946,6 +12009,9 @@ auto ReplicationManager::ReplicationGroup::RemoveMasterSession(
     }
   }
   session->Cancel();
+  while (session->control_reader_started_ && !session->control_reader_done_) {
+    co_await session->control_closed_.Wait();
+  }
   co_return absl::OkStatus();
 }
 
@@ -11994,6 +12060,11 @@ auto ReplicationManager::ReplicationGroup::DrainSourceEgress()
   // Flow teardown performs any history reset before ClearFlow drops the
   // final connected-flow count. Together with the monitor/reset flags, this
   // joins every old source task before its history can be disabled.
+  {
+    co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+    bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
+    PruneFullSessionsLocked();
+  }
   co_return absl::OkStatus();
 }
 
@@ -12016,6 +12087,7 @@ auto ReplicationManager::ReplicationGroup::RetireSourceHistory()
 
 auto ReplicationManager::ReplicationGroup::FinalizeRetiredMasterSessionsLocked()
     -> void {
+  PruneFullSessionsLocked();
   auto retired = retired_master_sessions_.begin();
   while (retired != retired_master_sessions_.end()) {
     const std::shared_ptr<MasterSession>& session = *retired;

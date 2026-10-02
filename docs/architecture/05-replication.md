@@ -140,6 +140,18 @@ flow cannot invalidate its replacement. The downstream registry retains its
 coroutine-aware cross-worker gate because source flow workers also access it;
 it does not block an operating-system worker thread.
 
+Each native target session owns one FULL lifecycle shared by its control
+connection and every source flow. Control admits a known FULL before its
+successful response can authorize destructive target replacement; a late
+coverage fallback enters the same admission boundary before replying FULL or
+starting capture. Admission is unlimited. The lifecycle completes only after
+all flows acknowledge the target's complete cut and promotion; an ONLINE
+session no longer owns FULL work. On cancellation, control retirement and FULL
+drain are distinct: the exact session remains active until its control setup
+and all source flows, capture queues and ACK readers have exited. The
+`lavik_full_sync_sessions` field in `INFO replication` includes this retired
+but undrained work.
+
 ## Roles and lifecycle
 
 ### Non-Meta Single mode

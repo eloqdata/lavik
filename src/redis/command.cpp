@@ -5046,6 +5046,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
                                : replication.replica_repl_offset_) +
             "\r\n";
     info += "second_repl_offset:-1\r\n";
+    info += "lavik_full_sync_sessions:" +
+            std::to_string(replication.full_sync_sessions_) + "\r\n";
     if (replication.role_ == ReplicationRole::kMaster) {
       info += "connected_slaves:" +
               std::to_string(replication.downstream_replicas_.size()) + "\r\n";
