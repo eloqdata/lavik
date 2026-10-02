@@ -447,6 +447,9 @@ class StallingNativeSource {
 // desired-state boundary rather than reimplementing native FULL in a fixture.
 class FollowOwnerSource {
  public:
+  void SetFullBusy(bool busy) { full_busy_.store(busy); }
+  unsigned busy_replies() const { return busy_replies_.load(); }
+
   FollowOwnerSource(std::string source_node_id, std::string source_boot_id,
                     std::string source_history_id, std::string group_token,
                     bool export_ready, std::string flow_mode = "FULL")
@@ -704,6 +707,19 @@ class FollowOwnerSource {
           request.find(RespBulk(source_history_id_)) != std::string::npos) {
         saw_resume_proof_.store(true, std::memory_order_release);
       }
+      if (full_busy_.load()) {
+        const std::string response = "-LVFULLBUSY 0 " + source_node_id_ + " " +
+                                     group_token_ + " " + source_boot_id_ +
+                                     " " + source_history_id_ + " 1 ?\r\n";
+        if (::send(connection, response.data(), response.size(),
+                   MSG_NOSIGNAL) != static_cast<ssize_t>(response.size())) {
+          error_.store(errno == 0 ? EIO : errno);
+          return;
+        }
+        busy_replies_.fetch_add(1);
+        replied = true;
+        continue;
+      }
       const std::string response = "+LVFULLRESYNC 1 " + source_node_id_ + " " +
                                    group_token_ + " " + source_boot_id_ + " " +
                                    source_history_id_ + " 1 " +
@@ -725,6 +741,8 @@ class FollowOwnerSource {
   std::string source_history_id_;
   std::string group_token_;
   bool export_ready_ = false;
+  std::atomic<bool> full_busy_{false};
+  std::atomic<unsigned> busy_replies_{0};
   std::string flow_mode_;
   std::jthread thread_;
   std::vector<std::jthread> handlers_;
@@ -4562,6 +4580,7 @@ class FollowOwnerReconcileService final : public bycorf::Service {
         lavik::ReplicaOfConfig{"127.0.0.1", replacement_->port()};
     replacement.members_.back() = {replacement.owner_node_id_,
                                    replacement.owner_assignment_id_};
+    replacement_->SetFullBusy(true);
     reconciled =
         co_await replication_->ReconcileClusterFollowOwner(replacement);
     if (!reconciled.ok()) co_return reconciled;
@@ -4576,6 +4595,26 @@ class FollowOwnerReconcileService final : public bycorf::Service {
         worker, [&] { return replacement_->saw_follow_scope(); },
         "replacement source did not receive steady FOLLOW scope");
     if (!waited.ok()) co_return waited;
+
+    waited = co_await WaitUntil(
+        worker, [&] { return replacement_->busy_replies() >= 3; },
+        "busy FULL did not retry the current follow relationship");
+    if (!waited.ok()) co_return waited;
+    const auto busy_population = co_await CheckedPopulation(*replication_);
+    if (!busy_population.ready_token_.has_value() ||
+        busy_population.ready_token_->identity() !=
+            before_export_ready.ready_token_->identity() ||
+        busy_population.applied_next_lsns_ !=
+            before_export_ready.applied_next_lsns_ ||
+        storage_->ReplicaRecoveryFenced() || replacement_->flows() != 0) {
+      co_return TestFailure("busy FULL withdrew trusted population evidence");
+    }
+    reconciled = co_await replication_->CancelInProgressClusterPopulation(true);
+    if (!reconciled.ok()) co_return reconciled;
+    reconciled =
+        co_await replication_->ReconcileClusterFollowOwner(replacement);
+    if (!reconciled.ok()) co_return reconciled;
+    replacement_->SetFullBusy(false);
 
     // Once the source admits FULL, the old Active proof must be withdrawn
     // before the destructive replacement can expose any incomplete data.
@@ -5391,6 +5430,50 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
           "concurrent followers did not receive the exact steady export");
     }
 
+    auto busy = OpenPeer(worker);
+    if (!busy.ok()) co_return busy.status();
+    RequestResult busy_control;
+    worker.Spawn(RunNativeRequest(
+        busy->stream_,
+        control_args(std::string(40, '1'), "target-assignment-1",
+                     std::string(40, '5'), std::string(40, '3'), false),
+        106, &busy_control));
+    auto busy_reply = co_await ReadPeerLine(worker, busy->peer_fd_,
+                                            "competing FULL source response");
+    if (!busy_reply.ok()) co_return busy_reply.status();
+    const bool competing_full_rejected =
+        busy_reply->starts_with("-LVFULLBUSY 0 ") &&
+        (co_await replication_->Observe()).full_sync_sessions_ == 1;
+
+    auto miss = OpenPeer(worker);
+    if (!miss.ok()) co_return miss.status();
+    RequestResult miss_control;
+    worker.Spawn(RunNativeRequest(
+        miss->stream_,
+        control_args(std::string(40, '1'), "target-assignment-1",
+                     std::string(40, '5'), std::string(40, '3'), true),
+        107, &miss_control));
+    auto miss_reply = co_await ReadPeerLine(worker, miss->peer_fd_,
+                                            "coverage-miss control response");
+    if (!miss_reply.ok()) co_return miss_reply.status();
+    const auto miss_words = Words(*miss_reply);
+    if (miss_words.size() != 8)
+      co_return TestFailure("invalid continuation response");
+    auto miss_flow = OpenPeer(worker);
+    if (!miss_flow.ok()) co_return miss_flow.status();
+    RequestResult miss_flow_result;
+    worker.Spawn(
+        RunNativeRequest(miss_flow->stream_,
+                         {"LVFLOW", "1", std::string(miss_words[1]), "0",
+                          "999999", "0", std::string(miss_words[7])},
+                         108, &miss_flow_result));
+    auto miss_mode = co_await ReadPeerLine(worker, miss_flow->peer_fd_,
+                                           "coverage-miss flow response");
+    if (!miss_mode.ok()) co_return miss_mode.status();
+    const bool miss_requires_admission =
+        miss_mode->ends_with(" FULL") &&
+        (co_await replication_->Observe()).full_sync_sessions_ == 1;
+
     reconciled = co_await replication_->ReconcileClusterFollowOwner(desired);
     if (!reconciled.ok()) co_return reconciled;
     waited = co_await bycorf::SleepFor(worker, 20ms);
@@ -5460,6 +5543,20 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
     waited = co_await WaitDone(worker, second_control,
                                "second steady export cleanup");
     if (!waited.ok()) co_return waited;
+    waited = co_await WaitDone(worker, busy_control,
+                               "competing FULL control cleanup");
+    if (!waited.ok()) co_return waited;
+    waited = co_await WaitDone(worker, miss_control,
+                               "coverage-miss control cleanup");
+    if (!waited.ok()) co_return waited;
+    waited = co_await WaitDone(worker, miss_flow_result,
+                               "coverage-miss flow cleanup");
+    if (!waited.ok()) co_return waited;
+    if (!competing_full_rejected || !miss_requires_admission) {
+      co_return TestFailure(
+          "source admitted competing FULL sessions or bypassed fresh "
+          "admission");
+    }
     // Both probes have ended without an online downstream. Let the standalone
     // idle-history monitor's 10 ms tick run: Meta still owns this population
     // and its advertised history even while no replica is connected.

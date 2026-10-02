@@ -193,6 +193,12 @@ constexpr std::string_view kLeaseAdmissionSuspendedReply = "-LVLEASESUSPENDED";
 constexpr std::string_view kLeaseAdmissionSuspendedStatus =
     "cluster source admission is suspended until lease renewal";
 constexpr unsigned kLeaseAdmissionPreMutationRetries = 3;
+constexpr std::string_view kFullAdmissionBusyStatus =
+    "native FULL admission is busy";
+constexpr std::string_view kFullAdmissionReplyPayload =
+    "lavik.replication/full-admission-reply";
+
+bool IsFullAdmissionBusy(const absl::Status& status);
 
 bool IsLeaseAdmissionSuspended(const absl::Status& status);
 

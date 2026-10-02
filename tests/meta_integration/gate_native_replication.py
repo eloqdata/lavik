@@ -316,6 +316,162 @@ def full_completion_reconnect(root):
         hold.unlink(missing_ok=True)
 
 
+def follow_full_limit(root):
+    import gate_failover as F
+
+    for cancel in (False, True):
+        name = "follow-full-failure" if cancel else "follow-full-success"
+        fixture = F.FailoverFixture(
+            C.META,
+            C.DATA,
+            C.CTL,
+            str(root / name),
+            False,
+            data_workers=2,
+            four_data=True,
+            client_mode=CLIENT_MODE,
+        )
+        source, first, second, healthy = fixture.data_nodes
+        arm = root / (name + ".arm")
+        source.environment = {
+            **os.environ,
+            "LAVIK_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS": "10000",
+            "LAVIK_REPLICATION_FULLSYNC_PAUSE_ARM_FILE": str(arm),
+        }
+        continue_key = "quota-continue-{foo}"
+        healthy.environment = {
+            **os.environ,
+            "LAVIK_REPLICATION_CANCEL_PEER_FLOW_AFTER_COMMAND_APPLY_ONCE": continue_key,
+        }
+        writer = None
+        try:
+            fixture.start_created()
+            writer = Client(source)
+            for key in ("quota-{foo}", "quota-{user1000}"):
+                writer.call("SET", key, "before-full")
+                H.wait_until(
+                    "every follower has resumable data",
+                    20,
+                    lambda: all(
+                        C.readonly_get(n, key) == "before-full"
+                        for n in (first, second, healthy)
+                    ),
+                )
+            first.force_kill()
+            second.force_kill()
+            H.wait_until(
+                "only healthy ONLINE remains",
+                10,
+                lambda: "connected_slaves:1\r\n"
+                in C.redis_call(source, ["INFO", "replication"]),
+            )
+            arm.touch()
+            source_log_start = len(Path(source.log_path).read_text())
+            first.start()
+            H.wait_until(
+                "first automatic FULL holds source work",
+                30,
+                lambda: "paused full sync after acknowledged handoff partition"
+                in Path(source.log_path).read_text()[source_log_start:],
+            )
+            second_log_start = len(Path(second.log_path).read_text())
+            second.start()
+            H.wait_until(
+                "second automatic FULL receives busy",
+                10,
+                lambda: "native FULL admission is busy"
+                in Path(second.log_path).read_text()[second_log_start:],
+            )
+            assert (
+                "durably invalidated system state"
+                not in Path(second.log_path).read_text()[second_log_start:]
+            )
+            assert "lavik_full_sync_sessions:1\r\n" in writer.call(
+                "INFO", "replication"
+            )
+            # Existing ONLINE traffic and a fresh CONTINUE must pass a held FULL.
+            continue_before = (
+                Path(source.log_path).read_text().count("selected=CONTINUE")
+            )
+            # Trigger the healthy target's own existing cancellation seam. A
+            # cached source CLIENT id can retire during unrelated reconnects.
+            assert writer.call("SET", continue_key, "reconnect") == "OK"
+            H.wait_until(
+                "healthy follower cancels its own native session",
+                5,
+                lambda: "injected peer-flow session cancellation after command apply"
+                in Path(healthy.log_path).read_text(),
+            )
+            H.wait_until(
+                "healthy follower continues beside FULL",
+                5,
+                lambda: Path(source.log_path).read_text().count("selected=CONTINUE")
+                > continue_before,
+            )
+            if cancel:
+                first.force_kill()
+                time.sleep(0.2)
+                assert "lavik_full_sync_sessions:1\r\n" in writer.call(
+                    "INFO", "replication"
+                )
+            else:
+                # A new Meta control session must retain source live accounting.
+                fixture.leader.force_kill()
+                H.wait_until(
+                    "Meta replacement leader",
+                    10,
+                    lambda: fixture.rediscover_leader(time.monotonic() + 1),
+                )
+            arm.unlink()
+            H.wait_until(
+                "waiting follower admitted after source work drains",
+                60,
+                lambda: "durably activated population"
+                in Path(second.log_path).read_text()[second_log_start:]
+                and "master_link_status:up\r\n"
+                in C.redis_call(second, ["INFO", "replication"])
+                and C.readonly_get(second, "quota-{foo}") == "before-full",
+            )
+            H.wait_until(
+                "FULL quota released while completed exports remain ONLINE",
+                30,
+                lambda: "lavik_full_sync_sessions:0\r\n"
+                in C.redis_call(source, ["INFO", "replication"]),
+            )
+            if cancel:
+                assert not first.alive()
+            else:
+                H.wait_until(
+                    "first FULL still serves after next admission",
+                    20,
+                    lambda: C.readonly_get(first, "quota-{foo}") == "before-full",
+                )
+            # Readable retained data and source slot release do not establish
+            # a new causal serving lease after Meta replacement.
+            H.wait_until(
+                "source serving authority after control replacement",
+                20,
+                lambda: C.redis_call(source, ["SET", "quota-{foo}", "after-full"])
+                == "OK",
+            )
+            H.wait_until(
+                "healthy and rebuilt followers receive tail",
+                20,
+                lambda: all(
+                    C.readonly_get(n, "quota-{foo}") == "after-full"
+                    for n in (second, healthy)
+                ),
+            )
+        except BaseException:
+            fixture.dump_logs()
+            raise
+        finally:
+            arm.unlink(missing_ok=True)
+            if writer is not None:
+                writer.close()
+            fixture.force_kill()
+
+
 def rejects(client, args, text):
     try:
         reply = client.call(*args)
@@ -1569,6 +1725,7 @@ def main():
         if C.has_fault(C.DATA, b"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK"):
             full_session_lifecycle(root)
             full_completion_reconnect(root)
+            follow_full_limit(root)
             full_tail_publish_before_reset(root)
             full_tail_expiration_effects(root)
             small_receive_window(root)
