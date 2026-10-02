@@ -1257,6 +1257,9 @@ auto ReplicationManager::ReplicationGroup::AdmitPendingClusterRebuild(
   cluster_rebuild_ = context;
   pending_cluster_rebuild_.reset();
   native_dataset_valid_.store(false, std::memory_order_release);
+  // Admission replaces the retained population even when the role is already
+  // syncing. Retire its client tokens and connections before destructive work.
+  StoreRole(ReplicationRole::kSyncing, std::memory_order_release);
   storage_->SetReplicaLoading(true);
   applied_frontier_.reset();
   upstream_node_id_.reset();

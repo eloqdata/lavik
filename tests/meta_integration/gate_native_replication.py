@@ -592,8 +592,11 @@ def explicit_full_limit(root):
                     "durably invalidated system state"
                     not in Path(waiting.log_path).read_text()
                 )
-                assert "lavik_full_sync_sessions:0\r\n" in C.redis_call(
-                    source, ["INFO", "replication"]
+                H.wait_until(
+                    "cancelled explicit FULL releases its source slot",
+                    30,
+                    lambda: "lavik_full_sync_sessions:0\r\n"
+                    in C.redis_call(source, ["INFO", "replication"]),
                 )
             else:
                 F.wait_ready(
