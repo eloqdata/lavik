@@ -143,8 +143,8 @@ it does not block an operating-system worker thread.
 Each native target session owns one FULL lifecycle shared by its control
 connection and every source flow. Control admits a known FULL before its
 successful response can authorize destructive target replacement; a late
-coverage miss in steady following returns the existing protocol-v1 `FULL` mode
-without starting source capture. The target's mode barrier requests fresh
+coverage miss in steady following returns `FULL` without starting source
+capture. The target's mode barrier requests fresh
 control admission before either peer starts FULL. The current source admits one
 Meta-managed native FULL target session per Group, shared by automatic
 FollowOwner and explicit population rebuilds. Other targets
@@ -166,11 +166,9 @@ replacement still cancels and drains exports through the existing fences.
 This quota limits load rather than protecting the last Candidate. The only
 remaining Candidate may enter FULL, and repeated failures can exhaust the
 candidate set. It introduces no durable Meta queue, storage-backend interface,
-or limits on Redis PSYNC or slot migration. Protocol-v1 FULL/CONTINUE modes are
-unchanged; `LVFULLBUSY` adds a scoped control error. Targets must support this
-admission contract before enabling a limiting source: older explicit targets
-withdraw their proof before connecting and treat busy as a terminal protocol
-error. Upgrade targets first when mixing these revisions.
+or limits on Redis PSYNC or slot migration. `LVFULLBUSY` is a scoped control
+error; the target retries admission before withdrawing its proof or beginning
+destructive replacement.
 
 ## Roles and lifecycle
 
@@ -703,14 +701,11 @@ Redis listener. Worker 0 owns the `LVPSYNC` control connection. The source has
 one `LVFLOW` data connection per source worker and adopts each flow socket onto
 that worker. A target may have a different worker count; it assigns source flow
 `n` to target worker `n % target_worker_count` without changing the source flow
-identity. Native protocol v1 supports an optional `ACKRANGE` capability on the
-`LVFLOW` request and response. A target sends range ACKs only after the source
-echoes the capability; an ordinary four-word response retains individual ACKs.
-A peer that closes the extended request without replying is retried once with
-the original request on a fresh, equally authenticated connection. Partial or
-malformed replies never trigger that fallback. The control hello carries
-the group,
-replica incarnation, replica boot, requested history context, and complete
+identity. The `LVFLOW` request and response require the `ACKRANGE` marker.
+Native peers support both bounded range ACKs for contiguous ONLINE completions
+and single ACKs for individual completions and FULL synchronization boundaries.
+Incomplete or malformed handshakes fail the session. The control hello carries
+the group, replica incarnation, replica boot, requested history context, and complete
 Applied vector; the response supplies the source group, boot, history, session,
 flow count, and a fresh 160-bit flow capability generated from the OS CSPRNG.
 The target captures that vector once for the control handshake and every
@@ -798,12 +793,12 @@ explicit retained-memory admission succeeds, unexpected physical allocation
 failure is process-fatal rather than converted to a second admission result.
 
 The source sends bounded batches while a separate receiver validates ACK order
-and advances the retained cursor. A negotiated ONLINE range ACK carries two
+and advances the retained cursor. An ONLINE range ACK carries two
 little-endian 64-bit inclusive LSN endpoints in frame kind 9. It represents
 at most 128 already-completed, contiguous events on one flow; an incomplete transaction or
 a gap ends the range without delaying earlier completions. Before advancing
 retention or `WAIT`, the source checks the entire bounded interval against its
-sent-event queue. FULL, cursor and singleton ACKs retain their original format.
+sent-event queue. FULL, cursor and singleton completions use individual ACK frames.
 Neither native history nor applied-frontier semantics depend on this transport
 compression. Sending can continue across batch boundaries
 so every participant of a cross-flow transaction can reach its rendezvous;
@@ -1089,11 +1084,8 @@ handoff tasks before the stream and rebuild attempt can be retired.
 
 The handoff ledger is not durable and has no partition-level resend protocol.
 A failed FULL session follows the existing whole-attempt recovery rules.
-The wire frames are unchanged: a source waiting after each handoff remains
-compatible because it cannot introduce overlapping handoff requests, and a
-target processing requests serially remains compatible with the source ACK
-dispatcher. A flow cannot reach the final cut until every partition is
-acknowledged. After scanning, it continues draining live writes while awaiting
+A flow cannot reach the final cut until every partition is acknowledged.
+After scanning, it continues draining live writes while awaiting
 handoff and peer-flow completion.
 
 At the final cut, the source closes and drains snapshot-transaction admission,

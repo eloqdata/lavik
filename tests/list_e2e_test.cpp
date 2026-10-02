@@ -2524,18 +2524,26 @@ TEST(ListE2eTest, NativeFlowCapabilityRejectsSessionHijack) {
   std::string wrong_capability = capability;
   wrong_capability.front() = wrong_capability.front() == '0' ? '1' : '0';
 
+  const int incomplete = ConnectSocket(port);
+  ASSERT_GE(incomplete, 0);
+  SendAll(incomplete, EncodeCommand({"LVFLOW", "1", session_id, "0", "1", "0",
+                                     capability}));
+  EXPECT_THROW((void)ReadRespLine(incomplete), std::runtime_error);
+  ASSERT_EQ(::close(incomplete), 0);
+
   const int hijack = ConnectSocket(port);
   ASSERT_GE(hijack, 0);
   SendAll(hijack, EncodeCommand({"LVFLOW", "1", session_id, "0", "1", "0",
-                                 wrong_capability}));
+                                 wrong_capability, "ACKRANGE"}));
   EXPECT_THROW((void)ReadRespLine(hijack), std::runtime_error);
   ASSERT_EQ(::close(hijack), 0);
 
   const int authorized = ConnectSocket(port);
   ASSERT_GE(authorized, 0);
   SendAll(authorized, EncodeCommand({"LVFLOW", "1", session_id, "0", "1", "0",
-                                     capability}));
-  EXPECT_EQ(ReadRespLine(authorized), "+LVFLOW " + session_id + " 0 FULL");
+                                     capability, "ACKRANGE"}));
+  EXPECT_EQ(ReadRespLine(authorized),
+            "+LVFLOW " + session_id + " 0 FULL ACKRANGE");
   ASSERT_EQ(::close(authorized), 0);
   ASSERT_EQ(::close(control), 0);
 

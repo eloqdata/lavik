@@ -661,7 +661,7 @@ class FollowOwnerSource {
             return;
           }
           flows_.fetch_add(1, std::memory_order_acq_rel);
-          std::string response = "+LVFLOW 1 0 " + flow_mode_ + "\r\n";
+          std::string response = "+LVFLOW 1 0 " + flow_mode_ + " ACKRANGE\r\n";
           if (flow_mode_ == "CONTINUE") response += cursor_frame;
           const ssize_t sent = ::send(connection, response.data(),
                                       response.size(), MSG_NOSIGNAL);
@@ -3234,12 +3234,12 @@ class RecoveryBoundaryDonor {
       }
       if (args[0] == "LVFLOW") {
         if (parent_mode_ == 7) {
-          Write(fd, "+LVFLOW 1 " + args[3] + " FULL\r\n");
+          Write(fd, "+LVFLOW 1 " + args[3] + " FULL ACKRANGE\r\n");
           Stall(fd, stop);
           return;
         }
         if (args.size() >= 6 && args[4] == "1" &&
-            Write(fd, "+LVFLOW 1 0 CONTINUE\r\n"))
+            Write(fd, "+LVFLOW 1 0 CONTINUE ACKRANGE\r\n"))
           continued_.store(true);
         Stall(fd, stop);
         return;
@@ -3865,12 +3865,12 @@ class CandidateRecoveryService final : public bycorf::Service {
       co_return TestFailure("child control handshake failed");
     auto flow = OpenNativeProbe(worker);
     if (!flow.ok()) co_return flow.status();
-    worker.Spawn(
-        ServeNativeProbe(replication_, *flow,
-                         {"LVFLOW", "1", words[1], "0", "1", "0", words[7]}));
+    worker.Spawn(ServeNativeProbe(
+        replication_, *flow,
+        {"LVFLOW", "1", words[1], "0", "1", "0", words[7], "ACKRANGE"}));
     auto selected = co_await ReadNativeProbe(*flow);
     if (!selected.ok()) co_return selected.status();
-    if (!selected->ends_with(" CONTINUE"))
+    if (!selected->ends_with(" CONTINUE ACKRANGE"))
       co_return TestFailure(
           "proved child origin fell back to FULL after ACK loss");
     status = co_await replication_->RevokeClusterRebuildSourceAuthorizations();
@@ -5671,16 +5671,16 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
     auto miss_flow = OpenPeer(worker);
     if (!miss_flow.ok()) co_return miss_flow.status();
     RequestResult miss_flow_result;
-    worker.Spawn(
-        RunNativeRequest(miss_flow->stream_,
-                         {"LVFLOW", "1", std::string(miss_words[1]), "0",
-                          "999999", "0", std::string(miss_words[7])},
-                         108, &miss_flow_result));
+    worker.Spawn(RunNativeRequest(
+        miss_flow->stream_,
+        {"LVFLOW", "1", std::string(miss_words[1]), "0", "999999", "0",
+         std::string(miss_words[7]), "ACKRANGE"},
+        108, &miss_flow_result));
     auto miss_mode = co_await ReadPeerLine(worker, miss_flow->peer_fd_,
                                            "coverage-miss flow response");
     if (!miss_mode.ok()) co_return miss_mode.status();
     const bool miss_requires_admission =
-        miss_mode->ends_with(" FULL") &&
+        miss_mode->ends_with(" FULL ACKRANGE") &&
         (co_await replication_->Observe()).full_sync_sessions_ == 1;
 
     reconciled = co_await replication_->ReconcileClusterFollowOwner(desired);
@@ -5719,20 +5719,21 @@ class FollowOwnerSourceAuthorizationService final : public bycorf::Service {
         RunNativeRequest(first_flow->stream_,
                          {"LVFLOW", "1", std::string(first_words[1]), "0",
                           std::to_string((*watermark)->next_lsns_.front()), "1",
-                          std::string(first_words[7])},
+                          std::string(first_words[7]), "ACKRANGE"},
                          104, &first_flow_result));
-    worker.Spawn(RunNativeRequest(second_flow->stream_,
-                                  {"LVFLOW", "1", std::string(second_words[1]),
-                                   "0", "1", "0", std::string(second_words[7])},
-                                  105, &second_flow_result));
+    worker.Spawn(
+        RunNativeRequest(second_flow->stream_,
+                         {"LVFLOW", "1", std::string(second_words[1]), "0", "1",
+                          "0", std::string(second_words[7]), "ACKRANGE"},
+                         105, &second_flow_result));
     auto first_mode = co_await ReadPeerLine(worker, first_flow->peer_fd_,
                                             "same-history flow mode");
     auto second_mode = co_await ReadPeerLine(worker, second_flow->peer_fd_,
                                              "mismatched-history flow mode");
     if (!first_mode.ok()) co_return first_mode.status();
     if (!second_mode.ok()) co_return second_mode.status();
-    if (!first_mode->ends_with(" CONTINUE") ||
-        !second_mode->ends_with(" FULL")) {
+    if (!first_mode->ends_with(" CONTINUE ACKRANGE") ||
+        !second_mode->ends_with(" FULL ACKRANGE")) {
       co_return TestFailure(
           "steady source did not reuse native CONTINUE/FULL selection");
     }
