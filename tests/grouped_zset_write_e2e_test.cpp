@@ -60,6 +60,222 @@ std::vector<std::string> ZSetSeed(std::string key) {
   return command;
 }
 
+TEST(GroupedSortedSetWriteE2e, TypedChangesDoNotRereadOrderedMemberDiff) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires member-diff read failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "checked-delta";
+  auto member = [](unsigned i) {
+    return std::to_string(i) + std::string(128, 'd');
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    for (unsigned i = 0; i < 256; ++i) {
+      seed.push_back(std::to_string(i));
+      seed.push_back(member(i));
+    }
+    ASSERT_EQ(client.Command(seed).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  std::optional<std::string> previous;
+  if (const auto* old = ::getenv("LAVIK_FAIL_ZSET_MEMBER_DIFF_READ_KEY"))
+    previous = old;
+  struct RestoreEnvironment {
+    std::optional<std::string>& previous_;
+    ~RestoreEnvironment() {
+      if (previous_)
+        ::setenv("LAVIK_FAIL_ZSET_MEMBER_DIFF_READ_KEY", previous_->c_str(), 1);
+      else
+        ::unsetenv("LAVIK_FAIL_ZSET_MEMBER_DIFF_READ_KEY");
+    }
+  } restore{previous};
+  ::setenv("LAVIK_FAIL_ZSET_MEMBER_DIFF_READ_KEY", key.c_str(), 1);
+  {
+    Server server(disk, 3);
+    Client client(server.port());
+    ASSERT_EQ(client
+                  .Command({"ZADD", key, "CH", "500", member(100), "400",
+                            member(256)})
+                  .text_,
+              "2");
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "2", member(101)}).text_, "103");
+    ASSERT_EQ(client.Command({"ZREM", key, member(102), member(103), "missing"})
+                  .text_,
+              "2");
+    ASSERT_EQ(client.Command({"ZPOPMIN", key, "2"}).items_.size(), 4);
+    ASSERT_EQ(client.Command({"ZPOPMAX", key, "2"}).items_.size(), 4);
+    ASSERT_EQ(client.Command({"ZREMRANGEBYSCORE", key, "2", "3"}).text_, "2");
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"ZREMRANGEBYRANK", key, "0", "1"}).text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"ZADD", key, "700", member(257)}).text_,
+              "QUEUED");
+    auto executed = client.Command({"EXEC"});
+    ASSERT_EQ(executed.items_.size(), 2);
+    EXPECT_EQ(executed.items_[0].text_, "2");
+    EXPECT_EQ(executed.items_[1].text_, "1");
+    EXPECT_EQ(client.Command({"ZCARD", key}).text_, "248");
+    for (unsigned i : {0U, 1U, 2U, 3U, 4U, 5U, 100U, 102U, 103U, 256U})
+      EXPECT_EQ(client.Command({"ZSCORE", key, member(i)}).text_, "-1");
+    EXPECT_EQ(client.Command({"ZSCORE", key, member(101)}).text_, "103");
+    EXPECT_EQ(client.Command({"ZSCORE", key, member(257)}).text_, "700");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"ZCARD", key}).text_, "248");
+  EXPECT_EQ(client.Command({"ZSCORE", key, member(101)}).text_, "103");
+  EXPECT_EQ(client.Command({"ZSCORE", key, member(257)}).text_, "700");
+  EXPECT_EQ(client.Command({"ZRANGE", key, "0", "-1"}).items_.size(), 248);
+}
+
+TEST(GroupedSortedSetWriteE2e, AdjacentScoreMovesReusePagesAcrossRecovery) {
+  PrivateDisk disk;
+  auto member = [](unsigned i) { return std::string(1024, 'a' + i); };
+  auto verify = [&](Client& client, bool moved) {
+    EXPECT_EQ(client.Command({"ZCARD", "adjacent"}).text_, "21");
+    auto reply =
+        client.Command({"ZRANGE", "adjacent", "0", "-1", "WITHSCORES"});
+    ASSERT_EQ(reply.items_.size(), 42);
+    std::vector<std::pair<double, std::string>> expected;
+    for (unsigned i = 0; i < 21; ++i) {
+      const double score = i == 6 && moved ? 7.5 : double(i);
+      expected.emplace_back(score, member(i));
+      EXPECT_EQ(
+          std::stod(client.Command({"ZSCORE", "adjacent", member(i)}).text_),
+          score);
+    }
+    std::sort(expected.begin(), expected.end());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+      EXPECT_EQ(reply.items_[2 * i].text_, expected[i].second);
+      EXPECT_EQ(std::stod(reply.items_[2 * i + 1].text_), expected[i].first);
+    }
+  };
+  auto page_ids = [&] {
+    std::set<std::uint64_t> ids;
+    for (const auto& [sequence, groups] : disk.Auxiliaries("adjacent"))
+      for (const auto& [prefix, bits] : groups)
+        if (bits == 0 && prefix != 0) ids.insert(prefix);
+    return ids;
+  };
+  {
+    Server server(disk);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", "adjacent"};
+    for (unsigned i = 0; i < 21; ++i)
+      seed.insert(seed.end(), {std::to_string(i), member(i)});
+    ASSERT_EQ(client.Command(seed).text_, "21");
+    verify(client, false);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto ids = page_ids();
+  ASSERT_EQ(ids.size(), 3);
+  {
+    Server server(disk, 3);
+    Client client(server.port());
+    for (unsigned i = 0; i < 12; ++i) {
+      ASSERT_EQ(client.Command({"ZINCRBY", "adjacent", "1.5", member(6)}).text_,
+                "7.5");
+      verify(client, true);
+      ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+      ASSERT_EQ(client.Command({"ZADD", "adjacent", "6", member(6)}).text_,
+                "QUEUED");
+      ASSERT_EQ(client.Command({"EXEC"}).items_.size(), 1);
+      verify(client, false);
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  EXPECT_EQ(page_ids(), ids);
+  Server recovered(disk, 4);
+  Client client(recovered.port());
+  verify(client, false);
+}
+
+TEST(GroupedSortedSetWriteE2e, PlannerSkipsUnchangedNeighborButChecksNewLinks) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires plan-page read failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string new_member(1024, 'z');
+  auto member = [](unsigned i) { return std::string(1024, 'a' + i); };
+  {
+    Server server(disk);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", "lazy-neighbor"};
+    for (unsigned i = 0; i < 21; ++i)
+      seed.insert(seed.end(), {std::to_string(i), member(i)});
+    ASSERT_EQ(client.Command(seed).text_, "21");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  struct Fault {
+    std::optional<std::string> key_, page_;
+    explicit Fault(const char* page) {
+      if (const char* prior = std::getenv("LAVIK_FAIL_ZSET_PLAN_READ_KEY"))
+        key_ = prior;
+      if (const char* prior = std::getenv("LAVIK_FAIL_ZSET_PLAN_READ_PAGE"))
+        page_ = prior;
+      ::setenv("LAVIK_FAIL_ZSET_PLAN_READ_KEY", "lazy-neighbor", 1);
+      ::setenv("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", page, 1);
+    }
+    ~Fault() {
+      if (key_)
+        ::setenv("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key_->c_str(), 1);
+      else
+        ::unsetenv("LAVIK_FAIL_ZSET_PLAN_READ_KEY");
+      if (page_)
+        ::setenv("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", page_->c_str(), 1);
+      else
+        ::unsetenv("LAVIK_FAIL_ZSET_PLAN_READ_PAGE");
+    }
+  };
+  {
+    // The third page is selected for adjacency but neither payload nor link
+    // changes when the two modified pages redistribute. A fault there must
+    // remain untouched, even though it is already included in admission.
+    Fault fault("3");
+    Server server(disk, 3);
+    Client client(server.port());
+    EXPECT_EQ(
+        client.Command({"ZINCRBY", "lazy-neighbor", "1.5", member(6)}).text_,
+        "7.5");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    // Real growth splits page one and changes page two's previous link. Its
+    // load must still fail atomically before either index can publish.
+    Fault fault("2");
+    Server server(disk, 4);
+    Client client(server.port());
+    const auto failed =
+        client.Command({"ZADD", "lazy-neighbor", "-1", new_member});
+    EXPECT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find("plan page read failure"), std::string::npos);
+    EXPECT_EQ(client.Command({"ZCARD", "lazy-neighbor"}).text_, "21");
+    EXPECT_EQ(client.Command({"ZSCORE", "lazy-neighbor", new_member}).text_,
+              "-1");
+    EXPECT_EQ(client.Command({"ZSCORE", "lazy-neighbor", member(6)}).text_,
+              "7.5");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"ZCARD", "lazy-neighbor"}).text_, "21");
+  EXPECT_EQ(client.Command({"ZSCORE", "lazy-neighbor", new_member}).text_,
+            "-1");
+  EXPECT_EQ(client.Command({"ZSCORE", "lazy-neighbor", member(6)}).text_,
+            "7.5");
+}
+
 TEST(GroupedSortedSetWriteE2e, BatchedMemberIndexChangesMatchOrderedPages) {
   PrivateDisk disk;
   std::map<std::string, double> expected;

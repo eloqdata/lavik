@@ -247,9 +247,13 @@ incarnation to the root and every initial page in both graphs. Transactional
 creation and promotion of an existing compact value retain their separate
 preparation contracts.
 
-Sorted Set mutation planning derives member-index changes from complete
+Sorted Set full-image mutation planning derives member-index changes from complete
 ordered before/after pages, including full-image callback and import paths.
-Changed ordered pages, prefix snapshots and split retirements share the same
+Typed updates verify requested old members against both indexes, then generate
+both private plans from those exact changes. The member plan owns its page
+strings before pop/range selections are released; no borrowed command member
+escapes preparation. Its cardinality and predecessor membership/score checks
+still precede any staging. Changed ordered pages, prefix snapshots and split retirements share the same
 command-local decision and publish through one root. Failure cannot expose
 only one half of the update.
 
