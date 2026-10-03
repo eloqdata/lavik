@@ -169,6 +169,89 @@ TEST(GroupedCollectionTest, StringSegmentBoundariesDoNotOrderPayloadBytes) {
   EXPECT_FALSE(ValidateOrderedGroupBoundary(left, right).ok());
 }
 
+TEST(GroupedCollectionTest, SortedSetRebalancePreservesOrderAndActiveIds) {
+  // Sweep both directions, empty afterimages and mixed member sizes. The
+  // two physical pages must remain independently encodable after a move.
+  for (std::size_t old_cut = 0; old_cut <= 14; ++old_cut) {
+    for (const bool mixed : {false, true}) {
+      auto left = Page(11, 0, OrderedCollectionKind::kSortedSet);
+      auto right = Page(42, 0, OrderedCollectionKind::kSortedSet);
+      left.previous_ = 7;
+      left.next_ = 42;
+      right.previous_ = 11;
+      right.next_ = 99;
+      std::vector<OrderedCollectionEntry> all;
+      for (std::size_t i = 0; i < 14; ++i) {
+        all.push_back({std::string(mixed ? 700 + 37 * i : 1024, 'a' + i),
+                       static_cast<double>(i)});
+        (i < old_cut ? left.entries_ : right.entries_).push_back(all.back());
+      }
+      auto balanced = RebalanceSortedSetGroupPair(left, right);
+      ASSERT_TRUE(balanced.ok()) << balanced.status();
+      EXPECT_EQ(left.id_, 11);
+      EXPECT_EQ(left.previous_, 7);
+      EXPECT_EQ(left.next_, 42);
+      EXPECT_EQ(right.id_, 42);
+      EXPECT_EQ(right.previous_, 11);
+      EXPECT_EQ(right.next_, 99);
+      auto actual = left.entries_;
+      actual.insert(actual.end(), right.entries_.begin(), right.entries_.end());
+      EXPECT_EQ(actual, all);
+      auto encoded_left = EncodeOrderedGroup(left);
+      auto encoded_right = EncodeOrderedGroup(right);
+      ASSERT_TRUE(encoded_left.ok()) << encoded_left.status();
+      ASSERT_TRUE(encoded_right.ok()) << encoded_right.status();
+      EXPECT_LE(encoded_left->size(), kCollectionGroupTargetBytes);
+      EXPECT_LE(encoded_right->size(), kCollectionGroupTargetBytes);
+      EXPECT_EQ(DecodeOrderedGroup(*encoded_left)->entries_, left.entries_);
+      EXPECT_EQ(DecodeOrderedGroup(*encoded_right)->entries_, right.entries_);
+      if (!mixed) EXPECT_EQ(*balanced, old_cut != 7);
+    }
+  }
+}
+
+TEST(GroupedCollectionTest, SortedSetRebalanceFallbackDoesNotMutatePages) {
+  auto left = Page(1, 0, OrderedCollectionKind::kSortedSet);
+  auto right = Page(2, 0, OrderedCollectionKind::kSortedSet);
+  left.next_ = 2;
+  right.previous_ = 1;
+  for (std::size_t i = 0; i < 16; ++i)
+    (i < 6 ? left.entries_ : right.entries_)
+        .push_back({std::string(1024, 'a' + i), static_cast<double>(i)});
+  const auto before_left = left.entries_;
+  const auto before_right = right.entries_;
+  auto balanced = RebalanceSortedSetGroupPair(left, right);
+  ASSERT_TRUE(balanced.ok());
+  EXPECT_FALSE(*balanced);
+  EXPECT_EQ(left.entries_, before_left);
+  EXPECT_EQ(right.entries_, before_right);
+  right.entries_.resize(1);
+  right.entries_[0].value_.assign(kCollectionGroupTargetBytes * 2, 'x');
+  const auto oversized = right.entries_;
+  balanced = RebalanceSortedSetGroupPair(left, right);
+  ASSERT_TRUE(balanced.ok());
+  EXPECT_FALSE(*balanced);
+  EXPECT_EQ(right.entries_, oversized);
+  EXPECT_EQ(left.entries_, before_left);
+  right.previous_ = 0;
+  EXPECT_FALSE(RebalanceSortedSetGroupPair(left, right).ok());
+}
+
+TEST(GroupedCollectionTest, SortedSetRebalanceRejectsInvalidOrdering) {
+  auto left = Page(1, 1, OrderedCollectionKind::kSortedSet);
+  auto right = Page(2, 0, OrderedCollectionKind::kSortedSet);
+  left.next_ = 2;
+  right.previous_ = 1;
+  for (unsigned i = 0; i < 8; ++i)
+    right.entries_.push_back({std::string(1024, 'a' + i), double(i)});
+  left.entries_[0] = {std::string(1024, 'z'), 100};
+  const auto before_left = left.entries_;
+  const auto before_right = right.entries_;
+  EXPECT_FALSE(RebalanceSortedSetGroupPair(left, right).ok());
+  EXPECT_EQ(left.entries_, before_left);
+  EXPECT_EQ(right.entries_, before_right);
+}
+
 TEST(GroupedCollectionTest, StringSegmentsValidateLengthsAndDirectPositions) {
   OrderedGroupSnapshot first{
       .kind_ = OrderedCollectionKind::kString,

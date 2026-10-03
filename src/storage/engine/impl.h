@@ -2225,15 +2225,24 @@ class StorageEngine::Impl {
     MemoryReservation leaves_;
     HashGroupMutationPlan plan_;
   };
-  // Derives member-index changes from complete ordered before/after pages so
-  // every typed, callback and ingest writer shares the same atomic boundary.
-  // Only touched prefix leaves are decoded; all retained scratch is admitted.
-  // Unlocked callers yield between pages, keeping hot-buffer scans cooperative.
+  struct SortedSetMemberChange {
+    std::string_view member_;
+    std::optional<double> before_;
+    std::optional<double> after_;
+  };
+  // Full-image writers derive changes from complete ordered before/after
+  // pages. Typed writers may supply exact changes after checking old members
+  // against both graphs and generating the ordered plan from those changes.
+  // Borrowed names must outlive this coroutine; the result owns all index
+  // writes. Only touched prefix leaves are decoded and retained scratch is
+  // admitted. Unlocked callers yield between pages.
   Task<absl::StatusOr<SortedSetMemberMutation>> PrepareSortedSetMembers(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedHashObject::Handle previous,
-      const OrderedCollectionMutationPlan& ordered, bool unlocked = false);
+      const OrderedCollectionMutationPlan& ordered, bool unlocked = false,
+      std::optional<std::span<const SortedSetMemberChange>> checked_changes =
+          std::nullopt);
   Task<absl::Status> UpdateGroupedExpirationLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -2253,6 +2262,7 @@ class StorageEngine::Impl {
     MemoryReservation pages_;
     MemoryReservation inputs_;
     OrderedCollectionMutationPlan plan_;
+    std::optional<SortedSetMemberMutation> members_;
   };
   // With an output, only prepare private pages; the caller owns store-lock
   // release/reacquisition, validation and commit (including successful no-ops).

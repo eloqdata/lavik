@@ -971,6 +971,92 @@ std::size_t OrderedGroupDirectory::UpperBoundScore(
   return found - groups_.begin();
 }
 
+absl::StatusOr<bool> RebalanceSortedSetGroupPair(OrderedGroupSnapshot& left,
+                                                 OrderedGroupSnapshot& right,
+                                                 std::size_t target_bytes) {
+  if (left.kind_ != OrderedCollectionKind::kSortedSet ||
+      right.kind_ != left.kind_ || left.incarnation_ == 0 ||
+      left.incarnation_ != right.incarnation_ || left.id_ == 0 ||
+      right.id_ == 0 || left.id_ == right.id_ || left.retired_ ||
+      right.retired_ || left.next_ != right.id_ ||
+      right.previous_ != left.id_ || left.previous_ == left.id_ ||
+      left.previous_ == right.id_ || right.next_ == right.id_ ||
+      right.next_ == left.id_ || target_bytes <= kOrderedGroupHeaderBytes ||
+      target_bytes > kMaxRecordPayloadBytes) {
+    return absl::InvalidArgumentError("invalid Sorted Set rebalance pair");
+  }
+  const auto capacity = target_bytes - kOrderedGroupHeaderBytes;
+  auto payload_bytes = [](const auto& entries) -> absl::StatusOr<std::size_t> {
+    std::size_t bytes = 0;
+    for (const auto& entry : entries) {
+      if (entry.value_.size() > kMaxStringBytes ||
+          bytes > std::numeric_limits<std::size_t>::max() - kEntryHeaderBytes -
+                      entry.value_.size())
+        return absl::OutOfRangeError("Sorted Set rebalance size overflow");
+      bytes += kEntryHeaderBytes + entry.value_.size();
+    }
+    return bytes;
+  };
+  const auto left_bytes = payload_bytes(left.entries_);
+  const auto right_bytes = payload_bytes(right.entries_);
+  if (!left_bytes.ok()) return left_bytes.status();
+  if (!right_bytes.ok()) return right_bytes.status();
+  if (!left.entries_.empty() && !right.entries_.empty() &&
+      *left_bytes <= capacity && *right_bytes <= capacity)
+    return false;
+  // Avoid adding unbounded page sizes: a feasible pair has at most two
+  // inline payloads. A large indivisible member must stay on the extent path.
+  if (*left_bytes > 2 * capacity || *right_bytes > 2 * capacity - *left_bytes)
+    return false;
+  const auto total_bytes = *left_bytes + *right_bytes;
+  const auto count = left.entries_.size() + right.entries_.size();
+  std::size_t prefix = 0, cut = 0;
+  auto best_distance = std::numeric_limits<std::size_t>::max();
+  for (std::size_t i = 0; i + 1 < count; ++i) {
+    const auto& entry = i < left.entries_.size()
+                            ? left.entries_[i]
+                            : right.entries_[i - left.entries_.size()];
+    prefix += kEntryHeaderBytes + entry.value_.size();
+    if (prefix > capacity) break;
+    if (total_bytes - prefix > capacity) continue;
+    const auto distance = i + 1 > left.entries_.size()
+                              ? i + 1 - left.entries_.size()
+                              : left.entries_.size() - (i + 1);
+    if (distance < best_distance) {
+      best_distance = distance;
+      cut = i + 1;
+    }
+  }
+  if (cut == 0) return false;
+  auto valid = ValidateEntries(left.kind_, left.entries_);
+  if (!valid.ok()) return valid;
+  valid = ValidateEntries(right.kind_, right.entries_);
+  if (!valid.ok()) return valid;
+  if (!left.entries_.empty() && !right.entries_.empty() &&
+      !OrderedEntryLess(left.entries_.back(), right.entries_.front()))
+    return absl::InvalidArgumentError("unordered Sorted Set rebalance pair");
+  // Reserve before moving anything. Existing active ids survive a score move
+  // when its two afterimages still fit, keeping directory publication local
+  // instead of rebuilding every group after an unnecessary split.
+  if (cut > left.entries_.size()) {
+    const auto moved = cut - left.entries_.size();
+    left.entries_.reserve(cut);
+    for (std::size_t i = 0; i < moved; ++i)
+      left.entries_.push_back(std::move(right.entries_[i]));
+    right.entries_.erase(right.entries_.begin(),
+                         right.entries_.begin() + moved);
+  } else {
+    std::vector<OrderedCollectionEntry> replacement;
+    replacement.reserve(count - cut);
+    for (std::size_t i = cut; i < left.entries_.size(); ++i)
+      replacement.push_back(std::move(left.entries_[i]));
+    for (auto& entry : right.entries_) replacement.push_back(std::move(entry));
+    left.entries_.resize(cut);
+    right.entries_ = std::move(replacement);
+  }
+  return true;
+}
+
 absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(OrderedGroupSnapshot group,
                                                     std::uint64_t next_group_id,
                                                     std::size_t target_bytes) {
