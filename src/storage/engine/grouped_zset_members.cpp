@@ -28,7 +28,8 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedHashObject::Handle previous,
-    const OrderedCollectionMutationPlan& ordered, bool unlocked) {
+    const OrderedCollectionMutationPlan& ordered, bool unlocked,
+    std::optional<std::span<const SortedSetMemberChange>> checked_changes) {
   // Bycorf terminates on an exception escaping a coroutine body; a caller's
   // catch only covers frame creation. This phase owns private, admitted pages
   // and has staged nothing, so release them here and preserve the old graph.
@@ -113,17 +114,26 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     };
     GroupedScratchBudget metadata_budget;
     absl::Status status;
-    for (const auto& page : ordered.writes_) {
-      std::uint64_t count = page.entries_.size();
-      if (previous) {
-        if (const auto* old = previous->ordered_directory().Find(page.id_))
-          count += old->item_count_;
-      }
-      if (count > std::numeric_limits<std::size_t>::max() / 256)
+    if (checked_changes) {
+      if (checked_changes->size() >
+          std::numeric_limits<std::size_t>::max() / 256)
         co_return absl::ResourceExhaustedError(
             "member-index metadata overflow");
-      status = metadata_budget.AddBytes(count * 256);
+      status = metadata_budget.AddBytes(checked_changes->size() * 256);
       if (!status.ok()) co_return status;
+    } else {
+      for (const auto& page : ordered.writes_) {
+        std::uint64_t count = page.entries_.size();
+        if (previous) {
+          if (const auto* old = previous->ordered_directory().Find(page.id_))
+            count += old->item_count_;
+        }
+        if (count > std::numeric_limits<std::size_t>::max() / 256)
+          co_return absl::ResourceExhaustedError(
+              "member-index metadata overflow");
+        status = metadata_budget.AddBytes(count * 256);
+        if (!status.ok()) co_return status;
+      }
     }
     auto metadata_admission = metadata_budget.Reserve(1);
     if (!metadata_admission.ok()) co_return metadata_admission.status();
@@ -144,41 +154,67 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     // peak.
     std::deque<RemovedMember> removed;
     absl::flat_hash_map<std::string_view, Change> changes;
-    for (const auto& page : ordered.writes_) {
-      if (unlocked) co_await bycorf::Yield(*store.worker_);
-      for (const auto& entry : page.entries_) {
-        auto& change = changes[entry.value_];
-        if (change.after_)
-          co_return absl::DataLossError("duplicate ordered replacement member");
-        change.after_ = entry.score_;
+    if (checked_changes) {
+      // The typed planner has checked each requested predecessor in both
+      // indexes. Page redistribution changes no other member's score. Build
+      // just that semantic delta, avoiding another ordered-page IO/decode and
+      // map insertion for every unchanged member in the replacement pages.
+      absl::int128 count = previous->ordered_directory().root().item_count_;
+      for (const auto& item : *checked_changes) {
+        if ((!item.before_ && !item.after_) ||
+            (item.before_ && std::isnan(*item.before_)) ||
+            (item.after_ && std::isnan(*item.after_)) ||
+            !changes
+                 .try_emplace(item.member_, Change{item.before_, item.after_})
+                 .second)
+          co_return absl::DataLossError("invalid checked member-index change");
+        count += int(item.after_.has_value()) - int(item.before_.has_value());
       }
-    }
-    for (const auto& page : ordered.writes_) {
-      if (!previous || !previous->ordered_directory().Find(page.id_)) continue;
-      if (unlocked) co_await bycorf::Yield(*store.worker_);
-      GroupedScratchBudget read_budget;
-      status = add_group(read_budget, {page.id_, 0});
-      if (!status.ok()) co_return status;
-      auto read_admission = read_budget.Reserve(2);
-      if (!read_admission.ok()) co_return read_admission.status();
-      auto loaded = co_await LoadOrderedGroupSnapshot(
-          store, partition, db_id, key, digest, previous, page.id_);
-      if (!loaded.ok()) co_return loaded.status();
-      for (auto& entry : loaded->snapshot_.entries_) {
-        auto found = changes.find(entry.value_);
-        if (found == changes.end()) {
-          auto admission = TryReserveMemory(entry.value_.capacity() + 1);
-          if (!admission) {
-            RecordMemoryRejection();
-            co_return absl::ResourceExhaustedError(
-                "OOM grouped operation scratch admission");
-          }
-          removed.push_back({std::move(*admission), std::move(entry.value_)});
-          found = changes.try_emplace(removed.back().member_).first;
+      if (count != ordered.root_.item_count_)
+        co_return absl::DataLossError("checked member-index count mismatch");
+    } else {
+      for (const auto& page : ordered.writes_) {
+        if (unlocked) co_await bycorf::Yield(*store.worker_);
+        for (const auto& entry : page.entries_) {
+          auto& change = changes[entry.value_];
+          if (change.after_)
+            co_return absl::DataLossError(
+                "duplicate ordered replacement member");
+          change.after_ = entry.score_;
         }
-        if (found->second.before_)
-          co_return absl::DataLossError("duplicate ordered source member");
-        found->second.before_ = entry.score_;
+      }
+      for (const auto& page : ordered.writes_) {
+        if (!previous || !previous->ordered_directory().Find(page.id_))
+          continue;
+        if (unlocked) co_await bycorf::Yield(*store.worker_);
+        GroupedScratchBudget read_budget;
+        status = add_group(read_budget, {page.id_, 0});
+        if (!status.ok()) co_return status;
+        auto read_admission = read_budget.Reserve(2);
+        if (!read_admission.ok()) co_return read_admission.status();
+        LAVIK_FAULT_INJECT(
+            if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_MEMBER_DIFF_READ_KEY",
+                                    key)) co_return absl::
+                UnavailableError("injected member diff read failure"););
+        auto loaded = co_await LoadOrderedGroupSnapshot(
+            store, partition, db_id, key, digest, previous, page.id_);
+        if (!loaded.ok()) co_return loaded.status();
+        for (auto& entry : loaded->snapshot_.entries_) {
+          auto found = changes.find(entry.value_);
+          if (found == changes.end()) {
+            auto admission = TryReserveMemory(entry.value_.capacity() + 1);
+            if (!admission) {
+              RecordMemoryRejection();
+              co_return absl::ResourceExhaustedError(
+                  "OOM grouped operation scratch admission");
+            }
+            removed.push_back({std::move(*admission), std::move(entry.value_)});
+            found = changes.try_emplace(removed.back().member_).first;
+          }
+          if (found->second.before_)
+            co_return absl::DataLossError("duplicate ordered source member");
+          found->second.before_ = entry.score_;
+        }
       }
     }
     absl::erase_if(changes, [](const auto& item) {

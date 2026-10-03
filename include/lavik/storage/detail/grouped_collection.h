@@ -386,6 +386,16 @@ struct OrderedGroupSplit {
   std::vector<OrderedGroupSnapshot> groups_;
 };
 
+// Redistributes sorted, globally unique members between two adjacent active
+// Sorted Set afterimages without changing their identities or links. Empty
+// afterimages are allowed. Returns false, leaving both inputs unchanged, when
+// they already fit or cannot fit in two nonempty pages at target_bytes;
+// oversized single members retain the ordinary split/extent fallback.
+// The caller owns admission for both pages and transient vector capacity.
+absl::StatusOr<bool> RebalanceSortedSetGroupPair(
+    OrderedGroupSnapshot& left, OrderedGroupSnapshot& right,
+    std::size_t target_bytes = kCollectionGroupTargetBytes);
+
 // Preserves the first page id and allocates monotonically increasing ids for
 // later pages. An indivisible 512 MiB item is allowed to exceed target_bytes;
 // the ordinary extent layer stores it. The caller must update the following

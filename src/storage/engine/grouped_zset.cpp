@@ -561,18 +561,9 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
             replication, mutation_precondition, &mutation);
         if (!prepared.ok()) co_return prepared.status();
         if (plan.changed_ && !plan.delete_key_) {
-          // The member-index builder also reads old ordered/prefix pages. Keep
-          // it in the unlocked phase; both plans still publish through one
-          // root.
-          LAVIK_FAULT_INJECT({
-            const auto paused = co_await PauseGroupedWriteForTest(
-                *store.worker_, key, "members");
-            if (!paused.ok()) co_return paused;
-          });
-          auto member_plan = co_await PrepareSortedSetMembers(
-              store, partition, db_id, key, digest, *view, plan, true);
-          if (!member_plan.ok()) co_return member_plan.status();
-          members = std::move(*member_plan);
+          if (!mutation.members_)
+            co_return absl::InternalError("missing prepared member-index plan");
+          members = std::move(*mutation.members_);
         }
         co_await store.store_state_mutex_.Lock();
         unlock.Adopt();
@@ -1297,8 +1288,22 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     auto admission = budget.Reserve(4);
     if (!admission.ok()) co_return admission.status();
     working_admission.emplace(std::move(*admission));
+    auto check_plan_read = [&](std::size_t i) -> absl::Status {
+      LAVIK_FAULT_INJECT(
+          if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key) &&
+              LAVIK_FAULT_MATCHES_NTH("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key,
+                                      "LAVIK_FAIL_ZSET_PLAN_READ_PAGE",
+                                      i + 1)) return absl::
+              UnavailableError("injected Sorted Set plan page read failure"););
+      return absl::OkStatus();
+    };
     std::map<std::size_t, OrderedGroupSnapshot> loaded;
-    for (const auto i : selected) {
+    // Reserve for all selected pages as before, but decode an unchanged
+    // neighbour only if splitting/retirement actually changes its link.
+    // Routing and pair redistribution need only the already modified pages.
+    for (const auto i : modified) {
+      status = check_plan_read(i);
+      if (!status.ok()) co_return status;
       auto page = co_await LoadOrderedGroupSnapshot(
           store, partition, db_id, key, digest, object, metadata[i].id_);
       if (!page.ok()) co_return page.status();
@@ -1314,6 +1319,21 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     for (const auto& [member, state] : pending)
       loaded.at(state->destination_)
           .entries_.push_back({std::string(member), *state->after_});
+
+    for (const auto i : modified) {
+      auto& entries = loaded.at(i).entries_;
+      std::sort(entries.begin(), entries.end(), OrderedEntryLess);
+    }
+    // A score move can overflow its destination while freeing the adjacent
+    // source. Reuse both already admitted pages when they still fit together;
+    // allocating an extra id would force full-directory reconstruction.
+    // Genuine growth and distant moves retain the ordinary split fallback.
+    for (const auto i : modified) {
+      if (!modified.contains(i + 1)) continue;
+      auto balanced =
+          RebalanceSortedSetGroupPair(loaded.at(i), loaded.at(i + 1));
+      if (!balanced.ok()) co_return balanced.status();
+    }
 
     struct Route {
       std::uint64_t id_;
@@ -1347,7 +1367,6 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           plan.writes_.push_back(std::move(page));
           continue;
         }
-        std::sort(page.entries_.begin(), page.entries_.end(), OrderedEntryLess);
         auto split = SplitOrderedGroup(std::move(page), next_id);
         if (!split.ok()) co_return split.status();
         next_id = split->next_group_id_;
@@ -1370,12 +1389,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         if (at.write_ == kNoPage) {
           const auto& old = metadata[at.source_];
           if (old.previous_ == previous && old.next_ == following) continue;
-          const auto neighbor = loaded.find(at.source_);
-          if (neighbor == loaded.end())
-            co_return absl::DataLossError(
-                "Sorted Set changed link lacks admitted neighbour");
+          status = check_plan_read(at.source_);
+          if (!status.ok()) co_return status;
+          // Revalidate the captured logical view and current physical
+          // location through the ordinary loader, including GC retry checks.
+          auto neighbor = co_await LoadOrderedGroupSnapshot(
+              store, partition, db_id, key, digest, object, old.id_);
+          if (!neighbor.ok()) co_return neighbor.status();
           at.write_ = plan.writes_.size();
-          plan.writes_.push_back(std::move(neighbor->second));
+          plan.writes_.push_back(std::move(neighbor->snapshot_));
         }
         plan.writes_[at.write_].previous_ = previous;
         plan.writes_[at.write_].next_ = following;
@@ -1388,15 +1410,41 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       co_return absl::DataLossError("invalid Sorted Set resulting page count");
     plan.root_.group_count_ = page_count;
     plan.root_.next_group_id_ = next_id;
+    SortedSetMemberMutation member_mutation;
+    if (indexed) {
+      // Names borrow command inputs, or the outer pop/range selection. Finish
+      // index preparation here while those names are alive; only owned leaf
+      // after-images escape in PreparedOrderedMutation. Never retain these
+      // views after the selected reply is cleared by range removal.
+      std::vector<SortedSetMemberChange> changes;
+      changes.reserve(members.size());
+      for (const auto& [member, state] : members) {
+        if (state.touched_)
+          changes.push_back({member, state.before_, state.after_});
+      }
+      LAVIK_FAULT_INJECT({
+        if (prepared != nullptr) {
+          const auto paused =
+              co_await PauseGroupedWriteForTest(*store.worker_, key, "members");
+          if (!paused.ok()) co_return paused;
+        }
+      });
+      auto built = co_await PrepareSortedSetMembers(
+          store, partition, db_id, key, digest, object, plan,
+          prepared != nullptr, std::span<const SortedSetMemberChange>(changes));
+      if (!built.ok()) co_return built.status();
+      member_mutation = std::move(*built);
+    }
     if (prepared != nullptr) {
       prepared->pages_ = std::move(*working_admission);
       prepared->plan_ = std::move(plan);
+      prepared->members_.emplace(std::move(member_mutation));
       co_return result;
     }
     auto written = co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, object, std::move(plan),
         object->version().root_.expire_at_ms_, tx, replication,
-        mutation_precondition);
+        mutation_precondition, indexed ? &member_mutation : nullptr);
     if (!written.ok()) co_return written;
     co_return result;
   } catch (const std::bad_alloc&) {
