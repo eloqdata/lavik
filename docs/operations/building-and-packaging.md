@@ -458,56 +458,76 @@ allowlist rules. The CTest labels are `cluster-model`,
 ## Continuous integration
 
 The [CI workflow](../../.github/workflows/ci.yml) runs on pushes to `main`, pull
-requests, and manual dispatch. A formatting job checks every maintained Lavik C/C++
-source through the pinned pre-commit hook. Two independent test jobs build and
-run natively on `ubuntu-24.04` (AMD64) and `ubuntu-24.04-arm` (ARM64).
+requests, and manual dispatch. Formatting and CI-runner regression checks run
+independently. AMD64 and ARM64 each build the complete software test runtime
+once, then distribute it to six isolated runners of the same architecture.
+All existing CTest, native large-List/Hash, >1 GiB RDB, and vendored Valkey TCL
+coverage runs on both architectures; there is no separate reduced PR tier.
 
-The workflow initializes the public `eloqdata/bycorf` submodule at the exact
-gitlink revision from the tested Lavik commit. It does not need a deploy key or
-an extra Actions secret, so fork pull requests can run the same software suite.
-The main checkout does not persist credentials.
-
-Both use Clang 18, Debug, `BUILD_TESTING=ON`,
+Builds use Clang 18, Debug, `BUILD_TESTING=ON`,
 `LAVIK_ENABLE_TEST_FAULTS=ON`, and `LAVIK_ENABLE_OPT=OFF`. Debug is required
 for the Meta fault gates; the Data fault option alone does not enable them.
-Redis, Python, and TCL are installed before configuration so the conditional
-integration targets are present. The jobs fetch the pinned io_uring runtime
-dependencies; SPDK is not part of this build.
-`BUILD_TESTING=ON` also enables Bycorf's registered software regressions,
-including connection/timer, connection-storage lifetime, and backend-selection
-checks, through Bycorf's own CTest definitions.
-Process fixtures that use more than two workers disable CPU pinning, preserving
-cross-worker coverage on two-CPU runners.
+The workflow fetches the exact public Bycorf and mimalloc gitlinks and pinned
+runtime dependencies, without a deploy key or persisted checkout credentials.
+SPDK is not part of this software build. The architecture-specific compiler
+cache accelerates later builds; a cache miss still builds every target.
 
-After building all targets, run the same suite locally with:
+Redis, RedisShake, and hash-pinned redis-py are installed before configuration
+under `build_ci/test_tools`. The compressed runtime bundle includes these peers,
+Debug binaries and symbols, shared test libraries, generated CTest metadata, and
+private working directories; compilation intermediates are omitted. Each shard
+checks the source revision, architecture, original workspace/build paths, and
+CTest inventory before testing. Builders and shards must use the same absolute
+workspace path because both CTest and test binaries reference source fixtures.
+The Go Raft race test still runs `go test -race`, so shards also provision the
+pinned Go toolchain and C compiler.
+
+The runner discovers the actual CTest inventory on each invocation. A
+deterministic duration-based planner assigns every case and the four external
+suites to exactly one shard. `scripts/ci_test_durations.json` contains scheduling
+estimates, not a coverage allowlist: new tests are included automatically using
+family defaults. Fixture dependencies stay together. Estimates can be refreshed
+from recorded timings when suites change; each run saves the full assignment
+and inventory fingerprint in `plan.json`.
+
+Run the complete suite locally after building all targets:
 
 ```bash
 ./scripts/run_ci_tests.sh build_ci
 ```
 
-The runner executes all registered CTest cases serially, including the three
-large codec regressions, followed by native large-List and large-Hash tests,
-the >1 GiB RDB import/export test, and every vendored Valkey TCL suite under its
-compatibility harness policy. The large codec cases are enabled by default and
-carry the `large-codec` label; each runs without concurrent CTest cases even
-when invoked with `ctest --parallel`, since each retains roughly 2 GiB of
-payload. The runner continues with the remaining suites after a failure and
-returns nonzero if any suite fails. The ordinary CTest report still marks the
-large RDB case skipped; its explicit run has a separate log.
+Inspect a six-shard plan without starting servers, or execute one shard:
 
-CI enables the hardware safety gate using a private temporary file-backed loop
-device, which is detached when the suite exits. This exercises the scratch
-device eligibility checks; raw-device/SPDK verification still requires a
-separate hardware host. Local runs skip this gate unless
-`LAVIK_CLUSTER_HARDWARE_OPT_IN=1`; once enabled, a valid, unmounted
-`LAVIK_CLUSTER_SCRATCH_DEVICE` block device is required.
+```bash
+./scripts/run_ci_tests.sh build_ci --shard-index 0 --shard-count 6 --plan-only
+./scripts/run_ci_tests.sh build_ci --shard-index 0 --shard-count 6
+```
 
-Allow several GiB of free space for private test files under `/mnt/dev` and
-`/tmp`, and enable io_uring with a sufficient memlock limit. CI prepares these
-on its disposable VMs. Test logs and JUnit results live in
-`<build-dir>/test-results/`; CI retains them as a per-architecture artifact for
-seven days. The test jobs run independently of formatting and of each other's
-outcome.
+Do not run shards concurrently on one host without additional isolation. Each
+CI shard has its own VM and runs CTest serially: fixed ports, large disk images,
+and timing-sensitive fault scenarios remain isolated. Tested servers still use
+multiple workers; fixtures with more than two workers disable CPU pinning on
+small runners. Bycorf's registered software regressions remain included.
+
+The runner continues its assigned external suites after a CTest failure and
+returns nonzero if any suite fails. The ordinary CTest report marks the opt-in
+large RDB case skipped inside its GTest executable; its explicit execution has
+a separate log. The three memory-heavy codec cases also remain enabled.
+
+CI enables the hardware safety gate using an unmounted private file-backed
+loop device and detaches it on exit. Raw-device/SPDK testing still requires a
+hardware host. Local runs skip this gate unless `LAVIK_CLUSTER_HARDWARE_OPT_IN=1`
+and a valid `LAVIK_CLUSTER_SCRATCH_DEVICE` are supplied.
+
+Provide several GiB of free space for scratch files under `/mnt/dev` and `/tmp`,
+and enable io_uring with sufficient memlock. CI prepares those on disposable
+VMs. Local callers can set `LAVIK_TEST_DATA_DIR` to another writable directory.
+Logs, JUnit, and plans are under `<build>/test-results/`, with
+`shard-N-of-M/` subdirectories for partitioned runs. Per-architecture/shard
+artifacts are retained for seven days; build bundles for one day.
+The existing required check names `Tests (amd64)` and `Tests (arm64)` are
+preserved as completion gates. Both require every build and shard to succeed;
+failure, cancellation, or skipped work cannot report a passing test gate.
 
 The RedisShake ScanReader integration test additionally needs RedisShake on
 PATH (or `-DLAVIK_REDIS_SHAKE_EXECUTABLE=/path/to/redis-shake`) and Meta enabled.

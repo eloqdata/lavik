@@ -10,6 +10,12 @@ start_server {
         set result {}
         array set seenrand {}
         r del tosort
+        # Batch independent fixture writes without changing the random dataset
+        # or the order of list insertion: multi-argument LPUSH has the same
+        # order as successive single-element LPUSH calls. Keep each batch
+        # bounded so the large cases do not require an oversized command.
+        set elements {}
+        set weights {}
         for {set i 0} {$i < $num} {incr i} {
             # Make sure all the weights are different because
             # Redis does not use a stable sort but Tcl does.
@@ -22,10 +28,24 @@ start_server {
                 if {![info exists seenrand($rint)]} break
             }
             set seenrand($rint) x
-            r $cmd tosort $i
-            r set weight_$i $rint
+            lappend elements $i
+            lappend weights weight_$i $rint
             r hset wobj_$i weight $rint
             lappend tosort [list $i $rint]
+            if {[llength $elements] == 64 || $i == $num - 1} {
+                set expected [expr {$cmd eq "lpush" ? $i + 1 : [llength $elements]}]
+                assert_equal $expected [r $cmd tosort {*}$elements]
+                if {$::cluster_mode} {
+                    # The fixture's independent weight keys span hash slots.
+                    foreach {key value} $weights {
+                        assert_equal OK [r set $key $value]
+                    }
+                } else {
+                    assert_equal OK [r mset {*}$weights]
+                }
+                set elements {}
+                set weights {}
+            }
         }
         set sorted [lsort -index 1 -real $tosort]
         for {set i 0} {$i < $num} {incr i} {
