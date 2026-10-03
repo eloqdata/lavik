@@ -882,6 +882,186 @@ TEST(GroupedCollectionTest, EnvelopeOnlyDecodeAndDualDecisionRetirement) {
   EXPECT_FALSE(directory->Apply(root, 11, std::span(&revived, 1), 7).ok());
 }
 
+TEST(GroupedCollectionTest,
+     StreamRanksMatchCountsAcrossSparseUpdatesAndSnapshots) {
+  for (const std::size_t pages : {1, 2, 31, 32, 255, 256, 257, 1025, 32769}) {
+    std::vector<RecoveredOrderedGroup> records;
+    std::vector<std::uint64_t> counts;
+    OrderedCollectionRoot root{
+        .kind_ = OrderedCollectionKind::kStream,
+        .incarnation_ = 17,
+        .first_group_ = 1,
+        .last_group_ = pages,
+        .next_group_id_ = pages + 1,
+        .group_count_ = static_cast<std::uint32_t>(pages),
+        .stream_length_ = 0};
+    for (std::size_t n = 0; n < pages; ++n) {
+      counts.push_back(3 + n % 7);
+      root.item_count_ += counts.back();
+      records.push_back({.incarnation_ = 17,
+                         .id_ = n + 1,
+                         .previous_ = n,
+                         .next_ = n + 1 == pages ? 0 : n + 2,
+                         .sequence_ = 1,
+                         .lsn_ = 1,
+                         .item_count_ = counts.back(),
+                         .record_token_ = n + 1});
+    }
+    auto directory = OrderedGroupDirectory::Recover(root, 1, records, {});
+    ASSERT_TRUE(directory.ok()) << directory.status();
+    auto check = [](const OrderedGroupDirectory& d, const auto& expected) {
+      std::uint64_t prefix = 0;
+      for (std::size_t n = 0; n < expected.size(); ++n) {
+        EXPECT_EQ(d.CountBefore(n), prefix);
+        for (auto offset :
+             {std::uint64_t{0}, expected[n] / 2, expected[n] - 1}) {
+          const auto rank = d.FindRank(prefix + offset);
+          ASSERT_TRUE(rank.has_value());
+          EXPECT_EQ(rank->group_index_, n);
+          EXPECT_EQ(rank->offset_, offset);
+        }
+        prefix += expected[n];
+      }
+      EXPECT_EQ(d.CountBefore(expected.size()), prefix);
+      EXPECT_FALSE(d.FindRank(prefix).has_value());
+    };
+    check(*directory, counts);
+    for (std::uint64_t revision = 2; revision != 8; ++revision) {
+      auto pinned = *directory;
+      const auto before = counts;
+      std::vector<RecoveredOrderedGroup> changes;
+      for (std::size_t n = 0; n < pages; ++n) {
+        if (n != 0 && n != pages / 2 && n + 1 != pages) continue;
+        auto changed = directory->groups()[n];
+        changed.item_count_ = (revision + n) % 11 + 1;
+        changed.sequence_ = changed.lsn_ = revision;
+        root.item_count_ -= counts[n];
+        root.item_count_ += changed.item_count_;
+        counts[n] = changed.item_count_;
+        changes.push_back(changed);
+      }
+      root.revision_ = revision;
+      auto updated = directory->Apply(root, revision, changes, revision);
+      ASSERT_TRUE(updated.ok()) << updated.status();
+      check(*updated, counts);
+      check(pinned, before);
+      directory = std::move(updated);
+    }
+  }
+}
+
+TEST(GroupedCollectionTest, StructuralUpdatesMatchRecoveryAcrossSplices) {
+  auto first = Page(1, 2), second = Page(2, 3), third = Page(3, 4);
+  first.next_ = 2;
+  second.previous_ = 1;
+  second.next_ = 3;
+  third.previous_ = 2;
+  auto root = Root({first, second, third}, 4);
+  auto records = Candidates({first, second, third});
+  auto directory = OrderedGroupDirectory::Recover(root, 1, records, {});
+  ASSERT_TRUE(directory.ok()) << directory.status();
+  for (std::uint64_t revision = 2; revision != 102; ++revision) {
+    // Replace an interior page with a fresh identity, leave both neighbours
+    // connected, and retain increasingly many tombstones for GC lookup.
+    auto left = *directory->Find(root.first_group_);
+    auto middle = *directory->Find(left.next_);
+    auto right = *directory->Find(middle.next_);
+    auto inserted = middle;
+    inserted.id_ = root.next_group_id_++;
+    inserted.item_count_ = revision % 7 + 1;
+    left.next_ = inserted.id_;
+    right.previous_ = inserted.id_;
+    middle.retired_ = true;
+    middle.item_count_ = 0;
+    middle.previous_ = middle.next_ = 0;
+    std::vector<RecoveredOrderedGroup> changes{right, inserted, middle, left};
+    for (auto& item : changes) {
+      item.sequence_ = item.lsn_ = revision;
+      item.encoded_bytes_ = item.retired_ ? 64 : 128 * item.item_count_;
+      item.txid_ = revision + 1000;
+      item.batch_txid_ = revision + 2000;
+    }
+    root.revision_ = revision;
+    root.item_count_ =
+        left.item_count_ + inserted.item_count_ + right.item_count_;
+    auto updated = directory->Apply(root, revision, changes, revision);
+    ASSERT_TRUE(updated.ok()) << updated.status();
+    records.insert(records.end(), changes.begin(), changes.end());
+    absl::flat_hash_set<std::uint64_t> committed;
+    for (const auto& item : records) {
+      committed.insert(item.txid_);
+      committed.insert(item.batch_txid_);
+    }
+    auto recovered = OrderedGroupDirectory::Recover(root, revision, records,
+                                                    committed, revision);
+    ASSERT_TRUE(recovered.ok()) << recovered.status();
+    EXPECT_EQ(updated->root(), recovered->root());
+    EXPECT_EQ(updated->total_group_bytes(), recovered->total_group_bytes());
+    EXPECT_EQ(updated->retired_groups().size(), revision - 1);
+    for (std::size_t n = 0; n < updated->groups().size(); ++n) {
+      const auto& actual = updated->groups()[n];
+      const auto& expected = recovered->groups()[n];
+      EXPECT_EQ(actual.id_, expected.id_);
+      EXPECT_EQ(actual.previous_, expected.previous_);
+      EXPECT_EQ(actual.next_, expected.next_);
+      EXPECT_EQ(actual.item_count_, expected.item_count_);
+      EXPECT_EQ(updated->FindIndex(actual.id_), n);
+      EXPECT_EQ(updated->CountBefore(n), recovered->CountBefore(n));
+      EXPECT_EQ(updated->FindRank(updated->CountBefore(n))->group_index_, n);
+    }
+    EXPECT_EQ(directory->Find(left.id_)->next_, middle.id_);
+    for (const auto& item : updated->retired_groups()) {
+      const auto* expected = recovered->FindRecord(item.id_);
+      ASSERT_NE(expected, nullptr);
+      EXPECT_EQ(item.sequence_, expected->sequence_);
+      EXPECT_TRUE(item.retired_);
+    }
+    directory = std::move(updated);
+  }
+}
+
+TEST(GroupedCollectionTest, StructuralUpdatesRejectDisconnectedOrInvalidPages) {
+  auto first = Page(1, 2), last = Page(2, 3);
+  first.next_ = 2;
+  last.previous_ = 1;
+  auto root = Root({first, last}, 3);
+  auto directory =
+      OrderedGroupDirectory::Recover(root, 1, Candidates({first, last}), {});
+  ASSERT_TRUE(directory.ok()) << directory.status();
+  auto inserted = Candidates({Page(3, 1)}, 2).front();
+  inserted.previous_ = 2;
+  auto tail = *directory->Find(2);
+  tail.next_ = 3;
+  tail.sequence_ = tail.lsn_ = 2;
+  root.revision_ = 2;
+  root.next_group_id_ = 4;
+  root.last_group_ = 3;
+  root.group_count_ = 3;
+  root.item_count_ = 6;
+  std::vector<RecoveredOrderedGroup> changes{inserted, tail};
+  ASSERT_TRUE(directory->Apply(root, 2, changes, 2).ok());
+  auto reject = [&](auto alter) {
+    auto broken = changes;
+    alter(broken);
+    EXPECT_FALSE(directory->Apply(root, 2, broken, 2).ok());
+    EXPECT_EQ(directory->Find(2)->next_, 0);
+  };
+  reject([](auto& c) { c[0].previous_ = 1; });
+  reject([](auto& c) { c[0].next_ = 2; });
+  reject([](auto& c) { c[1].next_ = 0; });
+  reject([](auto& c) { c[0].record_token_ = 0; });
+  reject([](auto& c) { c[0].id_ = 4; });
+  reject([](auto& c) { c[0].item_count_ = 0; });
+  reject([](auto& c) {
+    c[0].max_score_ = std::numeric_limits<double>::quiet_NaN();
+  });
+  reject([](auto& c) { c.push_back(c.front()); });
+  auto overflow = changes;
+  overflow[0].encoded_bytes_ = UINT64_MAX;
+  overflow[1].encoded_bytes_ = UINT64_MAX;
+  EXPECT_FALSE(directory->Apply(root, 2, overflow, 2).ok());
+}
+
 TEST(GroupedCollectionTest, StreamingMetadataRebuildsBoundsAcrossAnyFraming) {
   const auto infinity = std::numeric_limits<double>::infinity();
   auto page = Page(1, 0, OrderedCollectionKind::kSortedSet);
