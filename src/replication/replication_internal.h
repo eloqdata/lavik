@@ -1138,7 +1138,8 @@ struct ReplicaSession {
   // Flow coroutines are detached onto their owner workers. Track their whole
   // lifetime, including connect/handshake and storage apply, so a failed
   // session cannot start a replacement while old flows are still mutating
-  // replica storage or holding network buffers.
+  // replica storage or holding network buffers. The control handshake also
+  // participates while admitting a destructive FULL before flows exist.
   std::atomic<unsigned> active_flows_{0};
   std::atomic<unsigned> active_transaction_applies_{0};
   std::atomic<unsigned> connected_flows_{0};

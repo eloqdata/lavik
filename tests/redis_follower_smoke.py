@@ -354,6 +354,13 @@ def unavailable_startup(lavik, redis, root):
 
 
 def exercise(lavik, redis, root):
+    def tomb_stats(client):
+        return dict(
+            line.split(":", 1)
+            for line in client.call("INFO", "stats").splitlines()
+            if ":" in line
+        )
+
     with (
         process(lavik, root / "native", "native") as (native, native_port, _),
         process(lavik, root / "target", "target") as (target, _, target_log),
@@ -364,6 +371,14 @@ def exercise(lavik, redis, root):
         reject(target, ("SLAVEOF", "127.0.0.1", native_port), "ERR")
         assert target.call("GET", "retained") == "original"
         assert "role:master" in target.call("INFO", "replication")
+        assert target.call("CONFIG", "SET", "tomb-raider-sleep-ms", 0) == "OK"
+        assert target.call("CONFIG", "SET", "tomb-raider-interval-ms", 20) == "OK"
+        assert target.call("DEFRAG", "PAUSE") == "OK"
+        H.wait_until(
+            "standalone primary physical maintenance",
+            10,
+            lambda: int(tomb_stats(target)["tomb_raider_rounds"]) > 0,
+        )
         target.call("SELECT", 15)
         target.call("SET", "old-db15", "must-clear")
         target.call("SELECT", 0)
@@ -389,11 +404,27 @@ def exercise(lavik, redis, root):
                 30,
                 lambda: "master_link_status:up" in target.call("INFO", "replication"),
             )
+            assert tomb_stats(target)["tomb_raider_enabled"] == "1"
+            assert tomb_stats(target)["tomb_raider_eligible"] == "1"
             assert target.call("SELECT", 15) == "OK"
             assert target.call("GET", "baseline") == "db15"
             assert target.call("EXISTS", "old-db15") == 0
             assert target.call("PTTL", "ttl") > 0
             assert target.call("FCALL_RO", "follow_value", 0) == "function-value"
+            reaped_before = int(tomb_stats(target)["tomb_raider_reaped"])
+            assert source.call("SET", "reaped-delete", "buried", "PX", 5000) == "OK"
+            H.wait_until(
+                "replicated expiring value before logical delete",
+                10,
+                lambda: target.call("GET", "reaped-delete") == "buried",
+            )
+            assert source.call("DEL", "reaped-delete") == 1
+            H.wait_until(
+                "standalone replica physically reaps replicated delete",
+                20,
+                lambda: int(tomb_stats(target)["tomb_raider_reaped"]) > reaped_before,
+            )
+            assert target.call("GET", "reaped-delete") is None
             assert source.call("MULTI") == "OK"
             assert source.call("SET", "tx-a", "a") == "QUEUED"
             assert source.call("SET", "tx-b", "b") == "QUEUED"
@@ -421,6 +452,17 @@ def exercise(lavik, redis, root):
                 and "Redis partial resynchronization continued"
                 in target_log.read_text(),
             )
+            assert target.call("GET", "reaped-delete") is None
+            assert target.call("REPLICAOF", "NO", "ONE") == "OK"
+            assert tomb_stats(target)["tomb_raider_enabled"] == "1"
+            assert tomb_stats(target)["tomb_raider_eligible"] == "1"
+            promotion_round = int(tomb_stats(target)["tomb_raider_rounds"])
+            H.wait_until(
+                "physical maintenance survives standalone promotion",
+                10,
+                lambda: int(tomb_stats(target)["tomb_raider_rounds"]) > promotion_round,
+            )
+            assert target.call("GET", "baseline") == "db15"
     # Both startup forms must reject an unsupported handshake before replacing data.
     with process(lavik, root / "native", "native-again") as (_, native_port, _):
         for index, option in enumerate(("replicaof", "redis-replicaof")):

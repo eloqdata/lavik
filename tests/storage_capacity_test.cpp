@@ -276,9 +276,9 @@ class FiniteExpirationAuthorityService final : public bycorf::Service {
         lavik::storage::TombRaiderConfigUpdate{
             .action_ = lavik::storage::TombRaiderConfigAction::kInterval,
             .value_ = 60'000});
-    if (tomb_raider.code() != absl::StatusCode::kFailedPrecondition) {
+    if (!tomb_raider.ok() || !storage_->TombRaiderStats().enabled_) {
       result_ = absl::FailedPreconditionError(
-          "finite active-expiration authority changed Tomb Raider admission");
+          "Tomb Raider configuration must not require expiration authority");
       co_return Finish();
     }
     // Cancellation cleanup obeys the same per-cycle work budget as actual and

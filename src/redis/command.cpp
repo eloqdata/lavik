@@ -2035,7 +2035,8 @@ Task<CommandReply> ExecuteTombRaider(const CommandRequest& request,
         "mode=", TombRaiderModeName(status.mode_), " interval_ms=",
         status.interval_ms_, " block_sleep_ms=", status.block_sleep_ms_,
         " daily=", FormatDailySecond(status.daily_second_),
-        " timezone=local running=", status.running_ ? 1 : 0)));
+        " timezone=local running=", status.running_ ? 1 : 0, " eligible=",
+        status.eligible_ ? 1 : 0, " blocked_reason=", status.blocked_reason_)));
   }
 
   storage::TombRaiderConfigUpdate update;
@@ -4851,6 +4852,11 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             (raider.enabled_ ? "1\r\n" : "0\r\n");
     info += std::string("tomb_raider_running:") +
             (raider.running_ ? "1\r\n" : "0\r\n");
+    info += std::string("tomb_raider_eligible:") +
+            (raider.eligible_ ? "1\r\n" : "0\r\n");
+    info +=
+        "tomb_raider_blocked_reason:" + std::string(raider.blocked_reason_) +
+        "\r\n";
     info +=
         "tomb_raider_mode:" + std::string(TombRaiderModeName(raider.mode_)) +
         "\r\n";

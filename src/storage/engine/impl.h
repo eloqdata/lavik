@@ -1384,10 +1384,9 @@ class StorageEngine::Impl {
               std::chrono::nanoseconds::max()),
           std::memory_order_relaxed);
     }
-    const TombRaiderMode mode =
-        options_.expiration_authority_ && options_.tomb_raider_interval_ms_ != 0
-            ? TombRaiderMode::kInterval
-            : TombRaiderMode::kOff;
+    const TombRaiderMode mode = options_.tomb_raider_interval_ms_ != 0
+                                    ? TombRaiderMode::kInterval
+                                    : TombRaiderMode::kOff;
     tomb_raider_config_.mode_.store(mode, std::memory_order_relaxed);
     tomb_raider_config_.last_mode_.store(TombRaiderMode::kInterval,
                                          std::memory_order_relaxed);
@@ -1943,6 +1942,9 @@ class StorageEngine::Impl {
     bool flush_running_ = false;
     bool write_failed_ = false;
     bool defrag_running_ = false;
+    // Runtime record-block removal precedes the durable allocation bitmap.
+    // A sweep cannot snapshot a complete recovery population in that window.
+    std::size_t pending_record_block_retirements_ = 0;
     bool defrag_waiting_ = false;
     std::size_t defrag_waiting_device_ = 0;
     std::size_t active_defrag_device_ = 0;
@@ -2394,12 +2396,26 @@ class StorageEngine::Impl {
     totals.refreshed_ = tomb_raider_refreshed_.load(std::memory_order_relaxed);
     totals.enabled_ = totals.mode_ != TombRaiderMode::kOff;
     totals.running_ = tomb_raider_running_.load(std::memory_order_relaxed);
+    totals.blocked_reason_ = TombRaiderBlockedReason();
+    if (totals.blocked_reason_ == "none" && !totals.enabled_)
+      totals.blocked_reason_ = "user_off";
+    totals.eligible_ = totals.blocked_reason_ == "none";
     return totals;
   }
 
   Task<absl::Status> ConfigureTombRaider(TombRaiderConfigUpdate update);
 
-  Task<absl::Status> QuiesceTombRaiderForReplica();
+  // Storage owns maintenance generations. Protocol callers report their FULL
+  // lifecycle; they never carry a Tomb Raider admission token.
+  struct PopulationChangeToken {
+    std::uint64_t session_id_ = 0;
+    std::uint64_t generation_ = 0;
+  };
+  Task<absl::Status> CompleteStorageStartup();
+  Task<absl::StatusOr<PopulationChangeToken>> BeginPopulationChange(
+      std::uint64_t session_id);
+  Task<absl::Status> CompletePopulationChange(PopulationChangeToken token);
+  Task<absl::Status> CancelPopulationChange(PopulationChangeToken token);
 
   DefragTotals DefragStats() const noexcept {
     return DefragTotals{
@@ -3014,6 +3030,7 @@ class StorageEngine::Impl {
   Task<absl::Status> PublishCleanShutdownProof();
   absl::StatusOr<PopulationToken> RecoverPopulationToken() const;
   Task<absl::Status> BeginReplicaFullSync(std::uint64_t session_id);
+  Task<absl::Status> FinalizeReplicaFullSync(std::uint64_t session_id);
   Task<absl::Status> CompleteReplicaFullSync(std::uint64_t session_id,
                                              PopulationToken population);
   bool ReplicaRecoveryFenced() const noexcept {
@@ -3071,6 +3088,7 @@ class StorageEngine::Impl {
 
  private:
   friend class ExpirationAuthorityTestPeer;
+  friend class TombRaiderTestPeer;
 
   struct DurableSystemState {
     std::uint64_t generation_ = 0;
@@ -4020,27 +4038,47 @@ class StorageEngine::Impl {
     std::uint8_t db_id_ = 0;
   };
 
-  Task<absl::Status> TombRaiderLoop(WorkerStore* store,
-                                    std::uint64_t generation);
+  // Captured before marking. No task outlives the round; cross-worker claims
+  // carry this same immutable proof context, never a refreshed epoch.
+  struct TombRaiderRound {
+    std::uint64_t population_generation_ = 0;
+    std::uint64_t index_generation_ = 0;
+    std::array<std::uint64_t, kLogicalDatabaseCount> db_epochs_{};
+    std::vector<std::array<std::uint64_t, kLogicalDatabaseCount>> indexes_;
+    std::atomic<bool> cancelled_{false};
+  };
 
-  absl::Status ApplyTombRaiderConfig(WorkerStore& coordinator,
-                                     TombRaiderConfigUpdate update);
+#if LAVIK_FAULTS_ENABLED
+  enum class TombRaiderTestPoint : std::uint8_t {
+    kAfterMark,
+    kAfterClaimLookup,
+    kBeforeReapKeyLoad,
+    kAfterReapKeyLoad,
+    kBeforeReapLock,
+    kAfterSweepRead,
+    kBeforeRetirementWait,
+  };
+  using TombRaiderTestHook =
+      std::function<Task<absl::Status>(TombRaiderTestPoint)>;
+  TombRaiderTestHook tomb_raider_test_hook_;
+#endif
 
+  Task<absl::Status> TombRaiderLoop(WorkerStore* store);
+  absl::Status ApplyTombRaiderConfig(TombRaiderConfigUpdate update);
   Task<absl::Status> RunTombRaider();
-
+  // Does not include user OFF: operator reconfiguration lets an admitted
+  // round finish, whereas population replacement and shutdown must drain it.
+  std::string_view TombRaiderBlockedReason() const noexcept;
   bool TombRaiderShouldForfeit() const noexcept {
-    return shutdown_flush_requested_.load(std::memory_order_acquire) ||
-           tomb_raider_forfeit_requested_.load(std::memory_order_acquire);
+    return TombRaiderBlockedReason() != "none";
   }
-
-  Task<absl::Status> TombMarkLocal(WorkerStore& store);
-
-  Task<absl::Status> TombSweepLocal(WorkerStore& store);
-
-  Task<absl::Status> TombClaimLocal(WorkerStore& store,
+  bool TombRaiderRoundValid(TombRaiderRound& round,
+                            const WorkerStore* store = nullptr) const noexcept;
+  Task<absl::Status> TombMarkLocal(WorkerStore& store, TombRaiderRound& round);
+  Task<absl::Status> TombSweepLocal(WorkerStore& store, TombRaiderRound& round);
+  Task<absl::Status> TombClaimLocal(WorkerStore& store, TombRaiderRound& round,
                                     std::vector<TombClaim> claims);
-
-  Task<absl::Status> TombReapLocal(WorkerStore& store);
+  Task<absl::Status> TombReapLocal(WorkerStore& store, TombRaiderRound& round);
 
   Task<absl::Status> PeriodicFlush(WorkerStore* store);
 
@@ -4219,9 +4257,8 @@ class StorageEngine::Impl {
   std::optional<std::string> recovered_catalog_dump_;
   std::optional<absl::Status> system_state_failure_;
   std::atomic<bool> system_state_root_failure_injected_{false};
-  // Tomb Raider retains the pre-existing coarse authority switch. Finite
-  // capabilities govern active expiration only and deliberately do not alter
-  // Tomb Raider admission, scheduling, or an in-flight cleanup round.
+  // Permanent and finite authority govern active expiration only. Physical
+  // maintenance admission follows the independent local population lifecycle.
   std::atomic<bool> expiration_authority_{true};
   std::atomic<std::shared_ptr<ExpirationAuthorityGrant>>
       active_expiration_authority_;
@@ -4270,14 +4307,18 @@ class StorageEngine::Impl {
   static_assert(sizeof(TombRaiderRuntimeConfig) == 64);
   AsyncNotification tomb_raider_round_finished_;
   std::atomic<bool> tomb_raider_running_{false};
-  // Cross-worker phase checkpoints observe this flag. The worker-0 quiesce
-  // coordinator keeps it set until the current round has published running
-  // false; ordinary TOMBRAIDER OFF never touches it.
-  std::atomic<bool> tomb_raider_forfeit_requested_{false};
-  // Worker-0-only serialization prevents an enabling CONFIG update from
-  // reopening admission while replica quiesce is suspended waiting on a
-  // remote phase.
-  bool tomb_raider_quiescing_ = false;
+  std::atomic<bool> tomb_raider_startup_complete_{false};
+  std::atomic<bool> tomb_raider_population_complete_{true};
+  std::atomic<std::uint64_t> tomb_raider_population_generation_{0};
+  std::atomic<std::size_t> tomb_raider_population_holds_{0};
+  // Index replacement on any worker invalidates a whole-engine proof, even
+  // source-local Redis Cluster FLUSH that does not advance a global DB epoch.
+  std::atomic<std::uint64_t> tomb_raider_index_generation_{0};
+  // Worker 0 owns session -> generation holds. Only the newest successful
+  // replacement may certify completeness; cancelling an older hold cannot
+  // reopen admission underneath a newer one.
+  absl::flat_hash_map<std::uint64_t, std::uint64_t>
+      tomb_raider_population_changes_;
   std::atomic<std::uint64_t> tomb_raider_rounds_{0};
   std::atomic<std::uint64_t> tomb_raider_reaped_{0};
   std::atomic<std::uint64_t> tomb_raider_refreshed_{0};

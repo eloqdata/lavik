@@ -238,6 +238,9 @@ struct TombRaiderTotals {
   TombRaiderMode mode_ = TombRaiderMode::kOff;
   bool enabled_ = false;
   bool running_ = false;
+  // Eligibility includes operator configuration, but not the next due time.
+  bool eligible_ = false;
+  std::string_view blocked_reason_ = "startup";
 };
 
 struct TxCleanerTotals {
@@ -1193,6 +1196,10 @@ class StorageEngine {
   // complete fixed-file table, opens every file with O_DIRECT into its fixed
   // slot, and performs parallel recovery.
   bycorf::Task<absl::Status> InitializeWorker(bycorf::Worker& worker);
+  // Publish completion of all-worker recovery, catalog recovery and optional
+  // startup import. An unfinished durable FULL stays incomplete regardless
+  // of serving authority. Idempotent, callable from any worker.
+  bycorf::Task<absl::Status> CompleteStorageStartup();
   // Runs on the worker's native thread after its IO and coroutine frames have
   // been torn down. Releases all state owned by that worker, including every
   // worker-local ScanHashMap, unless AbandonWorkerStateForProcessExit armed
@@ -1261,10 +1268,21 @@ class StorageEngine {
   // population and Function catalog have both reached the final cut. Begin is
   // idempotent for the same nonzero session. Complete accepts only that active
   // session, atomically makes it readable, and never rolls back the
-  // replacement on failure.
+  // replacement on failure. Storage drains local physical maintenance before
+  // admission and keeps it closed until FinalizeReplicaFullSync certifies the
+  // entire protocol population, including all flow cuts and local identity.
+  // Begin may wait for maintenance using key, index, or allocator locks;
+  // callers must not hold any of those locks while awaiting admission.
   bycorf::Task<absl::Status> BeginReplicaFullSync(std::uint64_t session_id);
   bycorf::Task<absl::Status> CompleteReplicaFullSync(
       std::uint64_t session_id, PopulationToken population);
+  // Worker zero only. Call after checking the exact current protocol attempt,
+  // with no suspension between that check and this call. An old attempt must
+  // be joined before its source-local session ID can be reused. This method
+  // captures the storage admission synchronously, so deferring the returned
+  // task cannot make it finalize a replacement admission with the same ID.
+  // Success must precede publication of protocol readiness.
+  bycorf::Task<absl::Status> FinalizeReplicaFullSync(std::uint64_t session_id);
   bool ReplicaRecoveryFenced() const noexcept;
   // Irreversibly fences request serving in this process after a durable
   // mutation can no longer be reconciled with its replication history.
@@ -1900,10 +1918,6 @@ class StorageEngine {
   // Reconfigures the worker-0 scheduler. An in-flight round always finishes;
   // the new schedule starts counting from that completion.
   bycorf::Task<absl::Status> ConfigureTombRaider(TombRaiderConfigUpdate update);
-  // Replica reset coordination: disables future rounds, asks an in-flight
-  // round to forfeit at its next safe checkpoint, and waits until it exits.
-  // This is deliberately stronger than the user-facing OFF configuration.
-  bycorf::Task<absl::Status> QuiesceTombRaiderForReplica();
   // Runtime relocation pacing. Reducing concurrency does not cancel active
   // passes; it prevents replacements until the active count reaches the new
   // limit. Sleep changes take effect at the next checkpoint.
@@ -1929,6 +1943,7 @@ class StorageEngine {
 
  private:
   friend class ExpirationAuthorityTestPeer;
+  friend class TombRaiderTestPeer;
   class Impl;
   std::unique_ptr<Impl> impl_;
 };

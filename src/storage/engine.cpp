@@ -33,6 +33,10 @@ Task<absl::Status> StorageEngine::InitializeWorker(Worker& worker) {
   return impl_->InitializeWorker(worker);
 }
 
+Task<absl::Status> StorageEngine::CompleteStorageStartup() {
+  return impl_->CompleteStorageStartup();
+}
+
 void StorageEngine::FinalizeWorker(Worker& worker) noexcept {
   impl_->FinalizeWorker(worker.id());
 }
@@ -104,6 +108,11 @@ Task<absl::Status> StorageEngine::BeginReplicaFullSync(
 Task<absl::Status> StorageEngine::CompleteReplicaFullSync(
     std::uint64_t session_id, PopulationToken population) {
   return impl_->CompleteReplicaFullSync(session_id, population);
+}
+
+Task<absl::Status> StorageEngine::FinalizeReplicaFullSync(
+    std::uint64_t session_id) {
+  return impl_->FinalizeReplicaFullSync(session_id);
 }
 
 bool StorageEngine::ReplicaRecoveryFenced() const noexcept {

@@ -1446,8 +1446,26 @@ auto ReplicationManager::ReplicationGroup::
   if (recovered) {
     // Exercise the production verified-recovery boundary without repeating
     // the storage certificate/crash protocol covered by process tests.
-    co_return co_await InstallRecoveredPopulation(
+    const auto action = cluster_failover_action_;
+    const auto follow = cluster_follow_owner_;
+    storage_ready = co_await InstallRecoveredPopulation(
         {std::move(ready_identity), directive.required_applied_next_lsns_});
+    if (!storage_ready.ok()) co_return storage_ready;
+    AssertStateOwner();
+    if (cluster_failover_action_ != action || cluster_follow_owner_ != follow ||
+        (action != nullptr && action->cancelled_) ||
+        cluster_control_stopping_ || replica_reconfiguration_running_ ||
+        failed_stopped_.load(std::memory_order_relaxed) ||
+        cluster_rebuild_ == nullptr ||
+        cluster_rebuild_->state_.load(std::memory_order_relaxed) !=
+            ReplicationGroupState::kReady ||
+        !cluster_rebuild_->ready_token_.has_value() ||
+        !detail::SameRecoveredPopulationScope(
+            cluster_rebuild_->ready_token_->identity(), directive.identity_)) {
+      co_return absl::CancelledError(
+          "recovered fault candidate completed after supersession");
+    }
+    co_return co_await storage_->FinalizeReplicaFullSync(kFaultFullSyncSession);
   }
   RebuildDirective rebuild{
       .identity_ = std::move(ready_identity),
@@ -1521,7 +1539,7 @@ auto ReplicationManager::ReplicationGroup::
     native_dataset_valid_.store(true, std::memory_order_release);
     PublishHeartbeatObservation();
   }
-  co_return absl::OkStatus();
+  co_return co_await storage_->FinalizeReplicaFullSync(kFaultFullSyncSession);
 }
 #endif
 
@@ -6572,9 +6590,6 @@ auto ReplicationManager::ReplicationGroup::RunEmptyPopulationInitialization(
     }
   }
   if (prepared.ok()) {
-    prepared = co_await storage_->QuiesceTombRaiderForReplica();
-  }
-  if (prepared.ok()) {
     prepared = co_await storage_->QuiesceExpiration();
     if (prepared.ok()) storage_->ResumeExpiration();
   }
@@ -6736,10 +6751,16 @@ auto ReplicationManager::ReplicationGroup::RunEmptyPopulationInitialization(
     co_return co_await FinishEmptyPopulationFailure(
         context, session_id, root_started, promoted, recorded);
   }
-  recovered_population_.reset();
-  recovered_population_fenced_ = false;
-  operator_recovery_active_ = false;
-
+  if (!EmptyPopulationCurrent(context)) {
+    co_return co_await FinishEmptyPopulationFailure(
+        context, session_id, root_started, promoted, cancelled());
+  }
+  absl::Status finalized =
+      co_await storage_->FinalizeReplicaFullSync(session_id);
+  if (!finalized.ok()) {
+    co_return co_await FinishEmptyPopulationFailure(
+        context, session_id, root_started, promoted, finalized);
+  }
   bool installed = false;
   {
     AssertStateOwner();
@@ -6758,6 +6779,9 @@ auto ReplicationManager::ReplicationGroup::RunEmptyPopulationInitialization(
         context, session_id, root_started, promoted,
         absl::CancelledError("empty population completed after supersession"));
   }
+  recovered_population_.reset();
+  recovered_population_fenced_ = false;
+  operator_recovery_active_ = false;
   owner_source_term_ = context->directive_.identity_.term_;
   StoreRole(ReplicationRole::kMaster, std::memory_order_release);
   storage_->SetReplicaLoading(false);
@@ -7610,7 +7634,16 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
     }
     local_population_matches_response = false;
   }
+  // Cleanup must know the admitted session even if durable invalidation
+  // suspends and a role change cancels the handshake before flow creation.
+  session->session_id_ = session_id;
   if (!local_population_matches_response) {
+    // The control coroutine can suspend while draining physical maintenance
+    // and persisting the FULL fence before any data flow exists. Include
+    // that storage operation in the session join so reconfiguration cannot
+    // abort its hold and then be overtaken by the pending invalidation.
+    session->active_flows_.fetch_add(1, std::memory_order_acq_rel);
+    ReplicaFlowActivityGuard admission_activity(&session->active_flows_);
     // Publishing a new source context makes it eligible for the next
     // reconnect. Persist the destructive fence first, so a disconnect
     // before the first flow cannot turn an empty/old population into a
@@ -7630,7 +7663,6 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
       co_return absl::CancelledError("replication role epoch was replaced");
     }
   }
-  session->session_id_ = session_id;
   session->flow_capability_ = std::string(words[7]);
   session->source_worker_count_ = source_workers;
   session->transaction_owners_.reserve(storage_->worker_count());
@@ -7943,9 +7975,9 @@ auto ReplicationManager::ReplicationGroup::PrepareReplicaFlowMode(
 
   // A role-generation change prevents new external data commands, but work
   // admitted against the old population may already hold a database gate.
-  // Flow zero establishes the destructive-reset boundary while all other
-  // flows wait: close admission, drain that work, and quiesce background
-  // mutators before reopening the gates for trusted replica apply.
+  // Flow zero drains old client work and logical expiration while other
+  // flows wait. BeginReplicaFullSync separately drains physical maintenance
+  // before the durable invalidation that admits destructive replica apply.
   if (flow_id == 0) {
     absl::Status prepared = session->PrepareFullSyncCursors();
     while (prepared.ok() && !CloseAllCommandDbGates()) {
@@ -7970,9 +8002,6 @@ auto ReplicationManager::ReplicationGroup::PrepareReplicaFlowMode(
                                              std::chrono::milliseconds(1));
         if (!prepared.ok()) break;
       }
-    }
-    if (prepared.ok()) {
-      prepared = co_await storage_->QuiesceTombRaiderForReplica();
     }
     if (prepared.ok()) {
       prepared = co_await storage_->QuiesceExpiration();
@@ -9381,6 +9410,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
           session->promotion_complete_->Abort(installed);
           co_return installed;
         }
+        std::optional<ReadyToken> ready_population;
         if (session->cluster_rebuild_ != nullptr) {
           auto ready = cluster_group_->PublishReady(
               session->cluster_rebuild_->directive_.identity_);
@@ -9401,40 +9431,76 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
             session->promotion_complete_->Abort(recorded);
             co_return recorded;
           }
+          ready_population = *ready;
+        }
+        const auto current_population = [&] {
+          AssertStateOwner();
+          return active_replica_session_ == session &&
+                 !replica_reconfiguration_running_ && !session->cancelled() &&
+                 !failed_stopped_.load(std::memory_order_relaxed) &&
+                 (session->cluster_rebuild_ == nullptr ||
+                  (cluster_rebuild_ == session->cluster_rebuild_ &&
+                   session->cluster_rebuild_->state_.load(
+                       std::memory_order_relaxed) ==
+                       ReplicationGroupState::kRebuilding));
+        };
+        if (!current_population()) {
+          const absl::Status replaced =
+              absl::CancelledError("population finalization was superseded");
+          session->promotion_complete_->Abort(replaced);
+          co_return replaced;
+        }
+        // The owner check and finalization call have no intervening await.
+        // Storage captures its private admission immediately; joined session
+        // teardown prevents a retired caller from reusing a newer wire ID.
+        absl::Status finalized;
+        if (LAVIK_FAULT_MATCHES("LAVIK_REPLICATION_FAIL_POPULATION_FINALIZE",
+                                "1")) {
+          finalized = absl::InternalError(
+              "injected full-sync population finalization failure");
+        } else {
+          finalized =
+              co_await storage_->FinalizeReplicaFullSync(session->session_id_);
+        }
+        if (!current_population()) {
+          const absl::Status replaced = absl::CancelledError(
+              "population finalization completed after supersession");
+          session->promotion_complete_->Abort(replaced);
+          co_return replaced;
+        }
+        if (!finalized.ok()) {
+          const std::string reason = absl::StrCat(
+              "promoted population finalization failed: ", finalized.message());
+          session->RequireFailStop(reason);
+          if (session->cluster_rebuild_ != nullptr) {
+            (void)cluster_group_->FailStop(
+                session->cluster_rebuild_->directive_.identity_);
+            session->cluster_rebuild_->state_.store(
+                ReplicationGroupState::kFailedStopped,
+                std::memory_order_release);
+            PublishHeartbeatObservation();
+            session->cluster_rebuild_->completion_->Resolve(finalized);
+          }
+          session->promotion_complete_->Abort(finalized);
+          co_return finalized;
+        }
+        // Root/cut/identity durability and storage finalization all succeeded.
+        // Publish readiness only now: a finalization failure must neither
+        // leave a Ready attempt behind nor permit automatic CONTINUE retry.
+        native_dataset_valid_.store(true, std::memory_order_release);
+        if (session->cluster_rebuild_ != nullptr) {
           recovered_population_.reset();
           recovered_population_fenced_ = false;
           operator_recovery_active_ = false;
-          {
-            AssertStateOwner();
-            if (active_replica_session_ == session &&
-                cluster_rebuild_ == session->cluster_rebuild_ &&
-                !replica_reconfiguration_running_ &&
-                session->cluster_rebuild_->state_.load(
-                    std::memory_order_relaxed) ==
-                    ReplicationGroupState::kRebuilding) {
-              session->cluster_rebuild_->ready_token_ = *ready;
-              session->cluster_rebuild_->state_.store(
-                  ReplicationGroupState::kReady, std::memory_order_release);
-              native_dataset_valid_.store(true, std::memory_order_release);
-              if (session->cluster_follow_ != nullptr) {
-                // A backlog-gap latch is needed only until one fresh FULL
-                // publishes a complete replacement population. Clearing it
-                // here, rather than at admission, keeps retries destructive
-                // until success while allowing later reconnects to resume.
-                session->cluster_follow_->force_full_.store(
-                    false, std::memory_order_release);
-              }
-            } else {
-              const absl::Status replaced = absl::CancelledError(
-                  "cluster readiness completed after session supersession");
-              session->promotion_complete_->Abort(replaced);
-              co_return replaced;
-            }
+          session->cluster_rebuild_->ready_token_ = *ready_population;
+          session->cluster_rebuild_->state_.store(ReplicationGroupState::kReady,
+                                                  std::memory_order_release);
+          if (session->cluster_follow_ != nullptr) {
+            session->cluster_follow_->force_full_.store(
+                false, std::memory_order_release);
           }
           PublishHeartbeatObservation();
           session->cluster_rebuild_->completion_->Resolve(absl::OkStatus());
-        } else {
-          native_dataset_valid_.store(true, std::memory_order_release);
         }
       }
       absl::Status finalized = co_await session->promotion_complete_->Wait(

@@ -434,6 +434,7 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
   // suspends. Such a retry could invalidate the population being promoted.
   std::optional<std::uint64_t> detached_role_epoch;
   std::vector<std::shared_ptr<ReplicaSession>> draining_sessions;
+  std::uint64_t retired_redis_full_sync_session = 0;
   bool retire_source_before_gates = false;
   {
     AssertStateOwner();
@@ -455,6 +456,7 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
         if (source->session_ == nullptr) continue;
         draining_sessions.push_back(std::move(source->session_));
       }
+      retired_redis_full_sync_session = redis_full_sync_session_id_;
     }
   }
   for (const auto& session : draining_sessions) {
@@ -483,6 +485,17 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
             "replica abort outcome is uncertain: ", discarded.message()));
         co_return discarded;
       }
+    }
+  }
+  if (retired_redis_full_sync_session != 0) {
+    // Redis source transports have no native session ID. Their shared FULL
+    // population hold can be retired only after every source has joined.
+    absl::Status discarded =
+        co_await storage_->AbortReplicaRoot(retired_redis_full_sync_session);
+    if (!discarded.ok()) {
+      LatchReplicationFailure(absl::StrCat(
+          "Redis replica abort outcome is uncertain: ", discarded.message()));
+      co_return discarded;
     }
   }
   if (retire_source_before_gates) {
@@ -526,10 +539,9 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
     }
   } expiration_resume{storage_, &expiration_quiesced};
   if (upstream.has_value()) {
-    // Stop maintenance before the destructive replica transition. Tomb
-    // Raider checks this boundary again at its safe yield points.
-    absl::Status maintenance = co_await storage_->QuiesceTombRaiderForReplica();
-    if (!maintenance.ok()) co_return maintenance;
+    // Role changes only revoke logical-expiration authority. Physical
+    // reclamation remains valid for a complete local population; storage
+    // pauses it if this relationship later requires destructive full sync.
     storage_->SetExpirationAuthority(false);
     storage_->ResumeExpiration();
     expiration_quiesced = false;
@@ -1805,12 +1817,20 @@ auto ReplicationManager::ReplicationGroup::CompleteRedisFullSync(
       }
       {
         AssertStateOwner();
-        if (redis_full_sync_session_id_ != *full_sync_session) {
+        if (redis_full_sync_session_id_ != *full_sync_session ||
+            !RedisSourceRegistered(source) || replication_shutdown_requested_ ||
+            source->role_epoch_ !=
+                role_epoch_.load(std::memory_order_relaxed)) {
           co_return absl::CancelledError(
               "Redis full sync activation was superseded");
         }
-        redis_full_sync_session_id_ = 0;
       }
+      // Every registered source belongs to this completed session. Releasing
+      // physical maintenance here prevents a partial Cluster import from
+      // being mistaken for a complete local population.
+      status = co_await storage_->FinalizeReplicaFullSync(*full_sync_session);
+      if (!status.ok()) co_return status;
+      redis_full_sync_session_id_ = 0;
     }
   }
   spdlog::info("Redis FULLRESYNC completed from {}:{} at offset {}",

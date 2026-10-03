@@ -905,9 +905,27 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaFullSync(
     co_return co_await bycorf::SubmitTaskTo(
         0, [this, session_id]() { return BeginReplicaFullSync(session_id); });
   }
+  auto paused = co_await BeginPopulationChange(session_id);
+  if (!paused.ok()) co_return paused.status();
+  const auto generation = paused->generation_;
   co_await system_state_mutex_.Lock();
   UnlockGuard unlock(&system_state_mutex_, bycorf::ThisWorker().self_);
+  const auto hold = tomb_raider_population_changes_.find(session_id);
+  if (hold == tomb_raider_population_changes_.end() ||
+      hold->second != generation ||
+      generation !=
+          tomb_raider_population_generation_.load(std::memory_order_acquire)) {
+    // This caller has not attempted a durable mutation. Release only its
+    // exact generation, never a replacement reusing the same wire ID.
+    if (hold != tomb_raider_population_changes_.end() &&
+        hold->second == generation)
+      tomb_raider_population_changes_.erase(hold);
+    tomb_raider_population_holds_.store(tomb_raider_population_changes_.size(),
+                                        std::memory_order_release);
+    co_return absl::CancelledError("full sync population hold was cancelled");
+  }
   if (system_state_.full_sync_session_id_ == session_id) {
+    tomb_raider_population_complete_.store(false, std::memory_order_release);
     replica_recovery_fenced_.store(true, std::memory_order_release);
     co_return absl::OkStatus();
   }
@@ -919,9 +937,30 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaFullSync(
   next.population_identity_.clear();
   next.clean_shutdown_proof_.clear();
   staged_clean_shutdown_proof_.clear();
+  // Once durability is attempted, cancellation cannot certify the old root.
+  // Only explicit final FULL completion may reopen physical maintenance.
+  const bool previously_complete = tomb_raider_population_complete_.exchange(
+      false, std::memory_order_acq_rel);
   absl::Status committed =
       co_await CommitSystemState(std::move(next), {}, false);
-  if (!committed.ok()) co_return committed;
+  if (!committed.ok()) {
+    // CommitSystemState latches any ambiguous root write. A failure before
+    // that cut left only unpublished extents, so it preserves the old root.
+    // Supersession must never restore completeness over a newer admission.
+    if (!system_state_failure_.has_value() && !RuntimeFailureLatched() &&
+        generation == tomb_raider_population_generation_.load(
+                          std::memory_order_acquire)) {
+      tomb_raider_population_complete_.store(previously_complete,
+                                             std::memory_order_release);
+    }
+    const auto current = tomb_raider_population_changes_.find(session_id);
+    if (current != tomb_raider_population_changes_.end() &&
+        current->second == generation)
+      tomb_raider_population_changes_.erase(current);
+    tomb_raider_population_holds_.store(tomb_raider_population_changes_.size(),
+                                        std::memory_order_release);
+    co_return committed;
+  }
   replica_recovery_fenced_.store(true, std::memory_order_release);
   // This fence is shared by native and Redis full sync, while
   // replica_loading_ is not: Redis imports its RDB through ordinary writes,
@@ -932,6 +971,27 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaFullSync(
       "generation {}",
       session_id, system_state_.generation_);
   co_return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::FinalizeReplicaFullSync(
+    std::uint64_t session_id) {
+  // This is deliberately not a coroutine: bind the owner-validated attempt
+  // before returning a possibly deferred task. Joining old protocol attempts
+  // protects calls themselves; this private generation also protects an old
+  // task resumed after the source reused its wire-session identifier.
+  if (bycorf::ThisWorker().id_ != 0) {
+    return
+        [](absl::Status status)
+            -> Task<absl::Status> {
+          co_return status;
+        }(absl::FailedPreconditionError(
+                "full sync finalization requires the population owner worker"));
+  }
+  const auto hold = tomb_raider_population_changes_.find(session_id);
+  const auto generation =
+      hold == tomb_raider_population_changes_.end() ? 0 : hold->second;
+  return CompletePopulationChange(
+      PopulationChangeToken{session_id, generation});
 }
 
 Task<absl::Status> StorageEngine::Impl::CompleteReplicaFullSync(

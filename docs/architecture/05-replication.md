@@ -1030,8 +1030,10 @@ whole group instead of serving the old root.
 
 Before any target reset, every flow must select the same FULL mode. Flow zero
 then closes command database admission, drains work admitted against the old
-serving generation, and quiesces Tomb Raider and expiration while all other
-flows wait at a session barrier. Admission reopens only after that boundary so
+serving generation, and quiesces expiration while all other flows wait at a
+session barrier. Storage's durable FULL-begin boundary separately drains Tomb
+Raider before invalidation, including when the control handshake reaches that
+boundary before the flows start. Admission reopens only after the flow barrier so
 trusted replica apply can proceed; external commands remain fenced by the
 closed serving generation. This makes the first destructive reset, rather than
 the final cut, the boundary after which no request admitted against the old
@@ -1039,6 +1041,21 @@ serving generation, Tomb Raider round, or expiration task can mutate or
 publish the old logical population. Physical maintenance such as defrag and
 transaction cleanup may continue; epoch, index-generation, and record-location
 revalidation prevents that stale work from publishing into the replacement.
+
+The storage gate is independent of the Tomb Raider schedule and serving
+authority. FULL closes it before durable invalidation and keeps it closed until
+root promotion, all-flow cut installation, and required population completion
+records succeed. Replication reports these population lifecycle boundaries;
+storage owns the maintenance gate and its generation internally. The adapter
+validates the current attempt before final completion and joins its mutators
+before abort or session-identifier reuse. Storage captures the admission's
+private generation at final completion and before the abort drain, so delayed
+completion or cleanup can release only that admission.
+Redis FULLRESYNC and source-less initialization use the same boundary, and a
+multi-source Redis import completes only when every source in its session is
+complete. An interrupted destructive attempt stays ineligible until a complete
+population replaces it. Ordinary role changes, lease loss, and transport-only
+disconnects do not disable Tomb Raider on a complete local population.
 
 After that boundary, the native flows collectively call
 `ResetReplicaPartitions` for all 16,384 physical partitions, including empty

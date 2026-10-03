@@ -218,6 +218,7 @@ class ReplicationLogService final : public bycorf::Service {
     lavik::BindMemoryAccountingShard(worker.id());
     lavik::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
     result_ = co_await storage_->InitializeWorker(worker);
+    if (result_.ok()) result_ = co_await storage_->CompleteStorageStartup();
     if (result_.ok() && exercise_) {
       result_ = co_await Exercise();
     }
@@ -2998,8 +2999,16 @@ class ReplicationLogService final : public bycorf::Service {
     Check(saw_rewrite, "full sync lost the concurrent overwrite during shrink");
     storage_->EndPartitionReplication(kSession, partition_id);
     storage_->EndFullSyncSession(kSession);
-    status = co_await storage_->QuiesceTombRaiderForReplica();
+    status = co_await storage_->ConfigureTombRaider(
+        {.action_ = lavik::storage::TombRaiderConfigAction::kOff});
     if (!status.ok()) co_return status;
+    // This source-side fixture only needs to stop subsequent rounds. Target
+    // FULL replacement owns its separate population drain at admission.
+    while (storage_->TombRaiderStats().running_) {
+      status =
+          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(1));
+      if (!status.ok()) co_return status;
+    }
     co_return absl::OkStatus();
   }
 
