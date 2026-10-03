@@ -290,8 +290,10 @@ class OrderedGroupDirectory {
       std::optional<HashGroupDirectory> members = std::nullopt);
 
   // Complete after-image metadata, not value deltas. Existing adjudicated
-  // pages and retirement evidence remain candidates; only changed ids replace
-  // them. The physical side index independently COWs only touched pages.
+  // pages and retirement evidence stay adjudicated; only changed ids replace
+  // them. Structural edits validate the resulting complete chain directly;
+  // recovery alone selects winners from competing physical candidates. The
+  // physical side index independently COWs only touched pages.
   absl::StatusOr<OrderedGroupDirectory> Apply(
       const OrderedCollectionRoot& root, std::uint64_t revision,
       std::span<const RecoveredOrderedGroup> changed,
@@ -366,6 +368,8 @@ class OrderedGroupDirectory {
   GroupedMetadataArray<RecoveredOrderedGroup> groups_;
   GroupedMetadataArray<RecoveredOrderedGroup> retired_;
   GroupedMetadataArray<std::pair<std::uint64_t, std::size_t>, 256> ids_;
+  // Lists/Sorted Sets retain cumulative ranks. Streams use Fenwick partial
+  // sums so append/trim count transfers detach only logarithmic rank cells.
   GroupedMetadataArray<std::uint64_t, 256> ends_;
   mutable std::array<char, 48> stream_header_{};
   mutable bool has_stream_header_ = false;
