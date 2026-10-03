@@ -98,6 +98,8 @@ inline bycorf::Task<absl::Status> PauseGroupedDecisionForTest(
     if (::unlink((base + ".notify").c_str()) == 0) {
       test.probed_ = true;
       notification.NotifyAll(worker);
+      spdlog::info("grouped dependency premature notification sent txid={}",
+                   txid);
     }
     if (std::chrono::steady_clock::now() >= until)
       co_return absl::DeadlineExceededError(

@@ -557,6 +557,15 @@ Task<absl::Status> StorageEngine::Impl::MarkRecordDead(
   });
 }
 
+namespace {
+template <typename Callback>
+void ForEachGroupedPredecessor(const TxShardWrites& shard, Callback callback) {
+  if (shard.grouped_predecessor_) callback(shard.grouped_predecessor_);
+  for (auto link = shard.grouped_dependencies_; link; link = link->next_)
+    callback(link->decision_);
+}
+}  // namespace
+
 Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
     std::uint64_t txid, std::vector<TxShardWrites*> shards,
     RelocationDurabilityFence* deferred_decision) {
@@ -590,6 +599,43 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
             GroupedCommitDecision::State::kFailed) {
       co_return absl::FailedPreconditionError(
           "grouped transaction was abandoned");
+    }
+    // No foreground key/store lock is retained here. Local predecessors have
+    // earlier queue receipts; command-local batches can wait on the owner's
+    // separate drain. The queued batch flushes appended predecessors before
+    // entering this wait, avoiding a wait on its own deferred decision flush.
+    auto predecessor = shard->grouped_predecessor_;
+    auto next_predecessor = shard->grouped_dependencies_;
+    while (predecessor) {
+      for (;;) {
+        const auto state = predecessor->state_.load(std::memory_order_acquire);
+        if (state == GroupedCommitDecision::State::kDurable) break;
+        if (state == GroupedCommitDecision::State::kFailed ||
+            CurrentStore().write_failed_ || RuntimeFailureLatched())
+          co_return absl::FailedPreconditionError(
+              "prior grouped transaction did not commit");
+        if (CurrentStore().worker_->stop_requested())
+          co_return absl::CancelledError(
+              "worker stopped before grouped commit");
+        if (predecessor->completion_owner_ == CurrentStore().worker_->id()) {
+#if LAVIK_FAULTS_ENABLED
+          co_await GroupedDependencyTestWaiter(
+              CurrentStore().durability_progress_, predecessor->txid_);
+#else
+          co_await CurrentStore().durability_progress_.Wait();
+#endif
+        } else {
+          const auto waited = co_await bycorf::SleepFor(
+              *CurrentStore().worker_, std::chrono::microseconds(50));
+          if (!waited.ok()) co_return waited;
+        }
+      }
+      if (next_predecessor) {
+        predecessor = next_predecessor->decision_;
+        next_predecessor = next_predecessor->next_;
+      } else {
+        predecessor.reset();
+      }
     }
     if (commit_receipt == nullptr) commit_receipt = shard;
     for (const TxShardWrites::Fence& fence : shard->fences_) {
@@ -872,11 +918,65 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
     const bool defer_decisions = batch.size() > 1;
     std::vector<RelocationDurabilityFence> decision_fences;
     std::vector<WorkerStore::PendingTxCommit*> deferred_pending;
+    absl::flat_hash_set<const GroupedCommitDecision*> deferred_decisions;
+    const bool has_predecessors =
+        std::any_of(batch.begin(), batch.end(), [](const auto& pending) {
+          return std::any_of(pending.writes_.begin(), pending.writes_.end(),
+                             [](const auto& shard) {
+                               return shard.grouped_predecessor_ != nullptr;
+                             });
+        });
     if (defer_decisions) {
       decision_fences.reserve(batch.size());
       deferred_pending.reserve(batch.size());
+      if (has_predecessors) deferred_decisions.reserve(batch.size());
     }
+    auto flush_decisions = [&]() -> Task<absl::Status> {
+      if (!decision_fences.empty()) {
+        co_await store->store_state_mutex_.Lock();
+        UnlockGuard unlock(&store->store_state_mutex_, store->worker_);
+        for (const RelocationDurabilityFence& decision : decision_fences)
+          RequestFlush(*store, decision.block_id_);
+        unlock.Unlock();
+        absl::Status decisions_durable = absl::OkStatus();
+        for (const RelocationDurabilityFence& decision : decision_fences) {
+          decisions_durable = co_await AwaitRelocationDurable(decision);
+          if (!decisions_durable.ok()) break;
+        }
+        for (auto* pending : deferred_pending) {
+          for (TxShardWrites& shard : pending->writes_) {
+            if (!shard.grouped_decision_) continue;
+            if (decisions_durable.ok()) {
+              shard.grouped_decision_->state_.store(
+                  GroupedCommitDecision::State::kDurable,
+                  std::memory_order_release);
+            } else {
+              shard.grouped_decision_->FailPending();
+            }
+          }
+        }
+        if (!decisions_durable.ok())
+          spdlog::warn("transaction batch decision flush failed: {}",
+                       decisions_durable.message());
+      }
+      decision_fences.clear();
+      deferred_pending.clear();
+      deferred_decisions.clear();
+      store->durability_progress_.NotifyAll(*store->worker_);
+      co_return absl::OkStatus();
+    };
     for (WorkerStore::PendingTxCommit& pending : batch) {
+      bool inherits_deferred = false;
+      for (const auto& shard : pending.writes_) {
+        ForEachGroupedPredecessor(shard, [&](const auto& predecessor) {
+          inherits_deferred |= deferred_decisions.contains(predecessor.get());
+        });
+      }
+      // A later root can refer to an earlier transaction's untouched pages.
+      // Flush that earlier commit frontier before appending the later commit,
+      // including when rollover puts them on different physical blocks. Data
+      // staging and unrelated commits still share the opportunistic batch.
+      if (inherits_deferred) co_await flush_decisions();
       if (batch_status.ok()) {
         std::vector<TxShardWrites*> shards;
         for (TxShardWrites& shard : pending.writes_) {
@@ -895,6 +995,10 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
           } else if (defer_decisions) {
             decision_fences.push_back(decision);
             deferred_pending.push_back(&pending);
+            if (has_predecessors)
+              for (const auto& shard : pending.writes_)
+                if (shard.grouped_decision_)
+                  deferred_decisions.insert(shard.grouped_decision_.get());
           }
         }
       } else {
@@ -907,33 +1011,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
         }
       }
     }
-    if (!decision_fences.empty()) {
-      co_await store->store_state_mutex_.Lock();
-      UnlockGuard unlock(&store->store_state_mutex_, store->worker_);
-      for (const RelocationDurabilityFence& decision : decision_fences)
-        RequestFlush(*store, decision.block_id_);
-      unlock.Unlock();
-      absl::Status decisions_durable = absl::OkStatus();
-      for (const RelocationDurabilityFence& decision : decision_fences) {
-        decisions_durable = co_await AwaitRelocationDurable(decision);
-        if (!decisions_durable.ok()) break;
-      }
-      for (auto* pending : deferred_pending) {
-        for (TxShardWrites& shard : pending->writes_) {
-          if (!shard.grouped_decision_) continue;
-          if (decisions_durable.ok()) {
-            shard.grouped_decision_->state_.store(
-                GroupedCommitDecision::State::kDurable,
-                std::memory_order_release);
-          } else {
-            shard.grouped_decision_->FailPending();
-          }
-        }
-      }
-      if (!decisions_durable.ok())
-        spdlog::warn("transaction batch decision flush failed: {}",
-                     decisions_durable.message());
-    }
+    if (!decision_fences.empty()) co_await flush_decisions();
     // Local grouped successors wait for the decision, not merely its last
     // data/header flush. Wake after outcome publication, also when a failed
     // CommitTxWrites poisoned the decision while unwinding its guard.

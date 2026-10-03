@@ -3836,6 +3836,12 @@ class StorageEngine::Impl {
   // Retains the existing store mutex contract: releases it only while
   // awaiting a prior independent transaction's durable commit, then restores
   // ownership on every return. Caller revalidates key/population afterward.
+  // Called with the key and store locks held. A null receipt checks admission
+  // without retaining a predecessor; the second call attaches it before writes.
+  Task<absl::Status> PrepareGroupedDependencyLocked(
+      WorkerStore& store, const GroupedHashObject::Handle& object,
+      TxShardWrites* successor);
+
   Task<absl::Status> AwaitGroupedDependencyLocked(
       WorkerStore& store, const GroupedHashObject::Handle& object,
       std::uint64_t successor_txid);

@@ -975,9 +975,17 @@ void CheckLocalDependencyWakeup(bool hash, bool fail) {
   const auto registered = "grouped dependency waiter registered txid=" + txid;
   successor = std::async(std::launch::async, [hash, key, port = server.port()] {
     Client next(port);
-    return next.Command(
-        hash ? std::vector<std::string>{"HSET", key, "counter", "successor"}
-             : std::vector<std::string>{"SADD", key, "successor"});
+    Check(next.Command({"MULTI"}).text_ == "OK", "begin successor EXEC");
+    Check(
+        next.Command(hash ? std::vector<std::string>{"HSET", key, "counter",
+                                                     "successor"}
+                          : std::vector<std::string>{"SADD", key, "successor"})
+                .text_ == "QUEUED",
+        "queue successor");
+    auto executed = next.Command({"EXEC"});
+    if (executed.kind_ == '-') return executed;
+    Check(executed.items_.size() == 1, "one successor outcome");
+    return executed.items_[0];
   });
   ASSERT_TRUE(gate.WaitForLog(server, registered + " probed=false"))
       << server.Log();
@@ -993,7 +1001,9 @@ void CheckLocalDependencyWakeup(bool hash, bool fail) {
   const auto reply = successor.get();
   if (fail) {
     EXPECT_EQ(reply.kind_, '-');
-    EXPECT_NE(reply.text_.find("prior grouped transaction did not commit"),
+    // The EXEC coordinator reports its now-poisoned outer decision. The
+    // command batch below logs the original predecessor failure separately.
+    EXPECT_NE(reply.text_.find("grouped transaction was abandoned"),
               std::string::npos)
         << reply.text_;
     EXPECT_NE(server.Log().find("injected grouped commit failure"),
@@ -1024,6 +1034,325 @@ TEST(GroupedHashWriteE2e, LocalSuccessorWakesOnCommitFailure) {
   GTEST_SKIP() << "requires grouped dependency gate";
 #endif
   for (const bool hash : {true, false}) CheckLocalDependencyWakeup(hash, true);
+}
+
+void CheckLocalPipeline(bool hash, bool fail) {
+  SCOPED_TRACE(hash ? "Hash" : "Set");
+  PrivateDisk disk;
+  disk.PreserveOnFailure();
+  const std::string key = "pipeline", large_member(17000, 'm');
+  {
+    DependencyGate gate(disk);
+    std::future<void> settled;
+    Server server(disk, 2, {}, {}, false, 2, "1G", {}, {}, 0, 50);
+    server.PreserveOnFailure();
+    Client client(server.port());
+    ASSERT_EQ(
+        client
+            .Command(hash ? HashCommand(key)
+                          : std::vector<std::string>{"SADD", key, large_member})
+            .kind_,
+        ':');
+    client.Durable();
+    if (fail) gate.Signal("fail");
+    gate.Signal("arm");
+    ASSERT_EQ(
+        client
+            .Command(
+                hash ? std::vector<std::string>{"HSET", key, "counter", "first"}
+                     : std::vector<std::string>{"SADD", key, "first"})
+            .text_,
+        "1");
+    ASSERT_TRUE(
+        gate.WaitForLog(server, "grouped dependency decision held txid="))
+        << server.Log();
+    // These are changed ordinary commands, with no MULTI/EXEC. The predecessor
+    // is held deterministically, so replies prove staging did not await disk.
+    ASSERT_EQ(
+        client
+            .Command(hash ? std::vector<std::string>{"HSET", key, "counter",
+                                                     "second"}
+                          : std::vector<std::string>{"SADD", key, "second"})
+            .text_,
+        hash ? "0" : "1");
+    ASSERT_EQ(
+        client
+            .Command(hash ? std::vector<std::string>{"HDEL", key, "field0"}
+                          : std::vector<std::string>{"SREM", key, "first"})
+            .text_,
+        "1");
+    EXPECT_EQ(
+        client
+            .Command(hash
+                         ? std::vector<std::string>{"HGET", key, "counter"}
+                         : std::vector<std::string>{"SISMEMBER", key, "second"})
+            .text_,
+        hash ? "second" : "1");
+    EXPECT_EQ(client.Command({"SET", "unrelated", "ready"}).text_, "OK");
+    EXPECT_EQ(client.Command({"GET", "unrelated"}).text_, "ready");
+    EXPECT_EQ(client.Command({"INFO", "STATS"})
+                  .text_.find("storage_durability_pending:0\r\n"),
+              std::string::npos);
+    gate.Signal("notify");
+    ASSERT_TRUE(gate.WaitForLog(
+        server, "grouped dependency premature notification sent"))
+        << server.Log();
+    EXPECT_EQ(client.Command({"INFO", "STATS"})
+                  .text_.find("storage_durability_pending:0\r\n"),
+              std::string::npos);
+    settled = std::async(std::launch::async, [port = server.port()] {
+      Client observer(port);
+      observer.Durable();
+    });
+    gate.Signal("release");
+    ASSERT_EQ(settled.wait_for(5s), std::future_status::ready) << server.Log();
+    settled.get();
+    if (fail) {
+      EXPECT_NE(server.Log().find("prior grouped transaction did not commit"),
+                std::string::npos)
+          << server.Log();
+      EXPECT_EQ(
+          client
+              .Command(
+                  hash ? std::vector<std::string>{"HGET", key, "counter"}
+                       : std::vector<std::string>{"SISMEMBER", key, "second"})
+              .kind_,
+          '-');
+    }
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  if (hash) {
+    EXPECT_EQ(client.Command({"HLEN", key}).text_, "256");
+    const auto value = client.Command({"HGET", key, "counter"});
+    if (fail)
+      EXPECT_EQ(value.text_, "-1");
+    else
+      EXPECT_EQ(value.text_, "second");
+    EXPECT_EQ(client.Command({"HEXISTS", key, "field0"}).text_,
+              fail ? "1" : "0");
+  } else {
+    EXPECT_EQ(client.Command({"SCARD", key}).text_, fail ? "1" : "2");
+    EXPECT_EQ(client.Command({"SISMEMBER", key, "second"}).text_,
+              fail ? "0" : "1");
+    EXPECT_EQ(client.Command({"SISMEMBER", key, large_member}).text_, "1");
+  }
+}
+
+TEST(GroupedHashWriteE2e, OrdinarySuccessorsStageBeforePredecessorDecision) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires grouped dependency gate";
+#endif
+  for (const bool hash : {true, false}) CheckLocalPipeline(hash, false);
+}
+
+TEST(GroupedHashWriteE2e, FailedPredecessorPreventsSuccessorCommitAndRecovery) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires grouped dependency gate";
+#endif
+  for (const bool hash : {true, false}) CheckLocalPipeline(hash, true);
+}
+
+TEST(GroupedHashWriteE2e, OrderedTypesPipelineAndRecoverOrAbortTogether) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires grouped dependency gate";
+#endif
+  for (const std::string kind : {"list", "zset", "stream", "string"}) {
+    for (const bool fail : {false, true}) {
+      SCOPED_TRACE(kind + (fail ? " failure" : " success"));
+      PrivateDisk disk;
+      disk.PreserveOnFailure();
+      const std::string key = "ordered-pipeline", large(17000, 'a');
+      std::vector<std::string> seed, first, second;
+      if (kind == "list") {
+        seed = {"RPUSH", key, large, large};
+        first = {"LSET", key, "0", std::string(17000, 'b')};
+        second = {"LSET", key, "1", std::string(17000, 'c')};
+      } else if (kind == "zset") {
+        seed = {"ZADD", key, "1", large};
+        first = {"ZADD", key, "2", "first"};
+        second = {"ZADD", key, "3", "second"};
+      } else if (kind == "stream") {
+        seed = {"XADD", key, "1-0", "f", large};
+        first = {"XADD", key, "2-0", "f", "first"};
+        second = {"XADD", key, "3-0", "f", "second"};
+      } else {
+        seed = {"SET", key, std::string(32768, 'a')};
+        first = {"SETRANGE", key, "0", "b"};
+        second = {"SET", key, std::string(32768, 'c')};
+      }
+      auto read = [&](Client& client, bool changed) {
+        if (kind == "list") {
+          EXPECT_EQ(client.Command({"LINDEX", key, "0"}).text_,
+                    std::string(17000, changed ? 'b' : 'a'));
+          EXPECT_EQ(client.Command({"LINDEX", key, "1"}).text_,
+                    std::string(17000, changed ? 'c' : 'a'));
+        } else if (kind == "zset") {
+          EXPECT_EQ(client.Command({"ZCARD", key}).text_, changed ? "3" : "1");
+          EXPECT_EQ(client.Command({"ZSCORE", key, "second"}).text_,
+                    changed ? "3" : "-1");
+        } else if (kind == "stream") {
+          EXPECT_EQ(client.Command({"XLEN", key}).text_, changed ? "3" : "1");
+        } else {
+          EXPECT_EQ(client.Command({"GET", key}).text_,
+                    std::string(32768, changed ? 'c' : 'a'));
+        }
+      };
+      {
+        DependencyGate gate(disk);
+        std::future<void> settled;
+        Server server(disk, 2, {}, {}, false, 2, "1G", {}, {}, 0, 50);
+        server.PreserveOnFailure();
+        Client client(server.port());
+        ASSERT_NE(client.Command(seed).kind_, '-');
+        client.Durable();
+        if (fail) gate.Signal("fail");
+        gate.Signal("arm");
+        ASSERT_NE(client.Command(first).kind_, '-');
+        ASSERT_TRUE(
+            gate.WaitForLog(server, "grouped dependency decision held txid="))
+            << server.Log();
+        ASSERT_NE(client.Command(second).kind_, '-');
+        read(client, true);
+        EXPECT_EQ(client.Command({"INFO", "STATS"})
+                      .text_.find("storage_durability_pending:0\r\n"),
+                  std::string::npos);
+        settled = std::async(std::launch::async, [port = server.port()] {
+          Client observer(port);
+          observer.Durable();
+        });
+        gate.Signal("release");
+        ASSERT_EQ(settled.wait_for(5s), std::future_status::ready)
+            << server.Log();
+        settled.get();
+        ASSERT_EQ(server.Wait(true), 0) << server.Log();
+      }
+      Server recovered(disk, 3);
+      Client client(recovered.port());
+      read(client, !fail);
+    }
+  }
+}
+
+TEST(GroupedHashWriteE2e,
+     MultiKeyMetadataDependenciesDoNotFailUnrelatedWrites) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires grouped dependency gate";
+#endif
+  for (const bool fail : {false, true}) {
+    SCOPED_TRACE(fail ? "failure" : "success");
+    PrivateDisk disk;
+    disk.PreserveOnFailure();
+    {
+      DependencyGate gate(disk);
+      std::future<void> settled;
+      Server server(disk, 1, {}, {}, false, 2, "1G", {}, {}, 0, 50);
+      server.PreserveOnFailure();
+      Client client(server.port());
+      ASSERT_EQ(client.Command(HashCommand("a")).text_, "256");
+      ASSERT_EQ(client.Command(HashCommand("b")).text_, "256");
+      client.Durable();
+      if (fail) gate.Signal("fail");
+      gate.Signal("arm");
+      ASSERT_EQ(client.Command({"HSET", "a", "counter", "a-new"}).text_, "1");
+      ASSERT_TRUE(
+          gate.WaitForLog(server, "grouped dependency decision held txid="))
+          << server.Log();
+      ASSERT_EQ(client.Command({"HSET", "b", "counter", "b-new"}).text_, "1");
+      // Unlike per-command auxiliary batches, root-only metadata updates can
+      // collect both still-pending predecessors without a synchronous commit.
+      ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+      ASSERT_EQ(client.Command({"PEXPIRE", "a", "600000"}).text_, "QUEUED");
+      ASSERT_EQ(client.Command({"PEXPIRE", "b", "600000"}).text_, "QUEUED");
+      const auto reply = client.Command({"EXEC"});
+      ASSERT_EQ(reply.items_.size(), 2);
+      ASSERT_EQ(reply.items_[0].text_, "1");
+      ASSERT_EQ(reply.items_[1].text_, "1");
+      settled = std::async(std::launch::async, [port = server.port()] {
+        Client observer(port);
+        observer.Durable();
+      });
+      gate.Signal("release");
+      ASSERT_EQ(settled.wait_for(5s), std::future_status::ready)
+          << server.Log();
+      settled.get();
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    }
+    Server recovered(disk, 2);
+    Client client(recovered.port());
+    EXPECT_EQ(client.Command({"HGET", "a", "counter"}).text_,
+              fail ? "-1" : "a-new");
+    EXPECT_EQ(client.Command({"HGET", "b", "counter"}).text_, "b-new");
+    if (fail) {
+      EXPECT_EQ(client.Command({"PTTL", "a"}).text_, "-1");
+      EXPECT_EQ(client.Command({"PTTL", "b"}).text_, "-1");
+    } else {
+      EXPECT_GT(std::stoll(client.Command({"PTTL", "a"}).text_), 0);
+      EXPECT_GT(std::stoll(client.Command({"PTTL", "b"}).text_), 0);
+    }
+  }
+}
+
+TEST(GroupedHashWriteE2e, FailedExecCommandDropsUnusedPredecessor) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires grouped dependency and auxiliary-write faults";
+#endif
+  PrivateDisk disk;
+  disk.PreserveOnFailure();
+  {
+    Server seed(disk, 1);
+    Client client(seed.port());
+    ASSERT_EQ(client.Command(HashCommand("a")).text_, "256");
+    ASSERT_EQ(client.Command(HashCommand("b")).text_, "256");
+    client.Durable();
+    ASSERT_EQ(seed.Wait(true), 0) << seed.Log();
+  }
+  {
+    DependencyGate gate(disk);
+    std::future<void> settled;
+    Server server(disk, 1, {}, "b", false, 2, "1G", {}, {}, 0, 50);
+    server.PreserveOnFailure();
+    Client client(server.port());
+    gate.Signal("fail");
+    gate.Signal("arm");
+    // This changes one group, whereas the EXEC replacement below fails on
+    // its second auxiliary group before publishing any replacement root.
+    ASSERT_EQ(
+        client.Command({"HSET", "b", "field0", std::string(128, 'p')}).text_,
+        "0");
+    ASSERT_TRUE(
+        gate.WaitForLog(server, "grouped dependency decision held txid="))
+        << server.Log();
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"PEXPIRE", "a", "600000"}).text_, "QUEUED");
+    ASSERT_EQ(client.Command(HashCommand("b", 'w')).text_, "QUEUED");
+    ASSERT_EQ(
+        client.Command({"HSET", "a", "field0", std::string(128, 'a')}).text_,
+        "QUEUED");
+    const auto reply = client.Command({"EXEC"});
+    ASSERT_EQ(reply.items_.size(), 3) << reply.text_ << server.Log();
+    EXPECT_EQ(reply.items_[0].text_, "1");
+    EXPECT_EQ(reply.items_[1].kind_, '-');
+    EXPECT_EQ(reply.items_[2].text_, "0");
+    settled = std::async(std::launch::async, [port = server.port()] {
+      Client observer(port);
+      observer.Durable();
+    });
+    gate.Signal("release");
+    ASSERT_EQ(settled.wait_for(5s), std::future_status::ready) << server.Log();
+    settled.get();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // The unused B dependency must not prevent the independent A commands
+  // from committing, even though B's held predecessor eventually fails.
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"HGET", "a", "field0"}).text_,
+            std::string(128, 'a'));
+  EXPECT_GT(std::stoll(client.Command({"PTTL", "a"}).text_), 0);
+  EXPECT_EQ(client.Command({"HGET", "b", "field0"}).text_,
+            std::string(128, 'v'));
 }
 
 TEST(HashReplaceE2e, ColdReplacementDoesNotLoadOldPayload) {

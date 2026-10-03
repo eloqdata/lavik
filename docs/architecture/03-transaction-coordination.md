@@ -185,6 +185,14 @@ appends all ready decisions before requesting their shared flush; grouped
 decision publication waits for that flush. One receipt on an otherwise idle
 queue stays on the direct low-latency path.
 
+Owner-local grouped successors retain predecessor decisions in their receipts
+and may publish staged versions before those predecessors become durable. The
+drain completes an appended commit frontier before appending any dependent
+successor decision, preserving ancestor-before-successor durability even when
+commit records cross physical blocks. A failed predecessor fails its dependent
+receipt; unrelated receipt decisions remain independent. Cross-coordinator
+grouped predecessors retain their existing foreground ordering boundary.
+
 The queue high watermark is 4096 receipts per worker. Enqueueing always
 transfers an accepted receipt, but returns a backpressure indication at or above
 that depth; the command waits until the owner-local queue falls below the
