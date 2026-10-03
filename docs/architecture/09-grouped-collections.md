@@ -129,7 +129,12 @@ independent transaction can commit it, and snapshot/undo views retain their
 own historical root expiry. Immediate expiration uses the ordinary
 tombstone/graph retirement path.
 
-Views share unchanged physical index pages across mutations. The physical
+Views share unchanged physical index pages across mutations. Small updates to existing inline records retain a bounded immutable
+coordinate overlay before folding into the physical index. Lookup and graph
+lifecycle traversal resolve these overrides, including retirement state; they
+retain no payload data. Topology changes and external records fold pending
+overrides into the index, while positional String indexing retains its
+direct page path. The physical
 identity trie skips common prefix bits and retains complete identities in its
 leaves; inserting outside a skipped prefix adds a branch without changing
 pinned older views. Hash routing nodes are persistent; ordered directories share
