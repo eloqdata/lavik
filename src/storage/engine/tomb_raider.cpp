@@ -80,26 +80,7 @@ std::optional<std::chrono::system_clock::time_point> NextDailyTime(
 // forfeits the round, and recovery rebuilds both tombstone entries and
 // shielding bits exactly from the surviving records.
 
-Task<absl::Status> StorageEngine::CompleteTombRaiderStartup() {
-  return impl_->CompleteTombRaiderStartup();
-}
-
-Task<absl::StatusOr<TombRaiderPopulationToken>>
-StorageEngine::BeginTombRaiderPopulationChange(std::uint64_t session_id) {
-  return impl_->BeginTombRaiderPopulationChange(session_id);
-}
-
-Task<absl::Status> StorageEngine::CompleteTombRaiderPopulationChange(
-    TombRaiderPopulationToken token) {
-  return impl_->CompleteTombRaiderPopulationChange(token);
-}
-
-Task<absl::Status> StorageEngine::CancelTombRaiderPopulationChange(
-    TombRaiderPopulationToken token) {
-  return impl_->CancelTombRaiderPopulationChange(token);
-}
-
-Task<absl::Status> StorageEngine::Impl::CompleteTombRaiderStartup() {
+Task<absl::Status> StorageEngine::Impl::CompleteStorageStartup() {
   co_return co_await bycorf::SubmitTo(0, [this] {
     // Startup completion is a local recovery fact, not serving readiness.
     // Do not reset population completeness on a repeated notification.
@@ -114,14 +95,13 @@ Task<absl::Status> StorageEngine::Impl::ConfigureTombRaider(
       0, [this, update] { return ApplyTombRaiderConfig(update); });
 }
 
-Task<absl::StatusOr<TombRaiderPopulationToken>>
-StorageEngine::Impl::BeginTombRaiderPopulationChange(std::uint64_t session_id) {
+Task<absl::StatusOr<StorageEngine::Impl::PopulationChangeToken>>
+StorageEngine::Impl::BeginPopulationChange(std::uint64_t session_id) {
   if (session_id == 0)
     co_return absl::InvalidArgumentError("invalid population change session");
   if (bycorf::ThisWorker().id_ != 0) {
-    co_return co_await bycorf::SubmitTaskTo(0, [this, session_id] {
-      return BeginTombRaiderPopulationChange(session_id);
-    });
+    co_return co_await bycorf::SubmitTaskTo(
+        0, [this, session_id] { return BeginPopulationChange(session_id); });
   }
   auto [it, inserted] =
       tomb_raider_population_changes_.try_emplace(session_id, 0);
@@ -142,11 +122,11 @@ StorageEngine::Impl::BeginTombRaiderPopulationChange(std::uint64_t session_id) {
   if (it == tomb_raider_population_changes_.end() || it->second != generation) {
     co_return absl::CancelledError("population change was superseded");
   }
-  co_return TombRaiderPopulationToken{session_id, generation};
+  co_return PopulationChangeToken{session_id, generation};
 }
 
-Task<absl::Status> StorageEngine::Impl::CompleteTombRaiderPopulationChange(
-    TombRaiderPopulationToken token) {
+Task<absl::Status> StorageEngine::Impl::CompletePopulationChange(
+    PopulationChangeToken token) {
   co_return co_await bycorf::SubmitTo(0, [this, token] {
     auto it = tomb_raider_population_changes_.find(token.session_id_);
     if (it == tomb_raider_population_changes_.end() ||
@@ -168,8 +148,8 @@ Task<absl::Status> StorageEngine::Impl::CompleteTombRaiderPopulationChange(
   });
 }
 
-Task<absl::Status> StorageEngine::Impl::CancelTombRaiderPopulationChange(
-    TombRaiderPopulationToken token) {
+Task<absl::Status> StorageEngine::Impl::CancelPopulationChange(
+    PopulationChangeToken token) {
   co_return co_await bycorf::SubmitTo(0, [this, token] {
     auto it = tomb_raider_population_changes_.find(token.session_id_);
     if (it != tomb_raider_population_changes_.end() &&
@@ -575,11 +555,15 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
   // index and is dropped by salvage, never moved.
   // A retiring block can already be absent from this runtime walk while
   // recovery still sees its allocated bitmap bit. Wait for its durable
-  // retirement before using another snapshot to prove absence of old values.
-  if (store.pending_record_block_retirements_ != 0) {
-    round.cancelled_.store(true, std::memory_order_release);
-    co_return absl::OkStatus();
+  // retirement before taking the snapshot, without discarding this round's
+  // marks. No worker-local state changes between the final check and the walk.
+  while (store.pending_record_block_retirements_ != 0) {
+    if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
+    auto waited =
+        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
+    if (!waited.ok()) co_return waited;
   }
+  if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
   std::vector<BlockSnapshot> blocks;
   ForEachOwnedBlock(store, [&](std::uint64_t block_id, BlockState& state) {
     if (state.kind_ == BlockKind::kRecords &&
@@ -590,6 +574,41 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       });
     }
   });
+
+  const auto present = [&](const BlockSnapshot& snapshot) {
+    const auto* state = FindBlockState(store, snapshot.block_id_);
+    return state != nullptr &&
+           state->allocation_epoch_ == snapshot.allocation_epoch_ &&
+           state->kind_ == BlockKind::kRecords && !state->freeing_;
+  };
+  // Defrag may retire any snapshot block while we yield. Preserve the scan's
+  // progress and wait only for the durability evidence needed to skip it.
+  // No source pin or storage/key/allocator lock is held across this wait.
+  const auto await_block =
+      [&](const BlockSnapshot& snapshot) -> Task<absl::StatusOr<bool>> {
+    while (TombRaiderRoundValid(round, &store)) {
+      const auto* state = FindBlockState(store, snapshot.block_id_);
+      if (state != nullptr) {
+        // Reuse is published only after the old bitmap clear is durable.
+        if (state->allocation_epoch_ != snapshot.allocation_epoch_)
+          co_return false;
+        if (state->kind_ != BlockKind::kRecords) {
+          // A kind change without a new allocation cannot prove retirement.
+          round.cancelled_.store(true, std::memory_order_release);
+          co_return false;
+        }
+        if (!state->freeing_) co_return true;
+        // Freeing can wait for readers before incrementing the retirement
+        // counter. A zero counter alone cannot certify this allocation gone.
+      } else if (store.pending_record_block_retirements_ == 0) {
+        co_return false;
+      }
+      auto waited = co_await bycorf::SleepFor(*store.worker_,
+                                              std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+    co_return false;
+  };
 
   std::vector<std::vector<TombClaim>> pending(worker_count_);
   auto flush_claims = [&](unsigned owner) -> Task<absl::Status> {
@@ -618,13 +637,18 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
     if (!TombRaiderRoundValid(round, &store)) {
       co_return absl::OkStatus();  // forfeit the round
     }
-    BlockState* state = FindBlockState(store, snapshot.block_id_);
-    if (state == nullptr || !state->allocated_ || state->freeing_ ||
-        state->allocation_epoch_ != snapshot.allocation_epoch_ ||
-        state->kind_ != BlockKind::kRecords) {
-      round.cancelled_.store(true, std::memory_order_release);
-      co_return absl::OkStatus();
+    bool retired = false;
+    while (!present(snapshot)) {
+      auto available = co_await await_block(snapshot);
+      if (!available.ok()) co_return available.status();
+      if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
+      if (!*available) {
+        retired = true;
+        break;
+      }
     }
+    if (retired) continue;
+    BlockState* state = FindBlockState(store, snapshot.block_id_);
     const std::uint32_t committed = state->committed_bytes_;
     if (committed <= kBlockHeaderBytes) {
       continue;
@@ -667,12 +691,8 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       }
 #endif
       if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
-      BlockState* current = FindBlockState(store, snapshot.block_id_);
-      if (current == nullptr || !current->allocated_ || current->freeing_ ||
-          current->allocation_epoch_ != snapshot.allocation_epoch_) {
-        round.cancelled_.store(true, std::memory_order_release);
-        co_return absl::OkStatus();
-      }
+      // The decode loop below rechecks physical retirement before touching
+      // this copied image, just as it does after every asynchronous claim.
     }
 
     const std::uint64_t now_ms = UnixTimeMillis();
@@ -682,15 +702,15 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
       // The copied bytes may outlive their physical block across a claim/key
       // lookup. Its UUID registry may already be gone after reclamation.
-      const auto* live_block = FindBlockState(store, snapshot.block_id_);
-      if (live_block == nullptr || !live_block->allocated_ ||
-          live_block->freeing_ ||
-          live_block->allocation_epoch_ != snapshot.allocation_epoch_) {
-        // Runtime block retirement can precede the durable bitmap update.
-        // Missing state is not proof that recovery cannot see the remainder
-        // of our copied buffer. Retry rather than complete an incomplete sweep.
-        round.cancelled_.store(true, std::memory_order_release);
-        co_return absl::OkStatus();
+      if (!present(snapshot)) {
+        auto available = co_await await_block(snapshot);
+        if (!available.ok()) co_return available.status();
+        if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
+        // Already issued prefix claims only keep tombstones alive. Retaining
+        // them after durable block retirement is conservative; the unscanned
+        // suffix is now unreachable by recovery and needs no further claims.
+        if (!*available) break;
+        continue;  // Re-resolve after the wait before decoding this record.
       }
       const std::optional<std::uint32_t> next =
           NextRecordOffset(sweep.buffer_.data_, record_offset, committed);

@@ -218,7 +218,7 @@ class ReplicationLogService final : public bycorf::Service {
     lavik::BindMemoryAccountingShard(worker.id());
     lavik::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
     result_ = co_await storage_->InitializeWorker(worker);
-    if (result_.ok()) result_ = co_await storage_->CompleteTombRaiderStartup();
+    if (result_.ok()) result_ = co_await storage_->CompleteStorageStartup();
     if (result_.ok() && exercise_) {
       result_ = co_await Exercise();
     }

@@ -1055,8 +1055,7 @@ auto ReplicationManager::ReplicationGroup::BeginRedisFullSyncAttempt(
       source->replid_.reset();
     }
     RefreshRedisRole();
-    invalidated = co_await storage_->BeginReplicaFullSync(
-        session_id, &redis_full_sync_population_token_);
+    invalidated = co_await storage_->BeginReplicaFullSync(session_id);
   }
   absl::Status stopped = absl::OkStatus();
   for (const auto& session : replaced_sessions) {
@@ -1748,7 +1747,6 @@ auto ReplicationManager::ReplicationGroup::CompleteRedisFullSync(
   RefreshRedisRole();
   auto full_sync_session = co_await BeginRedisFullSyncAttempt(source);
   if (!full_sync_session.ok()) co_return full_sync_session.status();
-  const auto maintenance_token = redis_full_sync_population_token_;
   auto rdb_path = co_await ReceiveRedisRdb(stream);
   if (!rdb_path.ok()) co_return rdb_path.status();
   absl::Status status = co_await ImportRedisRdb(*rdb_path, source);
@@ -1819,7 +1817,10 @@ auto ReplicationManager::ReplicationGroup::CompleteRedisFullSync(
       }
       {
         AssertStateOwner();
-        if (redis_full_sync_session_id_ != *full_sync_session) {
+        if (redis_full_sync_session_id_ != *full_sync_session ||
+            !RedisSourceRegistered(source) || replication_shutdown_requested_ ||
+            source->role_epoch_ !=
+                role_epoch_.load(std::memory_order_relaxed)) {
           co_return absl::CancelledError(
               "Redis full sync activation was superseded");
         }
@@ -1827,8 +1828,7 @@ auto ReplicationManager::ReplicationGroup::CompleteRedisFullSync(
       // Every registered source belongs to this completed session. Releasing
       // physical maintenance here prevents a partial Cluster import from
       // being mistaken for a complete local population.
-      status = co_await storage_->CompleteTombRaiderPopulationChange(
-          maintenance_token);
+      status = co_await storage_->FinalizeReplicaFullSync(*full_sync_session);
       if (!status.ok()) co_return status;
       redis_full_sync_session_id_ = 0;
     }

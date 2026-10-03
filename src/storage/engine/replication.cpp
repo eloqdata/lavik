@@ -2338,6 +2338,13 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
     co_return co_await bycorf::SubmitTaskTo(
         0, [this, session_id]() { return AbortReplicaRoot(session_id); });
   }
+  // Protocol teardown joins this attempt before invoking abort. Capture its
+  // private admission before any drain can suspend; a delayed cleanup must
+  // never release a replacement that reused the same source-local wire ID.
+  const auto hold = tomb_raider_population_changes_.find(session_id);
+  const PopulationChangeToken admission{
+      session_id,
+      hold == tomb_raider_population_changes_.end() ? 0 : hold->second};
   // A stream can own an uncommitted grouped root and a cross-frame key hold.
   // Settle it before draining: a post-root writer failure makes drain fail,
   // but must not strand its undo journal, dependency pins or transaction lease.
@@ -2433,14 +2440,7 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
     }
     if (!discarded.ok()) co_return discarded;
   }
-  // Replication joins this session's mutators before aborting its root, so
-  // its active binding still owns this resource handoff.
-  const auto hold = tomb_raider_population_changes_.find(session_id);
-  if (hold != tomb_raider_population_changes_.end()) {
-    co_return co_await CancelTombRaiderPopulationChange(
-        TombRaiderPopulationToken{session_id, hold->second});
-  }
-  co_return absl::OkStatus();
+  co_return co_await CancelPopulationChange(admission);
 }
 
 }  // namespace lavik::storage

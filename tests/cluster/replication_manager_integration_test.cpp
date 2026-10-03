@@ -1522,7 +1522,7 @@ class EmptyPopulationService final : public bycorf::Service {
     if (result_.ok()) result_ = co_await storage_->InitializeWorker(worker);
     if (result_.ok()) {
       replication_->StorageReady(worker);
-      result_ = co_await storage_->CompleteTombRaiderStartup();
+      result_ = co_await storage_->CompleteStorageStartup();
       if (result_.ok()) result_ = co_await Exercise();
     }
     worker.RequestStop();

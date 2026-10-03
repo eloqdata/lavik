@@ -25,6 +25,7 @@ import os
 import concurrent.futures
 from pathlib import Path
 import re
+import signal
 import struct
 import sys
 import tempfile
@@ -1370,6 +1371,47 @@ def rejected_full(root, name, source_faults, target_faults, marker, **pair_optio
             reader.close()
 
 
+def population_finalization_failure(root):
+    with pair(
+        root,
+        "population-finalization-failure",
+        target_faults={"LAVIK_REPLICATION_FAIL_POPULATION_FINALIZE": "1"},
+    ) as (meta, source, target, _writer):
+        H.wait_until(
+            "post-promotion finalization failure latched",
+            30,
+            lambda: "replication failed-stopped until restart: promoted population "
+            "finalization failed: injected full-sync population finalization failure"
+            in Path(target.log_path).read_text(),
+        )
+        # The root, flow cut and durable identity already exist. Failure of
+        # the final local completion must resolve the rebuild with an error,
+        # rather than leave a Ready attempt or retry it through CONTINUE.
+        H.wait_until(
+            "finalization failure reported to Meta",
+            30,
+            lambda: C.cluster_status(meta).get("cluster_state")
+            == "provisioning-failed",
+        )
+        reader = Client(target, readonly=True)
+        try:
+            require_incomplete_population(reader)
+            replication = reader.call("INFO", "replication")
+            assert "lavik_replication_failed_stopped:1\r\n" in replication
+            assert "lavik_replication_state:online\r\n" not in replication
+            stats = reader.call("INFO", "stats")
+            assert "tomb_raider_eligible:0\r\n" in stats
+            assert "tomb_raider_blocked_reason:population_change\r\n" in stats
+            assert "selected=CONTINUE" not in Path(source.log_path).read_text()
+        finally:
+            reader.close()
+        # Failed-stop deliberately withholds a clean checkpoint. Verify that
+        # shutdown reports the unsafe state before pair's ordinary cleanup.
+        target.proc.send_signal(signal.SIGINT)
+        assert target.proc.wait(timeout=30) == 1
+        assert "skipping normal storage flush" in Path(target.log_path).read_text()
+
+
 def checksum_rejection(root):
     def seed(writer):
         # Partition 1 carries the corrupt record before the next reset batch,
@@ -2109,6 +2151,8 @@ def main():
         if len(sys.argv) > 5:
             assert sys.argv[5:] == ["tomb_raider"], sys.argv[5:]
             tomb_raider(root)
+            if C.has_fault(C.DATA, b"LAVIK_REPLICATION_FAIL_POPULATION_FINALIZE"):
+                population_finalization_failure(root)
             H.log("PASS")
             return
         grouped_streams(root)
@@ -2118,6 +2162,7 @@ def main():
         full_tail(root)
         backpressured_shutdown(root)
         if C.has_fault(C.DATA, b"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK"):
+            population_finalization_failure(root)
             full_session_lifecycle(root)
             full_completion_reconnect(root)
             follow_full_limit(root)

@@ -57,6 +57,27 @@ namespace lavik::storage {
 // at an explicitly selected boundary rather than depending on timer races.
 class TombRaiderTestPeer {
  public:
+  using Token = StorageEngine::Impl::PopulationChangeToken;
+
+  static auto Begin(StorageEngine& storage, std::uint64_t id) {
+    return storage.impl_->BeginPopulationChange(id);
+  }
+  static auto Complete(StorageEngine& storage, Token token) {
+    return storage.impl_->CompletePopulationChange(token);
+  }
+  static auto Cancel(StorageEngine& storage, Token token) {
+    return storage.impl_->CancelPopulationChange(token);
+  }
+
+  enum class RetirementScenario {
+    kBeforeSnapshot,
+    kAfterRead,
+    kPinned,
+    kPrefixClaim,
+    kRepeated,
+    kCancelledWait
+  };
+
   static bycorf::Task<absl::Status> Run(StorageEngine& storage) {
     return storage.impl_->RunTombRaider();
   }
@@ -92,131 +113,251 @@ class TombRaiderTestPeer {
         (*found)->value_.kind() == RecordKind::kTombstone;
   }
   static bycorf::Task<absl::Status> VerifyPendingBlockRetirement(
-      StorageEngine& storage, bool after_read) {
+      StorageEngine& storage, RetirementScenario scenario) {
     auto* impl = storage.impl_.get();
     auto& store = impl->CurrentStore();
+    auto& worker = *store.worker_;
     auto status = co_await storage.ConfigureTombRaider(
         {.action_ = TombRaiderConfigAction::kOff});
     if (!status.ok()) co_return status;
     status = co_await storage.ConfigureTombRaider(
         {.action_ = TombRaiderConfigAction::kBlockSleep, .value_ = 0});
     if (!status.ok()) co_return status;
-    status = co_await storage.CompleteTombRaiderStartup();
+    status = co_await storage.CompleteStorageStartup();
     if (!status.ok()) co_return status;
-    constexpr std::string_view key = "retiring-permanent-old-value";
-    auto wrote = co_await storage.Set(0, key, "must-not-resurrect");
-    if (!wrote.ok()) co_return wrote.status();
-    auto& partition = impl->PartitionForKey(store, key);
-    auto found = co_await impl->FindVerifiedEntry(store, partition.indexes_[0],
-                                                  ComputeDigest(key), key);
-    if (!found.ok()) co_return found.status();
-    if (*found == nullptr)
-      co_return absl::FailedPreconditionError(
-          "missing retirement fixture value");
-    const auto block = impl->MaterializeIndexLocation(**found).block_id();
-    status = co_await SealForSweep(storage);
-    if (!status.ok()) co_return status;
-    // Put the necessary tombstone in a different block. The sealed old block
-    // has no live index references, but recovery can still see its value until
-    // its allocation bitmap clear becomes durable.
-    auto removed = co_await storage.Delete(0, key);
-    if (!removed.ok()) co_return removed.status();
-    // Superseded-record accounting settles only when the replacement is
-    // durable. Flush the tombstone before asking real defrag to free its old
-    // value block.
-    status = co_await SealForSweep(storage);
-    if (!status.ok()) co_return status;
-    auto* source = impl->FindBlockState(store, block);
-    if (!*removed || source == nullptr || source->live_bytes_ != 0)
-      co_return absl::FailedPreconditionError("old records block is not empty");
-    auto& allocator =
-        *impl->device_allocators_[impl->DeviceIndexForBlock(block)];
-    // Both records blocks are now disk-backed. Select the old value's actual
-    // read, independent of whether allocation handed out ascending IDs.
-    std::size_t source_read = 0;
-    std::size_t read_count = 0;
-    impl->ForEachOwnedBlock(store, [&](std::uint64_t id, BlockState& state) {
-      if (state.kind_ == BlockKind::kRecords &&
-          state.committed_bytes_ > kBlockHeaderBytes &&
-          impl->StagingFor(store, state) == nullptr) {
-        ++read_count;
-        if (id == block) source_read = read_count;
+    const unsigned iterations =
+        scenario == RetirementScenario::kRepeated ? 4 : 1;
+    const std::size_t key_count =
+        scenario == RetirementScenario::kPrefixClaim ? 513 : 1;
+    for (unsigned iteration = 0; iteration < iterations; ++iteration) {
+      std::vector<std::string> keys;
+      for (std::size_t index = 0; index < key_count; ++index) {
+        keys.push_back("retiring-old-value-" + std::to_string(iteration) + "-" +
+                       std::to_string(index));
+        auto wrote = co_await storage.Set(0, keys.back(), "must-not-resurrect");
+        if (!wrote.ok()) co_return wrote.status();
       }
-    });
-    if (source_read == 0)
-      co_return absl::FailedPreconditionError("old value has no disk read");
-    co_await allocator.mutex_.Lock();
-    std::optional<bycorf::Task<absl::Status>> retirement;
-    bycorf::AsyncNotification completed;
-    const auto begin_retirement = [&]() -> absl::Status {
-      if (retirement.has_value()) return absl::OkStatus();
-      auto task = impl->CleanBlockLocked(store, block);
-      auto handle = std::move(task).ReleaseHandle();
-      retirement.emplace(handle);
-      retirement->SetCompletionCallback(
-          &completed, [](void* context, auto) noexcept {
-            static_cast<bycorf::AsyncNotification*>(context)->NotifyAll(
-                *bycorf::ThisWorker().self_);
-          });
-      handle.resume();
-      // The real defrag path has removed BlockState and is now waiting to
-      // enter ReturnColdBlocksLocal. No test code changes the retirement count
-      // or bitmap; the allocator mutex creates the real durability gap.
-      if (retirement->done() || impl->FindBlockState(store, block) != nullptr ||
-          store.pending_record_block_retirements_ != 1 ||
-          !impl->BitmapBit(allocator, LocalBlockId(block))) {
-        return absl::FailedPreconditionError(
-            "defrag did not pause between runtime and durable retirement");
+      auto& partition = impl->PartitionForKey(store, keys.front());
+      auto found = co_await impl->FindVerifiedEntry(
+          store, partition.indexes_[0], ComputeDigest(keys.front()),
+          keys.front());
+      if (!found.ok()) co_return found.status();
+      if (*found == nullptr)
+        co_return absl::FailedPreconditionError(
+            "missing retirement fixture value");
+      const auto block = impl->MaterializeIndexLocation(**found).block_id();
+      status = co_await SealForSweep(storage);
+      if (!status.ok()) co_return status;
+      for (const auto& key : keys) {
+        auto removed = co_await storage.Delete(0, key);
+        if (!removed.ok()) co_return removed.status();
+        if (!*removed)
+          co_return absl::FailedPreconditionError(
+              "missing retirement fixture tombstone");
       }
-      return absl::OkStatus();
-    };
-    if (after_read) {
-      read_count = 0;
-      SetHook(storage, [&](Point point) -> bycorf::Task<absl::Status> {
-        if (point == Point::kAfterSweepRead && ++read_count == source_read)
-          co_return begin_retirement();
-        co_return absl::OkStatus();
+      // Superseded accounting settles only when the replacement is durable.
+      // Keep permanent older values on disk in a separate, now-dead block.
+      status = co_await SealForSweep(storage);
+      if (!status.ok()) co_return status;
+      auto* source = impl->FindBlockState(store, block);
+      if (source == nullptr || source->live_bytes_ != 0)
+        co_return absl::FailedPreconditionError(
+            "old records block is not empty");
+      auto& allocator =
+          *impl->device_allocators_[impl->DeviceIndexForBlock(block)];
+      std::size_t source_read = 0;
+      std::size_t read_count = 0;
+      impl->ForEachOwnedBlock(store, [&](std::uint64_t id, BlockState& state) {
+        if (state.kind_ == BlockKind::kRecords &&
+            state.committed_bytes_ > kBlockHeaderBytes &&
+            impl->StagingFor(store, state) == nullptr) {
+          ++read_count;
+          if (id == block) source_read = read_count;
+        }
       });
-    } else {
-      status = begin_retirement();
+      if (source_read == 0)
+        co_return absl::FailedPreconditionError("old value has no disk read");
+
+      co_await allocator.mutex_.Lock();
+      std::optional<bycorf::Task<absl::Status>> retirement;
+      bycorf::AsyncNotification retired;
+      struct ReaderPin {
+        BlockState* state_ = nullptr;
+        void Reset() {
+          if (state_ != nullptr) {
+            --state_->pins_;
+            state_ = nullptr;
+          }
+        }
+        ~ReaderPin() { Reset(); }
+      } pin;
+      const auto begin_retirement = [&]() -> absl::Status {
+        if (retirement.has_value()) return absl::OkStatus();
+        auto task = impl->CleanBlockLocked(store, block);
+        auto handle = std::move(task).ReleaseHandle();
+        retirement.emplace(handle);
+        retirement->SetCompletionCallback(
+            &retired, [](void* context, auto) noexcept {
+              static_cast<bycorf::AsyncNotification*>(context)->NotifyAll(
+                  *bycorf::ThisWorker().self_);
+            });
+        handle.resume();
+        if (scenario == RetirementScenario::kPinned) return absl::OkStatus();
+        // Real defrag removed BlockState, then parked at the allocator mutex.
+        // Neither the pending counter nor the bitmap is changed by the test.
+        if (retirement->done() ||
+            impl->FindBlockState(store, block) != nullptr ||
+            store.pending_record_block_retirements_ != 1 ||
+            !impl->BitmapBit(allocator, LocalBlockId(block)))
+          return absl::FailedPreconditionError(
+              "defrag did not pause before durable retirement");
+        return absl::OkStatus();
+      };
+      if (scenario == RetirementScenario::kPinned) {
+        // Model a reader acquiring its owner-local pin after defrag's initial
+        // pins==0 check but before its final store-mutex check. The production
+        // ReleaseEmptyBlock path sets freeing and waits with pending==0.
+        co_await store.store_state_mutex_.Lock();
+        status = begin_retirement();
+        if (status.ok() && !retirement->done()) {
+          ++source->pins_;
+          pin.state_ = source;
+        } else if (status.ok()) {
+          status = absl::FailedPreconditionError(
+              "defrag did not wait for store mutex");
+        }
+        store.store_state_mutex_.Unlock(worker);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (status.ok() && !source->freeing_ &&
+               std::chrono::steady_clock::now() < deadline) {
+          status =
+              co_await bycorf::SleepFor(worker, std::chrono::milliseconds(1));
+        }
+        if (status.ok() && (!source->freeing_ || source->pins_ != 1 ||
+                            store.pending_record_block_retirements_ != 0))
+          status = absl::FailedPreconditionError(
+              "reader pin did not hold the freeing window");
+      } else if (scenario == RetirementScenario::kAfterRead ||
+                 scenario == RetirementScenario::kPrefixClaim) {
+        read_count = 0;
+        SetHook(storage, [&](Point point) -> bycorf::Task<absl::Status> {
+          if ((scenario == RetirementScenario::kAfterRead &&
+               point == Point::kAfterSweepRead &&
+               ++read_count == source_read) ||
+              (scenario == RetirementScenario::kPrefixClaim &&
+               point == Point::kAfterClaimLookup))
+            co_return begin_retirement();
+          co_return absl::OkStatus();
+        });
+      } else {
+        status = begin_retirement();
+      }
+
+      const auto before = storage.TombRaiderStats();
+      std::optional<bycorf::Task<absl::Status>> round;
+      bycorf::AsyncNotification round_finished;
+      if (status.ok()) {
+        auto task = Run(storage);
+        auto handle = std::move(task).ReleaseHandle();
+        round.emplace(handle);
+        round->SetCompletionCallback(
+            &round_finished, [](void* context, auto) noexcept {
+              static_cast<bycorf::AsyncNotification*>(context)->NotifyAll(
+                  *bycorf::ThisWorker().self_);
+            });
+        handle.resume();
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!retirement.has_value() && !round->done() &&
+               std::chrono::steady_clock::now() < deadline)
+          (co_await bycorf::SleepFor(worker, std::chrono::milliseconds(1)))
+              .IgnoreError();
+        // This yield lets the sweep reach its real wait. A premature abort is
+        // observable as task completion even though its totals stayed fixed.
+        status =
+            co_await bycorf::SleepFor(worker, std::chrono::milliseconds(20));
+        if (status.ok() &&
+            (!retirement.has_value() || round->done() ||
+             !storage.TombRaiderStats().running_ ||
+             storage.TombRaiderStats().rounds_ != before.rounds_ ||
+             storage.TombRaiderStats().reaped_ != before.reaped_))
+          status = absl::FailedPreconditionError(
+              "sweep did not wait for ordinary retirement");
+      }
+      if (status.ok()) {
+        for (const auto& key : keys) {
+          auto protected_key = co_await IsTombstone(storage, 0, key);
+          if (!protected_key.ok()) {
+            status = protected_key.status();
+            break;
+          }
+          if (!*protected_key) {
+            status = absl::FailedPreconditionError(
+                "pending retirement lost a necessary tombstone");
+            break;
+          }
+        }
+      }
+      const bool cancel_wait = scenario == RetirementScenario::kCancelledWait;
+      if (status.ok() && cancel_wait) {
+        auto change = co_await Begin(storage, 1000 + iteration);
+        if (!change.ok())
+          status = change.status();
+        else {
+          if (!round->done() ||
+              storage.TombRaiderStats().rounds_ != before.rounds_)
+            status = absl::FailedPreconditionError(
+                "population drain did not cancel retirement wait");
+          auto cancelled = co_await Cancel(storage, *change);
+          if (status.ok()) status = cancelled;
+        }
+      }
+      // Always release the real waiters before returning any fixture failure.
+      pin.Reset();
+      allocator.mutex_.Unlock(worker);
+      if (retirement.has_value()) {
+        while (!retirement->done()) co_await retired.Wait();
+        auto result = std::move(*retirement).TakeResult();
+        if (status.ok()) status = result;
+      }
+      if (round.has_value()) {
+        while (!round->done()) co_await round_finished.Wait();
+        auto result = std::move(*round).TakeResult();
+        if (status.ok()) status = result;
+      }
+      SetHook(storage, {});
+      if (!status.ok()) co_return status;
+      if (store.pending_record_block_retirements_ != 0 ||
+          impl->BitmapBit(allocator, LocalBlockId(block)))
+        co_return absl::FailedPreconditionError(
+            "bitmap retirement did not finish");
+      if (storage.TombRaiderStats().rounds_ !=
+          before.rounds_ + (cancel_wait ? 0 : 1))
+        co_return absl::FailedPreconditionError(
+            "ordinary retirement restarted the whole sweep");
+      if (scenario == RetirementScenario::kPrefixClaim) {
+        // The first 512 claims were already applied. They can conservatively
+        // retain that prefix, but must not invalidate the round or its suffix.
+        if (storage.TombRaiderStats().reaped_ != before.reaped_ + 1)
+          co_return absl::FailedPreconditionError(
+              "mid-decode retirement lost suffix progress");
+      }
+      if (cancel_wait || scenario == RetirementScenario::kPrefixClaim) {
+        status = co_await Run(storage);
+        if (!status.ok()) co_return status;
+      }
+      if (storage.TombRaiderStats().reaped_ != before.reaped_ + key_count)
+        co_return absl::FailedPreconditionError(
+            "durable retirement did not permit reclamation");
+      for (const auto& key : keys) {
+        auto remaining = co_await IsTombstone(storage, 0, key);
+        if (!remaining.ok()) co_return remaining.status();
+        if (*remaining)
+          co_return absl::FailedPreconditionError(
+              "retired block kept its tombstone indefinitely");
+      }
     }
-    const auto before = storage.TombRaiderStats();
-    if (status.ok()) status = co_await Run(storage);
-    SetHook(storage, {});
-    if (status.ok() && (!retirement.has_value() ||
-                        storage.TombRaiderStats().rounds_ != before.rounds_ ||
-                        storage.TombRaiderStats().reaped_ != before.reaped_)) {
-      status = absl::FailedPreconditionError(
-          "non-durable block disappearance incorrectly completed the sweep");
-    }
-    if (status.ok()) {
-      auto protected_key = co_await IsTombstone(storage, 0, key);
-      if (!protected_key.ok())
-        status = protected_key.status();
-      else if (!*protected_key)
-        status = absl::FailedPreconditionError(
-            "pending bitmap clear allowed a necessary tombstone to be reaped");
-    }
-    allocator.mutex_.Unlock(*store.worker_);
-    if (retirement.has_value()) {
-      while (!retirement->done()) co_await completed.Wait();
-      auto retired = std::move(*retirement).TakeResult();
-      if (status.ok()) status = retired;
-    }
-    if (!status.ok()) co_return status;
-    if (store.pending_record_block_retirements_ != 0 ||
-        impl->BitmapBit(allocator, LocalBlockId(block)))
-      co_return absl::FailedPreconditionError(
-          "bitmap retirement did not finish");
-    status = co_await Run(storage);
-    if (!status.ok()) co_return status;
-    auto protected_key = co_await IsTombstone(storage, 0, key);
-    if (!protected_key.ok()) co_return protected_key.status();
-    if (*protected_key ||
-        storage.TombRaiderStats().rounds_ != before.rounds_ + 1 ||
-        storage.TombRaiderStats().reaped_ != before.reaped_ + 1)
-      co_return absl::FailedPreconditionError(
-          "durable block retirement did not permit the subsequent reap");
     co_return absl::OkStatus();
   }
 
@@ -394,10 +535,11 @@ class TombRaiderControllerService final : public bycorf::Service {
  public:
   TombRaiderControllerService(
       lavik::storage::StorageEngine* storage, bool recover_incomplete,
-      std::optional<bool> retirement_after_read = std::nullopt)
+      std::optional<lavik::storage::TombRaiderTestPeer::RetirementScenario>
+          retirement_scenario = std::nullopt)
       : storage_(storage),
         recover_incomplete_(recover_incomplete),
-        retirement_after_read_(retirement_after_read) {}
+        retirement_scenario_(retirement_scenario) {}
 
   void Prepare(unsigned thread_count) override {
     if (thread_count != 1) Fail("tomb raider controller requires one worker");
@@ -428,9 +570,9 @@ class TombRaiderControllerService final : public bycorf::Service {
 
   bycorf::Task<absl::Status> ExerciseSelectedScenario() {
 #if LAVIK_FAULTS_ENABLED
-    if (retirement_after_read_.has_value()) {
+    if (retirement_scenario_.has_value()) {
       co_return co_await Peer::VerifyPendingBlockRetirement(
-          *storage_, *retirement_after_read_);
+          *storage_, *retirement_scenario_);
     }
 #endif
     if (recover_incomplete_) co_return co_await ExerciseIncompleteRecovery();
@@ -461,7 +603,7 @@ class TombRaiderControllerService final : public bycorf::Service {
   }
 
   bycorf::Task<absl::Status> ExerciseIncompleteRecovery() {
-    auto status = co_await storage_->CompleteTombRaiderStartup();
+    auto status = co_await storage_->CompleteStorageStartup();
     if (!status.ok()) co_return status;
     if (!storage_->ReplicaRecoveryFenced())
       co_return absl::FailedPreconditionError(
@@ -482,7 +624,7 @@ class TombRaiderControllerService final : public bycorf::Service {
     if (!status.ok()) co_return status;
     auto seeded = co_await storage_->Set(0, "quiesce-running-round", "v");
     if (!seeded.ok()) co_return seeded.status();
-    status = co_await storage_->CompleteTombRaiderStartup();
+    status = co_await storage_->CompleteStorageStartup();
     if (!status.ok()) co_return status;
 
     const auto deadline = std::chrono::steady_clock::now() + 10s;
@@ -501,7 +643,7 @@ class TombRaiderControllerService final : public bycorf::Service {
     }
     const auto rounds = storage_->TombRaiderStats().rounds_;
     const auto began = std::chrono::steady_clock::now();
-    auto hold11 = co_await storage_->BeginTombRaiderPopulationChange(11);
+    auto hold11 = co_await Peer::Begin(*storage_, 11);
     if (!hold11.ok()) co_return hold11.status();
     if (std::chrono::steady_clock::now() - began > 2s ||
         storage_->TombRaiderStats().running_ ||
@@ -513,56 +655,56 @@ class TombRaiderControllerService final : public bycorf::Service {
     status = co_await storage_->ConfigureTombRaider(
         {.action_ = Action::kBlockSleep, .value_ = 0});
     if (!status.ok()) co_return status;
-    auto hold12 = co_await storage_->BeginTombRaiderPopulationChange(12);
+    auto hold12 = co_await Peer::Begin(*storage_, 12);
     if (!hold12.ok()) co_return hold12.status();
-    auto repeated = co_await storage_->BeginTombRaiderPopulationChange(12);
+    auto repeated = co_await Peer::Begin(*storage_, 12);
     if (!repeated.ok()) co_return repeated.status();
     if (repeated->generation_ != hold12->generation_)
       co_return absl::FailedPreconditionError(
           "repeated active admission created a second population hold");
-    status = co_await storage_->CompleteTombRaiderPopulationChange(*hold11);
+    status = co_await Peer::Complete(*storage_, *hold11);
     if (!absl::IsFailedPrecondition(status))
       co_return absl::FailedPreconditionError("stale completion was accepted");
     status = co_await RequireBlocked("overlapping newer population change");
     if (!status.ok()) co_return status;
-    status = co_await storage_->CompleteTombRaiderPopulationChange(*hold12);
+    status = co_await Peer::Complete(*storage_, *hold12);
     if (!status.ok()) co_return status;
     status = co_await RequireRound("complete population without authority");
     if (!status.ok()) co_return status;
 
-    auto hold13 = co_await storage_->BeginTombRaiderPopulationChange(13);
+    auto hold13 = co_await Peer::Begin(*storage_, 13);
     if (!hold13.ok()) co_return hold13.status();
-    (void)co_await storage_->CompleteTombRaiderPopulationChange(*hold11);
+    (void)co_await Peer::Complete(*storage_, *hold11);
     status = co_await RequireBlocked("late callback after newer admission");
     if (!status.ok()) co_return status;
-    status = co_await storage_->CancelTombRaiderPopulationChange(*hold13);
+    status = co_await Peer::Cancel(*storage_, *hold13);
     if (!status.ok()) co_return status;
     status = co_await RequireRound("pre-destructive cancellation");
     if (!status.ok()) co_return status;
 
     // Wire session IDs can be reused after a source restarts. Neither a late
     // completion nor a late cancellation may release that new incarnation.
-    auto reused = co_await storage_->BeginTombRaiderPopulationChange(13);
+    auto reused = co_await Peer::Begin(*storage_, 13);
     if (!reused.ok()) co_return reused.status();
-    (void)co_await storage_->CompleteTombRaiderPopulationChange(*hold13);
-    (void)co_await storage_->CancelTombRaiderPopulationChange(*hold13);
+    (void)co_await Peer::Complete(*storage_, *hold13);
+    (void)co_await Peer::Cancel(*storage_, *hold13);
     status = co_await RequireBlocked("reused session after stale callbacks");
     if (!status.ok()) co_return status;
-    status = co_await storage_->CompleteTombRaiderPopulationChange(*reused);
+    status = co_await Peer::Complete(*storage_, *reused);
     if (!status.ok()) co_return status;
     status = co_await RequireRound("new incarnation of reused session");
     if (!status.ok()) co_return status;
 
-    auto earlier = co_await storage_->BeginTombRaiderPopulationChange(16);
+    auto earlier = co_await Peer::Begin(*storage_, 16);
     if (!earlier.ok()) co_return earlier.status();
-    auto newer = co_await storage_->BeginTombRaiderPopulationChange(17);
+    auto newer = co_await Peer::Begin(*storage_, 17);
     if (!newer.ok()) co_return newer.status();
-    status = co_await storage_->CompleteTombRaiderPopulationChange(*newer);
+    status = co_await Peer::Complete(*storage_, *newer);
     if (!status.ok()) co_return status;
     status =
         co_await RequireBlocked("new completion with an older active hold");
     if (!status.ok()) co_return status;
-    status = co_await storage_->CancelTombRaiderPopulationChange(*earlier);
+    status = co_await Peer::Cancel(*storage_, *earlier);
     if (!status.ok()) co_return status;
     status = co_await RequireRound("all overlapping holds released");
     if (!status.ok()) co_return status;
@@ -570,11 +712,11 @@ class TombRaiderControllerService final : public bycorf::Service {
     status = co_await storage_->ConfigureTombRaider(
         {.action_ = Action::kInterval, .value_ = 60'000});
     if (!status.ok()) co_return status;
-    auto hold14 = co_await storage_->BeginTombRaiderPopulationChange(14);
+    auto hold14 = co_await Peer::Begin(*storage_, 14);
     if (!hold14.ok()) co_return hold14.status();
     if (!storage_->TombRaiderStats().enabled_)
       co_return absl::FailedPreconditionError("internal drain changed user ON");
-    status = co_await storage_->CancelTombRaiderPopulationChange(*hold14);
+    status = co_await Peer::Cancel(*storage_, *hold14);
     if (!status.ok()) co_return status;
     status = co_await storage_->ConfigureTombRaider({.action_ = Action::kOff});
     if (!status.ok()) co_return status;
@@ -597,8 +739,7 @@ class TombRaiderControllerService final : public bycorf::Service {
 #endif
     // Storage completion precedes native all-flow cut installation. Only the
     // explicit final session completion may reopen physical maintenance.
-    lavik::storage::TombRaiderPopulationToken full20;
-    status = co_await storage_->BeginReplicaFullSync(20, &full20);
+    status = co_await storage_->BeginReplicaFullSync(20);
     if (!status.ok()) co_return status;
     status = co_await RequireBlocked("durable FULL invalidation");
     if (!status.ok()) co_return status;
@@ -609,15 +750,45 @@ class TombRaiderControllerService final : public bycorf::Service {
     if (!status.ok()) co_return status;
     status = co_await RequireBlocked("FULL root before final cut");
     if (!status.ok()) co_return status;
-    status = co_await storage_->CompleteTombRaiderPopulationChange(full20);
+    status = co_await storage_->FinalizeReplicaFullSync(20);
     if (!status.ok()) co_return status;
     status = co_await RequireRound("completed FULL final cut");
     if (!status.ok()) co_return status;
 
-    lavik::storage::TombRaiderPopulationToken full21;
-    status = co_await storage_->BeginReplicaFullSync(21, &full21);
+    status = co_await storage_->BeginReplicaFullSync(22);
     if (!status.ok()) co_return status;
-    status = co_await storage_->CancelTombRaiderPopulationChange(full21);
+    catalog = co_await storage_->CommitFunctionCatalog("old-finalizer-catalog");
+    if (!catalog.ok()) co_return catalog.status();
+    status = co_await storage_->CompleteReplicaFullSync(
+        22, {.generation_ = 22, .digest_ = 22});
+    if (!status.ok()) co_return status;
+    // The public lifecycle method binds the current private generation when
+    // called, before its task runs. Reusing a wire ID cannot retarget it.
+    auto delayed_finalizer = storage_->FinalizeReplicaFullSync(22);
+    status = co_await storage_->AbortReplicaRoot(22);
+    if (!status.ok()) co_return status;
+    status = co_await storage_->BeginReplicaFullSync(22);
+    if (!status.ok()) co_return status;
+    catalog = co_await storage_->CommitFunctionCatalog("new-finalizer-catalog");
+    if (!catalog.ok()) co_return catalog.status();
+    status = co_await storage_->CompleteReplicaFullSync(
+        22, {.generation_ = 23, .digest_ = 23});
+    if (!status.ok()) co_return status;
+    status = co_await std::move(delayed_finalizer);
+    if (!absl::IsFailedPrecondition(status))
+      co_return absl::FailedPreconditionError(
+          "delayed FULL finalizer accepted a reused session ID");
+    status = co_await RequireBlocked("new session before its own final cut");
+    if (!status.ok()) co_return status;
+    status = co_await storage_->FinalizeReplicaFullSync(22);
+    if (!status.ok()) co_return status;
+    status =
+        co_await RequireRound("reused FULL session after its own final cut");
+    if (!status.ok()) co_return status;
+
+    status = co_await storage_->BeginReplicaFullSync(21);
+    if (!status.ok()) co_return status;
+    status = co_await storage_->AbortReplicaRoot(21);
     if (!status.ok()) co_return status;
     co_return co_await RequireBlocked("cancelled destructive FULL");
   }
@@ -797,14 +968,16 @@ class TombRaiderControllerService final : public bycorf::Service {
 
   lavik::storage::StorageEngine* storage_ = nullptr;
   bool recover_incomplete_ = false;
-  std::optional<bool> retirement_after_read_;
+  std::optional<lavik::storage::TombRaiderTestPeer::RetirementScenario>
+      retirement_scenario_;
   bycorf::Worker* worker_ = nullptr;
   absl::Status result_ = absl::UnknownError("controller service did not run");
 };
 
 void VerifyTombRaiderController(
     const std::string& path, bool recover_incomplete = false,
-    std::optional<bool> retirement_after_read = std::nullopt) {
+    std::optional<lavik::storage::TombRaiderTestPeer::RetirementScenario>
+        retirement_scenario = std::nullopt) {
   lavik::storage::StorageEngineOptions options;
   options.data_files_ = {path};
   options.buffers_.registered_bytes_ = 64 * kMiB;
@@ -823,7 +996,7 @@ void VerifyTombRaiderController(
   if (lavik::tx::TxRuntime::Get() == nullptr) lavik::tx::TxRuntime::Create(1);
 
   TombRaiderControllerService service(&storage, recover_incomplete,
-                                      retirement_after_read);
+                                      retirement_scenario);
   bycorf::Server server;
   server.AddService(&service);
   bycorf::ServerOptions runtime;
@@ -838,15 +1011,18 @@ void VerifyTombRaiderController(
 
 void VerifyRetirementRaces(const std::string& prefix) {
 #if LAVIK_FAULTS_ENABLED
-  for (bool after_read : {false, true}) {
-    const std::string path =
-        prefix + (after_read ? ".after-read" : ".before-snapshot");
+  using Scenario = lavik::storage::TombRaiderTestPeer::RetirementScenario;
+  for (Scenario scenario : {Scenario::kBeforeSnapshot, Scenario::kAfterRead,
+                            Scenario::kPinned, Scenario::kPrefixClaim,
+                            Scenario::kRepeated, Scenario::kCancelledWait}) {
+    const std::string path = prefix + ".retirement-" +
+                             std::to_string(static_cast<unsigned>(scenario));
     struct Cleanup {
       const std::string& path_;
       ~Cleanup() { (void)::unlink(path_.c_str()); }
     } cleanup{path};
     CreateDataFile(path, 192 * kMiB);
-    VerifyTombRaiderController(path, false, after_read);
+    VerifyTombRaiderController(path, false, scenario);
   }
 #endif
 }
@@ -927,7 +1103,7 @@ class TombRaiderMultiworkerService final : public bycorf::Service {
         }
       }
     }
-    auto status = co_await storage_.CompleteTombRaiderStartup();
+    auto status = co_await storage_.CompleteStorageStartup();
     if (!status.ok()) co_return status;
     for (Point point : {Point::kAfterClaimLookup, Point::kBeforeReapKeyLoad}) {
       status = co_await storage_.FlushAllDetach();
@@ -1339,11 +1515,23 @@ std::string LocalTimeAfter(std::chrono::seconds offset) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 2 && argc != 3) {
-    std::cerr
-        << "usage: tomb_raider_e2e_test /path/to/lavik [--controller-only]\n";
+  const auto usage = [] {
+    std::cerr << "usage: tomb_raider_e2e_test /path/to/lavik "
+                 "[--controller-only | --multiworker-only]\n";
+#if !LAVIK_FAULTS_ENABLED
+    std::cerr << "--multiworker-only requires test fault support\n";
+#endif
     return 2;
+  };
+  if (argc != 2 && argc != 3) {
+    return usage();
   }
+  const std::string_view mode = argc == 3 ? argv[2] : "";
+  if (argc == 3 && mode != "--controller-only" && mode != "--multiworker-only")
+    return usage();
+#if !LAVIK_FAULTS_ENABLED
+  if (mode == "--multiworker-only") return usage();
+#endif
   const std::string prefix = lavik::test::TestDataPath(
       "lavik-tombraider-" + std::to_string(::getpid()));
   const std::string data_path = prefix + ".data";
@@ -1355,7 +1543,7 @@ int main(int argc, char** argv) {
 
   try {
 #if LAVIK_FAULTS_ENABLED
-    if (argc == 3 && std::string_view(argv[2]) == "--multiworker-only") {
+    if (mode == "--multiworker-only") {
       CreateDataFile(quiesce_path, 256 * kMiB);
       VerifyMultiworkerTombRaider(quiesce_path);
       (void)::unlink(quiesce_path.c_str());
@@ -1363,7 +1551,7 @@ int main(int argc, char** argv) {
       return 0;
     }
 #endif
-    if (argc == 3 && std::string_view(argv[2]) == "--controller-only") {
+    if (mode == "--controller-only") {
       CreateDataFile(quiesce_path, kControllerDataBytes);
       VerifyTombRaiderController(quiesce_path);
       VerifyTombRaiderController(quiesce_path, true);

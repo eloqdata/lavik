@@ -62,9 +62,10 @@ a fatal storage error prevents further rounds.
 changes invalidate the current round, which finishes any committed retirement
 accounting and stops. The next scheduled round starts with a fresh scan. FLUSH
 retains its own detached-index reclamation and SYNC/ASYNC completion semantics.
-Concurrent defrag can also cancel a round when record-block retirement is not
-yet durable or a block changes during its scan. The next scheduled round
-retries automatically; neither cancellation changes the configured schedule.
+Concurrent defrag may temporarily delay a sweep while record-block retirement
+becomes durable. The sweep then skips that old allocation and continues the
+same round, preserving its progress and the configured schedule. A tombstone
+already claimed before its older block retired may remain until the next round.
 
 ## Inspecting progress
 

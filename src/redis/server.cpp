@@ -852,7 +852,7 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
       // Physical reclamation needs all recovered indexes and the complete
       // startup catalog/import. It does not need a serving role or lease;
       // storage retains the gate if recovery found an unfinished FULL.
-      imported = co_await storage_->CompleteTombRaiderStartup();
+      imported = co_await storage_->CompleteStorageStartup();
     }
     std::lock_guard lock(rdb_import_status_mutex_);
     rdb_import_status_ = std::move(imported);

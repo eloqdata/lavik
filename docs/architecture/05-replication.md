@@ -1045,9 +1045,12 @@ revalidation prevents that stale work from publishing into the replacement.
 The storage gate is independent of the Tomb Raider schedule and serving
 authority. FULL closes it before durable invalidation and keeps it closed until
 root promotion, all-flow cut installation, and required population completion
-records succeed. Admission returns a local generation token retained by the
-session; an older completion cannot reopen the gate even if a later source
-reuses the same wire session identifier.
+records succeed. Replication reports these population lifecycle boundaries;
+storage owns the maintenance gate and its generation internally. The adapter
+validates the current attempt before final completion and joins its mutators
+before abort or session-identifier reuse. Storage captures the admission's
+private generation at final completion and before the abort drain, so delayed
+completion or cleanup can release only that admission.
 Redis FULLRESYNC and source-less initialization use the same boundary, and a
 multi-source Redis import completes only when every source in its session is
 complete. An interrupted destructive attempt stays ineligible until a complete

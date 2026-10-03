@@ -897,19 +897,16 @@ absl::StatusOr<PopulationToken> StorageEngine::Impl::RecoverPopulationToken()
 }
 
 Task<absl::Status> StorageEngine::Impl::BeginReplicaFullSync(
-    std::uint64_t session_id, TombRaiderPopulationToken* maintenance_token) {
+    std::uint64_t session_id) {
   if (session_id == 0) {
     co_return absl::InvalidArgumentError("invalid full-sync session");
   }
   if (bycorf::ThisWorker().id_ != 0) {
     co_return co_await bycorf::SubmitTaskTo(
-        0, [this, session_id, maintenance_token]() {
-          return BeginReplicaFullSync(session_id, maintenance_token);
-        });
+        0, [this, session_id]() { return BeginReplicaFullSync(session_id); });
   }
-  auto paused = co_await BeginTombRaiderPopulationChange(session_id);
+  auto paused = co_await BeginPopulationChange(session_id);
   if (!paused.ok()) co_return paused.status();
-  if (maintenance_token != nullptr) *maintenance_token = *paused;
   const auto generation = paused->generation_;
   co_await system_state_mutex_.Lock();
   UnlockGuard unlock(&system_state_mutex_, bycorf::ThisWorker().self_);
@@ -974,6 +971,27 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaFullSync(
       "generation {}",
       session_id, system_state_.generation_);
   co_return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::FinalizeReplicaFullSync(
+    std::uint64_t session_id) {
+  // This is deliberately not a coroutine: bind the owner-validated attempt
+  // before returning a possibly deferred task. Joining old protocol attempts
+  // protects calls themselves; this private generation also protects an old
+  // task resumed after the source reused its wire-session identifier.
+  if (bycorf::ThisWorker().id_ != 0) {
+    return
+        [](absl::Status status)
+            -> Task<absl::Status> {
+          co_return status;
+        }(absl::FailedPreconditionError(
+                "full sync finalization requires the population owner worker"));
+  }
+  const auto hold = tomb_raider_population_changes_.find(session_id);
+  const auto generation =
+      hold == tomb_raider_population_changes_.end() ? 0 : hold->second;
+  return CompletePopulationChange(
+      PopulationChangeToken{session_id, generation});
 }
 
 Task<absl::Status> StorageEngine::Impl::CompleteReplicaFullSync(

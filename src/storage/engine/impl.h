@@ -2405,13 +2405,17 @@ class StorageEngine::Impl {
 
   Task<absl::Status> ConfigureTombRaider(TombRaiderConfigUpdate update);
 
-  Task<absl::Status> CompleteTombRaiderStartup();
-  Task<absl::StatusOr<TombRaiderPopulationToken>>
-  BeginTombRaiderPopulationChange(std::uint64_t session_id);
-  Task<absl::Status> CompleteTombRaiderPopulationChange(
-      TombRaiderPopulationToken token);
-  Task<absl::Status> CancelTombRaiderPopulationChange(
-      TombRaiderPopulationToken token);
+  // Storage owns maintenance generations. Protocol callers report their FULL
+  // lifecycle; they never carry a Tomb Raider admission token.
+  struct PopulationChangeToken {
+    std::uint64_t session_id_ = 0;
+    std::uint64_t generation_ = 0;
+  };
+  Task<absl::Status> CompleteStorageStartup();
+  Task<absl::StatusOr<PopulationChangeToken>> BeginPopulationChange(
+      std::uint64_t session_id);
+  Task<absl::Status> CompletePopulationChange(PopulationChangeToken token);
+  Task<absl::Status> CancelPopulationChange(PopulationChangeToken token);
 
   DefragTotals DefragStats() const noexcept {
     return DefragTotals{
@@ -3025,9 +3029,8 @@ class StorageEngine::Impl {
   void StageCleanShutdownProof(std::string proof);
   Task<absl::Status> PublishCleanShutdownProof();
   absl::StatusOr<PopulationToken> RecoverPopulationToken() const;
-  Task<absl::Status> BeginReplicaFullSync(
-      std::uint64_t session_id,
-      TombRaiderPopulationToken* maintenance_token = nullptr);
+  Task<absl::Status> BeginReplicaFullSync(std::uint64_t session_id);
+  Task<absl::Status> FinalizeReplicaFullSync(std::uint64_t session_id);
   Task<absl::Status> CompleteReplicaFullSync(std::uint64_t session_id,
                                              PopulationToken population);
   bool ReplicaRecoveryFenced() const noexcept {
@@ -4247,9 +4250,8 @@ class StorageEngine::Impl {
   std::optional<std::string> recovered_catalog_dump_;
   std::optional<absl::Status> system_state_failure_;
   std::atomic<bool> system_state_root_failure_injected_{false};
-  // Tomb Raider retains the pre-existing coarse authority switch. Finite
-  // capabilities govern active expiration only and deliberately do not alter
-  // Tomb Raider admission, scheduling, or an in-flight cleanup round.
+  // Permanent and finite authority govern active expiration only. Physical
+  // maintenance admission follows the independent local population lifecycle.
   std::atomic<bool> expiration_authority_{true};
   std::atomic<std::shared_ptr<ExpirationAuthorityGrant>>
       active_expiration_authority_;

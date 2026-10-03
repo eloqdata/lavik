@@ -851,12 +851,14 @@ including staged prefixes, claims candidates for which an older unexpired
 value still exists, and only then clears stale shielding or erases unclaimed
 tombstones. Runtime block removal can precede durable allocation-bitmap
 retirement, so an absent runtime block alone never proves that its old values
-are unrecoverable. A sweep forfeits the round if a record-block retirement is
-pending when it captures its local block set, or a captured block is retired
-or replaced before its records are fully examined. The round state is
-process-local. A crash or shutdown can forfeit a round because recovery
-reconstructs the conservative tombstone and shielding state and the next
-round repeats the proof.
+are unrecoverable. Before capturing its local block set, a sweep waits for
+pending record-block retirements to become durable. If a captured block is
+being retired, the sweep waits for that retirement, then skips the obsolete
+allocation and continues the same round. Claims already made from that block
+remain conservative: they can retain a tombstone for another round, but cannot
+permit premature deletion. The round state is process-local. A crash or shutdown
+can forfeit a round because recovery reconstructs the conservative tombstone
+and shielding state and the next round repeats the proof.
 
 Index capacity follows removal from the in-memory index: replacing a value with a
 tombstone retains its slot, while erasing the entry enables incremental bucket
@@ -867,12 +869,14 @@ Shrinking preserves entry addresses and the cursor guarantee that continuously
 present entries are visited at least once; a cursor can revisit merged buckets.
 Memory admission can defer shrinking without preventing entry removal.
 
-The population gate stays closed through startup recovery and import. A
-generation-bound population-change token closes the gate, requests an active
-round to forfeit at a safe checkpoint, and drains it before a destructive FULL
-reset or source-less population initialization. Only successful completion of
-the current population change can reopen the gate; an interrupted rebuild and
-stale completion callbacks cannot expose partial data to cleanup. Native FULL
+The population gate stays closed through startup recovery and import. Storage
+uses its private population generation to close the gate, request an active
+round to forfeit at a safe checkpoint, and drain it before a destructive FULL
+reset or source-less population initialization. Replication reports population
+begin, final completion, and joined abort; it does not manage Tomb Raider or
+carry maintenance tokens. Only successful completion of the current population
+change can reopen the gate; an interrupted rebuild and stale completion
+callbacks cannot expose partial data to cleanup. Native FULL
 completion includes root promotion and installation of every flow's final cut;
 Redis Cluster import includes every source in the session. Shutdown closes and
 drains the gate before storage freezes, and a fatal storage fault keeps it
