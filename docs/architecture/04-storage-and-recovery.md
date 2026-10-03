@@ -827,9 +827,9 @@ Controlled failover holds it after request mutation drain while the old owner
 captures a stable replication frontier, and a replacement of that same pause
 transfers the hold without reopening expiration between desired states. The
 hold is released only when the source-pause intent disappears. Tomb Raider is
-not governed by the finite capability or this pause, but Meta-managed cluster
-startup never launches Tomb Raider because it starts without expiration
-authority.
+not governed by the finite capability or this pause: its authority is the
+completeness and availability of the local physical population, independently
+of request-serving authority.
 
 The preferred deletion is a durable tombstone, which remains safe if the wall
 clock later moves backward. If foreground space is completely exhausted, an
@@ -840,19 +840,23 @@ the root and side view leave the indexes together and the complete auxiliary
 graph is retired; UUIDs remain dependencies of their source record blocks. A shielding value cannot use this escape valve because an
 older durable value could reappear.
 
-Tomb Raider is a separate, optional cleanup loop launched at worker startup
-only when the node is then the expiration authority. Meta-managed startup does not
-grant that authority and therefore does not launch the loop. Once
-launched, the loop does not recheck authority on its own; the standalone
-`REPLICAOF` transition therefore explicitly quiesces it before installing an
-upstream. Native FULL mode also quiesces it at the session-wide boundary before
-the first destructive reset. It marks tombstones and shielding values as
+Storage owns one permanent Tomb Raider scheduler on worker zero. The scheduler
+checks the configured schedule and local population gate before admitting a
+round. Complete, usable populations are eligible on standalone and Meta-managed
+nodes, including replicas disconnected from their source. Owner leases,
+physical roles, and transport connectivity do not grant or revoke this local
+maintenance capability. Tomb Raider marks tombstones and shielding values as
 initially unclaimed, sweeps all ordinary record blocks
 including staged prefixes, claims candidates for which an older unexpired
 value still exists, and only then clears stale shielding or erases unclaimed
-tombstones. The round state is process-local. A crash or shutdown can forfeit a
-round because recovery reconstructs the conservative tombstone and shielding
-state and the next round repeats the proof.
+tombstones. Runtime block removal can precede durable allocation-bitmap
+retirement, so an absent runtime block alone never proves that its old values
+are unrecoverable. A sweep forfeits the round if a record-block retirement is
+pending when it captures its local block set, or a captured block is retired
+or replaced before its records are fully examined. The round state is
+process-local. A crash or shutdown can forfeit a round because recovery
+reconstructs the conservative tombstone and shielding state and the next
+round repeats the proof.
 
 Index capacity follows removal from the in-memory index: replacing a value with a
 tombstone retains its slot, while erasing the entry enables incremental bucket
@@ -863,15 +867,18 @@ Shrinking preserves entry addresses and the cursor guarantee that continuously
 present entries are visited at least once; a cursor can revisit merged buckets.
 Memory admission can defer shrinking without preventing entry removal.
 
-The internal `QuiesceTombRaiderForReplica` boundary is stronger than the
-user-facing `TOMBRAIDER OFF`: it disables future rounds, requests an in-flight
-round to forfeit at its next safe phase or block checkpoint, and waits until no
-round is running. The ordinary OFF command continues to let an in-flight round
-finish. Standalone role transition and the native FULL-begin barrier invoke
-this boundary while client database gates are closed. The callable cluster
-rebuild adapter uses that same native FULL path; cluster startup also avoids
-the pre-directive race by never launching Tomb Raider while authority is
-withheld.
+The population gate stays closed through startup recovery and import. A
+generation-bound population-change token closes the gate, requests an active
+round to forfeit at a safe checkpoint, and drains it before a destructive FULL
+reset or source-less population initialization. Only successful completion of
+the current population change can reopen the gate; an interrupted rebuild and
+stale completion callbacks cannot expose partial data to cleanup. Native FULL
+completion includes root promotion and installation of every flow's final cut;
+Redis Cluster import includes every source in the session. Shutdown closes and
+drains the gate before storage freezes, and a fatal storage fault keeps it
+closed. These internal boundaries preserve the configured schedule. The
+user-facing `TOMBRAIDER OFF` only prevents future rounds and lets a running
+round finish.
 
 ### Database and transaction cleanup
 
@@ -886,6 +893,17 @@ worker, and runs after command gates, publication order and Group drain are
 released. A wait or retirement error propagates without repeating the committed
 flush or completed retirement. Neither SYNC nor ASYNC promises that every
 obsolete disk extent is immediately reusable.
+
+Tomb Raider can overlap FLUSH without a whole-round drain. A round binds its
+mark/sweep/reap proof to database epochs and worker-local index generations;
+the latter distinguish local detach from the earlier global epoch publication.
+Changing either invalidates the whole proof and the next round starts again.
+After asynchronous work, cleanup revalidates that context before modifying the
+index. Final erasure retains the local key and store-state locks shared with
+index replacement, and already-erased records complete retirement accounting
+before cancellation. Owned handles and physical allocation-epoch checks protect
+record lifetime separately from logical generation checks. Detached-index
+reclamation remains the owner of the old FLUSH population.
 
 Managed command callers pass a mutation precondition down to device epoch
 persistence. After the device owner acquires its allocator lock and IO buffer,
@@ -1030,7 +1048,7 @@ Current test evidence includes:
 | `tests/extent_recovery_e2e_test.cpp` | External keys and values, manifest/extent recovery, reclamation, and repeated worker-count changes |
 | `tests/flushdb_reclaim_e2e_test.cpp` | Full-device FLUSHDB reclaim, paused-defrag exhaustion and resume, expiry escape valve, stale activated-header handling, and a crash after durable defrag source retirement |
 | `tests/ttl_e2e_test.cpp` | TTL mutation, disk-resident rewrite, expired/live restart behavior, and extent-backed values |
-| `tests/tomb_raider_e2e_test.cpp` | Runtime scheduling, retain/reap behavior for buried persistent or expired values, user OFF completion semantics, and bounded internal replica quiescence |
+| `tests/tomb_raider_e2e_test.cpp` | Runtime scheduling, retain/reap behavior for buried persistent or expired values, user OFF completion semantics, population-change drains, and FLUSH generation invalidation |
 | `tests/multikey_e2e_test.cpp` | Bounded disk MGET waves, commit batching and fence merging, transaction-block retirement, recovery, FLUSHDB invalidation, rollback, and retry |
 | `tests/atomicity_stress_e2e_test.cpp` | Overlapping multi-key serializability and recovery after a graceful durability drain |
 | `tests/list_e2e_test.cpp` | Function-catalog body/root/runtime crash windows, multi-device torn-root fallback, and shielded expired-winner behavior under an injected recovery clock rollback |
@@ -1048,11 +1066,6 @@ Current test evidence includes:
   activation and first flush for reset media or a reused zero-label added
   device. Operators should provision genuinely empty added media when that
   property matters.
-- Tomb Raider does not recheck replication authority independently. Supported
-  standalone role transition and the callable cluster rebuild adapter both
-  reach its quiesce boundary through native FULL, while Meta-managed startup
-  withholds authority from the outset. Any authority transition that bypasses
-  those replication paths must invoke the same boundary.
 - Storage persists partition/database epochs, population scope and a one-use
   shutdown certificate, but not a Meta-managed ready token or Data control
   authority. Meta control reconnects after every boot, but neither
@@ -1114,7 +1127,7 @@ current source code are authoritative for present storage behavior.
 | Periodic flush snapshots, data-before-header ordering, alternating header commits, dirty-tail ordering, and retirement settlement | `src/storage/engine/flush.cpp` |
 | Extent reclaim, defrag candidate selection, relocation durability fences, source retirement, and pacing | `src/storage/engine/defrag.cpp` |
 | Lazy and active expiration, permanent and finite authority capabilities, nestable quiescence, durable tombstones, and the full-device escape valve | `include/lavik/storage/engine.h`, `src/storage/engine/expire.cpp`, `src/cluster/node_control.cpp`, `src/replication/replication.cpp` |
-| Tombstone and shielding mark/sweep/reap lifecycle, startup authority check, internal replica quiescence, and runtime role limitation | `include/lavik/storage/engine.h`, `src/storage/engine/tomb_raider.cpp`, `src/storage/engine/init.cpp`, `src/replication/replication.cpp` |
+| Tombstone and shielding mark/sweep/reap lifecycle, storage-owned scheduling, population eligibility, and generation-checked FLUSH concurrency | `include/lavik/storage/engine.h`, `src/storage/engine/tomb_raider.cpp`, `src/storage/engine/init.cpp`, `src/storage/engine/flush_db.cpp`, `src/replication/replication.cpp`, `src/replication/redis_replication.cpp` |
 | Durable database and replica-partition epoch advance, bounded index detach, replica reset/promotion/abort, and detached-index reclaim | `src/storage/engine/flush_db.cpp`, `src/storage/engine/replication.cpp` |
 | Transaction-block promotion, commit-decision lifetime, and cold retirement | `src/storage/engine/tx_cleaner.cpp` |
 | Device, durability, recovery, storage-I/O, Defrag, Tomb Raider, and transaction-cleaner observability | `include/lavik/storage/engine.h`, `src/storage/engine/metrics.cpp`, `src/storage/engine/recovery.cpp`, `src/metrics.cpp` |

@@ -1423,8 +1423,9 @@ auto ReplicationManager::ReplicationGroup::
   }
 
   constexpr std::uint64_t kFaultFullSyncSession = 0x50524f4d4f5445ULL;
-  absl::Status storage_ready =
-      co_await storage_->BeginReplicaFullSync(kFaultFullSyncSession);
+  storage::TombRaiderPopulationToken maintenance_token;
+  absl::Status storage_ready = co_await storage_->BeginReplicaFullSync(
+      kFaultFullSyncSession, &maintenance_token);
   if (!storage_ready.ok()) co_return storage_ready;
   storage_ready = co_await GlobalFunctionCatalog().ReplaceFromLibraryCodes({});
   if (!storage_ready.ok()) co_return storage_ready;
@@ -1446,8 +1447,11 @@ auto ReplicationManager::ReplicationGroup::
   if (recovered) {
     // Exercise the production verified-recovery boundary without repeating
     // the storage certificate/crash protocol covered by process tests.
-    co_return co_await InstallRecoveredPopulation(
+    storage_ready = co_await InstallRecoveredPopulation(
         {std::move(ready_identity), directive.required_applied_next_lsns_});
+    if (!storage_ready.ok()) co_return storage_ready;
+    co_return co_await storage_->CompleteTombRaiderPopulationChange(
+        maintenance_token);
   }
   RebuildDirective rebuild{
       .identity_ = std::move(ready_identity),
@@ -1521,7 +1525,8 @@ auto ReplicationManager::ReplicationGroup::
     native_dataset_valid_.store(true, std::memory_order_release);
     PublishHeartbeatObservation();
   }
-  co_return absl::OkStatus();
+  co_return co_await storage_->CompleteTombRaiderPopulationChange(
+      maintenance_token);
 }
 #endif
 
@@ -6544,6 +6549,7 @@ auto ReplicationManager::ReplicationGroup::RunEmptyPopulationInitialization(
   } coordinator_guard{&coordinator_started_};
 
   std::uint64_t session_id = NextRedisFullSyncSessionId();
+  storage::TombRaiderPopulationToken maintenance_token;
   bool root_started = false;
   bool promoted = false;
   const auto cancelled = [] {
@@ -6572,9 +6578,6 @@ auto ReplicationManager::ReplicationGroup::RunEmptyPopulationInitialization(
     }
   }
   if (prepared.ok()) {
-    prepared = co_await storage_->QuiesceTombRaiderForReplica();
-  }
-  if (prepared.ok()) {
     prepared = co_await storage_->QuiesceExpiration();
     if (prepared.ok()) storage_->ResumeExpiration();
   }
@@ -6585,7 +6588,7 @@ auto ReplicationManager::ReplicationGroup::RunEmptyPopulationInitialization(
   }
 
   absl::Status invalidated =
-      co_await storage_->BeginReplicaFullSync(session_id);
+      co_await storage_->BeginReplicaFullSync(session_id, &maintenance_token);
   if (!invalidated.ok()) {
     co_return co_await FinishEmptyPopulationFailure(
         context, session_id, root_started, promoted, invalidated);
@@ -6761,6 +6764,12 @@ auto ReplicationManager::ReplicationGroup::RunEmptyPopulationInitialization(
   owner_source_term_ = context->directive_.identity_.term_;
   StoreRole(ReplicationRole::kMaster, std::memory_order_release);
   storage_->SetReplicaLoading(false);
+  absl::Status maintenance =
+      co_await storage_->CompleteTombRaiderPopulationChange(maintenance_token);
+  if (!maintenance.ok()) {
+    co_return co_await FinishEmptyPopulationFailure(
+        context, session_id, root_started, promoted, maintenance);
+  }
   // Population readiness does not convey a write lease. NodeControl enables
   // a finite expiration capability only after the matching FDS and lease
   // deadline pass their final activation recheck.
@@ -7610,14 +7619,23 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
     }
     local_population_matches_response = false;
   }
+  // Cleanup must know the admitted session even if durable invalidation
+  // suspends and a role change cancels the handshake before flow creation.
+  session->session_id_ = session_id;
   if (!local_population_matches_response) {
+    // The control coroutine can suspend while draining physical maintenance
+    // and persisting the FULL fence before any data flow exists. Include
+    // that storage operation in the session join so reconfiguration cannot
+    // abort its hold and then be overtaken by the pending invalidation.
+    session->active_flows_.fetch_add(1, std::memory_order_acq_rel);
+    ReplicaFlowActivityGuard admission_activity(&session->active_flows_);
     // Publishing a new source context makes it eligible for the next
     // reconnect. Persist the destructive fence first, so a disconnect
     // before the first flow cannot turn an empty/old population into a
     // same-context CONTINUE proof.
     session->destructive_root_started_.store(true, std::memory_order_release);
-    absl::Status invalidated =
-        co_await storage_->BeginReplicaFullSync(session_id);
+    absl::Status invalidated = co_await storage_->BeginReplicaFullSync(
+        session_id, &session->tomb_raider_population_token_);
     if (!invalidated.ok()) {
       session->sockets_.Remove(control_fd);
       control.Close().IgnoreError();
@@ -7630,7 +7648,6 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
       co_return absl::CancelledError("replication role epoch was replaced");
     }
   }
-  session->session_id_ = session_id;
   session->flow_capability_ = std::string(words[7]);
   session->source_worker_count_ = source_workers;
   session->transaction_owners_.reserve(storage_->worker_count());
@@ -7943,9 +7960,9 @@ auto ReplicationManager::ReplicationGroup::PrepareReplicaFlowMode(
 
   // A role-generation change prevents new external data commands, but work
   // admitted against the old population may already hold a database gate.
-  // Flow zero establishes the destructive-reset boundary while all other
-  // flows wait: close admission, drain that work, and quiesce background
-  // mutators before reopening the gates for trusted replica apply.
+  // Flow zero drains old client work and logical expiration while other
+  // flows wait. BeginReplicaFullSync separately drains physical maintenance
+  // before the durable invalidation that admits destructive replica apply.
   if (flow_id == 0) {
     absl::Status prepared = session->PrepareFullSyncCursors();
     while (prepared.ok() && !CloseAllCommandDbGates()) {
@@ -7970,9 +7987,6 @@ auto ReplicationManager::ReplicationGroup::PrepareReplicaFlowMode(
                                              std::chrono::milliseconds(1));
         if (!prepared.ok()) break;
       }
-    }
-    if (prepared.ok()) {
-      prepared = co_await storage_->QuiesceTombRaiderForReplica();
     }
     if (prepared.ok()) {
       prepared = co_await storage_->QuiesceExpiration();
@@ -8075,8 +8089,8 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
     // frame. The single system-state writer makes all of them wait for the
     // same durable invalidation, so no partition reset can outrun it.
     session->destructive_root_started_.store(true, std::memory_order_release);
-    absl::Status invalidated =
-        co_await storage_->BeginReplicaFullSync(session->session_id_);
+    absl::Status invalidated = co_await storage_->BeginReplicaFullSync(
+        session->session_id_, &session->tomb_raider_population_token_);
     if (!invalidated.ok()) {
       session->sockets_.Remove(fd);
       stream.Close().IgnoreError();
@@ -9431,10 +9445,23 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
               co_return replaced;
             }
           }
-          PublishHeartbeatObservation();
-          session->cluster_rebuild_->completion_->Resolve(absl::OkStatus());
         } else {
           native_dataset_valid_.store(true, std::memory_order_release);
+        }
+        // Root promotion alone is not the completion boundary: every flow's
+        // cut and the optional durable managed identity are installed above.
+        // The session binding prevents a retired completion from enabling
+        // reclamation in a newer destructive FULL attempt.
+        absl::Status maintenance =
+            co_await storage_->CompleteTombRaiderPopulationChange(
+                session->tomb_raider_population_token_);
+        if (!maintenance.ok()) {
+          session->promotion_complete_->Abort(maintenance);
+          co_return maintenance;
+        }
+        if (session->cluster_rebuild_ != nullptr) {
+          PublishHeartbeatObservation();
+          session->cluster_rebuild_->completion_->Resolve(absl::OkStatus());
         }
       }
       absl::Status finalized = co_await session->promotion_complete_->Wait(

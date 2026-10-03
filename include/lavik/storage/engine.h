@@ -228,6 +228,14 @@ struct TombRaiderConfigUpdate {
   std::uint64_t value_ = 0;
 };
 
+// A local generation distinguishes reused native wire-session identifiers.
+// Callers retain the token returned by admission, never reconstruct it from
+// the current session table when completing an asynchronous operation.
+struct TombRaiderPopulationToken {
+  std::uint64_t session_id_ = 0;
+  std::uint64_t generation_ = 0;
+};
+
 struct TombRaiderTotals {
   std::uint64_t rounds_ = 0;
   std::uint64_t reaped_ = 0;
@@ -238,6 +246,9 @@ struct TombRaiderTotals {
   TombRaiderMode mode_ = TombRaiderMode::kOff;
   bool enabled_ = false;
   bool running_ = false;
+  // Eligibility includes operator configuration, but not the next due time.
+  bool eligible_ = false;
+  std::string_view blocked_reason_ = "startup";
 };
 
 struct TxCleanerTotals {
@@ -1254,8 +1265,13 @@ class StorageEngine {
   // population and Function catalog have both reached the final cut. Begin is
   // idempotent for the same nonzero session. Complete accepts only that active
   // session, atomically makes it readable, and never rolls back the
-  // replacement on failure.
-  bycorf::Task<absl::Status> BeginReplicaFullSync(std::uint64_t session_id);
+  // replacement on failure. Begin first drains Tomb Raider without changing
+  // its schedule and optionally returns the exact maintenance token. The
+  // caller retains that token through the final protocol cut and completes it
+  // separately; CompleteReplicaFullSync alone does not reopen maintenance.
+  bycorf::Task<absl::Status> BeginReplicaFullSync(
+      std::uint64_t session_id,
+      TombRaiderPopulationToken* maintenance_token = nullptr);
   bycorf::Task<absl::Status> CompleteReplicaFullSync(
       std::uint64_t session_id, PopulationToken population);
   bool ReplicaRecoveryFenced() const noexcept;
@@ -1893,10 +1909,28 @@ class StorageEngine {
   // Reconfigures the worker-0 scheduler. An in-flight round always finishes;
   // the new schedule starts counting from that completion.
   bycorf::Task<absl::Status> ConfigureTombRaider(TombRaiderConfigUpdate update);
-  // Replica reset coordination: disables future rounds, asks an in-flight
-  // round to forfeit at its next safe checkpoint, and waits until it exits.
-  // This is deliberately stronger than the user-facing OFF configuration.
-  bycorf::Task<absl::Status> QuiesceTombRaiderForReplica();
+  // Release the startup hold after all-worker recovery and optional import.
+  // An unfinished durable FULL remains ineligible; serving/Meta authority is
+  // deliberately not consulted. Idempotent, callable from any worker.
+  bycorf::Task<absl::Status> CompleteTombRaiderStartup();
+  // Close admission and drain before touching a population. A nonzero
+  // session ID identifies an active hold bound to a local controller
+  // generation. Repeated begin for the same active session is idempotent;
+  // reuse after completion creates a distinct token.
+  // Never wait for this while holding key or storage locks.
+  bycorf::Task<absl::StatusOr<TombRaiderPopulationToken>>
+  BeginTombRaiderPopulationChange(std::uint64_t session_id);
+  // Only the newest generation can certify a complete population, after all
+  // FULL cuts/local completion records are installed. Older holds still block
+  // admission until released. A stale completion releases only its own hold
+  // and returns FailedPrecondition; user configuration is never changed.
+  bycorf::Task<absl::Status> CompleteTombRaiderPopulationChange(
+      TombRaiderPopulationToken token);
+  // Release a cancelled operation after its mutators have stopped. This does
+  // not certify completeness: cancellation after durable FULL invalidation
+  // remains blocked until a later successful replacement.
+  bycorf::Task<absl::Status> CancelTombRaiderPopulationChange(
+      TombRaiderPopulationToken token);
   // Runtime relocation pacing. Reducing concurrency does not cancel active
   // passes; it prevents replacements until the active count reaches the new
   // limit. Sleep changes take effect at the next checkpoint.
@@ -1922,6 +1956,7 @@ class StorageEngine {
 
  private:
   friend class ExpirationAuthorityTestPeer;
+  friend class TombRaiderTestPeer;
   class Impl;
   std::unique_ptr<Impl> impl_;
 };

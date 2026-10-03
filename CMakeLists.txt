@@ -1106,6 +1106,16 @@ if (BUILD_TESTING)
       )
       set_tests_properties(meta_integration.gate_native_replication PROPERTIES
         LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
+      add_test(
+        NAME meta_integration.gate_tomb_raider
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_native_replication.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+                tomb_raider
+      )
+      set_tests_properties(meta_integration.gate_tomb_raider PROPERTIES
+        LABELS meta-integration TIMEOUT 180 RUN_SERIAL TRUE)
 
       add_test(
         NAME meta_integration.gate_bootstrap
@@ -1969,6 +1979,20 @@ endforeach()
       COMMAND lavik_tomb_raider_e2e_test $<TARGET_FILE:lavik>
     )
     set_tests_properties(lavik_tomb_raider_e2e PROPERTIES TIMEOUT 600)
+    add_test(
+      NAME lavik_tomb_raider_controller
+      COMMAND lavik_tomb_raider_e2e_test $<TARGET_FILE:lavik>
+              --controller-only
+    )
+    set_tests_properties(lavik_tomb_raider_controller PROPERTIES TIMEOUT 120)
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR LAVIK_ENABLE_TEST_FAULTS)
+      add_test(
+        NAME lavik_tomb_raider_multiworker
+        COMMAND lavik_tomb_raider_e2e_test $<TARGET_FILE:lavik>
+                --multiworker-only
+      )
+      set_tests_properties(lavik_tomb_raider_multiworker PROPERTIES TIMEOUT 120)
+    endif()
 
     add_executable(lavik_multikey_e2e_test
       tests/multikey_e2e_test.cpp

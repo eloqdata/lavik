@@ -315,6 +315,7 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
   }
   store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
   ++store.index_generations_[db_id];
+  tomb_raider_index_generation_.fetch_add(1, std::memory_order_release);
   for (auto& partition : store.partitions_) {
     auto& index = partition.indexes_[db_id];
     ++partition.grouped_generations_[db_id];

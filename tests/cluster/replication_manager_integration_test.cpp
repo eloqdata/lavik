@@ -1522,7 +1522,8 @@ class EmptyPopulationService final : public bycorf::Service {
     if (result_.ok()) result_ = co_await storage_->InitializeWorker(worker);
     if (result_.ok()) {
       replication_->StorageReady(worker);
-      result_ = co_await Exercise();
+      result_ = co_await storage_->CompleteTombRaiderStartup();
+      if (result_.ok()) result_ = co_await Exercise();
     }
     worker.RequestStop();
     co_return result_;
@@ -1624,6 +1625,11 @@ class EmptyPopulationService final : public bycorf::Service {
         co_return TestFailure(
             "failed empty population did not retain its serving fence");
       }
+      if (storage_->ReplicaRecoveryFenced() &&
+          storage_->TombRaiderStats().eligible_) {
+        co_return TestFailure(
+            "failed destructive initialization reopened Tomb Raider");
+      }
       auto retry = co_await replication_->StartEmptyPopulationInitialization(
           identity, *manifest);
       if (retry.ok() ||
@@ -1656,6 +1662,13 @@ class EmptyPopulationService final : public bycorf::Service {
         replication_->is_loading() || replication_->reject_writes()) {
       co_return TestFailure(
           "empty population did not publish the source-less ReadyToken");
+    }
+
+    if (!storage_->TombRaiderStats().enabled_ ||
+        !storage_->TombRaiderStats().eligible_) {
+      co_return TestFailure(
+          "complete managed population did not permit Tomb Raider without a "
+          "lease");
     }
 
     // Ready is only a population fact. Before NodeControl installs a finite
@@ -1700,6 +1713,9 @@ class EmptyPopulationService final : public bycorf::Service {
     }
     expiration = co_await replication_->RevokeClusterExpirationAuthority();
     if (!expiration.ok()) co_return expiration;
+    if (!storage_->TombRaiderStats().eligible_) {
+      co_return TestFailure("lease revocation disabled local Tomb Raider");
+    }
     if (storage_->LocalSize(0) != 0) {
       co_return TestFailure(
           "finite expiration lease did not admit queued cleanup");

@@ -1930,15 +1930,10 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       [](auto& entry) { entry.value_->recovery_key_.reset(); });
   worker.SpawnRoot(PeriodicFlush(&store));
   worker.SpawnBackground(ActiveExpiration(&store));
-  if (options_.expiration_authority_) {
-    // One coordinator drives the whole-engine round; worker 0 hosts it.
-    if (worker.id() == 0 &&
-        tomb_raider_config_.mode_.load(std::memory_order_relaxed) !=
-            TombRaiderMode::kOff) {
-      worker.SpawnBackground(TombRaiderLoop(
-          &store,
-          tomb_raider_config_.generation_.load(std::memory_order_relaxed)));
-    }
+  // The scheduler lives until shutdown, including OFF and incomplete FULL.
+  // Startup admission is released only after the server's import barrier.
+  if (worker.id() == 0) {
+    worker.SpawnBackground(TombRaiderLoop(&store));
   }
   co_return absl::OkStatus();
 }
@@ -2242,7 +2237,10 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
   // Join it locally before freezing append streams; doing this through the
   // global QuiesceExpiration helper would make workers submit to and wait on
   // themselves while every periodic flush owns the same shutdown barrier.
-  while (store->expiry_cycle_running_ || store->indirect_key_cleaner_running_) {
+  // Tomb Raider also touches indexes and record accounting across workers;
+  // join its cancellable round before any worker freezes append streams.
+  while (store->expiry_cycle_running_ || store->indirect_key_cleaner_running_ ||
+         tomb_raider_running_.load(std::memory_order_acquire)) {
     absl::Status status = co_await bycorf::SleepFor(
         *store->worker_, std::chrono::milliseconds(1));
     if (!status.ok()) co_return status;

@@ -16,44 +16,80 @@ limitations under the License.
 
 # Tomb Raider scheduling
 
-Tomb Raider retires tombstones that no surviving disk record needs. Exactly
-one of three scheduling modes is active at a time:
+Tomb Raider retires tombstones that no surviving disk record needs. Storage
+keeps one scheduler running on standalone and Meta-managed nodes, including
+replicas. Exactly one of three scheduling modes is configured at a time:
 
 - `TOMBRAIDER OFF` disables future rounds. A round already running completes.
 - `TOMBRAIDER INTERVAL <milliseconds>` runs one round after each interval. The
-  next interval starts only after the previous round completes.
+  next interval starts only after the previous round completes or is cancelled.
+  If the population is unavailable when an interval expires, one round runs
+  when it becomes available again.
 - `TOMBRAIDER DAILY <HH:MM[:SS]>` runs once per day at that time in the
   server's local timezone. If a round overlaps a later scheduled time, that
-  occurrence is skipped rather than run concurrently.
+  occurrence is skipped rather than run concurrently. A scheduled time missed
+  while the population is unavailable is also skipped.
 
 `TOMBRAIDER ON` restores the schedule active before `OFF`.
 `TOMBRAIDER BLOCK-SLEEP <milliseconds>` changes the pause after each scanned
 block and takes effect during the current round. Zero disables the pause.
 `TOMBRAIDER STATUS` reports the mode, interval, block pause, daily time,
-timezone, and whether a round is running.
+timezone, whether a round is running, and its current eligibility and blocking
+reason. Disabled or unavailable schedulers continue checking at most once per
+second; they do not start cleanup work.
 
 Runtime changes are not persisted across restarts. Startup uses
 `--tomb-raider-interval-ms` and `--tomb-raider-sleep-ms`; an interval of zero
 starts in off mode.
 
-## Replication role changes
+## Population availability
 
-The cleanup loop is launched only when the node has expiration authority at
-startup. Startup with Meta seeds withholds that authority, so the loop is not
-launched in that mode. The native FULL path also closes command database
-admission and crosses the storage quiesce boundary before its first destructive
-reset; the callable cluster rebuild adapter reaches that same path.
+Cleanup requires a complete, usable local population. A complete replica can
+clean tombstones while disconnected, and neither a role change nor loss of a
+Meta Owner lease changes its configured schedule. Active expiration, which
+creates logical deletions, retains its separate authority requirements.
 
-On a standalone node, an already launched loop does not recheck authority on
-its own. Runtime `REPLICAOF host port` closes client database admission,
-invokes the internal replica-quiesce API, and waits until the current round has
-forfeited before installing the upstream. Tomb Raider remains OFF if that node
-is later detached with `REPLICAOF NO ONE`; explicitly configure the desired
-schedule when it becomes an expiration authority again. OFF is not persisted
-across restart.
+Startup recovery and imports hold cleanup until the local population is
+complete. Native FULL, Redis FULLRESYNC, and source-less population
+initialization cancel and drain any current round before destructive work.
+Cleanup resumes automatically only after that population change completes,
+including all native flow cuts or all sources in a Redis Cluster import.
+Failed or interrupted rebuilds remain blocked. These transitions never turn
+the user configuration OFF. Shutdown drains cleanup before freezing storage;
+a fatal storage error prevents further rounds.
 
-Storage's replica-quiesce seam can forfeit a running round at a safe checkpoint
-and wait for it to exit. It has no operator command. Standalone role transition
-and native FULL mode use it while command database gates are closed; the
-cluster-managed adapter reuses native FULL rather than maintaining a separate
-maintenance path.
+`FLUSHDB` and `FLUSHALL` may overlap cleanup. Their epoch and index-generation
+changes invalidate the current round, which finishes any committed retirement
+accounting and stops. The next scheduled round starts with a fresh scan. FLUSH
+retains its own detached-index reclamation and SYNC/ASYNC completion semantics.
+Concurrent defrag can also cancel a round when record-block retirement is not
+yet durable or a block changes during its scan. The next scheduled round
+retries automatically; neither cancellation changes the configured schedule.
+
+## Inspecting progress
+
+`TOMBRAIDER STATUS` reports `eligible=1` when the configured schedule is enabled
+and the local population is usable. This does not mean the next scheduled time
+has arrived. `running=1` means a round is currently executing; it can remain one
+after OFF while the round finishes. `INFO stats` exposes the same distinction:
+
+| Field | Meaning |
+|---|---|
+| `tomb_raider_enabled` | The configured scheduling mode is not OFF |
+| `tomb_raider_running` | A cleanup round is executing |
+| `tomb_raider_eligible` | A round may start when its schedule is due |
+| `tomb_raider_blocked_reason` | The current reason a new round cannot start |
+| `tomb_raider_rounds` | Successfully completed rounds; cancelled rounds do not count |
+| `tomb_raider_reaped` | Tombstones actually removed, including progress before a round is cancelled |
+| `tomb_raider_refreshed` | Shielding state actually cleared |
+
+STATUS names the reason `blocked_reason`. Its values are `none`, `user_off`,
+`startup`, `population_change`, `incomplete_population`, `storage_failure`, and
+`shutdown`. `none` means eligibility is open, even when the scheduler is waiting
+for the configured time. Population-related reasons require successful local
+recovery or rebuild completion; running `TOMBRAIDER ON` does not bypass them.
+
+To assess memory reclamation, compare indexed tombstone counts and index
+allocation with the reaped counter. Replication backlog and other storage
+buffers have separate retention rules, so process RSS need not fall with every
+completed round.

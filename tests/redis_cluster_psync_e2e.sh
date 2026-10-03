@@ -148,6 +148,8 @@ for _ in {1..1200}; do
   sleep 0.05
 done
 [[ $("$redis_cli" -p "$lavik_port" ping) == PONG ]]
+[[ $("$redis_cli" -p "$lavik_port" config set tomb-raider-sleep-ms 0) == OK ]]
+[[ $("$redis_cli" -p "$lavik_port" config set tomb-raider-interval-ms 50) == OK ]]
 
 "$redis_cli" -p "$lavik_port" replicaof 127.0.0.1 \
   "${master_ports[0]}" >/dev/null
@@ -159,6 +161,23 @@ grep -q 'slot overlap' <<<"$overlap"
 # No subset of sources may expose a partially imported logical dataset.
 incomplete=$("$redis_cli" -p "$lavik_port" get '{a}baseline' 2>&1)
 grep -q 'LOADING' <<<"$incomplete"
+# Each individual import can finish while the node-wide population remains
+# incomplete. Reclamation must retain the user's schedule without running
+# against the two-source subset, even after both sources finish their RDB.
+for _ in {1..400}; do
+  imported_sources=$(grep -c 'Redis FULLRESYNC completed from' "$case_dir/lavik.log" || true)
+  ((imported_sources >= 2)) && break
+  sleep 0.05
+done
+((imported_sources >= 2))
+maintenance=$("$redis_cli" -p "$lavik_port" info stats | tr -d '\r')
+grep -q '^tomb_raider_enabled:1$' <<<"$maintenance"
+grep -q '^tomb_raider_eligible:0$' <<<"$maintenance"
+grep -q '^tomb_raider_blocked_reason:population_change$' <<<"$maintenance"
+incomplete_rounds=$(sed -n 's/^tomb_raider_rounds://p' <<<"$maintenance")
+sleep 0.2
+maintenance=$("$redis_cli" -p "$lavik_port" info stats | tr -d '\r')
+[[ $(sed -n 's/^tomb_raider_rounds://p' <<<"$maintenance") == "$incomplete_rounds" ]]
 "$redis_cli" -p "$lavik_port" addreplicaof 127.0.0.1 \
   "${master_ports[2]}" >/dev/null
 
@@ -182,6 +201,15 @@ done
 info=$("$redis_cli" -p "$lavik_port" info replication | tr -d '\r')
 grep -q '^lavik_redis_sources:3$' <<<"$info"
 grep -q '^master_link_status:up$' <<<"$info"
+for _ in {1..200}; do
+  maintenance=$("$redis_cli" -p "$lavik_port" info stats | tr -d '\r')
+  completed_rounds=$(sed -n 's/^tomb_raider_rounds://p' <<<"$maintenance")
+  ((completed_rounds > incomplete_rounds)) && break
+  sleep 0.05
+done
+grep -q '^tomb_raider_enabled:1$' <<<"$maintenance"
+grep -q '^tomb_raider_eligible:1$' <<<"$maintenance"
+((completed_rounds > incomplete_rounds))
 
 [[ $("$redis_cli" -p "$lavik_port" get '{a}baseline') == one ]]
 [[ $("$redis_cli" -p "$lavik_port" get '{b}baseline') == two ]]

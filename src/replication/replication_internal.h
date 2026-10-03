@@ -1138,7 +1138,8 @@ struct ReplicaSession {
   // Flow coroutines are detached onto their owner workers. Track their whole
   // lifetime, including connect/handshake and storage apply, so a failed
   // session cannot start a replacement while old flows are still mutating
-  // replica storage or holding network buffers.
+  // replica storage or holding network buffers. The control handshake also
+  // participates while admitting a destructive FULL before flows exist.
   std::atomic<unsigned> active_flows_{0};
   std::atomic<unsigned> active_transaction_applies_{0};
   std::atomic<unsigned> connected_flows_{0};
@@ -1146,6 +1147,9 @@ struct ReplicaSession {
   // false value therefore proves that retrying a lease-gate response cannot
   // conceal an uncertain in-place root mutation.
   std::atomic<bool> destructive_root_started_{false};
+  // Captured by storage on worker zero before durable FULL admission. The
+  // generation distinguishes source-local wire session IDs reused later.
+  storage::TombRaiderPopulationToken tomb_raider_population_token_;
   SocketSet sockets_;
   std::atomic<bool> cancelled_{false};
   std::vector<std::unique_ptr<ReplicaTransactionOwner>> transaction_owners_;
@@ -2895,6 +2899,7 @@ class ReplicationManager::ReplicationGroup {
   // session is owned by worker zero; the allocator is boot-scoped so a
   // restarted process cannot mistake an old durable fence for its attempt.
   std::uint64_t redis_full_sync_session_id_ = 0;
+  storage::TombRaiderPopulationToken redis_full_sync_population_token_;
   std::atomic<std::uint64_t> next_redis_full_sync_session_id_{1};
   std::atomic<bool> native_dataset_valid_{false};
   std::atomic<bool> failed_stopped_{false};

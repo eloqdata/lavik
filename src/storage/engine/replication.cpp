@@ -1455,6 +1455,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
       old_keys.push_back(OldKey{.db_id_ = db_id, .key_ = std::move(*key)});
     }
   }
+  tomb_raider_index_generation_.fetch_add(1, std::memory_order_release);
   partition.replication_epoch_ = next_epoch;
   partition.mutation_sequence_ = 0;
   for (auto& [session_id, capture] : partition.fullsync_subscribers_) {
@@ -1594,6 +1595,7 @@ StorageEngine::Impl::ResetReplicaPartitions(
   }
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
     ++store.index_generations_[db_id];
+    tomb_raider_index_generation_.fetch_add(1, std::memory_order_release);
     tx::CurrentTxShard().MarkAllWatched(db_id);
   }
   replica_loading_.store(true, std::memory_order_release);
@@ -1694,6 +1696,7 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
   }
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
     ++store.index_generations_[db_id];
+    tomb_raider_index_generation_.fetch_add(1, std::memory_order_release);
     tx::CurrentTxShard().MarkAllWatched(db_id);
   }
   EnsureDetachedReclaim(store);
@@ -2410,6 +2413,8 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
         if (discarded_any) {
           for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
             ++store.index_generations_[db_id];
+            tomb_raider_index_generation_.fetch_add(1,
+                                                    std::memory_order_release);
             tx::CurrentTxShard().MarkAllWatched(db_id);
           }
         }
@@ -2427,6 +2432,13 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
       discarded = co_await bycorf::SubmitTaskTo(target, discard);
     }
     if (!discarded.ok()) co_return discarded;
+  }
+  // Replication joins this session's mutators before aborting its root, so
+  // its active binding still owns this resource handoff.
+  const auto hold = tomb_raider_population_changes_.find(session_id);
+  if (hold != tomb_raider_population_changes_.end()) {
+    co_return co_await CancelTombRaiderPopulationChange(
+        TombRaiderPopulationToken{session_id, hold->second});
   }
   co_return absl::OkStatus();
 }

@@ -204,6 +204,116 @@ def ready(meta):
     C.wait_cluster_ready(meta, "native population and authority ready", 90)
 
 
+def tomb_raider(root):
+    def info(node, section="stats"):
+        probe = Client(node)
+        try:
+            return dict(
+                line.split(":", 1)
+                for line in probe.call("INFO", section).splitlines()
+                if ":" in line
+            )
+        finally:
+            probe.close()
+
+    with pair(root, "tomb-raider") as (meta, source, target, writer):
+        ready(meta)
+        H.wait_until(
+            "complete native follower",
+            30,
+            lambda: info(target, "replication").get("master_link_status") == "up",
+        )
+        reader = Client(target, readonly=True)
+        keys = [f"{{native}}tomb-raider-{index}" for index in range(24)]
+        try:
+            for client in (writer, reader):
+                assert client.call("CONFIG", "SET", "tomb-raider-mode", "off") == "OK"
+                assert client.call("CONFIG", "SET", "tomb-raider-sleep-ms", 0) == "OK"
+                assert client.call("DEFRAG", "PAUSE") == "OK"
+            before_source = int(info(source)["tomb_raider_reaped"])
+            before_target = int(info(target)["tomb_raider_reaped"])
+            for key in keys:
+                assert writer.call("SET", key, "buried-value", "PX", 6000) == "OK"
+            assert writer.call("WAIT", 1, 5000) == 1
+            assert reader.call("MGET", *keys) == ["buried-value"] * len(keys)
+            assert writer.call("DEL", *keys) == len(keys)
+            assert writer.call("WAIT", 1, 5000) == 1
+            assert reader.call("EXISTS", *keys) == 0
+            assert writer.call("CONFIG", "SET", "tomb-raider-interval-ms", 20) == "OK"
+            H.wait_until(
+                "managed Owner physically reaps expired buried values",
+                20,
+                lambda: int(info(source)["tomb_raider_reaped"])
+                >= before_source + len(keys),
+            )
+            assert int(info(target)["tomb_raider_reaped"]) == before_target
+        finally:
+            reader.close()
+
+        # Keep Meta from electing a different Owner while isolating the complete
+        # follower. No live source transport or serving lease is needed for its
+        # local reclamation proof. Fresh INFO clients survive serving retirement.
+        meta.pause()
+        try:
+            assert writer.call("CLIENT", "KILL", "TYPE", "replica") > 0
+            source.pause()
+            try:
+                H.wait_until(
+                    "complete follower disconnected",
+                    10,
+                    lambda: info(target, "replication").get("master_link_status")
+                    == "down",
+                )
+                probe = Client(target)
+                try:
+                    assert (
+                        probe.call("CONFIG", "SET", "tomb-raider-interval-ms", 20)
+                        == "OK"
+                    )
+                finally:
+                    probe.close()
+                H.wait_until(
+                    "disconnected managed follower physically reaps",
+                    20,
+                    lambda: int(info(target)["tomb_raider_reaped"])
+                    >= before_target + len(keys),
+                )
+                assert info(target)["tomb_raider_eligible"] == "1"
+            finally:
+                source.resume()
+            H.wait_until(
+                "Owner serving lease expired",
+                10,
+                lambda: source.command_head(["SET", "{native}lease-probe", "x"]).split(
+                    " ", 1
+                )[0]
+                in ("-LOADING", "-CLUSTERDOWN"),
+            )
+            source_round = int(info(source)["tomb_raider_rounds"])
+            H.wait_until(
+                "physical maintenance continues without Owner authority",
+                10,
+                lambda: int(info(source)["tomb_raider_rounds"]) > source_round,
+            )
+            assert info(source)["tomb_raider_eligible"] == "1"
+        finally:
+            meta.resume()
+        ready(meta)
+        H.wait_until(
+            "native follower reconnected after reclamation",
+            30,
+            lambda: info(target, "replication").get("master_link_status") == "up",
+        )
+        for node in (source, target):
+            probe = Client(node, readonly=node == target)
+            try:
+                assert probe.call("EXISTS", *keys) == 0
+                assert probe.call("GET", "{native}seed") == "baseline"
+                assert info(node)["tomb_raider_enabled"] == "1"
+            finally:
+                probe.close()
+
+
 def full_session_lifecycle(root):
     # A session owns one FULL across unequal source/target worker layouts.
     # Source work can outlive its control connection, while a completed FULL
@@ -1996,6 +2106,11 @@ def main():
         prefix="lavik-meta-native-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
     ) as directory:
         root = Path(directory)
+        if len(sys.argv) > 5:
+            assert sys.argv[5:] == ["tomb_raider"], sys.argv[5:]
+            tomb_raider(root)
+            H.log("PASS")
+            return
         grouped_streams(root)
         replay_and_reconnect(root)
         replica_backup_during_exec(root)

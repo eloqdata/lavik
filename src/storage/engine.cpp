@@ -97,8 +97,8 @@ absl::StatusOr<PopulationToken> StorageEngine::RecoverPopulationToken() const {
 }
 
 Task<absl::Status> StorageEngine::BeginReplicaFullSync(
-    std::uint64_t session_id) {
-  return impl_->BeginReplicaFullSync(session_id);
+    std::uint64_t session_id, TombRaiderPopulationToken* maintenance_token) {
+  return impl_->BeginReplicaFullSync(session_id, maintenance_token);
 }
 
 Task<absl::Status> StorageEngine::CompleteReplicaFullSync(

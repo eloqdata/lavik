@@ -1119,8 +1119,20 @@ Task<absl::Status> StorageEngine::Impl::ReleaseEmptyBlock(
   // write failure fail-stops the allocator, so this block cannot be reused
   // in the ambiguous state.
   const auto allocation_epoch = source.allocation_epoch_;
-  DestroyBlockState(store, block_id);
-  absl::Status returned = co_await ReturnColdBlocks({block_id});
+  absl::Status returned;
+  {
+    const bool record_block = source.kind_ == BlockKind::kRecords;
+    if (record_block) ++store.pending_record_block_retirements_;
+    struct RetirementGuard {
+      WorkerStore& store_;
+      bool record_block_;
+      ~RetirementGuard() {
+        if (record_block_) --store_.pending_record_block_retirements_;
+      }
+    } retirement{store, record_block};
+    DestroyBlockState(store, block_id);
+    returned = co_await ReturnColdBlocks({block_id});
+  }
   if (returned.ok()) {
     // The source's cleared allocation bit is now durable while its stale
     // records are still on disk — the exact window the relocation durability
