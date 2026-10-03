@@ -4050,6 +4050,7 @@ class StorageEngine::Impl {
     kAfterReapKeyLoad,
     kBeforeReapLock,
     kAfterSweepRead,
+    kBeforeRetirementWait,
   };
   using TombRaiderTestHook =
       std::function<Task<absl::Status>(TombRaiderTestPoint)>;

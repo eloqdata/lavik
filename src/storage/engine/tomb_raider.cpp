@@ -559,6 +559,13 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
   // marks. No worker-local state changes between the final check and the walk.
   while (store.pending_record_block_retirements_ != 0) {
     if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
+#if LAVIK_FAULTS_ENABLED
+    if (tomb_raider_test_hook_) {
+      auto status = co_await tomb_raider_test_hook_(
+          TombRaiderTestPoint::kBeforeRetirementWait);
+      if (!status.ok()) co_return status;
+    }
+#endif
     auto waited =
         co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
     if (!waited.ok()) co_return waited;
@@ -603,6 +610,13 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       } else if (store.pending_record_block_retirements_ == 0) {
         co_return false;
       }
+#if LAVIK_FAULTS_ENABLED
+      if (tomb_raider_test_hook_) {
+        auto status = co_await tomb_raider_test_hook_(
+            TombRaiderTestPoint::kBeforeRetirementWait);
+        if (!status.ok()) co_return status;
+      }
+#endif
       auto waited = co_await bycorf::SleepFor(*store.worker_,
                                               std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;

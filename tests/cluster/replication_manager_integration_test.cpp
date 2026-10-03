@@ -1625,8 +1625,7 @@ class EmptyPopulationService final : public bycorf::Service {
         co_return TestFailure(
             "failed empty population did not retain its serving fence");
       }
-      if (storage_->ReplicaRecoveryFenced() &&
-          storage_->TombRaiderStats().eligible_) {
+      if (storage_->TombRaiderStats().eligible_) {
         co_return TestFailure(
             "failed destructive initialization reopened Tomb Raider");
       }

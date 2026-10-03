@@ -238,21 +238,22 @@ class TombRaiderTestPeer {
                             store.pending_record_block_retirements_ != 0))
           status = absl::FailedPreconditionError(
               "reader pin did not hold the freeing window");
-      } else if (scenario == RetirementScenario::kAfterRead ||
-                 scenario == RetirementScenario::kPrefixClaim) {
-        read_count = 0;
-        SetHook(storage, [&](Point point) -> bycorf::Task<absl::Status> {
-          if ((scenario == RetirementScenario::kAfterRead &&
-               point == Point::kAfterSweepRead &&
-               ++read_count == source_read) ||
-              (scenario == RetirementScenario::kPrefixClaim &&
-               point == Point::kAfterClaimLookup))
-            co_return begin_retirement();
-          co_return absl::OkStatus();
-        });
-      } else {
+      } else if (scenario != RetirementScenario::kAfterRead &&
+                 scenario != RetirementScenario::kPrefixClaim) {
         status = begin_retirement();
       }
+      read_count = 0;
+      bool retirement_wait_reached = false;
+      SetHook(storage, [&](Point point) -> bycorf::Task<absl::Status> {
+        if (point == Point::kBeforeRetirementWait)
+          retirement_wait_reached = true;
+        if ((scenario == RetirementScenario::kAfterRead &&
+             point == Point::kAfterSweepRead && ++read_count == source_read) ||
+            (scenario == RetirementScenario::kPrefixClaim &&
+             point == Point::kAfterClaimLookup))
+          co_return begin_retirement();
+        co_return absl::OkStatus();
+      });
 
       const auto before = storage.TombRaiderStats();
       std::optional<bycorf::Task<absl::Status>> round;
@@ -269,17 +270,16 @@ class TombRaiderTestPeer {
         handle.resume();
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (!retirement.has_value() && !round->done() &&
-               std::chrono::steady_clock::now() < deadline)
-          (co_await bycorf::SleepFor(worker, std::chrono::milliseconds(1)))
-              .IgnoreError();
-        // This yield lets the sweep reach its real wait. A premature abort is
-        // observable as task completion even though its totals stayed fixed.
-        status =
-            co_await bycorf::SleepFor(worker, std::chrono::milliseconds(20));
+        // Observe the actual sweep wait while the allocator mutex remains
+        // locked, including waits before the block snapshot and for pins.
+        while (status.ok() && !retirement_wait_reached && !round->done() &&
+               std::chrono::steady_clock::now() < deadline) {
+          status =
+              co_await bycorf::SleepFor(worker, std::chrono::milliseconds(1));
+        }
         if (status.ok() &&
-            (!retirement.has_value() || round->done() ||
-             !storage.TombRaiderStats().running_ ||
+            (!retirement_wait_reached || !retirement.has_value() ||
+             round->done() || !storage.TombRaiderStats().running_ ||
              storage.TombRaiderStats().rounds_ != before.rounds_ ||
              storage.TombRaiderStats().reaped_ != before.reaped_))
           status = absl::FailedPreconditionError(
