@@ -90,6 +90,22 @@ TEST(HashGroupEdits, OrderedDuplicatesOwnTheirBytesAndKeepWireFormat) {
   EXPECT_EQ(actual["new"], "b");
   EXPECT_EQ(actual[""], "empty field");
   EXPECT_EQ(*encoded, *EncodeHashGroup(*decoded));
+  // Prepared bytes include the envelope and can be borrowed by an inline
+  // writer. A different identity must not reuse that certified envelope.
+  EXPECT_EQ(leaf.prepared_->record_payload(), *encoded);
+  EXPECT_EQ(leaf.prepared_->bytes(),
+            std::string_view(*encoded).substr(kHashGroupHeaderBytes));
+  EXPECT_TRUE(DecodeHashValue(leaf.prepared_->bytes()).ok());
+  auto cursor = HashGroupEncoder::Create(leaf);
+  ASSERT_TRUE(cursor.ok());
+  auto part = cursor->Next();
+  ASSERT_TRUE(part.has_value());
+  EXPECT_EQ(part->data(), leaf.prepared_->record_payload().data());
+  EXPECT_EQ(part->size(), cursor->encoded_bytes());
+  EXPECT_FALSE(cursor->Next());
+  ++leaf.incarnation_;
+  EXPECT_FALSE(HashGroupEncoder::Create(leaf).ok());
+  --leaf.incarnation_;
   leaf.id_ = {0, 1};
   EXPECT_FALSE(HashGroupEncoder::Create(leaf).ok());
 }
@@ -126,6 +142,8 @@ TEST(HashGroupEdits, NxNoopsRepeatedRemovalAndEmptyLeaf) {
   auto empty = EncodeHashGroup(removed->leaves_[0]);
   ASSERT_TRUE(empty.ok());
   EXPECT_EQ(empty->size(), kHashGroupHeaderBytes);
+  EXPECT_EQ(removed->leaves_[0].prepared_->record_payload(), *empty);
+  EXPECT_TRUE(removed->leaves_[0].prepared_->bytes().empty());
   EXPECT_TRUE(DecodeHashGroup(*empty).ok());
 }
 

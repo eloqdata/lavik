@@ -41,11 +41,25 @@ std::uint64_t Mask(unsigned bits) noexcept {
                    : std::numeric_limits<std::uint64_t>::max() << (64 - bits);
 }
 
-void Store(std::string& bytes, std::size_t offset, std::uint64_t value,
+void Store(std::span<char> bytes, std::size_t offset, std::uint64_t value,
            unsigned width) {
   for (unsigned i = 0; i < width; ++i) {
     bytes[offset + i] = static_cast<char>(value >> (i * 8));
   }
+}
+
+void EncodeGroupHeader(std::span<char> bytes, const HashGroupSnapshot& group,
+                       std::uint32_t count, std::size_t payload_bytes) {
+  Store(bytes, 0, kGroupMagic, 8);
+  Store(bytes, 8, kVersion, 4);
+  Store(bytes, 12, kGroupHeaderBytes, 4);
+  Store(bytes, 16, group.incarnation_, 8);
+  Store(bytes, 24, group.id_.prefix_, 8);
+  Store(bytes, 32, count, 4);
+  Store(bytes, 36, payload_bytes, 4);
+  Store(bytes, 40, group.id_.bits_, 1);
+  Store(bytes, 41, group.retired_, 1);
+  Store(bytes, 42, 0, 6);  // Reserved wire bytes, even in uninitialized output.
 }
 
 template <std::size_t N>
@@ -163,29 +177,24 @@ absl::StatusOr<HashGroupEncoder> HashGroupEncoder::Create(
     const HashGroupSnapshot& group) {
   if (group.prepared_ &&
       (group.incarnation_ == 0 || group.retired_ ||
+       group.incarnation_ != group.prepared_->incarnation() ||
        group.id_ != group.prepared_->id() || !group.value_.entries_.empty()))
     return absl::InvalidArgumentError("invalid prepared Hash group");
   if (!group.prepared_) {
     auto valid = ValidateFields(group, nullptr);
     if (!valid.ok()) return valid;
   }
-  auto size = group.prepared_
-                  ? absl::StatusOr<std::size_t>(group.prepared_->bytes().size())
-                  : PayloadBytes(group.value_);
-  if (!size.ok()) return size.status();
   HashGroupEncoder cursor;
   cursor.group_ = &group;
+  if (group.prepared_) {
+    cursor.encoded_bytes_ = group.prepared_->record_payload().size();
+    return cursor;
+  }
+  auto size = PayloadBytes(group.value_);
+  if (!size.ok()) return size.status();
   cursor.encoded_bytes_ = kGroupHeaderBytes + *size;
   auto& bytes = cursor.header_;
-  Store(bytes, 0, kGroupMagic, 8);
-  Store(bytes, 8, kVersion, 4);
-  Store(bytes, 12, kGroupHeaderBytes, 4);
-  Store(bytes, 16, group.incarnation_, 8);
-  Store(bytes, 24, group.id_.prefix_, 8);
-  Store(bytes, 32, group.field_count(), 4);
-  Store(bytes, 36, *size, 4);
-  Store(bytes, 40, group.id_.bits_, 1);
-  Store(bytes, 41, group.retired_, 1);
+  EncodeGroupHeader(bytes, group, group.field_count(), *size);
   if (!group.value_.entries_.empty()) {
     Store(bytes, 48, kHashValueMagic, 8);
     Store(bytes, 56, kStorageFormatVersion, 4);
@@ -201,12 +210,7 @@ std::optional<std::string_view> HashGroupEncoder::Next() noexcept {
   if (group_->prepared_) {
     if (phase_ == 0) {
       phase_ = 1;
-      return std::string_view(header_.data(), kGroupHeaderBytes);
-    }
-    if (phase_ == 1) {
-      phase_ = 2;
-      if (!group_->prepared_->bytes().empty())
-        return group_->prepared_->bytes();
+      return group_->prepared_->record_payload();
     }
     return std::nullopt;
   }
@@ -385,35 +389,42 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
   if (bytes <= kCollectionGroupTargetBytes) {
     // All views still borrow the read lease or immutable request. Copy each
     // surviving byte once, then discard the index and lease before publication.
-    std::string encoded(bytes, '\0');
-    if (count != 0) {
-      Store(encoded, 0, kHashValueMagic, 8);
-      Store(encoded, 8, kStorageFormatVersion, 4);
-      Store(encoded, 12, kCompactHeaderBytes, 4);
-      Store(encoded, 16, count, 4);
-      Store(encoded, 24, bytes, 8);
+    std::string encoded;
+    const auto encoded_bytes = kGroupHeaderBytes + bytes;
+    encoded.resize_and_overwrite(encoded_bytes, [&](char* output,
+                                                    std::size_t) noexcept {
+      EncodeGroupHeader({output, kGroupHeaderBytes}, replacement, count, bytes);
+      if (count == 0) return encoded_bytes;
+      std::span<char> compact(output + kGroupHeaderBytes, bytes);
+      Store(compact, 0, kHashValueMagic, 8);
+      Store(compact, 8, kStorageFormatVersion, 4);
+      Store(compact, 12, kCompactHeaderBytes, 4);
+      Store(compact, 16, count, 4);
+      Store(compact, 20, 0, 4);
+      Store(compact, 24, bytes, 8);
       std::size_t offset = kCompactHeaderBytes;
       for (const auto& entry : entries) {
         if (entry.removed) continue;
         const auto& view = entry.view;
-        Store(encoded, offset, view.field_.size(), 4);
-        Store(encoded, offset + 4, view.value_.size(), 4);
+        Store(compact, offset, view.field_.size(), 4);
+        Store(compact, offset + 4, view.value_.size(), 4);
         offset += 8;
         // The destination was sized once above and cannot alias these views
         // of the read lease/request. Copy bytes directly; Set values are empty
         // and need no string mutation (or a zero-length copy from nullptr).
         if (!view.field_.empty())
-          std::memcpy(encoded.data() + offset, view.field_.data(),
+          std::memcpy(compact.data() + offset, view.field_.data(),
                       view.field_.size());
         offset += view.field_.size();
         if (!view.value_.empty())
-          std::memcpy(encoded.data() + offset, view.value_.data(),
+          std::memcpy(compact.data() + offset, view.value_.data(),
                       view.value_.size());
         offset += view.value_.size();
       }
-    }
-    replacement.prepared_ =
-        PreparedHashGroupPayload(std::move(encoded), count, metadata->id_);
+      return encoded_bytes;
+    });
+    replacement.prepared_ = PreparedHashGroupPayload(
+        std::move(encoded), count, metadata->id_, metadata->incarnation_);
     result.leaves_.push_back(std::move(replacement));
   } else {
     // Never construct a full serialized copy of an indivisible large value.
