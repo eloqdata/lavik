@@ -1141,9 +1141,22 @@ struct StreamRangeReplyState {
                                    : value <= range_.last_);
   }
   Task<absl::StatusOr<std::string>> Next() {
+    if (done_) co_return std::string{};
     std::string chunk;
     for (;;) {
       if (offset_ < pending_.size()) {
+        if (remaining_ == 0 && offset_ == 0 && chunk.empty() &&
+            pending_.size() <= kChunkBytes) {
+          // A complete final message needs no coalescing buffer. Keep its
+          // existing entry/compact-state charge until this producer dies:
+          // a composing producer can ask for EOF while still owning the
+          // returned string. Oversized or partially emitted messages keep
+          // the bounded chunk path below.
+          done_ = true;
+          page_.reset();
+          reader_ = {};
+          co_return std::move(pending_);
+        }
         if (chunk_limit_ == 0) {
           // Coalesce small messages so each does not require a separate
           // socket write. Single small results keep a proportionate buffer.
@@ -1171,7 +1184,7 @@ struct StreamRangeReplyState {
       pending_ = std::string{};
       offset_ = 0;
       entry_charge_.Reset();
-      if (remaining_ == 0 || done_) {
+      if (remaining_ == 0) {
         page_.reset();
         reader_ = {};
         co_return chunk;

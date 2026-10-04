@@ -597,6 +597,16 @@ TEST(GroupedStreamE2e, RangeRepliesPreserveMixedSizeBinaryRecords) {
         client.Command({"XREVRANGE", "s", "400-0", "(198-0", "COUNT", "202"});
     ASSERT_EQ(reverse.items_.size(), 202) << reverse.text_;
     for (unsigned i = 0; i < 202; ++i) check(reverse.items_[i], 400 - i);
+    // One-message replies exercise both direct ownership handoff and the
+    // oversized-message chunk cursor, with binary fields in either direction.
+    for (unsigned i : {1u, 257u, count}) {
+      const auto id = std::to_string(i) + "-0";
+      for (const auto* command : {"XRANGE", "XREVRANGE"}) {
+        auto point = client.Command({command, "s", id, id, "COUNT", "1"});
+        ASSERT_EQ(point.items_.size(), 1) << point.text_;
+        check(point.items_[0], i);
+      }
+    }
   }
   ASSERT_EQ(client.Command({"XGROUP", "CREATE", "s", "g", "0"}).text_, "OK");
   for (bool history : {false, true}) {
@@ -612,6 +622,12 @@ TEST(GroupedStreamE2e, RangeRepliesPreserveMixedSizeBinaryRecords) {
     for (unsigned i = 1; i <= count; ++i)
       check(entries[i - 1], i, history && (i == 1 || i == 257 || i == 512));
   }
+  auto missing = client.Command(
+      {"XREADGROUP", "GROUP", "g", "c", "COUNT", "1", "STREAMS", "s", "0"});
+  ASSERT_EQ(missing.items_.size(), 1) << missing.text_;
+  const auto& entries = missing.items_[0].items_[1].items_;
+  ASSERT_EQ(entries.size(), 1);
+  check(entries[0], 1, true);
 }
 
 TEST(GroupedStreamE2e, LargeRepliesKeepSnapshotsAndDeletedHistory) {
