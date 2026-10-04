@@ -154,7 +154,7 @@ class SentinelTest(unittest.TestCase):
 
     def wait_for_discovery_authority(self, node):
         # Raft leadership precedes current-term application and the runtime's
-        # authority eligibility. Subscriptions deliberately disconnect during
+        # authority eligibility. Discovery and subscriptions disconnect during
         # that gap; protocol tests must start after the authority is published.
         def ready():
             state = node.status()
@@ -224,7 +224,7 @@ class SentinelTest(unittest.TestCase):
             # Discovery exchanges carry committed topology claims, so Lavik
             # answers them only on a caught-up leader; replay them there.
             leader, leader_port = self.node(password=password, bootstrap=True)
-            H.wait_until("Meta leader", 5, leader.is_leader)
+            self.wait_for_discovery_authority(leader)
             sentinel_compat.check_discovery_port(self, leader_port, password)
             leader.terminate()
 
@@ -379,7 +379,7 @@ class SentinelTest(unittest.TestCase):
     def test_discovery_null_contract_on_bootstrap_leader(self):
         leader, leader_port = self.node(bootstrap=True)
         follower, follower_port = self.node()
-        H.wait_until("Meta leader", 5, leader.is_leader)
+        self.wait_for_discovery_authority(leader)
         self.assertFalse(follower.is_leader())
         client = self.client(leader_port)
         self.assertEqual(client.command("AUTH", "sentinel-secret"), b"OK")
