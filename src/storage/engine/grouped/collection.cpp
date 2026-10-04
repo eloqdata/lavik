@@ -43,6 +43,54 @@ void BuildStreamRanks(std::vector<std::uint64_t>& counts) {
   }
 }
 
+// Update existing Fenwick cells after a checked count change. Appended cells
+// can already include those deltas; existing_size bounds propagation in that
+// case so the new tail is not adjusted twice.
+absl::Status UpdateStreamRanks(
+    GroupedMetadataArray<std::uint64_t, 256>& ends,
+    std::span<const std::pair<std::size_t, absl::int128>> count_changes,
+    std::uint64_t item_count, std::size_t existing_size) {
+  using RankChange = std::pair<std::size_t, absl::int128>;
+  absl::InlinedVector<RankChange, 32> rank_changes;
+  const auto changed_counts =
+      std::count_if(count_changes.begin(), count_changes.end(),
+                    [](const auto& change) { return change.second != 0; });
+  if (changed_counts == 0) return absl::OkStatus();
+  const auto updates = changed_counts * (std::bit_width(existing_size) + 1);
+  // Reserve the complete temporary update list before allocating it.
+  // Changed page identities are unique and bounded by the 32-bit root
+  // page count, so this product fits size_t on supported 64-bit targets.
+  auto admission = TryReserveMemory(
+      AllocatorUsableSizeForRequest(updates * sizeof(RankChange) + 1024));
+  if (!admission) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM Stream rank update scratch");
+  }
+  rank_changes.reserve(updates);
+  for (const auto& [index, delta] : count_changes) {
+    if (delta == 0) continue;
+    for (std::size_t i = index + 1; i <= existing_size; i += i & (~i + 1))
+      rank_changes.emplace_back(i - 1, delta);
+  }
+  std::sort(rank_changes.begin(), rank_changes.end());
+  // Combine changes before setting a partial sum: a valid batch may add
+  // and remove counts from the same subtree in either command order.
+  for (std::size_t i = 0; i < rank_changes.size();) {
+    const auto index = rank_changes[i].first;
+    absl::int128 delta = 0;
+    do {
+      delta += rank_changes[i++].second;
+    } while (i < rank_changes.size() && rank_changes[i].first == index);
+    if (delta == 0) continue;
+    const auto value = absl::int128(ends[index]) + delta;
+    if (value < 0 || value > item_count)
+      return absl::DataLossError("invalid Stream updated rank sum");
+    auto status = ends.Set(index, static_cast<std::uint64_t>(value));
+    if (!status.ok()) return status;
+  }
+  return absl::OkStatus();
+}
+
 constexpr std::string_view kRootMagic = "LOCROOT1";
 constexpr std::string_view kGroupMagic = "LOCGRUP1";
 constexpr std::size_t kRootBytes = kOrderedCollectionRootBytes;
@@ -881,7 +929,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
 
   // Most writes replace a few pages without changing their order or links.
   // Share unchanged metadata and detach only changed chunks. Structural edits
-  // still require complete-chain validation below.
+  // validate changed links or reconstruct the chain below.
   bool same_topology = root.group_count_ == groups_.size() &&
                        root.first_group_ == root_.first_group_ &&
                        root.last_group_ == root_.last_group_ &&
@@ -955,45 +1003,9 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
         return absl::DataLossError("unordered updated Sorted Set score bounds");
     }
     if (root.kind_ == OrderedCollectionKind::kStream) {
-      using RankChange = std::pair<std::size_t, absl::int128>;
-      absl::InlinedVector<RankChange, 32> rank_changes;
-      const auto changed_counts =
-          std::count_if(count_changes.begin(), count_changes.end(),
-                        [](const auto& change) { return change.second != 0; });
-      if (changed_counts == 0) return result;
-      const auto updates = changed_counts * (std::bit_width(ends_.size()) + 1);
-      // Reserve the complete temporary update list before allocating it.
-      // Changed page identities are unique and bounded by the 32-bit root
-      // page count, so this product fits size_t on supported 64-bit targets.
-      auto admission = TryReserveMemory(
-          AllocatorUsableSizeForRequest(updates * sizeof(RankChange) + 1024));
-      if (!admission) {
-        RecordMemoryRejection();
-        return absl::ResourceExhaustedError("OOM Stream rank update scratch");
-      }
-      rank_changes.reserve(updates);
-      for (const auto& [index, delta] : count_changes) {
-        if (delta == 0) continue;
-        for (std::size_t i = index + 1; i <= ends_.size(); i += i & (~i + 1))
-          rank_changes.emplace_back(i - 1, delta);
-      }
-      std::sort(rank_changes.begin(), rank_changes.end());
-      // Combine changes before setting a partial sum: a valid batch may add
-      // and remove counts from the same subtree in either command order.
-      for (std::size_t i = 0; i < rank_changes.size();) {
-        const auto index = rank_changes[i].first;
-        absl::int128 delta = 0;
-        do {
-          delta += rank_changes[i++].second;
-        } while (i < rank_changes.size() && rank_changes[i].first == index);
-        if (delta == 0) continue;
-        const auto value = absl::int128(ends_[index]) + delta;
-        if (value < 0 || value > root.item_count_)
-          return absl::DataLossError("invalid Stream updated rank sum");
-        auto status =
-            result.ends_.Set(index, static_cast<std::uint64_t>(value));
-        if (!status.ok()) return status;
-      }
+      auto status = UpdateStreamRanks(result.ends_, count_changes,
+                                      root.item_count_, ends_.size());
+      if (!status.ok()) return status;
       return result;
     }
     // Count-neutral replacements share all rank metadata. A redistribution
@@ -1030,8 +1042,8 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
   // Foreground updates contain one decided replacement per changed identity.
   // The predecessor has already selected and validated all other winners.
   // Do not rebuild recovery's candidate hash map (or copy every record into
-  // it) just to select those same winners again. Walk the resulting chain
-  // against the small replacement map, checking its complete connectivity.
+  // it) just to select those same winners again. Check replacements against
+  // that adjudicated chain before choosing incremental or full validation.
   if (!ValidRoot(root) || (root.revision_ != 0 && root.revision_ != revision))
     return absl::DataLossError("invalid ordered structural root");
   absl::flat_hash_map<std::uint64_t, const RecoveredOrderedGroup*> replacements;
@@ -1061,6 +1073,116 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
   rebuilt.sequence_ = revision;
   rebuilt.command_sequence_ = command_sequence;
   rebuilt.members_ = std::move(members);
+  // Stream tail splits preserve every old ordinal. The predecessor already
+  // proved the old chain; unchanged links cannot introduce a cycle or orphan.
+  // Check the old/new seam and every inserted link, then share the old arrays.
+  // Limit this path to the small command batch so its temporary lists stay
+  // inline; bulk rewrites retain the general admitted reconstruction below.
+  if (root.kind_ == OrderedCollectionKind::kStream && changed.size() <= 8 &&
+      new_retired.empty() && root.first_group_ == root_.first_group_ &&
+      root.group_count_ > groups_.size()) {
+    absl::InlinedVector<const RecoveredOrderedGroup*, 8> appended;
+    absl::InlinedVector<std::pair<std::size_t, absl::int128>, 8> count_changes;
+    bool append_only = true;
+    absl::int128 old_count = root_.item_count_;
+    absl::int128 bytes = total_group_bytes_;
+    for (const auto& item : changed) {
+      const auto index = FindIndex(item.id_);
+      if (index) {
+        const auto& old = groups_[*index];
+        append_only &=
+            item.previous_ == old.previous_ &&
+            (*index + 1 == groups_.size() || item.next_ == old.next_);
+        const auto delta = absl::int128(item.item_count_) - old.item_count_;
+        count_changes.emplace_back(*index, delta);
+        old_count += delta;
+        bytes += absl::int128(item.encoded_bytes_) - old.encoded_bytes_;
+      } else {
+        // Fresh ids sort after every existing live or retired identity. This
+        // permits a persistent identity-index append without a whole-index
+        // sort.
+        append_only &= item.id_ >= root_.next_group_id_;
+        appended.push_back(&item);
+        bytes += item.encoded_bytes_;
+      }
+    }
+    std::sort(appended.begin(), appended.end(),
+              [](const auto* a, const auto* b) { return a->id_ < b->id_; });
+    const auto tail = replacements.find(root_.last_group_);
+    append_only &= !appended.empty() &&
+                   groups_.size() + appended.size() == root.group_count_;
+    // New identities need not follow logical order in general. Only use
+    // persistent appends when their sorted order is also their chain order.
+    for (std::size_t i = 0; append_only && i < appended.size(); ++i) {
+      const auto& item = *appended[i];
+      append_only =
+          item.previous_ ==
+              (i == 0 ? root_.last_group_ : appended[i - 1]->id_) &&
+          item.next_ == (i + 1 == appended.size() ? 0 : appended[i + 1]->id_);
+    }
+    if (append_only && tail != replacements.end() &&
+        tail->second->next_ == appended.front()->id_ &&
+        root.last_group_ == appended.back()->id_) {
+      absl::int128 count = old_count;
+      for (const auto* item : appended) count += item->item_count_;
+      if (count != root.item_count_ || old_count < 0 || bytes < 0 ||
+          bytes > UINT64_MAX)
+        return absl::DataLossError("Stream tail append aggregate mismatch");
+      rebuilt.total_group_bytes_ = static_cast<std::uint64_t>(bytes);
+      rebuilt.retired_ = retired_;
+      absl::InlinedVector<RecoveredOrderedGroup, 8> new_groups;
+      absl::InlinedVector<std::pair<std::uint64_t, std::size_t>, 8> new_ids;
+      absl::InlinedVector<std::uint64_t, 8> new_ends;
+      absl::InlinedVector<std::uint64_t, 8> new_prefixes;
+      auto prefix = static_cast<std::uint64_t>(old_count);
+      for (const auto* item : appended) {
+        const auto index = groups_.size() + new_groups.size();
+        new_groups.push_back(*item);
+        new_groups.back().txid_ = 0;
+        new_groups.back().batch_txid_ = 0;
+        new_ids.emplace_back(item->id_, index);
+        prefix += item->item_count_;
+        const auto start = (index + 1) & index;
+        absl::int128 before = 0;
+        if (start < groups_.size()) {
+          before = CountBefore(start);
+          for (const auto& [changed_index, delta] : count_changes)
+            if (changed_index < start) before += delta;
+        } else {
+          before = start == groups_.size()
+                       ? old_count
+                       : absl::int128(new_prefixes[start - groups_.size() - 1]);
+        }
+        new_ends.push_back(prefix - static_cast<std::uint64_t>(before));
+        new_prefixes.push_back(prefix);
+      }
+      auto groups = groups_.Appended(new_groups);
+      if (!groups.ok()) return groups.status();
+      auto ids = ids_.Appended(new_ids);
+      if (!ids.ok()) return ids.status();
+      auto ends = ends_.Appended(new_ends);
+      if (!ends.ok()) return ends.status();
+      rebuilt.groups_ = std::move(*groups);
+      rebuilt.ids_ = std::move(*ids);
+      rebuilt.ends_ = std::move(*ends);
+      for (auto item : changed) {
+        if (const auto index = FindIndex(item.id_)) {
+          item.txid_ = 0;
+          item.batch_txid_ = 0;
+          auto status = rebuilt.groups_.Set(*index, item);
+          if (!status.ok()) return status;
+        }
+      }
+      auto status = UpdateStreamRanks(rebuilt.ends_, count_changes,
+                                      root.item_count_, ends_.size());
+      if (!status.ok()) return status;
+      if (has_stream_header_ && !changed_ids.contains(root.first_group_)) {
+        rebuilt.stream_header_ = stream_header_;
+        rebuilt.has_stream_header_ = true;
+      }
+      return rebuilt;
+    }
+  }
   auto ordinal_admission = TryReserveMemory(AllocatorUsableSizeForRequest(
       groups_.size() * sizeof(std::size_t) + changed.size() * 32 + 1024));
   if (!ordinal_admission) {
