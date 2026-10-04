@@ -83,7 +83,7 @@ absl::Status InitializeLogging(const LoggingOptions& options) {
     logger->set_level(spdlog::level::info);
     logger->flush_on(spdlog::level::warn);
     spdlog::set_default_logger(std::move(logger));
-  } catch (const std::exception& error) {
+  } catch (const spdlog::spdlog_ex& error) {
     return absl::InternalError(
         absl::StrCat("failed to initialize logging: ", error.what()));
   }

@@ -39,7 +39,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <optional>
 #include <span>
 #include <string>
@@ -3562,77 +3561,71 @@ absl::Status AdoptRandomStreamSnapshot(RandomStreamPayloadState& state,
 absl::StatusOr<std::string> EncodeRandomStreamChunk(
     RandomStreamPayloadState& state) {
   if (state.remaining_ == 0) return std::string();
-  try {
-    std::string payload;
-    payload.reserve(RandomStreamPayloadState::kChunkBytes);
-    const std::size_t width = state.options_.with_values_ ? 2 : 1;
-    auto begin_bulk = [&] {
-      state.header_[0] = '$';
-      const auto size =
-          state.snapshot_.values_[state.selected_ + state.tuple_field_]->size();
-      auto encoded = std::to_chars(state.header_.data() + 1,
-                                   state.header_.data() + 29, size);
-      assert(encoded.ec == std::errc{});
-      *encoded.ptr++ = '\r';
-      *encoded.ptr++ = '\n';
-      state.header_bytes_ = encoded.ptr - state.header_.data();
-      state.part_ = RandomStreamPayloadState::Part::kHeader;
-    };
-    while (state.remaining_ != 0 &&
-           payload.size() < RandomStreamPayloadState::kChunkBytes) {
-      if (state.part_ == RandomStreamPayloadState::Part::kSelect) {
-        state.selected_ = static_cast<std::size_t>(RandomRank(
-                              state.population_, RandomSampleGenerator())) *
-                          width;
-        state.tuple_field_ = 0;
-        begin_bulk();
-      }
-      std::string_view piece;
-      switch (state.part_) {
-        case RandomStreamPayloadState::Part::kHeader:
-          piece = {state.header_.data(), state.header_bytes_};
-          break;
-        case RandomStreamPayloadState::Part::kValue:
-          piece =
-              *state.snapshot_.values_[state.selected_ + state.tuple_field_];
-          break;
-        case RandomStreamPayloadState::Part::kTerminator:
-          piece = "\r\n";
-          break;
-        case RandomStreamPayloadState::Part::kSelect:
-          std::terminate();  // begin_bulk always advances this state.
-      }
-      const auto copied =
-          std::min(piece.size() - state.part_offset_,
-                   RandomStreamPayloadState::kChunkBytes - payload.size());
-      payload.append(piece.substr(state.part_offset_, copied));
-      state.part_offset_ += copied;
-      if (state.part_offset_ != piece.size()) continue;
-      state.part_offset_ = 0;
-      switch (state.part_) {
-        case RandomStreamPayloadState::Part::kHeader:
-          state.part_ = RandomStreamPayloadState::Part::kValue;
-          break;
-        case RandomStreamPayloadState::Part::kValue:
-          state.part_ = RandomStreamPayloadState::Part::kTerminator;
-          break;
-        case RandomStreamPayloadState::Part::kTerminator:
-          if (++state.tuple_field_ == width) {
-            --state.remaining_;
-            state.part_ = RandomStreamPayloadState::Part::kSelect;
-          } else {
-            begin_bulk();
-          }
-          break;
-        case RandomStreamPayloadState::Part::kSelect:
-          std::terminate();
-      }
+  std::string payload;
+  payload.reserve(RandomStreamPayloadState::kChunkBytes);
+  const std::size_t width = state.options_.with_values_ ? 2 : 1;
+  auto begin_bulk = [&] {
+    state.header_[0] = '$';
+    const auto size =
+        state.snapshot_.values_[state.selected_ + state.tuple_field_]->size();
+    auto encoded = std::to_chars(state.header_.data() + 1,
+                                 state.header_.data() + 29, size);
+    assert(encoded.ec == std::errc{});
+    *encoded.ptr++ = '\r';
+    *encoded.ptr++ = '\n';
+    state.header_bytes_ = encoded.ptr - state.header_.data();
+    state.part_ = RandomStreamPayloadState::Part::kHeader;
+  };
+  while (state.remaining_ != 0 &&
+         payload.size() < RandomStreamPayloadState::kChunkBytes) {
+    if (state.part_ == RandomStreamPayloadState::Part::kSelect) {
+      state.selected_ = static_cast<std::size_t>(RandomRank(
+                            state.population_, RandomSampleGenerator())) *
+                        width;
+      state.tuple_field_ = 0;
+      begin_bulk();
     }
-    return payload;
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM random stream chunk");
+    std::string_view piece;
+    switch (state.part_) {
+      case RandomStreamPayloadState::Part::kHeader:
+        piece = {state.header_.data(), state.header_bytes_};
+        break;
+      case RandomStreamPayloadState::Part::kValue:
+        piece = *state.snapshot_.values_[state.selected_ + state.tuple_field_];
+        break;
+      case RandomStreamPayloadState::Part::kTerminator:
+        piece = "\r\n";
+        break;
+      case RandomStreamPayloadState::Part::kSelect:
+        std::terminate();  // begin_bulk always advances this state.
+    }
+    const auto copied =
+        std::min(piece.size() - state.part_offset_,
+                 RandomStreamPayloadState::kChunkBytes - payload.size());
+    payload.append(piece.substr(state.part_offset_, copied));
+    state.part_offset_ += copied;
+    if (state.part_offset_ != piece.size()) continue;
+    state.part_offset_ = 0;
+    switch (state.part_) {
+      case RandomStreamPayloadState::Part::kHeader:
+        state.part_ = RandomStreamPayloadState::Part::kValue;
+        break;
+      case RandomStreamPayloadState::Part::kValue:
+        state.part_ = RandomStreamPayloadState::Part::kTerminator;
+        break;
+      case RandomStreamPayloadState::Part::kTerminator:
+        if (++state.tuple_field_ == width) {
+          --state.remaining_;
+          state.part_ = RandomStreamPayloadState::Part::kSelect;
+        } else {
+          begin_bulk();
+        }
+        break;
+      case RandomStreamPayloadState::Part::kSelect:
+        std::terminate();
+    }
   }
+  return payload;
 }
 
 // Keep one immutable command-time view without retaining a DB gate or key
@@ -3660,35 +3653,30 @@ struct NegativeRandomStreamState : RandomStreamPayloadState {
 Task<absl::StatusOr<std::uint64_t>> BeginNegativeRandomStream(
     const std::shared_ptr<NegativeRandomStreamState>& state) {
   auto begin = [state]() -> Task<absl::StatusOr<std::uint64_t>> {
-    try {
-      tx::TxShard::Guard guard = co_await tx::CurrentTxShard().AcquireKey(
-          state->db_, tx::FingerprintOf(state->digest_), tx::LockMode::kShared);
-      storage::HashOperation operation;
-      operation.kind_ = state->options_.hash_ && state->options_.with_values_
-                            ? storage::HashOperationKind::kGetAll
-                            : storage::HashOperationKind::kKeys;
-      operation.now_ms_ = state->now_ms_;
-      absl::StatusOr<storage::HashResult> snapshot;
-      if (state->options_.zset_) {
-        snapshot = co_await ZSetRandomSnapshotLocked(
-            state->db_, state->key_, state->digest_,
-            state->options_.with_values_, nullptr, state->now_ms_);
-      } else if (state->options_.hash_) {
-        snapshot = co_await g_storage->ExecuteHashLocked(
-            state->db_, state->key_, state->digest_, operation, nullptr);
-      } else {
-        snapshot = co_await g_storage->ExecuteSetLocked(
-            state->db_, state->key_, state->digest_, operation, nullptr);
-      }
-      if (!snapshot.ok()) co_return snapshot.status();
-      if (snapshot->length_ == 0) co_return std::uint64_t{0};
-      auto adopted = AdoptRandomStreamSnapshot(*state, std::move(*snapshot));
-      if (!adopted.ok()) co_return adopted;
-      co_return state->population_;
-    } catch (const std::bad_alloc&) {
-      RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError("OOM random stream snapshot");
+    tx::TxShard::Guard guard = co_await tx::CurrentTxShard().AcquireKey(
+        state->db_, tx::FingerprintOf(state->digest_), tx::LockMode::kShared);
+    storage::HashOperation operation;
+    operation.kind_ = state->options_.hash_ && state->options_.with_values_
+                          ? storage::HashOperationKind::kGetAll
+                          : storage::HashOperationKind::kKeys;
+    operation.now_ms_ = state->now_ms_;
+    absl::StatusOr<storage::HashResult> snapshot;
+    if (state->options_.zset_) {
+      snapshot = co_await ZSetRandomSnapshotLocked(
+          state->db_, state->key_, state->digest_, state->options_.with_values_,
+          nullptr, state->now_ms_);
+    } else if (state->options_.hash_) {
+      snapshot = co_await g_storage->ExecuteHashLocked(
+          state->db_, state->key_, state->digest_, operation, nullptr);
+    } else {
+      snapshot = co_await g_storage->ExecuteSetLocked(
+          state->db_, state->key_, state->digest_, operation, nullptr);
     }
+    if (!snapshot.ok()) co_return snapshot.status();
+    if (snapshot->length_ == 0) co_return std::uint64_t{0};
+    auto adopted = AdoptRandomStreamSnapshot(*state, std::move(*snapshot));
+    if (!adopted.ok()) co_return adopted;
+    co_return state->population_;
   };
   if (state->owner_ != ThisWorker().id_) {
     co_return co_await bycorf::SubmitTaskTo(state->owner_, std::move(begin));
@@ -3702,68 +3690,70 @@ Task<absl::StatusOr<std::string>> NextNegativeRandomChunk(
 }
 
 #if LAVIK_FAULTS_ENABLED
-void MaybeFailRandomStreamBuild(const CommandRequest& request,
-                                std::string_view stage) {
-  if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_RANDOM_STREAM_STAGE", stage))
-    LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_RANDOM_STREAM_KEY", request.args_[1]);
+bool RejectRandomStreamBuild(const CommandRequest& request,
+                             std::string_view stage) {
+  return LAVIK_FAULT_MATCHES("LAVIK_FAIL_RANDOM_STREAM_STAGE", stage) &&
+         LAVIK_FAULT_MATCHES("LAVIK_FAIL_RANDOM_STREAM_KEY", request.args_[1]);
 }
 #endif
 
 Task<CommandReply> ExecuteNegativeRandomStream(
     const CommandRequest& request, NegativeRandomStreamOptions options,
     ReplyBuilder& reply_builder) {
-  try {
-    const std::uint8_t db = request.db_id_;
-    const unsigned owner = ShardForKey(request.args_[1]);
-    const auto state_bytes =
-        sizeof(NegativeRandomStreamState) + 64 + request.args_[1].size() + 1;
-    auto admission = TryReserveMemory(state_bytes);
-    if (!admission) {
-      RecordMemoryRejection();
-      co_return BuiltReply(AppendOomError(reply_builder));
-    }
-    auto state = std::make_shared<NegativeRandomStreamState>(
-        db, std::move(options), request.args_[1], owner);
-    state->state_charge_.Adopt(&*admission, state_bytes);
-    if (!TryBeginDbOperation(db)) {
-      co_return BuiltReply(
-          AppendTryAgainError(reply_builder, "database flush is in progress"));
-    }
-    DbOperationGuard initial_db_guard(db);
-    if (const char* error = CommandServingGenerationError(request);
-        error != nullptr) [[unlikely]] {
-      co_return BuiltReply(reply_builder.AppendError(error));
-    }
-    state->now_ms_ = RedisUnixTimeMillis();
-    auto length = co_await BeginNegativeRandomStream(state);
-    if (!length.ok()) {
-      co_return BuiltReply(AppendStorageError(reply_builder, length.status()));
-    }
-    if (*length == 0) {
-      co_return BuiltReply(reply_builder.AppendArrayHeader(0));
-    }
-    // The initial lookup is complete. Socket backpressure may retain the reply
-    // for an arbitrary duration, so retain neither the DB gate nor the key
-    // lock. Later batches sample only the immutable in-memory view.
-    initial_db_guard.Release();
-
-    std::uint64_t reply_elements = state->remaining_;
-    if (state->options_.with_values_) reply_elements *= 2;
-    LAVIK_FAULT_INJECT(MaybeFailRandomStreamBuild(request, "before-source"););
-    auto chunks = std::make_unique<ReplyContinuation>(
-        [state]() { return NextNegativeRandomChunk(state); });
-    CommandReply reply =
-        BuiltReply(reply_builder.AppendArrayHeader(reply_elements));
-    LAVIK_FAULT_INJECT(MaybeFailRandomStreamBuild(request, "after-header"););
-    reply.continuation_ = std::move(chunks);
-    co_return reply;
-  } catch (const std::bad_alloc&) {
+  const std::uint8_t db = request.db_id_;
+  const unsigned owner = ShardForKey(request.args_[1]);
+  const auto state_bytes =
+      sizeof(NegativeRandomStreamState) + 64 + request.args_[1].size() + 1;
+  auto admission = TryReserveMemory(state_bytes);
+  if (!admission) {
     RecordMemoryRejection();
-    // This builder belongs to this request; no reply bytes have left this
-    // function yet. Discard a partially built array before returning one error.
-    reply_builder.Reset();
     co_return BuiltReply(AppendOomError(reply_builder));
   }
+  auto state = std::make_shared<NegativeRandomStreamState>(
+      db, std::move(options), request.args_[1], owner);
+  state->state_charge_.Adopt(&*admission, state_bytes);
+  if (!TryBeginDbOperation(db)) {
+    co_return BuiltReply(
+        AppendTryAgainError(reply_builder, "database flush is in progress"));
+  }
+  DbOperationGuard initial_db_guard(db);
+  if (const char* error = CommandServingGenerationError(request);
+      error != nullptr) [[unlikely]] {
+    co_return BuiltReply(reply_builder.AppendError(error));
+  }
+  state->now_ms_ = RedisUnixTimeMillis();
+  auto length = co_await BeginNegativeRandomStream(state);
+  if (!length.ok()) {
+    co_return BuiltReply(AppendStorageError(reply_builder, length.status()));
+  }
+  if (*length == 0) {
+    co_return BuiltReply(reply_builder.AppendArrayHeader(0));
+  }
+  // The initial lookup is complete. Socket backpressure may retain the reply
+  // for an arbitrary duration, so retain neither the DB gate nor the key
+  // lock. Later batches sample only the immutable in-memory view.
+  initial_db_guard.Release();
+
+  std::uint64_t reply_elements = state->remaining_;
+  if (state->options_.with_values_) reply_elements *= 2;
+  LAVIK_FAULT_INJECT(if (RejectRandomStreamBuild(request, "before-source")) {
+    RecordMemoryRejection();
+    // No bytes have left this request; discard any partial array header.
+    reply_builder.Reset();
+    co_return BuiltReply(AppendOomError(reply_builder));
+  });
+  auto chunks = std::make_unique<ReplyContinuation>(
+      [state]() { return NextNegativeRandomChunk(state); });
+  CommandReply reply =
+      BuiltReply(reply_builder.AppendArrayHeader(reply_elements));
+  LAVIK_FAULT_INJECT(if (RejectRandomStreamBuild(request, "after-header")) {
+    RecordMemoryRejection();
+    // No bytes have left this request; discard any partial array header.
+    reply_builder.Reset();
+    co_return BuiltReply(AppendOomError(reply_builder));
+  });
+  reply.continuation_ = std::move(chunks);
+  co_return reply;
 }
 
 // EXEC must preserve the view observed at the command's position in the
@@ -3787,56 +3777,56 @@ Task<absl::StatusOr<OwnedStreamReply>>
 PrepareTransactionalNegativeRandomStreamLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx, NegativeRandomStreamOptions options) {
-  try {
-    storage::HashOperation operation;
-    operation.kind_ = options.hash_ && options.with_values_
-                          ? storage::HashOperationKind::kGetAll
-                          : storage::HashOperationKind::kKeys;
-    operation.now_ms_ = RedisUnixTimeMillis();
+  storage::HashOperation operation;
+  operation.kind_ = options.hash_ && options.with_values_
+                        ? storage::HashOperationKind::kGetAll
+                        : storage::HashOperationKind::kKeys;
+  operation.now_ms_ = RedisUnixTimeMillis();
 
-    absl::StatusOr<storage::HashResult> snapshot;
-    if (options.zset_) {
-      snapshot = co_await ZSetRandomSnapshotLocked(
-          request.db_id_, request.args_[1], digest, options.with_values_, tx,
-          operation.now_ms_);
-    } else if (options.hash_) {
-      snapshot = co_await g_storage->ExecuteHashLocked(
-          request.db_id_, request.args_[1], digest, operation, tx);
-    } else {
-      snapshot = co_await g_storage->ExecuteSetLocked(
-          request.db_id_, request.args_[1], digest, operation, tx);
-    }
-    if (!snapshot.ok()) co_return snapshot.status();
-    if (snapshot->length_ == 0) {
-      co_return OwnedStreamReply{.encoded_ = "*0\r\n", .chunks_ = {}};
-    }
+  absl::StatusOr<storage::HashResult> snapshot;
+  if (options.zset_) {
+    snapshot = co_await ZSetRandomSnapshotLocked(
+        request.db_id_, request.args_[1], digest, options.with_values_, tx,
+        operation.now_ms_);
+  } else if (options.hash_) {
+    snapshot = co_await g_storage->ExecuteHashLocked(
+        request.db_id_, request.args_[1], digest, operation, tx);
+  } else {
+    snapshot = co_await g_storage->ExecuteSetLocked(
+        request.db_id_, request.args_[1], digest, operation, tx);
+  }
+  if (!snapshot.ok()) co_return snapshot.status();
+  if (snapshot->length_ == 0) {
+    co_return OwnedStreamReply{.encoded_ = "*0\r\n", .chunks_ = {}};
+  }
 
-    constexpr auto state_bytes = sizeof(TransactionalRandomStreamState) + 64;
-    auto admission = TryReserveMemory(state_bytes);
-    if (!admission) {
-      RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError("OOM transactional random stream");
-    }
-    auto state = std::make_shared<TransactionalRandomStreamState>();
-    state->state_charge_.Adopt(&*admission, state_bytes);
-    state->options_ = options;
-    state->remaining_ = options.count_;
-    auto adopted = AdoptRandomStreamSnapshot(*state, std::move(*snapshot));
-    if (!adopted.ok()) co_return adopted;
-
-    const std::uint64_t elements =
-        options.with_values_ ? options.count_ * 2 : options.count_;
-    OwnedStreamReply reply;
-    LAVIK_FAULT_INJECT(MaybeFailRandomStreamBuild(request, "before-source"););
-    reply.chunks_ = [state]() { return NextTransactionalRandomChunk(state); };
-    reply.encoded_ = "*" + std::to_string(elements) + "\r\n";
-    LAVIK_FAULT_INJECT(MaybeFailRandomStreamBuild(request, "after-header"););
-    co_return reply;
-  } catch (const std::bad_alloc&) {
+  constexpr auto state_bytes = sizeof(TransactionalRandomStreamState) + 64;
+  auto admission = TryReserveMemory(state_bytes);
+  if (!admission) {
     RecordMemoryRejection();
-    // The owned reply is discarded, so no partial array reaches EXEC's builder.
     co_return absl::ResourceExhaustedError("OOM transactional random stream");
   }
+  auto state = std::make_shared<TransactionalRandomStreamState>();
+  state->state_charge_.Adopt(&*admission, state_bytes);
+  state->options_ = options;
+  state->remaining_ = options.count_;
+  auto adopted = AdoptRandomStreamSnapshot(*state, std::move(*snapshot));
+  if (!adopted.ok()) co_return adopted;
+
+  const std::uint64_t elements =
+      options.with_values_ ? options.count_ * 2 : options.count_;
+  OwnedStreamReply reply;
+  LAVIK_FAULT_INJECT(if (RejectRandomStreamBuild(request, "before-source")) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM transactional random stream");
+  });
+  reply.chunks_ = [state]() { return NextTransactionalRandomChunk(state); };
+  reply.encoded_ = "*" + std::to_string(elements) + "\r\n";
+  LAVIK_FAULT_INJECT(if (RejectRandomStreamBuild(request, "after-header")) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM transactional random stream");
+  });
+  co_return reply;
 }
 
 std::string EncodeStorageError(const absl::Status& status) {
@@ -7259,9 +7249,6 @@ Task<std::string> ExecuteExecSequentialSetMulti(
     builder.AppendSetHeader(ordered.size());
     for (const std::string& member : ordered) builder.AppendBulkString(member);
     co_return std::string(builder.View());
-  } catch (const std::bad_alloc&) {
-    // Coroutine handlers cannot await; unwind owned scratch, then use the
-    // same command-local compensation path as an ordinary storage OOM below.
   } catch (const std::length_error&) {
   }
   if (undo_active) {
@@ -7652,8 +7639,6 @@ void InitExecRun(ExecRunContext& run, const std::vector<CommandRequest>& queued,
         }
         prepared = command.replication_capture_->ReserveAdditionalCommands(
             effects.size(), bytes);
-      } catch (const std::bad_alloc&) {
-        prepared = absl::ResourceExhaustedError("OOM preparing DEL effects");
       } catch (const std::length_error&) {
         prepared = absl::ResourceExhaustedError("OOM preparing DEL effects");
       }
@@ -11130,23 +11115,18 @@ absl::Status ReplicationCommandCapture::ReserveAdditionalCommands(
     RecordMemoryRejection();
     return absl::ResourceExhaustedError("OOM preparing replication capture");
   }
-  try {
-    auto charge = prepared_charge_ ? prepared_charge_
-                                   : std::make_shared<RetainedMemoryCharge>();
-    commands_.reserve(commands_.size() + count);
-    if (prepared_charge_) {
-      charge->Resize(existing + bytes);
-      admission->Release();
-    } else {
-      charge->Adopt(&*admission, bytes);
-    }
-    preparation_owner_ = owner;
-    prepared_charge_ = std::move(charge);
-    return absl::OkStatus();
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM preparing replication capture");
+  auto charge = prepared_charge_ ? prepared_charge_
+                                 : std::make_shared<RetainedMemoryCharge>();
+  commands_.reserve(commands_.size() + count);
+  if (prepared_charge_) {
+    charge->Resize(existing + bytes);
+    admission->Release();
+  } else {
+    charge->Adopt(&*admission, bytes);
   }
+  preparation_owner_ = owner;
+  prepared_charge_ = std::move(charge);
+  return absl::OkStatus();
 }
 
 void ReplicationCommandCapture::ReleaseUnusedPreparation() {
@@ -11423,13 +11403,6 @@ absl::Status ReplicationTransactionGuard::TrySetCommandArgs(
   } catch (const std::length_error&) {
     return absl::ResourceExhaustedError(
         "replication transaction payload is too large");
-  } catch (const std::bad_alloc&) {
-    // Pre-mutation callers must be able to abort without changing the shared
-    // payload. In particular, a STORE's prepared effects cannot terminate the
-    // process just because this noexcept boundary owns the final vector.
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM preparing replication transaction payload");
   }
 }
 
@@ -11472,11 +11445,6 @@ void ReplicationTransactionGuard::SetFinalExpirations(
     }
     SetCommandArgs(std::move(command_args));
   } catch (const std::length_error&) {
-    InvalidatePayload();
-  } catch (const std::bad_alloc&) {
-    // Expiry settlement happens after mutations. An incomplete replication
-    // body must invalidate its envelope instead of publishing partial effects.
-    RecordMemoryRejection();
     InvalidatePayload();
   }
 }
