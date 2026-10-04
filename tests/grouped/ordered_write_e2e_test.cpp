@@ -169,10 +169,10 @@ TEST(GroupedListWriteE2e, RangeReadsBoundOversizedPageMemory) {
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
-  // The owned 64 MiB reply fits, but loading every indivisible large page
-  // concurrently can consume another complete payload in physical buffers.
-  // Storage admission is isolated from the separate client-buffer quota.
-  Server server(disk, 1, {}, {}, false, 2, "128M", {}, "0");
+  // Exercise pages larger than the entire read-window byte bound while
+  // retaining a 64 MiB reply. Storage admission is isolated from the separate
+  // client-buffer quota; contents and rank order must survive restart.
+  Server server(disk, 1, {}, {}, false, 2, "96M", {}, "0");
   Client client(server.port());
   const auto all = client.Command({"LRANGE", key, "0", "-1"});
   ASSERT_EQ(all.kind_, '*') << all.text_ << server.Log();
