@@ -1114,7 +1114,10 @@ void AppendEntry(ReplyBuilder& builder, const Entry& entry) {
 }
 
 struct StreamRangeReplyState {
+  static constexpr std::size_t kChunkBytes = 64 * 1024;
   RetainedMemoryCharge state_charge_;
+  RetainedMemoryCharge chunk_charge_;
+  std::size_t chunk_limit_ = 0;
   // Replies cross from a key owner to the connection/EXEC worker. Pending
   // reservations are worker-affine; retained charges may follow that ownership.
   RetainedMemoryCharge selection_charge_;
@@ -1144,11 +1147,31 @@ struct StreamRangeReplyState {
   }
   Task<absl::StatusOr<std::string>> Next() {
     try {
+      std::string chunk;
       for (;;) {
         if (offset_ < pending_.size()) {
-          auto chunk = pending_.substr(offset_, 64 * 1024);
-          offset_ += chunk.size();
-          co_return chunk;
+          if (chunk_limit_ == 0) {
+            // Coalesce small messages so each does not require a separate
+            // socket write. A single small result needs only its actual bytes.
+            const auto limit = remaining_ == 0
+                                   ? std::min(kChunkBytes, pending_.size())
+                                   : kChunkBytes;
+            // Returned chunks can overlap their successors in the writer;
+            // retained charges follow replies across worker ownership hops.
+            const auto bytes = 2 * (limit + 1);
+            auto admission = TryReserveMemory(bytes);
+            if (!admission)
+              co_return absl::ResourceExhaustedError("OOM Stream reply chunk");
+            chunk_charge_.Adopt(&*admission, bytes);
+            chunk_limit_ = limit;
+          }
+          if (chunk.empty()) chunk.reserve(chunk_limit_);
+          const auto size =
+              std::min(pending_.size() - offset_, chunk_limit_ - chunk.size());
+          chunk.append(pending_, offset_, size);
+          offset_ += size;
+          if (chunk.size() == chunk_limit_) co_return chunk;
+          continue;
         }
         pending_ = std::string{};
         offset_ = 0;
@@ -1156,18 +1179,19 @@ struct StreamRangeReplyState {
         if (remaining_ == 0 || done_) {
           page_.reset();
           reader_ = {};
-          co_return std::string{};
+          co_return chunk;
         }
         if (!selection_.empty() && selection_[selected_at_].missing_) {
           ReplyBuilder builder(version_);
           builder.AppendArrayHeader(2);
           builder.AppendBulkString(FormatId(selection_[selected_at_++].id_));
           builder.AppendNullArray();
-          pending_ = std::string(builder.View());
+          pending_ = std::move(builder).Release();
           --remaining_;
           continue;
         }
         Entry entry;
+        ReplyBuilder builder(version_);
         if (!reader_) {
           bool found = false;
           while (index_ < compact_.size()) {
@@ -1182,6 +1206,7 @@ struct StreamRangeReplyState {
           }
           if (!found)
             co_return absl::DataLossError("Stream reply count mismatch");
+          AppendEntry(builder, entry);
         } else {
           if (!page_ || index_ == page_->elements_.size()) {
             const bool end = page_ && page_->done_;
@@ -1216,20 +1241,25 @@ struct StreamRangeReplyState {
           if (!admission)
             co_return absl::ResourceExhaustedError("OOM Stream reply entry");
           entry_charge_.Adopt(&*admission, admission->bytes());
-          entry.fields_.reserve(fields);
+          // The pinned page owns field bytes until serialization finishes.
+          // Avoid an owned string per field and geometric reply growth; the
+          // conservative wire bound fits the existing entry admission above.
+          builder.Reserve(payload->size() + 64 + fields * std::size_t{20});
+          builder.AppendArrayHeader(2);
+          builder.AppendBulkString(FormatId(entry.id_));
+          builder.AppendArrayHeader(fields);
           for (std::uint32_t i = 0; i < fields; ++i) {
-            std::string field;
-            if (!GetString(*payload, &at, &field))
+            std::uint32_t size = 0;
+            if (!Get32(*payload, &at, &size) || size > payload->size() - at)
               co_return absl::DataLossError("truncated Stream reply field");
-            entry.fields_.push_back(std::move(field));
+            builder.AppendBulkString(payload->substr(at, size));
+            at += size;
           }
           if (at != payload->size())
             co_return absl::DataLossError("trailing Stream reply entry");
         }
-        ReplyBuilder builder(version_);
-        AppendEntry(builder, entry);
         if (!selection_.empty()) ++selected_at_;
-        pending_ = std::string(builder.View());
+        pending_ = std::move(builder).Release();
         --remaining_;
       }
     } catch (const std::bad_alloc&) {
