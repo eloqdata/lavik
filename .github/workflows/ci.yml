@@ -49,10 +49,10 @@ jobs:
       - name: Check all maintained sources
         run: pre-commit run clang-format --all-files --show-diff-on-failure
 
-  test:
-    name: Tests (${{ matrix.arch }})
+  build:
+    name: Build tests (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 240
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -61,6 +61,12 @@ jobs:
             runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
+    env:
+      PYTHONPATH: ${{ github.workspace }}/build_ci/test_tools/redis_py
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 1G
     steps:
       - uses: actions/checkout@v7
         with:
@@ -72,57 +78,121 @@ jobs:
             raft/go.sum
             tests/meta_integration/cluster_client_go/go.sum
             tests/meta_integration/sentinel_client_go/go.sum
-
+      - name: Restore compiler cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .ccache
+          key: ci-clang18-debug-v1-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: ci-clang18-debug-v1-${{ matrix.arch }}-
       - name: Initialize runtime dependencies
-        # Public submodules use the exact gitlinks from the tested commit.
-        # SPDK and its transitive dependencies are only needed by hardware builds.
+        # Public gitlinks are identical to the tested commit, including fork PRs.
         run: |
           git submodule update --init --depth 1 bycorf third_party/mimalloc
           git -C bycorf submodule update --init --depth 1 third_party/abseil third_party/liburing
-      - name: Install build and test dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential clang-18 cmake ninja-build libssl-dev openssl python3 \
-            python3-venv curl tcl
-          python3 -m venv "$RUNNER_TEMP/lavik-test-venv"
-          "$RUNNER_TEMP/lavik-test-venv/bin/pip" install --require-hashes \
-            -r tests/meta_integration/requirements-redis-py.txt
-          echo "$RUNNER_TEMP/lavik-test-venv/bin" >> "$GITHUB_PATH"
-      - name: Prepare test host
-        run: |
-          sudo sysctl -w kernel.io_uring_disabled=0
-          # Large-collection fixtures create private regular files here.
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/dev
+            build-essential clang-18 cmake ninja-build ccache libssl-dev openssl \
+            python3 python3-venv curl tcl zstd
+      - name: Check CI runner and bundle regressions
+        run: python3 -m unittest discover -s tests -p 'test_ci_*.py'
       - name: Check Go formatting
         run: test -z "$(gofmt -l raft tests/meta_integration/cluster_client_go tests/meta_integration/sentinel_client_go)"
       - name: Install Redis integration peers
+        # CTest embeds absolute paths. Package peers under the shared workspace
+        # path instead of RUNNER_TEMP so every shard uses these exact versions.
         run: |
-          ./scripts/install_test_redis.sh "$RUNNER_TEMP/redis"
-          echo "$RUNNER_TEMP/redis" >> "$GITHUB_PATH"
-          ./scripts/install_test_redisshake.sh "$RUNNER_TEMP/redis-shake"
-          echo "$RUNNER_TEMP/redis-shake" >> "$GITHUB_PATH"
-          # Pinned standard Cluster/Sentinel client for the acceptance matrix.
-          ./scripts/install_test_redis_py.sh "$RUNNER_TEMP/redis-py"
+          ./scripts/install_test_redis.sh "$GITHUB_WORKSPACE/build_ci/test_tools/redis"
+          ./scripts/install_test_redisshake.sh "$GITHUB_WORKSPACE/build_ci/test_tools/redis-shake"
+          ./scripts/install_test_redis_py.sh "$GITHUB_WORKSPACE/build_ci/test_tools/redis_py"
+          echo "$GITHUB_WORKSPACE/build_ci/test_tools/redis" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/build_ci/test_tools/redis-shake" >> "$GITHUB_PATH"
       - name: Configure
-        # Debug enables the Meta fault hooks as well as the Data crash tests.
+        # Retain Debug assertions and both Meta and Data fault hooks.
         run: |
           cmake -S . -B build_ci -G Ninja \
             -DCMAKE_C_COMPILER=clang-18 \
             -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=Debug \
             -DLAVIK_ENABLE_OPT=OFF \
             -DLAVIK_ENABLE_TEST_FAULTS=ON \
-            -DLAVIK_CLUSTER_CLIENT_REDIS_PY="$RUNNER_TEMP/redis-py" \
+            -DPython3_EXECUTABLE=/usr/bin/python3 \
+            -DLAVIK_PYTHON3_EXECUTABLE=/usr/bin/python3 \
+            -DLAVIK_CLUSTER_CLIENT_REDIS_PY="$GITHUB_WORKSPACE/build_ci/test_tools/redis_py" \
             -DBUILD_TESTING=ON
-      - name: Build all targets
-        run: cmake --build build_ci --parallel "$(nproc)"
-      - name: Run all software tests
+      - name: Build all targets once
         run: |
-          # Registered io_uring buffers must not depend on the runner's memlock limit.
+          cmake --build build_ci --parallel "$(nproc)"
+          ccache --show-stats
+      - name: Package test runtime
+        run: python3 scripts/ci_build_bundle.py create build_ci "$RUNNER_TEMP/ci-build.tar.zst"
+      - name: Upload test runtime
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-build-${{ matrix.arch }}
+          path: ${{ runner.temp }}/ci-build.tar.zst
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  test-shard:
+    name: Test shard (${{ matrix.platform.arch }}, ${{ matrix.shard }})
+    needs: build
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+        shard: [0, 1, 2, 3, 4, 5]
+    env:
+      PYTHONPATH: ${{ github.workspace }}/build_ci/test_tools/redis_py
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # meta_raft.go still exercises go test -race with the pinned toolchain.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: raft/go.mod
+          cache-dependency-path: |
+            raft/go.sum
+            tests/meta_integration/cluster_client_go/go.sum
+            tests/meta_integration/sentinel_client_go/go.sum
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang-18 cmake openssl python3 tcl zstd
+      - name: Download test runtime
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-build-${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/ci-build
+      - name: Restore and verify test runtime
+        run: |
+          tar --zstd -xf "$RUNNER_TEMP/ci-build/ci-build.tar.zst"
+          python3 scripts/ci_build_bundle.py validate build_ci
+          echo "$GITHUB_WORKSPACE/build_ci/test_tools/redis" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/build_ci/test_tools/redis-shake" >> "$GITHUB_PATH"
+      - name: Prepare test host
+        run: |
+          sudo sysctl -w kernel.io_uring_disabled=0
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/dev
+      - name: Run software test shard
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: |
           sudo prlimit --pid "$$" --memlock=unlimited
-          # Exercise the hardware safety gate with an unmounted private loop
-          # device. Actual NVMe/SPDK scenarios still require a hardware host.
+          # Each shard has an isolated VM and remains serial internally, so
+          # fixed ports, large fixtures, and timing-sensitive faults cannot race.
           scratch_image=$(mktemp "$RUNNER_TEMP/lavik-ci-gate.XXXXXX")
           scratch_device=
           cleanup() {
@@ -136,12 +206,12 @@ jobs:
           scratch_device=$(sudo losetup --find --show "$scratch_image")
           export LAVIK_CLUSTER_HARDWARE_OPT_IN=1
           export LAVIK_CLUSTER_SCRATCH_DEVICE="$scratch_device"
-          ./scripts/run_ci_tests.sh build_ci
+          ./scripts/run_ci_tests.sh build_ci --shard-index "$SHARD_INDEX" --shard-count 6
       - name: Upload test results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: test-results-${{ matrix.arch }}
+          name: test-results-${{ matrix.platform.arch }}-${{ matrix.shard }}
           path: |
             build_ci/test-results/
             build_ci/Testing/Temporary/
@@ -156,3 +226,24 @@ jobs:
             /tmp/lavik-*.log
           if-no-files-found: ignore
           retention-days: 7
+
+  test:
+    # Preserve the existing branch-protection check names. Both gates require
+    # every build and shard: failed, skipped, or cancelled work cannot pass.
+    name: Tests (${{ matrix.arch }})
+    if: ${{ always() }}
+    needs: [build, test-shard]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Require all test shards
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          SHARD_RESULT: ${{ needs.test-shard.result }}
+        run: |
+          test "$BUILD_RESULT" = success
+          test "$SHARD_RESULT" = success

@@ -26,7 +26,10 @@ The test cases retain the upstream assertions, with two portability adaptations:
 the Hash ziplist fixtures compare named field/value pairs without depending on
 `HGETALL` order, and the blocked-move WATCH fixture reads the EXEC result before
 unblocking the move from another connection. The latter makes command ordering
-explicit across Lavik's workers. The harness has Lavik-specific changes:
+explicit across Lavik's workers. SORT fixture setup batches independent list/set
+and string writes in groups of 64 elements; dataset sizes, insertion order,
+random values, and the original SORT assertions are unchanged.
+The harness has Lavik-specific changes:
 it limits the default suite list to the vendored data-structure files,
 external-server cleanup tolerates unavailable housekeeping commands,
 Valkey-only object-encoding configuration is emulated inside the harness, and

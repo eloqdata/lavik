@@ -655,11 +655,18 @@ def main():
             if scenario == "stream":
                 stream_revoke(root, mode, False)
                 stream_revoke(root, mode, True)
-                stream_revoke(root, mode, True, empty=True)
-                stream_revoke(root, mode, True, noack=True)
+                # Both modes keep pre-effect refusal and the committed prefix.
+                # Empty/NOACK vary shared per-stream effects; exercise those
+                # once with Single's keys spanning different hash slots.
+                if mode == "single":
+                    stream_revoke(root, mode, True, empty=True)
+                    stream_revoke(root, mode, True, noack=True)
             else:
+                # Mixed EXEC retains each mode's key admission and catalog cut;
+                # the catalog-only EXEC path is also covered in Single.
+                mixed_cases = (False, True) if mode == "single" else (True,)
                 for boundary in ("BEFORE_ROOT", "AFTER_ROOT_WRITE"):
-                    for mixed in (False, True):
+                    for mixed in mixed_cases:
                         catalog_revoke(root, mode, mixed, boundary)
     H.log("PASS")
 

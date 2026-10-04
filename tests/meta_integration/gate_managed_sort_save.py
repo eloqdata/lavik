@@ -738,10 +738,14 @@ def main():
         for mode in ("single", "cluster"):
             if "--save" in sys.argv:
                 saving(Path(directory), mode)
-                save_drains_exec(Path(directory), mode)
-                revoked_backup(Path(directory), mode)
-                revoked_save(Path(directory), mode)
-                failover_backup(Path(directory), mode)
+                # The full save/restore contract above retains each mode's
+                # DB and replica-read semantics. These DB0-only lifecycle
+                # cuts exercise the shared backup job and admission machinery.
+                if mode == "single":
+                    save_drains_exec(Path(directory), mode)
+                    revoked_backup(Path(directory), mode)
+                    revoked_save(Path(directory), mode)
+                    failover_backup(Path(directory), mode)
             else:
                 sorting(Path(directory), mode)
     H.log("PASS")

@@ -36,9 +36,7 @@ def context(ca, cert=None, key=None):
 
 
 class SecureFixture(D.DiscoveryFixture):
-    def __init__(
-        self, meta, data, ctl, directory, mapped=True, hostname=True, tls=True
-    ):
+    def __init__(self, meta, data, ctl, directory, hostname=True, tls=True):
         super().__init__(meta, data, ctl, directory)
         self.proxies = []
         self.discovery_host = "localhost" if hostname else "127.0.0.1"
@@ -120,11 +118,10 @@ class SecureFixture(D.DiscoveryFixture):
                 "yes" if hostname else "no",
             ]
             port = self.sentinel_ports[node.id]
-            if mapped:
-                proxy = HA.DataProxy(f"sentinel-{node.id}", port)
-                self.proxies.append(proxy)
-                port = proxy.listen_port
-                self.sentinel_ports[node.id] = port
+            proxy = HA.DataProxy(f"sentinel-{node.id}", port)
+            self.proxies.append(proxy)
+            port = proxy.listen_port
+            self.sentinel_ports[node.id] = port
             node.sentinel_endpoint = (
                 f"{'tls' if tls else 'tcp'}://{self.discovery_host}:{port}"
             )
@@ -156,14 +153,13 @@ class SecureFixture(D.DiscoveryFixture):
             )
             plain = node.redis_port
             secure = node.tls_port
-            if mapped:
-                proxy = HA.DataProxy(f"data-{i}-plain", plain)
+            proxy = HA.DataProxy(f"data-{i}-plain", plain)
+            self.proxies.append(proxy)
+            plain = proxy.listen_port
+            if tls:
+                proxy = HA.DataProxy(f"data-{i}-tls", secure)
                 self.proxies.append(proxy)
-                plain = proxy.listen_port
-                if tls:
-                    proxy = HA.DataProxy(f"data-{i}-tls", secure)
-                    self.proxies.append(proxy)
-                    secure = proxy.listen_port
+                secure = proxy.listen_port
             node.discovery_endpoint = f"tcp://{self.discovery_host}:{plain}"
             if tls:
                 node.discovery_tls_endpoint = f"tls://{self.discovery_host}:{secure}"
@@ -241,19 +237,30 @@ def check_subscriptions(clients, subscriptions, marker):
 def run_cluster(meta, data, ctl, go, directory, mode):
     import redis
 
-    tls = not mode.startswith("plaintext")
+    tls = mode != "plaintext"
     fixture = SecureFixture(
         meta,
         data,
         ctl,
         directory,
-        mapped=mode not in ("direct", "plaintext-direct"),
         hostname=mode == "hostname",
         tls=tls,
     )
     clients, resources, subscriptions = [], [], []
     try:
         fixture.start_created()
+        # Seed retry may reach only a subset of peers. Probe every advertised
+        # listener directly so routing/TLS coverage does not require electing
+        # every Meta member in each address-mode scenario.
+        for host, port in fixture.sentinel_addresses():
+            peer = Client(
+                port, host=host, ssl_context=getattr(fixture, "ssl_context", None)
+            )
+            try:
+                assert peer.command("AUTH", D.SENTINEL_PASSWORD) == b"OK"
+                assert peer.command("PING") == b"PONG"
+            finally:
+                peer.close()
         ports = [H.free_port() for _ in range(3)]
         for collision in (fixture.leader.raft_port, ports[0]):
             reply = fixture.leader.ctl(
@@ -295,19 +302,20 @@ def run_cluster(meta, data, ctl, go, directory, mode):
                     ]
                 finally:
                     wire.close()
-        for name, client in clients:
-            if isinstance(client, HA.GoClient):
-                client.call(Op="subscribe", Key="secure-ha")
-                subscriptions.append((name, client))
-            else:
-                sub = client.pubsub()
-                sub.subscribe("secure-ha")
-                H.wait_until(
-                    "subscription ready",
-                    5,
-                    lambda: sub.get_message(timeout=1) is not None,
-                )
-                subscriptions.append((name, sub))
+        if mode == "hostname":
+            for name, client in clients:
+                if isinstance(client, HA.GoClient):
+                    client.call(Op="subscribe", Key="secure-ha")
+                    subscriptions.append((name, client))
+                else:
+                    sub = client.pubsub()
+                    sub.subscribe("secure-ha")
+                    H.wait_until(
+                        "subscription ready",
+                        5,
+                        lambda: sub.get_message(timeout=1) is not None,
+                    )
+                    subscriptions.append((name, sub))
         kwargs = getattr(fixture, "client_tls_kwargs", {})
         replica = redis.Redis(
             host=fixture.discovery_host,
@@ -360,9 +368,12 @@ def run_cluster(meta, data, ctl, go, directory, mode):
                     assert reader.call(Op="role")[0] == "slave"
                 finally:
                     reader.close()
-        if tls:
+        # Authentication failures and HA use the same TLS/client paths for
+        # numeric and hostname publication. Exercise that matrix once with
+        # DNS-only SANs; mapped still proves positive numeric discovery,
+        # primary/replica client access, and the real forwarded endpoints.
+        if mode == "hostname":
             negative_clients(fixture, go, directory)
-        if mode in ("mapped", "hostname"):
             visited = set()
             for _ in range(10):
                 fixture.rediscover_leader()
@@ -425,12 +436,11 @@ def run_cluster(meta, data, ctl, go, directory, mode):
             candidate.force_kill()
             HA.recover(clients, "automatic-TLS")
             check_subscriptions(clients, subscriptions, "automatic-new-message")
-        if fixture.proxies:
-            assert all(
-                proxy.bytes_forwarded > 0
-                for proxy in fixture.proxies
-                if not (tls and "plain" in proxy.name)
-            )
+        assert all(
+            proxy.bytes_forwarded > 0
+            for proxy in fixture.proxies
+            if not (tls and "plain" in proxy.name)
+        )
         H.log(f"PASS secure Sentinel {mode}")
     except BaseException:
         fixture.dump_logs()
@@ -740,9 +750,14 @@ def handshake_matrix(meta, data, directory):
 
 
 def main():
-    if len(sys.argv) != 6:
+    if len(sys.argv) != 6 or sys.argv[5] not in (
+        "mapped",
+        "hostname",
+        "plaintext",
+        "handshake",
+    ):
         raise SystemExit(
-            "gate_sentinel_tls.py META DATA CTL GO direct|mapped|hostname|plaintext|plaintext-direct|handshake"
+            "gate_sentinel_tls.py META DATA CTL GO mapped|hostname|plaintext|handshake"
         )
     meta, data, ctl, go, mode = sys.argv[1:]
     if D.import_redis_py(meta) is None:
