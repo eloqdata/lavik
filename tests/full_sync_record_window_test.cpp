@@ -102,6 +102,24 @@ TEST(FullSyncRecordWindowTest, RegistrationAllowsAckBeforeWriterResumes) {
   EXPECT_EQ(window.inflight_bytes(), 0);
 }
 
+TEST(FullSyncRecordWindowTest, SnapshotReceiptWaitsForItsOwnAck) {
+  FullSyncRecordWindow window;
+  EXPECT_FALSE(window.Contains(0));
+  ASSERT_TRUE(window.Begin(2, 11, 1024).ok());
+  ASSERT_TRUE(window.Begin(2, 12, 1024).ok());
+  EXPECT_TRUE(window.Contains(11));
+  EXPECT_TRUE(window.Contains(12));
+  ASSERT_TRUE(window.Acknowledge(2, 12).value());
+  EXPECT_TRUE(window.Contains(11));
+  EXPECT_FALSE(window.Contains(12));
+  ASSERT_TRUE(window.Begin(2, 13, 1024).ok());
+  EXPECT_FALSE(window.Contains(12));
+  EXPECT_TRUE(window.Contains(13));
+  ASSERT_TRUE(window.Acknowledge(2, 11).value());
+  EXPECT_FALSE(window.Contains(11));
+  EXPECT_TRUE(window.Contains(13));
+}
+
 TEST(FullSyncRecordWindowTest, RejectedRegistrationDoesNotConsumeCapacity) {
   FullSyncRecordWindow window;
   EXPECT_EQ(window.Begin(0, 0, 64).code(), absl::StatusCode::kInvalidArgument);

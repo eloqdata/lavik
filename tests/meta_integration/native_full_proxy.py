@@ -62,10 +62,11 @@ def _records(payload):
     records = []
     for _ in range(count):
         kind = payload[offset]
+        db = payload[offset + 1]
         key_bytes, value_bytes = struct.unpack_from("<II", payload, offset + 43)
         key = payload[offset + 51 : offset + 51 + key_bytes]
         offset += 51 + key_bytes + value_bytes
-        records.append((key, kind))
+        records.append((key, kind, db))
     assert offset == len(payload), (offset, len(payload))
     return sequence, partition, records
 
@@ -83,11 +84,14 @@ def _ack(partition, sequence):
 class FullRecordProxy(H.Proxy):
     """Hold record ACKs selected by key, or the partition-zero handoff ACK."""
 
-    def __init__(self, keys=(), hold_handoff=False):
+    def __init__(self, keys=(), hold_handoff=False, prefix=None):
         super().__init__("full-record-window", 0)
         self._state = threading.RLock()
         self._hold = set(key.encode() for key in keys)
         self._watched = set(self._hold)
+        self._prefix = prefix.encode() if prefix is not None else None
+        if self._prefix is not None:
+            self._hold.update(self._prefix + f"/db{db}".encode() for db in (0, 15))
         self._hold_handoff = hold_handoff
         self._pending = []
         self._stats = defaultdict(lambda: {"frames": [], "forwarded": 0})
@@ -159,14 +163,19 @@ class FullRecordProxy(H.Proxy):
                 with self._state:
                     if kind == 2:
                         sequence, partition, records = _records(payload)
-                        selected = next(
-                            (
-                                (key, record_kind)
-                                for key, record_kind in records
-                                if key in self._watched
-                            ),
-                            None,
-                        )
+                        selected = None
+                        for key, record_kind, db in records:
+                            if key in self._watched:
+                                selected = (key, record_kind)
+                                break
+                            if self._prefix is not None and key.startswith(
+                                self._prefix
+                            ):
+                                selected = (
+                                    self._prefix + f"/db{db}".encode(),
+                                    record_kind,
+                                )
+                                break
                         if selected:
                             key, record_kind = selected
                             event = (sequence, len(frame), record_kind, partition)

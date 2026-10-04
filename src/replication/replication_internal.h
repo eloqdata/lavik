@@ -2681,7 +2681,7 @@ class ReplicationManager::ReplicationGroup {
     RetainedMemoryCharge records_charge_;
     detail::FullSyncRecordWindow records_;
     // Non-handoff ACKs share the same reader. Handoff ownership lives only in
-    // the partition ledger; streamed records use their bounded window. These
+    // the partition ledger; windowed records use their bounded ledger. These
     // entries belong to synchronous records, commands, reset and cut.
     absl::flat_hash_map<std::uint64_t, std::uint16_t> expected_;
     bycorf::AsyncNotification changed_;
@@ -2703,7 +2703,8 @@ class ReplicationManager::ReplicationGroup {
       std::uint64_t sequence);
 
   // Sends one record frame after window admission, without waiting for its
-  // ACK. The caller retains source ownership until DrainFullSyncRecords.
+  // ACK. The caller owns completion state until the exact ACK is observed or
+  // DrainFullSyncRecords completes.
   Task<absl::Status> SendFullSyncRecord(
       TcpStream& stream, const std::shared_ptr<FullSyncAckState>& state,
       std::string_view body, std::uint16_t partition, std::uint64_t sequence);

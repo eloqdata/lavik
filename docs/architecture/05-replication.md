@@ -943,8 +943,8 @@ have finished. Each flow pipelines one large value's begin, chunk, and commit
 record frames through a window bounded by both frame count and wire bytes.
 The existing FULL ACK reader releases credit only for the exact partition and
 sequence; completion of every frame precedes release of the source value and
-its capture or publisher credit. Ordinary record batches still complete one
-ACK at a time, and fragmented commands retain their final-fragment ACK contract.
+its capture or publisher credit. Fragmented commands retain their
+final-fragment ACK contract.
 These source-local handles do not enter the wire format. Grouped Streams use
 portable `LSR1` length-framed logical records rather than a whole `LXS1` image;
 compatible peers decode those records incrementally with the same ingest
@@ -962,8 +962,18 @@ population. The final frame validates exact bytes and cardinality before the
 transaction's durability boundary. Malformed input, cancellation or OOM
 rolls back uncommitted pages and invalidates the rebuild. Cleanup errors after
 durable commit never roll back that committed decision.
-Ordinary values are materialized into bounded record batches. Transactions
-committed during the LOADING rebuild publish their participant after-images
+Ordinary baseline values are materialized into bounded record batches and
+share the flow's bounded records window across successive scan batches within
+one database. The sender retains admitted completion identities after releasing
+the sent value buffers; only exact ACKs advance source coverage. Database
+completion joins these identities before the single scan coverage map is
+reused. Streaming values and nonempty replacement or publish batches join the
+baseline window before using their existing logical-completion boundary; an
+empty capture-queue check does not drain it. If retaining a batch's completion
+identities cannot be admitted, the sender drains older frames and sends that
+batch synchronously. Replacement and publish-record batches retain their
+existing whole-batch or whole-item confirmation boundary.
+Transactions committed during the LOADING rebuild publish their participant after-images
 only after the commit decision. `FLUSHDB` or `FLUSHALL` invalidates an active
 capture attempt so the next attempt starts from the new database epochs.
 
@@ -1000,7 +1010,8 @@ temporary materializations. They rely on protocol size limits and checked
 allocation rather than max-memory reservations. State that can accumulate or
 survive an individual frame is still admitted against retained memory: this
 includes journal/backlog ownership, full-sync coverage and subscriber queues,
-and the replica's multi-frame large-value staging buffer. Collection RDB
+source baseline completion identities, and the replica's multi-frame large-value
+staging buffer. Collection RDB
 decoders reserve memory before allocating a plain page or packed node; the
 page carries that charge through storage ingestion or output backpressure.
 

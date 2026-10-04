@@ -1431,6 +1431,10 @@ class StorageEngine {
   void AcknowledgePartitionFullSyncOverrides(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::span<const SnapshotRecord> records);
+  // Advances source coverage only after the peer has applied these records.
+  // Call on the owning worker before completing/reusing this DB's scan state.
+  // Value bytes are not inspected; deferred callers may retain only identities
+  // and source handles, keeping streamed handles pinned until all frame ACKs.
   void AcknowledgePartitionSnapshotRecords(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::span<const SnapshotRecord> records);

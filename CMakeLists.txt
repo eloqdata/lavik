@@ -1135,6 +1135,16 @@ if (BUILD_TESTING)
       set_tests_properties(meta_integration.gate_full_record_window PROPERTIES
         LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
       add_test(
+        NAME meta_integration.gate_full_snapshot_window
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_native_replication.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+                snapshot_window
+      )
+      set_tests_properties(meta_integration.gate_full_snapshot_window PROPERTIES
+        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
+      add_test(
         NAME meta_integration.native_fixture_startup
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/test_native_fixture_startup.py)

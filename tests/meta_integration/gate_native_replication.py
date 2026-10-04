@@ -1474,6 +1474,172 @@ def full_record_windows(root):
         full_record_window(root, failure=failure)
 
 
+def full_snapshot_window(root, disconnect=False, receipt_fallback=False):
+    """Pipeline ordinary scan batches and drain at each DB boundary."""
+    tag = next(
+        f"snapshot-window-{i}"
+        for i in range(100000)
+        if C.redis_slot(f"snapshot-window-{i}") == 0
+    )
+    prefix = "{" + tag + "}:"
+    count = 20 * 1024 + 1
+    proxy = FullRecordProxy(prefix=prefix)
+    window_frames = 1 if receipt_fallback else 8
+
+    def key(index):
+        return prefix + str(index)
+
+    def value(db, index):
+        # Well below the 16 KiB grouped-string threshold: these must remain
+        # ordinary kValue records, not streamed Begin/Chunk/Commit transfers.
+        return f"db{db}:{index:05d}".ljust(1024, "x")
+
+    def seed(writer):
+        for db in (0, 15):
+            assert writer.call("SELECT", db) == "OK"
+            for first in range(0, count, 128):
+                args = [
+                    part
+                    for index in range(first, min(first + 128, count))
+                    for part in (key(index), value(db, index))
+                ]
+                assert writer.call("MSET", *args) == "OK"
+        assert writer.call("SELECT", 0) == "OK"
+
+    def filled(db):
+        selected = prefix + f"/db{db}"
+        H.wait_until(
+            f"DB{db} ordinary snapshot window before ACK",
+            30,
+            lambda: proxy.snapshot(selected)["held"] == window_frames,
+        )
+        observed = proxy.snapshot(selected)
+        assert len(observed["frames"]) == window_frames, observed
+        assert observed["forwarded"] == 0
+        assert all(event[2] == 1 for event in observed["frames"]), observed
+        assert sum(event[1] for event in observed["frames"]) <= 16 * 1024 * 1024
+        time.sleep(0.2)
+        assert proxy.snapshot(selected) == observed
+        return selected, observed
+
+    suffix = (
+        "-disconnect" if disconnect else "-receipt-fallback" if receipt_fallback else ""
+    )
+    with pair(
+        root,
+        "full-snapshot-window" + suffix,
+        seed=seed,
+        require_seed_before_full=True,
+        source_workers=1,
+        target_workers=2,
+        client_mode="single",
+        source_proxy=proxy,
+        prepare_source=prepare_window_source,
+        source_faults=(
+            {"LAVIK_FULL_SNAPSHOT_RECEIPT_OOM": "1"} if receipt_fallback else None
+        ),
+        raft_args=H.raft_args(
+            snapshot_distance=100000, election_ms_low=5000, election_ms_high=10000
+        ),
+    ) as (meta, source, target, writer):
+        selected, before = filled(0)
+        assert not proxy.snapshot(prefix + "/db15")["frames"]
+        if disconnect:
+            proxy.cut_flows()
+            H.wait_until(
+                "outstanding ordinary snapshot cancellation reported",
+                30,
+                lambda: C.cluster_status(meta).get("cluster_state")
+                == "provisioning-failed",
+            )
+            reader = Client(target)
+            try:
+                for db in (0, 15):
+                    assert reader.call("SELECT", db) == "OK"
+                    rejects(reader, ("GET", key(0)), "LOADING")
+            finally:
+                reader.close()
+            target.terminate()
+            assert (
+                "replication targets quiesced before storage flush"
+                in Path(target.log_path).read_text()
+            )
+            return
+
+        assert proxy.release(selected, one=True) == 1
+        H.wait_until(
+            "one ordinary record ACK replenishes its window credit",
+            30,
+            lambda: len(proxy.snapshot(selected)["frames"]) == window_frames + 1
+            and proxy.snapshot(selected)["held"] == window_frames,
+        )
+        resumed = proxy.snapshot(selected)
+        assert resumed["forwarded"] == 1
+        assert resumed["frames"][:window_frames] == before["frames"]
+        if receipt_fallback:
+            # Refused receipt metadata must preserve the existing synchronous
+            # frame path. It must neither abort FULL nor silently accumulate
+            # completion ownership outside the retained-memory budget.
+            time.sleep(0.2)
+            assert proxy.snapshot(selected) == resumed
+        # A source DB-completion transition must wait for every completion
+        # receipt before reusing its one-DB scan coverage for DB15.
+        assert not proxy.snapshot(prefix + "/db15")["frames"]
+        expiry = int(time.time() * 1000) + 120000
+        for db in (0, 15):
+            assert writer.call("SELECT", db) == "OK"
+            assert writer.call("SET", key(0), f"db{db}:during-full") == "OK"
+            assert writer.call("DEL", key(1)) == 1
+            assert writer.call("PEXPIREAT", key(2), expiry) == 1
+        assert writer.call("SELECT", 0) == "OK"
+        proxy.release(selected)
+        selected, _ = filled(15)
+        assert writer.call("SELECT", 15) == "OK"
+        assert writer.call("SET", key(0), "db15:second-update") == "OK"
+        proxy.release(selected)
+        ready(meta)
+        reader = Client(target)
+        try:
+            for db in (0, 15):
+                assert reader.call("SELECT", db) == "OK"
+                expected_first = "db15:second-update" if db == 15 else "db0:during-full"
+                H.wait_until(
+                    f"DB{db} baseline and in-flight updates are readable",
+                    30,
+                    lambda: reader.call("GET", key(0)) == expected_first,
+                )
+                for first in range(0, count, 256):
+                    indices = range(first, min(first + 256, count))
+                    expected = [
+                        expected_first
+                        if index == 0
+                        else None
+                        if index == 1
+                        else value(db, index)
+                        for index in indices
+                    ]
+                    assert (
+                        reader.call("MGET", *(key(index) for index in indices))
+                        == expected
+                    )
+                assert reader.call("PEXPIRETIME", key(2)) == expiry
+                assert reader.call("DBSIZE") == count - 1 + (1 if db == 0 else 0)
+                assert writer.call("SELECT", db) == "OK"
+                assert writer.call("APPEND", key(3), ":online") == 1031
+                assert writer.call("WAIT", 1, 5000) == 1
+                assert reader.call("GET", key(3)) == value(db, 3) + ":online"
+        finally:
+            reader.close()
+        assert Path(source.log_path).read_text().count("selected=FULL") == 1
+
+
+def full_snapshot_windows(root):
+    full_snapshot_window(root)
+    full_snapshot_window(root, disconnect=True)
+    if C.has_fault(C.DATA, b"LAVIK_FULL_SNAPSHOT_RECEIPT_OOM"):
+        full_snapshot_window(root, receipt_fallback=True)
+
+
 def handoff_order(root):
     with pair(
         root,
@@ -2366,6 +2532,8 @@ def main():
             mode = sys.argv[5:]
             if mode == ["record_window"]:
                 full_record_windows(root)
+            elif mode == ["snapshot_window"]:
+                full_snapshot_windows(root)
             else:
                 assert mode == ["tomb_raider"], mode
                 tomb_raider(root)

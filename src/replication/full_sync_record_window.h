@@ -27,7 +27,8 @@ namespace lavik::detail {
 
 // One source flow owns this fixed-size ledger on its worker. It retains only
 // completion identities: the ordered writer releases each frame buffer after
-// WriteAll, while the caller retains the source value until the ledger drains.
+// WriteAll. Callers retain per-frame completion state until its exact ACK, or
+// retain a streamed source value until the entire ledger drains.
 // Unlike FULL commands, every record frame has its own ACK and can therefore
 // return byte credit without waiting for the end of a larger logical value.
 class FullSyncRecordWindow {
@@ -90,6 +91,16 @@ class FullSyncRecordWindow {
       inflight_bytes_ -= entry.wire_bytes_;
       entry = {};
       return true;
+    }
+    return false;
+  }
+
+  // A writer-owned completion may be reaped only after its exact entry has
+  // left the ledger; a different frame's ACK says nothing about this one.
+  bool Contains(std::uint64_t sequence) const noexcept {
+    if (sequence == 0) return false;
+    for (const Entry& entry : entries_) {
+      if (entry.sequence_ == sequence) return true;
     }
     return false;
   }

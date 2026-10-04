@@ -10069,6 +10069,24 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     TcpStream& stream, const std::shared_ptr<MasterSession>& session,
     unsigned flow_id, const std::shared_ptr<FullSyncAckState>& ack_state)
     -> Task<absl::StatusOr<std::uint64_t>> {
+  // A baseline frame may finish its socket write before the peer applies it.
+  // Keep only the identities needed to advance coverage, never value copies,
+  // and reap them on this writer before the current DB's coverage is reused.
+  struct PendingSnapshotAck {
+    std::uint64_t sequence_ = 0;
+    std::uint16_t partition_ = 0;
+    RetainedMemoryCharge memory_;
+    std::vector<SnapshotRecord> records_;
+  };
+  std::array<PendingSnapshotAck, detail::FullSyncRecordWindow::kMaxFrames>
+      pending_snapshot_acks;
+  auto receipts_reservation = TryReserveMemory(sizeof(pending_snapshot_acks));
+  if (!receipts_reservation.has_value()) {
+    co_return ReplicationMemoryExhausted("full-sync snapshot completions");
+  }
+  RetainedMemoryCharge receipts_charge;
+  receipts_charge.Adopt(&*receipts_reservation, sizeof(pending_snapshot_acks));
+
   const std::uint8_t db_count = storage_->database_count();
   auto fullsync_start = storage_->BeginFullSyncSession(session->id_);
   if (!fullsync_start.ok()) co_return fullsync_start.status();
@@ -10099,6 +10117,24 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       storage_->EndFullSyncSession(session->id_);
       fullsync_session_active = false;
     }
+  };
+
+  auto reap_snapshot_acks = [&]() {
+    if (!ack_state->status_.ok()) return;
+    for (PendingSnapshotAck& pending : pending_snapshot_acks) {
+      if (pending.sequence_ == 0 ||
+          ack_state->records_.Contains(pending.sequence_)) {
+        continue;
+      }
+      storage_->AcknowledgePartitionSnapshotRecords(
+          session->id_, pending.partition_, pending.records_);
+      pending = {};
+    }
+  };
+  auto drain_snapshot_acks = [&]() -> Task<absl::Status> {
+    absl::Status drained = co_await DrainFullSyncRecords(ack_state);
+    if (drained.ok()) reap_snapshot_acks();
+    co_return drained;
   };
 
   auto send_records =
@@ -10254,7 +10290,13 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       auto pending = storage_->PeekFullSyncPublishItems(
           session->id_, std::min(remaining_items, kBacklogBatchFrames));
       if (!pending.ok()) co_return pending.status();
+      // Empty interleave checks must not turn every scan quantum back into
+      // an ACK round trip. A nonempty FIFO keeps its existing logical-item
+      // completion contract, including the peek-before-pop ownership rule.
+      reap_snapshot_acks();
       if (pending->empty()) co_return absl::OkStatus();
+      absl::Status snapshots_done = co_await drain_snapshot_acks();
+      if (!snapshots_done.ok()) co_return snapshots_done;
 
       if (pending->front().record_.has_value()) {
         const storage::FullSyncPublishItem& item = pending->front();
@@ -10564,7 +10606,10 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       auto batch = co_await storage_->ReadPartitionFullSyncOverrides(
           session->id_, partition_id, kOverrideRecordsPerBatch);
       if (!batch.ok()) co_return batch.status();
+      reap_snapshot_acks();
       if (batch->records_.empty()) co_return absl::OkStatus();
+      absl::Status snapshots_done = co_await drain_snapshot_acks();
+      if (!snapshots_done.ok()) co_return snapshots_done;
       absl::Status sent = co_await send_records(partition_id, batch->records_);
       if (!sent.ok()) co_return sent;
       next_sequence[partition_id] = batch->records_.back().mutation_sequence_;
@@ -10801,11 +10846,67 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
         if (pending_snapshot_records.empty()) {
           co_return absl::OkStatus();
         }
-        absl::Status flushed =
-            co_await send_records(partition_id, pending_snapshot_records);
-        if (!flushed.ok()) co_return flushed;
-        storage_->AcknowledgePartitionSnapshotRecords(
-            session->id_, partition_id, pending_snapshot_records);
+        reap_snapshot_acks();
+        PendingSnapshotAck* completion = nullptr;
+        while (completion == nullptr) {
+          if (!ack_state->status_.ok()) co_return ack_state->status_;
+          for (PendingSnapshotAck& pending : pending_snapshot_acks) {
+            if (pending.sequence_ == 0) {
+              completion = &pending;
+              break;
+            }
+          }
+          if (completion != nullptr) break;
+          co_await ack_state->changed_.Wait();
+          reap_snapshot_acks();
+        }
+
+        // The vector and keys outlive this frame; its value bytes do not.
+        // Admission failure falls back to the original synchronous path once
+        // older frames drain, rather than failing an otherwise viable FULL.
+        std::size_t retained_bytes =
+            pending_snapshot_records.capacity() * sizeof(SnapshotRecord);
+        for (const SnapshotRecord& record : pending_snapshot_records) {
+          retained_bytes += record.key_.capacity() + 1;
+        }
+        auto reservation = TryReserveMemory(retained_bytes);
+        LAVIK_FAULT_INJECT({
+          if (std::getenv("LAVIK_FULL_SNAPSHOT_RECEIPT_OOM") != nullptr) {
+            reservation.reset();
+          }
+        });
+        if (!reservation.has_value()) {
+          absl::Status drained = co_await drain_snapshot_acks();
+          if (!drained.ok()) co_return drained;
+          absl::Status sent =
+              co_await send_records(partition_id, pending_snapshot_records);
+          if (!sent.ok()) co_return sent;
+          storage_->AcknowledgePartitionSnapshotRecords(
+              session->id_, partition_id, pending_snapshot_records);
+          pending_snapshot_records.clear();
+          pending_snapshot_bytes = kRecordsFrameHeaderBytes;
+          co_return absl::OkStatus();
+        }
+
+        std::string payload;
+        absl::Status encoded =
+            EncodeRecords(partition_id, pending_snapshot_records, &payload);
+        if (!encoded.ok()) co_return encoded;
+        completion->sequence_ = fullsync_sequence;
+        completion->partition_ = partition_id;
+        completion->records_ = std::move(pending_snapshot_records);
+        for (SnapshotRecord& record : completion->records_) {
+          std::string{}.swap(record.value_);
+        }
+        completion->memory_.Adopt(&*reservation, retained_bytes);
+        // Install ownership before the suspending write. ACK dispatch only
+        // updates the ledger; this writer reaps even an immediate ACK below.
+        absl::Status sent = co_await SendFullSyncRecord(
+            stream, ack_state, payload, partition_id, fullsync_sequence);
+        if (!sent.ok()) co_return sent;
+        ++fullsync_sequence;
+        session->TouchProgress(flow_id);
+        reap_snapshot_acks();
         pending_snapshot_records.clear();
         pending_snapshot_bytes = kRecordsFrameHeaderBytes;
         co_return absl::OkStatus();
@@ -10844,8 +10945,10 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
             if (!batch->records_.empty()) {
               for (SnapshotRecord& record : batch->records_) {
                 const std::size_t encoded = EncodedRecordBytes(record);
-                if (encoded > kBacklogBatchBytes - kRecordsFrameHeaderBytes) {
+                if (record.source_id_ != 0 ||
+                    encoded > kBacklogBatchBytes - kRecordsFrameHeaderBytes) {
                   sent = co_await flush_snapshot_records();
+                  if (sent.ok()) sent = co_await drain_snapshot_acks();
                   if (!sent.ok()) {
                     cleanup();
                     co_return sent;
@@ -10889,6 +10992,10 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
           } while (cursor != 0);
         }
         sent = co_await flush_snapshot_records();
+        // Completion callbacks address this DB's current coverage map. Join
+        // them before CompletePartitionDbReplication clears and reuses it;
+        // a later DB may contain the same key under a different baseline.
+        if (sent.ok()) sent = co_await drain_snapshot_acks();
         if (!sent.ok()) {
           cleanup();
           co_return sent;
