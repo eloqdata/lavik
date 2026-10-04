@@ -16,6 +16,7 @@
 
 #include "lavik/storage/detail/grouped_object_index.h"
 
+#include <map>
 #include <set>
 #include <string>
 
@@ -1015,6 +1016,13 @@ TEST(GroupedObjectIndexTest, SplitRetainsParentMarkerAcrossFurtherMutations) {
   ASSERT_EQ(input.locations_.size(), 1);
   auto old = Create(input);
   ASSERT_TRUE(old.ok());
+  // A pending coordinate replacement must fold before this topology change;
+  // the new retired marker must win over the older inline override.
+  auto moved = GroupedHashObject::RelocateGroup(*old, input.locations_[0].id_,
+                                                input.locations_[0].location_,
+                                                GroupLocation(1000, 5, 2));
+  ASSERT_TRUE(moved.ok()) << moved.status();
+  old = std::move(moved);
   auto root = input.directory_.root();
   root.group_count_ = 2;
   const std::array<RecoveredHashGroup, 3> changes{
@@ -1287,8 +1295,108 @@ TEST(GroupedObjectIndexTest, FailedPublishedDecisionCannotBeRead) {
             absl::StatusCode::kDataLoss);
 }
 
+TEST(GroupedObjectIndexTest, CoordinateChangesPreserveSnapshotsAndTraversal) {
+  GroupedMemoryScope memory;
+  auto input = Input(5, 1, 500, 256);
+  ASSERT_GT(input.locations_.size(), 64);
+  auto original = Create(input);
+  ASSERT_TRUE(original.ok()) << original.status();
+  auto current = *original;
+  std::map<HashGroupId, std::uint64_t> expected;
+  for (const auto& group : input.locations_)
+    expected.emplace(group.id_, group.location_.block_id());
+  struct Snapshot {
+    GroupedHashObject::Handle object;
+    std::map<HashGroupId, std::uint64_t> blocks;
+  };
+  std::vector<Snapshot> snapshots;
+  // More distinct coordinates than fit a small overlay, followed by repeated
+  // updates, exercise folding and shadow replacement while old views survive.
+  for (std::size_t step = 0; step < 96; ++step) {
+    const auto& group = input.locations_[step % 40];
+    const auto old =
+        GroupLocation(expected.at(group.id_), 5, group.location_.logical_size_);
+    const auto replacement =
+        GroupLocation(100000 + step, 5, group.location_.logical_size_);
+    auto moved =
+        GroupedHashObject::RelocateGroup(current, group.id_, old, replacement);
+    ASSERT_TRUE(moved.ok()) << moved.status();
+    current = std::move(*moved);
+    expected[group.id_] = replacement.block_id();
+    if (step % 7 == 0) snapshots.push_back({current, expected});
+    EXPECT_EQ(current->record_count(), input.locations_.size());
+    std::map<HashGroupId, std::uint64_t> visited;
+    current->ForEachRecord([&](HashGroupId id,
+                               const GroupedRecordIndexEntry& entry,
+                               const auto& extents, bool retired) {
+      EXPECT_FALSE(retired);
+      EXPECT_EQ(extents, nullptr);
+      EXPECT_EQ(current->FindRecord(id), &entry);
+      EXPECT_TRUE(visited.emplace(id, entry.value_.block_id()).second);
+    });
+    EXPECT_EQ(visited, expected);
+  }
+  for (const auto& snapshot : snapshots)
+    for (const auto& [id, block] : snapshot.blocks)
+      EXPECT_EQ(snapshot.object->FindRecord(id)->value_.block_id(), block);
+  for (const auto& group : input.locations_)
+    EXPECT_EQ((*original)->FindRecord(group.id_)->value_.block_id(),
+              group.location_.block_id());
+}
+
+TEST(GroupedObjectIndexTest, ExternalReplacementFoldsPendingInlineCoordinates) {
+  GroupedMemoryScope memory;
+  auto input = Input(5, 1, 100, 256);
+  ASSERT_GT(input.locations_.size(), 16);
+  auto original = Create(input);
+  ASSERT_TRUE(original.ok()) << original.status();
+  auto current = *original;
+  for (std::size_t i = 0; i < 5; ++i) {
+    const auto& group = input.locations_[i];
+    auto moved = GroupedHashObject::RelocateGroup(
+        current, group.id_, group.location_,
+        GroupLocation(10000 + i, 5, group.location_.logical_size_));
+    ASSERT_TRUE(moved.ok()) << moved.status();
+    current = std::move(*moved);
+  }
+  auto before = current;
+  const auto& group = input.locations_[2];
+  auto manifest = std::make_shared<const std::vector<ExtentRef>>(
+      std::vector<ExtentRef>{{.block_id_ = 200000,
+                              .allocation_epoch_ = 17,
+                              .payload_bytes_ = 256,
+                              .payload_checksum_ = 0}});
+  auto external = GroupedHashObject::RelocateGroup(
+      current, group.id_,
+      GroupLocation(10002, 5, group.location_.logical_size_),
+      GroupLocation(30000, 5, group.location_.logical_size_, false, true),
+      manifest);
+  ASSERT_TRUE(external.ok()) << external.status();
+  EXPECT_TRUE((*external)->FindRecord(group.id_)->value_.external());
+  auto retained = (*external)->ExtentsFor(group.id_);
+  ASSERT_NE(retained, nullptr);
+  ASSERT_EQ(retained->size(), 1);
+  EXPECT_EQ(retained->front().block_id_, 200000);
+  std::size_t visited = 0;
+  (*external)->ForEachRecord([&](HashGroupId id,
+                                 const GroupedRecordIndexEntry& entry,
+                                 const auto& extents, bool retired) {
+    ++visited;
+    EXPECT_FALSE(retired);
+    EXPECT_EQ((*external)->FindRecord(id), &entry);
+    if (id == group.id_) EXPECT_EQ(extents, retained);
+  });
+  EXPECT_EQ(visited, input.locations_.size());
+  EXPECT_FALSE(before->FindRecord(group.id_)->value_.external());
+  EXPECT_EQ(before->ExtentsFor(group.id_), nullptr);
+  for (std::size_t i = 0; i < 5; ++i)
+    EXPECT_EQ(
+        (*external)->FindRecord(input.locations_[i].id_)->value_.block_id(),
+        i == 2 ? 30000 : 10000 + i);
+}
+
 TEST(GroupedObjectIndexTest,
-     MetadataOnlyUpdateSharesHashDirectoryAndPhysicalPages) {
+     MetadataOnlyUpdateSharesHashRoutingNodesAndPhysicalPages) {
   auto input = Input();
   auto old = GroupedHashObject::Create(input.version_, input.directory_,
                                        input.locations_);
@@ -1302,7 +1410,12 @@ TEST(GroupedObjectIndexTest,
   auto updated = GroupedHashObject::PrepareMetadataUpdate(*old, version);
   ASSERT_TRUE(updated.ok()) << updated.status();
   EXPECT_TRUE(GroupedHashObject::FinalizeRoot(*updated, version).ok());
-  EXPECT_EQ(&(*old)->directory(), &(*updated)->directory());
+  // Each immutable object owns its header; the routing graph and physical
+  // pages stay shared even when only the root metadata changes.
+  EXPECT_NE(&(*old)->directory(), &(*updated)->directory());
+  for (const auto& group : input.locations_)
+    EXPECT_EQ((*old)->directory().groups().Get(group.id_.prefix_),
+              (*updated)->directory().groups().Get(group.id_.prefix_));
   for (const auto& group : input.locations_)
     EXPECT_EQ((*old)->FindRecord(group.id_), (*updated)->FindRecord(group.id_));
   EXPECT_EQ((*updated)->command_sequence(), 6);

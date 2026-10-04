@@ -20,6 +20,7 @@
 #include <memory>
 #include <span>
 #include <string_view>
+#include <variant>
 
 #include "lavik/storage/detail/grouped_collection.h"
 #include "lavik/storage/detail/grouped_commit.h"
@@ -90,8 +91,10 @@ class GroupedHashObject {
       std::span<const HashGroupLocation> locations,
       std::shared_ptr<ScanHashMapEntryArena> arena = nullptr);
 
-  // Constructs an unpublished update by copying only touched bounded index
-  // pages and their routing paths. The supplied directory is the validated
+  // Constructs an unpublished update with bounded coordinate overrides for
+  // existing inline records, folding them into index pages/routing paths on
+  // overflow, topology changes or external records. No payload is retained.
+  // The supplied directory is the validated
   // after-image; unchanged physical groups and manifests remain shared.
   // The provisional root retains the old physical address until FinalizeRoot.
   // Physical allocation ownership is the caller's invariant: new records and
@@ -153,22 +156,25 @@ class GroupedHashObject {
   // Requires a Hash/Set object or has_member_index(). In the latter case this
   // is the Sorted Set's member-to-score directory, not its ordered pages.
   const HashGroupDirectory& directory() const noexcept {
-    return is_ordered() ? *ordered_directory_->member_directory() : *directory_;
+    return is_ordered() ? *ordered_directory().member_directory()
+                        : std::get<HashGroupDirectory>(directory_);
   }
   bool has_member_index() const noexcept {
-    return is_ordered() && ordered_directory_->member_directory() != nullptr;
+    return is_ordered() && ordered_directory().member_directory() != nullptr;
   }
-  bool is_ordered() const noexcept { return ordered_directory_ != nullptr; }
+  bool is_ordered() const noexcept {
+    return std::holds_alternative<OrderedGroupDirectory>(directory_);
+  }
   const OrderedGroupDirectory& ordered_directory() const noexcept {
-    return *ordered_directory_;
+    return std::get<OrderedGroupDirectory>(directory_);
   }
   std::uint64_t incarnation() const noexcept {
-    return is_ordered() ? ordered_directory_->root().incarnation_
-                        : directory_->root().incarnation_;
+    return is_ordered() ? ordered_directory().root().incarnation_
+                        : directory().root().incarnation_;
   }
   std::uint64_t revision() const noexcept {
-    return is_ordered() ? ordered_directory_->sequence()
-                        : directory_->sequence();
+    return is_ordered() ? ordered_directory().sequence()
+                        : directory().sequence();
   }
   std::uint64_t command_sequence() const noexcept {
     return version_.root_.mutation_sequence_;
@@ -184,8 +190,8 @@ class GroupedHashObject {
   // Logical streaming-page count. Sorted Set streams traverse only ordered
   // pages; physical lifecycle code must use ForEachRecord for both graphs.
   std::size_t group_count() const noexcept {
-    return is_ordered() ? ordered_directory_->root().group_count_
-                        : directory_->root().group_count_;
+    return is_ordered() ? ordered_directory().root().group_count_
+                        : directory().root().group_count_;
   }
   std::size_t record_count() const noexcept;
   using RecordVisitor = std::function<void(
@@ -200,8 +206,12 @@ class GroupedHashObject {
   GroupedObjectVersion version_;
   // Directory nodes. Manifest copies carry independent shared charges so
   // their readers can outlive this object without escaping maxmemory.
-  std::shared_ptr<const HashGroupDirectory> directory_;
-  std::shared_ptr<const OrderedGroupDirectory> ordered_directory_;
+  // The immutable handle owns its small directory header directly. Persistent
+  // routing nodes remain shared across views, without a second allocation and
+  // atomic control block for each command or physical relocation. The variant
+  // stores only the active header; neither alternative retains field values.
+  std::variant<std::monostate, HashGroupDirectory, OrderedGroupDirectory>
+      directory_;
   std::shared_ptr<const GroupedHashPhysicalState> physical_;
 };
 

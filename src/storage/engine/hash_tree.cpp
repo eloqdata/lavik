@@ -800,7 +800,10 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
           selected.insert(metadata.id_);
       }
       const auto add_group = [&](HashGroupId id) -> absl::Status {
-        const auto* entry = grouped->FindGroup(id);
+        // Every id above came from this same immutable directory, and no await
+        // separates routing from admission. Rechecking the logical AVL route
+        // here adds a lookup without strengthening the physical read checks.
+        const auto* entry = grouped->FindRecord(id);
         if (entry == nullptr)
           return absl::DataLossError("missing Hash scratch page");
         // Inline records cannot own a manifest. Avoid a second physical-index

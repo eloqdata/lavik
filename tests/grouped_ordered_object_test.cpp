@@ -489,7 +489,7 @@ TEST(GroupedOrderedObjectTest, UpdatesSameCommandRevisionAndPreservesOldView) {
 }
 
 TEST(GroupedOrderedObjectTest,
-     MetadataOnlyUpdateSharesDirectoryAndPhysicalPages) {
+     MetadataOnlyUpdateSharesRoutingNodesAndPhysicalPages) {
   for (const auto type : {ValueType::kList, ValueType::kSortedSet}) {
     auto input = OrderedFixture(type);
     auto old = GroupedHashObject::CreateOrdered(
@@ -500,7 +500,11 @@ TEST(GroupedOrderedObjectTest,
     auto updated = GroupedHashObject::PrepareMetadataUpdate(*old, version);
     ASSERT_TRUE(updated.ok()) << updated.status();
     EXPECT_TRUE(GroupedHashObject::FinalizeRoot(*updated, version).ok());
-    EXPECT_EQ(&(*old)->ordered_directory(), &(*updated)->ordered_directory());
+    EXPECT_NE(&(*old)->ordered_directory(), &(*updated)->ordered_directory());
+    for (const auto& location : input.locations_)
+      EXPECT_EQ(
+          (*old)->ordered_directory().FindRecord(location.id_.prefix_),
+          (*updated)->ordered_directory().FindRecord(location.id_.prefix_));
     EXPECT_EQ((*old)->FindRecord({1, 0}), (*updated)->FindRecord({1, 0}));
     EXPECT_EQ((*old)->FindRecord({2, 0}), (*updated)->FindRecord({2, 0}));
     EXPECT_EQ((*updated)->command_sequence(), 8);
