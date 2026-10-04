@@ -1838,13 +1838,9 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
   co_await store.replica_apply_mutex_.Lock();
   UnlockGuard replica_unlock(&store.replica_apply_mutex_, store.worker_);
   absl::Status status;
-  try {
-    status = co_await ApplyReplicaRecordsLocked(session_id, partition_id,
-                                                replication_epoch, records);
-  } catch (const std::bad_alloc&) {
-    status =
-        absl::ResourceExhaustedError("replica collection allocation failed");
-  }
+  status = co_await ApplyReplicaRecordsLocked(session_id, partition_id,
+                                              replication_epoch, records);
+
   auto& partition = PartitionFor(store, partition_id);
   auto* sync = partition.replica_sync_.get();
   if (!status.ok() && sync && sync->session_id_ == session_id &&

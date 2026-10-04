@@ -39,6 +39,7 @@
 #include <iterator>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -166,7 +167,7 @@ bool ParseInt(std::string_view text, int min_value, int max_value, int* out) {
     }
     *out = value;
     return true;
-  } catch (...) {
+  } catch (const std::logic_error&) {
     return false;
   }
 }

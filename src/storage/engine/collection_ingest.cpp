@@ -612,49 +612,40 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
   };
 
   absl::Status status;
-  try {
-    status = co_await run();
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    status = absl::ResourceExhaustedError("OOM collection restore");
-  }
+  status = co_await run();
+
   // No source page remains live now. Prepare the journal join and batch fence
   // before committing the independent command decision; all later ownership
   // transfers are moves into capacity admitted before the first mutation.
   if (status.ok()) {
-    try {
-      co_await store.store_state_mutex_.Lock();
-      UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-      auto& suffix = store.tx_undo_.at(writes.txid_);
-      if (suffix.entries_.size() != 1) {
-        status = absl::InternalError("collection restore lost squashed undo");
-      } else {
-        auto* current = suffix.Current(suffix.entries_.front().entry_handle_);
-        if (prefix_address != nullptr)
-          prefix.NoAllocReplace(prefix_address, current);
-        prefix_address = current;
-        if (previous_collect_undo) {
-          auto original = suffix.entries_.front();
-          const auto handle = prefix.Track(current);
-          if (!handle)
-            status =
-                absl::ResourceExhaustedError("collection prefix handle limit");
-          else {
-            original.entry_handle_ = *handle;
-            prefix.entries_.push_back(std::move(original));
-            joined = true;
-          }
+    co_await store.store_state_mutex_.Lock();
+    UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+    auto& suffix = store.tx_undo_.at(writes.txid_);
+    if (suffix.entries_.size() != 1) {
+      status = absl::InternalError("collection restore lost squashed undo");
+    } else {
+      auto* current = suffix.Current(suffix.entries_.front().entry_handle_);
+      if (prefix_address != nullptr)
+        prefix.NoAllocReplace(prefix_address, current);
+      prefix_address = current;
+      if (previous_collect_undo) {
+        auto original = suffix.entries_.front();
+        const auto handle = prefix.Track(current);
+        if (!handle)
+          status =
+              absl::ResourceExhaustedError("collection prefix handle limit");
+        else {
+          original.entry_handle_ = *handle;
+          prefix.entries_.push_back(std::move(original));
+          joined = true;
         }
       }
-      if (status.ok()) {
-        status = ReserveIngestVector(batch.fences_, writes.fences_.size(),
-                                     state->undo_charge_);
-        if (status.ok())
-          batch.fences_.assign(writes.fences_.begin(), writes.fences_.end());
-      }
-    } catch (const std::bad_alloc&) {
-      status =
-          absl::ResourceExhaustedError("OOM collection commit preparation");
+    }
+    if (status.ok()) {
+      status = ReserveIngestVector(batch.fences_, writes.fences_.size(),
+                                   state->undo_charge_);
+      if (status.ok())
+        batch.fences_.assign(writes.fences_.begin(), writes.fences_.end());
     }
   }
   if (status.ok()) {

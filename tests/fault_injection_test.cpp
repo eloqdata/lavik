@@ -22,7 +22,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
-#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -106,7 +105,7 @@ TEST(FaultInjectionTest, InjectIsASingleStatementAndAcceptsCommaBodies) {
   EXPECT_EQ(count, kEnabled ? 7 : 0);
 }
 
-TEST(FaultInjectionTest, MatchAndThrowArgumentsAreErasedInRelease) {
+TEST(FaultInjectionTest, MatchArgumentsAreErasedInRelease) {
   ScopedEnvironment key(kKeyVariable);
   key.Set("armed");
   int variable_calls = 0;
@@ -116,24 +115,6 @@ TEST(FaultInjectionTest, MatchAndThrowArgumentsAreErasedInRelease) {
             kEnabled);
   EXPECT_EQ(variable_calls, kEnabled ? 1 : 0);
   EXPECT_EQ(key_calls, kEnabled ? 1 : 0);
-
-  bool thrown = false;
-  try {
-    LAVIK_FAULT_BAD_ALLOC((++variable_calls, kKeyVariable),
-                          (++key_calls, "armed"));
-  } catch (const std::bad_alloc&) {
-    thrown = true;
-  }
-  EXPECT_EQ(thrown, kEnabled);
-  EXPECT_EQ(variable_calls, kEnabled ? 2 : 0);
-  EXPECT_EQ(key_calls, kEnabled ? 2 : 0);
-  EXPECT_NO_THROW(LAVIK_FAULT_BAD_ALLOC(kKeyVariable, "not-armed"));
-  key.Set("");
-  if constexpr (kEnabled) {
-    EXPECT_THROW(LAVIK_FAULT_BAD_ALLOC(kKeyVariable, ""), std::bad_alloc);
-  } else {
-    EXPECT_NO_THROW(LAVIK_FAULT_BAD_ALLOC(kKeyVariable, ""));
-  }
 }
 
 TEST(FaultInjectionTest, NthMatchIsStrictOneBasedAndCallerLocal) {
@@ -183,7 +164,6 @@ TEST(FaultInjectionTest, ReleaseErasesEvenUnavailableArgumentNames) {
   EXPECT_FALSE(LAVIK_FAULT_MATCHES_NTH(missing_variable, missing_key,
                                        missing_ordinal_variable,
                                        missing_ordinal));
-  LAVIK_FAULT_BAD_ALLOC(missing_variable, missing_key);
   LAVIK_MAYBE_CRASH_AT(missing_crash_point);
 #else
   SUCCEED();

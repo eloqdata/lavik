@@ -21,6 +21,7 @@
 #include <bit>
 #include <chrono>
 #include <future>
+#include <stdexcept>
 
 #include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
@@ -655,7 +656,7 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
                     } else
                       attempt->replied_ = true;
                   }
-                } catch (...) {
+                } catch (const std::logic_error&) {
                   attempt->replied_ = true;
                 }
                 attempt->entered_.store(true, std::memory_order_release);

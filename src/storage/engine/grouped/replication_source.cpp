@@ -96,16 +96,13 @@ absl::Status StorageEngine::Impl::PrepareFullSyncPinnedValueInsert(
     RecordMemoryRejection();
     return absl::ResourceExhaustedError("OOM full-sync source map admission");
   }
-  try {
+  {
     map.reserve(map.size() + 1);
     const auto bytes = map.capacity() * kMapSlotBytes;
     if (bytes > budget)
       return absl::ResourceExhaustedError(
           "full-sync source map exceeded reserved capacity");
     capture.pinned_values_charge_.Adopt(&*reservation, bytes);
-  } catch (const std::bad_alloc&) {
-    return absl::ResourceExhaustedError(
-        "full-sync source map allocation failed");
   }
   return absl::OkStatus();
 }
@@ -175,77 +172,72 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
     co_return absl::ResourceExhaustedError(
         "OOM full-sync collection page admission");
   }
-  try {
-    CollectionPage page{.value_type_ = stream->saved_.location_.value_type()};
-    if (object->is_ordered()) {
-      auto decoded = co_await LoadOrderedGroupSnapshot(
-          store, partition, stream->db_id_, stream->key_, stream->digest_,
-          object, id.prefix_, true);
-      if (!decoded.ok()) co_return decoded.status();
-      if (page.value_type_ == ValueType::kStream ||
-          page.value_type_ == ValueType::kString ||
-          page.value_type_ == ValueType::kList) {
-        page.elements_.reserve(count);
-        for (auto& item : decoded->snapshot_.entries_)
-          page.elements_.push_back(std::move(item.value_));
-      } else {
-        page.scored_members_.reserve(count);
-        for (auto& item : decoded->snapshot_.entries_)
-          page.scored_members_.push_back({std::move(item.value_), item.score_});
-      }
-      page.done_ =
-          stream->cursor_ + 1 == object->ordered_directory().groups().size();
+  CollectionPage page{.value_type_ = stream->saved_.location_.value_type()};
+  if (object->is_ordered()) {
+    auto decoded = co_await LoadOrderedGroupSnapshot(
+        store, partition, stream->db_id_, stream->key_, stream->digest_, object,
+        id.prefix_, true);
+    if (!decoded.ok()) co_return decoded.status();
+    if (page.value_type_ == ValueType::kStream ||
+        page.value_type_ == ValueType::kString ||
+        page.value_type_ == ValueType::kList) {
+      page.elements_.reserve(count);
+      for (auto& item : decoded->snapshot_.entries_)
+        page.elements_.push_back(std::move(item.value_));
     } else {
-      auto decoded = co_await LoadHashGroupSnapshot(
-          store, partition, stream->db_id_, stream->key_, stream->digest_,
-          object, id, true);
-      if (!decoded.ok()) co_return decoded.status();
-      if (page.value_type_ == ValueType::kHash)
-        page.fields_.reserve(count);
-      else
-        page.elements_.reserve(count);
-      for (auto& item : decoded->snapshot_.value_.entries_) {
-        if (page.value_type_ == ValueType::kHash) {
-          page.fields_.push_back(
-              {std::move(item.field_), std::move(item.value_)});
-        } else {
-          if (!item.value_.empty())
-            co_return absl::DataLossError(
-                "full-sync Set page contains a Hash value");
-          page.elements_.push_back(std::move(item.field_));
-        }
-      }
-      ++stream->hash_cursor_;
-      page.done_ = stream->hash_cursor_ == object->directory().groups().end();
+      page.scored_members_.reserve(count);
+      for (auto& item : decoded->snapshot_.entries_)
+        page.scored_members_.push_back({std::move(item.value_), item.score_});
     }
-    if (!stream->Valid(*this))
-      co_return absl::CancelledError(
-          "full-sync population changed during page read");
-    const auto total = object->is_ordered()
-                           ? object->ordered_directory().root().item_count_
-                           : stream->saved_.location_.logical_size_;
-    const auto logical_count =
-        page.value_type_ == ValueType::kString
-            ? (page.elements_.empty() ? 0 : page.elements_.front().size())
-            : page.size();
-    if (stream->emitted_count_ > total ||
-        logical_count > total - stream->emitted_count_ ||
-        (page.done_ && logical_count != total - stream->emitted_count_))
-      co_return absl::DataLossError(
-          "full-sync collection aggregate count mismatch");
-    stream->emitted_count_ += logical_count;
-    stream->pages_done_ = page.done_;
-    page.next_cursor_ = ++stream->cursor_;
-    const auto retained = page.RetainedBytes();
-    if (retained > budget)
-      co_return absl::ResourceExhaustedError(
-          "full-sync page exceeds admitted capacity");
-    page.retained_charge_.Adopt(&*reservation, retained);
-    co_return page;
-  } catch (const std::bad_alloc&) {
-    co_return absl::ResourceExhaustedError(
-        "full-sync collection page allocation failed");
+    page.done_ =
+        stream->cursor_ + 1 == object->ordered_directory().groups().size();
+  } else {
+    auto decoded = co_await LoadHashGroupSnapshot(
+        store, partition, stream->db_id_, stream->key_, stream->digest_, object,
+        id, true);
+    if (!decoded.ok()) co_return decoded.status();
+    if (page.value_type_ == ValueType::kHash)
+      page.fields_.reserve(count);
+    else
+      page.elements_.reserve(count);
+    for (auto& item : decoded->snapshot_.value_.entries_) {
+      if (page.value_type_ == ValueType::kHash) {
+        page.fields_.push_back(
+            {std::move(item.field_), std::move(item.value_)});
+      } else {
+        if (!item.value_.empty())
+          co_return absl::DataLossError(
+              "full-sync Set page contains a Hash value");
+        page.elements_.push_back(std::move(item.field_));
+      }
+    }
+    ++stream->hash_cursor_;
+    page.done_ = stream->hash_cursor_ == object->directory().groups().end();
   }
+  if (!stream->Valid(*this))
+    co_return absl::CancelledError(
+        "full-sync population changed during page read");
+  const auto total = object->is_ordered()
+                         ? object->ordered_directory().root().item_count_
+                         : stream->saved_.location_.logical_size_;
+  const auto logical_count =
+      page.value_type_ == ValueType::kString
+          ? (page.elements_.empty() ? 0 : page.elements_.front().size())
+          : page.size();
+  if (stream->emitted_count_ > total ||
+      logical_count > total - stream->emitted_count_ ||
+      (page.done_ && logical_count != total - stream->emitted_count_))
+    co_return absl::DataLossError(
+        "full-sync collection aggregate count mismatch");
+  stream->emitted_count_ += logical_count;
+  stream->pages_done_ = page.done_;
+  page.next_cursor_ = ++stream->cursor_;
+  const auto retained = page.RetainedBytes();
+  if (retained > budget)
+    co_return absl::ResourceExhaustedError(
+        "full-sync page exceeds admitted capacity");
+  page.retained_charge_.Adopt(&*reservation, retained);
+  co_return page;
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
@@ -279,7 +271,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
         "OOM full-sync source metadata admission");
   }
   std::shared_ptr<FullSyncCollection> stream;
-  try {
+  {
     stream = std::make_shared<FullSyncCollection>();
     stream->store_ = &store;
     stream->partition_ = &partition;
@@ -291,9 +283,6 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
     stream->saved_.extents_ = std::move(root_extents);
     stream->saved_.grouped_ = std::move(*object);
     stream->charge_.Adopt(&*reservation, budget);
-  } catch (const std::bad_alloc&) {
-    co_return absl::ResourceExhaustedError(
-        "full-sync source state allocation failed");
   }
   // A pre-scan is not in pinned_values_ yet. Keep it visible to shutdown from
   // BEFORE the first owner hop until publication or a registered release task
@@ -368,15 +357,12 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
   // belongs to the capture, not an individual value released by ACK.
   auto map_prepared = PrepareFullSyncPinnedValueInsert(capture->second);
   if (!map_prepared.ok()) co_return map_prepared;
-  try {
+  {
     auto [_, inserted] = capture->second.pinned_values_.emplace(
         id, WorkerStore::FullSyncCapture::PinnedValue{
                 .extents_ = {}, .collection_ = stream, .value_bytes_ = bytes});
     if (!inserted)
       co_return absl::InternalError("duplicate full-sync collection source id");
-  } catch (const std::bad_alloc&) {
-    co_return absl::ResourceExhaustedError(
-        "full-sync collection source map allocation failed");
   }
   ++capture->second.next_pinned_value_id_;
   *encoded_bytes = bytes;
@@ -405,32 +391,60 @@ StorageEngine::Impl::ReadFullSyncCollectionChunk(
       });
   const auto count = static_cast<std::size_t>(
       std::min<std::uint64_t>(max_bytes, stream->encoded_bytes_ - offset));
-  try {
-    std::string output;
-    output.reserve(count);
-    while (output.size() < count) {
-      if (!stream->Valid(*this)) {
-        stream->cancelled_ = true;
-        co_return absl::CancelledError("full-sync collection stream cancelled");
-      }
-      if (!stream->piece_.empty()) {
-        const auto take =
-            std::min(count - output.size(), stream->piece_.size());
-        output.append(stream->piece_.substr(0, take));
-        stream->piece_.remove_prefix(take);
-        continue;
-      }
+  std::string output;
+  output.reserve(count);
+  while (output.size() < count) {
+    if (!stream->Valid(*this)) {
+      stream->cancelled_ = true;
+      co_return absl::CancelledError("full-sync collection stream cancelled");
+    }
+    if (!stream->piece_.empty()) {
+      const auto take = std::min(count - output.size(), stream->piece_.size());
+      output.append(stream->piece_.substr(0, take));
+      stream->piece_.remove_prefix(take);
+      continue;
+    }
+    if (auto piece = stream->encoder_->Next()) {
+      stream->piece_ = *piece;
+      continue;
+    }
+    if (stream->pages_done_) {
+      stream->cancelled_ = true;
+      co_return absl::DataLossError("full-sync collection encoder ended early");
+    }
+    // The last span has been consumed. Drop its page and charge before
+    // admitting the next one, including when both pages contain huge items.
+    stream->page_.reset();
+    auto page = co_await NextFullSyncCollectionPage(stream);
+    if (!page.ok()) {
+      stream->cancelled_ = true;
+      co_return page.status();
+    }
+    stream->page_.emplace(std::move(*page));
+    auto started = stream->encoder_->StartPage(*stream->page_);
+    if (!started.ok()) {
+      stream->cancelled_ = true;
+      co_return started;
+    }
+  }
+  stream->offset_ += output.size();
+  if (stream->offset_ == stream->encoded_bytes_) {
+    // Empty trailing fields/values still advance cursor state, but no
+    // nonempty byte may remain beyond the measured wire boundary.
+    if (!stream->piece_.empty()) {
+      stream->cancelled_ = true;
+      co_return absl::DataLossError("full-sync encoder has bytes beyond EOF");
+    }
+    for (;;) {
       if (auto piece = stream->encoder_->Next()) {
-        stream->piece_ = *piece;
-        continue;
-      }
-      if (stream->pages_done_) {
+        if (piece->empty()) continue;
         stream->cancelled_ = true;
         co_return absl::DataLossError(
-            "full-sync collection encoder ended early");
+            "full-sync collection exceeded measured length");
       }
-      // The last span has been consumed. Drop its page and charge before
-      // admitting the next one, including when both pages contain huge items.
+      if (stream->pages_done_) break;
+      // Empty Hash/Set routing leaves still have to advance the directory
+      // cursor after its last nonempty leaf emitted the last wire byte.
       stream->page_.reset();
       auto page = co_await NextFullSyncCollectionPage(stream);
       if (!page.ok()) {
@@ -444,52 +458,16 @@ StorageEngine::Impl::ReadFullSyncCollectionChunk(
         co_return started;
       }
     }
-    stream->offset_ += output.size();
-    if (stream->offset_ == stream->encoded_bytes_) {
-      // Empty trailing fields/values still advance cursor state, but no
-      // nonempty byte may remain beyond the measured wire boundary.
-      if (!stream->piece_.empty()) {
-        stream->cancelled_ = true;
-        co_return absl::DataLossError("full-sync encoder has bytes beyond EOF");
-      }
-      for (;;) {
-        if (auto piece = stream->encoder_->Next()) {
-          if (piece->empty()) continue;
-          stream->cancelled_ = true;
-          co_return absl::DataLossError(
-              "full-sync collection exceeded measured length");
-        }
-        if (stream->pages_done_) break;
-        // Empty Hash/Set routing leaves still have to advance the directory
-        // cursor after its last nonempty leaf emitted the last wire byte.
-        stream->page_.reset();
-        auto page = co_await NextFullSyncCollectionPage(stream);
-        if (!page.ok()) {
-          stream->cancelled_ = true;
-          co_return page.status();
-        }
-        stream->page_.emplace(std::move(*page));
-        auto started = stream->encoder_->StartPage(*stream->page_);
-        if (!started.ok()) {
-          stream->cancelled_ = true;
-          co_return started;
-        }
-      }
-      auto finished = stream->encoder_->Finish();
-      if (!finished.ok() || !stream->piece_.empty() || !stream->pages_done_) {
-        stream->cancelled_ = true;
-        co_return finished.ok()
-            ? absl::DataLossError("full-sync collection EOF mismatch")
-            : finished;
-      }
-      stream->page_.reset();
+    auto finished = stream->encoder_->Finish();
+    if (!finished.ok() || !stream->piece_.empty() || !stream->pages_done_) {
+      stream->cancelled_ = true;
+      co_return finished.ok()
+          ? absl::DataLossError("full-sync collection EOF mismatch")
+          : finished;
     }
-    co_return output;
-  } catch (const std::bad_alloc&) {
-    stream->cancelled_ = true;
-    co_return absl::ResourceExhaustedError(
-        "full-sync collection transfer buffer allocation failed");
+    stream->page_.reset();
   }
+  co_return output;
 }
 
 Task<absl::Status> StorageEngine::Impl::ReleaseFullSyncCollection(

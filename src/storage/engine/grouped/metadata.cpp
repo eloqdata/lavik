@@ -157,28 +157,26 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
         store_->write_failed_ = true;
       }
     } handoff{&store, decision->get()};
-    bool unlocked_for_handoff = false;
+
     absl::Status handoff_status;
-    try {
-      LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_GROUP_HANDOFF_KEY", key);
+    {
+      if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_GROUP_HANDOFF_KEY", key)) {
+        RecordMemoryRejection();
+        co_return absl::ResourceExhaustedError(
+            "OOM completing grouped publication handoff");
+      }
       PublishCommittedFullSyncEffects(&standalone);
       std::vector<TxShardWrites> receipts;
       receipts.push_back(std::move(standalone));
       const auto transaction_id = receipts.front().txid_;
       if (!EnqueueTxCommit(transaction_id, std::move(receipts))) {
         store.store_state_mutex_.Unlock(*store.worker_);
-        unlocked_for_handoff = true;
         const auto capacity = co_await WaitForTxCommitCapacity();
         co_await store.store_state_mutex_.Lock();
-        unlocked_for_handoff = false;
         handoff_status = capacity;
       }
-    } catch (const std::bad_alloc&) {
-      RecordMemoryRejection();
-      handoff_status = absl::ResourceExhaustedError(
-          "OOM completing grouped expiration handoff");
     }
-    if (unlocked_for_handoff) co_await store.store_state_mutex_.Lock();
+
     if (!handoff_status.ok()) {
       // The new TTL is a published root too. Failure to hand its decision to
       // a commit owner cannot make that tentative expiry readable or durable.
