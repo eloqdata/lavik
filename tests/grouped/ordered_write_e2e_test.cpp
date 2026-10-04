@@ -699,9 +699,18 @@ TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
   do {
     // Enqueue lazy expiration as well: this is a storage-capacity test, not a
     // deadline for a complete sweep of all partition/database maps.
+    bool expired = true;
     for (unsigned i = 0; i < 32; ++i) {
-      (void)client.Command({"EXISTS", "{expiry-387}" + std::to_string(i),
-                            "{expiry-387}fill:" + std::to_string(i)});
+      expired &= client
+                     .Command({"EXISTS", "{expiry-387}" + std::to_string(i),
+                               "{expiry-387}fill:" + std::to_string(i)})
+                     .text_ == "0";
+    }
+    // Defrag can make room before the TTLs elapse. A successful replacement
+    // alone does not establish that the old keys should be absent on recovery.
+    if (!expired) {
+      std::this_thread::sleep_for(100ms);
+      continue;
     }
     reply = client.Command({"SET", "replacement", value});
     if (reply.text_ == "OK") break;
