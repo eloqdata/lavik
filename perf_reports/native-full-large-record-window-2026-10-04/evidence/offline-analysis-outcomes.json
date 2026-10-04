@@ -1,0 +1,672 @@
+[
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-chunks",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-records",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-chunks",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-records",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-chunks",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-records",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-hash-128m-f1-rtt20/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-hash-128m-f1-rtt20/r1-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-hash-128m-f1-rtt20/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-hash-128m-f1-rtt20/r2-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-hash-128m-f1-rtt20/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-hash-128m-f1-rtt20/r3-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-hash-128m-f1-rtt5/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-hash-128m-f1-rtt5/r1-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-hash-128m-f1-rtt5/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-hash-128m-f1-rtt5/r2-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-hash-128m-f1-rtt5/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-hash-128m-f1-rtt5/r3-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20-queue32/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20-queue32/r1-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20-queue32/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20-queue32/r2-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20-queue32/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20-queue32/r3-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt5/r1-chunks",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt5/r1-main",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt5/r2-chunks",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt5/r2-main",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt5/r3-chunks",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt5/r3-main",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt5-queue32/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt5-queue32/r1-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt5-queue32/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt5-queue32/r2-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt5-queue32/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt5-queue32/r3-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt0/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt0/r1-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt0/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt0/r2-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt0/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt0/r3-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt1/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt1/r1-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt1/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt1/r2-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt1/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt1/r3-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt20/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt20/r1-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt20/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt20/r2-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt20/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt20/r3-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt5/r1-chunks",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt5/r1-main",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt5/r2-chunks",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt5/r2-main",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt5/r3-chunks",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f1-rtt5/r3-main",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f4-rtt20/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f4-rtt20/r1-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f4-rtt20/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f4-rtt20/r2-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f4-rtt20/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f4-rtt20/r3-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f4-rtt5/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f4-rtt5/r1-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f4-rtt5/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f4-rtt5/r2-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f4-rtt5/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/large-string-128m-f4-rtt5/r3-main",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-chunks",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-records",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-chunks",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-records",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-chunks",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-records",
+    "frame-spans": "existing",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-chunks",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  },
+  {
+    "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-records",
+    "frame-spans": "ok",
+    "tcp-overlap": "ok"
+  }
+]

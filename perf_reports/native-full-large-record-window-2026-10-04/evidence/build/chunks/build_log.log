@@ -1,0 +1,32 @@
+[0/2] Re-checking globbed directories...
+-- GLOB mismatch!
+-- GLOB mismatch!
+[1/2] Re-running CMake...
+-- clang-format 23.1.1 not found; format targets are disabled
+-- clang-format 23.1.1 not found; bycorf format targets are disabled
+-- 
+-- Architecture: x64
+-- Disable transparent huge pages support (MI_NO_THP=ON)
+-- 
+-- Library name     : mimalloc
+-- Version          : 3.4.5
+-- Build type       : release
+-- C Compiler       : /usr/bin/cc
+-- Compiler flags   : -Wall;-Wextra;-Wno-unknown-pragmas;-fvisibility=hidden;-Wstrict-prototypes;-ftls-model=initial-exec
+-- Compiler defines : MI_DEFAULT_ARENA_EAGER_COMMIT=1;MI_DEFAULT_ALLOW_THP=0;MI_CMAKE_BUILD_TYPE=release;MI_BUILD_RELEASE
+-- Link libraries   : pthread;rt;atomic
+-- Build targets    : static
+-- 
+-- Configuring done (0.2s)
+-- Generating done (0.1s)
+-- Build files have been written to: /mnt/local_nvme/i131/build-base
+[0/2] Re-checking globbed directories...
+[1/5] Building CXX object CMakeFiles/lavik_module.dir/src/replication/redis_export.cpp.o
+/mnt/local_nvme/i131/base/src/replication/redis_export.cpp: In member function ‘bool lavik::replication_internal::RedisRdbStreamQueue::TryPush(std::string*, unsigned int)’:
+/mnt/local_nvme/i131/base/src/replication/redis_export.cpp:134:48: warning: unused parameter ‘owner’ [-Wunused-parameter]
+  134 |   bool TryPush(std::string* fragment, unsigned owner) {
+      |                                       ~~~~~~~~~^~~~~
+[2/5] Building CXX object CMakeFiles/lavik_module.dir/src/replication/redis_replication.cpp.o
+[3/5] Building CXX object CMakeFiles/lavik_module.dir/src/replication/replication.cpp.o
+[4/5] Linking CXX static library liblavik_module.a
+[5/5] Linking CXX executable lavik

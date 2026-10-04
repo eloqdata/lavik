@@ -1,0 +1,20 @@
+| Case | Variant | Repeat | Begun | Latency n | Completed | QPS | Latency median ms | p99 ms | Max ms | Crossed FULL end |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| large-live-128m-f1-rtt20-queue32 | chunks | 1 | 10 | 10 | 10 | 0.95 | 90.36 | 216.32 | 216.32 | 0 |
+| large-live-128m-f1-rtt20-queue32 | chunks | 2 | 10 | 10 | 10 | 0.96 | 81.54 | 515.40 | 515.40 | 0 |
+| large-live-128m-f1-rtt20-queue32 | chunks | 3 | 10 | 10 | 10 | 0.95 | 83.55 | 490.89 | 490.89 | 0 |
+| large-live-128m-f1-rtt20-queue32 | main | 1 | 13 | 13 | 13 | 0.95 | 96.26 | 171.68 | 171.68 | 0 |
+| large-live-128m-f1-rtt20-queue32 | main | 2 | 14 | 14 | 14 | 1.01 | 92.86 | 178.94 | 178.94 | 0 |
+| large-live-128m-f1-rtt20-queue32 | main | 3 | 13 | 13 | 13 | 0.97 | 82.08 | 208.69 | 208.69 | 0 |
+| large-live-128m-f1-rtt5 | chunks | 1 | 4 | 4 | 4 | 0.84 | 77.47 | 86.63 | 86.63 | 0 |
+| large-live-128m-f1-rtt5 | chunks | 2 | 5 | 5 | 5 | 0.95 | 81.68 | 168.12 | 168.12 | 0 |
+| large-live-128m-f1-rtt5 | chunks | 3 | 4 | 4 | 4 | 0.84 | 97.17 | 109.43 | 109.43 | 0 |
+| large-live-128m-f1-rtt5 | main | 1 | 5 | 5 | 5 | 0.93 | 76.48 | 158.51 | 158.51 | 0 |
+| large-live-128m-f1-rtt5 | main | 2 | 5 | 5 | 5 | 0.94 | 95.32 | 126.56 | 126.56 | 0 |
+| large-live-128m-f1-rtt5 | main | 3 | 5 | 5 | 6 | 1.14 | 80.51 | 86.04 | 86.04 | 0 |
+| large-live-128m-f1-rtt5-queue32 | chunks | 1 | 5 | 5 | 4 | 0.83 | 96.38 | 170.80 | 170.80 | 1 |
+| large-live-128m-f1-rtt5-queue32 | chunks | 2 | 5 | 5 | 4 | 0.82 | 78.70 | 245.09 | 245.09 | 1 |
+| large-live-128m-f1-rtt5-queue32 | chunks | 3 | 5 | 5 | 5 | 0.93 | 95.67 | 695.54 | 695.54 | 0 |
+| large-live-128m-f1-rtt5-queue32 | main | 1 | 4 | 4 | 4 | 0.83 | 95.12 | 96.94 | 96.94 | 0 |
+| large-live-128m-f1-rtt5-queue32 | main | 2 | 5 | 5 | 5 | 0.88 | 90.64 | 115.35 | 115.35 | 0 |
+| large-live-128m-f1-rtt5-queue32 | main | 3 | 5 | 5 | 5 | 0.87 | 99.77 | 156.90 | 156.90 | 0 |

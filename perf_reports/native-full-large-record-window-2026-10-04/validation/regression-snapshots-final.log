@@ -1,0 +1,119 @@
+Internal ctest changing into directory: /mnt/local_nvme/i131/build-snapshots-debug
+Test project /mnt/local_nvme/i131/build-snapshots-debug
+      Start   1: cluster_model.ManualClockTest.MovesOnlyForward
+ 1/54 Test   #1: cluster_model.ManualClockTest.MovesOnlyForward ........................................................................................................................   Passed    0.00 sec
+      Start   2: cluster_model.SimNetworkTest.ControlsPartitionOrderDuplicationAndDrop
+ 2/54 Test   #2: cluster_model.SimNetworkTest.ControlsPartitionOrderDuplicationAndDrop .................................................................................................   Passed    0.00 sec
+      Start   3: cluster_model.SimStorageTest.SeparatesCompletionDurabilityAndRecovery
+ 3/54 Test   #3: cluster_model.SimStorageTest.SeparatesCompletionDurabilityAndRecovery .................................................................................................   Passed    0.00 sec
+      Start   4: cluster_model.ControlPlaneReferenceMachineTest.ReplaysIdempotentlyAndRejectsForks
+ 4/54 Test   #4: cluster_model.ControlPlaneReferenceMachineTest.ReplaysIdempotentlyAndRejectsForks .....................................................................................   Passed    0.00 sec
+      Start   5: cluster_model.FaultControllerTest.MatchesStableCheckpointOccurrence
+ 5/54 Test   #5: cluster_model.FaultControllerTest.MatchesStableCheckpointOccurrence ...................................................................................................   Passed    0.00 sec
+      Start   6: cluster_model.LftTraceTest.HasCanonicalRoundTripAndGoldenEncoding
+ 6/54 Test   #6: cluster_model.LftTraceTest.HasCanonicalRoundTripAndGoldenEncoding .....................................................................................................   Passed    0.00 sec
+      Start   7: cluster_model.LftTraceTest.RejectsMalformedAndUnknownInputs
+ 7/54 Test   #7: cluster_model.LftTraceTest.RejectsMalformedAndUnknownInputs ...........................................................................................................   Passed    0.00 sec
+      Start   8: cluster_model.LftTraceTest.ActionCodecPreservesTypedArgumentsAndPayload
+ 8/54 Test   #8: cluster_model.LftTraceTest.ActionCodecPreservesTypedArgumentsAndPayload ...............................................................................................   Passed    0.00 sec
+      Start   9: cluster_model.ScenarioRunnerTest.SameSeedProducesByteIdenticalTrace
+ 9/54 Test   #9: cluster_model.ScenarioRunnerTest.SameSeedProducesByteIdenticalTrace ...................................................................................................   Passed    0.00 sec
+      Start  10: cluster_model.ScenarioRunnerTest.MinimizerRemovesIrrelevantTransitions
+10/54 Test  #10: cluster_model.ScenarioRunnerTest.MinimizerRemovesIrrelevantTransitions ................................................................................................   Passed    0.00 sec
+      Start  11: cluster_model.ScenarioRunnerTest.GoodScenarioExploresAndReplaysDistinctSchedules
+11/54 Test  #11: cluster_model.ScenarioRunnerTest.GoodScenarioExploresAndReplaysDistinctSchedules ......................................................................................   Passed    0.53 sec
+      Start  12: cluster_model.ScenarioRunnerTest.RejectsScenarioAndObservationDrift
+12/54 Test  #12: cluster_model.ScenarioRunnerTest.RejectsScenarioAndObservationDrift ...................................................................................................   Passed    0.00 sec
+      Start  13: cluster_model.LftRegressionTest.CheckedInCounterexamplesRemainReplayable
+13/54 Test  #13: cluster_model.LftRegressionTest.CheckedInCounterexamplesRemainReplayable ..............................................................................................   Passed    0.00 sec
+      Start  14: cluster_model.ClusterInvariantTest.AcceptsGoodReferenceSnapshot
+14/54 Test  #14: cluster_model.ClusterInvariantTest.AcceptsGoodReferenceSnapshot .......................................................................................................   Passed    0.00 sec
+      Start  15: cluster_model.ClusterInvariantTest.RejectsDirectiveForAnotherReplicationGroup
+15/54 Test  #15: cluster_model.ClusterInvariantTest.RejectsDirectiveForAnotherReplicationGroup .........................................................................................   Passed    0.00 sec
+      Start  16: cluster_model.ClusterInvariantTest.AcceptsDirectiveForTheAssignedReplicationGroup
+16/54 Test  #16: cluster_model.ClusterInvariantTest.AcceptsDirectiveForTheAssignedReplicationGroup .....................................................................................   Passed    0.00 sec
+      Start  17: cluster_model.ClusterInvariantTest.RejectsDestructiveResetWithoutSafeSource
+17/54 Test  #17: cluster_model.ClusterInvariantTest.RejectsDestructiveResetWithoutSafeSource ...........................................................................................   Passed    0.00 sec
+      Start  18: cluster_model.ClusterInvariantTest.AcceptsDestructiveResetWithSafeSourceAssertion
+18/54 Test  #18: cluster_model.ClusterInvariantTest.AcceptsDestructiveResetWithSafeSourceAssertion .....................................................................................   Passed    0.00 sec
+      Start  19: cluster_model.ClusterInvariantTest.RejectsEveryReadinessExposureWithMismatchedIdentityOrManifest
+19/54 Test  #19: cluster_model.ClusterInvariantTest.RejectsEveryReadinessExposureWithMismatchedIdentityOrManifest ......................................................................   Passed    0.00 sec
+      Start  20: cluster_model.ClusterInvariantTest.RejectsEveryReadinessExposureWithoutIdentity
+20/54 Test  #20: cluster_model.ClusterInvariantTest.RejectsEveryReadinessExposureWithoutIdentity .......................................................................................   Passed    0.00 sec
+      Start  21: cluster_model.ClusterInvariantTest.AcceptsEveryFullyProvenReadinessExposure
+21/54 Test  #21: cluster_model.ClusterInvariantTest.AcceptsEveryFullyProvenReadinessExposure ...........................................................................................   Passed    0.00 sec
+      Start  22: cluster_model.ClusterInvariantTest.RejectsEveryIncompleteReadinessProof
+22/54 Test  #22: cluster_model.ClusterInvariantTest.RejectsEveryIncompleteReadinessProof ...............................................................................................   Passed    0.00 sec
+      Start  23: cluster_model.ClusterInvariantTest.RejectsRetryAfterPopulationFailedStopped
+23/54 Test  #23: cluster_model.ClusterInvariantTest.RejectsRetryAfterPopulationFailedStopped ...........................................................................................   Passed    0.00 sec
+      Start  24: cluster_model.ClusterInvariantTest.RejectsEveryExposureAfterPopulationFailedStopped
+24/54 Test  #24: cluster_model.ClusterInvariantTest.RejectsEveryExposureAfterPopulationFailedStopped ...................................................................................   Passed    0.00 sec
+      Start  25: cluster_model.ClusterInvariantTest.AcceptsQuiescentFailedStoppedPopulation
+25/54 Test  #25: cluster_model.ClusterInvariantTest.AcceptsQuiescentFailedStoppedPopulation ............................................................................................   Passed    0.00 sec
+      Start  26: cluster_model.ClusterInvariantTest.RetiredPopulationCapacityRemainsUnavailableUntilReclaim
+26/54 Test  #26: cluster_model.ClusterInvariantTest.RetiredPopulationCapacityRemainsUnavailableUntilReclaim ............................................................................   Passed    0.00 sec
+      Start  27: cluster_model.ClusterInvariantTest.RepeatedAbortMustReturnRuntimeIndexToBaseline
+27/54 Test  #27: cluster_model.ClusterInvariantTest.RepeatedAbortMustReturnRuntimeIndexToBaseline ......................................................................................   Passed    0.00 sec
+      Start  28: cluster_model.ClusterInvariantTest.CoversRemainingMatrixRows
+28/54 Test  #28: cluster_model.ClusterInvariantTest.CoversRemainingMatrixRows ..........................................................................................................   Passed    0.00 sec
+      Start  29: cluster_model.ClusterInvariantTest.DistinguishesAuthorityIncarnationsOnSameNode
+29/54 Test  #29: cluster_model.ClusterInvariantTest.DistinguishesAuthorityIncarnationsOnSameNode .......................................................................................   Passed    0.00 sec
+      Start  30: cluster_model.AppliedVectorTest.UsesCompatibilityAndComponentwisePartialOrder
+30/54 Test  #30: cluster_model.AppliedVectorTest.UsesCompatibilityAndComponentwisePartialOrder .........................................................................................   Passed    0.00 sec
+      Start  31: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <01>, "authority.single-writer")
+31/54 Test  #31: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <01>, "authority.single-writer") .............................   Passed    0.00 sec
+      Start  32: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <02>, "replication.restart-invalidates-evidence")
+32/54 Test  #32: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <02>, "replication.restart-invalidates-evidence") ............   Passed    0.00 sec
+      Start  33: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <03>, "replication.reparent-requires-complete-history")
+33/54 Test  #33: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <03>, "replication.reparent-requires-complete-history") ......   Passed    0.00 sec
+      Start  34: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <04>, "population.atomic-activation")
+34/54 Test  #34: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <04>, "population.atomic-activation") ........................   Passed    0.00 sec
+      Start  35: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <05>, "meta.directive-evidence-scoped")
+35/54 Test  #35: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <05>, "meta.directive-evidence-scoped") ......................   Passed    0.00 sec
+      Start  36: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <06>, "function.catalog-durable-before-ack")
+36/54 Test  #36: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <06>, "function.catalog-durable-before-ack") .................   Passed    0.00 sec
+      Start  37: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <07>, "fullsync.destructive-invalidation-before-transfer")
+37/54 Test  #37: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <07>, "fullsync.destructive-invalidation-before-transfer") ...   Passed    0.00 sec
+      Start  38: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <08>, "promotion.catalog-token-current")
+38/54 Test  #38: cluster_model.RequiredFaults/CounterexampleTest.GeneratesReplaysAndMinimizesStableFinding/(1-byte object <08>, "promotion.catalog-token-current") .....................   Passed    0.00 sec
+      Start 761: FullSyncHandoffProgressTest.OutOfOrderAckDoesNotHideUnsentOrPendingPartitions
+39/54 Test #761: FullSyncHandoffProgressTest.OutOfOrderAckDoesNotHideUnsentOrPendingPartitions .........................................................................................   Passed    0.01 sec
+      Start 762: FullSyncHandoffProgressTest.RejectsDuplicateSendAndAckWithoutAdvancingCounts
+40/54 Test #762: FullSyncHandoffProgressTest.RejectsDuplicateSendAndAckWithoutAdvancingCounts ..........................................................................................   Passed    0.01 sec
+      Start 763: FullSyncHandoffProgressTest.SessionReplacementAndOtherFlowsHaveIndependentProgress
+41/54 Test #763: FullSyncHandoffProgressTest.SessionReplacementAndOtherFlowsHaveIndependentProgress ....................................................................................   Passed    0.01 sec
+      Start 764: FullSyncRecordWindowTest.TinyFramesCannotExceedTheFrameCeiling
+42/54 Test #764: FullSyncRecordWindowTest.TinyFramesCannotExceedTheFrameCeiling ........................................................................................................   Passed    0.01 sec
+      Start 765: FullSyncRecordWindowTest.ByteCreditIncludesPartialFramesAndCannotOverflow
+43/54 Test #765: FullSyncRecordWindowTest.ByteCreditIncludesPartialFramesAndCannotOverflow .............................................................................................   Passed    0.01 sec
+      Start 766: FullSyncRecordWindowTest.AcknowledgingCommitDoesNotReleaseEarlierChunks
+44/54 Test #766: FullSyncRecordWindowTest.AcknowledgingCommitDoesNotReleaseEarlierChunks ...............................................................................................   Passed    0.01 sec
+      Start 767: FullSyncRecordWindowTest.ForeignAndDuplicateAcksNeverReleaseCredit
+45/54 Test #767: FullSyncRecordWindowTest.ForeignAndDuplicateAcksNeverReleaseCredit ....................................................................................................   Passed    0.01 sec
+      Start 768: FullSyncRecordWindowTest.RegistrationAllowsAckBeforeWriterResumes
+46/54 Test #768: FullSyncRecordWindowTest.RegistrationAllowsAckBeforeWriterResumes .....................................................................................................   Passed    0.01 sec
+      Start 769: FullSyncRecordWindowTest.SnapshotReceiptWaitsForItsOwnAck
+47/54 Test #769: FullSyncRecordWindowTest.SnapshotReceiptWaitsForItsOwnAck .............................................................................................................   Passed    0.01 sec
+      Start 770: FullSyncRecordWindowTest.RejectedRegistrationDoesNotConsumeCapacity
+48/54 Test #770: FullSyncRecordWindowTest.RejectedRegistrationDoesNotConsumeCapacity ...................................................................................................   Passed    0.01 sec
+      Start 827: benchmark.native_full_evidence
+49/54 Test #827: benchmark.native_full_evidence ........................................................................................................................................   Passed    0.07 sec
+      Start 851: meta_integration.gate_native_replication
+50/54 Test #851: meta_integration.gate_native_replication ..............................................................................................................................   Passed  492.95 sec
+      Start 857: meta_integration.gate_managed_single
+51/54 Test #857: meta_integration.gate_managed_single ..................................................................................................................................   Passed  214.01 sec
+      Start 917: cluster_integration.population_fail_closed
+52/54 Test #917: cluster_integration.population_fail_closed ............................................................................................................................   Passed    0.31 sec
+      Start 918: cluster_integration.replication_manager_control_api
+53/54 Test #918: cluster_integration.replication_manager_control_api ...................................................................................................................   Passed   38.34 sec
+      Start 924: lavik_replication_log_e2e
+54/54 Test #924: lavik_replication_log_e2e .............................................................................................................................................   Passed    6.06 sec
+
+100% tests passed, 0 tests failed out of 54
+
+Label Time Summary:
+cluster-integration    =  38.65 sec*proc (2 tests)
+cluster-model          =   0.60 sec*proc (38 tests)
+meta-integration       = 706.97 sec*proc (2 tests)
+
+Total Test time (real) = 752.45 sec
