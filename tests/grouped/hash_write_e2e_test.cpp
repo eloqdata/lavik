@@ -1572,7 +1572,7 @@ TEST(GroupedHashWriteE2e,
 
 TEST(GroupedHashWriteE2e, PublicationHandoffOomFailsClosedAndRecoversOldGraph) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
-  GTEST_SKIP() << "requires allocation failure after grouped root staging";
+  GTEST_SKIP() << "requires handoff rejection after grouped root staging";
 #endif
   const std::string old_value(20 * 1024, 'o');
   const std::string new_value(20 * 1024, 'n');

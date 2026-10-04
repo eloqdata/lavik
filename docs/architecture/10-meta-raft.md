@@ -212,9 +212,10 @@ heartbeat processing remains available. An authenticated higher term revokes
 authority immediately even at saturation; one retained maximum-term observation
 waits for ordered persistence capacity, without acknowledging the rejected RPC.
 
-Failed local snapshot preparation preserves the previous recovery root and
-increments the existing snapshot-failure guard. Publication, WAL, replay or
-application failure is fail-stop. GC errors preserve the root, are observable,
+Local snapshot preparation rejected through a status preserves the previous
+recovery root and increments the existing snapshot-failure guard. Unexpected
+C++ exceptions terminate at the C/Go callback boundary, including physical
+allocation failure. Publication, WAL, replay or application failure is fail-stop. GC errors preserve the root, are observable,
 and retry asynchronously; they do not report successful reclamation. Status
 separates retained logical log bytes, pending durability bytes, snapshot/first
 log indices, and transport/GC failures.

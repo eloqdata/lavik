@@ -114,17 +114,10 @@ StorageEngine::Impl::CurrentExpirationAuthority(
         active_expiration_authority_.load(std::memory_order_acquire);
     if (authority != nullptr) {
       auto* grant = authority.get();
-      try {
-        auto owner =
-            std::make_shared<std::shared_ptr<ExpirationAuthorityGrant>>(
-                std::move(authority));
-        authority =
-            std::shared_ptr<ExpirationAuthorityGrant>(std::move(owner), grant);
-      } catch (const std::bad_alloc&) {
-        // Leave the cache version unchanged so the next attempt can retry;
-        // inability to retain a capability must never authorize a deletion.
-        return nullptr;
-      }
+      auto owner = std::make_shared<std::shared_ptr<ExpirationAuthorityGrant>>(
+          std::move(authority));
+      authority =
+          std::shared_ptr<ExpirationAuthorityGrant>(std::move(owner), grant);
     }
     store.expiration_authority_cache_ = std::move(authority);
     // Sample the version BEFORE the pointer. A concurrent publication can
@@ -175,13 +168,8 @@ void StorageEngine::Impl::SetExpirationAuthority(bool authority) noexcept {
 
   std::shared_ptr<ExpirationAuthorityGrant> replacement;
   if (authority) {
-    try {
-      replacement = std::make_shared<ExpirationAuthorityGrant>(
-          std::chrono::nanoseconds::max());
-    } catch (const std::bad_alloc&) {
-      // The legacy API cannot report allocation failure. Installing no grant
-      // is the only fail-closed outcome, and a later call may retry.
-    }
+    replacement = std::make_shared<ExpirationAuthorityGrant>(
+        std::chrono::nanoseconds::max());
   }
 
   if (!authority) {
@@ -220,12 +208,8 @@ void StorageEngine::Impl::SetExpirationAuthority(bool authority) noexcept {
 
 absl::Status StorageEngine::Impl::SetExpirationAuthorityUntil(
     std::chrono::nanoseconds deadline_since_boot) noexcept {
-  try {
-    return SetExpirationAuthorityUntil(
-        std::make_shared<LeaseDeadline>(deadline_since_boot));
-  } catch (const std::bad_alloc&) {
-    return absl::ResourceExhaustedError("failed to allocate expiration lease");
-  }
+  return SetExpirationAuthorityUntil(
+      std::make_shared<LeaseDeadline>(deadline_since_boot));
 }
 
 absl::Status StorageEngine::Impl::SetExpirationAuthorityUntil(
@@ -235,12 +219,8 @@ absl::Status StorageEngine::Impl::SetExpirationAuthorityUntil(
         "expiration authority deadline has already elapsed");
   }
   std::shared_ptr<ExpirationAuthorityGrant> replacement;
-  try {
-    replacement = std::make_shared<ExpirationAuthorityGrant>(lease);
-  } catch (const std::bad_alloc&) {
-    return absl::ResourceExhaustedError(
-        "failed to allocate expiration authority grant");
-  }
+  replacement = std::make_shared<ExpirationAuthorityGrant>(lease);
+
   if (!lease->valid_at(BootTimeSinceEpoch())) {
     return absl::DeadlineExceededError(
         "expiration authority deadline elapsed during installation");
@@ -419,31 +399,26 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   GroupedHashObject::Handle grouped;
   std::vector<RetiredRecord> grouped_retirements;
   if (dropped.grouped()) {
-    try {
-      auto view = partition.grouped_objects_[candidate.db_id_].Lookup(
-          candidate.key_,
-          GroupedObjectVersion{
-              .root_ = dropped,
-              .db_epoch_ = EffectiveRecordDbEpoch(partition, candidate.db_id_),
-              .replication_epoch_ = partition.replication_epoch_,
-              .index_generation_ =
-                  partition.grouped_generations_[candidate.db_id_]});
-      if (!view.ok()) co_return view.status();
-      if (*view == nullptr)
-        co_return absl::DataLossError("missing expired grouped view");
-      grouped = std::move(*view);
-      // Prepare the complete graph before detaching either index, without
-      // allocating disk space or decoding values. This includes split-parent
-      // retirement records. Their source blocks retain UUID dependencies
-      // until physical retirement.
-      // Admission failure leaves the expired key indexed for a later retry.
-      auto retired = CollectGroupedRetirements(grouped, nullptr);
-      if (!retired.ok()) co_return retired.status();
-      grouped_retirements = std::move(*retired);
-    } catch (const std::bad_alloc&) {
-      co_return absl::ResourceExhaustedError(
-          "OOM preparing expired grouped retirements");
-    }
+    auto view = partition.grouped_objects_[candidate.db_id_].Lookup(
+        candidate.key_,
+        GroupedObjectVersion{
+            .root_ = dropped,
+            .db_epoch_ = EffectiveRecordDbEpoch(partition, candidate.db_id_),
+            .replication_epoch_ = partition.replication_epoch_,
+            .index_generation_ =
+                partition.grouped_generations_[candidate.db_id_]});
+    if (!view.ok()) co_return view.status();
+    if (*view == nullptr)
+      co_return absl::DataLossError("missing expired grouped view");
+    grouped = std::move(*view);
+    // Prepare the complete graph before detaching either index, without
+    // allocating disk space or decoding values. This includes split-parent
+    // retirement records. Their source blocks retain UUID dependencies
+    // until physical retirement.
+    // Admission failure leaves the expired key indexed for a later retry.
+    auto retired = CollectGroupedRetirements(grouped, nullptr);
+    if (!retired.ok()) co_return retired.status();
+    grouped_retirements = std::move(*retired);
   }
 
   // Append can fail before reaching its publication precondition. The
