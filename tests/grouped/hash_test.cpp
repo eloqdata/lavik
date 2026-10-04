@@ -841,6 +841,8 @@ TEST(GroupedHashTest, EmptyLeafAndRetiredLeafAreDifferentStates) {
 
 TEST(GroupedHashTest, DuplicateFieldsAreRejectedBeforePublication) {
   auto value = Value(3);
+  // Preserve the different cached digests: caller-created snapshots must
+  // validate the edited field bytes instead of trusting those stale digests.
   value.entries_[1].field_ = value.entries_[0].field_;
   EXPECT_FALSE(GroupHashValue(value, 17, Seed()).ok());
   EXPECT_FALSE(EncodeHashGroup({.incarnation_ = 17, .value_ = value}).ok());

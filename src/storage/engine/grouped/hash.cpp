@@ -23,6 +23,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/hash/hash.h"
 
 namespace lavik::storage {
 namespace {
@@ -101,15 +102,28 @@ absl::StatusOr<std::size_t> PayloadBytes(const HashValue& value) {
 }
 
 absl::Status ValidateFields(const HashGroupSnapshot& group,
-                            const DigestSeed* seed) {
+                            const DigestSeed* seed,
+                            bool decoded_digests = false) {
   if (group.incarnation_ == 0 || !group.id_.valid() ||
       (group.retired_ && !group.value_.entries_.empty())) {
     return absl::InvalidArgumentError("invalid Hash group identity or state");
   }
-  absl::flat_hash_set<std::string_view> fields;
+  // Entries stay alive and immutable throughout validation. Pointer keys use
+  // smaller slots than string views; equality still compares complete bytes.
+  // Only DecodeHashValue freshly reconstructs trustworthy process digests.
+  // Encoder/planner inputs can carry stale digests after editing field names.
+  auto hash = [decoded_digests](const HashEntry* entry) {
+    return decoded_digests ? static_cast<std::size_t>(entry->digest_.value_)
+                           : absl::Hash<std::string_view>{}(entry->field_);
+  };
+  auto equal = [](const HashEntry* left, const HashEntry* right) {
+    return left->field_ == right->field_;
+  };
+  absl::flat_hash_set<const HashEntry*, decltype(hash), decltype(equal)> fields(
+      0, hash, equal);
   fields.reserve(group.value_.entries_.size());
   for (const auto& entry : group.value_.entries_) {
-    if (!fields.insert(entry.field_).second) {
+    if (!fields.insert(&entry).second) {
       return absl::InvalidArgumentError("duplicate field in Hash group");
     }
     if (seed != nullptr &&
@@ -299,7 +313,7 @@ absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(std::string_view bytes) {
   if (group.value_.entries_.size() != metadata->field_count_) {
     return absl::DataLossError("Hash group count does not match its payload");
   }
-  auto valid = ValidateFields(group, nullptr);
+  auto valid = ValidateFields(group, nullptr, true);
   if (!valid.ok()) return absl::DataLossError(valid.message());
   return group;
 }
