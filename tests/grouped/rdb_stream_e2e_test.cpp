@@ -131,7 +131,7 @@ TEST(GroupedRdbStreamE2e, LaterPageFailurePreservesPreviousDump) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires the Debug RDB page failure hook";
 #endif
-  for (const char* injected : {"1", "alloc:1"}) {
+  for (const char* injected : {"1", "admit:1"}) {
     PrivateDisk disk;
     ScopedEnvironment fault("LAVIK_FAIL_RDB_COLLECTION_PAGE", injected);
     Server server(disk);
@@ -162,8 +162,8 @@ TEST(GroupedRdbStreamE2e, LaterPageFailurePreservesPreviousDump) {
            std::chrono::steady_clock::now() < deadline)
       std::this_thread::sleep_for(10ms);
     ASSERT_NE(
-        server.Log().find(std::string_view(injected).starts_with("alloc:")
-                              ? "OOM RDB collection page allocation"
+        server.Log().find(std::string_view(injected).starts_with("admit:")
+                              ? "OOM RDB collection page admission"
                               : "injected RDB collection page read failure"),
         std::string::npos)
         << server.Log();

@@ -2640,19 +2640,13 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
 bycorf::Task<absl::Status> RunDirectiveResults(
     std::shared_ptr<LiveSessionState> state, MetaBootIncarnation boot_id) {
   absl::Status status;
-  try {
-    while (!state->closing_ && !state->directive_results_.empty()) {
-      status = co_await HandleDirectiveResult(
-          state, state->directive_results_.front(), boot_id);
-      state->directive_results_.Pop();
-      if (!status.ok()) break;
-    }
-  } catch (const std::exception& error) {
-    status = absl::InternalError(
-        absl::StrCat("directive result task failed: ", error.what()));
-  } catch (...) {
-    status = absl::InternalError("directive result task failed");
+  while (!state->closing_ && !state->directive_results_.empty()) {
+    status = co_await HandleDirectiveResult(
+        state, state->directive_results_.front(), boot_id);
+    state->directive_results_.Pop();
+    if (!status.ok()) break;
   }
+
   // Unsubmitted items are replayed by Data. Only this consumer removes items,
   // so deque insertion in the reader cannot invalidate an awaited front().
   state->directive_results_.Clear();
@@ -3917,17 +3911,9 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   live->publisher_running_ = true;
   ++live->active_tasks_;
   live->worker_->Spawn(RunSessionPublisher(live));
-  absl::Status session_status;
-  try {
-    session_status =
-        co_await RunEstablishedSession(live, *boot_id, *replication_history_id,
-                                       session_generation, std::move(deferred));
-  } catch (const std::exception& error) {
-    session_status = absl::InternalError(
-        absl::StrCat("data-control reader failed: ", error.what()));
-  } catch (...) {
-    session_status = absl::InternalError("data-control reader failed");
-  }
+  absl::Status session_status =
+      co_await RunEstablishedSession(live, *boot_id, *replication_history_id,
+                                     session_generation, std::move(deferred));
 
   live->closing_ = true;
   if (!live->terminal_error_.has_value() && !session_status.ok()) {

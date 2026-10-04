@@ -151,7 +151,7 @@ TEST(GroupedRandomStreamE2e, DisconnectDuringLargeBulkReleasesStreamState) {
 }
 
 TEST(GroupedRandomStreamE2e,
-     AllocationFailureReturnsOneErrorWithoutArrayPrefix) {
+     AdmissionFailureReturnsOneErrorWithoutArrayPrefix) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires Debug/fault random stream construction hook";
 #endif

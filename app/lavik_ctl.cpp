@@ -674,7 +674,7 @@ int main(int argc, char** argv) {
     const Options options = ParseOptions(argc, argv, &early_exit);
     if (early_exit) return 0;
     return Run(options);
-  } catch (const std::exception& error) {
+  } catch (const std::runtime_error& error) {
     std::fprintf(stderr, "lavik-ctl: %s\n", error.what());
     return 1;
   }
