@@ -210,6 +210,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       // The first boundary page has already been consumed. Interior page
       // counts now bound COUNT without decoding or reading beyond its last
       // required page. Sparse selected-ID history uses the single-page path.
+      static_assert(sizeof(StreamPageWindow) + 4096 < StreamPageWindow::kBytes);
       auto metadata = TryReserveMemory(sizeof(StreamPageWindow) + 4096);
       if (!metadata) co_return absl::OkStatus();
       auto window = std::make_unique<StreamPageWindow>(std::move(*metadata),
@@ -364,7 +365,9 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       std::optional<LoadedOrderedGroup> loaded;
       if (source->window_) {
         auto& window = *source->window_;
+        assert(window.next_ < window.size_);
         auto& slot = window.pages_[window.next_++];
+        assert(slot.loaded_);
         admission = std::move(slot.admission_);
         loaded.emplace(std::move(*slot.loaded_));
         if (loaded->snapshot_.id_ != id.prefix_)
