@@ -95,7 +95,10 @@ as deletions. Storage validates the allowed mutation scope before publication.
 
 Sparse plans retain changed pages and necessary neighbours. Entire removed
 ranges use directory retirement metadata rather than copying their contents.
-Directory reconstruction still scales with page count; a range reply's pin
+Topology changes still reconstruct and validate the complete page chain.
+Count changes on existing pages update a persistent partial-sum rank index,
+without rewriting cumulative ranks across the intervening page interval.
+A range reply's pin
 metadata scales with its selected page interval. Whole-object export pins the
 complete graph;
 a command changing many PEL rows retains its admitted mutation metadata until

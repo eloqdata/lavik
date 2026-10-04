@@ -31,6 +31,18 @@
 namespace lavik::storage {
 namespace {
 
+// Stream trim/append transfers counts across distant pages. A Fenwick index
+// stores bounded partial sums instead of materializing every intervening
+// cumulative rank after each transfer. It is runtime metadata only.
+void BuildStreamRanks(std::vector<std::uint64_t>& counts) {
+  for (std::size_t i = counts.size(); i > 1; --i)
+    counts[i - 1] -= counts[i - 2];
+  for (std::size_t i = 0; i < counts.size(); ++i) {
+    const auto parent = i | (i + 1);
+    if (parent < counts.size()) counts[parent] += counts[i];
+  }
+}
+
 constexpr std::string_view kRootMagic = "LOCROOT1";
 constexpr std::string_view kGroupMagic = "LOCGRUP1";
 constexpr std::size_t kRootBytes = kOrderedCollectionRootBytes;
@@ -650,6 +662,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
   if (!retired_array.ok()) return retired_array.status();
   auto id_array = decltype(result.ids_)::From(ids);
   if (!id_array.ok()) return id_array.status();
+  if (root.kind_ == OrderedCollectionKind::kStream) BuildStreamRanks(ends);
   auto end_array = decltype(result.ends_)::From(ends);
   if (!end_array.ok()) return end_array.status();
   result.groups_ = std::move(*group_array);
@@ -798,7 +811,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
 
   // Most writes replace a few pages without changing their order or links.
   // Share unchanged metadata and detach only changed chunks. Structural edits
-  // still use Recover's complete-chain validation below.
+  // still require complete-chain validation below.
   bool same_topology = root.group_count_ == groups_.size() &&
                        root.first_group_ == root_.first_group_ &&
                        root.last_group_ == root_.last_group_ &&
@@ -871,6 +884,48 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
                 result.groups_[index + 1].min_score_)))
         return absl::DataLossError("unordered updated Sorted Set score bounds");
     }
+    if (root.kind_ == OrderedCollectionKind::kStream) {
+      using RankChange = std::pair<std::size_t, absl::int128>;
+      absl::InlinedVector<RankChange, 32> rank_changes;
+      const auto changed_counts =
+          std::count_if(count_changes.begin(), count_changes.end(),
+                        [](const auto& change) { return change.second != 0; });
+      if (changed_counts == 0) return result;
+      const auto updates = changed_counts * (std::bit_width(ends_.size()) + 1);
+      // Reserve the complete temporary update list before allocating it.
+      // Changed page identities are unique and bounded by the 32-bit root
+      // page count, so this product fits size_t on supported 64-bit targets.
+      auto admission = TryReserveMemory(
+          AllocatorUsableSizeForRequest(updates * sizeof(RankChange) + 1024));
+      if (!admission) {
+        RecordMemoryRejection();
+        return absl::ResourceExhaustedError("OOM Stream rank update scratch");
+      }
+      rank_changes.reserve(updates);
+      for (const auto& [index, delta] : count_changes) {
+        if (delta == 0) continue;
+        for (std::size_t i = index + 1; i <= ends_.size(); i += i & (~i + 1))
+          rank_changes.emplace_back(i - 1, delta);
+      }
+      std::sort(rank_changes.begin(), rank_changes.end());
+      // Combine changes before setting a partial sum: a valid batch may add
+      // and remove counts from the same subtree in either command order.
+      for (std::size_t i = 0; i < rank_changes.size();) {
+        const auto index = rank_changes[i].first;
+        absl::int128 delta = 0;
+        do {
+          delta += rank_changes[i++].second;
+        } while (i < rank_changes.size() && rank_changes[i].first == index);
+        if (delta == 0) continue;
+        const auto value = absl::int128(ends_[index]) + delta;
+        if (value < 0 || value > root.item_count_)
+          return absl::DataLossError("invalid Stream updated rank sum");
+        auto status =
+            result.ends_.Set(index, static_cast<std::uint64_t>(value));
+        if (!status.ok()) return status;
+      }
+      return result;
+    }
     // Count-neutral replacements share all rank metadata. A redistribution
     // updates only the affected interval, stopping once the net delta is zero.
     absl::int128 delta = 0;
@@ -902,31 +957,158 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     }
     return result;
   }
-  std::vector<RecoveredOrderedGroup> candidates;
-  candidates.reserve(groups_.size() + retired_.size() + changed.size());
-  // These previous candidates are already adjudicated by this root. Their
-  // original transaction ids are not re-decided by a later command's batch.
-  auto append = [&](RecoveredOrderedGroup item) {
+  // Foreground updates contain one decided replacement per changed identity.
+  // The predecessor has already selected and validated all other winners.
+  // Do not rebuild recovery's candidate hash map (or copy every record into
+  // it) just to select those same winners again. Walk the resulting chain
+  // against the small replacement map, checking its complete connectivity.
+  if (!ValidRoot(root) || (root.revision_ != 0 && root.revision_ != revision))
+    return absl::DataLossError("invalid ordered structural root");
+  absl::flat_hash_map<std::uint64_t, const RecoveredOrderedGroup*> replacements;
+  replacements.reserve(changed.size());
+  std::size_t live_count = groups_.size();
+  std::vector<RecoveredOrderedGroup> new_retired;
+  for (const auto& item : changed) {
+    if (item.id_ == 0 || item.id_ >= root.next_group_id_ || item.lsn_ == 0 ||
+        item.record_token_ == 0 ||
+        (item.retired_
+             ? (item.item_count_ != 0 || item.previous_ != 0 || item.next_ != 0)
+             : item.item_count_ == 0) ||
+        std::isnan(item.min_score_) || std::isnan(item.max_score_) ||
+        item.min_score_ > item.max_score_)
+      return absl::DataLossError("invalid ordered structural page");
+    replacements.emplace(item.id_, &item);
+    const auto* old = FindRecord(item.id_);
+    if (old != nullptr && !old->retired_ && item.retired_) --live_count;
+    if (old == nullptr && !item.retired_) ++live_count;
+    if (item.retired_) new_retired.push_back(item);
+  }
+  if (live_count != root.group_count_)
+    return absl::DataLossError("ordered structural page count mismatch");
+  OrderedGroupDirectory rebuilt;
+  rebuilt.root_ = root;
+  rebuilt.root_.revision_ = revision;
+  rebuilt.sequence_ = revision;
+  rebuilt.command_sequence_ = command_sequence;
+  rebuilt.members_ = std::move(members);
+  auto ordinal_admission = TryReserveMemory(AllocatorUsableSizeForRequest(
+      groups_.size() * sizeof(std::size_t) + changed.size() * 32 + 1024));
+  if (!ordinal_admission) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM ordered structural ordinals");
+  }
+  const auto absent = std::numeric_limits<std::size_t>::max();
+  std::vector<std::size_t> positions(groups_.size(), absent);
+  std::vector<std::pair<std::uint64_t, std::size_t>> inserted_ids;
+  std::vector<RecoveredOrderedGroup> groups;
+  std::vector<std::pair<std::uint64_t, std::size_t>> ids;
+  std::vector<std::uint64_t> ends;
+  groups.reserve(root.group_count_);
+  ids.reserve(root.group_count_);
+  ends.reserve(root.group_count_);
+  std::uint64_t id = root.first_group_, previous = 0, count = 0;
+  std::size_t old_cursor = 0, visited_changes = 0;
+  while (id != 0) {
+    const RecoveredOrderedGroup* item = nullptr;
+    const auto replacement = replacements.find(id);
+    if (replacement != replacements.end()) {
+      item = replacement->second;
+      ++visited_changes;
+      const auto old_index = FindIndex(id);
+      if (old_index)
+        positions[*old_index] = groups.size();
+      else
+        inserted_ids.emplace_back(id, groups.size());
+    } else {
+      // Whole unchanged runs keep their old ordinal. A split/trim may change
+      // the next run's start, so seek once there, then resume sequential
+      // access.
+      if (old_cursor >= groups_.size() || groups_[old_cursor].id_ != id) {
+        const auto position = FindIndex(id);
+        if (!position)
+          return absl::DataLossError("missing ordered structural page");
+        old_cursor = *position;
+      }
+      positions[old_cursor] = groups.size();
+      item = &groups_[old_cursor++];
+    }
+    if (groups.size() == root.group_count_ || item->retired_ ||
+        item->previous_ != previous ||
+        item->item_count_ > root.item_count_ - count)
+      return absl::DataLossError("broken ordered structural chain or count");
+    if (root.kind_ == OrderedCollectionKind::kSortedSet && !groups.empty() &&
+        groups.back().max_score_ > item->min_score_)
+      return absl::DataLossError("unordered updated Sorted Set score bounds");
+    if (item->encoded_bytes_ > UINT64_MAX - rebuilt.total_group_bytes_)
+      return absl::DataLossError("ordered group byte total overflows");
+    rebuilt.total_group_bytes_ += item->encoded_bytes_;
+    groups.push_back(*item);
+    groups.back().txid_ = 0;
+    groups.back().batch_txid_ = 0;
+    count += item->item_count_;
+    ends.push_back(count);
+    previous = id;
+    id = item->next_;
+  }
+  if (groups.size() != root.group_count_ || previous != root.last_group_ ||
+      count != root.item_count_ ||
+      visited_changes != changed.size() - new_retired.size())
+    return absl::DataLossError("disconnected ordered structural pages");
+  // Retired records remain available to relocation/reclamation. Merge their
+  // already sorted predecessor index with just this command's tombstones;
+  // never re-sort every historical retirement on each append/trim.
+  std::sort(new_retired.begin(), new_retired.end(),
+            [](const auto& a, const auto& b) { return a.id_ < b.id_; });
+  std::vector<RecoveredOrderedGroup> retired;
+  retired.reserve(retired_.size() + new_retired.size());
+  auto old = retired_.begin();
+  for (auto item : new_retired) {
+    for (; old != retired_.end() && old->id_ < item.id_; ++old)
+      retired.push_back(*old);
+    if (old != retired_.end() && old->id_ == item.id_) ++old;
     item.txid_ = 0;
     item.batch_txid_ = 0;
-    candidates.push_back(item);
-  };
-  for (const auto& item : groups_) append(item);
-  for (const auto& item : retired_) append(item);
-  for (const auto& item : changed) append(item);
-  auto rebuilt = Recover(root, revision, candidates, {}, command_sequence,
-                         std::move(members));
-  if (!rebuilt.ok()) return rebuilt.status();
-  // The header is a value of the first page, so a topology-preserving update
-  // may share it, while a replacement first page must provide a new copy.
+    retired.push_back(item);
+  }
+  retired.insert(retired.end(), old, retired_.end());
+  for (auto& item : retired) {
+    item.txid_ = 0;
+    item.batch_txid_ = 0;
+  }
+  // The predecessor identity index is already sorted. Its ordinal changes,
+  // not its identities. Reindex surviving old pages and merge only the new
+  // identities rather than sorting the entire directory after a middle split.
+  std::sort(inserted_ids.begin(), inserted_ids.end());
+  auto inserted = inserted_ids.begin();
+  for (const auto& [old_id, old_position] : ids_) {
+    if (positions[old_position] == absent) continue;
+    for (; inserted != inserted_ids.end() && inserted->first < old_id;
+         ++inserted)
+      ids.push_back(*inserted);
+    ids.emplace_back(old_id, positions[old_position]);
+  }
+  ids.insert(ids.end(), inserted, inserted_ids.end());
+  auto group_array = decltype(groups_)::From(groups);
+  if (!group_array.ok()) return group_array.status();
+  auto retired_array = decltype(retired_)::From(retired);
+  if (!retired_array.ok()) return retired_array.status();
+  auto id_array = decltype(ids_)::From(ids);
+  if (!id_array.ok()) return id_array.status();
+  if (root.kind_ == OrderedCollectionKind::kStream) BuildStreamRanks(ends);
+  auto end_array = decltype(ends_)::From(ends);
+  if (!end_array.ok()) return end_array.status();
+  rebuilt.groups_ = std::move(*group_array);
+  rebuilt.retired_ = std::move(*retired_array);
+  rebuilt.ids_ = std::move(*id_array);
+  rebuilt.ends_ = std::move(*end_array);
   if (root.kind_ == OrderedCollectionKind::kStream && has_stream_header_) {
     const auto* old_first = Find(root_.first_group_);
-    const auto* new_first = rebuilt->Find(root.first_group_);
+    const auto* new_first = rebuilt.Find(root.first_group_);
     if (old_first != nullptr && new_first != nullptr &&
         old_first->id_ == new_first->id_ &&
         old_first->sequence_ == new_first->sequence_) {
-      rebuilt->stream_header_ = stream_header_;
-      rebuilt->has_stream_header_ = true;
+      rebuilt.stream_header_ = stream_header_;
+      rebuilt.has_stream_header_ = true;
     }
   }
   return rebuilt;
@@ -938,6 +1120,11 @@ std::uint64_t OrderedGroupDirectory::CountBefore(
   if (index >= groups_.size()) return root_.item_count_;
   if (root_.kind_ == OrderedCollectionKind::kString)
     return index * kStringGroupBytes;
+  if (root_.kind_ == OrderedCollectionKind::kStream) {
+    std::uint64_t count = 0;
+    for (; index != 0; index -= index & (~index + 1)) count += ends_[index - 1];
+    return count;
+  }
   return ends_[index - 1];
 }
 
@@ -946,6 +1133,19 @@ std::optional<OrderedGroupDirectory::Position> OrderedGroupDirectory::FindRank(
   if (rank >= root_.item_count_) return std::nullopt;
   if (root_.kind_ == OrderedCollectionKind::kString)
     return Position{rank / kStringGroupBytes, rank % kStringGroupBytes};
+  if (root_.kind_ == OrderedCollectionKind::kStream) {
+    std::size_t index = 0;
+    std::uint64_t count = 0;
+    for (auto stride = std::bit_floor(ends_.size()); stride != 0;
+         stride >>= 1) {
+      const auto next = index + stride;
+      if (next <= ends_.size() && ends_[next - 1] <= rank - count) {
+        count += ends_[next - 1];
+        index = next;
+      }
+    }
+    return Position{index, rank - count};
+  }
   const auto found = std::upper_bound(ends_.begin(), ends_.end(), rank);
   const std::size_t index = found - ends_.begin();
   return Position{index, rank - (index == 0 ? 0 : ends_[index - 1])};

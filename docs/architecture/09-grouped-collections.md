@@ -140,9 +140,13 @@ leaves; inserting outside a skipped prefix adds a branch without changing
 pinned older views. Hash routing nodes are persistent; ordered directories share
 owner-local metadata chunks across immutable views. Each allocation admits and
 accounts its own lifetime, independently of the number of views retaining it.
-Local page replacements detach changed chunks and update only rank intervals
-whose counts change; unchanged identities, retirement records and ranks remain
-shared. Topology changes rebuild and validate the complete chain. Routing
+Local page replacements detach changed chunks. Lists and Sorted Sets update
+rank intervals whose counts change; Streams use a persistent partial-sum rank
+index to update logarithmic cells per changed count. Count-neutral replacements
+share ranks. Unchanged identities and retirement records remain shared. Topology
+changes validate the complete chain built from the adjudicated predecessor and
+the command's replacements; only recovery selects among competing physical
+candidates. Retired identities remain available to GC. Routing
 and physical-index node references, including final destruction, remain on
 the key owner. Cross-worker readers exchange physical identities or stream
 handles that route metadata access and cleanup back to that owner. Retained
