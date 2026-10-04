@@ -46,7 +46,17 @@ class GroupedMetadataArray {
   static constexpr unsigned kBranchBits = 5;
   static constexpr std::size_t kBranchEntries = 1 << kBranchBits;
   struct Chunk {
-    std::array<T, ChunkEntries> entries_{};
+    // Construct checked values in place. Value-initializing a full metadata
+    // chunk first would clear every byte only to overwrite it immediately.
+    explicit Chunk(std::span<const T> values)
+        : Chunk(values, std::make_index_sequence<ChunkEntries>{}) {}
+
+    std::array<T, ChunkEntries> entries_;
+
+   private:
+    template <std::size_t... Index>
+    Chunk(std::span<const T> values, std::index_sequence<Index...>)
+        : entries_{(Index < values.size() ? values[Index] : T{})...} {}
   };
   struct Branch {
     using Chunks = std::array<LocalSharedPtr<Chunk>, kBranchEntries>;
@@ -133,6 +143,51 @@ class GroupedMetadataArray {
     return result;
   }
 
+  // Return a longer immutable view, sharing the existing chunks except a
+  // partially filled tail. Admission failure leaves this view untouched.
+  absl::StatusOr<GroupedMetadataArray> Appended(
+      std::span<const T> values) const {
+    if (empty()) return From(values);
+    if (values.empty()) return *this;
+    if (values.size() > std::numeric_limits<std::size_t>::max() - size_)
+      return absl::ResourceExhaustedError("ordered metadata size overflows");
+    auto result = *this;
+    const auto size = size_ + values.size();
+    const auto last_chunk = (size - 1) / ChunkEntries;
+    while ((last_chunk >> result.root_shift_) >= kBranchEntries) {
+      auto root = Allocate<Branch>(false);
+      if (!root.ok()) return root.status();
+      std::get<typename Branch::Children>((*root)->entries_)[0] =
+          std::move(result.root_);
+      result.root_ = std::move(*root);
+      result.root_shift_ += kBranchBits;
+    }
+    auto index = size_;
+    while (!values.empty()) {
+      auto slot = result.MutableChunkSlot(index / ChunkEntries);
+      if (!slot.ok()) return slot.status();
+      auto& chunk = **slot;
+      const auto offset = index % ChunkEntries;
+      const auto count = std::min(ChunkEntries - offset, values.size());
+      if (offset == 0) {
+        auto appended = Allocate<Chunk>(values.first(count));
+        if (!appended.ok()) return appended.status();
+        chunk = std::move(*appended);
+      } else {
+        // The predecessor can still expose this tail to a pinned reader.
+        auto detached = Allocate<Chunk>(*chunk);
+        if (!detached.ok()) return detached.status();
+        std::copy_n(values.begin(), count,
+                    (*detached)->entries_.begin() + offset);
+        chunk = std::move(*detached);
+      }
+      index += count;
+      values = values.subspan(count);
+    }
+    result.size_ = size;
+    return result;
+  }
+
   std::size_t size() const noexcept { return root_ ? size_ : 0; }
   bool empty() const noexcept { return size() == 0; }
   const T& operator[](std::size_t index) const noexcept {
@@ -158,20 +213,9 @@ class GroupedMetadataArray {
   // That path remains valid and accounted; a retry can finish detaching it.
   absl::Status Set(std::size_t index, const T& value) {
     assert(index < size());
-    const auto chunk_index = index / ChunkEntries;
-    auto* link = &root_;
-    for (auto shift = root_shift_;; shift -= kBranchBits) {
-      if (link->use_count() != 1) {
-        auto replacement = Allocate<Branch>(**link);
-        if (!replacement.ok()) return replacement.status();
-        *link = std::move(*replacement);
-      }
-      if (shift == 0) break;
-      link = &std::get<typename Branch::Children>(
-          (*link)->entries_)[(chunk_index >> shift) & (kBranchEntries - 1)];
-    }
-    auto& chunk = std::get<typename Branch::Chunks>(
-        (*link)->entries_)[chunk_index & (kBranchEntries - 1)];
+    auto slot = MutableChunkSlot(index / ChunkEntries);
+    if (!slot.ok()) return slot.status();
+    auto& chunk = **slot;
     if (chunk.use_count() != 1) {
       auto replacement = Allocate<Chunk>(*chunk);
       if (!replacement.ok()) return replacement.status();
@@ -202,6 +246,26 @@ class GroupedMetadataArray {
   }
 
  private:
+  // Detach a path in an unpublished view, creating missing branches for an
+  // append. Partially detached paths remain valid if admission fails.
+  absl::StatusOr<LocalSharedPtr<Chunk>*> MutableChunkSlot(
+      std::size_t chunk_index) {
+    auto* link = &root_;
+    for (auto shift = root_shift_;; shift -= kBranchBits) {
+      if (!*link || link->use_count() != 1) {
+        auto replacement =
+            *link ? Allocate<Branch>(**link) : Allocate<Branch>(shift == 0);
+        if (!replacement.ok()) return replacement.status();
+        *link = std::move(*replacement);
+      }
+      if (shift == 0) break;
+      link = &std::get<typename Branch::Children>(
+          (*link)->entries_)[(chunk_index >> shift) & (kBranchEntries - 1)];
+    }
+    return &std::get<typename Branch::Chunks>(
+        (*link)->entries_)[chunk_index & (kBranchEntries - 1)];
+  }
+
   template <typename U, typename... Args>
   static absl::StatusOr<LocalSharedPtr<U>> Allocate(Args&&... args) {
     auto reservation =
@@ -226,10 +290,9 @@ class GroupedMetadataArray {
     if (shift == 0) {
       auto& chunks = std::get<typename Branch::Chunks>((*branch)->entries_);
       for (std::size_t slot = 0; !values.empty(); ++slot) {
-        auto chunk = Allocate<Chunk>();
-        if (!chunk.ok()) return chunk.status();
         const auto count = std::min(ChunkEntries, values.size());
-        std::copy_n(values.begin(), count, (*chunk)->entries_.begin());
+        auto chunk = Allocate<Chunk>(values.first(count));
+        if (!chunk.ok()) return chunk.status();
         chunks[slot] = std::move(*chunk);
         values = values.subspan(count);
       }

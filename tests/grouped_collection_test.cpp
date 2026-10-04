@@ -1081,6 +1081,9 @@ TEST(GroupedCollectionTest, StructuralUpdatesMatchRecoveryAcrossSplices) {
     EXPECT_EQ(updated->root(), recovered->root());
     EXPECT_EQ(updated->total_group_bytes(), recovered->total_group_bytes());
     EXPECT_EQ(updated->retired_groups().size(), revision - 1);
+    if (directory->retired_groups().size() >= 32)
+      EXPECT_EQ(&updated->retired_groups().front(),
+                &directory->retired_groups().front());
     for (std::size_t n = 0; n < updated->groups().size(); ++n) {
       const auto& actual = updated->groups()[n];
       const auto& expected = recovered->groups()[n];
@@ -1100,6 +1103,84 @@ TEST(GroupedCollectionTest, StructuralUpdatesMatchRecoveryAcrossSplices) {
       EXPECT_TRUE(item.retired_);
     }
     directory = std::move(updated);
+  }
+}
+
+TEST(GroupedCollectionTest,
+     TailAppendsAndRetirementsPreservePinnedDirectories) {
+  for (const auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kStream}) {
+    std::vector<OrderedGroupSnapshot> pages;
+    for (std::uint64_t id = 1; id <= 70; ++id) {
+      auto page = Page(id, 1, kind);
+      page.previous_ = id - 1;
+      page.next_ = id == 70 ? 0 : id + 1;
+      pages.push_back(std::move(page));
+    }
+    auto root = Root(pages, 72);
+    if (kind == OrderedCollectionKind::kStream) root.stream_length_ = 0;
+    auto records = Candidates(pages, 1, 100);
+    records.push_back({.incarnation_ = 17,
+                       .id_ = 71,
+                       .sequence_ = 1,
+                       .lsn_ = 1,
+                       .txid_ = 100,
+                       .record_token_ = 71,
+                       .retired_ = true});
+    auto directory = OrderedGroupDirectory::Recover(root, 1, records, {100});
+    ASSERT_TRUE(directory.ok()) << directory.status();
+    const auto pinned = *directory;
+    for (std::uint64_t revision = 2; revision <= 5; ++revision) {
+      std::vector<RecoveredOrderedGroup> changed;
+      if (revision == 3 || revision == 5) {
+        // Retire a lower identity than the existing tombstone to exercise
+        // the sorted merge fallback as well as the append-only path.
+        auto removed = directory->groups().front();
+        auto next = directory->groups()[1];
+        next.previous_ = 0;
+        removed.retired_ = true;
+        removed.item_count_ = removed.previous_ = removed.next_ = 0;
+        changed = {removed, next};
+        root.first_group_ = next.id_;
+        --root.group_count_;
+        --root.item_count_;
+      } else {
+        auto tail = directory->groups().back();
+        auto inserted = Candidates({Page(root.next_group_id_++, 1, kind)})[0];
+        tail.next_ = inserted.id_;
+        inserted.previous_ = tail.id_;
+        changed = {inserted, tail};
+        root.last_group_ = inserted.id_;
+        ++root.group_count_;
+        ++root.item_count_;
+      }
+      root.revision_ = revision;
+      for (auto& item : changed) item.sequence_ = item.lsn_ = revision;
+      auto updated = directory->Apply(root, revision, changed, revision);
+      ASSERT_TRUE(updated.ok()) << updated.status();
+      if (revision % 2 == 0) {
+        EXPECT_EQ(&updated->groups().front(), &directory->groups().front());
+        EXPECT_EQ(&updated->retired_groups().front(),
+                  &directory->retired_groups().front());
+      }
+      records.insert(records.end(), changed.begin(), changed.end());
+      auto recovered = OrderedGroupDirectory::Recover(root, revision, records,
+                                                      {100}, revision);
+      ASSERT_TRUE(recovered.ok()) << recovered.status();
+      for (std::size_t i = 0; i < updated->groups().size(); ++i) {
+        EXPECT_EQ(updated->groups()[i].id_, recovered->groups()[i].id_);
+        EXPECT_EQ(updated->CountBefore(i), recovered->CountBefore(i));
+        EXPECT_EQ(updated->FindIndex(updated->groups()[i].id_), i);
+      }
+      for (const auto& item : updated->retired_groups()) {
+        ASSERT_NE(recovered->FindRecord(item.id_), nullptr);
+        EXPECT_EQ(item.sequence_, recovered->FindRecord(item.id_)->sequence_);
+      }
+      EXPECT_EQ(pinned.groups().size(), 70);
+      EXPECT_EQ(pinned.groups().front().previous_, 0);
+      EXPECT_EQ(pinned.groups().back().next_, 0);
+      directory = std::move(updated);
+    }
   }
 }
 
