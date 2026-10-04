@@ -1095,6 +1095,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   }
   const bool indexed = object->has_member_index();
   std::size_t remaining_sources = 0;
+  std::optional<SortedSetMemberProbe> member_probe;
   if (indexed) {
     // Prefix routing retains only per-group metadata. Exact members and
     // scores are decoded from the selected Hash leaves, never trusted from
@@ -1139,6 +1140,13 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         requested->second.before_ = requested->second.after_ = *score;
         ++remaining_sources;
       }
+      // Point writes need this same leaf again to replace its member score.
+      // Retain only one admitted leaf, never a batch-sized payload cache.
+      // The exclusive key intent and final snapshot validation protect the
+      // logical contents across GC relocation and unlocked preparation.
+      if (!ReadOnly(operation) && members.size() == 1)
+        member_probe.emplace(std::move(*admission), object,
+                             std::move(leaf->snapshot_));
     }
     if (operation.kind_ == SortedSetOperationKind::kScores) {
       status = ApplyInputs(operation, &members, &result);
@@ -1420,7 +1428,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     });
     auto built = co_await PrepareSortedSetMembers(
         store, partition, db_id, key, digest, object, plan, prepared != nullptr,
-        std::span<const SortedSetMemberChange>(changes));
+        std::span<const SortedSetMemberChange>(changes),
+        member_probe ? &*member_probe : nullptr);
     if (!built.ok()) co_return built.status();
     member_mutation = std::move(*built);
   }
