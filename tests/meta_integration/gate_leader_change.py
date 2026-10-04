@@ -251,10 +251,30 @@ def link_fault_round(nodes, mesh, history, leader, follower, mode, hold_s):
     H.wait_until(
         f"post-{mode}: committed >= {pre}", 20, lambda: H.max_committed(nodes) >= pre
     )
-    current = H.find_leader(nodes)
-    _, reply = current.propose(f"post-{mode}")
-    if not reply.startswith("OK "):
-        raise H.Failure(f"post-{mode}: propose: {reply}")
+
+    # Healing can trigger another election after a status probe observed a
+    # leader. The recovery boundary is a committed write, not that stale probe;
+    # keep rediscovering within a bounded window. Use a separate history for
+    # this probe: CommittedHistory's convergence probe relies on one writer's
+    # insertion order, while the background load is still recording writes.
+    probe_history = H.CommittedHistory()
+
+    def propose_after_heal():
+        for current in nodes:
+            if not current.alive() or not current.is_leader():
+                continue
+            op_id, reply = current.propose(f"post-{mode}", timeout=1)
+            if reply.startswith("OK "):
+                probe_history.record(op_id, f"post-{mode}")
+                return True
+            if reply not in ("ERR not-leader", "ERR cancelled"):
+                # wait_until tolerates transport failures, but an unexpected
+                # protocol rejection is not a leadership transition.
+                raise AssertionError(f"post-{mode}: propose: {reply}")
+        return False
+
+    H.wait_until(f"post-{mode}: a fresh write commits", 20, propose_after_heal)
+    probe_history.check(nodes, timeout=30, desc=f"post-{mode} probe")
     history.check(nodes, timeout=30, desc=f"post-{mode}")
     H.log(f"link fault {mode}: cluster recovered, history intact")
 

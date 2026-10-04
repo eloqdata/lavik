@@ -822,6 +822,44 @@ TEST(GroupedOrderedWriteE2e, ListPointSetOnlyRewritesTargetAndNeighbours) {
   ExpectList(client, "list", items);
 }
 
+TEST(GroupedOrderedWriteE2e, ListReadIntervalsAcrossPagesAndRecovery) {
+  PrivateDisk disk;
+  auto items = Items();
+  items[0].clear();
+  items[63] = std::string("binary\0item", 11);
+  items[64].assign(9000, 'x');
+  auto check = [&](Client& client) {
+    for (const auto [first, last] :
+         {std::pair{0, 0}, {1, 70}, {63, 65}, {100, 200}, {255, 255}}) {
+      const auto reply = client.Command(
+          {"LRANGE", "list", std::to_string(first), std::to_string(last)});
+      ASSERT_EQ(reply.items_.size(), last - first + 1);
+      for (int i = first; i <= last; ++i)
+        EXPECT_EQ(reply.items_[i - first].text_, items[i]);
+      EXPECT_EQ(client.Command({"LINDEX", "list", std::to_string(first)}).text_,
+                items[first]);
+    }
+    const auto tail = client.Command({"LRANGE", "list", "-3", "999"});
+    ASSERT_EQ(tail.items_.size(), 3);
+    for (int i = 0; i < 3; ++i)
+      EXPECT_EQ(tail.items_[i].text_, items[items.size() - 3 + i]);
+    EXPECT_EQ(client.Command({"LINDEX", "list", "-1"}).text_, items.back());
+    EXPECT_TRUE(
+        client.Command({"LRANGE", "list", "256", "300"}).items_.empty());
+  };
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(Push("list", items)).text_, "256");
+    check(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  check(client);
+}
+
 TEST(GroupedOrderedWriteE2e, ListCommandSurfaceAndEmptyRecreation) {
   PrivateDisk disk;
   auto items = Items();

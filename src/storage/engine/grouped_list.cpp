@@ -303,6 +303,41 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
       result.retained_charge_.Account(CurrentMemoryAccountingShard(), bytes);
       return absl::OkStatus();
     };
+    if (read_only) {
+      // The loader checks the complete page under its read lease but only owns
+      // requested values. Move those directly into the reply and release each
+      // page before the next IO; LINDEX must not allocate every item on a page.
+      std::uint64_t remaining = erase_count;
+      std::size_t offset = first->offset_;
+      if (end_page - begin_page > 1) result.values_.reserve(erase_count);
+      for (std::size_t i = begin_page; i < end_page; ++i) {
+        const auto take = std::min<std::uint64_t>(
+            remaining, directory.groups()[i].item_count_ - offset);
+        auto values = co_await LoadOrderedListRange(
+            store, partition, db_id, key, digest, object,
+            directory.groups()[i].id_, offset, take);
+        if (!values.ok()) {
+          if (EffectiveRecordDbEpoch(partition, db_id) !=
+                  object->version().db_epoch_ ||
+              partition.replication_epoch_ !=
+                  object->version().replication_epoch_ ||
+              partition.grouped_generations_[db_id] !=
+                  object->version().index_generation_)
+            co_return ListResult{};
+          co_return values.status();
+        }
+        if (end_page - begin_page == 1)
+          result.values_ = std::move(*values);
+        else
+          for (auto& value : *values)
+            result.values_.push_back(std::move(value));
+        remaining -= take;
+        offset = 0;
+      }
+      const auto retained = retain_output();
+      if (!retained.ok()) co_return retained;
+      co_return result;
+    }
     std::vector<LoadedOrderedGroup> loaded;
     loaded.reserve(end_page - begin_page);
     std::optional<LoadedOrderedGroup> set_page;
@@ -333,21 +368,11 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
                                                     key, digest, object,
                                                     directory.groups()[i].id_);
       if (!page.ok()) {
-        if (read_only && (EffectiveRecordDbEpoch(partition, db_id) !=
-                              object->version().db_epoch_ ||
-                          partition.replication_epoch_ !=
-                              object->version().replication_epoch_ ||
-                          partition.grouped_generations_[db_id] !=
-                              object->version().index_generation_)) {
-          co_return ListResult{};
-        }
         co_return page.status();
       }
       loaded.push_back(std::move(*page));
     }
-    if (operation.kind_ == ListOperationKind::kIndex ||
-        operation.kind_ == ListOperationKind::kRange ||
-        operation.kind_ == ListOperationKind::kPopLeft ||
+    if (operation.kind_ == ListOperationKind::kPopLeft ||
         operation.kind_ == ListOperationKind::kPopRight) {
       std::uint64_t remaining = erase_count;
       std::uint64_t offset = first->offset_;
@@ -365,7 +390,6 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
       }
       const auto retained = retain_output();
       if (!retained.ok()) co_return retained;
-      if (read_only) co_return result;
     }
 
     if (scan) {

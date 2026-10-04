@@ -208,6 +208,12 @@ absl::StatusOr<std::string> EncodeOrderedGroup(
     const OrderedGroupSnapshot& group);
 absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(std::string_view bytes);
 
+// Validates a complete live List page, including entries outside the requested
+// interval, but allocates/copies only [first, first + count). The interval must
+// fit the page. Returned strings own their bytes independently of the payload.
+absl::StatusOr<std::vector<std::string>> DecodeOrderedListRange(
+    std::string_view bytes, std::size_t first, std::size_t count);
+
 // Binary member ordering breaks score ties. NaN is invalid; infinities are
 // valid. Equal -0/+0 scores have the same order, matching Redis numeric order.
 bool OrderedEntryLess(const OrderedCollectionEntry& left,
