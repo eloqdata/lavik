@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -127,8 +128,36 @@ std::string_view AppendStorageError(ReplyBuilder& reply_builder,
              : reply_builder.AppendError("ERR ", status.message());
 }
 
+void ReserveBulkArray(ReplyBuilder& builder,
+                      const std::vector<std::string>& values) {
+  if (values.size() < 2) return;
+  // Large reply buffers are released on Reset. Reserve the complete wire size
+  // once so each new array does not repeatedly grow and copy its prefix.
+  // Include any outer array/transaction prefix already in the builder.
+  std::size_t bytes = builder.View().size();
+  auto add = [&](std::size_t count) {
+    if (count > std::numeric_limits<std::size_t>::max() - bytes) return false;
+    bytes += count;
+    return true;
+  };
+  auto add_header = [&](std::size_t count, std::size_t framing) {
+    do {
+      ++framing;
+      count /= 10;
+    } while (count != 0);
+    return add(framing);
+  };
+  // An unrepresentable estimate falls back to ordinary append failure rather
+  // than wrapping the reservation. No wire bytes have been emitted here.
+  if (!add_header(values.size(), 3)) return;
+  for (const auto& value : values)
+    if (!add(value.size()) || !add_header(value.size(), 5)) return;
+  if (bytes > builder.Capacity()) builder.Reserve(bytes);
+}
+
 void AppendBulkArray(ReplyBuilder& builder,
                      const std::vector<std::string>& values) {
+  ReserveBulkArray(builder, values);
   builder.AppendArrayHeader(values.size());
   for (const std::string& value : values) builder.AppendBulkString(value);
 }
