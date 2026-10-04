@@ -409,6 +409,36 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(
   return group;
 }
 
+absl::StatusOr<std::vector<std::string>> DecodeOrderedListRange(
+    std::string_view bytes, std::size_t first, std::size_t count) {
+  auto metadata = DecodeOrderedGroupMetadata(bytes, bytes.size());
+  if (!metadata.ok()) return metadata.status();
+  if (metadata->kind_ != OrderedCollectionKind::kList || metadata->retired_)
+    return absl::DataLossError("List range requires a live List page");
+  if (first > metadata->item_count_ || count > metadata->item_count_ - first)
+    return absl::OutOfRangeError("List range exceeds page");
+  std::vector<std::string> values;
+  values.reserve(count);
+  std::size_t offset = kOrderedGroupHeaderBytes;
+  for (std::size_t i = 0; i < metadata->item_count_; ++i) {
+    if (bytes.size() - offset < kEntryHeaderBytes)
+      return absl::DataLossError("truncated List entry header");
+    const auto length = Load(bytes, offset, 4);
+    // Lists require the exact +0 bit pattern, including in skipped entries.
+    if (Load(bytes, offset + 4, 8) != 0)
+      return absl::DataLossError("invalid List entry score");
+    offset += kEntryHeaderBytes;
+    if (length > kMaxStringBytes || length > bytes.size() - offset)
+      return absl::DataLossError("truncated List entry value");
+    if (i >= first && i - first < count)
+      values.emplace_back(bytes.substr(offset, length));
+    offset += length;
+  }
+  if (offset != bytes.size())
+    return absl::DataLossError("List page has trailing bytes");
+  return values;
+}
+
 absl::StatusOr<OrderedGroupMetadata> DecodeOrderedGroupMetadata(
     std::string_view prefix, std::size_t encoded_bytes) {
   if (prefix.size() < kOrderedGroupHeaderBytes ||

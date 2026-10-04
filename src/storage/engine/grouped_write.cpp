@@ -167,11 +167,9 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
     payload = EncodeManifest(*extents);
     LAVIK_MAYBE_CRASH_AT("group-extents-durable-before-record");
   } else {
-    payload.resize(encoder.encoded_bytes());
-    RecordPayloadCursor cursor(encoder);
-    auto encoded = cursor.Read(std::as_writable_bytes(std::span(payload)));
-    if (encoded.ok()) encoded = cursor.Finish();
-    if (!encoded.ok()) co_return encoded;
+    auto encoded = EncodeInlineRecordPayload(encoder);
+    if (!encoded.ok()) co_return encoded.status();
+    payload = std::move(*encoded);
   }
   const GroupRecordWrite identity{
       .auxiliary_ = true,

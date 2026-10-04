@@ -3886,6 +3886,20 @@ class StorageEngine::Impl {
       std::uint64_t sequence, TxShardWrites& tx,
       ValueType value_type = ValueType::kHash, std::uint64_t batch_txid = 0);
 
+  // The synchronous decoder consumes the checked payload while its read lease
+  // is live. Specializations share physical lifetime/GC validation without an
+  // extra coroutine frame or allowing a borrowed payload to escape.
+  template <typename Result, typename Decode>
+  Task<absl::StatusOr<Result>> LoadOrderedGroup(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, std::uint64_t id, bool pinned,
+      Decode decode);
+  Task<absl::StatusOr<std::vector<std::string>>> LoadOrderedListRange(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, std::uint64_t id, std::size_t first,
+      std::size_t count);
   Task<absl::StatusOr<LoadedOrderedGroup>> LoadOrderedGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,

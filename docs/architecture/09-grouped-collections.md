@@ -342,13 +342,15 @@ before deleting its destination. Failure paths release no-longer-needed
 working state before compensation and propagate compensation failure rather
 than disguising it as an ordinary admission rejection.
 
-List length uses root metadata. Indexed/range reads load the corresponding
-rank pages. Read-only operations retain shared key intent and an immutable
-routing view, release worker store state before page I/O, and validate the
-population and physical record lifetime in the page loader. Push, pop and
-indexed replacement load the affected interval and its immediate link neighbours;
-an equal-sized indexed replacement only needs its target page. Pivot and position searches consume one page at
-a time and retain only the result; insertion reloads the located interval.
+List length uses root metadata. Indexed/range reads validate the corresponding
+rank pages completely, copy only requested values into owned replies, and
+release each page before loading the next. Read-only operations retain shared
+key intent and an immutable routing view, release worker store state before
+page I/O, and validate population and physical record lifetime in the page
+loader. Push, pop and indexed replacement load the affected interval and its
+immediate link neighbours; an equal-sized indexed replacement only needs its
+target page. Pivot and position searches consume one page at a time and retain
+only the result; insertion reloads the located interval.
 Value removals, trimming and within-list moves retain the needed logical
 contents before forming a replacement interval. Only changed snapshots enter
 the writer, and admitted reply buffers retain their charge across owner hops.

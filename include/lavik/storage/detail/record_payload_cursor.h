@@ -21,11 +21,43 @@
 #include <cstring>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 
 namespace lavik::storage {
+
+// Consumes a preflighted encoder into one inline payload. Unlike extent reads,
+// this has no partial-span state or type-erased calls. Every byte is
+// overwritten before exposure, including when resize_and_overwrite supplies
+// extra capacity. Next() must not throw and its borrowed span is consumed
+// before advancing.
+template <typename Encoder>
+absl::StatusOr<std::string> EncodeInlineRecordPayload(Encoder& encoder) {
+  static_assert(noexcept(encoder.Next()));
+  const auto bytes = encoder.encoded_bytes();
+  std::string payload;
+  bool valid = true;
+  payload.resize_and_overwrite(bytes, [&](char* output, std::size_t) noexcept {
+    std::size_t offset = 0;
+    while (auto part = encoder.Next()) {
+      if (part->size() > bytes - offset) {
+        valid = false;
+        return std::size_t{0};
+      }
+      if (!part->empty())
+        std::memcpy(output + offset, part->data(), part->size());
+      offset += part->size();
+    }
+    valid = offset == bytes;
+    return valid ? offset : 0;
+  });
+  if (!valid)
+    return absl::DataLossError("inline payload encoder length mismatch");
+  return payload;
+}
 
 // A non-owning, bounded-state bridge from a complete-value encoder to the
 // extent writer. Encoders validate before construction and expose Next() and

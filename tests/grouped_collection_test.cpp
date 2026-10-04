@@ -123,6 +123,67 @@ TEST(GroupedCollectionTest, RootAndPageRoundTripBothKinds) {
   }
 }
 
+TEST(GroupedCollectionTest, ListRangeOwnsOnlySelectedValues) {
+  auto page = Page();
+  page.entries_ = {{.value_ = ""},
+                   {.value_ = std::string("a\0b", 3)},
+                   {.value_ = std::string(8192, 'x')}};
+  auto encoded = EncodeOrderedGroup(page);
+  ASSERT_TRUE(encoded.ok());
+  for (std::size_t first = 0; first <= page.entries_.size(); ++first) {
+    for (std::size_t count = 0; count <= page.entries_.size() - first;
+         ++count) {
+      auto values = DecodeOrderedListRange(*encoded, first, count);
+      ASSERT_TRUE(values.ok()) << values.status();
+      ASSERT_EQ(values->size(), count);
+      for (std::size_t i = 0; i < count; ++i)
+        EXPECT_EQ((*values)[i], page.entries_[first + i].value_);
+    }
+  }
+  auto values = DecodeOrderedListRange(*encoded, 1, 1);
+  ASSERT_TRUE(values.ok());
+  encoded->assign(encoded->size(), '\xff');
+  EXPECT_EQ(values->front(), page.entries_[1].value_);
+}
+
+TEST(GroupedCollectionTest, ListRangeValidatesUnselectedEntriesAndEnvelope) {
+  auto page = Page();
+  auto encoded = EncodeOrderedGroup(page);
+  ASSERT_TRUE(encoded.ok());
+  // Corruption before and after the selected middle item must still fail.
+  for (const std::size_t entry : {0, 2}) {
+    const auto offset = kOrderedGroupHeaderBytes + entry * (12 + 6);
+    auto bad = *encoded;
+    bad[offset + 11] = '\x80';  // -0 is forbidden even though it equals +0.
+    EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(bad, 1, 1).status()));
+    bad = *encoded;
+    for (int i = 0; i < 4; ++i) bad[offset + i] = '\xff';
+    EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(bad, 1, 1).status()));
+  }
+  auto bad = *encoded;
+  bad[48] = 2;  // Correct framing for two entries still leaves trailing bytes.
+  EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(bad, 0, 1).status()));
+  bad = *encoded;
+  bad[56] = 1;  // Reserved envelope bytes remain checked.
+  EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(bad, 0, 1).status()));
+  for (std::size_t length = 0; length < encoded->size(); ++length)
+    EXPECT_FALSE(DecodeOrderedListRange(encoded->substr(0, length), 0, 0).ok());
+  EXPECT_TRUE(
+      absl::IsOutOfRange(DecodeOrderedListRange(*encoded, 4, 0).status()));
+  EXPECT_TRUE(absl::IsOutOfRange(
+      DecodeOrderedListRange(*encoded, 1, SIZE_MAX).status()));
+  auto sorted =
+      EncodeOrderedGroup(Page(1, 3, OrderedCollectionKind::kSortedSet));
+  ASSERT_TRUE(sorted.ok());
+  EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(*sorted, 0, 1).status()));
+  page.entries_.clear();
+  page.retired_ = true;
+  auto retired = EncodeOrderedGroup(page);
+  ASSERT_TRUE(retired.ok());
+  EXPECT_TRUE(
+      absl::IsDataLoss(DecodeOrderedListRange(*retired, 0, 0).status()));
+}
+
 TEST(GroupedCollectionTest, StringAndStreamHaveDistinctDurableKinds) {
   for (const auto kind :
        {OrderedCollectionKind::kStream, OrderedCollectionKind::kString}) {

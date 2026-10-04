@@ -49,11 +49,9 @@ StorageEngine::Impl::WriteOrderedGroupRecordLocked(
     payload = EncodeManifest(*extents);
     LAVIK_MAYBE_CRASH_AT("group-extents-durable-before-record");
   } else {
-    payload.resize(encoder.encoded_bytes());
-    RecordPayloadCursor cursor(encoder);
-    auto status = cursor.Read(std::as_writable_bytes(std::span(payload)));
-    if (status.ok()) status = cursor.Finish();
-    if (!status.ok()) co_return status;
+    auto encoded = EncodeInlineRecordPayload(encoder);
+    if (!encoded.ok()) co_return encoded.status();
+    payload = std::move(*encoded);
   }
   const HashGroupId id{snapshot.id_, 0};
   const GroupRecordWrite identity{
@@ -94,11 +92,12 @@ StorageEngine::Impl::WriteOrderedGroupRecordLocked(
                               .retired_ = snapshot.retired_};
 }
 
-Task<absl::StatusOr<LoadedOrderedGroup>>
-StorageEngine::Impl::LoadOrderedGroupSnapshot(
+template <typename Result, typename Decode>
+Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, std::uint64_t page_id, bool pinned) {
+    GroupedHashObject::Handle object, std::uint64_t page_id, bool pinned,
+    Decode decode) {
   if (object == nullptr || !object->is_ordered()) {
     co_return absl::DataLossError("missing ordered collection view");
   }
@@ -191,14 +190,7 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
         co_return absl::DataLossError(
             "ordered page physical identity mismatch");
       }
-      auto decoded = DecodeOrderedGroup(payload);
-      if (!decoded.ok()) co_return decoded.status();
-      if (root.kind_ == OrderedCollectionKind::kSortedSet &&
-          (decoded->entries_.front().score_ != route->min_score_ ||
-           decoded->entries_.back().score_ != route->max_score_))
-        co_return absl::DataLossError("ordered page score bounds mismatch");
-      co_return LoadedOrderedGroup{.sequence_ = location.mutation_sequence_,
-                                   .snapshot_ = std::move(*decoded)};
+      co_return decode(payload, location.mutation_sequence_, *route);
     }
     if (pinned || !absl::IsAborted(loaded.status())) co_return loaded.status();
     // The next iteration refreshes the view before materializing an entry.
@@ -211,6 +203,41 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
       co_return absl::DataLossError(loaded.status().message());
     }
   }
+}
+
+Task<absl::StatusOr<LoadedOrderedGroup>>
+StorageEngine::Impl::LoadOrderedGroupSnapshot(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedHashObject::Handle object, std::uint64_t page_id, bool pinned) {
+  return LoadOrderedGroup<LoadedOrderedGroup>(
+      store, partition, db_id, key, digest, std::move(object), page_id, pinned,
+      [](std::string_view payload, std::uint64_t sequence,
+         const RecoveredOrderedGroup& route)
+          -> absl::StatusOr<LoadedOrderedGroup> {
+        auto decoded = DecodeOrderedGroup(payload);
+        if (!decoded.ok()) return decoded.status();
+        if (decoded->kind_ == OrderedCollectionKind::kSortedSet &&
+            (decoded->entries_.front().score_ != route.min_score_ ||
+             decoded->entries_.back().score_ != route.max_score_))
+          return absl::DataLossError("ordered page score bounds mismatch");
+        return LoadedOrderedGroup{.sequence_ = sequence,
+                                  .snapshot_ = std::move(*decoded)};
+      });
+}
+
+Task<absl::StatusOr<std::vector<std::string>>>
+StorageEngine::Impl::LoadOrderedListRange(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedHashObject::Handle object, std::uint64_t page_id, std::size_t first,
+    std::size_t count) {
+  return LoadOrderedGroup<std::vector<std::string>>(
+      store, partition, db_id, key, digest, std::move(object), page_id, false,
+      [first, count](std::string_view payload, std::uint64_t,
+                     const RecoveredOrderedGroup&) {
+        return DecodeOrderedListRange(payload, first, count);
+      });
 }
 
 Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
