@@ -399,60 +399,50 @@ absl::StatusOr<LocalPubSubCapture> CaptureLocal(
         "OOM preparing deferred Pub/Sub snapshot");
   }
 
-  try {
-    LocalPubSubCapture capture;
-    capture.recipients_.reserve(recipient_count);
-    if (auto found = registry.channels_.find(channel);
-        found != registry.channels_.end()) {
-      for (const auto& session : found->second) {
-        const auto& frame = SelectFrame(*encoded, session->version());
-        if (frame != nullptr && session->live() &&
-            session->subscribed_to(channel)) {
-          capture.recipients_.push_back(
-              {.session_ = session, .encoded_ = frame});
-        }
+  LocalPubSubCapture capture;
+  capture.recipients_.reserve(recipient_count);
+  if (auto found = registry.channels_.find(channel);
+      found != registry.channels_.end()) {
+    for (const auto& session : found->second) {
+      const auto& frame = SelectFrame(*encoded, session->version());
+      if (frame != nullptr && session->live() &&
+          session->subscribed_to(channel)) {
+        capture.recipients_.push_back({.session_ = session, .encoded_ = frame});
       }
     }
-    for (const auto& [pattern, sessions] : registry.patterns_) {
-      if (!RedisGlobMatch(pattern, channel)) continue;
-      bool pattern_resp2 = false;
-      bool pattern_resp3 = false;
-      for (const auto& session : sessions) {
-        if (!session->live() || !session->subscribed_to_pattern(pattern)) {
-          continue;
-        }
-        if (session->version() == RespVersion::k3)
-          pattern_resp3 = true;
-        else
-          pattern_resp2 = true;
-      }
-      const EncodedFrames pattern_message{
-          .resp2_ = pattern_resp2
-                        ? EncodePatternMessage(RespVersion::k2, pattern,
-                                               channel, payload)
-                        : nullptr,
-          .resp3_ = pattern_resp3
-                        ? EncodePatternMessage(RespVersion::k3, pattern,
-                                               channel, payload)
-                        : nullptr,
-      };
-      for (const auto& session : sessions) {
-        const auto& frame = SelectFrame(pattern_message, session->version());
-        if (frame != nullptr && session->live() &&
-            session->subscribed_to_pattern(pattern)) {
-          capture.recipients_.push_back(
-              {.session_ = session, .encoded_ = frame});
-        }
-      }
-    }
-    assert(capture.recipients_.size() == recipient_count);
-    capture.charge_.Adopt(&*reservation, retained_bytes);
-    return capture;
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM allocating deferred Pub/Sub snapshot");
   }
+  for (const auto& [pattern, sessions] : registry.patterns_) {
+    if (!RedisGlobMatch(pattern, channel)) continue;
+    bool pattern_resp2 = false;
+    bool pattern_resp3 = false;
+    for (const auto& session : sessions) {
+      if (!session->live() || !session->subscribed_to_pattern(pattern)) {
+        continue;
+      }
+      if (session->version() == RespVersion::k3)
+        pattern_resp3 = true;
+      else
+        pattern_resp2 = true;
+    }
+    const EncodedFrames pattern_message{
+        .resp2_ = pattern_resp2 ? EncodePatternMessage(RespVersion::k2, pattern,
+                                                       channel, payload)
+                                : nullptr,
+        .resp3_ = pattern_resp3 ? EncodePatternMessage(RespVersion::k3, pattern,
+                                                       channel, payload)
+                                : nullptr,
+    };
+    for (const auto& session : sessions) {
+      const auto& frame = SelectFrame(pattern_message, session->version());
+      if (frame != nullptr && session->live() &&
+          session->subscribed_to_pattern(pattern)) {
+        capture.recipients_.push_back({.session_ = session, .encoded_ = frame});
+      }
+    }
+  }
+  assert(capture.recipients_.size() == recipient_count);
+  capture.charge_.Adopt(&*reservation, retained_bytes);
+  return capture;
 }
 
 class CapturePubSubOperation

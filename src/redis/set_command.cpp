@@ -20,7 +20,6 @@
 #include <charconv>
 #include <cstdint>
 #include <limits>
-#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -401,8 +400,6 @@ absl::Status ComputeAggregate(SetMultiContext* context) {
       context->add_.fields_.push_back(member);
     }
     return absl::OkStatus();
-  } catch (const std::bad_alloc&) {
-    return SetMultiOom();
   } catch (const std::length_error&) {
     return SetMultiOom();
   }
@@ -469,8 +466,6 @@ Task<absl::Status> PrepareSetEffects(SetMultiContext* context) {
     if (!status.ok()) co_return status;
     context->effects_prepared_ = true;
     co_return absl::OkStatus();
-  } catch (const std::bad_alloc&) {
-    co_return SetMultiOom();
   } catch (const std::length_error&) {
     co_return SetMultiOom();
   }
@@ -494,9 +489,6 @@ Task<absl::Status> ReplaceDestination(SetMultiContext* context) {
     if (!added.ok()) co_return added.status();
     context->changed_ = true;
     co_return absl::OkStatus();
-  } catch (const std::bad_alloc&) {
-    // The caller's normal failure path rolls back a staged DEL too.
-    co_return SetMultiOom();
   } catch (const std::length_error&) {
     co_return SetMultiOom();
   }
@@ -586,8 +578,6 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
       }
     }
     co_return absl::OkStatus();
-  } catch (const std::bad_alloc&) {
-    co_return SetMultiOom();
   } catch (const std::length_error&) {
     co_return SetMultiOom();
   }
@@ -615,8 +605,6 @@ Task<absl::Status> SetWriteShardCallback(void* opaque,
       context->changed_ = true;
     }
     co_return absl::OkStatus();
-  } catch (const std::bad_alloc&) {
-    co_return SetMultiOom();
   } catch (const std::length_error&) {
     co_return SetMultiOom();
   }
@@ -918,8 +906,6 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
       reply_builder.AppendBulkString(member);
     }
     co_return BuiltReply(reply_builder.View());
-  } catch (const std::bad_alloc&) {
-    co_return BuiltReply(AppendStorageError(reply_builder, SetMultiOom()));
   } catch (const std::length_error&) {
     co_return BuiltReply(AppendStorageError(reply_builder, SetMultiOom()));
   }

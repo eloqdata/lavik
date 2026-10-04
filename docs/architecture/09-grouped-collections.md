@@ -274,8 +274,9 @@ batch decision is durable before the successful command returns to its outer
 coordinator. Failure after root staging fail-stops the writer and poisons the
 shared outer decision, including when its coordinator runs on another worker.
 That protection extends through post-root fence construction and commit-queue
-handoff, not just record staging. A failed queue allocation does not create a
-pending-commit count without an owned receipt.
+handoff, not just record staging. A rejected queue handoff does not create a
+pending-commit count without an owned receipt. Physical allocation failure
+terminates the process; recoverable handoff failures use explicit statuses.
 An explicitly failed decision also makes its published graph unreadable,
 including collection length and checked Redis key metadata. An uncommitted
 expiry cannot disguise that failure as an absent key. Internal compensation

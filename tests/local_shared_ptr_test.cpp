@@ -45,7 +45,6 @@ struct AllocationStats {
   std::size_t allocations_ = 0;
   std::size_t deallocations_ = 0;
   std::size_t live_bytes_ = 0;
-  bool fail_ = false;
 };
 
 template <typename T>
@@ -59,7 +58,6 @@ struct CountingAllocator {
       : stats_(other.stats_) {}
 
   T* allocate(std::size_t count) {
-    if (stats_->fail_) throw std::bad_alloc();
     auto* pointer = std::allocator<T>{}.allocate(count);
     ++stats_->allocations_;
     stats_->live_bytes_ += count * sizeof(T);
@@ -153,7 +151,7 @@ TEST(LocalSharedPtrTest, StatefulAllocatorOwnsOneCombinedAllocation) {
   EXPECT_EQ(stats.live_bytes_, 0);
 }
 
-TEST(LocalSharedPtrTest, AllocationAndConstructorFailuresDoNotLeak) {
+TEST(LocalSharedPtrTest, ConstructorFailureDoesNotLeak) {
   struct Throwing {
     Throwing() { throw std::runtime_error("construction failed"); }
   };
@@ -163,10 +161,6 @@ TEST(LocalSharedPtrTest, AllocationAndConstructorFailuresDoNotLeak) {
   EXPECT_EQ(stats.allocations_, 1);
   EXPECT_EQ(stats.deallocations_, 1);
   EXPECT_EQ(stats.live_bytes_, 0);
-  stats.fail_ = true;
-  EXPECT_THROW(AllocateLocalShared<int>(allocator, 1), std::bad_alloc);
-  EXPECT_EQ(stats.allocations_, 1);
-  EXPECT_EQ(stats.deallocations_, 1);
 }
 
 TEST(LocalSharedPtrTest, CombinedAllocationPreservesObjectAlignment) {
