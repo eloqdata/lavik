@@ -1152,13 +1152,14 @@ struct StreamRangeReplyState {
         if (offset_ < pending_.size()) {
           if (chunk_limit_ == 0) {
             // Coalesce small messages so each does not require a separate
-            // socket write. A single small result needs only its actual bytes.
+            // socket write. Single small results keep a proportionate buffer.
             const auto limit = remaining_ == 0
                                    ? std::min(kChunkBytes, pending_.size())
                                    : kChunkBytes;
             // Returned chunks can overlap their successors in the writer;
             // retained charges follow replies across worker ownership hops.
-            const auto bytes = 2 * (limit + 1);
+            // Include the string's small-capacity growth for tiny fragments.
+            const auto bytes = 2 * (std::max(limit, std::size_t{64}) + 1);
             auto admission = TryReserveMemory(bytes);
             if (!admission)
               co_return absl::ResourceExhaustedError("OOM Stream reply chunk");
@@ -1190,9 +1191,9 @@ struct StreamRangeReplyState {
           --remaining_;
           continue;
         }
-        Entry entry;
         ReplyBuilder builder(version_);
         if (!reader_) {
+          Entry entry;
           bool found = false;
           while (index_ < compact_.size()) {
             auto& candidate = compact_[index_++];
@@ -1224,15 +1225,14 @@ struct StreamRangeReplyState {
           if (!key.ok()) co_return key.status();
           if (!payload.ok()) co_return payload.status();
           if ((*key)[0] != '\1') continue;
+          Id id;
           std::size_t at = 0;
           std::uint32_t fields = 0;
-          if (!GetId(*payload, &at, &entry.id_) ||
-              !Get32(*payload, &at, &fields) || fields % 2 ||
-              fields > (payload->size() - at) / 4)
+          if (!GetId(*payload, &at, &id) || !Get32(*payload, &at, &fields) ||
+              fields % 2 || fields > (payload->size() - at) / 4)
             co_return absl::DataLossError("invalid Stream reply entry");
-          if (!Matches(entry.id_) ||
-              (!selection_.empty() &&
-               entry.id_ != selection_[selected_at_].id_))
+          if (!Matches(id) ||
+              (!selection_.empty() && id != selection_[selected_at_].id_))
             continue;
           if (payload->size() > (SIZE_MAX - 4096) / 12)
             co_return absl::ResourceExhaustedError(
@@ -1243,10 +1243,12 @@ struct StreamRangeReplyState {
           entry_charge_.Adopt(&*admission, admission->bytes());
           // The pinned page owns field bytes until serialization finishes.
           // Avoid an owned string per field and geometric reply growth; the
-          // conservative wire bound fits the existing entry admission above.
-          builder.Reserve(payload->size() + 64 + fields * std::size_t{20});
+          // 32-bit field lengths need at most 11 extra RESP framing bytes
+          // per field; the fixed allowance covers array and ID headers. This
+          // bound fits the existing entry admission above.
+          builder.Reserve(payload->size() + 64 + fields * std::size_t{11});
           builder.AppendArrayHeader(2);
-          builder.AppendBulkString(FormatId(entry.id_));
+          builder.AppendBulkString(FormatId(id));
           builder.AppendArrayHeader(fields);
           for (std::uint32_t i = 0; i < fields; ++i) {
             std::uint32_t size = 0;
