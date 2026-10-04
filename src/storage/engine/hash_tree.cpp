@@ -29,7 +29,7 @@
 #include "lavik/memory.h"
 #include "lavik/random_sample.h"
 #include "lavik/redis_parse.h"
-#include "lavik/storage/detail/grouped_scratch.h"
+#include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/hash_read.h"
 
 namespace lavik::storage {

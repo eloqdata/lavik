@@ -23,7 +23,7 @@
 #include <limits>
 #include <new>
 
-#include "lavik/storage/detail/grouped_hash.h"
+#include "lavik/storage/detail/grouped/hash.h"
 #include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {

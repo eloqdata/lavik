@@ -63,7 +63,7 @@
 #include "lavik/memory.h"
 #include "lavik/replication_history.h"
 #include "lavik/storage/detail/compact_write.h"
-#include "lavik/storage/detail/grouped_object_index.h"
+#include "lavik/storage/detail/grouped/object_index.h"
 #include "lavik/storage/detail/hash_codec.h"
 #include "lavik/storage/detail/record_index.h"
 #include "lavik/storage/detail/record_payload_cursor.h"
@@ -3880,6 +3880,16 @@ class StorageEngine::Impl {
   Task<absl::Status> AwaitGroupedDependencyLocked(
       WorkerStore& store, const GroupedHashObject::Handle& object,
       std::uint64_t successor_txid);
+
+  // Shared inline/extent publication for prefix and ordered groups. Wrappers
+  // return the task directly; the snapshot/encoder lifetime contract below
+  // also applies to this implementation.
+  template <typename Snapshot, typename Encoder>
+  Task<absl::StatusOr<HashGroupLocation>> WriteGroupRecordLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const Snapshot& snapshot, Encoder encoder, std::uint64_t sequence,
+      TxShardWrites& tx, ValueType value_type, std::uint64_t batch_txid);
 
   // Writes one unpublished complete group snapshot. The receipt prevents its
   // transaction block from retiring; the caller must either publish it

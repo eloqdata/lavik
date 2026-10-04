@@ -20,8 +20,8 @@
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "lavik/storage/detail/grouped_collection.h"
-#include "lavik/storage/detail/grouped_hash.h"
+#include "lavik/storage/detail/grouped/collection.h"
+#include "lavik/storage/detail/grouped/hash.h"
 
 namespace lavik::storage {
 namespace {
