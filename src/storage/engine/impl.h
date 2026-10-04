@@ -3192,6 +3192,13 @@ class StorageEngine::Impl {
     std::uint32_t field_count_ = 0;
   };
 
+  // Move-only page ownership keeps every member view valid across coroutine
+  // moves. Entries are destroyed before their owning physical read lease.
+  struct LoadedSortedSetPage {
+    LoadedValue loaded_;
+    std::vector<OrderedCollectionEntryView> entries_;
+  };
+
   std::size_t DirectGetValueLimit() const noexcept;
 
   absl::StatusOr<DiskValue> EncodeDiskValue(LoadedValue loaded);
@@ -3887,8 +3894,9 @@ class StorageEngine::Impl {
       ValueType value_type = ValueType::kHash, std::uint64_t batch_txid = 0);
 
   // The synchronous decoder consumes the checked payload while its read lease
-  // is live. Specializations share physical lifetime/GC validation without an
-  // extra coroutine frame or allowing a borrowed payload to escape.
+  // is live and may move that lease into its result to retain borrowed views.
+  // Specializations share physical lifetime/GC validation without an extra
+  // coroutine frame; views must never escape without their owning lease.
   template <typename Result, typename Decode>
   Task<absl::StatusOr<Result>> LoadOrderedGroup(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -3904,6 +3912,10 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedHashObject::Handle object, std::uint64_t id, bool pinned = false);
+  Task<absl::StatusOr<LoadedSortedSetPage>> LoadSortedSetPage(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, std::uint64_t id);
   Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
   LoadGroupedOrderedValue(WorkerStore& store,
                           WorkerStore::PartitionStore& partition,

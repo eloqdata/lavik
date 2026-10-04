@@ -17,6 +17,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <type_traits>
 
 #include "impl.h"
 #include "lavik/glob.h"
@@ -36,6 +37,14 @@ struct MemberState {
   bool touched_ = false;
 };
 using Members = absl::flat_hash_map<std::string_view, MemberState>;
+
+// Admission outlives the page's entries and, for borrowed scans, its read
+// lease.
+template <typename Page>
+struct AdmittedScanPage {
+  MemoryReservation admission_;
+  Page page_;
+};
 
 bool ReadOnly(const SortedSetOperation& operation) {
   return operation.kind_ != SortedSetOperationKind::kAdd &&
@@ -62,8 +71,7 @@ std::pair<std::uint64_t, std::uint64_t> RankSlice(std::int64_t first,
   return {first, std::min<std::uint64_t>(last, count - 1) + 1};
 }
 
-bool Matches(const OrderedCollectionEntry& entry,
-             const SortedSetOperation& operation) {
+bool Matches(const auto& entry, const SortedSetOperation& operation) {
   if (operation.range_mode_ == SortedSetRangeMode::kScore) {
     const auto low = operation.minimum_score_;
     const auto high = operation.maximum_score_;
@@ -84,8 +92,7 @@ bool Matches(const OrderedCollectionEntry& entry,
                             : entry.value_ <= high.value_)));
 }
 
-absl::StatusOr<SortedSetMember> CopyOutput(
-    const OrderedCollectionEntry& entry) {
+absl::StatusOr<SortedSetMember> CopyOutput(const auto& entry) {
   auto admission = TryReserveMemory(entry.value_.size() + 64);
   if (!admission) {
     RecordMemoryRejection();
@@ -194,7 +201,7 @@ struct ScanBoundary {
     prefixes_.reserve(limit_);
     return absl::OkStatus();
   }
-  void Observe(const OrderedCollectionEntry& entry, std::uint64_t cursor) {
+  void Observe(const auto& entry, std::uint64_t cursor) {
     const auto prefix = ScanCursorPrefix(ComputeDigest(entry.value_));
     if (prefix < cursor || limit_ == 0) return;
     if (prefixes_.size() == limit_) {
@@ -206,8 +213,7 @@ struct ScanBoundary {
     }
     std::push_heap(prefixes_.begin(), prefixes_.end());
   }
-  absl::Status Emit(const OrderedCollectionEntry& entry,
-                    const SortedSetOperation& operation,
+  absl::Status Emit(const auto& entry, const SortedSetOperation& operation,
                     SortedSetResult* result) const {
     if (prefixes_.empty()) return absl::OkStatus();
     const auto prefix = ScanCursorPrefix(ComputeDigest(entry.value_));
@@ -255,7 +261,7 @@ struct ReadCursor {
               (operation.offset_ < 0 || operation.count_ == 0)));
   }
 
-  absl::Status Visit(const OrderedCollectionEntry& entry, std::uint64_t rank) {
+  absl::Status Visit(const auto& entry, std::uint64_t rank) {
     if (done_) return absl::OkStatus();
     if (operation_.kind_ == SortedSetOperationKind::kRank) {
       if (entry.value_ == operation_.members_.front()) {
@@ -296,8 +302,7 @@ struct ReadCursor {
   }
 };
 
-bool BetterLexCandidate(const OrderedCollectionEntry& entry,
-                        const SortedSetOperation& operation,
+bool BetterLexCandidate(const auto& entry, const SortedSetOperation& operation,
                         std::optional<std::string_view> after,
                         const std::optional<SortedSetMember>& candidate) {
   if (!Matches(entry, operation)) return false;
@@ -860,14 +865,12 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       return budget->AddGroup(entry->value_,
                               current->ExtentsFor({metadata[i].id_, 0}));
     };
-    // Each scan page owns its admission until its decoded strings disappear.
-    // Returning just LoadedOrderedGroup would release this reservation too
-    // soon.
-    struct ScanPage {
-      MemoryReservation admission_;
-      LoadedOrderedGroup page_;
-    };
-    auto read_page = [&](std::size_t i) -> Task<absl::StatusOr<ScanPage>> {
+    // A scan retains one physical read lease and borrowed member views.
+    // Keep scratch admitted until both disappear; replies own separate copies.
+    using OwnedScanPage = AdmittedScanPage<LoadedOrderedGroup>;
+    auto read_page_impl =
+        [&]<typename Page>(
+            std::size_t i) -> Task<absl::StatusOr<AdmittedScanPage<Page>>> {
       LAVIK_FAULT_INJECT(
           // An optional one-based directory page isolates routing tests from
           // the existing fail-all-ordered-reads member-index test.
@@ -888,10 +891,25 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (!checked.ok()) co_return checked;
       auto admission = budget.Reserve(2);
       if (!admission.ok()) co_return admission.status();
-      auto page = co_await LoadOrderedGroupSnapshot(
-          store, partition, db_id, key, digest, object, metadata[i].id_);
+      auto load = [&] {
+        if constexpr (std::is_same_v<Page, LoadedSortedSetPage>)
+          return LoadSortedSetPage(store, partition, db_id, key, digest, object,
+                                   metadata[i].id_);
+        else
+          return LoadOrderedGroupSnapshot(store, partition, db_id, key, digest,
+                                          object, metadata[i].id_);
+      };
+      auto page = co_await load();
       if (!page.ok()) co_return page.status();
-      co_return ScanPage{std::move(*admission), std::move(*page)};
+      co_return AdmittedScanPage<Page>{std::move(*admission), std::move(*page)};
+    };
+    auto read_page = [&](std::size_t i) {
+      return read_page_impl.template operator()<LoadedSortedSetPage>(i);
+    };
+    // Mutation probes own their entries, releasing physical leases before
+    // routing. Both wrappers return the loader task without another coroutine.
+    auto read_owned_page = [&](std::size_t i) {
+      return read_page_impl.template operator()<LoadedOrderedGroup>(i);
     };
     auto remove_selected = [&]() -> Task<absl::Status> {
       const auto count = result.members_.size();
@@ -936,7 +954,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         const auto i = position->group_index_;
         auto page = co_await read_page(i);
         if (!page.ok()) co_return page.status();
-        const auto& entries = page->page_.snapshot_.entries_;
+        const auto& entries = page->page_.entries_;
         do {
           const auto [rank, slot] = selection.draws_[draw];
           const auto at = directory.FindRank(rank);
@@ -959,14 +977,14 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       for (std::size_t i = 0; i < metadata.size(); ++i) {
         auto page = co_await read_page(i);
         if (!page.ok()) co_return page.status();
-        for (const auto& entry : page->page_.snapshot_.entries_)
+        for (const auto& entry : page->page_.entries_)
           boundary.Observe(entry, operation.scan_cursor_);
       }
       if (boundary.prefixes_.empty()) co_return result;
       for (std::size_t i = 0; i < metadata.size(); ++i) {
         auto page = co_await read_page(i);
         if (!page.ok()) co_return page.status();
-        for (const auto& entry : page->page_.snapshot_.entries_) {
+        for (const auto& entry : page->page_.entries_) {
           auto emitted = boundary.Emit(entry, operation, &result);
           if (!emitted.ok()) co_return emitted;
         }
@@ -984,7 +1002,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
             operation.reverse_ ? metadata.size() - 1 - ordinal : ordinal;
         auto page = co_await read_page(i);
         if (!page.ok()) co_return page.status();
-        const auto& entries = page->page_.snapshot_.entries_;
+        const auto& entries = page->page_.entries_;
         for (std::size_t j = 0;
              result.members_.size() < count && j < entries.size(); ++j) {
           const auto at = operation.reverse_ ? entries.size() - 1 - j : j;
@@ -1024,7 +1042,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           for (std::size_t i = 0; i < metadata.size(); ++i) {
             auto page = co_await read_page(i);
             if (!page.ok()) co_return page.status();
-            for (const auto& entry : page->page_.snapshot_.entries_) {
+            for (const auto& entry : page->page_.entries_) {
               if (!BetterLexCandidate(entry, operation, after, candidate))
                 continue;
               auto copied = CopyOutput(entry);
@@ -1077,7 +1095,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         const auto i = reverse ? end_page - 1 - ordinal : first_page + ordinal;
         auto page = co_await read_page(i);
         if (!page.ok()) co_return page.status();
-        const auto& entries = page->page_.snapshot_.entries_;
+        const auto& entries = page->page_.entries_;
         if (reverse) rank -= entries.size();
         for (std::size_t j = 0; !cursor.done_ && j < entries.size(); ++j) {
           const auto index = reverse ? entries.size() - 1 - j : j;
@@ -1175,7 +1193,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     for (const auto& [first, end] : source_ranges) {
       for (std::size_t i = std::max(first, scanned_end);
            i < end && (!indexed || remaining_sources != 0); ++i) {
-        auto page = co_await read_page(i);
+        auto page = co_await read_owned_page(i);
         if (!page.ok()) co_return page.status();
         for (const auto& entry : page->page_.snapshot_.entries_) {
           auto member = members.find(entry.value_);
@@ -1243,14 +1261,14 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       i = std::max(
           i, std::min(directory.LowerBoundScore(*pending[next].second->after_),
                       metadata.size() - 1));
-      std::optional<ScanPage> boundary;
+      std::optional<OwnedScanPage> boundary;
       while (next != pending.size()) {
         const auto& [member, state] = pending[next];
         if (i + 1 != metadata.size()) {
           if (*state->after_ > metadata[i].max_score_) break;
           if (*state->after_ == metadata[i].max_score_) {
             if (!boundary) {
-              auto page = co_await read_page(i);
+              auto page = co_await read_owned_page(i);
               if (!page.ok()) co_return page.status();
               boundary.emplace(std::move(*page));
             }

@@ -184,6 +184,67 @@ TEST(GroupedCollectionTest, ListRangeValidatesUnselectedEntriesAndEnvelope) {
       absl::IsDataLoss(DecodeOrderedListRange(*retired, 0, 0).status()));
 }
 
+TEST(GroupedCollectionTest, SortedSetViewsBorrowBinaryMembersAndKeepScores) {
+  auto page = Page(1, 0, OrderedCollectionKind::kSortedSet);
+  page.entries_ = {
+      {"", -std::numeric_limits<double>::infinity()},
+      {std::string("a\0b", 3), -0.0},
+      {std::string("a\0c", 3), 0.0},
+      {std::string(8192, 'z'), std::numeric_limits<double>::infinity()}};
+  auto encoded = EncodeOrderedGroup(page);
+  ASSERT_TRUE(encoded.ok());
+  auto views = DecodeSortedSetGroupViews(*encoded);
+  ASSERT_TRUE(views.ok()) << views.status();
+  ASSERT_EQ(views->size(), page.entries_.size());
+  std::size_t offset = kOrderedGroupHeaderBytes;
+  for (std::size_t i = 0; i < views->size(); ++i) {
+    offset += 12;
+    EXPECT_EQ((*views)[i].value_, page.entries_[i].value_);
+    EXPECT_EQ((*views)[i].value_.data(), encoded->data() + offset);
+    EXPECT_EQ(std::bit_cast<std::uint64_t>((*views)[i].score_),
+              std::bit_cast<std::uint64_t>(page.entries_[i].score_));
+    offset += (*views)[i].value_.size();
+  }
+}
+
+TEST(GroupedCollectionTest, SortedSetViewsMatchOwnedDecoderCorruptionChecks) {
+  auto page = Page(1, 3, OrderedCollectionKind::kSortedSet);
+  auto encoded = EncodeOrderedGroup(page);
+  ASSERT_TRUE(encoded.ok());
+  // Differential corruption checks cover every header, length, score and
+  // member byte. A borrowing decoder must not weaken the owning decoder's
+  // validation just because the caller may only consume the first member.
+  for (std::size_t i = 0; i < encoded->size(); ++i) {
+    for (const unsigned mask : {1u, 0x80u, 0xffu}) {
+      auto bad = *encoded;
+      bad[i] ^= static_cast<char>(mask);
+      auto owned = DecodeOrderedGroup(bad);
+      auto views = DecodeSortedSetGroupViews(bad);
+      EXPECT_EQ(owned.ok(), views.ok()) << i << ":" << mask;
+    }
+    EXPECT_FALSE(DecodeSortedSetGroupViews(encoded->substr(0, i)).ok());
+  }
+  auto duplicate = *encoded;
+  // Different scores can order duplicate member names correctly; uniqueness
+  // must still reject a repeated, non-adjacent member.
+  duplicate.replace(duplicate.find("item-2"), 6, "item-0");
+  EXPECT_TRUE(absl::IsDataLoss(DecodeSortedSetGroupViews(duplicate).status()));
+  auto nan = *encoded;
+  const auto bits =
+      std::bit_cast<std::uint64_t>(std::numeric_limits<double>::quiet_NaN());
+  for (unsigned i = 0; i < 8; ++i)
+    nan[kOrderedGroupHeaderBytes + 4 + i] = static_cast<char>(bits >> (8 * i));
+  EXPECT_TRUE(absl::IsDataLoss(DecodeSortedSetGroupViews(nan).status()));
+  page.entries_.clear();
+  page.retired_ = true;
+  auto retired = EncodeOrderedGroup(page);
+  ASSERT_TRUE(retired.ok());
+  EXPECT_FALSE(DecodeSortedSetGroupViews(*retired).ok());
+  auto list = EncodeOrderedGroup(Page());
+  ASSERT_TRUE(list.ok());
+  EXPECT_FALSE(DecodeSortedSetGroupViews(*list).ok());
+}
+
 TEST(GroupedCollectionTest, StringAndStreamHaveDistinctDurableKinds) {
   for (const auto kind :
        {OrderedCollectionKind::kStream, OrderedCollectionKind::kString}) {

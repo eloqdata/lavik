@@ -190,7 +190,8 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
         co_return absl::DataLossError(
             "ordered page physical identity mismatch");
       }
-      co_return decode(payload, location.mutation_sequence_, *route);
+      co_return decode(payload, location.mutation_sequence_, *route,
+                       std::move(*loaded));
     }
     if (pinned || !absl::IsAborted(loaded.status())) co_return loaded.status();
     // The next iteration refreshes the view before materializing an entry.
@@ -213,8 +214,8 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
   return LoadOrderedGroup<LoadedOrderedGroup>(
       store, partition, db_id, key, digest, std::move(object), page_id, pinned,
       [](std::string_view payload, std::uint64_t sequence,
-         const RecoveredOrderedGroup& route)
-          -> absl::StatusOr<LoadedOrderedGroup> {
+         const RecoveredOrderedGroup& route,
+         LoadedValue&&) -> absl::StatusOr<LoadedOrderedGroup> {
         auto decoded = DecodeOrderedGroup(payload);
         if (!decoded.ok()) return decoded.status();
         if (decoded->kind_ == OrderedCollectionKind::kSortedSet &&
@@ -235,8 +236,29 @@ StorageEngine::Impl::LoadOrderedListRange(
   return LoadOrderedGroup<std::vector<std::string>>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
       [first, count](std::string_view payload, std::uint64_t,
-                     const RecoveredOrderedGroup&) {
+                     const RecoveredOrderedGroup&, LoadedValue&&) {
         return DecodeOrderedListRange(payload, first, count);
+      });
+}
+
+Task<absl::StatusOr<StorageEngine::Impl::LoadedSortedSetPage>>
+StorageEngine::Impl::LoadSortedSetPage(WorkerStore& store,
+                                       WorkerStore::PartitionStore& partition,
+                                       std::uint8_t db_id, std::string_view key,
+                                       const Digest& digest,
+                                       GroupedHashObject::Handle object,
+                                       std::uint64_t page_id) {
+  return LoadOrderedGroup<LoadedSortedSetPage>(
+      store, partition, db_id, key, digest, std::move(object), page_id, false,
+      [](std::string_view payload, std::uint64_t,
+         const RecoveredOrderedGroup& route,
+         LoadedValue&& loaded) -> absl::StatusOr<LoadedSortedSetPage> {
+        auto entries = DecodeSortedSetGroupViews(payload);
+        if (!entries.ok()) return entries.status();
+        if (entries->front().score_ != route.min_score_ ||
+            entries->back().score_ != route.max_score_)
+          return absl::DataLossError("ordered page score bounds mismatch");
+        return LoadedSortedSetPage{std::move(loaded), std::move(*entries)};
       });
 }
 

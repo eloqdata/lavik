@@ -99,8 +99,14 @@ bool ValidRoot(const OrderedCollectionRoot& root) {
          ((root.group_count_ == 1) == (root.first_group_ == root.last_group_));
 }
 
-absl::Status ValidateEntries(OrderedCollectionKind kind,
-                             std::span<const OrderedCollectionEntry> entries) {
+bool EntryLess(const auto& left, const auto& right) noexcept {
+  return left.score_ < right.score_ ||
+         (left.score_ == right.score_ && left.value_ < right.value_);
+}
+
+template <typename Entry>
+absl::Status ValidateEntrySpan(OrderedCollectionKind kind,
+                               std::span<const Entry> entries) {
   if (!ValidKind(kind)) return absl::InvalidArgumentError("invalid page kind");
   absl::flat_hash_set<std::string_view> members;
   if (kind == OrderedCollectionKind::kSortedSet)
@@ -124,12 +130,17 @@ absl::Status ValidateEntries(OrderedCollectionKind kind,
     }
     if (kind == OrderedCollectionKind::kSortedSet &&
         (!members.insert(entry.value_).second ||
-         (i != 0 && !OrderedEntryLess(entries[i - 1], entry)))) {
+         (i != 0 && !EntryLess(entries[i - 1], entry)))) {
       return absl::InvalidArgumentError(
           "Sorted Set page is unordered or repeats a member");
     }
   }
   return absl::OkStatus();
+}
+
+absl::Status ValidateEntries(OrderedCollectionKind kind,
+                             std::span<const OrderedCollectionEntry> entries) {
+  return ValidateEntrySpan(kind, entries);
 }
 
 absl::StatusOr<std::size_t> ValidateGroup(const OrderedGroupSnapshot& group) {
@@ -223,8 +234,7 @@ std::optional<bool> StreamPageMaxKey::LessThanOrEqual(
 
 bool OrderedEntryLess(const OrderedCollectionEntry& left,
                       const OrderedCollectionEntry& right) noexcept {
-  return left.score_ < right.score_ ||
-         (left.score_ == right.score_ && left.value_ < right.value_);
+  return EntryLess(left, right);
 }
 
 std::string EncodeSortedSetMemberScore(double score) {
@@ -437,6 +447,36 @@ absl::StatusOr<std::vector<std::string>> DecodeOrderedListRange(
   if (offset != bytes.size())
     return absl::DataLossError("List page has trailing bytes");
   return values;
+}
+
+absl::StatusOr<std::vector<OrderedCollectionEntryView>>
+DecodeSortedSetGroupViews(std::string_view bytes) {
+  auto metadata = DecodeOrderedGroupMetadata(bytes, bytes.size());
+  if (!metadata.ok()) return metadata.status();
+  if (metadata->kind_ != OrderedCollectionKind::kSortedSet ||
+      metadata->retired_)
+    return absl::DataLossError(
+        "Sorted Set scan requires a live Sorted Set page");
+  std::vector<OrderedCollectionEntryView> entries;
+  entries.reserve(metadata->item_count_);
+  std::size_t offset = kOrderedGroupHeaderBytes;
+  for (std::size_t i = 0; i < metadata->item_count_; ++i) {
+    if (bytes.size() - offset < kEntryHeaderBytes)
+      return absl::DataLossError("truncated ordered entry header");
+    const auto length = Load(bytes, offset, 4);
+    const auto score = std::bit_cast<double>(Load(bytes, offset + 4, 8));
+    offset += kEntryHeaderBytes;
+    if (length > kMaxStringBytes || length > bytes.size() - offset)
+      return absl::DataLossError("truncated ordered entry value");
+    entries.push_back({bytes.substr(offset, length), score});
+    offset += length;
+  }
+  if (offset != bytes.size())
+    return absl::DataLossError("ordered page has trailing bytes");
+  auto valid = ValidateEntrySpan(
+      metadata->kind_, std::span<const OrderedCollectionEntryView>(entries));
+  if (!valid.ok()) return absl::DataLossError(valid.message());
+  return entries;
 }
 
 absl::StatusOr<OrderedGroupMetadata> DecodeOrderedGroupMetadata(
