@@ -220,7 +220,7 @@ class RedisRdbStreamQueue
     absl::Status status;
     storage::RdbSnapshotCursor cursor;
     unsigned reads_since_yield = 0;
-    try {
+    {
       while (status.ok() && !aborted_.load(std::memory_order_acquire)) {
         auto batch = co_await storage_->ReadRdbSnapshotBatch(
             session_id_, cursor, 1, 8ULL * 1024 * 1024);
@@ -269,11 +269,6 @@ class RedisRdbStreamQueue
           co_await bycorf::Yield(*bycorf::ThisWorker().self_);
         }
       }
-    } catch (const std::bad_alloc&) {
-      // Entry leases and admitted pages unwind before cancelling the retained
-      // snapshot. Never let a background allocation failure strand its pins.
-      RecordMemoryRejection();
-      status = absl::ResourceExhaustedError("OOM Redis RDB export");
     }
     absl::Status ended = co_await storage_->EndRdbSnapshot(session_id_);
     if (status.ok() && !aborted_.load(std::memory_order_acquire)) {

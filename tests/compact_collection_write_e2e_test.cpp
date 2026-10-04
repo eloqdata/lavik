@@ -584,9 +584,9 @@ TEST_P(GroupedWriteConcurrencyE2e, ColdWriteYieldsWorkerButRetainsKey) {
   ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
-TEST(GroupedWriteSemanticsE2e, EncoderPreflightAllocationFailureKeepsOldGraph) {
+TEST(GroupedWriteSemanticsE2e, EncoderPreflightAdmissionFailureKeepsOldGraph) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
-  GTEST_SKIP() << "requires encoder preflight allocation-failure hook";
+  GTEST_SKIP() << "requires encoder preflight admission-failure hook";
 #endif
   const std::string key = "encoder-failure";
   const std::string large(20 * 1024, 'o');
@@ -725,9 +725,9 @@ TEST(GroupedWriteSemanticsE2e, NoOpDeletionExecAndLuaRetainLogicalIdentity) {
 }
 
 TEST(GroupedWriteSemanticsE2e,
-     MemberPreparationAllocationFailureLeavesWorkerUsable) {
+     MemberPreparationAdmissionFailureLeavesWorkerUsable) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
-  GTEST_SKIP() << "requires member preparation allocation-failure hook";
+  GTEST_SKIP() << "requires member preparation admission-failure hook";
 #endif
   const std::string key = "member-prepare-failure";
   const GroupedCommands commands(GroupedKind::kSortedSet);
@@ -942,10 +942,9 @@ TEST(CollectionCreationSemanticsE2e, TombstoneAndExpiredOtherTypeStartFresh) {
   }
 }
 
-TEST(CollectionCreationSemanticsE2e,
-     AllocationFailureLeavesNoKeyOrWatchEffect) {
+TEST(CollectionCreationSemanticsE2e, AdmissionFailureLeavesNoKeyOrWatchEffect) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
-  GTEST_SKIP() << "requires creation allocation fault hook";
+  GTEST_SKIP() << "requires creation admission fault hook";
 #endif
   const std::string key = "failed-create";
   for (const auto kind : {GroupedKind::kHash, GroupedKind::kSet,
@@ -986,7 +985,7 @@ TEST(CollectionCreationSemanticsE2e,
 TEST(CollectionCreationSemanticsE2e,
      MemberPreparationFailurePublishesNeitherGraph) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
-  GTEST_SKIP() << "requires member preparation allocation fault hook";
+  GTEST_SKIP() << "requires member preparation admission fault hook";
 #endif
   const std::string key = "failed-members";
   const GroupedCommands commands(GroupedKind::kSortedSet);

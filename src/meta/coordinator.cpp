@@ -1411,14 +1411,13 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
             FailProposeDispatch(waiter);
             return;
           }
-          // Registration belongs inside the task's exception boundary too:
-          // without a handler, neither Raft nor the executor can resolve
-          // the waiter for this dispatch.
+          // Registration can reject duplicate completion ownership. Resolve
+          // that logic error through the same failed-dispatch path.
           result->when_ready([waiter](CmdResult& completed,
                                       std::shared_ptr<std::exception>& err) {
             CompletePropose(waiter, completed, err);
           });
-        } catch (...) {
+        } catch (const std::logic_error&) {
           FailProposeDispatch(waiter);
         }
       });

@@ -28,7 +28,6 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <optional>
 #include <string>
 #include <thread>
@@ -495,7 +494,7 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
     absl::Status status = absl::OkStatus();
     storage::RdbSnapshotCursor cursor;
     unsigned reads_since_yield = 0;
-    try {
+    {
       while (status.ok()) {
         // Grouped keys carry only a retained-view token; pages are loaded after
         // this producer acquires exclusive ownership of the file-entry stream.
@@ -547,11 +546,6 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
           co_await bycorf::Yield(*bycorf::ThisWorker().self_);
         }
       }
-    } catch (const std::bad_alloc&) {
-      // Cancellation still closes the token and releases physical pins. The
-      // incomplete temporary output must not replace the previous dump.
-      RecordMemoryRejection();
-      status = absl::ResourceExhaustedError("OOM RDB backup producer");
     }
     absl::Status ended = co_await storage_->EndRdbSnapshot(session_id_);
     if (status.ok()) status = std::move(ended);
