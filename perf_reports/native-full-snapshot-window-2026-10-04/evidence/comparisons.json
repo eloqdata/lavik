@@ -1,0 +1,1607 @@
+[
+  {
+    "case": "dense-live-128m-f1-rtt5",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 639.1325008831918,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 637.6716941250488,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 644.1651429431513,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          639.1325008831918,
+          637.6716941250488,
+          644.1651429431513
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 637.6716941250488,
+          "median_seconds": 639.1325008831918,
+          "max_seconds": 644.1651429431513,
+          "p50_seconds": 639.1325008831918,
+          "p90_seconds": 644.1651429431513,
+          "p99_seconds": 644.1651429431513,
+          "p999_seconds": 644.1651429431513
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 631.9098213412799,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 620.696051181294,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 613.0959465117194,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          631.9098213412799,
+          620.696051181294,
+          613.0959465117194
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 613.0959465117194,
+          "median_seconds": 620.696051181294,
+          "max_seconds": 631.9098213412799,
+          "p50_seconds": 620.696051181294,
+          "p90_seconds": 631.9098213412799,
+          "p99_seconds": 631.9098213412799,
+          "p999_seconds": 631.9098213412799
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 639.1325008831918,
+        "after_seconds": 631.9098213412799,
+        "speedup": 1.011429921324187,
+        "time_reduction_pct": 1.1300754588338457
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 637.6716941250488,
+        "after_seconds": 620.696051181294,
+        "speedup": 1.0273493651384558,
+        "time_reduction_pct": 2.6621289764236944
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 644.1651429431513,
+        "after_seconds": 613.0959465117194,
+        "speedup": 1.0506759123236806,
+        "time_reduction_pct": 4.823172562470335
+      }
+    ],
+    "median_speedup": 1.0297028628856426,
+    "median_time_reduction_pct": 2.884605254218997,
+    "median_paired_speedup": 1.0273493651384558,
+    "median_paired_time_reduction_pct": 2.6621289764236944
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 1.0946031310595572,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 1.1753492797724903,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 1.680627685971558,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          1.0946031310595572,
+          1.1753492797724903,
+          1.680627685971558
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 1.0946031310595572,
+          "median_seconds": 1.1753492797724903,
+          "max_seconds": 1.680627685971558,
+          "p50_seconds": 1.1753492797724903,
+          "p90_seconds": 1.680627685971558,
+          "p99_seconds": 1.680627685971558,
+          "p999_seconds": 1.680627685971558
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 1.056212130934,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 0.9116710391826928,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 0.8530004089698195,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          1.056212130934,
+          0.9116710391826928,
+          0.8530004089698195
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 0.8530004089698195,
+          "median_seconds": 0.9116710391826928,
+          "max_seconds": 1.056212130934,
+          "p50_seconds": 0.9116710391826928,
+          "p90_seconds": 1.056212130934,
+          "p99_seconds": 1.056212130934,
+          "p999_seconds": 1.056212130934
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 1.0946031310595572,
+        "after_seconds": 1.056212130934,
+        "speedup": 1.0363478121498266,
+        "time_reduction_pct": 3.5072985848665805
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 1.1753492797724903,
+        "after_seconds": 0.9116710391826928,
+        "speedup": 1.2892252021367085,
+        "time_reduction_pct": 22.434032600150744
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 1.680627685971558,
+        "after_seconds": 0.8530004089698195,
+        "speedup": 1.970254255799567,
+        "time_reduction_pct": 49.24512929961008
+      }
+    ],
+    "median_speedup": 1.2892252021367085,
+    "median_time_reduction_pct": 22.434032600150744,
+    "median_paired_speedup": 1.2892252021367085,
+    "median_paired_time_reduction_pct": 22.434032600150744
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0-nocap",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 0.8314005532301962,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 0.8737435392104089,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 0.8717283252626657,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          0.8314005532301962,
+          0.8737435392104089,
+          0.8717283252626657
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 0.8314005532301962,
+          "median_seconds": 0.8717283252626657,
+          "max_seconds": 0.8737435392104089,
+          "p50_seconds": 0.8717283252626657,
+          "p90_seconds": 0.8737435392104089,
+          "p99_seconds": 0.8737435392104089,
+          "p999_seconds": 0.8737435392104089
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 0.7937333518639207,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 0.7324257930740714,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 0.7723820637911558,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          0.7937333518639207,
+          0.7324257930740714,
+          0.7723820637911558
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 0.7324257930740714,
+          "median_seconds": 0.7723820637911558,
+          "max_seconds": 0.7937333518639207,
+          "p50_seconds": 0.7723820637911558,
+          "p90_seconds": 0.7937333518639207,
+          "p99_seconds": 0.7937333518639207,
+          "p999_seconds": 0.7937333518639207
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 0.8314005532301962,
+        "after_seconds": 0.7937333518639207,
+        "speedup": 1.0474557372168145,
+        "time_reduction_pct": 4.530572083447526
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 0.8737435392104089,
+        "after_seconds": 0.7324257930740714,
+        "speedup": 1.192944797237699,
+        "time_reduction_pct": 16.17382444556267
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 0.8717283252626657,
+        "after_seconds": 0.7723820637911558,
+        "speedup": 1.128623211398617,
+        "time_reduction_pct": 11.396470504910495
+      }
+    ],
+    "median_speedup": 1.128623211398617,
+    "median_time_reduction_pct": 11.396470504910495,
+    "median_paired_speedup": 1.128623211398617,
+    "median_paired_time_reduction_pct": 11.396470504910495
+  },
+  {
+    "case": "dense-records-128m-f1-rtt1",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 1.6223348882049322,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 2.004717011936009,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 1.6019725250080228,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          1.6223348882049322,
+          2.004717011936009,
+          1.6019725250080228
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 1.6019725250080228,
+          "median_seconds": 1.6223348882049322,
+          "max_seconds": 2.004717011936009,
+          "p50_seconds": 1.6223348882049322,
+          "p90_seconds": 2.004717011936009,
+          "p99_seconds": 2.004717011936009,
+          "p999_seconds": 2.004717011936009
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 1.516611685976386,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 1.3880093260668218,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 1.4303943803533912,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          1.516611685976386,
+          1.3880093260668218,
+          1.4303943803533912
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 1.3880093260668218,
+          "median_seconds": 1.4303943803533912,
+          "max_seconds": 1.516611685976386,
+          "p50_seconds": 1.4303943803533912,
+          "p90_seconds": 1.516611685976386,
+          "p99_seconds": 1.516611685976386,
+          "p999_seconds": 1.516611685976386
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 1.6223348882049322,
+        "after_seconds": 1.516611685976386,
+        "speedup": 1.0697101329273235,
+        "time_reduction_pct": 6.516731101401996
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 2.004717011936009,
+        "after_seconds": 1.3880093260668218,
+        "speedup": 1.4443109093630813,
+        "time_reduction_pct": 30.762829975369744
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 1.6019725250080228,
+        "after_seconds": 1.4303943803533912,
+        "speedup": 1.1199516350254688,
+        "time_reduction_pct": 10.710429921622556
+      }
+    ],
+    "median_speedup": 1.1341871238365189,
+    "median_time_reduction_pct": 11.831127423014232,
+    "median_paired_speedup": 1.1199516350254688,
+    "median_paired_time_reduction_pct": 10.710429921622556
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 8.44981948658824,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 8.170497580897063,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 8.252252297941595,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          8.44981948658824,
+          8.170497580897063,
+          8.252252297941595
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 8.170497580897063,
+          "median_seconds": 8.252252297941595,
+          "max_seconds": 8.44981948658824,
+          "p50_seconds": 8.252252297941595,
+          "p90_seconds": 8.44981948658824,
+          "p99_seconds": 8.44981948658824,
+          "p999_seconds": 8.44981948658824
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 7.1217334982939065,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 7.122268782928586,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 7.163571421988308,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          7.1217334982939065,
+          7.122268782928586,
+          7.163571421988308
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 7.1217334982939065,
+          "median_seconds": 7.122268782928586,
+          "max_seconds": 7.163571421988308,
+          "p50_seconds": 7.122268782928586,
+          "p90_seconds": 7.163571421988308,
+          "p99_seconds": 7.163571421988308,
+          "p999_seconds": 7.163571421988308
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 8.44981948658824,
+        "after_seconds": 7.1217334982939065,
+        "speedup": 1.186483528007962,
+        "time_reduction_pct": 15.717329706300875
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 8.170497580897063,
+        "after_seconds": 7.122268782928586,
+        "speedup": 1.1471762481754386,
+        "time_reduction_pct": 12.829436488902168
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 8.252252297941595,
+        "after_seconds": 7.163571421988308,
+        "speedup": 1.1519745964438384,
+        "time_reduction_pct": 13.192530192331164
+      }
+    ],
+    "median_speedup": 1.1586549945603675,
+    "median_time_reduction_pct": 13.693031601746686,
+    "median_paired_speedup": 1.1519745964438384,
+    "median_paired_time_reduction_pct": 13.192530192331164
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20-nocap",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 8.058915855828673,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 8.254166768398136,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 8.172946069855243,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          8.058915855828673,
+          8.254166768398136,
+          8.172946069855243
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 8.058915855828673,
+          "median_seconds": 8.172946069855243,
+          "max_seconds": 8.254166768398136,
+          "p50_seconds": 8.172946069855243,
+          "p90_seconds": 8.254166768398136,
+          "p99_seconds": 8.254166768398136,
+          "p999_seconds": 8.254166768398136
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 7.567037743050605,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 7.093778814189136,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 7.132728430908173,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          7.567037743050605,
+          7.093778814189136,
+          7.132728430908173
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 7.093778814189136,
+          "median_seconds": 7.132728430908173,
+          "max_seconds": 7.567037743050605,
+          "p50_seconds": 7.132728430908173,
+          "p90_seconds": 7.567037743050605,
+          "p99_seconds": 7.567037743050605,
+          "p999_seconds": 7.567037743050605
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 8.058915855828673,
+        "after_seconds": 7.567037743050605,
+        "speedup": 1.0650027301938327,
+        "time_reduction_pct": 6.103527094433092
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 8.254166768398136,
+        "after_seconds": 7.093778814189136,
+        "speedup": 1.163578254214519,
+        "time_reduction_pct": 14.058208257333204
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 8.172946069855243,
+        "after_seconds": 7.132728430908173,
+        "speedup": 1.1458372695698753,
+        "time_reduction_pct": 12.727572530837627
+      }
+    ],
+    "median_speedup": 1.1458372695698753,
+    "median_time_reduction_pct": 12.727572530837627,
+    "median_paired_speedup": 1.1458372695698753,
+    "median_paired_time_reduction_pct": 12.727572530837627
+  },
+  {
+    "case": "dense-records-128m-f1-rtt5",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 3.2288103071041405,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 3.312473373953253,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 3.23235541023314,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          3.2288103071041405,
+          3.312473373953253,
+          3.23235541023314
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 3.2288103071041405,
+          "median_seconds": 3.23235541023314,
+          "max_seconds": 3.312473373953253,
+          "p50_seconds": 3.23235541023314,
+          "p90_seconds": 3.312473373953253,
+          "p99_seconds": 3.312473373953253,
+          "p999_seconds": 3.312473373953253
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 2.7250420548953116,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 3.3794475849717855,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 2.6487416811287403,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          2.7250420548953116,
+          3.3794475849717855,
+          2.6487416811287403
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 2.6487416811287403,
+          "median_seconds": 2.7250420548953116,
+          "max_seconds": 3.3794475849717855,
+          "p50_seconds": 2.7250420548953116,
+          "p90_seconds": 3.3794475849717855,
+          "p99_seconds": 3.3794475849717855,
+          "p999_seconds": 3.3794475849717855
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 3.2288103071041405,
+        "after_seconds": 2.7250420548953116,
+        "speedup": 1.184866230340868,
+        "time_reduction_pct": 15.60228704363401
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 3.312473373953253,
+        "after_seconds": 3.3794475849717855,
+        "speedup": 0.9801819056711034,
+        "time_reduction_pct": -2.0218792261144314
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 3.23235541023314,
+        "after_seconds": 2.6487416811287403,
+        "speedup": 1.2203362197463126,
+        "time_reduction_pct": 18.055370002220926
+      }
+    ],
+    "median_speedup": 1.1861671655402464,
+    "median_time_reduction_pct": 15.6948506878839,
+    "median_paired_speedup": 1.184866230340868,
+    "median_paired_time_reduction_pct": 15.60228704363401
+  },
+  {
+    "case": "dense-records-128m-f4-rtt20",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "incomplete_or_incomparable",
+    "issues": [
+      "chunks: incomplete or duplicate repeats",
+      "records: incomplete or duplicate repeats"
+    ],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 2.7778047220781446,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          2.7778047220781446
+        ],
+        "statistics": {
+          "count": 1,
+          "min_seconds": 2.7778047220781446,
+          "median_seconds": 2.7778047220781446,
+          "max_seconds": 2.7778047220781446,
+          "p50_seconds": 2.7778047220781446,
+          "p90_seconds": 2.7778047220781446,
+          "p99_seconds": 2.7778047220781446,
+          "p999_seconds": 2.7778047220781446
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 2.537790862377733,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          2.537790862377733
+        ],
+        "statistics": {
+          "count": 1,
+          "min_seconds": 2.537790862377733,
+          "median_seconds": 2.537790862377733,
+          "max_seconds": 2.537790862377733,
+          "p50_seconds": 2.537790862377733,
+          "p90_seconds": 2.537790862377733,
+          "p99_seconds": 2.537790862377733,
+          "p999_seconds": 2.537790862377733
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 2.7778047220781446,
+        "after_seconds": 2.537790862377733,
+        "speedup": 1.0945759019226413,
+        "time_reduction_pct": 8.640415137636136
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt20-capture-repeat",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 2.616065427660942,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 2.818801439832896,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 2.7372875940054655,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          2.616065427660942,
+          2.818801439832896,
+          2.7372875940054655
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 2.616065427660942,
+          "median_seconds": 2.7372875940054655,
+          "max_seconds": 2.818801439832896,
+          "p50_seconds": 2.7372875940054655,
+          "p90_seconds": 2.818801439832896,
+          "p99_seconds": 2.818801439832896,
+          "p999_seconds": 2.818801439832896
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 2.4943097070790827,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 2.8565938747487962,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 3.1522405627183616,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          2.4943097070790827,
+          2.8565938747487962,
+          3.1522405627183616
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 2.4943097070790827,
+          "median_seconds": 2.8565938747487962,
+          "max_seconds": 3.1522405627183616,
+          "p50_seconds": 2.8565938747487962,
+          "p90_seconds": 3.1522405627183616,
+          "p99_seconds": 3.1522405627183616,
+          "p999_seconds": 3.1522405627183616
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 2.616065427660942,
+        "after_seconds": 2.4943097070790827,
+        "speedup": 1.0488133932351325,
+        "time_reduction_pct": 4.6541542613757425
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 2.818801439832896,
+        "after_seconds": 2.8565938747487962,
+        "speedup": 0.9867701057367759,
+        "time_reduction_pct": -1.3407271041461
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 2.7372875940054655,
+        "after_seconds": 3.1522405627183616,
+        "speedup": 0.8683625312038185,
+        "time_reduction_pct": -15.159275540561534
+      }
+    ],
+    "median_speedup": 0.9582347768095588,
+    "median_time_reduction_pct": -4.358558487044117,
+    "median_paired_speedup": 0.9867701057367759,
+    "median_paired_time_reduction_pct": -1.3407271041461
+  },
+  {
+    "case": "dense-records-128m-f4-rtt5",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 1.1112440000288188,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 1.1117370938882232,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 2.3955870531499386,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          1.1112440000288188,
+          1.1117370938882232,
+          2.3955870531499386
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 1.1112440000288188,
+          "median_seconds": 1.1117370938882232,
+          "max_seconds": 2.3955870531499386,
+          "p50_seconds": 1.1117370938882232,
+          "p90_seconds": 2.3955870531499386,
+          "p99_seconds": 2.3955870531499386,
+          "p999_seconds": 2.3955870531499386
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 1.3130771489813924,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 1.0856589381583035,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 0.9841887350194156,
+            "run_dir": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          1.3130771489813924,
+          1.0856589381583035,
+          0.9841887350194156
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 0.9841887350194156,
+          "median_seconds": 1.0856589381583035,
+          "max_seconds": 1.3130771489813924,
+          "p50_seconds": 1.0856589381583035,
+          "p90_seconds": 1.3130771489813924,
+          "p99_seconds": 1.3130771489813924,
+          "p999_seconds": 1.3130771489813924
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 1.1112440000288188,
+        "after_seconds": 1.3130771489813924,
+        "speedup": 0.8462899540143975,
+        "time_reduction_pct": -18.16281113304903
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 1.1117370938882232,
+        "after_seconds": 1.0856589381583035,
+        "speedup": 1.0240205784831085,
+        "time_reduction_pct": 2.345712477642814
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 2.3955870531499386,
+        "after_seconds": 0.9841887350194156,
+        "speedup": 2.4340728235450486,
+        "time_reduction_pct": 58.9165948394439
+      }
+    ],
+    "median_speedup": 1.0240205784831085,
+    "median_time_reduction_pct": 2.345712477642814,
+    "median_paired_speedup": 1.0240205784831085,
+    "median_paired_time_reduction_pct": 2.345712477642814
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt20",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 46.93941437918693,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 46.954016521107405,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 46.94883516477421,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          46.93941437918693,
+          46.954016521107405,
+          46.94883516477421
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 46.93941437918693,
+          "median_seconds": 46.94883516477421,
+          "max_seconds": 46.954016521107405,
+          "p50_seconds": 46.94883516477421,
+          "p90_seconds": 46.954016521107405,
+          "p99_seconds": 46.954016521107405,
+          "p999_seconds": 46.954016521107405
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 46.91726602008566,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 46.95218497235328,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 46.9490893590264,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          46.91726602008566,
+          46.95218497235328,
+          46.9490893590264
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 46.91726602008566,
+          "median_seconds": 46.9490893590264,
+          "max_seconds": 46.95218497235328,
+          "p50_seconds": 46.9490893590264,
+          "p90_seconds": 46.95218497235328,
+          "p99_seconds": 46.95218497235328,
+          "p999_seconds": 46.95218497235328
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 46.93941437918693,
+        "after_seconds": 46.91726602008566,
+        "speedup": 1.0004720726713228,
+        "time_reduction_pct": 0.047184992386883895
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 46.954016521107405,
+        "after_seconds": 46.95218497235328,
+        "speedup": 1.0000390088076883,
+        "time_reduction_pct": 0.003900728606043291
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 46.94883516477421,
+        "after_seconds": 46.9490893590264,
+        "speedup": 0.9999945857469088,
+        "time_reduction_pct": -0.0005414282405524773
+      }
+    ],
+    "median_speedup": 0.9999945857469088,
+    "median_time_reduction_pct": -0.0005414282405524773,
+    "median_paired_speedup": 1.0000390088076883,
+    "median_paired_time_reduction_pct": 0.003900728606043291
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt5",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 12.417511334177107,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 12.19263660395518,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 12.235620569903404,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          12.417511334177107,
+          12.19263660395518,
+          12.235620569903404
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 12.19263660395518,
+          "median_seconds": 12.235620569903404,
+          "max_seconds": 12.417511334177107,
+          "p50_seconds": 12.235620569903404,
+          "p90_seconds": 12.417511334177107,
+          "p99_seconds": 12.417511334177107,
+          "p999_seconds": 12.417511334177107
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 12.43839358491823,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 12.24834468588233,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 12.180528201162815,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          12.43839358491823,
+          12.24834468588233,
+          12.180528201162815
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 12.180528201162815,
+          "median_seconds": 12.24834468588233,
+          "max_seconds": 12.43839358491823,
+          "p50_seconds": 12.24834468588233,
+          "p90_seconds": 12.43839358491823,
+          "p99_seconds": 12.43839358491823,
+          "p999_seconds": 12.43839358491823
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 12.417511334177107,
+        "after_seconds": 12.43839358491823,
+        "speedup": 0.9983211456850469,
+        "time_reduction_pct": -0.1681677606659271
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 12.19263660395518,
+        "after_seconds": 12.24834468588233,
+        "speedup": 0.9954517868858344,
+        "time_reduction_pct": -0.45689938720128165
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 12.235620569903404,
+        "after_seconds": 12.180528201162815,
+        "speedup": 1.0045229868385617,
+        "time_reduction_pct": 0.45026215405945536
+      }
+    ],
+    "median_speedup": 0.9989611562782363,
+    "median_time_reduction_pct": -0.10399240403240473,
+    "median_paired_speedup": 0.9983211456850469,
+    "median_paired_time_reduction_pct": -0.1681677606659271
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt20",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 12.345463165082037,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 12.38119030604139,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 12.304849435109645,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          12.345463165082037,
+          12.38119030604139,
+          12.304849435109645
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 12.304849435109645,
+          "median_seconds": 12.345463165082037,
+          "max_seconds": 12.38119030604139,
+          "p50_seconds": 12.345463165082037,
+          "p90_seconds": 12.38119030604139,
+          "p99_seconds": 12.38119030604139,
+          "p999_seconds": 12.38119030604139
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 12.305840866174549,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 12.381840307731181,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 12.340538479853421,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          12.305840866174549,
+          12.381840307731181,
+          12.340538479853421
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 12.305840866174549,
+          "median_seconds": 12.340538479853421,
+          "max_seconds": 12.381840307731181,
+          "p50_seconds": 12.340538479853421,
+          "p90_seconds": 12.381840307731181,
+          "p99_seconds": 12.381840307731181,
+          "p999_seconds": 12.381840307731181
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 12.345463165082037,
+        "after_seconds": 12.305840866174549,
+        "speedup": 1.0032197961389537,
+        "time_reduction_pct": 0.3209462324553103
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 12.38119030604139,
+        "after_seconds": 12.381840307731181,
+        "speedup": 0.9999475036284077,
+        "time_reduction_pct": -0.0052499127606076
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 12.304849435109645,
+        "after_seconds": 12.340538479853421,
+        "speedup": 0.9971079831887368,
+        "time_reduction_pct": -0.2900404830793235
+      }
+    ],
+    "median_speedup": 1.0003990656677304,
+    "median_time_reduction_pct": 0.03989064778504581,
+    "median_paired_speedup": 0.9999475036284077,
+    "median_paired_time_reduction_pct": -0.0052499127606076
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt5",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 3,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 3.650809162762016,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 3.1978216599673033,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 3.273481619078666,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          3.650809162762016,
+          3.1978216599673033,
+          3.273481619078666
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 3.1978216599673033,
+          "median_seconds": 3.273481619078666,
+          "max_seconds": 3.650809162762016,
+          "p50_seconds": 3.273481619078666,
+          "p90_seconds": 3.650809162762016,
+          "p99_seconds": 3.650809162762016,
+          "p999_seconds": 3.650809162762016
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 3.198187535163015,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 3.702299906872213,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 3.1978360479697585,
+            "run_dir": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          3.198187535163015,
+          3.702299906872213,
+          3.1978360479697585
+        ],
+        "statistics": {
+          "count": 3,
+          "min_seconds": 3.1978360479697585,
+          "median_seconds": 3.198187535163015,
+          "max_seconds": 3.702299906872213,
+          "p50_seconds": 3.198187535163015,
+          "p90_seconds": 3.702299906872213,
+          "p99_seconds": 3.702299906872213,
+          "p999_seconds": 3.702299906872213
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 3.650809162762016,
+        "after_seconds": 3.198187535163015,
+        "speedup": 1.1415244173840888,
+        "time_reduction_pct": 12.397844078395226
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 3.1978216599673033,
+        "after_seconds": 3.702299906872213,
+        "speedup": 0.8637392270765271,
+        "time_reduction_pct": -15.775684217176389
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 3.273481619078666,
+        "after_seconds": 3.1978360479697585,
+        "speedup": 1.0236552374712684,
+        "time_reduction_pct": 2.3108598095686994
+      }
+    ],
+    "median_speedup": 1.0235427357175955,
+    "median_time_reduction_pct": 2.3001223980247287,
+    "median_paired_speedup": 1.0236552374712684,
+    "median_paired_time_reduction_pct": 2.3108598095686994
+  }
+]

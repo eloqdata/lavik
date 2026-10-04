@@ -1,0 +1,9 @@
+{
+  "source_revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+  "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a",
+  "compiler": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+  "build_directory": "/mnt/local_nvme/i131/build-base",
+  "source_directory": "/mnt/local_nvme/i131/base",
+  "configure_log": "/mnt/local_nvme/i131/logs/configure-base.log",
+  "build_log": "/mnt/local_nvme/i131/logs/build-snapshots-release.log"
+}

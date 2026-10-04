@@ -1,0 +1,4284 @@
+[
+  {
+    "case": "dense-live-128m-f1-rtt5",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks/result.json",
+        "bytes": 114754,
+        "sha256": "4d0d42985d2f2b10d7e525183bce738e490ead808a51c6183193ff6476ef485c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks/acceptance.json",
+        "bytes": 2939,
+        "sha256": "7b72657a609b5d65329a9f59fb1bf0840ba0976f1f03a7998ed568ab6fc1beab"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks/driver-outcome.json",
+        "bytes": 1562,
+        "sha256": "e27838cce7ab98a4aa164955384dae6315f8fd55fcf702758a0ffe2aa43f2b9d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks/samples.jsonl",
+        "bytes": 3145781,
+        "sha256": "d09770203158ec1756a0f5bf52ef5c232ee16319c2ae78f6136c8d3d3f2892e6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks/writer-samples.jsonl",
+        "bytes": 69523395,
+        "sha256": "32a1da61af3d0dce83e2f27c621e9e3bcf4762227ca6861d010c216c4ee86189"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks/frames.pcap",
+        "bytes": 217181802
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks/frame-spans.json",
+        "bytes": 3019,
+        "sha256": "f49a1b42ba100c155939f6aaae86b09f90dc651e5f26e5d6c006f93ea954b4e0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks/tcp-overlap.json",
+        "bytes": 1390,
+        "sha256": "84a8025ddfe751f9b89d52916bb0345b9120c3f23d04cd9faadb6160219cea7e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks/tcpdump.log",
+        "bytes": 251,
+        "sha256": "383a355d3dbd074c47921d94a146d66cb33c2966a648d6a432fedb8c6a144d33"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks/source/server.log",
+        "bytes": 6287,
+        "sha256": "416e02150dada152c783c2328e19a9b0ac0d5212236832945da953dd33ec6200"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-chunks/target/server.log",
+        "bytes": 3510,
+        "sha256": "8ffe43fb84e1ada791356ba55220bb9ad075f89d4577c21202ec8a57f821e9b9"
+      }
+    ]
+  },
+  {
+    "case": "dense-live-128m-f1-rtt5",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records/result.json",
+        "bytes": 114770,
+        "sha256": "c4ea6ce48cf479a9c62372abae13e7ae3f247a02fcbd661a7ec8f700f3e3751e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records/acceptance.json",
+        "bytes": 2943,
+        "sha256": "b6a6f900ed942e98f3fb1be34c6483a6d5052e3a973bb1c55d4ffc17f3e55f5c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records/driver-outcome.json",
+        "bytes": 1567,
+        "sha256": "8697ddb6ba87c2a6398649289a8e1b8891908d794291b8064c0f36ee3a601407"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records/samples.jsonl",
+        "bytes": 3110444,
+        "sha256": "a46ea82a9cd0642a33c3bc1c30b4d49c6491784f7ee2a1918b1c3399b81c0199"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records/writer-samples.jsonl",
+        "bytes": 68743515,
+        "sha256": "7b37e629ef23f54c5d370a632f29c6ca988e28861b9c851bea06660b8efbf03c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records/frames.pcap",
+        "bytes": 216288929
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records/frame-spans.json",
+        "bytes": 3020,
+        "sha256": "a5779bd4b330edae4129c61f08074787e220bd7da3f9227f8036d578498f9be7"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records/tcp-overlap.json",
+        "bytes": 1396,
+        "sha256": "348784b084c75899b5911d6ddd374466536ac0485dec5f6916027224eb1c206f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records/tcpdump.log",
+        "bytes": 251,
+        "sha256": "f1539a0c53a166d53d0165f02ebfe6ea16daa00af0c970bd239e56ca1e8080b4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records/source/server.log",
+        "bytes": 6301,
+        "sha256": "6a704087ec9b781a51442287673894e824c398ae18d19918b893eab6a360c651"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r1-records/target/server.log",
+        "bytes": 3512,
+        "sha256": "2da3cc2a4282d4f9f1ba029e29cc3d2c6185002f5614ad72a2e200f2c217a258"
+      }
+    ]
+  },
+  {
+    "case": "dense-live-128m-f1-rtt5",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks/result.json",
+        "bytes": 114760,
+        "sha256": "d5bb9d4dc7a7d67fa6d63eb353bb6d278b592f2211a5c04686b106946be08fe9"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks/acceptance.json",
+        "bytes": 2939,
+        "sha256": "8d91f5e766305f38c65ae4e827ec00922146eda24a5a96fd71e178bdaaaeff09"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks/driver-outcome.json",
+        "bytes": 1562,
+        "sha256": "4417fcf7efedb3f6db5af9537cfe5e16662babe0a45f44d348da90dc72bd8c68"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks/samples.jsonl",
+        "bytes": 3140728,
+        "sha256": "6b79cc8176fc8fc51ca1d71910881ccefce7efe883b527ecaebd170b0b017c68"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks/writer-samples.jsonl",
+        "bytes": 69367666,
+        "sha256": "65fc8c663a33a307fefd9ff100f2692e30bf1ecd7682ee8e9f8f3148b934d584"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks/frames.pcap",
+        "bytes": 216998133
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks/frame-spans.json",
+        "bytes": 3021,
+        "sha256": "95bbd3be6b610101239f52995f5dfb6e3e7b59d3065c477b85773c55a7cec105"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks/tcp-overlap.json",
+        "bytes": 1396,
+        "sha256": "8f08cca56b0666ecc36dd5193b802f8992b1a0ce2617ca49167578c031ed773f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks/tcpdump.log",
+        "bytes": 251,
+        "sha256": "503c89d559943735f26c3f78315e9e38bfad40b4f482b3936e38bda89879248d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks/source/server.log",
+        "bytes": 6298,
+        "sha256": "9b540a523d26787ed0ec83cb3f5fc870cfece148d087d6382c6f505347776e48"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-chunks/target/server.log",
+        "bytes": 3511,
+        "sha256": "18bbb54fc765fefebdb06311a53c5ea43d2c042b1ae3b9da597862f2874f8909"
+      }
+    ]
+  },
+  {
+    "case": "dense-live-128m-f1-rtt5",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records/result.json",
+        "bytes": 114760,
+        "sha256": "47110d8244dc56dba381d314690e6d25865e950d537bb15907823cb13a219b83"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records/acceptance.json",
+        "bytes": 2942,
+        "sha256": "c690f7e447b2ae21e5b0b055874b0066cb0998e642d1b84bba5112653b8e1e76"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records/driver-outcome.json",
+        "bytes": 1567,
+        "sha256": "8ef9f73f5ab1a82d7bb75e0f7ec829dcb25560f7c4d288f20ec738d16476ef8c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records/samples.jsonl",
+        "bytes": 3057412,
+        "sha256": "9bec442620976b2f57bc4dfdd4585c7a4c25a72c8a70c67669babcc005b9851b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records/writer-samples.jsonl",
+        "bytes": 67535592,
+        "sha256": "232657c4327b78b2dd677690fcb80e069856e21b2de993c9cce8fcc801ad1dbb"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records/frames.pcap",
+        "bytes": 215029324
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records/frame-spans.json",
+        "bytes": 3016,
+        "sha256": "a4ddd499c1e7ae0a42e620922c2c60c2ea5ab8c8f84f24f899ba32817dec1512"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records/tcp-overlap.json",
+        "bytes": 1389,
+        "sha256": "2688aff2bb549a2938bd4e6d1009759dbbeea0e78165937e0fbbd520bf92646d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records/tcpdump.log",
+        "bytes": 251,
+        "sha256": "143a9ea00618fea3230cd0853bc029f2358597c0c8595d2f41dca959e88edc6e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records/source/server.log",
+        "bytes": 6161,
+        "sha256": "d0558b4c4d5b3e75e163a5900db07227cc6875975716c65271beddb96f916778"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r2-records/target/server.log",
+        "bytes": 3511,
+        "sha256": "b63ba6c8e9354d45fdd6bdcad03cd3ec52e960e0b5b769ec167ee517c0a0f7d4"
+      }
+    ]
+  },
+  {
+    "case": "dense-live-128m-f1-rtt5",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks/result.json",
+        "bytes": 114759,
+        "sha256": "1d98038a84138b9f0636e3da16378aba4cc11028f07d74be075f9aa1e9208cc0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks/acceptance.json",
+        "bytes": 2939,
+        "sha256": "3d3a3cbe8f7ec5cfee44daeac7fc617cf1eb1f33dc5a099dd7ba63162757541c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks/driver-outcome.json",
+        "bytes": 1562,
+        "sha256": "55dbec0fecf4ad27a3070391a7c5b0242364a3d1ded9dac7f4ef09492c363db4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks/samples.jsonl",
+        "bytes": 3171047,
+        "sha256": "929bee08b9cd0e36ea01f929cddb9e4f1b9798b4b0cf8f34c178596f776fc672"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks/writer-samples.jsonl",
+        "bytes": 70068889,
+        "sha256": "54ef17605c4c3f2b4b10479e2f5671e6229c15bb5ec3e9a35925a382f7d36008"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks/frames.pcap",
+        "bytes": 217704344
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks/frame-spans.json",
+        "bytes": 3021,
+        "sha256": "4f4d143a4de77fb3f64c91f2be6582e716df351b8cdf54d85402cc8dc6408eac"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks/tcp-overlap.json",
+        "bytes": 1396,
+        "sha256": "035434222a0ce4b8dba0b1acda5325bd2848689dc6fb978b2c32a5e3956a31ea"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks/tcpdump.log",
+        "bytes": 251,
+        "sha256": "750c93ea457d7b36d78a194f5e82e03167cccb5b267473ddbcc8a15f507eaaf4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks/source/server.log",
+        "bytes": 6290,
+        "sha256": "39182fcc889e3cd3af917019e721bfeb6051729029207ee5b72ee997de9d5e80"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-chunks/target/server.log",
+        "bytes": 3511,
+        "sha256": "da1541339b845d9c6c1eba5018d2f0a3555866d067580264ab9e6114a8ce9140"
+      }
+    ]
+  },
+  {
+    "case": "dense-live-128m-f1-rtt5",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records/result.json",
+        "bytes": 114775,
+        "sha256": "25159242b00152a01121120da5ef09d1b0dc20ad3bfbc5910db5ad80e8a0b0e3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records/acceptance.json",
+        "bytes": 2943,
+        "sha256": "6e364bcaff599f9f64544c8ca03d06d2be6dc28a292c3b1eee112f489fe15cb6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records/driver-outcome.json",
+        "bytes": 1567,
+        "sha256": "7c478b6b8c8416c630bf2f3391f49769f130e38dbcdfbed007fa8f23e2037b28"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records/samples.jsonl",
+        "bytes": 3019571,
+        "sha256": "84d38acf1e94d403e6827c52f1f0a64490763d9edf3035f1f3cdbb473e225e0b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records/writer-samples.jsonl",
+        "bytes": 66714029,
+        "sha256": "79c812e8a0b9254e7bce2b168eb3984a47b2fc32d24e9b13fc9eab563355e7f3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records/frames.pcap",
+        "bytes": 213996413
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records/frame-spans.json",
+        "bytes": 3020,
+        "sha256": "3fd80c91e294b5902a3fb9d9d8a4d8a46acae8fa8b28e23a5df52400184ad971"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records/tcp-overlap.json",
+        "bytes": 1396,
+        "sha256": "ead21d8925558792d57df11a3f7840f69f1f2933fcf57a650477b16ac9d9b88f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records/tcpdump.log",
+        "bytes": 251,
+        "sha256": "1380a3065679f9d8578a2cbb7b98b4f2597dd87991a05b32d9d7763c03df5edd"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records/source/server.log",
+        "bytes": 6165,
+        "sha256": "6c2cba0bda8b38092b30306f37c3eeedbfa1669f704898dc120d27f00e17a0af"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-live-128m-f1-rtt5/r3-records/target/server.log",
+        "bytes": 3512,
+        "sha256": "5a36315a2bf6b36442fa7d5d8db0cfbc8d77ecad5379f28a8b1b926df6c641a8"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-chunks/result.json",
+        "bytes": 9756,
+        "sha256": "985a4e8269d00b5ce66768cc0b24a3c1bc4103e3911b404024b49a0241076ef8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-chunks/acceptance.json",
+        "bytes": 2588,
+        "sha256": "179181214a09a007eae0acd895cb3b32a9696287cf51633ed888e1dc0f598256"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-chunks/driver-outcome.json",
+        "bytes": 1498,
+        "sha256": "404c7371591837c49ce0b083c6b6a6fe7bc40ab0fd98af5c168c85c702ec097e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-chunks/samples.jsonl",
+        "bytes": 7472,
+        "sha256": "884f0629cc36f1aeee13c70c6c190b4ee379401e83458cb74de2bd6b09f8193a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-chunks/frames.pcap",
+        "bytes": 140777663
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-chunks/frame-spans.json",
+        "bytes": 2980,
+        "sha256": "ff3906f84e26679cf796904aba2b11a215883cb4e9d1522e15c11376faca9787"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-chunks/tcp-overlap.json",
+        "bytes": 1398,
+        "sha256": "df2e2276fb2a2b856f0547b1c46853487580ff666ecacf25bba44b2d52592972"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "020c8220d578e1d2f1506ab23b10b0ddf1b78e40f4a6363755718cb2e4f908bc"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-chunks/source/server.log",
+        "bytes": 3443,
+        "sha256": "8b176d54bd5271b6a2e70f248b712d8a699a35878db9ed459f0bcf55a24a5e0a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-chunks/target/server.log",
+        "bytes": 3514,
+        "sha256": "8993423fca3e77e2c66e480f8368e78ec2bb21ccb10105296b1f6fdc8ebd9023"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-records/result.json",
+        "bytes": 9756,
+        "sha256": "0092674bc529a20ef62e25b2ae3abb25483f4d7fe1d846d93d783d92dcb6521e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-records/acceptance.json",
+        "bytes": 2587,
+        "sha256": "788ca605cce157331cb5b5f6f70c0bf5a9840dcd2b62a275a8a823048726ebb5"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-records/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "69c6697e818c89d3a770d4f7059fddb0fafb1cc665ccead2b90233a4b5aab5ec"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-records/samples.jsonl",
+        "bytes": 7472,
+        "sha256": "296a3c0a6121b5a49b4899082f7caba47f209b481b3a8bd084a13ee6cbbee3c4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-records/frames.pcap",
+        "bytes": 140773481
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-records/frame-spans.json",
+        "bytes": 2971,
+        "sha256": "002e065125212ad6403c79b2232f32b296abd804e4ad92a2e74f2f2bb931f730"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-records/tcp-overlap.json",
+        "bytes": 1385,
+        "sha256": "613a1544318413403c39cc9c36de949d973eff90e036bb2eaaed1d12d3d69d1d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "54a19cd6c88a2d9e1b94fe8e63daa612d2abf285597b213ff9c6326709f80228"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-records/source/server.log",
+        "bytes": 3444,
+        "sha256": "7aedf56c7524264cbb62c575b4fa4d7cba5a6f5daedd9e6826082c885271b45b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r1-records/target/server.log",
+        "bytes": 3513,
+        "sha256": "d4a636dba8268fb8590c045a954f2d4cddcb9f24d288d284fd68bb35476bd048"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-chunks/result.json",
+        "bytes": 9761,
+        "sha256": "4a539572acf52581db3a7b64646a0f5fffc06a2030b946257b555f4cbdeb0fa1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-chunks/acceptance.json",
+        "bytes": 2588,
+        "sha256": "deb27bb6b40ca54ac4e95c1831e1b3ba505ef057cd5f43cf4e889193a9f4ebd6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-chunks/driver-outcome.json",
+        "bytes": 1498,
+        "sha256": "04cb208c21de9c98bdeeb69558433cc13bd55f6629c2db7d2418958ab8205b43"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-chunks/samples.jsonl",
+        "bytes": 7471,
+        "sha256": "88886fcb122efcb37835d7161d4a0a271fcb6741b510e828128759a45c9ab020"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-chunks/frames.pcap",
+        "bytes": 140778319
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-chunks/frame-spans.json",
+        "bytes": 2972,
+        "sha256": "ef73021313a43a1ff1e2d072b3b46549c1abc79fbcdfc01e12911239ed6da84f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-chunks/tcp-overlap.json",
+        "bytes": 1398,
+        "sha256": "c7d9ca2579bee88d159cb6fd8c662232c66641601459e8b9e1f491f619184d37"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "b224109161e3f80ece7d82dc872d813f6f18e530e20383518080f27fe6647315"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-chunks/source/server.log",
+        "bytes": 3443,
+        "sha256": "aee1f53767f705bf903454e139f9454d797e9813a3cb4b07b529c59437648110"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-chunks/target/server.log",
+        "bytes": 3514,
+        "sha256": "3191c82c32ec81699e1200f98add6160d23922d571670eddc20e2520cc23c048"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-records/result.json",
+        "bytes": 9767,
+        "sha256": "cb321e16390d6a7bce4db8a1f4de4a8a464550812a360727660f37f1c55669fc"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-records/acceptance.json",
+        "bytes": 2591,
+        "sha256": "9873426be9012e882ea39ae166b7cee141978d6bf8869b39923950d434c8dd59"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-records/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "9470b76017d90408270181c6130cea8735a54bc30f3458390428f13ab923ca50"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-records/samples.jsonl",
+        "bytes": 7473,
+        "sha256": "8531e532938f80f3acd61ddb5d4ef1758d07581d8b61812203c5cd5524cffe6c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-records/frames.pcap",
+        "bytes": 140781025
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-records/frame-spans.json",
+        "bytes": 2971,
+        "sha256": "8e5122b0cfee6b6ceb8259ccaeebedaf793d74b20b596941c1ba52bbc977ebf8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-records/tcp-overlap.json",
+        "bytes": 1399,
+        "sha256": "546254c9f6fff417f8879fe6a21ee5f2539c941e6b03b5d611e2bc0284324d13"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "5fbc26033145b2a238bd627868dab8bd5775dc010fea8fbcda3141642ea3f564"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-records/source/server.log",
+        "bytes": 3444,
+        "sha256": "adba2ae2decff4b284096bc0598b0de3af288b858530481cd2b2312f43dd7f15"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r2-records/target/server.log",
+        "bytes": 3515,
+        "sha256": "992917efc9b67804a3b9622439565d37ff44ade32eb1fa1a43edbf9a984eef70"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-chunks/result.json",
+        "bytes": 9755,
+        "sha256": "77494858ae4a128e76c602311d546f93d8b2f0bc420858b0e83cd534d85a1d6e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-chunks/acceptance.json",
+        "bytes": 2587,
+        "sha256": "614f931ff04e351e3b9ffe736d24e5a87b3702e48fadd5b644a0bb142966924b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-chunks/driver-outcome.json",
+        "bytes": 1498,
+        "sha256": "e1eac90f4e9f2d53d3ae6df925898bbb7f6bbe2d4b55d98fbda1cf1081ff0df2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-chunks/samples.jsonl",
+        "bytes": 9973,
+        "sha256": "11e10a066ea4b49020f7a46270b9351717a6bde584ba87c091dae2dd1f43f2dd"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-chunks/frames.pcap",
+        "bytes": 140774547
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-chunks/frame-spans.json",
+        "bytes": 2970,
+        "sha256": "7a37c453393195c2639540fd325b61f33f8bed6e03432e0b1402ab62acc1e563"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-chunks/tcp-overlap.json",
+        "bytes": 1390,
+        "sha256": "c2e003a2a056b3ee8725a591b4ddeca21fe0dd9e1f9b8f757c925fb90a2aada0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "4277c6919dabbce8c8d107c87c5d69db78152c1381a8e77558c1d0d87a31b70e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-chunks/source/server.log",
+        "bytes": 3443,
+        "sha256": "349b24a41bd94ad59cc518fa30091b1b66657b808c363325ce124ce58d089afb"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-chunks/target/server.log",
+        "bytes": 3513,
+        "sha256": "48fa9fe41c7a938e5b91ee7226c2f1a634ad14328a9f82443a95c3adca8e027e"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-records/result.json",
+        "bytes": 9767,
+        "sha256": "695dfd2a91e9f5d7b8d4f7a16e8218a94242177603ea3e4b9000a46a3969257a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-records/acceptance.json",
+        "bytes": 2591,
+        "sha256": "2b24b6997c5d479b2d5dcd6ca7582b2d7535e583537a3d144c6776fdd71e4379"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-records/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "404fc547a7c7a767fc0d877aba1d83d6ac0d9f99e2630117ead6fc26a5959acc"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-records/samples.jsonl",
+        "bytes": 4972,
+        "sha256": "51f59571851a34aea4e2c2c364866f4c3eac84d03894db72b2adcb3e2040c8da"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-records/frames.pcap",
+        "bytes": 140768807
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-records/frame-spans.json",
+        "bytes": 2977,
+        "sha256": "a109ea7b1e11c00ed2984cf5cd6881a66fdd153de77e9ed3468abd437598d2e6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-records/tcp-overlap.json",
+        "bytes": 1398,
+        "sha256": "f43e817f12b6e4e3ca0268679309f5abad04c2dfb2e48969c08c0ad3876ce8de"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "f0b7bfa55665b5143b2141ff05503970b8923cf0a59027c1d95221cd9e2ddfd2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-records/source/server.log",
+        "bytes": 3444,
+        "sha256": "6a33842de8f605f778e37f4cd9c7123aa01615cbb04fbbdbe1d7a9cd86c5a10e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0/r3-records/target/server.log",
+        "bytes": 3515,
+        "sha256": "56f5909b32d7334a4c681f9fc2a80bad7dafbcf2ba82f28fdbb461a4bab7ac19"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0-nocap",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-chunks/result.json",
+        "bytes": 8809,
+        "sha256": "b82dbeafe2725e1db6c72dbbabb6c9b88cabf1c4e41da300a0df0a2bc190d6a8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-chunks/acceptance.json",
+        "bytes": 2150,
+        "sha256": "9077fcf6063fb41c692ba1c2a5671e399670309a15ce2d9ab48544f93b2af1e0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-chunks/driver-outcome.json",
+        "bytes": 1499,
+        "sha256": "914e5610f84abec8739830a931d7b35a2bdfa0623acf194c4085d847aaeb7c72"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-chunks/samples.jsonl",
+        "bytes": 4994,
+        "sha256": "6bcec1ba196d5569ff049b0426ab72e3e5432581e1ba131fef91fee4165a3a67"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-chunks/source/server.log",
+        "bytes": 3449,
+        "sha256": "de428b5571e426059bddd1ee6ac9e38fe4a790dac7d82b42837d1cd1a1de553e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-chunks/target/server.log",
+        "bytes": 3519,
+        "sha256": "847aa9668519fb714e8e18c8c297301c16916f01fbdebdaf25d5e3531ebd2ddb"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0-nocap",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-records/result.json",
+        "bytes": 8822,
+        "sha256": "6ea4e2629d8dbf0af8c432fe2bdf7d8c09cefa4810e71fd4fe2febc856eab5ac"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-records/acceptance.json",
+        "bytes": 2153,
+        "sha256": "272b3b5af02c570b48e94383ba892c1a187435c77f1457c3f81a9dad0486af95"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-records/driver-outcome.json",
+        "bytes": 1504,
+        "sha256": "968b01c97124d7e76fc401c143589fb0517ad9d43fe31552b24e47bde31df545"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-records/samples.jsonl",
+        "bytes": 4994,
+        "sha256": "7fb89fdf09dae2ac63eff9c605343d9792b68194e72bfde94fcd1c2c5e6e36b4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-records/source/server.log",
+        "bytes": 3450,
+        "sha256": "59a36a3bb626a9f2a29fec0c395400c480b390acfc0abe0dba931ae4a4fb7cb2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r1-records/target/server.log",
+        "bytes": 3521,
+        "sha256": "b5183e287ef39b26c904135669b6cf1a503e25aca5894729177d44fd5fa58108"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0-nocap",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-chunks/result.json",
+        "bytes": 8810,
+        "sha256": "3019f3251892ac16194e1587a8558f7fff68c13912db7a6590dadfb3b0d44b14"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-chunks/acceptance.json",
+        "bytes": 2150,
+        "sha256": "cb475562f4db09e511c92415ff1c79b68f0b32a48874061d95dd64180a737992"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-chunks/driver-outcome.json",
+        "bytes": 1499,
+        "sha256": "75314974bd16e17d9afa354745cf6458c0fd537b66687e414219781a108dd221"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-chunks/samples.jsonl",
+        "bytes": 4993,
+        "sha256": "f6837f17f88d1a1151f51718a1b62c02875116a26eb437bbe021b53e683703f2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-chunks/source/server.log",
+        "bytes": 3449,
+        "sha256": "102ef6b605134fa76308f09a929ea7856a9c6cec2def68d36d34c6483ee4a1f4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-chunks/target/server.log",
+        "bytes": 3519,
+        "sha256": "e915e3fd465be4b140854eb5e909e8df2786c2aee1ce20c9fce5a6e436ea4164"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0-nocap",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-records/result.json",
+        "bytes": 8822,
+        "sha256": "8b387cf0a0629ee7acc681b60af6be8f9b3d6a581ce94096af8b987870bf13d3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-records/acceptance.json",
+        "bytes": 2153,
+        "sha256": "0be92d77d51c193f7d87715293ff3e41d810c547f0bb6549681cefa69de9d23a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-records/driver-outcome.json",
+        "bytes": 1504,
+        "sha256": "7966d6c3c2f748b08c91ef77fcbed3fe14e02f15fd69bf446f6986bbf5642eb6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-records/samples.jsonl",
+        "bytes": 4994,
+        "sha256": "b3a57073adf38b478e8b32300f29bf2b1f8b8c31053c7ef7c294795f122a9a6d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-records/source/server.log",
+        "bytes": 3450,
+        "sha256": "2a1387e035fe12d5acf641979cf6d72621abc73db065e07d18e9af6a03941667"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r2-records/target/server.log",
+        "bytes": 3521,
+        "sha256": "af045bf1c716a29016e589aedf105c8c2510cbadfced6a637b4c6b6cca15890e"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0-nocap",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-chunks/result.json",
+        "bytes": 8809,
+        "sha256": "1234b4328339a6345a2b8e19328c904d1109b19634831f0ee48443f1d7474958"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-chunks/acceptance.json",
+        "bytes": 2150,
+        "sha256": "d5cb02800cc567d605a6c61850a3953e43328cc1e4de110c49dbced97956eb75"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-chunks/driver-outcome.json",
+        "bytes": 1499,
+        "sha256": "c32d7c089a19417613393de3188b45e118f7f5ad9378eac72d644d59a3c40d14"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-chunks/samples.jsonl",
+        "bytes": 4994,
+        "sha256": "36f8d18321eab8bf39d4565d760930b62de7bd6bf3b77c4507e85a77db217923"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-chunks/source/server.log",
+        "bytes": 3449,
+        "sha256": "0d213b035cf776393fe4c2eb9568659d17b03d5bb2f76dc17f35fdfd7d2cd0a8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-chunks/target/server.log",
+        "bytes": 3519,
+        "sha256": "5c3ec6cbfc2a772e17b94688a604cc9809a184029619e9f6325c9d4225a787e2"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt0-nocap",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-records/result.json",
+        "bytes": 8821,
+        "sha256": "6720658301984d2200781c922d20f5c25dca0095b075f072dc596c90dd374527"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-records/acceptance.json",
+        "bytes": 2153,
+        "sha256": "6b2739925b70ca62fed1528d3cb77951c41e3f7d5183e0b7fffc80f68015368a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-records/driver-outcome.json",
+        "bytes": 1504,
+        "sha256": "cc4e9315a54847dea9e45b31fecefd6785d32209f7c17c4191b4002a89be8a94"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-records/samples.jsonl",
+        "bytes": 4994,
+        "sha256": "a4bd034f7c0a0394c485ce8b4d38f5898fa1b0f5fcd1b0d2b1333ccb6c570346"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-records/source/server.log",
+        "bytes": 3450,
+        "sha256": "7bac3e8f6639c9866aa759bc59d378a01b32930818c852bc84bc81a4e735d5e0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt0-nocap/r3-records/target/server.log",
+        "bytes": 3521,
+        "sha256": "f77e13f7ccc2029c46c211f10d0183da70dcc3a7e32a2c89a38a49d8035125f8"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt1",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-chunks/result.json",
+        "bytes": 9755,
+        "sha256": "fb80eb313093af9c33eb170dcfc12bd23b30916eb1898e62bc29b926487bb457"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-chunks/acceptance.json",
+        "bytes": 2588,
+        "sha256": "b9efd6cdaa0d68973c0bf277b587b0934667e5c2289dc11f3c9444cb1c0c0caa"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-chunks/driver-outcome.json",
+        "bytes": 1498,
+        "sha256": "b45ef977515ee858364179b657c291a73160535da734ca984f66b10bf1692f32"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-chunks/samples.jsonl",
+        "bytes": 9967,
+        "sha256": "c3e6b9669c3dd1284ab237e37e0a2d62b42829bc53348bc21a21bcaee673d572"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-chunks/frames.pcap",
+        "bytes": 140771841
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-chunks/frame-spans.json",
+        "bytes": 2974,
+        "sha256": "14aca7db58bd146bd6b4b838979fdf2ecbf857954ac25e58c14008d9d0362fb1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-chunks/tcp-overlap.json",
+        "bytes": 1398,
+        "sha256": "c40e4143d555292926063744a02cfd4753621547856f44e149ba13ec1241d32e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "88d6ecc29c125abaa42d2f8304f5d8854ec706dec874d9b9afc095e180bb55f8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-chunks/source/server.log",
+        "bytes": 3443,
+        "sha256": "978d58139e3f4bbb0a5ba5271e25232915c6040a0ccc8977357a95d552d20028"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-chunks/target/server.log",
+        "bytes": 3514,
+        "sha256": "6abb3452e20ed5387523e202cd27985c6fe99a56637efa45618188acd797a56d"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt1",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-records/result.json",
+        "bytes": 9764,
+        "sha256": "0239f5f9a690c5139801c862c3756b87d3c4cd9e15a3803fe3638f49a18631b8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-records/acceptance.json",
+        "bytes": 2590,
+        "sha256": "8583b02b4034f6394e29aaf212285907e068446c64ac68ede733f0f25a2e4ca8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-records/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "d7c5d630b1e3437310831e2fe73cac02d03a368d9bbfdf6d91478438d490fec2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-records/samples.jsonl",
+        "bytes": 9965,
+        "sha256": "af64dcb2f63998d46eb8b90e1ee713ae24481395644cf642d3bec39e9f3d44e6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-records/frames.pcap",
+        "bytes": 140779877
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-records/frame-spans.json",
+        "bytes": 2977,
+        "sha256": "cc5a109cae63379a856771f484ccbee3882d7c599756cc738bf763d10798eb20"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-records/tcp-overlap.json",
+        "bytes": 1399,
+        "sha256": "150e6245b254d44d5a8e8d01eb893349ef425156f80b3bf187b6c70074cb49d0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "290dcda4137817e3347f0b4f6283bc23f8009c6dbf3125f1be1a1534ea233e9d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-records/source/server.log",
+        "bytes": 3444,
+        "sha256": "f48a6284262dab39aa567eeaf7f8aeeab144f16373488dc8b23761a45b920cf0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r1-records/target/server.log",
+        "bytes": 3515,
+        "sha256": "e998e96fe1fb0b6a8704662bf50dc03259ff915895e34af879a15cff4cc461b9"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt1",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-chunks/result.json",
+        "bytes": 9746,
+        "sha256": "c64be3e07cbb7d120f1306cc9d7b8efddbd42166dba1ef4cae2103e975534d6b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-chunks/acceptance.json",
+        "bytes": 2587,
+        "sha256": "ef303ddaaefc0eed9f9c9ba6ac82a66e29baf1c632c5641980cd11ed90da2efa"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-chunks/driver-outcome.json",
+        "bytes": 1498,
+        "sha256": "6396073fc85d894a1b3abd78da65dec7014b38f330fe4ad246a18ed76225e3be"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-chunks/samples.jsonl",
+        "bytes": 12468,
+        "sha256": "4bab444d36c1d215f3bf86d94e2200746286c8e30ffeef8654d7406f5289776b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-chunks/frames.pcap",
+        "bytes": 140773481
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-chunks/frame-spans.json",
+        "bytes": 2976,
+        "sha256": "b295da871096e712328dcb76aed9ec94a4c718f371a98e8b173183952848de28"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-chunks/tcp-overlap.json",
+        "bytes": 1391,
+        "sha256": "d9116b7db16dc61c89cd97ddffdcd5c00afb836fb432db8f64b705b09651833f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "86997c608ae4ec97e7d5cbd8ddbd158000a860c4b747e81b9aab3a380327062b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-chunks/source/server.log",
+        "bytes": 3443,
+        "sha256": "4e5ef4b11dbc13d930c3d07d4f97a9a2ffba69718c196b45ec504080d8ab10e7"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-chunks/target/server.log",
+        "bytes": 3513,
+        "sha256": "3bb178b2d7a231fd6aa421fb10d979be0c78460e755034ebaade1d4f10ea4ea0"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt1",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-records/result.json",
+        "bytes": 9764,
+        "sha256": "25a3f2a78ed034ce0563fd911e7e3719d8f6338d3af997f634c744d8b931f0be"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-records/acceptance.json",
+        "bytes": 2591,
+        "sha256": "9adf238121ac61fb251de26b491f5c4614bf74d2868bd966313af49ecdf45070"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-records/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "865364adb96d52808b8862e6767eea1559f718b28b90926faaf96202ee00a3b9"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-records/samples.jsonl",
+        "bytes": 9954,
+        "sha256": "51e9650553cc0618fb8ce0d9c4cc372c2d5709b409456878df381f17af044503"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-records/frames.pcap",
+        "bytes": 140774219
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-records/frame-spans.json",
+        "bytes": 2979,
+        "sha256": "61a013c17bbf2e8c5a1175d921d377990123a9c71686ce02fc2c66691e0c9049"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-records/tcp-overlap.json",
+        "bytes": 1399,
+        "sha256": "d4d6ff144b029c5a92e105f78090caf62d4177ba3f0fde9f9d9e1ac507066daa"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "09d168d2bbf9564b767f0d0dcca3e5dbb3faaf8688873910a0b86535e7da1de2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-records/source/server.log",
+        "bytes": 3444,
+        "sha256": "fa45d837baa4ebecb0176b4bb2b2b028f179f477533aaa4e2e37ee193c31f88b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r2-records/target/server.log",
+        "bytes": 3515,
+        "sha256": "a86839d4a22c9a3997a915ea8bd3bc3516247d7516b3f6cf93f693533024c08c"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt1",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-chunks/result.json",
+        "bytes": 9756,
+        "sha256": "fdfbb081ab2e5c8a602f7d625f1d6573864c946cc38a43aab3994bc276b3ec2a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-chunks/acceptance.json",
+        "bytes": 2588,
+        "sha256": "bcb30c1fc76297242e1bd5a4d1cc9afb8d3345766c5dc118fee5e5ea9d2c363d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-chunks/driver-outcome.json",
+        "bytes": 1498,
+        "sha256": "09a742d2aed9793221cb1aa362f983710f6d96937a5ca24b10f2f51c2c381c18"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-chunks/samples.jsonl",
+        "bytes": 9967,
+        "sha256": "96a49f519eecd5b161aed351fac24968eba6a7fe3f6070ff13767ba08f144aaa"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-chunks/frames.pcap",
+        "bytes": 140776925
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-chunks/frame-spans.json",
+        "bytes": 2972,
+        "sha256": "fae34e14fd49e45c0969a1ec2c0b9d93dabb3cf5560f173dc9b6b3828b18f037"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-chunks/tcp-overlap.json",
+        "bytes": 1397,
+        "sha256": "ece017b14e9bb061f642e72047958780668ef296a5909c0d0ebd9c309d1f5e0c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "24c621d1a2d38a845da26d2e056b4183770ecb4121c545789a5c64c6137bd012"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-chunks/source/server.log",
+        "bytes": 3443,
+        "sha256": "4f083bb16d28bccde86c670b41dc26034241f3336e5a615da5afeb5c4f25a4df"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-chunks/target/server.log",
+        "bytes": 3514,
+        "sha256": "e331efa4a36cd150bd6ba1c93a9875cd8743f87a890f4decdacf5bb121dda096"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt1",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-records/result.json",
+        "bytes": 9759,
+        "sha256": "fca537ccc5a46a2cb51b282b752ba6d9dce99df561252c7c996a6a86a0d33388"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-records/acceptance.json",
+        "bytes": 2591,
+        "sha256": "841b297d35dafed5d14993c608845674bef89515a5492f850cc668bdae941fa1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-records/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "eca2ccd6f4c2ee7820b3c6ab0658adb7b8cbbea87410691e118e3d43ff3480ff"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-records/samples.jsonl",
+        "bytes": 9968,
+        "sha256": "0fc35a944b0b10635b86b5fbf93878ef36954cb67453f9925f408a8c5928eb75"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-records/frames.pcap",
+        "bytes": 140772989
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-records/frame-spans.json",
+        "bytes": 2971,
+        "sha256": "72a4f870574d5ab675afef5c79c292c2ba6460563c22623c85c1107b5c4018b9"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-records/tcp-overlap.json",
+        "bytes": 1393,
+        "sha256": "7268aaa472f1b6352c8802082ca415c8836a144b991e4c2246a8096c0d949bfd"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "e61b2a07c07e9b7f16d82a58ac8abf85bcf5d6997b71d61e5b7a6712c21a8500"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-records/source/server.log",
+        "bytes": 3444,
+        "sha256": "253d8a44ed1daffa75037e047db9f5488217d8c1a0a6dd7e99faefabb882f7ba"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt1/r3-records/target/server.log",
+        "bytes": 3514,
+        "sha256": "c51e7f97210d582ad73519c8a00b2ba9c0160a7409a3ebcc468d484bce1fbcee"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-chunks/result.json",
+        "bytes": 9763,
+        "sha256": "718636fd43616c8b4ff1e0c24fb7de8545dc25d96278cf7cf6fe736bd53d965c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-chunks/acceptance.json",
+        "bytes": 2587,
+        "sha256": "ed1902fe908bfd4bea804cc9e570bff18272cac41922f4998182cfc8dc7b59b6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-chunks/driver-outcome.json",
+        "bytes": 1502,
+        "sha256": "ef9234ca41f69dc7d386a7707cb32b0117a9a4ca0ee7eeec654db408cf457a60"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-chunks/samples.jsonl",
+        "bytes": 39928,
+        "sha256": "dc5fad2ca5e2853b105c9db5106be34ec981802c0ee3401ef19246368c569d3d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-chunks/frames.pcap",
+        "bytes": 140760607
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-chunks/frame-spans.json",
+        "bytes": 2977,
+        "sha256": "99c85bf2419c27caf324585bd32f70f9b116ccc3dcde9420536ba6d71959acd7"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-chunks/tcp-overlap.json",
+        "bytes": 1399,
+        "sha256": "4af7b3b32df65b1fe9777806d8c640b336f4cb32af18a5a10c10d240a94d1c96"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "c8980f8229bc52f147fab169334c51f799e082299f0d644736558fea8509d569"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-chunks/source/server.log",
+        "bytes": 3570,
+        "sha256": "c852c96b8d5dc7d1a869e93e0c2a434d8a0d47eb8dfaa1101bcecac4896b4efd"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-chunks/target/server.log",
+        "bytes": 3515,
+        "sha256": "1eddfbbeb093ac6ba1aa46979c37be110ea74a769c57b83bc8785f36659b1132"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-records/result.json",
+        "bytes": 9765,
+        "sha256": "954819bb386c5ea2011fe4638b0713aef1d7bb696fca13f5ea1fa65c023933fa"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-records/acceptance.json",
+        "bytes": 2592,
+        "sha256": "2aef1371da25dae76a85898223608ecc89c7194d457ea12fb178400dd5762f1f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-records/driver-outcome.json",
+        "bytes": 1507,
+        "sha256": "a7c39acb8c3663b0bf82ab2749f9587d1eb3c6e90b5ebc87c6ff311220fc974e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-records/samples.jsonl",
+        "bytes": 32424,
+        "sha256": "d523a026d62124eb4aeab67bf777e6167c49b91ba5275b73e4e2007a9c6ce6e3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-records/frames.pcap",
+        "bytes": 140767577
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-records/frame-spans.json",
+        "bytes": 2974,
+        "sha256": "47910f070b6a110580f049b6f8d426837ca4ad04665eb4de36e2000c60965ff1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-records/tcp-overlap.json",
+        "bytes": 1394,
+        "sha256": "02fcab6a714752c108fe835ce99009193605b6f300b5570a9b2f0e683efa765e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "9287e9e037792c9bb368d2e8f2fdfbcf06769726214438d93b417ba187ca65a0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-records/source/server.log",
+        "bytes": 3571,
+        "sha256": "d09d904e652736fec5d1b6dbee2d78e7c47d65c7325c62b34e51cdf083c455d9"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r1-records/target/server.log",
+        "bytes": 3515,
+        "sha256": "0c7f660454fd8820e8b8294b1f9e45cd4c6f3512fc760d792d502d8c0461301c"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-chunks/result.json",
+        "bytes": 9763,
+        "sha256": "f53527093079e3feda1b24450882c79332e43d91e1bd3ef93f95044aaac4315a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-chunks/acceptance.json",
+        "bytes": 2588,
+        "sha256": "85827d4ae86af7795c56c55e87c6b697d3d2d7f424eb7d04e69a1d3ab1f65b43"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-chunks/driver-outcome.json",
+        "bytes": 1502,
+        "sha256": "70e488a516d6a2f185239c37d9e360ac2ca26b090cbd41fc60b97afa9bcc15c5"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-chunks/samples.jsonl",
+        "bytes": 37425,
+        "sha256": "49e8f7b013e9e1799a8b24d3a14a3e07a1bd0b607c8e205a1be8fcf743a630be"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-chunks/frames.pcap",
+        "bytes": 140763805
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-chunks/frame-spans.json",
+        "bytes": 2979,
+        "sha256": "feaacc72ed1ab3a23ce64e4d6431e87dfbc9bfe314957dd75c07d5526016c724"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-chunks/tcp-overlap.json",
+        "bytes": 1398,
+        "sha256": "3ba2c955c6e3c358f8ad9e3b1806ca2f88aa4bed91ec080881a89f48a6251990"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "c4ce9035f12286c0d66576d692c78e9958c6ed4e9409533180c2b2097871dabd"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-chunks/source/server.log",
+        "bytes": 3570,
+        "sha256": "72872c4795b5eb507bac372919365afae5ec32c95c1d44171b2045e3fb4bbe01"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-chunks/target/server.log",
+        "bytes": 3515,
+        "sha256": "5862f2f73253d1aff1bd2aef7056eb54e5ee896068b216de05927f3835cb70a1"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-records/result.json",
+        "bytes": 9768,
+        "sha256": "85eb6873f71539062c9edb82a691085a5c95d738f1cb5adf00e27265556083e1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-records/acceptance.json",
+        "bytes": 2591,
+        "sha256": "2f6478981442b7ad4a60ecbc86e3f84ae22e8888e61a91187ec91d4442cb2a10"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-records/driver-outcome.json",
+        "bytes": 1507,
+        "sha256": "190ee6c1a0a489308556468cbf774e9641ae96e6fbacfb7dceb6f7139df29627"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-records/samples.jsonl",
+        "bytes": 32425,
+        "sha256": "7e7590ad29e37b3a0c56b043f16a25bbcefafb33a3d30f59d34b945255c8009d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-records/frames.pcap",
+        "bytes": 140770447
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-records/frame-spans.json",
+        "bytes": 2974,
+        "sha256": "681b79793bac4b86b1cb9cfdb0f744da1b73ceb94181a46550bf63c60ccbdde3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-records/tcp-overlap.json",
+        "bytes": 1393,
+        "sha256": "9c8bda97d463d9707d6e6a87da3900e94190a8f098bbcf4416955ac0ebfa79b2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "edf295d6ae447829678fe01818f08815997a0a1dd8ef13a39b1915480208edb6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-records/source/server.log",
+        "bytes": 3571,
+        "sha256": "69565c4785d9789f1d4094cefa826495bfab929c9a4f0487b2679f458b13e4f4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r2-records/target/server.log",
+        "bytes": 3515,
+        "sha256": "8eff32a048a91496d2fcf2605be4fdd1265b23366ccf2d307ef410cd641ce1f1"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-chunks/result.json",
+        "bytes": 9758,
+        "sha256": "655888144bda94b5170aff7c3947e37ea41c12d168563191e877a497ce73cae3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-chunks/acceptance.json",
+        "bytes": 2588,
+        "sha256": "cfaee743cd6f92b87ae935fb2771c07fc52ef6a13483064b28f0161d4677ead8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-chunks/driver-outcome.json",
+        "bytes": 1502,
+        "sha256": "8390c18997ec5bb88ed54f868dd97a978c4b6fd01ebb40d09d09a4b8ec172326"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-chunks/samples.jsonl",
+        "bytes": 39912,
+        "sha256": "010ad5a6d4f2ff913adaf1637f405225e9b7615f333d3096ff4daacb08f59f1f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-chunks/frames.pcap",
+        "bytes": 140757327
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-chunks/frame-spans.json",
+        "bytes": 2971,
+        "sha256": "2b3dadbb9f3a8e8782ec4b5cd0cb62ba9a14d1280c055743b8f073e0e26515c5"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-chunks/tcp-overlap.json",
+        "bytes": 1392,
+        "sha256": "073f07d8e1bd3897e35b2a53dae706801d4e236283b3fe913d37c03f56808ef0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "7bd4d3a3316704106cf8bb58a6c1b8ef65384fc47cf077bfe39d9b4e0e12dc72"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-chunks/source/server.log",
+        "bytes": 3570,
+        "sha256": "fce4b07c66543074343d33ce8665e776e70ed76b2753b7e88be8d95350617e85"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-chunks/target/server.log",
+        "bytes": 3514,
+        "sha256": "5df6c9fa97ba4ee8f066de29c7744d4b223b901bfaebb6b18662ba6c3ade79fb"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-records/result.json",
+        "bytes": 9769,
+        "sha256": "69aa5c1500171b6fe4dd518246e6d544f26303f9a7e8a02ff1e0d6712a927eeb"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-records/acceptance.json",
+        "bytes": 2591,
+        "sha256": "9ed977f2a2b3f4524a4d840c78c5f606fbfec3d5ac58124f00774574eb406d37"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-records/driver-outcome.json",
+        "bytes": 1507,
+        "sha256": "accde61a0be7c0e42d9c23dbf7886b3cde48c7bca7f9e969b19bc2ea56077705"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-records/samples.jsonl",
+        "bytes": 34912,
+        "sha256": "56ac6db63f63652fa5fe19ac324b654180c7484c1bebced130b52857c24735b2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-records/frames.pcap",
+        "bytes": 140769053
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-records/frame-spans.json",
+        "bytes": 2978,
+        "sha256": "e0dfbbec621c5b69fbe13bbd6ae52ffa5c2124a351bdcece4a88431a27cbf00f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-records/tcp-overlap.json",
+        "bytes": 1398,
+        "sha256": "fc84e24424b16c238be61cc1a9e4ecbe0ca0765d4ee2aa3b9d54f0c9b6036f53"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "a0506e392975639e4487972c4a350ba8874d45947e5e28387bc8443b65d2e882"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-records/source/server.log",
+        "bytes": 3571,
+        "sha256": "d9cd906065a2c78d02e2ee24ca0d5bae15bb5208859684cf2f6bb39e18a9471d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20/r3-records/target/server.log",
+        "bytes": 3516,
+        "sha256": "690ce708301c7ba59f11bc3ea43dd6f2cf4c3514a3142aad69a8592dfcb7164c"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20-nocap",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-chunks/result.json",
+        "bytes": 8813,
+        "sha256": "492daf5ff975507cda7decaf7091da8bc0b6a56e788244840782f77946098825"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-chunks/acceptance.json",
+        "bytes": 2150,
+        "sha256": "c80ea2f85b5aba4968b44f9d23717ec13a31550465ad5016d9f3edf05b416efb"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-chunks/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "63b103b21a32e104fd4167eda8765781e05c0097a0080f2001379c18252eb0ab"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-chunks/samples.jsonl",
+        "bytes": 37429,
+        "sha256": "c01dfa9ce9a237cb5f7428f064badf322dfa6997cff15c609fb8d4a2a54431f5"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-chunks/source/server.log",
+        "bytes": 3576,
+        "sha256": "fc82dd3c6c85e74180e9991ee7e93ee4484e5b639bd0ccbb74c393185fd502bf"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-chunks/target/server.log",
+        "bytes": 3521,
+        "sha256": "56b313976a62673142c65d481d6d5754bbbf5a4669349a3cef3c9d26e8de7e95"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20-nocap",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-records/result.json",
+        "bytes": 8819,
+        "sha256": "f0cc8a1810aa400f538f65946f22dc0cf1df0eb271334f570cb6f23307ccfa95"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-records/acceptance.json",
+        "bytes": 2153,
+        "sha256": "7d11244e6819198b8db620ac0e658685f25b91f46d942d1cd281dfe308659790"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-records/driver-outcome.json",
+        "bytes": 1508,
+        "sha256": "0802b8df5b2654f5a396e0c965d2bd8499d75b3e5755300c85e20a1b1a261dd4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-records/samples.jsonl",
+        "bytes": 34929,
+        "sha256": "b4bb16d5ef892d63e9807e5d3f311802f53c91b7ac642e6a47587124e0bacd50"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-records/source/server.log",
+        "bytes": 3577,
+        "sha256": "5da44a6feccbf36d70e3a4846d9ee3f919b800db9002613b17bf8f628ac146f2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r1-records/target/server.log",
+        "bytes": 3521,
+        "sha256": "ec2f564ffb14614b0cdf6e24854c582e0f29ac5e78dbcdd43a021756125641e2"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20-nocap",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-chunks/result.json",
+        "bytes": 8815,
+        "sha256": "b614b206ae0dcc76c42ec53b41167b5c1a61048e9125c78ffdb3e606e5f41b88"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-chunks/acceptance.json",
+        "bytes": 2150,
+        "sha256": "b1a343f0365634fa4ea63f704ad7bb26e6f557d17278c6a7ad302e8f6e43e8e3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-chunks/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "d59c03dffb6ca5ec3f0238f46fadb400b57cbe261837863a7c283d6ffb9ffb9c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-chunks/samples.jsonl",
+        "bytes": 37424,
+        "sha256": "84be7828c82ece6464f90fdaf27c3474a8d489486158bc3a7aa1d9f627abd42e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-chunks/source/server.log",
+        "bytes": 3576,
+        "sha256": "017a9e75b1799036b05c27f1c8a31a325298f717008cb89ab0e8b95782d6864f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-chunks/target/server.log",
+        "bytes": 3521,
+        "sha256": "010a201c6ee07ac2618e8adf9b79fdba2208b26273639ada43570ac1d47e861c"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20-nocap",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-records/result.json",
+        "bytes": 8824,
+        "sha256": "aad23dbfa251d1553131ee9d77c234542f7ae45e6e612599267e74504b17050d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-records/acceptance.json",
+        "bytes": 2153,
+        "sha256": "5ef0fca759563e467bcb5ad32ca643ca08b9141d229c008639b9dd8771b1d145"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-records/driver-outcome.json",
+        "bytes": 1508,
+        "sha256": "b091449ca14f2f13f09e326d56755f0cad75d46946407a4934c5ff2f79ea733c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-records/samples.jsonl",
+        "bytes": 32423,
+        "sha256": "4e14e644b8cecfb290b4b797a847c6fdc79ecd678d30b42274633a504a5ddc02"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-records/source/server.log",
+        "bytes": 3577,
+        "sha256": "5f7af844a79e2199fc6c0a9f00292b17fe8e65196f0006713fbbf3148c2c0ec0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r2-records/target/server.log",
+        "bytes": 3522,
+        "sha256": "e5f1c5484bb6d93438409848c13740ff58368cffe0819fc54a4a74d201a92e7e"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20-nocap",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-chunks/result.json",
+        "bytes": 8809,
+        "sha256": "6b2ad5800fa8af5b641aac8eff82cbf7dfb30391786d506c656b705b3749b9c5"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-chunks/acceptance.json",
+        "bytes": 2150,
+        "sha256": "77a6bc3d7d93ec33d36a3ac8461ac738f71a03ebc7cb5da45bbb68154fda3935"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-chunks/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "e7e70953df29208565c68a4c9ea789c4924e7288c41b2712ecadad65d758478d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-chunks/samples.jsonl",
+        "bytes": 37426,
+        "sha256": "62fa00060074210fc82437fdf9d9f68e33408c4308862e44a08e0a6abea0d375"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-chunks/source/server.log",
+        "bytes": 3576,
+        "sha256": "4fc3d0d16590a27c377e07726c1e4d73b778bd1a1ea19d1be93a932c62bb2254"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-chunks/target/server.log",
+        "bytes": 3520,
+        "sha256": "a19cdc28f18a209637f6252edd9a834af2c9eb95f5fc0a6c852e7fecd6005e94"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt20-nocap",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-records/result.json",
+        "bytes": 8824,
+        "sha256": "d64db96b0c7953a64dc57888ad1f71b42479c7cb1aff87194219249a7de6c0a1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-records/acceptance.json",
+        "bytes": 2153,
+        "sha256": "a90a1df6a8b71b4840fc48aaaf3f5e261acc1cfdc457c56fde558cd263f168a2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-records/driver-outcome.json",
+        "bytes": 1508,
+        "sha256": "515782e85975ecde445d07484051535b46ec447e902ef36288a753e79c94c204"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-records/samples.jsonl",
+        "bytes": 32423,
+        "sha256": "fe3901a4756658810cb93c205aaffc2037eaac5e9ca441ff9f3d273f1dd674be"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-records/source/server.log",
+        "bytes": 3577,
+        "sha256": "9fa5208471e12a2631dd153f96015dde1a004bedcf7b7202cffbe330c7f1a7ac"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt20-nocap/r3-records/target/server.log",
+        "bytes": 3522,
+        "sha256": "39706173bfb868eb7ebfff05ffc1849a82002fb141a91d7754fd2c432556a2d2"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt5",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-chunks/result.json",
+        "bytes": 9754,
+        "sha256": "08562a31d9358bfdb4d4fcb4f34ad2f08915c11dd331bff82c25462bcbdc3a0d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-chunks/acceptance.json",
+        "bytes": 2588,
+        "sha256": "aa9daaa3056564cce6f4faf3f0e076555bbf2a56504e722281ae7718d5557f46"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-chunks/driver-outcome.json",
+        "bytes": 1498,
+        "sha256": "0789fa733a9b65d9386d2b74eeecf3203aaa1b38f9b43cd98cb125a6e7375cc9"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-chunks/samples.jsonl",
+        "bytes": 17458,
+        "sha256": "c01af2192195fae46e73b3b069ee1c3c869ff41b518ac8ae083a3ce342ebcd8b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-chunks/frames.pcap",
+        "bytes": 140764461
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-chunks/frame-spans.json",
+        "bytes": 2978,
+        "sha256": "e6135c5146ee89ccb8da3bb4aa4d357a42768216ad6ec6c8eb65292f7f3a68fa"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-chunks/tcp-overlap.json",
+        "bytes": 1398,
+        "sha256": "1ac71f06b096929b141f81219d70cf8d5db3a4a1f5fc4ed8a98e53f0ad12b015"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "ecc7a1acfe4edcb4fc3feb8d083fb4e6a5737cd3c3da669c8320fbe688466b09"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-chunks/source/server.log",
+        "bytes": 3569,
+        "sha256": "e317f71219a650e705240e641655432951db7052b82d768b5a827f223a9e3f8e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-chunks/target/server.log",
+        "bytes": 3514,
+        "sha256": "85ccc76d5fe9d1fa64781191e697a6f7ff2e44dd8e9f83a331817c6303a0af1c"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt5",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-records/result.json",
+        "bytes": 9756,
+        "sha256": "7531947eb054b554be8b0490e516d9dfbec8f1888f4aa5766b2120dc0a69818b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-records/acceptance.json",
+        "bytes": 2591,
+        "sha256": "8db1236e2db607dac78161b3a9d9156dc85816712ce861689b1f80b0e95e75e4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-records/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "2f2350c9162a5f6009f5438bb7f62ff966776c4df4f0169b474656818adf1754"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-records/samples.jsonl",
+        "bytes": 14956,
+        "sha256": "e10251ddb336d50ea277bd7f898dd278528ec8422f99f38bda2d04bbcab46d93"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-records/frames.pcap",
+        "bytes": 140766504
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-records/frame-spans.json",
+        "bytes": 2973,
+        "sha256": "47bcec80903c4e2aef1098e5ed6789c0673d53c3a30284a8176ad5da07129523"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-records/tcp-overlap.json",
+        "bytes": 1399,
+        "sha256": "72b2dbcb5eecf06d7eab7190e3796ebefc83ed4ced4eb1098be44a00ea6bd283"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "8443e1ddb789add4e2eab4de79d1d3f04dbd0af95ee79c6d507abda4ac873e02"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-records/source/server.log",
+        "bytes": 3570,
+        "sha256": "d703f8aeeccceff342bb5933fccb11dee6d8f73562cfe0677d7a15dd1efe49b9"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r1-records/target/server.log",
+        "bytes": 3514,
+        "sha256": "c455ef97649a7aefd70d72a4ef4f81d8342ccd15b705e91399a713dbb3b33502"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt5",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-chunks/result.json",
+        "bytes": 9746,
+        "sha256": "dae380e64293b1d8f59346845843174af601b488485527bda99c98eae31beb60"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-chunks/acceptance.json",
+        "bytes": 2587,
+        "sha256": "be76585fa6f1512d8f734244233261b57106cb88e0ca1d620682fd057f6eab7f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-chunks/driver-outcome.json",
+        "bytes": 1498,
+        "sha256": "276d0836c145212646a23bfdb044e0ddb308b32c70cb677c725b50487de61f01"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-chunks/samples.jsonl",
+        "bytes": 17455,
+        "sha256": "df4ae4d9a66e006be5543cc33780151093c10721e8575da31e1c3ea62b001b5a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-chunks/frames.pcap",
+        "bytes": 140768971
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-chunks/frame-spans.json",
+        "bytes": 2974,
+        "sha256": "a07265be67c77b92d3278d86459a920b49d7b1fe8ee30bb287b808cc4b22e633"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-chunks/tcp-overlap.json",
+        "bytes": 1392,
+        "sha256": "9f8f76396268499f7f310dd7037320e54db912f6929e95df96b53b7cfed1e481"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "ef81f553926e7cfd7e190e10adbfe9db778e8748ee95cbd06f5fd24f1199a45e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-chunks/source/server.log",
+        "bytes": 3569,
+        "sha256": "522ba2b17e39eb9134c601b091c8a8bc176ad38c594c371c80cf980d4f91ef1d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-chunks/target/server.log",
+        "bytes": 3513,
+        "sha256": "c5d4fcf345aa2c86863d5fdc9d18ad95689292db74ee20bedc8ab4b2523ffe62"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt5",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-records/result.json",
+        "bytes": 9760,
+        "sha256": "031e68c8cf71d2da116b328d39308ad75c59761a1806e2305952164f57aa341a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-records/acceptance.json",
+        "bytes": 2591,
+        "sha256": "fc80b7d8b1adab8ca66295c24cd852258aa8352a1c9d9eaa0c817bd86b6acec6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-records/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "fed68d9946c3f26cbb6b2675cc9dbf6bbc991a662b70415a0a8196e4174bcd85"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-records/samples.jsonl",
+        "bytes": 17457,
+        "sha256": "5bf20c84aadb4cdce76d76bfe51c740866f5b547485f6f293980e12051596b51"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-records/frames.pcap",
+        "bytes": 140772579
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-records/frame-spans.json",
+        "bytes": 2975,
+        "sha256": "1fc8360167e9ee9ce966550a02db0dad60fc613ef31c28e325fcddf77643c74e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-records/tcp-overlap.json",
+        "bytes": 1398,
+        "sha256": "714c0c5aa67c688df18d5bdfd0e846f76a888ec973f717f88cc19003cfccab6d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "7368644826cbe376927a29c565fe081ae59f6fe04e9d1eb4f60c75505ac230f7"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-records/source/server.log",
+        "bytes": 3570,
+        "sha256": "4c86a13a0b09a8b3d4cb3a5d75a171c14f508ed4e532756142e3044142ee8f95"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r2-records/target/server.log",
+        "bytes": 3515,
+        "sha256": "2e52f661e69fc2d65a1e589f2a6896e34411a41da28e40a4c0a7a4357aa98c47"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt5",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-chunks/result.json",
+        "bytes": 9750,
+        "sha256": "4bcc8663d9b9290cd0651173fff33f3ddfe6963122ba25ca88e15356374b09da"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-chunks/acceptance.json",
+        "bytes": 2586,
+        "sha256": "8be2071f81ef0d8707b41cfb67039c7592dfc1ea4df790546379074ba5250069"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-chunks/driver-outcome.json",
+        "bytes": 1498,
+        "sha256": "6261b4cd0d50c525061058d5b629585f088fe68b164efb9cafcd0b8fb3a16d9f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-chunks/samples.jsonl",
+        "bytes": 17457,
+        "sha256": "02f64d0673766dd244f9c7ddd6e2051ca8493cb6646df634ae0636b6f321cb46"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-chunks/frames.pcap",
+        "bytes": 140767003
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-chunks/frame-spans.json",
+        "bytes": 2980,
+        "sha256": "734806be05efdd5ba13a15f3cd5022183748d57af91195f5df289930b73ce159"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-chunks/tcp-overlap.json",
+        "bytes": 1398,
+        "sha256": "7d4679d70f736baf36f48c581ab71675b721ba4e64cf07de675e0692d3895fb5"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "4ab5469f1c80b7e4f1907af991f83dff1accb8bd711033ae49f9a8d94909c7fd"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-chunks/source/server.log",
+        "bytes": 3569,
+        "sha256": "af2db92530ade6d8a3cadd6828bd2fcfd589b3ce17887b8e930412b7d5c0948e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-chunks/target/server.log",
+        "bytes": 3514,
+        "sha256": "85e9e68720f45aaea1712e5b14ff54cea3e0c1d25bad99fac6ba0f0838b81cd4"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f1-rtt5",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-records/result.json",
+        "bytes": 9757,
+        "sha256": "987c6c5277d6dd66a0e1c6771cb0802467f381772da12af13e52fa11059ff72c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-records/acceptance.json",
+        "bytes": 2591,
+        "sha256": "796d3173413e1d5b0a664d752f8d4343ddca0448a0badbdf40655ead9d896b60"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-records/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "7792db781bb75140a7e48ce4aa9006bac7301a20ca3492e04648f35d36aaeaf3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-records/samples.jsonl",
+        "bytes": 14957,
+        "sha256": "0385d84eb7809aa3706f441ecc91e91c6e2aa1cba9f0c024da96aeb432ee7b31"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-records/frames.pcap",
+        "bytes": 140766183
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-records/frame-spans.json",
+        "bytes": 2979,
+        "sha256": "1600abbe81752baecde47cdd03d1c04801fa25fa451c05ce08a3fb28f48b07bc"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-records/tcp-overlap.json",
+        "bytes": 1392,
+        "sha256": "bb37283a55f76de3292b2570c0d1eb329127ddd81a06ea564b2b11e785a8395c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "ad46b527c6513401697f1ee7f5a819b8b0c8c8746d7233b2e54e2def7c7f25f8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-records/source/server.log",
+        "bytes": 3570,
+        "sha256": "fc387047a614e8edff8f31c9a6d9f0d89e80374174288692b47e0c11c775c0ea"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f1-rtt5/r3-records/target/server.log",
+        "bytes": 3514,
+        "sha256": "db8b3dac526bb9dddc94da6fd0742508f6f5403cc5b5806e6c359c29061ebc07"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt20",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-chunks/result.json",
+        "bytes": 16998,
+        "sha256": "1762610ea9e12160141f2e5a0d85ac7d18b48c5d4b7552134f65df44eb7c80a0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-chunks/acceptance.json",
+        "bytes": 2877,
+        "sha256": "e529ae6da1d8d5016ad57b859c48670acd35cc5c4695393a4bd040d8ed6817e5"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-chunks/driver-outcome.json",
+        "bytes": 1506,
+        "sha256": "5ac20a1d2009c953216129973cdda39d62f161dcebcc5bebc4ec801d0ef4b0b0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-chunks/samples.jsonl",
+        "bytes": 42188,
+        "sha256": "fa1fc8def255a2e7889c97766ecfeb0b207a140164d8df728e8eaeffd40494da"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-chunks/frames.pcap",
+        "bytes": 140732662
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-chunks/frame-spans.json",
+        "bytes": 6653,
+        "sha256": "db0c523b6ab84b78f0147d9b6ade1cb81733af3a3b1b265c84ca15835e06c9a9"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-chunks/tcp-overlap.json",
+        "bytes": 2289,
+        "sha256": "44c957218a9eccbbe70350aea4f3a6b5418b97dc1332969852c56a36a1bd7feb"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "3fd8930e8186964463f327f3989b89c8d24fd00a6cb0f07deb4a1d32fab2968c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-chunks/source/server.log",
+        "bytes": 5370,
+        "sha256": "f781d6403e908c568360e315d954083fb0713bbb47eaba8bad56f6f8368cbe24"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-chunks/target/server.log",
+        "bytes": 4383,
+        "sha256": "b8958ff19cd75ab3d9b53b85e8d8a62cd1f118dc7be0b8fcf985ec4554aaafbc"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt20",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-records/result.json",
+        "bytes": 16991,
+        "sha256": "e64de0defdd98cfb0403f46da57c4ecac6b322a345bae87853034d301c03eb5d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-records/acceptance.json",
+        "bytes": 2879,
+        "sha256": "1181a3eba51529d3705922773330f821b9bc473ae8233dadc4909db59daa6982"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-records/driver-outcome.json",
+        "bytes": 1511,
+        "sha256": "c6dbe707e58513fd01d7740151b7c70dd4e7aae6448bea9009d67aa9520d81c6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-records/samples.jsonl",
+        "bytes": 35143,
+        "sha256": "fc236c99bd78f1f57b6c8f41b1c1cdecdb34d04df12abf762151cda0a558ed15"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-records/frames.pcap",
+        "bytes": 140735122
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-records/frame-spans.json",
+        "bytes": 6640,
+        "sha256": "fe96f4d6df7ce73e0d22ac50ec1af8d339377a0cd270e3cbe58f80c80098b84a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-records/tcp-overlap.json",
+        "bytes": 2281,
+        "sha256": "034863552a67a8e28d39e806c142a79b3474e05621d58df72e3a62562d305cb7"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "eef8ae0a9ca81d56cb4846d6d008673c6a02848f8c6f219e2fb8db7ab750044c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-records/source/server.log",
+        "bytes": 5371,
+        "sha256": "9d85bac525b2332f360f5b6e0b5af26dbd2ad063f67ea46a882ddb562c85e10b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20/r1-records/target/server.log",
+        "bytes": 4383,
+        "sha256": "3ed53425056554d9bb25bd295584b2b133aac6a25d9fe65878d1656441cb139a"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt20-capture-repeat",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-chunks/result.json",
+        "bytes": 17070,
+        "sha256": "5357208226bc67fb2c5d3f2f203252b9af5ce7848969bc4d0c0f20aafca3f16b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-chunks/acceptance.json",
+        "bytes": 2891,
+        "sha256": "1247c4ebb79dfc2645ed261a5fb9f7070c97a3b402456323ccb4c3bdd2b632ef"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-chunks/driver-outcome.json",
+        "bytes": 1551,
+        "sha256": "6b8645617abcf79205a4699387bce85aba459fa8e79be06f593916bba705c387"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-chunks/samples.jsonl",
+        "bytes": 35143,
+        "sha256": "a862e66864a9ff8bd6a6ea79ee889e205477555cc296d17cfbdf3fd21e8e95c4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-chunks/frames.pcap",
+        "bytes": 140735286
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-chunks/frame-spans.json",
+        "bytes": 6658,
+        "sha256": "f914f6753bb9a7d09ef9c8e25ceb07b68a64a8dba33a0d20a4c831d0f61e1aa5"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-chunks/tcp-overlap.json",
+        "bytes": 2308,
+        "sha256": "9682d45cfdd74557f59b322bcb32d964fa854508c59453a62536db2c1045be3a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "067eabc0bf4181d07c9dd5e7d3dd898168598e2c869540d192e427195d8fbca1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-chunks/source/server.log",
+        "bytes": 5385,
+        "sha256": "8a412393dad99238733b93afe4859c9741329923262b712ff9ab59e19e828775"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-chunks/target/server.log",
+        "bytes": 4398,
+        "sha256": "c1d4a2aa46790676a50ea186f771c4da7eec598521182a6d1da69a2b9ac85ba9"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt20-capture-repeat",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-records/result.json",
+        "bytes": 17058,
+        "sha256": "2e88baf366881bf9ad44299f8edf51609c83fa530290da1b72449ab18a643db2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-records/acceptance.json",
+        "bytes": 2895,
+        "sha256": "7e6987febc08718e07b9d05f4da7bcfdba9c2b0a9ac1b56ad207aaf1138123e8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-records/driver-outcome.json",
+        "bytes": 1556,
+        "sha256": "349814781b0218d43d96025d8a68eab0de54150af811caf4afb8e6ee587a5ceb"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-records/samples.jsonl",
+        "bytes": 35142,
+        "sha256": "0fd3b249de4ee192d3135115907c573c717d2d75ca5b737bd7cd1768a70463b0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-records/frames.pcap",
+        "bytes": 140731608
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-records/frame-spans.json",
+        "bytes": 6646,
+        "sha256": "6e017d0af9239233a0ca75024ac242b9a556500fdf8c161bce000e841c73d7ea"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-records/tcp-overlap.json",
+        "bytes": 2284,
+        "sha256": "1c178aff41f7ebf12a0ff4c4a69dac565f9153ff81735a3c4e181d2085ec9724"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "d77bbc8d4c11136e97ccb79f72d11d2934fe85375d91f2bc5bc8e9a4b1829ce4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-records/source/server.log",
+        "bytes": 5386,
+        "sha256": "fd12f8f6c5771f71aae105b663a1871b257d056a67bb6c0cfd6eaaf2a6e6adf1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r1-records/target/server.log",
+        "bytes": 4397,
+        "sha256": "46aabc4f057270fc1b5912e4ed7bac4a1916805ff433c8bd02c622ae211ee98e"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt20-capture-repeat",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-chunks/result.json",
+        "bytes": 17070,
+        "sha256": "6a72cc385f8529d3c86911ecb90c42f246bb88bcdd7c0fe20e1d07087ccf88cf"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-chunks/acceptance.json",
+        "bytes": 2891,
+        "sha256": "1d65e4d86a644f6315f9aab9979a2fc758df5eae0b30ce0e8a14adfd2c6ab659"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-chunks/driver-outcome.json",
+        "bytes": 1551,
+        "sha256": "a63830f0366cfc0013c9e0dc1b3cbf08ea1a589a63e7f266922e0c0c54e87987"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-chunks/samples.jsonl",
+        "bytes": 42189,
+        "sha256": "9c6dae2bf8816684bbe48b09a1e87496eb8e4a3af83626d5aafcccaa85654532"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-chunks/frames.pcap",
+        "bytes": 140721690
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-chunks/frame-spans.json",
+        "bytes": 6661,
+        "sha256": "6b699f6e30a1432cba5ad98325a8542c9ed5472caf95a54c0251718cf05b9762"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-chunks/tcp-overlap.json",
+        "bytes": 2307,
+        "sha256": "086c995aa0afa009601afad36f352ba300b7291bd5262d8dea1bcc59c2626c35"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "3d081f3378c6d5c222b07a958abdbe138919cdcfc6e8f2ef70c74d878d1399d6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-chunks/source/server.log",
+        "bytes": 5385,
+        "sha256": "1e45287a61ee77d927a0512fc8d39280a9f58d91bf74b9150a74af3626e1aec6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-chunks/target/server.log",
+        "bytes": 4398,
+        "sha256": "31e24fd042c98f2c1428e5e728d90e583cda0551685a8e6d57f1d86a81fe45cf"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt20-capture-repeat",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-records/result.json",
+        "bytes": 17080,
+        "sha256": "288f07f02a9e5ae0d16fdac78abf82ed02a1fa78606671bab3cc9d6944422143"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-records/acceptance.json",
+        "bytes": 2895,
+        "sha256": "76c4a632f13e765d8bcab13bd6a513029ce6427cd48fb0ea0b6eda5c3bfdcdf1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-records/driver-outcome.json",
+        "bytes": 1556,
+        "sha256": "980facb0f205f51c6add34ddad93cade5431509dd1e7f06955f842b59d240fd5"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-records/samples.jsonl",
+        "bytes": 42188,
+        "sha256": "af8edfaec5b7c0d1ab2038543c000bfe5d59da6292741726da2a510cb731b169"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-records/frames.pcap",
+        "bytes": 140780766
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-records/frame-spans.json",
+        "bytes": 6664,
+        "sha256": "090228a163a050a0ef1a442deed0eee8964917abb40f1774c77ed7e2fee6f09a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-records/tcp-overlap.json",
+        "bytes": 2315,
+        "sha256": "273c5005811b419fe46797c32b8c45d6c0f87aabbd229c6741bc8026fe5f6bff"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "af8adbd3ca719682d97c9dc68df684a0e1e37cb92cd5eb5f460179240f55ac6c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-records/source/server.log",
+        "bytes": 5386,
+        "sha256": "b2da2dc7ebcddf5152153d6d2bbcd48ec9cf00ee3f7309d143fad0c18b008f27"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r2-records/target/server.log",
+        "bytes": 4399,
+        "sha256": "df792d57ab79172745c0b40325a0e2292acc9be7713d67a298cb0419086ba725"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt20-capture-repeat",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-chunks/result.json",
+        "bytes": 17059,
+        "sha256": "f0866045d1e2c38b1afdcd942f9af27dcd10186196192b0dcb66b8c05cf574b4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-chunks/acceptance.json",
+        "bytes": 2892,
+        "sha256": "6d2cbaaa9e0f9c02f28ccec19b91e6ab5fa4b610b21d9e1430f649db29594862"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-chunks/driver-outcome.json",
+        "bytes": 1551,
+        "sha256": "771929de55c380679b482171f02930701ede820650d7eaa2b238db094296b668"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-chunks/samples.jsonl",
+        "bytes": 42189,
+        "sha256": "a6fa7f01011c4b656fbdc4b6a9d7df9f262caeb8f607358e10e1ed14666326d8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-chunks/frames.pcap",
+        "bytes": 140736434
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-chunks/frame-spans.json",
+        "bytes": 6652,
+        "sha256": "faff6f3563ff441d73d44352be4ce328617eeef61bc9f47707b7817e1fb9db93"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-chunks/tcp-overlap.json",
+        "bytes": 2295,
+        "sha256": "85bad1d7c565444dfcb9a313d91b1f3ff807731e6705ad53d5adf50859bbe06e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "bf9e70e284301d8f7c6319aebaf4a45a0d797908919c5601e4295a6077605255"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-chunks/source/server.log",
+        "bytes": 5385,
+        "sha256": "45c1521e634c60603117ed23767fc6e4c918af7e08c0fbed13a948d4af96a810"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-chunks/target/server.log",
+        "bytes": 4397,
+        "sha256": "beeff085340630656d98ed48e205c125e1e1ec80f2426a6bd31114c5826e2405"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt20-capture-repeat",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-records/result.json",
+        "bytes": 17078,
+        "sha256": "cc7c92eace1a639cf9c5ee91480ebad733f233611a4f5286ebc7c58d513c3aaa"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-records/acceptance.json",
+        "bytes": 2895,
+        "sha256": "e40349e4bff015f132f7ab3c18dee5eb1635fd7048581d43d01fd6674faeb043"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-records/driver-outcome.json",
+        "bytes": 1556,
+        "sha256": "bd08f370536d59d066a16716b3c6b8d5eb5bac844da983b720c16213010dcab2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-records/samples.jsonl",
+        "bytes": 42182,
+        "sha256": "11e294d27364906f4f83093db45c127e5758793c1c128bf773d513ab5cb70b93"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-records/frames.pcap",
+        "bytes": 140732396
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-records/frame-spans.json",
+        "bytes": 6660,
+        "sha256": "5581efc12fc470e55df727b4a7334e7914fd8bd569ba81dc83689db3fd73666c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-records/tcp-overlap.json",
+        "bytes": 2308,
+        "sha256": "e0d7c92504791912f26ff295471890d7b71654b8887ebda0352d10618e5bc554"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "de06b843f6fcf8334eb688016a128533bc94a80e896b566524c116f981a15ddb"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-records/source/server.log",
+        "bytes": 5386,
+        "sha256": "cbb594a584e81cefc84a016d3d7631a4765bbd4d8631a932f0d5686c84c5b7d2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt20-capture-repeat/r3-records/target/server.log",
+        "bytes": 4399,
+        "sha256": "3d2fee2d871787811b6f93eed33bf8cdf0794239c9469bbfc2791ff475bf1e24"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt5",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-chunks/result.json",
+        "bytes": 16985,
+        "sha256": "3aa73288389f42f9492f1a91057490fbfc34f613fa12e37c74e4e6139619be9b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-chunks/acceptance.json",
+        "bytes": 2876,
+        "sha256": "180ecb26c824250198b2d1a5a8ebf2ac0ab66ad6a99faefaca47476124c64eb9"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-chunks/driver-outcome.json",
+        "bytes": 1502,
+        "sha256": "8e95856b0b7cdeffff3b2b242c0839b6658ba0415b8063fdcf5d2c5ffa3835d2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-chunks/samples.jsonl",
+        "bytes": 21059,
+        "sha256": "c945df0150bebb819345032a7bbda9c9c2b3b271f02a8dd4053ce517a98f3c70"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-chunks/frames.pcap",
+        "bytes": 140722260
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-chunks/frame-spans.json",
+        "bytes": 6646,
+        "sha256": "bc822c1fef722febecd00f8e82544d8b1d6b00bd7126fe5e0f3eabb62fd9e6b1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-chunks/tcp-overlap.json",
+        "bytes": 2291,
+        "sha256": "dcd6d9bb4ff7b1529e9e46fa3c4bf2a2c70af9f57051116fdc2aea93f402e709"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "132822cec1fb80d44a0e2ce11c350054bfbf2bbdb67c744eba5c9b90783f8ec2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-chunks/source/server.log",
+        "bytes": 5369,
+        "sha256": "f299131c40226daf0b5e83d31a20aba0490665332ee921365950d8329b593b1e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-chunks/target/server.log",
+        "bytes": 4382,
+        "sha256": "1138d740f479b9cae2c5cbcb7ceddf280c61f786f06b3f9b7c01ea7e232ed0c3"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt5",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-records/result.json",
+        "bytes": 16982,
+        "sha256": "b8e113f8c191a2739132044a23e7364e002ded45c7550b4eaad0eb095e30aed9"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-records/acceptance.json",
+        "bytes": 2879,
+        "sha256": "dcdcf69c0b05daf0ca808bdfa78520b40203439b2ba2532ed92ec1745735592d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-records/driver-outcome.json",
+        "bytes": 1507,
+        "sha256": "93192e20c63e26a8ac357cf2a8c5960bc379c6054362db829ae663613fcc988a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-records/samples.jsonl",
+        "bytes": 21059,
+        "sha256": "4e9ae19b4dcd02a8e54e966fd2a9727bd68e6e61362d3eb3f2a20e7a23532521"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-records/frames.pcap",
+        "bytes": 140714986
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-records/frame-spans.json",
+        "bytes": 6641,
+        "sha256": "568069fbfa7c10e03e6a4c9269a9aeb3e3106286f535aa32371e94931095f77c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-records/tcp-overlap.json",
+        "bytes": 2277,
+        "sha256": "4886389981cc0999817d2fdace7246cbbdfe0b2a09101143976b048a85edde30"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "550623688f1f978bffc15e63c58d14f89db5d0426441ccc99ba9320f51727c71"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-records/source/server.log",
+        "bytes": 5370,
+        "sha256": "91f5bcaf22566e295d4efcf46fb619c01794d68d239a5724859b9215c79aa01b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r1-records/target/server.log",
+        "bytes": 4382,
+        "sha256": "b4c59f6da2148b1d05e2edccb30b0c6acc13c5e781a0564a6a00df21ebda19cd"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt5",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-chunks/result.json",
+        "bytes": 16987,
+        "sha256": "dbb42ac52cce37235bcf4a156ee5ae5aecf7ca8fb12a040162cb4d13ffb82337"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-chunks/acceptance.json",
+        "bytes": 2876,
+        "sha256": "8d90f082201623bbab03f6173d572b409aac0a0ebbc52fd6772325843ca90675"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-chunks/driver-outcome.json",
+        "bytes": 1502,
+        "sha256": "40f3ed0a21778f4877d823638ef39c3c5499a4555be61a8e6d5f3905b7561a8e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-chunks/samples.jsonl",
+        "bytes": 21061,
+        "sha256": "f1ab9b80f667ca0681e66f766ec2a7a2808c5d5e4e999274ef68986ddd04ab54"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-chunks/frames.pcap",
+        "bytes": 140804196
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-chunks/frame-spans.json",
+        "bytes": 6657,
+        "sha256": "b2bc1914a40339dab8389b6f376c701a6cdedea795777ca0e6d71c75eb4a1f7c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-chunks/tcp-overlap.json",
+        "bytes": 2299,
+        "sha256": "1f518907194dcb000c9ff8de2b6d8d76ec57625642fa494cd2707db1819ec320"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "9ed3abb53c8a8b2e6c51fc832459959bb6595659f14f5686eefdce19e734ad77"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-chunks/source/server.log",
+        "bytes": 5369,
+        "sha256": "198f215c5d7ff1bafe9068b32aa0dba602b4239f0a8635dc25358ef28a7d1dd8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-chunks/target/server.log",
+        "bytes": 4382,
+        "sha256": "55fc9c2656b004917fc73cff3fd21ca8176dd7918975e36d8520a5a7d630963b"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt5",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-records/result.json",
+        "bytes": 16993,
+        "sha256": "6b861464110fc5c634ec230eedb57bc72b224ec0b853ccd3168cfb92aa352d85"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-records/acceptance.json",
+        "bytes": 2879,
+        "sha256": "63ff3fd8592b4f30ad025a0440585504d9b767cc388c49b2154fcd6954f95b46"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-records/driver-outcome.json",
+        "bytes": 1507,
+        "sha256": "6e23ccdcd56a04e89c6406375ca6341e2a8a13ea9f5fe7a9bf8b94b24217edf1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-records/samples.jsonl",
+        "bytes": 21061,
+        "sha256": "6575714165a22387e4a610c14c20e1205e0ba6baea48320a6bbd9678f158d6a7"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-records/frames.pcap",
+        "bytes": 140728448
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-records/frame-spans.json",
+        "bytes": 6658,
+        "sha256": "1446cdde37fb5102203bd6845037f2ca2dcaf95fda50a01e87091b63c6d3240e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-records/tcp-overlap.json",
+        "bytes": 2291,
+        "sha256": "bc06493a0d97f742a0c85d36da337a9297c5455b19faae634fbdbe8d8a53c1ae"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "ce06b6d413d5d2db856a25313be352be8cc727fcac08adc295476f9fe7a1322e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-records/source/server.log",
+        "bytes": 5370,
+        "sha256": "c96a90799adde1cfe4da964f7f2da3ad033fa37b8477144933a61ad5136f4478"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r2-records/target/server.log",
+        "bytes": 4383,
+        "sha256": "24878a302c3a5db9f8a366422d67d7dc6f0ddd59c9f520743ef60b54fe90cc18"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt5",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-chunks/result.json",
+        "bytes": 16989,
+        "sha256": "fd561544f1945f398bc2396644b50f2c9d8bfd68cc896c6ee5b33ae0e874ec56"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-chunks/acceptance.json",
+        "bytes": 2876,
+        "sha256": "6ccdcfd7306ee4f67afbff3dd8c1383f2c84d5020a98d96f496282e64281f3cc"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-chunks/driver-outcome.json",
+        "bytes": 1502,
+        "sha256": "ffe1ab957111d05fcf8bee3009f2fd4920f356db64f3add14ac316a6a30043ec"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-chunks/samples.jsonl",
+        "bytes": 35141,
+        "sha256": "1755e1d76bfa04b5ecccc50870c52a6215c4e8657f1c3a193685934b187914a3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-chunks/frames.pcap",
+        "bytes": 140716464
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-chunks/frame-spans.json",
+        "bytes": 6644,
+        "sha256": "5bb22c5a08a2501e9475d77c5b932b1146ca04dbbdba800c575a91b3cbc23239"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-chunks/tcp-overlap.json",
+        "bytes": 2290,
+        "sha256": "59e7bedddfdd8ac3fddedfbb1d136c9b8f96bcece99c7c01306d6b3644d3807c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "70d4734146d5196a9dc038b485c737ad2290dda865abc3fe00fe116f4c6a52e9"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-chunks/source/server.log",
+        "bytes": 5369,
+        "sha256": "9c54b6c403dd167a533c7bc7f8468de108cb557831a80384492fd83f8d45946c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-chunks/target/server.log",
+        "bytes": 4382,
+        "sha256": "36d3f3dcc4eb44cf70d67e2364443d1462add33eff28856ad0c80cac7ebf10ac"
+      }
+    ]
+  },
+  {
+    "case": "dense-records-128m-f4-rtt5",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-records/result.json",
+        "bytes": 16985,
+        "sha256": "92e2a62021d587cf6388f722fa03f8cdc57ad508a193bd52978e2eecf1eebc0d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-records/acceptance.json",
+        "bytes": 2879,
+        "sha256": "f0a50fca3285833f37af5f780eb443c8348f20eb3b59a76d1970d3e8a63a2259"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-records/driver-outcome.json",
+        "bytes": 1507,
+        "sha256": "0041a4cd24fd88f7aff815c6ad536fe7bab94ec75b815e7f8bf1c0cee7dc46fb"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-records/samples.jsonl",
+        "bytes": 21060,
+        "sha256": "276e7bd6cb783fb3cc3be961743131085ffa91345d384562b03f2726ff69c0d7"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-records/frames.pcap",
+        "bytes": 140741650
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-records/frame-spans.json",
+        "bytes": 6642,
+        "sha256": "cd7f4e695d04117737d9b977e5cb1030a8608e51a6edb66e00eb6887e86c9db1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-records/tcp-overlap.json",
+        "bytes": 2284,
+        "sha256": "641e035180f82e5ca03b92f6608b5deda1b2ee2ab22c1287feb11610491b1aaf"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "5c9e856a9114b01b6f737564d671551ee5ffed3097793ca9dfa5732edadd3ebb"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-records/source/server.log",
+        "bytes": 5370,
+        "sha256": "64475a4ced9bffdb7964d24423a5eed2f1efbbc58ebc590151ba389f8123765f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/dense-records-128m-f4-rtt5/r3-records/target/server.log",
+        "bytes": 4382,
+        "sha256": "a4995d6d1746f04759b3a01ed0f992ad14b009ef7c32e6d6f0c67fc970c0954e"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt20",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-chunks/result.json",
+        "bytes": 258731,
+        "sha256": "ee38f4047ddf375d44add7e98c93e3b6999fdfeb742d3ec423e5f1d13a449495"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-chunks/acceptance.json",
+        "bytes": 2588,
+        "sha256": "796847ed85597c9076dd2583157c6af77a014c7f5571e4bd052f8b2d1e087bdb"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-chunks/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "e48abb31553e6defa762bf38b18510984865b6837adf91b537d37e0813568675"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-chunks/samples.jsonl",
+        "bytes": 209854,
+        "sha256": "98781b65243b0f51fb05832b183c0375a42a1ff189c6183b0b4ffdfdc7840c6c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-chunks/frames.pcap",
+        "bytes": 13169421
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-chunks/frame-spans.json",
+        "bytes": 2977,
+        "sha256": "d53f893219b0f4626c34c2bf1a1b045e03294fb1491e8d70a75cd3ff119b5330"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-chunks/tcp-overlap.json",
+        "bytes": 1389,
+        "sha256": "459bd573e62d1d37c4ece0a98a52a07fad82ca4f2ef550211f30f4f314cb6b8d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "ae4595b50d5fe57e81b18aad4d167f1a100dac98715f9015ed3c2cedafe53acd"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-chunks/source/server.log",
+        "bytes": 3690,
+        "sha256": "48f6925a7e01ae5916a29a6d7bfda1a2e89efa7ac329066412d812f9b2ff8746"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-chunks/target/server.log",
+        "bytes": 3514,
+        "sha256": "965f2341137399d3edad2c8f24aaddfda75cf32ff95626f0c596f1c78120f360"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt20",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-records/result.json",
+        "bytes": 258749,
+        "sha256": "6efb21873dc5402d9894ff7696e2198f8b671e2a7fa84be3147da857a7da86a0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-records/acceptance.json",
+        "bytes": 2591,
+        "sha256": "0c18d0c4ebadbda7c45cd625d32efc51976be096554450c85392da776d021d28"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-records/driver-outcome.json",
+        "bytes": 1508,
+        "sha256": "6808d713b8753507ab4de4fde34a74f0507b592104175d9278c16e21dd9af439"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-records/samples.jsonl",
+        "bytes": 209840,
+        "sha256": "a3d501cd22473b156e7a8aab03ecb49af764b636607f896af8d3aa99311c1e7c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-records/frames.pcap",
+        "bytes": 13169093
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-records/frame-spans.json",
+        "bytes": 2972,
+        "sha256": "09f8593b76f39d78d12656dccce2da7dcc2999b860e80aa6e738a010cbaa049a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-records/tcp-overlap.json",
+        "bytes": 1398,
+        "sha256": "5d80e8b920e80ddbde3d05ca26bd386652e9dbf9bd18213f55ac97d26116db5a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "c86cc21acabc6168291c056ad77ae8c492c9c7673fd213c38ccf3dccf85c5b4c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-records/source/server.log",
+        "bytes": 3691,
+        "sha256": "6d4792be332509f4da2117574cab91128c7dbd0fb0301b04e102a44be38fe65d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r1-records/target/server.log",
+        "bytes": 3516,
+        "sha256": "da2610415c6e5e89ea682efa1b6a96ecc13b5fde1be9edce5d54eeecbc72dd9a"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt20",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-chunks/result.json",
+        "bytes": 258736,
+        "sha256": "99bd556dc395c4199371b078934fc0f381556246ece150eae07773a62db24832"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-chunks/acceptance.json",
+        "bytes": 2589,
+        "sha256": "a60e066f78041178104502f8b5cbb563833009302a6401a5eb7cca9c26f9c966"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-chunks/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "140afef597ecc60f3a6f71cce7f74a9ebb550b58d6e1f581f867e428c35e3b24"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-chunks/samples.jsonl",
+        "bytes": 209838,
+        "sha256": "ab38923b8dda4e21f25d00706844c748d9604f434695a8ee04979f38b3c48cd4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-chunks/frames.pcap",
+        "bytes": 13168519
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-chunks/frame-spans.json",
+        "bytes": 2971,
+        "sha256": "087e47438ec19d7d931790fedee485de8a9b2b64cdb4aad2565bdc060dbb53b6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-chunks/tcp-overlap.json",
+        "bytes": 1397,
+        "sha256": "cd1fe79ba1e122fb97a0fa10a36d20d0a34da4c7aeccba8dfb1888314917bf56"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "d6ec042dd069f2f7c0cf27e80d1c6d49095b1e5c1e8fe52c96769bf6b3c5633d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-chunks/source/server.log",
+        "bytes": 3693,
+        "sha256": "56762800d67f4965a2f0ac01f58796557b3d04f9e5aa0372f1e4cc8f5be6d815"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-chunks/target/server.log",
+        "bytes": 3515,
+        "sha256": "4a5b0418e5560d6e000ed9dc8f43099de647db3d610433b23dd29868dc7a8182"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt20",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-records/result.json",
+        "bytes": 258741,
+        "sha256": "aae714adc260832799c1dcaae95a8f68272c3dfb31043df31d79f4dd337661a1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-records/acceptance.json",
+        "bytes": 2591,
+        "sha256": "191a6b7e2a022487ac2315bf9d6e5a4799d3a72ce497cb78e046acfd2b435e03"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-records/driver-outcome.json",
+        "bytes": 1508,
+        "sha256": "9ac0860b82a3d2f65747a537a8908cf95ec38c9e4c5cbdd32e3c531909ebd7ee"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-records/samples.jsonl",
+        "bytes": 209836,
+        "sha256": "a28c11700423e2f7ac3042553ddaf9a162a35f97fdaa203a6823620edf0962af"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-records/frames.pcap",
+        "bytes": 13170815
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-records/frame-spans.json",
+        "bytes": 2968,
+        "sha256": "3848e5a4c61c6da67a70a16fee033bc0a07e3530fb17573f062e9c2c4f56d688"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-records/tcp-overlap.json",
+        "bytes": 1392,
+        "sha256": "adf23ad35df3c91b1591e534774f42dc903d353a1f82c341f90d33960105f8e1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "93f55e886e6e2d8b42125690a1d5f5b3ffd80730ba48de3a9d856ecc7c0b98a0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-records/source/server.log",
+        "bytes": 3694,
+        "sha256": "61143af1221cc60a610fbf7a6967b79406baaf89021a5aed96d66b5161cbdb57"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r2-records/target/server.log",
+        "bytes": 3515,
+        "sha256": "f41079e80b96a7aa1cfdad877cc8a655c2ce55882a9178e6304c0610b0f538fe"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt20",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-chunks/result.json",
+        "bytes": 258732,
+        "sha256": "f3626bac79d899bc00a6eac2d783c1905f26ca74b9d488a74188735dce7468df"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-chunks/acceptance.json",
+        "bytes": 2588,
+        "sha256": "00bb1b00212524bebf2f6d9944a7c50e06c25836efc1798cfd358c9ff075e957"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-chunks/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "c051d2bcbb59644619b450e0c34c481959ae4408b040bc65229620dc237c8aec"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-chunks/samples.jsonl",
+        "bytes": 209845,
+        "sha256": "c38fcc8282314a2e775ac171521b6c3cc277f0d74ba8004ff470c2e058e9fbc8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-chunks/frames.pcap",
+        "bytes": 13168109
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-chunks/frame-spans.json",
+        "bytes": 2971,
+        "sha256": "2bcf8b147b688a9ec5a7ee234a8645d73fcae17cd76b4c75495ec68523f11b27"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-chunks/tcp-overlap.json",
+        "bytes": 1391,
+        "sha256": "62a3d84bc8540d6c76428cb9fc1d9666753e79c0b9ba2f43916325e42ea44d1c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "b84a87de3586ff863a8540c6ecd2066a7f388d5c9d9866d79a448096e27197d5"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-chunks/source/server.log",
+        "bytes": 3693,
+        "sha256": "c30f269a380aef00c1f1940c32a94ead393f5feeea51a21152c68f9c4c4278ab"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-chunks/target/server.log",
+        "bytes": 3514,
+        "sha256": "acc6f44fdf5449f77ea46d9460605d3f920006b60a2bfa3e2ca094b63e916be1"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt20",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-records/result.json",
+        "bytes": 258745,
+        "sha256": "c15d05ee5cf2f7a9a84382826fab7b9da9662d336d8de47018b4fd7efedd9748"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-records/acceptance.json",
+        "bytes": 2590,
+        "sha256": "8a75582b8e873ae2c7c19c7afb5207c352cf222e6011b3f40627fc065ca09a62"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-records/driver-outcome.json",
+        "bytes": 1508,
+        "sha256": "efee4a376fd2de93c7541e6c222c7cfb649cbf2f8584ce5a15fe898dcedc7278"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-records/samples.jsonl",
+        "bytes": 209849,
+        "sha256": "97af6abbde5dc98180131d8320d2afae257237e2102289cfd7d0f1b4196f8b35"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-records/frames.pcap",
+        "bytes": 13169257
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-records/frame-spans.json",
+        "bytes": 2978,
+        "sha256": "ffff8620dab6a9dff2d970749d086dd7e101a67e3eb2a3e1f15adbe53b228fda"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-records/tcp-overlap.json",
+        "bytes": 1396,
+        "sha256": "de45a9df829036b2f5995ce8134dd9eef2cc1875288f786d8097240e6640afa1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "a9094612e4ddba584d27d4126baba8f02e1a34127c572ced173a680c901902c0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-records/source/server.log",
+        "bytes": 3691,
+        "sha256": "cb8a7e7466886e8e084ae0339f4152f761ad5410c06efb8131a23d5ee3daf7d7"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt20/r3-records/target/server.log",
+        "bytes": 3516,
+        "sha256": "127a25fccc7574ea12bbc2d9b3fbf1b234d7768ceae284d55ca0ba5999a858fa"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt5",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-chunks/result.json",
+        "bytes": 258728,
+        "sha256": "dd289233f3b209709a418ac9b16c17aa57328d350760ab55d791518a353e6316"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-chunks/acceptance.json",
+        "bytes": 2588,
+        "sha256": "ca89aa520aae7000d2a5d0e2b321f576759a887276db5c35c173071dfc2fb64f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-chunks/driver-outcome.json",
+        "bytes": 1499,
+        "sha256": "d905ad87764818055de78624d3483ad7dcc74eadd302f855f24159fd924ca9d9"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-chunks/samples.jsonl",
+        "bytes": 62419,
+        "sha256": "034aa26edf3c1abe170052791e46ce32f315610454c244597eda8adce28f9133"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-chunks/frames.pcap",
+        "bytes": 13141869
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-chunks/frame-spans.json",
+        "bytes": 2980,
+        "sha256": "3e2234eeee67c43c2efdcb478e93ee00aac75720f36839acfd301ffa96c705ab"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-chunks/tcp-overlap.json",
+        "bytes": 1395,
+        "sha256": "c260ffe493bbd62e366b6627c899056de7614b862d86318073bc85f726a4cb5d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "d12ef3ece3b929e19195dd425a436d8854926518134ec84b394b59fa7ea83bce"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-chunks/source/server.log",
+        "bytes": 3569,
+        "sha256": "7f253cb50f05a55c65f9c9426755054051f2595d0b598d6ca98ea13bf05c6f31"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-chunks/target/server.log",
+        "bytes": 3514,
+        "sha256": "862b7d7a29cd27f71de06e54c986b405c624edcc9992eeb72eb217fc2e4feb0a"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt5",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-records/result.json",
+        "bytes": 258736,
+        "sha256": "6a24bd3950565d76a56dfd230e9956cce38c0ea5377474e28f955c724752618f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-records/acceptance.json",
+        "bytes": 2590,
+        "sha256": "8498e3440406d3353add78f4280fb9458084c9710d03d0a0a15f5794b70b9ab7"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-records/driver-outcome.json",
+        "bytes": 1504,
+        "sha256": "6ad6f145fcc25f4825314641c132c42fd80de6ad3899867235a8aa4f2c3e887c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-records/samples.jsonl",
+        "bytes": 62424,
+        "sha256": "17e687457b216ee5cd13baea412f345e3b945cb0c9e4aa9941382a9e7064284f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-records/frames.pcap",
+        "bytes": 13141787
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-records/frame-spans.json",
+        "bytes": 2979,
+        "sha256": "c0e3000d99c588ad540af39bd49437b59e6dcfa640961e439477e4d8526492ea"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-records/tcp-overlap.json",
+        "bytes": 1397,
+        "sha256": "b80e9dba061ea6dc5cf129ba4b6fa3e5c477bd5a15385c5037c0ed1706c78e04"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "e8312789e26988effe705015e2ab0450c886814dbbb3ca854eaf77c3eb97222a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-records/source/server.log",
+        "bytes": 3570,
+        "sha256": "34181034a4d3f1785dccd948569b93d6974e7fbb905bc4d49a76c1fd2e38a84b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r1-records/target/server.log",
+        "bytes": 3515,
+        "sha256": "72c825e1bd49003640bde449d9b2c5446c8fc2cb7992b9408c743b8b8f0737df"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt5",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-chunks/result.json",
+        "bytes": 258724,
+        "sha256": "8ddeed67c05c9c34cda8845a998f65de3c3db9ac7ce3729133019d38fcac894a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-chunks/acceptance.json",
+        "bytes": 2587,
+        "sha256": "61da91f51498a4ec35d0e65fa7e428c33d8b454748b9057a3e59960e9ce3a884"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-chunks/driver-outcome.json",
+        "bytes": 1499,
+        "sha256": "c5e920fe8e56d51399f6f4c6c4fdb7ba877d90989b179fc5d4071f1a264f375a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-chunks/samples.jsonl",
+        "bytes": 59919,
+        "sha256": "4705cec356524917a00c7ba4223112781a4303bcc6bf8a001b9e167efba56b7b"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-chunks/frames.pcap",
+        "bytes": 13145723
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-chunks/frame-spans.json",
+        "bytes": 2980,
+        "sha256": "d2a918e9e46d95a0a4422d190c27476cd10527c21374b01884dd3b928c5d9e76"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-chunks/tcp-overlap.json",
+        "bytes": 1395,
+        "sha256": "3f67d374d8552303de87164b26f099b06bb099195ed7b6f6fbdcd93e17086494"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "0a47907ae2d3ca3ba500b9eb1ec480043c9430f890bb76c98937c4d52c293265"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-chunks/source/server.log",
+        "bytes": 3569,
+        "sha256": "85cadd8b4f2f0d131c24ab5aba625dbf70609fd87d6796ae5252d4c9709980e8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-chunks/target/server.log",
+        "bytes": 3514,
+        "sha256": "a9ebacb9fc52adad5c8b41ddb7d271985024dfd6e59f37d142b652cb7ffcc9bf"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt5",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-records/result.json",
+        "bytes": 258733,
+        "sha256": "b68593cc8823e4513bb10d952de248fa808aa5943826cc6444d8ace424343606"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-records/acceptance.json",
+        "bytes": 2590,
+        "sha256": "1eb6a7f7e51e562fcf44073f412f1a3e690852c7c638dd94e8a44970fd665509"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-records/driver-outcome.json",
+        "bytes": 1504,
+        "sha256": "49121512baf477d0dbfd9f7477c94ec584b0d25e0114cf5d4c2d0914e362f0a3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-records/samples.jsonl",
+        "bytes": 59924,
+        "sha256": "66f7347d30a0cd4b137aa36dfb703224d4e376a28ddecb2ca744c7e1095de7e4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-records/frames.pcap",
+        "bytes": 13147691
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-records/frame-spans.json",
+        "bytes": 2973,
+        "sha256": "0ef7e390447bca761fec883c2b7229bb635897a6bdebca279dda12786b8d3d35"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-records/tcp-overlap.json",
+        "bytes": 1397,
+        "sha256": "45efb865a3b9bcfcd954ce122e1e61ea6e04aab9cb2d884c6e96292927e5d456"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "8f63a710db5f4dc8e33df34fb3744ab768b90c35f74d22af72737433ef78441f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-records/source/server.log",
+        "bytes": 3570,
+        "sha256": "132a758971f4dd9986984cbb199386971dfb68ee1444bf586b8f9f6cf82da310"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r2-records/target/server.log",
+        "bytes": 3515,
+        "sha256": "c0f59ee583580f75599fcf9b00f02115cf8d2d9580c575a98a51d95935e5e5c9"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt5",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-chunks/result.json",
+        "bytes": 258726,
+        "sha256": "3dab6c318bbc4671a2ba302addbe066592afb44b2d4458c80db26ba42c65c4d3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-chunks/acceptance.json",
+        "bytes": 2588,
+        "sha256": "47d9e530d3627f73694413d2f6b1c8ee8004bbc13cc45449570ea62381580ae0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-chunks/driver-outcome.json",
+        "bytes": 1499,
+        "sha256": "153d5037e791f3b377c2c0105dcecde62e4ad6c0fcae3ad1827769a819d34cbb"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-chunks/samples.jsonl",
+        "bytes": 59922,
+        "sha256": "90ddb2aed523a9d10dda6ce43ef6ff0a01796524e165558fb6a5ad3e6b76cc5f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-chunks/frames.pcap",
+        "bytes": 13145477
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-chunks/frame-spans.json",
+        "bytes": 2980,
+        "sha256": "b72c27783c4a791a008cb4bbe0d3b1a176ee540db69ac54a499ac35a02940404"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-chunks/tcp-overlap.json",
+        "bytes": 1395,
+        "sha256": "cb7c24171e4f4c40c9c97bb1d160793e208cc3ac5c44f190e417510a8351903a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "cc8f4f3bfc6e1cd11d4b8bdfb410e167d4e4cb7e4ff6894cb86b5a167842b32f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-chunks/source/server.log",
+        "bytes": 3569,
+        "sha256": "119a10b52cdee381addd39d146ba04ec3a54f27b11c44b94b9f1503890ddba80"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-chunks/target/server.log",
+        "bytes": 3514,
+        "sha256": "66f02dfbd97b9e67de15ef6d635fe0df9d335ebadf18c41656ecac003aa2d0cd"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f1-rtt5",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-records/result.json",
+        "bytes": 258737,
+        "sha256": "e4ffaa1be70b3ec05fa642abc492dcf9dbc83459a960d7b05ce21d6e58a5960e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-records/acceptance.json",
+        "bytes": 2591,
+        "sha256": "7d646f1b126a991e38f5396ee36e48fdc6517700bc7c74c8f3136ab97537d9e6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-records/driver-outcome.json",
+        "bytes": 1504,
+        "sha256": "3b040a7d066345c671eabc31aaf11ff874369ba1976ac2a1cc1a0008d6716f3e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-records/samples.jsonl",
+        "bytes": 59929,
+        "sha256": "954c51146829ff9ecdfbbd3fc49115e71366ecdffeb169eef9bf6775c6827d11"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-records/frames.pcap",
+        "bytes": 13149331
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-records/frame-spans.json",
+        "bytes": 2977,
+        "sha256": "02b5cb192966b3ccc6d7b6fe0a2cabf167c6be0eeb62db002cdd287e2d489111"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-records/tcp-overlap.json",
+        "bytes": 1397,
+        "sha256": "3a54eacc895bc6415995953cd0614146e4f1c8281bca377a579703278fda8423"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "091d75116ffabf3bbec4fae2df35a934e5439e1e2e5d89b05c4fdf1a90c86365"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-records/source/server.log",
+        "bytes": 3570,
+        "sha256": "cda96eab0a3df6a9bfc9102e5abd160dc7fd6909c3f384650c852cf1c822fd70"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f1-rtt5/r3-records/target/server.log",
+        "bytes": 3515,
+        "sha256": "86641f5a24d6a3511ee8e404891dbfd35d57ff1b72f81f3c2b8532b6f2b5ab3b"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt20",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-chunks/result.json",
+        "bytes": 265574,
+        "sha256": "f664b041eca2b0a89b90393ce17bd5e4c5c4cc2a7d6f08809ba8830048eba39d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-chunks/acceptance.json",
+        "bytes": 2877,
+        "sha256": "997fbf7a3fa776057d0f01a380d4a1c82b15f062e1cde0d87a9830f3c57e7834"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-chunks/driver-outcome.json",
+        "bytes": 1507,
+        "sha256": "1e21e729d1faca101c8772d80972340fa8e17a000e599801cf1d9c6cd1b32029"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-chunks/samples.jsonl",
+        "bytes": 161913,
+        "sha256": "f1713d033a70c5eb9f29482c6ee2f93abe93f387a54807f5331ed978e7cf1df4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-chunks/frames.pcap",
+        "bytes": 13105336
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-chunks/frame-spans.json",
+        "bytes": 6651,
+        "sha256": "85cc354d43bfb36a3ed82c9ff2d4c019bc7ae55ab1a4c03617ddea1730ece11c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-chunks/tcp-overlap.json",
+        "bytes": 2285,
+        "sha256": "5f9cfdbd13b88b703dd860a9a4e4c856c1bc3bfb5e9ed87c44eb27e0fe8a3f61"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "64512c976795c9900c87e3a3de8f39b5757b0716d0c90e7c6fdc7dc89911047f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-chunks/source/server.log",
+        "bytes": 5370,
+        "sha256": "74fbf36bc34592e8fc5b46fd735d08ea886f43d0214861b6fbc3ff9e85cb833d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-chunks/target/server.log",
+        "bytes": 4383,
+        "sha256": "0bf1fe2cd9286116acca5931958900cde1a2fd763eca2f6a8ac8a42f14647324"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt20",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-records/result.json",
+        "bytes": 265563,
+        "sha256": "90a3d3c1ff1ca00221d7abe359258995630e8b1b42937707935d4ce0ddffa69a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-records/acceptance.json",
+        "bytes": 2880,
+        "sha256": "d8759f3226895d4dff3ea8575c3e9e8a891a1f21c1e66d00d45cc34c79643327"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-records/driver-outcome.json",
+        "bytes": 1512,
+        "sha256": "d5656fb2c2c014af1ef01d832afa99cac144701efa1d71f77d549a58bd47eb16"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-records/samples.jsonl",
+        "bytes": 161943,
+        "sha256": "b3aed471535537ab2b0b6026c03af167a95a2044c90f00420a17c7986a8a46d2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-records/frames.pcap",
+        "bytes": 13109600
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-records/frame-spans.json",
+        "bytes": 6637,
+        "sha256": "fca81e32d1963a595cfa39b1ac8254643c868321205309969a2c8e674a59539c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-records/tcp-overlap.json",
+        "bytes": 2260,
+        "sha256": "f932a32491091cc786e3b3396516f63caf1c9d3e183dcd903adb2f0960ba1291"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "7e78c85f7d164660e44b7f9b8fba1757533f7a703425ffdbb3dd661b24d47cee"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-records/source/server.log",
+        "bytes": 5371,
+        "sha256": "aa09e722c564ec6f25d0e7bd90cec46c4f0506de8e82d10c87c2cc2ea31fa724"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r1-records/target/server.log",
+        "bytes": 4382,
+        "sha256": "d16860a03856df997713564c7edd0b55880b87eff9274517404a05a14fc5bd87"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt20",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-chunks/result.json",
+        "bytes": 265575,
+        "sha256": "f1572b1921c2b6e83c6077715221ed72a9bce9f5fbfac3081458ceeb8b2004c4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-chunks/acceptance.json",
+        "bytes": 2876,
+        "sha256": "aae899af9e5ed5e84d0f7a4697f4713a3f6e11d54c7664cf2517b0fc2c1c76d3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-chunks/driver-outcome.json",
+        "bytes": 1507,
+        "sha256": "f18fe320ae7a1679a52d2a964a633c26cdc199171ade709c57df01628c09e2b1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-chunks/samples.jsonl",
+        "bytes": 161943,
+        "sha256": "e54908ba23e10f732f8eda0f3f66529abfb0ea97ef25d0d5f05a6b23a8d9e2c5"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-chunks/frames.pcap",
+        "bytes": 13113044
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-chunks/frame-spans.json",
+        "bytes": 6648,
+        "sha256": "1c1d98db47c32c051e1555697ff73e5ff3f823ef78e1d79588bda5064e159a84"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-chunks/tcp-overlap.json",
+        "bytes": 2283,
+        "sha256": "a4407a7530dd5b7699ae914b0f898aa402ec7b9927358e58f923bec4c2187a8d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "7bb44ad646dea73125fbcdf3e04d5e09b8e7e310680863eb49f2115c809499ef"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-chunks/source/server.log",
+        "bytes": 5370,
+        "sha256": "4cdc481491fb0cd5ae4183c53a889c51bd6e8fa82f4075a44872aebb270dd7a0"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-chunks/target/server.log",
+        "bytes": 4383,
+        "sha256": "98fc70724820eaec8cea9901c90cc052968ed62336835b202aed8ffa17f3e7e0"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt20",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-records/result.json",
+        "bytes": 265585,
+        "sha256": "53d2c2c2c050a1042973b6843fc648ba26464e0a043d6a00f37a113d1713acd6"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-records/acceptance.json",
+        "bytes": 2880,
+        "sha256": "61b28a6f492e1e1a8501e02e5fb3079856976492c720e815516ee7c7c84cb581"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-records/driver-outcome.json",
+        "bytes": 1512,
+        "sha256": "c033b17616b3548250d182709724383652bd320e4c35511385b15cb16bb6e672"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-records/samples.jsonl",
+        "bytes": 161940,
+        "sha256": "50a467eb09c1d00c7cc97e41e0bc65900eaf8fafce0a1970c3b18bf162f6eec4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-records/frames.pcap",
+        "bytes": 13115600
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-records/frame-spans.json",
+        "bytes": 6648,
+        "sha256": "4b0a5390dc3f233361307d9d4ae4d7a56572020af7a6314b619c029615186f14"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-records/tcp-overlap.json",
+        "bytes": 2283,
+        "sha256": "4ac20f5c9849f9f18b46a5c3bd586a0d50377f56fad1e460e8ebeef88bc40e65"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "60d40f4e0baeb0fd9e5e4dc347ef594a571913b14945d63925a3323661a3a3ae"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-records/source/server.log",
+        "bytes": 5371,
+        "sha256": "dda43cbb26bcd53646cb7f3aef6c4df1765e8c4df3bf4e4b6e16e8a82819ad39"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r2-records/target/server.log",
+        "bytes": 4384,
+        "sha256": "6e5388c1109d7ae1fa9791f3bc8ae7a6e0cc8192a4d49ef95bbdec459b6c572d"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt20",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-chunks/result.json",
+        "bytes": 265565,
+        "sha256": "c989b28ec9dcad147c7cfaf1e3c5fb9c4154a9d8c3b6838bf238989ef0391cab"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-chunks/acceptance.json",
+        "bytes": 2877,
+        "sha256": "21daa0f2aa377158254ba2badb62d34d071abba7e492cf935030b7254992510c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-chunks/driver-outcome.json",
+        "bytes": 1507,
+        "sha256": "00a7f1f912b559a09f765aee01f857b9dece353352638907dd28810e0ea3ee7e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-chunks/samples.jsonl",
+        "bytes": 161940,
+        "sha256": "337baf134e921889ce61b83d59fbb2ce9810defee22c9a23ffae5fce11f6c9ab"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-chunks/frames.pcap",
+        "bytes": 13105676
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-chunks/frame-spans.json",
+        "bytes": 6639,
+        "sha256": "e450d6fcecccff36aba6a12292544ff1f328a7a80c78956a1a8725de6031e286"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-chunks/tcp-overlap.json",
+        "bytes": 2272,
+        "sha256": "3ea415504454bf16bdd0ad09090181224050e0d618af36d8f17ea11af79d4d41"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "1e89b8ec71c77a4be6e3a40437296f4cae4023e086d626ad126835de5accc190"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-chunks/source/server.log",
+        "bytes": 5370,
+        "sha256": "cda7681c52b35831629ab78f928c04d6b5a2fd3bc93dc6463e6db425438ba66e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-chunks/target/server.log",
+        "bytes": 4382,
+        "sha256": "07542c76ef50f8225f5350ec38f2b1f427add0848d86f7c0a8ac0e5eb34f38f8"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt20",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-records/result.json",
+        "bytes": 265584,
+        "sha256": "09676396d81f030e8e567545ec2f8efec4e92be05e291dbc9d79882758340b1c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-records/acceptance.json",
+        "bytes": 2880,
+        "sha256": "447fba690d1760106ed8b0ad54f1e29a87a0f1c30435dbd6f25fd87258464c5e"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-records/driver-outcome.json",
+        "bytes": 1512,
+        "sha256": "8af294d269fca02668579605cd025411f50df859c4f68dc201679d4a8d6ec2c3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-records/samples.jsonl",
+        "bytes": 161944,
+        "sha256": "452cae91262e65f89a9df61c7fa4cc3f8889d78b214f99c1c11b265b98e9a296"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-records/frames.pcap",
+        "bytes": 13104680
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-records/frame-spans.json",
+        "bytes": 6649,
+        "sha256": "394adf1ed00243ccda6e252483a8a7a65fa66a719ea54a3486c2c639696b91e7"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-records/tcp-overlap.json",
+        "bytes": 2285,
+        "sha256": "7811b5a9f744e5870174919fc2f757e147c93c634d48255718c535799caab52d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "c1f05b6a2a3ee0396eb79a0071ba4c39ca6825ab48e1d2111295f3f634d0781f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-records/source/server.log",
+        "bytes": 5371,
+        "sha256": "72a9cb9a76f209c1dddb214ea8c1a3532ed1f23a5b4d05e1537edadb8f0c8db4"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt20/r3-records/target/server.log",
+        "bytes": 4384,
+        "sha256": "707af893e31cc50b58097a816eed6a275e8fdc83550289c0fa24d704eb09f715"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt5",
+    "repeat": 1,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-chunks/result.json",
+        "bytes": 265562,
+        "sha256": "c025d1af09f94db2d1ba4d75d6f762cfd9406a8d1ad904ff7e2cb4580adafd9c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-chunks/acceptance.json",
+        "bytes": 2875,
+        "sha256": "d769a267fb8fc512a848a3da030d1571a470c8254bb2e33461cb74c546ff3b48"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-chunks/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "8a2cc157b6d1a007165be79fefb25103ea3e056122ca8551a30e69cedd11b4c7"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-chunks/samples.jsonl",
+        "bytes": 56230,
+        "sha256": "5a31a80b7698fb3a17748c42e4e929733ef430b774b96e5119e6004045aa8656"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-chunks/frames.pcap",
+        "bytes": 13100826
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-chunks/frame-spans.json",
+        "bytes": 6640,
+        "sha256": "7839514d3a54b027067ac7b0a0fee6b3c3a7834b191c89cf865df22edf8da983"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-chunks/tcp-overlap.json",
+        "bytes": 2283,
+        "sha256": "c4b92a0ff56e63228b949b2cc14993d3b27f08c433cdcdfb7a9a1ee15858d433"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "7bb023d50a1206c0f6da2d09b880f25574b15433f8e77b2749d2c8d329cacc94"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-chunks/source/server.log",
+        "bytes": 5369,
+        "sha256": "7ed2c15a8c7b2ba05b9f46a73a6087c719451330d979f9abd489916bd53f4a4a"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-chunks/target/server.log",
+        "bytes": 4382,
+        "sha256": "1b5bf515a1830ca50fb863b7bffadb2e2c6c70cae0df394e671aa85ac80b598c"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt5",
+    "repeat": 1,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-records/result.json",
+        "bytes": 265563,
+        "sha256": "f5d58eefd36a12835af009a3f189eb0a7cc51165a7bc011a874ef127248c9940"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-records/acceptance.json",
+        "bytes": 2878,
+        "sha256": "eacb6121e5fe6fa7e44e98ffebf62a8e7f854cd7fb86b2fd2ae573da27924a59"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-records/driver-outcome.json",
+        "bytes": 1508,
+        "sha256": "797b5f7fa95dad24c0f59d4d8d584eda72be2ab1747cfda3f99710a8514833d3"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-records/samples.jsonl",
+        "bytes": 49231,
+        "sha256": "78a699bb0fd9f3647cfa17912aa48ede3914cc8f2648145cda6274929ef97368"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-records/frames.pcap",
+        "bytes": 13102402
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-records/frame-spans.json",
+        "bytes": 6636,
+        "sha256": "a6d6dac34e93cf628a88f42e8585a231ccc0f18f4b8a95f8e5bf7d5672f69130"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-records/tcp-overlap.json",
+        "bytes": 2273,
+        "sha256": "25b808eaf7e9463ca4f8435f050756d2e316881f22e14bb491db6b0f7916cecd"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "999b01eff132e8dbe677ee91cb1f0eac73fb8f2ec5f22ceef44785bd8531573f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-records/source/server.log",
+        "bytes": 5370,
+        "sha256": "b5232a9f795914070b1a074fd311e4d7dba5799d3f768aaa163300673165fd2d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r1-records/target/server.log",
+        "bytes": 4382,
+        "sha256": "dfe84b3c7914b98ddd8cdc77917b1abe8f047cf07685705063e639bfdac233f1"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt5",
+    "repeat": 2,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-chunks/result.json",
+        "bytes": 265550,
+        "sha256": "b8fd631ee65106b7b45ca315e820de6c2721de7640f63b5238a50796a0e627c5"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-chunks/acceptance.json",
+        "bytes": 2876,
+        "sha256": "6b0ebd5dba19a0d532d4dda147c832b771d2bb8e568206ebb47b5a49aef27c5d"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-chunks/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "cf6be93cf07f2b2132eeb47288c979ec4c309563f2c8e9b71abe2b565b53cad9"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-chunks/samples.jsonl",
+        "bytes": 49231,
+        "sha256": "8ec0ee550fd3221d84a401da799a5fcb396586ed80bfbde71c7e3406d3ceb921"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-chunks/frames.pcap",
+        "bytes": 13098004
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-chunks/frame-spans.json",
+        "bytes": 6625,
+        "sha256": "443f6a0054f8c579b2911cac7a8b37e7062ff231fd98dd12d9dbd87c06798d07"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-chunks/tcp-overlap.json",
+        "bytes": 2271,
+        "sha256": "2ffdd8cf5baf26efc9e7e2ab48cfe1096057e453effcaa83daa60380733f3914"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "a51ae52826ea5c63fe09df4dda14c05da809517bd45ef3352c463936c007af5c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-chunks/source/server.log",
+        "bytes": 5369,
+        "sha256": "fa8cba1f3218672a63302055995757cd86f84a87baba52651623c5542e896d7f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-chunks/target/server.log",
+        "bytes": 4381,
+        "sha256": "21c0687cabe894bc9b753b7b749ce0c7301ae4d0d9ccc2954df434d230b10ff6"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt5",
+    "repeat": 2,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-records/result.json",
+        "bytes": 265569,
+        "sha256": "88e775356c0b016d382b8df3b71ad4b66d88401ae50d4d07b840e3dec67fa4aa"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-records/acceptance.json",
+        "bytes": 2878,
+        "sha256": "6fe70971f3bf51d1a2dcb9029a1e2ba062791df2367a77da8ed749c60b678c03"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-records/driver-outcome.json",
+        "bytes": 1508,
+        "sha256": "a4d4d769ab922167cab739565864e6edb4e04f25619a97d238b1a10cfd5df3cb"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-records/samples.jsonl",
+        "bytes": 56276,
+        "sha256": "b61cf42bdebb05e442709c9fe570f5e808c067a7319443f21acecf921072e614"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-records/frames.pcap",
+        "bytes": 13097830
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-records/frame-spans.json",
+        "bytes": 6646,
+        "sha256": "c5225e398fde9dc6775d3dee529aa036f7a6780a02d67d13c138a40c512c09ef"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-records/tcp-overlap.json",
+        "bytes": 2285,
+        "sha256": "bd5a15e7245d78b6e10f649fb484f19df00558365e1697eb1299bc15d36ada85"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "c5ff9b7c708c5ae1bb1ad492c43ec12a3c02015ea009a65e9d4fa56b40edbd3f"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-records/source/server.log",
+        "bytes": 5370,
+        "sha256": "a28379e9b162bb71cd03c4db5cf682e81d98619b2b67b614a3bccc61e7a010c1"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r2-records/target/server.log",
+        "bytes": 4383,
+        "sha256": "a8c6e03d66a70f0ba527b61c9a24c6726760846abb3686d9a8063fbf579d6f9c"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt5",
+    "repeat": 3,
+    "label": "chunks",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-chunks/result.json",
+        "bytes": 265558,
+        "sha256": "fb02cbb764b072e629a7bdda425b9ca12c7d0b58fd9c843017f76f080b01b3fd"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-chunks/acceptance.json",
+        "bytes": 2875,
+        "sha256": "066db0c51c3ca4dff0a5d58a1d71b5f4863d4a7d71c986a03ed360b703b47039"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-chunks/driver-outcome.json",
+        "bytes": 1503,
+        "sha256": "e7817b183689f9631b52d45ef683a992919bbb8ae0dbf4992b2bddc6cfa7c613"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-chunks/samples.jsonl",
+        "bytes": 49231,
+        "sha256": "54bec22812ba9fbd30210f4bf1285cd67af2761cb9fb77bed378f4f783ae672c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-chunks/frames.pcap",
+        "bytes": 13101580
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-chunks/frame-spans.json",
+        "bytes": 6644,
+        "sha256": "0f39409117088a11deb9b4b58913ddaaa566fff9b0c27b199b50387e57f3d340"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-chunks/tcp-overlap.json",
+        "bytes": 2282,
+        "sha256": "535ec7dcf676ba6987ed775da7e1464fb8d0ab7818229cdeedf824adcb4db1a7"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-chunks/tcpdump.log",
+        "bytes": 249,
+        "sha256": "1796f65a8d753281a5559c38c6188816a2574207e94e47dc7ef2469f32336041"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-chunks/source/server.log",
+        "bytes": 5369,
+        "sha256": "d17058a0f1f1ff786e2e01afbe4fd87a67b35d6669ba15a485d5e5980039038c"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-chunks/target/server.log",
+        "bytes": 4382,
+        "sha256": "750fa9eff3fa5093d4c66120b16c90cd2f9ff47e8b21dcd9305309fbb0aa369a"
+      }
+    ]
+  },
+  {
+    "case": "uniform-records-8m-f4-rtt5",
+    "repeat": 3,
+    "label": "records",
+    "files": [
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-records/result.json",
+        "bytes": 265561,
+        "sha256": "89b242df70116d7c15ed9df144b6a3f34f6ee726df8616fe0e2084ebe2b54d68"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-records/acceptance.json",
+        "bytes": 2879,
+        "sha256": "6598ffed37e9f35621f5de3c3cedaa218b5b054837504b1dccaf146fc1e01dc8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-records/driver-outcome.json",
+        "bytes": 1508,
+        "sha256": "a46fbce83a6252e9353546237c8eaf863ca7ffe880f2adce7ef80235ff703d48"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-records/samples.jsonl",
+        "bytes": 49230,
+        "sha256": "b7fab4d068b5c6c016b6f47ac499809e23321219b4a6d9c3acfd46f4f25aa643"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-records/frames.pcap",
+        "bytes": 13094338
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-records/frame-spans.json",
+        "bytes": 6647,
+        "sha256": "a4ea9f1fe43092916ce8ef7398c774a8d97822b42b5f02e0cd910269d7036a93"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-records/tcp-overlap.json",
+        "bytes": 2272,
+        "sha256": "9b390583dd448855536bf086ef5fceb070f606c0a7361e6fff121cd0a0b33ff2"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-records/tcpdump.log",
+        "bytes": 249,
+        "sha256": "e90f36bdf52f9a8c3b82e6316f424b60e7c6d60c92b37eb040c6b2163b260168"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-records/source/server.log",
+        "bytes": 5370,
+        "sha256": "7429d1791474dec3642e8e6f239fc156a76185c6e1627bf334d5080ded0556a8"
+      },
+      {
+        "path": "/mnt/local_nvme/i131/measurements/uniform-records-8m-f4-rtt5/r3-records/target/server.log",
+        "bytes": 4382,
+        "sha256": "42b8f537775a58802bc9aa5408e0cbadc73db8dbb4a751073aa095debeb09cc0"
+      }
+    ]
+  }
+]
