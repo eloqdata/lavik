@@ -144,10 +144,10 @@ Local page replacements detach changed chunks. Lists and Sorted Sets update
 rank intervals whose counts change; Streams use a persistent partial-sum rank
 index to update logarithmic cells per changed count. Count-neutral replacements
 share ranks. Unchanged identities and retirement records remain shared. Stream
-tail appends preserve the validated predecessor chain and check its new links
-and aggregate counts; other topology changes validate the complete resulting
-chain. Only recovery selects among competing physical candidates. Retired
-identities remain available to GC. Routing and physical-index node references,
+suffix insertions preserve a validated predecessor prefix and check the
+remaining chain and aggregate counts; other topology changes validate the
+complete resulting chain. Only recovery selects among competing physical
+candidates. Retired identities remain available to GC. Routing and physical-index node references,
 including final destruction, remain on
 the key owner. Cross-worker readers exchange physical identities or stream
 handles that route metadata access and cleanup back to that owner. Retained

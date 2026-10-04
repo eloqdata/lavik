@@ -1073,108 +1073,150 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
   rebuilt.sequence_ = revision;
   rebuilt.command_sequence_ = command_sequence;
   rebuilt.members_ = std::move(members);
-  // Stream tail splits preserve every old ordinal. The predecessor already
-  // proved the old chain; unchanged links cannot introduce a cycle or orphan.
-  // Check the old/new seam and every inserted link, then share the old arrays.
-  // Limit this path to the small command batch so its temporary lists stay
-  // inline; bulk rewrites retain the general admitted reconstruction below.
+  // Stream messages sort before node/group metadata. Appending a message
+  // therefore usually inserts near the end rather than after the last page.
+  // Preserve the already checked prefix and validate only a bounded suffix;
+  // front trims and broad rewrites retain the full reconstruction below.
   if (root.kind_ == OrderedCollectionKind::kStream && changed.size() <= 8 &&
       new_retired.empty() && root.first_group_ == root_.first_group_ &&
       root.group_count_ > groups_.size()) {
-    absl::InlinedVector<const RecoveredOrderedGroup*, 8> appended;
-    absl::InlinedVector<std::pair<std::size_t, absl::int128>, 8> count_changes;
-    bool append_only = true;
-    absl::int128 old_count = root_.item_count_;
+    std::size_t first = groups_.size();
+    bool fresh_ids = true;
     absl::int128 bytes = total_group_bytes_;
     for (const auto& item : changed) {
-      const auto index = FindIndex(item.id_);
-      if (index) {
+      if (const auto index = FindIndex(item.id_)) {
         const auto& old = groups_[*index];
-        append_only &=
-            item.previous_ == old.previous_ &&
-            (*index + 1 == groups_.size() || item.next_ == old.next_);
-        const auto delta = absl::int128(item.item_count_) - old.item_count_;
-        count_changes.emplace_back(*index, delta);
-        old_count += delta;
+        if (item.previous_ != old.previous_ || item.next_ != old.next_)
+          first = std::min(first, *index);
         bytes += absl::int128(item.encoded_bytes_) - old.encoded_bytes_;
       } else {
-        // Fresh ids sort after every existing live or retired identity. This
-        // permits a persistent identity-index append without a whole-index
-        // sort.
-        append_only &= item.id_ >= root_.next_group_id_;
-        appended.push_back(&item);
+        // Fresh identities sort after the existing identity index even when
+        // their logical order differs. Old reserved ids use the general path.
+        fresh_ids &= item.id_ >= root_.next_group_id_;
         bytes += item.encoded_bytes_;
       }
     }
-    std::sort(appended.begin(), appended.end(),
-              [](const auto* a, const auto* b) { return a->id_ < b->id_; });
-    const auto tail = replacements.find(root_.last_group_);
-    append_only &= !appended.empty() &&
-                   groups_.size() + appended.size() == root.group_count_;
-    // New identities need not follow logical order in general. Only use
-    // persistent appends when their sorted order is also their chain order.
-    for (std::size_t i = 0; append_only && i < appended.size(); ++i) {
-      const auto& item = *appended[i];
-      append_only =
-          item.previous_ ==
-              (i == 0 ? root_.last_group_ : appended[i - 1]->id_) &&
-          item.next_ == (i + 1 == appended.size() ? 0 : appended[i + 1]->id_);
-    }
-    if (append_only && tail != replacements.end() &&
-        tail->second->next_ == appended.front()->id_ &&
-        root.last_group_ == appended.back()->id_) {
-      absl::int128 count = old_count;
-      for (const auto* item : appended) count += item->item_count_;
-      if (count != root.item_count_ || old_count < 0 || bytes < 0 ||
-          bytes > UINT64_MAX)
-        return absl::DataLossError("Stream tail append aggregate mismatch");
-      rebuilt.total_group_bytes_ = static_cast<std::uint64_t>(bytes);
-      rebuilt.retired_ = retired_;
-      absl::InlinedVector<RecoveredOrderedGroup, 8> new_groups;
-      absl::InlinedVector<std::pair<std::uint64_t, std::size_t>, 8> new_ids;
-      absl::InlinedVector<std::uint64_t, 8> new_ends;
-      absl::InlinedVector<std::uint64_t, 8> new_prefixes;
-      auto prefix = static_cast<std::uint64_t>(old_count);
-      for (const auto* item : appended) {
-        const auto index = groups_.size() + new_groups.size();
-        new_groups.push_back(*item);
-        new_groups.back().txid_ = 0;
-        new_groups.back().batch_txid_ = 0;
-        new_ids.emplace_back(item->id_, index);
-        prefix += item->item_count_;
-        const auto start = (index + 1) & index;
-        absl::int128 before = 0;
-        if (start < groups_.size()) {
-          before = CountBefore(start);
-          for (const auto& [changed_index, delta] : count_changes)
-            if (changed_index < start) before += delta;
-        } else {
-          before = start == groups_.size()
-                       ? old_count
-                       : absl::int128(new_prefixes[start - groups_.size() - 1]);
-        }
-        new_ends.push_back(prefix - static_cast<std::uint64_t>(before));
-        new_prefixes.push_back(prefix);
+    if (fresh_ids && first < groups_.size() && groups_.size() - first <= 256) {
+      const auto suffix_size = root.group_count_ - first;
+      auto scratch = TryReserveMemory(AllocatorUsableSizeForRequest(
+          suffix_size * (sizeof(const RecoveredOrderedGroup*) +
+                         2 * sizeof(std::uint64_t)) +
+          1024));
+      if (!scratch) {
+        RecordMemoryRejection();
+        return absl::ResourceExhaustedError("OOM Stream suffix update scratch");
       }
-      auto groups = groups_.Appended(new_groups);
+      std::vector<const RecoveredOrderedGroup*> suffix;
+      std::vector<std::uint64_t> prefixes, ends;
+      suffix.reserve(suffix_size);
+      prefixes.reserve(suffix_size);
+      ends.reserve(suffix_size);
+      absl::InlinedVector<std::pair<std::size_t, absl::int128>, 8>
+          prefix_changes;
+      absl::int128 prefix_count = CountBefore(first);
+      for (const auto& item : changed) {
+        if (const auto index = FindIndex(item.id_); index && *index < first) {
+          const auto delta =
+              absl::int128(item.item_count_) - groups_[*index].item_count_;
+          prefix_changes.emplace_back(*index, delta);
+          prefix_count += delta;
+        }
+      }
+      if (prefix_count < 0 || prefix_count > root.item_count_ || bytes < 0 ||
+          bytes > UINT64_MAX)
+        return absl::DataLossError("Stream suffix aggregate overflow");
+      absl::int128 count = prefix_count;
+      std::uint64_t id = groups_[first].id_;
+      std::uint64_t previous = first == 0 ? 0 : groups_[first - 1].id_;
+      absl::InlinedVector<std::pair<std::uint64_t, std::size_t>, 8> new_ids;
+      while (id != 0) {
+        const auto replacement = replacements.find(id);
+        const auto old_index = FindIndex(id);
+        const auto* item = replacement == replacements.end()
+                               ? (old_index ? &groups_[*old_index] : nullptr)
+                               : replacement->second;
+        if (item == nullptr || item->retired_ || item->previous_ != previous ||
+            (old_index && *old_index < first) || suffix.size() == suffix_size)
+          return absl::DataLossError("broken Stream suffix chain");
+        const auto index = first + suffix.size();
+        if (!old_index) new_ids.emplace_back(id, index);
+        count += item->item_count_;
+        if (count > root.item_count_)
+          return absl::DataLossError("Stream suffix count overflow");
+        const auto start = (index + 1) & index;
+        absl::int128 before = prefix_count;
+        if (start < first) {
+          before = CountBefore(start);
+          for (const auto& [changed_index, delta] : prefix_changes)
+            if (changed_index < start) before += delta;
+        } else if (start > first) {
+          before = prefixes[start - first - 1];
+        }
+        ends.push_back(static_cast<std::uint64_t>(count - before));
+        prefixes.push_back(static_cast<std::uint64_t>(count));
+        suffix.push_back(item);
+        previous = id;
+        id = item->next_;
+      }
+      // The prefix keeps all its links. In the suffix, reciprocal previous
+      // links forbid cycles and the exact live count requires every old page
+      // and fresh identity to remain reachable, including unmodified pages.
+      if (suffix.size() != suffix_size || previous != root.last_group_ ||
+          count != root.item_count_ ||
+          new_ids.size() != root.group_count_ - groups_.size())
+        return absl::DataLossError("disconnected Stream suffix pages");
+      std::sort(new_ids.begin(), new_ids.end());
+      const auto old_suffix_size = groups_.size() - first;
+      absl::InlinedVector<RecoveredOrderedGroup, 8> extended;
+      for (std::size_t i = old_suffix_size; i < suffix.size(); ++i) {
+        extended.push_back(*suffix[i]);
+        extended.back().txid_ = 0;
+        extended.back().batch_txid_ = 0;
+      }
+      auto groups = groups_.Appended(extended);
       if (!groups.ok()) return groups.status();
       auto ids = ids_.Appended(new_ids);
       if (!ids.ok()) return ids.status();
-      auto ends = ends_.Appended(new_ends);
-      if (!ends.ok()) return ends.status();
+      auto ranks = ends_.Appended(std::span(ends).subspan(old_suffix_size));
+      if (!ranks.ok()) return ranks.status();
       rebuilt.groups_ = std::move(*groups);
       rebuilt.ids_ = std::move(*ids);
-      rebuilt.ends_ = std::move(*ends);
+      rebuilt.ends_ = std::move(*ranks);
+      rebuilt.retired_ = retired_;
+      rebuilt.total_group_bytes_ = static_cast<std::uint64_t>(bytes);
+      for (std::size_t i = 0; i < suffix.size(); ++i) {
+        const auto index = first + i;
+        auto item = *suffix[i];
+        if (i < old_suffix_size) {
+          item.txid_ = 0;
+          item.batch_txid_ = 0;
+          auto status = rebuilt.groups_.Set(index, item);
+          if (!status.ok()) return status;
+          status = rebuilt.ends_.Set(index, ends[i]);
+          if (!status.ok()) return status;
+        }
+        const auto found = std::lower_bound(
+            ids_.begin(), ids_.end(), item.id_,
+            [](const auto& entry, auto id) { return entry.first < id; });
+        if (found != ids_.end() && found->first == item.id_ &&
+            found->second != index) {
+          auto status =
+              rebuilt.ids_.Set(found - ids_.begin(), {item.id_, index});
+          if (!status.ok()) return status;
+        }
+      }
       for (auto item : changed) {
-        if (const auto index = FindIndex(item.id_)) {
+        if (const auto index = FindIndex(item.id_); index && *index < first) {
           item.txid_ = 0;
           item.batch_txid_ = 0;
           auto status = rebuilt.groups_.Set(*index, item);
           if (!status.ok()) return status;
         }
       }
-      auto status = UpdateStreamRanks(rebuilt.ends_, count_changes,
-                                      root.item_count_, ends_.size());
+      // Suffix cells already contain changed prefix counts. Propagate only
+      // through the unchanged prefix to avoid applying those deltas twice.
+      auto status = UpdateStreamRanks(rebuilt.ends_, prefix_changes,
+                                      root.item_count_, first);
       if (!status.ok()) return status;
       if (has_stream_header_ && !changed_ids.contains(root.first_group_)) {
         rebuilt.stream_header_ = stream_header_;

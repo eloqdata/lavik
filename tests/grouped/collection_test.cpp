@@ -1404,7 +1404,7 @@ TEST(GroupedCollectionTest,
   auto tail = *directory->Find(2);
   tail.next_ = 3;
   std::vector<RecoveredOrderedGroup> changed{tail};
-  // Nonmonotone new ids form a valid tail, but require the general builder.
+  // Fresh ids are opaque; their logical order need not be monotonic.
   for (const auto id : {3, 5, 4, 6})
     changed.push_back(
         Candidates({Page(id, 1, OrderedCollectionKind::kStream)})[0]);
@@ -1421,7 +1421,7 @@ TEST(GroupedCollectionTest,
   auto general = directory->Apply(root, 2, changed, 2);
   ASSERT_TRUE(general.ok()) << general.status();
   EXPECT_EQ(general->groups()[3].id_, 5);
-  // Put them in monotonic order to exercise the incremental path too.
+  // The monotonic case must preserve the same connectivity checks.
   std::sort(changed.begin(), changed.end(),
             [](const auto& a, const auto& b) { return a.id_ < b.id_; });
   for (std::size_t i = 1; i < changed.size(); ++i) {
@@ -1455,6 +1455,85 @@ TEST(GroupedCollectionTest,
             absl::StatusCode::kResourceExhausted);
   EXPECT_EQ(directory->groups().size(), 2);
   EXPECT_EQ(directory->Find(2)->next_, 0);
+}
+
+TEST(GroupedCollectionTest,
+     StreamSuffixInsertMatchesRecoveryAcrossShiftedRanks) {
+  // Messages precede node/group metadata, so inserting near the tail shifts
+  // existing suffix ordinals. Include a suffix beyond the incremental bound
+  // to verify the general builder has the same observable result.
+  for (const std::size_t size : {300, 1023}) {
+    for (const std::size_t trailing : {1, 3, 32, 128, 255, 256}) {
+      SCOPED_TRACE(size);
+      SCOPED_TRACE(trailing);
+      std::vector<OrderedGroupSnapshot> pages;
+      for (std::size_t i = 0; i < size; ++i) {
+        auto page = Page(i + 1, 2 + i % 5, OrderedCollectionKind::kStream);
+        page.previous_ = i;
+        page.next_ = i + 1 == size ? 0 : i + 2;
+        pages.push_back(std::move(page));
+      }
+      auto root = Root(pages, size + 1);
+      root.stream_length_ = 0;
+      auto records = Candidates(pages);
+      for (auto& item : records) item.encoded_bytes_ = item.item_count_ * 100;
+      auto directory = OrderedGroupDirectory::Recover(root, 1, records, {});
+      ASSERT_TRUE(directory.ok());
+      const auto pinned = *directory;
+      const auto first = size - trailing - 1;
+      auto head = directory->groups().front();
+      auto left = directory->groups()[first];
+      auto right = directory->groups()[first + 1];
+      ++head.item_count_;
+      head.encoded_bytes_ += 100;
+      --left.item_count_;
+      left.encoded_bytes_ -= 100;
+      left.next_ = root.next_group_id_;
+      std::vector<RecoveredOrderedGroup> changed{head, left};
+      for (int n = 0; n < 3; ++n) {
+        auto inserted = Candidates({Page(root.next_group_id_++, n + 1,
+                                         OrderedCollectionKind::kStream)})[0];
+        inserted.previous_ = n == 0 ? left.id_ : inserted.id_ - 1;
+        inserted.next_ = n == 2 ? right.id_ : inserted.id_ + 1;
+        inserted.encoded_bytes_ = inserted.item_count_ * 100;
+        root.item_count_ += inserted.item_count_;
+        ++root.group_count_;
+        changed.push_back(inserted);
+      }
+      right.previous_ = changed.back().id_;
+      changed.push_back(right);
+      root.revision_ = 2;
+      for (auto& item : changed) item.sequence_ = item.lsn_ = 2;
+      std::reverse(changed.begin(), changed.end());
+      auto updated = directory->Apply(root, 2, changed, 2);
+      ASSERT_TRUE(updated.ok()) << updated.status();
+      records.insert(records.end(), changed.begin(), changed.end());
+      auto recovered = OrderedGroupDirectory::Recover(root, 2, records, {}, 2);
+      ASSERT_TRUE(recovered.ok()) << recovered.status();
+      EXPECT_EQ(updated->total_group_bytes(), recovered->total_group_bytes());
+      for (std::size_t i = 0; i < updated->groups().size(); ++i) {
+        EXPECT_EQ(updated->groups()[i].id_, recovered->groups()[i].id_);
+        EXPECT_EQ(updated->CountBefore(i), recovered->CountBefore(i));
+        EXPECT_EQ(updated->FindIndex(updated->groups()[i].id_), i);
+      }
+      for (std::uint64_t rank = 0; rank < root.item_count_; ++rank) {
+        const auto position = updated->FindRank(rank);
+        const auto expected = recovered->FindRank(rank);
+        ASSERT_TRUE(position && expected);
+        EXPECT_EQ(position->group_index_, expected->group_index_);
+        EXPECT_EQ(position->offset_, expected->offset_);
+      }
+      if (first >= 64 && trailing < 256)
+        EXPECT_EQ(&updated->groups()[32], &directory->groups()[32]);
+      EXPECT_EQ(pinned.groups().size(), size);
+      EXPECT_EQ(pinned.groups()[first].next_, right.id_);
+      EXPECT_EQ(pinned.groups().front().item_count_, 2);
+      // Omitting the successor after-image disconnects the new seam even
+      // though every inserted page has the expected count and identity.
+      changed.erase(changed.begin());
+      EXPECT_FALSE(directory->Apply(root, 2, changed, 2).ok());
+    }
+  }
 }
 
 TEST(GroupedCollectionTest, StructuralUpdatesRejectDisconnectedOrInvalidPages) {
