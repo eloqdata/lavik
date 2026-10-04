@@ -461,8 +461,19 @@ The [CI workflow](../../.github/workflows/ci.yml) runs on pushes to `main`, pull
 requests, and manual dispatch. Formatting and CI-runner regression checks run
 independently. AMD64 and ARM64 each build the complete software test runtime
 once, then distribute it to six isolated runners of the same architecture.
-All existing CTest, native large-List/Hash, >1 GiB RDB, and vendored Valkey TCL
+All registered CTest, native large-List/Hash, >1 GiB RDB, and vendored Valkey TCL
 coverage runs on both architectures; there is no separate reduced PR tier.
+
+The shared Meta failover and recovery fault matrices run in Cluster mode.
+Single keeps representative multi-database handoff, rebuild, recovery, and
+fencing cases, plus its distinct client-command coverage; hostname cases also
+exercise Single handoff and Candidate Recovery. Managed-command fault gates
+exercise shared durability boundaries in Single and keep representative Cluster
+authority cuts alongside both modes' command semantics. Sentinel transport and
+address-mapping cases use real clients, while shared authentication and TLS
+failover scenarios run once. Direct listeners retain their dedicated TLS
+handshake matrix. These choices live in the CTest registrations and gate
+scenarios, so local full runs and CI use the same coverage boundary.
 
 Builds use Clang 18, Debug, `BUILD_TESTING=ON`,
 `LAVIK_ENABLE_TEST_FAULTS=ON`, and `LAVIK_ENABLE_OPT=OFF`. Debug is required

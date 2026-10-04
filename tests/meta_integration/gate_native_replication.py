@@ -621,16 +621,19 @@ def explicit_full_limit(root):
             for meta in fixture.metas:
                 meta.start(initial_cluster_manifest=fixture.manifest, wait_ready=False)
             fixture.leader = H.find_leader(fixture.metas, timeout=20)
-            for node in fixture.data_nodes:
-                node.seed = fixture.leader.data_control_endpoint
-                node.start()
+            # Election precedes initial identity reconciliation. A partial
+            # committed directory can omit the leader itself, which correctly
+            # makes Data bootstrap fail closed before storage opens.
             H.wait_until(
-                "Meta membership stable before creation",
+                "Meta membership stable before Data bootstrap",
                 15,
                 lambda: fixture.cluster_status(time.monotonic() + 2).get(
                     "meta_membership_stable"
                 ),
             )
+            for node in fixture.data_nodes:
+                node.seed = fixture.leader.data_control_endpoint
+                node.start()
             C.command(
                 os.environ.copy(),
                 [
@@ -783,16 +786,18 @@ def mixed_full_limit(root):
             finally:
                 os.environ.pop("LAVIK_TEST_MIXED_FULL_FOLLOW_NODE", None)
             fixture.leader = H.find_leader(fixture.metas, timeout=20)
-            for node in fixture.data_nodes:
-                node.seed = fixture.leader.data_control_endpoint
-                node.start()
+            # Data must not bootstrap against the leader's partially committed
+            # initial identity directory, even before Cluster Create is issued.
             H.wait_until(
-                "mixed fixture Meta membership stable",
+                "mixed fixture Meta membership stable before Data bootstrap",
                 15,
                 lambda: fixture.cluster_status(time.monotonic() + 2).get(
                     "meta_membership_stable"
                 ),
             )
+            for node in fixture.data_nodes:
+                node.seed = fixture.leader.data_control_endpoint
+                node.start()
             C.command(
                 os.environ.copy(),
                 [

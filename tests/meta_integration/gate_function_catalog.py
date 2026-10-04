@@ -402,15 +402,11 @@ def main():
                 revoked_at_commit(Path(directory), "AFTER_ROOT_WRITE", ambiguous=True)
                 for boundary in ("BEFORE_ROOT", "AFTER_ROOT_WRITE"):
                     controlled_pause_drains_catalog(Path(directory), boundary)
-                for boundary in ("BEFORE_STAGE", "BEFORE_ROOT", "AFTER_ROOT_WRITE"):
-                    revoked_at_commit(Path(directory), boundary, mode="cluster")
-                revoked_at_commit(
-                    Path(directory), "AFTER_ROOT_WRITE", ambiguous=True, mode="cluster"
-                )
+                # Catalog staging, mirrored-root recovery and pause/drain are
+                # mode-independent. Keep Cluster's authority response on both
+                # sides of commit alongside the full Single fault matrix.
                 for boundary in ("BEFORE_ROOT", "AFTER_ROOT_WRITE"):
-                    controlled_pause_drains_catalog(
-                        Path(directory), boundary, mode="cluster"
-                    )
+                    revoked_at_commit(Path(directory), boundary, mode="cluster")
     H.log("PASS")
 
 

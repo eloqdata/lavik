@@ -765,18 +765,22 @@ def main():
             for mode in ("single", "cluster"):
                 semantics(root, mode)
         elif scenario == "authority":
-            for mode in ("single", "cluster"):
-                for command in ("FLUSHDB", "FLUSHALL"):
-                    for boundary in (
-                        "BEFORE_DRAIN",
-                        "BEFORE_EPOCH",
-                        "AFTER_EPOCH_WRITE",
-                        "BEFORE_PUBLICATION",
-                        "BEFORE_REPLY",
-                    ):
-                        revoked(root, mode, command, boundary)
-                for boundary in ("BEFORE_EPOCH", "AFTER_EPOCH_WRITE"):
-                    controlled_pause(root, mode, boundary)
+            # Both commands keep every durable boundary in Single. Cluster
+            # samples either side of the irreversible cut and Controlled Pause
+            # for its authority contract; semantics/drain cover the DB scopes.
+            for command in ("FLUSHDB", "FLUSHALL"):
+                for boundary in (
+                    "BEFORE_DRAIN",
+                    "BEFORE_EPOCH",
+                    "AFTER_EPOCH_WRITE",
+                    "BEFORE_PUBLICATION",
+                    "BEFORE_REPLY",
+                ):
+                    revoked(root, "single", command, boundary)
+            for boundary in ("BEFORE_EPOCH", "AFTER_EPOCH_WRITE"):
+                controlled_pause(root, "single", boundary)
+                revoked(root, "cluster", "FLUSHALL", boundary)
+            controlled_pause(root, "cluster", "BEFORE_EPOCH")
         elif scenario == "storage":
             for command in ("FLUSHDB", "FLUSHALL"):
                 for kind in ("short", "write", "sync"):

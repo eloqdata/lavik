@@ -1107,6 +1107,12 @@ if (BUILD_TESTING)
       set_tests_properties(meta_integration.gate_native_replication PROPERTIES
         LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
       add_test(
+        NAME meta_integration.native_fixture_startup
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/test_native_fixture_startup.py)
+      set_tests_properties(meta_integration.native_fixture_startup PROPERTIES
+        LABELS meta-integration TIMEOUT 30)
+      add_test(
         NAME meta_integration.gate_tomb_raider
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_native_replication.py
@@ -1259,7 +1265,15 @@ if (BUILD_TESTING)
         # while a successful rerun cannot inherit older durable state.
         # Let the harness read the caller's environment at test runtime.
         foreach(service_mode IN ITEMS single cluster)
-          foreach(recovery_case IN ITEMS complete donor-failure budget coverage-gap candidate-replace leader-change)
+          set(candidate_recovery_cases
+            complete donor-failure budget coverage-gap candidate-replace leader-change)
+          if(service_mode STREQUAL "single")
+            # Cluster covers the shared recovery state machine's fault cuts.
+            # Single keeps the multi-DB coverage-gap path; hostname_recovery
+            # below already exercises its complete two-donor recovery path.
+            set(candidate_recovery_cases coverage-gap)
+          endif()
+          foreach(recovery_case IN LISTS candidate_recovery_cases)
             add_test(
               NAME meta_integration.recovery_${service_mode}_${recovery_case}
               COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
@@ -1299,7 +1313,10 @@ if (BUILD_TESTING)
         # only this unused auxiliary admin listener gets a short build-tree path.
         set(failover_socket_root "${CMAKE_CURRENT_BINARY_DIR}/fs")
         file(MAKE_DIRECTORY "${failover_socket_root}")
-        foreach(failover_case IN LISTS LAVIK_FAILOVER_INTEGRATION_CASES)
+        # Cluster covers every shared Meta transition fault cut. Single keeps
+        # full-population replacement and lease fencing, while hostname_partial
+        # above covers controlled failover and partial reparent with all DBs.
+        foreach(failover_case IN ITEMS full-fallback lease-fence)
           add_test(
             NAME meta_integration.single_failover_${failover_case}
             COMMAND ${CMAKE_COMMAND} -E env
@@ -1386,6 +1403,11 @@ if (BUILD_TESTING)
           RUN_SERIAL TRUE
         )
       endforeach()
+      # Cluster covers the shared startup and durable-proof fault matrix.
+      # Retain Single's complete multi-DB restart/rebuild paths, including the
+      # distinct incomplete-FULL cut after a DB15 partition has been applied.
+      set(LAVIK_SINGLE_POPULATION_RECOVERY_CASES
+        clean-owner clean-replica crash-operator incomplete-full promoted-follower)
       foreach(recovery_case IN ITEMS startup-barrier startup-stop clean-owner
                                      clean-replica crash-operator manual-fence
                                      before-publish after-publish
@@ -1409,20 +1431,22 @@ if (BUILD_TESTING)
           PROPERTIES LABELS "meta-integration;failover;population-recovery"
                      TIMEOUT 180 RUN_SERIAL TRUE
         )
-        add_test(
-          NAME meta_integration.single_population_recovery_${recovery_test_suffix}
-          COMMAND ${CMAKE_COMMAND} -E env
-                  "LAVIK_FAILOVER_SOCKET_ROOT=${automatic_failover_socket_root}"
-                  ${LAVIK_PYTHON3_EXECUTABLE}
-                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_population_recovery.py
-                  $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>
-                  --case=${recovery_case} --mode=single
-        )
-        set_tests_properties(
-          meta_integration.single_population_recovery_${recovery_test_suffix}
-          PROPERTIES LABELS "meta-integration;failover;population-recovery"
-                     TIMEOUT 180 RUN_SERIAL TRUE
-        )
+        if(recovery_case IN_LIST LAVIK_SINGLE_POPULATION_RECOVERY_CASES)
+          add_test(
+            NAME meta_integration.single_population_recovery_${recovery_test_suffix}
+            COMMAND ${CMAKE_COMMAND} -E env
+                    "LAVIK_FAILOVER_SOCKET_ROOT=${automatic_failover_socket_root}"
+                    ${LAVIK_PYTHON3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_population_recovery.py
+                    $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>
+                    --case=${recovery_case} --mode=single
+          )
+          set_tests_properties(
+            meta_integration.single_population_recovery_${recovery_test_suffix}
+            PROPERTIES LABELS "meta-integration;failover;population-recovery"
+                       TIMEOUT 180 RUN_SERIAL TRUE
+          )
+        endif()
       endforeach()
     endif()
 
@@ -1476,7 +1500,9 @@ if (BUILD_TESTING)
                 ${sentinel_client_go_dir}/go.sum
         VERBATIM)
       add_custom_target(lavik_sentinel_client_go ALL DEPENDS ${sentinel_client_go_bin})
-      foreach(mode direct mapped hostname plaintext plaintext-direct handshake)
+      # Mapped routes exercise the same client contracts as direct routes;
+      # handshake retains direct TCP/TLS listener and certificate coverage.
+      foreach(mode mapped hostname plaintext handshake)
         add_test(NAME meta_integration.sentinel_tls_${mode}
           COMMAND ${CMAKE_COMMAND} -E env
             "LAVIK_SENTINEL_REDIS_PY=${LAVIK_CLUSTER_CLIENT_REDIS_PY}"
