@@ -398,6 +398,15 @@ def run_partition(meta, data, ctl, workdir, direction, require_fault_hook):
         lease_metric = "lavik_cluster_control_lease_expirations_total"
         expirations_before = fixture.by_id[F.OWNER].metric(lease_metric)
 
+        # The explicit partition can revoke authority while a SET is in
+        # flight. As in the controlled lease-fence gate, an uncertain command
+        # may close without a reply; keep it out of successful-write intervals.
+        # Transport surprises before the fault cut remain failures.
+        old_probe.assert_healthy()
+        old_probe.allow_fence_disconnects()
+        for probe in replica_probes.values():
+            probe.assert_healthy()
+            probe.allow_fence_disconnects()
         fixture.partition_owner_control(direction)
         expected_reason = "heartbeat_expired" if direction == "downstream" else None
         wait_suspect(fixture, reason=expected_reason, timeout=20)
