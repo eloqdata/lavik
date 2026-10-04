@@ -3508,7 +3508,19 @@ class StorageEngine::Impl {
   absl::Status ApplyRecoveredRecord(WorkerStore& store,
                                     WorkerStore::PartitionStore& partition,
                                     const RecoveryRecordView& record);
-  Task<absl::Status> RecoverGroupedObjects(WorkerStore& store);
+  struct RecoveryExpiredTombstone {
+    std::uint8_t db_id_ = 0;
+    Digest digest_{};
+    std::string key_;
+    bool shielding_ = false;
+    // An unshielded, expired root whose graph was already reclaimed has no
+    // recoverable side view. It still needs a new durable deletion if space
+    // permits, even after the dead winner leaves the recovery index.
+    bool detached_ = false;
+  };
+  Task<absl::Status> RecoverGroupedObjects(
+      WorkerStore& store, std::optional<std::uint64_t> expiration_now_ms,
+      std::vector<RecoveryExpiredTombstone>& expired_tombstones);
   Task<absl::StatusOr<GroupedHashObject::Handle>> RecoverOrderedObject(
       WorkerStore& store, const OrderedCollectionRoot& root,
       GroupedObjectVersion version, RecoveryAuxiliaryRecords::iterator first,
