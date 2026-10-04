@@ -152,6 +152,19 @@ class SentinelTest(unittest.TestCase):
         self.assertIsInstance(reply, RespError)
         self.assertTrue(reply.startswith(prefix), repr(reply))
 
+    def wait_for_discovery_authority(self, node):
+        # Raft leadership precedes current-term application and the runtime's
+        # authority eligibility. Subscriptions deliberately disconnect during
+        # that gap; protocol tests must start after the authority is published.
+        def ready():
+            state = node.status()
+            return state.get("leader") == "1" and (
+                f"Raft leader term={state['term']} eligible=true"
+                in Path(node.log_path).read_text()
+            )
+
+        H.wait_until("Meta discovery authority", 5, ready)
+
     def test_authenticated_connection_without_data_cluster(self):
         node, port = self.node()
         client = self.client(port)
@@ -163,7 +176,7 @@ class SentinelTest(unittest.TestCase):
 
     def test_subscription_protocol_and_reset(self):
         node, port = self.node(bootstrap=True)
-        H.wait_until("Meta leader", 5, node.is_leader)
+        self.wait_for_discovery_authority(node)
         for protocol in (2, 3):
             client = self.client(port)
             client.command("HELLO", protocol, "AUTH", "default", "sentinel-secret")
@@ -481,8 +494,7 @@ class SentinelTest(unittest.TestCase):
 
     def test_slow_reader_keeps_admin_responsive_and_drains(self):
         node, port = self.node(password="", maxclients=1, bootstrap=True)
-        H.wait_until("Meta leader", 5, node.is_leader)
-        time.sleep(0.05)
+        self.wait_for_discovery_authority(node)
         slow = self.client(port)
         slow.command("HELLO", 3)
         slow.command("SUBSCRIBE", "+switch-master", "+replica-reconf-done")
