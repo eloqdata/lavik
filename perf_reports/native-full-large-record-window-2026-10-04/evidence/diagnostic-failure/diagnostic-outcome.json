@@ -1,0 +1,11 @@
+{
+  "classification": "diagnostic-aborted-invalid",
+  "aborted_at_utc": "2026-10-04T13:07:28.704184+00:00",
+  "signal": "SIGINT",
+  "runner_pid": 4104987,
+  "reason": "Explicitly aborted after >5 minutes with no native data progress in FULL. Source native TCP sent/acked counters stable, queues empty, both netem qdisc drop counters zero. Source outer EXEC admission 16777933 bytes exceeds configured 16MiB publish quota; cut gate/admission/fence256B cycle is source-consistent and supported by metrics, not stack-proven.",
+  "original_full_timeout_seconds": 900,
+  "is_timeout": false,
+  "is_performance_sample": false,
+  "followup": "Preserve original evidence; separate predeclared mixed-live5/20ms cohorts with queue32MiB, same1transaction/s, 8x16MiB corpus and64MiB backlog; do not mix cohorts."
+}

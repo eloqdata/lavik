@@ -1,0 +1,634 @@
+[0/2] Re-checking globbed directories...
+[1/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lbaselib.c.o
+[2/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lauxlib.c.o
+[3/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lapi.c.o
+[4/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lcode.c.o
+[5/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/ldebug.c.o
+[6/340] Building CXX object CMakeFiles/lavik_resp_protocol.dir/src/redis/password_authenticator.cpp.o
+[7/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/ldo.c.o
+[8/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/ldump.c.o
+[9/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lfunc.c.o
+[10/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lmathlib.c.o
+[11/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lmem.c.o
+[12/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/llex.c.o
+[13/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lgc.c.o
+[14/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lopcodes.c.o
+[15/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lobject.c.o
+[16/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lstate.c.o
+[17/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lparser.c.o
+[18/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lstring.c.o
+[19/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lstrlib.c.o
+[20/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/ltablib.c.o
+[21/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/ltm.c.o
+[22/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/ltable.c.o
+[23/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lzio.c.o
+[24/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lundump.c.o
+[25/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/strbuf.c.o
+[26/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/fpconv.c.o
+[27/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lua_struct.c.o
+[28/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lvm.c.o
+[29/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lua_cmsgpack.c.o
+[30/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lua_cjson.c.o
+[31/340] Building C object CMakeFiles/lavik_lua.dir/third_party/lua/src/lua_bit.c.o
+[32/340] Creating directories for 'bycorf_liburing_build'
+[33/340] Linking C static library liblavik_lua.a
+[34/340] No download step for 'bycorf_liburing_build'
+[35/340] No update step for 'bycorf_liburing_build'
+[36/340] No patch step for 'bycorf_liburing_build'
+[37/340] Building CXX object bycorf/third_party/abseil/absl/base/CMakeFiles/absl_log_severity.dir/log_severity.cc.o
+[38/340] Linking CXX static library bycorf/third_party/abseil/absl/base/libabsl_log_severity.a
+[39/340] Building CXX object bycorf/third_party/abseil/absl/base/CMakeFiles/absl_raw_logging_internal.dir/internal/raw_logging.cc.o
+[40/340] Linking CXX static library bycorf/third_party/abseil/absl/base/libabsl_raw_logging_internal.a
+[41/340] Building CXX object bycorf/third_party/abseil/absl/base/CMakeFiles/absl_spinlock_wait.dir/internal/spinlock_wait.cc.o
+[42/340] Linking CXX static library bycorf/third_party/abseil/absl/base/libabsl_spinlock_wait.a
+[43/340] Performing configure step for 'bycorf_liburing_build'
+prefix                             /usr
+includedir                         /usr/include
+libdir                             /usr/lib
+libdevdir                          /usr/lib
+relativelibdir                     
+mandir                             /usr/man
+datadir                            /usr/share
+libgcc_link_flag                   /usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a
+stringop_overflow                  yes
+array_bounds                       yes
+__kernel_rwf_t                     yes
+__kernel_timespec                  yes
+open_how                           yes
+statx                              yes
+glibc_statx                        yes
+C++                                yes
+has_ucontext                       yes
+has_memfd_create                   yes
+NVMe uring command support         yes
+futex waitv support                yes
+io_uring discard command support   no
+has_idtype_t                       yes
+/mnt/local_nvme/i131/base/bycorf/third_party/liburing/configure: 513: clang: not found
+has_clang                          no
+has_bpftool                        yes
+has_bpf_clang                      no
+has_libbpf                         no
+nolibc                             yes
+has_fanotify                       yes
+ublk_header                        yes
+use sanitizer                      no
+use tsan                           no
+CC                                 /usr/bin/cc
+CXX                                /usr/bin/c++
+[44/340] Building CXX object CMakeFiles/lavik_lease_clock.dir/src/cluster/lease_clock.cpp.o
+[45/340] Linking CXX static library liblavik_lease_clock.a
+[46/340] Building CXX object CMakeFiles/lavik_resp_protocol.dir/src/redis/resp.cpp.o
+[47/340] Building CXX object bycorf/third_party/abseil/absl/base/CMakeFiles/absl_malloc_internal.dir/internal/low_level_alloc.cc.o
+[48/340] Building CXX object CMakeFiles/lavik_sync_transport.dir/src/net/sync_stream.cpp.o
+[49/340] Performing build step for 'bycorf_liburing_build'
+gmake: Entering directory '/mnt/local_nvme/i131/build-base/bycorf/liburing/src'
+     CC setup.ol
+     CC queue.ol
+     CC register.ol
+     CC syscall.ol
+     CC version.ol
+     CC nolibc.ol
+     AR liburing.a
+ar: creating liburing.a
+ RANLIB liburing.a
+gmake: Leaving directory '/mnt/local_nvme/i131/build-base/bycorf/liburing/src'
+[50/340] No install step for 'bycorf_liburing_build'
+[51/340] Completed 'bycorf_liburing_build'
+[52/340] Building CXX object bycorf/third_party/abseil/absl/base/CMakeFiles/absl_base.dir/internal/spinlock.cc.o
+[53/340] Building CXX object bycorf/third_party/abseil/absl/base/CMakeFiles/absl_base.dir/internal/sysinfo.cc.o
+[54/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/io/io.cpp.o
+[55/340] Building CXX object bycorf/third_party/abseil/absl/base/CMakeFiles/absl_base.dir/internal/cycleclock.cc.o
+[56/340] Building CXX object bycorf/third_party/abseil/absl/base/CMakeFiles/absl_base.dir/internal/thread_identity.cc.o
+[57/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/io/backend_options.cpp.o
+[58/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/io/storage.cpp.o
+[59/340] Building CXX object CMakeFiles/lavik_control_transport.dir/src/cluster/control_transport.cpp.o
+[60/340] Building CXX object CMakeFiles/lavik_control_protocol.dir/src/cluster/control_protocol.cpp.o
+[61/340] Building CXX object CMakeFiles/lavik_module.dir/cmake_pch.hxx.gch
+[62/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/io/io_uring_backend.cpp.o
+[63/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/net/http_service.cpp.o
+[64/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/runtime/foreign_executor.cpp.o
+[65/340] Building CXX object CMakeFiles/lavik_module.dir/src/cluster/bootstrap.cpp.o
+[66/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/net/tcp_service.cpp.o
+[67/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/net/server.cpp.o
+[68/340] Building CXX object CMakeFiles/lavik_module.dir/src/cluster/meta_connector.cpp.o
+[69/340] Building CXX object CMakeFiles/lavik_module.dir/src/cluster/authority.cpp.o
+[70/340] Building CXX object CMakeFiles/lavik_module.dir/src/cluster/meta_control.cpp.o
+[71/340] Building CXX object CMakeFiles/lavik_module.dir/src/config.cpp.o
+[72/340] Building CXX object CMakeFiles/lavik_module.dir/src/cluster/node_control.cpp.o
+[73/340] Building CXX object CMakeFiles/lavik_module.dir/src/cluster/runtime.cpp.o
+[74/340] Building CXX object CMakeFiles/lavik_module.dir/src/cluster/topology.cpp.o
+[75/340] Building CXX object CMakeFiles/lavik_module.dir/src/cluster/meta_client.cpp.o
+[76/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/buffer_pool.cpp.o
+[77/340] Building CXX object CMakeFiles/lavik_module.dir/src/logging.cpp.o
+[78/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine.cpp.o
+[79/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/backup.cpp.o
+[80/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/alloc.cpp.o
+[81/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/compact_api.cpp.o
+[82/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/checkpoint.cpp.o
+[83/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/hash_codec.cpp.o
+[84/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/defrag.cpp.o
+[85/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/flush.cpp.o
+[86/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/expire.cpp.o
+[87/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/flush_db.cpp.o
+[88/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/hash_api.cpp.o
+[89/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_sorted_rewrite.cpp.o
+[90/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_hash.cpp.o
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_hash.cpp: In function ‘absl::lts_20250512::StatusOr<lavik::storage::HashGroupSnapshot> lavik::storage::DecodeHashGroup(std::string_view)’:
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_hash.cpp:282:3: warning: missing initializer for member ‘lavik::storage::HashGroupSnapshot::prepared_’ [-Wmissing-field-initializers]
+  282 |   };
+      |   ^
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_hash.cpp: In function ‘absl::lts_20250512::StatusOr<lavik::storage::HashGroupEdit> lavik::storage::ApplyHashGroupEdits(std::string_view, const DigestSeed&, HashGroupEditKind, std::span<const HashEntryView>)’:
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_hash.cpp:384:45: warning: missing initializer for member ‘lavik::storage::HashGroupSnapshot::prepared_’ [-Wmissing-field-initializers]
+  384 |                                 .value_ = {}};
+      |                                             ^
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_hash.cpp: In function ‘absl::lts_20250512::StatusOr<std::vector<lavik::storage::HashGroupSnapshot> > lavik::storage::SplitHashGroup(HashGroupSnapshot, const DigestSeed&, std::size_t)’:
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_hash.cpp:505:79: warning: missing initializer for member ‘lavik::storage::HashGroupSnapshot::prepared_’ [-Wmissing-field-initializers]
+  505 |           .incarnation_ = group.incarnation_, .id_ = current.id_, .value_ = {}};
+      |                                                                               ^
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_hash.cpp: In function ‘absl::lts_20250512::StatusOr<std::vector<lavik::storage::HashGroupSnapshot> > lavik::storage::GroupHashValue(HashValue, uint64_t, const DigestSeed&, std::size_t)’:
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_hash.cpp:542:69: warning: missing initializer for member ‘lavik::storage::HashGroupSnapshot::prepared_’ [-Wmissing-field-initializers]
+  542 |                                           .value_ = std::move(value)},
+      |                                                                     ^
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_hash.cpp: In function ‘absl::lts_20250512::StatusOr<lavik::storage::HashGroupMutationPlan> lavik::storage::PlanHashGroupMutation(const HashGroupDirectory&, std::vector<LoadedHashGroup>, HashGroupMutationKind, std::span<const std::basic_string_view<char> >, std::span<const std::basic_string_view<char> >, std::size_t)’:
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_hash.cpp:831:29: warning: missing initializer for member ‘lavik::storage::HashGroupSnapshot::prepared_’ [-Wmissing-field-initializers]
+  831 |       plan.writes_.push_back({.incarnation_ = plan.root_.incarnation_,
+      |       ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  832 |                               .id_ = id,
+      |                               ~~~~~~~~~~
+  833 |                               .retired_ = true,
+      |                               ~~~~~~~~~~~~~~~~~
+  834 |                               .value_ = {}});
+      |                               ~~~~~~~~~~~~~~
+[91/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_collection.cpp.o
+[92/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/ordered_compact_codec.cpp.o
+[93/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/stream_records.cpp.o
+[94/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/collection_compact_stream.cpp.o
+[95/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_stream.cpp.o
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_stream.cpp: In member function ‘bycorf::Task<absl::lts_20250512::StatusOr<lavik::storage::StreamTrimResult> > lavik::storage::StorageEngine::Impl::StreamPageAccess::Trim(const lavik::storage::StreamTrimRequest&, std::vector<lavik::storage::StreamRecordChange>&, std::vector<long unsigned int>&, uint64_t)’:
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_stream.cpp:534:75: warning: missing initializer for member ‘lavik::storage::StreamTrimResult::first_id_’ [-Wmissing-field-initializers]
+  534 |     StreamTrimResult result{.removed_ = remove, .length_ = length - remove};
+      |                                                                           ^
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_stream.cpp: In member function ‘bycorf::Task<absl::lts_20250512::Status> lavik::storage::StorageEngine::Impl::ExecuteGroupedStreamInspect(WorkerStore&, WorkerStore::PartitionStore&, uint8_t, std::string_view, const lavik::storage::Digest&, lavik::storage::GroupedHashObject::Handle, const lavik::storage::CompactValueCallback&, const lavik::storage::StreamInspectAccess&)’:
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_stream.cpp:959:72: warning: missing initializer for member ‘lavik::storage::StreamGroupSummary::first_pending_’ [-Wmissing-field-initializers]
+  959 |           .name_ = name, .consumers_ = Count(*value, value->size() - 4)};
+      |                                                                        ^
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_stream.cpp:959:72: warning: missing initializer for member ‘lavik::storage::StreamGroupSummary::last_pending_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_stream.cpp:959:72: warning: missing initializer for member ‘lavik::storage::StreamGroupSummary::consumer_pending_’ [-Wmissing-field-initializers]
+[96/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_replication_source.cpp.o
+[97/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_write.cpp.o
+[98/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_ordered_io.cpp.o
+[99/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_read.cpp.o
+[100/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_string.cpp.o
+[101/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_list.cpp.o
+[102/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_zset.cpp.o
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp: In lambda function:
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp:683:25: warning: loop variable ‘<structured bindings>’ creates a copy from type ‘const std::pair<long unsigned int, long unsigned int>’ [-Wrange-loop-construct]
+  683 |         for (const auto [rank, slot] : selection.draws_) {
+      |                         ^~~~~~~~~~~~
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp:683:25: note: use reference type to prevent copying
+  683 |         for (const auto [rank, slot] : selection.draws_) {
+      |                         ^~~~~~~~~~~~
+      |                         &
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp:713:64: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_’ [-Wmissing-field-initializers]
+  713 |                                   .expire_at_ms_ = std::nullopt};
+      |                                                                ^
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp:713:64: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_complete_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp:713:64: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_pending_removed_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp:743:64: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_’ [-Wmissing-field-initializers]
+  743 |                                   .expire_at_ms_ = std::nullopt};
+      |                                                                ^
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp:743:64: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_complete_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp:743:64: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_pending_removed_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp:782:62: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_’ [-Wmissing-field-initializers]
+  782 |                                 .expire_at_ms_ = std::nullopt};
+      |                                                              ^
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp:782:62: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_complete_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp:782:62: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_pending_removed_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp: In lambda function:
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset.cpp:1291:44: warning: unused parameter ‘i’ [-Wunused-parameter]
+ 1291 |     auto check_plan_read = [&](std::size_t i) -> absl::Status {
+      |                                ~~~~~~~~~~~~^
+[103/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_zset_members.cpp.o
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset_members.cpp: In member function ‘bycorf::Task<absl::lts_20250512::StatusOr<lavik::storage::StorageEngine::Impl::SortedSetMemberMutation> > lavik::storage::StorageEngine::Impl::PrepareSortedSetMembers(WorkerStore&, WorkerStore::PartitionStore&, uint8_t, std::string_view, const lavik::storage::Digest&, lavik::storage::GroupedHashObject::Handle, const lavik::storage::OrderedCollectionMutationPlan&, bool, std::optional<std::span<const SortedSetMemberChange> >)’:
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_zset_members.cpp:313:31: warning: missing initializer for member ‘lavik::storage::HashGroupSnapshot::prepared_’ [-Wmissing-field-initializers]
+  313 |         plan.writes_.push_back({.incarnation_ = plan.root_.incarnation_,
+      |         ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  314 |                                 .id_ = id,
+      |                                 ~~~~~~~~~~
+  315 |                                 .retired_ = true,
+      |                                 ~~~~~~~~~~~~~~~~~
+  316 |                                 .value_ = {}});
+      |                                 ~~~~~~~~~~~~~~
+[104/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_hash_random.cpp.o
+[105/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/transfer_api.cpp.o
+[106/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/sorted_set_api.cpp.o
+[107/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_restore.cpp.o
+[108/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_mutation.cpp.o
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_mutation.cpp: In member function ‘absl::lts_20250512::StatusOr<lavik::storage::HashGroupMutationPlan> lavik::storage::StorageEngine::Impl::PrepareGroupedHashMutation(const lavik::storage::GroupedHashObject::Handle&, lavik::storage::HashValue, std::span<const lavik::storage::HashGroupId>, uint64_t, uint64_t)’:
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_mutation.cpp:88:53: warning: missing initializer for member ‘lavik::storage::HashGroupSnapshot::prepared_’ [-Wmissing-field-initializers]
+   88 |                                         .value_ = {}})
+      |                                                     ^
+/mnt/local_nvme/i131/base/src/storage/engine/grouped_mutation.cpp:116:29: warning: missing initializer for member ‘lavik::storage::HashGroupSnapshot::prepared_’ [-Wmissing-field-initializers]
+  116 |       plan.writes_.push_back({.incarnation_ = plan.root_.incarnation_,
+      |       ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  117 |                               .id_ = id,
+      |                               ~~~~~~~~~~
+  118 |                               .retired_ = true,
+      |                               ~~~~~~~~~~~~~~~~~
+  119 |                               .value_ = {}});
+      |                               ~~~~~~~~~~~~~~
+[109/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/collection_ingest.cpp.o
+[110/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_ordered_mutation.cpp.o
+[111/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_metadata.cpp.o
+[112/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/replica_collection.cpp.o
+[113/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_object_index.cpp.o
+[114/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/grouped_lifecycle.cpp.o
+[115/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/hash_tree.cpp.o
+/mnt/local_nvme/i131/base/src/storage/engine/hash_tree.cpp: In member function ‘bycorf::Task<absl::lts_20250512::StatusOr<lavik::storage::HashResult> > lavik::storage::StorageEngine::Impl::ExecuteHashLikeLocked(uint8_t, std::string_view, const lavik::storage::Digest&, const lavik::storage::HashOperation&, lavik::storage::ValueType, lavik::storage::TxShardWrites*, lavik::storage::ReplicationCommandAppend*, const lavik::storage::MutationPrecondition*)’:
+/mnt/local_nvme/i131/base/src/storage/engine/hash_tree.cpp:889:33: warning: missing initializer for member ‘lavik::storage::HashGroupSnapshot::prepared_’ [-Wmissing-field-initializers]
+  889 |           plan.writes_.push_back({.incarnation_ = plan.root_.incarnation_,
+      |           ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  890 |                                   .id_ = id,
+      |                                   ~~~~~~~~~~
+  891 |                                   .retired_ = true,
+      |                                   ~~~~~~~~~~~~~~~~~
+  892 |                                   .value_ = {}});
+      |                                   ~~~~~~~~~~~~~~
+[116/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/indirect_key.cpp.o
+[117/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/list_api.cpp.o
+[118/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/list_tree.cpp.o
+[119/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/metrics.cpp.o
+[120/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/init.cpp.o
+[121/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/replication.cpp.o
+[122/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/redis_export_backlog.cpp.o
+[123/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/read.cpp.o
+[124/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/replication_log.cpp.o
+[125/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/recovery.cpp.o
+[126/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/system_state.cpp.o
+[127/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/format.cpp.o
+[128/340] Building CXX object CMakeFiles/lavik_module.dir/src/memory.cpp.o
+[129/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/tx_cleaner.cpp.o
+[130/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/tomb_raider.cpp.o
+[131/340] Building CXX object CMakeFiles/lavik_module.dir/src/metrics.cpp.o
+[132/340] Building CXX object CMakeFiles/lavik_module.dir/src/replication/replica_applied_frontier.cpp.o
+[133/340] Building CXX object CMakeFiles/lavik_module.dir/src/replication/replication_group.cpp.o
+[134/340] Building CXX object CMakeFiles/lavik_module.dir/src/storage/engine/write.cpp.o
+[135/340] Building CXX object CMakeFiles/lavik_module.dir/src/replication/command.cpp.o
+[136/340] Building CXX object CMakeFiles/lavik_module.dir/src/replication/replication_history.cpp.o
+[137/340] Building CXX object CMakeFiles/lavik_module.dir/src/replication/log_block.cpp.o
+[138/340] Building CXX object CMakeFiles/lavik_module.dir/src/replication/native_replay.cpp.o
+[139/340] Building CXX object CMakeFiles/lavik_module.dir/src/replication/native_reparent.cpp.o
+[140/340] Building CXX object CMakeFiles/lavik_module.dir/src/replication/native_recovery.cpp.o
+[141/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/rdb_collection.cpp.o
+In file included from /mnt/local_nvme/i131/base/src/redis/rdb_stream_encoder.h:26,
+                 from /mnt/local_nvme/i131/base/src/redis/rdb_collection.cpp:24:
+/mnt/local_nvme/i131/base/src/redis/rdb_record_spool.h: In static member function ‘static absl::lts_20250512::StatusOr<lavik::rdb::RecordSpool::Record> lavik::rdb::RecordSpool::Allocate(std::size_t, std::size_t)’:
+/mnt/local_nvme/i131/base/src/redis/rdb_record_spool.h:134:57: warning: missing initializer for member ‘lavik::rdb::RecordSpool::Record::key_’ [-Wmissing-field-initializers]
+  134 |     Record record{.reservation_ = std::move(reservation)};
+      |                                                         ^
+/mnt/local_nvme/i131/base/src/redis/rdb_record_spool.h:134:57: warning: missing initializer for member ‘lavik::rdb::RecordSpool::Record::value_’ [-Wmissing-field-initializers]
+[142/340] Building CXX object CMakeFiles/lavik_module.dir/src/replication/redis_replication.cpp.o
+[143/340] Building CXX object CMakeFiles/lavik_module.dir/src/replication/redis_export.cpp.o
+/mnt/local_nvme/i131/base/src/replication/redis_export.cpp: In member function ‘bool lavik::replication_internal::RedisRdbStreamQueue::TryPush(std::string*, unsigned int)’:
+/mnt/local_nvme/i131/base/src/replication/redis_export.cpp:134:48: warning: unused parameter ‘owner’ [-Wunused-parameter]
+  134 |   bool TryPush(std::string* fragment, unsigned owner) {
+      |                                       ~~~~~~~~~^~~~~
+[144/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/rdb_import.cpp.o
+[145/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/rdb.cpp.o
+In file included from /mnt/local_nvme/i131/base/src/redis/rdb.cpp:33:
+/mnt/local_nvme/i131/base/src/redis/rdb_record_spool.h: In static member function ‘static absl::lts_20250512::StatusOr<lavik::rdb::RecordSpool::Record> lavik::rdb::RecordSpool::Allocate(std::size_t, std::size_t)’:
+/mnt/local_nvme/i131/base/src/redis/rdb_record_spool.h:134:57: warning: missing initializer for member ‘lavik::rdb::RecordSpool::Record::key_’ [-Wmissing-field-initializers]
+  134 |     Record record{.reservation_ = std::move(reservation)};
+      |                                                         ^
+/mnt/local_nvme/i131/base/src/redis/rdb_record_spool.h:134:57: warning: missing initializer for member ‘lavik::rdb::RecordSpool::Record::value_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/rdb.cpp: In static member function ‘static absl::lts_20250512::StatusOr<lavik::rdb::RecordSpool::Record> lavik::rdb::{anonymous}::StreamInput::String(lavik::rdb::{anonymous}::Reader*)’:
+/mnt/local_nvme/i131/base/src/redis/rdb.cpp:1744:70: warning: missing initializer for member ‘lavik::rdb::RecordSpool::Record::key_’ [-Wmissing-field-initializers]
+ 1744 |     RecordSpool::Record result{.reservation_ = std::move(reservation)};
+      |                                                                      ^
+/mnt/local_nvme/i131/base/src/redis/rdb.cpp:1744:70: warning: missing initializer for member ‘lavik::rdb::RecordSpool::Record::value_’ [-Wmissing-field-initializers]
+[146/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/cluster_command.cpp.o
+[147/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/function_catalog.cpp.o
+[148/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/backup.cpp.o
+/mnt/local_nvme/i131/base/src/redis/backup.cpp: In member function ‘void lavik::{anonymous}::RdbOutputQueue::EndEntry(unsigned int)’:
+/mnt/local_nvme/i131/base/src/redis/backup.cpp:88:26: warning: unused parameter ‘owner’ [-Wunused-parameter]
+   88 |   void EndEntry(unsigned owner) {
+      |                 ~~~~~~~~~^~~~~
+[149/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/blocking_wait.cpp.o
+[150/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/hash_command.cpp.o
+[151/340] Building CXX object CMakeFiles/lavik_module.dir/src/replication/replication.cpp.o
+[152/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/monitor.cpp.o
+[153/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/list_command.cpp.o
+[154/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/lua_eval.cpp.o
+[155/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/pubsub.cpp.o
+[156/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/slowlog.cpp.o
+[157/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/command.cpp.o
+/mnt/local_nvme/i131/base/src/redis/command.cpp: In function ‘bycorf::Task<std::__cxx11::basic_string<char> > lavik::{anonymous}::ExecuteExecSequentialSort(const lavik::CommandRequest&, const std::vector<ExecKey>&, std::vector<lavik::storage::TxShardWrites>&, bool)’:
+/mnt/local_nvme/i131/base/src/redis/command.cpp:6587:71: warning: missing initializer for member ‘lavik::SortExecKey::name_’ [-Wmissing-field-initializers]
+ 6587 |         .digest_ = key.digest_, .owner_ = key.owner_, .arg_ = key.arg_});
+      |                                                                       ^
+/mnt/local_nvme/i131/base/src/redis/command.cpp: In function ‘bycorf::Task<std::__cxx11::basic_string<char> > lavik::{anonymous}::ExecuteLuaRedisCall(const lavik::CommandRequest&, lavik::LuaRedisCall, std::span<const std::__cxx11::basic_string<char> >, lavik::tx::Transaction*, std::vector<lavik::storage::TxShardWrites>*, const std::shared_ptr<lavik::BlockingNotificationCapture>&, std::vector<lavik::CapturedReplicationCommand>*, lavik::LuaExecution*, lavik::ConnectionContext*)’:
+/mnt/local_nvme/i131/base/src/redis/command.cpp:7879:62: warning: missing initializer for member ‘lavik::SortExecKey::digest_’ [-Wmissing-field-initializers]
+ 7879 |     for (const auto& key : declared_keys) sort_keys.push_back({.name_ = key});
+      |                                           ~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~
+[158/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/set_command.cpp.o
+[159/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/command_table.cpp.o
+[160/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/string_command.cpp.o
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp: In lambda function:
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:640:5: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_’ [-Wmissing-field-initializers]
+  640 |     };
+      |     ^
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:640:5: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_complete_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:640:5: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_pending_removed_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp: In lambda function:
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:808:7: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_’ [-Wmissing-field-initializers]
+  808 |       };
+      |       ^
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:808:7: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_complete_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:808:7: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_pending_removed_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp: In lambda function:
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:819:80: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_’ [-Wmissing-field-initializers]
+  819 |                                                   .expire_at_ms_ = std::nullopt}
+      |                                                                                ^
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:819:80: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_complete_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:819:80: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_pending_removed_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:839:9: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_’ [-Wmissing-field-initializers]
+  839 |         };
+      |         ^
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:839:9: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_complete_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:839:9: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_pending_removed_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:856:73: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_’ [-Wmissing-field-initializers]
+  856 |                                            .expire_at_ms_ = std::nullopt};
+      |                                                                         ^
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:856:73: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_complete_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:856:73: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_pending_removed_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:864:7: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_’ [-Wmissing-field-initializers]
+  864 |       };
+      |       ^
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:864:7: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_complete_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/string_command.cpp:864:7: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_pending_removed_’ [-Wmissing-field-initializers]
+[161/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/sort_command.cpp.o
+[162/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/zset_command.cpp.o
+/mnt/local_nvme/i131/base/src/redis/zset_command.cpp: In lambda function:
+/mnt/local_nvme/i131/base/src/redis/zset_command.cpp:2306:40: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_’ [-Wmissing-field-initializers]
+ 2306 |           .expire_at_ms_ = std::nullopt};
+      |                                        ^
+/mnt/local_nvme/i131/base/src/redis/zset_command.cpp:2306:40: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_complete_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/zset_command.cpp:2306:40: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_pending_removed_’ [-Wmissing-field-initializers]
+[163/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/stream_command.cpp.o
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp: In function ‘absl::lts_20250512::StatusOr<lavik::storage::CompactValueUpdate> lavik::{anonymous}::Changed(Stream)’:
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:788:67: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_’ [-Wmissing-field-initializers]
+  788 |                                      .expire_at_ms_ = std::nullopt};
+      |                                                                   ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:788:67: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_trim_complete_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:788:67: warning: missing initializer for member ‘lavik::storage::CompactValueUpdate::stream_pending_removed_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp: In function ‘bycorf::Task<absl::lts_20250512::Status> lavik::{anonymous}::RunCompact(const lavik::CommandRequest&, const lavik::storage::Digest*, lavik::storage::TxShardWrites*, bool, const lavik::storage::CompactValueCallback&, lavik::storage::ReplicationCommandAppend*)’:
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:977:66: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::pending_scan_’ [-Wmissing-field-initializers]
+  977 |       storage::StreamGroupAccess group{.group_ = request.args_[3]};
+      |                                                                  ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:977:66: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::remove_consumer_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:993:66: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::pending_scan_’ [-Wmissing-field-initializers]
+  993 |       storage::StreamGroupAccess group{.group_ = request.args_[3]};
+      |                                                                  ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:993:66: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::remove_consumer_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1007:55: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::pending_scan_’ [-Wmissing-field-initializers]
+ 1007 |           .group_ = request.args_[3], .destroy_ = true};
+      |                                                       ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1007:55: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::remove_consumer_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1039:59: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::remove_consumer_’ [-Wmissing-field-initializers]
+ 1039 |           .group_ = a[2], .pending_scan_ = std::move(scan)};
+      |                                                           ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1070:36: warning: missing initializer for member ‘lavik::storage::StreamRangeAccess::selected_ids_’ [-Wmissing-field-initializers]
+ 1070 |               .load_entries_ = true}};
+      |                                    ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1070:36: warning: missing initializer for member ‘lavik::storage::StreamPendingAccess::consumer_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1070:37: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::remove_consumer_’ [-Wmissing-field-initializers]
+ 1070 |               .load_entries_ = true}};
+      |                                     ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1074:72: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::pending_scan_’ [-Wmissing-field-initializers]
+ 1074 |                                        .consumers_ = {request.args_[3]}};
+      |                                                                        ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1074:72: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::remove_consumer_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp: In function ‘bycorf::Task<absl::lts_20250512::StatusOr<lavik::{anonymous}::ReadOneResult> > lavik::{anonymous}::ReadOneLocal(uint8_t, std::string, Id, bool, bool, std::string, std::string, bool, bool, uint64_t, const lavik::storage::Digest*, lavik::storage::TxShardWrites*, const lavik::CommandRequest*)’:
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1368:60: warning: missing initializer for member ‘lavik::storage::StreamRangeAccess::selected_ids_’ [-Wmissing-field-initializers]
+ 1368 |                                    .first_exclusive_ = true},
+      |                                                            ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1372:50: warning: missing initializer for member ‘lavik::{anonymous}::ReadOneResult::entries_’ [-Wmissing-field-initializers]
+ 1372 |         co_return ReadOneResult{.cursor_ = cursor};
+      |                                                  ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1372:50: warning: missing initializer for member ‘lavik::{anonymous}::ReadOneResult::stream_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1375:76: warning: missing initializer for member ‘lavik::{anonymous}::ReadOneResult::entries_’ [-Wmissing-field-initializers]
+ 1375 |     co_return ReadOneResult{.cursor_ = cursor, .stream_ = std::move(*state)};
+      |                                                                            ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1390:57: warning: missing initializer for member ‘lavik::{anonymous}::ReadOneResult::stream_’ [-Wmissing-field-initializers]
+ 1390 |   ReadOneResult result{.entries_ = {}, .cursor_ = cursor};
+      |                                                         ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1492:60: warning: missing initializer for member ‘lavik::storage::StreamRangeAccess::selected_ids_’ [-Wmissing-field-initializers]
+ 1492 |                                    .first_exclusive_ = true};
+      |                                                            ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1498:59: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::pending_scan_’ [-Wmissing-field-initializers]
+ 1498 |                                    .entry_ids_only_ = true};
+      |                                                           ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1498:59: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::remove_consumer_’ [-Wmissing-field-initializers]
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1509:38: warning: missing initializer for member ‘lavik::storage::StreamRangeAccess::selected_ids_’ [-Wmissing-field-initializers]
+ 1509 |                 .load_entries_ = true},
+      |                                      ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1510:32: warning: missing initializer for member ‘lavik::storage::StreamGroupAccess::remove_consumer_’ [-Wmissing-field-initializers]
+ 1510 |         .entry_ids_only_ = true};
+      |                                ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:1539:70: warning: missing initializer for member ‘lavik::storage::StreamRangeAccess::selected_ids_’ [-Wmissing-field-initializers]
+ 1539 |                                      .count_ = result.entries_.size()};
+      |                                                                      ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp: In function ‘bycorf::Task<lavik::CommandReply> lavik::{anonymous}::ExecuteImpl(const lavik::CommandRequest&, const lavik::storage::Digest*, lavik::storage::TxShardWrites*, lavik::ReplyBuilder&, uint64_t)’:
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:2148:76: warning: missing initializer for member ‘lavik::storage::StreamRangeAccess::selected_ids_’ [-Wmissing-field-initializers]
+ 2148 |                                                               : xinfo_count},
+      |                                                                            ^
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp: In lambda function:
+/mnt/local_nvme/i131/base/src/redis/stream_command.cpp:2664:56: warning: missing initializer for member ‘lavik::{anonymous}::Group::summary_’ [-Wmissing-field-initializers]
+ 2664 |                                          .pending_ = {}});
+      |                                                        ^
+[164/340] Building CXX object CMakeFiles/lavik_module.dir/src/tx/transaction.cpp.o
+[165/340] Building CXX object CMakeFiles/lavik_module.dir/src/redis/server.cpp.o
+[166/340] Building CXX object CMakeFiles/lavik_module.dir/src/tx/tx_shard.cpp.o
+[167/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/runtime/runtime.cpp.o
+[168/340] Building CXX object CMakeFiles/lavik.dir/app/mimalloc_new_delete.cpp.o
+[169/340] Building CXX object CMakeFiles/lavik.dir/app/lavik.cpp.o
+[170/340] Building CXX object bycorf/third_party/abseil/absl/base/CMakeFiles/absl_base.dir/internal/unscaledcycleclock.cc.o
+[171/340] Linking CXX static library bycorf/third_party/abseil/absl/base/libabsl_base.a
+[172/340] Linking CXX static library bycorf/third_party/abseil/absl/base/libabsl_malloc_internal.a
+[173/340] Building CXX object bycorf/third_party/abseil/absl/base/CMakeFiles/absl_throw_delegate.dir/internal/throw_delegate.cc.o
+[174/340] Linking CXX static library bycorf/third_party/abseil/absl/base/libabsl_throw_delegate.a
+[175/340] Building CXX object bycorf/third_party/abseil/absl/base/CMakeFiles/absl_strerror.dir/internal/strerror.cc.o
+[176/340] Linking CXX static library bycorf/third_party/abseil/absl/base/libabsl_strerror.a
+[177/340] Building CXX object bycorf/third_party/abseil/absl/base/CMakeFiles/absl_tracing_internal.dir/internal/tracing.cc.o
+[178/340] Linking CXX static library bycorf/third_party/abseil/absl/base/libabsl_tracing_internal.a
+[179/340] Building CXX object bycorf/CMakeFiles/bycorf_rpc.dir/src/rpc/rpc.cpp.o
+[180/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/net/tcp_stream.cpp.o
+[181/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/net/tls.cpp.o
+[182/340] Building CXX object bycorf/third_party/abseil/absl/crc/CMakeFiles/absl_crc_cpu_detect.dir/internal/cpu_detect.cc.o
+[183/340] Linking CXX static library bycorf/third_party/abseil/absl/crc/libabsl_crc_cpu_detect.a
+[184/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/runtime/worker.cpp.o
+[185/340] Building CXX object bycorf/third_party/abseil/absl/container/CMakeFiles/absl_hashtablez_sampler.dir/internal/hashtablez_sampler.cc.o
+[186/340] Building CXX object bycorf/third_party/abseil/absl/container/CMakeFiles/absl_hashtablez_sampler.dir/internal/hashtablez_sampler_force_weak_definition.cc.o
+[187/340] Building CXX object bycorf/third_party/abseil/absl/crc/CMakeFiles/absl_crc_internal.dir/internal/crc.cc.o
+[188/340] Building CXX object bycorf/CMakeFiles/bycorf.dir/src/net/tcp_listener.cpp.o
+[189/340] Building CXX object bycorf/third_party/abseil/absl/crc/CMakeFiles/absl_crc32c.dir/crc32c.cc.o
+[190/340] Building CXX object bycorf/third_party/abseil/absl/crc/CMakeFiles/absl_crc32c.dir/internal/crc_memcpy_x86_arm_combined.cc.o
+../base/bycorf/third_party/abseil/absl/crc/internal/crc_memcpy_x86_arm_combined.cc: In function ‘void absl::lts_20250512::crc_internal::{anonymous}::LargeTailCopy(absl::lts_20250512::crc32c_t*, char**, const char**, size_t, size_t)’:
+../base/bycorf/third_party/abseil/absl/crc/internal/crc_memcpy_x86_arm_combined.cc:97:31: warning: ignoring attributes on template argument ‘absl::lts_20250512::crc_internal::V128’ {aka ‘__m128i’} [-Wignored-attributes]
+   97 |   std::array<V128, vec_regions> data;
+      |                               ^
+../base/bycorf/third_party/abseil/absl/crc/internal/crc_memcpy_x86_arm_combined.cc: In member function ‘absl::lts_20250512::crc32c_t absl::lts_20250512::crc_internal::AcceleratedCrcMemcpyEngine<vec_regions, int_regions>::Compute(void*, const void*, std::size_t, absl::lts_20250512::crc32c_t) const’:
+../base/bycorf/third_party/abseil/absl/crc/internal/crc_memcpy_x86_arm_combined.cc:245:31: warning: ignoring attributes on template argument ‘absl::lts_20250512::crc_internal::V128’ {aka ‘__m128i’} [-Wignored-attributes]
+  245 |   std::array<V128, vec_regions> vec_data;
+      |                               ^
+[191/340] Building CXX object bycorf/third_party/abseil/absl/container/CMakeFiles/absl_raw_hash_set.dir/internal/raw_hash_set.cc.o
+[192/340] Building CXX object bycorf/third_party/abseil/absl/crc/CMakeFiles/absl_crc32c.dir/internal/crc_memcpy_fallback.cc.o
+[193/340] Building CXX object bycorf/third_party/abseil/absl/crc/CMakeFiles/absl_crc_internal.dir/internal/crc_x86_arm_combined.cc.o
+[194/340] Linking CXX static library bycorf/third_party/abseil/absl/crc/libabsl_crc_internal.a
+[195/340] Building CXX object bycorf/third_party/abseil/absl/debugging/CMakeFiles/absl_stacktrace.dir/stacktrace.cc.o
+[196/340] Building CXX object bycorf/third_party/abseil/absl/debugging/CMakeFiles/absl_debugging_internal.dir/internal/address_is_readable.cc.o
+[197/340] Building CXX object bycorf/third_party/abseil/absl/debugging/CMakeFiles/absl_debugging_internal.dir/internal/elf_mem_image.cc.o
+[198/340] Building CXX object bycorf/third_party/abseil/absl/crc/CMakeFiles/absl_crc32c.dir/internal/crc_non_temporal_memcpy.cc.o
+[199/340] Building CXX object bycorf/third_party/abseil/absl/debugging/CMakeFiles/absl_demangle_rust.dir/internal/demangle_rust.cc.o
+[200/340] Building CXX object bycorf/third_party/abseil/absl/debugging/CMakeFiles/absl_debugging_internal.dir/internal/vdso_support.cc.o
+[201/340] Linking CXX static library bycorf/third_party/abseil/absl/debugging/libabsl_debugging_internal.a
+[202/340] Building CXX object bycorf/third_party/abseil/absl/debugging/CMakeFiles/absl_utf8_for_code_point.dir/internal/utf8_for_code_point.cc.o
+[203/340] Building CXX object bycorf/third_party/abseil/absl/debugging/CMakeFiles/absl_symbolize.dir/symbolize.cc.o
+[204/340] Linking CXX static library bycorf/third_party/abseil/absl/debugging/libabsl_stacktrace.a
+[205/340] Linking CXX static library bycorf/third_party/abseil/absl/debugging/libabsl_utf8_for_code_point.a
+[206/340] Building CXX object bycorf/third_party/abseil/absl/debugging/CMakeFiles/absl_leak_check.dir/leak_check.cc.o
+[207/340] Linking CXX static library bycorf/third_party/abseil/absl/debugging/libabsl_leak_check.a
+[208/340] Building CXX object bycorf/third_party/abseil/absl/crc/CMakeFiles/absl_crc_cord_state.dir/internal/crc_cord_state.cc.o
+[209/340] Building CXX object bycorf/third_party/abseil/absl/debugging/CMakeFiles/absl_demangle_internal.dir/internal/demangle.cc.o
+[210/340] Building CXX object bycorf/third_party/abseil/absl/debugging/CMakeFiles/absl_decode_rust_punycode.dir/internal/decode_rust_punycode.cc.o
+[211/340] Linking CXX static library bycorf/third_party/abseil/absl/debugging/libabsl_decode_rust_punycode.a
+[212/340] Linking CXX static library bycorf/third_party/abseil/absl/debugging/libabsl_demangle_rust.a
+[213/340] Linking CXX static library bycorf/third_party/abseil/absl/debugging/libabsl_demangle_internal.a
+[214/340] Building CXX object bycorf/third_party/abseil/absl/profiling/CMakeFiles/absl_exponential_biased.dir/internal/exponential_biased.cc.o
+[215/340] Linking CXX static library bycorf/third_party/abseil/absl/profiling/libabsl_exponential_biased.a
+[216/340] Building CXX object bycorf/third_party/abseil/absl/hash/CMakeFiles/absl_low_level_hash.dir/internal/low_level_hash.cc.o
+[217/340] Building CXX object bycorf/third_party/abseil/absl/hash/CMakeFiles/absl_city.dir/internal/city.cc.o
+[218/340] Linking CXX static library bycorf/third_party/abseil/absl/hash/libabsl_city.a
+[219/340] Building CXX object bycorf/third_party/abseil/absl/hash/CMakeFiles/absl_hash.dir/internal/hash.cc.o
+[220/340] Building CXX object bycorf/third_party/abseil/absl/numeric/CMakeFiles/absl_int128.dir/int128.cc.o
+[221/340] Linking CXX static library bycorf/third_party/abseil/absl/numeric/libabsl_int128.a
+[222/340] Linking CXX static library bycorf/third_party/abseil/absl/hash/libabsl_low_level_hash.a
+[223/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_string_view.dir/string_view.cc.o
+[224/340] Linking CXX static library bycorf/third_party/abseil/absl/strings/libabsl_string_view.a
+[225/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/ascii.cc.o
+[226/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/charconv.cc.o
+[227/340] Building CXX object bycorf/third_party/abseil/absl/status/CMakeFiles/absl_status.dir/internal/status_internal.cc.o
+[228/340] Building CXX object bycorf/third_party/abseil/absl/status/CMakeFiles/absl_statusor.dir/statusor.cc.o
+[229/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/internal/charconv_bigint.cc.o
+[230/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/internal/charconv_parse.cc.o
+[231/340] Building CXX object bycorf/third_party/abseil/absl/status/CMakeFiles/absl_status.dir/status_payload_printer.cc.o
+[232/340] Building CXX object bycorf/third_party/abseil/absl/status/CMakeFiles/absl_status.dir/status.cc.o
+[233/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/internal/damerau_levenshtein_distance.cc.o
+[234/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/internal/memutil.cc.o
+[235/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/escaping.cc.o
+[236/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/internal/stringify_sink.cc.o
+[237/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/match.cc.o
+[238/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/numbers.cc.o
+[239/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings_internal.dir/internal/utf8.cc.o
+[240/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/str_cat.cc.o
+[241/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings_internal.dir/internal/ostringstream.cc.o
+[242/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/str_split.cc.o
+[243/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/str_replace.cc.o
+[244/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings.dir/substitute.cc.o
+[245/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_strings_internal.dir/internal/escaping.cc.o
+[246/340] Linking CXX static library bycorf/third_party/abseil/absl/strings/libabsl_strings_internal.a
+[247/340] Linking CXX static library bycorf/third_party/abseil/absl/strings/libabsl_strings.a
+[248/340] Linking CXX static library bycorf/third_party/abseil/absl/debugging/libabsl_symbolize.a
+[249/340] Linking CXX static library bycorf/third_party/abseil/absl/hash/libabsl_hash.a
+[250/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_str_format_internal.dir/internal/str_format/extension.cc.o
+[251/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_str_format_internal.dir/internal/str_format/output.cc.o
+[252/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_str_format_internal.dir/internal/str_format/arg.cc.o
+[253/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_str_format_internal.dir/internal/str_format/parser.cc.o
+[254/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_str_format_internal.dir/internal/str_format/bind.cc.o
+[255/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_str_format_internal.dir/internal/str_format/float_conversion.cc.o
+[256/340] Linking CXX static library bycorf/third_party/abseil/absl/strings/libabsl_str_format_internal.a
+[257/340] Linking CXX static library bycorf/third_party/abseil/absl/crc/libabsl_crc32c.a
+[258/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_cord_internal.dir/internal/cord_internal.cc.o
+[259/340] Linking CXX static library bycorf/third_party/abseil/absl/crc/libabsl_crc_cord_state.a
+[260/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_cord_internal.dir/internal/cord_rep_btree_navigator.cc.o
+[261/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_cord_internal.dir/internal/cord_rep_btree.cc.o
+[262/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_cord_internal.dir/internal/cord_rep_btree_reader.cc.o
+[263/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_cord_internal.dir/internal/cord_rep_crc.cc.o
+[264/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_cordz_functions.dir/internal/cordz_functions.cc.o
+[265/340] Linking CXX static library bycorf/third_party/abseil/absl/strings/libabsl_cordz_functions.a
+[266/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_cord_internal.dir/internal/cord_rep_consume.cc.o
+[267/340] Linking CXX static library bycorf/third_party/abseil/absl/strings/libabsl_cord_internal.a
+[268/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_cordz_handle.dir/internal/cordz_handle.cc.o
+[269/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_graphcycles_internal.dir/internal/graphcycles.cc.o
+[270/340] Linking CXX static library bycorf/third_party/abseil/absl/synchronization/libabsl_graphcycles_internal.a
+[271/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_cordz_info.dir/internal/cordz_info.cc.o
+[272/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_cord.dir/cord_analysis.cc.o
+[273/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_kernel_timeout_internal.dir/internal/kernel_timeout.cc.o
+[274/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_synchronization.dir/barrier.cc.o
+[275/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_synchronization.dir/blocking_counter.cc.o
+[276/340] Building CXX object bycorf/third_party/abseil/absl/strings/CMakeFiles/absl_cord.dir/cord.cc.o
+[277/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_synchronization.dir/internal/create_thread_identity.cc.o
+[278/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_synchronization.dir/internal/futex_waiter.cc.o
+[279/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_synchronization.dir/internal/win32_waiter.cc.o
+[280/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_synchronization.dir/internal/sem_waiter.cc.o
+[281/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_synchronization.dir/internal/pthread_waiter.cc.o
+[282/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_synchronization.dir/internal/per_thread_sem.cc.o
+[283/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_synchronization.dir/internal/stdcpp_waiter.cc.o
+[284/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_synchronization.dir/internal/waiter_base.cc.o
+[285/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time.dir/duration.cc.o
+[286/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_synchronization.dir/notification.cc.o
+[287/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time.dir/clock.cc.o
+[288/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time.dir/format.cc.o
+[289/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time.dir/civil_time.cc.o
+[290/340] Building CXX object bycorf/third_party/abseil/absl/synchronization/CMakeFiles/absl_synchronization.dir/mutex.cc.o
+[291/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_civil_time.dir/internal/cctz/src/civil_time_detail.cc.o
+[292/340] Linking CXX static library bycorf/third_party/abseil/absl/time/libabsl_civil_time.a
+[293/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time.dir/time.cc.o
+[294/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time_zone.dir/internal/cctz/src/time_zone_fixed.cc.o
+[295/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time_zone.dir/internal/cctz/src/time_zone_format.cc.o
+[296/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time_zone.dir/internal/cctz/src/time_zone_if.cc.o
+[297/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time_zone.dir/internal/cctz/src/time_zone_libc.cc.o
+[298/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time_zone.dir/internal/cctz/src/time_zone_info.cc.o
+[299/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time_zone.dir/internal/cctz/src/time_zone_impl.cc.o
+[300/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time_zone.dir/internal/cctz/src/time_zone_posix.cc.o
+[301/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/alloc-aligned.c.o
+[302/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/alloc.c.o
+[303/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time_zone.dir/internal/cctz/src/zone_info_source.cc.o
+[304/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/arena-meta.c.o
+[305/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/alloc-posix.c.o
+[306/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/arena.c.o
+[307/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/init.c.o
+[308/340] Building CXX object bycorf/third_party/abseil/absl/time/CMakeFiles/absl_time_zone.dir/internal/cctz/src/time_zone_lookup.cc.o
+[309/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/bitmap.c.o
+[310/340] Linking CXX static library bycorf/third_party/abseil/absl/time/libabsl_time_zone.a
+[311/340] Linking CXX static library bycorf/third_party/abseil/absl/time/libabsl_time.a
+[312/340] Linking CXX static library bycorf/third_party/abseil/absl/synchronization/libabsl_kernel_timeout_internal.a
+[313/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/libc.c.o
+[314/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/heap.c.o
+[315/340] Linking CXX static library bycorf/third_party/abseil/absl/synchronization/libabsl_synchronization.a
+[316/340] Linking CXX static library bycorf/third_party/abseil/absl/container/libabsl_hashtablez_sampler.a
+[317/340] Linking CXX static library bycorf/third_party/abseil/absl/strings/libabsl_cordz_handle.a
+[318/340] Linking CXX static library bycorf/third_party/abseil/absl/strings/libabsl_cordz_info.a
+[319/340] Linking CXX static library bycorf/third_party/abseil/absl/strings/libabsl_cord.a
+[320/340] Linking CXX static library bycorf/third_party/abseil/absl/container/libabsl_raw_hash_set.a
+[321/340] Linking CXX static library bycorf/third_party/abseil/absl/status/libabsl_status.a
+[322/340] Linking CXX static library bycorf/third_party/abseil/absl/status/libabsl_statusor.a
+[323/340] Linking CXX static library liblavik_resp_protocol.a
+[324/340] Linking CXX static library liblavik_sync_transport.a
+[325/340] Linking CXX static library liblavik_control_protocol.a
+[326/340] Linking CXX static library bycorf/libbycorf.a
+[327/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/options.c.o
+[328/340] Linking CXX static library liblavik_control_transport.a
+[329/340] Linking CXX static library bycorf/libbycorf_rpc.a
+[330/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/os.c.o
+[331/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/page-map.c.o
+[332/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/page.c.o
+[333/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/random.c.o
+[334/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/stats.c.o
+[335/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/theap.c.o
+[336/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/threadlocal.c.o
+[337/340] Building C object third_party/mimalloc/CMakeFiles/mimalloc-static.dir/src/prim/prim.c.o
+[338/340] Linking C static library third_party/mimalloc/libmimalloc.a
+[339/340] Linking CXX static library liblavik_module.a
+[340/340] Linking CXX executable lavik

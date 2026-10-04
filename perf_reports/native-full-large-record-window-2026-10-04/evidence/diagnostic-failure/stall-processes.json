@@ -1,0 +1,249 @@
+{
+  "captured_at_utc": "2026-10-04T13:04:27.200396+00:00",
+  "scope": "read-only /proc snapshots of the active benchmark runner and exact main binary processes; writer is a runner thread, not a separate process",
+  "processes": [
+    {
+      "pid": 4104987,
+      "argv": [
+        "/usr/bin/python3",
+        "/mnt/local_nvme/i131/bench-dev/scripts/bench_native_full_sync.py",
+        "--runtime-revision",
+        "62509c93d40c2480f5046b71454db6cf95801b04",
+        "--build-description",
+        "GCC13 Release native O3 IPO/LTO; io_uring; test faults off",
+        "--data-file-mib",
+        "2048",
+        "--max-memory-mib",
+        "2048",
+        "--backlog-mib",
+        "64",
+        "--queue-mib",
+        "16",
+        "--flush-ms",
+        "100",
+        "--timeout",
+        "900",
+        "--workload",
+        "large-string",
+        "--keys",
+        "8",
+        "--value-bytes",
+        "16777216",
+        "--rtt-ms",
+        "20",
+        "--source-workers",
+        "1",
+        "--target-workers",
+        "1",
+        "--source-cpus",
+        "0",
+        "--target-cpus",
+        "1",
+        "--client-cpus",
+        "6-7",
+        "--writer-warmup",
+        "5",
+        "--write-rate",
+        "1",
+        "--writer-mode",
+        "transactional-set",
+        "--binary",
+        "/mnt/local_nvme/i131/bin/main/lavik",
+        "--revision",
+        "25e159418603a95c1b2cca68173b329067e3ef48",
+        "--label",
+        "main",
+        "--run-dir",
+        "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20/r1-main",
+        "--capture"
+      ],
+      "status": "Name:\tpython3\nUmask:\t0002\nState:\tS (sleeping)\nTgid:\t4104987\nNgid:\t0\nPid:\t4104987\nPPid:\t4095246\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t64\nGroups:\t4 24 27 30 105 1000 \nNStgid:\t4104987\nNSpid:\t4104987\nNSpgid:\t4095244\nNSsid:\t4095244\nKthread:\t0\nVmPeak:\t  328124 kB\nVmSize:\t  197036 kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t  140260 kB\nVmRSS:\t   42268 kB\nRssAnon:\t   30272 kB\nRssFile:\t   11996 kB\nRssShmem:\t       0 kB\nVmData:\t   96380 kB\nVmStk:\t     132 kB\nVmExe:\t    2956 kB\nVmLib:\t    6456 kB\nVmPTE:\t     152 kB\nVmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t1\nuntag_mask:\t0xffffffffffffffff\nThreads:\t2\nSigQ:\t0/257070\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000001001004\nSigCgt:\t0000000100000002\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\nSpeculation_Store_Bypass:\tvulnerable\nSpeculationIndirectBranch:\talways enabled\nCpus_allowed:\tc0\nCpus_allowed_list:\t6-7\nMems_allowed:\t00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t10459\nnonvoluntary_ctxt_switches:\t4\nx86_Thread_features:\t\nx86_Thread_features_locked:\t\n",
+      "tasks": [
+        {
+          "tid": 4104987,
+          "comm": "python3",
+          "wchan": "0",
+          "stat": "4104987 (python3) R 4095246 4095244 4095244 0 -1 4194304 14111 8114 0 0 44 19 2 3 20 0 2 0 346894181 201764864 10555 18446744073709551615 4325376 7352253 140734412162448 0 0 0 0 16781316 2 0 0 0 17 7 0 0 0 0 0 10653128 12216448 652001280 140734412166016 140734412166759 140734412166759 140734412169191 0"
+        },
+        {
+          "tid": 4105060,
+          "comm": "python3",
+          "wchan": "poll_schedule_timeout.constprop.0",
+          "stat": "4105060 (python3) R 4095246 4095244 4095244 0 -1 4194368 319 8114 0 0 27 8 2 3 20 0 2 0 346894330 201764864 10555 18446744073709551615 4325376 7352253 140734412162448 0 0 0 0 16781316 2 0 0 0 -1 7 0 0 0 0 0 10653128 12216448 652001280 140734412166016 140734412166759 140734412166759 140734412169191 0"
+        }
+      ]
+    },
+    {
+      "pid": 4105035,
+      "argv": [
+        "/mnt/local_nvme/i131/bin/main/lavik",
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        "35579",
+        "--threads",
+        "1",
+        "--no-pin-workers",
+        "--metrics-port",
+        "52701",
+        "--recv-buffers-per-worker",
+        "0",
+        "--registered-buffer-mb-per-worker",
+        "64",
+        "--max-memory",
+        "2147483648",
+        "--repl-backlog-size",
+        "64mb",
+        "--replication-publish-queue-mb-per-worker",
+        "16",
+        "--flush-max-ms",
+        "100",
+        "--data-file",
+        "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20/r1-main/source/data",
+        "--rdb-dir",
+        "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20/r1-main/source",
+        "--logtostderr"
+      ],
+      "status": "Name:\tlavik\nUmask:\t0002\nState:\tS (sleeping)\nTgid:\t4105035\nNgid:\t0\nPid:\t4105035\nPPid:\t4104987\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t64\nGroups:\t4 24 27 30 105 1000 \nNStgid:\t4105035\nNSpid:\t4105035\nNSpgid:\t4095244\nNSsid:\t4095244\nKthread:\t0\nVmPeak:\t 1288436 kB\nVmSize:\t 1222900 kB\nVmLck:\t       0 kB\nVmPin:\t   64764 kB\nVmHWM:\t  421132 kB\nVmRSS:\t  291340 kB\nRssAnon:\t  278464 kB\nRssFile:\t   12876 kB\nRssShmem:\t       0 kB\nVmData:\t 1071768 kB\nVmStk:\t     132 kB\nVmExe:\t   13312 kB\nVmLib:\t    2260 kB\nVmPTE:\t     812 kB\nVmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t0\nuntag_mask:\t0xffffffffffffffff\nThreads:\t4\nSigQ:\t0/257070\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000001004\nSigCgt:\t0000000100004002\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\nSpeculation_Store_Bypass:\tvulnerable\nSpeculationIndirectBranch:\talways enabled\nCpus_allowed:\t01\nCpus_allowed_list:\t0\nMems_allowed:\t00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t5\nnonvoluntary_ctxt_switches:\t1\nx86_Thread_features:\t\nx86_Thread_features_locked:\t\n",
+      "tasks": [
+        {
+          "tid": 4105035,
+          "comm": "lavik",
+          "wchan": "poll_schedule_timeout.constprop.0",
+          "stat": "4105035 (lavik) S 4104987 4095244 4095244 0 -1 4194304 20997 0 0 0 0 2 0 0 20 0 4 0 346894201 1252249600 72819 18446744073709551615 103773234720768 103773248350073 140735061518624 0 0 0 0 4100 16386 1 0 0 17 0 0 0 0 0 0 103773250881392 103773251387832 103774224334848 140735061521523 140735061522004 140735061522004 140735061524436 0"
+        },
+        {
+          "tid": 4105036,
+          "comm": "lavik",
+          "wchan": "io_cqring_wait",
+          "stat": "4105036 (lavik) S 4104987 4095244 4095244 0 -1 4194368 81536 0 0 0 974 144 0 0 20 0 4 0 346894205 1252249600 72819 18446744073709551615 103773234720768 103773248350073 140735061518624 0 0 0 0 4100 16386 1 0 0 -1 0 0 0 0 0 0 103773250881392 103773251387832 103774224334848 140735061521523 140735061522004 140735061522004 140735061524436 0"
+        },
+        {
+          "tid": 4105037,
+          "comm": "lavik",
+          "wchan": "io_cqring_wait",
+          "stat": "4105037 (lavik) S 4104987 4095244 4095244 0 -1 4194368 9 0 0 0 0 0 0 0 20 0 4 0 346894205 1252249600 72819 18446744073709551615 103773234720768 103773248350073 140735061518624 0 0 0 0 4100 16386 1 0 0 -1 0 0 0 0 0 0 103773250881392 103773251387832 103774224334848 140735061521523 140735061522004 140735061522004 140735061524436 0"
+        },
+        {
+          "tid": 4105038,
+          "comm": "iou-wrk-4105036",
+          "wchan": "io_wq_worker",
+          "stat": "4105038 (iou-wrk-4105036) S 4104987 4095244 4095244 0 -1 4210768 0 0 0 0 0 0 0 0 20 0 4 0 346894206 1252249600 72819 18446744073709551615 103773234720768 103773248350073 140735061518624 0 0 0 2147221247 4100 16386 1 0 0 -1 0 0 0 0 0 0 103773250881392 103773251387832 103774224334848 140735061521523 140735061522004 140735061522004 140735061524436 0"
+        }
+      ]
+    },
+    {
+      "pid": 4105039,
+      "argv": [
+        "sudo",
+        "-n",
+        "ip",
+        "netns",
+        "exec",
+        "lvfull-4104987",
+        "setpriv",
+        "--reuid=1000",
+        "--regid=1000",
+        "--clear-groups",
+        "taskset",
+        "-c",
+        "1",
+        "/mnt/local_nvme/i131/bin/main/lavik",
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        "43531",
+        "--threads",
+        "1",
+        "--no-pin-workers",
+        "--metrics-port",
+        "38445",
+        "--recv-buffers-per-worker",
+        "0",
+        "--registered-buffer-mb-per-worker",
+        "64",
+        "--max-memory",
+        "2147483648",
+        "--repl-backlog-size",
+        "64mb",
+        "--replication-publish-queue-mb-per-worker",
+        "16",
+        "--flush-max-ms",
+        "100",
+        "--data-file",
+        "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20/r1-main/target/data",
+        "--rdb-dir",
+        "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20/r1-main/target",
+        "--logtostderr"
+      ],
+      "status": "Name:\tsudo\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t4105039\nNgid:\t0\nPid:\t4105039\nPPid:\t4104987\nTracerPid:\t0\nUid:\t1000\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t0 \nNStgid:\t4105039\nNSpid:\t4105039\nNSpgid:\t4095244\nNSsid:\t4095244\nKthread:\t0\nVmPeak:\t   17164 kB\nVmSize:\t   17164 kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t    7040 kB\nVmRSS:\t    7040 kB\nRssAnon:\t    1204 kB\nRssFile:\t    5836 kB\nRssShmem:\t       0 kB\nVmData:\t     896 kB\nVmStk:\t     280 kB\nVmExe:\t     196 kB\nVmLib:\t    7940 kB\nVmPTE:\t      80 kB\nVmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t1\nuntag_mask:\t0xffffffffffffffff\nThreads:\t1\nSigQ:\t0/257070\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000000000\nSigCgt:\t00000000080b7a07\nCapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\nCapEff:\t000001ffffffffff\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\nSpeculation_Store_Bypass:\tvulnerable\nSpeculationIndirectBranch:\talways enabled\nCpus_allowed:\tc0\nCpus_allowed_list:\t6-7\nMems_allowed:\t00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t4\nnonvoluntary_ctxt_switches:\t0\nx86_Thread_features:\t\nx86_Thread_features_locked:\t\n",
+      "tasks": [
+        {
+          "tid": 4105039,
+          "comm": "sudo",
+          "wchan": "0",
+          "stat": "4105039 (sudo) S 4104987 4095244 4095244 0 -1 4194560 506 0 0 0 0 0 0 0 20 0 1 0 346894211 17575936 1728 18446744073709551615 1 1 0 0 0 0 0 0 134969863 0 0 0 17 6 0 0 0 0 0 0 0 0 0 0 0 0 0"
+        }
+      ]
+    },
+    {
+      "pid": 4105040,
+      "argv": [
+        "/mnt/local_nvme/i131/bin/main/lavik",
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        "43531",
+        "--threads",
+        "1",
+        "--no-pin-workers",
+        "--metrics-port",
+        "38445",
+        "--recv-buffers-per-worker",
+        "0",
+        "--registered-buffer-mb-per-worker",
+        "64",
+        "--max-memory",
+        "2147483648",
+        "--repl-backlog-size",
+        "64mb",
+        "--replication-publish-queue-mb-per-worker",
+        "16",
+        "--flush-max-ms",
+        "100",
+        "--data-file",
+        "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20/r1-main/target/data",
+        "--rdb-dir",
+        "/mnt/local_nvme/i131/measurements/large-live-128m-f1-rtt20/r1-main/target",
+        "--logtostderr"
+      ],
+      "status": "Name:\tlavik\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t4105040\nNgid:\t0\nPid:\t4105040\nPPid:\t4105039\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t64\nGroups:\t \nNStgid:\t4105040\nNSpid:\t4105040\nNSpgid:\t4095244\nNSsid:\t4095244\nKthread:\t0\nVmPeak:\t 1288372 kB\nVmSize:\t 1222836 kB\nVmLck:\t       0 kB\nVmPin:\t   64764 kB\nVmHWM:\t  250516 kB\nVmRSS:\t  172208 kB\nRssAnon:\t  159260 kB\nRssFile:\t   12948 kB\nRssShmem:\t       0 kB\nVmData:\t 1071704 kB\nVmStk:\t     132 kB\nVmExe:\t   13312 kB\nVmLib:\t    2260 kB\nVmPTE:\t     508 kB\nVmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t0\nuntag_mask:\t0xffffffffffffffff\nThreads:\t4\nSigQ:\t0/257070\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000001004\nSigCgt:\t0000000100004002\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\nSpeculation_Store_Bypass:\tvulnerable\nSpeculationIndirectBranch:\talways enabled\nCpus_allowed:\t02\nCpus_allowed_list:\t1\nMems_allowed:\t00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t6\nnonvoluntary_ctxt_switches:\t1\nx86_Thread_features:\t\nx86_Thread_features_locked:\t\n",
+      "tasks": [
+        {
+          "tid": 4105040,
+          "comm": "lavik",
+          "wchan": "poll_schedule_timeout.constprop.0",
+          "stat": "4105040 (lavik) S 4105039 4095244 4095244 0 -1 4194560 21279 0 0 0 0 3 0 0 20 0 4 0 346894212 1252184064 43051 18446744073709551615 109776407572480 109776421201785 140733130598768 0 0 0 0 4100 16386 1 0 0 17 1 0 0 0 0 0 109776423733104 109776424239544 109776525324288 140733130603156 140733130603637 140733130603637 140733130604500 0"
+        },
+        {
+          "tid": 4105041,
+          "comm": "lavik",
+          "wchan": "io_cqring_wait",
+          "stat": "4105041 (lavik) S 4105039 4095244 4095244 0 -1 4194368 38994 0 0 0 137 32 0 0 20 0 4 0 346894216 1252184064 43051 18446744073709551615 109776407572480 109776421201785 140733130598768 0 0 0 0 4100 16386 1 0 0 -1 1 0 0 0 0 0 109776423733104 109776424239544 109776525324288 140733130603156 140733130603637 140733130603637 140733130604500 0"
+        },
+        {
+          "tid": 4105042,
+          "comm": "lavik",
+          "wchan": "io_cqring_wait",
+          "stat": "4105042 (lavik) S 4105039 4095244 4095244 0 -1 4194368 9 0 0 0 0 0 0 0 20 0 4 0 346894216 1252184064 43051 18446744073709551615 109776407572480 109776421201785 140733130598768 0 0 0 0 4100 16386 1 0 0 -1 1 0 0 0 0 0 109776423733104 109776424239544 109776525324288 140733130603156 140733130603637 140733130603637 140733130604500 0"
+        },
+        {
+          "tid": 4105043,
+          "comm": "iou-wrk-4105041",
+          "wchan": "io_wq_worker",
+          "stat": "4105043 (iou-wrk-4105041) S 4105039 4095244 4095244 0 -1 4210768 0 0 0 0 0 0 0 0 20 0 4 0 346894217 1252184064 43051 18446744073709551615 109776407572480 109776421201785 140733130598768 0 0 0 2147221247 4100 16386 1 0 0 -1 1 0 0 0 0 0 109776423733104 109776424239544 109776525324288 140733130603156 140733130603637 140733130603637 140733130604500 0"
+        }
+      ]
+    }
+  ]
+}

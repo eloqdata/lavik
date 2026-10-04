@@ -1,0 +1,38 @@
+{
+  "comparison": "chunks",
+  "labels": [
+    "main",
+    "chunks"
+  ],
+  "accepted_runs": 84,
+  "cases": [
+    "large-hash-128m-f1-rtt20",
+    "large-hash-128m-f1-rtt5",
+    "large-live-128m-f1-rtt20-queue32",
+    "large-live-128m-f1-rtt5",
+    "large-live-128m-f1-rtt5-queue32",
+    "large-string-128m-f1-rtt0",
+    "large-string-128m-f1-rtt0-nocap",
+    "large-string-128m-f1-rtt1",
+    "large-string-128m-f1-rtt20",
+    "large-string-128m-f1-rtt20-nocap",
+    "large-string-128m-f1-rtt5",
+    "large-string-128m-f4-rtt20",
+    "large-string-128m-f4-rtt5",
+    "large-string-128m-f4-rtt5-nocap"
+  ],
+  "all_accepted_formal_runs": 164,
+  "comparable_formal_runs": 162,
+  "diagnostic_excluded_runs": 2,
+  "created_at_utc": "2026-10-04T14:36:44.149883+00:00",
+  "variant_declarations": {
+    "main": {
+      "binary": "/mnt/local_nvme/i131/bin/main/lavik",
+      "revision": "25e159418603a95c1b2cca68173b329067e3ef48"
+    },
+    "chunks": {
+      "binary": "/mnt/local_nvme/i131/bin/chunks/lavik",
+      "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1"
+    }
+  }
+}
