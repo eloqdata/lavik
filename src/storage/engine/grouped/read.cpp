@@ -192,15 +192,8 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
   const auto bytes = loaded->loaded_.value();
   const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
                                  bytes.size());
-  auto decoded = DecodeHashGroup(payload);
+  auto decoded = DecodeHashGroup(payload, object->directory().root().seed_);
   if (!decoded.ok()) co_return decoded.status();
-  for (const auto& field : decoded->value_.entries_) {
-    if (!id.contains(
-            ComputeDigest(field.field_, object->directory().root().seed_)
-                .value_)) {
-      co_return absl::DataLossError("Hash field outside its group route");
-    }
-  }
   co_return LoadedHashGroup{.sequence_ = loaded->sequence_,
                             .snapshot_ = std::move(*decoded)};
 }

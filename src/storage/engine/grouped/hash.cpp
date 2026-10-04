@@ -304,6 +304,26 @@ absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(std::string_view bytes) {
   return group;
 }
 
+absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(
+    std::string_view bytes, const DigestSeed& routing_seed) {
+  auto group = DecodeHashGroup(bytes);
+  if (!group.ok()) return group.status();
+  // DecodeHashValue has just reconstructed each process-seed digest from the
+  // field bytes. A newly created leaf normally uses that same seed, so route
+  // validation can reuse the result. Recovered leaves may retain another
+  // seed and must hash under it; caller-supplied snapshot digests are never
+  // sufficient for this shortcut.
+  const bool same_seed = routing_seed == CurrentDigestSeed();
+  for (const auto& field : group->value_.entries_) {
+    const auto hash = same_seed
+                          ? field.digest_.value_
+                          : ComputeDigest(field.field_, routing_seed).value_;
+    if (!group->id_.contains(hash))
+      return absl::DataLossError("Hash field outside its group route");
+  }
+  return group;
+}
+
 absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
     std::string_view payload, const DigestSeed& seed, HashGroupEditKind kind,
     std::span<const HashEntryView> edits) {

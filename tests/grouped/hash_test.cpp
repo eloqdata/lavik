@@ -541,6 +541,46 @@ TEST(GroupedHashTest, CompleteSnapshotsAreBinarySafeAndNotMutationLogs) {
   }
 }
 
+TEST(GroupedHashTest, DecodedRoutingKeepsProcessAndPersistedSeedsSeparate) {
+  const auto process_seed = CurrentDigestSeed();
+  auto persisted_seed = process_seed;
+  persisted_seed[0] ^= 0xff;
+  const std::string field("field\0member", 12);
+  ASSERT_NE(ComputeDigest(field, process_seed),
+            ComputeDigest(field, persisted_seed));
+  for (const auto& seed : {process_seed, persisted_seed}) {
+    HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(1)};
+    group.value_.entries_[0].field_ = field;
+    group.value_.entries_[0].value_ = std::string("v\0x", 3);
+    group.id_ = {.prefix_ = ComputeDigest(field, seed).value_, .bits_ = 64};
+    auto encoded = EncodeHashGroup(group);
+    ASSERT_TRUE(encoded.ok()) << encoded.status();
+    auto decoded = DecodeHashGroup(*encoded, seed);
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    ASSERT_EQ(decoded->value_.entries_.size(), 1);
+    EXPECT_EQ(decoded->value_.entries_[0].field_, field);
+    EXPECT_EQ(decoded->value_.entries_[0].value_, std::string("v\0x", 3));
+    // The routing check must not overwrite the process-seed digest needed
+    // by later in-memory operations, even for an older persisted seed.
+    EXPECT_EQ(decoded->value_.entries_[0].digest_, ComputeDigest(field));
+    const auto& wrong_seed =
+        seed == process_seed ? persisted_seed : process_seed;
+    EXPECT_EQ(DecodeHashGroup(*encoded, wrong_seed).status().code(),
+              absl::StatusCode::kDataLoss);
+
+    // Validate every field, including one after an otherwise valid prefix.
+    const std::string misplaced = "outside-leaf";
+    ASSERT_NE(ComputeDigest(misplaced, seed).value_, group.id_.prefix_);
+    group.value_.entries_.push_back({.digest_ = ComputeDigest(misplaced),
+                                     .field_ = misplaced,
+                                     .value_ = ""});
+    auto invalid = EncodeHashGroup(group);
+    ASSERT_TRUE(invalid.ok()) << invalid.status();
+    EXPECT_EQ(DecodeHashGroup(*invalid, seed).status().code(),
+              absl::StatusCode::kDataLoss);
+  }
+}
+
 TEST(GroupedHashTest, PointLookupDistinguishesMissingEmptyAndBinaryValues) {
   auto value = Value(3);
   value.entries_[0].field_ = std::string("f\0x", 3);

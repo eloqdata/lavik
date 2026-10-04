@@ -188,6 +188,12 @@ absl::StatusOr<HashGroupMetadata> DecodeHashGroupMetadata(
 absl::StatusOr<std::string> EncodeHashGroup(const HashGroupSnapshot& group);
 absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(std::string_view bytes);
 
+// Also validates every field against the leaf's persisted routing seed.
+// Returned entry digests still use the current process seed, as in
+// DecodeHashValue; they are never trusted from the durable representation.
+absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(
+    std::string_view bytes, const DigestSeed& routing_seed);
+
 // Splits one complete leaf into complete replacement leaves. The input is
 // scratch, never the published directory. A large indivisible field or a full
 // 64-bit collision may exceed target_bytes; it is never fragmented into a
