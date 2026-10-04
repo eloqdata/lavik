@@ -205,6 +205,27 @@ def ready(meta):
     C.wait_cluster_ready(meta, "native population and authority ready", 90)
 
 
+def replica_flows_ready(target, source_workers):
+    """Probe live replication and a known seed on a disposable connection."""
+    probe = Client(target, readonly=True)
+    try:
+        info = dict(
+            line.split(":", 1)
+            for line in probe.call("INFO", "replication").splitlines()
+            if ":" in line
+        )
+        # Meta's extra worker is never a replication data flow. The seed read
+        # also checks the data-serving gate, which can lag transport setup.
+        return (
+            info.get("master_link_status") == "up"
+            and info.get("lavik_source_workers") == str(source_workers)
+            and info.get("lavik_connected_flows") == str(source_workers)
+            and probe.call("GET", "{native}seed") == "baseline"
+        )
+    finally:
+        probe.close()
+
+
 def tomb_raider(root):
     def info(node, section="stats"):
         probe = Client(node)
@@ -1012,26 +1033,11 @@ def replay_and_reconnect(root):
         # Created replaces the initial population directive with Follow Owner.
         # Meta readiness can precede that ingress reconnect; observe the live
         # data plane before retaining the client used by the WATCH regression.
-        def flows_ready():
-            probe = Client(target, readonly=True)
-            try:
-                info = dict(
-                    line.split(":", 1)
-                    for line in probe.call("INFO", "replication").splitlines()
-                    if ":" in line
-                )
-                # The source has two data shards and the target has three.
-                # Their extra Meta workers must never become replication flows.
-                return (
-                    info.get("master_link_status") == "up"
-                    and info.get("lavik_source_workers") == "2"
-                    and info.get("lavik_connected_flows") == "2"
-                    and probe.call("GET", "{native}seed") == "baseline"
-                )
-            finally:
-                probe.close()
-
-        H.wait_until("two source data flows online and seed readable", 30, flows_ready)
+        H.wait_until(
+            "two source data flows online and seed readable",
+            30,
+            lambda: replica_flows_ready(target, 2),
+        )
         reader = Client(target, readonly=True)
         try:
             assert reader.call("GET", "{native}seed") == "baseline"
@@ -1787,6 +1793,20 @@ def full_tail_collection_transactions(root, cross_worker=False):
                     (read, sorted(value) if read[0] == "SMEMBERS" else value)
                 )
         ready(meta)
+        # Created removes the initialization directive before its replacement
+        # Follow Owner connection is necessarily serving. Wait for every
+        # source flow to CONTINUE and the target's live serving gate, then
+        # check transaction results once. Requiring the original FULL count
+        # below still rejects a replacement snapshot that could hide lost tail
+        # publication; do not retry the collection-value assertions.
+        source_workers = 2 if cross_worker else 1
+        H.wait_until(
+            "collection Follow Owner flows continue and serve the baseline",
+            30,
+            lambda: Path(source.log_path).read_text().count("selected=CONTINUE")
+            >= source_workers
+            and replica_flows_ready(target, source_workers),
+        )
         reader = Client(target, readonly=True)
         try:
             for read, value in expected:
