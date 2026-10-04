@@ -315,11 +315,18 @@ are process memory. A fresh 160-bit boot identity prevents messages for a prior
 process from becoming current even though the durable data files remain.
 
 The Data process connects outward from configured numeric seed endpoints. It
-tries the accepted leader hint, the latest in-memory committed directory, then
-the configured bootstrap seeds. Retry rounds wait 100 ms with bounded jitter
-from 80 to 120 ms, both at startup and after session loss. Failures do not
-accumulate backoff: control loss closes serving admission, so an available Meta
-leader must remain promptly discoverable.
+initially prefers the accepted leader hint, the latest in-memory committed
+directory, then the configured bootstrap seeds. During discovery, bounded TCP
+races retain attempt progress across handshakes and cancelled attempts. A new
+leader preference gets an early attempt; authenticated non-leader responses
+remain eligible for retry, with dial capacity reserved for them so blackholed
+addresses cannot occupy every slot while a responsive peer becomes leader.
+The directory is refreshed after each handshake. Only the selected transport
+may authenticate and install a session, after every losing dial has retired.
+Discovery state is discarded after an established session ends. Retries wait
+100 ms with bounded jitter from 80 to 120 ms; a just-tried peer is not eligible
+again for 120 ms. Failures do not accumulate backoff: control loss closes
+serving admission, so an available Meta leader must remain promptly discoverable.
 An unresolved seed remains a fallback even when a learned member currently
 announces the same endpoint, because endpoint ownership can legitimately change
 across reconfiguration. A response replaces the in-memory directory atomically
@@ -1021,7 +1028,7 @@ incomplete-full-sync fence without a local topology source.
 | Final logical-mutation precondition and WATCH/publication seam | `include/lavik/storage/engine.h`, `src/storage/engine/write.cpp`, `src/storage/engine/hash_tree.cpp` |
 | Meta/Data protocol framing, resolved Authority Lease field and derived heartbeat cadence, independent failover observations, transition/activation projection, complete-object transfer, and bounded writer scheduling | `include/lavik/cluster/control_protocol.h`, `include/lavik/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Node controller, full-state validation, controlled pause, provisional activation, finite authority, drain, follow-owner reconciliation, and typed replication adaptation | `include/lavik/cluster/node_control.h`, `include/lavik/cluster/meta_control.h`, `src/cluster/node_control.cpp`, `src/cluster/meta_control.cpp`, `include/lavik/replication.h`, `src/replication/replication.cpp` |
-| Meta discovery, outbound Data control session, stop-and-wait causal heartbeat cadence, and finite-lease expiry | `include/lavik/cluster/meta_client.h`, `src/cluster/meta_client.cpp` |
+| Meta discovery, bounded TCP races, outbound Data control session, stop-and-wait causal heartbeat cadence, and finite-lease expiry | `include/lavik/cluster/meta_client.h`, `include/lavik/cluster/meta_connector.h`, `src/cluster/meta_client.cpp`, `src/cluster/meta_connector.cpp` |
 | Authenticated pre-storage mode discovery using the shared bounded startup/CLI transport | `include/lavik/cluster/bootstrap.h`, `src/cluster/bootstrap.cpp`, `include/lavik/net/sync_stream.h`, `src/net/sync_stream.cpp` |
 | Process-wide runtime installation | `include/lavik/cluster/runtime.h`, `src/cluster/runtime.cpp` |
 | Cluster admission gate, controlled TRYAGAIN/PUBLISH handling, owner/final re-check plumbing, outcome finalization, EXEC/Lua/blocking integration, and mode-restricted command policies | `src/redis/command.cpp`, `src/redis/cluster_gate.h`, `src/redis/blocking_wait.cpp` |

@@ -1047,6 +1047,17 @@ if (BUILD_TESTING)
       TIMEOUT 180
       RUN_SERIAL TRUE
     )
+    # The deterministic election-window seam lives in the Debug Meta server.
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+      add_test(
+        NAME meta_integration.gate_meta_follower_retry
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_meta_follower_retry.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+      )
+      set_tests_properties(meta_integration.gate_meta_follower_retry PROPERTIES
+        LABELS meta-integration TIMEOUT 90 RUN_SERIAL TRUE)
+    endif()
 
     # The tracer-bullet test independently verifies the eventual public
     # Redis surface. Production cluster-create returns at Genesis commit and

@@ -3696,6 +3696,21 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   auto directory = BuildCommittedMetaDirectory(*view);
   if (!directory.ok()) co_return finish(directory.status());
   const auto committed_service = CommittedClientService(*view);
+  LAVIK_FAULT_INJECT({
+    // Hold discovery in the election window without depending on Raft timing.
+    // The process gate releases this only after Data consumed every survivor's
+    // non-leader response, including the unresolved seed identity.
+    const char* path = std::getenv("LAVIK_TEST_META_FORCE_FOLLOWER_FILE");
+    if (path != nullptr && ::access(path, F_OK) == 0) {
+      auto reply = BuildServerHello(*core, std::move(*directory),
+                                    committed_service, false);
+      reply.disposition = control::ServerHelloDisposition::kLeaderUnknown;
+      reply.leader_id.reset();
+      co_return finish(
+          co_await io.Send(control::MessagePriority::kReliable,
+                           control::WireMessage(std::move(reply))));
+    }
+  });
   const bool accepted_leader =
       core->leader_ready_for_data_ &&
       AuthoritySessionsAllowed(*core, core->leader_term_);

@@ -17,8 +17,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 
 #include "bycorf/net/tcp_stream.h"
 #include "lavik/cluster/meta_client.h"
@@ -39,6 +42,48 @@ struct ConnectedMetaEndpoint {
   std::size_t index_;
   bycorf::TcpStream stream_;
   bycorf::ConnectionStorageBorrow storage_;
+};
+
+// Worker-local discovery state, retained across unsuccessful handshakes. Dial
+// order advances even for cancelled losers, so a fast follower cannot keep
+// restarting discovery at the same dead prefix. Only the returned winner
+// survives Connect; the schedule retains no transport.
+class MetaConnectSchedule {
+ public:
+  // Reconcile an authenticated directory without losing retry progress. A new
+  // first choice (leader hint) gets one preferred attempt. Identity changes are
+  // new candidates; unresolved seeds remain distinct from learned members.
+  void Refresh(std::span<const MetaControlEndpoint> candidates);
+
+  // Resolve an index returned by Connect; valid until the next Refresh.
+  const MetaControlEndpoint& Endpoint(std::size_t index) const {
+    return candidates_[index].endpoint_;
+  }
+
+  // Only a validated non-leader Hello qualifies for the reserved retry slot.
+  // Other handshake failures clear that status. Backoff is supplied by the
+  // caller, which also controls the pacing between successive handshakes.
+  void SessionEnded(std::size_t index, bool follower,
+                    std::chrono::steady_clock::time_point retry_at);
+
+  // Race at most three TCP attempts, reserving capacity for a known follower
+  // whose retry becomes due. Every attempt keeps its full connect deadline;
+  // all losers are cancelled and joined before the sole session may start.
+  // The schedule and stop flag must outlive the call and must not be mutated
+  // concurrently. Must run on the control worker.
+  bycorf::Task<absl::StatusOr<std::unique_ptr<ConnectedMetaEndpoint>>> Connect(
+      bycorf::Worker& worker, const std::atomic<bool>& stopping,
+      bool* attempted);
+
+ private:
+  struct Candidate {
+    MetaControlEndpoint endpoint_;
+    std::chrono::steady_clock::time_point retry_at_{};
+    std::uint64_t last_attempt_ = 0;
+    bool follower_ = false;
+  };
+  std::vector<Candidate> candidates_;
+  std::uint64_t next_attempt_ = 0;
 };
 
 // Attempts numeric endpoints in preference order, at most three at once,
