@@ -726,9 +726,17 @@ TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
   EXPECT_EQ(server.Log().find("commit append failed"), std::string::npos)
       << server.Log();
   Server recovered(disk, 1);
-  Client reader(recovered.port());
-  EXPECT_EQ(reader.Command({"GET", "replacement"}).text_, value);
-  EXPECT_EQ(reader.Command({"EXISTS", "{expiry-387}0"}).text_, "0");
+  recovered.PreserveOnFailure();
+  try {
+    Client reader(recovered.port());
+    EXPECT_EQ(reader.Command({"GET", "replacement"}).text_, value);
+    EXPECT_EQ(reader.Command({"EXISTS", "{expiry-387}0"}).text_, "0");
+  } catch (const std::exception& error) {
+    // A startup exception otherwise loses the recovery process's log when
+    // this second Server is destroyed, hiding whether it exited or stalled.
+    recovered.RecordDiagnostics("expiration recovery startup/read failed");
+    FAIL() << error.what() << '\n' << recovered.Log();
+  }
 }
 
 class GroupedStringCrashE2e : public testing::TestWithParam<const char*> {};
