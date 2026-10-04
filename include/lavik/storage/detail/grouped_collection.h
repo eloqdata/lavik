@@ -79,6 +79,13 @@ struct OrderedCollectionEntry {
   bool operator==(const OrderedCollectionEntry&) const noexcept = default;
 };
 
+// Borrows the encoded member bytes. The input page must remain alive and
+// unchanged for the lifetime of this view.
+struct OrderedCollectionEntryView {
+  std::string_view value_;
+  double score_ = 0;
+};
+
 struct OrderedCollectionRoot {
   OrderedCollectionKind kind_ = OrderedCollectionKind::kList;
   std::uint64_t incarnation_ = 0;
@@ -213,6 +220,12 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(std::string_view bytes);
 // fit the page. Returned strings own their bytes independently of the payload.
 absl::StatusOr<std::vector<std::string>> DecodeOrderedListRange(
     std::string_view bytes, std::size_t first, std::size_t count);
+
+// Validates a complete live Sorted Set page, including all member uniqueness,
+// score/order and framing checks, without copying members. Returned views
+// borrow bytes; callers must retain its owning read lease until they are done.
+absl::StatusOr<std::vector<OrderedCollectionEntryView>>
+DecodeSortedSetGroupViews(std::string_view bytes);
 
 // Binary member ordering breaks score ties. NaN is invalid; infinities are
 // valid. Equal -0/+0 scores have the same order, matching Redis numeric order.

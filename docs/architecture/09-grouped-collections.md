@@ -360,7 +360,10 @@ metadata. Indexed score lookups read only the selected member-prefix pages;
 legacy score lookups and member ranks scan admitted ordered pages. Rank ranges
 start at the directory's selected pages; score ranges and score counts first
 seek their candidate interval using resident score bounds, then read matching
-pages in physical order. Range replies retain only admitted output members.
+pages in physical order. Page scans borrow member bytes from one owned read
+lease and validate complete page framing, ordering and uniqueness before
+consumption. Replies copy only admitted output members; mutation planning
+materializes the pages it will rewrite.
 Mixed-score BYLEX preserves global member ordering without a resident member
 index by repeatedly selecting
 the next member: its work can scale with the collection size times the offset

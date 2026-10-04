@@ -771,6 +771,43 @@ TEST(GroupedSortedSetWriteE2e, BoundedRangeAliasesRanksBoundsAndMixedScoreLex) {
       '-');
 }
 
+TEST(GroupedSortedSetWriteE2e, PageScanRepliesOwnBinaryMembersAcrossRecovery) {
+  PrivateDisk disk;
+  std::vector<std::string> members;
+  std::vector<std::string> seed{"ZADD", "borrowed-pages"};
+  for (unsigned i = 0; i < 128; ++i) {
+    members.push_back(std::string("m\0", 2) + std::to_string(i) +
+                      std::string(i == 64 ? 128 * 1024 : 1024, 'a' + i % 26));
+    seed.push_back(std::to_string(i));
+    seed.push_back(members.back());
+  }
+  for (unsigned pass = 0; pass < 2; ++pass) {
+    Server server(disk, pass == 0 ? 2 : 3);
+    Client client(server.port());
+    if (pass == 0) ASSERT_EQ(client.Command(seed).text_, "128");
+    // Many subsequent page reads reuse read buffers before the reply is sent.
+    // The large middle member also exercises the external-value lease.
+    auto all =
+        client.Command({"ZRANGE", "borrowed-pages", "0", "-1", "WITHSCORES"});
+    ASSERT_EQ(all.items_.size(), members.size() * 2);
+    for (std::size_t i = 0; i < members.size(); ++i) {
+      EXPECT_EQ(all.items_[2 * i].text_, members[i]);
+      EXPECT_EQ(all.items_[2 * i + 1].text_, std::to_string(i));
+    }
+    auto reverse =
+        client.Command({"ZRANGE", "borrowed-pages", "60", "68", "REV"});
+    ASSERT_EQ(reverse.items_.size(), 9);
+    for (std::size_t i = 0; i < reverse.items_.size(); ++i)
+      EXPECT_EQ(reverse.items_[i].text_, members[67 - i]);
+    EXPECT_EQ(client.Command({"ZRANK", "borrowed-pages", members.back()}).text_,
+              "127");
+    EXPECT_EQ(client.Command({"ZCOUNT", "borrowed-pages", "(60", "68"}).text_,
+              "8");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+}
+
 TEST(GroupedSortedSetWriteE2e, ScanCursorsAndAllPopEntryPointsRecover) {
   PrivateDisk disk;
   auto member = [](unsigned i) {
