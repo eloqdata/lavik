@@ -110,11 +110,12 @@ pages, then drain admitted decoded pages under network backpressure. Continuous
 message ranges may read a bounded window concurrently after their first
 boundary page; directory counts limit that window to pages needed by COUNT.
 Sparse selected-ID history and ordinary collection transfers read pages on
-demand. Each delivered page carries its own retained-memory charge, while
-undelivered window pages remain admitted on the key owner. Optional window
-admission falls back to a single page; cancellation or read failure joins all
-started reads before releasing source pins. Population and readability checks
-also apply when delivering already decoded pages.
+demand. A range window is admitted on the key owner and returned as one logical
+page with its own retained-memory charge, reducing cross-worker pulls while
+the network drains bounded chunks. Optional window admission falls back to a
+single physical page; cancellation or read failure joins all started reads
+before releasing source pins. Population and readability are rechecked after
+the join before delivering the decoded window.
 
 EXEC retains that snapshot even if a later command replaces or deletes the
 key. XINFO FULL uses this same reader for its message array; its requested

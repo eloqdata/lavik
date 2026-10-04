@@ -33,13 +33,9 @@ class StreamPageWindow {
   static constexpr std::size_t kWidth = 16;
   static constexpr std::size_t kBytes = 512 * 1024;
   using Read = Task<absl::StatusOr<LoadedOrderedGroup>>;
-  struct Page {
-    MemoryReservation admission_;
-    std::optional<LoadedOrderedGroup> loaded_;
-  };
 
   StreamPageWindow(MemoryReservation admission, bycorf::Worker* worker)
-      : metadata_(std::move(admission)), worker_(worker) {}
+      : admission_(std::move(admission)), worker_(worker) {}
 
   void Start(std::size_t slot, Read read) {
     assert(slot < size_ && !reads_[slot].valid());
@@ -76,18 +72,18 @@ class StreamPageWindow {
       auto result = std::move(reads_[i]).TakeResult();
       reads_[i] = {};
       if (result.ok())
-        pages_[i].loaded_.emplace(std::move(*result));
+        pages_[i].emplace(std::move(*result));
       else if (status.ok())
         status = result.status();
     }
     return status;
   }
 
-  // Each output takes only its own credit. Undelivered pages remain charged
-  // while the connection drains previous output or crosses to another worker.
-  MemoryReservation metadata_;
-  std::array<Page, kWidth> pages_;
-  std::size_t size_ = 0, next_ = 0;
+  // The complete window becomes one logical output page. Its reservation
+  // covers concurrent decoders, this metadata and the combined output vector.
+  MemoryReservation admission_;
+  std::array<std::optional<LoadedOrderedGroup>, kWidth> pages_;
+  std::size_t size_ = 0;
 
  private:
   bycorf::Worker* worker_;
@@ -123,7 +119,6 @@ StorageEngine::Impl::ReadValueForTransferLocked(
     std::optional<LoadedOrderedGroup> probe_page_;
     std::optional<MemoryReservation> probe_reservation_;
     std::size_t probe_index_ = 0;
-    std::unique_ptr<StreamPageWindow> window_;
 
     // Resident maximum keys identify the candidate page. Unknown external
     // boundaries are learned lazily; only the candidate page needs a full
@@ -205,30 +200,23 @@ StorageEngine::Impl::ReadValueForTransferLocked(
                  version.index_generation_;
     }
 
-    static Task<absl::Status> FillWindow(Impl* engine, Source& source,
-                                         std::size_t first) {
-      // The first boundary page has already been consumed. Interior page
-      // counts now bound COUNT without decoding or reading beyond its last
-      // required page. Sparse selected-ID history uses the single-page path.
+    static Task<absl::StatusOr<std::unique_ptr<StreamPageWindow>>> ReadWindow(
+        Impl* engine, Source& source, std::size_t first) {
+      // The first boundary page has already been consumed. Interior counts
+      // bound COUNT without reading past its last required page. Sparse
+      // selected-ID history never enters this path.
       static_assert(sizeof(StreamPageWindow) + 4096 < StreamPageWindow::kBytes);
-      auto metadata = TryReserveMemory(sizeof(StreamPageWindow) + 4096);
-      if (!metadata) co_return absl::OkStatus();
-      auto window = std::make_unique<StreamPageWindow>(std::move(*metadata),
-                                                       source.store_->worker_);
       const auto object = source.saved_.grouped_;
       const auto& groups = object->ordered_directory().groups();
       const auto available =
           source.end_page_ - source.first_page_ - source.cursor_;
       auto remaining = source.range_count_ - source.emitted_;
-      std::size_t bytes = window->metadata_.bytes();
-      for (std::size_t j = 0;
-           j < StreamPageWindow::kWidth && j < available && remaining != 0;
-           ++j) {
-        if (j == 1 &&
-            LAVIK_FAULT_MATCHES("LAVIK_FAIL_STREAM_READ_WINDOW_ADMISSION_KEY",
-                                source.key_))
-          co_return absl::OkStatus();
-        const auto index = source.range_->reverse_ ? first - j : first + j;
+      std::size_t size = 0, bytes = sizeof(StreamPageWindow) + 4096;
+      for (; size < StreamPageWindow::kWidth && size < available &&
+             remaining != 0;
+           ++size) {
+        const auto index =
+            source.range_->reverse_ ? first - size : first + size;
         const auto& group = groups[index];
         const HashGroupId id{group.id_, 0};
         const auto* physical = object->FindGroup(id);
@@ -238,19 +226,23 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         auto status = budget.AddGroup(physical->value_, object->ExtentsFor(id));
         if (!status.ok()) co_return status;
         if (budget.bytes() > StreamPageWindow::kBytes - bytes) break;
-        auto admission = budget.Reserve(1);
-        // Prefetch is optional. If the entire planned window cannot be
-        // admitted, release it before falling back to the original page read.
-        // No task or page load has started at this point.
-        if (!admission.ok()) co_return absl::OkStatus();
-        bytes += admission->bytes();
-        window->pages_[j].admission_ = std::move(*admission);
-        ++window->size_;
+        bytes += budget.bytes();
         remaining -= std::min(remaining, group.item_count_);
       }
-      if (window->size_ < 2) co_return absl::OkStatus();
+      if (size < 2) co_return std::unique_ptr<StreamPageWindow>{};
+      // Admit once for the complete window before allocating slots or
+      // starting I/O. Optional admission failure preserves the original
+      // single-page path; no unfinished child or retained page can escape it.
+      auto admission = TryReserveMemory(bytes);
+      if (!admission ||
+          LAVIK_FAULT_MATCHES("LAVIK_FAIL_STREAM_READ_WINDOW_ADMISSION_KEY",
+                              source.key_))
+        co_return std::unique_ptr<StreamPageWindow>{};
+      auto window = std::make_unique<StreamPageWindow>(std::move(*admission),
+                                                       source.store_->worker_);
+      window->size_ = size;
       absl::Status status;
-      for (std::size_t j = 0; j < window->size_; ++j) {
+      for (std::size_t j = 0; j < size; ++j) {
         if (j == 1 &&
             LAVIK_FAULT_MATCHES("LAVIK_FAIL_STREAM_READ_WINDOW_START_KEY",
                                 source.key_)) {
@@ -259,7 +251,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         }
         const auto index = source.range_->reverse_ ? first - j : first + j;
         if (source.probe_page_ && source.probe_index_ == index) {
-          window->pages_[j].loaded_.emplace(std::move(*source.probe_page_));
+          window->pages_[j].emplace(std::move(*source.probe_page_));
           source.probe_page_.reset();
           source.probe_reservation_.reset();
         } else {
@@ -275,8 +267,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         co_return absl::CancelledError("Stream read-window population changed");
       if (!status.ok()) co_return status;
       if (!collected.ok()) co_return collected;
-      source.window_ = std::move(window);
-      co_return absl::OkStatus();
+      co_return std::move(window);
     }
 
     static Task<absl::Status> Release(Impl* engine,
@@ -327,6 +318,10 @@ StorageEngine::Impl::ReadValueForTransferLocked(
                                  .done_ = true};
       }
       HashGroupId id;
+      // This credit also outlives the decoded window on early return.
+      MemoryReservation admission;
+      std::unique_ptr<StreamPageWindow> window;
+      std::size_t read_pages = 1;
       if (object->is_ordered()) {
         if (source->cursor_ >= object->ordered_directory().groups().size())
           co_return absl::DataLossError("collection transfer cursor overflow");
@@ -349,30 +344,22 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         }
         id = {groups[index].id_, 0};
         if (source->range_ && source->range_->selected_ids_.empty() &&
-            source->cursor_ != 0 && !source->window_ &&
+            source->cursor_ != 0 &&
             source->cursor_ + 1 < source->end_page_ - source->first_page_ &&
             groups[index].item_count_ <
                 source->range_count_ - source->emitted_) {
-          auto status = co_await FillWindow(engine, *source, index);
-          if (!status.ok()) co_return status;
+          auto read = co_await ReadWindow(engine, *source, index);
+          if (!read.ok()) co_return read.status();
+          window = std::move(*read);
+          if (window) read_pages = window->size_;
         }
       } else {
         if (source->hash_cursor_ == object->directory().groups().end())
           co_return absl::DataLossError("collection transfer cursor overflow");
         id = source->hash_cursor_->second.id_;
       }
-      MemoryReservation admission;
-      std::optional<LoadedOrderedGroup> loaded;
-      if (source->window_) {
-        auto& window = *source->window_;
-        assert(window.next_ < window.size_);
-        auto& slot = window.pages_[window.next_++];
-        assert(slot.loaded_);
-        admission = std::move(slot.admission_);
-        loaded.emplace(std::move(*slot.loaded_));
-        if (loaded->snapshot_.id_ != id.prefix_)
-          co_return absl::DataLossError("Stream read-window cursor mismatch");
-        if (window.next_ == window.size_) source->window_.reset();
+      if (window) {
+        admission = std::move(window->admission_);
       } else {
         const auto* physical = object->FindGroup(id);
         if (physical == nullptr)
@@ -387,65 +374,80 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       }
       CollectionPage page{.value_type_ = source->saved_.location_.value_type()};
       if (object->is_ordered()) {
-        if (!loaded && source->range_ && source->probe_page_ &&
+        std::optional<LoadedOrderedGroup> loaded;
+        if (!window && source->range_ && source->probe_page_ &&
             source->probe_page_->snapshot_.id_ == id.prefix_) {
           loaded.emplace(std::move(*source->probe_page_));
           source->probe_page_.reset();
           // The page/output reservation above now covers these bytes.
           source->probe_reservation_.reset();
-        } else if (!loaded) {
+        } else if (!window) {
           auto from_disk = co_await engine->LoadOrderedGroupSnapshot(
               *source->store_, *source->partition_, source->db_id_,
               source->key_, source->digest_, object, id.prefix_, true);
           if (!from_disk.ok()) co_return from_disk.status();
           loaded.emplace(std::move(*from_disk));
         }
-        const auto count = loaded->snapshot_.entries_.size();
-        if (page.value_type_ == ValueType::kList ||
-            page.value_type_ == ValueType::kStream) {
-          page.elements_.reserve(count);
-          if (source->range_ && source->range_->reverse_)
-            std::reverse(loaded->snapshot_.entries_.begin(),
-                         loaded->snapshot_.entries_.end());
-          for (auto& entry : loaded->snapshot_.entries_) {
-            if (source->range_) {
-              auto key = StreamRecordKey(entry.value_);
-              if (!key.ok()) co_return key.status();
-              const auto& range = *source->range_;
-              if ((range.first_exclusive_ ? *key <= source->first_
-                                          : *key < source->first_) ||
-                  (range.last_exclusive_ ? *key >= source->last_
-                                         : *key > source->last_))
-                continue;
-              if (!range.selected_ids_.empty()) {
-                if (key->size() != 17) continue;
-                std::array<std::uint64_t, 2> id{};
-                for (unsigned part = 0; part < 2; ++part)
-                  for (unsigned byte = 0; byte < 8; ++byte)
-                    id[part] =
-                        (id[part] << 8) |
-                        static_cast<unsigned char>((*key)[1 + part * 8 + byte]);
-                if (!std::binary_search(range.selected_ids_.begin(),
-                                        range.selected_ids_.end(), id))
-                  continue;
-              }
-              if (page.elements_.size() ==
-                  source->range_count_ - source->emitted_)
-                break;
-            }
-            page.elements_.push_back(std::move(entry.value_));
+        std::size_t count = 0;
+        if (window) {
+          for (std::size_t j = 0; j < read_pages; ++j) {
+            assert(window->pages_[j]);
+            count += window->pages_[j]->snapshot_.entries_.size();
           }
         } else {
+          count = loaded->snapshot_.entries_.size();
+        }
+        if (page.value_type_ == ValueType::kList ||
+            page.value_type_ == ValueType::kStream)
+          page.elements_.reserve(count);
+        else
           page.scored_members_.reserve(count);
-          for (auto& entry : loaded->snapshot_.entries_)
-            page.scored_members_.push_back(
-                {std::move(entry.value_), entry.score_});
+        for (std::size_t j = 0; j < read_pages; ++j) {
+          auto& entries = window ? window->pages_[j]->snapshot_.entries_
+                                 : loaded->snapshot_.entries_;
+          if (page.value_type_ == ValueType::kList ||
+              page.value_type_ == ValueType::kStream) {
+            if (source->range_ && source->range_->reverse_)
+              std::reverse(entries.begin(), entries.end());
+            for (auto& entry : entries) {
+              if (source->range_) {
+                auto key = StreamRecordKey(entry.value_);
+                if (!key.ok()) co_return key.status();
+                const auto& range = *source->range_;
+                if ((range.first_exclusive_ ? *key <= source->first_
+                                            : *key < source->first_) ||
+                    (range.last_exclusive_ ? *key >= source->last_
+                                           : *key > source->last_))
+                  continue;
+                if (!range.selected_ids_.empty()) {
+                  if (key->size() != 17) continue;
+                  std::array<std::uint64_t, 2> id{};
+                  for (unsigned part = 0; part < 2; ++part)
+                    for (unsigned byte = 0; byte < 8; ++byte)
+                      id[part] =
+                          (id[part] << 8) | static_cast<unsigned char>(
+                                                (*key)[1 + part * 8 + byte]);
+                  if (!std::binary_search(range.selected_ids_.begin(),
+                                          range.selected_ids_.end(), id))
+                    continue;
+                }
+                if (page.elements_.size() ==
+                    source->range_count_ - source->emitted_)
+                  break;
+              }
+              page.elements_.push_back(std::move(entry.value_));
+            }
+          } else {
+            for (auto& entry : entries)
+              page.scored_members_.push_back(
+                  {std::move(entry.value_), entry.score_});
+          }
         }
         page.done_ =
             source->range_
                 ? (page.size() == source->range_count_ - source->emitted_ ||
                    (source->range_->selected_ids_.empty() &&
-                    source->cursor_ + 1 ==
+                    source->cursor_ + read_pages ==
                         source->end_page_ - source->first_page_))
                 : source->cursor_ + 1 ==
                       object->ordered_directory().groups().size();
@@ -476,6 +478,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       if (!source->Valid(*engine))
         co_return absl::CancelledError(
             "collection transfer population changed");
+      // A completed batch resumes through the worker queue. Recheck poison
+      // as well as population after that boundary, even if every child passed.
       const auto readable = object->ReadStatus();
       if (!readable.ok()) co_return readable;
       const auto total = source->range_ ? source->range_count_
@@ -487,7 +491,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         co_return absl::DataLossError("collection transfer count mismatch");
       source->emitted_ += page.size();
       source->done_ = page.done_;
-      page.next_cursor_ = ++source->cursor_;
+      source->cursor_ += read_pages;
+      page.next_cursor_ = source->cursor_;
       const auto bytes = page.RetainedBytes();
       if (bytes > admission.bytes())
         co_return absl::ResourceExhaustedError(
