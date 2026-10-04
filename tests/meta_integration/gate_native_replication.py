@@ -597,11 +597,12 @@ def explicit_full_limit(root):
             data_workers=2,
             client_mode=CLIENT_MODE,
         )
-        # Keep the deliberate election plus lease quarantine inside the
-        # separate three-second lease retry budget. Busy itself is unbounded.
+        # Lease quarantine is twice the election lower bound and starts only
+        # after reconnect. Leave headroom for both inside the independent
+        # three-second lease retry budget; FULL busy itself remains unbounded.
         for meta in fixture.metas:
             meta.args = H.raft_args(
-                snapshot_distance=100_000, election_ms_low=700, election_ms_high=1400
+                snapshot_distance=100_000, election_ms_low=300, election_ms_high=600
             )
         source, first, second = fixture.data_nodes
         hold = root / (name + ".hold")
@@ -657,8 +658,10 @@ def explicit_full_limit(root):
                 "explicit loser retries busy beyond lease retry budget",
                 15,
                 lambda: any(
+                    # Seven attempts span at least 3.5s with the capped
+                    # 100, 200, 400, 800, 1000, 1000ms busy retry delays.
                     Path(n.log_path).read_text().count("native FULL admission is busy")
-                    >= 4
+                    >= 7
                     for n in (first, second)
                 ),
             )
