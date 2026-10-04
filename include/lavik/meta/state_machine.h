@@ -26,7 +26,7 @@ using MetaCommitEventSink =
     std::function<void(std::uint64_t, const MetaApplyResult&)>;
 
 // The full committed aggregate and both indices captured under one state lock.
-// Legacy full-view consumers retain this owned copy; purpose-specific readers
+// Full-view subscribers retain this owned copy; purpose-specific readers
 // should use a narrower capture when their contract permits it.
 struct MetaCommittedStoresSnapshot {
   MetaStores stores_;
@@ -67,7 +67,7 @@ class MetaStateMachine {
   absl::StatusOr<std::string> Capture(std::uint64_t index) const;
   absl::Status Install(std::uint64_t index, std::string_view image);
   MetaStores StoresSnapshot() const;
-  // Legacy complete-state capture, atomically paired with both state indices.
+  // Full-state capture, paired with both indices for full-view subscriptions.
   MetaCommittedStoresSnapshot CaptureStores() const;
   // Capture the data and indices in one critical section. Lookup-index work
   // and every consumer query happen after releasing that lock.

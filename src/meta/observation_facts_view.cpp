@@ -37,7 +37,7 @@ MetaObservationFactsView::MetaObservationFactsView(
   std::sort(
       transition_index_.begin(), transition_index_.end(),
       [&](std::size_t left, std::size_t right) {
-        // Match the legacy first-Group lookup even if a test fixture
+        // Match MetaStoresFacts' first-Group lookup even if a test fixture
         // supplies duplicate transition identities across Groups.
         return std::tie(groups_[left].failover_transition_->transition_id_,
                         left) <
