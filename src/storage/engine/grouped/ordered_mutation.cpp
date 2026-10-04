@@ -100,15 +100,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     // pressure. Only a new standalone transaction can wait for reclamation
     // before taking its lease.
     store.store_state_mutex_.Unlock(*store.worker_);
-    absl::Status space;
-    try {
-      space = co_await BeforeGroupedTransaction(store, append_bytes);
-    } catch (const std::bad_alloc&) {
-      // Even allocation of the pressure coroutine frame must return with the
-      // caller's lock invariant intact.
-      RecordMemoryRejection();
-      space = absl::ResourceExhaustedError("OOM grouped pressure coordinator");
-    }
+    const auto space = co_await BeforeGroupedTransaction(store, append_bytes);
     co_await store.store_state_mutex_.Lock();
     if (!space.ok()) co_return space;
     InitializeTxWrites(tx::TxRuntime::Get()->next_txid_.fetch_add(
@@ -231,9 +223,12 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   std::vector<HashGroupEncoder> member_encoders;
   std::vector<std::uint64_t> ordered_sizes;
   std::vector<std::uint64_t> member_sizes;
-  try {
-    // No current-command pages have been staged if preflight allocation fails.
-    LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_GROUP_ENCODER_PREPARE_KEY", key);
+  {
+    // Reject preparation before any current-command pages are staged.
+    if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_GROUP_ENCODER_PREPARE_KEY", key)) {
+      RecordMemoryRejection();
+      co_return absl::ResourceExhaustedError("OOM preparing group encoders");
+    }
     ordered_encoders.reserve(plan.writes_.size());
     member_encoders.reserve(member_plan.writes_.size());
     ordered_sizes.reserve(plan.writes_.size());
@@ -257,15 +252,12 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       member_sizes.push_back(encoder->encoded_bytes());
       member_encoders.push_back(std::move(*encoder));
     }
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM preparing group encoders");
   }
   // Ordered page envelopes and per-entry framing dominate the compact
   // encoding. The Sorted Set member graph is excluded: it repeats members
   // solely for point lookup and has no counterpart in a compact value.
   std::optional<std::string> compact_payload;
-  try {
+  {
     if (previous != nullptr && tx->grouped_ingest_batch_ == nullptr) {
       std::uint64_t total = previous->ordered_directory().total_group_bytes();
       for (std::size_t i = 0; i < plan.writes_.size(); ++i) {
@@ -344,9 +336,6 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         compact_payload = std::move(*encoded);
       }
     }
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM preparing ordered demotion");
   }
   if (compact_payload) {
     // Standalone demotion appends an ordinary untagged complete value and
@@ -597,10 +586,13 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       store_->write_failed_ = true;
     }
   } handoff{&store, decision->get()};
-  bool unlocked_for_handoff = false;
-  absl::Status handoff_status;
-  try {
-    LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_GROUP_HANDOFF_KEY", key);
+
+  {
+    if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_GROUP_HANDOFF_KEY", key)) {
+      RecordMemoryRejection();
+      co_return absl::ResourceExhaustedError(
+          "OOM completing grouped publication handoff");
+    }
     if (outer_transaction) {
       // Waiting for this decision before returning the command makes the outer
       // coordinator's later commit causally depend on the complete auxiliary
@@ -611,7 +603,6 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       const bool inject_batch_failure =
           LAVIK_FAULT_MATCHES("LAVIK_FAIL_GROUP_BATCH_KEY", key);
       store.store_state_mutex_.Unlock(*store.worker_);
-      unlocked_for_handoff = true;
       absl::Status committed;
       if (inject_batch_failure) {
         // Make the failed root observable to cold recovery, rather than merely
@@ -632,7 +623,6 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         committed = co_await CommitTxWrites(batch.txid_, {&batch});
       }
       co_await store.store_state_mutex_.Lock();
-      unlocked_for_handoff = false;
       if (!committed.ok()) {
         (*decision)->FailPending();
         store.write_failed_ = true;
@@ -646,22 +636,13 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       const auto transaction_id = receipts.front().txid_;
       if (!EnqueueTxCommit(transaction_id, std::move(receipts))) {
         store.store_state_mutex_.Unlock(*store.worker_);
-        unlocked_for_handoff = true;
         const auto capacity = co_await WaitForTxCommitCapacity();
         co_await store.store_state_mutex_.Lock();
-        unlocked_for_handoff = false;
         if (!capacity.ok()) co_return capacity;
       }
     }
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    handoff_status = absl::ResourceExhaustedError(
-        "OOM completing grouped publication handoff");
   }
-  // The caller's unlock guard still owns the store mutex. Restore that
-  // invariant even if creating/awaiting the commit task threw after unlock.
-  if (unlocked_for_handoff) co_await store.store_state_mutex_.Lock();
-  if (!handoff_status.ok()) co_return handoff_status;
+
   handoff.completed_ = true;
   co_return absl::OkStatus();
 }

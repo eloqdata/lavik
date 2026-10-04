@@ -16,7 +16,6 @@
 #include <limits>
 #include <map>
 #include <memory>
-#include <new>
 #include <optional>
 #include <set>
 #include <string>
@@ -1780,7 +1779,7 @@ class StreamInput {
 class CollectionInput {
  public:
   static absl::StatusOr<std::unique_ptr<CollectionInput>> Open(
-      Reader* reader, std::uint8_t type) try {
+      Reader* reader, std::uint8_t type) {
     auto result = std::unique_ptr<CollectionInput>(new CollectionInput(type));
     if (CollectionType(type) == storage::ValueType::kStream) {
       auto stream = StreamInput::Open(reader, type);
@@ -1798,8 +1797,6 @@ class CollectionInput {
       if (result->plain_) result->expected_ = count->value;
     }
     return result;
-  } catch (const std::bad_alloc&) {
-    return Oom();
   }
   storage::ValueType type() const { return CollectionType(type_); }
   std::optional<std::uint64_t> expected() const { return expected_; }
@@ -1871,8 +1868,6 @@ class CollectionInput {
     if (page.RetainedBytes() > bytes) return Bad("RDB page budget mismatch");
     page.retained_charge_.Adopt(&*reservation, page.RetainedBytes());
     return page;
-  } catch (const std::bad_alloc&) {
-    return Oom();
   } catch (const std::length_error&) {
     return Oom();
   }
@@ -2508,7 +2503,7 @@ FileReader::FileReader(FileReader&&) noexcept = default;
 FileReader& FileReader::operator=(FileReader&&) noexcept = default;
 FileReader::~FileReader() = default;
 
-absl::StatusOr<FileReader> FileReader::Open(const std::string& path) try {
+absl::StatusOr<FileReader> FileReader::Open(const std::string& path) {
   // Allocate the stable source before opening its descriptor. Impl owns both
   // on every error path, and moving FileReader never invalidates its cursors.
   auto impl = std::make_unique<Impl>();
@@ -2560,27 +2555,18 @@ absl::StatusOr<FileReader> FileReader::Open(const std::string& path) try {
   impl->version_ = version;
   impl->Rewind();
   return FileReader(std::move(impl));
-} catch (const std::bad_alloc&) {
-  RecordMemoryRejection();
-  return absl::ResourceExhaustedError("OOM RDB file reader");
 }
 
-absl::StatusOr<std::optional<FileEntry>> FileReader::Next() try {
+absl::StatusOr<std::optional<FileEntry>> FileReader::Next() {
   auto entry = NextImpl(false);
   if (!impl_->input_.status().ok()) return impl_->input_.status();
   return entry;
-} catch (const std::bad_alloc&) {
-  RecordMemoryRejection();
-  return absl::ResourceExhaustedError("OOM RDB file entry");
 }
 
-absl::StatusOr<std::optional<FileEntry>> FileReader::NextStreaming() try {
+absl::StatusOr<std::optional<FileEntry>> FileReader::NextStreaming() {
   auto entry = NextImpl(true);
   if (!impl_->input_.status().ok()) return impl_->input_.status();
   return entry;
-} catch (const std::bad_alloc&) {
-  RecordMemoryRejection();
-  return absl::ResourceExhaustedError("OOM RDB file entry");
 }
 
 absl::StatusOr<storage::CollectionPage> FileReader::ReadCollectionPage() {
@@ -3105,7 +3091,7 @@ DumpReader::DumpReader(DumpReader&&) noexcept = default;
 DumpReader& DumpReader::operator=(DumpReader&&) noexcept = default;
 DumpReader::~DumpReader() = default;
 
-absl::StatusOr<DumpReader> DumpReader::Open(std::string_view payload) try {
+absl::StatusOr<DumpReader> DumpReader::Open(std::string_view payload) {
   if (payload.size() < 10)
     return absl::InvalidArgumentError(
         "DUMP payload version or checksum are wrong");
@@ -3120,9 +3106,6 @@ absl::StatusOr<DumpReader> DumpReader::Open(std::string_view payload) try {
   auto status = impl->Initialize();
   if (!status.ok()) return status;
   return DumpReader(std::move(impl));
-} catch (const std::bad_alloc&) {
-  RecordMemoryRejection();
-  return absl::ResourceExhaustedError("OOM DUMP reader");
 }
 
 bool DumpReader::collection() const noexcept {
@@ -3207,20 +3190,14 @@ absl::Status StreamFileEncoder::StartPage(const storage::CollectionPage& page) {
 
 std::optional<std::string_view> StreamFileEncoder::Next() noexcept {
   if (!status_.ok()) return std::nullopt;
-  try {
-    output_ = std::string{};
-    output_admission_.reset();
-    auto next = Advance();
-    if (!next.ok()) {
-      status_ = next.status();
-      return std::nullopt;
-    }
-    return *next;
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    status_ = absl::ResourceExhaustedError("OOM RDB Stream encoding");
+  output_ = std::string{};
+  output_admission_.reset();
+  auto next = Advance();
+  if (!next.ok()) {
+    status_ = next.status();
     return std::nullopt;
   }
+  return *next;
 }
 
 absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {

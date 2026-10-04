@@ -325,6 +325,10 @@ cleanup as another durable phase.
   domain command still consumes its index and creates an audit record;
   malformed durable bytes or inconsistent replay fail stop rather than
   allowing replicas to diverge.
+- Recoverable memory-budget and capacity rejections return explicit statuses.
+  Physical C++ allocation failure is fatal: request, background, and Meta flows
+  do not convert `std::bad_alloc` into a retryable status or Redis OOM reply.
+  Fault injection models recoverable rejection with statuses as well.
 - `maxmemory` admission uses explicit worker-owned retained allocations rather
   than global allocation hooks. RSS and mimalloc committed/reserved statistics
   remain diagnostic, so the retained waterline is not an instantaneous RSS

@@ -16,7 +16,6 @@
 
 #include <atomic>
 #include <cstdlib>
-#include <new>
 #include <optional>
 
 #include "impl.h"
@@ -815,10 +814,6 @@ StorageEngine::Impl::PrepareAdmittedReplicationCommand(
       publication.backlog_command_ = std::move(command);
     }
     return publication;
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "admitted replication command allocation failed");
   } catch (const std::length_error&) {
     RecordMemoryRejection();
     return absl::ResourceExhaustedError(
@@ -1263,10 +1258,6 @@ StorageEngine::Impl::PrepareFlushReplication(
       });
     }
     co_return publication;
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "FLUSH publication allocation failed");
   } catch (const std::length_error&) {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("FLUSH publication is too large");
