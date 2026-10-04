@@ -597,12 +597,13 @@ def explicit_full_limit(root):
             data_workers=2,
             client_mode=CLIENT_MODE,
         )
-        # Keep the deliberate election plus lease quarantine inside the
-        # separate three-second lease retry budget. Busy itself is unbounded.
+        # This gate exercises FULL-slot ownership across a Meta replacement,
+        # not exhaustion of the separate three-second lease retry budget.
+        # Quarantine adds twice election_ms_low after election and reconnect;
+        # 700/1400 ms leaves almost no room for a split vote or reconnect jitter.
+        # Use the shared fast-test timing (300/600 ms). Busy itself is unbounded.
         for meta in fixture.metas:
-            meta.args = H.raft_args(
-                snapshot_distance=100_000, election_ms_low=700, election_ms_high=1400
-            )
+            meta.args = H.raft_args(snapshot_distance=100_000)
         source, first, second = fixture.data_nodes
         hold = root / (name + ".hold")
         hold.touch()
