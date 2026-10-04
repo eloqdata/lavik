@@ -1059,21 +1059,37 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
   // never re-sort every historical retirement on each append/trim.
   std::sort(new_retired.begin(), new_retired.end(),
             [](const auto& a, const auto& b) { return a.id_ < b.id_; });
-  std::vector<RecoveredOrderedGroup> retired;
-  retired.reserve(retired_.size() + new_retired.size());
-  auto old = retired_.begin();
-  for (auto item : new_retired) {
-    for (; old != retired_.end() && old->id_ < item.id_; ++old)
-      retired.push_back(*old);
-    if (old != retired_.end() && old->id_ == item.id_) ++old;
-    item.txid_ = 0;
-    item.batch_txid_ = 0;
-    retired.push_back(item);
-  }
-  retired.insert(retired.end(), old, retired_.end());
-  for (auto& item : retired) {
-    item.txid_ = 0;
-    item.batch_txid_ = 0;
+  // Most append/split updates create no tombstones. Keep the adjudicated
+  // predecessor records shared, including their physical transaction tags;
+  // Apply never re-adjudicates those tags (as in the same-topology path).
+  // Monotonically retired identities need only a persistent tail append.
+  if (new_retired.empty()) {
+    rebuilt.retired_ = retired_;
+  } else if (retired_.empty() ||
+             retired_.back().id_ < new_retired.front().id_) {
+    for (auto& item : new_retired) {
+      item.txid_ = 0;
+      item.batch_txid_ = 0;
+    }
+    auto appended = retired_.Appended(new_retired);
+    if (!appended.ok()) return appended.status();
+    rebuilt.retired_ = std::move(*appended);
+  } else {
+    std::vector<RecoveredOrderedGroup> retired;
+    retired.reserve(retired_.size() + new_retired.size());
+    auto old = retired_.begin();
+    for (auto item : new_retired) {
+      for (; old != retired_.end() && old->id_ < item.id_; ++old)
+        retired.push_back(*old);
+      if (old != retired_.end() && old->id_ == item.id_) ++old;
+      item.txid_ = 0;
+      item.batch_txid_ = 0;
+      retired.push_back(item);
+    }
+    retired.insert(retired.end(), old, retired_.end());
+    auto array = decltype(retired_)::From(retired);
+    if (!array.ok()) return array.status();
+    rebuilt.retired_ = std::move(*array);
   }
   // The predecessor identity index is already sorted. Its ordinal changes,
   // not its identities. Reindex surviving old pages and merge only the new
@@ -1088,17 +1104,32 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     ids.emplace_back(old_id, positions[old_position]);
   }
   ids.insert(ids.end(), inserted, inserted_ids.end());
-  auto group_array = decltype(groups_)::From(groups);
+  // A tail split/append often preserves every existing ordinal. Validation
+  // above still walks the complete chain, but publication need not copy its
+  // unchanged metadata again. Middle insertion/removal keeps the rebuild
+  // path because its shifted ordinals require a different array layout.
+  bool preserves_ordinals = groups.size() >= groups_.size();
+  for (std::size_t i = 0; preserves_ordinals && i < positions.size(); ++i)
+    preserves_ordinals = positions[i] == i;
+  auto group_array =
+      preserves_ordinals
+          ? groups_.Appended(std::span(groups).subspan(groups_.size()))
+          : decltype(groups_)::From(groups);
   if (!group_array.ok()) return group_array.status();
-  auto retired_array = decltype(retired_)::From(retired);
-  if (!retired_array.ok()) return retired_array.status();
+  if (preserves_ordinals) {
+    for (const auto& item : changed) {
+      if (const auto position = FindIndex(item.id_)) {
+        auto status = group_array->Set(*position, groups[*position]);
+        if (!status.ok()) return status;
+      }
+    }
+  }
   auto id_array = decltype(ids_)::From(ids);
   if (!id_array.ok()) return id_array.status();
   if (root.kind_ == OrderedCollectionKind::kStream) BuildStreamRanks(ends);
   auto end_array = decltype(ends_)::From(ends);
   if (!end_array.ok()) return end_array.status();
   rebuilt.groups_ = std::move(*group_array);
-  rebuilt.retired_ = std::move(*retired_array);
   rebuilt.ids_ = std::move(*id_array);
   rebuilt.ends_ = std::move(*end_array);
   if (root.kind_ == OrderedCollectionKind::kStream && has_stream_header_) {

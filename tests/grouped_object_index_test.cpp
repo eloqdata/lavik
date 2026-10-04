@@ -229,6 +229,66 @@ TEST(GroupedMetadataArrayTest, PartialDetachAdmissionFailureCanBeRetried) {
   EXPECT_EQ(GetMemoryStats().admission_pending_bytes_, 0);
 }
 
+TEST(GroupedMetadataArrayTest, AppendsPreservePinnedTailsAcrossTreeGrowth) {
+  GroupedMemoryScope memory;
+  using Array = GroupedMetadataArray<std::uint64_t, 4>;
+  Array current;
+  std::vector<std::uint64_t> expected;
+  // Include partial tails, exact chunk boundaries, and two root expansions.
+  for (std::size_t count : {0, 1, 3, 123, 2, 4000, 1, 8192}) {
+    const auto pinned = current;
+    const auto old_size = expected.size();
+    std::vector<std::uint64_t> values(count);
+    for (std::size_t i = 0; i < count; ++i) values[i] = old_size + i + 17;
+    auto appended = current.Appended(values);
+    ASSERT_TRUE(appended.ok()) << appended.status();
+    expected.insert(expected.end(), values.begin(), values.end());
+    EXPECT_EQ(appended->size(), expected.size());
+    EXPECT_TRUE(
+        std::equal(appended->begin(), appended->end(), expected.begin()));
+    for (std::size_t i = 0; i < old_size; ++i) {
+      EXPECT_EQ(pinned[i], i + 17);
+      if (i < old_size / 4 * 4) EXPECT_EQ(&pinned[i], &(*appended)[i]);
+    }
+    current = std::move(*appended);
+    if (!current.empty()) {
+      // A later point update must also leave the previous tail intact.
+      auto changed = current;
+      ASSERT_TRUE(changed.Set(current.size() - 1, 999999).ok());
+      EXPECT_EQ(current.back(), expected.back());
+    }
+  }
+}
+
+TEST(GroupedMetadataArrayTest,
+     AppendAdmissionFailurePreservesViewAndAccounting) {
+  GroupedMemoryScope memory;
+  using Array = GroupedMetadataArray<std::uint64_t, 4>;
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  {
+    auto original = Array::From(std::vector<std::uint64_t>(128, 17));
+    ASSERT_TRUE(original.ok());
+    const auto before = WorkerMemoryAccountingBytes(0);
+    // Root growth succeeds before the new child path runs out of admission.
+    const auto steady = GetWorkerMemoryStats(0).retained_bytes_ + 1536;
+    ASSERT_TRUE(InitMemoryLimit((steady * 10 + 8) / 9, 1).ok());
+    const std::array<std::uint64_t, 1> tail{29};
+    auto rejected = original->Appended(tail);
+    EXPECT_EQ(rejected.status().code(), absl::StatusCode::kResourceExhausted);
+    EXPECT_EQ(WorkerMemoryAccountingBytes(0), before);
+    EXPECT_EQ(original->size(), 128);
+    EXPECT_EQ(original->back(), 17);
+    ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+    auto appended = original->Appended(tail);
+    ASSERT_TRUE(appended.ok()) << appended.status();
+    EXPECT_EQ(appended->back(), 29);
+    EXPECT_EQ(&appended->front(), &original->front());
+    EXPECT_LT(WorkerMemoryAccountingBytes(0) - before, 16 * 1024);
+  }
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+  EXPECT_EQ(GetMemoryStats().admission_pending_bytes_, 0);
+}
+
 TEST(GroupedObjectIndexTest, CompressedPathsRetainAllHashPrefixLengthBits) {
   GroupedMemoryScope memory;
   // Repeatedly split the zero-prefixed child all the way to 64 bits. Its
