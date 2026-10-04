@@ -63,6 +63,15 @@ class GroupedScratchBudget {
         value.external(), extents);
   }
 
+  // Value and id must belong to the same retained object view. Inline pages
+  // carry their complete size envelope in value; only external pages need a
+  // second physical-index traversal to retain their extent manifest.
+  absl::Status AddGroup(const RecordIndexValue& value,
+                        const GroupedHashObject& object, HashGroupId id) {
+    if (!value.external()) return AddGroup(value, nullptr);
+    return AddGroup(value, object.ExtentsFor(id));
+  }
+
   // Includes caller-owned copies of incoming fields/items before making them.
   absl::Status AddBytes(std::size_t bytes) {
     if (bytes > std::numeric_limits<std::size_t>::max() - bytes_)

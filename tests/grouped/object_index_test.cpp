@@ -919,6 +919,7 @@ TEST(GroupedObjectIndexTest, RejectsIncompleteDuplicateAndStaleGroupLocations) {
 }
 
 TEST(GroupedObjectIndexTest, ExternalGroupManifestIsSparseAndRequired) {
+  GroupedMemoryScope memory;
   auto input = Input();
   const auto old = input.locations_[0].location_;
   input.locations_[0].location_ = GroupLocation(
@@ -939,6 +940,21 @@ TEST(GroupedObjectIndexTest, ExternalGroupManifestIsSparseAndRequired) {
   EXPECT_EQ(*retained, *extents);
   for (std::size_t i = 1; i < input.locations_.size(); ++i) {
     EXPECT_EQ((*object)->ExtentsFor(input.locations_[i].id_), nullptr);
+  }
+  // The resident-view admission path must preserve the physical envelope
+  // for both the external page and the inline pages, without a live engine.
+  for (const auto& group : input.locations_) {
+    const auto* entry = (*object)->FindGroup(group.id_);
+    ASSERT_NE(entry, nullptr);
+    GroupedScratchBudget physical_budget, resident_budget;
+    ASSERT_TRUE(physical_budget.AddGroup(group.location_, group.extents_).ok());
+    ASSERT_TRUE(
+        resident_budget.AddGroup(entry->value_, **object, group.id_).ok());
+    auto physical = physical_budget.Reserve(1);
+    auto resident = resident_budget.Reserve(1);
+    ASSERT_TRUE(physical.ok()) << physical.status();
+    ASSERT_TRUE(resident.ok()) << resident.status();
+    EXPECT_EQ(physical->bytes(), resident->bytes());
   }
   (*extents)[0].allocation_epoch_ = 0;
   EXPECT_EQ((*retained)[0].allocation_epoch_, 17);

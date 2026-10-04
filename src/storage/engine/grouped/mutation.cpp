@@ -327,8 +327,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
           const auto* entry = previous->FindGroup(metadata.id_);
           if (entry == nullptr)
             co_return absl::DataLossError("missing Hash group for demotion");
-          const auto added = budget.AddGroup(
-              entry->value_, previous->ExtentsFor(metadata.id_));
+          const auto added =
+              budget.AddGroup(entry->value_, *previous, metadata.id_);
           if (!added.ok()) co_return added;
         }
         auto added = budget.AddBytes(2 * kCollectionGroupTargetBytes +

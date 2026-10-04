@@ -67,7 +67,10 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     // current physical epoch before suspending, and retry a GC move only while
     // the logical root is unchanged. Historical snapshots instead own pins.
     const auto location = MaterializeIndexLocation(*entry);
-    const auto extents = object->ExtentsFor(id);
+    // Inline pages need no extent lookup; external pages retain the manifest
+    // from this same physical view across the awaited read.
+    const auto extents =
+        location.external() ? object->ExtentsFor(id) : ExtentManifest{};
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
       loaded = co_await LoadExternalValueLocal(store, location, extents,

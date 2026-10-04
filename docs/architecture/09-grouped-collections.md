@@ -284,17 +284,17 @@ expiry cannot disguise that failure as an absent key. Internal compensation
 alone may inspect the failed physical view to restore or retire it; snapshot
 page readers independently recheck the decision after storage waits.
 
-An incremental successor from another transaction waits for its predecessor's
-durable decision before inheriting untouched groups. Same-transaction commands
-can reuse their view. This causal dependency is separate from the physical
-pins that keep prior transaction blocks allocated until retirement.
+Same-transaction commands can reuse their view. The predecessor decision
+dependencies described above are separate from the physical pins that keep
+prior transaction blocks allocated until retirement.
 
 Before acquiring a standalone transaction's append lease, grouped writes
-sample foreground space and coordinate transaction-block cleaning under pressure.
-The predecessor decision is durable before that cleaning can run. Borrowed
-EXEC/Lua transactions do not wait for their own still-active blocks to
-retire. This pressure signal bypasses the periodic cooldown, not explicit
-cleaner disabling or the allocator's authoritative capacity checks.
+reuse available transaction-stream staging capacity or coordinate cleaning
+when that capacity is insufficient. Borrowed EXEC/Lua transactions do not
+wait for their own still-active blocks to retire. This maintenance attempt
+bypasses the periodic cooldown, not explicit cleaner disabling or the
+allocator's authoritative capacity checks. Decision ordering remains the
+separate causal boundary described above.
 
 ## Command access paths
 
