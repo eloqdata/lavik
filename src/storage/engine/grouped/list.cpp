@@ -28,7 +28,8 @@ namespace {
 // only after the worker has quiesced storage I/O.
 class ListReadBatch {
  public:
-  static constexpr std::size_t kWidth = 16;
+  static constexpr std::size_t kWidth = 64;
+  static constexpr std::size_t kPayloadBytes = 512 * 1024;
   using Result = absl::StatusOr<std::vector<std::string>>;
   using Read = Task<Result>;
 
@@ -74,6 +75,36 @@ class ListReadBatch {
   std::coroutine_handle<> waiter_;
   std::array<Read, kWidth> reads_;
 };
+
+// Keep the task window out of the common List operation's coroutine frame:
+// point reads and writes should not allocate space for unused parallel reads.
+// The callable is owned here, and borrows inputs from the awaiting parent.
+template <typename Load>
+Task<absl::Status> AppendListReadWindow(bycorf::Worker* worker,
+                                        std::size_t count, Load load,
+                                        std::vector<std::string>& output) {
+  ListReadBatch batch(worker);
+  absl::Status status;
+  try {
+    for (std::size_t j = 0; j < count; ++j) batch.Add(load(j));
+  } catch (const std::bad_alloc&) {
+    status =
+        absl::ResourceExhaustedError("OOM grouped List read batch allocation");
+  }
+  co_await batch.Join();
+  if (!status.ok()) co_return status;
+  try {
+    for (std::size_t j = 0; j < batch.size(); ++j) {
+      auto values = batch.Take(j);
+      if (!values.ok()) co_return values.status();
+      for (auto& value : *values) output.push_back(std::move(value));
+    }
+  } catch (const std::bad_alloc&) {
+    co_return absl::ResourceExhaustedError(
+        "OOM allocating grouped List operation");
+  }
+  co_return absl::OkStatus();
+}
 
 std::uint64_t Magnitude(std::int64_t value) {
   return value < 0 ? static_cast<std::uint64_t>(-(value + 1)) + 1
@@ -343,8 +374,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
         std::min(ListReadBatch::kWidth, end_page - begin_page);
     if (read_only && read_width > 1) {
       // The ordinary budget includes one loader's fixed scratch. Admit the
-      // additional bounded coroutine frames before starting any parallel IO.
-      const auto added = page_budget.AddBytes((read_width - 1) * 4096);
+      // window owner and additional loader frames before any parallel IO.
+      const auto added = page_budget.AddBytes(read_width * 4096);
       if (!added.ok()) co_return added;
     }
     // Reads own each requested string once: page results move into the reply.
@@ -375,17 +406,6 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
       std::uint64_t remaining = erase_count;
       std::size_t offset = first->offset_;
       if (end_page - begin_page > 1) result.values_.reserve(erase_count);
-      auto append = [&](ListReadBatch::Result values) -> absl::Status {
-        if (!values.ok()) {
-          return values.status();
-        }
-        if (end_page - begin_page == 1)
-          result.values_ = std::move(*values);
-        else
-          for (auto& value : *values)
-            result.values_.push_back(std::move(value));
-        return absl::OkStatus();
-      };
       auto population_changed = [&] {
         return EffectiveRecordDbEpoch(partition, db_id) !=
                    object->version().db_epoch_ ||
@@ -396,44 +416,52 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
       };
       absl::Status read_status;
       if (read_width == 1) {
-        read_status = append(co_await LoadOrderedListRange(
+        auto values = co_await LoadOrderedListRange(
             store, partition, db_id, key, digest, object,
-            directory.groups()[begin_page].id_, offset, remaining));
+            directory.groups()[begin_page].id_, offset, remaining);
+        if (values.ok())
+          result.values_ = std::move(*values);
+        else
+          read_status = values.status();
       } else {
         for (std::size_t i = begin_page; i < end_page;) {
-          ListReadBatch batch(store.worker_);
-          try {
-            for (std::size_t j = 0;
-                 j < ListReadBatch::kWidth && i + j < end_page; ++j) {
-              LAVIK_FAULT_INJECT(if (j == 1) {
-                LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_LIST_READ_BATCH_START_KEY",
-                                      key);
-              });
-              const auto& route = directory.groups()[i + j];
-              const auto take = std::min<std::uint64_t>(
-                  remaining, route.item_count_ - offset);
-              batch.Add(LoadOrderedListRange(store, partition, db_id, key,
-                                             digest, object, route.id_, offset,
-                                             take));
-              remaining -= take;
-              offset = 0;
-            }
-          } catch (const std::bad_alloc&) {
-            read_status = absl::ResourceExhaustedError(
-                "OOM grouped List read batch allocation");
+          std::size_t pages = 0;
+          std::uint64_t bytes = 0;
+          while (pages < read_width && i + pages < end_page) {
+            const auto size = directory.groups()[i + pages].encoded_bytes_;
+            // Overlap ordinary pages, but never amplify oversized elements
+            // into a window of many large physical buffers. One indivisible
+            // page may exceed the byte bound and is then read alone.
+            if (pages != 0 && (bytes >= ListReadBatch::kPayloadBytes ||
+                               size > ListReadBatch::kPayloadBytes - bytes))
+              break;
+            bytes += size;
+            ++pages;
           }
-          co_await batch.Join();
-          // The join adds a scheduling boundary after the last loader's
-          // checks. A flush/population replacement can run in that gap even
-          // when every child returned a successfully decoded old page.
+          read_status = co_await AppendListReadWindow(
+              store.worker_, pages,
+              [&](std::size_t j) {
+                LAVIK_FAULT_INJECT(if (j == 1) {
+                  LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_LIST_READ_BATCH_START_KEY",
+                                        key);
+                });
+                const auto& route = directory.groups()[i + j];
+                const auto take = std::min<std::uint64_t>(
+                    remaining, route.item_count_ - offset);
+                auto read =
+                    LoadOrderedListRange(store, partition, db_id, key, digest,
+                                         object, route.id_, offset, take);
+                remaining -= take;
+                offset = 0;
+                return read;
+              },
+              result.values_);
+          // The window joins after the last loader's checks. A flush can run
+          // in that gap even if every child decoded successfully. Its values
+          // are owned, but must not be published for a replaced population.
           if (population_changed()) co_return ListResult{};
           if (!read_status.ok()) break;
-          for (std::size_t j = 0; j < batch.size(); ++j) {
-            read_status = append(batch.Take(j));
-            if (!read_status.ok()) break;
-          }
-          if (!read_status.ok()) break;
-          i += batch.size();
+          i += pages;
         }
       }
       if (!read_status.ok()) {

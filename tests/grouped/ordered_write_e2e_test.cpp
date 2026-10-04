@@ -150,6 +150,42 @@ TEST(GroupedListWriteE2e, RangeReadFailureJoinsStartedPages) {
   for (const auto& item : all.items_) EXPECT_EQ(item.text_, value);
 }
 
+TEST(GroupedListWriteE2e, RangeReadsBoundOversizedPageMemory) {
+  PrivateDisk disk;
+  const std::string key = "oversized-range-budget";
+  constexpr unsigned count = 16;
+  auto value = [](unsigned i) {
+    std::string bytes(4 * 1024 * 1024, static_cast<char>(i));
+    const auto prefix = std::to_string(i);
+    bytes.replace(0, prefix.size(), prefix);
+    return bytes;
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    for (unsigned i = 0; i < count; ++i)
+      ASSERT_EQ(client.Command({"RPUSH", key, value(i)}).text_,
+                std::to_string(i + 1));
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // The owned 64 MiB reply fits, but loading every indivisible large page
+  // concurrently can consume another complete payload in physical buffers.
+  // Storage admission is isolated from the separate client-buffer quota.
+  Server server(disk, 1, {}, {}, false, 2, "128M", {}, "0");
+  Client client(server.port());
+  const auto all = client.Command({"LRANGE", key, "0", "-1"});
+  ASSERT_EQ(all.kind_, '*') << all.text_ << server.Log();
+  ASSERT_EQ(all.items_.size(), count);
+  for (unsigned i = 0; i < count; ++i)
+    EXPECT_EQ(all.items_[i].text_, value(i)) << i;
+  EXPECT_EQ(client.Command({"LINDEX", key, "-1"}).text_, value(count - 1));
+  EXPECT_EQ(client.Command({"SET", "unrelated", "after-large-range"}).text_,
+            "OK");
+  client.Durable();
+  ASSERT_EQ(server.Wait(true), 0) << server.Log();
+}
+
 TEST(GroupedListWriteE2e, SuspendedReadersReleaseWorkerState) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires grouped List read gate";
