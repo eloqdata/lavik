@@ -15,7 +15,7 @@
  */
 
 #include "impl.h"
-#include "lavik/storage/detail/grouped_scratch.h"
+#include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
 
 namespace lavik::storage {

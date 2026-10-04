@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "lavik/storage/detail/grouped_collection.h"
+#include "lavik/storage/detail/grouped/collection.h"
 
 namespace lavik::storage {
 

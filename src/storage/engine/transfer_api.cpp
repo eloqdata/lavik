@@ -15,7 +15,7 @@
  */
 
 #include "impl.h"
-#include "lavik/storage/detail/grouped_scratch.h"
+#include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {

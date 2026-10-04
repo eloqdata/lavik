@@ -17,7 +17,7 @@
 #include <optional>
 #include <tuple>
 
-#include "grouped_write_e2e_support.h"
+#include "grouped/write_e2e_support.h"
 
 namespace {
 using namespace grouped_e2e;

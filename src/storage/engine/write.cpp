@@ -18,7 +18,7 @@
 #include <new>
 
 #include "absl/strings/str_cat.h"
-#include "grouped_dependency_test_hook.h"
+#include "grouped/dependency_test_hook.h"
 #include "impl.h"
 #include "lavik/memory.h"
 #include "lavik/metrics.h"

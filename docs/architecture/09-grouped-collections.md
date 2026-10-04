@@ -514,25 +514,27 @@ commit cannot resurrect failed input or reclaim the restored graph.
 
 ## Source map
 
-Internal storage model and codec headers live under
-`include/lavik/storage/detail/`; they are not an independent public engine
-API. Their implementation units remain under `src/storage/engine/`.
+Grouped storage remains part of the storage engine, with implementation units
+under `src/storage/engine/grouped/` and internal model/codec headers under
+`include/lavik/storage/detail/grouped/`. It shares the engine's `Impl`, append
+and recovery services; the directory is not an independent public engine API.
+Its unit, command, recovery and fault tests live under `tests/grouped/`.
 
 | Responsibility | Source |
 |---|---|
-| Prefix snapshots, mutation planning and persistent routing | `include/lavik/storage/detail/grouped_hash.h`, `src/storage/engine/grouped_hash.cpp` |
+| Prefix snapshots, mutation planning and persistent routing | `include/lavik/storage/detail/grouped/hash.h`, `src/storage/engine/grouped/hash.cpp` |
 | Logical collection encodings and per-element validation | `include/lavik/storage/detail/hash_codec.h`, `ordered_compact_codec.h`; `src/storage/engine/hash_codec.cpp`, `ordered_compact_codec.cpp`, `list_tree.cpp`, `src/redis/zset_command.cpp` |
-| Bounded Hash/Set random reads and deterministic sparse Set pops | `src/storage/engine/grouped_hash_random.cpp`, `hash_tree.cpp` |
-| Sparse object index, group locations and immutable metadata ownership | `include/lavik/storage/detail/grouped_object_index.h`, `src/storage/engine/grouped_object_index.cpp` |
-| Physical reads, incremental publication, extent streaming and commit dependencies | `src/storage/engine/grouped_read.cpp`, `grouped_write.cpp`, `grouped_mutation.cpp`, `write.cpp`; `include/lavik/storage/detail/record_payload_cursor.h`, `grouped_commit.h` |
-| Root-only expiration/persistence publication | `src/storage/engine/grouped_metadata.cpp`, `grouped_object_index.cpp`, `write.cpp` |
-| Fixed String segments and direct byte-range operations | `src/storage/engine/grouped_string.cpp`, `src/redis/string_command.cpp` |
-| Foreground scratch admission and pinned key transfers | `include/lavik/storage/detail/grouped_scratch.h`, `src/storage/engine/transfer_api.cpp`, `grouped_restore.cpp` |
-| Atomic ordinary collection ingestion and command-local compensation | `src/storage/engine/collection_ingest.cpp`, `grouped_restore.cpp`, `write.cpp`; `include/lavik/storage/detail/replica_collection_stage.h` |
+| Bounded Hash/Set random reads and deterministic sparse Set pops | `src/storage/engine/grouped/hash_random.cpp`, `hash_tree.cpp` |
+| Sparse object index, group locations and immutable metadata ownership | `include/lavik/storage/detail/grouped/object_index.h`, `src/storage/engine/grouped/object_index.cpp` |
+| Physical reads, incremental publication, extent streaming and commit dependencies | `src/storage/engine/grouped/read.cpp`, `src/storage/engine/grouped/write.cpp`, `src/storage/engine/grouped/mutation.cpp`, `write.cpp`; `include/lavik/storage/detail/record_payload_cursor.h`, `include/lavik/storage/detail/grouped/commit.h` |
+| Root-only expiration/persistence publication | `src/storage/engine/grouped/metadata.cpp`, `src/storage/engine/grouped/object_index.cpp`, `write.cpp` |
+| Fixed String segments and direct byte-range operations | `src/storage/engine/grouped/string.cpp`, `src/redis/string_command.cpp` |
+| Foreground scratch admission and pinned key transfers | `include/lavik/storage/detail/grouped/scratch.h`, `src/storage/engine/transfer_api.cpp`, `src/storage/engine/grouped/restore.cpp` |
+| Atomic ordinary collection ingestion and command-local compensation | `src/storage/engine/collection_ingest.cpp`, `src/storage/engine/grouped/restore.cpp`, `write.cpp`; `include/lavik/storage/detail/replica_collection_stage.h` |
 | Admitted snapshot tokens, sequential page reads and whole-key RDB output ownership | `include/lavik/storage/collection_page.h`, `src/storage/engine/backup.cpp`, `include/lavik/rdb_collection.h`, `src/redis/rdb_collection.cpp`, `src/redis/backup.cpp` |
 | Incremental RDB collection parsing, preflight validation and import consumers | `include/lavik/rdb.h`, `src/redis/rdb.cpp`, `src/redis/rdb_import.cpp`, `src/redis/server.cpp`, `src/redis/command.cpp`, `src/replication/replication.cpp` |
-| Native compact wire streaming and transactional grouped ingestion | `include/lavik/storage/detail/collection_compact_stream.h`, `replica_collection_stage.h`; `src/storage/engine/collection_compact_stream.cpp`, `grouped_replication_source.cpp`, `replica_collection.cpp`, `replication.cpp` |
-| Ordered pages, rank routing and collection command adapters | `include/lavik/storage/sorted_set.h`; `include/lavik/storage/detail/grouped_collection.h`, `grouped_sorted_rewrite.h`; `src/storage/engine/grouped_collection.cpp`, `grouped_sorted_rewrite.cpp`, `grouped_ordered_io.cpp`, `grouped_ordered_mutation.cpp`, `grouped_list.cpp`, `grouped_zset.cpp`, `sorted_set_api.cpp`, `list_tree.cpp`, `compact_api.cpp` |
-| Sorted Set member-prefix reads and atomic dual-index planning | `src/storage/engine/grouped_zset.cpp`, `grouped_zset_members.cpp`, `grouped_ordered_mutation.cpp` |
-| Retirement, undo and database detach | `src/storage/engine/grouped_lifecycle.cpp`, `write.cpp`, `flush_db.cpp`, `replication.cpp` |
+| Native compact wire streaming and transactional grouped ingestion | `include/lavik/storage/detail/collection_compact_stream.h`, `replica_collection_stage.h`; `src/storage/engine/collection_compact_stream.cpp`, `src/storage/engine/grouped/replication_source.cpp`, `replica_collection.cpp`, `replication.cpp` |
+| Ordered pages, rank routing and collection command adapters | `include/lavik/storage/sorted_set.h`; `include/lavik/storage/detail/grouped/collection.h`, `include/lavik/storage/detail/grouped/sorted_rewrite.h`; `src/storage/engine/grouped/collection.cpp`, `src/storage/engine/grouped/sorted_rewrite.cpp`, `src/storage/engine/grouped/ordered_io.cpp`, `src/storage/engine/grouped/ordered_mutation.cpp`, `src/storage/engine/grouped/list.cpp`, `src/storage/engine/grouped/zset.cpp`, `sorted_set_api.cpp`, `list_tree.cpp`, `compact_api.cpp` |
+| Sorted Set member-prefix reads and atomic dual-index planning | `src/storage/engine/grouped/zset.cpp`, `src/storage/engine/grouped/zset_members.cpp`, `src/storage/engine/grouped/ordered_mutation.cpp` |
+| Retirement, undo and database detach | `src/storage/engine/grouped/lifecycle.cpp`, `write.cpp`, `flush_db.cpp`, `replication.cpp` |
 | Recovery, GC and historical snapshots | `src/storage/engine/recovery.cpp`, `init.cpp`, `defrag.cpp`, `backup.cpp` |
