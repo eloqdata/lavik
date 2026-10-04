@@ -495,6 +495,7 @@ def quantiles(samples):
         return {"count": 0}
     return {
         "count": len(ordered),
+        "max_ms": ordered[-1],
         **{
             name: ordered[min(len(ordered) - 1, math.ceil(q * len(ordered)) - 1)]
             for name, q in (("p50_ms", 0.5), ("p99_ms", 0.99), ("p999_ms", 0.999))
@@ -514,6 +515,7 @@ class Writer(threading.Thread):
     def run(self):
         client = self.source.client()
         due, index, selected = time.monotonic(), 0, 0
+        pending = None
         try:
             while not self.stop_event.is_set():
                 self.stop_event.wait(max(0, due - time.monotonic()))
@@ -531,6 +533,13 @@ class Writer(threading.Thread):
                     key = f"writer:{index % 1024}".encode()
                     value = f"{index:016d}".encode() + b"w" * 112
                 started = time.monotonic()
+                pending = {
+                    "begin_monotonic": started,
+                    "db": selected,
+                    "key_hex": key.hex(),
+                    "value_bytes": len(value),
+                    "mode": self.mode,
+                }
                 if self.mode == "transactional-set":
                     assert client.pipeline(
                         [("MULTI",), ("SET", key, value), ("EXEC",)]
@@ -539,28 +548,69 @@ class Writer(threading.Thread):
                     assert client.call("SET", key, value) == b"OK"
                     self.keys.add(key)
                 ended = time.monotonic()
-                self.samples.append((started, ended, (ended - started) * 1000))
+                self.samples.append(
+                    {
+                        **pending,
+                        "end_monotonic": ended,
+                        "latency_ms": (ended - started) * 1000,
+                        "success": True,
+                    }
+                )
+                pending = None
                 index += 1
                 # No accumulated catch-up burst after a blocked write.
                 due = max(due + 1 / self.rate, ended)
         except Exception as error:
             self.errors.append(repr(error))
+            if pending is not None:
+                ended = time.monotonic()
+                self.samples.append(
+                    {
+                        **pending,
+                        "end_monotonic": ended,
+                        "latency_ms": (ended - pending["begin_monotonic"]) * 1000,
+                        "success": False,
+                        "error": repr(error),
+                    }
+                )
         finally:
             client.close()
 
     def summary(self, start, end):
-        samples = [
-            latency
-            for begin, finish, latency in self.samples
-            if begin >= start and finish <= end
+        # Join the writer before summarizing. Include the eventual latency of
+        # every successful operation begun during the interval: omitting a
+        # request that finishes just after ONLINE hides final-cut stalls.
+        begun = [
+            sample
+            for sample in self.samples
+            if start <= sample["begin_monotonic"] < end
         ]
+        samples = [sample["latency_ms"] for sample in begun if sample["success"]]
+        # Throughput is completion-based and has a separate population from
+        # latency; a warmup request may finish inside the measured interval.
+        completed = sum(
+            sample["success"] and start <= sample["end_monotonic"] < end
+            for sample in self.samples
+        )
         return {
             **quantiles(samples),
-            "completed_qps": len(samples) / (end - start),
+            "completed_count": completed,
+            "completed_qps": completed / (end - start),
+            "begun_count": len(begun),
+            "failed_begun_count": sum(not sample["success"] for sample in begun),
+            "crossed_interval_end_count": sum(
+                sample["end_monotonic"] >= end for sample in begun
+            ),
+            "latency_population": "successful operations begun in [start,end), including later completion",
             "requested_qps": self.rate,
             "mode": self.mode,
             "errors": self.errors,
         }
+
+    def save_samples(self, path):
+        with path.open("w") as output:
+            for sample in self.samples:
+                output.write(json.dumps(sample) + "\n")
 
 
 class Sampler(threading.Thread):
@@ -992,6 +1042,11 @@ def run(args):
         if writer:
             writer.stop_event.set()
             writer.join(40)
+            try:
+                writer.save_samples(directory / "writer-samples.jsonl")
+                result["writer_samples_file"] = "writer-samples.jsonl"
+            except Exception as error:
+                cleanup_errors.append(f"writer samples: {error!r}")
         if sampler:
             sampler.stop_event.set()
             sampler.join(10)
