@@ -614,6 +614,7 @@ set(LAVIK_META_CORE_SOURCES
   src/meta/identity_store.cpp
   src/meta/membership_reconciler.cpp
   src/meta/observation_store.cpp
+  src/meta/observation_facts_view.cpp
   src/meta/owner_serviceability.cpp
   src/meta/operation_store.cpp
   src/meta/policy_store.cpp
@@ -890,6 +891,7 @@ if (BUILD_TESTING)
     tests/meta_journal_test.cpp
     tests/meta_model_test.cpp
     tests/meta_observation_test.cpp
+    tests/meta_observation_facts_test.cpp
     tests/meta_owner_serviceability_test.cpp
     tests/meta_sentinel_discovery_test.cpp
     tests/meta_sentinel_server_test.cpp

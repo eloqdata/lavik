@@ -740,6 +740,24 @@ bool MetaTopologyStore::GroupExists(const std::string& group_id) const {
   return groups_.contains(group_id);
 }
 
+std::vector<MetaObservationGroupFacts> MetaTopologyStore::ObservationFacts()
+    const {
+  std::vector<MetaObservationGroupFacts> result;
+  result.reserve(groups_.size());
+  for (const auto& [group_id, state] : groups_) {
+    auto& group = result.emplace_back();
+    group.group_id_ = group_id;
+    group.record_ = state.record_;
+    group.authority_active_ = state.authority_active_;
+    group.failover_transition_ = state.failover_transition_;
+    group.members_.reserve(state.members_.size());
+    for (const auto& [node_id, member] : state.members_) {
+      group.members_.push_back({node_id, member.assignment_id_});
+    }
+  }
+  return result;
+}
+
 std::vector<MetaTopologyGroupView> MetaTopologyStore::Groups() const {
   std::vector<MetaTopologyGroupView> result;
   result.reserve(groups_.size());

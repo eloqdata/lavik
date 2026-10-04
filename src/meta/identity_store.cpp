@@ -508,6 +508,15 @@ bool MetaIdentityStore::IsActiveMetaMember(std::uint32_t server_id,
          it->second.principal_ == principal;
 }
 
+std::vector<std::string> MetaIdentityStore::ActiveNodeIds() const {
+  std::vector<std::string> result;
+  result.reserve(nodes_.size());
+  for (const auto& [node_id, record] : nodes_) {
+    if (!record.retired_) result.push_back(node_id);
+  }
+  return result;
+}
+
 std::vector<MetaNodeRecord> MetaIdentityStore::Nodes() const {
   std::vector<MetaNodeRecord> result;
   result.reserve(nodes_.size());
