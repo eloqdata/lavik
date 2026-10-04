@@ -2244,7 +2244,7 @@ class StorageEngine::Impl {
   // Borrowed names must outlive this coroutine; the result owns all index
   // writes. Only touched prefix leaves are decoded and retained scratch is
   // admitted. A probe must belong to this exact immutable predecessor and
-  // the only changed leaf. Unlocked callers yield between uncached pages.
+  // the only changed leaf. Unlocked callers yield before preparing each leaf.
   Task<absl::StatusOr<SortedSetMemberMutation>> PrepareSortedSetMembers(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
