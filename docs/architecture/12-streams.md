@@ -106,13 +106,21 @@ atomic publication. Consumer-filtered PEL operations scan the group's ID index,
 which has no separate persistent owner index.
 
 Range, XREAD and XREADGROUP replies pin the command-position root and selected
-pages, then generate
-message fields one page at a time as the network drains. EXEC retains that
-snapshot even if a later command replaces or deletes the key. XINFO FULL uses
-this same reader for its message array; its requested group/consumer/PEL
-inspection metadata remains admitted command state. Individual records and
-explicitly selected mutation/inspection windows must fit admission. Unlimited
-inspection metadata is not a constant-space operation.
+pages, then drain admitted decoded pages under network backpressure. Continuous
+message ranges may read a bounded window concurrently after their first
+boundary page; directory counts limit that window to pages needed by COUNT.
+Sparse selected-ID history and ordinary collection transfers read pages on
+demand. Each delivered page carries its own retained-memory charge, while
+undelivered window pages remain admitted on the key owner. Optional window
+admission falls back to a single page; cancellation or read failure joins all
+started reads before releasing source pins. Population and readability checks
+also apply when delivering already decoded pages.
+
+EXEC retains that snapshot even if a later command replaces or deletes the
+key. XINFO FULL uses this same reader for its message array; its requested
+group/consumer/PEL inspection metadata remains admitted command state.
+Individual records and explicitly selected mutation/inspection windows must
+fit admission. Unlimited inspection metadata is not a constant-space operation.
 
 Managed Single supports the same DB0–15 and cross-worker Stream execution as
 standalone; Cluster requires DB0 and one slot across all supplied Stream keys.

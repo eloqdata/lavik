@@ -612,6 +612,77 @@ TEST(GroupedStreamE2e, RangeRepliesPreserveMixedSizeBinaryRecords) {
     for (unsigned i = 1; i <= count; ++i)
       check(entries[i - 1], i, history && (i == 1 || i == 257 || i == 512));
   }
+  // Both readers outlive deletion and drain the remaining small pages.
+  // Forward and reverse cursors share the same command-position snapshot.
+  ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+  ASSERT_EQ(client.Command({"XRANGE", "s", "-", "+"}).text_, "QUEUED");
+  ASSERT_EQ(client.Command({"XREVRANGE", "s", "+", "-", "COUNT", "129"}).text_,
+            "QUEUED");
+  ASSERT_EQ(client.Command({"DEL", "s"}).text_, "QUEUED");
+  const auto transaction = client.Command({"EXEC"});
+  ASSERT_EQ(transaction.items_.size(), 3) << transaction.text_;
+  ASSERT_EQ(transaction.items_[0].items_.size(), count - 3);
+  std::size_t at = 0;
+  for (unsigned i = 1; i <= count; ++i)
+    if (i != 1 && i != 257 && i != 512)
+      check(transaction.items_[0].items_[at++], i);
+  ASSERT_EQ(transaction.items_[1].items_.size(), 129);
+  for (unsigned i = 0; i < 129; ++i)
+    check(transaction.items_[1].items_[i], 511 - i);
+  EXPECT_EQ(transaction.items_[2].text_, "1");
+}
+
+TEST(GroupedStreamE2e, ReadWindowsRespectCountAndJoinFailedStarts) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires Stream read-window admission/start hooks";
+#endif
+  PrivateDisk disk;
+  constexpr unsigned count = 128;
+  {
+    Server server(disk);
+    Client client(server.port());
+    PopulateStream(client, "s", count);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  for (bool fail_start : {false, true}) {
+    ScopedEnvironment fault(fail_start
+                                ? "LAVIK_FAIL_STREAM_READ_WINDOW_START_KEY"
+                                : "LAVIK_FAIL_STREAM_READ_WINDOW_ADMISSION_KEY",
+                            "s");
+    Server server(disk, 3);
+    Client control(server.port());
+    // Each small COUNT needs at most two pages, so neither fault may fire.
+    // In particular, do not prefetch the third page of a two-message result.
+    for (const auto* command : {"XRANGE", "XREVRANGE"}) {
+      const bool reverse = std::string_view(command) == "XREVRANGE";
+      auto small = control.Command({command, "s", reverse ? "+" : "-",
+                                    reverse ? "-" : "+", "COUNT", "2"});
+      ASSERT_EQ(small.items_.size(), 2) << small.text_;
+      EXPECT_EQ(small.items_[0].items_[0].text_, reverse ? "128-0" : "1-0");
+      Client reader(server.port());
+      const std::vector<std::string> full{command, "s", reverse ? "+" : "-",
+                                          reverse ? "-" : "+"};
+      if (fail_start) {
+        // Failure after a child starts terminates the streaming connection,
+        // but the source must join it before releasing borrowed state/pins.
+        EXPECT_THROW(reader.Command(full), std::runtime_error);
+      } else {
+        auto reply = reader.Command(full);
+        ASSERT_EQ(reply.items_.size(), count) << reply.text_;
+        EXPECT_EQ(reply.items_.back().items_[0].text_,
+                  reverse ? "1-0" : "128-0");
+      }
+      EXPECT_EQ(control.Command({"PING"}).text_, "PONG");
+      EXPECT_EQ(control.Command({"XLEN", "s"}).text_, "128");
+    }
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  const auto reply = client.Command({"XRANGE", "s", "-", "+"});
+  ASSERT_EQ(reply.items_.size(), count) << reply.text_;
+  EXPECT_EQ(reply.items_.back().items_[0].text_, "128-0");
 }
 
 TEST(GroupedStreamE2e, LargeRepliesKeepSnapshotsAndDeletedHistory) {

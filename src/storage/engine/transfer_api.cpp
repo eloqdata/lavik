@@ -14,11 +14,89 @@
  * limitations under the License.
  */
 
+#include <array>
+
 #include "impl.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
+
+namespace {
+
+// An owner-local, admitted window of decoded pages. Child tasks borrow the
+// source's key and pins, so every started task must finish before any error
+// returns to its caller. The source is released on its owner after readers
+// settle; shutdown reclaims this owned tree only after storage I/O quiesces.
+class StreamPageWindow {
+ public:
+  static constexpr std::size_t kWidth = 16;
+  static constexpr std::size_t kBytes = 512 * 1024;
+  using Read = Task<absl::StatusOr<LoadedOrderedGroup>>;
+  struct Page {
+    MemoryReservation admission_;
+    std::optional<LoadedOrderedGroup> loaded_;
+  };
+
+  StreamPageWindow(MemoryReservation admission, bycorf::Worker* worker)
+      : metadata_(std::move(admission)), worker_(worker) {}
+
+  void Start(std::size_t slot, Read read) {
+    assert(slot < size_ && !reads_[slot].valid());
+    read.SetCompletionCallback(
+        this, [](void* context, std::coroutine_handle<>) noexcept {
+          auto& window = *static_cast<StreamPageWindow*>(context);
+          assert(window.pending_ != 0);
+          if (--window.pending_ == 0 && window.waiter_)
+            window.worker_->Enqueue(std::exchange(window.waiter_, {}));
+        });
+    const auto handle = std::move(read).ReleaseHandle();
+    reads_[slot] = Read(handle);
+    ++pending_;
+    worker_->Enqueue(handle);
+  }
+
+  auto Join() {
+    struct Awaiter {
+      StreamPageWindow* window_;
+      bool await_ready() const noexcept { return window_->pending_ == 0; }
+      void await_suspend(std::coroutine_handle<> waiter) const noexcept {
+        window_->waiter_ = waiter;
+      }
+      void await_resume() const noexcept {}
+    };
+    return Awaiter{this};
+  }
+
+  absl::Status Collect() {
+    assert(pending_ == 0);
+    absl::Status status;
+    for (std::size_t i = 0; i < size_; ++i) {
+      if (!reads_[i].valid()) continue;
+      auto result = std::move(reads_[i]).TakeResult();
+      reads_[i] = {};
+      if (result.ok())
+        pages_[i].loaded_.emplace(std::move(*result));
+      else if (status.ok())
+        status = result.status();
+    }
+    return status;
+  }
+
+  // Each output takes only its own credit. Undelivered pages remain charged
+  // while the connection drains previous output or crosses to another worker.
+  MemoryReservation metadata_;
+  std::array<Page, kWidth> pages_;
+  std::size_t size_ = 0, next_ = 0;
+
+ private:
+  bycorf::Worker* worker_;
+  std::array<Read, kWidth> reads_;
+  std::size_t pending_ = 0;
+  std::coroutine_handle<> waiter_;
+};
+
+}  // namespace
 
 Task<absl::StatusOr<TransferValue>>
 StorageEngine::Impl::ReadValueForTransferLocked(
@@ -45,6 +123,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
     std::optional<LoadedOrderedGroup> probe_page_;
     std::optional<MemoryReservation> probe_reservation_;
     std::size_t probe_index_ = 0;
+    std::unique_ptr<StreamPageWindow> window_;
 
     // Resident maximum keys identify the candidate page. Unknown external
     // boundaries are learned lazily; only the candidate page needs a full
@@ -126,6 +205,79 @@ StorageEngine::Impl::ReadValueForTransferLocked(
                  version.index_generation_;
     }
 
+    static Task<absl::Status> FillWindow(Impl* engine, Source& source,
+                                         std::size_t first) {
+      // The first boundary page has already been consumed. Interior page
+      // counts now bound COUNT without decoding or reading beyond its last
+      // required page. Sparse selected-ID history uses the single-page path.
+      auto metadata = TryReserveMemory(sizeof(StreamPageWindow) + 4096);
+      if (!metadata) co_return absl::OkStatus();
+      auto window = std::make_unique<StreamPageWindow>(std::move(*metadata),
+                                                       source.store_->worker_);
+      const auto object = source.saved_.grouped_;
+      const auto& groups = object->ordered_directory().groups();
+      const auto available =
+          source.end_page_ - source.first_page_ - source.cursor_;
+      auto remaining = source.range_count_ - source.emitted_;
+      std::size_t bytes = window->metadata_.bytes();
+      for (std::size_t j = 0;
+           j < StreamPageWindow::kWidth && j < available && remaining != 0;
+           ++j) {
+        if (j == 1 &&
+            LAVIK_FAULT_MATCHES("LAVIK_FAIL_STREAM_READ_WINDOW_ADMISSION_KEY",
+                                source.key_))
+          co_return absl::OkStatus();
+        const auto index = source.range_->reverse_ ? first - j : first + j;
+        const auto& group = groups[index];
+        const HashGroupId id{group.id_, 0};
+        const auto* physical = object->FindGroup(id);
+        if (!physical)
+          co_return absl::DataLossError("missing Stream read-window page");
+        GroupedScratchBudget budget;
+        auto status = budget.AddGroup(physical->value_, object->ExtentsFor(id));
+        if (!status.ok()) co_return status;
+        if (budget.bytes() > StreamPageWindow::kBytes - bytes) break;
+        auto admission = budget.Reserve(1);
+        // Prefetch is optional. If the entire planned window cannot be
+        // admitted, release it before falling back to the original page read.
+        // No task or page load has started at this point.
+        if (!admission.ok()) co_return absl::OkStatus();
+        bytes += admission->bytes();
+        window->pages_[j].admission_ = std::move(*admission);
+        ++window->size_;
+        remaining -= std::min(remaining, group.item_count_);
+      }
+      if (window->size_ < 2) co_return absl::OkStatus();
+      absl::Status status;
+      for (std::size_t j = 0; j < window->size_; ++j) {
+        if (j == 1 &&
+            LAVIK_FAULT_MATCHES("LAVIK_FAIL_STREAM_READ_WINDOW_START_KEY",
+                                source.key_)) {
+          status = absl::ResourceExhaustedError("OOM Stream read window start");
+          break;
+        }
+        const auto index = source.range_->reverse_ ? first - j : first + j;
+        if (source.probe_page_ && source.probe_index_ == index) {
+          window->pages_[j].loaded_.emplace(std::move(*source.probe_page_));
+          source.probe_page_.reset();
+          source.probe_reservation_.reset();
+        } else {
+          window->Start(j, engine->LoadOrderedGroupSnapshot(
+                               *source.store_, *source.partition_,
+                               source.db_id_, source.key_, source.digest_,
+                               object, groups[index].id_, true));
+        }
+      }
+      co_await window->Join();
+      auto collected = window->Collect();
+      if (!source.Valid(*engine))
+        co_return absl::CancelledError("Stream read-window population changed");
+      if (!status.ok()) co_return status;
+      if (!collected.ok()) co_return collected;
+      source.window_ = std::move(window);
+      co_return absl::OkStatus();
+    }
+
     static Task<absl::Status> Release(Impl* engine,
                                       std::unique_ptr<Source> source) {
       const auto owner = source->store_->worker_->id();
@@ -195,30 +347,50 @@ StorageEngine::Impl::ReadValueForTransferLocked(
             co_return absl::DataLossError("missing selected Stream message");
         }
         id = {groups[index].id_, 0};
+        if (source->range_ && source->range_->selected_ids_.empty() &&
+            source->cursor_ != 0 && !source->window_ &&
+            source->cursor_ + 1 < source->end_page_ - source->first_page_ &&
+            groups[index].item_count_ <
+                source->range_count_ - source->emitted_) {
+          auto status = co_await FillWindow(engine, *source, index);
+          if (!status.ok()) co_return status;
+        }
       } else {
         if (source->hash_cursor_ == object->directory().groups().end())
           co_return absl::DataLossError("collection transfer cursor overflow");
         id = source->hash_cursor_->second.id_;
       }
-      const auto* physical = object->FindGroup(id);
-      if (physical == nullptr)
-        co_return absl::DataLossError("collection transfer page is missing");
-      GroupedScratchBudget budget;
-      const auto included =
-          budget.AddGroup(physical->value_, object->ExtentsFor(id));
-      if (!included.ok()) co_return included;
-      auto admission = budget.Reserve(1);
-      if (!admission.ok()) co_return admission.status();
+      MemoryReservation admission;
+      std::optional<LoadedOrderedGroup> loaded;
+      if (source->window_) {
+        auto& window = *source->window_;
+        auto& slot = window.pages_[window.next_++];
+        admission = std::move(slot.admission_);
+        loaded.emplace(std::move(*slot.loaded_));
+        if (loaded->snapshot_.id_ != id.prefix_)
+          co_return absl::DataLossError("Stream read-window cursor mismatch");
+        if (window.next_ == window.size_) source->window_.reset();
+      } else {
+        const auto* physical = object->FindGroup(id);
+        if (physical == nullptr)
+          co_return absl::DataLossError("collection transfer page is missing");
+        GroupedScratchBudget budget;
+        const auto included =
+            budget.AddGroup(physical->value_, object->ExtentsFor(id));
+        if (!included.ok()) co_return included;
+        auto reserved = budget.Reserve(1);
+        if (!reserved.ok()) co_return reserved.status();
+        admission = std::move(*reserved);
+      }
       CollectionPage page{.value_type_ = source->saved_.location_.value_type()};
       if (object->is_ordered()) {
-        std::optional<LoadedOrderedGroup> loaded;
-        if (source->range_ && source->probe_page_ &&
+        if (!loaded && source->range_ && source->probe_page_ &&
             source->probe_page_->snapshot_.id_ == id.prefix_) {
           loaded.emplace(std::move(*source->probe_page_));
           source->probe_page_.reset();
           // The page/output reservation above now covers these bytes.
           source->probe_reservation_.reset();
-        } else {
+        } else if (!loaded) {
           auto from_disk = co_await engine->LoadOrderedGroupSnapshot(
               *source->store_, *source->partition_, source->db_id_,
               source->key_, source->digest_, object, id.prefix_, true);
@@ -301,6 +473,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       if (!source->Valid(*engine))
         co_return absl::CancelledError(
             "collection transfer population changed");
+      const auto readable = object->ReadStatus();
+      if (!readable.ok()) co_return readable;
       const auto total = source->range_ ? source->range_count_
                          : object->is_ordered()
                              ? object->ordered_directory().root().item_count_
@@ -312,10 +486,10 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       source->done_ = page.done_;
       page.next_cursor_ = ++source->cursor_;
       const auto bytes = page.RetainedBytes();
-      if (bytes > admission->bytes())
+      if (bytes > admission.bytes())
         co_return absl::ResourceExhaustedError(
             "collection transfer page exceeds admission");
-      page.retained_charge_.Adopt(&*admission, bytes);
+      page.retained_charge_.Adopt(&admission, bytes);
       co_return page;
     }
   };
