@@ -2269,6 +2269,9 @@ class StorageEngine::Impl {
   // Page ownership and admission travel together from preparation through
   // publication. Declare charges first so pages die before credit is returned.
   struct PreparedOrderedMutation {
+    // A reused decoded page keeps its original credit. pages_ admits only
+    // the remaining plan bytes; both reservations outlive all after-images.
+    MemoryReservation source_page_;
     MemoryReservation pages_;
     MemoryReservation inputs_;
     OrderedCollectionMutationPlan plan_;

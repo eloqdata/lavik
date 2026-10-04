@@ -387,6 +387,30 @@ TEST(GroupedScratchBudgetTest, AdmitsSelectedScratchBeforeAllocation) {
   EXPECT_TRUE(selected.Reserve(4).ok());
 }
 
+TEST(GroupedScratchBudgetTest, ReusedPageCreditSurvivesPlanAdmission) {
+  GroupedMemoryScope memory;
+  GroupedScratchBudget budget;
+  ASSERT_TRUE(budget.AddGroup(GroupLocation(1, 1, 3), nullptr).ok());
+  auto probe = budget.Reserve(2);
+  ASSERT_TRUE(probe.ok());
+  const auto old_bytes = probe->bytes();
+  {
+    auto remainder = budget.Reserve(4, &*probe);
+    ASSERT_TRUE(remainder.ok()) << remainder.status();
+    EXPECT_EQ(remainder->bytes() + probe->bytes(), 2 * old_bytes);
+  }
+  // A rejected plan neither consumes nor releases the still-live probe.
+  GroupedScratchBudget oversized;
+  ASSERT_TRUE(oversized.AddBytes(1024ULL * 1024 * 1024).ok());
+  EXPECT_EQ(oversized.Reserve(4, &*probe).status().code(),
+            absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(probe->bytes(), old_bytes);
+  EXPECT_TRUE(static_cast<bool>(*probe));
+  EXPECT_EQ(budget.Reserve(1, &*probe).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_TRUE(budget.Reserve(4, &*probe).ok());
+}
+
 TEST(GroupedScratchBudgetTest, RetainedIndexMetadataNeedsNoLiveBlock) {
   GroupedMemoryScope memory;
   for (const bool external : {false, true}) {

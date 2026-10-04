@@ -71,11 +71,18 @@ class GroupedScratchBudget {
     return absl::OkStatus();
   }
 
-  absl::StatusOr<MemoryReservation> Reserve(std::size_t copies) const {
+  // Existing credit must belong to this worker, cover part of this same
+  // scratch, and outlive its payload alongside the returned reservation.
+  // Only the uncovered bytes are newly admitted; failure preserves the credit.
+  absl::StatusOr<MemoryReservation> Reserve(
+      std::size_t copies, const MemoryReservation* existing = nullptr) const {
     if (copies == 0 ||
         bytes_ > std::numeric_limits<std::size_t>::max() / copies)
       return absl::ResourceExhaustedError("grouped scratch peak size overflow");
-    auto reservation = TryReserveMemory(bytes_ * copies);
+    const auto covered = existing != nullptr ? existing->bytes() : 0;
+    if (covered > bytes_ * copies)
+      return absl::InvalidArgumentError("scratch credit exceeds plan budget");
+    auto reservation = TryReserveMemory(bytes_ * copies - covered);
     if (!reservation) {
       RecordMemoryRejection();
       return absl::ResourceExhaustedError(

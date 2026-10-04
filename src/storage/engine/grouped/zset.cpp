@@ -1197,6 +1197,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     } else {
       source_ranges.emplace_back(0, metadata.size());
     }
+    std::optional<OwnedScanPage> source_probe;
     std::size_t scanned_end = 0;
     for (const auto& [first, end] : source_ranges) {
       for (std::size_t i = std::max(first, scanned_end);
@@ -1217,6 +1218,11 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           state.source_ = i;
           if (indexed) --remaining_sources;
         }
+        // A point lookup stops here once its sole member is found. Keep one
+        // admitted owned page, never a request-sized cache or physical lease.
+        if (indexed && remaining_sources == 0 && !ReadOnly(operation) &&
+            members.size() == 1)
+          source_probe.emplace(std::move(*page));
       }
       scanned_end = std::max(scanned_end, end);
     }
@@ -1226,6 +1232,19 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     status = ApplyInputs(operation, &members, &result);
     if (!status.ok()) co_return status;
     if (ReadOnly(operation) || result.changed_ == 0) co_return result;
+    if (source_probe) {
+      const auto& state = members.begin()->second;
+      if (state.after_) {
+        const auto destination = std::min(
+            directory.LowerBoundScore(*state.after_), metadata.size() - 1);
+        // Cross-page moves and non-final maximum-score ties may read another
+        // boundary page. Drop this probe first to preserve their scan peak.
+        if (destination != state.source_ ||
+            (destination + 1 != metadata.size() &&
+             *state.after_ == metadata[destination].max_score_))
+          source_probe.reset();
+      }
+    }
     std::optional<MemoryReservation> working_admission;
     OrderedCollectionMutationPlan plan{
         .root_ = directory.root(),
@@ -1234,6 +1253,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         .writes_ = {}};
     plan.root_.item_count_ = result.length_;
     if (result.length_ == 0) {
+      source_probe.reset();
       plan.delete_key_ = true;
       if (prepared != nullptr) {
         prepared->plan_ = std::move(plan);
@@ -1311,7 +1331,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       status = budget.AddBytes(member.size() + 256);
       if (!status.ok()) co_return status;
     }
-    auto admission = budget.Reserve(4);
+    auto admission =
+        budget.Reserve(4, source_probe ? &source_probe->admission_ : nullptr);
     if (!admission.ok()) co_return admission.status();
     working_admission.emplace(std::move(*admission));
     auto check_plan_read = [&](std::size_t i) -> absl::Status {
@@ -1328,12 +1349,20 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     // neighbour only if splitting/retirement actually changes its link.
     // Routing and pair redistribution need only the already modified pages.
     for (const auto i : modified) {
-      status = check_plan_read(i);
-      if (!status.ok()) co_return status;
-      auto page = co_await LoadOrderedGroupSnapshot(
-          store, partition, db_id, key, digest, object, metadata[i].id_);
-      if (!page.ok()) co_return page.status();
-      loaded.emplace(i, std::move(page->snapshot_));
+      if (source_probe &&
+          source_probe->page_.snapshot_.id_ == metadata[i].id_) {
+        // The key intent protects logical contents; add_page_budget above
+        // rechecks population/readability before admission. This owned page
+        // survives GC relocation without pinning any physical allocation.
+        loaded.emplace(i, std::move(source_probe->page_.snapshot_));
+      } else {
+        status = check_plan_read(i);
+        if (!status.ok()) co_return status;
+        auto page = co_await LoadOrderedGroupSnapshot(
+            store, partition, db_id, key, digest, object, metadata[i].id_);
+        if (!page.ok()) co_return page.status();
+        loaded.emplace(i, std::move(page->snapshot_));
+      }
     }
     for (const auto i : modified) {
       auto& entries = loaded.at(i).entries_;
@@ -1463,6 +1492,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       member_mutation = std::move(*built);
     }
     if (prepared != nullptr) {
+      if (source_probe)
+        prepared->source_page_ = std::move(source_probe->admission_);
       prepared->pages_ = std::move(*working_admission);
       prepared->plan_ = std::move(plan);
       prepared->members_.emplace(std::move(member_mutation));
