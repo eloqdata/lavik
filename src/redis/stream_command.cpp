@@ -1112,7 +1112,6 @@ struct StreamRangeReplyState {
   static constexpr std::size_t kChunkBytes = 64 * 1024;
   RetainedMemoryCharge state_charge_;
   RetainedMemoryCharge chunk_charge_;
-  std::size_t chunk_limit_ = 0;
   // Replies cross from a key owner to the connection/EXEC worker. Pending
   // reservations are worker-affine; retained charges may follow that ownership.
   RetainedMemoryCharge selection_charge_;
@@ -1157,28 +1156,23 @@ struct StreamRangeReplyState {
           reader_ = {};
           co_return std::move(pending_);
         }
-        if (chunk_limit_ == 0) {
-          // Coalesce small messages so each does not require a separate
-          // socket write. Single small results keep a proportionate buffer.
-          const auto limit = remaining_ == 0
-                                 ? std::min(kChunkBytes, pending_.size())
-                                 : kChunkBytes;
-          // Returned chunks can overlap their successors in the writer;
-          // retained charges follow replies across worker ownership hops.
-          // Include the string's small-capacity growth for tiny fragments.
-          const auto bytes = 2 * (std::max(limit, std::size_t{64}) + 1);
+        if (chunk_charge_.bytes() == 0) {
+          // Coalesce multiple messages or split an oversized one. Complete
+          // small final messages have already transferred their own buffer.
+          // Returned chunks can overlap in a composing producer; retained
+          // charges follow replies across worker ownership hops.
+          constexpr auto bytes = 2 * (kChunkBytes + 1);
           auto admission = TryReserveMemory(bytes);
           if (!admission)
             co_return absl::ResourceExhaustedError("OOM Stream reply chunk");
           chunk_charge_.Adopt(&*admission, bytes);
-          chunk_limit_ = limit;
         }
-        if (chunk.empty()) chunk.reserve(chunk_limit_);
+        if (chunk.empty()) chunk.reserve(kChunkBytes);
         const auto size =
-            std::min(pending_.size() - offset_, chunk_limit_ - chunk.size());
+            std::min(pending_.size() - offset_, kChunkBytes - chunk.size());
         chunk.append(pending_, offset_, size);
         offset_ += size;
-        if (chunk.size() == chunk_limit_) co_return chunk;
+        if (chunk.size() == kChunkBytes) co_return chunk;
         continue;
       }
       pending_ = std::string{};
