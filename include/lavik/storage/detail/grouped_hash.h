@@ -71,28 +71,47 @@ struct GroupedHashRoot {
   bool operator==(const GroupedHashRoot&) const noexcept = default;
 };
 
+inline constexpr std::size_t kGroupedHashRootBytes = 64;
+inline constexpr std::size_t kHashGroupHeaderBytes = 48;
+inline constexpr std::size_t kHashGroupPayloadLimit =
+    kMaxRecordPayloadBytes - kHashGroupHeaderBytes;
+
 enum class HashGroupEditKind { kSet, kSetIfAbsent, kDelete };
 struct HashGroupEdit;
 
-// Command-owned, fully checked compact bytes for a small replacement leaf.
+// Command-owned, fully checked group payload for a small replacement leaf,
+// including its envelope. Inline writers borrow these bytes through the write
+// instead of allocating and copying another complete serialization.
 // Only ApplyHashGroupEdits can construct this certificate. No borrowed request
 // or read-buffer data survives it; it is never retained in the resident index.
 class PreparedHashGroupPayload {
  public:
-  std::string_view bytes() const noexcept { return bytes_; }
+  // Compact Hash value bytes, empty for a leaf with no fields. Demotion uses
+  // this view to decode fields without treating the group envelope as data.
+  std::string_view bytes() const noexcept {
+    return std::string_view(bytes_).substr(kHashGroupHeaderBytes);
+  }
+  // Complete group payload, borrowed for serialization through an inline write
+  // or the existing bounded extent cursor.
+  std::string_view record_payload() const noexcept { return bytes_; }
   std::uint32_t count() const noexcept { return count_; }
   HashGroupId id() const noexcept { return id_; }
+  std::uint64_t incarnation() const noexcept { return incarnation_; }
 
  private:
   friend absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
       std::string_view, const DigestSeed&, HashGroupEditKind,
       std::span<const HashEntryView>);
   PreparedHashGroupPayload(std::string bytes, std::uint32_t count,
-                           HashGroupId id)
-      : bytes_(std::move(bytes)), count_(count), id_(id) {}
+                           HashGroupId id, std::uint64_t incarnation)
+      : bytes_(std::move(bytes)),
+        count_(count),
+        id_(id),
+        incarnation_(incarnation) {}
   std::string bytes_;
   std::uint32_t count_;
   HashGroupId id_;
+  std::uint64_t incarnation_;
 };
 
 struct HashGroupSnapshot {
@@ -125,11 +144,6 @@ struct HashGroupEdit {
 absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
     std::string_view payload, const DigestSeed& seed, HashGroupEditKind kind,
     std::span<const HashEntryView> edits);
-
-inline constexpr std::size_t kGroupedHashRootBytes = 64;
-inline constexpr std::size_t kHashGroupHeaderBytes = 48;
-inline constexpr std::size_t kHashGroupPayloadLimit =
-    kMaxRecordPayloadBytes - kHashGroupHeaderBytes;
 
 // A bounded-state serializer for inline records and extent writers. Create
 // validates owned fields or consumes the checked prepared payload. The caller

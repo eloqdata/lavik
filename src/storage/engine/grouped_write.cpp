@@ -159,17 +159,25 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
                         inline_bytes > options_.buffers_.write_buffer_bytes_;
   ExtentManifest extents;
   std::string payload;
+  std::string_view record_payload;
   if (external) {
     RecordPayloadCursor cursor(encoder, std::string_view{});
     auto written = co_await WriteExtentValueLocked(store, {}, {}, &cursor, key);
     if (!written.ok()) co_return written.status();
     extents = std::move(*written);
     payload = EncodeManifest(*extents);
+    record_payload = payload;
     LAVIK_MAYBE_CRASH_AT("group-extents-durable-before-record");
+  } else if (snapshot.prepared_) {
+    // Preflight certified the complete envelope as well as the entries. The
+    // caller pins this immutable snapshot across WriteRecordLocked, so its
+    // command-owned bytes can be copied directly into the storage buffer.
+    record_payload = snapshot.prepared_->record_payload();
   } else {
     auto encoded = EncodeInlineRecordPayload(encoder);
     if (!encoded.ok()) co_return encoded.status();
     payload = std::move(*encoded);
+    record_payload = payload;
   }
   const GroupRecordWrite identity{
       .auxiliary_ = true,
@@ -186,7 +194,7 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
   RecordLocation location;
   const RecordWriteRequest record_write{
       .key_ = key,
-      .value_ = payload,
+      .value_ = record_payload,
       .digest_ = digest,
       .mutation_sequence_ = sequence,
       .logical_size_ = snapshot.field_count(),
