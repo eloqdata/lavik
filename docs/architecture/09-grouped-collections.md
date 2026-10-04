@@ -343,8 +343,15 @@ working state before compensation and propagate compensation failure rather
 than disguising it as an ordinary admission rejection.
 
 List length uses root metadata. Indexed/range reads validate the corresponding
-rank pages completely, copy only requested values into owned replies, and
-release each page before loading the next. Read-only operations retain shared
+rank pages completely and copy only requested values into owned replies.
+Multi-page ranges overlap a bounded window of page reads, join every launched
+read before returning or reporting an error, revalidate the population after
+the join, and append results in rank order.
+The caller owns the child tasks and aggregate reply admission; each child
+releases its physical read lease after decoding. Admission covers one owned
+payload plus reply/page headers and the bounded task window, independently
+of read-buffer accounting. Indexed reads retain their direct single-page path.
+Read-only operations retain shared
 key intent and an immutable routing view, release worker store state before
 page I/O, and validate population and physical record lifetime in the page
 loader. Push, pop and indexed replacement load the affected interval and its

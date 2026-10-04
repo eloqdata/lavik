@@ -14,11 +14,66 @@
  * limitations under the License.
  */
 
+#include <array>
+
 #include "../impl.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 
 namespace lavik::storage {
 namespace {
+
+// Keep reads owned by the parent, rather than detaching tasks that borrow its
+// key, view and admission. Every launched read is joined, including when a
+// later task/queue allocation fails. Shutdown destroys this owned child tree
+// only after the worker has quiesced storage I/O.
+class ListReadBatch {
+ public:
+  static constexpr std::size_t kWidth = 16;
+  using Result = absl::StatusOr<std::vector<std::string>>;
+  using Read = Task<Result>;
+
+  explicit ListReadBatch(bycorf::Worker* worker) : worker_(worker) {}
+
+  void Add(Read read) {
+    assert(size_ < kWidth);
+    read.SetCompletionCallback(
+        this, [](void* context, std::coroutine_handle<>) noexcept {
+          auto& batch = *static_cast<ListReadBatch*>(context);
+          assert(batch.pending_ != 0);
+          if (--batch.pending_ == 0 && batch.waiter_)
+            batch.worker_->Enqueue(std::exchange(batch.waiter_, {}));
+        });
+    const auto handle = std::move(read).ReleaseHandle();
+    reads_[size_] = Read(handle);
+    // If enqueue throws, this slot owns an unstarted task. The earlier slots
+    // must still finish before the batch and its borrowed inputs disappear.
+    worker_->Enqueue(handle);
+    ++size_;
+    ++pending_;
+  }
+
+  auto Join() {
+    struct Awaiter {
+      ListReadBatch* batch_;
+      bool await_ready() const noexcept { return batch_->pending_ == 0; }
+      void await_suspend(std::coroutine_handle<> waiter) const noexcept {
+        batch_->waiter_ = waiter;
+      }
+      void await_resume() const noexcept {}
+    };
+    return Awaiter{this};
+  }
+
+  std::size_t size() const noexcept { return size_; }
+  Result Take(std::size_t i) { return std::move(reads_[i]).TakeResult(); }
+
+ private:
+  bycorf::Worker* worker_;
+  std::size_t size_ = 0;
+  std::size_t pending_ = 0;
+  std::coroutine_handle<> waiter_;
+  std::array<Read, kWidth> reads_;
+};
 
 std::uint64_t Magnitude(std::int64_t value) {
   return value < 0 ? static_cast<std::uint64_t>(-(value + 1)) + 1
@@ -284,9 +339,19 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
           page_budget.AddGroup(entry->value_, object->ExtentsFor(id));
       if (!added.ok()) co_return added;
     }
-    // Scan adapters and range replies may retain several pages plus replacement
-    // entries. They must fail with OOM before accumulating an unbounded vector.
-    auto page_scratch = page_budget.Reserve(4);
+    const auto read_width =
+        std::min(ListReadBatch::kWidth, end_page - begin_page);
+    if (read_only && read_width > 1) {
+      // The ordinary budget includes one loader's fixed scratch. Admit the
+      // additional bounded coroutine frames before starting any parallel IO.
+      const auto added = page_budget.AddBytes((read_width - 1) * 4096);
+      if (!added.ok()) co_return added;
+    }
+    // Reads own each requested string once: page results move into the reply.
+    // The per-entry allowance covers both vectors' string headers; physical
+    // read buffers have independent accounting, including oversized pages.
+    // No mutation/encoding copies are needed, even with a wave in flight.
+    auto page_scratch = page_budget.Reserve(read_only ? 1 : 4);
     if (!page_scratch.ok()) co_return page_scratch.status();
     auto retain_output = [&]() -> absl::Status {
       std::size_t bytes = result.values_.capacity() * sizeof(std::string);
@@ -304,35 +369,76 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
       return absl::OkStatus();
     };
     if (read_only) {
-      // The loader checks the complete page under its read lease but only owns
-      // requested values. Move those directly into the reply and release each
-      // page before the next IO; LINDEX must not allocate every item on a page.
+      // A bounded wave overlaps storage waits while retaining rank order in
+      // the reply. Each loader checks its complete page and releases its lease
+      // after copying only the requested values. LINDEX keeps its direct path.
       std::uint64_t remaining = erase_count;
       std::size_t offset = first->offset_;
       if (end_page - begin_page > 1) result.values_.reserve(erase_count);
-      for (std::size_t i = begin_page; i < end_page; ++i) {
-        const auto take = std::min<std::uint64_t>(
-            remaining, directory.groups()[i].item_count_ - offset);
-        auto values = co_await LoadOrderedListRange(
-            store, partition, db_id, key, digest, object,
-            directory.groups()[i].id_, offset, take);
+      auto append = [&](ListReadBatch::Result values) -> absl::Status {
         if (!values.ok()) {
-          if (EffectiveRecordDbEpoch(partition, db_id) !=
-                  object->version().db_epoch_ ||
-              partition.replication_epoch_ !=
-                  object->version().replication_epoch_ ||
-              partition.grouped_generations_[db_id] !=
-                  object->version().index_generation_)
-            co_return ListResult{};
-          co_return values.status();
+          return values.status();
         }
         if (end_page - begin_page == 1)
           result.values_ = std::move(*values);
         else
           for (auto& value : *values)
             result.values_.push_back(std::move(value));
-        remaining -= take;
-        offset = 0;
+        return absl::OkStatus();
+      };
+      auto population_changed = [&] {
+        return EffectiveRecordDbEpoch(partition, db_id) !=
+                   object->version().db_epoch_ ||
+               partition.replication_epoch_ !=
+                   object->version().replication_epoch_ ||
+               partition.grouped_generations_[db_id] !=
+                   object->version().index_generation_;
+      };
+      absl::Status read_status;
+      if (read_width == 1) {
+        read_status = append(co_await LoadOrderedListRange(
+            store, partition, db_id, key, digest, object,
+            directory.groups()[begin_page].id_, offset, remaining));
+      } else {
+        for (std::size_t i = begin_page; i < end_page;) {
+          ListReadBatch batch(store.worker_);
+          try {
+            for (std::size_t j = 0;
+                 j < ListReadBatch::kWidth && i + j < end_page; ++j) {
+              LAVIK_FAULT_INJECT(if (j == 1) {
+                LAVIK_FAULT_BAD_ALLOC("LAVIK_FAIL_LIST_READ_BATCH_START_KEY",
+                                      key);
+              });
+              const auto& route = directory.groups()[i + j];
+              const auto take = std::min<std::uint64_t>(
+                  remaining, route.item_count_ - offset);
+              batch.Add(LoadOrderedListRange(store, partition, db_id, key,
+                                             digest, object, route.id_, offset,
+                                             take));
+              remaining -= take;
+              offset = 0;
+            }
+          } catch (const std::bad_alloc&) {
+            read_status = absl::ResourceExhaustedError(
+                "OOM grouped List read batch allocation");
+          }
+          co_await batch.Join();
+          // The join adds a scheduling boundary after the last loader's
+          // checks. A flush/population replacement can run in that gap even
+          // when every child returned a successfully decoded old page.
+          if (population_changed()) co_return ListResult{};
+          if (!read_status.ok()) break;
+          for (std::size_t j = 0; j < batch.size(); ++j) {
+            read_status = append(batch.Take(j));
+            if (!read_status.ok()) break;
+          }
+          if (!read_status.ok()) break;
+          i += batch.size();
+        }
+      }
+      if (!read_status.ok()) {
+        if (population_changed()) co_return ListResult{};
+        co_return read_status;
       }
       const auto retained = retain_output();
       if (!retained.ok()) co_return retained;
