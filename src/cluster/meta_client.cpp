@@ -2877,7 +2877,7 @@ struct MetaControlClientService::Impl {
 
   bycorf::Task<detail::MetaSessionRunResult> RunSession(
       bycorf::Worker& worker, const MetaControlEndpoint& endpoint,
-      bool* valid_heartbeat_ack, bycorf::TcpStream& stream) {
+      bool* valid_heartbeat_ack, bool* follower, bycorf::TcpStream& stream) {
     // Watchdogs can close the transport while cleanup awaits data workers.
     // Keep its storage alive through every session user, and close on early
     // handshake/redirect returns as well as the established-session path.
@@ -3005,6 +3005,7 @@ struct MetaControlClientService::Impl {
     }
     if (hello->disposition != control::ServerHelloDisposition::kAccepted) {
       directory_ = std::move(next_directory);
+      *follower = true;
       co_return absl::UnavailableError("connected Meta node is not leader");
     }
     if (auto status = CheckClientService(hello->service); !status.ok())
@@ -3427,28 +3428,26 @@ bycorf::Task<absl::Status> MetaControlClientService::Run(
   }
 
   bool attempted = false;
+  detail::MetaConnectSchedule schedule;
   while (!impl_->stopping_.load(std::memory_order_acquire) &&
          !worker.stop_requested()) {
-    bool valid_ack = false;
-    std::vector<MetaControlEndpoint> candidates =
-        impl_->directory_.Candidates();
-    while (!candidates.empty()) {
-      if (impl_->stopping_.load(std::memory_order_acquire) ||
-          worker.stop_requested()) {
-        break;
-      }
-      auto connected = co_await detail::ConnectMetaEndpoint(
-          worker, candidates, impl_->stopping_, &attempted);
-      if (!connected.ok()) {
-        if (!absl::IsCancelled(connected.status()))
-          spdlog::warn("Meta control connect attempts ended: {}",
-                       connected.status().message());
-        break;
-      }
-      const MetaControlEndpoint endpoint = candidates[(*connected)->index_];
-      candidates.erase(candidates.begin() + (*connected)->index_);
+    // A non-leader response can precede that peer's election. Retain retry
+    // progress, but refresh hints after every handshake rather than exhausting
+    // a stale candidate vector before revisiting responsive peers.
+    schedule.Refresh(impl_->directory_.Candidates());
+    auto connected =
+        co_await schedule.Connect(worker, impl_->stopping_, &attempted);
+    if (!connected.ok()) {
+      if (!absl::IsCancelled(connected.status()))
+        spdlog::warn("Meta control connect attempts ended: {}",
+                     connected.status().message());
+    } else {
+      bool valid_ack = false;
+      bool follower = false;
+      const MetaControlEndpoint endpoint =
+          schedule.Endpoint((*connected)->index_);
       const detail::MetaSessionRunResult session = co_await impl_->RunSession(
-          worker, endpoint, &valid_ack, (*connected)->stream_);
+          worker, endpoint, &valid_ack, &follower, (*connected)->stream_);
       const absl::Status& reported = session.report_status();
       if (impl_->service_incompatible_) {
         run_status = reported;
@@ -3471,9 +3470,12 @@ bycorf::Task<absl::Status> MetaControlClientService::Run(
         run_status = session.shutdown_status();
         break;
       }
-      if (valid_ack) {
-        break;
-      }
+      schedule.SessionEnded((*connected)->index_, follower,
+                            std::chrono::steady_clock::now() +
+                                MetaReconnectPolicy::MaximumDelay());
+      // An established session ends a discovery episode. Start its successor
+      // with the directory's normal leader preference and no old retry state.
+      if (valid_ack) schedule = detail::MetaConnectSchedule{};
     }
     if (impl_->stopping_.load(std::memory_order_acquire) ||
         worker.stop_requested()) {

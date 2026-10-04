@@ -16,6 +16,7 @@
 
 #include "lavik/cluster/meta_connector.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <optional>
@@ -83,34 +84,87 @@ bycorf::Task<absl::Status> Dial(bycorf::Worker& worker,
 }
 }  // namespace
 
+void MetaConnectSchedule::Refresh(
+    std::span<const MetaControlEndpoint> candidates) {
+  const bool new_preference =
+      !candidates.empty() &&
+      (candidates_.empty() ||
+       candidates.front() != candidates_.front().endpoint_);
+  std::vector<Candidate> refreshed;
+  refreshed.reserve(candidates.size());
+  for (const auto& endpoint : candidates) {
+    auto old = std::find_if(
+        candidates_.begin(), candidates_.end(),
+        [&](const Candidate& entry) { return entry.endpoint_ == endpoint; });
+    if (old == candidates_.end()) {
+      refreshed.push_back(Candidate{.endpoint_ = endpoint});
+    } else {
+      refreshed.push_back(std::move(*old));
+    }
+  }
+  candidates_ = std::move(refreshed);
+  if (new_preference) candidates_.front().last_attempt_ = 0;
+}
+
+void MetaConnectSchedule::SessionEnded(
+    std::size_t index, bool follower,
+    std::chrono::steady_clock::time_point retry_at) {
+  candidates_[index].follower_ = follower;
+  candidates_[index].retry_at_ = retry_at;
+}
+
 bycorf::Task<absl::StatusOr<std::unique_ptr<ConnectedMetaEndpoint>>>
-ConnectMetaEndpoint(bycorf::Worker& worker,
-                    std::span<const MetaControlEndpoint> candidates,
-                    const std::atomic<bool>& stopping, bool* attempted) {
+MetaConnectSchedule::Connect(bycorf::Worker& worker,
+                             const std::atomic<bool>& stopping,
+                             bool* attempted) {
   DialState state;
-  std::size_t next = 0;
+  std::vector<bool> started(candidates_.size(), false);
+  std::size_t remaining = candidates_.size();
   auto launch_at = std::chrono::steady_clock::now();
   absl::Status result;
-  while (state.winner_ == nullptr &&
-         (next < candidates.size() || state.Active())) {
+  while (state.winner_ == nullptr && (remaining != 0 || state.Active())) {
     if (stopping.load(std::memory_order_acquire) || worker.stop_requested()) {
       result = absl::CancelledError("Meta connection stopped");
       break;
     }
     const auto now = std::chrono::steady_clock::now();
-    if (next < candidates.size() && (now >= launch_at || !state.Active())) {
-      for (auto& attempt : state.attempts_) {
-        if (attempt.active_) continue;
-        attempt.cancellation_.emplace();
-        attempt.active_ = true;
-        worker.Spawn(Dial(worker, candidates[next], next, state, attempt));
-        if (attempted != nullptr) {
-          if (*attempted) RecordClusterControlReconnect();
-          *attempted = true;
+    if (remaining != 0 && (now >= launch_at || !state.Active())) {
+      std::size_t active = 0;
+      for (const auto& attempt : state.attempts_) active += attempt.active_;
+      bool waiting_follower = false;
+      for (std::size_t i = 0; i < candidates_.size(); ++i)
+        waiting_follower |= !started[i] && candidates_[i].follower_;
+      std::optional<std::size_t> next;
+      for (std::size_t i = 0; i < candidates_.size(); ++i) {
+        const auto& candidate = candidates_[i];
+        if (started[i] || now < candidate.retry_at_) continue;
+        // Keep one slot available even before the follower's backoff expires.
+        // Otherwise three blackholes can prevent revisiting a newly elected
+        // peer for the entire ten-second TCP deadline.
+        if (active >= kParallelAttempts ||
+            (waiting_follower && !candidate.follower_ &&
+             active >= kParallelAttempts - 1))
+          continue;
+        if (!next || candidate.last_attempt_ < candidates_[*next].last_attempt_)
+          next = i;
+      }
+      if (next) {
+        for (auto& attempt : state.attempts_) {
+          if (attempt.active_) continue;
+          attempt.cancellation_.emplace();
+          attempt.active_ = true;
+          started[*next] = true;
+          --remaining;
+          candidates_[*next].last_attempt_ = ++next_attempt_;
+          worker.Spawn(Dial(worker, candidates_[*next].endpoint_, *next, state,
+                            attempt));
+          if (attempted != nullptr) {
+            if (*attempted) RecordClusterControlReconnect();
+            *attempted = true;
+          }
+          launch_at = now + kStagger;
+          break;
         }
-        ++next;
-        launch_at = now + kStagger;
-        break;
       }
     }
     // Only active reconnection pays for this bounded stop/stagger polling.
@@ -127,5 +181,14 @@ ConnectMetaEndpoint(bycorf::Worker& worker,
     co_return absl::CancelledError("Meta connection stopped");
   if (state.winner_ != nullptr) co_return std::move(state.winner_);
   co_return state.last_error_;
+}
+
+bycorf::Task<absl::StatusOr<std::unique_ptr<ConnectedMetaEndpoint>>>
+ConnectMetaEndpoint(bycorf::Worker& worker,
+                    std::span<const MetaControlEndpoint> candidates,
+                    const std::atomic<bool>& stopping, bool* attempted) {
+  MetaConnectSchedule schedule;
+  schedule.Refresh(candidates);
+  co_return co_await schedule.Connect(worker, stopping, attempted);
 }
 }  // namespace lavik::cluster::detail

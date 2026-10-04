@@ -477,7 +477,7 @@ class TcpConnectBlackhole:
         self.listener.close()
 
 
-def run_plaintext(meta_binary, data_binary, workdir):
+def run_plaintext(meta_binary, data_binary, workdir, follower_retry_hold=None):
     scenario = os.path.join(workdir, "plaintext")
     os.makedirs(scenario, exist_ok=True)
     nodes = H.make_nodes(
@@ -546,6 +546,10 @@ def run_plaintext(meta_binary, data_binary, workdir):
         # SYNs. Otherwise a lucky ECONNREFUSED between kill and bind would evade
         # the connect-timeout regression on the old implementation.
         data.proc.send_signal(signal.SIGSTOP)
+        if follower_retry_hold is not None:
+            with open(follower_retry_hold, "w") as hold:
+                hold.write("return LeaderUnknown until all candidates were visited\n")
+            reconnect_log_start = os.path.getsize(data.log_path)
         old_leader.kill9()
         blackhole = TcpConnectBlackhole(old_leader.data_control_port)
         data.proc.send_signal(signal.SIGCONT)
@@ -558,6 +562,30 @@ def run_plaintext(meta_binary, data_binary, workdir):
         assert_keyed_write_fenced(data, "lost authority session")
         survivors = [node for node in nodes if node.id != old_leader.id]
         leader = H.find_leader(survivors, timeout=15)
+        if follower_retry_hold is not None:
+
+            def consumed_all_followers():
+                with open(data.log_path) as log:
+                    log.seek(reconnect_log_start)
+                    messages = log.read()
+                return all(
+                    messages.count(
+                        f"Meta control session to {node.data_control_endpoint} ended: "
+                        "connected Meta node is not leader"
+                    )
+                    >= (2 if node.id == follower.id else 1)
+                    for node in survivors
+                )
+
+            # The seed is also present as an unresolved identity. Require its
+            # second response so the old loop has exhausted every live entry,
+            # not just the learned directory, before the leader is discoverable.
+            H.wait_until(
+                "Data consumed all survivor non-leader replies",
+                5,
+                consumed_all_followers,
+            )
+            os.unlink(follower_retry_hold)
         reconnect_started = time.monotonic()
         data.wait_metric(
             "lavik_cluster_control_full_states_applied_total",
@@ -571,9 +599,14 @@ def run_plaintext(meta_binary, data_binary, workdir):
             "Data node reconnects to replacement Meta leader",
             timeout=10,
         )
+        recovery_boundary = (
+            "after election"
+            if follower_retry_hold is None
+            else "after releasing follower responses"
+        )
         H.log(
             "plaintext: blackholed old-leader reconnect, FDS and accepted "
-            f"session in {time.monotonic() - reconnect_started:.3f}s after election"
+            f"session in {time.monotonic() - reconnect_started:.3f}s {recovery_boundary}"
         )
         blackhole.close()
         blackhole = None
@@ -631,6 +664,8 @@ def run_plaintext(meta_binary, data_binary, workdir):
                     print(f"<Data metrics unavailable: {exc}>", file=sys.stderr)
         raise
     finally:
+        if follower_retry_hold is not None and os.path.exists(follower_retry_hold):
+            os.unlink(follower_retry_hold)
         if blackhole is not None:
             blackhole.close()
         if data is not None:

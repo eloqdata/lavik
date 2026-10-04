@@ -21,6 +21,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -233,4 +235,147 @@ TEST(MetaConnector, EmptyAndAllRefusedEndpointsReturnFailure) {
         co_return absl::OkStatus();
       }).ok());
 }
+TEST(MetaConnector, FollowerRetryKeepsASlotAndHonorsBackoff) {
+  Listener first, second, third, follower;
+  ASSERT_TRUE(first.Open(true));
+  ASSERT_TRUE(second.Open(true));
+  ASSERT_TRUE(third.Open(true));
+  ASSERT_TRUE(follower.Open());
+  const std::vector endpoints{first.Endpoint(), second.Endpoint(),
+                              third.Endpoint(), follower.Endpoint()};
+  std::atomic<bool> stopping{false};
+  EXPECT_TRUE(
+      RunScenario([&](bycorf::Worker& worker) -> bycorf::Task<absl::Status> {
+        lavik::cluster::detail::MetaConnectSchedule schedule;
+        schedule.Refresh(endpoints);
+        const auto retry_at = std::chrono::steady_clock::now() + 350ms;
+        schedule.SessionEnded(3, true, retry_at);
+        schedule.Refresh(endpoints);
+        auto connected = co_await schedule.Connect(worker, stopping, nullptr);
+        if (!connected.ok()) co_return connected.status();
+        EXPECT_EQ((*connected)->index_, 3);
+        EXPECT_GE(std::chrono::steady_clock::now(), retry_at);
+        EXPECT_LT(std::chrono::steady_clock::now(), retry_at + 2s);
+        co_return absl::OkStatus();
+      }).ok());
+}
+
+TEST(MetaConnector, FollowerWinsDoNotStarveCandidatesBeyondDeadPrefix) {
+  std::array<Listener, 5> dead;
+  Listener follower, leader;
+  std::vector<MetaControlEndpoint> endpoints;
+  for (auto& listener : dead) {
+    ASSERT_TRUE(listener.Open(true));
+    endpoints.push_back(listener.Endpoint());
+  }
+  ASSERT_TRUE(follower.Open());
+  ASSERT_TRUE(leader.Open());
+  endpoints.push_back(follower.Endpoint());
+  endpoints.push_back(leader.Endpoint());
+  std::atomic<bool> stopping{false};
+  EXPECT_TRUE(
+      RunScenario([&](bycorf::Worker& worker) -> bycorf::Task<absl::Status> {
+        lavik::cluster::detail::MetaConnectSchedule schedule;
+        schedule.Refresh(endpoints);
+        schedule.SessionEnded(5, true,
+                              std::chrono::steady_clock::now() + 120ms);
+        const auto started = std::chrono::steady_clock::now();
+        for (int round = 0; round < 4; ++round) {
+          // A fresh authenticated Hello may repeat the directory verbatim. This
+          // must not reset progress through attempts cancelled by the fast
+          // peer.
+          schedule.Refresh(endpoints);
+          auto connected = co_await schedule.Connect(worker, stopping, nullptr);
+          if (!connected.ok()) co_return connected.status();
+          EXPECT_LT(std::chrono::steady_clock::now() - started, 2s);
+          if ((*connected)->index_ == 6) co_return absl::OkStatus();
+          EXPECT_EQ((*connected)->index_, 5);
+          schedule.SessionEnded((*connected)->index_, true,
+                                std::chrono::steady_clock::now() + 120ms);
+          const int peer = ::accept4(follower.fd_, nullptr, nullptr,
+                                     SOCK_NONBLOCK | SOCK_CLOEXEC);
+          EXPECT_GE(peer, 0);
+          if (peer >= 0) ::close(peer);
+        }
+        co_return absl::InternalError("follower starved the later leader");
+      }).ok());
+}
+
+TEST(MetaConnector, ChangedLeaderHintOverridesOldDialOrder) {
+  Listener first, second;
+  ASSERT_TRUE(first.Open());
+  ASSERT_TRUE(second.Open());
+  std::atomic<bool> stopping{false};
+  EXPECT_TRUE(
+      RunScenario([&](bycorf::Worker& worker) -> bycorf::Task<absl::Status> {
+        lavik::cluster::detail::MetaConnectSchedule schedule;
+        std::vector endpoints{first.Endpoint(), second.Endpoint()};
+        schedule.Refresh(endpoints);
+        {
+          auto connected = co_await schedule.Connect(worker, stopping, nullptr);
+          if (!connected.ok()) co_return connected.status();
+          EXPECT_EQ(schedule.Endpoint((*connected)->index_), first.Endpoint());
+        }
+        schedule.Refresh(endpoints);
+        {
+          auto connected = co_await schedule.Connect(worker, stopping, nullptr);
+          if (!connected.ok()) co_return connected.status();
+          EXPECT_EQ(schedule.Endpoint((*connected)->index_), second.Endpoint());
+        }
+        // A new hint names the most recently tried endpoint. Without its
+        // preference, the least-recently attempted endpoint would win.
+        std::reverse(endpoints.begin(), endpoints.end());
+        schedule.Refresh(endpoints);
+        auto connected = co_await schedule.Connect(worker, stopping, nullptr);
+        if (!connected.ok()) co_return connected.status();
+        EXPECT_EQ(schedule.Endpoint((*connected)->index_), second.Endpoint());
+        co_return absl::OkStatus();
+      }).ok());
+}
+
+TEST(MetaConnector, StopDuringDeferredFollowerRetryCompletesPromptly) {
+  Listener dead, follower;
+  ASSERT_TRUE(dead.Open(true));
+  ASSERT_TRUE(follower.Open());
+  std::vector endpoints{dead.Endpoint(), follower.Endpoint()};
+  std::atomic<bool> stopping{false};
+  EXPECT_TRUE(
+      RunScenario([&](bycorf::Worker& worker) -> bycorf::Task<absl::Status> {
+        lavik::cluster::detail::MetaConnectSchedule schedule;
+        schedule.Refresh(endpoints);
+        schedule.SessionEnded(1, true, std::chrono::steady_clock::now() + 5s);
+        worker.Spawn(StopAfter(worker, stopping));
+        const auto started = std::chrono::steady_clock::now();
+        auto connected = co_await schedule.Connect(worker, stopping, nullptr);
+        EXPECT_FALSE(connected.ok());
+        if (!connected.ok()) EXPECT_TRUE(absl::IsCancelled(connected.status()));
+        EXPECT_LT(std::chrono::steady_clock::now() - started, 2s);
+        co_return absl::OkStatus();
+      }).ok());
+}
+
+TEST(MetaConnector, EndpointReuseDoesNotInheritPriorIdentityBackoff) {
+  Listener live;
+  ASSERT_TRUE(live.Open());
+  std::atomic<bool> stopping{false};
+  EXPECT_TRUE(
+      RunScenario([&](bycorf::Worker& worker) -> bycorf::Task<absl::Status> {
+        lavik::cluster::detail::MetaConnectSchedule schedule;
+        auto endpoint = live.Endpoint();
+        endpoint.server_id_ = 7;
+        endpoint.principal_ = "lavik://meta/7";
+        schedule.Refresh(std::span(&endpoint, 1));
+        schedule.SessionEnded(0, true, std::chrono::steady_clock::now() + 5s);
+        endpoint.server_id_ = 8;
+        endpoint.principal_ = "lavik://meta/8";
+        schedule.Refresh(std::span(&endpoint, 1));
+        const auto started = std::chrono::steady_clock::now();
+        auto connected = co_await schedule.Connect(worker, stopping, nullptr);
+        if (!connected.ok()) co_return connected.status();
+        EXPECT_EQ(schedule.Endpoint((*connected)->index_), endpoint);
+        EXPECT_LT(std::chrono::steady_clock::now() - started, 2s);
+        co_return absl::OkStatus();
+      }).ok());
+}
+
 }  // namespace
