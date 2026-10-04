@@ -9909,7 +9909,8 @@ auto ReplicationManager::ReplicationGroup::ReceiveFullSyncAcks(
   absl::Status result;
   while (!state->stopping_) {
     while (!state->stopping_ && state->expected_.empty() &&
-           state->handoffs_.inflight() == 0) {
+           state->handoffs_.inflight() == 0 &&
+           state->records_.inflight_frames() == 0) {
       co_await state->changed_.Wait();
     }
     if (state->stopping_) break;
@@ -9932,12 +9933,20 @@ auto ReplicationManager::ReplicationGroup::ReceiveFullSyncAcks(
       break;
     }
     if (!*handoff) {
-      const auto expected = state->expected_.find(sequence);
-      if (expected == state->expected_.end() || expected->second != partition) {
-        result = absl::InvalidArgumentError("unexpected full-sync ACK");
+      auto record = state->records_.Acknowledge(partition, sequence);
+      if (!record.ok()) {
+        result = record.status();
         break;
       }
-      state->expected_.erase(expected);
+      if (!*record) {
+        const auto expected = state->expected_.find(sequence);
+        if (expected == state->expected_.end() ||
+            expected->second != partition) {
+          result = absl::InvalidArgumentError("unexpected full-sync ACK");
+          break;
+        }
+        state->expected_.erase(expected);
+      }
     }
     session->TouchProgress(flow);
     state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
@@ -9980,11 +9989,52 @@ auto ReplicationManager::ReplicationGroup::SendFullSyncRequest(
   co_return co_await WaitFullSyncRequest(state, sequence);
 }
 
+auto ReplicationManager::ReplicationGroup::SendFullSyncRecord(
+    TcpStream& stream, const std::shared_ptr<FullSyncAckState>& state,
+    std::string_view body, std::uint16_t partition, std::uint64_t sequence)
+    -> Task<absl::Status> {
+  constexpr std::size_t kWireOverhead = kDataFrameHeaderBytes + 8;
+  if (body.size() > detail::FullSyncRecordWindow::kMaxBytes - kWireOverhead) {
+    co_return absl::ResourceExhaustedError(
+        "full-sync record exceeds send window byte limit");
+  }
+  const std::size_t wire_bytes = kWireOverhead + body.size();
+  while (state->status_.ok() && !state->records_.CanSend(wire_bytes)) {
+    co_await state->changed_.Wait();
+  }
+  if (!state->status_.ok()) co_return state->status_;
+  absl::Status begun = state->records_.Begin(partition, sequence, wire_bytes);
+  if (!begun.ok()) co_return begun;
+  state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
+  std::string payload;
+  PutU64(payload, sequence);
+  PutString(payload, body);
+  co_return co_await WriteDataFrame(stream, DataFrameKind::kRecords, payload);
+}
+
+auto ReplicationManager::ReplicationGroup::DrainFullSyncRecords(
+    const std::shared_ptr<FullSyncAckState>& state) -> Task<absl::Status> {
+  while (state->status_.ok() && state->records_.inflight_frames() != 0) {
+    co_await state->changed_.Wait();
+  }
+  co_return state->status_;
+}
+
 auto ReplicationManager::ReplicationGroup::RunMasterFlowData(
     TcpStream& stream, const std::shared_ptr<MasterSession>& session,
     unsigned flow_id) -> Task<absl::Status> {
+  // The fixed ledger survives individual writes, unlike transient frame
+  // buffers. Admit its retained bytes once; source pins keep their existing
+  // single-value lifetime and accounting until the complete value is ACKed.
+  auto records_reservation =
+      TryReserveMemory(sizeof(detail::FullSyncRecordWindow));
+  if (!records_reservation.has_value()) {
+    co_return ReplicationMemoryExhausted("full-sync record window");
+  }
   auto state =
       std::make_shared<FullSyncAckState>(flow_id, storage_->worker_count());
+  state->records_charge_.Adopt(&*records_reservation,
+                               sizeof(detail::FullSyncRecordWindow));
   bycorf::ThisWorker().self_->Spawn(
       ReceiveFullSyncAcks(stream, session, flow_id, state));
   auto cursor = co_await RunMasterFullSync(stream, session, flow_id, state);
@@ -10055,14 +10105,22 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       [&](std::uint16_t partition_id,
           std::span<const SnapshotRecord> records) -> Task<absl::Status> {
     if (records.empty()) co_return absl::OkStatus();
-    auto send_batch =
-        [&](std::span<const SnapshotRecord> batch) -> Task<absl::Status> {
+    auto send_batch = [&](std::span<const SnapshotRecord> batch,
+                          bool pipelined = false) -> Task<absl::Status> {
       std::string payload;
       absl::Status encoded = EncodeRecords(partition_id, batch, &payload);
       if (!encoded.ok()) co_return encoded;
-      absl::Status sent = co_await SendFullSyncRequest(
-          stream, ack_state, DataFrameKind::kRecords, payload, partition_id,
-          fullsync_sequence);
+      absl::Status sent;
+      // Keep each suspension in its own statement: GCC 13 can alias awaiter
+      // frame slots when both branches of ?: contain co_await.
+      if (pipelined) {
+        sent = co_await SendFullSyncRecord(stream, ack_state, payload,
+                                           partition_id, fullsync_sequence);
+      } else {
+        sent = co_await SendFullSyncRequest(stream, ack_state,
+                                            DataFrameKind::kRecords, payload,
+                                            partition_id, fullsync_sequence);
+      }
       if (!sent.ok()) co_return sent;
       session->TouchProgress(flow_id);
       ++fullsync_sequence;
@@ -10129,7 +10187,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
           .key_ = record.key_,
           .value_ = std::move(logical_size),
       };
-      sent = co_await send_batch(std::span(&begin, 1));
+      sent = co_await send_batch(std::span(&begin, 1), true);
       if (!sent.ok()) co_return sent;
       for (std::size_t chunk_index = 0; chunk_index < chunks; ++chunk_index) {
         const std::size_t offset =
@@ -10159,7 +10217,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
             .key_ = record.key_,
             .value_ = std::move(chunk_value),
         };
-        sent = co_await send_batch(std::span(&chunk, 1));
+        sent = co_await send_batch(std::span(&chunk, 1), true);
         if (!sent.ok()) co_return sent;
       }
       SnapshotRecord commit{
@@ -10175,7 +10233,12 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
           .key_ = record.key_,
           .value_ = {},
       };
-      sent = co_await send_batch(std::span(&commit, 1));
+      sent = co_await send_batch(std::span(&commit, 1), true);
+      if (!sent.ok()) co_return sent;
+      // Every origin (baseline, replacement, or publish-record FIFO) releases
+      // its source pin and capture credit when send_records returns. Retain
+      // that contract even though this value's individual frames overlap.
+      sent = co_await DrainFullSyncRecords(ack_state);
       if (!sent.ok()) co_return sent;
     }
     absl::Status sent = co_await flush_normal();

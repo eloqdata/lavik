@@ -929,6 +929,13 @@ if (BUILD_TESTING)
   find_program(LAVIK_PYTHON3_EXECUTABLE NAMES python3)
   if (LAVIK_PYTHON3_EXECUTABLE)
     add_test(
+      NAME benchmark.native_full_evidence
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/bench_native_full_sync_test.py
+    )
+    set_tests_properties(benchmark.native_full_evidence PROPERTIES TIMEOUT 30)
+
+    add_test(
       NAME meta_integration.smoke_3node
       COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/smoke_3node.py
@@ -1117,6 +1124,16 @@ if (BUILD_TESTING)
       )
       set_tests_properties(meta_integration.gate_native_replication PROPERTIES
         LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
+      add_test(
+        NAME meta_integration.gate_full_record_window
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_native_replication.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+                record_window
+      )
+      set_tests_properties(meta_integration.gate_full_record_window PROPERTIES
+        LABELS meta-integration TIMEOUT 300 RUN_SERIAL TRUE)
       add_test(
         NAME meta_integration.native_fixture_startup
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
@@ -1722,6 +1739,7 @@ if (BUILD_TESTING)
     tests/native_reparent_test.cpp
     tests/replica_applied_frontier_test.cpp
     tests/full_sync_handoff_test.cpp
+    tests/full_sync_record_window_test.cpp
     tests/ring_buffer_test.cpp
     tests/tx_block_leases_test.cpp
     tests/tx_lock_test.cpp

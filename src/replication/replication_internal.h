@@ -72,6 +72,7 @@
 #include "bycorf/runtime/sync.h"
 #include "bycorf/runtime/worker.h"
 #include "full_sync_handoff.h"
+#include "full_sync_record_window.h"
 #include "lavik/async_dns.h"
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/cluster/lease_clock.h"
@@ -2677,8 +2678,11 @@ class ReplicationManager::ReplicationGroup {
     FullSyncAckState(unsigned flow, unsigned flows)
         : handoffs_(storage::kLogicalStorageShards, flow, flows) {}
     detail::FullSyncHandoffProgress handoffs_;
+    RetainedMemoryCharge records_charge_;
+    detail::FullSyncRecordWindow records_;
     // Non-handoff ACKs share the same reader. Handoff ownership lives only in
-    // the partition ledger; these entries belong to records, commands and cut.
+    // the partition ledger; streamed records use their bounded window. These
+    // entries belong to synchronous records, commands, reset and cut.
     absl::flat_hash_map<std::uint64_t, std::uint16_t> expected_;
     bycorf::AsyncNotification changed_;
     absl::Status status_;
@@ -2697,6 +2701,15 @@ class ReplicationManager::ReplicationGroup {
       TcpStream& stream, const std::shared_ptr<FullSyncAckState>& state,
       DataFrameKind kind, std::string_view body, std::uint16_t partition,
       std::uint64_t sequence);
+
+  // Sends one record frame after window admission, without waiting for its
+  // ACK. The caller retains source ownership until DrainFullSyncRecords.
+  Task<absl::Status> SendFullSyncRecord(
+      TcpStream& stream, const std::shared_ptr<FullSyncAckState>& state,
+      std::string_view body, std::uint16_t partition, std::uint64_t sequence);
+
+  Task<absl::Status> DrainFullSyncRecords(
+      const std::shared_ptr<FullSyncAckState>& state);
 
   Task<absl::Status> RunMasterFlowData(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,

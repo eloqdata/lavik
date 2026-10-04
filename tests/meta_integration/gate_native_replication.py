@@ -34,7 +34,8 @@ import time
 
 import gate_cluster_create as C
 import harness as H
-from gate_data_control import DataProcess
+from gate_data_control import DataProcess, allocate_data_file
+from native_full_proxy import FullRecordProxy
 
 CLIENT_MODE = "cluster"
 
@@ -77,6 +78,8 @@ def pair(
     client_mode=None,
     prepare_target=None,
     source_extra_args=(),
+    source_proxy=None,
+    prepare_source=None,
 ):
     client_mode = client_mode or CLIENT_MODE
     directory = root / name
@@ -115,6 +118,12 @@ def pair(
         workers=target_workers,
         environment={**os.environ, **(target_faults or {})},
     )
+    if source_proxy is not None:
+        source_proxy.target = ("127.0.0.1", source.redis_port)
+        source.extra_args = tuple(source.extra_args) + (
+            "--announce-port",
+            str(source_proxy.listen_port),
+        )
     lines = [
         "schema_version = 1",
         f'client_mode = "{client_mode}"',
@@ -122,10 +131,15 @@ def pair(
     ]
     lines += C.meta_manifest_lines(meta)
     for node in (source, target):
+        endpoint = (
+            "tcp://" + source_proxy.endpoint
+            if node is source and source_proxy is not None
+            else node.advertised_endpoint
+        )
         lines += [
             "[[data_nodes]]",
             f'id = "{node.node_id}"',
-            f'client_endpoint = "{node.advertised_endpoint}"',
+            f'client_endpoint = "{endpoint}"',
         ]
     lines += [
         "[[groups]]",
@@ -137,9 +151,13 @@ def pair(
     manifest.write_text("\n".join(lines) + "\n")
     clients = []
     try:
+        if prepare_source is not None:
+            prepare_source(source)
         if prepare_target is not None:
             prepare_target(target)
         proxy.start()
+        if source_proxy is not None:
+            source_proxy.start()
         meta.start(initial_cluster_manifest=str(manifest))
         meta.wait_leader()
         source.start()
@@ -196,6 +214,8 @@ def pair(
         for client in clients:
             client.close()
         proxy.close()
+        if source_proxy is not None:
+            source_proxy.close()
         target.force_kill()
         source.force_kill()
         meta.force_kill()
@@ -1268,6 +1288,192 @@ def dense_collection_full_sync(root):
         )
 
 
+def prepare_window_source(source):
+    # The default one-worker fixture has only seven foreground storage blocks.
+    # Multiple 20 MiB values and their pinned snapshot versions need real device
+    # headroom; exhausting that fixture would test allocation failure instead.
+    path = Path(source.workdir).parent / "source-window-extra.data"
+    allocate_data_file(path, 512 * 1024 * 1024)
+    source.extra_args = tuple(source.extra_args) + ("--data-file", str(path))
+
+
+def full_record_window(root, origin="baseline", failure=None):
+    """Exercise real FULL data with ACK credit withheld at the transport."""
+    tag = next(
+        f"full-window-{i}"
+        for i in range(100000)
+        if C.redis_slot(f"full-window-{i}") == 0
+    )
+    key = "{" + tag + "}:value"
+    blocker = "{" + tag + "}:baseline-blocker"
+    # More than the 16 MiB window makes lack of backpressure observable. A
+    # streamed value ACKs Begin/each Chunk/Commit, unlike fragmented commands.
+    value = b"window-value:" + bytes(range(256)) * (20 * 1024 * 1024 // 256)
+    proxy = FullRecordProxy(
+        keys=(key, blocker) if origin == "override" else (key,),
+        hold_handoff=origin == "publish-record",
+    )
+
+    def seed(writer):
+        # A single logical SET must fit the source history even though FULL
+        # transports its value through the smaller record window.
+        assert (
+            writer.call("CONFIG", "SET", "repl-backlog-size", 64 * 1024 * 1024) == "OK"
+        )
+        if origin == "baseline":
+            assert writer.call("SET", key, value) == "OK"
+        elif origin == "override":
+            assert writer.call("SET", blocker, value) == "OK"
+        else:
+            assert writer.call("SET", blocker, "baseline") == "OK"
+
+    def filled(selected_key):
+        try:
+            H.wait_until(
+                "FULL record window filled before any ACK",
+                30,
+                lambda: proxy.snapshot(selected_key)["held"] == 8,
+            )
+        except BaseException:
+            H.log(f"record-window wire evidence: {proxy.snapshot(selected_key)}")
+            raise
+        before = proxy.snapshot(selected_key)
+        assert before["forwarded"] == 0, before
+        assert len(before["frames"]) == 8, before
+        assert [event[2] for event in before["frames"]] == [3] + [4] * 7
+        assert sum(event[1] for event in before["frames"]) <= 16 * 1024 * 1024
+        # With every ACK still held, neither source read speed nor kernel send
+        # buffering may admit another frame into this bounded application window.
+        time.sleep(0.2)
+        assert proxy.snapshot(selected_key) == before
+        return before
+
+    name = "full-record-window-" + origin + ("-" + failure if failure else "")
+    with pair(
+        root,
+        name,
+        seed=seed,
+        require_seed_before_full=True,
+        source_workers=1,
+        target_workers=2,
+        source_proxy=proxy,
+        prepare_source=prepare_window_source,
+        raft_args=H.raft_args(
+            snapshot_distance=100000, election_ms_low=5000, election_ms_high=10000
+        ),
+    ) as (meta, source, target, writer):
+        if origin == "override":
+            filled(blocker)
+            # The active DB is scanning, and this fresh identity has no covered
+            # baseline. Its write must therefore enter replacement capture,
+            # even if a later scanner happens to encounter the new key.
+            assert writer.call("SET", key, value) == "OK"
+            proxy.release(blocker)
+        elif origin == "publish-record":
+            H.wait_until("partition zero handed off", 30, proxy.handoff_seen.is_set)
+            # A transaction's after-image in an already-tailing partition uses
+            # the record FIFO, not a kFullSyncCommand projection. Holding its
+            # handoff keeps the source inside FULL until this effect commits.
+            assert writer.call("MULTI") == "OK"
+            assert writer.call("SET", key, value) == "QUEUED"
+            assert writer.call("EXEC") == ["OK"]
+            proxy.release()
+
+        before = filled(key)
+        if failure:
+            reader = Client(target, readonly=True)
+            try:
+                require_incomplete_population(reader)
+            finally:
+                reader.close()
+            if failure == "disconnect":
+                proxy.cut_flows()
+            else:
+                proxy.corrupt_ack(key, duplicate=failure == "duplicate-ack")
+                marker = (
+                    "unexpected full-sync ACK"
+                    if failure == "duplicate-ack"
+                    else "full-sync record ACK partition mismatch"
+                )
+                H.wait_until(
+                    failure + " rejected by source",
+                    30,
+                    lambda: marker in Path(source.log_path).read_text(),
+                )
+            H.wait_until(
+                "incomplete window failure reported to Meta",
+                30,
+                lambda: C.cluster_status(meta).get("cluster_state")
+                == "provisioning-failed",
+            )
+            reader = Client(target, readonly=True)
+            try:
+                require_incomplete_population(reader)
+                assert "lavik_replication_state:online" not in reader.call(
+                    "INFO", "replication"
+                )
+            finally:
+                reader.close()
+            target.terminate()
+            assert (
+                "replication targets quiesced before storage flush"
+                in Path(target.log_path).read_text()
+            )
+            return
+
+        # Releasing a full-sized chunk (not the tiny Begin ACK) creates exactly
+        # enough frame and byte credit for the next chunk. Other ACKs stay held.
+        assert proxy.release(key, record_kind=4) == 1
+        H.wait_until(
+            "one record ACK replenishes one window slot",
+            30,
+            lambda: proxy.snapshot(key)["held"] == 8
+            and len(proxy.snapshot(key)["frames"]) == 9,
+        )
+        resumed = proxy.snapshot(key)
+        assert resumed["forwarded"] == 1, resumed
+        assert resumed["frames"][:8] == before["frames"]
+        time.sleep(0.2)
+        assert proxy.snapshot(key) == resumed
+        # Begin owns a frame slot but almost no bytes. Releasing it must not
+        # admit an eighth 2 MiB chunk: headers would exceed the 16 MiB byte cap.
+        assert proxy.release(key, record_kind=3) == 1
+        after_begin = proxy.snapshot(key)
+        assert after_begin["forwarded"] == 2
+        assert after_begin["held"] == 7
+        time.sleep(0.2)
+        assert proxy.snapshot(key) == after_begin
+        proxy.release(key)
+        ready(meta)
+        reader = Client(target, readonly=True)
+        try:
+            H.wait_until(
+                origin + " window population is readable",
+                30,
+                lambda: reader.call("GET", key, decode=False) == value,
+            )
+            # A post-FULL mutation must follow the installed cut and complete
+            # the ONLINE cursor handoff without replaying the old value.
+            assert writer.call("APPEND", key, ":online") == len(value) + 7
+            assert writer.call("WAIT", 1, 5000) == 1
+            assert reader.call("GET", key, decode=False) == value + b":online"
+        finally:
+            reader.close()
+        frames = proxy.snapshot(key)["frames"]
+        assert [event[2] for event in frames] == [3] + [4] * 11 + [5], frames
+        assert [event[0] for event in frames] == list(
+            range(frames[0][0], frames[0][0] + len(frames))
+        )
+        assert Path(source.log_path).read_text().count("selected=FULL") == 1
+
+
+def full_record_windows(root):
+    for origin in ("baseline", "override", "publish-record"):
+        full_record_window(root, origin)
+    for failure in ("disconnect", "wrong-ack", "duplicate-ack"):
+        full_record_window(root, failure=failure)
+
+
 def handoff_order(root):
     with pair(
         root,
@@ -2157,10 +2363,14 @@ def main():
     ) as directory:
         root = Path(directory)
         if len(sys.argv) > 5:
-            assert sys.argv[5:] == ["tomb_raider"], sys.argv[5:]
-            tomb_raider(root)
-            if C.has_fault(C.DATA, b"LAVIK_REPLICATION_FAIL_POPULATION_FINALIZE"):
-                population_finalization_failure(root)
+            mode = sys.argv[5:]
+            if mode == ["record_window"]:
+                full_record_windows(root)
+            else:
+                assert mode == ["tomb_raider"], mode
+                tomb_raider(root)
+                if C.has_fault(C.DATA, b"LAVIK_REPLICATION_FAIL_POPULATION_FINALIZE"):
+                    population_finalization_failure(root)
             H.log("PASS")
             return
         grouped_streams(root)
