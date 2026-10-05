@@ -1463,9 +1463,9 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
               digest = entry.external_key_digest();
             }
             expired_tombstones.push_back(RecoveryExpiredTombstone{
-                .db_id_ = db_id,
                 .digest_ = digest,
                 .key_ = std::move(key),
+                .db_id_ = db_id,
                 .shielding_ = entry.value_.shielding(),
             });
           }

@@ -1391,9 +1391,9 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       // Never apply this escape valve to live or shielding winners, or to an
       // admission/I/O failure. Queue a fresh deletion before serving requests.
       expired_tombstones.push_back(
-          RecoveryExpiredTombstone{.db_id_ = root_db,
-                                   .digest_ = ComputeDigest(key),
+          RecoveryExpiredTombstone{.digest_ = ComputeDigest(key),
                                    .key_ = std::string(key),
+                                   .db_id_ = root_db,
                                    .detached_ = true});
       for (auto it = lower; it != end; ++it) it->grouped_reachable_ = false;
       --partition.live_key_count_[root_db];

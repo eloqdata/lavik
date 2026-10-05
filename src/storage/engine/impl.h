@@ -3499,9 +3499,9 @@ class StorageEngine::Impl {
                                     WorkerStore::PartitionStore& partition,
                                     const RecoveryRecordView& record);
   struct RecoveryExpiredTombstone {
-    std::uint8_t db_id_ = 0;
     Digest digest_{};
     std::string key_;
+    std::uint8_t db_id_ = 0;
     bool shielding_ = false;
     // An unshielded, expired root whose graph was already reclaimed has no
     // recoverable side view. It still needs a new durable deletion if space
