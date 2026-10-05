@@ -1987,11 +1987,27 @@ def full_tail_expiration_effects(root):
         ready(meta)
         reader = Client(target, readonly=True)
         try:
-            assert reader.call("GET", counter) == "1"
-            assert reader.call("PTTL", counter) == -1
-            assert reader.call("HGET", collection, "before") == "snapshot"
-            assert reader.call("HGET", collection, "after") == "tail"
-            assert reader.call("PEXPIRETIME", collection) == deadline
+            # Replacing the initialization directive with Follow Owner can
+            # reconnect after Meta reports ready. Cluster read admission may
+            # briefly close while the complete population remains intact.
+            # Retry only LOADING; wrong values and every other error still
+            # fail immediately, and the single-FULL assertion below remains.
+            read_deadline = time.monotonic() + 30
+            while True:
+                try:
+                    assert reader.call("GET", counter) == "1"
+                    assert reader.call("PTTL", counter) == -1
+                    assert reader.call("HGET", collection, "before") == "snapshot"
+                    assert reader.call("HGET", collection, "after") == "tail"
+                    assert reader.call("PEXPIRETIME", collection) == deadline
+                    break
+                except H.Failure as error:
+                    if (
+                        not str(error).startswith("LOADING ")
+                        or time.monotonic() >= read_deadline
+                    ):
+                        raise
+                    time.sleep(0.01)
             assert writer.call("INCR", counter) == 2
             assert writer.call("WAIT", 1, 5000) == 1
             assert reader.call("GET", counter) == "2"

@@ -15,10 +15,9 @@
  */
 
 #include <exception>
-#include <new>
 
 #include "absl/strings/str_cat.h"
-#include "grouped_dependency_test_hook.h"
+#include "grouped/dependency_test_hook.h"
 #include "impl.h"
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
@@ -790,8 +789,8 @@ bool StorageEngine::Impl::EnqueueTxCommit(std::uint64_t txid,
       .txid_ = txid,
       .writes_ = std::move(writes),
   });
-  // A deque allocation may fail. Count a commit only after the queue owns
-  // it, otherwise shutdown would wait forever for a nonexistent pending item.
+  // Pending counts track queue-owned receipts so shutdown drains exactly the
+  // work whose ownership has transferred to the background coordinator.
   NoteTxCommitStarted();
   const std::uint64_t depth =
       tx_commit_queue_depth_.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -801,22 +800,11 @@ bool StorageEngine::Impl::EnqueueTxCommit(std::uint64_t txid,
                              std::memory_order_relaxed)) {
   }
   if (!store.tx_commit_runner_) {
-    try {
-      // Allocate the coroutine before claiming its runner slot. A failed
-      // launch must release this queue/count ownership as well as poisoning
-      // the grouped decision in the foreground handoff guard.
-      auto runner = DrainTxCommitQueue(&store);
-      store.tx_commit_runner_ = true;
-      store.worker_->Spawn(std::move(runner));
-    } catch (const std::bad_alloc&) {
-      store.tx_commit_runner_ = false;
-      for (auto& shard : store.tx_commit_queue_.back().writes_)
-        if (shard.grouped_decision_) shard.grouped_decision_->FailPending();
-      store.tx_commit_queue_.pop_back();
-      tx_commit_queue_depth_.fetch_sub(1, std::memory_order_acq_rel);
-      NoteTxCommitFinished();
-      throw;
-    }
+    // Construct the runner before publishing its slot. Physical allocation
+    // failure is fatal; queue backpressure is reported explicitly below.
+    auto runner = DrainTxCommitQueue(&store);
+    store.tx_commit_runner_ = true;
+    store.worker_->Spawn(std::move(runner));
   }
   if (store.tx_commit_queue_.size() < kTxCommitQueueHighWatermark) {
     return true;

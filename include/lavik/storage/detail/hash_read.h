@@ -22,7 +22,7 @@
 #include <string_view>
 
 #include "absl/status/statusor.h"
-#include "lavik/storage/detail/grouped_hash.h"
+#include "lavik/storage/detail/grouped/hash.h"
 
 namespace lavik::storage {
 

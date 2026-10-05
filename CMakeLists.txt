@@ -406,32 +406,32 @@ add_library(lavik_module
   src/storage/engine/flush_db.cpp
   src/storage/engine/hash_api.cpp
   src/storage/engine/hash_codec.cpp
-  src/storage/engine/grouped_hash.cpp
-  src/storage/engine/grouped_collection.cpp
-  src/storage/engine/grouped_sorted_rewrite.cpp
-  src/storage/engine/grouped_stream.cpp
+  src/storage/engine/grouped/hash.cpp
+  src/storage/engine/grouped/collection.cpp
+  src/storage/engine/grouped/sorted_rewrite.cpp
+  src/storage/engine/grouped/stream.cpp
   src/storage/engine/stream_records.cpp
   src/storage/engine/ordered_compact_codec.cpp
   src/storage/engine/collection_compact_stream.cpp
-  src/storage/engine/grouped_replication_source.cpp
-  src/storage/engine/grouped_write.cpp
-  src/storage/engine/grouped_read.cpp
-  src/storage/engine/grouped_ordered_io.cpp
-  src/storage/engine/grouped_string.cpp
-  src/storage/engine/grouped_list.cpp
-  src/storage/engine/grouped_zset.cpp
-  src/storage/engine/grouped_zset_members.cpp
-  src/storage/engine/grouped_hash_random.cpp
+  src/storage/engine/grouped/replication_source.cpp
+  src/storage/engine/grouped/write.cpp
+  src/storage/engine/grouped/read.cpp
+  src/storage/engine/grouped/ordered_io.cpp
+  src/storage/engine/grouped/string.cpp
+  src/storage/engine/grouped/list.cpp
+  src/storage/engine/grouped/zset.cpp
+  src/storage/engine/grouped/zset_members.cpp
+  src/storage/engine/grouped/hash_random.cpp
   src/storage/engine/sorted_set_api.cpp
   src/storage/engine/transfer_api.cpp
-  src/storage/engine/grouped_restore.cpp
+  src/storage/engine/grouped/restore.cpp
   src/storage/engine/collection_ingest.cpp
-  src/storage/engine/grouped_mutation.cpp
-  src/storage/engine/grouped_ordered_mutation.cpp
-  src/storage/engine/grouped_metadata.cpp
+  src/storage/engine/grouped/mutation.cpp
+  src/storage/engine/grouped/ordered_mutation.cpp
+  src/storage/engine/grouped/metadata.cpp
   src/storage/engine/replica_collection.cpp
-  src/storage/engine/grouped_lifecycle.cpp
-  src/storage/engine/grouped_object_index.cpp
+  src/storage/engine/grouped/lifecycle.cpp
+  src/storage/engine/grouped/object_index.cpp
   src/storage/engine/hash_tree.cpp
   src/storage/engine/indirect_key.cpp
   src/storage/engine/init.cpp
@@ -614,6 +614,7 @@ set(LAVIK_META_CORE_SOURCES
   src/meta/identity_store.cpp
   src/meta/membership_reconciler.cpp
   src/meta/observation_store.cpp
+  src/meta/observation_facts_view.cpp
   src/meta/owner_serviceability.cpp
   src/meta/operation_store.cpp
   src/meta/policy_store.cpp
@@ -890,6 +891,7 @@ if (BUILD_TESTING)
     tests/meta_journal_test.cpp
     tests/meta_model_test.cpp
     tests/meta_observation_test.cpp
+    tests/meta_observation_facts_test.cpp
     tests/meta_owner_serviceability_test.cpp
     tests/meta_sentinel_discovery_test.cpp
     tests/meta_sentinel_server_test.cpp
@@ -1727,15 +1729,15 @@ if (BUILD_TESTING)
     tests/cross_worker_mutex_test.cpp
     tests/device_affinity_test.cpp
     tests/foreign_executor_test.cpp
-    tests/grouped_hash_test.cpp
-    tests/grouped_commit_decision_test.cpp
-    tests/grouped_collection_test.cpp
-    tests/grouped_sorted_rewrite_test.cpp
+    tests/grouped/hash_test.cpp
+    tests/grouped/commit_decision_test.cpp
+    tests/grouped/collection_test.cpp
+    tests/grouped/sorted_rewrite_test.cpp
     tests/ordered_compact_codec_test.cpp
     tests/collection_compact_stream_test.cpp
-    tests/grouped_ordered_object_test.cpp
+    tests/grouped/ordered_object_test.cpp
     tests/record_payload_cursor_test.cpp
-    tests/grouped_object_index_test.cpp
+    tests/grouped/object_index_test.cpp
     tests/local_shared_ptr_test.cpp
     tests/logging_test.cpp
     tests/lua_eval_test.cpp
@@ -2146,7 +2148,7 @@ endforeach()
     set_tests_properties(lavik_reply_fragments_e2e PROPERTIES TIMEOUT 120)
 
     add_executable(lavik_grouped_recovery_e2e_test
-      tests/grouped_recovery_e2e_test.cpp
+      tests/grouped/recovery_e2e_test.cpp
     )
     target_link_libraries(lavik_grouped_recovery_e2e_test
       PRIVATE lavik::module GTest::gtest
@@ -2163,7 +2165,7 @@ endforeach()
     )
 
     add_executable(lavik_grouped_hash_write_e2e_test
-      tests/grouped_hash_write_e2e_test.cpp
+      tests/grouped/hash_write_e2e_test.cpp
     )
     target_link_libraries(lavik_grouped_hash_write_e2e_test
       PRIVATE lavik::module GTest::gtest
@@ -2198,12 +2200,12 @@ endforeach()
     )
 
     add_executable(lavik_grouped_ordered_write_e2e_test
-      tests/grouped_stream_e2e_test.cpp
-      tests/grouped_ordered_write_e2e_test.cpp
-      tests/grouped_rdb_stream_e2e_test.cpp
-      tests/grouped_zset_write_e2e_test.cpp
-      tests/grouped_transfer_e2e_test.cpp
-      tests/grouped_random_stream_e2e_test.cpp
+      tests/grouped/stream_e2e_test.cpp
+      tests/grouped/ordered_write_e2e_test.cpp
+      tests/grouped/rdb_stream_e2e_test.cpp
+      tests/grouped/zset_write_e2e_test.cpp
+      tests/grouped/transfer_e2e_test.cpp
+      tests/grouped/random_stream_e2e_test.cpp
     )
     target_link_libraries(lavik_grouped_ordered_write_e2e_test
       PRIVATE lavik::module GTest::gtest

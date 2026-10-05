@@ -37,7 +37,7 @@
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
 #include "lavik/storage/detail/collection_compact_stream.h"
-#include "lavik/storage/detail/grouped_commit.h"
+#include "lavik/storage/detail/grouped/commit.h"
 #include "lavik/storage/engine.h"
 #include "lavik/storage/format.h"
 #include "lavik/tx/tx_shard.h"

@@ -925,8 +925,8 @@ MetaStores MetaCoordinator::AtomicStoresSnapshot(std::uint64_t& applied_index,
   //   - high_water_ (sink, set inside the SM's apply critical section) stable
   //     => no command commit reflected in the captured stores is newer than
   //        it;
-  //   - last_commit_index() (set atomically with the stores for snapshot
-  //     installs, right after them for command commits) stable => no install
+  //   - last_commit_index() (set under the state lock with the stores for
+  //     both snapshot installs and command commits) stable => no install
   //     landed mid-capture.
   // Together the accepted stores reflect exactly the committed prefix through
   // li1. Retries are rare: control-plane commit rates are low.
@@ -959,6 +959,35 @@ MetaCommittedView MetaCoordinator::CommittedView() {
   return MetaCommittedView(std::move(stores), applied_index);
 }
 
+MetaObservationFactsView MetaCoordinator::ObservationFacts() const {
+  return state_machine_.CaptureObservationFacts();
+}
+
+MetaCommittedCursor MetaCoordinator::CommittedCursor() const {
+  return state_machine_.CaptureCommittedCursor();
+}
+
+MetaClusterCreateDiscovery MetaCoordinator::ClusterCreateDiscovery() const {
+  return state_machine_.CaptureClusterCreateDiscovery();
+}
+
+MetaMembershipDiscovery MetaCoordinator::MembershipDiscovery() const {
+  return state_machine_.CaptureMembershipDiscovery();
+}
+
+std::optional<MetaClusterCreateView> MetaCoordinator::ClusterCreateView(
+    const MetaClusterCreateDiscovery& expected,
+    std::span<const MetaOperationId> children,
+    std::span<const MetaHash256> manifests) const {
+  return state_machine_.CaptureClusterCreateView(expected, children, manifests);
+}
+
+std::optional<MetaMembershipView> MetaCoordinator::MembershipView(
+    const MetaOperationRecord& expected,
+    std::span<const std::uint32_t> member_ids) const {
+  return state_machine_.CaptureMembershipView(expected, member_ids);
+}
+
 std::uint64_t MetaCoordinator::AppliedIndex() const {
   return state_machine_.last_commit_index();
 }
@@ -967,40 +996,72 @@ std::uint64_t MetaCoordinator::CommittedHighWater() const {
   return state_machine_.state_change_index();
 }
 
-MetaSubscriptionStart MetaCoordinator::SubscribeCommitted(
-    MetaCommitCallback callback, std::size_t queue_capacity) {
+template <typename Capture>
+auto MetaCoordinator::SubscribeCaptured(Capture capture,
+                                        MetaCommitCallback callback,
+                                        std::size_t queue_capacity) {
   const std::shared_ptr<MetaSubscriptionCore> core = sub_core_;
   const std::size_t capacity = queue_capacity != 0
                                    ? queue_capacity
                                    : options_.default_subscription_capacity_;
-  // Same atomic capture as AtomicStoresSnapshot, with registration folded
-  // into the accepting critical section: the subscriber's queue starts empty
-  // and the sink appends every later commit, so events are exactly the
-  // commits with log_index > cursor, in order.
   for (;;) {
-    std::uint64_t hw1;
+    std::uint64_t high_water;
     {
-      std::lock_guard<std::mutex> lock(core->mu_);
-      hw1 = core->high_water_;
+      std::lock_guard lock(core->mu_);
+      high_water = core->high_water_;
     }
-    const std::uint64_t li1 = state_machine_.last_commit_index();
-    MetaStores stores = state_machine_.StoresSnapshot();
-    const std::uint64_t li2 = state_machine_.last_commit_index();
+    auto view = capture();
+    if (options_.after_subscription_capture_for_testing_) {
+      options_.after_subscription_capture_for_testing_();
+    }
     {
-      std::lock_guard<std::mutex> lock(core->mu_);
-      if (core->high_water_ == hw1 && li1 == li2) {
+      std::lock_guard lock(core->mu_);
+      // Capture pairs data and indices under the state lock. Recheck the
+      // atomic applied cursor here to detect an Install/Advance as well as a
+      // command whose sink is waiting for this subscription lock. No state
+      // mutex is acquired in the reverse order. A later command's sink must
+      // enqueue into the newly registered subscription before releasing its
+      // state lock. Install/Advance remain eventless; consumers poll indices.
+      if (core->high_water_ == high_water &&
+          state_machine_.last_commit_index() == view.applied_index()) {
         auto sub = std::make_shared<Subscriber>();
         sub->id_ = core->next_id_++;
         sub->callback_ = std::move(callback);
         sub->capacity_ = capacity;
         core->subs_[sub->id_] = sub;
-        return MetaSubscriptionStart{
-            MetaCommittedView(std::move(stores), li1), hw1,
+        return MetaSubscriptionStartFor<decltype(view)>{
+            std::move(view), high_water,
             std::unique_ptr<MetaCommitSubscription>(
                 new MetaCommitSubscription(core, sub->id_))};
       }
     }
+    // A rejected capture is destroyed only after releasing the core lock.
   }
+}
+
+MetaSubscriptionStart MetaCoordinator::SubscribeCommitted(
+    MetaCommitCallback callback, std::size_t queue_capacity) {
+  return SubscribeCaptured(
+      [this] {
+        auto captured = state_machine_.CaptureStores();
+        return MetaCommittedView(std::move(captured.stores_),
+                                 captured.cursor_.applied_index());
+      },
+      std::move(callback), queue_capacity);
+}
+
+MetaObservationSubscriptionStart MetaCoordinator::SubscribeObservationFacts(
+    MetaCommitCallback callback, std::size_t queue_capacity) {
+  return SubscribeCaptured(
+      [this] { return state_machine_.CaptureObservationFacts(); },
+      std::move(callback), queue_capacity);
+}
+
+MetaCursorSubscriptionStart MetaCoordinator::SubscribeCommittedCursor(
+    MetaCommitCallback callback, std::size_t queue_capacity) {
+  return SubscribeCaptured(
+      [this] { return state_machine_.CaptureCommittedCursor(); },
+      std::move(callback), queue_capacity);
 }
 
 void MetaCoordinator::AddValidateHook(MetaValidateHook hook) {
@@ -1030,9 +1091,10 @@ void MetaCoordinator::DispatchMain() {
       // Do not hold the subscription mutex across state-machine or
       // observation-store calls. A commit racing this snapshot sets the dirty
       // bit again, guaranteeing another pass after this one.
-      const MetaStores stores = state_machine_.StoresSnapshot();
-      const MetaStoresFacts facts(stores);
-      observations_.RevalidateAll(facts, NowUnixMs());
+      {
+        const auto facts = state_machine_.CaptureObservationFacts();
+        observations_.RevalidateAll(facts, NowUnixMs());
+      }  // Release the owned view before reacquiring the subscription lock.
       lock.lock();
       continue;
     }
@@ -1411,14 +1473,13 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
             FailProposeDispatch(waiter);
             return;
           }
-          // Registration belongs inside the task's exception boundary too:
-          // without a handler, neither Raft nor the executor can resolve
-          // the waiter for this dispatch.
+          // Registration can reject duplicate completion ownership. Resolve
+          // that logic error through the same failed-dispatch path.
           result->when_ready([waiter](CmdResult& completed,
                                       std::shared_ptr<std::exception>& err) {
             CompletePropose(waiter, completed, err);
           });
-        } catch (...) {
+        } catch (const std::logic_error&) {
           FailProposeDispatch(waiter);
         }
       });
@@ -1478,6 +1539,35 @@ MetaCommittedView MetaLeaderContext::CommittedView() {
   return coordinator_->CommittedView();
 }
 
+MetaObservationFactsView MetaLeaderContext::ObservationFacts() const {
+  return coordinator_->ObservationFacts();
+}
+
+MetaCommittedCursor MetaLeaderContext::CommittedCursor() const {
+  return coordinator_->CommittedCursor();
+}
+
+MetaClusterCreateDiscovery MetaLeaderContext::ClusterCreateDiscovery() const {
+  return coordinator_->ClusterCreateDiscovery();
+}
+
+MetaMembershipDiscovery MetaLeaderContext::MembershipDiscovery() const {
+  return coordinator_->MembershipDiscovery();
+}
+
+std::optional<MetaClusterCreateView> MetaLeaderContext::ClusterCreateView(
+    const MetaClusterCreateDiscovery& expected,
+    std::span<const MetaOperationId> children,
+    std::span<const MetaHash256> manifests) const {
+  return coordinator_->ClusterCreateView(expected, children, manifests);
+}
+
+std::optional<MetaMembershipView> MetaLeaderContext::MembershipView(
+    const MetaOperationRecord& expected,
+    std::span<const std::uint32_t> member_ids) const {
+  return coordinator_->MembershipView(expected, member_ids);
+}
+
 std::uint64_t MetaLeaderContext::AppliedIndex() const {
   return coordinator_->AppliedIndex();
 }
@@ -1485,6 +1575,18 @@ std::uint64_t MetaLeaderContext::AppliedIndex() const {
 MetaSubscriptionStart MetaLeaderContext::SubscribeCommitted(
     MetaCommitCallback callback, std::size_t queue_capacity) {
   return coordinator_->SubscribeCommitted(std::move(callback), queue_capacity);
+}
+
+MetaObservationSubscriptionStart MetaLeaderContext::SubscribeObservationFacts(
+    MetaCommitCallback callback, std::size_t queue_capacity) {
+  return coordinator_->SubscribeObservationFacts(std::move(callback),
+                                                 queue_capacity);
+}
+
+MetaCursorSubscriptionStart MetaLeaderContext::SubscribeCommittedCursor(
+    MetaCommitCallback callback, std::size_t queue_capacity) {
+  return coordinator_->SubscribeCommittedCursor(std::move(callback),
+                                                queue_capacity);
 }
 
 const MetaObservationStore& MetaLeaderContext::Observations() const {

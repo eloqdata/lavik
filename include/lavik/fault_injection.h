@@ -20,7 +20,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <new>
 #include <string_view>
 
 // All fault sites use this single build policy. The explicit test-server option
@@ -61,12 +60,6 @@ inline bool MatchesNth(const char* variable, std::string_view key,
          ordinal == selected;
 }
 
-// Fail inside the caller's existing exception/rollback boundary, without an
-// allocation that could obscure which deterministic fault was exercised.
-inline void BadAlloc(const char* variable, std::string_view key) {
-  if (Matches(variable, key)) throw std::bad_alloc();
-}
-
 // Cache the process-wide selector on first use. Exit 86 distinguishes an armed
 // power-loss boundary from an accidental crash: no destructors or stdio flush.
 inline void CrashAt(const char* point) noexcept {
@@ -94,13 +87,10 @@ inline void CrashAt(const char* point) noexcept {
 #define LAVIK_FAULT_MATCHES_NTH(variable, key, ordinal_variable, ordinal)     \
   ::lavik::fault_injection::MatchesNth((variable), (key), (ordinal_variable), \
                                        (ordinal))
-#define LAVIK_FAULT_BAD_ALLOC(variable, key) \
-  ::lavik::fault_injection::BadAlloc((variable), (key))
 #define LAVIK_MAYBE_CRASH_AT(point) ::lavik::fault_injection::CrashAt((point))
 #else
 #define LAVIK_FAULT_INJECT(...) ((void)0)
 #define LAVIK_FAULT_MATCHES(variable, key) false
 #define LAVIK_FAULT_MATCHES_NTH(variable, key, ordinal_variable, ordinal) false
-#define LAVIK_FAULT_BAD_ALLOC(variable, key) ((void)0)
 #define LAVIK_MAYBE_CRASH_AT(point) ((void)0)
 #endif

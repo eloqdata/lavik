@@ -330,52 +330,46 @@ Task<absl::Status> StorageEngine::Impl::BeforeGroupedTransaction(
   // lease would leave that transaction preventing reclamation.
   if (tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
     co_return absl::OkStatus();  // Preserve explicit maintenance disabling.
-  try {
-    if (shutdown_flush_requested_.load(std::memory_order_acquire))
-      co_return absl::UnavailableError("storage is shutting down");
-    // Observe only on this stream's owner, without suspension. Small
-    // successors can reuse the current Tx stream's staging capacity even
-    // when every free foreground block is occupied. Forcing a rotation in
-    // that case would discard usable space and require a fresh tx block:
-    // a snapshot may retain the old extents until it obtains the key intent
-    // this very writer holds. This is not append admission; WriteRecord
-    // still validates the stream and remaining bytes after its own waits.
-    if (store.active_tx_block_) {
-      const auto& stream = *store.active_tx_block_;
-      const auto* state = FindBlockState(store, stream.block_id_);
-      if (state != nullptr && state->allocated_ && state->in_memory_ &&
-          !state->freeing_ && !state->release_pending_ &&
-          state->allocation_epoch_ == stream.allocation_epoch_ &&
-          state->kind_ == BlockKind::kTransaction) {
-        const auto used =
-            std::max(stream.committed_bytes_, state->committed_bytes_);
-        // An in-flight flush owns only its captured prefix, so still-open
-        // staging bytes remain reusable; the writer rechecks after waiting.
-        if (used <= kStorageBlockBytes &&
-            append_bytes <= kStorageBlockBytes - used)
-          co_return absl::OkStatus();
-      }
+  if (shutdown_flush_requested_.load(std::memory_order_acquire))
+    co_return absl::UnavailableError("storage is shutting down");
+  // Observe only on this stream's owner, without suspension. Small
+  // successors can reuse the current Tx stream's staging capacity even
+  // when every free foreground block is occupied. Forcing a rotation in
+  // that case would discard usable space and require a fresh tx block:
+  // a snapshot may retain the old extents until it obtains the key intent
+  // this very writer holds. This is not append admission; WriteRecord
+  // still validates the stream and remaining bytes after its own waits.
+  if (store.active_tx_block_) {
+    const auto& stream = *store.active_tx_block_;
+    const auto* state = FindBlockState(store, stream.block_id_);
+    if (state != nullptr && state->allocated_ && state->in_memory_ &&
+        !state->freeing_ && !state->release_pending_ &&
+        state->allocation_epoch_ == stream.allocation_epoch_ &&
+        state->kind_ == BlockKind::kTransaction) {
+      const auto used =
+          std::max(stream.committed_bytes_, state->committed_bytes_);
+      // An in-flight flush owns only its captured prefix, so still-open
+      // staging bytes remain reusable; the writer rechecks after waiting.
+      if (used <= kStorageBlockBytes &&
+          append_bytes <= kStorageBlockBytes - used)
+        co_return absl::OkStatus();
     }
-    // Try to reclaim sealed predecessors before the append path needs a new
-    // block. This is a maintenance attempt, not admission: allocation itself
-    // decides whether a successor exists after other writers run.
-    if (!tx_cleaner_running_.load(std::memory_order_acquire)) {
-      const auto cleaned = co_await MaybeRunTxCleaner(true);
-      if (!cleaned.ok()) {
-        if (!store.write_failed_ &&
-            !epoch_metadata_failed_.load(std::memory_order_acquire) &&
-            (absl::IsResourceExhausted(cleaned) || absl::IsAborted(cleaned) ||
-             absl::IsFailedPrecondition(cleaned)))
-          co_return absl::OkStatus();
-        co_return cleaned;
-      }
-    }
-    co_return absl::OkStatus();
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "OOM grouped space-pressure cleanup");
   }
+  // Try to reclaim sealed predecessors before the append path needs a new
+  // block. This is a maintenance attempt, not admission: allocation itself
+  // decides whether a successor exists after other writers run.
+  if (!tx_cleaner_running_.load(std::memory_order_acquire)) {
+    const auto cleaned = co_await MaybeRunTxCleaner(true);
+    if (!cleaned.ok()) {
+      if (!store.write_failed_ &&
+          !epoch_metadata_failed_.load(std::memory_order_acquire) &&
+          (absl::IsResourceExhausted(cleaned) || absl::IsAborted(cleaned) ||
+           absl::IsFailedPrecondition(cleaned)))
+        co_return absl::OkStatus();
+      co_return cleaned;
+    }
+  }
+  co_return absl::OkStatus();
 }
 
 Task<absl::Status> StorageEngine::Impl::MaybeRunTxCleaner(bool force) {

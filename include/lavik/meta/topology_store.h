@@ -151,6 +151,21 @@ struct MetaTopologyGroupView {
   bool operator==(const MetaTopologyGroupView&) const = default;
 };
 
+// Narrow owned extraction for observation validation. Membership roles and CAS
+// revisions do not affect freshness; only the exact assignment identity does.
+struct MetaObservationMemberFacts {
+  std::string node_id_;
+  MetaAssignmentId assignment_id_{};
+};
+
+struct MetaObservationGroupFacts {
+  std::string group_id_;
+  MetaGroupRecord record_;
+  bool authority_active_ = false;
+  std::optional<MetaFailoverTransition> failover_transition_;
+  std::vector<MetaObservationMemberFacts> members_;
+};
+
 // Derived authority query views; neither is separately persisted.
 struct MetaActiveAuthorityView {
   std::string owner_;  // node_id
@@ -250,8 +265,15 @@ class MetaTopologyStore {
   std::optional<std::string> FindGroupOfNode(const std::string& node_id) const;
   // Owning group of a slot; nullopt when unassigned or slot out of range.
   std::optional<std::string> SlotOwner(std::uint32_t slot) const;
+  // Owned absolute slot map in ordered, maximal assigned runs. Gaps remain
+  // unassigned; extraction never allocates one string for every covered slot.
+  std::vector<MetaSlotAssignment> SlotRanges() const;
   bool GroupExists(const std::string& group_id) const;
   std::vector<MetaTopologyGroupView> Groups() const;
+  // Copies just observation freshness facts directly from GroupState. Groups
+  // and their members retain store key order; no derived lookup indices are
+  // built here so callers can build them outside the state-machine lock.
+  std::vector<MetaObservationGroupFacts> ObservationFacts() const;
   std::size_t GroupCount() const { return groups_.size(); }
 
   // Snapshot support: u16 schema_version envelope, deterministic bytes.

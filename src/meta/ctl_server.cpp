@@ -34,6 +34,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1900,9 +1901,8 @@ bycorf::Task<std::string> HandleClusterCreate(
                                  std::string(config.status().message()));
   }
   raft_view.members_ = std::move(*config);
-  const MetaCommittedView committed(before, state_machine->last_commit_index());
-  if (auto meta =
-          detail::ValidateClusterCreateMetaSet(committed, manifest, raft_view);
+  if (auto meta = detail::ValidateClusterCreateMetaSet(
+          before.identity_.MetaMembers(), manifest, raft_view);
       !meta.ok()) {
     co_return ClusterCreateError("preflight", "bad-request",
                                  std::string(meta.message()));
@@ -2329,7 +2329,7 @@ bool ParseServerId(const std::string& text, int& out) {
     }
     out = value;
     return true;
-  } catch (...) {
+  } catch (const std::logic_error&) {
     return false;
   }
 }
@@ -2635,14 +2635,9 @@ bycorf::Task<std::string> DispatchCommand(
         [server, state_machine, data_control_runtime_status,
          automatic_failover_diagnostics, observation_ttl_ms,
          cluster_status_service, foreign_executor, reply]() mutable {
-          std::string result;
-          try {
-            result = BuildClusterStatusReply(
-                server, state_machine, data_control_runtime_status,
-                automatic_failover_diagnostics, observation_ttl_ms);
-          } catch (...) {
-            result = "ERR state_corrupt";
-          }
+          std::string result = BuildClusterStatusReply(
+              server, state_machine, data_control_runtime_status,
+              automatic_failover_diagnostics, observation_ttl_ms);
           std::size_t retained_bytes = 0;
           if (result.starts_with("OK clusterstatus 1 ")) {
             retained_bytes = result.size() + 1;
@@ -2926,17 +2921,12 @@ bycorf::Task<std::string> DispatchCommand(
     std::shared_ptr<AsyncReply> state = std::make_shared<AsyncReply>();
     const absl::Status submitted =
         proposal_executor.Submit([server, foreign_executor, state]() mutable {
-          try {
-            MetaRaft::create_snapshot_options options;
-            options.serialize_commit_ = true;
-            const std::uint64_t idx = server->create_snapshot(options);
-            CompleteAsyncReply(
-                foreign_executor, std::move(state),
-                idx == 0 ? "ERR snapshot-failed" : "OK " + std::to_string(idx));
-          } catch (...) {
-            CompleteAsyncReply(foreign_executor, std::move(state),
-                               "ERR exception");
-          }
+          MetaRaft::create_snapshot_options options;
+          options.serialize_commit_ = true;
+          const std::uint64_t idx = server->create_snapshot(options);
+          CompleteAsyncReply(
+              foreign_executor, std::move(state),
+              idx == 0 ? "ERR snapshot-failed" : "OK " + std::to_string(idx));
         });
     if (!submitted.ok()) co_return "ERR executor-unavailable";
     co_return co_await AsyncReplyAwaiter(std::move(state));

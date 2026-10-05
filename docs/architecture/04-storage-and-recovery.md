@@ -1057,9 +1057,9 @@ Current test evidence includes:
 | `tests/atomicity_stress_e2e_test.cpp` | Overlapping multi-key serializability and recovery after a graceful durability drain |
 | `tests/list_e2e_test.cpp` | Function-catalog body/root/runtime crash windows, multi-device torn-root fallback, and shielded expired-winner behavior under an injected recovery clock rollback |
 | `tests/buffer_pool_test.cpp` | Reuse of a waiting storage write-buffer acquisition |
-| `tests/grouped_hash_test.cpp` | Group codecs, incremental routing, mutation planning and transaction-adjudicated recovery-model validation |
-| `tests/grouped_object_index_test.cpp` | Side-index identity, copy-on-write updates, retirement markers, pre-admitted publication and retained-memory rollback |
-| `tests/grouped_recovery_e2e_test.cpp` | Real grouped disk images, child/outer decisions, physical corruption, worker reassignment, GC crash windows, snapshots and graph detachment |
+| `tests/grouped/hash_test.cpp` | Group codecs, incremental routing, mutation planning and transaction-adjudicated recovery-model validation |
+| `tests/grouped/object_index_test.cpp` | Side-index identity, copy-on-write updates, retirement markers, pre-admitted publication and retained-memory rollback |
+| `tests/grouped/recovery_e2e_test.cpp` | Real grouped disk images, child/outer decisions, physical corruption, worker reassignment, GC crash windows, snapshots and graph detachment |
 | `LargeHashDurabilityE2eTest` in `tests/list_e2e_test.cpp` | Large Hash extent-write and GC crash recovery, bounded-device reclamation, and RESP OOM atomicity; dedicated grouped suites also cover graph publication and relocation boundaries |
 | `tests/device_affinity_test.cpp` | SPDK controller quota and qpair-owner planning across balanced, weighted, and controller-heavy layouts |
 
@@ -1115,7 +1115,7 @@ current source code are authoritative for present storage behavior.
 | Public lifecycle, routing, typed operations, locked transaction contract, snapshots, epochs, maintenance, and durability interfaces | `include/lavik/storage/engine.h` |
 | Worker, partition, block, append-stream, allocator, recovery, and background-maintenance state | `src/storage/engine/impl.h` |
 | Runtime index representation, shared entry arena, runtime key digests, and asynchronous entry-identity validation | `include/lavik/storage/scan_hash_map.h`, `include/lavik/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
-| Compact and grouped Hash/Set serving, group identity and object side index | `src/storage/engine/hash_tree.cpp`, `src/storage/engine/hash_codec.cpp`, `src/storage/engine/grouped_hash.cpp`, `src/storage/engine/grouped_object_index.cpp`, [Grouped collections](09-grouped-collections.md) |
+| Compact and grouped Hash/Set serving, group identity and object side index | `src/storage/engine/hash_tree.cpp`, `src/storage/engine/hash_codec.cpp`, `src/storage/engine/grouped/hash.cpp`, `src/storage/engine/grouped/object_index.cpp`, [Grouped collections](09-grouped-collections.md) |
 | Compact physical index representation shared by user-key and group-location indexes | `include/lavik/storage/detail/record_index.h` |
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/lavik/storage/format.h`, `src/storage/format.cpp` |
 | Checkpoint serialization, bitmap validation, generation publication and consumption, fallback, and block retirement | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/init.cpp`, `src/storage/engine/recovery.cpp` |

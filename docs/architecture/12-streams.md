@@ -169,7 +169,7 @@ layouts.
 |---|---|
 | Redis semantics, partial-view contracts and canonical group deltas | `src/redis/stream_command.cpp`; `include/lavik/storage/engine.h` |
 | Logical records, sparse plans and ingestion validation | `include/lavik/storage/detail/stream_records.h`, `src/storage/engine/stream_records.cpp` |
-| Incremental storage access | `src/storage/engine/grouped_stream.cpp`, `compact_api.cpp` |
-| Root/page formats, publication and recovery | `src/storage/engine/grouped_collection.cpp`, `grouped_ordered_mutation.cpp`, `recovery.cpp`; `src/storage/format.cpp` |
-| Snapshot projection and key transfer | `src/storage/engine/grouped_replication_source.cpp`, `collection_compact_stream.cpp`, `transfer_api.cpp`, `collection_ingest.cpp` |
+| Incremental storage access | `src/storage/engine/grouped/stream.cpp`, `compact_api.cpp` |
+| Root/page formats, publication and recovery | `src/storage/engine/grouped/collection.cpp`, `src/storage/engine/grouped/ordered_mutation.cpp`, `recovery.cpp`; `src/storage/format.cpp` |
+| Snapshot projection and key transfer | `src/storage/engine/grouped/replication_source.cpp`, `collection_compact_stream.cpp`, `transfer_api.cpp`, `collection_ingest.cpp` |
 | RDB conversion and bounded external reorder | `src/redis/rdb.cpp`, `rdb_collection.cpp`, `rdb_stream_encoder.h`, `rdb_record_spool.h` |

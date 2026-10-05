@@ -2017,34 +2017,28 @@ struct MultiContext {
 };
 
 absl::Status PrepareMultiContext(MultiContext* context, std::size_t arguments) {
-  try {
-    constexpr auto slot_bytes =
-        sizeof(ZSet) + sizeof(ZSetInputCharge) + sizeof(double);
-    const auto workers = g_storage->worker_count();
-    constexpr auto limit = std::numeric_limits<std::size_t>::max();
-    if (arguments > limit / slot_bytes ||
-        workers >
-            (limit - arguments * slot_bytes) / sizeof(storage::TxShardWrites))
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set context size overflow");
-    auto admission = ReserveZSetScratch(
-        arguments * slot_bytes + workers * sizeof(storage::TxShardWrites), 0,
-        2);
-    if (!admission.ok()) return admission.status();
-    context->inputs_.resize(arguments);
-    context->input_charges_.resize(arguments);
-    context->weights_.reserve(arguments);
-    context->writes_.reserve(workers);
-    context->metadata_charge_.Adopt(
-        &*admission,
-        context->inputs_.capacity() * sizeof(ZSet) +
-            context->input_charges_.capacity() * sizeof(ZSetInputCharge) +
-            context->weights_.capacity() * sizeof(double) +
-            context->writes_.capacity() * sizeof(storage::TxShardWrites));
-    return absl::OkStatus();
-  } catch (const std::bad_alloc&) {
-    return absl::ResourceExhaustedError("OOM Sorted Set context allocation");
-  }
+  constexpr auto slot_bytes =
+      sizeof(ZSet) + sizeof(ZSetInputCharge) + sizeof(double);
+  const auto workers = g_storage->worker_count();
+  constexpr auto limit = std::numeric_limits<std::size_t>::max();
+  if (arguments > limit / slot_bytes ||
+      workers >
+          (limit - arguments * slot_bytes) / sizeof(storage::TxShardWrites))
+    return absl::ResourceExhaustedError("OOM Sorted Set context size overflow");
+  auto admission = ReserveZSetScratch(
+      arguments * slot_bytes + workers * sizeof(storage::TxShardWrites), 0, 2);
+  if (!admission.ok()) return admission.status();
+  context->inputs_.resize(arguments);
+  context->input_charges_.resize(arguments);
+  context->weights_.reserve(arguments);
+  context->writes_.reserve(workers);
+  context->metadata_charge_.Adopt(
+      &*admission,
+      context->inputs_.capacity() * sizeof(ZSet) +
+          context->input_charges_.capacity() * sizeof(ZSetInputCharge) +
+          context->weights_.capacity() * sizeof(double) +
+          context->writes_.capacity() * sizeof(storage::TxShardWrites));
+  return absl::OkStatus();
 }
 
 void ClearMultiPayloads(MultiContext* context) noexcept {
@@ -2197,120 +2191,111 @@ absl::Status ComputeMultiUnchecked(MultiContext* context) {
 }
 
 absl::Status ComputeMulti(MultiContext* context) {
-  try {
-    std::size_t bytes = 0, count = 0;
-    constexpr auto limit = std::numeric_limits<std::size_t>::max();
-    for (const auto& input : context->inputs_) {
-      const auto retained = ZSetRetainedBytes(input);
-      if (!retained.ok()) return retained.status();
-      if (*retained > limit - bytes || input.size() > limit - count)
-        return absl::ResourceExhaustedError(
-            "OOM Sorted Set aggregate size overflow");
-      bytes += *retained;
-      count += input.size();
-    }
-    // Covers score-map keys/nodes, selection indexes, output copies and
-    // canonical replication effects before any destination is deleted.
-    auto admission = ReserveZSetScratch(bytes, count, 4);
-    if (!admission.ok()) return admission.status();
-    struct ClearOnFailure {
-      MultiContext* context_;
-      bool published_ = false;
-      ~ClearOnFailure() {
-        if (published_) return;
-        ZSet{}.swap(context_->output_);
-        std::vector<CapturedReplicationCommand>{}.swap(
-            context_->replacement_effects_);
-        std::vector<std::string>{}.swap(context_->replacement_args_);
-      }
-    } cleanup{context};
-    auto computed = ComputeMultiUnchecked(context);
-    if (!computed.ok()) return computed;
-    if (context->store_) {
-      auto effects = BuildZSetReplacement(
-          *context->request_, context->store_shape_->destination_arg_,
-          context->output_);
-      if (context->borrowed_tx_)
-        context->replacement_effects_ = std::move(effects);
-      else
-        context->replacement_args_ =
-            EncodeReplicationCommandEffects(std::move(effects));
-    }
-    auto retained = ZSetRetainedBytes(context->output_);
+  std::size_t bytes = 0, count = 0;
+  constexpr auto limit = std::numeric_limits<std::size_t>::max();
+  for (const auto& input : context->inputs_) {
+    const auto retained = ZSetRetainedBytes(input);
     if (!retained.ok()) return retained.status();
-    auto add_strings = [&](const std::vector<std::string>& strings) {
-      if (strings.capacity() > (limit - *retained) / sizeof(std::string))
-        return false;
-      *retained += strings.capacity() * sizeof(std::string);
-      for (const auto& string : strings) {
-        if (string.capacity() >= limit - *retained) return false;
-        *retained += string.capacity() + 1;
-      }
-      return true;
-    };
-    if (!add_strings(context->replacement_args_))
+    if (*retained > limit - bytes || input.size() > limit - count)
       return absl::ResourceExhaustedError(
-          "OOM Sorted Set replication size overflow");
-    if (context->replacement_effects_.capacity() >
-        (limit - *retained) / sizeof(CapturedReplicationCommand))
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set replication size overflow");
-    *retained += context->replacement_effects_.capacity() *
-                 sizeof(CapturedReplicationCommand);
-    for (const auto& effect : context->replacement_effects_)
-      if (!add_strings(effect.args_))
-        return absl::ResourceExhaustedError(
-            "OOM Sorted Set replication size overflow");
-    if (admission->bytes() && *retained > admission->bytes())
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set output exceeds admission");
-    context->output_charge_.Adopt(&*admission, *retained);
-    cleanup.published_ = true;
-    return absl::OkStatus();
-  } catch (const std::bad_alloc&) {
-    return absl::ResourceExhaustedError("OOM Sorted Set aggregate allocation");
+          "OOM Sorted Set aggregate size overflow");
+    bytes += *retained;
+    count += input.size();
   }
+  // Covers score-map keys/nodes, selection indexes, output copies and
+  // canonical replication effects before any destination is deleted.
+  auto admission = ReserveZSetScratch(bytes, count, 4);
+  if (!admission.ok()) return admission.status();
+  struct ClearOnFailure {
+    MultiContext* context_;
+    bool published_ = false;
+    ~ClearOnFailure() {
+      if (published_) return;
+      ZSet{}.swap(context_->output_);
+      std::vector<CapturedReplicationCommand>{}.swap(
+          context_->replacement_effects_);
+      std::vector<std::string>{}.swap(context_->replacement_args_);
+    }
+  } cleanup{context};
+  auto computed = ComputeMultiUnchecked(context);
+  if (!computed.ok()) return computed;
+  if (context->store_) {
+    auto effects = BuildZSetReplacement(*context->request_,
+                                        context->store_shape_->destination_arg_,
+                                        context->output_);
+    if (context->borrowed_tx_)
+      context->replacement_effects_ = std::move(effects);
+    else
+      context->replacement_args_ =
+          EncodeReplicationCommandEffects(std::move(effects));
+  }
+  auto retained = ZSetRetainedBytes(context->output_);
+  if (!retained.ok()) return retained.status();
+  auto add_strings = [&](const std::vector<std::string>& strings) {
+    if (strings.capacity() > (limit - *retained) / sizeof(std::string))
+      return false;
+    *retained += strings.capacity() * sizeof(std::string);
+    for (const auto& string : strings) {
+      if (string.capacity() >= limit - *retained) return false;
+      *retained += string.capacity() + 1;
+    }
+    return true;
+  };
+  if (!add_strings(context->replacement_args_))
+    return absl::ResourceExhaustedError(
+        "OOM Sorted Set replication size overflow");
+  if (context->replacement_effects_.capacity() >
+      (limit - *retained) / sizeof(CapturedReplicationCommand))
+    return absl::ResourceExhaustedError(
+        "OOM Sorted Set replication size overflow");
+  *retained += context->replacement_effects_.capacity() *
+               sizeof(CapturedReplicationCommand);
+  for (const auto& effect : context->replacement_effects_)
+    if (!add_strings(effect.args_))
+      return absl::ResourceExhaustedError(
+          "OOM Sorted Set replication size overflow");
+  if (admission->bytes() && *retained > admission->bytes())
+    return absl::ResourceExhaustedError(
+        "OOM Sorted Set output exceeds admission");
+  context->output_charge_.Adopt(&*admission, *retained);
+  cleanup.published_ = true;
+  return absl::OkStatus();
 }
 
 Task<absl::Status> ReplaceMultiDestination(
     MultiContext* context, const storage::Digest& digest,
     storage::TxShardWrites* writes = nullptr) {
-  try {
-    const auto& request = *context->request_;
-    const std::size_t destination_arg =
-        context->store_shape_ ? context->store_shape_->destination_arg_ : 1;
-    const std::string& destination = request.args_[destination_arg];
-    if (writes == nullptr) writes = LocalWrites(*context);
-    const auto bytes = ZSetRetainedBytes(context->output_);
-    if (!bytes.ok()) co_return bytes.status();
-    auto admission = ReserveZSetScratch(*bytes, context->output_.size(), 6);
-    if (!admission.ok()) co_return admission.status();
-    // Encode and admit destination-local decode/planner headroom before DEL.
-    // Errors after DEL are returned to the existing transaction undo owner.
-    auto encoded = Encode(context->output_);
-    if (!encoded.ok()) co_return encoded.status();
-    auto deleted = co_await g_storage->DeleteLocked(request.db_id_, destination,
-                                                    digest, writes);
-    if (!deleted.ok()) co_return deleted.status();
-    if (context->output_.empty()) co_return absl::OkStatus();
-    auto callback = [&](std::optional<storage::CompactValueView> value)
-        -> absl::StatusOr<storage::CompactValueUpdate> {
-      if (value) {
-        return absl::InternalError(
-            "sorted-set STORE destination was not replaced");
-      }
-      return storage::CompactValueUpdate{
-          .changed_ = true,
-          .encoded_ = std::move(*encoded),
-          .logical_size_ = context->output_.size(),
-          .expire_at_ms_ = std::nullopt};
-    };
-    co_return co_await g_storage->ExecuteCompactLocked(
-        request.db_id_, destination, digest, storage::ValueType::kSortedSet,
-        false, callback, writes);
-  } catch (const std::bad_alloc&) {
-    co_return absl::ResourceExhaustedError("OOM Sorted Set STORE allocation");
-  }
+  const auto& request = *context->request_;
+  const std::size_t destination_arg =
+      context->store_shape_ ? context->store_shape_->destination_arg_ : 1;
+  const std::string& destination = request.args_[destination_arg];
+  if (writes == nullptr) writes = LocalWrites(*context);
+  const auto bytes = ZSetRetainedBytes(context->output_);
+  if (!bytes.ok()) co_return bytes.status();
+  auto admission = ReserveZSetScratch(*bytes, context->output_.size(), 6);
+  if (!admission.ok()) co_return admission.status();
+  // Encode and admit destination-local decode/planner headroom before DEL.
+  // Errors after DEL are returned to the existing transaction undo owner.
+  auto encoded = Encode(context->output_);
+  if (!encoded.ok()) co_return encoded.status();
+  auto deleted = co_await g_storage->DeleteLocked(request.db_id_, destination,
+                                                  digest, writes);
+  if (!deleted.ok()) co_return deleted.status();
+  if (context->output_.empty()) co_return absl::OkStatus();
+  auto callback = [&](std::optional<storage::CompactValueView> value)
+      -> absl::StatusOr<storage::CompactValueUpdate> {
+    if (value) {
+      return absl::InternalError(
+          "sorted-set STORE destination was not replaced");
+    }
+    return storage::CompactValueUpdate{.changed_ = true,
+                                       .encoded_ = std::move(*encoded),
+                                       .logical_size_ = context->output_.size(),
+                                       .expire_at_ms_ = std::nullopt};
+  };
+  co_return co_await g_storage->ExecuteCompactLocked(
+      request.db_id_, destination, digest, storage::ValueType::kSortedSet,
+      false, callback, writes);
 }
 
 absl::Status DecodeRetainedInput(std::optional<storage::CompactValueView> value,
@@ -2333,79 +2318,66 @@ absl::Status DecodeRetainedInput(std::optional<storage::CompactValueView> value,
 Task<absl::StatusOr<ZSet>> ReadAggregateInputLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
     ZSetInputCharge* charge) {
-  try {
-    ZSet input;
-    auto callback = [&](std::optional<storage::CompactValueView> value)
-        -> absl::StatusOr<storage::CompactValueUpdate> {
-      auto decoded = DecodeRetainedInput(value, &input, charge);
-      if (!decoded.ok()) return decoded;
-      return NoChange();
-    };
-    absl::Status status = co_await g_storage->ExecuteCompactLocked(
-        db_id, key, digest, storage::ValueType::kSortedSet, true, callback);
-    if (status.ok()) co_return input;
-    if (!status.message().starts_with("WRONGTYPE ")) co_return status;
+  ZSet input;
+  auto callback = [&](std::optional<storage::CompactValueView> value)
+      -> absl::StatusOr<storage::CompactValueUpdate> {
+    auto decoded = DecodeRetainedInput(value, &input, charge);
+    if (!decoded.ok()) return decoded;
+    return NoChange();
+  };
+  absl::Status status = co_await g_storage->ExecuteCompactLocked(
+      db_id, key, digest, storage::ValueType::kSortedSet, true, callback);
+  if (status.ok()) co_return input;
+  if (!status.message().starts_with("WRONGTYPE ")) co_return status;
 
-    // Redis ZUNION/ZINTER/ZDIFF accept Set inputs and assign every Set member
-    // the implicit score 1.0.
-    storage::HashOperation operation;
-    operation.kind_ = storage::HashOperationKind::kKeys;
-    auto members =
-        co_await g_storage->ExecuteSetLocked(db_id, key, digest, operation);
-    if (!members.ok()) co_return members.status();
-    std::size_t string_bytes = 0;
-    for (const auto& member : members->values_) {
-      if (!member)
-        co_return absl::InternalError(
-            "Set aggregate source has missing member");
-      if (member->capacity() >=
-          std::numeric_limits<std::size_t>::max() - string_bytes)
-        co_return absl::ResourceExhaustedError(
-            "OOM Set aggregate size overflow");
-      string_bytes += member->capacity() + 1;
-    }
-    const bool transfer = members->retained_charge_.bytes() >= string_bytes;
-    auto admission = ReserveZSetScratch(transfer ? 0 : string_bytes,
-                                        members->values_.size());
-    if (!admission.ok()) co_return admission.status();
-    input.reserve(members->values_.size());
-    for (auto& member : members->values_) {
-      if (!member.has_value())
-        co_return absl::InternalError(
-            "Set aggregate source has missing member");
-      input.push_back(Element{std::move(*member), 1.0});
-    }
-    if (transfer) charge->inherited_ = std::move(members->retained_charge_);
-    charge->decoded_.Adopt(&*admission, input.capacity() * sizeof(Element) +
-                                            (transfer ? 0 : string_bytes));
-    co_return input;
-  } catch (const std::bad_alloc&) {
-    co_return absl::ResourceExhaustedError(
-        "OOM Sorted Set aggregate input allocation");
+  // Redis ZUNION/ZINTER/ZDIFF accept Set inputs and assign every Set member
+  // the implicit score 1.0.
+  storage::HashOperation operation;
+  operation.kind_ = storage::HashOperationKind::kKeys;
+  auto members =
+      co_await g_storage->ExecuteSetLocked(db_id, key, digest, operation);
+  if (!members.ok()) co_return members.status();
+  std::size_t string_bytes = 0;
+  for (const auto& member : members->values_) {
+    if (!member)
+      co_return absl::InternalError("Set aggregate source has missing member");
+    if (member->capacity() >=
+        std::numeric_limits<std::size_t>::max() - string_bytes)
+      co_return absl::ResourceExhaustedError("OOM Set aggregate size overflow");
+    string_bytes += member->capacity() + 1;
   }
+  const bool transfer = members->retained_charge_.bytes() >= string_bytes;
+  auto admission =
+      ReserveZSetScratch(transfer ? 0 : string_bytes, members->values_.size());
+  if (!admission.ok()) co_return admission.status();
+  input.reserve(members->values_.size());
+  for (auto& member : members->values_) {
+    if (!member.has_value())
+      co_return absl::InternalError("Set aggregate source has missing member");
+    input.push_back(Element{std::move(*member), 1.0});
+  }
+  if (transfer) charge->inherited_ = std::move(members->retained_charge_);
+  charge->decoded_.Adopt(&*admission, input.capacity() * sizeof(Element) +
+                                          (transfer ? 0 : string_bytes));
+  co_return input;
 }
 
 Task<absl::StatusOr<ZSet>> ReadZSetOnlyLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
     ZSetInputCharge* retained = nullptr) {
-  try {
-    ZSetInputCharge local_charge;
-    auto* charge = retained ? retained : &local_charge;
-    ZSet input;
-    auto callback = [&](std::optional<storage::CompactValueView> value)
-        -> absl::StatusOr<storage::CompactValueUpdate> {
-      auto decoded = DecodeRetainedInput(value, &input, charge);
-      if (!decoded.ok()) return decoded;
-      return NoChange();
-    };
-    absl::Status status = co_await g_storage->ExecuteCompactLocked(
-        db_id, key, digest, storage::ValueType::kSortedSet, true, callback);
-    if (!status.ok()) co_return status;
-    co_return input;
-  } catch (const std::bad_alloc&) {
-    co_return absl::ResourceExhaustedError(
-        "OOM Sorted Set aggregate input allocation");
-  }
+  ZSetInputCharge local_charge;
+  auto* charge = retained ? retained : &local_charge;
+  ZSet input;
+  auto callback = [&](std::optional<storage::CompactValueView> value)
+      -> absl::StatusOr<storage::CompactValueUpdate> {
+    auto decoded = DecodeRetainedInput(value, &input, charge);
+    if (!decoded.ok()) return decoded;
+    return NoChange();
+  };
+  absl::Status status = co_await g_storage->ExecuteCompactLocked(
+      db_id, key, digest, storage::ValueType::kSortedSet, true, callback);
+  if (!status.ok()) co_return status;
+  co_return input;
 }
 
 Task<absl::Status> MultiReadShard(void* opaque, const tx::ShardSlice& slice) {
@@ -2498,49 +2470,44 @@ void InitZSetCommandStorage(storage::StorageEngine* engine) {
 Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
     bool with_scores, storage::TxShardWrites* tx, std::uint64_t now_ms) {
-  try {
-    storage::HashResult result;
-    auto callback = [&](std::optional<storage::CompactValueView> value)
-        -> absl::StatusOr<storage::CompactValueUpdate> {
-      auto admission = ReserveZSetScratch(value ? value->encoded_.size() : 0,
-                                          value ? value->logical_size_ : 0, 2);
-      if (!admission.ok()) return admission.status();
-      auto decoded = Decode(value);
-      if (!decoded.ok()) return decoded.status();
-      result.key_exists_ = value.has_value();
-      result.length_ = decoded->size();
-      result.values_.reserve(decoded->size() * (with_scores ? 2 : 1));
-      for (const Element& element : *decoded) {
-        result.values_.emplace_back(element.member_);
-        if (with_scores) {
-          result.values_.emplace_back(FormatDouble(element.score_));
-        }
+  storage::HashResult result;
+  auto callback = [&](std::optional<storage::CompactValueView> value)
+      -> absl::StatusOr<storage::CompactValueUpdate> {
+    auto admission = ReserveZSetScratch(value ? value->encoded_.size() : 0,
+                                        value ? value->logical_size_ : 0, 2);
+    if (!admission.ok()) return admission.status();
+    auto decoded = Decode(value);
+    if (!decoded.ok()) return decoded.status();
+    result.key_exists_ = value.has_value();
+    result.length_ = decoded->size();
+    result.values_.reserve(decoded->size() * (with_scores ? 2 : 1));
+    for (const Element& element : *decoded) {
+      result.values_.emplace_back(element.member_);
+      if (with_scores) {
+        result.values_.emplace_back(FormatDouble(element.score_));
       }
-      std::size_t retained =
-          result.values_.capacity() * sizeof(result.values_[0]);
-      for (const auto& item : result.values_) {
-        if (!item) continue;
-        if (item->capacity() >=
-            std::numeric_limits<std::size_t>::max() - retained)
-          return absl::ResourceExhaustedError(
-              "OOM Sorted Set random snapshot size overflow");
-        retained += item->capacity() + 1;
-      }
-      if (admission->bytes() && retained > admission->bytes())
+    }
+    std::size_t retained =
+        result.values_.capacity() * sizeof(result.values_[0]);
+    for (const auto& item : result.values_) {
+      if (!item) continue;
+      if (item->capacity() >=
+          std::numeric_limits<std::size_t>::max() - retained)
         return absl::ResourceExhaustedError(
-            "OOM Sorted Set random snapshot exceeds admission");
-      result.retained_charge_.Adopt(&*admission, retained);
-      return NoChange();
-    };
-    absl::Status status = co_await g_storage->ExecuteCompactLocked(
-        db_id, key, digest, storage::ValueType::kSortedSet, true, callback, tx,
-        now_ms);
-    if (!status.ok()) co_return status;
-    co_return result;
-  } catch (const std::bad_alloc&) {
-    co_return absl::ResourceExhaustedError(
-        "OOM Sorted Set random snapshot allocation");
-  }
+            "OOM Sorted Set random snapshot size overflow");
+      retained += item->capacity() + 1;
+    }
+    if (admission->bytes() && retained > admission->bytes())
+      return absl::ResourceExhaustedError(
+          "OOM Sorted Set random snapshot exceeds admission");
+    result.retained_charge_.Adopt(&*admission, retained);
+    return NoChange();
+  };
+  absl::Status status = co_await g_storage->ExecuteCompactLocked(
+      db_id, key, digest, storage::ValueType::kSortedSet, true, callback, tx,
+      now_ms);
+  if (!status.ok()) co_return status;
+  co_return result;
 }
 
 Task<CommandReply> ExecuteZSetCommand(const CommandRequest& request,

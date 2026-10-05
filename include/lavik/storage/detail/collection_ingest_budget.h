@@ -23,8 +23,8 @@
 #include <string_view>
 
 #include "absl/status/statusor.h"
-#include "lavik/storage/detail/grouped_collection.h"
-#include "lavik/storage/detail/grouped_hash.h"
+#include "lavik/storage/detail/grouped/collection.h"
+#include "lavik/storage/detail/grouped/hash.h"
 #include "lavik/storage/detail/record_index.h"
 #include "lavik/storage/sorted_set.h"
 

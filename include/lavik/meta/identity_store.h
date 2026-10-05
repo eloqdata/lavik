@@ -135,6 +135,9 @@ class MetaIdentityStore {
   bool IsActiveMetaMember(std::uint32_t server_id,
                           std::string_view principal) const;
   std::vector<MetaNodeRecord> Nodes() const;
+  // Owned ids in node order, extracted without copying node records or their
+  // endpoint/principal payloads. Retired identity tombstones are excluded.
+  std::vector<std::string> ActiveNodeIds() const;
   std::vector<MetaMemberRecord> MetaMembers() const;
   // Registered records including retired tombstones (tombstones keep the
   // principal binding, so they occupy the cap).

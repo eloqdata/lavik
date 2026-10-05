@@ -485,6 +485,308 @@ TEST_F(MetaCoordinatorComponentTest,
   relay.DetachAndStop();
 }
 
+TEST_F(MetaCoordinatorComponentTest, ObservationSubscriptionOwnsInitialCut) {
+  MakeCoordinator();
+  Commit(1, MakeRegister(0x11));
+  machine_->Advance(2);
+  RecordedEvents recorded;
+  auto start = coordinator_->SubscribeObservationFacts(recorded.Callback());
+  EXPECT_EQ(start.view_.applied_index(), 2u);
+  EXPECT_EQ(start.view_.state_change_index(), 1u);
+  EXPECT_EQ(start.cursor_, 1u);
+  EXPECT_TRUE(start.view_.IsActiveNode(MakeNodeId(0x11)));
+
+  Commit(3, MakeRegister(0x12));
+  ASSERT_TRUE(
+      WaitFor([&] { return recorded.size() == 1u; }, std::chrono::seconds(10)));
+  EXPECT_EQ(recorded.Snapshot().front().log_index_, 3u);
+  EXPECT_FALSE(start.view_.IsActiveNode(MakeNodeId(0x12)));
+}
+
+TEST_F(MetaCoordinatorComponentTest, CursorSubscriptionTracksEventlessCuts) {
+  MakeCoordinator();
+  Commit(1, MakeRegister(0x11));
+  RecordedEvents recorded;
+  auto start = coordinator_->SubscribeCommittedCursor(recorded.Callback());
+  EXPECT_EQ(start.view_.applied_index(), 1u);
+  EXPECT_EQ(start.view_.state_change_index(), 1u);
+  EXPECT_EQ(start.cursor_, 1u);
+
+  machine_->Advance(2);
+  auto cursor = coordinator_->CommittedCursor();
+  EXPECT_EQ(cursor.applied_index(), 2u);
+  EXPECT_EQ(cursor.state_change_index(), 1u);
+  auto image = machine_->Capture(2);
+  ASSERT_TRUE(image.ok()) << image.status();
+  ASSERT_TRUE(machine_->Install(3, *image).ok());
+  cursor = coordinator_->CommittedCursor();
+  EXPECT_EQ(cursor.applied_index(), 3u);
+  EXPECT_EQ(cursor.state_change_index(), 3u);
+  EXPECT_EQ(recorded.size(), 0u);
+  const auto refreshed = coordinator_->ObservationFacts();
+  EXPECT_EQ(refreshed.applied_index(), 3u);
+  EXPECT_TRUE(refreshed.IsActiveNode(MakeNodeId(0x11)));
+
+  Commit(4, MakeRegister(0x12));
+  ASSERT_TRUE(
+      WaitFor([&] { return recorded.size() == 1u; }, std::chrono::seconds(10)));
+  EXPECT_EQ(recorded.Snapshot().front().log_index_, 4u);
+  EXPECT_EQ(start.view_.applied_index(), 1u);
+}
+
+TEST_F(MetaCoordinatorComponentTest,
+       WorkflowCaptureProgressDoesNotDependOnNotificationDelivery) {
+  MakeCoordinator();
+  std::promise<void> entered, release;
+  auto entered_signal = entered.get_future();
+  auto release_signal = release.get_future().share();
+  std::atomic<bool> notified{false};
+  auto subscribed = coordinator_->SubscribeCommittedCursor(
+      [&](const MetaCommitEvent&) {
+        entered.set_value();
+        release_signal.wait_for(std::chrono::seconds(5));
+        notified = true;
+      },
+      1);
+  SubmitOperation submit;
+  submit.operation_id_ = MakeOperationId(0x74);
+  submit.kind_ = lavik::meta::kMetaMembershipOperationKind;
+  submit.intent_ = "retained-membership-input";
+  submit.intent_hash_ = lavik::meta::MetaSha256(submit.intent_);
+  Commit(1, submit);
+  EXPECT_EQ(entered_signal.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  EXPECT_FALSE(notified.load());
+  EXPECT_GT(coordinator_->AppliedIndex(), subscribed.view_.applied_index());
+  auto discovered = coordinator_->MembershipDiscovery();
+  EXPECT_TRUE(discovered.operation_);
+  // Completion is already committed while notification delivery is blocked.
+  // A fresh capture must see its new revision and must reject old selectors.
+  TransitionOperationPhase phase;
+  phase.operation_id_ = submit.operation_id_;
+  phase.expected_revision_ = 0;
+  phase.kind_phase_blob_ = "bind-member";
+  Commit(2, phase);
+  if (discovered.operation_)
+    EXPECT_FALSE(coordinator_->MembershipView(*discovered.operation_, {}));
+  discovered = coordinator_->MembershipDiscovery();
+  if (discovered.operation_) {
+    auto view = coordinator_->MembershipView(*discovered.operation_, {});
+    EXPECT_TRUE(view);
+    if (view) EXPECT_EQ(view->operation_.kind_phase_blob_, "bind-member");
+    machine_->Advance(3);
+    view = coordinator_->MembershipView(*discovered.operation_, {});
+    EXPECT_TRUE(view);
+    if (view) {
+      EXPECT_EQ(view->cursor_.applied_index(), 3u);
+      EXPECT_EQ(view->cursor_.state_change_index(), 2u);
+    }
+  }
+  auto stores = machine_->StoresSnapshot();
+  phase.expected_revision_ = 1;
+  phase.kind_phase_blob_ = "change-config";
+  EXPECT_TRUE(stores.operation_.TransitionOperationPhase(phase, 4).ok());
+  auto image = stores.Serialize();
+  EXPECT_TRUE(image.ok());
+  machine_->Advance(4);
+  const auto advanced = coordinator_->MembershipDiscovery();
+  EXPECT_EQ(advanced.cursor_.applied_index(), 4u);
+  EXPECT_EQ(advanced.cursor_.state_change_index(), 2u);
+  if (image.ok()) EXPECT_TRUE(machine_->Install(4, *image).ok());
+  // Install may change state at an already applied index, without an event.
+  // Comparing only applied_index would leave idle workflow discovery stale.
+  const auto installed_cursor = coordinator_->CommittedCursor();
+  EXPECT_EQ(installed_cursor.applied_index(), advanced.cursor_.applied_index());
+  EXPECT_NE(installed_cursor.state_change_index(),
+            advanced.cursor_.state_change_index());
+  discovered = coordinator_->MembershipDiscovery();
+  EXPECT_EQ(discovered.cursor_.state_change_index(), 4u);
+  ASSERT_TRUE(discovered.operation_);
+  EXPECT_EQ(discovered.operation_->kind_phase_blob_, "change-config");
+  Commit(5, MakeRegister(0x75));
+  Commit(6, MakeRegister(0x76));
+  EXPECT_TRUE(subscribed.subscription_->needs_resync());
+  release.set_value();
+  subscribed.subscription_.reset();
+  subscribed = coordinator_->SubscribeCommittedCursor([](const auto&) {});
+  EXPECT_EQ(subscribed.view_.applied_index(), 6u);
+  discovered = coordinator_->MembershipDiscovery();
+  ASSERT_TRUE(discovered.operation_);
+  const auto view = coordinator_->MembershipView(*discovered.operation_, {});
+  ASSERT_TRUE(view);
+  EXPECT_EQ(view->operation_.kind_phase_blob_, "change-config");
+  EXPECT_EQ(view->cursor_.applied_index(), 6u);
+}
+
+TEST_F(MetaCoordinatorComponentTest,
+       CommitRevalidationPurgesRetiredNodeWithoutSubscribers) {
+  MakeCoordinator();
+  Commit(1, MakeRegister(0x11));
+  MetaObservationIdentity identity;
+  identity.node_id_ = MakeNodeId(0x11);
+  identity.boot_incarnation_.fill(0x11);
+  identity.session_generation_ = 1;
+  ASSERT_TRUE(observations_.AdoptSession(identity, 1000).ok());
+  lavik::meta::MetaObservation observation;
+  observation.identity_ = identity;
+  observation.payload_ = lavik::meta::MetaNodeBootObs{};
+  ASSERT_TRUE(observations_
+                  .Ingest(std::move(observation),
+                          coordinator_->ObservationFacts(), 1000)
+                  .ok());
+  ASSERT_EQ(observations_.size(), 1u);
+  EXPECT_GT(observations_.retained_bytes(), 0u);
+
+  lavik::meta::RetireNode retire;
+  retire.request_id_ = MakeRequestId(0x12);
+  retire.node_id_ = identity.node_id_;
+  retire.expected_revision_ = 1;
+  Commit(2, retire);
+  // size() is unfiltered: reaching zero requires dispatch-driven removal,
+  // rather than a query hiding the stale observation through new facts.
+  ASSERT_TRUE(WaitFor([&] { return observations_.size() == 0; },
+                      std::chrono::seconds(5)));
+  EXPECT_EQ(observations_.retained_bytes(), 0u);
+  const auto audit = observations_.AuditRing();
+  ASSERT_EQ(audit.size(), 1u);
+  EXPECT_EQ(audit.front().detail_, "commit-stale:node-not-active");
+}
+
+// All public capture variants share the same event delivery contract.
+class MetaSubscriptionCaptureTest : public MetaCoordinatorComponentTest,
+                                    public ::testing::WithParamInterface<int> {
+ protected:
+  struct Start {
+    std::uint64_t applied_index;
+    std::uint64_t cursor;
+    std::unique_ptr<lavik::meta::MetaCommitSubscription> subscription;
+  };
+
+  Start Subscribe(MetaCommitCallback callback, std::size_t capacity = 0) {
+    auto keep = [](auto start) {
+      return Start{start.view_.applied_index(), start.cursor_,
+                   std::move(start.subscription_)};
+    };
+    switch (GetParam()) {
+      case 0:
+        return keep(
+            coordinator_->SubscribeCommitted(std::move(callback), capacity));
+      case 1:
+        return keep(coordinator_->SubscribeObservationFacts(std::move(callback),
+                                                            capacity));
+      default:
+        return keep(coordinator_->SubscribeCommittedCursor(std::move(callback),
+                                                           capacity));
+    }
+  }
+
+  void CheckCaptureGap(const std::function<void()>& mutate,
+                       std::uint64_t expected_cursor) {
+    bool first_capture = true;
+    MetaCoordinatorOptions options;
+    // A deterministic scheduling boundary. Mutating here also verifies that
+    // capture has released the state mutex and registration has not taken the
+    // subscription mutex: synchronous commit needs both in the normal order.
+    options.after_subscription_capture_for_testing_ = [&] {
+      if (!first_capture) return;
+      first_capture = false;
+      mutate();
+    };
+    MakeCoordinator(std::move(options));
+    Commit(1, MakeRegister(0x11));
+    RecordedEvents recorded;
+    auto start = Subscribe(recorded.Callback());
+    EXPECT_FALSE(first_capture);
+    EXPECT_EQ(start.applied_index, 2u);
+    EXPECT_EQ(start.cursor, expected_cursor);
+    EXPECT_EQ(recorded.size(), 0u);
+    Commit(3, MakeRegister(0x13));
+    ASSERT_TRUE(WaitFor([&] { return recorded.size() == 1u; },
+                        std::chrono::seconds(5)));
+    EXPECT_EQ(recorded.Snapshot().front().log_index_, 3u);
+  }
+};
+
+TEST_P(MetaSubscriptionCaptureTest, CommitBetweenCaptureAndRegistration) {
+  CheckCaptureGap([&] { Commit(2, MakeRegister(0x12)); }, 2);
+}
+
+TEST_P(MetaSubscriptionCaptureTest, AdvanceBetweenCaptureAndRegistration) {
+  CheckCaptureGap([&] { machine_->Advance(2); }, 1);
+}
+
+TEST_P(MetaSubscriptionCaptureTest, InstallBetweenCaptureAndRegistration) {
+  CheckCaptureGap(
+      [&] {
+        auto image = machine_->Capture(1);
+        ASSERT_TRUE(image.ok()) << image.status();
+        ASSERT_TRUE(machine_->Install(2, *image).ok());
+      },
+      1);
+}
+
+TEST_P(MetaSubscriptionCaptureTest, OverflowResyncReplayAndCallbackLifetime) {
+  MakeCoordinator();
+  std::promise<void> entered;
+  auto entered_signal = entered.get_future();
+  std::promise<void> release;
+  auto release_signal = release.get_future().share();
+  std::atomic<unsigned> calls{0};
+  auto start = Subscribe(
+      [&](const MetaCommitEvent&) {
+        ++calls;
+        entered.set_value();
+        // Bound the barrier so a failed assertion cannot strand teardown.
+        release_signal.wait_for(std::chrono::seconds(5));
+      },
+      1);
+  Commit(1, MakeRegister(0x11));
+  ASSERT_EQ(entered_signal.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  Commit(2, MakeRegister(0x12));
+  Commit(3, MakeRegister(0x13));
+  EXPECT_TRUE(start.subscription->cancelled());
+  EXPECT_TRUE(start.subscription->needs_resync());
+
+  auto destroy =
+      std::async(std::launch::async, [&] { start.subscription.reset(); });
+  EXPECT_EQ(destroy.wait_for(std::chrono::milliseconds(25)),
+            std::future_status::timeout);
+  release.set_value();
+  ASSERT_EQ(destroy.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  destroy.get();
+  EXPECT_EQ(calls.load(), 1u);
+
+  RecordedEvents recorded;
+  auto refreshed = Subscribe(recorded.Callback());
+  EXPECT_EQ(refreshed.applied_index, 3u);
+  EXPECT_EQ(refreshed.cursor, 3u);
+  EXPECT_FALSE(refreshed.subscription->needs_resync());
+  const auto command = MakeRegister(0x14);
+  Commit(4, command);
+  Commit(4, command);
+  ASSERT_TRUE(
+      WaitFor([&] { return recorded.size() == 2u; }, std::chrono::seconds(5)));
+  auto watermark = refreshed.applied_index;
+  std::vector<std::uint64_t> effective;
+  for (const auto& event : recorded.Snapshot()) {
+    if (event.log_index_ <= watermark) continue;
+    effective.push_back(event.log_index_);
+    watermark = event.log_index_;
+  }
+  EXPECT_EQ(effective, (std::vector<std::uint64_t>{4}));
+  EXPECT_EQ(calls.load(), 1u);
+}
+
+INSTANTIATE_TEST_SUITE_P(FullObservationAndCursor, MetaSubscriptionCaptureTest,
+                         ::testing::Values(0, 1, 2),
+                         [](const ::testing::TestParamInfo<int>& info) {
+                           return info.param == 0   ? "Full"
+                                  : info.param == 1 ? "Observation"
+                                                    : "Cursor";
+                         });
+
 TEST_F(MetaCoordinatorComponentTest, SubscriptionTripleIsAtomicAndOrdered) {
   MakeCoordinator();
   for (std::uint8_t ii = 0; ii < 3; ++ii) {

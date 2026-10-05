@@ -185,6 +185,8 @@ absl::StatusOr<std::shared_ptr<MetaRaft>> MetaRaft::Open(
   }
   auto self =
       std::shared_ptr<MetaRaft>(new MetaRaft(std::move(options), machine));
+  // Exceptions must not cross the C/Go ABI. Recoverable failures use return
+  // codes; an unexpected C++ exception (including allocation failure) is fatal.
   LavikRaftCallbacks callbacks{};
   callbacks.apply = [](uintptr_t owner, uint64_t index, void* data,
                        uint64_t size, LavikRaftBytes* output) -> int {
@@ -201,7 +203,7 @@ absl::StatusOr<std::shared_ptr<MetaRaft>> MetaRaft::Open(
                  ? 0
                  : 1;
     } catch (...) {
-      return 1;
+      std::terminate();
     }
   };
   callbacks.advance = [](uintptr_t owner, uint64_t index) {
@@ -222,7 +224,7 @@ absl::StatusOr<std::shared_ptr<MetaRaft>> MetaRaft::Open(
                  ? 0
                  : 1;
     } catch (...) {
-      return 1;
+      std::terminate();
     }
   };
   callbacks.identities = [](uintptr_t owner, LavikRaftBytes* output) -> int {
@@ -243,7 +245,7 @@ absl::StatusOr<std::shared_ptr<MetaRaft>> MetaRaft::Open(
       result += ']';
       return CopyOutput(result, output) ? 0 : 1;
     } catch (...) {
-      return 1;
+      std::terminate();
     }
   };
   callbacks.capture = [](uintptr_t owner, uint64_t index,
@@ -252,7 +254,7 @@ absl::StatusOr<std::shared_ptr<MetaRaft>> MetaRaft::Open(
       auto result = reinterpret_cast<MetaRaft*>(owner)->machine_.Capture(index);
       return result.ok() && CopyOutput(*result, output) ? 0 : 1;
     } catch (...) {
-      return 1;
+      std::terminate();
     }
   };
   callbacks.role = [](uintptr_t owner, uint64_t term, uint64_t leader,
@@ -277,7 +279,7 @@ absl::StatusOr<std::shared_ptr<MetaRaft>> MetaRaft::Open(
   std::string config;
   try {
     config = ConfigJson(self->options_);
-  } catch (const std::exception& error) {
+  } catch (const std::invalid_argument& error) {
     return absl::InvalidArgumentError(error.what());
   }
   LavikRaftBytes error{};
@@ -408,7 +410,7 @@ bool MetaRaft::RefreshStatus() {
     config_.store(std::move(config));
     progress_.store(std::move(progress));
     return true;
-  } catch (...) {
+  } catch (const std::runtime_error&) {
     return false;
   }
 }
@@ -520,7 +522,7 @@ std::shared_ptr<MetaRaftResult> MetaRaft::add_srv(const MetaRaftMember& member,
   std::string data;
   try {
     data = MemberJson(member);
-  } catch (const std::exception&) {
+  } catch (const std::invalid_argument&) {
     OnResult(ticket, 0, 3, nullptr, 0);
     return result;
   }

@@ -21,9 +21,8 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <new>
 
-#include "lavik/storage/detail/grouped_hash.h"
+#include "lavik/storage/detail/grouped/hash.h"
 #include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
@@ -395,60 +394,54 @@ absl::StatusOr<std::size_t> CollectionCompactDecoder::Consume(
     std::string_view input) {
   if (!status_.ok()) return status_;
   std::size_t used = 0;
-  try {
-    while (!ready_) {
-      if (stage_ == Stage::kDone) {
-        if (used != input.size())
-          return Fail(absl::DataLossError("trailing compact stream bytes"));
-        break;
+  while (!ready_) {
+    if (stage_ == Stage::kDone) {
+      if (used != input.size())
+        return Fail(absl::DataLossError("trailing compact stream bytes"));
+      break;
+    }
+    if (stage_ == Stage::kFirst || stage_ == Stage::kSecond) {
+      auto& output = stage_ == Stage::kFirst ? first_ : second_;
+      auto& filled = stage_ == Stage::kFirst ? first_used_ : second_used_;
+      const auto need = stage_ == Stage::kFirst ? first_bytes_ : second_bytes_;
+      if (output.size() != need) {
+        // Allocate the checked individual string exactly once. In particular,
+        // an attacker-controlled aggregate length never drives a reserve.
+        auto status = Admit(need + 1);
+        if (!status.ok()) return Fail(status);
+        output = std::string(need, '\0');
       }
-      if (stage_ == Stage::kFirst || stage_ == Stage::kSecond) {
-        auto& output = stage_ == Stage::kFirst ? first_ : second_;
-        auto& filled = stage_ == Stage::kFirst ? first_used_ : second_used_;
-        const auto need =
-            stage_ == Stage::kFirst ? first_bytes_ : second_bytes_;
-        if (output.size() != need) {
-          // Allocate the checked individual string exactly once. In particular,
-          // an attacker-controlled aggregate length never drives a reserve.
-          auto status = Admit(need + 1);
-          if (!status.ok()) return Fail(status);
-          output = std::string(need, '\0');
-        }
-        const auto copy = std::min(need - filled, input.size() - used);
-        if (copy != 0)
-          std::memcpy(output.data() + filled, input.data() + used, copy);
-        filled += copy;
-        consumed_bytes_ += copy;
-        used += copy;
-        if (filled != need) break;
-        if (stage_ == Stage::kFirst && HashWire(type_)) {
-          stage_ = Stage::kSecond;
-        } else {
-          auto valid = CompleteEntry();
-          if (!valid.ok()) return Fail(valid);
-        }
-        continue;
-      }
-      if (used == input.size()) break;
-      const auto need =
-          stage_ == Stage::kHeader ? HeaderBytes(type_) : EntryFraming(type_);
-      const auto copy = std::min(need - framing_used_, input.size() - used);
-      if (copy > total_bytes_ - consumed_bytes_)
-        return Fail(
-            absl::DataLossError("compact framing exceeds stream bytes"));
-      std::memcpy(framing_.data() + framing_used_, input.data() + used, copy);
-      framing_used_ += copy;
+      const auto copy = std::min(need - filled, input.size() - used);
+      if (copy != 0)
+        std::memcpy(output.data() + filled, input.data() + used, copy);
+      filled += copy;
       consumed_bytes_ += copy;
       used += copy;
-      if (framing_used_ == need) {
-        auto valid =
-            stage_ == Stage::kHeader ? ReadHeader() : ReadEntryHeader();
+      if (filled != need) break;
+      if (stage_ == Stage::kFirst && HashWire(type_)) {
+        stage_ = Stage::kSecond;
+      } else {
+        auto valid = CompleteEntry();
         if (!valid.ok()) return Fail(valid);
       }
+      continue;
     }
-  } catch (const std::bad_alloc&) {
-    return Fail(absl::ResourceExhaustedError("compact stream page allocation"));
+    if (used == input.size()) break;
+    const auto need =
+        stage_ == Stage::kHeader ? HeaderBytes(type_) : EntryFraming(type_);
+    const auto copy = std::min(need - framing_used_, input.size() - used);
+    if (copy > total_bytes_ - consumed_bytes_)
+      return Fail(absl::DataLossError("compact framing exceeds stream bytes"));
+    std::memcpy(framing_.data() + framing_used_, input.data() + used, copy);
+    framing_used_ += copy;
+    consumed_bytes_ += copy;
+    used += copy;
+    if (framing_used_ == need) {
+      auto valid = stage_ == Stage::kHeader ? ReadHeader() : ReadEntryHeader();
+      if (!valid.ok()) return Fail(valid);
+    }
   }
+
   return used;
 }
 

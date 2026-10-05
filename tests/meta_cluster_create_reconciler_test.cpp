@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+#include <barrier>
 #include <limits>
+#include <thread>
 #include <variant>
 
 #include "gtest/gtest.h"
@@ -23,6 +25,8 @@
 #include "lavik/meta/cluster_create_reconciler.h"
 #include "lavik/meta/control_projector.h"
 #include "lavik/meta/hash.h"
+#include "lavik/meta/state_machine.h"
+#include "support/test_data_path.h"
 
 namespace lavik::meta {
 namespace {
@@ -106,10 +110,31 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
     Apply(submit);
   }
 
-  auto Plan() {
-    return detail::PlanClusterCreateStep(
-        MetaCommittedView(stores_, index_),
-        *stores_.operation_.FindOperation(root_), runtime_, raft_);
+  absl::StatusOr<MetaClusterCreateView> CaptureView() {
+    auto opened = MetaStateMachine::Open(
+        lavik::test::TestDataPath("create_reconciler_capture"));
+    if (!opened.ok()) return opened.status();
+    auto image = stores_.Serialize();
+    if (!image.ok()) return image.status();
+    if (auto status = (*opened)->Install(index_, *image); !status.ok())
+      return status;
+    auto discovery = (*opened)->CaptureClusterCreateDiscovery();
+    // Pure-planner tests also exercise an already-terminal root; production
+    // discovery correctly stops returning it after Creating ends.
+    if (!discovery.root_) discovery.root_ = (*opened)->FindOperation(root_);
+    auto keys = detail::CaptureClusterCreateReadKeys(*discovery.root_);
+    if (!keys.ok()) return keys.status();
+    auto view = (*opened)->CaptureClusterCreateView(discovery, keys->children_,
+                                                    keys->manifests_);
+    if (!view)
+      return absl::InternalError("uncontended creation capture changed");
+    return std::move(*view);
+  }
+
+  absl::StatusOr<std::optional<MetaCommand>> Plan() {
+    auto view = CaptureView();
+    if (!view.ok()) return view.status();
+    return detail::PlanClusterCreateStep(*view, runtime_, raft_);
   }
 
   virtual void ConfigureDataEndpoints() {}
@@ -288,6 +313,238 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
   MetaDataControlRuntimeSnapshot runtime_;
   MetaClusterCreateRaftView raft_;
 };
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       CapturePreservesExtraDataAndGroupsForRejection) {
+  AdvanceToProjectionWait();
+  const auto clean = stores_;
+  RegisterNode extra;
+  extra.node_id_ = std::string(40, 'e');
+  extra.principal_ = "lavik://node/" + extra.node_id_;
+  extra.role_ = MetaNodeRole::kReplica;
+  extra.endpoints_ = {"tcp://127.0.0.1:6399"};
+  Apply(extra);
+  auto view = CaptureView();
+  ASSERT_TRUE(view.ok()) << view.status();
+  EXPECT_EQ(view->nodes_.size(), manifest_.data_nodes_.size() + 1);
+  EXPECT_NE(Plan().status().message().find("node differs from intent"),
+            std::string_view::npos);
+  stores_ = clean;
+  CreateGroup group;
+  group.group_id_ = "unexpected";
+  group.new_topology_epoch_ = stores_.topology_.TopologyEpoch() + 1;
+  Apply(group);
+  EXPECT_NE(Plan().status().message().find("unknown Group"),
+            std::string_view::npos);
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       CapturesAbsoluteSlotsIncludingUnassignedGaps) {
+  AdvanceToProjectionWait();
+  auto original = CaptureView();
+  ASSERT_TRUE(original.ok()) << original.status();
+  SetSlotMap slots;
+  slots.new_topology_epoch_ = stores_.topology_.TopologyEpoch() + 1;
+  slots.ranges_ = {{1, 8191, "group-a"}, {8192, 16382, "group-b"}};
+  // Exercise a valid absolute map with incorrect creation coverage. The pure
+  // store deliberately omits the aggregate authority gate for this fixture.
+  ASSERT_TRUE(stores_.topology_.Apply(slots).ok());
+  auto current = CaptureView();
+  ASSERT_TRUE(current.ok()) << current.status();
+  EXPECT_FALSE(current->SlotOwner(0));
+  EXPECT_FALSE(current->SlotOwner(16383));
+  EXPECT_EQ(current->SlotOwner(8192), "group-b");
+  EXPECT_EQ(original->SlotOwner(0), "group-a");
+  EXPECT_EQ(original->SlotOwner(16383), "group-b");
+  EXPECT_NE(Plan().status().message().find("Slot map differs"),
+            std::string_view::npos);
+}
+
+TEST_F(ClusterCreateV1RecoveryTest, ArchivedChildIsNotRediscoveredAsNewWork) {
+  StartFirstReplicaBatch();
+  auto child = GroupOperation("group-a");
+  CommitResult(child, child.current_directives_[1],
+               MetaDirectiveResultStatus::kSucceeded);
+  ApplyPlanned();
+  ApplyPlanned();
+  child = GroupOperation("group-a");
+  ASSERT_EQ(child.lifecycle_, MetaOperationLifecycle::kCompleted);
+  ArchiveOperations archive;
+  archive.operation_seqs_ = {child.operation_seq_};
+  Apply(archive);
+  const auto view = CaptureView();
+  ASSERT_TRUE(view.ok()) << view.status();
+  const auto& archived = view->children_.at(child.operation_id_);
+  EXPECT_TRUE(archived.known_);
+  EXPECT_FALSE(archived.operation_);
+  const auto& missing = view->children_.at(
+      detail::ClusterCreateV1GroupOperationId(root_, "group-b"));
+  EXPECT_FALSE(missing.known_);
+  EXPECT_FALSE(missing.operation_);
+  EXPECT_NE(Plan().status().message().find("operation was archived"),
+            std::string_view::npos);
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       CaptureRetriesChangedRootAndOwnsChildReceipts) {
+  StartFirstReplicaBatch();
+  auto opened = MetaStateMachine::Open("");
+  ASSERT_TRUE(opened.ok());
+  auto machine = std::move(*opened);
+  auto image = stores_.Serialize();
+  ASSERT_TRUE(image.ok());
+  ASSERT_TRUE(machine->Install(index_, *image).ok());
+  const auto discovery = machine->CaptureClusterCreateDiscovery();
+  ASSERT_TRUE(discovery.root_);
+  const auto keys = detail::CaptureClusterCreateReadKeys(*discovery.root_);
+  ASSERT_TRUE(keys.ok());
+  const auto before = machine->CaptureClusterCreateView(
+      discovery, keys->children_, keys->manifests_);
+  ASSERT_TRUE(before);
+  const auto child = GroupOperation("group-a");
+  CommitResult(child, child.current_directives_[1],
+               MetaDirectiveResultStatus::kSucceeded);
+  image = stores_.Serialize();
+  ASSERT_TRUE(image.ok());
+  ASSERT_TRUE(machine->Install(index_, *image).ok());
+  // Child changes do not invalidate root-derived selectors; the complete new
+  // child set and cursor are captured together, never reused from discovery.
+  auto after = machine->CaptureClusterCreateView(discovery, keys->children_,
+                                                 keys->manifests_);
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->applied_index(), index_);
+  EXPECT_EQ(after->children_.at(child.operation_id_)
+                .operation_->terminal_receipts_.size(),
+            child.terminal_receipts_.size() + 1);
+  TransitionOperationPhase change;
+  change.operation_id_ = root_;
+  change.expected_revision_ = discovery.root_->revision_;
+  change.kind_phase_blob_ = "recovery-required:test";
+  Apply(change);
+  image = stores_.Serialize();
+  ASSERT_TRUE(image.ok());
+  ASSERT_TRUE(machine->Install(index_, *image).ok());
+  EXPECT_FALSE(machine->CaptureClusterCreateView(discovery, keys->children_,
+                                                 keys->manifests_));
+  machine.reset();
+  EXPECT_EQ(before->children_.at(child.operation_id_).operation_, child);
+  EXPECT_EQ(
+      after->children_.at(child.operation_id_).operation_->current_directives_,
+      child.current_directives_);
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       ConcurrentCommitAdvanceInstallKeepWorkflowCut) {
+  StartFirstReplicaBatch();
+  ASSERT_FALSE(HasFatalFailure());
+  auto opened = MetaStateMachine::Open("");
+  ASSERT_TRUE(opened.ok());
+  auto machine = std::move(*opened);
+  auto image = stores_.Serialize();
+  ASSERT_TRUE(image.ok());
+  ASSERT_TRUE(machine->Install(index_, *image).ok());
+  const auto initial_index = index_;
+  const auto child_id = GroupOperation("group-a").operation_id_;
+  const auto keys = detail::CaptureClusterCreateReadKeys(
+      *stores_.operation_.FindOperation(root_));
+  ASSERT_TRUE(keys.ok());
+  struct Expected {
+    MetaOperationRecord root;
+    MetaOperationRecord child;
+    std::uint64_t epoch;
+    std::uint64_t state_index;
+  };
+  std::vector<Expected> expected;
+  auto remember = [&](std::uint64_t state_index) {
+    expected.push_back({*stores_.operation_.FindOperation(root_),
+                        *stores_.operation_.FindOperation(child_id),
+                        stores_.topology_.TopologyEpoch(), state_index});
+  };
+  remember(index_);
+  struct Step {
+    std::shared_ptr<MetaRaftBuffer> command;
+    std::string image;
+  };
+  std::vector<Step> steps;
+  for (int round = 0; round < 12; ++round) {
+    TransitionOperationPhase phase;
+    phase.operation_id_ = root_;
+    phase.expected_revision_ =
+        stores_.operation_.FindOperation(root_)->revision_;
+    phase.kind_phase_blob_ = "commit-" + std::to_string(round);
+    auto command = MetaStateMachine::EncodeCommand(phase);
+    ASSERT_TRUE(command.ok());
+    Apply(phase);
+    ASSERT_FALSE(HasFatalFailure());
+    steps.push_back({*command, {}});
+    remember(index_);
+    ++index_;
+    steps.push_back({{}, {}});  // configuration-only Advance
+    remember(index_ - 1);
+    phase.expected_revision_ =
+        stores_.operation_.FindOperation(root_)->revision_;
+    phase.kind_phase_blob_ = "install-" + std::to_string(round);
+    ASSERT_TRUE(
+        stores_.operation_.TransitionOperationPhase(phase, ++index_).ok());
+    phase.operation_id_ = child_id;
+    phase.expected_revision_ =
+        stores_.operation_.FindOperation(child_id)->revision_;
+    ASSERT_TRUE(
+        stores_.operation_.TransitionOperationPhase(phase, index_).ok());
+    ASSERT_TRUE(stores_.topology_
+                    .SetTopologyEpoch(stores_.topology_.TopologyEpoch() + 1)
+                    .ok());
+    image = stores_.Serialize();
+    ASSERT_TRUE(image.ok());
+    steps.push_back({{}, *image});
+    remember(index_);
+  }
+  auto check = [&](const MetaClusterCreateView& view) {
+    const auto offset = view.applied_index() - initial_index;
+    ASSERT_LT(offset, expected.size());
+    const auto& want = expected[offset];
+    EXPECT_EQ(view.root_, want.root);
+    EXPECT_EQ(view.children_.at(child_id).operation_, want.child);
+    EXPECT_EQ(view.topology_epoch_, want.epoch);
+    EXPECT_EQ(view.cursor_.state_change_index(), want.state_index);
+    EXPECT_EQ(view.nodes_.size(), 4u);
+    EXPECT_EQ(view.groups_.size(), 2u);
+    EXPECT_EQ(view.SlotOwner(16383), "group-b");
+  };
+  std::barrier barrier(3);
+  auto reader = [&] {
+    for (std::size_t step = 0; step < steps.size(); ++step) {
+      barrier.arrive_and_wait();
+      for (int attempt = 0; attempt < 8; ++attempt) {
+        auto discovery = machine->CaptureClusterCreateDiscovery();
+        if (auto view = machine->CaptureClusterCreateView(
+                discovery, keys->children_, keys->manifests_))
+          check(*view);
+      }
+      barrier.arrive_and_wait();
+      auto discovery = machine->CaptureClusterCreateDiscovery();
+      auto view = machine->CaptureClusterCreateView(discovery, keys->children_,
+                                                    keys->manifests_);
+      EXPECT_TRUE(view);
+      if (view) {
+        check(*view);
+        EXPECT_EQ(view->applied_index(), initial_index + step + 1);
+      }
+    }
+  };
+  std::jthread first(reader), second(reader);
+  for (std::size_t step = 0; step < steps.size(); ++step) {
+    barrier.arrive_and_wait();
+    const auto index = initial_index + step + 1;
+    if (steps[step].command)
+      EXPECT_NE(machine->commit(index, *steps[step].command), nullptr);
+    else if (!steps[step].image.empty())
+      EXPECT_TRUE(machine->Install(index, steps[step].image).ok());
+    else
+      machine->Advance(index);
+    barrier.arrive_and_wait();
+  }
+}
 
 class ClusterCreateTlsRecoveryTest : public ClusterCreateV1RecoveryTest {
  protected:

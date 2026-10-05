@@ -63,7 +63,7 @@
 #include "lavik/memory.h"
 #include "lavik/replication_history.h"
 #include "lavik/storage/detail/compact_write.h"
-#include "lavik/storage/detail/grouped_object_index.h"
+#include "lavik/storage/detail/grouped/object_index.h"
 #include "lavik/storage/detail/hash_codec.h"
 #include "lavik/storage/detail/record_index.h"
 #include "lavik/storage/detail/record_payload_cursor.h"
@@ -3192,6 +3192,13 @@ class StorageEngine::Impl {
     std::uint32_t field_count_ = 0;
   };
 
+  // Move-only page ownership keeps every member view valid across coroutine
+  // moves. Entries are destroyed before their owning physical read lease.
+  struct LoadedSortedSetPage {
+    LoadedValue loaded_;
+    std::vector<OrderedCollectionEntryView> entries_;
+  };
+
   std::size_t DirectGetValueLimit() const noexcept;
 
   absl::StatusOr<DiskValue> EncodeDiskValue(LoadedValue loaded);
@@ -3874,6 +3881,16 @@ class StorageEngine::Impl {
       WorkerStore& store, const GroupedHashObject::Handle& object,
       std::uint64_t successor_txid);
 
+  // Shared inline/extent publication for prefix and ordered groups. Wrappers
+  // return the task directly; the snapshot/encoder lifetime contract below
+  // also applies to this implementation.
+  template <typename Snapshot, typename Encoder>
+  Task<absl::StatusOr<HashGroupLocation>> WriteGroupRecordLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const Snapshot& snapshot, Encoder encoder, std::uint64_t sequence,
+      TxShardWrites& tx, ValueType value_type, std::uint64_t batch_txid);
+
   // Writes one unpublished complete group snapshot. The receipt prevents its
   // transaction block from retiring; the caller must either publish it
   // with the root's decision or reclaim it when that batch is abandoned.
@@ -3886,10 +3903,29 @@ class StorageEngine::Impl {
       std::uint64_t sequence, TxShardWrites& tx,
       ValueType value_type = ValueType::kHash, std::uint64_t batch_txid = 0);
 
+  // The synchronous decoder consumes the checked payload while its read lease
+  // is live and may move that lease into its result to retain borrowed views.
+  // Specializations share physical lifetime/GC validation without an extra
+  // coroutine frame; views must never escape without their owning lease.
+  template <typename Result, typename Decode>
+  Task<absl::StatusOr<Result>> LoadOrderedGroup(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, std::uint64_t id, bool pinned,
+      Decode decode);
+  Task<absl::StatusOr<std::vector<std::string>>> LoadOrderedListRange(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, std::uint64_t id, std::size_t first,
+      std::size_t count);
   Task<absl::StatusOr<LoadedOrderedGroup>> LoadOrderedGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedHashObject::Handle object, std::uint64_t id, bool pinned = false);
+  Task<absl::StatusOr<LoadedSortedSetPage>> LoadSortedSetPage(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, std::uint64_t id);
   Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
   LoadGroupedOrderedValue(WorkerStore& store,
                           WorkerStore::PartitionStore& partition,

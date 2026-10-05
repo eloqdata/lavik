@@ -20,7 +20,8 @@
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "lavik/storage/detail/grouped_hash.h"
+#include "lavik/storage/detail/grouped/collection.h"
+#include "lavik/storage/detail/grouped/hash.h"
 
 namespace lavik::storage {
 namespace {
@@ -30,11 +31,50 @@ struct Encoder {
   std::vector<std::string_view> spans_;
   std::size_t next_ = 0;
   std::size_t encoded_bytes() const { return bytes_; }
-  std::optional<std::string_view> Next() {
+  std::optional<std::string_view> Next() noexcept {
     return next_ == spans_.size() ? std::nullopt
                                   : std::optional(spans_[next_++]);
   }
 };
+
+TEST(RecordPayloadCursorTest, InlineEncodingChecksExactProducerLength) {
+  for (const std::size_t bytes : {0, 1, 15, 16, 31, 256}) {
+    const std::string input(bytes, '\xff');
+    Encoder encoder{bytes, {"", input, ""}};
+    auto encoded = EncodeInlineRecordPayload(encoder);
+    ASSERT_TRUE(encoded.ok()) << encoded.status();
+    EXPECT_EQ(*encoded, input);
+  }
+  for (auto spans : {std::vector<std::string_view>{"ab"},
+                     std::vector<std::string_view>{"abcd"},
+                     std::vector<std::string_view>{"abc", "", "d"}}) {
+    Encoder encoder{3, std::move(spans)};
+    EXPECT_TRUE(absl::IsDataLoss(EncodeInlineRecordPayload(encoder).status()));
+  }
+  Encoder nonempty{0, {"x"}};
+  EXPECT_TRUE(absl::IsDataLoss(EncodeInlineRecordPayload(nonempty).status()));
+}
+
+TEST(RecordPayloadCursorTest, InlineEncodingPreservesBorrowedPageFraming) {
+  OrderedGroupSnapshot list{.incarnation_ = 17, .id_ = 1};
+  HashGroupSnapshot hash{.incarnation_ = 17};
+  for (int i = 0; i < 100; ++i) {
+    std::string value(i * 3, static_cast<char>(i));
+    list.entries_.push_back({.value_ = value});
+    hash.value_.entries_.push_back(
+        {.field_ = std::to_string(i), .value_ = value});
+  }
+  auto ordered = OrderedGroupEncoder::Create(list);
+  ASSERT_TRUE(ordered.ok());
+  auto ordered_bytes = EncodeInlineRecordPayload(*ordered);
+  ASSERT_TRUE(ordered_bytes.ok());
+  EXPECT_EQ(*ordered_bytes, *EncodeOrderedGroup(list));
+  auto prefix = HashGroupEncoder::Create(hash);
+  ASSERT_TRUE(prefix.ok());
+  auto hash_bytes = EncodeInlineRecordPayload(*prefix);
+  ASSERT_TRUE(hash_bytes.ok());
+  EXPECT_EQ(*hash_bytes, *EncodeHashGroup(hash));
+}
 
 TEST(RecordPayloadCursorTest, StreamsEmptySpansAndExternalKeyPrefix) {
   Encoder encoder{5, {"", "a", "", "bc", "de", ""}};

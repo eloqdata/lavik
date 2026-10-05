@@ -779,169 +779,162 @@ StorageEngine::Impl::ReadRdbSnapshotBatch(std::uint64_t session_id,
     co_return absl::InvalidArgumentError("invalid RDB snapshot batch request");
   }
   WorkerStore& store = CurrentStore();
-  try {
-    LAVIK_FAULT_INJECT(
-        // Deterministic snapshot tests mutate or detach a grouped key after the
-        // global cut but before its first physical read. Pause no captured
-        // pointer: the normal session validation below must still reject
-        // cancellation while this coroutine was suspended. Production builds
-        // omit the environment hook.
-        if (cursor.partition_index_ == 0 && cursor.db_id_ == 0 &&
-            cursor.index_cursor_ == 0 && cursor.dirty_cursor_ == 0 &&
-            !cursor.finalizing_) {
-          if (const char* configured = std::getenv("LAVIK_RDB_SCAN_PAUSE_MS");
-              configured != nullptr) {
-            std::uint32_t delay_ms = 0;
-            const char* end = configured + std::strlen(configured);
-            const auto parsed = std::from_chars(configured, end, delay_ms);
-            if (parsed.ec == std::errc{} && parsed.ptr == end &&
-                delay_ms != 0 && delay_ms <= 10000) {
-              const absl::Status delayed = co_await bycorf::SleepFor(
-                  *store.worker_, std::chrono::milliseconds(delay_ms));
-              if (!delayed.ok()) co_return delayed;
-            }
+  LAVIK_FAULT_INJECT(
+      // Deterministic snapshot tests mutate or detach a grouped key after the
+      // global cut but before its first physical read. Pause no captured
+      // pointer: the normal session validation below must still reject
+      // cancellation while this coroutine was suspended. Production builds
+      // omit the environment hook.
+      if (cursor.partition_index_ == 0 && cursor.db_id_ == 0 &&
+          cursor.index_cursor_ == 0 && cursor.dirty_cursor_ == 0 &&
+          !cursor.finalizing_) {
+        if (const char* configured = std::getenv("LAVIK_RDB_SCAN_PAUSE_MS");
+            configured != nullptr) {
+          std::uint32_t delay_ms = 0;
+          const char* end = configured + std::strlen(configured);
+          const auto parsed = std::from_chars(configured, end, delay_ms);
+          if (parsed.ec == std::errc{} && parsed.ptr == end && delay_ms != 0 &&
+              delay_ms <= 10000) {
+            const absl::Status delayed = co_await bycorf::SleepFor(
+                *store.worker_, std::chrono::milliseconds(delay_ms));
+            if (!delayed.ok()) co_return delayed;
           }
-        });
-    if (!store.rdb_snapshot_ || store.rdb_snapshot_->id_ != session_id ||
-        store.rdb_snapshot_->invalidated_) {
-      co_return absl::FailedPreconditionError(
-          "RDB snapshot was invalidated or ended");
-    }
-    if (store.rdb_snapshot_->collection_ || store.rdb_snapshot_->readers_ != 0)
-      co_return absl::FailedPreconditionError(
-          "finish the outstanding RDB stream before scanning");
-    SnapshotReadGuard read_guard(&store.rdb_snapshot_->readers_);
-    // A batch is allowed to contain fewer values than requested. Keeping one
-    // outstanding key avoids retaining multiple graphs and makes cancellation
-    // and file-entry output ownership bounded independently of key count.
-    count = 1;
-
-    RdbSnapshotBatch result{
-        .cursor_ = cursor,
-        .values_ = {},
-    };
-    std::size_t logical_bytes = 0;
-    std::size_t partitions_visited = 0;
-    constexpr std::size_t kMaxEmptyPartitionsPerBatch = 64;
-    while (result.values_.size() < count && logical_bytes < max_bytes &&
-           result.cursor_.partition_index_ < store.partitions_.size()) {
-      auto& partition = store.partitions_[result.cursor_.partition_index_];
-      auto* capture =
-          partition.rdb_snapshot_ ? &*partition.rdb_snapshot_ : nullptr;
-      if (capture == nullptr || capture->session_id_ != session_id) {
-        co_return absl::FailedPreconditionError(
-            "RDB partition snapshot is not active");
-      }
-
-      if (!result.cursor_.finalizing_) {
-        if (result.cursor_.db_id_ < options_.database_count_) {
-          const std::size_t remaining = count - result.values_.size();
-          const auto scan_start = result.cursor_.index_cursor_;
-          auto scanned = co_await ScanPartition(
-              partition.id_, result.cursor_.db_id_,
-              result.cursor_.index_cursor_, std::max<std::size_t>(remaining, 1),
-              capture->snapshot_time_ms_, max_bytes - logical_bytes);
-          if (!scanned.ok()) co_return scanned.status();
-          result.cursor_.index_cursor_ = scanned->cursor_;
-          for (std::string& key : scanned->keys_) {
-            auto value = co_await MaterializeRdbSnapshotKey(
-                store, partition, session_id, result.cursor_.db_id_,
-                std::move(key));
-            if (!value.ok()) co_return value.status();
-            if (value->has_value()) {
-              logical_bytes += (**value).key_.size();
-              logical_bytes += (**value).value_.encoded_.size();
-              result.values_.push_back(std::move(**value));
-              // RecordIndex::Scan visits a whole bucket and may exceed count.
-              // Resume that bucket on the next batch; the dirty-map Done or
-              // Inflight markers skip already emitted keys. Advancing past it
-              // here would silently lose its other keys, while materializing
-              // them all would violate the one-stream-per-worker contract.
-              result.cursor_.index_cursor_ = scan_start;
-              break;
-            }
-          }
-          if (!result.values_.empty()) break;
-          if (result.cursor_.index_cursor_ == 0) {
-            ++result.cursor_.db_id_;
-          }
-          continue;
         }
-        capture->accepting_ = false;
-        result.cursor_.finalizing_ = true;
-        result.cursor_.dirty_cursor_ = 0;
-      }
+      });
+  if (!store.rdb_snapshot_ || store.rdb_snapshot_->id_ != session_id ||
+      store.rdb_snapshot_->invalidated_) {
+    co_return absl::FailedPreconditionError(
+        "RDB snapshot was invalidated or ended");
+  }
+  if (store.rdb_snapshot_->collection_ || store.rdb_snapshot_->readers_ != 0)
+    co_return absl::FailedPreconditionError(
+        "finish the outstanding RDB stream before scanning");
+  SnapshotReadGuard read_guard(&store.rdb_snapshot_->readers_);
+  // A batch is allowed to contain fewer values than requested. Keeping one
+  // outstanding key avoids retaining multiple graphs and makes cancellation
+  // and file-entry output ownership bounded independently of key count.
+  count = 1;
 
-      if (capture->capture_admissions_ != 0) {
-        absl::Status yielded = co_await bycorf::SleepFor(
-            *store.worker_, std::chrono::milliseconds(1));
-        if (!yielded.ok()) co_return yielded;
+  RdbSnapshotBatch result{
+      .cursor_ = cursor,
+      .values_ = {},
+  };
+  std::size_t logical_bytes = 0;
+  std::size_t partitions_visited = 0;
+  constexpr std::size_t kMaxEmptyPartitionsPerBatch = 64;
+  while (result.values_.size() < count && logical_bytes < max_bytes &&
+         result.cursor_.partition_index_ < store.partitions_.size()) {
+    auto& partition = store.partitions_[result.cursor_.partition_index_];
+    auto* capture =
+        partition.rdb_snapshot_ ? &*partition.rdb_snapshot_ : nullptr;
+    if (capture == nullptr || capture->session_id_ != session_id) {
+      co_return absl::FailedPreconditionError(
+          "RDB partition snapshot is not active");
+    }
+
+    if (!result.cursor_.finalizing_) {
+      if (result.cursor_.db_id_ < options_.database_count_) {
+        const std::size_t remaining = count - result.values_.size();
+        const auto scan_start = result.cursor_.index_cursor_;
+        auto scanned = co_await ScanPartition(
+            partition.id_, result.cursor_.db_id_, result.cursor_.index_cursor_,
+            std::max<std::size_t>(remaining, 1), capture->snapshot_time_ms_,
+            max_bytes - logical_bytes);
+        if (!scanned.ok()) co_return scanned.status();
+        result.cursor_.index_cursor_ = scanned->cursor_;
+        for (std::string& key : scanned->keys_) {
+          auto value = co_await MaterializeRdbSnapshotKey(
+              store, partition, session_id, result.cursor_.db_id_,
+              std::move(key));
+          if (!value.ok()) co_return value.status();
+          if (value->has_value()) {
+            logical_bytes += (**value).key_.size();
+            logical_bytes += (**value).value_.encoded_.size();
+            result.values_.push_back(std::move(**value));
+            // RecordIndex::Scan visits a whole bucket and may exceed count.
+            // Resume that bucket on the next batch; the dirty-map Done or
+            // Inflight markers skip already emitted keys. Advancing past it
+            // here would silently lose its other keys, while materializing
+            // them all would violate the one-stream-per-worker contract.
+            result.cursor_.index_cursor_ = scan_start;
+            break;
+          }
+        }
+        if (!result.values_.empty()) break;
+        if (result.cursor_.index_cursor_ == 0) {
+          ++result.cursor_.db_id_;
+        }
         continue;
       }
+      capture->accepting_ = false;
+      result.cursor_.finalizing_ = true;
+      result.cursor_.dirty_cursor_ = 0;
+    }
 
-      struct DirtyKey {
-        std::uint8_t db_id_ = 0;
-        std::string key_;
-      };
-      std::vector<DirtyKey> old_keys;
-      const std::size_t remaining = count - result.values_.size();
-      result.cursor_.dirty_cursor_ = capture->dirty_keys_.Scan(
-          result.cursor_.dirty_cursor_, [&](auto& entry) {
-            if (entry.value_.phase_ ==
-                WorkerStore::PartitionStore::RdbSnapshotValue::Phase::kAbsent) {
-              entry.value_.phase_ =
-                  WorkerStore::PartitionStore::RdbSnapshotValue::Phase::kDone;
-            } else if (entry.value_.phase_ ==
-                           WorkerStore::PartitionStore::RdbSnapshotValue::
-                               Phase::kOldValue &&
-                       old_keys.size() < remaining) {
-              const std::string_view composite = entry.key();
-              if (!composite.empty()) {
-                old_keys.push_back(DirtyKey{
-                    .db_id_ = static_cast<std::uint8_t>(composite.front()),
-                    .key_ = std::string(composite.substr(1)),
-                });
-              }
+    if (capture->capture_admissions_ != 0) {
+      absl::Status yielded = co_await bycorf::SleepFor(
+          *store.worker_, std::chrono::milliseconds(1));
+      if (!yielded.ok()) co_return yielded;
+      continue;
+    }
+
+    struct DirtyKey {
+      std::uint8_t db_id_ = 0;
+      std::string key_;
+    };
+    std::vector<DirtyKey> old_keys;
+    const std::size_t remaining = count - result.values_.size();
+    result.cursor_.dirty_cursor_ = capture->dirty_keys_.Scan(
+        result.cursor_.dirty_cursor_, [&](auto& entry) {
+          if (entry.value_.phase_ ==
+              WorkerStore::PartitionStore::RdbSnapshotValue::Phase::kAbsent) {
+            entry.value_.phase_ =
+                WorkerStore::PartitionStore::RdbSnapshotValue::Phase::kDone;
+          } else if (entry.value_.phase_ ==
+                         WorkerStore::PartitionStore::RdbSnapshotValue::Phase::
+                             kOldValue &&
+                     old_keys.size() < remaining) {
+            const std::string_view composite = entry.key();
+            if (!composite.empty()) {
+              old_keys.push_back(DirtyKey{
+                  .db_id_ = static_cast<std::uint8_t>(composite.front()),
+                  .key_ = std::string(composite.substr(1)),
+              });
             }
-          });
-      for (DirtyKey& key : old_keys) {
-        auto value = co_await MaterializeRdbSnapshotKey(
-            store, partition, session_id, key.db_id_, std::move(key.key_));
-        if (!value.ok()) co_return value.status();
-        if (value->has_value()) {
-          logical_bytes += (**value).key_.size();
-          logical_bytes += (**value).value_.encoded_.size();
-          result.values_.push_back(std::move(**value));
-        }
-      }
-      if (!result.values_.empty()) break;
-
-      if (result.cursor_.dirty_cursor_ == 0) {
-        bool old_remains = false;
-        capture->dirty_keys_.ForEach([&](const auto& entry) {
-          old_remains |=
-              entry.value_.phase_ ==
-              WorkerStore::PartitionStore::RdbSnapshotValue::Phase::kOldValue;
+          }
         });
-        if (old_remains) continue;
-        capture->dirty_keys_.Clear();
-        partition.rdb_snapshot_.reset();
-        ++result.cursor_.partition_index_;
-        result.cursor_.db_id_ = 0;
-        result.cursor_.index_cursor_ = 0;
-        result.cursor_.dirty_cursor_ = 0;
-        result.cursor_.finalizing_ = false;
-        if (++partitions_visited == kMaxEmptyPartitionsPerBatch) break;
+    for (DirtyKey& key : old_keys) {
+      auto value = co_await MaterializeRdbSnapshotKey(
+          store, partition, session_id, key.db_id_, std::move(key.key_));
+      if (!value.ok()) co_return value.status();
+      if (value->has_value()) {
+        logical_bytes += (**value).key_.size();
+        logical_bytes += (**value).value_.encoded_.size();
+        result.values_.push_back(std::move(**value));
       }
     }
-    result.done_ = result.cursor_.partition_index_ == store.partitions_.size();
-    co_return result;
-  } catch (const std::bad_alloc&) {
-    if (store.rdb_snapshot_ && store.rdb_snapshot_->id_ == session_id)
-      store.rdb_snapshot_->invalidated_ = true;
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM RDB snapshot batch");
+    if (!result.values_.empty()) break;
+
+    if (result.cursor_.dirty_cursor_ == 0) {
+      bool old_remains = false;
+      capture->dirty_keys_.ForEach([&](const auto& entry) {
+        old_remains |=
+            entry.value_.phase_ ==
+            WorkerStore::PartitionStore::RdbSnapshotValue::Phase::kOldValue;
+      });
+      if (old_remains) continue;
+      capture->dirty_keys_.Clear();
+      partition.rdb_snapshot_.reset();
+      ++result.cursor_.partition_index_;
+      result.cursor_.db_id_ = 0;
+      result.cursor_.index_cursor_ = 0;
+      result.cursor_.dirty_cursor_ = 0;
+      result.cursor_.finalizing_ = false;
+      if (++partitions_visited == kMaxEmptyPartitionsPerBatch) break;
+    }
   }
+  result.done_ = result.cursor_.partition_index_ == store.partitions_.size();
+  co_return result;
 }
 
 Task<absl::Status> StorageEngine::Impl::EndRdbSnapshot(
@@ -1014,262 +1007,246 @@ Task<absl::Status> StorageEngine::Impl::EndRdbSnapshot(
 Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
     std::uint64_t session_id, std::uint64_t token, std::uint64_t cursor) {
   auto& store = CurrentStore();
-  try {
-    if (!store.rdb_snapshot_ || store.rdb_snapshot_->id_ != session_id ||
-        store.rdb_snapshot_->invalidated_ || !store.rdb_snapshot_->collection_)
-      co_return absl::FailedPreconditionError(
-          "RDB collection stream is not active");
-    auto& stream = *store.rdb_snapshot_->collection_;
-    if (token == 0 || token != stream.token_ || cursor != stream.cursor_ ||
-        stream.reading_ || stream.done_)
-      co_return absl::InvalidArgumentError(
-          "invalid RDB collection token or cursor");
-    SnapshotReadGuard read_guard(&store.rdb_snapshot_->readers_);
-    stream.reading_ = true;
-    struct ReadingGuard {
-      bool* reading;
-      ~ReadingGuard() { *reading = false; }
-    } reading_guard{&stream.reading_};
-    LAVIK_FAULT_INJECT(if (const char* configured =
-                               std::getenv("LAVIK_FAIL_RDB_COLLECTION_PAGE");
-                           configured != nullptr) {
-      std::uint64_t failed_cursor = 0;
-      const char* end = configured + std::strlen(configured);
-      const bool allocation =
-          std::string_view(configured).starts_with("alloc:");
-      const char* number = configured + (allocation ? 6 : 0);
-      const auto parsed = std::from_chars(number, end, failed_cursor);
-      if (parsed.ec == std::errc{} && parsed.ptr == end &&
-          cursor == failed_cursor) {
-        if (allocation) throw std::bad_alloc();
-        // A later-page fault leaves an incomplete key in the temporary output.
-        // The job must cancel its token and never publish that file over a
-        // previously successful dump. Production builds omit this test hook.
+  if (!store.rdb_snapshot_ || store.rdb_snapshot_->id_ != session_id ||
+      store.rdb_snapshot_->invalidated_ || !store.rdb_snapshot_->collection_)
+    co_return absl::FailedPreconditionError(
+        "RDB collection stream is not active");
+  auto& stream = *store.rdb_snapshot_->collection_;
+  if (token == 0 || token != stream.token_ || cursor != stream.cursor_ ||
+      stream.reading_ || stream.done_)
+    co_return absl::InvalidArgumentError(
+        "invalid RDB collection token or cursor");
+  SnapshotReadGuard read_guard(&store.rdb_snapshot_->readers_);
+  stream.reading_ = true;
+  struct ReadingGuard {
+    bool* reading;
+    ~ReadingGuard() { *reading = false; }
+  } reading_guard{&stream.reading_};
+  LAVIK_FAULT_INJECT(if (const char* configured =
+                             std::getenv("LAVIK_FAIL_RDB_COLLECTION_PAGE");
+                         configured != nullptr) {
+    std::uint64_t failed_cursor = 0;
+    const char* end = configured + std::strlen(configured);
+    const bool admission = std::string_view(configured).starts_with("admit:");
+    const char* number = configured + (admission ? 6 : 0);
+    const auto parsed = std::from_chars(number, end, failed_cursor);
+    if (parsed.ec == std::errc{} && parsed.ptr == end &&
+        cursor == failed_cursor) {
+      if (admission) {
         store.rdb_snapshot_->invalidated_ = true;
-        co_return absl::InternalError(
-            "injected RDB collection page read failure");
+        RecordMemoryRejection();
+        co_return absl::ResourceExhaustedError(
+            "OOM RDB collection page admission");
       }
-    });
-    const auto object = stream.saved_->grouped_;
-    HashGroupId group_id;
-    if (object->is_ordered()) {
-      const auto& groups = object->ordered_directory().groups();
-      if (cursor >= groups.size())
-        co_return absl::DataLossError("RDB ordered cursor exceeds directory");
-      group_id = {groups[cursor].id_, 0};
-    } else {
-      if (stream.hash_cursor_ == object->directory().groups().end())
-        co_return absl::DataLossError("RDB Hash cursor exceeds directory");
-      group_id = stream.hash_cursor_->second.id_;
-    }
-    const auto* group_entry = object->FindGroup(group_id);
-    if (group_entry == nullptr)
-      co_return absl::DataLossError("RDB page has no physical record");
-    const auto location = MaterializeIndexLocation(*group_entry);
-    std::size_t payload_bytes = location.total_disk_bytes();
-    if (location.external()) {
-      const auto extents = object->ExtentsFor(group_id);
-      if (extents == nullptr)
-        co_return absl::DataLossError("RDB page has no extent manifest");
-      payload_bytes = 0;
-      for (const auto& extent : *extents) {
-        if (extent.payload_bytes_ > kMaxRecordPayloadBytes - payload_bytes)
-          co_return absl::DataLossError("RDB page extent payload overflow");
-        payload_bytes += extent.payload_bytes_;
-      }
-    }
-    // A decoded page survives asynchronous output backpressure. Reserve its
-    // retention before any page IO/decode; the loaders validate the checked
-    // envelope count before allocating entry vectors. This conservatively
-    // covers both decoder/DTO vector headers and small-string capacity.
-    const auto maximum = std::numeric_limits<std::size_t>::max();
-    constexpr std::size_t per_entry = 256;
-    constexpr std::size_t overhead = 4096;
-    if (payload_bytes > maximum - overhead ||
-        location.logical_size_ >
-            (maximum - payload_bytes - overhead) / per_entry)
-      co_return absl::ResourceExhaustedError(
-          "RDB page admission size overflow");
-    auto reservation = TryReserveMemory(payload_bytes + overhead +
-                                        location.logical_size_ * per_entry);
-    if (!reservation) {
-      RecordMemoryRejection();
+      // A later-page fault leaves an incomplete key in the temporary output.
+      // The job must cancel its token and never publish that file over a
+      // previously successful dump. Production builds omit this test hook.
       store.rdb_snapshot_->invalidated_ = true;
-      co_return absl::ResourceExhaustedError(
-          "OOM RDB collection page retention rejected");
+      co_return absl::InternalError(
+          "injected RDB collection page read failure");
     }
-    CollectionPage page;
-    page.value_type_ = stream.saved_->location_.value_type();
-    const Digest digest = ComputeDigest(stream.key_);
-    if (object->is_ordered()) {
-      const auto& groups = object->ordered_directory().groups();
-      if (cursor >= groups.size())
-        co_return absl::DataLossError("RDB ordered cursor exceeds directory");
-      auto loaded = co_await LoadOrderedGroupSnapshot(
-          store, *stream.partition_, stream.db_id_, stream.key_, digest, object,
-          groups[cursor].id_, true);
-      if (!loaded.ok()) {
-        store.rdb_snapshot_->invalidated_ = true;
-        co_return loaded.status();
-      }
-      if (page.value_type_ == ValueType::kList ||
-          page.value_type_ == ValueType::kStream) {
-        page.elements_.reserve(loaded->snapshot_.entries_.size());
-        for (auto& entry : loaded->snapshot_.entries_)
-          page.elements_.push_back(std::move(entry.value_));
-      } else {
-        page.scored_members_.reserve(loaded->snapshot_.entries_.size());
-        for (auto& entry : loaded->snapshot_.entries_)
-          page.scored_members_.push_back(
-              {std::move(entry.value_), entry.score_});
-      }
-      page.done_ = cursor + 1 == groups.size();
+  });
+  const auto object = stream.saved_->grouped_;
+  HashGroupId group_id;
+  if (object->is_ordered()) {
+    const auto& groups = object->ordered_directory().groups();
+    if (cursor >= groups.size())
+      co_return absl::DataLossError("RDB ordered cursor exceeds directory");
+    group_id = {groups[cursor].id_, 0};
+  } else {
+    if (stream.hash_cursor_ == object->directory().groups().end())
+      co_return absl::DataLossError("RDB Hash cursor exceeds directory");
+    group_id = stream.hash_cursor_->second.id_;
+  }
+  const auto* group_entry = object->FindGroup(group_id);
+  if (group_entry == nullptr)
+    co_return absl::DataLossError("RDB page has no physical record");
+  const auto location = MaterializeIndexLocation(*group_entry);
+  std::size_t payload_bytes = location.total_disk_bytes();
+  if (location.external()) {
+    const auto extents = object->ExtentsFor(group_id);
+    if (extents == nullptr)
+      co_return absl::DataLossError("RDB page has no extent manifest");
+    payload_bytes = 0;
+    for (const auto& extent : *extents) {
+      if (extent.payload_bytes_ > kMaxRecordPayloadBytes - payload_bytes)
+        co_return absl::DataLossError("RDB page extent payload overflow");
+      payload_bytes += extent.payload_bytes_;
+    }
+  }
+  // A decoded page survives asynchronous output backpressure. Reserve its
+  // retention before any page IO/decode; the loaders validate the checked
+  // envelope count before allocating entry vectors. This conservatively
+  // covers both decoder/DTO vector headers and small-string capacity.
+  const auto maximum = std::numeric_limits<std::size_t>::max();
+  constexpr std::size_t per_entry = 256;
+  constexpr std::size_t overhead = 4096;
+  if (payload_bytes > maximum - overhead ||
+      location.logical_size_ > (maximum - payload_bytes - overhead) / per_entry)
+    co_return absl::ResourceExhaustedError("RDB page admission size overflow");
+  auto reservation = TryReserveMemory(payload_bytes + overhead +
+                                      location.logical_size_ * per_entry);
+  if (!reservation) {
+    RecordMemoryRejection();
+    store.rdb_snapshot_->invalidated_ = true;
+    co_return absl::ResourceExhaustedError(
+        "OOM RDB collection page retention rejected");
+  }
+  CollectionPage page;
+  page.value_type_ = stream.saved_->location_.value_type();
+  const Digest digest = ComputeDigest(stream.key_);
+  if (object->is_ordered()) {
+    const auto& groups = object->ordered_directory().groups();
+    if (cursor >= groups.size())
+      co_return absl::DataLossError("RDB ordered cursor exceeds directory");
+    auto loaded = co_await LoadOrderedGroupSnapshot(
+        store, *stream.partition_, stream.db_id_, stream.key_, digest, object,
+        groups[cursor].id_, true);
+    if (!loaded.ok()) {
+      store.rdb_snapshot_->invalidated_ = true;
+      co_return loaded.status();
+    }
+    if (page.value_type_ == ValueType::kList ||
+        page.value_type_ == ValueType::kStream) {
+      page.elements_.reserve(loaded->snapshot_.entries_.size());
+      for (auto& entry : loaded->snapshot_.entries_)
+        page.elements_.push_back(std::move(entry.value_));
     } else {
-      const auto& groups = object->directory().groups();
-      if (stream.hash_cursor_ == groups.end())
-        co_return absl::DataLossError("RDB Hash cursor exceeds directory");
-      const auto id = stream.hash_cursor_->second.id_;
-      auto loaded = co_await LoadHashGroupSnapshot(store, *stream.partition_,
-                                                   stream.db_id_, stream.key_,
-                                                   digest, object, id, true);
-      if (!loaded.ok()) {
-        store.rdb_snapshot_->invalidated_ = true;
-        co_return loaded.status();
-      }
-      if (page.value_type_ == ValueType::kHash) {
-        page.fields_.reserve(loaded->snapshot_.value_.entries_.size());
-        for (auto& field : loaded->snapshot_.value_.entries_)
-          page.fields_.push_back(
-              {std::move(field.field_), std::move(field.value_)});
-      } else {
-        page.elements_.reserve(loaded->snapshot_.value_.entries_.size());
-        for (auto& field : loaded->snapshot_.value_.entries_) {
-          if (!field.value_.empty()) {
-            store.rdb_snapshot_->invalidated_ = true;
-            co_return absl::DataLossError("RDB Set page contains a Hash value");
-          }
-          page.elements_.push_back(std::move(field.field_));
+      page.scored_members_.reserve(loaded->snapshot_.entries_.size());
+      for (auto& entry : loaded->snapshot_.entries_)
+        page.scored_members_.push_back({std::move(entry.value_), entry.score_});
+    }
+    page.done_ = cursor + 1 == groups.size();
+  } else {
+    const auto& groups = object->directory().groups();
+    if (stream.hash_cursor_ == groups.end())
+      co_return absl::DataLossError("RDB Hash cursor exceeds directory");
+    const auto id = stream.hash_cursor_->second.id_;
+    auto loaded =
+        co_await LoadHashGroupSnapshot(store, *stream.partition_, stream.db_id_,
+                                       stream.key_, digest, object, id, true);
+    if (!loaded.ok()) {
+      store.rdb_snapshot_->invalidated_ = true;
+      co_return loaded.status();
+    }
+    if (page.value_type_ == ValueType::kHash) {
+      page.fields_.reserve(loaded->snapshot_.value_.entries_.size());
+      for (auto& field : loaded->snapshot_.value_.entries_)
+        page.fields_.push_back(
+            {std::move(field.field_), std::move(field.value_)});
+    } else {
+      page.elements_.reserve(loaded->snapshot_.value_.entries_.size());
+      for (auto& field : loaded->snapshot_.value_.entries_) {
+        if (!field.value_.empty()) {
+          store.rdb_snapshot_->invalidated_ = true;
+          co_return absl::DataLossError("RDB Set page contains a Hash value");
         }
+        page.elements_.push_back(std::move(field.field_));
       }
-      ++stream.hash_cursor_;
-      page.done_ = stream.hash_cursor_ == groups.end();
     }
-    if (store.rdb_snapshot_->invalidated_)
-      co_return absl::CancelledError(
-          "RDB collection stream was cancelled during read");
-    const auto expected = page.value_type_ == ValueType::kStream
-                              ? object->ordered_directory().root().item_count_
-                              : stream.saved_->location_.logical_size_;
-    if (stream.emitted_ > expected ||
-        page.size() > expected - stream.emitted_ ||
-        (page.done_ && page.size() != expected - stream.emitted_)) {
-      store.rdb_snapshot_->invalidated_ = true;
-      co_return absl::DataLossError("RDB collection aggregate count mismatch");
-    }
-    stream.emitted_ += page.size();
-    page.next_cursor_ = ++stream.cursor_;
-    stream.done_ = page.done_;
-    const auto retained_bytes = page.RetainedBytes();
-    if (retained_bytes > reservation->bytes()) {
-      store.rdb_snapshot_->invalidated_ = true;
-      co_return absl::DataLossError(
-          "RDB decoded page exceeds its admitted envelope");
-    }
-    page.retained_charge_.Adopt(&*reservation, retained_bytes);
-    LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES("LAVIK_RDB_CANCEL_ADMITTED_PAGE",
-                                               stream.key_)) {
-      static std::atomic_flag once;
-      if (!once.test_and_set(std::memory_order_relaxed)) {
-        // Exercise a real concurrent End, not merely FLUSHDB's invalidation.
-        // The independent coroutine must wait for this reader, and its exact
-        // pin checks must remain a registered settlement during shutdown.
-        using BlockPins =
-            WorkerStore::PartitionStore::RdbSnapshotValue::BlockPins;
-        const auto pins = stream.saved_->block_pins_;
-        const auto before =
-            GetWorkerMemoryStats(store.worker_->id()).retained_bytes_;
-        auto cancel = [](Impl* engine, WorkerStore* owner,
-                         std::uint64_t session,
-                         std::shared_ptr<const BlockPins> exact_pins,
-                         std::uint64_t retained_before,
-                         std::size_t page_bytes) -> Task<absl::Status> {
-          struct Settlement {
-            std::atomic<std::uint32_t>* count;
-            ~Settlement() { count->fetch_sub(1, std::memory_order_acq_rel); }
-          } settlement{&engine->active_settlements_};
-          auto ended = co_await engine->EndRdbSnapshot(session);
-          if (!ended.ok()) co_return ended;
-          ended = co_await engine->EndRdbSnapshot(session);
-          if (!ended.ok()) co_return ended;
-          std::size_t remaining = 0;
-          for (const auto pin : exact_pins->blocks_) {
-            const unsigned physical_owner = engine->BlockOwner(pin.block_id_);
-            auto count = [engine, physical_owner,
-                          pin]() -> Task<std::uint32_t> {
-              auto& physical = *engine->stores_[physical_owner];
-              co_await physical.store_state_mutex_.Lock();
-              UnlockGuard unlock(&physical.store_state_mutex_,
-                                 physical.worker_);
-              const auto* block =
-                  engine->FindBlockState(physical, pin.block_id_);
-              co_return block != nullptr && block->allocated_ &&
-                      block->allocation_epoch_ == pin.allocation_epoch_
-                  ? block->pins_
-                  : 0;
-            };
-            // if/else, not ?:, to keep the two co_awaits in separate full
-            // expressions. GCC 13 can reuse the wrong coroutine-frame slot
-            // when both arms of ?: contain co_await.
-            if (physical_owner == owner->worker_->id()) {
-              remaining += co_await count();
-            } else {
-              remaining += co_await bycorf::SubmitTaskTo(physical_owner, count);
-            }
+    ++stream.hash_cursor_;
+    page.done_ = stream.hash_cursor_ == groups.end();
+  }
+  if (store.rdb_snapshot_->invalidated_)
+    co_return absl::CancelledError(
+        "RDB collection stream was cancelled during read");
+  const auto expected = page.value_type_ == ValueType::kStream
+                            ? object->ordered_directory().root().item_count_
+                            : stream.saved_->location_.logical_size_;
+  if (stream.emitted_ > expected || page.size() > expected - stream.emitted_ ||
+      (page.done_ && page.size() != expected - stream.emitted_)) {
+    store.rdb_snapshot_->invalidated_ = true;
+    co_return absl::DataLossError("RDB collection aggregate count mismatch");
+  }
+  stream.emitted_ += page.size();
+  page.next_cursor_ = ++stream.cursor_;
+  stream.done_ = page.done_;
+  const auto retained_bytes = page.RetainedBytes();
+  if (retained_bytes > reservation->bytes()) {
+    store.rdb_snapshot_->invalidated_ = true;
+    co_return absl::DataLossError(
+        "RDB decoded page exceeds its admitted envelope");
+  }
+  page.retained_charge_.Adopt(&*reservation, retained_bytes);
+  LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES("LAVIK_RDB_CANCEL_ADMITTED_PAGE",
+                                             stream.key_)) {
+    static std::atomic_flag once;
+    if (!once.test_and_set(std::memory_order_relaxed)) {
+      // Exercise a real concurrent End, not merely FLUSHDB's invalidation.
+      // The independent coroutine must wait for this reader, and its exact
+      // pin checks must remain a registered settlement during shutdown.
+      using BlockPins =
+          WorkerStore::PartitionStore::RdbSnapshotValue::BlockPins;
+      const auto pins = stream.saved_->block_pins_;
+      const auto before =
+          GetWorkerMemoryStats(store.worker_->id()).retained_bytes_;
+      auto cancel = [](Impl* engine, WorkerStore* owner, std::uint64_t session,
+                       std::shared_ptr<const BlockPins> exact_pins,
+                       std::uint64_t retained_before,
+                       std::size_t page_bytes) -> Task<absl::Status> {
+        struct Settlement {
+          std::atomic<std::uint32_t>* count;
+          ~Settlement() { count->fetch_sub(1, std::memory_order_acq_rel); }
+        } settlement{&engine->active_settlements_};
+        auto ended = co_await engine->EndRdbSnapshot(session);
+        if (!ended.ok()) co_return ended;
+        ended = co_await engine->EndRdbSnapshot(session);
+        if (!ended.ok()) co_return ended;
+        std::size_t remaining = 0;
+        for (const auto pin : exact_pins->blocks_) {
+          const unsigned physical_owner = engine->BlockOwner(pin.block_id_);
+          auto count = [engine, physical_owner, pin]() -> Task<std::uint32_t> {
+            auto& physical = *engine->stores_[physical_owner];
+            co_await physical.store_state_mutex_.Lock();
+            UnlockGuard unlock(&physical.store_state_mutex_, physical.worker_);
+            const auto* block = engine->FindBlockState(physical, pin.block_id_);
+            co_return block != nullptr && block->allocated_ &&
+                    block->allocation_epoch_ == pin.allocation_epoch_
+                ? block->pins_
+                : 0;
+          };
+          // if/else, not ?:, to keep the two co_awaits in separate full
+          // expressions. GCC 13 can reuse the wrong coroutine-frame slot
+          // when both arms of ?: contain co_await.
+          if (physical_owner == owner->worker_->id()) {
+            remaining += co_await count();
+          } else {
+            remaining += co_await bycorf::SubmitTaskTo(physical_owner, count);
           }
-          const auto after =
-              GetWorkerMemoryStats(owner->worker_->id()).retained_bytes_;
-          if (remaining != 0 || retained_before < page_bytes ||
-              after > retained_before - page_bytes) {
-            spdlog::error(
-                "RDB page cancellation leaked state: pins={} before={} "
-                "after={} page={}",
-                remaining, retained_before, after, page_bytes);
-            co_return absl::InternalError("RDB page cancellation leaked state");
-          }
-          spdlog::info(
-              "RDB page cancellation completed: pins={} remaining=0 "
-              "returned-page-bytes={}",
-              exact_pins->blocks_.size(), page_bytes);
-          co_return absl::OkStatus();
-        };
-        active_settlements_.fetch_add(1, std::memory_order_acq_rel);
-        store.worker_->Spawn(
-            cancel(this, &store, session_id, pins, before, retained_bytes));
-        auto paused = co_await bycorf::SleepFor(*store.worker_,
-                                                std::chrono::milliseconds(50));
-        if (!paused.ok()) co_return paused;
-        if (!store.rdb_snapshot_ || !store.rdb_snapshot_->ending_ ||
-            store.rdb_snapshot_->readers_ == 0) {
-          co_return absl::InternalError(
-              "RDB End did not wait for its page reader");
+        }
+        const auto after =
+            GetWorkerMemoryStats(owner->worker_->id()).retained_bytes_;
+        if (remaining != 0 || retained_before < page_bytes ||
+            after > retained_before - page_bytes) {
+          spdlog::error(
+              "RDB page cancellation leaked state: pins={} before={} "
+              "after={} page={}",
+              remaining, retained_before, after, page_bytes);
+          co_return absl::InternalError("RDB page cancellation leaked state");
         }
         spdlog::info(
-            "RDB page cancellation waiting: readers={} retained-page={}",
-            store.rdb_snapshot_->readers_, retained_bytes);
-        co_return absl::CancelledError(
-            "RDB page cancelled while holding reader");
+            "RDB page cancellation completed: pins={} remaining=0 "
+            "returned-page-bytes={}",
+            exact_pins->blocks_.size(), page_bytes);
+        co_return absl::OkStatus();
+      };
+      active_settlements_.fetch_add(1, std::memory_order_acq_rel);
+      store.worker_->Spawn(
+          cancel(this, &store, session_id, pins, before, retained_bytes));
+      auto paused = co_await bycorf::SleepFor(*store.worker_,
+                                              std::chrono::milliseconds(50));
+      if (!paused.ok()) co_return paused;
+      if (!store.rdb_snapshot_ || !store.rdb_snapshot_->ending_ ||
+          store.rdb_snapshot_->readers_ == 0) {
+        co_return absl::InternalError(
+            "RDB End did not wait for its page reader");
       }
-    });
-    co_return std::move(page);
-  } catch (const std::bad_alloc&) {
-    // Guards have dropped the active reader before End can settle the token;
-    // invalidate it so a caller cannot retry a partially advanced cursor.
-    if (store.rdb_snapshot_ && store.rdb_snapshot_->id_ == session_id)
-      store.rdb_snapshot_->invalidated_ = true;
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "OOM RDB collection page allocation");
-  }
+      spdlog::info("RDB page cancellation waiting: readers={} retained-page={}",
+                   store.rdb_snapshot_->readers_, retained_bytes);
+      co_return absl::CancelledError("RDB page cancelled while holding reader");
+    }
+  });
+  co_return std::move(page);
 }
 
 Task<absl::Status> StorageEngine::Impl::FinishRdbCollection(
