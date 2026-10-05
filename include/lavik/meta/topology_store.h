@@ -183,6 +183,29 @@ struct MetaGroupAuthorityView {
   bool operator==(const MetaGroupAuthorityView&) const = default;
 };
 
+// Discovery and outcome facts, without candidate domain/frontier payloads.
+// The action markers also identify existing deterministic test pause cuts.
+struct MetaFailoverWork {
+  std::string group_id_;
+  MetaFailoverTransitionRef transition_;
+  MetaFailoverMode mode_ = MetaFailoverMode::kUncontrolled;
+  std::optional<MetaOperationId> operation_id_;
+  std::optional<MetaFailoverActionId> action_id_;
+  std::optional<MetaFailoverLoss> authorized_loss_;
+  bool recovery_started_ = false;
+};
+
+// Automatic detection needs the Owner assignment, not the complete member
+// table or a transition's candidate payload. Missing assignment stays explicit.
+struct MetaAutomaticGroupFacts {
+  std::string group_id_;
+  MetaGroupRecord record_;
+  std::uint64_t revision_ = 0;
+  std::optional<MetaAssignmentId> owner_assignment_;
+  MetaGroupAuthorityView authority_;
+  std::optional<MetaFailoverTransitionRef> transition_;
+};
+
 class MetaTopologyStore {
  public:
   // Cluster creation never advances topology_epoch.
@@ -274,6 +297,9 @@ class MetaTopologyStore {
   // and their members retain store key order; no derived lookup indices are
   // built here so callers can build them outside the state-machine lock.
   std::vector<MetaObservationGroupFacts> ObservationFacts() const;
+  // Owned, Group-id ordered extraction; no intermediate full Group copies.
+  std::vector<MetaFailoverWork> FailoverWork() const;
+  std::vector<MetaAutomaticGroupFacts> AutomaticDetectionFacts() const;
   std::size_t GroupCount() const { return groups_.size(); }
 
   // Snapshot support: u16 schema_version envelope, deterministic bytes.

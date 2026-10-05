@@ -621,6 +621,7 @@ set(LAVIK_META_CORE_SOURCES
   src/meta/population_manifest_store.cpp
   src/meta/proposal_executor.cpp
   src/meta/proposal_view.cpp
+  src/meta/failover_views.cpp
   src/meta/state_apply.cpp
   src/meta/state_machine.cpp
   src/meta/topology_store.cpp
@@ -888,6 +889,7 @@ if (BUILD_TESTING)
     tests/meta_failover_aggregate_revision_test.cpp
     tests/meta_failover_observation_test.cpp
     tests/meta_failover_reconciler_test.cpp
+    tests/meta_failover_views_test.cpp
     tests/meta_failover_test.cpp
     tests/meta_journal_test.cpp
     tests/meta_model_test.cpp

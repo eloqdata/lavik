@@ -448,6 +448,79 @@ TEST_F(MetaObservationFactsFixture,
   EXPECT_EQ(retained.group(command.group_id_)->record_.group_term_, 2u);
 }
 
+TEST_F(MetaObservationFactsFixture,
+       FailoverCapturesKeepGlobalEvidenceAndOnlyTheirCurrentPolicies) {
+  const auto discovery = machine_->CaptureFailoverDiscovery();
+  ASSERT_EQ(discovery.work_.size(), 2u);
+  EXPECT_EQ(discovery.work_[0].group_id_, kControlled.id);
+  EXPECT_EQ(discovery.work_[1].group_id_, kRecovering.id);
+  ASSERT_EQ(discovery.operations_.size(), 1u);
+  EXPECT_EQ(discovery.work_[0].operation_id_,
+            discovery.operations_[0].operation_id_);
+  const auto controlled =
+      machine_->CaptureFailoverPlanningView(discovery.cursor_, kControlled.id);
+  const auto recovering =
+      machine_->CaptureFailoverPlanningView(discovery.cursor_, kRecovering.id);
+  ASSERT_TRUE(controlled);
+  ASSERT_TRUE(recovering);
+  ASSERT_TRUE(controlled->operation_);
+  EXPECT_EQ(controlled->operation_->intent_, discovery.operations_[0].intent_);
+  EXPECT_FALSE(controlled->recovery_policy_);
+  EXPECT_FALSE(recovering->operation_);
+  ASSERT_TRUE(recovering->recovery_policy_);
+  EXPECT_EQ(recovering->recovery_policy_->budget_ms_, 2000u);
+  const auto detection = machine_->CaptureAutomaticDetectionView();
+  ASSERT_TRUE(detection.automatic_);
+  ASSERT_TRUE(detection.lease_);
+  EXPECT_EQ(detection.automatic_->suspect_after_ms_, 5000u);
+  EXPECT_EQ(detection.lease_->duration_ms_, 5000u);
+  ASSERT_EQ(detection.groups_.size(), 2u);
+  EXPECT_EQ(detection.FindGroup(kControlled.id)->owner_assignment_,
+            kControlled.SourceAssignment());
+  EXPECT_EQ(detection.FindGroup(kRecovering.id)->transition_->transition_id_,
+            kRecovering.TransitionId());
+  EXPECT_EQ(detection.FindGroup("absent"), nullptr);
+
+  const meta::MetaStoresFacts original_facts(stores_);
+  // The target is recovering, but the newest valid node-wide report can live
+  // exclusively in the controlled Group. Every observation lookup keeps its
+  // complete domain and must survive later apply/Install independently.
+  for (const auto& observation :
+       Observations(Candidate(kControlled), digest_)) {
+    meta::MetaObservationStore original;
+    meta::MetaObservationStore projected;
+    ASSERT_TRUE(original.AdoptSession(observation.identity_, 999).ok());
+    ASSERT_TRUE(projected.AdoptSession(observation.identity_, 999).ok());
+    ASSERT_TRUE(original.Ingest(observation, original_facts, 1000).ok());
+    ASSERT_TRUE(projected.Ingest(observation, recovering->facts_, 1000).ok());
+    ExpectEqualObservations(original, projected, original_facts,
+                            recovering->facts_, 1001);
+  }
+  machine_->Advance(101);
+  const auto advanced =
+      machine_->CaptureAutomaticTriggerView(detection.cursor_);
+  ASSERT_TRUE(advanced);
+  EXPECT_EQ(advanced->cursor_.applied_index(), 101u);
+  EXPECT_EQ(advanced->cursor_.state_change_index(), 100u);
+  const auto advanced_plan =
+      machine_->CaptureFailoverPlanningView(discovery.cursor_, kRecovering.id);
+  ASSERT_TRUE(advanced_plan);
+  EXPECT_EQ(advanced_plan->facts_.applied_index(), 101u);
+  // Equal applied indexes still have different state-change cuts after Install.
+  meta::MetaStores empty;
+  Install(empty, 101);
+  EXPECT_FALSE(machine_->CaptureAutomaticTriggerView(advanced->cursor_));
+  EXPECT_FALSE(
+      machine_->CaptureFailoverPlanningView({101, 100}, kRecovering.id));
+  machine_.reset();
+  EXPECT_EQ(recovering->facts_.applied_index(), 100u);
+  EXPECT_TRUE(recovering->facts_.IsActiveNode(Node(kControlled.candidate)));
+  EXPECT_EQ(controlled->group_->failover_transition_->transition_id_,
+            kControlled.TransitionId());
+  EXPECT_EQ(detection.FindGroup(kControlled.id)->record_.group_term_, 1u);
+  EXPECT_EQ(advanced->operations_[0].intent_, discovery.operations_[0].intent_);
+}
+
 void ClearTransition(meta::MetaStores& stores, const FactsGroup& group) {
   const auto transition =
       *stores.topology_.FindGroup(group.id)->failover_transition_;
@@ -857,6 +930,24 @@ TEST(MetaObservationFactsTest, ConcurrentCommitAdvanceAndInstallKeepOneCut) {
         check_cut(facts, facts);
         const auto proposal = machine->CaptureProposal(proposal_command);
         check_cut(proposal, proposal.facts());
+        const auto discovery = machine->CaptureFailoverDiscovery();
+        const auto planning = machine->CaptureFailoverPlanningView(
+            discovery.cursor_, create.group_id_);
+        if (planning) {
+          check_cut(planning->facts_, planning->facts_);
+          EXPECT_EQ(planning->group_->record_.group_term_,
+                    planning->facts_.CurrentGroupTerm(create.group_id_));
+        }
+        const auto detection = machine->CaptureAutomaticDetectionView();
+        const auto detected_index = detection.cursor_.applied_index();
+        EXPECT_EQ(detection.FindGroup(create.group_id_)->record_.group_term_,
+                  ((detected_index - 1) / 3) * 2 +
+                      ((detected_index - 1) % 3 == 0 ? 0u : 1u));
+        const auto trigger =
+            machine->CaptureAutomaticTriggerView(detection.cursor_);
+        if (trigger)
+          EXPECT_EQ(trigger->cursor_.state_change_index(),
+                    detection.cursor_.state_change_index());
       }
       phase.arrive_and_wait();
       // The writer cannot enter the next phase until both readers finish

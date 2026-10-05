@@ -486,6 +486,24 @@ operations remain whole records so directive payloads, revisions and exact
 receipts preserve their recovery meaning. Other readers can still use the
 complete `CommittedView`.
 
+Failover discovery retains only active failover operations and Group transition
+ownership, with operations ordered by submission sequence and transitions by
+Group id. Each attempted target captures its Group, authority, associated whole
+operation and complete observation-facts domain from one state-change cut.
+Uncontrolled recovery also retains the current CandidateRecovery Policy.
+Automatic detection retains lifecycle, compact facts for all Groups, and the
+current automatic and lease Policies; it has no operation journal. Only a
+trigger captures submitted failover operations for pristine-request selection.
+That capture must match the detection state-change cut before the detector
+latches the trigger or allocates command identities; a mismatch preserves the
+previous debounce state and causes a fresh read. Pending outcomes use transition
+id/revision facts, while uncertain retries preserve their command identity.
+Both reconcilers use cursor-only subscriptions, polling both applied and
+state-change indices as well as completion notifications. This keeps snapshot
+installation, overflow/resubscription and configuration-only applied advances
+visible without retaining full stores. Capture sorting, intent/hash checks,
+Policy decoding and observation-facts indexing run outside the state lock.
+
 Committed subscribers atomically receive an initial full or purpose-specific
 view, its command-event cursor, and a bounded ordered subscription. Consumers
 that only need notifications capture the applied and state-change indices
@@ -1493,6 +1511,7 @@ audit history rather than replacing it.
 | Pure Owner Serviceability cut, causal lease confirmation, leader-local detector state, automatic Begin adapter, and generation-bracketed diagnostics | `include/lavik/meta/owner_serviceability.h`, `src/meta/owner_serviceability.cpp`, `include/lavik/meta/automatic_failover_detector.h`, `src/meta/automatic_failover_detector.cpp`, `include/lavik/meta/automatic_failover_reconciler.h`, `src/meta/automatic_failover_reconciler.cpp` |
 | Volatile candidate/failover observations and deterministic compatibility-domain plan selection | `include/lavik/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/lavik/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
 | Owned observation-facts cuts, index-only captures, and atomic subscription registration | `include/lavik/meta/observation_facts_view.h`, `src/meta/observation_facts_view.cpp`, `src/meta/state_machine.cpp`, `src/meta/coordinator.cpp` |
+| Owned failover discovery and per-target planning, compact automatic detection and conditional trigger cuts | `include/lavik/meta/failover_views.h`, `src/meta/failover_views.cpp`, `src/meta/topology_store.cpp`, `src/meta/failover_reconciler.cpp`, `src/meta/automatic_failover_reconciler.cpp` |
 | Command-specific proposal cuts, live-operation headers, and the same-cut full recovery exception | `include/lavik/meta/proposal_view.h`, `src/meta/proposal_view.cpp`, `src/meta/operation_store.cpp`, `src/meta/state_machine.cpp`, `src/meta/coordinator.cpp` |
 | Pure per-node projection including resolved lease duration, Data-derived heartbeat cadence, and failover/activation/follow-owner state, plus the leader-scoped Data-session publisher and causal heartbeat admission | `include/lavik/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/lavik/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
 | Manifest-bootstrapped initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `raft/engine/storage.go`, `raft/engine/join.go`, `app/lavik_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |

@@ -28,6 +28,7 @@
 #include "lavik/meta/failover_reconciler.h"
 #include "lavik/meta/hash.h"
 #include "lavik/meta/state_apply.h"
+#include "support/failover_planning.h"
 
 namespace lavik::meta {
 namespace {
@@ -399,8 +400,8 @@ struct ProposalFixture {
   }
 
   absl::StatusOr<std::optional<MetaCommand>> Plan(std::int64_t now) {
-    return PlanFailoverStep(
-        MetaCommittedView(stores, next_index - 1), observations,
+    return lavik::test::PlanFailoverFixture(
+        stores, next_index - 1, observations,
         {.now_unix_ms_ = now,
          .leadership_started_unix_ms_ = now - 101,
          .observation_grace_ms_ = 100,
