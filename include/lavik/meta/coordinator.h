@@ -118,6 +118,7 @@
 #include "lavik/meta/observation_facts_view.h"
 #include "lavik/meta/observation_store.h"
 #include "lavik/meta/proposal_executor.h"
+#include "lavik/meta/proposal_view.h"
 #include "lavik/meta/raft.h"
 #include "lavik/meta/state_apply.h"
 #include "lavik/meta/workflow_views.h"
@@ -314,15 +315,18 @@ using MetaCursorSubscriptionStart =
 // registration order, and the first non-OK status aborts the proposal with
 // that status — nothing is appended, no audit record is written. What a hook
 // approves must be baked into the command as an immutable evidence summary;
-// apply never re-checks hooks. Hooks receive the same atomic view Propose
-// used for its fail-safe gates and the leader-local observation store (read
-// it only on the coordinator's owner thread, see the file header). The final
-// argument is one wall-clock cut shared by every hook for that proposal, so
-// TTL/deadline outcomes cannot depend on hook registration order.
+// apply never re-checks hooks. Hooks receive an owned command-specific view
+// from the same cut as Propose's gates, plus the leader-local observation store
+// (read it only on the coordinator's owner thread, see the file header). The
+// final argument is one wall-clock cut shared by every hook for that proposal,
+// so TTL/deadline outcomes cannot depend on hook registration order. Hook
+// dependencies must be listed in MetaProposalView's exhaustive command map;
+// querying an uncaptured dependency fails stop rather than granting admission
+// based on a false absence. Hooks never capture a second cut.
 // ---------------------------------------------------------------------------
 
 using MetaValidateHook = std::function<absl::Status(
-    const MetaCommand&, const MetaCommittedView&, const MetaObservationStore&,
+    const MetaCommand&, const MetaProposalView&, const MetaObservationStore&,
     std::int64_t proposal_now_unix_ms)>;
 
 // ---------------------------------------------------------------------------

@@ -451,6 +451,20 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
       std::uint32_t effective_lease_duration_ms = 5'000) {
     auto projected = MetaControlProjector::ProjectNode(view, seed.owner_);
     if (!projected.ok()) return projected.status();
+    return PublishOwnerHeartbeat(
+        std::move(*projected), MetaStoresFacts(view.stores()),
+        view.applied_index(), seed, std::move(health), causally_confirm_lease,
+        observed_at_unix_ms, observed_at_steady_ms,
+        effective_lease_duration_ms);
+  }
+
+  absl::Status PublishOwnerHeartbeat(
+      NodeControlBatch projection, const MetaCommittedFacts& facts,
+      std::uint64_t applied_index, const SeedState& seed,
+      MetaNodeHealthObs health, bool causally_confirm_lease,
+      std::int64_t observed_at_unix_ms, std::uint64_t observed_at_steady_ms,
+      std::uint32_t effective_lease_duration_ms = 5'000) {
+    auto* projected = &projection;
     const auto group =
         std::find_if(projected->full_state.groups.begin(),
                      projected->full_state.groups.end(),
@@ -484,7 +498,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
         seed.owner_, std::string(40, '1'), session_id, history,
         /*replication_flow_count=*/1, /*session_generation=*/1,
         /*leader_term=*/CurrentTerm(),
-        /*validated_committed_high_water=*/view.applied_index(),
+        /*validated_committed_high_water=*/applied_index,
         projected->full_state);
 
     const MetaObservedOwnerProjection owner_projection{
@@ -496,7 +510,6 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
         .authority_lease_duration_ms_ =
             projected->full_state.authority_lease_duration_ms,
     };
-    const MetaStoresFacts facts(view.stores());
     auto first = observations_.ReplaceHeartbeat(
         identity, health, std::nullopt, std::nullopt, std::nullopt,
         owner_projection, /*heartbeat_sequence=*/1, std::nullopt, facts,
@@ -735,7 +748,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   for (unsigned index = 2; index <= 6; ++index) AddOwnerGroup(index);
   std::atomic<int> attempts{0};
   coordinator_->AddValidateHook(
-      [&attempts](const MetaCommand& command, const MetaCommittedView&,
+      [&attempts](const MetaCommand& command, const MetaProposalView&,
                   const MetaObservationStore&, std::int64_t) {
         if (std::holds_alternative<BeginUncontrolledFailover>(command))
           attempts.fetch_add(1, std::memory_order_release);
@@ -775,7 +788,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   for (unsigned index = 2; index <= 6; ++index) AddOwnerGroup(index);
   std::atomic<int> attempts{0};
   coordinator_->AddValidateHook(
-      [&attempts](const MetaCommand& command, const MetaCommittedView&,
+      [&attempts](const MetaCommand& command, const MetaProposalView&,
                   const MetaObservationStore&, std::int64_t) {
         if (std::holds_alternative<BeginUncontrolledFailover>(command))
           ++attempts;
@@ -811,7 +824,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTimeoutTest,
   ArmShortProposalTimeout();
   std::atomic<int> attempts{0};
   coordinator_->AddValidateHook(
-      [&attempts](const MetaCommand& command, const MetaCommittedView&,
+      [&attempts](const MetaCommand& command, const MetaProposalView&,
                   const MetaObservationStore&, std::int64_t) {
         if (std::holds_alternative<BeginUncontrolledFailover>(command))
           ++attempts;
@@ -876,7 +889,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   }
   std::atomic<int> attempts{0};
   coordinator_->AddValidateHook(
-      [&attempts](const MetaCommand& command, const MetaCommittedView&,
+      [&attempts](const MetaCommand& command, const MetaProposalView&,
                   const MetaObservationStore&, std::int64_t) {
         if (std::holds_alternative<AbortControlledFailover>(command))
           ++attempts;
@@ -1112,11 +1125,15 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 TEST_F(MetaAutomaticFailoverReconcilerTest,
        ServiceableRecoveryImmediatelyBeforeAppendSuppressesBegin) {
   const SeedState seed = SeedCluster();
+  // Prepare Data projection outside the hook; admission supplies only facts.
+  const auto projection = MetaControlProjector::ProjectNode(
+      coordinator_->CommittedView(), seed.owner_);
+  ASSERT_TRUE(projection.ok()) << projection.status();
   std::promise<absl::Status> injected;
   std::future<absl::Status> injection = injected.get_future();
   std::atomic<bool> injected_once{false};
   coordinator_->AddValidateHook(
-      [&](const MetaCommand& command, const MetaCommittedView& view,
+      [&](const MetaCommand& command, const MetaProposalView& view,
           const MetaObservationStore&, std::int64_t proposal_now_unix_ms) {
         const auto* begin = std::get_if<BeginUncontrolledFailover>(&command);
         if (begin == nullptr ||
@@ -1126,7 +1143,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
         }
         now_unix_ms_.store(proposal_now_unix_ms, std::memory_order_release);
         absl::Status status = PublishOwnerHeartbeat(
-            view, seed,
+            *projection, view.facts(), view.applied_index(), seed,
             MetaNodeHealthObs{.storage_ready_ = true,
                               .population_ready_ = true,
                               .draining_ = false,
@@ -1165,12 +1182,16 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 TEST_F(MetaAutomaticFailoverReconcilerTest,
        FailureReasonChangeImmediatelyBeforeAppendPreservesAdmission) {
   const SeedState seed = SeedCluster();
+  // Prepare Data projection outside the hook; admission supplies only facts.
+  const auto projection = MetaControlProjector::ProjectNode(
+      coordinator_->CommittedView(), seed.owner_);
+  ASSERT_TRUE(projection.ok()) << projection.status();
   std::promise<absl::Status> injected;
   std::future<absl::Status> injection = injected.get_future();
   std::atomic<bool> injected_once{false};
   std::atomic<std::uint8_t> proposed_reason{0};
   coordinator_->AddValidateHook(
-      [&](const MetaCommand& command, const MetaCommittedView& view,
+      [&](const MetaCommand& command, const MetaProposalView& view,
           const MetaObservationStore&, std::int64_t proposal_now_unix_ms) {
         const auto* begin = std::get_if<BeginUncontrolledFailover>(&command);
         if (begin == nullptr ||
@@ -1182,7 +1203,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                               std::memory_order_release);
         now_unix_ms_.store(proposal_now_unix_ms, std::memory_order_release);
         absl::Status status = PublishOwnerHeartbeat(
-            view, seed,
+            *projection, view.facts(), view.applied_index(), seed,
             MetaNodeHealthObs{.storage_ready_ = false,
                               .population_ready_ = true,
                               .draining_ = false,
@@ -1232,7 +1253,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   std::future<void> first_attempt = first_attempt_seen.get_future();
   std::atomic<int> automatic_attempts{0};
   coordinator_->AddValidateHook([&](const MetaCommand& command,
-                                    const MetaCommittedView&,
+                                    const MetaProposalView&,
                                     const MetaObservationStore&, std::int64_t) {
     const auto* begin = std::get_if<BeginUncontrolledFailover>(&command);
     if (begin == nullptr ||

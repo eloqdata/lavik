@@ -634,20 +634,22 @@ TEST(MetaFailoverReconcilerPlannerTest,
       std::get_if<meta::AuthorizeFailoverPrepare>(&**authorized);
   ASSERT_NE(authorize, nullptr);
   EXPECT_EQ(authorize->loss_if_cutover_, meta::MetaFailoverLoss::kUnknown);
-  EXPECT_TRUE(
-      meta::ValidateFailoverProposal(
-          **authorized,
-          meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-          fixture.observations, 3013)
-          .ok());
+  EXPECT_TRUE(meta::ValidateFailoverProposal(
+                  **authorized,
+                  meta::MetaProposalView::FromStores(
+                      **authorized, fixture.stores,
+                      {fixture.next_index - 1, fixture.next_index - 1}),
+                  fixture.observations, 3013)
+                  .ok());
   // A changed role update withdraws the terminal report before append.
   fixture.ReportCandidate(3014);
-  EXPECT_FALSE(
-      meta::ValidateFailoverProposal(
-          **authorized,
-          meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-          fixture.observations, 3014)
-          .ok());
+  EXPECT_FALSE(meta::ValidateFailoverProposal(
+                   **authorized,
+                   meta::MetaProposalView::FromStores(
+                       **authorized, fixture.stores,
+                       {fixture.next_index - 1, fixture.next_index - 1}),
+                   fixture.observations, 3014)
+                   .ok());
 }
 
 TEST(MetaFailoverReconcilerPlannerTest,

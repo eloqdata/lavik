@@ -311,6 +311,14 @@ std::optional<std::uint64_t> MetaPolicyStore::LatestVersion(
   return policy->second.rbegin()->first;
 }
 
+std::optional<MetaPolicyVersionView> MetaPolicyStore::CurrentVersion(
+    const std::string& policy_id) const {
+  const auto policy = policies_.find(policy_id);
+  if (policy == policies_.end() || policy->second.empty()) return std::nullopt;
+  const auto& [version, content] = *policy->second.rbegin();
+  return MetaPolicyVersionView{policy->first, version, content};
+}
+
 std::vector<MetaPolicyVersionView> MetaPolicyStore::Versions() const {
   std::vector<MetaPolicyVersionView> result;
   for (const auto& [policy_id, versions] : policies_) {

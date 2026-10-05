@@ -14,6 +14,7 @@
 #include "absl/status/statusor.h"
 #include "lavik/meta/committed_status_view.h"
 #include "lavik/meta/observation_facts_view.h"
+#include "lavik/meta/proposal_view.h"
 #include "lavik/meta/raft.h"
 #include "lavik/meta/state_apply.h"
 #include "lavik/meta/workflow_views.h"
@@ -70,6 +71,10 @@ class MetaStateMachine {
   MetaStores StoresSnapshot() const;
   // Full-state capture, paired with both indices for full-view subscriptions.
   MetaCommittedStoresSnapshot CaptureStores() const;
+  // Captures admission data and its indices under one state lock. The result
+  // owns its lifetime independently of this machine and subsequent commits.
+  // Observation-facts indexing and Policy decoding happen after releasing it.
+  MetaProposalView CaptureProposal(const MetaCommand& command) const;
   // Capture the data and indices in one critical section. Lookup-index work
   // and every consumer query happen after releasing that lock.
   MetaObservationFactsView CaptureObservationFacts() const;
