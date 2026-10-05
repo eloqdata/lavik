@@ -1853,6 +1853,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   // replace every expired winner with a tombstone without either
   // double-charging the new record or exposing a side-state-less collection
   // to clients.
+  std::vector<RelocationDurabilityFence> detached_deletions;
   for (const RecoveryExpiredTombstone& expired : expired_tombstones) {
     absl::Status deleted;
     if (expired.detached_) {
@@ -1865,6 +1866,42 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
           store, PartitionForKey(store, expired.key_), expired.db_id_,
           expired.key_, expired.digest_, {}, RecordKind::kTombstone,
           ValueType::kNone, 0, nullptr, 0, nullptr, nullptr, nullptr, true);
+      if (deleted.ok()) {
+        auto current = co_await FindVerifiedEntry(
+            store,
+            PartitionForKey(store, expired.key_).indexes_[expired.db_id_],
+            expired.digest_, expired.key_);
+        if (!current.ok()) {
+          Fail(current.status());
+          co_return current.status();
+        }
+        if (*current == nullptr ||
+            (*current)->value_.kind() != RecordKind::kTombstone) {
+          status = absl::InternalError("recovery deletion lost its tombstone");
+          Fail(status);
+          co_return status;
+        }
+        const auto location = MaterializeIndexLocation(**current);
+        const RelocationDurabilityFence fence{
+            .block_id_ = location.block_id(),
+            .allocation_epoch_ = location.allocation_epoch(),
+            .block_owner_ = location.block_owner(),
+            .committed_bytes_ = static_cast<std::uint32_t>(
+                location.record_offset() + location.total_disk_bytes())};
+        // Startup appends share a worker-local stream. Coalesce adjacent
+        // records into one fence per block rather than flushing each key.
+        if (!detached_deletions.empty() &&
+            detached_deletions.back().block_id_ == fence.block_id_ &&
+            detached_deletions.back().allocation_epoch_ ==
+                fence.allocation_epoch_ &&
+            detached_deletions.back().block_owner_ == fence.block_owner_) {
+          detached_deletions.back().committed_bytes_ =
+              std::max(detached_deletions.back().committed_bytes_,
+                       fence.committed_bytes_);
+        } else {
+          detached_deletions.push_back(fence);
+        }
+      }
     } else {
       auto result =
           co_await DeleteLocked(expired.db_id_, expired.key_, expired.digest_);
@@ -1872,7 +1909,12 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     }
     if (!deleted.ok()) {
       if (deleted.code() != absl::StatusCode::kResourceExhausted ||
-          expired.shielding_) {
+          expired.shielding_ ||
+          (expired.detached_ &&
+           !deleted.GetPayload(kDiskSpaceExhaustionTypeUrl).has_value())) {
+        // A detached winner cannot retain a predecessor on append failure.
+        // Only confirmed disk exhaustion permits the full-device exception;
+        // index or memory admission failures must not silently skip repair.
         Fail(deleted);
         co_return deleted;
       }
@@ -1932,6 +1974,18 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       }
     }
   }
+  // Detached roots no longer have recoverable predecessors. Complete their
+  // deletion before readiness, independently of background flush scheduling,
+  // so a subsequent crash and clock rollback cannot lose a successful repair.
+  for (const auto& fence : detached_deletions) {
+    status = co_await AwaitRelocationDurable(fence);
+    if (!status.ok()) {
+      Fail(status);
+      co_return status;
+    }
+  }
+  if (!detached_deletions.empty())
+    LAVIK_MAYBE_CRASH_AT("recovery-expired-tombstones-complete");
   store.recovery_external_keys_.clear();
   store.recovery_external_keys_.rehash(0);
   store.indirect_keys_.ForEach(

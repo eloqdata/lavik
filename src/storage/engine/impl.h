@@ -3816,6 +3816,11 @@ class StorageEngine::Impl {
       WorkerStore::PartitionStore& partition, RecordLocation location,
       ExtentManifest extents);
 
+  // Distinguish exhausted foreground disk capacity from index/memory
+  // admission failures without depending on a human-readable error message.
+  static constexpr absl::string_view kDiskSpaceExhaustionTypeUrl =
+      "type.googleapis.com/lavik.storage.DiskSpaceExhaustion";
+
   Task<absl::StatusOr<ReservedBlock>> AcquireWriteBlock(WorkerStore& store,
                                                         bool for_defrag,
                                                         bool unlock_writer);
