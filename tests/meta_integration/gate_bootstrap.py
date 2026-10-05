@@ -46,30 +46,6 @@ def stop_bootstrap(data):
     assert time.monotonic() - started < 3
 
 
-def create_after_membership_admission(meta, request):
-    """Retry only an uncommitted membership-gate refusal within a 10s budget."""
-    # Election does not imply that startup membership work released its gate.
-    # This exact response precedes proposal submission. Keep the same request
-    # identity, and never retry transport failures or other uncertain outcomes.
-    busy = (
-        "ERR clustercreate 1 preflight pre-commit-failed "
-        "another cluster creation or Meta membership change is in progress"
-    )
-    deadline = time.monotonic() + 10
-    reply = busy
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise H.Failure(f"bootstrap creation exceeded 10s: {reply}")
-        reply = meta.ctl(request, timeout=min(5.0, remaining))
-        if reply != busy:
-            assert reply.startswith("OK clustercreate"), reply
-            if time.monotonic() >= deadline:
-                raise H.Failure(f"bootstrap creation exceeded 10s: {reply}")
-            return reply
-        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
-
-
 def late_meta(root):
     scenario = root / "late"
     scenario.mkdir()
@@ -91,7 +67,7 @@ def late_meta(root):
         no_redis(data)
         # Real committed creation supplies mode while the unrelated primary is
         # still offline. This Data identity remains deliberately unregistered.
-        create_after_membership_admission(
+        C.create_after_membership_admission(
             meta,
             C.create_request(
                 meta, "1" * 40, f"tcp://127.0.0.1:{H.free_port()}", "group"

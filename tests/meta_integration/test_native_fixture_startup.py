@@ -11,7 +11,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-import gate_bootstrap as B
+import gate_cluster_create as C
+import gate_data_control as D
 import gate_failover as F
 import gate_native_replication as N
 
@@ -90,7 +91,7 @@ class BootstrapCreationAdmissionTest(unittest.TestCase):
     def setUp(self):
         self.now = 0.0
         self.clock = SimpleNamespace(monotonic=lambda: self.now, sleep=self.advance)
-        self.patch = patch.object(B, "time", self.clock)
+        self.patch = patch.object(C, "time", self.clock)
         self.patch.start()
         self.addCleanup(self.patch.stop)
 
@@ -101,9 +102,22 @@ class BootstrapCreationAdmissionTest(unittest.TestCase):
         meta = Mock()
         meta.ctl.side_effect = [self.busy, "OK clustercreate 1"]
         self.assertEqual(
-            B.create_after_membership_admission(meta, "fixed request"),
+            C.create_after_membership_admission(meta, "fixed request"),
             "OK clustercreate 1",
         )
+        self.assertEqual(meta.ctl.call_count, 2)
+        for call in meta.ctl.call_args_list:
+            self.assertEqual(call.args, ("fixed request",))
+
+    def test_data_control_retries_without_regenerating_creation_identity(self):
+        meta = Mock()
+        meta.ctl.side_effect = [self.busy, "OK clustercreate 1"]
+        with (
+            patch.object(C, "create_request", return_value="fixed request") as request,
+            patch.object(C.H, "free_port", return_value=12345),
+        ):
+            D.commit_service_mode(meta, [meta])
+        request.assert_called_once()
         self.assertEqual(meta.ctl.call_count, 2)
         for call in meta.ctl.call_args_list:
             self.assertEqual(call.args, ("fixed request",))
@@ -117,22 +131,22 @@ class BootstrapCreationAdmissionTest(unittest.TestCase):
             with self.subTest(reply=reply):
                 meta = Mock()
                 meta.ctl.return_value = reply
-                with self.assertRaises(AssertionError):
-                    B.create_after_membership_admission(meta, "fixed request")
+                with self.assertRaises(C.H.Failure):
+                    C.create_after_membership_admission(meta, "fixed request")
                 meta.ctl.assert_called_once()
 
     def test_transport_failure_is_not_retried(self):
         meta = Mock()
         meta.ctl.side_effect = TimeoutError("unknown outcome")
         with self.assertRaises(TimeoutError):
-            B.create_after_membership_admission(meta, "fixed request")
+            C.create_after_membership_admission(meta, "fixed request")
         meta.ctl.assert_called_once()
 
     def test_persistent_busy_stops_at_deadline(self):
         meta = Mock()
         meta.ctl.return_value = self.busy
-        with self.assertRaisesRegex(B.H.Failure, "bootstrap creation exceeded 10s"):
-            B.create_after_membership_admission(meta, "fixed request")
+        with self.assertRaisesRegex(C.H.Failure, "bootstrap creation exceeded 10s"):
+            C.create_after_membership_admission(meta, "fixed request")
         self.assertEqual(self.now, 10)
 
     def test_call_timeout_uses_remaining_budget(self):
@@ -146,7 +160,7 @@ class BootstrapCreationAdmissionTest(unittest.TestCase):
             return "OK clustercreate 1"
 
         meta.ctl.side_effect = reply
-        B.create_after_membership_admission(meta, "fixed request")
+        C.create_after_membership_admission(meta, "fixed request")
         self.assertEqual(meta.ctl.call_count, 2)
 
     def test_success_after_budget_is_not_accepted_or_retried(self):
@@ -157,8 +171,8 @@ class BootstrapCreationAdmissionTest(unittest.TestCase):
             return "OK clustercreate 1"
 
         meta.ctl.side_effect = reply
-        with self.assertRaisesRegex(B.H.Failure, "bootstrap creation exceeded 10s"):
-            B.create_after_membership_admission(meta, "fixed request")
+        with self.assertRaisesRegex(C.H.Failure, "bootstrap creation exceeded 10s"):
+            C.create_after_membership_admission(meta, "fixed request")
         meta.ctl.assert_called_once()
 
 

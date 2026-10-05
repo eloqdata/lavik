@@ -47,6 +47,31 @@ GROUPS = {
 TRANSIENT_SELF_FENCE = "CLUSTERDOWN Hash slot not served"
 
 
+def create_after_membership_admission(meta, request):
+    """Retry only an uncommitted membership-gate refusal within a 10s budget."""
+    # Election does not imply that startup membership work released its gate.
+    # This exact response precedes proposal submission. Keep the same request
+    # identity, and never retry transport failures or other uncertain outcomes.
+    busy = (
+        "ERR clustercreate 1 preflight pre-commit-failed "
+        "another cluster creation or Meta membership change is in progress"
+    )
+    deadline = time.monotonic() + 10
+    reply = busy
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise H.Failure(f"bootstrap creation exceeded 10s: {reply}")
+        reply = meta.ctl(request, timeout=min(5.0, remaining))
+        if reply != busy:
+            if not reply.startswith("OK clustercreate"):
+                raise H.Failure(f"cluster creation rejected: {reply}")
+            if time.monotonic() >= deadline:
+                raise H.Failure(f"bootstrap creation exceeded 10s: {reply}")
+            return reply
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
+
 def creation_raft_args():
     """Keep the initial authority handoff inside the source retry budget."""
     # The election lower bound D also requires a 2D first-grant quarantine.
