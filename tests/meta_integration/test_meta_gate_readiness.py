@@ -5,11 +5,13 @@
 """Exercise gate orchestration across valid asynchronous leadership windows."""
 
 from types import SimpleNamespace
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
 import gate_leader_change as L
 import gate_sentinel as S
+import gate_sentinel_ha as HA
 
 
 class MetaGateReadinessTest(unittest.TestCase):
@@ -49,6 +51,81 @@ class MetaGateReadinessTest(unittest.TestCase):
             gate.test_redis72_wire_contract()
         self.assertEqual(wire.call_count, 2)
         self.assertEqual(calls, 4)
+
+    def test_slow_reader_waits_for_discovery_authority(self):
+        ready = False
+        calls = 0
+
+        def status(command):
+            nonlocal ready, calls
+            self.assertEqual(command, "clusterstatus 1")
+            calls += 1
+            ready = calls == 2
+            return "OK clusterstatus 1 fixture" if ready else "ERR leader_not_caught_up"
+
+        class ReadyForSubscription(Exception):
+            pass
+
+        def connect(*_args):
+            self.assertTrue(ready, "subscription bound before discovery authority")
+            raise ReadyForSubscription
+
+        node = SimpleNamespace(is_leader=lambda: True, ctl=status)
+        gate = S.SentinelTest("test_slow_reader_keeps_admin_responsive_and_drains")
+        with (
+            patch.object(gate, "node", return_value=(node, 12345)),
+            patch.object(gate, "client", side_effect=connect),
+            self.assertRaises(ReadyForSubscription),
+        ):
+            gate.test_slow_reader_keeps_admin_responsive_and_drains()
+        self.assertEqual(calls, 2)
+
+    def test_recovery_clients_share_a_concurrent_fault_deadline(self):
+        # Four independent clients must start recovery together. Serial probes
+        # spend later clients' recovery budget waiting for earlier libraries.
+        barrier = threading.Barrier(4)
+        now = 0.0
+
+        def set_value(*_args):
+            nonlocal now
+            try:
+                barrier.wait(timeout=2)
+            except threading.BrokenBarrierError:
+                now = 31.0
+                raise
+
+        clients = [
+            (
+                f"client-{index}",
+                SimpleNamespace(
+                    set=Mock(side_effect=set_value), get=Mock(return_value="fixture")
+                ),
+            )
+            for index in range(4)
+        ]
+        with (
+            patch.object(HA.time, "monotonic", side_effect=lambda: now),
+            patch.object(HA.time, "sleep"),
+        ):
+            HA.recover(clients, "fixture", start=0.0)
+        for name, client in clients:
+            client.set.assert_called_once_with("sentinel-ha-" + name, "fixture")
+            client.get.assert_called_once_with("sentinel-ha-" + name)
+
+    def test_recovery_rejects_success_after_the_original_deadline(self):
+        now = 0.0
+
+        def set_value(*_args):
+            nonlocal now
+            now = 31.0
+
+        client = SimpleNamespace(set=set_value, get=lambda *_: "fixture")
+        with (
+            patch.object(HA.time, "monotonic", side_effect=lambda: now),
+            patch.object(HA.time, "sleep"),
+            self.assertRaisesRegex(HA.H.Failure, "30s budget exceeded"),
+        ):
+            HA.recover([("late", client)], "fixture", start=0.0)
 
     def run_link_fault(self, replies):
         nodes = [

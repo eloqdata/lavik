@@ -501,7 +501,7 @@ class SentinelTest(unittest.TestCase):
 
     def test_slow_reader_keeps_admin_responsive_and_drains(self):
         node, port = self.node(password="", maxclients=1, bootstrap=True)
-        H.wait_until("Meta leader", 5, node.is_leader)
+        self.wait_discovery_ready(node)
         time.sleep(0.05)
         slow = self.client(port)
         slow.command("HELLO", 3)
