@@ -265,6 +265,9 @@ class MetaTopologyStore {
   std::optional<std::string> FindGroupOfNode(const std::string& node_id) const;
   // Owning group of a slot; nullopt when unassigned or slot out of range.
   std::optional<std::string> SlotOwner(std::uint32_t slot) const;
+  // Owned absolute slot map in ordered, maximal assigned runs. Gaps remain
+  // unassigned; extraction never allocates one string for every covered slot.
+  std::vector<MetaSlotAssignment> SlotRanges() const;
   bool GroupExists(const std::string& group_id) const;
   std::vector<MetaTopologyGroupView> Groups() const;
   // Copies just observation freshness facts directly from GroupState. Groups

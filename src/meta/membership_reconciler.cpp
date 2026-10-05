@@ -163,7 +163,7 @@ absl::StatusOr<std::vector<MetaMembershipPeer>> CaptureMembershipConfig(
 }
 
 absl::StatusOr<std::optional<BindMetaMember>> PlanInitialMetaBindings(
-    const MetaCommittedView& view,
+    std::span<const MetaMemberRecord> bindings,
     const std::vector<MetaMembershipPeer>& config, bool initial_config) {
   for (const auto& peer : config) {
     if (initial_config && (peer.dc_id_ != 0 || peer.priority_ != 1 ||
@@ -173,7 +173,7 @@ absl::StatusOr<std::optional<BindMetaMember>> PlanInitialMetaBindings(
     const MetaMemberRecord expected{
         peer.id_,           peer.principal_, peer.data_control_endpoint_,
         peer.ctl_endpoint_, false,           peer.sentinel_endpoint_};
-    const auto actual = view.identity().FindMetaMember(peer.id_);
+    const auto actual = FindMetaBinding(bindings, peer.id_);
     if (actual.has_value()) {
       if (*actual != expected) {
         return Conflict(
@@ -193,7 +193,7 @@ absl::StatusOr<std::optional<BindMetaMember>> PlanInitialMetaBindings(
     return std::optional(std::move(bind));
   }
   if (initial_config) {
-    for (const auto& binding : view.identity().MetaMembers()) {
+    for (const auto& binding : bindings) {
       const auto peer = std::find_if(
           config.begin(), config.end(), [&](const auto& candidate) {
             return candidate.id_ == binding.server_id_;
@@ -290,10 +290,10 @@ absl::StatusOr<MetaMembershipIntent> DecodeMembershipIntent(
   return MetaMembershipIntent{*add, *target, *binding, *before, *bindings};
 }
 
-Plan PlanMembershipStep(const MetaCommittedView& view,
-                        const MetaOperationRecord& op,
+Plan PlanMembershipStep(const MetaMembershipView& view,
                         const std::vector<MetaMembershipPeer>& config,
                         std::uint32_t local_id) {
+  const auto& op = view.operation_;
   if (op.kind_ != kMetaMembershipOperationKind || Terminal(op))
     return std::nullopt;
   auto intent = DecodeMembershipIntent(op.intent_);
@@ -322,14 +322,14 @@ Plan PlanMembershipStep(const MetaCommittedView& view,
   if (!done && !catching_up && config != p.before_)
     return Conflict("membership configuration diverged from intent");
   for (const auto& expected : p.bindings_) {
-    auto current = view.identity().FindMetaMember(expected.server_id_);
+    auto current = FindMetaBinding(view.bindings_, expected.server_id_);
     if (!p.add_ && expected.server_id_ == p.target_.id_ && done && current &&
         current->retired_)
       current->retired_ = false;
     if (current != std::optional(expected))
       return Conflict("membership identity baseline changed");
   }
-  auto binding = view.identity().FindMetaMember(p.target_.id_);
+  auto binding = FindMetaBinding(view.bindings_, p.target_.id_);
   auto expected = p.binding_;
   if (!p.add_ && done && binding && binding->retired_) expected.retired_ = true;
   if ((binding && *binding != expected) || (!p.add_ && !binding))
@@ -451,11 +451,12 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
   auto retry_at = std::chrono::steady_clock::now();
   auto changed = std::make_shared<std::atomic<bool>>(false);
   auto subscribe = [&] {
-    return context->SubscribeCommitted([changed](const MetaCommitEvent&) {
+    return context->SubscribeCommittedCursor([changed](const MetaCommitEvent&) {
       changed->store(true, std::memory_order_release);
     });
   };
   auto subscribed = subscribe();
+  std::optional<MetaMembershipDiscovery> discovered;
   std::string last_cut;
   std::optional<MetaOperationId> last_operation;
   while (!core->cancelled_ && context->IsCurrent()) {
@@ -467,24 +468,41 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
       if (!slept.ok()) break;
       continue;
     }
-    if (subscribed.subscription_->needs_resync()) subscribed = subscribe();
-    if (changed->exchange(false, std::memory_order_acq_rel))
-      subscribed.view_ = context->CommittedView();
-    const auto& view = subscribed.view_;
-    auto operations =
-        view.operation().HasActiveKind(kMetaMembershipOperationKind)
-            ? view.operation().LiveOperations()
-            : std::vector<MetaOperationRecord>{};
-    auto op = std::find_if(
-        operations.begin(), operations.end(), [](const auto& item) {
-          return item.kind_ == kMetaMembershipOperationKind && !Terminal(item);
-        });
+    if (subscribed.subscription_->needs_resync()) {
+      subscribed = subscribe();
+      discovered.reset();
+    }
+    const bool notified = changed->exchange(false, std::memory_order_acq_rel);
+    if (!discovered || notified ||
+        context->AppliedIndex() != discovered->cursor_.applied_index())
+      discovered = context->MembershipDiscovery();
+    const MetaOperationRecord* op =
+        discovered->operation_ ? &*discovered->operation_ : nullptr;
+    std::optional<MetaMembershipView> planning;
+    if (op) {
+      const auto intent = DecodeMembershipIntent(op->intent_);
+      std::vector<std::uint32_t> ids;
+      if (intent.ok()) {
+        ids.reserve(intent->bindings_.size() + 1);
+        for (const auto& binding : intent->bindings_)
+          ids.push_back(binding.server_id_);
+        ids.push_back(intent->target_.id_);
+      }
+      // Even a malformed intent must be reported against the current operation;
+      // a capture race is a retry, not a durable recovery-required outcome.
+      planning = context->MembershipView(*op, ids);
+      if (!planning) {
+        discovered.reset();
+        continue;
+      }
+      op = &planning->operation_;
+    }
     const auto loaded_config = core->server_->get_config();
     auto configured = CaptureMembershipConfig(loaded_config);
-    if (op == operations.end()) {
+    if (op == nullptr) {
       auto initial_binding =
           configured.ok() ? PlanInitialMetaBindings(
-                                view, *configured,
+                                discovered->initial_bindings_, *configured,
                                 core->server_->initial_bindings_pending())
                           : absl::StatusOr<std::optional<BindMetaMember>>(
                                 configured.status());
@@ -500,7 +518,7 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
           bool paused = false;
           std::size_t active_binding_count = 0;
           LAVIK_FAULT_INJECT(
-              const auto bindings = view.identity().MetaMembers();
+              const auto& bindings = discovered->initial_bindings_;
               active_binding_count = static_cast<std::size_t>(std::count_if(
                   bindings.begin(), bindings.end(),
                   [](const auto& binding) { return !binding.retired_; }));
@@ -539,7 +557,7 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
         continue;
       }
     }
-    if (op == operations.end()) {
+    if (op == nullptr) {
       lease.reset();
       attempt.reset();
       last_operation.reset();
@@ -574,7 +592,7 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
         if (!paused && core->server_->is_leader() &&
             core->server_->is_leader_alive() &&
             core->server_->is_leader_sm_fully_caught_up()) {
-          auto plan = config.ok() ? PlanMembershipStep(view, *op, *config,
+          auto plan = config.ok() ? PlanMembershipStep(*planning, *config,
                                                        core->server_->get_id())
                                   : Plan(config.status());
           if (!plan.ok()) {

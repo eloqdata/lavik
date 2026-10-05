@@ -134,7 +134,7 @@ std::string StripValidatedTcpEndpointScheme(std::string_view endpoint) {
                          : endpoint);
 }
 
-absl::Status ValidateMetaSet(const MetaCommittedView& view,
+absl::Status ValidateMetaSet(std::span<const MetaMemberRecord> bindings,
                              const ClusterCreateManifestV1& manifest,
                              const MetaClusterCreateRaftView& raft) {
   if (raft.local_server_id_ == 0 ||
@@ -142,7 +142,6 @@ absl::Status ValidateMetaSet(const MetaCommittedView& view,
     return absl::FailedPreconditionError(
         "creation Meta config differs from intent");
   }
-  const auto bindings = view.identity().MetaMembers();
   if (bindings.size() != manifest.meta_members_.size()) {
     return absl::FailedPreconditionError(
         "creation Meta identity directory differs from intent");
@@ -168,7 +167,7 @@ absl::Status ValidateMetaSet(const MetaCommittedView& view,
       return absl::FailedPreconditionError(
           "creation Meta config descriptor differs from intent");
     }
-    const auto binding = view.identity().FindMetaMember(expected.server_id_);
+    const auto binding = FindMetaBinding(bindings, expected.server_id_);
     if (!binding.has_value() || binding->retired_ ||
         binding->principal_ != peer.principal_ ||
         binding->data_control_endpoint_ != peer.data_control_endpoint_ ||
@@ -316,7 +315,7 @@ PutPopulationManifest V1PopulationManifest(
   return population;
 }
 
-bool V1SlotMapMatches(const MetaStores& stores,
+bool V1SlotMapMatches(const MetaClusterCreateView& view,
                       const ClusterCreateManifestV1& manifest, bool* empty) {
   *empty = true;
   bool matches = true;
@@ -325,9 +324,9 @@ bool V1SlotMapMatches(const MetaStores& stores,
     while (range_index + 1 < manifest.slot_ranges_.size() &&
            slot > manifest.slot_ranges_[range_index].last_)
       ++range_index;
-    const auto owner = stores.topology_.SlotOwner(slot);
+    const auto owner = view.SlotOwner(slot);
     *empty &= !owner.has_value();
-    matches &= owner == std::optional<std::string>(
+    matches &= owner == std::optional<std::string_view>(
                             manifest.slot_ranges_[range_index].group_id_);
   }
   return matches;
@@ -342,10 +341,10 @@ std::vector<std::string> V1DataEndpoints(
   return endpoints;
 }
 
-absl::Status ValidateV1Nodes(const MetaStores& stores,
+absl::Status ValidateV1Nodes(const MetaClusterCreateView& view,
                              const ClusterCreateManifestV1& manifest,
                              bool require_all) {
-  for (const MetaNodeRecord& node : stores.identity_.Nodes()) {
+  for (const MetaNodeRecord& node : view.nodes_) {
     const auto* declaration = FindData(manifest, node.node_id_);
     if (declaration == nullptr || node.retired_ ||
         node.principal_ != absl::StrCat("lavik://node/", node.node_id_) ||
@@ -355,9 +354,8 @@ absl::Status ValidateV1Nodes(const MetaStores& stores,
           "creation node differs from intent: node=", node.node_id_));
     }
   }
-  if (stores.identity_.NodeCount() > manifest.data_nodes_.size() ||
-      (require_all &&
-       stores.identity_.NodeCount() != manifest.data_nodes_.size())) {
+  if (view.nodes_.size() > manifest.data_nodes_.size() ||
+      (require_all && view.nodes_.size() != manifest.data_nodes_.size())) {
     return absl::FailedPreconditionError(
         "creation Data membership differs from intent");
   }
@@ -390,11 +388,11 @@ absl::Status ValidateV1GroupMembers(
   return absl::OkStatus();
 }
 
-absl::Status ValidateV1GroupsKnown(const MetaStores& stores,
+absl::Status ValidateV1GroupsKnown(const MetaClusterCreateView& view,
                                    const ClusterCreateManifestV1& manifest,
                                    const MetaOperationId& root,
                                    bool require_all_members) {
-  for (const MetaTopologyGroupView& group : stores.topology_.Groups()) {
+  for (const MetaTopologyGroupView& group : view.groups_) {
     const auto* declaration = FindDeclaration(manifest, group.group_id_);
     if (declaration == nullptr)
       return absl::FailedPreconditionError(absl::StrCat(
@@ -404,48 +402,46 @@ absl::Status ValidateV1GroupsKnown(const MetaStores& stores,
         !status.ok())
       return status;
   }
-  if (stores.topology_.GroupCount() > manifest.groups_.size() ||
-      (require_all_members &&
-       stores.topology_.GroupCount() != manifest.groups_.size())) {
+  if (view.groups_.size() > manifest.groups_.size() ||
+      (require_all_members && view.groups_.size() != manifest.groups_.size())) {
     return absl::FailedPreconditionError(
         "creation Group set differs from intent");
   }
   return absl::OkStatus();
 }
 
-absl::Status ValidateV1FinalTopology(const MetaStores& stores,
+absl::Status ValidateV1FinalTopology(const MetaClusterCreateView& view,
                                      const ClusterCreateManifestV1& manifest,
                                      const MetaOperationId& root,
                                      bool allow_failed_group) {
-  if (auto status = ValidateV1Nodes(stores, manifest, true); !status.ok())
+  if (auto status = ValidateV1Nodes(view, manifest, true); !status.ok())
     return status;
-  if (auto status = ValidateV1GroupsKnown(stores, manifest, root, true);
+  if (auto status = ValidateV1GroupsKnown(view, manifest, root, true);
       !status.ok())
     return status;
   bool slots_empty = false;
-  if (!V1SlotMapMatches(stores, manifest, &slots_empty) || slots_empty)
+  if (!V1SlotMapMatches(view, manifest, &slots_empty) || slots_empty)
     return absl::FailedPreconditionError(
         "creation Slot map differs from intent");
-  if (!stores.policy_.CurrentAutomaticUncontrolledFailover().has_value() ||
-      !stores.policy_.CurrentAuthorityLease().has_value() ||
-      !stores.policy_.CurrentCandidateRecovery().has_value()) {
+  if (!view.automatic_failover_policy_ || !view.authority_lease_policy_ ||
+      !view.candidate_recovery_policy_) {
     return absl::FailedPreconditionError(
         "creation requires all registered global policies");
   }
   for (const auto& declaration : manifest.groups_) {
-    const auto group = stores.topology_.FindGroup(declaration.group_id_);
-    const auto grant = stores.topology_.AuthorityFor(declaration.group_id_);
+    const auto group = view.FindGroup(declaration.group_id_);
+    const auto grant = view.AuthorityFor(declaration.group_id_);
     const auto population =
         V1PopulationManifest(manifest, declaration.group_id_);
-    if (!group.has_value() ||
+    if (group == nullptr ||
         (group->record_.group_term_ != 1 &&
          !(allow_failed_group && group->record_.group_term_ == 2)) ||
         group->record_.population_manifest_revision_ != 1 ||
         group->record_.population_manifest_digest_ !=
             population.manifest_digest_ ||
         group->record_.partition_replication_epoch_ != 1 ||
-        !stores.population_manifest_.Contains(population.manifest_digest_) ||
-        !grant.has_value()) {
+        !view.ContainsManifest(population.manifest_digest_) ||
+        grant == nullptr) {
       return absl::FailedPreconditionError(
           absl::StrCat("creation Group anchors differ from intent: group=",
                        declaration.group_id_));
@@ -491,17 +487,16 @@ absl::StatusOr<MetaBootIncarnation> ParseBoot(std::string_view value) {
   return result;
 }
 
-Plan PlanV1GroupStep(const MetaCommittedView& view,
+Plan PlanV1GroupStep(const MetaClusterCreateView& view,
                      const MetaOperationRecord& root,
                      const MetaOperationRecord& operation,
                      const ClusterCreateManifestV1& manifest,
                      const ClusterCreateManifestV1::Group& declaration,
                      const MetaDataControlRuntimeSnapshot& runtime) {
-  const auto& stores = view.stores();
-  const auto group = stores.topology_.FindGroup(declaration.group_id_);
-  const auto grant = stores.topology_.AuthorityFor(declaration.group_id_);
+  const auto group = view.FindGroup(declaration.group_id_);
+  const auto grant = view.AuthorityFor(declaration.group_id_);
   const auto population = V1PopulationManifest(manifest, declaration.group_id_);
-  if (!group.has_value() || !grant.has_value())
+  if (group == nullptr || grant == nullptr)
     return Conflict(absl::StrCat("group=", declaration.group_id_,
                                  " committed anchors disappeared"));
   const auto primary_member = std::find_if(
@@ -961,7 +956,7 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
                                " has an unknown creation phase"));
 }
 
-Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
+Plan PlanV1ClusterCreateStep(const MetaClusterCreateView& view,
                              const MetaOperationRecord& operation,
                              const MetaDataControlRuntimeSnapshot& runtime,
                              const MetaClusterCreateRaftView& raft) {
@@ -972,14 +967,14 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
   auto manifest = DecodeClusterCreateRequest(operation.intent_, &intent_root);
   if (!manifest.ok())
     return Conflict("creation intent is not a recoverable v1 plan");
-  const auto& stores = view.stores();
-  if (auto status = detail::ValidateClusterCreateMetaSet(view, *manifest, raft);
+  if (auto status = detail::ValidateClusterCreateMetaSet(view.meta_members_,
+                                                         *manifest, raft);
       !status.ok()) {
     return Conflict(status.message());
   }
-  if (auto status = ValidateV1Nodes(stores, *manifest, false); !status.ok())
+  if (auto status = ValidateV1Nodes(view, *manifest, false); !status.ok())
     return Conflict(status.message());
-  if (auto status = ValidateV1GroupsKnown(stores, *manifest,
+  if (auto status = ValidateV1GroupsKnown(view, *manifest,
                                           operation.operation_id_, false);
       !status.ok())
     return Conflict(status.message());
@@ -996,26 +991,25 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
     // creating a Group. From that point onward every intermediate committed
     // state must be projectable as a complete FDS, including BeginGroupTerm's
     // fenced, pre-authority state.
-    if (stores.identity_.NodeCount() != 0 ||
-        stores.topology_.GroupCount() != 0) {
+    if (view.nodes_.size() != 0 || view.groups_.size() != 0) {
       return Conflict(
           "creation reached Policy bootstrap after Data topology appeared");
     }
-    if (!stores.policy_.CurrentAutomaticUncontrolledFailover().has_value()) {
+    if (!view.automatic_failover_policy_) {
       PutPolicy command;
       command.policy_id_ = kAutomaticUncontrolledFailoverPolicyId;
       command.version_ = 1;
       command.content_ = AutomaticFailoverPolicyContent(*manifest);
       return Emit(std::move(command));
     }
-    if (!stores.policy_.CurrentAuthorityLease().has_value()) {
+    if (!view.authority_lease_policy_) {
       PutPolicy command;
       command.policy_id_ = kAuthorityLeasePolicyId;
       command.version_ = 1;
       command.content_ = AuthorityLeasePolicyContent(*manifest);
       return Emit(std::move(command));
     }
-    if (!stores.policy_.CurrentCandidateRecovery().has_value()) {
+    if (!view.candidate_recovery_policy_) {
       PutPolicy command;
       command.policy_id_ = kCandidateRecoveryPolicyId;
       command.version_ = 1;
@@ -1027,10 +1021,10 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
     return Advance(operation, kRootPhaseRegisterData);
   }
   if (phase == kRootPhaseRegisterData) {
-    if (stores.topology_.GroupCount() != 0)
+    if (view.groups_.size() != 0)
       return Conflict("creation Group appeared before registration completed");
     for (const auto& node : manifest->data_nodes_) {
-      if (!stores.identity_.FindNode(node.node_id_).has_value()) {
+      if (view.FindNode(node.node_id_) == nullptr) {
         RegisterNode command;
         command.node_id_ = node.node_id_;
         command.principal_ = absl::StrCat("lavik://node/", node.node_id_);
@@ -1042,15 +1036,15 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
     return Advance(operation, kRootPhaseCreateGroups);
   }
 
-  if (auto status = ValidateV1Nodes(stores, *manifest, true); !status.ok())
+  if (auto status = ValidateV1Nodes(view, *manifest, true); !status.ok())
     return Conflict(status.message());
   if (phase == kRootPhaseCreateGroups) {
     for (const auto& declaration : manifest->groups_) {
-      auto group = stores.topology_.FindGroup(declaration.group_id_);
-      if (!group.has_value()) {
+      auto group = view.FindGroup(declaration.group_id_);
+      if (group == nullptr) {
         CreateGroup command;
         command.group_id_ = declaration.group_id_;
-        command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
+        command.new_topology_epoch_ = view.topology_epoch_ + 1;
         return Emit(std::move(command));
       }
       if (group->record_.group_term_ > 1 ||
@@ -1076,7 +1070,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
               operation.operation_id_, declaration.group_id_, node_id);
           command.role_ = role;
           command.expected_revision_ = group->revision_;
-          command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
+          command.new_topology_epoch_ = view.topology_epoch_ + 1;
           return Emit(std::move(command));
         }
       }
@@ -1090,16 +1084,16 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
     return Advance(operation, kRootPhaseSlotMap);
   }
 
-  if (auto status = ValidateV1GroupsKnown(stores, *manifest,
-                                          operation.operation_id_, true);
+  if (auto status =
+          ValidateV1GroupsKnown(view, *manifest, operation.operation_id_, true);
       !status.ok())
     return Conflict(status.message());
   if (phase == kRootPhaseSlotMap) {
     bool slots_empty = false;
-    const bool slots_match = V1SlotMapMatches(stores, *manifest, &slots_empty);
+    const bool slots_match = V1SlotMapMatches(view, *manifest, &slots_empty);
     for (const auto& declaration : manifest->groups_) {
-      const auto group = stores.topology_.FindGroup(declaration.group_id_);
-      if (!group.has_value() || group->record_.group_term_ != 1 ||
+      const auto group = view.FindGroup(declaration.group_id_);
+      if (group == nullptr || group->record_.group_term_ != 1 ||
           !group->record_.owner_.empty())
         return Conflict(absl::StrCat("creation Group is not ready for Slots: ",
                                      declaration.group_id_));
@@ -1108,7 +1102,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
       SetSlotMap command;
       for (const auto& range : manifest->slot_ranges_)
         command.ranges_.push_back({range.first_, range.last_, range.group_id_});
-      command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
+      command.new_topology_epoch_ = view.topology_epoch_ + 1;
       return Emit(std::move(command));
     }
     if (!slots_match) return Conflict("creation Slot map differs from intent");
@@ -1116,17 +1110,17 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
   }
 
   bool slots_empty = false;
-  if (!V1SlotMapMatches(stores, *manifest, &slots_empty) || slots_empty)
+  if (!V1SlotMapMatches(view, *manifest, &slots_empty) || slots_empty)
     return Conflict("creation Slot map differs from intent");
   if (phase == kRootPhasePopulation) {
     for (const auto& declaration : manifest->groups_) {
       const auto population =
           V1PopulationManifest(*manifest, declaration.group_id_);
-      if (!stores.population_manifest_.Contains(population.manifest_digest_))
+      if (!view.ContainsManifest(population.manifest_digest_))
         return Emit(population);
-      const auto group = stores.topology_.FindGroup(declaration.group_id_);
-      const auto grant = stores.topology_.AuthorityFor(declaration.group_id_);
-      if (!group.has_value() || !grant.has_value())
+      const auto group = view.FindGroup(declaration.group_id_);
+      const auto grant = view.AuthorityFor(declaration.group_id_);
+      if (group == nullptr || grant == nullptr)
         return Conflict(absl::StrCat("creation Group disappeared: group=",
                                      declaration.group_id_));
       const bool population_empty =
@@ -1143,7 +1137,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
         command.new_population_manifest_revision_ = 1;
         command.new_population_manifest_digest_ = population.manifest_digest_;
         command.new_partition_replication_epoch_ = 1;
-        command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
+        command.new_topology_epoch_ = view.topology_epoch_ + 1;
         return Emit(std::move(command));
       }
       if (!population_matches)
@@ -1162,7 +1156,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
         command.group_id_ = declaration.group_id_;
         command.expected_term_ = 1;
         command.new_owner_ = declaration.primary_node_id_;
-        command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
+        command.new_topology_epoch_ = view.topology_epoch_ + 1;
         return Emit(std::move(command));
       }
     }
@@ -1173,15 +1167,15 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
       phase != kRootPhaseInitializeGroups)
     return Conflict("unknown v1 creation phase");
   if (auto status =
-          ValidateV1FinalTopology(stores, *manifest, operation.operation_id_,
+          ValidateV1FinalTopology(view, *manifest, operation.operation_id_,
                                   phase == kRootPhaseInitializeGroups);
       !status.ok())
     return Conflict(status.message());
   if (phase == kRootPhaseWaitDataProjection) {
     if (!runtime.leader_authority_eligible_) return std::nullopt;
     for (const auto& declaration : manifest->groups_) {
-      const auto group = stores.topology_.FindGroup(declaration.group_id_);
-      const auto grant = stores.topology_.AuthorityFor(declaration.group_id_);
+      const auto group = view.FindGroup(declaration.group_id_);
+      const auto grant = view.AuthorityFor(declaration.group_id_);
       for (const auto& [node_id, role] : DeclaredMembers(declaration)) {
         (void)role;
         const auto node = std::find_if(
@@ -1199,7 +1193,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
   // same admission bound survives uncertain proposals and leader recovery.
   // A waiting child consumes a slot, but does not block other admitted work.
   constexpr std::size_t kMaxActiveGroups = 4;
-  std::vector<std::optional<MetaOperationRecord>> children;
+  std::vector<const MetaOperationRecord*> children;
   children.reserve(manifest->groups_.size());
   std::size_t active = 0;
   std::size_t completed = 0;
@@ -1207,8 +1201,9 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
   for (const auto& declaration : manifest->groups_) {
     const auto child_id = detail::ClusterCreateV1GroupOperationId(
         operation.operation_id_, declaration.group_id_);
-    auto child = stores.operation_.FindOperation(child_id);
-    if (!child && stores.operation_.OperationKnown(child_id))
+    const auto& captured = view.children_.at(child_id);
+    const auto& child = captured.operation_;
+    if (!child && captured.known_)
       return Conflict(
           absl::StrCat("creation Group operation was archived: group=",
                        declaration.group_id_));
@@ -1221,7 +1216,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
         ++active;
       }
     }
-    children.push_back(std::move(child));
+    children.push_back(child ? &*child : nullptr);
   }
 
   std::optional<MetaCommand> runnable;
@@ -1260,8 +1255,8 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
   for (std::size_t index = 0; index < children.size(); ++index) {
     if (children[index]) continue;
     const auto& declaration = manifest->groups_[index];
-    const auto group = stores.topology_.FindGroup(declaration.group_id_);
-    const auto grant = stores.topology_.AuthorityFor(declaration.group_id_);
+    const auto group = view.FindGroup(declaration.group_id_);
+    const auto grant = view.AuthorityFor(declaration.group_id_);
     const auto primary = std::find_if(
         runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& node) {
           return node.node_id_ == declaration.primary_node_id_;
@@ -1297,16 +1292,37 @@ MetaOperationId detail::ClusterCreateV1GroupOperationId(
                      absl::StrCat("group/", absl::BytesToHexString(group_id)));
 }
 
+absl::StatusOr<detail::ClusterCreateReadKeys>
+detail::CaptureClusterCreateReadKeys(const MetaOperationRecord& root) {
+  MetaOperationId intent_root{};
+  const auto manifest = DecodeClusterCreateRequest(root.intent_, &intent_root);
+  if (!manifest.ok())
+    return absl::FailedPreconditionError(
+        "creation intent is not a recoverable v1 plan");
+  ClusterCreateReadKeys keys;
+  keys.children_.reserve(manifest->groups_.size());
+  keys.manifests_.reserve(manifest->groups_.size());
+  for (const auto& group : manifest->groups_) {
+    keys.children_.push_back(
+        ClusterCreateV1GroupOperationId(root.operation_id_, group.group_id_));
+    keys.manifests_.push_back(
+        V1PopulationManifest(*manifest, group.group_id_).manifest_digest_);
+  }
+  return keys;
+}
+
 absl::Status detail::ValidateClusterCreateMetaSet(
-    const MetaCommittedView& view, const ClusterCreateManifestV1& manifest,
+    std::span<const MetaMemberRecord> bindings,
+    const ClusterCreateManifestV1& manifest,
     const MetaClusterCreateRaftView& raft) {
-  return ValidateMetaSet(view, manifest, raft);
+  return ValidateMetaSet(bindings, manifest, raft);
 }
 
 Plan detail::PlanClusterCreateStep(
-    const MetaCommittedView& view, const MetaOperationRecord& operation,
+    const MetaClusterCreateView& view,
     const MetaDataControlRuntimeSnapshot& runtime,
     const MetaClusterCreateRaftView& raft) {
+  const auto& operation = view.root_;
   if (operation.kind_ == kMetaClusterCreateOperationKind)
     return PlanV1ClusterCreateStep(view, operation, runtime, raft);
   return std::nullopt;
@@ -1385,28 +1401,26 @@ bycorf::Task<absl::Status> MetaClusterCreateReconciler::Run(
   std::string last_cut;
   auto changed = std::make_shared<std::atomic<bool>>(false);
   auto subscribe = [&] {
-    return context->SubscribeCommitted([changed](const MetaCommitEvent&) {
+    return context->SubscribeCommittedCursor([changed](const MetaCommitEvent&) {
       changed->store(true, std::memory_order_release);
     });
   };
   auto subscribed = subscribe();
+  std::optional<MetaClusterCreateDiscovery> discovered;
   while (!core->cancelled_ && context->IsCurrent()) {
-    // CommittedView includes snapshot restoration and WAL replay. There is
-    // deliberately no saved process-local task list to reconstruct on boot.
-    // Idle polling only reads a notification bit, not the entire metadata
-    // aggregate. Overflow resubscribes from an atomic view instead of losing
-    // a committed task. Active Data waits still observe volatile runtime.
-    if (subscribed.subscription_->needs_resync()) subscribed = subscribe();
-    if (changed->exchange(false, std::memory_order_acq_rel))
-      subscribed.view_ = context->CommittedView();
-    const auto& view = subscribed.view_;
-    const auto& lifecycle = view.topology().ClusterLifecycle();
-    const bool has_creation =
-        lifecycle.state_ == MetaClusterLifecycle::kCreating;
-    const auto operation =
-        has_creation
-            ? view.operation().FindOperation(lifecycle.root_operation_id_)
-            : std::optional<MetaOperationRecord>{};
+    // Idle polling has no store payload. Advance/Install may have no command
+    // event; a changed applied cursor also requires rediscovery. Active
+    // planning captures its entire input anew, including all unfinished
+    // siblings.
+    if (subscribed.subscription_->needs_resync()) {
+      subscribed = subscribe();
+      discovered.reset();
+    }
+    const bool notified = changed->exchange(false, std::memory_order_acq_rel);
+    if (!discovered || notified ||
+        context->AppliedIndex() != discovered->cursor_.applied_index())
+      discovered = context->ClusterCreateDiscovery();
+    const auto& operation = discovered->root_;
     // The runtime always reports actual peer application. Only this planner
     // imposes the all-genesis-member barrier; writes retain majority semantics.
     if (!operation.has_value())
@@ -1415,31 +1429,34 @@ bycorf::Task<absl::Status> MetaClusterCreateReconciler::Run(
       if (lease == nullptr) lease = core->membership_gate_->TryAcquire();
       if (lease != nullptr &&
           !operation->kind_phase_blob_.starts_with("recovery-required:")) {
+        auto keys = detail::CaptureClusterCreateReadKeys(*operation);
+        std::optional<MetaClusterCreateView> planning;
+        if (keys.ok()) {
+          planning = context->ClusterCreateView(*discovered, keys->children_,
+                                                keys->manifests_);
+          if (!planning) {
+            discovered.reset();
+            continue;
+          }
+        }
         std::string cut = operation->kind_phase_blob_.empty()
                               ? "submitted"
                               : operation->kind_phase_blob_;
-        if (cut == kRootPhaseInitializeGroups) {
-          MetaOperationId intent_root{};
-          const auto manifest =
-              DecodeClusterCreateRequest(operation->intent_, &intent_root);
-          if (manifest.ok()) {
-            for (const auto& declaration : manifest->groups_) {
-              const auto child = view.operation().FindOperation(
-                  detail::ClusterCreateV1GroupOperationId(
-                      operation->operation_id_, declaration.group_id_));
-              if (!child.has_value()) break;
-              if (child->lifecycle_ == MetaOperationLifecycle::kCompleted) {
-                cut = "child-completed";
-                continue;
-              }
-              if (child->kind_phase_blob_ == kGroupPhaseReady)
-                cut = "directive-removed";
-              else if (!child->terminal_receipts_.empty())
-                cut = "result-committed";
-              else if (!child->current_directives_.empty())
-                cut = "initialization-issued";
-              break;
+        if (cut == kRootPhaseInitializeGroups && planning) {
+          for (const auto& child_id : keys->children_) {
+            const auto& child = planning->children_.at(child_id).operation_;
+            if (!child) break;
+            if (child->lifecycle_ == MetaOperationLifecycle::kCompleted) {
+              cut = "child-completed";
+              continue;
             }
+            if (child->kind_phase_blob_ == kGroupPhaseReady)
+              cut = "directive-removed";
+            else if (!child->terminal_receipts_.empty())
+              cut = "result-committed";
+            else if (!child->current_directives_.empty())
+              cut = "initialization-issued";
+            break;
           }
         }
         if (cut != last_cut) {
@@ -1464,8 +1481,11 @@ bycorf::Task<absl::Status> MetaClusterCreateReconciler::Run(
                 {static_cast<std::uint32_t>(peer.id_),
                  peer.last_sm_committed_idx_, peer.last_succ_resp_us_});
           }
-          auto planned = detail::PlanClusterCreateStep(
-              view, *operation, core->runtime_status_->Snapshot(), raft_view);
+          auto planned =
+              keys.ok()
+                  ? detail::PlanClusterCreateStep(
+                        *planning, core->runtime_status_->Snapshot(), raft_view)
+                  : Plan(keys.status());
           if (!planned.ok()) {
             spdlog::warn("cluster-create {} requires recovery: {}",
                          Hex(operation->operation_id_),

@@ -62,7 +62,7 @@ absl::StatusOr<std::vector<MetaMembershipPeer>> CaptureMembershipConfig(
 // bindings are legal only while the state manager's durable genesis marker is
 // active; one deterministic BindMetaMember effect is returned at a time.
 absl::StatusOr<std::optional<BindMetaMember>> PlanInitialMetaBindings(
-    const MetaCommittedView& view,
+    std::span<const MetaMemberRecord> bindings,
     const std::vector<MetaMembershipPeer>& config, bool initial_config);
 // Bounded, versioned operation-intent codec; no changes to the generic journal
 // format. The complete precondition and target survive snapshot/WAL recovery.
@@ -74,8 +74,8 @@ using MetaMembershipStep = std::variant<MetaCommand, MetaMembershipRaftAction>;
 // Pure recovery planner. A missing step waits; an incompatible committed
 // prefix requires operator recovery, never automatic rollback or replacement.
 absl::StatusOr<std::optional<MetaMembershipStep>> PlanMembershipStep(
-    const MetaCommittedView&, const MetaOperationRecord&,
-    const std::vector<MetaMembershipPeer>& config, std::uint32_t local_id);
+    const MetaMembershipView&, const std::vector<MetaMembershipPeer>& config,
+    std::uint32_t local_id);
 
 // Leader-owned membership workflow. Local Raft API entry runs on the
 // proposal executor. Demotion joins that entry, not remote invite/leave
