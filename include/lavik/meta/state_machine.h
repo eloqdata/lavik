@@ -72,7 +72,7 @@ class MetaStateMachine {
   MetaCommittedStoresSnapshot CaptureStores() const;
   // Captures admission data and its indices under one state lock. The result
   // owns its lifetime independently of this machine and subsequent commits.
-  // Observation-facts indices are built after releasing the state lock.
+  // Observation-facts indexing and Policy decoding happen after releasing it.
   MetaProposalView CaptureProposal(const MetaCommand& command) const;
   // Capture the data and indices in one critical section. Lookup-index work
   // and every consumer query happen after releasing that lock.

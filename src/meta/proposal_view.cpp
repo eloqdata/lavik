@@ -26,7 +26,8 @@ void RequireCaptured(bool captured) {
 MetaProposalView::CaptureData MetaProposalView::Extract(
     const MetaCommand& command, const MetaStores& stores,
     MetaCommittedCursor cursor) {
-  CaptureData data;
+  CaptureData captured;
+  Data& data = captured.selected_;
   data.audit_ = stores.audit_;
   data.cursor_ = cursor;
   // This is a closed dependency map for the production hooks, not a default
@@ -62,14 +63,20 @@ MetaProposalView::CaptureData MetaProposalView::Extract(
           // Absence proofs and LatestForNode may inspect other Groups. Keep the
           // complete compact fact domain, excluding slots and unrelated
           // payloads.
-          data.active_nodes_ = stores.identity_.ActiveNodeIds();
-          data.groups_ = stores.topology_.ObservationFacts();
+          captured.active_nodes_ = stores.identity_.ActiveNodeIds();
+          captured.groups_ = stores.topology_.ObservationFacts();
           if constexpr (std::is_same_v<T, BeginUncontrolledFailover>) {
             if (cmd.trigger_reason_ != MetaAutomaticFailoverReason::kManual) {
-              data.automatic_ = {
-                  stores.topology_.TopologyEpoch(),
-                  stores.policy_.CurrentAutomaticUncontrolledFailover(),
-                  stores.policy_.CurrentAuthorityLease()};
+              data.automatic_.emplace();
+              data.automatic_->topology_epoch_ =
+                  stores.topology_.TopologyEpoch();
+              // Typed getters parse JSON. Extract raw current documents so
+              // both decoding and its temporary allocations stay outside the
+              // state lock; retained Policy history never enters this cut.
+              captured.automatic_policy_ = stores.policy_.CurrentVersion(
+                  std::string(kAutomaticUncontrolledFailoverPolicyId));
+              captured.lease_policy_ = stores.policy_.CurrentVersion(
+                  std::string(kAuthorityLeasePolicyId));
             }
           }
         } else {
@@ -78,14 +85,31 @@ MetaProposalView::CaptureData MetaProposalView::Extract(
         }
       },
       command);
-  return data;
+  return captured;
 }
 
-MetaProposalView::MetaProposalView(CaptureData data) : data_(std::move(data)) {
+MetaProposalView::MetaProposalView(CaptureData data)
+    : data_(std::move(data.selected_)) {
   if (data_.group_id_.has_value()) {
-    facts_.emplace(MetaObservationFactsView(std::move(data_.active_nodes_),
-                                            std::move(data_.groups_),
-                                            data_.cursor_));
+    facts_.emplace(MetaObservationFactsView(
+        std::move(data.active_nodes_), std::move(data.groups_), data_.cursor_));
+  }
+  if (data_.automatic_.has_value()) {
+    if (data.automatic_policy_.has_value()) {
+      auto decoded = DecodeAutomaticUncontrolledFailoverPolicy(
+          data.automatic_policy_->content_);
+      if (decoded.ok()) {
+        decoded->version_ = data.automatic_policy_->version_;
+        data_.automatic_->automatic_ = *decoded;
+      }
+    }
+    if (data.lease_policy_.has_value()) {
+      auto decoded = DecodeAuthorityLeasePolicy(data.lease_policy_->content_);
+      if (decoded.ok()) {
+        decoded->version_ = data.lease_policy_->version_;
+        data_.automatic_->lease_ = *decoded;
+      }
+    }
   }
 }
 

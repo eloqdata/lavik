@@ -445,7 +445,8 @@ dependencies are programming errors, never evidence that an object is absent.
 The durability fail-safe remains an explicit full-state capture path. Its
 recovery simulation and hook projection use the same owned cut, with no second
 state-machine snapshot. Capture copies the selected data and paired indices
-under the state lock; lookup-index construction runs after releasing it. The
+under the state lock; lookup-index construction and current Policy decoding
+run after releasing it. The
 exclusive recovery reservation spans simulation and the actual Raft outcome.
 Additional simulation copies, serialization, simulation, hooks and view
 destruction run outside state and proposal-gate locks. Deterministic apply

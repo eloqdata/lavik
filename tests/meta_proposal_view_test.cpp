@@ -112,6 +112,31 @@ TEST(MetaProposalViewTest, FailoverRetainsGlobalFactsAndOnlyCurrentPolicies) {
   EXPECT_EQ(captured.automatic_policies().lease_->version_, 2u);
   EXPECT_EQ(captured.automatic_policies().lease_->duration_ms_, 6000u);
   EXPECT_FALSE(captured.automatic_policies().automatic_.has_value());
+  const auto raw_lease = stores.policy_.CurrentVersion(policy.policy_id_);
+  ASSERT_TRUE(raw_lease.has_value());
+  EXPECT_EQ(raw_lease->content_, policy.content_);
+  policy.version_ = 3;
+  policy.content_ = R"({"kind":"authority-lease-v1","duration_ms":7000})";
+  ASSERT_TRUE(stores.policy_.Apply(policy).ok());
+  policy.policy_id_ = meta::kAutomaticUncontrolledFailoverPolicyId;
+  EXPECT_FALSE(stores.policy_.CurrentVersion(policy.policy_id_).has_value());
+  policy.version_ = 1;
+  policy.content_ =
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})";
+  ASSERT_TRUE(stores.policy_.Apply(policy).ok());
+  const auto updated =
+      meta::MetaProposalView::FromStores(begin, stores, {11, 11});
+  EXPECT_EQ(updated.automatic_policies().lease_,
+            stores.policy_.CurrentAuthorityLease());
+  EXPECT_EQ(updated.automatic_policies().automatic_,
+            stores.policy_.CurrentAutomaticUncontrolledFailover());
+  EXPECT_EQ(raw_lease->version_, 2u);
+  EXPECT_NE(
+      raw_lease->content_,
+      stores.policy_.CurrentVersion(std::string(meta::kAuthorityLeasePolicyId))
+          ->content_);
+  EXPECT_EQ(captured.automatic_policies().lease_->duration_ms_, 6000u);
+  EXPECT_FALSE(captured.automatic_policies().automatic_.has_value());
   meta::RetireNode retire;
   retire.node_id_ = node.node_id_;
   retire.expected_revision_ = 1;

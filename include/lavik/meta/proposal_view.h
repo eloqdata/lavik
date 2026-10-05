@@ -19,7 +19,7 @@ namespace lavik::meta {
 
 struct MetaStores;
 
-// Only current values: Policy history and raw JSON are not admission data.
+// Finalized current values; a proposal view retains no Policy history or JSON.
 struct MetaProposalAutomaticPolicies {
   std::uint64_t topology_epoch_ = 0;
   std::optional<MetaAutomaticUncontrolledFailoverPolicy> automatic_;
@@ -56,7 +56,7 @@ class MetaProposalView {
 
  private:
   friend class MetaStateMachine;
-  struct CaptureData {
+  struct Data {
     MetaAuditStore audit_;
     MetaCommittedCursor cursor_;
     std::optional<MetaOperationId> operation_id_;
@@ -64,17 +64,23 @@ class MetaProposalView {
     std::optional<std::string> group_id_;
     std::optional<MetaTopologyGroupView> group_;
     std::optional<MetaGroupAuthorityView> authority_;
+    std::optional<MetaProposalAutomaticPolicies> automatic_;
+  };
+  struct CaptureData {
+    Data selected_;
     std::vector<std::string> active_nodes_;
     std::vector<MetaObservationGroupFacts> groups_;
-    std::optional<MetaProposalAutomaticPolicies> automatic_;
+    std::optional<MetaPolicyVersionView> automatic_policy_;
+    std::optional<MetaPolicyVersionView> lease_policy_;
   };
   static CaptureData Extract(const MetaCommand& command,
                              const MetaStores& stores,
                              MetaCommittedCursor cursor);
-  // Finishes lookup indices after Extract's state-lock scope has ended.
+  // Finishes lookup indices and Policy decoding after the state lock is
+  // released. Temporary raw documents are destroyed here, not in the view.
   explicit MetaProposalView(CaptureData data);
 
-  CaptureData data_;
+  Data data_;
   std::optional<MetaObservationFactsView> facts_;
 };
 
