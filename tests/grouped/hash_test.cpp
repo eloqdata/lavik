@@ -509,6 +509,67 @@ TEST(GroupedHashTest,
   EXPECT_EQ(original->total_group_bytes(), old_bytes);
 }
 
+TEST(GroupedHashTest, SingleRouteUpdatesPreserveEveryPinnedPath) {
+  constexpr std::uint64_t groups = 32;
+  auto root = Root(groups, groups);
+  root.revision_ = 1;
+  std::vector<RecoveredHashGroup> records;
+  for (std::uint64_t i = 0; i < groups; ++i)
+    records.push_back({.incarnation_ = root.incarnation_,
+                       .id_ = {i << 59, 5},
+                       .sequence_ = 1,
+                       .field_count_ = 1,
+                       .encoded_bytes_ = 128});
+  auto recovered = HashGroupDirectory::Recover(root, 1, records, {});
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  auto current = *recovered;
+  // Visit every prefix in a nonmonotonic order, keeping all historical views.
+  // Subsequent replacements must not alter their records or aggregate bytes.
+  std::vector<HashGroupDirectory> history{current};
+  for (std::uint64_t step = 0; step < groups; ++step) {
+    const auto index = (step * 13) % groups;
+    auto change = records[index];
+    change.sequence_ = ++root.revision_;
+    change.field_count_ = 2;
+    change.encoded_bytes_ = 192;
+    change.record_token_ = 100 + step;
+    ++root.field_count_;
+    auto next = current.Apply(root, 1, std::span(&change, 1));
+    ASSERT_TRUE(next.ok()) << next.status();
+    current = std::move(*next);
+    history.push_back(current);
+  }
+  for (std::size_t version = 0; version < history.size(); ++version) {
+    const auto& snapshot = history[version];
+    EXPECT_EQ(snapshot.root().field_count_, groups + version);
+    EXPECT_EQ(snapshot.total_group_bytes(), groups * 128 + version * 64);
+    EXPECT_EQ(snapshot.groups().size(), groups);
+    for (std::uint64_t step = 0; step < groups; ++step) {
+      const auto prefix = ((step * 13) % groups) << 59;
+      const auto* group = snapshot.groups().Floor(prefix | 1);
+      ASSERT_NE(group, nullptr);
+      EXPECT_EQ(group->id_.prefix_, prefix);
+      EXPECT_EQ(group->sequence_, step < version ? step + 2 : 1);
+      EXPECT_EQ(group->field_count_, step < version ? 2 : 1);
+      EXPECT_EQ(group->record_token_, step < version ? 100 + step : 0);
+    }
+  }
+  auto change = records.front();
+  change.sequence_ = ++root.revision_;
+  change.field_count_ = 2;
+  // One replacement cannot alter the prefix interval, introduce an uncovered
+  // route, or overflow the aggregate payload bytes, even with plausible counts.
+  change.id_.bits_ = 4;
+  EXPECT_FALSE(current.Apply(root, 1, std::span(&change, 1)).ok());
+  change.id_ = {1, 64};
+  EXPECT_FALSE(current.Apply(root, 1, std::span(&change, 1)).ok());
+  change.id_ = records.front().id_;
+  change.encoded_bytes_ = std::numeric_limits<std::uint64_t>::max();
+  EXPECT_FALSE(current.Apply(root, 1, std::span(&change, 1)).ok());
+  EXPECT_EQ(current.total_group_bytes(), groups * 192);
+  EXPECT_EQ(current.groups().at(0).sequence_, 2);
+}
+
 TEST(GroupedHashTest, CompleteSnapshotsAreBinarySafeAndNotMutationLogs) {
   HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(3)};
   group.value_.entries_[0].field_ = std::string("a\0b", 3);

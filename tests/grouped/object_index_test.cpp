@@ -433,6 +433,36 @@ TEST(GroupedScratchBudgetTest, IndirectKeysDoNotReduceValueExtentAdmission) {
   EXPECT_GE(compact->bytes(), kValueBytes);
 }
 
+TEST(HashGroupMapTest, ReplacementAdmissionFailurePreservesPinnedVersion) {
+  GroupedMemoryScope memory;
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  {
+    HashGroupMap<std::uint64_t> map;
+    for (std::uint64_t i = 0; i < 32; ++i)
+      ASSERT_TRUE(map.Set(i, {.sequence_ = 1, .record_token_ = i}).ok());
+    const auto pinned = map;
+    const auto* original = map.Get(0);
+    const auto retained = WorkerMemoryAccountingBytes(0);
+    const auto missing = map.Replace(32, {.sequence_ = 2});
+    EXPECT_EQ(missing.status().code(), absl::StatusCode::kNotFound);
+    EXPECT_EQ(WorkerMemoryAccountingBytes(0), retained);
+    ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
+    const auto rejected = map.Replace(0, {.sequence_ = 2});
+    EXPECT_EQ(rejected.status().code(), absl::StatusCode::kResourceExhausted);
+    EXPECT_EQ(map.Get(0), original);
+    EXPECT_EQ(pinned.Get(0), original);
+    EXPECT_EQ(WorkerMemoryAccountingBytes(0), retained);
+    ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+    auto replaced = map.Replace(0, {.sequence_ = 2, .record_token_ = 100});
+    ASSERT_TRUE(replaced.ok()) << replaced.status();
+    EXPECT_EQ(replaced->sequence_, 1);
+    EXPECT_EQ(map.size(), 32);
+    EXPECT_EQ(map.Get(0)->record_token_, 100);
+    EXPECT_EQ(pinned.Get(0)->record_token_, 0);
+  }
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+}
+
 TEST(GroupedObjectIndexTest, PublishOomPreservesExistingKeyAndCanBeRetried) {
   GroupedMemoryScope memory;
   auto old = Create(Input());

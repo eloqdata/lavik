@@ -241,7 +241,7 @@ class HashGroupMap {
     Link left_, right_;
     std::size_t size_;
     unsigned height_;
-    Node(Key key, RecoveredHashGroup value, Link left, Link right)
+    Node(Key key, const RecoveredHashGroup& value, Link left, Link right)
         : entry_(key, value),
           left_(std::move(left)),
           right_(std::move(right)),
@@ -335,11 +335,22 @@ class HashGroupMap {
     }
     return found ? &found->entry_.second : nullptr;
   }
-  absl::Status Set(Key key, RecoveredHashGroup value) {
+  absl::Status Set(Key key, const RecoveredHashGroup& value) {
     auto next = SetNode(root_, key, value);
     if (!next.ok()) return next.status();
     root_ = std::move(*next);
     return absl::OkStatus();
+  }
+  // Replace an existing key without changing tree shape. Returns its previous
+  // metadata; missing keys and admission failures leave this version unchanged.
+  // Retained readers continue owning their original search path.
+  absl::StatusOr<RecoveredHashGroup> Replace(Key key,
+                                             const RecoveredHashGroup& value) {
+    RecoveredHashGroup previous;
+    auto next = ReplaceNode(root_, key, value, previous);
+    if (!next.ok()) return next.status();
+    root_ = std::move(*next);
+    return previous;
   }
   absl::Status Erase(Key key) {
     auto next = EraseNode(root_, key);
@@ -351,8 +362,8 @@ class HashGroupMap {
  private:
   static std::size_t Size(const Link& node) { return node ? node->size_ : 0; }
   static unsigned Height(const Link& node) { return node ? node->height_ : 0; }
-  static absl::StatusOr<Link> Make(Key key, RecoveredHashGroup value, Link left,
-                                   Link right) {
+  static absl::StatusOr<Link> Make(Key key, const RecoveredHashGroup& value,
+                                   Link left, Link right) {
     auto reservation =
         TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(Node) + 1024));
     if (!reservation) {
@@ -368,7 +379,7 @@ class HashGroupMap {
                                           value, std::move(left),
                                           std::move(right)));
   }
-  static absl::StatusOr<Link> Balance(Key key, RecoveredHashGroup value,
+  static absl::StatusOr<Link> Balance(Key key, const RecoveredHashGroup& value,
                                       Link left, Link right) {
     if (Height(left) > Height(right) + 1) {
       if (Height(left->left_) >= Height(left->right_)) {
@@ -403,7 +414,7 @@ class HashGroupMap {
     return Make(key, value, std::move(left), std::move(right));
   }
   static absl::StatusOr<Link> SetNode(const Link& node, Key key,
-                                      RecoveredHashGroup value) {
+                                      const RecoveredHashGroup& value) {
     if (!node || key == node->entry_.first) {
       return Make(key, value, node ? node->left_ : Link{},
                   node ? node->right_ : Link{});
@@ -413,6 +424,23 @@ class HashGroupMap {
     if (!child.ok()) return child.status();
     return Balance(node->entry_.first, node->entry_.second,
                    left ? *child : node->left_, left ? node->right_ : *child);
+  }
+  static absl::StatusOr<Link> ReplaceNode(const Link& node, Key key,
+                                          const RecoveredHashGroup& value,
+                                          RecoveredHashGroup& previous) {
+    if (!node) return absl::NotFoundError("missing group routing key");
+    if (key == node->entry_.first) {
+      previous = node->entry_.second;
+      return Make(key, value, node->left_, node->right_);
+    }
+    const bool left = key < node->entry_.first;
+    auto child =
+        ReplaceNode(left ? node->left_ : node->right_, key, value, previous);
+    if (!child.ok()) return child.status();
+    // Replacing metadata leaves subtree heights and cardinalities intact.
+    // Copy the path for pinned readers without insertion/rotation checks.
+    return Make(node->entry_.first, node->entry_.second,
+                left ? *child : node->left_, left ? node->right_ : *child);
   }
   static absl::StatusOr<Link> EraseNode(const Link& node, Key key) {
     if (!node) return Link{};

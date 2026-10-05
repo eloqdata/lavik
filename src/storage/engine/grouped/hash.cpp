@@ -655,9 +655,42 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
   next.root_ = root;
   next.sequence_ = root.revision_;
   next.command_sequence_ = sequence;
-  // Most point writes replace one route. A sorted pointer list preserves
-  // duplicate detection and prefix order without allocating a map node per
-  // changed group; larger batches spill under the existing scratch admission.
+  const auto valid_change = [&](const RecoveredHashGroup& change) {
+    return change.id_.valid() && change.incarnation_ == root.incarnation_ &&
+           change.sequence_ == root.revision_ &&
+           change.field_count_ <= std::numeric_limits<std::uint32_t>::max() &&
+           (!change.retired_ || change.field_count_ == 0);
+  };
+  if (changes.size() == 1 && !changes.front().retired_) {
+    const auto& change = changes.front();
+    if (!valid_change(change))
+      return absl::DataLossError("invalid grouped directory mutation record");
+    auto previous = next.groups_.Replace(change.id_.prefix_, change);
+    if (!previous.ok()) {
+      if (previous.status().code() == absl::StatusCode::kNotFound)
+        return absl::DataLossError("group update has no existing route");
+      return previous.status();
+    }
+    // One live replacement cannot split or merge the complete prefix cover.
+    // An existing identity cannot also be retired in a validated directory.
+    // Validate the old metadata returned by that same search, avoiding separate
+    // exact/predecessor/retirement lookups and a second tree descent to update.
+    if (previous->id_ != change.id_ ||
+        root.field_count_ !=
+            root_.field_count_ - previous->field_count_ + change.field_count_ ||
+        root.group_count_ != groups_.size())
+      return absl::DataLossError(
+          "group directory update has gaps or count mismatch");
+    next.total_group_bytes_ -= previous->encoded_bytes_;
+    if (change.encoded_bytes_ >
+        std::numeric_limits<std::uint64_t>::max() - next.total_group_bytes_)
+      return absl::DataLossError("grouped Hash byte total overflows");
+    next.total_group_bytes_ += change.encoded_bytes_;
+    return next;
+  }
+  // Multi-leaf changes need duplicate detection and prefix order. A sorted
+  // pointer list avoids allocating a map node per changed group; larger
+  // batches spill under the existing scratch admission.
   absl::InlinedVector<const RecoveredHashGroup*, 4> writes;
   writes.reserve(changes.size());
   for (const auto& change : changes) writes.push_back(&change);
@@ -672,11 +705,7 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
   __uint128_t coverage = static_cast<__uint128_t>(1) << 64;
   for (const auto* changed : writes) {
     const auto& change = *changed;
-    if (!change.id_.valid() || change.incarnation_ != root.incarnation_ ||
-        change.sequence_ != root.revision_ ||
-        change.field_count_ > std::numeric_limits<std::uint32_t>::max() ||
-        (change.retired_ && change.field_count_ != 0) ||
-        previous == change.id_) {
+    if (!valid_change(change) || previous == change.id_) {
       return absl::DataLossError("invalid grouped directory mutation record");
     }
     previous = change.id_;
