@@ -1333,7 +1333,8 @@ def full_streamed_value_serial(root):
         H.wait_until(
             "first streamed Chunk ACK withheld",
             30,
-            lambda: len(proxy.snapshot(key)["frames"]) >= 2,
+            lambda: len(proxy.snapshot(key)["frames"]) >= 2
+            and proxy.snapshot(key)["held"] == 1,
         )
         chunk = proxy.snapshot(key)
         assert len(chunk["frames"]) == 2 and chunk["held"] == 1, chunk
