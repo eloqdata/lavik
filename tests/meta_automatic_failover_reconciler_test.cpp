@@ -449,7 +449,10 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
       MetaNodeHealthObs health, bool causally_confirm_lease,
       std::int64_t observed_at_unix_ms, std::uint64_t observed_at_steady_ms,
       std::uint32_t effective_lease_duration_ms = 5'000) {
-    auto projected = MetaControlProjector::ProjectNode(view, seed.owner_);
+    auto projected = MetaControlProjector::ProjectNode(
+        MetaDataPublicationView::FromStores(
+            view.stores(), {view.applied_index(), view.applied_index()}),
+        seed.owner_);
     if (!projected.ok()) return projected.status();
     return PublishOwnerHeartbeat(
         std::move(*projected), MetaStoresFacts(view.stores()),
@@ -542,7 +545,10 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
       std::int64_t observed_at_unix_ms, std::uint64_t observed_at_steady_ms,
       bool draining = false, bool storage_ready = true,
       bool population_ready = true) {
-    auto projected = MetaControlProjector::ProjectNode(view, seed.owner_);
+    auto projected = MetaControlProjector::ProjectNode(
+        MetaDataPublicationView::FromStores(
+            view.stores(), {view.applied_index(), view.applied_index()}),
+        seed.owner_);
     if (!projected.ok()) return projected.status();
     if (absl::Status limited = detail::ApplyLeadershipValidityLimit(
             *projected, effective_lease_duration_ms);
@@ -592,7 +598,10 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
   absl::Status PublishOwnerFds(const MetaCommittedView& view,
                                const SeedState& seed,
                                std::uint32_t effective_lease_duration_ms) {
-    auto projected = MetaControlProjector::ProjectNode(view, seed.owner_);
+    auto projected = MetaControlProjector::ProjectNode(
+        MetaDataPublicationView::FromStores(
+            view.stores(), {view.applied_index(), view.applied_index()}),
+        seed.owner_);
     if (!projected.ok()) return projected.status();
     if (absl::Status limited = detail::ApplyLeadershipValidityLimit(
             *projected, effective_lease_duration_ms);
@@ -1127,7 +1136,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   const SeedState seed = SeedCluster();
   // Prepare Data projection outside the hook; admission supplies only facts.
   const auto projection = MetaControlProjector::ProjectNode(
-      coordinator_->CommittedView(), seed.owner_);
+      coordinator_->DataPublication(), seed.owner_);
   ASSERT_TRUE(projection.ok()) << projection.status();
   std::promise<absl::Status> injected;
   std::future<absl::Status> injection = injected.get_future();
@@ -1184,7 +1193,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   const SeedState seed = SeedCluster();
   // Prepare Data projection outside the hook; admission supplies only facts.
   const auto projection = MetaControlProjector::ProjectNode(
-      coordinator_->CommittedView(), seed.owner_);
+      coordinator_->DataPublication(), seed.owner_);
   ASSERT_TRUE(projection.ok()) << projection.status();
   std::promise<absl::Status> injected;
   std::future<absl::Status> injection = injected.get_future();
@@ -1485,7 +1494,11 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   lease.content_ = R"({"kind":"authority-lease-v1","duration_ms":250})";
   ProposeAccepted(lease);
   const MetaCommittedView advanced = coordinator_->CommittedView();
-  auto projected = MetaControlProjector::ProjectNode(advanced, seed.owner_);
+  auto projected = MetaControlProjector::ProjectNode(
+      MetaDataPublicationView::FromStores(
+          advanced.stores(),
+          {advanced.applied_index(), advanced.applied_index()}),
+      seed.owner_);
   ASSERT_TRUE(projected.ok()) << projected.status();
   ASSERT_TRUE(detail::ApplyLeadershipValidityLimit(*projected, 250).ok());
   data_runtime_->PublishCurrent(

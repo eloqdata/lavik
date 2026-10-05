@@ -374,25 +374,24 @@ bool ClusterCreateDirectiveReady(const MetaOperationRecord& operation,
 namespace {
 
 absl::StatusOr<control::FullDesiredState> ProjectNodeState(
-    const MetaStores& stores, std::uint64_t applied_index,
-    std::string_view node_id) {
+    const MetaDataPublicationView& view, std::string_view node_id) {
   if (!control::IsCanonicalIdentity160(node_id)) {
     return Invalid("requested data node id is not canonical");
   }
-  if (!stores.identity_.IsActiveNode(std::string(node_id))) {
+  if (!view.IsActiveNode(node_id)) {
     return absl::NotFoundError("requested data node is not active");
   }
-  if (applied_index == 0) {
+  if (view.applied_index() == 0) {
     return Inconsistent("committed view has applied index zero");
   }
   control::FullDesiredState state;
-  const auto& lifecycle = stores.topology_.ClusterLifecycle();
+  const auto& lifecycle = view.lifecycle();
   state.service = {lifecycle.client_mode_, lifecycle.root_operation_id_,
                    lifecycle.genesis_commit_index_};
-  state.control_revision = applied_index;
-  state.topology_epoch = stores.topology_.TopologyEpoch();
+  state.control_revision = view.applied_index();
+  state.topology_epoch = view.topology_epoch();
   const std::optional<MetaAuthorityLeasePolicy> authority_lease =
-      stores.policy_.CurrentAuthorityLease();
+      view.authority_lease();
   if (!authority_lease.has_value()) {
     return Inconsistent("current Authority Lease Policy is missing");
   }
@@ -405,7 +404,7 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
   state.authority_lease_duration_ms =
       static_cast<std::uint32_t>(authority_lease->duration_ms_);
 
-  for (const MetaMemberRecord& member : stores.identity_.MetaMembers()) {
+  for (const MetaMemberRecord& member : view.meta_members()) {
     if (member.retired_) continue;
     auto endpoint = ParseNumericHostPort(member.data_control_endpoint_,
                                          "Meta data-control endpoint");
@@ -416,7 +415,7 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
   }
 
   std::set<std::string> active_nodes;
-  for (const MetaNodeRecord& node : stores.identity_.Nodes()) {
+  for (const MetaNodeRecord& node : view.nodes()) {
     if (node.retired_) continue;
     auto endpoint = ProjectDataEndpoint(node);
     if (!endpoint.ok()) return endpoint.status();
@@ -429,9 +428,9 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
 
   std::set<ManifestReference> manifest_references;
   std::map<std::string, std::size_t> group_indices;
-  for (const MetaTopologyGroupView& source : stores.topology_.Groups()) {
-    const auto grant = stores.topology_.AuthorityFor(source.group_id_);
-    if (!grant.has_value()) {
+  for (const MetaTopologyGroupView& source : view.groups()) {
+    const auto grant = view.AuthorityFor(source.group_id_);
+    if (grant == nullptr) {
       return Inconsistent(
           absl::StrCat("group ", source.group_id_, " has no grant state"));
     }
@@ -448,8 +447,7 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
     projected.partition_replication_epoch =
         source.record_.partition_replication_epoch_;
     projected.steady_replication_enabled =
-        stores.topology_.ClusterLifecycle().state_ ==
-        MetaClusterLifecycle::kCreated;
+        view.lifecycle().state_ == MetaClusterLifecycle::kCreated;
 
     LAVIK_FAULT_INJECT(
         // Genesis normally separates explicit population from FollowOwner.
@@ -458,7 +456,7 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
         const char* mixed = std::getenv("LAVIK_TEST_MIXED_FULL_FOLLOW_NODE");
         if (mixed != nullptr && *mixed != '\0' &&
             (node_id == mixed || node_id == source.record_.owner_)) {
-          for (const auto& operation : stores.operation_.LiveOperationsView()) {
+          for (const auto& operation : view.operations()) {
             for (const auto& current : operation.current_directives_) {
               if (current.spec_.group_id_ != source.group_id_) continue;
               // Install source FollowOwner before its authorize receipt lets
@@ -552,34 +550,19 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
     state.groups.push_back(std::move(projected));
   }
 
-  // Reconstruct canonical ranges from the authoritative slot table. The
-  // committed SetSlotMap command shape is not retained, so adjacent runs are
-  // intentionally coalesced here.
-  std::optional<std::string> previous_group;
-  for (std::uint32_t slot = 0; slot < kMetaSlotCount; ++slot) {
-    const std::optional<std::string> owner = stores.topology_.SlotOwner(slot);
-    if (!owner.has_value()) {
-      previous_group.reset();
-      continue;
-    }
-    const auto group = group_indices.find(*owner);
+  // Capture retains the canonical absolute slot ranges once per shared cut.
+  for (const auto& range : view.slots()) {
+    const auto group = group_indices.find(range.group_id_);
     if (group == group_indices.end()) {
-      return Inconsistent(
-          absl::StrCat("slot ", slot, " names unknown group ", *owner));
+      return Inconsistent(absl::StrCat("slot ", range.first_slot_,
+                                       " names unknown group ",
+                                       range.group_id_));
     }
-    std::vector<control::WireSlotRange>& ranges =
-        state.groups[group->second].slot_ranges;
-    if (previous_group.has_value() && *previous_group == *owner) {
-      ranges.back().last = static_cast<std::uint16_t>(slot);
-    } else {
-      ranges.push_back(
-          {static_cast<std::uint16_t>(slot), static_cast<std::uint16_t>(slot)});
-    }
-    previous_group = *owner;
+    state.groups[group->second].slot_ranges.push_back(
+        {range.first_slot_, range.last_slot_});
   }
 
-  for (const MetaOperationRecord& operation :
-       stores.operation_.LiveOperationsView()) {
+  for (const MetaOperationRecord& operation : view.operations()) {
     for (const MetaCurrentDirective& current : operation.current_directives_) {
       if (current.spec_.recipient_node_id_ != node_id) continue;
       if (!ClusterCreateDirectiveReady(operation, current)) continue;
@@ -588,7 +571,7 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
         continue;
       }
       if (const absl::Status anchor =
-              ValidateCommittedDirectiveAnchor(stores, current.spec_);
+              view.ValidateDirectiveAnchor(current.spec_);
           !anchor.ok()) {
         return Inconsistent(
             absl::StrCat("stale current directive anchor: ", anchor.message()));
@@ -617,8 +600,8 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
       });
 
   for (const auto& [revision, digest] : manifest_references) {
-    const auto document = stores.population_manifest_.Find(digest);
-    if (!document.has_value()) {
+    const auto document = view.FindManifest(digest);
+    if (document == nullptr) {
       return Inconsistent(absl::StrCat("referenced population manifest at ",
                                        "revision ", revision, " is missing"));
     }
@@ -645,12 +628,13 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
 }  // namespace
 
 absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
-    const MetaCommittedView& view, std::string_view node_id) {
-  auto state = ProjectNodeState(view.stores(), view.applied_index(), node_id);
+    const MetaDataPublicationView& view, std::string_view node_id) {
+  auto state = ProjectNodeState(view, node_id);
   if (!state.ok()) return state.status();
   auto encoded = control::EncodeFullDesiredState(*state);
   if (!encoded.ok()) return encoded.status();
-  return NodeControlBatch{std::move(*state), std::move(*encoded)};
+  return NodeControlBatch{std::move(*state), std::move(*encoded),
+                          view.state_change_index()};
 }
 
 std::size_t NodeControlBatchRetainedBytes(

@@ -33,6 +33,7 @@
 #include "lavik/meta/policy_store.h"
 #include "lavik/meta/population_manifest_store.h"
 #include "lavik/meta/state_apply.h"
+#include "lavik/meta/state_machine.h"
 #include "meta_topology_test_access.h"
 
 namespace {
@@ -42,7 +43,11 @@ using lavik::meta::ApplyCommitted;
 using lavik::meta::MetaApplyResult;
 using lavik::meta::MetaAuditVerdict;
 using lavik::meta::MetaCommand;
-using lavik::meta::MetaCommittedView;
+lavik::meta::MetaDataPublicationView PublicationView(
+    const lavik::meta::MetaStores& stores, std::uint64_t index) {
+  return lavik::meta::MetaDataPublicationView::FromStores(stores,
+                                                          {index, index});
+}
 using lavik::meta::MetaControlProjector;
 using lavik::meta::MetaStores;
 
@@ -288,7 +293,7 @@ TEST(MetaControlProjector, ProjectsRegisteredNodeBeforeAnyGroupExists) {
   Commit(stores, 2, registration);
 
   const auto projected = MetaControlProjector::ProjectNode(
-      MetaCommittedView(std::move(stores), 2), registration.node_id_);
+      PublicationView(std::move(stores), 2), registration.node_id_);
   ASSERT_TRUE(projected.ok()) << projected.status();
   EXPECT_EQ(projected->full_state.topology_epoch, 0u);
   EXPECT_EQ(projected->full_state.authority_lease_duration_ms, 3000u);
@@ -306,7 +311,7 @@ TEST(MetaControlProjector, MissingAuthorityLeasePolicyFailsClosed) {
   ASSERT_TRUE(stores.identity_.Apply(registration).ok());
 
   const auto projected = MetaControlProjector::ProjectNode(
-      MetaCommittedView(std::move(stores), 1), registration.node_id_);
+      PublicationView(std::move(stores), 1), registration.node_id_);
   ASSERT_FALSE(projected.ok());
   EXPECT_EQ(projected.status().code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_NE(projected.status().message().find("Authority Lease Policy"),
@@ -315,7 +320,7 @@ TEST(MetaControlProjector, MissingAuthorityLeasePolicyFailsClosed) {
 
 TEST(MetaControlProjector, ProjectsCompleteCanonicalStateForOneNode) {
   const Fixture fixture = CompleteFixture();
-  const MetaCommittedView view(fixture.stores, 99);
+  const auto view = PublicationView(fixture.stores, 99);
 
   const auto projected =
       MetaControlProjector::ProjectNode(view, fixture.target);
@@ -436,7 +441,7 @@ TEST(MetaControlProjector, ProjectsCommittedFailoverExecutionSubset) {
                   .ok());
 
   const auto projected = MetaControlProjector::ProjectNode(
-      MetaCommittedView(std::move(fixture.stores), 100), fixture.source);
+      PublicationView(std::move(fixture.stores), 100), fixture.source);
   ASSERT_TRUE(projected.ok()) << projected.status();
   ASSERT_EQ(projected->full_state.groups.size(), 2u);
   const control::WireDesiredGroup& group = projected->full_state.groups[0];
@@ -499,7 +504,7 @@ TEST(MetaControlProjector, ProjectsCurrentGrantActivationActionIdentity) {
   // Project the other member so the fixture's deliberately old target-only
   // directive is outside this node-specific batch.
   const auto projected = MetaControlProjector::ProjectNode(
-      MetaCommittedView(std::move(fixture.stores), 100), fixture.source);
+      PublicationView(std::move(fixture.stores), 100), fixture.source);
   ASSERT_TRUE(projected.ok()) << projected.status();
   ASSERT_EQ(projected->full_state.groups.size(), 2u);
   const control::WireDesiredGroup& group = projected->full_state.groups[0];
@@ -512,7 +517,7 @@ TEST(MetaControlProjector, ProjectsCurrentGrantActivationActionIdentity) {
 TEST(MetaControlProjector, ProjectedManifestPassesDataPlaneValidation) {
   const Fixture fixture = CompleteFixture();
   const auto projected = MetaControlProjector::ProjectNode(
-      MetaCommittedView(fixture.stores, 99), fixture.target);
+      PublicationView(fixture.stores, 99), fixture.target);
   ASSERT_TRUE(projected.ok()) << projected.status();
 
   const auto prepared = lavik::cluster::PrepareNodeControlState(
@@ -530,7 +535,7 @@ TEST(MetaControlProjector,
      EnablesSteadyReplicationOnlyAfterClusterCreationCompletes) {
   Fixture fixture = CompleteFixture();
   auto creating = MetaControlProjector::ProjectNode(
-      MetaCommittedView(fixture.stores, 99), fixture.target);
+      PublicationView(fixture.stores, 99), fixture.target);
   ASSERT_TRUE(creating.ok()) << creating.status();
   ASSERT_FALSE(creating->full_state.groups.empty());
   EXPECT_FALSE(creating->full_state.groups.front().steady_replication_enabled);
@@ -541,7 +546,7 @@ TEST(MetaControlProjector,
                   .ok());
   ASSERT_TRUE(fixture.stores.topology_.CompleteClusterCreate(root).ok());
   auto created = MetaControlProjector::ProjectNode(
-      MetaCommittedView(std::move(fixture.stores), 100), fixture.target);
+      PublicationView(std::move(fixture.stores), 100), fixture.target);
   ASSERT_TRUE(created.ok()) << created.status();
   ASSERT_FALSE(created->full_state.groups.empty());
   EXPECT_TRUE(created->full_state.groups.front().steady_replication_enabled);
@@ -551,9 +556,9 @@ TEST(MetaControlProjector,
      DesiredContentIgnoresSourceIndexAndTracksCurrentLeasePolicy) {
   const Fixture fixture = CompleteFixture();
   const auto first = MetaControlProjector::ProjectNode(
-      MetaCommittedView(fixture.stores, 99), fixture.target);
+      PublicationView(fixture.stores, 99), fixture.target);
   const auto later = MetaControlProjector::ProjectNode(
-      MetaCommittedView(fixture.stores, 1000), fixture.target);
+      PublicationView(fixture.stores, 1000), fixture.target);
   ASSERT_TRUE(first.ok()) << first.status();
   ASSERT_TRUE(later.ok()) << later.status();
 
@@ -569,7 +574,7 @@ TEST(MetaControlProjector,
                       2, R"({"kind":"authority-lease-v1","duration_ms":6000})"))
                   .ok());
   const auto changed = MetaControlProjector::ProjectNode(
-      MetaCommittedView(std::move(with_policy_change), 1001), fixture.target);
+      PublicationView(std::move(with_policy_change), 1001), fixture.target);
   ASSERT_TRUE(changed.ok()) << changed.status();
   EXPECT_FALSE(
       control::SameDesiredState(changed->full_state, first->full_state));
@@ -587,7 +592,7 @@ TEST(MetaControlProjector,
           .ok());
 
   const auto projected = MetaControlProjector::ProjectNode(
-      MetaCommittedView(std::move(fixture.stores), 101), fixture.source);
+      PublicationView(std::move(fixture.stores), 101), fixture.source);
   ASSERT_TRUE(projected.ok()) << projected.status();
   ASSERT_EQ(projected->full_state.nodes.size(), 2u);
   EXPECT_EQ(
@@ -616,7 +621,7 @@ TEST(MetaControlProjector,
   Commit(fixture.stores, 22, remove);
 
   const auto projected = MetaControlProjector::ProjectNode(
-      MetaCommittedView(std::move(fixture.stores), 22), fixture.source);
+      PublicationView(std::move(fixture.stores), 22), fixture.source);
   ASSERT_TRUE(projected.ok()) << projected.status();
   ASSERT_EQ(projected->full_state.groups.size(), 2u);
   const control::WireDesiredGroup& group = projected->full_state.groups[0];
@@ -638,7 +643,7 @@ TEST(MetaControlProjector,
   Commit(fixture.stores, 21, fence);
 
   const auto projected = MetaControlProjector::ProjectNode(
-      MetaCommittedView(std::move(fixture.stores), 21), fixture.source);
+      PublicationView(std::move(fixture.stores), 21), fixture.source);
   ASSERT_TRUE(projected.ok()) << projected.status();
   const control::WireDesiredGroup& group = projected->full_state.groups[0];
   EXPECT_FALSE(group.grant_active);
@@ -681,7 +686,7 @@ TEST(MetaControlProjector,
   Commit(fixture.stores, 21, transition);
 
   const auto target = MetaControlProjector::ProjectNode(
-      MetaCommittedView(fixture.stores, 104), fixture.target);
+      PublicationView(fixture.stores, 104), fixture.target);
   ASSERT_TRUE(target.ok()) << target.status();
   ASSERT_EQ(target->full_state.current_directives.size(), 1u);
   const control::WireProjectedDirective& projected_rebuild =
@@ -691,7 +696,7 @@ TEST(MetaControlProjector,
   EXPECT_EQ(projected_rebuild.identity.directive_revision, 21u);
 
   const auto source = MetaControlProjector::ProjectNode(
-      MetaCommittedView(std::move(fixture.stores), 104), fixture.source);
+      PublicationView(std::move(fixture.stores), 104), fixture.source);
   ASSERT_TRUE(source.ok()) << source.status();
   ASSERT_EQ(source->full_state.current_directives.size(), 2u);
   for (const control::WireProjectedDirective& directive :
@@ -748,12 +753,12 @@ TEST(MetaControlProjector,
     Commit(fixture.stores, 21, authorize_transition);
 
     auto target = MetaControlProjector::ProjectNode(
-        MetaCommittedView(fixture.stores, 104), fixture.target);
+        PublicationView(fixture.stores, 104), fixture.target);
     ASSERT_TRUE(target.ok()) << target.status();
     EXPECT_TRUE(target->full_state.current_directives.empty());
 
     auto source = MetaControlProjector::ProjectNode(
-        MetaCommittedView(fixture.stores, 104), fixture.source);
+        PublicationView(fixture.stores, 104), fixture.source);
     ASSERT_TRUE(source.ok()) << source.status();
     ASSERT_EQ(source->full_state.current_directives.size(), 1u);
     EXPECT_EQ(source->full_state.current_directives.front().kind,
@@ -777,7 +782,7 @@ TEST(MetaControlProjector,
     failed.result_ = "source-rejected";
     Commit(failed_stores, 22, failed);
     const auto target_after_failure = MetaControlProjector::ProjectNode(
-        MetaCommittedView(std::move(failed_stores), 105), fixture.target);
+        PublicationView(std::move(failed_stores), 105), fixture.target);
     ASSERT_TRUE(target_after_failure.ok()) << target_after_failure.status();
     EXPECT_TRUE(target_after_failure->full_state.current_directives.empty());
 
@@ -794,7 +799,7 @@ TEST(MetaControlProjector,
     Commit(fixture.stores, 23, rebuild_transition);
 
     target = MetaControlProjector::ProjectNode(
-        MetaCommittedView(std::move(fixture.stores), 105), fixture.target);
+        PublicationView(std::move(fixture.stores), 105), fixture.target);
     ASSERT_TRUE(target.ok()) << target.status();
     if (mismatched_layout) {
       EXPECT_TRUE(target->full_state.current_directives.empty());
@@ -815,7 +820,7 @@ TEST(MetaControlProjector,
   MetaStores named = fixture.stores;
   ASSERT_TRUE(ReplaceEndpoints(named, 1, {"tls://data.example:17000"}).ok());
   const auto projection = MetaControlProjector::ProjectNode(
-      MetaCommittedView(std::move(named), 102), fixture.target);
+      PublicationView(std::move(named), 102), fixture.target);
   ASSERT_TRUE(projection.ok()) << projection.status();
   EXPECT_TRUE(
       std::ranges::any_of(projection->full_state.nodes, [](const auto& node) {
@@ -837,7 +842,7 @@ TEST(MetaControlProjector,
     EXPECT_FALSE(ReplaceEndpoints(stores, 1, endpoints).ok());
     // A rejected update cannot poison the global projection for every node.
     const auto projected = MetaControlProjector::ProjectNode(
-        MetaCommittedView(std::move(stores), 102), fixture.target);
+        PublicationView(std::move(stores), 102), fixture.target);
     EXPECT_TRUE(projected.ok()) << projected.status();
   }
 }
@@ -903,11 +908,162 @@ TEST(MetaControlProjector,
             ? fixture.source
             : fixture.target;
     const auto projected = MetaControlProjector::ProjectNode(
-        MetaCommittedView(std::move(stores), 103), recipient);
+        PublicationView(std::move(stores), 103), recipient);
     ASSERT_TRUE(projected.ok()) << projected.status();
     ASSERT_EQ(projected->full_state.current_directives.size(), 1u);
     EXPECT_EQ(projected->full_state.current_directives[0].kind, *test.expected);
   }
 }
 
+}  // namespace
+
+namespace {
+namespace meta = lavik::meta;
+
+TEST(MetaDataPublicationViewTest,
+     SelectsOperationsAndReferencedManifestsBeforeCopying) {
+  auto fixture = CompleteFixture();
+  auto before = PublicationView(fixture.stores, 100);
+  auto projected = MetaControlProjector::ProjectNode(before, fixture.target);
+  ASSERT_TRUE(projected.ok()) << projected.status();
+  for (std::uint8_t n = 0xa0; n < 0xb0; ++n) {
+    meta::SubmitOperation submit;
+    submit.operation_id_ = Bytes<16>(n);
+    submit.kind_ = "unrelated";
+    submit.intent_ = std::string(16384, 'x');
+    submit.intent_hash_ = meta::MetaSha256(submit.intent_);
+    ASSERT_TRUE(fixture.stores.operation_.SubmitOperation(submit, n).ok());
+    if (n % 2 == 0) {
+      meta::CompleteOperation complete;
+      complete.operation_id_ = submit.operation_id_;
+      complete.result_ = std::string(16384, 'y');
+      ASSERT_TRUE(fixture.stores.operation_.CompleteOperation(complete).ok());
+      meta::ArchiveOperations archive;
+      archive.operation_seqs_ = {n};
+      ASSERT_TRUE(fixture.stores.operation_.ArchiveOperations(archive).ok());
+    }
+  }
+  meta::PutPopulationManifest unrelated;
+  unrelated.entries_ = {{3, 123}};
+  unrelated.manifest_digest_ =
+      meta::MetaPopulationManifestStore::CanonicalDigest(unrelated.entries_);
+  ASSERT_TRUE(fixture.stores.population_manifest_.Put(unrelated).ok());
+  auto after = PublicationView(fixture.stores, 100);
+  ASSERT_EQ(after.operations().size(), 1u);
+  EXPECT_EQ(after.operations().front(), before.operations().front());
+  EXPECT_EQ(after.FindOperation(Bytes<16>(0xa1)), nullptr);
+  EXPECT_EQ(after.FindManifest(unrelated.manifest_digest_), nullptr);
+  ASSERT_NE(after.FindManifest(fixture.manifest_digest), nullptr);
+  EXPECT_EQ(*after.FindManifest(fixture.manifest_digest),
+            *before.FindManifest(fixture.manifest_digest));
+  auto unchanged = MetaControlProjector::ProjectNode(after, fixture.target);
+  ASSERT_TRUE(unchanged.ok()) << unchanged.status();
+  EXPECT_EQ(unchanged->encoded_full_state, projected->encoded_full_state);
+  EXPECT_EQ(unchanged->full_state, projected->full_state);
+  ASSERT_NE(after.FindNode(NodeId(3)), nullptr);
+  EXPECT_TRUE(after.FindNode(NodeId(3))->retired_);
+  EXPECT_FALSE(after.IsActiveNode(NodeId(3)));
+}
+
+TEST(MetaDataPublicationViewTest, CreatingRootIsRetainedOnceWithoutDirectives) {
+  meta::MetaStores stores;
+  meta::SubmitOperation root;
+  root.operation_id_ = Bytes<16>(0xab);
+  root.kind_ = meta::kMetaClusterCreateOperationKind;
+  root.intent_ = "creation root intent";
+  root.intent_hash_ = meta::MetaSha256(root.intent_);
+  ASSERT_TRUE(stores.operation_.SubmitOperation(root, 1).ok());
+  ASSERT_TRUE(stores.topology_
+                  .BeginClusterCreate(root.operation_id_, 2,
+                                      lavik::ClientMode::kCluster)
+                  .ok());
+  auto view = PublicationView(stores, 2);
+  ASSERT_EQ(view.operations().size(), 1u);
+  EXPECT_EQ(view.FindOperation(root.operation_id_)->intent_, root.intent_);
+  ASSERT_TRUE(stores.topology_.CompleteClusterCreate(root.operation_id_).ok());
+  EXPECT_TRUE(PublicationView(stores, 3).operations().empty());
+  EXPECT_EQ(view.FindOperation(root.operation_id_)->intent_, root.intent_);
+}
+
+TEST(MetaDataPublicationViewTest,
+     PublicationAndExactResultsSurviveCommitArchiveInstallAndTeardown) {
+  auto fixture = CompleteFixture();
+  auto opened = meta::MetaStateMachine::Open("");
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  auto machine = std::move(*opened);
+  auto image = fixture.stores.Serialize();
+  ASSERT_TRUE(image.ok()) << image.status();
+  ASSERT_TRUE(machine->Install(100, *image).ok());
+  const meta::MetaTerminalReceiptKey key{
+      fixture.operation_id, fixture.directive_id, fixture.attempt_id,
+      fixture.directive_revision};
+  const auto publication = machine->CaptureDataPublication();
+  const auto pending = machine->CaptureDirectiveResult(key);
+  ASSERT_TRUE(pending.operation_);
+  EXPECT_FALSE(pending.receipt_);
+  EXPECT_EQ(pending.cursor_.applied_index(), 100u);
+  EXPECT_EQ(*pending.operation_, publication.operations().front());
+
+  meta::CommitDirectiveResult result;
+  result.operation_id_ = fixture.operation_id;
+  result.directive_id_ = fixture.directive_id;
+  result.attempt_id_ = fixture.attempt_id;
+  result.directive_revision_ = fixture.directive_revision;
+  result.recipient_node_id_ = fixture.target;
+  result.recipient_boot_id_ = fixture.target_boot;
+  result.assignment_id_ = fixture.target_assignment;
+  result.status_ = meta::MetaDirectiveResultStatus::kSucceeded;
+  result.result_ = "ready";
+  auto encoded = meta::MetaStateMachine::EncodeCommand(result);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  machine->commit(101, **encoded);
+  const auto live = machine->CaptureDirectiveResult(key);
+  ASSERT_TRUE(live.receipt_);
+  EXPECT_FALSE(live.operation_);
+  EXPECT_EQ(live.receipt_->committed_index_, 101u);
+  EXPECT_EQ(machine->FindTerminalReceipt(key), live.receipt_);
+  EXPECT_TRUE(pending.operation_->terminal_receipts_.empty());
+  EXPECT_TRUE(publication.operations().front().terminal_receipts_.empty());
+
+  // The post-proposal query must survive archival between commit and ACK.
+  auto stores = machine->StoresSnapshot();
+  const auto operation = stores.operation_.FindOperation(fixture.operation_id);
+  ASSERT_TRUE(operation);
+  meta::CompleteOperation complete;
+  complete.operation_id_ = fixture.operation_id;
+  complete.expected_revision_ = operation->revision_;
+  ASSERT_TRUE(stores.operation_.CompleteOperation(complete).ok());
+  meta::ArchiveOperations archive;
+  archive.operation_seqs_ = {operation->operation_seq_};
+  ASSERT_TRUE(stores.operation_.ArchiveOperations(archive).ok());
+  image = stores.Serialize();
+  ASSERT_TRUE(image.ok()) << image.status();
+  machine->Advance(102);
+  EXPECT_EQ(machine->CaptureDataPublication().state_change_index(), 101u);
+  ASSERT_TRUE(machine->Install(102, *image).ok());
+  const auto archived = machine->CaptureDirectiveResult(key);
+  EXPECT_EQ(archived.receipt_, live.receipt_);
+  EXPECT_FALSE(archived.operation_);
+  EXPECT_EQ(machine->FindTerminalReceipt(key), live.receipt_);
+  EXPECT_TRUE(machine->CaptureDataPublication().operations().empty());
+  auto wrong_key = key;
+  ++wrong_key.directive_revision_;
+  const auto absent = machine->CaptureDirectiveResult(wrong_key);
+  EXPECT_FALSE(absent.receipt_);
+  EXPECT_FALSE(absent.operation_);
+  meta::PruneTerminalReceipts prune;
+  prune.receipts_ = {key};
+  ASSERT_TRUE(stores.operation_.PruneTerminalReceipts(prune).ok());
+  image = stores.Serialize();
+  ASSERT_TRUE(image.ok());
+  ASSERT_TRUE(machine->Install(103, *image).ok());
+  EXPECT_FALSE(machine->FindTerminalReceipt(key));
+  machine.reset();
+  EXPECT_EQ(archived.receipt_->committed_index_, 101u);
+  EXPECT_EQ(publication.state_change_index(), 100u);
+  EXPECT_EQ(publication.FindGroup("group-a")->record_.group_term_, 1u);
+  ASSERT_NE(publication.FindManifest(fixture.manifest_digest), nullptr);
+  EXPECT_EQ(publication.FindManifest(fixture.manifest_digest)->entries_.size(),
+            3u);
+}
 }  // namespace
