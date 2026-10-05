@@ -52,6 +52,7 @@ namespace lavik::meta {
 class MetaObservationStore;
 class MetaCommittedFacts;
 struct NodeControlBatch;
+struct MetaPrincipalIdentity;
 
 namespace detail {
 
@@ -213,6 +214,16 @@ class MetaDataPublicationViewCache {
   Loader loader_;
   std::shared_ptr<const MetaDataPublicationView> cached_;
 };
+
+// Rechecks the first Hello's service and authenticated identity against the
+// refreshed cut returned for the accepted directory and projection. The view
+// owns its data; tls_identity is borrowed only for this call (null: plaintext).
+absl::StatusOr<std::shared_ptr<const MetaDataPublicationView>>
+RefreshAcceptedDataPublication(
+    MetaDataPublicationViewCache& cache,
+    std::uint64_t minimum_state_change_index, std::string_view node_id,
+    const cluster::control::ServiceDeclaration& expected_service,
+    const MetaPrincipalIdentity* tls_identity);
 
 // Transfer chunks consult this predicate before rebuilding a node projection.
 // Recording an equivalent committed view makes the remaining chunks O(1)

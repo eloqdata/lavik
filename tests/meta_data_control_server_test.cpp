@@ -30,7 +30,9 @@
 #include "lavik/meta/control_projector.h"
 #include "lavik/meta/data_control_runtime_status.h"
 #include "lavik/meta/data_control_server.h"
+#include "lavik/meta/identity_verifier.h"
 #include "lavik/meta/observation_store.h"
+#include "lavik/meta/state_machine.h"
 
 namespace lavik::meta {
 
@@ -445,6 +447,101 @@ TEST(MetaDataPublicationViewCacheTest,
   EXPECT_EQ((*advanced)->state_change_index(), 3u);
   EXPECT_EQ((*installed)->state_change_index(), 10u);
   EXPECT_TRUE(TransferBoundaryNeedsProjectionValidation(3, 10, 3));
+}
+
+TEST(MetaDataPublicationHandshakeTest,
+     RetirementBetweenDiscoveryAndAcceptance) {
+  namespace meta = lavik::meta;
+  auto opened = meta::MetaStateMachine::Open("");
+  ASSERT_TRUE(opened.ok());
+  auto machine = std::move(*opened);
+  meta::RegisterNode registration;
+  registration.node_id_ = Identity('1');
+  registration.principal_ = "lavik://node/" + registration.node_id_;
+  registration.endpoints_ = {"tcp://127.0.0.1:6379"};
+  auto encoded = meta::MetaStateMachine::EncodeCommand(registration);
+  ASSERT_TRUE(encoded.ok());
+  ASSERT_NE(machine->commit(1, **encoded), nullptr);
+  MetaDataPublicationViewCache cache(
+      [&] { return machine->CaptureDataPublication(); });
+  auto discovery = cache.Get(1);
+  ASSERT_TRUE(discovery.ok());
+  ASSERT_TRUE((*discovery)->IsActiveNode(registration.node_id_));
+  meta::MetaPrincipalIdentity identity{registration.principal_,
+                                       meta::MetaPrincipalRole::kDataNode,
+                                       registration.node_id_};
+
+  // Commit after the first registry read, before the actual accepted-cut
+  // refresh used by SessionLoop. The retained discovery cut stays readable.
+  meta::RetireNode retire;
+  retire.node_id_ = registration.node_id_;
+  retire.expected_revision_ = 1;
+  encoded = meta::MetaStateMachine::EncodeCommand(retire);
+  ASSERT_TRUE(encoded.ok());
+  ASSERT_NE(machine->commit(2, **encoded), nullptr);
+  for (const auto* authenticated :
+       {&identity, static_cast<meta::MetaPrincipalIdentity*>(nullptr)}) {
+    auto accepted = meta::detail::RefreshAcceptedDataPublication(
+        cache, machine->state_change_index(), registration.node_id_, {},
+        authenticated);
+    EXPECT_EQ(accepted.status().code(), absl::StatusCode::kPermissionDenied);
+  }
+  EXPECT_TRUE((*discovery)->IsActiveNode(registration.node_id_));
+  EXPECT_TRUE((*cache.Get(2))->FindNode(registration.node_id_)->retired_);
+}
+
+TEST(MetaDataPublicationHandshakeTest,
+     RefreshBindsIdentityAndServiceToReturnedCut) {
+  namespace meta = lavik::meta;
+  MetaStores stores;
+  meta::RegisterNode registration;
+  registration.node_id_ = Identity('1');
+  registration.principal_ = "lavik://node/" + registration.node_id_;
+  registration.endpoints_ = {"tcp://127.0.0.1:6379"};
+  ASSERT_TRUE(stores.identity_.Apply(registration).ok());
+  std::uint64_t index = 1;
+  MetaDataPublicationViewCache cache([&] {
+    return meta::MetaDataPublicationView::FromStores(stores, {index, index});
+  });
+  auto discovery = cache.Get(1);
+  ASSERT_TRUE(discovery.ok());
+  const control::ServiceDeclaration discovered_service;
+  const auto root = Bytes<16>(0x21);
+  ASSERT_TRUE(
+      stores.topology_.BeginClusterCreate(root, 2, lavik::ClientMode::kCluster)
+          .ok());
+  index = 2;
+  auto stale = meta::detail::RefreshAcceptedDataPublication(
+      cache, index, registration.node_id_, discovered_service, nullptr);
+  EXPECT_EQ(stale.status().code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_FALSE((*discovery)->lifecycle().client_mode_);
+
+  const control::ServiceDeclaration current{lavik::ClientMode::kCluster, root,
+                                            2};
+  meta::MetaPrincipalIdentity wrong_binding{"lavik://node/" + Identity('2'),
+                                            meta::MetaPrincipalRole::kDataNode,
+                                            registration.node_id_};
+  EXPECT_EQ(meta::detail::RefreshAcceptedDataPublication(
+                cache, index, registration.node_id_, current, &wrong_binding)
+                .status()
+                .code(),
+            absl::StatusCode::kPermissionDenied);
+  wrong_binding.principal_ = registration.principal_;
+  wrong_binding.subject_id_ = Identity('2');
+  EXPECT_EQ(meta::detail::RefreshAcceptedDataPublication(
+                cache, index, registration.node_id_, current, &wrong_binding)
+                .status()
+                .code(),
+            absl::StatusCode::kPermissionDenied);
+  wrong_binding.subject_id_ = registration.node_id_;
+  auto accepted = meta::detail::RefreshAcceptedDataPublication(
+      cache, index, registration.node_id_, current, &wrong_binding);
+  ASSERT_TRUE(accepted.ok()) << accepted.status();
+  EXPECT_EQ(accepted->get(), cache.Get(index)->get());
+  EXPECT_EQ((*accepted)->state_change_index(), 2u);
+  EXPECT_EQ((*accepted)->lifecycle().root_operation_id_, root);
+  EXPECT_EQ((*accepted)->FindNode(registration.node_id_)->principal_,
+            registration.principal_);
 }
 
 TEST(MetaTransferBoundaryTest,

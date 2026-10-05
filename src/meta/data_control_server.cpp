@@ -533,6 +533,37 @@ control::ResultNoLongerTracked NoLongerTracked(
 
 }  // namespace
 
+absl::StatusOr<std::shared_ptr<const MetaDataPublicationView>>
+detail::RefreshAcceptedDataPublication(
+    MetaDataPublicationViewCache& cache,
+    std::uint64_t minimum_state_change_index, std::string_view node_id,
+    const control::ServiceDeclaration& expected_service,
+    const MetaPrincipalIdentity* tls_identity) {
+  auto captured = cache.Get(minimum_state_change_index);
+  if (!captured.ok()) return captured.status();
+  const auto& view = **captured;
+  const auto& lifecycle = view.lifecycle();
+  const control::ServiceDeclaration service{lifecycle.client_mode_,
+                                            lifecycle.root_operation_id_,
+                                            lifecycle.genesis_commit_index_};
+  if (service != expected_service) {
+    return absl::FailedPreconditionError(
+        "cluster service declaration changed during handshake");
+  }
+  const auto* node = view.FindNode(node_id);
+  if (node == nullptr || node->retired_) {
+    return absl::PermissionDeniedError(
+        "data node left the active committed registry during handshake");
+  }
+  if (tls_identity != nullptr &&
+      (tls_identity->subject_id_ != node_id ||
+       tls_identity->principal_ != node->principal_)) {
+    return absl::PermissionDeniedError(
+        "data-node certificate no longer matches its committed binding");
+  }
+  return *captured;
+}
+
 detail::MetaDataPublicationViewCache::MetaDataPublicationViewCache(
     Loader loader)
     : loader_(std::move(loader)) {}
@@ -3756,29 +3787,14 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
     co_return finish(
         absl::CancelledError("Meta leadership subscription is unavailable"));
   }
-  cached_view =
-      PublicationViewAtLeast(*core, core->coordinator_->CommittedHighWater());
-  if (!cached_view.ok()) co_return finish(cached_view.status());
-  view = *cached_view;
-  if (CommittedClientService(*view) != committed_service) {
-    co_return finish(absl::FailedPreconditionError(
-        "cluster service declaration changed during handshake"));
-  }
-
   // The first registry/directory read was sufficient for a follower redirect,
   // but an accepted session must bind its identity and Hello to the same
   // atomic view used by its initial desired-state projection.
-  const auto accepted_node = view->FindNode(node_id);
-  if (accepted_node == nullptr || accepted_node->retired_) {
-    co_return finish(absl::PermissionDeniedError(
-        "data node left the active committed registry during handshake"));
-  }
-  if (tls_identity.has_value() &&
-      (tls_identity->subject_id_ != node_id ||
-       tls_identity->principal_ != accepted_node->principal_)) {
-    co_return finish(absl::PermissionDeniedError(
-        "data-node certificate no longer matches its committed binding"));
-  }
+  cached_view = detail::RefreshAcceptedDataPublication(
+      *core->committed_view_cache_, core->coordinator_->CommittedHighWater(),
+      node_id, committed_service, tls_identity ? &*tls_identity : nullptr);
+  if (!cached_view.ok()) co_return finish(cached_view.status());
+  view = *cached_view;
   directory = BuildCommittedMetaDirectory(*view);
   if (!directory.ok()) co_return finish(directory.status());
   auto boot_id = ParseIdentity<20>(hello->boot_id, "data boot id");
