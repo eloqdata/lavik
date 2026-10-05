@@ -62,25 +62,37 @@ class MetaGateReadinessTest(unittest.TestCase):
         ]
         proxy = Mock()
         mesh = SimpleNamespace(proxy=lambda _id: proxy)
-        history = Mock()
+        history, probe_history = Mock(), Mock()
         with (
             patch.object(L.H, "max_committed", return_value=12),
-            patch.object(L.H, "find_leader", side_effect=nodes),
+            patch.object(L.H, "CommittedHistory", return_value=probe_history),
             patch.object(L.time, "sleep"),
         ):
             L.link_fault_round(nodes, mesh, history, nodes[0], nodes[0], "refuse", 0)
-        return nodes, history
+        return nodes, history, probe_history
 
     def test_healed_link_reselects_leader_after_not_leader(self):
-        nodes, history = self.run_link_fault(["ERR not-leader", "OK 13"])
+        nodes, history, probe_history = self.run_link_fault(["ERR not-leader", "OK 13"])
         for node in nodes:
-            node.propose.assert_called_once()
-        history.record.assert_called_once_with("op-2", "post-refuse")
+            node.propose.assert_called_once_with("post-refuse", timeout=1)
+        probe_history.record.assert_called_once_with("op-2", "post-refuse")
+        probe_history.check.assert_called_once_with(
+            nodes, timeout=30, desc="post-refuse probe"
+        )
+        history.record.assert_not_called()
         history.check.assert_called_once_with(nodes, timeout=30, desc="post-refuse")
+
+    def test_healed_link_reselects_after_cancelled_proposal(self):
+        nodes, history, probe_history = self.run_link_fault(["ERR cancelled", "OK 13"])
+        probe_history.record.assert_called_once_with("op-2", "post-refuse")
+        history.record.assert_not_called()
 
     def test_healed_link_does_not_hide_other_proposal_errors(self):
         for reply in ("ERR rejected", "ERR timeout", "ERR propose-failed"):
-            with self.subTest(reply=reply), self.assertRaisesRegex(L.H.Failure, reply):
+            with (
+                self.subTest(reply=reply),
+                self.assertRaisesRegex(AssertionError, reply),
+            ):
                 self.run_link_fault([reply])
 
     def test_healed_link_requires_progress_before_deadline(self):
@@ -96,17 +108,19 @@ class MetaGateReadinessTest(unittest.TestCase):
             is_leader=lambda: True,
             propose=Mock(return_value=("uncertain-op", "ERR not-leader")),
         )
-        history = Mock()
+        history, probe_history = Mock(), Mock()
         with (
             patch.object(L.H, "max_committed", return_value=12),
-            patch.object(L.H, "find_leader", return_value=node),
+            patch.object(L.H, "CommittedHistory", return_value=probe_history),
             patch.object(L.time, "monotonic", side_effect=lambda: now),
             patch.object(L.time, "sleep", side_effect=sleep),
-            self.assertRaisesRegex(L.H.Failure, "no acknowledged proposal within 20s"),
+            self.assertRaisesRegex(L.H.Failure, "a fresh write commits"),
         ):
             L.link_fault_round([node], Mock(), history, node, node, "refuse", 0)
         history.record.assert_not_called()
         history.check.assert_not_called()
+        probe_history.record.assert_not_called()
+        probe_history.check.assert_not_called()
 
 
 if __name__ == "__main__":

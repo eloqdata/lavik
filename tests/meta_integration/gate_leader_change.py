@@ -251,24 +251,30 @@ def link_fault_round(nodes, mesh, history, leader, follower, mode, hold_s):
     H.wait_until(
         f"post-{mode}: committed >= {pre}", 20, lambda: H.max_committed(nodes) >= pre
     )
-    # Healing an asymmetric fault can leave higher-term traffic in flight.
-    # A status read does not reserve leadership for the following proposal.
-    # Require an acknowledged write within the existing recovery budget, and
-    # reselect only for the expected leadership race, not arbitrary errors.
-    deadline = time.monotonic() + 20
-    while time.monotonic() < deadline:
-        current = H.find_leader(nodes, timeout=deadline - time.monotonic())
-        # Each attempt uses a fresh operation id. If only submitop committed
-        # before demotion, its uncertain completion is not counted as success.
-        op_id, reply = current.propose(f"post-{mode}")
-        if reply.startswith("OK "):
-            history.record(op_id, f"post-{mode}")
-            break
-        if reply != "ERR not-leader":
-            raise H.Failure(f"post-{mode}: propose: {reply}")
-        time.sleep(0.05)
-    else:
-        raise H.Failure(f"post-{mode}: no acknowledged proposal within 20s")
+
+    # Healing can trigger another election after a status probe observed a
+    # leader. The recovery boundary is a committed write, not that stale probe;
+    # keep rediscovering within a bounded window. Use a separate history for
+    # this probe: CommittedHistory's convergence probe relies on one writer's
+    # insertion order, while the background load is still recording writes.
+    probe_history = H.CommittedHistory()
+
+    def propose_after_heal():
+        for current in nodes:
+            if not current.alive() or not current.is_leader():
+                continue
+            op_id, reply = current.propose(f"post-{mode}", timeout=1)
+            if reply.startswith("OK "):
+                probe_history.record(op_id, f"post-{mode}")
+                return True
+            if reply not in ("ERR not-leader", "ERR cancelled"):
+                # wait_until tolerates transport failures, but an unexpected
+                # protocol rejection is not a leadership transition.
+                raise AssertionError(f"post-{mode}: propose: {reply}")
+        return False
+
+    H.wait_until(f"post-{mode}: a fresh write commits", 20, propose_after_heal)
+    probe_history.check(nodes, timeout=30, desc=f"post-{mode} probe")
     history.check(nodes, timeout=30, desc=f"post-{mode}")
     H.log(f"link fault {mode}: cluster recovered, history intact")
 
