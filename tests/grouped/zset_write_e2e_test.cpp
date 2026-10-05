@@ -150,34 +150,48 @@ TEST(GroupedSortedSetWriteE2e,
     ASSERT_EQ(client.Command({"ZINCRBY", key, "2", member(101)}).text_, "103");
     ASSERT_EQ(client.Command({"ZADD", key, "500", member(256)}).text_, "1");
     ASSERT_EQ(client.Command({"ZREM", key, member(100)}).text_, "1");
-    {
-      ScopedEnvironment page_key("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key.c_str());
-      ScopedEnvironment page_number("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", "1");
-      // The initial ordered lookup must supply the same-page after-image.
-      // Cross-page and batch changes still use checked planner reads, and a
-      // failure there must not update either graph or consume the old score.
-      EXPECT_EQ(client.Command({"ZINCRBY", key, "0.5", member(1)}).text_,
-                "1.5");
-      for (const auto& command : std::vector<std::vector<std::string>>{
-               {"ZINCRBY", key, "10000", member(1)},
-               {"ZADD", key, "900", member(1), "901", member(2)}}) {
-        const auto failed = client.Command(command);
-        EXPECT_EQ(failed.kind_, '-');
-        EXPECT_NE(failed.text_.find("plan page read failure"),
-                  std::string::npos);
-        EXPECT_EQ(client.Command({"ZSCORE", key, member(1)}).text_, "1.5");
-        EXPECT_EQ(client.Command({"ZSCORE", key, member(2)}).text_, "2");
-      }
-      ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
-      ASSERT_EQ(client.Command({"ZINCRBY", key, "-0.25", member(1)}).text_,
-                "QUEUED");
-      ASSERT_EQ(client.Command({"ZINCRBY", key, "-0.25", member(1)}).text_,
-                "QUEUED");
-      const auto executed = client.Command({"EXEC"});
-      ASSERT_EQ(executed.items_.size(), 2);
-      EXPECT_EQ(executed.items_[0].text_, "1.25");
-      EXPECT_EQ(executed.items_[1].text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    // Server is a child process: configure every fault before it starts.
+    // Changing the parent's environment cannot enable a hook in a live child.
+    ScopedEnvironment fault("LAVIK_FAIL_ZSET_MEMBER_LEAF_READ_KEY",
+                            key.c_str());
+    ScopedEnvironment page_key("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key.c_str());
+    ScopedEnvironment page_number("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", "1");
+    Server server(disk, 3);
+    Client client(server.port());
+    // The initial ordered lookup must supply the same-page after-image.
+    // Cross-page and batch changes still use checked planner reads, and a
+    // failure there must not update either graph or consume the old score.
+    EXPECT_EQ(client.Command({"ZINCRBY", key, "0.5", member(1)}).text_, "1.5");
+    for (const auto& command : std::vector<std::vector<std::string>>{
+             {"ZINCRBY", key, "10000", member(1)},
+             {"ZADD", key, "900", member(1), "901", member(2)}}) {
+      const auto failed = client.Command(command);
+      EXPECT_EQ(failed.kind_, '-');
+      EXPECT_NE(failed.text_.find("plan page read failure"), std::string::npos);
+      EXPECT_EQ(client.Command({"ZSCORE", key, member(1)}).text_, "1.5");
+      EXPECT_EQ(client.Command({"ZSCORE", key, member(2)}).text_, "2");
     }
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "-0.25", member(1)}).text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "-0.25", member(1)}).text_,
+              "QUEUED");
+    const auto executed = client.Command({"EXEC"});
+    ASSERT_EQ(executed.items_.size(), 2);
+    EXPECT_EQ(executed.items_[0].text_, "1.25");
+    EXPECT_EQ(executed.items_[1].text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    ScopedEnvironment fault("LAVIK_FAIL_ZSET_MEMBER_LEAF_READ_KEY",
+                            key.c_str());
+    Server server(disk, 3);
+    Client client(server.port());
     // Multi-member writes keep bounded sequential lookup and the ordinary
     // prepare read. Failure after planning must leave both graphs unchanged.
     const auto failed =
