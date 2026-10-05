@@ -407,9 +407,11 @@ Recovery proceeds as follows:
 5. Each key owner chooses the highest mutation sequence. Equal sequences are
    physical relocation copies of one logical version, so the higher physical
    LSN wins. Recovery also rebuilds whether the winner shields an older,
-   potentially live value.
+   potentially live value. Grouped winners then undergo
+   [graph reconstruction](09-grouped-collections.md#recovery-reclamation-and-snapshots),
+   including its expired-root exception, before live-byte accounting.
 6. A second cross-worker pass walks each in-memory winner index once and
-   charges every winning root and referenced extent exactly once to its
+   charges every surviving root and referenced extent exactly once to its
    physical block owner. A resumable stable cursor pauses at the same
    process-wide byte target divided across workers, applies the per-owner
    batches, and then continues at the next entry; it neither rescans storage
@@ -831,22 +833,18 @@ not governed by the finite capability or this pause: its authority is the
 completeness and availability of the local physical population, independently
 of request-serving authority.
 
-The preferred deletion is a durable tombstone, which remains safe if the wall
-clock later moves backward. If foreground space is completely exhausted, an
-unshielded expired value can be removed only from memory and physical live-byte
-accounting; its on-disk deadline still makes it expired at ordinary recovery
-time, and the freed blocks can restore write capacity. For grouped values,
-the root and side view leave the indexes together and the complete auxiliary
-graph is retired; UUIDs remain dependencies of their source record blocks.
-A shielding value cannot use this escape valve because an older durable value
-could reappear. A surviving expired root can consequently name an incomplete
-grouped graph. Recovery still selects that root first; with expiration
-authority, an unshielded graph that cannot be reconstructed is discarded and
-queued for a fresh tombstone after allocator recovery. If space remains
-exhausted, the same unshielded escape valve applies. Live and shielding roots
-retain strict graph validation. The exception relies on the expired deadline:
-a clock rollback before durable deletion can make the incomplete graph
-unrecoverable; it does not authorize returning an older live version.
+Deletion normally publishes a durable tombstone before retiring the value,
+remaining safe across wall-clock rollback. If foreground space is exhausted,
+runtime expiration and startup cleanup may instead remove an unshielded expired
+value from the indexes and live-byte accounting to restore write capacity.
+Shielding values require a tombstone because an older durable value could
+otherwise reappear. For grouped values, the root and side view leave the
+indexes together and the auxiliary graph is retired; UUIDs remain dependencies
+of their source record blocks. A surviving root can therefore name reclaimed
+children; [grouped recovery](09-grouped-collections.md#recovery-reclamation-and-snapshots)
+defines when that incomplete graph may be discarded. This full-device exception
+relies on the on-disk deadline: clock rollback before durable deletion can make
+the graph unrecoverable, but never authorizes returning an older live version.
 
 Storage owns one permanent Tomb Raider scheduler on worker zero. The scheduler
 checks the configured schedule and local population gate before admitting a

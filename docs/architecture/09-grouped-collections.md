@@ -404,17 +404,20 @@ restricts writes to changed pages and structural neighbours.
 Cold scanning gathers roots and auxiliary candidates separately. After
 transaction adjudication and root selection, recovery reconstructs each
 winning incarnation, including retained parent markers, and checks routing
-coverage and aggregate counts. An expired, unshielded winner can retain an
-incomplete graph after full-device expiration reclaimed its children. When
-startup holds expiration authority, a graph reconstruction data-loss result
-for that winner discards its remaining graph and queues a fresh durable
-tombstone before serving; it does not select an older root. Live or shielding
-winners, roots without expiration authority, and admission or I/O failures
-still fail recovery. Complete expired graphs follow ordinary accounting and
-durable deletion. Only reachable external group payloads are validated: an obsolete inline-key group's value extents may already have been
-reclaimed while its records block is still scannable. UUID references remain
-source-block dependencies so classification can still resolve the original key. Every live group, root and extent joins physical-owner
-accounting before orphan reclamation.
+coverage and aggregate counts. Under the
+[full-device expiration policy](04-storage-and-recovery.md#expiry-and-tombstones),
+a graph reconstruction data-loss result may discard only an expired,
+unshielded winner, and only with startup expiration authority. Recovery never
+falls back to an older root. It queues a tombstone for append after allocator
+recovery and before serving, subject to the same full-device policy. All other
+reconstruction errors remain fatal; complete expired graphs retain ordinary
+accounting and deletion.
+
+Only reachable external group payloads are validated: an obsolete inline-key
+group's value extents may already have been reclaimed while its records block
+is still scannable. UUID references remain source-block dependencies so
+classification can still resolve the original key. Every live group, root and
+extent joins physical-owner accounting before orphan reclamation.
 
 For indexed Sorted Sets, reconstruction requires both complete directories
 and validates reachable member snapshots and extent checksums as well as the
