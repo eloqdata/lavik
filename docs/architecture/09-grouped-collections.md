@@ -372,8 +372,9 @@ seek their candidate interval using resident score bounds, then read matching
 pages in physical order. Range, rank, count, scan, random and pop selection
 borrow member bytes from one owned read lease and validate complete page
 framing, ordering and uniqueness before consumption. Replies copy only
-admitted output members. Mutation source and boundary probes, and rewrite
-planning, use owned snapshots.
+admitted output members. Mutation source and boundary probes borrow checked
+ordered-page views, retaining only scores and page positions after each lease
+ends. Rewrite planning uses owned snapshots.
 Mixed-score BYLEX preserves global member ordering without a resident member
 index by repeatedly selecting
 the next member: its work can scale with the collection size times the offset

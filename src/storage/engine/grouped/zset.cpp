@@ -17,7 +17,6 @@
 #include <cmath>
 #include <map>
 #include <set>
-#include <type_traits>
 
 #include "../impl.h"
 #include "lavik/glob.h"
@@ -850,10 +849,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   };
   // A scan retains one physical read lease and borrowed member views.
   // Keep scratch admitted until both disappear; replies own separate copies.
-  using OwnedScanPage = AdmittedScanPage<LoadedOrderedGroup>;
-  auto read_page_impl =
-      [&]<typename Page>(
-          std::size_t i) -> Task<absl::StatusOr<AdmittedScanPage<Page>>> {
+  using ScanPage = AdmittedScanPage<LoadedSortedSetPage>;
+  auto read_page = [&](std::size_t i) -> Task<absl::StatusOr<ScanPage>> {
     LAVIK_FAULT_INJECT(
         // An optional one-based directory page isolates routing tests from
         // the existing fail-all-ordered-reads member-index test.
@@ -873,25 +870,10 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     if (!checked.ok()) co_return checked;
     auto admission = budget.Reserve(2);
     if (!admission.ok()) co_return admission.status();
-    auto load = [&] {
-      if constexpr (std::is_same_v<Page, LoadedSortedSetPage>)
-        return LoadSortedSetPage(store, partition, db_id, key, digest, object,
-                                 metadata[i].id_);
-      else
-        return LoadOrderedGroupSnapshot(store, partition, db_id, key, digest,
-                                        object, metadata[i].id_);
-    };
-    auto page = co_await load();
+    auto page = co_await LoadSortedSetPage(store, partition, db_id, key, digest,
+                                           object, metadata[i].id_);
     if (!page.ok()) co_return page.status();
-    co_return AdmittedScanPage<Page>{std::move(*admission), std::move(*page)};
-  };
-  auto read_page = [&](std::size_t i) {
-    return read_page_impl.template operator()<LoadedSortedSetPage>(i);
-  };
-  // Mutation probes own their entries, releasing physical leases before
-  // routing. Both wrappers return the loader task without another coroutine.
-  auto read_owned_page = [&](std::size_t i) {
-    return read_page_impl.template operator()<LoadedOrderedGroup>(i);
+    co_return ScanPage{std::move(*admission), std::move(*page)};
   };
   auto remove_selected = [&]() -> Task<absl::Status> {
     const auto count = result.members_.size();
@@ -1201,9 +1183,12 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   for (const auto& [first, end] : source_ranges) {
     for (std::size_t i = std::max(first, scanned_end);
          i < end && (!indexed || remaining_sources != 0); ++i) {
-      auto page = co_await read_owned_page(i);
+      auto page = co_await read_page(i);
       if (!page.ok()) co_return page.status();
-      for (const auto& entry : page->page_.snapshot_.entries_) {
+      // Probes retain only scores and page ordinals in request-owned state.
+      // Borrow member bytes for matching, then release this lease before the
+      // next page read; rewrite preparation loads its own mutable snapshots.
+      for (const auto& entry : page->page_.entries_) {
         auto member = members.find(entry.value_);
         if (member == members.end()) continue;
         auto& state = member->second;
@@ -1266,18 +1251,20 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     i = std::max(
         i, std::min(directory.LowerBoundScore(*pending[next].second->after_),
                     metadata.size() - 1));
-    std::optional<OwnedScanPage> boundary;
+    std::optional<ScanPage> boundary;
     while (next != pending.size()) {
       const auto& [member, state] = pending[next];
       if (i + 1 != metadata.size()) {
         if (*state->after_ > metadata[i].max_score_) break;
         if (*state->after_ == metadata[i].max_score_) {
           if (!boundary) {
-            auto page = co_await read_owned_page(i);
+            auto page = co_await read_page(i);
             if (!page.ok()) co_return page.status();
             boundary.emplace(std::move(*page));
           }
-          if (member > boundary->page_.snapshot_.entries_.back().value_) break;
+          // Keep the lease through comparisons for this destination page;
+          // no boundary member view escapes into the mutation plan.
+          if (member > boundary->page_.entries_.back().value_) break;
         }
       }
       state->destination_ = i;

@@ -466,15 +466,18 @@ TEST(GroupedSortedSetWriteE2e, ScoreBoundsSkipUnrelatedPagesAfterRecovery) {
   EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
-TEST(GroupedSortedSetWriteE2e, ScoreBoundsHandleLongTieRunsAndMixedBatchMoves) {
+void CheckScoreBoundsTieMoves(std::size_t member_bytes) {
   PrivateDisk disk;
   std::vector<std::string> members;
   std::map<std::string, double> expected;
   std::vector<std::string> seed{"ZADD", "ties"};
   for (unsigned i = 0; i < 64; ++i) {
-    // Every member exceeds the page target: the equal-score run necessarily
-    // spans many pages, rather than only exercising a page-local tie search.
-    members.push_back(std::to_string(1000 + i) + std::string(20 * 1024, 'x'));
+    // Distinguishing bytes follow a NUL so both source matching and tie
+    // routing must compare the complete binary member. The large variant
+    // puts each member beyond the page target; the small variant also checks
+    // several members sharing one borrowed page lease.
+    members.push_back(std::string("tie\0", 4) + std::to_string(1000 + i) +
+                      std::string(member_bytes, 'x'));
     const double score = i < 8 ? -1 : i < 56 ? 7 : 20;
     expected[members.back()] = score;
     seed.push_back(std::to_string(score));
@@ -493,6 +496,12 @@ TEST(GroupedSortedSetWriteE2e, ScoreBoundsHandleLongTieRunsAndMixedBatchMoves) {
       EXPECT_EQ(all.items_[2 * i].text_, sorted[i].second) << "rank " << i;
       EXPECT_EQ(std::stod(all.items_[2 * i + 1].text_), sorted[i].first);
     }
+    std::vector<std::string> lookup{"ZMSCORE", "ties"};
+    for (const auto& [score, member] : sorted) lookup.push_back(member);
+    const auto scores = client.Command(lookup);
+    ASSERT_EQ(scores.items_.size(), sorted.size()) << scores.text_;
+    for (std::size_t i = 0; i < sorted.size(); ++i)
+      EXPECT_EQ(std::stod(scores.items_[i].text_), sorted[i].first);
     const auto tied = client.Command({"ZRANGEBYSCORE", "ties", "7", "7"});
     std::vector<std::string> at_seven;
     std::size_t above_seven = 0;
@@ -566,6 +575,15 @@ TEST(GroupedSortedSetWriteE2e, ScoreBoundsHandleLongTieRunsAndMixedBatchMoves) {
             "1");
   expected[members[48]] = 6.5;
   check(client);
+}
+
+TEST(GroupedSortedSetWriteE2e, ScoreBoundsHandleLongTieRunsAndMixedBatchMoves) {
+  CheckScoreBoundsTieMoves(20 * 1024);
+}
+
+TEST(GroupedSortedSetWriteE2e, WriteProbesPreserveBinaryMembersWithinPages) {
+  // Stay above grouped promotion while retaining many entries per page.
+  CheckScoreBoundsTieMoves(512);
 }
 
 TEST(GroupedSortedSetWriteE2e, ScoreBoundsRecoverAfterMultiExtentParentKey) {
