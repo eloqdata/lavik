@@ -1,0 +1,55 @@
+[gate-leader-change] node 1 started (pid 4160916, raft 38053, ctl /mnt/local_nvme/i131/data/meta_integration_leader_h8grp291/node1/meta-admin.sock,127.0.0.1:51405, initial_manifest=True, attempt 1)
+[gate-leader-change] node 1 is leader
+[gate-leader-change] node 1: clean exit 0
+[gate-leader-change] node 1 started (pid 4160933, raft 54743, ctl /mnt/local_nvme/i131/data/meta_integration_leader_h8grp291/node1/meta-admin.sock,127.0.0.1:51405, initial_manifest=False, attempt 1)
+[gate-leader-change] node 1 is leader
+[gate-leader-change] node 2 started (pid 4160954, raft 46667, ctl /mnt/local_nvme/i131/data/meta_integration_leader_h8grp291/node2/meta-admin.sock,127.0.0.1:47997, initial_manifest=False, attempt 1)
+[gate-leader-change] node 2 joined (probe idx 15)
+[gate-leader-change] node 3 started (pid 4160983, raft 34559, ctl /mnt/local_nvme/i131/data/meta_integration_leader_h8grp291/node3/meta-admin.sock,127.0.0.1:51789, initial_manifest=False, attempt 1)
+[gate-leader-change] node 3 joined (probe idx 26)
+[gate-leader-change] 3-node meshed cluster converged
+[gate-leader-change] post-setup: 1 operations verified on 3 node(s)
+[gate-leader-change] load running (29 writes OK)
+[gate-leader-change] node 1 is leader
+[gate-leader-change] round1: killing leader node 1 (cluster committed=88)
+[gate-leader-change] node 1: SIGKILL
+[gate-leader-change] node 3 is leader
+[gate-leader-change] round1: node 3 elected in 0.62s
+[gate-leader-change] round1: propose resumed (idx 93)
+[gate-leader-change] round1: [raft-cb] trail verified (node 3 BecomeLeader term=4, node 2 observed term >= 4, victim node 1 BecomeLeader term=3)
+[gate-leader-change] node 1 started (pid 4161043, raft 54743, ctl /mnt/local_nvme/i131/data/meta_integration_leader_h8grp291/node1/meta-admin.sock,127.0.0.1:51405, initial_manifest=False, attempt 1)
+[gate-leader-change] node 1 restart catch-up: 33 operations verified on 3 node(s)
+[gate-leader-change] node 1 restarted and caught up (post-restart Raft term >= 4 verified)
+[gate-leader-change] node 3 is leader
+[gate-leader-change] round2: killing leader node 3 (cluster committed=107)
+[gate-leader-change] node 3: SIGKILL
+[gate-leader-change] node 2 is leader
+[gate-leader-change] round2: node 2 elected in 0.45s
+[gate-leader-change] round2: propose resumed (idx 114)
+[gate-leader-change] round2: [raft-cb] trail verified (node 2 BecomeLeader term=5, node 1 observed term >= 5, victim node 3 BecomeLeader term=4)
+[gate-leader-change] node 3 started (pid 4161077, raft 34559, ctl /mnt/local_nvme/i131/data/meta_integration_leader_h8grp291/node3/meta-admin.sock,127.0.0.1:51789, initial_manifest=False, attempt 1)
+[gate-leader-change] node 3 restart catch-up: 41 operations verified on 3 node(s)
+[gate-leader-change] node 3 restarted and caught up (post-restart Raft term >= 5 verified)
+[gate-leader-change] after two failovers: 44 operations verified on 3 node(s)
+[gate-leader-change] node 2 is leader
+[gate-leader-change] link fault: delay (250ms/chunk) on node 1 inbound for 2.0s (committed=126)
+[gate-leader-change] post-delay probe: 1 operations verified on 3 node(s)
+[gate-leader-change] post-delay: 85 operations verified on 3 node(s)
+[gate-leader-change] link fault delay: cluster recovered, history intact
+[gate-leader-change] link fault: drop (half-open blackhole) on node 1 inbound for 1.5s (committed=223)
+[gate-leader-change] post-drop probe: 1 operations verified on 3 node(s)
+[gate-leader-change] post-drop: 118 operations verified on 3 node(s)
+[gate-leader-change] link fault drop: cluster recovered, history intact
+[gate-leader-change] link fault: refuse (connection refused) on node 1 inbound for 1.0s (committed=285)
+[gate-leader-change] post-refuse probe: 1 operations verified on 3 node(s)
+[gate-leader-change] post-refuse: 131 operations verified on 3 node(s)
+[gate-leader-change] link fault refuse: cluster recovered, history intact
+[gate-leader-change] proxy n1: 66954 bytes forwarded
+[gate-leader-change] proxy n2: 49259 bytes forwarded
+[gate-leader-change] proxy n3: 76887 bytes forwarded
+[gate-leader-change] load lc: ok=143 errors: =1, cancelled=1, io=1, not-leader=1
+[gate-leader-change] final: 144 operations verified on 3 node(s)
+[gate-leader-change] node 1: clean exit 0
+[gate-leader-change] node 2: clean exit 0
+[gate-leader-change] node 3: clean exit 0
+[gate-leader-change] PASS in 15.3s

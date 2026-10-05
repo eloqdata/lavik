@@ -118,5 +118,25 @@
     "file": "leader-after-10.log",
     "bytes": 4515,
     "sha256": "b2ef98ae2f8fdd3a6d47536b96c8ca7816271330d500c66a5c67405c4f432748"
+  },
+  {
+    "file": "upstream-regressions.log",
+    "bytes": 841,
+    "sha256": "bc4a1b9461a2196d9dcd3561a01a76968622ba1dede96e5a3a40d64136d86c41"
+  },
+  {
+    "file": "leader-upstream-1.log",
+    "bytes": 4342,
+    "sha256": "69f7f18adc6c989910dd3b22188edb136d1bdae3fb9a20a23eb9f15ad3e5df08"
+  },
+  {
+    "file": "leader-upstream-2.log",
+    "bytes": 4312,
+    "sha256": "880085b9596af8142a58aba0e0f371f1d69e06b61834c66af9d5017a8ddde445"
+  },
+  {
+    "file": "leader-upstream-3.log",
+    "bytes": 4342,
+    "sha256": "8b1fa26d5390700e40e26f331bd474141243051d62b9513160cc9a19b1d117d7"
   }
 ]
