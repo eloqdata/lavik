@@ -2287,6 +2287,13 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
         !sent.ok()) {
       co_return sent;
     }
+    LAVIK_FAULT_INJECT({
+      // Exercise a real committed-view replacement after one visible chunk,
+      // before the next validation can authorize any TransferEnd.
+      auto paused = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_TEST_META_PUBLICATION_CHUNK_HOLD_FILE");
+      if (!paused.ok()) co_return paused;
+    });
     boundary = co_await CheckLiveTransferBoundary(state, installed, replacement,
                                                   publication_cut);
     if (!boundary.ok()) {

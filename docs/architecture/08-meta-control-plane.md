@@ -483,8 +483,13 @@ manifest-declared children, including missing/archive distinctions. Membership
 retains its active operation and the bindings named by its durable intent;
 initial binding reconciliation retains the entire Meta directory. Selected
 operations remain whole records so directive payloads, revisions and exact
-receipts preserve their recovery meaning. Other readers can still use the
-complete `CommittedView`.
+receipts preserve their recovery meaning. Data publication captures a complete
+routing and identity domain, current Authority Lease Policy, operations with
+current directives and the Creating root, and referenced manifest documents.
+It excludes unrelated operation/archive payloads, Policy history, and audit.
+Selected whole operations preserve cross-recipient source authorization and
+its exact receipt identity. Other readers can still use the complete
+`CommittedView`.
 
 Committed subscribers atomically receive an initial full or purpose-specific
 view, its command-event cursor, and a bounded ordered subscription. Consumers
@@ -684,7 +689,12 @@ installs control state or executes directives. TCP reachability is not session
 success: authentication, redirects, projection installation and heartbeat/lease
 validation remain required, and their deadlines remain session-local.
 
-`MetaControlProjector` reads one atomic committed view. Initial connection and
+`MetaControlProjector` reads an owned `MetaDataPublicationView`. One worker-local
+immutable cache shares each state cut across Data sessions, including bootstrap,
+redirect, identity/configuration checks and heartbeat observation facts. The
+leader subscription's initial view enters that cache directly; retained views
+survive later apply and snapshot installation. Initial session identity,
+service declaration and projection use the same cut. Initial connection and
 reconnection receive a complete `FullDesiredState` containing cluster discovery,
 Group state, referenced manifests, resolved lease duration, and the recipient's
 current tasks. Data selects its own control state and releases that input.
@@ -736,10 +746,14 @@ fresh bootstrap and does not depend on retained delta history. Protocol v1
 layouts evolve in place for fresh clusters, without migration or mixed-version
 negotiation.
 
-Each publication retains its own validated committed high-water, separate from
-the installed projection's cursor. Transfer boundaries and final adoption reuse
-that proof until a newer commit arrives, so delivering one object does not
-repeatedly rebuild and encode the same manifests on the heartbeat worker.
+Each publication retains its own validated committed cut, separate from the
+installed projection's cursor. Cache and authority freshness use the
+state-change watermark; wire revisions and runtime readiness retain the paired
+applied index. Configuration-only Advance can move applied ahead of state, so
+an Install at that applied index must still invalidate an older state proof.
+Transfer boundaries and final adoption reuse the proof until the state watermark
+advances, so delivering one object does not repeatedly rebuild and encode the
+same manifests on the heartbeat worker.
 
 The Data-control wire protocol has a fixed versioned header, per-direction
 sequence, payload length, and CRC32C. Frames are bounded to 16 KiB. Larger
@@ -960,7 +974,10 @@ responses. Pending results, including the in-flight front item, have both a
 per-session count/capacity bound and a server-wide retained-byte budget. Full
 queues close the session without waiting for capacity; Data retains and replays
 unacknowledged results on reconnect. The consumer validates each result against
-fresh committed state and acknowledges only the exact durable receipt. On
+one atomic exact-key capture of a live/archive receipt or, when absent, its
+live operation. After proposal completion it queries only that receipt key;
+archival preserves the original acknowledgement and conflict semantics. Neither
+read refreshes the publication cache. On
 disconnect, demotion, or shutdown, the session discards unsubmitted results and
 drains its accepted proposal to completion or the coordinator's bounded timeout.
 It joins the consumer before releasing transport or term-owned state. A retired
@@ -1494,7 +1511,7 @@ audit history rather than replacing it.
 | Volatile candidate/failover observations and deterministic compatibility-domain plan selection | `include/lavik/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/lavik/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
 | Owned observation-facts cuts, index-only captures, and atomic subscription registration | `include/lavik/meta/observation_facts_view.h`, `src/meta/observation_facts_view.cpp`, `src/meta/state_machine.cpp`, `src/meta/coordinator.cpp` |
 | Command-specific proposal cuts, live-operation headers, and the same-cut full recovery exception | `include/lavik/meta/proposal_view.h`, `src/meta/proposal_view.cpp`, `src/meta/operation_store.cpp`, `src/meta/state_machine.cpp`, `src/meta/coordinator.cpp` |
-| Pure per-node projection including resolved lease duration, Data-derived heartbeat cadence, and failover/activation/follow-owner state, plus the leader-scoped Data-session publisher and causal heartbeat admission | `include/lavik/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/lavik/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
+| Shared owned Data publication cuts and pure per-node projection including resolved lease duration, Data-derived heartbeat cadence, and failover/activation/follow-owner state, plus the leader-scoped Data-session publisher and causal heartbeat admission | `include/lavik/meta/data_publication_view.h`, `src/meta/data_publication_view.cpp`, `include/lavik/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/lavik/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
 | Manifest-bootstrapped initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `raft/engine/storage.go`, `raft/engine/join.go`, `app/lavik_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |
 | Owned creation/membership planning cuts and exact child recovery | `include/lavik/meta/workflow_views.h`, `src/meta/state_machine.cpp`, `src/meta/cluster_create_reconciler.cpp`, `src/meta/membership_reconciler.cpp` |
 | Atomic Genesis lifecycle, strict Bootstrap Policy Defaults, durable creation admission, Meta catch-up barrier, and leader-owned recovery | `include/lavik/meta/cluster_create.h`, `src/meta/cluster_create.cpp`, `include/lavik/meta/topology_store.h`, `src/meta/topology_store.cpp`, `src/meta/state_apply.cpp`, `src/meta/ctl_server.cpp`, `include/lavik/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `app/lavik_meta.cpp` |
