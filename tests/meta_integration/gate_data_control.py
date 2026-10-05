@@ -344,7 +344,20 @@ def commit_service_mode(leader, metas):
     request = C.create_request(
         metas, "f" * 40, f"tcp://127.0.0.1:{H.free_port()}", "bootstrap-group"
     )
-    expect_ok(leader.ctl(request), "commit cluster client mode")
+    # Election can finish before initial identity reconciliation releases the
+    # membership gate. This exact refusal precedes any proposal, so retrying
+    # the same request is safe; other errors may have an uncertain outcome.
+    busy = (
+        "ERR clustercreate 1 preflight pre-commit-failed "
+        "another cluster creation or Meta membership change is in progress"
+    )
+    deadline = time.monotonic() + 10
+    while True:
+        reply = leader.ctl(request)
+        if reply != busy or time.monotonic() >= deadline:
+            expect_ok(reply, "commit cluster client mode")
+            return
+        time.sleep(0.05)
 
 
 def seed_assigned_authority(leader, data):
