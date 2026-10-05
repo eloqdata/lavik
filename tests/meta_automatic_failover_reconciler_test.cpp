@@ -962,6 +962,36 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 }
 
 TEST_F(MetaAutomaticFailoverReconcilerTest,
+       InstallAtSameAppliedIndexRefreshesDetectorPolicy) {
+  SeedCluster();
+  std::atomic<int> generated_ids{0};
+  InstallReconciler(CountingIds(generated_ids));
+  StartEligibleTerm();
+  ASSERT_TRUE(WaitForLeadershipWarmup());
+  const auto before = machine_->last_commit_index();
+  machine_->Advance(before + 1);
+  ASSERT_TRUE(WaitUntil([&] {
+    return diagnostics_->Snapshot().evaluated_applied_index_ == before + 1;
+  }));
+  auto stores = machine_->StoresSnapshot();
+  PutPolicy policy;
+  policy.policy_id_ = kAutomaticUncontrolledFailoverPolicyId;
+  policy.version_ = 2;
+  policy.content_ =
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":2000})";
+  ASSERT_TRUE(stores.policy_.Apply(policy).ok());
+  const auto image = stores.Serialize();
+  ASSERT_TRUE(image.ok()) << image.status();
+  ASSERT_TRUE(machine_->Install(before + 1, *image).ok());
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.anchor_.automatic_failover_policy_version_ == 2;
+  }));
+  EXPECT_EQ(diagnostics_->Snapshot().evaluated_applied_index_, before + 1);
+  EXPECT_EQ(GroupStatus().effective_threshold_ms_, 2000u);
+  EXPECT_EQ(generated_ids.load(), 0);
+}
+
+TEST_F(MetaAutomaticFailoverReconcilerTest,
        NewGenerationRepeatsWarmupAndAFullDebounce) {
   SeedCluster();
   std::atomic<int> generated_ids{0};

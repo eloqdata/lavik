@@ -177,8 +177,12 @@ class MetaAutomaticFailoverStateMachine {
   // After `trigger_now_`, the same input anchor remains TRIGGERING so later
   // health cannot retract an in-flight Begin; a definitive non-commit may be
   // restarted with EraseGroup, while committed-anchor changes reset naturally.
+  // With defer_trigger, an edge is returned without changing that Group. The
+  // caller can confirm a committed capture, then repeat the same input/time
+  // without deferral to latch it. Ordinary non-trigger updates still commit.
   [[nodiscard]] absl::StatusOr<AdvanceResult> Advance(
-      const Input& input, std::uint64_t now_steady_ms);
+      const Input& input, std::uint64_t now_steady_ms,
+      bool defer_trigger = false);
 
   // Explicit Group/lifecycle cleanup. Neither operation emits trigger edges.
   void EraseGroup(std::string_view group_id);

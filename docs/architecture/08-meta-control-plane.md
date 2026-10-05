@@ -486,6 +486,24 @@ operations remain whole records so directive payloads, revisions and exact
 receipts preserve their recovery meaning. Other readers can still use the
 complete `CommittedView`.
 
+Failover discovery retains only active failover operations and Group transition
+ownership, with operations ordered by submission sequence and transitions by
+Group id. Each attempted target captures its Group, authority, associated whole
+operation and complete observation-facts domain from one state-change cut.
+Uncontrolled recovery also retains the current CandidateRecovery Policy.
+Automatic detection retains lifecycle, compact facts for all Groups, and the
+current automatic and lease Policies; it has no operation journal. Only a
+trigger captures submitted failover operations for pristine-request selection.
+That capture must match the detection state-change cut before the detector
+latches the trigger or allocates command identities; a mismatch preserves the
+previous debounce state and causes a fresh read. Pending outcomes use transition
+id/revision facts, while uncertain retries preserve their command identity.
+Both reconcilers use cursor-only subscriptions, polling both applied and
+state-change indices as well as completion notifications. This keeps snapshot
+installation, overflow/resubscription and configuration-only applied advances
+visible without retaining full stores. Capture sorting, intent/hash checks,
+Policy decoding and observation-facts indexing run outside the state lock.
+
 Committed subscribers atomically receive an initial full or purpose-specific
 view, its command-event cursor, and a bounded ordered subscription. Consumers
 that only need notifications capture the applied and state-change indices

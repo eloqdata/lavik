@@ -43,6 +43,7 @@
 #include "lavik/meta/hash.h"
 #include "lavik/meta/state_apply.h"
 #include "lavik/meta/state_machine.h"
+#include "support/failover_planning.h"
 #include "support/meta_raft.h"
 #include "support/test_data_path.h"
 
@@ -494,9 +495,8 @@ void BeginControlled(Fixture& fixture, std::uint8_t first_id = 0x80,
   fixture.ReportOwner(1'000);
   fixture.ReportCandidate(1'000);
   std::uint8_t next = first_id;
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'001,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -549,9 +549,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   std::uint8_t next = 0x80;
   bool occupied = true;
   auto plan = [&] {
-    return meta::PlanFailoverStep(
-        meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-        fixture.observations,
+    return lavik::test::PlanFailoverFixture(
+        fixture.stores, fixture.next_index - 1, fixture.observations,
         {.now_unix_ms_ = 1'001,
          .leadership_started_unix_ms_ = 900,
          .observation_grace_ms_ = 100,
@@ -588,9 +587,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   std::uint8_t id = 0xc0;
   bool excluded = false;
   auto plan = [&](std::int64_t now) {
-    return meta::PlanFailoverStep(
-        meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-        fixture.observations,
+    return lavik::test::PlanFailoverFixture(
+        fixture.stores, fixture.next_index - 1, fixture.observations,
         {.now_unix_ms_ = now,
          .leadership_started_unix_ms_ = 900,
          .observation_grace_ms_ = 100,
@@ -665,9 +663,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.Accept(recovery);
   std::uint8_t id = 0xc0;
   auto plan = [&](std::int64_t now) {
-    return meta::PlanFailoverStep(
-        meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-        fixture.observations,
+    return lavik::test::PlanFailoverFixture(
+        fixture.stores, fixture.next_index - 1, fixture.observations,
         {.now_unix_ms_ = now,
          .leadership_started_unix_ms_ = 900,
          .observation_grace_ms_ = 100,
@@ -716,9 +713,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportCandidate();
   IdSequence ids{0xa0, 0xa1, 0xa2};
 
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'001,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -763,9 +759,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
                           std::nullopt, 2);
 
   IdSequence begin_ids{0xa3, 0xa4, 0xa5};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'003,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -777,9 +772,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
 
   fixture.ReportSourcePaused(1'004);
   IdSequence authorize_ids{0xa6};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'005,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -796,9 +790,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportOwner(1'000);
   fixture.ReportCandidate();
   IdSequence begin_ids{0xb0, 0xb1, 0xb2};
-  auto begin = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto begin = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'001,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -813,9 +806,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.observations.InvalidateCandidateOnDisconnect(
       {fixture.candidate, fixture.candidate_boot, 1}, 1'020);
   IdSequence abort_ids{0xb3};
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'020,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -848,9 +840,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
       {fixture.candidate, fixture.candidate_boot, 1}, 1'020);
 
   IdSequence ids{0xb3};
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'050,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -880,9 +871,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
                           std::nullopt, 2);
 
   IdSequence ids{0xb3};
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'012,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -912,9 +902,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
                           std::nullopt, 2);
 
   IdSequence ids{0xb3};
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'050,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -942,9 +931,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportActionFailed(1'020);
 
   IdSequence ids{0xb3};
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'050,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -973,9 +961,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
       {fixture.candidate, fixture.candidate_boot, 1}, 1'020);
 
   IdSequence ids{0xb3};
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'110,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1007,9 +994,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
                           std::nullopt, 2);
 
   IdSequence ids{0xb3};
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'012,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1032,9 +1018,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportSourcePaused(1'010);
 
   IdSequence authorize_ids{0xb4};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'011,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1050,9 +1035,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportPrepared(1'013, {10, 20}, 2);
 
   IdSequence abort_ids{0xb5};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'014,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1077,9 +1061,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
                           fixture.candidate_boot, 1'011, {11, 20});
 
   IdSequence authorize_ids{0x83};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'012,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1103,9 +1086,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportPrepared(1'013, {11, 20});
 
   IdSequence commit_ids{0x84};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'014,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1138,9 +1120,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportSourcePaused(1'010);
 
   IdSequence authorize_ids{0xb6};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'011,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1164,9 +1145,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   ASSERT_TRUE(preparing.failover_status_.ok()) << preparing.failover_status_;
 
   IdSequence wait_ids{0xb7};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'013,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1177,9 +1157,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
 
   fixture.ReportActionFailed(1'014);
   IdSequence abort_ids{0xb8};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'015,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1200,9 +1179,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   BeginControlled(fixture, 0xb4, 1'014);
   fixture.ReportSourcePaused(1'010);
   IdSequence authorize_ids{0xb7};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'011,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1213,9 +1191,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportPrepared(1'013);
 
   IdSequence deadline_ids{0xb8};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'014,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1236,9 +1213,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
       {fixture.owner, fixture.owner_boot, 1}, 1'010);
 
   IdSequence wait_ids{0x85};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'050,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1248,9 +1224,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_EQ(wait_ids.consumed(), 0);
 
   IdSequence degrade_ids{0x86};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'110,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1289,9 +1264,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
                   .ok());
 
   IdSequence wait_ids{0x87};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'050,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1301,9 +1275,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_EQ(wait_ids.consumed(), 0);
 
   IdSequence degrade_ids{0x88};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'110,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1326,9 +1299,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportOwner(1'030, fixture.owner_boot, 2);
 
   IdSequence ids{0x89};
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'050,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1348,9 +1320,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportOwner(1'010, replacement_boot, 2);
 
   IdSequence ids{0x8a};
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'011,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1376,9 +1347,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   BeginControlled(fixture);
   fixture.ReportSourcePaused(1'010, {10, 20});
   IdSequence authorize_ids{0x8c};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'011,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1392,9 +1362,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportOwner(1'012, fixture.owner_boot, 2, std::nullopt,
                       Bytes<20>(0x7a));
   IdSequence degrade_ids{0x8d};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'013,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1423,9 +1392,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   meta::MetaObservationStore fresh_observations;
 
   IdSequence warmup_ids{0x8e};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fresh_observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fresh_observations,
       {.now_unix_ms_ = 1'050,
        .leadership_started_unix_ms_ = 1'000,
        .observation_grace_ms_ = 100,
@@ -1435,9 +1403,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_EQ(warmup_ids.consumed(), 0);
 
   IdSequence degrade_ids{0x8f};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fresh_observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fresh_observations,
       {.now_unix_ms_ = 1'100,
        .leadership_started_unix_ms_ = 1'000,
        .observation_grace_ms_ = 100,
@@ -1457,9 +1424,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
     fixture.SubmitControlled();
     fixture.ReportOwner(1'000);
     IdSequence ids{0x87};
-    const auto planned = meta::PlanFailoverStep(
-        meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-        fixture.observations,
+    const auto planned = lavik::test::PlanFailoverFixture(
+        fixture.stores, fixture.next_index - 1, fixture.observations,
         {.now_unix_ms_ = 1'001,
          .leadership_started_unix_ms_ = 900,
          .observation_grace_ms_ = 100,
@@ -1476,9 +1442,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
     Fixture fixture;
     fixture.SubmitControlled(950);
     IdSequence ids{0x88};
-    const auto planned = meta::PlanFailoverStep(
-        meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-        fixture.observations,
+    const auto planned = lavik::test::PlanFailoverFixture(
+        fixture.stores, fixture.next_index - 1, fixture.observations,
         {.now_unix_ms_ = 950,
          .leadership_started_unix_ms_ = 900,
          .observation_grace_ms_ = 100,
@@ -1497,9 +1462,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
     BeginUncontrolled(fixture);
     fixture.ReportCandidate(1'000);
     IdSequence ids{0x89};
-    const auto planned = meta::PlanFailoverStep(
-        meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-        fixture.observations,
+    const auto planned = lavik::test::PlanFailoverFixture(
+        fixture.stores, fixture.next_index - 1, fixture.observations,
         {.now_unix_ms_ = 1'001,
          .leadership_started_unix_ms_ = 900,
          .observation_grace_ms_ = 100,
@@ -1522,9 +1486,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
     fence.new_term_ = 2;
     fixture.Accept(fence);
     IdSequence ids{0x8b};
-    const auto planned = meta::PlanFailoverStep(
-        meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-        fixture.observations,
+    const auto planned = lavik::test::PlanFailoverFixture(
+        fixture.stores, fixture.next_index - 1, fixture.observations,
         {.now_unix_ms_ = 1'001,
          .leadership_started_unix_ms_ = 900,
          .observation_grace_ms_ = 100,
@@ -1551,9 +1514,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
                           std::nullopt, 2);
 
   IdSequence set_ids{0x9a, 0x9b};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'003,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1565,9 +1527,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
 
   fixture.CompleteRecovery(1003);
   IdSequence authorize_ids{0x9c};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'004,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1601,9 +1562,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
                                      1'001);
 
   IdSequence premature_replacement_ids{0x9e};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'001,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1618,9 +1578,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
                           fixture.CurrentFailoverProjection());
   fixture.CompleteRecovery(1002);
   IdSequence authorize_ids{0x9f};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'003,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1668,9 +1627,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
       << replacement_heartbeat.candidate_status_;
 
   IdSequence ids{0xa8};
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'003,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1724,9 +1682,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   ASSERT_TRUE(omitted.candidate_status_.ok()) << omitted.candidate_status_;
 
   IdSequence replacement_ids{0xa8};
-  const auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  const auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'004,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1776,9 +1733,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
                           former_owner_domain);
 
   IdSequence replacement_ids{0xaa, 0xab};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'004,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1799,9 +1755,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
 
   fixture.CompleteRecovery(1004);
   IdSequence authorize_ids{0xac};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'005,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1823,9 +1778,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   BeginUncontrolled(fixture);
 
   IdSequence wait_ids{0xa0};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'001,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1839,9 +1793,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportCandidate(fixture.alternate, fixture.alternate_assignment,
                           fixture.alternate_boot, 1'002, {10, 10});
   IdSequence select_ids{0xa1, 0xa2};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'003,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1856,9 +1809,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
 
   fixture.ReportActionFailed(1'004);
   IdSequence replacement_ids{0xa3, 0xa4};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'005,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1876,9 +1828,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
 
   fixture.CompleteRecovery(1005);
   IdSequence authorize_ids{0xa5};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'006,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1894,9 +1845,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   const auto authorized = fixture.Transition();
   fixture.ReportPrepared(1'007, {10, 10});
   IdSequence commit_ids{0xa6};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'008,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1947,9 +1897,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
 
   fixture.CompleteRecovery(1002);
   IdSequence authorize_ids{0xb1};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'003,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -1961,9 +1910,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
 
   fixture.ReportPrepared(1'004);
   IdSequence commit_ids{0xb2};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'005,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -2017,9 +1965,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   // every follower has withdrawn its old recoverable population.
   BeginUncontrolled(fixture, std::nullopt, 0xd0);
   IdSequence wait_ids{0xd2};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'009,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -2047,9 +1994,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.ReportCandidate(fixture.candidate, fixture.candidate_assignment,
                           fixture.candidate_boot, 1'000, {10, 20});
   IdSequence select_ids{0xc0, 0xc1};
-  auto planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  auto planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'001,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -2072,9 +2018,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
 
   fixture.CompleteRecovery(1003);
   IdSequence authorize_ids{0xc2};
-  planned = meta::PlanFailoverStep(
-      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
-      fixture.observations,
+  planned = lavik::test::PlanFailoverFixture(
+      fixture.stores, fixture.next_index - 1, fixture.observations,
       {.now_unix_ms_ = 1'003,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -2238,8 +2183,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
       << candidate_result.candidate_status_;
 
   IdSequence expected_ids{0xd0, 0xd1, 0xd2};
-  const auto expected = meta::PlanFailoverStep(
-      meta::MetaCommittedView(current, committed_index), observations,
+  const auto expected = lavik::test::PlanFailoverFixture(
+      current, committed_index, observations,
       {.now_unix_ms_ = 1'001,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -2383,8 +2328,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
       << candidate_result.candidate_status_;
 
   IdSequence begin_ids{0xe7, 0xe8, 0xe9};
-  auto begin = meta::PlanFailoverStep(
-      meta::MetaCommittedView(submitted, committed_index), observations,
+  auto begin = lavik::test::PlanFailoverFixture(
+      submitted, committed_index, observations,
       {.now_unix_ms_ = 1'001,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -2420,8 +2365,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
       << owner_result.failover_status_;
 
   IdSequence authorize_ids{0xea};
-  auto authorize = meta::PlanFailoverStep(
-      meta::MetaCommittedView(begun, committed_index), observations,
+  auto authorize = lavik::test::PlanFailoverFixture(
+      begun, committed_index, observations,
       {.now_unix_ms_ = 1'011,
        .leadership_started_unix_ms_ = 900,
        .observation_grace_ms_ = 100,
@@ -2463,8 +2408,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   const auto before_cutover_owner = StoresSnapshotOnHeap(*machine);
   const meta::MetaStores& before_cutover = *before_cutover_owner;
   IdSequence expected_ids{0xf0};
-  const auto expected = meta::PlanFailoverStep(
-      meta::MetaCommittedView(before_cutover, committed_index), observations,
+  const auto expected = lavik::test::PlanFailoverFixture(
+      before_cutover, committed_index, observations,
       {.now_unix_ms_ = 1'013,
        .leadership_started_unix_ms_ = 1'013,
        .observation_grace_ms_ = 100,
