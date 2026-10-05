@@ -135,8 +135,9 @@ TEST(GroupedListWriteE2e, RangeReadFailureJoinsStartedPages) {
     EXPECT_NE(failed.text_.find(
                   variable == std::string_view("LAVIK_FAIL_VALUE_READ_KEY")
                       ? "injected value payload read failure"
-                      : "OOM grouped List read batch allocation"),
-              std::string::npos);
+                      : "OOM grouped List read batch admission"),
+              std::string::npos)
+        << failed.text_;
     EXPECT_EQ(client.Command({"LLEN", key}).text_, "1024");
     EXPECT_EQ(client.Command({"SET", "unrelated", "after-failure"}).text_,
               "OK");
