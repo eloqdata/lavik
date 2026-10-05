@@ -1,0 +1,88 @@
+[native-replication] node 1 started (pid 21634, raft 43859, ctl /mnt/local_nvme/i131/data/lavik-meta-native-5yyr0qi6/full-snapshot-pending-batch/node1/meta-admin.sock,127.0.0.1:38565, initial_manifest=True, attempt 1)
+[native-replication] Data node 11111111 started (pid 21726, seed 127.0.0.1:54773)
+[native-replication] Data node 22222222 started (pid 21729, seed 127.0.0.1:54773)
+[native-replication] Data node 22222222: SIGSTOP
+--- node 1 log tail (/mnt/local_nvme/i131/data/lavik-meta-native-5yyr0qi6/full-snapshot-pending-batch/node1.log) ---
+[n1] 2026-10-05T05:09:01.304 [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2300001410 Hz (2300.001 MHz) ticks-per-us=2300.001
+[n1] 2026-10-05T05:09:01.318 [info] node 1 up: raft=127.0.0.1:43859 data-control=127.0.0.1:59005 ctl=/mnt/local_nvme/i131/data/lavik-meta-native-5yyr0qi6/full-snapshot-pending-batch/node1/meta-admin.sock,127.0.0.1:38565 sentinel-tcp=disabled sentinel-tls=disabled data-dir=/mnt/local_nvme/i131/data/lavik-meta-native-5yyr0qi6/full-snapshot-pending-batch/node1 backend=etcd/raft tls=false
+[n1] 2026-10-05T05:09:09.708 [info] [raft-cb] event=BecomeLeader term=2
+[n1] 2026-10-05T05:09:09.728 [info] automatic failover Raft leader term=2 eligible=true eligibility_revision=1
+[n1] 2026-10-05T05:09:09.879 [info] cluster-create 2a11c3031ab097df103023b73a6a24b5 phase=submitted
+[n1] 2026-10-05T05:09:09.888 [info] cluster-create 2a11c3031ab097df103023b73a6a24b5 phase=policy
+[n1] 2026-10-05T05:09:09.947 [info] cluster-create 2a11c3031ab097df103023b73a6a24b5 phase=register-data
+[n1] 2026-10-05T05:09:09.985 [info] cluster-create 2a11c3031ab097df103023b73a6a24b5 phase=create-groups
+[n1] 2026-10-05T05:09:10.048 [info] cluster-create 2a11c3031ab097df103023b73a6a24b5 phase=slot-map
+[n1] 2026-10-05T05:09:10.091 [info] cluster-create 2a11c3031ab097df103023b73a6a24b5 phase=population
+[n1] 2026-10-05T05:09:10.215 [info] cluster-create 2a11c3031ab097df103023b73a6a24b5 phase=wait-data-projection
+[n1] 2026-10-05T05:09:10.701 [info] cluster-create 2a11c3031ab097df103023b73a6a24b5 phase=initialize-groups
+[n1] 2026-10-05T05:09:10.804 [info] cluster-create 2a11c3031ab097df103023b73a6a24b5 phase=initialization-issued
+[n1] 2026-10-05T05:09:11.036 [info] cluster-create 2a11c3031ab097df103023b73a6a24b5 phase=result-committed
+[n1] 2026-10-05T05:09:22.701 [info] cluster-create 2a11c3031ab097df103023b73a6a24b5 phase=directive-removed
+[n1] 2026-10-05T05:09:22.742 [info] cluster-create 2a11c3031ab097df103023b73a6a24b5 phase=child-completed
+[n1] 2026-10-05T05:09:22.782 [info] automatic failover detector group=group-1 owner=1111111111111111111111111111111111111111 term=1 state=blocked reason=none blocker=leadership_warmup suspect_ms=0 threshold_ms=5000
+
+[2026-10-05 05:09:09.746] [lavik] [info] I/O backends: network=kernel storage=uring rings=one-per-worker
+[2026-10-05 05:09:09.746] [lavik] [info] mimalloc recovery_purge_delay=1000 online_purge_delay=60000 arena_eager_commit=1 allow_thp=0
+[2026-10-05 05:09:09.746] [lavik] [info] lavik version=0.1.0-dev listening on 127.0.0.1:45739 tls_port=0 metrics_port=47451 shards=1 maxclients=10000 maxclients_fd_reserve=256 pin_workers=false idle_timeout_ms=-1 busy_poll_us=20 foreground_budget_us=1000 background_budget_us=10 background_warrant_percent=1 spdk_max_completions_per_poll=8 spdk_foreground_pre_poll_us=5 registered_buffer_bytes=67108864 per worker storage_write_buffers=4 storage_read_buffer_bytes=1048576 replication_publish_queue_bytes=16777216 per worker max_memory=1073741824 maxmemory_clients=5% client_query_buffer_limit=1073741824 flush_max_ms=20 flush_size_bytes=131072 defrag_max_active_per_device=8 defrag_sleep_ms=0 defrag_record_sleep_us=0 defrag_paused=false shutdown_checkpoint=false replication_backlog_backpressure=true
+[2026-10-05 05:09:09.746] [lavik] [info] memory limit=1073741824 (1.00G) initial_used=0 initial_rss=12791808
+[2026-10-05 05:09:09.750] [lavik] [info] waiting for Meta bootstrap: waiting for leader, cluster creation or Data registration
+[2026-10-05 05:09:09.997] [lavik] [info] Meta committed client mode: single
+[2026-10-05 05:09:09.998] [lavik] [info] storage device id=0 path=/mnt/local_nvme/i131/data/lavik-meta-native-5yyr0qi6/full-snapshot-pending-batch/source/lavik.data capacity-bytes=134217728 data-blocks=15 foreground-blocks=7 defrag-reserve-blocks=8 data-bytes=125829120
+[2026-10-05 05:09:09.998] [lavik] [info] storage capacity: data-blocks=15 foreground-blocks=7 defrag-reserve-blocks=8
+[2026-10-05 05:09:09.998] [lavik] [info] storage direct-I/O alignment=4096 bytes
+[2026-10-05 05:09:09.998] [lavik] [info] storage flush submission size=131072 bytes
+[2026-10-05 05:09:10.263] [lavik] [info] storage device id=0 foreground-weight=7 home-workers=1
+[2026-10-05 05:09:10.275] [lavik] [info] runtime workers=2 data_shards=1 control_worker=1 cpus=
+[2026-10-05 05:09:10.277] [lavik] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2299999806 Hz (2300.000 MHz) ticks-per-us=2300.000
+[2026-10-05 05:09:10.277] [lavik] [info] provided-buffer ring disabled; using per-connection receive buffers
+[2026-10-05 05:09:10.277] [lavik] [info] provided-buffer ring disabled; using per-connection receive buffers
+[2026-10-05 05:09:10.423] [lavik] [info] storage recovery: blocks=0/0 (100.0%) swept=15/15 records=0 rate=0 blocks/s 0.00M records/s eta=0.0s
+[2026-10-05 05:09:10.435] [lavik] [info] mimalloc recovery collection complete; online purge_delay=60000
+[2026-10-05 05:09:10.435] [lavik] [info] worker[0] direct-IO storage initialized
+[2026-10-05 05:09:10.898] [lavik] [info] full-sync session 15356126682787211068 durably invalidated system state at generation 1
+[2026-10-05 05:09:10.971] [lavik] [info] full-sync session 15356126682787211068 durably activated population at system state generation 3
+[2026-10-05 05:09:21.304] [lavik] [info] replication session 1 flow 0 requested cursor=1:0 history-match=false backlog-state=1 floor=1 tail=4 selected=FULL
+[2026-10-05 05:09:21.309] [lavik] [warning] fault pause reached: LAVIK_FULL_PENDING_SNAPSHOT_HOLD_FILE
+[2026-10-05 05:09:22.618] [lavik] [info] accepted replication session 1 with 1 data flows
+[2026-10-05 05:09:22.905] [lavik] [warning] replication source flow 0 ended: replication session ended while sending backlog
+[2026-10-05 05:09:22.905] [lavik] [warning] replication native handshake failed: replication session ended while sending backlog
+[2026-10-05 05:09:22.907] [lavik] [info] replication session 2 flow 0 requested cursor=8:0 history-match=true backlog-state=1 floor=1 tail=7 selected=CONTINUE
+[2026-10-05 05:09:22.908] [lavik] [info] accepted replication session 2 with 1 data flows
+
+[2026-10-05 05:09:09.797] [lavik] [info] I/O backends: network=kernel storage=uring rings=one-per-worker
+[2026-10-05 05:09:09.798] [lavik] [info] mimalloc recovery_purge_delay=1000 online_purge_delay=60000 arena_eager_commit=1 allow_thp=0
+[2026-10-05 05:09:09.798] [lavik] [info] lavik version=0.1.0-dev listening on 127.0.0.1:56253 tls_port=0 metrics_port=41351 shards=2 maxclients=10000 maxclients_fd_reserve=256 pin_workers=false idle_timeout_ms=-1 busy_poll_us=20 foreground_budget_us=1000 background_budget_us=10 background_warrant_percent=1 spdk_max_completions_per_poll=8 spdk_foreground_pre_poll_us=5 registered_buffer_bytes=67108864 per worker storage_write_buffers=4 storage_read_buffer_bytes=1048576 replication_publish_queue_bytes=16777216 per worker max_memory=1073741824 maxmemory_clients=5% client_query_buffer_limit=1073741824 flush_max_ms=20 flush_size_bytes=131072 defrag_max_active_per_device=8 defrag_sleep_ms=0 defrag_record_sleep_us=0 defrag_paused=false shutdown_checkpoint=false replication_backlog_backpressure=true
+[2026-10-05 05:09:09.798] [lavik] [info] memory limit=1073741824 (1.00G) initial_used=0 initial_rss=12660736
+[2026-10-05 05:09:09.798] [lavik] [info] waiting for Meta bootstrap: waiting for leader, cluster creation or Data registration
+[2026-10-05 05:09:10.127] [lavik] [info] Meta committed client mode: single
+[2026-10-05 05:09:10.128] [lavik] [info] storage device id=0 path=/mnt/local_nvme/i131/data/lavik-meta-native-5yyr0qi6/full-snapshot-pending-batch/target/lavik.data capacity-bytes=268435456 data-blocks=31 foreground-blocks=23 defrag-reserve-blocks=8 data-bytes=260046848
+[2026-10-05 05:09:10.128] [lavik] [info] storage capacity: data-blocks=31 foreground-blocks=23 defrag-reserve-blocks=8
+[2026-10-05 05:09:10.128] [lavik] [info] storage direct-I/O alignment=4096 bytes
+[2026-10-05 05:09:10.128] [lavik] [info] storage flush submission size=131072 bytes
+[2026-10-05 05:09:10.402] [lavik] [info] storage device id=0 foreground-weight=23 home-workers=2
+[2026-10-05 05:09:10.413] [lavik] [info] runtime workers=3 data_shards=2 control_worker=2 cpus=
+[2026-10-05 05:09:10.418] [lavik] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2300001166 Hz (2300.001 MHz) ticks-per-us=2300.001
+[2026-10-05 05:09:10.419] [lavik] [info] provided-buffer ring disabled; using per-connection receive buffers
+[2026-10-05 05:09:10.419] [lavik] [info] provided-buffer ring disabled; using per-connection receive buffers
+[2026-10-05 05:09:10.419] [lavik] [info] provided-buffer ring disabled; using per-connection receive buffers
+[2026-10-05 05:09:10.576] [lavik] [info] storage recovery: blocks=0/0 (100.0%) swept=31/31 records=0 rate=0 blocks/s 0.00M records/s eta=0.0s
+[2026-10-05 05:09:10.589] [lavik] [info] mimalloc recovery collection complete; online purge_delay=60000
+[2026-10-05 05:09:10.589] [lavik] [info] worker[1] direct-IO storage initialized
+[2026-10-05 05:09:10.589] [lavik] [info] worker[0] direct-IO storage initialized
+[2026-10-05 05:09:21.304] [lavik] [info] full-sync session 1 durably invalidated system state at generation 1
+[2026-10-05 05:09:21.304] [lavik] [info] replication target session 1 flow 0 requesting cursor=1:0
+[2026-10-05 05:09:22.617] [lavik] [info] full-sync session 1 durably activated population at system state generation 3
+[2026-10-05 05:09:22.618] [lavik] [info] replication session 1 online with 127.0.0.1:45739 using 1+1 connections
+[2026-10-05 05:09:22.905] [lavik] [warning] replication target flow 0 ended: replication peer closed
+[2026-10-05 05:09:22.907] [lavik] [info] replication target session 2 flow 0 requesting cursor=8:0
+[2026-10-05 05:09:22.908] [lavik] [info] replication session 2 online with 127.0.0.1:45739 using 1+1 connections
+
+Traceback (most recent call last):
+  File "/mnt/local_nvme/i131/chunks/tests/meta_integration/gate_native_replication.py", line 2490, in <module>
+    main()
+  File "/mnt/local_nvme/i131/chunks/tests/meta_integration/gate_native_replication.py", line 2423, in main
+    full_pending_snapshot_batch(root)
+  File "/mnt/local_nvme/i131/chunks/tests/meta_integration/gate_native_replication.py", line 1510, in full_pending_snapshot_batch
+    assert actual_expiry == expiry, (actual_expiry, expiry)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (-1, 1791177081332)

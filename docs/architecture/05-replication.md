@@ -962,7 +962,12 @@ population. The final frame validates exact bytes and cardinality before the
 transaction's durability boundary. Malformed input, cancellation or OOM
 rolls back uncommitted pages and invalidates the rebuild. Cleanup errors after
 durable commit never roll back that committed decision.
-Ordinary values are materialized into bounded record batches. Transactions
+Ordinary values are materialized into bounded record batches. Materialization
+makes subsequent writes eligible for the ordered command FIFO even before a
+batch is sent. Before draining a nonempty FIFO, the sender flushes any pending
+baseline batch and waits for its completion, so dependent commands and
+after-images cannot precede their baseline. Empty FIFO checks retain batching.
+Transactions
 committed during the LOADING rebuild publish their participant after-images
 only after the commit decision. `FLUSHDB` or `FLUSHALL` invalidates an active
 capture attempt so the next attempt starts from the new database epochs.

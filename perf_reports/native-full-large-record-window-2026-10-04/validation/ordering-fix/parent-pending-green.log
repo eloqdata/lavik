@@ -1,0 +1,15 @@
+Internal ctest changing into directory: /mnt/local_nvme/i131/build-chunks-debug
+Test project /mnt/local_nvme/i131/build-chunks-debug
+    Start 853: meta_integration.gate_full_snapshot_ordering
+    Test #853: meta_integration.gate_full_snapshot_ordering ...   Passed   22.58 sec
+    Start 853: meta_integration.gate_full_snapshot_ordering
+    Test #853: meta_integration.gate_full_snapshot_ordering ...   Passed   23.91 sec
+    Start 853: meta_integration.gate_full_snapshot_ordering
+1/1 Test #853: meta_integration.gate_full_snapshot_ordering ...   Passed   25.32 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Label Time Summary:
+meta-integration    =  25.32 sec*proc (1 test)
+
+Total Test time (real) =  71.83 sec
