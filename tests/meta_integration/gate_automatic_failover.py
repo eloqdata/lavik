@@ -398,6 +398,12 @@ def run_partition(meta, data, ctl, workdir, direction, require_fault_hook):
         lease_metric = "lavik_cluster_control_lease_expirations_total"
         expirations_before = fixture.by_id[F.OWNER].metric(lease_metric)
 
+        # Lease retirement and promotion can close a racing client without a
+        # definitive SET reply. Retain those attempts as unknown outcomes;
+        # only acknowledged writes count toward the non-overlap proof below.
+        old_probe.allow_fence_disconnects()
+        for probe in replica_probes.values():
+            probe.allow_fence_disconnects()
         fixture.partition_owner_control(direction)
         expected_reason = "heartbeat_expired" if direction == "downstream" else None
         wait_suspect(fixture, reason=expected_reason, timeout=20)

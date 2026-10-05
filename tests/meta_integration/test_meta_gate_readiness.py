@@ -10,11 +10,57 @@ import unittest
 from unittest.mock import Mock, patch
 
 import gate_leader_change as L
+import gate_automatic_failover as A
 import gate_sentinel as S
 import gate_sentinel_ha as HA
 
 
 class MetaGateReadinessTest(unittest.TestCase):
+    def test_partition_probes_accept_fence_eof_without_recording_success(self):
+        class PartitionInstalled(Exception):
+            pass
+
+        for direction in ("downstream", "both"):
+            with self.subTest(direction=direction):
+                fixture = Mock()
+                fixture.by_id = {
+                    node_id: Mock()
+                    for node_id in (A.F.OWNER, A.F.CANDIDATE, A.F.FOLLOWER)
+                }
+                probes = [
+                    A.F.ContinuousSetProbe(fixture.by_id[node_id], "key", node_id)
+                    for node_id in fixture.by_id
+                ]
+
+                def partition(actual_direction):
+                    self.assertEqual(actual_direction, direction)
+                    for probe in probes:
+
+                        def fence_eof(*_args):
+                            probe._stop.set()
+                            raise A.H.Failure("Data command SET returned no RESP line")
+
+                        probe.data.command_head.side_effect = fence_eof
+                        probe._run()
+                        probe.assert_healthy()
+                        self.assertEqual(probe.fence_disconnects(), 1)
+                        self.assertEqual(probe.successes(), [])
+                    raise PartitionInstalled
+
+                fixture.partition_owner_control.side_effect = partition
+                with (
+                    patch.object(A.F, "FailoverFixture", return_value=fixture),
+                    patch.object(A, "configure_fast_policies"),
+                    patch.object(A.F.ContinuousSetProbe, "start"),
+                    patch.object(
+                        A.F.ContinuousSetProbe,
+                        "wait_for_success",
+                    ),
+                    patch.object(A.F, "ContinuousSetProbe", side_effect=probes),
+                    self.assertRaises(PartitionInstalled),
+                ):
+                    A.run_partition("meta", "data", "ctl", "/unused", direction, False)
+
     def test_wire_replay_waits_for_discovery_authority(self):
         # Raft can report leader before the control worker publishes its term
         # and eligibility. Drive the real wire-test orchestration through that
