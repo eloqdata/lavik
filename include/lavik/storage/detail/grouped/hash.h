@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "lavik/local_shared_ptr.h"
@@ -187,6 +188,17 @@ absl::StatusOr<HashGroupMetadata> DecodeHashGroupMetadata(
     std::string_view prefix, std::size_t encoded_bytes);
 absl::StatusOr<std::string> EncodeHashGroup(const HashGroupSnapshot& group);
 absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(std::string_view bytes);
+
+// Scans a loader-verified envelope without owning its fields or values. Count
+// must come from that envelope; id and seed must come from the checked route.
+// Validates all framing, duplicate fields and persisted-seed routing. The
+// synchronous visitor borrows payload and may only update unpublished scratch:
+// a later entry can invalidate the page, so discard its effects on failure.
+// The caller admits page scratch before this call and keeps payload alive.
+absl::Status VisitHashGroupFields(
+    std::string_view payload, std::uint32_t field_count, HashGroupId id,
+    const DigestSeed& seed,
+    absl::FunctionRef<absl::Status(const HashEntryView&)> visitor);
 
 // Splits one complete leaf into complete replacement leaves. The input is
 // scratch, never the published directory. A large indivisible field or a full

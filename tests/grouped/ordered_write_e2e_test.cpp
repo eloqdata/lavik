@@ -1218,15 +1218,34 @@ TEST_P(GroupedFullDiskExpirationE2e, ReclaimsGraphAndRecovers) {
         std::chrono::duration_cast<std::chrono::milliseconds>(
             (std::chrono::system_clock::now() + 10s).time_since_epoch())
             .count();
-    for (const auto& key : expired_keys) {
+    for (std::size_t i = 0; i < expired_keys.size(); ++i) {
+      const auto& key = expired_keys[i];
       // RESTORE creates a grouped root with its final TTL in one publication.
       // Adding TTL afterward would create a shielding successor, which must
       // never take the full-disk, non-durable expiration escape valve.
-      ASSERT_EQ(client
-                    .Command({"RESTORE", key, std::to_string(deadline), *dump,
-                              "ABSTTL"})
-                    .text_,
-                "OK");
+      const auto started = std::chrono::steady_clock::now();
+      try {
+        ASSERT_EQ(client
+                      .Command({"RESTORE", key, std::to_string(deadline), *dump,
+                                "ABSTTL"})
+                      .text_,
+                  "OK");
+      } catch (const std::exception& error) {
+        // The client exception otherwise loses the restore ordinal and the
+        // live worker state when Server unwinds. Do not send another command
+        // to a potentially stalled worker while collecting failure evidence.
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started)
+                .count();
+        server.RecordDiagnostics(
+            "full-disk RESTORE failed",
+            "restore_index=" + std::to_string(i) +
+                " key_count=" + std::to_string(expired_keys.size()) +
+                " key_bytes=" + std::to_string(key.size()) +
+                " elapsed_ms=" + std::to_string(elapsed));
+        FAIL() << error.what() << '\n' << server.Log();
+      }
     }
     ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
     ASSERT_EQ(

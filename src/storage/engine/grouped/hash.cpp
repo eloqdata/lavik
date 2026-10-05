@@ -36,6 +36,17 @@ constexpr std::size_t kRootBytes = kGroupedHashRootBytes;
 constexpr std::size_t kGroupHeaderBytes = kHashGroupHeaderBytes;
 constexpr std::size_t kCompactHeaderBytes = kHashValueHeaderBytes;
 
+// Reuse the persisted-seed digest required for route validation in temporary
+// lookup tables. Complete bytes still distinguish fields on digest collisions.
+struct FieldKey {
+  std::string_view field;
+  std::uint64_t hash;
+  bool operator==(const FieldKey&) const = default;
+};
+struct FieldHash {
+  std::size_t operator()(const FieldKey& key) const { return key.hash; }
+};
+
 std::uint64_t Mask(unsigned bits) noexcept {
   return bits == 0 ? 0
                    : std::numeric_limits<std::uint64_t>::max() << (64 - bits);
@@ -304,6 +315,32 @@ absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(std::string_view bytes) {
   return group;
 }
 
+absl::Status VisitHashGroupFields(
+    std::string_view payload, std::uint32_t field_count, HashGroupId id,
+    const DigestSeed& seed,
+    absl::FunctionRef<absl::Status(const HashEntryView&)> visitor) {
+  if (field_count == 0) return absl::OkStatus();
+  auto reader = HashValueReader::Open(payload.substr(kGroupHeaderBytes));
+  if (!reader.ok()) return absl::DataLossError(reader.status().message());
+  if (reader->size() != field_count)
+    return absl::DataLossError(
+        "Hash group inner count disagrees with envelope");
+  absl::flat_hash_set<FieldKey, FieldHash> fields;
+  fields.reserve(field_count);
+  for (std::size_t i = 0; i < reader->size(); ++i) {
+    auto entry = reader->Next();
+    if (!entry.ok()) return absl::DataLossError(entry.status().message());
+    const auto hash = ComputeDigest(entry->field_, seed).value_;
+    if (!id.contains(hash))
+      return absl::DataLossError("Hash field outside its group route");
+    if (!fields.insert(FieldKey{entry->field_, hash}).second)
+      return absl::DataLossError("duplicate field in Hash group");
+    auto status = visitor(*entry);
+    if (!status.ok()) return status;
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
     std::string_view payload, const DigestSeed& seed, HashGroupEditKind kind,
     std::span<const HashEntryView> edits) {
@@ -314,17 +351,6 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
   struct Entry {
     HashEntryView view;
     bool removed = false;
-  };
-  // Reuse the persisted-seed digest required for route validation instead of
-  // hashing every field a second time for the temporary lookup table. Compare
-  // complete bytes on collisions; the digest is never a field identity.
-  struct FieldKey {
-    std::string_view field;
-    std::uint64_t hash;
-    bool operator==(const FieldKey&) const = default;
-  };
-  struct FieldHash {
-    std::size_t operator()(const FieldKey& key) const { return key.hash; }
   };
   std::vector<Entry> entries;
   absl::flat_hash_map<FieldKey, std::size_t, FieldHash> positions;
