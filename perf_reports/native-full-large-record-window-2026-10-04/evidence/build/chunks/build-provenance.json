@@ -1,9 +1,0 @@
-{
-  "source_revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
-  "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751",
-  "compiler": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
-  "build_directory": "/mnt/local_nvme/i131/build-base",
-  "source_directory": "/mnt/local_nvme/i131/base",
-  "configure_log": "/mnt/local_nvme/i131/logs/configure-base.log",
-  "build_log": "/mnt/local_nvme/i131/logs/build-chunks-release.log"
-}
