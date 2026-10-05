@@ -61,6 +61,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "gtest/gtest.h"
 #include "lavik/meta/cluster_create.h"
 #include "lavik/meta/commands.h"
@@ -1650,6 +1651,14 @@ TEST_F(MetaCoordinatorServerTest,
   archive.request_id_ = MakeRequestId(0x3a);
   archive.operation_seqs_ = {submitted_complete->log_index_,
                              submitted_abort->log_index_};
+  // This archive passes recovery simulation, then fails actor encoding. The
+  // reservation must also unwind before dispatch has created a Raft waiter.
+  auto encoding_failure = RunTaskSync(coordinator_->Propose(
+      archive, MetaCoordinatorTestPeer::Make(
+                   std::string(lavik::meta::kMaxMetaPrincipalBytes + 1, 'x'))));
+  ASSERT_FALSE(encoding_failure.ok());
+  EXPECT_NE(encoding_failure.status().message().find("actor_principal"),
+            std::string::npos);
   auto recovery = ProposeSync(archive);
   ASSERT_TRUE(recovery.ok()) << recovery.status();
   EXPECT_EQ(recovery->verdict_, MetaAuditVerdict::kAccepted);
@@ -1735,6 +1744,54 @@ TEST_F(MetaCoordinatorServerTest,
   ASSERT_TRUE(recovered.ok()) << recovered.status();
 }
 
+TEST_F(MetaCoordinatorServerTest, DispatchFailureReleasesRecoveryReservation) {
+  StartServer();
+  MakeCoordinator();
+  WaitLeader();
+  SubmitOperation submit;
+  submit.request_id_ = MakeRequestId(0x42);
+  submit.operation_id_ = MakeOperationId(0x42);
+  submit.kind_ = "maintenance";
+  submit.intent_hash_ = lavik::meta::MetaSha256(submit.intent_);
+  ASSERT_TRUE(ProposeSync(submit).ok());
+  lavik::meta::SetAuditPolicy policy;
+  policy.request_id_ = MakeRequestId(0x43);
+  policy.policy_ = lavik::meta::MetaAuditPolicy::kStrictExport;
+  policy.attestation_ = "test-reservation-dispatch";
+  ASSERT_TRUE(ProposeSync(policy).ok());
+  {
+    std::lock_guard<std::mutex> lock(role_mu_);
+    forward_target_ = nullptr;
+  }
+  coordinator_.reset();
+  lavik::meta::MetaProposalExecutor executor(/*capacity=*/0);
+  // The borrowed executor must outlive the coordinator, including an ASSERT
+  // failure before normal fixture teardown.
+  absl::Cleanup reset_coordinator = [&] {
+    {
+      std::lock_guard<std::mutex> lock(role_mu_);
+      forward_target_ = nullptr;
+    }
+    coordinator_.reset();
+  };
+  MetaCoordinatorOptions options;
+  options.proposal_executor_ = &executor;
+  options.max_consecutive_snapshot_failures_ = 0;
+  MakeCoordinator(options);
+  lavik::meta::AbortOperation abort;
+  abort.operation_id_ = submit.operation_id_;
+  const auto before = machine_->last_commit_index();
+  for (const std::uint8_t request : {0x44, 0x45}) {
+    abort.request_id_ = MakeRequestId(request);
+    const auto result = ProposeSync(abort);
+    ASSERT_FALSE(result.ok());
+    // Both attempts must reach dispatch. A leaked recovery reservation would
+    // instead reject the second one with an uncertain-outcome gate error.
+    EXPECT_EQ(result.status().message(), "meta proposal executor is full");
+    EXPECT_EQ(machine_->last_commit_index(), before);
+  }
+}
+
 TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
   StartServer({.client_req_timeout_ms_ = 25000});
   WaitLeader();
@@ -1817,6 +1874,12 @@ TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
   ASSERT_FALSE(rejected_prune.ok());
   EXPECT_EQ(rejected_prune.status().message(), "reject reserved prune");
   reject_prune = false;
+  auto encoding_failure = RunTaskSync(coordinator_->Propose(
+      first_prune, MetaCoordinatorTestPeer::Make(std::string(
+                       lavik::meta::kMaxMetaPrincipalBytes + 1, 'x'))));
+  ASSERT_FALSE(encoding_failure.ok());
+  EXPECT_NE(encoding_failure.status().message().find("actor_principal"),
+            std::string::npos);
   apply_barrier_.Pause();
   auto uncertain = ProposeSync(first_prune);
   ASSERT_FALSE(uncertain.ok());
