@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+import gate_bootstrap as B
 import gate_failover as F
 import gate_native_replication as N
 
@@ -78,6 +79,87 @@ class NativeFixtureStartupTest(unittest.TestCase):
 
     def test_mixed_full_waits_for_membership_before_data_bootstrap(self):
         self.check_startup(N.mixed_full_limit)
+
+
+class BootstrapCreationAdmissionTest(unittest.TestCase):
+    busy = (
+        "ERR clustercreate 1 preflight pre-commit-failed "
+        "another cluster creation or Meta membership change is in progress"
+    )
+
+    def setUp(self):
+        self.now = 0.0
+        self.clock = SimpleNamespace(monotonic=lambda: self.now, sleep=self.advance)
+        self.patch = patch.object(B, "time", self.clock)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+
+    def advance(self, duration):
+        self.now += duration
+
+    def test_busy_retries_exact_request_then_stops_on_success(self):
+        meta = Mock()
+        meta.ctl.side_effect = [self.busy, "OK clustercreate 1"]
+        self.assertEqual(
+            B.create_after_membership_admission(meta, "fixed request"),
+            "OK clustercreate 1",
+        )
+        self.assertEqual(meta.ctl.call_count, 2)
+        for call in meta.ctl.call_args_list:
+            self.assertEqual(call.args, ("fixed request",))
+
+    def test_other_rejections_are_not_retried(self):
+        for reply in (
+            "ERR clustercreate 1 preflight pre-commit-failed Meta is shutting down",
+            "ERR clustercreate 1 commit unknown outcome",
+            "",
+        ):
+            with self.subTest(reply=reply):
+                meta = Mock()
+                meta.ctl.return_value = reply
+                with self.assertRaises(AssertionError):
+                    B.create_after_membership_admission(meta, "fixed request")
+                meta.ctl.assert_called_once()
+
+    def test_transport_failure_is_not_retried(self):
+        meta = Mock()
+        meta.ctl.side_effect = TimeoutError("unknown outcome")
+        with self.assertRaises(TimeoutError):
+            B.create_after_membership_admission(meta, "fixed request")
+        meta.ctl.assert_called_once()
+
+    def test_persistent_busy_stops_at_deadline(self):
+        meta = Mock()
+        meta.ctl.return_value = self.busy
+        with self.assertRaisesRegex(B.H.Failure, "bootstrap creation exceeded 10s"):
+            B.create_after_membership_admission(meta, "fixed request")
+        self.assertEqual(self.now, 10)
+
+    def test_call_timeout_uses_remaining_budget(self):
+        meta = Mock()
+
+        def reply(_request, timeout):
+            if meta.ctl.call_count == 1:
+                self.advance(8)
+                return self.busy
+            self.assertAlmostEqual(timeout, 1.95)
+            return "OK clustercreate 1"
+
+        meta.ctl.side_effect = reply
+        B.create_after_membership_admission(meta, "fixed request")
+        self.assertEqual(meta.ctl.call_count, 2)
+
+    def test_success_after_budget_is_not_accepted_or_retried(self):
+        meta = Mock()
+
+        def reply(_request, timeout):
+            self.advance(11)
+            return "OK clustercreate 1"
+
+        meta.ctl.side_effect = reply
+        with self.assertRaisesRegex(B.H.Failure, "bootstrap creation exceeded 10s"):
+            B.create_after_membership_admission(meta, "fixed request")
+        meta.ctl.assert_called_once()
 
 
 if __name__ == "__main__":
