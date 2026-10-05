@@ -372,14 +372,15 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
 
   void InstallReconciler(std::function<absl::StatusOr<MetaRequestId>()> next_id,
                          std::uint64_t grace_ms = 100,
-                         std::uint32_t observation_ttl_ms = 1'000) {
+                         std::uint32_t observation_ttl_ms = 1'000,
+                         std::function<std::uint64_t()> clock = {}) {
     MetaAutomaticFailoverReconcilerOptions options;
     options.data_control_runtime_status_ = data_runtime_;
     options.diagnostics_ = diagnostics_;
     options.observation_ttl_ms_ = observation_ttl_ms;
     options.observation_grace_ms_ = grace_ms;
     options.poll_interval_ = 5ms;
-    options.now_steady_ms_ = [this] {
+    options.now_steady_ms_ = clock ? std::move(clock) : [this] {
       return now_steady_ms_.load(std::memory_order_acquire);
     };
     options.next_id_ = std::move(next_id);
@@ -962,6 +963,87 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 }
 
 TEST_F(MetaAutomaticFailoverReconcilerTest,
+       CommitBetweenDetectionAndTriggerPreservesDebounceAndDefersIds) {
+  const auto seed = SeedCluster();
+  const auto before = machine_->last_commit_index();
+  auto replacement = machine_->StoresSnapshot();
+  SubmitOperation submitted;
+  submitted.operation_id_ = seed.controlled_operation_id_;
+  submitted.kind_ = kFailoverOperationKind;
+  submitted.intent_ = *EncodeFailoverOperationIntent({"g1", 2'000'000'000'000});
+  submitted.intent_hash_ = MetaSha256(submitted.intent_);
+  ASSERT_TRUE(
+      replacement.operation_.SubmitOperation(submitted, before + 1).ok());
+  const auto image = replacement.Serialize();
+  ASSERT_TRUE(image.ok()) << image.status();
+  // Make the later Install change only the state-change half of the cursor.
+  // The proposal hook below prevents appending into this synthetic Raft cut.
+  machine_->Advance(before + 1);
+  auto phase = std::make_shared<std::atomic<int>>(0);
+  auto ids = std::make_shared<std::atomic<int>>(0);
+  auto attempts = std::make_shared<std::atomic<int>>(0);
+  auto duration = std::make_shared<std::atomic<std::uint64_t>>(0);
+  auto preempted = std::make_shared<std::atomic<bool>>(false);
+  coordinator_->AddValidateHook([attempts, duration, preempted,
+                                 operation = submitted.operation_id_](
+                                    const MetaCommand& command,
+                                    const MetaProposalView&,
+                                    const MetaObservationStore&, std::int64_t) {
+    if (const auto* begin = std::get_if<BeginUncontrolledFailover>(&command)) {
+      duration->store(begin->suspect_duration_ms_);
+      preempted->store(begin->preempted_operation_id_ == operation);
+      ++*attempts;
+      return absl::FailedPreconditionError("test: capture command, no append");
+    }
+    return absl::OkStatus();
+  });
+  InstallReconciler(
+      [ids, phase]() -> absl::StatusOr<MetaRequestId> {
+        EXPECT_GE(phase->load(), 3);
+        return Bytes<16>(static_cast<std::uint8_t>(0x70 + ids->fetch_add(1)));
+      },
+      0, 1000,
+      [this, phase, ids, image = *image, before] {
+        if (phase->load() == 1) {
+          // Run acquired its detection batch just before reading this clock.
+          EXPECT_TRUE(machine_->Install(before + 1, image).ok());
+          now_steady_ms_.store(11'000);
+          phase->store(2);
+        } else if (phase->load() == 2) {
+          // This is the next Run iteration, after the conditional capture
+          // rejected the previous batch. No trigger was latched or published.
+          EXPECT_EQ(ids->load(), 0);
+          const auto status = diagnostics_->Snapshot();
+          EXPECT_EQ(status.statuses_.size(), 1u);
+          if (status.statuses_.size() == 1) {
+            EXPECT_EQ(status.statuses_[0].state_,
+                      MetaAutomaticFailoverState::kSuspect);
+            EXPECT_EQ(status.statuses_[0].accumulated_suspect_ms_, 999u);
+          }
+          now_steady_ms_.store(11'025);
+          phase->store(3);
+        }
+        return now_steady_ms_.load();
+      });
+  StartEligibleTerm();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.state_ == MetaAutomaticFailoverState::kSuspect;
+  }));
+  now_steady_ms_.store(10'999);
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.accumulated_suspect_ms_ == 999;
+  }));
+  phase->store(1);
+  const bool proposed = WaitUntil([&] { return attempts->load() != 0; });
+  reconciler_->Shutdown();
+  EXPECT_TRUE(proposed);
+  EXPECT_EQ(ids->load(), 2);
+  EXPECT_EQ(attempts->load(), 1);
+  EXPECT_EQ(duration->load(), 1025u);
+  EXPECT_TRUE(preempted->load());
+}
+
+TEST_F(MetaAutomaticFailoverReconcilerTest,
        InstallAtSameAppliedIndexRefreshesDetectorPolicy) {
   SeedCluster();
   std::atomic<int> generated_ids{0};
@@ -1018,6 +1100,12 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 
   // A new elected Raft term discards both the old warmup and its 999 ms
   // suspicion; neither interval is allowed to leak into the new bracket.
+  // Revoke the old leader before jumping the injected clock. Otherwise it
+  // can legitimately trigger in the scheduling gap before yield_leadership.
+  data_runtime_->SetLeaderAuthorityEligible(CurrentTerm(), false);
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.blocker_ == MetaAutomaticFailoverBlocker::kLeaderIneligible;
+  }));
   now_steady_ms_.store(20'000, std::memory_order_release);
   StartEligibleTerm(/*reelect=*/true);
   ASSERT_TRUE(WaitForLeadershipWarmup());
