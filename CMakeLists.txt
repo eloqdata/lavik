@@ -620,6 +620,7 @@ set(LAVIK_META_CORE_SOURCES
   src/meta/policy_store.cpp
   src/meta/population_manifest_store.cpp
   src/meta/proposal_executor.cpp
+  src/meta/proposal_view.cpp
   src/meta/state_apply.cpp
   src/meta/state_machine.cpp
   src/meta/topology_store.cpp
@@ -892,6 +893,7 @@ if (BUILD_TESTING)
     tests/meta_model_test.cpp
     tests/meta_observation_test.cpp
     tests/meta_observation_facts_test.cpp
+    tests/meta_proposal_view_test.cpp
     tests/meta_owner_serviceability_test.cpp
     tests/meta_sentinel_discovery_test.cpp
     tests/meta_sentinel_server_test.cpp

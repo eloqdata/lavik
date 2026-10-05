@@ -29,7 +29,7 @@
 
 namespace lavik::meta {
 
-class MetaCommittedView;
+class MetaProposalView;
 class MetaObservationStore;
 
 inline constexpr std::string_view kFailoverOperationKind = "failover";
@@ -68,7 +68,7 @@ absl::StatusOr<FailoverOperationIntent> DecodeFailoverOperationIntent(
 // durable CAS/invariant. Malformed
 // requests and generic failover mutations are rejected before Raft append.
 absl::Status ValidateFailoverProposal(const MetaCommand& command,
-                                      const MetaCommittedView& view,
+                                      const MetaProposalView& view,
                                       const MetaObservationStore& observations,
                                       std::int64_t proposal_now_unix_ms);
 

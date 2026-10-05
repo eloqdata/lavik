@@ -410,6 +410,17 @@ struct ProposalFixture {
   }
 };
 
+absl::Status ValidateProposal(const MetaCommand& command,
+                              const MetaCommittedView& view,
+                              const MetaObservationStore& observations,
+                              std::int64_t now) {
+  return ValidateFailoverProposal(
+      command,
+      MetaProposalView::FromStores(
+          command, view.stores(), {view.applied_index(), view.applied_index()}),
+      observations, now);
+}
+
 TEST(MetaFailoverOperationIntentCodecTest, RoundTripsCanonicalRequest) {
   const FailoverOperationIntent intent = OperationIntent();
 
@@ -479,31 +490,31 @@ TEST(MetaFailoverValidationTest, AcceptsOnlyCanonicalRequestOnlySubmit) {
   MetaStores stores;
   SubmitOperation submit = FailoverSubmit();
 
-  EXPECT_TRUE(ValidateFailoverProposal(MetaCommand(submit),
-                                       MetaCommittedView(stores, 0),
-                                       observations, 1'000)
+  EXPECT_TRUE(ValidateProposal(MetaCommand(submit),
+                               MetaCommittedView(stores, 0), observations,
+                               1'000)
                   .ok());
 
   SubmitOperation malformed = submit;
   malformed.intent_ = "not-a-failover-request";
   malformed.intent_hash_ = MetaSha256(malformed.intent_);
-  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
-                MetaCommand(malformed), MetaCommittedView(stores, 0),
-                observations, 1'000)),
+  EXPECT_EQ(MetaFailureClassOf(ValidateProposal(MetaCommand(malformed),
+                                                MetaCommittedView(stores, 0),
+                                                observations, 1'000)),
             MetaFailureClass::kDomainReject);
 
   SubmitOperation wrong_hash = submit;
   wrong_hash.intent_hash_ = Bytes<32>(4);
-  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
-                MetaCommand(wrong_hash), MetaCommittedView(stores, 0),
-                observations, 1'000)),
+  EXPECT_EQ(MetaFailureClassOf(ValidateProposal(MetaCommand(wrong_hash),
+                                                MetaCommittedView(stores, 0),
+                                                observations, 1'000)),
             MetaFailureClass::kDomainReject);
 
   SubmitOperation history_bound = submit;
   history_bound.replication_history_id_ = Bytes<20>(7);
-  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
-                MetaCommand(history_bound), MetaCommittedView(stores, 0),
-                observations, 1'000)),
+  EXPECT_EQ(MetaFailureClassOf(ValidateProposal(MetaCommand(history_bound),
+                                                MetaCommittedView(stores, 0),
+                                                observations, 1'000)),
             MetaFailureClass::kDomainReject);
 }
 
@@ -516,21 +527,57 @@ TEST(MetaFailoverValidationTest, RejectsGenericMutationOfFailoverOperation) {
 
   TransitionOperationPhase transition;
   transition.operation_id_ = submit.operation_id_;
-  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
-                MetaCommand(transition), view, observations, 1'000)),
+  EXPECT_EQ(MetaFailureClassOf(ValidateProposal(MetaCommand(transition), view,
+                                                observations, 1'000)),
             MetaFailureClass::kDomainReject);
 
   CompleteOperation complete;
   complete.operation_id_ = submit.operation_id_;
-  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
-                MetaCommand(complete), view, observations, 1'000)),
+  EXPECT_EQ(MetaFailureClassOf(ValidateProposal(MetaCommand(complete), view,
+                                                observations, 1'000)),
             MetaFailureClass::kDomainReject);
 
   AbortOperation abort;
   abort.operation_id_ = submit.operation_id_;
-  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
-                MetaCommand(abort), view, observations, 1'000)),
+  EXPECT_EQ(MetaFailureClassOf(ValidateProposal(MetaCommand(abort), view,
+                                                observations, 1'000)),
             MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverValidationTest,
+     OperatorRecoveryRequiresNoOtherEligibleCandidate) {
+  ProposalFixture fixture;
+  fixture.AddAlternate();
+  auto progress = fixture.CandidateProgress();
+  progress.operator_recovery_ = true;
+  progress.population_ready_ = false;
+  progress.source_group_term_ = 0;
+  progress.source_node_id_.clear();
+  progress.source_assignment_id_ = {};
+  progress.source_boot_incarnation_ = {};
+  progress.source_replication_history_id_ = {};
+  progress.applied_next_lsns_.clear();
+  const MetaObservationIdentity identity{fixture.candidate,
+                                         fixture.candidate_boot, 1};
+  ASSERT_TRUE(fixture.observations.AdoptSession(identity, 999).ok());
+  ASSERT_TRUE(
+      fixture.observations
+          .Ingest({identity, progress}, MetaStoresFacts(fixture.stores), 1000)
+          .ok());
+  auto begin = fixture.UncontrolledBegin(true);
+  begin.candidate_action_->operator_recovery_ = true;
+  begin.candidate_action_->domain_ = {};
+  const auto validate = [&] {
+    return ValidateProposal(
+        begin, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+        fixture.observations, 1001);
+  };
+  EXPECT_TRUE(validate().ok()) << validate();
+  fixture.ReportAlternate(1000);
+  const auto rejected = validate();
+  EXPECT_EQ(MetaFailureClassOf(rejected), MetaFailureClass::kDomainReject);
+  EXPECT_EQ(rejected.message(),
+            "operator recovery requires no eligible automatic candidate");
 }
 
 TEST(MetaFailoverValidationTest,
@@ -543,13 +590,13 @@ TEST(MetaFailoverValidationTest,
   ASSERT_TRUE(planned.ok()) << planned.status();
   ASSERT_TRUE(planned->has_value());
   ASSERT_NE(std::get_if<BeginControlledFailover>(&**planned), nullptr);
-  EXPECT_TRUE(ValidateFailoverProposal(
+  EXPECT_TRUE(ValidateProposal(
                   **planned,
                   MetaCommittedView(fixture.stores, fixture.next_index - 1),
                   fixture.observations, 1'001)
                   .ok());
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 5'000)),
       MetaFailureClass::kDomainReject);
@@ -557,7 +604,7 @@ TEST(MetaFailoverValidationTest,
   fixture.observations.InvalidateCandidateOnDisconnect(
       {fixture.candidate, fixture.candidate_boot, 1}, 1'002);
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 1'002)),
       MetaFailureClass::kDomainReject);
@@ -575,7 +622,7 @@ TEST(MetaFailoverValidationTest,
   ASSERT_NE(std::get_if<BeginControlledFailover>(&**planned), nullptr);
 
   fixture.ReportCandidate(1'002, std::nullopt, 1, {11, 21});
-  EXPECT_TRUE(ValidateFailoverProposal(
+  EXPECT_TRUE(ValidateProposal(
                   **planned,
                   MetaCommittedView(fixture.stores, fixture.next_index - 1),
                   fixture.observations, 1'002)
@@ -598,7 +645,7 @@ TEST(MetaFailoverValidationTest,
   // freshness from the independent controlled-failover deadline gate.
   fixture.ReportCandidate(31'001);
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 31'001)),
       MetaFailureClass::kDomainReject);
@@ -613,7 +660,7 @@ TEST(MetaFailoverValidationTest,
   ASSERT_TRUE(planned.ok()) << planned.status();
   ASSERT_TRUE(planned->has_value());
   ASSERT_NE(std::get_if<SetUncontrolledCandidate>(&**planned), nullptr);
-  EXPECT_TRUE(ValidateFailoverProposal(
+  EXPECT_TRUE(ValidateProposal(
                   **planned,
                   MetaCommittedView(fixture.stores, fixture.next_index - 1),
                   fixture.observations, 1'011)
@@ -622,7 +669,7 @@ TEST(MetaFailoverValidationTest,
   fixture.observations.InvalidateCandidateOnDisconnect(
       {fixture.candidate, fixture.candidate_boot, 1}, 1'012);
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 1'012)),
       MetaFailureClass::kDomainReject);
@@ -640,7 +687,7 @@ TEST(MetaFailoverValidationTest,
   clear.expected_transition_ = {transition.transition_id_,
                                 transition.revision_};
 
-  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
+  EXPECT_EQ(MetaFailureClassOf(ValidateProposal(
                 MetaCommand(clear),
                 MetaCommittedView(fixture.stores, fixture.next_index - 1),
                 fixture.observations, 1'011)),
@@ -677,14 +724,14 @@ TEST(MetaFailoverValidationTest,
   ASSERT_TRUE(replacement->candidate_action_.has_value());
   EXPECT_EQ(replacement->candidate_action_->candidate_.node_id_,
             fixture.alternate);
-  EXPECT_TRUE(ValidateFailoverProposal(
+  EXPECT_TRUE(ValidateProposal(
                   **planned,
                   MetaCommittedView(fixture.stores, fixture.next_index - 1),
                   fixture.observations, 1'031)
                   .ok());
 
   fixture.ReportPrepared(1'032, 2);
-  EXPECT_TRUE(ValidateFailoverProposal(
+  EXPECT_TRUE(ValidateProposal(
                   **planned,
                   MetaCommittedView(fixture.stores, fixture.next_index - 1),
                   fixture.observations, 1'032)
@@ -696,7 +743,7 @@ TEST(MetaFailoverValidationTest,
   ProposalFixture fixture;
   fixture.ReportCandidate(1'000);
   const MetaCommand begin = fixture.UncontrolledBegin(/*with_candidate=*/true);
-  EXPECT_TRUE(ValidateFailoverProposal(
+  EXPECT_TRUE(ValidateProposal(
                   begin,
                   MetaCommittedView(fixture.stores, fixture.next_index - 1),
                   fixture.observations, 1'001)
@@ -705,7 +752,7 @@ TEST(MetaFailoverValidationTest,
   fixture.observations.InvalidateCandidateOnDisconnect(
       {fixture.candidate, fixture.candidate_boot, 1}, 1'002);
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           begin, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 1'002)),
       MetaFailureClass::kDomainReject);
@@ -729,13 +776,13 @@ TEST(MetaFailoverValidationTest,
   ASSERT_TRUE(planned.ok()) << planned.status();
   ASSERT_TRUE(planned->has_value());
   ASSERT_NE(std::get_if<AuthorizeFailoverPrepare>(&**planned), nullptr);
-  EXPECT_TRUE(ValidateFailoverProposal(
+  EXPECT_TRUE(ValidateProposal(
                   **planned,
                   MetaCommittedView(fixture.stores, fixture.next_index - 1),
                   fixture.observations, 1'011)
                   .ok());
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 5'000)),
       MetaFailureClass::kDomainReject);
@@ -743,7 +790,7 @@ TEST(MetaFailoverValidationTest,
   fixture.observations.InvalidateCandidateOnDisconnect(
       {fixture.candidate, fixture.candidate_boot, 1}, 1'012);
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 1'012)),
       MetaFailureClass::kDomainReject);
@@ -769,7 +816,7 @@ TEST(MetaFailoverValidationTest,
 
   fixture.ReportOwner(1'012);
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 1'012)),
       MetaFailureClass::kDomainReject);
@@ -805,13 +852,13 @@ TEST(
   const auto* degrade = std::get_if<DegradeControlledFailover>(&**planned);
   ASSERT_NE(degrade, nullptr);
   ASSERT_TRUE(degrade->retain_candidate_action_);
-  EXPECT_TRUE(ValidateFailoverProposal(
+  EXPECT_TRUE(ValidateProposal(
                   **planned,
                   MetaCommittedView(fixture.stores, fixture.next_index - 1),
                   fixture.observations, 1'021)
                   .ok());
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 5'000)),
       MetaFailureClass::kDomainReject);
@@ -819,7 +866,7 @@ TEST(
   fixture.observations.InvalidateCandidateOnDisconnect(
       {fixture.candidate, fixture.candidate_boot, 1}, 1'022);
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 1'022)),
       MetaFailureClass::kDomainReject);
@@ -846,7 +893,7 @@ TEST(MetaFailoverValidationTest,
   const auto* degrade = std::get_if<DegradeControlledFailover>(&**planned);
   ASSERT_NE(degrade, nullptr);
   ASSERT_FALSE(degrade->retain_candidate_action_);
-  EXPECT_TRUE(ValidateFailoverProposal(
+  EXPECT_TRUE(ValidateProposal(
                   **planned,
                   MetaCommittedView(fixture.stores, fixture.next_index - 1),
                   fixture.observations, 1'110)
@@ -857,7 +904,7 @@ TEST(MetaFailoverValidationTest,
   // stale degradation must not fence a source that has recovered.
   fixture.ReportOwner(1'111, std::nullopt, 2);
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 1'111)),
       MetaFailureClass::kDomainReject);
@@ -886,20 +933,20 @@ TEST(MetaFailoverValidationTest,
   ASSERT_TRUE(planned.ok()) << planned.status();
   ASSERT_TRUE(planned->has_value());
   ASSERT_NE(std::get_if<CommitControlledFailover>(&**planned), nullptr);
-  EXPECT_TRUE(ValidateFailoverProposal(
+  EXPECT_TRUE(ValidateProposal(
                   **planned,
                   MetaCommittedView(fixture.stores, fixture.next_index - 1),
                   fixture.observations, 1'021)
                   .ok());
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 5'000)),
       MetaFailureClass::kDomainReject);
 
   fixture.ReportCandidate(1'022);
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 1'022)),
       MetaFailureClass::kDomainReject);
@@ -933,7 +980,7 @@ TEST(MetaFailoverValidationTest,
       {fixture.candidate, fixture.candidate_boot, 1}, 1'022);
   fixture.ReportPrepared(1'023, 2);
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 1'023)),
       MetaFailureClass::kDomainReject);
@@ -962,7 +1009,7 @@ TEST(MetaFailoverValidationTest,
   ASSERT_TRUE(planned.ok()) << planned.status();
   ASSERT_TRUE(planned->has_value());
   ASSERT_NE(std::get_if<CommitUncontrolledFailover>(&**planned), nullptr);
-  EXPECT_TRUE(ValidateFailoverProposal(
+  EXPECT_TRUE(ValidateProposal(
                   **planned,
                   MetaCommittedView(fixture.stores, fixture.next_index - 1),
                   fixture.observations, 1'031)
@@ -970,7 +1017,7 @@ TEST(MetaFailoverValidationTest,
 
   fixture.ReportCandidate(1'032);
   EXPECT_EQ(
-      MetaFailureClassOf(ValidateFailoverProposal(
+      MetaFailureClassOf(ValidateProposal(
           **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
           fixture.observations, 1'032)),
       MetaFailureClass::kDomainReject);

@@ -61,6 +61,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "gtest/gtest.h"
 #include "lavik/meta/cluster_create.h"
 #include "lavik/meta/commands.h"
@@ -1697,6 +1698,29 @@ TEST_F(MetaCoordinatorServerTest,
   lavik::meta::CompleteOperation complete = growing_complete;
   complete.request_id_ = MakeRequestId(0x38);
   complete.result_.clear();
+  bool reject_terminalization = true;
+  coordinator_->AddValidateHook(
+      [&](const MetaCommand& command, const lavik::meta::MetaProposalView& view,
+          const MetaObservationStore&, std::uint64_t) {
+        if (!std::holds_alternative<lavik::meta::CompleteOperation>(command)) {
+          return absl::OkStatus();
+        }
+        const auto& header = view.operation_header(complete.operation_id_);
+        EXPECT_TRUE(header.has_value());
+        if (header.has_value()) EXPECT_EQ(header->kind_, complete_target.kind_);
+        EXPECT_EQ(view.applied_index(), machine_->last_commit_index());
+        return reject_terminalization ? absl::FailedPreconditionError(
+                                            "reject after recovery reservation")
+                                      : absl::OkStatus();
+      });
+  const auto before_hook_rejection = machine_->last_commit_index();
+  const auto rejected = ProposeSync(complete);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.status().message(), "reject after recovery reservation");
+  EXPECT_EQ(machine_->last_commit_index(), before_hook_rejection);
+  // The hook rejects after the recovery simulation. Its reservation must be
+  // released so the same effective terminalization can proceed on retry.
+  reject_terminalization = false;
   auto completed = ProposeSync(complete);
   ASSERT_TRUE(completed.ok()) << completed.status();
 
@@ -1711,6 +1735,14 @@ TEST_F(MetaCoordinatorServerTest,
   archive.request_id_ = MakeRequestId(0x3a);
   archive.operation_seqs_ = {submitted_complete->log_index_,
                              submitted_abort->log_index_};
+  // This archive passes recovery simulation, then fails actor encoding. The
+  // reservation must also unwind before dispatch has created a Raft waiter.
+  auto encoding_failure = RunTaskSync(coordinator_->Propose(
+      archive, MetaCoordinatorTestPeer::Make(
+                   std::string(lavik::meta::kMaxMetaPrincipalBytes + 1, 'x'))));
+  ASSERT_FALSE(encoding_failure.ok());
+  EXPECT_NE(encoding_failure.status().message().find("actor_principal"),
+            std::string::npos);
   auto recovery = ProposeSync(archive);
   ASSERT_TRUE(recovery.ok()) << recovery.status();
   EXPECT_EQ(recovery->verdict_, MetaAuditVerdict::kAccepted);
@@ -1796,6 +1828,54 @@ TEST_F(MetaCoordinatorServerTest,
   ASSERT_TRUE(recovered.ok()) << recovered.status();
 }
 
+TEST_F(MetaCoordinatorServerTest, DispatchFailureReleasesRecoveryReservation) {
+  StartServer();
+  MakeCoordinator();
+  WaitLeader();
+  SubmitOperation submit;
+  submit.request_id_ = MakeRequestId(0x42);
+  submit.operation_id_ = MakeOperationId(0x42);
+  submit.kind_ = "maintenance";
+  submit.intent_hash_ = lavik::meta::MetaSha256(submit.intent_);
+  ASSERT_TRUE(ProposeSync(submit).ok());
+  lavik::meta::SetAuditPolicy policy;
+  policy.request_id_ = MakeRequestId(0x43);
+  policy.policy_ = lavik::meta::MetaAuditPolicy::kStrictExport;
+  policy.attestation_ = "test-reservation-dispatch";
+  ASSERT_TRUE(ProposeSync(policy).ok());
+  {
+    std::lock_guard<std::mutex> lock(role_mu_);
+    forward_target_ = nullptr;
+  }
+  coordinator_.reset();
+  lavik::meta::MetaProposalExecutor executor(/*capacity=*/0);
+  // The borrowed executor must outlive the coordinator, including an ASSERT
+  // failure before normal fixture teardown.
+  absl::Cleanup reset_coordinator = [&] {
+    {
+      std::lock_guard<std::mutex> lock(role_mu_);
+      forward_target_ = nullptr;
+    }
+    coordinator_.reset();
+  };
+  MetaCoordinatorOptions options;
+  options.proposal_executor_ = &executor;
+  options.max_consecutive_snapshot_failures_ = 0;
+  MakeCoordinator(options);
+  lavik::meta::AbortOperation abort;
+  abort.operation_id_ = submit.operation_id_;
+  const auto before = machine_->last_commit_index();
+  for (const std::uint8_t request : {0x44, 0x45}) {
+    abort.request_id_ = MakeRequestId(request);
+    const auto result = ProposeSync(abort);
+    ASSERT_FALSE(result.ok());
+    // Both attempts must reach dispatch. A leaked recovery reservation would
+    // instead reject the second one with an uncertain-outcome gate error.
+    EXPECT_EQ(result.status().message(), "meta proposal executor is full");
+    EXPECT_EQ(machine_->last_commit_index(), before);
+  }
+}
+
 TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
   StartServer({.client_req_timeout_ms_ = 25000});
   WaitLeader();
@@ -1863,10 +1943,28 @@ TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
     ++first_audit_index;
   }
   ASSERT_LE(first_audit_index, machine_->last_commit_index());
-  apply_barrier_.Pause();
   lavik::meta::PruneAudit first_prune;
   first_prune.request_id_ = MakeRequestId(0x35);
   first_prune.through_log_index_ = first_audit_index;
+  bool reject_prune = true;
+  coordinator_->AddValidateHook(
+      [&](const MetaCommand&, const lavik::meta::MetaProposalView&,
+          const MetaObservationStore&, std::uint64_t) {
+        return reject_prune
+                   ? absl::FailedPreconditionError("reject reserved prune")
+                   : absl::OkStatus();
+      });
+  const auto rejected_prune = ProposeSync(first_prune);
+  ASSERT_FALSE(rejected_prune.ok());
+  EXPECT_EQ(rejected_prune.status().message(), "reject reserved prune");
+  reject_prune = false;
+  auto encoding_failure = RunTaskSync(coordinator_->Propose(
+      first_prune, MetaCoordinatorTestPeer::Make(std::string(
+                       lavik::meta::kMaxMetaPrincipalBytes + 1, 'x'))));
+  ASSERT_FALSE(encoding_failure.ok());
+  EXPECT_NE(encoding_failure.status().message().find("actor_principal"),
+            std::string::npos);
+  apply_barrier_.Pause();
   auto uncertain = ProposeSync(first_prune);
   ASSERT_FALSE(uncertain.ok());
   EXPECT_EQ(uncertain.status().code(), absl::StatusCode::kDeadlineExceeded);
@@ -1896,27 +1994,27 @@ TEST_F(MetaCoordinatorServerTest, ValidateHooksObserveAndRejectBeforeAppend) {
 
   struct HookObservation {
     std::string group_id_seen_;
-    std::size_t node_count_seen_ = 0;
+    std::size_t applied_index_seen_ = 0;
     const MetaObservationStore* obs_seen_ = nullptr;
   };
   std::vector<HookObservation> observations_log;
   std::vector<std::int64_t> hook_times;
   coordinator_->AddValidateHook(
-      [&](const MetaCommand& cmd, const lavik::meta::MetaCommittedView& view,
+      [&](const MetaCommand& cmd, const lavik::meta::MetaProposalView& view,
           const MetaObservationStore& obs,
           std::int64_t proposal_now_unix_ms) -> absl::Status {
         HookObservation record;
         if (const auto* create = std::get_if<CreateGroup>(&cmd)) {
           record.group_id_seen_ = create->group_id_;
         }
-        record.node_count_seen_ = view.identity().NodeCount();
+        record.applied_index_seen_ = view.applied_index();
         record.obs_seen_ = &obs;
         observations_log.push_back(std::move(record));
         hook_times.push_back(proposal_now_unix_ms);
         return absl::OkStatus();
       });
   coordinator_->AddValidateHook(
-      [&](const MetaCommand& cmd, const lavik::meta::MetaCommittedView&,
+      [&](const MetaCommand& cmd, const lavik::meta::MetaProposalView&,
           const MetaObservationStore&,
           std::int64_t proposal_now_unix_ms) -> absl::Status {
         hook_times.push_back(proposal_now_unix_ms);
@@ -1954,12 +2052,54 @@ TEST_F(MetaCoordinatorServerTest, ValidateHooksObserveAndRejectBeforeAppend) {
   ASSERT_EQ(observations_log.size(), 2u);
   EXPECT_EQ(observations_log[0].group_id_seen_, "forbidden");
   EXPECT_EQ(observations_log[1].group_id_seen_, "g1");
-  EXPECT_EQ(observations_log[1].node_count_seen_, 1u);
+  EXPECT_EQ(observations_log[1].applied_index_seen_,
+            observations_log[0].applied_index_seen_);
+  EXPECT_GT(observations_log[1].applied_index_seen_, 0u);
   EXPECT_EQ(observations_log[1].obs_seen_, &observations_);
   ASSERT_EQ(hook_times.size(), 4u);
   EXPECT_EQ(hook_times[0], hook_times[1]);
   EXPECT_EQ(hook_times[2], hook_times[3]);
   EXPECT_TRUE(machine_->StoresSnapshot().topology_.GroupExists("g1"));
+}
+
+TEST_F(MetaCoordinatorServerTest,
+       HooksKeepOneOwnedCutAcrossAnInterveningCommit) {
+  StartServer();
+  MakeCoordinator();
+  WaitLeader();
+  std::uint64_t captured_index = 0;
+  std::size_t captured_audit_count = 0;
+  std::int64_t captured_time = 0;
+  coordinator_->AddValidateHook([&](const MetaCommand&,
+                                    const lavik::meta::MetaProposalView& view,
+                                    const MetaObservationStore&,
+                                    std::int64_t now) {
+    captured_index = view.applied_index();
+    captured_audit_count = view.audit().size();
+    captured_time = now;
+    auto encoded = MetaStateMachine::EncodeCommand(MakeRegister(0x61));
+    if (!encoded.ok()) return encoded.status();
+    const auto pending = server_->append_entries({*encoded});
+    if (!WaitFor([&] { return pending->has_result(); },
+                 std::chrono::seconds(5))) {
+      return absl::DeadlineExceededError("test intervening append timed out");
+    }
+    EXPECT_EQ(pending->get_result_code(), lavik::meta::MetaRaftResultCode::OK);
+    return absl::OkStatus();
+  });
+  coordinator_->AddValidateHook(
+      [&](const MetaCommand&, const lavik::meta::MetaProposalView& view,
+          const MetaObservationStore&, std::int64_t now) {
+        EXPECT_GT(machine_->last_commit_index(), captured_index);
+        EXPECT_EQ(view.applied_index(), captured_index);
+        EXPECT_EQ(view.audit().size(), captured_audit_count);
+        EXPECT_EQ(now, captured_time);
+        return absl::OkStatus();
+      });
+  auto result = ProposeSync(MakeRegister(0x62));
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(result->verdict_, MetaAuditVerdict::kAccepted);
+  EXPECT_GT(result->log_index_, captured_index + 1);
 }
 
 TEST_F(MetaCoordinatorServerTest, UncertainOutcomeTimeoutIsReconcilable) {

@@ -49,6 +49,7 @@ class MetaObservationFactsView final : public MetaCommittedFacts {
 
  private:
   friend class MetaStateMachine;
+  friend class MetaProposalView;
   // Extraction preserves ordered store traversal. Additional indices are
   // constructed here only after the state-machine lock has been released.
   MetaObservationFactsView(std::vector<std::string> active_nodes,

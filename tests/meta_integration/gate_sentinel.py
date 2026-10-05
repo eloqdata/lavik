@@ -152,6 +152,16 @@ class SentinelTest(unittest.TestCase):
         self.assertIsInstance(reply, RespError)
         self.assertTrue(reply.startswith(prefix), repr(reply))
 
+    def wait_discovery_leader(self, node):
+        # Election precedes state-machine catch-up and leader authority
+        # admission. Discovery correctly drops connections in that window;
+        # wait for the same authority before asserting steady-state replies.
+        H.wait_until(
+            "authoritative Meta leader",
+            5,
+            lambda: node.ctl("clusterstatus 1").startswith("OK "),
+        )
+
     def test_authenticated_connection_without_data_cluster(self):
         node, port = self.node()
         client = self.client(port)
@@ -163,7 +173,7 @@ class SentinelTest(unittest.TestCase):
 
     def test_subscription_protocol_and_reset(self):
         node, port = self.node(bootstrap=True)
-        H.wait_until("Meta leader", 5, node.is_leader)
+        self.wait_discovery_leader(node)
         for protocol in (2, 3):
             client = self.client(port)
             client.command("HELLO", protocol, "AUTH", "default", "sentinel-secret")
@@ -211,7 +221,7 @@ class SentinelTest(unittest.TestCase):
             # Discovery exchanges carry committed topology claims, so Lavik
             # answers them only on a caught-up leader; replay them there.
             leader, leader_port = self.node(password=password, bootstrap=True)
-            H.wait_until("Meta leader", 5, leader.is_leader)
+            self.wait_discovery_leader(leader)
             sentinel_compat.check_discovery_port(self, leader_port, password)
             leader.terminate()
 
@@ -366,7 +376,7 @@ class SentinelTest(unittest.TestCase):
     def test_discovery_null_contract_on_bootstrap_leader(self):
         leader, leader_port = self.node(bootstrap=True)
         follower, follower_port = self.node()
-        H.wait_until("Meta leader", 5, leader.is_leader)
+        self.wait_discovery_leader(leader)
         self.assertFalse(follower.is_leader())
         client = self.client(leader_port)
         self.assertEqual(client.command("AUTH", "sentinel-secret"), b"OK")
@@ -481,7 +491,7 @@ class SentinelTest(unittest.TestCase):
 
     def test_slow_reader_keeps_admin_responsive_and_drains(self):
         node, port = self.node(password="", maxclients=1, bootstrap=True)
-        H.wait_until("Meta leader", 5, node.is_leader)
+        self.wait_discovery_leader(node)
         time.sleep(0.05)
         slow = self.client(port)
         slow.command("HELLO", 3)

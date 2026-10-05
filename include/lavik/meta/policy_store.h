@@ -22,7 +22,8 @@
 //
 // The raw compact JSON is retained unchanged for administration and exact
 // replay identity. Admission and snapshot restore validate it; consumers use
-// typed current-policy accessors and never parse JSON themselves.
+// typed current-policy accessors or the registered decoders. Capture code may
+// first own current raw documents so decoding runs outside the state lock.
 // Versions start at 1 and are consecutive. Each family retains the newest 32
 // versions; admitting a later version evicts the oldest atomically.
 //
@@ -113,6 +114,10 @@ class MetaPolicyStore {
   std::optional<MetaPolicyVersionView> FindVersion(const std::string& policy_id,
                                                    std::uint64_t version) const;
   std::optional<std::uint64_t> LatestVersion(
+      const std::string& policy_id) const;
+  // Owns only the newest raw document, without decoding or copying history.
+  // Capture callers can release the state lock before typed decoding.
+  std::optional<MetaPolicyVersionView> CurrentVersion(
       const std::string& policy_id) const;
   std::vector<MetaPolicyVersionView> Versions() const;
 

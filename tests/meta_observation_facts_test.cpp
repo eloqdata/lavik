@@ -411,6 +411,43 @@ TEST_F(MetaObservationFactsFixture,
   EXPECT_FALSE(captured.FailoverTransitionById(Bytes<16>(0xff)).has_value());
 }
 
+TEST_F(MetaObservationFactsFixture,
+       ProposalFactsPreserveCrossGroupEvidenceAndLifetime) {
+  meta::StartCandidateRecovery command;
+  command.group_id_ = kRecovering.id;
+  auto view = machine_->CaptureProposal(command);
+  auto copied = view;
+  auto retained = std::move(copied);
+  const meta::MetaStoresFacts original_facts(stores_);
+  // Query the other Group's observations too, including node-wide lookup.
+  for (const auto& observation :
+       Observations(Candidate(kControlled), digest_)) {
+    SCOPED_TRACE(observation.payload_.index());
+    meta::MetaObservationStore original;
+    meta::MetaObservationStore projected;
+    ASSERT_TRUE(original.AdoptSession(observation.identity_, 999).ok());
+    ASSERT_TRUE(projected.AdoptSession(observation.identity_, 999).ok());
+    ASSERT_TRUE(original.Ingest(observation, original_facts, 1000).ok());
+    ASSERT_TRUE(projected.Ingest(observation, retained.facts(), 1000).ok());
+    ExpectEqualObservations(original, projected, original_facts,
+                            retained.facts(), 1001);
+  }
+  const auto transition =
+      retained.facts().FailoverTransitionById(kControlled.TransitionId());
+  ASSERT_TRUE(transition.has_value());
+  EXPECT_EQ(transition->group_id_, kControlled.id);
+  meta::MetaStores empty;
+  Install(empty, 101);
+  machine_.reset();
+  EXPECT_EQ(retained.applied_index(), 100u);
+  EXPECT_EQ(retained.facts()
+                .FailoverTransitionById(kControlled.TransitionId())
+                ->transition_,
+            transition->transition_);
+  EXPECT_TRUE(retained.facts().IsActiveNode(Node(kRecovering.source)));
+  EXPECT_EQ(retained.group(command.group_id_)->record_.group_term_, 2u);
+}
+
 void ClearTransition(meta::MetaStores& stores, const FactsGroup& group) {
   const auto transition =
       *stores.topology_.FindGroup(group.id)->failover_transition_;
@@ -790,7 +827,10 @@ TEST(MetaObservationFactsTest, ConcurrentCommitAdvanceAndInstallKeepOneCut) {
     steps.push_back({Change::kInstall, round * 3 + 4, {}, std::move(*image)});
   }
 
-  const auto check_cut = [&](const meta::MetaObservationFactsView& view) {
+  meta::StartCandidateRecovery proposal_command;
+  proposal_command.group_id_ = create.group_id_;
+  const auto check_cut = [&](const auto& view,
+                             const meta::MetaCommittedFacts& facts) {
     const auto index = view.applied_index();
     if (index == 0 || index > kRounds * 3 + 1) {
       ADD_FAILURE() << "unexpected capture index " << index;
@@ -800,11 +840,11 @@ TEST(MetaObservationFactsTest, ConcurrentCommitAdvanceAndInstallKeepOneCut) {
     // installs the next term together with one additional active node.
     const auto completed = (index - 1) / 3;
     const auto phase = (index - 1) % 3;
-    EXPECT_EQ(view.CurrentGroupTerm(create.group_id_),
+    EXPECT_EQ(facts.CurrentGroupTerm(create.group_id_),
               completed * 2 + (phase == 0 ? 0u : 1u));
     EXPECT_EQ(view.state_change_index(), phase == 2 ? index - 1 : index);
     for (std::uint64_t node = 0; node < kRounds; ++node) {
-      EXPECT_EQ(view.IsActiveNode(node_id(node)), node < completed)
+      EXPECT_EQ(facts.IsActiveNode(node_id(node)), node < completed)
           << "at committed cut " << index << ", node " << node;
     }
   };
@@ -813,13 +853,19 @@ TEST(MetaObservationFactsTest, ConcurrentCommitAdvanceAndInstallKeepOneCut) {
     for (const auto& step : steps) {
       phase.arrive_and_wait();
       for (int capture = 0; capture < 8; ++capture) {
-        check_cut(machine->CaptureObservationFacts());
+        const auto facts = machine->CaptureObservationFacts();
+        check_cut(facts, facts);
+        const auto proposal = machine->CaptureProposal(proposal_command);
+        check_cut(proposal, proposal.facts());
       }
       phase.arrive_and_wait();
       // The writer cannot enter the next phase until both readers finish
       // this check, so this also verifies every completed mutation was seen.
       const auto view = machine->CaptureObservationFacts();
-      check_cut(view);
+      check_cut(view, view);
+      const auto proposal = machine->CaptureProposal(proposal_command);
+      check_cut(proposal, proposal.facts());
+      EXPECT_EQ(proposal.applied_index(), step.index);
       EXPECT_EQ(view.applied_index(), step.index);
       const auto cursor = machine->CaptureCommittedCursor();
       EXPECT_EQ(cursor.applied_index(), view.applied_index());
@@ -845,7 +891,10 @@ TEST(MetaObservationFactsTest, ConcurrentCommitAdvanceAndInstallKeepOneCut) {
   }
   first.join();
   second.join();
-  check_cut(machine->CaptureObservationFacts());
+  const auto facts = machine->CaptureObservationFacts();
+  check_cut(facts, facts);
+  const auto proposal = machine->CaptureProposal(proposal_command);
+  check_cut(proposal, proposal.facts());
   EXPECT_EQ(machine->CaptureCommittedCursor().applied_index(), kRounds * 3 + 1);
 }
 }  // namespace

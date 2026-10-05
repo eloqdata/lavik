@@ -132,14 +132,14 @@ const MetaDataControlRuntimeGroup* RuntimeGroupFor(
 }
 
 bool RuntimeProjectionIsCurrent(
-    const MetaCommittedView& view, const MetaTopologyGroupView& group,
-    const MetaAssignmentId& assignment,
+    std::uint64_t applied_index, std::uint64_t topology_epoch,
+    const MetaTopologyGroupView& group, const MetaAssignmentId& assignment,
     const MetaDataControlRuntimeNode& runtime_node) {
   const MetaDataControlRuntimeGroup* runtime_group =
       RuntimeGroupFor(runtime_node, group.group_id_);
   return runtime_node.leader_term_ != 0 &&
-         runtime_node.validated_committed_high_water_ >= view.applied_index() &&
-         runtime_node.topology_epoch_ == view.topology().TopologyEpoch() &&
+         runtime_node.validated_committed_high_water_ >= applied_index &&
+         runtime_node.topology_epoch_ == topology_epoch &&
          runtime_group != nullptr &&
          runtime_group->assignment_id_ == assignment &&
          runtime_group->group_term_ == group.record_.group_term_ &&
@@ -291,13 +291,14 @@ bool HandoffComplete(const MetaDataControlRuntimeNode* runtime_node,
 }
 
 absl::StatusOr<MetaAutomaticFailoverStateMachine::Input> BuildInput(
-    const MetaCommittedView& view, const MetaTopologyGroupView& group,
+    std::uint64_t applied_index, std::uint64_t topology_epoch,
+    const std::optional<MetaGroupAuthorityView>& grant,
+    const MetaTopologyGroupView& group,
     const MetaAutomaticUncontrolledFailoverPolicy& automatic,
     const MetaAuthorityLeasePolicy& lease,
     const MetaDataControlRuntimeSnapshot& runtime,
     const MetaObservationStore& observations, std::uint64_t now_steady_ms,
     std::uint32_t observation_ttl_ms, bool warmup_complete) {
-  const auto grant = view.topology().AuthorityFor(group.group_id_);
   if (!grant.has_value()) {
     return absl::FailedPreconditionError(
         "automatic failover group has no grant state");
@@ -312,7 +313,8 @@ absl::StatusOr<MetaAutomaticFailoverStateMachine::Input> BuildInput(
       RuntimeNodeFor(runtime, group.record_.owner_);
   const bool projection_current =
       runtime_node != nullptr &&
-      RuntimeProjectionIsCurrent(view, group, *assignment, *runtime_node);
+      RuntimeProjectionIsCurrent(applied_index, topology_epoch, group,
+                                 *assignment, *runtime_node);
   const MetaOwnerAuthorityAnchor committed =
       OwnerAnchor(group, *assignment, runtime_node, projection_current);
   const auto observed = observations.OwnerObservationFor(group.record_.owner_);
@@ -584,7 +586,7 @@ void RemoveAdmission(
 
 absl::Status ValidateAutomaticProposal(
     const std::shared_ptr<MetaAutomaticFailoverReconciler::Core>& core,
-    const MetaCommand& proposed, const MetaCommittedView& view,
+    const MetaCommand& proposed, const MetaProposalView& view,
     const MetaObservationStore& observations, std::int64_t now_unix_ms) {
   const auto* command = std::get_if<BeginUncontrolledFailover>(&proposed);
   if (command == nullptr ||
@@ -623,21 +625,23 @@ absl::Status ValidateAutomaticProposal(
     return absl::FailedPreconditionError(
         "automatic failover leader authority is no longer eligible");
   }
-  const auto group = view.topology().FindGroup(command->group_id_);
+  const auto& group = view.group(command->group_id_);
   if (!group.has_value()) {
     return absl::FailedPreconditionError(
         "automatic failover group disappeared before append");
   }
-  const auto automatic = view.policy().CurrentAutomaticUncontrolledFailover();
-  const auto lease = view.policy().CurrentAuthorityLease();
+  const auto& automatic = view.automatic_policies().automatic_;
+  const auto& lease = view.automatic_policies().lease_;
   if (!automatic.has_value() || !lease.has_value()) {
     return absl::FailedPreconditionError(
         "automatic failover requires both current global Policies");
   }
-  auto input = BuildInput(view, *group, *automatic, *lease, runtime,
-                          observations, core->options_.now_steady_ms_(),
-                          core->options_.observation_ttl_ms_,
-                          /*warmup_complete=*/true);
+  auto input = BuildInput(
+      view.applied_index(), view.automatic_policies().topology_epoch_,
+      view.authority(command->group_id_), *group, *automatic, *lease, runtime,
+      observations, core->options_.now_steady_ms_(),
+      core->options_.observation_ttl_ms_,
+      /*warmup_complete=*/true);
   if (!input.ok()) return input.status();
   // The command records the exact reason observed at the threshold edge, but
   // moving between exact failure reasons does not interrupt unserviceability.
@@ -746,7 +750,7 @@ MetaAutomaticFailoverReconciler::~MetaAutomaticFailoverReconciler() {
 
 MetaValidateHook MetaAutomaticFailoverReconciler::validation_hook() const {
   const std::shared_ptr<Core> core = core_;
-  return [core](const MetaCommand& command, const MetaCommittedView& view,
+  return [core](const MetaCommand& command, const MetaProposalView& view,
                 const MetaObservationStore& observations,
                 std::int64_t proposal_now_unix_ms) {
     return ValidateAutomaticProposal(core, command, view, observations,
@@ -1018,10 +1022,12 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
           }
           continue;
         }
-        auto input =
-            BuildInput(subscribed.view_, group, *automatic, *lease, runtime,
-                       context->Observations(), now_steady,
-                       core->options_.observation_ttl_ms_, warmup_complete);
+        auto input = BuildInput(
+            subscribed.view_.applied_index(),
+            subscribed.view_.topology().TopologyEpoch(),
+            subscribed.view_.topology().AuthorityFor(group.group_id_), group,
+            *automatic, *lease, runtime, context->Observations(), now_steady,
+            core->options_.observation_ttl_ms_, warmup_complete);
         if (!input.ok()) {
           if (last_error != input.status().message()) {
             spdlog::warn("automatic failover evaluation blocked: {}",

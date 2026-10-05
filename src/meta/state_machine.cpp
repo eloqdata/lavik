@@ -289,6 +289,19 @@ MetaCommittedStoresSnapshot MetaStateMachine::CaptureStores() const {
            last_state_change_idx_.load(std::memory_order_relaxed)}};
 }
 
+MetaProposalView MetaStateMachine::CaptureProposal(
+    const MetaCommand& command) const {
+  MetaProposalView::CaptureData data;
+  {
+    std::lock_guard lock(mutex_);
+    data = MetaProposalView::Extract(
+        command, stores_,
+        {last_committed_idx_.load(std::memory_order_relaxed),
+         last_state_change_idx_.load(std::memory_order_relaxed)});
+  }
+  return MetaProposalView(std::move(data));
+}
+
 MetaObservationFactsView MetaStateMachine::CaptureObservationFacts() const {
   std::vector<std::string> active_nodes;
   std::vector<MetaObservationGroupFacts> groups;
