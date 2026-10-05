@@ -13,6 +13,7 @@
 
 #include "absl/status/statusor.h"
 #include "lavik/meta/committed_status_view.h"
+#include "lavik/meta/data_publication_view.h"
 #include "lavik/meta/observation_facts_view.h"
 #include "lavik/meta/proposal_view.h"
 #include "lavik/meta/raft.h"
@@ -71,6 +72,15 @@ class MetaStateMachine {
   MetaStores StoresSnapshot() const;
   // Full-state capture, paired with both indices for full-view subscriptions.
   MetaCommittedStoresSnapshot CaptureStores() const;
+  // Owned publication data and both indices from one state lock. Policy
+  // decoding and view destruction never run under that lock.
+  MetaDataPublicationView CaptureDataPublication() const;
+  // Exact live/archive receipt and, only on absence, its live operation.
+  MetaDirectiveResultView CaptureDirectiveResult(
+      const MetaTerminalReceiptKey& key) const;
+  // Post-proposal reconciliation needs only this exact live/archive receipt.
+  std::optional<MetaTerminalReceipt> FindTerminalReceipt(
+      const MetaTerminalReceiptKey& key) const;
   // Captures admission data and its indices under one state lock. The result
   // owns its lifetime independently of this machine and subsequent commits.
   // Observation-facts indexing and Policy decoding happen after releasing it.

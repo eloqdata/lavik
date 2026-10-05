@@ -599,6 +599,7 @@ set(LAVIK_META_CORE_SOURCES
   src/meta/candidate_plan.cpp
   src/meta/cluster_create_reconciler.cpp
   src/meta/commands.cpp
+  src/meta/data_publication_view.cpp
   src/meta/control_projector.cpp
   src/meta/coordinator.cpp
   src/meta/ctl_server.cpp

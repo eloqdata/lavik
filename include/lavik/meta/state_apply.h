@@ -165,6 +165,12 @@ bool HasDataClusterArtifacts(const MetaStores& stores);
 absl::Status ValidateCommittedDirectiveAnchor(
     const MetaStores& stores, const MetaDirectiveSpec& directive);
 
+// Same predicate for owned publication inputs. The caller resolves all three
+// participant identities and the directive's Group/authority from one cut.
+absl::Status ValidateCommittedDirectiveAnchor(
+    const MetaDirectiveSpec& directive, bool participants_active,
+    const MetaTopologyGroupView* group, const MetaGroupAuthorityView* grant);
+
 // The outcome of applying one committed command. verdict_ reuses the audit
 // schema's enum so the apply result and the persisted audit verdict can never
 // drift apart; a kRejected verdict is always the kDomainReject class

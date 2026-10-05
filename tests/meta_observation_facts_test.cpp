@@ -773,7 +773,8 @@ TEST_F(MetaObservationFactsFixture,
             "commit-stale:candidate-is-committed-owner");
 }
 
-TEST(MetaObservationFactsTest, ConcurrentCommitAdvanceAndInstallKeepOneCut) {
+template <auto CaptureFacts>
+void CheckConcurrentCaptures() {
   constexpr std::uint64_t kRounds = 16;
   const auto node_id = [](std::uint64_t index) {
     constexpr std::string_view digits = "0123456789abcdef";
@@ -853,7 +854,7 @@ TEST(MetaObservationFactsTest, ConcurrentCommitAdvanceAndInstallKeepOneCut) {
     for (const auto& step : steps) {
       phase.arrive_and_wait();
       for (int capture = 0; capture < 8; ++capture) {
-        const auto facts = machine->CaptureObservationFacts();
+        const auto facts = (machine.get()->*CaptureFacts)();
         check_cut(facts, facts);
         const auto proposal = machine->CaptureProposal(proposal_command);
         check_cut(proposal, proposal.facts());
@@ -861,7 +862,7 @@ TEST(MetaObservationFactsTest, ConcurrentCommitAdvanceAndInstallKeepOneCut) {
       phase.arrive_and_wait();
       // The writer cannot enter the next phase until both readers finish
       // this check, so this also verifies every completed mutation was seen.
-      const auto view = machine->CaptureObservationFacts();
+      const auto view = (machine.get()->*CaptureFacts)();
       check_cut(view, view);
       const auto proposal = machine->CaptureProposal(proposal_command);
       check_cut(proposal, proposal.facts());
@@ -891,10 +892,71 @@ TEST(MetaObservationFactsTest, ConcurrentCommitAdvanceAndInstallKeepOneCut) {
   }
   first.join();
   second.join();
-  const auto facts = machine->CaptureObservationFacts();
+  const auto facts = (machine.get()->*CaptureFacts)();
   check_cut(facts, facts);
   const auto proposal = machine->CaptureProposal(proposal_command);
   check_cut(proposal, proposal.facts());
   EXPECT_EQ(machine->CaptureCommittedCursor().applied_index(), kRounds * 3 + 1);
 }
+TEST(MetaObservationFactsTest, ConcurrentCommitAdvanceAndInstallKeepOneCut) {
+  CheckConcurrentCaptures<&meta::MetaStateMachine::CaptureObservationFacts>();
+}
+TEST(MetaDataPublicationViewTest, ConcurrentCommitAdvanceAndInstallKeepOneCut) {
+  CheckConcurrentCaptures<&meta::MetaStateMachine::CaptureDataPublication>();
+}
+
+// Transition and candidate ordering intentionally differ from Group ordering,
+// so every global lookup must cover the whole committed set.
+TEST_F(MetaObservationFactsFixture, PublicationFactsMatchAllObservationTypes) {
+  const auto captured = machine_->CaptureDataPublication();
+  const meta::MetaStoresFacts original_facts(stores_);
+  for (const auto& observation :
+       Observations(Candidate(kControlled), digest_)) {
+    SCOPED_TRACE(observation.payload_.index());
+    meta::MetaObservationStore original;
+    meta::MetaObservationStore projected;
+    ASSERT_TRUE(original.AdoptSession(observation.identity_, 999).ok());
+    ASSERT_TRUE(projected.AdoptSession(observation.identity_, 999).ok());
+    ASSERT_TRUE(original.Ingest(observation, original_facts, 1000).ok());
+    ASSERT_TRUE(projected.Ingest(observation, captured, 1000).ok());
+    EXPECT_EQ(projected.size(), 1u);
+    EXPECT_GT(projected.retained_bytes(), 0u);
+    ExpectEqualObservations(original, projected, original_facts, captured,
+                            1001);
+    original.RevalidateAll(original_facts, 1001);
+    projected.RevalidateAll(captured, 1001);
+    EXPECT_EQ(projected.size(), 1u);
+    ExpectEqualObservations(original, projected, original_facts, captured,
+                            1001);
+  }
+  for (const auto& group : {kControlled, kRecovering}) {
+    const auto transition =
+        captured.FailoverTransitionById(group.TransitionId());
+    ASSERT_TRUE(transition.has_value());
+    EXPECT_EQ(transition->group_id_, group.id);
+    EXPECT_EQ(transition->transition_,
+              *stores_.topology_.FindGroup(group.id)->failover_transition_);
+    EXPECT_TRUE(captured.IsCurrentFailoverCandidate(Node(group.candidate),
+                                                    group.CandidateBoot()));
+    EXPECT_FALSE(captured.IsCurrentFailoverCandidate(Node(group.candidate),
+                                                     group.SourceBoot()));
+    EXPECT_TRUE(captured.IsOwnerAssignment(group.id, Node(group.source),
+                                           group.SourceAssignment()));
+    EXPECT_FALSE(captured.AssignmentMatches(group.id, Node(group.candidate),
+                                            group.SourceAssignment()));
+  }
+  EXPECT_FALSE(captured.IsActiveNode("unknown"));
+  EXPECT_EQ(captured.CurrentGroupTerm("unknown"), 0u);
+  EXPECT_EQ(captured.CurrentPopulationManifestRevision("unknown"), 0u);
+  EXPECT_EQ(captured.CurrentPopulationManifestDigest("unknown"),
+            meta::MetaHash256{});
+  EXPECT_EQ(captured.CurrentPartitionReplicationEpoch("unknown"), 0u);
+  EXPECT_FALSE(captured.AssignmentMatches("unknown", Node(kControlled.source),
+                                          kControlled.SourceAssignment()));
+  EXPECT_FALSE(captured.IsOwnerAssignment("unknown", Node(kControlled.source),
+                                          kControlled.SourceAssignment()));
+  EXPECT_FALSE(captured.IsCurrentFailoverCandidate("unknown", Bytes<20>(1)));
+  EXPECT_FALSE(captured.FailoverTransitionById(Bytes<16>(0xff)).has_value());
+}
+
 }  // namespace

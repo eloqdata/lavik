@@ -675,6 +675,9 @@ class MetaSubscriptionCaptureTest : public MetaCoordinatorComponentTest,
       case 1:
         return keep(coordinator_->SubscribeObservationFacts(std::move(callback),
                                                             capacity));
+      case 2:
+        return keep(coordinator_->SubscribeDataPublication(std::move(callback),
+                                                           capacity));
       default:
         return keep(coordinator_->SubscribeCommittedCursor(std::move(callback),
                                                            capacity));
@@ -724,6 +727,28 @@ TEST_P(MetaSubscriptionCaptureTest, InstallBetweenCaptureAndRegistration) {
         ASSERT_TRUE(machine_->Install(2, *image).ok());
       },
       1);
+}
+
+TEST_F(MetaCoordinatorComponentTest,
+       PublicationSubscriptionRechecksInstallAtAdvancedIndex) {
+  bool installed = false;
+  MetaCoordinatorOptions options;
+  options.after_subscription_capture_for_testing_ = [&] {
+    if (installed) return;
+    installed = true;
+    auto replacement = machine_->StoresSnapshot();
+    EXPECT_TRUE(replacement.identity_.Apply(MakeRegister(0x21)).ok());
+    auto image = replacement.Serialize();
+    ASSERT_TRUE(image.ok());
+    ASSERT_TRUE(machine_->Install(2, *image).ok());
+  };
+  MakeCoordinator(std::move(options));
+  Commit(1, MakeRegister(0x11));
+  machine_->Advance(2);
+  auto start = coordinator_->SubscribeDataPublication([](const auto&) {});
+  EXPECT_EQ(start.view_.applied_index(), 2u);
+  EXPECT_EQ(start.view_.state_change_index(), 2u);
+  EXPECT_TRUE(start.view_.IsActiveNode(MakeRegister(0x21).node_id_));
 }
 
 TEST_P(MetaSubscriptionCaptureTest, OverflowResyncReplayAndCallbackLifetime) {
@@ -781,10 +806,11 @@ TEST_P(MetaSubscriptionCaptureTest, OverflowResyncReplayAndCallbackLifetime) {
 }
 
 INSTANTIATE_TEST_SUITE_P(FullObservationAndCursor, MetaSubscriptionCaptureTest,
-                         ::testing::Values(0, 1, 2),
+                         ::testing::Values(0, 1, 2, 3),
                          [](const ::testing::TestParamInfo<int>& info) {
                            return info.param == 0   ? "Full"
                                   : info.param == 1 ? "Observation"
+                                  : info.param == 2 ? "Publication"
                                                     : "Cursor";
                          });
 
