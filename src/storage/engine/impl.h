@@ -2230,19 +2230,29 @@ class StorageEngine::Impl {
     std::optional<double> before_;
     std::optional<double> after_;
   };
+  // A single-member writer may hand its checked lookup leaf to index
+  // preparation. Ownership is command-local, and the original admission
+  // follows the decoded strings until the prepared after-image is released.
+  struct SortedSetMemberProbe {
+    MemoryReservation admission_;
+    GroupedHashObject::Handle source_;
+    HashGroupSnapshot snapshot_;
+  };
   // Full-image writers derive changes from complete ordered before/after
   // pages. Typed writers may supply exact changes after checking old members
   // against both graphs and generating the ordered plan from those changes.
   // Borrowed names must outlive this coroutine; the result owns all index
   // writes. Only touched prefix leaves are decoded and retained scratch is
-  // admitted. Unlocked callers yield between pages.
+  // admitted. A probe must belong to this exact immutable predecessor and
+  // the only changed leaf. Unlocked callers yield before preparing each leaf.
   Task<absl::StatusOr<SortedSetMemberMutation>> PrepareSortedSetMembers(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedHashObject::Handle previous,
       const OrderedCollectionMutationPlan& ordered, bool unlocked = false,
       std::optional<std::span<const SortedSetMemberChange>> checked_changes =
-          std::nullopt);
+          std::nullopt,
+      SortedSetMemberProbe* probe = nullptr);
   Task<absl::Status> UpdateGroupedExpirationLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,

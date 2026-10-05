@@ -122,6 +122,66 @@ TEST(GroupedSortedSetWriteE2e, TypedChangesDoNotRereadOrderedMemberDiff) {
   EXPECT_EQ(client.Command({"ZRANGE", key, "0", "-1"}).items_.size(), 248);
 }
 
+TEST(GroupedSortedSetWriteE2e,
+     PointWritesReuseMemberLeafAndKeepBatchFailureAtomic) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires member-index leaf read failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "member-probe";
+  auto member = [](unsigned i) {
+    return std::to_string(i) + std::string(128, 'm');
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed(key)).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    ScopedEnvironment fault("LAVIK_FAIL_ZSET_MEMBER_LEAF_READ_KEY",
+                            key.c_str());
+    Server server(disk, 3);
+    Client client(server.port());
+    // Recovered pages have no command-local decoded state. The initial
+    // lookup must supply the checked leaf for replacement, insertion and
+    // deletion without the second read disabled by this fault.
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "2", member(101)}).text_, "103");
+    ASSERT_EQ(client.Command({"ZADD", key, "500", member(256)}).text_, "1");
+    ASSERT_EQ(client.Command({"ZREM", key, member(100)}).text_, "1");
+    // Multi-member writes keep bounded sequential lookup and the ordinary
+    // prepare read. Failure after planning must leave both graphs unchanged.
+    const auto failed =
+        client.Command({"ZADD", key, "900", member(10), "901", member(11)});
+    EXPECT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find("member-index leaf read failure"),
+              std::string::npos);
+    EXPECT_EQ(client.Command({"ZSCORE", key, member(10)}).text_, "10");
+    EXPECT_EQ(client.Command({"ZSCORE", key, member(11)}).text_, "11");
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "1", member(101)}).text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "1", member(101)}).text_,
+              "QUEUED");
+    const auto executed = client.Command({"EXEC"});
+    ASSERT_EQ(executed.items_.size(), 2);
+    EXPECT_EQ(executed.items_[0].text_, "104");
+    EXPECT_EQ(executed.items_[1].text_, "105");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"ZCARD", key}).text_, "256");
+  EXPECT_EQ(client.Command({"ZSCORE", key, member(100)}).text_, "-1");
+  EXPECT_EQ(client.Command({"ZSCORE", key, member(101)}).text_, "105");
+  EXPECT_EQ(client.Command({"ZSCORE", key, member(256)}).text_, "500");
+  EXPECT_EQ(client.Command({"ZSCORE", key, member(10)}).text_, "10");
+  EXPECT_EQ(client.Command({"ZSCORE", key, member(11)}).text_, "11");
+  EXPECT_EQ(client.Command({"ZRANGE", key, "0", "-1"}).items_.size(), 256);
+}
+
 TEST(GroupedSortedSetWriteE2e, AdjacentScoreMovesReusePagesAcrossRecovery) {
   PrivateDisk disk;
   auto member = [](unsigned i) { return std::string(1024, 'a' + i); };

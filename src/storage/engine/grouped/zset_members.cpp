@@ -29,7 +29,8 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedHashObject::Handle previous,
     const OrderedCollectionMutationPlan& ordered, bool unlocked,
-    std::optional<std::span<const SortedSetMemberChange>> checked_changes) {
+    std::optional<std::span<const SortedSetMemberChange>> checked_changes,
+    SortedSetMemberProbe* probe) {
   SortedSetMemberMutation result;
   if (ordered.root_.kind_ != OrderedCollectionKind::kSortedSet ||
       (previous && !previous->has_member_index()))
@@ -233,26 +234,47 @@ StorageEngine::Impl::PrepareSortedSetMembers(
   if (changes.empty()) co_return result;
 
   std::map<HashGroupId, HashGroupSnapshot> leaves;
-  GroupedScratchBudget leaf_budget;
   for (const auto& [member, change] : changes) {
     const auto* route = previous->directory().Find(member);
     if (!route) co_return absl::DataLossError("member has no prefix route");
-    if (leaves.try_emplace(route->id_).second) {
-      status = add_group(leaf_budget, route->id_);
+    leaves.try_emplace(route->id_);
+  }
+  if (probe != nullptr &&
+      (!checked_changes || probe->source_.get() != previous.get() ||
+       leaves.size() != 1 || leaves.begin()->first != probe->snapshot_.id_ ||
+       probe->snapshot_.retired_))
+    co_return absl::DataLossError("invalid Sorted Set member probe");
+  if (probe != nullptr) {
+    // The lookup already admitted and decoded this exact logical leaf.
+    // Transfer its credit with the strings rather than charging it twice.
+    result.leaves_ = std::move(probe->admission_);
+    leaves.begin()->second = std::move(probe->snapshot_);
+  } else {
+    GroupedScratchBudget leaf_budget;
+    for (const auto& [id, leaf] : leaves) {
+      status = add_group(leaf_budget, id);
       if (!status.ok()) co_return status;
     }
+    // One retained decoded leaf plus decoder/inline encoder headroom. The
+    // incoming member copies have their own reservation above.
+    auto admission = leaf_budget.Reserve(2);
+    if (!admission.ok()) co_return admission.status();
+    result.leaves_ = std::move(*admission);
   }
-  // One retained decoded leaf plus decoder/inline encoder headroom. The
-  // incoming member copies have their own reservation above.
-  auto admission = leaf_budget.Reserve(2);
-  if (!admission.ok()) co_return admission.status();
-  result.leaves_ = std::move(*admission);
   for (auto& [id, leaf] : leaves) {
+    // Reusing payload work must not remove the preparation phase's
+    // scheduling opportunity for other keys on this worker.
     if (unlocked) co_await bycorf::Yield(*store.worker_);
-    auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
-                                                 digest, previous, id);
-    if (!loaded.ok()) co_return loaded.status();
-    leaf = std::move(loaded->snapshot_);
+    if (probe == nullptr) {
+      LAVIK_FAULT_INJECT(
+          if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_MEMBER_LEAF_READ_KEY",
+                                  key)) co_return absl::
+              UnavailableError("injected member-index leaf read failure"););
+      auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
+                                                   digest, previous, id);
+      if (!loaded.ok()) co_return loaded.status();
+      leaf = std::move(loaded->snapshot_);
+    }
     for (const auto& entry : leaf.value_.entries_) {
       const auto found = changes.find(entry.field_);
       if (found == changes.end()) continue;
