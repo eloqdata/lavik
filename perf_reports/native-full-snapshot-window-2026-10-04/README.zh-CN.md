@@ -2,6 +2,8 @@
 
 2026-10-04 · [English](README.md) · [公共方法](../native-full-large-record-window-2026-10-04/METHODS.md) · [复现](../native-full-large-record-window-2026-10-04/REPRODUCE.md)
 
+**2026-10-05补测：** [四flow、20ms、十对无抓包对照](followup-2026-10-05/README.zh-CN.md)使FULL中位耗时下降 **7.37%**，**8／10对更快**。[共享Meta CI修复](../native-full-large-record-window-2026-10-04/validation/CI-FIX.md)仅改测试。下文保留2026-10-04原始批次。
+
 普通 baseline records pipeline 在本次单 source flow、密集分布负载下使 FULL 中位数在附加 RTT 5/20 ms 分别下降 **15.69% / 13.69%**。每个 partition+DB 只有一帧的稀疏均匀数据基本没有收益；持续 500 ops/s 写入时 FULL 仍接近十分钟，中位数仅改善 **2.88%**。4-flow 结果波动明显，完整重测组在 20 ms **回退 4.36%**。证据支持密集 records 场景的优化，不支持普遍 FULL 加速。
 
 ## 比较对象与条件

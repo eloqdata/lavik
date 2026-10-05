@@ -1,0 +1,281 @@
+[
+  {
+    "case": "dense-records-128m-f4-rtt20-nocap-followup",
+    "comparison": "records",
+    "before_label": "chunks",
+    "after_label": "records",
+    "expected_repeats": 10,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 2.8698187642730772,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 2.8303457577712834,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 2.700252498034388,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 4,
+            "full_seconds": 2.624794229865074,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r4-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 5,
+            "full_seconds": 2.738483634777367,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r5-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 6,
+            "full_seconds": 2.5820423187687993,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r6-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 7,
+            "full_seconds": 2.937489340081811,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r7-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 8,
+            "full_seconds": 2.7368643237277865,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r8-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 9,
+            "full_seconds": 3.1106260269880295,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r9-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 10,
+            "full_seconds": 2.6574195567518473,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r10-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          2.8698187642730772,
+          2.8303457577712834,
+          2.700252498034388,
+          2.624794229865074,
+          2.738483634777367,
+          2.5820423187687993,
+          2.937489340081811,
+          2.7368643237277865,
+          3.1106260269880295,
+          2.6574195567518473
+        ],
+        "statistics": {
+          "count": 10,
+          "min_seconds": 2.5820423187687993,
+          "median_seconds": 2.737673979252577,
+          "max_seconds": 3.1106260269880295,
+          "p50_seconds": 2.7368643237277865,
+          "p90_seconds": 2.937489340081811,
+          "p99_seconds": 3.1106260269880295,
+          "p999_seconds": 3.1106260269880295
+        }
+      },
+      "records": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 2.668903678189963,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r1-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 2.7789142481051385,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r2-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 2.7754715150222182,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r3-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 4,
+            "full_seconds": 2.575415684375912,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r4-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 5,
+            "full_seconds": 2.4167910241521895,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r5-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 6,
+            "full_seconds": 2.615940062329173,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r6-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 7,
+            "full_seconds": 2.496200275141746,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r7-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 8,
+            "full_seconds": 2.3358923182822764,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r8-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 9,
+            "full_seconds": 2.4192472021095455,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r9-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          },
+          {
+            "repeat": 10,
+            "full_seconds": 2.4262183750979602,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/dense-records-128m-f4-rtt20-nocap-followup/r10-records",
+            "revision": "9da9c797eefaea45dfde3ccc521baa440de559a8",
+            "binary_sha256": "ae24694323ff25448658bf56797f0fb36694fea310ce37224b93ab00d1f57e6a"
+          }
+        ],
+        "full_seconds": [
+          2.668903678189963,
+          2.7789142481051385,
+          2.7754715150222182,
+          2.575415684375912,
+          2.4167910241521895,
+          2.615940062329173,
+          2.496200275141746,
+          2.3358923182822764,
+          2.4192472021095455,
+          2.4262183750979602
+        ],
+        "statistics": {
+          "count": 10,
+          "min_seconds": 2.3358923182822764,
+          "median_seconds": 2.535807979758829,
+          "max_seconds": 2.7789142481051385,
+          "p50_seconds": 2.496200275141746,
+          "p90_seconds": 2.7754715150222182,
+          "p99_seconds": 2.7789142481051385,
+          "p999_seconds": 2.7789142481051385
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 2.8698187642730772,
+        "after_seconds": 2.668903678189963,
+        "speedup": 1.0752800064404624,
+        "time_reduction_pct": 7.000967746965225
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 2.8303457577712834,
+        "after_seconds": 2.7789142481051385,
+        "speedup": 1.0185077714079211,
+        "time_reduction_pct": 1.8171458213163239
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 2.700252498034388,
+        "after_seconds": 2.7754715150222182,
+        "speedup": 0.972898652866474,
+        "time_reduction_pct": -2.785629012197388
+      },
+      {
+        "repeat": 4,
+        "before_seconds": 2.624794229865074,
+        "after_seconds": 2.575415684375912,
+        "speedup": 1.0191730390510252,
+        "time_reduction_pct": 1.8812349146203555
+      },
+      {
+        "repeat": 5,
+        "before_seconds": 2.738483634777367,
+        "after_seconds": 2.4167910241521895,
+        "speedup": 1.1331073342338431,
+        "time_reduction_pct": 11.747107287399604
+      },
+      {
+        "repeat": 6,
+        "before_seconds": 2.5820423187687993,
+        "after_seconds": 2.615940062329173,
+        "speedup": 0.9870418500605125,
+        "time_reduction_pct": -1.3128268004738652
+      },
+      {
+        "repeat": 7,
+        "before_seconds": 2.937489340081811,
+        "after_seconds": 2.496200275141746,
+        "speedup": 1.1767843186841276,
+        "time_reduction_pct": 15.02266098190419
+      },
+      {
+        "repeat": 8,
+        "before_seconds": 2.7368643237277865,
+        "after_seconds": 2.3358923182822764,
+        "speedup": 1.171656887737175,
+        "time_reduction_pct": 14.65078125975059
+      },
+      {
+        "repeat": 9,
+        "before_seconds": 3.1106260269880295,
+        "after_seconds": 2.4192472021095455,
+        "speedup": 1.2857826286935923,
+        "time_reduction_pct": 22.226356330848784
+      },
+      {
+        "repeat": 10,
+        "before_seconds": 2.6574195567518473,
+        "after_seconds": 2.4262183750979602,
+        "speedup": 1.095292816189537,
+        "time_reduction_pct": 8.700213749329189
+      }
+    ],
+    "median_speedup": 1.0796061851311576,
+    "median_time_reduction_pct": 7.373631813853166,
+    "median_paired_speedup": 1.0852864113149998,
+    "median_paired_time_reduction_pct": 7.850590748147207
+  }
+]

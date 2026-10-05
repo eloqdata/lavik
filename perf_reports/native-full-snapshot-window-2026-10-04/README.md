@@ -2,6 +2,8 @@
 
 2026-10-04 · [中文](README.zh-CN.md) · [Shared methods](../native-full-large-record-window-2026-10-04/METHODS.md) · [Reproduce](../native-full-large-record-window-2026-10-04/REPRODUCE.md)
 
+**2026-10-05 follow-up:** [Ten-pair four-flow /20 ms no-capture comparison](followup-2026-10-05/README.md) reduces median FULL time by **7.37%**, with **8/10 pairs faster**. [The shared Meta CI gate repair](../native-full-large-record-window-2026-10-04/validation/CI-FIX.md) is test-only. The figures below preserve the original 2026-10-04 cohort.
+
 Pipelining ordinary baseline record frames reduced FULL time for the measured dense, single-source-flow corpus: **15.69% at 5 ms added RTT** and **13.69% at 20 ms**. Sparse/uniform groups with one record frame each show essentially no benefit. Sustained 500 ops/s foreground writes leave FULL near ten minutes, with only **2.88%** median improvement. Four-source-flow results are variable, including a **4.36% regression at 20 ms** in the complete replacement cohort. The data supports a dense-record optimization, not a general native FULL speedup.
 
 ## Comparison and conditions

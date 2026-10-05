@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "status": "predeclared-nocapture-followup-2026-10-05",
+  "repeats": 10,
+  "capture": false,
+  "comparisons": {
+    "chunks": [
+      "main",
+      "chunks"
+    ],
+    "records": [
+      "chunks",
+      "records"
+    ]
+  },
+  "common": {
+    "runtime_revision": "62509c93d40c2480f5046b71454db6cf95801b04",
+    "build_description": "GCC13 Release native O3 IPO/LTO; io_uring; test faults off",
+    "data_file_mib": 2048,
+    "max_memory_mib": 2048,
+    "backlog_mib": 64,
+    "queue_mib": 16,
+    "flush_ms": 100,
+    "timeout": 900
+  },
+  "caveats": [
+    "No concurrent builds or heavy tests during measurement.",
+    "1->1 and4->2 worker layouts keep source,target,client CPU sets disjoint on this8CPU host.",
+    "Uniform corpus is smaller to bound stop-and-wait runtime; compare variants within each case, not absolute throughput across corpora.",
+    "One writer at1large transaction/s has too few samples for a reliable p99 in short FULL runs; report count,max and distribution, not a strong tail-latency conclusion.",
+    "Real added RTT uses half-delay on each task-owned veth endpoint; actual measured target PING RTT is recorded.",
+    "Client samples include successful operations; compare completed QPS and requested rate, not requested rate alone.",
+    "Source CPU usage can be derived from samples.jsonl; peak RSS/queue metrics are sampled watermarks, not exact allocation peaks.",
+    "Mixed live runs can emit different total captured bytes because FULL duration changes the number of concurrent writes; report actual writes and frame bytes, not just requested rate.",
+    "Capture is disabled for all60runs. This later cohort cannot identify packet capture as the cause of prior differences.",
+    "10pairs improve observation counts but do not guarantee statistically stable p99; report per-run maxima, sample counts, distributions and paired FULL deltas."
+  ],
+  "cases": [
+    {
+      "name": "dense-records-128m-f4-rtt20-nocap-followup",
+      "comparison": "records",
+      "arguments": {
+        "workload": "dense",
+        "keys": 32768,
+        "value_bytes": 4096,
+        "rtt_ms": 20,
+        "source_workers": 4,
+        "target_workers": 2,
+        "source_cpus": "0-3",
+        "target_cpus": "4-5",
+        "client_cpus": "6-7",
+        "writer_warmup": 0
+      },
+      "matched_primary_case": "dense-records-128m-f4-rtt20"
+    }
+  ],
+  "declaration": {
+    "declared_at_utc": "2026-10-05T03:24:24.936252+00:00",
+    "reason": "Complete no-capture live large-value 5/20ms and dense four-flow20ms comparisons; preserve input parameters, predeclare10 AB/BA pairs for each case, retain every outcome.",
+    "runs": 60,
+    "production_binaries": "Same immutable main/chunks/records binaries as original report. CI fixes must be test-only to retain this provenance; revisit if production changes."
+  }
+}
