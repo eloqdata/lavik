@@ -17,6 +17,8 @@
 #include "gtest/gtest.h"
 #include "lavik/meta/hash.h"
 #include "lavik/meta/membership_reconciler.h"
+#include "lavik/meta/state_machine.h"
+#include "support/test_data_path.h"
 
 namespace lavik::meta {
 namespace {
@@ -84,10 +86,22 @@ class MembershipRecoveryTest : public testing::Test {
     c.intent_hash_ = MetaSha256(*bytes);
     Apply(c);
   }
-  auto Plan(unsigned local = 1) {
-    return PlanMembershipStep(MetaCommittedView(stores_, index_),
-                              *stores_.operation_.FindOperation(id_), config_,
-                              local);
+  absl::StatusOr<std::optional<MetaMembershipStep>> Plan(unsigned local = 1) {
+    auto opened = MetaStateMachine::Open(
+        lavik::test::TestDataPath("membership_reconciler_capture"));
+    if (!opened.ok()) return opened.status();
+    auto image = stores_.Serialize();
+    if (!image.ok()) return image.status();
+    if (auto status = (*opened)->Install(index_, *image); !status.ok())
+      return status;
+    const auto op = (*opened)->FindOperation(id_);
+    std::vector<std::uint32_t> ids{intent_.target_.id_};
+    for (const auto& binding : intent_.bindings_)
+      ids.push_back(binding.server_id_);
+    auto view = (*opened)->CaptureMembershipView(*op, ids);
+    if (!view)
+      return absl::InternalError("uncontended membership capture changed");
+    return PlanMembershipStep(*view, config_, local);
   }
   void AdvanceToRaft() {
     for (unsigned i = 0; i < 10; ++i) {
@@ -157,7 +171,7 @@ TEST_F(MembershipRecoveryTest,
   config_ = {Peer(1), Peer(2), Peer(3)};
   for (unsigned expected_id = 1; expected_id <= 3; ++expected_id) {
     auto step =
-        PlanInitialMetaBindings(MetaCommittedView(stores_, index_), config_,
+        PlanInitialMetaBindings(stores_.identity_.MetaMembers(), config_,
                                 /*initial_config=*/true);
     ASSERT_TRUE(step.ok()) << step.status();
     ASSERT_TRUE(step->has_value());
@@ -166,7 +180,7 @@ TEST_F(MembershipRecoveryTest,
   }
 
   auto complete =
-      PlanInitialMetaBindings(MetaCommittedView(stores_, index_), config_,
+      PlanInitialMetaBindings(stores_.identity_.MetaMembers(), config_,
                               /*initial_config=*/true);
   ASSERT_TRUE(complete.ok()) << complete.status();
   EXPECT_FALSE(complete->has_value());
@@ -184,14 +198,14 @@ TEST_F(MembershipRecoveryTest,
   conflicting.ctl_endpoint_ = Peer(2).ctl_endpoint_;
   Apply(MetaCommand(conflicting));
 
-  EXPECT_EQ(PlanInitialMetaBindings(MetaCommittedView(stores_, index_), config_,
+  EXPECT_EQ(PlanInitialMetaBindings(stores_.identity_.MetaMembers(), config_,
                                     /*initial_config=*/true)
                 .status()
                 .code(),
             absl::StatusCode::kFailedPrecondition);
 
   MetaStores empty;
-  EXPECT_EQ(PlanInitialMetaBindings(MetaCommittedView(empty, 0), config_,
+  EXPECT_EQ(PlanInitialMetaBindings(empty.identity_.MetaMembers(), config_,
                                     /*initial_config=*/false)
                 .status()
                 .code(),
@@ -208,6 +222,83 @@ TEST_F(MembershipRecoveryTest, AddRestoresEveryCommittedPrefix) {
   ASSERT_FALSE(HasFatalFailure());
   EXPECT_EQ(stores_.operation_.FindOperation(id_)->terminal_result_,
             "member-added");
+}
+
+TEST_F(MembershipRecoveryTest,
+       InitialCaptureRejectsBindingsOutsideConfiguration) {
+  config_ = {Peer(1), Peer(2)};
+  Bind(1);
+  Bind(2);
+  Bind(3);
+  auto opened = MetaStateMachine::Open("");
+  ASSERT_TRUE(opened.ok());
+  auto image = stores_.Serialize();
+  ASSERT_TRUE(image.ok());
+  ASSERT_TRUE((*opened)->Install(index_, *image).ok());
+  const auto discovery = (*opened)->CaptureMembershipDiscovery();
+  EXPECT_FALSE(discovery.operation_);
+  EXPECT_EQ(discovery.initial_bindings_.size(), 3u);
+  const auto step =
+      PlanInitialMetaBindings(discovery.initial_bindings_, config_, true);
+  EXPECT_EQ(step.status().message(),
+            "initial identity binding is absent from Meta config");
+}
+
+TEST_F(MembershipRecoveryTest,
+       CaptureOwnsSelectedBindingsAndRetriesOperationChange) {
+  Start(true);
+  Bind(4);  // Ordinary planning needs only the retained baseline and target.
+  SubmitOperation unrelated;
+  unrelated.operation_id_.fill(99);
+  unrelated.kind_ = "unrelated";
+  unrelated.intent_ = std::string(256 * 1024, 'x');
+  unrelated.intent_hash_ = MetaSha256(unrelated.intent_);
+  Apply(unrelated);
+  auto opened = MetaStateMachine::Open("");
+  ASSERT_TRUE(opened.ok());
+  auto machine = std::move(*opened);
+  auto image = stores_.Serialize();
+  ASSERT_TRUE(image.ok());
+  ASSERT_TRUE(machine->Install(index_, *image).ok());
+  const auto discovery = machine->CaptureMembershipDiscovery();
+  ASSERT_TRUE(discovery.operation_);
+  EXPECT_EQ(discovery.operation_->operation_id_, id_);
+  EXPECT_TRUE(discovery.initial_bindings_.empty());
+  const std::vector<std::uint32_t> ids{3, 2, 1, 2};
+  const auto view = machine->CaptureMembershipView(*discovery.operation_, ids);
+  ASSERT_TRUE(view);
+  ASSERT_EQ(view->bindings_.size(), 2u);
+  EXPECT_EQ(view->bindings_[0], Binding(1));
+  EXPECT_EQ(view->bindings_[1], Binding(2));
+  EXPECT_FALSE(FindMetaBinding(view->bindings_, 3));
+  EXPECT_FALSE(FindMetaBinding(view->bindings_, 4));
+  machine->Advance(++index_);
+  auto advanced = machine->CaptureMembershipView(*discovery.operation_, ids);
+  ASSERT_TRUE(advanced);
+  EXPECT_EQ(advanced->cursor_.applied_index(), index_);
+  EXPECT_EQ(advanced->cursor_.state_change_index(),
+            view->cursor_.state_change_index());
+  Bind(3);
+  image = stores_.Serialize();
+  ASSERT_TRUE(image.ok());
+  ASSERT_TRUE(machine->Install(index_, *image).ok());
+  auto bound = machine->CaptureMembershipView(*discovery.operation_, ids);
+  ASSERT_TRUE(bound);
+  EXPECT_EQ(bound->bindings_.size(), 3u);
+  EXPECT_EQ(bound->cursor_.state_change_index(), index_);
+  TransitionOperationPhase phase;
+  phase.operation_id_ = id_;
+  phase.expected_revision_ = discovery.operation_->revision_;
+  phase.kind_phase_blob_ = "bind-member";
+  Apply(phase);
+  image = stores_.Serialize();
+  ASSERT_TRUE(image.ok());
+  ASSERT_TRUE(machine->Install(index_, *image).ok());
+  EXPECT_FALSE(machine->CaptureMembershipView(*discovery.operation_, ids));
+  machine.reset();
+  EXPECT_EQ(view->operation_, discovery.operation_);
+  EXPECT_EQ(view->bindings_.size(), 2u);
+  EXPECT_EQ(bound->bindings_.back(), Binding(3));
 }
 TEST_F(MembershipRecoveryTest, RemoveRetiresOnlyAfterExactCommittedConfig) {
   Start(false);

@@ -120,6 +120,7 @@
 #include "lavik/meta/proposal_executor.h"
 #include "lavik/meta/raft.h"
 #include "lavik/meta/state_apply.h"
+#include "lavik/meta/workflow_views.h"
 
 namespace lavik::meta {
 
@@ -347,6 +348,17 @@ class MetaLeaderContext {
   MetaObservationFactsView ObservationFacts() const;
   // Atomically paired applied/state-change indices, without copying stores.
   MetaCommittedCursor CommittedCursor() const;
+  // Owned inputs for creation/membership planning. See the state-machine
+  // capture contract: selectors may race state, yielding nullopt to rediscover.
+  MetaClusterCreateDiscovery ClusterCreateDiscovery() const;
+  MetaMembershipDiscovery MembershipDiscovery() const;
+  std::optional<MetaClusterCreateView> ClusterCreateView(
+      const MetaClusterCreateDiscovery& expected,
+      std::span<const MetaOperationId> children,
+      std::span<const MetaHash256> manifests) const;
+  std::optional<MetaMembershipView> MembershipView(
+      const MetaOperationRecord& expected,
+      std::span<const std::uint32_t> member_ids) const;
   // O(1) applied cursor, including Raft configurations without commit events.
   // A changed cursor requires a fresh committed capture before publishing a
   // cut.
@@ -482,6 +494,17 @@ class MetaCoordinator {
   MetaObservationFactsView ObservationFacts() const;
   // Atomically paired applied/state-change indices, without copying stores.
   MetaCommittedCursor CommittedCursor() const;
+  // Owned inputs for creation/membership planning. See the state-machine
+  // capture contract: selectors may race state, yielding nullopt to rediscover.
+  MetaClusterCreateDiscovery ClusterCreateDiscovery() const;
+  MetaMembershipDiscovery MembershipDiscovery() const;
+  std::optional<MetaClusterCreateView> ClusterCreateView(
+      const MetaClusterCreateDiscovery& expected,
+      std::span<const MetaOperationId> children,
+      std::span<const MetaHash256> manifests) const;
+  std::optional<MetaMembershipView> MembershipView(
+      const MetaOperationRecord& expected,
+      std::span<const std::uint32_t> member_ids) const;
 
   // O(1) full applied cursor, including configuration commits that do not
   // change MetaStores or notify subscribers. This is a freshness hint, not

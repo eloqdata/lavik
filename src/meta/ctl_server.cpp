@@ -1901,9 +1901,8 @@ bycorf::Task<std::string> HandleClusterCreate(
                                  std::string(config.status().message()));
   }
   raft_view.members_ = std::move(*config);
-  const MetaCommittedView committed(before, state_machine->last_commit_index());
-  if (auto meta =
-          detail::ValidateClusterCreateMetaSet(committed, manifest, raft_view);
+  if (auto meta = detail::ValidateClusterCreateMetaSet(
+          before.identity_.MetaMembers(), manifest, raft_view);
       !meta.ok()) {
     co_return ClusterCreateError("preflight", "bad-request",
                                  std::string(meta.message()));

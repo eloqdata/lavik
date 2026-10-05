@@ -454,8 +454,16 @@ active-node identities and each Group's membership, population, authority and
 failover facts. Its complete Group domain supports transition-identity lookup
 without copying unrelated stores or payloads. Lookup indices are built and
 observations are validated after releasing the state lock; retained views
-remain immutable across later commits and snapshot installation. Other
-readers can still use the complete `CommittedView`.
+remain immutable across later commits and snapshot installation. Creation and
+membership owners use owned workflow inputs instead of copying the aggregate
+or live journal. Creation retains the complete identity/topology domains for
+its exact-set checks, current Policy and selected manifest existence, and all
+manifest-declared children, including missing/archive distinctions. Membership
+retains its active operation and the bindings named by its durable intent;
+initial binding reconciliation retains the entire Meta directory. Selected
+operations remain whole records so directive payloads, revisions and exact
+receipts preserve their recovery meaning. Other readers can still use the
+complete `CommittedView`.
 
 Committed subscribers atomically receive an initial full or purpose-specific
 view, its command-event cursor, and a bounded ordered subscription. Consumers
@@ -1090,6 +1098,11 @@ leader transition. Add binds identity before invoking `add_srv`; remove
 observes the committed configuration without the member before retiring its
 identity. Learner promotion additionally requires fresh actual application
 through the current commit. Submission alone is not a commit certificate.
+Membership planning captures its operation and selected bindings together,
+rechecking the discovered operation before adopting intent-derived selectors.
+The Raft executor independently rechecks the exact operation revision/lifecycle,
+leader term and configuration before entering a membership API.
+
 The owner checks the actual committed configuration, checkpoints each phase,
 and completes the operation only after all effects are present. Recovery also
 handles a crash between an effect and its phase checkpoint. If the removal
@@ -1302,12 +1315,16 @@ retains the caller-generated root id so the operator can resolve it with
 
 `MetaClusterCreateReconciler` runs on the Meta worker after each caught-up
 leader transition, but only while lifecycle is `Creating`. Its atomic
-committed subscription includes the recovered snapshot/WAL prefix; it loads the
-exact root id stored by topology and plans one existing Meta command at a time
-from retained intent, phase, and actual
-committed state. Every effect is checked before its phase checkpoint advances,
-including recovery between those commits. Subscription overflow reacquires the
-complete view. The reconciler uses the trusted coordinator actor for follow-up
+cursor subscription covers the recovered snapshot/WAL prefix; discovery loads
+only the exact root id stored by topology. Before each planning step, it captures
+the root, complete creation topology and every declared child at one committed
+cut. Intent decoding and child/digest selection happen outside state exclusion;
+capture rechecks the discovered root and lifecycle, retrying if they changed.
+Every effect is checked before its phase checkpoint advances, including recovery
+between those commits. Creation and membership owners check both committed cursor fields
+for eventless configuration/snapshot progress, recapture after their own proposal
+completion, and renew cursor subscription plus workflow capture after overflow.
+A notification is a wakeup hint, never durable progress. The reconciler uses the trusted coordinator actor for follow-up
 proposals; the original operator remains recorded on the root operation.
 Creation and Meta membership changes share admission, with the durable
 `Creating` lifecycle covering handoff, timeout, archive, and restart.
@@ -1457,6 +1474,7 @@ audit history rather than replacing it.
 | Owned observation-facts cuts, index-only captures, and atomic subscription registration | `include/lavik/meta/observation_facts_view.h`, `src/meta/observation_facts_view.cpp`, `src/meta/state_machine.cpp`, `src/meta/coordinator.cpp` |
 | Pure per-node projection including resolved lease duration, Data-derived heartbeat cadence, and failover/activation/follow-owner state, plus the leader-scoped Data-session publisher and causal heartbeat admission | `include/lavik/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/lavik/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
 | Manifest-bootstrapped initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `raft/engine/storage.go`, `raft/engine/join.go`, `app/lavik_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |
+| Owned creation/membership planning cuts and exact child recovery | `include/lavik/meta/workflow_views.h`, `src/meta/state_machine.cpp`, `src/meta/cluster_create_reconciler.cpp`, `src/meta/membership_reconciler.cpp` |
 | Atomic Genesis lifecycle, strict Bootstrap Policy Defaults, durable creation admission, Meta catch-up barrier, and leader-owned recovery | `include/lavik/meta/cluster_create.h`, `src/meta/cluster_create.cpp`, `include/lavik/meta/topology_store.h`, `src/meta/topology_store.cpp`, `src/meta/state_apply.cpp`, `src/meta/ctl_server.cpp`, `include/lavik/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `app/lavik_meta.cpp` |
 | Durable post-genesis Meta membership intent, exact-config recovery, leadership handoff, and identity retirement | `include/lavik/meta/membership_reconciler.h`, `src/meta/membership_reconciler.cpp`, `src/meta/ctl_server.cpp`, `src/meta/state_apply.cpp`, `tests/meta_integration/gate_membership_recovery.py` |
 | Shared Meta/Data frame, object-transfer, failover observation, transition, and activation formats | `include/lavik/cluster/control_protocol.h`, `include/lavik/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |

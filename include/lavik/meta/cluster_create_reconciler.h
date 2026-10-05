@@ -55,10 +55,20 @@ namespace detail {
 MetaOperationId ClusterCreateV1GroupOperationId(const MetaOperationId& root,
                                                 std::string_view group_id);
 
+struct ClusterCreateReadKeys {
+  std::vector<MetaOperationId> children_;
+  std::vector<MetaHash256> manifests_;
+};
+// Decode intent and derive the complete child/digest selection before taking
+// the state lock. Capture rechecks the discovered root before using these keys.
+absl::StatusOr<ClusterCreateReadKeys> CaptureClusterCreateReadKeys(
+    const MetaOperationRecord& root);
+
 // Exact desired/actual Meta validation shared by Admin admission and every
 // recovered planner step. It is read-only and never repairs membership.
 absl::Status ValidateClusterCreateMetaSet(
-    const MetaCommittedView& view, const ClusterCreateManifestV1& manifest,
+    std::span<const MetaMemberRecord> bindings,
+    const ClusterCreateManifestV1& manifest,
     const MetaClusterCreateRaftView& raft);
 
 // Plans at most one committed effect from an atomic recovered view. A missing
@@ -66,14 +76,14 @@ absl::Status ValidateClusterCreateMetaSet(
 // bounded concurrent progress. Incompatible state requires operator recovery,
 // never another destructive initialization. No I/O or in-memory phase cursor.
 absl::StatusOr<std::optional<MetaCommand>> PlanClusterCreateStep(
-    const MetaCommittedView& view, const MetaOperationRecord& operation,
+    const MetaClusterCreateView& view,
     const MetaDataControlRuntimeSnapshot& runtime,
     const MetaClusterCreateRaftView& raft);
 }  // namespace detail
 
 // Leader-scoped owner of durable cluster-create operations. Admin submits the
 // complete intent before changing topology and merely waits for this owner.
-// Every Start rescans the recovered operation journal. Demotion/shutdown joins
+// Every Start discovers the recovered topology root. Demotion/shutdown joins
 // local proposals, not remote Data completion, leaving durable work resumable.
 class MetaClusterCreateReconciler final : public MetaReconciler {
  public:

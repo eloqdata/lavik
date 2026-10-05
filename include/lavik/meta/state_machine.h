@@ -16,6 +16,7 @@
 #include "lavik/meta/observation_facts_view.h"
 #include "lavik/meta/raft.h"
 #include "lavik/meta/state_apply.h"
+#include "lavik/meta/workflow_views.h"
 
 namespace lavik::meta {
 
@@ -75,6 +76,22 @@ class MetaStateMachine {
   // Config-only Advance and snapshot Install do not emit command events.
   // Consumers use this atomic pair to detect those progress/state changes.
   MetaCommittedCursor CaptureCommittedCursor() const;
+  // Discovery copies only the exact creation root while Creating, or the first
+  // active membership operation in journal key order. Idle membership discovery
+  // includes the complete Meta binding directory for genesis reconciliation.
+  MetaClusterCreateDiscovery CaptureClusterCreateDiscovery() const;
+  MetaMembershipDiscovery CaptureMembershipDiscovery() const;
+  // Selectors are derived from the discovered intent outside the state lock.
+  // A changed operation/lifecycle returns nullopt: rediscover instead of
+  // combining old selectors with new state or declaring a recovery failure.
+  // The returned records and cursor all belong to this later atomic cut.
+  std::optional<MetaClusterCreateView> CaptureClusterCreateView(
+      const MetaClusterCreateDiscovery& expected,
+      std::span<const MetaOperationId> children,
+      std::span<const MetaHash256> manifests) const;
+  std::optional<MetaMembershipView> CaptureMembershipView(
+      const MetaOperationRecord& expected,
+      std::span<const std::uint32_t> member_ids) const;
   MetaCommittedStatusView StatusSnapshot() const;
   // Returns at most 100 live-journal summaries after an immutable submit
   // sequence, in sequence order, without copying retained operation payloads.

@@ -967,6 +967,27 @@ MetaCommittedCursor MetaCoordinator::CommittedCursor() const {
   return state_machine_.CaptureCommittedCursor();
 }
 
+MetaClusterCreateDiscovery MetaCoordinator::ClusterCreateDiscovery() const {
+  return state_machine_.CaptureClusterCreateDiscovery();
+}
+
+MetaMembershipDiscovery MetaCoordinator::MembershipDiscovery() const {
+  return state_machine_.CaptureMembershipDiscovery();
+}
+
+std::optional<MetaClusterCreateView> MetaCoordinator::ClusterCreateView(
+    const MetaClusterCreateDiscovery& expected,
+    std::span<const MetaOperationId> children,
+    std::span<const MetaHash256> manifests) const {
+  return state_machine_.CaptureClusterCreateView(expected, children, manifests);
+}
+
+std::optional<MetaMembershipView> MetaCoordinator::MembershipView(
+    const MetaOperationRecord& expected,
+    std::span<const std::uint32_t> member_ids) const {
+  return state_machine_.CaptureMembershipView(expected, member_ids);
+}
+
 std::uint64_t MetaCoordinator::AppliedIndex() const {
   return state_machine_.last_commit_index();
 }
@@ -1524,6 +1545,27 @@ MetaObservationFactsView MetaLeaderContext::ObservationFacts() const {
 
 MetaCommittedCursor MetaLeaderContext::CommittedCursor() const {
   return coordinator_->CommittedCursor();
+}
+
+MetaClusterCreateDiscovery MetaLeaderContext::ClusterCreateDiscovery() const {
+  return coordinator_->ClusterCreateDiscovery();
+}
+
+MetaMembershipDiscovery MetaLeaderContext::MembershipDiscovery() const {
+  return coordinator_->MembershipDiscovery();
+}
+
+std::optional<MetaClusterCreateView> MetaLeaderContext::ClusterCreateView(
+    const MetaClusterCreateDiscovery& expected,
+    std::span<const MetaOperationId> children,
+    std::span<const MetaHash256> manifests) const {
+  return coordinator_->ClusterCreateView(expected, children, manifests);
+}
+
+std::optional<MetaMembershipView> MetaLeaderContext::MembershipView(
+    const MetaOperationRecord& expected,
+    std::span<const std::uint32_t> member_ids) const {
+  return coordinator_->MembershipView(expected, member_ids);
 }
 
 std::uint64_t MetaLeaderContext::AppliedIndex() const {

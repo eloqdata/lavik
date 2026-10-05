@@ -310,6 +310,130 @@ MetaCommittedCursor MetaStateMachine::CaptureCommittedCursor() const {
           last_state_change_idx_.load(std::memory_order_relaxed)};
 }
 
+namespace {
+bool SameWorkflow(const MetaOperationRecord& current,
+                  const MetaOperationRecord& expected) {
+  return current.operation_id_ == expected.operation_id_ &&
+         current.operation_seq_ == expected.operation_seq_ &&
+         current.kind_ == expected.kind_ &&
+         current.revision_ == expected.revision_ &&
+         current.lifecycle_ == expected.lifecycle_ &&
+         current.intent_hash_ == expected.intent_hash_ &&
+         current.intent_ == expected.intent_;
+}
+}  // namespace
+
+MetaClusterCreateDiscovery MetaStateMachine::CaptureClusterCreateDiscovery()
+    const {
+  MetaClusterCreateDiscovery view;
+  {
+    std::lock_guard lock(mutex_);
+    view.cursor_ = {last_committed_idx_.load(std::memory_order_relaxed),
+                    last_state_change_idx_.load(std::memory_order_relaxed)};
+    view.lifecycle_ = stores_.topology_.ClusterLifecycle();
+    if (view.lifecycle_.state_ == MetaClusterLifecycle::kCreating)
+      view.root_ =
+          stores_.operation_.FindOperation(view.lifecycle_.root_operation_id_);
+  }
+  return view;
+}
+
+std::optional<MetaClusterCreateView> MetaStateMachine::CaptureClusterCreateView(
+    const MetaClusterCreateDiscovery& expected,
+    std::span<const MetaOperationId> children,
+    std::span<const MetaHash256> manifests) const {
+  if (!expected.root_) return std::nullopt;
+  MetaClusterCreateView view;
+  std::optional<MetaOperationRecord> root;
+  {
+    std::lock_guard lock(mutex_);
+    if (stores_.topology_.ClusterLifecycle() != expected.lifecycle_)
+      return std::nullopt;
+    root = stores_.operation_.FindOperation(expected.root_->operation_id_);
+    if (!root || !SameWorkflow(*root, *expected.root_)) return std::nullopt;
+    view.root_ = std::move(*root);
+    view.cursor_ = {last_committed_idx_.load(std::memory_order_relaxed),
+                    last_state_change_idx_.load(std::memory_order_relaxed)};
+    view.meta_members_ = stores_.identity_.MetaMembers();
+    view.nodes_ = stores_.identity_.Nodes();
+    view.groups_ = stores_.topology_.Groups();
+    view.authorities_.reserve(view.groups_.size());
+    for (const auto& group : view.groups_)
+      view.authorities_.push_back(
+          *stores_.topology_.AuthorityFor(group.group_id_));
+    view.topology_epoch_ = stores_.topology_.TopologyEpoch();
+    view.slots_ = stores_.topology_.SlotRanges();
+    // Registered policies are validated on apply/restore. Their presence does
+    // not require copying or decoding the retained document again.
+    view.automatic_failover_policy_ =
+        stores_.policy_
+            .LatestVersion(std::string(kAutomaticUncontrolledFailoverPolicyId))
+            .has_value();
+    view.authority_lease_policy_ =
+        stores_.policy_.LatestVersion(std::string(kAuthorityLeasePolicyId))
+            .has_value();
+    view.candidate_recovery_policy_ =
+        stores_.policy_.LatestVersion(std::string(kCandidateRecoveryPolicyId))
+            .has_value();
+    for (const auto& digest : manifests)
+      if (stores_.population_manifest_.Contains(digest))
+        view.present_manifests_.push_back(digest);
+    for (const auto& id : children)
+      view.children_.emplace(
+          id, MetaClusterCreateChild{stores_.operation_.OperationKnown(id),
+                                     stores_.operation_.FindOperation(id)});
+  }
+  return view;
+}
+
+MetaMembershipDiscovery MetaStateMachine::CaptureMembershipDiscovery() const {
+  MetaMembershipDiscovery view;
+  {
+    std::lock_guard lock(mutex_);
+    view.cursor_ = {last_committed_idx_.load(std::memory_order_relaxed),
+                    last_state_change_idx_.load(std::memory_order_relaxed)};
+    // The borrowed range is confined to the state lock. Scan headers only and
+    // copy the same first active operation previously selected by
+    // LiveOperations.
+    for (const auto& operation : stores_.operation_.LiveOperationsView()) {
+      if (operation.kind_ == kMetaMembershipOperationKind &&
+          operation.lifecycle_ != MetaOperationLifecycle::kCompleted &&
+          operation.lifecycle_ != MetaOperationLifecycle::kAborted) {
+        view.operation_ = operation;
+        break;
+      }
+    }
+    if (!view.operation_)
+      view.initial_bindings_ = stores_.identity_.MetaMembers();
+  }
+  return view;
+}
+
+std::optional<MetaMembershipView> MetaStateMachine::CaptureMembershipView(
+    const MetaOperationRecord& expected,
+    std::span<const std::uint32_t> member_ids) const {
+  // Stable ordering and deduplication are caller-independent, but require no
+  // state exclusion. Unknown requested bindings remain absent in the result.
+  std::vector<std::uint32_t> ids(member_ids.begin(), member_ids.end());
+  std::sort(ids.begin(), ids.end());
+  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  MetaMembershipView view;
+  std::optional<MetaOperationRecord> operation;
+  {
+    std::lock_guard lock(mutex_);
+    operation = stores_.operation_.FindOperation(expected.operation_id_);
+    if (!operation || !SameWorkflow(*operation, expected)) return std::nullopt;
+    view.operation_ = std::move(*operation);
+    view.cursor_ = {last_committed_idx_.load(std::memory_order_relaxed),
+                    last_state_change_idx_.load(std::memory_order_relaxed)};
+    view.bindings_.reserve(ids.size());
+    for (const auto id : ids)
+      if (auto binding = stores_.identity_.FindMetaMember(id))
+        view.bindings_.push_back(std::move(*binding));
+  }
+  return view;
+}
+
 std::vector<MetaOperationSummary> MetaStateMachine::OperationSummaries(
     std::uint64_t after, std::size_t limit) const {
   std::lock_guard lock(mutex_);

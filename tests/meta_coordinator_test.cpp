@@ -535,6 +535,90 @@ TEST_F(MetaCoordinatorComponentTest, CursorSubscriptionTracksEventlessCuts) {
 }
 
 TEST_F(MetaCoordinatorComponentTest,
+       WorkflowCaptureProgressDoesNotDependOnNotificationDelivery) {
+  MakeCoordinator();
+  std::promise<void> entered, release;
+  auto entered_signal = entered.get_future();
+  auto release_signal = release.get_future().share();
+  std::atomic<bool> notified{false};
+  auto subscribed = coordinator_->SubscribeCommittedCursor(
+      [&](const MetaCommitEvent&) {
+        entered.set_value();
+        release_signal.wait_for(std::chrono::seconds(5));
+        notified = true;
+      },
+      1);
+  SubmitOperation submit;
+  submit.operation_id_ = MakeOperationId(0x74);
+  submit.kind_ = lavik::meta::kMetaMembershipOperationKind;
+  submit.intent_ = "retained-membership-input";
+  submit.intent_hash_ = lavik::meta::MetaSha256(submit.intent_);
+  Commit(1, submit);
+  EXPECT_EQ(entered_signal.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  EXPECT_FALSE(notified.load());
+  EXPECT_GT(coordinator_->AppliedIndex(), subscribed.view_.applied_index());
+  auto discovered = coordinator_->MembershipDiscovery();
+  EXPECT_TRUE(discovered.operation_);
+  // Completion is already committed while notification delivery is blocked.
+  // A fresh capture must see its new revision and must reject old selectors.
+  TransitionOperationPhase phase;
+  phase.operation_id_ = submit.operation_id_;
+  phase.expected_revision_ = 0;
+  phase.kind_phase_blob_ = "bind-member";
+  Commit(2, phase);
+  if (discovered.operation_)
+    EXPECT_FALSE(coordinator_->MembershipView(*discovered.operation_, {}));
+  discovered = coordinator_->MembershipDiscovery();
+  if (discovered.operation_) {
+    auto view = coordinator_->MembershipView(*discovered.operation_, {});
+    EXPECT_TRUE(view);
+    if (view) EXPECT_EQ(view->operation_.kind_phase_blob_, "bind-member");
+    machine_->Advance(3);
+    view = coordinator_->MembershipView(*discovered.operation_, {});
+    EXPECT_TRUE(view);
+    if (view) {
+      EXPECT_EQ(view->cursor_.applied_index(), 3u);
+      EXPECT_EQ(view->cursor_.state_change_index(), 2u);
+    }
+  }
+  auto stores = machine_->StoresSnapshot();
+  phase.expected_revision_ = 1;
+  phase.kind_phase_blob_ = "change-config";
+  EXPECT_TRUE(stores.operation_.TransitionOperationPhase(phase, 4).ok());
+  auto image = stores.Serialize();
+  EXPECT_TRUE(image.ok());
+  machine_->Advance(4);
+  const auto advanced = coordinator_->MembershipDiscovery();
+  EXPECT_EQ(advanced.cursor_.applied_index(), 4u);
+  EXPECT_EQ(advanced.cursor_.state_change_index(), 2u);
+  if (image.ok()) EXPECT_TRUE(machine_->Install(4, *image).ok());
+  // Install may change state at an already applied index, without an event.
+  // Comparing only applied_index would leave idle workflow discovery stale.
+  const auto installed_cursor = coordinator_->CommittedCursor();
+  EXPECT_EQ(installed_cursor.applied_index(), advanced.cursor_.applied_index());
+  EXPECT_NE(installed_cursor.state_change_index(),
+            advanced.cursor_.state_change_index());
+  discovered = coordinator_->MembershipDiscovery();
+  EXPECT_EQ(discovered.cursor_.state_change_index(), 4u);
+  ASSERT_TRUE(discovered.operation_);
+  EXPECT_EQ(discovered.operation_->kind_phase_blob_, "change-config");
+  Commit(5, MakeRegister(0x75));
+  Commit(6, MakeRegister(0x76));
+  EXPECT_TRUE(subscribed.subscription_->needs_resync());
+  release.set_value();
+  subscribed.subscription_.reset();
+  subscribed = coordinator_->SubscribeCommittedCursor([](const auto&) {});
+  EXPECT_EQ(subscribed.view_.applied_index(), 6u);
+  discovered = coordinator_->MembershipDiscovery();
+  ASSERT_TRUE(discovered.operation_);
+  const auto view = coordinator_->MembershipView(*discovered.operation_, {});
+  ASSERT_TRUE(view);
+  EXPECT_EQ(view->operation_.kind_phase_blob_, "change-config");
+  EXPECT_EQ(view->cursor_.applied_index(), 6u);
+}
+
+TEST_F(MetaCoordinatorComponentTest,
        CommitRevalidationPurgesRetiredNodeWithoutSubscribers) {
   MakeCoordinator();
   Commit(1, MakeRegister(0x11));
