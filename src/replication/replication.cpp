@@ -15,6 +15,7 @@
  */
 
 #include "absl/cleanup/cleanup.h"
+#include "absl/functional/function_ref.h"
 #include "absl/strings/cord.h"
 #include "lavik/fault_pause.h"
 #include "replication_internal.h"
@@ -10282,12 +10283,15 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     co_return absl::OkStatus();
   };
 
+  // Callback references are copied into the drain coroutine; each named
+  // callback and its captured snapshot buffer outlive the complete await.
   auto no_pending_snapshot = []() -> Task<absl::Status> {
     co_return absl::OkStatus();
   };
   auto drain_fullsync_publish_queue =
       [&](std::size_t max_items,
-          const auto& flush_pending_snapshot) -> Task<absl::Status> {
+          absl::FunctionRef<Task<absl::Status>()> flush_pending_snapshot)
+      -> Task<absl::Status> {
     std::size_t drained_items = 0;
     while (drained_items < max_items) {
       const std::size_t remaining_items = max_items - drained_items;
@@ -10584,7 +10588,8 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
   // watermark. This changes publisher duty cycle before capacity admission
   // has to stop foreground writes; it does not weaken the capacity limit.
   auto drain_interleaved_publish_queue =
-      [&](const auto& flush_pending_snapshot) -> Task<absl::Status> {
+      [&](absl::FunctionRef<Task<absl::Status>()> flush_pending_snapshot)
+      -> Task<absl::Status> {
     absl::Status drained = co_await drain_fullsync_publish_queue(
         kFullSyncInterleaveCommands, flush_pending_snapshot);
     if (!drained.ok()) co_return drained;
