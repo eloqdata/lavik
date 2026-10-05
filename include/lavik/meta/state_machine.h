@@ -13,6 +13,7 @@
 
 #include "absl/status/statusor.h"
 #include "lavik/meta/committed_status_view.h"
+#include "lavik/meta/observation_facts_view.h"
 #include "lavik/meta/raft.h"
 #include "lavik/meta/state_apply.h"
 
@@ -23,6 +24,14 @@ namespace lavik::meta {
 // not synthesize per-command events; consumers reload their committed view.
 using MetaCommitEventSink =
     std::function<void(std::uint64_t, const MetaApplyResult&)>;
+
+// The full committed aggregate and both indices captured under one state lock.
+// Full-view subscribers retain this owned copy; purpose-specific readers
+// should use a narrower capture when their contract permits it.
+struct MetaCommittedStoresSnapshot {
+  MetaStores stores_;
+  MetaCommittedCursor cursor_;
+};
 
 // Bounded diagnostic projection; never carries an operation's opaque intent,
 // directives, or receipts. Text previews may be truncated to 512 bytes.
@@ -58,6 +67,14 @@ class MetaStateMachine {
   absl::StatusOr<std::string> Capture(std::uint64_t index) const;
   absl::Status Install(std::uint64_t index, std::string_view image);
   MetaStores StoresSnapshot() const;
+  // Full-state capture, paired with both indices for full-view subscriptions.
+  MetaCommittedStoresSnapshot CaptureStores() const;
+  // Capture the data and indices in one critical section. Lookup-index work
+  // and every consumer query happen after releasing that lock.
+  MetaObservationFactsView CaptureObservationFacts() const;
+  // Config-only Advance and snapshot Install do not emit command events.
+  // Consumers use this atomic pair to detect those progress/state changes.
+  MetaCommittedCursor CaptureCommittedCursor() const;
   MetaCommittedStatusView StatusSnapshot() const;
   // Returns at most 100 live-journal summaries after an immutable submit
   // sequence, in sequence order, without copying retained operation payloads.

@@ -115,6 +115,7 @@
 #include "bycorf/runtime/foreign_executor.h"
 #include "bycorf/runtime/task.h"
 #include "lavik/meta/commands.h"
+#include "lavik/meta/observation_facts_view.h"
 #include "lavik/meta/observation_store.h"
 #include "lavik/meta/proposal_executor.h"
 #include "lavik/meta/raft.h"
@@ -254,9 +255,9 @@ class MetaCommitSubscription {
 
   // Overflow cancellation: once the bounded per-subscriber queue overflows,
   // the subscription is cancelled, no callback fires again, and
-  // needs_resync() reports that the consumer must re-SubscribeCommitted from
-  // a fresh view. cancelled() is
-  // also true after the owning coordinator is destroyed.
+  // needs_resync() requires a fresh capture and subscription through the
+  // consumer's chosen Subscribe* entry point. cancelled() is also true after
+  // the owning coordinator is destroyed.
   bool cancelled() const;
   bool needs_resync() const;
 
@@ -268,9 +269,9 @@ class MetaCommitSubscription {
   std::uint64_t id_;
 };
 
-// The atomic triple: the complete committed view, the cursor it was
-// captured against, and the live subscription — captured as one consistent
-// unit, so "everything committed" = view + events with log_index > cursor.
+// The atomic triple: an owned committed view (or just its two state indices),
+// the command-event cursor it was captured against, and a live subscription.
+// Capturing a purpose-specific view never requires the complete MetaStores.
 //
 // Delivery contract:
 //   - Events arrive in strict commit order, one per committed command.
@@ -279,22 +280,29 @@ class MetaCommitSubscription {
 //     start with watermark = view.applied_index(), skip events with
 //     log_index <= watermark, otherwise process and advance the watermark.
 //   - Normally cursor == view.applied_index(). When committed state arrived
-//     via a snapshot INSTALL (a catching-up follower), the install replaces
-//     state without per-entry events: then view.applied_index() > cursor and
-//     the entries in between are covered by the view, never by events. The
-//     watermark rule above absorbs both cases. Leader-side consumers never
-//     rely on this gap: RunAsLeader reconcilers resubscribe on every
-//     BecomeLeader.
+//     via a snapshot INSTALL (a catching-up follower) or configuration-only
+//     Advance, view.applied_index() can exceed cursor. The initial capture
+//     covers those entries, so the same watermark rule applies. After capture,
+//     Install/Advance still emit no events: consumers poll AppliedIndex() or
+//     CommittedHighWater() and recapture for any new cut they need. Leader
+//     reconcilers also resubscribe on every BecomeLeader.
 //   - Config-only commits carry no command and produce no events; the event
 //     stream is therefore NOT index-contiguous. Key on log_index, never on
 //     arrival count.
 //   - The stream survives leadership changes of this process: subscriptions
 //     live on the coordinator, not on the raft role.
-struct MetaSubscriptionStart {
-  MetaCommittedView view_;
+template <typename View>
+struct MetaSubscriptionStartFor {
+  View view_;
   std::uint64_t cursor_ = 0;
   std::unique_ptr<MetaCommitSubscription> subscription_;
 };
+
+using MetaSubscriptionStart = MetaSubscriptionStartFor<MetaCommittedView>;
+using MetaObservationSubscriptionStart =
+    MetaSubscriptionStartFor<MetaObservationFactsView>;
+using MetaCursorSubscriptionStart =
+    MetaSubscriptionStartFor<MetaCommittedCursor>;
 
 // ---------------------------------------------------------------------------
 // ValidateProposal plugins separate leader-local validation from committed
@@ -335,11 +343,22 @@ class MetaLeaderContext {
   bool IsCurrent() const;
   bycorf::Task<absl::StatusOr<MetaApplyResult>> Propose(MetaCommand command);
   MetaCommittedView CommittedView();
+  // Owned facts used by observation validation, captured at one committed cut.
+  MetaObservationFactsView ObservationFacts() const;
+  // Atomically paired applied/state-change indices, without copying stores.
+  MetaCommittedCursor CommittedCursor() const;
   // O(1) applied cursor, including Raft configurations without commit events.
-  // A changed cursor requires a fresh CommittedView before publishing a cut.
+  // A changed cursor requires a fresh committed capture before publishing a
+  // cut.
   std::uint64_t AppliedIndex() const;
   MetaSubscriptionStart SubscribeCommitted(MetaCommitCallback callback,
                                            std::size_t queue_capacity = 0);
+  MetaObservationSubscriptionStart SubscribeObservationFacts(
+      MetaCommitCallback callback, std::size_t queue_capacity = 0);
+  // Notification-only consumers keep the same event continuity and resync
+  // contract without allocating a data view. view_ carries only state indices.
+  MetaCursorSubscriptionStart SubscribeCommittedCursor(
+      MetaCommitCallback callback, std::size_t queue_capacity = 0);
   const MetaObservationStore& Observations() const;
 
  private:
@@ -409,6 +428,10 @@ struct MetaCoordinatorOptions {
   // assembly must never enable this or Raft/timer threads could run
   // worker-owned continuations inline.
   bool inline_resume_for_testing_ = false;
+  // Deterministic scheduling seam for capture/register races. Invoked without
+  // either the state or subscription mutex, after each capture attempt; empty
+  // in production. A test may commit, Advance, or Install here.
+  std::function<void()> after_subscription_capture_for_testing_;
 };
 
 class MetaCoordinator {
@@ -455,6 +478,10 @@ class MetaCoordinator {
 
   // One atomic read of the committed aggregate (see MetaCommittedView).
   MetaCommittedView CommittedView();
+  // Owned facts used by observation validation, captured at one committed cut.
+  MetaObservationFactsView ObservationFacts() const;
+  // Atomically paired applied/state-change indices, without copying stores.
+  MetaCommittedCursor CommittedCursor() const;
 
   // O(1) full applied cursor, including configuration commits that do not
   // change MetaStores or notify subscribers. This is a freshness hint, not
@@ -472,6 +499,14 @@ class MetaCoordinator {
   // selects options_.default_subscription_capacity_.
   MetaSubscriptionStart SubscribeCommitted(MetaCommitCallback callback,
                                            std::size_t queue_capacity = 0);
+  // Same delivery contract with only the committed facts needed by observation
+  // validation. The owned initial view remains valid across later commits.
+  MetaObservationSubscriptionStart SubscribeObservationFacts(
+      MetaCommitCallback callback, std::size_t queue_capacity = 0);
+  // Notification-only consumers keep the same event continuity and resync
+  // contract without allocating a data view. view_ carries only state indices.
+  MetaCursorSubscriptionStart SubscribeCommittedCursor(
+      MetaCommitCallback callback, std::size_t queue_capacity = 0);
 
   // Read-only access to the leader-local observation store (already
   // query-time filtered and internally synchronized by the store).
@@ -513,6 +548,12 @@ class MetaCoordinator {
   // MetaSubscriptionStart for the snapshot-install case).
   MetaStores AtomicStoresSnapshot(std::uint64_t& applied_index,
                                   std::uint64_t& high_water);
+
+  // The capture callable is internal and executes without the subscription
+  // mutex; each state-machine entry point captures its own exact committed cut.
+  template <typename Capture>
+  auto SubscribeCaptured(Capture capture, MetaCommitCallback callback,
+                         std::size_t queue_capacity);
 
   void DispatchMain();
   void LeadershipMain();

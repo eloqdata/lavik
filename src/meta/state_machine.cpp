@@ -282,6 +282,34 @@ MetaStores MetaStateMachine::StoresSnapshot() const {
   return stores_;
 }
 
+MetaCommittedStoresSnapshot MetaStateMachine::CaptureStores() const {
+  std::lock_guard lock(mutex_);
+  return {stores_,
+          {last_committed_idx_.load(std::memory_order_relaxed),
+           last_state_change_idx_.load(std::memory_order_relaxed)}};
+}
+
+MetaObservationFactsView MetaStateMachine::CaptureObservationFacts() const {
+  std::vector<std::string> active_nodes;
+  std::vector<MetaObservationGroupFacts> groups;
+  MetaCommittedCursor cursor;
+  {
+    std::lock_guard lock(mutex_);
+    active_nodes = stores_.identity_.ActiveNodeIds();
+    groups = stores_.topology_.ObservationFacts();
+    cursor = {last_committed_idx_.load(std::memory_order_relaxed),
+              last_state_change_idx_.load(std::memory_order_relaxed)};
+  }
+  return MetaObservationFactsView(std::move(active_nodes), std::move(groups),
+                                  cursor);
+}
+
+MetaCommittedCursor MetaStateMachine::CaptureCommittedCursor() const {
+  std::lock_guard lock(mutex_);
+  return {last_committed_idx_.load(std::memory_order_relaxed),
+          last_state_change_idx_.load(std::memory_order_relaxed)};
+}
+
 std::vector<MetaOperationSummary> MetaStateMachine::OperationSummaries(
     std::uint64_t after, std::size_t limit) const {
   std::lock_guard lock(mutex_);

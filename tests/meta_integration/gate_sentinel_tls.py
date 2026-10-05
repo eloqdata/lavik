@@ -737,7 +737,19 @@ def handshake_matrix(meta, data, directory):
     Path(limited.workdir).mkdir(parents=True, exist_ok=True)
     try:
         limited.start()
-        with socket.create_connection(("127.0.0.1", port), timeout=2) as stalled:
+        # Admin readiness precedes Sentinel listener binding. Keep the first
+        # successful connection as the stalled client: a throwaway readiness
+        # probe could still occupy this listener's only admission slot.
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                stalled = socket.create_connection(("127.0.0.1", port), timeout=2)
+                break
+            except ConnectionRefusedError:
+                if not limited.alive() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+        with stalled:
             time.sleep(0.05)
             with socket.create_connection(("127.0.0.1", port), timeout=2) as rejected:
                 assert rejected.recv(100) == b""  # No plaintext maxclients error.

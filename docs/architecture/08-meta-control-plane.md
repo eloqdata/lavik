@@ -448,10 +448,28 @@ and rejects that stale proposal. These checks gate leader-local capabilities
 only; deterministic transition revision and aggregate preconditions remain
 the authoritative conflict check during apply.
 
-Committed subscribers atomically receive a complete `CommittedView`, its
-cursor, and a bounded ordered subscription. Replay can redeliver an index, so
-consumers deduplicate by index. Queue overflow cancels the subscription and
-requires resynchronization from a new full view. Each Raft role callback
+Purpose-specific captures own their data and retain its applied index from the
+same state-machine critical section. Observation revalidation captures only
+active-node identities and each Group's membership, population, authority and
+failover facts. Its complete Group domain supports transition-identity lookup
+without copying unrelated stores or payloads. Lookup indices are built and
+observations are validated after releasing the state lock; retained views
+remain immutable across later commits and snapshot installation. Other
+readers can still use the complete `CommittedView`.
+
+Committed subscribers atomically receive an initial full or purpose-specific
+view, its command-event cursor, and a bounded ordered subscription. Consumers
+that only need notifications capture the applied and state-change indices
+without store data. Replay can redeliver an index, so consumers deduplicate
+from the initial applied index. Queue overflow cancels the subscription and
+requires a fresh capture and subscription. Configuration-only Advance and
+snapshot Install do not emit command events; consumers compare the applied or
+state-change watermark and recapture when needed, rather than assuming an
+index-contiguous event stream. Captures and registration preserve the state
+mutex to subscription mutex lock order without running consumer code under
+the state lock.
+
+Each Raft role callback
 synchronously records its exact edge in `MetaLeadershipRelay` before scheduling
 a Bycorf drain, so a stalled worker or coordinator cannot collapse a rapid
 Leader/Follower/Leader sequence into its final role. The relay also preserves
@@ -1436,6 +1454,7 @@ audit history rather than replacing it.
 | Registered typed durable Policy families, strict raw JSON admission/history, and current-value accessors | `include/lavik/meta/policy_store.h`, `src/meta/policy_store.cpp`, `tests/meta_stores_test.cpp` |
 | Pure Owner Serviceability cut, causal lease confirmation, leader-local detector state, automatic Begin adapter, and generation-bracketed diagnostics | `include/lavik/meta/owner_serviceability.h`, `src/meta/owner_serviceability.cpp`, `include/lavik/meta/automatic_failover_detector.h`, `src/meta/automatic_failover_detector.cpp`, `include/lavik/meta/automatic_failover_reconciler.h`, `src/meta/automatic_failover_reconciler.cpp` |
 | Volatile candidate/failover observations and deterministic compatibility-domain plan selection | `include/lavik/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/lavik/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
+| Owned observation-facts cuts, index-only captures, and atomic subscription registration | `include/lavik/meta/observation_facts_view.h`, `src/meta/observation_facts_view.cpp`, `src/meta/state_machine.cpp`, `src/meta/coordinator.cpp` |
 | Pure per-node projection including resolved lease duration, Data-derived heartbeat cadence, and failover/activation/follow-owner state, plus the leader-scoped Data-session publisher and causal heartbeat admission | `include/lavik/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/lavik/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
 | Manifest-bootstrapped initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `raft/engine/storage.go`, `raft/engine/join.go`, `app/lavik_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |
 | Atomic Genesis lifecycle, strict Bootstrap Policy Defaults, durable creation admission, Meta catch-up barrier, and leader-owned recovery | `include/lavik/meta/cluster_create.h`, `src/meta/cluster_create.cpp`, `include/lavik/meta/topology_store.h`, `src/meta/topology_store.cpp`, `src/meta/state_apply.cpp`, `src/meta/ctl_server.cpp`, `include/lavik/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `app/lavik_meta.cpp` |
