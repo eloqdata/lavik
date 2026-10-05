@@ -2522,9 +2522,8 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
       result.identity.attempt_id,
       result.identity.directive_revision,
   };
-  auto view = core->coordinator_->CommittedView();
-  if (const auto receipt = view.operation().FindTerminalReceipt(key);
-      receipt.has_value()) {
+  auto result_view = core->coordinator_->CaptureDirectiveResult(key);
+  if (const auto& receipt = result_view.receipt_; receipt.has_value()) {
     if (!ReceiptMatches(*receipt, result, node_id, boot_id)) {
       co_return absl::AlreadyExistsError(
           "directive result conflicts with its committed receipt");
@@ -2533,8 +2532,7 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
         control::MessagePriority::kReliable,
         control::WireMessage(ResultAck(result, *receipt)));
   }
-  const auto operation =
-      view.operation().FindOperation(result.identity.operation_id);
+  const auto& operation = result_view.operation_;
   const MetaCurrentDirective* tracked = nullptr;
   if (operation.has_value() && !IsTerminal(operation->lifecycle_)) {
     const auto match = std::find_if(
@@ -2601,6 +2599,9 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
       .status_ = status,
       .result_ = result.result,
   };
+  // The command owns everything needed across Propose's suspension. Do not
+  // retain a potentially large operation throughout the Raft round trip.
+  result_view = {};
   LAVIK_FAULT_INJECT({
     auto paused = co_await fault_injection::PauseWhileFileExists(
         "LAVIK_TEST_META_DIRECTIVE_RESULT_HOLD_FILE");
@@ -2619,8 +2620,7 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
     co_return absl::CancelledError("directive result session is retired");
   }
 
-  view = core->coordinator_->CommittedView();
-  const auto receipt = view.operation().FindTerminalReceipt(key);
+  const auto receipt = core->coordinator_->FindTerminalReceipt(key);
   if (!receipt.has_value()) {
     // An accepted Raft index with a domain rejection means the operation no
     // longer tracks this attempt. An uncertain proposal status was returned
