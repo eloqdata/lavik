@@ -3673,6 +3673,27 @@ class CandidateRecoveryService final : public bycorf::Service {
             action.recovery_deadline_unix_ms_)
       co_return TestFailure(
           "replacement changed cutoff or retained the old action report");
+    if (stall_) {
+      // The shared deadline includes cold population preparation and DNS.
+      // It may expire before even the first complete donor effect is applied.
+      // Check the report against stored effects, rather than assuming that
+      // effect always wins a 300 ms race on a loaded test host. The second
+      // donor never sends its payload, so it must remain absent in either cut.
+      auto first = co_await storage_->Get(0, "recovery-a");
+      if (!first.ok() && !absl::IsNotFound(first.status()))
+        co_return first.status();
+      if (first.ok()) {
+        const auto bytes = first->value_bytes();
+        if (std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                             bytes.size()) != "value")
+          co_return TestFailure("recovery stored an incomplete donor effect");
+      }
+      auto second = co_await storage_->Get(0, "recovery-b");
+      if (second.ok())
+        co_return TestFailure("stalled donor advanced without a payload");
+      if (!absl::IsNotFound(second.status())) co_return second.status();
+      expected_ = {first.ok() ? 2U : 1U, 1U};
+    }
     if (observed.recovery_->applied_next_lsns_ != expected_)
       co_return TestFailure(
           absl::StrCat("candidate reported wrong complete cut: ",
