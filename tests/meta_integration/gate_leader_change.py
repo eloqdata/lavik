@@ -251,10 +251,24 @@ def link_fault_round(nodes, mesh, history, leader, follower, mode, hold_s):
     H.wait_until(
         f"post-{mode}: committed >= {pre}", 20, lambda: H.max_committed(nodes) >= pre
     )
-    current = H.find_leader(nodes)
-    _, reply = current.propose(f"post-{mode}")
-    if not reply.startswith("OK "):
-        raise H.Failure(f"post-{mode}: propose: {reply}")
+    # Healing an asymmetric fault can leave higher-term traffic in flight.
+    # A status read does not reserve leadership for the following proposal.
+    # Require an acknowledged write within the existing recovery budget, and
+    # reselect only for the expected leadership race, not arbitrary errors.
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        current = H.find_leader(nodes, timeout=deadline - time.monotonic())
+        # Each attempt uses a fresh operation id. If only submitop committed
+        # before demotion, its uncertain completion is not counted as success.
+        op_id, reply = current.propose(f"post-{mode}")
+        if reply.startswith("OK "):
+            history.record(op_id, f"post-{mode}")
+            break
+        if reply != "ERR not-leader":
+            raise H.Failure(f"post-{mode}: propose: {reply}")
+        time.sleep(0.05)
+    else:
+        raise H.Failure(f"post-{mode}: no acknowledged proposal within 20s")
     history.check(nodes, timeout=30, desc=f"post-{mode}")
     H.log(f"link fault {mode}: cluster recovered, history intact")
 

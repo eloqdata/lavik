@@ -152,6 +152,26 @@ class SentinelTest(unittest.TestCase):
         self.assertIsInstance(reply, RespError)
         self.assertTrue(reply.startswith(prefix), repr(reply))
 
+    def wait_discovery_ready(self, node):
+        # Raft publishes leader=1 before the control worker installs its
+        # leadership term and eligibility. Binding a discovery connection in
+        # that interval can correctly retire it during initialization.
+        # clusterstatus brackets both states; wait before the exact wire replay
+        # so an EOF or wrong reply during the replay remains a test failure.
+        def ready():
+            reply = node.ctl("clusterstatus 1")
+            if reply.startswith("OK clusterstatus 1 "):
+                return True
+            if reply in (
+                "ERR not_leader",
+                "ERR leader_not_caught_up",
+                "ERR cut_changed",
+            ):
+                return False
+            self.fail(f"discovery readiness: {reply}")
+
+        H.wait_until("Meta discovery authority ready", 5, ready)
+
     def test_authenticated_connection_without_data_cluster(self):
         node, port = self.node()
         client = self.client(port)
@@ -163,7 +183,7 @@ class SentinelTest(unittest.TestCase):
 
     def test_subscription_protocol_and_reset(self):
         node, port = self.node(bootstrap=True)
-        H.wait_until("Meta leader", 5, node.is_leader)
+        self.wait_discovery_ready(node)
         for protocol in (2, 3):
             client = self.client(port)
             client.command("HELLO", protocol, "AUTH", "default", "sentinel-secret")
@@ -211,7 +231,7 @@ class SentinelTest(unittest.TestCase):
             # Discovery exchanges carry committed topology claims, so Lavik
             # answers them only on a caught-up leader; replay them there.
             leader, leader_port = self.node(password=password, bootstrap=True)
-            H.wait_until("Meta leader", 5, leader.is_leader)
+            self.wait_discovery_ready(leader)
             sentinel_compat.check_discovery_port(self, leader_port, password)
             leader.terminate()
 
@@ -366,7 +386,7 @@ class SentinelTest(unittest.TestCase):
     def test_discovery_null_contract_on_bootstrap_leader(self):
         leader, leader_port = self.node(bootstrap=True)
         follower, follower_port = self.node()
-        H.wait_until("Meta leader", 5, leader.is_leader)
+        self.wait_discovery_ready(leader)
         self.assertFalse(follower.is_leader())
         client = self.client(leader_port)
         self.assertEqual(client.command("AUTH", "sentinel-secret"), b"OK")
