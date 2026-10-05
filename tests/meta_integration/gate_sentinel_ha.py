@@ -8,6 +8,7 @@ unchanged redis-py and go-redis pools. TCP proxies force new Data connections so
 continued success on an old socket cannot masquerade as discovery recovery.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
@@ -304,31 +305,49 @@ def make_clients(fixture, go_binary, directory, learned=False):
 
 
 def recover(clients, description, start=None):
+    """Probe independent pools against one deadline measured from the fault."""
     start = time.monotonic() if start is None else start
-    errors = {}
-    pending = dict(clients)
-    while pending and time.monotonic() - start < 30:
-        for name, client in list(pending.items()):
+
+    def probe(name, client):
+        errors = []
+        while time.monotonic() - start < 30:
             try:
                 client.set("sentinel-ha-" + name, description)
                 value = client.get("sentinel-ha-" + name)
                 if value not in (description, description.encode()):
                     raise H.Failure(f"{name}: wrong value {value!r}")
-                if time.monotonic() - start > 30:
+                elapsed = time.monotonic() - start
+                if elapsed > 30:
                     raise H.Failure(
                         f"{name}: successful command exceeded 30s recovery budget"
                     )
-                del pending[name]
-                H.log(
-                    f"{description}: {name} recovered at {time.monotonic() - start:.3f}s; errors={errors.get(name, [])}"
-                )
+                return elapsed, errors
             except Exception as error:
-                errors.setdefault(name, []).append(
-                    type(error).__name__ + ": " + str(error)
+                errors.append(type(error).__name__ + ": " + str(error))
+            time.sleep(0.05)
+        return None, errors
+
+    if not clients:
+        return
+    failures = {}
+    # Discovery can block on several dead/follower seeds. Serial probes would
+    # charge that time to unrelated pools. Each worker exclusively owns one
+    # client; join every bounded client operation before fixture cleanup.
+    with ThreadPoolExecutor(max_workers=len(clients)) as executor:
+        pending = {
+            executor.submit(probe, name, client): name for name, client in clients
+        }
+        for future in as_completed(pending):
+            name = pending[future]
+            elapsed, errors = future.result()
+            if elapsed is None:
+                failures[name] = errors
+            else:
+                H.log(
+                    f"{description}: {name} recovered at {elapsed:.3f}s; errors={errors}"
                 )
-        time.sleep(0.05)
-    if pending:
-        raise H.Failure(f"{description}: 30s budget exceeded: {errors}")
+    if failures:
+        raise H.Failure(f"{description}: 30s budget exceeded: {failures}")
 
 
 class Subscription:
