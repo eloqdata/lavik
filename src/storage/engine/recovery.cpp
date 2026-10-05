@@ -96,7 +96,11 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
       header.extent_index_ != extent_index ||
       header.extent_payload_bytes_ != ref.payload_bytes_ ||
       header.extent_payload_checksum_ != ref.payload_checksum_) {
-    co_return absl::InternalError("recovered extent does not match manifest");
+    // A reclaimed or reused extent can outlive its reference in a scannable
+    // auxiliary record. Classify the missing identity as data loss so grouped
+    // recovery can apply its expired, unshielded winner policy. Read failures
+    // above and checksum failures below remain non-discardable.
+    co_return absl::DataLossError("recovered extent does not match manifest");
   }
   const auto payload = std::span<const std::byte>(io.data_ + kBlockHeaderBytes,
                                                   ref.payload_bytes_);
@@ -1232,7 +1236,8 @@ absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
 }
 
 Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
-    WorkerStore& store) {
+    WorkerStore& store, std::optional<std::uint64_t> expiration_now_ms,
+    std::vector<RecoveryExpiredTombstone>& expired_tombstones) {
   auto& records = store.recovery_hash_groups_;
   // Group candidates by logical key once. Recovery memory is proportional to
   // scanned auxiliary metadata, never to retained field/value bodies; a root
@@ -1246,7 +1251,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
               return left.key() < right.key();
             });
   struct RootToRecover {
-    const RecordIndex::Entry* entry_;
+    RecordIndex::Entry* entry_;
     const RecoveredGroupedRoot* root_;
     std::string_view key_;
     std::uint8_t db_id_;
@@ -1272,15 +1277,17 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     }
     auto& partition = PartitionForKey(store, key);
     std::optional<std::uint8_t> root_db;
+    RecordIndex::Entry* root_entry = nullptr;
     // The transient metadata key is an entry address, not a persisted DB.
     // Resolve it against the small, owner-local index array exactly once per
     // grouped key. Physical identity disambiguates a reused name across DBs.
     const Digest digest = ComputeDigest(key);
     for (std::uint8_t db = 0; db < options_.database_count_; ++db) {
-      for (const auto* candidate :
+      for (auto* candidate :
            partition.indexes_[db].FindCandidates(digest, key)) {
         if (candidate == entry) {
           root_db = db;
+          root_entry = candidate;
           break;
         }
       }
@@ -1290,7 +1297,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       co_return absl::DataLossError(
           "grouped recovery root is not a key winner");
     }
-    roots.push_back({entry, &root, key, *root_db});
+    roots.push_back({root_entry, &root, key, *root_db});
   }
   std::sort(roots.begin(), roots.end(),
             [](const RootToRecover& left, const RootToRecover& right) {
@@ -1328,12 +1335,21 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     while (end != records.end() && end->db_id_ == root_db && end->key() == key)
       ++end;
     const std::size_t candidate_count = end - lower;
-    auto retain_selected = [&]() -> Task<absl::Status> {
+    auto validate_selected = [&]() -> Task<absl::Status> {
+      // Validate the complete graph before publishing it or consuming any
+      // candidates. A late missing extent must not leave an earlier child
+      // charged as live, or leave a side view for a discarded root.
+      for (auto it = lower; it != end; ++it) {
+        if (!it->grouped_reachable_) continue;
+        auto checked = co_await ValidateRecoveredGroup(store, *it);
+        if (!checked.ok()) co_return checked;
+      }
+      co_return absl::OkStatus();
+    };
+    auto retain_selected = [&] {
       for (std::size_t i = 0; i < candidate_count; ++i) {
         RecoveryAuxiliaryRecord& physical = records.front();
         if (physical.grouped_reachable_) {
-          auto checked = co_await ValidateRecoveredGroup(store, physical);
-          if (!checked.ok()) co_return checked;
           ExtentManifest extents;
           if (physical.extent_token_ != 0) {
             extents = std::move(
@@ -1355,7 +1371,6 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       }
       released_since_collect += candidate_count;
       collect_released();
-      co_return absl::OkStatus();
     };
     auto& partition = PartitionForKey(store, key);
     const RecordLocation location = MaterializeIndexLocation(*entry);
@@ -1365,15 +1380,54 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
         .replication_epoch_ = partition.replication_epoch_,
         .index_generation_ = partition.grouped_generations_[root_db],
     };
+    auto discard_expired_graph = [&](const absl::Status& failure) {
+      if (!absl::IsDataLoss(failure) || !expiration_now_ms ||
+          location.expire_at_ms_ == 0 ||
+          location.expire_at_ms_ > *expiration_now_ms || location.shielding())
+        return false;
+      // Full-device expiration can retire children before the containing root
+      // block is reclaimed. The dead winner must still suppress older roots,
+      // but reconstructing its now-incomplete graph would prevent startup.
+      // Never apply this escape valve to live or shielding winners, or to an
+      // admission/I/O failure. Queue a fresh deletion before serving requests.
+      expired_tombstones.push_back(
+          RecoveryExpiredTombstone{.digest_ = ComputeDigest(key),
+                                   .key_ = std::string(key),
+                                   .db_id_ = root_db,
+                                   .detached_ = true});
+      for (auto it = lower; it != end; ++it) it->grouped_reachable_ = false;
+      --partition.live_key_count_[root_db];
+      --store.live_key_count_[root_db];
+      --partition.expiring_key_count_[root_db];
+      store.recovery_lsns_.erase(entry);
+      store.recovery_txids_.erase(entry);
+      store.recovery_grouped_roots_.erase(entry);
+      store.external_manifests_.erase(entry);
+      store.recovery_external_keys_.erase(entry);
+      const auto key_bytes = entry->logical_key_size();
+      const bool erased = partition.indexes_[root_db].Erase(entry);
+      assert(erased);
+      if (erased) RemoveFullSyncCoverageEntry(partition, root_db, key_bytes);
+      return true;
+    };
     if (const auto* ordered = std::get_if<OrderedCollectionRoot>(root)) {
       auto object =
           co_await RecoverOrderedObject(store, *ordered, version, lower, end);
-      if (!object.ok()) co_return object.status();
+      if (!object.ok()) {
+        if (!discard_expired_graph(object.status())) co_return object.status();
+        retain_selected();
+        continue;
+      }
+      auto checked = co_await validate_selected();
+      if (!checked.ok()) {
+        if (!discard_expired_graph(checked)) co_return checked;
+        retain_selected();
+        continue;
+      }
       auto published = partition.grouped_objects_[root_db].Publish(
           key, nullptr, std::move(*object));
       if (!published.ok()) co_return published;
-      auto retained = co_await retain_selected();
-      if (!retained.ok()) co_return retained;
+      retain_selected();
       continue;
     }
     std::vector<RecoveredHashGroup> candidates;
@@ -1386,7 +1440,12 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     auto directory = HashGroupDirectory::Recover(
         std::get<GroupedHashRoot>(*root), location.mutation_sequence_,
         candidates, recovery_committed_txids_);
-    if (!directory.ok()) co_return directory.status();
+    if (!directory.ok()) {
+      if (!discard_expired_graph(directory.status()))
+        co_return directory.status();
+      retain_selected();
+      continue;
+    }
     std::vector<HashGroupLocation> locations;
     locations.reserve(directory->groups().size() +
                       directory->retired_groups().size());
@@ -1409,6 +1468,12 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     for (const auto& [id, selected] : directory->retired_groups()) {
       append_location(selected);
     }
+    auto checked = co_await validate_selected();
+    if (!checked.ok()) {
+      if (!discard_expired_graph(checked)) co_return checked;
+      retain_selected();
+      continue;
+    }
     auto object =
         GroupedHashObject::Create(version, std::move(*directory), locations,
                                   store.record_index_entry_arena_);
@@ -1416,8 +1481,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     auto published = partition.grouped_objects_[root_db].Publish(
         key, nullptr, std::move(*object));
     if (!published.ok()) co_return published;
-    auto retained = co_await retain_selected();
-    if (!retained.ok()) co_return retained;
+    retain_selected();
   }
   records.clear();
   store.recovery_aux_keys_.clear();

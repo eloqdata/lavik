@@ -699,9 +699,18 @@ TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
   do {
     // Enqueue lazy expiration as well: this is a storage-capacity test, not a
     // deadline for a complete sweep of all partition/database maps.
+    bool expired = true;
     for (unsigned i = 0; i < 32; ++i) {
-      (void)client.Command({"EXISTS", "{expiry-387}" + std::to_string(i),
-                            "{expiry-387}fill:" + std::to_string(i)});
+      expired &= client
+                     .Command({"EXISTS", "{expiry-387}" + std::to_string(i),
+                               "{expiry-387}fill:" + std::to_string(i)})
+                     .text_ == "0";
+    }
+    // Defrag can make room before the TTLs elapse. A successful replacement
+    // alone does not establish that the old keys should be absent on recovery.
+    if (!expired) {
+      std::this_thread::sleep_for(100ms);
+      continue;
     }
     reply = client.Command({"SET", "replacement", value});
     if (reply.text_ == "OK") break;
@@ -717,9 +726,17 @@ TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
   EXPECT_EQ(server.Log().find("commit append failed"), std::string::npos)
       << server.Log();
   Server recovered(disk, 1);
-  Client reader(recovered.port());
-  EXPECT_EQ(reader.Command({"GET", "replacement"}).text_, value);
-  EXPECT_EQ(reader.Command({"EXISTS", "{expiry-387}0"}).text_, "0");
+  recovered.PreserveOnFailure();
+  try {
+    Client reader(recovered.port());
+    EXPECT_EQ(reader.Command({"GET", "replacement"}).text_, value);
+    EXPECT_EQ(reader.Command({"EXISTS", "{expiry-387}0"}).text_, "0");
+  } catch (const std::exception& error) {
+    // A startup exception otherwise loses the recovery process's log when
+    // this second Server is destroyed, hiding whether it exited or stalled.
+    recovered.RecordDiagnostics("expiration recovery startup/read failed");
+    FAIL() << error.what() << '\n' << recovered.Log();
+  }
 }
 
 class GroupedStringCrashE2e : public testing::TestWithParam<const char*> {};

@@ -492,7 +492,6 @@ class SentinelTest(unittest.TestCase):
     def test_slow_reader_keeps_admin_responsive_and_drains(self):
         node, port = self.node(password="", maxclients=1, bootstrap=True)
         self.wait_discovery_leader(node)
-        time.sleep(0.05)
         slow = self.client(port)
         slow.command("HELLO", 3)
         slow.command("SUBSCRIBE", "+switch-master", "+replica-reconf-done")

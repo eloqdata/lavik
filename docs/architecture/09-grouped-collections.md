@@ -405,11 +405,21 @@ restricts writes to changed pages and structural neighbours.
 Cold scanning gathers roots and auxiliary candidates separately. After
 transaction adjudication and root selection, recovery reconstructs each
 winning incarnation, including retained parent markers, and checks routing
-coverage and aggregate counts. Only reachable external group payloads are
-validated: an obsolete inline-key group's value extents may already have been
-reclaimed while its records block is still scannable. UUID references remain
-source-block dependencies so classification can still resolve the original key. Every live group, root and extent joins physical-owner
-accounting before orphan reclamation.
+coverage and aggregate counts. Under the
+[full-device expiration policy](04-storage-and-recovery.md#expiry-and-tombstones),
+a graph reconstruction data-loss result may discard only an expired,
+unshielded winner, and only with startup expiration authority. Recovery never
+falls back to an older root. After allocator recovery, it appends a tombstone
+and waits for durable deletion before serving. Only confirmed foreground disk
+exhaustion permits skipping that detached-root repair; admission and I/O
+failures remain fatal. All other reconstruction errors remain fatal; complete
+expired graphs retain ordinary accounting and deletion.
+
+Only reachable external group payloads are validated: an obsolete inline-key
+group's value extents may already have been reclaimed while its records block
+is still scannable. UUID references remain source-block dependencies so
+classification can still resolve the original key. Every live group, root and
+extent joins physical-owner accounting before orphan reclamation.
 
 For indexed Sorted Sets, reconstruction requires both complete directories
 and validates reachable member snapshots and extent checksums as well as the
