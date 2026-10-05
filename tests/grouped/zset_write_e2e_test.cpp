@@ -595,6 +595,15 @@ TEST(GroupedSortedSetWriteE2e, PointFlagsDuplicatesScoresAndAtomicNan) {
   Server server(disk);
   Client client(server.port());
   ASSERT_EQ(client.Command(ZSetSeed("zset")).text_, "256");
+  // Span the prefix directory in reverse order so page traversal cannot
+  // substitute its order for the command's output positions.
+  std::vector<std::string> lookup{"ZMSCORE", "zset"};
+  for (int i = 255; i >= 0; --i)
+    lookup.push_back(std::to_string(i) + std::string(128, 'm'));
+  auto all_scores = client.Command(lookup);
+  ASSERT_EQ(all_scores.items_.size(), 256);
+  for (std::size_t i = 0; i < all_scores.items_.size(); ++i)
+    EXPECT_EQ(all_scores.items_[i].text_, std::to_string(255 - i));
   ASSERT_EQ(client.Command({"EXPIRE", "zset", "3600"}).text_, "1");
   EXPECT_EQ(client.Command({"ZADD", "zset", "CH", "1", "x", "2", "x"}).text_,
             "2");

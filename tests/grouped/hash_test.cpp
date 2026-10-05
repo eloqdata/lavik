@@ -548,6 +548,18 @@ TEST(GroupedHashTest, PointLookupDistinguishesMissingEmptyAndBinaryValues) {
   value.entries_[1].value_.clear();
   auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = value});
   ASSERT_TRUE(encoded.ok());
+  std::size_t visited = 0;
+  auto visit = [&](const HashEntryView& entry) {
+    EXPECT_EQ(entry.field_, value.entries_[visited].field_);
+    EXPECT_EQ(entry.value_, value.entries_[visited].value_);
+    EXPECT_GE(entry.field_.data(), encoded->data());
+    EXPECT_LE(entry.value_.data() + entry.value_.size(),
+              encoded->data() + encoded->size());
+    ++visited;
+    return absl::OkStatus();
+  };
+  ASSERT_TRUE(VisitHashGroupFields(*encoded, 3, {}, Seed(), visit).ok());
+  EXPECT_EQ(visited, 3);
   for (const auto& expected : value.entries_) {
     auto found = FindHashGroupField(*encoded, 3, expected.field_);
     ASSERT_TRUE(found.ok()) << found.status();
@@ -566,6 +578,8 @@ TEST(GroupedHashTest, PointLookupDistinguishesMissingEmptyAndBinaryValues) {
   missing = FindHashGroupField(*empty, 0, "absent");
   ASSERT_TRUE(missing.ok());
   EXPECT_FALSE(missing->has_value());
+  ASSERT_TRUE(VisitHashGroupFields(*empty, 0, {}, Seed(), visit).ok());
+  EXPECT_EQ(visited, 3);
 }
 
 TEST(GroupedHashTest, PointLookupRejectsCorruptionAfterMatch) {
@@ -577,8 +591,13 @@ TEST(GroupedHashTest, PointLookupRejectsCorruptionAfterMatch) {
     auto metadata = DecodeHashGroupMetadata(bytes, bytes.size());
     EXPECT_TRUE(metadata.ok());
     if (!metadata.ok()) return metadata.status();
-    return FindHashGroupField(bytes, metadata->field_count_, "field-0")
-        .status();
+    const auto status =
+        FindHashGroupField(bytes, metadata->field_count_, "field-0").status();
+    const auto visited = VisitHashGroupFields(
+        bytes, metadata->field_count_, metadata->id_, Seed(),
+        [](const HashEntryView&) { return absl::OkStatus(); });
+    EXPECT_EQ(visited.code(), status.code());
+    return status;
   };
   auto broken = *encoded;
   broken.replace(broken.find("field-1"), 7, "field-0");
@@ -628,6 +647,46 @@ TEST(GroupedHashTest,
   ASSERT_TRUE(found->has_value());
   EXPECT_EQ(**found, std::string(128, 'a'));
   EXPECT_FALSE(DecodeHashGroup(*encoded).ok());
+  std::size_t visited = 0;
+  const auto status =
+      VisitHashGroupFields(*encoded, 3, {}, Seed(), [&](const HashEntryView&) {
+        ++visited;
+        return absl::OkStatus();
+      });
+  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
+  EXPECT_EQ(status.message(), "duplicate field in Hash group");
+  EXPECT_EQ(visited, 2);
+}
+
+TEST(GroupedHashTest, BorrowedVisitorChecksUnrelatedRouteAndPropagatesFailure) {
+  // The first field is a valid match; the unrelated second field must still
+  // be checked against the persisted seed, independently of process hashing.
+  const auto seed = Seed(91);
+  const auto value = Value(2);
+  const HashGroupId id{ComputeDigest("field-0", seed).value_, 64};
+  ASSERT_FALSE(id.contains(ComputeDigest("field-1", seed).value_));
+  auto encoded =
+      EncodeHashGroup({.incarnation_ = 17, .id_ = id, .value_ = value});
+  ASSERT_TRUE(encoded.ok());
+  auto metadata = DecodeHashGroupMetadata(*encoded, encoded->size());
+  ASSERT_TRUE(metadata.ok());
+  std::size_t visited = 0;
+  auto status =
+      VisitHashGroupFields(*encoded, metadata->field_count_, metadata->id_,
+                           seed, [&](const HashEntryView&) {
+                             ++visited;
+                             return absl::OkStatus();
+                           });
+  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
+  EXPECT_EQ(status.message(), "Hash field outside its group route");
+  EXPECT_EQ(visited, 1);
+
+  status =
+      VisitHashGroupFields(*encoded, metadata->field_count_, metadata->id_,
+                           seed, [](const HashEntryView&) {
+                             return absl::DataLossError("invalid member score");
+                           });
+  EXPECT_EQ(status.message(), "invalid member score");
 }
 
 TEST(GroupedHashTest,
