@@ -151,6 +151,13 @@ struct MetaOperationRecord {
   bool operator==(const MetaOperationRecord&) const = default;
 };
 
+// Owned live-journal identity needed by proposal ownership checks. Includes
+// terminal records until archival, but never copies their retained payloads.
+struct MetaOperationHeader {
+  std::string kind_;
+  bool operator==(const MetaOperationHeader&) const = default;
+};
+
 // Tombstone of an archived terminal operation. Kept for the retention window
 // so late duplicate submissions resolve deterministically and lost result
 // acknowledgements can replay their original TerminalReceipt.
@@ -219,6 +226,9 @@ class MetaOperationStore {
   // Fact queries. Archived ids/seqs resolve to their terminal summary —
   // "already done" — while unknown ones return nullopt.
   std::optional<MetaOperationRecord> FindOperation(
+      const MetaOperationId& id) const;
+  // Missing and archived-only ids return nullopt, just as FindOperation does.
+  std::optional<MetaOperationHeader> FindOperationHeader(
       const MetaOperationId& id) const;
   std::optional<MetaOperationRecord> FindOperationBySeq(
       std::uint64_t seq) const;

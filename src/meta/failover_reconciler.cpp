@@ -936,12 +936,12 @@ MetaFailoverReconciler::~MetaFailoverReconciler() { Shutdown(); }
 
 MetaValidateHook MetaFailoverReconciler::validation_hook() const {
   return [core = core_](
-             const MetaCommand& command, const MetaCommittedView& view,
+             const MetaCommand& command, const MetaProposalView& view,
              const MetaObservationStore&, std::int64_t) -> absl::Status {
     const auto* start = std::get_if<StartCandidateRecovery>(&command);
     if (start == nullptr) return absl::OkStatus();
-    const auto group = view.topology().FindGroup(start->group_id_);
-    const auto grant = view.topology().AuthorityFor(start->group_id_);
+    const auto& group = view.group(start->group_id_);
+    const auto& grant = view.authority(start->group_id_);
     if (!group.has_value() || !grant.has_value() || grant->grant_.has_value() ||
         !group->failover_transition_.has_value()) {
       return MetaDomainRejectError(

@@ -1398,7 +1398,8 @@ bycorf::Task<std::string> HandlePromote(
     const std::shared_ptr<MetaObservationStore>& observations,
     AuthenticatedPrincipal principal, const std::string& group_id,
     const std::string& node_id) {
-  const MetaStores before = state_machine->StoresSnapshot();
+  const auto captured = state_machine->CaptureStores();
+  const MetaStores& before = captured.stores_;
   if (before.topology_.ClusterLifecycle().state_ !=
       MetaClusterLifecycle::kCreated) {
     co_return "ERR promote cluster-not-created";
@@ -1474,7 +1475,8 @@ bycorf::Task<std::string> HandlePromote(
             group->record_.partition_replication_epoch_,
     };
   }
-  const MetaCommittedView view(before, state_machine->last_commit_index());
+  const auto view =
+      MetaProposalView::FromStores(command, before, captured.cursor_);
   const absl::Status valid =
       ValidateFailoverProposal(command, view, *observations, now);
   if (!valid.ok()) co_return absl::StrCat("ERR promote ", valid.message());

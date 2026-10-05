@@ -244,6 +244,13 @@ std::optional<MetaOperationRecord> MetaOperationStore::FindOperationBySeq(
   return FindOperation(it->second);
 }
 
+std::optional<MetaOperationHeader> MetaOperationStore::FindOperationHeader(
+    const MetaOperationId& id) const {
+  const auto it = live_.find(id);
+  if (it == live_.end()) return std::nullopt;
+  return MetaOperationHeader{it->second.kind_};
+}
+
 std::optional<MetaOperationArchiveSummary> MetaOperationStore::FindArchived(
     const MetaOperationId& id) const {
   const auto it = archived_.find(id);

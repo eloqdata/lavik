@@ -437,6 +437,14 @@ bool IsNonTerminal(MetaOperationLifecycle lifecycle) {
          lifecycle == MetaOperationLifecycle::kRunning;
 }
 
+std::unique_ptr<MetaCommittedStoresSnapshot> CaptureRecoveryCut(
+    const MetaStateMachine& machine) {
+  // MetaStores embeds the complete slot array. Keep both the optional full
+  // state and its construction temporary outside Propose's coroutine frame:
+  // ordinary admission must not allocate that recovery-only footprint.
+  return std::make_unique<MetaCommittedStoresSnapshot>(machine.CaptureStores());
+}
+
 // The WAL/snapshot fail-safe cannot use a variant-name whitelist: most prune
 // commands are intentionally replay-idempotent, so an absent target would let
 // fresh request ids append no-op records forever. Evaluate the command against
@@ -445,11 +453,10 @@ bool IsNonTerminal(MetaOperationLifecycle lifecycle) {
 // variable-length payload while the guard is active; it can happen once per
 // live operation and unlocks archive -> prune.
 absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
-                                      const MetaCommittedView& view,
+                                      const MetaStores& stores,
                                       std::uint64_t applied_index,
                                       std::string_view actor_principal,
                                       std::string_view readable_time) {
-  const MetaStores& stores = view.stores();
   if (applied_index == std::numeric_limits<std::uint64_t>::max()) {
     return IneffectiveFailSafeRecovery("the applied index is exhausted");
   }
@@ -1319,14 +1326,25 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   // completion separately and can outlive a timed-out caller.
   InFlightGuard in_flight(*this);
 
-  // One atomic committed view serves the fail-safe gates AND the validate
-  // hooks. This bounded aggregate copy may be large and contributes to
-  // proposal latency, but copying once is cheaper than letting each hook
-  // snapshot independently and keeps every validation on one exact cut.
-  std::uint64_t applied_index = 0;
-  std::uint64_t high_water = 0;
-  MetaStores stores = AtomicStoresSnapshot(applied_index, high_water);
-  MetaCommittedView view(std::move(stores), applied_index);
+  // Sample the durability guard once to choose the capture shape, without
+  // changing rejection precedence: audit, recovery, then hooks. Recovery is
+  // the explicit full-state exception. Derive its hook view from that same
+  // owned cut rather than capturing another version of committed state.
+  const std::uint64_t uncompacted = server_->UncompactedBytes();
+  const std::uint64_t snapshot_failures =
+      state_machine_.consecutive_snapshot_failures();
+  const bool wal_fail_safe = uncompacted > options_.max_uncompacted_wal_bytes_;
+  const bool snapshot_fail_safe =
+      snapshot_failures >= options_.max_consecutive_snapshot_failures_;
+  std::unique_ptr<MetaCommittedStoresSnapshot> recovery_cut;
+  if (wal_fail_safe || snapshot_fail_safe) {
+    recovery_cut = CaptureRecoveryCut(state_machine_);
+  }
+  const MetaProposalView view =
+      recovery_cut != nullptr
+          ? MetaProposalView::FromStores(command, recovery_cut->stores_,
+                                         recovery_cut->cursor_)
+          : state_machine_.CaptureProposal(command);
   // All semantic hooks evaluate volatile observations against one proposal
   // instant. Re-reading wall time in individual hooks could otherwise make
   // command admission depend on hook order around the same TTL boundary.
@@ -1341,9 +1359,9 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   // ordinary records. A strict reservation moves to the Raft waiter so an
   // uncertain client timeout cannot free space while its append is unresolved.
   std::unique_ptr<AuditReservation> audit_reservation;
-  if (view.stores().audit_.policy() == MetaAuditPolicy::kStrictExport) {
+  if (view.audit().policy() == MetaAuditPolicy::kStrictExport) {
     std::lock_guard<std::mutex> lock(proposal_gate_->mu_);
-    const MetaAuditStore& audit = view.stores().audit_;
+    const MetaAuditStore& audit = view.audit();
     const auto* prune = std::get_if<PruneAudit>(&command);
     const bool valid_prune =
         prune != nullptr && audit.Find(prune->through_log_index_).has_value();
@@ -1374,24 +1392,26 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
     }
   }
 
-  const std::uint64_t uncompacted = server_->UncompactedBytes();
-  const std::uint64_t snapshot_failures =
-      state_machine_.consecutive_snapshot_failures();
-  const bool wal_fail_safe = uncompacted > options_.max_uncompacted_wal_bytes_;
-  const bool snapshot_fail_safe =
-      snapshot_failures >= options_.max_consecutive_snapshot_failures_;
   std::unique_ptr<FailSafeRecoveryReservation> recovery_reservation;
   if (wal_fail_safe || snapshot_fail_safe) {
     // Serialize recovery through the actual Raft outcome. A type whitelist is
     // insufficient because idempotent prune commands can legally be no-ops;
     // repeated fresh request ids would then grow the WAL without bound.
-    std::lock_guard<std::mutex> lock(proposal_gate_->mu_);
-    if (proposal_gate_->fail_safe_recovery_reserved_) {
-      co_return IneffectiveFailSafeRecovery(
-          "another recovery proposal still has an uncertain Raft outcome");
+    {
+      std::lock_guard<std::mutex> lock(proposal_gate_->mu_);
+      if (proposal_gate_->fail_safe_recovery_reserved_) {
+        co_return IneffectiveFailSafeRecovery(
+            "another recovery proposal still has an uncertain Raft outcome");
+      }
+      proposal_gate_->fail_safe_recovery_reserved_ = true;
+      recovery_reservation =
+          std::make_unique<FailSafeRecoveryReservation>(proposal_gate_);
     }
+    // Keep exclusive recovery ownership while simulating, but never hold a
+    // state or proposal-gate mutex over copies, serialization, or apply.
     if (absl::Status recovery = ValidateFailSafeRecovery(
-            command, view, applied_index, principal.principal(), readable_time);
+            command, recovery_cut->stores_, view.applied_index(),
+            principal.principal(), readable_time);
         !recovery.ok()) {
       std::string trigger;
       if (wal_fail_safe) {
@@ -1409,9 +1429,6 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
                              "meta: " + trigger + " (fail-safe); " +
                                  std::string(recovery.message()));
     }
-    proposal_gate_->fail_safe_recovery_reserved_ = true;
-    recovery_reservation =
-        std::make_unique<FailSafeRecoveryReservation>(proposal_gate_);
   }
 
   // ValidateProposal plugins run leader-locally. The first rejection aborts

@@ -425,13 +425,30 @@ proposals cannot overbook the window.
 
 `MetaCoordinator` is the in-process API used by reconcilers, the Data-session
 publisher, and the administrative adapter. `Propose` accepts model commands
-rather than Raft types. On the leader it takes one atomic committed view,
-applies fail-safe and
+rather than Raft types. On the leader it captures one owned, command-specific
+committed cut, applies fail-safe and
 registered semantic validation, injects the transport-authorized actor and a
 readable proposal time, encodes the current durable format, submits to
 Raft through the proposal executor, and returns the apply result carried by
 Raft's completion. It never re-reads a record that bounded audit rotation may
 already have evicted. Followers return a not-leader status without appending.
+Ordinary admission retains the paged audit view and only the business data
+required by its registered hooks. Generic operation ownership checks retain
+the named live-journal operation's kind, including terminal records until
+archival. Typed failover checks retain their Group/authority pre-state and
+the complete compact observation-facts domain, so cross-Group freshness and
+candidate-absence proofs remain sound. Non-manual automatic Begin also retains
+the current automatic and lease Policies and topology epoch; an uncertain
+append retry still skips Policy and health re-evaluation. Missing capture
+dependencies are programming errors, never evidence that an object is absent.
+
+The durability fail-safe remains an explicit full-state capture path. Its
+recovery simulation and hook projection use the same owned cut, with no second
+state-machine snapshot. The exclusive recovery reservation spans simulation
+and the actual Raft outcome, while copies, serialization, simulation and hooks
+run outside state and proposal-gate locks. Deterministic apply still checks
+the full committed aggregate; admission does not build a read cache on writes.
+
 Membership workflows hold one exclusive leader-local lease through completion,
 so Raft never receives overlapping configuration changes.
 
@@ -1455,6 +1472,7 @@ audit history rather than replacing it.
 | Pure Owner Serviceability cut, causal lease confirmation, leader-local detector state, automatic Begin adapter, and generation-bracketed diagnostics | `include/lavik/meta/owner_serviceability.h`, `src/meta/owner_serviceability.cpp`, `include/lavik/meta/automatic_failover_detector.h`, `src/meta/automatic_failover_detector.cpp`, `include/lavik/meta/automatic_failover_reconciler.h`, `src/meta/automatic_failover_reconciler.cpp` |
 | Volatile candidate/failover observations and deterministic compatibility-domain plan selection | `include/lavik/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/lavik/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
 | Owned observation-facts cuts, index-only captures, and atomic subscription registration | `include/lavik/meta/observation_facts_view.h`, `src/meta/observation_facts_view.cpp`, `src/meta/state_machine.cpp`, `src/meta/coordinator.cpp` |
+| Command-specific proposal cuts, live-operation headers, and the same-cut full recovery exception | `include/lavik/meta/proposal_view.h`, `src/meta/proposal_view.cpp`, `src/meta/operation_store.cpp`, `src/meta/state_machine.cpp`, `src/meta/coordinator.cpp` |
 | Pure per-node projection including resolved lease duration, Data-derived heartbeat cadence, and failover/activation/follow-owner state, plus the leader-scoped Data-session publisher and causal heartbeat admission | `include/lavik/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/lavik/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
 | Manifest-bootstrapped initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `raft/engine/storage.go`, `raft/engine/join.go`, `app/lavik_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |
 | Atomic Genesis lifecycle, strict Bootstrap Policy Defaults, durable creation admission, Meta catch-up barrier, and leader-owned recovery | `include/lavik/meta/cluster_create.h`, `src/meta/cluster_create.cpp`, `include/lavik/meta/topology_store.h`, `src/meta/topology_store.cpp`, `src/meta/state_apply.cpp`, `src/meta/ctl_server.cpp`, `include/lavik/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `app/lavik_meta.cpp` |
