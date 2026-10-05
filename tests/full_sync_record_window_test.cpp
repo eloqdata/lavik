@@ -56,7 +56,7 @@ TEST(FullSyncRecordWindowTest,
   EXPECT_EQ(window.inflight_frames(), 1);
 }
 
-TEST(FullSyncRecordWindowTest, AcknowledgingCommitDoesNotReleaseEarlierChunks) {
+TEST(FullSyncRecordWindowTest, LaterAckDoesNotReleaseEarlierFrames) {
   FullSyncRecordWindow window;
   ASSERT_TRUE(window.Begin(3, 1, 64).ok());
   ASSERT_TRUE(window.Begin(3, 2, 4096).ok());

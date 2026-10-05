@@ -82,9 +82,9 @@ def _ack(partition, sequence):
 
 
 class FullRecordProxy(H.Proxy):
-    """Hold record ACKs selected by key, or the partition-zero handoff ACK."""
+    """Hold record ACKs selected by key or by a prefix within each database."""
 
-    def __init__(self, keys=(), hold_handoff=False, prefix=None):
+    def __init__(self, keys=(), prefix=None):
         super().__init__("full-record-window", 0)
         self._state = threading.RLock()
         self._hold = set(key.encode() for key in keys)
@@ -92,11 +92,9 @@ class FullRecordProxy(H.Proxy):
         self._prefix = prefix.encode() if prefix is not None else None
         if self._prefix is not None:
             self._hold.update(self._prefix + f"/db{db}".encode() for db in (0, 15))
-        self._hold_handoff = hold_handoff
         self._pending = []
         self._stats = defaultdict(lambda: {"frames": [], "forwarded": 0})
         self._flow_pairs = []
-        self.handoff_seen = threading.Event()
         self.errors = []
 
     def _on_accept(self, conn):
@@ -181,10 +179,6 @@ class FullRecordProxy(H.Proxy):
                             event = (sequence, len(frame), record_kind, partition)
                             self._stats[key]["frames"].append(event)
                             flow["records"][sequence] = (key, event)
-                    elif kind == 6:
-                        sequence, partition = struct.unpack_from("<QH", payload)
-                        if partition == 0 and self._hold_handoff:
-                            flow["records"][sequence] = (None, None)
                 conn.sendall(frame)
         except (OSError, EOFError):
             pass
@@ -206,9 +200,7 @@ class FullRecordProxy(H.Proxy):
                         selected = flow["records"].pop(sequence, None)
                     if selected is not None:
                         key, event = selected
-                        if key is None:
-                            self.handoff_seen.set()
-                        if key in self._hold or (key is None and self._hold_handoff):
+                        if key in self._hold:
                             self._pending.append((flow, frame, key, event))
                             continue
                     self._send_ack(flow, frame, selected[0] if selected else None)
@@ -238,26 +230,16 @@ class FullRecordProxy(H.Proxy):
                 "held": sum(item[2] == key for item in self._pending),
             }
 
-    def release(self, key=None, record_kind=None, one=False):
-        """Release selected ACKs, optionally just one frame of a given kind."""
-        key = key.encode() if key is not None else None
-        one = one or record_kind is not None
+    def release(self, key, one=False):
+        """Release the selected key's ACKs, optionally just its first held ACK."""
+        key = key.encode()
         with self._state:
             if not one:
-                if key is None:
-                    self._hold_handoff = False
-                else:
-                    self._hold.discard(key)
+                self._hold.discard(key)
             released = 0
             retained = []
             for flow, frame, selected_key, event in self._pending:
-                matches = selected_key == key and (
-                    not one
-                    or (
-                        released == 0
-                        and (record_kind is None or event[2] == record_kind)
-                    )
-                )
+                matches = selected_key == key and (not one or released == 0)
                 if matches:
                     self._send_ack(flow, frame, key)
                     released += 1

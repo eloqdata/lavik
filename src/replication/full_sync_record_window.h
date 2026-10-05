@@ -27,17 +27,16 @@ namespace lavik::detail {
 
 // One source flow owns this fixed-size ledger on its worker. It retains only
 // completion identities: the ordered writer releases each frame buffer after
-// WriteAll. Callers retain per-frame completion state until its exact ACK, or
-// retain a streamed source value until the entire ledger drains.
-// Unlike FULL commands, every record frame has its own ACK and can therefore
-// return byte credit without waiting for the end of a larger logical value.
+// WriteAll. Callers retain ordinary snapshot completion identities until each
+// exact ACK. Unlike fragmented FULL commands, every record frame has its own
+// ACK and can therefore return byte credit independently.
 class FullSyncRecordWindow {
  public:
   static constexpr std::size_t kMaxFrames = 8;
   static constexpr std::size_t kMaxBytes = 16 * 1024 * 1024;
 
   // Wire bytes include the transport header and FULL sequence. The frame-count
-  // ceiling also bounds tiny begin/commit records independently of byte credit.
+  // ceiling also bounds tiny record batches independently of byte credit.
   bool CanSend(std::size_t wire_bytes) const noexcept {
     return wire_bytes != 0 && inflight_frames_ < kMaxFrames &&
            wire_bytes <= kMaxBytes - inflight_bytes_;

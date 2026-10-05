@@ -939,12 +939,9 @@ and `commit` frames. Grouped sources pin an immutable root and its complete
 group graph, measure the compact wire length page by page, and traverse the
 same graph again to emit chunks. Source state retains one admitted decoded
 page; completion and cancellation release the graph only after active reads
-have finished. Each flow pipelines one large value's begin, chunk, and commit
-record frames through a window bounded by both frame count and wire bytes.
-The existing FULL ACK reader releases credit only for the exact partition and
-sequence; completion of every frame precedes release of the source value and
-its capture or publisher credit. Fragmented commands retain their
-final-fragment ACK contract.
+have finished. Each streamed begin, chunk, and commit frame waits for its own
+ACK before the sender advances; source pins and capture or publisher credit
+remain held through the complete logical value.
 These source-local handles do not enter the wire format. Grouped Streams use
 portable `LSR1` length-framed logical records rather than a whole `LXS1` image;
 compatible peers decode those records incrementally with the same ingest
@@ -963,7 +960,7 @@ transaction's durability boundary. Malformed input, cancellation or OOM
 rolls back uncommitted pages and invalidates the rebuild. Cleanup errors after
 durable commit never roll back that committed decision.
 Ordinary baseline values are materialized into bounded record batches and
-share the flow's bounded records window across successive scan batches within
+use the flow's bounded records window across successive scan batches within
 one database. The sender retains admitted completion identities after releasing
 the sent value buffers; only exact ACKs advance source coverage. Database
 completion joins these identities before the single scan coverage map is
