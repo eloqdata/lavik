@@ -60,6 +60,97 @@ class ListReadGate {
   ScopedEnvironment fault_;
 };
 
+TEST(GroupedListWriteE2e, RangeReadsFitReplyBudgetAndKeepRankOrder) {
+  PrivateDisk disk;
+  const std::string key = "range-budget";
+  constexpr unsigned count = 65536;
+  auto value = [](unsigned i) {
+    auto bytes = std::to_string(i);
+    bytes.resize(128, static_cast<char>(i % 251));
+    bytes[16] = '\0';
+    return bytes;
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    for (unsigned first = 0; first < count; first += 256) {
+      std::vector<std::string> command{"RPUSH", key};
+      for (unsigned i = first; i < first + 256; ++i)
+        command.push_back(value(i));
+      ASSERT_EQ(client.Command(command).text_, std::to_string(first + 256));
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // The 8 MiB payload and its reply fit this limit. Reserving four complete
+  // mutation/encoding copies exceeds it before the first range page is read.
+  // Disable the separate client-buffer quota to isolate storage admission.
+  Server server(disk, 1, {}, {}, false, 2, "96M", {}, "0");
+  Client client(server.port());
+  const auto all = client.Command({"LRANGE", key, "0", "-1"});
+  ASSERT_EQ(all.kind_, '*') << all.text_;
+  ASSERT_EQ(all.items_.size(), count);
+  for (unsigned i = 0; i < count; ++i)
+    ASSERT_EQ(all.items_[i].text_, value(i)) << i;
+  // Nonzero first offsets, partial final pages and several read windows must
+  // retain logical rank order regardless of physical completion order.
+  const auto middle = client.Command({"LRANGE", key, "17", "4137"});
+  ASSERT_EQ(middle.items_.size(), 4121);
+  for (unsigned i = 0; i < middle.items_.size(); ++i)
+    ASSERT_EQ(middle.items_[i].text_, value(i + 17)) << i;
+  const auto tail = client.Command({"LRANGE", key, "-83", "-1"});
+  ASSERT_EQ(tail.items_.size(), 83);
+  for (unsigned i = 0; i < tail.items_.size(); ++i)
+    ASSERT_EQ(tail.items_[i].text_, value(count - 83 + i)) << i;
+  EXPECT_EQ(client.Command({"LINDEX", key, "-1"}).text_, value(count - 1));
+  EXPECT_EQ(client.Command({"SET", "unrelated", "after-range"}).text_, "OK");
+  client.Durable();
+  ASSERT_EQ(server.Wait(true), 0) << server.Log();
+}
+
+TEST(GroupedListWriteE2e, RangeReadFailureJoinsStartedPages) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires read and partial batch start failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "range-failure";
+  const std::string value(128, 'v');
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    std::vector<std::string> seed{"RPUSH", key};
+    seed.insert(seed.end(), 1024, value);
+    ASSERT_EQ(client.Command(seed).text_, "1024");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  for (const char* variable :
+       {"LAVIK_FAIL_LIST_READ_BATCH_START_KEY", "LAVIK_FAIL_VALUE_READ_KEY"}) {
+    SCOPED_TRACE(variable);
+    ScopedEnvironment fault(variable, key.c_str());
+    Server server(disk, 3);
+    Client client(server.port());
+    const auto failed = client.Command({"LRANGE", key, "0", "-1"});
+    ASSERT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find(
+                  variable == std::string_view("LAVIK_FAIL_VALUE_READ_KEY")
+                      ? "injected value payload read failure"
+                      : "OOM grouped List read batch admission"),
+              std::string::npos)
+        << failed.text_;
+    EXPECT_EQ(client.Command({"LLEN", key}).text_, "1024");
+    EXPECT_EQ(client.Command({"SET", "unrelated", "after-failure"}).text_,
+              "OK");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  const auto all = client.Command({"LRANGE", key, "0", "-1"});
+  ASSERT_EQ(all.items_.size(), 1024);
+  for (const auto& item : all.items_) EXPECT_EQ(item.text_, value);
+}
+
 TEST(GroupedListWriteE2e, SuspendedReadersReleaseWorkerState) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires grouped List read gate";
