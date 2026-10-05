@@ -57,7 +57,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
       // Refresh before materializing compact locations, not only after IO
       // fails: otherwise a reused block could lend an old entry a new epoch.
       auto resolved = co_await FindVerifiedEntry(
-          store, partition.indexes_[db_id], digest, key);
+          store, partition.indexes_[db_id], digest, key, original.root_);
       if (!resolved.ok()) co_return resolved.status();
       if (*resolved == nullptr || !(*resolved)->value_.grouped() ||
           (*resolved)->value_.mutation_sequence_ !=

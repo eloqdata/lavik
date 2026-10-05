@@ -1140,6 +1140,28 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadOutOfIndexKey(
 }
 
 Task<absl::StatusOr<RecordIndex::Entry*>>
+StorageEngine::Impl::FindVerifiedEntry(
+    WorkerStore& store, RecordIndex& index, const Digest& digest,
+    std::string_view key, const RecordLocation& verified_location) {
+  // Grouped readers already checked the parent key before capturing their
+  // view. Re-reading a multi-megabyte key for every small page adds IO and
+  // copies proportional to key bytes times page count. Selection never
+  // suspends, and the allocation epoch prevents a reused block from matching.
+  // Complete index keys still compare full bytes, while a digest collision
+  // between indirect keys must also match the previously checked record.
+  auto* current = index.FindCandidateIf(
+      digest, key, [&](const RecordIndex::Entry& candidate) {
+        return candidate.key_complete() ||
+               MaterializeIndexLocation(candidate).SamePhysicalRecord(
+                   verified_location);
+      });
+  if (current != nullptr) co_return current;
+  // Relocation may preserve the logical key while changing physical identity.
+  // Keep the asynchronous verifier and its retry/membership checks as fallback.
+  co_return co_await FindVerifiedEntry(store, index, digest, key);
+}
+
+Task<absl::StatusOr<RecordIndex::Entry*>>
 StorageEngine::Impl::FindVerifiedEntry(WorkerStore& store, RecordIndex& index,
                                        const Digest& digest,
                                        std::string_view key) {
