@@ -1,5 +1,0 @@
-libibverbs: Warning: couldn't open config directory '/etc/libibverbs.d'.
-tcpdump: listening on lvh4106889, link-type EN10MB (Ethernet), snapshot length 262144 bytes
-20670 packets captured
-20671 packets received by filter
-1 packet dropped by kernel

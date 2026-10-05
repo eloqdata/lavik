@@ -1,7 +1,0 @@
-# Preserve byte-exact archived output and generated figures. These files are
-# evidence, so normalizing their whitespace would invalidate recorded hashes.
-evidence/build/**/CMakeCache.txt -whitespace
-evidence/**/*.log -whitespace
-*.svg -whitespace
-# Python's CSV writer uses CRLF; retain ordinary whitespace checks otherwise.
-evidence/*.csv whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

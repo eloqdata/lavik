@@ -1,9 +1,0 @@
-{
-  "classification": "instrumentation-invalid",
-  "is_replication_failure": false,
-  "digest_verified": false,
-  "is_performance_sample": false,
-  "reason": "tcpdump reported1packet dropped by kernel, capture completeness asserted before digest; full transport reachedONLINE4/4 with oneFULL perflow. No retries or source/server failure inferred.",
-  "tcpdump_buffer_kib": 16384,
-  "followup_case": "dense-records-128m-f4-rtt20-capture-repeat"
-}
