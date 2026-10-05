@@ -588,7 +588,21 @@ TEST_F(MetaCoordinatorComponentTest,
   EXPECT_TRUE(stores.operation_.TransitionOperationPhase(phase, 4).ok());
   auto image = stores.Serialize();
   EXPECT_TRUE(image.ok());
+  machine_->Advance(4);
+  const auto advanced = coordinator_->MembershipDiscovery();
+  EXPECT_EQ(advanced.cursor_.applied_index(), 4u);
+  EXPECT_EQ(advanced.cursor_.state_change_index(), 2u);
   if (image.ok()) EXPECT_TRUE(machine_->Install(4, *image).ok());
+  // Install may change state at an already applied index, without an event.
+  // Comparing only applied_index would leave idle workflow discovery stale.
+  const auto installed_cursor = coordinator_->CommittedCursor();
+  EXPECT_EQ(installed_cursor.applied_index(), advanced.cursor_.applied_index());
+  EXPECT_NE(installed_cursor.state_change_index(),
+            advanced.cursor_.state_change_index());
+  discovered = coordinator_->MembershipDiscovery();
+  EXPECT_EQ(discovered.cursor_.state_change_index(), 4u);
+  ASSERT_TRUE(discovered.operation_);
+  EXPECT_EQ(discovered.operation_->kind_phase_blob_, "change-config");
   Commit(5, MakeRegister(0x75));
   Commit(6, MakeRegister(0x76));
   EXPECT_TRUE(subscribed.subscription_->needs_resync());

@@ -1409,7 +1409,7 @@ bycorf::Task<absl::Status> MetaClusterCreateReconciler::Run(
   std::optional<MetaClusterCreateDiscovery> discovered;
   while (!core->cancelled_ && context->IsCurrent()) {
     // Idle polling has no store payload. Advance/Install may have no command
-    // event; a changed applied cursor also requires rediscovery. Active
+    // event; either cursor component changing requires rediscovery. Active
     // planning captures its entire input anew, including all unfinished
     // siblings.
     if (subscribed.subscription_->needs_resync()) {
@@ -1417,8 +1417,10 @@ bycorf::Task<absl::Status> MetaClusterCreateReconciler::Run(
       discovered.reset();
     }
     const bool notified = changed->exchange(false, std::memory_order_acq_rel);
+    const auto cursor = context->CommittedCursor();
     if (!discovered || notified ||
-        context->AppliedIndex() != discovered->cursor_.applied_index())
+        cursor.applied_index() != discovered->cursor_.applied_index() ||
+        cursor.state_change_index() != discovered->cursor_.state_change_index())
       discovered = context->ClusterCreateDiscovery();
     const auto& operation = discovered->root_;
     // The runtime always reports actual peer application. Only this planner

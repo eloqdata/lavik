@@ -1321,7 +1321,7 @@ the root, complete creation topology and every declared child at one committed
 cut. Intent decoding and child/digest selection happen outside state exclusion;
 capture rechecks the discovered root and lifecycle, retrying if they changed.
 Every effect is checked before its phase checkpoint advances, including recovery
-between those commits. Creation and membership owners check the applied cursor
+between those commits. Creation and membership owners check both committed cursor fields
 for eventless configuration/snapshot progress, recapture after their own proposal
 completion, and renew cursor subscription plus workflow capture after overflow.
 A notification is a wakeup hint, never durable progress. The reconciler uses the trusted coordinator actor for follow-up

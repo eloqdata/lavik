@@ -473,8 +473,12 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
       discovered.reset();
     }
     const bool notified = changed->exchange(false, std::memory_order_acq_rel);
+    // Install can change state at an index already reached by Advance, without
+    // a command notification. Compare both components of the committed cut.
+    const auto cursor = context->CommittedCursor();
     if (!discovered || notified ||
-        context->AppliedIndex() != discovered->cursor_.applied_index())
+        cursor.applied_index() != discovered->cursor_.applied_index() ||
+        cursor.state_change_index() != discovered->cursor_.state_change_index())
       discovered = context->MembershipDiscovery();
     const MetaOperationRecord* op =
         discovered->operation_ ? &*discovered->operation_ : nullptr;
