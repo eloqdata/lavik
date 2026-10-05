@@ -1040,6 +1040,13 @@ if (BUILD_TESTING)
     set_tests_properties(meta_integration.gate_initial_recovery PROPERTIES
       TIMEOUT 300)
 
+    add_test(
+      NAME meta_integration.gate_readiness
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/test_meta_gate_readiness.py)
+    set_tests_properties(meta_integration.gate_readiness PROPERTIES
+      LABELS meta-integration TIMEOUT 30)
+
     # Real-process Meta <-> Data control gate.  It needs both executables,
     # unlike the Meta-only fault gates above.
     add_test(
