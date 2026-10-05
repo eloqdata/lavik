@@ -1,0 +1,15 @@
+Internal ctest changing into directory: /mnt/local_nvme/i131/build-snapshots-debug
+Test project /mnt/local_nvme/i131/build-snapshots-debug
+    Start 830: meta_integration.sentinel
+1/3 Test #830: meta_integration.sentinel .............   Passed   15.73 sec
+    Start 836: meta_integration.gate_leader_change
+2/3 Test #836: meta_integration.gate_leader_change ...   Passed   13.76 sec
+    Start 845: meta_integration.gate_readiness
+3/3 Test #845: meta_integration.gate_readiness .......   Passed    0.19 sec
+
+100% tests passed, 0 tests failed out of 3
+
+Label Time Summary:
+meta-integration    =  29.67 sec*proc (3 tests)
+
+Total Test time (real) =  29.69 sec

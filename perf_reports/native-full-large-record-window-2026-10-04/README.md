@@ -2,6 +2,8 @@
 
 2026-10-04 · [中文](README.zh-CN.md) · [Methods](METHODS.md) · [Reproduce](REPRODUCE.md)
 
+**2026-10-05 follow-up:** [Ten-pair no-capture live-write tests](followup-2026-10-05/README.md) reduce median FULL time by **9.14% / 23.03% at 5/20 ms**, while retaining higher foreground maxima in 6/10 and 7/10 pairs. [The Meta CI gate repair](validation/CI-FIX.md) is test-only. The figures below preserve the original 2026-10-04 cohort.
+
 The large-value record window reduced end-to-end FULL time in the measured single-source-flow cases: 128 MiB strings improved by **12.76% at 5 ms added RTT** and **13.57% at 20 ms**; large hashes improved by **13.69% and 18.54%**. This is a scoped benefit, with important negative and variable results: **four-source-flow strings at 5 ms regressed 13.95% with capture**, while the later matched no-capture cohort improved 21.30%. At zero added RTT, the no-capture median regressed 1.23%. These results do not establish a universal gain or a precise causal cost of packet capture.
 
 ## Comparison and conditions

@@ -1,0 +1,560 @@
+[
+  {
+    "case": "large-live-128m-f1-rtt20-queue32-nocap-followup",
+    "comparison": "chunks",
+    "before_label": "main",
+    "after_label": "chunks",
+    "expected_repeats": 10,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "main": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 14.77067800797522,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r1-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 13.613095628563315,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r2-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 17.84280283888802,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r3-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 4,
+            "full_seconds": 13.632125122006983,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r4-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 5,
+            "full_seconds": 12.842607081867754,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r5-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 6,
+            "full_seconds": 12.85351754911244,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r6-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 7,
+            "full_seconds": 12.842209042981267,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r7-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 8,
+            "full_seconds": 13.573146712966263,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r8-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 9,
+            "full_seconds": 14.060716467909515,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r9-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 10,
+            "full_seconds": 14.030369732994586,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r10-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          }
+        ],
+        "full_seconds": [
+          14.77067800797522,
+          13.613095628563315,
+          17.84280283888802,
+          13.632125122006983,
+          12.842607081867754,
+          12.85351754911244,
+          12.842209042981267,
+          13.573146712966263,
+          14.060716467909515,
+          14.030369732994586
+        ],
+        "statistics": {
+          "count": 10,
+          "min_seconds": 12.842209042981267,
+          "median_seconds": 13.622610375285149,
+          "max_seconds": 17.84280283888802,
+          "p50_seconds": 13.613095628563315,
+          "p90_seconds": 14.77067800797522,
+          "p99_seconds": 17.84280283888802,
+          "p999_seconds": 17.84280283888802
+        }
+      },
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 10.458522805012763,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 10.47367937490344,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 13.59549635881558,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 4,
+            "full_seconds": 10.497951361816376,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r4-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 5,
+            "full_seconds": 10.016848731786013,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r5-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 6,
+            "full_seconds": 10.41601922782138,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r6-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 7,
+            "full_seconds": 11.590492175891995,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r7-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 8,
+            "full_seconds": 9.989298747852445,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r8-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 9,
+            "full_seconds": 11.695618671830744,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r9-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 10,
+            "full_seconds": 10.90885655907914,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt20-queue32-nocap-followup/r10-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          10.458522805012763,
+          10.47367937490344,
+          13.59549635881558,
+          10.497951361816376,
+          10.016848731786013,
+          10.41601922782138,
+          11.590492175891995,
+          9.989298747852445,
+          11.695618671830744,
+          10.90885655907914
+        ],
+        "statistics": {
+          "count": 10,
+          "min_seconds": 9.989298747852445,
+          "median_seconds": 10.485815368359908,
+          "max_seconds": 13.59549635881558,
+          "p50_seconds": 10.47367937490344,
+          "p90_seconds": 11.695618671830744,
+          "p99_seconds": 13.59549635881558,
+          "p999_seconds": 13.59549635881558
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 14.77067800797522,
+        "after_seconds": 10.458522805012763,
+        "speedup": 1.4123101592220697,
+        "time_reduction_pct": 29.194023460765784
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 13.613095628563315,
+        "after_seconds": 10.47367937490344,
+        "speedup": 1.2997433987890066,
+        "time_reduction_pct": 23.06173657571815
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 17.84280283888802,
+        "after_seconds": 13.59549635881558,
+        "speedup": 1.3124054001396135,
+        "time_reduction_pct": 23.80403190251883
+      },
+      {
+        "repeat": 4,
+        "before_seconds": 13.632125122006983,
+        "after_seconds": 10.497951361816376,
+        "speedup": 1.2985509888710633,
+        "time_reduction_pct": 22.991087098598896
+      },
+      {
+        "repeat": 5,
+        "before_seconds": 12.842607081867754,
+        "after_seconds": 10.016848731786013,
+        "speedup": 1.2821005313891674,
+        "time_reduction_pct": 22.002996214618907
+      },
+      {
+        "repeat": 6,
+        "before_seconds": 12.85351754911244,
+        "after_seconds": 10.41601922782138,
+        "speedup": 1.234014383804175,
+        "time_reduction_pct": 18.963667431716956
+      },
+      {
+        "repeat": 7,
+        "before_seconds": 12.842209042981267,
+        "after_seconds": 11.590492175891995,
+        "speedup": 1.10799514361373,
+        "time_reduction_pct": 9.746896837607387
+      },
+      {
+        "repeat": 8,
+        "before_seconds": 13.573146712966263,
+        "after_seconds": 9.989298747852445,
+        "speedup": 1.358768723969167,
+        "time_reduction_pct": 26.403958057052545
+      },
+      {
+        "repeat": 9,
+        "before_seconds": 14.060716467909515,
+        "after_seconds": 11.695618671830744,
+        "speedup": 1.2022208369169203,
+        "time_reduction_pct": 16.820606556405473
+      },
+      {
+        "repeat": 10,
+        "before_seconds": 14.030369732994586,
+        "after_seconds": 10.90885655907914,
+        "speedup": 1.2861448545968364,
+        "time_reduction_pct": 22.248260261985287
+      }
+    ],
+    "median_speedup": 1.2991465037988617,
+    "median_time_reduction_pct": 23.0263871645054,
+    "median_paired_speedup": 1.29234792173395,
+    "median_paired_time_reduction_pct": 22.61967368029209
+  },
+  {
+    "case": "large-live-128m-f1-rtt5-queue32-nocap-followup",
+    "comparison": "chunks",
+    "before_label": "main",
+    "after_label": "chunks",
+    "expected_repeats": 10,
+    "status": "ready",
+    "issues": [],
+    "variants": {
+      "main": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 5.024808377958834,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r1-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 5.559119273908436,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r2-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 5.454042300116271,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r3-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 4,
+            "full_seconds": 5.070323260966688,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r4-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 5,
+            "full_seconds": 5.581370250321925,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r5-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 6,
+            "full_seconds": 5.004159756936133,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r6-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 7,
+            "full_seconds": 5.530688258819282,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r7-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 8,
+            "full_seconds": 5.018857882358134,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r8-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 9,
+            "full_seconds": 5.896973249968141,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r9-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          },
+          {
+            "repeat": 10,
+            "full_seconds": 5.71809481875971,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r10-main",
+            "revision": "25e159418603a95c1b2cca68173b329067e3ef48",
+            "binary_sha256": "a056e41003b0c833157fe89737448b6a7715d2c5ba63aa32ad1675b4d643fabc"
+          }
+        ],
+        "full_seconds": [
+          5.024808377958834,
+          5.559119273908436,
+          5.454042300116271,
+          5.070323260966688,
+          5.581370250321925,
+          5.004159756936133,
+          5.530688258819282,
+          5.018857882358134,
+          5.896973249968141,
+          5.71809481875971
+        ],
+        "statistics": {
+          "count": 10,
+          "min_seconds": 5.004159756936133,
+          "median_seconds": 5.492365279467776,
+          "max_seconds": 5.896973249968141,
+          "p50_seconds": 5.454042300116271,
+          "p90_seconds": 5.71809481875971,
+          "p99_seconds": 5.896973249968141,
+          "p999_seconds": 5.896973249968141
+        }
+      },
+      "chunks": {
+        "runs": [
+          {
+            "repeat": 1,
+            "full_seconds": 5.456345676910132,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r1-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 2,
+            "full_seconds": 5.0443548248149455,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r2-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 3,
+            "full_seconds": 4.981812843121588,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r3-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 4,
+            "full_seconds": 4.977613005321473,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r4-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 5,
+            "full_seconds": 4.95134393312037,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r5-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 6,
+            "full_seconds": 4.9407525411807,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r6-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 7,
+            "full_seconds": 4.888366475235671,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r7-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 8,
+            "full_seconds": 4.998387200757861,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r8-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 9,
+            "full_seconds": 5.441199324093759,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r9-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          },
+          {
+            "repeat": 10,
+            "full_seconds": 5.4171656728722155,
+            "run_dir": "/mnt/local_nvme/i131/measurements-followup/large-live-128m-f1-rtt5-queue32-nocap-followup/r10-chunks",
+            "revision": "51d03f97fede341fb42c14bd46a9f1aaf416eeb1",
+            "binary_sha256": "c9dae66f6d752823acc72f7d399016d2a14201c6b848ea1aa610e910aaada751"
+          }
+        ],
+        "full_seconds": [
+          5.456345676910132,
+          5.0443548248149455,
+          4.981812843121588,
+          4.977613005321473,
+          4.95134393312037,
+          4.9407525411807,
+          4.888366475235671,
+          4.998387200757861,
+          5.441199324093759,
+          5.4171656728722155
+        ],
+        "statistics": {
+          "count": 10,
+          "min_seconds": 4.888366475235671,
+          "median_seconds": 4.990100021939725,
+          "max_seconds": 5.456345676910132,
+          "p50_seconds": 4.981812843121588,
+          "p90_seconds": 5.441199324093759,
+          "p99_seconds": 5.456345676910132,
+          "p999_seconds": 5.456345676910132
+        }
+      }
+    },
+    "paired_values": [
+      {
+        "repeat": 1,
+        "before_seconds": 5.024808377958834,
+        "after_seconds": 5.456345676910132,
+        "speedup": 0.9209109311425311,
+        "time_reduction_pct": -8.58813444198634
+      },
+      {
+        "repeat": 2,
+        "before_seconds": 5.559119273908436,
+        "after_seconds": 5.0443548248149455,
+        "speedup": 1.102047628878362,
+        "time_reduction_pct": 9.25982019327275
+      },
+      {
+        "repeat": 3,
+        "before_seconds": 5.454042300116271,
+        "after_seconds": 4.981812843121588,
+        "speedup": 1.0947906860143677,
+        "time_reduction_pct": 8.658338733174386
+      },
+      {
+        "repeat": 4,
+        "before_seconds": 5.070323260966688,
+        "after_seconds": 4.977613005321473,
+        "speedup": 1.018625444675209,
+        "time_reduction_pct": 1.828488064241085
+      },
+      {
+        "repeat": 5,
+        "before_seconds": 5.581370250321925,
+        "after_seconds": 4.95134393312037,
+        "speedup": 1.1272434970609098,
+        "time_reduction_pct": 11.288022276701959
+      },
+      {
+        "repeat": 6,
+        "before_seconds": 5.004159756936133,
+        "after_seconds": 4.9407525411807,
+        "speedup": 1.0128335137667672,
+        "time_reduction_pct": 1.2670901576942173
+      },
+      {
+        "repeat": 7,
+        "before_seconds": 5.530688258819282,
+        "after_seconds": 4.888366475235671,
+        "speedup": 1.1313980420325676,
+        "time_reduction_pct": 11.613776686099776
+      },
+      {
+        "repeat": 8,
+        "before_seconds": 5.018857882358134,
+        "after_seconds": 4.998387200757861,
+        "speedup": 1.0040954573501566,
+        "time_reduction_pct": 0.4078752991239165
+      },
+      {
+        "repeat": 9,
+        "before_seconds": 5.896973249968141,
+        "after_seconds": 5.441199324093759,
+        "speedup": 1.0837635048317757,
+        "time_reduction_pct": 7.728946809735737
+      },
+      {
+        "repeat": 10,
+        "before_seconds": 5.71809481875971,
+        "after_seconds": 5.4171656728722155,
+        "speedup": 1.0555510324143251,
+        "time_reduction_pct": 5.262751937939491
+      }
+    ],
+    "median_speedup": 1.1006523427025043,
+    "median_time_reduction_pct": 9.14478975762374,
+    "median_paired_speedup": 1.0696572686230503,
+    "median_paired_time_reduction_pct": 6.495849373837614
+  }
+]

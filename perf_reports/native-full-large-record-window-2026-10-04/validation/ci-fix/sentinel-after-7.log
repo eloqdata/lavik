@@ -1,0 +1,42 @@
+[meta-integration] node 1 started (pid 4140509, raft 53873, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-n0a0o627/node1/meta-admin.sock,127.0.0.1:40267, initial_manifest=False, attempt 1)
+[meta-integration] node 1: clean exit 0
+.[meta-integration] node 1 started (pid 4140526, raft 35555, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-_t0bwqk1/node1/meta-admin.sock,127.0.0.1:46849, initial_manifest=False, attempt 1)
+..[meta-integration] node 1 started (pid 4140556, raft 48617, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-qe4dijn6/node1/meta-admin.sock,127.0.0.1:40659, initial_manifest=True, attempt 1)
+[meta-integration] node 2 started (pid 4140570, raft 40989, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-qe4dijn6/node2/meta-admin.sock,127.0.0.1:39599, initial_manifest=False, attempt 1)
+[meta-integration] node 1: clean exit 0
+[meta-integration] node 2: clean exit 0
+.[meta-integration] node 1 started (pid 4140585, raft 37093, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-yoytb4et/node1/meta-admin.sock,127.0.0.1:42827, initial_manifest=False, attempt 1)
+[meta-integration] node 1: clean exit 0
+.[meta-integration] node 1 started (pid 4140604, raft 52213, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-ed1ludx_/node1/meta-admin.sock,127.0.0.1:60539, initial_manifest=False, attempt 1)
+[meta-integration] node 1: clean exit 0
+.[meta-integration] node 1 started (pid 4140619, raft 36517, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-_bzbrzu0/node1/meta-admin.sock,127.0.0.1:33411, initial_manifest=False, attempt 1)
+[meta-integration] node 1: clean exit 0
+[meta-integration] node 2 started (pid 4140633, raft 54661, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-_bzbrzu0/node2/meta-admin.sock,127.0.0.1:58615, initial_manifest=False, attempt 1)
+.[meta-integration] node 1 started (pid 4140647, raft 49005, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-qifxwu3u/node1/meta-admin.sock,127.0.0.1:48569, initial_manifest=True, attempt 1)
+[meta-integration] node 2 started (pid 4140661, raft 43125, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-qifxwu3u/node2/meta-admin.sock,127.0.0.1:35595, initial_manifest=False, attempt 1)
+[meta-integration] node 1: clean exit 0
+[meta-integration] node 2: clean exit 0
+.[meta-integration] node 1 started (pid 4140678, raft 38549, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-l4csmflg/node1/meta-admin.sock,127.0.0.1:38735, initial_manifest=False, attempt 1)
+[meta-integration] node 1: clean exit 0
+.[meta-integration] node 1 started (pid 4140693, raft 36227, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-3zacy1rt/node1/meta-admin.sock,127.0.0.1:42195, initial_manifest=False, attempt 1)
+[meta-integration] node 1: clean exit 0
+.[meta-integration] node 1 started (pid 4140707, raft 35117, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-nfrpmhih/node1/meta-admin.sock,127.0.0.1:37681, initial_manifest=False, attempt 1)
+[meta-integration] node 1: clean exit 0
+.[meta-integration] node 1 started (pid 4140720, raft 43101, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-rfb8g7gk/node1/meta-admin.sock,127.0.0.1:43227, initial_manifest=False, attempt 1)
+[meta-integration] node 1: clean exit 0
+.[meta-integration] node 1 started (pid 4140734, raft 59003, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-qa8hfn_2/node1/meta-admin.sock,127.0.0.1:58077, initial_manifest=False, attempt 1)
+[meta-integration] node 1: clean exit 0
+[meta-integration] node 2 started (pid 4140748, raft 60095, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-qa8hfn_2/node2/meta-admin.sock,127.0.0.1:60919, initial_manifest=True, attempt 1)
+[meta-integration] node 2: clean exit 0
+[meta-integration] node 3 started (pid 4140764, raft 54507, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-qa8hfn_2/node3/meta-admin.sock,127.0.0.1:53735, initial_manifest=False, attempt 1)
+[meta-integration] node 3: clean exit 0
+[meta-integration] node 4 started (pid 4140777, raft 38815, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-qa8hfn_2/node4/meta-admin.sock,127.0.0.1:45229, initial_manifest=True, attempt 1)
+[meta-integration] node 4: clean exit 0
+.[meta-integration] node 1 started (pid 4140793, raft 59685, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-fwg5i7uy/node1/meta-admin.sock,127.0.0.1:49931, initial_manifest=True, attempt 1)
+[meta-integration] node 1: clean exit 0
+.[meta-integration] node 1 started (pid 4140809, raft 36993, ctl /mnt/local_nvme/i131/tmp/lavik-sentinel-t4zi59n2/node1/meta-admin.sock,127.0.0.1:58243, initial_manifest=True, attempt 1)
+.
+----------------------------------------------------------------------
+Ran 15 tests in 15.637s
+
+OK
