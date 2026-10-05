@@ -973,7 +973,12 @@ empty capture-queue check does not drain it. If retaining a batch's completion
 identities cannot be admitted, the sender drains older frames and sends that
 batch synchronously. Replacement and publish-record batches retain their
 existing whole-batch or whole-item confirmation boundary.
-Transactions committed during the LOADING rebuild publish their participant after-images
+Materialization makes subsequent writes eligible for the ordered command FIFO
+even before a batch is sent. Before draining a nonempty FIFO, the sender flushes
+any pending baseline batch and joins its completions, so dependent commands and
+after-images cannot precede their baseline. Empty FIFO checks retain batching.
+Transactions committed during the LOADING rebuild publish their participant
+after-images
 only after the commit decision. `FLUSHDB` or `FLUSHALL` invalidates an active
 capture attempt so the next attempt starts from the new database epochs.
 

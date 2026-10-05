@@ -1467,6 +1467,56 @@ def full_record_window(root, origin="baseline", failure=None):
         assert Path(source.log_path).read_text().count("selected=FULL") == 1
 
 
+def full_pending_snapshot_batch(root):
+    """A captured command cannot overtake its materialized, unsent baseline."""
+    prefix = "{snapshot-window-13021}:pending-"
+    assert C.redis_slot(prefix) == 0
+    hold = root / "pending-snapshot.hold"
+    hold.touch()
+
+    def seed(writer):
+        for suffix in ("ttl", "append", "delete"):
+            assert writer.call("SET", prefix + suffix, "baseline") == "OK"
+
+    try:
+        with pair(
+            root,
+            "full-snapshot-pending-batch",
+            seed=seed,
+            require_seed_before_full=True,
+            source_workers=1,
+            target_workers=2,
+            client_mode="single",
+            source_faults={"LAVIK_FULL_PENDING_SNAPSHOT_HOLD_FILE": str(hold)},
+            raft_args=H.raft_args(
+                snapshot_distance=100000, election_ms_low=5000, election_ms_high=10000
+            ),
+        ) as (meta, source, target, writer):
+            H.wait_until(
+                "materialized baseline is held before its first frame",
+                30,
+                lambda: "fault pause reached: LAVIK_FULL_PENDING_SNAPSHOT_HOLD_FILE"
+                in Path(source.log_path).read_text(),
+            )
+            expiry = int(time.time() * 1000) + 120000
+            assert writer.call("PEXPIREAT", prefix + "ttl", expiry) == 1
+            assert writer.call("APPEND", prefix + "append", ":tail") == 13
+            assert writer.call("DEL", prefix + "delete") == 1
+            hold.unlink()
+            ready(meta)
+            reader = Client(target)
+            try:
+                actual_expiry = reader.call("PEXPIRETIME", prefix + "ttl")
+                assert actual_expiry == expiry, (actual_expiry, expiry)
+                assert reader.call("GET", prefix + "append") == "baseline:tail"
+                assert reader.call("GET", prefix + "delete") is None
+            finally:
+                reader.close()
+            assert Path(source.log_path).read_text().count("selected=FULL") == 1
+    finally:
+        hold.unlink(missing_ok=True)
+
+
 def full_record_windows(root):
     for origin in ("baseline", "override", "publish-record"):
         full_record_window(root, origin)
@@ -2532,6 +2582,11 @@ def main():
             mode = sys.argv[5:]
             if mode == ["record_window"]:
                 full_record_windows(root)
+            elif mode == ["snapshot_ordering"]:
+                if not C.has_fault(C.DATA, b"LAVIK_FULL_PENDING_SNAPSHOT_HOLD_FILE"):
+                    H.log("SKIP: snapshot ordering gate requires test faults")
+                    sys.exit(77)
+                full_pending_snapshot_batch(root)
             elif mode == ["snapshot_window"]:
                 full_snapshot_windows(root)
             else:

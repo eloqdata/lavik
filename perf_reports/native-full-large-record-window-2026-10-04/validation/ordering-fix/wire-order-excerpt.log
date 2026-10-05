@@ -1,0 +1,28 @@
+RUN 0 /mnt/local_nvme/i131/data/snapshot-expiry-0-kq8rkrda
+[DEBUG-wire-record] 1 0 b'{snapshot-window-13021}:1' 40962 0
+[DEBUG-wire-record] 3 0 b'{snapshot-window-13021}:0' 40962 0
+[DEBUG-wire-record] 5 0 b'{snapshot-window-13021}:2' 40962 0
+[DEBUG-expiry] 1791176414.6869767 0 ('PEXPIREAT', '{snapshot-window-13021}:2', 1791176534684) 1
+[DEBUG-expiry] 1791176414.6876695 15 ('PEXPIREAT', '{snapshot-window-13021}:2', 1791176534684) 1
+[DEBUG-wire-command] 10 40963 b'LRC1\x01\x00\x03\x00\x03\x00\x00\x00\x19\x00\x00\x00\x0f\x00\x00\x00SET{snapshot-window-13021}:0db0:during-full'
+[DEBUG-wire-command] 11 40964 b'LRC1\x01\x00\x02\x00\x03\x00\x00\x00\x19\x00\x00\x00DEL{snapshot-window-13021}:1'
+[DEBUG-wire-command] 12 40965 b'LRC1\x01\x00\x0c\x00\x0f\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\t\x00\x00\x00\x19\x00\x00\x00\r\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\t\x00\x00\x00\x19\x00\x00\x00\r\x00\x00\x00__LAVIK_EXEC_V1203PEXPIREAT{snapshot-window-13021}:2179117653468403PEXPIREAT{snapshot-window-13021}:21791176534684'
+[DEBUG-wire-record] 17 15 b'{snapshot-window-13021}:0' 40962 0
+[DEBUG-wire-record] 19 15 b'{snapshot-window-13021}:2' 40962 1791176534684
+[DEBUG-wire-command] 24 40969 b'LRC1\x01\x0f\x03\x00\x03\x00\x00\x00\x19\x00\x00\x00\x12\x00\x00\x00SET{snapshot-window-13021}:0db15:second-update'
+[DEBUG-expiry] 1791176428.494246 0 ('PEXPIRETIME', '{snapshot-window-13021}:2') 1791176534684
+[DEBUG-expiry] 1791176428.9403474 15 ('PEXPIRETIME', '{snapshot-window-13021}:2') 1791176534684
+PASS 0
+RUN 1 /mnt/local_nvme/i131/data/snapshot-expiry-1-z6lihofr
+[DEBUG-wire-record] 4 0 b'{snapshot-window-13021}:1' 40962 0
+[DEBUG-expiry] 1791176450.679753 0 ('PEXPIREAT', '{snapshot-window-13021}:2', 1791176570677) 1
+[DEBUG-expiry] 1791176450.6803942 15 ('PEXPIREAT', '{snapshot-window-13021}:2', 1791176570677) 1
+[DEBUG-wire-command] 10 40964 b'LRC1\x01\x00\x02\x00\x03\x00\x00\x00\x19\x00\x00\x00DEL{snapshot-window-13021}:1'
+[DEBUG-wire-command] 11 40965 b'LRC1\x01\x00\x0c\x00\x0f\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\t\x00\x00\x00\x19\x00\x00\x00\r\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\t\x00\x00\x00\x19\x00\x00\x00\r\x00\x00\x00__LAVIK_EXEC_V1203PEXPIREAT{snapshot-window-13021}:2179117657067703PEXPIREAT{snapshot-window-13021}:21791176570677'
+[DEBUG-wire-record] 12 0 b'{snapshot-window-13021}:0' 40963 0
+[DEBUG-wire-record] 13 0 b'{snapshot-window-13021}:2' 40962 0
+[DEBUG-wire-record] 24 15 b'{snapshot-window-13021}:0' 40969 0
+[DEBUG-wire-record] 25 15 b'{snapshot-window-13021}:2' 40962 1791176570677
+[DEBUG-expiry] 1791176464.5765734 0 ('PEXPIRETIME', '{snapshot-window-13021}:2') -1
+[DEBUG-expiry-source] 0 1791176570677
+[DEBUG-expiry-later] 0 -1
