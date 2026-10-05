@@ -593,9 +593,15 @@ StorageEngine::Impl::ReadValueForTransferLocked(
                                           !range.last_exclusive_);
         if (!end.ok()) co_return end.status();
         source->first_page_ = first->first;
-        source->end_page_ = std::min(
-            end->first + 1,
-            source->saved_.grouped_->ordered_directory().groups().size());
+        const auto& directory = source->saved_.grouped_->ordered_directory();
+        // Bound returns an exclusive record rank. A bound at the start of
+        // the next page contributes no records, so do not pin or visit it.
+        // In reverse order that empty boundary would otherwise consume the
+        // first demand read and enable a window before any message is emitted.
+        source->end_page_ = end->first;
+        if (end->first < directory.groups().size() &&
+            end->second > directory.CountBefore(end->first))
+          ++source->end_page_;
         source->range_count_ =
             range.selected_ids_.empty()
                 ? std::min(range.count_, end->second > first->second
