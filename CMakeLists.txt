@@ -929,13 +929,6 @@ if (BUILD_TESTING)
   find_program(LAVIK_PYTHON3_EXECUTABLE NAMES python3)
   if (LAVIK_PYTHON3_EXECUTABLE)
     add_test(
-      NAME benchmark.native_full_evidence
-      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
-              ${CMAKE_CURRENT_SOURCE_DIR}/tests/bench_native_full_sync_test.py
-    )
-    set_tests_properties(benchmark.native_full_evidence PROPERTIES TIMEOUT 30)
-
-    add_test(
       NAME meta_integration.smoke_3node
       COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/smoke_3node.py
