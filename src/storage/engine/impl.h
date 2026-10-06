@@ -3563,6 +3563,14 @@ class StorageEngine::Impl {
       WorkerStore& store, RecordIndex& index, const Digest& digest,
       std::string_view key);
 
+  // Reuse a completed full-key check only for the same immutable physical
+  // record. The caller must have verified this key at that location,
+  // retain the location across this task, and fence population changes before
+  // calling. Without a matching physical candidate, fall back to full key IO.
+  Task<absl::StatusOr<RecordIndex::Entry*>> FindVerifiedEntry(
+      WorkerStore& store, RecordIndex& index, const Digest& digest,
+      std::string_view key, const RecordLocation& verified_location);
+
   Task<absl::StatusOr<LoadedValue>> LoadValue(
       WorkerStore& key_store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
