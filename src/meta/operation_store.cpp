@@ -921,6 +921,22 @@ absl::StatusOr<MetaOperationArchiveSummary> ReadSummary(MetaReader& r) {
 
 }  // namespace
 
+MetaOperationArchiveExport MetaOperationStore::CaptureArchiveExport() const {
+  MetaOperationArchiveExport result;
+  result.summaries_.reserve(archived_.size());
+  for (const auto& [id, summary] : archived_)
+    result.summaries_.push_back(summary);
+  return result;
+}
+
+absl::StatusOr<std::string> MetaOperationArchiveExport::Encode() const {
+  MetaWriter writer;
+  writer.WriteU16(kMetaFormatVersion);
+  writer.WriteCount(static_cast<std::uint32_t>(summaries_.size()));
+  for (const auto& summary : summaries_) WriteSummary(writer, summary);
+  return writer.TakeBuffer();
+}
+
 absl::StatusOr<std::string> MetaOperationStore::ExportArchive() const {
   MetaWriter w;
   w.WriteU16(kMetaFormatVersion);

@@ -674,10 +674,18 @@ struct MetaSentinelServer::Core {
   }
   void Subscribe() {
     auto signal = std::make_shared<std::atomic<std::uint64_t>>(0);
-    auto start =
-        context_->SubscribeCommitted([signal](const MetaCommitEvent& event) {
-          signal->store(event.log_index_, std::memory_order_release);
-        });
+    // Registration can deliver a newer event before returning its initial
+    // cursor. Neither that initialization nor a replay may regress the signal.
+    const auto advance = [signal](std::uint64_t index) {
+      auto previous = signal->load(std::memory_order_acquire);
+      while (previous < index &&
+             !signal->compare_exchange_weak(previous, index,
+                                            std::memory_order_acq_rel)) {
+      }
+    };
+    auto start = context_->SubscribeCommittedCursor(
+        [advance](const MetaCommitEvent& event) { advance(event.log_index_); });
+    advance(start.view_.applied_index());
     committed_signal_ = std::move(signal);
     subscription_ = std::move(start.subscription_);
   }

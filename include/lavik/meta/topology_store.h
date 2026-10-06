@@ -293,6 +293,8 @@ class MetaTopologyStore {
   std::vector<MetaSlotAssignment> SlotRanges() const;
   bool GroupExists(const std::string& group_id) const;
   std::vector<MetaTopologyGroupView> Groups() const;
+  // Scans transition ownership without copying unrelated Group records.
+  bool HasControlledOperation(const MetaOperationId& id) const;
   // Copies just observation freshness facts directly from GroupState. Groups
   // and their members retain store key order; no derived lookup indices are
   // built here so callers can build them outside the state-machine lock.

@@ -26,9 +26,11 @@
 
 #include "absl/status/statusor.h"
 #include "lavik/meta/commands.h"
+#include "lavik/meta/topology_store.h"
 
 namespace lavik::meta {
 
+class MetaCommittedFacts;
 class MetaProposalView;
 class MetaObservationStore;
 
@@ -58,6 +60,17 @@ absl::StatusOr<std::string> EncodeFailoverOperationIntent(
     const FailoverOperationIntent& intent);
 absl::StatusOr<FailoverOperationIntent> DecodeFailoverOperationIntent(
     std::string_view encoded);
+
+// Shared typed-transition validation for proposal admission and Admin promote.
+// Group, authority and the complete facts domain must belong to one owned cut
+// for the command's Group. These borrowed inputs are used only during the call.
+// Non-transition commands are rejected; generic ownership remains in the hook.
+absl::Status ValidateFailoverTransition(
+    const MetaCommand& command,
+    const std::optional<MetaTopologyGroupView>& group,
+    const std::optional<MetaGroupAuthorityView>& authority,
+    const MetaCommittedFacts& facts, const MetaObservationStore& observations,
+    std::int64_t proposal_now_unix_ms);
 
 // Coordinator admission for workflow ownership and canonical operator input.
 // Runtime progress is represented by MetaFailoverTransition and the eight

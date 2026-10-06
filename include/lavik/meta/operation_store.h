@@ -182,6 +182,8 @@ struct MetaSubmitResult {
   bool operator==(const MetaSubmitResult&) const = default;
 };
 
+struct MetaOperationArchiveExport;
+
 class MetaOperationStore {
  public:
   explicit MetaOperationStore(
@@ -267,6 +269,11 @@ class MetaOperationStore {
   // the cap, retain this result externally and then submit a replicated
   // PruneOperationArchive command; export alone does not remove summaries.
   absl::StatusOr<std::string> ExportArchive() const;
+  // Owned archive-only cut in the existing operation-id wire order.
+  MetaOperationArchiveExport CaptureArchiveExport() const;
+  bool ArchivedSequenceExists(std::uint64_t seq) const {
+    return archived_by_seq_.contains(seq);
+  }
 
   // Snapshot serialization: versioned strict encoding; decode enforces caps
   // and identity invariants (unique ids/seqs, terminal-only archive) with
@@ -299,6 +306,8 @@ class MetaOperationStore {
 struct MetaOperationArchiveExport {
   std::vector<MetaOperationArchiveSummary> summaries_;
   bool operator==(const MetaOperationArchiveExport&) const = default;
+  // Encodes this retained cut, never consulting the current journal.
+  absl::StatusOr<std::string> Encode() const;
 };
 
 absl::StatusOr<MetaOperationArchiveExport> DecodeMetaOperationArchiveExport(

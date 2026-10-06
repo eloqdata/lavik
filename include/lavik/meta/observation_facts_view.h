@@ -27,6 +27,10 @@ class MetaObservationFactsView final : public MetaCommittedFacts {
     return cursor_.state_change_index();
   }
 
+  // Returns the committed assignment even if its identity is retired. Ingest
+  // separately enforces active identity using this same facts cut.
+  std::optional<MetaAssignmentId> AssignmentFor(std::string_view group_id,
+                                                std::string_view node_id) const;
   bool IsActiveNode(std::string_view node_id) const override;
   std::uint64_t CurrentGroupTerm(std::string_view group_id) const override;
   std::uint64_t CurrentPopulationManifestRevision(

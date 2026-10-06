@@ -12,6 +12,7 @@
 #include <string_view>
 
 #include "absl/status/statusor.h"
+#include "lavik/meta/admin_views.h"
 #include "lavik/meta/committed_status_view.h"
 #include "lavik/meta/data_publication_view.h"
 #include "lavik/meta/failover_views.h"
@@ -118,6 +119,28 @@ class MetaStateMachine {
   std::optional<MetaMembershipView> CaptureMembershipView(
       const MetaOperationRecord& expected,
       std::span<const std::uint32_t> member_ids) const;
+  // Purpose-specific Admin reads. Multi-record results are captured under one
+  // state lock; callers must not combine independent reads into a CAS cut.
+  MetaAdminGroupView CaptureAdminGroup(const std::string& group_id) const;
+  MetaOperationStatusView CaptureOperationStatus(
+      const MetaOperationId& id) const;
+  MetaCreatePreflightView CaptureCreatePreflight() const;
+  MetaMembershipAdminView CaptureMembershipAdmin() const;
+  MetaPromoteView CapturePromote(const std::string& group_id) const;
+  MetaSlotMapCheckView CaptureSlotMapCheck(const std::string& group_id) const;
+  MetaCurrentPolicyView CaptureCurrentPolicy(
+      const std::string& policy_id) const;
+  std::uint64_t TopologyEpoch() const;
+  bool GroupExists(const std::string& group_id) const;
+  std::optional<std::uint64_t> CurrentGroupTerm(
+      const std::string& group_id) const;
+  // Checks the complete requested sequence set in one cut without copying
+  // archived receipts. Concurrent pruning is reflected by a fresh check.
+  bool ArchivedOperationsExist(std::span<const std::uint64_t> seqs) const;
+  MetaAuditStatus AuditStatus() const;
+  // Capture only the export domain. All encoding runs outside the state lock.
+  MetaAuditStore CaptureAuditExport() const;
+  MetaOperationArchiveExport CaptureOperationArchiveExport() const;
   MetaCommittedStatusView StatusSnapshot() const;
   // Returns at most 100 live-journal summaries after an immutable submit
   // sequence, in sequence order, without copying retained operation payloads.

@@ -593,6 +593,7 @@ endif()
 # control-worker ingress; the Go runtime owns consensus, peer transport,
 # timers, WAL, and snapshot I/O.
 set(LAVIK_META_CORE_SOURCES
+  src/meta/admin_views.cpp
   src/meta/audit_store.cpp
   src/meta/automatic_failover_detector.cpp
   src/meta/automatic_failover_reconciler.cpp
@@ -876,6 +877,7 @@ if (BUILD_TESTING)
   # test binary stays Raft-free, while this binary also links the data module
   # for explicit Meta-projection-to-Data-validation contract tests.
   add_executable(lavik_meta_tests
+    tests/meta_admin_views_test.cpp
     tests/meta_automatic_failover_detector_test.cpp
     tests/meta_automatic_failover_reconciler_test.cpp
     tests/meta_hash_test.cpp

@@ -422,6 +422,64 @@ absl::Status ValidateProposal(const MetaCommand& command,
       observations, now);
 }
 
+TEST(MetaFailoverAdminViewsTest, PromoteCaptureMatchesHookAndAssignmentFacts) {
+  ProposalFixture fixture;
+  fixture.ReportCandidate(1000);
+  const auto begin = fixture.UncontrolledBegin(true);
+  auto opened = MetaStateMachine::Open("");
+  ASSERT_TRUE(opened.ok());
+  ASSERT_TRUE((*opened)
+                  ->Install(fixture.next_index - 1, *fixture.stores.Serialize())
+                  .ok());
+  const auto view = (*opened)->CapturePromote("g1");
+  EXPECT_EQ(view.facts_.AssignmentFor("g1", fixture.candidate),
+            fixture.candidate_assignment);
+  EXPECT_EQ(view.lifecycle_, fixture.stores.topology_.ClusterLifecycle());
+  const auto expected = ValidateProposal(
+      begin, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+      fixture.observations, 1001);
+  EXPECT_EQ(ValidateFailoverTransition(begin, view.group_, view.authority_,
+                                       view.facts_, fixture.observations, 1001),
+            expected);
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.candidate, fixture.candidate_boot, 1}, 1002);
+  EXPECT_EQ(
+      ValidateFailoverTransition(begin, view.group_, view.authority_,
+                                 view.facts_, fixture.observations, 1003),
+      ValidateProposal(
+          begin, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 1003));
+}
+
+TEST(MetaFailoverAdminViewsTest,
+     GetOpCapturesControlledTransitionWithOperation) {
+  ProposalFixture fixture;
+  fixture.SubmitControlled(10000);
+  fixture.ReportOwner(1000);
+  fixture.ReportCandidate(1000);
+  auto opened = MetaStateMachine::Open("");
+  ASSERT_TRUE(opened.ok());
+  ASSERT_TRUE((*opened)
+                  ->Install(fixture.next_index - 1, *fixture.stores.Serialize())
+                  .ok());
+  const auto submitted =
+      (*opened)->CaptureOperationStatus(fixture.operation_id);
+  ASSERT_TRUE(submitted.operation_);
+  EXPECT_FALSE(submitted.controlled_running_);
+  const auto next = fixture.Plan(1001);
+  ASSERT_TRUE(next.ok() && next->has_value()) << next.status();
+  ASSERT_TRUE(std::holds_alternative<BeginControlledFailover>(**next));
+  fixture.Apply(**next);
+  ASSERT_TRUE((*opened)
+                  ->Install(fixture.next_index - 1, *fixture.stores.Serialize())
+                  .ok());
+  const auto running = (*opened)->CaptureOperationStatus(fixture.operation_id);
+  EXPECT_TRUE(running.controlled_running_);
+  EXPECT_EQ(running.operation_,
+            fixture.stores.operation_.FindOperation(fixture.operation_id));
+  EXPECT_FALSE(submitted.controlled_running_);
+}
+
 TEST(MetaFailoverOperationIntentCodecTest, RoundTripsCanonicalRequest) {
   const FailoverOperationIntent intent = OperationIntent();
 
