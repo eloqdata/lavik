@@ -137,7 +137,11 @@ overrides into the index, while positional String indexing retains its
 direct page path. The physical
 identity trie skips common prefix bits and retains complete identities in its
 leaves; inserting outside a skipped prefix adds a branch without changing
-pinned older views. Hash routing nodes are persistent; ordered directories share
+pinned older views. Hash routing nodes are persistent. Large routing directories
+buffer replacements of existing prefixes in a bounded immutable metadata
+overlay; lookup and iteration resolve it, and overflow folds pending replacements
+into the tree in one batch. It retains no payload or physical pins, and each
+snapshot owns its matching routing version. Ordered directories share
 owner-local metadata chunks across immutable views. Each allocation admits and
 accounts its own lifetime, independently of the number of views retaining it.
 Local page replacements detach changed chunks. Lists and Sorted Sets update
