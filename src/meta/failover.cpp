@@ -164,9 +164,8 @@ absl::Status RequireExactCurrentSource(
 }
 
 std::optional<MetaFailoverTransition> ExactTransition(
-    const MetaProposalView& view, const std::string& group_id,
+    const std::optional<MetaTopologyGroupView>& group,
     const MetaFailoverTransitionRef& expected) {
-  const auto& group = view.group(group_id);
   if (!group.has_value() || !group->failover_transition_.has_value()) {
     return std::nullopt;
   }
@@ -222,14 +221,14 @@ absl::StatusOr<MetaCandidatePreparedObs> ExactCandidatePrepared(
 }
 
 template <typename CommitCommand>
-absl::Status ValidateCommitProposal(const CommitCommand& commit,
-                                    const MetaProposalView& view,
-                                    const MetaObservationStore& observations,
-                                    std::int64_t proposal_now_unix_ms) {
+absl::Status ValidateCommitProposal(
+    const CommitCommand& commit,
+    const std::optional<MetaTopologyGroupView>& group,
+    const MetaCommittedFacts& facts, const MetaObservationStore& observations,
+    std::int64_t proposal_now_unix_ms) {
   constexpr bool kControlled =
       std::is_same_v<CommitCommand, CommitControlledFailover>;
-  const auto transition =
-      ExactTransition(view, commit.group_id_, commit.expected_transition_);
+  const auto transition = ExactTransition(group, commit.expected_transition_);
   if (!transition.has_value() ||
       transition->mode_ != (kControlled ? MetaFailoverMode::kControlled
                                         : MetaFailoverMode::kUncontrolled) ||
@@ -258,7 +257,6 @@ absl::Status ValidateCommitProposal(const CommitCommand& commit,
     return Invalid("uncontrolled failover commit loss authorization is stale");
   }
 
-  const MetaCommittedFacts& facts = view.facts();
   if (observations
           .ActionFailedFor(transition->transition_id_, action.action_id_, facts,
                            proposal_now_unix_ms)
@@ -334,17 +332,47 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
     return absl::OkStatus();
   }
 
+  if (const MetaOperationId* id = GenericOperationId(command)) {
+    const auto& operation = view.operation_header(*id);
+    if (operation && operation->kind_ == kFailoverOperationKind)
+      return Invalid("failover operation is owned by typed commands");
+    return absl::OkStatus();
+  }
+  return std::visit(
+      [&](const auto& cmd) -> absl::Status {
+        using T = std::decay_t<decltype(cmd)>;
+        if constexpr (std::is_same_v<T, BeginControlledFailover> ||
+                      std::is_same_v<T, BeginUncontrolledFailover> ||
+                      std::is_same_v<T, SetUncontrolledCandidate> ||
+                      std::is_same_v<T, StartCandidateRecovery> ||
+                      std::is_same_v<T, AuthorizeFailoverPrepare> ||
+                      std::is_same_v<T, DegradeControlledFailover> ||
+                      std::is_same_v<T, CommitControlledFailover> ||
+                      std::is_same_v<T, CommitUncontrolledFailover>) {
+          return ValidateFailoverTransition(
+              command, view.group(cmd.group_id_), view.authority(cmd.group_id_),
+              view.facts(), observations, proposal_now_unix_ms);
+        }
+        return absl::OkStatus();
+      },
+      command);
+}
+
+absl::Status ValidateFailoverTransition(
+    const MetaCommand& command,
+    const std::optional<MetaTopologyGroupView>& group,
+    const std::optional<MetaGroupAuthorityView>& authority,
+    const MetaCommittedFacts& facts, const MetaObservationStore& observations,
+    std::int64_t proposal_now_unix_ms) {
   if (const auto* begin = std::get_if<BeginControlledFailover>(&command)) {
     if (proposal_now_unix_ms < 0 ||
         static_cast<std::uint64_t>(proposal_now_unix_ms) >=
             begin->absolute_deadline_unix_ms_) {
       return Invalid("controlled failover begin deadline has expired");
     }
-    const auto& group = view.group(begin->group_id_);
     if (!group.has_value() || group->failover_transition_.has_value()) {
       return Invalid("controlled failover begin pre-state is stale");
     }
-    const MetaCommittedFacts& facts = view.facts();
     if (absl::Status source = RequireExactCurrentSource(
             begin->group_id_, begin->candidate_action_.domain_, facts,
             observations, proposal_now_unix_ms);
@@ -361,7 +389,6 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
   }
 
   if (const auto* begin = std::get_if<BeginUncontrolledFailover>(&command)) {
-    const auto& group = view.group(begin->group_id_);
     if (!group.has_value() || group->failover_transition_.has_value()) {
       return Invalid("uncontrolled failover begin pre-state is stale");
     }
@@ -379,7 +406,6 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
       }
     }
     if (begin->candidate_action_.has_value()) {
-      const MetaCommittedFacts& facts = view.facts();
       if (auto candidate = ExactCandidateProgress(
               begin->group_id_, *begin->candidate_action_, facts, observations,
               proposal_now_unix_ms,
@@ -392,8 +418,7 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
   }
 
   if (const auto* set = std::get_if<SetUncontrolledCandidate>(&command)) {
-    const auto transition =
-        ExactTransition(view, set->group_id_, set->expected_transition_);
+    const auto transition = ExactTransition(group, set->expected_transition_);
     if (!transition.has_value() ||
         transition->mode_ != MetaFailoverMode::kUncontrolled) {
       return Invalid("uncontrolled candidate set pre-state is stale");
@@ -405,7 +430,6 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
         !set->candidate_action_.has_value()) {
       return Invalid("uncontrolled failover candidate is absent");
     }
-    const MetaCommittedFacts& facts = view.facts();
     if (transition->candidate_action_.has_value()) {
       const MetaFailoverCandidateAction& current =
           *transition->candidate_action_;
@@ -443,9 +467,8 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
   }
 
   if (const auto* start = std::get_if<StartCandidateRecovery>(&command)) {
-    const auto transition =
-        ExactTransition(view, start->group_id_, start->expected_transition_);
-    const auto& grant = view.authority(start->group_id_);
+    const auto transition = ExactTransition(group, start->expected_transition_);
+    const auto& grant = authority;
     if (!transition.has_value() ||
         transition->mode_ != MetaFailoverMode::kUncontrolled ||
         !grant.has_value() || grant->grant_.has_value() ||
@@ -456,7 +479,6 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
         transition->candidate_action_->authorization_.has_value()) {
       return Invalid("candidate recovery start pre-state is stale");
     }
-    const MetaCommittedFacts& facts = view.facts();
     const auto progress =
         ExactCandidateProgress(start->group_id_, *transition->candidate_action_,
                                facts, observations, proposal_now_unix_ms, true);
@@ -464,8 +486,8 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
   }
 
   if (const auto* authorize = std::get_if<AuthorizeFailoverPrepare>(&command)) {
-    const auto transition = ExactTransition(view, authorize->group_id_,
-                                            authorize->expected_transition_);
+    const auto transition =
+        ExactTransition(group, authorize->expected_transition_);
     if (!transition.has_value() || !transition->candidate_action_.has_value() ||
         transition->candidate_action_->action_id_ != authorize->action_id_ ||
         transition->candidate_action_->authorization_.has_value()) {
@@ -484,7 +506,6 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
       return Invalid("uncontrolled failover authorization loss is invalid");
     }
 
-    const MetaCommittedFacts& facts = view.facts();
     const MetaFailoverCandidateAction& action = *transition->candidate_action_;
     if (observations
             .ActionFailedFor(transition->transition_id_, action.action_id_,
@@ -527,8 +548,8 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
   }
 
   if (const auto* degrade = std::get_if<DegradeControlledFailover>(&command)) {
-    const auto transition = ExactTransition(view, degrade->group_id_,
-                                            degrade->expected_transition_);
+    const auto transition =
+        ExactTransition(group, degrade->expected_transition_);
     if (!transition.has_value() ||
         transition->mode_ != MetaFailoverMode::kControlled ||
         !transition->controlled_.has_value() ||
@@ -542,7 +563,6 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
       return Invalid("controlled failover degrade deadline has expired");
     }
 
-    const MetaCommittedFacts& facts = view.facts();
     if (!transition->candidate_action_.has_value()) {
       return Invalid("controlled failover degrade has no candidate action");
     }
@@ -591,21 +611,15 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
   }
 
   if (const auto* commit = std::get_if<CommitControlledFailover>(&command)) {
-    return ValidateCommitProposal(*commit, view, observations,
+    return ValidateCommitProposal(*commit, group, facts, observations,
                                   proposal_now_unix_ms);
   }
   if (const auto* commit = std::get_if<CommitUncontrolledFailover>(&command)) {
-    return ValidateCommitProposal(*commit, view, observations,
+    return ValidateCommitProposal(*commit, group, facts, observations,
                                   proposal_now_unix_ms);
   }
 
-  const MetaOperationId* operation_id = GenericOperationId(command);
-  if (operation_id == nullptr) return absl::OkStatus();
-  const auto& operation = view.operation_header(*operation_id);
-  if (operation.has_value() && operation->kind_ == kFailoverOperationKind) {
-    return Invalid("failover operation is owned by typed commands");
-  }
-  return absl::OkStatus();
+  return Invalid("expected typed failover transition");
 }
 
 }  // namespace lavik::meta

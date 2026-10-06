@@ -326,9 +326,9 @@ std::vector<std::uint32_t> ConfigServerIds(
 }
 
 std::vector<MetaMemberRecord> ActiveMetaMembers(
-    const MetaCommittedStatusView& view) {
+    std::span<const MetaMemberRecord> directory) {
   std::vector<MetaMemberRecord> members;
-  for (const MetaMemberRecord& member : view.meta_members_) {
+  for (const MetaMemberRecord& member : directory) {
     if (!member.retired_) members.push_back(member);
   }
   std::sort(members.begin(), members.end(),
@@ -355,8 +355,8 @@ std::vector<ClusterMetaMemberWireV1> StatusMembers(
 std::string BuildClusterHeadReply(
     const std::shared_ptr<MetaRaft>& server,
     const std::shared_ptr<MetaStateMachine>& state_machine) {
-  const MetaCommittedStatusView view = state_machine->StatusSnapshot();
-  const auto members = ActiveMetaMembers(view);
+  const auto directory = state_machine->MetaBindings();
+  const auto members = ActiveMetaMembers(*directory);
   const std::shared_ptr<MetaRaftConfig> config = server->get_config();
   if (config == nullptr || members.empty()) return "ERR leader_not_caught_up";
   // Use one role observation for both fields. A promotion can otherwise land
@@ -434,7 +434,7 @@ std::string BuildClusterStatusReply(
                                                      view.applied_index_)) {
     return "ERR cut_changed";
   }
-  const auto active_meta_members = ActiveMetaMembers(view);
+  const auto active_meta_members = ActiveMetaMembers(view.meta_members_);
   if (std::none_of(active_meta_members.begin(), active_meta_members.end(),
                    [&](const MetaMemberRecord& member) {
                      return member.server_id_ ==
@@ -823,7 +823,7 @@ std::string BuildClusterStatusReply(
   // compact snapshot do not invalidate that snapshot, but a leadership or
   // routing-identity change would make the response a mixed authority cut.
   const std::shared_ptr<MetaRaftConfig> after_config = server->get_config();
-  const MetaCommittedStatusView after_view = state_machine->StatusSnapshot();
+  const auto after_directory = state_machine->MetaBindings();
   const MetaDataControlLeadershipState after_leadership =
       runtime_status->LeadershipState();
   const auto after_term = server->leader_term();
@@ -840,7 +840,7 @@ std::string BuildClusterStatusReply(
     after_bracket.config_index_ = after_config->get_log_idx();
     after_bracket.config_server_ids_ = ConfigServerIds(after_config);
   }
-  after_bracket.active_meta_members_ = ActiveMetaMembers(after_view);
+  after_bracket.active_meta_members_ = ActiveMetaMembers(*after_directory);
   if (after_config == nullptr ||
       !detail::IsStableClusterStatusBracket(before_bracket, after_bracket)) {
     return "ERR cut_changed";
@@ -1297,7 +1297,8 @@ bycorf::Task<std::string> HandleAbortOp(
 // Non-linearizable read of committed operator state (see the header).
 std::string HandleGetOp(std::shared_ptr<MetaStateMachine> state_machine,
                         const MetaOperationId& id) {
-  std::optional<MetaOperationRecord> record = state_machine->FindOperation(id);
+  const auto view = state_machine->CaptureOperationStatus(id);
+  const auto& record = view.operation_;
   if (!record.has_value()) {
     return "ERR not-found";
   }
@@ -1306,26 +1307,8 @@ std::string HandleGetOp(std::shared_ptr<MetaStateMachine> state_machine,
            record->terminal_result_;
   }
   if (record->kind_ == kFailoverOperationKind) {
-    // The displayed Running state is derived rather than persisted. Re-read
-    // the operation and transition from one aggregate cut so Admin cannot
-    // combine a pre-Cutover operation with a post-Cutover topology (or the
-    // reverse) across two individually valid reads.
-    const MetaStores stores = state_machine->StoresSnapshot();
-    record = stores.operation_.FindOperation(id);
-    if (!record.has_value()) return "ERR not-found";
-    if (IsTerminal(record->lifecycle_)) {
-      return std::string("OK ") + LifecycleName(record->lifecycle_) + " " +
-             record->terminal_result_;
-    }
-    const bool running = std::ranges::any_of(
-        stores.topology_.Groups(), [&](const MetaTopologyGroupView& group) {
-          return group.failover_transition_.has_value() &&
-                 group.failover_transition_->mode_ ==
-                     MetaFailoverMode::kControlled &&
-                 group.failover_transition_->controlled_.has_value() &&
-                 group.failover_transition_->controlled_->operation_id_ == id;
-        });
-    return running ? "OK running" : "OK submitted";
+    // The operation and its topology-owned Running state share one cut.
+    return view.controlled_running_ ? "OK running" : "OK submitted";
   }
   if (record->kind_ == kMetaClusterCreateOperationKind ||
       record->kind_ == kMetaClusterCreateV1GroupOperationKind ||
@@ -1346,12 +1329,11 @@ bycorf::Task<std::string> HandleFailover(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const FailoverAdminRequestV1& request) {
-  const MetaStores before = state_machine->StoresSnapshot();
-  if (before.topology_.ClusterLifecycle().state_ !=
-      MetaClusterLifecycle::kCreated) {
+  const auto before = state_machine->CaptureAdminGroup(request.group_id_);
+  if (before.lifecycle_.state_ != MetaClusterLifecycle::kCreated) {
     co_return FailoverError("preflight", "cluster-not-created");
   }
-  if (!before.topology_.FindGroup(request.group_id_).has_value()) {
+  if (!before.group_.has_value()) {
     co_return FailoverError("preflight", "group-not-found");
   }
 
@@ -1398,15 +1380,13 @@ bycorf::Task<std::string> HandlePromote(
     const std::shared_ptr<MetaObservationStore>& observations,
     AuthenticatedPrincipal principal, const std::string& group_id,
     const std::string& node_id) {
-  const auto captured = state_machine->CaptureStores();
-  const MetaStores& before = captured.stores_;
-  if (before.topology_.ClusterLifecycle().state_ !=
-      MetaClusterLifecycle::kCreated) {
+  const auto before = state_machine->CapturePromote(group_id);
+  if (before.lifecycle_.state_ != MetaClusterLifecycle::kCreated) {
     co_return "ERR promote cluster-not-created";
   }
-  const auto group = before.topology_.FindGroup(group_id);
+  const auto& group = before.group_;
   if (!group.has_value()) co_return "ERR promote group-not-found";
-  const MetaStoresFacts facts(before);
+  const auto& facts = before.facts_;
   const auto now = NowUnixMs();
   if (!observations->LiveCandidateProgressFor(group_id, facts, now).empty()) {
     co_return "ERR promote eligible-candidate-exists";
@@ -1475,10 +1455,8 @@ bycorf::Task<std::string> HandlePromote(
             group->record_.partition_replication_epoch_,
     };
   }
-  const auto view =
-      MetaProposalView::FromStores(command, before, captured.cursor_);
-  const absl::Status valid =
-      ValidateFailoverProposal(command, view, *observations, now);
+  const absl::Status valid = ValidateFailoverTransition(
+      command, group, before.authority_, facts, *observations, now);
   if (!valid.ok()) co_return absl::StrCat("ERR promote ", valid.message());
   const std::string reply = co_await ProposeCommand(
       coordinator, std::move(principal), std::move(command));
@@ -1548,14 +1526,13 @@ bycorf::Task<std::string> HandleCreateGroup(
   CreateGroup command;
   command.request_id_ = MakeRequestId();
   command.group_id_ = group_id;
-  command.new_topology_epoch_ =
-      state_machine->StoresSnapshot().topology_.TopologyEpoch() + 1;
+  command.new_topology_epoch_ = state_machine->TopologyEpoch() + 1;
   std::string reply =
       co_await ProposeCommand(coordinator, std::move(principal), command);
   if (reply.rfind("OK ", 0) != 0) {
     co_return reply;
   }
-  if (!state_machine->StoresSnapshot().topology_.GroupExists(group_id)) {
+  if (!state_machine->GroupExists(group_id)) {
     co_return "ERR rejected";
   }
   co_return reply;
@@ -1569,8 +1546,8 @@ bycorf::Task<std::string> HandleAssignNode(
     std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
     const std::string& node_id, MetaNodeRole role) {
-  const MetaStores before = state_machine->StoresSnapshot();
-  const auto group = before.topology_.FindGroup(group_id);
+  const auto before = state_machine->CaptureAdminGroup(group_id);
+  const auto& group = before.group_;
   if (!group.has_value()) co_return "ERR not-found";
   const auto existing =
       std::find_if(group->members_.begin(), group->members_.end(),
@@ -1588,14 +1565,13 @@ bycorf::Task<std::string> HandleAssignNode(
   command.assignment_id_ = MakeAssignmentId();
   command.role_ = role;
   command.expected_revision_ = group->revision_;
-  command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
+  command.new_topology_epoch_ = before.topology_epoch_ + 1;
   const MetaAssignmentId expected_assignment = command.assignment_id_;
   std::string reply =
       co_await ProposeCommand(coordinator, std::move(principal), command);
   if (reply.rfind("OK ", 0) != 0) co_return reply;
 
-  const auto after =
-      state_machine->StoresSnapshot().topology_.FindGroup(group_id);
+  const auto after = state_machine->FindGroup(group_id);
   if (!after.has_value()) co_return "ERR rejected";
   const auto installed =
       std::find_if(after->members_.begin(), after->members_.end(),
@@ -1614,11 +1590,10 @@ bycorf::Task<std::string> HandleUnassignNode(
     std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
     const std::string& node_id, std::uint64_t expected_revision) {
-  const MetaStores before = state_machine->StoresSnapshot();
-  const auto group = before.topology_.FindGroup(group_id);
+  const auto before = state_machine->CaptureAdminGroup(group_id);
+  const auto& group = before.group_;
   if (!group.has_value()) co_return "ERR not-found";
-  if (before.topology_.ClusterLifecycle().state_ !=
-          MetaClusterLifecycle::kCreated ||
+  if (before.lifecycle_.state_ != MetaClusterLifecycle::kCreated ||
       group->record_.owner_ == node_id || group->failover_transition_) {
     co_return "ERR owner-or-transition-cannot-be-removed";
   }
@@ -1634,7 +1609,7 @@ bycorf::Task<std::string> HandleUnassignNode(
   command.group_id_ = group_id;
   command.node_id_ = node_id;
   command.expected_revision_ = expected_revision;
-  command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
+  command.new_topology_epoch_ = before.topology_epoch_ + 1;
   const std::string reply =
       co_await ProposeCommand(coordinator, std::move(principal), command);
   if (!reply.starts_with("OK ")) co_return reply;
@@ -1669,7 +1644,7 @@ bycorf::Task<std::string> HandleBeginGroupTerm(
     co_return reply;
   }
   const std::optional<std::uint64_t> term =
-      state_machine->StoresSnapshot().topology_.CurrentGroupTerm(group_id);
+      state_machine->CurrentGroupTerm(group_id);
   if (!term.has_value() || *term != next) {
     co_return "ERR rejected";
   }
@@ -1701,11 +1676,10 @@ bycorf::Task<std::string> HandlePutPolicy(
 
 std::string HandleGetPolicy(std::shared_ptr<MetaStateMachine> state_machine,
                             const std::string& policy_id) {
-  const MetaPolicyStore& policy = state_machine->StoresSnapshot().policy_;
-  const auto version = policy.LatestVersion(policy_id);
-  if (!version.has_value()) return "ERR not-found";
-  const auto current = policy.FindVersion(policy_id, *version);
-  if (!current.has_value()) return "ERR state_corrupt";
+  const auto policy = state_machine->CaptureCurrentPolicy(policy_id);
+  if (!policy.version_) return "ERR not-found";
+  const auto& current = policy.current_;
+  if (!current) return "ERR state_corrupt";
   return absl::StrCat("OK version=", current->version_,
                       " content=", current->content_);
 }
@@ -1715,25 +1689,23 @@ bycorf::Task<std::string> HandleSetSlotMap(
     std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, std::uint16_t first_slot,
     std::uint16_t last_slot, const std::string& group_id) {
-  const MetaStores before = state_machine->StoresSnapshot();
   SetSlotMap command;
   command.request_id_ = MakeRequestId();
   command.ranges_.push_back({first_slot, last_slot, group_id});
-  command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
+  command.new_topology_epoch_ = state_machine->TopologyEpoch() + 1;
   std::string reply =
       co_await ProposeCommand(coordinator, std::move(principal), command);
   if (reply.rfind("OK ", 0) != 0) co_return reply;
 
-  const MetaStores after = state_machine->StoresSnapshot();
-  const auto group = after.topology_.FindGroup(group_id);
-  if (!group.has_value() ||
-      after.topology_.TopologyEpoch() != command.new_topology_epoch_) {
+  const auto after = state_machine->CaptureSlotMapCheck(group_id);
+  if (!after.group_exists_ ||
+      after.topology_epoch_ != command.new_topology_epoch_) {
     co_return "ERR rejected";
   }
   for (std::uint32_t slot = 0; slot < kMetaSlotCount; ++slot) {
-    const std::optional<std::string> owner = after.topology_.SlotOwner(slot);
+    const auto owner = after.SlotOwner(slot);
     const bool assigned = slot >= first_slot && slot <= last_slot;
-    if ((assigned && owner != std::optional<std::string>(group_id)) ||
+    if ((assigned && owner != std::optional<std::string_view>(group_id)) ||
         (!assigned && owner.has_value())) {
       co_return "ERR rejected";
     }
@@ -1746,26 +1718,25 @@ bycorf::Task<std::string> HandleActivateAuthority(
     std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
     std::uint64_t expected_term, const std::string& owner_node_id) {
-  const MetaStores before = state_machine->StoresSnapshot();
   ActivateAuthority command;
   command.request_id_ = MakeRequestId();
   command.group_id_ = group_id;
   command.expected_term_ = expected_term;
   command.new_owner_ = owner_node_id;
-  command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
+  command.new_topology_epoch_ = state_machine->TopologyEpoch() + 1;
   std::string reply =
       co_await ProposeCommand(coordinator, std::move(principal), command);
   if (reply.rfind("OK ", 0) != 0) co_return reply;
 
-  const MetaStores after = state_machine->StoresSnapshot();
-  const auto topology = after.topology_.FindGroup(group_id);
-  const auto grant = after.topology_.AuthorityFor(group_id);
+  const auto after = state_machine->CaptureAdminGroup(group_id);
+  const auto& topology = after.group_;
+  const auto& grant = after.authority_;
   if (!topology.has_value() || !grant.has_value() ||
       !grant->grant_.has_value() || grant->grant_->owner_ != owner_node_id ||
       grant->group_term_ != expected_term ||
       topology->record_.owner_ != owner_node_id ||
       topology->record_.group_term_ != expected_term ||
-      after.topology_.TopologyEpoch() != command.new_topology_epoch_) {
+      after.topology_epoch_ != command.new_topology_epoch_) {
     co_return "ERR rejected";
   }
   co_return reply;
@@ -1785,9 +1756,9 @@ bycorf::Task<std::string> HandleFenceGroup(
       co_await ProposeCommand(coordinator, std::move(principal), command);
   if (reply.rfind("OK ", 0) != 0) co_return reply;
 
-  const MetaStores after = state_machine->StoresSnapshot();
-  const auto state = after.topology_.AuthorityFor(group_id);
-  const auto topology = after.topology_.FindGroup(group_id);
+  const auto after = state_machine->CaptureAdminGroup(group_id);
+  const auto& state = after.authority_;
+  const auto& topology = after.group_;
   if (!state.has_value() || !topology.has_value() ||
       state->group_term_ != command.new_term_ || state->grant_.has_value() ||
       topology->record_.group_term_ != command.new_term_) {
@@ -1869,11 +1840,9 @@ bycorf::Task<std::string> HandleClusterCreate(
   if (*shutdown)
     co_return ClusterCreateError("preflight", "pre-commit-failed",
                                  "Meta is shutting down");
-  const auto observed = state_machine->StoresSnapshot();
-  if (observed.topology_.ClusterLifecycle().state_ !=
-      MetaClusterLifecycle::kUninitialized) {
-    co_return ClusterAlreadyCreatedError("preflight",
-                                         observed.topology_.ClusterLifecycle());
+  const auto observed = state_machine->ClusterLifecycle();
+  if (observed.state_ != MetaClusterLifecycle::kUninitialized) {
+    co_return ClusterAlreadyCreatedError("preflight", observed);
   }
   auto create_lease = membership_gate->TryAcquire();
   if (create_lease == nullptr) {
@@ -1886,12 +1855,12 @@ bycorf::Task<std::string> HandleClusterCreate(
     co_return ClusterCreateError("preflight", "pre-commit-failed",
                                  "responder is not an eligible leader");
   }
-  const auto before = state_machine->StoresSnapshot();
-  const auto& lifecycle = before.topology_.ClusterLifecycle();
+  const auto before = state_machine->CaptureCreatePreflight();
+  const auto& lifecycle = before.lifecycle_;
   if (lifecycle.state_ != MetaClusterLifecycle::kUninitialized) {
     co_return ClusterAlreadyCreatedError("preflight", lifecycle);
   }
-  if (before.operation_.HasActiveKind(kMetaMembershipOperationKind)) {
+  if (before.active_membership_) {
     co_return ClusterCreateError("preflight", "pre-commit-failed",
                                  "a Meta membership workflow is active");
   }
@@ -1903,13 +1872,13 @@ bycorf::Task<std::string> HandleClusterCreate(
                                  std::string(config.status().message()));
   }
   raft_view.members_ = std::move(*config);
-  if (auto meta = detail::ValidateClusterCreateMetaSet(
-          before.identity_.MetaMembers(), manifest, raft_view);
+  if (auto meta = detail::ValidateClusterCreateMetaSet(before.meta_members_,
+                                                       manifest, raft_view);
       !meta.ok()) {
     co_return ClusterCreateError("preflight", "bad-request",
                                  std::string(meta.message()));
   }
-  if (HasDataClusterArtifacts(before)) {
+  if (before.data_artifacts_) {
     co_return ClusterCreateError(
         "preflight", "non-pristine",
         "Uninitialized Meta contains Data-cluster artifacts");
@@ -1936,13 +1905,11 @@ bycorf::Task<std::string> HandleClusterCreate(
         absl::StrCat(applied.status().message(), "; operation=", id));
   }
   if (applied->verdict_ != MetaAuditVerdict::kAccepted) {
-    const auto after = state_machine->StoresSnapshot();
-    if (after.topology_.ClusterLifecycle().state_ !=
-        MetaClusterLifecycle::kUninitialized) {
-      co_return ClusterAlreadyCreatedError("proposal",
-                                           after.topology_.ClusterLifecycle());
+    const auto after = state_machine->CaptureCreatePreflight();
+    if (after.lifecycle_.state_ != MetaClusterLifecycle::kUninitialized) {
+      co_return ClusterAlreadyCreatedError("proposal", after.lifecycle_);
     }
-    if (HasDataClusterArtifacts(after)) {
+    if (after.data_artifacts_) {
       co_return ClusterCreateError(
           "proposal", "non-pristine",
           "Uninitialized Meta acquired Data-cluster artifacts before commit");
@@ -1950,8 +1917,7 @@ bycorf::Task<std::string> HandleClusterCreate(
     co_return ClusterCreateError("proposal", "pre-commit-failed",
                                  applied->detail_);
   }
-  const auto committed_stores = state_machine->StoresSnapshot();
-  const auto& accepted = committed_stores.topology_.ClusterLifecycle();
+  const auto accepted = state_machine->ClusterLifecycle();
   // The background reconciler can terminalize a very small workflow before
   // this read. Any non-Uninitialized state with the exact Genesis identity
   // proves the atomic admission commit; readiness and terminal outcome are
@@ -2008,12 +1974,8 @@ bycorf::Task<std::string> HandleArchiveOperations(
       co_await ProposeCommand(coordinator, std::move(principal), command);
   if (reply.rfind("OK ", 0) != 0) co_return reply;
 
-  const MetaStores after = state_machine->StoresSnapshot();
-  for (const std::uint64_t seq : command.operation_seqs_) {
-    if (!after.operation_.FindArchivedBySeq(seq).has_value()) {
-      co_return "ERR rejected";
-    }
-  }
+  if (!state_machine->ArchivedOperationsExist(command.operation_seqs_))
+    co_return "ERR rejected";
   co_return reply;
 }
 
@@ -2039,21 +2001,14 @@ std::string HandleObsIngest(
     MetaObservation observation) {
   const std::int64_t now = NowUnixMs();
   obs_store->SweepExpired(now);
-  MetaStores stores = state_machine->StoresSnapshot();
+  const auto facts = state_machine->CaptureObservationFacts();
   const auto bind_reporter_assignment = [&](std::string_view group_id,
                                             std::string* node_id,
                                             MetaAssignmentId* assignment_id) {
     *node_id = observation.identity_.node_id_;
-    const auto group = stores.topology_.FindGroup(std::string(group_id));
-    if (!group.has_value()) return;
-    const auto member = std::find_if(
-        group->members_.begin(), group->members_.end(),
-        [&](const MetaGroupMember& candidate_member) {
-          return candidate_member.node_id_ == observation.identity_.node_id_;
-        });
-    if (member != group->members_.end()) {
-      *assignment_id = member->assignment_id_;
-    }
+    if (auto assignment =
+            facts.AssignmentFor(group_id, observation.identity_.node_id_))
+      *assignment_id = *assignment;
   };
   if (auto* candidate =
           std::get_if<MetaCandidateProgressObs>(&observation.payload_)) {
@@ -2066,7 +2021,6 @@ std::string HandleObsIngest(
     candidate->boot_incarnation_ = observation.identity_.boot_incarnation_;
   }
 
-  const MetaStoresFacts facts(stores);
   const absl::Status status =
       obs_store->Ingest(std::move(observation), facts, now);
   if (!status.ok()) {
@@ -2083,8 +2037,7 @@ std::string HandleObservations(
   if (!group_id.has_value()) {
     return "OK total=" + std::to_string(obs_store->size());
   }
-  const MetaStores stores = state_machine->StoresSnapshot();
-  const MetaStoresFacts facts(stores);
+  const auto facts = state_machine->CaptureObservationFacts();
   const std::vector<MetaCandidateProgressObs> candidates =
       obs_store->CandidateProgressFor(*group_id, facts);
   std::string reply = "OK candidates=" + std::to_string(candidates.size());
@@ -2154,16 +2107,14 @@ bycorf::Task<std::string> HandleConfigChange(
       sentinel_endpoint = lavik::FormatClientEndpoint(*sentinel, true);
     }
   }
-  const auto before = state_machine->StoresSnapshot();
-  if (before.topology_.ClusterLifecycle().state_ ==
-      MetaClusterLifecycle::kCreating)
+  const auto before = state_machine->CaptureMembershipAdmin();
+  if (before.lifecycle_.state_ == MetaClusterLifecycle::kCreating)
     co_return "ERR config-changing";
   std::optional<MetaOperationId> operation_id;
   // Retrying an identical in-flight request attaches to its original task.
   // Different requests must not overtake an uncertain membership outcome.
-  for (const auto& op : before.operation_.LiveOperations()) {
-    if (op.kind_ != kMetaMembershipOperationKind || IsTerminal(op.lifecycle_))
-      continue;
+  if (before.operation_) {
+    const auto& op = *before.operation_;
     auto intent = DecodeMembershipIntent(op.intent_);
     if (!intent.ok() || intent->add_ != add ||
         intent->target_.id_ != static_cast<std::uint32_t>(server_id) ||
@@ -2177,7 +2128,6 @@ bycorf::Task<std::string> HandleConfigChange(
           intent->binding_.ctl_endpoint_ != std::optional(ctl_endpoint))))
       co_return "ERR config-changing";
     operation_id = op.operation_id_;
-    break;
   }
   if (!operation_id) {
     auto lease = membership_gate->TryAcquire();
@@ -2231,8 +2181,7 @@ bycorf::Task<std::string> HandleConfigChange(
       bind.ctl_endpoint_ = ctl_endpoint;
       bind.sentinel_endpoint_ = sentinel_endpoint;
       // A Single discovery deployment cannot admit a voter without an entry.
-      if (before.topology_.ClusterLifecycle().client_mode_ ==
-              ClientMode::kSingle &&
+      if (before.lifecycle_.client_mode_ == ClientMode::kSingle &&
           std::any_of(config->begin(), config->end(), [&](const auto& p) {
             return p.sentinel_endpoint_.empty() != sentinel_endpoint.empty();
           }))
@@ -2851,19 +2800,18 @@ bycorf::Task<std::string> DispatchCommand(
     if (tokens.size() != 2 || !ParseU64(tokens[1], through) || through == 0) {
       co_return "ERR bad-request";
     }
-    auto exported =
-        state_machine->StoresSnapshot().audit_.ExportThrough(through);
+    auto exported = state_machine->CaptureAuditExport().ExportThrough(through);
     if (!exported.ok()) co_return "ERR rejected";
     co_return "OK " + HexEncode(*exported);
   }
   if (command == "exportoperations") {
     if (tokens.size() != 1) co_return "ERR bad-request";
-    auto exported = state_machine->StoresSnapshot().operation_.ExportArchive();
+    auto exported = state_machine->CaptureOperationArchiveExport().Encode();
     if (!exported.ok()) co_return "ERR rejected";
     co_return "OK " + HexEncode(*exported);
   }
   if (command == "status") {
-    const MetaAuditStore audit = state_machine->StoresSnapshot().audit_;
+    const auto audit = state_machine->AuditStatus();
     co_return "OK leader=" + std::to_string(server->is_leader() ? 1 : 0) +
         " id=" + std::to_string(server->get_id()) +
         " committed=" + std::to_string(server->get_committed_log_idx()) +
@@ -2877,11 +2825,11 @@ bycorf::Task<std::string> DispatchCommand(
         " term=" + std::to_string(server->get_term()) +
         " initial_bindings_pending=" +
         std::to_string(server->initial_bindings_pending() ? 1 : 0) +
-        " audit_policy=" + AuditPolicyName(audit.policy()) +
-        " audit_size=" + std::to_string(audit.size()) +
-        " audit_capacity=" + std::to_string(audit.capacity()) +
-        " audit_dropped_total=" + std::to_string(audit.dropped_total()) +
-        " audit_dropped_through=" + std::to_string(audit.dropped_through());
+        " audit_policy=" + AuditPolicyName(audit.policy_) +
+        " audit_size=" + std::to_string(audit.size_) +
+        " audit_capacity=" + std::to_string(audit.capacity_) +
+        " audit_dropped_total=" + std::to_string(audit.dropped_total_) +
+        " audit_dropped_through=" + std::to_string(audit.dropped_through_);
   }
   if (command == "addsrv" || command == "removesrv") {
     if (!membership_enabled) co_return "ERR membership-unavailable";

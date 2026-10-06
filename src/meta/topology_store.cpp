@@ -740,6 +740,10 @@ bool MetaTopologyStore::GroupExists(const std::string& group_id) const {
   return groups_.contains(group_id);
 }
 
+std::vector<std::string> MetaTopologyStore::SlotOwners() const {
+  return {slots_.begin(), slots_.end()};
+}
+
 std::vector<MetaSlotAssignment> MetaTopologyStore::SlotRanges() const {
   std::vector<MetaSlotAssignment> ranges;
   for (std::uint32_t first = 0; first < kMetaSlotCount;) {
@@ -813,6 +817,16 @@ MetaTopologyStore::AutomaticDetectionFacts() const {
                            state.failover_transition_->revision_};
   }
   return result;
+}
+
+bool MetaTopologyStore::HasControlledOperation(
+    const MetaOperationId& id) const {
+  return std::any_of(groups_.begin(), groups_.end(), [&](const auto& entry) {
+    const auto& transition = entry.second.failover_transition_;
+    return transition && transition->mode_ == MetaFailoverMode::kControlled &&
+           transition->controlled_ &&
+           transition->controlled_->operation_id_ == id;
+  });
 }
 
 std::vector<MetaTopologyGroupView> MetaTopologyStore::Groups() const {

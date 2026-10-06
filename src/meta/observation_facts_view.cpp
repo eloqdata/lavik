@@ -67,6 +67,18 @@ const MetaObservationGroupFacts* MetaObservationFactsView::FindGroup(
                                                                 : nullptr;
 }
 
+std::optional<MetaAssignmentId> MetaObservationFactsView::AssignmentFor(
+    std::string_view group_id, std::string_view node_id) const {
+  const auto* group = FindGroup(group_id);
+  if (!group) return std::nullopt;
+  const auto member = std::lower_bound(
+      group->members_.begin(), group->members_.end(), node_id,
+      [](const auto& value, auto id) { return value.node_id_ < id; });
+  if (member == group->members_.end() || member->node_id_ != node_id)
+    return std::nullopt;
+  return member->assignment_id_;
+}
+
 bool MetaObservationFactsView::IsActiveNode(std::string_view node_id) const {
   return std::binary_search(active_nodes_.begin(), active_nodes_.end(),
                             node_id);

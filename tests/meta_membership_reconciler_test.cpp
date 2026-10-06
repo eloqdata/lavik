@@ -212,6 +212,37 @@ TEST_F(MembershipRecoveryTest,
             absl::StatusCode::kFailedPrecondition);
 }
 
+TEST_F(MembershipRecoveryTest,
+       AdminCaptureSelectsOnlyActiveWorkflowAndKeepsIntent) {
+  Start(true);
+  SubmitOperation unrelated;
+  unrelated.operation_id_.fill(99);
+  unrelated.kind_ = "maintenance";
+  unrelated.intent_ = std::string(256 * 1024, 'x');
+  unrelated.intent_hash_ = MetaSha256(unrelated.intent_);
+  Apply(unrelated);
+  auto opened = MetaStateMachine::Open("");
+  ASSERT_TRUE(opened.ok());
+  ASSERT_TRUE((*opened)->Install(index_, *stores_.Serialize()).ok());
+  const auto captured = (*opened)->CaptureMembershipAdmin();
+  EXPECT_EQ(captured.operation_, stores_.operation_.FindOperation(id_));
+  EXPECT_EQ(captured.identity_.NodeCount(), 0);
+  EXPECT_TRUE(captured.identity_.MetaMembers().empty());
+  EXPECT_TRUE((*opened)->CaptureCreatePreflight().active_membership_);
+  EXPECT_FALSE((*opened)->CaptureCreatePreflight().data_artifacts_);
+  AdvanceToRaft();
+  CommitConfig();
+  Finish();
+  ASSERT_FALSE(HasFatalFailure());
+  ASSERT_TRUE((*opened)->Install(index_, *stores_.Serialize()).ok());
+  const auto completed = (*opened)->CaptureMembershipAdmin();
+  EXPECT_FALSE(completed.operation_);
+  EXPECT_EQ(completed.identity_.Serialize(), stores_.identity_.Serialize());
+  EXPECT_FALSE((*opened)->CaptureCreatePreflight().active_membership_);
+  ASSERT_TRUE(captured.operation_);
+  EXPECT_EQ(*DecodeMembershipIntent(captured.operation_->intent_), intent_);
+}
+
 TEST_F(MembershipRecoveryTest, AddRestoresEveryCommittedPrefix) {
   Start(true);
   AdvanceToRaft();

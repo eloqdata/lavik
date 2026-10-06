@@ -291,8 +291,13 @@ class MetaTopologyStore {
   // Owned absolute slot map in ordered, maximal assigned runs. Gaps remain
   // unassigned; extraction never allocates one string for every covered slot.
   std::vector<MetaSlotAssignment> SlotRanges() const;
+  // Copies the complete slot-indexed table for absolute map checks. An empty
+  // string means unassigned; unlike SlotRanges, no range compression runs.
+  std::vector<std::string> SlotOwners() const;
   bool GroupExists(const std::string& group_id) const;
   std::vector<MetaTopologyGroupView> Groups() const;
+  // Scans transition ownership without copying unrelated Group records.
+  bool HasControlledOperation(const MetaOperationId& id) const;
   // Copies just observation freshness facts directly from GroupState. Groups
   // and their members retain store key order; no derived lookup indices are
   // built here so callers can build them outside the state-machine lock.
