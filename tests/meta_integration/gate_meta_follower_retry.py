@@ -15,23 +15,25 @@
 
 """Deterministic follower-to-leader discovery regression (Debug Meta required).
 
-Usage: gate_meta_follower_retry.py /path/to/lavik-meta /path/to/lavik [workdir]
+Usage: gate_meta_follower_retry.py /path/to/lavik-meta /path/to/lavik /path/to/lavik-ctl [workdir]
 """
 
 import os
 import sys
 
+import gate_cluster_create as C
 import gate_data_control as D
 import harness as H
 
 
 def main():
-    if len(sys.argv) not in (3, 4):
+    if len(sys.argv) not in (4, 5):
         print(__doc__)
         return 2
+    C.CTL = os.path.abspath(sys.argv[3])
     work_argv = [sys.argv[0], sys.argv[1]]
-    if len(sys.argv) == 4:
-        work_argv.append(sys.argv[3])
+    if len(sys.argv) == 5:
+        work_argv.append(sys.argv[4])
     workdir, keep = H.make_workdir(work_argv, "meta_follower_retry_")
     variable = "LAVIK_TEST_META_FORCE_FOLLOWER_FILE"
     previous = os.environ.get(variable)

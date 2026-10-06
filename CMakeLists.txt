@@ -1074,7 +1074,7 @@ if (BUILD_TESTING)
         NAME meta_integration.gate_meta_follower_retry
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_meta_follower_retry.py
-                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>
       )
       set_tests_properties(meta_integration.gate_meta_follower_retry PROPERTIES
         LABELS meta-integration TIMEOUT 90 RUN_SERIAL TRUE)
