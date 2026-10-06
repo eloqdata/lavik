@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -239,13 +240,14 @@ struct RecoveredHashGroup {
 
 // Immutable AVL metadata, one node per group. Copies retain one root and an
 // topology update allocates only the logarithmic search path. Existing-key
-// updates share a bounded immutable metadata overlay; eviction folds one entry
-// into the tree. Nodes and overlays are admitted and
-// charged independently, so old snapshot readers retain exactly the nodes
-// they still own. Lookups and iteration resolve the overlay without replay.
-// All node references and destruction stay on the key owner. Cross-worker
-// readers send physical identities or owner-routed stream handles, not these
-// links, so persistent sharing does not require atomic reference counts.
+// updates share a bounded immutable metadata overlay; overflow folds a batch
+// into the tree, copying each shared ancestor only once. Nodes and overlays are
+// admitted and charged independently, so old snapshot readers retain exactly
+// the nodes they still own. Lookups and iteration resolve the overlay without
+// replay. All node references and destruction stay on the key owner.
+// Cross-worker readers send physical identities or owner-routed stream handles,
+// not these links, so persistent sharing does not require atomic reference
+// counts.
 template <typename Key>
 class HashGroupMap {
   struct Node;
@@ -266,17 +268,15 @@ class HashGroupMap {
   // Match the physical directory's bounded update window. This stores only
   // metadata for keys already in the tree, so ordering and subtree sizes stay
   // valid. The shared allocation keeps directory copies cheap; old snapshots
-  // retain their own overlay, and eviction never chains overlays together.
+  // retain their own overlay, and overflow never chains overlays together.
   struct Overlay {
     static constexpr std::size_t kCapacity = 8;
     using Entry = std::pair<const Key, RecoveredHashGroup>;
     std::array<std::optional<Entry>, kCapacity> entries_;
     std::size_t size_ = 0;
-    std::size_t victim_ = 0;
     explicit Overlay(const Overlay* previous) {
       if (previous) {
         size_ = previous->size_;
-        victim_ = previous->victim_;
         for (std::size_t i = 0; i < size_; ++i)
           entries_[i].emplace(*previous->entries_[i]);
       }
@@ -398,26 +398,37 @@ class HashGroupMap {
   absl::Status Set(Key key, RecoveredHashGroup value) {
     const auto* current = overlay_ ? overlay_->Find(key) : nullptr;
     if (current || GetBase(key)) {
+      if (!current && overlay_ && overlay_->size_ == Overlay::kCapacity) {
+        // Fold all pending replacements together. Dispersed writes still
+        // share ancestor copies, instead of paying for a full path plus an
+        // overlay allocation on each eviction. All keys already exist, so
+        // subtree shape, sizes and balance cannot change.
+        const typename Overlay::Entry incoming(key, value);
+        std::array<const typename Overlay::Entry*, Overlay::kCapacity + 1>
+            writes;
+        for (std::size_t i = 0; i < Overlay::kCapacity; ++i)
+          writes[i] = &*overlay_->entries_[i];
+        writes.back() = &incoming;
+        std::sort(
+            writes.begin(), writes.end(),
+            [](const auto* a, const auto* b) { return a->first < b->first; });
+        auto next = ReplaceNodes(root_, writes);
+        if (!next.ok()) return next.status();
+        root_ = std::move(*next);
+        overlay_ = {};
+        return absl::OkStatus();
+      }
       auto overlay = MakeOverlay(overlay_.get());
       if (!overlay.ok()) return overlay.status();
       auto& updated = **overlay;
       std::size_t slot;
-      Link base = root_;
       if (current) {
         slot = 0;
         while (updated.entries_[slot]->first != key) ++slot;
-      } else if (updated.size_ < Overlay::kCapacity) {
-        slot = updated.size_++;
       } else {
-        slot = updated.victim_;
-        const auto& evicted = *updated.entries_[slot];
-        auto next = SetNode(root_, evicted.first, evicted.second);
-        if (!next.ok()) return next.status();
-        base = std::move(*next);
-        updated.victim_ = (slot + 1) % Overlay::kCapacity;
+        slot = updated.size_++;
       }
       updated.entries_[slot].emplace(key, value);
-      root_ = std::move(base);
       overlay_ = std::move(*overlay);
       return absl::OkStatus();
     }
@@ -439,7 +450,6 @@ class HashGroupMap {
       if (slot != updated.size_)
         updated.entries_[slot].emplace(*updated.entries_[updated.size_]);
       updated.entries_[updated.size_].reset();
-      updated.victim_ = 0;
       overlay_ = updated.size_
                      ? LocalSharedPtr<const Overlay>(std::move(*overlay))
                      : LocalSharedPtr<const Overlay>{};
@@ -449,6 +459,26 @@ class HashGroupMap {
   }
 
  private:
+  static absl::StatusOr<Link> ReplaceNodes(
+      const Link& node,
+      std::span<const typename Overlay::Entry* const> writes) {
+    if (writes.empty()) return node;
+    assert(node);  // Overlay keys are existing keys; Erase removes overrides.
+    const auto pivot = std::lower_bound(
+        writes.begin(), writes.end(), node->entry_.first,
+        [](const auto* entry, Key key) { return entry->first < key; });
+    const auto before = static_cast<std::size_t>(pivot - writes.begin());
+    const bool replaces =
+        pivot != writes.end() && (*pivot)->first == node->entry_.first;
+    auto left = ReplaceNodes(node->left_, writes.first(before));
+    if (!left.ok()) return left.status();
+    auto right = ReplaceNodes(node->right_, writes.subspan(before + replaces));
+    if (!right.ok()) return right.status();
+    return Make(node->entry_.first,
+                replaces ? (*pivot)->second : node->entry_.second,
+                std::move(*left), std::move(*right));
+  }
+
   static absl::StatusOr<LocalSharedPtr<Overlay>> MakeOverlay(
       const Overlay* previous) {
     auto reservation =

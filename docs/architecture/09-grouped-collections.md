@@ -139,7 +139,7 @@ identity trie skips common prefix bits and retains complete identities in its
 leaves; inserting outside a skipped prefix adds a branch without changing
 pinned older views. Hash routing nodes are persistent. A bounded immutable metadata overlay holds
 replacements of existing prefixes; lookup and iteration resolve it, and
-eviction folds one replacement into the tree. It retains no payload or
+overflow folds the pending replacements into the tree in one batch. It retains no payload or
 physical pins, and each snapshot owns its matching routing version. Ordered directories share
 owner-local metadata chunks across immutable views. Each allocation admits and
 accounts its own lifetime, independently of the number of views retaining it.
