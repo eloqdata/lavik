@@ -71,6 +71,10 @@ class GroupedScratchBudget {
     return absl::OkStatus();
   }
 
+  // Estimated headroom for one copy, including decoder/frame overhead.
+  // Readers can bound an optional window before requesting admission.
+  std::size_t bytes() const noexcept { return bytes_; }
+
   absl::StatusOr<MemoryReservation> Reserve(std::size_t copies) const {
     if (copies == 0 ||
         bytes_ > std::numeric_limits<std::size_t>::max() / copies)

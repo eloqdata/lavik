@@ -67,12 +67,12 @@ def late_meta(root):
         no_redis(data)
         # Real committed creation supplies mode while the unrelated primary is
         # still offline. This Data identity remains deliberately unregistered.
-        reply = meta.ctl(
+        C.create_after_membership_admission(
+            meta,
             C.create_request(
                 meta, "1" * 40, f"tcp://127.0.0.1:{H.free_port()}", "group"
-            )
+            ),
         )
-        assert reply.startswith("OK clustercreate"), reply
         time.sleep(0.3)
         no_redis(data)
         reply = meta.registernode(

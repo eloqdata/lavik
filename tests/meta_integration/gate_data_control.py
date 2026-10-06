@@ -351,7 +351,7 @@ def commit_service_mode(leader, metas):
     request = C.create_request(
         metas, "f" * 40, f"tcp://127.0.0.1:{H.free_port()}", "bootstrap-group"
     )
-    expect_ok(leader.ctl(request), "commit cluster client mode")
+    C.create_after_membership_admission(leader, request)
 
 
 def seed_assigned_authority(leader, data):
