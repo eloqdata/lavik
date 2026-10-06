@@ -393,7 +393,7 @@ absl::StatusOr<std::optional<MetaCommand>> Authorize(
 }
 
 absl::StatusOr<std::optional<MetaCommand>> CommitControlled(
-    const MetaCommittedView& view, const MetaTopologyGroupView& group,
+    const MetaFailoverPlanningView& view, const MetaTopologyGroupView& group,
     const MetaFailoverTransition& transition,
     const MetaOperationRecord& operation,
     const MetaFailoverPlannerContext& context) {
@@ -407,7 +407,7 @@ absl::StatusOr<std::optional<MetaCommand>> CommitControlled(
     return absl::FailedPreconditionError(
         "controlled commit owner assignment is absent");
   }
-  auto topology = Increment(view.topology().TopologyEpoch(), "topology epoch");
+  auto topology = Increment(view.topology_epoch_, "topology epoch");
   if (!topology.ok()) return topology.status();
   auto request_id = NextId(context);
   if (!request_id.ok()) return request_id.status();
@@ -427,7 +427,7 @@ absl::StatusOr<std::optional<MetaCommand>> CommitControlled(
 }
 
 absl::StatusOr<std::optional<MetaCommand>> CommitUncontrolled(
-    const MetaCommittedView& view, const MetaTopologyGroupView& group,
+    const MetaFailoverPlanningView& view, const MetaTopologyGroupView& group,
     const MetaFailoverTransition& transition,
     const MetaFailoverPlannerContext& context) {
   const auto& action = *transition.candidate_action_;
@@ -439,7 +439,7 @@ absl::StatusOr<std::optional<MetaCommand>> CommitUncontrolled(
     return absl::FailedPreconditionError(
         "uncontrolled commit owner assignment is absent");
   }
-  auto topology = Increment(view.topology().TopologyEpoch(), "topology epoch");
+  auto topology = Increment(view.topology_epoch_, "topology epoch");
   if (!topology.ok()) return topology.status();
   auto request_id = NextId(context);
   if (!request_id.ok()) return request_id.status();
@@ -458,7 +458,7 @@ absl::StatusOr<std::optional<MetaCommand>> CommitUncontrolled(
 }
 
 absl::StatusOr<std::optional<MetaCommand>> PlanControlledTransition(
-    const MetaCommittedView& view, const MetaTopologyGroupView& group,
+    const MetaFailoverPlanningView& view, const MetaTopologyGroupView& group,
     const MetaFailoverTransition& transition,
     const MetaObservationStore& observations,
     const MetaFailoverPlannerContext& context) {
@@ -467,8 +467,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanControlledTransition(
     return absl::FailedPreconditionError(
         "controlled failover transition is incomplete");
   }
-  const auto operation =
-      view.operation().FindOperation(transition.controlled_->operation_id_);
+  const auto& operation = view.operation_;
   if (!operation.has_value() || Terminal(operation->lifecycle_)) {
     return absl::FailedPreconditionError(
         "controlled failover operation is unavailable");
@@ -481,7 +480,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanControlledTransition(
                            "controlled failover deadline expired", context);
   }
 
-  MetaStoresFacts facts(view.stores());
+  const auto& facts = view.facts_;
   const SourceAvailability source =
       SourceState(*transition.candidate_action_, facts, observations, context);
   const CandidateState candidate = CurrentCandidateState(
@@ -545,7 +544,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanControlledTransition(
            .has_value()) {
     return std::nullopt;
   }
-  const auto grant = view.topology().AuthorityFor(group.group_id_);
+  const auto& grant = view.authority_;
   if (!grant.has_value()) {
     return absl::FailedPreconditionError(
         "controlled transition grant state is absent");
@@ -572,7 +571,7 @@ absl::StatusOr<std::optional<MetaCommand>> SetUncontrolledAction(
 }
 
 absl::StatusOr<std::optional<MetaCommand>> PlanUncontrolledTransition(
-    const MetaCommittedView& view, const MetaTopologyGroupView& group,
+    const MetaFailoverPlanningView& view, const MetaTopologyGroupView& group,
     const MetaFailoverTransition& transition,
     const MetaObservationStore& observations,
     const MetaFailoverPlannerContext& context) {
@@ -580,7 +579,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanUncontrolledTransition(
     return absl::FailedPreconditionError(
         "uncontrolled transition retains controlled state");
   }
-  MetaStoresFacts facts(view.stores());
+  const auto& facts = view.facts_;
   if (!transition.candidate_action_.has_value()) {
     const CandidatePlan plan = UncontrolledCandidatePlanFor(
         group.group_id_, facts, observations, context.now_unix_ms_);
@@ -616,7 +615,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanUncontrolledTransition(
                                        transition.target_term_)) {
         return std::nullopt;
       }
-      const auto policy = view.stores().policy_.CurrentCandidateRecovery();
+      const auto& policy = view.recovery_policy_;
       if (!policy.has_value())
         return absl::FailedPreconditionError("recovery policy is missing");
       if (context.now_unix_ms_ <= 0 ||
@@ -658,25 +657,12 @@ absl::StatusOr<std::optional<MetaCommand>> PlanUncontrolledTransition(
            .has_value()) {
     return std::nullopt;
   }
-  const auto grant = view.topology().AuthorityFor(group.group_id_);
+  const auto& grant = view.authority_;
   if (!grant.has_value()) {
     return absl::FailedPreconditionError(
         "uncontrolled transition grant state is absent");
   }
   return CommitUncontrolled(view, group, transition, context);
-}
-
-bool OperationOwnsControlledTransition(const MetaCommittedView& view,
-                                       const MetaOperationId& operation_id) {
-  return std::ranges::any_of(
-      view.topology().Groups(), [&](const MetaTopologyGroupView& group) {
-        return group.failover_transition_.has_value() &&
-               group.failover_transition_->mode_ ==
-                   MetaFailoverMode::kControlled &&
-               group.failover_transition_->controlled_.has_value() &&
-               group.failover_transition_->controlled_->operation_id_ ==
-                   operation_id;
-      });
 }
 
 std::optional<MetaFailoverCompatibilityDomain> ControlledDomain(
@@ -717,60 +703,57 @@ std::optional<MetaFailoverCompatibilityDomain> ControlledDomain(
 }
 
 absl::StatusOr<std::optional<MetaCommand>> PlanSubmittedControlled(
-    const MetaCommittedView& view, const MetaOperationRecord& operation,
+    const MetaFailoverPlanningView& view, const MetaOperationRecord& operation,
+    const FailoverOperationIntent& intent,
     const MetaObservationStore& observations,
     const MetaFailoverPlannerContext& context) {
-  auto intent = DecodeFailoverOperationIntent(operation.intent_);
-  if (!intent.ok()) return intent.status();
-  if (context.group_in_flight_ && context.group_in_flight_(intent->group_id_))
-    return std::nullopt;
   if (static_cast<std::uint64_t>(context.now_unix_ms_) >=
-      intent->absolute_deadline_unix_ms_) {
-    return AbortControlled(operation, intent->group_id_, std::nullopt,
+      intent.absolute_deadline_unix_ms_) {
+    return AbortControlled(operation, intent.group_id_, std::nullopt,
                            "controlled failover deadline expired before begin",
                            context);
   }
   if (!WarmupComplete(context)) return std::nullopt;
 
-  const auto group = view.topology().FindGroup(intent->group_id_);
+  const auto& group = view.group_;
   if (!group.has_value()) {
-    return AbortControlled(operation, intent->group_id_, std::nullopt,
+    return AbortControlled(operation, intent.group_id_, std::nullopt,
                            "controlled failover group is unavailable", context);
   }
   if (group->failover_transition_.has_value()) {
-    return AbortControlled(operation, intent->group_id_, std::nullopt,
+    return AbortControlled(operation, intent.group_id_, std::nullopt,
                            "controlled failover group already has a transition",
                            context);
   }
-  const auto grant = view.topology().AuthorityFor(intent->group_id_);
+  const auto& grant = view.authority_;
   if (!grant.has_value() || !ActiveGrantMatchesGroup(*group, *grant)) {
-    return AbortControlled(operation, intent->group_id_, std::nullopt,
+    return AbortControlled(operation, intent.group_id_, std::nullopt,
                            "controlled failover grant is unavailable", context);
   }
   if (group->record_.group_term_ == std::numeric_limits<std::uint64_t>::max()) {
-    return AbortControlled(operation, intent->group_id_, std::nullopt,
+    return AbortControlled(operation, intent.group_id_, std::nullopt,
                            "controlled failover group term cannot advance",
                            context);
   }
   const auto owner_assignment = AssignmentFor(*group, group->record_.owner_);
   if (!owner_assignment.has_value()) {
     return AbortControlled(
-        operation, intent->group_id_, std::nullopt,
+        operation, intent.group_id_, std::nullopt,
         "controlled failover owner assignment is unavailable", context);
   }
 
-  MetaStoresFacts facts(view.stores());
+  const auto& facts = view.facts_;
   const auto domain = ControlledDomain(*group, observations, facts, context);
   if (!domain.has_value() ||
       !ControlledDomainMatchesOwner(*domain, *group, *owner_assignment)) {
-    return AbortControlled(operation, intent->group_id_, std::nullopt,
+    return AbortControlled(operation, intent.group_id_, std::nullopt,
                            "controlled failover has no exact-source candidate",
                            context);
   }
   const CandidatePlan candidate = CandidatePlanForDomain(
-      intent->group_id_, *domain, facts, observations, context.now_unix_ms_);
+      intent.group_id_, *domain, facts, observations, context.now_unix_ms_);
   if (!candidate.selected_.has_value()) {
-    return AbortControlled(operation, intent->group_id_, std::nullopt,
+    return AbortControlled(operation, intent.group_id_, std::nullopt,
                            "controlled failover has no eligible candidate",
                            context);
   }
@@ -784,14 +767,14 @@ absl::StatusOr<std::optional<MetaCommand>> PlanSubmittedControlled(
 
   BeginControlledFailover command;
   command.request_id_ = *request_id;
-  command.group_id_ = intent->group_id_;
+  command.group_id_ = intent.group_id_;
   command.transition_id_ = *transition_id;
   command.target_term_ = group->record_.group_term_ + 1;
   command.candidate_action_ =
       CandidateActionFrom(*candidate.selected_, *action_id);
   command.operation_id_ = operation.operation_id_;
   command.expected_operation_revision_ = operation.revision_;
-  command.absolute_deadline_unix_ms_ = intent->absolute_deadline_unix_ms_;
+  command.absolute_deadline_unix_ms_ = intent.absolute_deadline_unix_ms_;
   SetGroupAnchors(command, *group);
   return MetaCommand{std::move(command)};
 }
@@ -799,47 +782,53 @@ absl::StatusOr<std::optional<MetaCommand>> PlanSubmittedControlled(
 }  // namespace
 
 absl::StatusOr<std::optional<MetaCommand>> PlanFailoverStep(
-    const MetaCommittedView& view, const MetaObservationStore& observations,
+    const MetaFailoverDiscovery& discovery,
+    const MetaFailoverPlanningCapture& capture,
+    const MetaObservationStore& observations,
     const MetaFailoverPlannerContext& context) {
   if (context.now_unix_ms_ < 0 || context.leadership_started_unix_ms_ < 0 ||
       context.observation_grace_ms_ < 0 ||
       context.leadership_started_unix_ms_ > context.now_unix_ms_) {
     return absl::InvalidArgumentError("invalid failover planning clock cut");
   }
-
-  std::vector<MetaOperationRecord> operations =
-      view.operation().LiveOperations();
-  std::ranges::sort(operations, {}, &MetaOperationRecord::operation_seq_);
-  for (const MetaOperationRecord& operation : operations) {
-    if (operation.kind_ != kFailoverOperationKind ||
-        Terminal(operation.lifecycle_)) {
+  for (const auto& operation : discovery.operations_) {
+    if (std::ranges::any_of(discovery.work_, [&](const auto& work) {
+          return work.mode_ == MetaFailoverMode::kControlled &&
+                 work.operation_id_ == std::optional(operation.operation_id_);
+        }))
       continue;
-    }
-    if (OperationOwnsControlledTransition(view, operation.operation_id_)) {
-      continue;
-    }
     if (operation.lifecycle_ != MetaOperationLifecycle::kSubmitted ||
         operation.revision_ != 0 || !operation.kind_phase_blob_.empty() ||
         !operation.current_directives_.empty()) {
       return absl::FailedPreconditionError(
           "active failover operation is not a pristine submitted request");
     }
-    auto planned =
-        PlanSubmittedControlled(view, operation, observations, context);
+    const auto intent = DecodeFailoverOperationIntent(operation.intent_);
+    if (!intent.ok()) return intent.status();
+    if (context.group_in_flight_ && context.group_in_flight_(intent->group_id_))
+      continue;
+    const auto view = capture(intent->group_id_, operation.operation_id_);
+    if (!view) return absl::AbortedError("failover discovery changed");
+    if (!view->operation_)
+      return absl::AbortedError("failover operation changed");
+    auto planned = PlanSubmittedControlled(*view, *view->operation_, *intent,
+                                           observations, context);
     if (!planned.ok() || planned->has_value()) return planned;
   }
-
-  for (const MetaTopologyGroupView& group : view.topology().Groups()) {
-    if (!group.failover_transition_.has_value() ||
-        (context.group_in_flight_ && context.group_in_flight_(group.group_id_)))
+  for (const auto& work : discovery.work_) {
+    if (context.group_in_flight_ && context.group_in_flight_(work.group_id_))
       continue;
-    auto planned =
-        group.failover_transition_->mode_ == MetaFailoverMode::kControlled
-            ? PlanControlledTransition(view, group, *group.failover_transition_,
-                                       observations, context)
-            : PlanUncontrolledTransition(view, group,
-                                         *group.failover_transition_,
-                                         observations, context);
+    const auto view = capture(work.group_id_, std::nullopt);
+    if (!view || !view->group_ || !view->group_->failover_transition_)
+      return absl::AbortedError("failover discovery changed");
+    const auto& group = *view->group_;
+    auto planned = work.mode_ == MetaFailoverMode::kControlled
+                       ? PlanControlledTransition(*view, group,
+                                                  *group.failover_transition_,
+                                                  observations, context)
+                       : PlanUncontrolledTransition(*view, group,
+                                                    *group.failover_transition_,
+                                                    observations, context);
     if (!planned.ok() || planned->has_value()) return planned;
   }
   return std::nullopt;
@@ -1028,11 +1017,12 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
     std::int64_t leadership_started_unix_ms) {
   auto changed = std::make_shared<std::atomic<bool>>(false);
   auto subscribe = [&] {
-    return context->SubscribeCommitted([changed](const MetaCommitEvent&) {
+    return context->SubscribeCommittedCursor([changed](const MetaCommitEvent&) {
       changed->store(true, std::memory_order_release);
     });
   };
   auto subscribed = subscribe();
+  auto discovery = context->FailoverDiscovery();
   std::string last_error;
   detail::GroupProposalWindow proposals;
   std::map<std::string, std::chrono::steady_clock::time_point, std::less<>>
@@ -1062,23 +1052,26 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
     std::erase_if(retry_after, [retry_now](const auto& entry) {
       return retry_now >= entry.second;
     });
-    if (subscribed.subscription_->needs_resync()) subscribed = subscribe();
-    if (changed->exchange(false, std::memory_order_acq_rel)) {
-      subscribed.view_ = context->CommittedView();
+    if (subscribed.subscription_->needs_resync()) {
+      subscribed = subscribe();
+      changed->store(true, std::memory_order_release);
+    }
+    const auto cursor = context->CommittedCursor();
+    if (changed->exchange(false, std::memory_order_acq_rel) ||
+        cursor.applied_index() != discovery.cursor_.applied_index() ||
+        cursor.state_change_index() != discovery.cursor_.state_change_index()) {
+      discovery = context->FailoverDiscovery();
     }
 
 #if LAVIK_FAULTS_ENABLED
     if (!core->test_pause_after_automatic_begin_applied_) {
       const auto delay =
           TestPauseDelay("LAVIK_TEST_PAUSE_FAILOVER_AFTER_AUTOMATIC_BEGIN_MS");
-      const auto groups = subscribed.view_.topology().Groups();
+      const auto& groups = discovery.work_;
       const auto paused_group =
           std::ranges::find_if(groups, [](const auto& group) {
-            if (!group.failover_transition_.has_value()) return false;
-            const MetaFailoverTransition& transition =
-                *group.failover_transition_;
-            return transition.mode_ == MetaFailoverMode::kUncontrolled &&
-                   !transition.candidate_action_.has_value();
+            return group.mode_ == MetaFailoverMode::kUncontrolled &&
+                   !group.action_id_.has_value();
           });
       if (delay != std::chrono::milliseconds::zero() &&
           paused_group != groups.end()) {
@@ -1106,16 +1099,13 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
     if (!core->test_pause_after_begin_applied_) {
       const auto delay =
           TestPauseDelay("LAVIK_TEST_PAUSE_FAILOVER_AFTER_BEGIN_MS");
-      const auto groups = subscribed.view_.topology().Groups();
+      const auto& groups = discovery.work_;
       const auto paused_group =
           std::ranges::find_if(groups, [](const auto& group) {
-            if (!group.failover_transition_.has_value()) return false;
-            const MetaFailoverTransition& transition =
-                *group.failover_transition_;
-            return transition.mode_ == MetaFailoverMode::kControlled &&
-                   transition.controlled_.has_value() &&
-                   transition.candidate_action_.has_value() &&
-                   !transition.candidate_action_->authorization_.has_value();
+            return group.mode_ == MetaFailoverMode::kControlled &&
+                   group.operation_id_.has_value() &&
+                   group.action_id_.has_value() &&
+                   !group.authorized_loss_.has_value();
           });
       if (delay != std::chrono::milliseconds::zero() &&
           paused_group != groups.end()) {
@@ -1143,18 +1133,13 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
     if (!core->test_pause_after_authorize_applied_) {
       const auto delay =
           TestPauseDelay("LAVIK_TEST_PAUSE_FAILOVER_AFTER_AUTHORIZE_MS");
-      const auto groups = subscribed.view_.topology().Groups();
+      const auto& groups = discovery.work_;
       const auto paused_group =
           std::ranges::find_if(groups, [](const auto& group) {
-            if (!group.failover_transition_.has_value()) return false;
-            const MetaFailoverTransition& transition =
-                *group.failover_transition_;
-            return transition.mode_ == MetaFailoverMode::kControlled &&
-                   transition.controlled_.has_value() &&
-                   transition.candidate_action_.has_value() &&
-                   transition.candidate_action_->authorization_.has_value() &&
-                   transition.candidate_action_->authorization_
-                           ->loss_if_cutover_ == MetaFailoverLoss::kNone;
+            return group.mode_ == MetaFailoverMode::kControlled &&
+                   group.operation_id_.has_value() &&
+                   group.action_id_.has_value() &&
+                   group.authorized_loss_ == MetaFailoverLoss::kNone;
           });
       if (delay != std::chrono::milliseconds::zero() &&
           paused_group != groups.end()) {
@@ -1183,23 +1168,21 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
       const auto delay =
           TestPauseDelay("LAVIK_TEST_PAUSE_FAILOVER_AFTER_PREPARED_MS");
       const std::int64_t observed_at = core->options_.now_unix_ms_();
-      const MetaStoresFacts facts(subscribed.view_.stores());
-      const auto groups = subscribed.view_.topology().Groups();
+      const auto& groups = discovery.work_;
       const auto paused_group =
           std::ranges::find_if(groups, [&](const auto& group) {
-            if (!group.failover_transition_.has_value()) return false;
-            const MetaFailoverTransition& transition =
-                *group.failover_transition_;
-            if (transition.mode_ != MetaFailoverMode::kControlled ||
-                !transition.controlled_.has_value() ||
-                !transition.candidate_action_.has_value() ||
-                !transition.candidate_action_->authorization_.has_value()) {
+            if (delay == std::chrono::milliseconds::zero() ||
+                group.mode_ != MetaFailoverMode::kControlled ||
+                !group.operation_id_ || !group.action_id_ ||
+                !group.authorized_loss_)
               return false;
-            }
+            const auto view = context->FailoverPlanningView(discovery.cursor_,
+                                                            group.group_id_);
+            if (!view) return false;
             return context->Observations()
-                .CandidatePreparedFor(transition.transition_id_,
-                                      transition.candidate_action_->action_id_,
-                                      facts, observed_at)
+                .CandidatePreparedFor(group.transition_.transition_id_,
+                                      *group.action_id_, view->facts_,
+                                      observed_at)
                 .has_value();
           });
       if (delay != std::chrono::milliseconds::zero() &&
@@ -1230,12 +1213,12 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
     {
       std::lock_guard lock(core->recovery_mutex_);
       std::erase_if(core->recovery_starts_, [&](const auto& entry) {
-        const auto group = subscribed.view_.topology().FindGroup(entry.first);
-        return !group.has_value() || !group->failover_transition_.has_value() ||
-               group->failover_transition_->transition_id_ !=
+        const auto work = std::ranges::find(discovery.work_, entry.first,
+                                            &MetaFailoverWork::group_id_);
+        return work == discovery.work_.end() ||
+               work->transition_.transition_id_ !=
                    entry.second.transition_id_ ||
-               group->failover_transition_->recovery_deadline_unix_ms_
-                   .has_value();
+               work->recovery_started_;
       });
     }
     const std::int64_t now = core->options_.now_unix_ms_();
@@ -1246,7 +1229,12 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
       continue;
     }
     auto planned = PlanFailoverStep(
-        subscribed.view_, context->Observations(),
+        discovery,
+        [&](const auto& group, auto operation) {
+          return context->FailoverPlanningView(discovery.cursor_, group,
+                                               operation);
+        },
+        context->Observations(),
         {.now_unix_ms_ = now,
          .leadership_started_unix_ms_ = leadership_started_unix_ms,
          .observation_grace_ms_ = core->options_.observation_grace_ms_,
@@ -1263,7 +1251,9 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
                return proposals.Contains(group) || retry_after.contains(group);
              }});
     if (!planned.ok()) {
-      if (last_error != planned.status().message()) {
+      if (absl::IsAborted(planned.status())) {
+        changed->store(true, std::memory_order_release);
+      } else if (last_error != planned.status().message()) {
         spdlog::warn("failover reconciliation blocked: {}",
                      planned.status().message());
         last_error = std::string(planned.status().message());

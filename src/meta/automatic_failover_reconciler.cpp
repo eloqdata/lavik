@@ -102,7 +102,21 @@ std::optional<MetaAssignmentId> AssignmentFor(
   return found->assignment_id_;
 }
 
-bool ActiveGrantMatches(const MetaTopologyGroupView& group,
+// The proposal hook already owns one complete selected Group. Adapt just its
+// detector facts without changing the proposal capture or its dependency map.
+MetaAutomaticGroupFacts DetectionFacts(const MetaTopologyGroupView& group) {
+  MetaAutomaticGroupFacts facts;
+  facts.group_id_ = group.group_id_;
+  facts.record_ = group.record_;
+  facts.revision_ = group.revision_;
+  facts.owner_assignment_ = AssignmentFor(group, group.record_.owner_);
+  if (group.failover_transition_)
+    facts.transition_ = {group.failover_transition_->transition_id_,
+                         group.failover_transition_->revision_};
+  return facts;
+}
+
+bool ActiveGrantMatches(const MetaAutomaticGroupFacts& group,
                         const MetaGroupAuthorityView& grant) {
   return grant.grant_.has_value() &&
          grant.group_term_ == group.record_.group_term_ &&
@@ -133,7 +147,7 @@ const MetaDataControlRuntimeGroup* RuntimeGroupFor(
 
 bool RuntimeProjectionIsCurrent(
     std::uint64_t applied_index, std::uint64_t topology_epoch,
-    const MetaTopologyGroupView& group, const MetaAssignmentId& assignment,
+    const MetaAutomaticGroupFacts& group, const MetaAssignmentId& assignment,
     const MetaDataControlRuntimeNode& runtime_node) {
   const MetaDataControlRuntimeGroup* runtime_group =
       RuntimeGroupFor(runtime_node, group.group_id_);
@@ -152,7 +166,7 @@ bool RuntimeProjectionIsCurrent(
 }
 
 MetaOwnerAuthorityAnchor OwnerAnchor(
-    const MetaTopologyGroupView& group, const MetaAssignmentId& assignment,
+    const MetaAutomaticGroupFacts& group, const MetaAssignmentId& assignment,
     const MetaDataControlRuntimeNode* runtime_node, bool projection_current) {
   MetaOwnerAuthorityAnchor result{
       .group_id_ = group.group_id_,
@@ -292,18 +306,17 @@ bool HandoffComplete(const MetaDataControlRuntimeNode* runtime_node,
 
 absl::StatusOr<MetaAutomaticFailoverStateMachine::Input> BuildInput(
     std::uint64_t applied_index, std::uint64_t topology_epoch,
-    const std::optional<MetaGroupAuthorityView>& grant,
-    const MetaTopologyGroupView& group,
+    const MetaGroupAuthorityView* grant, const MetaAutomaticGroupFacts& group,
     const MetaAutomaticUncontrolledFailoverPolicy& automatic,
     const MetaAuthorityLeasePolicy& lease,
     const MetaDataControlRuntimeSnapshot& runtime,
     const MetaObservationStore& observations, std::uint64_t now_steady_ms,
     std::uint32_t observation_ttl_ms, bool warmup_complete) {
-  if (!grant.has_value()) {
+  if (grant == nullptr) {
     return absl::FailedPreconditionError(
         "automatic failover group has no grant state");
   }
-  const auto assignment = AssignmentFor(group, group.record_.owner_);
+  const auto& assignment = group.owner_assignment_;
   if (group.record_.owner_.empty() || !assignment.has_value()) {
     return absl::FailedPreconditionError(
         "automatic failover Owner assignment is absent");
@@ -326,7 +339,7 @@ absl::StatusOr<MetaAutomaticFailoverStateMachine::Input> BuildInput(
           ActiveGrantMatches(group, *grant) &&
           HandoffComplete(runtime_node, projection_current, observed, committed,
                           runtime.leader_term_),
-      .failover_transition_active_ = group.failover_transition_.has_value(),
+      .failover_transition_active_ = group.transition_.has_value(),
       .committed_anchor_ = committed,
       .session_ = std::nullopt,
   };
@@ -443,7 +456,7 @@ absl::StatusOr<MetaRequestId> NextId(
 }
 
 void SetGroupAnchors(BeginUncontrolledFailover& command,
-                     const MetaTopologyGroupView& group,
+                     const MetaAutomaticGroupFacts& group,
                      const MetaAssignmentId& owner_assignment) {
   command.expected_owner_node_id_ = group.record_.owner_;
   command.expected_owner_assignment_id_ = owner_assignment;
@@ -455,28 +468,6 @@ void SetGroupAnchors(BeginUncontrolledFailover& command,
       group.record_.population_manifest_digest_;
   command.expected_partition_replication_epoch_ =
       group.record_.partition_replication_epoch_;
-}
-
-std::optional<MetaOperationRecord> PreemptableControlledRequest(
-    const MetaCommittedView& view, std::string_view group_id) {
-  std::vector<MetaOperationRecord> operations =
-      view.operation().LiveOperations();
-  std::ranges::sort(operations, {}, &MetaOperationRecord::operation_seq_);
-  for (const MetaOperationRecord& operation : operations) {
-    if (operation.kind_ != kFailoverOperationKind ||
-        operation.lifecycle_ != MetaOperationLifecycle::kSubmitted ||
-        operation.revision_ != 0 || !operation.kind_phase_blob_.empty() ||
-        !operation.current_directives_.empty() ||
-        !operation.terminal_receipts_.empty() ||
-        !std::ranges::all_of(operation.replication_history_id_,
-                             [](std::uint8_t byte) { return byte == 0; }) ||
-        operation.intent_hash_ != MetaSha256(operation.intent_)) {
-      continue;
-    }
-    const auto intent = DecodeFailoverOperationIntent(operation.intent_);
-    if (intent.ok() && intent->group_id_ == group_id) return operation;
-  }
-  return std::nullopt;
 }
 
 std::optional<std::uint64_t> AddDelay(std::uint64_t now, std::uint64_t delay) {
@@ -638,9 +629,10 @@ absl::Status ValidateAutomaticProposal(
   }
   auto input = BuildInput(
       view.applied_index(), view.automatic_policies().topology_epoch_,
-      view.authority(command->group_id_), *group, *automatic, *lease, runtime,
-      observations, core->options_.now_steady_ms_(),
-      core->options_.observation_ttl_ms_,
+      view.authority(command->group_id_) ? &*view.authority(command->group_id_)
+                                         : nullptr,
+      DetectionFacts(*group), *automatic, *lease, runtime, observations,
+      core->options_.now_steady_ms_(), core->options_.observation_ttl_ms_,
       /*warmup_complete=*/true);
   if (!input.ok()) return input.status();
   // The command records the exact reason observed at the threshold edge, but
@@ -661,18 +653,17 @@ absl::Status ValidateAutomaticProposal(
 }
 
 bool CommandTransitionCommitted(
-    const MetaCommittedView& view,
+    const MetaAutomaticDetectionView& view,
     const MetaAutomaticFailoverReconciler::Core::Pending& pending,
     std::uint64_t* committed_index) {
-  const auto group = view.topology().FindGroup(pending.command_.group_id_);
-  if (!group.has_value() || !group->failover_transition_.has_value()) {
+  const auto group = view.FindGroup(pending.command_.group_id_);
+  if (group == nullptr || !group->transition_.has_value()) {
     return false;
   }
-  if (group->failover_transition_->transition_id_ !=
-      pending.command_.transition_id_) {
+  if (group->transition_->transition_id_ != pending.command_.transition_id_) {
     return false;
   }
-  *committed_index = group->failover_transition_->revision_;
+  *committed_index = group->transition_->revision_;
   return true;
 }
 
@@ -814,11 +805,12 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
     std::shared_ptr<Core> core, MetaLeaderContext* context) {
   auto changed = std::make_shared<std::atomic<bool>>(false);
   auto subscribe = [&] {
-    return context->SubscribeCommitted([changed](const MetaCommitEvent&) {
+    return context->SubscribeCommittedCursor([changed](const MetaCommitEvent&) {
       changed->store(true, std::memory_order_release);
     });
   };
   auto subscribed = subscribe();
+  auto detection = context->AutomaticDetectionView();
   std::string last_error;
   detail::GroupProposalWindow proposals;
 
@@ -893,14 +885,19 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
           ready->first, Hex(pending.command_.transition_id_), delay,
           pending.uncertain_append_, applied.status().message());
     }
-    if (subscribed.subscription_->needs_resync()) subscribed = subscribe();
+    if (subscribed.subscription_->needs_resync()) {
+      subscribed = subscribe();
+      changed->store(true, std::memory_order_release);
+    }
     // Raft configuration commits advance the status cut without notifying
     // Meta command subscribers. In particular, a new leader's configuration
     // must not leave diagnostics permanently behind until another command.
-    // Check the cheap cursor each poll; copy stores only when it advances.
+    // Check both cursor fields; Install/Advance need not emit command events.
+    const auto cursor = context->CommittedCursor();
     if (changed->exchange(false, std::memory_order_acq_rel) ||
-        subscribed.view_.applied_index() != context->AppliedIndex()) {
-      subscribed.view_ = context->CommittedView();
+        detection.cursor_.applied_index() != cursor.applied_index() ||
+        detection.cursor_.state_change_index() != cursor.state_change_index()) {
+      detection = context->AutomaticDetectionView();
     }
     const std::uint64_t now_steady = core->options_.now_steady_ms_();
     MetaDataControlRuntimeSnapshot runtime =
@@ -969,8 +966,7 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
         continue;
       }
       std::uint64_t committed_index = 0;
-      if (CommandTransitionCommitted(subscribed.view_, it->second,
-                                     &committed_index)) {
+      if (CommandTransitionCommitted(detection, it->second, &committed_index)) {
         spdlog::info(
             "automatic failover Begin committed group={} transition={} "
             "commit_index={}",
@@ -981,8 +977,8 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
         it = core->pending_.erase(it);
         continue;
       }
-      const auto group = subscribed.view_.topology().FindGroup(it->first);
-      if (group.has_value() && group->failover_transition_.has_value()) {
+      const auto group = detection.FindGroup(it->first);
+      if (group != nullptr && group->transition_.has_value()) {
         spdlog::info(
             "automatic failover proposal superseded group={} transition={}",
             it->first, Hex(it->second.command_.transition_id_));
@@ -996,17 +992,12 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
 
     const auto before_status = core->detector_.Snapshot();
     std::set<std::string, std::less<>> live_groups;
-    // Policy accessors validate/parse the retained raw documents. Resolve one
-    // typed pair for this committed cut instead of reparsing both documents
-    // for every Group in the 25ms detector loop.
-    const auto automatic =
-        subscribed.view_.policy().CurrentAutomaticUncontrolledFailover();
-    const auto lease = subscribed.view_.policy().CurrentAuthorityLease();
-    if (subscribed.view_.topology().ClusterLifecycle().state_ ==
-            MetaClusterLifecycle::kCreated &&
+    const auto& automatic = detection.automatic_;
+    const auto& lease = detection.lease_;
+    bool detection_raced = false;
+    if (detection.lifecycle_ == MetaClusterLifecycle::kCreated &&
         runtime.leader_term_ != 0) {
-      for (const MetaTopologyGroupView& group :
-           subscribed.view_.topology().Groups()) {
+      for (const MetaAutomaticGroupFacts& group : detection.groups_) {
         live_groups.insert(group.group_id_);
         if (core->pending_.contains(group.group_id_) ||
             proposals.Contains(group.group_id_))
@@ -1023,10 +1014,9 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
           continue;
         }
         auto input = BuildInput(
-            subscribed.view_.applied_index(),
-            subscribed.view_.topology().TopologyEpoch(),
-            subscribed.view_.topology().AuthorityFor(group.group_id_), group,
-            *automatic, *lease, runtime, context->Observations(), now_steady,
+            detection.cursor_.applied_index(), detection.topology_epoch_,
+            &group.authority_, group, *automatic, *lease, runtime,
+            context->Observations(), now_steady,
             core->options_.observation_ttl_ms_, warmup_complete);
         if (!input.ok()) {
           if (last_error != input.status().message()) {
@@ -1036,7 +1026,8 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
           }
           continue;
         }
-        auto update = core->detector_.Advance(*input, now_steady);
+        auto update =
+            core->detector_.Advance(*input, now_steady, /*defer_trigger=*/true);
         if (!update.ok()) {
           if (last_error != update.status().message()) {
             spdlog::warn("automatic failover detector rejected input: {}",
@@ -1046,14 +1037,26 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
           continue;
         }
         last_error.clear();
+        if (!update->trigger_now_) {
+          LogStatusEdge(FindStatus(before_status, group.group_id_),
+                        update->status_);
+          continue;
+        }
+        // No operation scan occurs on ordinary detector polls. If committed
+        // state raced this trigger, leave its clock untouched and reacquire
+        // the detection batch before latching TRIGGERING or allocating IDs.
+        const auto trigger = context->AutomaticTriggerView(detection.cursor_);
+        if (!trigger) {
+          changed->store(true, std::memory_order_release);
+          detection_raced = true;
+          break;
+        }
+        update = core->detector_.Advance(*input, now_steady);
+        if (!update.ok() || !update->trigger_now_) std::terminate();
         LogStatusEdge(FindStatus(before_status, group.group_id_),
                       update->status_);
-        if (!update->trigger_now_) continue;
-
-        const auto grant =
-            subscribed.view_.topology().AuthorityFor(group.group_id_);
-        const auto assignment = AssignmentFor(group, group.record_.owner_);
-        if (!grant.has_value() || !assignment.has_value() ||
+        const auto& assignment = group.owner_assignment_;
+        if (!assignment.has_value() ||
             group.record_.group_term_ ==
                 std::numeric_limits<std::uint64_t>::max()) {
           core->detector_.EraseGroup(group.group_id_);
@@ -1079,8 +1082,8 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
             CommandReason(update->status_.current_reason_);
         command.suspect_duration_ms_ = update->status_.accumulated_suspect_ms_;
         if (const auto preempted =
-                PreemptableControlledRequest(subscribed.view_, group.group_id_);
-            preempted.has_value()) {
+                trigger->PreemptableControlledRequest(group.group_id_);
+            preempted != nullptr) {
           command.preempted_operation_id_ = preempted->operation_id_;
           command.expected_preempted_operation_revision_ = preempted->revision_;
         }
@@ -1106,6 +1109,13 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
       }
     }
 
+    if (detection_raced) {
+      const auto waited =
+          co_await proposals.Wait(core->options_.poll_interval_);
+      if (!waited.ok()) break;
+      continue;
+    }
+
     // Remove diagnostics for deleted Groups without touching an in-flight
     // uncertain proposal that still needs deterministic reconciliation.
     for (const MetaAutomaticFailoverStatus& status :
@@ -1118,7 +1128,7 @@ bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
     if (core->leader_term_ != 0) {
       core->options_.diagnostics_->Publish(
           core->leader_term_, runtime.leader_authority_eligibility_revision_,
-          subscribed.view_.applied_index(), core->detector_.Snapshot());
+          detection.cursor_.applied_index(), core->detector_.Snapshot());
     }
 
     auto ready = std::ranges::find_if(core->pending_, [&](const auto& entry) {

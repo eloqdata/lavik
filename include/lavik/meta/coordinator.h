@@ -116,6 +116,7 @@
 #include "bycorf/runtime/task.h"
 #include "lavik/meta/commands.h"
 #include "lavik/meta/data_publication_view.h"
+#include "lavik/meta/failover_views.h"
 #include "lavik/meta/observation_facts_view.h"
 #include "lavik/meta/observation_store.h"
 #include "lavik/meta/proposal_executor.h"
@@ -355,6 +356,16 @@ class MetaLeaderContext {
   MetaObservationFactsView ObservationFacts() const;
   // Atomically paired applied/state-change indices, without copying stores.
   MetaCommittedCursor CommittedCursor() const;
+  // Failover discovery and planning use owned purpose-specific cuts. Planning
+  // and trigger capture return nullopt when the supplied state cut changed.
+  MetaFailoverDiscovery FailoverDiscovery() const;
+  std::optional<MetaFailoverPlanningView> FailoverPlanningView(
+      MetaCommittedCursor expected, const std::string& group_id,
+      std::optional<MetaOperationId> submitted_operation = std::nullopt) const;
+  MetaAutomaticDetectionView AutomaticDetectionView() const;
+  std::optional<MetaAutomaticTriggerView> AutomaticTriggerView(
+      MetaCommittedCursor expected) const;
+
   // Owned inputs for creation/membership planning. See the state-machine
   // capture contract: selectors may race state, yielding nullopt to rediscover.
   MetaClusterCreateDiscovery ClusterCreateDiscovery() const;
@@ -505,6 +516,16 @@ class MetaCoordinator {
   MetaObservationFactsView ObservationFacts() const;
   // Atomically paired applied/state-change indices, without copying stores.
   MetaCommittedCursor CommittedCursor() const;
+  // Failover discovery and planning use owned purpose-specific cuts. Planning
+  // and trigger capture return nullopt when the supplied state cut changed.
+  MetaFailoverDiscovery FailoverDiscovery() const;
+  std::optional<MetaFailoverPlanningView> FailoverPlanningView(
+      MetaCommittedCursor expected, const std::string& group_id,
+      std::optional<MetaOperationId> submitted_operation = std::nullopt) const;
+  MetaAutomaticDetectionView AutomaticDetectionView() const;
+  std::optional<MetaAutomaticTriggerView> AutomaticTriggerView(
+      MetaCommittedCursor expected) const;
+
   // Owned inputs for creation/membership planning. See the state-machine
   // capture contract: selectors may race state, yielding nullopt to rediscover.
   MetaClusterCreateDiscovery ClusterCreateDiscovery() const;

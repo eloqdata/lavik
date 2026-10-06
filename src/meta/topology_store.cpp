@@ -772,6 +772,49 @@ std::vector<MetaObservationGroupFacts> MetaTopologyStore::ObservationFacts()
   return result;
 }
 
+std::vector<MetaFailoverWork> MetaTopologyStore::FailoverWork() const {
+  std::vector<MetaFailoverWork> result;
+  for (const auto& [id, state] : groups_) {
+    if (!state.failover_transition_) continue;
+    const auto& transition = *state.failover_transition_;
+    auto& work = result.emplace_back();
+    work.group_id_ = id;
+    work.transition_ = {transition.transition_id_, transition.revision_};
+    work.mode_ = transition.mode_;
+    work.recovery_started_ = transition.recovery_deadline_unix_ms_.has_value();
+    if (transition.controlled_)
+      work.operation_id_ = transition.controlled_->operation_id_;
+    if (transition.candidate_action_) {
+      work.action_id_ = transition.candidate_action_->action_id_;
+      if (transition.candidate_action_->authorization_)
+        work.authorized_loss_ =
+            transition.candidate_action_->authorization_->loss_if_cutover_;
+    }
+  }
+  return result;
+}
+
+std::vector<MetaAutomaticGroupFacts>
+MetaTopologyStore::AutomaticDetectionFacts() const {
+  std::vector<MetaAutomaticGroupFacts> result;
+  result.reserve(groups_.size());
+  for (const auto& [id, state] : groups_) {
+    auto& facts = result.emplace_back();
+    facts.group_id_ = id;
+    facts.record_ = state.record_;
+    facts.revision_ = state.revision_;
+    const auto owner = state.members_.find(state.record_.owner_);
+    if (owner != state.members_.end())
+      facts.owner_assignment_ = owner->second.assignment_id_;
+    auto authority = AuthorityFor(id);
+    facts.authority_ = std::move(*authority);
+    if (state.failover_transition_)
+      facts.transition_ = {state.failover_transition_->transition_id_,
+                           state.failover_transition_->revision_};
+  }
+  return result;
+}
+
 std::vector<MetaTopologyGroupView> MetaTopologyStore::Groups() const {
   std::vector<MetaTopologyGroupView> result;
   result.reserve(groups_.size());

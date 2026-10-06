@@ -90,7 +90,8 @@ class RecordImage {
   const std::string& path() const { return path_; }
 
   void Root(std::string_view key, const GroupedHashRoot& root,
-            std::uint64_t sequence, std::uint64_t txid = 0) {
+            std::uint64_t sequence, std::uint64_t txid = 0,
+            std::uint64_t expire_at_ms = 0) {
     auto persisted = root;
     if (persisted.revision_ == 0) persisted.revision_ = sequence;
     auto bytes = EncodeGroupedHashRoot(persisted);
@@ -101,7 +102,8 @@ class RecordImage {
                .grouped_ = true,
                .logical_size_ = static_cast<std::uint32_t>(root.field_count_),
                .txid_ = txid,
-               .mutation_sequence_ = sequence});
+               .mutation_sequence_ = sequence,
+               .expire_at_ms_ = expire_at_ms});
   }
 
   std::vector<ExtentRef> Group(std::string_view key,
@@ -128,7 +130,8 @@ class RecordImage {
   }
 
   void OrderedRoot(std::string_view key, const OrderedCollectionRoot& root,
-                   std::uint64_t sequence, std::uint64_t txid = 0) {
+                   std::uint64_t sequence, std::uint64_t txid = 0,
+                   std::uint64_t expire_at_ms = 0) {
     auto encoded = EncodeOrderedCollectionRoot(root);
     Check(encoded.ok(), "ordered root fixture encoding failed");
     Append(key, *encoded,
@@ -139,7 +142,8 @@ class RecordImage {
                .grouped_ = true,
                .logical_size_ = static_cast<std::uint32_t>(root.item_count_),
                .txid_ = txid,
-               .mutation_sequence_ = sequence});
+               .mutation_sequence_ = sequence,
+               .expire_at_ms_ = expire_at_ms});
   }
 
   std::vector<ExtentRef> OrderedGroup(std::string_view key,
@@ -288,8 +292,9 @@ class RecordImage {
       };
     }
     record.key_bytes_ = key.size();
-    record.header_bytes_ = RecordHeaderBytes(key.size(), false, tagged, false,
-                                             record.auxiliary_group_);
+    record.header_bytes_ =
+        RecordHeaderBytes(key.size(), false, tagged, record.expire_at_ms_ != 0,
+                          record.auxiliary_group_);
     record.payload_bytes_ = payload.size();
     record.total_disk_bytes_ =
         AlignRecord(record.header_bytes_ + payload.size());
@@ -695,6 +700,206 @@ TEST(GroupedRecoveryE2e, LegacySortedSetCanStillMutateAndRecover) {
   EXPECT_EQ(recovered.Command({"ZSCORE", "legacy", "new"}), "-1");
   EXPECT_EQ(recovered.Command({"ZREM", "legacy", "original"}), ":1");
   EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedRecoveryE2e, ReclaimedExpiredGraphsDoNotPreventStartup) {
+  for (const bool ordered : {false, true}) {
+    // Only the expired, unshielded winner can have used the full-device
+    // escape valve. Missing live or shielding graphs remain fatal.
+    for (const int mode : {0, 1, 2}) {
+      SCOPED_TRACE(ordered);
+      SCOPED_TRACE(mode);
+      RecordImage image;
+      const RecordHeader compact{.value_type_ = ValueType::kString,
+                                 .logical_size_ = 1,
+                                 .mutation_sequence_ = 1};
+      image.GroupPayload("keep", "v", compact);
+      if (mode == 2) image.GroupPayload("expired", "v", compact);
+      const std::uint64_t expiry = mode == 1 ? 0 : 1;
+      if (ordered) {
+        const OrderedCollectionRoot root{.kind_ = OrderedCollectionKind::kList,
+                                         .incarnation_ = 17,
+                                         .item_count_ = 2,
+                                         .first_group_ = 1,
+                                         .last_group_ = 2,
+                                         .next_group_id_ = 3,
+                                         .group_count_ = 2,
+                                         .revision_ = 2};
+        image.OrderedRoot("expired", root, 2, 0, expiry);
+        // Page two was reclaimed, while the root shares a live records block.
+        image.OrderedGroup(
+            "expired",
+            OrderedGroupSnapshot{.kind_ = OrderedCollectionKind::kList,
+                                 .incarnation_ = 17,
+                                 .id_ = 1,
+                                 .next_ = 2,
+                                 .entries_ = {{"gone", 0}}},
+            2);
+      } else {
+        image.Root("expired",
+                   GroupedHashRoot{.incarnation_ = 17,
+                                   .field_count_ = 1,
+                                   .group_count_ = 1,
+                                   .revision_ = 2},
+                   2, 0, expiry);
+      }
+      image.Finish();
+      {
+        ChildServer server(image);
+        if (mode != 0) {
+          EXPECT_NE(server.Wait(), 0) << server.Log();
+          continue;
+        }
+        EXPECT_EQ(server.Command({"EXISTS", "expired"}), ":0");
+        EXPECT_EQ(server.Command({"DBSIZE"}), ":1");
+        EXPECT_EQ(server.Command({"GET", "keep"}), "v");
+        EXPECT_EQ(server.Command({"SET", "after", "repair"}), "+OK");
+        EXPECT_EQ(server.Wait(true), 0) << server.Log();
+      }
+      // Successful repair must persist the deletion even though its root was
+      // already detached in memory. The live "keep" record preserves the old
+      // block, so merely forgetting the expired root cannot pass this boot.
+#if LAVIK_TEST_FAULTS_AVAILABLE
+      grouped_e2e::ScopedEnvironment clock("LAVIK_RECOVERY_NOW_MS", "0");
+#endif
+      ChildServer recovered(image);
+      EXPECT_EQ(recovered.Command({"EXISTS", "expired"}), ":0");
+      EXPECT_EQ(recovered.Command({"GET", "keep"}), "v");
+      EXPECT_EQ(recovered.Command({"GET", "after"}), "repair");
+      EXPECT_EQ(recovered.Command({"DBSIZE"}), ":2");
+      EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+    }
+  }
+}
+
+TEST(GroupedRecoveryE2e, ReclaimedExpiredGroupExtentsDoNotPreventStartup) {
+  for (const bool ordered : {false, true}) {
+    // Exercise both reconstruction and the later Hash payload validation.
+    // A valid first child must not enter live accounting before the complete
+    // graph passes validation; the second child's last extent is reclaimed.
+    for (const int mode : {0, 1, 2, 3}) {
+      SCOPED_TRACE(ordered);
+      SCOPED_TRACE(mode);
+      RecordImage image;
+      const RecordHeader compact{.value_type_ = ValueType::kString,
+                                 .logical_size_ = 1,
+                                 .mutation_sequence_ = 1};
+      image.GroupPayload("keep", "v", compact);
+      if (mode == 2) image.GroupPayload("expired", "v", compact);
+      const std::uint64_t expiry = mode == 1 ? 0 : 1;
+      std::vector<ExtentRef> extents;
+      if (ordered) {
+        image.OrderedRoot(
+            "expired",
+            OrderedCollectionRoot{.kind_ = OrderedCollectionKind::kList,
+                                  .incarnation_ = 17,
+                                  .item_count_ = 2,
+                                  .first_group_ = 1,
+                                  .last_group_ = 2,
+                                  .next_group_id_ = 3,
+                                  .group_count_ = 2,
+                                  .revision_ = 2},
+            2, 0, expiry);
+        image.OrderedGroup(
+            "expired",
+            OrderedGroupSnapshot{.kind_ = OrderedCollectionKind::kList,
+                                 .incarnation_ = 17,
+                                 .id_ = 1,
+                                 .next_ = 2,
+                                 .entries_ = {{"first", 0}}},
+            2);
+        extents = image.OrderedGroup(
+            "expired",
+            OrderedGroupSnapshot{
+                .kind_ = OrderedCollectionKind::kList,
+                .incarnation_ = 17,
+                .id_ = 2,
+                .previous_ = 1,
+                .entries_ = {{std::string(9 * 1024 * 1024, 'v'), 0}}},
+            2, 0, true);
+      } else {
+        auto group = SingleGroup(9 * 1024 * 1024);
+        group.id_.bits_ = 1;
+        group.id_.prefix_ = ComputeDigest("field", DigestSeed{}).value_ &
+                            (std::uint64_t{1} << 63);
+        auto sibling = group;
+        sibling.id_.prefix_ ^= std::uint64_t{1} << 63;
+        sibling.value_.entries_.clear();
+        image.Group("expired", sibling, 2);
+        extents = image.Group("expired", group, 2, 0, true);
+        image.Root("expired",
+                   GroupedHashRoot{.incarnation_ = 17,
+                                   .field_count_ = 1,
+                                   .group_count_ = 2,
+                                   .revision_ = 2},
+                   2, 0, expiry);
+      }
+      image.Finish();
+      ASSERT_EQ(extents.size(), 2);
+      if (mode == 3) {
+        // A matching extent identity with corrupt contents is not evidence
+        // of reclamation, even when its selected root has expired.
+        image.CorruptExtentBody(extents.back());
+      } else {
+        image.FreeExtents(std::span(extents).last(1));
+      }
+      {
+        ChildServer server(image);
+        if (mode != 0) {
+          EXPECT_NE(server.Wait(), 0) << server.Log();
+          EXPECT_NE(server.Log().find(mode == 3 ? "checksum mismatch"
+                                                : "does not match manifest"),
+                    std::string::npos)
+              << server.Log();
+          continue;
+        }
+        EXPECT_EQ(server.Command({"EXISTS", "expired"}), ":0");
+        EXPECT_EQ(server.Command({"GET", "keep"}), "v");
+        EXPECT_EQ(server.Command({"DBSIZE"}), ":1");
+        EXPECT_EQ(server.Command({"SET", "expired", "replacement"}), "+OK");
+        EXPECT_EQ(server.Wait(true), 0) << server.Log();
+      }
+#if LAVIK_TEST_FAULTS_AVAILABLE
+      grouped_e2e::ScopedEnvironment clock("LAVIK_RECOVERY_NOW_MS", "0");
+#endif
+      ChildServer recovered(image);
+      EXPECT_EQ(recovered.Command({"GET", "expired"}), "replacement");
+      EXPECT_EQ(recovered.Command({"GET", "keep"}), "v");
+      EXPECT_EQ(recovered.Command({"DBSIZE"}), ":2");
+      EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+    }
+  }
+}
+
+TEST(GroupedRecoveryE2e, DetachedExpirationIsDurableBeforeStartupCompletes) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires recovery crash and clock fault hooks";
+#else
+  RecordImage image;
+  image.GroupPayload("keep", "v",
+                     RecordHeader{.value_type_ = ValueType::kString,
+                                  .logical_size_ = 1,
+                                  .mutation_sequence_ = 1});
+  image.Root("expired",
+             GroupedHashRoot{.incarnation_ = 17,
+                             .field_count_ = 1,
+                             .group_count_ = 1,
+                             .revision_ = 2},
+             2, 0, 1);
+  image.Finish();
+  {
+    // Exit before background flush or graceful shutdown can persist a staged
+    // deletion. The unrelated key keeps the expired root's block scannable.
+    ChildServer server(image, false, "recovery-expired-tombstones-complete");
+    EXPECT_EQ(server.Wait(), 86) << server.Log();
+  }
+  grouped_e2e::ScopedEnvironment clock("LAVIK_RECOVERY_NOW_MS", "0");
+  ChildServer recovered(image);
+  EXPECT_EQ(recovered.Command({"EXISTS", "expired"}), ":0");
+  EXPECT_EQ(recovered.Command({"GET", "keep"}), "v");
+  EXPECT_EQ(recovered.Command({"DBSIZE"}), ":1");
+  EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+#endif
 }
 
 TEST(GroupedRecoveryE2e, IndexedSortedSetRequiresAndChecksMemberGraph) {

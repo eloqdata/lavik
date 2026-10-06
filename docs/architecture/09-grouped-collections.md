@@ -143,11 +143,12 @@ accounts its own lifetime, independently of the number of views retaining it.
 Local page replacements detach changed chunks. Lists and Sorted Sets update
 rank intervals whose counts change; Streams use a persistent partial-sum rank
 index to update logarithmic cells per changed count. Count-neutral replacements
-share ranks. Unchanged identities and retirement records remain shared. Topology
-changes validate the complete chain built from the adjudicated predecessor and
-the command's replacements; only recovery selects among competing physical
-candidates. Retired identities remain available to GC. Routing
-and physical-index node references, including final destruction, remain on
+share ranks. Unchanged identities and retirement records remain shared. Stream
+suffix insertions preserve a validated predecessor prefix and check the
+remaining chain and aggregate counts; other topology changes validate the
+complete resulting chain. Only recovery selects among competing physical
+candidates. Retired identities remain available to GC. Routing and physical-index node references,
+including final destruction, remain on
 the key owner. Cross-worker readers exchange physical identities or stream
 handles that route metadata access and cleanup back to that owner. Retained
 directories, index pages, manifests, publication reservations, retirement
@@ -344,8 +345,15 @@ working state before compensation and propagate compensation failure rather
 than disguising it as an ordinary admission rejection.
 
 List length uses root metadata. Indexed/range reads validate the corresponding
-rank pages completely, copy only requested values into owned replies, and
-release each page before loading the next. Read-only operations retain shared
+rank pages completely and copy only requested values into owned replies.
+Multi-page ranges overlap a bounded window of page reads, join every launched
+read before returning or reporting an error, revalidate the population after
+the join, and append results in rank order.
+The caller owns the child tasks and aggregate reply admission; each child
+releases its physical read lease after decoding. Admission covers one owned
+payload plus reply/page headers and the bounded task window, independently
+of read-buffer accounting. Indexed reads retain their direct single-page path.
+Read-only operations retain shared
 key intent and an immutable routing view, release worker store state before
 page I/O, and validate population and physical record lifetime in the page
 loader. Push, pop and indexed replacement load the affected interval and its
@@ -404,11 +412,21 @@ restricts writes to changed pages and structural neighbours.
 Cold scanning gathers roots and auxiliary candidates separately. After
 transaction adjudication and root selection, recovery reconstructs each
 winning incarnation, including retained parent markers, and checks routing
-coverage and aggregate counts. Only reachable external group payloads are
-validated: an obsolete inline-key group's value extents may already have been
-reclaimed while its records block is still scannable. UUID references remain
-source-block dependencies so classification can still resolve the original key. Every live group, root and extent joins physical-owner
-accounting before orphan reclamation.
+coverage and aggregate counts. Under the
+[full-device expiration policy](04-storage-and-recovery.md#expiry-and-tombstones),
+a graph reconstruction data-loss result may discard only an expired,
+unshielded winner, and only with startup expiration authority. Recovery never
+falls back to an older root. After allocator recovery, it appends a tombstone
+and waits for durable deletion before serving. Only confirmed foreground disk
+exhaustion permits skipping that detached-root repair; admission and I/O
+failures remain fatal. All other reconstruction errors remain fatal; complete
+expired graphs retain ordinary accounting and deletion.
+
+Only reachable external group payloads are validated: an obsolete inline-key
+group's value extents may already have been reclaimed while its records block
+is still scannable. UUID references remain source-block dependencies so
+classification can still resolve the original key. Every live group, root and
+extent joins physical-owner accounting before orphan reclamation.
 
 For indexed Sorted Sets, reconstruction requires both complete directories
 and validates reachable member snapshots and extent checksums as well as the

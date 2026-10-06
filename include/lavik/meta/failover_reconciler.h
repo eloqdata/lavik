@@ -77,13 +77,20 @@ struct MetaFailoverPlannerContext {
   std::function<bool(std::string_view)> group_in_flight_;
 };
 
-// Derives at most one typed failover mutation from one committed view and the
-// leader-local observations current at `now_unix_ms_`. A missing command means
-// wait: committed changes may wake the caller early, while periodic polling
-// bounds how long fresh volatile observations wait to be re-evaluated.
-// Proposal completion is never an input to this function.
+// A typed per-target capture, invoked only after discovery selects its Group.
+// nullopt means the discovery cut changed and the caller must rediscover.
+using MetaFailoverPlanningCapture =
+    std::function<std::optional<MetaFailoverPlanningView>(
+        const std::string&, std::optional<MetaOperationId>)>;
+
+// Derives at most one typed mutation in operation-sequence then Group order.
+// Each attempted target obtains its own owned input. Missing command means
+// wait; Aborted means discovery raced committed state. Neither consumes IDs.
+// Proposal completion is not an input; it only requests a fresh discovery.
 absl::StatusOr<std::optional<MetaCommand>> PlanFailoverStep(
-    const MetaCommittedView& view, const MetaObservationStore& observations,
+    const MetaFailoverDiscovery& discovery,
+    const MetaFailoverPlanningCapture& capture,
+    const MetaObservationStore& observations,
     const MetaFailoverPlannerContext& context);
 
 struct MetaFailoverReconcilerOptions {

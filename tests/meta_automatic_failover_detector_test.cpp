@@ -72,6 +72,31 @@ MetaAutomaticFailoverStatus Diagnostic(
   return status;
 }
 
+TEST(MetaAutomaticFailoverStateMachineTest,
+     DeferredTriggerPreservesDebounceUntilCommittedCutIsConfirmed) {
+  MetaAutomaticFailoverStateMachine detector;
+  const auto input = UnserviceableInput();
+  ASSERT_TRUE(detector.Advance(input, 100).ok());
+  const auto before = detector.Snapshot();
+  const auto provisional =
+      detector.Advance(input, 1100, /*defer_trigger=*/true);
+  ASSERT_TRUE(provisional.ok());
+  EXPECT_TRUE(provisional->trigger_now_);
+  EXPECT_EQ(detector.Snapshot(), before);
+  // A capture race may postpone admission without starting a new debounce.
+  const auto retried = detector.Advance(input, 1125, /*defer_trigger=*/true);
+  ASSERT_TRUE(retried.ok());
+  EXPECT_TRUE(retried->trigger_now_);
+  EXPECT_EQ(retried->status_.accumulated_suspect_ms_, 1025);
+  const auto committed = detector.Advance(input, 1125);
+  ASSERT_TRUE(committed.ok());
+  EXPECT_EQ(committed->status_, retried->status_);
+  EXPECT_TRUE(committed->trigger_now_);
+  const auto repeated = detector.Advance(input, 1150);
+  ASSERT_TRUE(repeated.ok());
+  EXPECT_FALSE(repeated->trigger_now_);
+}
+
 TEST(MetaAutomaticFailoverDiagnosticsRegistryTest,
      PublishesOneAtomicGroupSortedGenerationCut) {
   MetaAutomaticFailoverDiagnosticsRegistry registry;

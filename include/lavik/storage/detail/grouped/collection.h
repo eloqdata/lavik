@@ -310,9 +310,10 @@ class OrderedGroupDirectory {
 
   // Complete after-image metadata, not value deltas. Existing adjudicated
   // pages and retirement evidence stay adjudicated; only changed ids replace
-  // them. Structural edits validate the resulting complete chain directly;
-  // recovery alone selects winners from competing physical candidates. The
-  // physical side index independently COWs only touched pages.
+  // them. Stream suffix inserts reuse the checked prefix and validate new
+  // links; general structural edits validate the resulting complete chain
+  // directly. Recovery alone selects winners from competing physical
+  // candidates. The physical side index independently COWs only touched pages.
   absl::StatusOr<OrderedGroupDirectory> Apply(
       const OrderedCollectionRoot& root, std::uint64_t revision,
       std::span<const RecoveredOrderedGroup> changed,

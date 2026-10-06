@@ -14,6 +14,7 @@
 #include "absl/status/statusor.h"
 #include "lavik/meta/committed_status_view.h"
 #include "lavik/meta/data_publication_view.h"
+#include "lavik/meta/failover_views.h"
 #include "lavik/meta/observation_facts_view.h"
 #include "lavik/meta/proposal_view.h"
 #include "lavik/meta/raft.h"
@@ -91,6 +92,16 @@ class MetaStateMachine {
   // Config-only Advance and snapshot Install do not emit command events.
   // Consumers use this atomic pair to detect those progress/state changes.
   MetaCommittedCursor CaptureCommittedCursor() const;
+  MetaFailoverDiscovery CaptureFailoverDiscovery() const;
+  // A discovery/trigger selector is valid only while its state-change index
+  // still matches. Advance may move the applied index without invalidating
+  // those selectors; a failed match returns nullopt for a fresh discovery.
+  std::optional<MetaFailoverPlanningView> CaptureFailoverPlanningView(
+      MetaCommittedCursor expected, const std::string& group_id,
+      std::optional<MetaOperationId> submitted_operation = std::nullopt) const;
+  MetaAutomaticDetectionView CaptureAutomaticDetectionView() const;
+  std::optional<MetaAutomaticTriggerView> CaptureAutomaticTriggerView(
+      MetaCommittedCursor expected) const;
   // Discovery copies only the exact creation root while Creating, or the first
   // active membership operation in journal key order. Idle membership discovery
   // includes the complete Meta binding directory for genesis reconciliation.

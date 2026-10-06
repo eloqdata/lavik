@@ -1095,6 +1095,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   }
   const bool indexed = object->has_member_index();
   std::size_t remaining_sources = 0;
+  std::optional<SortedSetMemberProbe> member_probe;
   if (indexed) {
     // Prefix routing retains only per-group metadata. Exact members and
     // scores are decoded from the selected Hash leaves, never trusted from
@@ -1128,17 +1129,46 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (!checked.ok()) co_return checked;
       auto admission = budget.Reserve(2);
       if (!admission.ok()) co_return admission.status();
+      auto retain_score = [&](const auto& entry) -> absl::Status {
+        const auto requested = members.find(entry.field_);
+        if (requested == members.end()) return absl::OkStatus();
+        auto score = DecodeSortedSetMemberScore(entry.value_);
+        if (!score.ok()) return score.status();
+        requested->second.before_ = requested->second.after_ = *score;
+        ++remaining_sources;
+        return absl::OkStatus();
+      };
+      if (operation.kind_ == SortedSetOperationKind::kScores) {
+        auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
+                                                  digest, object, id);
+        if (!leaf.ok()) co_return leaf.status();
+        const auto bytes = leaf->loaded_.value();
+        const std::string_view payload(
+            reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        // Keep the lease through the synchronous scan. Only requested doubles
+        // escape; full route/duplicate validation still covers unrelated
+        // fields. Any failure discards command-local member state before a
+        // reply exists.
+        status = VisitHashGroupFields(payload, leaf->field_count_, id,
+                                      object->directory().root().seed_,
+                                      retain_score);
+        if (!status.ok()) co_return status;
+        continue;
+      }
       auto leaf = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
                                                  digest, object, id);
       if (!leaf.ok()) co_return leaf.status();
       for (const auto& entry : leaf->snapshot_.value_.entries_) {
-        const auto requested = members.find(entry.field_);
-        if (requested == members.end()) continue;
-        auto score = DecodeSortedSetMemberScore(entry.value_);
-        if (!score.ok()) co_return score.status();
-        requested->second.before_ = requested->second.after_ = *score;
-        ++remaining_sources;
+        status = retain_score(entry);
+        if (!status.ok()) co_return status;
       }
+      // Point writes need this same leaf again to replace its member score.
+      // Retain only one admitted leaf, never a batch-sized payload cache.
+      // The exclusive key intent and final snapshot validation protect the
+      // logical contents across GC relocation and unlocked preparation.
+      if (!ReadOnly(operation) && members.size() == 1)
+        member_probe.emplace(std::move(*admission), object,
+                             std::move(leaf->snapshot_));
     }
     if (operation.kind_ == SortedSetOperationKind::kScores) {
       status = ApplyInputs(operation, &members, &result);
@@ -1420,7 +1450,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     });
     auto built = co_await PrepareSortedSetMembers(
         store, partition, db_id, key, digest, object, plan, prepared != nullptr,
-        std::span<const SortedSetMemberChange>(changes));
+        std::span<const SortedSetMemberChange>(changes),
+        member_probe ? &*member_probe : nullptr);
     if (!built.ok()) co_return built.status();
     member_mutation = std::move(*built);
   }

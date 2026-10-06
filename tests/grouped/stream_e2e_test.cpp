@@ -553,6 +553,67 @@ TEST(GroupedStreamE2e, AggregateAbove512MiBKeepsHotPathsAndRecoveryBounded) {
   EXPECT_EQ(client.Command({"EXISTS", "s"}).text_, "0");
 }
 
+TEST(GroupedStreamE2e, RangeRepliesPreserveMixedSizeBinaryRecords) {
+  PrivateDisk disk;
+  Server server(disk);
+  Client client(server.port());
+  constexpr unsigned count = 512;
+  const std::string field("f\0", 2);
+  auto value = [](unsigned i) {
+    // Many messages fit one reply chunk, while one message crosses it. Empty
+    // and binary fields exercise RESP framing rather than text delimiters.
+    return std::string(i == 257 ? 96 * 1024 : (i % 7) * 31,
+                       static_cast<char>(i % 251));
+  };
+  auto check = [&](const Reply& entry, unsigned i, bool missing = false) {
+    ASSERT_EQ(entry.kind_, '*') << entry.text_;
+    ASSERT_EQ(entry.items_.size(), 2);
+    EXPECT_EQ(entry.items_[0].text_, std::to_string(i) + "-0");
+    const auto& fields = entry.items_[1];
+    ASSERT_EQ(fields.kind_, '*') << fields.text_;
+    if (missing) {
+      EXPECT_EQ(fields.text_, "-1");
+      return;
+    }
+    ASSERT_EQ(fields.items_.size(), 4);
+    EXPECT_EQ(fields.items_[0].text_, field);
+    EXPECT_EQ(fields.items_[1].text_, value(i));
+    EXPECT_EQ(fields.items_[2].text_, "");
+    EXPECT_EQ(fields.items_[3].text_, std::to_string(i));
+  };
+  for (unsigned i = 1; i <= count; ++i) {
+    const auto id = std::to_string(i) + "-0";
+    ASSERT_EQ(
+        client
+            .Command({"XADD", "s", id, field, value(i), "", std::to_string(i)})
+            .text_,
+        id);
+  }
+  {
+    auto range = client.Command({"XRANGE", "s", "-", "+"});
+    ASSERT_EQ(range.items_.size(), count) << range.text_;
+    for (unsigned i = 1; i <= count; ++i) check(range.items_[i - 1], i);
+    auto reverse =
+        client.Command({"XREVRANGE", "s", "400-0", "(198-0", "COUNT", "202"});
+    ASSERT_EQ(reverse.items_.size(), 202) << reverse.text_;
+    for (unsigned i = 0; i < 202; ++i) check(reverse.items_[i], 400 - i);
+  }
+  ASSERT_EQ(client.Command({"XGROUP", "CREATE", "s", "g", "0"}).text_, "OK");
+  for (bool history : {false, true}) {
+    if (history)
+      ASSERT_EQ(client.Command({"XDEL", "s", "1-0", "257-0", "512-0"}).text_,
+                "3");
+    auto read = client.Command(
+        {"XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", history ? "0" : ">"});
+    ASSERT_EQ(read.items_.size(), 1) << read.text_;
+    ASSERT_EQ(read.items_[0].items_.size(), 2);
+    const auto& entries = read.items_[0].items_[1].items_;
+    ASSERT_EQ(entries.size(), count);
+    for (unsigned i = 1; i <= count; ++i)
+      check(entries[i - 1], i, history && (i == 1 || i == 257 || i == 512));
+  }
+}
+
 TEST(GroupedStreamE2e, LargeRepliesKeepSnapshotsAndDeletedHistory) {
   PrivateDisk disk(2ULL * 1024 * 1024 * 1024);
   // Keep this budget tight: RESTORE must leave headroom for the destination's

@@ -1642,4 +1642,38 @@ const MetaObservationStore& MetaLeaderContext::Observations() const {
   return coordinator_->Observations();
 }
 
+MetaFailoverDiscovery MetaCoordinator::FailoverDiscovery() const {
+  return state_machine_.CaptureFailoverDiscovery();
+}
+std::optional<MetaFailoverPlanningView> MetaCoordinator::FailoverPlanningView(
+    MetaCommittedCursor expected, const std::string& group_id,
+    std::optional<MetaOperationId> submitted_operation) const {
+  return state_machine_.CaptureFailoverPlanningView(expected, group_id,
+                                                    submitted_operation);
+}
+MetaAutomaticDetectionView MetaCoordinator::AutomaticDetectionView() const {
+  return state_machine_.CaptureAutomaticDetectionView();
+}
+std::optional<MetaAutomaticTriggerView> MetaCoordinator::AutomaticTriggerView(
+    MetaCommittedCursor expected) const {
+  return state_machine_.CaptureAutomaticTriggerView(expected);
+}
+
+MetaFailoverDiscovery MetaLeaderContext::FailoverDiscovery() const {
+  return coordinator_->FailoverDiscovery();
+}
+std::optional<MetaFailoverPlanningView> MetaLeaderContext::FailoverPlanningView(
+    MetaCommittedCursor expected, const std::string& group_id,
+    std::optional<MetaOperationId> submitted_operation) const {
+  return coordinator_->FailoverPlanningView(expected, group_id,
+                                            submitted_operation);
+}
+MetaAutomaticDetectionView MetaLeaderContext::AutomaticDetectionView() const {
+  return coordinator_->AutomaticDetectionView();
+}
+std::optional<MetaAutomaticTriggerView> MetaLeaderContext::AutomaticTriggerView(
+    MetaCommittedCursor expected) const {
+  return coordinator_->AutomaticTriggerView(expected);
+}
+
 }  // namespace lavik::meta
