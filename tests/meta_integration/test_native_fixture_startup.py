@@ -114,10 +114,14 @@ class BootstrapCreationAdmissionTest(unittest.TestCase):
         meta.ctl.side_effect = [self.busy, "OK clustercreate 1"]
         with (
             patch.object(C, "create_request", return_value="fixed request") as request,
+            patch.object(
+                C, "cluster_status", return_value={"meta_membership_stable": True}
+            ) as status,
             patch.object(C.H, "free_port", return_value=12345),
         ):
             D.commit_service_mode(meta, [meta])
         request.assert_called_once()
+        status.assert_called_once_with(meta)
         self.assertEqual(meta.ctl.call_count, 2)
         for call in meta.ctl.call_args_list:
             self.assertEqual(call.args, ("fixed request",))

@@ -23,7 +23,9 @@ class DataControlFixtureStartupTest(unittest.TestCase):
             stable = status_calls > 1
             return {"meta_membership_stable": stable}
 
-        def create(_request):
+        def create(_request, *, timeout):
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 5)
             if not stable:
                 return (
                     "ERR clustercreate 1 preflight pre-commit-failed "
@@ -38,7 +40,7 @@ class DataControlFixtureStartupTest(unittest.TestCase):
         ):
             D.commit_service_mode(leader, [leader])
         self.assertGreaterEqual(status_calls, 2)
-        leader.ctl.assert_called_once_with("create-request")
+        leader.ctl.assert_called_once_with("create-request", timeout=5.0)
 
 
 if __name__ == "__main__":
