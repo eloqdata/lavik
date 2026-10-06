@@ -1047,20 +1047,27 @@ if (BUILD_TESTING)
     set_tests_properties(meta_integration.gate_initial_recovery PROPERTIES
       TIMEOUT 300)
 
-    # Real-process Meta <-> Data control gate.  It needs both executables,
-    # unlike the Meta-only fault gates above.
+    # Real-process Meta <-> Data control gate, with the CLI observing committed
+    # membership readiness before the fixture submits Genesis.
     add_test(
       NAME meta_integration.gate_data_control
       COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_data_control.py
               $<TARGET_FILE:lavik-meta>
               $<TARGET_FILE:lavik>
+              $<TARGET_FILE:lavik-ctl>
     )
     set_tests_properties(meta_integration.gate_data_control PROPERTIES
       LABELS meta-integration
       TIMEOUT 180
       RUN_SERIAL TRUE
     )
+    add_test(
+      NAME meta_integration.data_control_fixture_startup
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/test_data_control_fixture_startup.py)
+    set_tests_properties(meta_integration.data_control_fixture_startup PROPERTIES
+      LABELS meta-integration TIMEOUT 30)
     # The deterministic election-window seam lives in the Debug Meta server.
     if (CMAKE_BUILD_TYPE STREQUAL "Debug")
       add_test(
