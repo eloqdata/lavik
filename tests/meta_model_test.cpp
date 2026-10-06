@@ -3204,7 +3204,9 @@ TEST(MetaStateApply,
   ApplyOk(stores, log_index++, MetaCommand{boundary_transition});
 
   const auto boundary = lavik::meta::MetaControlProjector::ProjectNode(
-      lavik::meta::MetaCommittedView(stores, log_index - 1), MakeNodeId(1));
+      lavik::meta::MetaDataPublicationView::FromStores(
+          stores, {log_index - 1, log_index - 1}),
+      MakeNodeId(1));
   ASSERT_TRUE(boundary.ok()) << boundary.status();
   EXPECT_EQ(boundary->full_state.current_directives.size(),
             control::kMaxProjectedDirectives);

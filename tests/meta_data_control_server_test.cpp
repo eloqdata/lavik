@@ -30,7 +30,9 @@
 #include "lavik/meta/control_projector.h"
 #include "lavik/meta/data_control_runtime_status.h"
 #include "lavik/meta/data_control_server.h"
+#include "lavik/meta/identity_verifier.h"
 #include "lavik/meta/observation_store.h"
+#include "lavik/meta/state_machine.h"
 
 namespace lavik::meta {
 
@@ -130,7 +132,11 @@ using lavik::meta::EvaluateLeaseChallenge;
 using lavik::meta::EvaluateReplacementDisposition;
 using lavik::meta::IngestHeartbeatObservations;
 using lavik::meta::MetaCommittedFacts;
-using lavik::meta::MetaCommittedView;
+lavik::meta::MetaDataPublicationView PublicationView(
+    const lavik::meta::MetaStores& stores, std::uint64_t index) {
+  return lavik::meta::MetaDataPublicationView::FromStores(stores,
+                                                          {index, index});
+}
 using lavik::meta::MetaDataControlRuntimeStatus;
 using lavik::meta::MetaDataControlServer;
 using lavik::meta::MetaDataControlServerOptions;
@@ -150,9 +156,8 @@ using lavik::meta::detail::BoundNodeSessionRegistry;
 using lavik::meta::detail::ConfirmedLeaseForHeartbeat;
 using lavik::meta::detail::EstablishedSessionReadTimeout;
 using lavik::meta::detail::FailoverProjectionForHeartbeat;
-using lavik::meta::detail::MetaCommittedViewCache;
+using lavik::meta::detail::MetaDataPublicationViewCache;
 using lavik::meta::detail::PendingHandshakeLimiter;
-using lavik::meta::detail::RecordEquivalentTransferBoundary;
 using lavik::meta::detail::RetainedProjectionLimiter;
 using lavik::meta::detail::TransferBoundaryNeedsProjectionValidation;
 
@@ -383,13 +388,13 @@ TEST(MetaDataControlRuntimeStatusTest, UnregisteredRetryEvidenceIsBounded) {
             control::kMaxProjectedNodes);
 }
 
-TEST(MetaCommittedViewCacheTest, CopiesOncePerNewAppliedHighWater) {
+TEST(MetaDataPublicationViewCacheTest, CopiesOncePerNewAppliedHighWater) {
   std::uint64_t next_index = 3;
   std::size_t loads = 0;
-  MetaCommittedViewCache cache([&] {
+  MetaDataPublicationViewCache cache([&] {
     ++loads;
     MetaStores stores;
-    return MetaCommittedView(std::move(stores), next_index);
+    return PublicationView(std::move(stores), next_index);
   });
 
   auto first = cache.Get(1);
@@ -408,7 +413,7 @@ TEST(MetaCommittedViewCacheTest, CopiesOncePerNewAppliedHighWater) {
   EXPECT_EQ(loads, 2u);
 
   MetaStores adopted_stores;
-  auto adopted = cache.Adopt(MetaCommittedView(std::move(adopted_stores), 9));
+  auto adopted = cache.Adopt(PublicationView(std::move(adopted_stores), 9));
   ASSERT_NE(adopted, nullptr);
   EXPECT_EQ(adopted->applied_index(), 9u);
   ASSERT_TRUE(cache.Get(9).ok());
@@ -419,13 +424,133 @@ TEST(MetaCommittedViewCacheTest, CopiesOncePerNewAppliedHighWater) {
   EXPECT_EQ(loads, 3u);
 }
 
+TEST(MetaDataPublicationViewCacheTest,
+     InstallAfterAdvanceAtSameAppliedIndexRefreshes) {
+  MetaStores stores;
+  std::uint64_t changed = 3;
+  std::size_t loads = 0;
+  MetaDataPublicationViewCache cache([&] {
+    ++loads;
+    return lavik::meta::MetaDataPublicationView::FromStores(stores,
+                                                            {10, changed});
+  });
+  auto advanced = cache.Get(3);
+  ASSERT_TRUE(advanced.ok());
+  EXPECT_EQ((*advanced)->applied_index(), 10u);
+  ASSERT_TRUE(cache.Get(3).ok());
+  EXPECT_EQ(loads, 1u);
+  changed = 10;
+  auto installed = cache.Get(10);
+  ASSERT_TRUE(installed.ok());
+  EXPECT_EQ(loads, 2u);
+  EXPECT_NE(advanced->get(), installed->get());
+  EXPECT_EQ((*advanced)->state_change_index(), 3u);
+  EXPECT_EQ((*installed)->state_change_index(), 10u);
+  EXPECT_TRUE(TransferBoundaryNeedsProjectionValidation(3, 10, 3));
+}
+
+TEST(MetaDataPublicationHandshakeTest,
+     RetirementBetweenDiscoveryAndAcceptance) {
+  namespace meta = lavik::meta;
+  auto opened = meta::MetaStateMachine::Open("");
+  ASSERT_TRUE(opened.ok());
+  auto machine = std::move(*opened);
+  meta::RegisterNode registration;
+  registration.node_id_ = Identity('1');
+  registration.principal_ = "lavik://node/" + registration.node_id_;
+  registration.endpoints_ = {"tcp://127.0.0.1:6379"};
+  auto encoded = meta::MetaStateMachine::EncodeCommand(registration);
+  ASSERT_TRUE(encoded.ok());
+  ASSERT_NE(machine->commit(1, **encoded), nullptr);
+  MetaDataPublicationViewCache cache(
+      [&] { return machine->CaptureDataPublication(); });
+  auto discovery = cache.Get(1);
+  ASSERT_TRUE(discovery.ok());
+  ASSERT_TRUE((*discovery)->IsActiveNode(registration.node_id_));
+  meta::MetaPrincipalIdentity identity{registration.principal_,
+                                       meta::MetaPrincipalRole::kDataNode,
+                                       registration.node_id_};
+
+  // Commit after the first registry read, before the actual accepted-cut
+  // refresh used by SessionLoop. The retained discovery cut stays readable.
+  meta::RetireNode retire;
+  retire.node_id_ = registration.node_id_;
+  retire.expected_revision_ = 1;
+  encoded = meta::MetaStateMachine::EncodeCommand(retire);
+  ASSERT_TRUE(encoded.ok());
+  ASSERT_NE(machine->commit(2, **encoded), nullptr);
+  for (const auto* authenticated :
+       {&identity, static_cast<meta::MetaPrincipalIdentity*>(nullptr)}) {
+    auto accepted = meta::detail::RefreshAcceptedDataPublication(
+        cache, machine->state_change_index(), registration.node_id_, {},
+        authenticated);
+    EXPECT_EQ(accepted.status().code(), absl::StatusCode::kPermissionDenied);
+  }
+  EXPECT_TRUE((*discovery)->IsActiveNode(registration.node_id_));
+  EXPECT_TRUE((*cache.Get(2))->FindNode(registration.node_id_)->retired_);
+}
+
+TEST(MetaDataPublicationHandshakeTest,
+     RefreshBindsIdentityAndServiceToReturnedCut) {
+  namespace meta = lavik::meta;
+  MetaStores stores;
+  meta::RegisterNode registration;
+  registration.node_id_ = Identity('1');
+  registration.principal_ = "lavik://node/" + registration.node_id_;
+  registration.endpoints_ = {"tcp://127.0.0.1:6379"};
+  ASSERT_TRUE(stores.identity_.Apply(registration).ok());
+  std::uint64_t index = 1;
+  MetaDataPublicationViewCache cache([&] {
+    return meta::MetaDataPublicationView::FromStores(stores, {index, index});
+  });
+  auto discovery = cache.Get(1);
+  ASSERT_TRUE(discovery.ok());
+  const control::ServiceDeclaration discovered_service;
+  const auto root = Bytes<16>(0x21);
+  ASSERT_TRUE(
+      stores.topology_.BeginClusterCreate(root, 2, lavik::ClientMode::kCluster)
+          .ok());
+  index = 2;
+  auto stale = meta::detail::RefreshAcceptedDataPublication(
+      cache, index, registration.node_id_, discovered_service, nullptr);
+  EXPECT_EQ(stale.status().code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_FALSE((*discovery)->lifecycle().client_mode_);
+
+  const control::ServiceDeclaration current{lavik::ClientMode::kCluster, root,
+                                            2};
+  meta::MetaPrincipalIdentity wrong_binding{"lavik://node/" + Identity('2'),
+                                            meta::MetaPrincipalRole::kDataNode,
+                                            registration.node_id_};
+  EXPECT_EQ(meta::detail::RefreshAcceptedDataPublication(
+                cache, index, registration.node_id_, current, &wrong_binding)
+                .status()
+                .code(),
+            absl::StatusCode::kPermissionDenied);
+  wrong_binding.principal_ = registration.principal_;
+  wrong_binding.subject_id_ = Identity('2');
+  EXPECT_EQ(meta::detail::RefreshAcceptedDataPublication(
+                cache, index, registration.node_id_, current, &wrong_binding)
+                .status()
+                .code(),
+            absl::StatusCode::kPermissionDenied);
+  wrong_binding.subject_id_ = registration.node_id_;
+  auto accepted = meta::detail::RefreshAcceptedDataPublication(
+      cache, index, registration.node_id_, current, &wrong_binding);
+  ASSERT_TRUE(accepted.ok()) << accepted.status();
+  EXPECT_EQ(accepted->get(), cache.Get(index)->get());
+  EXPECT_EQ((*accepted)->state_change_index(), 2u);
+  EXPECT_EQ((*accepted)->lifecycle().root_operation_id_, root);
+  EXPECT_EQ((*accepted)->FindNode(registration.node_id_)->principal_,
+            registration.principal_);
+}
+
 TEST(MetaTransferBoundaryTest,
      EquivalentCommitIsProjectedOnceUntilTheHighWaterAdvances) {
   std::uint64_t validated = 10;
   EXPECT_TRUE(TransferBoundaryNeedsProjectionValidation(
       /*published_index=*/20, /*committed_high_water=*/20, validated));
 
-  RecordEquivalentTransferBoundary(/*applied_index=*/20, &validated);
+  validated = 20;
   EXPECT_EQ(validated, 20U);
   EXPECT_FALSE(TransferBoundaryNeedsProjectionValidation(
       /*published_index=*/20, /*committed_high_water=*/20, validated));
@@ -847,7 +972,7 @@ TEST(MetaDataControlDirectoryTest, UsesOnlyCommittedActiveMembersInIdOrder) {
   ASSERT_TRUE(stores.identity_.Apply(retire).ok());
 
   auto directory = BuildCommittedMetaDirectory(
-      MetaCommittedView(std::move(stores), /*applied_index=*/3));
+      PublicationView(std::move(stores), /*applied_index=*/3));
   ASSERT_TRUE(directory.ok()) << directory.status();
   ASSERT_EQ(directory->size(), 1u);
   EXPECT_EQ(directory->front().server_id, 1u);
@@ -872,7 +997,7 @@ TEST(MetaDataControlDirectoryTest,
   EXPECT_FALSE(stores.identity_.Apply(member).ok());
 
   auto directory = BuildCommittedMetaDirectory(
-      MetaCommittedView(std::move(stores), /*applied_index=*/1));
+      PublicationView(std::move(stores), /*applied_index=*/1));
   ASSERT_TRUE(directory.ok()) << directory.status();
   ASSERT_EQ(directory->size(), 1u);
   EXPECT_EQ(directory->front().server_id, prior.server_id_);
@@ -898,7 +1023,7 @@ TEST(MetaDataControlDirectoryTest,
   EXPECT_FALSE(stores.identity_.Apply(last).ok());
 
   auto directory = BuildCommittedMetaDirectory(
-      MetaCommittedView(std::move(stores), /*applied_index=*/2));
+      PublicationView(std::move(stores), /*applied_index=*/2));
   ASSERT_TRUE(directory.ok()) << directory.status();
   EXPECT_EQ(directory->size(), 2u);
 }
@@ -920,7 +1045,7 @@ TEST(MetaDataControlDirectoryTest,
   EXPECT_TRUE(stores.identity_.Apply(bind).ok());
 
   auto directory = BuildCommittedMetaDirectory(
-      MetaCommittedView(std::move(stores), /*applied_index=*/1));
+      PublicationView(std::move(stores), /*applied_index=*/1));
   ASSERT_TRUE(directory.ok()) << directory.status();
   ASSERT_EQ(directory->size(), 1u);
   EXPECT_EQ(directory->front().host, "::1");
@@ -945,8 +1070,8 @@ TEST(MetaDataControlDirectoryTest,
   }
   ASSERT_NE(rejected_id, 0u);
   const auto directory = BuildCommittedMetaDirectory(
-      MetaCommittedView(std::move(stores),
-                        /*applied_index=*/rejected_id - 1));
+      PublicationView(std::move(stores),
+                      /*applied_index=*/rejected_id - 1));
   ASSERT_TRUE(directory.ok()) << directory.status();
   EXPECT_EQ(directory->size(), rejected_id - 1);
 }

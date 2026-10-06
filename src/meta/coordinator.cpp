@@ -966,6 +966,18 @@ MetaCommittedView MetaCoordinator::CommittedView() {
   return MetaCommittedView(std::move(stores), applied_index);
 }
 
+MetaDataPublicationView MetaCoordinator::DataPublication() const {
+  return state_machine_.CaptureDataPublication();
+}
+MetaDirectiveResultView MetaCoordinator::CaptureDirectiveResult(
+    const MetaTerminalReceiptKey& key) const {
+  return state_machine_.CaptureDirectiveResult(key);
+}
+std::optional<MetaTerminalReceipt> MetaCoordinator::FindTerminalReceipt(
+    const MetaTerminalReceiptKey& key) const {
+  return state_machine_.FindTerminalReceipt(key);
+}
+
 MetaObservationFactsView MetaCoordinator::ObservationFacts() const {
   return state_machine_.CaptureObservationFacts();
 }
@@ -1029,7 +1041,13 @@ auto MetaCoordinator::SubscribeCaptured(Capture capture,
       // mutex is acquired in the reverse order. A later command's sink must
       // enqueue into the newly registered subscription before releasing its
       // state lock. Install/Advance remain eventless; consumers poll indices.
-      if (core->high_water_ == high_water &&
+      // Advance(N) followed by Install(N) can replace state without moving
+      // applied. Purpose-specific views must also recheck their state cut.
+      bool state_matches = true;
+      if constexpr (requires { view.state_change_index(); })
+        state_matches =
+            state_machine_.state_change_index() == view.state_change_index();
+      if (state_matches && core->high_water_ == high_water &&
           state_machine_.last_commit_index() == view.applied_index()) {
         auto sub = std::make_shared<Subscriber>();
         sub->id_ = core->next_id_++;
@@ -1054,6 +1072,13 @@ MetaSubscriptionStart MetaCoordinator::SubscribeCommitted(
         return MetaCommittedView(std::move(captured.stores_),
                                  captured.cursor_.applied_index());
       },
+      std::move(callback), queue_capacity);
+}
+
+MetaDataPublicationSubscriptionStart MetaCoordinator::SubscribeDataPublication(
+    MetaCommitCallback callback, std::size_t queue_capacity) {
+  return SubscribeCaptured(
+      [this] { return state_machine_.CaptureDataPublication(); },
       std::move(callback), queue_capacity);
 }
 
@@ -1592,6 +1617,13 @@ std::uint64_t MetaLeaderContext::AppliedIndex() const {
 MetaSubscriptionStart MetaLeaderContext::SubscribeCommitted(
     MetaCommitCallback callback, std::size_t queue_capacity) {
   return coordinator_->SubscribeCommitted(std::move(callback), queue_capacity);
+}
+
+MetaDataPublicationSubscriptionStart
+MetaLeaderContext::SubscribeDataPublication(MetaCommitCallback callback,
+                                            std::size_t queue_capacity) {
+  return coordinator_->SubscribeDataPublication(std::move(callback),
+                                                queue_capacity);
 }
 
 MetaObservationSubscriptionStart MetaLeaderContext::SubscribeObservationFacts(

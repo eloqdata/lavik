@@ -289,6 +289,37 @@ MetaCommittedStoresSnapshot MetaStateMachine::CaptureStores() const {
            last_state_change_idx_.load(std::memory_order_relaxed)}};
 }
 
+MetaDataPublicationView MetaStateMachine::CaptureDataPublication() const {
+  MetaDataPublicationView::CaptureData data;
+  {
+    std::lock_guard lock(mutex_);
+    data = MetaDataPublicationView::Extract(
+        stores_, {last_committed_idx_.load(std::memory_order_relaxed),
+                  last_state_change_idx_.load(std::memory_order_relaxed)});
+  }
+  return MetaDataPublicationView(std::move(data));
+}
+
+MetaDirectiveResultView MetaStateMachine::CaptureDirectiveResult(
+    const MetaTerminalReceiptKey& key) const {
+  MetaDirectiveResultView view;
+  {
+    std::lock_guard lock(mutex_);
+    view.cursor_ = {last_committed_idx_.load(std::memory_order_relaxed),
+                    last_state_change_idx_.load(std::memory_order_relaxed)};
+    view.receipt_ = stores_.operation_.FindTerminalReceipt(key);
+    if (!view.receipt_)
+      view.operation_ = stores_.operation_.FindOperation(key.operation_id_);
+  }
+  return view;
+}
+
+std::optional<MetaTerminalReceipt> MetaStateMachine::FindTerminalReceipt(
+    const MetaTerminalReceiptKey& key) const {
+  std::lock_guard lock(mutex_);
+  return stores_.operation_.FindTerminalReceipt(key);
+}
+
 MetaProposalView MetaStateMachine::CaptureProposal(
     const MetaCommand& command) const {
   MetaProposalView::CaptureData data;

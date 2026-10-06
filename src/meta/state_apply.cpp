@@ -183,44 +183,15 @@ bool HasAssignment(const MetaTopologyGroupView& view,
 
 absl::Status ValidateCommittedDirectiveAnchorImpl(
     const MetaStores& stores, const MetaDirectiveSpec& directive) {
-  const bool initializes_empty =
-      directive.kind_ == kMetaDirectiveInitializeEmptyPopulation;
-  if (!stores.identity_.IsActiveNode(directive.recipient_node_id_) ||
-      !stores.identity_.IsActiveNode(directive.target_node_id_) ||
-      (!initializes_empty &&
-       !stores.identity_.IsActiveNode(directive.source_node_id_))) {
-    return MetaDomainRejectError(
-        "directive recipient, source, or target is not active");
-  }
+  const bool active =
+      stores.identity_.IsActiveNode(directive.recipient_node_id_) &&
+      stores.identity_.IsActiveNode(directive.target_node_id_) &&
+      (directive.kind_ == kMetaDirectiveInitializeEmptyPopulation ||
+       stores.identity_.IsActiveNode(directive.source_node_id_));
   const auto group = stores.topology_.FindGroup(directive.group_id_);
   const auto grant = stores.topology_.AuthorityFor(directive.group_id_);
-  if (!group.has_value() || !grant.has_value()) {
-    return MetaDomainRejectError("directive group does not exist");
-  }
-  if (!grant->grant_.has_value()) {
-    return MetaDomainRejectError("directive group has no active authority");
-  }
-  if (!HasAssignment(*group, directive.target_node_id_,
-                     directive.assignment_id_) ||
-      (!initializes_empty && !HasAssignment(*group, directive.source_node_id_,
-                                            directive.source_assignment_id_))) {
-    return MetaDomainRejectError("directive membership or assignment is stale");
-  }
-  const bool authority_matches =
-      group->record_.group_term_ == directive.group_term_ &&
-      grant->group_term_ == directive.group_term_;
-  if (!authority_matches) {
-    return MetaDomainRejectError("directive authority anchor is stale");
-  }
-  if (group->record_.population_manifest_revision_ !=
-          directive.population_manifest_revision_ ||
-      group->record_.population_manifest_digest_ !=
-          directive.population_manifest_digest_ ||
-      group->record_.partition_replication_epoch_ !=
-          directive.partition_replication_epoch_) {
-    return MetaDomainRejectError("directive population identity is stale");
-  }
-  return absl::OkStatus();
+  return ValidateCommittedDirectiveAnchor(
+      directive, active, group ? &*group : nullptr, grant ? &*grant : nullptr);
 }
 
 void InvalidateStaleCurrentDirectives(MetaStores& stores,
@@ -2827,6 +2798,41 @@ bool HasDataClusterArtifacts(const MetaStores& stores) {
   return HasDataClusterArtifactsImpl(stores);
 }
 
+absl::Status ValidateCommittedDirectiveAnchor(
+    const MetaDirectiveSpec& directive, bool participants_active,
+    const MetaTopologyGroupView* group, const MetaGroupAuthorityView* grant) {
+  const bool initializes_empty =
+      directive.kind_ == kMetaDirectiveInitializeEmptyPopulation;
+  if (!participants_active)
+    return MetaDomainRejectError(
+        "directive recipient, source, or target is not active");
+  if (group == nullptr || grant == nullptr)
+    return MetaDomainRejectError("directive group does not exist");
+  if (!grant->grant_.has_value()) {
+    return MetaDomainRejectError("directive group has no active authority");
+  }
+  if (!HasAssignment(*group, directive.target_node_id_,
+                     directive.assignment_id_) ||
+      (!initializes_empty && !HasAssignment(*group, directive.source_node_id_,
+                                            directive.source_assignment_id_))) {
+    return MetaDomainRejectError("directive membership or assignment is stale");
+  }
+  const bool authority_matches =
+      group->record_.group_term_ == directive.group_term_ &&
+      grant->group_term_ == directive.group_term_;
+  if (!authority_matches) {
+    return MetaDomainRejectError("directive authority anchor is stale");
+  }
+  if (group->record_.population_manifest_revision_ !=
+          directive.population_manifest_revision_ ||
+      group->record_.population_manifest_digest_ !=
+          directive.population_manifest_digest_ ||
+      group->record_.partition_replication_epoch_ !=
+          directive.partition_replication_epoch_) {
+    return MetaDomainRejectError("directive population identity is stale");
+  }
+  return absl::OkStatus();
+}
 absl::Status ValidateCommittedDirectiveAnchor(
     const MetaStores& stores, const MetaDirectiveSpec& directive) {
   return ValidateCommittedDirectiveAnchorImpl(stores, directive);

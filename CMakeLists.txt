@@ -599,6 +599,7 @@ set(LAVIK_META_CORE_SOURCES
   src/meta/candidate_plan.cpp
   src/meta/cluster_create_reconciler.cpp
   src/meta/commands.cpp
+  src/meta/data_publication_view.cpp
   src/meta/control_projector.cpp
   src/meta/coordinator.cpp
   src/meta/ctl_server.cpp
@@ -1046,27 +1047,34 @@ if (BUILD_TESTING)
     set_tests_properties(meta_integration.gate_initial_recovery PROPERTIES
       TIMEOUT 300)
 
-    # Real-process Meta <-> Data control gate.  It needs both executables,
-    # unlike the Meta-only fault gates above.
+    # Real-process Meta <-> Data control gate, with the CLI observing committed
+    # membership readiness before the fixture submits Genesis.
     add_test(
       NAME meta_integration.gate_data_control
       COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_data_control.py
               $<TARGET_FILE:lavik-meta>
               $<TARGET_FILE:lavik>
+              $<TARGET_FILE:lavik-ctl>
     )
     set_tests_properties(meta_integration.gate_data_control PROPERTIES
       LABELS meta-integration
       TIMEOUT 180
       RUN_SERIAL TRUE
     )
+    add_test(
+      NAME meta_integration.data_control_fixture_startup
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/test_data_control_fixture_startup.py)
+    set_tests_properties(meta_integration.data_control_fixture_startup PROPERTIES
+      LABELS meta-integration TIMEOUT 30)
     # The deterministic election-window seam lives in the Debug Meta server.
     if (CMAKE_BUILD_TYPE STREQUAL "Debug")
       add_test(
         NAME meta_integration.gate_meta_follower_retry
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_meta_follower_retry.py
-                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik> $<TARGET_FILE:lavik-ctl>
       )
       set_tests_properties(meta_integration.gate_meta_follower_retry PROPERTIES
         LABELS meta-integration TIMEOUT 90 RUN_SERIAL TRUE)
@@ -1112,6 +1120,15 @@ if (BUILD_TESTING)
       )
       set_tests_properties(meta_integration.gate_heartbeat_cadence PROPERTIES
         LABELS meta-integration TIMEOUT 120 RUN_SERIAL TRUE)
+      add_test(
+        NAME meta_integration.gate_data_publication
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_data_publication.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+      )
+      set_tests_properties(meta_integration.gate_data_publication PROPERTIES
+        LABELS meta-integration TIMEOUT 120 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
       add_test(
         NAME meta_integration.gate_directive_results
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}

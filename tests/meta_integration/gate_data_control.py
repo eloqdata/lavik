@@ -41,7 +41,7 @@ indefinitely blocked write cannot exercise a non-empty process-level drain in
 this gate; the request/NodeControl drain seams cover that ordering in unit
 tests until reconciliation can bootstrap the population.
 
-Usage: gate_data_control.py /path/to/lavik-meta /path/to/lavik [workdir]
+Usage: gate_data_control.py /path/to/lavik-meta /path/to/lavik /path/to/lavik-ctl [workdir]
 """
 
 import os
@@ -341,6 +341,13 @@ def commit_service_mode(leader, metas):
     # assignment and its lease-denial path through the ordinary Data session.
     import gate_cluster_create as C
 
+    # Election precedes initial identity recovery. Genesis shares its admission
+    # gate with membership changes, so wait for the committed bootstrap cut.
+    H.wait_until(
+        "bootstrap Meta identities committed",
+        5,
+        lambda: C.cluster_status(leader)["meta_membership_stable"],
+    )
     request = C.create_request(
         metas, "f" * 40, f"tcp://127.0.0.1:{H.free_port()}", "bootstrap-group"
     )
@@ -890,12 +897,15 @@ def run_mtls(meta_binary, data_binary, workdir):
 
 
 def main():
-    if len(sys.argv) not in (3, 4):
+    if len(sys.argv) not in (4, 5):
         print(__doc__)
         return 2
+    import gate_cluster_create as C
+
+    C.CTL = os.path.abspath(sys.argv[3])
     work_argv = [sys.argv[0], sys.argv[1]]
-    if len(sys.argv) == 4:
-        work_argv.append(sys.argv[3])
+    if len(sys.argv) == 5:
+        work_argv.append(sys.argv[4])
     workdir, keep = H.make_workdir(work_argv, "meta_integration_data_control_")
     started = time.monotonic()
     try:

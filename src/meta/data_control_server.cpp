@@ -533,24 +533,59 @@ control::ResultNoLongerTracked NoLongerTracked(
 
 }  // namespace
 
-detail::MetaCommittedViewCache::MetaCommittedViewCache(Loader loader)
+absl::StatusOr<std::shared_ptr<const MetaDataPublicationView>>
+detail::RefreshAcceptedDataPublication(
+    MetaDataPublicationViewCache& cache,
+    std::uint64_t minimum_state_change_index, std::string_view node_id,
+    const control::ServiceDeclaration& expected_service,
+    const MetaPrincipalIdentity* tls_identity) {
+  auto captured = cache.Get(minimum_state_change_index);
+  if (!captured.ok()) return captured.status();
+  const auto& view = **captured;
+  const auto& lifecycle = view.lifecycle();
+  const control::ServiceDeclaration service{lifecycle.client_mode_,
+                                            lifecycle.root_operation_id_,
+                                            lifecycle.genesis_commit_index_};
+  if (service != expected_service) {
+    return absl::FailedPreconditionError(
+        "cluster service declaration changed during handshake");
+  }
+  const auto* node = view.FindNode(node_id);
+  if (node == nullptr || node->retired_) {
+    return absl::PermissionDeniedError(
+        "data node left the active committed registry during handshake");
+  }
+  if (tls_identity != nullptr &&
+      (tls_identity->subject_id_ != node_id ||
+       tls_identity->principal_ != node->principal_)) {
+    return absl::PermissionDeniedError(
+        "data-node certificate no longer matches its committed binding");
+  }
+  return *captured;
+}
+
+detail::MetaDataPublicationViewCache::MetaDataPublicationViewCache(
+    Loader loader)
     : loader_(std::move(loader)) {}
 
-std::shared_ptr<const MetaCommittedView> detail::MetaCommittedViewCache::Adopt(
-    MetaCommittedView view) {
-  if (cached_ == nullptr || view.applied_index() >= cached_->applied_index()) {
-    cached_ = std::make_shared<const MetaCommittedView>(std::move(view));
+std::shared_ptr<const MetaDataPublicationView>
+detail::MetaDataPublicationViewCache::Adopt(MetaDataPublicationView view) {
+  if (cached_ == nullptr ||
+      view.state_change_index() >= cached_->state_change_index()) {
+    cached_ = std::make_shared<const MetaDataPublicationView>(std::move(view));
   }
   return cached_;
 }
 
-absl::StatusOr<std::shared_ptr<const MetaCommittedView>>
-detail::MetaCommittedViewCache::Get(std::uint64_t minimum_applied_index) {
-  if (cached_ != nullptr && cached_->applied_index() >= minimum_applied_index) {
+absl::StatusOr<std::shared_ptr<const MetaDataPublicationView>>
+detail::MetaDataPublicationViewCache::Get(
+    std::uint64_t minimum_state_change_index) {
+  if (cached_ != nullptr &&
+      cached_->state_change_index() >= minimum_state_change_index) {
     return cached_;
   }
-  auto loaded = std::make_shared<const MetaCommittedView>(loader_());
-  if (loaded->applied_index() < minimum_applied_index) {
+  auto loaded = std::make_shared<const MetaDataPublicationView>(loader_());
+  if (loaded->state_change_index() < minimum_state_change_index) {
     return absl::InternalError(
         "atomic committed view fell behind its published high-water");
   }
@@ -563,11 +598,6 @@ bool detail::TransferBoundaryNeedsProjectionValidation(
     std::uint64_t validated_index) noexcept {
   return published_index > validated_index ||
          committed_high_water > validated_index;
-}
-
-void detail::RecordEquivalentTransferBoundary(
-    std::uint64_t applied_index, std::uint64_t* validated_index) noexcept {
-  *validated_index = std::max(*validated_index, applied_index);
 }
 
 detail::MetaPublisherTransferDisposition detail::ClassifyPublisherSupersession(
@@ -1008,9 +1038,9 @@ bool CanRenewDuringLeasePolicyUpdate(const control::FullDesiredState& installed,
 }
 
 absl::StatusOr<std::vector<control::WireMetaEndpoint>>
-BuildCommittedMetaDirectory(const MetaCommittedView& view) {
+BuildCommittedMetaDirectory(const MetaDataPublicationView& view) {
   std::vector<control::WireMetaEndpoint> directory;
-  for (const MetaMemberRecord& member : view.identity().MetaMembers()) {
+  for (const MetaMemberRecord& member : view.meta_members()) {
     if (member.retired_) continue;
     auto endpoint = ParseMetaEndpoint(member);
     if (!endpoint.ok()) return endpoint.status();
@@ -1278,7 +1308,7 @@ struct MetaDataControlServer::Core {
   // Non-owning. MetaCoordinator owns this reconciler and therefore outlives
   // every Core access; keeping this edge non-owning avoids a cycle.
   MetaCoordinator* coordinator_ = nullptr;
-  std::unique_ptr<detail::MetaCommittedViewCache> committed_view_cache_;
+  std::unique_ptr<detail::MetaDataPublicationViewCache> committed_view_cache_;
   std::shared_ptr<MetaObservationStore> observations_;
   MetaDataControlServerOptions options_;
   std::shared_ptr<bycorf::TlsContext> tls_context_;
@@ -1374,7 +1404,9 @@ struct LiveSessionState {
   // projection has been compared with installed_. Heartbeats and update
   // boundaries deny authority if the coordinator high-water advances first,
   // even while the subscription callback is still queued cross-thread.
-  std::uint64_t validated_committed_high_water_ = 0;
+  // Runtime consumers retain the applied cut; freshness comparisons use the
+  // state-change cut so an eventless Install cannot hide behind Advance.
+  MetaCommittedCursor validated_cut_;
   // A separate certificate permits only old-duration renewal during a
   // compatible policy publication. It never makes the projection current for
   // directives/status, and is cleared whenever installed_ changes.
@@ -1409,8 +1441,9 @@ bool StillLeader(const MetaDataControlServer::Core& core, std::uint64_t term) {
          core.server_->leader_term() == static_cast<std::int64_t>(term);
 }
 
-absl::StatusOr<std::shared_ptr<const MetaCommittedView>> CommittedViewAtLeast(
-    MetaDataControlServer::Core& core, std::uint64_t minimum_index) {
+absl::StatusOr<std::shared_ptr<const MetaDataPublicationView>>
+PublicationViewAtLeast(MetaDataControlServer::Core& core,
+                       std::uint64_t minimum_index) {
   if (core.committed_view_cache_ == nullptr) {
     return absl::FailedPreconditionError(
         "data-control committed-view cache is not initialized");
@@ -1421,8 +1454,8 @@ absl::StatusOr<std::shared_ptr<const MetaCommittedView>> CommittedViewAtLeast(
 bool ProjectionCurrent(const LiveSessionState& state) {
   return !state.projection_superseded_ &&
          !CommitPending(*state.commit_signal_,
-                        state.validated_committed_high_water_) &&
-         state.validated_committed_high_water_ >=
+                        state.validated_cut_.state_change_index()) &&
+         state.validated_cut_.state_change_index() >=
              state.core_->coordinator_->CommittedHighWater();
 }
 
@@ -1582,7 +1615,7 @@ struct BudgetedNodeControlBatch final : NodeControlBatch {
 };
 
 absl::StatusOr<BudgetedNodeControlBatch> ProjectNodeBounded(
-    MetaDataControlServer::Core& core, const MetaCommittedView& view,
+    MetaDataControlServer::Core& core, const MetaDataPublicationView& view,
     std::string_view node_id) {
   auto permit =
       core.projection_limiter_->TryAcquire(kProjectionBuildReservationBytes);
@@ -1660,7 +1693,7 @@ absl::StatusOr<MetaMemberIdentity> LocalConfiguredIdentity(
 
 absl::Status ValidateCommittedConfigBindings(
     const std::shared_ptr<MetaRaftConfig>& config,
-    const MetaCommittedView& view) {
+    const MetaDataPublicationView& view) {
   if (config == nullptr) {
     return absl::FailedPreconditionError(
         "Raft has no committed membership configuration");
@@ -1675,9 +1708,9 @@ absl::Status ValidateCommittedConfigBindings(
       return absl::FailedPreconditionError(
           "Raft member has invalid canonical aux identity");
     }
-    const auto committed = view.identity().FindMetaMember(
-        static_cast<std::uint32_t>(member->get_id()));
-    if (!committed.has_value() || committed->retired_ ||
+    const auto committed =
+        view.FindMetaMember(static_cast<std::uint32_t>(member->get_id()));
+    if (committed == nullptr || committed->retired_ ||
         committed->principal_ != identity->principal_ ||
         committed->data_control_endpoint_ != identity->data_control_endpoint_ ||
         committed->ctl_endpoint_ !=
@@ -1694,13 +1727,12 @@ absl::Status ValidateCommittedConfigBindings(
   return absl::OkStatus();
 }
 
-bool ActiveClusterCreateDeclaresNode(const MetaCommittedView& view,
+bool ActiveClusterCreateDeclaresNode(const MetaDataPublicationView& view,
                                      std::string_view node_id) {
-  const auto& lifecycle = view.topology().ClusterLifecycle();
+  const auto& lifecycle = view.lifecycle();
   if (lifecycle.state_ != MetaClusterLifecycle::kCreating) return false;
-  const auto operation =
-      view.operation().FindOperation(lifecycle.root_operation_id_);
-  if (!operation.has_value() ||
+  const auto operation = view.FindOperation(lifecycle.root_operation_id_);
+  if (operation == nullptr ||
       operation->kind_ != kMetaClusterCreateOperationKind ||
       operation->lifecycle_ == MetaOperationLifecycle::kCompleted ||
       operation->lifecycle_ == MetaOperationLifecycle::kAborted) {
@@ -1730,8 +1762,8 @@ bycorf::Task<absl::Status> ReconcileLocalMetaMember(
       // Membership reconciliation owns every BindMetaMember effect. The Data
       // publisher only opens after the complete config descriptor and
       // committed identity directory agree, including remote endpoints.
-      auto view =
-          CommittedViewAtLeast(*core, core->coordinator_->CommittedHighWater());
+      auto view = PublicationViewAtLeast(
+          *core, core->coordinator_->CommittedHighWater());
       status = view.ok() ? ValidateCommittedConfigBindings(config, **view)
                          : view.status();
     }
@@ -1780,8 +1812,8 @@ absl::Status ValidateHello(const control::ClientHello& hello) {
 }
 
 control::ServiceDeclaration CommittedClientService(
-    const MetaCommittedView& view) {
-  const auto& lifecycle = view.topology().ClusterLifecycle();
+    const MetaDataPublicationView& view) {
+  const auto& lifecycle = view.lifecycle();
   return {lifecycle.client_mode_, lifecycle.root_operation_id_,
           lifecycle.genesis_commit_index_};
 }
@@ -1860,13 +1892,13 @@ bycorf::Task<absl::Status> SendFullState(
     std::uint64_t term) {
   if (batch == nullptr)
     co_return absl::InvalidArgumentError("bootstrap batch is empty");
-  std::uint64_t validated_index = batch->full_state.control_revision;
+  std::uint64_t validated_index = batch->state_change_index;
   const auto validate = [&]() -> absl::Status {
     if (!AuthoritySessionsAllowed(*core, term))
       return absl::CancelledError("Meta leadership ended during bootstrap");
     const auto high_water = core->coordinator_->CommittedHighWater();
     if (high_water <= validated_index) return absl::OkStatus();
-    auto view = CommittedViewAtLeast(*core, high_water);
+    auto view = PublicationViewAtLeast(*core, high_water);
     if (!view.ok()) return view.status();
     auto latest = ProjectNodeBounded(*core, **view, node_id);
     if (!latest.ok()) return latest.status();
@@ -1875,7 +1907,7 @@ bycorf::Task<absl::Status> SendFullState(
         MetaReplacementDisposition::kContinue)
       return absl::AbortedError(
           "bootstrap control was superseded before delivery");
-    validated_index = (*view)->applied_index();
+    validated_index = (*view)->state_change_index();
     return absl::OkStatus();
   };
   const std::string_view bytes = batch->encoded_full_state;
@@ -1942,7 +1974,7 @@ bycorf::Task<absl::Status> ValidateBootstrapApplied(
     std::string_view boot_id, const control::WireId128& session_id,
     std::uint64_t leader_term, SessionCommitSignal& commit_signal,
     const MetaCommitSubscription& commit_subscription,
-    std::uint64_t* validated_committed_high_water,
+    MetaCommittedCursor* validated_cut,
     std::deque<control::WireMessage>* deferred,
     std::size_t max_deferred_messages,
     std::vector<control::WireAuthorityAnchor>* fenced) {
@@ -1961,9 +1993,9 @@ bycorf::Task<absl::Status> ValidateBootstrapApplied(
   // changes concurrent with delivery now fence or close the installed session
   // before it can receive new authority.
   const std::uint64_t high_water = core->coordinator_->CommittedHighWater();
-  auto cached_view = CommittedViewAtLeast(*core, high_water);
+  auto cached_view = PublicationViewAtLeast(*core, high_water);
   if (!cached_view.ok()) co_return cached_view.status();
-  const MetaCommittedView& view = **cached_view;
+  const MetaDataPublicationView& view = **cached_view;
   auto latest = ProjectNodeBounded(*core, view, node_id);
   const control::FullDesiredState* latest_state =
       latest.ok() ? &latest->full_state : nullptr;
@@ -1984,7 +2016,7 @@ bycorf::Task<absl::Status> ValidateBootstrapApplied(
     co_return absl::AbortedError(
         "bootstrap state changed concurrently with installation");
   }
-  *validated_committed_high_water = view.applied_index();
+  *validated_cut = {view.applied_index(), view.state_change_index()};
   co_return absl::OkStatus();
 }
 
@@ -2124,7 +2156,7 @@ bycorf::Task<absl::StatusOr<MetaReplacementDisposition>>
 CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
                           const NodeControlBatch& installed,
                           const NodeControlBatch& replacement,
-                          std::uint64_t* publication_high_water) {
+                          MetaCommittedCursor* publication_cut) {
   if (!AuthoritySessionsAllowed(*state->core_, state->leader_term_)) {
     co_return absl::CancelledError(
         "Meta authority is unavailable during FullDesiredState publication");
@@ -2140,13 +2172,13 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
   const std::uint64_t published_index =
       state->commit_signal_->published_index_.load(std::memory_order_acquire);
   if (!detail::TransferBoundaryNeedsProjectionValidation(
-          published_index, high_water, *publication_high_water)) {
+          published_index, high_water, publication_cut->state_change_index())) {
     co_return MetaReplacementDisposition::kContinue;
   }
 
-  auto cached_view = CommittedViewAtLeast(*state->core_, high_water);
+  auto cached_view = PublicationViewAtLeast(*state->core_, high_water);
   if (!cached_view.ok()) co_return cached_view.status();
-  const MetaCommittedView& view = **cached_view;
+  const MetaDataPublicationView& view = **cached_view;
   auto latest = ProjectNodeBounded(*state->core_, view, state->node_id_);
   const control::FullDesiredState* latest_state =
       latest.ok() ? &latest->full_state : nullptr;
@@ -2154,7 +2186,7 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
       latest.ok() &&
               CanRenewDuringLeasePolicyUpdate(
                   installed.full_state, latest->full_state, state->node_id_)
-          ? view.applied_index()
+          ? view.state_change_index()
           : 0;
   if (absl::Status fenced =
           co_await FenceSupersededAuthorityLive(state, installed, latest_state);
@@ -2168,8 +2200,7 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
     // The transferred object has its own validation cursor. Advancing the
     // installed cursor here could hide a required retry if this transfer is
     // subsequently aborted before Data can apply it.
-    detail::RecordEquivalentTransferBoundary(view.applied_index(),
-                                             publication_high_water);
+    *publication_cut = {view.applied_index(), view.state_change_index()};
   }
   co_return disposition;
 }
@@ -2179,7 +2210,7 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
                       const NodeControlBatch& installed,
                       const NodeControlBatch& replacement,
                       const control::NodeControlUpdate& update,
-                      std::uint64_t* publication_high_water) {
+                      MetaCommittedCursor* publication_cut) {
   auto encoded = control::EncodeNodeControlUpdate(update);
   if (!encoded.ok()) co_return encoded.status();
   const std::string_view bytes = *encoded;
@@ -2194,7 +2225,7 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
 
   if (bytes.size() <= control::kMaxFramePayloadBytes) {
     auto boundary = co_await CheckLiveTransferBoundary(
-        state, installed, replacement, publication_high_water);
+        state, installed, replacement, publication_cut);
     if (!boundary.ok()) co_return boundary.status();
     if (*boundary == MetaReplacementDisposition::kAbortSuperseded) {
       co_return detail::ClassifyPublisherSupersession(
@@ -2225,7 +2256,7 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
       co_return sent;
     }
     boundary = co_await CheckLiveTransferBoundary(state, installed, replacement,
-                                                  publication_high_water);
+                                                  publication_cut);
     if (!boundary.ok()) {
       ClearPublisherApplied(state);
       co_return boundary.status();
@@ -2259,7 +2290,7 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
   }
 
   auto boundary = co_await CheckLiveTransferBoundary(
-      state, installed, replacement, publication_high_water);
+      state, installed, replacement, publication_cut);
   if (!boundary.ok()) {
     co_return boundary.status();
   }
@@ -2287,8 +2318,15 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
         !sent.ok()) {
       co_return sent;
     }
+    LAVIK_FAULT_INJECT({
+      // Exercise a real committed-view replacement after one visible chunk,
+      // before the next validation can authorize any TransferEnd.
+      auto paused = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_TEST_META_PUBLICATION_CHUNK_HOLD_FILE");
+      if (!paused.ok()) co_return paused;
+    });
     boundary = co_await CheckLiveTransferBoundary(state, installed, replacement,
-                                                  publication_high_water);
+                                                  publication_cut);
     if (!boundary.ok()) {
       co_return boundary.status();
     }
@@ -2324,7 +2362,7 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
     co_return sent;
   }
   boundary = co_await CheckLiveTransferBoundary(state, installed, replacement,
-                                                publication_high_water);
+                                                publication_cut);
   if (!boundary.ok()) {
     ClearPublisherApplied(state);
     co_return boundary.status();
@@ -2361,15 +2399,15 @@ bycorf::Task<absl::Status> SessionPublisherBody(
     const std::uint64_t high_water =
         state->core_->coordinator_->CommittedHighWater();
     if (!CommitPending(*state->commit_signal_,
-                       state->validated_committed_high_water_) &&
-        state->validated_committed_high_water_ >= high_water) {
+                       state->validated_cut_.state_change_index()) &&
+        state->validated_cut_.state_change_index() >= high_water) {
       co_await state->commit_signal_->changed_.Wait();
       continue;
     }
 
-    auto cached_view = CommittedViewAtLeast(*state->core_, high_water);
+    auto cached_view = PublicationViewAtLeast(*state->core_, high_water);
     if (!cached_view.ok()) co_return cached_view.status();
-    const MetaCommittedView& view = **cached_view;
+    const MetaDataPublicationView& view = **cached_view;
     auto latest = ProjectNodeBounded(*state->core_, view, state->node_id_);
     std::shared_ptr<const NodeControlBatch> installed = state->installed_;
     const control::FullDesiredState* latest_state =
@@ -2378,7 +2416,7 @@ bycorf::Task<absl::Status> SessionPublisherBody(
         latest.ok() &&
                 CanRenewDuringLeasePolicyUpdate(
                     installed->full_state, latest->full_state, state->node_id_)
-            ? view.applied_index()
+            ? view.state_change_index()
             : 0;
     if (!latest.ok() ||
         EvaluateNodeReplacement(installed->full_state, latest->full_state,
@@ -2396,11 +2434,10 @@ bycorf::Task<absl::Status> SessionPublisherBody(
                                 state->node_id_) ==
         MetaReplacementDisposition::kContinue) {
       // No selected object changed. Advance only Meta's validation cursor.
-      state->validated_committed_high_water_ = std::max(
-          state->validated_committed_high_water_, view.applied_index());
+      state->validated_cut_ = {view.applied_index(), view.state_change_index()};
       state->core_->options_.runtime_status_->MarkValidated(
           state->node_id_, state->session_id_,
-          state->validated_committed_high_water_);
+          state->validated_cut_.applied_index());
       state->projection_superseded_ = false;
       continue;
     }
@@ -2417,9 +2454,10 @@ bycorf::Task<absl::Status> SessionPublisherBody(
     // This exact committed view was just projected and compared. Neither
     // transfer boundaries nor Applied need to rebuild it unless a newer
     // commit arrives. The cursor is local to this replacement, not installed_.
-    std::uint64_t publication_high_water = view.applied_index();
-    auto published = co_await SendControlUpdateLive(
-        state, *installed, *latest, update, &publication_high_water);
+    MetaCommittedCursor publication_cut{view.applied_index(),
+                                        view.state_change_index()};
+    auto published = co_await SendControlUpdateLive(state, *installed, *latest,
+                                                    update, &publication_cut);
     if (!published.ok()) {
       co_return published.status();
     }
@@ -2459,11 +2497,11 @@ bycorf::Task<absl::Status> SessionPublisherBody(
     if (detail::TransferBoundaryNeedsProjectionValidation(
             state->commit_signal_->published_index_.load(
                 std::memory_order_acquire),
-            stable_high_water, publication_high_water)) {
+            stable_high_water, publication_cut.state_change_index())) {
       auto cached_stable_view =
-          CommittedViewAtLeast(*state->core_, stable_high_water);
+          PublicationViewAtLeast(*state->core_, stable_high_water);
       if (!cached_stable_view.ok()) co_return cached_stable_view.status();
-      const MetaCommittedView& stable_view = **cached_stable_view;
+      const MetaDataPublicationView& stable_view = **cached_stable_view;
       auto stable =
           ProjectNodeBounded(*state->core_, stable_view, state->node_id_);
       if (!stable.ok() ||
@@ -2471,16 +2509,16 @@ bycorf::Task<absl::Status> SessionPublisherBody(
                                   stable->full_state, state->node_id_) ==
               MetaReplacementDisposition::kAbortSuperseded)
         continue;
-      publication_high_water = stable_view.applied_index();
+      publication_cut = {stable_view.applied_index(),
+                         stable_view.state_change_index()};
     }
-    state->validated_committed_high_water_ = std::max(
-        state->validated_committed_high_water_, publication_high_water);
+    state->validated_cut_ = publication_cut;
     state->projection_superseded_ = false;
     state->core_->options_.runtime_status_->PublishCurrent(
         state->node_id_, state->boot_id_, state->session_id_,
         state->replication_history_id_, state->replication_flow_count_,
         state->session_generation_, state->leader_term_,
-        state->validated_committed_high_water_, state->installed_->full_state);
+        state->validated_cut_.applied_index(), state->installed_->full_state);
   }
   co_return absl::CancelledError(
       "data-control publisher stopped with its leader term");
@@ -2522,9 +2560,8 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
       result.identity.attempt_id,
       result.identity.directive_revision,
   };
-  auto view = core->coordinator_->CommittedView();
-  if (const auto receipt = view.operation().FindTerminalReceipt(key);
-      receipt.has_value()) {
+  auto result_view = core->coordinator_->CaptureDirectiveResult(key);
+  if (const auto& receipt = result_view.receipt_; receipt.has_value()) {
     if (!ReceiptMatches(*receipt, result, node_id, boot_id)) {
       co_return absl::AlreadyExistsError(
           "directive result conflicts with its committed receipt");
@@ -2533,8 +2570,7 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
         control::MessagePriority::kReliable,
         control::WireMessage(ResultAck(result, *receipt)));
   }
-  const auto operation =
-      view.operation().FindOperation(result.identity.operation_id);
+  const auto& operation = result_view.operation_;
   const MetaCurrentDirective* tracked = nullptr;
   if (operation.has_value() && !IsTerminal(operation->lifecycle_)) {
     const auto match = std::find_if(
@@ -2601,6 +2637,9 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
       .status_ = status,
       .result_ = result.result,
   };
+  // The command owns everything needed across Propose's suspension. Do not
+  // retain a potentially large operation throughout the Raft round trip.
+  result_view = {};
   LAVIK_FAULT_INJECT({
     auto paused = co_await fault_injection::PauseWhileFileExists(
         "LAVIK_TEST_META_DIRECTIVE_RESULT_HOLD_FILE");
@@ -2619,8 +2658,7 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
     co_return absl::CancelledError("directive result session is retired");
   }
 
-  view = core->coordinator_->CommittedView();
-  const auto receipt = view.operation().FindTerminalReceipt(key);
+  const auto receipt = core->coordinator_->FindTerminalReceipt(key);
   if (!receipt.has_value()) {
     // An accepted Raft index with a domain rejection means the operation no
     // longer tracks this attempt. An uncertain proposal status was returned
@@ -2783,7 +2821,7 @@ bycorf::Task<absl::Status> RunEstablishedSession(
               *owner_projection);
       const std::uint64_t committed_high_water =
           state->core_->coordinator_->CommittedHighWater();
-      if (committed_high_water > state->validated_committed_high_water_ &&
+      if (committed_high_water > state->validated_cut_.state_change_index() &&
           PublishCommitIndex(*state->commit_signal_, committed_high_water)) {
         // Snapshot install has no per-entry subscription callback. A live
         // heartbeat that detects its synchronous store watermark wakes the
@@ -2792,10 +2830,10 @@ bycorf::Task<absl::Status> RunEstablishedSession(
         state->commit_signal_->changed_.NotifyAll(*state->worker_);
       }
       auto cached_view =
-          CommittedViewAtLeast(*state->core_, committed_high_water);
+          PublicationViewAtLeast(*state->core_, committed_high_water);
       if (!cached_view.ok()) co_return cached_view.status();
-      const MetaCommittedView& latest_view = **cached_view;
-      MetaStoresFacts facts(latest_view.stores());
+      const MetaDataPublicationView& latest_view = **cached_view;
+      const MetaCommittedFacts& facts = latest_view;
       const std::int64_t heartbeat_received_unix_ms = NowUnixMillis();
       const std::int64_t heartbeat_received_lease_ms =
           cluster::LeaseClockMillis();
@@ -3189,8 +3227,8 @@ MetaDataControlServer::Create(
   core->server_ = std::move(server);
   core->coordinator_ = &coordinator;
   core->committed_view_cache_ =
-      std::make_unique<detail::MetaCommittedViewCache>(
-          [&coordinator] { return coordinator.CommittedView(); });
+      std::make_unique<detail::MetaDataPublicationViewCache>(
+          [&coordinator] { return coordinator.DataPublication(); });
   core->observations_ = std::move(observations);
   core->options_ = std::move(options);
   if (core->options_.runtime_status_ == nullptr) {
@@ -3364,19 +3402,21 @@ void MetaDataControlServer::StartOnExecutor(MetaLeaderContext* context) {
         if (core->worker_ == nullptr) core->worker_ = worker;
         auto commit_signal = std::make_shared<SessionCommitSignal>();
         bycorf::ForeignExecutor commit_executor = core->foreign_executor_;
-        MetaSubscriptionStart commit_start = context->SubscribeCommitted(
-            [commit_signal, commit_executor,
-             worker](const MetaCommitEvent& event) mutable {
-              if (PublishCommitIndex(*commit_signal, event.log_index_) &&
-                  !commit_executor.Notify([commit_signal, worker]() noexcept {
-                    commit_signal->changed_.NotifyAll(*worker);
-                  })) {
-                commit_signal->delivery_failed_.store(
-                    true, std::memory_order_release);
-              }
-            });
+        MetaDataPublicationSubscriptionStart commit_start =
+            context->SubscribeDataPublication(
+                [commit_signal, commit_executor,
+                 worker](const MetaCommitEvent& event) mutable {
+                  if (PublishCommitIndex(*commit_signal, event.log_index_) &&
+                      !commit_executor.Notify(
+                          [commit_signal, worker]() noexcept {
+                            commit_signal->changed_.NotifyAll(*worker);
+                          })) {
+                    commit_signal->delivery_failed_.store(
+                        true, std::memory_order_release);
+                  }
+                });
         (void)PublishCommitIndex(*commit_signal,
-                                 commit_start.view_.applied_index());
+                                 commit_start.view_.state_change_index());
         core->committed_view_cache_->Adopt(std::move(commit_start.view_));
         core->leader_commit_subscription_ =
             std::shared_ptr<MetaCommitSubscription>(
@@ -3612,7 +3652,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
     // This branch deliberately precedes node-slot claims, session adoption,
     // projections and lease installation. Storage/history do not exist yet.
     auto captured =
-        CommittedViewAtLeast(*core, core->coordinator_->CommittedHighWater());
+        PublicationViewAtLeast(*core, core->coordinator_->CommittedHighWater());
     if (!captured.ok()) co_return finish(captured.status());
     const auto& view = **captured;
     auto directory = BuildCommittedMetaDirectory(view);
@@ -3622,7 +3662,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
     control::BootstrapReply reply;
     reply.server = BuildServerHello(*core, std::move(*directory),
                                     CommittedClientService(view), leader);
-    const auto node = view.identity().FindNode(bootstrap->node_id);
+    const auto node = view.FindNode(bootstrap->node_id);
     const bool wrong_identity =
         tls_identity &&
         (tls_identity->subject_id_ != bootstrap->node_id ||
@@ -3670,12 +3710,12 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   }
 
   auto cached_view =
-      CommittedViewAtLeast(*core, core->coordinator_->CommittedHighWater());
+      PublicationViewAtLeast(*core, core->coordinator_->CommittedHighWater());
   if (!cached_view.ok()) co_return finish(cached_view.status());
-  std::shared_ptr<const MetaCommittedView> view = *cached_view;
-  const auto node = view->identity().FindNode(node_id);
-  if (!node.has_value() || node->retired_) {
-    if (!node.has_value() && ActiveClusterCreateDeclaresNode(*view, node_id)) {
+  std::shared_ptr<const MetaDataPublicationView> view = *cached_view;
+  const auto node = view->FindNode(node_id);
+  if (node == nullptr || node->retired_) {
+    if (node == nullptr && ActiveClusterCreateDeclaresNode(*view, node_id)) {
       core->options_.runtime_status_->NoteUnregisteredRetry(node_id,
                                                             core->leader_term_);
     }
@@ -3747,29 +3787,14 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
     co_return finish(
         absl::CancelledError("Meta leadership subscription is unavailable"));
   }
-  cached_view =
-      CommittedViewAtLeast(*core, core->coordinator_->CommittedHighWater());
-  if (!cached_view.ok()) co_return finish(cached_view.status());
-  view = *cached_view;
-  if (CommittedClientService(*view) != committed_service) {
-    co_return finish(absl::FailedPreconditionError(
-        "cluster service declaration changed during handshake"));
-  }
-
   // The first registry/directory read was sufficient for a follower redirect,
   // but an accepted session must bind its identity and Hello to the same
   // atomic view used by its initial desired-state projection.
-  const auto accepted_node = view->identity().FindNode(node_id);
-  if (!accepted_node.has_value() || accepted_node->retired_) {
-    co_return finish(absl::PermissionDeniedError(
-        "data node left the active committed registry during handshake"));
-  }
-  if (tls_identity.has_value() &&
-      (tls_identity->subject_id_ != node_id ||
-       tls_identity->principal_ != accepted_node->principal_)) {
-    co_return finish(absl::PermissionDeniedError(
-        "data-node certificate no longer matches its committed binding"));
-  }
+  cached_view = detail::RefreshAcceptedDataPublication(
+      *core->committed_view_cache_, core->coordinator_->CommittedHighWater(),
+      node_id, committed_service, tls_identity ? &*tls_identity : nullptr);
+  if (!cached_view.ok()) co_return finish(cached_view.status());
+  view = *cached_view;
   directory = BuildCommittedMetaDirectory(*view);
   if (!directory.ok()) co_return finish(directory.status());
   auto boot_id = ParseIdentity<20>(hello->boot_id, "data boot id");
@@ -3800,6 +3825,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   std::shared_ptr<const NodeControlBatch> batch =
       RetainProjection(std::move(*projected));
   view.reset();
+  cached_view->reset();
   auto session_id = control::GenerateId128();
   if (!session_id.ok()) co_return finish(session_id.status());
   status_session_id = *session_id;
@@ -3837,11 +3863,11 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   if (absl::Status applied = co_await AwaitApplied(io, *batch); !applied.ok()) {
     co_return finish(applied, true);
   }
-  std::uint64_t validated_committed_high_water = 0;
+  MetaCommittedCursor validated_cut;
   if (absl::Status current = co_await ValidateBootstrapApplied(
           core, io, *batch, node_id, hello->boot_id, *session_id, leader_term,
-          *commit_signal, *commit_subscription, &validated_committed_high_water,
-          &deferred, max_deferred_messages, &fenced_authorities);
+          *commit_signal, *commit_subscription, &validated_cut, &deferred,
+          max_deferred_messages, &fenced_authorities);
       !current.ok()) {
     co_return finish(current);
   }
@@ -3864,7 +3890,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   live->installed_ = std::move(batch);
   live->selected_ =
       control::SelectNodeControlState(live->installed_->full_state, node_id);
-  live->validated_committed_high_water_ = validated_committed_high_water;
+  live->validated_cut_ = validated_cut;
   live->fenced_authorities_ = std::move(fenced_authorities);
   const std::weak_ptr<LiveSessionState> weak_live = live;
   live->fence_ack_deadline_ =
@@ -3900,7 +3926,7 @@ bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
   core->options_.runtime_status_->PublishCurrent(
       node_id, hello->boot_id, *session_id, *replication_history_id,
       hello->replication_flow_count, session_generation, leader_term,
-      live->validated_committed_high_water_, live->installed_->full_state);
+      live->validated_cut_.applied_index(), live->installed_->full_state);
   core->accepted_sessions_.fetch_add(1, std::memory_order_relaxed);
   core->active_sessions_.fetch_add(1, std::memory_order_relaxed);
   accepted_session = true;

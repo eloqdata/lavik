@@ -115,6 +115,7 @@
 #include "bycorf/runtime/foreign_executor.h"
 #include "bycorf/runtime/task.h"
 #include "lavik/meta/commands.h"
+#include "lavik/meta/data_publication_view.h"
 #include "lavik/meta/failover_views.h"
 #include "lavik/meta/observation_facts_view.h"
 #include "lavik/meta/observation_store.h"
@@ -302,6 +303,8 @@ struct MetaSubscriptionStartFor {
 };
 
 using MetaSubscriptionStart = MetaSubscriptionStartFor<MetaCommittedView>;
+using MetaDataPublicationSubscriptionStart =
+    MetaSubscriptionStartFor<MetaDataPublicationView>;
 using MetaObservationSubscriptionStart =
     MetaSubscriptionStartFor<MetaObservationFactsView>;
 using MetaCursorSubscriptionStart =
@@ -380,6 +383,10 @@ class MetaLeaderContext {
   std::uint64_t AppliedIndex() const;
   MetaSubscriptionStart SubscribeCommitted(MetaCommitCallback callback,
                                            std::size_t queue_capacity = 0);
+  // Publication subscribers adopt this owned initial cut into their shared
+  // worker-local cache, preserving the normal no-gap event contract.
+  MetaDataPublicationSubscriptionStart SubscribeDataPublication(
+      MetaCommitCallback callback, std::size_t queue_capacity = 0);
   MetaObservationSubscriptionStart SubscribeObservationFacts(
       MetaCommitCallback callback, std::size_t queue_capacity = 0);
   // Notification-only consumers keep the same event continuity and resync
@@ -531,6 +538,15 @@ class MetaCoordinator {
       const MetaOperationRecord& expected,
       std::span<const std::uint32_t> member_ids) const;
 
+  // Purpose-specific Data reads; each call owns one atomic committed cut.
+  MetaDataPublicationView DataPublication() const;
+  MetaDirectiveResultView CaptureDirectiveResult(
+      const MetaTerminalReceiptKey& key) const;
+  // Exact live/archive lookup after a result proposal; never refreshes
+  // publication.
+  std::optional<MetaTerminalReceipt> FindTerminalReceipt(
+      const MetaTerminalReceiptKey& key) const;
+
   // O(1) full applied cursor, including configuration commits that do not
   // change MetaStores or notify subscribers. This is a freshness hint, not
   // an atomic pairing with a separately captured store snapshot.
@@ -547,6 +563,10 @@ class MetaCoordinator {
   // selects options_.default_subscription_capacity_.
   MetaSubscriptionStart SubscribeCommitted(MetaCommitCallback callback,
                                            std::size_t queue_capacity = 0);
+  // Publication subscribers adopt this owned initial cut into their shared
+  // worker-local cache, preserving the normal no-gap event contract.
+  MetaDataPublicationSubscriptionStart SubscribeDataPublication(
+      MetaCommitCallback callback, std::size_t queue_capacity = 0);
   // Same delivery contract with only the committed facts needed by observation
   // validation. The owned initial view remains valid across later commits.
   MetaObservationSubscriptionStart SubscribeObservationFacts(

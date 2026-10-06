@@ -570,7 +570,8 @@ TEST_F(ClusterCreateTlsRecoveryTest, RecoversRegistrationAndProjectsTlsPorts) {
   EXPECT_EQ(replica->endpoints_,
             (std::vector<std::string>{"tls://127.0.0.1:16372"}));
   const auto projected = MetaControlProjector::ProjectNode(
-      MetaCommittedView(stores_, index_), replica->node_id_);
+      MetaDataPublicationView::FromStores(stores_, {index_, index_}),
+      replica->node_id_);
   ASSERT_TRUE(projected.ok()) << projected.status();
   ASSERT_EQ(projected->full_state.nodes.size(), 4U);
   EXPECT_EQ(projected->full_state.nodes[0].port, 6371);

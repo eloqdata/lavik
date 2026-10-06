@@ -52,6 +52,7 @@ namespace lavik::meta {
 class MetaObservationStore;
 class MetaCommittedFacts;
 struct NodeControlBatch;
+struct MetaPrincipalIdentity;
 
 namespace detail {
 
@@ -195,22 +196,34 @@ class RetainedProjectionLimiter {
 };
 
 // Worker-local immutable view cache shared by all Data sessions. A Meta
-// commit may wake thousands of sessions, but the six committed stores are
-// copied only once for each new applied high-water. Not thread-safe: the
+// commit may wake thousands of sessions, but publication data is captured
+// only once for each new state-change high-water. Applied alone cannot detect
+// Install(N) following configuration-only Advance(N). Not thread-safe: the
 // data-control server owns and accesses it exclusively on its Bycorf worker.
-class MetaCommittedViewCache {
+class MetaDataPublicationViewCache {
  public:
-  using Loader = std::function<MetaCommittedView()>;
+  using Loader = std::function<MetaDataPublicationView()>;
 
-  explicit MetaCommittedViewCache(Loader loader);
-  std::shared_ptr<const MetaCommittedView> Adopt(MetaCommittedView view);
-  absl::StatusOr<std::shared_ptr<const MetaCommittedView>> Get(
-      std::uint64_t minimum_applied_index);
+  explicit MetaDataPublicationViewCache(Loader loader);
+  std::shared_ptr<const MetaDataPublicationView> Adopt(
+      MetaDataPublicationView view);
+  absl::StatusOr<std::shared_ptr<const MetaDataPublicationView>> Get(
+      std::uint64_t minimum_state_change_index);
 
  private:
   Loader loader_;
-  std::shared_ptr<const MetaCommittedView> cached_;
+  std::shared_ptr<const MetaDataPublicationView> cached_;
 };
+
+// Rechecks the first Hello's service and authenticated identity against the
+// refreshed cut returned for the accepted directory and projection. The view
+// owns its data; tls_identity is borrowed only for this call (null: plaintext).
+absl::StatusOr<std::shared_ptr<const MetaDataPublicationView>>
+RefreshAcceptedDataPublication(
+    MetaDataPublicationViewCache& cache,
+    std::uint64_t minimum_state_change_index, std::string_view node_id,
+    const cluster::control::ServiceDeclaration& expected_service,
+    const MetaPrincipalIdentity* tls_identity);
 
 // Transfer chunks consult this predicate before rebuilding a node projection.
 // Recording an equivalent committed view makes the remaining chunks O(1)
@@ -218,8 +231,6 @@ class MetaCommittedViewCache {
 bool TransferBoundaryNeedsProjectionValidation(
     std::uint64_t published_index, std::uint64_t committed_high_water,
     std::uint64_t validated_index) noexcept;
-void RecordEquivalentTransferBoundary(std::uint64_t applied_index,
-                                      std::uint64_t* validated_index) noexcept;
 
 enum class MetaPublisherTransferDisposition : std::uint8_t {
   kApplied,
@@ -541,7 +552,7 @@ class MetaLeaderRuntimeGuard {
 // Builds the redirect/Hello directory solely from committed, active Meta
 // member records. Malformed committed endpoints fail closed.
 absl::StatusOr<std::vector<cluster::control::WireMetaEndpoint>>
-BuildCommittedMetaDirectory(const MetaCommittedView& view);
+BuildCommittedMetaDirectory(const MetaDataPublicationView& view);
 
 // Returns installed local-primary authority anchors that no longer exist
 // unchanged in `latest`, excluding anchors already fenced in this session.

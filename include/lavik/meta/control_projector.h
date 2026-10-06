@@ -19,9 +19,9 @@
 // Pure committed-state projection for the Meta -> Data control plane.
 //
 // This module deliberately stops before transport/session concerns: callers
-// give it one atomic MetaCommittedView and receive canonical FullDesiredState
-// bytes that can be published or chunked later. It performs no I/O and owns
-// no mutable state.
+// give it one atomic MetaDataPublicationView and receive canonical
+// FullDesiredState bytes that can be published or chunked later. It performs no
+// I/O and owns no mutable state.
 
 #include <cstddef>
 #include <string>
@@ -29,13 +29,17 @@
 
 #include "absl/status/statusor.h"
 #include "lavik/cluster/control_protocol.h"
-#include "lavik/meta/coordinator.h"
+#include "lavik/meta/data_publication_view.h"
 
 namespace lavik::meta {
 
 struct NodeControlBatch {
   cluster::control::FullDesiredState full_state;
   std::string encoded_full_state;
+
+  // Local publication proof, never encoded. Configuration-only Advance can
+  // put control_revision ahead of the state represented by this batch.
+  std::uint64_t state_change_index = 0;
 
   bool operator==(const NodeControlBatch&) const = default;
 };
@@ -57,7 +61,7 @@ class MetaControlProjector {
   // produce a challenge. The leader publisher may only lower the projected
   // ceiling to its local leadership-validity limit.
   static absl::StatusOr<NodeControlBatch> ProjectNode(
-      const MetaCommittedView& view, std::string_view node_id);
+      const MetaDataPublicationView& view, std::string_view node_id);
 };
 
 }  // namespace lavik::meta
