@@ -740,6 +740,10 @@ bool MetaTopologyStore::GroupExists(const std::string& group_id) const {
   return groups_.contains(group_id);
 }
 
+std::vector<std::string> MetaTopologyStore::SlotOwners() const {
+  return {slots_.begin(), slots_.end()};
+}
+
 std::vector<MetaSlotAssignment> MetaTopologyStore::SlotRanges() const {
   std::vector<MetaSlotAssignment> ranges;
   for (std::uint32_t first = 0; first < kMetaSlotCount;) {

@@ -18,11 +18,8 @@ bool IsTerminal(MetaOperationLifecycle lifecycle) {
 
 std::optional<std::string_view> MetaSlotMapCheckView::SlotOwner(
     std::uint32_t slot) const {
-  const auto it = std::lower_bound(
-      slots_.begin(), slots_.end(), slot,
-      [](const auto& range, auto index) { return range.last_slot_ < index; });
-  if (it == slots_.end() || slot < it->first_slot_) return std::nullopt;
-  return it->group_id_;
+  if (slot >= slots_.size() || slots_[slot].empty()) return std::nullopt;
+  return slots_[slot];
 }
 
 MetaAdminGroupView MetaStateMachine::CaptureAdminGroup(
@@ -107,7 +104,7 @@ MetaSlotMapCheckView MetaStateMachine::CaptureSlotMapCheck(
   return {{last_committed_idx_.load(), last_state_change_idx_.load()},
           stores_.topology_.TopologyEpoch(),
           stores_.topology_.GroupExists(group_id),
-          stores_.topology_.SlotRanges()};
+          stores_.topology_.SlotOwners()};
 }
 
 MetaCurrentPolicyView MetaStateMachine::CaptureCurrentPolicy(

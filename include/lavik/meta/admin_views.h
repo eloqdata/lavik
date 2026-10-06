@@ -17,9 +17,10 @@
 
 namespace lavik::meta {
 
-// Owned Admin inputs. Each capture pairs all its records with one committed
-// cursor; no pointer refers to live state. Consumers perform validation and
-// encoding after capture and acquire a new cut for post-proposal checks.
+// Owned Admin inputs captured from one committed cut; readers that need a
+// cursor retain it with their records. No pointer refers to live state.
+// Consumers validate and encode after capture and acquire a new cut for
+// post-proposal checks.
 struct MetaAdminGroupView {
   MetaCommittedCursor cursor_;
   MetaClusterLifecycleState lifecycle_;
@@ -67,7 +68,10 @@ struct MetaSlotMapCheckView {
   MetaCommittedCursor cursor_;
   std::uint64_t topology_epoch_ = 0;
   bool group_exists_ = false;
-  std::vector<MetaSlotAssignment> slots_;
+  // Slot-indexed ownership, with an empty string for an unassigned slot.
+  // Keep the store's representation so capture does not compress fragmented
+  // ranges under the state lock and completion checks can use direct indexing.
+  std::vector<std::string> slots_;
   // Returns the owner borrowed from this view, or nullopt for an unassigned
   // slot. The result is valid only while this view and its slots_ are
   // unchanged.
