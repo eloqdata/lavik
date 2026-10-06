@@ -738,7 +738,7 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
     if (floor && !replaces_route && floor->id_.last() >= id.prefix_) {
       return absl::DataLossError("group update overlaps an earlier route");
     }
-    const auto inserted = next.groups_.Set(id.prefix_, change);
+    const auto inserted = next.groups_.SetBuffered(id.prefix_, change);
     if (!inserted.ok()) return inserted;
     // Replacing the exact interval cannot change either neighbour boundary.
     if (!replaces_route) {

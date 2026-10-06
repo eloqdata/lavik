@@ -396,8 +396,18 @@ class HashGroupMap {
     return &found->entry_.second;
   }
   absl::Status Set(Key key, RecoveredHashGroup value) {
+    if (overlay_ && overlay_->Find(key)) return SetBuffered(key, value);
+    auto next = SetNode(root_, key, value);
+    if (!next.ok()) return next.status();
+    root_ = std::move(*next);
+    return absl::OkStatus();
+  }
+  // Amortize repeated replacements in large maps. Small maps keep ordinary
+  // path copies, which cost less than a fixed-capacity overlay. Bulk recovery
+  // uses Set directly and pays no extra existence lookup for each insertion.
+  absl::Status SetBuffered(Key key, RecoveredHashGroup value) {
     const auto* current = overlay_ ? overlay_->Find(key) : nullptr;
-    if (current || GetBase(key)) {
+    if (current || (size() >= 64 && GetBase(key))) {
       if (!current && overlay_ && overlay_->size_ == Overlay::kCapacity) {
         // Fold all pending replacements together. Dispersed writes still
         // share ancestor copies, instead of paying for a full path plus an
@@ -432,10 +442,7 @@ class HashGroupMap {
       overlay_ = std::move(*overlay);
       return absl::OkStatus();
     }
-    auto next = SetNode(root_, key, value);
-    if (!next.ok()) return next.status();
-    root_ = std::move(*next);
-    return absl::OkStatus();
+    return Set(key, value);
   }
   absl::Status Erase(Key key) {
     auto next = EraseNode(root_, key);

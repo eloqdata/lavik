@@ -788,7 +788,7 @@ TEST(HashGroupMapTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
       ASSERT_TRUE(map.Erase(key).ok());
       expected.erase(key);
     } else {
-      ASSERT_TRUE(map.Set(key, {.sequence_ = revision}).ok());
+      ASSERT_TRUE(map.SetBuffered(key, {.sequence_ = revision}).ok());
       expected[key] = revision;
     }
     check(map, expected);
@@ -802,22 +802,22 @@ TEST_F(HashLookupMemoryTest, RoutingUpdatesAdmitMemoryAndFailAtomically) {
   const auto before = GetWorkerMemoryStats(0);
   {
     HashGroupMap<std::uint64_t> map;
-    for (unsigned key = 0; key < 32; ++key)
-      ASSERT_TRUE(map.Set(key, {.sequence_ = 1}).ok());
+    for (unsigned key = 0; key < 128; ++key)
+      ASSERT_TRUE(map.SetBuffered(key, {.sequence_ = 1}).ok());
     auto original = map;
     for (unsigned key = 0; key < 8; ++key)
-      ASSERT_TRUE(map.Set(key, {.sequence_ = 2}).ok());
+      ASSERT_TRUE(map.SetBuffered(key, {.sequence_ = 2}).ok());
     auto snapshot = map;
     const auto retained = GetWorkerMemoryStats(0).retained_bytes_;
     ASSERT_GT(retained, before.retained_bytes_);
     ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
-    for (unsigned key : {0, 8, 32}) {
-      EXPECT_EQ(map.Set(key, {.sequence_ = 3}).code(),
+    for (unsigned key : {0, 8, 128}) {
+      EXPECT_EQ(map.SetBuffered(key, {.sequence_ = 3}).code(),
                 absl::StatusCode::kResourceExhausted);
       EXPECT_EQ(map.Erase(key).code(), absl::StatusCode::kResourceExhausted);
     }
-    EXPECT_EQ(map.size(), 32);
-    for (unsigned key = 0; key < 32; ++key) {
+    EXPECT_EQ(map.size(), 128);
+    for (unsigned key = 0; key < 128; ++key) {
       EXPECT_EQ(original.Get(key)->sequence_, 1);
       EXPECT_EQ(map.Get(key)->sequence_, key < 8 ? 2 : 1);
       EXPECT_EQ(snapshot.Get(key)->sequence_, key < 8 ? 2 : 1);
