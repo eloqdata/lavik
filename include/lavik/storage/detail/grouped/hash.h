@@ -238,9 +238,9 @@ struct RecoveredHashGroup {
   bool retired_ = false;
 };
 
-// Immutable AVL metadata, one node per group. Copies retain one root and an
-// topology update allocates only the logarithmic search path. Existing-key
-// updates share a bounded immutable metadata overlay; overflow folds a batch
+// Immutable AVL metadata, one node per group. Copies retain one root and a
+// topology update allocates only the logarithmic search path. Large maps buffer
+// existing-key updates in an immutable metadata overlay; overflow folds a batch
 // into the tree, copying each shared ancestor only once. Nodes and overlays are
 // admitted and charged independently, so old snapshot readers retain exactly
 // the nodes they still own. Lookups and iteration resolve the overlay without
@@ -403,11 +403,14 @@ class HashGroupMap {
     return absl::OkStatus();
   }
   // Amortize repeated replacements in large maps. Small maps keep ordinary
-  // path copies, which cost less than a fixed-capacity overlay. Bulk recovery
-  // uses Set directly and pays no extra existence lookup for each insertion.
+  // path copies: the fixed eight-entry allocation and retained base tree can
+  // outweigh avoiding a short path, especially with many small collections.
+  // Require 1024 groups before starting an overlay; an existing overlay must
+  // still resolve its entries if subsequent erases shrink the map. Bulk
+  // recovery uses Set directly, without an existence lookup per insertion.
   absl::Status SetBuffered(Key key, RecoveredHashGroup value) {
     const auto* current = overlay_ ? overlay_->Find(key) : nullptr;
-    if (current || (size() >= 64 && GetBase(key))) {
+    if (current || (size() >= 1024 && GetBase(key))) {
       if (!current && overlay_ && overlay_->size_ == Overlay::kCapacity) {
         // Fold all pending replacements together. Dispersed writes still
         // share ancestor copies, instead of paying for a full path plus an

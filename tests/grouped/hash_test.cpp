@@ -748,6 +748,10 @@ TEST(HashGroupMapTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
   using Map = HashGroupMap<std::uint64_t>;
   Map map;
   std::map<std::uint64_t, std::uint64_t> expected;
+  for (std::uint64_t key = 0; key < 1152; ++key) {
+    ASSERT_TRUE(map.Set(key, {.sequence_ = 0}).ok());
+    expected[key] = 0;
+  }
   std::vector<std::pair<Map, decltype(expected)>> snapshots;
   std::mt19937 random(731);
   auto check = [](const Map& actual, const auto& values) {
@@ -764,7 +768,7 @@ TEST(HashGroupMapTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
       ++it;
     }
     EXPECT_EQ(it, actual.end());
-    for (std::uint64_t key = 0; key < 130; ++key) {
+    for (std::uint64_t key = 0; key < 1154; ++key) {
       auto floor = values.upper_bound(key);
       const auto* found = actual.Floor(key);
       if (floor == values.begin()) {
@@ -781,7 +785,8 @@ TEST(HashGroupMapTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
     }
   };
   // Both repeatedly hot routes and dispersed edits exercise replacement,
-  // eviction, AVL rotations, deletion of shadowed entries and reinsertion.
+  // batch folding, deletion of shadowed entries and reinsertion. Untouched
+  // routes keep the map large enough to exercise buffering throughout.
   for (std::uint64_t revision = 1; revision <= 800; ++revision) {
     const std::uint64_t key = random() % (revision % 2 ? 8 : 128);
     if (revision % 7 == 0) {
@@ -798,11 +803,27 @@ TEST(HashGroupMapTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
   for (const auto& [snapshot, values] : snapshots) check(snapshot, values);
 }
 
+TEST_F(HashLookupMemoryTest, SmallRoutingMapsDoNotRetainAnOverlay) {
+  for (unsigned count : {32, 256, 1023}) {
+    HashGroupMap<std::uint64_t> map;
+    for (unsigned key = 0; key < count; ++key)
+      ASSERT_TRUE(map.Set(key, {.sequence_ = 1}).ok());
+    const auto retained = GetWorkerMemoryStats(0).retained_bytes_;
+    // Without pinned snapshots, replacements release the old path and must
+    // not add one fixed-capacity allocation per small collection.
+    for (unsigned key : {0U, count / 2, count - 1}) {
+      ASSERT_TRUE(map.SetBuffered(key, {.sequence_ = 2}).ok());
+      EXPECT_EQ(map.Get(key)->sequence_, 2);
+      EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, retained);
+    }
+  }
+}
+
 TEST_F(HashLookupMemoryTest, RoutingUpdatesAdmitMemoryAndFailAtomically) {
   const auto before = GetWorkerMemoryStats(0);
   {
     HashGroupMap<std::uint64_t> map;
-    for (unsigned key = 0; key < 128; ++key)
+    for (unsigned key = 0; key < 1024; ++key)
       ASSERT_TRUE(map.SetBuffered(key, {.sequence_ = 1}).ok());
     auto original = map;
     for (unsigned key = 0; key < 8; ++key)
@@ -811,13 +832,13 @@ TEST_F(HashLookupMemoryTest, RoutingUpdatesAdmitMemoryAndFailAtomically) {
     const auto retained = GetWorkerMemoryStats(0).retained_bytes_;
     ASSERT_GT(retained, before.retained_bytes_);
     ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
-    for (unsigned key : {0, 8, 128}) {
+    for (unsigned key : {0, 8, 1024}) {
       EXPECT_EQ(map.SetBuffered(key, {.sequence_ = 3}).code(),
                 absl::StatusCode::kResourceExhausted);
       EXPECT_EQ(map.Erase(key).code(), absl::StatusCode::kResourceExhausted);
     }
-    EXPECT_EQ(map.size(), 128);
-    for (unsigned key = 0; key < 128; ++key) {
+    EXPECT_EQ(map.size(), 1024);
+    for (unsigned key = 0; key < 1024; ++key) {
       EXPECT_EQ(original.Get(key)->sequence_, 1);
       EXPECT_EQ(map.Get(key)->sequence_, key < 8 ? 2 : 1);
       EXPECT_EQ(snapshot.Get(key)->sequence_, key < 8 ? 2 : 1);
