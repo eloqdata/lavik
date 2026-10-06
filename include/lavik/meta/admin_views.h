@@ -68,6 +68,9 @@ struct MetaSlotMapCheckView {
   std::uint64_t topology_epoch_ = 0;
   bool group_exists_ = false;
   std::vector<MetaSlotAssignment> slots_;
+  // Returns the owner borrowed from this view, or nullopt for an unassigned
+  // slot. The result is valid only while this view and its slots_ are
+  // unchanged.
   std::optional<std::string_view> SlotOwner(std::uint32_t slot) const;
 };
 

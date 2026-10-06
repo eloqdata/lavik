@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <ranges>
 #include <set>
 #include <tuple>
 
@@ -919,6 +920,15 @@ absl::StatusOr<MetaOperationArchiveSummary> ReadSummary(MetaReader& r) {
   return summary;
 }
 
+template <typename Summaries>
+absl::StatusOr<std::string> EncodeArchive(const Summaries& summaries) {
+  MetaWriter writer;
+  writer.WriteU16(kMetaFormatVersion);
+  writer.WriteCount(static_cast<std::uint32_t>(summaries.size()));
+  for (const auto& summary : summaries) WriteSummary(writer, summary);
+  return writer.TakeBuffer();
+}
+
 }  // namespace
 
 MetaOperationArchiveExport MetaOperationStore::CaptureArchiveExport() const {
@@ -930,21 +940,11 @@ MetaOperationArchiveExport MetaOperationStore::CaptureArchiveExport() const {
 }
 
 absl::StatusOr<std::string> MetaOperationArchiveExport::Encode() const {
-  MetaWriter writer;
-  writer.WriteU16(kMetaFormatVersion);
-  writer.WriteCount(static_cast<std::uint32_t>(summaries_.size()));
-  for (const auto& summary : summaries_) WriteSummary(writer, summary);
-  return writer.TakeBuffer();
+  return EncodeArchive(summaries_);
 }
 
 absl::StatusOr<std::string> MetaOperationStore::ExportArchive() const {
-  MetaWriter w;
-  w.WriteU16(kMetaFormatVersion);
-  w.WriteCount(static_cast<std::uint32_t>(archived_.size()));
-  for (const auto& [id, summary] : archived_) {
-    WriteSummary(w, summary);
-  }
-  return w.TakeBuffer();
+  return EncodeArchive(std::views::values(archived_));
 }
 
 void MetaOperationStore::WriteSnapshot(MetaWriter& w) const {
