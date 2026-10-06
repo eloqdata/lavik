@@ -238,9 +238,11 @@ struct RecoveredHashGroup {
 };
 
 // Immutable AVL metadata, one node per group. Copies retain one root and an
-// update allocates only the logarithmic search path. Nodes are admitted and
+// topology update allocates only the logarithmic search path. Existing-key
+// updates share a bounded immutable metadata overlay; eviction folds one entry
+// into the tree. Nodes and overlays are admitted and
 // charged independently, so old snapshot readers retain exactly the nodes
-// they still own; no mutation log is replayed by a later read.
+// they still own. Lookups and iteration resolve the overlay without replay.
 // All node references and destruction stay on the key owner. Cross-worker
 // readers send physical identities or owner-routed stream handles, not these
 // links, so persistent sharing does not require atomic reference counts.
@@ -261,13 +263,43 @@ class HashGroupMap {
           height_(1 + std::max(Height(left_), Height(right_))) {}
   };
 
+  // Match the physical directory's bounded update window. This stores only
+  // metadata for keys already in the tree, so ordering and subtree sizes stay
+  // valid. The shared allocation keeps directory copies cheap; old snapshots
+  // retain their own overlay, and eviction never chains overlays together.
+  struct Overlay {
+    static constexpr std::size_t kCapacity = 8;
+    using Entry = std::pair<const Key, RecoveredHashGroup>;
+    std::array<std::optional<Entry>, kCapacity> entries_;
+    std::size_t size_ = 0;
+    std::size_t victim_ = 0;
+    explicit Overlay(const Overlay* previous) {
+      if (previous) {
+        size_ = previous->size_;
+        victim_ = previous->victim_;
+        for (std::size_t i = 0; i < size_; ++i)
+          entries_[i].emplace(*previous->entries_[i]);
+      }
+    }
+    const Entry* Find(Key key) const noexcept {
+      for (std::size_t i = 0; i < size_; ++i)
+        if (entries_[i]->first == key) return &*entries_[i];
+      return nullptr;
+    }
+  };
+
  public:
   class const_iterator {
    public:
     using value_type = std::pair<const Key, RecoveredHashGroup>;
     using reference = const value_type&;
     using pointer = const value_type*;
-    reference operator*() const { return path_[depth_ - 1]->entry_; }
+    reference operator*() const {
+      const auto& entry = path_[depth_ - 1]->entry_;
+      if (overlay_)
+        if (const auto* updated = overlay_->Find(entry.first)) return *updated;
+      return entry;
+    }
     pointer operator->() const { return &operator*(); }
     const_iterator& operator++() {
       const auto* node = path_[depth_ - 1];
@@ -294,6 +326,7 @@ class HashGroupMap {
     friend class HashGroupMap;
     // An AVL tree containing at most UINT32_MAX groups is far shallower than
     // this fixed stack. Iteration never allocates retained/scratch memory.
+    const Overlay* overlay_ = nullptr;
     std::array<const Node*, 96> path_{};
     unsigned depth_ = 0;
   };
@@ -302,6 +335,7 @@ class HashGroupMap {
   bool empty() const noexcept { return !root_; }
   const_iterator begin() const {
     const_iterator it;
+    it.overlay_ = overlay_.get();
     const auto* node = root_.get();
     while (node) {
       it.path_[it.depth_++] = node;
@@ -312,6 +346,7 @@ class HashGroupMap {
   const_iterator end() const { return {}; }
   const_iterator find(Key key) const {
     const_iterator it;
+    it.overlay_ = overlay_.get();
     const auto* node = root_.get();
     while (node) {
       it.path_[it.depth_++] = node;
@@ -323,6 +358,13 @@ class HashGroupMap {
   // Exact metadata lookup without constructing the ancestor stack needed by
   // an iterator. The returned pointer borrows this immutable tree version.
   const RecoveredHashGroup* Get(Key key) const noexcept {
+    if (overlay_)
+      if (const auto* entry = overlay_->Find(key)) return &entry->second;
+    return GetBase(key);
+  }
+
+ private:
+  const RecoveredHashGroup* GetBase(Key key) const noexcept {
     const auto* node = root_.get();
     while (node) {
       if (key == node->entry_.first) return &node->entry_.second;
@@ -330,6 +372,8 @@ class HashGroupMap {
     }
     return nullptr;
   }
+
+ public:
   const RecoveredHashGroup& at(Key key) const {
     const auto it = find(key);
     if (it == end()) throw std::out_of_range("group directory key");
@@ -345,9 +389,38 @@ class HashGroupMap {
       } else
         node = node->left_.get();
     }
-    return found ? &found->entry_.second : nullptr;
+    if (!found) return nullptr;
+    if (overlay_)
+      if (const auto* entry = overlay_->Find(found->entry_.first))
+        return &entry->second;
+    return &found->entry_.second;
   }
   absl::Status Set(Key key, RecoveredHashGroup value) {
+    const auto* current = overlay_ ? overlay_->Find(key) : nullptr;
+    if (current || GetBase(key)) {
+      auto overlay = MakeOverlay(overlay_.get());
+      if (!overlay.ok()) return overlay.status();
+      auto& updated = **overlay;
+      std::size_t slot;
+      Link base = root_;
+      if (current) {
+        slot = 0;
+        while (updated.entries_[slot]->first != key) ++slot;
+      } else if (updated.size_ < Overlay::kCapacity) {
+        slot = updated.size_++;
+      } else {
+        slot = updated.victim_;
+        const auto& evicted = *updated.entries_[slot];
+        auto next = SetNode(root_, evicted.first, evicted.second);
+        if (!next.ok()) return next.status();
+        base = std::move(*next);
+        updated.victim_ = (slot + 1) % Overlay::kCapacity;
+      }
+      updated.entries_[slot].emplace(key, value);
+      root_ = std::move(base);
+      overlay_ = std::move(*overlay);
+      return absl::OkStatus();
+    }
     auto next = SetNode(root_, key, value);
     if (!next.ok()) return next.status();
     root_ = std::move(*next);
@@ -356,11 +429,42 @@ class HashGroupMap {
   absl::Status Erase(Key key) {
     auto next = EraseNode(root_, key);
     if (!next.ok()) return next.status();
+    if (overlay_ && overlay_->Find(key)) {
+      auto overlay = MakeOverlay(overlay_.get());
+      if (!overlay.ok()) return overlay.status();
+      auto& updated = **overlay;
+      std::size_t slot = 0;
+      while (updated.entries_[slot]->first != key) ++slot;
+      --updated.size_;
+      if (slot != updated.size_)
+        updated.entries_[slot].emplace(*updated.entries_[updated.size_]);
+      updated.entries_[updated.size_].reset();
+      updated.victim_ = 0;
+      overlay_ = updated.size_
+                     ? LocalSharedPtr<const Overlay>(std::move(*overlay))
+                     : LocalSharedPtr<const Overlay>{};
+    }
     root_ = std::move(*next);
     return absl::OkStatus();
   }
 
  private:
+  static absl::StatusOr<LocalSharedPtr<Overlay>> MakeOverlay(
+      const Overlay* previous) {
+    auto reservation =
+        TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(Overlay) + 1024));
+    if (!reservation) {
+      RecordMemoryRejection();
+      return absl::ResourceExhaustedError(
+          "OOM group routing exceeds maxmemory");
+    }
+    RetainedAllocationDomain domain{
+        .owner_shard_ = CurrentMemoryAccountingShard(),
+        .externally_admitted_ = true,
+        .externally_accounted_ = false};
+    return AllocateLocalShared<Overlay>(RetainedAllocator<Overlay>(domain),
+                                        previous);
+  }
   static std::size_t Size(const Link& node) { return node ? node->size_ : 0; }
   static unsigned Height(const Link& node) { return node ? node->height_ : 0; }
   static absl::StatusOr<Link> Make(Key key, RecoveredHashGroup value, Link left,
@@ -445,6 +549,7 @@ class HashGroupMap {
                    left ? *child : node->left_, left ? node->right_ : *child);
   }
   Link root_;
+  LocalSharedPtr<const Overlay> overlay_;
 };
 
 // Immutable routing view produced only after complete recovery validation.
