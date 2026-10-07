@@ -218,6 +218,10 @@ class GroupedObject {
   std::shared_ptr<const GroupedPhysicalState> physical_;
 };
 
+// Storage integration: user keys resolve to GroupedObject views here. Each
+// view owns a routing directory, which uses lavik::MapIndex or OrderedIndex
+// internally; those containers have no object publication/lifecycle semantics.
+//
 // Sparse second-level USER-KEY map. Only a grouped top-level RecordIndex
 // entry warrants a lookup here. This is deliberately ScanHashMap too; neither
 // field names nor pointers to replaceable top-level entries are map keys.

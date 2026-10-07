@@ -31,20 +31,17 @@
 #include "lavik/memory.h"
 #include "lavik/retained_allocator.h"
 
-namespace lavik::storage {
+namespace lavik {
 
-// Key-based metadata indexing, paired with the ordinal/rank algorithms in
-// ordered_index.h. The persistent AVL tree orders identities; values are
-// routing metadata only; payload ownership and physical pins belong to the
-// caller. Copies retain one root and a topology update allocates only the
-// logarithmic search path. Large maps buffer existing-key updates in an
-// immutable metadata overlay; overflow folds a batch into the tree, copying
-// each shared ancestor only once. Nodes and overlays are admitted and charged
-// independently, so old snapshot readers retain exactly the nodes they still
-// own. Lookups and iteration resolve the overlay without replay. All node
-// references and destruction stay on the key owner. Cross-worker readers send
-// physical identities or owner-routed stream handles, not these links, so
-// persistent sharing does not require atomic reference counts.
+// Persistent key-to-metadata AVL map. Copies retain one root; topology
+// updates copy only a logarithmic search path. Large maps buffer existing-key
+// updates in one bounded immutable overlay. Overflow folds the batch into the
+// tree, copying each shared ancestor only once; lookups and iteration resolve
+// the overlay directly. Nodes and overlays admit/account their own lifetimes.
+//
+// Keys and metadata are trivially copyable; referenced resources remain the
+// caller's responsibility. All copies, access and destruction stay on the
+// allocating thread. Callers must bound the population to UINT32_MAX entries.
 template <typename Key, typename Metadata>
 class MapIndex {
   static_assert(std::is_trivially_copyable_v<Key>);
@@ -64,9 +61,8 @@ class MapIndex {
           height_(1 + std::max(Height(left_), Height(right_))) {}
   };
 
-  // Match the physical directory's bounded update window. This stores only
-  // metadata for keys already in the tree, so ordering and subtree sizes stay
-  // valid. The shared allocation keeps directory copies cheap; old snapshots
+  // Buffer only replacements of existing keys, preserving ordering and
+  // subtree sizes. The shared allocation keeps map copies cheap; old snapshots
   // retain their own overlay, and overflow never chains overlays together.
   struct Overlay {
     static constexpr std::size_t kCapacity = 8;
@@ -123,7 +119,7 @@ class MapIndex {
 
    private:
     friend class MapIndex;
-    // An AVL tree containing at most UINT32_MAX groups is far shallower than
+    // An AVL tree containing at most UINT32_MAX entries is far shallower than
     // this fixed stack. Iteration never allocates retained/scratch memory.
     const Overlay* overlay_ = nullptr;
     std::array<const Node*, 96> path_{};
@@ -175,7 +171,7 @@ class MapIndex {
  public:
   const Metadata& at(Key key) const {
     const auto it = find(key);
-    if (it == end()) throw std::out_of_range("group directory key");
+    if (it == end()) throw std::out_of_range("map index key");
     return it->second;
   }
   // Borrows the metadata at the greatest key <= key, resolving this view's
@@ -207,10 +203,10 @@ class MapIndex {
   }
   // Amortize repeated replacements in large maps. Small maps keep ordinary
   // path copies: the fixed eight-entry allocation and retained base tree can
-  // outweigh avoiding a short path, especially with many small collections.
-  // Require 1024 groups before starting an overlay; an existing overlay must
+  // outweigh avoiding a short path, especially with many small maps.
+  // Require 1024 entries before starting an overlay; an existing overlay must
   // still resolve its entries if subsequent erases shrink the map. Bulk
-  // recovery uses Set directly, without an existence lookup per insertion.
+  // construction uses Set directly, without an existence lookup per insertion.
   absl::Status SetBuffered(Key key, Metadata value) {
     const auto* current = overlay_ ? overlay_->Find(key) : nullptr;
     if (current || (size() >= 1024 && GetBase(key))) {
@@ -300,8 +296,7 @@ class MapIndex {
         TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(Overlay) + 1024));
     if (!reservation) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM group routing exceeds maxmemory");
+      return absl::ResourceExhaustedError("OOM map index exceeds maxmemory");
     }
     RetainedAllocationDomain domain{
         .owner_shard_ = CurrentMemoryAccountingShard(),
@@ -318,8 +313,7 @@ class MapIndex {
         TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(Node) + 1024));
     if (!reservation) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM group routing exceeds maxmemory");
+      return absl::ResourceExhaustedError("OOM map index exceeds maxmemory");
     }
     RetainedAllocationDomain domain{
         .owner_shard_ = CurrentMemoryAccountingShard(),
@@ -397,4 +391,4 @@ class MapIndex {
   LocalSharedPtr<const Overlay> overlay_;
 };
 
-}  // namespace lavik::storage
+}  // namespace lavik

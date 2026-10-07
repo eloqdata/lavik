@@ -1731,6 +1731,7 @@ if (BUILD_TESTING)
     tests/grouped/ordered_object_test.cpp
     tests/record_payload_cursor_test.cpp
     tests/grouped/object_index_test.cpp
+    tests/index_test.cpp
     tests/cow_array_test.cpp
     tests/local_shared_ptr_test.cpp
     tests/logging_test.cpp

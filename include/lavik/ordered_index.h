@@ -29,17 +29,18 @@
 #include "absl/numeric/int128.h"
 #include "lavik/cow_array.h"
 
-namespace lavik::storage {
+namespace lavik {
 
-// Persistent Fenwick index mapping an element rank to a group ordinal and
-// offset. MapIndex indexes metadata by key; OrderedIndex indexes page counts
-// by position. Neither retains value payloads or physical pins. Prefix reads
-// and count updates both visit logarithmically many cells.
-// Copies share owner-local metadata chunks. Mutators belong to an unpublished
+// Persistent Fenwick index over counts of ordered groups. Maps an element
+// rank to a group ordinal and offset; prefix reads and count updates visit
+// logarithmically many cells. Groups are abstract count buckets: no collection
+// kind, record identity or physical location is retained here.
+//
+// Copies share owner-thread CowArray storage. Mutators belong to an unpublished
 // view: a failure may partially update that builder, never a pinned
-// predecessor. Callers validate page counts and admit temporary build/suffix
-// arrays. There is one cell layout, so the index stores no policy tag or
-// duplicate total.
+// predecessor. Callers validate counts, bound the population to UINT32_MAX
+// groups and admit temporary build/suffix arrays. There is one cell layout,
+// so the index stores no policy tag or duplicate total.
 class OrderedIndex {
  public:
   struct Position {
@@ -49,7 +50,7 @@ class OrderedIndex {
   using CountChange = std::pair<std::size_t, absl::int128>;
 
   // Consumes checked cumulative counts as build scratch, encoding them into
-  // Fenwick cells in place to avoid another whole-directory scratch array.
+  // Fenwick cells in place to avoid another full-size scratch array.
   static absl::StatusOr<OrderedIndex> FromCumulative(
       std::vector<std::uint64_t> ends) {
     for (std::size_t i = ends.size(); i > 1; --i) ends[i - 1] -= ends[i - 2];
@@ -64,7 +65,8 @@ class OrderedIndex {
     return result;
   }
 
-  // Returns the count preceding a page; the page count denotes the full total.
+  // Returns the count preceding a group; index == group count returns the
+  // full total.
   std::uint64_t CountBefore(std::size_t index) const noexcept {
     assert(index <= cells_.size());
     std::uint64_t count = 0;
@@ -73,8 +75,8 @@ class OrderedIndex {
     return count;
   }
 
-  // The caller must first check rank < total count. The owning root already
-  // keeps that total, avoiding an extra field or Fenwick sum on every lookup.
+  // The caller must first check rank < total count. Keeping that total with
+  // the caller avoids an extra field or Fenwick sum on every lookup.
   Position Locate(std::uint64_t rank) const noexcept {
     std::size_t index = 0;
     std::uint64_t count = 0;
@@ -89,7 +91,7 @@ class OrderedIndex {
     return {index, rank - count};
   }
 
-  // Changes have distinct, increasing page ordinals and checked page counts.
+  // Changes have distinct, increasing group ordinals and checked group counts.
   // Count-neutral writes retain every chunk. Combining deltas before applying
   // them prevents compensating changes from overflowing intermediate sums.
   absl::Status ApplyCounts(std::span<const CountChange> changes,
@@ -97,7 +99,7 @@ class OrderedIndex {
     return ApplyPartialSums(changes, item_count, cells_.size());
   }
 
-  // Suffix insertion retains the preceding page ordinals. The suffix carries
+  // Suffix insertion retains the preceding group ordinals. The suffix carries
   // complete NEW cumulative counts, including prefix_changes; only the old
   // prefix cells receive those deltas separately. The suffix may grow but
   // cannot shrink the index on this path.
@@ -155,7 +157,7 @@ class OrderedIndex {
                       [](const auto& change) { return change.second != 0; });
     if (changed_counts == 0) return absl::OkStatus();
     const auto updates = changed_counts * (std::bit_width(existing_size) + 1);
-    // Page counts are bounded by the 32-bit root group count. This product
+    // The caller bounds group counts to UINT32_MAX. This product
     // fits size_t on supported 64-bit targets; scratch is admitted before use.
     auto admission = TryReserveMemory(
         AllocatorUsableSizeForRequest(updates * sizeof(CountChange) + 1024));
@@ -187,4 +189,4 @@ class OrderedIndex {
   }
 };
 
-}  // namespace lavik::storage
+}  // namespace lavik

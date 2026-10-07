@@ -36,9 +36,9 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "lavik/local_shared_ptr.h"
+#include "lavik/map_index.h"
 #include "lavik/memory.h"
 #include "lavik/storage/detail/collection_limits.h"
-#include "lavik/storage/detail/grouped/map_index.h"
 #include "lavik/storage/detail/hash_codec.h"
 #include "lavik/storage/scan_hash_map.h"
 
