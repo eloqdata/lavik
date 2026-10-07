@@ -409,7 +409,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
           // a null reservation contributes metadata capacity, not a graph.
           return;
         }
-        object->ForEachRecord([&](HashGroupId,
+        object->ForEachRecord([&](GroupedRecordId,
                                   const GroupedRecordIndexEntry& entry,
                                   const ExtentManifest& manifest, bool) {
           if (entry.value_.external() != static_cast<bool>(manifest)) {

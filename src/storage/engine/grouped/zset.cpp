@@ -1100,7 +1100,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     // Prefix routing retains only per-group metadata. Exact members and
     // scores are decoded from the selected Hash leaves, never trusted from
     // a digest alone. Batch requests read each selected leaf just once.
-    std::set<HashGroupId> selected;
+    std::set<GroupedRecordId> selected;
     for (const auto& [member, state] : members) {
       const auto* route = object->directory().Find(member);
       if (!route) co_return absl::DataLossError("missing member prefix route");

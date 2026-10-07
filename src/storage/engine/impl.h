@@ -401,7 +401,7 @@ struct RecoveryRecord {
   // Auxiliary records share their user key with the root, but must never
   // enter the top-level winner merge. Keep only checked routing metadata;
   // complete group values remain on disk throughout index reconstruction.
-  std::optional<RecoveredHashGroup> auxiliary_group_;
+  std::optional<RecoveredGroupedRecord> auxiliary_group_;
   std::optional<RecoveredOrderedGroup> ordered_group_;
   std::optional<RecoveredGroupedRoot> grouped_root_;
   // Set only by complete graph reconstruction, then consumed by the bounded
@@ -430,7 +430,7 @@ struct RecoveryAuxiliaryRecord {
   RecordLocation location_{};
   // One-based index into WorkerStore::recovery_aux_extents_; zero is inline.
   std::uint32_t extent_token_ = 0;
-  RecoveredHashGroup auxiliary_group_;
+  RecoveredGroupedRecord auxiliary_group_;
   // Hash candidates never need ordered-page metadata. Allocate it only for
   // inline ordered pages instead of reserving its size in every candidate.
   std::unique_ptr<RecoveredOrderedGroup> ordered_group_;
@@ -2192,8 +2192,8 @@ class StorageEngine::Impl {
   // Only changed_groups are rewritten. Null previous builds a fresh graph.
   absl::StatusOr<HashGroupMutationPlan> PrepareGroupedHashMutation(
       const GroupedObject::Handle& previous, HashValue after_image,
-      std::span<const HashGroupId> changed_groups, std::uint64_t field_count,
-      std::uint64_t revision);
+      std::span<const GroupedRecordId> changed_groups,
+      std::uint64_t field_count, std::uint64_t revision);
   // Caller retains exclusive key intent and store state. A prepared plan must
   // name the validated predecessor or a validated creation; commit assigns
   // its durable revision and stamps every page of a fresh incarnation.
@@ -2201,7 +2201,7 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle previous, HashValue after_image,
-      std::vector<HashGroupId> changed_groups, std::uint64_t field_count,
+      std::vector<GroupedRecordId> changed_groups, std::uint64_t field_count,
       ValueType value_type, std::uint64_t expire_at_ms, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition = nullptr,
@@ -3581,11 +3581,11 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<LoadedHashGroupPayload>> LoadHashGroupPayload(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, HashGroupId id, bool pinned = false);
+      GroupedObject::Handle object, GroupedRecordId id, bool pinned = false);
   Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, HashGroupId id, bool pinned = false);
+      GroupedObject::Handle object, GroupedRecordId id, bool pinned = false);
   Task<absl::StatusOr<HashValue>> LoadGroupedHashValue(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -3657,7 +3657,7 @@ class StorageEngine::Impl {
   absl::StatusOr<std::vector<RetiredRecord>> CollectGroupedRetirements(
       const GroupedObject::Handle& previous,
       const GroupedObject::Handle& replacement,
-      std::optional<std::span<const HashGroupId>> touched = std::nullopt);
+      std::optional<std::span<const GroupedRecordId>> touched = std::nullopt);
   Task<absl::Status> ClearGroupedUndoSlots(WorkerStore& store,
                                            const TxUndoLog& undo);
   struct GroupedRetirementPins {
@@ -3677,8 +3677,8 @@ class StorageEngine::Impl {
   };
   Task<absl::Status> PrepinGroupedRetirementsLocked(
       WorkerStore& store, const GroupedObject::Handle& previous,
-      std::optional<std::span<const HashGroupId>> touched, bool include_root,
-      std::unique_ptr<GroupedRetirementPins>* pins);
+      std::optional<std::span<const GroupedRecordId>> touched,
+      bool include_root, std::unique_ptr<GroupedRetirementPins>* pins);
   Task<absl::Status> ReleaseGroupedRetirementPins(
       WorkerStore* store, std::vector<RetiredRecord> pins);
 
@@ -3872,7 +3872,7 @@ class StorageEngine::Impl {
   struct GroupRecordWrite {
     bool auxiliary_ = false;
     std::uint64_t incarnation_ = 0;
-    HashGroupId id_{};
+    GroupedRecordId id_{};
     bool retired_ = false;
     std::uint64_t batch_txid_ = 0;
     // Pre-admitted before any durable root write. The root and its side view
@@ -3885,7 +3885,7 @@ class StorageEngine::Impl {
     std::function<absl::Status(const GroupedObjectVersion&)> prepare_root_;
     // Every complete page or split marker written by this mutation. Borrowed
     // for this call; only these prior ids need dependency pins/retirement.
-    std::span<const HashGroupId> changed_groups_;
+    std::span<const GroupedRecordId> changed_groups_;
     // Foreground root after-image identity, known before the late builder.
     // A new incarnation replaces the complete prior graph, even when its
     // newly written ids happen to match a subset of the old directory.
@@ -3918,7 +3918,7 @@ class StorageEngine::Impl {
   // return the task directly; the snapshot/encoder lifetime contract below
   // also applies to this implementation.
   template <typename Snapshot, typename Encoder>
-  Task<absl::StatusOr<HashGroupLocation>> WriteGroupRecordLocked(
+  Task<absl::StatusOr<GroupedRecordLocation>> WriteGroupRecordLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const Snapshot& snapshot, Encoder encoder, std::uint64_t sequence,
@@ -3929,7 +3929,7 @@ class StorageEngine::Impl {
   // with the root's decision or reclaim it when that batch is abandoned.
   // Pass an unconsumed encoder from the batch's complete preflight. Its exact
   // snapshot must stay alive, unmoved and immutable through the awaited write.
-  Task<absl::StatusOr<HashGroupLocation>> WriteHashGroupRecordLocked(
+  Task<absl::StatusOr<GroupedRecordLocation>> WriteHashGroupRecordLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashGroupSnapshot& snapshot, HashGroupEncoder encoder,
@@ -3967,7 +3967,7 @@ class StorageEngine::Impl {
                           bool pinned = false);
   // Consumes an unstarted preflight encoder with the same snapshot lifetime
   // contract as WriteHashGroupRecordLocked, including across extent IO.
-  Task<absl::StatusOr<HashGroupLocation>> WriteOrderedGroupRecordLocked(
+  Task<absl::StatusOr<GroupedRecordLocation>> WriteOrderedGroupRecordLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const OrderedGroupSnapshot& snapshot, OrderedGroupEncoder encoder,

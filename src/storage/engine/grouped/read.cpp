@@ -37,7 +37,7 @@ Task<absl::StatusOr<StorageEngine::Impl::LoadedHashGroupPayload>>
 StorageEngine::Impl::LoadHashGroupPayload(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedObject::Handle object, HashGroupId id, bool pinned) {
+    GroupedObject::Handle object, GroupedRecordId id, bool pinned) {
   if (object == nullptr) co_return absl::DataLossError("missing grouped view");
   if (object->is_ordered() && !object->has_member_index())
     co_return absl::DataLossError("ordered view has no prefix groups");
@@ -185,7 +185,7 @@ Task<absl::StatusOr<LoadedHashGroup>>
 StorageEngine::Impl::LoadHashGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedObject::Handle object, HashGroupId id, bool pinned) {
+    GroupedObject::Handle object, GroupedRecordId id, bool pinned) {
   auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
                                               digest, object, id, pinned);
   if (!loaded.ok()) co_return loaded.status();
@@ -195,7 +195,7 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
   auto decoded = DecodeHashGroup(payload);
   if (!decoded.ok()) co_return decoded.status();
   for (const auto& field : decoded->value_.entries_) {
-    if (!id.contains(
+    if (!id.ContainsHash(
             ComputeDigest(field.field_, object->directory().root().seed_)
                 .value_)) {
       co_return absl::DataLossError("Hash field outside its group route");
@@ -250,7 +250,7 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
   if (snapshot == nullptr)
     co_return absl::DataLossError("missing grouped materialization view");
   GroupedScratchBudget budget;
-  auto include_group = [&](HashGroupId id) -> absl::Status {
+  auto include_group = [&](GroupedRecordId id) -> absl::Status {
     const auto* entry = snapshot->FindGroup(id);
     if (entry == nullptr)
       return absl::DataLossError("missing grouped materialization page");

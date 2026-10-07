@@ -29,7 +29,7 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
   }
   const auto original = object->version();
   const auto root = object->ordered_directory().root();
-  const HashGroupId id{page_id, 0};
+  const GroupedRecordId id{page_id, 0};
   for (;;) {
     const auto readable = object->ReadStatus();
     if (!readable.ok()) co_return readable;

@@ -135,7 +135,7 @@ Task<absl::Status> StorageEngine::Impl::AwaitGroupedDependencyLocked(
 }
 
 template <typename Snapshot, typename Encoder>
-Task<absl::StatusOr<HashGroupLocation>>
+Task<absl::StatusOr<GroupedRecordLocation>>
 StorageEngine::Impl::WriteGroupRecordLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -149,11 +149,11 @@ StorageEngine::Impl::WriteGroupRecordLocked(
           "invalid prefix-group collection type");
     }
   }
-  const HashGroupId id = [&] {
+  const GroupedRecordId id = [&] {
     if constexpr (prefix_group)
       return snapshot.id_;
     else
-      return HashGroupId{snapshot.id_, 0};
+      return GroupedRecordId{snapshot.id_, 0};
   }();
   const auto logical_size = [&] {
     if constexpr (prefix_group)
@@ -240,7 +240,7 @@ StorageEngine::Impl::WriteGroupRecordLocked(
     co_return written;
   }
   LAVIK_MAYBE_CRASH_AT("group-record-staged-before-root");
-  co_return HashGroupLocation{
+  co_return GroupedRecordLocation{
       .id_ = id,
       .location_ = location,
       .extents_ = std::move(extents),
@@ -248,7 +248,7 @@ StorageEngine::Impl::WriteGroupRecordLocked(
   };
 }
 
-Task<absl::StatusOr<HashGroupLocation>>
+Task<absl::StatusOr<GroupedRecordLocation>>
 StorageEngine::Impl::WriteHashGroupRecordLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -260,7 +260,7 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
                                 batch_txid);
 }
 
-Task<absl::StatusOr<HashGroupLocation>>
+Task<absl::StatusOr<GroupedRecordLocation>>
 StorageEngine::Impl::WriteOrderedGroupRecordLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,

@@ -36,7 +36,7 @@ namespace {
 // below call the production API directly with deliberately different C and R.
 absl::StatusOr<HashGroupDirectory> Recover(
     GroupedHashRoot root, std::uint64_t sequence,
-    std::span<const RecoveredHashGroup> candidates,
+    std::span<const RecoveredGroupedRecord> candidates,
     const absl::flat_hash_set<std::uint64_t>& committed) {
   root.revision_ = sequence;
   return HashGroupDirectory::Recover(root, sequence, candidates, committed);
@@ -168,7 +168,7 @@ TEST(HashGroupEdits, SplitsAndOversizedValuesKeepOwnedStreamingPath) {
     for (const auto& entry : decoded->value_.entries_) {
       ++count;
       EXPECT_TRUE(
-          leaf.id_.contains(ComputeDigest(entry.field_, Seed()).value_));
+          leaf.id_.ContainsHash(ComputeDigest(entry.field_, Seed()).value_));
       if (entry.field_ == "large") {
         found = true;
         EXPECT_EQ(entry.value_, large);
@@ -211,10 +211,10 @@ GroupedHashRoot Root(std::uint64_t count, std::uint32_t groups = 1) {
           .revision_ = 1};
 }
 
-std::vector<RecoveredHashGroup> Candidates(
+std::vector<RecoveredGroupedRecord> Candidates(
     const std::vector<HashGroupSnapshot>& groups, std::uint64_t seq = 1,
     std::uint64_t txid = 0) {
-  std::vector<RecoveredHashGroup> candidates;
+  std::vector<RecoveredGroupedRecord> candidates;
   for (const auto& group : groups) {
     candidates.push_back({.incarnation_ = group.incarnation_,
                           .id_ = group.id_,
@@ -230,14 +230,14 @@ std::vector<RecoveredHashGroup> Candidates(
 
 TEST(GroupedHashTest, PrefixBoundsIncludeZeroAndFullWidth) {
   const auto maximum = std::numeric_limits<std::uint64_t>::max();
-  EXPECT_TRUE((HashGroupId{}).contains(0));
-  EXPECT_TRUE((HashGroupId{}).contains(maximum));
-  EXPECT_EQ((HashGroupId{}).last(), maximum);
-  EXPECT_FALSE((HashGroupId{1, 0}).valid());
-  EXPECT_FALSE((HashGroupId{0, 65}).valid());
-  EXPECT_TRUE((HashGroupId{maximum, 64}).contains(maximum));
-  EXPECT_FALSE((HashGroupId{maximum, 64}).contains(maximum - 1));
-  EXPECT_EQ((HashGroupId{0, 1}).last(), maximum >> 1);
+  EXPECT_TRUE((GroupedRecordId{}).ContainsHash(0));
+  EXPECT_TRUE((GroupedRecordId{}).ContainsHash(maximum));
+  EXPECT_EQ((GroupedRecordId{}).LastHash(), maximum);
+  EXPECT_FALSE((GroupedRecordId{1, 0}).IsHashPrefix());
+  EXPECT_FALSE((GroupedRecordId{0, 65}).IsHashPrefix());
+  EXPECT_TRUE((GroupedRecordId{maximum, 64}).ContainsHash(maximum));
+  EXPECT_FALSE((GroupedRecordId{maximum, 64}).ContainsHash(maximum - 1));
+  EXPECT_EQ((GroupedRecordId{0, 1}).LastHash(), maximum >> 1);
 }
 
 TEST(GroupedHashTest, CompactPayloadHasAnExplicitLittleEndianHeader) {
@@ -418,7 +418,7 @@ TEST(GroupedHashTest, RejectsInnerCountBeforeDecodingEntryStorage) {
 TEST(GroupedHashTest, ReplayCommandSequenceIsIndependentOfGroupRevision) {
   auto root = Root(1);
   root.revision_ = 100;
-  std::vector<RecoveredHashGroup> candidates{
+  std::vector<RecoveredGroupedRecord> candidates{
       {.incarnation_ = root.incarnation_, .sequence_ = 100, .field_count_ = 1},
       {.incarnation_ = root.incarnation_, .sequence_ = 101, .field_count_ = 2}};
   auto first = HashGroupDirectory::Recover(root, 7, candidates, {});
@@ -447,7 +447,7 @@ TEST(GroupedHashTest,
      DirectoryReplacementAndSplitPreserveSnapshotsAndCoverage) {
   auto root = Root(10, 4);
   root.revision_ = 1;
-  std::vector<RecoveredHashGroup> records;
+  std::vector<RecoveredGroupedRecord> records;
   for (std::uint64_t i = 0; i < 4; ++i)
     records.push_back({.incarnation_ = root.incarnation_,
                        .id_ = {i << 62, 2},
@@ -475,7 +475,7 @@ TEST(GroupedHashTest,
   right.id_.prefix_ |= std::uint64_t{1} << 61;
   // Interleave a metadata replacement with an actual routing change. Inputs
   // are deliberately unsorted; both update forms share one atomic directory.
-  std::vector<RecoveredHashGroup> changes{right, update, parent, left};
+  std::vector<RecoveredGroupedRecord> changes{right, update, parent, left};
   auto next_root = root;
   next_root.revision_ = 2;
   next_root.field_count_ = 11;
@@ -663,8 +663,8 @@ TEST(GroupedHashTest, BorrowedVisitorChecksUnrelatedRouteAndPropagatesFailure) {
   // be checked against the persisted seed, independently of process hashing.
   const auto seed = Seed(91);
   const auto value = Value(2);
-  const HashGroupId id{ComputeDigest("field-0", seed).value_, 64};
-  ASSERT_FALSE(id.contains(ComputeDigest("field-1", seed).value_));
+  const GroupedRecordId id{ComputeDigest("field-0", seed).value_, 64};
+  ASSERT_FALSE(id.ContainsHash(ComputeDigest("field-1", seed).value_));
   auto encoded =
       EncodeHashGroup({.incarnation_ = 17, .id_ = id, .value_ = value});
   ASSERT_TRUE(encoded.ok());
@@ -1017,7 +1017,7 @@ TEST(GroupedHashTest, LargeIndivisibleFieldDoesNotCauseRecursiveExplosion) {
   auto groups = GroupHashValue(Value(1, 1024 * 1024), 17, Seed());
   ASSERT_TRUE(groups.ok()) << groups.status();
   ASSERT_EQ(groups->size(), 1);
-  EXPECT_EQ(groups->front().id_, HashGroupId{});
+  EXPECT_EQ(groups->front().id_, GroupedRecordId{});
   EXPECT_EQ(groups->front().value_.entries_[0].value_.size(), 1024 * 1024);
   EXPECT_FALSE(GroupHashValue(Value(1), 17, Seed(), 0).ok());
   EXPECT_FALSE(GroupHashValue({}, 17, Seed()).ok());
@@ -1198,7 +1198,7 @@ TEST(GroupedHashTest, DurableRoutingDoesNotDependOnProcessLookupSeed) {
   auto root = Root(100, groups->size());
   auto directory = Recover(root, 1, Candidates(*groups), {});
   ASSERT_TRUE(directory.ok()) << directory.status();
-  std::vector<HashGroupId> before;
+  std::vector<GroupedRecordId> before;
   for (const auto& entry : Value(100).entries_) {
     ASSERT_NE(directory->Find(entry.field_), nullptr);
     before.push_back(directory->Find(entry.field_)->id_);
@@ -1213,7 +1213,7 @@ TEST(GroupedHashTest, DurableRoutingDoesNotDependOnProcessLookupSeed) {
 }
 
 TEST(GroupedHashTest, RecoverySelectsEachGroupSequenceIndependently) {
-  std::vector<RecoveredHashGroup> records{
+  std::vector<RecoveredGroupedRecord> records{
       {.incarnation_ = 17,
        .id_ = {0, 1},
        .sequence_ = 1,
@@ -1237,7 +1237,7 @@ TEST(GroupedHashTest, RecoverySelectsEachGroupSequenceIndependently) {
 }
 
 TEST(GroupedHashTest, RecoveryFiltersUncommittedFutureAndOtherIncarnations) {
-  std::vector<RecoveredHashGroup> records{
+  std::vector<RecoveredGroupedRecord> records{
       {.incarnation_ = 17, .sequence_ = 1, .lsn_ = 1, .field_count_ = 10},
       {.incarnation_ = 17,
        .sequence_ = 2,
@@ -1256,9 +1256,9 @@ TEST(GroupedHashTest, RecoveryFiltersUncommittedFutureAndOtherIncarnations) {
 }
 
 TEST(GroupedHashTest, SplitRecoveryIsOldOrNewAndNeverAPartialDirectory) {
-  const RecoveredHashGroup old{
+  const RecoveredGroupedRecord old{
       .incarnation_ = 17, .sequence_ = 1, .lsn_ = 1, .field_count_ = 10};
-  std::vector<RecoveredHashGroup> writes{
+  std::vector<RecoveredGroupedRecord> writes{
       {.incarnation_ = 17,
        .sequence_ = 2,
        .lsn_ = 2,
@@ -1279,7 +1279,7 @@ TEST(GroupedHashTest, SplitRecoveryIsOldOrNewAndNeverAPartialDirectory) {
   };
   // Every subset models data pages reaching disk before the commit decision.
   for (unsigned subset = 0; subset < 8; ++subset) {
-    std::vector<RecoveredHashGroup> records{old};
+    std::vector<RecoveredGroupedRecord> records{old};
     for (unsigned i = 0; i < 3; ++i) {
       if (subset & (1U << i)) records.push_back(writes[i]);
     }
@@ -1292,7 +1292,7 @@ TEST(GroupedHashTest, SplitRecoveryIsOldOrNewAndNeverAPartialDirectory) {
 }
 
 TEST(GroupedHashTest, EmptyLeafRemainsRoutableAfterDeletingItsLastField) {
-  std::vector<RecoveredHashGroup> records{
+  std::vector<RecoveredGroupedRecord> records{
       {.incarnation_ = 17, .id_ = {0, 1}, .sequence_ = 2, .lsn_ = 2},
       {.incarnation_ = 17,
        .id_ = {1ULL << 63, 1},
@@ -1310,7 +1310,7 @@ TEST(GroupedHashTest, EmptyLeafRemainsRoutableAfterDeletingItsLastField) {
 }
 
 TEST(GroupedHashTest, RelocationUsesLsnOnlyWithinTheSameLogicalVersion) {
-  std::vector<RecoveredHashGroup> records{
+  std::vector<RecoveredGroupedRecord> records{
       {.incarnation_ = 17, .sequence_ = 1, .lsn_ = 100, .field_count_ = 20},
       {.incarnation_ = 17,
        .sequence_ = 2,
@@ -1332,7 +1332,7 @@ TEST(GroupedHashTest, RelocationUsesLsnOnlyWithinTheSameLogicalVersion) {
 }
 
 TEST(GroupedHashTest, RejectsCountsGapsOverlapsAndMalformedIdentities) {
-  std::vector<RecoveredHashGroup> records{
+  std::vector<RecoveredGroupedRecord> records{
       {.incarnation_ = 17, .sequence_ = 1, .lsn_ = 1, .field_count_ = 10},
   };
   EXPECT_FALSE(Recover(Root(11), 1, records, {}).ok());
@@ -1447,7 +1447,7 @@ TEST(GroupedHashTest, MutationSplitIncludesOldLeafRetirement) {
   ASSERT_TRUE(plan.ok()) << plan.status();
   ASSERT_GT(plan->writes_.size(), 2);
   EXPECT_TRUE(plan->writes_.front().retired_);
-  EXPECT_EQ(plan->writes_.front().id_, HashGroupId{});
+  EXPECT_EQ(plan->writes_.front().id_, GroupedRecordId{});
   auto candidates = Candidates(*groups);
   auto updates = Candidates(plan->writes_, 2, 99);
   candidates.insert(candidates.end(), updates.begin(), updates.end());
@@ -1492,7 +1492,7 @@ TEST(GroupedHashTest, RandomizedPartialWritesRecoverAgainstReferenceHash) {
       std::vector<std::string_view> values(owned_values.begin(),
                                            owned_values.end());
       if (deleting) values.clear();
-      std::map<HashGroupId, LoadedHashGroup> affected;
+      std::map<GroupedRecordId, LoadedHashGroup> affected;
       for (auto field : fields) {
         const auto* group = directory->Find(field);
         ASSERT_NE(group, nullptr);

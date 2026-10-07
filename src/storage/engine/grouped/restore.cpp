@@ -68,8 +68,8 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
   // but give the compensating root a fresh, strictly greater R. The caller
   // must leave the failed ingest's shared auxiliary batch uncommitted.
   constexpr std::size_t kPerRecordScratch = 4 * sizeof(RecoveredOrderedGroup) +
-                                            4 * sizeof(RecoveredHashGroup) +
-                                            4 * sizeof(HashGroupId);
+                                            4 * sizeof(RecoveredGroupedRecord) +
+                                            4 * sizeof(GroupedRecordId);
   const auto count = previous->record_count();
   // Different incarnations already make Append retire the whole replacement
   // graph. Only an in-incarnation restore needs an explicit touched-id list.
@@ -102,9 +102,9 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
   } else {
     auto root = previous->directory().root();
     root.revision_ = revision;
-    std::vector<RecoveredHashGroup> candidates;
+    std::vector<RecoveredGroupedRecord> candidates;
     candidates.reserve(count);
-    auto append = [&](RecoveredHashGroup record) {
+    auto append = [&](RecoveredGroupedRecord record) {
       // These are the original journal's adjudicated pages. Their previous
       // runtime decision ids do not become new durable commit assertions.
       record.txid_ = 0;
@@ -121,12 +121,12 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
     payload = EncodeGroupedHashRoot(root);
   }
   if (!payload.ok()) co_return payload.status();
-  std::vector<HashGroupId> changed;
+  std::vector<GroupedRecordId> changed;
   changed.reserve(replaced_count);
   if (replaced_count != 0) {
     // This also covers compensation inside the same incarnation. Retirement
     // compares exact coordinates and skips any old page shared by both views.
-    replaced->ForEachRecord([&](HashGroupId id, const auto&, const auto&,
+    replaced->ForEachRecord([&](GroupedRecordId id, const auto&, const auto&,
                                 bool) { changed.push_back(id); });
   }
   auto decision = PrepareGroupedDecision(*compensation);

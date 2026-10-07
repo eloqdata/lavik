@@ -43,17 +43,19 @@
 
 namespace lavik::storage {
 
-// Prefixes use the HIGH bits of the persisted-seed field hash. Empty leaves
-// still own their range: deleting the last field must not make future inserts
-// unroutable. A retired leaf, in contrast, relinquishes its range after split.
-struct HashGroupId {
+// Shared auxiliary identity: Hash prefixes use the HIGH bits of the persisted
+// field hash; ordered pages use {nonzero page id, 0}. The {0, 0} identity is
+// reserved for the unsplit Hash range, keeping the two graphs disjoint.
+struct GroupedRecordId {
   std::uint64_t prefix_ = 0;
   std::uint8_t bits_ = 0;
 
-  bool valid() const noexcept;
-  bool contains(std::uint64_t hash) const noexcept;
-  std::uint64_t last() const noexcept;
-  auto operator<=>(const HashGroupId&) const noexcept = default;
+  // These helpers describe Hash ranges only; an ordered page is not a prefix.
+  // Empty active leaves still own their range, while split parents retire it.
+  bool IsHashPrefix() const noexcept;
+  bool ContainsHash(std::uint64_t hash) const noexcept;
+  std::uint64_t LastHash() const noexcept;
+  auto operator<=>(const GroupedRecordId&) const noexcept = default;
 };
 
 // The containing keyed record supplies database/replication epochs, source
@@ -97,7 +99,7 @@ class PreparedHashGroupPayload {
   // or the existing bounded extent cursor.
   std::string_view record_payload() const noexcept { return bytes_; }
   std::uint32_t count() const noexcept { return count_; }
-  HashGroupId id() const noexcept { return id_; }
+  GroupedRecordId id() const noexcept { return id_; }
   std::uint64_t incarnation() const noexcept { return incarnation_; }
 
  private:
@@ -105,20 +107,20 @@ class PreparedHashGroupPayload {
       std::string_view, const DigestSeed&, HashGroupEditKind,
       std::span<const HashEntryView>);
   PreparedHashGroupPayload(std::string bytes, std::uint32_t count,
-                           HashGroupId id, std::uint64_t incarnation)
+                           GroupedRecordId id, std::uint64_t incarnation)
       : bytes_(std::move(bytes)),
         count_(count),
         id_(id),
         incarnation_(incarnation) {}
   std::string bytes_;
   std::uint32_t count_;
-  HashGroupId id_;
+  GroupedRecordId id_;
   std::uint64_t incarnation_;
 };
 
 struct HashGroupSnapshot {
   std::uint64_t incarnation_ = 0;
-  HashGroupId id_{};
+  GroupedRecordId id_{};
   bool retired_ = false;
   HashValue value_;
   // Mutually exclusive with value_; the encoder checks this invariant.
@@ -177,7 +179,7 @@ absl::StatusOr<std::string> EncodeGroupedHashRoot(const GroupedHashRoot& root);
 absl::StatusOr<GroupedHashRoot> DecodeGroupedHashRoot(std::string_view bytes);
 struct HashGroupMetadata {
   std::uint64_t incarnation_ = 0;
-  HashGroupId id_{};
+  GroupedRecordId id_{};
   std::uint32_t field_count_ = 0;
   bool retired_ = false;
 };
@@ -197,7 +199,7 @@ absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(std::string_view bytes);
 // a later entry can invalidate the page, so discard its effects on failure.
 // The caller admits page scratch before this call and keeps payload alive.
 absl::Status VisitHashGroupFields(
-    std::string_view payload, std::uint32_t field_count, HashGroupId id,
+    std::string_view payload, std::uint32_t field_count, GroupedRecordId id,
     const DigestSeed& seed,
     absl::FunctionRef<absl::Status(const HashEntryView&)> visitor);
 
@@ -217,19 +219,23 @@ absl::StatusOr<std::vector<HashGroupSnapshot>> GroupHashValue(
     HashValue value, std::uint64_t incarnation, const DigestSeed& seed,
     std::size_t target_bytes = kCollectionGroupTargetBytes);
 
-// Recovery input after physical record/checksum and enclosing key/epoch
-// validation. record_token is caller-owned identity for its compact location,
+// Common auxiliary metadata for Hash prefixes and ordered pages, after record
+// identity validation. Ordered links and bounds live in RecoveredOrderedGroup;
+// external payloads are checked after selecting the reachable graph.
+// record_token is caller-owned identity for its compact location,
 // not a persisted pointer. Superseded candidates are discarded by logical seq
 // BEFORE physical LSN; a relocation never wins over a newer logical mutation.
-struct RecoveredHashGroup {
+struct RecoveredGroupedRecord {
   std::uint64_t incarnation_ = 0;
-  HashGroupId id_{};
+  GroupedRecordId id_{};
   std::uint64_t sequence_ = 0;
   std::uint64_t lsn_ = 0;
   std::uint64_t txid_ = 0;
   // A command-local auxiliary batch can be aborted while its surrounding
   // EXEC transaction commits. Both independent decisions must be present.
   std::uint64_t batch_txid_ = 0;
+  // Logical size from the auxiliary header: fields, ordered records, or String
+  // bytes. Ordered recovery projects it into the page's item_count_.
   std::uint64_t field_count_ = 0;
   // Complete encoded group payload, including its envelope. Zero is reserved
   // for callers that build a directory without physical payload metadata.
@@ -253,11 +259,11 @@ class HashGroupMap {
   struct Node;
   using Link = LocalSharedPtr<const Node>;
   struct Node {
-    std::pair<const Key, RecoveredHashGroup> entry_;
+    std::pair<const Key, RecoveredGroupedRecord> entry_;
     Link left_, right_;
     std::size_t size_;
     unsigned height_;
-    Node(Key key, RecoveredHashGroup value, Link left, Link right)
+    Node(Key key, RecoveredGroupedRecord value, Link left, Link right)
         : entry_(key, value),
           left_(std::move(left)),
           right_(std::move(right)),
@@ -271,7 +277,7 @@ class HashGroupMap {
   // retain their own overlay, and overflow never chains overlays together.
   struct Overlay {
     static constexpr std::size_t kCapacity = 8;
-    using Entry = std::pair<const Key, RecoveredHashGroup>;
+    using Entry = std::pair<const Key, RecoveredGroupedRecord>;
     std::array<std::optional<Entry>, kCapacity> entries_;
     std::size_t size_ = 0;
     explicit Overlay(const Overlay* previous) {
@@ -291,7 +297,7 @@ class HashGroupMap {
  public:
   class const_iterator {
    public:
-    using value_type = std::pair<const Key, RecoveredHashGroup>;
+    using value_type = std::pair<const Key, RecoveredGroupedRecord>;
     using reference = const value_type&;
     using pointer = const value_type*;
     reference operator*() const {
@@ -357,14 +363,14 @@ class HashGroupMap {
   }
   // Exact metadata lookup without constructing the ancestor stack needed by
   // an iterator. The returned pointer borrows this immutable tree version.
-  const RecoveredHashGroup* Get(Key key) const noexcept {
+  const RecoveredGroupedRecord* Get(Key key) const noexcept {
     if (overlay_)
       if (const auto* entry = overlay_->Find(key)) return &entry->second;
     return GetBase(key);
   }
 
  private:
-  const RecoveredHashGroup* GetBase(Key key) const noexcept {
+  const RecoveredGroupedRecord* GetBase(Key key) const noexcept {
     const auto* node = root_.get();
     while (node) {
       if (key == node->entry_.first) return &node->entry_.second;
@@ -374,12 +380,12 @@ class HashGroupMap {
   }
 
  public:
-  const RecoveredHashGroup& at(Key key) const {
+  const RecoveredGroupedRecord& at(Key key) const {
     const auto it = find(key);
     if (it == end()) throw std::out_of_range("group directory key");
     return it->second;
   }
-  const RecoveredHashGroup* Floor(Key key) const noexcept {
+  const RecoveredGroupedRecord* Floor(Key key) const noexcept {
     const Node* found = nullptr;
     auto* node = root_.get();
     while (node) {
@@ -395,7 +401,7 @@ class HashGroupMap {
         return &entry->second;
     return &found->entry_.second;
   }
-  absl::Status Set(Key key, RecoveredHashGroup value) {
+  absl::Status Set(Key key, RecoveredGroupedRecord value) {
     if (overlay_ && overlay_->Find(key)) return SetBuffered(key, value);
     auto next = SetNode(root_, key, value);
     if (!next.ok()) return next.status();
@@ -408,7 +414,7 @@ class HashGroupMap {
   // Require 1024 groups before starting an overlay; an existing overlay must
   // still resolve its entries if subsequent erases shrink the map. Bulk
   // recovery uses Set directly, without an existence lookup per insertion.
-  absl::Status SetBuffered(Key key, RecoveredHashGroup value) {
+  absl::Status SetBuffered(Key key, RecoveredGroupedRecord value) {
     const auto* current = overlay_ ? overlay_->Find(key) : nullptr;
     if (current || (size() >= 1024 && GetBase(key))) {
       if (!current && overlay_ && overlay_->size_ == Overlay::kCapacity) {
@@ -507,8 +513,8 @@ class HashGroupMap {
   }
   static std::size_t Size(const Link& node) { return node ? node->size_ : 0; }
   static unsigned Height(const Link& node) { return node ? node->height_ : 0; }
-  static absl::StatusOr<Link> Make(Key key, RecoveredHashGroup value, Link left,
-                                   Link right) {
+  static absl::StatusOr<Link> Make(Key key, RecoveredGroupedRecord value,
+                                   Link left, Link right) {
     auto reservation =
         TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(Node) + 1024));
     if (!reservation) {
@@ -524,7 +530,7 @@ class HashGroupMap {
                                           value, std::move(left),
                                           std::move(right)));
   }
-  static absl::StatusOr<Link> Balance(Key key, RecoveredHashGroup value,
+  static absl::StatusOr<Link> Balance(Key key, RecoveredGroupedRecord value,
                                       Link left, Link right) {
     if (Height(left) > Height(right) + 1) {
       if (Height(left->left_) >= Height(left->right_)) {
@@ -559,7 +565,7 @@ class HashGroupMap {
     return Make(key, value, std::move(left), std::move(right));
   }
   static absl::StatusOr<Link> SetNode(const Link& node, Key key,
-                                      RecoveredHashGroup value) {
+                                      RecoveredGroupedRecord value) {
     if (!node || key == node->entry_.first) {
       return Make(key, value, node ? node->left_ : Link{},
                   node ? node->right_ : Link{});
@@ -607,7 +613,7 @@ class HashGroupDirectory {
   // and is bounded by root.revision_, never by C.
   static absl::StatusOr<HashGroupDirectory> Recover(
       const GroupedHashRoot& root, std::uint64_t root_sequence,
-      std::span<const RecoveredHashGroup> candidates,
+      std::span<const RecoveredGroupedRecord> candidates,
       const absl::flat_hash_set<std::uint64_t>& committed_txids);
 
   // The second argument is the containing root's source command sequence C;
@@ -618,9 +624,9 @@ class HashGroupDirectory {
   // caller; this method never manufactures a durable commit decision.
   absl::StatusOr<HashGroupDirectory> Apply(
       const GroupedHashRoot& root, std::uint64_t sequence,
-      std::span<const RecoveredHashGroup> changes) const;
+      std::span<const RecoveredGroupedRecord> changes) const;
 
-  const RecoveredHashGroup* Find(std::string_view field) const noexcept;
+  const RecoveredGroupedRecord* Find(std::string_view field) const noexcept;
   const GroupedHashRoot& root() const noexcept { return root_; }
   std::uint64_t sequence() const noexcept { return sequence_; }
   std::uint64_t command_sequence() const noexcept { return command_sequence_; }
@@ -629,7 +635,7 @@ class HashGroupDirectory {
     return total_group_bytes_;
   }
   const HashGroupMap<std::uint64_t>& groups() const noexcept { return groups_; }
-  const HashGroupMap<HashGroupId>& retired_groups() const noexcept {
+  const HashGroupMap<GroupedRecordId>& retired_groups() const noexcept {
     return retired_;
   }
 
@@ -639,7 +645,7 @@ class HashGroupDirectory {
   std::uint64_t command_sequence_ = 0;
   std::uint64_t total_group_bytes_ = 0;
   HashGroupMap<std::uint64_t> groups_;
-  HashGroupMap<HashGroupId> retired_;
+  HashGroupMap<GroupedRecordId> retired_;
 };
 
 enum class HashGroupMutationKind { kSet, kSetIfAbsent, kDelete };

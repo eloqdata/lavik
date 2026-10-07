@@ -133,7 +133,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           -> Task<absl::StatusOr<const LoadedOrderedGroup*>> {
         if (source.probe_page_ && source.probe_index_ == index)
           co_return &*source.probe_page_;
-        const HashGroupId id{groups[index].id_, 0};
+        const GroupedRecordId id{groups[index].id_, 0};
         const auto* physical = object->FindGroup(id);
         if (!physical)
           co_return absl::DataLossError("missing Stream range page");
@@ -218,7 +218,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         const auto index =
             source.range_->reverse_ ? first - size : first + size;
         const auto& group = groups[index];
-        const HashGroupId id{group.id_, 0};
+        const GroupedRecordId id{group.id_, 0};
         const auto* physical = object->FindGroup(id);
         if (!physical)
           co_return absl::DataLossError("missing Stream read-window page");
@@ -317,7 +317,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         co_return CollectionPage{.value_type_ = ValueType::kStream,
                                  .done_ = true};
       }
-      HashGroupId id;
+      GroupedRecordId id;
       // This credit also outlives the decoded window on early return.
       MemoryReservation admission;
       std::unique_ptr<StreamPageWindow> window;

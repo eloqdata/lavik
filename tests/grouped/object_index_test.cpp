@@ -31,7 +31,7 @@ namespace {
 // below call the production API directly with deliberately different C and R.
 absl::StatusOr<HashGroupDirectory> Recover(
     GroupedHashRoot root, std::uint64_t sequence,
-    std::span<const RecoveredHashGroup> candidates,
+    std::span<const RecoveredGroupedRecord> candidates,
     const absl::flat_hash_set<std::uint64_t>& committed) {
   root.revision_ = sequence;
   return HashGroupDirectory::Recover(root, sequence, candidates, committed);
@@ -39,7 +39,7 @@ absl::StatusOr<HashGroupDirectory> Recover(
 
 absl::StatusOr<HashGroupDirectory> Apply(
     const HashGroupDirectory& directory, GroupedHashRoot root,
-    std::uint64_t sequence, std::span<const RecoveredHashGroup> changes) {
+    std::uint64_t sequence, std::span<const RecoveredGroupedRecord> changes) {
   root.revision_ = sequence;
   return directory.Apply(root, sequence, changes);
 }
@@ -57,7 +57,7 @@ RecordLocation GroupLocation(std::uint64_t block, std::uint64_t seq,
 struct ObjectInput {
   GroupedObjectVersion version_;
   HashGroupDirectory directory_;
-  std::vector<HashGroupLocation> locations_;
+  std::vector<GroupedRecordLocation> locations_;
 };
 
 ObjectInput Input(std::uint64_t sequence = 5, std::uint64_t incarnation = 1,
@@ -79,7 +79,7 @@ ObjectInput Input(std::uint64_t sequence = 5, std::uint64_t incarnation = 1,
       .seed_ = seed,
       .field_count_ = field_count,
       .group_count_ = static_cast<std::uint32_t>(groups->size())};
-  std::vector<RecoveredHashGroup> candidates;
+  std::vector<RecoveredGroupedRecord> candidates;
   ObjectInput input;
   input.version_ = {.root_ = GroupLocation(999999, sequence, field_count, true),
                     .db_epoch_ = 1,
@@ -113,7 +113,7 @@ absl::StatusOr<GroupedObject::Handle> Create(ObjectInput input) {
 TEST(GroupedObjectIndexTest,
      PhysicalGroupsUseRevisionNotSourceCommandSequence) {
   auto input = Input(100);
-  std::vector<RecoveredHashGroup> records;
+  std::vector<RecoveredGroupedRecord> records;
   for (const auto& [prefix, group] : input.directory_.groups())
     records.push_back(group);
   auto directory =
@@ -296,9 +296,9 @@ TEST(GroupedObjectIndexTest, CompressedPathsRetainAllHashPrefixLengthBits) {
   // one physical leaf is needed to retain their distinct length bytes.
   GroupedHashRoot root{
       .incarnation_ = 1, .field_count_ = 65, .group_count_ = 65};
-  std::vector<RecoveredHashGroup> candidates;
-  std::vector<HashGroupLocation> locations;
-  auto add = [&](HashGroupId id, bool retired) {
+  std::vector<RecoveredGroupedRecord> candidates;
+  std::vector<GroupedRecordLocation> locations;
+  auto add = [&](GroupedRecordId id, bool retired) {
     const auto block = locations.size() + 1;
     const unsigned count = retired ? 0 : 1;
     candidates.push_back({.incarnation_ = 1,
@@ -344,7 +344,7 @@ TEST(GroupedObjectIndexTest, CompressedPathsRetainAllHashPrefixLengthBits) {
   for (const auto& location : locations) {
     const auto* entry = (*moved)->FindRecord(location.id_);
     ASSERT_NE(entry, nullptr);
-    EXPECT_EQ(entry->value_.block_id(), location.id_ == HashGroupId(0, 7)
+    EXPECT_EQ(entry->value_.block_id(), location.id_ == GroupedRecordId(0, 7)
                                             ? 200
                                             : location.location_.block_id());
     EXPECT_EQ(entry->value_.mutation_sequence_,
@@ -352,7 +352,7 @@ TEST(GroupedObjectIndexTest, CompressedPathsRetainAllHashPrefixLengthBits) {
     EXPECT_EQ(entry->value_.logical_size(), location.location_.logical_size_);
   }
   (*moved)->ForEachRecord(
-      [&](HashGroupId id, const auto&, const auto&, bool retired) {
+      [&](GroupedRecordId id, const auto&, const auto&, bool retired) {
         EXPECT_EQ(retired, id.prefix_ == 0 && id.bits_ < 64);
       });
 }
@@ -678,8 +678,8 @@ TEST(GroupedObjectIndexTest, StoresOneCompactPhysicalIndexEntryPerGroup) {
     EXPECT_FALSE(location->value_.has_expiry());
     EXPECT_EQ(location, (*object)->FindGroup(route->id_));
   }
-  EXPECT_EQ((*object)->FindGroup(HashGroupId{1, 0}), nullptr);
-  EXPECT_EQ((*object)->ExtentsFor(HashGroupId{1, 0}), nullptr);
+  EXPECT_EQ((*object)->FindGroup(GroupedRecordId{1, 0}), nullptr);
+  EXPECT_EQ((*object)->ExtentsFor(GroupedRecordId{1, 0}), nullptr);
 }
 
 TEST(GroupedObjectIndexTest, NonGroupedRootBypassesSideTable) {
@@ -1037,7 +1037,7 @@ TEST(GroupedObjectIndexTest,
   ASSERT_TRUE(directory.ok()) << directory.status();
   auto version = input.version_;
   version.root_.mutation_sequence_ = 6;
-  HashGroupLocation changed{
+  GroupedRecordLocation changed{
       .id_ = changed_id,
       .location_ = GroupLocation(500000, 6, candidate.field_count_)};
   auto next = GroupedObject::PrepareUpdate(*old, version, *directory,
@@ -1085,7 +1085,7 @@ TEST(GroupedObjectIndexTest, SplitRetainsParentMarkerAcrossFurtherMutations) {
   old = std::move(moved);
   auto root = input.directory_.root();
   root.group_count_ = 2;
-  const std::array<RecoveredHashGroup, 3> changes{
+  const std::array<RecoveredGroupedRecord, 3> changes{
       {{.incarnation_ = 1, .id_ = {0, 0}, .sequence_ = 6, .retired_ = true},
        {.incarnation_ = 1, .id_ = {0, 1}, .sequence_ = 6, .field_count_ = 1},
        {.incarnation_ = 1,
@@ -1095,7 +1095,7 @@ TEST(GroupedObjectIndexTest, SplitRetainsParentMarkerAcrossFurtherMutations) {
   auto directory = Apply(input.directory_, root, 6, changes);
   ASSERT_TRUE(directory.ok()) << directory.status();
   ASSERT_EQ(directory->retired_groups().size(), 1);
-  const std::array<HashGroupLocation, 3> locations{
+  const std::array<GroupedRecordLocation, 3> locations{
       {{.id_ = {0, 0}, .location_ = GroupLocation(10, 6, 0), .retired_ = true},
        {.id_ = {0, 1}, .location_ = GroupLocation(11, 6, 1)},
        {.id_ = {1ULL << 63, 1}, .location_ = GroupLocation(12, 6, 1)}}};
@@ -1106,11 +1106,11 @@ TEST(GroupedObjectIndexTest, SplitRetainsParentMarkerAcrossFurtherMutations) {
   ASSERT_TRUE(next.ok()) << next.status();
   EXPECT_EQ((*next)->group_count(), 2);
   EXPECT_EQ((*next)->record_count(), 3);
-  EXPECT_EQ((*next)->FindGroup(HashGroupId{0, 0}), nullptr);
+  EXPECT_EQ((*next)->FindGroup(GroupedRecordId{0, 0}), nullptr);
   ASSERT_NE((*next)->FindRecord({0, 0}), nullptr);
   EXPECT_EQ((*next)->FindRecord({0, 0})->value_.block_id(), 10);
   unsigned active = 0, retired = 0;
-  (*next)->ForEachRecord([&](HashGroupId, const auto&, const auto&,
+  (*next)->ForEachRecord([&](GroupedRecordId, const auto&, const auto&,
                              bool marker) { marker ? ++retired : ++active; });
   EXPECT_EQ(active, 2);
   EXPECT_EQ(retired, 1);
@@ -1126,7 +1126,8 @@ TEST(GroupedObjectIndexTest, SplitRetainsParentMarkerAcrossFurtherMutations) {
   EXPECT_EQ(again->retired_groups().at({0, 0}).sequence_, 6);
   // An old complete parent physically surviving a GC cycle is still defeated
   // by its retained marker when cold recovery adjudicates the same incarnation.
-  std::vector<RecoveredHashGroup> candidates(changes.begin(), changes.end());
+  std::vector<RecoveredGroupedRecord> candidates(changes.begin(),
+                                                 changes.end());
   candidates.push_back(input.directory_.groups().at(0));
   auto recovered = Recover(root, 6, candidates, {});
   ASSERT_TRUE(recovered.ok()) << recovered.status();
@@ -1213,7 +1214,7 @@ TEST(GroupedObjectIndexTest,
   ASSERT_TRUE(directory.ok());
   auto version = input.version_;
   version.root_.mutation_sequence_ = 6;
-  HashGroupLocation physical{
+  GroupedRecordLocation physical{
       .id_ = change.id_,
       .location_ = GroupLocation(98765, 6, change.field_count_)};
   const auto before = WorkerMemoryAccountingBytes(0);
@@ -1236,7 +1237,7 @@ TEST(GroupedObjectIndexTest,
   auto input = Input(5, 1, 2, 4096);
   auto root = input.directory_.root();
   root.group_count_ = 2;
-  const std::array<RecoveredHashGroup, 2> incomplete{
+  const std::array<RecoveredGroupedRecord, 2> incomplete{
       {{.incarnation_ = 1, .id_ = {0, 0}, .sequence_ = 6, .retired_ = true},
        {.incarnation_ = 1, .id_ = {0, 1}, .sequence_ = 6, .field_count_ = 2}}};
   EXPECT_EQ(Apply(input.directory_, root, 6, incomplete).status().code(),
@@ -1249,7 +1250,7 @@ TEST(GroupedObjectIndexTest, RetiredMarkerCanKeepAnExternalParentKey) {
   auto input = Input(5, 1, 2, 4096);
   auto root = input.directory_.root();
   root.group_count_ = 2;
-  const std::array<RecoveredHashGroup, 3> changes{
+  const std::array<RecoveredGroupedRecord, 3> changes{
       {{.incarnation_ = 1, .id_ = {0, 0}, .sequence_ = 6, .retired_ = true},
        {.incarnation_ = 1, .id_ = {0, 1}, .sequence_ = 6, .field_count_ = 1},
        {.incarnation_ = 1,
@@ -1268,7 +1269,7 @@ TEST(GroupedObjectIndexTest, RetiredMarkerCanKeepAnExternalParentKey) {
                               .allocation_epoch_ = 17,
                               .payload_bytes_ = 1024,
                               .payload_checksum_ = 1}});
-  const std::array<HashGroupLocation, 3> locations{
+  const std::array<GroupedRecordLocation, 3> locations{
       {{.id_ = {0, 0},
         .location_ = marker,
         .extents_ = manifest,
@@ -1296,7 +1297,7 @@ TEST(GroupedObjectIndexTest,
   prepared.txid_ = 77;
   prepared.batch_txid_ = 100;
   prepared.record_token_ = 999;
-  const std::array<RecoveredHashGroup, 2> candidates{old, prepared};
+  const std::array<RecoveredGroupedRecord, 2> candidates{old, prepared};
   for (const auto& decisions : {absl::flat_hash_set<std::uint64_t>{},
                                 absl::flat_hash_set<std::uint64_t>{77},
                                 absl::flat_hash_set<std::uint64_t>{100}}) {
@@ -1362,12 +1363,12 @@ TEST(GroupedObjectIndexTest, CoordinateChangesPreserveSnapshotsAndTraversal) {
   auto original = Create(input);
   ASSERT_TRUE(original.ok()) << original.status();
   auto current = *original;
-  std::map<HashGroupId, std::uint64_t> expected;
+  std::map<GroupedRecordId, std::uint64_t> expected;
   for (const auto& group : input.locations_)
     expected.emplace(group.id_, group.location_.block_id());
   struct Snapshot {
     GroupedObject::Handle object;
-    std::map<HashGroupId, std::uint64_t> blocks;
+    std::map<GroupedRecordId, std::uint64_t> blocks;
   };
   std::vector<Snapshot> snapshots;
   // More distinct coordinates than fit a small overlay, followed by repeated
@@ -1385,8 +1386,8 @@ TEST(GroupedObjectIndexTest, CoordinateChangesPreserveSnapshotsAndTraversal) {
     expected[group.id_] = replacement.block_id();
     if (step % 7 == 0) snapshots.push_back({current, expected});
     EXPECT_EQ(current->record_count(), input.locations_.size());
-    std::map<HashGroupId, std::uint64_t> visited;
-    current->ForEachRecord([&](HashGroupId id,
+    std::map<GroupedRecordId, std::uint64_t> visited;
+    current->ForEachRecord([&](GroupedRecordId id,
                                const GroupedRecordIndexEntry& entry,
                                const auto& extents, bool retired) {
       EXPECT_FALSE(retired);
@@ -1438,7 +1439,7 @@ TEST(GroupedObjectIndexTest, ExternalReplacementFoldsPendingInlineCoordinates) {
   ASSERT_EQ(retained->size(), 1);
   EXPECT_EQ(retained->front().block_id_, 200000);
   std::size_t visited = 0;
-  (*external)->ForEachRecord([&](HashGroupId id,
+  (*external)->ForEachRecord([&](GroupedRecordId id,
                                  const GroupedRecordIndexEntry& entry,
                                  const auto& extents, bool retired) {
     ++visited;

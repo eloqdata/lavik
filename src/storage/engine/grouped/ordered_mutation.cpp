@@ -280,7 +280,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
               plan.writes_.begin(), plan.writes_.end(),
               [&](const auto& page) { return page.id_ == metadata.id_; });
           if (replaced) continue;
-          const HashGroupId id{metadata.id_, 0};
+          const GroupedRecordId id{metadata.id_, 0};
           const auto* entry = previous->FindGroup(id);
           if (entry == nullptr)
             co_return absl::DataLossError("missing ordered page for demotion");
@@ -375,7 +375,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   if (!reserved.ok()) co_return reserved.status();
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
-  std::vector<HashGroupLocation> written;
+  std::vector<GroupedRecordLocation> written;
   written.reserve(plan.writes_.size() + member_plan.writes_.size());
   // A failed batch in an outer transaction retains its staged bytes until the
   // outer commit retires them. Its existing fence must not point at a block we
@@ -420,7 +420,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
           co_return absl::ResourceExhaustedError(
               "OOM injected grouped auxiliary admission failure");
         });
-    absl::StatusOr<HashGroupLocation> group;
+    absl::StatusOr<GroupedRecordLocation> group;
     if (i < plan.writes_.size()) {
       group = co_await WriteOrderedGroupRecordLocked(
           store, partition, db_id, key, digest, plan.writes_[i],
@@ -440,8 +440,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     written.push_back(std::move(*group));
   }
   std::vector<RecoveredOrderedGroup> candidates;
-  std::vector<RecoveredHashGroup> member_candidates;
-  std::vector<HashGroupId> written_ids;
+  std::vector<RecoveredGroupedRecord> member_candidates;
+  std::vector<GroupedRecordId> written_ids;
   candidates.reserve(written.size());
   written_ids.reserve(written.size());
   for (std::size_t i = 0; i < written.size(); ++i) {

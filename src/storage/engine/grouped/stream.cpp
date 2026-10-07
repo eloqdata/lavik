@@ -94,7 +94,7 @@ struct StorageEngine::Impl::StreamPageAccess {
   Task<absl::Status> Load(std::size_t index) {
     if (pages_.contains(index)) co_return absl::OkStatus();
     const auto& groups = object_->ordered_directory().groups();
-    const HashGroupId id{groups[index].id_, 0};
+    const GroupedRecordId id{groups[index].id_, 0};
     const auto* physical = object_->FindGroup(id);
     if (!physical) co_return absl::DataLossError("missing Stream page");
     GroupedScratchBudget budget;
@@ -1637,7 +1637,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
   std::optional<MemoryReservation> probe_charge;
   auto load =
       [&](std::size_t index) -> Task<absl::StatusOr<LoadedOrderedGroup>> {
-    const HashGroupId id{groups[index].id_, 0};
+    const GroupedRecordId id{groups[index].id_, 0};
     const auto* physical = object->FindGroup(id);
     if (!physical) co_return absl::DataLossError("missing Stream probe page");
     GroupedScratchBudget budget;
@@ -1699,7 +1699,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
       if (shutdown_flush_requested_)
         co_return absl::CancelledError("Stream range interrupted by shutdown");
       co_await bycorf::Yield(*store.worker_);
-      const HashGroupId id{groups[index].id_, 0};
+      const GroupedRecordId id{groups[index].id_, 0};
       const auto* physical = object->FindGroup(id);
       if (!physical) co_return absl::DataLossError("missing Stream range page");
       GroupedScratchBudget budget;

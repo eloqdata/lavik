@@ -318,7 +318,7 @@ class OrderedGroupDirectory {
       const OrderedCollectionRoot& root, std::uint64_t revision,
       std::span<const RecoveredOrderedGroup> changed,
       std::uint64_t command_sequence,
-      std::span<const RecoveredHashGroup> member_changes = {}) const;
+      std::span<const RecoveredGroupedRecord> member_changes = {}) const;
 
   // Present only for dual-index Sorted Sets; its lifetime is this view's.
   const HashGroupDirectory* member_directory() const noexcept {
@@ -401,7 +401,7 @@ class OrderedGroupDirectory {
 // Ordered ids are nonzero opaque integers with zero prefix bits. Hash range
 // ids have either a nonzero bit count or the unique {0, 0} root range, so the
 // two graphs share one physical index without overlapping identities.
-inline bool IsOrderedPageId(HashGroupId id) noexcept {
+inline bool IsOrderedPageId(GroupedRecordId id) noexcept {
   return id.bits_ == 0 && id.prefix_ != 0;
 }
 

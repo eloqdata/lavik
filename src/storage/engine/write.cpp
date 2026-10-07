@@ -2502,7 +2502,7 @@ bool StorageEngine::Impl::ValidGroupedWrite(const RecordWriteRequest& request,
                               (request.value_type_ == ValueType::kSortedSet &&
                                IsOrderedPageId(group.id_));
     const bool valid_id =
-        ordered_page ? IsOrderedPageId(group.id_) : group.id_.valid();
+        ordered_page ? IsOrderedPageId(group.id_) : group.id_.IsHashPrefix();
     return group.incarnation_ != 0 && valid_id && request.expire_at_ms_ == 0 &&
            request.explicit_root_ == nullptr &&
            (!group.retired_ || logical_size == 0) &&
@@ -2511,7 +2511,7 @@ bool StorageEngine::Impl::ValidGroupedWrite(const RecordWriteRequest& request,
   }
 
   return (logical_size != 0 || request.value_type_ == ValueType::kStream) &&
-         group.incarnation_ == 0 && group.id_ == HashGroupId{} &&
+         group.incarnation_ == 0 && group.id_ == GroupedRecordId{} &&
          !group.retired_ && group.batch_txid_ == 0 &&
          group.prepared_root_ != nullptr && group.publication_ != nullptr;
 }

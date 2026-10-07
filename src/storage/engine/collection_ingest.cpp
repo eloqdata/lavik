@@ -252,8 +252,8 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
         ReserveIngestVector(restored_groups, old_records, state->undo_charge_);
     if (!reserved.ok()) co_return reserved;
     constexpr auto width = 4 * sizeof(RecoveredOrderedGroup) +
-                           4 * sizeof(RecoveredHashGroup) +
-                           4 * sizeof(HashGroupId);
+                           4 * sizeof(RecoveredGroupedRecord) +
+                           4 * sizeof(GroupedRecordId);
     constexpr auto maximum = std::numeric_limits<std::size_t>::max();
     if (key.size() > (maximum - 16384) / 4 ||
         old_records > (maximum - 16384 - key.size() * 4) / width)

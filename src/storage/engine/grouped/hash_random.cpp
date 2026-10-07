@@ -80,7 +80,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
       result.values_.capacity() * sizeof(result.values_[0]);
   result.retained_charge_.Account(CurrentMemoryAccountingShard(), output_bytes);
   struct Selection {
-    HashGroupId id_;
+    GroupedRecordId id_;
     std::uint64_t base_;
     std::size_t begin_, end_;
   };
@@ -100,7 +100,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
   if (base != result.length_ || cursor != samples.size())
     co_return absl::DataLossError("random sample directory count mismatch");
 
-  auto add_page = [&](GroupedScratchBudget* budget, HashGroupId id) {
+  auto add_page = [&](GroupedScratchBudget* budget, GroupedRecordId id) {
     const auto* record = object->FindGroup(id);
     return record == nullptr
                ? absl::DataLossError("random sample page is missing")
@@ -118,7 +118,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
     write_scratch.emplace(std::move(*admission));
   }
   HashValue remaining;
-  std::vector<HashGroupId> changed;
+  std::vector<GroupedRecordId> changed;
   changed.reserve(selected.size());
   for (std::size_t page_index = 0; page_index < selected.size(); ++page_index) {
     if (shutdown_flush_requested_)

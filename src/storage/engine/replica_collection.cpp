@@ -364,7 +364,7 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
                                      .value_ = {}});
     }
     HashValue after;
-    std::vector<HashGroupId> touched;
+    std::vector<GroupedRecordId> touched;
     if (previous) {
       // Each import batch may contain thousands of fields for the same group.
       // A linear search through the groups already loaded makes large Hash/Set

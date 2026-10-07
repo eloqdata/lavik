@@ -94,7 +94,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
   }
 
   auto add_group = [&](GroupedScratchBudget& budget,
-                       HashGroupId id) -> absl::Status {
+                       GroupedRecordId id) -> absl::Status {
     // Prior IO may have allowed physical relocation. Never use an old
     // manifest to admit the next read; the loader refreshes again before IO.
     const auto current =
@@ -233,7 +233,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
   plan.root_ = previous->directory().root();
   if (changes.empty()) co_return result;
 
-  std::map<HashGroupId, HashGroupSnapshot> leaves;
+  std::map<GroupedRecordId, HashGroupSnapshot> leaves;
   for (const auto& [member, change] : changes) {
     const auto* route = previous->directory().Find(member);
     if (!route) co_return absl::DataLossError("member has no prefix route");

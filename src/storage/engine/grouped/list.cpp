@@ -176,7 +176,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
         if (step != 0) co_await bycorf::Yield(*store.worker_);
         const auto index =
             reverse ? directory.groups().size() - 1 - step : step;
-        const HashGroupId id{directory.groups()[index].id_, 0};
+        const GroupedRecordId id{directory.groups()[index].id_, 0};
         const auto* physical = object->FindGroup(id);
         if (physical == nullptr)
           co_return absl::DataLossError("missing List search page");
@@ -316,7 +316,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
   }
   GroupedScratchBudget page_budget;
   for (std::size_t i = begin_page; i < end_page; ++i) {
-    const HashGroupId id{directory.groups()[i].id_, 0};
+    const GroupedRecordId id{directory.groups()[i].id_, 0};
     const auto* entry = object->FindGroup(id);
     if (entry == nullptr)
       co_return absl::DataLossError("missing List scratch page");

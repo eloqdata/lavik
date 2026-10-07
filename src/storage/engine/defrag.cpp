@@ -428,8 +428,8 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
     digest = ComputeDigest(key);
   }
   if (record.auxiliary_group_) {
-    const HashGroupId id{.prefix_ = record.group_prefix_,
-                         .bits_ = record.group_prefix_bits_};
+    const GroupedRecordId id{.prefix_ = record.group_prefix_,
+                             .bits_ = record.group_prefix_bits_};
     auto lookup_object = [&]() -> Task<absl::StatusOr<GroupedObject::Handle>> {
       if (EffectiveRecordDbEpoch(partition, record.db_id_) !=
               record.db_epoch_ ||

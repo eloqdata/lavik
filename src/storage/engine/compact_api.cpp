@@ -270,7 +270,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
                    : OrderedCollectionKind::kSortedSet))
         co_return absl::DataLossError("invalid ordered callback view");
       for (const auto& page : grouped->ordered_directory().groups()) {
-        const HashGroupId id{page.id_, 0};
+        const GroupedRecordId id{page.id_, 0};
         const auto* entry = grouped->FindGroup(id);
         if (!entry)
           co_return absl::DataLossError("missing Sorted Set callback page");
