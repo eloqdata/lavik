@@ -20,6 +20,7 @@
 // path. The authoritative-image recovery suite deliberately remains separate.
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -229,6 +230,19 @@ class Client {
     while (std::chrono::steady_clock::now() < until) {
       fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
       Check(fd_ >= 0, "socket failed");
+      // These servers deliberately use a small receive ring. On CI loopback,
+      // a ~64 KiB MSS can exceed a reopened receive window and leave bulk
+      // uploads advancing only on TCP's window-probe timer. Negotiate smaller
+      // segments before connecting; keep the storage deadlines unchanged.
+      const int max_segment = 16 * 1024;
+      if (::setsockopt(fd_, IPPROTO_TCP, TCP_MAXSEG, &max_segment,
+                       sizeof(max_segment)) != 0) {
+        const int error = errno;
+        ::close(fd_);
+        fd_ = -1;
+        throw std::runtime_error("setting test TCP_MAXSEG failed: " +
+                                 std::string(std::strerror(error)));
+      }
       sockaddr_in address{.sin_family = AF_INET,
                           .sin_port = htons(port),
                           .sin_addr = {.s_addr = htonl(INADDR_LOOPBACK)}};
