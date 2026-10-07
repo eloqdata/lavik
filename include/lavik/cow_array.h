@@ -31,24 +31,26 @@
 #include "absl/status/statusor.h"
 #include "lavik/local_shared_ptr.h"
 #include "lavik/memory.h"
-#include "lavik/storage/scan_hash_map.h"
+#include "lavik/retained_allocator.h"
 
-namespace lavik::storage {
+namespace lavik {
 
-// Immutable-view routing metadata, never value payloads. Both data chunks and
-// their radix pointer tree are owner-local copy-on-write allocations. Updating
-// an unpublished view detaches only the root-to-chunk path, so a point write
-// does not retain/release pointers to every chunk of a large collection.
+// Owner-thread copy-on-write array with chunked storage and a radix pointer
+// tree. Copying shares the root; a point write detaches only its root-to-chunk
+// path. All copies, access and destruction stay on the allocating thread.
 // Each allocation admits/accounts itself once until its last view releases it.
-// Access and destruction stay on the key owner, as with Hash routing nodes.
+//
+// T must be default/copy constructible, copy assignable and trivially
+// destructible. Elements are copied by value; any referenced resources remain
+// the caller's responsibility. This container does not validate element values.
 template <typename T, std::size_t ChunkEntries = 32>
-class GroupedMetadataArray {
+class CowArray {
   static_assert(ChunkEntries != 0 && std::is_trivially_destructible_v<T>);
   static constexpr unsigned kBranchBits = 5;
   static constexpr std::size_t kBranchEntries = 1 << kBranchBits;
   struct Chunk {
-    // Construct checked values in place. Value-initializing a full metadata
-    // chunk first would clear every byte only to overwrite it immediately.
+    // Construct values in place. Value-initializing a full chunk first
+    // would clear every byte only to overwrite it immediately.
     explicit Chunk(std::span<const T> values)
         : Chunk(values, std::make_index_sequence<ChunkEntries>{}) {}
 
@@ -122,16 +124,16 @@ class GroupedMetadataArray {
     auto operator<=>(const const_iterator&) const = default;
 
    private:
-    friend class GroupedMetadataArray;
-    const_iterator(const GroupedMetadataArray* owner, std::size_t index)
+    friend class CowArray;
+    const_iterator(const CowArray* owner, std::size_t index)
         : owner_(owner), index_(index) {}
-    const GroupedMetadataArray* owner_ = nullptr;
+    const CowArray* owner_ = nullptr;
     std::size_t index_ = 0;
   };
 
-  // Build only after recovery/planning has checked the complete metadata.
-  static absl::StatusOr<GroupedMetadataArray> From(std::span<const T> values) {
-    GroupedMetadataArray result;
+  // Copy values into a new array; admission failure releases partial storage.
+  static absl::StatusOr<CowArray> From(std::span<const T> values) {
+    CowArray result;
     if (values.empty()) return result;
     const auto chunks = 1 + (values.size() - 1) / ChunkEntries;
     for (auto remaining = (chunks - 1) >> kBranchBits; remaining != 0;
@@ -146,12 +148,11 @@ class GroupedMetadataArray {
 
   // Return a longer immutable view, sharing the existing chunks except a
   // partially filled tail. Admission failure leaves this view untouched.
-  absl::StatusOr<GroupedMetadataArray> Appended(
-      std::span<const T> values) const {
+  absl::StatusOr<CowArray> Appended(std::span<const T> values) const {
     if (empty()) return From(values);
     if (values.empty()) return *this;
     if (values.size() > std::numeric_limits<std::size_t>::max() - size_)
-      return absl::ResourceExhaustedError("ordered metadata size overflows");
+      return absl::ResourceExhaustedError("copy-on-write array size overflows");
     auto result = *this;
     const auto size = size_ + values.size();
     const auto last_chunk = (size - 1) / ChunkEntries;
@@ -209,8 +210,9 @@ class GroupedMetadataArray {
   const_iterator begin() const noexcept { return {this, 0}; }
   const_iterator end() const noexcept { return {this, size()}; }
 
-  // Only an unpublished directory may call Set. Admission failure preserves
-  // all values, but may leave an identical, partially detached pointer path.
+  // Mutate this view, preserving copies of it. References into this view may
+  // be invalidated. Admission failure preserves all values, but may leave
+  // an identical, partially detached pointer path.
   // That path remains valid and accounted; a retry can finish detaching it.
   absl::Status Set(std::size_t index, const T& value) {
     assert(index < size());
@@ -274,7 +276,7 @@ class GroupedMetadataArray {
     if (!reservation) {
       RecordMemoryRejection();
       return absl::ResourceExhaustedError(
-          "OOM ordered metadata exceeds maxmemory");
+          "OOM copy-on-write array exceeds maxmemory");
     }
     RetainedAllocationDomain domain{
         .owner_shard_ = CurrentMemoryAccountingShard(),
@@ -318,4 +320,4 @@ class GroupedMetadataArray {
   unsigned root_shift_ = 0;
 };
 
-}  // namespace lavik::storage
+}  // namespace lavik

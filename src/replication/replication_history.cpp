@@ -25,6 +25,7 @@
 #include <utility>
 
 #include "lavik/memory.h"
+#include "lavik/retained_allocator.h"
 #include "lavik/storage/format.h"
 #include "log_block.h"
 
@@ -75,13 +76,11 @@ struct ReplicationHistory::Impl {
   // Export builds this index on demand, once per immutable prefix. Normal
   // receive/apply never allocates or updates a per-record lookup index.
   struct Block : detail::ReplicationLogBlock {
-    using Index =
-        std::vector<IndexEntry, storage::RetainedAllocator<IndexEntry>>;
+    using Index = std::vector<IndexEntry, RetainedAllocator<IndexEntry>>;
     explicit Block(detail::ReplicationLogBlock block)
         : detail::ReplicationLogBlock(std::move(block)),
-          index_(storage::RetainedAllocator<IndexEntry>(
-              storage::RetainedAllocationDomain{.externally_admitted_ =
-                                                    true})) {}
+          index_(RetainedAllocator<IndexEntry>(
+              RetainedAllocationDomain{.externally_admitted_ = true})) {}
     Index index_;
     std::uint32_t record_count_ = 0;
     std::uint32_t indexed_bytes_ = 0;

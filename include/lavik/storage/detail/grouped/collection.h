@@ -27,9 +27,9 @@
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
+#include "lavik/cow_array.h"
 #include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped/hash.h"
-#include "lavik/storage/detail/grouped/metadata_array.h"
 #include "lavik/storage/detail/grouped/ordered_index.h"
 #include "lavik/storage/format.h"
 
@@ -353,11 +353,10 @@ class OrderedGroupDirectory {
   std::optional<std::size_t> FindIndex(std::uint64_t id) const noexcept;
   const RecoveredOrderedGroup* Find(std::uint64_t id) const noexcept;
   const RecoveredOrderedGroup* FindRecord(std::uint64_t id) const noexcept;
-  const GroupedMetadataArray<RecoveredOrderedGroup>& groups() const noexcept {
+  const CowArray<RecoveredOrderedGroup>& groups() const noexcept {
     return groups_;
   }
-  const GroupedMetadataArray<RecoveredOrderedGroup>& retired_groups()
-      const noexcept {
+  const CowArray<RecoveredOrderedGroup>& retired_groups() const noexcept {
     return retired_;
   }
   // Only the key-owning worker may learn missing boundaries from decoded
@@ -383,9 +382,9 @@ class OrderedGroupDirectory {
   std::uint64_t sequence_ = 0;
   std::uint64_t command_sequence_ = 0;
   std::uint64_t total_group_bytes_ = 0;
-  GroupedMetadataArray<RecoveredOrderedGroup> groups_;
-  GroupedMetadataArray<RecoveredOrderedGroup> retired_;
-  GroupedMetadataArray<std::pair<std::uint64_t, std::size_t>, 256> ids_;
+  CowArray<RecoveredOrderedGroup> groups_;
+  CowArray<RecoveredOrderedGroup> retired_;
+  CowArray<std::pair<std::uint64_t, std::size_t>, 256> ids_;
   // List, ZSet and Stream share the same Fenwick rank representation. String
   // leaves this index empty and uses fixed-segment arithmetic instead.
   OrderedIndex ranks_;

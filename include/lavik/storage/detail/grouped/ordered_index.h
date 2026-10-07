@@ -27,7 +27,7 @@
 
 #include "absl/container/inlined_vector.h"
 #include "absl/numeric/int128.h"
-#include "lavik/storage/detail/grouped/metadata_array.h"
+#include "lavik/cow_array.h"
 
 namespace lavik::storage {
 
@@ -143,7 +143,7 @@ class OrderedIndex {
   std::size_t RetainedBytes() const noexcept { return cells_.RetainedBytes(); }
 
  private:
-  using Storage = GroupedMetadataArray<std::uint64_t, 256>;
+  using Storage = CowArray<std::uint64_t, 256>;
   Storage cells_;
 
   absl::Status ApplyPartialSums(std::span<const CountChange> count_changes,
