@@ -198,6 +198,14 @@ class GroupedObject {
   void ForEachRecord(const RecordVisitor& visitor) const;
 
  private:
+  // Common physical ownership validation and allocation; directory-specific
+  // invariants are checked through overloads before constructing the view.
+  template <typename Directory>
+  static absl::StatusOr<PreparedHandle> PrepareCreateImpl(
+      GroupedObjectVersion version, Directory directory,
+      std::span<const GroupedRecordLocation> locations,
+      std::shared_ptr<ScanHashMapEntryArena> arena);
+
   GroupedObjectVersion version_;
   // Directory nodes. Manifest copies carry independent shared charges so
   // their readers can outlive this object without escaping maxmemory.

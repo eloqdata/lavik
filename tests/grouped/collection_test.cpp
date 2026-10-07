@@ -738,6 +738,55 @@ TEST(GroupedCollectionTest, SparseSameTopologyUpdateMatchesFullRecovery) {
   EXPECT_FALSE(original->Apply(root, 2, std::span(&changed, 1), 2).ok());
 }
 
+TEST(GroupedCollectionTest, RootKindOwnsRankLayoutAcrossSharedViews) {
+  for (const auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kStream}) {
+    std::vector<OrderedGroupSnapshot> pages;
+    const std::array<std::size_t, 4> counts{3, 4, 2, 5};
+    for (std::size_t i = 0; i < counts.size(); ++i) {
+      auto page = Page(i + 1, counts[i], kind);
+      page.previous_ = i;
+      page.next_ = i + 1 == counts.size() ? 0 : i + 2;
+      pages.push_back(std::move(page));
+    }
+    auto root = Root(pages, 5);
+    if (kind == OrderedCollectionKind::kStream) root.stream_length_ = 0;
+    auto original =
+        OrderedGroupDirectory::Recover(root, 1, Candidates(pages), {});
+    ASSERT_TRUE(original.ok()) << original.status();
+    EXPECT_EQ(original->CountBefore(3), 9);
+    ASSERT_TRUE(original->FindRank(8));
+    EXPECT_EQ(original->FindRank(8)->group_index_, 2);
+
+    auto changed = original->groups()[1];
+    changed.sequence_ = changed.lsn_ = root.revision_ = 2;
+    ++changed.item_count_;
+    ++root.item_count_;
+    const std::array changes{changed};
+    auto updated = original->Apply(root, 2, changes, 2);
+    ASSERT_TRUE(updated.ok()) << updated.status();
+    EXPECT_EQ(updated->CountBefore(3), 10);
+    ASSERT_TRUE(updated->FindRank(7));
+    EXPECT_EQ(updated->FindRank(7)->group_index_, 1);
+    EXPECT_EQ(original->CountBefore(3), 9);
+    ASSERT_TRUE(original->FindRank(7));
+    EXPECT_EQ(original->FindRank(7)->group_index_, 2);
+
+    // Untagged cells must never be reinterpreted through the other policy,
+    // even when the replacement root is otherwise a valid collection kind.
+    root.kind_ = kind == OrderedCollectionKind::kStream
+                     ? OrderedCollectionKind::kList
+                     : OrderedCollectionKind::kStream;
+    if (root.kind_ == OrderedCollectionKind::kStream)
+      root.stream_length_ = 0;
+    else
+      root.stream_length_.reset();
+    EXPECT_EQ(original->Apply(root, 2, changes, 2).status().code(),
+              absl::StatusCode::kFailedPrecondition);
+    EXPECT_EQ(original->CountBefore(3), 9);
+  }
+}
+
 TEST(GroupedCollectionTest, PageLookupHandlesContiguousAndSparseIds) {
   auto first = Page(7, 2);
   auto second = Page(8, 2);

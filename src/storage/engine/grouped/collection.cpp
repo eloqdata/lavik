@@ -31,64 +31,13 @@
 namespace lavik::storage {
 namespace {
 
-// Stream trim/append transfers counts across distant pages. A Fenwick index
-// stores bounded partial sums instead of materializing every intervening
-// cumulative rank after each transfer. It is runtime metadata only.
-void BuildStreamRanks(std::vector<std::uint64_t>& counts) {
-  for (std::size_t i = counts.size(); i > 1; --i)
-    counts[i - 1] -= counts[i - 2];
-  for (std::size_t i = 0; i < counts.size(); ++i) {
-    const auto parent = i | (i + 1);
-    if (parent < counts.size()) counts[parent] += counts[i];
-  }
-}
-
-// Update existing Fenwick cells after a checked count change. Appended cells
-// can already include those deltas; existing_size bounds propagation in that
-// case so the new tail is not adjusted twice.
-absl::Status UpdateStreamRanks(
-    GroupedMetadataArray<std::uint64_t, 256>& ends,
-    std::span<const std::pair<std::size_t, absl::int128>> count_changes,
-    std::uint64_t item_count, std::size_t existing_size) {
-  using RankChange = std::pair<std::size_t, absl::int128>;
-  absl::InlinedVector<RankChange, 32> rank_changes;
-  const auto changed_counts =
-      std::count_if(count_changes.begin(), count_changes.end(),
-                    [](const auto& change) { return change.second != 0; });
-  if (changed_counts == 0) return absl::OkStatus();
-  const auto updates = changed_counts * (std::bit_width(existing_size) + 1);
-  // Reserve the complete temporary update list before allocating it.
-  // Changed page identities are unique and bounded by the 32-bit root
-  // page count, so this product fits size_t on supported 64-bit targets.
-  auto admission = TryReserveMemory(
-      AllocatorUsableSizeForRequest(updates * sizeof(RankChange) + 1024));
-  if (!admission) {
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Stream rank update scratch");
-  }
-  rank_changes.reserve(updates);
-  for (const auto& [index, delta] : count_changes) {
-    if (delta == 0) continue;
-    for (std::size_t i = index + 1; i <= existing_size; i += i & (~i + 1))
-      rank_changes.emplace_back(i - 1, delta);
-  }
-  std::sort(rank_changes.begin(), rank_changes.end());
-  // Combine changes before setting a partial sum: a valid batch may add
-  // and remove counts from the same subtree in either command order.
-  for (std::size_t i = 0; i < rank_changes.size();) {
-    const auto index = rank_changes[i].first;
-    absl::int128 delta = 0;
-    do {
-      delta += rank_changes[i++].second;
-    } while (i < rank_changes.size() && rank_changes[i].first == index);
-    if (delta == 0) continue;
-    const auto value = absl::int128(ends[index]) + delta;
-    if (value < 0 || value > item_count)
-      return absl::DataLossError("invalid Stream updated rank sum");
-    auto status = ends.Set(index, static_cast<std::uint64_t>(value));
-    if (!status.ok()) return status;
-  }
-  return absl::OkStatus();
+// The durable kind selects a runtime-only rank policy. String directories
+// pass an empty array and keep their direct segment arithmetic.
+absl::StatusOr<OrderedRankStorage> BuildRanks(
+    OrderedCollectionKind kind, std::vector<std::uint64_t> cumulative) {
+  if (kind == OrderedCollectionKind::kStream)
+    return FenwickRankOps::FromCumulative(std::move(cumulative));
+  return CumulativeRankOps::FromCumulative(std::move(cumulative));
 }
 
 constexpr std::string_view kRootMagic = "LOCROOT1";
@@ -780,13 +729,12 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
   if (!retired_array.ok()) return retired_array.status();
   auto id_array = decltype(result.ids_)::From(ids);
   if (!id_array.ok()) return id_array.status();
-  if (root.kind_ == OrderedCollectionKind::kStream) BuildStreamRanks(ends);
-  auto end_array = decltype(result.ends_)::From(ends);
+  auto end_array = BuildRanks(root.kind_, std::move(ends));
   if (!end_array.ok()) return end_array.status();
   result.groups_ = std::move(*group_array);
   result.retired_ = std::move(*retired_array);
   result.ids_ = std::move(*id_array);
-  result.ends_ = std::move(*end_array);
+  result.ranks_ = std::move(*end_array);
   return result;
 }
 
@@ -956,7 +904,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     result.groups_ = groups_;
     result.retired_ = retired_;
     result.ids_ = ids_;
-    result.ends_ = ends_;
+    result.ranks_ = ranks_;
     result.members_ = std::move(members);
     if (root.kind_ == OrderedCollectionKind::kStream && has_stream_header_) {
       result.stream_header_ = stream_header_;
@@ -1002,41 +950,12 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
                 result.groups_[index + 1].min_score_)))
         return absl::DataLossError("unordered updated Sorted Set score bounds");
     }
-    if (root.kind_ == OrderedCollectionKind::kStream) {
-      auto status = UpdateStreamRanks(result.ends_, count_changes,
-                                      root.item_count_, ends_.size());
-      if (!status.ok()) return status;
-      return result;
-    }
-    // Count-neutral replacements share all rank metadata. A redistribution
-    // updates only the affected interval, stopping once the net delta is zero.
-    absl::int128 delta = 0;
-    std::size_t cursor = 0;
-    for (std::size_t n = 0; n < count_changes.size(); ++n) {
-      const auto [index, change] = count_changes[n];
-      if (delta != 0) {
-        for (; cursor < index; ++cursor) {
-          const auto value = absl::int128(ends_[cursor]) + delta;
-          if (value < 0 || value > root.item_count_)
-            return absl::DataLossError("invalid ordered updated rank");
-          auto status =
-              result.ends_.Set(cursor, static_cast<std::uint64_t>(value));
-          if (!status.ok()) return status;
-        }
-      }
-      delta += change;
-      cursor = index;
-    }
-    if (delta != 0) {
-      for (; cursor < ends_.size(); ++cursor) {
-        const auto value = absl::int128(ends_[cursor]) + delta;
-        if (value < 0 || value > root.item_count_)
-          return absl::DataLossError("invalid ordered updated rank");
-        auto status =
-            result.ends_.Set(cursor, static_cast<std::uint64_t>(value));
-        if (!status.ok()) return status;
-      }
-    }
+    auto status = root.kind_ == OrderedCollectionKind::kStream
+                      ? FenwickRankOps::ApplyCounts(
+                            result.ranks_, count_changes, root.item_count_)
+                      : CumulativeRankOps::ApplyCounts(
+                            result.ranks_, count_changes, root.item_count_);
+    if (!status.ok()) return status;
     return result;
   }
   // Foreground updates contain one decided replacement per changed identity.
@@ -1107,10 +1026,9 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
         return absl::ResourceExhaustedError("OOM Stream suffix update scratch");
       }
       std::vector<const RecoveredOrderedGroup*> suffix;
-      std::vector<std::uint64_t> prefixes, ends;
+      std::vector<std::uint64_t> prefixes;
       suffix.reserve(suffix_size);
       prefixes.reserve(suffix_size);
-      ends.reserve(suffix_size);
       absl::InlinedVector<std::pair<std::size_t, absl::int128>, 8>
           prefix_changes;
       absl::int128 prefix_count = CountBefore(first);
@@ -1143,16 +1061,6 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
         count += item->item_count_;
         if (count > root.item_count_)
           return absl::DataLossError("Stream suffix count overflow");
-        const auto start = (index + 1) & index;
-        absl::int128 before = prefix_count;
-        if (start < first) {
-          before = CountBefore(start);
-          for (const auto& [changed_index, delta] : prefix_changes)
-            if (changed_index < start) before += delta;
-        } else if (start > first) {
-          before = prefixes[start - first - 1];
-        }
-        ends.push_back(static_cast<std::uint64_t>(count - before));
         prefixes.push_back(static_cast<std::uint64_t>(count));
         suffix.push_back(item);
         previous = id;
@@ -1177,11 +1085,12 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       if (!groups.ok()) return groups.status();
       auto ids = ids_.Appended(new_ids);
       if (!ids.ok()) return ids.status();
-      auto ranks = ends_.Appended(std::span(ends).subspan(old_suffix_size));
+      auto ranks = FenwickRankOps::WithSuffix(ranks_, first, prefixes,
+                                              prefix_changes, root.item_count_);
       if (!ranks.ok()) return ranks.status();
       rebuilt.groups_ = std::move(*groups);
       rebuilt.ids_ = std::move(*ids);
-      rebuilt.ends_ = std::move(*ranks);
+      rebuilt.ranks_ = std::move(*ranks);
       rebuilt.retired_ = retired_;
       rebuilt.total_group_bytes_ = static_cast<std::uint64_t>(bytes);
       for (std::size_t i = 0; i < suffix.size(); ++i) {
@@ -1191,8 +1100,6 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
           item.txid_ = 0;
           item.batch_txid_ = 0;
           auto status = rebuilt.groups_.Set(index, item);
-          if (!status.ok()) return status;
-          status = rebuilt.ends_.Set(index, ends[i]);
           if (!status.ok()) return status;
         }
         const auto found = std::lower_bound(
@@ -1213,11 +1120,6 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
           if (!status.ok()) return status;
         }
       }
-      // Suffix cells already contain changed prefix counts. Propagate only
-      // through the unchanged prefix to avoid applying those deltas twice.
-      auto status = UpdateStreamRanks(rebuilt.ends_, prefix_changes,
-                                      root.item_count_, first);
-      if (!status.ok()) return status;
       if (has_stream_header_ && !changed_ids.contains(root.first_group_)) {
         rebuilt.stream_header_ = stream_header_;
         rebuilt.has_stream_header_ = true;
@@ -1360,12 +1262,11 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
   }
   auto id_array = decltype(ids_)::From(ids);
   if (!id_array.ok()) return id_array.status();
-  if (root.kind_ == OrderedCollectionKind::kStream) BuildStreamRanks(ends);
-  auto end_array = decltype(ends_)::From(ends);
+  auto end_array = BuildRanks(root.kind_, std::move(ends));
   if (!end_array.ok()) return end_array.status();
   rebuilt.groups_ = std::move(*group_array);
   rebuilt.ids_ = std::move(*id_array);
-  rebuilt.ends_ = std::move(*end_array);
+  rebuilt.ranks_ = std::move(*end_array);
   if (root.kind_ == OrderedCollectionKind::kStream && has_stream_header_) {
     const auto* old_first = Find(root_.first_group_);
     const auto* new_first = rebuilt.Find(root.first_group_);
@@ -1385,12 +1286,9 @@ std::uint64_t OrderedGroupDirectory::CountBefore(
   if (index >= groups_.size()) return root_.item_count_;
   if (root_.kind_ == OrderedCollectionKind::kString)
     return index * kStringGroupBytes;
-  if (root_.kind_ == OrderedCollectionKind::kStream) {
-    std::uint64_t count = 0;
-    for (; index != 0; index -= index & (~index + 1)) count += ends_[index - 1];
-    return count;
-  }
-  return ends_[index - 1];
+  return root_.kind_ == OrderedCollectionKind::kStream
+             ? FenwickRankOps::CountBefore(ranks_, index)
+             : CumulativeRankOps::CountBefore(ranks_, index);
 }
 
 std::optional<OrderedGroupDirectory::Position> OrderedGroupDirectory::FindRank(
@@ -1398,22 +1296,9 @@ std::optional<OrderedGroupDirectory::Position> OrderedGroupDirectory::FindRank(
   if (rank >= root_.item_count_) return std::nullopt;
   if (root_.kind_ == OrderedCollectionKind::kString)
     return Position{rank / kStringGroupBytes, rank % kStringGroupBytes};
-  if (root_.kind_ == OrderedCollectionKind::kStream) {
-    std::size_t index = 0;
-    std::uint64_t count = 0;
-    for (auto stride = std::bit_floor(ends_.size()); stride != 0;
-         stride >>= 1) {
-      const auto next = index + stride;
-      if (next <= ends_.size() && ends_[next - 1] <= rank - count) {
-        count += ends_[next - 1];
-        index = next;
-      }
-    }
-    return Position{index, rank - count};
-  }
-  const auto found = std::upper_bound(ends_.begin(), ends_.end(), rank);
-  const std::size_t index = found - ends_.begin();
-  return Position{index, rank - (index == 0 ? 0 : ends_[index - 1])};
+  return root_.kind_ == OrderedCollectionKind::kStream
+             ? FenwickRankOps::Locate(ranks_, rank)
+             : CumulativeRankOps::Locate(ranks_, rank);
 }
 
 std::size_t OrderedGroupDirectory::LowerBoundScore(

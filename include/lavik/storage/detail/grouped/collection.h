@@ -30,6 +30,7 @@
 #include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped/hash.h"
 #include "lavik/storage/detail/grouped/metadata_array.h"
+#include "lavik/storage/detail/grouped/rank_index.h"
 #include "lavik/storage/format.h"
 
 namespace lavik::storage {
@@ -325,10 +326,7 @@ class OrderedGroupDirectory {
     return members_ ? &*members_ : nullptr;
   }
 
-  struct Position {
-    std::size_t group_index_;
-    std::uint64_t offset_;
-  };
+  using Position = OrderedRankPosition;
   std::optional<Position> FindRank(std::uint64_t rank) const noexcept;
   // Number of records in pages preceding index; index may equal
   // groups().size().
@@ -377,7 +375,7 @@ class OrderedGroupDirectory {
   // allocation accounts itself; callers use this only for scratch planning.
   std::size_t RetainedBytes() const noexcept {
     return groups_.RetainedBytes() + retired_.RetainedBytes() +
-           ids_.RetainedBytes() + ends_.RetainedBytes();
+           ids_.RetainedBytes() + ranks_.RetainedBytes();
   }
 
  private:
@@ -388,9 +386,10 @@ class OrderedGroupDirectory {
   GroupedMetadataArray<RecoveredOrderedGroup> groups_;
   GroupedMetadataArray<RecoveredOrderedGroup> retired_;
   GroupedMetadataArray<std::pair<std::uint64_t, std::size_t>, 256> ids_;
-  // Lists/Sorted Sets retain cumulative ranks. Streams use Fenwick partial
-  // sums so append/trim count transfers detach only logarithmic rank cells.
-  GroupedMetadataArray<std::uint64_t, 256> ends_;
+  // root_.kind_ is the sole rank-layout discriminator: Stream uses Fenwick,
+  // List/ZSet use cumulative counts, and String leaves this storage empty.
+  // Apply rejects kind changes before sharing cells with a successor view.
+  OrderedRankStorage ranks_;
   mutable std::array<char, 48> stream_header_{};
   mutable bool has_stream_header_ = false;
   // The inline directory shares owner-local AVL nodes; those nodes account

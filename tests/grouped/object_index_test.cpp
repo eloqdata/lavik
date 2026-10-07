@@ -144,6 +144,135 @@ class GroupedMemoryScope {
   unsigned shard_;
 };
 
+TEST(GroupedMetadataMapTest, GenericValuesSurviveOverlayFoldingAndErasure) {
+  GroupedMemoryScope memory;
+  GroupedMetadataMap<std::uint64_t, std::uint64_t> map;
+  std::map<std::uint64_t, std::uint64_t> expected;
+  for (std::uint64_t i = 0; i < 1100; ++i) {
+    ASSERT_TRUE(map.Set(i * 2, i).ok());
+    expected.emplace(i * 2, i);
+  }
+  const auto original = map;
+  // More than eight distinct replacements exercise a fold, followed by a
+  // fresh overlay. Erasure must remove an override as well as the base node.
+  for (std::uint64_t i = 0; i < 12; ++i) {
+    ASSERT_TRUE(map.SetBuffered(i * 100, i + 10000).ok());
+    expected[i * 100] = i + 10000;
+  }
+  const auto replaced = map;
+  ASSERT_TRUE(map.Erase(1100).ok());
+  expected.erase(1100);
+  ASSERT_TRUE(map.Set(1101, 42).ok());
+  expected[1101] = 42;
+  EXPECT_EQ(map.Get(1100), nullptr);
+  ASSERT_NE(replaced.Get(1100), nullptr);
+  EXPECT_EQ(*replaced.Get(1100), 10011);
+  ASSERT_NE(original.Get(1100), nullptr);
+  EXPECT_EQ(*original.Get(1100), 550);
+  EXPECT_EQ(*map.Floor(1100), expected.at(1098));
+  EXPECT_EQ(*map.Floor(1101), 42);
+  auto entry = map.begin();
+  for (const auto& [key, value] : expected) {
+    ASSERT_NE(entry, map.end());
+    EXPECT_EQ(entry->first, key);
+    EXPECT_EQ(entry->second, value);
+    ASSERT_NE(map.Get(key), nullptr);
+    EXPECT_EQ(*map.Get(key), value);
+    ++entry;
+  }
+  EXPECT_EQ(entry, map.end());
+}
+
+template <typename Ops>
+class RankOpsTest : public testing::Test {};
+using RankOpsTypes = testing::Types<CumulativeRankOps, FenwickRankOps>;
+TYPED_TEST_SUITE(RankOpsTest, RankOpsTypes);
+
+TYPED_TEST(RankOpsTest, SparseTransfersMatchCountsAndPreserveSnapshots) {
+  GroupedMemoryScope memory;
+  std::vector<std::uint64_t> counts(1025, 10), ends;
+  std::uint64_t total = 0;
+  for (const auto count : counts) ends.push_back(total += count);
+  auto original = TypeParam::FromCumulative(ends);
+  ASSERT_TRUE(original.ok()) << original.status();
+  auto current = *original;
+  const auto check = [](const auto& index, const auto& values) {
+    std::uint64_t sum = 0;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      EXPECT_EQ(TypeParam::CountBefore(index, i), sum);
+      for (const auto offset : {std::uint64_t{0}, values[i] - 1}) {
+        const auto position = TypeParam::Locate(index, sum + offset);
+        EXPECT_EQ(position.group_index_, i);
+        EXPECT_EQ(position.offset_, offset);
+      }
+      sum += values[i];
+    }
+    EXPECT_EQ(TypeParam::CountBefore(index, values.size()), sum);
+  };
+  for (std::size_t step = 0; step < 8; ++step) {
+    const auto before = current;
+    const auto old_counts = counts;
+    std::vector<typename TypeParam::CountChange> changes;
+    for (const auto i : {step, 255 + step, 1024 - step}) {
+      const auto replacement = 1 + (i + step) % 19;
+      changes.emplace_back(i, absl::int128(replacement) - counts[i]);
+      total = total - counts[i] + replacement;
+      counts[i] = replacement;
+    }
+    ASSERT_TRUE(TypeParam::ApplyCounts(current, changes, total).ok());
+    check(current, counts);
+    check(before, old_counts);
+  }
+  check(*original, std::vector<std::uint64_t>(1025, 10));
+}
+
+TYPED_TEST(RankOpsTest, AdmissionFailurePreservesPublishedIndex) {
+  GroupedMemoryScope memory;
+  auto original = TypeParam::FromCumulative({3, 7, 9});
+  ASSERT_TRUE(original.ok());
+  auto builder = *original;
+  const std::array<typename TypeParam::CountChange, 1> neutral{{{1, 0}}};
+  const std::array<typename TypeParam::CountChange, 1> changed{{{1, 1}}};
+  ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
+  EXPECT_TRUE(TypeParam::ApplyCounts(builder, neutral, 9).ok());
+  EXPECT_EQ(TypeParam::ApplyCounts(builder, changed, 10).code(),
+            absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(TypeParam::CountBefore(*original, 2), 7);
+  EXPECT_EQ(TypeParam::Locate(*original, 7).group_index_, 2);
+  ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+  builder = *original;
+  ASSERT_TRUE(TypeParam::ApplyCounts(builder, changed, 10).ok());
+  EXPECT_EQ(TypeParam::CountBefore(builder, 2), 8);
+  EXPECT_EQ(TypeParam::CountBefore(*original, 2), 7);
+}
+
+TEST(RankOpsTest, FenwickSuffixAppliesPrefixTransfersExactlyOnce) {
+  GroupedMemoryScope memory;
+  for (const std::size_t first : {0, 1, 3, 4, 255, 256, 257}) {
+    std::vector<std::uint64_t> ends(258);
+    for (std::size_t i = 0; i < ends.size(); ++i) ends[i] = (i + 1) * 3;
+    auto original = FenwickRankOps::FromCumulative(ends);
+    ASSERT_TRUE(original.ok());
+    std::vector<FenwickRankOps::CountChange> prefix_changes;
+    if (first != 0) prefix_changes.emplace_back(0, 2);
+    std::vector<std::uint64_t> suffix;
+    auto total = first * 3 + (first == 0 ? 0 : 2);
+    for (std::size_t i = first; i < 261; ++i)
+      suffix.push_back(total += 1 + i % 7);
+    auto extended = FenwickRankOps::WithSuffix(*original, first, suffix,
+                                               prefix_changes, total);
+    ASSERT_TRUE(extended.ok()) << extended.status();
+    for (std::size_t i = 0; i <= 261; ++i) {
+      const auto expected =
+          i <= first ? i * 3 + (i == 0 ? 0 : 2) : suffix[i - first - 1];
+      EXPECT_EQ(FenwickRankOps::CountBefore(*extended, i), expected);
+      if (i != 261)
+        EXPECT_EQ(FenwickRankOps::Locate(*extended, expected).group_index_, i);
+    }
+    EXPECT_EQ(FenwickRankOps::CountBefore(*original, 258), 258 * 3);
+  }
+}
+
 TEST(GroupedMetadataArrayTest, SparseUpdatesPreserveSnapshotsAcrossTreeLevels) {
   GroupedMemoryScope memory;
   using Array = GroupedMetadataArray<std::uint64_t, 4>;

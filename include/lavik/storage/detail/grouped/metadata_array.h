@@ -31,6 +31,7 @@
 #include "absl/status/statusor.h"
 #include "lavik/local_shared_ptr.h"
 #include "lavik/memory.h"
+#include "lavik/storage/scan_hash_map.h"
 
 namespace lavik::storage {
 
