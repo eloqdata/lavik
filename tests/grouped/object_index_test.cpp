@@ -17,6 +17,7 @@
 #include "lavik/storage/detail/grouped/object_index.h"
 
 #include <map>
+#include <random>
 #include <set>
 #include <string>
 
@@ -144,43 +145,64 @@ class GroupedMemoryScope {
   unsigned shard_;
 };
 
-TEST(GroupedMetadataMapTest, GenericValuesSurviveOverlayFoldingAndErasure) {
+TEST(GroupedMetadataMapTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
   GroupedMemoryScope memory;
-  GroupedMetadataMap<std::uint64_t, std::uint64_t> map;
+  using Map = GroupedMetadataMap<std::uint64_t, std::uint64_t>;
+  Map map;
   std::map<std::uint64_t, std::uint64_t> expected;
-  for (std::uint64_t i = 0; i < 1100; ++i) {
-    ASSERT_TRUE(map.Set(i * 2, i).ok());
-    expected.emplace(i * 2, i);
+  for (std::uint64_t key = 0; key < 1152; ++key) {
+    ASSERT_TRUE(map.Set(key, 0).ok());
+    expected[key] = 0;
   }
-  const auto original = map;
-  // More than eight distinct replacements exercise a fold, followed by a
-  // fresh overlay. Erasure must remove an override as well as the base node.
-  for (std::uint64_t i = 0; i < 12; ++i) {
-    ASSERT_TRUE(map.SetBuffered(i * 100, i + 10000).ok());
-    expected[i * 100] = i + 10000;
+  std::vector<std::pair<Map, decltype(expected)>> snapshots;
+  std::mt19937 random(731);
+  auto check = [](const Map& actual, const auto& values) {
+    ASSERT_EQ(actual.size(), values.size());
+    auto it = actual.begin();
+    for (const auto& [key, sequence] : values) {
+      ASSERT_NE(it, actual.end());
+      EXPECT_EQ(it->first, key);
+      EXPECT_EQ(it->second, sequence);
+      ASSERT_NE(actual.Get(key), nullptr);
+      EXPECT_EQ(*actual.Get(key), sequence);
+      EXPECT_EQ(actual.at(key), sequence);
+      EXPECT_EQ(actual.find(key)->second, sequence);
+      ++it;
+    }
+    EXPECT_EQ(it, actual.end());
+    for (std::uint64_t key = 0; key < 1154; ++key) {
+      auto floor = values.upper_bound(key);
+      const auto* found = actual.Floor(key);
+      if (floor == values.begin()) {
+        EXPECT_EQ(found, nullptr);
+      } else {
+        --floor;
+        ASSERT_NE(found, nullptr);
+        EXPECT_EQ(*found, floor->second);
+      }
+      if (!values.contains(key)) {
+        EXPECT_EQ(actual.Get(key), nullptr);
+        EXPECT_EQ(actual.find(key), actual.end());
+      }
+    }
+  };
+  // Both repeatedly hot routes and dispersed edits exercise replacement,
+  // batch folding, deletion of shadowed entries and reinsertion. Untouched
+  // routes keep the map large enough to exercise buffering throughout.
+  for (std::uint64_t revision = 1; revision <= 800; ++revision) {
+    const std::uint64_t key = random() % (revision % 2 ? 8 : 128);
+    if (revision % 7 == 0) {
+      ASSERT_TRUE(map.Erase(key).ok());
+      expected.erase(key);
+    } else {
+      ASSERT_TRUE(map.SetBuffered(key, revision).ok());
+      expected[key] = revision;
+    }
+    check(map, expected);
+    if (revision % 37 == 0) snapshots.emplace_back(map, expected);
   }
-  const auto replaced = map;
-  ASSERT_TRUE(map.Erase(1100).ok());
-  expected.erase(1100);
-  ASSERT_TRUE(map.Set(1101, 42).ok());
-  expected[1101] = 42;
-  EXPECT_EQ(map.Get(1100), nullptr);
-  ASSERT_NE(replaced.Get(1100), nullptr);
-  EXPECT_EQ(*replaced.Get(1100), 10011);
-  ASSERT_NE(original.Get(1100), nullptr);
-  EXPECT_EQ(*original.Get(1100), 550);
-  EXPECT_EQ(*map.Floor(1100), expected.at(1098));
-  EXPECT_EQ(*map.Floor(1101), 42);
-  auto entry = map.begin();
-  for (const auto& [key, value] : expected) {
-    ASSERT_NE(entry, map.end());
-    EXPECT_EQ(entry->first, key);
-    EXPECT_EQ(entry->second, value);
-    ASSERT_NE(map.Get(key), nullptr);
-    EXPECT_EQ(*map.Get(key), value);
-    ++entry;
-  }
-  EXPECT_EQ(entry, map.end());
+  map = Map{};
+  for (const auto& [snapshot, values] : snapshots) check(snapshot, values);
 }
 
 template <typename Ops>

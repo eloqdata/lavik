@@ -744,65 +744,6 @@ class HashLookupMemoryTest : public ::testing::Test {
   unsigned previous_shard_ = 0;
 };
 
-TEST(HashGroupMapTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
-  using Map = HashGroupMap<std::uint64_t>;
-  Map map;
-  std::map<std::uint64_t, std::uint64_t> expected;
-  for (std::uint64_t key = 0; key < 1152; ++key) {
-    ASSERT_TRUE(map.Set(key, {.sequence_ = 0}).ok());
-    expected[key] = 0;
-  }
-  std::vector<std::pair<Map, decltype(expected)>> snapshots;
-  std::mt19937 random(731);
-  auto check = [](const Map& actual, const auto& values) {
-    ASSERT_EQ(actual.size(), values.size());
-    auto it = actual.begin();
-    for (const auto& [key, sequence] : values) {
-      ASSERT_NE(it, actual.end());
-      EXPECT_EQ(it->first, key);
-      EXPECT_EQ(it->second.sequence_, sequence);
-      ASSERT_NE(actual.Get(key), nullptr);
-      EXPECT_EQ(actual.Get(key)->sequence_, sequence);
-      EXPECT_EQ(actual.at(key).sequence_, sequence);
-      EXPECT_EQ(actual.find(key)->second.sequence_, sequence);
-      ++it;
-    }
-    EXPECT_EQ(it, actual.end());
-    for (std::uint64_t key = 0; key < 1154; ++key) {
-      auto floor = values.upper_bound(key);
-      const auto* found = actual.Floor(key);
-      if (floor == values.begin()) {
-        EXPECT_EQ(found, nullptr);
-      } else {
-        --floor;
-        ASSERT_NE(found, nullptr);
-        EXPECT_EQ(found->sequence_, floor->second);
-      }
-      if (!values.contains(key)) {
-        EXPECT_EQ(actual.Get(key), nullptr);
-        EXPECT_EQ(actual.find(key), actual.end());
-      }
-    }
-  };
-  // Both repeatedly hot routes and dispersed edits exercise replacement,
-  // batch folding, deletion of shadowed entries and reinsertion. Untouched
-  // routes keep the map large enough to exercise buffering throughout.
-  for (std::uint64_t revision = 1; revision <= 800; ++revision) {
-    const std::uint64_t key = random() % (revision % 2 ? 8 : 128);
-    if (revision % 7 == 0) {
-      ASSERT_TRUE(map.Erase(key).ok());
-      expected.erase(key);
-    } else {
-      ASSERT_TRUE(map.SetBuffered(key, {.sequence_ = revision}).ok());
-      expected[key] = revision;
-    }
-    check(map, expected);
-    if (revision % 37 == 0) snapshots.emplace_back(map, expected);
-  }
-  map = Map{};
-  for (const auto& [snapshot, values] : snapshots) check(snapshot, values);
-}
-
 TEST_F(HashLookupMemoryTest, SmallRoutingMapsDoNotRetainAnOverlay) {
   for (unsigned count : {32, 256, 1023}) {
     HashGroupMap<std::uint64_t> map;
