@@ -79,8 +79,8 @@ absl::StatusOr<ExtentManifest> UnsharedGroupedExtents(
 
 absl::StatusOr<std::vector<RetiredRecord>>
 StorageEngine::Impl::CollectGroupedRetirements(
-    const GroupedHashObject::Handle& previous,
-    const GroupedHashObject::Handle& replacement,
+    const GroupedObject::Handle& previous,
+    const GroupedObject::Handle& replacement,
     std::optional<std::span<const HashGroupId>> touched) {
   std::vector<RetiredRecord> result;
   if (previous == nullptr || previous == replacement) return result;
@@ -198,7 +198,7 @@ bool StorageEngine::Impl::GroupedRetirementPins::Take(
 }
 
 Task<absl::Status> StorageEngine::Impl::PrepinGroupedRetirementsLocked(
-    WorkerStore& store, const GroupedHashObject::Handle& previous,
+    WorkerStore& store, const GroupedObject::Handle& previous,
     std::optional<std::span<const HashGroupId>> touched, bool include_root,
     std::unique_ptr<GroupedRetirementPins>* pins) {
   if (previous == nullptr) co_return absl::OkStatus();

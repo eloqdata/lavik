@@ -319,8 +319,7 @@ absl::Status RetainHashLookupValue(HashResult& result,
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object,
-    std::span<const std::string_view> fields) {
+    GroupedObject::Handle object, std::span<const std::string_view> fields) {
   // Keep multi-field planning in its own coroutine so single-field reads do
   // not pay for the plan's allocations or coroutine-frame storage.
   constexpr auto max_size = std::numeric_limits<std::size_t>::max();
@@ -486,7 +485,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   const ExtentManifest extents =
       exists ? ExtentsFor(store, found) : ExtentManifest{};
   const std::uint64_t expire_at_ms = exists ? location.expire_at_ms_ : 0;
-  GroupedHashObject::Handle grouped;
+  GroupedObject::Handle grouped;
   if (exists && location.grouped()) {
     auto view = partition.grouped_objects_[db_id].Lookup(
         key, GroupedObjectVersion{

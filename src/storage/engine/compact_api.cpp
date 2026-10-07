@@ -157,7 +157,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   std::optional<CompactWriteSnapshot> write_snapshot;
   if (unlocked_compact_write || unlocked_create)
     write_snapshot = CaptureCompactWriteSnapshot(store, partition, db_id);
-  GroupedHashObject::Handle grouped;
+  GroupedObject::Handle grouped;
   if (exists && location.grouped()) {
     auto object = partition.grouped_objects_[db_id].Lookup(
         key, GroupedObjectVersion{

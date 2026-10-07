@@ -430,12 +430,11 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   if (record.auxiliary_group_) {
     const HashGroupId id{.prefix_ = record.group_prefix_,
                          .bits_ = record.group_prefix_bits_};
-    auto lookup_object =
-        [&]() -> Task<absl::StatusOr<GroupedHashObject::Handle>> {
+    auto lookup_object = [&]() -> Task<absl::StatusOr<GroupedObject::Handle>> {
       if (EffectiveRecordDbEpoch(partition, record.db_id_) !=
               record.db_epoch_ ||
           partition.replication_epoch_ != record.replication_epoch_) {
-        co_return GroupedHashObject::Handle{};
+        co_return GroupedObject::Handle{};
       }
       auto* root = index.Find(digest, key);
       if (root != nullptr && !root->key_complete()) {
@@ -445,7 +444,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
         root = *verified;
       }
       if (root == nullptr || !root->value_.grouped()) {
-        co_return GroupedHashObject::Handle{};
+        co_return GroupedObject::Handle{};
       }
       auto found = partition.grouped_objects_[record.db_id_].Lookup(
           digest, key,
@@ -458,7 +457,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
           });
       if (!found.ok()) co_return found.status();
       if ((*found)->incarnation() != record.group_incarnation_) {
-        co_return GroupedHashObject::Handle{};
+        co_return GroupedObject::Handle{};
       }
       co_return *found;
     };
@@ -529,7 +528,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       if (!object.ok()) co_return object.status();
       co_return std::optional<RelocationDurabilityFence>{};
     }
-    auto replacement = GroupedHashObject::RelocateGroup(
+    auto replacement = GroupedObject::RelocateGroup(
         *object, id, source_location, relocated, extents);
     if (!replacement.ok()) {
       // A failed metadata admission owns only the new physical record, not
@@ -596,7 +595,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
           verify_payload ? std::optional(record.payload_checksum_)
                          : std::nullopt,
   };
-  GroupedHashObject::PreparedHandle grouped_builder;
+  GroupedObject::PreparedHandle grouped_builder;
   std::optional<GroupedObjectIndex::Publication> grouped_publication;
   GroupRecordWrite grouped_descriptor;
   if (record.grouped_) {
@@ -609,7 +608,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
             .index_generation_ = partition.grouped_generations_[record.db_id_],
         });
     if (!object.ok()) co_return object.status();
-    auto prepared = GroupedHashObject::PrepareRootRelocation(*object);
+    auto prepared = GroupedObject::PrepareRootRelocation(*object);
     if (!prepared.ok()) co_return prepared.status();
     grouped_builder = std::move(*prepared);
     auto publication =

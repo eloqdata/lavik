@@ -27,7 +27,7 @@ Task<absl::StatusOr<StorageEngine::Impl::SortedSetMemberMutation>>
 StorageEngine::Impl::PrepareSortedSetMembers(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle previous,
+    GroupedObject::Handle previous,
     const OrderedCollectionMutationPlan& ordered, bool unlocked,
     std::optional<std::span<const SortedSetMemberChange>> checked_changes,
     SortedSetMemberProbe* probe) {

@@ -86,7 +86,7 @@ struct StorageEngine::Impl::StreamPageAccess {
   std::uint8_t db_id_;
   std::string_view key_;
   const Digest& digest_;
-  GroupedHashObject::Handle object_;
+  GroupedObject::Handle object_;
   std::vector<MemoryReservation> reservations_{};
   std::map<std::size_t, LoadedOrderedGroup> pages_{};
   std::map<std::size_t, MemoryReservation> page_reservations_{};
@@ -629,7 +629,7 @@ struct StorageEngine::Impl::StreamPageAccess {
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     std::uint32_t node_max_entries, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
@@ -757,7 +757,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
   StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
@@ -814,7 +814,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamInspectAccess& access) {
   using Kind = StreamInspectAccess::Kind;
   StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
@@ -999,7 +999,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamTrimLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
   StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
@@ -1041,7 +1041,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamTrimLocked(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamDeleteAccess& access, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
@@ -1161,7 +1161,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamAckAccess& access, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
@@ -1254,7 +1254,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamGroupAccess& access, bool read_only, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
@@ -1618,7 +1618,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamRangeAccess& range) {
   if (!object->is_ordered() || object->ordered_directory().root().kind_ !=
                                    OrderedCollectionKind::kStream)

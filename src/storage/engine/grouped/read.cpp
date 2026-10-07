@@ -37,7 +37,7 @@ Task<absl::StatusOr<StorageEngine::Impl::LoadedHashGroupPayload>>
 StorageEngine::Impl::LoadHashGroupPayload(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, HashGroupId id, bool pinned) {
+    GroupedObject::Handle object, HashGroupId id, bool pinned) {
   if (object == nullptr) co_return absl::DataLossError("missing grouped view");
   if (object->is_ordered() && !object->has_member_index())
     co_return absl::DataLossError("ordered view has no prefix groups");
@@ -185,7 +185,7 @@ Task<absl::StatusOr<LoadedHashGroup>>
 StorageEngine::Impl::LoadHashGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, HashGroupId id, bool pinned) {
+    GroupedObject::Handle object, HashGroupId id, bool pinned) {
   auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
                                               digest, object, id, pinned);
   if (!loaded.ok()) co_return loaded.status();
@@ -208,7 +208,7 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
 Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, bool pinned) {
+    GroupedObject::Handle object, bool pinned) {
   if (object == nullptr) co_return absl::DataLossError("missing grouped view");
   HashValue result;
   for (const auto& [prefix, metadata] : object->directory().groups()) {
@@ -232,7 +232,7 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
                                       std::uint8_t db_id, std::string_view key,
                                       const Digest& digest,
                                       RecordLocation location,
-                                      GroupedHashObject::Handle snapshot) {
+                                      GroupedObject::Handle snapshot) {
   const bool pinned = snapshot != nullptr;
   if (!pinned) {
     auto found = partition.grouped_objects_[db_id].Lookup(

@@ -129,7 +129,7 @@ absl::Status AppendPosition(std::uint64_t position, ListResult* result) {
 Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const ListOperation& operation, GroupedHashObject::Handle object,
+    const ListOperation& operation, GroupedObject::Handle object,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
     PreparedOrderedMutation* prepared) {

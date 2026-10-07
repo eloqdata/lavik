@@ -890,7 +890,7 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store,
                                std::uint8_t db_id, std::string_view key,
                                const Digest& digest, RecordLocation location,
                                ExtentManifest extents, ReadLatencyTrace* trace,
-                               GroupedHashObject::Handle grouped_snapshot) {
+                               GroupedObject::Handle grouped_snapshot) {
   if (location.grouped()) {
     co_return co_await LoadGroupedValue(key_store, partition, db_id, key,
                                         digest, location,

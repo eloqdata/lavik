@@ -54,7 +54,7 @@ struct HashGroupLocation {
   bool retired_ = false;
 };
 
-struct GroupedHashPhysicalState;
+struct GroupedPhysicalState;
 
 // An auxiliary has no independent key or expiry. Keep only its compact
 // physical coordinates; the owning page supplies the sorted group identity.
@@ -65,16 +65,17 @@ struct GroupedRecordIndexEntry {
   const std::uint64_t* optional_extra() const noexcept { return nullptr; }
 };
 
-// Resident metadata only: field names and values are never retained here.
+// Shared object view for grouped String, Hash, Set, List, Sorted Set and Stream
+// values. Retains routing and physical metadata; payloads are loaded on demand.
 // There is one compact physical index entry per group, not per field. The
-// prefix directory selects that entry; the physical owner supplies the
+// routing directory selects that entry; the physical owner supplies the
 // allocation epoch when materializing its compact location, as for top-level
 // RecordIndex entries. The adapter must validate payload identity/checksums
 // before creating this view and hold the necessary physical pins during IO.
-class GroupedHashObject {
+class GroupedObject {
  public:
-  using Handle = std::shared_ptr<const GroupedHashObject>;
-  using PreparedHandle = std::shared_ptr<GroupedHashObject>;
+  using Handle = std::shared_ptr<const GroupedObject>;
+  using PreparedHandle = std::shared_ptr<GroupedObject>;
 
   // Builds an immutable, unpublished view. This is a recovery/construction
   // operation, not the per-HSET update path: rebuilding every group entry on
@@ -179,7 +180,7 @@ class GroupedHashObject {
   std::uint64_t command_sequence() const noexcept {
     return version_.root_.mutation_sequence_;
   }
-  bool SameLogicalRoot(const GroupedHashObject& other) const noexcept;
+  bool SameLogicalRoot(const GroupedObject& other) const noexcept;
   const GroupedRecordIndexEntry* FindGroup(std::string_view field) const;
   const GroupedRecordIndexEntry* FindGroup(HashGroupId id) const;
   const GroupedRecordIndexEntry* FindRecord(HashGroupId id) const;
@@ -212,7 +213,7 @@ class GroupedHashObject {
   // stores only the active header; neither alternative retains field values.
   std::variant<std::monostate, HashGroupDirectory, OrderedGroupDirectory>
       directory_;
-  std::shared_ptr<const GroupedHashPhysicalState> physical_;
+  std::shared_ptr<const GroupedPhysicalState> physical_;
 };
 
 // Sparse second-level USER-KEY map. Only a grouped top-level RecordIndex
@@ -222,7 +223,7 @@ class GroupedHashObject {
 // Handles retain metadata across suspension, NOT physical disk-block pins.
 class GroupedObjectIndex {
  public:
-  using Handle = GroupedHashObject::Handle;
+  using Handle = GroupedObject::Handle;
 
   explicit GroupedObjectIndex(
       std::shared_ptr<ScanHashMapEntryArena> arena = nullptr);

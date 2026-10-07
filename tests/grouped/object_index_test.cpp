@@ -105,9 +105,9 @@ ObjectInput Input(std::uint64_t sequence = 5, std::uint64_t incarnation = 1,
   return input;
 }
 
-absl::StatusOr<GroupedHashObject::Handle> Create(ObjectInput input) {
-  return GroupedHashObject::Create(input.version_, std::move(input.directory_),
-                                   input.locations_);
+absl::StatusOr<GroupedObject::Handle> Create(ObjectInput input) {
+  return GroupedObject::Create(input.version_, std::move(input.directory_),
+                               input.locations_);
 }
 
 TEST(GroupedObjectIndexTest,
@@ -121,7 +121,7 @@ TEST(GroupedObjectIndexTest,
   ASSERT_TRUE(directory.ok()) << directory.status();
   input.version_.root_.mutation_sequence_ = 7;
   auto object =
-      GroupedHashObject::Create(input.version_, *directory, input.locations_);
+      GroupedObject::Create(input.version_, *directory, input.locations_);
   ASSERT_TRUE(object.ok()) << object.status();
   EXPECT_EQ((*object)->version().root_.mutation_sequence_, 7);
   EXPECT_EQ((*object)->directory().sequence(), 100);
@@ -323,7 +323,7 @@ TEST(GroupedObjectIndexTest, CompressedPathsRetainAllHashPrefixLengthBits) {
                                .db_epoch_ = 1,
                                .replication_epoch_ = 2,
                                .index_generation_ = 3};
-  auto old = GroupedHashObject::Create(version, *directory, locations);
+  auto old = GroupedObject::Create(version, *directory, locations);
   ASSERT_TRUE(old.ok()) << old.status();
   for (const auto& location : locations) {
     ASSERT_NE((*old)->FindRecord(location.id_), nullptr);
@@ -331,7 +331,7 @@ TEST(GroupedObjectIndexTest, CompressedPathsRetainAllHashPrefixLengthBits) {
               location.location_.block_id());
     EXPECT_EQ((*old)->FindGroup(location.id_) == nullptr, location.retired_);
   }
-  auto moved = GroupedHashObject::RelocateGroup(
+  auto moved = GroupedObject::RelocateGroup(
       *old, {0, 7}, locations[7].location_, GroupLocation(200, 5, 0));
   ASSERT_TRUE(moved.ok()) << moved.status();
   EXPECT_EQ((*moved)->FindRecord({0, 7})->value_.block_id(), 200);
@@ -486,8 +486,8 @@ TEST(GroupedObjectIndexTest, PartialConstructionFailureUnwindsGroupEntries) {
   }
   auto arena = std::make_shared<ScanHashMapEntryArena>(1, true, false);
   for (unsigned attempt = 0; attempt < 3; ++attempt) {
-    auto rejected = GroupedHashObject::Create(input.version_, input.directory_,
-                                              input.locations_, arena);
+    auto rejected = GroupedObject::Create(input.version_, input.directory_,
+                                          input.locations_, arena);
     EXPECT_EQ(rejected.status().code(), absl::StatusCode::kResourceExhausted);
     EXPECT_EQ(arena->allocated_pages(), 0);
     auto preserved = index.Lookup("hash", (*old)->version());
@@ -500,8 +500,8 @@ TEST(GroupedObjectIndexTest, PartialConstructionFailureUnwindsGroupEntries) {
   // Failed builds return their handles/slots; the same bounded arena remains
   // usable with its retained directory bookkeeping and recycled page IDs.
   auto small = Input(7);
-  auto recovered = GroupedHashObject::Create(small.version_, small.directory_,
-                                             small.locations_, arena);
+  auto recovered = GroupedObject::Create(small.version_, small.directory_,
+                                         small.locations_, arena);
   ASSERT_TRUE(recovered.ok()) << recovered.status();
   EXPECT_TRUE(index.Publish("hash", *old, *recovered).ok());
 }
@@ -527,8 +527,8 @@ TEST(GroupedObjectIndexTest,
   ASSERT_TRUE(InitMemoryLimit(maximum, 1).ok());
   auto arena = std::make_shared<ScanHashMapEntryArena>(
       ScanHashMapEntryArena::kMaximumPageId, true, false);
-  auto rejected = GroupedHashObject::Create(input.version_, input.directory_,
-                                            input.locations_, arena);
+  auto rejected = GroupedObject::Create(input.version_, input.directory_,
+                                        input.locations_, arena);
   EXPECT_EQ(rejected.status().code(), absl::StatusCode::kResourceExhausted);
   EXPECT_TRUE(rejected.status().message().starts_with("OOM "));
   EXPECT_EQ(arena->allocated_pages(), 0);
@@ -538,8 +538,8 @@ TEST(GroupedObjectIndexTest,
   RefreshMemoryStats();
   EXPECT_EQ(GetMemoryStats().admission_pending_bytes_, 0);
   ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
-  auto retry = GroupedHashObject::Create(input.version_, input.directory_,
-                                         input.locations_, arena);
+  auto retry = GroupedObject::Create(input.version_, input.directory_,
+                                     input.locations_, arena);
   ASSERT_TRUE(retry.ok()) << retry.status();
   EXPECT_EQ((*retry)->group_count(), input.locations_.size());
   retry->reset();
@@ -552,7 +552,7 @@ TEST(GroupedObjectIndexTest,
   GroupedMemoryScope memory;
   constexpr unsigned owner = 0;  // Worker ID, not the accounting slot (1).
   const auto baseline = WorkerMemoryAccountingBytes(owner);
-  GroupedHashObject::Handle reader;
+  GroupedObject::Handle reader;
   {
     auto object = Create(Input());
     ASSERT_TRUE(object.ok());
@@ -660,8 +660,8 @@ TEST(GroupedObjectIndexTest, ManifestReaderRetainsItsOwnMemoryCharge) {
 
 TEST(GroupedObjectIndexTest, StoresOneCompactPhysicalIndexEntryPerGroup) {
   auto input = Input();
-  auto object = GroupedHashObject::Create(input.version_, input.directory_,
-                                          input.locations_);
+  auto object =
+      GroupedObject::Create(input.version_, input.directory_, input.locations_);
   ASSERT_TRUE(object.ok()) << object.status();
   EXPECT_EQ((*object)->group_count(), input.locations_.size());
   EXPECT_LT((*object)->group_count(), 100);
@@ -867,7 +867,7 @@ TEST(GroupedObjectIndexTest,
      MetadataHandleOutlivesRemovalWithoutPretendingToPinDisk) {
   auto object = Create(Input());
   ASSERT_TRUE(object.ok());
-  std::weak_ptr<const GroupedHashObject> weak = *object;
+  std::weak_ptr<const GroupedObject> weak = *object;
   GroupedObjectIndex index;
   ASSERT_TRUE(index.Publish("key", nullptr, *object).ok());
   auto reader = index.Lookup("key", (*object)->version());
@@ -950,8 +950,8 @@ TEST(GroupedObjectIndexTest, ArenaCapacityFailurePublishesNothing) {
   auto input = Input();
   // Inline physical coordinates need no arena slots. The keyed publication
   // still must fail without exposing an object when that arena has no space.
-  auto object = GroupedHashObject::Create(input.version_, input.directory_,
-                                          input.locations_, arena);
+  auto object = GroupedObject::Create(input.version_, input.directory_,
+                                      input.locations_, arena);
   ASSERT_TRUE(object.ok()) << object.status();
   EXPECT_EQ(arena->allocated_pages(), 0);
   GroupedObjectIndex index(arena);
@@ -1040,8 +1040,8 @@ TEST(GroupedObjectIndexTest,
   HashGroupLocation changed{
       .id_ = changed_id,
       .location_ = GroupLocation(500000, 6, candidate.field_count_)};
-  auto next = GroupedHashObject::PrepareUpdate(*old, version, *directory,
-                                               std::span(&changed, 1));
+  auto next = GroupedObject::PrepareUpdate(*old, version, *directory,
+                                           std::span(&changed, 1));
   ASSERT_TRUE(next.ok()) << next.status();
   std::size_t shared_entries = 0;
   std::size_t shared_routes = 0;
@@ -1066,7 +1066,7 @@ TEST(GroupedObjectIndexTest,
   EXPECT_EQ((*old)->FindRecord(changed_id)->value_.mutation_sequence_, 5);
   EXPECT_EQ((*next)->FindRecord(changed_id)->value_.mutation_sequence_, 6);
   version.root_ = GroupLocation(600000, 6, version.root_.logical_size_, true);
-  EXPECT_TRUE(GroupedHashObject::FinalizeRoot(*next, version).ok());
+  EXPECT_TRUE(GroupedObject::FinalizeRoot(*next, version).ok());
   EXPECT_EQ((*next)->version().root_.block_id(), 600000);
   EXPECT_EQ((*old)->version().root_.block_id(), 999999);
 }
@@ -1078,9 +1078,9 @@ TEST(GroupedObjectIndexTest, SplitRetainsParentMarkerAcrossFurtherMutations) {
   ASSERT_TRUE(old.ok());
   // A pending coordinate replacement must fold before this topology change;
   // the new retired marker must win over the older inline override.
-  auto moved = GroupedHashObject::RelocateGroup(*old, input.locations_[0].id_,
-                                                input.locations_[0].location_,
-                                                GroupLocation(1000, 5, 2));
+  auto moved = GroupedObject::RelocateGroup(*old, input.locations_[0].id_,
+                                            input.locations_[0].location_,
+                                            GroupLocation(1000, 5, 2));
   ASSERT_TRUE(moved.ok()) << moved.status();
   old = std::move(moved);
   auto root = input.directory_.root();
@@ -1102,7 +1102,7 @@ TEST(GroupedObjectIndexTest, SplitRetainsParentMarkerAcrossFurtherMutations) {
   auto version = input.version_;
   version.root_.mutation_sequence_ = 6;
   auto next =
-      GroupedHashObject::PrepareUpdate(*old, version, *directory, locations);
+      GroupedObject::PrepareUpdate(*old, version, *directory, locations);
   ASSERT_TRUE(next.ok()) << next.status();
   EXPECT_EQ((*next)->group_count(), 2);
   EXPECT_EQ((*next)->record_count(), 3);
@@ -1114,10 +1114,10 @@ TEST(GroupedObjectIndexTest, SplitRetainsParentMarkerAcrossFurtherMutations) {
                              bool marker) { marker ? ++retired : ++active; });
   EXPECT_EQ(active, 2);
   EXPECT_EQ(retired, 1);
-  auto missing_marker = GroupedHashObject::Create(
-      version, *directory, std::span(locations).subspan(1));
+  auto missing_marker = GroupedObject::Create(version, *directory,
+                                              std::span(locations).subspan(1));
   EXPECT_EQ(missing_marker.status().code(), absl::StatusCode::kDataLoss);
-  auto rebuilt = GroupedHashObject::Create(version, *directory, locations);
+  auto rebuilt = GroupedObject::Create(version, *directory, locations);
   ASSERT_TRUE(rebuilt.ok()) << rebuilt.status();
   auto newer = changes[1];
   newer.sequence_ = 7;
@@ -1143,19 +1143,19 @@ TEST(GroupedObjectIndexTest,
   ASSERT_TRUE(index.Publish("key", nullptr, *old).ok());
   auto publication = index.PreparePublish("key", *old);
   ASSERT_TRUE(publication.ok());
-  auto builder = GroupedHashObject::PrepareRootRelocation(*old);
+  auto builder = GroupedObject::PrepareRootRelocation(*old);
   ASSERT_TRUE(builder.ok());
   auto source = input.locations_[0];
   auto destination = GroupLocation(77777, source.location_.mutation_sequence_,
                                    source.location_.logical_size_);
-  auto relocated = GroupedHashObject::RelocateGroup(
-      *old, source.id_, source.location_, destination);
+  auto relocated = GroupedObject::RelocateGroup(*old, source.id_,
+                                                source.location_, destination);
   ASSERT_TRUE(relocated.ok()) << relocated.status();
   ASSERT_TRUE(index.Publish("key", *old, *relocated).ok());
   auto version = input.version_;
   version.root_ = GroupLocation(88888, 5, 100, true);
   ASSERT_TRUE(
-      GroupedHashObject::FinalizeRootRelocation(*builder, *relocated, version)
+      GroupedObject::FinalizeRootRelocation(*builder, *relocated, version)
           .ok());
   ASSERT_TRUE(publication->RefreshExpected(*relocated).ok());
   ASSERT_TRUE(publication->Commit(std::move(*builder)).ok());
@@ -1163,7 +1163,7 @@ TEST(GroupedObjectIndexTest,
   ASSERT_TRUE(current.ok());
   EXPECT_EQ((*current)->FindRecord(source.id_)->value_.block_id(), 77777);
   EXPECT_NE((*old)->FindRecord(source.id_)->value_.block_id(), 77777);
-  auto direct = GroupedHashObject::RelocateRoot(*current, input.version_);
+  auto direct = GroupedObject::RelocateRoot(*current, input.version_);
   ASSERT_TRUE(direct.ok());
   for (const auto& group : input.locations_) {
     EXPECT_EQ((*direct)->FindRecord(group.id_),
@@ -1175,8 +1175,8 @@ TEST(GroupedObjectIndexTest,
      ReservedPublicationAndFinalizationAllocateNothing) {
   GroupedMemoryScope memory;
   auto input = Input();
-  auto builder = GroupedHashObject::PrepareCreate(
-      input.version_, input.directory_, input.locations_);
+  auto builder = GroupedObject::PrepareCreate(input.version_, input.directory_,
+                                              input.locations_);
   ASSERT_TRUE(builder.ok());
   GroupedObjectIndex index;
   const auto digest = ComputeDigest("cancel");
@@ -1195,7 +1195,7 @@ TEST(GroupedObjectIndexTest,
   ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
   auto exact = input.version_;
   exact.root_ = GroupLocation(999998, 5, 100, true);
-  EXPECT_TRUE(GroupedHashObject::FinalizeRoot(*builder, exact).ok());
+  EXPECT_TRUE(GroupedObject::FinalizeRoot(*builder, exact).ok());
   EXPECT_TRUE(publication->Commit(std::move(*builder)).ok());
   EXPECT_TRUE(index.Lookup("key", exact).ok());
 }
@@ -1218,8 +1218,8 @@ TEST(GroupedObjectIndexTest,
       .location_ = GroupLocation(98765, 6, change.field_count_)};
   const auto before = WorkerMemoryAccountingBytes(0);
   ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
-  auto rejected = GroupedHashObject::PrepareUpdate(*old, version, *directory,
-                                                   std::span(&physical, 1));
+  auto rejected = GroupedObject::PrepareUpdate(*old, version, *directory,
+                                               std::span(&physical, 1));
   EXPECT_EQ(rejected.status().code(), absl::StatusCode::kResourceExhausted);
   EXPECT_TRUE(rejected.status().message().starts_with("OOM "));
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), before);
@@ -1277,7 +1277,7 @@ TEST(GroupedObjectIndexTest, RetiredMarkerCanKeepAnExternalParentKey) {
        {.id_ = {1ULL << 63, 1}, .location_ = GroupLocation(12, 6, 1)}}};
   auto version = input.version_;
   version.root_.mutation_sequence_ = 6;
-  auto object = GroupedHashObject::Create(version, *directory, locations);
+  auto object = GroupedObject::Create(version, *directory, locations);
   ASSERT_TRUE(object.ok()) << object.status();
   const auto* retained = (*object)->FindRecord({0, 0});
   ASSERT_NE(retained, nullptr);
@@ -1314,17 +1314,17 @@ TEST(GroupedObjectIndexTest, RootPhysicalFinalizationKeepsPendingDecision) {
   auto input = Input();
   auto decision = std::make_shared<GroupedCommitDecision>(77);
   input.version_.decision_ = decision;
-  auto builder = GroupedHashObject::PrepareCreate(
-      input.version_, input.directory_, input.locations_);
+  auto builder = GroupedObject::PrepareCreate(input.version_, input.directory_,
+                                              input.locations_);
   ASSERT_TRUE(builder.ok());
   auto physical = input.version_;
   physical.decision_.reset();
   physical.root_ = GroupLocation(555555, 5, 100, true);
-  ASSERT_TRUE(GroupedHashObject::FinalizeRoot(*builder, physical).ok());
+  ASSERT_TRUE(GroupedObject::FinalizeRoot(*builder, physical).ok());
   EXPECT_EQ((*builder)->version().decision_, decision);
-  GroupedHashObject::Handle current = std::move(*builder);
+  GroupedObject::Handle current = std::move(*builder);
   physical.root_ = GroupLocation(555556, 5, 100, true);
-  auto relocated = GroupedHashObject::RelocateRoot(current, physical);
+  auto relocated = GroupedObject::RelocateRoot(current, physical);
   ASSERT_TRUE(relocated.ok());
   EXPECT_EQ((*relocated)->version().decision_, decision);
   EXPECT_EQ(decision->state_.load(), GroupedCommitDecision::State::kPending);
@@ -1334,8 +1334,8 @@ TEST(GroupedObjectIndexTest, FailedPublishedDecisionCannotBeRead) {
   auto input = Input();
   auto decision = std::make_shared<GroupedCommitDecision>(77);
   input.version_.decision_ = decision;
-  auto object = GroupedHashObject::Create(input.version_, input.directory_,
-                                          input.locations_);
+  auto object =
+      GroupedObject::Create(input.version_, input.directory_, input.locations_);
   ASSERT_TRUE(object.ok()) << object.status();
   GroupedObjectIndex index;
   ASSERT_TRUE(index.Publish("key", nullptr, *object).ok());
@@ -1366,7 +1366,7 @@ TEST(GroupedObjectIndexTest, CoordinateChangesPreserveSnapshotsAndTraversal) {
   for (const auto& group : input.locations_)
     expected.emplace(group.id_, group.location_.block_id());
   struct Snapshot {
-    GroupedHashObject::Handle object;
+    GroupedObject::Handle object;
     std::map<HashGroupId, std::uint64_t> blocks;
   };
   std::vector<Snapshot> snapshots;
@@ -1379,7 +1379,7 @@ TEST(GroupedObjectIndexTest, CoordinateChangesPreserveSnapshotsAndTraversal) {
     const auto replacement =
         GroupLocation(100000 + step, 5, group.location_.logical_size_);
     auto moved =
-        GroupedHashObject::RelocateGroup(current, group.id_, old, replacement);
+        GroupedObject::RelocateGroup(current, group.id_, old, replacement);
     ASSERT_TRUE(moved.ok()) << moved.status();
     current = std::move(*moved);
     expected[group.id_] = replacement.block_id();
@@ -1413,7 +1413,7 @@ TEST(GroupedObjectIndexTest, ExternalReplacementFoldsPendingInlineCoordinates) {
   auto current = *original;
   for (std::size_t i = 0; i < 5; ++i) {
     const auto& group = input.locations_[i];
-    auto moved = GroupedHashObject::RelocateGroup(
+    auto moved = GroupedObject::RelocateGroup(
         current, group.id_, group.location_,
         GroupLocation(10000 + i, 5, group.location_.logical_size_));
     ASSERT_TRUE(moved.ok()) << moved.status();
@@ -1426,7 +1426,7 @@ TEST(GroupedObjectIndexTest, ExternalReplacementFoldsPendingInlineCoordinates) {
                               .allocation_epoch_ = 17,
                               .payload_bytes_ = 256,
                               .payload_checksum_ = 0}});
-  auto external = GroupedHashObject::RelocateGroup(
+  auto external = GroupedObject::RelocateGroup(
       current, group.id_,
       GroupLocation(10002, 5, group.location_.logical_size_),
       GroupLocation(30000, 5, group.location_.logical_size_, false, true),
@@ -1458,8 +1458,8 @@ TEST(GroupedObjectIndexTest, ExternalReplacementFoldsPendingInlineCoordinates) {
 TEST(GroupedObjectIndexTest,
      MetadataOnlyUpdateSharesHashRoutingNodesAndPhysicalPages) {
   auto input = Input();
-  auto old = GroupedHashObject::Create(input.version_, input.directory_,
-                                       input.locations_);
+  auto old =
+      GroupedObject::Create(input.version_, input.directory_, input.locations_);
   ASSERT_TRUE(old.ok()) << old.status();
   auto version = input.version_;
   version.root_ = RecordLocation(
@@ -1467,9 +1467,9 @@ TEST(GroupedObjectIndexTest,
       RecordLocation::PackedMetadata::Encode(
           kBlockHeaderBytes, 256, 0, true, false, false, false, false, false,
           RecordKind::kValue, ValueType::kHash, true, true));
-  auto updated = GroupedHashObject::PrepareMetadataUpdate(*old, version);
+  auto updated = GroupedObject::PrepareMetadataUpdate(*old, version);
   ASSERT_TRUE(updated.ok()) << updated.status();
-  EXPECT_TRUE(GroupedHashObject::FinalizeRoot(*updated, version).ok());
+  EXPECT_TRUE(GroupedObject::FinalizeRoot(*updated, version).ok());
   // Each immutable object owns its header; the routing graph and physical
   // pages stay shared even when only the root metadata changes.
   EXPECT_NE(&(*old)->directory(), &(*updated)->directory());

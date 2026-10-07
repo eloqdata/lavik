@@ -796,7 +796,7 @@ Task<absl::StatusOr<SortedSetResult>>
 StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const SortedSetOperation& operation, GroupedHashObject::Handle object,
+    const SortedSetOperation& operation, GroupedObject::Handle object,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
     PreparedOrderedMutation* prepared) {

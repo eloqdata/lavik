@@ -1055,7 +1055,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
         current->key_complete() ? current->key() : std::string_view(loaded_key);
     const Digest undo_digest = ComputeDigest(undo_key);
     auto& partition = PartitionForKey(store, undo_key);
-    GroupedHashObject::Handle applied_grouped;
+    GroupedObject::Handle applied_grouped;
     if (applied.grouped()) {
       auto view = partition.grouped_objects_[entry.db_id_].Lookup(
           undo_key,
@@ -3144,11 +3144,11 @@ acquire_active_stream:
     });
     if (!prepared.ok()) co_return prepared;
   }
-  GroupedHashObject::Handle previous_grouped;
+  GroupedObject::Handle previous_grouped;
   std::shared_ptr<std::vector<RetiredRecord>> grouped_retirements;
   std::shared_ptr<std::vector<RetiredRecord>> grouped_abort_retirements;
-  GroupedHashObject::Handle replacement_grouped =
-      grouped_root ? GroupedHashObject::Handle(*request.group_->prepared_root_)
+  GroupedObject::Handle replacement_grouped =
+      grouped_root ? GroupedObject::Handle(*request.group_->prepared_root_)
                    : nullptr;
   auto touched_groups = grouped_root
                             ? std::optional(request.group_->changed_groups_)
@@ -3436,15 +3436,15 @@ acquire_active_stream:
           });
       if (current.ok()) version.decision_ = (*current)->version().decision_;
       finalized = current.ok()
-                      ? GroupedHashObject::FinalizeRootRelocation(
+                      ? GroupedObject::FinalizeRootRelocation(
                             *request.group_->prepared_root_, *current, version)
                       : current.status();
       if (finalized.ok()) {
         finalized = request.group_->publication_->RefreshExpected(*current);
       }
     } else {
-      finalized = GroupedHashObject::FinalizeRoot(
-          *request.group_->prepared_root_, version);
+      finalized =
+          GroupedObject::FinalizeRoot(*request.group_->prepared_root_, version);
     }
     if (!finalized.ok()) {
       // This can only be an internal contract violation after the validated

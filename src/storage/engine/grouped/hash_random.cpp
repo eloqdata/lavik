@@ -27,7 +27,7 @@ Task<absl::StatusOr<HashResult>>
 StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const HashOperation& operation, GroupedHashObject::Handle object,
+    const HashOperation& operation, GroupedObject::Handle object,
     ValueType value_type, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {

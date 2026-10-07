@@ -1475,8 +1475,8 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       continue;
     }
     auto object =
-        GroupedHashObject::Create(version, std::move(*directory), locations,
-                                  store.record_index_entry_arena_);
+        GroupedObject::Create(version, std::move(*directory), locations,
+                              store.record_index_entry_arena_);
     if (!object.ok()) co_return object.status();
     auto published = partition.grouped_objects_[root_db].Publish(
         key, nullptr, std::move(*object));
@@ -1494,7 +1494,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
   co_return absl::OkStatus();
 }
 
-Task<absl::StatusOr<GroupedHashObject::Handle>>
+Task<absl::StatusOr<GroupedObject::Handle>>
 StorageEngine::Impl::RecoverOrderedObject(
     WorkerStore& store, const OrderedCollectionRoot& root,
     GroupedObjectVersion version, RecoveryAuxiliaryRecords::iterator first,
@@ -1641,9 +1641,9 @@ StorageEngine::Impl::RecoverOrderedObject(
     for (const auto& [id, member] : member_directory->retired_groups())
       append_member(member);
   }
-  co_return GroupedHashObject::CreateOrdered(version, std::move(*directory),
-                                             locations,
-                                             store.record_index_entry_arena_);
+  co_return GroupedObject::CreateOrdered(version, std::move(*directory),
+                                         locations,
+                                         store.record_index_entry_arena_);
 }
 
 Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroup(

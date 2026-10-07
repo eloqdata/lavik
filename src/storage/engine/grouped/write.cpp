@@ -48,7 +48,7 @@ StorageEngine::Impl::PrepareGroupedDecision(TxShardWrites& tx,
 }
 
 Task<absl::Status> StorageEngine::Impl::PrepareGroupedDependencyLocked(
-    WorkerStore& store, const GroupedHashObject::Handle& object,
+    WorkerStore& store, const GroupedObject::Handle& object,
     TxShardWrites* successor) {
   auto decision = object == nullptr ? nullptr : object->version().decision_;
   if (!decision || (successor && decision->txid_ == successor->txid_))
@@ -96,7 +96,7 @@ Task<absl::Status> StorageEngine::Impl::PrepareGroupedDependencyLocked(
 }
 
 Task<absl::Status> StorageEngine::Impl::AwaitGroupedDependencyLocked(
-    WorkerStore& store, const GroupedHashObject::Handle& object,
+    WorkerStore& store, const GroupedObject::Handle& object,
     std::uint64_t successor_txid) {
   auto decision = object == nullptr ? nullptr : object->version().decision_;
   if (decision == nullptr || decision->txid_ == successor_txid) {

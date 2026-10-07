@@ -48,7 +48,7 @@ Task<absl::Status> StorageEngine::Impl::WriteGroupedStringLocked(
     std::string_view value, std::uint64_t expire_at_ms, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    GroupedHashObject::Handle previous, std::string_view before) {
+    GroupedObject::Handle previous, std::string_view before) {
   if (value.empty() || value.size() > kMaxStringBytes)
     co_return absl::OutOfRangeError("invalid grouped String length");
   // Whole-value shrink can bypass segment preparation altogether. A String
@@ -128,7 +128,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
       co_await FindVerifiedEntry(store, partition.indexes_[db_id], digest, key);
   if (!resolved.ok()) co_return resolved.status();
   auto* found = *resolved;
-  GroupedHashObject::Handle grouped;
+  GroupedObject::Handle grouped;
   if (found && found->value_.grouped()) {
     auto object = partition.grouped_objects_[db_id].Lookup(
         key, GroupedObjectVersion{

@@ -21,7 +21,7 @@ namespace lavik::storage {
 Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle previous, TxShardWrites* compensation,
+    GroupedObject::Handle previous, TxShardWrites* compensation,
     TxUndoLog* replacement_undo) {
   if (!previous || !compensation || compensation->collect_undo_ ||
       compensation->grouped_ingest_batch_ != nullptr)
@@ -37,7 +37,7 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
     co_return absl::AbortedError("grouped compensation population changed");
   auto& side = partition.grouped_objects_[db_id];
   const auto replaced = side.CurrentForMutation(key);
-  auto same_replaced = [&](const GroupedHashObject::Handle& current) {
+  auto same_replaced = [&](const GroupedObject::Handle& current) {
     if (!replaced || !current) return replaced == current;
     return current->command_sequence() == replaced->command_sequence() &&
            current->version().root_.expire_at_ms_ ==
@@ -135,7 +135,7 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
   if (!reserved.ok()) co_return reserved.status();
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
-  GroupedHashObject::PreparedHandle builder;
+  GroupedObject::PreparedHandle builder;
   GroupRecordWrite root_write{
       .prepared_root_ = &builder,
       .publication_ = &*publication,
@@ -155,10 +155,10 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
         // pins. Share them directly; neither group payloads nor extent
         // values are read or rewritten as part of this compensation.
         auto prepared = previous->is_ordered()
-                            ? GroupedHashObject::PrepareUpdateOrdered(
+                            ? GroupedObject::PrepareUpdateOrdered(
                                   previous, version, *ordered_directory, {})
-                            : GroupedHashObject::PrepareUpdate(
-                                  previous, version, *hash_directory, {});
+                            : GroupedObject::PrepareUpdate(previous, version,
+                                                           *hash_directory, {});
         if (!prepared.ok()) return prepared.status();
         builder = std::move(*prepared);
         publication.reset();

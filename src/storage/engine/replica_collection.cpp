@@ -325,7 +325,7 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
     }
   } command_scope{native_snapshot ? sync : nullptr};
   const auto digest = ComputeDigest(stage.key_);
-  GroupedHashObject::Handle previous;
+  GroupedObject::Handle previous;
   if (state->applied_count_ != 0) {
     previous =
         partition.grouped_objects_[stage.db_id_].CurrentForMutation(stage.key_);

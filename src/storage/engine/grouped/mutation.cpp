@@ -24,8 +24,8 @@
 namespace lavik::storage {
 namespace {
 
-bool SameLogicalView(const GroupedHashObject::Handle& before,
-                     const GroupedHashObject::Handle& current) {
+bool SameLogicalView(const GroupedObject::Handle& before,
+                     const GroupedObject::Handle& current) {
   if (!before || !current) return before == current;
   const auto& a = before->version();
   const auto& b = current->version();
@@ -43,7 +43,7 @@ bool SameLogicalView(const GroupedHashObject::Handle& before,
 
 absl::StatusOr<HashGroupMutationPlan>
 StorageEngine::Impl::PrepareGroupedHashMutation(
-    const GroupedHashObject::Handle& previous, HashValue after_image,
+    const GroupedObject::Handle& previous, HashValue after_image,
     std::span<const HashGroupId> changed_groups, std::uint64_t field_count,
     std::uint64_t sequence) {
   HashGroupMutationPlan plan;
@@ -128,7 +128,7 @@ StorageEngine::Impl::PrepareGroupedHashMutation(
 Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle previous, HashValue after_image,
+    GroupedObject::Handle previous, HashValue after_image,
     std::vector<HashGroupId> changed_groups, std::uint64_t field_count,
     ValueType value_type, std::uint64_t expire_at_ms, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
@@ -481,7 +481,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
                           .encoded_bytes_ = encoded_sizes[i],
                           .retired_ = group.retired_});
   }
-  GroupedHashObject::PreparedHandle builder;
+  GroupedObject::PreparedHandle builder;
   GroupRecordWrite root_write{
       .prepared_root_ = &builder,
       .publication_ = &*publication,
@@ -510,9 +510,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
                                                          command_batch});
         if (!directory.ok()) return directory.status();
         auto prepared =
-            previous ? GroupedHashObject::PrepareUpdate(
+            previous ? GroupedObject::PrepareUpdate(
                            current, version, std::move(*directory), written)
-                     : GroupedHashObject::PrepareCreate(
+                     : GroupedObject::PrepareCreate(
                            version, std::move(*directory), written,
                            store.record_index_entry_arena_);
         if (!prepared.ok()) return prepared.status();

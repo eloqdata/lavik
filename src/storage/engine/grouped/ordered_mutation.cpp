@@ -25,8 +25,8 @@
 namespace lavik::storage {
 namespace {
 
-bool SameLogicalView(const GroupedHashObject::Handle& before,
-                     const GroupedHashObject::Handle& current) {
+bool SameLogicalView(const GroupedObject::Handle& before,
+                     const GroupedObject::Handle& current) {
   if (!before || !current) return before == current;
   const auto& a = before->version();
   const auto& b = current->version();
@@ -45,7 +45,7 @@ bool SameLogicalView(const GroupedHashObject::Handle& before,
 Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle previous, OrderedCollectionMutationPlan plan,
+    GroupedObject::Handle previous, OrderedCollectionMutationPlan plan,
     std::uint64_t expire_at_ms, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
@@ -483,7 +483,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     }
     candidates.push_back(std::move(candidate));
   }
-  GroupedHashObject::PreparedHandle builder;
+  GroupedObject::PreparedHandle builder;
   GroupRecordWrite root_write{
       .prepared_root_ = &builder,
       .publication_ = &*publication,
@@ -532,9 +532,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
           }
         }
         auto prepared =
-            previous ? GroupedHashObject::PrepareUpdateOrdered(
+            previous ? GroupedObject::PrepareUpdateOrdered(
                            current, version, std::move(*directory), written)
-                     : GroupedHashObject::PrepareCreateOrdered(
+                     : GroupedObject::PrepareCreateOrdered(
                            version, std::move(*directory), written,
                            store.record_index_entry_arena_);
         if (!prepared.ok()) return prepared.status();
