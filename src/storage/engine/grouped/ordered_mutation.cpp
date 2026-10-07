@@ -91,10 +91,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       append_bytes += kBlockHeaderSlotBytes;
       for (const auto& entry : page.entries_)
         append_bytes += (entry.value_.size() + 16) *
-                        (value_type == ValueType::kSortedSet &&
-                                 (!previous || previous->has_member_index())
-                             ? 2
-                             : 1);
+                        (value_type == ValueType::kSortedSet ? 2 : 1);
     }
     // An outer transaction must be able to finish even under capacity
     // pressure. Only a new standalone transaction can wait for reclamation
@@ -184,8 +181,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, previous, plan);
   if (!member_mutation.ok()) co_return member_mutation.status();
   auto& member_plan = member_mutation->plan_;
-  if (value_type == ValueType::kSortedSet &&
-      (!previous || previous->has_member_index())) {
+  if (value_type == ValueType::kSortedSet) {
     if (!previous && prepared_members != nullptr) {
       if (member_plan.expected_sequence_ != 0)
         co_return absl::AbortedError("prepared member creation is stale");

@@ -79,9 +79,11 @@ bool ValidRoot(const OrderedCollectionRoot& root) {
        root.last_group_ != root.group_count_ ||
        root.next_group_id_ != root.last_group_ + 1))
     return false;
+  if ((root.kind_ == OrderedCollectionKind::kSortedSet) !=
+      root.member_index_.has_value())
+    return false;
   if (root.member_index_ &&
-      (root.kind_ != OrderedCollectionKind::kSortedSet ||
-       root.member_index_->incarnation_ != root.incarnation_ ||
+      (root.member_index_->incarnation_ != root.incarnation_ ||
        root.member_index_->field_count_ != root.item_count_ ||
        root.member_index_->revision_ == 0 ||
        root.member_index_->revision_ > root.revision_))
@@ -257,8 +259,8 @@ absl::StatusOr<std::string> EncodeOrderedCollectionRoot(
   bytes.replace(0, kRootMagic.size(), kRootMagic);
   Store(bytes, 8, 1, 4);
   Store(bytes, 12, static_cast<unsigned>(root.kind_), 1);
-  // All shapes are v1. An explicit presence flag, rather than length alone,
-  // prevents a truncated indexed root from becoming a valid ordered-only root.
+  // The kind, extension flag and payload length must agree; Sorted Sets
+  // always carry the member graph and Streams carry their logical length.
   Store(bytes, 13, root.member_index_ ? 1 : root.stream_length_ ? 2 : 0, 1);
   Store(bytes, 16, root.incarnation_, 8);
   Store(bytes, 24, root.item_count_, 8);

@@ -418,9 +418,6 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
     // member index rejects collisions with earlier, untouched ordered pages,
     // including the same member at another score, before either graph writes.
     // Keep that invariant explicit instead of scanning all prior pages here.
-    if (previous && !previous->has_member_index())
-      co_return absl::DataLossError(
-          "collection staged Sorted Set has no member index");
     for (auto& item : page.scored_members_)
       entries.push_back(
           {.value_ = std::move(item.member_), .score_ = item.score_});

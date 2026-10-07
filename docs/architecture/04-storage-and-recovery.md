@@ -44,8 +44,8 @@ Their serving, transaction, recovery and graph-lifecycle boundaries are describe
 [Grouped collections](09-grouped-collections.md). Collection writes promote
 automatically at the compact-size threshold, while streaming imports construct
 grouped graphs directly. Hash/Set use prefix routing; List uses ordered pages.
-Newly built Sorted Sets combine ordered pages with a member-to-score prefix
-index under one atomic root; legacy ordered-only roots remain supported.
+Sorted Sets combine ordered pages with a member-to-score prefix
+index under one atomic root.
 [Streams](12-streams.md) use ordered logical records for messages, nodes,
 consumer groups and PEL state, with an independent user-visible message count.
 Explicit full-image callbacks retain aggregate
@@ -209,9 +209,9 @@ retain complete snapshots, not read-time mutation logs. The group payload
 envelope leaves framing space within the 1 GiB record-payload limit while
 preserving the independent 512 MiB limit for each field and value. Hash and Set
 use persisted-seed hash prefixes; List uses stable ordered page identities.
-Indexed Sorted Sets use both disjoint identity spaces under their collection
-type. The version-1 ordered-root payload has a checked presence flag for the
-optional appended member Hash root. Roots preserve an independent
+Sorted Sets use both disjoint identity spaces under their collection type.
+The version-1 ordered-root payload has a checked presence flag for its appended
+member Hash root, required for Sorted Sets and absent for other kinds. Roots preserve an independent
 group revision, distinct from the source command sequence shared by mutations
 in a replay envelope.
 Header length is derived from

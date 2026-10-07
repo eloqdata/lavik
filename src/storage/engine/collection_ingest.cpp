@@ -406,7 +406,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       if (type == ValueType::kSortedSet && state->applied_count_ != 0) {
         const auto current =
             partition.grouped_objects_[db_id].CurrentForMutation(key);
-        if (current && current->has_member_index()) {
+        if (current) {
           // RDB input need not be ordered. A batch strictly outside the staged
           // score range can use a head/tail splice after sorting; overlapping
           // scores (including ties) still use the general planner.

@@ -129,9 +129,40 @@ class RecordImage {
                      .mutation_sequence_ = sequence});
   }
 
-  void OrderedRoot(std::string_view key, const OrderedCollectionRoot& root,
+  void OrderedRoot(std::string_view key, OrderedCollectionRoot root,
                    std::uint64_t sequence, std::uint64_t txid = 0,
-                   std::uint64_t expire_at_ms = 0) {
+                   std::uint64_t expire_at_ms = 0,
+                   std::span<const OrderedCollectionEntry> members = {}) {
+    // Build the matching physical member graph for ordinary Sorted Set
+    // fixtures. Tests of graph corruption supply their own records and root.
+    if (root.kind_ == OrderedCollectionKind::kSortedSet && !members.empty()) {
+      Check(members.size() == root.item_count_,
+            "member fixture count mismatch");
+      root.member_index_ = GroupedHashRoot{.incarnation_ = root.incarnation_,
+                                           .seed_ = CurrentDigestSeed(),
+                                           .field_count_ = root.item_count_,
+                                           .group_count_ = 1,
+                                           .revision_ = root.revision_};
+      HashGroupSnapshot group{.incarnation_ = root.incarnation_};
+      for (const auto& member : members) {
+        group.value_.entries_.push_back(
+            {.digest_ = ComputeDigest(member.value_),
+             .field_ = member.value_,
+             .value_ = EncodeSortedSetMemberScore(member.score_)});
+      }
+      auto payload = EncodeHashGroup(group);
+      Check(payload.ok(), "member fixture encoding failed");
+      const bool external = payload->size() > kCollectionGroupTargetBytes;
+      GroupPayload(key, std::move(*payload),
+                   RecordHeader{.value_type_ = ValueType::kSortedSet,
+                                .external_ = external,
+                                .auxiliary_group_ = true,
+                                .group_incarnation_ = root.incarnation_,
+                                .logical_size_ =
+                                    static_cast<std::uint32_t>(members.size()),
+                                .txid_ = txid,
+                                .mutation_sequence_ = root.revision_});
+    }
     auto encoded = EncodeOrderedCollectionRoot(root);
     Check(encoded.ok(), "ordered root fixture encoding failed");
     Append(key, *encoded,
@@ -647,7 +678,8 @@ TEST(GroupedRecoveryE2e, ManyInlineOrderedRootsRecoverOnSmallStack) {
                                             .next_group_id_ = 2,
                                             .group_count_ = 1,
                                             .revision_ = 1},
-                      1);
+                      1, 0, 0,
+                      std::array{OrderedCollectionEntry{"value", 3.5}});
   }
   image.Finish();
   // Inline metadata needs no I/O between roots. A small worker stack catches
@@ -666,40 +698,6 @@ TEST(GroupedRecoveryE2e, ManyInlineOrderedRootsRecoverOnSmallStack) {
     }
   }
   EXPECT_EQ(server.Wait(true), 0) << server.Log();
-}
-
-TEST(GroupedRecoveryE2e, LegacySortedSetCanStillMutateAndRecover) {
-  RecordImage image;
-  OrderedGroupSnapshot page{.kind_ = OrderedCollectionKind::kSortedSet,
-                            .incarnation_ = 17,
-                            .id_ = 1,
-                            .entries_ = {{"original", 3.5}}};
-  image.OrderedGroup("legacy", page, 1);
-  image.OrderedRoot(
-      "legacy",
-      OrderedCollectionRoot{.kind_ = OrderedCollectionKind::kSortedSet,
-                            .incarnation_ = 17,
-                            .item_count_ = 1,
-                            .first_group_ = 1,
-                            .last_group_ = 1,
-                            .next_group_id_ = 2,
-                            .group_count_ = 1,
-                            .revision_ = 1},
-      1);
-  image.Finish();
-  {
-    ChildServer server(image);
-    EXPECT_EQ(server.Command({"ZSCORE", "legacy", "original"}), "3.5");
-    EXPECT_EQ(server.Command({"ZINCRBY", "legacy", "2", "original"}), "5.5");
-    EXPECT_EQ(server.Command({"ZADD", "legacy", "-1", "new"}), ":1");
-    EXPECT_EQ(server.Wait(true), 0) << server.Log();
-  }
-  ChildServer recovered(image);
-  EXPECT_EQ(recovered.Command({"ZCARD", "legacy"}), ":2");
-  EXPECT_EQ(recovered.Command({"ZSCORE", "legacy", "original"}), "5.5");
-  EXPECT_EQ(recovered.Command({"ZSCORE", "legacy", "new"}), "-1");
-  EXPECT_EQ(recovered.Command({"ZREM", "legacy", "original"}), ":1");
-  EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
 TEST(GroupedRecoveryE2e, ReclaimedExpiredGraphsDoNotPreventStartup) {
@@ -1500,7 +1498,7 @@ TEST(GroupedRecoveryE2e, OrderedRetirementSkipsFreedObsoletePageExtents) {
                                             .next_group_id_ = 3,
                                             .group_count_ = 1,
                                             .revision_ = 4},
-                      4, 42);
+                      4, 42, 0, std::array{OrderedCollectionEntry{"new", 1.0}});
     image.Commit(41);
     image.Commit(91);
     image.Commit(42);
@@ -1546,7 +1544,7 @@ TEST(GroupedRecoveryE2e, OrderedOversizedItemChecksEveryLiveExtent) {
                                               .next_group_id_ = 2,
                                               .group_count_ = 1,
                                               .revision_ = 1},
-                        1);
+                        1, 0, 0, page.entries_);
       image.Finish();
       if (corrupt) image.CorruptExtentBody(extents.back());
       ChildServer server(image);
@@ -1602,7 +1600,7 @@ TEST(GroupedRecoveryE2e, OrderedGcCrashesPreservePagesMarkersAndRoot) {
                                               .next_group_id_ = 3,
                                               .group_count_ = 1,
                                               .revision_ = 7},
-                        7);
+                        7, 0, 0, std::array{OrderedCollectionEntry{item, 1.0}});
       image.Finish();
       {
         ChildServer server(image, false, point, true);
@@ -1649,7 +1647,7 @@ TEST(GroupedRecoveryE2e, OrderedBgSavePinsExactPreCutPagesAndExpiration) {
                                             .next_group_id_ = 2,
                                             .group_count_ = 1,
                                             .revision_ = 1},
-                      1, 41);
+                      1, 41, 0, page.entries_);
     image.Commit(41);
     image.Finish();
     ChildServer server(image, false, {}, false, true);

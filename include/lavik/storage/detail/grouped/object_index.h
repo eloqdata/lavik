@@ -100,7 +100,7 @@ class GroupedObject {
       std::span<const GroupedRecordLocation> changed_locations);
 
   // Ordered collections share the same bounded physical index pages.
-  // For indexed Sorted Sets, locations include BOTH the ordered graph and
+  // For Sorted Sets, locations include BOTH the ordered graph and
   // member-prefix graph; either incomplete graph rejects publication.
   static absl::StatusOr<Handle> CreateOrdered(
       GroupedObjectVersion version, OrderedGroupDirectory directory,
