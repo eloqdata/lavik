@@ -27,7 +27,7 @@ Task<absl::StatusOr<StorageEngine::Impl::SortedSetMemberMutation>>
 StorageEngine::Impl::PrepareSortedSetMembers(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle previous,
+    GroupedObject::Handle previous,
     const OrderedCollectionMutationPlan& ordered, bool unlocked,
     std::optional<std::span<const SortedSetMemberChange>> checked_changes,
     SortedSetMemberProbe* probe) {
@@ -94,7 +94,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
   }
 
   auto add_group = [&](GroupedScratchBudget& budget,
-                       HashGroupId id) -> absl::Status {
+                       GroupedRecordId id) -> absl::Status {
     // Prior IO may have allowed physical relocation. Never use an old
     // manifest to admit the next read; the loader refreshes again before IO.
     const auto current =
@@ -108,7 +108,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
       return absl::AbortedError("member-index source population changed");
     const auto* entry = current->FindGroup(id);
     if (!entry) return absl::DataLossError("missing member-index source page");
-    return budget.AddGroup(entry->value_, current->ExtentsFor(id));
+    return budget.AddGroup(*entry, current->ExtentsFor(id));
   };
   GroupedScratchBudget metadata_budget;
   absl::Status status;
@@ -233,7 +233,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
   plan.root_ = previous->directory().root();
   if (changes.empty()) co_return result;
 
-  std::map<HashGroupId, HashGroupSnapshot> leaves;
+  std::map<GroupedRecordId, HashGroupSnapshot> leaves;
   for (const auto& [member, change] : changes) {
     const auto* route = previous->directory().Find(member);
     if (!route) co_return absl::DataLossError("member has no prefix route");

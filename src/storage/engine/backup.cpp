@@ -86,14 +86,14 @@ absl::Status PrepareSnapshotBlockPins(
     if (value->grouped_ == nullptr) return absl::OkStatus();
     if (!ordered_pages) {
       value->grouped_->ForEachRecord(
-          [&](HashGroupId, const auto& entry,
+          [&](GroupedRecordId, const auto& entry,
               const std::shared_ptr<const std::vector<ExtentRef>>& extents,
               bool) { visit(entry, extents); });
       return absl::OkStatus();
     }
     const auto& groups = value->grouped_->ordered_directory().groups();
     for (std::size_t i = ordered_pages->first; i < ordered_pages->second; ++i) {
-      const HashGroupId id{groups[i].id_, 0};
+      const GroupedRecordId id{groups[i].id_, 0};
       const auto* entry = value->grouped_->FindGroup(id);
       if (entry == nullptr)
         return absl::DataLossError("missing ordered range pin page");
@@ -1047,7 +1047,7 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
     }
   });
   const auto object = stream.saved_->grouped_;
-  HashGroupId group_id;
+  GroupedRecordId group_id;
   if (object->is_ordered()) {
     const auto& groups = object->ordered_directory().groups();
     if (cursor >= groups.size())

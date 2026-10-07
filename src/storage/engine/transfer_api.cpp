@@ -133,12 +133,12 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           -> Task<absl::StatusOr<const LoadedOrderedGroup*>> {
         if (source.probe_page_ && source.probe_index_ == index)
           co_return &*source.probe_page_;
-        const HashGroupId id{groups[index].id_, 0};
+        const GroupedRecordId id{groups[index].id_, 0};
         const auto* physical = object->FindGroup(id);
         if (!physical)
           co_return absl::DataLossError("missing Stream range page");
         GroupedScratchBudget budget;
-        auto status = budget.AddGroup(physical->value_, object->ExtentsFor(id));
+        auto status = budget.AddGroup(*physical, object->ExtentsFor(id));
         if (!status.ok()) co_return status;
         auto admission = budget.Reserve(1);
         if (!admission.ok()) co_return admission.status();
@@ -218,12 +218,12 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         const auto index =
             source.range_->reverse_ ? first - size : first + size;
         const auto& group = groups[index];
-        const HashGroupId id{group.id_, 0};
+        const GroupedRecordId id{group.id_, 0};
         const auto* physical = object->FindGroup(id);
         if (!physical)
           co_return absl::DataLossError("missing Stream read-window page");
         GroupedScratchBudget budget;
-        auto status = budget.AddGroup(physical->value_, object->ExtentsFor(id));
+        auto status = budget.AddGroup(*physical, object->ExtentsFor(id));
         if (!status.ok()) co_return status;
         if (budget.bytes() > StreamPageWindow::kBytes - bytes) break;
         bytes += budget.bytes();
@@ -317,7 +317,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         co_return CollectionPage{.value_type_ = ValueType::kStream,
                                  .done_ = true};
       }
-      HashGroupId id;
+      GroupedRecordId id;
       // This credit also outlives the decoded window on early return.
       MemoryReservation admission;
       std::unique_ptr<StreamPageWindow> window;
@@ -366,7 +366,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           co_return absl::DataLossError("collection transfer page is missing");
         GroupedScratchBudget budget;
         const auto included =
-            budget.AddGroup(physical->value_, object->ExtentsFor(id));
+            budget.AddGroup(*physical, object->ExtentsFor(id));
         if (!included.ok()) co_return included;
         auto reserved = budget.Reserve(1);
         if (!reserved.ok()) co_return reserved.status();

@@ -79,9 +79,9 @@ absl::StatusOr<ExtentManifest> UnsharedGroupedExtents(
 
 absl::StatusOr<std::vector<RetiredRecord>>
 StorageEngine::Impl::CollectGroupedRetirements(
-    const GroupedHashObject::Handle& previous,
-    const GroupedHashObject::Handle& replacement,
-    std::optional<std::span<const HashGroupId>> touched) {
+    const GroupedObject::Handle& previous,
+    const GroupedObject::Handle& replacement,
+    std::optional<std::span<const GroupedRecordId>> touched) {
   std::vector<RetiredRecord> result;
   if (previous == nullptr || previous == replacement) return result;
   const auto records = touched ? touched->size() : previous->record_count();
@@ -106,7 +106,7 @@ StorageEngine::Impl::CollectGroupedRetirements(
   std::vector<RetiredExtentIdentity> replacement_extents;
   result.reserve(records);
   absl::Status status;
-  auto collect = [&](HashGroupId id, const GroupedRecordIndexEntry& old_entry,
+  auto collect = [&](GroupedRecordId id, const RecordIndexValue& old_entry,
                      const ExtentManifest& old_extents, bool) {
     if (!status.ok()) return;
     // The adapter calls this before suspension/publication. Never defer
@@ -142,7 +142,7 @@ StorageEngine::Impl::CollectGroupedRetirements(
     result.push_back(std::move(retired));
   };
   if (touched) {
-    std::vector<HashGroupId> ids(touched->begin(), touched->end());
+    std::vector<GroupedRecordId> ids(touched->begin(), touched->end());
     std::sort(ids.begin(), ids.end());
     if (std::adjacent_find(ids.begin(), ids.end()) != ids.end())
       return absl::InvalidArgumentError(
@@ -198,8 +198,8 @@ bool StorageEngine::Impl::GroupedRetirementPins::Take(
 }
 
 Task<absl::Status> StorageEngine::Impl::PrepinGroupedRetirementsLocked(
-    WorkerStore& store, const GroupedHashObject::Handle& previous,
-    std::optional<std::span<const HashGroupId>> touched, bool include_root,
+    WorkerStore& store, const GroupedObject::Handle& previous,
+    std::optional<std::span<const GroupedRecordId>> touched, bool include_root,
     std::unique_ptr<GroupedRetirementPins>* pins) {
   if (previous == nullptr) co_return absl::OkStatus();
   auto records = CollectGroupedRetirements(previous, nullptr, touched);

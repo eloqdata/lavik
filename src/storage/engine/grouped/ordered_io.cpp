@@ -22,14 +22,14 @@ template <typename Result, typename Decode>
 Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, std::uint64_t page_id, bool pinned,
+    GroupedObject::Handle object, std::uint64_t page_id, bool pinned,
     Decode decode) {
   if (object == nullptr || !object->is_ordered()) {
     co_return absl::DataLossError("missing ordered collection view");
   }
   const auto original = object->version();
   const auto root = object->ordered_directory().root();
-  const HashGroupId id{page_id, 0};
+  const GroupedRecordId id{page_id, 0};
   for (;;) {
     const auto readable = object->ReadStatus();
     if (!readable.ok()) co_return readable;
@@ -136,7 +136,7 @@ Task<absl::StatusOr<LoadedOrderedGroup>>
 StorageEngine::Impl::LoadOrderedGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, std::uint64_t page_id, bool pinned) {
+    GroupedObject::Handle object, std::uint64_t page_id, bool pinned) {
   return LoadOrderedGroup<LoadedOrderedGroup>(
       store, partition, db_id, key, digest, std::move(object), page_id, pinned,
       [](std::string_view payload, std::uint64_t sequence,
@@ -157,7 +157,7 @@ Task<absl::StatusOr<std::vector<std::string>>>
 StorageEngine::Impl::LoadOrderedListRange(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, std::uint64_t page_id, std::size_t first,
+    GroupedObject::Handle object, std::uint64_t page_id, std::size_t first,
     std::size_t count) {
   return LoadOrderedGroup<std::vector<std::string>>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
@@ -172,7 +172,7 @@ StorageEngine::Impl::LoadSortedSetPage(WorkerStore& store,
                                        WorkerStore::PartitionStore& partition,
                                        std::uint8_t db_id, std::string_view key,
                                        const Digest& digest,
-                                       GroupedHashObject::Handle object,
+                                       GroupedObject::Handle object,
                                        std::uint64_t page_id) {
   return LoadOrderedGroup<LoadedSortedSetPage>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
@@ -192,7 +192,7 @@ Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
 StorageEngine::Impl::LoadGroupedOrderedValue(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, bool pinned) {
+    GroupedObject::Handle object, bool pinned) {
   if (object == nullptr || !object->is_ordered()) {
     co_return absl::DataLossError("missing ordered collection view");
   }

@@ -116,7 +116,7 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
   if (!stream->Valid(*this) || stream->pages_done_)
     co_return absl::CancelledError(
         "full-sync collection cursor is no longer active");
-  HashGroupId id;
+  GroupedRecordId id;
   if (object->is_ordered()) {
     const auto& groups = object->ordered_directory().groups();
     if (stream->cursor_ >= groups.size())

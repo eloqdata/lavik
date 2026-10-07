@@ -157,7 +157,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   std::optional<CompactWriteSnapshot> write_snapshot;
   if (unlocked_compact_write || unlocked_create)
     write_snapshot = CaptureCompactWriteSnapshot(store, partition, db_id);
-  GroupedHashObject::Handle grouped;
+  GroupedObject::Handle grouped;
   if (exists && location.grouped()) {
     auto object = partition.grouped_objects_[db_id].Lookup(
         key, GroupedObjectVersion{
@@ -270,11 +270,11 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
                    : OrderedCollectionKind::kSortedSet))
         co_return absl::DataLossError("invalid ordered callback view");
       for (const auto& page : grouped->ordered_directory().groups()) {
-        const HashGroupId id{page.id_, 0};
+        const GroupedRecordId id{page.id_, 0};
         const auto* entry = grouped->FindGroup(id);
         if (!entry)
           co_return absl::DataLossError("missing Sorted Set callback page");
-        auto admitted = budget.AddGroup(entry->value_, grouped->ExtentsFor(id));
+        auto admitted = budget.AddGroup(*entry, grouped->ExtentsFor(id));
         if (!admitted.ok()) co_return admitted;
       }
     } else {

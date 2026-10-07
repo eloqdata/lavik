@@ -319,8 +319,7 @@ absl::Status RetainHashLookupValue(HashResult& result,
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object,
-    std::span<const std::string_view> fields) {
+    GroupedObject::Handle object, std::span<const std::string_view> fields) {
   // Keep multi-field planning in its own coroutine so single-field reads do
   // not pay for the plan's allocations or coroutine-frame storage.
   constexpr auto max_size = std::numeric_limits<std::size_t>::max();
@@ -486,7 +485,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   const ExtentManifest extents =
       exists ? ExtentsFor(store, found) : ExtentManifest{};
   const std::uint64_t expire_at_ms = exists ? location.expire_at_ms_ : 0;
-  GroupedHashObject::Handle grouped;
+  GroupedObject::Handle grouped;
   if (exists && location.grouped()) {
     auto view = partition.grouped_objects_[db_id].Lookup(
         key, GroupedObjectVersion{
@@ -665,7 +664,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       co_return absl::DataLossError("grouped scan has no physical page");
     GroupedScratchBudget budget;
     const auto included =
-        budget.AddGroup(entry->value_, grouped->ExtentsFor(route->id_));
+        budget.AddGroup(*entry, grouped->ExtentsFor(route->id_));
     if (!included.ok()) co_return included;
     // Matching strings move into the reply; no second payload copy is made.
     // The physical read buffer has its own independent admission.
@@ -729,10 +728,10 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   if (edit_leaves && operation.kind_ != HashOperationKind::kDelete &&
       operation.fields_.size() != operation.values_.size())
     co_return absl::InvalidArgumentError("Hash field/value mismatch");
-  std::set<HashGroupId> selected;
+  std::set<GroupedRecordId> selected;
   std::optional<MemoryReservation> operand_scratch;
   struct RoutedEdit {
-    HashGroupId id_;
+    GroupedRecordId id_;
     HashEntryView view_;
     std::size_t ordinal_;
   };
@@ -796,7 +795,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       for (const auto& [prefix, metadata] : grouped->directory().groups())
         selected.insert(metadata.id_);
     }
-    const auto add_group = [&](HashGroupId id) -> absl::Status {
+    const auto add_group = [&](GroupedRecordId id) -> absl::Status {
       // Every id above came from this same immutable directory, and no await
       // separates routing from admission. Rechecking the logical AVL route
       // here adds a lookup without strengthening the physical read checks.
@@ -805,9 +804,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         return absl::DataLossError("missing Hash scratch page");
       // Inline records cannot own a manifest. Avoid a second physical-index
       // traversal merely to obtain the null handle used by admission.
-      return budget.AddGroup(entry->value_, entry->value_.external()
-                                                ? grouped->ExtentsFor(id)
-                                                : ExtentManifest{});
+      return budget.AddGroup(*entry, entry->external() ? grouped->ExtentsFor(id)
+                                                       : ExtentManifest{});
     };
     if (edit_leaves) {
       if (leaf_edits.size() > 1)
@@ -816,7 +814,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
                     return a.id_ != b.id_ ? a.id_ < b.id_
                                           : a.ordinal_ < b.ordinal_;
                   });
-      std::optional<HashGroupId> previous;
+      std::optional<GroupedRecordId> previous;
       for (const auto& edit : leaf_edits) {
         if (previous == edit.id_) continue;
         const auto added = add_group(edit.id_);
@@ -945,7 +943,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   }
 
   const std::uint64_t selected_field_count = compact.entries_.size();
-  std::set<HashGroupId> changed_groups;
+  std::set<GroupedRecordId> changed_groups;
   auto mark_group_changed = [&](std::string_view field) {
     if (grouped != nullptr) {
       const auto* route = grouped->directory().Find(field);
@@ -1360,8 +1358,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   result.key_exists_ = result.length_ != 0;
   if (unlocked_grouped_write) {
     if (!grouped_plan && result.changed_ && result.key_exists_) {
-      const std::vector<HashGroupId> changed(changed_groups.begin(),
-                                             changed_groups.end());
+      const std::vector<GroupedRecordId> changed(changed_groups.begin(),
+                                                 changed_groups.end());
       auto prepared =
           PrepareGroupedHashMutation(grouped, std::move(compact), changed,
                                      result.length_, grouped->revision());
@@ -1461,7 +1459,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
                                   : NeedsGroupedHash(compact)))) {
     absl::Status written = co_await CommitGroupedHashMutationLocked(
         store, partition, db_id, key, digest, grouped, std::move(compact),
-        std::vector<HashGroupId>(changed_groups.begin(), changed_groups.end()),
+        std::vector<GroupedRecordId>(changed_groups.begin(),
+                                     changed_groups.end()),
         result.length_, value_type, expire_at_ms, tx, replication,
         mutation_precondition, grouped_plan ? &*grouped_plan : nullptr);
     if (!written.ok()) co_return written;

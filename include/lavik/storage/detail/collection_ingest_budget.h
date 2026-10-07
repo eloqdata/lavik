@@ -125,7 +125,7 @@ inline absl::StatusOr<std::size_t> CollectionIngestBuildBytes(
     // Existing-topology mutations retain the conservative per-item estimate;
     // fresh Sorted Sets use the complete split-tree bound above.
     add(hash_groups, sizeof(HashGroupSnapshot) + sizeof(HashGroupEncoder) +
-                         sizeof(HashGroupMetadata) + sizeof(HashGroupId));
+                         sizeof(HashGroupMetadata) + sizeof(GroupedRecordId));
   }
   if (!hash) {
     // Ordered input and split-page entry arrays coexist. Sorted Sets also

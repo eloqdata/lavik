@@ -97,6 +97,8 @@ TEST(RecordLocationTest, DefaultLocationRetainsEmptyValueSemantics) {
 
 TEST(RecordLocationTest, GroupedRepresentationSurvivesIndexAndExpiryChanges) {
   RecordIndex index;
+  BlockState state;
+  state.Reset(7, 83);
   const auto digest = ComputeDigest("grouped-hash");
   for (bool external : {false, true}) {
     for (bool key_indirect : {false, true}) {
@@ -119,8 +121,7 @@ TEST(RecordLocationTest, GroupedRepresentationSurvivesIndexAndExpiryChanges) {
         EXPECT_TRUE(entry->value_.grouped());
         entry->value_.set_in_memory(false);
         entry->value_.set_tx_tagged(false);
-        const auto restored = RecordIndexEntryPolicy::Load(
-            entry->value_, entry->optional_extra(), 83, 7);
+        const auto restored = MaterializePublishedIndexLocation(*entry, state);
         EXPECT_TRUE(restored.grouped());
         EXPECT_EQ(restored.value_type(), ValueType::kHash);
         EXPECT_EQ(restored.external(), external);
@@ -237,7 +238,7 @@ TEST(RecordLocationTest, RemoteMaterializationRejectsReusedBlockByEpoch) {
   RecordLocation old_location;
   RecordLocation current_location;
   std::thread remote_reader([&] {
-    old_location = MaterializePublishedIndexLocation(*old_entry, state);
+    old_location = MaterializePublishedIndexLocation(old_entry->value_, state);
     old_materialized.store(true, std::memory_order_release);
     while (!block_reused.load(std::memory_order_acquire)) {
       std::this_thread::yield();

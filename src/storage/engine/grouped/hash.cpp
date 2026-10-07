@@ -113,7 +113,7 @@ absl::StatusOr<std::size_t> PayloadBytes(const HashValue& value) {
 
 absl::Status ValidateFields(const HashGroupSnapshot& group,
                             const DigestSeed* seed) {
-  if (group.incarnation_ == 0 || !group.id_.valid() ||
+  if (group.incarnation_ == 0 || !group.id_.IsHashPrefix() ||
       (group.retired_ && !group.value_.entries_.empty())) {
     return absl::InvalidArgumentError("invalid Hash group identity or state");
   }
@@ -124,7 +124,7 @@ absl::Status ValidateFields(const HashGroupSnapshot& group,
       return absl::InvalidArgumentError("duplicate field in Hash group");
     }
     if (seed != nullptr &&
-        !group.id_.contains(ComputeDigest(entry.field_, *seed).value_)) {
+        !group.id_.ContainsHash(ComputeDigest(entry.field_, *seed).value_)) {
       return absl::InvalidArgumentError("field is outside its Hash group");
     }
   }
@@ -133,16 +133,16 @@ absl::Status ValidateFields(const HashGroupSnapshot& group,
 
 }  // namespace
 
-bool HashGroupId::valid() const noexcept {
+bool GroupedRecordId::IsHashPrefix() const noexcept {
   return bits_ <= 64 && (prefix_ & ~Mask(bits_)) == 0;
 }
 
-bool HashGroupId::contains(std::uint64_t hash) const noexcept {
-  return valid() && (hash & Mask(bits_)) == prefix_;
+bool GroupedRecordId::ContainsHash(std::uint64_t hash) const noexcept {
+  return IsHashPrefix() && (hash & Mask(bits_)) == prefix_;
 }
 
-std::uint64_t HashGroupId::last() const noexcept {
-  return valid() ? prefix_ | ~Mask(bits_) : 0;
+std::uint64_t GroupedRecordId::LastHash() const noexcept {
+  return IsHashPrefix() ? prefix_ | ~Mask(bits_) : 0;
 }
 
 absl::StatusOr<std::string> EncodeGroupedHashRoot(const GroupedHashRoot& root) {
@@ -275,7 +275,7 @@ absl::StatusOr<HashGroupMetadata> DecodeHashGroupMetadata(
       .retired_ = Load(bytes, 41, 1) != 0,
   };
   const std::size_t payload_bytes = encoded_bytes - kGroupHeaderBytes;
-  if (metadata.incarnation_ == 0 || !metadata.id_.valid() ||
+  if (metadata.incarnation_ == 0 || !metadata.id_.IsHashPrefix() ||
       (metadata.retired_ && metadata.field_count_ != 0) ||
       (metadata.field_count_ == 0 && payload_bytes != 0) ||
       (metadata.field_count_ != 0 &&
@@ -316,7 +316,7 @@ absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(std::string_view bytes) {
 }
 
 absl::Status VisitHashGroupFields(
-    std::string_view payload, std::uint32_t field_count, HashGroupId id,
+    std::string_view payload, std::uint32_t field_count, GroupedRecordId id,
     const DigestSeed& seed,
     absl::FunctionRef<absl::Status(const HashEntryView&)> visitor) {
   if (field_count == 0) return absl::OkStatus();
@@ -331,7 +331,7 @@ absl::Status VisitHashGroupFields(
     auto entry = reader->Next();
     if (!entry.ok()) return absl::DataLossError(entry.status().message());
     const auto hash = ComputeDigest(entry->field_, seed).value_;
-    if (!id.contains(hash))
+    if (!id.ContainsHash(hash))
       return absl::DataLossError("Hash field outside its group route");
     if (!fields.insert(FieldKey{entry->field_, hash}).second)
       return absl::DataLossError("duplicate field in Hash group");
@@ -368,7 +368,7 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
       auto entry = reader->Next();
       if (!entry.ok()) return absl::DataLossError(entry.status().message());
       const auto hash = ComputeDigest(entry->field_, seed).value_;
-      if (!metadata->id_.contains(hash))
+      if (!metadata->id_.ContainsHash(hash))
         return absl::DataLossError("Hash field outside its group route");
       if (!positions.emplace(FieldKey{entry->field_, hash}, entries.size())
                .second)
@@ -382,7 +382,7 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
                                     edit.value_.size(), kHashGroupPayloadLimit);
     if (!size.ok()) return size.status();
     const FieldKey key{edit.field_, ComputeDigest(edit.field_, seed).value_};
-    if (!metadata->id_.contains(key.hash))
+    if (!metadata->id_.ContainsHash(key.hash))
       return absl::InvalidArgumentError("Hash edit outside its group route");
     const auto found = positions.find(key);
     if (kind == HashGroupEditKind::kDelete) {
@@ -507,7 +507,7 @@ absl::StatusOr<std::vector<HashGroupSnapshot>> SplitHashGroup(
     std::size_t index_;
   };
   struct Range {
-    HashGroupId id_;
+    GroupedRecordId id_;
     std::size_t first_;
     std::size_t last_;
     std::uint64_t entry_bytes_;
@@ -582,12 +582,12 @@ absl::StatusOr<std::vector<HashGroupSnapshot>> GroupHashValue(
 
 absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Recover(
     const GroupedHashRoot& root, std::uint64_t root_sequence,
-    std::span<const RecoveredHashGroup> candidates,
+    std::span<const RecoveredGroupedRecord> candidates,
     const absl::flat_hash_set<std::uint64_t>& committed_txids) {
   if (!ValidRoot(root) || root_sequence == 0) {
     return absl::DataLossError("invalid grouped Hash recovery root");
   }
-  std::map<HashGroupId, RecoveredHashGroup> winners;
+  std::map<GroupedRecordId, RecoveredGroupedRecord> winners;
   for (const auto& candidate : candidates) {
     if (candidate.incarnation_ != root.incarnation_ ||
         candidate.sequence_ > root.revision_ ||
@@ -596,7 +596,7 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Recover(
          !committed_txids.contains(candidate.batch_txid_))) {
       continue;
     }
-    if (!candidate.id_.valid() || candidate.sequence_ == 0 ||
+    if (!candidate.id_.IsHashPrefix() || candidate.sequence_ == 0 ||
         (candidate.retired_ && candidate.field_count_ != 0) ||
         candidate.field_count_ > std::numeric_limits<std::uint32_t>::max()) {
       return absl::DataLossError("invalid recovered Hash group metadata");
@@ -652,7 +652,7 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Recover(
     if (complete || prefix != next) {
       return absl::DataLossError("grouped Hash routing has gaps or overlaps");
     }
-    const std::uint64_t last = candidate.id_.last();
+    const std::uint64_t last = candidate.id_.LastHash();
     complete = last == std::numeric_limits<std::uint64_t>::max();
     if (!complete) next = last + 1;
   }
@@ -662,16 +662,16 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Recover(
   return directory;
 }
 
-const RecoveredHashGroup* HashGroupDirectory::Find(
+const RecoveredGroupedRecord* HashGroupDirectory::Find(
     std::string_view field) const noexcept {
   const std::uint64_t hash = ComputeDigest(field, root_.seed_).value_;
   const auto* group = groups_.Floor(hash);
-  return group && group->id_.contains(hash) ? group : nullptr;
+  return group && group->id_.ContainsHash(hash) ? group : nullptr;
 }
 
 absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
     const GroupedHashRoot& root, std::uint64_t sequence,
-    std::span<const RecoveredHashGroup> changes) const {
+    std::span<const RecoveredGroupedRecord> changes) const {
   if (!ValidRoot(root) || root.incarnation_ != root_.incarnation_ ||
       root.seed_ != root_.seed_ || sequence < command_sequence_ ||
       root.revision_ <= sequence_ || changes.empty()) {
@@ -684,12 +684,12 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
   // Most point writes replace one route. A sorted pointer list preserves
   // duplicate detection and prefix order without allocating a map node per
   // changed group; larger batches spill under the existing scratch admission.
-  absl::InlinedVector<const RecoveredHashGroup*, 4> writes;
+  absl::InlinedVector<const RecoveredGroupedRecord*, 4> writes;
   writes.reserve(changes.size());
   for (const auto& change : changes) writes.push_back(&change);
   std::sort(writes.begin(), writes.end(),
             [](const auto* a, const auto* b) { return a->id_ < b->id_; });
-  std::optional<HashGroupId> previous;
+  std::optional<GroupedRecordId> previous;
   std::uint64_t count = root_.field_count_;
   // Hash-prefix leaves partition a 64-bit domain. A wider scratch accumulator
   // verifies total coverage after local replacements, without scanning every
@@ -698,7 +698,8 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
   __uint128_t coverage = static_cast<__uint128_t>(1) << 64;
   for (const auto* changed : writes) {
     const auto& change = *changed;
-    if (!change.id_.valid() || change.incarnation_ != root.incarnation_ ||
+    if (!change.id_.IsHashPrefix() ||
+        change.incarnation_ != root.incarnation_ ||
         change.sequence_ != root.revision_ ||
         change.field_count_ > std::numeric_limits<std::uint32_t>::max() ||
         (change.retired_ && change.field_count_ != 0) ||
@@ -735,7 +736,7 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
     }
     const auto* floor = next.groups_.Floor(id.prefix_);
     const bool replaces_route = floor && floor->id_ == id;
-    if (floor && !replaces_route && floor->id_.last() >= id.prefix_) {
+    if (floor && !replaces_route && floor->id_.LastHash() >= id.prefix_) {
       return absl::DataLossError("group update overlaps an earlier route");
     }
     const auto inserted = next.groups_.SetBuffered(id.prefix_, change);
@@ -744,7 +745,7 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
     if (!replaces_route) {
       auto after = next.groups_.find(id.prefix_);
       ++after;
-      if (after != next.groups_.end() && after->first <= id.last()) {
+      if (after != next.groups_.end() && after->first <= id.LastHash()) {
         return absl::DataLossError("group update overlaps a later route");
       }
     }
@@ -775,7 +776,7 @@ absl::StatusOr<HashGroupMutationPlan> PlanHashGroupMutation(
        kind != HashGroupMutationKind::kSetIfAbsent && !deleting)) {
     return absl::InvalidArgumentError("invalid grouped Hash mutation operands");
   }
-  std::map<HashGroupId, LoadedHashGroup*> loaded_by_id;
+  std::map<GroupedRecordId, LoadedHashGroup*> loaded_by_id;
   for (auto& loaded : loaded_groups) {
     const auto& group = loaded.snapshot_;
     auto current = directory.groups().find(group.id_.prefix_);
@@ -797,7 +798,7 @@ absl::StatusOr<HashGroupMutationPlan> PlanHashGroupMutation(
       .expected_sequence_ = directory.sequence(),
       .writes_ = {},
   };
-  std::map<HashGroupId, bool> changed;
+  std::map<GroupedRecordId, bool> changed;
   for (std::size_t i = 0; i < fields.size(); ++i) {
     if (fields[i].size() > kMaxStringBytes ||
         (!deleting && values[i].size() > kMaxStringBytes)) {

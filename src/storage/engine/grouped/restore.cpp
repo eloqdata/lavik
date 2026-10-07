@@ -21,7 +21,7 @@ namespace lavik::storage {
 Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle previous, TxShardWrites* compensation,
+    GroupedObject::Handle previous, TxShardWrites* compensation,
     TxUndoLog* replacement_undo) {
   if (!previous || !compensation || compensation->collect_undo_ ||
       compensation->grouped_ingest_batch_ != nullptr)
@@ -37,7 +37,7 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
     co_return absl::AbortedError("grouped compensation population changed");
   auto& side = partition.grouped_objects_[db_id];
   const auto replaced = side.CurrentForMutation(key);
-  auto same_replaced = [&](const GroupedHashObject::Handle& current) {
+  auto same_replaced = [&](const GroupedObject::Handle& current) {
     if (!replaced || !current) return replaced == current;
     return current->command_sequence() == replaced->command_sequence() &&
            current->version().root_.expire_at_ms_ ==
@@ -68,8 +68,8 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
   // but give the compensating root a fresh, strictly greater R. The caller
   // must leave the failed ingest's shared auxiliary batch uncommitted.
   constexpr std::size_t kPerRecordScratch = 4 * sizeof(RecoveredOrderedGroup) +
-                                            4 * sizeof(RecoveredHashGroup) +
-                                            4 * sizeof(HashGroupId);
+                                            4 * sizeof(RecoveredGroupedRecord) +
+                                            4 * sizeof(GroupedRecordId);
   const auto count = previous->record_count();
   // Different incarnations already make Append retire the whole replacement
   // graph. Only an in-incarnation restore needs an explicit touched-id list.
@@ -102,9 +102,9 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
   } else {
     auto root = previous->directory().root();
     root.revision_ = revision;
-    std::vector<RecoveredHashGroup> candidates;
+    std::vector<RecoveredGroupedRecord> candidates;
     candidates.reserve(count);
-    auto append = [&](RecoveredHashGroup record) {
+    auto append = [&](RecoveredGroupedRecord record) {
       // These are the original journal's adjudicated pages. Their previous
       // runtime decision ids do not become new durable commit assertions.
       record.txid_ = 0;
@@ -121,12 +121,12 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
     payload = EncodeGroupedHashRoot(root);
   }
   if (!payload.ok()) co_return payload.status();
-  std::vector<HashGroupId> changed;
+  std::vector<GroupedRecordId> changed;
   changed.reserve(replaced_count);
   if (replaced_count != 0) {
     // This also covers compensation inside the same incarnation. Retirement
     // compares exact coordinates and skips any old page shared by both views.
-    replaced->ForEachRecord([&](HashGroupId id, const auto&, const auto&,
+    replaced->ForEachRecord([&](GroupedRecordId id, const auto&, const auto&,
                                 bool) { changed.push_back(id); });
   }
   auto decision = PrepareGroupedDecision(*compensation);
@@ -135,7 +135,7 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
   if (!reserved.ok()) co_return reserved.status();
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
-  GroupedHashObject::PreparedHandle builder;
+  GroupedObject::PreparedHandle builder;
   GroupRecordWrite root_write{
       .prepared_root_ = &builder,
       .publication_ = &*publication,
@@ -155,10 +155,10 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
         // pins. Share them directly; neither group payloads nor extent
         // values are read or rewritten as part of this compensation.
         auto prepared = previous->is_ordered()
-                            ? GroupedHashObject::PrepareUpdateOrdered(
+                            ? GroupedObject::PrepareUpdateOrdered(
                                   previous, version, *ordered_directory, {})
-                            : GroupedHashObject::PrepareUpdate(
-                                  previous, version, *hash_directory, {});
+                            : GroupedObject::PrepareUpdate(previous, version,
+                                                           *hash_directory, {});
         if (!prepared.ok()) return prepared.status();
         builder = std::move(*prepared);
         publication.reset();

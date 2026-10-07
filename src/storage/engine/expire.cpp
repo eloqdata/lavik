@@ -396,7 +396,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   const RecordLocation dropped = MaterializeIndexLocation(*current);
   const ExtentManifest dropped_extents = ExtentsFor(store, current);
   const ExtentManifest dropped_dependent_extents = ExtentManifest{};
-  GroupedHashObject::Handle grouped;
+  GroupedObject::Handle grouped;
   std::vector<RetiredRecord> grouped_retirements;
   if (dropped.grouped()) {
     auto view = partition.grouped_objects_[candidate.db_id_].Lookup(

@@ -796,7 +796,7 @@ Task<absl::StatusOr<SortedSetResult>>
 StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const SortedSetOperation& operation, GroupedHashObject::Handle object,
+    const SortedSetOperation& operation, GroupedObject::Handle object,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
     PreparedOrderedMutation* prepared) {
@@ -845,8 +845,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     if (!readable.ok()) return readable;
     const auto* entry = current->FindGroup({metadata[i].id_, 0});
     if (!entry) return absl::DataLossError("missing Sorted Set physical page");
-    return budget->AddGroup(entry->value_,
-                            current->ExtentsFor({metadata[i].id_, 0}));
+    return budget->AddGroup(*entry, current->ExtentsFor({metadata[i].id_, 0}));
   };
   // A scan retains one physical read lease and borrowed member views.
   // Keep scratch admitted until both disappear; replies own separate copies.
@@ -1100,7 +1099,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     // Prefix routing retains only per-group metadata. Exact members and
     // scores are decoded from the selected Hash leaves, never trusted from
     // a digest alone. Batch requests read each selected leaf just once.
-    std::set<HashGroupId> selected;
+    std::set<GroupedRecordId> selected;
     for (const auto& [member, state] : members) {
       const auto* route = object->directory().Find(member);
       if (!route) co_return absl::DataLossError("missing member prefix route");
@@ -1125,7 +1124,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (!physical)
         co_return absl::DataLossError("missing member prefix page");
       GroupedScratchBudget budget;
-      auto checked = budget.AddGroup(physical->value_, current->ExtentsFor(id));
+      auto checked = budget.AddGroup(*physical, current->ExtentsFor(id));
       if (!checked.ok()) co_return checked;
       auto admission = budget.Reserve(2);
       if (!admission.ok()) co_return admission.status();

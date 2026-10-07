@@ -86,7 +86,7 @@ struct StorageEngine::Impl::StreamPageAccess {
   std::uint8_t db_id_;
   std::string_view key_;
   const Digest& digest_;
-  GroupedHashObject::Handle object_;
+  GroupedObject::Handle object_;
   std::vector<MemoryReservation> reservations_{};
   std::map<std::size_t, LoadedOrderedGroup> pages_{};
   std::map<std::size_t, MemoryReservation> page_reservations_{};
@@ -94,11 +94,11 @@ struct StorageEngine::Impl::StreamPageAccess {
   Task<absl::Status> Load(std::size_t index) {
     if (pages_.contains(index)) co_return absl::OkStatus();
     const auto& groups = object_->ordered_directory().groups();
-    const HashGroupId id{groups[index].id_, 0};
+    const GroupedRecordId id{groups[index].id_, 0};
     const auto* physical = object_->FindGroup(id);
     if (!physical) co_return absl::DataLossError("missing Stream page");
     GroupedScratchBudget budget;
-    auto added = budget.AddGroup(physical->value_, object_->ExtentsFor(id));
+    auto added = budget.AddGroup(*physical, object_->ExtentsFor(id));
     if (!added.ok()) co_return added;
     auto admitted = budget.Reserve(6);
     if (!admitted.ok()) co_return admitted.status();
@@ -629,7 +629,7 @@ struct StorageEngine::Impl::StreamPageAccess {
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     std::uint32_t node_max_entries, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
@@ -757,7 +757,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
   StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
@@ -814,7 +814,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamInspectAccess& access) {
   using Kind = StreamInspectAccess::Kind;
   StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
@@ -999,7 +999,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamTrimLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
   StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
@@ -1041,7 +1041,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamTrimLocked(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamDeleteAccess& access, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
@@ -1161,7 +1161,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamAckAccess& access, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
@@ -1254,7 +1254,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamGroupAccess& access, bool read_only, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
@@ -1618,7 +1618,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle object, const CompactValueCallback& callback,
+    GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamRangeAccess& range) {
   if (!object->is_ordered() || object->ordered_directory().root().kind_ !=
                                    OrderedCollectionKind::kStream)
@@ -1637,11 +1637,11 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
   std::optional<MemoryReservation> probe_charge;
   auto load =
       [&](std::size_t index) -> Task<absl::StatusOr<LoadedOrderedGroup>> {
-    const HashGroupId id{groups[index].id_, 0};
+    const GroupedRecordId id{groups[index].id_, 0};
     const auto* physical = object->FindGroup(id);
     if (!physical) co_return absl::DataLossError("missing Stream probe page");
     GroupedScratchBudget budget;
-    auto added = budget.AddGroup(physical->value_, object->ExtentsFor(id));
+    auto added = budget.AddGroup(*physical, object->ExtentsFor(id));
     if (!added.ok()) co_return added;
     auto admitted = budget.Reserve(2);
     if (!admitted.ok()) co_return admitted.status();
@@ -1699,11 +1699,11 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
       if (shutdown_flush_requested_)
         co_return absl::CancelledError("Stream range interrupted by shutdown");
       co_await bycorf::Yield(*store.worker_);
-      const HashGroupId id{groups[index].id_, 0};
+      const GroupedRecordId id{groups[index].id_, 0};
       const auto* physical = object->FindGroup(id);
       if (!physical) co_return absl::DataLossError("missing Stream range page");
       GroupedScratchBudget budget;
-      auto added = budget.AddGroup(physical->value_, object->ExtentsFor(id));
+      auto added = budget.AddGroup(*physical, object->ExtentsFor(id));
       if (!added.ok()) co_return added;
       // Retained selected entries and the callback's decode/reply copies must
       // stay admitted after this page's temporary decoder has been destroyed.

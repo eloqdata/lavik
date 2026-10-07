@@ -25,8 +25,8 @@
 namespace lavik::storage {
 namespace {
 
-bool SameLogicalView(const GroupedHashObject::Handle& before,
-                     const GroupedHashObject::Handle& current) {
+bool SameLogicalView(const GroupedObject::Handle& before,
+                     const GroupedObject::Handle& current) {
   if (!before || !current) return before == current;
   const auto& a = before->version();
   const auto& b = current->version();
@@ -45,7 +45,7 @@ bool SameLogicalView(const GroupedHashObject::Handle& before,
 Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle previous, OrderedCollectionMutationPlan plan,
+    GroupedObject::Handle previous, OrderedCollectionMutationPlan plan,
     std::uint64_t expire_at_ms, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
@@ -280,12 +280,11 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
               plan.writes_.begin(), plan.writes_.end(),
               [&](const auto& page) { return page.id_ == metadata.id_; });
           if (replaced) continue;
-          const HashGroupId id{metadata.id_, 0};
+          const GroupedRecordId id{metadata.id_, 0};
           const auto* entry = previous->FindGroup(id);
           if (entry == nullptr)
             co_return absl::DataLossError("missing ordered page for demotion");
-          const auto added =
-              budget.AddGroup(entry->value_, previous->ExtentsFor(id));
+          const auto added = budget.AddGroup(*entry, previous->ExtentsFor(id));
           if (!added.ok()) co_return added;
         }
         auto added = budget.AddBytes(2 * kCollectionGroupTargetBytes +
@@ -375,7 +374,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   if (!reserved.ok()) co_return reserved.status();
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
-  std::vector<HashGroupLocation> written;
+  std::vector<GroupedRecordLocation> written;
   written.reserve(plan.writes_.size() + member_plan.writes_.size());
   // A failed batch in an outer transaction retains its staged bytes until the
   // outer commit retires them. Its existing fence must not point at a block we
@@ -420,7 +419,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
           co_return absl::ResourceExhaustedError(
               "OOM injected grouped auxiliary admission failure");
         });
-    absl::StatusOr<HashGroupLocation> group;
+    absl::StatusOr<GroupedRecordLocation> group;
     if (i < plan.writes_.size()) {
       group = co_await WriteOrderedGroupRecordLocked(
           store, partition, db_id, key, digest, plan.writes_[i],
@@ -440,8 +439,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     written.push_back(std::move(*group));
   }
   std::vector<RecoveredOrderedGroup> candidates;
-  std::vector<RecoveredHashGroup> member_candidates;
-  std::vector<HashGroupId> written_ids;
+  std::vector<RecoveredGroupedRecord> member_candidates;
+  std::vector<GroupedRecordId> written_ids;
   candidates.reserve(written.size());
   written_ids.reserve(written.size());
   for (std::size_t i = 0; i < written.size(); ++i) {
@@ -483,7 +482,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     }
     candidates.push_back(std::move(candidate));
   }
-  GroupedHashObject::PreparedHandle builder;
+  GroupedObject::PreparedHandle builder;
   GroupRecordWrite root_write{
       .prepared_root_ = &builder,
       .publication_ = &*publication,
@@ -532,9 +531,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
           }
         }
         auto prepared =
-            previous ? GroupedHashObject::PrepareUpdateOrdered(
+            previous ? GroupedObject::PrepareUpdateOrdered(
                            current, version, std::move(*directory), written)
-                     : GroupedHashObject::PrepareCreateOrdered(
+                     : GroupedObject::PrepareCreateOrdered(
                            version, std::move(*directory), written,
                            store.record_index_entry_arena_);
         if (!prepared.ok()) return prepared.status();

@@ -858,7 +858,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     const OrderedCollectionRoot& root, std::uint64_t revision,
     std::span<const RecoveredOrderedGroup> changed,
     std::uint64_t command_sequence,
-    std::span<const RecoveredHashGroup> member_changes) const {
+    std::span<const RecoveredGroupedRecord> member_changes) const {
   if (root.kind_ != root_.kind_ || root.incarnation_ != root_.incarnation_ ||
       revision <= sequence_ || command_sequence < command_sequence_ ||
       root.next_group_id_ < root_.next_group_id_) {

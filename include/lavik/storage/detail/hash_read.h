@@ -42,7 +42,7 @@ absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
 // sorted by group then field, while result_index preserves the command order.
 // field borrows the request; value borrows only the currently loaded page.
 struct HashFieldLookup {
-  HashGroupId group_;
+  GroupedRecordId group_;
   std::string_view field_;
   std::size_t result_index_ = 0;
   std::optional<std::string_view> value_;

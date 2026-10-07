@@ -20,8 +20,8 @@
 namespace lavik::storage {
 namespace {
 
-bool SameMetadataSource(const GroupedHashObject::Handle& expected,
-                        const GroupedHashObject::Handle& current) {
+bool SameMetadataSource(const GroupedObject::Handle& expected,
+                        const GroupedObject::Handle& current) {
   if (!expected || !current) return false;
   const auto& a = expected->version();
   const auto& b = current->version();
@@ -39,7 +39,7 @@ bool SameMetadataSource(const GroupedHashObject::Handle& expected,
 Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedHashObject::Handle previous, std::uint64_t expire_at_ms,
+    GroupedObject::Handle previous, std::uint64_t expire_at_ms,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
   auto& side = partition.grouped_objects_[db_id];
@@ -103,7 +103,7 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
   if (!reserved.ok()) co_return reserved.status();
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
-  GroupedHashObject::PreparedHandle builder;
+  GroupedObject::PreparedHandle builder;
   GroupRecordWrite root_write{
       .prepared_root_ = &builder,
       .publication_ = &*publication,
@@ -120,8 +120,7 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
         }
         auto version = physical;
         version.decision_ = *decision;
-        auto prepared =
-            GroupedHashObject::PrepareMetadataUpdate(current, version);
+        auto prepared = GroupedObject::PrepareMetadataUpdate(current, version);
         if (!prepared.ok()) return prepared.status();
         builder = std::move(*prepared);
         publication.reset();

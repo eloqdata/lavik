@@ -111,7 +111,7 @@ RecordLocation OrderedLocation(std::uint64_t block, std::uint64_t sequence,
 struct OrderedInput {
   GroupedObjectVersion version_;
   OrderedGroupDirectory directory_;
-  std::vector<HashGroupLocation> locations_;
+  std::vector<GroupedRecordLocation> locations_;
 };
 
 OrderedInput OrderedFixture(ValueType type = ValueType::kList) {
@@ -183,7 +183,7 @@ TEST(GroupedOrderedObjectTest,
                                .group_count_ = count,
                                .revision_ = 3};
     std::vector<RecoveredOrderedGroup> records;
-    std::vector<HashGroupLocation> locations;
+    std::vector<GroupedRecordLocation> locations;
     for (std::uint64_t i = 1; i <= count; ++i) {
       records.push_back({.incarnation_ = 17,
                          .id_ = base + i,
@@ -203,7 +203,7 @@ TEST(GroupedOrderedObjectTest,
         .db_epoch_ = 1,
         .replication_epoch_ = 2,
         .index_generation_ = 3};
-    auto old = GroupedHashObject::CreateOrdered(version, *directory, locations);
+    auto old = GroupedObject::CreateOrdered(version, *directory, locations);
     ASSERT_TRUE(old.ok()) << old.status();
     const std::uint64_t added_id = base == 0 ? 1ULL << 40 : 1;
     auto tail = records.back();
@@ -226,39 +226,39 @@ TEST(GroupedOrderedObjectTest,
     root.revision_ = 4;
     auto next_directory = directory->Apply(root, 4, changed, 8);
     ASSERT_TRUE(next_directory.ok()) << next_directory.status();
-    const std::array<HashGroupLocation, 2> replacements{
-        HashGroupLocation{.id_ = {base + count, 0},
-                          .location_ = OrderedLocation(200, 4, 1, type)},
-        HashGroupLocation{.id_ = {added_id, 0},
-                          .location_ = OrderedLocation(201, 4, 1, type)}};
+    const std::array<GroupedRecordLocation, 2> replacements{
+        GroupedRecordLocation{.id_ = {base + count, 0},
+                              .location_ = OrderedLocation(200, 4, 1, type)},
+        GroupedRecordLocation{.id_ = {added_id, 0},
+                              .location_ = OrderedLocation(201, 4, 1, type)}};
     version.root_ = OrderedLocation(1000, 8, count + 1, type, true);
-    auto next = GroupedHashObject::PrepareUpdateOrdered(
+    auto next = GroupedObject::PrepareUpdateOrdered(
         *old, version, *next_directory, replacements);
     ASSERT_TRUE(next.ok()) << next.status();
     for (std::uint64_t i = 1; i <= count; ++i) {
       SCOPED_TRACE(i);
       ASSERT_NE((*old)->FindRecord({base + i, 0}), nullptr);
-      EXPECT_EQ((*old)->FindRecord({base + i, 0})->value_.block_id(), i);
+      EXPECT_EQ((*old)->FindRecord({base + i, 0})->block_id(), i);
       ASSERT_NE((*next)->FindRecord({base + i, 0}), nullptr);
-      EXPECT_EQ((*next)->FindRecord({base + i, 0})->value_.block_id(),
+      EXPECT_EQ((*next)->FindRecord({base + i, 0})->block_id(),
                 i == count ? 200 : i);
     }
     EXPECT_EQ((*old)->FindRecord({added_id, 0}), nullptr);
     ASSERT_NE((*next)->FindRecord({added_id, 0}), nullptr);
-    EXPECT_EQ((*next)->FindRecord({added_id, 0})->value_.block_id(), 201);
+    EXPECT_EQ((*next)->FindRecord({added_id, 0})->block_id(), 201);
     EXPECT_EQ((*next)->FindRecord({added_id, 1}), nullptr);
     EXPECT_EQ((*next)->FindRecord({base + count + 1000, 0}), nullptr);
     // Relocation after prefix expansion must update only the new view, and
     // traversal must still visit each old and newly inserted identity once.
-    auto moved = GroupedHashObject::RelocateGroup(
-        *next, {base + 65, 0}, locations[64].location_,
-        OrderedLocation(300, 3, 1, type));
+    auto moved = GroupedObject::RelocateGroup(*next, {base + 65, 0},
+                                              locations[64].location_,
+                                              OrderedLocation(300, 3, 1, type));
     ASSERT_TRUE(moved.ok()) << moved.status();
-    EXPECT_EQ((*moved)->FindRecord({base + 65, 0})->value_.block_id(), 300);
-    EXPECT_EQ((*next)->FindRecord({base + 65, 0})->value_.block_id(), 65);
-    std::set<HashGroupId> visited;
+    EXPECT_EQ((*moved)->FindRecord({base + 65, 0})->block_id(), 300);
+    EXPECT_EQ((*next)->FindRecord({base + 65, 0})->block_id(), 65);
+    std::set<GroupedRecordId> visited;
     (*moved)->ForEachRecord(
-        [&](HashGroupId id, const auto&, const auto&, bool retired) {
+        [&](GroupedRecordId id, const auto&, const auto&, bool retired) {
           EXPECT_FALSE(retired);
           EXPECT_TRUE(visited.insert(id).second);
         });
@@ -278,7 +278,7 @@ TEST(GroupedOrderedObjectTest, StringVectorSharesUntouchedPagesAndOldViews) {
                              .group_count_ = count,
                              .revision_ = 3};
   std::vector<RecoveredOrderedGroup> candidates;
-  std::vector<HashGroupLocation> locations;
+  std::vector<GroupedRecordLocation> locations;
   for (std::uint64_t id = 1; id <= count; ++id) {
     candidates.push_back({.incarnation_ = 17,
                           .id_ = id,
@@ -300,7 +300,7 @@ TEST(GroupedOrderedObjectTest, StringVectorSharesUntouchedPagesAndOldViews) {
       .db_epoch_ = 1,
       .replication_epoch_ = 2,
       .index_generation_ = 3};
-  auto old = GroupedHashObject::CreateOrdered(version, *directory, locations);
+  auto old = GroupedObject::CreateOrdered(version, *directory, locations);
   ASSERT_TRUE(old.ok()) << old.status();
   root.revision_ = 4;
   auto changed = candidates[64];
@@ -308,30 +308,30 @@ TEST(GroupedOrderedObjectTest, StringVectorSharesUntouchedPagesAndOldViews) {
   auto next_directory = directory->Apply(root, 4, std::span(&changed, 1), 8);
   ASSERT_TRUE(next_directory.ok()) << next_directory.status();
   version.root_ = OrderedLocation(1000, 8, root.item_count_, type, true);
-  HashGroupLocation replacement{
+  GroupedRecordLocation replacement{
       .id_ = {65, 0},
       .location_ = OrderedLocation(1001, 4, kStringGroupBytes, type),
       .extents_ = nullptr};
-  auto next = GroupedHashObject::PrepareUpdateOrdered(
+  auto next = GroupedObject::PrepareUpdateOrdered(
       *old, version, *next_directory, std::span(&replacement, 1));
   ASSERT_TRUE(next.ok()) << next.status();
-  EXPECT_EQ((*old)->FindRecord({65, 0})->value_.block_id(), 65);
-  EXPECT_EQ((*next)->FindRecord({65, 0})->value_.block_id(), 1001);
+  EXPECT_EQ((*old)->FindRecord({65, 0})->block_id(), 65);
+  EXPECT_EQ((*next)->FindRecord({65, 0})->block_id(), 1001);
   for (const auto id : {1, 64, 129, 130})
     EXPECT_EQ((*old)->FindRecord({static_cast<std::uint64_t>(id), 0}),
               (*next)->FindRecord({static_cast<std::uint64_t>(id), 0}));
   EXPECT_EQ((*next)->FindRecord({0, 0}), nullptr);
   EXPECT_EQ((*next)->FindRecord({131, 0}), nullptr);
   EXPECT_EQ((*next)->FindRecord({65, 1}), nullptr);
-  auto relocated = GroupedHashObject::RelocateGroup(
+  auto relocated = GroupedObject::RelocateGroup(
       *next, {65, 0}, replacement.location_,
       OrderedLocation(1002, 4, kStringGroupBytes, type));
   ASSERT_TRUE(relocated.ok()) << relocated.status();
-  EXPECT_EQ((*next)->FindRecord({65, 0})->value_.block_id(), 1001);
-  EXPECT_EQ((*relocated)->FindRecord({65, 0})->value_.block_id(), 1002);
+  EXPECT_EQ((*next)->FindRecord({65, 0})->block_id(), 1001);
+  EXPECT_EQ((*relocated)->FindRecord({65, 0})->block_id(), 1002);
   std::size_t visited = 0;
   (*relocated)
-      ->ForEachRecord([&](HashGroupId id, const GroupedRecordIndexEntry& entry,
+      ->ForEachRecord([&](GroupedRecordId id, const RecordIndexValue& entry,
                           const auto& extents, bool retired) {
         EXPECT_EQ(&entry, (*relocated)->FindRecord(id));
         EXPECT_FALSE(extents);
@@ -344,8 +344,8 @@ TEST(GroupedOrderedObjectTest, StringVectorSharesUntouchedPagesAndOldViews) {
 TEST(GroupedOrderedObjectTest, BothKindsRetainRetiredPhysicalRecordsAndRanks) {
   for (const auto type : {ValueType::kList, ValueType::kSortedSet}) {
     auto input = OrderedFixture(type);
-    auto object = GroupedHashObject::CreateOrdered(
-        input.version_, input.directory_, input.locations_);
+    auto object = GroupedObject::CreateOrdered(input.version_, input.directory_,
+                                               input.locations_);
     ASSERT_TRUE(object.ok()) << object.status();
     EXPECT_TRUE((*object)->is_ordered());
     EXPECT_EQ((*object)->incarnation(), 17);
@@ -353,8 +353,8 @@ TEST(GroupedOrderedObjectTest, BothKindsRetainRetiredPhysicalRecordsAndRanks) {
     EXPECT_EQ((*object)->command_sequence(), 7);
     EXPECT_EQ((*object)->group_count(), 2);
     EXPECT_EQ((*object)->record_count(), 3);
-    EXPECT_NE((*object)->FindGroup(HashGroupId{1, 0}), nullptr);
-    EXPECT_EQ((*object)->FindGroup(HashGroupId{2, 0}), nullptr);
+    EXPECT_NE((*object)->FindGroup(GroupedRecordId{1, 0}), nullptr);
+    EXPECT_EQ((*object)->FindGroup(GroupedRecordId{2, 0}), nullptr);
     EXPECT_NE((*object)->FindRecord({2, 0}), nullptr);
     EXPECT_EQ((*object)->FindRecord({1, 1}), nullptr);
     EXPECT_EQ((*object)->FindGroup("member"), nullptr);
@@ -363,10 +363,9 @@ TEST(GroupedOrderedObjectTest, BothKindsRetainRetiredPhysicalRecordsAndRanks) {
     EXPECT_EQ(position->group_index_, 1);
     EXPECT_EQ(position->offset_, 0);
     std::size_t active = 0, retired = 0;
-    (*object)->ForEachRecord([&](HashGroupId,
-                                 const GroupedRecordIndexEntry& entry,
+    (*object)->ForEachRecord([&](GroupedRecordId, const RecordIndexValue& entry,
                                  const auto&, bool marker) {
-      EXPECT_EQ(entry.value_.value_type(), type);
+      EXPECT_EQ(entry.value_type(), type);
       marker ? ++retired : ++active;
     });
     EXPECT_EQ(active, 2);
@@ -379,11 +378,11 @@ TEST(GroupedOrderedObjectTest, MemberIndexSharesPhysicalLifecycleAndOldViews) {
   auto root = input.directory_.root();
   root.member_index_ = GroupedHashRoot{
       .incarnation_ = 17, .field_count_ = 4, .group_count_ = 1, .revision_ = 3};
-  RecoveredHashGroup member{.incarnation_ = 17,
-                            .id_ = {0, 0},
-                            .sequence_ = 3,
-                            .lsn_ = 3,
-                            .field_count_ = 4};
+  RecoveredGroupedRecord member{.incarnation_ = 17,
+                                .id_ = {0, 0},
+                                .sequence_ = 3,
+                                .lsn_ = 3,
+                                .field_count_ = 4};
   auto members = HashGroupDirectory::Recover(*root.member_index_, 7,
                                              std::span(&member, 1), {});
   ASSERT_TRUE(members.ok()) << members.status();
@@ -395,29 +394,29 @@ TEST(GroupedOrderedObjectTest, MemberIndexSharesPhysicalLifecycleAndOldViews) {
   auto directory =
       OrderedGroupDirectory::Recover(root, 3, pages, {}, 7, *members);
   ASSERT_TRUE(directory.ok()) << directory.status();
-  EXPECT_FALSE(GroupedHashObject::CreateOrdered(input.version_, *directory,
-                                                input.locations_)
-                   .ok());
+  EXPECT_FALSE(
+      GroupedObject::CreateOrdered(input.version_, *directory, input.locations_)
+          .ok());
   input.locations_.push_back(
       {.id_ = {0, 0},
        .location_ = OrderedLocation(100, 3, 4, ValueType::kSortedSet),
        .extents_ = nullptr});
-  auto object = GroupedHashObject::CreateOrdered(input.version_, *directory,
-                                                 input.locations_);
+  auto object = GroupedObject::CreateOrdered(input.version_, *directory,
+                                             input.locations_);
   ASSERT_TRUE(object.ok()) << object.status();
   EXPECT_TRUE((*object)->has_member_index());
   EXPECT_EQ((*object)->group_count(), 2);
   EXPECT_EQ((*object)->record_count(), 4);
   EXPECT_NE((*object)->FindGroup("arbitrary member"), nullptr);
-  EXPECT_NE((*object)->FindGroup(HashGroupId{0, 0}), nullptr);
-  EXPECT_NE((*object)->FindGroup(HashGroupId{1, 0}), nullptr);
+  EXPECT_NE((*object)->FindGroup(GroupedRecordId{0, 0}), nullptr);
+  EXPECT_NE((*object)->FindGroup(GroupedRecordId{1, 0}), nullptr);
 
-  auto relocated = GroupedHashObject::RelocateGroup(
+  auto relocated = GroupedObject::RelocateGroup(
       *object, {0, 0}, input.locations_.back().location_,
       OrderedLocation(101, 3, 4, ValueType::kSortedSet));
   ASSERT_TRUE(relocated.ok()) << relocated.status();
-  EXPECT_EQ((*object)->FindGroup(HashGroupId{0, 0})->value_.block_id(), 100);
-  EXPECT_EQ((*relocated)->FindGroup(HashGroupId{0, 0})->value_.block_id(), 101);
+  EXPECT_EQ((*object)->FindGroup(GroupedRecordId{0, 0})->block_id(), 100);
+  EXPECT_EQ((*relocated)->FindGroup(GroupedRecordId{0, 0})->block_id(), 101);
   EXPECT_TRUE((*relocated)->SameLogicalRoot(**object));
 
   root.revision_ = 4;
@@ -428,26 +427,26 @@ TEST(GroupedOrderedObjectTest, MemberIndexSharesPhysicalLifecycleAndOldViews) {
   ASSERT_TRUE(updated_directory.ok()) << updated_directory.status();
   auto version = input.version_;
   version.root_ = OrderedLocation(1000, 8, 4, ValueType::kSortedSet, true);
-  HashGroupLocation replacement{
+  GroupedRecordLocation replacement{
       .id_ = {0, 0},
       .location_ = OrderedLocation(102, 4, 4, ValueType::kSortedSet),
       .extents_ = nullptr};
-  auto updated = GroupedHashObject::PrepareUpdateOrdered(
+  auto updated = GroupedObject::PrepareUpdateOrdered(
       *relocated, version, *updated_directory, std::span(&replacement, 1));
   ASSERT_TRUE(updated.ok()) << updated.status();
-  EXPECT_EQ((*updated)->FindGroup(HashGroupId{0, 0})->value_.block_id(), 102);
-  EXPECT_EQ((*updated)->FindGroup(HashGroupId{1, 0})->value_.block_id(), 1);
+  EXPECT_EQ((*updated)->FindGroup(GroupedRecordId{0, 0})->block_id(), 102);
+  EXPECT_EQ((*updated)->FindGroup(GroupedRecordId{1, 0})->block_id(), 1);
   EXPECT_EQ((*relocated)->directory().root().revision_, 3);
   EXPECT_EQ((*updated)->directory().root().revision_, 4);
-  EXPECT_FALSE(GroupedHashObject::PrepareUpdateOrdered(*relocated, version,
-                                                       *updated_directory, {})
+  EXPECT_FALSE(GroupedObject::PrepareUpdateOrdered(*relocated, version,
+                                                   *updated_directory, {})
                    .ok());
 }
 
 TEST(GroupedOrderedObjectTest, UpdatesSameCommandRevisionAndPreservesOldView) {
   auto input = OrderedFixture();
-  auto old = GroupedHashObject::CreateOrdered(input.version_, input.directory_,
-                                              input.locations_);
+  auto old = GroupedObject::CreateOrdered(input.version_, input.directory_,
+                                          input.locations_);
   ASSERT_TRUE(old.ok()) << old.status();
   auto root = input.directory_.root();
   root.revision_ = 4;
@@ -461,45 +460,45 @@ TEST(GroupedOrderedObjectTest, UpdatesSameCommandRevisionAndPreservesOldView) {
   EXPECT_EQ(directory->retired_groups().size(), 1);
   auto version = input.version_;
   version.root_ = OrderedLocation(999, 7, 5, ValueType::kList, true);
-  HashGroupLocation physical{
+  GroupedRecordLocation physical{
       .id_ = {3, 0},
       .location_ = OrderedLocation(30, 4, 3, ValueType::kList),
       .extents_ = nullptr};
-  auto next = GroupedHashObject::PrepareUpdateOrdered(*old, version, *directory,
-                                                      std::span(&physical, 1));
+  auto next = GroupedObject::PrepareUpdateOrdered(*old, version, *directory,
+                                                  std::span(&physical, 1));
   ASSERT_TRUE(next.ok()) << next.status();
   version.root_ = OrderedLocation(1000, 7, 5, ValueType::kList, true);
-  EXPECT_TRUE(GroupedHashObject::FinalizeRoot(*next, version).ok());
-  EXPECT_EQ((*old)->FindRecord({3, 0})->value_.block_id(), 3);
-  EXPECT_EQ((*next)->FindRecord({3, 0})->value_.block_id(), 30);
-  EXPECT_EQ((*next)->FindRecord({1, 0})->value_.block_id(), 1);
+  EXPECT_TRUE(GroupedObject::FinalizeRoot(*next, version).ok());
+  EXPECT_EQ((*old)->FindRecord({3, 0})->block_id(), 3);
+  EXPECT_EQ((*next)->FindRecord({3, 0})->block_id(), 30);
+  EXPECT_EQ((*next)->FindRecord({1, 0})->block_id(), 1);
   EXPECT_FALSE((*old)->SameLogicalRoot(**next));
 
   auto moved_version = version;
   moved_version.root_ = OrderedLocation(1001, 7, 5, ValueType::kList, true);
-  auto moved = GroupedHashObject::RelocateRoot(*next, moved_version);
+  auto moved = GroupedObject::RelocateRoot(*next, moved_version);
   ASSERT_TRUE(moved.ok()) << moved.status();
   EXPECT_TRUE((*moved)->SameLogicalRoot(**next));
   const auto marker = input.locations_[1].location_;
-  auto relocated = GroupedHashObject::RelocateGroup(
+  auto relocated = GroupedObject::RelocateGroup(
       *moved, {2, 0}, marker, OrderedLocation(200, 3, 0, ValueType::kList));
   ASSERT_TRUE(relocated.ok()) << relocated.status();
-  EXPECT_EQ((*relocated)->FindRecord({2, 0})->value_.block_id(), 200);
-  EXPECT_EQ((*relocated)->FindGroup(HashGroupId{2, 0}), nullptr);
+  EXPECT_EQ((*relocated)->FindRecord({2, 0})->block_id(), 200);
+  EXPECT_EQ((*relocated)->FindGroup(GroupedRecordId{2, 0}), nullptr);
 }
 
 TEST(GroupedOrderedObjectTest,
      MetadataOnlyUpdateSharesRoutingNodesAndPhysicalPages) {
   for (const auto type : {ValueType::kList, ValueType::kSortedSet}) {
     auto input = OrderedFixture(type);
-    auto old = GroupedHashObject::CreateOrdered(
-        input.version_, input.directory_, input.locations_);
+    auto old = GroupedObject::CreateOrdered(input.version_, input.directory_,
+                                            input.locations_);
     ASSERT_TRUE(old.ok()) << old.status();
     auto version = input.version_;
     version.root_ = OrderedLocation(1000, 8, 4, type, true, 123456);
-    auto updated = GroupedHashObject::PrepareMetadataUpdate(*old, version);
+    auto updated = GroupedObject::PrepareMetadataUpdate(*old, version);
     ASSERT_TRUE(updated.ok()) << updated.status();
-    EXPECT_TRUE(GroupedHashObject::FinalizeRoot(*updated, version).ok());
+    EXPECT_TRUE(GroupedObject::FinalizeRoot(*updated, version).ok());
     EXPECT_NE(&(*old)->ordered_directory(), &(*updated)->ordered_directory());
     for (const auto& location : input.locations_)
       EXPECT_EQ(
@@ -515,11 +514,10 @@ TEST(GroupedOrderedObjectTest,
     EXPECT_TRUE((*old)->SameLogicalRoot(**updated));
     auto moved = version;
     moved.root_ = OrderedLocation(1001, 8, 4, type, true, 123456);
-    EXPECT_TRUE(GroupedHashObject::RelocateRoot(*updated, moved).ok());
+    EXPECT_TRUE(GroupedObject::RelocateRoot(*updated, moved).ok());
     auto stale = version;
     stale.root_ = OrderedLocation(1002, 7, 4, type, true);
-    EXPECT_FALSE(
-        GroupedHashObject::PrepareMetadataUpdate(*updated, stale).ok());
+    EXPECT_FALSE(GroupedObject::PrepareMetadataUpdate(*updated, stale).ok());
   }
 }
 
@@ -527,25 +525,25 @@ TEST(GroupedOrderedObjectTest, InvalidTypeMissingMarkerAndOomCannotPublish) {
   auto input = OrderedFixture();
   auto incomplete = input.locations_;
   incomplete.erase(incomplete.begin() + 1);
-  EXPECT_FALSE(GroupedHashObject::CreateOrdered(input.version_,
-                                                input.directory_, incomplete)
-                   .ok());
+  EXPECT_FALSE(
+      GroupedObject::CreateOrdered(input.version_, input.directory_, incomplete)
+          .ok());
   auto wrong = input.version_;
   wrong.root_ = OrderedLocation(999, 7, 4, ValueType::kHash, true);
-  EXPECT_FALSE(GroupedHashObject::CreateOrdered(wrong, input.directory_,
-                                                input.locations_)
-                   .ok());
-  auto old = GroupedHashObject::CreateOrdered(input.version_, input.directory_,
-                                              input.locations_);
+  EXPECT_FALSE(
+      GroupedObject::CreateOrdered(wrong, input.directory_, input.locations_)
+          .ok());
+  auto old = GroupedObject::CreateOrdered(input.version_, input.directory_,
+                                          input.locations_);
   ASSERT_TRUE(old.ok()) << old.status();
   struct ResetMemory {
     ~ResetMemory() { (void)InitMemoryLimit(1024ULL * 1024 * 1024, 1); }
   } reset;
   ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
-  auto oom = GroupedHashObject::PrepareRootRelocation(*old);
+  auto oom = GroupedObject::PrepareRootRelocation(*old);
   EXPECT_EQ(oom.status().code(), absl::StatusCode::kResourceExhausted);
   EXPECT_EQ((*old)->record_count(), 3);
-  EXPECT_EQ((*old)->FindRecord({3, 0})->value_.block_id(), 3);
+  EXPECT_EQ((*old)->FindRecord({3, 0})->block_id(), 3);
 }
 
 }  // namespace

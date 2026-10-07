@@ -749,7 +749,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                              record.value_type_ == ValueType::kStream;
         const auto ordered_kind = OrderedKind(record.value_type_);
         std::optional<RecoveredGroupedRoot> grouped_root;
-        std::optional<RecoveredHashGroup> auxiliary_group;
+        std::optional<RecoveredGroupedRecord> auxiliary_group;
         std::optional<RecoveredOrderedGroup> ordered_group;
         if (record.auxiliary_group_) {
           std::uint64_t group_bytes =
@@ -767,7 +767,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           // reclaimed while other live records retain this source block.
           // Its checked header contains all winner-selection metadata; touch
           // external values only after the complete root graph is selected.
-          auxiliary_group = RecoveredHashGroup{
+          auxiliary_group = RecoveredGroupedRecord{
               .incarnation_ = record.group_incarnation_,
               .id_ = {.prefix_ = record.group_prefix_,
                       .bits_ = record.group_prefix_bits_},
@@ -1430,7 +1430,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       retain_selected();
       continue;
     }
-    std::vector<RecoveredHashGroup> candidates;
+    std::vector<RecoveredGroupedRecord> candidates;
     for (auto it = lower; it != end; ++it) {
       auto candidate = it->auxiliary_group_;
       candidate.record_token_ =
@@ -1446,13 +1446,13 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       retain_selected();
       continue;
     }
-    std::vector<HashGroupLocation> locations;
+    std::vector<GroupedRecordLocation> locations;
     locations.reserve(directory->groups().size() +
                       directory->retired_groups().size());
-    auto append_location = [&](const RecoveredHashGroup& selected) {
+    auto append_location = [&](const RecoveredGroupedRecord& selected) {
       RecoveryAuxiliaryRecord& physical = records.at(selected.record_token_);
       physical.grouped_reachable_ = true;
-      locations.push_back(HashGroupLocation{
+      locations.push_back(GroupedRecordLocation{
           .id_ = selected.id_,
           .location_ = physical.location_,
           .extents_ = store.AuxiliaryExtents(physical),
@@ -1475,8 +1475,8 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       continue;
     }
     auto object =
-        GroupedHashObject::Create(version, std::move(*directory), locations,
-                                  store.record_index_entry_arena_);
+        GroupedObject::Create(version, std::move(*directory), locations,
+                              store.record_index_entry_arena_);
     if (!object.ok()) co_return object.status();
     auto published = partition.grouped_objects_[root_db].Publish(
         key, nullptr, std::move(*object));
@@ -1494,7 +1494,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
   co_return absl::OkStatus();
 }
 
-Task<absl::StatusOr<GroupedHashObject::Handle>>
+Task<absl::StatusOr<GroupedObject::Handle>>
 StorageEngine::Impl::RecoverOrderedObject(
     WorkerStore& store, const OrderedCollectionRoot& root,
     GroupedObjectVersion version, RecoveryAuxiliaryRecords::iterator first,
@@ -1502,7 +1502,7 @@ StorageEngine::Impl::RecoverOrderedObject(
   const auto revision =
       root.revision_ == 0 ? version.root_.mutation_sequence_ : root.revision_;
   std::map<std::uint64_t, std::size_t> winners;
-  std::vector<RecoveredHashGroup> member_candidates;
+  std::vector<RecoveredGroupedRecord> member_candidates;
   for (std::size_t i = 0; i < static_cast<std::size_t>(last - first); ++i) {
     const auto& candidate = first[i].auxiliary_group_;
     if (candidate.incarnation_ != root.incarnation_ ||
@@ -1516,7 +1516,7 @@ StorageEngine::Impl::RecoverOrderedObject(
       co_return absl::DataLossError("ordered candidate has a different type");
     }
     if (!IsOrderedPageId(candidate.id_)) {
-      if (!candidate.id_.valid())
+      if (!candidate.id_.IsHashPrefix())
         co_return absl::DataLossError("invalid member group identity");
       auto member = candidate;
       member.record_token_ = i;
@@ -1613,12 +1613,12 @@ StorageEngine::Impl::RecoverOrderedObject(
       root, revision, candidates, recovery_committed_txids_,
       version.root_.mutation_sequence_, std::move(members));
   if (!directory.ok()) co_return directory.status();
-  std::vector<HashGroupLocation> locations;
+  std::vector<GroupedRecordLocation> locations;
   locations.reserve(candidates.size());
   const auto append = [&](const RecoveredOrderedGroup& candidate) {
     auto& physical = first[candidate.record_token_ - 1];
     physical.grouped_reachable_ = true;
-    locations.push_back(HashGroupLocation{
+    locations.push_back(GroupedRecordLocation{
         .id_ = {.prefix_ = candidate.id_, .bits_ = 0},
         .location_ = physical.location_,
         .extents_ = store.AuxiliaryExtents(physical),
@@ -1628,7 +1628,7 @@ StorageEngine::Impl::RecoverOrderedObject(
   for (const auto& candidate : directory->groups()) append(candidate);
   for (const auto& candidate : directory->retired_groups()) append(candidate);
   if (const auto* member_directory = directory->member_directory()) {
-    auto append_member = [&](const RecoveredHashGroup& candidate) {
+    auto append_member = [&](const RecoveredGroupedRecord& candidate) {
       auto& physical = first[candidate.record_token_];
       physical.grouped_reachable_ = true;
       locations.push_back({.id_ = candidate.id_,
@@ -1641,9 +1641,9 @@ StorageEngine::Impl::RecoverOrderedObject(
     for (const auto& [id, member] : member_directory->retired_groups())
       append_member(member);
   }
-  co_return GroupedHashObject::CreateOrdered(version, std::move(*directory),
-                                             locations,
-                                             store.record_index_entry_arena_);
+  co_return GroupedObject::CreateOrdered(version, std::move(*directory),
+                                         locations,
+                                         store.record_index_entry_arena_);
 }
 
 Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroup(
@@ -1678,7 +1678,7 @@ Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroup(
   if (!prefix.ok()) co_return prefix.status();
   auto decoded = DecodeHashGroupMetadata(*prefix, encoded_bytes);
   if (!decoded.ok()) co_return decoded.status();
-  const RecoveredHashGroup& expected = record.auxiliary_group_;
+  const RecoveredGroupedRecord& expected = record.auxiliary_group_;
   if (decoded->incarnation_ != expected.incarnation_ ||
       decoded->id_ != expected.id_ ||
       decoded->field_count_ != expected.field_count_ ||

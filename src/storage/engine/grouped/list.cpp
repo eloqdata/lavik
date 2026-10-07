@@ -129,7 +129,7 @@ absl::Status AppendPosition(std::uint64_t position, ListResult* result) {
 Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const ListOperation& operation, GroupedHashObject::Handle object,
+    const ListOperation& operation, GroupedObject::Handle object,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
     PreparedOrderedMutation* prepared) {
@@ -176,12 +176,12 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
         if (step != 0) co_await bycorf::Yield(*store.worker_);
         const auto index =
             reverse ? directory.groups().size() - 1 - step : step;
-        const HashGroupId id{directory.groups()[index].id_, 0};
+        const GroupedRecordId id{directory.groups()[index].id_, 0};
         const auto* physical = object->FindGroup(id);
         if (physical == nullptr)
           co_return absl::DataLossError("missing List search page");
         GroupedScratchBudget budget;
-        auto added = budget.AddGroup(physical->value_, object->ExtentsFor(id));
+        auto added = budget.AddGroup(*physical, object->ExtentsFor(id));
         if (!added.ok()) co_return added;
         auto scratch = budget.Reserve(1);
         if (!scratch.ok()) co_return scratch.status();
@@ -316,12 +316,11 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
   }
   GroupedScratchBudget page_budget;
   for (std::size_t i = begin_page; i < end_page; ++i) {
-    const HashGroupId id{directory.groups()[i].id_, 0};
+    const GroupedRecordId id{directory.groups()[i].id_, 0};
     const auto* entry = object->FindGroup(id);
     if (entry == nullptr)
       co_return absl::DataLossError("missing List scratch page");
-    const auto added =
-        page_budget.AddGroup(entry->value_, object->ExtentsFor(id));
+    const auto added = page_budget.AddGroup(*entry, object->ExtentsFor(id));
     if (!added.ok()) co_return added;
   }
   const auto read_width =

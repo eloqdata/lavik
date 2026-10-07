@@ -45,8 +45,9 @@ struct GroupedObjectVersion {
   bool Matches(const GroupedObjectVersion& other) const noexcept;
 };
 
-struct HashGroupLocation {
-  HashGroupId id_;
+// Complete physical coordinates for either a prefix group or an ordered page.
+struct GroupedRecordLocation {
+  GroupedRecordId id_;
   RecordLocation location_;
   std::shared_ptr<const std::vector<ExtentRef>> extents_;
   // Split markers remain live until the incarnation is removed. Dropping a
@@ -54,27 +55,20 @@ struct HashGroupLocation {
   bool retired_ = false;
 };
 
-struct GroupedHashPhysicalState;
+struct GroupedPhysicalState;
 
-// An auxiliary has no independent key or expiry. Keep only its compact
-// physical coordinates; the owning page supplies the sorted group identity.
-// This is deliberately distinct from a ScanHashMap entry with a variable key
-// tail. Returned pointers borrow the immutable object view.
-struct GroupedRecordIndexEntry {
-  RecordIndexValue value_;
-  const std::uint64_t* optional_extra() const noexcept { return nullptr; }
-};
-
-// Resident metadata only: field names and values are never retained here.
-// There is one compact physical index entry per group, not per field. The
-// prefix directory selects that entry; the physical owner supplies the
+// Shared object view for grouped String, Hash, Set, List, Sorted Set and Stream
+// values. Retains routing and physical metadata; payloads are loaded on demand.
+// Each auxiliary retains one RecordIndexValue without an independent key or
+// expiry; its owning page supplies the group identity. The
+// routing directory selects that entry; the physical owner supplies the
 // allocation epoch when materializing its compact location, as for top-level
 // RecordIndex entries. The adapter must validate payload identity/checksums
 // before creating this view and hold the necessary physical pins during IO.
-class GroupedHashObject {
+class GroupedObject {
  public:
-  using Handle = std::shared_ptr<const GroupedHashObject>;
-  using PreparedHandle = std::shared_ptr<GroupedHashObject>;
+  using Handle = std::shared_ptr<const GroupedObject>;
+  using PreparedHandle = std::shared_ptr<GroupedObject>;
 
   // Builds an immutable, unpublished view. This is a recovery/construction
   // operation, not the per-HSET update path: rebuilding every group entry on
@@ -84,11 +78,11 @@ class GroupedHashObject {
   // accounting, matching the worker's ordinary RecordIndex arena.
   static absl::StatusOr<Handle> Create(
       GroupedObjectVersion version, HashGroupDirectory directory,
-      std::span<const HashGroupLocation> locations,
+      std::span<const GroupedRecordLocation> locations,
       std::shared_ptr<ScanHashMapEntryArena> arena = nullptr);
   static absl::StatusOr<PreparedHandle> PrepareCreate(
       GroupedObjectVersion provisional_version, HashGroupDirectory directory,
-      std::span<const HashGroupLocation> locations,
+      std::span<const GroupedRecordLocation> locations,
       std::shared_ptr<ScanHashMapEntryArena> arena = nullptr);
 
   // Constructs an unpublished update with bounded coordinate overrides for
@@ -103,23 +97,23 @@ class GroupedHashObject {
   static absl::StatusOr<PreparedHandle> PrepareUpdate(
       const Handle& expected, GroupedObjectVersion provisional_version,
       HashGroupDirectory directory,
-      std::span<const HashGroupLocation> changed_locations);
+      std::span<const GroupedRecordLocation> changed_locations);
 
   // Ordered collections share the same bounded physical index pages.
   // For indexed Sorted Sets, locations include BOTH the ordered graph and
   // member-prefix graph; either incomplete graph rejects publication.
   static absl::StatusOr<Handle> CreateOrdered(
       GroupedObjectVersion version, OrderedGroupDirectory directory,
-      std::span<const HashGroupLocation> locations,
+      std::span<const GroupedRecordLocation> locations,
       std::shared_ptr<ScanHashMapEntryArena> arena = nullptr);
   static absl::StatusOr<PreparedHandle> PrepareCreateOrdered(
       GroupedObjectVersion version, OrderedGroupDirectory directory,
-      std::span<const HashGroupLocation> locations,
+      std::span<const GroupedRecordLocation> locations,
       std::shared_ptr<ScanHashMapEntryArena> arena = nullptr);
   static absl::StatusOr<PreparedHandle> PrepareUpdateOrdered(
       const Handle& expected, GroupedObjectVersion version,
       OrderedGroupDirectory directory,
-      std::span<const HashGroupLocation> changed_locations);
+      std::span<const GroupedRecordLocation> changed_locations);
 
   // TTL-only publication retains the exact value revision, routing directory
   // and physical pages. Only the wrapper/root command sequence, expiration
@@ -142,7 +136,7 @@ class GroupedHashObject {
       PreparedHandle& prepared, const Handle& current,
       GroupedObjectVersion exact_version);
   static absl::StatusOr<Handle> RelocateGroup(
-      const Handle& expected, HashGroupId id,
+      const Handle& expected, GroupedRecordId id,
       const RecordLocation& expected_location,
       const RecordLocation& replacement,
       std::shared_ptr<const std::vector<ExtentRef>> extents = nullptr);
@@ -179,14 +173,15 @@ class GroupedHashObject {
   std::uint64_t command_sequence() const noexcept {
     return version_.root_.mutation_sequence_;
   }
-  bool SameLogicalRoot(const GroupedHashObject& other) const noexcept;
-  const GroupedRecordIndexEntry* FindGroup(std::string_view field) const;
-  const GroupedRecordIndexEntry* FindGroup(HashGroupId id) const;
-  const GroupedRecordIndexEntry* FindRecord(HashGroupId id) const;
+  bool SameLogicalRoot(const GroupedObject& other) const noexcept;
+  // Returned coordinates borrow this immutable view; they carry no expiry.
+  const RecordIndexValue* FindGroup(std::string_view field) const;
+  const RecordIndexValue* FindGroup(GroupedRecordId id) const;
+  const RecordIndexValue* FindRecord(GroupedRecordId id) const;
   // The manifest's retained charge follows this handle even after the object
   // and its side-index entry have been reclaimed.
   std::shared_ptr<const std::vector<ExtentRef>> ExtentsFor(
-      HashGroupId id) const;
+      GroupedRecordId id) const;
   // Logical streaming-page count. Sorted Set streams traverse only ordered
   // pages; physical lifecycle code must use ForEachRecord for both graphs.
   std::size_t group_count() const noexcept {
@@ -195,7 +190,7 @@ class GroupedHashObject {
   }
   std::size_t record_count() const noexcept;
   using RecordVisitor = std::function<void(
-      HashGroupId, const GroupedRecordIndexEntry&,
+      GroupedRecordId, const RecordIndexValue&,
       const std::shared_ptr<const std::vector<ExtentRef>>&, bool)>;
   // Includes active leaves AND retired parent markers in both identity spaces.
   // The callback borrows compact entries and must materialize block epoch/owner
@@ -212,7 +207,7 @@ class GroupedHashObject {
   // stores only the active header; neither alternative retains field values.
   std::variant<std::monostate, HashGroupDirectory, OrderedGroupDirectory>
       directory_;
-  std::shared_ptr<const GroupedHashPhysicalState> physical_;
+  std::shared_ptr<const GroupedPhysicalState> physical_;
 };
 
 // Sparse second-level USER-KEY map. Only a grouped top-level RecordIndex
@@ -222,7 +217,7 @@ class GroupedHashObject {
 // Handles retain metadata across suspension, NOT physical disk-block pins.
 class GroupedObjectIndex {
  public:
-  using Handle = GroupedHashObject::Handle;
+  using Handle = GroupedObject::Handle;
 
   explicit GroupedObjectIndex(
       std::shared_ptr<ScanHashMapEntryArena> arena = nullptr);
