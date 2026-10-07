@@ -356,17 +356,23 @@ static_assert(alignof(BlockState) == 32);
 // acquire owner load observes the epoch initialized before publication; live-
 // byte accounting prevents either field from changing while the entry is
 // current.
-template <typename Entry>
 inline RecordLocation MaterializePublishedIndexLocation(
-    const Entry& entry, const BlockState& state) noexcept {
+    const RecordIndexValue& value, const BlockState& state,
+    const std::uint64_t* expiry = nullptr) noexcept {
   const std::uint16_t owner = state.owner_.load(std::memory_order_acquire);
   const std::uint64_t allocation_epoch = state.allocation_epoch_;
   assert(owner < kMaxMemoryWorkers);
   assert(allocation_epoch != 0);
-  assert(RecordLocation::CanEncodeBlockIdentity(entry.value_.block_id(),
+  assert(RecordLocation::CanEncodeBlockIdentity(value.block_id(),
                                                 allocation_epoch));
-  return RecordIndexEntryPolicy::Load(entry.value_, entry.optional_extra(),
-                                      allocation_epoch, owner);
+  return RecordIndexEntryPolicy::Load(value, expiry, allocation_epoch, owner);
+}
+
+// Top-level keys may carry an expiry word; grouped auxiliary values never do.
+inline RecordLocation MaterializePublishedIndexLocation(
+    const RecordIndex::Entry& entry, const BlockState& state) noexcept {
+  return MaterializePublishedIndexLocation(entry.value_, state,
+                                           entry.optional_extra());
 }
 
 struct ExtentIdentity {
@@ -3471,13 +3477,20 @@ class StorageEngine::Impl {
   // and retirement cannot reset that state until the index stops referencing
   // it. The returned value then owns the epoch snapshot and is safe to carry
   // across suspension even if a later relocation replaces the index entry.
-  template <typename Entry>
-  RecordLocation MaterializeIndexLocation(const Entry& entry) const noexcept {
-    const std::uint64_t block_id = entry.value_.block_id();
+  RecordLocation MaterializeIndexLocation(
+      const RecordIndexValue& value,
+      const std::uint64_t* expiry = nullptr) const noexcept {
+    const std::uint64_t block_id = value.block_id();
     const BlockState& state = const_cast<Impl*>(this)->BlockStateAt(block_id);
-    RecordLocation location = MaterializePublishedIndexLocation(entry, state);
+    RecordLocation location =
+        MaterializePublishedIndexLocation(value, state, expiry);
     assert(location.block_owner() < worker_count_);
     return location;
+  }
+
+  RecordLocation MaterializeIndexLocation(
+      const RecordIndex::Entry& entry) const noexcept {
+    return MaterializeIndexLocation(entry.value_, entry.optional_extra());
   }
 
   std::uint16_t RecoveredBlockOwner(const BlockHeader& block,

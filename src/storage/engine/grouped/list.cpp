@@ -181,7 +181,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
         if (physical == nullptr)
           co_return absl::DataLossError("missing List search page");
         GroupedScratchBudget budget;
-        auto added = budget.AddGroup(physical->value_, object->ExtentsFor(id));
+        auto added = budget.AddGroup(*physical, object->ExtentsFor(id));
         if (!added.ok()) co_return added;
         auto scratch = budget.Reserve(1);
         if (!scratch.ok()) co_return scratch.status();
@@ -320,8 +320,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     const auto* entry = object->FindGroup(id);
     if (entry == nullptr)
       co_return absl::DataLossError("missing List scratch page");
-    const auto added =
-        page_budget.AddGroup(entry->value_, object->ExtentsFor(id));
+    const auto added = page_budget.AddGroup(*entry, object->ExtentsFor(id));
     if (!added.ok()) co_return added;
   }
   const auto read_width =

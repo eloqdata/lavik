@@ -284,8 +284,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
           const auto* entry = previous->FindGroup(id);
           if (entry == nullptr)
             co_return absl::DataLossError("missing ordered page for demotion");
-          const auto added =
-              budget.AddGroup(entry->value_, previous->ExtentsFor(id));
+          const auto added = budget.AddGroup(*entry, previous->ExtentsFor(id));
           if (!added.ok()) co_return added;
         }
         auto added = budget.AddBytes(2 * kCollectionGroupTargetBytes +

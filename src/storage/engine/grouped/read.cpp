@@ -254,7 +254,7 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
     const auto* entry = snapshot->FindGroup(id);
     if (entry == nullptr)
       return absl::DataLossError("missing grouped materialization page");
-    return budget.AddGroup(entry->value_, snapshot->ExtentsFor(id));
+    return budget.AddGroup(*entry, snapshot->ExtentsFor(id));
   };
   if (snapshot->is_ordered()) {
     for (const auto& metadata : snapshot->ordered_directory().groups()) {

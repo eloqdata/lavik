@@ -108,7 +108,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
       return absl::AbortedError("member-index source population changed");
     const auto* entry = current->FindGroup(id);
     if (!entry) return absl::DataLossError("missing member-index source page");
-    return budget.AddGroup(entry->value_, current->ExtentsFor(id));
+    return budget.AddGroup(*entry, current->ExtentsFor(id));
   };
   GroupedScratchBudget metadata_budget;
   absl::Status status;

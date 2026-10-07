@@ -327,29 +327,28 @@ TEST(GroupedObjectIndexTest, CompressedPathsRetainAllHashPrefixLengthBits) {
   ASSERT_TRUE(old.ok()) << old.status();
   for (const auto& location : locations) {
     ASSERT_NE((*old)->FindRecord(location.id_), nullptr);
-    EXPECT_EQ((*old)->FindRecord(location.id_)->value_.block_id(),
+    EXPECT_EQ((*old)->FindRecord(location.id_)->block_id(),
               location.location_.block_id());
     EXPECT_EQ((*old)->FindGroup(location.id_) == nullptr, location.retired_);
   }
   auto moved = GroupedObject::RelocateGroup(
       *old, {0, 7}, locations[7].location_, GroupLocation(200, 5, 0));
   ASSERT_TRUE(moved.ok()) << moved.status();
-  EXPECT_EQ((*moved)->FindRecord({0, 7})->value_.block_id(), 200);
-  EXPECT_EQ((*old)->FindRecord({0, 7})->value_.block_id(), 8);
-  EXPECT_EQ((*moved)->FindRecord({0, 6})->value_.block_id(), 7);
-  EXPECT_EQ((*moved)->FindRecord({0, 64})->value_.block_id(), 65);
+  EXPECT_EQ((*moved)->FindRecord({0, 7})->block_id(), 200);
+  EXPECT_EQ((*old)->FindRecord({0, 7})->block_id(), 8);
+  EXPECT_EQ((*moved)->FindRecord({0, 6})->block_id(), 7);
+  EXPECT_EQ((*moved)->FindRecord({0, 64})->block_id(), 65);
   EXPECT_EQ((*moved)->record_count(), locations.size());
   // A copied physical page must preserve all its other coordinates and
   // retirement bits, including ancestors with the same uint64 prefix.
   for (const auto& location : locations) {
     const auto* entry = (*moved)->FindRecord(location.id_);
     ASSERT_NE(entry, nullptr);
-    EXPECT_EQ(entry->value_.block_id(), location.id_ == GroupedRecordId(0, 7)
-                                            ? 200
-                                            : location.location_.block_id());
-    EXPECT_EQ(entry->value_.mutation_sequence_,
-              location.location_.mutation_sequence_);
-    EXPECT_EQ(entry->value_.logical_size(), location.location_.logical_size_);
+    EXPECT_EQ(entry->block_id(), location.id_ == GroupedRecordId(0, 7)
+                                     ? 200
+                                     : location.location_.block_id());
+    EXPECT_EQ(entry->mutation_sequence_, location.location_.mutation_sequence_);
+    EXPECT_EQ(entry->logical_size(), location.location_.logical_size_);
   }
   (*moved)->ForEachRecord(
       [&](GroupedRecordId id, const auto&, const auto&, bool retired) {
@@ -672,10 +671,10 @@ TEST(GroupedObjectIndexTest, StoresOneCompactPhysicalIndexEntryPerGroup) {
     ASSERT_NE(route, nullptr);
     const auto* location = (*object)->FindGroup(field);
     ASSERT_NE(location, nullptr);
-    EXPECT_EQ(location->value_.block_id(), route->record_token_);
-    EXPECT_EQ(location->value_.mutation_sequence_, route->sequence_);
-    EXPECT_EQ(location->value_.logical_size(), route->field_count_);
-    EXPECT_FALSE(location->value_.has_expiry());
+    EXPECT_EQ(location->block_id(), route->record_token_);
+    EXPECT_EQ(location->mutation_sequence_, route->sequence_);
+    EXPECT_EQ(location->logical_size(), route->field_count_);
+    EXPECT_FALSE(location->has_expiry());
     EXPECT_EQ(location, (*object)->FindGroup(route->id_));
   }
   EXPECT_EQ((*object)->FindGroup(GroupedRecordId{1, 0}), nullptr);
@@ -1018,8 +1017,8 @@ TEST(GroupedObjectIndexTest, MultipleGroupsCanShareOnePackedRecordsBlock) {
   }
   auto object = Create(std::move(input));
   ASSERT_TRUE(object.ok()) << object.status();
-  EXPECT_EQ((*object)->FindGroup("field0")->value_.block_id(), 123);
-  EXPECT_EQ((*object)->FindGroup("field99")->value_.block_id(), 123);
+  EXPECT_EQ((*object)->FindGroup("field0")->block_id(), 123);
+  EXPECT_EQ((*object)->FindGroup("field99")->block_id(), 123);
 }
 
 TEST(GroupedObjectIndexTest,
@@ -1051,20 +1050,19 @@ TEST(GroupedObjectIndexTest,
     ASSERT_NE(before, nullptr);
     ASSERT_NE(after, nullptr);
     shared_entries += before == after;
-    EXPECT_EQ(after->value_.block_id(),
-              location.id_ == changed_id ? 500000 : before->value_.block_id());
-    EXPECT_EQ(
-        after->value_.mutation_sequence_,
-        location.id_ == changed_id ? 6 : before->value_.mutation_sequence_);
-    EXPECT_EQ(after->value_.logical_size(), before->value_.logical_size());
-    EXPECT_EQ(after->value_.record_offset(), before->value_.record_offset());
+    EXPECT_EQ(after->block_id(),
+              location.id_ == changed_id ? 500000 : before->block_id());
+    EXPECT_EQ(after->mutation_sequence_,
+              location.id_ == changed_id ? 6 : before->mutation_sequence_);
+    EXPECT_EQ(after->logical_size(), before->logical_size());
+    EXPECT_EQ(after->record_offset(), before->record_offset());
     shared_routes += &(*old)->directory().groups().at(location.id_.prefix_) ==
                      &(*next)->directory().groups().at(location.id_.prefix_);
   }
   EXPECT_GE(shared_entries, input.locations_.size() - 64);
   EXPECT_GE(shared_routes, input.locations_.size() - 32);
-  EXPECT_EQ((*old)->FindRecord(changed_id)->value_.mutation_sequence_, 5);
-  EXPECT_EQ((*next)->FindRecord(changed_id)->value_.mutation_sequence_, 6);
+  EXPECT_EQ((*old)->FindRecord(changed_id)->mutation_sequence_, 5);
+  EXPECT_EQ((*next)->FindRecord(changed_id)->mutation_sequence_, 6);
   version.root_ = GroupLocation(600000, 6, version.root_.logical_size_, true);
   EXPECT_TRUE(GroupedObject::FinalizeRoot(*next, version).ok());
   EXPECT_EQ((*next)->version().root_.block_id(), 600000);
@@ -1108,7 +1106,7 @@ TEST(GroupedObjectIndexTest, SplitRetainsParentMarkerAcrossFurtherMutations) {
   EXPECT_EQ((*next)->record_count(), 3);
   EXPECT_EQ((*next)->FindGroup(GroupedRecordId{0, 0}), nullptr);
   ASSERT_NE((*next)->FindRecord({0, 0}), nullptr);
-  EXPECT_EQ((*next)->FindRecord({0, 0})->value_.block_id(), 10);
+  EXPECT_EQ((*next)->FindRecord({0, 0})->block_id(), 10);
   unsigned active = 0, retired = 0;
   (*next)->ForEachRecord([&](GroupedRecordId, const auto&, const auto&,
                              bool marker) { marker ? ++retired : ++active; });
@@ -1162,8 +1160,8 @@ TEST(GroupedObjectIndexTest,
   ASSERT_TRUE(publication->Commit(std::move(*builder)).ok());
   auto current = index.Lookup("key", version);
   ASSERT_TRUE(current.ok());
-  EXPECT_EQ((*current)->FindRecord(source.id_)->value_.block_id(), 77777);
-  EXPECT_NE((*old)->FindRecord(source.id_)->value_.block_id(), 77777);
+  EXPECT_EQ((*current)->FindRecord(source.id_)->block_id(), 77777);
+  EXPECT_NE((*old)->FindRecord(source.id_)->block_id(), 77777);
   auto direct = GroupedObject::RelocateRoot(*current, input.version_);
   ASSERT_TRUE(direct.ok());
   for (const auto& group : input.locations_) {
@@ -1224,7 +1222,7 @@ TEST(GroupedObjectIndexTest,
   EXPECT_EQ(rejected.status().code(), absl::StatusCode::kResourceExhausted);
   EXPECT_TRUE(rejected.status().message().starts_with("OOM "));
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), before);
-  EXPECT_EQ((*old)->FindRecord(change.id_)->value_.mutation_sequence_, 5);
+  EXPECT_EQ((*old)->FindRecord(change.id_)->mutation_sequence_, 5);
   auto rejected_route = Apply(input.directory_, input.directory_.root(), 6,
                               std::span(&change, 1));
   EXPECT_EQ(rejected_route.status().code(),
@@ -1282,8 +1280,8 @@ TEST(GroupedObjectIndexTest, RetiredMarkerCanKeepAnExternalParentKey) {
   ASSERT_TRUE(object.ok()) << object.status();
   const auto* retained = (*object)->FindRecord({0, 0});
   ASSERT_NE(retained, nullptr);
-  EXPECT_TRUE(retained->value_.key_indirect());
-  EXPECT_TRUE(retained->value_.external());
+  EXPECT_TRUE(retained->key_indirect());
+  EXPECT_TRUE(retained->external());
   ASSERT_NE((*object)->ExtentsFor({0, 0}), nullptr);
   EXPECT_EQ((*object)->ExtentsFor({0, 0})->at(0).block_id_, 20);
 }
@@ -1393,15 +1391,15 @@ TEST(GroupedObjectIndexTest, CoordinateChangesPreserveSnapshotsAndTraversal) {
       EXPECT_FALSE(retired);
       EXPECT_EQ(extents, nullptr);
       EXPECT_EQ(current->FindRecord(id), &entry);
-      EXPECT_TRUE(visited.emplace(id, entry.value_.block_id()).second);
+      EXPECT_TRUE(visited.emplace(id, entry.block_id()).second);
     });
     EXPECT_EQ(visited, expected);
   }
   for (const auto& snapshot : snapshots)
     for (const auto& [id, block] : snapshot.blocks)
-      EXPECT_EQ(snapshot.object->FindRecord(id)->value_.block_id(), block);
+      EXPECT_EQ(snapshot.object->FindRecord(id)->block_id(), block);
   for (const auto& group : input.locations_)
-    EXPECT_EQ((*original)->FindRecord(group.id_)->value_.block_id(),
+    EXPECT_EQ((*original)->FindRecord(group.id_)->block_id(),
               group.location_.block_id());
 }
 
@@ -1433,7 +1431,7 @@ TEST(GroupedObjectIndexTest, ExternalReplacementFoldsPendingInlineCoordinates) {
       GroupLocation(30000, 5, group.location_.logical_size_, false, true),
       manifest);
   ASSERT_TRUE(external.ok()) << external.status();
-  EXPECT_TRUE((*external)->FindRecord(group.id_)->value_.external());
+  EXPECT_TRUE((*external)->FindRecord(group.id_)->external());
   auto retained = (*external)->ExtentsFor(group.id_);
   ASSERT_NE(retained, nullptr);
   ASSERT_EQ(retained->size(), 1);
@@ -1448,12 +1446,11 @@ TEST(GroupedObjectIndexTest, ExternalReplacementFoldsPendingInlineCoordinates) {
     if (id == group.id_) EXPECT_EQ(extents, retained);
   });
   EXPECT_EQ(visited, input.locations_.size());
-  EXPECT_FALSE(before->FindRecord(group.id_)->value_.external());
+  EXPECT_FALSE(before->FindRecord(group.id_)->external());
   EXPECT_EQ(before->ExtentsFor(group.id_), nullptr);
   for (std::size_t i = 0; i < 5; ++i)
-    EXPECT_EQ(
-        (*external)->FindRecord(input.locations_[i].id_)->value_.block_id(),
-        i == 2 ? 30000 : 10000 + i);
+    EXPECT_EQ((*external)->FindRecord(input.locations_[i].id_)->block_id(),
+              i == 2 ? 30000 : 10000 + i);
 }
 
 TEST(GroupedObjectIndexTest,

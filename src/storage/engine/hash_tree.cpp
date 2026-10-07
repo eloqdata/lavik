@@ -664,7 +664,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       co_return absl::DataLossError("grouped scan has no physical page");
     GroupedScratchBudget budget;
     const auto included =
-        budget.AddGroup(entry->value_, grouped->ExtentsFor(route->id_));
+        budget.AddGroup(*entry, grouped->ExtentsFor(route->id_));
     if (!included.ok()) co_return included;
     // Matching strings move into the reply; no second payload copy is made.
     // The physical read buffer has its own independent admission.
@@ -804,9 +804,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         return absl::DataLossError("missing Hash scratch page");
       // Inline records cannot own a manifest. Avoid a second physical-index
       // traversal merely to obtain the null handle used by admission.
-      return budget.AddGroup(entry->value_, entry->value_.external()
-                                                ? grouped->ExtentsFor(id)
-                                                : ExtentManifest{});
+      return budget.AddGroup(*entry, entry->external() ? grouped->ExtentsFor(id)
+                                                       : ExtentManifest{});
     };
     if (edit_leaves) {
       if (leaf_edits.size() > 1)

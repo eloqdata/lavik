@@ -359,7 +359,7 @@ absl::StatusOr<NodeHandle> BuildPhysical(
   (*page)->locations_.reserve(records.size());
   (*page)->extents_.SetEntryArena(arena);
   for (const auto& record : records) {
-    (*page)->locations_.push_back({RecordIndexValue(record.location_)});
+    (*page)->locations_.emplace_back(record.location_);
     if (record.retired_) (*page)->retired_ |= 1ULL << (*page)->ids_.size();
     (*page)->ids_.push_back(record.id_);
     if (record.extents_) {
@@ -441,8 +441,8 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
         (*copied)->locations_ = page.locations_;
         (*copied)->extents_.SetEntryArena(arena);
         const auto index = static_cast<std::size_t>(found - page.ids_.begin());
-        (*copied)->locations_[index] = {
-            RecordIndexValue(changed.front().location_)};
+        (*copied)->locations_[index] =
+            RecordIndexValue(changed.front().location_);
         const auto mask = std::uint64_t{1} << index;
         (*copied)->retired_ = changed.front().retired_ ? page.retired_ | mask
                                                        : page.retired_ & ~mask;
@@ -471,11 +471,11 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
       // Epoch/owner remain the physical block's authority. A compact entry
       // is copied byte-for-byte through this temporary location; these two
       // fields do not enter the compact physical index.
-      merged.push_back({.id_ = id,
-                        .location_ = RecordIndexEntryPolicy::Load(
-                            entry->value_, nullptr, 1, 0),
-                        .extents_ = ManifestFor(page, id),
-                        .retired_ = ((page.retired_ >> i) & 1) != 0});
+      merged.push_back(
+          {.id_ = id,
+           .location_ = RecordIndexEntryPolicy::Load(*entry, nullptr, 1, 0),
+           .extents_ = ManifestFor(page, id),
+           .retired_ = ((page.retired_ >> i) & 1) != 0});
     }
     merged.insert(merged.end(), changed.begin() + next, changed.end());
     return BuildPhysical(merged, arena);
@@ -585,7 +585,7 @@ bool TryUpdatePhysicalOverrides(
   auto count = previous.override_count_;
   for (const auto& record : changed) {
     const auto* old = FindPhysicalRecord(previous, record.id_);
-    if (!old || old->value_.external() || record.location_.external() ||
+    if (!old || old->external() || record.location_.external() ||
         record.extents_)
       return false;
     count += FindOverride(previous, record.id_) == nullptr;
@@ -606,7 +606,7 @@ bool TryUpdatePhysicalOverrides(
       ++output.override_count_;
     }
     *position = {.id_ = record.id_,
-                 .entry_ = {RecordIndexValue(record.location_)},
+                 .entry_ = RecordIndexValue(record.location_),
                  .retired_ = record.retired_};
   }
   return true;
@@ -623,11 +623,11 @@ void FoldPhysicalOverrides(
   std::size_t cursor = 0;
   auto append_override = [&] {
     const auto& entry = previous.overrides_[cursor++];
-    folded.push_back({.id_ = entry.id_,
-                      .location_ = RecordIndexEntryPolicy::Load(
-                          entry.entry_.value_, nullptr, 1, 0),
-                      .extents_ = nullptr,
-                      .retired_ = entry.retired_});
+    folded.push_back(
+        {.id_ = entry.id_,
+         .location_ = RecordIndexEntryPolicy::Load(entry.entry_, nullptr, 1, 0),
+         .extents_ = nullptr,
+         .retired_ = entry.retired_});
   };
   for (const auto& record : changed) {
     while (cursor < previous.override_count_ &&
@@ -689,8 +689,7 @@ absl::Status BuildStringPhysical(GroupedPhysicalState& output,
         const auto* entry = page.entries_[position % kGroupIndexPageEntries];
         records.push_back(
             {.id_ = {position + 1, 0},
-             .location_ =
-                 RecordIndexEntryPolicy::Load(entry->value_, nullptr, 1, 0),
+             .location_ = RecordIndexEntryPolicy::Load(*entry, nullptr, 1, 0),
              .extents_ = ManifestFor(*page.owner_->page_, {position + 1, 0})});
       } else
         return absl::DataLossError("missing String index segment");
@@ -885,7 +884,7 @@ absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareUpdate(
     previous = record.id_;
     if (const auto* old = expected->FindGroup(record.id_)) {
       --active;
-      fields -= old->value_.logical_size();
+      fields -= old->logical_size();
     }
     active += !record.retired_;
     if (!record.retired_) fields += record.location_.logical_size_;
@@ -1060,7 +1059,7 @@ GroupedObject::PrepareUpdateOrdered(
     previous = record.id_;
     if (const auto* old = expected->FindGroup(record.id_)) {
       --active;
-      fields -= old->value_.logical_size();
+      fields -= old->logical_size();
     }
     active += !record.retired_;
     if (!record.retired_) fields += record.location_.logical_size_;
@@ -1208,12 +1207,10 @@ absl::StatusOr<GroupedObject::Handle> GroupedObject::RelocateGroup(
   if (!expected)
     return absl::InvalidArgumentError("missing group relocation source");
   const auto* current = expected->FindRecord(id);
-  if (!current || current->value_.block_id() != expected_location.block_id() ||
-      current->value_.record_offset() != expected_location.record_offset() ||
-      current->value_.total_disk_bytes() !=
-          expected_location.total_disk_bytes() ||
-      current->value_.mutation_sequence_ !=
-          expected_location.mutation_sequence_ ||
+  if (!current || current->block_id() != expected_location.block_id() ||
+      current->record_offset() != expected_location.record_offset() ||
+      current->total_disk_bytes() != expected_location.total_disk_bytes() ||
+      current->mutation_sequence_ != expected_location.mutation_sequence_ ||
       replacement.mutation_sequence_ != expected_location.mutation_sequence_ ||
       replacement.logical_size_ != expected_location.logical_size_) {
     return absl::AbortedError("group relocation source changed");

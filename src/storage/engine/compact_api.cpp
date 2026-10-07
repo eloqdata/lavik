@@ -274,7 +274,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
         const auto* entry = grouped->FindGroup(id);
         if (!entry)
           co_return absl::DataLossError("missing Sorted Set callback page");
-        auto admitted = budget.AddGroup(entry->value_, grouped->ExtentsFor(id));
+        auto admitted = budget.AddGroup(*entry, grouped->ExtentsFor(id));
         if (!admitted.ok()) co_return admitted;
       }
     } else {

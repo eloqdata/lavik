@@ -61,10 +61,7 @@ struct GroupedPhysicalState;
 // physical coordinates; the owning page supplies the sorted group identity.
 // This is deliberately distinct from a ScanHashMap entry with a variable key
 // tail. Returned pointers borrow the immutable object view.
-struct GroupedRecordIndexEntry {
-  RecordIndexValue value_;
-  const std::uint64_t* optional_extra() const noexcept { return nullptr; }
-};
+using GroupedRecordIndexEntry = RecordIndexValue;
 
 // Shared object view for grouped String, Hash, Set, List, Sorted Set and Stream
 // values. Retains routing and physical metadata; payloads are loaded on demand.

@@ -238,14 +238,14 @@ TEST(GroupedOrderedObjectTest,
     for (std::uint64_t i = 1; i <= count; ++i) {
       SCOPED_TRACE(i);
       ASSERT_NE((*old)->FindRecord({base + i, 0}), nullptr);
-      EXPECT_EQ((*old)->FindRecord({base + i, 0})->value_.block_id(), i);
+      EXPECT_EQ((*old)->FindRecord({base + i, 0})->block_id(), i);
       ASSERT_NE((*next)->FindRecord({base + i, 0}), nullptr);
-      EXPECT_EQ((*next)->FindRecord({base + i, 0})->value_.block_id(),
+      EXPECT_EQ((*next)->FindRecord({base + i, 0})->block_id(),
                 i == count ? 200 : i);
     }
     EXPECT_EQ((*old)->FindRecord({added_id, 0}), nullptr);
     ASSERT_NE((*next)->FindRecord({added_id, 0}), nullptr);
-    EXPECT_EQ((*next)->FindRecord({added_id, 0})->value_.block_id(), 201);
+    EXPECT_EQ((*next)->FindRecord({added_id, 0})->block_id(), 201);
     EXPECT_EQ((*next)->FindRecord({added_id, 1}), nullptr);
     EXPECT_EQ((*next)->FindRecord({base + count + 1000, 0}), nullptr);
     // Relocation after prefix expansion must update only the new view, and
@@ -254,8 +254,8 @@ TEST(GroupedOrderedObjectTest,
                                               locations[64].location_,
                                               OrderedLocation(300, 3, 1, type));
     ASSERT_TRUE(moved.ok()) << moved.status();
-    EXPECT_EQ((*moved)->FindRecord({base + 65, 0})->value_.block_id(), 300);
-    EXPECT_EQ((*next)->FindRecord({base + 65, 0})->value_.block_id(), 65);
+    EXPECT_EQ((*moved)->FindRecord({base + 65, 0})->block_id(), 300);
+    EXPECT_EQ((*next)->FindRecord({base + 65, 0})->block_id(), 65);
     std::set<GroupedRecordId> visited;
     (*moved)->ForEachRecord(
         [&](GroupedRecordId id, const auto&, const auto&, bool retired) {
@@ -315,8 +315,8 @@ TEST(GroupedOrderedObjectTest, StringVectorSharesUntouchedPagesAndOldViews) {
   auto next = GroupedObject::PrepareUpdateOrdered(
       *old, version, *next_directory, std::span(&replacement, 1));
   ASSERT_TRUE(next.ok()) << next.status();
-  EXPECT_EQ((*old)->FindRecord({65, 0})->value_.block_id(), 65);
-  EXPECT_EQ((*next)->FindRecord({65, 0})->value_.block_id(), 1001);
+  EXPECT_EQ((*old)->FindRecord({65, 0})->block_id(), 65);
+  EXPECT_EQ((*next)->FindRecord({65, 0})->block_id(), 1001);
   for (const auto id : {1, 64, 129, 130})
     EXPECT_EQ((*old)->FindRecord({static_cast<std::uint64_t>(id), 0}),
               (*next)->FindRecord({static_cast<std::uint64_t>(id), 0}));
@@ -327,8 +327,8 @@ TEST(GroupedOrderedObjectTest, StringVectorSharesUntouchedPagesAndOldViews) {
       *next, {65, 0}, replacement.location_,
       OrderedLocation(1002, 4, kStringGroupBytes, type));
   ASSERT_TRUE(relocated.ok()) << relocated.status();
-  EXPECT_EQ((*next)->FindRecord({65, 0})->value_.block_id(), 1001);
-  EXPECT_EQ((*relocated)->FindRecord({65, 0})->value_.block_id(), 1002);
+  EXPECT_EQ((*next)->FindRecord({65, 0})->block_id(), 1001);
+  EXPECT_EQ((*relocated)->FindRecord({65, 0})->block_id(), 1002);
   std::size_t visited = 0;
   (*relocated)
       ->ForEachRecord([&](GroupedRecordId id,
@@ -367,7 +367,7 @@ TEST(GroupedOrderedObjectTest, BothKindsRetainRetiredPhysicalRecordsAndRanks) {
     (*object)->ForEachRecord([&](GroupedRecordId,
                                  const GroupedRecordIndexEntry& entry,
                                  const auto&, bool marker) {
-      EXPECT_EQ(entry.value_.value_type(), type);
+      EXPECT_EQ(entry.value_type(), type);
       marker ? ++retired : ++active;
     });
     EXPECT_EQ(active, 2);
@@ -417,10 +417,8 @@ TEST(GroupedOrderedObjectTest, MemberIndexSharesPhysicalLifecycleAndOldViews) {
       *object, {0, 0}, input.locations_.back().location_,
       OrderedLocation(101, 3, 4, ValueType::kSortedSet));
   ASSERT_TRUE(relocated.ok()) << relocated.status();
-  EXPECT_EQ((*object)->FindGroup(GroupedRecordId{0, 0})->value_.block_id(),
-            100);
-  EXPECT_EQ((*relocated)->FindGroup(GroupedRecordId{0, 0})->value_.block_id(),
-            101);
+  EXPECT_EQ((*object)->FindGroup(GroupedRecordId{0, 0})->block_id(), 100);
+  EXPECT_EQ((*relocated)->FindGroup(GroupedRecordId{0, 0})->block_id(), 101);
   EXPECT_TRUE((*relocated)->SameLogicalRoot(**object));
 
   root.revision_ = 4;
@@ -438,9 +436,8 @@ TEST(GroupedOrderedObjectTest, MemberIndexSharesPhysicalLifecycleAndOldViews) {
   auto updated = GroupedObject::PrepareUpdateOrdered(
       *relocated, version, *updated_directory, std::span(&replacement, 1));
   ASSERT_TRUE(updated.ok()) << updated.status();
-  EXPECT_EQ((*updated)->FindGroup(GroupedRecordId{0, 0})->value_.block_id(),
-            102);
-  EXPECT_EQ((*updated)->FindGroup(GroupedRecordId{1, 0})->value_.block_id(), 1);
+  EXPECT_EQ((*updated)->FindGroup(GroupedRecordId{0, 0})->block_id(), 102);
+  EXPECT_EQ((*updated)->FindGroup(GroupedRecordId{1, 0})->block_id(), 1);
   EXPECT_EQ((*relocated)->directory().root().revision_, 3);
   EXPECT_EQ((*updated)->directory().root().revision_, 4);
   EXPECT_FALSE(GroupedObject::PrepareUpdateOrdered(*relocated, version,
@@ -474,9 +471,9 @@ TEST(GroupedOrderedObjectTest, UpdatesSameCommandRevisionAndPreservesOldView) {
   ASSERT_TRUE(next.ok()) << next.status();
   version.root_ = OrderedLocation(1000, 7, 5, ValueType::kList, true);
   EXPECT_TRUE(GroupedObject::FinalizeRoot(*next, version).ok());
-  EXPECT_EQ((*old)->FindRecord({3, 0})->value_.block_id(), 3);
-  EXPECT_EQ((*next)->FindRecord({3, 0})->value_.block_id(), 30);
-  EXPECT_EQ((*next)->FindRecord({1, 0})->value_.block_id(), 1);
+  EXPECT_EQ((*old)->FindRecord({3, 0})->block_id(), 3);
+  EXPECT_EQ((*next)->FindRecord({3, 0})->block_id(), 30);
+  EXPECT_EQ((*next)->FindRecord({1, 0})->block_id(), 1);
   EXPECT_FALSE((*old)->SameLogicalRoot(**next));
 
   auto moved_version = version;
@@ -488,7 +485,7 @@ TEST(GroupedOrderedObjectTest, UpdatesSameCommandRevisionAndPreservesOldView) {
   auto relocated = GroupedObject::RelocateGroup(
       *moved, {2, 0}, marker, OrderedLocation(200, 3, 0, ValueType::kList));
   ASSERT_TRUE(relocated.ok()) << relocated.status();
-  EXPECT_EQ((*relocated)->FindRecord({2, 0})->value_.block_id(), 200);
+  EXPECT_EQ((*relocated)->FindRecord({2, 0})->block_id(), 200);
   EXPECT_EQ((*relocated)->FindGroup(GroupedRecordId{2, 0}), nullptr);
 }
 
@@ -548,7 +545,7 @@ TEST(GroupedOrderedObjectTest, InvalidTypeMissingMarkerAndOomCannotPublish) {
   auto oom = GroupedObject::PrepareRootRelocation(*old);
   EXPECT_EQ(oom.status().code(), absl::StatusCode::kResourceExhausted);
   EXPECT_EQ((*old)->record_count(), 3);
-  EXPECT_EQ((*old)->FindRecord({3, 0})->value_.block_id(), 3);
+  EXPECT_EQ((*old)->FindRecord({3, 0})->block_id(), 3);
 }
 
 }  // namespace

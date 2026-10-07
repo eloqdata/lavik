@@ -379,9 +379,9 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
       BlockDelta& delta = dead_by_block[std::pair(location.block_id(),
                                                   location.allocation_epoch())];
       delta.block_owner_ = location.block_owner();
-      delta.bytes_ += entry.value_.total_disk_bytes();
-      if (entry.value_.tx_tagged()) {
-        delta.tagged_bytes_ += entry.value_.total_disk_bytes();
+      delta.bytes_ += location.total_disk_bytes();
+      if (location.tx_tagged()) {
+        delta.tagged_bytes_ += location.total_disk_bytes();
       }
       if (manifest) {
         dead_extents.push_back(manifest);
@@ -412,7 +412,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
         object->ForEachRecord([&](GroupedRecordId,
                                   const GroupedRecordIndexEntry& entry,
                                   const ExtentManifest& manifest, bool) {
-          if (entry.value_.external() != static_cast<bool>(manifest)) {
+          if (entry.external() != static_cast<bool>(manifest)) {
             grouped_status = absl::InternalError(
                 "detached group lost its external extent manifest");
             return;
