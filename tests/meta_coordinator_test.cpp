@@ -73,6 +73,7 @@
 #include "spdlog/sinks/ostream_sink.h"
 #include "spdlog/spdlog.h"
 #include "support/meta_raft.h"
+#include "support/meta_stores.h"
 #include "support/test_data_path.h"
 
 // Trusted test peer for the passkey-protected principal boundary. Tests use
@@ -103,13 +104,13 @@ using lavik::meta::MetaLeaderContext;
 using lavik::meta::MetaLeadershipRelay;
 using lavik::meta::MetaObservationIdentity;
 using lavik::meta::MetaObservationStore;
+using lavik::meta::MetaObservationSubscriptionStart;
 using lavik::meta::MetaOperationId;
 using lavik::meta::MetaReconciler;
 using lavik::meta::MetaRequestId;
 using lavik::meta::MetaStateMachine;
-using lavik::meta::MetaStoresFacts;
-using lavik::meta::MetaSubscriptionStart;
 using lavik::meta::RegisterNode;
+using lavik::meta::StoredFactsTestAdapter;
 using lavik::meta::SubmitOperation;
 using lavik::meta::TransitionOperationPhase;
 
@@ -583,7 +584,7 @@ TEST_F(MetaCoordinatorComponentTest,
       EXPECT_EQ(view->cursor_.state_change_index(), 2u);
     }
   }
-  auto stores = machine_->StoresSnapshot();
+  auto stores = machine_->CaptureRecoveryStores().stores_;
   phase.expected_revision_ = 1;
   phase.kind_phase_blob_ = "change-config";
   EXPECT_TRUE(stores.operation_.TransitionOperationPhase(phase, 4).ok());
@@ -659,19 +660,23 @@ class MetaSubscriptionCaptureTest : public MetaCoordinatorComponentTest,
  protected:
   struct Start {
     std::uint64_t applied_index;
+    std::uint64_t state_change_index;
     std::uint64_t cursor;
     std::unique_ptr<lavik::meta::MetaCommitSubscription> subscription;
+    std::optional<bool> installed_node_present;
   };
 
   Start Subscribe(MetaCommitCallback callback, std::size_t capacity = 0) {
     auto keep = [](auto start) {
-      return Start{start.view_.applied_index(), start.cursor_,
-                   std::move(start.subscription_)};
+      std::optional<bool> installed_node_present;
+      if constexpr (requires { start.view_.IsActiveNode(MakeNodeId(0x21)); }) {
+        installed_node_present = start.view_.IsActiveNode(MakeNodeId(0x21));
+      }
+      return Start{start.view_.applied_index(),
+                   start.view_.state_change_index(), start.cursor_,
+                   std::move(start.subscription_), installed_node_present};
     };
     switch (GetParam()) {
-      case 0:
-        return keep(
-            coordinator_->SubscribeCommitted(std::move(callback), capacity));
       case 1:
         return keep(coordinator_->SubscribeObservationFacts(std::move(callback),
                                                             capacity));
@@ -729,6 +734,37 @@ TEST_P(MetaSubscriptionCaptureTest, InstallBetweenCaptureAndRegistration) {
       1);
 }
 
+TEST_P(MetaSubscriptionCaptureTest, InstallAtAdvancedIndexRecapturesState) {
+  bool installed = false;
+  MetaCoordinatorOptions options;
+  options.after_subscription_capture_for_testing_ = [&] {
+    if (installed) return;
+    installed = true;
+    auto replacement = machine_->CaptureRecoveryStores().stores_;
+    ASSERT_TRUE(replacement.identity_.Apply(MakeRegister(0x21)).ok());
+    auto image = replacement.Serialize();
+    ASSERT_TRUE(image.ok());
+    ASSERT_TRUE(machine_->Install(2, *image).ok());
+  };
+  MakeCoordinator(std::move(options));
+  Commit(1, MakeRegister(0x11));
+  machine_->Advance(2);
+  RecordedEvents recorded;
+  auto start = Subscribe(recorded.Callback());
+  EXPECT_TRUE(installed);
+  EXPECT_EQ(start.applied_index, 2u);
+  EXPECT_EQ(start.state_change_index, 2u);
+  EXPECT_EQ(start.cursor, 1u);
+  if (GetParam() != 3) {
+    ASSERT_TRUE(start.installed_node_present.has_value());
+    EXPECT_TRUE(*start.installed_node_present);
+  }
+  Commit(3, MakeRegister(0x13));
+  ASSERT_TRUE(
+      WaitFor([&] { return recorded.size() == 1; }, std::chrono::seconds(5)));
+  EXPECT_EQ(recorded.Snapshot().front().log_index_, 3u);
+}
+
 TEST_F(MetaCoordinatorComponentTest,
        PublicationSubscriptionRechecksInstallAtAdvancedIndex) {
   bool installed = false;
@@ -736,7 +772,7 @@ TEST_F(MetaCoordinatorComponentTest,
   options.after_subscription_capture_for_testing_ = [&] {
     if (installed) return;
     installed = true;
-    auto replacement = machine_->StoresSnapshot();
+    auto replacement = machine_->CaptureRecoveryStores().stores_;
     EXPECT_TRUE(replacement.identity_.Apply(MakeRegister(0x21)).ok());
     auto image = replacement.Serialize();
     ASSERT_TRUE(image.ok());
@@ -805,11 +841,11 @@ TEST_P(MetaSubscriptionCaptureTest, OverflowResyncReplayAndCallbackLifetime) {
   EXPECT_EQ(calls.load(), 1u);
 }
 
-INSTANTIATE_TEST_SUITE_P(FullObservationAndCursor, MetaSubscriptionCaptureTest,
-                         ::testing::Values(0, 1, 2, 3),
+INSTANTIATE_TEST_SUITE_P(ObservationPublicationAndCursor,
+                         MetaSubscriptionCaptureTest,
+                         ::testing::Values(1, 2, 3),
                          [](const ::testing::TestParamInfo<int>& info) {
-                           return info.param == 0   ? "Full"
-                                  : info.param == 1 ? "Observation"
+                           return info.param == 1   ? "Observation"
                                   : info.param == 2 ? "Publication"
                                                     : "Cursor";
                          });
@@ -821,13 +857,16 @@ TEST_F(MetaCoordinatorComponentTest, SubscriptionTripleIsAtomicAndOrdered) {
   }
 
   RecordedEvents recorded;
-  MetaSubscriptionStart start =
-      coordinator_->SubscribeCommitted(recorded.Callback());
+  MetaObservationSubscriptionStart start =
+      coordinator_->SubscribeObservationFacts(recorded.Callback());
   // The atomic triple: the view reflects exactly the cursor — all three
   // committed commands are in the view, none are delivered as events.
   EXPECT_EQ(start.cursor_, 3u);
   EXPECT_EQ(start.view_.applied_index(), 3u);
-  EXPECT_EQ(start.view_.identity().NodeCount(), 3u);
+  for (std::uint8_t ii = 0; ii < 3; ++ii) {
+    EXPECT_TRUE(start.view_.IsActiveNode(
+        MakeNodeId(static_cast<std::uint8_t>(0x10 + ii))));
+  }
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   EXPECT_EQ(recorded.size(), 0u);
 
@@ -849,8 +888,8 @@ TEST_F(MetaCoordinatorComponentTest, SubscriptionReplayDuplicatesAndDedupRule) {
   // index against their watermark (initially view.applied_index()).
   MakeCoordinator();
   RecordedEvents recorded;
-  MetaSubscriptionStart start =
-      coordinator_->SubscribeCommitted(recorded.Callback());
+  MetaObservationSubscriptionStart start =
+      coordinator_->SubscribeObservationFacts(recorded.Callback());
   EXPECT_EQ(start.cursor_, 0u);
 
   const MetaCommand first = MakeRegister(0x21);
@@ -875,8 +914,10 @@ TEST_F(MetaCoordinatorComponentTest, SubscriptionReplayDuplicatesAndDedupRule) {
   }
   EXPECT_EQ(effective, (std::vector<std::uint64_t>{1u, 2u}));
   // And the replayed commit produced no extra state or audit record.
-  EXPECT_EQ(coordinator_->CommittedView().identity().NodeCount(), 2u);
-  EXPECT_EQ(coordinator_->CommittedView().audit().size(), 2u);
+  EXPECT_EQ(
+      lavik::meta::CaptureFullViewForTest(*machine_).identity().NodeCount(),
+      2u);
+  EXPECT_EQ(lavik::meta::CaptureFullViewForTest(*machine_).audit().size(), 2u);
 }
 
 TEST_F(MetaCoordinatorComponentTest,
@@ -886,14 +927,15 @@ TEST_F(MetaCoordinatorComponentTest,
   std::mutex latch_mu;
   std::condition_variable latch_cv;
   bool release = false;
-  MetaSubscriptionStart start = coordinator_->SubscribeCommitted(
-      [&](const MetaCommitEvent& event) {
-        recorded.Callback()(event);
-        // Block the dispatcher thread so the bounded queue fills up.
-        std::unique_lock<std::mutex> lock(latch_mu);
-        latch_cv.wait(lock, [&] { return release; });
-      },
-      /*queue_capacity=*/2);
+  MetaObservationSubscriptionStart start =
+      coordinator_->SubscribeObservationFacts(
+          [&](const MetaCommitEvent& event) {
+            recorded.Callback()(event);
+            // Block the dispatcher thread so the bounded queue fills up.
+            std::unique_lock<std::mutex> lock(latch_mu);
+            latch_cv.wait(lock, [&] { return release; });
+          },
+          /*queue_capacity=*/2);
 
   for (std::uint64_t idx = 1; idx <= 4; ++idx) {
     Commit(idx, MakeRegister(static_cast<std::uint8_t>(0x30 + idx)));
@@ -921,8 +963,8 @@ TEST_F(MetaCoordinatorComponentTest,
   MakeCoordinator();
   RecordedEvents recorded;
   {
-    MetaSubscriptionStart start =
-        coordinator_->SubscribeCommitted(recorded.Callback());
+    MetaObservationSubscriptionStart start =
+        coordinator_->SubscribeObservationFacts(recorded.Callback());
     Commit(1, MakeRegister(0x41));
     ASSERT_TRUE(WaitFor([&] { return recorded.size() == 1u; },
                         std::chrono::seconds(10)));
@@ -938,8 +980,8 @@ TEST_F(MetaCoordinatorComponentTest,
   bool entered = false;
   bool release = false;
   {
-    MetaSubscriptionStart start =
-        coordinator_->SubscribeCommitted([&](const MetaCommitEvent&) {
+    MetaObservationSubscriptionStart start =
+        coordinator_->SubscribeObservationFacts([&](const MetaCommitEvent&) {
           std::unique_lock<std::mutex> lock(latch_mu);
           entered = true;
           latch_cv.notify_all();
@@ -1000,10 +1042,11 @@ TEST_F(MetaCoordinatorComponentTest, CommittedViewFactsAnswerFromStores) {
   submit.intent_hash_ = lavik::meta::MetaSha256(submit.intent_);
   Commit(4, submit);
 
-  // The adapter the obs store's freshness queries run against.
-  const auto view = coordinator_->CommittedView();
+  // Keep the complete-store facts oracle test-only; production freshness
+  // queries use owned purpose-specific captures.
+  const auto view = lavik::meta::CaptureFullViewForTest(*machine_);
   EXPECT_EQ(view.applied_index(), 4u);
-  MetaStoresFacts facts(view.stores());
+  StoredFactsTestAdapter facts(view.stores());
   EXPECT_TRUE(facts.IsActiveNode(MakeNodeId(0x61)));
   EXPECT_FALSE(facts.IsActiveNode(MakeNodeId(0x62)));
   EXPECT_EQ(facts.CurrentGroupTerm("g1"), 1u);
@@ -1342,7 +1385,7 @@ TEST_F(MetaCoordinatorServerTest, ProposeInjectsActorAndReturnsAuditVerdict) {
 
   // The coordinator injected the actor and propose-time readable clock; the
   // committed command's audit record carries both.
-  const auto stores = machine_->StoresSnapshot();
+  const auto stores = machine_->CaptureRecoveryStores().stores_;
   ASSERT_TRUE(stores.identity_.FindNode(MakeNodeId(0x11)).has_value());
   const auto audit = stores.audit_.Find(accepted->log_index_);
   ASSERT_TRUE(audit.has_value());
@@ -1358,8 +1401,8 @@ TEST_F(MetaCoordinatorServerTest, ProposeInjectsActorAndReturnsAuditVerdict) {
   ASSERT_TRUE(rejected.ok()) << rejected.status();
   EXPECT_EQ(rejected->verdict_, MetaAuditVerdict::kRejected);
   EXPECT_FALSE(rejected->detail_.empty());
-  EXPECT_FALSE(machine_->StoresSnapshot()
-                   .identity_.FindNode(MakeNodeId(0x12))
+  EXPECT_FALSE(machine_->CaptureRecoveryStores()
+                   .stores_.identity_.FindNode(MakeNodeId(0x12))
                    .has_value());
 }
 
@@ -1404,7 +1447,7 @@ TEST_F(MetaCoordinatorServerTest, FailSafeWalGate) {
       lavik::meta::MetaPopulationManifestStore::CanonicalDigest(put.entries_);
   ASSERT_TRUE(ProposeSync(put).ok());
   const std::size_t audit_before_gate =
-      machine_->StoresSnapshot().audit_.size();
+      machine_->CaptureRecoveryStores().stores_.audit_.size();
 
   // Constructor-injected threshold: zero tolerated uncompacted WAL bytes. The
   // boot config entry alone already exceeds that, so the gate must trip.
@@ -1422,7 +1465,8 @@ TEST_F(MetaCoordinatorServerTest, FailSafeWalGate) {
   EXPECT_NE(gated.status().message().find("WAL"), std::string::npos)
       << gated.status();
   // Fail-safe means nothing was appended: no audit record, no state change.
-  EXPECT_EQ(machine_->StoresSnapshot().audit_.size(), audit_before_gate);
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.audit_.size(),
+            audit_before_gate);
 
   // A prune-shaped no-op is rejected before append; fresh request ids cannot
   // use idempotency to grow the WAL after the hard gate has fired.
@@ -1441,8 +1485,9 @@ TEST_F(MetaCoordinatorServerTest, FailSafeWalGate) {
   auto recovery = ProposeSync(prune);
   ASSERT_TRUE(recovery.ok()) << recovery.status();
   EXPECT_EQ(recovery->verdict_, MetaAuditVerdict::kAccepted);
-  EXPECT_FALSE(machine_->StoresSnapshot().population_manifest_.Contains(
-      put.manifest_digest_));
+  EXPECT_FALSE(
+      machine_->CaptureRecoveryStores().stores_.population_manifest_.Contains(
+          put.manifest_digest_));
 }
 
 TEST_F(MetaCoordinatorServerTest, FailSafeSnapshotFailureGate) {
@@ -1498,7 +1543,7 @@ TEST_F(MetaCoordinatorServerTest,
 
   FailSafeControlledFailoverState failover;
   SeedControlledFailover(failover, /*begin_transition=*/false);
-  const auto before = machine_->StoresSnapshot();
+  const auto before = machine_->CaptureRecoveryStores().stores_;
   const auto before_group = before.topology_.FindGroup("g1");
   const auto before_grant = before.topology_.AuthorityFor("g1");
   ASSERT_TRUE(before_group.has_value());
@@ -1523,7 +1568,7 @@ TEST_F(MetaCoordinatorServerTest,
   ASSERT_TRUE(aborted.ok()) << aborted.status();
   EXPECT_EQ(aborted->verdict_, MetaAuditVerdict::kAccepted);
 
-  const auto after = machine_->StoresSnapshot();
+  const auto after = machine_->CaptureRecoveryStores().stores_;
   const auto operation = after.operation_.FindOperation(failover.operation_id_);
   ASSERT_TRUE(operation.has_value());
   EXPECT_EQ(operation->lifecycle_,
@@ -1554,7 +1599,7 @@ TEST_F(MetaCoordinatorServerTest,
 
   FailSafeControlledFailoverState failover;
   SeedControlledFailover(failover, /*begin_transition=*/true);
-  const auto before = machine_->StoresSnapshot();
+  const auto before = machine_->CaptureRecoveryStores().stores_;
   const auto before_group = before.topology_.FindGroup("g1");
   const auto before_grant = before.topology_.AuthorityFor("g1");
   ASSERT_TRUE(before_group.has_value());
@@ -1640,7 +1685,7 @@ TEST_F(MetaCoordinatorServerTest,
   EXPECT_NE(first_abort_log.find("action=a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"),
             std::string::npos);
 
-  const auto after = machine_->StoresSnapshot();
+  const auto after = machine_->CaptureRecoveryStores().stores_;
   const auto operation = after.operation_.FindOperation(failover.operation_id_);
   ASSERT_TRUE(operation.has_value());
   EXPECT_EQ(operation->lifecycle_,
@@ -1772,7 +1817,7 @@ TEST_F(MetaCoordinatorServerTest,
   auto recovery = ProposeSync(archive);
   ASSERT_TRUE(recovery.ok()) << recovery.status();
   EXPECT_EQ(recovery->verdict_, MetaAuditVerdict::kAccepted);
-  EXPECT_TRUE(coordinator_->CommittedView()
+  EXPECT_TRUE(lavik::meta::CaptureFullViewForTest(*machine_)
                   .operation()
                   .FindArchived(complete_target.operation_id_)
                   .has_value());
@@ -1782,7 +1827,7 @@ TEST_F(MetaCoordinatorServerTest,
   prune.operation_seqs_ = archive.operation_seqs_;
   auto pruned = ProposeSync(prune);
   ASSERT_TRUE(pruned.ok()) << pruned.status();
-  const auto view = coordinator_->CommittedView();
+  const auto view = lavik::meta::CaptureFullViewForTest(*machine_);
   EXPECT_FALSE(view.operation().OperationKnown(complete_target.operation_id_));
   EXPECT_FALSE(view.operation().OperationKnown(abort_target.operation_id_));
 
@@ -1841,8 +1886,8 @@ TEST_F(MetaCoordinatorServerTest,
   apply_barrier_.Resume();
   ASSERT_TRUE(WaitFor(
       [&] {
-        return machine_->StoresSnapshot()
-            .operation_.FindArchived(submit.operation_id_)
+        return machine_->CaptureRecoveryStores()
+            .stores_.operation_.FindArchived(submit.operation_id_)
             .has_value();
       },
       std::chrono::seconds(10)));
@@ -1939,7 +1984,7 @@ TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
     for (const auto& value : pending)
       ASSERT_EQ(value->get_result_code(), lavik::meta::MetaRaftResultCode::OK);
   }
-  ASSERT_EQ(machine_->StoresSnapshot().audit_.size(),
+  ASSERT_EQ(machine_->CaptureRecoveryStores().stores_.audit_.size(),
             lavik::meta::kMaxMetaAuditWindowRecords);
   ASSERT_GE(machine_->last_commit_index(),
             before + lavik::meta::kMaxMetaAuditWindowRecords);
@@ -1955,14 +2000,14 @@ TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
   EXPECT_EQ(gated.status().code(), absl::StatusCode::kResourceExhausted);
   EXPECT_NE(gated.status().message().find("audit"), std::string::npos)
       << gated.status();
-  EXPECT_EQ(machine_->StoresSnapshot().audit_.size(),
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.audit_.size(),
             lavik::meta::kMaxMetaAuditWindowRecords);
 
   // A prune owns exclusive audit headroom until Raft resolves it, even when
   // the caller times out first. Without that reservation, a second prune can
   // observe the same full prefix, become a no-op after the first commits, and
   // make its own audit append overflow the fixed window.
-  const auto full = machine_->StoresSnapshot();
+  const auto full = machine_->CaptureRecoveryStores().stores_;
   std::uint64_t first_audit_index = before + 1;
   while (first_audit_index <= machine_->last_commit_index() &&
          !full.audit_.Find(first_audit_index).has_value()) {
@@ -2004,11 +2049,11 @@ TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
   apply_barrier_.Resume();
   ASSERT_TRUE(WaitFor(
       [&] {
-        return machine_->StoresSnapshot().audit_.pruned_floor() >=
-               first_audit_index;
+        return machine_->CaptureRecoveryStores()
+                   .stores_.audit_.pruned_floor() >= first_audit_index;
       },
       std::chrono::seconds(10)));
-  EXPECT_EQ(machine_->StoresSnapshot().audit_.size(),
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.audit_.size(),
             lavik::meta::kMaxMetaAuditWindowRecords);
 }
 
@@ -2058,13 +2103,16 @@ TEST_F(MetaCoordinatorServerTest, ValidateHooksObserveAndRejectBeforeAppend) {
   forbidden.request_id_ = MakeRequestId(0x42);
   forbidden.group_id_ = "forbidden";
   forbidden.new_topology_epoch_ = 1;
-  const std::size_t audit_before = machine_->StoresSnapshot().audit_.size();
+  const std::size_t audit_before =
+      machine_->CaptureRecoveryStores().stores_.audit_.size();
   auto rejected = ProposeSync(forbidden);
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.status().code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_NE(rejected.status().message().find("forbidden"), std::string::npos);
-  EXPECT_EQ(machine_->StoresSnapshot().audit_.size(), audit_before);
-  EXPECT_FALSE(machine_->StoresSnapshot().topology_.GroupExists("forbidden"));
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.audit_.size(),
+            audit_before);
+  EXPECT_FALSE(machine_->CaptureRecoveryStores().stores_.topology_.GroupExists(
+      "forbidden"));
 
   // Pass-through: both hooks ran in registration order against the same
   // atomic view and the coordinator's observation store.
@@ -2085,7 +2133,8 @@ TEST_F(MetaCoordinatorServerTest, ValidateHooksObserveAndRejectBeforeAppend) {
   ASSERT_EQ(hook_times.size(), 4u);
   EXPECT_EQ(hook_times[0], hook_times[1]);
   EXPECT_EQ(hook_times[2], hook_times[3]);
-  EXPECT_TRUE(machine_->StoresSnapshot().topology_.GroupExists("g1"));
+  EXPECT_TRUE(
+      machine_->CaptureRecoveryStores().stores_.topology_.GroupExists("g1"));
 }
 
 TEST_F(MetaCoordinatorServerTest,
@@ -2153,24 +2202,24 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeTimeoutIsReconcilable) {
       << timed_out.status();
   // The entry was genuinely in flight: appended to the WAL, never applied.
   EXPECT_GT(server_->DurableIndex(), slot_before_timeout);
-  EXPECT_FALSE(machine_->StoresSnapshot()
-                   .identity_.FindNode(MakeNodeId(0x52))
+  EXPECT_FALSE(machine_->CaptureRecoveryStores()
+                   .stores_.identity_.FindNode(MakeNodeId(0x52))
                    .has_value());
 
   // "May still have committed", realized: after resume, the timed-out command
   // commits and its effect and audit record appear. A caller that treated the
   // timeout as failure and retried a NON-idempotent command would now have
   // double-applied it — the seam's commands are idempotent by design, and the
-  // documented reconciliation is via CommittedView.
+  // documented reconciliation uses a fresh purpose-specific capture.
   apply_barrier_.Resume();
   ASSERT_TRUE(WaitFor(
       [this] {
-        return machine_->StoresSnapshot()
-            .identity_.FindNode(MakeNodeId(0x52))
+        return machine_->CaptureRecoveryStores()
+            .stores_.identity_.FindNode(MakeNodeId(0x52))
             .has_value();
       },
       std::chrono::seconds(10)));
-  EXPECT_EQ(machine_->StoresSnapshot().audit_.size(), 2u);
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.audit_.size(), 2u);
 }
 
 TEST_F(MetaCoordinatorServerTest, UncertainOutcomeDemotionIsReconcilable) {
@@ -2215,8 +2264,8 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeDemotionIsReconcilable) {
   EXPECT_EQ(demoted.status().code(), absl::StatusCode::kCancelled);
   EXPECT_NE(demoted.status().message().find("uncertain"), std::string::npos)
       << demoted.status();
-  EXPECT_FALSE(machine_->StoresSnapshot()
-                   .identity_.FindNode(MakeNodeId(0x54))
+  EXPECT_FALSE(machine_->CaptureRecoveryStores()
+                   .stores_.identity_.FindNode(MakeNodeId(0x54))
                    .has_value());
 
   // The result really is uncertain: this committed command applies after its
@@ -2224,12 +2273,12 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeDemotionIsReconcilable) {
   apply_barrier_.Resume();
   ASSERT_TRUE(WaitFor(
       [this] {
-        return machine_->StoresSnapshot()
-            .identity_.FindNode(MakeNodeId(0x54))
+        return machine_->CaptureRecoveryStores()
+            .stores_.identity_.FindNode(MakeNodeId(0x54))
             .has_value();
       },
       std::chrono::seconds(10)));
-  EXPECT_EQ(machine_->StoresSnapshot().audit_.size(), 2u);
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.audit_.size(), 2u);
 }
 
 TEST_F(MetaCoordinatorServerTest, UncertainOutcomeCancelIsReconcilable) {
@@ -2261,8 +2310,8 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeCancelIsReconcilable) {
   handle.resume();
   ASSERT_TRUE(WaitFor([&] { return server_->DurableIndex() > slot_before; },
                       std::chrono::seconds(10)));
-  EXPECT_FALSE(machine_->StoresSnapshot()
-                   .identity_.FindNode(MakeNodeId(0x53))
+  EXPECT_FALSE(machine_->CaptureRecoveryStores()
+                   .stores_.identity_.FindNode(MakeNodeId(0x53))
                    .has_value());
   ShutdownRaft();
   ASSERT_EQ(signal.wait_for(std::chrono::seconds(15)),
@@ -2281,7 +2330,11 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeCancelIsReconcilable) {
 // the operation already Running proposes nothing.
 class MockReconciler : public lavik::meta::MetaReconciler {
  public:
-  explicit MockReconciler(MetaOperationId op_id) : op_id_(op_id) {}
+  MockReconciler(MetaOperationId op_id,
+                 std::function<lavik::meta::MetaOperationStatusView(
+                     const MetaOperationId&)>
+                     read)
+      : op_id_(op_id), read_(std::move(read)) {}
   ~MockReconciler() override {
     if (thread_.joinable()) thread_.join();
   }
@@ -2340,8 +2393,7 @@ class MockReconciler : public lavik::meta::MetaReconciler {
 
   void ReconcileOnce(MetaLeaderContext& ctx) {
     DoneGuard done_guard{this};
-    auto view = ctx.CommittedView();
-    auto record = view.operation().FindOperation(op_id_);
+    auto record = read_(op_id_).operation_;
     if (!record.has_value()) {
       SubmitOperation submit;
       submit.request_id_ = MakeRequestId(0x71);
@@ -2357,7 +2409,7 @@ class MockReconciler : public lavik::meta::MetaReconciler {
       if (!proposed.ok() || proposed->verdict_ != MetaAuditVerdict::kAccepted) {
         return;
       }
-      record = ctx.CommittedView().operation().FindOperation(op_id_);
+      record = read_(op_id_).operation_;
       if (!record.has_value()) return;
     }
     if (record->lifecycle_ == lavik::meta::MetaOperationLifecycle::kSubmitted) {
@@ -2380,6 +2432,8 @@ class MockReconciler : public lavik::meta::MetaReconciler {
   }
 
   MetaOperationId op_id_;
+  std::function<lavik::meta::MetaOperationStatusView(const MetaOperationId&)>
+      read_;
   mutable std::mutex mu_;
   std::thread thread_;
   int starts_ = 0;
@@ -2393,7 +2447,10 @@ class MockReconciler : public lavik::meta::MetaReconciler {
 TEST_F(MetaCoordinatorServerTest, ReconcilerStartCancelRestartIsIdempotent) {
   StartServer();
   MakeCoordinator();
-  auto reconciler = std::make_shared<MockReconciler>(MakeOperationId(0x81));
+  auto reconciler = std::make_shared<MockReconciler>(
+      MakeOperationId(0x81), [this](const MetaOperationId& id) {
+        return machine_->CaptureOperationStatus(id);
+      });
   coordinator_->RunAsLeader(reconciler);
   WaitLeader();
   ASSERT_TRUE(WaitFor([&] { return reconciler->reconcile_done() >= 1; },
@@ -2422,7 +2479,8 @@ TEST_F(MetaCoordinatorServerTest, ReconcilerStartCancelRestartIsIdempotent) {
                     .has_value();
       },
       std::chrono::seconds(10)));
-  const std::size_t audit_at_cancel = machine_->StoresSnapshot().audit_.size();
+  const std::size_t audit_at_cancel =
+      machine_->CaptureRecoveryStores().stores_.audit_.size();
 
   // Re-arm: the reconciler reconciles from the committed view, finds the
   // operation already Running, and proposes nothing.
@@ -2435,12 +2493,17 @@ TEST_F(MetaCoordinatorServerTest, ReconcilerStartCancelRestartIsIdempotent) {
   EXPECT_EQ(reconciler->starts(), 2);
   EXPECT_EQ(reconciler->submit_attempts(), 1);
   EXPECT_TRUE(reconciler->resumed_at_running());
-  EXPECT_EQ(machine_->StoresSnapshot().audit_.size(), audit_at_cancel);
-  EXPECT_EQ(machine_->StoresSnapshot().operation_.LiveCount(), 1u);
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.audit_.size(),
+            audit_at_cancel);
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.operation_.LiveCount(),
+            1u);
 
   // Registering another reconciler while already leader starts it without a
   // new BecomeLeader edge.
-  auto second = std::make_shared<MockReconciler>(MakeOperationId(0x82));
+  auto second = std::make_shared<MockReconciler>(
+      MakeOperationId(0x82), [this](const MetaOperationId& id) {
+        return machine_->CaptureOperationStatus(id);
+      });
   coordinator_->RunAsLeader(second);
   ASSERT_TRUE(
       WaitFor([&] { return second->starts() == 1; }, std::chrono::seconds(10)));
@@ -2448,7 +2511,10 @@ TEST_F(MetaCoordinatorServerTest, ReconcilerStartCancelRestartIsIdempotent) {
 
 TEST_F(MetaCoordinatorServerTest,
        ReconcilerSurvivesServerRestartWithoutDuplicateSubmit) {
-  auto reconciler = std::make_shared<MockReconciler>(MakeOperationId(0x91));
+  auto reconciler = std::make_shared<MockReconciler>(
+      MakeOperationId(0x91), [this](const MetaOperationId& id) {
+        return machine_->CaptureOperationStatus(id);
+      });
   StartServer();
   MakeCoordinator();
   coordinator_->RunAsLeader(reconciler);
@@ -2456,7 +2522,7 @@ TEST_F(MetaCoordinatorServerTest,
   ASSERT_TRUE(WaitFor([&] { return reconciler->reconcile_done() >= 1; },
                       std::chrono::seconds(15)));
   ASSERT_TRUE(reconciler->reached_running());
-  ASSERT_EQ(machine_->StoresSnapshot().audit_.size(), 2u);
+  ASSERT_EQ(machine_->CaptureRecoveryStores().stores_.audit_.size(), 2u);
   const std::uint64_t committed_before = machine_->last_commit_index();
   StopServer();  // coordinator dtor cancels+joins the reconciler
   EXPECT_EQ(reconciler->cancels(), 1);
@@ -2476,7 +2542,7 @@ TEST_F(MetaCoordinatorServerTest,
   // audit records keyed by the same log indexes (window did not grow).
   EXPECT_EQ(reconciler->submit_attempts(), 1);
   EXPECT_TRUE(reconciler->resumed_at_running());
-  const auto stores = machine_->StoresSnapshot();
+  const auto stores = machine_->CaptureRecoveryStores().stores_;
   EXPECT_EQ(stores.operation_.LiveCount(), 1u);
   EXPECT_EQ(stores.audit_.size(), 2u);
   EXPECT_GE(machine_->last_commit_index(), committed_before);
@@ -2484,10 +2550,10 @@ TEST_F(MetaCoordinatorServerTest,
   // The committed stream is alive on the new leader: a fresh subscription
   // gets the recovered state in its view and the next commit as an event.
   RecordedEvents recorded;
-  MetaSubscriptionStart start =
-      coordinator_->SubscribeCommitted(recorded.Callback());
-  EXPECT_TRUE(
-      start.view_.operation().FindOperation(MakeOperationId(0x91)).has_value());
+  MetaObservationSubscriptionStart start =
+      coordinator_->SubscribeObservationFacts(recorded.Callback());
+  EXPECT_TRUE(machine_->CaptureOperationStatus(MakeOperationId(0x91))
+                  .operation_.has_value());
   EXPECT_LE(start.cursor_, start.view_.applied_index());
   auto proposed = ProposeSync(MakeRegister(0x92));
   ASSERT_TRUE(proposed.ok()) << proposed.status();

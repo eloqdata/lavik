@@ -118,7 +118,7 @@ class MetaSubscriptionCore {
   // the state machine's stores: the sink's high-water mark, seeded from the
   // SM's durable commit watermark at coordinator construction. Snapshot
   // installs advance the stores past it without events — the documented
-  // resync case (coordinator.h, MetaSubscriptionStart).
+  // resync case (coordinator.h, MetaSubscriptionStartFor).
   std::uint64_t high_water_ = 0;
   // Set by the O(1) commit sink and consumed by the dispatch worker. The
   // worker snapshots committed stores only after apply releases the state
@@ -154,113 +154,6 @@ bool MetaCommitSubscription::needs_resync() const {
   std::lock_guard<std::mutex> lock(core_->mu_);
   const auto it = core_->subs_.find(id_);
   return it == core_->subs_.end() || it->second->needs_resync_;
-}
-
-// ---------------------------------------------------------------------------
-// MetaStoresFacts
-// ---------------------------------------------------------------------------
-
-bool MetaStoresFacts::IsActiveNode(std::string_view node_id) const {
-  return stores_.identity_.IsActiveNode(std::string(node_id));
-}
-
-uint64_t MetaStoresFacts::CurrentGroupTerm(std::string_view group_id) const {
-  // Conservative "unknown" per the MetaCommittedFacts contract: 0.
-  return stores_.topology_.CurrentGroupTerm(group_id).value_or(0);
-}
-
-uint64_t MetaStoresFacts::CurrentPopulationManifestRevision(
-    std::string_view group_id) const {
-  const auto group = stores_.topology_.FindGroup(std::string(group_id));
-  return group.has_value() ? group->record_.population_manifest_revision_ : 0;
-}
-
-MetaHash256 MetaStoresFacts::CurrentPopulationManifestDigest(
-    std::string_view group_id) const {
-  const auto group = stores_.topology_.FindGroup(std::string(group_id));
-  return group.has_value() ? group->record_.population_manifest_digest_
-                           : MetaHash256{};
-}
-
-uint64_t MetaStoresFacts::CurrentPartitionReplicationEpoch(
-    std::string_view group_id) const {
-  const auto group = stores_.topology_.FindGroup(std::string(group_id));
-  return group.has_value() ? group->record_.partition_replication_epoch_ : 0;
-}
-
-bool MetaStoresFacts::AssignmentMatches(
-    std::string_view group_id, std::string_view node_id,
-    const MetaAssignmentId& assignment_id) const {
-  const auto group = stores_.topology_.FindGroup(std::string(group_id));
-  return group.has_value() &&
-         std::any_of(group->members_.begin(), group->members_.end(),
-                     [&](const MetaGroupMember& member) {
-                       return member.node_id_ == node_id &&
-                              member.assignment_id_ == assignment_id;
-                     });
-}
-
-bool MetaStoresFacts::IsOwnerAssignment(
-    std::string_view group_id, std::string_view node_id,
-    const MetaAssignmentId& assignment_id) const {
-  const auto group = stores_.topology_.FindGroup(std::string(group_id));
-  return group.has_value() && group->record_.owner_ == node_id &&
-         std::any_of(group->members_.begin(), group->members_.end(),
-                     [&](const MetaGroupMember& member) {
-                       return member.node_id_ == node_id &&
-                              member.assignment_id_ == assignment_id;
-                     });
-}
-
-bool MetaStoresFacts::MayReportFencedOwnerCandidate(
-    const MetaCandidateProgressObs& candidate) const {
-  const auto group =
-      stores_.topology_.FindGroup(std::string(candidate.group_id_));
-  const auto grant = stores_.topology_.AuthorityFor(candidate.group_id_);
-  if (!group.has_value() || !grant.has_value() ||
-      !group->failover_transition_.has_value() ||
-      group->failover_transition_->mode_ != MetaFailoverMode::kUncontrolled ||
-      group->failover_transition_->target_term_ != group->record_.group_term_ ||
-      candidate.group_term_ != group->record_.group_term_ ||
-      candidate.source_group_term_ ==
-          std::numeric_limits<std::uint64_t>::max() ||
-      candidate.source_group_term_ + 1 != candidate.group_term_ ||
-      group->record_.owner_ != candidate.node_id_ ||
-      grant->group_term_ != group->record_.group_term_ ||
-      grant->grant_.has_value()) {
-    return false;
-  }
-  return std::ranges::any_of(
-      group->members_, [&](const MetaGroupMember& member) {
-        return member.node_id_ == candidate.node_id_ &&
-               member.assignment_id_ == candidate.assignment_id_;
-      });
-}
-
-bool MetaStoresFacts::IsCurrentFailoverCandidate(
-    std::string_view node_id, const MetaBootIncarnation& boot_id) const {
-  return std::ranges::any_of(
-      stores_.topology_.Groups(), [&](const MetaTopologyGroupView& group) {
-        return group.failover_transition_.has_value() &&
-               group.failover_transition_->candidate_action_.has_value() &&
-               group.failover_transition_->candidate_action_->candidate_
-                       .node_id_ == node_id &&
-               group.failover_transition_->candidate_action_->candidate_
-                       .boot_id_ == boot_id;
-      });
-}
-
-std::optional<MetaCommittedFacts::FailoverTransitionView>
-MetaStoresFacts::FailoverTransitionById(
-    const MetaFailoverTransitionId& transition_id) const {
-  for (const MetaTopologyGroupView& group : stores_.topology_.Groups()) {
-    if (group.failover_transition_.has_value() &&
-        group.failover_transition_->transition_id_ == transition_id) {
-      return FailoverTransitionView{group.group_id_,
-                                    *group.failover_transition_};
-    }
-  }
-  return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +335,8 @@ std::unique_ptr<MetaCommittedStoresSnapshot> CaptureRecoveryCut(
   // MetaStores embeds the complete slot array. Keep both the optional full
   // state and its construction temporary outside Propose's coroutine frame:
   // ordinary admission must not allocate that recovery-only footprint.
-  return std::make_unique<MetaCommittedStoresSnapshot>(machine.CaptureStores());
+  return std::make_unique<MetaCommittedStoresSnapshot>(
+      machine.CaptureRecoveryStores());
 }
 
 // The WAL/snapshot fail-safe cannot use a variant-name whitelist: most prune
@@ -663,11 +557,11 @@ std::int64_t NowUnixMs() {
 
 absl::Status UncertainOutcome(absl::StatusCode code, const std::string& what) {
   return absl::Status(
-      code,
-      "meta: propose " + what +
-          "; outcome uncertain — the command may still have committed; "
-          "reconcile via CommittedView using the command's idempotency key "
-          "(commands are replay/idempotency-safe by design)");
+      code, "meta: propose " + what +
+                "; outcome uncertain — the command may still have committed; "
+                "reconcile via a purpose-specific capture using the command's "
+                "idempotency key "
+                "(commands are replay/idempotency-safe by design)");
 }
 
 }  // namespace
@@ -924,48 +818,6 @@ absl::Status MetaCoordinator::NotLeaderStatus() const {
                       "meta: not leader; known leader: " + hint);
 }
 
-MetaStores MetaCoordinator::AtomicStoresSnapshot(std::uint64_t& applied_index,
-                                                 std::uint64_t& high_water) {
-  const std::shared_ptr<MetaSubscriptionCore> core = sub_core_;
-  // Two-phase bracketed read, NO core lock held across SM calls (lock order).
-  // Accept when neither watermark moved across the capture:
-  //   - high_water_ (sink, set inside the SM's apply critical section) stable
-  //     => no command commit reflected in the captured stores is newer than
-  //        it;
-  //   - last_commit_index() (set under the state lock with the stores for
-  //     both snapshot installs and command commits) stable => no install
-  //     landed mid-capture.
-  // Together the accepted stores reflect exactly the committed prefix through
-  // li1. Retries are rare: control-plane commit rates are low.
-  for (;;) {
-    std::uint64_t hw1;
-    {
-      std::lock_guard<std::mutex> lock(core->mu_);
-      hw1 = core->high_water_;
-    }
-    const std::uint64_t li1 = state_machine_.last_commit_index();
-    MetaStores stores = state_machine_.StoresSnapshot();
-    const std::uint64_t li2 = state_machine_.last_commit_index();
-    std::uint64_t hw2;
-    {
-      std::lock_guard<std::mutex> lock(core->mu_);
-      hw2 = core->high_water_;
-    }
-    if (hw1 == hw2 && li1 == li2) {
-      applied_index = li1;
-      high_water = hw1;
-      return stores;
-    }
-  }
-}
-
-MetaCommittedView MetaCoordinator::CommittedView() {
-  std::uint64_t applied_index = 0;
-  std::uint64_t high_water = 0;
-  MetaStores stores = AtomicStoresSnapshot(applied_index, high_water);
-  return MetaCommittedView(std::move(stores), applied_index);
-}
-
 MetaDataPublicationView MetaCoordinator::DataPublication() const {
   return state_machine_.CaptureDataPublication();
 }
@@ -1062,17 +914,6 @@ auto MetaCoordinator::SubscribeCaptured(Capture capture,
     }
     // A rejected capture is destroyed only after releasing the core lock.
   }
-}
-
-MetaSubscriptionStart MetaCoordinator::SubscribeCommitted(
-    MetaCommitCallback callback, std::size_t queue_capacity) {
-  return SubscribeCaptured(
-      [this] {
-        auto captured = state_machine_.CaptureStores();
-        return MetaCommittedView(std::move(captured.stores_),
-                                 captured.cursor_.applied_index());
-      },
-      std::move(callback), queue_capacity);
 }
 
 MetaDataPublicationSubscriptionStart MetaCoordinator::SubscribeDataPublication(
@@ -1577,10 +1418,6 @@ bool MetaLeaderContext::IsCurrent() const {
                             static_cast<std::int64_t>(term_));
 }
 
-MetaCommittedView MetaLeaderContext::CommittedView() {
-  return coordinator_->CommittedView();
-}
-
 MetaObservationFactsView MetaLeaderContext::ObservationFacts() const {
   return coordinator_->ObservationFacts();
 }
@@ -1612,11 +1449,6 @@ std::optional<MetaMembershipView> MetaLeaderContext::MembershipView(
 
 std::uint64_t MetaLeaderContext::AppliedIndex() const {
   return coordinator_->AppliedIndex();
-}
-
-MetaSubscriptionStart MetaLeaderContext::SubscribeCommitted(
-    MetaCommitCallback callback, std::size_t queue_capacity) {
-  return coordinator_->SubscribeCommitted(std::move(callback), queue_capacity);
 }
 
 MetaDataPublicationSubscriptionStart

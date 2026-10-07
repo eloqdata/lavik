@@ -277,12 +277,7 @@ absl::StatusOr<std::unique_ptr<MetaStateMachine>> MetaStateMachine::Open(
   return std::unique_ptr<MetaStateMachine>(new MetaStateMachine());
 }
 
-MetaStores MetaStateMachine::StoresSnapshot() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return stores_;
-}
-
-MetaCommittedStoresSnapshot MetaStateMachine::CaptureStores() const {
+MetaCommittedStoresSnapshot MetaStateMachine::CaptureRecoveryStores() const {
   std::lock_guard lock(mutex_);
   return {stores_,
           {last_committed_idx_.load(std::memory_order_relaxed),

@@ -508,8 +508,13 @@ only archive summaries and receipts in operation-id order. Encoding happens
 after releasing the state lock. Legacy audit status reads only counters and
 policy. Cluster-head discovery and the final cluster-status directory bracket
 read the immutable Meta binding directory; the status body still comes from
-its complete compact status cut. Full aggregate reads remain available for
-snapshot/recovery and consumers that have not yet migrated.
+its complete compact status cut. Ordinary readers have no full-aggregate
+capture or subscription entry point. Complete state is retained only by the
+state machine, durable Capture/Install/Deserialize, and the durability
+fail-safe's CaptureRecoveryStores simulation. The latter preserves a complete
+committed cut before testing an allowed recovery command; it is not a fallback
+for an ordinary proposal or query. Test fixtures can capture complete state
+to compare independent read models and construct recovery images.
 
 Failover discovery retains only active failover operations and Group transition
 ownership, with operations ordered by submission sequence and transitions by
@@ -529,7 +534,7 @@ installation, overflow/resubscription and configuration-only applied advances
 visible without retaining full stores. Capture sorting, intent/hash checks,
 Policy decoding and observation-facts indexing run outside the state lock.
 
-Committed subscribers atomically receive an initial full or purpose-specific
+Committed subscribers atomically receive an initial purpose-specific
 view, its command-event cursor, and a bounded ordered subscription. Consumers
 that only need notifications capture the applied and state-change indices
 without store data. Replay can redeliver an index, so consumers deduplicate
@@ -553,8 +558,9 @@ Leader event can restart anything. Promotion still waits for Raft to catch
 the state machine up.
 
 `MetaFailoverReconciler` is a leader-scoped, level-triggered driver. It starts
-from the complete committed view on every eligible leadership epoch, consumes
-committed updates, and periodically re-evaluates observation TTLs. It overlaps
+from owned discovery and per-Group planning cuts on every eligible leadership
+epoch, consumes committed updates, and periodically re-evaluates observation
+TTLs. It overlaps
 at most four local proposal waits for distinct Groups, with one unresolved
 local proposal per Group. Each planner pass derives one existing typed command
 and skips occupied Groups before allocating action identities. Proposal

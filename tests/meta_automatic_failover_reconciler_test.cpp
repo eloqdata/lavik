@@ -48,6 +48,7 @@
 #include "lavik/meta/proposal_executor.h"
 #include "lavik/meta/state_machine.h"
 #include "support/meta_raft.h"
+#include "support/meta_stores.h"
 #include "support/test_data_path.h"
 
 namespace lavik::meta {
@@ -348,7 +349,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     CreateGroup group;
     group.group_id_ = name;
     group.new_topology_epoch_ =
-        machine_->StoresSnapshot().topology_.TopologyEpoch() + 1;
+        machine_->CaptureRecoveryStores().stores_.topology_.TopologyEpoch() + 1;
     ProposeAccepted(group);
     AssignNodeToGroup assign;
     assign.group_id_ = name;
@@ -446,7 +447,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
   }
 
   absl::Status PublishOwnerHeartbeat(
-      const MetaCommittedView& view, const SeedState& seed,
+      const FullStoresTestView& view, const SeedState& seed,
       MetaNodeHealthObs health, bool causally_confirm_lease,
       std::int64_t observed_at_unix_ms, std::uint64_t observed_at_steady_ms,
       std::uint32_t effective_lease_duration_ms = 5'000) {
@@ -456,7 +457,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
         seed.owner_);
     if (!projected.ok()) return projected.status();
     return PublishOwnerHeartbeat(
-        std::move(*projected), MetaStoresFacts(view.stores()),
+        std::move(*projected), StoredFactsTestAdapter(view.stores()),
         view.applied_index(), seed, std::move(health), causally_confirm_lease,
         observed_at_unix_ms, observed_at_steady_ms,
         effective_lease_duration_ms);
@@ -539,7 +540,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
   }
 
   absl::Status ContinueOwnerHeartbeat(
-      const MetaCommittedView& view, const SeedState& seed,
+      const FullStoresTestView& view, const SeedState& seed,
       std::uint64_t heartbeat_sequence,
       std::optional<std::uint64_t> confirmed_ack_sequence,
       std::uint32_t effective_lease_duration_ms,
@@ -578,7 +579,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
             projected->full_state.authority_lease_duration_ms,
     };
     const MetaObservationIdentity identity{seed.owner_, Bytes<20>(0x11), 1};
-    const MetaStoresFacts facts(view.stores());
+    const StoredFactsTestAdapter facts(view.stores());
     auto result = observations_.ReplaceHeartbeat(
         identity,
         MetaNodeHealthObs{.storage_ready_ = storage_ready,
@@ -596,7 +597,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     return absl::OkStatus();
   }
 
-  absl::Status PublishOwnerFds(const MetaCommittedView& view,
+  absl::Status PublishOwnerFds(const FullStoresTestView& view,
                                const SeedState& seed,
                                std::uint32_t effective_lease_duration_ms) {
     auto projected = MetaControlProjector::ProjectNode(
@@ -783,7 +784,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   EXPECT_EQ(attempts.load(), 4);
   ReleaseProposalExecutor();
   ASSERT_TRUE(WaitUntil([&] {
-    const auto stores = machine_->StoresSnapshot();
+    const auto stores = machine_->CaptureRecoveryStores().stores_;
     for (const auto& group : stores.topology_.Groups())
       if (!group.failover_transition_) return false;
     return true;
@@ -861,14 +862,14 @@ TEST_F(MetaAutomaticFailoverReconcilerTimeoutTest,
   EXPECT_EQ(ids.load(), 8);  // two ids per Group, none minted for retries
   ReleaseProposalExecutor();
   ASSERT_TRUE(WaitUntil([&] {
-    const auto stores = machine_->StoresSnapshot();
+    const auto stores = machine_->CaptureRecoveryStores().stores_;
     return std::ranges::all_of(stores.topology_.Groups(),
                                [](const auto& group) {
                                  return group.failover_transition_.has_value();
                                });
   }));
   reconciler_->Shutdown();
-  const auto stores = machine_->StoresSnapshot();
+  const auto stores = machine_->CaptureRecoveryStores().stores_;
   for (unsigned index = 1; index <= 4; ++index) {
     const auto group = stores.topology_.FindGroup("g" + std::to_string(index));
     ASSERT_TRUE(group && group->failover_transition_);
@@ -929,7 +930,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   // requests without keeping old window slots.
   StartEligibleTerm(/*reelect=*/true);
   ASSERT_TRUE(WaitUntil([&] {
-    const auto stores = machine_->StoresSnapshot();
+    const auto stores = machine_->CaptureRecoveryStores().stores_;
     for (unsigned index = 1; index <= 6; ++index) {
       const auto operation = stores.operation_.FindOperation(
           Bytes<16>(static_cast<std::uint8_t>(0x40 + index)));
@@ -975,7 +976,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
        CommitBetweenDetectionAndTriggerPreservesDebounceAndDefersIds) {
   const auto seed = SeedCluster();
   const auto before = machine_->last_commit_index();
-  auto replacement = machine_->StoresSnapshot();
+  auto replacement = machine_->CaptureRecoveryStores().stores_;
   SubmitOperation submitted;
   submitted.operation_id_ = seed.controlled_operation_id_;
   submitted.kind_ = kFailoverOperationKind;
@@ -1064,7 +1065,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   ASSERT_TRUE(WaitUntil([&] {
     return diagnostics_->Snapshot().evaluated_applied_index_ == before + 1;
   }));
-  auto stores = machine_->StoresSnapshot();
+  auto stores = machine_->CaptureRecoveryStores().stores_;
   PutPolicy policy;
   policy.policy_id_ = kAutomaticUncontrolledFailoverPolicyId;
   policy.version_ = 2;
@@ -1131,7 +1132,8 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 
   now_steady_ms_.store(21'100, std::memory_order_release);
   ASSERT_TRUE(WaitUntil([&] {
-    const auto group = machine_->StoresSnapshot().topology_.FindGroup("g1");
+    const auto group =
+        machine_->CaptureRecoveryStores().stores_.topology_.FindGroup("g1");
     return group.has_value() && group->failover_transition_.has_value();
   }));
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 2);
@@ -1167,15 +1169,16 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   ASSERT_TRUE(WaitUntil(
       [&] {
         const auto snapshot = diagnostics_->Snapshot();
-        const auto group = machine_->StoresSnapshot().topology_.FindGroup("g1");
+        const auto group =
+            machine_->CaptureRecoveryStores().stores_.topology_.FindGroup("g1");
         return (snapshot.statuses_.size() == 1 &&
                 snapshot.statuses_[0].blocker_ ==
                     MetaAutomaticFailoverBlocker::kLeadershipWarmup) ||
                (group.has_value() && group->failover_transition_.has_value());
       },
       1s));
-  EXPECT_FALSE(machine_->StoresSnapshot()
-                   .topology_.FindGroup("g1")
+  EXPECT_FALSE(machine_->CaptureRecoveryStores()
+                   .stores_.topology_.FindGroup("g1")
                    ->failover_transition_.has_value());
   const auto recovered_diagnostics = diagnostics_->Snapshot();
   ASSERT_EQ(recovered_diagnostics.statuses_.size(), 1u);
@@ -1200,7 +1203,8 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 
   now_steady_ms_.store(12'200, std::memory_order_release);
   ASSERT_TRUE(WaitUntil([&] {
-    const auto group = machine_->StoresSnapshot().topology_.FindGroup("g1");
+    const auto group =
+        machine_->CaptureRecoveryStores().stores_.topology_.FindGroup("g1");
     return group.has_value() && group->failover_transition_.has_value();
   }));
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 2);
@@ -1244,8 +1248,8 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
            snapshot.statuses_[0].accumulated_suspect_ms_ == 0;
   }));
   EXPECT_EQ(machine_->last_commit_index(), before);
-  EXPECT_FALSE(machine_->StoresSnapshot()
-                   .topology_.FindGroup("g1")
+  EXPECT_FALSE(machine_->CaptureRecoveryStores()
+                   .stores_.topology_.FindGroup("g1")
                    ->failover_transition_.has_value());
 }
 
@@ -1300,8 +1304,8 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   }));
 
   EXPECT_EQ(machine_->last_commit_index(), before);
-  EXPECT_FALSE(machine_->StoresSnapshot()
-                   .topology_.FindGroup("g1")
+  EXPECT_FALSE(machine_->CaptureRecoveryStores()
+                   .stores_.topology_.FindGroup("g1")
                    ->failover_transition_.has_value());
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 2);
 }
@@ -1357,13 +1361,15 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   ASSERT_TRUE(injection.get().ok());
   ASSERT_TRUE(WaitUntil(
       [&] {
-        const auto group = machine_->StoresSnapshot().topology_.FindGroup("g1");
+        const auto group =
+            machine_->CaptureRecoveryStores().stores_.topology_.FindGroup("g1");
         return group.has_value() && group->failover_transition_.has_value();
       },
       1s))
       << "changing between exact failure reasons must not restart debounce";
 
-  const auto group = machine_->StoresSnapshot().topology_.FindGroup("g1");
+  const auto group =
+      machine_->CaptureRecoveryStores().stores_.topology_.FindGroup("g1");
   ASSERT_TRUE(group.has_value());
   ASSERT_TRUE(group->failover_transition_.has_value());
   EXPECT_EQ(group->failover_transition_->transition_id_, Bytes<16>(0x89));
@@ -1420,24 +1426,25 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   longer_threshold.content_ =
       R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":10000})";
   ProposeAccepted(longer_threshold);
-  ASSERT_TRUE(
-      PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                            MetaNodeHealthObs{.storage_ready_ = true,
-                                              .population_ready_ = true,
-                                              .draining_ = false,
-                                              .active_groups_ = 1},
-                            /*causally_confirm_lease=*/true,
-                            now_unix_ms_.load(std::memory_order_acquire),
-                            now_steady_ms_.load(std::memory_order_acquire))
-          .ok());
+  ASSERT_TRUE(PublishOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  MetaNodeHealthObs{.storage_ready_ = true,
+                                    .population_ready_ = true,
+                                    .draining_ = false,
+                                    .active_groups_ = 1},
+                  /*causally_confirm_lease=*/true,
+                  now_unix_ms_.load(std::memory_order_acquire),
+                  now_steady_ms_.load(std::memory_order_acquire))
+                  .ok());
 
   now_steady_ms_.store(11'100, std::memory_order_release);
   ASSERT_TRUE(WaitUntil([&] {
-    const auto group = machine_->StoresSnapshot().topology_.FindGroup("g1");
+    const auto group =
+        machine_->CaptureRecoveryStores().stores_.topology_.FindGroup("g1");
     return group.has_value() && group->failover_transition_.has_value();
   }));
 
-  const MetaStores stores = machine_->StoresSnapshot();
+  const MetaStores stores = machine_->CaptureRecoveryStores().stores_;
   const auto group = stores.topology_.FindGroup("g1");
   ASSERT_TRUE(group.has_value());
   ASSERT_TRUE(group->failover_transition_.has_value());
@@ -1481,11 +1488,12 @@ TEST_F(MetaAutomaticFailoverReconcilerTimeoutTest,
   ASSERT_TRUE(
       WaitUntil([&] { return machine_->last_commit_index() >= before + 1; }));
   ASSERT_TRUE(WaitUntil([&] {
-    const auto group = machine_->StoresSnapshot().topology_.FindGroup("g1");
+    const auto group =
+        machine_->CaptureRecoveryStores().stores_.topology_.FindGroup("g1");
     return group.has_value() && group->failover_transition_.has_value();
   }));
-  const auto transition = machine_->StoresSnapshot()
-                              .topology_.FindGroup("g1")
+  const auto transition = machine_->CaptureRecoveryStores()
+                              .stores_.topology_.FindGroup("g1")
                               ->failover_transition_;
   ASSERT_TRUE(transition.has_value());
   EXPECT_EQ(transition->transition_id_, Bytes<16>(0x91));
@@ -1508,10 +1516,11 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   now_steady_ms_.store(11'000, std::memory_order_release);
 
   ASSERT_TRUE(WaitUntil([&] {
-    const auto group = machine_->StoresSnapshot().topology_.FindGroup("g1");
+    const auto group =
+        machine_->CaptureRecoveryStores().stores_.topology_.FindGroup("g1");
     return group.has_value() && group->failover_transition_.has_value();
   }));
-  const MetaStores stores = machine_->StoresSnapshot();
+  const MetaStores stores = machine_->CaptureRecoveryStores().stores_;
   const auto group = stores.topology_.FindGroup("g1");
   ASSERT_TRUE(group.has_value());
   ASSERT_TRUE(group->failover_transition_.has_value());
@@ -1532,15 +1541,16 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids));
   StartEligibleTerm();
-  ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                    MetaNodeHealthObs{.storage_ready_ = true,
-                                                      .population_ready_ = true,
-                                                      .draining_ = false,
-                                                      .active_groups_ = 1},
-                                    /*causally_confirm_lease=*/false,
-                                    /*observed_at_unix_ms=*/1'000'000,
-                                    /*observed_at_steady_ms=*/10'000,
-                                    /*effective_lease_duration_ms=*/250)
+  ASSERT_TRUE(PublishOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  MetaNodeHealthObs{.storage_ready_ = true,
+                                    .population_ready_ = true,
+                                    .draining_ = false,
+                                    .active_groups_ = 1},
+                  /*causally_confirm_lease=*/false,
+                  /*observed_at_unix_ms=*/1'000'000,
+                  /*observed_at_steady_ms=*/10'000,
+                  /*effective_lease_duration_ms=*/250)
                   .ok());
 
   ASSERT_TRUE(WaitForLeadershipWarmup());
@@ -1552,12 +1562,13 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 
   now_unix_ms_.store(1'000'250, std::memory_order_release);
   now_steady_ms_.store(10'250, std::memory_order_release);
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed, 2,
-                                     std::nullopt, 250,
-                                     /*observed_at_unix_ms=*/1'000'250,
-                                     /*observed_at_steady_ms=*/10'250,
-                                     /*draining=*/true)
-                  .ok());
+  ASSERT_TRUE(
+      ContinueOwnerHeartbeat(lavik::meta::CaptureFullViewForTest(*machine_),
+                             seed, 2, std::nullopt, 250,
+                             /*observed_at_unix_ms=*/1'000'250,
+                             /*observed_at_steady_ms=*/10'250,
+                             /*draining=*/true)
+          .ok());
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.current_reason_ == MetaOwnerServiceabilityReason::kDraining;
@@ -1565,11 +1576,12 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 
   now_unix_ms_.store(1'000'251, std::memory_order_release);
   now_steady_ms_.store(10'251, std::memory_order_release);
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed, 3,
-                                     std::nullopt, 250,
-                                     /*observed_at_unix_ms=*/1'000'251,
-                                     /*observed_at_steady_ms=*/10'251)
-                  .ok());
+  ASSERT_TRUE(
+      ContinueOwnerHeartbeat(lavik::meta::CaptureFullViewForTest(*machine_),
+                             seed, 3, std::nullopt, 250,
+                             /*observed_at_unix_ms=*/1'000'251,
+                             /*observed_at_steady_ms=*/10'251)
+          .ok());
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.current_reason_ ==
@@ -1584,15 +1596,16 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   InstallReconciler(CountingIds(generated_ids), /*grace_ms=*/100,
                     /*observation_ttl_ms=*/30'000);
   StartEligibleTerm();
-  ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                    MetaNodeHealthObs{.storage_ready_ = true,
-                                                      .population_ready_ = true,
-                                                      .draining_ = false,
-                                                      .active_groups_ = 1},
-                                    /*causally_confirm_lease=*/true,
-                                    /*observed_at_unix_ms=*/1'000'000,
-                                    /*observed_at_steady_ms=*/10'000,
-                                    /*effective_lease_duration_ms=*/5'000)
+  ASSERT_TRUE(PublishOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  MetaNodeHealthObs{.storage_ready_ = true,
+                                    .population_ready_ = true,
+                                    .draining_ = false,
+                                    .active_groups_ = 1},
+                  /*causally_confirm_lease=*/true,
+                  /*observed_at_unix_ms=*/1'000'000,
+                  /*observed_at_steady_ms=*/10'000,
+                  /*effective_lease_duration_ms=*/5'000)
                   .ok());
 
   ASSERT_TRUE(WaitForLeadershipWarmup());
@@ -1611,7 +1624,8 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   lease.version_ = 2;
   lease.content_ = R"({"kind":"authority-lease-v1","duration_ms":250})";
   ProposeAccepted(lease);
-  const MetaCommittedView advanced = coordinator_->CommittedView();
+  const FullStoresTestView advanced =
+      lavik::meta::CaptureFullViewForTest(*machine_);
   auto projected = MetaControlProjector::ProjectNode(
       MetaDataPublicationView::FromStores(
           advanced.stores(),
@@ -1658,14 +1672,14 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.accumulated_suspect_ms_ == 999;
   }));
-  EXPECT_FALSE(machine_->StoresSnapshot()
-                   .topology_.FindGroup("g1")
+  EXPECT_FALSE(machine_->CaptureRecoveryStores()
+                   .stores_.topology_.FindGroup("g1")
                    ->failover_transition_.has_value());
 
   now_steady_ms_.store(16'001, std::memory_order_release);
   ASSERT_TRUE(WaitUntil([&] {
-    return machine_->StoresSnapshot()
-        .topology_.FindGroup("g1")
+    return machine_->CaptureRecoveryStores()
+        .stores_.topology_.FindGroup("g1")
         ->failover_transition_.has_value();
   }));
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 2);
@@ -1682,24 +1696,26 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   ProposeAccepted(lease);
 
   StartEligibleTerm();
-  ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                    MetaNodeHealthObs{.storage_ready_ = true,
-                                                      .population_ready_ = true,
-                                                      .draining_ = false,
-                                                      .active_groups_ = 1},
-                                    /*causally_confirm_lease=*/false,
-                                    /*observed_at_unix_ms=*/1'000'000,
-                                    /*observed_at_steady_ms=*/10'000,
-                                    /*effective_lease_duration_ms=*/6'000)
+  ASSERT_TRUE(PublishOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  MetaNodeHealthObs{.storage_ready_ = true,
+                                    .population_ready_ = true,
+                                    .draining_ = false,
+                                    .active_groups_ = 1},
+                  /*causally_confirm_lease=*/false,
+                  /*observed_at_unix_ms=*/1'000'000,
+                  /*observed_at_steady_ms=*/10'000,
+                  /*effective_lease_duration_ms=*/6'000)
                   .ok());
   for (std::uint64_t sequence = 2; sequence <= 7; ++sequence) {
     const std::uint64_t elapsed_ms = (sequence - 1) * 2'000;
-    ASSERT_TRUE(ContinueOwnerHeartbeat(
-                    coordinator_->CommittedView(), seed, sequence, std::nullopt,
-                    /*effective_lease_duration_ms=*/6'000,
-                    /*observed_at_unix_ms=*/1'000'000 + elapsed_ms,
-                    /*observed_at_steady_ms=*/10'000 + elapsed_ms)
-                    .ok());
+    ASSERT_TRUE(
+        ContinueOwnerHeartbeat(lavik::meta::CaptureFullViewForTest(*machine_),
+                               seed, sequence, std::nullopt,
+                               /*effective_lease_duration_ms=*/6'000,
+                               /*observed_at_unix_ms=*/1'000'000 + elapsed_ms,
+                               /*observed_at_steady_ms=*/10'000 + elapsed_ms)
+            .ok());
   }
 
   const auto runtime = data_runtime_->Snapshot();
@@ -1734,15 +1750,17 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   replacement_lease.content_ =
       R"({"kind":"authority-lease-v1","duration_ms":250})";
   ProposeAccepted(replacement_lease);
-  ASSERT_TRUE(
-      PublishOwnerFds(coordinator_->CommittedView(), seed, /*D=*/250).ok());
+  ASSERT_TRUE(PublishOwnerFds(lavik::meta::CaptureFullViewForTest(*machine_),
+                              seed, /*D=*/250)
+                  .ok());
   now_unix_ms_.store(1'012'100, std::memory_order_release);
   now_steady_ms_.store(22'100, std::memory_order_release);
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                     /*heartbeat_sequence=*/8, std::nullopt,
-                                     /*effective_lease_duration_ms=*/250,
-                                     /*observed_at_unix_ms=*/1'012'100,
-                                     /*observed_at_steady_ms=*/22'100)
+  ASSERT_TRUE(ContinueOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  /*heartbeat_sequence=*/8, std::nullopt,
+                  /*effective_lease_duration_ms=*/250,
+                  /*observed_at_unix_ms=*/1'012'100,
+                  /*observed_at_steady_ms=*/22'100)
                   .ok());
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.blocker_ == MetaAutomaticFailoverBlocker::kAuthorityHandoff;
@@ -1782,8 +1800,8 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   now_steady_ms_.store(22'200, std::memory_order_release);
   EXPECT_FALSE(WaitUntil(
       [&] {
-        return machine_->StoresSnapshot()
-            .topology_.FindGroup("g1")
+        return machine_->CaptureRecoveryStores()
+            .stores_.topology_.FindGroup("g1")
             ->failover_transition_.has_value();
       },
       100ms));
@@ -1791,12 +1809,13 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 
   now_unix_ms_.store(1'012'300, std::memory_order_release);
   now_steady_ms_.store(22'300, std::memory_order_release);
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                     /*heartbeat_sequence=*/9,
-                                     /*confirmed_ack_sequence=*/8,
-                                     /*effective_lease_duration_ms=*/250,
-                                     /*observed_at_unix_ms=*/1'012'300,
-                                     /*observed_at_steady_ms=*/22'300)
+  ASSERT_TRUE(ContinueOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  /*heartbeat_sequence=*/9,
+                  /*confirmed_ack_sequence=*/8,
+                  /*effective_lease_duration_ms=*/250,
+                  /*observed_at_unix_ms=*/1'012'300,
+                  /*observed_at_steady_ms=*/22'300)
                   .ok());
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kHealthy;
@@ -1808,21 +1827,23 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
        NewerHandoffMarkerOutranksStaleRuntimeDecisionButDoesNotLatch) {
   const SeedState seed = SeedCluster();
   StartEligibleTerm();
-  ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                    MetaNodeHealthObs{.storage_ready_ = true,
-                                                      .population_ready_ = true,
-                                                      .draining_ = false,
-                                                      .active_groups_ = 1},
-                                    /*causally_confirm_lease=*/false,
-                                    /*observed_at_unix_ms=*/1'000'000,
-                                    /*observed_at_steady_ms=*/10'000,
-                                    /*effective_lease_duration_ms=*/5'000)
+  ASSERT_TRUE(PublishOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  MetaNodeHealthObs{.storage_ready_ = true,
+                                    .population_ready_ = true,
+                                    .draining_ = false,
+                                    .active_groups_ = 1},
+                  /*causally_confirm_lease=*/false,
+                  /*observed_at_unix_ms=*/1'000'000,
+                  /*observed_at_steady_ms=*/10'000,
+                  /*effective_lease_duration_ms=*/5'000)
                   .ok());
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                     /*heartbeat_sequence=*/2, std::nullopt,
-                                     /*effective_lease_duration_ms=*/5'000,
-                                     /*observed_at_unix_ms=*/1'000'010,
-                                     /*observed_at_steady_ms=*/10'010)
+  ASSERT_TRUE(ContinueOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  /*heartbeat_sequence=*/2, std::nullopt,
+                  /*effective_lease_duration_ms=*/5'000,
+                  /*observed_at_unix_ms=*/1'000'010,
+                  /*observed_at_steady_ms=*/10'010)
                   .ok());
 
   const cluster::control::LeaseDenied node_not_ready{
@@ -1850,13 +1871,14 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   })) << "a decision for heartbeat N-1 cannot supersede the pre-send marker "
          "for heartbeat N";
 
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                     /*heartbeat_sequence=*/3, std::nullopt,
-                                     /*effective_lease_duration_ms=*/5'000,
-                                     /*observed_at_unix_ms=*/1'000'020,
-                                     /*observed_at_steady_ms=*/10'020,
-                                     /*draining=*/false,
-                                     /*storage_ready=*/false)
+  ASSERT_TRUE(ContinueOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  /*heartbeat_sequence=*/3, std::nullopt,
+                  /*effective_lease_duration_ms=*/5'000,
+                  /*observed_at_unix_ms=*/1'000'020,
+                  /*observed_at_steady_ms=*/10'020,
+                  /*draining=*/false,
+                  /*storage_ready=*/false)
                   .ok());
   ASSERT_TRUE(RecordOwnerLeaseDecision(seed, 3, node_not_ready).ok());
   ASSERT_TRUE(RecordOwnerLeaseDecisionWritten(seed, 3, node_not_ready).ok());
@@ -1885,21 +1907,23 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   ProposeAccepted(lease);
 
   StartEligibleTerm();
-  ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                    MetaNodeHealthObs{.storage_ready_ = true,
-                                                      .population_ready_ = true,
-                                                      .draining_ = false,
-                                                      .active_groups_ = 1},
-                                    /*causally_confirm_lease=*/false,
-                                    /*observed_at_unix_ms=*/1'000'000,
-                                    /*observed_at_steady_ms=*/10'000,
-                                    /*effective_lease_duration_ms=*/6'000)
+  ASSERT_TRUE(PublishOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  MetaNodeHealthObs{.storage_ready_ = true,
+                                    .population_ready_ = true,
+                                    .draining_ = false,
+                                    .active_groups_ = 1},
+                  /*causally_confirm_lease=*/false,
+                  /*observed_at_unix_ms=*/1'000'000,
+                  /*observed_at_steady_ms=*/10'000,
+                  /*effective_lease_duration_ms=*/6'000)
                   .ok());
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                     /*heartbeat_sequence=*/7, std::nullopt,
-                                     /*effective_lease_duration_ms=*/6'000,
-                                     /*observed_at_unix_ms=*/1'012'000,
-                                     /*observed_at_steady_ms=*/22'000)
+  ASSERT_TRUE(ContinueOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  /*heartbeat_sequence=*/7, std::nullopt,
+                  /*effective_lease_duration_ms=*/6'000,
+                  /*observed_at_unix_ms=*/1'012'000,
+                  /*observed_at_steady_ms=*/22'000)
                   .ok());
 
   const auto runtime = data_runtime_->Snapshot();
@@ -1922,12 +1946,13 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
       /*heartbeat_received_lease_ms=*/1'012'000,
       /*written_unix_ms=*/1'012'000);
 
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                     /*heartbeat_sequence=*/8,
-                                     /*confirmed_ack_sequence=*/7,
-                                     /*effective_lease_duration_ms=*/6'000,
-                                     /*observed_at_unix_ms=*/1'012'100,
-                                     /*observed_at_steady_ms=*/22'100)
+  ASSERT_TRUE(ContinueOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  /*heartbeat_sequence=*/8,
+                  /*confirmed_ack_sequence=*/7,
+                  /*effective_lease_duration_ms=*/6'000,
+                  /*observed_at_unix_ms=*/1'012'100,
+                  /*observed_at_steady_ms=*/22'100)
                   .ok());
 
   PutPolicy replacement_lease;
@@ -1937,13 +1962,15 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   replacement_lease.content_ =
       R"({"kind":"authority-lease-v1","duration_ms":250})";
   ProposeAccepted(replacement_lease);
-  ASSERT_TRUE(
-      PublishOwnerFds(coordinator_->CommittedView(), seed, /*D=*/250).ok());
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                     /*heartbeat_sequence=*/9, std::nullopt,
-                                     /*effective_lease_duration_ms=*/250,
-                                     /*observed_at_unix_ms=*/1'013'000,
-                                     /*observed_at_steady_ms=*/23'000)
+  ASSERT_TRUE(PublishOwnerFds(lavik::meta::CaptureFullViewForTest(*machine_),
+                              seed, /*D=*/250)
+                  .ok());
+  ASSERT_TRUE(ContinueOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  /*heartbeat_sequence=*/9, std::nullopt,
+                  /*effective_lease_duration_ms=*/250,
+                  /*observed_at_unix_ms=*/1'013'000,
+                  /*observed_at_steady_ms=*/23'000)
                   .ok());
 
   std::atomic<int> generated_ids{0};
@@ -1966,13 +1993,13 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   })) << "missing causal progress becomes exact failure only after D";
 
   now_steady_ms_.store(29'000, std::memory_order_release);
-  EXPECT_FALSE(machine_->StoresSnapshot()
-                   .topology_.FindGroup("g1")
+  EXPECT_FALSE(machine_->CaptureRecoveryStores()
+                   .stores_.topology_.FindGroup("g1")
                    ->failover_transition_.has_value());
   now_steady_ms_.store(29'001, std::memory_order_release);
   ASSERT_TRUE(WaitUntil([&] {
-    return machine_->StoresSnapshot()
-        .topology_.FindGroup("g1")
+    return machine_->CaptureRecoveryStores()
+        .stores_.topology_.FindGroup("g1")
         ->failover_transition_.has_value();
   }));
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 2);
@@ -1984,15 +2011,16 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids));
   StartEligibleTerm();
-  ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                    MetaNodeHealthObs{.storage_ready_ = true,
-                                                      .population_ready_ = true,
-                                                      .draining_ = false,
-                                                      .active_groups_ = 1},
-                                    /*causally_confirm_lease=*/true,
-                                    /*observed_at_unix_ms=*/1'000'000,
-                                    /*observed_at_steady_ms=*/10'000,
-                                    /*effective_lease_duration_ms=*/250)
+  ASSERT_TRUE(PublishOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  MetaNodeHealthObs{.storage_ready_ = true,
+                                    .population_ready_ = true,
+                                    .draining_ = false,
+                                    .active_groups_ = 1},
+                  /*causally_confirm_lease=*/true,
+                  /*observed_at_unix_ms=*/1'000'000,
+                  /*observed_at_steady_ms=*/10'000,
+                  /*effective_lease_duration_ms=*/250)
                   .ok());
   ASSERT_TRUE(WaitForLeadershipWarmup());
   now_steady_ms_.store(10'100, std::memory_order_release);
@@ -2002,11 +2030,12 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 
   now_unix_ms_.store(1'000'250, std::memory_order_release);
   now_steady_ms_.store(10'250, std::memory_order_release);
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed, 3,
-                                     /*confirmed_ack_sequence=*/1, 250,
-                                     /*observed_at_unix_ms=*/1'000'250,
-                                     /*observed_at_steady_ms=*/10'250,
-                                     /*draining=*/true)
+  ASSERT_TRUE(ContinueOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed, 3,
+                  /*confirmed_ack_sequence=*/1, 250,
+                  /*observed_at_unix_ms=*/1'000'250,
+                  /*observed_at_steady_ms=*/10'250,
+                  /*draining=*/true)
                   .ok());
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
@@ -2015,10 +2044,11 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 
   now_unix_ms_.store(1'000'251, std::memory_order_release);
   now_steady_ms_.store(10'251, std::memory_order_release);
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed, 4,
-                                     /*confirmed_ack_sequence=*/1, 250,
-                                     /*observed_at_unix_ms=*/1'000'251,
-                                     /*observed_at_steady_ms=*/10'251)
+  ASSERT_TRUE(ContinueOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed, 4,
+                  /*confirmed_ack_sequence=*/1, 250,
+                  /*observed_at_unix_ms=*/1'000'251,
+                  /*observed_at_steady_ms=*/10'251)
                   .ok());
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
@@ -2033,15 +2063,16 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   std::atomic<int> generated_ids{0};
   InstallReconciler(CountingIds(generated_ids));
   StartEligibleTerm();
-  ASSERT_TRUE(PublishOwnerHeartbeat(coordinator_->CommittedView(), seed,
-                                    MetaNodeHealthObs{.storage_ready_ = true,
-                                                      .population_ready_ = true,
-                                                      .draining_ = false,
-                                                      .active_groups_ = 1},
-                                    /*causally_confirm_lease=*/true,
-                                    /*observed_at_unix_ms=*/1'000'000,
-                                    /*observed_at_steady_ms=*/10'000,
-                                    /*effective_lease_duration_ms=*/250)
+  ASSERT_TRUE(PublishOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed,
+                  MetaNodeHealthObs{.storage_ready_ = true,
+                                    .population_ready_ = true,
+                                    .draining_ = false,
+                                    .active_groups_ = 1},
+                  /*causally_confirm_lease=*/true,
+                  /*observed_at_unix_ms=*/1'000'000,
+                  /*observed_at_steady_ms=*/10'000,
+                  /*effective_lease_duration_ms=*/250)
                   .ok());
 
   ASSERT_TRUE(WaitForLeadershipWarmup());
@@ -2058,10 +2089,11 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   // lease received in this interval must not inherit the lower wall timestamp:
   // correcting the wall clock does not mean the lease aged by the size of the
   // correction.
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed, 3,
-                                     /*confirmed_ack_sequence=*/2, 250,
-                                     /*observed_at_unix_ms=*/999'000,
-                                     /*observed_at_steady_ms=*/10'100)
+  ASSERT_TRUE(ContinueOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed, 3,
+                  /*confirmed_ack_sequence=*/2, 250,
+                  /*observed_at_unix_ms=*/999'000,
+                  /*observed_at_steady_ms=*/10'100)
                   .ok());
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kHealthy;
@@ -2078,11 +2110,12 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 
   now_unix_ms_.store(1'000'250, std::memory_order_release);
   now_steady_ms_.store(10'350, std::memory_order_release);
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed, 4,
-                                     /*confirmed_ack_sequence=*/2, 250,
-                                     /*observed_at_unix_ms=*/1'000'250,
-                                     /*observed_at_steady_ms=*/10'350,
-                                     /*draining=*/true)
+  ASSERT_TRUE(ContinueOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed, 4,
+                  /*confirmed_ack_sequence=*/2, 250,
+                  /*observed_at_unix_ms=*/1'000'250,
+                  /*observed_at_steady_ms=*/10'350,
+                  /*draining=*/true)
                   .ok());
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
@@ -2091,10 +2124,11 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
 
   now_unix_ms_.store(1'000'251, std::memory_order_release);
   now_steady_ms_.store(10'351, std::memory_order_release);
-  ASSERT_TRUE(ContinueOwnerHeartbeat(coordinator_->CommittedView(), seed, 5,
-                                     /*confirmed_ack_sequence=*/2, 250,
-                                     /*observed_at_unix_ms=*/1'000'251,
-                                     /*observed_at_steady_ms=*/10'351)
+  ASSERT_TRUE(ContinueOwnerHeartbeat(
+                  lavik::meta::CaptureFullViewForTest(*machine_), seed, 5,
+                  /*confirmed_ack_sequence=*/2, 250,
+                  /*observed_at_unix_ms=*/1'000'251,
+                  /*observed_at_steady_ms=*/10'351)
                   .ok());
   ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&

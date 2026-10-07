@@ -18,6 +18,7 @@
 #include "lavik/meta/failover.h"
 #include "lavik/meta/hash.h"
 #include "lavik/meta/state_machine.h"
+#include "support/meta_stores.h"
 #include "support/test_data_path.h"
 
 namespace {
@@ -361,7 +362,7 @@ void ExpectEqualObservations(const meta::MetaObservationStore& original,
 TEST_F(MetaObservationFactsFixture,
        EveryObservationTypeMatchesOwnedStoresFacts) {
   const auto captured = machine_->CaptureObservationFacts();
-  const meta::MetaStoresFacts original_facts(stores_);
+  const meta::StoredFactsTestAdapter original_facts(stores_);
   for (const auto& observation :
        Observations(Candidate(kControlled), digest_)) {
     SCOPED_TRACE(observation.payload_.index());
@@ -418,7 +419,7 @@ TEST_F(MetaObservationFactsFixture,
   auto view = machine_->CaptureProposal(command);
   auto copied = view;
   auto retained = std::move(copied);
-  const meta::MetaStoresFacts original_facts(stores_);
+  const meta::StoredFactsTestAdapter original_facts(stores_);
   // Query the other Group's observations too, including node-wide lookup.
   for (const auto& observation :
        Observations(Candidate(kControlled), digest_)) {
@@ -481,7 +482,7 @@ TEST_F(MetaObservationFactsFixture,
             kRecovering.TransitionId());
   EXPECT_EQ(detection.FindGroup("absent"), nullptr);
 
-  const meta::MetaStoresFacts original_facts(stores_);
+  const meta::StoredFactsTestAdapter original_facts(stores_);
   // The target is recovering, but the newest valid node-wide report can live
   // exclusively in the controlled Group. Every observation lookup keeps its
   // complete domain and must survive later apply/Install independently.
@@ -687,7 +688,7 @@ TEST_F(MetaObservationFactsFixture,
        {"", "", "", "", "", "", "failover-transition-mismatch"}},
   };
   const auto initial = machine_->CaptureObservationFacts();
-  const meta::MetaStoresFacts original_initial(stores_);
+  const meta::StoredFactsTestAdapter original_initial(stores_);
   const auto observations = Observations(Candidate(kControlled), digest_);
   std::uint64_t index = 100;
   for (const auto& scenario : scenarios) {
@@ -698,7 +699,7 @@ TEST_F(MetaObservationFactsFixture,
     Install(changed, ++index);
     ASSERT_FALSE(HasFatalFailure());
     const auto captured = machine_->CaptureObservationFacts();
-    const meta::MetaStoresFacts original_changed(changed);
+    const meta::StoredFactsTestAdapter original_changed(changed);
     for (std::size_t i = 0; i < observations.size(); ++i) {
       SCOPED_TRACE(i);
       const auto& observation = observations[i];
@@ -739,7 +740,7 @@ TEST_F(MetaObservationFactsFixture,
   }();
   const auto owner_candidate = Candidate(kRecovering, true);
   const auto active_owner_candidate = Candidate(kControlled, true);
-  const meta::MetaStoresFacts original_facts(stores_);
+  const meta::StoredFactsTestAdapter original_facts(stores_);
   EXPECT_TRUE(retained.MayReportFencedOwnerCandidate(owner_candidate));
   EXPECT_TRUE(original_facts.MayReportFencedOwnerCandidate(owner_candidate));
   EXPECT_FALSE(retained.MayReportFencedOwnerCandidate(active_owner_candidate));
@@ -773,7 +774,7 @@ TEST_F(MetaObservationFactsFixture,
   EXPECT_FALSE(retained.IsActiveNode(node.node_id_));
   machine_->Advance(102);
 
-  auto changed = machine_->StoresSnapshot();
+  auto changed = machine_->CaptureRecoveryStores().stores_;
   ClearTransition(changed, kRecovering);
   meta::ActivateAuthority activate;
   activate.group_id_ = kRecovering.id;
@@ -1000,7 +1001,7 @@ TEST(MetaDataPublicationViewTest, ConcurrentCommitAdvanceAndInstallKeepOneCut) {
 // so every global lookup must cover the whole committed set.
 TEST_F(MetaObservationFactsFixture, PublicationFactsMatchAllObservationTypes) {
   const auto captured = machine_->CaptureDataPublication();
-  const meta::MetaStoresFacts original_facts(stores_);
+  const meta::StoredFactsTestAdapter original_facts(stores_);
   for (const auto& observation :
        Observations(Candidate(kControlled), digest_)) {
     SCOPED_TRACE(observation.payload_.index());

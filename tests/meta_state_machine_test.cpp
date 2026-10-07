@@ -297,7 +297,7 @@ TEST_F(MetaStateMachineTest, CommitAppliesRealCommands) {
 
   Commit(*machine, 1, MakeRegister(0x11));
   {
-    const MetaStores stores = machine->StoresSnapshot();
+    const MetaStores stores = machine->CaptureRecoveryStores().stores_;
     const auto node = stores.identity_.FindNode(MakeNodeId(0x11));
     ASSERT_TRUE(node.has_value());
     EXPECT_EQ(node->principal_, MakePrincipal(0x11));
@@ -318,7 +318,7 @@ TEST_F(MetaStateMachineTest, CommitAppliesRealCommands) {
 
   Commit(*machine, 2, MakeCreateGroup("g1", /*new_topology_epoch=*/1));
   {
-    const MetaStores stores = machine->StoresSnapshot();
+    const MetaStores stores = machine->CaptureRecoveryStores().stores_;
     EXPECT_TRUE(stores.topology_.GroupExists("g1"));
     EXPECT_EQ(stores.topology_.TopologyEpoch(), 1u);
     EXPECT_EQ(stores.audit_.size(), 2u);
@@ -353,7 +353,7 @@ TEST_F(MetaStateMachineTest, DomainRejectConsumesIndexWithoutStateChange) {
   conflict.principal_ = MakePrincipal(0x11);
   Commit(*machine, 2, conflict);
 
-  const MetaStores stores = machine->StoresSnapshot();
+  const MetaStores stores = machine->CaptureRecoveryStores().stores_;
   EXPECT_EQ(stores.identity_.NodeCount(), 1u);
   EXPECT_FALSE(stores.identity_.FindNode(MakeNodeId(0x22)).has_value());
   const auto audit = stores.audit_.Find(2);
@@ -405,11 +405,11 @@ TEST_F(MetaStateMachineTest, RestartWithoutSnapshotReplaysFromScratch) {
   std::unique_ptr<MetaStateMachine> machine = std::move(*reopened);
   EXPECT_EQ(machine->last_commit_index(), 0u);
   EXPECT_FALSE(captured_.has_value());
-  EXPECT_EQ(machine->StoresSnapshot().identity_.NodeCount(), 0u);
+  EXPECT_EQ(machine->CaptureRecoveryStores().stores_.identity_.NodeCount(), 0u);
 
   machine->commit(1, *c1);
   machine->commit(2, *c2);
-  const MetaStores stores = machine->StoresSnapshot();
+  const MetaStores stores = machine->CaptureRecoveryStores().stores_;
   EXPECT_EQ(stores.identity_.NodeCount(), 2u);
   EXPECT_EQ(stores.audit_.size(), 2u);
   EXPECT_EQ(machine->last_commit_index(), 2u);
@@ -469,7 +469,7 @@ TEST_F(
     ASSERT_NE(machine.commit(1, *root_bytes), nullptr);
     ASSERT_NE(machine.commit(2, *automatic_bytes), nullptr);
     ASSERT_NE(machine.commit(3, *complete_bytes), nullptr);
-    const MetaStores stores = machine.StoresSnapshot();
+    const MetaStores stores = machine.CaptureRecoveryStores().stores_;
     EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
               lavik::meta::MetaClusterLifecycle::kCreating);
     ASSERT_TRUE(
@@ -521,7 +521,7 @@ TEST_F(MetaStateMachineTest, SnapshotInstallRestoresAllStores) {
   EXPECT_EQ(machine->last_commit_index(), 3u);
   ASSERT_TRUE(captured_.has_value());
   EXPECT_EQ(captured_->index, 3u);
-  const MetaStores stores = machine->StoresSnapshot();
+  const MetaStores stores = machine->CaptureRecoveryStores().stores_;
   EXPECT_EQ(stores.identity_.NodeCount(), 2u);
   EXPECT_TRUE(stores.topology_.GroupExists("g1"));
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 1u);
@@ -645,7 +645,7 @@ TEST_F(MetaStateMachineTest,
   begin.expected_partition_replication_epoch_ = 0;
   Commit(*machine, 11, begin);
 
-  const MetaStores committed = machine->StoresSnapshot();
+  const MetaStores committed = machine->CaptureRecoveryStores().stores_;
   ASSERT_EQ(committed.topology_.ClusterLifecycle().state_,
             lavik::meta::MetaClusterLifecycle::kCreated);
   const auto committed_group = committed.topology_.FindGroup(group_id);
@@ -671,7 +671,7 @@ TEST_F(MetaStateMachineTest,
   machine = std::move(*reopened);
   EXPECT_EQ(machine->last_commit_index(), 11u);
 
-  const MetaStores restored = machine->StoresSnapshot();
+  const MetaStores restored = machine->CaptureRecoveryStores().stores_;
   const auto restored_group = restored.topology_.FindGroup(group_id);
   ASSERT_TRUE(restored_group.has_value());
   ASSERT_TRUE(restored_group->failover_transition_.has_value());
@@ -686,7 +686,7 @@ TEST_F(MetaStateMachineTest,
   // replay must validate the installed post-state instead of advancing the
   // term or transition revision a second time.
   Commit(*machine, 11, begin);
-  const MetaStores replayed = machine->StoresSnapshot();
+  const MetaStores replayed = machine->CaptureRecoveryStores().stores_;
   const auto replayed_group = replayed.topology_.FindGroup(group_id);
   ASSERT_TRUE(replayed_group.has_value());
   ASSERT_TRUE(replayed_group->failover_transition_.has_value());
@@ -773,7 +773,7 @@ TEST_F(MetaStateMachineTest, SnapshotExactCutPoint) {
   EXPECT_EQ(snap_stores->audit_.size(), 2u);
 
   // The live state moved on past the snapshot point.
-  EXPECT_EQ(machine->StoresSnapshot().identity_.NodeCount(), 4u);
+  EXPECT_EQ(machine->CaptureRecoveryStores().stores_.identity_.NodeCount(), 4u);
 }
 
 TEST_F(MetaStateMachineTest, ReplayAfterSnapshotDoesNotGrowAudit) {
@@ -800,7 +800,7 @@ TEST_F(MetaStateMachineTest, ReplayAfterSnapshotDoesNotGrowAudit) {
     CreateSnapshot(*machine, 3, 1);
     machine->commit(4, *c4);
     machine->commit(5, *c5);
-    const MetaStores stores = machine->StoresSnapshot();
+    const MetaStores stores = machine->CaptureRecoveryStores().stores_;
     ASSERT_EQ(stores.audit_.size(), 5u);
     const auto record4 = stores.audit_.Find(4);
     ASSERT_TRUE(record4.has_value());
@@ -813,12 +813,12 @@ TEST_F(MetaStateMachineTest, ReplayAfterSnapshotDoesNotGrowAudit) {
   ASSERT_TRUE(reopened.ok()) << reopened.status();
   std::unique_ptr<MetaStateMachine> machine = std::move(*reopened);
   EXPECT_EQ(machine->last_commit_index(), 3u);
-  EXPECT_EQ(machine->StoresSnapshot().identity_.NodeCount(), 3u);
-  EXPECT_EQ(machine->StoresSnapshot().audit_.size(), 3u);
+  EXPECT_EQ(machine->CaptureRecoveryStores().stores_.identity_.NodeCount(), 3u);
+  EXPECT_EQ(machine->CaptureRecoveryStores().stores_.audit_.size(), 3u);
 
   machine->commit(4, *c4);
   machine->commit(5, *c5);
-  const MetaStores stores = machine->StoresSnapshot();
+  const MetaStores stores = machine->CaptureRecoveryStores().stores_;
   EXPECT_EQ(stores.identity_.NodeCount(), 5u);
   // Uniqueness: replay rewrote the same records; the window did not grow.
   EXPECT_EQ(stores.audit_.size(), 5u);
@@ -839,26 +839,28 @@ TEST_F(MetaStateMachineTest, SnapshotInstallValidatesBeforeReplacingState) {
   auto follower = Open();
   ASSERT_TRUE(follower.ok());
   ASSERT_TRUE((*follower)->Install(3, *image).ok());
-  EXPECT_EQ((*follower)->StoresSnapshot().audit_.Serialize(),
-            (*leader)->StoresSnapshot().audit_.Serialize());
-  EXPECT_EQ((*follower)->StoresSnapshot().identity_.NodeCount(), 2u);
-  EXPECT_TRUE((*follower)->StoresSnapshot().topology_.GroupExists("g1"));
+  EXPECT_EQ((*follower)->CaptureRecoveryStores().stores_.audit_.Serialize(),
+            (*leader)->CaptureRecoveryStores().stores_.audit_.Serialize());
+  EXPECT_EQ((*follower)->CaptureRecoveryStores().stores_.identity_.NodeCount(),
+            2u);
+  EXPECT_TRUE(
+      (*follower)->CaptureRecoveryStores().stores_.topology_.GroupExists("g1"));
   EXPECT_EQ((*follower)->last_commit_index(), 3u);
   EXPECT_FALSE((*follower)->Install(4, "corrupt image").ok());
   EXPECT_FALSE((*follower)->Install(2, *image).ok());
   EXPECT_EQ((*follower)->last_commit_index(), 3u);
-  EXPECT_EQ((*follower)->StoresSnapshot().audit_.Serialize(),
-            (*leader)->StoresSnapshot().audit_.Serialize());
+  EXPECT_EQ((*follower)->CaptureRecoveryStores().stores_.audit_.Serialize(),
+            (*leader)->CaptureRecoveryStores().stores_.audit_.Serialize());
 }
 
 TEST_F(MetaStateMachineTest, RetainedStoresSurviveApplyAndSnapshotInstall) {
   auto machine = Open();
   ASSERT_TRUE(machine.ok());
   Commit(**machine, 1, MakeRegister(0x11));
-  const auto first = (*machine)->StoresSnapshot();
+  const auto first = (*machine)->CaptureRecoveryStores().stores_;
   const auto first_audit = first.audit_.Serialize();
   Commit(**machine, 2, MakeRegister(0x22));
-  const auto second = (*machine)->StoresSnapshot();
+  const auto second = (*machine)->CaptureRecoveryStores().stores_;
   const auto second_audit = second.audit_.Serialize();
 
   auto replacement = Open();
@@ -877,7 +879,7 @@ TEST_F(MetaStateMachineTest, RetainedStoresSurviveApplyAndSnapshotInstall) {
   EXPECT_EQ(second.audit_.size(), 2u);
   EXPECT_EQ(second.identity_.NodeCount(), 2u);
   EXPECT_FALSE(second.audit_.Find(3));
-  EXPECT_EQ((*machine)->StoresSnapshot().audit_.size(), 4u);
+  EXPECT_EQ((*machine)->CaptureRecoveryStores().stores_.audit_.size(), 4u);
 }
 
 TEST_F(MetaStateMachineTest, CapturedImageRemainsOwnedWhileLiveStateAdvances) {
@@ -912,7 +914,7 @@ TEST_F(MetaStateMachineTest, SubmitOperationSeqEqualsLogIndex) {
   Commit(*machine, 7, submit);
 
   {
-    const MetaStores stores = machine->StoresSnapshot();
+    const MetaStores stores = machine->CaptureRecoveryStores().stores_;
     const auto operation = stores.operation_.FindOperationBySeq(7);
     ASSERT_TRUE(operation.has_value());
     EXPECT_EQ(operation->operation_seq_, 7u);
@@ -926,7 +928,7 @@ TEST_F(MetaStateMachineTest, SubmitOperationSeqEqualsLogIndex) {
   // Replay of the same index: idempotent accept, no state growth, no audit
   // growth during replay.
   Commit(*machine, 7, submit);
-  const MetaStores stores = machine->StoresSnapshot();
+  const MetaStores stores = machine->CaptureRecoveryStores().stores_;
   EXPECT_EQ(stores.audit_.size(), 1u);
   EXPECT_EQ(stores.operation_.FindOperationBySeq(7)->operation_seq_, 7u);
 }
@@ -980,10 +982,12 @@ TEST_F(MetaServerIntegrationTest, CommitThenRestartReplaysLog) {
   const auto term = server_->get_term();
   StopServer();
   StartServer();
-  EXPECT_EQ(machine_->StoresSnapshot().identity_.NodeCount(), 2u);
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.identity_.NodeCount(),
+            2u);
   EXPECT_GT(server_->get_term(), term);
   AppendAndWait(MakeRegister(0x33));
-  EXPECT_EQ(machine_->StoresSnapshot().identity_.NodeCount(), 3u);
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.identity_.NodeCount(),
+            3u);
 }
 
 TEST_F(MetaServerIntegrationTest, SnapshotCompactionAndRestart) {
@@ -996,10 +1000,12 @@ TEST_F(MetaServerIntegrationTest, SnapshotCompactionAndRestart) {
   StopServer();
   StartServer();
   EXPECT_GE(machine_->last_commit_index(), snapshot);
-  EXPECT_EQ(machine_->StoresSnapshot().identity_.NodeCount(), 9u);
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.identity_.NodeCount(),
+            9u);
   EXPECT_GE(server_->FirstLogIndex(), snapshot + 1);
   AppendAndWait(MakeRegister(0x19));
-  EXPECT_EQ(machine_->StoresSnapshot().identity_.NodeCount(), 10u);
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.identity_.NodeCount(),
+            10u);
 }
 
 TEST_F(MetaServerIntegrationTest, AutomaticSnapshotAndTailReplay) {
@@ -1011,9 +1017,11 @@ TEST_F(MetaServerIntegrationTest, AutomaticSnapshotAndTailReplay) {
   StopServer();
   StartServer(5);
   EXPECT_GE(server_->get_last_snapshot_idx(), snapshot);
-  EXPECT_EQ(machine_->StoresSnapshot().identity_.NodeCount(), 12u);
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.identity_.NodeCount(),
+            12u);
   AppendAndWait(MakeRegister(0x3c));
-  EXPECT_EQ(machine_->StoresSnapshot().identity_.NodeCount(), 13u);
+  EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.identity_.NodeCount(),
+            13u);
 }
 
 TEST_F(MetaServerIntegrationTest, ShutdownJoinsAllCallbacks) {

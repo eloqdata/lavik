@@ -31,8 +31,8 @@ using MetaCommitEventSink =
     std::function<void(std::uint64_t, const MetaApplyResult&)>;
 
 // The full committed aggregate and both indices captured under one state lock.
-// Full-view subscribers retain this owned copy; purpose-specific readers
-// should use a narrower capture when their contract permits it.
+// Reserved for durability fail-safe simulation and independent test oracles.
+// Ordinary readers and subscribers retain purpose-specific owned views.
 struct MetaCommittedStoresSnapshot {
   MetaStores stores_;
   MetaCommittedCursor cursor_;
@@ -71,9 +71,9 @@ class MetaStateMachine {
   void Advance(std::uint64_t index);
   absl::StatusOr<std::string> Capture(std::uint64_t index) const;
   absl::Status Install(std::uint64_t index, std::string_view image);
-  MetaStores StoresSnapshot() const;
-  // Full-state capture, paired with both indices for full-view subscriptions.
-  MetaCommittedStoresSnapshot CaptureStores() const;
+  // Complete state for durability fail-safe simulation only. Ordinary readers
+  // must use purpose-specific captures; snapshots use Capture/Install instead.
+  MetaCommittedStoresSnapshot CaptureRecoveryStores() const;
   // Owned publication data and both indices from one state lock. Policy
   // decoding and view destruction never run under that lock.
   MetaDataPublicationView CaptureDataPublication() const;
