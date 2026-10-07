@@ -57,15 +57,10 @@ struct GroupedRecordLocation {
 
 struct GroupedPhysicalState;
 
-// An auxiliary has no independent key or expiry. Keep only its compact
-// physical coordinates; the owning page supplies the sorted group identity.
-// This is deliberately distinct from a ScanHashMap entry with a variable key
-// tail. Returned pointers borrow the immutable object view.
-using GroupedRecordIndexEntry = RecordIndexValue;
-
 // Shared object view for grouped String, Hash, Set, List, Sorted Set and Stream
 // values. Retains routing and physical metadata; payloads are loaded on demand.
-// There is one compact physical index entry per group, not per field. The
+// Each auxiliary retains one RecordIndexValue without an independent key or
+// expiry; its owning page supplies the group identity. The
 // routing directory selects that entry; the physical owner supplies the
 // allocation epoch when materializing its compact location, as for top-level
 // RecordIndex entries. The adapter must validate payload identity/checksums
@@ -179,9 +174,10 @@ class GroupedObject {
     return version_.root_.mutation_sequence_;
   }
   bool SameLogicalRoot(const GroupedObject& other) const noexcept;
-  const GroupedRecordIndexEntry* FindGroup(std::string_view field) const;
-  const GroupedRecordIndexEntry* FindGroup(GroupedRecordId id) const;
-  const GroupedRecordIndexEntry* FindRecord(GroupedRecordId id) const;
+  // Returned coordinates borrow this immutable view; they carry no expiry.
+  const RecordIndexValue* FindGroup(std::string_view field) const;
+  const RecordIndexValue* FindGroup(GroupedRecordId id) const;
+  const RecordIndexValue* FindRecord(GroupedRecordId id) const;
   // The manifest's retained charge follows this handle even after the object
   // and its side-index entry have been reclaimed.
   std::shared_ptr<const std::vector<ExtentRef>> ExtentsFor(
@@ -194,7 +190,7 @@ class GroupedObject {
   }
   std::size_t record_count() const noexcept;
   using RecordVisitor = std::function<void(
-      GroupedRecordId, const GroupedRecordIndexEntry&,
+      GroupedRecordId, const RecordIndexValue&,
       const std::shared_ptr<const std::vector<ExtentRef>>&, bool)>;
   // Includes active leaves AND retired parent markers in both identity spaces.
   // The callback borrows compact entries and must materialize block epoch/owner

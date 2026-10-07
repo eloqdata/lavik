@@ -410,7 +410,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
           return;
         }
         object->ForEachRecord([&](GroupedRecordId,
-                                  const GroupedRecordIndexEntry& entry,
+                                  const RecordIndexValue& entry,
                                   const ExtentManifest& manifest, bool) {
           if (entry.external() != static_cast<bool>(manifest)) {
             grouped_status = absl::InternalError(

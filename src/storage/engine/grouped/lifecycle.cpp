@@ -106,8 +106,7 @@ StorageEngine::Impl::CollectGroupedRetirements(
   std::vector<RetiredExtentIdentity> replacement_extents;
   result.reserve(records);
   absl::Status status;
-  auto collect = [&](GroupedRecordId id,
-                     const GroupedRecordIndexEntry& old_entry,
+  auto collect = [&](GroupedRecordId id, const RecordIndexValue& old_entry,
                      const ExtentManifest& old_extents, bool) {
     if (!status.ok()) return;
     // The adapter calls this before suspension/publication. Never defer

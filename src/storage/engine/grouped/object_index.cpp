@@ -296,7 +296,7 @@ struct GroupIndexPage {
   RetainedMemoryCharge arrays_charge_;
   std::vector<GroupedRecordId> ids_;
   std::uint64_t retired_ = 0;
-  std::vector<GroupedRecordIndexEntry> locations_;
+  std::vector<RecordIndexValue> locations_;
   ScanHashMap<std::shared_ptr<const std::vector<ExtentRef>>> extents_;
 };
 
@@ -345,8 +345,7 @@ absl::StatusOr<NodeHandle> BuildPhysical(
   if (!page.ok()) return page.status();
   const auto arrays_bytes =
       AllocatorUsableSizeForRequest(records.size() * sizeof(GroupedRecordId)) +
-      AllocatorUsableSizeForRequest(records.size() *
-                                    sizeof(GroupedRecordIndexEntry));
+      AllocatorUsableSizeForRequest(records.size() * sizeof(RecordIndexValue));
   auto arrays_reservation = TryReserveMemory(arrays_bytes);
   if (!arrays_reservation) {
     RecordMemoryRejection();
@@ -384,8 +383,8 @@ const GroupIndexPage* FindPage(const NodeHandle& root, GroupedRecordId id) {
   return node ? node->page_.get() : nullptr;
 }
 
-const GroupedRecordIndexEntry* FindBaseRecord(const NodeHandle& root,
-                                              GroupedRecordId id) {
+const RecordIndexValue* FindBaseRecord(const NodeHandle& root,
+                                       GroupedRecordId id) {
   const auto* page = FindPage(root, id);
   if (!page) return nullptr;
   const auto found = std::lower_bound(page->ids_.begin(), page->ids_.end(), id);
@@ -427,7 +426,7 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
             AllocatorUsableSizeForRequest(page.ids_.size() *
                                           sizeof(GroupedRecordId)) +
             AllocatorUsableSizeForRequest(page.locations_.size() *
-                                          sizeof(GroupedRecordIndexEntry));
+                                          sizeof(RecordIndexValue));
         auto reservation = TryReserveMemory(arrays_bytes);
         if (!reservation) {
           RecordMemoryRejection();
@@ -536,7 +535,7 @@ struct GroupedPhysicalState {
   NodeHandle root_;
   struct CoordinateOverride {
     GroupedRecordId id_;
-    GroupedRecordIndexEntry entry_;
+    RecordIndexValue entry_;
     bool retired_ = false;
   };
   // A small immutable coordinate overlay amortizes copying routing paths and
@@ -550,8 +549,7 @@ struct GroupedPhysicalState {
     // The owner keeps compact physical index entries alive. Direct pointers are
     // immutable and used only on the key owner, including destruction.
     NodeHandle owner_;
-    std::array<const GroupedRecordIndexEntry*, kGroupIndexPageEntries>
-        entries_{};
+    std::array<const RecordIndexValue*, kGroupIndexPageEntries> entries_{};
   };
   RetainedMemoryCharge string_pages_charge_;
   std::vector<LocalSharedPtr<const StringPage>> string_pages_;
@@ -570,8 +568,8 @@ const GroupedPhysicalState::CoordinateOverride* FindOverride(
   return found == end || found->id_ != id ? nullptr : &*found;
 }
 
-const GroupedRecordIndexEntry* FindPhysicalRecord(
-    const GroupedPhysicalState& state, GroupedRecordId id) {
+const RecordIndexValue* FindPhysicalRecord(const GroupedPhysicalState& state,
+                                           GroupedRecordId id) {
   if (const auto* replacement = FindOverride(state, id))
     return &replacement->entry_;
   return FindBaseRecord(state.root_, id);
@@ -1245,15 +1243,13 @@ absl::StatusOr<GroupedObject::Handle> GroupedObject::RelocateGroup(
   return Handle(std::move(*object));
 }
 
-const GroupedRecordIndexEntry* GroupedObject::FindGroup(
-    std::string_view field) const {
+const RecordIndexValue* GroupedObject::FindGroup(std::string_view field) const {
   if (is_ordered() && !has_member_index()) return nullptr;
   const auto* route = directory().Find(field);
   return route == nullptr ? nullptr : FindRecord(route->id_);
 }
 
-const GroupedRecordIndexEntry* GroupedObject::FindGroup(
-    GroupedRecordId id) const {
+const RecordIndexValue* GroupedObject::FindGroup(GroupedRecordId id) const {
   if (is_ordered() && IsOrderedPageId(id)) {
     return id.bits_ == 0 && ordered_directory().Find(id.prefix_) != nullptr
                ? FindRecord(id)
@@ -1265,8 +1261,7 @@ const GroupedRecordIndexEntry* GroupedObject::FindGroup(
   return FindRecord(id);
 }
 
-const GroupedRecordIndexEntry* GroupedObject::FindRecord(
-    GroupedRecordId id) const {
+const RecordIndexValue* GroupedObject::FindRecord(GroupedRecordId id) const {
   if (physical_->string_size_) {
     if (!IsOrderedPageId(id) || id.prefix_ > physical_->string_size_)
       return nullptr;
@@ -1327,7 +1322,7 @@ void GroupedObject::ForEachRecord(const RecordVisitor& visitor) const {
   std::size_t cursor = 0;
   VisitPhysical(
       physical_->root_,
-      [&](GroupedRecordId id, const GroupedRecordIndexEntry& entry,
+      [&](GroupedRecordId id, const RecordIndexValue& entry,
           const std::shared_ptr<const std::vector<ExtentRef>>& extents,
           bool retired) {
         if (cursor < physical_->override_count_ &&

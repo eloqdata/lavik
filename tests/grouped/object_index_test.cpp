@@ -664,7 +664,7 @@ TEST(GroupedObjectIndexTest, StoresOneCompactPhysicalIndexEntryPerGroup) {
   ASSERT_TRUE(object.ok()) << object.status();
   EXPECT_EQ((*object)->group_count(), input.locations_.size());
   EXPECT_LT((*object)->group_count(), 100);
-  EXPECT_EQ(sizeof(GroupedRecordIndexEntry), 24);
+  EXPECT_EQ(sizeof(RecordIndexValue), 24);
   for (unsigned i = 0; i < 100; ++i) {
     const std::string field = "field" + std::to_string(i);
     const auto* route = input.directory_.Find(field);
@@ -1386,7 +1386,7 @@ TEST(GroupedObjectIndexTest, CoordinateChangesPreserveSnapshotsAndTraversal) {
     EXPECT_EQ(current->record_count(), input.locations_.size());
     std::map<GroupedRecordId, std::uint64_t> visited;
     current->ForEachRecord([&](GroupedRecordId id,
-                               const GroupedRecordIndexEntry& entry,
+                               const RecordIndexValue& entry,
                                const auto& extents, bool retired) {
       EXPECT_FALSE(retired);
       EXPECT_EQ(extents, nullptr);
@@ -1438,7 +1438,7 @@ TEST(GroupedObjectIndexTest, ExternalReplacementFoldsPendingInlineCoordinates) {
   EXPECT_EQ(retained->front().block_id_, 200000);
   std::size_t visited = 0;
   (*external)->ForEachRecord([&](GroupedRecordId id,
-                                 const GroupedRecordIndexEntry& entry,
+                                 const RecordIndexValue& entry,
                                  const auto& extents, bool retired) {
     ++visited;
     EXPECT_FALSE(retired);
