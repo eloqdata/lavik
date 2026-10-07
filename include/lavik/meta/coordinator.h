@@ -77,7 +77,7 @@
 //   - Lock order: SM state mutex -> SM sink mutex -> subscription core mutex.
 //     The coordinator never calls into the state machine while holding the
 //     subscription core mutex (the atomic triple uses a two-phase retry read,
-//     see SubscribeCommitted), so the order is never inverted.
+//     see SubscribeCaptured), so the order is never inverted.
 //
 // TRUST BOUNDARY
 //
@@ -167,69 +167,6 @@ class AuthenticatedPrincipal {
 };
 
 // ---------------------------------------------------------------------------
-// MetaCommittedView: one atomic read of the committed aggregate.
-// A single snapshot object pairing a deep copy of MetaStores with the applied
-// index they reflect — consumers never observe a cross-store tear. Produced
-// only by the coordinator (the constructor is just a value bundle; the
-// atomicity comes from the coordinator's capture protocol).
-// ---------------------------------------------------------------------------
-
-class MetaCommittedView {
- public:
-  MetaCommittedView(MetaStores stores, std::uint64_t applied_index)
-      : stores_(std::move(stores)), applied_index_(applied_index) {}
-
-  const MetaStores& stores() const { return stores_; }
-  // Highest raft log index whose effects the stores reflect.
-  std::uint64_t applied_index() const { return applied_index_; }
-
-  const MetaIdentityStore& identity() const { return stores_.identity_; }
-  const MetaTopologyStore& topology() const { return stores_.topology_; }
-  const MetaPolicyStore& policy() const { return stores_.policy_; }
-  const MetaOperationStore& operation() const { return stores_.operation_; }
-  const MetaPopulationManifestStore& population_manifest() const {
-    return stores_.population_manifest_;
-  }
-  const MetaAuditStore& audit() const { return stores_.audit_; }
-
- private:
-  MetaStores stores_;
-  std::uint64_t applied_index_;
-};
-
-// MetaCommittedFacts (observation freshness queries, observation_store.h)
-// answered from committed stores — the production implementation the obs store
-// header refers to. Holds a reference: the referenced stores must outlive the
-// adapter (bind it to a MetaCommittedView for the duration of a query batch).
-class MetaStoresFacts : public MetaCommittedFacts {
- public:
-  explicit MetaStoresFacts(const MetaStores& stores) : stores_(stores) {}
-
-  bool IsActiveNode(std::string_view node_id) const override;
-  uint64_t CurrentGroupTerm(std::string_view group_id) const override;
-  uint64_t CurrentPopulationManifestRevision(
-      std::string_view group_id) const override;
-  MetaHash256 CurrentPopulationManifestDigest(
-      std::string_view group_id) const override;
-  uint64_t CurrentPartitionReplicationEpoch(
-      std::string_view group_id) const override;
-  bool AssignmentMatches(std::string_view group_id, std::string_view node_id,
-                         const MetaAssignmentId& assignment_id) const override;
-  bool IsOwnerAssignment(std::string_view group_id, std::string_view node_id,
-                         const MetaAssignmentId& assignment_id) const override;
-  bool MayReportFencedOwnerCandidate(
-      const MetaCandidateProgressObs& candidate) const override;
-  bool IsCurrentFailoverCandidate(
-      std::string_view node_id,
-      const MetaBootIncarnation& boot_id) const override;
-  std::optional<FailoverTransitionView> FailoverTransitionById(
-      const MetaFailoverTransitionId& transition_id) const override;
-
- private:
-  const MetaStores& stores_;
-};
-
-// ---------------------------------------------------------------------------
 // Committed-stream subscription.
 // ---------------------------------------------------------------------------
 
@@ -302,7 +239,6 @@ struct MetaSubscriptionStartFor {
   std::unique_ptr<MetaCommitSubscription> subscription_;
 };
 
-using MetaSubscriptionStart = MetaSubscriptionStartFor<MetaCommittedView>;
 using MetaDataPublicationSubscriptionStart =
     MetaSubscriptionStartFor<MetaDataPublicationView>;
 using MetaObservationSubscriptionStart =
@@ -351,7 +287,6 @@ class MetaLeaderContext {
   std::uint64_t term() const { return term_; }
   bool IsCurrent() const;
   bycorf::Task<absl::StatusOr<MetaApplyResult>> Propose(MetaCommand command);
-  MetaCommittedView CommittedView();
   // Owned facts used by observation validation, captured at one committed cut.
   MetaObservationFactsView ObservationFacts() const;
   // Atomically paired applied/state-change indices, without copying stores.
@@ -381,8 +316,6 @@ class MetaLeaderContext {
   // A changed cursor requires a fresh committed capture before publishing a
   // cut.
   std::uint64_t AppliedIndex() const;
-  MetaSubscriptionStart SubscribeCommitted(MetaCommitCallback callback,
-                                           std::size_t queue_capacity = 0);
   // Publication subscribers adopt this owned initial cut into their shared
   // worker-local cache, preserving the normal no-gap event contract.
   MetaDataPublicationSubscriptionStart SubscribeDataPublication(
@@ -416,7 +349,7 @@ class MetaLeaderContext {
 // Idempotency contract: reconcilers advance ONLY through Propose;
 // operation idempotency keys, expected_revision CAS, and the apply layer's
 // replay idempotency make retries and restarts safe. After any leadership
-// change the reconciler rebuilds from CommittedView() and must tolerate
+// change the reconciler recaptures its planning inputs and must tolerate
 // finding its previous work already committed.
 class MetaReconciler {
  public:
@@ -496,9 +429,10 @@ class MetaCoordinator {
   //   - kDeadlineExceeded / kCancelled / kInternal: the raft round timed out,
   //     was cancelled (shutdown/leadership loss), or failed. These are
   //     UNCERTAIN OUTCOMES: the command may still have committed.
-  //     The message says so; the caller reconciles against CommittedView()
-  //     using the command's idempotency key instead of assuming failure —
-  //     safe because every command is replay/idempotency-safe by design.
+  //     The message says so; the caller reconciles against a fresh
+  //     purpose-specific capture using the command's idempotency key instead of
+  //     assuming failure — safe because every command is
+  //     replay/idempotency-safe by design.
   // Zero captures the current leader term; a leader context supplies its own
   // fixed term. The expected term is checked again by the Raft protocol owner.
   bycorf::Task<absl::StatusOr<MetaApplyResult>> Propose(
@@ -510,8 +444,6 @@ class MetaCoordinator {
   // thread-safe against in-flight Propose calls.
   void AddValidateHook(MetaValidateHook hook);
 
-  // One atomic read of the committed aggregate (see MetaCommittedView).
-  MetaCommittedView CommittedView();
   // Owned facts used by observation validation, captured at one committed cut.
   MetaObservationFactsView ObservationFacts() const;
   // Atomically paired applied/state-change indices, without copying stores.
@@ -559,10 +491,8 @@ class MetaCoordinator {
   // asynchronous subscription callback reaches their worker.
   std::uint64_t CommittedHighWater() const;
 
-  // See MetaSubscriptionStart for the delivery contract. queue_capacity == 0
+  // See MetaSubscriptionStartFor for the delivery contract. queue_capacity == 0
   // selects options_.default_subscription_capacity_.
-  MetaSubscriptionStart SubscribeCommitted(MetaCommitCallback callback,
-                                           std::size_t queue_capacity = 0);
   // Publication subscribers adopt this owned initial cut into their shared
   // worker-local cache, preserving the normal no-gap event contract.
   MetaDataPublicationSubscriptionStart SubscribeDataPublication(
@@ -607,15 +537,6 @@ class MetaCoordinator {
   void InFlightEnter();
   void InFlightLeave();
   absl::Status NotLeaderStatus() const;
-
-  // The (stores, applied index) atomic capture behind CommittedView and
-  // SubscribeCommitted: two-phase retry read that never holds the
-  // subscription core mutex across a state machine call (lock order, see the
-  // file header). high_water receives the sink-tracked coverage mark (the
-  // subscription cursor; normally == applied_index, see
-  // MetaSubscriptionStart for the snapshot-install case).
-  MetaStores AtomicStoresSnapshot(std::uint64_t& applied_index,
-                                  std::uint64_t& high_water);
 
   // The capture callable is internal and executes without the subscription
   // mutex; each state-machine entry point captures its own exact committed cut.

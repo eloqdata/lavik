@@ -1026,7 +1026,7 @@ TEST(MetaDataPublicationViewTest,
   EXPECT_TRUE(publication.operations().front().terminal_receipts_.empty());
 
   // The post-proposal query must survive archival between commit and ACK.
-  auto stores = machine->StoresSnapshot();
+  auto stores = machine->CaptureRecoveryStores().stores_;
   const auto operation = stores.operation_.FindOperation(fixture.operation_id);
   ASSERT_TRUE(operation);
   meta::CompleteOperation complete;

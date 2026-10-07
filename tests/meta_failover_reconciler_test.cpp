@@ -45,6 +45,7 @@
 #include "lavik/meta/state_machine.h"
 #include "support/failover_planning.h"
 #include "support/meta_raft.h"
+#include "support/meta_stores.h"
 #include "support/test_data_path.h"
 
 namespace {
@@ -76,13 +77,16 @@ bool WaitUntil(const std::function<bool()>& predicate,
   return predicate();
 }
 
-std::unique_ptr<const meta::MetaStores> StoresSnapshotOnHeap(
+std::shared_ptr<const meta::MetaStores> StoresSnapshotOnHeap(
     const meta::MetaStateMachine& machine) {
   // These lifecycle tests retain several large snapshots. Direct initialization
   // elides the return-value copy into heap storage; make_unique would first
   // materialize a large stack temporary for its forwarding argument.
-  return std::unique_ptr<const meta::MetaStores>(
-      new const meta::MetaStores(machine.StoresSnapshot()));
+  auto owner = std::shared_ptr<const meta::MetaCommittedStoresSnapshot>(
+      new const meta::MetaCommittedStoresSnapshot(
+          machine.CaptureRecoveryStores()));
+  const auto* stores = &owner->stores_;
+  return std::shared_ptr<const meta::MetaStores>(std::move(owner), stores);
 }
 
 TEST(MetaFencedAuthorityGuardTest,
@@ -276,7 +280,7 @@ struct Fixture {
       std::uint64_t generation = 1,
       std::optional<meta::MetaObservedFailoverProjection> failover_projection =
           std::nullopt) {
-    meta::MetaStoresFacts facts(stores);
+    meta::StoredFactsTestAdapter facts(stores);
     const meta::MetaObservationIdentity identity{node_id, boot, generation};
     if (observations.CurrentGeneration(node_id) != std::optional(generation)) {
       ASSERT_TRUE(
@@ -300,7 +304,7 @@ struct Fixture {
       std::optional<meta::MetaFailoverObservationObs> failover = std::nullopt,
       std::optional<meta::MetaReplicationHistoryId> session_history =
           std::nullopt) {
-    meta::MetaStoresFacts facts(stores);
+    meta::StoredFactsTestAdapter facts(stores);
     const meta::MetaObservationIdentity identity{owner, boot, generation};
     if (observations.CurrentGeneration(owner) != std::optional(generation)) {
       ASSERT_TRUE(observations
@@ -416,7 +420,7 @@ struct Fixture {
     }
     if (!frontier.has_value()) {
       auto progress = observations.LiveCandidateProgressFor(
-          "g1", meta::MetaStoresFacts(stores), now);
+          "g1", meta::StoredFactsTestAdapter(stores), now);
       auto current =
           std::ranges::find(progress, action.candidate_.node_id_,
                             &meta::MetaCandidateProgressObs::node_id_);
@@ -1138,7 +1142,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
       identity,
       {.storage_ready_ = true, .population_ready_ = true, .active_groups_ = 1},
       std::nullopt, std::nullopt, fixture.CurrentFailoverProjection(),
-      meta::MetaStoresFacts(fixture.stores), 1'012);
+      meta::StoredFactsTestAdapter(fixture.stores), 1'012);
   ASSERT_TRUE(preparing.boot_status_.ok()) << preparing.boot_status_;
   ASSERT_TRUE(preparing.health_status_.ok()) << preparing.health_status_;
   ASSERT_TRUE(preparing.candidate_status_.ok()) << preparing.candidate_status_;
@@ -1558,8 +1562,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   };
 
   BeginUncontrolled(fixture, action);
-  fixture.observations.RevalidateAll(meta::MetaStoresFacts(fixture.stores),
-                                     1'001);
+  fixture.observations.RevalidateAll(
+      meta::StoredFactsTestAdapter(fixture.stores), 1'001);
 
   IdSequence premature_replacement_ids{0x9e};
   auto planned = lavik::test::PlanFailoverFixture(
@@ -1618,7 +1622,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
   const auto replacement_heartbeat = fixture.observations.ReplaceHeartbeat(
       replacement_identity,
       {.storage_ready_ = true, .population_ready_ = true, .active_groups_ = 1},
-      std::nullopt, meta::MetaStoresFacts(fixture.stores), 1'002);
+      std::nullopt, meta::StoredFactsTestAdapter(fixture.stores), 1'002);
   ASSERT_TRUE(replacement_heartbeat.boot_status_.ok())
       << replacement_heartbeat.boot_status_;
   ASSERT_TRUE(replacement_heartbeat.health_status_.ok())
@@ -1663,8 +1667,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
       .domain_ = meta::CandidateCompatibilityDomain(progress),
   };
   BeginUncontrolled(fixture, action);
-  fixture.observations.RevalidateAll(meta::MetaStoresFacts(fixture.stores),
-                                     1'001);
+  fixture.observations.RevalidateAll(
+      meta::StoredFactsTestAdapter(fixture.stores), 1'001);
   fixture.ReportCandidate(fixture.candidate, fixture.candidate_assignment,
                           fixture.candidate_boot, 1'002, {10, 20}, std::nullopt,
                           action.domain_, 1,
@@ -1676,7 +1680,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
       identity,
       {.storage_ready_ = true, .population_ready_ = false, .active_groups_ = 1},
       std::nullopt, std::nullopt, fixture.CurrentFailoverProjection(),
-      meta::MetaStoresFacts(fixture.stores), 1'003);
+      meta::StoredFactsTestAdapter(fixture.stores), 1'003);
   ASSERT_TRUE(omitted.boot_status_.ok()) << omitted.boot_status_;
   ASSERT_TRUE(omitted.health_status_.ok()) << omitted.health_status_;
   ASSERT_TRUE(omitted.candidate_status_.ok()) << omitted.candidate_status_;
@@ -1888,8 +1892,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   };
   fixture.ReportCandidate(1'000);
   BeginUncontrolled(fixture, initial_action);
-  fixture.observations.RevalidateAll(meta::MetaStoresFacts(fixture.stores),
-                                     1'001);
+  fixture.observations.RevalidateAll(
+      meta::StoredFactsTestAdapter(fixture.stores), 1'001);
   fixture.ReportCandidate(fixture.candidate, fixture.candidate_assignment,
                           fixture.candidate_boot, 1'002, {10, 20}, std::nullopt,
                           initial_action.domain_, 1,
@@ -1927,8 +1931,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_EQ(group->record_.group_term_, 2);
   EXPECT_FALSE(group->failover_transition_.has_value());
 
-  fixture.observations.RevalidateAll(meta::MetaStoresFacts(fixture.stores),
-                                     1'006);
+  fixture.observations.RevalidateAll(
+      meta::StoredFactsTestAdapter(fixture.stores), 1'006);
   const auto report_without_candidate =
       [&](const std::string& node_id, const meta::MetaBootIncarnation& boot,
           const meta::MetaReplicationHistoryId& history, std::int64_t now) {
@@ -1940,7 +1944,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
             {.storage_ready_ = true,
              .population_ready_ = false,
              .active_groups_ = 1},
-            std::nullopt, meta::MetaStoresFacts(fixture.stores), now);
+            std::nullopt, meta::StoredFactsTestAdapter(fixture.stores), now);
         ASSERT_TRUE(result.boot_status_.ok()) << result.boot_status_;
         ASSERT_TRUE(result.health_status_.ok()) << result.health_status_;
         ASSERT_TRUE(result.candidate_status_.ok()) << result.candidate_status_;
@@ -1955,7 +1959,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
                            Bytes<20>(0x44), 1'007);
   EXPECT_TRUE(fixture.observations
                   .LiveCandidateProgressFor(
-                      "g1", meta::MetaStoresFacts(fixture.stores), 1'008)
+                      "g1", meta::StoredFactsTestAdapter(fixture.stores), 1'008)
                   .empty());
   fixture.observations.InvalidateCandidateOnDisconnect(
       {fixture.candidate, fixture.candidate_boot, 1}, 1'008);
@@ -2052,7 +2056,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
     auto encoded = meta::MetaStateMachine::EncodeCommand(command);
     ASSERT_TRUE(encoded.ok()) << encoded.status();
     ASSERT_NE(machine->commit(++committed_index, **encoded), nullptr);
-    const auto audit = machine->StoresSnapshot().audit_.Find(committed_index);
+    const auto audit =
+        machine->CaptureRecoveryStores().stores_.audit_.Find(committed_index);
     ASSERT_TRUE(audit.has_value());
     ASSERT_EQ(audit->verdict_, meta::MetaAuditVerdict::kAccepted)
         << audit->verdict_detail_;
@@ -2158,7 +2163,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
 
   const auto current_owner = StoresSnapshotOnHeap(*machine);
   const meta::MetaStores& current = *current_owner;
-  meta::MetaStoresFacts facts(current);
+  meta::StoredFactsTestAdapter facts(current);
   const meta::MetaObservationIdentity owner_identity{fixture.owner,
                                                      fixture.owner_boot, 1};
   ASSERT_TRUE(
@@ -2203,8 +2208,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   commit(**expected);
   std::this_thread::sleep_for(std::chrono::milliseconds(750));
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 3);
-  EXPECT_TRUE(machine->StoresSnapshot()
-                  .topology_.FindGroup("g1")
+  EXPECT_TRUE(machine->CaptureRecoveryStores()
+                  .stores_.topology_.FindGroup("g1")
                   ->failover_transition_.has_value());
 
   coordinator->BecomeFollower(1);
@@ -2245,7 +2250,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
     auto encoded = meta::MetaStateMachine::EncodeCommand(command);
     ASSERT_TRUE(encoded.ok()) << encoded.status();
     ASSERT_NE(machine->commit(++committed_index, **encoded), nullptr);
-    const auto audit = machine->StoresSnapshot().audit_.Find(committed_index);
+    const auto audit =
+        machine->CaptureRecoveryStores().stores_.audit_.Find(committed_index);
     ASSERT_TRUE(audit.has_value());
     ASSERT_EQ(audit->verdict_, meta::MetaAuditVerdict::kAccepted)
         << audit->verdict_detail_;
@@ -2312,7 +2318,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
 
   const auto submitted_owner = StoresSnapshotOnHeap(*machine);
   const meta::MetaStores& submitted = *submitted_owner;
-  const meta::MetaStoresFacts submitted_facts(submitted);
+  const meta::StoredFactsTestAdapter submitted_facts(submitted);
   auto owner_result = observations.ReplaceHeartbeat(
       owner_identity,
       {.storage_ready_ = true, .population_ready_ = true, .active_groups_ = 1},
@@ -2360,7 +2366,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
       owner_identity,
       {.storage_ready_ = true, .population_ready_ = true, .active_groups_ = 1},
       std::nullopt, meta::MetaFailoverObservationObs{.payload_ = paused},
-      meta::MetaStoresFacts(begun), 1'010);
+      meta::StoredFactsTestAdapter(begun), 1'010);
   ASSERT_TRUE(owner_result.failover_status_.ok())
       << owner_result.failover_status_;
 
@@ -2399,7 +2405,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
                                 fixture.candidate_boot, {10, 20},
                                 action.domain_),
       meta::MetaFailoverObservationObs{.payload_ = prepared},
-      meta::MetaStoresFacts(authorized), 1'012);
+      meta::StoredFactsTestAdapter(authorized), 1'012);
   ASSERT_TRUE(candidate_result.candidate_status_.ok())
       << candidate_result.candidate_status_;
   ASSERT_TRUE(candidate_result.failover_status_.ok())
@@ -2480,7 +2486,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   owner_result = observations.ReplaceHeartbeat(
       owner_identity,
       {.storage_ready_ = true, .population_ready_ = true, .active_groups_ = 1},
-      std::nullopt, meta::MetaStoresFacts(before_cutover), 1'010);
+      std::nullopt, meta::StoredFactsTestAdapter(before_cutover), 1'010);
   ASSERT_TRUE(owner_result.boot_status_.ok()) << owner_result.boot_status_;
   candidate_result = observations.ReplaceHeartbeat(
       candidate_identity,
@@ -2489,7 +2495,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
                                 fixture.candidate_boot, {10, 20},
                                 action.domain_),
       meta::MetaFailoverObservationObs{.payload_ = prepared},
-      meta::MetaStoresFacts(before_cutover), 1'012);
+      meta::StoredFactsTestAdapter(before_cutover), 1'012);
   ASSERT_TRUE(candidate_result.candidate_status_.ok())
       << candidate_result.candidate_status_;
   ASSERT_TRUE(candidate_result.failover_status_.ok())
@@ -2506,7 +2512,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   commit(**expected);
   ASSERT_TRUE(WaitUntil(
       [&] {
-        const auto stores = machine->StoresSnapshot();
+        const auto stores = machine->CaptureRecoveryStores().stores_;
         const auto group = stores.topology_.FindGroup("g1");
         const auto operation =
             stores.operation_.FindOperation(fixture.operation_id);

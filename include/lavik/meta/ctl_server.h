@@ -198,7 +198,7 @@
 //                             per audit-ring event, oldest first.
 // The coordinator revalidates volatile observations after every committed
 // batch, including batches proposed by reconcilers rather than this surface.
-// Read paths also filter against one committed MetaStores snapshot.
+// Read paths also filter against one owned, purpose-specific committed cut.
 // Payloads and principals are whitespace-free single tokens; anything else
 // is a protocol error and closes the connection after an "ERR bad-request".
 //
