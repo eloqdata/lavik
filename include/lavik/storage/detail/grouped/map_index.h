@@ -33,19 +33,20 @@
 
 namespace lavik::storage {
 
-// Immutable AVL metadata keyed by an ordered identity. Values are routing
-// metadata only; payload ownership and physical pins belong to the caller.
-// Copies retain one root and a topology update allocates only the logarithmic
-// search path. Large maps buffer existing-key updates in an immutable metadata
-// overlay; overflow folds a batch into the tree, copying each shared ancestor
-// only once. Nodes and overlays are admitted and charged independently, so old
-// snapshot readers retain exactly the nodes they still own. Lookups and
-// iteration resolve the overlay without replay. All node references and
-// destruction stay on the key owner. Cross-worker readers send physical
-// identities or owner-routed stream handles, not these links, so persistent
-// sharing does not require atomic reference counts.
+// Key-based metadata indexing, paired with the ordinal/rank algorithms in
+// ordered_index.h. The persistent AVL tree orders identities; values are
+// routing metadata only; payload ownership and physical pins belong to the
+// caller. Copies retain one root and a topology update allocates only the
+// logarithmic search path. Large maps buffer existing-key updates in an
+// immutable metadata overlay; overflow folds a batch into the tree, copying
+// each shared ancestor only once. Nodes and overlays are admitted and charged
+// independently, so old snapshot readers retain exactly the nodes they still
+// own. Lookups and iteration resolve the overlay without replay. All node
+// references and destruction stay on the key owner. Cross-worker readers send
+// physical identities or owner-routed stream handles, not these links, so
+// persistent sharing does not require atomic reference counts.
 template <typename Key, typename Metadata>
-class GroupedMetadataMap {
+class MapIndex {
   static_assert(std::is_trivially_copyable_v<Key>);
   static_assert(std::is_trivially_copyable_v<Metadata>);
   struct Node;
@@ -121,7 +122,7 @@ class GroupedMetadataMap {
     }
 
    private:
-    friend class GroupedMetadataMap;
+    friend class MapIndex;
     // An AVL tree containing at most UINT32_MAX groups is far shallower than
     // this fixed stack. Iteration never allocates retained/scratch memory.
     const Overlay* overlay_ = nullptr;

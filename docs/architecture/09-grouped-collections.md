@@ -143,11 +143,11 @@ into the tree in one batch. It retains no payload or physical pins, and each
 snapshot owns its matching routing version. Ordered directories share
 owner-local metadata chunks across immutable views. Each allocation admits and
 accounts its own lifetime, independently of the number of views retaining it.
-Local page replacements detach changed chunks. Lists and Sorted Sets update
-rank intervals whose counts change; Streams use a persistent partial-sum rank
-index to update logarithmic cells per changed count. Count-neutral replacements
-share ranks. Unchanged identities and retirement records remain shared. Stream
-suffix insertions preserve a validated predecessor prefix and check the
+Local page replacements detach changed chunks. Lists, Sorted Sets and Streams
+share a persistent Fenwick rank index, updating logarithmic cells per changed
+page count. Rank lookup and prefix counting use the same index; count-neutral
+replacements share it. Strings use fixed-segment arithmetic. Unchanged
+identities and retirement records remain shared. Stream suffix insertions preserve a validated predecessor prefix and check the
 remaining chain and aggregate counts; other topology changes validate the
 complete resulting chain. Only recovery selects among competing physical
 candidates. Retired identities remain available to GC. Routing and physical-index node references,

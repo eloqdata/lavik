@@ -1,0 +1,190 @@
+/*
+ * Copyright (C) 2026 EloqData Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <algorithm>
+#include <bit>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <utility>
+#include <vector>
+
+#include "absl/container/inlined_vector.h"
+#include "absl/numeric/int128.h"
+#include "lavik/storage/detail/grouped/metadata_array.h"
+
+namespace lavik::storage {
+
+// Persistent Fenwick index mapping an element rank to a group ordinal and
+// offset. MapIndex indexes metadata by key; OrderedIndex indexes page counts
+// by position. Neither retains value payloads or physical pins. Prefix reads
+// and count updates both visit logarithmically many cells.
+// Copies share owner-local metadata chunks. Mutators belong to an unpublished
+// view: a failure may partially update that builder, never a pinned
+// predecessor. Callers validate page counts and admit temporary build/suffix
+// arrays. There is one cell layout, so the index stores no policy tag or
+// duplicate total.
+class OrderedIndex {
+ public:
+  struct Position {
+    std::size_t group_index_;
+    std::uint64_t offset_;
+  };
+  using CountChange = std::pair<std::size_t, absl::int128>;
+
+  // Consumes checked cumulative counts as build scratch, encoding them into
+  // Fenwick cells in place to avoid another whole-directory scratch array.
+  static absl::StatusOr<OrderedIndex> FromCumulative(
+      std::vector<std::uint64_t> ends) {
+    for (std::size_t i = ends.size(); i > 1; --i) ends[i - 1] -= ends[i - 2];
+    for (std::size_t i = 0; i < ends.size(); ++i) {
+      const auto parent = i | (i + 1);
+      if (parent < ends.size()) ends[parent] += ends[i];
+    }
+    auto cells = Storage::From(ends);
+    if (!cells.ok()) return cells.status();
+    OrderedIndex result;
+    result.cells_ = std::move(*cells);
+    return result;
+  }
+
+  // Returns the count preceding a page; the page count denotes the full total.
+  std::uint64_t CountBefore(std::size_t index) const noexcept {
+    assert(index <= cells_.size());
+    std::uint64_t count = 0;
+    for (; index != 0; index -= index & (~index + 1))
+      count += cells_[index - 1];
+    return count;
+  }
+
+  // The caller must first check rank < total count. The owning root already
+  // keeps that total, avoiding an extra field or Fenwick sum on every lookup.
+  Position Locate(std::uint64_t rank) const noexcept {
+    std::size_t index = 0;
+    std::uint64_t count = 0;
+    for (auto stride = std::bit_floor(cells_.size()); stride != 0;
+         stride >>= 1) {
+      const auto next = index + stride;
+      if (next <= cells_.size() && cells_[next - 1] <= rank - count) {
+        count += cells_[next - 1];
+        index = next;
+      }
+    }
+    return {index, rank - count};
+  }
+
+  // Changes have distinct, increasing page ordinals and checked page counts.
+  // Count-neutral writes retain every chunk. Combining deltas before applying
+  // them prevents compensating changes from overflowing intermediate sums.
+  absl::Status ApplyCounts(std::span<const CountChange> changes,
+                           std::uint64_t item_count) {
+    return ApplyPartialSums(changes, item_count, cells_.size());
+  }
+
+  // Suffix insertion retains the preceding page ordinals. The suffix carries
+  // complete NEW cumulative counts, including prefix_changes; only the old
+  // prefix cells receive those deltas separately. The suffix may grow but
+  // cannot shrink the index on this path.
+  absl::StatusOr<OrderedIndex> WithSuffix(
+      std::size_t first, std::span<const std::uint64_t> cumulative,
+      std::span<const CountChange> prefix_changes,
+      std::uint64_t item_count) const {
+    assert(first <= cells_.size() &&
+           cumulative.size() >= cells_.size() - first);
+    std::vector<std::uint64_t> encoded;
+    encoded.reserve(cumulative.size());
+    for (std::size_t i = 0; i < cumulative.size(); ++i) {
+      const auto index = first + i;
+      const auto start = (index + 1) & index;
+      absl::int128 before;
+      if (start <= first) {
+        before = CountBefore(start);
+        for (const auto& [changed_index, delta] : prefix_changes)
+          if (changed_index < start) before += delta;
+      } else {
+        before = cumulative[start - first - 1];
+      }
+      const auto value = absl::int128(cumulative[i]) - before;
+      if (value < 0 || value > item_count)
+        return absl::DataLossError("invalid ordered suffix rank sum");
+      encoded.push_back(static_cast<std::uint64_t>(value));
+    }
+    const auto old_suffix = cells_.size() - first;
+    auto appended = cells_.Appended(std::span(encoded).subspan(old_suffix));
+    if (!appended.ok()) return appended.status();
+    OrderedIndex result;
+    result.cells_ = std::move(*appended);
+    for (std::size_t i = 0; i < old_suffix; ++i) {
+      auto status = result.cells_.Set(first + i, encoded[i]);
+      if (!status.ok()) return status;
+    }
+    auto status = result.ApplyPartialSums(prefix_changes, item_count, first);
+    if (!status.ok()) return status;
+    return result;
+  }
+
+  // Scratch-planning bound; the underlying chunks account their own lifetime.
+  std::size_t RetainedBytes() const noexcept { return cells_.RetainedBytes(); }
+
+ private:
+  using Storage = GroupedMetadataArray<std::uint64_t, 256>;
+  Storage cells_;
+
+  absl::Status ApplyPartialSums(std::span<const CountChange> count_changes,
+                                std::uint64_t item_count,
+                                std::size_t existing_size) {
+    absl::InlinedVector<CountChange, 32> rank_changes;
+    const auto changed_counts =
+        std::count_if(count_changes.begin(), count_changes.end(),
+                      [](const auto& change) { return change.second != 0; });
+    if (changed_counts == 0) return absl::OkStatus();
+    const auto updates = changed_counts * (std::bit_width(existing_size) + 1);
+    // Page counts are bounded by the 32-bit root group count. This product
+    // fits size_t on supported 64-bit targets; scratch is admitted before use.
+    auto admission = TryReserveMemory(
+        AllocatorUsableSizeForRequest(updates * sizeof(CountChange) + 1024));
+    if (!admission) {
+      RecordMemoryRejection();
+      return absl::ResourceExhaustedError("OOM ordered rank update scratch");
+    }
+    rank_changes.reserve(updates);
+    for (const auto& [index, delta] : count_changes) {
+      if (delta == 0) continue;
+      for (std::size_t i = index + 1; i <= existing_size; i += i & (~i + 1))
+        rank_changes.emplace_back(i - 1, delta);
+    }
+    std::sort(rank_changes.begin(), rank_changes.end());
+    for (std::size_t i = 0; i < rank_changes.size();) {
+      const auto index = rank_changes[i].first;
+      absl::int128 delta = 0;
+      do {
+        delta += rank_changes[i++].second;
+      } while (i < rank_changes.size() && rank_changes[i].first == index);
+      if (delta == 0) continue;
+      const auto value = absl::int128(cells_[index]) + delta;
+      if (value < 0 || value > item_count)
+        return absl::DataLossError("invalid ordered updated rank sum");
+      auto status = cells_.Set(index, static_cast<std::uint64_t>(value));
+      if (!status.ok()) return status;
+    }
+    return absl::OkStatus();
+  }
+};
+
+}  // namespace lavik::storage

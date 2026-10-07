@@ -31,15 +31,6 @@
 namespace lavik::storage {
 namespace {
 
-// The durable kind selects a runtime-only rank policy. String directories
-// pass an empty array and keep their direct segment arithmetic.
-absl::StatusOr<OrderedRankStorage> BuildRanks(
-    OrderedCollectionKind kind, std::vector<std::uint64_t> cumulative) {
-  if (kind == OrderedCollectionKind::kStream)
-    return FenwickRankOps::FromCumulative(std::move(cumulative));
-  return CumulativeRankOps::FromCumulative(std::move(cumulative));
-}
-
 constexpr std::string_view kRootMagic = "LOCROOT1";
 constexpr std::string_view kGroupMagic = "LOCGRUP1";
 constexpr std::size_t kRootBytes = kOrderedCollectionRootBytes;
@@ -731,7 +722,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
   if (!retired_array.ok()) return retired_array.status();
   auto id_array = decltype(result.ids_)::From(ids);
   if (!id_array.ok()) return id_array.status();
-  auto end_array = BuildRanks(root.kind_, std::move(ends));
+  auto end_array = OrderedIndex::FromCumulative(std::move(ends));
   if (!end_array.ok()) return end_array.status();
   result.groups_ = std::move(*group_array);
   result.retired_ = std::move(*retired_array);
@@ -952,11 +943,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
                 result.groups_[index + 1].min_score_)))
         return absl::DataLossError("unordered updated Sorted Set score bounds");
     }
-    auto status = root.kind_ == OrderedCollectionKind::kStream
-                      ? FenwickRankOps::ApplyCounts(
-                            result.ranks_, count_changes, root.item_count_)
-                      : CumulativeRankOps::ApplyCounts(
-                            result.ranks_, count_changes, root.item_count_);
+    auto status = result.ranks_.ApplyCounts(count_changes, root.item_count_);
     if (!status.ok()) return status;
     return result;
   }
@@ -1087,8 +1074,8 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       if (!groups.ok()) return groups.status();
       auto ids = ids_.Appended(new_ids);
       if (!ids.ok()) return ids.status();
-      auto ranks = FenwickRankOps::WithSuffix(ranks_, first, prefixes,
-                                              prefix_changes, root.item_count_);
+      auto ranks =
+          ranks_.WithSuffix(first, prefixes, prefix_changes, root.item_count_);
       if (!ranks.ok()) return ranks.status();
       rebuilt.groups_ = std::move(*groups);
       rebuilt.ids_ = std::move(*ids);
@@ -1264,7 +1251,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
   }
   auto id_array = decltype(ids_)::From(ids);
   if (!id_array.ok()) return id_array.status();
-  auto end_array = BuildRanks(root.kind_, std::move(ends));
+  auto end_array = OrderedIndex::FromCumulative(std::move(ends));
   if (!end_array.ok()) return end_array.status();
   rebuilt.groups_ = std::move(*group_array);
   rebuilt.ids_ = std::move(*id_array);
@@ -1288,9 +1275,7 @@ std::uint64_t OrderedGroupDirectory::CountBefore(
   if (index >= groups_.size()) return root_.item_count_;
   if (root_.kind_ == OrderedCollectionKind::kString)
     return index * kStringGroupBytes;
-  return root_.kind_ == OrderedCollectionKind::kStream
-             ? FenwickRankOps::CountBefore(ranks_, index)
-             : CumulativeRankOps::CountBefore(ranks_, index);
+  return ranks_.CountBefore(index);
 }
 
 std::optional<OrderedGroupDirectory::Position> OrderedGroupDirectory::FindRank(
@@ -1298,9 +1283,7 @@ std::optional<OrderedGroupDirectory::Position> OrderedGroupDirectory::FindRank(
   if (rank >= root_.item_count_) return std::nullopt;
   if (root_.kind_ == OrderedCollectionKind::kString)
     return Position{rank / kStringGroupBytes, rank % kStringGroupBytes};
-  return root_.kind_ == OrderedCollectionKind::kStream
-             ? FenwickRankOps::Locate(ranks_, rank)
-             : CumulativeRankOps::Locate(ranks_, rank);
+  return ranks_.Locate(rank);
 }
 
 std::size_t OrderedGroupDirectory::LowerBoundScore(

@@ -145,9 +145,9 @@ class GroupedMemoryScope {
   unsigned shard_;
 };
 
-TEST(GroupedMetadataMapTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
+TEST(MapIndexTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
   GroupedMemoryScope memory;
-  using Map = GroupedMetadataMap<std::uint64_t, std::uint64_t>;
+  using Map = MapIndex<std::uint64_t, std::uint64_t>;
   Map map;
   std::map<std::uint64_t, std::uint64_t> expected;
   for (std::uint64_t key = 0; key < 1152; ++key) {
@@ -205,93 +205,86 @@ TEST(GroupedMetadataMapTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
   for (const auto& [snapshot, values] : snapshots) check(snapshot, values);
 }
 
-template <typename Ops>
-class RankOpsTest : public testing::Test {};
-using RankOpsTypes = testing::Types<CumulativeRankOps, FenwickRankOps>;
-TYPED_TEST_SUITE(RankOpsTest, RankOpsTypes);
-
-TYPED_TEST(RankOpsTest, SparseTransfersMatchCountsAndPreserveSnapshots) {
+TEST(OrderedIndexTest, SparseTransfersMatchCountsAndPreserveSnapshots) {
   GroupedMemoryScope memory;
   std::vector<std::uint64_t> counts(1025, 10), ends;
   std::uint64_t total = 0;
   for (const auto count : counts) ends.push_back(total += count);
-  auto original = TypeParam::FromCumulative(ends);
+  auto original = OrderedIndex::FromCumulative(ends);
   ASSERT_TRUE(original.ok()) << original.status();
   auto current = *original;
   const auto check = [](const auto& index, const auto& values) {
     std::uint64_t sum = 0;
     for (std::size_t i = 0; i < values.size(); ++i) {
-      EXPECT_EQ(TypeParam::CountBefore(index, i), sum);
+      EXPECT_EQ(index.CountBefore(i), sum);
       for (const auto offset : {std::uint64_t{0}, values[i] - 1}) {
-        const auto position = TypeParam::Locate(index, sum + offset);
+        const auto position = index.Locate(sum + offset);
         EXPECT_EQ(position.group_index_, i);
         EXPECT_EQ(position.offset_, offset);
       }
       sum += values[i];
     }
-    EXPECT_EQ(TypeParam::CountBefore(index, values.size()), sum);
+    EXPECT_EQ(index.CountBefore(values.size()), sum);
   };
   for (std::size_t step = 0; step < 8; ++step) {
     const auto before = current;
     const auto old_counts = counts;
-    std::vector<typename TypeParam::CountChange> changes;
+    std::vector<OrderedIndex::CountChange> changes;
     for (const auto i : {step, 255 + step, 1024 - step}) {
       const auto replacement = 1 + (i + step) % 19;
       changes.emplace_back(i, absl::int128(replacement) - counts[i]);
       total = total - counts[i] + replacement;
       counts[i] = replacement;
     }
-    ASSERT_TRUE(TypeParam::ApplyCounts(current, changes, total).ok());
+    ASSERT_TRUE(current.ApplyCounts(changes, total).ok());
     check(current, counts);
     check(before, old_counts);
   }
   check(*original, std::vector<std::uint64_t>(1025, 10));
 }
 
-TYPED_TEST(RankOpsTest, AdmissionFailurePreservesPublishedIndex) {
+TEST(OrderedIndexTest, AdmissionFailurePreservesPublishedIndex) {
   GroupedMemoryScope memory;
-  auto original = TypeParam::FromCumulative({3, 7, 9});
+  auto original = OrderedIndex::FromCumulative({3, 7, 9});
   ASSERT_TRUE(original.ok());
   auto builder = *original;
-  const std::array<typename TypeParam::CountChange, 1> neutral{{{1, 0}}};
-  const std::array<typename TypeParam::CountChange, 1> changed{{{1, 1}}};
+  const std::array<OrderedIndex::CountChange, 1> neutral{{{1, 0}}};
+  const std::array<OrderedIndex::CountChange, 1> changed{{{1, 1}}};
   ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
-  EXPECT_TRUE(TypeParam::ApplyCounts(builder, neutral, 9).ok());
-  EXPECT_EQ(TypeParam::ApplyCounts(builder, changed, 10).code(),
+  EXPECT_TRUE(builder.ApplyCounts(neutral, 9).ok());
+  EXPECT_EQ(builder.ApplyCounts(changed, 10).code(),
             absl::StatusCode::kResourceExhausted);
-  EXPECT_EQ(TypeParam::CountBefore(*original, 2), 7);
-  EXPECT_EQ(TypeParam::Locate(*original, 7).group_index_, 2);
+  EXPECT_EQ(original->CountBefore(2), 7);
+  EXPECT_EQ(original->Locate(7).group_index_, 2);
   ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
   builder = *original;
-  ASSERT_TRUE(TypeParam::ApplyCounts(builder, changed, 10).ok());
-  EXPECT_EQ(TypeParam::CountBefore(builder, 2), 8);
-  EXPECT_EQ(TypeParam::CountBefore(*original, 2), 7);
+  ASSERT_TRUE(builder.ApplyCounts(changed, 10).ok());
+  EXPECT_EQ(builder.CountBefore(2), 8);
+  EXPECT_EQ(original->CountBefore(2), 7);
 }
 
-TEST(RankOpsTest, FenwickSuffixAppliesPrefixTransfersExactlyOnce) {
+TEST(OrderedIndexTest, FenwickSuffixAppliesPrefixTransfersExactlyOnce) {
   GroupedMemoryScope memory;
   for (const std::size_t first : {0, 1, 3, 4, 255, 256, 257}) {
     std::vector<std::uint64_t> ends(258);
     for (std::size_t i = 0; i < ends.size(); ++i) ends[i] = (i + 1) * 3;
-    auto original = FenwickRankOps::FromCumulative(ends);
+    auto original = OrderedIndex::FromCumulative(ends);
     ASSERT_TRUE(original.ok());
-    std::vector<FenwickRankOps::CountChange> prefix_changes;
+    std::vector<OrderedIndex::CountChange> prefix_changes;
     if (first != 0) prefix_changes.emplace_back(0, 2);
     std::vector<std::uint64_t> suffix;
     auto total = first * 3 + (first == 0 ? 0 : 2);
     for (std::size_t i = first; i < 261; ++i)
       suffix.push_back(total += 1 + i % 7);
-    auto extended = FenwickRankOps::WithSuffix(*original, first, suffix,
-                                               prefix_changes, total);
+    auto extended = original->WithSuffix(first, suffix, prefix_changes, total);
     ASSERT_TRUE(extended.ok()) << extended.status();
     for (std::size_t i = 0; i <= 261; ++i) {
       const auto expected =
           i <= first ? i * 3 + (i == 0 ? 0 : 2) : suffix[i - first - 1];
-      EXPECT_EQ(FenwickRankOps::CountBefore(*extended, i), expected);
-      if (i != 261)
-        EXPECT_EQ(FenwickRankOps::Locate(*extended, expected).group_index_, i);
+      EXPECT_EQ(extended->CountBefore(i), expected);
+      if (i != 261) EXPECT_EQ(extended->Locate(expected).group_index_, i);
     }
-    EXPECT_EQ(FenwickRankOps::CountBefore(*original, 258), 258 * 3);
+    EXPECT_EQ(original->CountBefore(258), 258 * 3);
   }
 }
 

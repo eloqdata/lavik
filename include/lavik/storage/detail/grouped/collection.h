@@ -30,7 +30,7 @@
 #include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped/hash.h"
 #include "lavik/storage/detail/grouped/metadata_array.h"
-#include "lavik/storage/detail/grouped/rank_index.h"
+#include "lavik/storage/detail/grouped/ordered_index.h"
 #include "lavik/storage/format.h"
 
 namespace lavik::storage {
@@ -326,7 +326,7 @@ class OrderedGroupDirectory {
     return members_ ? &*members_ : nullptr;
   }
 
-  using Position = OrderedRankPosition;
+  using Position = OrderedIndex::Position;
   std::optional<Position> FindRank(std::uint64_t rank) const noexcept;
   // Number of records in pages preceding index; index may equal
   // groups().size().
@@ -386,10 +386,9 @@ class OrderedGroupDirectory {
   GroupedMetadataArray<RecoveredOrderedGroup> groups_;
   GroupedMetadataArray<RecoveredOrderedGroup> retired_;
   GroupedMetadataArray<std::pair<std::uint64_t, std::size_t>, 256> ids_;
-  // root_.kind_ is the sole rank-layout discriminator: Stream uses Fenwick,
-  // List/ZSet use cumulative counts, and String leaves this storage empty.
-  // Apply rejects kind changes before sharing cells with a successor view.
-  OrderedRankStorage ranks_;
+  // List, ZSet and Stream share the same Fenwick rank representation. String
+  // leaves this index empty and uses fixed-segment arithmetic instead.
+  OrderedIndex ranks_;
   mutable std::array<char, 48> stream_header_{};
   mutable bool has_stream_header_ = false;
   // The inline directory shares owner-local AVL nodes; those nodes account

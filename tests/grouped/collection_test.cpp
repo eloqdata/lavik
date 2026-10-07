@@ -732,21 +732,32 @@ TEST(GroupedCollectionTest, SparseSameTopologyUpdateMatchesFullRecovery) {
   EXPECT_FALSE(original->Apply(root, 2, std::span(&changed, 1), 2).ok());
 }
 
-TEST(GroupedCollectionTest, RootKindOwnsRankLayoutAcrossSharedViews) {
+TEST(GroupedCollectionTest, RankUpdatesPreserveViewsAcrossOrderedKinds) {
   for (const auto kind :
-       {OrderedCollectionKind::kList, OrderedCollectionKind::kStream}) {
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet,
+        OrderedCollectionKind::kStream}) {
     std::vector<OrderedGroupSnapshot> pages;
     const std::array<std::size_t, 4> counts{3, 4, 2, 5};
+    std::size_t preceding = 0;
     for (std::size_t i = 0; i < counts.size(); ++i) {
       auto page = Page(i + 1, counts[i], kind);
+      if (kind == OrderedCollectionKind::kSortedSet) {
+        for (auto& entry : page.entries_) {
+          entry.score_ += preceding;
+          entry.value_ = std::to_string(i) + "-" + entry.value_;
+        }
+      }
+      preceding += counts[i];
       page.previous_ = i;
       page.next_ = i + 1 == counts.size() ? 0 : i + 2;
       pages.push_back(std::move(page));
     }
     auto root = Root(pages, 5);
     if (kind == OrderedCollectionKind::kStream) root.stream_length_ = 0;
-    auto original =
-        OrderedGroupDirectory::Recover(root, 1, Candidates(pages), {});
+    std::optional<HashGroupDirectory> members;
+    if (root.member_index_) members = grouped_test::MemberDirectory(root);
+    auto original = OrderedGroupDirectory::Recover(root, 1, Candidates(pages),
+                                                   {}, 1, std::move(members));
     ASSERT_TRUE(original.ok()) << original.status();
     EXPECT_EQ(original->CountBefore(3), 9);
     ASSERT_TRUE(original->FindRank(8));
@@ -757,7 +768,12 @@ TEST(GroupedCollectionTest, RootKindOwnsRankLayoutAcrossSharedViews) {
     ++changed.item_count_;
     ++root.item_count_;
     const std::array changes{changed};
-    auto updated = original->Apply(root, 2, changes, 2);
+    std::vector<RecoveredGroupedRecord> member_changes;
+    if (root.member_index_) {
+      root.member_index_ = grouped_test::MemberRoot(root);
+      member_changes.push_back(grouped_test::MemberRecord(root));
+    }
+    auto updated = original->Apply(root, 2, changes, 2, member_changes);
     ASSERT_TRUE(updated.ok()) << updated.status();
     EXPECT_EQ(updated->CountBefore(3), 10);
     ASSERT_TRUE(updated->FindRank(7));
@@ -766,11 +782,12 @@ TEST(GroupedCollectionTest, RootKindOwnsRankLayoutAcrossSharedViews) {
     ASSERT_TRUE(original->FindRank(7));
     EXPECT_EQ(original->FindRank(7)->group_index_, 2);
 
-    // Untagged cells must never be reinterpreted through the other policy,
-    // even when the replacement root is otherwise a valid collection kind.
+    // Sharing a rank representation does not allow changing a collection
+    // kind in place; the directory still owns that identity invariant.
     root.kind_ = kind == OrderedCollectionKind::kStream
                      ? OrderedCollectionKind::kList
                      : OrderedCollectionKind::kStream;
+    root.member_index_.reset();
     if (root.kind_ == OrderedCollectionKind::kStream)
       root.stream_length_ = 0;
     else

@@ -38,7 +38,7 @@
 #include "lavik/local_shared_ptr.h"
 #include "lavik/memory.h"
 #include "lavik/storage/detail/collection_limits.h"
-#include "lavik/storage/detail/grouped/metadata_map.h"
+#include "lavik/storage/detail/grouped/map_index.h"
 #include "lavik/storage/detail/hash_codec.h"
 #include "lavik/storage/scan_hash_map.h"
 
@@ -248,7 +248,7 @@ struct RecoveredGroupedRecord {
 // Hash routing specializes the metadata container without coupling its AVL
 // and overlay implementation to recovery records or field payloads.
 template <typename Key>
-using HashGroupMap = GroupedMetadataMap<Key, RecoveredGroupedRecord>;
+using HashGroupMap = MapIndex<Key, RecoveredGroupedRecord>;
 
 // Immutable routing view produced only after complete recovery validation.
 // It stores one entry per GROUP, not per field. Persistent metadata nodes
