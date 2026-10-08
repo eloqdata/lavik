@@ -389,11 +389,18 @@ using RecoveredGroupedRoot =
 struct RecoveryOrderedMetadata {
   std::uint64_t previous_ = 0;
   std::uint64_t next_ = 0;
-  double min_score_ = 0;
-  double max_score_ = 0;
-  StreamPageMaxKey stream_max_key_{};
+  struct ScoreBounds {
+    double min_ = 0;
+    double max_ = 0;
+  };
+  // RecordLocation's value type selects the active member. Stream pages have
+  // zero scores (checked by the decoder); only Sorted Set needs score bounds.
+  union {
+    ScoreBounds scores_{};
+    StreamPageMaxKey stream_max_key_;
+  };
 };
-static_assert(sizeof(RecoveryOrderedMetadata) <= 56);
+static_assert(sizeof(RecoveryOrderedMetadata) <= 40);
 
 struct RecoveryRecord {
   Digest digest_{};

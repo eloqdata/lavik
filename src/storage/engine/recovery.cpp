@@ -16,6 +16,7 @@
 
 #include <mimalloc.h>
 
+#include <memory>
 #include <tuple>
 
 #include "impl.h"
@@ -796,18 +797,19 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               ordered_group = RecoveryOrderedMetadata{
                   .previous_ = decoded->previous_,
                   .next_ = decoded->next_,
-                  .min_score_ = decoded->entries_.empty()
-                                    ? 0
-                                    : decoded->entries_.front().score_,
-                  .max_score_ = decoded->entries_.empty()
-                                    ? 0
-                                    : decoded->entries_.back().score_,
               };
-              if (ordered_kind == OrderedCollectionKind::kStream &&
-                  !decoded->retired_) {
-                auto max_key = StreamRecordKey(decoded->entries_.back().value_);
-                if (!max_key.ok()) co_return max_key.status();
-                ordered_group->stream_max_key_.Set(*max_key);
+              if (ordered_kind == OrderedCollectionKind::kStream) {
+                std::construct_at(&ordered_group->stream_max_key_);
+                if (!decoded->retired_) {
+                  auto max_key =
+                      StreamRecordKey(decoded->entries_.back().value_);
+                  if (!max_key.ok()) co_return max_key.status();
+                  ordered_group->stream_max_key_.Set(*max_key);
+                }
+              } else if (!decoded->entries_.empty()) {
+                ordered_group->scores_ = {
+                    .min_ = decoded->entries_.front().score_,
+                    .max_ = decoded->entries_.back().score_};
               }
             } else {
               auto decoded = DecodeHashGroup(encoded);
@@ -1380,7 +1382,6 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       --partition.live_key_count_[root_db];
       --store.live_key_count_[root_db];
       --partition.expiring_key_count_[root_db];
-      store.recovery_lsns_.erase(entry);
       store.recovery_txids_.erase(entry);
       store.recovery_grouped_roots_.erase(entry);
       store.external_manifests_.erase(entry);
@@ -1579,9 +1580,12 @@ StorageEngine::Impl::RecoverOrderedObject(
         co_return absl::DataLossError("ordered inline page has no metadata");
       candidate.previous_ = physical.ordered_group_->previous_;
       candidate.next_ = physical.ordered_group_->next_;
-      candidate.min_score_ = physical.ordered_group_->min_score_;
-      candidate.max_score_ = physical.ordered_group_->max_score_;
-      candidate.stream_max_key_ = physical.ordered_group_->stream_max_key_;
+      if (root.kind_ == OrderedCollectionKind::kStream) {
+        candidate.stream_max_key_ = physical.ordered_group_->stream_max_key_;
+      } else {
+        candidate.min_score_ = physical.ordered_group_->scores_.min_;
+        candidate.max_score_ = physical.ordered_group_->scores_.max_;
+      }
     }
     candidates.push_back(candidate);
   }

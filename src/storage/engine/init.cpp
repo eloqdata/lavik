@@ -1356,6 +1356,9 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     std::lock_guard<std::mutex> lock(recovery_committed_mutex_);
     recovery_committed_txids_.merge(committed_txids);
   }
+  // merge leaves the source allocation (and duplicate decisions) behind.
+  // Only the global set is consulted after the scan barrier.
+  absl::flat_hash_set<std::uint64_t>{}.swap(committed_txids);
 
   status = co_await ApplyRecoveryBatches(store, &batches);
   if (!status.ok()) {
@@ -1403,6 +1406,10 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   // Group reconstruction no longer needs parked keys, roots or manifests.
   // Release them before allocating the final grouped directories.
   std::vector<RecoveryPreparedRecord>{}.swap(store.recovery_tx_records_);
+  // Top-level winners are final. Drop their physical-copy tie-breakers before
+  // allocating grouped directories; auxiliary candidates carry their own LSN.
+  store.recovery_lsns_.clear();
+  store.recovery_lsns_.rehash(0);
   std::vector<RecoveryExpiredTombstone> expired_tombstones;
   std::uint64_t recovery_now_ms = UnixTimeMillis();
   LAVIK_FAULT_INJECT(
@@ -1481,8 +1488,6 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       }
     }
   }
-  store.recovery_lsns_.clear();
-  store.recovery_lsns_.rehash(0);
   if (worker.id() == 0) {
     // Seed the transaction-id counter above everything on disk so a new
     // boot's transactions can never alias a previous boot's commit records.
@@ -1765,6 +1770,11 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   status = co_await recovery_accounting_barrier_->Wait(worker);
   if (!status.ok()) {
     co_return status;
+  }
+  // Every worker has finished transaction adjudication and grouped recovery.
+  // The shared decisions have no runtime readers; only worker 0 destroys them.
+  if (worker.id() == 0) {
+    absl::flat_hash_set<std::uint64_t>{}.swap(recovery_committed_txids_);
   }
   // Every worker's live-reference pass has run, so no manifest still needs
   // to be matched against a recovered extent header.
