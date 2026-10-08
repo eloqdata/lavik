@@ -375,8 +375,10 @@ contents before forming a replacement interval. Only changed snapshots enter
 the writer, and admitted reply buffers retain their charge across owner hops.
 
 Sorted Set operations use a typed storage interface. Cardinality reads root
-metadata. Score lookups read only the selected member-prefix pages; member
-ranks scan admitted ordered pages. Rank ranges start at the directory's
+metadata. Score lookups read only the selected member-prefix pages. Member
+ranks resolve the score through that index, search the score-bounded ordered
+pages for the exact member, and combine its page offset with the directory's
+Fenwick prefix count. Rank ranges start at the directory's
 selected pages; score ranges and score counts first
 seek their candidate interval using resident score bounds, then read matching
 pages in physical order. Range, rank, count, scan, random and pop selection

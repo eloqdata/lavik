@@ -999,7 +999,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     if (!deleted.ok()) co_return deleted;
     co_return result;
   }
-  if (ScanRead(operation)) {
+  if (ScanRead(operation) && operation.kind_ != SortedSetOperationKind::kRank) {
     ReadCursor cursor(operation, &result);
     if (cursor.done_) co_return result;
     if (operation.kind_ == SortedSetOperationKind::kRange &&
@@ -1057,18 +1057,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           operation.reverse_ ? result.length_ - cursor.first_ : cursor.end_;
       first_page = directory.FindRank(begin_rank)->group_index_;
       end_page = directory.FindRank(end_rank - 1)->group_index_ + 1;
-    } else if (operation.kind_ != SortedSetOperationKind::kRank &&
-               operation.range_mode_ == SortedSetRangeMode::kScore) {
+    } else if (operation.range_mode_ == SortedSetRangeMode::kScore) {
       first_page = directory.LowerBoundScore(
           operation.minimum_score_.value_, operation.minimum_score_.exclusive_);
       end_page = directory.UpperBoundScore(operation.maximum_score_.value_,
                                            operation.maximum_score_.exclusive_);
       if (first_page >= end_page) co_return result;
     }
-    std::uint64_t rank = 0;
     const bool reverse = operation.reverse_;
-    for (std::size_t i = 0; i < (reverse ? end_page : first_page); ++i)
-      rank += metadata[i].item_count_;
+    std::uint64_t rank = directory.CountBefore(reverse ? end_page : first_page);
     for (std::size_t ordinal = 0;
          !cursor.done_ && ordinal < end_page - first_page; ++ordinal) {
       const auto i = reverse ? end_page - 1 - ordinal : first_page + ordinal;
@@ -1136,7 +1133,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         ++remaining_sources;
         return absl::OkStatus();
       };
-      if (operation.kind_ == SortedSetOperationKind::kScores) {
+      if (operation.kind_ == SortedSetOperationKind::kScores ||
+          operation.kind_ == SortedSetOperationKind::kRank) {
         auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
                                                   digest, object, id);
         if (!leaf.ok()) co_return leaf.status();
@@ -1173,6 +1171,33 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (!status.ok()) co_return status;
       co_return result;
     }
+  }
+  if (operation.kind_ == SortedSetOperationKind::kRank) {
+    const auto member = operation.members_.front();
+    const auto score = members.at(member).before_;
+    if (!score) co_return result;
+    // The member index supplies the score, not a page identity. Equal-score
+    // runs may span pages, so compare exact members within that interval;
+    // Fenwick supplies the skipped prefix without loading unrelated pages.
+    const auto first = directory.LowerBoundScore(*score);
+    const auto end = directory.UpperBoundScore(*score);
+    for (std::size_t i = first; i < end; ++i) {
+      auto page = co_await read_page(i);
+      if (!page.ok()) co_return page.status();
+      const auto& entries = page->page_.entries_;
+      for (std::size_t j = 0; j < entries.size(); ++j) {
+        if (entries[j].value_ != member) continue;
+        if (entries[j].score_ != *score)
+          co_return absl::DataLossError("Sorted Set member score mismatch");
+        const auto rank = directory.CountBefore(i) + j;
+        result.rank_ = operation.reverse_ ? result.length_ - 1 - rank : rank;
+        result.rank_score_ = *score;
+        co_return result;
+      }
+    }
+    // A member found in the hash graph must also exist in the ordered graph
+    // under the same retained logical root; absence is corruption, not nil.
+    co_return absl::DataLossError("Sorted Set indexed member missing");
   }
   // The two resident doubles bound old-score candidates without reading
   // unrelated pages. Equal-score runs still scan for exact members. Sort
