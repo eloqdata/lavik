@@ -16,6 +16,7 @@
 
 #include <mimalloc.h>
 
+#include <memory>
 #include <tuple>
 
 #include "impl.h"
@@ -750,7 +751,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         const auto ordered_kind = OrderedKind(record.value_type_);
         std::optional<RecoveredGroupedRoot> grouped_root;
         std::optional<RecoveredGroupedRecord> auxiliary_group;
-        std::optional<RecoveredOrderedGroup> ordered_group;
+        std::optional<RecoveryOrderedMetadata> ordered_group;
         if (record.auxiliary_group_) {
           std::uint64_t group_bytes =
               record.external_ ? 0 : record.payload_bytes_;
@@ -793,31 +794,22 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 co_return absl::DataLossError(
                     "ordered page disagrees with its record identity");
               }
-              ordered_group = RecoveredOrderedGroup{
-                  {
-                      .incarnation_ = decoded->incarnation_,
-                      .id_ = decoded->id_,
-                      .previous_ = decoded->previous_,
-                      .next_ = decoded->next_,
-                      .sequence_ = record.mutation_sequence_,
-                      .lsn_ = record.lsn_,
-                      .item_count_ = record.logical_size_,
-                      .encoded_bytes_ = group_bytes,
-                      .retired_ = record.group_retired_,
-                      .min_score_ = decoded->entries_.empty()
-                                        ? 0
-                                        : decoded->entries_.front().score_,
-                      .max_score_ = decoded->entries_.empty()
-                                        ? 0
-                                        : decoded->entries_.back().score_,
-                  },
-                  record.txid_,
-                  record.group_batch_txid_};
-              if (ordered_kind == OrderedCollectionKind::kStream &&
-                  !decoded->retired_) {
-                auto max_key = StreamRecordKey(decoded->entries_.back().value_);
-                if (!max_key.ok()) co_return max_key.status();
-                ordered_group->stream_max_key_.Set(*max_key);
+              ordered_group = RecoveryOrderedMetadata{
+                  .previous_ = decoded->previous_,
+                  .next_ = decoded->next_,
+              };
+              if (ordered_kind == OrderedCollectionKind::kStream) {
+                std::construct_at(&ordered_group->stream_max_key_);
+                if (!decoded->retired_) {
+                  auto max_key =
+                      StreamRecordKey(decoded->entries_.back().value_);
+                  if (!max_key.ok()) co_return max_key.status();
+                  ordered_group->stream_max_key_.Set(*max_key);
+                }
+              } else if (!decoded->entries_.empty()) {
+                ordered_group->scores_ = {
+                    .min_ = decoded->entries_.front().score_,
+                    .max_ = decoded->entries_.back().score_};
               }
             } else {
               auto decoded = DecodeHashGroup(encoded);
@@ -1006,24 +998,14 @@ absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
         extent_token =
             static_cast<std::uint32_t>(store.recovery_aux_extents_.size());
       }
-      store.recovery_hash_groups_.push_back(RecoveryAuxiliaryRecord{
-          .key_ = key,
-          .db_id_ = recovered.db_id_,
-          .location_ = recovered.location_,
-          .extent_token_ = extent_token,
-          .auxiliary_group_ = std::move(*recovered.auxiliary_group_),
-          .ordered_group_ = recovered.ordered_group_
-                                ? std::make_unique<RecoveredOrderedGroup>(
-                                      std::move(*recovered.ordered_group_))
-                                : nullptr,
-      });
+      store.recovery_hash_groups_.emplace_back(key, recovered, extent_token);
       continue;
     }
     if (recovered.txid_ != 0) {
       // Whether this record's transaction committed is only decidable once
       // every worker's scan has fed the committed set; park it until after
       // the recovery barrier.
-      store.recovery_tx_records_.push_back(recovered);
+      store.recovery_tx_records_.emplace_back(std::move(recovered));
       continue;
     }
     absl::Status applied = ApplyRecoveredRecord(store, recovered);
@@ -1046,6 +1028,10 @@ absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
       NoteTxRecordLocal(store, commit.block_id_, state->allocation_epoch_,
                         commit.txid_, commit.bytes_, true);
     }
+  }
+  if (WouldExceedMemoryLimit(0)) {
+    return absl::ResourceExhaustedError(
+        "recovery batch exceeds maxmemory including candidate metadata");
   }
   return absl::OkStatus();
 }
@@ -1257,7 +1243,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     std::string_view key_;
     std::uint8_t db_id_;
   };
-  std::vector<RootToRecover> roots;
+  RecoveryVector<RootToRecover> roots;
   roots.reserve(store.recovery_grouped_roots_.size());
   for (const auto& [entry, root] : store.recovery_grouped_roots_) {
     const RecordLocation location = MaterializeIndexLocation(*entry);
@@ -1359,8 +1345,8 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
           store.recovery_live_groups_.push_back(RecoveryLiveGroup{
               .location_ = physical.location_,
               .extents_ = std::move(extents),
-              .txid_ = physical.auxiliary_group_.txid_,
-              .batch_txid_ = physical.auxiliary_group_.batch_txid_,
+              .txid_ = physical.txid_,
+              .batch_txid_ = physical.batch_txid_,
           });
         }
         if (physical.extent_token_ != 0) {
@@ -1400,7 +1386,6 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       --partition.live_key_count_[root_db];
       --store.live_key_count_[root_db];
       --partition.expiring_key_count_[root_db];
-      store.recovery_lsns_.erase(entry);
       store.recovery_txids_.erase(entry);
       store.recovery_grouped_roots_.erase(entry);
       store.external_manifests_.erase(entry);
@@ -1431,9 +1416,9 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       retain_selected();
       continue;
     }
-    std::vector<RecoveredGroupedRecord> candidates;
+    RecoveryVector<RecoveredGroupedRecord> candidates;
     for (auto it = lower; it != end; ++it) {
-      auto candidate = it->auxiliary_group_;
+      auto candidate = it->AuxiliaryGroup();
       candidate.record_token_ =
           static_cast<std::uint64_t>(it - records.begin());
       candidates.push_back(candidate);
@@ -1447,7 +1432,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       retain_selected();
       continue;
     }
-    std::vector<GroupedRecordLocation> locations;
+    RecoveryVector<GroupedRecordLocation> locations;
     locations.reserve(directory->groups().size() +
                       directory->retired_groups().size());
     auto append_location = [&](const RecoveredGroupedRecord& selected) {
@@ -1484,7 +1469,9 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     if (!published.ok()) co_return published;
     retain_selected();
   }
-  records.clear();
+  // pop_front releases element blocks but leaves the deque's peak-sized map.
+  // Destroy that map before returning to normal request handling as well.
+  RecoveryAuxiliaryRecords{}.swap(records);
   store.recovery_aux_keys_.clear();
   store.recovery_aux_keys_.rehash(0);
   store.recovery_aux_extents_.clear();
@@ -1502,10 +1489,12 @@ StorageEngine::Impl::RecoverOrderedObject(
     RecoveryAuxiliaryRecords::iterator last) {
   const auto revision =
       root.revision_ == 0 ? version.root_.mutation_sequence_ : root.revision_;
-  std::map<std::uint64_t, std::size_t> winners;
-  std::vector<RecoveredGroupedRecord> member_candidates;
+  std::map<std::uint64_t, std::size_t, std::less<std::uint64_t>,
+           RecoveryAllocator<std::pair<const std::uint64_t, std::size_t>>>
+      winners;
+  RecoveryVector<RecoveredGroupedRecord> member_candidates;
   for (std::size_t i = 0; i < static_cast<std::size_t>(last - first); ++i) {
-    const auto& candidate = first[i].auxiliary_group_;
+    const auto candidate = first[i].AuxiliaryGroup();
     if (candidate.incarnation_ != root.incarnation_ ||
         candidate.sequence_ > revision ||
         (candidate.txid_ != 0 &&
@@ -1526,7 +1515,7 @@ StorageEngine::Impl::RecoverOrderedObject(
     }
     auto [position, inserted] = winners.emplace(candidate.id_.prefix_, i);
     if (inserted) continue;
-    const auto& previous = first[position->second].auxiliary_group_;
+    const auto previous = first[position->second].AuxiliaryGroup();
     if (candidate.sequence_ == previous.sequence_ &&
         (candidate.field_count_ != previous.field_count_ ||
          candidate.encoded_bytes_ != previous.encoded_bytes_ ||
@@ -1539,11 +1528,11 @@ StorageEngine::Impl::RecoverOrderedObject(
       position->second = i;
     }
   }
-  std::vector<RecoveredOrderedGroup> candidates;
+  RecoveryVector<RecoveredOrderedGroup> candidates;
   candidates.reserve(winners.size());
   for (const auto& [id, token] : winners) {
     auto& physical = first[token];
-    const auto& header = physical.auxiliary_group_;
+    const auto header = physical.AuxiliaryGroup();
     RecoveredOrderedGroup candidate{
         {
             .incarnation_ = header.incarnation_,
@@ -1597,9 +1586,12 @@ StorageEngine::Impl::RecoverOrderedObject(
         co_return absl::DataLossError("ordered inline page has no metadata");
       candidate.previous_ = physical.ordered_group_->previous_;
       candidate.next_ = physical.ordered_group_->next_;
-      candidate.min_score_ = physical.ordered_group_->min_score_;
-      candidate.max_score_ = physical.ordered_group_->max_score_;
-      candidate.stream_max_key_ = physical.ordered_group_->stream_max_key_;
+      if (root.kind_ == OrderedCollectionKind::kStream) {
+        candidate.stream_max_key_ = physical.ordered_group_->stream_max_key_;
+      } else {
+        candidate.min_score_ = physical.ordered_group_->scores_.min_;
+        candidate.max_score_ = physical.ordered_group_->scores_.max_;
+      }
     }
     candidates.push_back(candidate);
   }
@@ -1615,7 +1607,7 @@ StorageEngine::Impl::RecoverOrderedObject(
       root, revision, candidates, recovery_committed_txids_,
       version.root_.mutation_sequence_, std::move(members));
   if (!directory.ok()) co_return directory.status();
-  std::vector<GroupedRecordLocation> locations;
+  RecoveryVector<GroupedRecordLocation> locations;
   locations.reserve(candidates.size());
   const auto append = [&](const OrderedGroupEntry& candidate) {
     auto& physical = first[candidate.record_token_ - 1];
@@ -1657,7 +1649,7 @@ Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroup(
        record.location_.value_type() == ValueType::kList ||
        record.location_.value_type() == ValueType::kSortedSet ||
        record.location_.value_type() == ValueType::kStream) &&
-      IsOrderedPageId(record.auxiliary_group_.id_))
+      IsOrderedPageId(record.AuxiliaryGroup().id_))
     co_return absl::OkStatus();
   const ExtentManifest& extents = store.AuxiliaryExtents(record);
   if (extents == nullptr) {
@@ -1680,7 +1672,7 @@ Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroup(
   if (!prefix.ok()) co_return prefix.status();
   auto decoded = DecodeHashGroupMetadata(*prefix, encoded_bytes);
   if (!decoded.ok()) co_return decoded.status();
-  const RecoveredGroupedRecord& expected = record.auxiliary_group_;
+  const auto expected = record.AuxiliaryGroup();
   if (decoded->incarnation_ != expected.incarnation_ ||
       decoded->id_ != expected.id_ ||
       decoded->field_count_ != expected.field_count_ ||

@@ -447,6 +447,7 @@ class RedisService final : public TcpService, public ClientLimit {
  public:
   RedisService(std::uint16_t port, storage::StorageEngine* storage,
                ReplicationManager* replication,
+               RecoveryMemoryBudget* recovery_memory,
                long online_mimalloc_purge_delay_ms,
                std::string_view requirepass, std::string load_rdb_file,
                std::uint64_t max_clients,
@@ -454,6 +455,7 @@ class RedisService final : public TcpService, public ClientLimit {
       : TcpService(port),
         storage_(storage),
         replication_(replication),
+        recovery_memory_(recovery_memory),
         online_mimalloc_purge_delay_ms_(online_mimalloc_purge_delay_ms),
         authenticator_(requirepass),
         load_rdb_file_(std::move(load_rdb_file)),
@@ -537,6 +539,7 @@ class RedisService final : public TcpService, public ClientLimit {
 
   storage::StorageEngine* storage_;
   ReplicationManager* replication_;
+  RecoveryMemoryBudget* recovery_memory_;
   long online_mimalloc_purge_delay_ms_;
   PasswordAuthenticator authenticator_;
   std::string load_rdb_file_;
@@ -832,6 +835,15 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
     co_return status;
   }
   if (worker.id() == 0) {
+    status = recovery_memory_->Finish();
+    if (!status.ok()) {
+      startup_failed_.store(true, std::memory_order_release);
+      spdlog::error("storage recovery memory transition failed: {}",
+                    status.message());
+      online_allocator_barrier_->Abort(status);
+      server_->RequestStop();
+      co_return status;
+    }
     mi_option_set(mi_option_purge_delay, online_mimalloc_purge_delay_ms_);
     spdlog::info("mimalloc recovery collection complete; online purge_delay={}",
                  mi_option_get(mi_option_purge_delay));
@@ -2291,6 +2303,7 @@ int RunServer(ServerOptions options) {
       options.storage_write_buffer_count_;
   storage_options.buffers_.read_payload_bytes_ =
       options.storage_read_buffer_bytes_;
+  RecoveryMemoryBudget recovery_memory;
   storage::StorageEngine storage(std::move(storage_options));
   absl::Status storage_status = storage.Prepare(options.shard_count_);
   if (!storage_status.ok()) [[unlikely]] {
@@ -2413,7 +2426,7 @@ int RunServer(ServerOptions options) {
   runtime_options.spdk_foreground_pre_poll_us_ =
       options.spdk_foreground_pre_poll_us_;
 
-  RedisService redis(options.port_, &storage, &replication,
+  RedisService redis(options.port_, &storage, &replication, &recovery_memory,
                      options.mimalloc_purge_delay_ms_, options.requirepass_,
                      std::move(options.load_rdb_file_), options.max_clients_,
                      options.client_query_buffer_limit_bytes_);

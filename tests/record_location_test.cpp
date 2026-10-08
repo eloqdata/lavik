@@ -35,6 +35,36 @@ TEST(RecoveryMemoryTest, DividesTemporaryBatchTargetAcrossWorkers) {
             kRecoveryProcessBatchTargetBytes / kMaxMemoryWorkers);
 }
 
+TEST(RecoveryMemoryTest, PreparedViewsSurviveBatchDestructionAndVectorGrowth) {
+  std::vector<RecoveryPreparedRecord> parked;
+  for (unsigned i = 0; i < 64; ++i) {
+    RecoveryRecord record;
+    // Cover SSO strings, owned long strings and shared indirect keys. The
+    // parked view must never point into the destroyed/moved scan record.
+    record.key_ = i % 3 == 0 ? "short" : std::string(128, 'k');
+    if (i % 3 == 2) {
+      record.indirect_key_ = std::make_shared<const std::string>("indirect");
+    }
+    if (i % 2 == 0) {
+      record.grouped_root_ = GroupedHashRoot{.incarnation_ = i + 101};
+    }
+    parked.emplace_back(std::move(record));
+  }
+  for (unsigned i = 0; i < parked.size(); ++i) {
+    const auto view = parked[i].View();
+    EXPECT_EQ(view.key_, i % 3 == 0   ? "short"
+                         : i % 3 == 1 ? std::string(128, 'k')
+                                      : "indirect");
+    if (i % 2 == 0) {
+      ASSERT_NE(view.grouped_root_, nullptr);
+      EXPECT_EQ(std::get<GroupedHashRoot>(*view.grouped_root_).incarnation_,
+                i + 101);
+    } else {
+      EXPECT_EQ(view.grouped_root_, nullptr);
+    }
+  }
+}
+
 TEST(RecordLocationTest, PackedMetadataRoundTripsMaximumValues) {
   constexpr std::uint32_t offset =
       static_cast<std::uint32_t>(kStorageBlockBytes - kRecordAlignment);

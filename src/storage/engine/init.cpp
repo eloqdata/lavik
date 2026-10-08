@@ -1356,6 +1356,9 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     std::lock_guard<std::mutex> lock(recovery_committed_mutex_);
     recovery_committed_txids_.merge(committed_txids);
   }
+  // merge leaves the source allocation (and duplicate decisions) behind.
+  // Only the global set is consulted after the scan barrier.
+  absl::flat_hash_set<std::uint64_t>{}.swap(committed_txids);
 
   status = co_await ApplyRecoveryBatches(store, &batches);
   if (!status.ok()) {
@@ -1390,15 +1393,23 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   // without its commit record is a prepare whose transaction never durably
   // committed — recovery drops it, which is exactly the all-or-nothing the
   // commit protocol promises.
-  for (const RecoveryRecord& parked : store.recovery_tx_records_) {
+  for (const RecoveryPreparedRecord& parked : store.recovery_tx_records_) {
     if (recovery_committed_txids_.contains(parked.txid_)) {
-      status = ApplyRecoveredRecord(store, parked);
+      status = ApplyRecoveredRecord(store, PartitionForKey(store, parked.key()),
+                                    parked.View());
       if (!status.ok()) {
         Fail(status);
         co_return status;
       }
     }
   }
+  // Group reconstruction no longer needs parked keys, roots or manifests.
+  // Release them before allocating the final grouped directories.
+  RecoveryVector<RecoveryPreparedRecord>{}.swap(store.recovery_tx_records_);
+  // Top-level winners are final. Drop their physical-copy tie-breakers before
+  // allocating grouped directories; auxiliary candidates carry their own LSN.
+  store.recovery_lsns_.clear();
+  store.recovery_lsns_.rehash(0);
   std::vector<RecoveryExpiredTombstone> expired_tombstones;
   std::uint64_t recovery_now_ms = UnixTimeMillis();
   LAVIK_FAULT_INJECT(
@@ -1477,10 +1488,6 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       }
     }
   }
-  store.recovery_tx_records_.clear();
-  store.recovery_tx_records_.shrink_to_fit();
-  store.recovery_lsns_.clear();
-  store.recovery_lsns_.rehash(0);
   if (worker.id() == 0) {
     // Seed the transaction-id counter above everything on disk so a new
     // boot's transactions can never alias a previous boot's commit records.
@@ -1753,7 +1760,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     }
   }
   store.recovery_hash_groups_.clear();
-  store.recovery_live_groups_.clear();
+  RecoveryLiveGroups{}.swap(store.recovery_live_groups_);
   status = co_await ApplyRecoveryLiveReferenceBatches(store, &live_by_owner);
   if (!status.ok()) {
     Fail(status);
@@ -1764,9 +1771,15 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   if (!status.ok()) {
     co_return status;
   }
+  // Every worker has finished transaction adjudication and grouped recovery.
+  // The shared decisions have no runtime readers; only worker 0 destroys them.
+  if (worker.id() == 0) {
+    absl::flat_hash_set<std::uint64_t>{}.swap(recovery_committed_txids_);
+  }
   // Every worker's live-reference pass has run, so no manifest still needs
   // to be matched against a recovered extent header.
   store.recovered_extents_.clear();
+  store.recovered_extents_.rehash(0);
   store.recovery_txids_.clear();
   store.recovery_txids_.rehash(0);
 
@@ -1990,6 +2003,12 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   store.recovery_external_keys_.rehash(0);
   store.indirect_keys_.ForEach(
       [](auto& entry) { entry.value_->recovery_key_.reset(); });
+  if (WouldExceedMemoryLimit(0)) {
+    status = absl::ResourceExhaustedError(
+        "recovery exceeds maxmemory including temporary metadata");
+    Fail(status);
+    co_return status;
+  }
   worker.SpawnRoot(PeriodicFlush(&store));
   worker.SpawnBackground(ActiveExpiration(&store));
   // The scheduler lives until shutdown, including OFF and incomplete FULL.

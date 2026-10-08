@@ -56,8 +56,9 @@ struct MemoryStats {
 // Snapshot of the accounting inputs used by one worker's memory gates.
 // Retained bytes include that worker's deterministic share of allocations
 // created outside a bound worker, so retained + pending + full-sync reserved
-// reconciles with the worker-local admission decision. Temporary allocations
-// and RSS remain process-wide diagnostics and are intentionally absent.
+// reconciles with the worker-local admission decision. Accounted recovery
+// containers are included while live; ordinary scratch and RSS remain
+// process-wide diagnostics and are intentionally absent.
 struct WorkerMemoryStats {
   std::uint64_t retained_bytes_ = 0;
   std::uint64_t admission_pending_bytes_ = 0;
@@ -163,6 +164,26 @@ absl::Status InitMemoryLimit(std::uint64_t configured_max_bytes,
                              unsigned worker_count,
                              ClientBufferLimit client_buffer_limit = {});
 
+// Startup-only budget: recovery may use the entire configured worker share.
+// Create before starting workers and destroy after joining them. Finish must
+// run at a startup barrier, after every worker has released recovery scratch;
+// it refuses the transition if any worker exceeds its normal 90% share.
+// Destruction also restores the normal policy on failed/abandoned startup.
+class RecoveryMemoryBudget {
+ public:
+  RecoveryMemoryBudget() noexcept;
+  ~RecoveryMemoryBudget();
+  RecoveryMemoryBudget(const RecoveryMemoryBudget&) = delete;
+  RecoveryMemoryBudget& operator=(const RecoveryMemoryBudget&) = delete;
+  absl::Status Finish();
+  // Background index maintenance must wait for the online policy. Otherwise
+  // it could consume recovery headroom while Finish checks another worker.
+  static bool Active() noexcept;
+
+ private:
+  bool active_ = true;
+};
+
 // Associates subsequent admission and retained allocations with one worker.
 // This does not replace the thread's default mimalloc heap: ordinary C++
 // allocations use mimalloc without participating in maxmemory accounting.
@@ -172,8 +193,8 @@ void BindMemoryAccountingShard(unsigned worker_id) noexcept;
 // fallback for startup and non-worker threads; worker N owns slot N+1.
 unsigned CurrentMemoryAccountingShard() noexcept;
 
-// Explicit retained-memory ownership. These functions are intentionally used
-// only by long-lived data structures, not by global new/delete. The owner slot
+// Explicit accumulating-memory ownership, including recovery containers.
+// These functions do not instrument global new/delete. The owner slot
 // travels with the allocation domain, so cross-worker destruction returns
 // bytes to the origin without a pointer-to-owner index.
 void AccountRetainedMemory(unsigned owner_shard, std::size_t bytes) noexcept;
@@ -196,10 +217,12 @@ void RefreshMemoryDiagnostics() noexcept;
 MemoryStats GetMemoryStats() noexcept;
 
 // Conservative preflight for retained allocations. Ten percent of configured
-// maxmemory is withheld from retained state; the default client-buffer quota
-// may consume five percentage points, leaving five for allocator, IO, and
+// maxmemory is withheld from retained state during normal operation (startup
+// RecoveryMemoryBudget temporarily uses the full share); the client-buffer
+// quota may consume five percentage points, leaving five for allocator, IO, and
 // request-time peaks. Ordinary temporary allocations do not participate in
-// admission; this boundary controls state that can accumulate. It never calls
+// admission; explicitly accounted recovery containers share this budget.
+// This boundary controls state that can accumulate. It never calls
 // into mimalloc and performs only relaxed atomic loads.
 bool WouldExceedMemoryLimit(std::size_t additional_bytes) noexcept;
 // Reserves headroom in the calling worker's fixed share. Worker reservations

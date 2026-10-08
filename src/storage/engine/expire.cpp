@@ -508,6 +508,11 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
       break;
     }
 
+    // Recovery releases its extra admission headroom only after all workers
+    // finish. Do not start online index growth/expiration under that temporary
+    // budget while a different worker is still reconstructing its data.
+    if (RecoveryMemoryBudget::Active()) continue;
+
     // Sample once after waking: CONFIG can run while this cycle yields, but
     // cannot extend an in-flight batch by repeatedly raising its budget.
     const std::size_t map_steps = ActiveExpirationConfigValue(

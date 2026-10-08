@@ -75,6 +75,7 @@ std::atomic<bool> g_client_buffer_limit_percentage{true};
 // slot N+1, so workers never update the same cache line.
 std::array<AllocationShard, kMaxMemoryWorkers + 1> g_allocation_shards;
 std::atomic<unsigned> g_accounted_workers{0};
+std::atomic<bool> g_recovery_memory_budget{false};
 thread_local unsigned g_allocation_shard = 0;
 thread_local std::uint64_t g_local_admission_pending_bytes = 0;
 thread_local std::uint64_t g_local_fullsync_reserved_bytes = 0;
@@ -246,7 +247,7 @@ bool WorkerWouldExceed(std::uint64_t maximum, std::size_t additional_bytes,
     const std::uint64_t used = RetainedUsed();
     const std::uint64_t reserved = SumFullSyncReserved();
     const std::uint64_t pending = SumAdmissionPending();
-    return used >= maximum || reserved > maximum - used ||
+    return used > maximum || reserved > maximum - used ||
            pending > maximum - used - reserved ||
            additional_bytes > maximum - used - reserved - pending;
   }
@@ -259,7 +260,7 @@ bool WorkerWouldExceed(std::uint64_t maximum, std::size_t additional_bytes,
   const std::uint64_t owned =
       g_allocation_shards[g_allocation_shard].retained_bytes_.load(
           std::memory_order_relaxed);
-  return shared >= capacity || owned > capacity - shared ||
+  return shared > capacity || owned > capacity - shared ||
          fullsync_bytes > capacity - shared - owned ||
          pending_bytes > capacity - shared - owned - fullsync_bytes ||
          additional_bytes >
@@ -274,6 +275,12 @@ std::uint64_t SteadyMemoryLimit() noexcept {
   // IO, and request-time peaks even when both admitted classes are full.
   // Temporary allocations are intentionally not admitted one by one.
   return maximum - maximum / 10;
+}
+
+std::uint64_t AdmissionMemoryLimit() noexcept {
+  return g_recovery_memory_budget.load(std::memory_order_relaxed)
+             ? g_memory_gauges.max_bytes_.load(std::memory_order_relaxed)
+             : SteadyMemoryLimit();
 }
 
 constexpr std::uint64_t kMinimumClientBufferBytes = 128 * 1024;
@@ -301,6 +308,50 @@ void UpdatePeak(std::uint64_t current) noexcept {
 }
 
 }  // namespace
+
+RecoveryMemoryBudget::RecoveryMemoryBudget() noexcept {
+  // A process has one startup owner; overlapping recoveries would restore the
+  // normal policy while another owner still relied on the extra headroom.
+  if (g_recovery_memory_budget.exchange(true, std::memory_order_relaxed))
+    std::abort();
+}
+
+bool RecoveryMemoryBudget::Active() noexcept {
+  return g_recovery_memory_budget.load(std::memory_order_relaxed);
+}
+
+RecoveryMemoryBudget::~RecoveryMemoryBudget() {
+  if (active_) g_recovery_memory_budget.store(false, std::memory_order_relaxed);
+}
+
+absl::Status RecoveryMemoryBudget::Finish() {
+  if (!active_) return absl::OkStatus();
+  const auto limit = SteadyMemoryLimit();
+  const auto total = SaturatingAdd(
+      RetainedUsed(),
+      SaturatingAdd(SumAdmissionPending(), SumFullSyncReserved()));
+  if (limit != 0 && total > limit) {
+    return absl::ResourceExhaustedError(
+        absl::StrCat("recovered memory exceeds online budget: used=", total,
+                     " limit=", limit));
+  }
+  const unsigned workers = MemoryAccountingWorkerCount();
+  for (unsigned worker = 0; limit != 0 && worker < workers; ++worker) {
+    const auto stats = GetWorkerMemoryStats(worker);
+    const auto used = SaturatingAdd(
+        stats.retained_bytes_, SaturatingAdd(stats.admission_pending_bytes_,
+                                             stats.fullsync_reserved_bytes_));
+    const auto share = DistributedShare(limit, worker, workers);
+    if (used > share) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "recovered memory exceeds online budget: worker=", worker,
+          " used=", used, " limit=", share));
+    }
+  }
+  g_recovery_memory_budget.store(false, std::memory_order_relaxed);
+  active_ = false;
+  return absl::OkStatus();
+}
 
 absl::Status InitMemoryLimit(std::uint64_t configured_max_bytes,
                              unsigned worker_count,
@@ -418,7 +469,7 @@ WorkerMemoryStats GetWorkerMemoryStats(unsigned worker_id) noexcept {
       .client_buffered_bytes_ =
           shard.client_buffered_bytes_.load(std::memory_order_relaxed),
       .retained_limit_bytes_ =
-          DistributedShare(SteadyMemoryLimit(), worker_id, workers),
+          DistributedShare(AdmissionMemoryLimit(), worker_id, workers),
   };
 }
 
@@ -469,7 +520,7 @@ MemoryStats GetMemoryStats() noexcept {
 }
 
 bool WouldExceedMemoryLimit(std::size_t additional_bytes) noexcept {
-  return WorkerWouldExceed(SteadyMemoryLimit(), additional_bytes,
+  return WorkerWouldExceed(AdmissionMemoryLimit(), additional_bytes,
                            g_local_admission_pending_bytes,
                            g_local_fullsync_reserved_bytes);
 }
@@ -642,7 +693,7 @@ void RetainedMemoryCharge::Reset() noexcept {
 }
 
 std::optional<MemoryReservation> TryReserveMemory(std::size_t bytes) noexcept {
-  const std::uint64_t maximum = SteadyMemoryLimit();
+  const std::uint64_t maximum = AdmissionMemoryLimit();
   if (bytes == 0 || maximum == 0) {
     return MemoryReservation(0, g_allocation_shard, true);
   }
@@ -673,7 +724,7 @@ std::size_t AllocatorUsableSizeForRequest(
 
 bool TryReserveFullSyncMemory(std::size_t bytes) noexcept {
   if (bytes == 0) return true;
-  const std::uint64_t maximum = SteadyMemoryLimit();
+  const std::uint64_t maximum = AdmissionMemoryLimit();
   if (WorkerWouldExceed(maximum, bytes, g_local_admission_pending_bytes,
                         g_local_fullsync_reserved_bytes)) {
     return false;
