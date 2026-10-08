@@ -3629,6 +3629,9 @@ TEST(HashE2eTest, ExpiredShieldedWinnerDoesNotResurrectOlderString) {
 }
 
 TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
+#if defined(NDEBUG) && !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "post-recovery OOM injection requires test faults";
+#else
   ASSERT_FALSE(g_lavik_binary.empty());
   const std::string prefix = lavik::test::TestDataPathPrefix() +
                              "lavik-memory-recovery-" +
@@ -3674,7 +3677,7 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
                               std::string(16 * 1024 - 90, 'v')}),
               Bulk("1-0"));
     // Keep enough keys in one partition to require direct-bucket growth when
-    // the index is rebuilt by the low-memory restart below.
+    // the index is rebuilt before the online OOM injection below.
     for (int i = 0; i < 16; ++i) {
       const std::string key = "{memory-recovery}:" + std::to_string(i);
       EXPECT_EQ(client.Command({"SET", key, "value"}), "+OK");
@@ -3683,10 +3686,12 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
     server.Stop();
   }
   {
-    ServerProcess server(g_lavik_binary, port, data_path, log_path, 2, {},
-                         {"--max-memory", "1"});
+    // A one-byte startup budget must now fail recovery. Instead, recover
+    // normally and lower the budget at the online transition, so the same
+    // shrink/read/scratch checks exercise an already-running OOM server.
+    ServerProcess server(g_lavik_binary, port, data_path, log_path, 2, {}, {},
+                         {{"LAVIK_TEST_OOM_AFTER_RECOVERY", "1"}});
     RespClient client(port);
-    std::this_thread::sleep_for(200ms);
     EXPECT_TRUE(client.Command({"SET", "must-be-rejected", "value"})
                     .starts_with("-OOM command not allowed"));
     for (int i = 0; i < 16; ++i) {
@@ -3756,6 +3761,7 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
     EXPECT_EQ(client.Command({"ZCARD", large_inline_zset_key}), ":1");
     server.Stop();
   }
+#endif
 }
 
 TEST(CollectionE2eTest, ExecPartialWritesRollbackDurably) {

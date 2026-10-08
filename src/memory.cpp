@@ -34,6 +34,7 @@
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "lavik/fault_injection.h"
 #include "mimalloc-stats.h"
 #include "mimalloc.h"
 
@@ -350,6 +351,12 @@ absl::Status RecoveryMemoryBudget::Finish() {
   }
   g_recovery_memory_budget.store(false, std::memory_order_relaxed);
   active_ = false;
+  // Exercise commands that release memory after successful recovery without
+  // bypassing startup admission. Package builds erase this test-only hook.
+  LAVIK_FAULT_INJECT(
+      if (LAVIK_FAULT_MATCHES("LAVIK_TEST_OOM_AFTER_RECOVERY", "1")) {
+        g_memory_gauges.max_bytes_.store(1, std::memory_order_relaxed);
+      });
   return absl::OkStatus();
 }
 
