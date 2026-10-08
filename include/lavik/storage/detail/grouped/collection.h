@@ -412,7 +412,7 @@ class OrderedGroupDirectory {
   const OrderedGroupEntry* FindRecord(std::uint64_t id) const noexcept;
   // Borrowed logical-order view. Iterators borrow the underlying array and
   // head coordinates, not this temporary view; the directory must outlive them.
-  class Groups {
+  class GroupsView {
    public:
     class const_iterator {
      public:
@@ -471,7 +471,7 @@ class OrderedGroupDirectory {
       auto operator<=>(const const_iterator&) const = default;
 
      private:
-      friend class Groups;
+      friend class GroupsView;
       const_iterator(const CowArray<OrderedGroupEntry>* array, std::size_t head,
                      std::size_t index)
           : array_(array), head_(head), index_(index) {}
@@ -491,13 +491,13 @@ class OrderedGroupDirectory {
 
    private:
     friend class OrderedGroupDirectory;
-    Groups(const CowArray<OrderedGroupEntry>* array, std::size_t head,
-           std::size_t size)
+    GroupsView(const CowArray<OrderedGroupEntry>* array, std::size_t head,
+               std::size_t size)
         : array_(array), head_(head), size_(size) {}
     const CowArray<OrderedGroupEntry>* array_;
     std::size_t head_, size_;
   };
-  Groups groups() const noexcept {
+  GroupsView groups() const noexcept {
     const auto* list = std::get_if<ListSlots>(&ids_);
     return {&groups_, list ? list->head_ : 0, root_.group_count_};
   }
