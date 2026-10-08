@@ -1390,15 +1390,19 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   // without its commit record is a prepare whose transaction never durably
   // committed — recovery drops it, which is exactly the all-or-nothing the
   // commit protocol promises.
-  for (const RecoveryRecord& parked : store.recovery_tx_records_) {
+  for (const RecoveryPreparedRecord& parked : store.recovery_tx_records_) {
     if (recovery_committed_txids_.contains(parked.txid_)) {
-      status = ApplyRecoveredRecord(store, parked);
+      status = ApplyRecoveredRecord(store, PartitionForKey(store, parked.key()),
+                                    parked.View());
       if (!status.ok()) {
         Fail(status);
         co_return status;
       }
     }
   }
+  // Group reconstruction no longer needs parked keys, roots or manifests.
+  // Release them before allocating the final grouped directories.
+  std::vector<RecoveryPreparedRecord>{}.swap(store.recovery_tx_records_);
   std::vector<RecoveryExpiredTombstone> expired_tombstones;
   std::uint64_t recovery_now_ms = UnixTimeMillis();
   LAVIK_FAULT_INJECT(
@@ -1477,8 +1481,6 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       }
     }
   }
-  store.recovery_tx_records_.clear();
-  store.recovery_tx_records_.shrink_to_fit();
   store.recovery_lsns_.clear();
   store.recovery_lsns_.rehash(0);
   if (worker.id() == 0) {

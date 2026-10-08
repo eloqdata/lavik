@@ -383,6 +383,18 @@ struct ExtentIdentity {
 using RecoveredGroupedRoot =
     std::variant<GroupedHashRoot, OrderedCollectionRoot>;
 
+// The auxiliary record already owns identity, revision, decision tags and
+// counts. Retain only the ordered envelope that cannot be reconstructed from
+// that header; historical pages must not each allocate a second full header.
+struct RecoveryOrderedMetadata {
+  std::uint64_t previous_ = 0;
+  std::uint64_t next_ = 0;
+  double min_score_ = 0;
+  double max_score_ = 0;
+  StreamPageMaxKey stream_max_key_{};
+};
+static_assert(sizeof(RecoveryOrderedMetadata) <= 56);
+
 struct RecoveryRecord {
   Digest digest_{};
   std::string key_;
@@ -408,7 +420,7 @@ struct RecoveryRecord {
   // enter the top-level winner merge. Keep only checked routing metadata;
   // complete group values remain on disk throughout index reconstruction.
   std::optional<RecoveredGroupedRecord> auxiliary_group_;
-  std::optional<RecoveredOrderedGroup> ordered_group_;
+  std::optional<RecoveryOrderedMetadata> ordered_group_;
   std::optional<RecoveredGroupedRoot> grouped_root_;
   // Set only by complete graph reconstruction, then consumed by the bounded
   // physical-accounting pass. A prepared/orphan auxiliary never owns bytes.
@@ -428,24 +440,67 @@ struct RecoveryRecord {
 // routing fields, so retaining it for millions of superseded groups can OOM
 // a node whose steady-state index fits in memory.
 struct RecoveryAuxiliaryRecord {
+  RecoveryAuxiliaryRecord(const std::string* key,
+                          const RecoveryRecord& recovered,
+                          std::uint32_t extent_token)
+      : key_(key),
+        location_(recovered.location_),
+        incarnation_(recovered.auxiliary_group_->incarnation_),
+        prefix_(recovered.auxiliary_group_->id_.prefix_),
+        lsn_(recovered.auxiliary_group_->lsn_),
+        txid_(recovered.auxiliary_group_->txid_),
+        batch_txid_(recovered.auxiliary_group_->batch_txid_),
+        encoded_bytes_(recovered.auxiliary_group_->encoded_bytes_),
+        ordered_group_(recovered.ordered_group_
+                           ? std::make_unique<RecoveryOrderedMetadata>(
+                                 *recovered.ordered_group_)
+                           : nullptr),
+        extent_token_(extent_token),
+        db_id_(recovered.db_id_),
+        prefix_bits_(recovered.auxiliary_group_->id_.bits_),
+        retired_(recovered.auxiliary_group_->retired_) {
+    assert(recovered.auxiliary_group_->sequence_ ==
+           location_.mutation_sequence_);
+    assert(recovered.auxiliary_group_->field_count_ == location_.logical_size_);
+    assert(recovered.auxiliary_group_->record_token_ == 0);
+  }
+
   // WorkerStore's recovery_aux_keys_ owns this string until all candidates
-  // have been consumed. A raw pointer keeps three candidates per deque block.
+  // have been consumed. Identity and location each have a single owner here;
+  // expand the public recovery header only while selecting one key's graph.
   const std::string* key_ = nullptr;
   std::string_view key() const noexcept { return *key_; }
-  std::uint8_t db_id_ = 0;
   RecordLocation location_{};
+  std::uint64_t incarnation_ = 0;
+  std::uint64_t prefix_ = 0;
+  std::uint64_t lsn_ = 0;
+  std::uint64_t txid_ = 0;
+  std::uint64_t batch_txid_ = 0;
+  std::uint64_t encoded_bytes_ = 0;
+  std::unique_ptr<RecoveryOrderedMetadata> ordered_group_;
   // One-based index into WorkerStore::recovery_aux_extents_; zero is inline.
   std::uint32_t extent_token_ = 0;
-  RecoveredGroupedRecord auxiliary_group_;
-  // Hash candidates never need ordered-page metadata. Allocate it only for
-  // inline ordered pages instead of reserving its size in every candidate.
-  std::unique_ptr<RecoveredOrderedGroup> ordered_group_;
+  std::uint8_t db_id_ = 0;
+  std::uint8_t prefix_bits_ = 0;
+  bool retired_ = false;
   bool grouped_reachable_ = false;
+
+  RecoveredGroupedRecord AuxiliaryGroup() const noexcept {
+    return {.incarnation_ = incarnation_,
+            .id_ = {.prefix_ = prefix_, .bits_ = prefix_bits_},
+            .sequence_ = location_.mutation_sequence_,
+            .lsn_ = lsn_,
+            .txid_ = txid_,
+            .batch_txid_ = batch_txid_,
+            .field_count_ = location_.logical_size_,
+            .encoded_bytes_ = encoded_bytes_,
+            .retired_ = retired_};
+  }
 };
 
-// Three candidates must fit in one 512-byte deque block. Crossing that
+// Four candidates must fit in one 512-byte deque block. Crossing that
 // boundary raises cold-recovery resident memory sharply on large histories.
-static_assert(sizeof(RecoveryAuxiliaryRecord) <= 168);
+static_assert(sizeof(RecoveryAuxiliaryRecord) <= 112);
 
 using RecoveryAuxiliaryRecords = std::deque<RecoveryAuxiliaryRecord>;
 
@@ -480,6 +535,57 @@ struct RecoveryRecordView {
   const RecoveredGroupedRoot* grouped_root_ = nullptr;
   bool checkpoint_snapshot_ = false;
 };
+
+// Transaction candidates cannot be auxiliaries (those take the branch above
+// the transaction parking path). Move their owned key/manifest out of the scan
+// batch and allocate root metadata only when the record actually has a root.
+struct RecoveryPreparedRecord {
+  explicit RecoveryPreparedRecord(RecoveryRecord&& record)
+      : digest_(record.digest_),
+        key_(std::move(record.key_)),
+        indirect_key_(std::move(record.indirect_key_)),
+        txid_(record.txid_),
+        lsn_(record.lsn_),
+        replication_epoch_(record.replication_epoch_),
+        location_(record.location_),
+        extents_(std::move(record.extents_)),
+        grouped_root_(record.grouped_root_
+                          ? std::make_unique<RecoveredGroupedRoot>(
+                                std::move(*record.grouped_root_))
+                          : nullptr),
+        db_id_(record.db_id_),
+        checkpoint_snapshot_(record.checkpoint_snapshot_) {
+    assert(!record.auxiliary_group_ && !record.ordered_group_);
+  }
+  std::string_view key() const noexcept {
+    return indirect_key_ ? std::string_view(*indirect_key_)
+                         : std::string_view(key_);
+  }
+  RecoveryRecordView View() const noexcept {
+    return {.digest_ = digest_,
+            .key_ = key(),
+            .db_id_ = db_id_,
+            .txid_ = txid_,
+            .lsn_ = lsn_,
+            .replication_epoch_ = replication_epoch_,
+            .location_ = location_,
+            .extents_ = &extents_,
+            .grouped_root_ = grouped_root_.get(),
+            .checkpoint_snapshot_ = checkpoint_snapshot_};
+  }
+  Digest digest_{};
+  std::string key_;
+  std::shared_ptr<const std::string> indirect_key_;
+  std::uint64_t txid_ = 0;
+  std::uint64_t lsn_ = 0;
+  std::uint64_t replication_epoch_ = 1;
+  RecordLocation location_{};
+  ExtentManifest extents_;
+  std::unique_ptr<RecoveredGroupedRoot> grouped_root_;
+  std::uint8_t db_id_ = 0;
+  bool checkpoint_snapshot_ = false;
+};
+static_assert(sizeof(RecoveryPreparedRecord) <= 152);
 
 struct RecoveryBlock {
   ActiveBlock block_{};
@@ -1858,7 +1964,7 @@ class StorageEngine::Impl {
         recovery_txids_;
     // txid-tagged records parked by ApplyRecovery until the committed-txid set
     // is complete (after the recovery barrier).
-    std::vector<RecoveryRecord> recovery_tx_records_;
+    std::vector<RecoveryPreparedRecord> recovery_tx_records_;
     // Group auxiliary versions repeatedly name the same user key. Intern
     // those names while cold recovery retains physical candidates; views
     // point into their shared values and are cleared after the candidates.
