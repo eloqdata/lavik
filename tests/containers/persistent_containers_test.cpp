@@ -46,6 +46,59 @@ class ContainerMemoryScope {
   unsigned shard_;
 };
 
+TEST(CowMapTest, FootprintTracksRetainedAllocationsAndSharedOverlay) {
+  ContainerMemoryScope memory;
+  const auto retained = [] { return GetWorkerMemoryStats(0).retained_bytes_; };
+  const auto baseline = retained();
+  {
+    CowMap<std::uint64_t, std::uint64_t> map;
+    EXPECT_EQ(map.RetainedBytes(), 0);
+    for (std::uint64_t key = 0; key < 1024; ++key)
+      ASSERT_TRUE(map.Set(key, key).ok());
+    // Observe allocator accounting independently of the footprint formula.
+    // mimalloc's request estimate may exceed actual usable bytes (including
+    // in debug builds). Bound that conservative rounding without permitting
+    // the former fixed 1 KiB allowance on every small node.
+    const auto tree_bytes = retained() - baseline;
+    const auto tree_estimate = map.RetainedBytes();
+    EXPECT_GE(tree_estimate, tree_bytes);
+    EXPECT_LE(tree_estimate, 2 * tree_bytes);
+    const auto snapshot = map;
+    EXPECT_EQ(retained() - baseline, tree_bytes);
+    ASSERT_TRUE(map.SetBuffered(0, 42).ok());
+    EXPECT_GT(retained() - baseline, tree_bytes);
+    const auto overlay_bytes = retained() - baseline - tree_bytes;
+    EXPECT_GE(map.RetainedBytes() - tree_estimate, overlay_bytes);
+    EXPECT_LE(map.RetainedBytes() - tree_estimate, 2 * overlay_bytes);
+    EXPECT_EQ(snapshot.RetainedBytes(), tree_estimate);
+    EXPECT_EQ(snapshot.at(0), 0);
+    EXPECT_EQ(map.at(0), 42);
+  }
+  EXPECT_EQ(retained(), baseline);
+}
+
+TEST(CowMapTest, OverAlignedFootprintCoversRetainedAllocations) {
+  ContainerMemoryScope memory;
+  struct alignas(64) Value {
+    std::uint64_t value_;
+  };
+  const auto baseline = GetWorkerMemoryStats(0).retained_bytes_;
+  {
+    CowMap<std::uint64_t, Value> map;
+    for (std::uint64_t key = 0; key < 1024; ++key)
+      ASSERT_TRUE(map.Set(key, Value{key}).ok());
+    for (const auto buffered : {false, true}) {
+      if (buffered) ASSERT_TRUE(map.SetBuffered(0, Value{42}).ok());
+      const auto actual = GetWorkerMemoryStats(0).retained_bytes_ - baseline;
+      EXPECT_GE(map.RetainedBytes(), actual);
+      // Cover both allocator rounding and the alignment allowance, while
+      // rejecting a fixed 1 KiB margin on every node.
+      EXPECT_LE(map.RetainedBytes(), 2 * actual);
+    }
+  }
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
+}
+
 TEST(CowMapTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
   ContainerMemoryScope memory;
   using Map = CowMap<std::uint64_t, std::uint64_t>;
