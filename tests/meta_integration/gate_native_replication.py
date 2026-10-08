@@ -1542,6 +1542,20 @@ def full_tail(root):
             writer.call("RPUSH", "{native}list", str(i))
             writer.call("EXEC")
         ready(meta)
+
+        # Meta's Created/READY cut can precede the replica's switch from the
+        # initialization directive to steady Follow Owner. That reconnect may
+        # briefly close read admission even after FULL has activated locally.
+        # Probe the actual tail with fresh clients so connection retirement is
+        # retryable; keep the complete value checks below after convergence.
+        def tail_readable():
+            probe = Client(target, readonly=True)
+            try:
+                return probe.call("GET", "{native}count") == "32"
+            finally:
+                probe.close()
+
+        H.wait_until("FULL tail applied and replica readable", 30, tail_readable)
         reader = Client(target, readonly=True)
         try:
             assert reader.call("GET", "{native}count") == "32"
