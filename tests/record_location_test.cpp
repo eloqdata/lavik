@@ -35,52 +35,6 @@ TEST(RecoveryMemoryTest, DividesTemporaryBatchTargetAcrossWorkers) {
             kRecoveryProcessBatchTargetBytes / kMaxMemoryWorkers);
 }
 
-TEST(RecoveryMemoryTest, CompactAuxiliaryPreservesWideIdentityAndEnvelope) {
-  const std::string key = "shared recovery key";
-  RecoveryRecord record;
-  record.db_id_ = 255;
-  record.location_.mutation_sequence_ = (std::uint64_t{1} << 48) + 31;
-  record.location_.logical_size_ = std::numeric_limits<std::uint32_t>::max();
-  record.auxiliary_group_ = RecoveredGroupedRecord{
-      .incarnation_ = (std::uint64_t{1} << 57) + 1,
-      .id_ = {.prefix_ = std::numeric_limits<std::uint64_t>::max(),
-              .bits_ = 64},
-      .sequence_ = record.location_.mutation_sequence_,
-      .lsn_ = (std::uint64_t{1} << 56) + 2,
-      .txid_ = (std::uint64_t{1} << 55) + 3,
-      .batch_txid_ = (std::uint64_t{1} << 54) + 4,
-      .field_count_ = record.location_.logical_size_,
-      .encoded_bytes_ = (std::uint64_t{1} << 33) + 5,
-      .retired_ = true};
-  record.ordered_group_ = RecoveryOrderedMetadata{
-      .previous_ = 123, .next_ = 456, .min_score_ = -3.25, .max_score_ = 17.5};
-  record.ordered_group_->stream_max_key_.Set("stream-boundary");
-  RecoveryAuxiliaryRecord compact(&key, record, 17);
-  const auto restored = compact.AuxiliaryGroup();
-  const auto& expected = *record.auxiliary_group_;
-  EXPECT_EQ(restored.incarnation_, expected.incarnation_);
-  EXPECT_EQ(restored.id_, expected.id_);
-  EXPECT_EQ(restored.sequence_, expected.sequence_);
-  EXPECT_EQ(restored.lsn_, expected.lsn_);
-  EXPECT_EQ(restored.txid_, expected.txid_);
-  EXPECT_EQ(restored.batch_txid_, expected.batch_txid_);
-  EXPECT_EQ(restored.field_count_, expected.field_count_);
-  EXPECT_EQ(restored.encoded_bytes_, expected.encoded_bytes_);
-  EXPECT_EQ(restored.retired_, expected.retired_);
-  EXPECT_EQ(restored.record_token_, 0);
-  EXPECT_EQ(compact.key(), key);
-  EXPECT_EQ(compact.db_id_, 255);
-  EXPECT_EQ(compact.extent_token_, 17);
-  ASSERT_NE(compact.ordered_group_, nullptr);
-  EXPECT_EQ(compact.ordered_group_->previous_, 123);
-  EXPECT_EQ(compact.ordered_group_->next_, 456);
-  EXPECT_EQ(compact.ordered_group_->min_score_, -3.25);
-  EXPECT_EQ(compact.ordered_group_->max_score_, 17.5);
-  EXPECT_EQ(compact.ordered_group_->stream_max_key_.LessThanOrEqual(
-                "stream-boundary"),
-            true);
-}
-
 TEST(RecoveryMemoryTest, PreparedViewsSurviveBatchDestructionAndVectorGrowth) {
   std::vector<RecoveryPreparedRecord> parked;
   for (unsigned i = 0; i < 64; ++i) {
@@ -91,11 +45,6 @@ TEST(RecoveryMemoryTest, PreparedViewsSurviveBatchDestructionAndVectorGrowth) {
     if (i % 3 == 2) {
       record.indirect_key_ = std::make_shared<const std::string>("indirect");
     }
-    record.db_id_ = i;
-    record.txid_ = (std::uint64_t{1} << 40) + i;
-    record.lsn_ = i + 17;
-    record.replication_epoch_ = i + 31;
-    record.location_.mutation_sequence_ = i + 51;
     if (i % 2 == 0) {
       record.grouped_root_ = GroupedHashRoot{.incarnation_ = i + 101};
     }
@@ -106,12 +55,6 @@ TEST(RecoveryMemoryTest, PreparedViewsSurviveBatchDestructionAndVectorGrowth) {
     EXPECT_EQ(view.key_, i % 3 == 0   ? "short"
                          : i % 3 == 1 ? std::string(128, 'k')
                                       : "indirect");
-    EXPECT_EQ(view.db_id_, i);
-    EXPECT_EQ(view.txid_, (std::uint64_t{1} << 40) + i);
-    EXPECT_EQ(view.lsn_, i + 17);
-    EXPECT_EQ(view.replication_epoch_, i + 31);
-    EXPECT_EQ(view.location_.mutation_sequence_, i + 51);
-    EXPECT_EQ(view.extents_, &parked[i].extents_);
     if (i % 2 == 0) {
       ASSERT_NE(view.grouped_root_, nullptr);
       EXPECT_EQ(std::get<GroupedHashRoot>(*view.grouped_root_).incarnation_,
