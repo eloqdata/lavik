@@ -1240,11 +1240,23 @@ struct CheckpointIndexCapacity {
 };
 
 struct CheckpointBodyBlock {
+  std::uint64_t sequence_ = 0;
   std::uint64_t block_id_ = 0;
   std::uint16_t shard_id_ = 0;
 };
 
+// Every physical reference survives logical deletion until its records block
+// is retired. Restored after the KeyRecord pass has reconstructed UUID owners.
+struct CheckpointIndirectReference {
+  std::uint64_t block_id_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  IndirectKeyId key_id_{};
+  std::uint32_t record_offset_ = 0;
+  std::uint32_t reserved_ = 0;
+};
+
 struct CheckpointLoadResult {
+  std::vector<CheckpointIndirectReference> indirect_references_;
   absl::Status status_ = absl::OkStatus();
   std::vector<std::uint64_t> blocks_;
   std::uint64_t entry_count_ = 0;

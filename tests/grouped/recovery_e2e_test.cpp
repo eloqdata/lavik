@@ -67,7 +67,7 @@ void WriteAt(int fd, std::span<const std::byte> bytes, std::uint64_t offset) {
 
 class RecordImage {
  public:
-  RecordImage() {
+  explicit RecordImage(std::uint64_t blocks = 16) : kBlocks(blocks) {
     std::string pattern =
         lavik::test::TestDataPath("lavik-grouped-recovery-XXXXXX");
     fd_ = ::mkstemp(pattern.data());
@@ -88,6 +88,43 @@ class RecordImage {
     if (!path_.empty()) ::unlink(path_.c_str());
   }
   const std::string& path() const { return path_; }
+
+  void CorruptLastCheckpointObjectChunk() {
+    std::uint64_t selected = 0, sequence = 0;
+    std::uint32_t payload_bytes = 0;
+    std::array<std::byte, kBlockHeaderBytes> bytes{};
+    for (std::uint64_t id = DataBlockBegin(kBlocks); id < kBlocks; ++id) {
+      Check(::pread(fd_, bytes.data(), bytes.size(), id * kStorageBlockBytes) ==
+                static_cast<ssize_t>(bytes.size()),
+            "checkpoint header read failed");
+      BlockHeader header;
+      if (!DecodeBlockHeaderPages(bytes, &header) ||
+          header.kind_ != BlockKind::kCheckpointIndex)
+        continue;
+      std::array<std::byte, 64> chunk{};
+      Check(::pread(fd_, chunk.data(), chunk.size(),
+                    id * kStorageBlockBytes + kBlockHeaderBytes) ==
+                static_cast<ssize_t>(chunk.size()),
+            "checkpoint chunk read failed");
+      std::uint32_t kind;
+      std::uint64_t stream_sequence;
+      std::memcpy(&kind, chunk.data() + 28, sizeof(kind));
+      std::memcpy(&stream_sequence, chunk.data() + 56, sizeof(stream_sequence));
+      if (kind == 4 && stream_sequence >= sequence) {
+        selected = id;
+        sequence = stream_sequence;
+        payload_bytes = header.extent_payload_bytes_;
+      }
+    }
+    Check(selected != 0, "no checkpoint object chunk to corrupt");
+    const std::uint64_t offset =
+        selected * kStorageBlockBytes + kBlockHeaderBytes + payload_bytes - 1;
+    std::byte byte{};
+    Check(::pread(fd_, &byte, 1, offset) == 1, "checkpoint byte read failed");
+    byte ^= std::byte{1};
+    WriteAt(fd_, std::span(&byte, 1), offset);
+    Check(::fsync(fd_) == 0, "checkpoint corruption sync failed");
+  }
 
   void Root(std::string_view key, const GroupedHashRoot& root,
             std::uint64_t sequence, std::uint64_t txid = 0,
@@ -259,7 +296,7 @@ class RecordImage {
       WriteAt(fd_, block.payload_,
               LocalBlockOffset(block.header_.block_id_) + kBlockHeaderBytes);
     }
-    std::array<std::byte, ScanBitmapBytes(kBlocks)> bitmap{};
+    std::vector<std::byte> bitmap(ScanBitmapBytes(kBlocks));
     for (const std::uint64_t id : allocated_) {
       bitmap[id / 8] |= static_cast<std::byte>(1U << (id % 8));
     }
@@ -285,7 +322,7 @@ class RecordImage {
           std::find(allocated_.begin(), allocated_.end(), extent.block_id_));
       WriteAt(fd_, empty, LocalBlockOffset(extent.block_id_));
     }
-    std::array<std::byte, ScanBitmapBytes(kBlocks)> bitmap{};
+    std::vector<std::byte> bitmap(ScanBitmapBytes(kBlocks));
     for (const auto id : allocated_) {
       bitmap[id / 8] |= static_cast<std::byte>(1U << (id % 8));
     }
@@ -347,7 +384,7 @@ class RecordImage {
     ++block.header_.record_count_;
     block.header_.max_lsn_ = record.lsn_;
   }
-  static constexpr std::uint64_t kBlocks = 16;
+  const std::uint64_t kBlocks;
   int fd_ = -1;
   std::string path_;
   std::uint64_t lsn_ = 0;
@@ -968,7 +1005,7 @@ TEST(GroupedRecoveryE2e, IndexedSortedSetRequiresAndChecksMemberGraph) {
 }
 
 TEST(GroupedRecoveryE2e, RetainsSplitParentRetirementEvidence) {
-  RecordImage image;
+  RecordImage image(64);
   auto group = SingleGroup();
   image.Group("hash", group, 1);
   auto retired = group;
@@ -989,10 +1026,21 @@ TEST(GroupedRecoveryE2e, RetainsSplitParentRetirementEvidence) {
       2, 42);
   image.Commit(42);
   image.Finish();
-  ChildServer server(image);
-  EXPECT_EQ(server.Command({"HLEN", "hash"}), ":1");
-  EXPECT_EQ(server.Command({"DBSIZE"}), ":1");
-  EXPECT_EQ(server.Command({"HGET", "hash", "field"}), std::string(128, 'v'));
+  for (int boot = 0; boot != 3; ++boot) {
+    ChildServer server(image, boot < 2);
+    EXPECT_EQ(server.Command({"HLEN", "hash"}), ":1");
+    EXPECT_EQ(server.Command({"DBSIZE"}), ":1");
+    EXPECT_EQ(server.Command({"HGET", "hash", "field"}), std::string(128, 'v'));
+    if (boot == 1)
+      EXPECT_NE(server.Log().find("loaded shutdown checkpoint generation="),
+                std::string::npos)
+          << server.Log();
+    EXPECT_EQ(server.Wait(true), 0) << server.Log();
+    if (boot < 2)
+      EXPECT_NE(server.Log().find("published shutdown checkpoint generation="),
+                std::string::npos)
+          << server.Log();
+  }
 }
 
 TEST(GroupedRecoveryE2e, ValidatesOversizedGroupBeyondItsEnvelopeExtent) {
@@ -1048,8 +1096,8 @@ TEST(GroupedRecoveryE2e, ObsoleteGroupDoesNotReadAlreadyReclaimedValueExtents) {
   EXPECT_EQ(server.Command({"HGET", "hash", "field"}), std::string(128, 'v'));
 }
 
-TEST(GroupedRecoveryE2e, CheckpointDeclinesSafelyAndColdRecoveryRetainsGraph) {
-  RecordImage image;
+TEST(GroupedRecoveryE2e, CheckpointRestoresGroupedGraphAndExternalPayload) {
+  RecordImage image(64);
   image.Group("hash", SingleGroup(9 * 1024 * 1024), 1, 0, true);
   image.Root(
       "hash",
@@ -1060,14 +1108,126 @@ TEST(GroupedRecoveryE2e, CheckpointDeclinesSafelyAndColdRecoveryRetainsGraph) {
     ChildServer server(image, true);
     ASSERT_EQ(server.Command({"HLEN", "hash"}), ":1");
     EXPECT_EQ(server.Wait(true), 0) << server.Log();
-    EXPECT_NE(server.Log().find("shutdown checkpoint was not published"),
+    EXPECT_NE(server.Log().find("published shutdown checkpoint generation="),
               std::string::npos)
         << server.Log();
   }
-  ChildServer recovered(image);
+  ChildServer recovered(image, true);
   EXPECT_EQ(recovered.Command({"HLEN", "hash"}), ":1");
+  EXPECT_NE(recovered.Log().find("loaded shutdown checkpoint generation="),
+            std::string::npos)
+      << recovered.Log();
   EXPECT_EQ(recovered.Command({"HGET", "hash", "field"}),
             std::string(9 * 1024 * 1024, 'v'));
+}
+
+TEST(GroupedRecoveryE2e, CheckpointRestoresAllGroupedTypesWithIndirectKeys) {
+  RecordImage image(128);
+  image.Finish();
+  const std::string prefix(3000, 'k');
+  const std::string value(24000, 'v');
+  const std::string hash = prefix + "hash";
+  const std::string set = prefix + "set";
+  const std::string list = prefix + "list";
+  const std::string zset = prefix + "zset";
+  const std::string stream = prefix + "stream";
+  const std::string string = prefix + "string";
+  // This key alone crosses a checkpoint stream chunk and uses key extents.
+  const std::string huge_key(9 * 1024 * 1024, 'K');
+  std::vector<std::pair<std::string, std::string>> dumps;
+  {
+    ChildServer server(image, true);
+    ASSERT_EQ(server.Command({"SET", string, value}), "+OK");
+    ASSERT_EQ(server.Command({"HSET", hash, "f", value}), ":1");
+    ASSERT_EQ(server.Command({"SADD", set, value}), ":1");
+    ASSERT_EQ(server.Command({"RPUSH", list, value, "tail"}), ":2");
+    ASSERT_EQ(server.Command({"ZADD", zset, "1", value, "2", "tail"}), ":2");
+    ASSERT_EQ(server.Command({"XADD", stream, "1-0", "f", value}), "1-0");
+    ASSERT_EQ(server.Command({"SET", huge_key, "huge-key-value"}), "+OK");
+    // An obsolete user record still holds a UUID dependency after deletion.
+    ASSERT_EQ(server.Command({"SET", prefix + "deleted", "old"}), "+OK");
+    ASSERT_EQ(server.Command({"DEL", prefix + "deleted"}), ":1");
+    for (const auto& key : {hash, set, list, zset, stream, string})
+      dumps.emplace_back(key, server.Command({"DUMP", key}));
+    EXPECT_EQ(server.Wait(true), 0) << server.Log();
+    ASSERT_NE(server.Log().find("published shutdown checkpoint generation="),
+              std::string::npos)
+        << server.Log();
+  }
+  {
+    ChildServer server(image, true);
+    EXPECT_EQ(server.Command({"GET", huge_key}), "huge-key-value");
+    ASSERT_NE(server.Log().find("loaded shutdown checkpoint generation="),
+              std::string::npos)
+        << server.Log();
+    for (const auto& [key, dump] : dumps)
+      EXPECT_EQ(server.Command({"DUMP", key}), dump);
+    EXPECT_EQ(server.Command({"ZSCORE", zset, value}), "1");
+    EXPECT_EQ(server.Command({"ZRANK", zset, "tail"}), ":1");
+    EXPECT_EQ(server.Command({"LINDEX", list, "0"}), value);
+    EXPECT_EQ(server.Command({"EXISTS", prefix + "deleted"}), ":0");
+    // Exercise restored directory publication and physical accounting, then
+    // write another checkpoint before falling back to authoritative scanning.
+    EXPECT_EQ(server.Command({"ZADD", zset, "3", value}), ":0");
+    EXPECT_EQ(server.Command({"HSET", hash, "g", "new"}), ":1");
+    EXPECT_EQ(server.Command({"XADD", stream, "2-0", "g", "new"}), "2-0");
+    EXPECT_EQ(server.Command({"LPOP", list}), value);
+    EXPECT_EQ(server.Command({"SETRANGE", string, "9000", "changed"}),
+              ":24000");
+    EXPECT_EQ(server.Wait(true), 0) << server.Log();
+    ASSERT_NE(server.Log().find("published shutdown checkpoint generation="),
+              std::string::npos)
+        << server.Log();
+  }
+  {
+    ChildServer server(image, true);
+    EXPECT_EQ(server.Command({"ZSCORE", zset, value}), "3");
+    ASSERT_NE(server.Log().find("loaded shutdown checkpoint generation="),
+              std::string::npos)
+        << server.Log();
+    EXPECT_EQ(server.Command({"HGET", hash, "g"}), "new");
+    EXPECT_EQ(server.Command({"XLEN", stream}), ":2");
+    EXPECT_EQ(server.Command({"LINDEX", list, "0"}), "tail");
+    EXPECT_EQ(server.Command({"GETRANGE", string, "9000", "9006"}), "changed");
+    EXPECT_EQ(server.Command({"CONFIG", "SET", "shutdown-checkpoint", "no"}),
+              "+OK");
+    EXPECT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ChildServer cold(image);
+  EXPECT_EQ(cold.Command({"ZSCORE", zset, value}), "3");
+  EXPECT_EQ(cold.Command({"GET", huge_key}), "huge-key-value");
+  EXPECT_EQ(cold.Command({"HGET", hash, "g"}), "new");
+  EXPECT_EQ(cold.Command({"EXISTS", prefix + "deleted"}), ":0");
+}
+
+TEST(GroupedRecoveryE2e,
+     CorruptObjectCheckpointFallsBackWithIndirectDependencies) {
+  RecordImage image(128);
+  image.Finish();
+  const std::string key(3000, 'k');
+  const std::string huge_key(9 * 1024 * 1024, 'K');
+  const std::string value(24000, 'v');
+  {
+    ChildServer server(image, true);
+    ASSERT_EQ(server.Command({"SET", "inline", "plain"}), "+OK");
+    ASSERT_EQ(server.Command({"HSET", key, "field", value}), ":1");
+    ASSERT_EQ(server.Command({"SET", huge_key, "large-key"}), "+OK");
+    ASSERT_EQ(server.Command({"SET", key + "deleted", "old"}), "+OK");
+    ASSERT_EQ(server.Command({"DEL", key + "deleted"}), ":1");
+    EXPECT_EQ(server.Wait(true), 0) << server.Log();
+    ASSERT_NE(server.Log().find("published shutdown checkpoint generation="),
+              std::string::npos)
+        << server.Log();
+  }
+  image.CorruptLastCheckpointObjectChunk();
+  ChildServer recovered(image, true);
+  EXPECT_EQ(recovered.Command({"GET", "inline"}), "plain");
+  EXPECT_NE(recovered.Log().find("falling back to record scan"),
+            std::string::npos)
+      << recovered.Log();
+  EXPECT_EQ(recovered.Command({"HGET", key, "field"}), value);
+  EXPECT_EQ(recovered.Command({"GET", huge_key}), "large-key");
+  EXPECT_EQ(recovered.Command({"EXISTS", key + "deleted"}), ":0");
 }
 
 TEST(GroupedRecoveryE2e, FlushDbDetachesAndRetiresTheCompleteGraph) {
@@ -1467,7 +1627,7 @@ TEST(GroupedRecoveryE2e, OrderedRetirementSkipsFreedObsoletePageExtents) {
   for (const auto kind :
        {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
     SCOPED_TRACE(static_cast<unsigned>(kind));
-    RecordImage image;
+    RecordImage image(64);
     OrderedGroupSnapshot page{
         .kind_ = kind,
         .incarnation_ = 17,
@@ -1504,8 +1664,8 @@ TEST(GroupedRecoveryE2e, OrderedRetirementSkipsFreedObsoletePageExtents) {
     image.Commit(42);
     image.Finish();
     image.FreeExtents(obsolete);
-    for (const bool checkpoint : {true, false}) {
-      ChildServer server(image, checkpoint);
+    for (int boot = 0; boot != 3; ++boot) {
+      ChildServer server(image, boot < 2);
       if (kind == OrderedCollectionKind::kList) {
         EXPECT_EQ(server.Command({"LLEN", "ordered"}), ":1");
         EXPECT_EQ(server.Command({"LINDEX", "ordered", "0"}), "new");
@@ -1513,7 +1673,16 @@ TEST(GroupedRecoveryE2e, OrderedRetirementSkipsFreedObsoletePageExtents) {
         EXPECT_EQ(server.Command({"ZCARD", "ordered"}), ":1");
         EXPECT_EQ(server.Command({"ZSCORE", "ordered", "new"}), "1");
       }
-      if (checkpoint) EXPECT_EQ(server.Wait(true), 0) << server.Log();
+      if (boot == 1)
+        EXPECT_NE(server.Log().find("loaded shutdown checkpoint generation="),
+                  std::string::npos)
+            << server.Log();
+      EXPECT_EQ(server.Wait(true), 0) << server.Log();
+      if (boot < 2)
+        EXPECT_NE(
+            server.Log().find("published shutdown checkpoint generation="),
+            std::string::npos)
+            << server.Log();
     }
   }
 }

@@ -25,14 +25,16 @@ constexpr std::uint64_t kCheckpointChunkMagic =
     0x3150434b4843564cULL;  // LVCHKCP1
 constexpr std::uint32_t kCheckpointWireVersion = 1;
 // Version 1 is intentionally replaced in place during development. Requiring
-// this layout tag prevents an older same-sized entry header from being
-// interpreted under the packed partition layout below.
-constexpr std::uint32_t kCheckpointLayoutTag = 0x50545231;  // PTR1
+// this layout tag rejects snapshots without ordered object fragments and
+// indirect-key dependencies; ordinary record formats remain unchanged.
+constexpr std::uint32_t kCheckpointLayoutTag = 0x47525032;  // GRP2
 
 enum class CheckpointChunkKind : std::uint32_t {
   kIndexEntries = 1,
   kBlockAccounting = 2,
   kIndexCapacity = 3,
+  kObjectFragment = 4,
+  kIndirectReferences = 5,
 };
 
 enum CheckpointEntryFlag : std::uint8_t {
@@ -91,6 +93,8 @@ struct CheckpointChunkHeader {
   // retain it so index construction can consume the serialized digest; cold
   // recovery remains free to start with a newly randomized process seed.
   DigestSeed digest_seed_{};
+  // Orders fragmented metadata independently of reusable physical block IDs.
+  std::uint64_t sequence_ = 0;
 };
 
 struct CheckpointEntryHeader {
@@ -138,7 +142,7 @@ static_assert(std::is_trivially_copyable_v<CheckpointChunkHeader>);
 static_assert(std::is_trivially_copyable_v<CheckpointEntryHeader>);
 static_assert(std::is_trivially_copyable_v<CheckpointAccountingEntry>);
 static_assert(std::is_trivially_copyable_v<CheckpointCapacityEntry>);
-static_assert(sizeof(CheckpointChunkHeader) == 56);
+static_assert(sizeof(CheckpointChunkHeader) == 64);
 static_assert(sizeof(CheckpointEntryHeader) == 48);
 static_assert(sizeof(CheckpointAccountingEntry) == 40);
 static_assert(sizeof(CheckpointCapacityEntry) == 16);
@@ -257,6 +261,264 @@ constexpr std::uint64_t kCheckpointPackedFieldTest =
 static_assert(CheckpointKeyBytes(kCheckpointPackedFieldTest) == 0xfedcba98U);
 static_assert(CheckpointExtentCount(kCheckpointPackedFieldTest) == 0x2aaaaU);
 static_assert(CheckpointPartition(kCheckpointPackedFieldTest) == 0x2aaaU);
+
+// Object metadata is framed across checkpoint blocks. Values never enter this
+// stream: even a large collection contributes only its root and page directory.
+// Explicit coordinates avoid persisting runtime pointers or compact locations
+// whose allocation epoch is supplied by the live BlockState table.
+struct CheckpointLocation {
+  std::uint64_t block = 0, epoch = 0, sequence = 0, expiry = 0;
+  std::uint32_t size = 0, offset = 0, bytes = 0;
+  std::uint16_t owner = 0;
+  std::uint8_t type = 0, flags = 0;
+};
+struct CheckpointObjectHeader {
+  CheckpointLocation location;
+  Digest digest{};
+  std::uint64_t groups = 0;
+  std::uint32_t key_bytes = 0, extent_count = 0, root_bytes = 0;
+  std::uint16_t partition = 0;
+  std::uint8_t db = 0, reserved = 0;
+};
+struct CheckpointGroupHeader {
+  CheckpointLocation location;
+  std::uint64_t id = 0, previous = 0, next = 0, lsn = 0, encoded_bytes = 0;
+  double min_score = 0, max_score = 0;
+  std::uint32_t extent_count = 0;
+  std::uint8_t bits = 0, retired = 0;
+  std::array<std::uint8_t, 2> reserved{};
+};
+static_assert(sizeof(CheckpointLocation) == 48);
+static_assert(sizeof(CheckpointObjectHeader) == 80);
+static_assert(sizeof(CheckpointGroupHeader) == 112);
+static_assert(sizeof(CheckpointIndirectReference) == 40);
+
+CheckpointLocation SaveLocation(const RecordLocation& loc) {
+  return {.block = loc.block_id(),
+          .epoch = loc.allocation_epoch(),
+          .sequence = loc.mutation_sequence_,
+          .expiry = loc.expire_at_ms_,
+          .size = loc.logical_size_,
+          .offset = loc.record_offset(),
+          .bytes = loc.total_disk_bytes(),
+          .owner = loc.block_owner(),
+          .type = static_cast<std::uint8_t>(loc.value_type()),
+          .flags = static_cast<std::uint8_t>(
+              (loc.external() ? 1 : 0) | (loc.key_indirect() ? 2 : 0) |
+              (loc.shielding() ? 4 : 0) | (loc.unclaimed() ? 8 : 0) |
+              (loc.grouped() ? 16 : 0) |
+              (loc.kind() == RecordKind::kTombstone ? 32 : 0))};
+}
+
+absl::StatusOr<RecordLocation> LoadLocation(const CheckpointLocation& loc,
+                                            unsigned workers) {
+  const bool tombstone = (loc.flags & 32) != 0;
+  if (!RecordLocation::CanEncodeBlockIdentity(loc.block, loc.epoch) ||
+      loc.epoch == 0 || loc.owner >= workers || (loc.flags & ~63) != 0 ||
+      loc.offset < kBlockHeaderBytes || loc.offset % kRecordAlignment != 0 ||
+      loc.bytes == 0 || loc.bytes % kRecordAlignment != 0 ||
+      loc.offset > kStorageBlockBytes ||
+      loc.bytes > kStorageBlockBytes - loc.offset ||
+      loc.size > RecordIndexValue::kLogicalSizeMask ||
+      (tombstone
+           ? loc.type != static_cast<std::uint8_t>(ValueType::kNone)
+           : loc.type < static_cast<std::uint8_t>(ValueType::kString) ||
+                 loc.type > static_cast<std::uint8_t>(ValueType::kStream)) ||
+      (tombstone && (loc.flags & 17) != 0)) {
+    return absl::DataLossError("invalid checkpoint object location");
+  }
+  return RecordLocation(
+      loc.block, loc.sequence, loc.epoch, loc.expiry, loc.size,
+      RecordLocation::PackedMetadata::Encode(
+          loc.offset, loc.bytes, loc.owner, false, loc.flags & 1, loc.flags & 2,
+          loc.flags & 4, loc.flags & 8, false,
+          tombstone ? RecordKind::kTombstone : RecordKind::kValue,
+          static_cast<ValueType>(loc.type), loc.expiry != 0, loc.flags & 16));
+}
+
+class CheckpointObjectReader {
+ public:
+  explicit CheckpointObjectReader(std::span<const std::byte> bytes)
+      : remaining_(bytes) {}
+  template <typename T>
+  bool Read(T& value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    if (remaining_.size() < sizeof(T)) return false;
+    std::memcpy(&value, remaining_.data(), sizeof(T));
+    remaining_ = remaining_.subspan(sizeof(T));
+    return true;
+  }
+  bool ReadBytes(std::size_t size, std::string_view& value) {
+    if (size > remaining_.size()) return false;
+    value = {reinterpret_cast<const char*>(remaining_.data()), size};
+    remaining_ = remaining_.subspan(size);
+    return true;
+  }
+  absl::StatusOr<ExtentManifest> ReadExtents(std::uint32_t count,
+                                             bool external) {
+    if (external != (count != 0) || count > kMaxStringExtents ||
+        count > remaining_.size() / sizeof(ExtentRef))
+      return absl::DataLossError("invalid checkpoint object manifest");
+    if (count == 0) return ExtentManifest{};
+    auto extents = std::make_shared<std::vector<ExtentRef>>(count);
+    std::memcpy(extents->data(), remaining_.data(), count * sizeof(ExtentRef));
+    remaining_ = remaining_.subspan(count * sizeof(ExtentRef));
+    for (const auto& extent : *extents) {
+      if (!RecordLocation::CanEncodeBlockIdentity(extent.block_id_,
+                                                  extent.allocation_epoch_) ||
+          extent.allocation_epoch_ == 0 || extent.payload_bytes_ == 0 ||
+          extent.payload_bytes_ > kExtentPayloadBytes)
+        return absl::DataLossError("invalid checkpoint extent identity");
+    }
+    return ExtentManifest(std::move(extents));
+  }
+  std::size_t remaining() const { return remaining_.size(); }
+
+ private:
+  std::span<const std::byte> remaining_;
+};
+
+struct CheckpointObjectData {
+  CheckpointObjectHeader header;
+  std::string_view key;
+  RecordLocation location;
+  ExtentManifest extents;
+  std::optional<RecoveredGroupedRoot> root;
+  GroupedObject::Handle object;
+};
+
+absl::StatusOr<CheckpointObjectData> DecodeCheckpointObject(
+    std::span<const std::byte> bytes, unsigned workers, unsigned owner,
+    unsigned databases,
+    const std::function<GroupedObjectVersion(std::uint16_t, std::uint8_t,
+                                             const RecordLocation&)>& version,
+    const std::shared_ptr<ScanHashMapEntryArena>& arena) {
+  CheckpointObjectReader reader(bytes);
+  CheckpointObjectData result;
+  auto& h = result.header;
+  if (!reader.Read(h) || h.reserved != 0 || h.db >= databases ||
+      h.partition >= kLogicalStorageShards || h.partition % workers != owner ||
+      h.key_bytes > MaxKeyBytes() || !reader.ReadBytes(h.key_bytes, result.key))
+    return absl::DataLossError("invalid checkpoint object header");
+  auto location = LoadLocation(h.location, workers);
+  if (!location.ok()) return location.status();
+  result.location = *location;
+  // Unlike the hot inline checkpoint path, complex keys pay this validation
+  // once per object. A malformed fragment must not publish a cross-shard view.
+  if (RedisSlot(result.key) != h.partition ||
+      ComputeDigest(result.key) != h.digest)
+    return absl::DataLossError("checkpoint object key identity mismatch");
+  auto extents = reader.ReadExtents(h.extent_count, location->external());
+  if (!extents.ok()) return extents.status();
+  result.extents = std::move(*extents);
+  std::string_view root_bytes;
+  if (!reader.ReadBytes(h.root_bytes, root_bytes) ||
+      location->grouped() != (h.root_bytes != 0) ||
+      h.groups > reader.remaining() / sizeof(CheckpointGroupHeader))
+    return absl::DataLossError("invalid checkpoint object directory size");
+  if (!location->grouped()) {
+    if (h.groups != 0 || reader.remaining() != 0)
+      return absl::DataLossError("unexpected compact checkpoint directory");
+    return result;
+  }
+  const bool ordered = location->value_type() != ValueType::kHash &&
+                       location->value_type() != ValueType::kSet;
+  std::uint64_t incarnation;
+  if (ordered) {
+    auto root = DecodeOrderedCollectionRoot(root_bytes);
+    if (!root.ok()) return root.status();
+    incarnation = root->incarnation_;
+    result.root = *root;
+  } else {
+    auto root = DecodeGroupedHashRoot(root_bytes);
+    if (!root.ok()) return root.status();
+    incarnation = root->incarnation_;
+    result.root = *root;
+  }
+  RecoveryVector<RecoveredGroupedRecord> hash_records;
+  RecoveryVector<RecoveredOrderedGroup> ordered_records;
+  RecoveryVector<GroupedRecordLocation> locations;
+  absl::flat_hash_set<std::pair<std::uint64_t, std::uint8_t>> identities;
+  for (std::uint64_t i = 0; i < h.groups; ++i) {
+    CheckpointGroupHeader g;
+    if (!reader.Read(g) || g.retired > 1 ||
+        g.reserved != std::array<std::uint8_t, 2>{} ||
+        !identities.emplace(g.id, g.bits).second)
+      return absl::DataLossError("invalid or duplicate checkpoint group");
+    auto physical = LoadLocation(g.location, workers);
+    if (!physical.ok()) return physical.status();
+    auto manifest = reader.ReadExtents(g.extent_count, physical->external());
+    if (!manifest.ok()) return manifest.status();
+    GroupedRecordId id{.prefix_ = g.id, .bits_ = g.bits};
+    locations.push_back({.id_ = id,
+                         .location_ = *physical,
+                         .extents_ = std::move(*manifest),
+                         .retired_ = g.retired != 0});
+    if (ordered && IsOrderedPageId(id)) {
+      ordered_records.push_back(
+          RecoveredOrderedGroup{{.incarnation_ = incarnation,
+                                 .id_ = g.id,
+                                 .previous_ = g.previous,
+                                 .next_ = g.next,
+                                 .sequence_ = physical->mutation_sequence_,
+                                 .lsn_ = g.lsn,
+                                 .item_count_ = physical->logical_size_,
+                                 .encoded_bytes_ = g.encoded_bytes,
+                                 .record_token_ = i + 1,
+                                 .retired_ = g.retired != 0,
+                                 .min_score_ = g.min_score,
+                                 .max_score_ = g.max_score}});
+    } else {
+      if (g.previous != 0 || g.next != 0 || g.min_score != 0 ||
+          g.max_score != 0)
+        return absl::DataLossError("unexpected checkpoint prefix ordering");
+      hash_records.push_back({.incarnation_ = incarnation,
+                              .id_ = id,
+                              .sequence_ = physical->mutation_sequence_,
+                              .lsn_ = g.lsn,
+                              .field_count_ = physical->logical_size_,
+                              .encoded_bytes_ = g.encoded_bytes,
+                              .record_token_ = i + 1,
+                              .retired_ = g.retired != 0});
+    }
+  }
+  if (reader.remaining() != 0)
+    return absl::DataLossError("checkpoint object trailing bytes");
+  const absl::flat_hash_set<std::uint64_t> committed;
+  const auto object_version = version(h.partition, h.db, *location);
+  absl::StatusOr<GroupedObject::Handle> object;
+  if (ordered) {
+    const auto& root = std::get<OrderedCollectionRoot>(*result.root);
+    std::optional<HashGroupDirectory> member_directory;
+    if (root.member_index_) {
+      auto members = HashGroupDirectory::Recover(*root.member_index_,
+                                                 location->mutation_sequence_,
+                                                 hash_records, committed);
+      if (!members.ok()) return members.status();
+      member_directory = std::move(*members);
+    } else if (!hash_records.empty()) {
+      return absl::DataLossError("checkpoint member graph on non-ZSet");
+    }
+    // Root locations carry the command sequence; page locations and the
+    // directory root carry the independent local graph revision.
+    auto directory = OrderedGroupDirectory::Recover(
+        root, root.revision_, ordered_records, committed,
+        location->mutation_sequence_, std::move(member_directory));
+    if (!directory.ok()) return directory.status();
+    object = GroupedObject::CreateOrdered(object_version, std::move(*directory),
+                                          locations, arena);
+  } else {
+    auto directory = HashGroupDirectory::Recover(
+        std::get<GroupedHashRoot>(*result.root), location->mutation_sequence_,
+        hash_records, committed);
+    if (!directory.ok()) return directory.status();
+    object = GroupedObject::Create(object_version, std::move(*directory),
+                                   locations, arena);
+  }
+  if (!object.ok()) return object.status();
+  result.object = std::move(*object);
+  return result;
+}
 
 // Two slots let shutdown encode the next chunk while the prior direct write is
 // in flight. Heap-owned completion state keeps the DMA buffer alive if an
@@ -527,7 +789,9 @@ absl::StatusOr<CheckpointChunkHeader> ValidateCheckpointChunk(
       chunk.layout_tag_ != kCheckpointLayoutTag ||
       (chunk.kind_ != CheckpointChunkKind::kIndexEntries &&
        chunk.kind_ != CheckpointChunkKind::kBlockAccounting &&
-       chunk.kind_ != CheckpointChunkKind::kIndexCapacity)) {
+       chunk.kind_ != CheckpointChunkKind::kIndexCapacity &&
+       chunk.kind_ != CheckpointChunkKind::kObjectFragment &&
+       chunk.kind_ != CheckpointChunkKind::kIndirectReferences)) {
     return absl::InternalError("invalid checkpoint chunk header");
   }
   return chunk;
@@ -840,13 +1104,6 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointRoot(
 
 Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
     WorkerStore& store, std::uint64_t generation) {
-  // The checkpoint format has no UUID registry or stale-record dependency
-  // graph. Preserve cold recovery until both can be represented together.
-  if (!store.indirect_keys_.empty() ||
-      !store.indirect_key_references_.empty() ||
-      !store.indirect_key_records_.empty())
-    co_return absl::FailedPreconditionError(
-        "shutdown checkpoint does not encode indirect keys");
   CheckpointShardResult& result = checkpoint_shards_[store.worker_->id()];
   result = {};
   std::array<CheckpointWriteSlot, 2> write_slots;
@@ -938,6 +1195,206 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
     co_return absl::OkStatus();
   };
 
+  std::uint64_t fragment_sequence = 0;
+  auto account_extents =
+      [&extent_identities](const ExtentManifest& refs) -> absl::Status {
+    if (!refs) return absl::OkStatus();
+    for (std::size_t i = 0; i < refs->size(); ++i) {
+      const auto& e = refs->at(i);
+      RecoveryLiveReference identity{
+          .block_id_ = e.block_id_,
+          .allocation_epoch_ = e.allocation_epoch_,
+          .bytes_ = e.payload_bytes_,
+          .extent_ = true,
+          .extent_payload_bytes_ = e.payload_bytes_,
+          .extent_index_ = static_cast<std::uint32_t>(i),
+          .extent_payload_checksum_ = e.payload_checksum_};
+      auto [pos, inserted] =
+          extent_identities.try_emplace(e.block_id_, identity);
+      if (!inserted) {
+        const auto& old = pos->second;
+        if (old.allocation_epoch_ != identity.allocation_epoch_ ||
+            old.extent_payload_bytes_ != identity.extent_payload_bytes_ ||
+            old.extent_index_ != identity.extent_index_ ||
+            old.extent_payload_checksum_ != identity.extent_payload_checksum_ ||
+            identity.bytes_ >
+                std::numeric_limits<std::uint32_t>::max() - old.bytes_)
+          return absl::DataLossError(
+              "conflicting checkpoint extent identities");
+        pos->second.bytes_ += identity.bytes_;
+      }
+    }
+    return absl::OkStatus();
+  };
+  // Small objects share stream chunks; a large key/directory spans chunks.
+  // This avoids reserving an 8 MiB physical block for every grouped key.
+  std::vector<std::byte> object_stream;
+  constexpr std::size_t stream_capacity =
+      kExtentPayloadBytes - sizeof(CheckpointChunkHeader);
+  auto flush_object_stream = [&]() -> Task<absl::Status> {
+    if (object_stream.empty()) co_return absl::OkStatus();
+    if (chunk_entries != 0) {
+      auto status = co_await flush_chunk();
+      if (!status.ok()) co_return status;
+    }
+    payload->Clear();
+    payload->AppendPod(CheckpointChunkHeader{
+        .generation_ = generation,
+        .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
+        .kind_ = CheckpointChunkKind::kObjectFragment,
+        .entry_count_ = 1,
+        .digest_seed_ = CurrentDigestSeed(),
+        .sequence_ = ++fragment_sequence});
+    payload->AppendBytes(object_stream.data(), object_stream.size());
+    auto status = co_await submit_payload(1);
+    if (!status.ok()) co_return status;
+    payload->AppendPod(chunk);
+    object_stream.clear();
+    co_return absl::OkStatus();
+  };
+  auto append_object_stream =
+      [&](std::span<const std::byte> bytes) -> Task<absl::Status> {
+    while (!bytes.empty()) {
+      const auto count =
+          std::min(bytes.size(), stream_capacity - object_stream.size());
+      object_stream.insert(object_stream.end(), bytes.begin(),
+                           bytes.begin() + count);
+      bytes = bytes.subspan(count);
+      if (object_stream.size() == stream_capacity) {
+        auto status = co_await flush_object_stream();
+        if (!status.ok()) co_return status;
+      }
+    }
+    co_return absl::OkStatus();
+  };
+  auto write_object = [&](WorkerStore::PartitionStore& partition,
+                          std::uint8_t db, std::string_view key,
+                          const RecordLocation& location,
+                          const ExtentManifest& extents) -> Task<absl::Status> {
+    GroupedObject::Handle object;
+    std::string root;
+    if (location.grouped()) {
+      auto found = partition.grouped_objects_[db].Lookup(
+          key, GroupedObjectVersion{
+                   .root_ = location,
+                   .db_epoch_ = DbEpoch(db),
+                   .replication_epoch_ = partition.replication_epoch_,
+                   .index_generation_ = partition.grouped_generations_[db]});
+      if (!found.ok()) co_return found.status();
+      object = std::move(*found);
+      if (!object)
+        co_return absl::DataLossError("checkpoint grouped root has no view");
+      auto encoded =
+          object->is_ordered()
+              ? EncodeOrderedCollectionRoot(object->ordered_directory().root())
+              : EncodeGroupedHashRoot(object->directory().root());
+      if (!encoded.ok()) co_return encoded.status();
+      root = std::move(*encoded);
+    }
+    std::size_t total = sizeof(CheckpointObjectHeader) + key.size() +
+                        root.size() +
+                        (extents ? extents->size() * sizeof(ExtentRef) : 0);
+    if (object)
+      object->ForEachRecord([&](auto, const auto&, const auto& refs, bool) {
+        total += sizeof(CheckpointGroupHeader) +
+                 (refs ? refs->size() * sizeof(ExtentRef) : 0);
+      });
+    // One object's directory/key is temporary, never its value. This also
+    // admits keys larger than an 8 MiB checkpoint chunk without silently
+    // expanding checkpoint scratch beyond maxmemory.
+    auto reservation = TryReserveMemory(AllocatorUsableSizeForRequest(total));
+    if (!reservation)
+      co_return absl::ResourceExhaustedError("OOM checkpoint object metadata");
+    std::vector<std::byte> bytes;
+    bytes.reserve(total);
+    auto append = [&](const void* data, std::size_t size) {
+      if (size == 0) return;
+      const auto* first = static_cast<const std::byte*>(data);
+      bytes.insert(bytes.end(), first, first + size);
+    };
+    auto append_extents = [&](const ExtentManifest& refs) {
+      if (refs) append(refs->data(), refs->size() * sizeof(ExtentRef));
+    };
+    CheckpointObjectHeader header{
+        .location = SaveLocation(location),
+        .digest = ComputeDigest(key),
+        .groups = object ? object->record_count() : 0,
+        .key_bytes = static_cast<std::uint32_t>(key.size()),
+        .extent_count =
+            static_cast<std::uint32_t>(extents ? extents->size() : 0),
+        .root_bytes = static_cast<std::uint32_t>(root.size()),
+        .partition = partition.id_,
+        .db = db};
+    append(&header, sizeof(header));
+    append(key.data(), key.size());
+    append_extents(extents);
+    append(root.data(), root.size());
+    absl::Status status = account_extents(extents);
+    if (object)
+      object->ForEachRecord([&](GroupedRecordId id,
+                                const RecordIndexValue& value,
+                                const ExtentManifest& refs, bool retired) {
+        if (!status.ok()) return;
+        const auto physical = MaterializeIndexLocation(value);
+        if (physical.tx_tagged()) {
+          status = absl::FailedPreconditionError(
+              "checkpoint group still transaction-tagged");
+          return;
+        }
+        CheckpointGroupHeader group{
+            .location = SaveLocation(physical),
+            .id = id.prefix_,
+            .extent_count = static_cast<std::uint32_t>(refs ? refs->size() : 0),
+            .bits = id.bits_,
+            .retired = static_cast<std::uint8_t>(retired)};
+        if (object->is_ordered() && IsOrderedPageId(id)) {
+          const auto* route =
+              object->ordered_directory().FindRecord(id.prefix_);
+          if (!route) {
+            status = absl::DataLossError("checkpoint ordered route missing");
+            return;
+          }
+          group.previous = route->previous_;
+          group.next = route->next_;
+          group.lsn = route->lsn_;
+          group.encoded_bytes = route->encoded_bytes_;
+          group.min_score = route->min_score_;
+          group.max_score = route->max_score_;
+        } else {
+          const auto& directory = object->directory();
+          const RecoveredGroupedRecord* route = nullptr;
+          if (retired) {
+            const auto it = directory.retired_groups().find(id);
+            if (it != directory.retired_groups().end()) route = &it->second;
+          } else {
+            const auto it = directory.groups().find(id.prefix_);
+            if (it != directory.groups().end()) route = &it->second;
+          }
+          if (!route) {
+            status = absl::DataLossError("checkpoint prefix route missing");
+            return;
+          }
+          group.lsn = route->lsn_;
+          group.encoded_bytes = route->encoded_bytes_;
+        }
+        append(&group, sizeof(group));
+        append_extents(refs);
+        status = account_extents(refs);
+      });
+    if (!status.ok()) co_return status;
+    if (bytes.size() != total)
+      co_return absl::InternalError(
+          "checkpoint object size changed during freeze");
+    const std::uint64_t object_size = bytes.size();
+    status = co_await append_object_stream(
+        std::as_bytes(std::span(&object_size, 1)));
+    if (!status.ok()) co_return status;
+    status = co_await append_object_stream(bytes);
+    if (!status.ok()) co_return status;
+    ++result.entry_count_;
+    co_return absl::OkStatus();
+  };
+
   for (WorkerStore::PartitionStore& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
       RecordIndex& index = partition.indexes_[db_id];
@@ -952,15 +1409,6 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
             });
         if (entry == nullptr) continue;
         const RecordLocation location = MaterializeIndexLocation(*entry);
-        // This accelerator snapshots only top-level indexes, not auxiliary
-        // collection graphs. Declining publication leaves the already-flushed
-        // records authoritative and the next boot performs graph-aware cold
-        // recovery. Never publish a root-only snapshot that would let startup
-        // skip the ordinary blocks containing its live groups.
-        if (location.grouped()) {
-          co_return absl::FailedPreconditionError(
-              "shutdown checkpoint does not encode grouped collections");
-        }
         if (location.tx_tagged()) {
           co_return absl::FailedPreconditionError(
               "shutdown transaction cleanup left a transaction-tagged index "
@@ -978,6 +1426,12 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         }
         if (key.size() > std::numeric_limits<std::uint32_t>::max()) {
           co_return absl::ResourceExhaustedError("checkpoint key is too large");
+        }
+        if (location.grouped() || location.key_indirect()) {
+          auto written =
+              co_await write_object(partition, db_id, key, location, extents);
+          if (!written.ok()) co_return written;
+          continue;
         }
         const std::size_t extent_count =
             extents == nullptr ? 0 : extents->size();
@@ -1067,6 +1521,8 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
       }
     }
   }
+  absl::Status streamed = co_await flush_object_stream();
+  if (!streamed.ok()) co_return streamed;
   absl::Status flushed = co_await flush_chunk();
   if (!flushed.ok()) co_return flushed;
 
@@ -1111,7 +1567,11 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
       // Extent ownership is reassigned from the physical block id during
       // recovery and need not match the key-index shard. Their sparse
       // accounting is emitted from the manifests below instead.
-      if (state.kind_ == BlockKind::kPayloadExtent) continue;
+      // KeyRecords and their extents are accounted by the existing UUID
+      // recovery pass. Do not install a second absolute charge here.
+      if (state.kind_ == BlockKind::kPayloadExtent ||
+          state.kind_ == BlockKind::kIndirectKeys)
+        continue;
       const std::uint64_t block_id = MakeBlockId(
           device.id_,
           static_cast<std::uint32_t>(slot + device.data_block_begin_));
@@ -1156,6 +1616,44 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
   }
   flushed = co_await flush_accounting_chunk();
   if (!flushed.ok()) co_return flushed;
+  payload->Clear();
+  CheckpointChunkHeader dependencies{
+      .generation_ = generation,
+      .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
+      .kind_ = CheckpointChunkKind::kIndirectReferences,
+      .digest_seed_ = CurrentDigestSeed()};
+  payload->AppendPod(dependencies);
+  std::uint32_t references = 0;
+  auto flush_references = [&]() -> Task<absl::Status> {
+    reinterpret_cast<CheckpointChunkHeader*>(payload->payload().data())
+        ->entry_count_ = references;
+    auto status = co_await submit_payload(references);
+    if (!status.ok()) co_return status;
+    payload->AppendPod(dependencies);
+    references = 0;
+    co_return absl::OkStatus();
+  };
+  // Retain references from obsolete/aborted records too. Their original UUID
+  // must remain resolvable if a later boot falls back to ordinary scanning.
+  for (const auto& [block, refs] : store.indirect_key_references_) {
+    for (const auto& [offset, key] : refs) {
+      if (payload->size() + sizeof(CheckpointIndirectReference) >
+          kExtentPayloadBytes) {
+        auto status = co_await flush_references();
+        if (!status.ok()) co_return status;
+      }
+      payload->AppendPod(
+          CheckpointIndirectReference{.block_id_ = block.first,
+                                      .allocation_epoch_ = block.second,
+                                      .key_id_ = key->id_,
+                                      .record_offset_ = offset});
+      ++references;
+    }
+  }
+  if (references != 0) {
+    flushed = co_await flush_references();
+    if (!flushed.ok()) co_return flushed;
+  }
   for (CheckpointWriteSlot& slot : write_slots) {
     if (!slot.active()) continue;
     absl::Status completed = co_await slot.Wait();
@@ -1417,7 +1915,8 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
       capacity_blocks.push_back(candidates[index]);
     } else {
       result->discovered_body_blocks_.push_back(
-          {.block_id_ = candidates[index],
+          {.sequence_ = chunk->sequence_,
+           .block_id_ = candidates[index],
            .shard_id_ = static_cast<std::uint16_t>(chunk->shard_id_)});
     }
   }
@@ -1489,7 +1988,8 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
       static_cast<std::size_t>(kLogicalStorageShards) * kLogicalDatabaseCount,
       kMissing);
   std::vector<std::uint32_t> capacity_chunks(worker_count_, 0);
-  std::vector<std::vector<std::uint64_t>> body_blocks_by_owner(worker_count_);
+  std::vector<std::vector<CheckpointBodyBlock>> body_blocks_by_owner(
+      worker_count_);
   std::optional<DigestSeed> checkpoint_digest_seed;
   std::uint64_t discovered_blocks = 0;
   std::uint64_t declared_entries = 0;
@@ -1526,7 +2026,7 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
               "checkpoint owner has no qpair for its body block");
         }
       }
-      body_blocks_by_owner[body.shard_id_].push_back(body.block_id_);
+      body_blocks_by_owner[body.shard_id_].push_back(body);
     }
     for (unsigned shard = 0; shard < worker_count_; ++shard) {
       if (std::numeric_limits<std::uint32_t>::max() - capacity_chunks[shard] <
@@ -1598,8 +2098,12 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
     // large bucket arrays after the barrier so NUMA placement remains local
     // and all worker allocations can proceed concurrently.
     stores_[owner]->checkpoint_index_capacities_ = std::move(capacities);
-    checkpoint_load_results_[owner].body_blocks_ =
-        std::move(body_blocks_by_owner[owner]);
+    auto& bodies = body_blocks_by_owner[owner];
+    std::stable_sort(
+        bodies.begin(), bodies.end(),
+        [](const auto& a, const auto& b) { return a.sequence_ < b.sequence_; });
+    for (const auto& body : bodies)
+      checkpoint_load_results_[owner].body_blocks_.push_back(body.block_id_);
   }
   co_return absl::OkStatus();
 }
@@ -1664,7 +2168,54 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
     if (!initialized.ok()) co_return initialized;
   }
 
-  auto decode_block = [this, &store, result](
+  std::uint64_t fragment_sequence = 0, object_size = 0;
+  std::vector<std::byte> object_bytes;
+  std::optional<MemoryReservation> object_reservation;
+  auto install_object = [&]() -> absl::Status {
+    auto decoded = DecodeCheckpointObject(
+        object_bytes, worker_count_, store.worker_->id(),
+        options_.database_count_,
+        [&](std::uint16_t partition_id, std::uint8_t db,
+            const RecordLocation& location) {
+          auto& partition = PartitionFor(store, partition_id);
+          return GroupedObjectVersion{
+              .root_ = location,
+              .db_epoch_ = DbEpoch(db),
+              .replication_epoch_ = partition.replication_epoch_,
+              .index_generation_ = partition.grouped_generations_[db]};
+        },
+        store.record_index_entry_arena_);
+    if (!decoded.ok()) return decoded.status();
+    auto& object = *decoded;
+    auto& partition = PartitionFor(store, object.header.partition);
+    // Keep root metadata until the global validation barrier: on fallback
+    // the ordinary scan needs it to merge an equal-version grouped winner.
+    RecoveryRecordView recovered{
+        .digest_ = object.header.digest,
+        .key_ = object.key,
+        .db_id_ = object.header.db,
+        .replication_epoch_ = partition.replication_epoch_,
+        .location_ = object.location,
+        .extents_ = &object.extents,
+        .grouped_root_ = object.root ? &*object.root : nullptr,
+        .checkpoint_snapshot_ = true};
+    auto installed = ApplyRecoveredRecord(store, partition, recovered);
+    if (!installed.ok()) return installed;
+    if (object.object) {
+      auto published = partition.grouped_objects_[object.header.db].Publish(
+          object.key, nullptr, object.object);
+      if (!published.ok()) return published;
+      AtomicMax(&recovery_max_txid_, object.object->incarnation());
+      AtomicMax(&recovery_max_txid_, object.object->revision());
+    }
+    ++result->entry_count_;
+    std::vector<std::byte>{}.swap(object_bytes);
+    object_reservation.reset();
+    object_size = 0;
+    return absl::OkStatus();
+  };
+  auto decode_block = [this, &store, result, &fragment_sequence, &object_size,
+                       &object_bytes, &object_reservation, &install_object](
                           std::uint64_t block_id, const std::byte* data,
                           BlockHeader block) -> Task<absl::Status> {
     auto decoded_chunk = ValidateCheckpointChunk(block_id, data, block,
@@ -1687,6 +2238,66 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
     const std::byte* end = cursor + block.extent_payload_bytes_;
     CheckpointChunkHeader chunk = *decoded_chunk;
     cursor += sizeof(chunk);
+    if (chunk.kind_ == CheckpointChunkKind::kIndirectReferences) {
+      if (chunk.sequence_ != 0 ||
+          static_cast<std::size_t>(end - cursor) !=
+              static_cast<std::size_t>(chunk.entry_count_) *
+                  sizeof(CheckpointIndirectReference))
+        co_return absl::DataLossError("invalid checkpoint UUID references");
+      for (std::uint32_t i = 0; i < chunk.entry_count_; ++i) {
+        CheckpointIndirectReference ref;
+        std::memcpy(&ref, cursor, sizeof(ref));
+        cursor += sizeof(ref);
+        if (ref.reserved_ != 0 || ref.allocation_epoch_ == 0 ||
+            !RecordLocation::CanEncodeBlockIdentity(ref.block_id_,
+                                                    ref.allocation_epoch_) ||
+            ref.record_offset_ < kBlockHeaderBytes ||
+            ref.record_offset_ >= kStorageBlockBytes ||
+            ref.record_offset_ % kRecordAlignment != 0)
+          co_return absl::DataLossError(
+              "invalid checkpoint UUID reference identity");
+        result->indirect_references_.push_back(ref);
+      }
+      co_return absl::OkStatus();
+    }
+    if (chunk.kind_ == CheckpointChunkKind::kObjectFragment) {
+      if (chunk.sequence_ != ++fragment_sequence || chunk.entry_count_ != 1 ||
+          cursor == end)
+        co_return absl::DataLossError("invalid checkpoint fragment sequence");
+      while (cursor != end) {
+        if (object_size == 0) {
+          const auto count = std::min<std::size_t>(
+              sizeof(std::uint64_t) - object_bytes.size(), end - cursor);
+          object_bytes.insert(object_bytes.end(), cursor, cursor + count);
+          cursor += count;
+          if (object_bytes.size() != sizeof(std::uint64_t)) continue;
+          std::memcpy(&object_size, object_bytes.data(), sizeof(object_size));
+          // The complete checkpoint bounds any single frame before allocation.
+          if (object_size < sizeof(CheckpointObjectHeader) ||
+              object_size / kExtentPayloadBytes > checkpoint_root_.block_count_)
+            co_return absl::DataLossError(
+                "invalid checkpoint object frame size");
+          object_reservation =
+              TryReserveMemory(AllocatorUsableSizeForRequest(object_size));
+          if (!object_reservation)
+            co_return absl::ResourceExhaustedError(
+                "OOM checkpoint object recovery");
+          object_bytes.clear();
+          object_bytes.reserve(object_size);
+        }
+        const auto count = std::min<std::size_t>(
+            object_size - object_bytes.size(), end - cursor);
+        object_bytes.insert(object_bytes.end(), cursor, cursor + count);
+        cursor += count;
+        if (object_bytes.size() == object_size) {
+          auto status = install_object();
+          if (!status.ok()) co_return status;
+        }
+      }
+      co_return absl::OkStatus();
+    }
+    if (chunk.sequence_ != 0)
+      co_return absl::DataLossError("unexpected checkpoint stream sequence");
     if (chunk.kind_ == CheckpointChunkKind::kBlockAccounting) {
       if (chunk.entry_count_ > static_cast<std::size_t>(end - cursor) /
                                    sizeof(CheckpointAccountingEntry) ||
@@ -1913,6 +2524,8 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
                                                  current.data(), **candidate);
     if (!decoded.ok()) co_return decoded;
   }
+  if (object_size != 0 || !object_bytes.empty())
+    co_return absl::DataLossError("incomplete checkpoint object stream");
   co_return absl::OkStatus();
 }
 
