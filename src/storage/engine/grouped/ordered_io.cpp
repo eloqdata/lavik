@@ -140,7 +140,7 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
   return LoadOrderedGroup<LoadedOrderedGroup>(
       store, partition, db_id, key, digest, std::move(object), page_id, pinned,
       [](std::string_view payload, std::uint64_t sequence,
-         const RecoveredOrderedGroup& route,
+         const OrderedGroupEntry& route,
          LoadedValue&&) -> absl::StatusOr<LoadedOrderedGroup> {
         auto decoded = DecodeOrderedGroup(payload);
         if (!decoded.ok()) return decoded.status();
@@ -162,7 +162,7 @@ StorageEngine::Impl::LoadOrderedListRange(
   return LoadOrderedGroup<std::vector<std::string>>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
       [first, count](std::string_view payload, std::uint64_t,
-                     const RecoveredOrderedGroup&, LoadedValue&&) {
+                     const OrderedGroupEntry&, LoadedValue&&) {
         return DecodeOrderedListRange(payload, first, count);
       });
 }
@@ -177,7 +177,7 @@ StorageEngine::Impl::LoadSortedSetPage(WorkerStore& store,
   return LoadOrderedGroup<LoadedSortedSetPage>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
       [](std::string_view payload, std::uint64_t,
-         const RecoveredOrderedGroup& route,
+         const OrderedGroupEntry& route,
          LoadedValue&& loaded) -> absl::StatusOr<LoadedSortedSetPage> {
         auto entries = DecodeSortedSetGroupViews(payload);
         if (!entries.ok()) return entries.status();

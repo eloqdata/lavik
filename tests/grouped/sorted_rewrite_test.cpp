@@ -47,16 +47,16 @@ SortedFixture Fixture() {
                                .score_ = static_cast<double>(score)});
       fixture.entries_.push_back(page.entries_.back());
     }
-    candidates.push_back({.incarnation_ = 17,
-                          .id_ = id,
-                          .previous_ = page.previous_,
-                          .next_ = page.next_,
-                          .sequence_ = 1,
-                          .lsn_ = 1,
-                          .item_count_ = 4,
-                          .record_token_ = id,
-                          .min_score_ = page.entries_.front().score_,
-                          .max_score_ = page.entries_.back().score_});
+    candidates.push_back({{.incarnation_ = 17,
+                           .id_ = id,
+                           .previous_ = page.previous_,
+                           .next_ = page.next_,
+                           .sequence_ = 1,
+                           .lsn_ = 1,
+                           .item_count_ = 4,
+                           .record_token_ = id,
+                           .min_score_ = page.entries_.front().score_,
+                           .max_score_ = page.entries_.back().score_}});
     fixture.pages_.push_back(std::move(page));
   }
   OrderedCollectionRoot root{.kind_ = OrderedCollectionKind::kSortedSet,
@@ -86,18 +86,19 @@ void CheckApplied(const SortedFixture& fixture,
   for (const auto& page : plan.writes_) {
     pages[page.id_] = page;
     changed.push_back(
-        {.incarnation_ = page.incarnation_,
-         .id_ = page.id_,
-         .previous_ = page.previous_,
-         .next_ = page.next_,
-         .sequence_ = 2,
-         .lsn_ = 2,
-         .item_count_ = page.entries_.size(),
-         .record_token_ = page.id_,
-         .retired_ = page.retired_,
-         .min_score_ = page.entries_.empty() ? 0 : page.entries_.front().score_,
-         .max_score_ =
-             page.entries_.empty() ? 0 : page.entries_.back().score_});
+        {{.incarnation_ = page.incarnation_,
+          .id_ = page.id_,
+          .previous_ = page.previous_,
+          .next_ = page.next_,
+          .sequence_ = 2,
+          .lsn_ = 2,
+          .item_count_ = page.entries_.size(),
+          .record_token_ = page.id_,
+          .retired_ = page.retired_,
+          .min_score_ =
+              page.entries_.empty() ? 0 : page.entries_.front().score_,
+          .max_score_ =
+              page.entries_.empty() ? 0 : page.entries_.back().score_}});
   }
   plan.root_.revision_ = 2;
   plan.root_.member_index_ = grouped_test::MemberRoot(plan.root_);

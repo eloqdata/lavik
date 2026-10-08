@@ -562,8 +562,15 @@ struct GroupedPhysicalState {
   // Only inline records qualify, so shadowed base entries retain no obsolete
   // extent manifests. Overflow/topology changes fold into the ordinary trie.
   static constexpr std::size_t kOverrideCapacity = 8;
-  std::array<CoordinateOverride, kOverrideCapacity> overrides_{};
-  std::size_t override_count_ = 0;
+  // Empty states allocate no overlay. A live overlay is one exact-sized COW
+  // chunk; root/TTL-only views share it, and a changed view owns its copy.
+  CowArray<CoordinateOverride, kOverrideCapacity> overrides_;
+  std::span<const CoordinateOverride> Overrides() const noexcept {
+    // Capacity never exceeds one CowArray chunk, so these entries are
+    // contiguous. Borrow them once per operation instead of tree iterators.
+    if (overrides_.empty()) return {};
+    return {&overrides_.front(), overrides_.size()};
+  }
   struct StringPage {
     // The owner keeps compact physical index entries alive. Direct pointers are
     // immutable and used only on the key owner, including destruction.
@@ -579,8 +586,10 @@ namespace {
 
 const GroupedPhysicalState::CoordinateOverride* FindOverride(
     const GroupedPhysicalState& state, GroupedRecordId id) {
-  const auto begin = state.overrides_.begin();
-  const auto end = begin + state.override_count_;
+  const auto entries = state.Overrides();
+  if (entries.empty()) return nullptr;
+  const auto begin = entries.begin();
+  const auto end = entries.end();
   const auto found = std::lower_bound(
       begin, end, id,
       [](const auto& entry, GroupedRecordId key) { return entry.id_ < key; });
@@ -596,10 +605,10 @@ const RecordIndexValue* FindPhysicalRecord(const GroupedPhysicalState& state,
 
 // Changed identities are sorted and unique. Reject before touching output so
 // callers can fall back to the trie without undoing a partial overlay update.
-bool TryUpdatePhysicalOverrides(
+absl::StatusOr<bool> TryUpdatePhysicalOverrides(
     GroupedPhysicalState& output, const GroupedPhysicalState& previous,
     std::span<const GroupedRecordLocation> changed) {
-  auto count = previous.override_count_;
+  auto count = previous.overrides_.size();
   for (const auto& record : changed) {
     const auto* old = FindPhysicalRecord(previous, record.id_);
     if (!old || old->external() || record.location_.external() ||
@@ -608,24 +617,38 @@ bool TryUpdatePhysicalOverrides(
     count += FindOverride(previous, record.id_) == nullptr;
     if (count > GroupedPhysicalState::kOverrideCapacity) return false;
   }
-  if (count > GroupedPhysicalState::kOverrideCapacity) return false;
-  output.root_ = previous.root_;
-  output.overrides_ = previous.overrides_;
-  output.override_count_ = previous.override_count_;
+  if (changed.empty()) {
+    output.root_ = previous.root_;
+    output.overrides_ = previous.overrides_;
+    return true;
+  }
+  // Merge into bounded command-local scratch before allocating the immutable
+  // after-image. Only live entries are retained; failure leaves the old graph
+  // and overlay unchanged and must propagate as admission failure.
+  std::array<GroupedPhysicalState::CoordinateOverride,
+             GroupedPhysicalState::kOverrideCapacity>
+      entries;
+  count = previous.overrides_.size();
+  const auto previous_entries = previous.Overrides();
+  std::copy(previous_entries.begin(), previous_entries.end(), entries.begin());
   for (const auto& record : changed) {
-    const auto begin = output.overrides_.begin();
-    const auto end = begin + output.override_count_;
+    const auto end = entries.begin() + count;
     const auto position = std::lower_bound(
-        begin, end, record.id_,
+        entries.begin(), end, record.id_,
         [](const auto& entry, GroupedRecordId key) { return entry.id_ < key; });
     if (position == end || position->id_ != record.id_) {
       std::move_backward(position, end, end + 1);
-      ++output.override_count_;
+      ++count;
     }
     *position = {.id_ = record.id_,
                  .entry_ = RecordIndexValue(record.location_),
                  .retired_ = record.retired_};
   }
+  auto overlay =
+      decltype(output.overrides_)::From(std::span(entries).first(count));
+  if (!overlay.ok()) return overlay.status();
+  output.root_ = previous.root_;
+  output.overrides_ = std::move(*overlay);
   return true;
 }
 
@@ -636,7 +659,7 @@ void FoldPhysicalOverrides(
     const GroupedPhysicalState& previous,
     std::span<const GroupedRecordLocation> changed,
     absl::InlinedVector<GroupedRecordLocation, 16>& folded) {
-  folded.reserve(changed.size() + previous.override_count_);
+  folded.reserve(changed.size() + previous.overrides_.size());
   std::size_t cursor = 0;
   auto append_override = [&] {
     const auto& entry = previous.overrides_[cursor++];
@@ -647,15 +670,15 @@ void FoldPhysicalOverrides(
          .retired_ = entry.retired_});
   };
   for (const auto& record : changed) {
-    while (cursor < previous.override_count_ &&
+    while (cursor < previous.overrides_.size() &&
            previous.overrides_[cursor].id_ < record.id_)
       append_override();
-    if (cursor < previous.override_count_ &&
+    if (cursor < previous.overrides_.size() &&
         previous.overrides_[cursor].id_ == record.id_)
       ++cursor;
     folded.push_back(record);
   }
-  while (cursor < previous.override_count_) append_override();
+  while (cursor < previous.overrides_.size()) append_override();
 }
 
 // String positions are dense and stable. A paged vector avoids hashing/trie
@@ -736,10 +759,13 @@ absl::Status BuildPhysicalState(
                               changed.empty() ? 0 : changed.back().id_.prefix_);
     return BuildStringPhysical(output, previous, changed, count);
   }
-  if (previous && TryUpdatePhysicalOverrides(output, *previous, changed))
-    return absl::OkStatus();
+  if (previous) {
+    auto updated = TryUpdatePhysicalOverrides(output, *previous, changed);
+    if (!updated.ok()) return updated.status();
+    if (*updated) return absl::OkStatus();
+  }
   absl::InlinedVector<GroupedRecordLocation, 16> folded;
-  if (previous && previous->override_count_ != 0) {
+  if (previous && previous->overrides_.size() != 0) {
     FoldPhysicalOverrides(*previous, changed, folded);
     changed = folded;
   }
@@ -1269,7 +1295,7 @@ void GroupedObject::ForEachRecord(const RecordVisitor& visitor) const {
     }
     return;
   }
-  if (physical_->override_count_ == 0) {
+  if (physical_->overrides_.size() == 0) {
     VisitPhysical(physical_->root_, visitor);
     return;
   }
@@ -1279,7 +1305,7 @@ void GroupedObject::ForEachRecord(const RecordVisitor& visitor) const {
       [&](GroupedRecordId id, const RecordIndexValue& entry,
           const std::shared_ptr<const std::vector<ExtentRef>>& extents,
           bool retired) {
-        if (cursor < physical_->override_count_ &&
+        if (cursor < physical_->overrides_.size() &&
             physical_->overrides_[cursor].id_ == id) {
           const auto& replacement = physical_->overrides_[cursor++];
           visitor(id, replacement.entry_, nullptr, replacement.retired_);
@@ -1287,7 +1313,7 @@ void GroupedObject::ForEachRecord(const RecordVisitor& visitor) const {
           visitor(id, entry, extents, retired);
         }
       });
-  assert(cursor == physical_->override_count_);
+  assert(cursor == physical_->overrides_.size());
 }
 
 GroupedObjectIndex::GroupedObjectIndex(

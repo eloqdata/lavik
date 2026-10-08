@@ -20,6 +20,7 @@
 #include <array>
 #include <cassert>
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -42,7 +43,7 @@ namespace lavik {
 //
 // Keys and values are trivially copyable; referenced resources remain the
 // caller's responsibility. All copies, access and destruction stay on the
-// allocating thread. Callers must bound the population to UINT32_MAX entries.
+// allocating thread.
 template <typename Key, typename Value>
 class CowMap {
   static_assert(std::is_trivially_copyable_v<Key>);
@@ -120,12 +121,21 @@ class CowMap {
 
    private:
     friend class CowMap;
-    // An AVL tree containing at most UINT32_MAX entries is far shallower than
-    // this fixed stack. Iteration never allocates retained/scratch memory.
+    // This stack covers an AVL tree whose node count fits a 64-bit size_t.
+    // Iteration never allocates retained/scratch memory.
     const Overlay* overlay_ = nullptr;
     std::array<const Node*, 96> path_{};
     unsigned depth_ = 0;
   };
+
+  // Conservative footprint including shared nodes; allocations already own
+  // these charges. Callers may use it for scratch planning, not re-accounting.
+  std::size_t RetainedBytes() const noexcept {
+    const auto node = AllocationBytes<Node>();
+    const auto overlay = overlay_ ? AllocationBytes<Overlay>() : 0;
+    const auto limit = std::numeric_limits<std::size_t>::max();
+    return size() > (limit - overlay) / node ? limit : size() * node + overlay;
+  }
 
   std::size_t size() const noexcept { return Size(root_); }
   bool empty() const noexcept { return !root_; }
@@ -291,10 +301,23 @@ class CowMap {
                 std::move(*left), std::move(*right));
   }
 
+  template <typename T>
+  static std::size_t AllocationBytes() noexcept {
+    // Match AllocateLocalShared's combined allocation, including its control
+    // block and retained allocator state. Over-aligned allocations need the
+    // same alignment headroom as TryAllocateRetainedBytes.
+    using Block = local_shared_detail::Allocation<T, RetainedAllocator<T>>;
+    const auto bytes = AllocatorUsableSizeForRequest(sizeof(Block));
+    if constexpr (alignof(Block) > __STDCPP_DEFAULT_NEW_ALIGNMENT__) {
+      const auto limit = std::numeric_limits<std::size_t>::max();
+      return bytes > limit - alignof(Block) ? limit : bytes + alignof(Block);
+    }
+    return bytes;
+  }
+
   static absl::StatusOr<LocalSharedPtr<Overlay>> MakeOverlay(
       const Overlay* previous) {
-    auto reservation =
-        TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(Overlay) + 1024));
+    auto reservation = TryReserveMemory(AllocationBytes<Overlay>());
     if (!reservation) {
       RecordMemoryRejection();
       return absl::ResourceExhaustedError(
@@ -311,8 +334,7 @@ class CowMap {
   static unsigned Height(const Link& node) { return node ? node->height_ : 0; }
   static absl::StatusOr<Link> Make(Key key, Value value, Link left,
                                    Link right) {
-    auto reservation =
-        TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(Node) + 1024));
+    auto reservation = TryReserveMemory(AllocationBytes<Node>());
     if (!reservation) {
       RecordMemoryRejection();
       return absl::ResourceExhaustedError(

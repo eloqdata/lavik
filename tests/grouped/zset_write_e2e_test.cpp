@@ -420,11 +420,72 @@ TEST(GroupedSortedSetWriteE2e, MemberScoresUsePrefixPagesWithoutOrderedReads) {
   EXPECT_EQ(scores.items_[0].text_, "128");
   EXPECT_EQ(scores.items_[1].text_, "-1");
   EXPECT_EQ(scores.items_[2].text_, "128");
+  // Absence is decided by the member index without touching ordered pages.
+  for (const auto* command : {"ZRANK", "ZREVRANK"}) {
+    const auto absent = client.Command({command, "indexed", "missing"});
+    EXPECT_EQ(absent.kind_, '$');
+    EXPECT_EQ(absent.text_, "-1");
+    const auto absent_score =
+        client.Command({command, "indexed", "missing", "WITHSCORE"});
+    EXPECT_EQ(absent_score.kind_, '*');
+    EXPECT_EQ(absent_score.text_, "-1");
+    const auto present = client.Command({command, "indexed", member});
+    EXPECT_EQ(present.kind_, '-');
+    EXPECT_NE(present.text_.find("injected ordered-page"), std::string::npos);
+  }
   const auto range = client.Command({"ZRANGE", "indexed", "0", "0"});
   EXPECT_EQ(range.kind_, '-');
   EXPECT_NE(range.text_.find("injected ordered-page"), std::string::npos);
   EXPECT_EQ(client.Command({"ZCARD", "indexed"}).text_, "256");
   EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedSortedSetWriteE2e, MemberRanksSkipUnrelatedPagesAfterRecovery) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires selected ordered-page failure injection";
+#endif
+  PrivateDisk disk;
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed("ranked")).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto records = disk.Auxiliaries("ranked");
+  ASSERT_FALSE(records.empty());
+  std::size_t pages = 0;
+  for (const auto& [id, bits] : records.rbegin()->second)
+    if (bits == 0 && id != 0) ++pages;
+  ASSERT_GT(pages, 2);
+  ScopedEnvironment key_fault("LAVIK_FAIL_ZSET_ORDERED_READ_KEY", "ranked");
+  // Fault both ends in separate boots: either scan direction would encounter
+  // an unrelated fault before reaching a member at the opposite end.
+  for (const auto fault_page : {std::size_t{1}, pages}) {
+    const auto fault_number = std::to_string(fault_page);
+    ScopedEnvironment page_fault("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE",
+                                 fault_number.c_str());
+    Server recovered(disk, 3);
+    Client client(recovered.port());
+    const unsigned wanted = fault_page == 1 ? 255 : 0;
+    const auto member = std::to_string(wanted) + std::string(128, 'm');
+    for (const auto* command : {"ZRANK", "ZREVRANK"}) {
+      const auto expected = std::to_string(
+          std::string_view(command) == "ZRANK" ? wanted : 255 - wanted);
+      EXPECT_EQ(client.Command({command, "ranked", member}).text_, expected);
+      const auto with_score =
+          client.Command({command, "ranked", member, "WITHSCORE"});
+      ASSERT_EQ(with_score.items_.size(), 2) << with_score.text_;
+      EXPECT_EQ(with_score.items_[0].text_, expected);
+      EXPECT_EQ(with_score.items_[1].text_, std::to_string(wanted));
+    }
+    // The selected page must still surface read failures.
+    const auto blocked = std::to_string(255 - wanted) + std::string(128, 'm');
+    const auto failed = client.Command({"ZRANK", "ranked", blocked});
+    EXPECT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find("injected ordered-page"), std::string::npos);
+    ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+  }
 }
 
 TEST(GroupedSortedSetWriteE2e, ScoreBoundsSkipUnrelatedPagesAfterRecovery) {
@@ -492,6 +553,13 @@ TEST(GroupedSortedSetWriteE2e, ScoreBoundsHandleLongTieRunsAndMixedBatchMoves) {
     for (std::size_t i = 0; i < sorted.size(); ++i) {
       EXPECT_EQ(all.items_[2 * i].text_, sorted[i].second) << "rank " << i;
       EXPECT_EQ(std::stod(all.items_[2 * i + 1].text_), sorted[i].first);
+      const auto rank =
+          client.Command({"ZRANK", "ties", sorted[i].second, "WITHSCORE"});
+      ASSERT_EQ(rank.items_.size(), 2) << rank.text_;
+      EXPECT_EQ(rank.items_[0].text_, std::to_string(i));
+      EXPECT_EQ(std::stod(rank.items_[1].text_), sorted[i].first);
+      EXPECT_EQ(client.Command({"ZREVRANK", "ties", sorted[i].second}).text_,
+                std::to_string(sorted.size() - 1 - i));
     }
     const auto tied = client.Command({"ZRANGEBYSCORE", "ties", "7", "7"});
     std::vector<std::string> at_seven;

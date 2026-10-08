@@ -129,7 +129,9 @@ own historical root expiry. Immediate expiration uses the ordinary
 tombstone/graph retirement path.
 
 Views share unchanged physical index pages across mutations. Small updates to existing inline records retain a bounded immutable
-coordinate overlay before folding into the physical index. Lookup and graph
+coordinate overlay before folding into the physical index. Empty physical
+states allocate no overlay; live overrides occupy a shared, bounded block
+containing only the selected records. Lookup and graph
 lifecycle traversal resolve these overrides, including retirement state; they
 retain no payload data. Topology changes and external records fold pending
 overrides into the index, while positional String indexing retains its
@@ -141,16 +143,31 @@ buffer replacements of existing prefixes in a bounded immutable metadata
 overlay; lookup and iteration resolve it, and overflow folds pending replacements
 into the tree in one batch. It retains no payload or physical pins, and each
 snapshot owns its matching routing version. Ordered directories share
-owner-local metadata chunks across immutable views. Each allocation admits and
+owner-local metadata chunks across immutable views. Small arrays retain a
+single block directly, with exact capacity at construction; larger arrays add a
+persistent pointer tree, and appends can reserve bounded tail capacity. Small
+Lists also recover without spare ring slots; larger rings retain geometric
+slack for end edits. Recovery candidates keep
+transaction tags through adjudication, while resident ordered-page entries omit
+those tags. Pending foreground decisions and undo remain owned by the existing
+publication machinery. Each allocation admits and
 accounts its own lifetime, independently of the number of views retaining it.
 Local page replacements detach changed chunks. Lists, Sorted Sets and Streams
 share a persistent Fenwick rank index, updating logarithmic cells per changed
 page count. Rank lookup and prefix counting use the same index; count-neutral
-replacements share it. Strings use fixed-segment arithmetic. Unchanged
-identities and retirement records remain shared. Stream suffix insertions preserve a validated predecessor prefix and check the
-remaining chain and aggregate counts; other topology changes validate the
-complete resulting chain. Only recovery selects among competing physical
-candidates. Retired identities remain available to GC. Routing and physical-index node references,
+replacements share it. List directories store pages in a persistent ring and
+count physical slots, translating logical ranks across its wrap boundary.
+An identity map names active slots or append-only retirement entries. End
+splits and removals within capacity preserve untouched slots and validate only
+the replaced chain interval and its boundary links. Capacity grows geometrically;
+growth and length-changing middle splices may rebuild the slot layout. Pops do
+not shrink capacity. These are runtime representations: durable page IDs,
+links and recovery validation remain unchanged.
+Strings use fixed-segment arithmetic. Unchanged identities and retirement
+records remain shared. Stream suffix insertions preserve a validated predecessor
+prefix and check the remaining chain and aggregate counts; other non-List
+topology changes validate the complete resulting chain. Only recovery selects
+among competing physical candidates. Retired identities remain available to GC. Routing and physical-index node references,
 including final destruction, remain on
 the key owner. Cross-worker readers exchange physical identities or stream
 handles that route metadata access and cleanup back to that owner. Retained
@@ -367,8 +384,10 @@ contents before forming a replacement interval. Only changed snapshots enter
 the writer, and admitted reply buffers retain their charge across owner hops.
 
 Sorted Set operations use a typed storage interface. Cardinality reads root
-metadata. Score lookups read only the selected member-prefix pages; member
-ranks scan admitted ordered pages. Rank ranges start at the directory's
+metadata. Score lookups read only the selected member-prefix pages. Member
+ranks resolve the score through that index, search the score-bounded ordered
+pages for the exact member, and combine its page offset with the directory's
+Fenwick prefix count. Rank ranges start at the directory's
 selected pages; score ranges and score counts first
 seek their candidate interval using resident score bounds, then read matching
 pages in physical order. Range, rank, count, scan, random and pop selection

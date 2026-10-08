@@ -1725,6 +1725,7 @@ if (BUILD_TESTING)
     tests/grouped/hash_test.cpp
     tests/grouped/commit_decision_test.cpp
     tests/grouped/collection_test.cpp
+    tests/grouped/list_directory_test.cpp
     tests/grouped/sorted_rewrite_test.cpp
     tests/ordered_compact_codec_test.cpp
     tests/collection_compact_stream_test.cpp

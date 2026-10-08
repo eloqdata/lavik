@@ -303,20 +303,20 @@ TEST(StreamRecords, SpliceBoundsRejectDuplicateIdsWithDifferentPayloads) {
                      .id_ = 2,
                      .previous_ = 1,
                      .entries_ = {(*records)[3]}}}};
-  std::vector<RecoveredOrderedGroup> metadata{{.incarnation_ = 1,
-                                               .id_ = 1,
-                                               .next_ = 2,
-                                               .sequence_ = 1,
-                                               .lsn_ = 1,
-                                               .item_count_ = 1,
-                                               .record_token_ = 1},
-                                              {.incarnation_ = 1,
-                                               .id_ = 2,
-                                               .previous_ = 1,
-                                               .sequence_ = 1,
-                                               .lsn_ = 2,
-                                               .item_count_ = 1,
-                                               .record_token_ = 2}};
+  std::vector<RecoveredOrderedGroup> metadata{{{.incarnation_ = 1,
+                                                .id_ = 1,
+                                                .next_ = 2,
+                                                .sequence_ = 1,
+                                                .lsn_ = 1,
+                                                .item_count_ = 1,
+                                                .record_token_ = 1}},
+                                              {{.incarnation_ = 1,
+                                                .id_ = 2,
+                                                .previous_ = 1,
+                                                .sequence_ = 1,
+                                                .lsn_ = 2,
+                                                .item_count_ = 1,
+                                                .record_token_ = 2}}};
   auto directory = OrderedGroupDirectory::Recover(root, 1, metadata, {});
   ASSERT_TRUE(directory.ok()) << directory.status();
   auto lower = (*records)[1], upper = (*records)[3];
@@ -358,14 +358,14 @@ TEST(StreamRecords, DisjointIntervalsSplitAndRetireWithoutChangingGaps) {
                                       .next_ = i == 23 ? 0 : id(i + 1),
                                       .entries_ = {(*records)[2 * i + 1],
                                                    (*records)[2 * i + 2]}}});
-    metadata.push_back({.incarnation_ = 1,
-                        .id_ = id(i),
-                        .previous_ = i == 0 ? 0 : id(i - 1),
-                        .next_ = i == 23 ? 0 : id(i + 1),
-                        .sequence_ = 1,
-                        .lsn_ = i + 1,
-                        .item_count_ = 2,
-                        .record_token_ = i + 1});
+    metadata.push_back({{.incarnation_ = 1,
+                         .id_ = id(i),
+                         .previous_ = i == 0 ? 0 : id(i - 1),
+                         .next_ = i == 23 ? 0 : id(i + 1),
+                         .sequence_ = 1,
+                         .lsn_ = i + 1,
+                         .item_count_ = 2,
+                         .record_token_ = i + 1}});
   }
   OrderedCollectionRoot root{.kind_ = OrderedCollectionKind::kStream,
                              .incarnation_ = 1,
@@ -468,12 +468,12 @@ TEST(StreamRecords, BulkInsertionSplitsAndPreservesLogicalImage) {
                              .revision_ = 1,
                              .stream_length_ = 0};
   const std::vector<RecoveredOrderedGroup> metadata{
-      {.incarnation_ = 1,
-       .id_ = 1,
-       .sequence_ = 1,
-       .lsn_ = 1,
-       .item_count_ = before->size(),
-       .record_token_ = 1}};
+      {{.incarnation_ = 1,
+        .id_ = 1,
+        .sequence_ = 1,
+        .lsn_ = 1,
+        .item_count_ = before->size(),
+        .record_token_ = 1}}};
   auto directory = OrderedGroupDirectory::Recover(root, 1, metadata, {});
   ASSERT_TRUE(directory.ok()) << directory.status();
   std::vector<LoadedOrderedGroup> loaded{

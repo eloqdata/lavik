@@ -20,6 +20,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -44,6 +46,117 @@ class ArrayMemoryScope {
  private:
   unsigned shard_;
 };
+
+TEST(CowArrayTest, SmallArraysAllocateOnlyLiveEntriesAndDetachOnlyWhenShared) {
+  ArrayMemoryScope memory;
+  using Array = CowArray<std::uint64_t>;
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  {
+    auto current = Array::From(std::vector<std::uint64_t>(22, 17));
+    ASSERT_TRUE(current.ok());
+    const auto allocated = WorkerMemoryAccountingBytes(0) - baseline;
+    // 176 bytes of elements plus ownership metadata fit one small allocation;
+    // a pointer branch or a fully reserved 32-entry chunk would exceed this.
+    EXPECT_LT(allocated, 256);
+    const auto* data = &current->front();
+    ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
+    EXPECT_TRUE(current->Set(21, 23).ok());
+    EXPECT_EQ(&current->front(), data);
+    auto pinned = *current;
+    EXPECT_EQ(current->Set(0, 29).code(), absl::StatusCode::kResourceExhausted);
+    EXPECT_EQ(current->front(), 17);
+    EXPECT_EQ(pinned.back(), 23);
+    ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+    ASSERT_TRUE(current->Set(0, 29).ok());
+    EXPECT_NE(&current->front(), data);
+    EXPECT_EQ(pinned.front(), 17);
+    EXPECT_LT(WorkerMemoryAccountingBytes(0) - baseline, 512);
+  }
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+}
+
+struct CountedArrayValue {
+  static inline int constructions = 0;
+  static inline int throw_after = -1;
+  int value_ = 0;
+  CountedArrayValue() { ++constructions; }
+  CountedArrayValue(const CountedArrayValue& other) : value_(other.value_) {
+    if (throw_after == 0) throw std::runtime_error("copy failure");
+    if (throw_after > 0) --throw_after;
+    ++constructions;
+  }
+  CountedArrayValue& operator=(const CountedArrayValue&) = default;
+};
+
+TEST(CowArrayTest,
+     SpareCapacityIsUninitializedAndThrowingCopiesReleaseStorage) {
+  ArrayMemoryScope memory;
+  std::array<CountedArrayValue, 3> values;
+  values[0].value_ = 11;
+  using Array = CowArray<CountedArrayValue>;
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  {
+    CountedArrayValue::constructions = 0;
+    auto current = Array::From(std::span(values).first(2));
+    ASSERT_TRUE(current.ok());
+    EXPECT_EQ(CountedArrayValue::constructions, 2);
+    CountedArrayValue::constructions = 0;
+    auto appended = current->Appended(std::span(values).last(1));
+    ASSERT_TRUE(appended.ok());
+    EXPECT_EQ(CountedArrayValue::constructions, 3);
+    EXPECT_EQ(current->size(), 2);
+    EXPECT_EQ(appended->size(), 3);
+    const auto before = WorkerMemoryAccountingBytes(0);
+    CountedArrayValue::throw_after = 1;
+    EXPECT_THROW(current->Appended(values), std::runtime_error);
+    CountedArrayValue::throw_after = -1;
+    EXPECT_EQ(WorkerMemoryAccountingBytes(0), before);
+    EXPECT_EQ(current->front().value_, 11);
+  }
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+}
+
+TEST(CowArrayTest, OverAlignedElementsSurviveSingleChunkPromotionAndCopies) {
+  ArrayMemoryScope memory;
+  struct alignas(128) Value {
+    std::uint64_t value_;
+  };
+  using Array = CowArray<Value, 4>;
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  {
+    const std::array<Value, 3> input{{{1}, {2}, {3}}};
+    auto current = Array::From(input);
+    ASSERT_TRUE(current.ok());
+    for (unsigned step = 0; step < 50; ++step) {
+      const auto pinned = *current;
+      auto next = current->Appended(input);
+      ASSERT_TRUE(next.ok());
+      for (std::size_t i = 0; i < next->size(); ++i) {
+        EXPECT_EQ(
+            reinterpret_cast<std::uintptr_t>(&(*next)[i]) % alignof(Value), 0);
+        EXPECT_EQ((*next)[i].value_, 1 + i % 3);
+      }
+      ASSERT_TRUE(next->Set(next->size() - 1, Value{99}).ok());
+      EXPECT_EQ(pinned.back().value_, 3);
+      ASSERT_TRUE(next->Set(next->size() - 1, Value{3}).ok());
+      *current = std::move(*next);
+    }
+  }
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+}
+
+#ifndef NDEBUG
+TEST(CowArrayDeathTest, RejectsForeignThreadSharing) {
+  auto array = CowArray<std::uint64_t>::From(std::array<std::uint64_t, 1>{17});
+  ASSERT_TRUE(array.ok());
+  EXPECT_DEATH(
+      {
+        std::thread reader([&] { auto copy = *array; });
+        reader.join();
+      },
+      "owner_");
+}
+#endif
 
 TEST(CowArrayTest, SparseUpdatesPreserveSnapshotsAcrossTreeLevels) {
   ArrayMemoryScope memory;
@@ -114,7 +227,7 @@ TEST(CowArrayTest, PartialDetachAdmissionFailureCanBeRetried) {
     auto updated = *original;
     const auto before = WorkerMemoryAccountingBytes(0);
     // Admit the first pointer allocation but not the rest of a shared path.
-    const auto steady = GetWorkerMemoryStats(0).retained_bytes_ + 1536;
+    const auto steady = GetWorkerMemoryStats(0).retained_bytes_ + 400;
     ASSERT_TRUE(InitMemoryLimit((steady * 10 + 8) / 9, 1).ok());
     EXPECT_EQ(updated.Set(4099, 29).code(),
               absl::StatusCode::kResourceExhausted);
@@ -170,7 +283,7 @@ TEST(CowArrayTest, AppendAdmissionFailurePreservesViewAndAccounting) {
     ASSERT_TRUE(original.ok());
     const auto before = WorkerMemoryAccountingBytes(0);
     // Root growth succeeds before the new child path runs out of admission.
-    const auto steady = GetWorkerMemoryStats(0).retained_bytes_ + 1536;
+    const auto steady = GetWorkerMemoryStats(0).retained_bytes_ + 400;
     ASSERT_TRUE(InitMemoryLimit((steady * 10 + 8) / 9, 1).ok());
     const std::array<std::uint64_t, 1> tail{29};
     auto rejected = original->Appended(tail);
