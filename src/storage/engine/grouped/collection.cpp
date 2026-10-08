@@ -34,7 +34,7 @@ namespace {
 constexpr std::string_view kRootMagic = "LOCROOT1";
 constexpr std::string_view kGroupMagic = "LOCGRUP1";
 constexpr std::size_t kRootBytes = kOrderedCollectionRootBytes;
-constexpr std::size_t kEntryHeaderBytes = 12;
+constexpr std::size_t kEntryHeaderBytes = kOrderedEntryHeaderBytes;
 
 template <typename Buffer>
 void Store(Buffer& bytes, std::size_t offset, std::uint64_t value,
@@ -1751,9 +1751,15 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
     }
   }
   for (std::size_t i = required_begin; i < required_end; ++i) {
-    if (!loaded.contains(groups[i].id_))
+    if (!loaded.contains(groups[i].id_)) {
+      // List values have no cross-page ordering constraint. The directory
+      // already validates links; require a neighbour's payload only if its
+      // link actually changes after the split/removal below.
+      if (root.kind_ == OrderedCollectionKind::kList && (i < begin || i >= end))
+        continue;
       return absl::InvalidArgumentError("ordered splice needs adjacent pages");
-    if (i != required_begin) {
+    }
+    if (i != required_begin && loaded.contains(groups[i - 1].id_)) {
       auto boundary = ValidateOrderedGroupBoundary(loaded.at(groups[i - 1].id_),
                                                    loaded.at(groups[i].id_));
       if (!boundary.ok()) return boundary;
@@ -1838,14 +1844,18 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
     plan.writes_.push_back(Retired(root, groups[i].id_));
   if (begin == 0)
     plan.root_.first_group_ = new_first;
-  else if (loaded.at(previous).next_ != new_first) {
+  else if (groups[begin - 1].next_ != new_first) {
+    if (!loaded.contains(previous))
+      return absl::InvalidArgumentError("ordered splice needs previous page");
     auto& neighbour = loaded.at(previous);
     neighbour.next_ = new_first;
     plan.writes_.push_back(std::move(neighbour));
   }
   if (end == groups.size())
     plan.root_.last_group_ = new_last;
-  else if (loaded.at(next).previous_ != new_last) {
+  else if (groups[end].previous_ != new_last) {
+    if (!loaded.contains(next))
+      return absl::InvalidArgumentError("ordered splice needs next page");
     auto& neighbour = loaded.at(next);
     neighbour.previous_ = new_last;
     plan.writes_.push_back(std::move(neighbour));

@@ -139,6 +139,8 @@ inline std::size_t OrderedGroupSize(
 }
 
 inline constexpr std::size_t kOrderedGroupHeaderBytes = 64;
+// Each ordered item stores its byte length and score before its value.
+inline constexpr std::size_t kOrderedEntryHeaderBytes = 12;
 inline constexpr std::size_t kOrderedCollectionRootBytes = 72;
 inline constexpr std::size_t kGroupedStreamRootBytes =
     kOrderedCollectionRootBytes + 8;
@@ -204,7 +206,7 @@ class OrderedGroupEncoder {
  private:
   const OrderedGroupSnapshot* group_ = nullptr;
   std::array<char, kOrderedGroupHeaderBytes> header_{};
-  std::array<char, 12> entry_header_{};
+  std::array<char, kOrderedEntryHeaderBytes> entry_header_{};
   std::size_t encoded_bytes_ = 0;
   std::size_t entry_ = 0;
   unsigned phase_ = 0;
@@ -578,6 +580,9 @@ struct OrderedCollectionMutationPlan {
 // storage primitive for List push/pop/insert/remove and Sorted Set insertion,
 // deletion or score repositioning. The caller supplies all intersected pages
 // plus their immediate neighbours; only changed complete pages are returned.
+// List neighbours may be omitted when their links remain unchanged, including
+// tail pushes (even with a split) and pops that leave the touched page nonempty
+// without splitting it at a smaller target size.
 // Replacing one List item with the same byte length at the default page target
 // needs only its containing page, because its size and links stay unchanged.
 // Noncontiguous List removals or a Sorted Set reposition may be expressed as

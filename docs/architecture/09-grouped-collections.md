@@ -375,12 +375,15 @@ of read-buffer accounting. Indexed reads retain their direct single-page path.
 Read-only operations retain shared
 key intent and an immutable routing view, release worker store state before
 page I/O, and validate population and physical record lifetime in the page
-loader. Push, pop and indexed replacement load the affected interval and its
-immediate link neighbours; an equal-sized indexed replacement only needs its
-target page. Pivot and position searches consume one page at a time and retain
-only the result; insertion reloads the located interval.
-Value removals, trimming and within-list moves retain the needed logical
-contents before forming a replacement interval. Only changed snapshots enter
+loader. Push, pop and indexed replacement load the affected interval, with
+neighbour payloads when their links may change. Tail pushes, insertions that fit
+one page, pops that leave their single affected page nonempty, and indexed
+replacements that retain one page need only their target page. Position searches
+consume one page at a time and retain only the result. Pivot searches retain the
+matched page and its admission for insertion preparation. Full-range trims use
+resident cardinality to return without reading payloads. Other trims, value
+removals and within-list moves retain the needed logical contents before forming
+a replacement interval. Only changed snapshots enter
 the writer, and admitted reply buffers retain their charge across owner hops.
 
 Sorted Set operations use a typed storage interface. Cardinality reads root
@@ -390,11 +393,17 @@ pages for the exact member, and combine its page offset with the directory's
 Fenwick prefix count. Rank ranges start at the directory's
 selected pages; score ranges and score counts first
 seek their candidate interval using resident score bounds, then read matching
-pages in physical order. Range, rank, count, scan, random and pop selection
+pages in physical order. Range, rank, count, scan and random selection
 borrow member bytes from one owned read lease and validate complete page
 framing, ordering and uniqueness before consumption. Replies copy only
 admitted output members. Mutation source and boundary probes, and rewrite
-planning, use owned snapshots.
+planning, use owned snapshots. Command-local probes retain admitted source
+pages containing requested members within a fixed scratch bound and reuse
+them in planning. Unrelated or excess search pages are released immediately;
+large members retain the ordinary read fallback. Pop selection passes its owned pages
+into deletion under the same exclusive key intent. Reuse checks the logical
+population and preserves member-index/ordered-index agreement; physical GC
+relocation does not invalidate owned payload bytes.
 Mixed-score BYLEX preserves global member ordering without a resident member
 index by repeatedly selecting
 the next member: its work can scale with the collection size times the offset

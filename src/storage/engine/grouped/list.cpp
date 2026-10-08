@@ -148,11 +148,19 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
                          operation.kind_ == ListOperationKind::kIndex ||
                          operation.kind_ == ListOperationKind::kRange ||
                          operation.kind_ == ListOperationKind::kPosition;
+  // A full-range trim changes neither values nor WATCH state. Its range is
+  // determined by resident cardinality; no payload validation/read is needed.
+  if (operation.kind_ == ListOperationKind::kTrim &&
+      ListRange(operation.first_, operation.second_, count) ==
+          std::pair<std::uint64_t, std::uint64_t>{0, count})
+    co_return result;
   // Searching a disk-backed List must not retain its unrelated values. Only
-  // LPOS's actual output and one decoded page survive each iteration; LINSERT
-  // retains just the pivot rank and reloads its affected interval below.
+  // LPOS's actual output and one decoded page survive each iteration. LINSERT
+  // retains the matched page with its admission for mutation preparation.
   const bool find_pivot = operation.kind_ == ListOperationKind::kInsertBefore ||
                           operation.kind_ == ListOperationKind::kInsertAfter;
+  std::optional<MemoryReservation> pivot_scratch;
+  std::optional<LoadedOrderedGroup> pivot_page;
   std::optional<std::uint64_t> pivot_rank;
   if (find_pivot || operation.kind_ == ListOperationKind::kPosition) {
     {
@@ -198,6 +206,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
             continue;
           if (find_pivot) {
             pivot_rank = position;
+            pivot_scratch.emplace(std::move(*scratch));
+            pivot_page.emplace(std::move(*page));
             break;
           }
           if (++matches >= wanted) {
@@ -309,10 +319,40 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
   std::size_t begin_page = first->group_index_;
   std::size_t end_page = last->group_index_ + 1;
   if (!read_only) {
-    // Links belong to their complete page snapshots. A split/removal can
-    // change either neighbour, so pin its logical contents in the same plan.
-    if (begin_page != 0) --begin_page;
-    if (end_page != directory.groups().size()) ++end_page;
+    // Tail insertion retains the old tail's identity even when it splits, so
+    // its predecessor cannot change. A pop that leaves its one touched page
+    // nonempty also preserves both links. Avoid reading/decoding neighbours
+    // in these cases; page retirement still needs their complete snapshots.
+    const bool append = rank == count && erase_count == 0;
+    const bool partial_pop =
+        (operation.kind_ == ListOperationKind::kPopLeft ||
+         operation.kind_ == ListOperationKind::kPopRight) &&
+        begin_page + 1 == end_page &&
+        erase_count < directory.groups()[begin_page].item_count_;
+    // A nonempty one-page splice retains its first page id, including a
+    // split. Only its successor can acquire a different previous link.
+    const bool retains_first =
+        begin_page + 1 == end_page &&
+        (!insertions.empty() ||
+         erase_count < directory.groups()[begin_page].item_count_);
+    bool fits = false;
+    if (begin_page + 1 == end_page && erase_count == 0 &&
+        end_page != directory.groups().size()) {
+      std::uint64_t bytes = directory.groups()[begin_page].encoded_bytes_;
+      fits = bytes <= kCollectionGroupTargetBytes;
+      for (const auto& entry : insertions) {
+        const auto extra = kOrderedEntryHeaderBytes + entry.value_.size();
+        if (!fits || extra > kCollectionGroupTargetBytes - bytes) {
+          fits = false;
+          break;
+        }
+        bytes += extra;
+      }
+    }
+    if (!append && !partial_pop && !retains_first && begin_page != 0)
+      --begin_page;
+    if (!partial_pop && !fits && end_page != directory.groups().size())
+      ++end_page;
   }
   GroupedScratchBudget page_budget;
   for (std::size_t i = begin_page; i < end_page; ++i) {
@@ -428,7 +468,6 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
   std::vector<LoadedOrderedGroup> loaded;
   loaded.reserve(end_page - begin_page);
   std::optional<LoadedOrderedGroup> set_page;
-  bool same_size_set = false;
   if (operation.kind_ == ListOperationKind::kSet) {
     if (prepared != nullptr) co_await bycorf::Yield(*store.worker_);
     auto page = co_await LoadOrderedGroupSnapshot(
@@ -437,28 +476,41 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     if (!page.ok()) co_return page.status();
     if (first->offset_ >= page->snapshot_.entries_.size())
       co_return absl::DataLossError("List replacement rank exceeds page");
-    same_size_set = page->snapshot_.entries_[first->offset_].value_.size() ==
-                    operation.value_.size();
+    const auto old_size =
+        page->snapshot_.entries_[first->offset_].value_.size();
+    const auto bytes = directory.groups()[first->group_index_].encoded_bytes_;
+    // Equal-sized oversized items keep the planner's existing fast path.
+    // Other replacements need a successor only if the page actually splits.
+    if (old_size == operation.value_.size() ||
+        bytes - old_size + operation.value_.size() <=
+            kCollectionGroupTargetBytes ||
+        page->snapshot_.entries_.size() == 1) {
+      begin_page = first->group_index_;
+      end_page = begin_page + 1;
+    }
     set_page.emplace(std::move(*page));
-    // The splice planner verifies that an equal-sized replacement preserves
-    // the complete page and links. Retain the conservative page admission,
-    // but avoid reading neighbours whose contents cannot affect this write.
-    if (same_size_set) loaded.push_back(std::move(*set_page));
   }
-  for (std::size_t i = begin_page; !same_size_set && i < end_page; ++i) {
+  for (std::size_t i = begin_page; i < end_page; ++i) {
     if (set_page && i == first->group_index_) {
       loaded.push_back(std::move(*set_page));
+      continue;
+    }
+    if (pivot_page && pivot_page->snapshot_.id_ == directory.groups()[i].id_) {
+      loaded.push_back(std::move(*pivot_page));
+      pivot_page.reset();
       continue;
     }
     if (prepared != nullptr) co_await bycorf::Yield(*store.worker_);
     auto page =
         co_await LoadOrderedGroupSnapshot(store, partition, db_id, key, digest,
                                           object, directory.groups()[i].id_);
-    if (!page.ok()) {
-      co_return page.status();
-    }
+    if (!page.ok()) co_return page.status();
     loaded.push_back(std::move(*page));
   }
+  // The mutation's page reservation now covers reused payloads too. A pivot
+  // at the preceding page's end may lie outside the actual insertion page.
+  pivot_page.reset();
+  pivot_scratch.reset();
   if (operation.kind_ == ListOperationKind::kPopLeft ||
       operation.kind_ == ListOperationKind::kPopRight) {
     std::uint64_t remaining = erase_count;

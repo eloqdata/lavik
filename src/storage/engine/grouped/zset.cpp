@@ -799,7 +799,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     const SortedSetOperation& operation, GroupedObject::Handle object,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    PreparedOrderedMutation* prepared) {
+    PreparedOrderedMutation* prepared, SortedSetOrderedProbe* ordered_probe) {
   if (!object || !object->is_ordered() ||
       object->ordered_directory().root().kind_ !=
           OrderedCollectionKind::kSortedSet)
@@ -849,10 +849,43 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   };
   // A scan retains one physical read lease and borrowed member views.
   // Keep scratch admitted until both disappear; replies own separate copies.
-  using OwnedScanPage = AdmittedScanPage<LoadedOrderedGroup>;
-  auto read_page_impl =
-      [&]<typename Page>(
-          std::size_t i) -> Task<absl::StatusOr<AdmittedScanPage<Page>>> {
+  SortedSetOrderedProbe local_probe{.source_ = object, .pages_ = {}};
+  if (ordered_probe == nullptr) ordered_probe = &local_probe;
+  if (ordered_probe->source_.get() != object.get())
+    co_return absl::DataLossError("Sorted Set probe logical view mismatch");
+  auto& probed_pages = ordered_probe->pages_;
+  using OwnedScanPage = SortedSetOrderedProbe::Page;
+  auto retain_probe = [&](std::size_t i, OwnedScanPage page) {
+    // Reuse is optional, not a batch-sized payload cache. Bound admitted
+    // retention (including decoded entry overhead), so large members and
+    // wide pops keep the ordinary one-page scan/fallback under maxmemory.
+    constexpr std::size_t kProbeBytes = 64 * 1024;
+    std::size_t bytes = page.admission_.bytes();
+    if (bytes > kProbeBytes) return;
+    for (const auto& [index, retained] : probed_pages) {
+      if (retained.admission_.bytes() > kProbeBytes - bytes) return;
+      bytes += retained.admission_.bytes();
+    }
+    probed_pages.emplace(i, std::move(page));
+  };
+  auto read_page_impl = [&]<typename Page>(std::size_t i)
+      -> Task<absl::StatusOr<
+          std::conditional_t<std::is_same_v<Page, LoadedOrderedGroup>,
+                             OwnedScanPage, AdmittedScanPage<Page>>>> {
+    using ResultPage =
+        std::conditional_t<std::is_same_v<Page, LoadedOrderedGroup>,
+                           OwnedScanPage, AdmittedScanPage<Page>>;
+    if constexpr (std::is_same_v<Page, LoadedOrderedGroup>) {
+      if (auto found = probed_pages.find(i); found != probed_pages.end()) {
+        // Owned payloads survive GC relocation, but not logical replacement.
+        GroupedScratchBudget budget;
+        auto valid = add_page_budget(&budget, i);
+        if (!valid.ok()) co_return valid;
+        auto page = std::move(found->second);
+        probed_pages.erase(found);
+        co_return page;
+      }
+    }
     LAVIK_FAULT_INJECT(
         // An optional one-based directory page isolates routing tests from
         // the existing fail-all-ordered-reads member-index test.
@@ -882,7 +915,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     };
     auto page = co_await load();
     if (!page.ok()) co_return page.status();
-    co_return AdmittedScanPage<Page>{std::move(*admission), std::move(*page)};
+    co_return ResultPage{std::move(*admission), std::move(*page)};
   };
   auto read_page = [&](std::size_t i) {
     return read_page_impl.template operator()<LoadedSortedSetPage>(i);
@@ -916,7 +949,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         store, partition, db_id, key, digest,
         SortedSetOperation{.kind_ = SortedSetOperationKind::kRemove,
                            .members_ = removed},
-        object, tx, replication, mutation_precondition, prepared);
+        object, tx, replication, mutation_precondition, prepared,
+        ordered_probe);
     if (!deleted.ok()) co_return deleted.status();
     result.changed_ = deleted->changed_;
     result.length_ = deleted->length_;
@@ -981,9 +1015,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
          ++ordinal) {
       const auto i =
           operation.reverse_ ? metadata.size() - 1 - ordinal : ordinal;
-      auto page = co_await read_page(i);
+      auto page = co_await read_owned_page(i);
       if (!page.ok()) co_return page.status();
-      const auto& entries = page->page_.entries_;
+      const auto& entries = page->page_.snapshot_.entries_;
       for (std::size_t j = 0;
            result.members_.size() < count && j < entries.size(); ++j) {
         const auto at = operation.reverse_ ? entries.size() - 1 - j : j;
@@ -992,6 +1026,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         auto appended = AppendOutput(std::move(*copied), &result);
         if (!appended.ok()) co_return appended;
       }
+      retain_probe(i, std::move(*page));
     }
     if (result.members_.size() != count)
       co_return absl::DataLossError("Sorted Set pop cardinality mismatch");
@@ -1199,6 +1234,33 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     // under the same retained logical root; absence is corruption, not nil.
     co_return absl::DataLossError("Sorted Set indexed member missing");
   }
+  // Pop already knows the exact source pages. Check the member index above
+  // against their owned entries, then omit those members from score routing.
+  // New point-write probes follow the same path on later planner reads.
+  auto locate_sources = [&](std::size_t i,
+                            const auto& entries) -> absl::StatusOr<bool> {
+    bool matched = false;
+    for (const auto& entry : entries) {
+      auto member = members.find(entry.value_);
+      if (member == members.end()) continue;
+      auto& state = member->second;
+      if (state.source_ != kNoPage)
+        return absl::DataLossError("duplicate persisted Sorted Set member");
+      if (!state.before_ || *state.before_ != entry.score_)
+        return absl::DataLossError("member-index/ordered score mismatch");
+      state.source_ = i;
+      --remaining_sources;
+      matched = true;
+    }
+    return matched;
+  };
+  for (const auto& [i, page] : probed_pages) {
+    GroupedScratchBudget budget;
+    status = add_page_budget(&budget, i);
+    if (!status.ok()) co_return status;
+    auto located = locate_sources(i, page.page_.snapshot_.entries_);
+    if (!located.ok()) co_return located.status();
+  }
   // The two resident doubles bound old-score candidates without reading
   // unrelated pages. Equal-score runs still scan for exact members. Sort
   // and merge requested intervals so a batch reads an overlapping page only
@@ -1206,7 +1268,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   std::vector<std::pair<std::size_t, std::size_t>> source_ranges;
   source_ranges.reserve(members.size());
   for (const auto& [member, state] : members) {
-    if (!state.before_) continue;
+    if (!state.before_ || state.source_ != kNoPage) continue;
     const auto first = directory.LowerBoundScore(*state.before_);
     const auto end = directory.UpperBoundScore(*state.before_);
     if (first >= end)
@@ -1218,21 +1280,14 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   for (const auto& [first, end] : source_ranges) {
     for (std::size_t i = std::max(first, scanned_end);
          i < end && remaining_sources != 0; ++i) {
+      if (probed_pages.contains(i)) continue;
       auto page = co_await read_owned_page(i);
       if (!page.ok()) co_return page.status();
-      for (const auto& entry : page->page_.snapshot_.entries_) {
-        auto member = members.find(entry.value_);
-        if (member == members.end()) continue;
-        auto& state = member->second;
-        if (state.source_ != kNoPage)
-          co_return absl::DataLossError(
-              "duplicate persisted Sorted Set member");
-        if (!state.before_ || *state.before_ != entry.score_)
-          co_return absl::DataLossError("member-index/ordered score mismatch");
-        state.before_ = state.after_ = entry.score_;
-        state.source_ = i;
-        --remaining_sources;
-      }
+      auto located = locate_sources(i, page->page_.snapshot_.entries_);
+      if (!located.ok()) co_return located.status();
+      // Equal-score scans may touch unrelated pages. Retain only pages with
+      // requested members, so a point update never caches the whole set.
+      if (*located) retain_probe(i, std::move(*page));
     }
     scanned_end = std::max(scanned_end, end);
   }
@@ -1301,9 +1356,13 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       modified.insert(i);
       ++next;
     }
+    if (boundary && modified.contains(i)) retain_probe(i, std::move(*boundary));
   }
   if (next != pending.size())
     co_return absl::DataLossError("Sorted Set destination scan ended early");
+  std::erase_if(probed_pages, [&](const auto& page) {
+    return !modified.contains(page.first);
+  });
   std::set<std::size_t> selected = modified;
   for (const auto i : modified) {
     if (i != 0) selected.insert(i - 1);
@@ -1340,12 +1399,19 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   // neighbour only if splitting/retirement actually changes its link.
   // Routing and pair redistribution need only the already modified pages.
   for (const auto i : modified) {
-    status = check_plan_read(i);
-    if (!status.ok()) co_return status;
-    auto page = co_await LoadOrderedGroupSnapshot(
-        store, partition, db_id, key, digest, object, metadata[i].id_);
-    if (!page.ok()) co_return page.status();
-    loaded.emplace(i, std::move(page->snapshot_));
+    if (probed_pages.contains(i)) {
+      auto page = co_await read_owned_page(i);
+      if (!page.ok()) co_return page.status();
+      loaded.emplace(i, std::move(page->page_.snapshot_));
+      // working_admission now covers the transferred strings.
+    } else {
+      status = check_plan_read(i);
+      if (!status.ok()) co_return status;
+      auto page = co_await LoadOrderedGroupSnapshot(
+          store, partition, db_id, key, digest, object, metadata[i].id_);
+      if (!page.ok()) co_return page.status();
+      loaded.emplace(i, std::move(page->snapshot_));
+    }
   }
   for (const auto i : modified) {
     auto& entries = loaded.at(i).entries_;

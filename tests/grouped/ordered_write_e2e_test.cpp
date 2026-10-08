@@ -974,6 +974,75 @@ TEST(GroupedOrderedWriteE2e,
   ExpectList(client, "list", items);
 }
 
+TEST(GroupedListWriteE2e, FullRangeTrimReadsNoPayloadAndPreservesWatch) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires payload read failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "trim-noop";
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(Push(key, Items())).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ScopedEnvironment fault("LAVIK_FAIL_VALUE_READ_KEY", key.c_str());
+  Server server(disk, 3);
+  Client watcher(server.port());
+  Client writer(server.port());
+  ASSERT_EQ(watcher.Command({"WATCH", key}).text_, "OK");
+  EXPECT_EQ(writer.Command({"LTRIM", key, "0", "-1"}).text_, "OK");
+  EXPECT_EQ(writer.Command({"LTRIM", key, "-99999", "99999"}).text_, "OK");
+  ASSERT_EQ(watcher.Command({"MULTI"}).text_, "OK");
+  ASSERT_EQ(watcher.Command({"LLEN", key}).text_, "QUEUED");
+  const auto result = watcher.Command({"EXEC"});
+  ASSERT_EQ(result.items_.size(), 1) << result.text_;
+  EXPECT_EQ(result.items_[0].text_, "256");
+  // A real trim still needs checked payloads and cannot partially publish
+  // when that read fails.
+  EXPECT_EQ(writer.Command({"LTRIM", key, "1", "-1"}).kind_, '-');
+  EXPECT_EQ(writer.Command({"LLEN", key}).text_, "256");
+}
+
+TEST(GroupedOrderedWriteE2e, ListReusedPivotAndDeferredNeighboursRecover) {
+  PrivateDisk disk;
+  auto items = Items();
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(Push("list", items)).text_, "256");
+    // Shrink, then grow within the old page; the following growth splits it.
+    for (const auto size : {1, 120, 18000, 0, 128}) {
+      items[128] = std::string(size, 'v');
+      ASSERT_EQ(client.Command({"LSET", "list", "128", items[128]}).text_,
+                "OK");
+      ExpectList(client, "list", items);
+    }
+    for (const auto size : {0, 1, 1000, 17000}) {
+      std::string value(size, 'h');
+      ASSERT_EQ(client.Command({"LPUSH", "list", value}).text_,
+                std::to_string(items.size() + 1));
+      items.insert(items.begin(), value);
+    }
+    for (const auto at : {0u, 57u, 128u, 259u}) {
+      const auto pivot = items[at];
+      const std::string value("insert\0value", 12);
+      ASSERT_EQ(
+          client.Command({"LINSERT", "list", "AFTER", pivot, value}).text_,
+          std::to_string(items.size() + 1));
+      // Redis uses the first matching pivot even when page values repeat.
+      items.insert(std::find(items.begin(), items.end(), pivot) + 1, value);
+    }
+    ExpectList(client, "list", items);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  ExpectList(client, "list", items);
+}
+
 TEST(GroupedOrderedWriteE2e, ListReadIntervalsAcrossPagesAndRecovery) {
   PrivateDisk disk;
   auto items = Items();
@@ -1019,6 +1088,9 @@ TEST(GroupedOrderedWriteE2e, ListCommandSurfaceAndEmptyRecreation) {
     Server server(disk);
     Client client(server.port());
     ASSERT_EQ(client.Command(Push("list", items)).text_, "256");
+    // Both normalized full ranges are metadata-only no-ops.
+    EXPECT_EQ(client.Command({"LTRIM", "list", "0", "-1"}).text_, "OK");
+    EXPECT_EQ(client.Command({"LTRIM", "list", "-99999", "99999"}).text_, "OK");
     EXPECT_EQ(client.Command({"LPUSHX", "missing", "x"}).text_, "0");
     EXPECT_EQ(client.Command({"RPUSHX", "missing", "x"}).text_, "0");
     EXPECT_EQ(client.Command({"LPUSH", "list", "a", "b"}).text_, "258");
@@ -1524,6 +1596,52 @@ TEST(GroupedOrderedWriteE2e, SortedSetRemovalPopAndStoreCommandSurface) {
   EXPECT_EQ(client.Command({"ZCARD", "union"}).text_, "246");
   EXPECT_EQ(client.Command({"ZSCORE", "intersection", members[8]}).text_, "16");
   EXPECT_EQ(client.Command({"EXISTS", "difference"}).text_, "0");
+}
+
+TEST(GroupedOrderedWriteE2e,
+     SortedSetPopReusesTiedPagesAndRecoversBothIndexes) {
+  PrivateDisk disk;
+  auto members = Items();
+  std::sort(members.begin(), members.end());
+  {
+    Server server(disk);
+    Client client(server.port());
+    std::vector<std::string> command{"ZADD", "tied"};
+    for (const auto& member : members) {
+      command.push_back("7");
+      command.push_back(member);
+    }
+    ASSERT_EQ(client.Command(command).text_, "256");
+    // Equal scores span pages. Exercise both bounded probe reuse and its
+    // read fallback, still checking exact members in the prefix index.
+    for (const auto& operation : {"ZPOPMIN", "ZPOPMAX"}) {
+      auto popped = client.Command({operation, "tied", "70"});
+      ASSERT_EQ(popped.items_.size(), 140) << popped.text_;
+      for (std::size_t i = 0; i < 70; ++i) {
+        const auto at = std::string_view(operation) == "ZPOPMIN"
+                            ? i
+                            : members.size() - 1 - i;
+        EXPECT_EQ(popped.items_[2 * i].text_, members[at]);
+        EXPECT_EQ(popped.items_[2 * i + 1].text_, "7");
+        EXPECT_EQ(client.Command({"ZSCORE", "tied", members[at]}).text_, "-1");
+      }
+      if (std::string_view(operation) == "ZPOPMIN")
+        members.erase(members.begin(), members.begin() + 70);
+      else
+        members.resize(members.size() - 70);
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  const auto range = client.Command({"ZRANGE", "tied", "0", "-1"});
+  ASSERT_EQ(range.items_.size(), members.size());
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    EXPECT_EQ(range.items_[i].text_, members[i]);
+    EXPECT_EQ(client.Command({"ZRANK", "tied", members[i]}).text_,
+              std::to_string(i));
+  }
 }
 
 TEST(GroupedOrderedWriteE2e, LargeSortedSetMemberUsesExtents) {

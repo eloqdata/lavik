@@ -889,6 +889,31 @@ TEST(GroupedCollectionTest,
         auto plan = PlanOrderedCollectionSplice(
             *directory, Loaded(split->groups_), rank, count, insertions, 104);
         ASSERT_TRUE(plan.ok()) << plan.status();
+        // Repeat each splice with only touched pages and neighbours whose
+        // links change. This includes tail splits, partial pops, retirement,
+        // middle edits and whole-key deletion, using the full plan as oracle.
+        const auto first =
+            directory->FindRank(std::min(rank, original.size() - 1));
+        const auto last =
+            count == 0 ? first : directory->FindRank(rank + count - 1);
+        auto minimal = Loaded(split->groups_);
+        std::erase_if(minimal, [&](const auto& page) {
+          const auto index = *directory->FindIndex(page.snapshot_.id_);
+          return (index < first->group_index_ || index > last->group_index_) &&
+                 std::none_of(plan->writes_.begin(), plan->writes_.end(),
+                              [&](const auto& write) {
+                                return write.id_ == page.snapshot_.id_;
+                              });
+        });
+        auto local = PlanOrderedCollectionSplice(*directory, std::move(minimal),
+                                                 rank, count, insertions, 104);
+        ASSERT_TRUE(local.ok()) << local.status();
+        EXPECT_EQ(local->root_, plan->root_);
+        EXPECT_EQ(local->delete_key_, plan->delete_key_);
+        ASSERT_EQ(local->writes_.size(), plan->writes_.size());
+        for (std::size_t i = 0; i < plan->writes_.size(); ++i)
+          EXPECT_EQ(EncodeOrderedGroup(local->writes_[i]),
+                    EncodeOrderedGroup(plan->writes_[i]));
         EXPECT_EQ(plan->expected_sequence_, 1);
         if (expected.empty()) {
           EXPECT_TRUE(plan->delete_key_);
@@ -946,10 +971,10 @@ TEST(GroupedCollectionTest, SameSizeListReplacementNeedsOnlyItsOwnPage) {
     EXPECT_EQ(page.entries_[rank % 2].value_, "change");
     EXPECT_EQ(page.entries_[1 - rank % 2], pages[index].entries_[1 - rank % 2]);
   }
-  // Growth still requires neighbours for splitting; stale pages must never
-  // pass through the shortcut even when the replacement has the same size.
+  // A split that changes the next page's link still requires that neighbour;
+  // stale pages must never pass even when the replacement has the same size.
   EXPECT_EQ(PlanOrderedCollectionSplice(*directory, Loaded({pages[1]}), 2, 1,
-                                        {{.value_ = "longer!"}})
+                                        {{.value_ = "longer!"}}, 100)
                 .status()
                 .code(),
             absl::StatusCode::kInvalidArgument);
@@ -981,7 +1006,7 @@ TEST(GroupedCollectionTest, SpliceRejectsStaleMissingDuplicateAndInvalidInput) {
   auto missing = Loaded(split->groups_);
   missing.erase(missing.begin() + 1);
   EXPECT_FALSE(
-      PlanOrderedCollectionSplice(*directory, std::move(missing), 0, 1, {})
+      PlanOrderedCollectionSplice(*directory, std::move(missing), 0, 2, {})
           .ok());
   auto duplicate = Loaded(split->groups_);
   duplicate.push_back(duplicate.front());

@@ -143,7 +143,8 @@ struct HashGroupEdit {
 // Apply ordered operands to one encoded leaf, checking all old fields for
 // uniqueness and routing. HSET uses last-value-wins, NX uses first-value-wins,
 // and repeated removals count once. Inputs need only survive this call. Small
-// replacements copy views directly into checked bytes; splits and oversized
+// replacements copy views directly into checked bytes; a single edit copies
+// unchanged encoded spans without an entry-position table. Splits and oversized
 // entries retain the bounded-state owned encoder path. Caller admits page and
 // operand scratch before calling; this function performs no storage writes.
 absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(

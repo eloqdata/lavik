@@ -122,6 +122,55 @@ TEST(GroupedSortedSetWriteE2e, TypedChangesDoNotRereadOrderedMemberDiff) {
   EXPECT_EQ(client.Command({"ZRANGE", key, "0", "-1"}).items_.size(), 248);
 }
 
+TEST(GroupedSortedSetWriteE2e, SourceAndPopPagesAvoidSecondPlanRead) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires ordered plan read failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "ordered-probe";
+  auto member = [](unsigned i) {
+    return std::to_string(i) + std::string(128, 'm');
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed(key)).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    ScopedEnvironment fault("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key.c_str());
+    ScopedEnvironment page("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", "1");
+    Server server(disk, 3);
+    Client client(server.port());
+    // Existing source pages already contain the complete checked payload.
+    // Fail every new planner read of page one: source reuse and the head
+    // pop still succeed, while an unprobed insertion fails before publication.
+    // The tail pop also exercises selection handoff at the other endpoint.
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "0.5", member(10)}).text_,
+              "10.5");
+    ASSERT_EQ(client.Command({"ZREM", key, member(11)}).text_, "1");
+    for (const auto* op : {"ZPOPMIN", "ZPOPMAX"}) {
+      const auto reply = client.Command({op, key});
+      ASSERT_EQ(reply.items_.size(), 2) << reply.text_;
+      EXPECT_EQ(reply.items_[0].text_,
+                member(std::string_view(op) == "ZPOPMIN" ? 0 : 255));
+    }
+    const auto failed = client.Command({"ZADD", key, "-1", "new"});
+    EXPECT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find("plan page read failure"), std::string::npos);
+    EXPECT_EQ(client.Command({"ZCARD", key}).text_, "253");
+    EXPECT_EQ(client.Command({"ZSCORE", key, "new"}).text_, "-1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"ZCARD", key}).text_, "253");
+  EXPECT_EQ(client.Command({"ZSCORE", key, member(10)}).text_, "10.5");
+  EXPECT_EQ(client.Command({"ZRANK", key, member(12)}).text_, "10");
+}
+
 TEST(GroupedSortedSetWriteE2e,
      PointWritesReuseMemberLeafAndKeepBatchFailureAtomic) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
