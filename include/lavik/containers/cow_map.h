@@ -33,27 +33,28 @@
 
 namespace lavik {
 
-// Persistent key-to-metadata AVL map. Copies retain one root; topology
-// updates copy only a logarithmic search path. Large maps buffer existing-key
-// updates in one bounded immutable overlay. Overflow folds the batch into the
-// tree, copying each shared ancestor only once; lookups and iteration resolve
-// the overlay directly. Nodes and overlays admit/account their own lifetimes.
+// Copy-on-write ordered key/value map backed by an AVL tree. Copies retain one
+// root; topology updates copy only a logarithmic search path. Large maps buffer
+// existing-key updates in one bounded immutable overlay. Overflow folds the
+// batch into the tree, copying each shared ancestor only once; lookups and
+// iteration resolve the overlay directly. Nodes and overlays admit/account
+// their own lifetimes.
 //
-// Keys and metadata are trivially copyable; referenced resources remain the
+// Keys and values are trivially copyable; referenced resources remain the
 // caller's responsibility. All copies, access and destruction stay on the
 // allocating thread. Callers must bound the population to UINT32_MAX entries.
-template <typename Key, typename Metadata>
-class MapIndex {
+template <typename Key, typename Value>
+class CowMap {
   static_assert(std::is_trivially_copyable_v<Key>);
-  static_assert(std::is_trivially_copyable_v<Metadata>);
+  static_assert(std::is_trivially_copyable_v<Value>);
   struct Node;
   using Link = LocalSharedPtr<const Node>;
   struct Node {
-    std::pair<const Key, Metadata> entry_;
+    std::pair<const Key, Value> entry_;
     Link left_, right_;
     std::size_t size_;
     unsigned height_;
-    Node(Key key, Metadata value, Link left, Link right)
+    Node(Key key, Value value, Link left, Link right)
         : entry_(key, value),
           left_(std::move(left)),
           right_(std::move(right)),
@@ -66,7 +67,7 @@ class MapIndex {
   // retain their own overlay, and overflow never chains overlays together.
   struct Overlay {
     static constexpr std::size_t kCapacity = 8;
-    using Entry = std::pair<const Key, Metadata>;
+    using Entry = std::pair<const Key, Value>;
     std::array<std::optional<Entry>, kCapacity> entries_;
     std::size_t size_ = 0;
     explicit Overlay(const Overlay* previous) {
@@ -86,7 +87,7 @@ class MapIndex {
  public:
   class const_iterator {
    public:
-    using value_type = std::pair<const Key, Metadata>;
+    using value_type = std::pair<const Key, Value>;
     using reference = const value_type&;
     using pointer = const value_type*;
     reference operator*() const {
@@ -118,7 +119,7 @@ class MapIndex {
     }
 
    private:
-    friend class MapIndex;
+    friend class CowMap;
     // An AVL tree containing at most UINT32_MAX entries is far shallower than
     // this fixed stack. Iteration never allocates retained/scratch memory.
     const Overlay* overlay_ = nullptr;
@@ -152,14 +153,14 @@ class MapIndex {
   }
   // Exact metadata lookup without constructing the ancestor stack needed by
   // an iterator. The returned pointer borrows this immutable tree version.
-  const Metadata* Get(Key key) const noexcept {
+  const Value* Get(Key key) const noexcept {
     if (overlay_)
       if (const auto* entry = overlay_->Find(key)) return &entry->second;
     return GetBase(key);
   }
 
  private:
-  const Metadata* GetBase(Key key) const noexcept {
+  const Value* GetBase(Key key) const noexcept {
     const auto* node = root_.get();
     while (node) {
       if (key == node->entry_.first) return &node->entry_.second;
@@ -169,14 +170,14 @@ class MapIndex {
   }
 
  public:
-  const Metadata& at(Key key) const {
+  const Value& at(Key key) const {
     const auto it = find(key);
-    if (it == end()) throw std::out_of_range("map index key");
+    if (it == end()) throw std::out_of_range("copy-on-write map key");
     return it->second;
   }
   // Borrows the metadata at the greatest key <= key, resolving this view's
   // overlay. No predecessor returns nullptr, rather than an empty value.
-  const Metadata* Floor(Key key) const noexcept {
+  const Value* Floor(Key key) const noexcept {
     const Node* found = nullptr;
     auto* node = root_.get();
     while (node) {
@@ -194,7 +195,7 @@ class MapIndex {
   }
   // Insert/replace in an unpublished map. Allocation failure preserves its
   // previous root and overlay, including when a shared AVL path must rotate.
-  absl::Status Set(Key key, Metadata value) {
+  absl::Status Set(Key key, Value value) {
     if (overlay_ && overlay_->Find(key)) return SetBuffered(key, value);
     auto next = SetNode(root_, key, value);
     if (!next.ok()) return next.status();
@@ -207,7 +208,7 @@ class MapIndex {
   // Require 1024 entries before starting an overlay; an existing overlay must
   // still resolve its entries if subsequent erases shrink the map. Bulk
   // construction uses Set directly, without an existence lookup per insertion.
-  absl::Status SetBuffered(Key key, Metadata value) {
+  absl::Status SetBuffered(Key key, Value value) {
     const auto* current = overlay_ ? overlay_->Find(key) : nullptr;
     if (current || (size() >= 1024 && GetBase(key))) {
       if (!current && overlay_ && overlay_->size_ == Overlay::kCapacity) {
@@ -296,7 +297,8 @@ class MapIndex {
         TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(Overlay) + 1024));
     if (!reservation) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError("OOM map index exceeds maxmemory");
+      return absl::ResourceExhaustedError(
+          "OOM copy-on-write map exceeds maxmemory");
     }
     RetainedAllocationDomain domain{
         .owner_shard_ = CurrentMemoryAccountingShard(),
@@ -307,13 +309,14 @@ class MapIndex {
   }
   static std::size_t Size(const Link& node) { return node ? node->size_ : 0; }
   static unsigned Height(const Link& node) { return node ? node->height_ : 0; }
-  static absl::StatusOr<Link> Make(Key key, Metadata value, Link left,
+  static absl::StatusOr<Link> Make(Key key, Value value, Link left,
                                    Link right) {
     auto reservation =
         TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(Node) + 1024));
     if (!reservation) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError("OOM map index exceeds maxmemory");
+      return absl::ResourceExhaustedError(
+          "OOM copy-on-write map exceeds maxmemory");
     }
     RetainedAllocationDomain domain{
         .owner_shard_ = CurrentMemoryAccountingShard(),
@@ -323,7 +326,7 @@ class MapIndex {
                                           value, std::move(left),
                                           std::move(right)));
   }
-  static absl::StatusOr<Link> Balance(Key key, Metadata value, Link left,
+  static absl::StatusOr<Link> Balance(Key key, Value value, Link left,
                                       Link right) {
     if (Height(left) > Height(right) + 1) {
       if (Height(left->left_) >= Height(left->right_)) {
@@ -357,8 +360,7 @@ class MapIndex {
     }
     return Make(key, value, std::move(left), std::move(right));
   }
-  static absl::StatusOr<Link> SetNode(const Link& node, Key key,
-                                      Metadata value) {
+  static absl::StatusOr<Link> SetNode(const Link& node, Key key, Value value) {
     if (!node || key == node->entry_.first) {
       return Make(key, value, node ? node->left_ : Link{},
                   node ? node->right_ : Link{});

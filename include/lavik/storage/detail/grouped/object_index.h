@@ -219,7 +219,7 @@ class GroupedObject {
 };
 
 // Storage integration: user keys resolve to GroupedObject views here. Each
-// view owns a routing directory, which uses lavik::MapIndex or OrderedIndex
+// view owns a routing directory, which uses lavik::CowMap or FenwickTree
 // internally; those containers have no object publication/lifecycle semantics.
 //
 // Sparse second-level USER-KEY map. Only a grouped top-level RecordIndex

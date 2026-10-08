@@ -28,7 +28,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
 #include "lavik/containers/cow_array.h"
-#include "lavik/containers/ordered_index.h"
+#include "lavik/containers/fenwick_tree.h"
 #include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped/hash.h"
 #include "lavik/storage/format.h"
@@ -326,7 +326,7 @@ class OrderedGroupDirectory {
     return members_ ? &*members_ : nullptr;
   }
 
-  using Position = OrderedIndex::Position;
+  using Position = FenwickTree::Position;
   std::optional<Position> FindRank(std::uint64_t rank) const noexcept;
   // Number of records in pages preceding index; index may equal
   // groups().size().
@@ -387,7 +387,7 @@ class OrderedGroupDirectory {
   CowArray<std::pair<std::uint64_t, std::size_t>, 256> ids_;
   // List, ZSet and Stream share the same Fenwick rank representation. String
   // leaves this index empty and uses fixed-segment arithmetic instead.
-  OrderedIndex ranks_;
+  FenwickTree ranks_;
   mutable std::array<char, 48> stream_header_{};
   mutable bool has_stream_header_ = false;
   // The inline directory shares owner-local AVL nodes; those nodes account

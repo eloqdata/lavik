@@ -23,21 +23,21 @@
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "lavik/containers/map_index.h"
-#include "lavik/containers/ordered_index.h"
+#include "lavik/containers/cow_map.h"
+#include "lavik/containers/fenwick_tree.h"
 #include "lavik/memory.h"
 
 namespace lavik {
 namespace {
 
 // Restore process-wide admission even after ASSERT_* exits a test early.
-class IndexMemoryScope {
+class ContainerMemoryScope {
  public:
-  IndexMemoryScope() : shard_(CurrentMemoryAccountingShard()) {
+  ContainerMemoryScope() : shard_(CurrentMemoryAccountingShard()) {
     EXPECT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
     BindMemoryAccountingShard(0);
   }
-  ~IndexMemoryScope() {
+  ~ContainerMemoryScope() {
     EXPECT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
     BindMemoryAccountingShard(shard_ == 0 ? kMaxMemoryWorkers : shard_ - 1);
   }
@@ -46,9 +46,9 @@ class IndexMemoryScope {
   unsigned shard_;
 };
 
-TEST(MapIndexTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
-  IndexMemoryScope memory;
-  using Map = MapIndex<std::uint64_t, std::uint64_t>;
+TEST(CowMapTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
+  ContainerMemoryScope memory;
+  using Map = CowMap<std::uint64_t, std::uint64_t>;
   Map map;
   std::map<std::uint64_t, std::uint64_t> expected;
   for (std::uint64_t key = 0; key < 1152; ++key) {
@@ -106,12 +106,12 @@ TEST(MapIndexTest, BufferedUpdatesPreserveSnapshotsAndEveryLookup) {
   for (const auto& [snapshot, values] : snapshots) check(snapshot, values);
 }
 
-TEST(OrderedIndexTest, SparseTransfersMatchCountsAndPreserveSnapshots) {
-  IndexMemoryScope memory;
+TEST(FenwickTreeTest, SparseTransfersMatchCountsAndPreserveSnapshots) {
+  ContainerMemoryScope memory;
   std::vector<std::uint64_t> counts(1025, 10), ends;
   std::uint64_t total = 0;
   for (const auto count : counts) ends.push_back(total += count);
-  auto original = OrderedIndex::FromCumulative(ends);
+  auto original = FenwickTree::FromCumulative(ends);
   ASSERT_TRUE(original.ok()) << original.status();
   auto current = *original;
   const auto check = [](const auto& index, const auto& values) {
@@ -130,7 +130,7 @@ TEST(OrderedIndexTest, SparseTransfersMatchCountsAndPreserveSnapshots) {
   for (std::size_t step = 0; step < 8; ++step) {
     const auto before = current;
     const auto old_counts = counts;
-    std::vector<OrderedIndex::CountChange> changes;
+    std::vector<FenwickTree::CountChange> changes;
     for (const auto i : {step, 255 + step, 1024 - step}) {
       const auto replacement = 1 + (i + step) % 19;
       changes.emplace_back(i, absl::int128(replacement) - counts[i]);
@@ -144,13 +144,13 @@ TEST(OrderedIndexTest, SparseTransfersMatchCountsAndPreserveSnapshots) {
   check(*original, std::vector<std::uint64_t>(1025, 10));
 }
 
-TEST(OrderedIndexTest, AdmissionFailurePreservesPublishedIndex) {
-  IndexMemoryScope memory;
-  auto original = OrderedIndex::FromCumulative({3, 7, 9});
+TEST(FenwickTreeTest, AdmissionFailurePreservesPublishedSnapshot) {
+  ContainerMemoryScope memory;
+  auto original = FenwickTree::FromCumulative({3, 7, 9});
   ASSERT_TRUE(original.ok());
   auto builder = *original;
-  const std::array<OrderedIndex::CountChange, 1> neutral{{{1, 0}}};
-  const std::array<OrderedIndex::CountChange, 1> changed{{{1, 1}}};
+  const std::array<FenwickTree::CountChange, 1> neutral{{{1, 0}}};
+  const std::array<FenwickTree::CountChange, 1> changed{{{1, 1}}};
   ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
   EXPECT_TRUE(builder.ApplyCounts(neutral, 9).ok());
   EXPECT_EQ(builder.ApplyCounts(changed, 10).code(),
@@ -164,14 +164,14 @@ TEST(OrderedIndexTest, AdmissionFailurePreservesPublishedIndex) {
   EXPECT_EQ(original->CountBefore(2), 7);
 }
 
-TEST(OrderedIndexTest, FenwickSuffixAppliesPrefixTransfersExactlyOnce) {
-  IndexMemoryScope memory;
+TEST(FenwickTreeTest, FenwickSuffixAppliesPrefixTransfersExactlyOnce) {
+  ContainerMemoryScope memory;
   for (const std::size_t first : {0, 1, 3, 4, 255, 256, 257}) {
     std::vector<std::uint64_t> ends(258);
     for (std::size_t i = 0; i < ends.size(); ++i) ends[i] = (i + 1) * 3;
-    auto original = OrderedIndex::FromCumulative(ends);
+    auto original = FenwickTree::FromCumulative(ends);
     ASSERT_TRUE(original.ok());
-    std::vector<OrderedIndex::CountChange> prefix_changes;
+    std::vector<FenwickTree::CountChange> prefix_changes;
     if (first != 0) prefix_changes.emplace_back(0, 2);
     std::vector<std::uint64_t> suffix;
     auto total = first * 3 + (first == 0 ? 0 : 2);

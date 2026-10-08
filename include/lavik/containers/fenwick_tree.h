@@ -31,7 +31,7 @@
 
 namespace lavik {
 
-// Persistent Fenwick index over counts of ordered groups. Maps an element
+// Copy-on-write Fenwick tree over counts of ordered groups. Maps an element
 // rank to a group ordinal and offset; prefix reads and count updates visit
 // logarithmically many cells. Groups are abstract count buckets: no collection
 // kind, record identity or physical location is retained here.
@@ -40,8 +40,8 @@ namespace lavik {
 // view: a failure may partially update that builder, never a pinned
 // predecessor. Callers validate counts, bound the population to UINT32_MAX
 // groups and admit temporary build/suffix arrays. There is one cell layout,
-// so the index stores no policy tag or duplicate total.
-class OrderedIndex {
+// so the tree stores no policy tag or duplicate total.
+class FenwickTree {
  public:
   struct Position {
     std::size_t group_index_;
@@ -51,7 +51,7 @@ class OrderedIndex {
 
   // Consumes checked cumulative counts as build scratch, encoding them into
   // Fenwick cells in place to avoid another full-size scratch array.
-  static absl::StatusOr<OrderedIndex> FromCumulative(
+  static absl::StatusOr<FenwickTree> FromCumulative(
       std::vector<std::uint64_t> ends) {
     for (std::size_t i = ends.size(); i > 1; --i) ends[i - 1] -= ends[i - 2];
     for (std::size_t i = 0; i < ends.size(); ++i) {
@@ -60,7 +60,7 @@ class OrderedIndex {
     }
     auto cells = Storage::From(ends);
     if (!cells.ok()) return cells.status();
-    OrderedIndex result;
+    FenwickTree result;
     result.cells_ = std::move(*cells);
     return result;
   }
@@ -102,8 +102,8 @@ class OrderedIndex {
   // Suffix insertion retains the preceding group ordinals. The suffix carries
   // complete NEW cumulative counts, including prefix_changes; only the old
   // prefix cells receive those deltas separately. The suffix may grow but
-  // cannot shrink the index on this path.
-  absl::StatusOr<OrderedIndex> WithSuffix(
+  // cannot shrink the tree on this path.
+  absl::StatusOr<FenwickTree> WithSuffix(
       std::size_t first, std::span<const std::uint64_t> cumulative,
       std::span<const CountChange> prefix_changes,
       std::uint64_t item_count) const {
@@ -124,13 +124,13 @@ class OrderedIndex {
       }
       const auto value = absl::int128(cumulative[i]) - before;
       if (value < 0 || value > item_count)
-        return absl::DataLossError("invalid ordered suffix rank sum");
+        return absl::DataLossError("invalid Fenwick suffix sum");
       encoded.push_back(static_cast<std::uint64_t>(value));
     }
     const auto old_suffix = cells_.size() - first;
     auto appended = cells_.Appended(std::span(encoded).subspan(old_suffix));
     if (!appended.ok()) return appended.status();
-    OrderedIndex result;
+    FenwickTree result;
     result.cells_ = std::move(*appended);
     for (std::size_t i = 0; i < old_suffix; ++i) {
       auto status = result.cells_.Set(first + i, encoded[i]);
@@ -163,7 +163,7 @@ class OrderedIndex {
         AllocatorUsableSizeForRequest(updates * sizeof(CountChange) + 1024));
     if (!admission) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError("OOM ordered rank update scratch");
+      return absl::ResourceExhaustedError("OOM Fenwick update scratch");
     }
     rank_changes.reserve(updates);
     for (const auto& [index, delta] : count_changes) {
@@ -181,7 +181,7 @@ class OrderedIndex {
       if (delta == 0) continue;
       const auto value = absl::int128(cells_[index]) + delta;
       if (value < 0 || value > item_count)
-        return absl::DataLossError("invalid ordered updated rank sum");
+        return absl::DataLossError("invalid Fenwick updated sum");
       auto status = cells_.Set(index, static_cast<std::uint64_t>(value));
       if (!status.ok()) return status;
     }

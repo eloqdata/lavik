@@ -722,7 +722,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
   if (!retired_array.ok()) return retired_array.status();
   auto id_array = decltype(result.ids_)::From(ids);
   if (!id_array.ok()) return id_array.status();
-  auto end_array = OrderedIndex::FromCumulative(std::move(ends));
+  auto end_array = FenwickTree::FromCumulative(std::move(ends));
   if (!end_array.ok()) return end_array.status();
   result.groups_ = std::move(*group_array);
   result.retired_ = std::move(*retired_array);
@@ -1251,7 +1251,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
   }
   auto id_array = decltype(ids_)::From(ids);
   if (!id_array.ok()) return id_array.status();
-  auto end_array = OrderedIndex::FromCumulative(std::move(ends));
+  auto end_array = FenwickTree::FromCumulative(std::move(ends));
   if (!end_array.ok()) return end_array.status();
   rebuilt.groups_ = std::move(*group_array);
   rebuilt.ids_ = std::move(*id_array);
